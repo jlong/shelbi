@@ -1794,36 +1794,49 @@ impl ShellState {
     }
 
     /// The per-frame sidebar inputs (the palette chord, the hovered footer
-    /// button), owned so the draw closure holds no borrow of the rest of the
-    /// shell state.
+    /// button, whether the Search button is hovered), owned so the draw
+    /// closure holds no borrow of the rest of the shell state.
     fn sidebar_chrome(&self) -> sidebar::SidebarChrome {
         sidebar::SidebarChrome::from_keymaps(&self.keymaps, self.display_style)
             .with_hover(self.footer_hover())
+            .with_search_hover(self.search_hover())
     }
 
-    /// The sidebar footer button under the pointer, while the nav sidebar is
-    /// what shows there: never under an overlay, Settings, or a review or
-    /// workspace panel in the sidebar's column.
-    fn footer_hover(&self) -> Option<FooterButton> {
+    /// The pointer, while it is over the nav sidebar and that is what shows
+    /// there: never under an overlay, Settings, or a review or workspace
+    /// panel in the sidebar's column.
+    fn sidebar_pointer(&self) -> Option<(u16, u16)> {
         let (x, y) = self.pointer?;
-        if self.overlay.is_some()
+        let hidden = self.overlay.is_some()
             || self.settings_open()
             || self.acknowledgements_open()
-            || matches!(self.main_view, MainView::Review(_) | MainView::Workspace(_))
-            || !contains(self.sidebar_rect, x, y)
-        {
-            return None;
-        }
+            || matches!(self.main_view, MainView::Review(_) | MainView::Workspace(_));
+        (!hidden && contains(self.sidebar_rect, x, y)).then_some((x, y))
+    }
+
+    /// The sidebar footer button under the pointer (see
+    /// [`Self::sidebar_pointer`]).
+    fn footer_hover(&self) -> Option<FooterButton> {
+        let (x, y) = self.sidebar_pointer()?;
         self.sidebar_view()?
             .footer_button_at(self.sidebar_content_rect(), x, y)
     }
 
+    /// Whether the pointer is over the header's Search button (see
+    /// [`Self::sidebar_pointer`]).
+    fn search_hover(&self) -> bool {
+        self.sidebar_pointer().is_some_and(|(x, y)| {
+            self.sidebar_view()
+                .is_some_and(|v| v.search_button_hit(self.sidebar_content_rect(), x, y))
+        })
+    }
+
     /// Record where the pointer is (`None`: the terminal lost focus, so it may
-    /// be anywhere), repainting when that moves the footer's hover.
+    /// be anywhere), repainting when that moves the sidebar's hover.
     fn track_pointer(&mut self, pointer: Option<(u16, u16)>) {
-        let before = self.footer_hover();
+        let before = (self.footer_hover(), self.search_hover());
         self.pointer = pointer;
-        if self.footer_hover() != before {
+        if (self.footer_hover(), self.search_hover()) != before {
             self.dirty = true;
         }
         // A Settings table row under the pointer lights; one it left goes
@@ -5136,9 +5149,9 @@ impl ShellState {
                 // focuses the sidebar (hit returns `None`), opening nothing.
                 self.client.focus_sidebar();
                 if let Some(view) = self.sidebar_view() {
-                    // A click on the search box opens the command palette, the
-                    // same as pressing the palette chord.
-                    if view.search_box_hit(self.sidebar_content_rect(), m.column, m.row) {
+                    // A click on the header's Search button opens the command
+                    // palette, the same as pressing the palette chord.
+                    if view.search_button_hit(self.sidebar_content_rect(), m.column, m.row) {
                         self.open_palette();
                         self.dirty = true;
                         return;
@@ -6719,11 +6732,11 @@ mod tests {
         // The user has tabbed into the nav, so focus starts on the sidebar.
         st.client.focus_sidebar();
 
-        // The nav block renders two-row bleed pills below the 6-row header: the
-        // label for nav item `k` sits on row `6 + 2k + 1`. Rows are Orchestrator
-        // (k=0 → row 7), Issues (k=1 → row 9), Activity (k=2 → row 11). Click the
+        // The nav block renders two-row bleed pills below the 4-row header: the
+        // label for nav item `k` sits on row `4 + 2k + 1`. Rows are Orchestrator
+        // (k=0 → row 5), Issues (k=1 → row 7), Changelog (k=2 → row 9). Click the
         // Issues label.
-        st.handle_event(Event::Mouse(left_click(5, 9)));
+        st.handle_event(Event::Mouse(left_click(5, 7)));
         assert!(
             matches!(st.main_view, MainView::Native(View::Issues)),
             "the click opened the Issues view",
@@ -7052,7 +7065,8 @@ mod tests {
 
     #[test]
     fn a_click_on_the_search_box_opens_the_palette() {
-        // The search box sits on header rows 3–5; clicking it opens the command
+        // The header's Search button is a square across header rows 0–2, two
+        // columns in from the sidebar's right; clicking it opens the command
         // palette, the same as the palette chord.
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
@@ -7060,12 +7074,15 @@ mod tests {
         st.show(RowTarget::Session(SessionRef::Orchestrator));
         assert!(st.overlay.is_none(), "no overlay before the click");
 
-        // Header layout: blank (row 0), title (row 1), blank (row 2), search
-        // box (rows 3–5).
-        st.handle_mouse(left_click(3, 4));
+        // The sidebar's content is 27 columns (the last is the divider), so
+        // the five-column square spans columns 20–24. The title beside it
+        // opens nothing.
+        st.handle_mouse(left_click(3, 1));
+        assert!(st.overlay.is_none(), "the title is not the button");
+        st.handle_mouse(left_click(22, 1));
         assert!(
             matches!(st.overlay, Some(ActiveOverlay::Palette(_))),
-            "clicking the search box opens the command palette"
+            "clicking the Search button opens the command palette"
         );
     }
 
@@ -7288,11 +7305,12 @@ mod tests {
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_main();
-        // Sidebar geometry: rows 0-5 are the header (title, margin, the 2-row
-        // search box across rows 2-4, margin), then the nav block interleaves
-        // items with separator lines — Chat on y=7, Issues on y=9, Activity on
-        // y=11 (even rows between are inert separators). Click Issues.
-        st.handle_mouse(left_click(2, 9));
+        // Sidebar geometry: rows 0-3 are the header (the title on row 1 beside
+        // the Search button's square across rows 0-2), then the nav block
+        // interleaves items with separator lines — Chat on y=5, Issues on
+        // y=7, the third item on y=9 (even rows between are inert
+        // separators). Click Issues.
+        st.handle_mouse(left_click(2, 7));
         assert_eq!(st.selection(), 1, "selection moved to Issues");
         assert!(
             matches!(st.main_view, MainView::Native(View::Issues)),
@@ -7302,9 +7320,9 @@ mod tests {
         // same as a session (so the click lands the user on what they opened).
         assert_eq!(st.client.focus(), Focus::Main);
 
-        // Clicking Activity (y=11) switches the main area again and keeps main
+        // Clicking Activity (y=9) switches the main area again and keeps main
         // focus.
-        st.handle_mouse(left_click(2, 11));
+        st.handle_mouse(left_click(2, 9));
         assert_eq!(st.selection(), 2, "selection moved to Activity");
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
         assert_eq!(st.client.focus(), Focus::Main);
@@ -7315,10 +7333,10 @@ mod tests {
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_sidebar();
-        // After the nav block (ends y=12) comes a blank (y=13), the
-        // "— Workspaces —" header (y=14), then the single flat workspace alpha
-        // on y=15 (selectable ordinal 3).
-        st.handle_mouse(left_click(2, 15));
+        // After the nav block (ends y=10) comes a blank (y=11), the
+        // "— Workspaces —" header (y=12), then the single flat workspace alpha
+        // on y=13 (selectable ordinal 3).
+        st.handle_mouse(left_click(2, 13));
         assert_eq!(st.selection(), 3, "selection moved to alpha");
         assert!(
             matches!(st.main_view, MainView::Session),
@@ -7356,8 +7374,8 @@ mod tests {
         }));
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_sidebar();
-        // The single flat workspace `alpha` sits on y=15 (see the click test).
-        st.handle_mouse(left_click(2, 15));
+        // The single flat workspace `alpha` sits on y=13 (see the click test).
+        st.handle_mouse(left_click(2, 13));
         assert!(matches!(st.main_view, MainView::Session));
         assert_eq!(
             st.sessions.current_target(),
@@ -9523,6 +9541,45 @@ mod tests {
         st.effect_tap = None;
         st.dispatch_effect(Effect::SendFeedback);
         assert!(matches!(st.overlay, Some(ActiveOverlay::Feedback(_))));
+    }
+
+    /// The header's Search button lights and names its chord under the
+    /// pointer, repaints only when that changes, and goes dark off the
+    /// button, on focus loss, and under an overlay.
+    #[test]
+    fn search_button_hover_follows_the_pointer() {
+        let mut st = settings_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (sx, sy) = find_on_screen(&term, "🔍").expect("the Search button shows");
+        assert!(!st.search_hover(), "no hover before any motion");
+        assert!(!screen_text(&term).contains("Search ("), "no tooltip at rest");
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(sx, sy)));
+        assert!(st.search_hover());
+        assert!(st.dirty, "a hover change repaints");
+        assert_eq!(st.footer_hover(), None, "the footer stays dark");
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_eq!(term.backend().buffer()[(sx, sy)].bg, palette().button_hover, "lit");
+        assert!(screen_text(&term).contains("Search ("), "the tooltip names the chord");
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(sx, sy - 1)));
+        assert!(!st.dirty, "still on the button (its top cap): no repaint");
+
+        st.handle_event(Event::Mouse(moved(3, sy)));
+        assert!(!st.search_hover(), "the title is not the button");
+        assert!(st.dirty);
+
+        st.handle_event(Event::Mouse(moved(sx, sy)));
+        st.handle_event(Event::FocusLost);
+        assert!(!st.search_hover(), "the pointer may be anywhere once focus goes");
+
+        st.handle_event(Event::Mouse(moved(sx, sy)));
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        assert!(st.overlay.is_some());
+        assert!(!st.search_hover(), "under the palette");
     }
 
     /// The footer's hover follows the pointer, repaints only when it changes,
