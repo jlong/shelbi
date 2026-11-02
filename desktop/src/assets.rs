@@ -29,7 +29,8 @@
 //!
 //! One exception: a few drawings John made in the Figma file where
 //! Heroicons has none (the palette's Zen toggle, error log and finish
-//! flag, the sidebar's toggle, every dropdown's chevron). They live under `assets/icons/figma/` (see its README), on the
+//! flag, the sidebar's toggle, every dropdown's chevron, the Changelog's
+//! pull request). They live under `assets/icons/figma/` (see its README), on the
 //! Figma's 20pt grid, and render through the same [`heroicon`] helper.
 //!
 //! Where the Figma file draws an icon at **14pt** (the Activity pickers'
@@ -428,6 +429,7 @@ heroicons! {
         SIDEBAR = "sidebar";
         KEYBOARD_KEY = "keyboard-key";
         CHEVRON_DOWN_SMALL = "chevron-down-small";
+        PULL_REQUEST = "pull-request";
     }
     @small {
         FUNNEL_SMALL = "funnel";
