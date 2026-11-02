@@ -31,6 +31,10 @@
 #
 #   assets/icon/retro-{512,224,128}.png
 #
+# Retro Racing S, from its 1024px master (assets/icon/retro-racing-s-1024.png):
+#
+#   assets/icon/retro-racing-s-{512,224,128}.png
+#
 # and the TUI About tables (crates/shelbi-tui/src/overlay/about_icon.rs).
 #
 # bundle.sh only copies the compiled files, so a release never needs Xcode
@@ -137,9 +141,12 @@ compile_icon RacingS "$work/RacingS"
 echo "==> drawing Racing S as macOS shows it"
 draw_icon RacingS "$work/RacingS" "$icon_dir/racing-s"
 
-echo "==> cutting Retro from retro-1024.png"
-for size in 512 224 128; do
-  sips -s format png -z "$size" "$size" "$icon_dir/retro-1024.png" --out "$icon_dir/retro-$size.png" >/dev/null
+# Retro and Retro Racing S are flat rasters: cut each down from its master.
+for name in retro retro-racing-s; do
+  echo "==> cutting $name from $name-1024.png"
+  for size in 512 224 128; do
+    sips -s format png -z "$size" "$size" "$icon_dir/$name-1024.png" --out "$icon_dir/$name-$size.png" >/dev/null
+  done
 done
 
 echo "==> TUI About tables"

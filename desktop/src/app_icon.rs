@@ -1,5 +1,5 @@
 //! The app icon setting (`desktop.app_icon`): Command Grille, the bundle's
-//! own icon and the default, Retro, or Racing S.
+//! own icon and the default, Retro, Racing S, or Retro Racing S.
 //!
 //! [`AppIconSetting`] is the choice in effect, a global: [`init`] reads it
 //! from `config.yaml` at launch and [`set`] changes it (Settings ▸ General's
@@ -50,20 +50,22 @@ fn png(bytes: &'static [u8]) -> Arc<Image> {
 }
 
 /// The icons at 224px, for About's 112pt.
-static ABOUT: LazyLock<[Arc<Image>; 3]> = LazyLock::new(|| {
+static ABOUT: LazyLock<[Arc<Image>; 4]> = LazyLock::new(|| {
     [
         png(include_bytes!("../assets/icon/command-grille-224.png")),
         png(include_bytes!("../assets/icon/retro-224.png")),
         png(include_bytes!("../assets/icon/racing-s-224.png")),
+        png(include_bytes!("../assets/icon/retro-racing-s-224.png")),
     ]
 });
 
 /// The icons at 128px, for the picker's 64pt tiles.
-static TILE: LazyLock<[Arc<Image>; 3]> = LazyLock::new(|| {
+static TILE: LazyLock<[Arc<Image>; 4]> = LazyLock::new(|| {
     [
         png(include_bytes!("../assets/icon/command-grille-128.png")),
         png(include_bytes!("../assets/icon/retro-128.png")),
         png(include_bytes!("../assets/icon/racing-s-128.png")),
+        png(include_bytes!("../assets/icon/retro-racing-s-128.png")),
     ]
 });
 
@@ -72,6 +74,7 @@ fn index(icon: AppIcon) -> usize {
         AppIcon::CommandGrille => 0,
         AppIcon::Retro => 1,
         AppIcon::RacingS => 2,
+        AppIcon::RetroRacingS => 3,
     }
 }
 
@@ -105,9 +108,11 @@ mod tests {
             (&include_bytes!("../assets/icon/command-grille-224.png")[..], about),
             (&include_bytes!("../assets/icon/retro-224.png")[..], about),
             (&include_bytes!("../assets/icon/racing-s-224.png")[..], about),
+            (&include_bytes!("../assets/icon/retro-racing-s-224.png")[..], about),
             (&include_bytes!("../assets/icon/command-grille-128.png")[..], 128),
             (&include_bytes!("../assets/icon/retro-128.png")[..], 128),
             (&include_bytes!("../assets/icon/racing-s-128.png")[..], 128),
+            (&include_bytes!("../assets/icon/retro-racing-s-128.png")[..], 128),
         ] {
             assert_eq!(header(png), (size, size, true));
         }
@@ -121,9 +126,11 @@ mod tests {
         assert_eq!(cx.update(|cx| current(cx)), AppIcon::Retro);
         cx.update(|cx| set(AppIcon::RacingS, cx));
         assert_eq!(cx.update(|cx| current(cx)), AppIcon::RacingS);
+        cx.update(|cx| set(AppIcon::RetroRacingS, cx));
+        assert_eq!(cx.update(|cx| current(cx)), AppIcon::RetroRacingS);
         cx.update(|cx| set(AppIcon::CommandGrille, cx));
         assert_eq!(cx.update(|cx| current(cx)), AppIcon::CommandGrille);
         let applied = dock_icon::tests::APPLIED.with(|a| a.borrow().clone());
-        assert_eq!(applied, [AppIcon::Retro, AppIcon::RacingS, AppIcon::CommandGrille]);
+        assert_eq!(applied, [AppIcon::Retro, AppIcon::RacingS, AppIcon::RetroRacingS, AppIcon::CommandGrille]);
     }
 }

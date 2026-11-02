@@ -1141,6 +1141,14 @@ fn dock_applied() -> Vec<shelbi_state::AppIcon> {
     crate::platform::dock_icon::tests::APPLIED.with(|a| a.borrow().clone())
 }
 
+/// The App icon picker's tiles, in [`shelbi_state::AppIcon::ALL`]'s order.
+const TILES: [&str; 4] = [
+    "settings-app-icon-command-grille",
+    "settings-app-icon-retro",
+    "settings-app-icon-racing-s",
+    "settings-app-icon-retro-racing-s",
+];
+
 #[gpui::test]
 fn the_app_icon_tiles_pick_the_icon_live_and_save_it(cx: &mut TestAppContext) {
     use shelbi_state::AppIcon;
@@ -1149,7 +1157,7 @@ fn the_app_icon_tiles_pick_the_icon_live_and_save_it(cx: &mut TestAppContext) {
 
     // Unset: Command Grille, shown picked, and nothing written.
     let view = general_page(&mut s, shelbi_state::UserConfig::default());
-    for selector in ["settings-app-icon-command-grille", "settings-app-icon-retro", "settings-app-icon-racing-s"] {
+    for selector in TILES {
         assert!(s.drawn(selector), "{selector}");
     }
     assert_eq!(app_icon_in_effect(&mut s), AppIcon::CommandGrille);
@@ -1159,8 +1167,7 @@ fn the_app_icon_tiles_pick_the_icon_live_and_save_it(cx: &mut TestAppContext) {
     // Picking moves only the ring: each tile keeps its bounds whichever is
     // picked (no label to turn bold and widen it), so nothing reflows.
     let tiles = |s: &mut Settings| {
-        ["settings-app-icon-command-grille", "settings-app-icon-retro", "settings-app-icon-racing-s"]
-            .map(|selector| s.bounds(selector))
+        TILES.map(|selector| s.bounds(selector))
     };
     let unpicked_retro = tiles(&mut s);
     // Each tile is its well alone: the picture 12px in, no label under it.
@@ -1181,6 +1188,11 @@ fn the_app_icon_tiles_pick_the_icon_live_and_save_it(cx: &mut TestAppContext) {
     assert_eq!(app_icon_in_effect(&mut s), AppIcon::RacingS);
     assert_eq!(dock_applied().last(), Some(&AppIcon::RacingS));
     assert_eq!(saved(&mut s), Some(AppIcon::RacingS));
+    s.click("settings-app-icon-retro-racing-s");
+    assert_eq!(tiles(&mut s), unpicked_retro, "picking Retro Racing S moves no tile");
+    assert_eq!(app_icon_in_effect(&mut s), AppIcon::RetroRacingS);
+    assert_eq!(dock_applied().last(), Some(&AppIcon::RetroRacingS));
+    assert_eq!(saved(&mut s), Some(AppIcon::RetroRacingS));
     // Picking the default writes it too: it was chosen.
     s.click("settings-app-icon-command-grille");
     assert_eq!(tiles(&mut s), unpicked_retro, "picking Command Grille moves no tile");
