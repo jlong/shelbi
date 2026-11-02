@@ -89,9 +89,6 @@ pub struct DocEditor {
     /// The scroll the editor sits in.
     scroll: Option<ScrollHandle>,
     link: Option<LinkPrompt>,
-    /// The editor sits on the window's glass (the task pane over the
-    /// board), not on an opaque overlay: it paints from the window's theme.
-    on_glass: bool,
     _subs: Vec<Subscription>,
     _blink: Task<()>,
 }
@@ -164,7 +161,6 @@ impl DocEditor {
             reveal: false,
             scroll,
             link: None,
-            on_glass: false,
             _subs: subs,
             _blink: blink,
         }
@@ -187,23 +183,10 @@ impl DocEditor {
         cx.notify();
     }
 
-    /// Whether the editor sits on the window's glass ([`Self::theme`]).
-    pub fn set_on_glass(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.on_glass != on {
-            self.on_glass = on;
-            cx.notify();
-        }
-    }
-
-    /// The theme the editor paints from: the window's on the glass, the
-    /// opaque one on an overlay.
+    /// The theme the editor paints from: the opaque one, as the task pane
+    /// it sits in is opaque over whatever it floats on.
     fn theme(&self, cx: &App) -> Theme {
-        let theme = *cx.global::<Theme>();
-        if self.on_glass {
-            theme
-        } else {
-            theme.opaque()
-        }
+        cx.global::<Theme>().opaque()
     }
 
     /// The text changed from outside (a read, the draft store): put it in

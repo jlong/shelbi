@@ -1030,11 +1030,6 @@ impl IssuesView {
         if let Some(e) = &self.pane_editors {
             e.title.update(cx, |t, cx| t.set_from_outside(&title, cx));
             e.body.update(cx, |b, cx| b.set_from_outside(&body, cx));
-            // Over the board the pane is on the glass; over another screen
-            // it is an opaque overlay (`task_detail::render`).
-            let glass = !self.floating;
-            e.title.update(cx, |t, cx| t.set_on_glass(glass, cx));
-            e.body.update(cx, |b, cx| b.set_on_glass(glass, cx));
         }
     }
 
@@ -2213,30 +2208,21 @@ impl Render for IssuesView {
                 .into_any_element();
         }
         let board = self.render_board(&theme, cx);
-        // The board's layers, clipped short of the task pane while the window
-        // is translucent so nothing draws under the pane but the glass. The
-        // inner box keeps the full width either way, so nothing reflows.
-        let cover = task_detail::board_cover(self, &theme).unwrap_or(0.0);
+        // The board's layers, at the view's full width whether or not the
+        // task pane is open: the pane floats over them (`task_detail`), so
+        // the board shows in its margins and scrolls on under it.
         let content = div()
+            .debug_selector(|| "board-content".into())
             .absolute()
             .top_0()
             .bottom_0()
             .left_0()
-            .right(px(cover))
-            .overflow_hidden()
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .bottom_0()
-                    .left_0()
-                    .right(px(-cover))
-                    .flex()
-                    .flex_col()
-                    .child(self.render_header(&theme, window, cx))
-                    .child(board)
-                    .child(self.render_footer(&theme)),
-            );
+            .right_0()
+            .flex()
+            .flex_col()
+            .child(self.render_header(&theme, window, cx))
+            .child(board)
+            .child(self.render_footer(&theme));
         div()
             .id("issues")
             .track_focus(&self.focus)
@@ -2745,6 +2731,47 @@ mod tests {
         assert_eq!(view.read_with(&cx, |v, _| v.board_scroll.handle.offset()), offset);
         assert_eq!(view.read_with(&cx, |v, _| (v.state.selected_column, v.state.selected_row)), now);
         assert!(board_focused(&view, &mut cx), "the keys are back on the board");
+    }
+
+    #[gpui::test]
+    fn the_pane_floats_over_the_board_not_beside_it(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) = open_board_sized(cx, wide_board(), Some(gpui::size(px(1160.0), px(1024.0))));
+        // A translucent window, where the board used to stop at the pane's
+        // left edge and leave the glass in its margins.
+        cx.update(|_, cx| {
+            let glass = cx.global::<Theme>().with_opacity(0.85);
+            cx.set_global(glass);
+        });
+        let main = gpui::Bounds::new(gpui::point(px(0.0), px(0.0)), gpui::size(px(1160.0), px(1024.0)));
+        let board = bounds(&mut cx, "board-content");
+        assert_eq!(board, main, "the board fills the view with the pane closed");
+
+        click(&mut cx, "card-T2");
+        let pane = bounds(&mut cx, "task-pane");
+        assert_eq!(bounds(&mut cx, "board-content"), board, "the board keeps its full width under the pane");
+        // The pane lies on the board, 8pt in from its top, right and bottom,
+        // so the board shows all around it but on the left.
+        let edge = px(task_detail::EDGE);
+        assert_eq!(pane.top() - board.top(), edge);
+        assert_eq!(board.right() - pane.right(), edge);
+        assert_eq!(board.bottom() - pane.bottom(), edge);
+        assert!(pane.left() > board.left(), "{pane:?} over {board:?}");
+        assert!(bounds(&mut cx, "board-columns").right() > pane.left(), "columns run on under the pane");
+
+        // The board still scrolls sideways under it.
+        let at = gpui::point(board.left() + px(40.0), board.center().y);
+        cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(-200.0), px(0.0))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let offset = view.read_with(&cx, |v, _| v.board_scroll.handle.offset());
+        assert!(offset.x < px(0.0), "the board scrolled: {offset:?}");
+        assert_eq!(pane_id(&view, &cx).as_deref(), Some("T2"), "and the pane stays");
     }
 
     #[gpui::test]

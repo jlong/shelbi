@@ -5,9 +5,11 @@
 //! The pane isn't modal. It sits [`EDGE`] in from the main area's top, right
 //! and bottom (the user's chosen width at most, 640pt until they drag its
 //! left edge, narrower in a window that can't fit it; see
-//! [`super::pane_width`]), on an overlay layer over the board, which keeps its width, scroll and
-//! selection under it and stays usable where the pane doesn't cover it: a
-//! click on another card shows that card here. It slides in from the right
+//! [`super::pane_width`]), on an overlay layer over the board. The board
+//! runs at its full width under the pane (it shows in the pane's margins
+//! too), keeps its scroll and selection, and stays usable where the pane
+//! doesn't cover it: a click on another card shows that card here. The pane
+//! is opaque in every window, with Figma's `shadow/hard` drop over the board. It slides in from the right
 //! as it opens ([`SLIDE`], gpui's animation, so Reduce Motion shows it in
 //! place). The same pane shows over Review and Workspace (their More), drawn
 //! by a floating board ([`IssuesView::open_task_over`]).
@@ -105,12 +107,10 @@ pub enum PaneContent<'a> {
 
 /// The pane for task `id`, on its overlay layer over the main area.
 pub fn render(view: &IssuesView, id: &str, content: PaneContent<'_>, theme: &Theme, cx: &mut Context<IssuesView>) -> AnyElement {
-    // Over the board, the pane is on the window's glass: the board draws
-    // nothing under it ([`board_cover`]), so it paints no surface of its own
-    // and its fills are tints of the glass. Over another screen (Review,
-    // Workspace) it covers a live session, so it is an opaque overlay.
-    let floating = view.is_floating();
-    let theme = &if floating { theme.opaque() } else { *theme };
+    // The pane floats over what it covers (the board, or a live session
+    // over Review and Workspace), so it paints from the opaque theme: on a
+    // translucent window the board would otherwise show through it.
+    let theme = &theme.opaque();
     let title = match &content {
         PaneContent::Task(d) => format!("{} / {}", workflow_label(&d.workflow_name), d.id),
         _ => format!("Task / {id}"),
@@ -145,7 +145,7 @@ pub fn render(view: &IssuesView, id: &str, content: PaneContent<'_>, theme: &The
         .w(px(width))
         .min_w_0()
         .overflow_hidden()
-        .bg(theme.nested(theme.canvas))
+        .bg(theme.canvas)
         .rounded(px(RADIUS))
         .shadow(pane_shadow(theme))
         .type_style(Type::Base)
@@ -250,21 +250,10 @@ fn resize_probe(view: &IssuesView, cx: &mut Context<IssuesView>) -> impl IntoEle
     .size_full()
 }
 
-/// The frame's elevation: a 32pt drop 8pt down, in the shadow role.
-/// How far in from the board's right edge the open pane reaches while the
-/// window is translucent: the board clips its content there, so only the
-/// glass is under the pane (the pane's final place: while it slides in, the
-/// board is already clipped). `None` while opaque or over another screen,
-/// where the pane hides what it covers by itself. Independent of the board's
-/// width: the pane sits [`EDGE`] in from the right, `wanted` wide, or all
-/// the room when that's less (the clip is then past the left edge).
-pub fn board_cover(view: &IssuesView, theme: &Theme) -> Option<f32> {
-    (theme.translucent() && !view.is_floating() && view.state.detail_id().is_some())
-        .then(|| EDGE + view.pane_width.wanted())
-}
-
+/// The frame's elevation over the board: Figma's `0 8 32` drop in
+/// `shadow/hard` (the `pane_shadow` role).
 fn pane_shadow(theme: &Theme) -> Vec<BoxShadow> {
-    vec![BoxShadow::new(px(0.0), px(8.0), theme.shadow).blur_radius(style::figma_blur(32.0))]
+    vec![BoxShadow::new(px(0.0), px(8.0), theme.pane_shadow).blur_radius(style::figma_blur(32.0))]
 }
 
 /// A workflow's name as the pane spells it (`task` → `Task`).

@@ -187,7 +187,7 @@ The Figma text styles, all Geist (`assets/fonts/geist/` bundles 400, 500,
 | Menu, popover | `raised`, 8px corners, a 1px `ring` and a soft drop |
 | Palette | The Command palette frame: over the `scrim`, 200px down, 788px wide (a 580px commands column, a 160px Projects column, 16px between and either side); `raised`, 8px corners, no ring, `palette_shadow` (0 10 15 -3). A 44px query line (`❯`, a 2x18px `link` caret, the placeholder `muted`), 32px rows (6px across and between, 6px corners: a 20px `icon`, the name in a 220px column in Base medium `foreground`, the description in Base `muted`; the selected row on `background`, its name Base semibold `text_loud`, its description `foreground`), 26px project rows, an X-Small `muted` footer |
 | Dialog | Over the `scrim`, `raised`, 8px corners, a 1px ring and a deeper drop |
-| Task pane | The Task pane frames (2172:722, 2573:10737): not a dialog, no scrim. 8px in from the main area's top, right and bottom, 640px wide until the user drags its left edge (400px to the main area less 240px; narrower when the window can't fit it), the `canvas` with 12px corners, a 1px `divider` edge drawn inside it and a 32px drop 8px down in `shadow`; slides in from the right over `SLIDE` on the motion curve. The 52px Header (`toolbar`, `Workflow / id` in Base semibold `text_loud`, 28px More and Close with 20px icons), then the scroll 20px in with 20px between sections: the title (Desktop/Title, loud), 6px-apart 28px properties (a 108px Small `muted` label, 12px, the value: the Button at Small in the Ghost style with its chevron, opening a picker under it, the branch in the terminal face at 12px, selectable), a divider, the body, the dates (X-Small, `muted`) |
+| Task pane | The Task pane frames (2172:722, 2573:10737): not a dialog, no scrim. 8px in from the main area's top, right and bottom, 640px wide until the user drags its left edge (400px to the main area less 240px; narrower when the window can't fit it), over the board (which keeps its full width and shows in the margins), the opaque `canvas` with 12px corners, a 1px `divider` edge drawn inside it and a 32px drop 8px down in `pane_shadow`; slides in from the right over `SLIDE` on the motion curve. The 52px Header (`toolbar`, `Workflow / id` in Base semibold `text_loud`, 28px More and Close with 20px icons), then the scroll 20px in with 20px between sections: the title (Desktop/Title, loud), 6px-apart 28px properties (a 108px Small `muted` label, 12px, the value: the Button at Small in the Ghost style with its chevron, opening a picker under it, the branch in the terminal face at 12px, selectable), a divider, the body, the dates (X-Small, `muted`) |
 | Card | `card` with `shadow/raised card`, 12px corners, 12px inside, 6px between the title (Base medium, two lines), the excerpt (X-Small on an 18px line, `foreground`, four lines, 244px wide) and the meta row (the workflow badge, 4px across with 2px corners, then the branch in `muted`); the keyboard's card wears the focus ring and glow instead of the shadow |
 | Chip, badge | 20px, 6px across, X-Small medium, the hue's text on its tint; a workflow name is `workflow_badge_text` on `workflow_badge` |
 | Zen pill | 42px, the sidebar's width inside 8px, fully rounded: `zen` (the Success fill) over the canvas with a `success` (`text/green`) "Zen mode on"; off, `background` over the canvas with "Zen mode off" in `foreground`. A click toggles Zen |
@@ -274,13 +274,11 @@ the windows see-through. The opacity is applied when the theme resolves
   `theme.opaque()`, as do the fills a drop shadow sits under (the selected
   segment, a slider's thumb, the board's drag ghost, the focused back
   button) and the terminal's notice band.
-- **The task pane over the board is glass.** It paints no surface of its
-  own (`nested(canvas)`) and its fills are tints; the board clips its header,
-  columns and footer short of the pane (`task_detail::board_cover`, the
-  pane's final place, anchored to the right so nothing reflows), so only the
-  glass is under it. Over Review and Workspace (More) the pane covers a live
-  session, so there it is an opaque overlay, its title and body editors too
-  (`DocEditor::set_on_glass`).
+- **The task pane is opaque.** It floats over the board (which runs at its
+  full width under it and shows in its 8px margins) or over a live session
+  (Review and Workspace's More), so it paints from `theme.opaque()`, its
+  title and body editors too (`DocEditor::theme`); a tinted pane would show
+  the board through it. Its `pane_shadow` drop lifts it off the board.
 - **Alpha blends with "over"**: gpui-pre 0.3.9's Metal pipelines add each
   primitive's alpha to the framebuffer's, which saturates any fill over the
   glass to opaque; `platform::metal_blend` corrects that at pipeline creation
@@ -531,6 +529,7 @@ the rule the Button component's Success and Danger styles follow.
 | `shadow` | `#0a1e5105` | `#0a1e5105` | `shadow/raised card`'s drops (menus, popovers and dialogs too) |
 | `shadow_ring` | `#0a1e5108` | `#0a1e5108` | `shadow/raised card`'s 1px ring |
 | `palette_shadow` | `#00000040` | `#00000040` | The Command palette's drop effect (`0 10 15 -3`): the palette over the scrim |
+| `pane_shadow` | `#0203038c` | `#acb4cf99` | `shadow/hard`: the task pane's drop (`0 8 32`) over the board |
 | `scrim` | `#02030359` | `#444c65a6` | `surface/overlay`: the backdrop behind the palette and dialogs |
 
 ## Contrast
