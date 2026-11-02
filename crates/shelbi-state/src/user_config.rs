@@ -173,7 +173,7 @@ pub struct DesktopConfig {
     pub contrast: Option<u8>,
 
     /// Which icon the desktop app wears in the Dock and its About, and the
-    /// TUI's About draws: `command-grille` or `retro`. Unset, or a value it
+    /// TUI's About draws: `command-grille`, `retro` or `racing-s`. Unset, or a value it
     /// doesn't know, means Command Grille (the app bundle's own icon).
     #[serde(
         default,
@@ -279,11 +279,14 @@ pub enum AppIcon {
     /// The earlier raster icon: cobalt and chrome, the grille behind an oval
     /// bezel.
     Retro,
+    /// The layered cobalt tile with a porcelain italic racing S over a
+    /// translucent ice-blue copy of itself.
+    RacingS,
 }
 
 impl AppIcon {
     /// Every icon, in the order the settings show them.
-    pub const ALL: [AppIcon; 2] = [AppIcon::CommandGrille, AppIcon::Retro];
+    pub const ALL: [AppIcon; 3] = [AppIcon::CommandGrille, AppIcon::Retro, AppIcon::RacingS];
 
     /// The icon `cfg` names (unset is Command Grille).
     pub fn from_config(cfg: &DesktopConfig) -> AppIcon {
@@ -295,11 +298,12 @@ impl AppIcon {
         match self {
             AppIcon::CommandGrille => "Command Grille",
             AppIcon::Retro => "Retro",
+            AppIcon::RacingS => "Racing S",
         }
     }
 }
 
-/// `app_icon`: `command-grille` or `retro` (any case, `_` for `-`);
+/// `app_icon`: `command-grille`, `retro` or `racing-s` (any case, `_` for `-`);
 /// anything else is ignored rather than failing the whole file.
 fn lenient_app_icon<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<AppIcon>, D::Error> {
     let value = serde_yaml::Value::deserialize(d)?;
@@ -309,6 +313,7 @@ fn lenient_app_icon<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Resu
     Ok(match text.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "command-grille" => Some(AppIcon::CommandGrille),
         "retro" => Some(AppIcon::Retro),
+        "racing-s" => Some(AppIcon::RacingS),
         _ => None,
     })
 }
@@ -1461,6 +1466,13 @@ mod tests {
         })
         .unwrap();
         assert!(text.contains("app_icon: command-grille"), "{text}");
+        let text = serde_yaml::to_string(&DesktopConfig {
+            app_icon: Some(AppIcon::RacingS),
+            ..DesktopConfig::default()
+        })
+        .unwrap();
+        assert!(text.contains("app_icon: racing-s"), "{text}");
+        assert_eq!(AppIcon::RacingS.label(), "Racing S");
 
         let read = |v: &str| {
             let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n  app_icon: {v}\n")).unwrap();
@@ -1468,8 +1480,12 @@ mod tests {
         };
         assert_eq!(read("retro"), Some(AppIcon::Retro));
         assert_eq!(read("Command_Grille"), Some(AppIcon::CommandGrille));
+        assert_eq!(read("racing-s"), Some(AppIcon::RacingS));
+        assert_eq!(read("racing_s"), Some(AppIcon::RacingS));
+        assert_eq!(read("Racing-S"), Some(AppIcon::RacingS));
         // Unknown values are ignored, not an error that loses the file.
         assert_eq!(read("roadster"), None);
+        assert_eq!(read("racing"), None);
         assert_eq!(read("~"), None);
         // Unset is Command Grille, and isn't written.
         assert_eq!(AppIcon::from_config(&DesktopConfig::default()), AppIcon::CommandGrille);

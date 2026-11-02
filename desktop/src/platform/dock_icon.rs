@@ -4,7 +4,7 @@
 //!
 //! The bundle's own icon is Command Grille, layered, which macOS draws with
 //! its live glass in the Dock; choosing it puts that back (`nil`) rather than
-//! a flat picture of it. Retro, and Command Grille in an unbundled
+//! a flat picture of it. Retro, Racing S, and Command Grille in an unbundled
 //! `cargo run` (which has no icon of its own), set a picture: the icon at
 //! 512px, the Dock's largest magnified size on a Retina display.
 
@@ -15,12 +15,15 @@ use shelbi_state::AppIcon;
 const COMMAND_GRILLE: &[u8] = include_bytes!("../../assets/icon/command-grille-512.png");
 /// Retro at 512px, cut from its master.
 const RETRO: &[u8] = include_bytes!("../../assets/icon/retro-512.png");
+/// Racing S as macOS draws it, at 512px (rendered like Command Grille).
+const RACING_S: &[u8] = include_bytes!("../../assets/icon/racing-s-512.png");
 
 /// The picture the Dock shows for `icon`.
 fn png(icon: AppIcon) -> &'static [u8] {
     match icon {
         AppIcon::CommandGrille => COMMAND_GRILLE,
         AppIcon::Retro => RETRO,
+        AppIcon::RacingS => RACING_S,
     }
 }
 

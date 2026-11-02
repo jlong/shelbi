@@ -85,7 +85,7 @@ use shelbi_app::settings::{
 use shelbi_app::settings::workflows::{Committed, Edit, Target};
 use shelbi_app::{EditTarget, Effect};
 use shelbi_state::keymap::{DisplayStyle, Key, Keymaps, SidebarAction};
-use shelbi_state::{ThemePreference, UserConfig};
+use shelbi_state::{AppIcon, ThemePreference, UserConfig};
 use shelbi_state::workflow_config::WorkflowConfig;
 use shelbi_state::agents_config::AgentsConfig;
 
@@ -267,6 +267,8 @@ enum Does {
     Reload,
     /// The theme's segmented control (←/→, or Enter for the next one).
     Theme,
+    /// The app icon's segmented control (←/→, or Enter for the next one).
+    AppIcon,
     /// A tool's picker (Editor, Diff tool): Enter opens its list.
     Tool(ToolSetting),
     /// Open a file in the editor.
@@ -287,6 +289,8 @@ pub(crate) enum Hit {
     Action(usize),
     /// A theme's segment.
     Theme(ThemePreference),
+    /// An app icon's segment.
+    AppIcon(AppIcon),
     PromptSave,
     PromptDiscard,
     PromptCancel,
@@ -1384,7 +1388,8 @@ impl SettingsShell {
         }
     }
 
-    /// General's rows: the theme and the editor (once `config.yaml` reads),
+    /// General's rows: the theme, the app icon and the tools (once
+    /// `config.yaml` reads),
     /// Edit config.yaml, the summary's actions, then About Shelbi (always:
     /// it reads nothing).
     fn general_actions(&self) -> Vec<PageAction> {
@@ -1392,6 +1397,7 @@ impl SettingsShell {
         if let JobState::Done(summary) = self.general.state() {
             if self.form.saved().is_some() {
                 out.push(PageAction { label: "Theme".into(), note: None, does: Does::Theme });
+                out.push(PageAction { label: "App icon".into(), note: None, does: Does::AppIcon });
                 for setting in [ToolSetting::Editor, ToolSetting::DiffTool] {
                     out.push(PageAction { label: setting.label().into(), note: None, does: Does::Tool(setting) });
                 }
@@ -1472,6 +1478,7 @@ impl SettingsShell {
             Does::Run(effect) => SettingsAction::Run(effect),
             Does::Reload => SettingsAction::Reload,
             Does::Theme => write(self.form.step_theme(1)),
+            Does::AppIcon => write(self.form.step_app_icon(1)),
             Does::Tool(setting) => {
                 self.form.cancel_edit();
                 self.tools.open(&self.form, setting);
@@ -1639,7 +1646,9 @@ impl SettingsShell {
             Region::Page => {
                 let actions = self.actions();
                 let n = actions.len();
-                let on_theme = actions.get(self.action).is_some_and(|a| a.does == Does::Theme);
+                let on = actions.get(self.action).map(|a| &a.does);
+                let sideways = matches!(k.code, KeyCode::Left | KeyCode::Right);
+                let step = if k.code == KeyCode::Left { -1 } else { 1 };
                 if n == 0 && (up || down) {
                     // Nothing to choose: the arrows scroll.
                     self.scroll = if down { self.scroll.saturating_add(1) } else { self.scroll.saturating_sub(1) };
@@ -1647,8 +1656,10 @@ impl SettingsShell {
                     self.action = self.action.saturating_sub(1);
                 } else if down {
                     self.action = (self.action + 1).min(n.saturating_sub(1));
-                } else if on_theme && matches!(k.code, KeyCode::Left | KeyCode::Right) {
-                    return write(self.form.step_theme(if k.code == KeyCode::Left { -1 } else { 1 }));
+                } else if sideways && on == Some(&Does::Theme) {
+                    return write(self.form.step_theme(step));
+                } else if sideways && on == Some(&Does::AppIcon) {
+                    return write(self.form.step_app_icon(step));
                 } else if activate {
                     return self.run_action(self.action);
                 } else {
@@ -1854,6 +1865,12 @@ impl SettingsShell {
                             self.action = i;
                         }
                         write(self.form.choose_theme(theme))
+                    }
+                    Some(Hit::AppIcon(icon)) => {
+                        if let Some(i) = self.actions().iter().position(|a| a.does == Does::AppIcon) {
+                            self.action = i;
+                        }
+                        write(self.form.choose_app_icon(icon))
                     }
                     _ => SettingsAction::Stay,
                 }
@@ -2429,6 +2446,35 @@ fn general_rows(
             wrapped(
                 &mut rows,
                 "Auto is dark here: a terminal doesn't report its appearance. The theme colors Shelbi's lists and panels, never your sessions.",
+                width,
+                Style::default().fg(palette().muted),
+            );
+            rows.push(Row::blank());
+        }
+        if let Some(i) = at(&Does::AppIcon) {
+            // Shared with the desktop app, whose picker shows the icons as
+            // tiles: here, one segment per icon, by name.
+            rows.push(Row::text(textbox::label("App icon", focus == Some(i), false, width)));
+            let labels: Vec<&str> = AppIcon::ALL.iter().map(|icon| icon.label()).collect();
+            let chosen = AppIcon::ALL.iter().position(|icon| *icon == form.app_icon()).unwrap_or(0);
+            let (mut lines, at) = button::segmented(&labels, chosen, focus == Some(i), width);
+            let mut targets: Vec<(u16, u16, Hit)> =
+                at.iter().zip(AppIcon::ALL).map(|(&(x, w), icon)| (x, w, Hit::AppIcon(icon))).collect();
+            if at.len() < labels.len() {
+                // Too narrow for every name (the segments would cut off,
+                // the chosen one with them): the chosen one alone, a click
+                // on it the next, as Enter and → step.
+                let next = AppIcon::ALL[(chosen + 1) % AppIcon::ALL.len()];
+                let (one, at) = button::segmented(&labels[chosen..=chosen], 0, focus == Some(i), width);
+                lines = one;
+                targets = at.iter().map(|&(x, w)| (x, w, Hit::AppIcon(next))).collect();
+            }
+            for line in lines {
+                rows.push(Row { action: Some(i), targets: targets.clone(), ..Row::text(line) });
+            }
+            wrapped(
+                &mut rows,
+                "About draws it here, and the desktop app wears it in the Dock and its About.",
                 width,
                 Style::default().fg(palette().muted),
             );
@@ -3175,7 +3221,7 @@ fn hints(region: Region, page: SettingsPage, typing: bool, moves: &str) -> Strin
             format!("{moves} choose · ⏎ open · n new · e edit · d remove · r reload · Tab sidebar · Esc back")
         }
         Region::Page if page == SettingsPage::General => {
-            format!("{moves} choose · ←→ theme · ⏎ run · r reload · Tab sidebar · Esc back")
+            format!("{moves} choose · ←→ pick · ⏎ run · r reload · Tab sidebar · Esc back")
         }
         // Nothing on the page acts: the arrows scroll it.
         Region::Page => format!("{moves} scroll · Tab sidebar · Esc back"),
@@ -3460,11 +3506,11 @@ mod tests {
         let labels: Vec<String> = s.actions().into_iter().map(|a| a.label).collect();
         assert_eq!(
             labels,
-            ["Theme", "Editor", "Diff tool", "Edit config.yaml", "Edit Project Settings", "Edit Zen Mode", "About Shelbi"]
+            ["Theme", "App icon", "Editor", "Diff tool", "Edit config.yaml", "Edit Project Settings", "Edit Zen Mode", "About Shelbi"]
         );
         let km = keymaps();
         s.set_region(Region::Page);
-        for _ in 0..5 {
+        for _ in 0..6 {
             s.handle_key(key(KeyCode::Char('j')), &km);
         }
         assert_eq!(
@@ -3485,7 +3531,7 @@ mod tests {
         let labels: Vec<String> = s.actions().into_iter().map(|a| a.label).collect();
         assert_eq!(
             labels,
-            ["Theme", "Editor", "Diff tool", "Edit config.yaml", "Switch project…", "Add project…", "About Shelbi"]
+            ["Theme", "App icon", "Editor", "Diff tool", "Edit config.yaml", "Switch project…", "Add project…", "About Shelbi"]
         );
         // A failed read offers Try again.
         let t = s.begin_load(Some("proj"), true).unwrap();
@@ -3562,7 +3608,7 @@ mod tests {
         let mut s = SettingsShell::default();
         let t = s.begin_load(None, false).unwrap();
         s.loaded(&t, Ok(fixture_summary(None)));
-        let text = screen(&mut s, 100, 50);
+        let text = screen(&mut s, 100, 60);
         for want in ["No project is open.", "Switch project…", "Add project…", "This computer"] {
             assert!(text.contains(want), "{want:?}:\n{text}");
         }
@@ -3655,6 +3701,63 @@ mod tests {
         );
     }
 
+    /// The App icon row: ←/→ and Enter step through the icons, a click on
+    /// a segment picks it, and a write shows pending.
+    #[test]
+    fn the_app_icon_row_picks_with_keys_and_clicks() {
+        let mut s = on_general(fixture_summary(Some("proj")));
+        let km = keymaps();
+        let text = screen(&mut s, 100, 40);
+        for want in ["App icon", "Command Grille", "Retro", "Racing S"] {
+            assert!(text.contains(want), "{want:?}:\n{text}");
+        }
+        s.handle_key(key(KeyCode::Down), &km);
+        assert_eq!(s.handle_key(key(KeyCode::Left), &km), SettingsAction::Write(Change::AppIcon(AppIcon::RacingS)));
+        assert_eq!(s.form().app_icon(), AppIcon::RacingS, "pending shows the pick");
+        let mut cfg = UserConfig::default();
+        cfg.desktop.app_icon = Some(AppIcon::RacingS);
+        s.config_written(Ok(cfg));
+        assert_eq!(s.handle_key(key(KeyCode::Enter), &km), SettingsAction::Write(Change::AppIcon(AppIcon::CommandGrille)));
+        s.config_written(Ok(UserConfig::default()));
+        assert_eq!(s.handle_key(key(KeyCode::Right), &km), SettingsAction::Write(Change::AppIcon(AppIcon::Retro)));
+        s.config_written(Err("read-only".into()));
+
+        // A click on Racing S's segment picks it.
+        let text = screen(&mut s, 100, 40);
+        let (x, y) = text
+            .lines()
+            .enumerate()
+            .find_map(|(y, l)| l.find(" Racing S ").map(|x| (l[..x].chars().count() + 1, y)))
+            .unwrap_or_else(|| panic!("{text}"));
+        let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x as u16, row: y as u16, modifiers: KeyModifiers::NONE };
+        assert_eq!(
+            s.handle_mouse(click, Rect::new(0, 0, 28, 40), Rect::new(28, 0, 72, 40)),
+            SettingsAction::Write(Change::AppIcon(AppIcon::RacingS))
+        );
+    }
+
+    /// Too narrow for the three names, the App icon control shows the
+    /// chosen one (never cut off) and a click on it steps to the next.
+    #[test]
+    fn a_narrow_app_icon_row_keeps_the_chosen_icon() {
+        let mut summary = fixture_summary(Some("proj"));
+        summary.global.preferences = Ok(general::Preferences { app_icon: AppIcon::RacingS, ..general::Preferences::default() });
+        let mut s = on_general(summary);
+        let text = screen(&mut s, 60, 50);
+        assert!(text.contains(" Racing S ") && !text.contains(" Retro "), "{text}");
+        let (x, y) = text
+            .lines()
+            .enumerate()
+            .find_map(|(y, l)| l.find(" Racing S ").map(|x| (l[..x].chars().count() + 1, y)))
+            .unwrap_or_else(|| panic!("{text}"));
+        let click = MouseEvent { kind: MouseEventKind::Down(MouseButton::Left), column: x as u16, row: y as u16, modifiers: KeyModifiers::NONE };
+        assert_eq!(
+            s.handle_mouse(click, Rect::new(0, 0, 28, 50), Rect::new(28, 0, 32, 50)),
+            SettingsAction::Write(Change::AppIcon(AppIcon::CommandGrille)),
+            "Racing S wraps to the first"
+        );
+    }
+
     /// [`on_general`] with the fixture's installed tools detected.
     fn with_tools(summary: GeneralSummary) -> SettingsShell {
         let mut s = on_general(summary);
@@ -3666,10 +3769,10 @@ mod tests {
     fn a_click_anywhere_on_a_picker_opens_its_list() {
         let mut s = with_tools(fixture_summary(Some("proj")));
         let km = keymaps();
-        let side = Rect::new(0, 0, 28, 30);
-        let main = Rect::new(28, 0, 72, 30);
+        let side = Rect::new(0, 0, 28, 40);
+        let main = Rect::new(28, 0, 72, 40);
         for (label, setting) in [("Editor", ToolSetting::Editor), ("Diff tool", ToolSetting::DiffTool)] {
-            let text = screen(&mut s, 100, 30);
+            let text = screen(&mut s, 100, 40);
             let at = text.lines().position(|l| l.trim_end().ends_with(&format!("  {label}"))).unwrap_or_else(|| panic!("{text}"));
             let lines: Vec<&str> = text.lines().collect();
             assert!(lines[at + 1].contains("▄▄▄▄") && lines[at + 2].contains("▾") && lines[at + 3].contains("▀▀▀▀"), "{text}");
@@ -3685,7 +3788,7 @@ mod tests {
                 assert_eq!(s.tool_layer().setting(), Some(setting), "a click on row {y} opens the list");
                 assert_eq!(s.handle_key(key(KeyCode::Esc), &km), SettingsAction::Stay);
                 assert_eq!(s.page(), SettingsPage::General, "Esc closed the list, not Settings");
-                screen(&mut s, 100, 30);
+                screen(&mut s, 100, 40);
             }
         }
     }
@@ -3694,6 +3797,8 @@ mod tests {
     fn the_list_draws_the_choices_and_a_click_picks_an_app() {
         let mut s = with_tools(fixture_summary(Some("proj")));
         let km = keymaps();
+        // Past Theme and App icon to Editor.
+        s.handle_key(key(KeyCode::Down), &km);
         s.handle_key(key(KeyCode::Down), &km);
         s.handle_key(key(KeyCode::Enter), &km);
         let text = screen(&mut s, 100, 40);
@@ -3737,7 +3842,7 @@ mod tests {
     fn a_failed_pick_goes_back_and_says_why() {
         let mut s = with_tools(fixture_summary(Some("proj")));
         let km = keymaps();
-        for _ in 0..2 {
+        for _ in 0..3 {
             s.handle_key(key(KeyCode::Down), &km);
         }
         s.handle_key(key(KeyCode::Enter), &km);
@@ -3758,6 +3863,8 @@ mod tests {
     fn other_command_takes_every_key_while_typed_and_saves_only_on_enter() {
         let mut s = with_tools(fixture_summary(Some("proj")));
         let km = keymaps();
+        // Past Theme and App icon to Editor.
+        s.handle_key(key(KeyCode::Down), &km);
         s.handle_key(key(KeyCode::Down), &km);
         // The list's last entry: Other command…, which types under the picker.
         s.handle_key(key(KeyCode::Enter), &km);
@@ -3803,6 +3910,8 @@ mod tests {
     fn browse_opens_a_path_prompt_over_the_page() {
         let mut s = with_tools(fixture_summary(Some("proj")));
         let km = keymaps();
+        // Past Theme and App icon to Editor.
+        s.handle_key(key(KeyCode::Down), &km);
         s.handle_key(key(KeyCode::Down), &km);
         s.handle_key(key(KeyCode::Enter), &km);
         s.handle_key(key(KeyCode::End), &km);
@@ -3837,6 +3946,8 @@ mod tests {
     fn leaving_with_a_typed_command_asks_and_save_writes_it() {
         let mut s = on_general(fixture_summary(Some("proj")));
         let km = keymaps();
+        // Past Theme and App icon to Editor.
+        s.handle_key(key(KeyCode::Down), &km);
         s.handle_key(key(KeyCode::Down), &km);
         s.handle_key(key(KeyCode::Enter), &km);
         s.handle_key(key(KeyCode::End), &km);
@@ -3881,10 +3992,11 @@ mod tests {
             summary.global.preferences = Ok(general::Preferences {
                 theme: ThemePreference::Light,
                 editor: Some("code --wait".into()),
-                diff_tool: None,
+                ..general::Preferences::default()
             });
             let mut s = on_general(summary);
             let km = keymaps();
+            s.handle_key(key(KeyCode::Down), &km);
             s.handle_key(key(KeyCode::Down), &km);
             s.handle_key(key(KeyCode::Enter), &km);
             let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();

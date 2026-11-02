@@ -9732,7 +9732,7 @@ mod tests {
 
     #[test]
     fn settings_draws_at_80x24_and_wide_over_the_hidden_view() {
-        for (w, h) in [(80, 24), (160, 48)] {
+        for (w, h) in [(80, 24), (160, 56)] {
             let mut st = settings_state();
             st.dispatch_effect(Effect::OpenSettings);
             settle_settings(&mut st);
@@ -9768,7 +9768,7 @@ mod tests {
         assert!(screen_text(&term).contains("↓ more"), "what's below says so");
         // Tab to the page and walk down to its last action: it scrolls into view.
         press(&mut st, KeyCode::Tab);
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut st, KeyCode::Down);
         }
         draw_frame(&mut term, &mut st).unwrap();
@@ -9791,9 +9791,9 @@ mod tests {
         settle_settings(&mut st);
         st.effect_tap = Some(Vec::new());
         press(&mut st, KeyCode::Tab);
-        // Past the theme, the Editor and Diff tool pickers and Edit
-        // config.yaml, then Edit Project Settings, to Edit Zen Mode.
-        for _ in 0..5 {
+        // Past the theme, the app icon, the Editor and Diff tool pickers and
+        // Edit config.yaml, then Edit Project Settings, to Edit Zen Mode.
+        for _ in 0..6 {
             press(&mut st, KeyCode::Char('j'));
         }
         press(&mut st, KeyCode::Enter);
@@ -9844,6 +9844,8 @@ mod tests {
         settle_settings(&mut st);
         press(&mut st, KeyCode::Tab);
         // Editor ▸ Other command….
+        // (past Theme and App icon)
+        press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Enter);
         press(&mut st, KeyCode::End);
@@ -10031,6 +10033,8 @@ mod tests {
         let mut st = settings_state();
         on_general_page(&mut st);
         // The Editor picker's list, its last entry: Other command….
+        // (past Theme and App icon)
+        press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Enter);
         press(&mut st, KeyCode::End);
@@ -10072,6 +10076,8 @@ mod tests {
         on_general_page(&mut st);
         settle_until(&mut st, "the tools are detected", |st| !st.settings.form().detected().editors.is_empty());
         // Editor ▸ Zed (Default, Neovim, Helix, Visual Studio Code, Zed).
+        // (past Theme and App icon)
+        press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Enter);
         for _ in 0..4 {

@@ -1,7 +1,7 @@
 //! The General page's shared preferences (`tui-settings-general`): the
-//! appearance (`theme:`), the editor (`editor:`) and the diff tool
-//! (`diff_tool:`) in `~/.shelbi/config.yaml`, and where a save of them
-//! stands.
+//! appearance (`theme:`), the app icon (`desktop.app_icon`), the editor
+//! (`editor:`) and the diff tool (`diff_tool:`) in `~/.shelbi/config.yaml`,
+//! and where a save of them stands.
 //!
 //! All are immediate-save controls, as the desktop app's are: picking a
 //! theme or a tool saves it, and an "Other command…" is saved when the user
@@ -24,7 +24,7 @@
 use std::path::Path;
 
 use shelbi_state::tools::{DetectedTools, ToolOption};
-use shelbi_state::{EditorSource, ThemePreference, ToolChoice, ToolKind, UserConfig};
+use shelbi_state::{AppIcon, EditorSource, ThemePreference, ToolChoice, ToolKind, UserConfig};
 
 /// The theme choices, in the order a segmented control shows them.
 pub const THEMES: [ThemePreference; 3] = [ThemePreference::Auto, ThemePreference::Dark, ThemePreference::Light];
@@ -68,6 +68,8 @@ impl SaveStatus {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Preferences {
     pub theme: ThemePreference,
+    /// The app icon (`desktop.app_icon`; unset is Command Grille).
+    pub app_icon: AppIcon,
     /// The `editor:` setting, as written (a command may carry arguments).
     pub editor: Option<ToolChoice>,
     /// The `diff_tool:` setting.
@@ -78,6 +80,7 @@ impl Preferences {
     pub fn from_config(cfg: &UserConfig) -> Preferences {
         Preferences {
             theme: cfg.theme,
+            app_icon: AppIcon::from_config(&cfg.desktop),
             editor: cfg.editor.clone(),
             diff_tool: cfg.diff_tool.clone(),
         }
@@ -125,6 +128,9 @@ pub const OTHER_COMMAND_LABEL: &str = "Other command…";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     Theme(ThemePreference),
+    /// The app icon (`desktop.app_icon`), written even when it is the
+    /// default, as the desktop's picker writes it.
+    AppIcon(AppIcon),
     /// The editor; `None` clears it, so the fallback applies.
     Editor(Option<ToolChoice>),
     /// The diff tool; `None` clears it, so git's difftool applies.
@@ -144,6 +150,7 @@ impl Change {
     pub fn apply(&self, cfg: &mut UserConfig) {
         match self {
             Change::Theme(theme) => cfg.theme = *theme,
+            Change::AppIcon(icon) => cfg.desktop.app_icon = Some(*icon),
             Change::Editor(editor) => cfg.editor = editor.clone(),
             Change::DiffTool(diff_tool) => cfg.diff_tool = diff_tool.clone(),
         }
@@ -484,6 +491,14 @@ impl GeneralForm {
         }
     }
 
+    /// The app icon the control shows: the one being saved, else the file's.
+    pub fn app_icon(&self) -> AppIcon {
+        match &self.pending {
+            Some(Change::AppIcon(icon)) => *icon,
+            _ => self.saved.as_ref().map(|p| p.app_icon).unwrap_or_default(),
+        }
+    }
+
     /// The installed tools arrived (detected off the UI thread).
     pub fn set_detected(&mut self, detected: DetectedTools) {
         self.detected = detected;
@@ -629,6 +644,23 @@ impl GeneralForm {
         self.choose_theme(next)
     }
 
+    /// Pick an app icon: the change to write, or `None` when it is already
+    /// the file's or the form can't save.
+    pub fn choose_app_icon(&mut self, icon: AppIcon) -> Option<Change> {
+        if !self.editable() || self.app_icon() == icon {
+            return None;
+        }
+        self.begin(Change::AppIcon(icon))
+    }
+
+    /// The app icon `steps` places from the shown one, wrapping (a
+    /// segmented control's ←/→), in [`AppIcon::ALL`]'s order.
+    pub fn step_app_icon(&mut self, steps: isize) -> Option<Change> {
+        let all = AppIcon::ALL;
+        let at = all.iter().position(|i| *i == self.app_icon()).unwrap_or(0) as isize;
+        self.choose_app_icon(all[(at + steps).rem_euclid(all.len() as isize) as usize])
+    }
+
     /// Start typing the editor command, from the shown override.
     pub fn begin_edit(&mut self) -> bool {
         self.begin_edit_tool(ToolSetting::Editor)
@@ -749,7 +781,7 @@ mod tests {
             Ok(Preferences {
                 theme,
                 editor: editor.map(ToolChoice::from),
-                diff_tool: None,
+                ..Preferences::default()
             }),
             env.map(str::to_string),
         );
@@ -832,7 +864,7 @@ mod tests {
         assert_eq!(f.theme(), ThemePreference::Dark);
         f.saved_result(Ok(written(ThemePreference::Dark, None)));
         // An external edit read later is taken.
-        f.load(Ok(Preferences { theme: ThemePreference::Light, editor: Some("zed".into()), diff_tool: None }), None);
+        f.load(Ok(Preferences { theme: ThemePreference::Light, editor: Some("zed".into()), ..Preferences::default() }), None);
         assert_eq!((f.theme(), f.editor()), (ThemePreference::Light, Some("zed")));
     }
 
@@ -850,6 +882,27 @@ mod tests {
         Change::DiffTool(Some("difft".into())).apply(&mut cfg);
         assert_eq!((cfg.editor.as_ref(), cfg.diff_tool.as_ref()), (None, Some(&"difft".into())));
         assert_eq!(cfg.desktop.terminal_font_size, Some(15));
+        Change::AppIcon(AppIcon::RacingS).apply(&mut cfg);
+        assert_eq!(cfg.desktop.app_icon, Some(AppIcon::RacingS));
+        assert_eq!((cfg.diff_tool.as_ref(), cfg.desktop.terminal_font_size), (Some(&"difft".into()), Some(15)));
+    }
+
+    #[test]
+    fn an_app_icon_shows_pending_then_saved_and_steps_wrap() {
+        let mut f = loaded(ThemePreference::Auto, None, None);
+        assert_eq!(f.app_icon(), AppIcon::CommandGrille, "unset is Command Grille");
+        assert_eq!(f.choose_app_icon(AppIcon::CommandGrille), None, "already the file's");
+        assert_eq!(f.step_app_icon(-1), Some(Change::AppIcon(AppIcon::RacingS)), "← wraps to the last");
+        assert_eq!((f.app_icon(), f.status()), (AppIcon::RacingS, &SaveStatus::Saving));
+        assert_eq!(f.choose_app_icon(AppIcon::Retro), None, "one save at a time");
+        let mut cfg = UserConfig::default();
+        cfg.desktop.app_icon = Some(AppIcon::RacingS);
+        f.saved_result(Ok(cfg));
+        assert_eq!((f.app_icon(), f.status()), (AppIcon::RacingS, &SaveStatus::Saved));
+        assert_eq!(f.step_app_icon(1), Some(Change::AppIcon(AppIcon::CommandGrille)), "→ wraps to the first");
+        // A failed write goes back to what the file holds.
+        f.saved_result(Err("disk full".into()));
+        assert_eq!(f.app_icon(), AppIcon::RacingS);
     }
 
     fn detected() -> DetectedTools {

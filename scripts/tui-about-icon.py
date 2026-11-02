@@ -2,8 +2,9 @@
 """Generate the TUI About screen's half-block app icons.
 
 Reads each desktop app icon as the app draws it (`desktop/assets/icon/`:
-Command Grille's `command-grille-512.png`, rendered from its layered
-source, and Retro's 1024px master `retro-1024.png`), crops it to the tile
+Command Grille's `command-grille-512.png` and Racing S's
+`racing-s-512.png`, each rendered from its layered source, and Retro's
+1024px master `retro-1024.png`), crops it to the tile
 (dropping the macOS padding and the soft shadow, which only waste cells in a
 terminal), box-filters it down to SIZE x SIZE pixels with premultiplied alpha,
 and writes `crates/shelbi-tui/src/overlay/about_icon.rs`: a table per icon,
@@ -17,7 +18,8 @@ Standard library only (a small PNG reader), so it runs anywhere:
 
 `desktop/scripts/app-icon.sh` runs it after regenerating the icons (see
 desktop/assets/icon/README.md). `--preview out.png` also writes each table
-scaled up (`out-command-grille.png`, `out-retro.png`), for checking by eye.
+scaled up (`out-command-grille.png`, `out-retro.png`,
+`out-racing-s.png`), for checking by eye.
 """
 
 import argparse
@@ -37,6 +39,7 @@ ICONS = os.path.join(ROOT, "desktop", "assets", "icon")
 MASTERS = [
     ("COMMAND_GRILLE", "command-grille", os.path.join(ICONS, "command-grille-512.png")),
     ("RETRO", "retro", os.path.join(ICONS, "retro-1024.png")),
+    ("RACING_S", "racing-s", os.path.join(ICONS, "racing-s-512.png")),
 ]
 OUT = os.path.join(ROOT, "crates", "shelbi-tui", "src", "overlay", "about_icon.rs")
 
@@ -144,8 +147,8 @@ def write_rust(tables, size):
     lines = [
         "//! The app icons as half-block pixel art, for the About screen: generated",
         "//! by `scripts/tui-about-icon.py` from the desktop app's icons as it draws",
-        "//! them (`desktop/assets/icon/command-grille-512.png` and",
-        "//! `retro-1024.png`), cropped to the tile and box-filtered to",
+        "//! them (`desktop/assets/icon/command-grille-512.png`, `retro-1024.png`",
+        "//! and `racing-s-512.png`), cropped to the tile and box-filtered to",
         f"//! {size} x {size}. Regenerate it, never edit it by hand.",
         "",
         "/// The icons' width and height, in pixels (cells are one pixel wide and",

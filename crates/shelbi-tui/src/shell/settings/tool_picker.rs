@@ -573,7 +573,7 @@ mod tests {
 
     fn form() -> GeneralForm {
         let mut f = GeneralForm::default();
-        f.load(Ok(Preferences { theme: ThemePreference::Dark, editor: None, diff_tool: None }), Some("nvim".into()));
+        f.load(Ok(Preferences { theme: ThemePreference::Dark, ..Preferences::default() }), Some("nvim".into()));
         f.set_detected(super::super::fixture_detected());
         f
     }
