@@ -335,9 +335,11 @@ pub struct ProjectItem {
 }
 
 /// An on-disk edit target that exists for this project.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EditItem {
+    #[serde(default = "crate::wire::default_edit_target")]
     pub target: EditTarget,
+    #[serde(default)]
     pub title: String,
 }
 

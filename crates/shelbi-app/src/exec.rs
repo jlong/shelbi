@@ -82,7 +82,8 @@ pub enum Effect {
 }
 
 /// An editable on-disk target the palette's `edit:*` commands open.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EditTarget {
     /// The project settings YAML.
     Project,

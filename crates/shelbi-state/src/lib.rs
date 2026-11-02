@@ -2982,7 +2982,7 @@ pub fn task_path(project: &str, id: &str) -> Result<PathBuf> {
     Ok(tasks_dir(project)?.join(format!("{id}.md")))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IssueFile {
     pub task: Issue,
     pub body: String,

@@ -18,8 +18,13 @@ use std::collections::HashMap;
 /// views.
 /// [`View::Session`] is a terminal view bound to a session by name — the
 /// orchestrator chat, a workspace agent, or a review editor/diff session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Defaults to [`View::Issues`], the same view
+/// [`View::default_for_project`] lands on.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum View {
+    #[default]
     Issues,
     /// The project's changelog: what has shipped ([`crate::changelog`]).
     Changelog,

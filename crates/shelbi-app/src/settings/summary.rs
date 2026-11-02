@@ -6,6 +6,8 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::command::EditItem;
 
 use super::general::Preferences;
@@ -49,21 +51,32 @@ pub struct GlobalSummary {
 }
 
 /// The shown project's settings.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable for the remote window's query service (`crate::wire` pins the
+/// JSON shape). `settings_dir` is a path on the machine that read it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectSummary {
+    #[serde(default)]
     pub project: String,
+    #[serde(default)]
     pub label: String,
     /// Where its settings (agents, workflows, statuses) live.
+    #[serde(default)]
     pub settings_dir: PathBuf,
     /// They live in the repository (`<repo>/.shelbi`), shared through Git.
+    #[serde(default)]
     pub in_repo: bool,
     /// Its workflows and statuses, or why they don't read.
+    #[serde(default = "crate::wire::ok_default")]
     pub workflows: Result<(usize, usize), String>,
     /// Its agents, or why they don't list.
+    #[serde(default = "crate::wire::ok_default")]
     pub agents: Result<usize, String>,
     /// The machines it runs agents on.
+    #[serde(default)]
     pub machines: usize,
     /// The files Open in editor offers, the palette's edit targets.
+    #[serde(default)]
     pub edit_targets: Vec<EditItem>,
 }
 

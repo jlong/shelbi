@@ -35,6 +35,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
+use serde::{Deserialize, Serialize};
 use shelbi_core::{Column, StatusCategory, DEFAULT_WORKFLOW_NAME};
 use shelbi_state::{events_log_path, WorkspaceState};
 
@@ -83,7 +84,12 @@ pub fn category_tone(category: StatusCategory) -> Tone {
 /// variant so the renderer can fall back to the original text if a
 /// later format change introduces a shape we don't recognize — nothing
 /// in the file should ever be silently dropped.
-#[derive(Debug, Clone)]
+///
+/// Serializable for the remote window's query service. Every variant field
+/// decodes when missing (the identity enums fall back to the defaults in
+/// `crate::wire`), so a field added later never breaks an older peer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Event {
     /// A task transition. Carries the workflow-aware fields documented in
     /// `Plans/workflows.md` §10 (`workflow=`, `from_category=`,
@@ -92,31 +98,48 @@ pub enum Event {
     /// [`DEFAULT_WORKFLOW_NAME`] and the categories are derived from the
     /// canonical 5-status column-to-category map.
     Issue {
+        #[serde(default)]
         ts: DateTime<Utc>,
         /// The `project=` scope the line carried, if any.
+        #[serde(default)]
         project: Option<String>,
+        #[serde(default)]
         id: String,
+        #[serde(default)]
         workflow: String,
+        #[serde(default = "crate::wire::default_column")]
         from: Column,
+        #[serde(default = "crate::wire::default_column")]
         to: Column,
+        #[serde(default)]
         reason: String,
         /// Agent name embedded in the `reason=` field as `_agent=<name>`
         /// — set by `shelbi task start` when it spawns a workspace with a
         /// specific agent loaded. `None` for events without the segment
         /// (older lines from before this field was emitted, plus
         /// transitions that don't spawn an agent).
+        #[serde(default)]
         agent: Option<String>,
+        #[serde(default = "crate::wire::default_category")]
         from_category: StatusCategory,
+        #[serde(default = "crate::wire::default_category")]
         to_category: StatusCategory,
+        #[serde(default)]
         raw: String,
     },
     Workspace {
+        #[serde(default)]
         ts: DateTime<Utc>,
         /// The `project=` scope the line carried, if any.
+        #[serde(default)]
         project: Option<String>,
+        #[serde(default)]
         name: String,
+        #[serde(default)]
         prev: Option<WorkspaceState>,
+        #[serde(default = "crate::wire::default_workspace_state")]
         new: WorkspaceState,
+        #[serde(default)]
         raw: String,
     },
     /// A `shelbi zen dry-run` preview decision — recorded but never
@@ -124,12 +147,18 @@ pub enum Event {
     /// tell at a glance these rows reflect what Zen *would* have done,
     /// not a real state change.
     ZenDryRun {
+        #[serde(default)]
         ts: DateTime<Utc>,
         /// The `project=` scope the line carried, if any.
+        #[serde(default)]
         project: Option<String>,
+        #[serde(default)]
         task_id: String,
+        #[serde(default)]
         action: String,
+        #[serde(default)]
         detail: String,
+        #[serde(default)]
         raw: String,
     },
     /// Hub-poller heartbeat — `<ts> project=<name> heartbeat`. The
@@ -140,8 +169,11 @@ pub enum Event {
     /// keep the parsed variant so the raw line survives any future
     /// "show internal events" toggle, then filter it out at render time.
     Heartbeat {
+        #[serde(default)]
         ts: DateTime<Utc>,
+        #[serde(default)]
         project: String,
+        #[serde(default)]
         raw: String,
     },
     /// A classified system / infra event: everything that isn't a task
@@ -157,7 +189,9 @@ pub enum Event {
     /// timestamp stripped, relative time on the right) so nothing vanishes
     /// and nothing shows raw wire syntax with a full timestamp.
     Unknown {
+        #[serde(default)]
         ts: Option<DateTime<Utc>>,
+        #[serde(default)]
         raw: String,
     },
 }
@@ -165,7 +199,8 @@ pub enum Event {
 /// The classified kind of a [`SystemEvent`]. Drives both the renderer's
 /// per-kind verb/glyph choice and — together with the event's target and
 /// status — the fold key that collapses a flapping infra loop into one row.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SystemKind {
     /// `ssh reverse-forward host=… status=…` — a reverse-tunnel attempt.
     Ssh,
@@ -203,6 +238,7 @@ pub enum SystemKind {
     PaneDeath,
     /// A project-scoped verb we don't model individually — still rendered
     /// as a clean human row (verb + humanized detail), never raw.
+    #[default]
     Other,
 }
 
@@ -213,7 +249,8 @@ pub enum SystemKind {
 /// together with `kind`; `detail` is the volatile tail and is excluded
 /// from that key so a flapping loop still collapses when only its detail
 /// text jitters.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SystemEvent {
     pub ts: DateTime<Utc>,
     pub kind: SystemKind,
@@ -254,7 +291,8 @@ impl Event {
 }
 
 /// Cached subset of an issue's frontmatter that the feed renders.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct TaskMeta {
     pub title: String,
     pub branch: Option<String>,
@@ -280,15 +318,22 @@ pub struct TaskMeta {
 /// view (`GitHubStore::get` per event, id-search + issue-fetch per tick, no
 /// negative cache) and the per-sweep `id-search` re-run the sidebar-never-loads
 /// rework flagged (a short-TTL miss going stale every 15s, forever).
-#[derive(Debug, Clone)]
+///
+/// Serializable with the rest of [`ActivityData`]. `fetched` is a monotonic
+/// [`Instant`], meaningless off the machine that took it, so it stays off the
+/// wire and a decoded entry counts as resolved when it was decoded.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskCacheEntry {
     /// Resolved metadata, or `None` for a confirmed miss (negative cache).
+    #[serde(default)]
     pub meta: Option<TaskMeta>,
     /// Task-file modification time on the filesystem backend; `None` for a
     /// backend with no local task file (the TTL path takes over then).
+    #[serde(default)]
     pub(crate) mtime: Option<SystemTime>,
     /// When this entry was last resolved from the store — drives the TTL refresh
     /// for entries that have no `mtime` to compare against (and every miss).
+    #[serde(skip, default = "Instant::now")]
     pub(crate) fetched: Instant,
     /// Whether the resolved issue sits in a terminal (done/canceled) column. A
     /// resolved terminal issue is **frozen**: closed history doesn't change, so
@@ -297,6 +342,7 @@ pub struct TaskCacheEntry {
     /// done-history refetch loop (sidebar-never-loads incident). `false` for a
     /// miss (frozen on its own rule) and for open issues (which keep the short
     /// TTL so edits show up).
+    #[serde(default)]
     pub(crate) terminal: bool,
 }
 
@@ -326,7 +372,11 @@ const FETCH_BACKOFF_MAX: Duration = Duration::from_secs(600);
 /// newest) and the title snapshot the feed renders from. Read off the UI
 /// thread ([`read_activity_data`], [`read_activity_window`]) and handed to the
 /// client to fold in.
-#[derive(Debug, Clone, Default)]
+///
+/// Serializable for the remote window's query service (`crate::wire` pins the
+/// JSON shape); `#[serde(default)]` so a field added later still decodes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ActivityData {
     pub events: Vec<Event>,
     pub task_cache: TaskCache,

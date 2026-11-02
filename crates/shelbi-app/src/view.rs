@@ -14,6 +14,7 @@
 
 use std::collections::{BTreeSet, HashMap};
 
+use serde::{Deserialize, Serialize};
 use shelbi_core::{Column, Machine, MachineKind, Reachability, StatusCategory, WorkspaceSpec};
 use shelbi_palette::{Decoration, DecorationColor};
 use shelbi_state::machine_state::MachineRecord;
@@ -39,7 +40,13 @@ use crate::theme::Tone;
 /// line, unread-errors count). The board-derived parts are pure functions over
 /// an already-read board slice; the disk-derived parts (badges, review
 /// serving-markers, version probe) are filled by the host that owns IO.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable, like every read model a client draws, so the remote window's
+/// query service can send it from the far machine (`crate::wire` pins the JSON
+/// shape). `#[serde(default)]` throughout: a field added later still decodes
+/// from JSON that lacks it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SidebarModel {
     pub project_label: String,
     pub nav: Vec<NavItem>,
@@ -88,14 +95,16 @@ pub struct SidebarModel {
 }
 
 /// A fixed nav builtin (Chat / Issues / Changelog).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct NavItem {
     pub label: String,
     pub view: View,
 }
 
 /// A dev workspace row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WorkspaceRow {
     pub name: String,
     /// The machine this workspace lives on — used to group rows under a
@@ -112,7 +121,8 @@ pub struct WorkspaceRow {
 }
 
 /// A review-column task row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReviewRow {
     pub task_id: String,
     pub title: String,
@@ -134,7 +144,11 @@ pub struct ReviewRow {
 /// data twin of the former tmux-runtime `WorkspaceBadge`; the glyph + colour
 /// are the single source both the sidebar renderer and the palette consume so
 /// the two surfaces can't drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Defaults to [`WorkspaceBadge::Loading`]: a row decoded without a badge
+/// shows "state not read yet", never a made-up state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkspaceBadge {
     /// ⏵ — the agent is actively running a turn.
     Working,
@@ -149,6 +163,7 @@ pub enum WorkspaceBadge {
     /// … — state not read yet: the row comes from the project's config (a
     /// cold project switch paints its workspace rows before the first board /
     /// status read lands), and the real badge replaces it within ~one refresh.
+    #[default]
     Loading,
 }
 
@@ -188,7 +203,11 @@ impl WorkspaceBadge {
 /// and `Loading` both read "Ready for Review" (the slot is already assigned —
 /// serving shows a ✓, loading a ▶ with no ✓ yet); `Pending` reads "Queued for
 /// Review" (no slot yet).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Defaults to [`ReviewState::Pending`], the state that claims nothing about a
+/// slot or a server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReviewState {
     /// The review slot's dev server is confirmed up. Ready for Review, ✓, with
     /// the `machine:port` location.
@@ -197,6 +216,7 @@ pub enum ReviewState {
     /// Ready for Review, ▶, no ✓ and no location yet.
     Loading,
     /// In Review but not yet assigned to any review slot. Queued for Review, ·.
+    #[default]
     Pending,
 }
 
@@ -1096,7 +1116,10 @@ fn card_for(
 /// workspace that lives on it (review slots included). Shared by the TUI's
 /// machines view and the desktop's; `shelbi_orchestrator::machines_model`
 /// reads the inputs and [`MachinesModel::build`] maps them.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// Serializable for the remote window (see [`SidebarModel`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MachinesModel {
     /// The project's display name (or label), for the view's title.
     pub display_name: Option<String>,
@@ -1104,18 +1127,24 @@ pub struct MachinesModel {
 }
 
 /// A machine and the workspaces on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineRow {
+    #[serde(default)]
     pub name: String,
+    #[serde(default = "crate::wire::default_machine_kind")]
     pub kind: MachineKind,
     /// SSH host, when this is a remote machine.
+    #[serde(default)]
     pub host: Option<String>,
+    #[serde(default)]
     pub is_local: bool,
     /// Capability tags declared on the machine.
+    #[serde(default)]
     pub tags: Vec<String>,
     /// The resolved remote `shelbi` binary (path + version) once `shelbi
     /// machine setup` has run for it. `None` for a local machine or a remote
     /// not set up yet.
+    #[serde(default)]
     pub remote: Option<MachineRecord>,
     /// Live reachability, folded in from a [`ReachabilityProber`]
     /// (`fold_reachability`). A local machine is the hub itself: always
@@ -1123,12 +1152,15 @@ pub struct MachineRow {
     /// [`Reachability::Unknown`] ("checking…") until its first probe lands.
     ///
     /// [`ReachabilityProber`]: crate::reachability::ReachabilityProber
+    #[serde(default)]
     pub reachability: Reachability,
+    #[serde(default)]
     pub workspaces: Vec<MachineWorkspace>,
 }
 
 /// A workspace under its machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MachineWorkspace {
     pub name: String,
     /// Whether this is a `review`-tagged slot.
@@ -1175,9 +1207,11 @@ impl MachineWorkspace {
 }
 
 /// A workspace's assignment, matching `shelbi workspace list`'s STATE cell.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SlotAssignment {
     /// Nothing assigned.
+    #[default]
     Idle,
     /// In-progress task(s) assigned to it (normally one; more means the board
     /// diverged, and the cell shows them all).
@@ -1208,7 +1242,8 @@ impl SlotAssignment {
 }
 
 /// A review slot's server: whether it is up and where.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReviewSlot {
     pub task_id: String,
     /// [`ReviewState::Serving`] once the server is confirmed up, else

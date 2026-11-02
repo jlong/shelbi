@@ -19,6 +19,8 @@
 
 use std::collections::{BTreeMap, HashSet};
 
+use serde::{Deserialize, Serialize};
+
 use shelbi_core::{
     default_project_statuses, default_workflow, Issue, ProjectStatuses, StatusCategory, Workflow,
     DEFAULT_WORKFLOW_NAME,
@@ -630,47 +632,69 @@ pub fn next_workflow_filter(workflows: &[Workflow], current: Option<&str>) -> Op
 // ---------------------------------------------------------------------------
 
 /// The project-level fields a board read carries.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoardProject {
+    #[serde(default)]
     pub default_workflow_name: String,
+    #[serde(default)]
     pub display_name: Option<String>,
+    #[serde(default)]
     pub workspaces: Vec<String>,
     /// The tracker-ownership gate cards are marked against
     /// ([`shelbi_state::ownership`]): unrestricted on a filesystem board.
+    /// Decodes as [`OwnershipGate::FailClosed`] when missing, the same
+    /// fallback [`read_open_board`] uses when the gate can't be read.
+    #[serde(default = "crate::wire::fail_closed")]
     pub ownership: OwnershipGate,
     /// The tracker can search its issues remotely (a GitHub board), so the
     /// board's text search asks it ([`crate::board_search`]).
+    #[serde(default)]
     pub remote_search: bool,
 }
 
 /// How the open-board read went.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BoardOutcome {
     /// `issue_store_for` or `read_board_report` failed; a ready-to-show message.
     Failed(String),
     /// No index published yet: paint the column chrome with a loading state
     /// until the daemon fills it.
-    Cold { banner: Option<String> },
+    Cold {
+        #[serde(default)]
+        banner: Option<String>,
+    },
     /// A warm or stale read of the **open** board. Terminal history is read
     /// separately ([`read_closed_page`]).
     Warm {
+        #[serde(default)]
         banner: Option<String>,
+        #[serde(default)]
         base_tasks: Vec<IssueFile>,
     },
 }
 
 /// Everything one open-board refresh reads, produced off the UI thread by
 /// [`read_open_board`] and folded in on it.
-#[derive(Debug, Clone)]
+///
+/// Serializable for the remote window's query service (`crate::wire` pins the
+/// JSON shape). Every field decodes when missing: an absent `board` reads as
+/// [`BoardOutcome::Cold`], the loading state, never as an empty board.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoardRead {
     /// `None` when the project YAML couldn't be read.
+    #[serde(default)]
     pub project: Option<BoardProject>,
     /// The project state (persisted workspace filter, column overrides).
+    #[serde(default)]
     pub state_snapshot: Option<shelbi_state::State>,
     /// The loaded workflows, or the load error for the status line.
+    #[serde(default = "crate::wire::ok_default", with = "crate::wire::workflows")]
     pub workflows: Result<Vec<Workflow>, String>,
     /// `statuses.yaml`, or the load error for the status line.
+    #[serde(default = "crate::wire::ok_default")]
     pub project_statuses: Result<ProjectStatuses, String>,
+    #[serde(default = "crate::wire::cold_board")]
     pub board: BoardOutcome,
 }
 
@@ -725,8 +749,10 @@ pub fn read_open_board(project: &str) -> BoardRead {
     }
 }
 
-/// One page of terminal `done`/`canceled` history.
-#[derive(Debug, Clone)]
+/// One page of terminal `done`/`canceled` history. Serializable for the remote
+/// window's query service.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ClosedPage {
     pub issues: Vec<IssueFile>,
     /// Cursor for the next page; `None` when this is the whole history.

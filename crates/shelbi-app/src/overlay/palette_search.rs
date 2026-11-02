@@ -21,6 +21,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use shelbi_core::{ProjectStatuses, StatusCategory};
 use shelbi_palette::{Entry, EntryKind, Scorer};
 use shelbi_state::IssueFile;
@@ -146,7 +147,11 @@ impl ResultKind {
 // ---------------------------------------------------------------------------
 
 /// One issue as the palette searches and draws it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable with [`SearchCorpus`]. The lowercased body is derived, so it
+/// stays off the wire and decoding rebuilds it ([`IssueDocWire`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "IssueDocWire")]
 pub struct IssueDoc {
     pub id: String,
     pub title: String,
@@ -155,7 +160,30 @@ pub struct IssueDoc {
     pub status: String,
     pub category: StatusCategory,
     /// `body` lowercased once, for the word search.
+    #[serde(skip_serializing)]
     body_lower: String,
+}
+
+/// [`IssueDoc`]'s JSON form: every field but the derived lowercased body,
+/// each defaulted so a field added later still decodes.
+#[derive(Deserialize)]
+struct IssueDocWire {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default = "crate::wire::default_category")]
+    category: StatusCategory,
+}
+
+impl From<IssueDocWire> for IssueDoc {
+    fn from(w: IssueDocWire) -> Self {
+        IssueDoc::new(w.id, w.title, w.body, w.status, w.category)
+    }
 }
 
 impl IssueDoc {
@@ -211,7 +239,11 @@ pub fn issue_docs(tasks: &[IssueFile], statuses: &ProjectStatuses, rules: BoardR
 
 /// Everything the palette's search looks through besides the commands.
 /// Cheap to clone (shared), so each query hands the worker the same data.
-#[derive(Debug, Clone, Default)]
+///
+/// Serializable for the remote window's query service (`crate::wire` pins the
+/// JSON shape); the `Arc`s serialize as the plain lists they hold.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SearchCorpus {
     pub issues: Arc<Vec<IssueDoc>>,
     pub changelog: Arc<Vec<ChangelogEntryView>>,

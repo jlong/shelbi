@@ -23,7 +23,9 @@ shelbi-client = { workspace = true }
 # The askpass dialog and its deadline for the connections a user starts
 # (`launch::ssh`). No UI toolkit: osascript runs as a child process.
 shelbi-ssh = { workspace = true }
-serde = { workspace = true }
+# `rc`: `SearchCorpus` shares its documents in `Arc`s and serializes them
+# for the remote window's query service (the feature is already in the tree).
+serde = { workspace = true, features = ["rc"] }
 # Contact Us's request body and the remembered name and email.
 serde_json = { workspace = true }
 chrono = { workspace = true }

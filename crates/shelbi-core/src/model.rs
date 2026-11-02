@@ -1632,7 +1632,8 @@ pub enum MachineKind {
 /// its `ssh <host>` label. Produced by the background prober
 /// (`shelbi_orchestrator::machine::probe_reachability`); a local machine is always reachable and never
 /// probed, so this only ever describes a remote.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Reachability {
     /// Not probed yet (startup), or a probe is in flight — the initial state the
     /// view shows as "checking".
@@ -1642,7 +1643,10 @@ pub enum Reachability {
     Reachable,
     /// The last probe failed; carries a short human reason (SSH timeout, auth
     /// failure, connection refused, …) so the view can show *why*.
-    Unreachable { error: String },
+    Unreachable {
+        #[serde(default)]
+        error: String,
+    },
 }
 
 /// How the hub exposes its daemon socket to a remote machine via SSH.
@@ -2165,7 +2169,7 @@ impl<'de> serde::Deserialize<'de> for Column {
 
 /// One Kanban card. Position within a column is given by `priority`
 /// (0 = top); the storage layer keeps these contiguous within each column.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Issue {
     pub id: String,
     pub title: String,

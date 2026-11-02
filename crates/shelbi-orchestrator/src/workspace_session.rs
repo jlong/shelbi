@@ -75,7 +75,12 @@ fn in_progress_task_for(
 
 /// Everything a client's workspace view shows about a workspace, on any
 /// machine: where it lives, its worktree, and the task it is working.
-#[derive(Debug, Clone)]
+///
+/// Serializable for the remote window's query service, which resolves it on
+/// the far machine; `#[serde(default)]` so a field added later still decodes.
+/// The JSON shape is pinned by `workspace_details_json_shape_is_pinned`.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct WorkspaceDetails {
     /// The machine the workspace is declared on.
     pub machine: String,
@@ -389,6 +394,63 @@ pub fn close_user_shell(project_name: &str, workspace: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `WorkspaceDetails` is a remote-window wire type: pin its JSON shape,
+    /// decode it back equal, and decode `{}` (every field defaults).
+    #[test]
+    fn workspace_details_json_shape_is_pinned() {
+        let task: shelbi_state::IssueFile = serde_json::from_value(serde_json::json!({
+            "task": {
+                "id": "t-1",
+                "title": "Fix it",
+                "column": "in_progress",
+                "priority": 0,
+                "created_at": "2026-11-02T10:00:00Z",
+                "updated_at": "2026-11-02T10:00:00Z"
+            },
+            "body": "The body."
+        }))
+        .unwrap();
+        let details = WorkspaceDetails {
+            machine: "devbox".into(),
+            is_remote: true,
+            worktree: "/srv/shelbi/.shelbi/wt/alpha".into(),
+            remote_address: Some("jlong@devbox:/srv/shelbi/.shelbi/wt/alpha".into()),
+            editor_name: "Helix".into(),
+            apps: shelbi_state::AppTools {
+                editor: false,
+                diff: true,
+            },
+            branch: Some("jlong/t-1".into()),
+            task: Some(Box::new(task)),
+        };
+        let expected = serde_json::json!({
+            "machine": "devbox",
+            "is_remote": true,
+            "worktree": "/srv/shelbi/.shelbi/wt/alpha",
+            "remote_address": "jlong@devbox:/srv/shelbi/.shelbi/wt/alpha",
+            "editor_name": "Helix",
+            "apps": { "editor": false, "diff": true },
+            "branch": "jlong/t-1",
+            "task": {
+                "task": {
+                    "id": "t-1",
+                    "title": "Fix it",
+                    "column": "in_progress",
+                    "priority": 0,
+                    "created_at": "2026-11-02T10:00:00Z",
+                    "updated_at": "2026-11-02T10:00:00Z"
+                },
+                "body": "The body."
+            }
+        });
+        assert_eq!(serde_json::to_value(&details).unwrap(), expected);
+        let back: WorkspaceDetails = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, details);
+
+        let empty: WorkspaceDetails = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, WorkspaceDetails::default());
+    }
 
     /// A remote content session runs under the remote login shell (for its
     /// `PATH`), with the command quoted whole.

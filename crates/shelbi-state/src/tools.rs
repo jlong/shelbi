@@ -130,7 +130,8 @@ impl ToolChoice {
 /// Which of a workspace's Edit and View Diff entries open in an app instead
 /// of a pane. A client's panel reads it to launch the app and keep the
 /// current view, rather than switch to a pane.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppTools {
     /// `editor:` is an app.
     pub editor: bool,
