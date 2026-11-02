@@ -21,8 +21,14 @@
 //!
 //! The segmented control ([`segmented`]) is a field's box holding its
 //! choices, the chosen one a chip in [`Theme::segment`] (the desktop's
-//! canvas chip, as Contact Us's), the others on the track alone: the
-//! pointer lifts no segment.
+//! canvas chip, as Contact Us's) between half-block caps ([`chip`]), the
+//! others on the track alone: the pointer lifts no segment.
+//!
+//! ```text
+//!   ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
+//!     Auto  ▐ Dark ▌  Light
+//!   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+//! ```
 //!
 //! [`Theme::segment`]: shelbi_app::theme::Theme::segment
 
@@ -278,9 +284,10 @@ pub(crate) fn beside(left: [Line<'static>; 3], right: [Line<'static>; 3], width:
 }
 
 /// A segmented control in `width` columns: a field's box holding `labels`,
-/// `chosen` a chip in the segment fill (bold and strong while the control has
-/// the keyboard), the others on the track (the pointer lifts none). Returns
-/// its three lines and each segment's column and width.
+/// `chosen` a [`chip`] in the segment fill (bold and strong while the control
+/// has the keyboard), the others on the track (the pointer lifts none).
+/// Returns its three lines and each segment's column and width (a chip's
+/// caps included).
 pub(crate) fn segmented(labels: &[&str], chosen: usize, focused: bool, width: usize) -> ([Line<'static>; 3], Vec<(u16, u16)>) {
     segmented_in(labels, chosen, focused, width, palette().segment)
 }
@@ -301,23 +308,21 @@ pub(crate) fn segmented_in(
     let mut at = Vec::new();
     let mut x = 1;
     for (i, label) in labels.iter().enumerate() {
+        // Every segment leaves a column each side for the chosen one's caps,
+        // so choosing doesn't shift the others.
         let text = format!(" {label} ");
-        let w = panel::display_width(&text);
+        let w = panel::display_width(&text) + 2;
         if x + w + 1 > width {
             break;
         }
-        let style = if i == chosen {
+        if i == chosen {
             // The desktop's canvas chip on its track, as Contact Us draws it.
-            let s = Style::default().bg(chosen_fill).fg(p.white);
-            if focused {
-                s.add_modifier(Modifier::BOLD)
-            } else {
-                s
-            }
+            let s = Style::default().fg(p.white);
+            let s = if focused { s.add_modifier(Modifier::BOLD) } else { s };
+            spans.extend(chip(text, s, chosen_fill, track));
         } else {
-            on_track.fg(p.foreground)
-        };
-        spans.push(Span::styled(text, style));
+            spans.push(Span::styled(format!(" {text} "), on_track.fg(p.foreground)));
+        }
         at.push((x as u16, w as u16));
         x += w;
     }
@@ -325,6 +330,15 @@ pub(crate) fn segmented_in(
     x += 1;
     let (above, below) = textbox::caps(x, track);
     ([above, Line::from(spans), below], at)
+}
+
+/// A chosen segment's chip on its control's `track`: `text` in `style` on
+/// `fill` between `▐` and `▌`, whose foreground is the fill and background
+/// the track, so the chip reads as one rounded pill (the table's lit row).
+/// Two columns wider than `text`.
+pub(crate) fn chip(text: String, style: Style, fill: Color, track: Color) -> [Span<'static>; 3] {
+    let cap = Style::default().fg(fill).bg(track);
+    [Span::styled("▐", cap), Span::styled(text, style.bg(fill)), Span::styled("▌", cap)]
 }
 
 /// A badge beside a title (Default, Customized): the desktop's
@@ -587,19 +601,44 @@ mod tests {
     fn a_segmented_control_fills_the_chosen_segment() {
         let (lines, at) = segmented(&["Auto", "Dark", "Light"], 1, false, 40);
         let buf = draw(lines.to_vec(), 40);
-        assert_eq!(text(&buf, 1), "  Auto  Dark  Light");
-        assert_eq!(at, vec![(1, 6), (7, 6), (13, 7)]);
+        assert_eq!(text(&buf, 1), "   Auto  ▐ Dark ▌  Light");
+        assert_eq!(at, vec![(1, 8), (9, 8), (17, 9)]);
         let p = palette();
-        assert_eq!(buf[(8, 1)].bg, p.segment, "the chosen");
+        assert_eq!(buf[(11, 1)].bg, p.segment, "the chosen");
         assert_eq!(buf[(2, 1)].bg, p.input, "the track");
-        assert_eq!(buf[(14, 1)].bg, p.input, "an unchosen segment is the track's");
-        assert_eq!(text(&buf, 0), "▄".repeat(21));
+        assert_eq!(buf[(18, 1)].bg, p.input, "an unchosen segment is the track's");
+        assert_eq!(text(&buf, 0), "▄".repeat(27));
         let (lines, _) = segmented(&["Auto", "Dark", "Light"], 0, true, 40);
         let buf = draw(lines.to_vec(), 40);
         assert_eq!(buf[(0, 1)].bg, p.input_focus, "focus tints the track");
         // Too narrow for every segment: the ones that fit.
-        let (_, at) = segmented(&["Auto", "Dark", "Light"], 0, false, 14);
+        let (_, at) = segmented(&["Auto", "Dark", "Light"], 0, false, 18);
         assert_eq!(at.len(), 2);
+    }
+
+    #[test]
+    fn the_chosen_segments_caps_carry_its_fill_over_the_track() {
+        let p = palette();
+        for (focused, track) in [(false, p.input), (true, p.input_focus)] {
+            for chosen in 0..3 {
+                let (lines, at) = segmented(&["Auto", "Dark", "Light"], chosen, focused, 40);
+                let buf = draw(lines.to_vec(), 40);
+                let (x, w) = at[chosen];
+                let (left, right) = (&buf[(x, 1)], &buf[(x + w - 1, 1)]);
+                assert_eq!((left.symbol(), right.symbol()), ("▐", "▌"));
+                for cap in [left, right] {
+                    assert_eq!((cap.fg, cap.bg), (p.segment, track), "fill over the track");
+                }
+                assert_eq!(buf[(x + 1, 1)].bg, p.segment, "the chip's fill meets its cap");
+                assert_eq!(buf[(x + w - 2, 1)].bg, p.segment);
+            }
+        }
+        // A control drawn in another fill (the palette's filter row) caps
+        // in that fill.
+        let (lines, at) = segmented_in(&["All", "Tasks"], 1, false, 40, p.selection);
+        let buf = draw(lines.to_vec(), 40);
+        assert_eq!(buf[(at[1].0, 1)].fg, p.selection);
+        assert_eq!(buf[(at[1].0 + at[1].1 - 1, 1)].fg, p.selection);
     }
 
     #[test]

@@ -1760,12 +1760,18 @@ mod tests {
         let (buf, _) = draw(&p, 100, 30);
         let text = dump(&buf);
         assert!(
-            text.contains("All 4  Issues 2  Changelog Entries 1  Commands 1"),
+            text.contains("▐ All 4 ▌  Issues 2    Changelog Entries 1    Commands 1"),
             "the chips with their counts: {text}"
         );
-        // The chosen chip is in the selection fill.
+        // The chosen chip is in the selection fill, its caps that fill over
+        // the track.
         let (x, y) = find_cell(&buf, "All 4").unwrap();
         assert_eq!(buf[(x, y)].bg, palette().selection, "the chosen chip");
+        let track = buf[(x - 3, y)].bg;
+        assert_ne!(track, palette().selection);
+        for cap in [&buf[(x - 2, y)], &buf[(x + 6, y)]] {
+            assert_eq!((cap.fg, cap.bg), (palette().selection, track), "{:?}", cap.symbol());
+        }
         let (x, y) = find_cell(&buf, "Issues 2").unwrap();
         assert_ne!(buf[(x, y)].bg, palette().selection);
         // Groups in order, commands first, each under its header.
