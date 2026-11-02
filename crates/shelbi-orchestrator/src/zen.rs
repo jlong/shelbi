@@ -55,7 +55,7 @@ use crate::git::{
     commit_subject, compose_pr_body, gh_pr_merge, locate_hub_workdir, locate_workspace_worktree,
     login_shell_prefix, lookup_merged_pr, lookup_open_pr_in_repository, lookup_origin_repository,
     lookup_origin_repository_selector, lookup_origin_repository_with_push_target,
-    lookup_pr_identity, parse_pr_number_from_url, pr_head_contains_tip, pr_title,
+    lookup_pr_identity, parse_pr_number_from_url, repository_owner_and_name, pr_head_contains_tip, pr_title,
     resolve_branch_tip, run_in_dir, run_login_shell_script_with_deadline, squash_merge_subject,
     MergedPr, RepositoryIdentity,
 };
@@ -656,7 +656,7 @@ fn verify_pr_identity(
     let attempts = head_retry.attempts.max(1);
     let mut last_head_oid = String::new();
     for attempt in 0..attempts {
-        let identity = lookup_pr_identity(host, &wt, &origin_repository.selector, pr)?;
+        let identity = lookup_pr_identity(host, &wt, origin_repository, pr)?;
         verify_task_branch_head(
             host,
             worktree,
@@ -1797,25 +1797,6 @@ fn ci_snapshot(
     })
 }
 
-fn repository_owner_and_name<'a>(
-    repository: &'a RepositoryIdentity,
-    operation: &str,
-) -> Result<(&'a str, &'a str)> {
-    let (owner, name) = repository.name_with_owner.split_once('/').ok_or_else(|| {
-        Error::Other(format!(
-            "GitHub repository `{}` is not in OWNER/REPO form; refusing an ambiguous {operation} query",
-            repository.name_with_owner
-        ))
-    })?;
-    if owner.is_empty() || name.is_empty() || name.contains('/') {
-        return Err(Error::Other(format!(
-            "GitHub repository `{}` is not in OWNER/REPO form; refusing an ambiguous {operation} query",
-            repository.name_with_owner
-        )));
-    }
-    Ok((owner, name))
-}
-
 /// Parse one status-rollup node. Returns `Ok(None)` for an empty/unnamed
 /// rollup placeholder (GitHub occasionally emits `{"name":null,"status":null}`
 /// rows); those are ignored rather than counted as a passing check or treated
@@ -2050,7 +2031,7 @@ pub fn pr_merge(
         ));
     }
 
-    let identity = lookup_pr_identity(&host, &wt, &repository.selector, pr)?;
+    let identity = lookup_pr_identity(&host, &wt, &repository, pr)?;
     if identity.base_ref != expected.base_branch {
         return Err(Error::Other(format!(
             "PR #{pr} targets base `{}`, expected reviewed base `{}`; no ref was updated. \
@@ -3179,6 +3160,46 @@ mod pr_create_tests {
     const ORIGIN_REPOSITORY_NAME: &str = "example/repo";
     const CI_BASE_SHA: &str = "cccccccccccccccccccccccccccccccccccccccc";
 
+    /// Every `gh pr view --json` / `gh pr list --json` field gh 2.46.0 knows
+    /// (Ubuntu's packaged gh, as found on remote Linux machines). Newer gh
+    /// adds fields such as `baseRefOid`; production code must not depend on
+    /// them, so every stub below rejects anything outside this list.
+    const GH_2_46_PR_JSON_FIELDS: &str = "additions,assignees,author,autoMergeRequest,\
+        baseRefName,body,changedFiles,closed,closedAt,comments,commits,createdAt,deletions,\
+        files,headRefName,headRefOid,headRepository,headRepositoryOwner,id,isCrossRepository,\
+        isDraft,labels,latestReviews,maintainerCanModify,mergeCommit,mergeStateStatus,\
+        mergeable,mergedAt,mergedBy,milestone,number,potentialMergeCommit,projectCards,\
+        projectItems,reactionGroups,reviewDecision,reviewRequests,reviews,state,\
+        statusCheckRollup,title,updatedAt,url";
+
+    /// Shell prelude for every `gh` stub: a `pr view`/`pr list` asking for a
+    /// `--json` field gh 2.46.0 lacks fails exactly the way real gh does
+    /// (`Unknown JSON field: "baseRefOid"`, exit 1).
+    fn gh_json_field_guard() -> String {
+        format!(
+            r#"case "$1 $2" in
+  "pr view"|"pr list")
+    prev=
+    for arg in "$@"; do
+      if [ "$prev" = --json ]; then
+        old_ifs=$IFS
+        IFS=,
+        for field in $arg; do
+          case ",{GH_2_46_PR_JSON_FIELDS}," in
+            *",$field,"*) ;;
+            *) printf 'Unknown JSON field: "%s"\n' "$field" >&2; exit 1 ;;
+          esac
+        done
+        IFS=$old_ifs
+      fi
+      prev=$arg
+    done
+    ;;
+esac
+"#
+        )
+    }
+
     struct EnvGuard {
         shell: Option<OsString>,
         home: Option<OsString>,
@@ -3695,8 +3716,19 @@ mod pr_create_tests {
         let q = shelbi_agent::shell_escape;
         let script = format!(
             r#"#!/bin/sh
+{json_guard}
 case "$1 $2" in
-  "api graphql") printf 'api graphql --hostname %s\n' "$4" >> {log} ;;
+  "api graphql")
+    op=unknown
+    number=
+    for arg in "$@"; do
+      case "$arg" in
+        query=*ShelbiPrIdentity*) op=pr-identity ;;
+        number=*) number=${{arg#number=}} ;;
+      esac
+    done
+    printf 'api graphql --hostname %s op=%s number=%s\n' "$4" "$op" "$number" >> {log}
+    ;;
   *) printf '%s\n' "$*" >> {log} ;;
 esac
 case "$1 $2" in
@@ -3711,7 +3743,11 @@ case "$1 $2" in
   "pr list")
     if [ -f {number} ]; then cat {number}; fi
     ;;
-  "pr view")
+  "api graphql")
+    if [ "$op" != pr-identity ]; then
+      printf 'unexpected gh graphql operation: %s\n' "$op" >&2
+      exit 64
+    fi
     if [ -f {head_override} ]; then
       cat {head_override}
     else
@@ -3745,6 +3781,7 @@ case "$1 $2" in
     ;;
 esac
 "#,
+            json_guard = gh_json_field_guard(),
             log = q(&log_file.to_string_lossy()),
             number = q(&number_file.to_string_lossy()),
             head_override = q(&override_file.to_string_lossy()),
@@ -3789,7 +3826,20 @@ esac
         let q = shelbi_agent::shell_escape;
         let script = format!(
             r#"#!/bin/sh
-printf '%s\n' "$*" >> {log}
+{json_guard}
+case "$1 $2" in
+  "api graphql")
+    case "$*" in
+      *ShelbiPrIdentity*) ;;
+      *) printf 'unexpected gh graphql invocation: %s\n' "$*" >&2; exit 64 ;;
+    esac
+    for arg in "$@"; do
+      case "$arg" in number=*) number=${{arg#number=}} ;; esac
+    done
+    printf 'api graphql --hostname %s op=pr-identity number=%s\n' "$4" "$number" >> {log}
+    ;;
+  *) printf '%s\n' "$*" >> {log} ;;
+esac
 case "$1 $2" in
   "repo view")
     printf '%s\n' {origin_repository_id} {origin_repository_name} {origin_repository_url}
@@ -3799,7 +3849,7 @@ case "$1 $2" in
   "pr create")
     printf '%s\n' https://github.com/example/repo/pull/42
     ;;
-  "pr view")
+  "api graphql")
     reads=0
     if [ -f {view_reads} ]; then reads=$(cat {view_reads}); fi
     reads=$((reads + 1))
@@ -3821,6 +3871,7 @@ case "$1 $2" in
     ;;
 esac
 "#,
+            json_guard = gh_json_field_guard(),
             log = q(&log_file.to_string_lossy()),
             view_reads = q(&view_reads.to_string_lossy()),
             lag_reads = lag_reads,
@@ -3937,6 +3988,7 @@ esac
         let q = shelbi_agent::shell_escape;
         let script = format!(
             r#"#!/bin/sh
+{json_guard}
 case "$1 $2" in
   "repo view")
     printf '%s\n' "$*" >> {log}
@@ -3945,9 +3997,6 @@ case "$1 $2" in
   "pr view")
     printf '%s\n' "$*" >> {log}
     case "$*" in
-      *headRefOid,headRefName,baseRefName,baseRefOid,headRepository*)
-        printf '%s\n' {reviewed_head} {task_branch} "$(cat {pr_base})" {reviewed_base} {origin_repository_id} {origin_repository_name}
-        ;;
       *mergeCommit*)
         cat {merge_commit}
         ;;
@@ -3986,12 +4035,18 @@ case "$1 $2" in
           esac
           ;;
         query=*ShelbiCancelPendingMerge*) operation=cancel ;;
+        query=*ShelbiPrIdentity*) operation=pr-identity ;;
         *enablePullRequestAutoMerge*) operation=enable-auto ;;
         id=*|head=*|method=*) fields="$fields $arg" ;;
+        number=*) number_field=" $arg" ;;
       esac
     done
+    if [ "$operation" = pr-identity ]; then fields="$number_field"; fi
     printf 'api graphql op=%s%s\n' "$operation" "$fields" >> {log}
     case "$operation" in
+      pr-identity)
+        printf '%s\n' {reviewed_head} {task_branch} "$(cat {pr_base})" {reviewed_base} {origin_repository_id} {origin_repository_name}
+        ;;
       pending)
         if [ -f {merged_marker} ]; then
           cat {merged_snapshot}
@@ -4035,6 +4090,7 @@ case "$1 $2" in
     ;;
 esac
 "#,
+            json_guard = gh_json_field_guard(),
             log = q(&log_file.to_string_lossy()),
             pr_base = q(&pr_base.to_string_lossy()),
             rules = q(&rules.to_string_lossy()),
@@ -4455,6 +4511,43 @@ esac
         task_branch_head(worktree)
     }
 
+    /// The stubs model gh 2.46.0, which has no `baseRefOid` on `pr view`:
+    /// asking for it must fail the way real gh does, so the existing-PR
+    /// tests below cannot pass on a field older gh rejects.
+    #[test]
+    fn gh_stub_rejects_pr_view_json_fields_old_gh_lacks() {
+        let (_base, origin, _worktree) = setup_repo(true);
+        let stub = tempfile::tempdir().unwrap();
+        install_gh_stub(stub.path(), &origin, Some(379), None);
+        let gh = stub.path().join("bin").join("gh");
+
+        let rejected = Command::new(&gh)
+            .args([
+                "pr",
+                "view",
+                "379",
+                "--json",
+                "headRefOid,headRefName,baseRefName,baseRefOid,headRepository",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(rejected.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&rejected.stderr),
+            "Unknown JSON field: \"baseRefOid\"\n"
+        );
+
+        let listed = Command::new(&gh)
+            .args(["pr", "list", "--json", "number", "--jq", ".[].number"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success(), "{listed:?}");
+        assert_eq!(String::from_utf8_lossy(&listed.stdout), "379\n");
+    }
+
+    /// An already-open PR (e.g. one a workflow's `open_pr` action opened at
+    /// handoff) is reused: its identity, base commit included, is read in a
+    /// form gh 2.46.0 supports, and pr-create reports its number.
     #[test]
     fn stale_open_pr_is_updated_and_verified_before_reuse() {
         let _lock = crate::test_lock::acquire();
@@ -4486,7 +4579,7 @@ esac
         let calls = gh_calls(&log);
         assert!(calls.contains("pr list"), "{calls}");
         assert!(
-            calls.contains("pr view 379 --repo github.com/example/repo --json headRefOid,headRefName,baseRefName,baseRefOid,headRepository"),
+            calls.contains("api graphql --hostname github.com op=pr-identity number=379"),
             "{calls}"
         );
         assert!(!calls.contains("pr create"), "{calls}");
@@ -4532,7 +4625,7 @@ esac
             "{calls}"
         );
         assert!(
-            calls.contains("pr view 379 --repo github.com/example/repo --json headRefOid,headRefName,baseRefName,baseRefOid,headRepository"),
+            calls.contains("api graphql --hostname github.com op=pr-identity number=379"),
             "{calls}"
         );
         assert!(!calls.contains("pr create"), "{calls}");
@@ -4698,7 +4791,7 @@ esac
             "{calls}"
         );
         assert!(
-            calls.contains("pr view 42 --repo github.com/example/repo --json headRefOid,headRefName,baseRefName,baseRefOid,headRepository"),
+            calls.contains("api graphql --hostname github.com op=pr-identity number=42"),
             "{calls}"
         );
     }
@@ -4788,7 +4881,7 @@ esac
         assert_eq!(remote_head(&origin), identity.integration_sha);
         let calls = gh_calls(&log);
         assert!(
-            calls.contains("pr view 21 --repo github.com/example/repo --json headRefOid,headRefName,baseRefName,baseRefOid,headRepository"),
+            calls.contains("api graphql --hostname github.com op=pr-identity number=21"),
             "{calls}"
         );
         assert!(!calls.contains("pr create"), "{calls}");
@@ -4826,7 +4919,7 @@ esac
         assert!(calls.contains("--title initial task work"), "{calls}");
         assert!(!calls.contains("--title replacement task work"), "{calls}");
         assert!(
-            calls.contains("pr view 42 --repo github.com/example/repo --json headRefOid,headRefName,baseRefName,baseRefOid,headRepository"),
+            calls.contains("api graphql --hostname github.com op=pr-identity number=42"),
             "{calls}"
         );
     }
@@ -4989,10 +5082,10 @@ esac
         );
         let calls = gh_calls(&log);
         assert!(calls.contains("pr create"), "{calls}");
-        // The lagging first read forced at least a second pr view.
+        // The lagging first read forced at least a second PR identity read.
         assert!(
-            calls.matches("pr view 42").count() >= 2,
-            "expected a retried pr view, got: {calls}"
+            calls.matches("op=pr-identity number=42").count() >= 2,
+            "expected a retried PR identity read, got: {calls}"
         );
     }
 
