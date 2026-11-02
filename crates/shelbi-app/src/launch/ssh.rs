@@ -94,6 +94,15 @@ impl SshAuth {
         shelbi_ssh::askpass::Askpass::available().map_or(SshAuth::Batch, SshAuth::Ask)
     }
 
+    /// This sign-in for `host` (as the user typed it), which the dialog
+    /// names.
+    pub fn for_host(self, host: &str) -> SshAuth {
+        match self {
+            SshAuth::Batch => SshAuth::Batch,
+            SshAuth::Ask(askpass) => SshAuth::Ask(askpass.with_host(host)),
+        }
+    }
+
     /// The askpass setup, when ssh may ask.
     pub fn askpass(&self) -> Option<&shelbi_ssh::askpass::Askpass> {
         match self {
@@ -247,7 +256,7 @@ pub struct OpenSsh;
 
 impl SshTransport for OpenSsh {
     fn run(&self, host: &str, script: &str, deadline: Duration) -> std::io::Result<SshOutput> {
-        let auth = SshAuth::detect();
+        let auth = SshAuth::detect().for_host(host);
         let mut cmd = Command::new("ssh");
         cmd.args(ssh_options(&auth, remote_control_path().as_deref()))
             .arg(host)
@@ -340,6 +349,7 @@ exec \"$P\" --project {}
         shelbi_core::shell_escape(&session.project)
     );
     let mut argv = Vec::new();
+    let auth = auth.clone().for_host(&session.host);
     if let Some(askpass) = auth.askpass() {
         argv.push("env".to_string());
         argv.extend(
@@ -350,7 +360,7 @@ exec \"$P\" --project {}
         );
     }
     argv.extend(["ssh".to_string(), "-t".to_string()]);
-    argv.extend(ssh_options(auth, control_path));
+    argv.extend(ssh_options(&auth, control_path));
     argv.push(session.host.clone());
     argv.push("--".to_string());
     argv.push(remote_sh(&script));
@@ -937,15 +947,16 @@ mod tests {
             Some("/Users/jlong/.shelbi/ssh/r-%C"),
         );
         assert_eq!(
-            &argv[..4],
+            &argv[..5],
             [
                 "env",
                 "SSH_ASKPASS=/Applications/Shelbi.app/Contents/MacOS/shelbi-desktop",
                 "SSH_ASKPASS_REQUIRE=force",
                 "SHELBI_ASKPASS_HELPER=1",
+                "SHELBI_ASKPASS_HOST=jlong@devbox",
             ]
         );
-        assert_eq!(&argv[4..6], ["ssh", "-t"]);
+        assert_eq!(&argv[5..7], ["ssh", "-t"]);
         assert!(has(&argv, ["-o", "BatchMode=no"]), "{argv:?}");
         assert!(!argv.iter().any(|a| a == "BatchMode=yes"));
         assert!(has(&argv, ["-o", "ControlMaster=auto"]));

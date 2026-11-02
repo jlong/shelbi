@@ -456,9 +456,11 @@ pub fn sign_in(
     if master_alive(hostname) {
         return Ok(());
     }
+    // The dialog names the host it is signing in to.
+    let askpass = askpass.map(|a| a.clone().with_host(hostname.as_str()));
     let mut cmd = Command::new("ssh");
     cmd.args(sign_in_argv(hostname, build_ssh_control_opts(hostname), askpass.is_some()));
-    let out = askpass::run_until(&mut cmd, askpass, deadline)
+    let out = askpass::run_until(&mut cmd, askpass.as_ref(), deadline)
         .map_err(|e| SignInError::Unreachable(e.to_string()))?;
     classify_sign_in(&out)
 }

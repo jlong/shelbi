@@ -10,12 +10,19 @@
 //! - [`HELPER_ENV`]`=1`, which tells this executable, when ssh runs it as
 //!   `<exe> "<prompt>"`, to be the helper ([`helper_requested`]) rather than
 //!   Shelbi (both `shelbi` and the desktop app check it first thing in
-//!   `main`).
+//!   `main`; it takes exactly that shape, with `SSH_ASKPASS_REQUIRE` set too,
+//!   so a `shelbi` that merely inherited the variable runs as itself);
+//! - [`HOST_ENV`], the host as the user typed it, so the dialog says who is
+//!   asking.
 //!
 //! The helper shows ssh's own prompt text in a native macOS dialog
 //! (`osascript`'s `display dialog`): a hidden text field for a password,
 //! passphrase or one-time code, Yes/No buttons for a yes/no question (a new
-//! host key), an OK button for a notice (touch your security key). Its
+//! host key; No is the default, so Return refuses), an OK button for a
+//! notice (touch your security key). A keyboard-interactive prompt is the
+//! server's own text, so the dialog leads with a line Shelbi writes naming
+//! the host and quotes the prompt as that host's ([`dialog_text`]): a
+//! hostile host can't pass its prompt off as Shelbi's or the Mac's. Its
 //! answer goes from `osascript`'s stdout straight to ssh: Shelbi never reads,
 //! logs or stores it, and it is never on a command line. Cancel (or No)
 //! exits non-zero, which ssh reads as a refusal.
@@ -43,6 +50,10 @@ use std::time::{Duration, Instant};
 /// Set (to `1`) in the environment of an `ssh` that may ask: when ssh runs
 /// this executable as its askpass program, this says to be the helper.
 pub const HELPER_ENV: &str = "SHELBI_ASKPASS_HELPER";
+
+/// The host the user is signing in to, as they typed it: the dialog names
+/// it so the remote's prompt reads as the remote's.
+pub const HOST_ENV: &str = "SHELBI_ASKPASS_HOST";
 
 /// The [`PromptWatch`] socket the helper reports an open dialog to.
 pub const NOTIFY_ENV: &str = "SHELBI_ASKPASS_NOTIFY";
@@ -104,6 +115,7 @@ pub fn classify_prompt(prompt: &str, askpass_prompt: Option<&str>) -> PromptKind
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Askpass {
     helper: PathBuf,
+    host: Option<String>,
 }
 
 impl Askpass {
@@ -112,7 +124,20 @@ impl Askpass {
     pub fn new(helper: impl Into<PathBuf>) -> Askpass {
         Askpass {
             helper: helper.into(),
+            host: None,
         }
+    }
+
+    /// This setup for a sign-in to `host` (as the user typed it), which the
+    /// dialog names ([`HOST_ENV`]).
+    pub fn with_host(mut self, host: impl Into<String>) -> Askpass {
+        self.host = Some(host.into());
+        self
+    }
+
+    /// The host the dialog names, if any.
+    pub fn host(&self) -> Option<&str> {
+        self.host.as_deref()
     }
 
     /// This executable as the helper, when a dialog can be shown here.
@@ -132,11 +157,15 @@ impl Askpass {
 
     /// The environment ssh runs with so it asks through the helper.
     pub fn env(&self) -> Vec<(&'static str, OsString)> {
-        vec![
+        let mut env = vec![
             ("SSH_ASKPASS", self.helper.clone().into_os_string()),
             ("SSH_ASKPASS_REQUIRE", "force".into()),
             (HELPER_ENV, "1".into()),
-        ]
+        ];
+        if let Some(host) = &self.host {
+            env.push((HOST_ENV, host.into()));
+        }
+        env
     }
 
     /// Set [`Askpass::env`] on `cmd`.
@@ -204,25 +233,65 @@ pub fn auth_failed_message(host: &str, reason: &str, asked: bool) -> String {
 // The helper
 // ===========================================================================
 
-/// When this process was started by ssh as its askpass program
-/// ([`HELPER_ENV`] set, one argument: the prompt), show the dialog and
-/// return the exit code to exit with. `None` otherwise. Call it first thing
-/// in `main`.
+/// When this process was started by ssh as its askpass program, show the
+/// dialog and return the exit code to exit with. `None` otherwise. Call it
+/// first thing in `main`. See [`helper_prompt`] for what counts.
 pub fn helper_requested() -> Option<i32> {
-    if std::env::var_os(HELPER_ENV).as_deref() != Some("1".as_ref()) {
-        return None;
-    }
     let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    if args.len() > 1 {
-        // Not ssh's shape (`<exe> "<prompt>"`): something else inherited the
-        // variable. Be Shelbi.
+    let prompt = helper_prompt(
+        std::env::var_os(HELPER_ENV).as_deref(),
+        std::env::var_os("SSH_ASKPASS_REQUIRE").as_deref(),
+        &args,
+    )?;
+    Some(run_helper(&prompt))
+}
+
+/// The prompt to ask, when this process has ssh's askpass shape: `helper`
+/// ([`HELPER_ENV`]) is `1`, `require` (`SSH_ASKPASS_REQUIRE`, which ssh's
+/// askpass child inherits from [`Askpass::env`]) is set, and `args` (after
+/// the program name) is exactly one argument, the prompt. Anything else is
+/// a process that merely inherited the variables (an ssh `ProxyCommand` or
+/// `LocalCommand` child, a `SendEnv`): `None`, so it runs as Shelbi.
+pub fn helper_prompt(
+    helper: Option<&std::ffi::OsStr>,
+    require: Option<&std::ffi::OsStr>,
+    args: &[OsString],
+) -> Option<String> {
+    if helper != Some("1".as_ref()) || require.is_none_or(|r| r.is_empty()) {
         return None;
     }
-    let prompt = args
-        .first()
-        .map(|a| a.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    Some(run_helper(&prompt))
+    match args {
+        [prompt] => Some(prompt.to_string_lossy().into_owned()),
+        _ => None,
+    }
+}
+
+/// The text the dialog shows for ssh's `prompt` on a sign-in to `host`. A
+/// keyboard-interactive prompt is whatever the server sends, so with a host
+/// the dialog leads with a line Shelbi writes and quotes the prompt as the
+/// host's:
+///
+/// ```text
+/// SSH sign-in to devbox
+///
+/// devbox asks:
+/// (jlong@devbox) Verification code:
+/// ```
+///
+/// Without a host (an `ssh-askpass` run by hand) it is just the prompt.
+/// Control characters in the host are dropped so it stays one line.
+pub fn dialog_text(host: Option<&str>, prompt: &str) -> String {
+    let prompt = prompt.trim_end();
+    let host: String = host
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let host = host.trim();
+    if host.is_empty() {
+        return prompt.to_string();
+    }
+    format!("SSH sign-in to {host}\n\n{host} asks:\n{prompt}")
 }
 
 /// Show `prompt` in the dialog its kind calls for, with the answer on
@@ -244,8 +313,9 @@ pub fn run_helper(prompt: &str) -> i32 {
     for line in DIALOG_SCRIPT.lines() {
         cmd.arg("-e").arg(line);
     }
+    let text = dialog_text(std::env::var(HOST_ENV).ok().as_deref(), prompt);
     // The kind leads, so a prompt can never be read as an osascript option.
-    cmd.arg(kind.script_word()).arg(icon).arg(prompt);
+    cmd.arg(kind.script_word()).arg(icon).arg(text);
     // The answer goes from osascript's stdout straight to ssh, never through
     // this process. Its "User canceled" chatter on stderr is noise.
     cmd.stdin(Stdio::null())
@@ -297,9 +367,12 @@ fn dialog_icon() -> Option<PathBuf> {
 }
 
 /// The dialog, as AppleScript run by `osascript -e …`. Its arguments are the
-/// [`PromptKind`] word, the icon path (empty for none) and ssh's prompt.
-/// `activate` brings the dialog to the front. Cancel / No is the cancel
-/// button, which ends `osascript` with an error (a non-zero exit).
+/// [`PromptKind`] word, the icon path (empty for none) and the text
+/// ([`dialog_text`]: ssh's prompt, under a line naming the host). `activate`
+/// brings the dialog to the front. Cancel / No is the cancel button, which
+/// ends `osascript` with an error (a non-zero exit). A confirmation defaults
+/// to No: Return refuses an unverified host key, and accepting one takes a
+/// click on Yes, as ssh's own prompt takes typing `yes`.
 const DIALOG_SCRIPT: &str = r#"on run argv
 set dialogKind to item 1 of argv
 set iconPath to item 2 of argv
@@ -311,7 +384,7 @@ set theIcon to (POSIX file iconPath) as alias
 end if
 activate
 if dialogKind is "confirm" then
-display dialog promptText with title "Shelbi" buttons {"No", "Yes"} default button "Yes" cancel button "No" with icon theIcon
+display dialog promptText with title "Shelbi" buttons {"No", "Yes"} default button "No" cancel button "No" with icon theIcon
 return "yes"
 else if dialogKind is "notice" then
 display dialog promptText with title "Shelbi" buttons {"OK"} default button "OK" with icon theIcon
@@ -532,6 +605,61 @@ mod tests {
         askpass.apply(&mut cmd);
         assert_eq!(cmd.get_envs().count(), 3);
         assert_eq!(cmd.get_args().count(), 0, "nothing on the command line");
+
+        let for_devbox = askpass.with_host("jlong@devbox");
+        assert_eq!(for_devbox.host(), Some("jlong@devbox"));
+        assert_eq!(
+            for_devbox.env().last(),
+            Some(&(HOST_ENV, OsString::from("jlong@devbox"))),
+            "the host the dialog names travels alongside"
+        );
+    }
+
+    #[test]
+    fn the_dialog_names_the_host_and_quotes_its_prompt() {
+        assert_eq!(
+            dialog_text(Some("devbox"), "(jlong@devbox) Verification code: "),
+            "SSH sign-in to devbox\n\ndevbox asks:\n(jlong@devbox) Verification code:"
+        );
+        // A server can't push its text above Shelbi's line.
+        let phish = dialog_text(Some("jlong@devbox"), "Enter your Mac password to continue:");
+        assert!(phish.starts_with("SSH sign-in to jlong@devbox\n\njlong@devbox asks:\n"), "{phish}");
+        assert!(phish.ends_with("Enter your Mac password to continue:"));
+        // The host stays one line.
+        assert_eq!(
+            dialog_text(Some("dev\nbox"), "Password:"),
+            "SSH sign-in to devbox\n\ndevbox asks:\nPassword:"
+        );
+        // No host: just the prompt.
+        assert_eq!(dialog_text(None, "Password: "), "Password:");
+        assert_eq!(dialog_text(Some("  "), "Password:"), "Password:");
+    }
+
+    #[test]
+    fn only_sshs_askpass_shape_runs_the_helper() {
+        let one = |s: &str| vec![OsString::from(s)];
+        let yes = Some(std::ffi::OsStr::new("1"));
+        let force = Some(std::ffi::OsStr::new("force"));
+        assert_eq!(
+            helper_prompt(yes, force, &one("jlong@devbox's password: ")),
+            Some("jlong@devbox's password: ".to_string())
+        );
+        assert_eq!(
+            helper_prompt(yes, Some("prefer".as_ref()), &one("")),
+            Some(String::new()),
+            "ssh may ask with an empty prompt"
+        );
+        // An inherited variable with no arguments (a ProxyCommand child
+        // running plain `shelbi`) is Shelbi, not an empty dialog.
+        assert_eq!(helper_prompt(yes, force, &[]), None);
+        // Nor with more than one.
+        assert_eq!(helper_prompt(yes, force, &[OsString::from("remote"), OsString::from("list")]), None);
+        // ssh's own variable must be there too.
+        assert_eq!(helper_prompt(yes, None, &one("Password:")), None);
+        assert_eq!(helper_prompt(yes, Some("".as_ref()), &one("Password:")), None);
+        // And ours must say so.
+        assert_eq!(helper_prompt(None, force, &one("Password:")), None);
+        assert_eq!(helper_prompt(Some("0".as_ref()), force, &one("Password:")), None);
     }
 
     #[test]
@@ -541,11 +669,25 @@ mod tests {
         assert!(!DIALOG_SCRIPT.contains("{prompt}"));
         assert!(DIALOG_SCRIPT.contains("with hidden answer"));
         assert!(DIALOG_SCRIPT.contains(r#"buttons {"No", "Yes"}"#));
+        assert!(DIALOG_SCRIPT.contains("display dialog promptText"));
         for kind in [PromptKind::Secret, PromptKind::Confirm, PromptKind::Notice] {
             assert!(!kind.script_word().starts_with('-'));
         }
         assert!(DIALOG_SCRIPT.contains(r#"dialogKind is "confirm""#));
         assert!(DIALOG_SCRIPT.contains(r#"dialogKind is "notice""#));
+    }
+
+    #[test]
+    fn the_host_key_dialog_defaults_to_no() {
+        let confirm = DIALOG_SCRIPT
+            .lines()
+            .skip_while(|l| !l.contains(r#"dialogKind is "confirm""#))
+            .nth(1)
+            .expect("the confirm branch");
+        assert!(confirm.contains(r#"default button "No""#), "{confirm}");
+        assert!(!confirm.contains(r#"default button "Yes""#), "Return must refuse: {confirm}");
+        assert!(confirm.contains(r#"cancel button "No""#));
+        assert!(confirm.contains("promptText"), "ssh's whole prompt, fingerprint and all");
     }
 
     #[test]

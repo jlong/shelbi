@@ -171,8 +171,8 @@ fn usage(problem: &str) -> ! {
 }
 
 fn main() {
-    // ssh running the app as its askpass program (`<app> "<prompt>"` with
-    // `SHELBI_ASKPASS_HELPER=1`) when a remote connection wants a password:
+    // ssh running the app as its askpass program (exactly `<app> "<prompt>"`,
+    // with `SHELBI_ASKPASS_HELPER=1` and `SSH_ASKPASS_REQUIRE` set) when a remote connection wants a password:
     // show the dialog and exit, before any logging, window or state.
     if let Some(code) = shelbi_ssh::askpass::helper_requested() {
         std::process::exit(code);

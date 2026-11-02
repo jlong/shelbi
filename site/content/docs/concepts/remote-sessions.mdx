@@ -71,9 +71,14 @@ Shelbi uses your existing SSH setup:
   "Enter passphrase for key …") with a hidden field. **OK** carries on
   connecting; **Cancel** stops with "Couldn't sign in to *host*". A wrong
   password is asked again, as many times as SSH allows.
-- A machine you haven't connected to before shows SSH's host-key question in
-  the same kind of dialog, with **Yes** and **No**. Shelbi never answers it
-  for you.
+- Every dialog starts with "SSH sign-in to *host*" and "*host* asks:" above
+  the prompt. A one-time-code prompt is text the other machine sends, so
+  treat it as that machine's question: Shelbi never asks for your Mac's own
+  password.
+- A machine you haven't connected to before shows SSH's host-key question,
+  with the key's fingerprint, in the same kind of dialog, with **Yes** and
+  **No**. **No** is the default, so pressing Return refuses; accepting the key
+  takes a click on **Yes**. Shelbi never answers it for you.
 - You're asked once. The steps of a connection, and the session's terminal
   after them, share one SSH connection, which stays open for ten minutes after
   you leave.

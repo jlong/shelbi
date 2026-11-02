@@ -453,8 +453,8 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    // ssh running Shelbi as its askpass program: `shelbi "<prompt>"` with
-    // `SHELBI_ASKPASS_HELPER=1`. Before anything parses, logs or touches
+    // ssh running Shelbi as its askpass program: exactly `shelbi "<prompt>"`,
+    // with `SHELBI_ASKPASS_HELPER=1` and `SSH_ASKPASS_REQUIRE` set. Before anything parses, logs or touches
     // state: this process only shows the dialog.
     if let Some(code) = shelbi_ssh::askpass::helper_requested() {
         std::process::exit(code);
