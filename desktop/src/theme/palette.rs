@@ -77,8 +77,8 @@ pub mod figma {
     pub const DIVIDER_STRONG: Pair = pair(0xacb4cf33, 0xacb4cf33);
     /// `stroke/dark`: `Slate/400` at 30% / 50%, a textbox's 1px edge.
     pub const DIVIDER_FORM: Pair = pair(0xacb4cf4d, 0xacb4cf80);
-    /// `shadow/hard`: the buttons' Hotkey drop (`Black/950` at 55% in Dark,
-    /// `Slate/400` at 60% in Light).
+    /// `shadow/hard`: the buttons' Hotkey drop and the task pane's
+    /// (`Black/950` at 55% in Dark, `Slate/400` at 60% in Light).
     pub const SEARCH_DETAIL: Pair = pair(0x0203038c, 0xacb4cf99);
     /// `text/foreground`: body text, `Slate/100` at 85% in Dark, `Black/950`
     /// at 70% in Light.
@@ -570,6 +570,9 @@ palette! {
     shadow_ring,
     /// The command palette's drop, over the scrim.
     palette_shadow,
+    /// The task pane's drop over the board (`shadow/hard`, Figma node
+    /// 2568:10589).
+    pane_shadow,
     /// The backdrop behind a modal overlay (`surface/overlay`).
     scrim,
 }
@@ -710,6 +713,7 @@ impl Palette {
             shadow: pick(SHADOW),
             shadow_ring: pick(SHADOW_RING),
             palette_shadow: pick(PALETTE_SHADOW),
+            pane_shadow: pick(SEARCH_DETAIL),
             scrim: pick(SCRIM),
         }
     }

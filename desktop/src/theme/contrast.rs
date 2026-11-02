@@ -115,7 +115,7 @@ pub fn class(role: &str) -> Option<Class> {
         | "red_tint" | "primary_fill" | "primary_fill_hover" | "primary_fill_active" | "success_fill"
         | "success_fill_hover" | "success_fill_active" | "danger_fill" | "danger_fill_hover"
         | "danger_fill_active" | "zen" | "notice" | "row_selected" | "text_selection" | "search_match"
-        | "search_current" | "shadow" | "shadow_ring" | "palette_shadow" | "scrim" => Kept,
+        | "search_current" | "shadow" | "shadow_ring" | "palette_shadow" | "pane_shadow" | "scrim" => Kept,
         _ => return None,
     })
 }

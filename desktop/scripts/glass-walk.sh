@@ -20,8 +20,8 @@
 # every fill (the fills composite over the same desktop, no separate pass);
 # at blur 30 and 50 they wash out evenly under both (the window server's
 # one background blur, at the setting's radius, never doubled or missing).
-# The task pane shows only the glass (the board is clipped under it); at
-# 100% the window is opaque.
+# The task pane is opaque over the board, which runs on under it and shows
+# in its 8px margins, with its drop shadow; at 100% the window is opaque.
 #
 # Needs an unlocked screen, Screen Recording for the terminal it runs in,
 # and swiftc. It posts keys to the app it launched and captures only the
