@@ -58,7 +58,7 @@ use shelbi_app::text_area::TextArea;
 use shelbi_state::keymap::{Key as Code, KeyChord, Mods};
 
 use super::centered_rect;
-use crate::button::Button;
+use crate::button::{self, Button};
 use crate::modal_form::{Control, FormLines};
 use crate::panel;
 use crate::sidebar::{BLEED_ABOVE, BLEED_BELOW};
@@ -420,7 +420,7 @@ impl FeedbackDialog {
     }
 
     /// Bug Report / Feature Request / Other: a track the width of the form
-    /// (a textbox's caps and fill), the picked one a chip in it.
+    /// (a textbox's caps and fill), the picked one a [`button::chip`] in it.
     fn kinds(&self, out: &mut FormLines<Hit>) {
         let width = out.width;
         let focused = self.form.focus() == Focus::Kind;
@@ -434,13 +434,12 @@ impl FeedbackDialog {
         for (i, kind) in Kind::ALL.into_iter().enumerate() {
             let n = Kind::ALL.len();
             let w = inner / n + usize::from(i < inner % n);
-            let picked = kind == self.form.kind();
-            let style = if picked {
-                Style::default().bg(palette().segment).fg(palette().white).add_modifier(Modifier::BOLD)
+            if kind == self.form.kind() && w >= 2 {
+                let style = Style::default().fg(palette().white).add_modifier(Modifier::BOLD);
+                spans.extend(button::chip(center(kind.label(), w - 2), style, palette().segment, track));
             } else {
-                on_track.fg(palette().gray)
-            };
-            spans.push(Span::styled(center(kind.label(), w), style));
+                spans.push(Span::styled(center(kind.label(), w), on_track.fg(palette().gray)));
+            }
             segments.push((x, w, kind));
             x += w;
         }

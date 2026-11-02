@@ -158,6 +158,17 @@ fn tab_walks_the_desktops_order_and_each_control_shows_its_focus() {
     };
     assert_eq!(at(&mut d, Focus::Kind, "Feature Request").bg, palette().input_focus);
     assert_eq!(at(&mut d, Focus::Kind, "Bug Report").bg, palette().segment, "the picked one's chip");
+    // The chip's caps carry its fill over the track, at rest and focused.
+    for (focus, track) in [(Focus::Name, palette().dialog_control), (Focus::Kind, palette().input_focus)] {
+        d.form.set_focus(focus);
+        let (buf, _) = render(&mut d, 100, 45);
+        let (x, y) = find(&buf, "Bug Report").unwrap();
+        let left = (0..x).rev().find(|&cx| buf[(cx, y)].symbol() == "▐").expect("a left cap");
+        let right = (x..buf.area.width).find(|&cx| buf[(cx, y)].symbol() == "▌").expect("a right cap");
+        for cx in [left, right] {
+            assert_eq!((buf[(cx, y)].fg, buf[(cx, y)].bg), (palette().segment, track), "{focus:?}");
+        }
+    }
     assert_eq!(at(&mut d, Focus::SystemInfo, "Include").fg, palette().cyan);
     // Send and Cancel are Settings' buttons: Primary and Secondary, focus
     // a solid fill.
