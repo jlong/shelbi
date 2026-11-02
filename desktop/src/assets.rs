@@ -57,7 +57,8 @@
 //! a 16pt grid under `assets/icons/menu/` (see its README): the open and
 //! closed project dots, the current project's heavy check, and the plus.
 //! Their constants end in `_MENU` and [`heroicon`] draws them at
-//! [`ICON_SIZE_MENU`].
+//! [`ICON_SIZE_MENU`]. The terminal's Jump to bottom pill draws its arrow
+//! from the same list, at 16pt beside its X-Small label.
 //!
 //! The other exception is the **status glyphs** ([`status_glyph`]): the Figma
 //! file's own `status-*` drawings (a dashed circle for backlog, an open one
@@ -232,7 +233,7 @@ macro_rules! heroicons {
         @figma { $($fconst:ident = $ffile:literal;)* }
         @small { $($sconst:ident = $sfile:literal;)* }
         @button { $($(#[$bmeta:meta])* $bconst:ident = $bfile:literal;)* }
-        @menu { $($mconst:ident = $mfile:literal;)* }
+        @menu { $($(#[$mmeta:meta])* $mconst:ident = $mfile:literal;)* }
         @large { $($lconst:ident = $lfile:literal;)* }
     ) => {
         /// The vendored icons.
@@ -270,6 +271,7 @@ macro_rules! heroicons {
                 };
             )*
             $(
+                $(#[$mmeta])*
                 pub const $mconst: Icon = Icon {
                     name: $mfile,
                     path: concat!("icons/menu/", $mfile, ".svg"),
@@ -392,6 +394,9 @@ heroicons! {
     COMMAND_LINE = "command-line";
     FOLDER = "folder";
     GLOBE_ALT = "globe-alt";
+    /// The drawing `ARROW_DOWN_MENU` redraws on the 16pt grid; no view
+    /// draws the arrow at 20pt.
+    #[allow(dead_code)]
     ARROW_DOWN = "arrow-down";
     CHEVRON_UP = "chevron-up";
     /// The terminal search bar's newer-match button (a dropdown's chevron
@@ -453,6 +458,8 @@ heroicons! {
         CIRCLE_MENU = "circle";
         CHECK_SMALL_HEAVY_MENU = "check-small-heavy";
         PLUS_MENU = "plus";
+        /// The terminal's Jump to bottom pill, beside its X-Small label.
+        ARROW_DOWN_MENU = "arrow-down";
     }
     @large {
         FOLDER_LARGE = "folder";

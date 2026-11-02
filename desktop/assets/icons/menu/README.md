@@ -12,3 +12,9 @@ them (`icon_green` for the filled dot, `gray` for the rest).
   (`check-small-heavy`, 2196:9086), a 2.5pt stroke.
 - `plus.svg`: "Add project" (the Heroicons plus, drawn on the 16pt grid
   with a 1.25pt stroke).
+
+The terminal's "Jump to bottom" pill draws its arrow on the same grid, so
+it sits at 16pt beside the pill's X-Small label:
+
+- `arrow-down.svg`: the Heroicons arrow-down, drawn on the 16pt grid with a
+  1.25pt stroke (the 24/outline path scaled by 2/3, as `plus.svg` is).
