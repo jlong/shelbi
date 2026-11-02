@@ -9,6 +9,41 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### November 2, 2026
+
+**v0.13.0. Remote workspaces open from the sidebar, editor and diff tool pickers, and a desktop that looks right on glass.**
+
+**Remote workspaces open like local ones.** Click a workspace on another
+machine (such as a devbox reached over SSH) and its agent attaches, with Shell,
+Diff and Editor working the same as on this Mac. Reveal copies the
+workspace's `host:path` ([#2064](https://github.com/jlong/shelbi/pull/2064)). `shelbi zen pr-create` also works when
+the workspace's machine has an older `gh` ([#2063](https://github.com/jlong/shelbi/pull/2063)).
+
+**Pick your editor and diff tool.** `editor:` and the new `diff_tool:` in
+`~/.shelbi/config.yaml` take either a command or a macOS app, and Settings ▸
+General in both clients lists the tools Shelbi detects, plus Browse… and
+Other command…. A command opens as a pane in the worktree; an app opens in
+the app ([#2034](https://github.com/jlong/shelbi/pull/2034), [#2035](https://github.com/jlong/shelbi/pull/2035), [#2037](https://github.com/jlong/shelbi/pull/2037)).
+
+**Run script action.** In the workflow editors, a transition's `run`, `ready`
+and `ready_timeout` move into a Run script action beside its other actions.
+The YAML is unchanged ([#2042](https://github.com/jlong/shelbi/pull/2042)).
+
+**Desktop.** Buttons, fields, chips and cards tint the glass in a translucent
+window instead of reading as opaque patches, and new installs start at
+contrast 50, 85% opaque, blur 30 ([#2044](https://github.com/jlong/shelbi/pull/2044), [#2028](https://github.com/jlong/shelbi/pull/2028)). The task pane floats over
+the board with a drop shadow and rounded top corners, slides out when it
+closes, and resizes from its left edge ([#2029](https://github.com/jlong/shelbi/pull/2029), [#2054](https://github.com/jlong/shelbi/pull/2054), [#2058](https://github.com/jlong/shelbi/pull/2058)). Menus place
+themselves inside the window, flipping above their button and scrolling when
+space runs short, and close on a second click or a click outside
+([#2046](https://github.com/jlong/shelbi/pull/2046), [#2052](https://github.com/jlong/shelbi/pull/2052)). Workspaces sit flush under their machine's header, and Changelog
+PR chips draw the pull-request icon ([#2048](https://github.com/jlong/shelbi/pull/2048), [#2050](https://github.com/jlong/shelbi/pull/2050), [#2057](https://github.com/jlong/shelbi/pull/2057)).
+
+**Polish.** Multi-line text areas soft-wrap in both clients ([#2038](https://github.com/jlong/shelbi/pull/2038)). In
+the TUI, segmented controls cap the chosen segment as one rounded pill
+([#2061](https://github.com/jlong/shelbi/pull/2061)). On the desktop, slider tracks line up with their labels ([#2043](https://github.com/jlong/shelbi/pull/2043)).
+On shelbi.dev, the install command follows the TUI | Desktop switch ([#2025](https://github.com/jlong/shelbi/pull/2025)).
+
 ### October 30, 2026
 
 **v0.12.0. Settings and a launch screen in the TUI, a per-project Changelog, and tasks you edit in place.**
