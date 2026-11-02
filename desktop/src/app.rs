@@ -2532,7 +2532,9 @@ impl ShelbiWindow {
         };
         let ready = matches!(self.boot, Boot::Ready(_)) && !self.chooser;
         let board = ready && matches!(self.route, Route::View) && matches!(self.client.view(), View::Issues);
-        let floating = ready && issues.read(cx).is_floating();
+        // A pane closed over another screen keeps its session while it
+        // slides out.
+        let floating = ready && (issues.read(cx).is_floating() || issues.read(cx).closing_over());
         let mut main_shows = MainShows::default();
         if floating {
             main_shows.workspace = self
@@ -4472,11 +4474,13 @@ impl ShelbiWindow {
     /// sidebar hidden or going, no panel holding the column), with the
     /// button that shows the sidebar.
     fn render_main(&self, theme: &Theme, titlebar: MainTitlebar, cx: &mut Context<Self>) -> impl IntoElement {
-        let detail_over = self
-            .detail_over
-            .as_ref()
-            .and_then(|_| self.issues.clone())
-            .filter(|issues| issues.read(cx).is_floating());
+        // The board's detail over the main area, or the one just closed
+        // there sliding back out (unless the board itself shows now).
+        let board_shown = matches!(self.route, Route::View) && matches!(self.client.view(), View::Issues);
+        let detail_over = self.issues.clone().filter(|issues| {
+            let v = issues.read(cx);
+            (self.detail_over.is_some() && v.is_floating()) || (!board_shown && v.closing_over())
+        });
         let body = match &self.route {
             Route::Settings(view) => div().size_full().child(view.clone()).into_any_element(),
             Route::Review => div()

@@ -63,6 +63,7 @@ use shelbi_app::issue_edit::{Field, SaveJob};
 use super::doc_editor::layout::Field as DocField;
 use super::doc_editor::{DocEditor, DocEvent};
 use super::external_edit::{self, EditorEvent};
+use super::column_swap::SLIDE;
 use super::pane_session::{MainShows, PaneSession};
 use super::pane_width::PaneWidth;
 use super::session_view::{SessionDeps, SessionView};
@@ -260,6 +261,10 @@ pub struct IssuesView {
     /// The pane's layer (the main area inside its insets), measured for the
     /// drag.
     pub(super) pane_layer: Option<gpui::Bounds<gpui::Pixels>>,
+    /// A closed pane sliding back out, drawn until its [`SLIDE`] is up.
+    pane_closing: Option<ClosingPane>,
+    /// Counts closes, so a slide's end drops only its own pane.
+    pane_closes: u64,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -332,6 +337,8 @@ impl IssuesView {
             pane_width: PaneWidth::default(),
             pane_resize: None,
             pane_layer: None,
+            pane_closing: None,
+            pane_closes: 0,
             _subscriptions: Vec::new(),
             _poll: poll,
         }
@@ -386,11 +393,18 @@ impl IssuesView {
 
     /// Attach the pane's session to what its task needs now.
     fn sync_session(&mut self, rows_changed: bool, cx: &mut Context<Self>) {
+        // A pane closed since: it keeps its session as it slides out.
+        self.note_pane_close(cx);
         if self.pane_session.is_none() {
             return;
         }
         // Only a task the board has: a deleted or missing one shows none.
-        let task = self.detail_model().map(|d| d.id);
+        let task = self.detail_model().map(|d| d.id).or_else(|| {
+            self.pane_closing
+                .as_ref()
+                .filter(|c| matches!(c.snapshot, task_detail::PaneSnapshot::Task(_)))
+                .map(|c| c.id.clone())
+        });
         if let Some(p) = self.pane_session.as_mut() {
             p.sync(task.as_deref(), rows_changed, cx);
         }
@@ -619,13 +633,64 @@ impl IssuesView {
     /// screen it opened over went away); without it the detail stays open,
     /// for the board.
     pub fn land(&mut self, close: bool, cx: &mut Context<Self>) {
+        // A pane just closed over the screen slides out over it.
+        self.note_pane_close(cx);
         self.floating = false;
         if close {
             self.close_editors();
             self.add_input = None;
             self.state.close_pane();
+            // The screen it was over went away: so does the pane, at once.
+            self.state.take_closed();
+            self.pane_closing = None;
         }
         cx.notify();
+    }
+
+    /// Whether a pane closed over another screen is still sliding out (the
+    /// window keeps this view laid over the main area until it is gone).
+    pub fn closing_over(&self) -> bool {
+        self.pane_closing.as_ref().is_some_and(|c| c.over)
+    }
+
+    /// Whether a closed pane is still sliding out.
+    #[cfg(test)]
+    pub fn pane_closing(&self) -> bool {
+        self.pane_closing.is_some()
+    }
+
+    /// A pane closed (by any path: [`BoardState::take_closed`]): keep it
+    /// drawn as it slides back out for one [`SLIDE`], then drop it. With
+    /// Reduce Motion it goes at once, as it opens in place.
+    fn note_pane_close(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.state.take_closed() else {
+            return;
+        };
+        if cx.reduce_motion() {
+            return;
+        }
+        let snapshot = match TaskDetailModel::build(self.state.input(), &id) {
+            Some(d) => task_detail::PaneSnapshot::Task(Box::new(d)),
+            None if self.state.model().loading => task_detail::PaneSnapshot::Loading,
+            None => match self.state.model().error.clone() {
+                Some(e) => task_detail::PaneSnapshot::Failed(e),
+                None => task_detail::PaneSnapshot::Missing,
+            },
+        };
+        self.pane_closes += 1;
+        let close = self.pane_closes;
+        self.pane_closing = Some(ClosingPane { id, over: self.floating, snapshot, close });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SLIDE).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.pane_closing.as_ref().is_some_and(|c| c.close == close) {
+                    this.pane_closing = None;
+                    this.sync_session(false, cx);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
     }
 
     /// Close the task pane (its Close, or Esc on it). An in-place edit with
@@ -2189,7 +2254,7 @@ impl Render for IssuesView {
         self.sync_session(false, cx);
         let theme = *cx.global::<Theme>();
         let detail = self.render_detail(&theme, cx);
-        if self.floating {
+        if self.floating || self.closing_over() {
             // Over another screen: the pane and its assign picker, on a layer
             // filling the main area the window lays this over. The layer
             // itself takes no pointer or focus, so the screen around the
@@ -2253,8 +2318,12 @@ impl IssuesView {
         let Some(id) = self.state.detail_id().map(str::to_string) else {
             // A pane closed mid-drag (Esc) leaves no drag behind for the next.
             self.pane_resize = None;
-            return None;
+            // A closed pane sliding out.
+            let c = self.pane_closing.as_ref()?;
+            return Some(task_detail::render(self, &c.id, c.snapshot.content(), task_detail::PaneMotion::Out, theme, cx));
         };
+        // A pane opened while another slides out shows at once.
+        self.pane_closing = None;
         let model = self.detail_model();
         let content = match &model {
             Some(d) => task_detail::PaneContent::Task(d),
@@ -2264,11 +2333,22 @@ impl IssuesView {
                 None => task_detail::PaneContent::Missing,
             },
         };
-        Some(task_detail::render(self, &id, content, theme, cx))
+        Some(task_detail::render(self, &id, content, task_detail::PaneMotion::In, theme, cx))
     }
 }
 
 // ---- small pieces ------------------------------------------------------------
+
+/// A closed task pane sliding back out ([`task_detail::PaneMotion::Out`]).
+struct ClosingPane {
+    id: String,
+    /// It closed over another screen (Review, Workspace's More).
+    over: bool,
+    /// What it showed, read once as it closed.
+    snapshot: task_detail::PaneSnapshot,
+    /// Which close this is ([`IssuesView::pane_closes`]).
+    close: u64,
+}
 
 /// A fingerprint of a background read (its debug rendering hashed, off the
 /// UI thread), to tell a refresh that read the same board again.
@@ -2800,6 +2880,64 @@ mod tests {
         let settled = bounds(&mut cx, "task-pane");
         assert_eq!(settled.left(), px(512.0), "and lands 8pt in from the right");
         assert_eq!(settled.top(), first.top(), "sliding, not dropping");
+    }
+
+    #[gpui::test]
+    fn closing_slides_the_pane_back_out_then_drops_it(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        std::thread::sleep(SLIDE + Duration::from_millis(60));
+        let open = bounds(&mut cx, "task-pane");
+
+        click(&mut cx, "pane-close");
+        assert_eq!(pane_id(&view, &cx), None, "closed at once");
+        assert!(board_focused(&view, &mut cx), "the keys are back on the board");
+        // Still drawn, starting back out from where it stood.
+        let leaving = bounds(&mut cx, "task-pane-closing");
+        assert!(!drawn(&mut cx, "task-pane"));
+        assert!(leaving.left() >= open.left() && leaving.left() < px(1160.0), "{leaving:?} from {open:?}");
+        assert_eq!(leaving.top(), open.top(), "sliding, not dropping");
+        // The slide ends past the window's right edge, the way it came in.
+        std::thread::sleep(SLIDE + Duration::from_millis(60));
+        let out = bounds(&mut cx, "task-pane-closing");
+        assert_eq!(out.left(), px(1160.0), "{out:?}");
+
+        // Then it's gone: nothing of it is drawn, and it takes no clicks.
+        cx.executor().advance_clock(SLIDE);
+        cx.run_until_parked();
+        assert!(!drawn(&mut cx, "task-pane-closing"));
+        assert!(!drawn(&mut cx, "pane-close"));
+        assert!(view.read_with(&cx, |v, _| !v.pane_closing()));
+    }
+
+    #[gpui::test]
+    fn every_close_slides_out_and_a_new_pane_shows_without_waiting(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        let (view, mut cx) =
+            open_board_sized(cx, vec![issue("A", "todo"), issue("B", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
+        click(&mut cx, "card-A");
+        assert!(drawn(&mut cx, "task-pane"));
+        // Esc closes through the same slide as Close.
+        cx.simulate_keystrokes("escape");
+        assert_eq!(pane_id(&view, &cx), None);
+        assert!(drawn(&mut cx, "task-pane-closing"), "Esc slides it out");
+        // Another task mid-slide shows at once, and the closing pane goes.
+        click(&mut cx, "card-B");
+        assert_eq!(pane_id(&view, &cx).as_deref(), Some("B"));
+        assert!(drawn(&mut cx, "task-pane"));
+        assert!(!drawn(&mut cx, "task-pane-closing"), "the old slide is dropped");
+        // The old slide's end leaves the new pane alone.
+        cx.executor().advance_clock(SLIDE);
+        cx.run_until_parked();
+        assert!(drawn(&mut cx, "task-pane"));
+        assert_eq!(pane_id(&view, &cx).as_deref(), Some("B"));
+
+        // With Reduce Motion a closed pane goes at once, as it opens in place.
+        cx.update(|_, cx| cx.set_reduce_motion(true));
+        click(&mut cx, "pane-close");
+        assert!(!drawn(&mut cx, "task-pane-closing"));
+        assert!(!drawn(&mut cx, "task-pane"));
     }
 
     // ---- resizing the pane (`dt-task-pane-resize`) -------------------------

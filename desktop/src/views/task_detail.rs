@@ -11,10 +11,14 @@
 //! doesn't cover it: a click on another card shows that card here. The pane
 //! is opaque in every window, with Figma's `shadow/hard` drop over the board. It slides in from the right
 //! as it opens ([`SLIDE`], gpui's animation, so Reduce Motion shows it in
-//! place). The same pane shows over Review and Workspace (their More), drawn
+//! place). Closing it, by any path, plays that in reverse ([`PaneMotion::Out`]):
+//! the view keeps the closed pane drawn, inert, for one [`SLIDE`] as it slides
+//! back out, then drops it. The same pane shows over Review and Workspace (their More), drawn
 //! by a floating board ([`IssuesView::open_task_over`]).
 //!
-//! Inside, a 12pt-cornered canvas with a divider edge and the frame's drop:
+//! Inside, a 12pt-cornered canvas with a divider edge and the frame's drop
+//! (gpui clips children to a rectangle, so the Header and the session area
+//! round their own outer corners to match):
 //! the Header (52pt, `Workflow / id`, More, Close), then a scroll of the
 //! title (Desktop/Title), the Status / Workflow / Priority / Branch
 //! properties (and, when the task has them, its tracker owner, dependencies
@@ -77,7 +81,7 @@ use crate::app::RESIZE_GRAB;
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::placed::MenuScroll;
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
-use crate::theme::motion::{ease_out_expo, fill_layer};
+use crate::theme::motion::{ease_out_expo, ease_out_expo_reversed, fill_layer};
 use crate::theme::style::{self, ButtonContent, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
@@ -105,8 +109,46 @@ pub enum PaneContent<'a> {
     Failed(String),
 }
 
+/// What the pane shows, kept by the view while a closed pane slides out.
+pub enum PaneSnapshot {
+    Task(Box<TaskDetailModel>),
+    Loading,
+    Missing,
+    Failed(String),
+}
+
+impl PaneSnapshot {
+    pub fn content(&self) -> PaneContent<'_> {
+        match self {
+            PaneSnapshot::Task(d) => PaneContent::Task(d),
+            PaneSnapshot::Loading => PaneContent::Loading,
+            PaneSnapshot::Missing => PaneContent::Missing,
+            PaneSnapshot::Failed(e) => PaneContent::Failed(e.clone()),
+        }
+    }
+}
+
+/// Which way the pane is moving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneMotion {
+    /// The open pane: it slides in from the right as it first draws.
+    In,
+    /// A closed pane, the open slide played backwards (same [`SLIDE`], the
+    /// curve reversed): drawn inert, taking the pointer from nothing under
+    /// it and never the keys, until the view drops it.
+    Out,
+}
+
 /// The pane for task `id`, on its overlay layer over the main area.
-pub fn render(view: &IssuesView, id: &str, content: PaneContent<'_>, theme: &Theme, cx: &mut Context<IssuesView>) -> AnyElement {
+pub fn render(
+    view: &IssuesView,
+    id: &str,
+    content: PaneContent<'_>,
+    motion: PaneMotion,
+    theme: &Theme,
+    cx: &mut Context<IssuesView>,
+) -> AnyElement {
+    let closing = motion == PaneMotion::Out;
     // The pane floats over what it covers (the board, or a live session
     // over Review and Workspace), so it paints from the opaque theme: on a
     // translucent window the board would otherwise show through it.
@@ -135,9 +177,10 @@ pub fn render(view: &IssuesView, id: &str, content: PaneContent<'_>, theme: &The
     // The chosen width; the row it sits in shrinks it in a main area too
     // narrow for it.
     let width = view.pane_width.wanted();
+    let selector = if closing { "task-pane-closing" } else { "task-pane" };
     let pane = div()
-        .id("task-pane")
-        .debug_selector(|| "task-pane".into())
+        .id(selector)
+        .debug_selector(move || selector.into())
         .relative()
         .flex()
         .flex_col()
@@ -166,8 +209,26 @@ pub fn render(view: &IssuesView, id: &str, content: PaneContent<'_>, theme: &The
                 .border_1()
                 .border_color(theme.divider),
         )
-        .child(resize_handle(view, theme, cx));
-    let pane = view.pane_focus(pane, cx);
+        .child(resize_handle(view, theme, cx))
+        // Sliding out, the pane's controls are past use: a cover over them
+        // takes the pointer, and the pane never takes the keys.
+        .when(closing, |pane| pane.child(div().id("task-pane-inert").absolute().top_0().left_0().size_full().occlude()));
+    let pane = if closing { pane } else { view.pane_focus(pane, cx) };
+    let travel = width + EDGE;
+    let pane = match motion {
+        // In from past the window's right edge.
+        PaneMotion::In => pane
+            .with_animation("task-pane-in", Animation::new(SLIDE).with_easing(ease_out_expo), move |pane, t| {
+                pane.left(px((1.0 - t) * travel))
+            })
+            .into_any_element(),
+        // Back out the way it came, along the same curve backwards.
+        PaneMotion::Out => pane
+            .with_animation("task-pane-out", Animation::new(SLIDE).with_easing(ease_out_expo_reversed), move |pane, t| {
+                pane.left(px(t * travel))
+            })
+            .into_any_element(),
+    };
     div()
         .absolute()
         .top(px(EDGE))
@@ -177,13 +238,8 @@ pub fn render(view: &IssuesView, id: &str, content: PaneContent<'_>, theme: &The
         .flex()
         .flex_row()
         .justify_end()
-        .child(pane.with_animation(
-            "task-pane-in",
-            Animation::new(SLIDE).with_easing(ease_out_expo),
-            // In from past the window's right edge.
-            move |pane, t| pane.left(px((1.0 - t) * (width + EDGE))),
-        ))
-        .child(resize_probe(view, cx))
+        .child(pane)
+        .when(!closing, |layer| layer.child(resize_probe(view, cx)))
         .into_any_element()
 }
 
@@ -313,6 +369,9 @@ fn header(view: &IssuesView, title: String, theme: &Theme, cx: &mut Context<Issu
         .gap(px(8.0))
         .h(px(HEADER_H))
         .px(px(12.0))
+        // The pane's top corners: its overflow clip is square, so the band
+        // rounds its own fill (and its edge) to the pane's.
+        .rounded_t(px(RADIUS))
         .bg(theme.toolbar)
         // The Header's 1px canvas edge on its left.
         .border_l_1()
@@ -535,6 +594,8 @@ fn with_session(
                 .h(px(session_h))
                 .w_full()
                 .overflow_hidden()
+                // The pane's bottom corners, which this fills.
+                .rounded_b(px(RADIUS))
                 // The terminal's own surface, the pane's canvas at the
                 // default contrast, so the grid's insets match the grid.
                 .bg(theme.terminal_canvas())
