@@ -75,6 +75,7 @@ fn pixels(icon: AppIcon) -> &'static about_icon::Pixels {
     match icon {
         AppIcon::CommandGrille => &about_icon::COMMAND_GRILLE,
         AppIcon::Retro => &about_icon::RETRO,
+        AppIcon::RacingS => &about_icon::RACING_S,
     }
 }
 
@@ -901,6 +902,8 @@ mod tests {
             assert!(b > r && b > g, "{icon:?} blue: {r},{g},{b}");
         }
         assert_ne!(about_icon::COMMAND_GRILLE, about_icon::RETRO);
+        assert_ne!(about_icon::COMMAND_GRILLE, about_icon::RACING_S);
+        assert_ne!(about_icon::RETRO, about_icon::RACING_S);
     }
 
     /// About draws the icon it was opened with: Command Grille unless told
@@ -927,6 +930,9 @@ mod tests {
         assert_eq!(icon_cells(&About::new(true).with_icon(AppIcon::CommandGrille)), grille);
         let retro = icon_cells(&About::new(true).with_icon(AppIcon::Retro));
         assert_ne!(retro, grille);
+        let racing = icon_cells(&About::new(true).with_icon(AppIcon::RacingS));
+        assert_ne!(racing, grille);
+        assert_ne!(racing, retro);
         // Its middle cell is that table's pixel, drawn in 24-bit color.
         let mid = about_icon::SIZE / 2;
         let at = (ICON_ROWS / 2) * about_icon::SIZE + mid;

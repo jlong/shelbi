@@ -31,8 +31,8 @@
 //!   translucency, two sliders under Contrast. A slider applies to every open
 //!   window as it moves ([`crate::theme::window`]) and is saved when it is
 //!   let go; Reduce Transparency forces the windows opaque and disables them.
-//! - `desktop.app_icon`: the app's icon, Command Grille (the default) or
-//!   Retro, picked from a tile of each under Translucency. A pick shows in
+//! - `desktop.app_icon`: the app's icon, Command Grille (the default),
+//!   Retro or Racing S, picked from a tile of each under Translucency. A pick shows in
 //!   the Dock at once ([`crate::app_icon`]), and in About, and is saved;
 //!   unset stays unset until one is picked.
 //! - `desktop.notifications`: which system notifications the app posts.
@@ -1620,7 +1620,7 @@ impl EventEmitter<SettingsEvent> for SettingsView {}
 fn tool_setting_of(change: &Change) -> ToolSetting {
     match change {
         Change::DiffTool(_) => ToolSetting::DiffTool,
-        Change::Editor(_) | Change::Theme(_) => ToolSetting::Editor,
+        Change::Editor(_) | Change::Theme(_) | Change::AppIcon(_) => ToolSetting::Editor,
     }
 }
 
@@ -1653,6 +1653,7 @@ fn app_icon_selector(icon: AppIcon) -> &'static str {
     match icon {
         AppIcon::CommandGrille => "settings-app-icon-command-grille",
         AppIcon::Retro => "settings-app-icon-retro",
+        AppIcon::RacingS => "settings-app-icon-racing-s",
     }
 }
 

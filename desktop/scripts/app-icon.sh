@@ -19,11 +19,19 @@
 #                                       (mask, glass, shadow), for the app's
 #                                       own use: the Dock, About, Settings
 #
+# Racing S, from its layered Icon Composer document
+# (assets/icon/RacingS.icon), compiled the same way into a scratch directory
+# (the bundle never wears it, so its compile isn't kept):
+#
+#   assets/icon/racing-s-{512,224,128}.png
+#                                       drawn as macOS draws it, like Command
+#                                       Grille's
+#
 # Retro, from its 1024px master (assets/icon/retro-1024.png):
 #
 #   assets/icon/retro-{512,224,128}.png
 #
-# and both TUI About tables (crates/shelbi-tui/src/overlay/about_icon.rs).
+# and the TUI About tables (crates/shelbi-tui/src/overlay/about_icon.rs).
 #
 # bundle.sh only copies the compiled files, so a release never needs Xcode
 # 26; commit what this script writes.
@@ -31,7 +39,6 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)" # desktop/
 icon_dir="$here/assets/icon"
-source="$icon_dir/Shelbi.icon"
 compiled="$icon_dir/compiled"
 
 fail() {
@@ -48,9 +55,11 @@ actool_version="$(xcrun actool --version 2>/dev/null |
 
 work="$(mktemp -d)"
 lsregister=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
-app="$work/IconRender.app"
+registered=()
 cleanup() {
-  if [[ -d "$app" ]]; then "$lsregister" -u "$app" >/dev/null 2>&1 || true; fi
+  for app in "${registered[@]+"${registered[@]}"}"; do
+    "$lsregister" -u "$app" >/dev/null 2>&1 || true
+  done
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -61,26 +70,33 @@ source_digest() {
     xargs -0 shasum -a 256) | shasum -a 256 | cut -c1-64
 }
 
-echo "==> compiling $source (actool $actool_version)"
-xcrun actool "$source" \
-  --compile "$work" \
-  --app-icon Shelbi \
-  --output-partial-info-plist "$work/partial.plist" \
-  --platform macosx \
-  --minimum-deployment-target 15.0 \
-  --include-all-app-icons >/dev/null
-[[ -s "$work/Assets.car" && -s "$work/Shelbi.icns" ]] || fail "actool wrote no Assets.car / Shelbi.icns"
-mkdir -p "$compiled"
-cp "$work/Assets.car" "$work/Shelbi.icns" "$compiled/"
-source_digest >"$compiled/Shelbi.icon.sha256"
+# compile_icon <Name> <out-dir>: actool <Name>.icon into <out-dir>
+# (<Name>.icns and Assets.car).
+compile_icon() {
+  local name="$1" out="$2"
+  echo "==> compiling $icon_dir/$name.icon (actool $actool_version)"
+  mkdir -p "$out"
+  xcrun actool "$icon_dir/$name.icon" \
+    --compile "$out" \
+    --app-icon "$name" \
+    --output-partial-info-plist "$out/partial.plist" \
+    --platform macosx \
+    --minimum-deployment-target 15.0 \
+    --include-all-app-icons >/dev/null
+  [[ -s "$out/Assets.car" && -s "$out/$name.icns" ]] || fail "actool wrote no Assets.car / $name.icns for $name.icon"
+}
 
-echo "==> drawing Command Grille as macOS shows it"
+# draw_icon <Name> <compiled-dir> <png-prefix>: draw a compiled icon as
+# macOS shows it (mask, glass, shadow) into <png-prefix>-{512,224,128}.png.
 # A throwaway app around the compiled icon (any executable will do; without
 # one Finder badges the icon), registered so NSWorkspace draws its icon.
-mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-cp "$compiled/Assets.car" "$compiled/Shelbi.icns" "$app/Contents/Resources/"
-cp /usr/bin/true "$app/Contents/MacOS/IconRender"
-cat >"$app/Contents/Info.plist" <<PLIST
+draw_icon() {
+  local name="$1" from="$2" prefix="$3"
+  local app="$work/render-$name/IconRender.app"
+  mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+  cp "$from/Assets.car" "$from/$name.icns" "$app/Contents/Resources/"
+  cp /usr/bin/true "$app/Contents/MacOS/IconRender"
+  cat >"$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -88,22 +104,38 @@ cat >"$app/Contents/Info.plist" <<PLIST
 	<key>CFBundleExecutable</key>
 	<string>IconRender</string>
 	<key>CFBundleIdentifier</key>
-	<string>dev.shelbi.icon-render.$$</string>
+	<string>dev.shelbi.icon-render.$name.$$</string>
 	<key>CFBundleIconFile</key>
-	<string>Shelbi</string>
+	<string>$name</string>
 	<key>CFBundleIconName</key>
-	<string>Shelbi</string>
+	<string>$name</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 </dict>
 </plist>
 PLIST
-codesign --force --sign - "$app" >/dev/null 2>&1
-"$lsregister" -f "$app"
+  codesign --force --sign - "$app" >/dev/null 2>&1
+  "$lsregister" -f "$app"
+  registered+=("$app")
+  for size in 512 224 128; do
+    "$work/render-app-icon" "$app" "$size" "$prefix-$size.png"
+  done
+}
+
 xcrun swiftc -O "$here/scripts/render-app-icon.swift" -o "$work/render-app-icon"
-for size in 512 224 128; do
-  "$work/render-app-icon" "$app" "$size" "$icon_dir/command-grille-$size.png"
-done
+
+compile_icon Shelbi "$work/Shelbi"
+mkdir -p "$compiled"
+cp "$work/Shelbi/Assets.car" "$work/Shelbi/Shelbi.icns" "$compiled/"
+source_digest >"$compiled/Shelbi.icon.sha256"
+echo "==> drawing Command Grille as macOS shows it"
+draw_icon Shelbi "$compiled" "$icon_dir/command-grille"
+
+# Racing S is only ever drawn by the app itself (the bundle wears Command
+# Grille), so its compile stays in the scratch directory.
+compile_icon RacingS "$work/RacingS"
+echo "==> drawing Racing S as macOS shows it"
+draw_icon RacingS "$work/RacingS" "$icon_dir/racing-s"
 
 echo "==> cutting Retro from retro-1024.png"
 for size in 512 224 128; do

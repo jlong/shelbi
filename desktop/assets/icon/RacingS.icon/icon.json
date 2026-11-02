@@ -1,0 +1,63 @@
+{
+  "groups" : [
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "02-ribbon-opaque.svg",
+          "name" : "Porcelain ribbon"
+        }
+      ],
+      "name" : "02 Opaque ribbon",
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.5
+      }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : true,
+          "image-name" : "01-ribbon-translucent.svg",
+          "name" : "Ice ribbon"
+        }
+      ],
+      "name" : "01 Translucent ribbon",
+      "shadow" : {
+        "kind" : "neutral",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : true,
+        "value" : 0.5
+      }
+    },
+    {
+      "layers" : [
+        {
+          "glass" : false,
+          "image-name" : "00-background.svg",
+          "name" : "Opaque cobalt field"
+        }
+      ],
+      "name" : "00 Background",
+      "shadow" : {
+        "kind" : "none",
+        "opacity" : 0.5
+      },
+      "translucency" : {
+        "enabled" : false,
+        "value" : 0.5
+      }
+    }
+  ],
+  "supported-platforms" : {
+    "squares" : [
+      "macOS"
+    ]
+  }
+}
