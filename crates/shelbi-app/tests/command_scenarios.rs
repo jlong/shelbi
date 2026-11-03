@@ -482,11 +482,18 @@ fn the_zen_toggle_is_a_daemon_mutation_and_relabels() {
         project: PROJECT.into(),
     };
     assert_eq!(effect, Effect::Mutate(toggle.clone()));
-    assert_eq!(s.last(), &Performed::Mutation(toggle));
+    assert_eq!(s.last(), &Performed::Mutation(toggle.clone()));
     // The next refresh reports Zen on; the same entry now turns it off.
     s.model.zen_on = true;
     assert_eq!(title(&s.model), "Turn Zen Mode off");
     assert_eq!(s.client.view(), &View::Session("orch".into()), "the view stays put");
+
+    // A remote window runs it too: the far daemon makes the write
+    // (`StateWrite::ToggleZen` over the relay), so nothing refuses it.
+    s.model.remote_host = Some("jlong@devbox".into());
+    assert_eq!(s.model.unavailable(&CommandKind::ToggleZen), None);
+    assert_eq!(s.invoke("action:toggle-zen"), Effect::Mutate(toggle.clone()));
+    assert_eq!(s.last(), &Performed::Mutation(toggle));
 }
 
 #[test]

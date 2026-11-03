@@ -18,8 +18,8 @@ use std::path::Path;
 use serde::de::DeserializeOwned;
 use shelbi_proto::control::{
     self, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, ExpectedState,
-    MutationRequest, ReviewSessionRequest, ServerMsg, Stream as OutStream, WorkspaceSessionRequest,
-    CONTROL_PROTOCOL_VERSION,
+    MutationRequest, ReviewSessionRequest, ServerMsg, StateWriteRequest, Stream as OutStream,
+    WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
 };
 
 use crate::error::ClientError;
@@ -241,6 +241,27 @@ impl ControlClient {
                     stream,
                     text,
                 } if request_id == req.request_id => on_line(stream, &text),
+                ServerMsg::Done { request_id, .. } if request_id == req.request_id => return Ok(()),
+                ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
+                    return Err(ClientError::Mutation(error))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Ask the daemon to make one write to a project's state files (protocol
+    /// v7): it is the single writer and announces the change to the other
+    /// subscribers. Blocks until the daemon replies [`ServerMsg::Done`] (`Ok`)
+    /// or [`ServerMsg::Failed`] ([`ClientError::Mutation`]).
+    pub fn write_state(&mut self, req: &StateWriteRequest) -> Result<(), ClientError> {
+        self.write
+            .write_all(&control::encode(&ClientMsg::WriteState(req.clone()))?)?;
+        self.write.flush()?;
+
+        loop {
+            let msg: ServerMsg = self.read.read_frame()?.ok_or(ClientError::UnexpectedEof)?;
+            match msg {
                 ServerMsg::Done { request_id, .. } if request_id == req.request_id => return Ok(()),
                 ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
                     return Err(ClientError::Mutation(error))

@@ -23,11 +23,11 @@
 //!   instead of doing it: [`command_unavailable`] (the command registry
 //!   carries it, [`crate::command::CommandModel::remote_host`], so menus draw
 //!   the item disabled and the palette lists the reason), [`settings_read_only`]
-//!   (config saves, P8), [`drop_refused`] (image drops into a far terminal),
-//!   and the direct project-state writes (the board's workspace filter and
-//!   column overrides, the error log's read marks) a remote window keeps in
-//!   the window and never writes, here or there, until the far daemon owns
-//!   them (P7).
+//!   (config saves, P8), and [`drop_refused`] (image drops into a far
+//!   terminal). The project-state writes (the board's workspace filter and
+//!   column overrides, Zen Mode, the error log and its read marks, a pane's
+//!   reopen marker) go to the far daemon like issue mutations
+//!   ([`crate::state_write`]).
 //!
 //! The far daemon is never started implicitly: the window's link only
 //! reconnects after [`RemoteConnector::connect`] says the daemon runs, and a
@@ -150,14 +150,13 @@ pub fn remote_handle(
 
 /// Why `kind` can't run in a window on a project on `host`, or `None` when it
 /// can. These are the actions that still write this machine's files or
-/// command this machine's daemon, the ones the far side can't take yet (the
-/// direct state writes and config saves, P7 and P8; Edit in editor), and the
-/// ones a remote window never sends (Quit Shelbi, denylisted by the relay).
-/// Issue mutations, reviews and Quit Project go to the far daemon.
+/// command this machine's daemon, the ones the far side can't take yet (config
+/// saves, P8; Edit in editor), and the ones a remote window never sends (Quit
+/// Shelbi, denylisted by the relay). Issue mutations, project-state writes
+/// (Zen Mode among them), reviews and Quit Project go to the far daemon.
 pub fn command_unavailable(kind: &CommandKind, host: &str) -> Option<String> {
     let host = bare_host(host);
     let reason = match kind {
-        CommandKind::ToggleZen => format!("Zen Mode can't be switched from a remote window yet. Use Shelbi on {host}."),
         CommandKind::OpenEditor { .. } => {
             format!("Opening {host}'s files in an editor isn't available in a remote window yet.")
         }
@@ -168,6 +167,7 @@ pub fn command_unavailable(kind: &CommandKind, host: &str) -> Option<String> {
         }
         CommandKind::NewWindow => "Another window on a remote project isn't available yet.".to_string(),
         CommandKind::ShowView(_)
+        | CommandKind::ToggleZen
         | CommandKind::FocusWorkspace { .. }
         | CommandKind::LoadReview { .. }
         | CommandKind::OpenErrorLog
@@ -210,15 +210,6 @@ pub fn settings_read_only(host: &str) -> String {
 pub fn local_open_unavailable(host: &str) -> String {
     format!(
         "That folder is on {}: opening it from a remote window isn't available yet.",
-        bare_host(host)
-    )
-}
-
-/// Why the error log's Clear does nothing in a remote window: the log and
-/// its read marks are the far machine's state (P7).
-pub fn error_log_clear_unavailable(host: &str) -> String {
-    format!(
-        "Clearing {}'s error log isn't available in a remote window yet.",
         bare_host(host)
     )
 }
@@ -296,7 +287,6 @@ mod tests {
     #[test]
     fn far_writes_and_local_only_actions_are_unavailable_with_a_reason() {
         let unavailable = [
-            CommandKind::ToggleZen,
             CommandKind::OpenEditor {
                 target: crate::exec::EditTarget::ZenMode,
             },
@@ -316,6 +306,8 @@ mod tests {
                 to_status: "todo".into(),
             },
             CommandKind::QuitProject,
+            // A far state write, through the far daemon (P7).
+            CommandKind::ToggleZen,
             CommandKind::ShowView(crate::nav::View::Issues),
             CommandKind::OpenSettings,
         ] {

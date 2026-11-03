@@ -1100,15 +1100,16 @@ mod tests {
             local.iter().map(Command::id).collect::<Vec<_>>(),
             "nothing is dropped: a refused command stays listed",
         );
-        let zen = reg.resolve("action:toggle-zen", &m).unwrap();
-        let reason = m.unavailable(zen.kind()).expect("zen is a far state write");
-        assert_eq!(zen.to_entry().subtitle.as_deref(), Some(reason.as_str()));
-        assert!(zen.to_entry().shortcut.is_none(), "a refused command shows no shortcut");
         let quit = reg.resolve("action:quit-shelbi", &m).unwrap();
-        assert!(m.unavailable(quit.kind()).unwrap().contains("devbox"));
+        let reason = m.unavailable(quit.kind()).expect("Quit Shelbi never reaches the far host");
+        assert!(reason.contains("devbox"));
+        assert_eq!(quit.to_entry().subtitle.as_deref(), Some(reason.as_str()));
         // What goes to the far daemon stays available.
         let quit_project = reg.resolve("action:quit-project", &m).unwrap();
         assert_eq!(m.unavailable(quit_project.kind()), None);
+        let zen = reg.resolve("action:toggle-zen", &m).unwrap();
+        assert_eq!(m.unavailable(zen.kind()), None, "Zen Mode is a far state write");
+        assert_eq!(zen.to_entry().shortcut.as_deref(), Some("⌥Z"), "an available command keeps its shortcut");
         assert_eq!(m.unavailable(&CommandKind::ShowView(View::Issues)), None);
     }
 

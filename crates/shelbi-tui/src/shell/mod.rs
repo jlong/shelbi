@@ -3908,7 +3908,7 @@ impl ShellState {
             return;
         }
         self.spawn_quiet_job(move || {
-            shelbi_app::zen::report(&project, shelbi_app::zen::toggle(&project))
+            shelbi_app::zen::report(&project, None, shelbi_app::zen::toggle(&project, None))
         });
     }
 
@@ -3917,8 +3917,8 @@ impl ShellState {
     /// `apply_zen_intro_result`.
     fn apply_zen_intro(&mut self, project: String, confirmed: bool, dont_show_again: bool) {
         self.spawn_quiet_job(move || {
-            let result = shelbi_app::zen::apply_intro(&project, confirmed, dont_show_again);
-            shelbi_app::zen::report(&project, result)
+            let result = shelbi_app::zen::apply_intro(&project, None, confirmed, dont_show_again);
+            shelbi_app::zen::report(&project, None, result)
         });
     }
 
@@ -6806,6 +6806,11 @@ mod tests {
         let saved_sock = std::env::var_os("SHELBI_HUB_SOCK");
         std::env::set_var("SHELBI_HOME", &home);
         std::env::set_var("SHELBI_HUB_SOCK", home.join("hub.sock"));
+        // No daemon runs here: the toggle's state writes are made in-process
+        // by the function the daemon runs for them.
+        shelbi_app::state_write::test_support::write_locally_with(std::sync::Arc::new(
+            shelbi_orchestrator::state_write::apply,
+        ));
         shelbi_state::mark_zen_intro_seen().unwrap();
         body(&home);
         match saved_sock {

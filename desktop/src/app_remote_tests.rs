@@ -266,7 +266,6 @@ fn what_a_remote_window_cant_do_yet_is_refused_with_the_reason(cx: &mut TestAppC
     let far = FarHost::new("refuse");
     let handle = open(cx, &far);
     for kind in [
-        CommandKind::ToggleZen,
         CommandKind::QuitShelbi,
         CommandKind::AddProject,
         CommandKind::NewWindow,
@@ -288,12 +287,49 @@ fn what_a_remote_window_cant_do_yet_is_refused_with_the_reason(cx: &mut TestAppC
     let entry = read(cx, handle, |w, _| {
         w.palette_entries()
             .into_iter()
-            .find(|e| e.id == "action:toggle-zen")
+            .find(|e| e.id == "action:quit-shelbi")
             .unwrap()
     });
     assert_eq!(
         entry.subtitle,
-        remote_window::command_unavailable(&CommandKind::ToggleZen, HOST)
+        remote_window::command_unavailable(&CommandKind::QuitShelbi, HOST)
     );
+}
+
+#[gpui::test]
+fn zen_and_the_error_log_are_written_by_the_far_daemon(cx: &mut TestAppContext) {
+    use shelbi_proto::control::StateWrite;
+    setup(cx);
+    let far = FarHost::new("writes");
+    // The intro is the viewer's own (this machine's), already seen.
+    shelbi_state::mark_zen_intro_seen().unwrap();
+    shelbi_state::append_error(PROJECT, "the far board didn't refresh", Some("poller")).unwrap();
+    let handle = open(cx, &far);
+    let wrote = |what: fn(&StateWrite) -> bool| far.writes.lock().unwrap().iter().any(what);
+
+    run(cx, handle, CommandKind::ToggleZen);
+    settle(cx, "the far daemon to flip Zen", |_| wrote(|w| matches!(w, StateWrite::ToggleZen { .. })));
+    assert_eq!(read(cx, handle, |w, _| w.banner.clone()), None, "nothing was refused");
+    assert_eq!(
+        shelbi_state::read_state(PROJECT).unwrap().zen_mode,
+        shelbi_state::ZenModeState::On
+    );
+
+    run(cx, handle, CommandKind::OpenErrorLog);
+    settle(cx, "the far daemon to mark the log read", |_| wrote(|w| *w == StateWrite::MarkErrorsRead));
+    assert_eq!(shelbi_state::unread_error_count(PROJECT).unwrap(), 0);
+
+    update(cx, handle, |w, window, cx| {
+        w.apply_overlay_event(
+            OverlayEvent::ClearErrors {
+                project: PROJECT.into(),
+            },
+            window,
+            cx,
+        )
+    });
+    settle(cx, "the far daemon to clear the log", |_| wrote(|w| *w == StateWrite::ClearErrors));
+    assert_eq!(read(cx, handle, |w, _| w.banner.clone()), None, "the clear wasn't refused");
+    assert!(shelbi_state::read_errors(PROJECT).unwrap().is_empty());
 }
 

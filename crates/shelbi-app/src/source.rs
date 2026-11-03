@@ -470,6 +470,21 @@ impl ProjectLink {
             }
         }
     }
+
+    /// Ask the project's daemon to make one write to its state files (the
+    /// board's filter and column overrides, Zen Mode, the error log, a pane's
+    /// reopen marker): this machine's, or the host's over its relay. The
+    /// daemon is their single writer and tells its other clients. Blocking.
+    pub fn write_state(&self, write: crate::state_write::StateWrite) -> Result<(), String> {
+        match &self.relay {
+            None => crate::exec_daemon::write_state(&self.key.name, write).map_err(|e| e.to_string()),
+            Some(relay) => {
+                let mut client = Self::far_control(&**relay, &self.key.name).map_err(|e| e.to_string())?;
+                crate::exec_daemon::write_state_over(&mut client, &self.key.name, write)
+                    .map_err(|e| format!("{}: {e}", relay.host()))
+            }
+        }
+    }
 }
 
 /// What a window owns for the project it shows: the key, the source its

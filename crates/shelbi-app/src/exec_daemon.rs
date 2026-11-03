@@ -14,7 +14,8 @@
 
 use shelbi_proto::control::{
     AddSpec, EditSpec, ExpectedState, MutationKind, MutationRequest, ReviewSessionOp,
-    ReviewSessionRequest, Stream, WorkspaceSessionOp, WorkspaceSessionRequest,
+    ReviewSessionRequest, StateWrite, StateWriteRequest, Stream, WorkspaceSessionOp,
+    WorkspaceSessionRequest,
 };
 
 use shelbi_client::ControlClient;
@@ -129,6 +130,31 @@ pub(crate) fn workspace_session_over(
         op,
     };
     client.workspace_session(&req, on_line).map_err(map_client_err)
+}
+
+/// Ask this machine's daemon, started on demand, to make one write to
+/// `project`'s state files (control protocol v7): the daemon is their single
+/// writer and announces the change to its other clients. A remote window's
+/// writes go to its host's daemon instead
+/// ([`ProjectLink::write_state`](crate::source::ProjectLink::write_state)).
+pub fn write_state(project: &str, write: StateWrite) -> ExecOutcome {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(writer) = crate::state_write::test_support::local_writer() {
+        return writer(project, &write).map_err(ExecError::Backend);
+    }
+    let mut client = connect_local()?;
+    write_state_over(&mut client, project, write)
+}
+
+/// [`write_state`] over an already connected control client (a remote
+/// window's, on its host's `control` service).
+pub(crate) fn write_state_over(client: &mut ControlClient, project: &str, write: StateWrite) -> ExecOutcome {
+    let req = StateWriteRequest {
+        request_id: 1,
+        project: project.to_string(),
+        write,
+    };
+    client.write_state(&req).map_err(map_client_err)
 }
 
 /// Map an app [`Mutation`] to `(project, issue id, wire kind)`. The two

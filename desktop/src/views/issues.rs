@@ -51,6 +51,7 @@ use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
 use shelbi_app::board::{BoardRead, ClosedPage};
 use shelbi_app::board_search::SearchWorker;
 use shelbi_app::source::ProjectHandle;
+use shelbi_app::state_write::{self, StateWrite};
 use shelbi_app::{
     CommandKind, ExecError, ExpectedState, IssueCard, IssueColumn, TaskDetailModel,
 };
@@ -956,28 +957,20 @@ impl IssuesView {
                 Intent::Refresh => self.refresh(),
                 Intent::LoadMore => self.load_more(),
                 Intent::PersistWorkspaceFilter(filter) => {
-                    let project = self.state.project.clone();
-                    let disk = filter.map(|f| f.to_disk());
-                    self.persist(move || {
-                        shelbi_state::set_workspace_filter(&project, disk.as_deref())
-                            .map_err(|e| format!("filter persist failed: {e}"))
-                    });
+                    let filter = filter.map(|f| f.to_disk());
+                    self.persist(StateWrite::SetWorkspaceFilter { filter }, "filter");
                 }
                 Intent::PersistColumnOverride {
                     workflow,
                     status_id,
                     value,
                 } => {
-                    let project = self.state.project.clone();
-                    self.persist(move || {
-                        shelbi_state::set_kanban_column_override(
-                            &project,
-                            &workflow,
-                            &status_id,
-                            Some(value),
-                        )
-                        .map_err(|e| format!("column override persist failed: {e}"))
-                    });
+                    let write = StateWrite::SetColumnOverride {
+                        workflow,
+                        status: status_id,
+                        value: Some(state_write::column_override(value)),
+                    };
+                    self.persist(write, "column override");
                 }
                 Intent::ScrollDetail(s) => self.scroll_detail(s),
                 Intent::BeginEdit(id) => self.begin_edit(&id, window, cx),
@@ -998,18 +991,17 @@ impl IssuesView {
         }
     }
 
-    /// Small `state.json` writes, off the UI thread.
     /// Write a board setting (the workspace filter, a column override) off
-    /// the UI thread. A remote window's project keeps them in the window:
-    /// they are the far machine's project state, which it doesn't write yet
-    /// (P7), and never this machine's.
-    fn persist(&self, f: impl FnOnce() -> Result<(), String> + Send + 'static) {
-        if !self.project.key().is_local() {
-            return;
-        }
+    /// the UI thread, through the project's daemon: this machine's, or the
+    /// far host's for a remote window. `what` names it in a failure.
+    fn persist(&self, write: StateWrite, what: &'static str) {
+        let link = self.project.link.clone();
         let tx = self.done_tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Done::Persisted(f()));
+            let result = link
+                .write_state(write)
+                .map_err(|e| format!("{what} persist failed: {e}"));
+            let _ = tx.send(Done::Persisted(result));
         });
     }
 

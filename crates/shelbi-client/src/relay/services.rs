@@ -51,8 +51,8 @@ pub type QueryHandler = Arc<dyn Fn(&[u8], &mut dyn FnMut(Vec<u8>)) + Send + Sync
 ///
 /// Refused (maintainer decision, remote-window plan section 7): quitting Shelbi
 /// on the far machine, reloading every far client, detaching every far client,
-/// and quitting any project but the window's own. Every refused message
-/// carries a request id, which the refusal answers.
+/// and quitting, or writing the state of, any project but the window's own.
+/// Every refused message carries a request id, which the refusal answers.
 pub fn control_refusal(msg: &ClientMsg, project: &str) -> Option<(u64, String)> {
     let why = |what: &str| format!("{what} isn't allowed from a remote window");
     match msg {
@@ -70,6 +70,10 @@ pub fn control_refusal(msg: &ClientMsg, project: &str) -> Option<(u64, String)> 
             *request_id,
             why(&format!("Quitting project `{other}` from a window on `{project}`")),
         )),
+        ClientMsg::WriteState(req) if req.project != project => Some((
+            req.request_id,
+            why(&format!("Changing project `{}` from a window on `{project}`", req.project)),
+        )),
         ClientMsg::Hello { .. }
         | ClientMsg::Subscribe { .. }
         | ClientMsg::Mutate(_)
@@ -77,7 +81,8 @@ pub fn control_refusal(msg: &ClientMsg, project: &str) -> Option<(u64, String)> 
         | ClientMsg::ReviewSession(_)
         | ClientMsg::WorkspaceSession(_)
         | ClientMsg::ListClients { .. }
-        | ClientMsg::DetachClients { .. } => None,
+        | ClientMsg::DetachClients { .. }
+        | ClientMsg::WriteState(_) => None,
     }
 }
 
@@ -360,7 +365,19 @@ fn open_query(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shelbi_proto::control::{ClientInfo, ClientKind, MutationKind, MutationRequest};
+    use shelbi_proto::control::{
+        ClientInfo, ClientKind, MutationKind, MutationRequest, StateWrite, StateWriteRequest,
+    };
+
+    fn write_state(project: &str) -> ClientMsg {
+        ClientMsg::WriteState(StateWriteRequest {
+            request_id: 5,
+            project: project.into(),
+            write: StateWrite::ToggleZen {
+                source: "user:palette".into(),
+            },
+        })
+    }
 
     fn refused(msg: ClientMsg) -> bool {
         control_refusal(&msg, "mine").is_some()
@@ -379,6 +396,7 @@ mod tests {
             request_id: 4,
             project: "theirs".into(),
         }));
+        assert!(refused(write_state("theirs")), "another project's state is off limits");
         let (id, why) = control_refusal(&ClientMsg::QuitShelbi { request_id: 9 }, "mine").unwrap();
         assert_eq!(id, 9);
         assert!(why.contains("remote window"), "{why}");
@@ -418,6 +436,7 @@ mod tests {
             expected: None,
             kind: MutationKind::Unassign,
         })));
+        assert!(!refused(write_state("mine")), "the window's own project state is its to write");
     }
 
     #[test]
