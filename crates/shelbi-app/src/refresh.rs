@@ -12,7 +12,7 @@
 //! `shelbi-state` IO (the host supplies the real reader; tests supply a
 //! canned one).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -172,6 +172,16 @@ pub struct Refresher<T> {
     snapshot_rx: Receiver<T>,
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    /// Set for an [`inline_worker`]: the reader runs on the caller's thread.
+    inline: Option<Inline<T>>,
+}
+
+/// An [`inline_worker`]'s reader, the sender its results go back through,
+/// and the next generation to hand it.
+struct Inline<T> {
+    reader: Box<dyn Fn(u64) -> T + Send>,
+    result_tx: Sender<T>,
+    generation: AtomicU64,
 }
 
 /// Spawn a [`Refresher`] driven by `reader`. The worker blocks until
@@ -211,13 +221,47 @@ where
         snapshot_rx,
         stop,
         join: Some(join),
+        inline: None,
+    }
+}
+
+/// A [`Refresher`] with no worker thread: [`Refresher::request`] calls
+/// `reader(gen)` on the caller's thread before it returns, and the next
+/// [`Refresher::latest`] hands the result back. For tests that drive a view's
+/// refresh loop deterministically (no thread to wait on, no wall-clock
+/// budget): one request then one `latest` always sees the read. Never for a
+/// UI thread in production, where a slow read would freeze it.
+pub fn inline_worker<T, F>(reader: F) -> Refresher<T>
+where
+    T: Send + 'static,
+    F: Fn(u64) -> T + Send + 'static,
+{
+    let (result_tx, snapshot_rx) = mpsc::channel::<T>();
+    Refresher {
+        request_tx: None,
+        snapshot_rx,
+        stop: Arc::new(AtomicBool::new(false)),
+        join: None,
+        inline: Some(Inline {
+            reader: Box::new(reader),
+            result_tx,
+            generation: AtomicU64::new(0),
+        }),
     }
 }
 
 impl<T> Refresher<T> {
-    /// Ask for a refresh. Returns immediately; the read happens on the worker.
-    /// Returns `false` if the worker has stopped.
+    /// Ask for a refresh. Returns immediately; the read happens on the worker
+    /// (an [`inline_worker`] reads before returning). Returns `false` if the
+    /// worker has stopped.
     pub fn request(&self) -> bool {
+        if let Some(inline) = &self.inline {
+            if self.stop.load(Ordering::Acquire) {
+                return false;
+            }
+            let generation = inline.generation.fetch_add(1, Ordering::Relaxed);
+            return inline.result_tx.send((inline.reader)(generation)).is_ok();
+        }
         match &self.request_tx {
             Some(tx) => tx.send(()).is_ok(),
             None => false,
@@ -405,5 +449,21 @@ mod tests {
         worker.stop_without_waiting();
         drop(worker);
         assert!(t0.elapsed() < Duration::from_millis(100), "took {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn an_inline_worker_reads_on_the_callers_thread() {
+        let caller = std::thread::current().id();
+        let mut worker = inline_worker(move |generation| (generation, std::thread::current().id() == caller));
+        assert_eq!(worker.latest(), None, "nothing read before a request");
+        assert!(worker.request());
+        assert_eq!(worker.latest(), Some((0, true)), "the read lands before request returns");
+        assert_eq!(worker.latest(), None, "drained");
+        assert!(worker.request());
+        assert!(worker.request());
+        assert_eq!(worker.latest(), Some((2, true)), "each request reads; latest is the freshest");
+        worker.stop();
+        assert!(!worker.request(), "a stopped worker refuses requests");
+        assert_eq!(worker.latest(), None);
     }
 }

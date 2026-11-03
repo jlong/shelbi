@@ -187,12 +187,18 @@ impl ChangelogView {
         let source = project.source.clone();
         // The stamp of the last read: the next reads only when it changed.
         let last = Mutex::new(None);
-        let refresher = shelbi_app::spawn_worker(move |_| {
+        let read = move |_| {
             let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
             let data = source.changelog(last.as_ref())?;
             *last = Some(data.stamp);
             Some(data)
-        });
+        };
+        // Tests read inline, on the test's thread: a tick asks for a read
+        // and the next folds it in, with no worker thread to wait on.
+        #[cfg(not(test))]
+        let refresher = shelbi_app::spawn_worker(read);
+        #[cfg(test)]
+        let refresher = shelbi_app::inline_worker(read);
         refresher.request();
         let poll = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(REFRESH_INTERVAL).await;
@@ -872,7 +878,6 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
     use shelbi_state::changelog::{add_entry, NewEntry, PrRef};
-    use std::time::Instant;
 
     fn nav(spec: &str) -> Option<Nav> {
         nav_for(&Keystroke::parse(spec).unwrap())
@@ -932,19 +937,20 @@ mod tests {
         }
     }
 
-    /// Settle until `done` (the page's worker reads on its own thread).
-    fn until(view: &Entity<ChangelogView>, cx: &mut VisualTestContext, done: impl Fn(&ChangelogModel) -> bool) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(10) {
+    /// Fold in what is on disk and draw. The page reads inline under test
+    /// ([`shelbi_app::inline_worker`]), so this needs no thread or clock: the
+    /// first tick asks for a read (it runs before `request` returns) and the
+    /// second folds it into the model, as two ticks of the poll would.
+    fn settle(view: &Entity<ChangelogView>, cx: &mut VisualTestContext) {
+        for _ in 0..2 {
             view.update(cx, |v, cx| v.tick(cx));
             cx.update(|window, cx| window.draw(cx).clear(cx));
             cx.run_until_parked();
-            if view.read_with(cx, |v, _| done(&v.model)) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(20));
         }
-        false
+    }
+
+    fn model<R>(view: &Entity<ChangelogView>, cx: &VisualTestContext, read: impl Fn(&ChangelogModel) -> R) -> R {
+        view.read_with(cx, |v, _| read(&v.model))
     }
 
     #[gpui::test]
@@ -979,10 +985,8 @@ mod tests {
         let oldest = ids[0].clone();
         vcx.update(|window, cx| view.update(cx, |v, cx| v.search_for("entry 7", window, cx)));
         vcx.update(|window, cx| view.update(cx, |v, cx| v.reveal(&oldest, window, cx)));
-        assert!(until(&view, &mut vcx, |m| m.total() == 8), "the first read lands");
-        view.update(&mut vcx, |v, cx| v.tick(cx));
-        vcx.update(|window, cx| window.draw(cx).clear(cx));
-        vcx.run_until_parked();
+        settle(&view, &mut vcx);
+        assert_eq!(model(&view, &vcx, |m| m.total()), 8, "the first read lands");
         let (query, at, top) = view.read_with(&vcx, |v, _| {
             let at = v.model().visible().position(|e| e.id == oldest);
             (v.model().query().to_string(), at, v.scroll_top().item_ix)
@@ -1040,7 +1044,8 @@ mod tests {
             .detach();
         });
 
-        assert!(until(&view, &mut vcx, |m| m.total() == 2), "the first read lands");
+        settle(&view, &mut vcx);
+        assert_eq!(model(&view, &vcx, |m| m.total()), 2, "the first read lands");
         let titles: Vec<String> = view.read_with(&vcx, |v, _| v.model.visible().map(|e| e.title.clone()).collect());
         assert_eq!(titles, ["Contact Us", "A faster board"], "newest first");
         assert!(vcx.debug_bounds("changelog-entries").is_some());
@@ -1058,7 +1063,8 @@ mod tests {
 
         // An entry added outside the page appears on its own.
         add_entry(project, entry("Changelog view", &["changelog-desktop"], "Blog layout.")).unwrap();
-        assert!(until(&view, &mut vcx, |m| m.total() == 3), "the new entry appears live");
+        settle(&view, &mut vcx);
+        assert_eq!(model(&view, &vcx, |m| m.total()), 3, "the new entry appears live");
 
         // ⌘F, then a query: the entries narrow, the subtitle counts them.
         vcx.simulate_keystrokes("cmd-f");
@@ -1066,15 +1072,18 @@ mod tests {
             assert!(v.search_focused(window, cx), "⌘F puts the keyboard in the search");
             v.search_for("board", window, cx);
         });
-        assert!(until(&view, &mut vcx, |m| m.match_count() == 1));
+        settle(&view, &mut vcx);
+        assert_eq!(model(&view, &vcx, |m| m.match_count()), 1);
         assert_eq!(view.read_with(&vcx, |v, _| v.subtitle()).as_deref(), Some("1 of 3 entries"));
         // A query nothing matches says so, with a way back.
         view.update_in(&mut vcx, |v, window, cx| v.search_for("zzz", window, cx));
-        assert!(until(&view, &mut vcx, |m| m.match_count() == 0));
+        settle(&view, &mut vcx);
+        assert_eq!(model(&view, &vcx, |m| m.match_count()), 0);
         assert!(vcx.debug_bounds("changelog-no-match").is_some());
         // Esc in the entries clears it.
         view.update_in(&mut vcx, |v, window, cx| v.navigate(Nav::ClearSearch, window, cx));
-        assert!(until(&view, &mut vcx, |m| m.query().is_empty() && m.match_count() == 3));
+        settle(&view, &mut vcx);
+        assert_eq!(model(&view, &vcx, |m| (m.query().to_string(), m.match_count())), (String::new(), 3));
 
         view.update(&mut vcx, |v, _| v.stop_workers());
         unsafe { std::env::remove_var("SHELBI_HOME") };
@@ -1099,7 +1108,8 @@ mod tests {
         });
         let mut vcx = VisualTestContext::from_window(handle.into(), cx);
         let view = handle.root(&mut vcx).unwrap();
-        assert!(until(&view, &mut vcx, |m| !m.is_loading()), "the read lands");
+        settle(&view, &mut vcx);
+        assert!(!model(&view, &vcx, |m| m.is_loading()), "the read lands");
         assert!(vcx.debug_bounds("changelog-empty").is_some());
         assert_eq!(view.read_with(&vcx, |v, _| v.subtitle()), None);
         view.update(&mut vcx, |v, _| v.stop_workers());
