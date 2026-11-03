@@ -28,6 +28,9 @@
 //! - [`settings`] — Settings' pages and sections, the settings sidebar's
 //!   navigation over the pages a client offers, and the hooks a page uses
 //!   for background loads and saves and the unsaved-edits leave prompt.
+//! - [`new_task`] — the New task dialog: the draft, its pickers, the
+//!   create request and the orchestrator write-up hand-off, shared by both
+//!   clients' dialogs.
 //! - [`feedback`] — Contact Us: the form's state, what a report sends
 //!   and how, shared by the desktop's dialog and the TUI's.
 //! - [`text_area`] — a multi-line text buffer with a caret, for the editors
@@ -78,6 +81,7 @@ pub mod command_model;
 pub mod exec;
 pub mod exec_daemon;
 pub mod issue_edit;
+pub mod new_task;
 pub mod feedback;
 pub mod harness_picker;
 pub mod launch;

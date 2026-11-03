@@ -40,6 +40,7 @@ paths on every `cargo test`.
 | Approve | `action:approve-review:<id>` | Reached the daemon; the sandbox's gated merge refused (no `origin` to push to) and the status line said so | Reached the daemon; refused (the slot never loaded the task) and the banner said so |
 | Reject | `action:reject-review:<id>` | Reason prompt; Ctrl+D sent it; the task went back to `todo` | Same (Reviews ▸ … ▸ Reject…) |
 | Zen toggle | `action:toggle-zen` | First off-to-on shows the intro; confirm turned Zen on; again turned it off | Same; the View menu item relabels on/off |
+| New Issue | `action:new-issue` | Added after this walk (`new-task-dialog`), covered by both smoke tests: the New task overlay over the view (also the board's `n` and its `+ New issue`), Ctrl+Enter creates | The New task dialog over the window (`views/new_task.rs`; also the board's New issue and `n`, File ▸ New Issue…), ⌘Return creates; the window flashes the outcome |
 | Error log | `action:error-log` | Overlay ("No errors logged.") | Same (View ▸ Error Log) |
 | Settings | `action:settings` | Added after this walk (`tui-settings-shell`), covered by both smoke tests: Settings over the view, its sidebar in the sidebar's column (also `,` in the sidebar and the ⚙ beside the project title) | The existing Settings, on the page last used (Shelbi ▸ Settings…, ⌘,) |
 | Switch Project | `action:switch-project` | Fixed here: was a switch to an empty project name; now the palette's Projects column, focused | The sidebar's project switcher (File ▸ Switch Project…) |
@@ -648,6 +649,34 @@ Built by `shelbi_app::harness_picker::HarnessPicker::models` for both Default mo
 | `model` | not shown: what choosing the row selects (`shell/onboarding.rs` `choose`, `overlay/add_project.rs` `choose`) | not shown: what choosing the row selects (`views/harness_picker.rs` `fields`) |
 | `label` | picker row (`picker.rs` `model_labels`) | menu row (`views/harness_picker.rs` `fields`) |
 | `selected` | the row's ✓ (`picker.rs` `render_menu`) | the row's selected fill (`views/harness_picker.rs` `fields`) |
+
+### `NewTaskModel`
+The New task dialog (`new-task-dialog`), built by `shelbi_app::new_task::NewTaskForm::model`; the copy is in `shelbi_app::new_task`. TUI: `overlay/new_task.rs`. Desktop: `views/new_task.rs` (Figma `2730:10845`).
+
+| Field | TUI | Desktop |
+|---|---|---|
+| `title` | the Title box's text, the caret while typed in (`overlay/new_task.rs` `title_field`; typing kept in the dialog's `TextArea`) | the Title field's text (`views/new_task.rs` `render`, kept in its `InputState`) |
+| `workflow` | the Workflow box's value (`overlay/new_task.rs` `pickers`) | the Workflow button's label (`views/new_task.rs` `render_pickers`) |
+| `workflows` | the Workflow picker's rows, the chosen one ✓ (`overlay/new_task.rs` `render_menu`) | the Workflow menu's rows, the chosen one checked (`views/new_task.rs` `menu_row`) |
+| `status` | the Status box's value (`overlay/new_task.rs` `pickers`) | the Status button's label (`views/new_task.rs` `render_pickers`) |
+| `status_category` | the status glyph before the Status value, in its category color (`overlay/new_task.rs` `select_lines`) | the status glyph in the Status button's Left Icon slot (`views/new_task.rs` `render_pickers`) |
+| `statuses` | the Status picker's rows, each with its glyph (`overlay/new_task.rs` `render_menu`) | the Status menu's rows, each with its glyph (`views/new_task.rs` `menu_row`) |
+| `priority` | the Priority box's value (`overlay/new_task.rs` `pickers`) | the Priority button's label (`views/new_task.rs` `render_pickers`) |
+| `priorities` | the Priority picker's rows (`overlay/new_task.rs` `render_menu`) | the Priority menu's rows (`views/new_task.rs` `menu_row`) |
+| `description` | the Description box's wrapped text, the placeholder while empty (`overlay/new_task.rs` `description_field`) | the Description box's text, the placeholder while empty (`views/new_task.rs` `render_description`) |
+| `write_up` | `( ● )` / `( ○ )` on the write-up card (`overlay/new_task.rs` `write_up`) | the Switch on the write-up card (`views/new_task.rs` `render_write_up`, `controls::switch`) |
+| `focus` | the lit box, label or button (`overlay/new_task.rs` `title_field`, `pickers`, `write_up`, `footer`) | the field with the keyboard, the focus ring on the rest once the keyboard is used (`views/new_task.rs` `sync_focus`, `ring`) |
+| `menu` | the open picker's rows dropped below its box, the keyboard's row lit (`overlay/new_task.rs` `render_menu`) | the open menu under its button, the keyboard's row selected (`views/new_task.rs` `render_pickers`) |
+| `can_create` | Create Task enabled or dimmed (`overlay/new_task.rs` `footer`) | Create Task enabled or disabled (`views/new_task.rs` `render_footer`) |
+| `creating` | "Creating…" on a disabled Create Task, Cancel disabled (`overlay/new_task.rs` `footer`) | "Creating…" with a spinner, Cancel disabled (`views/new_task.rs` `render_footer`) |
+| `error` | red, over the footer's rule (`overlay/new_task.rs` `lines`) | red, over the footer (`views/new_task.rs` `render`) |
+
+### `NewTaskOption`
+| Field | TUI | Desktop |
+|---|---|---|
+| `label` | the picker row's text (`overlay/new_task.rs` `render_menu`) | the menu row's text (`views/new_task.rs` `menu_row`) |
+| `category` | a status row's glyph (`overlay/new_task.rs` `render_menu`) | a status row's glyph (`views/new_task.rs` `menu_row`) |
+| `selected` | the row's ✓ (`overlay/new_task.rs` `render_menu`) | the row's check mark (`views/new_task.rs` `menu_row`) |
 
 ### `ErrorLogModel`
 Neither client consumes `ErrorLogModel`. Both render `shelbi_state::read_errors_with_unread` rows (`(ErrorLogEntry, bool)`) through the shared `shelbi_app::overlay::error_log::Viewer`. Mapped to that datum:

@@ -161,6 +161,15 @@ enum SettingsMsg {
 /// Reads the General summary for a project (blocking; run off the UI thread).
 type SettingsReader = Arc<dyn Fn(Option<&str>) -> GeneralSummary + Send + Sync>;
 
+/// Runs New task's create in `project` (the daemon's add, then the
+/// orchestrator hand-off): [`shelbi_app::new_task::create_live`], or a
+/// test's recorder. Called off the UI thread.
+type NewTaskRunner = Arc<
+    dyn Fn(&str, &shelbi_app::new_task::CreateRequest) -> Result<shelbi_app::new_task::Created, String>
+        + Send
+        + Sync,
+>;
+
 /// Reads a project's workflow config for Settings ▸ Workflows (blocking; run
 /// off the UI thread).
 type WorkflowsReader = Arc<dyn Fn(&str) -> Result<WorkflowConfig, String> + Send + Sync>;
@@ -632,6 +641,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             state.dirty = true;
         }
         if state.poll_feedback_job() {
+            state.dirty = true;
+        }
+        if state.poll_new_task_job() {
             state.dirty = true;
         }
         if state.poll_launch() {
@@ -1162,6 +1174,7 @@ fn production_workers(project: &str, activity_cache: Arc<Mutex<ActivityMetaCache
 fn build_embedded_apps(project: &str, keymaps: &Keymaps) -> (KanbanApp, ActivityApp, MachinesApp) {
     let mut kanban = KanbanApp::new(project);
     kanban.keymaps = keymaps.clone();
+    kanban.show_new_issue = true;
     // Board moves go through the shelbi-app executor (daemon-backed when
     // `dev.daemon_mutations` is on); the standalone process keeps its direct path.
     kanban.move_persister = Some(Arc::new(ExecutorMovePersister));
@@ -1459,6 +1472,11 @@ struct ShellState {
     feedback_service: shelbi_app::feedback::FeedbackService,
     /// The Contact Us send that's out, off the UI thread.
     feedback_job: Option<Receiver<Result<(), shelbi_app::feedback::FeedbackError>>>,
+    /// New task's create that's out, off the UI thread.
+    new_task_job: Option<Receiver<Result<shelbi_app::new_task::Created, String>>>,
+    /// Runs New task's create (the daemon's add, then the orchestrator
+    /// hand-off): the live one, or a test's recorder.
+    new_task_runner: NewTaskRunner,
     /// How the launch screen and Connect to Remote Session reach another
     /// machine (`None`: connecting isn't offered, so the palette doesn't
     /// list it), and start the daemon for a project they open: the live
@@ -1700,6 +1718,10 @@ impl ShellState {
             create_job: None,
             feedback_service,
             feedback_job: None,
+            new_task_job: None,
+            new_task_runner: Arc::new(|project: &str, request: &shelbi_app::new_task::CreateRequest| {
+                shelbi_app::new_task::create_live(project, request)
+            }),
             remote: crate::launch::remote_connector(),
             launch_daemon: Arc::new(shelbi_app::launch::SharedDaemon),
             should_quit: false,
@@ -3571,6 +3593,7 @@ impl ShellState {
             }
             OverlayEvent::OpenUrl(url) => self.open_url(url),
             OverlayEvent::FeedbackSend(submission) => self.send_feedback(submission),
+            OverlayEvent::NewTaskCreate(request) => self.create_new_task(request),
             OverlayEvent::OpenAcknowledgements => {
                 self.overlay = None;
                 self.open_acknowledgements(AckReturn { about: true });
@@ -3613,6 +3636,69 @@ impl ShellState {
             Ok(_) => self.feedback_job = Some(rx),
             Err(e) => self.feedback_landed(Err(shelbi_app::feedback::FeedbackError::Network(e.to_string()))),
         }
+    }
+
+    /// Open New task for `project` over the current view, its pickers from
+    /// the board's loaded workflows.
+    fn open_new_task(&mut self, project: &str) {
+        let dialog = ActiveOverlay::new_task(project, &self.kanban.workflows, &self.kanban.default_workflow_name);
+        self.overlay = Some(dialog);
+        self.dirty = true;
+    }
+
+    /// Run New task's create off the UI thread; [`Self::poll_new_task_job`]
+    /// hands the answer back. The dialog stays up meanwhile, "Creating…".
+    fn create_new_task(&mut self, request: shelbi_app::new_task::CreateRequest) {
+        let Some(ActiveOverlay::NewTask(dialog)) = self.overlay.as_ref() else {
+            return;
+        };
+        let project = dialog.project().to_string();
+        let runner = self.new_task_runner.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-new-task".into())
+            .spawn(move || {
+                let _ = tx.send(runner(&project, &request));
+            });
+        match spawned {
+            Ok(_) => self.new_task_job = Some(rx),
+            Err(e) => self.new_task_landed(Err(e.to_string())),
+        }
+    }
+
+    /// New task's create came back: hand it to the dialog. Returns `true`
+    /// when it did (so the caller redraws).
+    fn poll_new_task_job(&mut self) -> bool {
+        let result = match &self.new_task_job {
+            Some(rx) => match rx.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => Err("the create stopped unexpectedly".to_string()),
+            },
+            None => return false,
+        };
+        self.new_task_job = None;
+        self.new_task_landed(result);
+        true
+    }
+
+    /// Created: close the dialog and say so (and what became of the
+    /// write-up) on the status line; failed: the error under the form.
+    fn new_task_landed(&mut self, result: Result<shelbi_app::new_task::Created, String>) {
+        let message = result.as_ref().ok().map(|c| c.message());
+        let Some(ActiveOverlay::NewTask(dialog)) = self.overlay.as_mut() else {
+            self.status = message;
+            return;
+        };
+        let step = dialog.finished(result.map(|_| ()));
+        if step == crate::overlay::new_task::Step::Close {
+            self.overlay = None;
+            self.client.focus_main();
+        }
+        if message.is_some() {
+            self.status = message;
+        }
+        self.dirty = true;
     }
 
     /// The Contact Us send came back: hand it to the dialog. Returns `true`
@@ -3983,6 +4069,8 @@ impl ShellState {
             }
             Effect::Mutate(m @ Mutation::EditIssue { .. }) => self.spawn_mutation(m, "edited", "edit failed"),
             Effect::Mutate(m @ Mutation::AddIssue { .. }) => self.spawn_mutation(m, "added", "add failed"),
+            // New task, over whatever is showing, on the board's workflows.
+            Effect::NewIssue { project } => self.open_new_task(&project),
             Effect::Mutate(m @ Mutation::PrioritizeIssue { .. }) => {
                 self.spawn_mutation(m, "reordered", "reorder failed")
             }
@@ -5061,6 +5149,8 @@ impl ShellState {
             // In one process there's no board process to quit, and the palette is
             // a later phase; both are no-ops here.
             Outcome::Quit | Outcome::OpenPalette | Outcome::Continue => {}
+            // `n`: New task, as the palette's New Issue.
+            Outcome::NewIssue => self.run_command(CommandKind::NewIssue),
         }
     }
 
@@ -5348,6 +5438,18 @@ impl ShellState {
         // coordinate math applies unchanged.
         match &self.main_view {
             MainView::Native(View::Issues) => {
+                // The title row's `+ New issue` opens New task (no menu or
+                // detail is up over it then).
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !self.kanban.popover_is_open()
+                    && !self.kanban.workspace_dropdown_is_open()
+                    && !self.kanban.workflow_dropdown_is_open()
+                    && self.kanban.new_issue_at(m.column, m.row)
+                {
+                    self.run_command(CommandKind::NewIssue);
+                    self.dirty = true;
+                    return;
+                }
                 crate::handlers::kanban::handle_kanban_mouse(&mut self.kanban, m);
                 self.dirty = true;
                 return;
@@ -6295,6 +6397,9 @@ mod tests {
     mod stray_output;
     // Contact Us opened, typed into and sent (`tests/feedback.rs`).
     mod feedback;
+    // New task opened from the board and the palette, and created
+    // (`tests/new_task.rs`).
+    mod new_task;
 
     #[test]
     fn orchestrator_view_names_the_supervisor_failure_while_down() {

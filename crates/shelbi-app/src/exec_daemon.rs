@@ -64,6 +64,31 @@ pub fn execute_mutation_expecting(
     route(&project, &id, expected, kind, on_line)
 }
 
+/// Run a [`Mutation::AddIssue`] against the daemon and answer with the id it
+/// created (`None` from a daemon that doesn't report one). Any other mutation
+/// is refused as [`ExecError::Backend`]: only an add has an id to learn.
+pub fn add_issue(
+    mutation: &Mutation,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> Result<Option<String>, ExecError> {
+    let (project, id, kind) = map_to_kind(mutation)?;
+    if !matches!(kind, MutationKind::Add(_)) {
+        return Err(ExecError::Backend("not an add".to_string()));
+    }
+    let mut client = connect_for_mutation()?;
+    let req = MutationRequest {
+        request_id: 1,
+        project,
+        id,
+        expected: None,
+        kind,
+    };
+    client
+        .mutate_done(&req, on_line)
+        .map(|done| done.id)
+        .map_err(map_client_err)
+}
+
 /// Ask the daemon to start or stop a review slot's editor/diff/server sessions
 /// (`rt-tui-review`). The single-process TUI calls this off its UI thread when
 /// a review view is switched to (`Ensure`) and when a review is closed
@@ -189,19 +214,23 @@ fn map_to_kind(m: &Mutation) -> Result<(String, String, MutationKind), ExecError
         Mutation::AddIssue {
             project,
             title,
+            body,
             workflow,
+            status,
+            top,
         } => (
             project.clone(),
             String::new(),
             MutationKind::Add(Box::new(AddSpec {
                 title: title.clone(),
                 id: None,
-                status: "backlog".to_string(),
-                body: None,
+                status: status.clone().unwrap_or_else(|| "backlog".to_string()),
+                body: body.clone(),
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 workflow: workflow.clone(),
                 branch: None,
+                top: *top,
             })),
         ),
         Mutation::PrioritizeIssue {
@@ -232,9 +261,24 @@ fn route(
     kind: MutationKind,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> Result<Option<ExpectedState>, ExecError> {
+    let mut client = connect_for_mutation()?;
+
+    let req = MutationRequest {
+        request_id: 1,
+        project: project.to_string(),
+        id: id.to_string(),
+        expected,
+        kind,
+    };
+    client.mutate(&req, on_line).map_err(map_client_err)
+}
+
+/// Ensure the daemon, connect to its control socket, and refuse when this
+/// client is out of date.
+fn connect_for_mutation() -> Result<shelbi_client::ControlClient, ExecError> {
     shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
     let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
-    let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)
+    let client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)
         .map_err(|e| ExecError::Backend(e.to_string()))?;
 
     // Out-of-date gate (removing-tmux Phase 4f, "Versions and upgrades"): if the
@@ -246,15 +290,7 @@ fn route(
     if let Some(err) = out_of_date_gate(&client.daemon_version, shelbi_state::CLIENT_VERSION) {
         return Err(err);
     }
-
-    let req = MutationRequest {
-        request_id: 1,
-        project: project.to_string(),
-        id: id.to_string(),
-        expected,
-        kind,
-    };
-    client.mutate(&req, on_line).map_err(map_client_err)
+    Ok(client)
 }
 
 /// The out-of-date mutation gate: `Some(err)` when `daemon_version` differs

@@ -361,6 +361,7 @@ mod tests {
                 "view:machines",
                 "action:toggle-zen",
                 "review:T-9",
+                "action:new-issue",
                 "action:error-log",
                 "action:settings",
                 "action:send-feedback",

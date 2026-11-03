@@ -104,6 +104,11 @@ pub struct AddSpec {
     pub prefers_machine: Option<String>,
     pub workflow: Option<String>,
     pub branch: Option<String>,
+    /// Land the new issue at the top of its status's queue (priority 0)
+    /// instead of the end, where an add lands by default. Defaulted so an
+    /// older client's request still parses (and adds at the end).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub top: bool,
 }
 
 /// A non-interactive edit. The `$EDITOR` path and reading piped stdin / a
@@ -514,6 +519,12 @@ pub enum ServerMsg {
         request_id: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         state: Option<ExpectedState>,
+        /// The issue the mutation acted on: for an add, the id the daemon
+        /// created (so the client can follow up on it). `None` for every other
+        /// request and from a daemon older than the field; optional on the
+        /// wire both ways, like `state`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
     /// The mutation failed (or was refused).
     Failed {
@@ -624,7 +635,7 @@ mod tests {
 
     #[test]
     fn decode_reports_incomplete_until_the_whole_frame_is_present() {
-        let bytes = encode(&ServerMsg::Done { request_id: 1, state: None }).unwrap();
+        let bytes = encode(&ServerMsg::Done { request_id: 1, state: None, id: None }).unwrap();
         // Just the length prefix, no payload yet.
         let err = decode::<ServerMsg>(&bytes[..LEN_PREFIX]).unwrap_err();
         assert!(matches!(err, ProtoError::Incomplete { .. }));
@@ -744,6 +755,7 @@ mod tests {
         let msg = ServerMsg::Done {
             request_id: 3,
             state: Some(state),
+            id: Some("write-docs".into()),
         };
         let (back, _): (ServerMsg, usize) = decode(&encode(&msg).unwrap()).unwrap();
         assert_eq!(back, msg);
@@ -755,8 +767,8 @@ mod tests {
         let mut frame = (old.len() as u32).to_be_bytes().to_vec();
         frame.extend_from_slice(old);
         let (back, _): (ServerMsg, usize) = decode(&frame).unwrap();
-        assert_eq!(back, ServerMsg::Done { request_id: 4, state: None });
-        let bytes = encode(&ServerMsg::Done { request_id: 4, state: None }).unwrap();
+        assert_eq!(back, ServerMsg::Done { request_id: 4, state: None, id: None });
+        let bytes = encode(&ServerMsg::Done { request_id: 4, state: None, id: None }).unwrap();
         assert_eq!(&bytes[LEN_PREFIX..], old);
     }
 
@@ -768,7 +780,7 @@ mod tests {
             text: "→ launching".into(),
         })
         .unwrap();
-        buf.extend(encode(&ServerMsg::Done { request_id: 1, state: None }).unwrap());
+        buf.extend(encode(&ServerMsg::Done { request_id: 1, state: None, id: None }).unwrap());
         let (first, n1): (ServerMsg, usize) = decode(&buf).unwrap();
         let (second, n2): (ServerMsg, usize) = decode(&buf[n1..]).unwrap();
         assert!(matches!(first, ServerMsg::Line { .. }));
