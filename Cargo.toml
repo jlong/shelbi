@@ -73,6 +73,10 @@ termwiz = { version = "0.23", default-features = false }
 # spike proved controlling-terminal, group-kill, and no-descriptor-leak
 # behavior against this exact version.
 portable-pty = "0.9"
+# CommonMark/GFM parser for `shelbi_app::review::description_text`, the plain
+# prose preview of a task body. Only the event stream is used: default
+# features (the `html` renderer and the CLI's `getopts`) are off.
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # Client-side terminal emulator, vendored under `vendor/` (Apache-2.0). Chosen
 # in the `rt-spike-emulator-replay` Phase 0 spike as a fork because attach

@@ -224,61 +224,84 @@ impl ReviewPanelModel {
     }
 }
 
-/// A markdown body as one stream of plain prose: headings dropped (they label
-/// sections, they aren't prose), list, task-list (`[x]`) and blockquote
-/// markers and inline-code backticks stripped, whitespace collapsed. Emphasis markers are left alone
-/// so identifiers like `snake_case` survive. The TUI wraps this into its
-/// three-line preview; the desktop clamps it.
+/// A markdown body as one paragraph of plain prose, for the panels' clamped
+/// description preview (the TUI wraps it into three lines, the desktop clamps
+/// it to five).
+///
+/// The body is parsed as CommonMark with GitHub's tables, strikethrough and
+/// task lists, and only its text is kept:
+///
+/// - Inline formatting reads as its text: emphasis, strong and strikethrough
+///   lose their markers, a link shows its text (never its URL), inline code its
+///   contents, an image its alt text. Inline HTML tags are dropped, and escapes
+///   and entities are decoded.
+/// - Paragraphs, list items, task items and blockquote lines join with single
+///   spaces, and whitespace collapses.
+/// - Headings (section labels, not prose), fenced and indented code blocks
+///   (often ASCII mockups), tables, HTML blocks and thematic breaks are dropped,
+///   as are task-list checkboxes.
+///
+/// Because it is a real parser, intraword `_` and a lone `*` aren't emphasis,
+/// so identifiers like `snake_case` and `a*b` survive intact.
 pub fn description_text(body: &str) -> String {
-    let mut words: Vec<String> = Vec::new();
-    for raw in body.lines() {
-        for w in strip_block_markers(raw).split_whitespace() {
-            words.push(w.to_string());
-        }
-    }
-    words.join(" ")
-}
+    use pulldown_cmark::{Event, Options, Parser, Tag};
 
-fn strip_block_markers(line: &str) -> String {
-    let mut t = line.trim();
-    while let Some(rest) = t.strip_prefix('>') {
-        t = rest.trim_start();
-    }
-    if t.starts_with('#') {
-        return String::new();
-    }
-    let item = strip_list_marker(t);
-    if item.len() < t.len() {
-        // A task list item's checkbox, as GitHub draws it.
-        for checkbox in ["[ ] ", "[x] ", "[X] "] {
-            if let Some(rest) = item.strip_prefix(checkbox) {
-                return rest.trim_start().replace('`', "");
+    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
+    let mut text = String::new();
+    // How deep inside a dropped block (heading, code, table, HTML) the parser
+    // is. Start and end events always pair, so counting every nested start
+    // inside one finds its end.
+    let mut dropped = 0usize;
+    for event in Parser::new_ext(body, options) {
+        if dropped > 0 {
+            match event {
+                Event::Start(_) => dropped += 1,
+                Event::End(_) => {
+                    dropped -= 1;
+                    if dropped == 0 {
+                        text.push(' ');
+                    }
+                }
+                _ => {}
             }
+            continue;
+        }
+        match event {
+            Event::Start(
+                Tag::Heading { .. } | Tag::CodeBlock(_) | Tag::Table(_) | Tag::HtmlBlock,
+            ) => {
+                text.push(' ');
+                dropped = 1;
+            }
+            // Inline tags join their text to the words around them; every
+            // block boundary is a word break.
+            Event::Start(tag) if is_inline(&tag) => {}
+            Event::End(end) if is_inline_end(end) => {}
+            Event::Start(_) | Event::End(_) => text.push(' '),
+            Event::Text(t) | Event::Code(t) => text.push_str(&t),
+            Event::SoftBreak | Event::HardBreak | Event::Rule => text.push(' '),
+            // Inline HTML tags, task-list checkboxes, and the extensions this
+            // parser doesn't enable (math, footnotes).
+            _ => {}
         }
     }
-    item.replace('`', "")
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Strip a single leading list marker (`- `, `* `, `+ `, or an ordered
-/// `N.`/`N)` followed by a space).
-fn strip_list_marker(s: &str) -> &str {
-    let t = s.trim_start();
-    for m in ["- ", "* ", "+ "] {
-        if let Some(rest) = t.strip_prefix(m) {
-            return rest.trim_start();
-        }
-    }
-    let bytes = t.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i > 0 && i < bytes.len() && (bytes[i] == b'.' || bytes[i] == b')') {
-        if let Some(rest) = t[i + 1..].strip_prefix(' ') {
-            return rest.trim_start();
-        }
-    }
-    t
+fn is_inline(tag: &pulldown_cmark::Tag<'_>) -> bool {
+    use pulldown_cmark::Tag;
+    matches!(
+        tag,
+        Tag::Emphasis | Tag::Strong | Tag::Strikethrough | Tag::Link { .. } | Tag::Image { .. }
+    )
+}
+
+fn is_inline_end(end: pulldown_cmark::TagEnd) -> bool {
+    use pulldown_cmark::TagEnd;
+    matches!(
+        end,
+        TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link | TagEnd::Image
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1205,5 +1228,37 @@ mod tests {
         assert_eq!(description_text(""), "");
         assert_eq!(description_text("# Title\n\n1. one\n2) two\n* three"), "one two three");
         assert_eq!(description_text("- [x] done\n- [ ] open\n[x] prose"), "done open [x] prose");
+        // Inline formatting reads as its text.
+        assert_eq!(
+            description_text("Fix the **retry** loop in [fetch](https://x/y) so that _flaky_ hosts\nback off."),
+            "Fix the retry loop in fetch so that flaky hosts back off."
+        );
+        assert_eq!(description_text("*one* __two__ ~~three~~ ***four***"), "one two three four");
+        assert_eq!(description_text("Run `cargo test` now"), "Run cargo test now");
+        assert_eq!(description_text("See <https://x.dev/a> and [ref][r].\n\n[r]: https://y"), "See https://x.dev/a and ref.");
+        assert_eq!(description_text("Logo ![the logo](a.png) and ![](b.png) here"), "Logo the logo and here");
+        // HTML tags are dropped, their text kept; HTML blocks go entirely.
+        assert_eq!(description_text("Press <kbd>Enter</kbd> to go"), "Press Enter to go");
+        assert_eq!(description_text("Before\n\n<div align=\"center\">\n<img src=\"x\">\n</div>\n\nAfter"), "Before After");
+        // Escapes and entities are decoded.
+        assert_eq!(description_text(r"Not \*emphasis\* \[x\] a &amp; b"), "Not *emphasis* [x] a & b");
+        // Identifiers that aren't emphasis survive.
+        assert_eq!(
+            description_text("Rename snake_case_name, MAX_DESC_LINES and a*b"),
+            "Rename snake_case_name, MAX_DESC_LINES and a*b"
+        );
+        // Headings (ATX and setext) are dropped.
+        assert_eq!(description_text("## Current Behavior\nIt breaks.\n\nSetext\n======\nMore."), "It breaks. More.");
+        // Code blocks (fenced and indented), tables and rules are dropped.
+        let body = "Intro.\n\n```\n┌──────┐\n│ mock │\n└──────┘\n```\n\n    indented code\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n---\n\nOutro.";
+        assert_eq!(description_text(body), "Intro. Outro.");
+        // Blockquotes and nested lists join; a checkbox doesn't show, even in a
+        // quote or a loose list.
+        assert_eq!(
+            description_text("> quoted **line**\n> - [x] boxed\n\n- loose\n\n  - [ ] nested\n"),
+            "quoted line boxed loose nested"
+        );
+        // Paragraphs and soft or hard breaks become single spaces.
+        assert_eq!(description_text("one  \ntwo\\\nthree\n\n\nfour"), "one two three four");
     }
 }

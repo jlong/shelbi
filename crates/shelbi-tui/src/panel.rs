@@ -532,11 +532,10 @@ fn nav_block_line(entry: &NavEntry, selected: bool, width: usize, bg: Color) -> 
 }
 
 // ---------------------------------------------------------------------------
-// Description preview (markdown stripped, wrapped, clipped) — pure, unit-tested.
+// Description preview (markdown as plain prose, wrapped, clipped) — pure, unit-tested.
 
-/// Build the task-description preview: strip block markdown (headings, list
-/// markers, blockquotes, inline code backticks), flatten to a single
-/// whitespace-separated stream, greedily wrap to `width` columns, and keep at
+/// Build the task-description preview: read the markdown body as one paragraph
+/// of plain prose (`shelbi_app::review::description_text`), greedily wrap to `width` columns, and keep at
 /// most `max_lines` lines — appending `...` to the last kept line when the body
 /// runs past the preview. Returns an empty vec for an empty body or zero width.
 pub(crate) fn description_preview(body: &str, width: usize, max_lines: usize) -> Vec<String> {
@@ -731,6 +730,15 @@ mod tests {
         assert_eq!(
             description_preview("- first item\n- second item", 40, 3),
             vec!["first item second item".to_string()]
+        );
+    }
+
+    #[test]
+    fn description_preview_reads_inline_markdown_as_plain_prose() {
+        let body = "Fix the **retry** loop in [fetch](https://x/y) for `snake_case` hosts.\n\n```\n┌──────┐\n│ mock │\n└──────┘\n```\n\n| a | b |\n|---|---|";
+        assert_eq!(
+            description_preview(body, 80, 3),
+            vec!["Fix the retry loop in fetch for snake_case hosts.".to_string()]
         );
     }
 
