@@ -1,10 +1,42 @@
 name: desktop-ci
 
 # Build, lint, and test the gpui desktop app (`desktop/`, its own Cargo
-# workspace). Manual only for now: run it from the Actions tab against a
-# branch or tag. It never runs on push or pull_request, so it can't slow or
-# block the main CI (`app-ci.yml`, which never sees `desktop/`).
+# workspace). Runs on every PR and every push to main that can change what
+# the desktop app builds, and by hand from the Actions tab against any
+# branch, tag, or SHA. The main CI (`app-ci.yml`) never sees `desktop/`.
+#
+# The path filter is everything the desktop build reads. Keep it in sync
+# with the desktop's local packages:
+#   cd desktop && cargo metadata --format-version 1 \
+#     | jq -r '.packages[] | select(.source == null) | .manifest_path'
+#   - desktop/**: the app itself (sources, own Cargo.toml/Cargo.lock,
+#     rust-toolchain.toml, build.rs, assets, docs it include_str!s).
+#   - crates/**: the desktop depends (directly or transitively) on every
+#     crate except shelbi-cli and shelbi-tui, so those two are excluded
+#     below instead of listing the rest. A new crate is covered by default;
+#     drop an exclusion if the desktop ever starts depending on it.
+#   - Cargo.toml: the shared crates inherit version, edition, rust-version,
+#     and `workspace = true` dependencies from the root manifest.
+#   - plugins/**: shelbi-orchestrator include_str!s the bundled
+#     update-shelbi-configuration plugin files.
+#   - vendor/**: vendor/alacritty_terminal, a path dependency.
+#   - this workflow file.
+# Root Cargo.lock is not listed: the desktop resolves against its own
+# desktop/Cargo.lock.
 on:
+  pull_request:
+    paths: &desktop-paths
+      - "desktop/**"
+      - "crates/**"
+      - "!crates/shelbi-cli/**"
+      - "!crates/shelbi-tui/**"
+      - "Cargo.toml"
+      - "plugins/**"
+      - "vendor/**"
+      - ".github/workflows/desktop-ci.yml"
+  push:
+    branches: [main]
+    paths: *desktop-paths
   workflow_dispatch:
     inputs:
       ref:
@@ -12,7 +44,16 @@ on:
         required: true
         default: main
 
+# One run per PR (or per ref): a new push to a PR cancels its superseded
+# macOS run. Pushes to main queue instead of cancelling, so a merged commit
+# that is already building still reports a result.
+concurrency:
+  group: desktop-ci-${{ github.event.pull_request.number || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
+
 jobs:
+  # Keep the job id `desktop` stable: it is the check name a ruleset can
+  # require.
   desktop:
     # arm64: the first release is macOS on Apple silicon only.
     runs-on: macos-14
@@ -20,9 +61,11 @@ jobs:
       run:
         working-directory: desktop
     steps:
+      # `inputs.ref` is only set on a manual run; PR and push runs build the
+      # event's own commit.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       # Install exactly the toolchain `desktop/rust-toolchain.toml` pins (with
       # its clippy component); rustup reads the file from the working

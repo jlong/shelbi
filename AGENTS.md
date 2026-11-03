@@ -47,11 +47,12 @@ a Rust workspace plus a Next.js marketing/docs site.
 - Site: `cd site && npm run lint && npm run build`
 - Desktop (from `desktop/`, never part of the root `--workspace` commands):
   `cargo build`, `cargo clippy --all-targets -- -D warnings`, `cargo test`.
-  Desktop CI is manual (`desktop-ci.yml`), so run these yourself before
-  handing off any change under `desktop/`. A change to a shared crate the
-  desktop uses (`shelbi-app`, `shelbi-term`, `shelbi-client`, `shelbi-state`,
-  ...) runs both sets, and must not move the root `Cargo.lock` (root MSRV is
-  Rust 1.88: `cargo check --workspace --locked`).
+  Desktop CI (`desktop-ci.yml`) runs them on every PR that touches
+  `desktop/` or a crate the desktop builds, but only once the PR is open, so
+  run them yourself before handing off any such change. A change to a shared
+  crate the desktop uses (`shelbi-app`, `shelbi-term`, `shelbi-client`,
+  `shelbi-state`, ...) runs both sets, and must not move the root
+  `Cargo.lock` (root MSRV is Rust 1.88: `cargo check --workspace --locked`).
 
 ## Two clients, one model (TUI and desktop parity)
 

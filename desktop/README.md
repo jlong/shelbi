@@ -538,8 +538,11 @@ the `docs/parity.md` guard. A failing parity check is a real gap: fix the
 client (or the table), never the check.
 
 CI: `.github/workflows/desktop-ci.yml` runs the three desktop commands on a
-`macos-14` (arm64) runner. It is manual only (`workflow_dispatch`, input
-`ref`); run it from the Actions tab against your branch.
+`macos-14` (arm64) runner, as the `desktop` check. It runs on every PR and
+every push to `main` that touches something the desktop build reads (the
+path filter and why each entry is there are in the workflow's header
+comment), and by hand from the Actions tab (`workflow_dispatch`, input `ref`)
+against any branch, tag, or SHA.
 
 ## Status docs
 
