@@ -9,6 +9,44 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### November 3, 2026
+
+**v0.13.2. Remote projects in the native desktop window, a New task dialog, and onboarding for new orchestrators.**
+
+**Remote projects open natively.** Opening a project on another machine in the
+desktop app now opens the full native window (sidebar, Orchestrator, Issues
+board, task pane, Workspaces, Activity, Machines and Settings) instead of the
+far machine's TUI in a terminal. Everything runs over one SSH relay channel per
+host. The native window needs the same Shelbi version on both machines;
+otherwise the terminal view opens with a notice naming both versions
+([#2098](https://github.com/jlong/shelbi/pull/2098)).
+
+**New task dialog.** New issue opens a full dialog in both clients: Title,
+Workflow, Status, Priority, Description, and "Let Orchestrator write this up".
+It opens from the board, its `n` key, and a new New Issue palette command
+([#2106](https://github.com/jlong/shelbi/pull/2106)).
+
+**Orchestrator onboarding.** A project whose orchestrator was never set up
+walks through three steps (intro, harness and default model, and the
+orchestrator's instructions) before launching it. The new-project flow gains an
+Agent defaults step that picks the harness and model the project's agents use
+([#2099](https://github.com/jlong/shelbi/pull/2099), [#2101](https://github.com/jlong/shelbi/pull/2101)).
+
+**Command palette.** The palette works fully with the mouse in both clients:
+hover selects, the wheel scrolls, and a click outside closes it. In the TUI,
+clicking the sidebar's project name opens it, and the sidebar header matches
+the desktop's ([#2093](https://github.com/jlong/shelbi/pull/2093), [#2095](https://github.com/jlong/shelbi/pull/2095), [#2091](https://github.com/jlong/shelbi/pull/2091)).
+
+**Polish.** Retro Racing S joins the app icons ([#2076](https://github.com/jlong/shelbi/pull/2076)). New Changelog
+entries end with their description instead of a list of the links already
+shown as chips, and existing default templates upgrade on their own
+([#2104](https://github.com/jlong/shelbi/pull/2104)). The TUI Changelog leaves more room between entries ([#2105](https://github.com/jlong/shelbi/pull/2105)), and
+the desktop's Jump to bottom arrow is drawn at the right size ([#2075](https://github.com/jlong/shelbi/pull/2075)).
+
+**Merges.** Moving a task to done merges when its branch exists only on origin,
+such as an umbrella advanced only by subtask merges there, and never rewinds
+origin from a stale local branch ([#2110](https://github.com/jlong/shelbi/pull/2110)).
+
 ### November 2, 2026
 
 **v0.13.1. SSH passwords in a macOS dialog, and a third app icon.**
