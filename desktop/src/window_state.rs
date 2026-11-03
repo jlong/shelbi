@@ -72,13 +72,46 @@ impl Frame {
     }
 }
 
+/// The display a window's frame was saved on. A frame is relative to its
+/// display (gpui reports and places window bounds from the top-left of the
+/// window's own screen), so a frame means nothing without it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DisplayRef {
+    /// The display's UUID (`CGDisplayCreateUUIDFromDisplayID`): the same
+    /// across reboots and reconnects. `None` when it couldn't be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// The display's `CGDirectDisplayID`, which can change across reboots and
+    /// reconnects (and be reused by another display): matched only when no
+    /// UUID was saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<u64>,
+}
+
+impl DisplayRef {
+    /// Whether this is the attached display with `uuid` and `id`: by UUID
+    /// when one was saved (a saved display that's gone never matches another
+    /// that took its id), else by id.
+    pub fn matches(&self, uuid: Option<&str>, id: u64) -> bool {
+        match &self.uuid {
+            Some(saved) => uuid == Some(saved.as_str()),
+            None => self.id == Some(id),
+        }
+    }
+}
+
 /// What a window remembers of itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WindowState {
-    /// The window's last frame; `None` until the window has been moved or
-    /// sized, so a first open centers a default-sized window.
+    /// The window's last frame, relative to [`Self::display`]; `None` until
+    /// the window has been moved or sized, so a first open centers a
+    /// default-sized window.
     pub frame: Option<Frame>,
+    /// The display the frame is on. `None` (a file from before displays were
+    /// saved, or a display that couldn't be read) is the primary display.
+    pub display: Option<DisplayRef>,
     /// The user's chosen sidebar width, in the shared nav model's column units
     /// (see `crate::views::sidebar::COLUMN_PX`). Saved as chosen, so a window
     /// too narrow to honor it shrinks the sidebar for display only.
@@ -94,6 +127,7 @@ impl Default for WindowState {
     fn default() -> Self {
         WindowState {
             frame: None,
+            display: None,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_collapsed: false,
             task_pane_width: DEFAULT_W,
@@ -366,6 +400,10 @@ mod tests {
                 width: 1280.0,
                 height: 820.0,
             }),
+            display: Some(DisplayRef {
+                uuid: Some("37D8832A-2D66-02CA-B9F7-8F30A301B230".into()),
+                id: Some(2),
+            }),
             sidebar_width: 33,
             sidebar_collapsed: true,
             task_pane_width: 812.0,
@@ -459,6 +497,7 @@ mod tests {
                 width: 900.0,
                 height: 700.0,
             }),
+            display: None,
             sidebar_width: 30,
             sidebar_collapsed: false,
             task_pane_width: DEFAULT_W,
@@ -612,5 +651,50 @@ mod tests {
         let local_only = |p: &ProjectKey| p.is_local();
         let never = |_: &str| -> WindowState { panic!("a session never reads the legacy file") };
         assert!(launch_plan(Some(&remote), None, None, &local_only, &never).is_empty());
+    }
+
+    #[test]
+    fn a_saved_display_matches_by_uuid_else_by_id() {
+        let uuid = "37D8832A-2D66-02CA-B9F7-8F30A301B230";
+        let saved = DisplayRef {
+            uuid: Some(uuid.into()),
+            id: Some(2),
+        };
+        assert!(saved.matches(Some(uuid), 2));
+        // The same display under a new id (after a reboot or reconnect).
+        assert!(saved.matches(Some(uuid), 7));
+        // Another display that took its id: not it.
+        assert!(!saved.matches(Some("0F6A2B1C-0000-0000-0000-000000000001"), 2));
+        assert!(!saved.matches(None, 2));
+        // No UUID was read when it was saved: the id is all there is.
+        let by_id = DisplayRef { uuid: None, id: Some(2) };
+        assert!(by_id.matches(Some(uuid), 2));
+        assert!(!by_id.matches(Some(uuid), 3));
+        assert!(!DisplayRef::default().matches(Some(uuid), 2));
+    }
+
+    #[test]
+    fn a_session_from_before_displays_reads_as_the_primary() {
+        // Written before displays were saved: no display, which opens on the
+        // primary display.
+        let old = r#"{"slots":[{"project":"web","open":true,
+            "frame":{"x":40.0,"y":60.0,"width":1280.0,"height":820.0},
+            "sidebar_width":30}]}"#;
+        let session: WindowSession = serde_json::from_str(old).unwrap();
+        let state = &session.slots[0].state;
+        assert_eq!(state.display, None);
+        assert_eq!(state.frame.map(|f| f.width), Some(1280.0));
+        assert_eq!(state.sidebar_width, 30);
+        // A display is saved beside the frame and reads back.
+        let mut session = session;
+        session.slots[0].state.display = Some(DisplayRef {
+            uuid: Some("37D8832A-2D66-02CA-B9F7-8F30A301B230".into()),
+            id: Some(2),
+        });
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["slots"][0]["display"]["uuid"], "37D8832A-2D66-02CA-B9F7-8F30A301B230");
+        assert_eq!(json["slots"][0]["display"]["id"], 2);
+        let back: WindowSession = serde_json::from_value(json).unwrap();
+        assert_eq!(back, session);
     }
 }

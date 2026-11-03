@@ -102,9 +102,12 @@ desktop:
 Window state (frame, sidebar width, sidebar collapsed) is saved per window
 slot in `~/.shelbi/desktop-windows.json`, with the project each window last
 showed and whether it was open: a launch reopens the windows that were open.
-A window reopens at exactly its saved frame when that fits the display's
-visible area (a window filling the screen included, even under Stage
-Manager); a frame that no longer fits is shrunk and moved onto it.
+Each frame is saved with the display it's on (by the display's UUID, which
+survives reboots and reconnects), and a window reopens on that display while
+it's attached, else on the primary display. It reopens at exactly its saved
+frame when that fits the display's visible area (a window filling the screen
+included, even under Stage Manager); a frame that no longer fits is shrunk
+and moved onto it.
 Where each project was left (view, sidebar selection and scroll, open review,
 board filter) is in `~/.shelbi/projects/<project>/desktop-view.json`, so a
 switch back lands there. (The old per-project `desktop-window.json` is read
