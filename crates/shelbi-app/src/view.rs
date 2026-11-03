@@ -1503,6 +1503,67 @@ impl ErrorLogModel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Orchestrator onboarding
+// ---------------------------------------------------------------------------
+
+/// The Orchestrator view's onboarding, as a client draws it: the step, its
+/// pickers' choices, the instructions draft, and the error to show. Built by
+/// [`crate::onboarding::OnboardingState::model`]; the copy is in
+/// [`crate::onboarding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingModel {
+    pub step: OnboardingStep,
+    /// The project's agents are still being read (step 2 and 3 wait).
+    pub loading: bool,
+    /// The harnesses Shelbi supports, in picker order.
+    pub harnesses: Vec<HarnessOption>,
+    /// The selected harness's models, after "Use runner default". Empty for a
+    /// runner that takes none.
+    pub models: Vec<ModelOption>,
+    /// What the Default model picker shows.
+    pub model_label: String,
+    /// The Default model picker can be used (the runner takes a model).
+    pub model_enabled: bool,
+    /// A note under Default model in place of its helper: why it's disabled,
+    /// or that the project's settings set the model over it.
+    pub model_note: Option<String>,
+    /// The orchestrator instructions draft (step 3's editor).
+    pub instructions: String,
+    /// The error the current step shows above its buttons.
+    pub error: Option<String>,
+    /// A save is running: the step's buttons wait.
+    pub busy: bool,
+}
+
+/// Which onboarding step shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingStep {
+    /// "Your project’s orchestrator" with Get started.
+    Intro,
+    /// "Choose your Orchestrator": Harness and Default model.
+    Harness,
+    /// "Make it yours": the orchestrator instructions.
+    Instructions,
+}
+
+/// One Harness choice: the runner, its label, the provider shown beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessOption {
+    pub kind: shelbi_core::RunnerKind,
+    pub label: String,
+    pub provider: Option<String>,
+    pub selected: bool,
+}
+
+/// One Default model choice (`model: None` is "Use runner default").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOption {
+    pub model: Option<String>,
+    pub label: String,
+    pub selected: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

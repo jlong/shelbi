@@ -452,6 +452,7 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
             ))
         })?
         .clone();
+    let runner_spec = with_orchestrator_model(&project, &runner_spec);
 
     let session = format!("shelbi-{project_name}");
 
@@ -577,6 +578,7 @@ pub fn relaunch_orchestrator_session(project_name: &str) -> Result<BootstrapStat
             ))
         })?
         .clone();
+    let runner_spec = with_orchestrator_model(&project, &runner_spec);
     // A relaunch is a replacement launch (the old session is dead), so it is
     // subject to the same runner-transition guard as a cold `ensure_dashboard`.
     handoff::validate_orchestrator_runner_transition(
@@ -585,6 +587,30 @@ pub fn relaunch_orchestrator_session(project_name: &str) -> Result<BootstrapStat
         &runner_spec.command,
     )?;
     spawn_orchestrator_locked(project_name, &host, hub.work_dir.as_path(), &runner_spec)
+}
+
+/// `spec` (the runner `orchestrator.runner` names) with the orchestrator's
+/// model ([`shelbi_core::orchestrator_model`]: the project's
+/// `runners.<kind>.model`, else `agents/orchestrator/agent.yaml`'s) as its
+/// model flag. Nothing set anywhere returns `spec` unchanged, so such a
+/// project launches exactly as before; a custom runner keeps its command and
+/// flags either way.
+pub fn with_orchestrator_model(
+    project: &shelbi_core::Project,
+    spec: &shelbi_core::AgentRunnerSpec,
+) -> shelbi_core::AgentRunnerSpec {
+    let manifest = shelbi_state::load_agent_manifest(&project.name, shelbi_state::ORCHESTRATOR_AGENT)
+        .ok()
+        .flatten();
+    orchestrator_spec(project, manifest.as_ref(), spec)
+}
+
+fn orchestrator_spec(
+    project: &shelbi_core::Project,
+    manifest: Option<&shelbi_core::AgentManifest>,
+    spec: &shelbi_core::AgentRunnerSpec,
+) -> shelbi_core::AgentRunnerSpec {
+    shelbi_agent::with_model(spec, shelbi_core::orchestrator_model(project, manifest).as_deref())
 }
 
 /// Deploy the orchestrator's agent context into its workdir and bring its
@@ -1104,6 +1130,45 @@ fn ensure_orchestrator_session(
 
 
 
+
+#[cfg(test)]
+mod orchestrator_model_tests {
+    //! The orchestrator's model reaches its launch (`orch-onboarding`) only
+    //! when something sets one, and never at the cost of a custom runner's
+    //! command or flags.
+    use super::*;
+
+    fn project(runner: &str) -> shelbi_core::Project {
+        shelbi_core::Project::from_yaml_str(&format!(
+            "repo: /tmp/p\nmachines:\n  - {{ name: local, kind: local, work_dir: /tmp/p }}\n\
+             orchestrator:\n  runner: {runner}\nagent_runners:\n  claude:\n    command: claude\n\
+             \x20 house:\n    command: /opt/bin/claude-wrapper\n    integration: claude\n    flags: [--verbose, --model, legacy]\n"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn no_model_anywhere_launches_as_before() {
+        let p = project("house");
+        let spec = p.runner("house").unwrap().clone();
+        let bare = shelbi_core::AgentManifest::from_yaml_str("name: orchestrator\npreferred_runner: claude\n").unwrap();
+        assert_eq!(orchestrator_spec(&p, None, &spec), spec);
+        assert_eq!(orchestrator_spec(&p, Some(&bare), &spec), spec);
+    }
+
+    #[test]
+    fn a_chosen_model_keeps_the_custom_runner() {
+        let p = project("house");
+        let spec = p.runner("house").unwrap().clone();
+        let m = shelbi_core::AgentManifest::from_yaml_str("name: orchestrator\nrunners:\n  claude:\n    model: opus\n").unwrap();
+        let out = orchestrator_spec(&p, Some(&m), &spec);
+        assert_eq!(out.command, "/opt/bin/claude-wrapper");
+        assert_eq!(out.integration, spec.integration);
+        assert_eq!(out.flags, ["--verbose", "--model", "opus"], "one model flag, the chosen one");
+        let plain = p.runner("claude").unwrap().clone();
+        assert_eq!(orchestrator_spec(&project("claude"), Some(&m), &plain).flags, ["--model", "opus"]);
+    }
+}
 
 #[cfg(test)]
 mod supervise_restart_orchestrator_tests {

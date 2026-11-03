@@ -102,6 +102,9 @@ use crate::platform::{
 };
 use crate::views::bootstrap::{self as boot_view, ScreenAction};
 use crate::views::chat::{ChatDeps, ChatEvent, ChatView};
+use crate::views::onboarding::{OnboardingEvent, OnboardingView};
+#[cfg(test)]
+use shelbi_app::view::OnboardingStep;
 use crate::views::update::{self as update_view, UpdateState};
 use crate::views::workspace_dialog::{Body as DialogBody, WorkspaceDialog, WorkspaceDialogEvent};
 use crate::views::connect_remote::{ConnectDialog, ConnectEvent};
@@ -770,6 +773,17 @@ pub struct ShelbiWindow {
     pending_workflow_filter: Option<String>,
     /// The orchestrator chat, created the first time it is shown.
     chat: Option<Entity<ChatView>>,
+    /// The Orchestrator view's onboarding (`orch-onboarding`), in place of
+    /// the chat while the project's orchestrator isn't set up: wanted once
+    /// opening the project finds it isn't ([`Self::open_project`]), built
+    /// the next time the chat would show, dropped when its Launch
+    /// Orchestrator lands or the project switches.
+    onboarding: Option<Entity<OnboardingView>>,
+    onboarding_wanted: bool,
+    /// Whether a project shows the onboarding
+    /// (`shelbi_app::onboarding::needs_onboarding`; never in a test window
+    /// unless the test says so).
+    needs_onboarding: fn(&str) -> bool,
     /// The Activity feed and the Machines view, likewise created on first show.
     activity: Option<Entity<ActivityView>>,
     /// The Activity feed's reader, started when the project opens so its
@@ -1033,6 +1047,13 @@ impl ShelbiWindow {
             detail_over: None,
             pending_workflow_filter: None,
             chat: None,
+            onboarding: None,
+            onboarding_wanted: false,
+            needs_onboarding: if cfg!(any(test, feature = "visual-check")) {
+                |_| false
+            } else {
+                shelbi_app::onboarding::needs_onboarding
+            },
             activity: None,
             activity_reader: None,
             prefetch_activity: false,
@@ -1492,9 +1513,16 @@ impl ShelbiWindow {
         let project = self.project.clone();
         self.status = Some(STARTUP_STATUS.into());
         let opening = project.clone();
-        let open = cx
-            .background_executor()
-            .spawn(async move { projects::open_project(&project, &cli, &env) });
+        let needs_onboarding = self.needs_onboarding;
+        // A project whose orchestrator was never set up shows the onboarding
+        // and starts nothing (`orch-onboarding`); its Launch Orchestrator
+        // comes back here.
+        let open = cx.background_executor().spawn(async move {
+            if needs_onboarding(&project) {
+                return Ok(false);
+            }
+            projects::open_project(&project, &cli, &env).map(|()| true)
+        });
         cx.spawn(async move |this, cx| {
             let result = open.await;
             this.update(cx, |this, cx| {
@@ -1502,8 +1530,14 @@ impl ShelbiWindow {
                 if !this.shows(&opening) {
                     return;
                 }
+                if result == Ok(false) {
+                    this.status = None;
+                    this.onboarding_wanted = true;
+                    cx.notify();
+                    return;
+                }
                 this.status = match result {
-                    Ok(()) => None,
+                    Ok(_) => None,
                     Err(message) => Some(message.into()),
                 };
                 // The orchestrator is up now: re-attach a chat that isn't
@@ -1624,6 +1658,8 @@ impl ShelbiWindow {
         if let Some(chat) = self.chat.take() {
             chat.update(cx, |chat, cx| chat.hide(cx));
         }
+        self.onboarding = None;
+        self.onboarding_wanted = false;
         if let Some(ws) = self.workspace.take() {
             ws.update(cx, |ws, cx| ws.hide(cx));
         }
@@ -2930,12 +2966,46 @@ impl ShelbiWindow {
             && self.switch_hold.is_none()
             && matches!(self.route, Route::View)
             && is_chat(self.client.view())
+            && self.onboarding.is_none()
+    }
+
+    /// The onboarding for the window's project, built on first use.
+    fn ensure_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<OnboardingView> {
+        if let Some(view) = &self.onboarding {
+            return view.clone();
+        }
+        let project = self.project.clone();
+        let view = cx.new(|cx| OnboardingView::new(&project, window, cx));
+        let sub = cx.subscribe_in(&view, window, |this, _, ev: &OnboardingEvent, window, cx| match ev {
+            // Saved and marked: bring the orchestrator up through the usual
+            // open (it launches now) and show its chat.
+            OnboardingEvent::Launched => {
+                this.onboarding = None;
+                this.onboarding_wanted = false;
+                this.open_project(cx);
+                this.sync_chat(window, cx);
+                this.focus_main_view(window, cx);
+                cx.notify();
+            }
+        });
+        self._view_subscriptions.push(sub);
+        self.onboarding = Some(view.clone());
+        // It takes the chat's place, keyboard included.
+        if self.client.focus() == Focus::Main && is_chat(self.client.view()) && matches!(self.route, Route::View) {
+            window.focus(&gpui::Focusable::focus_handle(view.read(cx), cx), cx);
+        }
+        view
     }
 
     /// Attach the chat when the main area shows it and detach it when it
     /// doesn't. Idempotent: it never re-shows a chat that is already shown,
     /// so a failed or given-up chat waits for the user to re-select it.
     fn sync_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The onboarding stands in for the chat until its Launch
+        // Orchestrator: no chat attaches meanwhile.
+        if self.onboarding_wanted && self.onboarding.is_none() {
+            self.ensure_onboarding(window, cx);
+        }
         let wanted = self.chat_wanted();
         if wanted {
             let chat = self.ensure_chat(window, cx);
@@ -3196,6 +3266,11 @@ impl ShelbiWindow {
             View::Changelog if self.changelog.is_some() => {
                 if let Some(changelog) = &self.changelog {
                     changelog.update(cx, |v, _| v.request_focus());
+                }
+            }
+            view if is_chat(view) && self.onboarding.is_some() => {
+                if let Some(onboarding) = &self.onboarding {
+                    window.focus(&gpui::Focusable::focus_handle(onboarding.read(cx), cx), cx);
                 }
             }
             view if is_chat(view) && self.chat.is_some() => {
@@ -4499,7 +4574,10 @@ impl ShelbiWindow {
                     View::Changelog => self.changelog.clone().map(|v| v.into_any_element()),
                     View::Activity => self.activity.clone().map(|v| v.into_any_element()),
                     View::Machines => self.machines.clone().map(|v| v.into_any_element()),
-                    View::Session(_) if is_chat(view) => self.chat.clone().map(|v| v.into_any_element()),
+                    View::Session(_) if is_chat(view) => match &self.onboarding {
+                        Some(onboarding) => Some(onboarding.clone().into_any_element()),
+                        None => self.chat.clone().map(|v| v.into_any_element()),
+                    },
                     View::Session(_) => self.workspace.clone().map(|w| w.update(cx, |w, cx| w.render_main(cx))),
                 };
                 div()
@@ -5387,6 +5465,16 @@ impl ShelbiWindow {
         self.detail_over.is_some() && self.issues.as_ref().is_some_and(|v| v.read(cx).is_floating())
     }
 
+    /// The Orchestrator view's onboarding, as opening a project that
+    /// needs it shows it.
+    #[cfg(feature = "visual-check")]
+    pub(crate) fn offscreen_onboarding(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<OnboardingView> {
+        self.onboarding_wanted = true;
+        self.status = None;
+        self.sync_chat(window, cx);
+        self.ensure_onboarding(window, cx)
+    }
+
     pub(crate) fn offscreen_open_settings(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
         self.open_settings(Some(page), window, cx);
     }
@@ -5479,6 +5567,10 @@ mod connect_tests;
 #[cfg(test)]
 #[path = "app_fold_tests.rs"]
 mod fold_tests;
+
+#[cfg(test)]
+#[path = "app_onboarding_tests.rs"]
+mod onboarding_tests;
 
 #[cfg(test)]
 mod tests {

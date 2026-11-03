@@ -60,6 +60,9 @@ pub enum Type {
     Title,
     /// `Desktop/Heading`: 20 / 28, bold. A page or dialog title.
     Heading,
+    /// `Desktop/Large/Medium`: 16 / 24, 500. A Large button's label (the
+    /// Orchestrator onboarding's actions).
+    LargeMedium,
     /// `Desktop/Base/Regular`: 14 / 18. Body text, nav labels, card titles'
     /// descriptions in a dialog.
     Base,
@@ -86,6 +89,7 @@ impl Type {
         match self {
             Type::Title => 24.0,
             Type::Heading => 20.0,
+            Type::LargeMedium => 16.0,
             Type::Base | Type::BaseMedium | Type::BaseSemibold => 14.0,
             Type::Small | Type::SmallMedium => 13.0,
             Type::XSmall | Type::XSmallMedium | Type::XSmallSemibold => 12.0,
@@ -97,6 +101,7 @@ impl Type {
         match self {
             Type::Title => 32.0,
             Type::Heading => 28.0,
+            Type::LargeMedium => 24.0,
             Type::Base | Type::BaseMedium | Type::BaseSemibold | Type::Small | Type::SmallMedium => 18.0,
             Type::XSmall | Type::XSmallMedium | Type::XSmallSemibold => 16.0,
         }
@@ -105,7 +110,7 @@ impl Type {
     pub fn weight(self) -> FontWeight {
         match self {
             Type::Base | Type::Small | Type::XSmall => FontWeight::NORMAL,
-            Type::BaseMedium | Type::SmallMedium | Type::XSmallMedium => FontWeight::MEDIUM,
+            Type::LargeMedium | Type::BaseMedium | Type::SmallMedium | Type::XSmallMedium => FontWeight::MEDIUM,
             Type::Title | Type::BaseSemibold | Type::XSmallSemibold => FontWeight::SEMIBOLD,
             Type::Heading => FontWeight::BOLD,
         }
@@ -413,6 +418,10 @@ pub enum ButtonSize {
     /// 32px, Base medium (14 / 18), 12px across, 6px between, a 20px glyph
     /// in a 14px slot (forms and dialogs).
     Base,
+    /// 40px, Large medium (16 / 24), 16px across, 6px between, a 20px glyph
+    /// in a 14px slot (a full-page step's actions: the Orchestrator
+    /// onboarding's Get started, Continue, Back, Launch Orchestrator).
+    Large,
 }
 
 impl ButtonSize {
@@ -421,6 +430,7 @@ impl ButtonSize {
             ButtonSize::XSmall => 24.0,
             ButtonSize::Small => 28.0,
             ButtonSize::Base => 32.0,
+            ButtonSize::Large => 40.0,
         }
     }
 
@@ -429,6 +439,7 @@ impl ButtonSize {
         match self {
             ButtonSize::XSmall => 8.0,
             ButtonSize::Small | ButtonSize::Base => 12.0,
+            ButtonSize::Large => 16.0,
         }
     }
 
@@ -436,7 +447,7 @@ impl ButtonSize {
     pub const fn gap(self) -> f32 {
         match self {
             ButtonSize::XSmall | ButtonSize::Small => 4.0,
-            ButtonSize::Base => 6.0,
+            ButtonSize::Base | ButtonSize::Large => 6.0,
         }
     }
 
@@ -446,6 +457,7 @@ impl ButtonSize {
             ButtonSize::XSmall => Type::XSmallMedium,
             ButtonSize::Small => Type::SmallMedium,
             ButtonSize::Base => Type::BaseMedium,
+            ButtonSize::Large => Type::LargeMedium,
         }
     }
 
@@ -453,7 +465,7 @@ impl ButtonSize {
     /// slot's outer edge.
     pub const fn slot(self) -> f32 {
         match self {
-            ButtonSize::XSmall | ButtonSize::Base => 14.0,
+            ButtonSize::XSmall | ButtonSize::Base | ButtonSize::Large => 14.0,
             ButtonSize::Small => 12.0,
         }
     }
@@ -463,7 +475,7 @@ impl ButtonSize {
     pub const fn glyph(self) -> Pixels {
         match self {
             ButtonSize::XSmall => ICON_SIZE_BUTTON,
-            ButtonSize::Small | ButtonSize::Base => ICON_SIZE,
+            ButtonSize::Small | ButtonSize::Base | ButtonSize::Large => ICON_SIZE,
         }
     }
 }
@@ -1503,7 +1515,7 @@ mod tests {
         }
     }
 
-    const SIZES: [ButtonSize; 3] = [ButtonSize::XSmall, ButtonSize::Small, ButtonSize::Base];
+    const SIZES: [ButtonSize; 4] = [ButtonSize::XSmall, ButtonSize::Small, ButtonSize::Base, ButtonSize::Large];
 
     impl gpui::Render for SizeSheet {
         fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
@@ -1550,6 +1562,7 @@ mod tests {
                 ButtonSize::XSmall => (24.0, 8.0, 4.0, 14.0),
                 ButtonSize::Small => (28.0, 12.0, 4.0, 12.0),
                 ButtonSize::Base => (32.0, 12.0, 6.0, 14.0),
+                ButtonSize::Large => (40.0, 16.0, 6.0, 14.0),
             });
             for name in CONTENTS {
                 let id = format!("{size:?}-{name}");

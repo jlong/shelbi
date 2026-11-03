@@ -27,6 +27,7 @@ pub mod remote_session;
 use shelbi_app::session::relaunch;
 mod review;
 mod keybindings;
+mod onboarding;
 mod session;
 mod settings;
 mod sidebar;
@@ -639,6 +640,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if state.poll_startup() {
             state.dirty = true;
         }
+        if state.poll_onboarding() {
+            state.dirty = true;
+        }
         if state.poll_settings() {
             state.dirty = true;
         }
@@ -944,6 +948,26 @@ trait Bootstrap: Send + Sync {
     /// orchestrator dashboard. Blocking; returns a user-facing message on
     /// failure.
     fn bootstrap(&self, project: &str) -> Result<(), String>;
+
+    /// Whether `project`'s Orchestrator view shows the onboarding
+    /// (`orch-onboarding`): then the startup brings the daemon up but not the
+    /// orchestrator. A stub says no, so tests see today's startup.
+    fn needs_onboarding(&self, _project: &str) -> bool {
+        false
+    }
+
+    /// Start the daemon only (a project still onboarding). Blocking.
+    fn start_daemon(&self) {}
+}
+
+/// What the startup job did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Started {
+    /// The orchestrator is up.
+    Orchestrator,
+    /// The project's orchestrator isn't set up: the Orchestrator view shows
+    /// the onboarding, and nothing was launched.
+    Onboarding,
 }
 
 /// The production [`Bootstrap`]: start the hub daemon, then bootstrap the
@@ -966,6 +990,16 @@ impl Bootstrap for DaemonBootstrap {
         shelbi_orchestrator::ensure_dashboard(project)
             .map(|_status| ())
             .map_err(|e| format!("couldn't bring up the orchestrator: {e}"))
+    }
+
+    fn needs_onboarding(&self, project: &str) -> bool {
+        shelbi_app::onboarding::needs_onboarding(project)
+    }
+
+    fn start_daemon(&self) {
+        if let Err(e) = shelbi_state::ensure_daemon_running() {
+            tracing::warn!(error = %e, "could not start the hub daemon");
+        }
     }
 }
 
@@ -1175,7 +1209,12 @@ struct ShellState {
     /// while it is still pending. A project switch replaces it (dropping the old
     /// project's receiver), so a late result for a project the user already left
     /// never lands in the new project's view or status.
-    startup_rx: Option<(String, Receiver<Result<(), String>>)>,
+    startup_rx: Option<(String, Receiver<Result<Started, String>>)>,
+    /// The Orchestrator view's onboarding for the current project, while its
+    /// orchestrator isn't set up (`orch-onboarding`): shown in place of the
+    /// orchestrator's terminal. Dropped when its Launch Orchestrator lands
+    /// or the project switches.
+    onboarding: Option<onboarding::OnboardingPage>,
     /// The open review interface (panel + content terminal view), when
     /// `main_view` is [`MainView::Review`]. `rt-tui-review`.
     review: Option<ReviewInterface>,
@@ -1580,6 +1619,7 @@ impl ShellState {
             lifecycle,
             bootstrap,
             startup_rx: None,
+            onboarding: None,
             review: None,
             review_rx: None,
             review_backend: Arc::new(DaemonReviewBackend),
@@ -2176,6 +2216,9 @@ impl ShellState {
         // open/load still in flight for it, whose late result must not land in
         // the new project.
         let old_interfaces = (self.review.take(), self.workspace.take());
+        // The onboarding belongs to the project we left too; the target's
+        // startup brings its own up if it needs one.
+        self.onboarding = None;
         self.review_rx = None;
         self.review_opening = None;
         self.review_open_pending = None;
@@ -2418,6 +2461,13 @@ impl ShellState {
             return;
         }
         match self.main_view {
+            MainView::Session if self.onboarding_shown() => {
+                self.client.focus_main();
+                if let Some(page) = self.onboarding.as_mut() {
+                    page.paste(text);
+                }
+                self.dirty = true;
+            }
             MainView::Session => {
                 self.client.focus_main();
                 self.sessions.send_paste(text);
@@ -3693,7 +3743,13 @@ impl ShellState {
         if std::thread::Builder::new()
             .name("shelbi-shell-startup".into())
             .spawn(move || {
-                let _ = tx.send(bootstrap.bootstrap(&job_project));
+                let started = if bootstrap.needs_onboarding(&job_project) {
+                    bootstrap.start_daemon();
+                    Ok(Started::Onboarding)
+                } else {
+                    bootstrap.bootstrap(&job_project).map(|()| Started::Orchestrator)
+                };
+                let _ = tx.send(started);
             })
             .is_ok()
         {
@@ -3725,7 +3781,20 @@ impl ShellState {
         };
         self.startup_rx = None;
         match result {
-            Ok(()) => {
+            Ok(Started::Onboarding) => {
+                // Nothing launched: the Orchestrator view shows the onboarding
+                // until its Launch Orchestrator.
+                if let Some(project) = self.client.project() {
+                    if self.onboarding.as_ref().map(|o| o.project()) != Some(project) {
+                        self.onboarding = Some(onboarding::OnboardingPage::new(project));
+                    }
+                }
+                if self.status.as_deref() == Some(STARTUP_STATUS) {
+                    self.status = None;
+                }
+            }
+            Ok(Started::Orchestrator) => {
+                self.onboarding = None;
                 // The orchestrator session exists now; re-attach if the main area
                 // is showing a session (a native view doesn't need it).
                 if matches!(self.main_view, MainView::Session) {
@@ -3738,6 +3807,38 @@ impl ShellState {
             Err(msg) => self.status = Some(msg),
         }
         true
+    }
+
+    /// Whether the main area shows the onboarding: the Orchestrator view of
+    /// a project whose orchestrator isn't set up (`orch-onboarding`).
+    fn onboarding_shown(&self) -> bool {
+        self.onboarding.is_some()
+            && matches!(self.main_view, MainView::Session)
+            && self.sessions.current_target() == Some(&SessionRef::Orchestrator)
+    }
+
+    /// Fold in the onboarding's finished reads and saves. Launch
+    /// Orchestrator's landing starts the orchestrator through the usual
+    /// startup (the project counts as set up now, so it launches) and the
+    /// view attaches its terminal once it is up.
+    fn poll_onboarding(&mut self) -> bool {
+        let Some(page) = self.onboarding.as_mut() else {
+            return false;
+        };
+        let (changed, action) = page.poll();
+        self.apply_onboarding_action(action);
+        changed
+    }
+
+    fn apply_onboarding_action(&mut self, action: onboarding::PageAction) {
+        match action {
+            onboarding::PageAction::Stay => {}
+            onboarding::PageAction::Launch => {
+                self.status = Some(STARTUP_STATUS.to_string());
+                self.spawn_startup();
+            }
+        }
+        self.dirty = true;
     }
 
     /// Resolve a palette entry to its command effect and dispatch it.
@@ -4844,6 +4945,15 @@ impl ShellState {
             }
             _ => {}
         }
+        // The onboarding stands in for the orchestrator's terminal: it takes
+        // the main area's keys, and none reaches a session.
+        if self.onboarding_shown() {
+            if let Some(page) = self.onboarding.as_mut() {
+                let action = page.handle_key(k);
+                self.apply_onboarding_action(action);
+            }
+            return;
+        }
 
         // Cmd+C / Ctrl+Shift+C copies the current selection to the clipboard
         // and is consumed here — never forwarded — so no stray `c` / Ctrl+C
@@ -5222,6 +5332,13 @@ impl ShellState {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.client.focus_main();
         }
+        if self.onboarding_shown() {
+            if let Some(page) = self.onboarding.as_mut() {
+                let action = page.handle_mouse(m);
+                self.apply_onboarding_action(action);
+            }
+            return;
+        }
 
         // Native views handle their own mouse. The board's hit maps and the
         // feed's pill hits are recorded in `render_full` against `main_rect`
@@ -5498,6 +5615,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
         .unwrap_or_else(|| "No project".to_string());
     let has_project = state.client.project().is_some();
     let settings_covers = state.settings.covers_columns();
+    let onboarding_shown = state.onboarding_shown();
     let settings = &mut state.settings;
     let keymaps = &state.keymaps;
     let display_style = state.display_style;
@@ -5505,6 +5623,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
     let activity = &mut state.activity;
     let machines = &mut state.machines;
     let changelog = &mut state.changelog;
+    let onboarding = &mut state.onboarding;
     let sessions = &state.sessions;
 
     let mut cursor: Option<(u16, u16)> = None;
@@ -5513,6 +5632,13 @@ fn draw_frame<B: ratatui::backend::Backend>(
         // they must run before the shared buffer is taken below.
         match &main_view {
             _ if is_settings || is_ack => {}
+            // The onboarding draws through the frame too, in place of the
+            // orchestrator's terminal.
+            MainView::Session if onboarding_shown => {
+                if let Some(page) = onboarding.as_mut() {
+                    page.render(frame, main_rect);
+                }
+            }
             MainView::Native(View::Issues) => crate::kanban::render_full(frame, kanban, main_rect),
             MainView::Native(View::Activity) => {
                 crate::activity::render_full(frame, activity, main_rect)
@@ -5552,6 +5678,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
             );
             match &main_view {
                 _ if is_settings || is_ack => {}
+                MainView::Session if onboarding_shown => {}
                 MainView::Session if orch_down.is_some() => {
                     render_placeholder(buf, main_rect, orch_down.as_deref().unwrap_or_default())
                 }
@@ -8414,6 +8541,64 @@ mod tests {
         open_gate.send(()).unwrap();
         let done = wait_until(Duration::from_secs(2), || st.poll_startup());
         assert!(done, "poll_startup reports completion once the bootstrap returns");
+    }
+
+    /// A bootstrap whose project needs onboarding until the test says not,
+    /// recording what it brought up (`orch-onboarding`).
+    #[derive(Default)]
+    struct OnboardingBootstrap {
+        set_up: std::sync::atomic::AtomicBool,
+        launched: Mutex<Vec<String>>,
+    }
+    impl Bootstrap for OnboardingBootstrap {
+        fn bootstrap(&self, project: &str) -> Result<(), String> {
+            self.launched.lock().unwrap().push(project.to_string());
+            Ok(())
+        }
+        fn needs_onboarding(&self, _project: &str) -> bool {
+            !self.set_up.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn a_project_that_needs_onboarding_shows_it_and_starts_no_orchestrator() {
+        use std::sync::atomic::Ordering;
+        let lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = shelbi_app::settings::agents::fixture::Home::new("shell-onb", "proj", lock);
+        let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
+        let boot = Arc::new(OnboardingBootstrap::default());
+        let mut st = ShellState::new_with(
+            "proj",
+            Arc::new(NoopConnector),
+            caps,
+            Arc::new(RecordingLifecycle::default()),
+            boot.clone(),
+        );
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        st.spawn_startup();
+        assert!(wait_until(Duration::from_secs(2), || st.poll_startup()));
+        assert!(st.onboarding_shown(), "the Orchestrator view shows the onboarding");
+        assert!(boot.launched.lock().unwrap().is_empty(), "no orchestrator started on its own");
+
+        // Its keys reach the page, not a session: Enter is Get started.
+        st.client.focus_main();
+        st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            st.onboarding.as_ref().map(|p| p.step()),
+            Some(shelbi_app::view::OnboardingStep::Harness)
+        );
+        // Another view hides it; the Orchestrator view shows it again.
+        st.show(RowTarget::Native(View::Issues));
+        assert!(!st.onboarding_shown());
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        assert!(st.onboarding_shown());
+
+        // Launch Orchestrator's save landed: the startup launches it now.
+        boot.set_up.store(true, Ordering::SeqCst);
+        st.apply_onboarding_action(onboarding::PageAction::Launch);
+        assert!(wait_until(Duration::from_secs(2), || st.poll_startup()));
+        assert_eq!(*boot.launched.lock().unwrap(), ["proj"]);
+        assert!(st.onboarding.is_none() && !st.onboarding_shown(), "the terminal shows");
     }
 
     /// A bootstrap that records every project it was asked to bring up. A project

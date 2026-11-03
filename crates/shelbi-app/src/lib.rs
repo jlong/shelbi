@@ -84,6 +84,7 @@ pub mod layout_sub;
 pub mod licenses;
 pub mod markdown_edit;
 pub mod nav;
+pub mod onboarding;
 pub mod overlay;
 pub mod reachability;
 pub mod refresh;
