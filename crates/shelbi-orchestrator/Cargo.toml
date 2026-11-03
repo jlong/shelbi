@@ -49,6 +49,9 @@ test-support = []
 [dev-dependencies]
 tempfile = "3"
 serde_yaml = { workspace = true }
+# The agents/workflows fixture project (`settings::agents::fixture`) the
+# remote-source parity test reads through both sources.
+shelbi-app = { workspace = true, features = ["test-support"] }
 # `shelbi-session` is a normal dependency (the session backend). The detector
 # round-trip test (`detector_snapshot_parity`) also feeds the ready.rs /
 # submit.rs screen fixtures through the session emulator and asserts the

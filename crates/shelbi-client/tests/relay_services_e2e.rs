@@ -60,10 +60,10 @@ fn split(stream: RelayStream) -> Halves {
 // --- query -----------------------------------------------------------------
 
 fn echo_handler() -> QueryHandler {
-    Arc::new(|req: &[u8]| {
+    Arc::new(|req: &[u8], reply: &mut dyn FnMut(Vec<u8>)| {
         let mut answer = b"answer:".to_vec();
         answer.extend_from_slice(req);
-        answer
+        reply(answer)
     })
 }
 
@@ -96,13 +96,41 @@ fn query_round_trips_requests_through_the_injected_handler() {
 }
 
 #[test]
+fn a_query_answered_twice_arrives_as_two_replies_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let handler: QueryHandler = Arc::new(|req: &[u8], reply: &mut dyn FnMut(Vec<u8>)| {
+        let mut early = b"early:".to_vec();
+        early.extend_from_slice(req);
+        reply(early);
+        let mut full = b"full:".to_vec();
+        full.extend_from_slice(req);
+        reply(full)
+    });
+    let relay = start_relay(
+        dir.path(),
+        RelayServices {
+            query: Some(handler),
+            ..RelayServices::default()
+        },
+    );
+    let mut query = relay.open_query().unwrap();
+    query.send(b"a").unwrap();
+    assert_eq!(query.recv().unwrap(), b"early:a");
+    assert_eq!(query.recv().unwrap(), b"full:a");
+    // The next request starts clean.
+    query.send(b"b").unwrap();
+    assert_eq!(query.recv().unwrap(), b"early:b");
+    assert_eq!(query.recv().unwrap(), b"full:b");
+}
+
+#[test]
 fn a_panicking_query_handler_closes_the_stream_not_the_channel() {
     let dir = tempfile::tempdir().unwrap();
-    let handler: QueryHandler = Arc::new(|req: &[u8]| {
+    let handler: QueryHandler = Arc::new(|req: &[u8], reply: &mut dyn FnMut(Vec<u8>)| {
         if req == b"boom" {
             panic!("reader blew up");
         }
-        req.to_vec()
+        reply(req.to_vec())
     });
     let relay = start_relay(
         dir.path(),

@@ -13,7 +13,7 @@ use shelbi_app::view::SidebarModel;
 use shelbi_client::{RelayChannel, RelayServices};
 
 fn relay_answering(
-    answer: impl Fn(Query) -> Result<Answer, QueryError> + Send + Sync + 'static,
+    answer: impl Fn(Query, &mut dyn FnMut(Answer)) -> Result<Answer, QueryError> + Send + Sync + 'static,
 ) -> RelayChannel {
     // No sessions are served here; a root that doesn't exist lists none.
     let root = std::env::temp_dir().join(format!("shelbi-relay-query-{}-none", std::process::id()));
@@ -41,12 +41,12 @@ fn sidebar(label: &str) -> SidebarModel {
 fn typed_queries_round_trip_over_the_relay() {
     let asked = Arc::new(AtomicUsize::new(0));
     let count = asked.clone();
-    let relay = relay_answering(move |query| {
+    let relay = relay_answering(move |query, _early| {
         count.fetch_add(1, Ordering::SeqCst);
         match query {
             Query::Sidebar { project } => Ok(Answer::Sidebar(Some(sidebar(&project)))),
             Query::ProjectExists { project } => Ok(Answer::ProjectExists(project == "alpha")),
-            Query::Changelog { .. } => Ok(Answer::Changelog(ChangelogData::default())),
+            Query::Changelog { .. } => Ok(Answer::Changelog(Some(ChangelogData::default()))),
             Query::Machines { project } => Err(QueryError::Failed {
                 message: format!("no machines for {project}"),
             }),
@@ -58,19 +58,21 @@ fn typed_queries_round_trip_over_the_relay() {
     let mut querier = Querier::new(relay.open_query().unwrap());
 
     let answer = querier.ask(Query::Sidebar { project: "alpha".into() }).unwrap();
-    assert_eq!(answer, Answer::Sidebar(Some(sidebar("alpha"))));
-    assert_eq!(
+    assert!(matches!(answer, Answer::Sidebar(Some(ref m)) if *m == sidebar("alpha")));
+    assert!(matches!(
         querier.ask(Query::ProjectExists { project: "alpha".into() }).unwrap(),
         Answer::ProjectExists(true)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         querier.ask(Query::ProjectExists { project: "nope".into() }).unwrap(),
         Answer::ProjectExists(false)
-    );
-    assert_eq!(
-        querier.ask(Query::Changelog { project: "alpha".into() }).unwrap(),
-        Answer::Changelog(ChangelogData::default())
-    );
+    ));
+    assert!(matches!(
+        querier
+            .ask(Query::Changelog { project: "alpha".into(), unless: None })
+            .unwrap(),
+        Answer::Changelog(Some(_))
+    ));
     match querier.ask(Query::Machines { project: "alpha".into() }) {
         Err(AskError::Query(QueryError::Failed { message })) => assert_eq!(message, "no machines for alpha"),
         other => panic!("expected the far failure, got {other:?}"),
@@ -83,7 +85,7 @@ fn typed_queries_round_trip_over_the_relay() {
 
 #[test]
 fn an_answer_of_the_wrong_kind_is_a_protocol_error() {
-    let relay = relay_answering(|_| Ok(Answer::ProjectExists(true)));
+    let relay = relay_answering(|_, _| Ok(Answer::ProjectExists(true)));
     let mut querier = Querier::new(relay.open_query().unwrap());
     match querier.ask(Query::Sidebar { project: "alpha".into() }) {
         Err(AskError::Protocol(why)) => assert!(why.contains("sidebar"), "{why}"),

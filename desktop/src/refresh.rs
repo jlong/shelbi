@@ -18,6 +18,9 @@
 //!   refreshes on the TUI's cadence and reports [`DaemonLink::Polling`] so the
 //!   sidebar can show it; when the daemon comes back the subscription
 //!   reconnects on its own and the link flips back to [`DaemonLink::Live`].
+//!   A project on another machine polls (and safety-refreshes) more slowly
+//!   ([`FeedTiming::remote`]): each of its reads is a round trip over the
+//!   host's relay plus the far read.
 //!
 //! App-wide, one [`ControlWatcher`] holds a subscription on the daemon's
 //! control socket for [`Notice::Changed`], the only source that sees a
@@ -160,6 +163,29 @@ impl Default for FeedTiming {
     }
 }
 
+impl FeedTiming {
+    /// The timing for a project on another machine: every read is a round
+    /// trip over the host's relay, so the fallback poll and the safety
+    /// refresh run several times less often than a local feed's. Changes
+    /// still wake it at once over the link.
+    pub fn remote() -> Self {
+        FeedTiming {
+            live_interval: Duration::from_secs(20),
+            poll_interval: Duration::from_secs(4),
+            ..FeedTiming::default()
+        }
+    }
+
+    /// The timing for `key`'s feed.
+    pub fn for_key(key: &shelbi_app::source::ProjectKey) -> Self {
+        if key.is_local() {
+            FeedTiming::default()
+        } else {
+            FeedTiming::remote()
+        }
+    }
+}
+
 /// A project's running feed. Dropping it stops the feed without waiting.
 pub struct ProjectFeed {
     wake: Sender<()>,
@@ -171,11 +197,17 @@ pub struct ProjectFeed {
 impl ProjectFeed {
     /// The production feed for `project`: the sidebar read through its
     /// source, the change and layout subscriptions on its link, and the
-    /// default timing.
+    /// timing for where it lives ([`FeedTiming::for_key`]).
     pub fn spawn(project: &ProjectHandle) -> (ProjectFeed, UnboundedReceiver<FeedEvent>) {
         let connected = Arc::new(AtomicBool::new(false));
         let (subscription, changes) = project.link.subscribe_changes(connected.clone());
         let (layout_subscription, layout) = project.link.subscribe_layout();
+        // The title probe reads this machine's sessions, so only a local
+        // project's orchestrator answers it.
+        let orchestrator: Option<TitleProbe> = project
+            .key()
+            .is_local()
+            .then(|| Arc::new(orchestrator_title) as TitleProbe);
         Self::spawn_with(
             project.name(),
             sidebar_reader(project.source.clone()),
@@ -184,9 +216,9 @@ impl ProjectFeed {
                 changes: Some(changes),
                 layout: Some(layout),
                 keep_alive: Some(Box::new((subscription, layout_subscription))),
-                orchestrator: Some(Arc::new(orchestrator_title)),
+                orchestrator,
             },
-            FeedTiming::default(),
+            FeedTiming::for_key(project.key()),
         )
     }
 
@@ -468,6 +500,16 @@ impl ControlWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_feed_polls_more_slowly_than_a_local_one() {
+        use shelbi_app::source::ProjectKey;
+        let local = FeedTiming::for_key(&ProjectKey::local("p"));
+        let remote = FeedTiming::for_key(&ProjectKey::remote("devbox", "p"));
+        assert_eq!(local.poll_interval, FeedTiming::default().poll_interval);
+        assert!(remote.poll_interval > local.poll_interval);
+        assert!(remote.live_interval > local.live_interval);
+    }
     use futures::StreamExt;
     use shelbi_app::view::SidebarModel;
 

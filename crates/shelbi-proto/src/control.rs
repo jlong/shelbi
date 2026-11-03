@@ -305,9 +305,11 @@ pub struct WorkspaceSessionRequest {
 }
 
 /// What kind of UI client is attached to a session. Room is left for the
-/// Desktop app attaching to a running CLI session and a client attaching to a
-/// remote session (the detach task's motivating cases); only [`ClientKind::Tui`]
-/// is produced today.
+/// Desktop app attaching to a running CLI session (the detach task's
+/// motivating case). [`ClientKind::Remote`] is a remote window's link: another
+/// machine's app subscribing over this machine's relay, which the daemon never
+/// tells to re-exec for a version difference (a deliberate reload still
+/// reaches it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClientKind {
@@ -315,7 +317,8 @@ pub enum ClientKind {
     Tui,
     /// The desktop app (future).
     Desktop,
-    /// A client attached to a remote session (future).
+    /// A remote window's link: another machine's app, subscribed over this
+    /// machine's relay (`shelbi_app::source::remote`).
     Remote,
 }
 

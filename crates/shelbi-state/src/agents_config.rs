@@ -121,6 +121,7 @@ use crate::agent_workspaces::{
     bundled_agent_manifest_yaml, BundledAgent, DEFAULT_AGENTS, SHARED_AGENT_DIR,
     SHARED_PREAMBLE_FILE,
 };
+use crate::workflow_config::WorkflowFile;
 use crate::{yaml_edit, AgentDivergence};
 
 const MANIFEST_FILE: &str = "agent.yaml";
@@ -452,6 +453,39 @@ enum Origin {
     New,
 }
 
+/// The files an [`AgentsConfig`] is built from, as read
+/// ([`AgentsConfig::read_files`]) and not yet parsed. Serializable: a far
+/// machine sends them to a remote window, which parses them with the same
+/// loader ([`AgentsConfig::from_files`]). The paths are the far machine's.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AgentsFiles {
+    pub project: String,
+    pub dir: PathBuf,
+    /// Every agent directory's files.
+    pub agents: Vec<AgentDirFiles>,
+    pub preamble_path: PathBuf,
+    /// The shared preamble; `None` when the file doesn't exist.
+    pub preamble: Option<String>,
+    /// `deployed_agent_defaults` from the project state.
+    pub deployed: BTreeMap<String, String>,
+    /// The status catalog's text, for the statuses that name each agent.
+    pub statuses_text: Option<String>,
+    /// The workflow files, for the statuses that name each agent.
+    pub workflows: Vec<WorkflowFile>,
+    /// The project YAML, for its runner pins and overrides.
+    pub project_text: Option<String>,
+}
+
+/// One agent directory's files, by `/`-separated relative path.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AgentDirFiles {
+    pub name: String,
+    pub path: PathBuf,
+    pub files: BTreeMap<String, Vec<u8>>,
+}
+
 /// What a save did.
 #[derive(Debug, Clone)]
 pub struct Saved {
@@ -511,13 +545,70 @@ impl AgentsConfig {
     /// Load `project`'s agents, shared instructions and the workflow
     /// statuses that name each agent.
     pub fn load(project: &str) -> Result<Self> {
+        Self::from_files(Self::read_files(project)?)
+    }
+
+    /// Read every file [`load`](Self::load) builds the model from, without
+    /// parsing them: what a far machine sends a remote window, which builds
+    /// the model with [`from_files`](Self::from_files), the same loader.
+    pub fn read_files(project: &str) -> Result<AgentsFiles> {
         let dir = crate::agents_dir(project).map_err(other)?;
-        let mut loaded = BTreeMap::new();
         let mut agents = Vec::new();
-        let mut unreadable = Vec::new();
         for name in crate::list_agents(project).map_err(other)? {
             let path = dir.join(&name);
             let files = snapshot(&path)?;
+            agents.push(AgentDirFiles { name, path, files });
+        }
+        let preamble_path = dir.join(SHARED_AGENT_DIR).join(SHARED_PREAMBLE_FILE);
+        let preamble = read_optional(&preamble_path)?;
+        let deployed = crate::read_state(project)
+            .map(|s| s.deployed_agent_defaults.into_iter().collect())
+            .unwrap_or_default();
+        let statuses_path = crate::workflows::statuses_read_path(project).map_err(other)?;
+        let statuses_text = read_optional(&statuses_path)?;
+        let workflows_dir = crate::workflows_dir(project).map_err(other)?;
+        let mut workflows = Vec::new();
+        for (stem, path) in crate::workflow_config::workflow_files(&workflows_dir)
+            .map_err(|e| file_err(&workflows_dir, e))?
+        {
+            if let Some(text) = read_optional(&path)? {
+                workflows.push(WorkflowFile { stem, path, text });
+            }
+        }
+        let project_text = crate::workflow_config::project_config_file(project)
+            .ok()
+            .and_then(|path| read_optional(&path).ok().flatten());
+        Ok(AgentsFiles {
+            project: project.to_string(),
+            dir,
+            agents,
+            preamble_path,
+            preamble,
+            deployed,
+            statuses_text,
+            workflows,
+            project_text,
+        })
+    }
+
+    /// The model over `files` as [`read_files`](Self::read_files) read them.
+    /// Reads nothing.
+    pub fn from_files(files: AgentsFiles) -> Result<Self> {
+        let AgentsFiles {
+            project,
+            dir,
+            agents: dirs,
+            preamble_path,
+            preamble,
+            deployed,
+            statuses_text,
+            workflows,
+            project_text,
+        } = files;
+        let mut loaded = BTreeMap::new();
+        let mut agents = Vec::new();
+        let mut unreadable = Vec::new();
+        for AgentDirFiles { name, path, files } in dirs {
             match parse_agent(&name, &files) {
                 Ok((manifest, instructions)) => {
                     let mut rest = files.clone();
@@ -542,20 +633,18 @@ impl AgentsConfig {
             (rank.unwrap_or(usize::MAX), a.name.clone())
         });
 
-        let preamble_path = dir.join(SHARED_AGENT_DIR).join(SHARED_PREAMBLE_FILE);
-        let preamble = read_optional(&preamble_path)?;
-        let deployed = crate::read_state(project)
-            .map(|s| s.deployed_agent_defaults.into_iter().collect())
-            .unwrap_or_default();
+        let project_yaml = project_text
+            .as_deref()
+            .and_then(|text| serde_yaml::from_str::<Value>(text).ok());
         Ok(AgentsConfig {
-            project: project.to_string(),
+            project,
             agents,
             shared_instructions: preamble.clone().unwrap_or_default(),
             unreadable,
             disk: Arc::new(Disk {
-                assignments: load_assignments(project)?,
-                pinned: load_pins(project),
-                overrides: load_overrides(project),
+                assignments: assignments_from(statuses_text.as_deref(), &workflows),
+                pinned: pins_from(project_yaml.as_ref()),
+                overrides: overrides_from(project_yaml.as_ref()),
                 dir,
                 agents: loaded,
                 preamble_path,
@@ -1427,20 +1516,16 @@ fn patch_manifest(
 
 /// Every workflow status that names an agent, by agent. Read leniently, so a
 /// workflow the loader would reject still counts.
-fn load_assignments(project: &str) -> Result<BTreeMap<String, Vec<Assignment>>> {
-    let statuses_path = crate::workflows::statuses_read_path(project).map_err(other)?;
-    let catalog = read_optional(&statuses_path)?
-        .and_then(|text| ProjectStatuses::from_yaml_str(&text).ok())
+fn assignments_from(
+    statuses_text: Option<&str>,
+    workflows: &[WorkflowFile],
+) -> BTreeMap<String, Vec<Assignment>> {
+    let catalog = statuses_text
+        .and_then(|text| ProjectStatuses::from_yaml_str(text).ok())
         .unwrap_or_else(shelbi_core::default_project_statuses);
-    let dir = crate::workflows_dir(project).map_err(other)?;
     let mut out: BTreeMap<String, Vec<Assignment>> = BTreeMap::new();
-    for (stem, path) in
-        crate::workflow_config::workflow_files(&dir).map_err(|e| file_err(&dir, e))?
-    {
-        let Some(text) = read_optional(&path)? else {
-            continue;
-        };
-        let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+    for WorkflowFile { stem, text, .. } in workflows {
+        let Ok(value) = serde_yaml::from_str::<Value>(text) else {
             continue;
         };
         let Some(items) = value.get("statuses").and_then(Value::as_sequence) else {
@@ -1464,7 +1549,7 @@ fn load_assignments(project: &str) -> Result<BTreeMap<String, Vec<Assignment>>> 
             });
         }
     }
-    Ok(out)
+    out
 }
 
 /// What a project YAML sets over its agents' own preferences, as dispatch
@@ -1481,15 +1566,9 @@ struct ProjectOverrides {
 
 /// The project YAML's overrides, read leniently: a value that doesn't
 /// parse is left out (dispatch would refuse the file anyway).
-fn load_overrides(project: &str) -> ProjectOverrides {
+fn overrides_from(value: Option<&Value>) -> ProjectOverrides {
     let mut out = ProjectOverrides::default();
-    let Ok(path) = crate::workflow_config::project_config_file(project) else {
-        return out;
-    };
-    let Ok(Some(text)) = read_optional(&path) else {
-        return out;
-    };
-    let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+    let Some(value) = value else {
         return out;
     };
     fn parse<T: serde::de::DeserializeOwned>(v: Option<&Value>) -> Option<T> {
@@ -1522,14 +1601,8 @@ fn load_overrides(project: &str) -> ProjectOverrides {
 }
 
 /// The agents the project YAML pins a runner for (`agents.<name>:`).
-fn load_pins(project: &str) -> Vec<String> {
-    let Ok(path) = crate::workflow_config::project_config_file(project) else {
-        return Vec::new();
-    };
-    let Ok(Some(text)) = read_optional(&path) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+fn pins_from(value: Option<&Value>) -> Vec<String> {
+    let Some(value) = value else {
         return Vec::new();
     };
     value
