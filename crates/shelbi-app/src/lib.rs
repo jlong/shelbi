@@ -121,7 +121,7 @@ pub use exec_daemon::{
 };
 pub use shelbi_proto::control::{ExpectedState, ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
 pub use nav::{ClientState, Focus, GlobalFlags, Overlay, View};
-pub use refresh::{spawn_refresher, spawn_worker, RefreshHandle, Refresher, Snapshot};
+pub use refresh::{inline_worker, spawn_refresher, spawn_worker, RefreshHandle, Refresher, Snapshot};
 pub use view::{
     BoardFilters, ErrorLogModel, IssueCard, IssueColumn, IssuesModel,
     MachinesModel, ReviewPanelModel, SidebarModel, TaskDetailModel,
