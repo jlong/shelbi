@@ -15,7 +15,8 @@ type CodeTabProps = {
    * Open on this tab while the site-wide TUI | Desktop switch is on `client`
    * and the reader hasn't picked a tab in this group (e.g. the install guide's
    * "macOS" tab for `tui`, "macOS desktop app" for `desktop`). Without one for
-   * a client, the first tab is the default.
+   * `desktop` (the site default), the first tab is its default; without one
+   * for `tui`, the TUI opens on the desktop default.
    */
   client?: ClientKind
   children: ReactNode
@@ -56,7 +57,7 @@ function isCodeTab(node: ReactNode): node is ReactElement<CodeTabProps> {
  *
  * Until the reader picks a tab, the default follows the site-wide TUI | Desktop
  * switch through each tab's optional `client`. Like `ClientVariant`, that
- * default is drawn by CSS (the `client-desktop:` variant), so it is right from
+ * default is drawn by CSS (the `client-tui:` variant), so it is right from
  * the first frame and follows the switch live; the hook only moves the ARIA
  * state and roving tabindex once hydrated.
  *
@@ -84,10 +85,10 @@ export function CodeTabs({ group, children }: CodeTabsProps) {
 
   const [chosen, select] = useCodeTabGroup(group, labels)
   const [client] = useClientPreference()
-  const tuiDefault = tabs.find((tab) => tab.props.client === "tui")?.props.label ?? labels[0]
   const desktopDefault =
-    tabs.find((tab) => tab.props.client === "desktop")?.props.label ?? tuiDefault
-  const active = chosen ?? (client === "desktop" ? desktopDefault : tuiDefault)
+    tabs.find((tab) => tab.props.client === "desktop")?.props.label ?? labels[0]
+  const tuiDefault = tabs.find((tab) => tab.props.client === "tui")?.props.label ?? desktopDefault
+  const active = chosen ?? (client === "tui" ? tuiDefault : desktopDefault)
   // With no pick yet and a per-client default, CSS shows the default tab, so
   // the server render and every frame before hydration already match the
   // chosen client.
@@ -196,29 +197,30 @@ const TAB_INACTIVE = "border-transparent text-gray-6 hover:text-fg"
 
 /**
  * A tab's look: active or not by the reader's pick (`active`), or, with no
- * pick, by the chosen client (the two defaults swap under `client-desktop:`).
+ * pick, by the chosen client (the desktop default is the base; the two
+ * defaults swap under `client-tui:`).
  */
 function tabLook(
   label: string,
   by: { active: string } | { tuiDefault: string; desktopDefault: string },
 ): string {
   if ("active" in by) return label === by.active ? TAB_ACTIVE : TAB_INACTIVE
-  if (label === by.tuiDefault) {
-    return `${TAB_ACTIVE} client-desktop:border-transparent client-desktop:text-gray-6 client-desktop:hover:text-fg`
-  }
   if (label === by.desktopDefault) {
-    return `${TAB_INACTIVE} client-desktop:border-fg client-desktop:text-fg`
+    return `${TAB_ACTIVE} client-tui:border-transparent client-tui:text-gray-6 client-tui:hover:text-fg`
+  }
+  if (label === by.tuiDefault) {
+    return `${TAB_INACTIVE} client-tui:border-fg client-tui:text-fg`
   }
   return TAB_INACTIVE
 }
 
 /**
  * With no pick, the pane each client opens on is shown by CSS rather than the
- * `hidden` attribute (which preflight forces to `display: none`): the TUI
- * default unless the desktop app is chosen, the desktop default only then.
+ * `hidden` attribute (which preflight forces to `display: none`): the desktop
+ * default unless the TUI is chosen, the TUI default only then.
  */
 function paneShownByClient(label: string, tuiDefault: string, desktopDefault: string): string {
-  if (label === tuiDefault) return "client-desktop:hidden"
-  if (label === desktopDefault) return "hidden client-desktop:block"
+  if (label === desktopDefault) return "client-tui:hidden"
+  if (label === tuiDefault) return "hidden client-tui:block"
   return "hidden"
 }

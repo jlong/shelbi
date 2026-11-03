@@ -1,11 +1,12 @@
 @import "tailwindcss";
 @custom-variant dark (&:where(.dark, .dark *));
-/* The TUI / Desktop illustration choice (lib/client-preference.ts): the boot
-   script marks `<html data-client="desktop">` before paint, so these variants
-   swap the client-specific mockups with no flash. TUI is the default (no
-   attribute). */
+/* The TUI / Desktop illustration choice (lib/client-preference.ts): the root
+   layout server-renders `<html data-client="desktop">` (the default) and the
+   boot script rewrites it to a stored `tui` before paint, so these variants
+   swap the client-specific mockups with no flash. Each is keyed on its own
+   attribute value; neither client is "no attribute". */
 @custom-variant client-desktop (&:where([data-client="desktop"], [data-client="desktop"] *));
-@custom-variant client-tui (&:where(:root:not([data-client="desktop"]), :root:not([data-client="desktop"]) *));
+@custom-variant client-tui (&:where([data-client="tui"], [data-client="tui"] *));
 
 /* ============================================================
    Mono symbol supplement (box-drawing, arrows, block/geometry)

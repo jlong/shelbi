@@ -20,7 +20,7 @@ import {
  * - a change made in another tab arrives as a `storage` event and is applied
  *   to this tab's attribute too.
  *
- * During SSR and hydration the hook reports the default (`tui`), then settles
+ * During SSR and hydration the hook reports the default (`desktop`), then settles
  * on the stored value right after. Anything visual should key off the CSS
  * variants (`ClientVariant`, `client-desktop:` / `client-tui:` classes) so it
  * is right from the first frame; the hook is for behavior and ARIA state.
@@ -32,10 +32,10 @@ function readClient(): ClientKind {
   return parseClient(document.documentElement.getAttribute(CLIENT_ATTRIBUTE))
 }
 
+// Always written, default included: the CSS variants key on the value, not on
+// the attribute's presence.
 function applyClient(client: ClientKind) {
-  const root = document.documentElement
-  if (client === DEFAULT_CLIENT) root.removeAttribute(CLIENT_ATTRIBUTE)
-  else root.setAttribute(CLIENT_ATTRIBUTE, client)
+  document.documentElement.setAttribute(CLIENT_ATTRIBUTE, client)
 }
 
 function subscribe(onChange: () => void): () => void {
