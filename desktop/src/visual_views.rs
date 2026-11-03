@@ -88,7 +88,7 @@ pub fn run(out: PathBuf) -> ! {
     };
 
     // ---- Activity ----
-    let (activity, window) = open(&mut cx, |cx| cx.new(|cx| ActivityView::new(PROJECT.into(), cx)));
+    let (activity, window) = open(&mut cx, |cx| cx.new(|cx| ActivityView::new(&shelbi_orchestrator::source::local_handle(PROJECT), cx)));
     let loaded = wait(&mut cx, window, Duration::from_secs(10), |cx| {
         activity.update(cx, |v, cx| v.poll(cx));
         activity.read_with(cx, |v, _| v.state().feed().rows().count() >= 6)
@@ -149,7 +149,7 @@ pub fn run(out: PathBuf) -> ! {
     }
 
     // ---- Machines ----
-    let (machines, window) = open(&mut cx, |cx| cx.new(|cx| MachinesView::new(PROJECT.into(), cx)));
+    let (machines, window) = open(&mut cx, |cx| cx.new(|cx| MachinesView::new(&shelbi_orchestrator::source::local_handle(PROJECT), cx)));
     let loaded = wait(&mut cx, window, Duration::from_secs(10), |cx| {
         machines.update(cx, |v, cx| v.poll(cx));
         machines.read_with(cx, |v, _| v.state().model().workspace_count() == 3)
@@ -175,7 +175,7 @@ pub fn run(out: PathBuf) -> ! {
     save(&mut cx, window, &out, "machines.png");
 
     // ---- Issues board ----
-    let (board, window) = open(&mut cx, |cx| cx.new(|cx| IssuesView::new(PROJECT.into(), cx)));
+    let (board, window) = open(&mut cx, |cx| cx.new(|cx| IssuesView::new(&shelbi_orchestrator::source::local_handle(PROJECT), cx)));
     let loaded = wait(&mut cx, window, Duration::from_secs(10), |cx| {
         board.update(cx, |v, cx| v.poll(cx));
         board.update(cx, |v, _| {
@@ -274,7 +274,7 @@ pub fn run(out: PathBuf) -> ! {
 
     // ---- Settings, the bootstrap screens and the notice bars ----
     let window = open_with_window(&mut cx, |window, cx| {
-        cx.new(|cx| crate::views::settings::SettingsView::new(PROJECT, window, cx))
+        cx.new(|cx| crate::views::settings::SettingsView::new(&shelbi_orchestrator::source::local_handle(PROJECT), window, cx))
     });
     save(&mut cx, window, &out, "settings.png");
     let settings = window
@@ -329,7 +329,7 @@ pub fn run(out: PathBuf) -> ! {
         ];
         for (name, theme, option, size) in states {
             let window = open_with_window(&mut cx, |window, cx| {
-                cx.new(|cx| crate::views::settings::SettingsView::new(PROJECT, window, cx))
+                cx.new(|cx| crate::views::settings::SettingsView::new(&shelbi_orchestrator::source::local_handle(PROJECT), window, cx))
             });
             let settings = window
                 .update(&mut cx, |root, _, _| root.downcast::<crate::views::settings::SettingsView>())
@@ -362,7 +362,7 @@ pub fn run(out: PathBuf) -> ! {
     ] {
         let window: AnyWindowHandle = cx
             .open_offscreen_window(size(px(1100.0), px(1000.0)), |window, cx| {
-                cx.new(|cx| crate::views::settings::SettingsView::new(PROJECT, window, cx))
+                cx.new(|cx| crate::views::settings::SettingsView::new(&shelbi_orchestrator::source::local_handle(PROJECT), window, cx))
             })
             .expect("open the offscreen window")
             .into();

@@ -205,6 +205,9 @@ pub enum PaneEvent {
     /// The connection ended without an exit: the session process went away
     /// (killed, or replaced by a relaunch).
     Closed,
+    /// Something to say over the pane for a moment: why dropped files
+    /// weren't pasted, why a far file didn't open.
+    Note(String),
 }
 
 impl gpui::EventEmitter<PaneEvent> for TerminalPane {}
@@ -312,6 +315,9 @@ struct ScrollbarDrag {
 /// One session in a terminal element.
 pub struct TerminalPane {
     selector: String,
+    /// A remote window's link, when the session runs on another machine
+    /// ([`Self::set_far_files`]).
+    far: Option<shelbi_app::source::ProjectLink>,
     title: Option<String>,
     status: PaneStatus,
     view: TerminalView,
@@ -670,6 +676,7 @@ impl TerminalPane {
         let size = Size::new(80, 24);
         Self {
             selector,
+            far: None,
             title: None,
             status: PaneStatus::Connecting,
             view: TerminalView::new(size),
@@ -1044,13 +1051,49 @@ impl TerminalPane {
     /// and take keyboard focus so the user can keep typing after the drop.
     /// A Finder drop arrives straight from gpui; an image or file-promise drop
     /// is first written to a file by `crate::drops`, then replayed here.
+    ///
+    /// A remote window's session runs on another machine, where the dropped
+    /// files' paths don't exist: they're uploaded there first
+    /// (`shelbi_app::far::upload`, the relay's `put`), and the far paths are
+    /// pasted.
     fn drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(link) = self.far.clone() {
+            if self.io.is_none() || paths.paths().is_empty() {
+                return;
+            }
+            window.focus(&self.focus_handle, cx);
+            let paths = paths.paths().to_vec();
+            let upload = cx
+                .background_executor()
+                .spawn(async move { shelbi_app::far::upload(&link, &paths) });
+            cx.spawn(async move |this, cx| {
+                let uploaded = upload.await;
+                let _ = this.update(cx, |this, cx| match uploaded {
+                    Ok(far) => {
+                        let text = input::dropped_paths_text(&far);
+                        if !text.is_empty() && this.io.is_some() {
+                            this.paste(text, cx);
+                        }
+                    }
+                    Err(why) => cx.emit(PaneEvent::Note(why)),
+                });
+            })
+            .detach();
+            return;
+        }
         let text = input::dropped_paths_text(paths.paths());
         if text.is_empty() || self.io.is_none() {
             return;
         }
         window.focus(&self.focus_handle, cx);
         self.paste(text, cx);
+    }
+
+    /// The session runs on `far`'s machine (a remote window's pane): drops
+    /// are uploaded there and Cmd+clicked paths open in an editor session
+    /// there. `None`: this machine's.
+    pub fn set_far_files(&mut self, far: Option<shelbi_app::source::ProjectLink>) {
+        self.far = far;
     }
 
     fn paste(&mut self, text: String, cx: &mut Context<Self>) {
@@ -1523,6 +1566,21 @@ impl TerminalPane {
                     #[cfg(feature = "visual-check")]
                     if let Some(sink) = self.link_sink.as_ref() {
                         sink.borrow_mut().push(link.target);
+                        return;
+                    }
+                    if let (Some(far), shelbi_term::links::LinkTarget::Path { path, line, column }) =
+                        (self.far.as_ref(), &link.target)
+                    {
+                        // The path is the far session's: open it there.
+                        let file = shelbi_app::far::FarFile::Path {
+                            candidates: shelbi_app::far::link_candidates(path, self.cwd.as_deref()),
+                            line: *line,
+                            column: *column,
+                        };
+                        let label = crate::views::far_editor::label_of(path);
+                        crate::views::far_editor::open_from(far, file, label, cx, |_, e, cx| {
+                            cx.emit(PaneEvent::Note(e));
+                        });
                         return;
                     }
                     open::open(&link.target, self.cwd.clone(), cx);

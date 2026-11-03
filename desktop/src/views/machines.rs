@@ -22,6 +22,7 @@
 //! Clicking (or Enter on) a workspace runs `CommandKind::FocusWorkspace`
 //! through the window's dispatch.
 
+use shelbi_app::source::{ProjectHandle, ProjectSource};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -50,15 +51,16 @@ const REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
 /// How often the view drains its refresher and the prober.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Probe `host` over SSH, or (`--visual-figma`, whose fixture hosts don't
-/// exist) answer the stubbed reachability without a probe. Settings ▸
-/// Workspaces' prober probes through it too.
-pub(super) fn probe(host: &str) -> shelbi_core::Reachability {
+/// Probe `host` over SSH from the project's machine (its `source`), or
+/// (`--visual-figma`, whose fixture hosts don't exist) answer the stubbed
+/// reachability without a probe. Settings ▸ Workspaces' prober probes
+/// through it too.
+pub(super) fn probe(source: &dyn ProjectSource, host: &str) -> shelbi_core::Reachability {
     #[cfg(feature = "visual-check")]
     if let Some(stub) = FIXTURE_HOSTS.lock().unwrap().clone() {
         return stub;
     }
-    shelbi_orchestrator::machine::probe_host_reachability(host)
+    source.machine_reachability(host)
 }
 
 #[cfg(feature = "visual-check")]
@@ -92,16 +94,16 @@ pub struct MachinesView {
 impl EventEmitter<MachinesEvent> for MachinesView {}
 
 impl MachinesView {
-    pub fn new(project: String, cx: &mut Context<Self>) -> Self {
-        let p = project.clone();
-        let refresher = shelbi_app::spawn_worker(move |_| {
-            shelbi_orchestrator::machines_model::read_machines_model(&p).map_err(|e| e.to_string())
-        });
+    pub fn new(handle: &ProjectHandle, cx: &mut Context<Self>) -> Self {
+        let project = handle.name().to_string();
+        let source = handle.source.clone();
+        let refresher = shelbi_app::spawn_worker(move |_| source.machines());
         refresher.request();
+        let source = handle.source.clone();
         let prober = ReachabilityProber::spawn(
             REACHABILITY_CADENCE,
             REACHABILITY_BACKOFF_MAX,
-            |_machine: &str, host: &str| probe(host),
+            move |_machine: &str, host: &str| probe(source.as_ref(), host),
         );
         let poll = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(POLL_INTERVAL).await;
@@ -184,8 +186,8 @@ impl MachinesView {
         self.tick(cx);
     }
 
-    /// The view's state, for the offscreen views check.
-    #[cfg(feature = "visual-check")]
+    /// The view's state, for the offscreen views check (and tests).
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn state(&self) -> &MachinesState {
         &self.state
     }

@@ -14,7 +14,6 @@
 //! moved on since (`dt-activity-perf`).
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 use chrono::{DateTime, Utc};
@@ -36,33 +35,7 @@ pub enum Picker {
     Workspace,
 }
 
-/// What the feed needs from the project's config, read beside the log: the
-/// header's name and the workspaces that review (their actor reads cyan).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProjectInfo {
-    /// The project's display name (`name:`), when it has one.
-    pub label: Option<String>,
-    /// The `review`-tagged workspaces.
-    pub reviewers: HashSet<String>,
-}
-
-impl ProjectInfo {
-    /// Read `project`'s config; the default when it won't load.
-    pub fn read(project: &str) -> Self {
-        let Ok(p) = shelbi_state::load_project(project) else {
-            return Self::default();
-        };
-        ProjectInfo {
-            label: p.display_name.clone().or_else(|| p.label.clone()),
-            reviewers: p
-                .workspaces
-                .iter()
-                .filter(|w| p.effective_tags(w).contains("review"))
-                .map(|w| w.name.clone())
-                .collect(),
-        }
-    }
-}
+pub use shelbi_app::activity::ProjectInfo;
 
 /// One feed item's identity for the view's virtualized list: `ident` is the
 /// item without its relative time (the same row, a minute older), `content`
@@ -558,7 +531,7 @@ mod tests {
         assert_eq!(s.title(), "demo");
         s.set_project_info(ProjectInfo {
             label: Some("Demo Board".into()),
-            reviewers: HashSet::new(),
+            reviewers: std::collections::HashSet::new(),
         });
         assert_eq!(s.title(), "Demo Board");
     }

@@ -56,6 +56,10 @@
 //! - [`about`] — About Shelbi's words and links (the tagline, the project's
 //!   URLs, the copyright and license), so both clients' About screens read
 //!   the same.
+//! - [`source`] — the seam between a client's views and every read they
+//!   make of a project ([`source::ProjectSource`]), named by a
+//!   [`source::ProjectKey`], and the window's link for everything that isn't
+//!   a read ([`source::ProjectLink`]).
 //! - [`licenses`] — Acknowledgements: the bundled software's entries and
 //!   license tables, the search / selection browser over them, and a
 //!   license text's paragraph layout.
@@ -80,6 +84,7 @@ pub mod command;
 pub mod command_model;
 pub mod exec;
 pub mod exec_daemon;
+pub mod far;
 pub mod issue_edit;
 pub mod new_task;
 pub mod feedback;
@@ -93,22 +98,26 @@ pub mod onboarding;
 pub mod overlay;
 pub mod reachability;
 pub mod refresh;
+pub mod remote_window;
 pub mod review;
 pub mod session;
 pub mod settings;
+pub mod source;
+pub mod state_write;
 pub mod supervision;
 pub mod task_properties;
 pub mod task_session;
 pub mod text_area;
 pub mod theme;
 pub mod view;
+pub mod wire;
 pub mod workspace_panel;
 pub mod zen;
 
 pub use command::{Command, CommandKind, CommandModel, CommandRegistry};
 pub use exec::{EditTarget, Effect, ExecError, ExecOutcome, Executor, Mutation};
 pub use exec_daemon::{
-    execute_mutation, execute_mutation_expecting, review_session, workspace_session,
+    execute_mutation, execute_mutation_expecting, review_session, workspace_session, write_state,
 };
 pub use shelbi_proto::control::{ExpectedState, ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
 pub use nav::{ClientState, Focus, GlobalFlags, Overlay, View};

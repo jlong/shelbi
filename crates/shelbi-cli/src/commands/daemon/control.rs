@@ -31,9 +31,10 @@ use std::time::Duration;
 
 use shelbi_orchestrator::mutate::{self, MutateError, OutputSink};
 use shelbi_proto::control::{
-    self, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, MutationError,
-    MutationKind, MutationRequest, ReviewRole, ReviewSessionOp, ReviewSessionRequest, ServerMsg,
-    Stream, WorkspaceSessionOp, WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
+    self, AppRequest, AttachedClient, ChangeNote, ClientInfo, ClientKind, ClientMsg, DetachSelector,
+    MutationError, MutationKind, MutationRequest, ReviewRole, ReviewSessionOp, ReviewSessionRequest,
+    SaveConfigRequest, ServerMsg, StateWriteRequest, Stream, WorkspaceSessionOp, WorkspaceSessionRequest,
+    CONTROL_PROTOCOL_VERSION,
 };
 use shelbi_state::CLIENT_VERSION;
 
@@ -153,7 +154,13 @@ struct Inner {
     apply: Box<ApplyFn>,
     /// The quit/stop operations behind the lifecycle commands.
     lifecycle: Arc<dyn LifecycleOps>,
+    /// The app requests' runner (see [`FarFn`]).
+    far: Arc<FarFn>,
 }
+
+/// Runs one app request ([`ClientMsg::AppRequest`]) for a project. Defaults
+/// to [`shelbi_orchestrator::far::answer`]; a test substitutes a stub.
+type FarFn = dyn Fn(&str, shelbi_app::far::Request) -> shelbi_app::far::Reply + Send + Sync;
 
 /// One attached UI client in the registry: its announced identity, the time it
 /// attached (daemon-stamped RFC3339), and the sender feeding its writer thread
@@ -200,7 +207,17 @@ impl ControlState {
                 next_conn_id: AtomicU64::new(1),
                 apply,
                 lifecycle,
+                far: Arc::new(shelbi_orchestrator::far::answer),
             }),
+        }
+    }
+
+    /// This state running app requests with `far` instead (tests).
+    #[cfg(test)]
+    fn with_far(self, far: Arc<FarFn>) -> Self {
+        let inner = Arc::try_unwrap(self.inner).unwrap_or_else(|_| panic!("a fresh state"));
+        Self {
+            inner: Arc::new(Inner { far, ..inner }),
         }
     }
 
@@ -408,6 +425,12 @@ fn handle_client(stream: UnixStream, state: ControlState) {
             }
             ClientMsg::Subscribe { info } => {
                 state.register(conn_id, tx.clone());
+                // A remote window's link (another machine's app, over this
+                // machine's relay) decided on the version before it opened
+                // and can't re-exec this daemon's binary anyway: it is never
+                // told to for a version difference. A deliberate reload still
+                // reaches it (`ReloadClients` broadcasts to every subscriber).
+                let remote = info.as_ref().is_some_and(|i| i.kind == ClientKind::Remote);
                 // When the subscriber announced its identity, track it as an
                 // attached UI client so `shelbi detach` can list and target it.
                 if let Some(info) = info {
@@ -417,7 +440,7 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 // is out of date: tell it to re-exec (a TUI) / prompt for
                 // relaunch (the desktop app) right away, so it stops sending
                 // commands before it does anything else.
-                if let Some(cv) = &client_version {
+                if let Some(cv) = client_version.as_ref().filter(|_| !remote) {
                     if *cv != state.inner.lifecycle.daemon_version() {
                         let _ = tx.send(ServerMsg::Reexec {
                             reason: format!(
@@ -490,6 +513,25 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 // are reaped as their connections close.
                 let count = state.detach_clients(&selector, &reason);
                 let _ = tx.send(ServerMsg::Detached { request_id, count });
+            }
+            ClientMsg::WriteState(req) => {
+                // Detached like a mutation, so a client that leaves right after
+                // asking still gets its write made (and announced).
+                let state = state.clone();
+                let tx = tx.clone();
+                thread::spawn(move || run_state_write(conn_id, req, state, tx));
+            }
+            ClientMsg::SaveConfig(req) => {
+                // Detached like a mutation: a save the client walked away
+                // from still lands whole (or not at all).
+                let state = state.clone();
+                let tx = tx.clone();
+                thread::spawn(move || run_save_config(req, state, tx));
+            }
+            ClientMsg::AppRequest(req) => {
+                let state = state.clone();
+                let tx = tx.clone();
+                thread::spawn(move || run_app_request(req, state, tx));
             }
         }
     }
@@ -594,6 +636,38 @@ fn run_job(origin: u64, req: MutationRequest, state: ControlState, tx: Sender<Se
     }
 }
 
+/// Make one project-state write (protocol v7) through
+/// [`shelbi_orchestrator::state_write::apply`], reply to the requester, and
+/// announce it to every other subscriber, so their views of the project
+/// refresh. Not an issue mutation: no per-issue lock or expected state (the
+/// state files carry their own locks), and the note names no issue.
+fn run_state_write(origin: u64, req: StateWriteRequest, state: ControlState, tx: Sender<ServerMsg>) {
+    let request_id = req.request_id;
+    match shelbi_orchestrator::state_write::apply(&req.project, &req.write) {
+        Ok(()) => {
+            let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
+            state.broadcast(origin, &state_write_note(&req));
+        }
+        Err(message) => {
+            let _ = tx.send(ServerMsg::Failed {
+                request_id,
+                error: MutationError::Backend { message },
+            });
+        }
+    }
+}
+
+/// The `Changed` note announcing `req`: the project, no issue, the write's verb.
+fn state_write_note(req: &StateWriteRequest) -> ChangeNote {
+    ChangeNote {
+        project: req.project.clone(),
+        id: String::new(),
+        verb: req.write.verb().to_string(),
+        status: String::new(),
+        updated_at: String::new(),
+    }
+}
+
 /// Carry out one review-session request (`rt-tui-review`): start/stop the
 /// editor/diff/server sessions of a review slot through
 /// [`shelbi_orchestrator::review_session`], then report the result keyed by
@@ -690,6 +764,75 @@ fn run_workspace_session_job(req: WorkspaceSessionRequest, tx: Sender<ServerMsg>
                 error: MutationError::Backend {
                     message: e.to_string(),
                 },
+            });
+        }
+    }
+}
+
+/// Write one config save a client planned (`SaveConfig`, protocol v8):
+/// [`shelbi_state::config_write::apply`] validates it against the project
+/// (paths inside the surface's config, YAML re-parsed with this binary's
+/// loader), checks each file is as the client read it, and writes it. Saves
+/// of one project's surface run one at a time, so two can't both pass their
+/// checks before either writes.
+fn run_save_config(req: SaveConfigRequest, state: ControlState, tx: Sender<ServerMsg>) {
+    use shelbi_state::config_write::{self, WriteError};
+    let request_id = req.request_id;
+    let failed = |error: MutationError| {
+        let _ = tx.send(ServerMsg::Failed { request_id, error });
+    };
+    let plan: config_write::Plan = match serde_json::from_value(req.plan) {
+        Ok(plan) => plan,
+        Err(e) => {
+            return failed(MutationError::Backend {
+                message: format!("a config save this daemon can't read: {e}"),
+            })
+        }
+    };
+    if plan.surface.as_str() != req.surface {
+        return failed(MutationError::Backend {
+            message: format!("a {} save that writes {}", req.surface, plan.surface.as_str()),
+        });
+    }
+    let lock = state.issue_lock(&req.project, &format!("config:{}", req.surface));
+    let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+    match config_write::apply(&req.project, &plan) {
+        Ok(()) => {
+            let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
+        }
+        Err(WriteError::Changed(paths)) => failed(MutationError::ConfigChanged {
+            paths: paths.iter().map(|p| p.display().to_string()).collect(),
+        }),
+        Err(e) => failed(MutationError::Backend { message: e.to_string() }),
+    }
+}
+
+/// Run one app request (`AppRequest`, protocol v8) and reply with its
+/// answer: a workspace or machine change, a machine check, an editor
+/// session (`shelbi_orchestrator::far`).
+fn run_app_request(req: AppRequest, state: ControlState, tx: Sender<ServerMsg>) {
+    let request_id = req.request_id;
+    let request: shelbi_app::far::Request = match serde_json::from_value(req.body) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = tx.send(ServerMsg::Failed {
+                request_id,
+                error: MutationError::Backend {
+                    message: format!("a request this daemon can't read: {e}"),
+                },
+            });
+            return;
+        }
+    };
+    let reply = (state.inner.far)(&req.project, request);
+    match serde_json::to_value(&reply) {
+        Ok(body) => {
+            let _ = tx.send(ServerMsg::Reply { request_id, body });
+        }
+        Err(e) => {
+            let _ = tx.send(ServerMsg::Failed {
+                request_id,
+                error: MutationError::Backend { message: e.to_string() },
             });
         }
     }
@@ -1175,6 +1318,89 @@ mod tests {
         assert_eq!(rec.merges.load(AOrd::SeqCst), 1);
     }
 
+    // --- project-state writes (protocol v7) ----------------------------------
+
+    #[test]
+    fn a_state_write_lands_on_disk_and_is_announced_to_the_other_subscribers() {
+        use shelbi_proto::control::{StateWrite, StateWriteRequest};
+        let _home = Home::new("statewr");
+        let served = serve_bg(ControlState::new(), "statewr");
+
+        let watcher = ControlClient::connect(&served.sock, CLIENT_VERSION).unwrap();
+        let mut sub = watcher.subscribe().unwrap();
+        // Give the daemon a moment to register the watcher.
+        thread::sleep(Duration::from_millis(150));
+
+        let mut client = ControlClient::connect(&served.sock, CLIENT_VERSION).unwrap();
+        client
+            .write_state(&StateWriteRequest {
+                request_id: 3,
+                project: "p".into(),
+                write: StateWrite::SetWorkspaceFilter {
+                    filter: Some("ws:dev".into()),
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            shelbi_state::read_state("p").unwrap().workspace_filter.as_deref(),
+            Some("ws:dev")
+        );
+        match sub.recv() {
+            Ok(Some(Notice::Changed(note))) => {
+                assert_eq!(note.project, "p");
+                assert_eq!(note.id, "", "a state write names no issue");
+                assert_eq!(note.verb, "workspace-filter");
+            }
+            other => panic!("the watcher should hear of the write, got {other:?}"),
+        }
+
+        client
+            .write_state(&StateWriteRequest {
+                request_id: 4,
+                project: "p".into(),
+                write: StateWrite::AppendError {
+                    message: "boom".into(),
+                    source: Some("zen".into()),
+                },
+            })
+            .unwrap();
+        let errors = shelbi_state::read_errors("p").unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, "boom");
+    }
+
+    #[test]
+    fn a_state_write_that_fails_says_why_and_announces_nothing() {
+        use shelbi_proto::control::{StateWrite, StateWriteRequest};
+        let home = Home::new("statewf");
+        // A directory where state.json belongs: nothing can be written there.
+        std::fs::create_dir_all(home.path.join("projects/p/state.json")).unwrap();
+        let state = ControlState::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.register(7, tx);
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        run_state_write(
+            1,
+            StateWriteRequest {
+                request_id: 9,
+                project: "p".into(),
+                write: StateWrite::ToggleZen {
+                    source: "user:palette".into(),
+                },
+            },
+            state,
+            reply_tx,
+        );
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Ok(ServerMsg::Failed {
+                request_id: 9,
+                error: MutationError::Backend { .. }
+            })
+        ));
+        assert!(rx.try_recv().is_err(), "a failed write announces nothing");
+    }
+
     // --- lifecycle commands (Phase 4f) ---------------------------------------
     //
     // These drive the real control server with a RECORDING LifecycleOps so the
@@ -1303,9 +1529,55 @@ mod tests {
         }
     }
 
+    fn remote_info(id: &str) -> shelbi_proto::control::ClientInfo {
+        shelbi_proto::control::ClientInfo {
+            client_id: id.into(),
+            kind: shelbi_proto::control::ClientKind::Remote,
+            host: "laptop".into(),
+            pid: Some(7),
+            project: Some("p".into()),
+        }
+    }
+
+    #[test]
+    fn a_remote_subscriber_on_another_version_is_not_told_to_reexec() {
+        // A remote window's link subscribes as `ClientKind::Remote`. Its
+        // version difference never earns a Reexec: the first push it sees is
+        // the next real one (here a reload), not an "out of date".
+        let life = RecordingLifecycle::new("daemon-NEW");
+        let served = serve_lifecycle(life, "remote-sub");
+        let a = ControlClient::connect(&served.sock, "client-OLD").unwrap();
+        let mut sub = a.subscribe_as(remote_info("far")).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        let mut b = ControlClient::connect(&served.sock, "daemon-NEW").unwrap();
+        b.reload_clients().unwrap();
+        match sub.recv() {
+            Ok(Some(Notice::Reexec { reason })) => assert!(
+                reason.contains("reload") && !reason.contains("out of date"),
+                "a remote subscriber only hears the reload: {reason}"
+            ),
+            other => panic!("expected the reload push, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deliberate_reload_still_reaches_a_remote_subscriber() {
+        let life = RecordingLifecycle::new("v1");
+        let served = serve_lifecycle(life, "remote-reload");
+        let a = ControlClient::connect(&served.sock, "v1").unwrap();
+        let mut sub = a.subscribe_as(remote_info("far")).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        let mut b = ControlClient::connect(&served.sock, "v1").unwrap();
+        b.reload_clients().unwrap();
+        match sub.recv() {
+            Ok(Some(Notice::Reexec { reason })) => assert!(reason.contains("reload"), "{reason}"),
+            other => panic!("a remote subscriber still hears a reload, got {other:?}"),
+        }
+    }
+
     // --- attached-client registry + detach (v4) ------------------------------
 
-    use shelbi_proto::control::{ClientInfo, ClientKind, DetachSelector};
+    use shelbi_proto::control::{ClientInfo, DetachSelector};
 
     fn info(id: &str) -> ClientInfo {
         ClientInfo {
@@ -1438,5 +1710,78 @@ mod tests {
             }
             other => panic!("the subscriber should receive a Detach push, got {other:?}"),
         }
+    }
+
+    // --- settings writes (protocol v8) ----------------------------------------
+
+    #[test]
+    fn a_config_save_is_written_and_one_planned_against_a_changed_file_is_refused() {
+        use shelbi_proto::control::{MutationError, SaveConfigRequest};
+        use shelbi_state::config_write::{content_hash, Check, Contents, Op, Plan, Surface};
+        let home = Home::new("savecfg");
+        let workflows = home.path.join("projects/p/workflows");
+        std::fs::create_dir_all(&workflows).unwrap();
+        let statuses = workflows.join("statuses.yaml");
+        let before = "# Ours.\nstatuses:\n- id: todo\n  name: Todo\n  category: ready\n- id: done\n  name: Done\n  category: done\n";
+        std::fs::write(&statuses, before).unwrap();
+        let after = before.replace("name: Todo", "name: Up next");
+        let plan = Plan {
+            surface: Surface::Workflows,
+            checks: vec![Check::File {
+                path: statuses.clone(),
+                hash: Some(content_hash(before.as_bytes())),
+            }],
+            ops: vec![Op::Write {
+                path: statuses.clone(),
+                contents: Contents::Text(after.clone()),
+            }],
+        };
+        let served = serve_bg(ControlState::new(), "savecfg");
+        let save = |request_id| {
+            let mut client = ControlClient::connect(&served.sock, CLIENT_VERSION).unwrap();
+            client.save_config(&SaveConfigRequest {
+                request_id,
+                project: "p".into(),
+                surface: "workflows".into(),
+                plan: serde_json::to_value(&plan).unwrap(),
+            })
+        };
+        save(1).expect("written");
+        assert_eq!(std::fs::read_to_string(&statuses).unwrap(), after);
+        match save(2) {
+            Err(shelbi_client::ClientError::Mutation(MutationError::ConfigChanged { paths })) => {
+                assert_eq!(paths, [statuses.display().to_string()]);
+            }
+            other => panic!("expected ConfigChanged, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&statuses).unwrap(), after, "nothing written");
+    }
+
+    #[test]
+    fn an_app_request_is_answered_with_the_far_reply() {
+        use shelbi_app::far::{FarFile, Reply, Request};
+        let seen: Arc<Mutex<Vec<(String, Request)>>> = Arc::default();
+        let far: Arc<FarFn> = {
+            let seen = seen.clone();
+            Arc::new(move |project: &str, request: Request| {
+                seen.lock().unwrap().push((project.to_string(), request));
+                Reply::Editor(Ok("p/edit/k1".into()))
+            })
+        };
+        let served = serve_bg(ControlState::new().with_far(far), "appreq");
+        let mut client = ControlClient::connect(&served.sock, CLIENT_VERSION).unwrap();
+        let request = Request::OpenEditor {
+            key: "k1".into(),
+            file: FarFile::path("/srv/p/notes.md"),
+        };
+        let body = client
+            .app_request(&AppRequest {
+                request_id: 3,
+                project: "p".into(),
+                body: serde_json::to_value(&request).unwrap(),
+            })
+            .unwrap();
+        assert_eq!(serde_json::from_value::<Reply>(body).unwrap(), Reply::Editor(Ok("p/edit/k1".into())));
+        assert_eq!(seen.lock().unwrap().clone(), [("p".to_string(), request)]);
     }
 }

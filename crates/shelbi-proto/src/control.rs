@@ -52,7 +52,23 @@ use crate::error::ProtoError;
 /// v6 adds [`WorkspaceSessionOp::EnsureShell`] / [`WorkspaceSessionOp::CloseShell`]:
 /// the desktop app's Workspace view asks the daemon for a plain user shell in
 /// the workspace's worktree, shown beside the agent (`dt-workspace-view`).
-pub const CONTROL_PROTOCOL_VERSION: u32 = 6;
+///
+/// v7 adds [`ClientMsg::WriteState`]: the project-state writes a client used
+/// to make on this machine's disk (the board's workspace filter and column
+/// overrides, Zen Mode, the error log and its read mark, a pane's supervision
+/// relaunch) go to the daemon, the single writer, which announces each with a
+/// [`ServerMsg::Changed`]. A remote window sends the same message over the
+/// relay (`rw-remote-state-writes`).
+///
+/// v8 adds the settings writes a window makes through the daemon, so a
+/// window on a project on another machine makes them there (remote-window
+/// P8): [`ClientMsg::SaveConfig`] (a config save the client planned, with the
+/// content hash of every file it was planned against, refused as
+/// [`MutationError::ConfigChanged`] when one changed since) and
+/// [`ClientMsg::AppRequest`] / [`ServerMsg::Reply`] (the app's own requests:
+/// workspace and machine changes, machine checks, an editor session; their
+/// bodies are `shelbi_app::far`'s).
+pub const CONTROL_PROTOCOL_VERSION: u32 = 8;
 
 /// Upper bound on a single control frame. Generous enough for a large issue body
 /// in an `edit`/`add`, far below the session [`crate::MAX_FRAME_LEN`].
@@ -309,10 +325,121 @@ pub struct WorkspaceSessionRequest {
     pub op: WorkspaceSessionOp,
 }
 
+/// A board column's persisted collapse override, for
+/// [`StateWrite::SetColumnOverride`]. Mirrors `shelbi_state::KanbanColumnOverride`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColumnOverride {
+    Collapsed,
+    Expanded,
+}
+
+/// The persistent pane a [`StateWrite::RequestRelaunch`] resets the daemon's
+/// supervision budget for. The daemon writes every relaunch key a pass could
+/// consume for it (a workspace is governed by more than one pass).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelaunchPane {
+    /// The project's orchestrator.
+    Orchestrator,
+    /// A workspace's agent pane (a dev workspace or a review slot).
+    Workspace { workspace: String },
+}
+
+/// One write to a project's state files that the daemon makes on a client's
+/// behalf (protocol v7). Each was a direct disk write in the client; behind
+/// the daemon there is one writer, the change is announced to every other
+/// client, and a remote window sends the same message over the relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateWrite {
+    /// The board's workspace filter (`state.json`), in its persisted form;
+    /// `None` clears it.
+    SetWorkspaceFilter { filter: Option<String> },
+    /// A board column's collapse override (`state.json`); `None` clears it.
+    SetColumnOverride {
+        workflow: String,
+        status: String,
+        value: Option<ColumnOverride>,
+    },
+    /// Flip Zen Mode (`state.json`) and log the change; `source` is the
+    /// event's actor (`user:palette`).
+    ToggleZen { source: String },
+    /// Append an entry to the project's error log.
+    AppendError {
+        message: String,
+        source: Option<String>,
+    },
+    /// Empty the project's error log (and its read mark).
+    ClearErrors,
+    /// Mark every entry in the project's error log read.
+    MarkErrorsRead,
+    /// Reset a persistent pane's supervision budget so the daemon relaunches
+    /// it now (the reopen marker).
+    RequestRelaunch { pane: RelaunchPane },
+}
+
+impl StateWrite {
+    /// A short noun for the `Changed` notification and logging.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            StateWrite::SetWorkspaceFilter { .. } => "workspace-filter",
+            StateWrite::SetColumnOverride { .. } => "column-override",
+            StateWrite::ToggleZen { .. } => "zen",
+            StateWrite::AppendError { .. } => "append-error",
+            StateWrite::ClearErrors => "clear-errors",
+            StateWrite::MarkErrorsRead => "mark-errors-read",
+            StateWrite::RequestRelaunch { .. } => "request-relaunch",
+        }
+    }
+}
+
+/// Client → daemon request to make one [`StateWrite`] to `project`'s state
+/// (protocol v7). Replies reuse [`ServerMsg::Done`] / [`ServerMsg::Failed`]
+/// keyed by `request_id`; every other subscriber gets a [`ServerMsg::Changed`]
+/// naming the project, with an empty issue id and [`StateWrite::verb`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateWriteRequest {
+    pub request_id: u64,
+    pub project: String,
+    pub write: StateWrite,
+}
+
+/// Client → daemon: write a config save the client planned with its own
+/// comment-preserving patcher (protocol v8). `plan` is a
+/// `shelbi_state::config_write::Plan`: the content hash each file it touches
+/// had when the client read it, then the writes in order. The daemon
+/// validates it against the project (every path inside `surface`'s config,
+/// every YAML re-parsed with its own loader), refuses it with
+/// [`MutationError::ConfigChanged`] when a file changed since, and otherwise
+/// writes it, each file atomically. Replies [`ServerMsg::Done`] or
+/// [`ServerMsg::Failed`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveConfigRequest {
+    pub request_id: u64,
+    pub project: String,
+    /// The plan's surface (`workflows`, `agents`), for logs and the relay.
+    pub surface: String,
+    pub plan: serde_json::Value,
+}
+
+/// Client → daemon: one of the app's own requests about `project` that run
+/// where the project lives (protocol v8): add, change or remove a workspace
+/// or machine, check a machine's readiness, open a file in an editor
+/// session. `body` is a `shelbi_app::far::Request`; the daemon answers with
+/// [`ServerMsg::Reply`] carrying a `shelbi_app::far::Reply`, or
+/// [`ServerMsg::Failed`] when it couldn't read the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppRequest {
+    pub request_id: u64,
+    pub project: String,
+    pub body: serde_json::Value,
+}
+
 /// What kind of UI client is attached to a session. Room is left for the
-/// Desktop app attaching to a running CLI session and a client attaching to a
-/// remote session (the detach task's motivating cases); only [`ClientKind::Tui`]
-/// is produced today.
+/// Desktop app attaching to a running CLI session (the detach task's
+/// motivating case). [`ClientKind::Remote`] is a remote window's link: another
+/// machine's app subscribing over this machine's relay, which the daemon never
+/// tells to re-exec for a version difference (a deliberate reload still
+/// reaches it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ClientKind {
@@ -320,7 +447,8 @@ pub enum ClientKind {
     Tui,
     /// The desktop app (future).
     Desktop,
-    /// A client attached to a remote session (future).
+    /// A remote window's link: another machine's app, subscribed over this
+    /// machine's relay (`shelbi_app::source::remote`).
     Remote,
 }
 
@@ -429,6 +557,35 @@ pub enum ClientMsg {
         selector: DetachSelector,
         reason: String,
     },
+    /// Make one write to a project's state files (protocol v7): the daemon is
+    /// the single writer, and announces the change to every other subscriber.
+    WriteState(StateWriteRequest),
+    /// Write a config save the client planned (protocol v8).
+    SaveConfig(SaveConfigRequest),
+    /// One of the app's requests that run where the project lives
+    /// (protocol v8).
+    AppRequest(AppRequest),
+}
+
+impl ClientMsg {
+    /// The project a request is about, for the requests that name one.
+    pub fn project(&self) -> Option<&str> {
+        match self {
+            ClientMsg::Mutate(r) => Some(&r.project),
+            ClientMsg::QuitProject { project, .. } => Some(project),
+            ClientMsg::ReviewSession(r) => Some(&r.project),
+            ClientMsg::WorkspaceSession(r) => Some(&r.project),
+            ClientMsg::WriteState(r) => Some(&r.project),
+            ClientMsg::SaveConfig(r) => Some(&r.project),
+            ClientMsg::AppRequest(r) => Some(&r.project),
+            ClientMsg::Hello { .. }
+            | ClientMsg::Subscribe { .. }
+            | ClientMsg::QuitShelbi { .. }
+            | ClientMsg::ReloadClients { .. }
+            | ClientMsg::ListClients { .. }
+            | ClientMsg::DetachClients { .. } => None,
+        }
+    }
 }
 
 /// Why a mutation did not run (or could not be accepted). `Display` is the
@@ -448,6 +605,9 @@ pub enum MutationError {
     VersionMismatch { message: String },
     /// Anything the library returned as an error. `message` is verbatim.
     Backend { message: String },
+    /// A [`ClientMsg::SaveConfig`] was refused: these files changed since
+    /// the client read them (protocol v8). Nothing was written.
+    ConfigChanged { paths: Vec<String> },
 }
 
 impl std::fmt::Display for MutationError {
@@ -462,6 +622,9 @@ impl std::fmt::Display for MutationError {
             MutationError::NotFound { id } => write!(f, "issue `{id}` not found"),
             MutationError::VersionMismatch { message } => write!(f, "{message}"),
             MutationError::Backend { message } => write!(f, "{message}"),
+            MutationError::ConfigChanged { paths } => {
+                write!(f, "changed since it was loaded: {}", paths.join(", "))
+            }
         }
     }
 }
@@ -554,6 +717,12 @@ pub enum ServerMsg {
     /// message the client prints on exit. Broadcast to the targets; no
     /// `request_id`.
     Detach { reason: String },
+    /// The answer to a [`ClientMsg::AppRequest`] (protocol v8): a
+    /// `shelbi_app::far::Reply`.
+    Reply {
+        request_id: u64,
+        body: serde_json::Value,
+    },
 }
 
 /// Encode a message to its full wire bytes (`[len: u32 BE][json]`).
@@ -631,6 +800,57 @@ mod tests {
         let (back, _): (ClientMsg, usize) = decode(&bytes).unwrap();
         assert_eq!(back, msg);
         assert_eq!(MutationKind::Prioritize { position: 0 }.verb(), "prioritize");
+    }
+
+    #[test]
+    fn round_trips_every_state_write() {
+        let writes = [
+            StateWrite::SetWorkspaceFilter {
+                filter: Some("ws:alpha".into()),
+            },
+            StateWrite::SetWorkspaceFilter { filter: None },
+            StateWrite::SetColumnOverride {
+                workflow: "task".into(),
+                status: "done".into(),
+                value: Some(ColumnOverride::Collapsed),
+            },
+            StateWrite::SetColumnOverride {
+                workflow: "task".into(),
+                status: "done".into(),
+                value: None,
+            },
+            StateWrite::ToggleZen {
+                source: "user:palette".into(),
+            },
+            StateWrite::AppendError {
+                message: "Zen toggle failed: x".into(),
+                source: Some("zen".into()),
+            },
+            StateWrite::ClearErrors,
+            StateWrite::MarkErrorsRead,
+            StateWrite::RequestRelaunch {
+                pane: RelaunchPane::Orchestrator,
+            },
+            StateWrite::RequestRelaunch {
+                pane: RelaunchPane::Workspace {
+                    workspace: "alpha".into(),
+                },
+            },
+        ];
+        let mut verbs = std::collections::BTreeSet::new();
+        for (n, write) in writes.into_iter().enumerate() {
+            verbs.insert(write.verb());
+            let msg = ClientMsg::WriteState(StateWriteRequest {
+                request_id: n as u64,
+                project: "p".into(),
+                write,
+            });
+            let bytes = encode(&msg).unwrap();
+            let (back, used): (ClientMsg, usize) = decode(&bytes).unwrap();
+            assert_eq!(used, bytes.len());
+            assert_eq!(back, msg);
+        }
+        assert_eq!(verbs.len(), 7, "each kind of write has its own verb");
     }
 
     #[test]
@@ -770,6 +990,51 @@ mod tests {
         assert_eq!(back, ServerMsg::Done { request_id: 4, state: None, id: None });
         let bytes = encode(&ServerMsg::Done { request_id: 4, state: None, id: None }).unwrap();
         assert_eq!(&bytes[LEN_PREFIX..], old);
+    }
+
+    #[test]
+    fn round_trips_the_settings_messages() {
+        let msgs = [
+            ClientMsg::SaveConfig(SaveConfigRequest {
+                request_id: 11,
+                project: "alpha".into(),
+                surface: "workflows".into(),
+                plan: serde_json::json!({"surface": "workflows", "checks": [], "ops": []}),
+            }),
+            ClientMsg::AppRequest(AppRequest {
+                request_id: 12,
+                project: "alpha".into(),
+                body: serde_json::json!({"check_machine": {"host": "devbox"}}),
+            }),
+        ];
+        for msg in msgs {
+            let (back, _): (ClientMsg, usize) = decode(&encode(&msg).unwrap()).unwrap();
+            assert_eq!(back.project(), Some("alpha"));
+            assert_eq!(back, msg);
+        }
+        let replies = [
+            ServerMsg::Reply {
+                request_id: 12,
+                body: serde_json::json!({"ok": true}),
+            },
+            ServerMsg::Failed {
+                request_id: 11,
+                error: MutationError::ConfigChanged {
+                    paths: vec!["/p/workflows/task.yaml".into()],
+                },
+            },
+        ];
+        for msg in replies {
+            let (back, _): (ServerMsg, usize) = decode(&encode(&msg).unwrap()).unwrap();
+            assert_eq!(back, msg);
+        }
+        assert_eq!(
+            MutationError::ConfigChanged {
+                paths: vec!["a".into(), "b".into()]
+            }
+            .to_string(),
+            "changed since it was loaded: a, b"
+        );
     }
 
     #[test]

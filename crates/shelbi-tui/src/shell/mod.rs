@@ -1631,6 +1631,7 @@ impl ShellState {
             sessions: SessionManager::new(project, connector.clone()).with_relauncher(
                 std::sync::Arc::new(relaunch::PersistentRelauncher {
                     project: project.to_string(),
+                    link: None,
                 }),
             ),
             connector,
@@ -2206,6 +2207,7 @@ impl ShellState {
             SessionManager::new(project, self.connector.clone()).with_relauncher(
                 std::sync::Arc::new(relaunch::PersistentRelauncher {
                     project: project.to_string(),
+                    link: None,
                 }),
             ),
         );
@@ -3073,7 +3075,11 @@ impl ShellState {
         let spawned = std::thread::Builder::new()
             .name("shelbi-shell-settings-commit".into())
             .spawn(move || {
-                let done = shelbi_app::settings::agents::commit(&project, &config, edit);
+                let done = shelbi_app::settings::agents::commit(
+                    &shelbi_app::settings::store::Local { project: project.clone() },
+                    &config,
+                    edit,
+                );
                 let _ = tx.send(SettingsMsg::AgentsCommitted(id, Box::new(done)));
             });
         if let Err(e) = spawned {
@@ -3194,7 +3200,11 @@ impl ShellState {
         let spawned = std::thread::Builder::new()
             .name("shelbi-shell-settings-save".into())
             .spawn(move || {
-                let done = shelbi_app::settings::workflows::commit(&project, &config, work);
+                let done = shelbi_app::settings::workflows::commit(
+                    &shelbi_app::settings::store::Local { project: project.clone() },
+                    &config,
+                    work,
+                );
                 let _ = tx.send(SettingsMsg::WorkflowsCommitted(sent, Box::new(done)));
             });
         if let Err(e) = spawned {
@@ -4024,6 +4034,14 @@ impl ShellState {
                     "New Window is a desktop command: run shelbi in another terminal".to_string(),
                 )
             }
+            // The registry lists Open in Terminal View only in a native
+            // remote window (`CommandModel::remote_host`, the desktop's): this
+            // client is already the project's terminal view, and a remote
+            // project opens here over `ssh -t` (`remote_connected`).
+            Effect::OpenTerminalView { .. } => {
+                self.client.focus_main();
+                self.status = Some("You're in Shelbi's terminal view.".to_string());
+            }
             Effect::Detach => self.quit(QuitAction::CloseUi),
             Effect::DetachOtherClients => self.detach_other_clients(),
             Effect::QuitProject { .. } => self.quit(QuitAction::QuitProject),
@@ -4121,7 +4139,7 @@ impl ShellState {
             return;
         }
         self.spawn_quiet_job(move || {
-            shelbi_app::zen::report(&project, shelbi_app::zen::toggle(&project))
+            shelbi_app::zen::report(&project, None, shelbi_app::zen::toggle(&project, None))
         });
     }
 
@@ -4130,8 +4148,8 @@ impl ShellState {
     /// `apply_zen_intro_result`.
     fn apply_zen_intro(&mut self, project: String, confirmed: bool, dont_show_again: bool) {
         self.spawn_quiet_job(move || {
-            let result = shelbi_app::zen::apply_intro(&project, confirmed, dont_show_again);
-            shelbi_app::zen::report(&project, result)
+            let result = shelbi_app::zen::apply_intro(&project, None, confirmed, dont_show_again);
+            shelbi_app::zen::report(&project, None, result)
         });
     }
 
@@ -7113,6 +7131,11 @@ mod tests {
         let saved_sock = std::env::var_os("SHELBI_HUB_SOCK");
         std::env::set_var("SHELBI_HOME", &home);
         std::env::set_var("SHELBI_HUB_SOCK", home.join("hub.sock"));
+        // No daemon runs here: the toggle's state writes are made in-process
+        // by the function the daemon runs for them.
+        shelbi_app::state_write::test_support::write_locally_with(std::sync::Arc::new(
+            shelbi_orchestrator::state_write::apply,
+        ));
         shelbi_state::mark_zen_intro_seen().unwrap();
         body(&home);
         match saved_sock {
@@ -9582,6 +9605,24 @@ mod tests {
         assert!(screen_text(&term).contains("Connect to Remote Session"));
         st.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(st.overlay.is_none(), "Esc cancels");
+    }
+
+    #[test]
+    fn open_in_terminal_view_is_never_listed_and_says_this_is_it() {
+        // A native remote window's command: the TUI's model has no remote
+        // host, so its palette never lists it.
+        let mut st = smoke_state();
+        assert!(!st
+            .palette_entries_from_model()
+            .iter()
+            .any(|e| e.id == "action:open-terminal-view"));
+        // Arriving anyway, it lands on the terminal view this already is.
+        st.effect_tap = None;
+        st.client.focus_sidebar();
+        st.dispatch_effect(Effect::OpenTerminalView { project: "proj".into() });
+        assert_eq!(st.client.focus(), shelbi_app::Focus::Main);
+        assert_eq!(st.status.as_deref(), Some("You're in Shelbi's terminal view."));
+        assert!(st.opened_remotes.is_empty(), "nothing opens over ssh");
     }
 
     #[test]

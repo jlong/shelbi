@@ -345,6 +345,8 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::RejectReview { .. } => Placement::GoReview,
         CommandKind::ToggleZen => Placement::View,
         CommandKind::OpenErrorLog => Placement::View,
+        // View ▸ Open in Terminal View, live in a native remote window.
+        CommandKind::OpenTerminalView => Placement::View,
         CommandKind::OpenSettings => Placement::App,
         CommandKind::SendFeedback => Placement::Help,
         CommandKind::OpenAbout => Placement::App,
@@ -386,7 +388,14 @@ pub struct WindowFacts {
 
 /// The menu bar for `model` with `keymaps`' shortcuts.
 pub fn build(model: &CommandModel, keymaps: &Keymaps, facts: WindowFacts) -> MenuTree {
-    let commands = CommandRegistry::new().commands(model);
+    // What this window can't run (a remote window's far writes) is drawn
+    // disabled: dropped here, so its fixed slot shows gray and a family
+    // (the edit targets) shows its empty placeholder.
+    let commands: Vec<Command> = CommandRegistry::new()
+        .commands(model)
+        .into_iter()
+        .filter(|c| model.unavailable(c.kind()).is_none())
+        .collect();
     let available: HashSet<&str> = commands.iter().map(Command::id).collect();
     let by_place = |p: Placement| commands.iter().filter(move |c| place(c.kind()) == p);
 
@@ -555,6 +564,10 @@ fn view_menu(
                 global_shortcut(keymaps, GlobalAction::ZenToggle),
             ),
             slot("action:error-log", "Error Log", None),
+            MenuEntry::Separator,
+            // A native remote window's project in the far TUI (`ssh -t`);
+            // gray in a window on this machine.
+            slot("action:open-terminal-view", "Open in Terminal View", None),
         ],
     }
 }
@@ -783,6 +796,7 @@ mod tests {
             // The desktop has the launch screen and the Connect dialog.
             launch_screen: true,
             remote_connect: true,
+            remote_host: None,
         }
     }
 
@@ -918,6 +932,21 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_windows_unavailable_commands_are_disabled() {
+        let mut model = fixture();
+        model.remote_host = Some("devbox".into());
+        let tree = build(&model, &Keymaps::default(), WindowFacts::default());
+        for title in ["Add Project\u{2026}", "Quit Shelbi and Stop All Agents\u{2026}", "New Window"] {
+            assert!(!find(&tree, title).enabled, "{title} is disabled in a remote window");
+        }
+        assert!(find(&tree, "Quit Project\u{2026}").enabled, "the far project quits over the link");
+        // View ▸ Open in Terminal View keeps the far TUI reachable.
+        assert!(find(&tree, "Open in Terminal View").enabled);
+        let local = build(&fixture(), &Keymaps::default(), WindowFacts::default());
+        assert!(!find(&local, "Open in Terminal View").enabled, "gray in a window on this machine");
+    }
+
+    #[test]
     fn empty_families_show_a_disabled_placeholder() {
         let model = CommandModel {
             workspaces: vec![],
@@ -994,6 +1023,8 @@ mod tests {
                 "-",
                 "Turn Zen Mode On",
                 "Error Log",
+                "-",
+                "Open in Terminal View",
             ]
         );
         for (title, command, keystroke, display) in [

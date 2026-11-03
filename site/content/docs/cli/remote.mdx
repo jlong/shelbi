@@ -40,7 +40,9 @@ daemon is running, and every registered project with its `repo:` location
 `repo:` is a clone URL shows the URL. It only reads. It never starts the daemon or changes a project.
 
 A remote client runs `shelbi remote list --json` over SSH; you can run it by
-hand to check what a client will see.
+hand to check what a client will see. The desktop app opens its full window for
+a project here only when this version matches its own exactly (see
+[Remote sessions](/docs/concepts/remote-sessions)).
 
 ```text
 $ shelbi remote list
@@ -56,7 +58,7 @@ With no registered projects it prints `No projects.`
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `-y, --yes` | bool | false | `connect`: start Shelbi on the other machine without asking when it isn't running. |
-| `--json` | bool | false | `list`: print the listing as JSON: `protocol`, `version`, `user`, `daemon_running`, and `projects` (each with `name`, optional `label`, and `path`). |
+| `--json` | bool | false | `list`: print the listing as JSON: `protocol`, `version`, `user`, `daemon_running`, `projects` (each with `name`, optional `label`, and `path`), and `native`, the protocol numbers the desktop app's full window needs (absent from a Shelbi that predates it). |
 | `--root <PATH>` | string | install-time default / `$SHELBI_ROOT` / `~/.shelbi` | Override the Shelbi root directory. |
 
 ## See also

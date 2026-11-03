@@ -45,7 +45,8 @@ pub enum Intent {
 }
 
 /// One effective tag on a workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Tag {
     pub name: String,
     /// Declared on the workspace's machine, not the workspace itself.
@@ -53,7 +54,8 @@ pub struct Tag {
 }
 
 /// A row of the workspace table.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct WorkspaceRow {
     pub name: String,
     /// The worktree, `<machine work_dir>/.shelbi/wt/<name>`, with a local
@@ -71,16 +73,21 @@ pub struct WorkspaceRow {
 }
 
 /// A row of the machine list.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MachineRow {
+    #[serde(default)]
     pub name: String,
+    #[serde(default = "crate::wire::default_machine_kind")]
     pub kind: MachineKind,
     /// The host SSH connects to (its `host:`, else its name); `None` for a
     /// local machine.
+    #[serde(default)]
     pub host: Option<String>,
     /// The root project directory, `~`-shortened when local.
+    #[serde(default)]
     pub work_dir: String,
     /// How many of the project's workspaces it hosts.
+    #[serde(default)]
     pub workspaces: usize,
     /// The machine as declared, every field (its Configure form edits it).
     pub config: Machine,
@@ -100,8 +107,36 @@ impl PartialEq for PoolSource {
 
 impl Eq for PoolSource {}
 
+/// On the wire a pool source is its project's declared form plus the name
+/// (which the declared form leaves out: it comes from the file name).
+/// Load-time detections (`detected_shapes`) don't travel.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PoolSourceWire {
+    name: String,
+    project: Project,
+}
+
+impl serde::Serialize for PoolSource {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        PoolSourceWire {
+            name: self.0.name.clone(),
+            project: (*self.0).clone(),
+        }
+        .serialize(s)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for PoolSource {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let PoolSourceWire { name, mut project } = PoolSourceWire::deserialize(d)?;
+        project.name = name;
+        Ok(PoolSource(Arc::new(project)))
+    }
+}
+
 /// The page's rows.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct PoolIndex {
     pub workspaces: Vec<WorkspaceRow>,
     pub machines: Vec<MachineRow>,

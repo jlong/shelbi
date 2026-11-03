@@ -42,6 +42,7 @@ use gpui::{
 };
 use gpui_kit::component::input::{InputEvent, InputState, Textarea, TextareaState};
 use shelbi_app::new_task::{self as model, Action, CreateRequest, Created, Field, Key, Menu, NewTaskForm};
+use shelbi_app::source::ProjectLink;
 use shelbi_app::view::{NewTaskModel, NewTaskOption};
 use shelbi_core::Workflow;
 use shelbi_state::keymap::{Key as Code, KeyChord, Mods};
@@ -64,9 +65,10 @@ const DESCRIPTION_H: f32 = 152.0;
 /// apart).
 const MENU_W: f32 = (DIALOG_W - 2.0 * PADDING - 2.0 * 12.0) / 3.0;
 
-/// Runs a create in `project` (the daemon's add, then the orchestrator
-/// hand-off), blocking: [`model::create_live`], or a test's recorder.
-pub type NewTaskRunner = Arc<dyn Fn(&str, &CreateRequest) -> Result<Created, String> + Send + Sync>;
+/// Runs a create through the window's link (the project's daemon's add,
+/// then the hand-off to its orchestrator, local or over the host's relay),
+/// blocking: [`model::create_linked`], or a test's recorder.
+pub type NewTaskRunner = Arc<dyn Fn(&ProjectLink, &CreateRequest) -> Result<Created, String> + Send + Sync>;
 
 /// The [`NewTaskRunner`] the dialog creates through, as a gpui global when a
 /// test sets one; otherwise the live one.
@@ -86,7 +88,7 @@ pub enum NewTaskEvent {
 
 /// The open dialog.
 pub struct NewTaskDialog {
-    project: String,
+    link: ProjectLink,
     form: NewTaskForm,
     /// The dialog's own focus: the pickers, the switch and the buttons
     /// paint their ring from it.
@@ -106,11 +108,11 @@ pub struct NewTaskDialog {
 }
 
 impl NewTaskDialog {
-    /// A blank draft for `project` over its `workflows`, on
+    /// A blank draft for the project `link` reaches, over its `workflows`, on
     /// `default_workflow`, created through the [`NewTaskGlobal`] runner when
     /// one is set (a test's), else the live one.
     pub fn new(
-        project: &str,
+        link: ProjectLink,
         workflows: &[Workflow],
         default_workflow: &str,
         window: &mut Window,
@@ -161,7 +163,7 @@ impl NewTaskDialog {
             cx.notify();
         }));
         let mut dialog = NewTaskDialog {
-            project: project.to_string(),
+            link,
             form,
             focus,
             title_input,
@@ -263,8 +265,8 @@ impl NewTaskDialog {
     /// A dialog closed meanwhile (its window gone) drops it.
     fn create(&mut self, request: CreateRequest, window: &mut Window, cx: &mut Context<Self>) {
         let runner = self.runner.clone();
-        let project = self.project.clone();
-        let work = cx.background_executor().spawn(async move { runner(&project, &request) });
+        let link = self.link.clone();
+        let work = cx.background_executor().spawn(async move { runner(&link, &request) });
         cx.spawn_in(window, async move |this, cx| {
             let result = work.await;
             this.update_in(cx, |this, window, cx| this.created(result, window, cx)).ok();
@@ -336,11 +338,11 @@ impl EventEmitter<NewTaskEvent> for NewTaskDialog {}
 fn fallback_runner() -> NewTaskRunner {
     #[cfg(not(test))]
     {
-        Arc::new(|project: &str, request: &CreateRequest| model::create_live(project, request))
+        Arc::new(|link: &ProjectLink, request: &CreateRequest| model::create_linked(link, request))
     }
     #[cfg(test)]
     {
-        Arc::new(|_: &str, _: &CreateRequest| Err("no daemon in tests".to_string()))
+        Arc::new(|_: &ProjectLink, _: &CreateRequest| Err("no daemon in tests".to_string()))
     }
 }
 

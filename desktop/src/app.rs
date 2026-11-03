@@ -91,6 +91,7 @@ use shelbi_app::overlay::palette::ProjectEntry as PaletteProject;
 use shelbi_app::overlay::palette_search::{issue_docs, IssueDoc, PaletteSearch, SearchCorpus};
 use shelbi_app::overlay::review_confirm::Slot;
 use shelbi_app::review::{LoadStep, ReviewInfo, ReviewLoader};
+use shelbi_app::state_write::StateWrite;
 use shelbi_app::view::{SidebarModel, SidebarTarget};
 use shelbi_app::{CommandKind, CommandRegistry, EditTarget, Mutation};
 use shelbi_proto::control::DetachSelector;
@@ -118,6 +119,10 @@ use shelbi_state::keymap::{
 use crate::assets::{heroicon, icons};
 use crate::commands::{self, CommandHost};
 use crate::feeds::{FeedHub, FeedSubscription};
+use shelbi_app::launch::remote::{RemoteConnector, RemoteError, RemoteSession};
+use shelbi_app::launch::{HostLink, RemoteListing};
+use shelbi_app::session::remote::RemoteSessionConnector;
+use shelbi_app::source::{ProjectHandle, ProjectKey, ProjectSource};
 use crate::elements::terminal::{ResizeHold, TerminalSettings};
 use crate::keys::{
     chord_from_keystroke, font_zoom, is_new_window, nav_chord, overlay_chord, paste_chords, NavChord,
@@ -258,7 +263,8 @@ pub fn shared_ready(cx: &App) -> Option<Ready> {
 /// Open the windows a launch restores (`window_state::launch_plan`).
 pub fn open_launch_windows(plan: Vec<LaunchWindow>, cx: &mut App) {
     for w in plan {
-        open_window(&w.project, w.slot, w.state, None, cx);
+        // The plan holds this machine's projects only (`read_launch_plan`).
+        open_window(&w.project.name, w.slot, w.state, None, cx);
     }
 }
 
@@ -284,12 +290,19 @@ fn frontmost(cx: &App) -> Option<WindowHandle<ShelbiWindow>> {
         .or_else(|| ours.first().copied())
 }
 
-/// The windows showing `project`, in the order they opened. `me`, the window
-/// asking (mid-update, so it can't be read), counts as showing it.
+/// The windows showing `project` on this machine, in the order they opened.
+/// `me`, the window asking (mid-update, so it can't be read), counts as
+/// showing it.
 fn windows_showing(project: &str, me: Option<WindowId>, cx: &App) -> Vec<WindowHandle<ShelbiWindow>> {
+    windows_showing_key(&ProjectKey::local(project), me, cx)
+}
+
+/// The windows showing `key` (a project here or on another machine), in the
+/// order they opened; `me` counts as showing it.
+fn windows_showing_key(key: &ProjectKey, me: Option<WindowId>, cx: &App) -> Vec<WindowHandle<ShelbiWindow>> {
     shelbi_windows(cx)
         .into_iter()
-        .filter(|h| Some(h.window_id()) == me || h.read(cx).is_ok_and(|w| w.shows(project)))
+        .filter(|h| Some(h.window_id()) == me || h.read(cx).is_ok_and(|w| w.shows_key(key)))
         .collect()
 }
 
@@ -346,7 +359,7 @@ pub fn open_added_project(slug: &str, from: Option<WindowHandle<ShelbiWindow>>, 
         if !catalog.lists(slug) {
             return Err(format!("Shelbi can’t find the project “{slug}” yet."));
         }
-        catalog.forget_view(slug);
+        catalog.forget_view(&ProjectKey::local(slug));
     }
     let shown = windows_showing(slug, None, cx).into_iter().next();
     for handle in shown.into_iter().chain(from) {
@@ -366,11 +379,13 @@ pub fn open_notice_tag(tag: &str, cx: &mut App) {
     let Some((project, target)) = notify::parse_tag(tag) else {
         return;
     };
-    let Some(handle) = windows_showing(&project, None, cx)
-        .first()
-        .copied()
-        .or_else(|| frontmost(cx))
-    else {
+    // A remote window's notices name its project as `host:project`: only
+    // that window opens them (no local window switches to it).
+    let showing = shelbi_windows(cx)
+        .into_iter()
+        .find(|h| h.read(cx).is_ok_and(|w| w.shows_id(&project)));
+    let remote = !showing.is_some() && project.contains(':');
+    let Some(handle) = showing.or_else(|| frontmost(cx).filter(|_| !remote)) else {
         return;
     };
     let _ = handle.update(cx, |this, window, cx| {
@@ -391,6 +406,65 @@ fn open_window(
     bounds: Option<Bounds<gpui::Pixels>>,
     cx: &mut App,
 ) -> Option<WindowHandle<ShelbiWindow>> {
+    open_window_with(shelbi_orchestrator::source::local_handle(project), None, slot, state, bounds, cx)
+}
+
+/// Open the native window for `remote`'s project on another machine
+/// (remote-window; a host on this exact version): the main window over
+/// the host's relay link. A window already showing that project comes up
+/// instead. `None` when the window couldn't open (logged).
+/// What an `edit:*` target opens, named for a far editor window's title.
+fn edit_target_label(target: &EditTarget) -> String {
+    match target {
+        EditTarget::Project => "project settings".to_string(),
+        EditTarget::Agent(agent) => format!("{agent}/instructions.md"),
+        EditTarget::ZenMode => "zenmode.md".to_string(),
+        EditTarget::Workflows => "workflows".to_string(),
+        EditTarget::ChangelogTemplate => "changelog-template.md".to_string(),
+    }
+}
+
+pub fn open_remote_window(mut remote: RemoteWindow, cx: &mut App) -> Option<WindowHandle<ShelbiWindow>> {
+    let key = ProjectKey::remote(remote.session.host.clone(), remote.session.project.clone());
+    if let Some(handle) = windows_showing_key(&key, None, cx).first().copied() {
+        let _ = handle.update(cx, |_, window, _| window.activate_window());
+        crate::views::launch::project_window_opened(cx);
+        return Some(handle);
+    }
+    let taken: Vec<usize> = cx
+        .try_global::<Shell>()
+        .map(|s| s.windows.iter().map(|w| w.slot).collect())
+        .unwrap_or_default();
+    let slot = WindowSession::free_slot(&taken);
+    let mut state = WindowState::default();
+    if let Some(from) = frontmost(cx) {
+        let _ = from.update(cx, |w, _, _| {
+            state.sidebar_width = w.window_state.sidebar_width;
+            state.sidebar_collapsed = w.window_state.sidebar_collapsed;
+            state.task_pane_width = w.window_state.task_pane_width;
+        });
+    }
+    let project = remote.session.project.clone();
+    let handle = remote.handle_for(&project);
+    let opened = open_window_with(handle, Some(remote), slot, state, None, cx);
+    if opened.is_some() {
+        cx.activate(true);
+    }
+    opened
+}
+
+/// [`open_window`] over a project handle, local or (with `remote`) on
+/// another machine.
+fn open_window_with(
+    handle: ProjectHandle,
+    remote: Option<RemoteWindow>,
+    slot: usize,
+    state: WindowState,
+    bounds: Option<Bounds<gpui::Pixels>>,
+    cx: &mut App,
+) -> Option<WindowHandle<ShelbiWindow>> {
+    let project = handle.name().to_string();
+    let project = project.as_str();
     let bounds = bounds.unwrap_or_else(|| match state.frame {
         Some(f) if f.width >= 400.0 && f.height >= 300.0 => Bounds {
             origin: gpui::point(px(f.x), px(f.y)),
@@ -412,6 +486,7 @@ fn open_window(
     }
     #[cfg(test)]
     let inert = cx.global::<Shell>().inert_windows;
+    #[cfg(test)]
     let project_name = project.to_string();
     let opened = cx.open_window(
         WindowOptions {
@@ -430,9 +505,13 @@ fn open_window(
             cx.new(|cx| {
                 #[cfg(test)]
                 if inert {
-                    return ShelbiWindow::inert(&project_name, slot, state, window, cx);
+                    let mut w = ShelbiWindow::inert(&project_name, slot, state, window, cx);
+                    if let Some(remote) = remote {
+                        w.become_remote(handle, remote, window);
+                    }
+                    return w;
                 }
-                ShelbiWindow::new(&project_name, slot, state, window, cx)
+                ShelbiWindow::new(handle, remote, slot, state, window, cx)
             })
         },
     );
@@ -542,6 +621,7 @@ pub enum HostCall {
     OpenAddProject,
     ConnectRemote,
     ShowLaunchScreen,
+    OpenTerminalView,
     LoadReview(String),
     ApproveReview(String),
     AskRejectReason(String),
@@ -609,6 +689,9 @@ impl CommandHost for Vec<HostCall> {
     fn show_launch_screen(&mut self) {
         self.push(HostCall::ShowLaunchScreen);
     }
+    fn open_terminal_view(&mut self) {
+        self.push(HostCall::OpenTerminalView);
+    }
     fn load_review(&mut self, task_id: &str) {
         self.push(HostCall::LoadReview(task_id.to_string()));
     }
@@ -645,8 +728,36 @@ pub struct PaletteInputs {
 }
 
 impl PaletteInputs {
-    /// Read them (blocking: small local files and one control-socket call).
-    fn read(project: &str, control: Option<crate::platform::control::ControlHandle>, client_id: &str) -> Self {
+    /// A remote window's: the host's `projects` (name, label) from its
+    /// listing, and the edit targets through the source. Blocking.
+    fn read_remote(project: &str, source: &dyn ProjectSource, projects: Vec<(String, String)>) -> Self {
+        PaletteInputs {
+            other_projects: projects
+                .iter()
+                .filter(|(name, _)| name != project)
+                .map(|(name, label)| ProjectItem {
+                    slug: name.clone(),
+                    label: label.clone(),
+                })
+                .collect(),
+            edit_targets: source.edit_targets(),
+            projects: shelbi_app::command_model::projects_column_from(
+                project,
+                projects,
+                &std::collections::HashSet::new(),
+            ),
+            others_attached: false,
+        }
+    }
+
+    /// Read them (blocking: small local files, the project's edit targets
+    /// through its source, and one control-socket call).
+    fn read(
+        project: &str,
+        source: &dyn ProjectSource,
+        control: Option<crate::platform::control::ControlHandle>,
+        client_id: &str,
+    ) -> Self {
         let summaries = shelbi_state::list_projects().unwrap_or_default();
         let open: std::collections::HashSet<String> = shelbi_state::list_open_projects()
             .unwrap_or_default()
@@ -665,7 +776,7 @@ impl PaletteInputs {
                     label: p.display_label().to_string(),
                 })
                 .collect(),
-            edit_targets: shelbi_app::command_model::edit_targets(project),
+            edit_targets: source.edit_targets(),
             projects: shelbi_app::command_model::projects_column_from(
                 project,
                 summaries
@@ -715,10 +826,136 @@ struct PendingRows {
     scroll_y: f32,
 }
 
+/// What a native remote window keeps about its host (remote-window P6):
+/// the session it opened (host, the far user, the project it shows now), the
+/// host's listing (its projects, for the switcher), the host's one shared
+/// relay link, and the connector reconnects check the host with (never
+/// starting its daemon).
+#[derive(Clone)]
+pub struct RemoteWindow {
+    pub session: RemoteSession,
+    pub listing: RemoteListing,
+    pub link: Arc<HostLink>,
+    pub remote: Arc<dyn RemoteConnector>,
+    /// The shown project's pane connector, which remembers the far daemon
+    /// being found stopped (`refusal`).
+    sessions: Option<Arc<RemoteSessionConnector>>,
+}
+
+impl RemoteWindow {
+    pub fn new(
+        session: RemoteSession,
+        listing: RemoteListing,
+        link: Arc<HostLink>,
+        remote: Arc<dyn RemoteConnector>,
+    ) -> RemoteWindow {
+        RemoteWindow {
+            session,
+            listing,
+            link,
+            remote,
+            sessions: None,
+        }
+    }
+
+    /// The handle for `project` on the host: reads, commands and panes over
+    /// the host's link. The window now shows `project`.
+    fn handle_for(&mut self, project: &str) -> ProjectHandle {
+        let (handle, sessions) = shelbi_app::remote_window::remote_handle(
+            &self.session,
+            project,
+            self.link.clone(),
+            self.remote.clone(),
+        );
+        self.session.project = project.to_string();
+        self.session.label = self.label_of(project);
+        self.sessions = Some(sessions);
+        handle
+    }
+
+    /// [`Self::handle_for`], for a test outside the window.
+    #[cfg(test)]
+    pub(crate) fn handle_for_test(&mut self, project: &str) -> ProjectHandle {
+        self.handle_for(project)
+    }
+
+    /// The host's projects (name, label), as its listing names them.
+    fn projects(&self) -> Vec<(String, String)> {
+        self.listing
+            .projects
+            .iter()
+            .map(|p| (p.name.clone(), p.label.clone().unwrap_or_else(|| p.name.clone())))
+            .collect()
+    }
+
+    /// `project`'s display name in the listing, when it has one.
+    fn label_of(&self, project: &str) -> Option<String> {
+        self.listing
+            .projects
+            .iter()
+            .find(|p| p.name == project)
+            .and_then(|p| p.label.clone())
+    }
+
+    /// Bring the host's link back up when it is down (blocking: `ssh`). The
+    /// panes reconnect on their own; a window showing none (the board, say)
+    /// still needs its reads and change stream back, so the window asks
+    /// here too. The check runs first
+    /// ([`shelbi_app::remote_window::reconnect_check`]), so a stopped far
+    /// daemon is reported, never started, and a host on another version now
+    /// is refused rather than talked to: `Err` carries either refusal,
+    /// `Ok(true)` that the link was down and is up again.
+    fn keep_up(link: &HostLink, remote: &dyn RemoteConnector, session: &RemoteSession) -> Result<bool, Option<RemoteError>> {
+        if link.is_up() {
+            return Ok(false);
+        }
+        match link.connect(&|| shelbi_app::remote_window::reconnect_check(remote, session)) {
+            Ok(_) => Ok(true),
+            Err(error) => Err(Self::refusal(error)),
+        }
+    }
+
+    /// `error` when it is one the window answers (Start for a stopped far
+    /// daemon, Reopen for a host that changed), else `None` (the host is
+    /// only unreachable for now: keep trying).
+    fn refusal(error: RemoteError) -> Option<RemoteError> {
+        match error {
+            error @ (RemoteError::DaemonStopped { .. } | RemoteError::NoLongerNative { .. }) => Some(error),
+            _ => None,
+        }
+    }
+
+    /// What the last pane reconnect was refused with, when the window
+    /// answers it ([`Self::refusal`]).
+    fn refused(&self) -> Option<RemoteError> {
+        Self::refusal(self.sessions.as_ref()?.refusal()?)
+    }
+}
+
+/// How often a remote window checks its host's link.
+const REMOTE_WATCH: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// A Shelbi window's root view.
 pub struct ShelbiWindow {
     /// The project the window shows (meaningless while [`Self::chooser`]).
     project: String,
+    /// What the window owns for that project: its key, the source every
+    /// view reads it through, and the link for everything else
+    /// (`shelbi_app::source`). Replaced with [`Self::project`] on a switch.
+    project_handle: ProjectHandle,
+    /// The host a native remote window's project lives on (remote-window
+    /// P6), `None` for a project on this machine.
+    remote: Option<RemoteWindow>,
+    /// A remote window's far daemon was found stopped: the bar offers to
+    /// start it (never started implicitly).
+    remote_stopped: Option<SharedString>,
+    /// A native remote window's host no longer opens natively (another
+    /// version, or other protocols, since the window opened): the line the
+    /// window shows instead of its shell, with Reopen. Its panes are closed
+    /// and nothing more is sent to the far daemon.
+    remote_changed: Option<SharedString>,
+    /// A remote window's link watch ([`Self::watch_remote`]).
+    _remote_watch: Option<Task<()>>,
     /// The window slot its frame is saved in.
     slot: usize,
     /// No project is shown: the empty-state chooser (the last open project
@@ -838,8 +1075,10 @@ pub struct ShelbiWindow {
     /// The switch's first frame is still to come or to finish.
     switch_hold: Option<SwitchHold>,
     pending_rows: Option<PendingRows>,
-    /// The blocking review work (resolve, load, the content sessions).
-    review_ops: Arc<dyn ReviewOps>,
+    /// Test seam: the blocking review work (resolve, load, the content
+    /// sessions) in place of the live one over [`Self::project_handle`]
+    /// ([`Self::review_ops`]).
+    review_ops: Option<Arc<dyn ReviewOps>>,
     /// The "Not implemented yet" (or failure) banner.
     banner: Option<SharedString>,
     /// A transient status note (the orchestrator coming up, a failure).
@@ -913,19 +1152,24 @@ pub struct ShelbiWindow {
 
 impl ShelbiWindow {
     pub fn new(
-        project: &str,
+        handle: ProjectHandle,
+        remote: Option<RemoteWindow>,
         slot: usize,
         window_state: WindowState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let shared_ready = cx.try_global::<Shell>().and_then(|s| s.ready.clone());
-        let mut this = Self::build(project, window_state, window, cx);
+        let mut this = Self::build(handle.name(), window_state, window, cx);
+        if let Some(remote) = remote {
+            this.become_remote(handle, remote, window);
+            this.watch_remote(cx);
+        }
         this.slot = slot;
         // Where the project was left (a small local read: a new window may
         // open before the catalog has prefetched it).
         let saved = if persists(cx) {
-            ProjectViewState::load(project)
+            ProjectViewState::load(this.project_handle.key())
         } else {
             ProjectViewState::default()
         };
@@ -967,8 +1211,174 @@ impl ShelbiWindow {
             async {}
         }));
         this.load_notify_prefs(cx);
-        window.set_window_title(&this.model.project_label);
+        window.set_window_title(&this.window_title());
         this
+    }
+
+    /// Make this freshly built window `remote`'s: its project on the host,
+    /// read and attached over the host's link. Before anything reads or
+    /// attaches. The first frame paints the listing's name for the project.
+    fn become_remote(&mut self, handle: ProjectHandle, remote: RemoteWindow, window: &mut Window) {
+        debug_assert_eq!(handle.name(), self.project);
+        if let Some(label) = remote.label_of(&self.project) {
+            self.model.project_label = label;
+        }
+        self.notifier = notify::Tracker::new(&handle.key().to_string());
+        self.project_handle = handle;
+        self.remote = Some(remote);
+        window.set_window_title(&self.window_title());
+    }
+
+    /// The window's title: the project's name, and for a remote window who
+    /// and where first (`jlong@devbox · Shelbi`).
+    fn window_title(&self) -> String {
+        match &self.remote {
+            Some(r) => shelbi_app::remote_window::window_title(&r.session.user, &r.session.host, &self.model.project_label),
+            None => self.model.project_label.clone(),
+        }
+    }
+
+    /// Whether this window's project is on another machine.
+    #[cfg(test)]
+    pub fn is_remote(&self) -> bool {
+        self.remote.is_some()
+    }
+
+    /// Keep a remote window's link up: every [`REMOTE_WATCH`], a link found
+    /// down is reopened off the UI thread after the host checks out (never
+    /// starting its daemon), and a stopped far daemon, found here or by a
+    /// pane's reconnect, shows the bar that offers to start it.
+    fn watch_remote(&mut self, cx: &mut Context<Self>) {
+        self._remote_watch = Some(cx.spawn(async move |this, cx| loop {
+            // A host that changed is done with: Reopen decides again.
+            let Ok(Some(remote)) =
+                this.update(cx, |this, _| this.remote.clone().filter(|_| this.remote_changed.is_none()))
+            else {
+                return;
+            };
+            let (link, connector, session) = (remote.link.clone(), remote.remote.clone(), remote.session.clone());
+            let kept = cx
+                .background_executor()
+                .spawn(async move { RemoteWindow::keep_up(&link, connector.as_ref(), &session) })
+                .await;
+            let alive = this.update(cx, |this, cx| {
+                let refused = match &kept {
+                    Err(Some(error)) => Some(error.clone()),
+                    Ok(true) => None,
+                    _ => this.remote.as_ref().and_then(RemoteWindow::refused),
+                };
+                if let Some(RemoteError::NoLongerNative { message, .. }) = &refused {
+                    this.host_changed(message.clone(), cx);
+                    return;
+                }
+                let stopped = refused.map(|error| SharedString::from(error.to_string()));
+                if kept == Ok(true) {
+                    this.request_refresh();
+                }
+                if stopped != this.remote_stopped {
+                    this.remote_stopped = stopped;
+                    cx.notify();
+                }
+            });
+            if alive.is_err() {
+                return;
+            }
+            cx.background_executor().timer(REMOTE_WATCH).await;
+        }));
+    }
+
+    /// The remote window's host no longer opens natively (it was upgraded,
+    /// or this Mac was, while the window was away): show `line` with Reopen
+    /// in place of the shell. The panes close on the next frame
+    /// ([`Self::close_remote_panes`]) and nothing more is sent to the far
+    /// daemon: every reconnect is refused by the same check.
+    fn host_changed(&mut self, line: String, cx: &mut Context<Self>) {
+        if self.remote_changed.is_some() {
+            return;
+        }
+        tracing::info!(line, "the remote window's host changed; offering Reopen");
+        self.remote_changed = Some(line.into());
+        self.remote_stopped = None;
+        cx.notify();
+    }
+
+    /// Close a changed remote window's panes (their sessions detach; the far
+    /// agents keep running) and its views. Idempotent.
+    fn close_remote_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.chat.is_some()
+            || self.workspace.is_some()
+            || self.review.is_some()
+            || self.issues.is_some()
+            || self.activity.is_some()
+            || self.machines.is_some()
+            || self.changelog.is_some();
+        if open {
+            self.teardown_project(window, cx);
+        }
+    }
+
+    /// Reopen (a changed remote window's): this window closes and the
+    /// project opens again, in whichever window the host gets now (the
+    /// native one when it matches again, else the terminal view with its
+    /// notice).
+    fn reopen_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(remote) = self.remote.as_ref() else {
+            return;
+        };
+        let session = remote.session.clone();
+        self.close_remote_panes(window, cx);
+        window.remove_window();
+        cx.defer(move |cx| crate::views::remote_session::open_remote_session(session, cx));
+    }
+
+    /// View ▸ Open in Terminal View: this remote window's project in the far
+    /// machine's TUI, in a terminal window of its own beside this one (both
+    /// attach to the same far sessions). A window on this machine has it
+    /// gray (the registry lists it only for a remote window); its project's
+    /// terminal view is `shelbi` in a terminal.
+    fn open_terminal_view(&mut self, cx: &mut Context<Self>) {
+        let Some(remote) = self.remote.as_ref() else {
+            let line = format!("{} is on this Mac: run shelbi in a terminal for its terminal view.", self.model.project_label);
+            self.flash(line, cx);
+            return;
+        };
+        let (session, connector) = (remote.session.clone(), remote.remote.clone());
+        // Its own window, after this update (as New Window).
+        cx.defer(move |cx| crate::views::remote_session::open_terminal_view(session, connector, cx));
+    }
+
+    /// The bar's Start: start Shelbi on the remote window's host (only ever
+    /// on the user's say-so), then bring the link back up.
+    fn start_far_daemon(&mut self, cx: &mut Context<Self>) {
+        let Some(remote) = self.remote.clone() else {
+            return;
+        };
+        let host = remote.session.host.clone();
+        self.flash(format!("Starting Shelbi on {host}…"), cx);
+        let work = cx.background_executor().spawn(async move {
+            remote.remote.start_daemon(&remote.session.host)?;
+            remote
+                .link
+                .connect(&|| shelbi_app::remote_window::reconnect_check(remote.remote.as_ref(), &remote.session))
+                .map(|_| ())
+        });
+        cx.spawn(async move |this, cx| {
+            let started = work.await;
+            this.update(cx, |this, cx| match started {
+                Ok(()) => {
+                    this.remote_stopped = None;
+                    this.flash(format!("Started Shelbi on {host}."), cx);
+                    this.request_refresh();
+                }
+                Err(RemoteError::NoLongerNative { message, .. }) => this.host_changed(message, cx),
+                Err(error) => {
+                    this.banner = Some(error.to_string().into());
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// A window that reaches nothing (a test's): the shell over the
@@ -1009,7 +1419,7 @@ impl ShelbiWindow {
 
         let model = cx
             .try_global::<Catalog>()
-            .map(|c| c.first_frame_sidebar(project))
+            .map(|c| c.first_frame_sidebar(&ProjectKey::local(project)))
             .unwrap_or_else(|| SidebarModel::skeleton(project));
         // The built-in keymaps until the user's `keys.yaml` is read (below).
         let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
@@ -1020,6 +1430,11 @@ impl ShelbiWindow {
 
         ShelbiWindow {
             project: project.to_string(),
+            project_handle: shelbi_orchestrator::source::local_handle(project),
+            remote: None,
+            remote_stopped: None,
+            remote_changed: None,
+            _remote_watch: None,
             slot: 0,
             chooser: false,
             chooser_highlight: 0,
@@ -1084,7 +1499,7 @@ impl ShelbiWindow {
             quiet_review: None,
             switch_hold: None,
             pending_rows: None,
-            review_ops: Arc::new(crate::views::review::LiveOps),
+            review_ops: None,
             banner: None,
             status: None,
             focus_handle,
@@ -1166,6 +1581,8 @@ impl ShelbiWindow {
         // It has the launch screen and the Connect to Remote Session dialog.
         model.launch_screen = true;
         model.remote_connect = true;
+        // A remote window lists what it can't run yet, disabled with why.
+        model.remote_host = self.remote.as_ref().map(|r| r.session.host.clone());
         if self.chooser {
             // No project: only what needs none (switch, add, detach, quit
             // Shelbi).
@@ -1212,15 +1629,22 @@ impl ShelbiWindow {
             return;
         }
         let project = self.project.clone();
+        let source = self.project_handle.source.clone();
         let control = self.ready().map(|r| r.control.clone());
         let client_id = cx
             .try_global::<Shell>()
             .map(|s| s.client_id.clone())
             .unwrap_or_default();
         let reading = project.clone();
-        let read = cx
-            .background_executor()
-            .spawn(async move { PaletteInputs::read(&project, control, &client_id) });
+        let remote = self.remote.as_ref().map(RemoteWindow::projects);
+        let read = cx.background_executor().spawn(async move {
+            match remote {
+                // Only the far host's projects, from its listing; no local
+                // daemon is asked who else is attached.
+                Some(projects) => PaletteInputs::read_remote(&project, source.as_ref(), projects),
+                None => PaletteInputs::read(&project, source.as_ref(), control, &client_id),
+            }
+        });
         cx.spawn(async move |this, cx| {
             let inputs = read.await;
             this.update(cx, |this, cx| {
@@ -1285,7 +1709,7 @@ impl ShelbiWindow {
         let Some(me) = self.handle.map(|h| h.window_id()) else {
             return true;
         };
-        windows_showing(&self.project, Some(me), cx)
+        windows_showing_key(self.project_handle.key(), Some(me), cx)
             .first()
             .is_none_or(|first| first.window_id() == me)
     }
@@ -1324,7 +1748,7 @@ impl ShelbiWindow {
     /// project) and pump its events into this view.
     fn start_feed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let hub = FeedHub::global(cx);
-        let (feed, mut events) = hub.subscribe(&self.project, cx);
+        let (feed, mut events) = hub.subscribe(&self.project_handle, cx);
         self._feed = Some(feed);
         self._feed_task = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events.next().await {
@@ -1349,7 +1773,11 @@ impl ShelbiWindow {
             FeedEvent::Snapshot(snapshot) => match snapshot.sidebar {
                 Some(model) if model != self.model => {
                     let changes = self.notifier.observe_sidebar(&model);
+                    let relabeled = model.project_label != self.model.project_label;
                     self.model = model;
+                    if relabeled {
+                        window.set_window_title(&self.window_title());
+                    }
                     self.apply_notices(changes, cx);
                     self.apply_pending_rows();
                     // An open palette follows the live state, query kept.
@@ -1393,11 +1821,9 @@ impl ShelbiWindow {
 
     /// Read the user's merged keymaps (`keys.yaml`) off the UI thread.
     fn load_keymaps(&mut self, cx: &mut Context<Self>) {
-        let project = self.project.clone();
-        let reading = project.clone();
-        let read = cx
-            .background_executor()
-            .spawn(async move { shelbi_state::keymap::load_keymaps(Some(&project)).0 });
+        let source = self.project_handle.source.clone();
+        let reading = self.project.clone();
+        let read = cx.background_executor().spawn(async move { source.project_keymap().0 });
         cx.spawn(async move |this, cx| {
             let keymaps = read.await;
             this.update(cx, |this, cx| {
@@ -1514,6 +1940,11 @@ impl ShelbiWindow {
     /// Bring the project's orchestrator up (and record the project open) off
     /// the UI thread, through the CLI bootstrap found.
     fn open_project(&mut self, cx: &mut Context<Self>) {
+        // A remote project is the far Shelbi's to run: its orchestrator is
+        // never brought up from here (and the far daemon never started).
+        if self.remote.is_some() {
+            return;
+        }
         let Some(ready) = self.ready() else {
             return;
         };
@@ -1565,9 +1996,30 @@ impl ShelbiWindow {
 
     // --- switching projects ------------------------------------------------
 
-    /// Whether the window shows `project` (not the chooser).
+    /// The review work: the test seam's, else the live one over the
+    /// window's project source and link.
+    fn review_ops(&self) -> Arc<dyn ReviewOps> {
+        self.review_ops
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::views::review::LiveOps::new(self.project_handle.clone())))
+    }
+
+    /// Whether the window shows `project` (not the chooser). Within one
+    /// window a name is enough: a window switches only among one machine's
+    /// projects. Across windows, ask [`Self::shows_key`].
     pub fn shows(&self, project: &str) -> bool {
         !self.chooser && self.project == project
+    }
+
+    /// Whether the window shows `key`: that project, on that machine.
+    pub fn shows_key(&self, key: &ProjectKey) -> bool {
+        !self.chooser && self.project_handle.key() == key
+    }
+
+    /// Whether the window shows the project `id` names (a notice tag's:
+    /// the name here, `host:name` for another machine's).
+    pub fn shows_id(&self, id: &str) -> bool {
+        !self.chooser && self.project_handle.key().to_string() == id
     }
 
     /// Switch this window to `project` in place. The outgoing project's
@@ -1589,17 +2041,26 @@ impl ShelbiWindow {
         self.teardown_project(window, cx);
         self.chooser = false;
         self.project = project.to_string();
+        // A remote window switches among its host's projects only.
+        self.project_handle = match &mut self.remote {
+            Some(remote) => remote.handle_for(project),
+            None => shelbi_orchestrator::source::local_handle(project),
+        };
+        self.remote_stopped = None;
         self.client.switch_project(project);
         self.model = cx
             .try_global::<Catalog>()
-            .map(|c| c.first_frame_sidebar(project))
+            .map(|c| c.first_frame_sidebar(self.project_handle.key()))
             .unwrap_or_else(|| SidebarModel::skeleton(project));
-        self.notifier = notify::Tracker::new(project);
+        if let Some(label) = self.remote.as_ref().and_then(|r| r.label_of(project)) {
+            self.model.project_label = label;
+        }
+        self.notifier = notify::Tracker::new(&self.project_handle.key().to_string());
         self.palette_inputs = PaletteInputs::default();
-        window.set_window_title(&self.model.project_label);
+        window.set_window_title(&self.window_title());
         let saved = cx
             .try_global::<Catalog>()
-            .map(|c| c.view_state(project))
+            .map(|c| c.view_state(self.project_handle.key()))
             .unwrap_or_default();
         self.adopt_view_state(saved);
         self.start_feed(window, cx);
@@ -1717,7 +2178,7 @@ impl ShelbiWindow {
 
     /// Where the shown project is left: its view, focus, sidebar selection
     /// and scroll, open review and board filter. `None` for the chooser.
-    fn view_state_to_save(&self, cx: &App) -> Option<(String, ProjectViewState)> {
+    fn view_state_to_save(&self, cx: &App) -> Option<(ProjectKey, ProjectViewState)> {
         if self.chooser {
             return None;
         }
@@ -1735,7 +2196,7 @@ impl ShelbiWindow {
                 .unwrap_or_else(|| self.pending_workflow_filter.clone()),
             collapsed_sections: self.collapsed_sections.iter().map(|s| s.key().to_string()).collect(),
         };
-        Some((self.project.clone(), state))
+        Some((self.project_handle.key().clone(), state))
     }
 
     /// Remember where the shown project is left: in the catalog at once (a
@@ -1858,7 +2319,7 @@ impl ShelbiWindow {
     /// Record this window's slot (its project and frame) and save the slots.
     fn record_slot(&mut self, cx: &mut Context<Self>) {
         let entry = window_state::Slot {
-            project: (!self.chooser).then(|| self.project.clone()),
+            project: (!self.chooser).then(|| self.project_handle.key().clone()),
             open: true,
             state: self.window_state.clone(),
         };
@@ -2136,6 +2597,13 @@ impl ShelbiWindow {
     /// Run a registry command. While a relaunch is required (the CLI was
     /// upgraded under the app), commands that reach the daemon are refused.
     fn run(&mut self, kind: CommandKind, window: &mut Window, cx: &mut Context<Self>) {
+        // What a remote window can't run yet: refused with the reason the
+        // menus and the palette show it with (never dispatched).
+        if let Some(reason) = self.unavailable(&kind) {
+            self.banner = Some(reason.into());
+            cx.notify();
+            return;
+        }
         #[cfg(any(test, feature = "visual-check"))]
         if let Some(tap) = &self.tap {
             commands::dispatch_command(&kind, &mut *tap.borrow_mut());
@@ -2161,6 +2629,13 @@ impl ShelbiWindow {
             self.perform(call, window, cx);
         }
         cx.notify();
+    }
+
+    /// Why `kind` can't run in this window (a remote window's reasons,
+    /// `shelbi_app::remote_window::command_unavailable`), or `None`.
+    pub(crate) fn unavailable(&self, kind: &CommandKind) -> Option<String> {
+        let host = self.remote.as_ref()?.session.host.as_str();
+        shelbi_app::remote_window::command_unavailable(kind, host)
     }
 
     fn perform(&mut self, call: HostCall, window: &mut Window, cx: &mut Context<Self>) {
@@ -2258,6 +2733,7 @@ impl ShelbiWindow {
             HostCall::ShowLaunchScreen => cx.defer(|cx| {
                 crate::views::launch::show(cx);
             }),
+            HostCall::OpenTerminalView => self.open_terminal_view(cx),
             HostCall::LoadReview(task_id) => self.load_review(task_id, window, cx),
             HostCall::ApproveReview(id) => {
                 let m = Mutation::ApproveReview {
@@ -2279,7 +2755,25 @@ impl ShelbiWindow {
     /// `edit:workflows`) in the user's editor, the path the TUI opens
     /// (`edit_target_path`). The lookup and the launch run off the UI thread;
     /// a terminal editor opens in Terminal.app, a GUI editor directly.
+    ///
+    /// A remote window's files are on the far machine: the far daemon opens
+    /// the target in an editor session there, shown in a window of its own
+    /// (`views::far_editor`).
     fn open_editor(&mut self, target: EditTarget, cx: &mut Context<Self>) {
+        if self.project_handle.link.is_remote() {
+            let label = edit_target_label(&target);
+            crate::views::far_editor::open_from(
+                &self.project_handle.link,
+                shelbi_app::far::FarFile::Target(target),
+                label,
+                cx,
+                |this: &mut Self, e, cx| {
+                    this.banner = Some(e.into());
+                    cx.notify();
+                },
+            );
+            return;
+        }
         let project = self.project.clone();
         self.open_in_editor(move || shelbi_app::command_model::edit_target_path(&project, &target), cx);
     }
@@ -2313,6 +2807,8 @@ impl ShelbiWindow {
     /// a workspace dialog over the window; Add machine and Configure go to
     /// the settings view, which opens its machine form. One dialog at a time.
     fn open_pool_form(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
+        // A remote project's workspaces and machines change on the far hub:
+        // the forms' services send their requests there.
         #[cfg(test)]
         self.pool_forms.push(intent.clone());
         let Route::Settings(view) = &self.route else {
@@ -2328,7 +2824,10 @@ impl ShelbiWindow {
             // gone) leaves the page as it was.
             Intent::NewWorkspace | Intent::EditWorkspace(_) | Intent::RemoveWorkspace(_) => {
                 DialogBody::for_intent(&intent, &page, cx)
-                    .map(|body| cx.new(|cx| WorkspaceDialog::new(body, page, window, cx)))
+                    .map(|body| {
+                        let far = self.project_handle.link.is_remote().then(|| self.project_handle.link.clone());
+                        cx.new(|cx| WorkspaceDialog::new(body, page, far, window, cx))
+                    })
             }
             Intent::AddMachine | Intent::ConfigureMachine(_) => {
                 view.update(cx, |v, cx| v.open_pool_form(&intent, window, cx));
@@ -2409,21 +2908,20 @@ impl ShelbiWindow {
         if self.overlay.is_some() {
             self.close_overlay(window, cx);
         }
-        let project = self.project.clone();
         let loaded = self
             .issues
             .as_ref()
             .map(|issues| issues.read(cx).new_task_workflows())
             .filter(|(workflows, _)| !workflows.is_empty());
-        let (workflows, default_workflow) = loaded.unwrap_or_else(|| {
-            let workflows = shelbi_state::list_workflows(&project).unwrap_or_default();
-            let default = shelbi_state::load_project(&project)
-                .map(|p| p.default_workflow_name().to_string())
-                .unwrap_or_else(|_| shelbi_core::DEFAULT_WORKFLOW_NAME.to_string());
-            (workflows, default)
+        // Unloaded board: ask the window's source (this machine's disk, or
+        // the host over its relay), as the board's own read does.
+        let (workflows, default_workflow) = loaded.unwrap_or_else(|| match self.project_handle.source.workflow_config() {
+            Ok(config) => (config.workflows().cloned().collect(), config.default_workflow().to_string()),
+            Err(_) => (Vec::new(), shelbi_core::DEFAULT_WORKFLOW_NAME.to_string()),
         });
         let restore = window.focused(cx);
-        let dialog = cx.new(|cx| NewTaskDialog::new(&project, &workflows, &default_workflow, window, cx));
+        let link = self.project_handle.link.clone();
+        let dialog = cx.new(|cx| NewTaskDialog::new(link, &workflows, &default_workflow, window, cx));
         let sub = cx.subscribe_in(&dialog, window, |this, _, event: &NewTaskEvent, window, cx| {
             if let Some((_, _, Some(restore))) = this.new_task.take() {
                 window.focus(&restore, cx);
@@ -2580,8 +3078,8 @@ impl ShelbiWindow {
         if let Some(issues) = &self.issues {
             return issues.clone();
         }
-        let project = self.project.clone();
-        let issues = cx.new(|cx| IssuesView::new(project.clone(), cx));
+        let project = self.project_handle.clone();
+        let issues = cx.new(|cx| IssuesView::new(&project, cx));
         // The task pane's live session: attach only, through the same
         // sessions the Workspace view reaches.
         let handle = window.window_handle();
@@ -2664,7 +3162,7 @@ impl ShelbiWindow {
         let project = self.project.clone();
         let handle = window.window_handle();
         let sink = self._feed.as_ref().map(|f| f.session_sink());
-        let deps = ChatDeps::live(&project);
+        let deps = ChatDeps::live(&self.project_handle);
         #[cfg(any(test, feature = "visual-check"))]
         let deps = self.chat_deps.as_ref().map(|make| make()).unwrap_or(deps);
         let chat = cx.new(|cx| ChatView::orchestrator(&project, handle, deps, sink, cx));
@@ -2707,7 +3205,7 @@ impl ShelbiWindow {
         let handle = window.window_handle();
         let sink = self._feed.as_ref().map(|f| f.session_sink());
         let chord = self.palette_chord.clone();
-        let deps = WorkspaceDeps::live(&project);
+        let deps = WorkspaceDeps::live(&self.project_handle);
         #[cfg(any(test, feature = "visual-check"))]
         let deps = self.workspace_deps.clone().unwrap_or(deps);
         let ws = cx.new(|cx| {
@@ -2737,8 +3235,8 @@ impl ShelbiWindow {
         let handle = window.window_handle();
         let sink = self._feed.as_ref().map(|f| f.session_sink());
         let deps = ReviewDeps {
-            ops: self.review_ops.clone(),
-            ..ReviewDeps::live(&project)
+            ops: self.review_ops(),
+            ..ReviewDeps::live(&self.project_handle)
         };
         #[cfg(any(test, feature = "visual-check"))]
         let deps = self.review_deps.take().unwrap_or(deps);
@@ -3142,7 +3640,7 @@ impl ShelbiWindow {
     /// first read is done before the feed is first shown.
     fn prefetch_activity(&mut self) {
         if self.prefetch_activity && !self.chooser && self.activity.is_none() {
-            self.activity_reader = Some(ActivityReader::spawn(self.project.clone()));
+            self.activity_reader = Some(ActivityReader::spawn(self.project_handle.source.clone()));
         }
     }
 
@@ -3165,10 +3663,10 @@ impl ShelbiWindow {
         if let Some(activity) = &self.activity {
             return activity.clone();
         }
-        let project = self.project.clone();
+        let project = self.project_handle.clone();
         let activity = match self.activity_reader.take() {
-            Some(reader) => cx.new(|cx| ActivityView::with_reader(project, reader, cx)),
-            None => cx.new(|cx| ActivityView::new(project, cx)),
+            Some(reader) => cx.new(|cx| ActivityView::with_reader(&project, reader, cx)),
+            None => cx.new(|cx| ActivityView::new(&project, cx)),
         };
         let sub = cx.subscribe_in(&activity, window, |this, _, ev: &ActivityEvent, window, cx| {
             match ev {
@@ -3190,8 +3688,8 @@ impl ShelbiWindow {
         if let Some(machines) = &self.machines {
             return machines.clone();
         }
-        let project = self.project.clone();
-        let machines = cx.new(|cx| MachinesView::new(project, cx));
+        let project = self.project_handle.clone();
+        let machines = cx.new(|cx| MachinesView::new(&project, cx));
         let sub = cx.subscribe_in(&machines, window, |this, _, ev: &MachinesEvent, window, cx| {
             let MachinesEvent::Command(kind) = ev;
             this.run(kind.clone(), window, cx);
@@ -3211,8 +3709,8 @@ impl ShelbiWindow {
         if let Some(changelog) = &self.changelog {
             return changelog.clone();
         }
-        let project = self.project.clone();
-        let changelog = cx.new(|cx| ChangelogView::new(project, cx));
+        let project = self.project_handle.clone();
+        let changelog = cx.new(|cx| ChangelogView::new(&project, cx));
         let sub = cx.subscribe_in(&changelog, window, |this, _, ev: &ChangelogEvent, window, cx| {
             let ChangelogEvent::OpenIssue(id) = ev;
             this.open_task(id, window, cx);
@@ -3379,6 +3877,13 @@ impl ShelbiWindow {
     /// The projects the switcher lists (the catalog's, empty until it has
     /// loaded).
     fn switcher_projects(&self, cx: &App) -> Vec<ProjectEntry> {
+        if let Some(remote) = &self.remote {
+            return remote
+                .projects()
+                .into_iter()
+                .map(|(name, label)| ProjectEntry { name, label })
+                .collect();
+        }
         cx.try_global::<Catalog>().map(|c| c.projects()).unwrap_or_default()
     }
 
@@ -3387,6 +3892,13 @@ impl ShelbiWindow {
     /// current project).
     fn switcher_rows(&self, cx: &App) -> Vec<shelbi_app::overlay::palette::ProjectEntry> {
         let current = if self.chooser { "" } else { self.project.as_str() };
+        if let Some(remote) = &self.remote {
+            return shelbi_app::command_model::project_rows(
+                current,
+                remote.projects(),
+                &std::collections::HashSet::new(),
+            );
+        }
         cx.try_global::<Catalog>().map(|c| c.rows(current)).unwrap_or_default()
     }
 
@@ -3523,7 +4035,8 @@ impl ShelbiWindow {
             cx,
         );
         let project = self.project.clone();
-        let quit_project = project.clone();
+        let quit_key = self.project_handle.key().clone();
+        let link = self.project_handle.link.clone();
         let control = self.ready().map(|r| r.control.clone());
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
@@ -3549,6 +4062,10 @@ impl ShelbiWindow {
             let quit = cx
                 .background_executor()
                 .spawn(async move {
+                    // A remote window's project quits on the far daemon.
+                    if let Some(quit) = link.quit_far_project() {
+                        return quit;
+                    }
                     control
                         .ok_or_else(|| "Couldn't reach the daemon.".to_string())?
                         .connect()
@@ -3562,7 +4079,8 @@ impl ShelbiWindow {
                 // staying open.
                 Ok(()) => {
                     let me = window.window_handle().window_id();
-                    for other in windows_showing(&quit_project, Some(me), cx) {
+                    let quit_project = quit_key.name.clone();
+                    for other in windows_showing_key(&quit_key, Some(me), cx) {
                         if other.window_id() != me {
                             let quit = quit_project.clone();
                             cx.defer(move |cx| {
@@ -3641,7 +4159,7 @@ impl ShelbiWindow {
             Route::Settings(view) => view.update(cx, |v, cx| v.show_page(page, cx)),
             route => {
                 self.settings_over_review = matches!(route, Route::Review) && self.review.is_some();
-                let project = self.project.clone();
+                let project = self.project_handle.clone();
                 let view = cx.new(|cx| {
                     let mut view = SettingsView::new(&project, window, cx);
                     view.show_page(page, cx);
@@ -3843,7 +4361,17 @@ impl ShelbiWindow {
     /// live sidebar model and the last [`PaletteInputs`], in the desktop's
     /// copy and order.
     pub(crate) fn palette_entries(&self) -> Vec<shelbi_palette::Entry> {
-        crate::views::palette::present(CommandRegistry::new().entries(&self.command_model()))
+        let model = self.command_model();
+        let mut entries = crate::views::palette::present(CommandRegistry::new().entries(&model));
+        // A remote window's refused commands keep their reason as the line
+        // under them, over the frame's copy.
+        for entry in &mut entries {
+            if let Some(reason) = CommandKind::from_id(&entry.id).and_then(|kind| model.unavailable(&kind)) {
+                entry.subtitle = Some(reason);
+                entry.shortcut = None;
+            }
+        }
+        entries
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3894,11 +4422,12 @@ impl ShelbiWindow {
         if self.tap.is_some() {
             return;
         }
-        let project = self.project.clone();
-        let reading = project.clone();
-        let read = cx
-            .background_executor()
-            .spawn(async move { shelbi_app::overlay::palette_search::read_corpus(&project) });
+        let source = self.project_handle.source.clone();
+        let reading = self.project.clone();
+        let read = cx.background_executor().spawn(async move {
+            let changelog = source.changelog(None).map(|c| c.entries).unwrap_or_default();
+            shelbi_app::overlay::palette_search::corpus_from_reads(source.open_board(), changelog)
+        });
         cx.spawn(async move |this, cx| {
             let read = read.await;
             this.update(cx, |this, cx| {
@@ -4023,9 +4552,12 @@ impl ShelbiWindow {
                 {
                     viewer.clear();
                 }
-                let clear = cx
-                    .background_executor()
-                    .spawn(async move { shelbi_state::clear_errors(&project).map_err(|e| e.to_string()) });
+                // The project's daemon empties it: this machine's, or the far
+                // host's for a remote window.
+                let link = self.project_handle.link.clone();
+                let clear = cx.background_executor().spawn(async move {
+                    shelbi_app::state_write::write(&project, Some(&link), StateWrite::ClearErrors)
+                });
                 cx.spawn(async move |this, cx| {
                     let result = clear.await;
                     this.update(cx, |this, cx| {
@@ -4075,12 +4607,13 @@ impl ShelbiWindow {
     }
 
     /// `ToggleZen`: through the first-run intro on a first off-to-on toggle
-    /// (both checks read small local files, off the UI thread).
+    /// (both checks read small files off the UI thread: the project's Zen
+    /// state through the window's source, the viewer's intro flag locally).
     fn toggle_zen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.project.clone();
+        let source = self.project_handle.source.clone();
         let check = cx
             .background_executor()
-            .spawn(async move { shelbi_app::zen::should_show_intro(&project) });
+            .spawn(async move { shelbi_app::zen::intro_due(source.zen_state().ok()) });
         cx.spawn_in(window, async move |this, cx| {
             let intro = check.await;
             this.update_in(cx, |this, window, cx| {
@@ -4096,18 +4629,21 @@ impl ShelbiWindow {
         .detach();
     }
 
-    /// Toggle Zen (or apply the intro's answer) off the UI thread, then
+    /// Toggle Zen (or apply the intro's answer) off the UI thread, through
+    /// the project's daemon (the far host's, for a remote window), then
     /// refresh the sidebar so its Zen band (or, on a failure, the error
     /// badge) follows. Success flashes nothing: the band is the indicator.
     fn run_zen(&mut self, project: String, intro: Option<(bool, bool)>, cx: &mut Context<Self>) {
+        let link = self.project_handle.link.clone();
         let work = cx.background_executor().spawn(async move {
+            let link = Some(&link);
             let result = match intro {
                 Some((confirmed, dont_show_again)) => {
-                    shelbi_app::zen::apply_intro(&project, confirmed, dont_show_again)
+                    shelbi_app::zen::apply_intro(&project, link, confirmed, dont_show_again)
                 }
-                None => shelbi_app::zen::toggle(&project),
+                None => shelbi_app::zen::toggle(&project, link),
             };
-            shelbi_app::zen::report(&project, result)
+            shelbi_app::zen::report(&project, link, result)
         });
         cx.spawn(async move |this, cx| {
             let message = work.await;
@@ -4127,11 +4663,14 @@ impl ShelbiWindow {
     fn open_error_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let project = self.project.clone();
         self.open_overlay(ActiveOverlay::error_log(project.clone()), window, cx);
+        // The read marks are the project's state: its daemon (the far host's,
+        // for a remote window) marks them.
         let read = cx.background_executor().spawn({
             let project = project.clone();
+            let handle = self.project_handle.clone();
             async move {
-                let rows = shelbi_state::read_errors_with_unread(&project).unwrap_or_default();
-                let _ = shelbi_state::mark_errors_read(&project);
+                let rows = handle.source.errors().unwrap_or_default();
+                let _ = shelbi_app::state_write::write(&project, Some(&handle.link), StateWrite::MarkErrorsRead);
                 rows
             }
         });
@@ -4199,7 +4738,7 @@ impl ShelbiWindow {
         match step {
             LoadStep::None => {}
             LoadStep::Resolve(task) => {
-                let (ops, project, t) = (self.review_ops.clone(), self.project.clone(), task.clone());
+                let (ops, project, t) = (self.review_ops(), self.project.clone(), task.clone());
                 let resolve = cx.background_executor().spawn(async move { ops.resolve(&project, &t) });
                 cx.spawn_in(window, async move |this, cx| {
                     let result = resolve.await;
@@ -4245,7 +4784,7 @@ impl ShelbiWindow {
             }
             LoadStep::Load { task, slot } => {
                 self.status = Some(format!("Loading {task} onto {slot}…").into());
-                let (ops, project) = (self.review_ops.clone(), self.project.clone());
+                let (ops, project) = (self.review_ops(), self.project.clone());
                 let (t, workspace) = (task.clone(), slot.clone());
                 let load = cx.background_executor().spawn(async move {
                     ops.session_op(&project, &t, shelbi_app::ReviewSessionOp::Load { workspace })
@@ -4309,8 +4848,14 @@ impl ShelbiWindow {
             Some(r) => r.update(cx, |r, cx| r.set_merging(true, cx)),
             None => self.flash(format!("{} {id}…", decision.working), cx),
         }
+        let ProjectHandle { source, link } = self.project_handle.clone();
+        let id_for_state = id.clone();
         let work = cx.background_executor().spawn(async move {
-            shelbi_app::execute_mutation(&m, &mut |_, _| {}).map_err(|e| e.to_string())
+            // The issue as its store has it now: the daemon refuses the
+            // mutation if another client moved it meanwhile.
+            link.mutate(&m, source.issue_state(&id_for_state), &mut |_, _| {})
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = work.await;
@@ -4878,19 +5423,31 @@ impl SidebarHost for ShelbiWindow {
 impl Render for ShelbiWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let weak = cx.entity().downgrade();
         match &self.boot {
+            // A native remote window whose host changed: no shell, no panes,
+            // only Reopen.
+            Boot::Ready(_) if self.remote_changed.is_some() => {
+                cx.defer_in(window, |this, window, cx| this.close_remote_panes(window, cx));
+                let line = self.remote_changed.clone().unwrap_or_default();
+                let host = self
+                    .remote
+                    .as_ref()
+                    .map(|r| shelbi_app::remote_window::bare_host(&r.session.host).to_string())
+                    .unwrap_or_default();
+                boot_view::render_remote_changed(&host, &line, &theme, move |window, cx| {
+                    let _ = weak.update(cx, |this, cx| this.reopen_remote(window, cx));
+                })
+            }
             Boot::Ready(_) => self.render_shell(&theme, window, cx),
             Boot::InFlight(state) => boot_view::render_progress(state, &theme),
-            Boot::Failed(failure) => {
-                let weak = cx.entity().downgrade();
-                boot_view::render_failure(
-                    &boot_view::failure_screen(failure),
-                    &theme,
-                    move |action, _, cx| {
-                        let _ = weak.update(cx, |this, cx| this.screen_action(action, cx));
-                    },
-                )
-            }
+            Boot::Failed(failure) => boot_view::render_failure(
+                &boot_view::failure_screen(failure),
+                &theme,
+                move |action, _, cx| {
+                    let _ = weak.update(cx, |this, cx| this.screen_action(action, cx));
+                },
+            ),
         }
     }
 }
@@ -5050,6 +5607,14 @@ impl ShelbiWindow {
                         scroll: self.sidebar_scroll.clone(),
                         track: self.nav_track.clone(),
                         chip,
+                        remote: self.remote.as_ref().map(|r| sidebar::RemoteBadge {
+                            address: format!(
+                                "{}@{}",
+                                r.session.user,
+                                shelbi_app::remote_window::bare_host(&r.session.host)
+                            ),
+                            connected: self.link == Some(DaemonLink::Live),
+                        }),
                     },
                     &theme,
                     cx,
@@ -5257,6 +5822,8 @@ impl ShelbiWindow {
         let connect = self.connect.as_ref().map(|(dialog, _, _)| dialog.clone());
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
         let weak = cx.entity().downgrade();
+        let start_weak = weak.clone();
+        let remote_stopped = self.remote_stopped.clone();
         let layer = self.overlay.as_ref().map(|o| {
             let entering = if reduce_motion {
                 None
@@ -5321,6 +5888,17 @@ impl ShelbiWindow {
                     });
                 }))
             })
+            .when_some(remote_stopped, |col, line| {
+                col.child(boot_view::render_action_bar(
+                    "remote-stopped",
+                    line,
+                    shelbi_app::launch::remote::START_DAEMON_LABEL,
+                    &theme,
+                    move |_, cx| {
+                        let _ = start_weak.update(cx, |this, cx| this.start_far_daemon(cx));
+                    },
+                ))
+            })
             .child(shell.flex_1().min_h_0())
             .children(machine_form)
             .children(pool_dialog)
@@ -5382,7 +5960,7 @@ impl ShelbiWindow {
         w.boot = Boot::Ready(Box::new(inert_ready()));
         w.model = model;
         w.tap = Some(Default::default());
-        w.review_ops = deps.ops.clone();
+        w.review_ops = Some(deps.ops.clone());
         w.review_deps = Some(deps);
         w.clock = clock;
         w.reduce_motion = Rc::new(|| false);
@@ -5643,6 +6221,10 @@ mod connect_tests;
 #[cfg(test)]
 #[path = "app_fold_tests.rs"]
 mod fold_tests;
+
+#[cfg(test)]
+#[path = "app_remote_tests.rs"]
+mod remote_tests;
 
 #[cfg(test)]
 #[path = "app_onboarding_tests.rs"]

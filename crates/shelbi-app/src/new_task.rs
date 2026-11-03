@@ -704,6 +704,38 @@ pub fn create_live(project: &str, request: &CreateRequest) -> Result<Created, St
     )
 }
 
+/// [`create`] through a window's `link`: the add goes to the project's daemon
+/// (this machine's, or the host's over its relay for a remote window), and
+/// the write-up to its orchestrator's session the same way.
+pub fn create_linked(link: &crate::source::ProjectLink, request: &CreateRequest) -> Result<Created, String> {
+    create(
+        &link.key().name,
+        request,
+        |m| link.add_issue(m, &mut |_, _| {}),
+        &LinkMessenger(link),
+    )
+}
+
+/// The [`OrchestratorMessenger`] over a window's link: the project's own
+/// orchestrator, wherever it runs.
+struct LinkMessenger<'a>(&'a crate::source::ProjectLink);
+
+impl OrchestratorMessenger for LinkMessenger<'_> {
+    fn send(&self, _project: &str, text: &str) -> Result<(), HandoffError> {
+        self.0.message_orchestrator(text)
+    }
+}
+
+/// Type `text` into a connected session the way a client's terminal view
+/// does when the user types: a paste, then Return a beat later as its own
+/// key so the agent doesn't take it as part of the paste.
+pub(crate) fn paste_then_return(conn: &shelbi_client::Connection, text: &str) -> Result<(), HandoffError> {
+    conn.paste(text).map_err(|e| HandoffError::Failed(e.to_string()))?;
+    std::thread::sleep(SETTLE);
+    conn.input(b"\r").map_err(|e| HandoffError::Failed(e.to_string()))?;
+    Ok(())
+}
+
 /// The live [`OrchestratorMessenger`]: finds `<project>/orch` among this
 /// machine's sessions and sends the text the way a client's terminal view
 /// does when the user types into it, a paste then Return, the Return a beat
@@ -724,10 +756,7 @@ impl OrchestratorMessenger for SessionMessenger {
         let (conn, _events) =
             shelbi_client::Connection::open(&session.sock, None, shelbi_proto::capability::ALL)
                 .map_err(|e| HandoffError::Failed(e.to_string()))?;
-        conn.paste(text).map_err(|e| HandoffError::Failed(e.to_string()))?;
-        std::thread::sleep(SETTLE);
-        conn.input(b"\r").map_err(|e| HandoffError::Failed(e.to_string()))?;
-        Ok(())
+        paste_then_return(&conn, text)
     }
 }
 

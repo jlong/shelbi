@@ -31,6 +31,12 @@ use shelbi_state::ChangeNotification;
 pub enum ChangeWake {
     Board,
     Workspace(String),
+    /// The far daemon asked its clients to reload (`shelbi reload` there):
+    /// a remote window reconnects and decides again whether it may stay
+    /// native. Only a remote link sends it
+    /// ([`crate::source::remote::subscribe_changes`]); this machine's own
+    /// reload reaches the app through its relaunch watch instead.
+    Reload { reason: String },
 }
 
 /// How long a connect attempt / idle read waits before re-checking the stop flag,
@@ -41,13 +47,30 @@ const POLL_SLICE: Duration = Duration::from_millis(500);
 /// joins).
 pub struct ChangeSubscription {
     stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    handles: Vec<JoinHandle<()>>,
+    /// A remote subscription's relay streams, closed on drop so their
+    /// threads' reads end.
+    streams: Vec<crate::source::remote::OpenStream>,
+}
+
+impl ChangeSubscription {
+    /// A remote subscription: its threads, and the streams they read.
+    pub(crate) fn remote(
+        stop: Arc<AtomicBool>,
+        handles: Vec<JoinHandle<()>>,
+        streams: Vec<crate::source::remote::OpenStream>,
+    ) -> Self {
+        ChangeSubscription { stop, handles, streams }
+    }
 }
 
 impl Drop for ChangeSubscription {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
+        for stream in &self.streams {
+            stream.close();
+        }
+        for h in self.handles.drain(..) {
             let _ = h.join();
         }
     }
@@ -76,7 +99,14 @@ pub fn spawn_observed(
         .name("shelbi-changes".to_string())
         .spawn(move || subscriber_loop(&project, &tx, &stop_thread, &connected))
         .expect("spawn change subscriber thread");
-    (ChangeSubscription { stop, handle: Some(handle) }, rx)
+    (
+        ChangeSubscription {
+            stop,
+            handles: vec![handle],
+            streams: Vec::new(),
+        },
+        rx,
+    )
 }
 
 fn subscriber_loop(
@@ -114,7 +144,7 @@ fn connect_and_stream(
     };
     let _ = stream.set_read_timeout(Some(POLL_SLICE));
 
-    let frame = format!("{{\"verb\":\"subscribe\",\"project\":{}}}\n", json_string(project));
+    let frame = shelbi_client::relay::services::subscribe_line(project);
     if stream.write_all(frame.as_bytes()).is_err() {
         return StreamEnd::Disconnected;
     }
@@ -142,7 +172,7 @@ fn connect_and_stream(
 
 /// Split complete lines out of `buf`; send a wake for each board/workspace change
 /// for this project. `Err(())` means the receiver was dropped.
-fn drain_lines(
+pub(crate) fn drain_lines(
     buf: &mut Vec<u8>,
     project: &str,
     tx: &Sender<ChangeWake>,
@@ -190,25 +220,6 @@ fn is_timeout(e: &std::io::Error) -> bool {
     )
 }
 
-/// Minimal JSON string encoder for the project name in the subscribe frame.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,11 +245,5 @@ mod tests {
             br#"{"change":"layout","project":"demo","event":{"layout":"orchestrator-restarted"}}"#;
         assert_eq!(wake_for(layout, "demo"), None);
         assert_eq!(wake_for(b"not json", "demo"), None);
-    }
-
-    #[test]
-    fn json_string_escapes_quotes_and_controls() {
-        assert_eq!(json_string("a\"b"), "\"a\\\"b\"");
-        assert_eq!(json_string("x\ty"), "\"x\\ty\"");
     }
 }

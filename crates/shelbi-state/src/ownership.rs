@@ -22,12 +22,15 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use shelbi_core::{IssueTrackerConfig, Result};
 
 use crate::{IssueFile, IssueStore};
 
 /// Who "the user" is for tracker ownership, and hence which issues pass.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum OwnershipGate {
     /// Filesystem backend (or any backend with no tracker-side ownership): no
     /// ownership filtering.

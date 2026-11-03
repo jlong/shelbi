@@ -47,6 +47,8 @@
 //! not: the keys the row can't show (`target`, `url`). The button takes the
 //! Select style when the transition sets either.
 
+use std::sync::Arc;
+use shelbi_app::source::{ProjectHandle, ProjectSource};
 use std::collections::HashMap;
 
 use gpui::{
@@ -59,7 +61,7 @@ use shelbi_state::workflow_config::WorkflowConfig;
 
 use super::workflow_editor_state::{
     action_label, owner_label, run_delete, run_duplicate, run_save, strategy_label, Change, DetailsForm, EditorState,
-    Field, GitForm, Leave, Mode, ProjectGit, ReviewForm, ReviewMode, SaveJob, SaveOutcome, ScriptForm, TextForm, ACTIONS,
+    Field, GitForm, Leave, Mode, ReviewForm, ReviewMode, SaveJob, SaveOutcome, ScriptForm, TextForm, ACTIONS,
     ADD_COMMAND, DETAILS_TARGET, DETAILS_URL, RUN_HELP, RUN_PLACEHOLDER, RUN_SCRIPT, SCRIPT_READY, SCRIPT_TIMEOUT,
     STRATEGIES,
 };
@@ -217,7 +219,10 @@ struct ReviewInputs {
 
 /// The workflow editor.
 pub struct WorkflowEditor {
-    project: String,
+    /// The window's project, read through its source.
+    source: Arc<dyn ProjectSource>,
+    /// The window's project, saved through it (wherever it lives).
+    handle: ProjectHandle,
     /// `None` until the workflow config has loaded.
     pub(super) state: Option<EditorState>,
     load_error: Option<String>,
@@ -265,7 +270,7 @@ impl WorkflowEditor {
     /// it loaded (else it is read off the UI thread; a test's editor reads
     /// no disk).
     pub fn new(
-        project: &str,
+        handle: &ProjectHandle,
         name: &str,
         config: Option<WorkflowConfig>,
         window: &mut Window,
@@ -304,7 +309,8 @@ impl WorkflowEditor {
             }));
         }
         let mut editor = WorkflowEditor {
-            project: project.to_string(),
+            source: handle.source.clone(),
+            handle: handle.clone(),
             state: None,
             load_error: None,
             name: name_input,
@@ -339,8 +345,8 @@ impl WorkflowEditor {
         // The project's own git values, the Git fields' placeholders (a
         // test's editor keeps the defaults, reading no disk).
         if !cfg!(test) {
-            let project = project.to_string();
-            let read = cx.background_executor().spawn(async move { ProjectGit::load(&project) });
+            let source = handle.source.clone();
+            let read = cx.background_executor().spawn(async move { source.project_git() });
             cx.spawn(async move |this, cx| {
                 let git = read.await;
                 this.update(cx, |this, cx| {
@@ -358,8 +364,8 @@ impl WorkflowEditor {
 
     /// Read the workflow config off the UI thread and edit `name`.
     fn load(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.project.clone();
-        let read = cx.background_executor().spawn(async move { WorkflowConfig::load(&project) });
+        let source = self.source.clone();
+        let read = cx.background_executor().spawn(async move { source.workflow_config() });
         cx.spawn_in(window, async move |this, cx| {
             let config = read.await;
             this.update_in(cx, |this, window, cx| {
@@ -580,7 +586,8 @@ impl WorkflowEditor {
             cx.notify();
             return;
         };
-        let save = cx.background_executor().spawn(async move { run_save(job) });
+        let store = self.handle.clone();
+        let save = cx.background_executor().spawn(async move { run_save(job, &store) });
         cx.spawn_in(window, async move |this, cx| {
             let outcome = save.await;
             this.update_in(cx, |this, window, cx| this.saved(outcome, window, cx)).ok();
@@ -617,8 +624,8 @@ impl WorkflowEditor {
     /// save is running) by the time they're read. Closes when the workflow
     /// is gone from them.
     fn read_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.project.clone();
-        let read = cx.background_executor().spawn(async move { WorkflowConfig::load(&project) });
+        let source = self.source.clone();
+        let read = cx.background_executor().spawn(async move { source.workflow_config() });
         cx.spawn_in(window, async move |this, cx| {
             let config = read.await;
             this.update_in(cx, |this, window, cx| {
@@ -653,6 +660,19 @@ impl WorkflowEditor {
         };
         let path = state.file();
         self.reload_on_return = true;
+        if self.handle.link.is_remote() {
+            // The file is on the far machine: an editor session there.
+            let path = path.to_string_lossy().into_owned();
+            let label = super::far_editor::label_of(&path);
+            let file = shelbi_app::far::FarFile::path(path);
+            super::far_editor::open_from(&self.handle.link, file, label, cx, |this: &mut Self, e, cx| {
+                if let Some(state) = this.state.as_mut() {
+                    state.open_failed(e);
+                    cx.notify();
+                }
+            });
+            return;
+        }
         let open = cx.background_executor().spawn(async move {
             let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
             if !path.exists() {
@@ -731,7 +751,8 @@ impl WorkflowEditor {
         };
         let job = cx.background_executor().spawn({
             let copy = copy.clone();
-            async move { run_duplicate(base, &name, &copy) }
+            let store = self.handle.clone();
+            async move { run_duplicate(base, &name, &copy, &store) }
         });
         cx.spawn_in(window, async move |this, cx| {
             let done = job.await;
@@ -764,7 +785,8 @@ impl WorkflowEditor {
         let Some(base) = state.begin_job() else {
             return;
         };
-        let job = cx.background_executor().spawn(async move { run_delete(base, &name) });
+        let store = self.handle.clone();
+        let job = cx.background_executor().spawn(async move { run_delete(base, &name, &store) });
         cx.spawn_in(window, async move |this, cx| {
             let done = job.await;
             this.update(cx, |this, cx| {

@@ -91,6 +91,7 @@ use shelbi_core::{
     WorkflowStatus,
 };
 
+use crate::config_write;
 use crate::yaml_edit;
 
 /// How many blocking issue ids a [`ConfigError::WorkflowInUse`] names.
@@ -159,9 +160,24 @@ pub enum ConfigError {
     /// written; reload and redo the edit.
     #[error("changed on disk since it was loaded: {}", display_paths(.0))]
     Conflict(Vec<PathBuf>),
+    /// Files changed on `host` (a project on another machine) since the
+    /// model was loaded. Nothing was written there.
+    #[error("changed on {host} since it was loaded: {}", display_paths(.paths))]
+    ChangedOn { host: String, paths: Vec<PathBuf> },
     /// A file couldn't be read, parsed or written.
     #[error("{path}: {message}")]
     File { path: PathBuf, message: String },
+}
+
+impl From<config_write::WriteError> for ConfigError {
+    fn from(e: config_write::WriteError) -> Self {
+        match e {
+            config_write::WriteError::Changed(paths) => ConfigError::Conflict(paths),
+            config_write::WriteError::Refused { path, message } | config_write::WriteError::Io { path, message } => {
+                ConfigError::File { path, message }
+            }
+        }
+    }
 }
 
 fn list_or_none(names: &[String]) -> String {
@@ -216,6 +232,38 @@ pub struct UnreadableWorkflow {
     status_ids: Vec<String>,
 }
 
+/// The files a [`WorkflowConfig`] is built from, as read
+/// ([`WorkflowConfig::read_files`]) and not yet parsed. Serializable: a far
+/// machine sends them to a remote window, which parses them with the same
+/// loader ([`WorkflowConfig::from_files`]). The paths are the far machine's.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WorkflowFiles {
+    pub project: String,
+    pub dir: PathBuf,
+    pub statuses_path: PathBuf,
+    /// `None` when the file doesn't exist.
+    pub statuses_text: Option<String>,
+    /// Every workflow file, by stem.
+    pub workflows: Vec<WorkflowFile>,
+    /// The project YAML that holds `default_workflow:`.
+    pub project_path: PathBuf,
+    pub project_text: String,
+    /// The default workflow, its alias resolved.
+    pub default_workflow: String,
+    /// The project's agents, or `None` when it has no `agents/` directory.
+    pub agents: Option<Vec<String>>,
+}
+
+/// One workflow file's text.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WorkflowFile {
+    pub stem: String,
+    pub path: PathBuf,
+    pub text: String,
+}
+
 /// What a save did.
 #[derive(Debug, Clone)]
 pub struct Saved {
@@ -227,6 +275,27 @@ pub struct Saved {
     /// whole file's when its layout couldn't be followed and it had to be
     /// re-serialized.
     pub dropped_comments: Vec<(PathBuf, Vec<String>)>,
+}
+
+/// A save, planned ([`WorkflowConfig::save_plan`]) and not yet written.
+#[derive(Debug, Clone)]
+pub struct SavePlan {
+    pub plan: config_write::Plan,
+    pub written: Vec<PathBuf>,
+    pub removed: Vec<PathBuf>,
+    pub dropped_comments: Vec<(PathBuf, Vec<String>)>,
+}
+
+impl SavePlan {
+    /// What the save did, once its plan ran and `config` was read back.
+    pub fn saved(self, config: WorkflowConfig) -> Saved {
+        Saved {
+            config,
+            written: self.written,
+            removed: self.removed,
+            dropped_comments: self.dropped_comments,
+        }
+    }
 }
 
 /// The editable statuses, workflows and default of one project.
@@ -288,9 +357,63 @@ struct Loaded {
 impl WorkflowConfig {
     /// Load `project`'s statuses, workflows and default workflow.
     pub fn load(project: &str) -> Result<Self> {
+        Self::from_files(Self::read_files(project)?)
+    }
+
+    /// Read every file [`load`](Self::load) builds the model from, without
+    /// parsing them: what a far machine sends a remote window, which builds
+    /// the model with [`from_files`](Self::from_files), the same loader.
+    pub fn read_files(project: &str) -> Result<WorkflowFiles> {
         let dir = crate::workflows_dir(project).map_err(other)?;
         let statuses_path = crate::workflows::statuses_read_path(project).map_err(other)?;
         let statuses_text = read_optional(&statuses_path)?;
+        let mut workflows = Vec::new();
+        for (stem, path) in workflow_files(&dir)? {
+            let text = read_optional(&path)?.unwrap_or_default();
+            workflows.push(WorkflowFile { stem, path, text });
+        }
+        let project_path = project_config_file(project)?;
+        let project_text =
+            fs::read_to_string(&project_path).map_err(|e| file_err(&project_path, e))?;
+        let declared = yaml_edit::parse(&project_text)
+            .ok()
+            .and_then(|v| v.get("default_workflow")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| shelbi_core::DEFAULT_WORKFLOW_NAME.to_string());
+        let default_workflow =
+            crate::workflows::resolve_workflow_alias(project, &declared).map_err(other)?;
+        let agents_dir = crate::agents_dir(project).map_err(other)?;
+        let agents = if agents_dir.is_dir() {
+            Some(crate::list_agents(project).map_err(other)?)
+        } else {
+            None
+        };
+        Ok(WorkflowFiles {
+            project: project.to_string(),
+            dir,
+            statuses_path,
+            statuses_text,
+            workflows,
+            project_path,
+            project_text,
+            default_workflow,
+            agents,
+        })
+    }
+
+    /// The model over `files` as [`read_files`](Self::read_files) read them.
+    /// Reads nothing.
+    pub fn from_files(files: WorkflowFiles) -> Result<Self> {
+        let WorkflowFiles {
+            project,
+            dir,
+            statuses_path,
+            statuses_text,
+            workflows: files,
+            project_path,
+            project_text,
+            default_workflow,
+            agents,
+        } = files;
         let catalog = match &statuses_text {
             Some(text) => {
                 ProjectStatuses::from_yaml_str(text).map_err(|e| file_err(&statuses_path, e))?
@@ -300,8 +423,7 @@ impl WorkflowConfig {
 
         let mut workflows = BTreeMap::new();
         let mut unreadable = Vec::new();
-        for (stem, path) in workflow_files(&dir)? {
-            let text = read_optional(&path)?.unwrap_or_default();
+        for WorkflowFile { stem, path, text } in files {
             match parse_workflow(&text, &catalog) {
                 Ok(mut workflow) => {
                     // Workflows load by file stem; the stem is the name.
@@ -317,23 +439,6 @@ impl WorkflowConfig {
             }
         }
 
-        let project_path = project_config_file(project)?;
-        let project_text =
-            fs::read_to_string(&project_path).map_err(|e| file_err(&project_path, e))?;
-        let declared = yaml_edit::parse(&project_text)
-            .ok()
-            .and_then(|v| v.get("default_workflow")?.as_str().map(str::to_string))
-            .unwrap_or_else(|| shelbi_core::DEFAULT_WORKFLOW_NAME.to_string());
-        let default_workflow =
-            crate::workflows::resolve_workflow_alias(project, &declared).map_err(other)?;
-
-        let agents_dir = crate::agents_dir(project).map_err(other)?;
-        let agents = if agents_dir.is_dir() {
-            Some(crate::list_agents(project).map_err(other)?)
-        } else {
-            None
-        };
-
         let entries = workflows
             .iter()
             .map(|(stem, loaded)| Entry {
@@ -342,7 +447,7 @@ impl WorkflowConfig {
             })
             .collect();
         Ok(WorkflowConfig {
-            project: project.to_string(),
+            project,
             statuses: catalog.statuses.clone(),
             workflows: entries,
             default_workflow: default_workflow.clone(),
@@ -917,40 +1022,48 @@ impl WorkflowConfig {
     /// writing nothing, if a file to be written or removed changed on disk
     /// since the load.
     pub fn save(&self) -> Result<Saved> {
-        let plan = self.plan()?;
-        let conflicts: Vec<PathBuf> = plan
-            .iter()
-            .filter(|op| read_optional(&op.path).map_or(true, |now| now != op.expected))
-            .map(|op| op.path.clone())
-            .collect();
-        if !conflicts.is_empty() {
-            return Err(ConfigError::Conflict(conflicts));
-        }
+        let plan = self.save_plan()?;
+        config_write::check_and_run(&plan.plan).map_err(ConfigError::from)?;
+        Ok(plan.saved(WorkflowConfig::load(&self.project)?))
+    }
+
+    /// What [`save`](Self::save) writes, as a [`config_write::Plan`]: each
+    /// file's expected content hash, then the writes and removals in order.
+    /// A window on a project on another machine sends this to that
+    /// machine's daemon instead of writing it here.
+    pub fn save_plan(&self) -> Result<SavePlan> {
+        let ops = self.plan()?;
+        let mut plan = config_write::Plan::new(config_write::Surface::Workflows);
         let mut written = Vec::new();
         let mut removed = Vec::new();
         let mut dropped_comments = Vec::new();
-        for op in &plan {
-            match &op.text {
+        for op in ops {
+            plan.checks.push(config_write::Check::File {
+                path: op.path.clone(),
+                hash: op.expected.as_deref().map(|t| config_write::content_hash(t.as_bytes())),
+            });
+            match op.text {
                 Some(text) => {
-                    crate::atomic_write(&op.path, text.as_bytes())
-                        .map_err(|e| file_err(&op.path, e))?;
+                    plan.ops.push(config_write::Op::Write {
+                        path: op.path.clone(),
+                        contents: config_write::Contents::Text(text),
+                    });
                     written.push(op.path.clone());
                 }
                 None => {
-                    match fs::remove_file(&op.path) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == ErrorKind::NotFound => {}
-                        Err(e) => return Err(file_err(&op.path, e)),
-                    }
+                    plan.ops.push(config_write::Op::RemoveFile {
+                        path: op.path.clone(),
+                        prune: None,
+                    });
                     removed.push(op.path.clone());
                 }
             }
             if !op.dropped_comments.is_empty() {
-                dropped_comments.push((op.path.clone(), op.dropped_comments.clone()));
+                dropped_comments.push((op.path, op.dropped_comments));
             }
         }
-        Ok(Saved {
-            config: WorkflowConfig::load(&self.project)?,
+        Ok(SavePlan {
+            plan,
             written,
             removed,
             dropped_comments,

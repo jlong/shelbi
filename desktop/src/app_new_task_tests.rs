@@ -29,7 +29,7 @@ impl NewTask {
         let mut h = Harness::open(cx);
         let seen = Arc::new(Mutex::new(Vec::new()));
         let record = seen.clone();
-        let runner = Arc::new(move |_: &str, request: &CreateRequest| {
+        let runner = Arc::new(move |_: &shelbi_app::source::ProjectLink, request: &CreateRequest| {
             record.lock().unwrap().push(request.clone());
             Ok(Created {
                 id: Some("write-docs".into()),

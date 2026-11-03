@@ -69,6 +69,11 @@ pub enum CommandKind {
     /// Open another window on the current project. Offered only by a client
     /// that has windows to open ([`CommandModel::multi_window`]).
     NewWindow,
+    /// Open this remote window's project in its terminal view: the far
+    /// machine's TUI over `ssh -t`, the window a host on another version
+    /// opens. Offered only in a native remote window
+    /// ([`CommandModel::remote_host`]), so that view stays reachable.
+    OpenTerminalView,
     /// Detach this client (leave Shelbi running in the background).
     Detach,
     /// Detach every other client attached to this session.
@@ -215,6 +220,7 @@ impl CommandKind {
             CommandKind::ConnectRemote => Effect::ConnectRemote,
             CommandKind::ShowLaunchScreen => Effect::ShowLaunchScreen,
             CommandKind::NewWindow => Effect::NewWindow { project: p() },
+            CommandKind::OpenTerminalView => Effect::OpenTerminalView { project: p() },
             CommandKind::Detach => Effect::Detach,
             CommandKind::DetachOtherClients => Effect::DetachOtherClients,
             CommandKind::QuitProject => Effect::QuitProject { project: p() },
@@ -356,9 +362,11 @@ pub struct ProjectItem {
 }
 
 /// An on-disk edit target that exists for this project.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EditItem {
+    #[serde(default = "crate::wire::default_edit_target")]
     pub target: EditTarget,
+    #[serde(default)]
     pub title: String,
 }
 
@@ -394,6 +402,21 @@ pub struct CommandModel {
     /// "Connect to Remote Session…"; a client turns it on once its dialog is
     /// built.
     pub remote_connect: bool,
+    /// The host a remote window's project lives on (`None` on this
+    /// machine). Commands such a window can't run yet stay listed, each
+    /// with the reason as its subtitle ([`CommandModel::unavailable`]): a
+    /// menu draws them disabled and the client refuses them with that line.
+    pub remote_host: Option<String>,
+}
+
+impl CommandModel {
+    /// Why `kind` can't run in this window, or `None` when it can: only a
+    /// remote window's ([`Self::remote_host`]) refuses any
+    /// ([`crate::remote_window::command_unavailable`]).
+    pub fn unavailable(&self, kind: &CommandKind) -> Option<String> {
+        let host = self.remote_host.as_deref()?;
+        crate::remote_window::command_unavailable(kind, host)
+    }
 }
 
 /// The one-line description shown beside a nav view in the command palette's
@@ -714,6 +737,21 @@ impl CommandRegistry {
             });
         }
 
+        // The terminal view of a remote window's project (hidden until
+        // query), only in a remote window: the far TUI over `ssh -t`.
+        if model.remote_host.is_some() && model.project.is_some() {
+            out.push(Command {
+                id: "action:open-terminal-view".to_string(),
+                title: "Open in Terminal View".to_string(),
+                kind: CommandKind::OpenTerminalView,
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some("Open this project in Shelbi's terminal interface".to_string()),
+                shortcut: None,
+                hidden_until_query: true,
+            });
+        }
+
         // Edit targets (hidden until query).
         for e in &model.edit_targets {
             out.push(Command {
@@ -793,6 +831,13 @@ impl CommandRegistry {
             hidden_until_query: false,
         });
 
+        // A remote window lists what it can't run yet with the reason.
+        for c in &mut out {
+            if let Some(reason) = model.unavailable(&c.kind) {
+                c.subtitle = Some(reason);
+                c.shortcut = None;
+            }
+        }
         out
     }
 
@@ -881,6 +926,7 @@ impl CommandKind {
             "action:connect-remote" => Some(CommandKind::ConnectRemote),
             "action:launch-screen" => Some(CommandKind::ShowLaunchScreen),
             "action:new-window" => Some(CommandKind::NewWindow),
+            "action:open-terminal-view" => Some(CommandKind::OpenTerminalView),
             "action:detach" => Some(CommandKind::Detach),
             "action:detach-others" => Some(CommandKind::DetachOtherClients),
             "action:quit-project" => Some(CommandKind::QuitProject),
@@ -975,6 +1021,7 @@ mod tests {
             multi_window: true,
             launch_screen: true,
             remote_connect: true,
+            remote_host: None,
         }
     }
 
@@ -1100,6 +1147,34 @@ mod tests {
         assert!(reg.resolve("action:launch-screen", &m).is_none());
         let fresh = CommandModel::default();
         assert!(!fresh.launch_screen && !fresh.remote_connect);
+    }
+
+    #[test]
+    fn a_remote_window_lists_what_it_cant_run_with_the_reason() {
+        let reg = CommandRegistry::new();
+        let mut m = model();
+        let local = reg.commands(&m);
+        assert!(local.iter().all(|c| m.unavailable(c.kind()).is_none()), "a local window refuses nothing");
+
+        m.remote_host = Some("jlong@devbox".into());
+        let remote = reg.commands(&m);
+        // Nothing is dropped (a refused command stays listed); the one
+        // command a remote window adds is Open in Terminal View.
+        let mut expected: Vec<&str> = local.iter().map(Command::id).collect();
+        let at = expected.iter().position(|id| id.starts_with("edit:")).unwrap_or(expected.len());
+        expected.insert(at, "action:open-terminal-view");
+        assert_eq!(remote.iter().map(Command::id).collect::<Vec<_>>(), expected);
+        let quit = reg.resolve("action:quit-shelbi", &m).unwrap();
+        let reason = m.unavailable(quit.kind()).expect("Quit Shelbi never reaches the far host");
+        assert!(reason.contains("devbox"));
+        assert_eq!(quit.to_entry().subtitle.as_deref(), Some(reason.as_str()));
+        // What goes to the far daemon stays available.
+        let quit_project = reg.resolve("action:quit-project", &m).unwrap();
+        assert_eq!(m.unavailable(quit_project.kind()), None);
+        let zen = reg.resolve("action:toggle-zen", &m).unwrap();
+        assert_eq!(m.unavailable(zen.kind()), None, "Zen Mode is a far state write");
+        assert_eq!(zen.to_entry().shortcut.as_deref(), Some("⌥Z"), "an available command keeps its shortcut");
+        assert_eq!(m.unavailable(&CommandKind::ShowView(View::Issues)), None);
     }
 
     #[test]

@@ -119,10 +119,9 @@ impl KeybindingsPage {
     /// Read `keys.yaml` off the UI thread (after the shared loader's one-shot
     /// migrations, so the file is the one the TUI reads) and show it.
     pub fn load(&mut self, cx: &mut Context<Self>) {
-        let project = self.state.project().map(str::to_string);
-        let read = cx
-            .background_executor()
-            .spawn(async move { shared::read_keys(project.as_deref()) });
+        // `keys.yaml` is the viewer's own, so no project's bindings are read
+        // here: the loader's migrations it runs first are the file's own.
+        let read = cx.background_executor().spawn(async move { shared::read_keys(None) });
         cx.spawn(async move |this, cx| {
             let text = read.await;
             this.update(cx, |this, cx| {

@@ -30,9 +30,13 @@ mod notify;
 mod platform;
 mod projects;
 mod refresh;
+#[cfg(test)]
+mod source_gate;
 mod spike;
 #[cfg(test)]
 mod test_env;
+#[cfg(test)]
+mod remote_fixture;
 mod theme;
 mod views;
 #[cfg(feature = "visual-check")]
@@ -355,7 +359,8 @@ pub(crate) fn read_launch_plan() -> (Option<WindowSession>, Vec<window_state::La
         session.as_ref(),
         named.as_deref(),
         projects::launch_project().as_deref(),
-        &|p| known.contains(p),
+        // Only this machine's projects reopen in a window of their own.
+        &|p: &shelbi_app::source::ProjectKey| p.is_local() && known.contains(&p.name),
         &WindowState::load_legacy,
     );
     (session, plan)

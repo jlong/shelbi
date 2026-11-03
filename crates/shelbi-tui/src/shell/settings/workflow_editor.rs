@@ -60,6 +60,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use shelbi_app::settings::store::Local;
 use shelbi_app::settings::workflow_editor::{
     action_label, owner_label, run_delete, run_duplicate, run_save, strategy_label, zen_custom_help, Change,
     EditorState, Field, GitForm, Leave, Mode, ProjectGit, ReviewMode, SaveJob, SaveOutcome, TextForm,
@@ -377,12 +378,19 @@ pub(crate) fn run_work(work: EditorWork, read: &dyn Fn(&str) -> Result<WorkflowC
             };
             EditorDone::Loaded(config, git)
         }
-        EditorWork::Save(job) => EditorDone::Saved(run_save(job)),
+        EditorWork::Save(job) => {
+            let store = Local { project: job.project().to_string() };
+            EditorDone::Saved(run_save(job, &store))
+        }
         EditorWork::Duplicate { base, name, copy } => {
-            let done = run_duplicate(base, &name, &copy);
+            let store = Local { project: base.project().to_string() };
+            let done = run_duplicate(base, &name, &copy, &store);
             EditorDone::Duplicated(done, copy)
         }
-        EditorWork::Delete { base, name } => EditorDone::Deleted(run_delete(base, &name)),
+        EditorWork::Delete { base, name } => {
+            let store = Local { project: base.project().to_string() };
+            EditorDone::Deleted(run_delete(base, &name, &store))
+        }
     }
 }
 

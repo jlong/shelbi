@@ -20,6 +20,7 @@ use crate::platform::{BootstrapState, Failure, RelaunchNotice};
 use crate::theme::style::{self, ButtonKind, ButtonSize};
 use crate::theme::Theme;
 use crate::theme::style::{Type, Typography};
+use shelbi_app::launch::remote::REOPEN_LABEL;
 
 /// The CLI's install command.
 pub const INSTALL_COMMAND: &str = "brew install jlong/shelbi/shelbi";
@@ -429,6 +430,43 @@ pub fn render_failure(
     on_action: impl Fn(ScreenAction, &mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     let action = screen.action;
+    render_screen(
+        screen,
+        ("bootstrap-action", action.icon(), action.label()),
+        theme,
+        move |window, cx| on_action(action, window, cx),
+    )
+}
+
+/// The screen a native remote window shows in place of its shell once its
+/// host no longer opens natively (`line`,
+/// [`shelbi_app::remote_window::changed_notice`]): its panes are closed,
+/// nothing more is sent, and Reopen ([`REOPEN_LABEL`]) decides again.
+pub fn render_remote_changed(
+    host: &str,
+    line: &str,
+    theme: &Theme,
+    on_reopen: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let screen = Screen {
+        title: format!("Shelbi on {host} changed"),
+        body: vec![line.to_string()],
+        fix: Vec::new(),
+        details: None,
+        // The button below is Reopen's.
+        action: ScreenAction::Retry,
+    };
+    render_screen(&screen, ("remote-reopen", icons::ARROW_PATH, REOPEN_LABEL), theme, on_reopen)
+}
+
+/// A full-window screen: `screen`'s title, body, fix and details, and one
+/// button (`id`, icon, label) that runs `on_click`.
+fn render_screen(
+    screen: &Screen,
+    (id, icon, label): (&'static str, Icon, &'static str),
+    theme: &Theme,
+    on_click: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
     let mut column = div()
         .flex()
         .flex_col()
@@ -491,15 +529,8 @@ pub fn render_failure(
     }
     column = column.child(
         div().flex().flex_row().child(
-            style::icon_label_button(
-                "bootstrap-action",
-                action.icon(),
-                action.label(),
-                ButtonKind::Success,
-                ButtonSize::Base,
-                theme,
-            )
-            .on_click(move |_, window, cx| on_action(action, window, cx)),
+            style::icon_label_button(id, icon, label, ButtonKind::Success, ButtonSize::Base, theme)
+                .on_click(move |_, window, cx| on_click(window, cx)),
         ),
     );
     centered(theme).child(column).into_any_element()
@@ -542,6 +573,46 @@ pub fn render_relaunch_bar(
         .child(
             style::button("relaunch", ScreenAction::Relaunch.label(), ButtonKind::Success, ButtonSize::Base, false, theme)
                 .on_click(move |_, window, cx| on_relaunch(window, cx)),
+        )
+        .into_any_element()
+}
+
+/// A bar like the relaunch bar: `message` and one button, `label`. A remote
+/// window's "Shelbi isn't running on devbox." with Start Shelbi draws it.
+pub fn render_action_bar(
+    id: &'static str,
+    message: impl Into<gpui::SharedString>,
+    label: &'static str,
+    theme: &Theme,
+    on_click: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    div()
+        .debug_selector(move || id.into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .min_h(px(sidebar::TITLEBAR_H))
+        .pl(px(sidebar::BESIDE_TRAFFIC_LIGHTS))
+        .pr_4()
+        .py_2()
+        .bg(theme.notice)
+        .border_b_1()
+        .border_color(theme.divider)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .text_color(theme.text_loud)
+                .child(heroicon(icons::EXCLAMATION_TRIANGLE).text_color(theme.warning))
+                .child(message.into()),
+        )
+        .child(
+            style::button(id, label, ButtonKind::Success, ButtonSize::Base, false, theme)
+                .on_click(move |_, window, cx| on_click(window, cx)),
         )
         .into_any_element()
 }

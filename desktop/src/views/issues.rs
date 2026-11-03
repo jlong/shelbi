@@ -48,8 +48,10 @@ use gpui::{
 };
 use shelbi_app::board::DropTarget;
 use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
-use shelbi_app::board::{self, BoardRead, ClosedPage};
+use shelbi_app::board::{BoardRead, ClosedPage};
 use shelbi_app::board_search::SearchWorker;
+use shelbi_app::source::ProjectHandle;
+use shelbi_app::state_write::{self, StateWrite};
 use shelbi_app::{
     CommandKind, ExecError, ExpectedState, IssueCard, IssueColumn, TaskDetailModel,
 };
@@ -79,6 +81,9 @@ use crate::theme::style::{Type, Typography};
 
 /// The fallback refresh cadence (the TUI's).
 const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+/// The re-read cadence for a project on another machine: each read is a
+/// round trip over the host's relay link.
+const REMOTE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// How often the view drains its channels.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// An expanded column's width.
@@ -247,6 +252,9 @@ pub struct IssuesView {
     /// Runs the board's GitHub searches off the UI thread, started on the
     /// first one (a local board never starts it).
     search_worker: Option<SearchWorker>,
+    /// The window's project: every read goes through its source, every
+    /// mutation through its link.
+    project: ProjectHandle,
     display_style: DisplayStyle,
     /// Drawn over another screen: the detail alone, no board.
     floating: bool,
@@ -271,20 +279,21 @@ pub struct IssuesView {
 impl EventEmitter<IssuesEvent> for IssuesView {}
 
 impl IssuesView {
-    pub fn new(project: String, cx: &mut Context<Self>) -> Self {
-        let (keymaps, diagnostics) = shelbi_state::keymap::load_keymaps(Some(&project));
+    pub fn new(handle: &ProjectHandle, cx: &mut Context<Self>) -> Self {
+        let project = handle.name().to_string();
+        let (keymaps, diagnostics) = handle.source.project_keymap();
         for d in diagnostics {
             tracing::warn!("keys.yaml: {d:?}");
         }
-        let p = project.clone();
+        let source = handle.source.clone();
         let open_refresher = shelbi_app::spawn_worker(move |_| {
-            let read = board::read_open_board(&p);
+            let read = source.open_board();
             let print = fingerprint(&read);
             (read, print)
         });
-        let p = project.clone();
+        let source = handle.source.clone();
         let closed_refresher = shelbi_app::spawn_worker(move |_| {
-            let page = board::read_closed_page(&p);
+            let page = source.closed_page();
             let print = fingerprint(&page);
             (page, print)
         });
@@ -329,6 +338,7 @@ impl IssuesView {
             sent_saves: Vec::new(),
             search_input: None,
             search_worker: None,
+            project: handle.clone(),
             display_style: DisplayStyle::detect(),
             floating: false,
             pane_session: None,
@@ -805,7 +815,12 @@ impl IssuesView {
             self.close_editors();
             changed = true;
         }
-        if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
+        let interval = if self.project.key().is_local() {
+            REFRESH_INTERVAL
+        } else {
+            REMOTE_REFRESH_INTERVAL
+        };
+        if self.last_refresh.elapsed() >= interval {
             self.refresh();
         }
         if changed {
@@ -888,14 +903,11 @@ impl IssuesView {
 
     fn spawn_mutation(&self, job: MutationJob) {
         let project = self.state.project.clone();
+        let link = self.project.link.clone();
         let tx = self.done_tx.clone();
         std::thread::spawn(move || {
             let result = match job.mutation(&project) {
-                Some(m) => shelbi_app::execute_mutation_expecting(
-                    &m,
-                    job.expected.clone(),
-                    &mut |_stream, _line| {},
-                ),
+                Some(m) => link.mutate(&m, job.expected.clone(), &mut |_stream, _line| {}),
                 None => Err(ExecError::Backend("not an issue mutation".into())),
             };
             let _ = tx.send(Done::Mutation { id: job.id, result });
@@ -915,14 +927,11 @@ impl IssuesView {
     #[cfg(not(test))]
     fn run_save(&self, job: SaveJob) {
         let project = self.state.project.clone();
+        let link = self.project.link.clone();
         let edits = self.state.edits();
         let tx = self.done_tx.clone();
         std::thread::spawn(move || {
-            let result = shelbi_app::execute_mutation_expecting(
-                &job.mutation(&project),
-                job.expected.clone(),
-                &mut |_stream, _line| {},
-            );
+            let result = link.mutate(&job.mutation(&project), job.expected.clone(), &mut |_stream, _line| {});
             if let Err(e) = &result {
                 tracing::warn!("saving {}/{} failed: {e}", project, job.id);
             }
@@ -956,28 +965,20 @@ impl IssuesView {
                 Intent::Refresh => self.refresh(),
                 Intent::LoadMore => self.load_more(),
                 Intent::PersistWorkspaceFilter(filter) => {
-                    let project = self.state.project.clone();
-                    let disk = filter.map(|f| f.to_disk());
-                    self.persist(move || {
-                        shelbi_state::set_workspace_filter(&project, disk.as_deref())
-                            .map_err(|e| format!("filter persist failed: {e}"))
-                    });
+                    let filter = filter.map(|f| f.to_disk());
+                    self.persist(StateWrite::SetWorkspaceFilter { filter }, "filter");
                 }
                 Intent::PersistColumnOverride {
                     workflow,
                     status_id,
                     value,
                 } => {
-                    let project = self.state.project.clone();
-                    self.persist(move || {
-                        shelbi_state::set_kanban_column_override(
-                            &project,
-                            &workflow,
-                            &status_id,
-                            Some(value),
-                        )
-                        .map_err(|e| format!("column override persist failed: {e}"))
-                    });
+                    let write = StateWrite::SetColumnOverride {
+                        workflow,
+                        status: status_id,
+                        value: Some(state_write::column_override(value)),
+                    };
+                    self.persist(write, "column override");
                 }
                 Intent::ScrollDetail(s) => self.scroll_detail(s),
                 Intent::BeginEdit(id) => self.begin_edit(&id, window, cx),
@@ -997,18 +998,24 @@ impl IssuesView {
         }
     }
 
-    /// Small `state.json` writes, off the UI thread.
-    fn persist(&self, f: impl FnOnce() -> Result<(), String> + Send + 'static) {
+    /// Write a board setting (the workspace filter, a column override) off
+    /// the UI thread, through the project's daemon: this machine's, or the
+    /// far host's for a remote window. `what` names it in a failure.
+    fn persist(&self, write: StateWrite, what: &'static str) {
+        let link = self.project.link.clone();
         let tx = self.done_tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Done::Persisted(f()));
+            let result = link
+                .write_state(write)
+                .map_err(|e| format!("{what} persist failed: {e}"));
+            let _ = tx.send(Done::Persisted(result));
         });
     }
 
     /// The search's worker, started on first use.
     fn search_worker(&mut self) -> &SearchWorker {
-        let project = self.state.project.clone();
-        self.search_worker.get_or_insert_with(|| SearchWorker::github(project))
+        let source = self.project.source.clone();
+        self.search_worker.get_or_insert_with(|| SearchWorker::over(source))
     }
 
     /// Send the search that's due and fold in the answers; true when the
@@ -1039,10 +1046,10 @@ impl IssuesView {
         }
         self.load_more_in_flight = true;
         self.state.status = Some("loading more history…".into());
-        let project = self.state.project.clone();
+        let source = self.project.source.clone();
         let tx = self.done_tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Done::More(board::load_more_closed(&project, &cursor)));
+            let _ = tx.send(Done::More(source.more_closed(&cursor)));
         });
     }
 
@@ -2567,7 +2574,7 @@ mod tests {
         };
         let handle = cx.update(|cx| {
             cx.open_window(options, |_, cx| {
-                cx.new(|cx| IssuesView::new("dt-search-clear-test".into(), cx))
+                cx.new(|cx| IssuesView::new(&shelbi_orchestrator::source::local_handle("dt-search-clear-test"), cx))
             })
             .unwrap()
         });

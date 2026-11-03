@@ -17,9 +17,9 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use shelbi_proto::control::{
-    self, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, ExpectedState,
-    MutationRequest, ReviewSessionRequest, ServerMsg, Stream as OutStream, WorkspaceSessionRequest,
-    CONTROL_PROTOCOL_VERSION,
+    self, AppRequest, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, ExpectedState,
+    MutationRequest, ReviewSessionRequest, SaveConfigRequest, ServerMsg, StateWriteRequest, Stream as OutStream,
+    WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
 };
 
 use crate::error::ClientError;
@@ -51,8 +51,8 @@ pub struct MutationDone {
 /// A connection to the daemon's mutation control socket, past the hello
 /// handshake.
 pub struct ControlClient {
-    write: UnixStream,
-    read: FrameReader<BufReader<UnixStream>>,
+    write: Box<dyn Write + Send>,
+    read: FrameReader<BufReader<Box<dyn Read + Send>>>,
     /// The daemon version from its hello, for diagnostics.
     pub daemon_version: String,
 }
@@ -63,8 +63,18 @@ impl ControlClient {
     pub fn connect(path: &Path, client_version: &str) -> Result<Self, ClientError> {
         let stream = UnixStream::connect(path)?;
         let read_half = stream.try_clone()?;
-        let mut write = stream;
-        let mut read = FrameReader::new(BufReader::new(read_half));
+        Self::over(Box::new(read_half), Box::new(stream), client_version)
+    }
+
+    /// [`connect`](Self::connect) over an already open byte stream to the
+    /// daemon's control protocol, given as its two halves: a relay `control`
+    /// stream to a far daemon, say. Sends the hello and reads the daemon's.
+    pub fn over(
+        read: Box<dyn Read + Send>,
+        mut write: Box<dyn Write + Send>,
+        client_version: &str,
+    ) -> Result<Self, ClientError> {
+        let mut read = FrameReader::new(BufReader::new(read));
 
         write.write_all(&control::encode(&ClientMsg::Hello {
             protocol: CONTROL_PROTOCOL_VERSION,
@@ -260,6 +270,65 @@ impl ControlClient {
         }
     }
 
+    /// Ask the daemon to make one write to a project's state files (protocol
+    /// v7): it is the single writer and announces the change to the other
+    /// subscribers. Blocks until the daemon replies [`ServerMsg::Done`] (`Ok`)
+    /// or [`ServerMsg::Failed`] ([`ClientError::Mutation`]).
+    pub fn write_state(&mut self, req: &StateWriteRequest) -> Result<(), ClientError> {
+        self.write
+            .write_all(&control::encode(&ClientMsg::WriteState(req.clone()))?)?;
+        self.write.flush()?;
+
+        loop {
+            let msg: ServerMsg = self.read.read_frame()?.ok_or(ClientError::UnexpectedEof)?;
+            match msg {
+                ServerMsg::Done { request_id, .. } if request_id == req.request_id => return Ok(()),
+                ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
+                    return Err(ClientError::Mutation(error))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Write a config save the client planned (protocol v8). Blocks until the
+    /// daemon reports [`ServerMsg::Done`] (`Ok`) or [`ServerMsg::Failed`]
+    /// ([`ClientError::Mutation`]; a changed file is
+    /// `MutationError::ConfigChanged`).
+    pub fn save_config(&mut self, req: &SaveConfigRequest) -> Result<(), ClientError> {
+        self.write
+            .write_all(&control::encode(&ClientMsg::SaveConfig(req.clone()))?)?;
+        self.write.flush()?;
+        loop {
+            let msg: ServerMsg = self.read.read_frame()?.ok_or(ClientError::UnexpectedEof)?;
+            match msg {
+                ServerMsg::Done { request_id, .. } if request_id == req.request_id => return Ok(()),
+                ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
+                    return Err(ClientError::Mutation(error))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Run one of the app's requests where the project lives (protocol v8)
+    /// and return the daemon's [`ServerMsg::Reply`] body. Blocks.
+    pub fn app_request(&mut self, req: &AppRequest) -> Result<serde_json::Value, ClientError> {
+        self.write
+            .write_all(&control::encode(&ClientMsg::AppRequest(req.clone()))?)?;
+        self.write.flush()?;
+        loop {
+            let msg: ServerMsg = self.read.read_frame()?.ok_or(ClientError::UnexpectedEof)?;
+            match msg {
+                ServerMsg::Reply { request_id, body } if request_id == req.request_id => return Ok(body),
+                ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
+                    return Err(ClientError::Mutation(error))
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Subscribe this connection to change / re-exec / detach notifications and
     /// return a blocking iterator of [`Notice`]s, without registering as a
     /// listable attached client (an internal watcher). The iterator ends when the
@@ -279,7 +348,10 @@ impl ControlClient {
         self.write
             .write_all(&control::encode(&ClientMsg::Subscribe { info })?)?;
         self.write.flush()?;
-        Ok(Subscription { read: self.read })
+        Ok(Subscription {
+            read: self.read,
+            _write: self.write,
+        })
     }
 
     /// List the attached UI clients (`shelbi detach --list`). Blocks until the
@@ -336,7 +408,10 @@ impl ControlClient {
 
 /// A blocking stream of [`Notice`]s from a subscribed connection.
 pub struct Subscription {
-    read: FrameReader<BufReader<UnixStream>>,
+    read: FrameReader<BufReader<Box<dyn Read + Send>>>,
+    /// The write half, held so the connection stays open: over a relay
+    /// stream, dropping it closes the stream.
+    _write: Box<dyn Write + Send>,
 }
 
 impl Subscription {

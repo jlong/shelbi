@@ -64,7 +64,10 @@ pub use discovery::{
 };
 pub use error::ClientError;
 pub use reader::SessionEvent;
-pub use relay::{serve_relay, RelayChannel, RelayStream};
+pub use relay::{
+    put_file, serve_relay, serve_relay_with, QueryHandler, QueryStream, RelayChannel, RelayServices, RelayStream,
+    SessionOpener,
+};
 pub use snapshot::{snapshot, Snapshot, SnapshotSource};
 pub use spawn::{spawn, spawn_with_exe, SpawnSpec, SpawnedSession};
 pub use transport::{LocalTransport, Transport};

@@ -114,10 +114,21 @@ pub enum RemoteError {
     /// client offers [`START_DAEMON_LABEL`] rather than starting it unasked.
     #[error("Shelbi isn't running on {host}.")]
     DaemonStopped { host: String },
+    /// A native window's host changed while the window was away (another
+    /// version, or other protocols): the window no longer talks to it, and
+    /// offers [`REOPEN_LABEL`], which decides again
+    /// ([`crate::remote_window::reconnect_check`]).
+    #[error("{message}")]
+    NoLongerNative { host: String, message: String },
     /// Anything else, already worded for the dialog.
     #[error("{0}")]
     Failed(String),
 }
+
+/// The button a native remote window offers once its host no longer opens
+/// natively ([`RemoteError::NoLongerNative`]): open the project again, in
+/// whichever window the host gets now.
+pub const REOPEN_LABEL: &str = "Reopen";
 
 /// The host field's text as an SSH destination: trimmed, and refused when
 /// it is empty, holds whitespace, or starts with `-` (which `ssh` would read
@@ -152,6 +163,17 @@ pub trait RemoteConnector: Send + Sync {
     /// Start Shelbi's daemon on `host`, the way a client there would. Only
     /// ever on the user's say-so ([`START_DAEMON_LABEL`]).
     fn start_daemon(&self, host: &str) -> Result<(), RemoteError>;
+
+    /// Log in to `host` and read its whole listing (`shelbi remote list
+    /// --json`): its version and the protocols it speaks, which decide
+    /// whether a project there opens in a native window
+    /// ([`super::RemoteListing::window_decision`]), and its projects (a
+    /// native window's project switcher). Starts nothing. A connector that
+    /// can't read one answers [`RemoteError::Failed`], and the project opens
+    /// in the terminal view.
+    fn listing(&self, host: &str) -> Result<super::RemoteListing, RemoteError> {
+        Err(RemoteError::Failed(format!("Shelbi couldn't read {host}'s listing.")))
+    }
 }
 
 /// A scripted [`RemoteConnector`] for tests: hosts answer what they were
@@ -165,6 +187,8 @@ pub struct FakeRemote {
     searched: std::sync::Mutex<Vec<String>>,
     connected: std::sync::Mutex<Vec<RemoteSession>>,
     started: std::sync::Mutex<Vec<String>>,
+    /// Hosts whose listing names another version or no native capability.
+    versions: std::sync::Mutex<std::collections::HashMap<String, (String, Option<super::NativeCapability>)>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -212,6 +236,26 @@ impl FakeRemote {
     pub fn failing_connect(self, error: RemoteError) -> FakeRemote {
         *self.connect_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
         self
+    }
+
+    /// `host` runs Shelbi `version`, speaking `native` (`None`: a Shelbi
+    /// from before the native window). Unset, a host runs exactly this
+    /// build.
+    pub fn with_far_version(self, host: &str, version: &str, native: Option<super::NativeCapability>) -> FakeRemote {
+        self.versions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(host.to_string(), (version.to_string(), native));
+        self
+    }
+
+    /// [`Self::with_far_version`] on a fake already in use: `host` was
+    /// upgraded (or downgraded) while a window had it open.
+    pub fn set_far_version(&self, host: &str, version: &str, native: Option<super::NativeCapability>) {
+        self.versions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(host.to_string(), (version.to_string(), native));
     }
 
     /// The hosts searched, in order.
@@ -274,6 +318,38 @@ impl RemoteConnector for FakeRemote {
         self.stopped.lock().unwrap_or_else(|p| p.into_inner()).remove(&host);
         self.started.lock().unwrap_or_else(|p| p.into_inner()).push(host);
         Ok(())
+    }
+
+    fn listing(&self, host: &str) -> Result<super::RemoteListing, RemoteError> {
+        let host = validate_host(host)?;
+        let (user, sessions) = self.lock_hosts().get(&host).cloned().unwrap_or_else(|| {
+            Err(RemoteError::Unreachable {
+                host: host.clone(),
+                reason: "Could not resolve hostname".into(),
+            })
+        })?;
+        let (version, native) = self
+            .versions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&host)
+            .cloned()
+            .unwrap_or_else(|| (env!("CARGO_PKG_VERSION").to_string(), Some(super::NativeCapability::current())));
+        Ok(super::RemoteListing {
+            protocol: super::ssh::REMOTE_PROTOCOL,
+            version,
+            user,
+            daemon_running: !self.stopped.lock().unwrap_or_else(|p| p.into_inner()).contains(&host),
+            projects: sessions
+                .into_iter()
+                .map(|s| super::ssh::RemoteProject {
+                    name: s.project,
+                    label: s.label,
+                    path: s.path,
+                })
+                .collect(),
+            native,
+        })
     }
 }
 

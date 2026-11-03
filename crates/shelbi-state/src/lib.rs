@@ -23,6 +23,7 @@ mod agent_workspaces;
 pub mod board_index;
 pub mod change_bus;
 pub mod changelog;
+pub mod config_write;
 mod daemon_lifecycle;
 mod daemon_poller;
 pub mod disk;
@@ -2991,7 +2992,7 @@ pub fn task_path(project: &str, id: &str) -> Result<PathBuf> {
     Ok(tasks_dir(project)?.join(format!("{id}.md")))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IssueFile {
     pub task: Issue,
     pub body: String,

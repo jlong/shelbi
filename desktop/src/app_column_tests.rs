@@ -55,7 +55,7 @@ impl Column {
         h.window.update(&mut h.cx, |w, _| {
             w.clock = Rc::new(move || n.get());
             w.reduce_motion = Rc::new(move || r.get());
-            w.review_ops = o;
+            w.review_ops = Some(o);
             w.review_deps = Some(deps);
             w.workspace_deps = Some(ws_deps);
             w.model.reviews.push(row(ReviewState::Serving));

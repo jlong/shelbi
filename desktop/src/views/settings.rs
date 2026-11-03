@@ -79,6 +79,7 @@
 //! key this view doesn't own (the zen chord, the review editor, a newer
 //! client's settings). Every read and write runs on the background executor.
 
+use shelbi_app::source::ProjectHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -364,6 +365,8 @@ impl Drop for OpenForm {
 
 /// The settings view.
 pub struct SettingsView {
+    /// The window's project (its pages and editors read through its source).
+    project: ProjectHandle,
     /// The page shown.
     page: SettingsPage,
     /// The segmented controls, measured for their selection's slide.
@@ -441,7 +444,8 @@ pub struct SettingsView {
 }
 
 impl SettingsView {
-    pub fn new(project: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(handle: &ProjectHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let project = handle.name();
         let font_family = cx.new(|cx| FontPicker::new(PRIMARY_FAMILY.to_string(), window, cx));
         let font_size_input = cx.new(|cx| InputState::new(window, cx).default_value(size_text(DEFAULT_SIZE)));
         let defaults = cx.global::<Theme>().terminal.ansi;
@@ -459,9 +463,9 @@ impl SettingsView {
             pane
         });
         let keybindings = cx.new(|cx| KeybindingsPage::new(project, window, cx));
-        let workflows = cx.new(|cx| WorkflowsPage::new(project, window, cx));
-        let agents = cx.new(|cx| AgentsPage::new(project, window, cx));
-        let workspaces = cx.new(|cx| WorkspacesPage::new(project, window, cx));
+        let workflows = cx.new(|cx| WorkflowsPage::new(handle, window, cx));
+        let agents = cx.new(|cx| AgentsPage::new(handle, window, cx));
+        let workspaces = cx.new(|cx| WorkspacesPage::new(handle, window, cx));
         let range = |r: &std::ops::RangeInclusive<u8>| *r.start() as i32..=*r.end() as i32;
         let initial = Translucency::default();
         let opacity_slider = cx.new(|cx| {
@@ -545,6 +549,7 @@ impl SettingsView {
             }));
         }
         let mut view = SettingsView {
+            project: handle.clone(),
             page: SettingsPage::default(),
             font_family,
             font_size: DEFAULT_SIZE,
@@ -685,7 +690,12 @@ impl SettingsView {
                     });
                     return;
                 };
-                let home = std::env::var_os("HOME").map(PathBuf::from);
+                // A far machine's directory isn't under this Mac's home.
+                let home = if self.project.link.is_remote() {
+                    None
+                } else {
+                    std::env::var_os("HOME").map(PathBuf::from)
+                };
                 machine_form_state::configure(&project, &row.config, row.workspaces, home.as_deref())
             }
             // The window's workspace dialog (`ShelbiWindow::open_pool_form`).
@@ -695,7 +705,12 @@ impl SettingsView {
             return;
         }
         let restore = window.focused(cx);
-        let engine = machine_form::Engine::current(cx);
+        // A remote project's machines are saved and checked by the far hub.
+        let engine = if self.project.link.is_remote() {
+            machine_form::Engine::far(&self.project.link)
+        } else {
+            machine_form::Engine::current(cx)
+        };
         let view = cx.new(|cx| MachineFormView::new(form, engine, window, cx));
         let sub = cx.subscribe_in(&view, window, |this, _, event: &MachineFormEvent, window, cx| {
             let saved = matches!(event, MachineFormEvent::Saved(_));
@@ -753,7 +768,7 @@ impl SettingsView {
     /// as last loaded (a save checks the files haven't changed since).
     pub fn open_editor(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let config = self.workflows.read(cx).state().config().cloned();
-        let project = self.workflows.read(cx).state().project().to_string();
+        let project = self.project.clone();
         let editor = cx.new(|cx| WorkflowEditor::new(&project, name, config, window, cx));
         let sub = cx.subscribe_in(&editor, window, |this, _, event: &EditorEvent, window, cx| {
             this.close_editor(*event == EditorEvent::ManageStatuses, window, cx)
@@ -793,7 +808,7 @@ impl SettingsView {
     /// model as last loaded (a save checks the files haven't changed since).
     pub fn open_agent_editor(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let config = self.agents.read(cx).state().config().cloned();
-        let project = self.agents.read(cx).state().project().to_string();
+        let project = self.project.clone();
         let editor = cx.new(|cx| AgentEditor::new(&project, name, config, window, cx));
         let sub = cx.subscribe_in(&editor, window, |this, _, event: &AgentEditorEvent, window, cx| match event {
             AgentEditorEvent::Close => this.close_agent_editor(SettingsPage::Agents, window, cx),

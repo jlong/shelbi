@@ -315,7 +315,8 @@ impl Cursor {
 /// apart from "the board hasn't loaded yet" — the distinction a plain
 /// `Vec<IssueFile>` can't carry, and the reason a cold render used to either
 /// block on the network or lie with a blank board.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BoardState {
     /// Fresh data: within the cache TTL, or a local `file_system` board (whose
     /// reads are always authoritative). Render it directly.
@@ -326,6 +327,7 @@ pub enum BoardState {
     Stale(Vec<IssueFile>),
     /// No data at all — a genuine first run with no snapshot yet. The caller
     /// should paint its chrome plus a loading indicator, never an empty board.
+    #[default]
     Cold,
 }
 

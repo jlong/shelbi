@@ -133,6 +133,7 @@ pub fn command_model_from(
         // Connect to Remote Session dialog.
         launch_screen: false,
         remote_connect: false,
+        remote_host: None,
     }
 }
 

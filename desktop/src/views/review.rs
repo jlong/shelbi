@@ -53,6 +53,7 @@
 //! ([`ReviewView::hold_content`]), so the session's connect, replay and
 //! first layout land after the push has settled, not in its frames.
 
+use shelbi_app::source::ProjectHandle;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -104,14 +105,24 @@ pub trait ReviewOps: Send + Sync {
     }
 }
 
-/// The real thing: the orchestrator's review state, the daemon's control
-/// socket, and `open`.
-pub struct LiveOps;
+/// The real thing: the review state read through the window's project
+/// source, the daemon's session ops through its link, and `open`. Answers
+/// for the window's project only (the `project` its methods are handed).
+pub struct LiveOps {
+    project: ProjectHandle,
+}
+
+impl LiveOps {
+    pub fn new(project: ProjectHandle) -> Self {
+        LiveOps { project }
+    }
+}
 
 impl ReviewOps for LiveOps {
     fn resolve(&self, project: &str, task: &str) -> Result<ReviewTarget, String> {
-        use shelbi_orchestrator::review_session::{review_open_target, ReviewOpenTarget};
-        match review_open_target(project, task).map_err(|e| e.to_string())? {
+        use shelbi_app::source::ReviewOpenTarget;
+        debug_assert_eq!(project, self.project.name());
+        match self.project.source.review_open_target(task)? {
             ReviewOpenTarget::Serving(info) => {
                 let (title, body) = info
                     .task
@@ -134,7 +145,7 @@ impl ReviewOps for LiveOps {
             ReviewOpenTarget::Queued { title } => {
                 // The free slots only: a busy slot is left to its occupant,
                 // never evicted (the TUI's load).
-                let all = shelbi_orchestrator::load::review_slots(project).map_err(|e| e.to_string())?;
+                let all = self.project.source.review_slots()?;
                 let total_slots = all.len();
                 let free_slots = all
                     .into_iter()
@@ -151,12 +162,18 @@ impl ReviewOps for LiveOps {
     }
 
     fn session_op(&self, project: &str, task: &str, op: ReviewSessionOp) -> Result<(), String> {
-        shelbi_app::review_session(project, task, op, &mut |_, _| {})
+        debug_assert_eq!(project, self.project.name());
+        self.project
+            .link
+            .review_session(task, op, &mut |_, _| {})
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
     fn open_in_app(&self, project: &str, task: &str, role: ReviewRole) -> Result<(), String> {
+        if let Some(host) = self.project.key().host() {
+            return Err(shelbi_app::remote_window::local_open_unavailable(host));
+        }
         shelbi_orchestrator::review_session::open_in_app(project, task, role.into())
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -167,11 +184,17 @@ impl ReviewOps for LiveOps {
     }
 
     fn reveal(&self, path: &str) -> Result<(), String> {
+        if let Some(host) = self.project.key().host() {
+            return Err(shelbi_app::remote_window::local_open_unavailable(host));
+        }
         run_open(path)
     }
 
     fn shell_op(&self, project: &str, slot: &str, op: WorkspaceSessionOp) -> Result<(), String> {
-        shelbi_app::workspace_session(project, slot, op, &mut |_, _| {})
+        debug_assert_eq!(project, self.project.name());
+        self.project
+            .link
+            .workspace_session(slot, op, &mut |_, _| {})
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -201,15 +224,19 @@ pub struct ReviewDeps {
 
 impl ReviewDeps {
     /// The real daemon and sessions for `project`.
-    pub fn live(project: &str) -> Self {
-        let project = project.to_string();
+    pub fn live(project: &ProjectHandle) -> Self {
+        let handle = project.clone();
         Self {
-            ops: Arc::new(LiveOps),
+            ops: Arc::new(LiveOps::new(project.clone())),
             sessions: Rc::new(move |task| {
-                SessionDeps::live_with(Arc::new(ReviewRelauncher {
-                    project: project.clone(),
-                    task: task.to_string(),
-                }))
+                SessionDeps::live_with(
+                    &handle.link,
+                    Arc::new(ReviewRelauncher {
+                        project: handle.name().to_string(),
+                        task: task.to_string(),
+                        link: Some(handle.link.clone()),
+                    }),
+                )
             }),
         }
     }

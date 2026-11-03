@@ -28,6 +28,8 @@
 //! front after one, the files are read again to show the hand edit, as they
 //! are each time the page is shown.
 
+use std::sync::Arc;
+use shelbi_app::source::{ProjectHandle, ProjectSource};
 use std::path::PathBuf;
 
 use gpui::{
@@ -74,6 +76,10 @@ pub enum AgentsEvent {
 /// The Agents page.
 pub struct AgentsPage {
     state: AgentsState,
+    /// The window's project, read through its source.
+    source: Arc<dyn ProjectSource>,
+    /// The window's project, saved through it (wherever it lives).
+    handle: ProjectHandle,
     /// The new row's name field.
     draft_input: Entity<InputState>,
     /// The shared instructions' text area, while they're being edited.
@@ -91,7 +97,8 @@ pub struct AgentsPage {
 }
 
 impl AgentsPage {
-    pub fn new(project: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(handle: &ProjectHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let project = handle.name();
         let draft_input = cx.new(|cx| InputState::new(window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&draft_input, window, |this, _, event: &InputEvent, window, cx| {
@@ -107,6 +114,8 @@ impl AgentsPage {
         ];
         let mut page = AgentsPage {
             state: AgentsState::new(project),
+            source: handle.source.clone(),
+            handle: handle.clone(),
             draft_input,
             shared_input: None,
             menu: None,
@@ -125,10 +134,8 @@ impl AgentsPage {
     /// Read the project's agents off the UI thread (again, to pick up hand
     /// edits) and show them.
     pub fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.state.project().to_string();
-        let read = cx
-            .background_executor()
-            .spawn(async move { AgentsConfig::load(&project).map_err(|e| e.to_string()) });
+        let source = self.source.clone();
+        let read = cx.background_executor().spawn(async move { source.agents_config() });
         cx.spawn_in(window, async move |this, cx| {
             let config = read.await;
             this.update(cx, |this, cx| {
@@ -197,10 +204,10 @@ impl AgentsPage {
 
     /// Save one edit off the UI thread; when it lands, start the next.
     fn start(&mut self, (config, edit): (AgentsConfig, Edit), window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.state.project().to_string();
+        let store = self.handle.clone();
         let save = cx
             .background_executor()
-            .spawn(async move { commit(&project, &config, edit) });
+            .spawn(async move { commit(&store, &config, edit) });
         cx.spawn_in(window, async move |this, cx| {
             let done = save.await;
             this.update_in(cx, |this, window, cx| this.committed(done, window, cx)).ok();
@@ -300,6 +307,17 @@ impl AgentsPage {
         self.menu = None;
         self.reload_on_return = true;
         let target = Target::Agent(name.to_string());
+        if self.handle.link.is_remote() {
+            // The file is on the far machine: an editor session there.
+            let path = dir.join("agent.yaml").to_string_lossy().into_owned();
+            let file = shelbi_app::far::FarFile::path(path);
+            super::far_editor::open_from(&self.handle.link, file, "agent.yaml".into(), cx, move |this: &mut Self, e, cx| {
+                this.state.set_error(target, e);
+                cx.notify();
+            });
+            cx.notify();
+            return;
+        }
         let open = cx.background_executor().spawn(async move {
             let path = dir.join("agent.yaml");
             if !path.exists() {

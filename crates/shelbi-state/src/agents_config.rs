@@ -121,7 +121,8 @@ use crate::agent_workspaces::{
     bundled_agent_manifest_yaml, BundledAgent, DEFAULT_AGENTS, SHARED_AGENT_DIR,
     SHARED_PREAMBLE_FILE,
 };
-use crate::{yaml_edit, AgentDivergence};
+use crate::workflow_config::WorkflowFile;
+use crate::{config_write, yaml_edit, AgentDivergence};
 
 const MANIFEST_FILE: &str = "agent.yaml";
 const INSTRUCTIONS_FILE: &str = "instructions.md";
@@ -129,9 +130,6 @@ const SKILLS_DIR: &str = "skills";
 const SKILL_FILE: &str = "SKILL.md";
 /// An agent directory's files, by `/`-separated path relative to it.
 type Files = BTreeMap<String, Vec<u8>>;
-
-/// Deeper than any real skill tree; stops a symlink loop.
-const MAX_DEPTH: usize = 16;
 
 /// Why an edit, load or save was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -174,9 +172,24 @@ pub enum AgentError {
     /// written; reload and redo the edit.
     #[error("changed on disk since it was loaded: {}", display_paths(.0))]
     Conflict(Vec<PathBuf>),
+    /// Files changed on `host` (a project on another machine) since the
+    /// model was loaded. Nothing was written there.
+    #[error("changed on {host} since it was loaded: {}", display_paths(.paths))]
+    ChangedOn { host: String, paths: Vec<PathBuf> },
     /// A file couldn't be read, parsed or written.
     #[error("{path}: {message}")]
     File { path: PathBuf, message: String },
+}
+
+impl From<config_write::WriteError> for AgentError {
+    fn from(e: config_write::WriteError) -> Self {
+        match e {
+            config_write::WriteError::Changed(paths) => AgentError::Conflict(paths),
+            config_write::WriteError::Refused { path, message } | config_write::WriteError::Io { path, message } => {
+                AgentError::File { path, message }
+            }
+        }
+    }
 }
 
 fn display_paths(paths: &[PathBuf]) -> String {
@@ -452,6 +465,39 @@ enum Origin {
     New,
 }
 
+/// The files an [`AgentsConfig`] is built from, as read
+/// ([`AgentsConfig::read_files`]) and not yet parsed. Serializable: a far
+/// machine sends them to a remote window, which parses them with the same
+/// loader ([`AgentsConfig::from_files`]). The paths are the far machine's.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AgentsFiles {
+    pub project: String,
+    pub dir: PathBuf,
+    /// Every agent directory's files.
+    pub agents: Vec<AgentDirFiles>,
+    pub preamble_path: PathBuf,
+    /// The shared preamble; `None` when the file doesn't exist.
+    pub preamble: Option<String>,
+    /// `deployed_agent_defaults` from the project state.
+    pub deployed: BTreeMap<String, String>,
+    /// The status catalog's text, for the statuses that name each agent.
+    pub statuses_text: Option<String>,
+    /// The workflow files, for the statuses that name each agent.
+    pub workflows: Vec<WorkflowFile>,
+    /// The project YAML, for its runner pins and overrides.
+    pub project_text: Option<String>,
+}
+
+/// One agent directory's files, by `/`-separated relative path.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct AgentDirFiles {
+    pub name: String,
+    pub path: PathBuf,
+    pub files: BTreeMap<String, Vec<u8>>,
+}
+
 /// What a save did.
 #[derive(Debug, Clone)]
 pub struct Saved {
@@ -462,6 +508,27 @@ pub struct Saved {
     /// Comments an `agent.yaml` lost: lines whose entry the edit removed, or
     /// the whole file's when its layout couldn't be followed.
     pub dropped_comments: Vec<(PathBuf, Vec<String>)>,
+}
+
+/// A save, planned ([`AgentsConfig::save_plan`]) and not yet written.
+#[derive(Debug, Clone)]
+pub struct SavePlan {
+    pub plan: config_write::Plan,
+    pub written: Vec<PathBuf>,
+    pub removed: Vec<PathBuf>,
+    pub dropped_comments: Vec<(PathBuf, Vec<String>)>,
+}
+
+impl SavePlan {
+    /// What the save did, once its plan ran and `config` was read back.
+    pub fn saved(self, config: AgentsConfig) -> Saved {
+        Saved {
+            config,
+            written: self.written,
+            removed: self.removed,
+            dropped_comments: self.dropped_comments,
+        }
+    }
 }
 
 /// The editable agents and shared instructions of one project.
@@ -511,13 +578,70 @@ impl AgentsConfig {
     /// Load `project`'s agents, shared instructions and the workflow
     /// statuses that name each agent.
     pub fn load(project: &str) -> Result<Self> {
+        Self::from_files(Self::read_files(project)?)
+    }
+
+    /// Read every file [`load`](Self::load) builds the model from, without
+    /// parsing them: what a far machine sends a remote window, which builds
+    /// the model with [`from_files`](Self::from_files), the same loader.
+    pub fn read_files(project: &str) -> Result<AgentsFiles> {
         let dir = crate::agents_dir(project).map_err(other)?;
-        let mut loaded = BTreeMap::new();
         let mut agents = Vec::new();
-        let mut unreadable = Vec::new();
         for name in crate::list_agents(project).map_err(other)? {
             let path = dir.join(&name);
             let files = snapshot(&path)?;
+            agents.push(AgentDirFiles { name, path, files });
+        }
+        let preamble_path = dir.join(SHARED_AGENT_DIR).join(SHARED_PREAMBLE_FILE);
+        let preamble = read_optional(&preamble_path)?;
+        let deployed = crate::read_state(project)
+            .map(|s| s.deployed_agent_defaults.into_iter().collect())
+            .unwrap_or_default();
+        let statuses_path = crate::workflows::statuses_read_path(project).map_err(other)?;
+        let statuses_text = read_optional(&statuses_path)?;
+        let workflows_dir = crate::workflows_dir(project).map_err(other)?;
+        let mut workflows = Vec::new();
+        for (stem, path) in crate::workflow_config::workflow_files(&workflows_dir)
+            .map_err(|e| file_err(&workflows_dir, e))?
+        {
+            if let Some(text) = read_optional(&path)? {
+                workflows.push(WorkflowFile { stem, path, text });
+            }
+        }
+        let project_text = crate::workflow_config::project_config_file(project)
+            .ok()
+            .and_then(|path| read_optional(&path).ok().flatten());
+        Ok(AgentsFiles {
+            project: project.to_string(),
+            dir,
+            agents,
+            preamble_path,
+            preamble,
+            deployed,
+            statuses_text,
+            workflows,
+            project_text,
+        })
+    }
+
+    /// The model over `files` as [`read_files`](Self::read_files) read them.
+    /// Reads nothing.
+    pub fn from_files(files: AgentsFiles) -> Result<Self> {
+        let AgentsFiles {
+            project,
+            dir,
+            agents: dirs,
+            preamble_path,
+            preamble,
+            deployed,
+            statuses_text,
+            workflows,
+            project_text,
+        } = files;
+        let mut loaded = BTreeMap::new();
+        let mut agents = Vec::new();
+        let mut unreadable = Vec::new();
+        for AgentDirFiles { name, path, files } in dirs {
             match parse_agent(&name, &files) {
                 Ok((manifest, instructions)) => {
                     let mut rest = files.clone();
@@ -542,20 +666,18 @@ impl AgentsConfig {
             (rank.unwrap_or(usize::MAX), a.name.clone())
         });
 
-        let preamble_path = dir.join(SHARED_AGENT_DIR).join(SHARED_PREAMBLE_FILE);
-        let preamble = read_optional(&preamble_path)?;
-        let deployed = crate::read_state(project)
-            .map(|s| s.deployed_agent_defaults.into_iter().collect())
-            .unwrap_or_default();
+        let project_yaml = project_text
+            .as_deref()
+            .and_then(|text| serde_yaml::from_str::<Value>(text).ok());
         Ok(AgentsConfig {
-            project: project.to_string(),
+            project,
             agents,
             shared_instructions: preamble.clone().unwrap_or_default(),
             unreadable,
             disk: Arc::new(Disk {
-                assignments: load_assignments(project)?,
-                pinned: load_pins(project),
-                overrides: load_overrides(project),
+                assignments: assignments_from(statuses_text.as_deref(), &workflows),
+                pinned: pins_from(project_yaml.as_ref()),
+                overrides: overrides_from(project_yaml.as_ref()),
                 dir,
                 agents: loaded,
                 preamble_path,
@@ -1025,70 +1147,91 @@ impl AgentsConfig {
     /// preamble) changed on disk since the load, or a new agent's directory
     /// appeared.
     pub fn save(&self) -> Result<Saved> {
-        let plan = self.plan()?;
-        let mut conflicts = Vec::new();
-        for op in &plan {
+        let plan = self.save_plan()?;
+        config_write::check_and_run(&plan.plan).map_err(AgentError::from)?;
+        Ok(plan.saved(AgentsConfig::load(&self.project)?))
+    }
+
+    /// What [`save`](Self::save) does, as a [`config_write::Plan`]: each
+    /// agent directory (and the preamble) it changes as loaded, by content
+    /// hash, and each new directory absent; then removals, renames through
+    /// a parking name (so a swap or chain works), new directories, edits and
+    /// the preamble. A window on a project on another machine sends this to
+    /// that machine's daemon instead of writing it here.
+    pub fn save_plan(&self) -> Result<SavePlan> {
+        let ops = self.plan()?;
+        let mut plan = config_write::Plan::new(config_write::Surface::Agents);
+        let loaded_hash = |dir: &Path| {
+            let name = file_name(dir);
+            Some(config_write::dir_hash(&self.disk.agents[&name].files))
+        };
+        for op in &ops {
             match op {
                 Op::Remove { dir, .. } | Op::Rename { from: dir, .. } | Op::Edit { dir, .. } => {
-                    let name = file_name(dir);
-                    if snapshot(dir).ok().as_ref() != Some(&self.disk.agents[&name].files) {
-                        conflicts.push(dir.clone());
-                    }
+                    plan.checks.push(config_write::Check::Dir {
+                        path: dir.clone(),
+                        hash: loaded_hash(dir),
+                    });
                 }
                 Op::Create { .. } | Op::Preamble { .. } => {}
             }
         }
         // A new or renamed-to directory must not exist, unless the save
         // first moves or removes what's there.
-        let freed: Vec<&PathBuf> = plan
+        let freed: Vec<&PathBuf> = ops
             .iter()
             .filter_map(|op| match op {
                 Op::Remove { dir, .. } | Op::Rename { from: dir, .. } => Some(dir),
                 _ => None,
             })
             .collect();
-        for op in &plan {
+        for op in &ops {
             let target = match op {
                 Op::Create { dir, .. } | Op::Rename { to: dir, .. } => dir,
                 _ => continue,
             };
-            if target.exists() && !freed.contains(&target) {
-                conflicts.push(target.clone());
+            if !freed.contains(&target) {
+                plan.checks.push(config_write::Check::Dir {
+                    path: target.clone(),
+                    hash: None,
+                });
             }
         }
-        if plan.iter().any(|op| matches!(op, Op::Preamble { .. }))
-            && read_optional(&self.disk.preamble_path)? != self.disk.preamble
-        {
-            conflicts.push(self.disk.preamble_path.clone());
-        }
-        conflicts.dedup();
-        if !conflicts.is_empty() {
-            return Err(AgentError::Conflict(conflicts));
+        if ops.iter().any(|op| matches!(op, Op::Preamble { .. })) {
+            plan.checks.push(config_write::Check::File {
+                path: self.disk.preamble_path.clone(),
+                hash: self
+                    .disk
+                    .preamble
+                    .as_deref()
+                    .map(|t| config_write::content_hash(t.as_bytes())),
+            });
         }
 
         let mut written = Vec::new();
         let mut removed = Vec::new();
         let mut dropped_comments = Vec::new();
-        // Removals, then renames through a parking name (so a swap or chain
-        // works), then new directories, then edits.
-        for op in &plan {
+        for op in &ops {
             if let Op::Remove { dir } = op {
-                fs::remove_dir_all(dir).map_err(|e| file_err(dir, e))?;
+                plan.ops.push(config_write::Op::RemoveDir { path: dir.clone() });
                 removed.push(dir.clone());
             }
         }
         let mut parked = Vec::new();
-        for op in &plan {
+        for op in &ops {
             if let Op::Rename { from, to } = op {
                 let park = self.disk.dir.join(format!(".renaming-{}", file_name(from)));
-                fs::rename(from, &park).map_err(|e| file_err(from, e))?;
+                plan.ops.push(config_write::Op::Rename {
+                    from: from.clone(),
+                    to: park.clone(),
+                });
                 parked.push((park, to.clone()));
             }
         }
         for (park, to) in parked {
-            fs::rename(&park, &to).map_err(|e| file_err(&to, e))?;
+            plan.ops.push(config_write::Op::Rename { from: park, to });
         }
-        for op in &plan {
+        for op in &ops {
             match op {
                 Op::Create {
                     dir,
@@ -1101,20 +1244,27 @@ impl AgentsConfig {
                     comments,
                     ..
                 } => {
-                    crate::ensure_dir(&dir.join(SKILLS_DIR)).map_err(|e| file_err(dir, e))?;
+                    plan.ops.push(config_write::Op::EnsureDir {
+                        path: dir.join(SKILLS_DIR),
+                    });
                     for (rel, change) in files {
                         let path = dir.join(rel);
                         match change {
                             Some(bytes) => {
-                                if let Some(parent) = path.parent() {
-                                    crate::ensure_dir(parent).map_err(|e| file_err(parent, e))?;
-                                }
-                                crate::atomic_write(&path, bytes)
-                                    .map_err(|e| file_err(&path, e))?;
+                                plan.ops.push(config_write::Op::Write {
+                                    path: path.clone(),
+                                    contents: config_write::Contents::from_bytes(bytes.clone()),
+                                });
                                 written.push(path);
                             }
                             None => {
-                                remove_file_and_empty_parents(&path, dir)?;
+                                plan.ops.push(config_write::Op::RemoveFile {
+                                    path: path.clone(),
+                                    prune: Some(config_write::Prune {
+                                        root: dir.clone(),
+                                        keep: vec![dir.join(SKILLS_DIR)],
+                                    }),
+                                });
                                 removed.push(path);
                             }
                         }
@@ -1124,18 +1274,18 @@ impl AgentsConfig {
                     }
                 }
                 Op::Preamble { text } => {
-                    let path = &self.disk.preamble_path;
-                    if let Some(parent) = path.parent() {
-                        crate::ensure_dir(parent).map_err(|e| file_err(parent, e))?;
-                    }
-                    crate::atomic_write(path, text.as_bytes()).map_err(|e| file_err(path, e))?;
-                    written.push(path.clone());
+                    let path = self.disk.preamble_path.clone();
+                    plan.ops.push(config_write::Op::Write {
+                        path: path.clone(),
+                        contents: config_write::Contents::Text(text.clone()),
+                    });
+                    written.push(path);
                 }
                 Op::Remove { .. } | Op::Rename { .. } => {}
             }
         }
-        Ok(Saved {
-            config: AgentsConfig::load(&self.project)?,
+        Ok(SavePlan {
+            plan,
             written,
             removed,
             dropped_comments,
@@ -1427,20 +1577,16 @@ fn patch_manifest(
 
 /// Every workflow status that names an agent, by agent. Read leniently, so a
 /// workflow the loader would reject still counts.
-fn load_assignments(project: &str) -> Result<BTreeMap<String, Vec<Assignment>>> {
-    let statuses_path = crate::workflows::statuses_read_path(project).map_err(other)?;
-    let catalog = read_optional(&statuses_path)?
-        .and_then(|text| ProjectStatuses::from_yaml_str(&text).ok())
+fn assignments_from(
+    statuses_text: Option<&str>,
+    workflows: &[WorkflowFile],
+) -> BTreeMap<String, Vec<Assignment>> {
+    let catalog = statuses_text
+        .and_then(|text| ProjectStatuses::from_yaml_str(text).ok())
         .unwrap_or_else(shelbi_core::default_project_statuses);
-    let dir = crate::workflows_dir(project).map_err(other)?;
     let mut out: BTreeMap<String, Vec<Assignment>> = BTreeMap::new();
-    for (stem, path) in
-        crate::workflow_config::workflow_files(&dir).map_err(|e| file_err(&dir, e))?
-    {
-        let Some(text) = read_optional(&path)? else {
-            continue;
-        };
-        let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+    for WorkflowFile { stem, text, .. } in workflows {
+        let Ok(value) = serde_yaml::from_str::<Value>(text) else {
             continue;
         };
         let Some(items) = value.get("statuses").and_then(Value::as_sequence) else {
@@ -1464,7 +1610,7 @@ fn load_assignments(project: &str) -> Result<BTreeMap<String, Vec<Assignment>>> 
             });
         }
     }
-    Ok(out)
+    out
 }
 
 /// What a project YAML sets over its agents' own preferences, as dispatch
@@ -1481,15 +1627,9 @@ struct ProjectOverrides {
 
 /// The project YAML's overrides, read leniently: a value that doesn't
 /// parse is left out (dispatch would refuse the file anyway).
-fn load_overrides(project: &str) -> ProjectOverrides {
+fn overrides_from(value: Option<&Value>) -> ProjectOverrides {
     let mut out = ProjectOverrides::default();
-    let Ok(path) = crate::workflow_config::project_config_file(project) else {
-        return out;
-    };
-    let Ok(Some(text)) = read_optional(&path) else {
-        return out;
-    };
-    let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+    let Some(value) = value else {
         return out;
     };
     fn parse<T: serde::de::DeserializeOwned>(v: Option<&Value>) -> Option<T> {
@@ -1522,14 +1662,8 @@ fn load_overrides(project: &str) -> ProjectOverrides {
 }
 
 /// The agents the project YAML pins a runner for (`agents.<name>:`).
-fn load_pins(project: &str) -> Vec<String> {
-    let Ok(path) = crate::workflow_config::project_config_file(project) else {
-        return Vec::new();
-    };
-    let Ok(Some(text)) = read_optional(&path) else {
-        return Vec::new();
-    };
-    let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+fn pins_from(value: Option<&Value>) -> Vec<String> {
+    let Some(value) = value else {
         return Vec::new();
     };
     value
@@ -1543,60 +1677,10 @@ fn load_pins(project: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every file under `dir`, by `/`-separated relative path, reading through
-/// symlinks. Empty when `dir` doesn't exist.
+/// Every file under `dir`, by `/`-separated relative path, following
+/// symlinks ([`config_write::snapshot`]). Empty when `dir` doesn't exist.
 fn snapshot(dir: &Path) -> Result<Files> {
-    let mut out = BTreeMap::new();
-    if dir.is_dir() {
-        walk(dir, "", 0, &mut out)?;
-    }
-    Ok(out)
-}
-
-fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Files) -> Result<()> {
-    if depth > MAX_DEPTH {
-        return Err(file_err(dir, "is nested too deeply (a symlink loop?)"));
-    }
-    for entry in fs::read_dir(dir).map_err(|e| file_err(dir, e))? {
-        let entry = entry.map_err(|e| file_err(dir, e))?;
-        let path = entry.path();
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        let rel = format!("{prefix}{name}");
-        // A dangling symlink has nothing to read; skip it like the mount
-        // would fail to.
-        let Ok(meta) = fs::metadata(&path) else {
-            continue;
-        };
-        if meta.is_dir() {
-            walk(&path, &format!("{rel}/"), depth + 1, out)?;
-        } else {
-            out.insert(rel, fs::read(&path).map_err(|e| file_err(&path, e))?);
-        }
-    }
-    Ok(())
-}
-
-/// Remove `path`, then any directories it leaves empty, up to `root`.
-fn remove_file_and_empty_parents(path: &Path, root: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(file_err(path, e)),
-    }
-    let skills = root.join(SKILLS_DIR);
-    let mut dir = path.parent();
-    while let Some(d) = dir {
-        if d == root || d == skills || !d.starts_with(root) {
-            break;
-        }
-        if fs::remove_dir(d).is_err() {
-            break;
-        }
-        dir = d.parent();
-    }
-    Ok(())
+    config_write::snapshot(dir).map_err(|e| file_err(dir, e))
 }
 
 /// A skill name the runner accepts: lowercase letters, digits and `-`,

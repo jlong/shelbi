@@ -626,7 +626,8 @@ fn fetched_at_is_stale(fetched_at: &str, interval_secs: u64) -> bool {
 
 /// Where a board read came from — the provenance a staleness banner needs to
 /// tell "the daemon's index" apart from "this process's own cache fallback".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BoardSource {
     /// A local `file_system` board read straight from disk — always
     /// authoritative, so it carries no freshness banner.
@@ -641,17 +642,20 @@ pub enum BoardSource {
     CacheFallback,
     /// No board data at all yet: a remote project whose daemon is up (the socket
     /// answers) but hasn't published a first index. Renders as a loading state.
+    #[default]
     None,
 }
 
 /// Which backend read path last produced the index — surfaced by `shelbi status`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReadPath {
     /// The GraphQL board reader (the healthy path).
     Graphql,
     /// The REST fallback (GHES without `filterBy.since`, missing scope, a blip).
     RestFallback,
     /// Not known — a local board, a cache fallback, or no index yet.
+    #[default]
     Unknown,
 }
 
@@ -670,7 +674,11 @@ impl ReadPath {
 /// [`read_board_report`]. Everything a staleness banner or the `shelbi status`
 /// GitHub section needs: where the board came from, whether it is stale, how old
 /// it is, the token budget behind it, and which read path produced it.
-#[derive(Debug, Clone)]
+///
+/// Serializable for the remote window's query service; `#[serde(default)]` so a
+/// field added later still decodes from an older peer's JSON.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BoardFreshness {
     /// Provenance of the board (index / cache fallback / local / none).
     pub source: BoardSource,
@@ -745,7 +753,10 @@ impl BoardFreshness {
 /// A board read plus its freshness envelope — the richer read the staleness UI
 /// and `shelbi status` use, where the plain [`read_board`] returns only the
 /// [`BoardState`].
-#[derive(Debug, Clone)]
+///
+/// Serializable for the remote window's query service (see [`BoardFreshness`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BoardReport {
     /// The renderable board state (the same three-state value [`read_board`]
     /// returns). Destructive gating still keys off `Warm` here.
@@ -1142,6 +1153,60 @@ mod tests {
             body: String::new(),
             tracker_assignees: Vec::new(),
         }
+    }
+
+    /// `BoardReport` is a remote-window wire type: pin its JSON shape, decode
+    /// it back equal, and decode `{}` (every field defaults; a missing board
+    /// is cold, never an empty warm one).
+    #[test]
+    fn board_report_json_shape_is_pinned() {
+        let report = BoardReport {
+            state: BoardState::Stale(vec![issue("t-1", "review", 0)]),
+            freshness: BoardFreshness {
+                source: BoardSource::CacheFallback,
+                stale: true,
+                age_secs: Some(240),
+                remaining: Some(4000),
+                reset: Some(1_793_000_000),
+                read_path: ReadPath::RestFallback,
+            },
+        };
+        let expected = serde_json::json!({
+            "state": { "stale": [{
+                "task": {
+                    "id": "t-1",
+                    "title": "t-1",
+                    "column": "review",
+                    "priority": 0,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z"
+                },
+                "body": ""
+            }] },
+            "freshness": {
+                "source": "cache_fallback",
+                "stale": true,
+                "age_secs": 240,
+                "remaining": 4000,
+                "reset": 1_793_000_000,
+                "read_path": "rest_fallback"
+            }
+        });
+        assert_eq!(serde_json::to_value(&report).unwrap(), expected);
+        let back: BoardReport = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, report);
+
+        for state in [BoardState::Warm(vec![]), BoardState::Cold] {
+            let json = serde_json::to_string(&state).unwrap();
+            assert_eq!(serde_json::from_str::<BoardState>(&json).unwrap(), state);
+        }
+        assert_eq!(serde_json::to_value(BoardState::Cold).unwrap(), "cold");
+
+        let empty: BoardReport = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, BoardReport::default());
+        assert_eq!(empty.state, BoardState::Cold);
+        assert_eq!(empty.freshness.source, BoardSource::None);
+        assert_eq!(empty.freshness.read_path, ReadPath::Unknown);
     }
 
     fn temp_index_path(tag: &str) -> PathBuf {

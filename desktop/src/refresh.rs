@@ -6,17 +6,21 @@
 //! project (`crate::feeds`):
 //!
 //! - a [`shelbi_app::spawn_refresher`] worker that runs the injected reader
-//!   (the shared `shelbi_orchestrator::sidebar_model::read_sidebar_model`) and
+//!   (the window's project source's `sidebar`, the shared sidebar model) and
 //!   publishes immutable [`Snapshot`]s;
-//! - the hub-socket change subscriber ([`shelbi_app::changes`]), which wakes a
-//!   refresh whenever the daemon's poller sees a board or workspace change;
-//! - the hub-socket layout subscriber ([`shelbi_app::layout_sub`]), whose
+//! - the project link's change subscription ([`shelbi_app::changes`] over
+//!   this machine's hub socket), which wakes a refresh whenever the daemon's
+//!   poller sees a board or workspace change;
+//! - the link's layout subscription ([`shelbi_app::layout_sub`]), whose
 //!   events (a review slot opening or closing) cross to the window as
 //!   [`FeedEvent::Layout`];
 //! - a polling fallback: while that subscription is down (no daemon), the feed
 //!   refreshes on the TUI's cadence and reports [`DaemonLink::Polling`] so the
 //!   sidebar can show it; when the daemon comes back the subscription
 //!   reconnects on its own and the link flips back to [`DaemonLink::Live`].
+//!   A project on another machine polls (and safety-refreshes) more slowly
+//!   ([`FeedTiming::remote`]): each of its reads is a round trip over the
+//!   host's relay plus the far read.
 //!
 //! App-wide, one [`ControlWatcher`] holds a subscription on the daemon's
 //! control socket for [`Notice::Changed`], the only source that sees a
@@ -25,7 +29,8 @@
 //! Session events (title, exit) arrive from the terminal views'
 //! `shelbi-client` connections through a feed's [`SessionSink`]. The
 //! orchestrator's title is also probed after every refresh
-//! ([`orchestrator_title`]), since its chat is only attached while shown and
+//! (`ProjectLink::orchestrator_title`, over the host's relay for a remote
+//! project), since its chat is only attached while shown and
 //! its `shelbi:<state>` marker drives the "orchestrator is waiting" notice.
 //!
 //! Nothing here ever blocks the caller: spawning returns at once, a refresh
@@ -41,6 +46,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use shelbi_app::source::{ProjectHandle, ProjectSource};
 use shelbi_app::{spawn_refresher, Snapshot};
 use shelbi_client::{ControlClient, Notice, SessionEvent};
 
@@ -48,14 +54,15 @@ use shelbi_client::{ControlClient, Notice, SessionEvent};
 /// SSH probe for a remote review slot); always called on the refresh worker.
 pub type Reader = Arc<dyn Fn(&str, u64) -> Snapshot + Send + Sync>;
 
-/// The production reader: the sidebar model both clients share, less the
-/// warm board's age (`crate::views::sidebar::board_warning`), which would
-/// otherwise differ on every read and repaint the window for nothing.
-pub fn sidebar_reader() -> Reader {
-    Arc::new(|project, generation| Snapshot {
+/// The production reader: the sidebar model both clients share, read
+/// through the window's project `source`, less the warm board's age
+/// (`crate::views::sidebar::board_warning`), which would otherwise differ on
+/// every read and repaint the window for nothing.
+pub fn sidebar_reader(source: Arc<dyn ProjectSource>) -> Reader {
+    Arc::new(move |_project, generation| Snapshot {
         generation,
         taken_at: Some(std::time::SystemTime::now()),
-        sidebar: shelbi_orchestrator::sidebar_model::read_sidebar_model(project).map(|mut m| {
+        sidebar: source.sidebar().map(|mut m| {
             m.board_banner = crate::views::sidebar::board_warning(m.board_banner.take());
             m
         }),
@@ -69,28 +76,6 @@ pub type TitleProbe = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 /// The orchestrator chat's view name: what [`SessionNotice::session`] carries
 /// for its titles, from the chat view and the probe alike.
 pub const ORCHESTRATOR_SESSION: &str = "orch";
-
-/// The production probe: find the project's live orchestrator session and
-/// ask it for its title over a short-lived, never-attached connection (the
-/// session protocol's `info` request). `None` when there is no live session,
-/// it doesn't answer within half a second, or it has set no title.
-pub fn orchestrator_title(project: &str) -> Option<String> {
-    use shelbi_app::session::{discovery_name, SessionRef};
-    let root = shelbi_state::sessions_dir().ok()?;
-    let sessions = shelbi_client::list(&root).ok()?;
-    let session = shelbi_client::choose_session(
-        &sessions,
-        &discovery_name(project, &SessionRef::Orchestrator),
-    )?;
-    let (conn, _events) = shelbi_client::Connection::open_with_timeout(
-        &session.sock,
-        None,
-        &[shelbi_proto::capability::INFO],
-        Duration::from_millis(500),
-    )
-    .ok()?;
-    conn.info().ok()?.title
-}
 
 /// Whether the daemon is pushing changes or the feed is polling for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,6 +142,29 @@ impl Default for FeedTiming {
     }
 }
 
+impl FeedTiming {
+    /// The timing for a project on another machine: every read is a round
+    /// trip over the host's relay, so the fallback poll and the safety
+    /// refresh run several times less often than a local feed's. Changes
+    /// still wake it at once over the link.
+    pub fn remote() -> Self {
+        FeedTiming {
+            live_interval: Duration::from_secs(20),
+            poll_interval: Duration::from_secs(4),
+            ..FeedTiming::default()
+        }
+    }
+
+    /// The timing for `key`'s feed.
+    pub fn for_key(key: &shelbi_app::source::ProjectKey) -> Self {
+        if key.is_local() {
+            FeedTiming::default()
+        } else {
+            FeedTiming::remote()
+        }
+    }
+}
+
 /// A project's running feed. Dropping it stops the feed without waiting.
 pub struct ProjectFeed {
     wake: Sender<()>,
@@ -166,24 +174,29 @@ pub struct ProjectFeed {
 }
 
 impl ProjectFeed {
-    /// The production feed for `project`: the shared sidebar reader, the hub
-    /// change subscription, and the default timing.
-    pub fn spawn(project: &str) -> (ProjectFeed, UnboundedReceiver<FeedEvent>) {
+    /// The production feed for `project`: the sidebar read through its
+    /// source, the change and layout subscriptions on its link, and the
+    /// timing for where it lives ([`FeedTiming::for_key`]).
+    pub fn spawn(project: &ProjectHandle) -> (ProjectFeed, UnboundedReceiver<FeedEvent>) {
         let connected = Arc::new(AtomicBool::new(false));
-        let (subscription, changes) =
-            shelbi_app::changes::spawn_observed(project, connected.clone());
-        let (layout_subscription, layout) = shelbi_app::layout_sub::spawn(project);
+        let (subscription, changes) = project.link.subscribe_changes(connected.clone());
+        let (layout_subscription, layout) = project.link.subscribe_layout();
+        // The orchestrator's title, asked of its session without attaching:
+        // this machine's socket, or over the host's relay link for a remote
+        // project.
+        let link = project.link.clone();
+        let orchestrator: Option<TitleProbe> = Some(Arc::new(move |_: &str| link.orchestrator_title()));
         Self::spawn_with(
-            project,
-            sidebar_reader(),
+            project.name(),
+            sidebar_reader(project.source.clone()),
             FeedSources {
                 connected,
                 changes: Some(changes),
                 layout: Some(layout),
                 keep_alive: Some(Box::new((subscription, layout_subscription))),
-                orchestrator: Some(Arc::new(orchestrator_title)),
+                orchestrator,
             },
-            FeedTiming::default(),
+            FeedTiming::for_key(project.key()),
         )
     }
 
@@ -465,6 +478,68 @@ impl ControlWatcher {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_feed_polls_more_slowly_than_a_local_one() {
+        use shelbi_app::source::ProjectKey;
+        let local = FeedTiming::for_key(&ProjectKey::local("p"));
+        let remote = FeedTiming::for_key(&ProjectKey::remote("devbox", "p"));
+        assert_eq!(local.poll_interval, FeedTiming::default().poll_interval);
+        assert!(remote.poll_interval > local.poll_interval);
+        assert!(remote.live_interval > local.live_interval);
+    }
+
+    /// A remote window's feed, over the far host's relay link: the far
+    /// daemon's `Changed` (another client there moved a card) wakes it at
+    /// once, long before its 20s safety refresh, and its snapshot is the far
+    /// project's.
+    #[test]
+    fn a_far_changed_note_wakes_a_remote_feed() {
+        let far = crate::remote_fixture::FarHost::new("feed");
+        let mut remote = crate::app::RemoteWindow::new(far.session(), far.listing(), far.link.clone(), far.remote.clone());
+        let handle = remote.handle_for_test(crate::remote_fixture::PROJECT);
+        let (feed, mut events) = ProjectFeed::spawn(&handle);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Some(event) = futures::executor::block_on(events.next()) {
+                if tx.send(event).is_err() {
+                    return;
+                }
+            }
+        });
+        let wait = Duration::from_secs(10);
+        let mut snapshots = 0;
+        let mut live = false;
+        let deadline = Instant::now() + wait;
+        while !(live && snapshots > 0) {
+            assert!(Instant::now() < deadline, "the feed never went live over the link");
+            match rx.recv_timeout(wait).expect("the feed's first events") {
+                FeedEvent::Link(DaemonLink::Live) => live = true,
+                FeedEvent::Snapshot(snapshot) => {
+                    let sidebar = snapshot.sidebar.expect("the far project's sidebar");
+                    // The far fixture project's display name, read far side.
+                    assert_eq!(sidebar.project_label, "My project");
+                    snapshots += 1;
+                }
+                _ => {}
+            }
+        }
+        // Let the far daemon's subscription land, then drain what came.
+        thread::sleep(Duration::from_millis(300));
+        while rx.try_recv().is_ok() {}
+
+        far.far_move("t-2", "todo");
+        let woke = Instant::now();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).expect("a far Changed wakes the feed") {
+                FeedEvent::Snapshot(_) => break,
+                _ => continue,
+            }
+        }
+        assert!(woke.elapsed() < FeedTiming::remote().live_interval / 4, "{:?}", woke.elapsed());
+        drop(feed);
+    }
+
     use futures::StreamExt;
     use shelbi_app::view::SidebarModel;
 

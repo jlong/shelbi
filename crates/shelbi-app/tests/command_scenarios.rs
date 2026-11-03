@@ -104,6 +104,7 @@ fn fixture() -> CommandModel {
         // A client with the launch screen and the Connect dialog.
         launch_screen: true,
         remote_connect: true,
+        remote_host: None,
     }
 }
 
@@ -244,7 +245,9 @@ impl Executor for Scenario {
             | Effect::DetachOtherClients
             | Effect::QuitProject { .. }
             | Effect::QuitShelbi
-            | Effect::NewWindow { .. } => Performed::Host(effect.clone()),
+            | Effect::NewWindow { .. }
+            // The terminal window over `ssh -t`, beside this one.
+            | Effect::OpenTerminalView { .. } => Performed::Host(effect.clone()),
         };
         self.performed.push(performed);
         Ok(())
@@ -278,6 +281,7 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::SwitchProject { .. } => "switch_project_moves_the_client_or_opens_the_switcher",
         CommandKind::AddProject => "add_project_collects_the_form_then_mutates",
         CommandKind::NewWindow => "new_window_reaches_the_host_on_a_multi_window_client",
+        CommandKind::OpenTerminalView => "open_in_terminal_view_reaches_the_host_only_in_a_remote_window",
         CommandKind::ConnectRemote | CommandKind::ShowLaunchScreen => {
             "launch_commands_reach_the_host_only_on_a_client_that_has_them"
         }
@@ -484,11 +488,18 @@ fn the_zen_toggle_is_a_daemon_mutation_and_relabels() {
         project: PROJECT.into(),
     };
     assert_eq!(effect, Effect::Mutate(toggle.clone()));
-    assert_eq!(s.last(), &Performed::Mutation(toggle));
+    assert_eq!(s.last(), &Performed::Mutation(toggle.clone()));
     // The next refresh reports Zen on; the same entry now turns it off.
     s.model.zen_on = true;
     assert_eq!(title(&s.model), "Turn Zen Mode off");
     assert_eq!(s.client.view(), &View::Session("orch".into()), "the view stays put");
+
+    // A remote window runs it too: the far daemon makes the write
+    // (`StateWrite::ToggleZen` over the relay), so nothing refuses it.
+    s.model.remote_host = Some("jlong@devbox".into());
+    assert_eq!(s.model.unavailable(&CommandKind::ToggleZen), None);
+    assert_eq!(s.invoke("action:toggle-zen"), Effect::Mutate(toggle.clone()));
+    assert_eq!(s.last(), &Performed::Mutation(toggle));
 }
 
 #[test]
@@ -745,6 +756,38 @@ fn new_window_reaches_the_host_on_a_multi_window_client() {
     let mut m = fixture();
     m.multi_window = false;
     assert!(CommandRegistry::new().resolve("action:new-window", &m).is_none());
+}
+
+#[test]
+fn open_in_terminal_view_reaches_the_host_only_in_a_remote_window() {
+    // A native remote window (its project on devbox) opens the project in
+    // its terminal view too: the host's own window over `ssh -t`. Nothing
+    // reaches a daemon and this client's project, view and overlays stay.
+    let mut s = Scenario::new();
+    s.model.remote_host = Some("jlong@devbox".into());
+    s.client.set_view(View::Issues);
+    let effect = Effect::OpenTerminalView {
+        project: PROJECT.into(),
+    };
+    assert_eq!(s.invoke("action:open-terminal-view"), effect);
+    assert_eq!(s.last(), &Performed::Host(effect));
+    assert_eq!(s.client.project(), Some(PROJECT));
+    assert_eq!(s.client.view(), &View::Issues);
+    assert_eq!(s.client.overlay(), None);
+    // It runs there (it is what keeps the terminal view reachable), so the
+    // palette lists it with its own line, not a reason.
+    let command = CommandRegistry::new()
+        .resolve("action:open-terminal-view", &s.model)
+        .unwrap();
+    assert_eq!(s.model.unavailable(command.kind()), None);
+    assert_eq!(command.title(), "Open in Terminal View");
+    // A window on this machine (the TUI, a local desktop window) never
+    // lists it, nor does a remote window before it has a project.
+    let reg = CommandRegistry::new();
+    assert!(reg.resolve("action:open-terminal-view", &fixture()).is_none());
+    let mut m = s.model.clone();
+    m.project = None;
+    assert!(reg.resolve("action:open-terminal-view", &m).is_none());
 }
 
 #[test]

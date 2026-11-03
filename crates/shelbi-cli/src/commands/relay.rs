@@ -1,21 +1,40 @@
-//! `shelbi relay` — bridge one stdio channel to every session on this machine.
+//! `shelbi relay` — bridge one stdio channel to every session on this machine,
+//! and (relay protocol v2) to this machine's project reads, daemon control
+//! socket and change notifications.
 //!
-//! The hub starts this over SSH (`ssh <host> shelbi relay`) as a short-lived
-//! process: it reads the [`shelbi_proto::relay`] envelope on stdin and writes it
-//! on stdout, multiplexing a single channel to every session socket under
-//! `~/.shelbi/sessions/`. It holds no PTYs and no session state, so if it or the
-//! SSH connection dies the hub simply starts another. All the behavior lives in
-//! [`shelbi_client::serve_relay`]; this is the thin CLI seam.
+//! Two kinds of client start this over SSH as a short-lived process:
 //!
-//! The hub side — resolving the remote `shelbi` binary path and wiring the SSH
-//! child's piped stdio to a [`shelbi_client::RelayChannel`] — is `rt-machine-setup`
-//! / `rt-remote-spawn`; this crate only provides the server end and the
-//! transport. Not intended for direct use by hand.
+//! - the hub, to reach the sessions of a project's workspaces on this machine
+//!   (`ssh <host> shelbi relay`);
+//! - a remote desktop window on another machine, to show a project that lives
+//!   here (`shelbi_app::launch::RemoteLink`), which also opens the services.
+//!
+//! It reads the [`shelbi_proto::relay`] envelope on stdin and writes it on
+//! stdout. It holds no PTYs and no session state, so if it or the SSH
+//! connection dies the client simply starts another. All the protocol
+//! behavior lives in [`shelbi_client::serve_relay_with`]; this is the thin CLI
+//! seam that injects the services:
+//!
+//! - `query`: `shelbi_orchestrator::source::QueryAnswers`, this machine's
+//!   project source.
+//! - `control`: this machine's `control.sock` (filtered by the relay).
+//! - `changes`: this machine's `hub.sock` (subscribe only).
+//! - `put`: files a remote window drops on a terminal here, saved under this
+//!   user's temp directory.
+//! - `session`: a session of a project here, on whichever of its machines it
+//!   runs (`shelbi_orchestrator::session_connect::relay_opener`). One on
+//!   another machine is reached through this machine's own relay to it, so a
+//!   remote window streams it with no route of its own there (the second
+//!   hop). That relay's SSH, and its `-R` forward, are this machine's.
+//!
+//! It never starts the daemon: `control` and `changes` fail to open while it
+//! is stopped. Not intended for direct use by hand.
 
 use std::io::{stdin, stdout, Read, Write};
 
 use anyhow::Result;
 use clap::Parser;
+use shelbi_client::RelayServices;
 
 /// Arguments for `shelbi relay`. There are none today: the relay serves the one
 /// stdio channel it was started with and discovers sessions from the default
@@ -29,6 +48,36 @@ pub fn run(_args: Args) -> Result<()> {
     let root = shelbi_state::sessions_dir()?;
     let read: Box<dyn Read + Send> = Box::new(stdin());
     let write: Box<dyn Write + Send> = Box::new(stdout());
-    shelbi_client::serve_relay(read, write, &root)?;
+    shelbi_client::serve_relay_with(read, write, &root, services())?;
     Ok(())
+}
+
+/// The services this machine's relay offers.
+fn services() -> RelayServices {
+    RelayServices {
+        // This machine's project source (`shelbi_orchestrator::source::
+        // LocalSource`), the code a local window reads its project through,
+        // so a remote window sees what a local one would.
+        query: Some(shelbi_orchestrator::source::QueryAnswers::default().handler()),
+        control_socket: shelbi_state::control_socket_path().ok(),
+        hub_socket: shelbi_state::hub_socket_path().ok(),
+        put_dir: put_dir(),
+        session: Some(shelbi_orchestrator::session_connect::relay_opener()),
+    }
+}
+
+/// Where `put` saves the files a remote window drops on this machine's
+/// terminals: this user's own temp directory (`$XDG_RUNTIME_DIR`, else
+/// `$TMPDIR`), else `~/.shelbi/tmp`. Never a shared `/tmp`, where another
+/// user could get there first.
+fn put_dir() -> Option<std::path::PathBuf> {
+    let private = ["XDG_RUNTIME_DIR", "TMPDIR"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_absolute() && p.is_dir() && p != std::path::Path::new("/tmp"));
+    match private {
+        Some(dir) => Some(dir.join("shelbi-drops")),
+        None => shelbi_state::shelbi_home().ok().map(|home| home.join("tmp").join("drops")),
+    }
 }

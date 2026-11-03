@@ -44,7 +44,7 @@ pub const KEYS_FILENAME: &str = "keys.yaml";
 /// Final, merged keymaps for every mode. Constructed by [`load_keymaps`]
 /// from the three-layer merge — callers should treat fields as read-only
 /// after construction.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Keymaps {
     pub global: ModeKeymap<GlobalAction>,
     pub sidebar: ModeKeymap<SidebarAction>,
@@ -56,7 +56,7 @@ pub struct Keymaps {
 
 /// Per-mode binding map: chord → action plus a reverse index of action →
 /// chord list so dispatchers can render hints without scanning.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ModeKeymap<A: Copy + Eq + Hash> {
     pub bindings: HashMap<KeyChord, A>,
     /// Stable insertion-ordered chord list per action, for help rendering.
@@ -306,7 +306,44 @@ fn value_type_name(v: &Value) -> &'static str {
 /// and `config.yaml` on disk, so subsequent calls observe the migrated
 /// state and stay silent.
 pub fn load_keymaps(project_name: Option<&str>) -> (Keymaps, Vec<KeymapDiagnostic>) {
-    load_keymaps_source(project_name, None, true)
+    load_keymaps_source(project_name, None, true, ProjectLayer::FromFile)
+}
+
+/// The keymaps for a project on another machine: this machine's `keys.yaml`
+/// (built-ins, then its `defaults`), then `overlay`, the far machine's
+/// `projects.<name>` section ([`project_overlay`]) in place of this file's
+/// own section for the name. The far user's `defaults` never apply: the
+/// keys are the viewer's, plus what the project sets.
+pub fn load_keymaps_with_overlay(
+    project_name: &str,
+    overlay: Option<&str>,
+) -> (Keymaps, Vec<KeymapDiagnostic>) {
+    load_keymaps_source(
+        Some(project_name),
+        None,
+        true,
+        ProjectLayer::Given(overlay),
+    )
+}
+
+/// `project_name`'s section of this machine's `keys.yaml`
+/// (`projects.<name>`), as YAML text: what a far machine sends a remote
+/// window for [`load_keymaps_with_overlay`]. `None` when the file has no
+/// section for the project (or doesn't read). Runs no migration.
+pub fn project_overlay(project_name: &str) -> Option<String> {
+    let mut ignored = Vec::new();
+    let file = read_keys_file(&mut ignored)?;
+    let section = file.projects?.remove(project_name)?;
+    serde_yaml::to_string(&section).ok()
+}
+
+/// Where the project layer of a merge comes from.
+#[derive(Clone, Copy)]
+enum ProjectLayer<'a> {
+    /// The loaded file's `projects.<name>` section.
+    FromFile,
+    /// A section given as YAML text (a far machine's), or none.
+    Given(Option<&'a str>),
 }
 
 /// Parse and validate a buffered `keys.yaml` candidate through the same merge,
@@ -318,13 +355,14 @@ pub fn validate_keymaps_yaml(
     text: &str,
     project_name: Option<&str>,
 ) -> (Keymaps, Vec<KeymapDiagnostic>) {
-    load_keymaps_source(project_name, Some(text), false)
+    load_keymaps_source(project_name, Some(text), false, ProjectLayer::FromFile)
 }
 
 fn load_keymaps_source(
     project_name: Option<&str>,
     source: Option<&str>,
     run_migrations: bool,
+    project_layer: ProjectLayer<'_>,
 ) -> (Keymaps, Vec<KeymapDiagnostic>) {
     let mut diags = Vec::new();
 
@@ -398,12 +436,27 @@ fn load_keymaps_source(
         .map(|g| g.contains_key("zen_toggle"))
         .unwrap_or(false);
 
-    if let (Some(name), Some(f)) = (project_name, file.as_ref()) {
-        if let Some(projects) = &f.projects {
-            if let Some(p) = projects.get(name) {
-                let scope = format!("projects.{name}");
-                apply_overrides(&scope, p, &mut staged, &mut diags);
+    if let Some(name) = project_name {
+        let scope = format!("projects.{name}");
+        match project_layer {
+            ProjectLayer::FromFile => {
+                if let Some(p) = file
+                    .as_ref()
+                    .and_then(|f| f.projects.as_ref())
+                    .and_then(|projects| projects.get(name))
+                {
+                    apply_overrides(&scope, p, &mut staged, &mut diags);
+                }
             }
+            ProjectLayer::Given(None) => {}
+            ProjectLayer::Given(Some(text)) => match serde_yaml::from_str::<ModeMap>(text) {
+                Ok(p) => apply_overrides(&scope, &p, &mut staged, &mut diags),
+                Err(e) => diags.push(KeymapDiagnostic::err(
+                    ErrorKind::ParseError,
+                    format!("parsing the project's keys ({scope}): {e}"),
+                    Some(KEYS_FILENAME.into()),
+                )),
+            },
         }
     }
 

@@ -1,9 +1,9 @@
 //! The project catalog and opening a project.
 //!
 //! The catalog is the TUI switcher's source, `shelbi_state::list_projects`
-//! (most recently launched first), plus each project's config-only sidebar
-//! skeleton (`shelbi_orchestrator::sidebar_model::read_config_skeleton`: its
-//! label and declared workspace rows with a loading badge). Both are read on a
+//! (most recently launched first): this machine's projects. With each, its
+//! config-only sidebar skeleton (its source's `config_skeleton`: its label and
+//! declared workspace rows with a loading badge). Both are read on a
 //! background thread and kept in memory, so a project switch paints the
 //! target's chrome on its very first frame without touching disk: the
 //! prefetched skeleton when there is one, else the zero-IO
@@ -21,6 +21,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use gpui::Global;
+use shelbi_app::source::{ProjectKey, ProjectSource};
 use shelbi_app::view::SidebarModel;
 
 use crate::platform::env::Env;
@@ -41,11 +42,11 @@ struct CatalogInner {
     /// The projects recorded open (running in some window or terminal), as
     /// of the last refresh.
     open: std::collections::HashSet<String>,
-    skeletons: std::collections::HashMap<String, SidebarModel>,
-    views: std::collections::HashMap<String, ProjectViewState>,
+    skeletons: std::collections::HashMap<ProjectKey, SidebarModel>,
+    views: std::collections::HashMap<ProjectKey, ProjectViewState>,
     /// Projects whose view state this process has set: a refresh never
     /// replaces those with what it read (the write may not have landed).
-    remembered: std::collections::HashSet<String>,
+    remembered: std::collections::HashSet<ProjectKey>,
 }
 
 /// The app-wide project catalog, installed as a gpui global. Cheap to clone;
@@ -80,19 +81,19 @@ impl Catalog {
 
     /// The sidebar a window for `project` paints on its first frame, from
     /// memory only: its prefetched config skeleton, else the bare skeleton.
-    pub fn first_frame_sidebar(&self, project: &str) -> SidebarModel {
+    pub fn first_frame_sidebar(&self, project: &ProjectKey) -> SidebarModel {
         // `try_lock`: a refresh holds the lock only for its final swap, and a
         // first frame must never wait on it.
         self.inner
             .try_lock()
             .ok()
             .and_then(|inner| inner.skeletons.get(project).cloned())
-            .unwrap_or_else(|| SidebarModel::skeleton(project))
+            .unwrap_or_else(|| SidebarModel::skeleton(&project.name))
     }
 
     /// Where `project` was left, from memory only (the default when it was
     /// never left, or the catalog hasn't loaded).
-    pub fn view_state(&self, project: &str) -> ProjectViewState {
+    pub fn view_state(&self, project: &ProjectKey) -> ProjectViewState {
         self.inner
             .try_lock()
             .ok()
@@ -101,16 +102,16 @@ impl Catalog {
     }
 
     /// Remember where `project` was left (the caller saves it to disk).
-    pub fn remember_view(&self, project: &str, state: ProjectViewState) {
+    pub fn remember_view(&self, project: &ProjectKey, state: ProjectViewState) {
         let mut inner = self.lock();
-        inner.views.insert(project.to_string(), state);
-        inner.remembered.insert(project.to_string());
+        inner.views.insert(project.clone(), state);
+        inner.remembered.insert(project.clone());
     }
 
     /// Start `project` over: no view state from a project that had its id
     /// before (a project just created opens on its Orchestrator), and a
     /// refresh never brings one back from disk.
-    pub fn forget_view(&self, project: &str) {
+    pub fn forget_view(&self, project: &ProjectKey) {
         self.remember_view(project, ProjectViewState::default());
     }
 
@@ -146,13 +147,17 @@ impl Catalog {
         let skeletons = projects
             .iter()
             .filter_map(|p| {
-                shelbi_orchestrator::sidebar_model::read_config_skeleton(&p.name)
-                    .map(|m| (p.name.clone(), m))
+                let source = shelbi_orchestrator::source::LocalSource::new(&p.name);
+                source.config_skeleton().map(|m| (source.key().clone(), m))
             })
             .collect();
-        let views: Vec<(String, ProjectViewState)> = projects
+        let views: Vec<(ProjectKey, ProjectViewState)> = projects
             .iter()
-            .map(|p| (p.name.clone(), ProjectViewState::load(&p.name)))
+            .map(|p| {
+                let key = ProjectKey::local(&p.name);
+                let view = ProjectViewState::load(&key);
+                (key, view)
+            })
             .collect();
         let mut guard = self.lock();
         guard.projects = projects;
@@ -185,7 +190,7 @@ impl Catalog {
             inner.skeletons = skeletons
                 .into_iter()
                 .zip(projects.iter())
-                .map(|(m, p)| (p.name.clone(), m))
+                .map(|(m, p)| (ProjectKey::local(&p.name), m))
                 .collect();
             inner.projects = projects;
         }
@@ -295,9 +300,13 @@ mod tests {
             }],
             vec![skeleton.clone()],
         );
-        assert_eq!(catalog.first_frame_sidebar("web"), skeleton);
+        assert_eq!(catalog.first_frame_sidebar(&ProjectKey::local("web")), skeleton);
+        // A remote project of the same name is another project.
+        let remote = catalog.first_frame_sidebar(&ProjectKey::remote("devbox", "web"));
+        assert_eq!(remote.project_label, "web");
+        assert!(remote.board_loading);
         // An unknown project paints the bare skeleton: its own name, loading.
-        let bare = catalog.first_frame_sidebar("api");
+        let bare = catalog.first_frame_sidebar(&ProjectKey::local("api"));
         assert_eq!(bare.project_label, "api");
         assert!(bare.board_loading);
     }
@@ -329,17 +338,23 @@ mod tests {
     #[test]
     fn a_remembered_view_state_is_served_from_memory() {
         let catalog = Catalog::default();
-        assert_eq!(catalog.view_state("web"), ProjectViewState::default());
+        let web = ProjectKey::local("web");
+        assert_eq!(catalog.view_state(&web), ProjectViewState::default());
         let state = ProjectViewState {
             view: Some("tasks".into()),
             ..Default::default()
         };
-        catalog.remember_view("web", state.clone());
-        assert_eq!(catalog.view_state("web"), state);
+        catalog.remember_view(&web, state.clone());
+        assert_eq!(catalog.view_state(&web), state);
+        assert_eq!(
+            catalog.view_state(&ProjectKey::remote("devbox", "web")),
+            ProjectViewState::default(),
+            "a remote project of the same name has its own"
+        );
         // A project created under the id starts over.
-        catalog.forget_view("web");
-        assert_eq!(catalog.view_state("web"), ProjectViewState::default());
-        assert!(catalog.inner.lock().unwrap().remembered.contains("web"), "a refresh keeps it forgotten");
+        catalog.forget_view(&web);
+        assert_eq!(catalog.view_state(&web), ProjectViewState::default());
+        assert!(catalog.inner.lock().unwrap().remembered.contains(&web), "a refresh keeps it forgotten");
     }
 
     #[test]

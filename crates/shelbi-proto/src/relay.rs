@@ -25,6 +25,20 @@
 //! family carried on a distinct channel, so there is no overlap with
 //! [`crate::FrameType`]). Control frames carry JSON; the one high-volume frame,
 //! [`RelayFrame::Data`], carries `[stream: u32 BE][session-frame bytes]` raw.
+//!
+//! ## Services (v2)
+//!
+//! Version 2 adds one frame, [`RelayFrame::OpenService`], which opens a logical
+//! stream to a named [`RelayService`] rather than a session: the far project's
+//! read `query` handler, a filtered bridge to the far daemon's `control.sock`,
+//! a one-way `changes` subscription on the far `hub.sock`, a file `put`, or a
+//! `session` of the far project on whichever of its machines it runs (a second
+//! hop through the far side's own relay). It is answered by
+//! [`RelayFrame::Opened`] / [`RelayFrame::OpenError`] exactly like
+//! [`RelayFrame::Open`], and the stream's bytes then ride [`RelayFrame::Data`].
+//! A v1 relay ends the channel on a frame type it does not know, so a client
+//! reads the relay's [`RelayFrame::Hello`] first and sends `OpenService` only
+//! when its version is at least [`RELAY_SERVICES_VERSION`].
 
 use serde::{Deserialize, Serialize};
 
@@ -33,10 +47,18 @@ use crate::error::ProtoError;
 const LEN_PREFIX: usize = 4;
 
 /// Version of the relay channel protocol this build speaks, exchanged in the
-/// [`RelayFrame::Hello`]. The relay is always started from the installed
-/// binary, so it is current; the hello lets the hub log a mismatch for
-/// diagnostics. Not a frozen core.
-pub const RELAY_PROTOCOL_VERSION: u16 = 1;
+/// [`RelayFrame::Hello`]. The relay runs whatever binary the far host has
+/// installed, which may be older than the client: a client reads the relay's
+/// hello before opening a [`RelayService`] (see [`RELAY_SERVICES_VERSION`]).
+/// Not a frozen core.
+///
+/// v2 adds [`RelayFrame::OpenService`] and the [`RelayService`]s behind it.
+pub const RELAY_PROTOCOL_VERSION: u16 = 2;
+
+/// The first relay protocol version that understands
+/// [`RelayFrame::OpenService`]. A relay announcing less ends the channel on
+/// that frame, so a client must never send it one.
+pub const RELAY_SERVICES_VERSION: u16 = 2;
 
 /// The one-byte type tag leading each relay frame's payload. Its own space,
 /// unrelated to [`crate::FrameType`].
@@ -63,6 +85,9 @@ pub enum RelayType {
     Ping = 0x09,
     /// [`RelayFrame::Pong`] — channel keepalive reply (empty payload).
     Pong = 0x0a,
+    /// [`RelayFrame::OpenService`] — open a logical stream to a service (JSON).
+    /// Protocol v2.
+    OpenService = 0x0b,
 }
 
 impl RelayType {
@@ -79,6 +104,7 @@ impl RelayType {
             0x08 => Self::Close,
             0x09 => Self::Ping,
             0x0a => Self::Pong,
+            0x0b => Self::OpenService,
             _ => return None,
         })
     }
@@ -110,10 +136,181 @@ pub struct RelaySession {
     pub protocol_version: u16,
 }
 
+/// A service a client can open a stream to with [`RelayFrame::OpenService`]
+/// (protocol v2). Each runs inside the far `shelbi relay`:
+///
+/// - [`Query`](RelayService::Query): request/response reads, each message
+///   framed `[len: u32 BE][json]`, answered by a handler the far CLI injects.
+/// - [`Control`](RelayService::Control): a bridge to the far daemon's
+///   `control.sock`. The relay decodes every client frame and refuses the
+///   ones a remote window may not send (quitting Shelbi, reloading or
+///   detaching every client, quitting another project); `project` is the
+///   window's own project.
+/// - [`Changes`](RelayService::Changes): the relay subscribes to the far
+///   `hub.sock` for `project` itself and forwards the notification lines
+///   down. One way: nothing the client writes reaches `hub.sock`.
+/// - [`Put`](RelayService::Put): a file dropped on a far terminal. The
+///   client writes its bytes as one message framed `[len: u32 BE][bytes]`;
+///   the relay saves them as `file` in a fresh directory under the far
+///   machine's temp directory and answers one framed message, the file's
+///   far path (UTF-8), then closes the stream.
+/// - [`Session`](RelayService::Session): a session of `project`, wherever the
+///   far project runs it. The far relay resolves `target` as the far hub
+///   would (`shelbi_orchestrator::session_connect`): a session on the far
+///   machine itself, or one on another of the far project's machines, reached
+///   through the far side's own relay to it (a second hop). The stream then
+///   carries that session's frames both ways unchanged, like an
+///   [`Open`](RelayFrame::Open)ed one, so the client speaks the session
+///   protocol end to end. A failed open answers [`RelayFrame::OpenError`]
+///   whose `error` is a [`SessionOpenError`] ([`SessionOpenError::to_wire`]).
+///
+/// On the wire it is `{"name": "<service>", ...}`. A name this build does not
+/// know decodes as [`Unknown`](RelayService::Unknown), which the relay answers
+/// with [`RelayFrame::OpenError`] rather than ending the channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "name", rename_all = "snake_case")]
+pub enum RelayService {
+    /// The far project's read queries.
+    Query,
+    /// The far daemon's control socket, filtered.
+    Control {
+        /// The project the remote window shows.
+        project: String,
+    },
+    /// The far hub's change notifications for `project`, one way.
+    Changes {
+        /// The project to subscribe to.
+        project: String,
+    },
+    /// Save one file the client sends in the far temp directory and answer
+    /// its path.
+    Put {
+        /// The file's name (its base name is kept; anything else is
+        /// dropped).
+        file: String,
+    },
+    /// A session of `project`, on whichever of its machines it runs.
+    Session {
+        /// The project the session belongs to.
+        project: String,
+        /// Which of the project's sessions.
+        target: SessionTarget,
+    },
+    /// A service this build does not know (a newer client's).
+    #[serde(other)]
+    Unknown,
+}
+
+impl RelayService {
+    /// The service's wire name.
+    pub fn name(&self) -> &'static str {
+        match self {
+            RelayService::Query => "query",
+            RelayService::Control { .. } => "control",
+            RelayService::Changes { .. } => "changes",
+            RelayService::Put { .. } => "put",
+            RelayService::Session { .. } => "session",
+            RelayService::Unknown => "unknown",
+        }
+    }
+}
+
+/// Which of a project's sessions a [`RelayService::Session`] stream attaches
+/// to: `shelbi_app::session::SessionRef` on the wire.
+///
+/// On the wire it is `{"kind": "<kind>", ...}`. A kind this build does not
+/// know decodes as [`Unknown`](SessionTarget::Unknown), which the relay
+/// refuses with [`RelayFrame::OpenError`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionTarget {
+    /// The project's orchestrator.
+    Orchestrator,
+    /// A workspace's agent.
+    Workspace {
+        /// The workspace.
+        workspace: String,
+    },
+    /// A review slot's content session (`role` is `editor` / `diff`).
+    Review {
+        /// The review workspace.
+        slot: String,
+        /// The content role.
+        role: String,
+    },
+    /// A dev workspace's content session (`role` is `editor` / `diff` /
+    /// `shell`).
+    WorkspaceContent {
+        /// The dev workspace.
+        workspace: String,
+        /// The content role.
+        role: String,
+    },
+    /// A kind this build does not know (a newer client's).
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a [`RelayService::Session`] stream did not open. It rides the
+/// [`RelayFrame::OpenError`] `error` string as JSON ([`to_wire`]), so the
+/// client can tell a machine it merely can't reach (keep reconnecting) from
+/// one that answered.
+///
+/// [`to_wire`]: SessionOpenError::to_wire
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "session_error", rename_all = "snake_case")]
+pub enum SessionOpenError {
+    /// The machine the session runs on couldn't be reached (the far side's
+    /// relay to it won't start or died). The session may well still run.
+    Unreachable {
+        /// A short human-readable reason.
+        message: String,
+    },
+    /// The machine answered and has no live session by that name. `exited`:
+    /// one ran and stopped there, rather than none ever having run.
+    NoSession {
+        /// Whether a dead session by that name is on record.
+        exited: bool,
+    },
+    /// Anything else.
+    Failed {
+        /// A short human-readable reason.
+        message: String,
+    },
+}
+
+impl SessionOpenError {
+    /// The [`RelayFrame::OpenError`] `error` string carrying this.
+    pub fn to_wire(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| self.to_string())
+    }
+
+    /// Read an [`RelayFrame::OpenError`] `error` string. One that is not a
+    /// [`SessionOpenError`] (a relay that doesn't know the service, a plain
+    /// reason) is [`Failed`](SessionOpenError::Failed) with it as the message.
+    pub fn from_wire(error: &str) -> SessionOpenError {
+        serde_json::from_str(error).unwrap_or_else(|_| SessionOpenError::Failed {
+            message: error.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for SessionOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionOpenError::Unreachable { message } | SessionOpenError::Failed { message } => f.write_str(message),
+            SessionOpenError::NoSession { exited: true } => f.write_str("the session exited"),
+            SessionOpenError::NoSession { exited: false } => f.write_str("no live session"),
+        }
+    }
+}
+
 /// A decoded relay-channel frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayFrame {
-    /// Protocol hello, sent by both ends first. Diagnostic only.
+    /// Protocol hello, sent by both ends first. The relay's tells the client
+    /// whether it may send [`OpenService`](RelayFrame::OpenService); the
+    /// client's is diagnostic.
     Hello {
         /// The sender's [`RELAY_PROTOCOL_VERSION`].
         version: u16,
@@ -132,7 +329,19 @@ pub enum RelayFrame {
         /// The target session's short directory id.
         short_id: String,
     },
-    /// The relay connected the session socket for `stream`.
+    /// Open a logical stream `stream` to the relay-side `service` (protocol
+    /// v2). Answered by [`Opened`](RelayFrame::Opened) /
+    /// [`OpenError`](RelayFrame::OpenError) like [`Open`](RelayFrame::Open).
+    /// Never send it to a relay whose hello announced less than
+    /// [`RELAY_SERVICES_VERSION`].
+    OpenService {
+        /// Client-assigned stream id, unique for the channel's lifetime (shared
+        /// with [`Open`](RelayFrame::Open)'s id space).
+        stream: u32,
+        /// The service to open.
+        service: RelayService,
+    },
+    /// The relay connected the session socket (or service) for `stream`.
     Opened {
         /// The stream that is now open.
         stream: u32,
@@ -180,6 +389,11 @@ struct OpenBody {
     short_id: String,
 }
 #[derive(Serialize, Deserialize)]
+struct OpenServiceBody {
+    stream: u32,
+    service: RelayService,
+}
+#[derive(Serialize, Deserialize)]
 struct StreamBody {
     stream: u32,
 }
@@ -197,6 +411,7 @@ impl RelayFrame {
             RelayFrame::ListSessions => RelayType::ListSessions,
             RelayFrame::SessionList { .. } => RelayType::SessionList,
             RelayFrame::Open { .. } => RelayType::Open,
+            RelayFrame::OpenService { .. } => RelayType::OpenService,
             RelayFrame::Opened { .. } => RelayType::Opened,
             RelayFrame::OpenError { .. } => RelayType::OpenError,
             RelayFrame::Data { .. } => RelayType::Data,
@@ -216,6 +431,10 @@ impl RelayFrame {
             RelayFrame::Open { stream, short_id } => serde_json::to_vec(&OpenBody {
                 stream: *stream,
                 short_id: short_id.clone(),
+            })?,
+            RelayFrame::OpenService { stream, service } => serde_json::to_vec(&OpenServiceBody {
+                stream: *stream,
+                service: service.clone(),
             })?,
             RelayFrame::Opened { stream } => serde_json::to_vec(&StreamBody { stream: *stream })?,
             RelayFrame::OpenError { stream, error } => serde_json::to_vec(&OpenErrorBody {
@@ -286,6 +505,13 @@ impl RelayFrame {
                 RelayFrame::Open {
                     stream: b.stream,
                     short_id: b.short_id,
+                }
+            }
+            RelayType::OpenService => {
+                let b: OpenServiceBody = serde_json::from_slice(payload)?;
+                RelayFrame::OpenService {
+                    stream: b.stream,
+                    service: b.service,
                 }
             }
             RelayType::Opened => {
@@ -363,6 +589,22 @@ mod tests {
             stream: 7,
             short_id: "abc123".into(),
         });
+        roundtrip(RelayFrame::OpenService {
+            stream: 8,
+            service: RelayService::Query,
+        });
+        roundtrip(RelayFrame::OpenService {
+            stream: 9,
+            service: RelayService::Control {
+                project: "demo".into(),
+            },
+        });
+        roundtrip(RelayFrame::OpenService {
+            stream: 10,
+            service: RelayService::Changes {
+                project: "demo".into(),
+            },
+        });
         roundtrip(RelayFrame::Opened { stream: 7 });
         roundtrip(RelayFrame::OpenError {
             stream: 9,
@@ -379,6 +621,96 @@ mod tests {
         roundtrip(RelayFrame::Close { stream: 3 });
         roundtrip(RelayFrame::Ping);
         roundtrip(RelayFrame::Pong);
+    }
+
+    #[test]
+    fn services_have_a_pinned_wire_shape() {
+        let json = |s: &RelayService| serde_json::to_string(s).unwrap();
+        assert_eq!(json(&RelayService::Query), r#"{"name":"query"}"#);
+        assert_eq!(
+            json(&RelayService::Control { project: "p".into() }),
+            r#"{"name":"control","project":"p"}"#
+        );
+        assert_eq!(
+            json(&RelayService::Changes { project: "p".into() }),
+            r#"{"name":"changes","project":"p"}"#
+        );
+        assert_eq!(
+            json(&RelayService::Put { file: "shot.png".into() }),
+            r#"{"name":"put","file":"shot.png"}"#
+        );
+        assert_eq!(
+            json(&RelayService::Session {
+                project: "p".into(),
+                target: SessionTarget::Workspace { workspace: "gamma".into() },
+            }),
+            r#"{"name":"session","project":"p","target":{"kind":"workspace","workspace":"gamma"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionTarget::WorkspaceContent {
+                workspace: "gamma".into(),
+                role: "shell".into(),
+            })
+            .unwrap(),
+            r#"{"kind":"workspace_content","workspace":"gamma","role":"shell"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionTarget::Orchestrator).unwrap(),
+            r#"{"kind":"orchestrator"}"#
+        );
+        for s in [
+            RelayService::Query,
+            RelayService::Control { project: "p".into() },
+            RelayService::Changes { project: "p".into() },
+        ] {
+            assert!(json(&s).contains(s.name()));
+        }
+    }
+
+    #[test]
+    fn a_session_open_error_round_trips_through_the_open_error_string() {
+        for e in [
+            SessionOpenError::Unreachable {
+                message: "`gpu-box` is unreachable".into(),
+            },
+            SessionOpenError::NoSession { exited: false },
+            SessionOpenError::NoSession { exited: true },
+            SessionOpenError::Failed { message: "boom".into() },
+        ] {
+            assert_eq!(SessionOpenError::from_wire(&e.to_wire()), e);
+        }
+        assert_eq!(
+            SessionOpenError::NoSession { exited: true }.to_wire(),
+            r#"{"session_error":"no_session","exited":true}"#
+        );
+        // A relay that doesn't know the service answers a plain reason.
+        assert_eq!(
+            SessionOpenError::from_wire("unknown relay service"),
+            SessionOpenError::Failed {
+                message: "unknown relay service".into()
+            }
+        );
+        // An unknown target kind still decodes, so the relay can refuse it.
+        let target: SessionTarget = serde_json::from_str(r#"{"kind":"hologram","x":1}"#).unwrap();
+        assert_eq!(target, SessionTarget::Unknown);
+    }
+
+    #[test]
+    fn an_unknown_service_decodes_instead_of_failing_the_frame() {
+        // A newer client's service: the frame still decodes, so the relay can
+        // answer OpenError and keep the channel up.
+        let payload = br#"{"stream":4,"service":{"name":"teleport","to":"mars"}}"#;
+        let mut buf = ((1 + payload.len()) as u32).to_be_bytes().to_vec();
+        buf.push(RelayType::OpenService as u8);
+        buf.extend_from_slice(payload);
+        let (frame, _) = RelayFrame::decode(&buf).unwrap();
+        assert_eq!(
+            frame,
+            RelayFrame::OpenService {
+                stream: 4,
+                service: RelayService::Unknown
+            }
+        );
     }
 
     #[test]

@@ -28,6 +28,8 @@
 //! window comes back to the front after one, the files are read again to
 //! show the hand edit.
 
+use std::sync::Arc;
+use shelbi_app::source::{ProjectHandle, ProjectSource};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -122,6 +124,10 @@ impl Render for StatusGhost {
 /// The Workflows page.
 pub struct WorkflowsPage {
     state: WorkflowsState,
+    /// The window's project, read through its source.
+    source: Arc<dyn ProjectSource>,
+    /// The window's project, saved through it (wherever it lives).
+    handle: ProjectHandle,
     /// Each status's name field, by id.
     names: HashMap<String, (Entity<InputState>, Subscription)>,
     /// The new row's name field (a workflow's or a status's).
@@ -141,7 +147,8 @@ pub struct WorkflowsPage {
 }
 
 impl WorkflowsPage {
-    pub fn new(project: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(handle: &ProjectHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let project = handle.name();
         let draft_input = cx.new(|cx| InputState::new(window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&draft_input, window, |this, _, event: &InputEvent, window, cx| {
@@ -160,6 +167,8 @@ impl WorkflowsPage {
         ];
         let mut page = WorkflowsPage {
             state: WorkflowsState::new(project),
+            source: handle.source.clone(),
+            handle: handle.clone(),
             names: HashMap::new(),
             draft_input,
             menu: None,
@@ -179,10 +188,8 @@ impl WorkflowsPage {
     /// Read the project's workflow config off the UI thread (again, to pick
     /// up hand edits) and show it.
     pub fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.state.project().to_string();
-        let read = cx
-            .background_executor()
-            .spawn(async move { WorkflowConfig::load(&project).map_err(|e| e.to_string()) });
+        let source = self.source.clone();
+        let read = cx.background_executor().spawn(async move { source.workflow_config() });
         cx.spawn_in(window, async move |this, cx| {
             let config = read.await;
             this.update_in(cx, |this, window, cx| {
@@ -277,10 +284,10 @@ impl WorkflowsPage {
 
     /// Save one edit off the UI thread; when it lands, start the next.
     fn start(&mut self, (config, edit): (WorkflowConfig, Edit), window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.state.project().to_string();
+        let store = self.handle.clone();
         let save = cx
             .background_executor()
-            .spawn(async move { commit(&project, &config, edit) });
+            .spawn(async move { commit(&store, &config, edit) });
         cx.spawn_in(window, async move |this, cx| {
             let done = save.await;
             this.update_in(cx, |this, window, cx| this.committed(done, window, cx)).ok();
@@ -376,6 +383,17 @@ impl WorkflowsPage {
         }
     }
 
+    /// Open a far file in an editor session on the far machine (a remote
+    /// window's Edit YAML); an error shows at `target`. The files are read
+    /// again when the window comes back to the front.
+    fn open_far(&mut self, file: shelbi_app::far::FarFile, label: String, target: Target, cx: &mut Context<Self>) {
+        self.reload_on_return = true;
+        super::far_editor::open_from(&self.handle.link, file, label, cx, move |this: &mut Self, e, cx| {
+            this.state.set_error(target, e);
+            cx.notify();
+        });
+    }
+
     fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
         self.menu = if self.menu.as_ref() == Some(&menu) { None } else { Some(menu) };
         cx.notify();
@@ -387,6 +405,11 @@ impl WorkflowsPage {
         let Some(path) = self.state.config().map(|c| c.statuses_path().to_path_buf()) else {
             return;
         };
+        if self.handle.link.is_remote() {
+            // The far daemon writes the shipped catalog first, there.
+            self.open_far(shelbi_app::far::FarFile::Statuses, "statuses.yaml".into(), Target::Page, cx);
+            return;
+        }
         let project = self.state.project().to_string();
         let prepare = move |path: &Path| prepare_statuses_yaml(&project, path);
         self.open_yaml(path, Target::Page, prepare, window, cx);
@@ -416,6 +439,12 @@ impl WorkflowsPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.handle.link.is_remote() {
+            let file = shelbi_app::far::FarFile::path(path.to_string_lossy());
+            let label = super::far_editor::label_of(&path.to_string_lossy());
+            self.open_far(file, label, target, cx);
+            return;
+        }
         self.reload_on_return = true;
         let open = cx.background_executor().spawn(async move {
             prepare(&path)?;

@@ -14,8 +14,11 @@
 
 use shelbi_proto::control::{
     AddSpec, EditSpec, ExpectedState, MutationKind, MutationRequest, ReviewSessionOp,
-    ReviewSessionRequest, Stream, WorkspaceSessionOp, WorkspaceSessionRequest,
+    ReviewSessionRequest, StateWrite, StateWriteRequest, Stream, WorkspaceSessionOp,
+    WorkspaceSessionRequest,
 };
+
+use shelbi_client::ControlClient;
 
 use crate::exec::{ExecError, ExecOutcome, Mutation};
 
@@ -71,11 +74,24 @@ pub fn add_issue(
     mutation: &Mutation,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> Result<Option<String>, ExecError> {
+    let mut client = connect_local()?;
+    add_issue_over(&mut client, mutation, on_line)
+}
+
+/// [`add_issue`] over an already connected control client (a remote
+/// window's, on its host's `control` service).
+pub(crate) fn add_issue_over(
+    client: &mut ControlClient,
+    mutation: &Mutation,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> Result<Option<String>, ExecError> {
     let (project, id, kind) = map_to_kind(mutation)?;
     if !matches!(kind, MutationKind::Add(_)) {
         return Err(ExecError::Backend("not an add".to_string()));
     }
-    let mut client = connect_for_mutation()?;
+    if let Some(err) = out_of_date_gate(&client.daemon_version, shelbi_state::CLIENT_VERSION) {
+        return Err(err);
+    }
     let req = MutationRequest {
         request_id: 1,
         project,
@@ -100,10 +116,19 @@ pub fn review_session(
     op: ReviewSessionOp,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> ExecOutcome {
-    shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
-    let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
-    let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)
-        .map_err(|e| ExecError::Backend(e.to_string()))?;
+    let mut client = connect_local()?;
+    review_session_over(&mut client, project, task, op, on_line)
+}
+
+/// [`review_session`] over an already connected control client (a remote
+/// window's, on its host's `control` service).
+pub(crate) fn review_session_over(
+    client: &mut ControlClient,
+    project: &str,
+    task: &str,
+    op: ReviewSessionOp,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> ExecOutcome {
     let req = ReviewSessionRequest {
         request_id: 1,
         project: project.to_string(),
@@ -124,10 +149,18 @@ pub fn workspace_session(
     op: WorkspaceSessionOp,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> ExecOutcome {
-    shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
-    let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
-    let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)
-        .map_err(|e| ExecError::Backend(e.to_string()))?;
+    let mut client = connect_local()?;
+    workspace_session_over(&mut client, project, workspace, op, on_line)
+}
+
+/// [`workspace_session`] over an already connected control client.
+pub(crate) fn workspace_session_over(
+    client: &mut ControlClient,
+    project: &str,
+    workspace: &str,
+    op: WorkspaceSessionOp,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> ExecOutcome {
     let req = WorkspaceSessionRequest {
         request_id: 1,
         project: project.to_string(),
@@ -135,6 +168,31 @@ pub fn workspace_session(
         op,
     };
     client.workspace_session(&req, on_line).map_err(map_client_err)
+}
+
+/// Ask this machine's daemon, started on demand, to make one write to
+/// `project`'s state files (control protocol v7): the daemon is their single
+/// writer and announces the change to its other clients. A remote window's
+/// writes go to its host's daemon instead
+/// ([`ProjectLink::write_state`](crate::source::ProjectLink::write_state)).
+pub fn write_state(project: &str, write: StateWrite) -> ExecOutcome {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(writer) = crate::state_write::test_support::local_writer() {
+        return writer(project, &write).map_err(ExecError::Backend);
+    }
+    let mut client = connect_local()?;
+    write_state_over(&mut client, project, write)
+}
+
+/// [`write_state`] over an already connected control client (a remote
+/// window's, on its host's `control` service).
+pub(crate) fn write_state_over(client: &mut ControlClient, project: &str, write: StateWrite) -> ExecOutcome {
+    let req = StateWriteRequest {
+        request_id: 1,
+        project: project.to_string(),
+        write,
+    };
+    client.write_state(&req).map_err(map_client_err)
 }
 
 /// Map an app [`Mutation`] to `(project, issue id, wire kind)`. The two
@@ -261,26 +319,55 @@ fn route(
     kind: MutationKind,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> Result<Option<ExpectedState>, ExecError> {
-    let mut client = connect_for_mutation()?;
-
-    let req = MutationRequest {
-        request_id: 1,
-        project: project.to_string(),
-        id: id.to_string(),
-        expected,
-        kind,
-    };
-    client.mutate(&req, on_line).map_err(map_client_err)
+    let mut client = connect_local()?;
+    send_mutation(&mut client, project, id, expected, kind, on_line)
 }
 
-/// Ensure the daemon, connect to its control socket, and refuse when this
-/// client is out of date.
-fn connect_for_mutation() -> Result<shelbi_client::ControlClient, ExecError> {
+/// This machine's daemon, started on demand, past the control hello.
+fn connect_local() -> Result<ControlClient, ExecError> {
     shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
     let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
-    let client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)
-        .map_err(|e| ExecError::Backend(e.to_string()))?;
+    ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION).map_err(|e| ExecError::Backend(e.to_string()))
+}
 
+/// This machine's daemon past the control hello, when it is running: `None`
+/// when nothing answers its control socket (nothing is started).
+pub(crate) fn connect_running() -> Option<ControlClient> {
+    let sock = shelbi_state::control_socket_path().ok()?;
+    ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION).ok()
+}
+
+/// The out-of-date refusal for a request on `client`: `Some` when its
+/// daemon runs another version than this client, which must relaunch first.
+pub(crate) fn out_of_date(client: &ControlClient) -> Option<ExecError> {
+    out_of_date_gate(&client.daemon_version, shelbi_state::CLIENT_VERSION)
+}
+
+/// [`execute_mutation_expecting`] over an already connected control client
+/// (a remote window's, on its host's `control` service).
+pub(crate) fn mutate_over(
+    client: &mut ControlClient,
+    mutation: &Mutation,
+    expected: Option<ExpectedState>,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> Result<Option<ExpectedState>, ExecError> {
+    let (project, id, kind) = map_to_kind(mutation)?;
+    let expected = match &kind {
+        MutationKind::Add(_) => None,
+        _ => expected,
+    };
+    send_mutation(client, &project, &id, expected, kind, on_line)
+}
+
+/// Send one mutation on `client` and map the result to an [`ExecError`].
+fn send_mutation(
+    client: &mut ControlClient,
+    project: &str,
+    id: &str,
+    expected: Option<ExpectedState>,
+    kind: MutationKind,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> Result<Option<ExpectedState>, ExecError> {
     // Out-of-date gate (removing-tmux Phase 4f, "Versions and upgrades"): if the
     // daemon answered its hello with a different version than ours, this client
     // is out of date and must NOT send a mutation — it should re-exec / relaunch
@@ -290,7 +377,15 @@ fn connect_for_mutation() -> Result<shelbi_client::ControlClient, ExecError> {
     if let Some(err) = out_of_date_gate(&client.daemon_version, shelbi_state::CLIENT_VERSION) {
         return Err(err);
     }
-    Ok(client)
+
+    let req = MutationRequest {
+        request_id: 1,
+        project: project.to_string(),
+        id: id.to_string(),
+        expected,
+        kind,
+    };
+    client.mutate(&req, on_line).map_err(map_client_err)
 }
 
 /// The out-of-date mutation gate: `Some(err)` when `daemon_version` differs
@@ -307,7 +402,9 @@ fn out_of_date_gate(daemon_version: &str, client_version: &str) -> Option<ExecEr
     )))
 }
 
-fn read_expected(project: &str, id: &str) -> Option<ExpectedState> {
+/// Issue `id`'s `(status, revision)` as `project`'s store has it now: what a
+/// mutation sent without a client snapshot expects. Blocking (a store read).
+pub fn read_expected(project: &str, id: &str) -> Option<ExpectedState> {
     let store = shelbi_state::issue_store_for(project).ok()?;
     let tf = store.get(id).ok()??;
     Some(ExpectedState {

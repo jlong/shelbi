@@ -49,7 +49,7 @@ pub use super::machine_form::{CheckKey, Field, Focus, SaveRequest};
 // ===========================================================================
 
 /// Which part of a target can't be checked as typed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TargetField {
     Host,
     WorkDir,
@@ -103,7 +103,7 @@ pub fn validate_target(host: &str, work_dir: &str) -> Result<(), TargetError> {
 // ===========================================================================
 
 /// One thing a readiness check verifies, in the order it's reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum StageKind {
     /// SSH connects and logs in.
     Ssh,
@@ -139,7 +139,7 @@ impl StageKind {
 }
 
 /// Where a stage stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum StageState {
     /// Not checked (yet): nothing ran, or an earlier stage has to answer.
     Waiting,
@@ -155,7 +155,7 @@ pub enum StageState {
 }
 
 /// One stage's result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Stage {
     pub kind: StageKind,
     pub state: StageState,
@@ -174,7 +174,7 @@ impl Stage {
 }
 
 /// How far SSH got.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Reach {
     /// It ran the check: the stages say what it found.
     Reached,
@@ -193,7 +193,7 @@ pub enum Reach {
 }
 
 /// The binary a ready check verified: what the hub records for the machine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VerifiedCli {
     pub path: String,
     pub version: String,
@@ -202,7 +202,7 @@ pub struct VerifiedCli {
 }
 
 /// What a readiness check found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Report {
     pub reach: Reach,
     /// Every [`StageKind`], in order.
@@ -273,7 +273,7 @@ impl Report {
 }
 
 /// What a readiness request found.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CheckOutcome {
     /// Test connection / Test again: the check's answer.
     Checked(Report),
@@ -328,7 +328,7 @@ impl CheckOutcome {
 // ===========================================================================
 
 /// Which readiness button was pressed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ReadinessIntent {
     /// Test connection: nothing checked yet for this host and directory.
     Test,
@@ -340,7 +340,7 @@ pub enum ReadinessIntent {
 
 /// The machine a readiness request is about: the draft as it stands, which
 /// may not be saved yet.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReadinessTarget {
     pub project: String,
     /// The configured machine's name, for Configure; `None` for a new one.
@@ -361,7 +361,7 @@ pub struct ReadinessTarget {
 
 /// The structured handoff to the readiness service: what to do, for which
 /// draft. `run` comes back with its outcome.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ReadinessRequest {
     pub run: u64,
     pub intent: ReadinessIntent,
@@ -369,7 +369,7 @@ pub struct ReadinessRequest {
 }
 
 /// A verified binary to record for a machine the project has.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Record {
     /// The machine's name in the project.
     pub machine: String,

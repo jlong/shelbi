@@ -163,10 +163,10 @@ fn a_switch_retargets_this_window_with_no_new_window(cx: &mut TestAppContext) {
     assert_eq!(windows(cx), [("beta".to_string(), 0)]);
     // The first frame paints beta's prefetched skeleton, in the same window.
     assert_eq!(read(cx, h, |w, _| w.model.project_label.clone()), "Beta");
-    assert_eq!(f.hub.subscribers(), [("beta".to_string(), 1)], "alpha's feed is gone");
+    assert_eq!(f.hub.subscribers(), [(ProjectKey::local("beta"), 1)], "alpha's feed is gone");
     // The window's slot now names beta.
     let slot = cx.update(|cx| cx.global::<Shell>().session.slots[0].clone());
-    assert_eq!(slot.project.as_deref(), Some("beta"));
+    assert_eq!(slot.project, Some(ProjectKey::local("beta")));
     assert!(slot.open);
     // Switching to the project already shown does nothing.
     update(cx, h, |w, window, cx| w.perform(HostCall::SwitchProject("beta".into()), window, cx));
@@ -246,7 +246,7 @@ fn a_to_b_to_a_restores_alpha_with_nothing_left_behind(cx: &mut TestAppContext) 
     });
     // One feed (alpha's), one subscriber; alpha's first feed and beta's have
     // stopped.
-    assert_eq!(f.hub.subscribers(), [("alpha".to_string(), 1)]);
+    assert_eq!(f.hub.subscribers(), [(ProjectKey::local("alpha"), 1)]);
     assert_eq!(f.hub.spawned(), 3);
     assert_eq!(f.feeds.running(), 1);
     // One live attach: alpha's agent. Beta's chat is closed, and alpha's
@@ -296,8 +296,8 @@ fn new_window_opens_a_second_window_that_switches_on_its_own(cx: &mut TestAppCon
     update(cx, b, |w, window, cx| w.switch_to("beta", window, cx));
     assert_eq!(windows(cx), [("alpha".to_string(), 0), ("beta".to_string(), 1)]);
     let slots = cx.update(|cx| cx.global::<Shell>().session.slots.clone());
-    assert_eq!(slots[0].project.as_deref(), Some("alpha"));
-    assert_eq!(slots[1].project.as_deref(), Some("beta"));
+    assert_eq!(slots[0].project, Some(ProjectKey::local("alpha")));
+    assert_eq!(slots[1].project, Some(ProjectKey::local("beta")));
     // ⌘⇧N is on the command, and the palette offers it.
     assert!(read(cx, a, |w, _| w.command_model().multi_window));
     assert_eq!(
@@ -311,7 +311,7 @@ fn two_windows_on_one_project_share_its_feed_and_one_posts_notices(cx: &mut Test
     let f = fixture(cx);
     let a = open(cx, &f, "alpha", 0);
     let b = open(cx, &f, "alpha", 1);
-    assert_eq!(f.hub.subscribers(), [("alpha".to_string(), 2)]);
+    assert_eq!(f.hub.subscribers(), [(ProjectKey::local("alpha"), 2)]);
     assert_eq!(f.hub.spawned(), 1);
     // Asked as a feed event asks it: from inside the window's own update.
     assert!(update(cx, a, |w, _, cx| w.posts_notices(cx)));
@@ -402,12 +402,12 @@ fn a_launch_reopens_the_open_windows_and_a_close_forgets_one(cx: &mut TestAppCon
     let plan = vec![
         LaunchWindow {
             slot: 0,
-            project: "alpha".into(),
+            project: ProjectKey::local("alpha"),
             state: WindowState::default(),
         },
         LaunchWindow {
             slot: 2,
-            project: "beta".into(),
+            project: ProjectKey::local("beta"),
             state: WindowState {
                 sidebar_width: 33,
                 task_pane_width: 820.0,
@@ -473,7 +473,7 @@ fn okay_from_a_project_window_lands_on_the_new_projects_orchestrator(cx: &mut Te
     assert!(read(cx, h, |w, _| matches!(w.route, Route::Settings(_))));
     cx.update(|cx| {
         cx.global::<Catalog>().remember_view(
-            "gamma",
+            &ProjectKey::local("gamma"),
             ProjectViewState {
                 view: Some("tasks".into()),
                 ..Default::default()
@@ -495,7 +495,7 @@ fn okay_from_a_project_window_lands_on_the_new_projects_orchestrator(cx: &mut Te
         assert_eq!(w.model.project_label, "Gamma");
     });
     // alpha keeps where it was left.
-    let alpha = cx.update(|cx| cx.global::<Catalog>().view_state("alpha"));
+    let alpha = cx.update(|cx| cx.global::<Catalog>().view_state(&ProjectKey::local("alpha")));
     assert_eq!(alpha.view.as_deref(), Some("alpha-1"));
 
     // Okay again (a retried open): the window that shows it comes up, still

@@ -60,7 +60,7 @@ fn loaded() -> WorkflowsState {
 fn make(state: &mut WorkflowsState, edit: Edit) {
     let mut job = state.request(edit);
     while let Some((config, edit)) = job {
-        let done = commit(PROJECT, &config, edit);
+        let done = commit(&shelbi_app::settings::store::Disk { project: PROJECT.into() }, &config, edit);
         job = state.committed(done);
     }
 }
@@ -170,9 +170,9 @@ fn moves_queued_behind_a_save_each_take_a_step() {
         let down = state.move_status_by("todo", true).unwrap();
         assert!(state.request(down).is_none());
     }
-    let mut job = state.committed(commit(PROJECT, &config, first));
+    let mut job = state.committed(commit(&shelbi_app::settings::store::Disk { project: PROJECT.into() }, &config, first));
     while let Some((config, edit)) = job {
-        job = state.committed(commit(PROJECT, &config, edit));
+        job = state.committed(commit(&shelbi_app::settings::store::Disk { project: PROJECT.into() }, &config, edit));
     }
     let ids: Vec<_> = state.statuses().into_iter().map(|s| s.id).collect();
     assert_eq!(ids, ["backlog", "in-progress", "review", "done", "todo", "canceled"]);
@@ -294,10 +294,10 @@ fn an_edit_made_while_one_saves_waits_its_turn() {
     assert!(state.request(Edit::RenameStatus { id: "done".into(), name: "B".into() }).is_none());
     assert!(state.request(Edit::SetCategory { id: "review".into(), category: StatusCategory::Active }).is_none());
     assert_eq!(state.queued(), 2);
-    let (config2, second) = state.committed(commit(PROJECT, &config, first)).expect("the queued one");
+    let (config2, second) = state.committed(commit(&shelbi_app::settings::store::Disk { project: PROJECT.into() }, &config, first)).expect("the queued one");
     assert_eq!(config2.status("todo").unwrap().name, "A", "builds on the first save");
-    let (config3, third) = state.committed(commit(PROJECT, &config2, second)).expect("the last one");
-    assert_eq!(state.committed(commit(PROJECT, &config3, third)).map(|_| ()), None);
+    let (config3, third) = state.committed(commit(&shelbi_app::settings::store::Disk { project: PROJECT.into() }, &config2, second)).expect("the last one");
+    assert_eq!(state.committed(commit(&shelbi_app::settings::store::Disk { project: PROJECT.into() }, &config3, third)).map(|_| ()), None);
     assert!(!state.saving());
     let back = WorkflowConfig::load(PROJECT).unwrap();
     assert_eq!(
@@ -313,9 +313,9 @@ fn a_queued_edit_that_saves_doesnt_hide_the_one_that_failed() {
     let mut state = loaded();
     let (config, first) = state.request(Edit::DeleteStatus { id: "review".into() }).unwrap();
     state.request(Edit::RenameStatus { id: "todo".into(), name: "Next".into() });
-    let (config2, second) = state.committed(commit(PROJECT, &config, first)).expect("the queued rename");
+    let (config2, second) = state.committed(commit(&shelbi_app::settings::store::Disk { project: PROJECT.into() }, &config, first)).expect("the queued rename");
     assert!(state.error_at(&Target::Status("review".into())).is_some(), "the delete was refused");
-    assert_eq!(state.committed(commit(PROJECT, &config2, second)).map(|_| ()), None);
+    assert_eq!(state.committed(commit(&shelbi_app::settings::store::Disk { project: PROJECT.into() }, &config2, second)).map(|_| ()), None);
     assert!(
         state.error_at(&Target::Status("review".into())).is_some(),
         "the rename saving doesn't clear the delete's error"
@@ -336,10 +336,10 @@ fn a_late_completion_or_load_never_overrides_the_save_in_flight() {
     // A reload landing mid-save is ignored: the save brings its own model.
     assert!(!state.loaded(Err("stale".into())));
     assert!(state.error_at(&Target::Page).is_none());
-    let done = commit(PROJECT, &config, edit);
+    let done = commit(&shelbi_app::settings::store::Disk { project: PROJECT.into() }, &config, edit);
     assert_eq!(state.committed(done).map(|_| ()), None);
     // A second completion with nothing in flight is dropped.
-    let again = commit(PROJECT, &config, Edit::RenameStatus { id: "todo".into(), name: "Old".into() });
+    let again = commit(&shelbi_app::settings::store::Disk { project: PROJECT.into() }, &config, Edit::RenameStatus { id: "todo".into(), name: "Old".into() });
     assert!(again.error.is_some(), "the stale model conflicts with the save on disk");
     state.committed(again);
     assert!(state.error_at(&Target::Status("todo".into())).is_none());

@@ -112,6 +112,18 @@ impl Engine {
         }
     }
 
+    /// A remote window's: the far hub saves and checks the project's
+    /// machines, over the window's link (`shelbi_app::far`).
+    pub fn far(link: &shelbi_app::source::ProjectLink) -> Self {
+        let machines = shelbi_app::far::machine_service(link);
+        let readiness = shelbi_app::far::readiness_service(link);
+        Engine {
+            save: Arc::new(move |project, request| machines.run(project, request)),
+            readiness: readiness.check,
+            record: readiness.record,
+        }
+    }
+
     /// The engine a form opened now uses: the global, else the real one (a
     /// test's default never reaches the hub or a real home).
     pub fn current(cx: &App) -> Self {

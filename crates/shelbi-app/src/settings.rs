@@ -49,6 +49,7 @@ pub mod general;
 pub mod keybindings;
 pub mod machine_check;
 pub mod machine_form;
+pub mod store;
 pub mod summary;
 pub mod terminal_preview;
 pub mod workflow_builder;

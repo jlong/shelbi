@@ -1001,7 +1001,8 @@ fn origin_from_config(config: &str) -> Option<String> {
 /// and the newest modification time among them and the directory. A client
 /// polls it and re-reads the changelog when it changes (an entry added,
 /// edited, or removed).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ChangelogStamp {
     pub entries: usize,
     pub modified: Option<SystemTime>,

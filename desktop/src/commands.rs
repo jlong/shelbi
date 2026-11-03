@@ -61,6 +61,9 @@ pub trait CommandHost {
     fn connect_remote(&mut self);
     /// Show the launch screen.
     fn show_launch_screen(&mut self);
+    /// Open this remote window's project in its terminal view: the far TUI
+    /// in a terminal window of its own.
+    fn open_terminal_view(&mut self);
     /// Open a review task: a queued one asks which slot to load it onto.
     fn load_review(&mut self, task_id: &str);
     /// Approve (accept and merge) a review task.
@@ -122,6 +125,9 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         // (`CommandModel::remote_connect` / `launch_screen`).
         CommandKind::ConnectRemote => host.connect_remote(),
         CommandKind::ShowLaunchScreen => host.show_launch_screen(),
+        // View ▸ Open in Terminal View (a native remote window's): the far
+        // machine's TUI over `ssh -t`, beside this window.
+        CommandKind::OpenTerminalView => host.open_terminal_view(),
         // File ▸ New Window (⌘⇧N): another window, on this project, that
         // switches on its own.
         CommandKind::NewWindow => host.new_window(),
@@ -192,6 +198,8 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::ConnectRemote => false,
         // Only lists the projects and the recent remote sessions.
         CommandKind::ShowLaunchScreen => false,
+        // A terminal window over SSH to the far machine, not this daemon.
+        CommandKind::OpenTerminalView => false,
         // May launch the workspace's agent.
         CommandKind::FocusWorkspace { .. } => true,
         CommandKind::LoadReview { .. } => true,
@@ -314,6 +322,9 @@ mod tests {
         fn show_launch_screen(&mut self) {
             self.0.push("launch-screen".into());
         }
+        fn open_terminal_view(&mut self) {
+            self.0.push("open-terminal-view".into());
+        }
         fn load_review(&mut self, task_id: &str) {
             self.0.push(format!("load-review:{task_id}"));
         }
@@ -385,6 +396,7 @@ mod tests {
             (CommandKind::AddProject, "add-project"),
             (CommandKind::ConnectRemote, "connect-remote"),
             (CommandKind::ShowLaunchScreen, "launch-screen"),
+            (CommandKind::OpenTerminalView, "open-terminal-view"),
             (CommandKind::NewWindow, "new-window"),
             (CommandKind::Detach, "detach"),
             (CommandKind::DetachOtherClients, "detach-others"),
@@ -503,6 +515,7 @@ mod tests {
                 "acknowledgements",
                 "connect-remote",
                 "launch-screen",
+                "open-terminal-view",
                 "new-window",
                 "detach",
                 "editor:edit:project",

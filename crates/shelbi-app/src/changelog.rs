@@ -12,6 +12,7 @@
 //! this module is the view over them.
 
 use chrono::{DateTime, FixedOffset};
+use serde::{Deserialize, Serialize};
 use shelbi_state::changelog::{self, ChangelogStamp, Link};
 
 /// How many entries a page shows, and how many more each
@@ -19,7 +20,8 @@ use shelbi_state::changelog::{self, ChangelogStamp, Link};
 pub const PAGE_SIZE: usize = 50;
 
 /// What a link points at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LinkKind {
     /// A Shelbi issue.
     Issue,
@@ -30,7 +32,8 @@ pub enum LinkKind {
 }
 
 /// Where following a link goes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LinkTarget {
     /// Open this Shelbi issue inside Shelbi.
     Issue(String),
@@ -41,7 +44,12 @@ pub enum LinkTarget {
 }
 
 /// One resolved link, ready to draw.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// On the wire it is the state layer's [`Link`] alone (`{"kind":"pr",…}`):
+/// the kind, label and target are derived from it, so decoding rebuilds them
+/// with [`ChangelogLink::new`] rather than trusting a second copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "Link", into = "Link")]
 pub struct ChangelogLink {
     pub kind: LinkKind,
     /// How it reads: the issue id, `#1942`, or the URL without its scheme.
@@ -49,6 +57,18 @@ pub struct ChangelogLink {
     pub target: LinkTarget,
     /// The link as the state layer has it, for search.
     link: Link,
+}
+
+impl From<Link> for ChangelogLink {
+    fn from(link: Link) -> Self {
+        ChangelogLink::new(link)
+    }
+}
+
+impl From<ChangelogLink> for Link {
+    fn from(link: ChangelogLink) -> Self {
+        link.link
+    }
 }
 
 impl ChangelogLink {
@@ -89,7 +109,8 @@ fn display_url(url: &str) -> String {
 }
 
 /// One entry as a client draws it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ChangelogEntryView {
     /// The entry id (`shelbi changelog show <id>`).
     pub id: String,
@@ -186,8 +207,10 @@ impl ChangelogEntryView {
     }
 }
 
-/// One read of a project's changelog.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// One read of a project's changelog. Serializable for the remote window's
+/// query service (`crate::wire` pins the JSON shape).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ChangelogData {
     pub project: String,
     /// Newest first.

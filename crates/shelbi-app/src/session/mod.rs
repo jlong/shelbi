@@ -24,12 +24,17 @@
 //!   restart, a backoff wait, a give-up, or standing down.
 //! - [`Relauncher`] ([`relaunch`]): how a dead pane is brought back before
 //!   the client re-attaches.
+//! - [`ReconnectController`] ([`reconnect`]): riding out a lost connection
+//!   to a session on another machine.
+//! - [`remote::RemoteSessionConnector`] ([`remote`]): a remote window's
+//!   panes, attached over the host's relay link.
 //! - The notices the views show ([`connecting_notice`], [`failed_notice`],
 //!   [`restarting_notice`], [`gave_up_notice`], [`orchestrator_down_notice`],
 //!   [`exit_line`]), so both
 //!   clients word them identically.
 
 pub mod reconnect;
+pub mod remote;
 pub mod relaunch;
 pub mod restart;
 
@@ -99,6 +104,44 @@ impl SessionRef {
             workspace: workspace.to_string(),
             role: SHELL_ROLE.to_string(),
         }
+    }
+
+    /// This target as the relay's `session` service names it on the wire.
+    pub fn to_target(&self) -> shelbi_proto::SessionTarget {
+        use shelbi_proto::SessionTarget;
+        match self {
+            SessionRef::Orchestrator => SessionTarget::Orchestrator,
+            SessionRef::Workspace(workspace) => SessionTarget::Workspace {
+                workspace: workspace.clone(),
+            },
+            SessionRef::Review { slot, role } => SessionTarget::Review {
+                slot: slot.clone(),
+                role: role.clone(),
+            },
+            SessionRef::WorkspaceContent { workspace, role } => SessionTarget::WorkspaceContent {
+                workspace: workspace.clone(),
+                role: role.clone(),
+            },
+        }
+    }
+
+    /// The target a relay `session` stream names, or `None` for a kind this
+    /// build does not know.
+    pub fn from_target(target: &shelbi_proto::SessionTarget) -> Option<SessionRef> {
+        use shelbi_proto::SessionTarget;
+        Some(match target {
+            SessionTarget::Orchestrator => SessionRef::Orchestrator,
+            SessionTarget::Workspace { workspace } => SessionRef::Workspace(workspace.clone()),
+            SessionTarget::Review { slot, role } => SessionRef::Review {
+                slot: slot.clone(),
+                role: role.clone(),
+            },
+            SessionTarget::WorkspaceContent { workspace, role } => SessionRef::WorkspaceContent {
+                workspace: workspace.clone(),
+                role: role.clone(),
+            },
+            SessionTarget::Unknown => return None,
+        })
     }
 
     /// The workspace a workspace-scoped target belongs to (its agent, editor,
