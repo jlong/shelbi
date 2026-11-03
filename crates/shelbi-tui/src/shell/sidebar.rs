@@ -6,7 +6,7 @@
 //! UI thread by [`super::sidebar_model`]); this module only lays those rows out
 //! and maps a selection / click to what the main area should show. Laid out
 //! top to bottom to match John's Figma "Navigation" design: a header (project
-//! title + a filled search box that opens the command palette), a full-width
+//! title + a square Search button that opens the command palette), a full-width
 //! nav block with the half-block selection bleed, the machine-grouped
 //! workspace pool with per-state badges, the two review sections rendered as
 //! two-line entries (dim `⎇ branch` line, truncated with `…`), and the footer
@@ -103,9 +103,9 @@ impl FooterButton {
 }
 
 /// Per-frame footer/header input that isn't board state: the resolved
-/// palette-open chord shown in the search box's `⌘K`-style hint. Owned (no
-/// borrow of the shell state) so the draw closure can disjointly borrow the
-/// rest of the state.
+/// palette-open chord the Search button's tooltip names, and which button the
+/// pointer is over. Owned (no borrow of the shell state) so the draw closure
+/// can disjointly borrow the rest of the state.
 pub struct SidebarChrome {
     /// The palette-open chord resolved for the host platform (e.g. `⌃P` on
     /// macOS, `Ctrl+P` elsewhere), or `<unbound>` when no chord is bound.
@@ -113,6 +113,9 @@ pub struct SidebarChrome {
     /// The footer button under the pointer, lit with its hover fill (the
     /// unread-errors badge also shows its count beside the toolbar).
     hover: Option<FooterButton>,
+    /// The pointer is over the header's Search button: its square lifts and
+    /// its tooltip shows.
+    search_hover: bool,
 }
 
 impl SidebarChrome {
@@ -124,12 +127,19 @@ impl SidebarChrome {
                 display_style,
             ),
             hover: None,
+            search_hover: false,
         }
     }
 
     /// The footer button the pointer is over (see [`SidebarView::footer_button_at`]).
     pub fn with_hover(self, hover: Option<FooterButton>) -> Self {
         SidebarChrome { hover, ..self }
+    }
+
+    /// Whether the pointer is over the header's Search button (see
+    /// [`SidebarView::search_button_hit`]).
+    pub fn with_search_hover(self, search_hover: bool) -> Self {
+        SidebarChrome { search_hover, ..self }
     }
 
     /// The resolved palette-open chord (e.g. `⌃P`, `Ctrl+Space`), for callers
@@ -363,9 +373,37 @@ impl SidebarView {
             .map_or(row.x + LIST_INDENT.horizontal, |(_, r)| r.right())
     }
 
+    /// The header's Search button glyph (`🔍`, two cells wide), or the word
+    /// when emoji can't draw.
+    fn search_face(&self) -> &'static str {
+        if self.emoji {
+            "🔍"
+        } else {
+            "Search"
+        }
+    }
+
+    /// The header's Search button: a square like the footer's (`▄` cap,
+    /// glyph row, `▀` cap) across header rows 0–2, so its glyph shares the
+    /// title's row, its right edge [`HEADER_INSET`] columns in from the
+    /// sidebar's right as the title is from its left. `None` on a header too
+    /// short for all three rows, or a sidebar too narrow to leave the title a
+    /// column beside it.
+    fn search_button_rect(&self, header: Rect) -> Option<Rect> {
+        let width = panel::square_button_width(self.search_face()) as u16;
+        let x = header.right().checked_sub(HEADER_INSET + width)?;
+        (header.height >= 3 && x > header.x + HEADER_INSET).then_some(Rect {
+            x,
+            y: header.y,
+            width,
+            height: 3,
+        })
+    }
+
     /// Split the sidebar `area` into (header, search, nav, rest-list, footer)
     /// rects — the shared geometry the renderer and the click map both derive
-    /// from. `search` is `None` when the header is too short to hold the box;
+    /// from. `search` is the Search button's square, `None` when the header
+    /// can't hold it (see [`Self::search_button_rect`]);
     /// `rest` is `None` when the body is too short to hold anything past the nav
     /// block.
     fn geometry(&self, area: Rect) -> SidebarGeometry {
@@ -375,9 +413,6 @@ impl SidebarView {
             .split(area);
         let body_region = outer[0];
         let footer = self.footer_rows(outer[1]);
-        // Header holds the project title (row 0), a half-row margin (row 1),
-        // the 2-row search box across rows 2–4 (`▄` / label / `▀`), and a
-        // half-row margin (row 5); then the body.
         let header_h = HEADER_H.min(body_region.height);
         let split = Layout::default()
             .direction(Direction::Vertical)
@@ -385,17 +420,7 @@ impl SidebarView {
             .split(body_region);
         let header = split[0];
         let body = split[1];
-        // Header rhythm: a blank row (0), the project title (1), a blank row
-        // (2), then the 2-row search box drawn across the three cell rows 3–5
-        // (`▄` / label / `▀`). The box needs all three rows present (height ≥ 6).
-        let search = (header.height >= 6).then(|| {
-            Rect {
-                y: header.y + 3,
-                height: 3,
-                ..header
-            }
-            .inner(LIST_INDENT)
-        });
+        let search = self.search_button_rect(header);
         let nav_height = (nav_lines(self.nav_n()) as u16).min(body.height);
         let nav = Rect {
             height: nav_height,
@@ -456,9 +481,10 @@ impl SidebarView {
         }
     }
 
-    /// Whether `(x, y)` lands on the search box — the shell maps a click here to
-    /// opening the command palette, the same as pressing the palette chord.
-    pub fn search_box_hit(&self, area: Rect, x: u16, y: u16) -> bool {
+    /// Whether `(x, y)` lands on the header's Search button (any of the three
+    /// cell rows its square spans) — the shell maps a click here to opening
+    /// the command palette, the same as pressing the palette chord.
+    pub fn search_button_hit(&self, area: Rect, x: u16, y: u16) -> bool {
         if area.width == 0 || area.height == 0 || !contains(area, x, y) {
             return false;
         }
@@ -469,7 +495,7 @@ impl SidebarView {
 
     /// The footer button at `(x, y)`, if any: its columns across the three
     /// cell rows its square spans (the `▄` margin, the toolbar row, the `▀`
-    /// margin), like the search box's target. The shell opens Settings, runs
+    /// margin), like the Search button's target. The shell opens Settings, runs
     /// Send Feedback, or opens the error log.
     pub fn footer_button_at(&self, area: Rect, x: u16, y: u16) -> Option<FooterButton> {
         if area.width == 0 || area.height == 0 || !contains(area, x, y) {
@@ -559,7 +585,7 @@ impl SidebarView {
         // The sidebar paints no full-area background: unfilled cells keep the
         // terminal's default background (`Color::Reset`) so a semi-transparent
         // terminal shows through. Only the components that are filled in the
-        // Figma carry a fill — the search box, the selection blocks, and the zen
+        // Figma carry a fill — the buttons, the selection blocks, and the zen
         // band. The half-block bleed rows draw their fill as the glyph's
         // *foreground* over that default background, so they blend with whatever
         // sits behind the sidebar rather than a painted black.
@@ -575,9 +601,12 @@ impl SidebarView {
         self.render_footer(buf, area, &geo.footer, chrome.hover);
     }
 
-    /// Render the header block: the project title in the accent cyan on the
-    /// first row, and the 2-row filled search box (with its half-block bleed)
-    /// two rows below it.
+    /// Render the header block (Figma `Project`): the project title in bold
+    /// accent cyan on row 1, [`HEADER_INSET`] columns in so it lines up with
+    /// the nav glyphs, and the Search button's square at the row's right end,
+    /// its glyph on the title's row. Under the pointer the square lifts, as
+    /// the footer's do, and the row below it names the button and its chord
+    /// (the desktop's `Search (⌃P)` tooltip), right-aligned under the square.
     fn render_header(
         &self,
         buf: &mut Buffer,
@@ -589,28 +618,61 @@ impl SidebarView {
             return;
         }
         // The title sits on row 1 (a blank row above it); fall back to row 0 on
-        // a header clamped to a single row. Settings lives in the footer's
-        // toolbar, so the title has the row to itself.
+        // a header clamped to a single row. It stops a column short of the
+        // Search button.
+        let title_y = header.y + if header.height >= 2 { 1 } else { 0 };
+        let title_x = (header.x + HEADER_INSET).min(header.right());
+        let title_end = search.map_or(header.right().saturating_sub(HEADER_INSET), |b| b.x - 1);
         let title_rect = Rect {
-            y: header.y + if header.height >= 2 { 1 } else { 0 },
+            x: title_x,
+            y: title_y,
+            width: title_end.saturating_sub(title_x),
             height: 1,
-            ..header
-        }
-        .inner(LIST_INDENT);
+        };
         Paragraph::new(Line::from(Span::styled(
             truncate_ellipsis(&self.project_label, title_rect.width as usize),
             Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
         )))
         .render(title_rect, buf);
 
-        if let Some(search) = search {
-            render_search_box(buf, search, &chrome.palette);
+        let Some(button) = search else {
+            return;
+        };
+        let fill = if chrome.search_hover {
+            palette().button_hover
+        } else {
+            palette().search
+        };
+        panel::draw_square_button(
+            buf,
+            button.x,
+            [Some(button.y), Some(button.y + 1), Some(button.y + 2)],
+            button.width,
+            self.search_face(),
+            fill,
+            Style::default().fg(palette().gray),
+        );
+        // The tooltip row: the header's last row, when it has one past the
+        // square.
+        let tip_y = button.y + 3;
+        if chrome.search_hover && tip_y < header.bottom() {
+            let tip = search_tooltip(&chrome.palette);
+            let room = button.right().saturating_sub(header.x + LIST_INDENT.horizontal) as usize;
+            let tip = truncate_ellipsis(&tip, room);
+            let w = UnicodeWidthStr::width(tip.as_str()) as u16;
+            buf.set_stringn(
+                button.right() - w,
+                tip_y,
+                &tip,
+                w as usize,
+                Style::default().fg(palette().gray),
+            );
         }
     }
 
     /// Render the leading `Row::Nav` rows as an inset block: a separator line
     /// between (and bracketing) each item, the selected item's fill spanning the
-    /// inset width (one column in from each edge, matching the search box), its
+    /// inset width (one column in from each edge), its
     /// adjacent separators carrying the half-block bleed. The label keeps a
     /// further 1-col inner pad inside that inset.
     fn render_nav(&self, buf: &mut Buffer, area: Rect, sel_row: Option<usize>, focused: bool) {
@@ -618,7 +680,7 @@ impl SidebarView {
             return;
         }
         // The nav item bounds — fill, half-block bleed, and label — are inset one
-        // column from each side, exactly like the search box above, so the
+        // column from each side, as the rest of the list's rows are, so the
         // selection block reads as the same width. The gutter columns stay on
         // the terminal's default (transparent) background.
         let inner = area.inner(LIST_INDENT);
@@ -791,14 +853,21 @@ struct FooterRows {
 /// two squares never touch).
 const BUTTON_GAP: u16 = 1;
 
-/// Height of the header block: a blank row (0), the project title (row 1), a
-/// blank row (2), and the 2-row search box drawn across three cell rows with
-/// the half-block bleed (rows 3–5: `▄` top, label, `▀` bottom). The nav block's
-/// own leading separator sits directly below that.
-const HEADER_H: u16 = 6;
+/// Height of the header block (Figma `Project`, 88pt = four 22pt rows): the
+/// Search button's square across rows 0–2 (`▄` cap, glyph, `▀` cap), the
+/// project title on row 1 beside its glyph, and a blank row 3 (where the
+/// button's tooltip shows under the pointer). The nav block's own leading
+/// separator sits directly below that, so the nav labels land on rows 5, 7
+/// and 9, as in the Figma.
+const HEADER_H: u16 = 4;
 
-/// 1-col horizontal padding shared by the title, the search box, the nav
-/// labels, and the rest-of-list rows. The nav section's full-width fill
+/// Columns between the sidebar's edges and the header's contents (Figma's
+/// 19.2pt): the title on the left, lined up with the nav glyphs, and the
+/// Search button on the right.
+const HEADER_INSET: u16 = 2;
+
+/// 1-col horizontal padding shared by the nav block, the footer's toolbar,
+/// and the rest-of-list rows. The nav section's full-width fill
 /// deliberately bypasses it while its label text re-applies it.
 const LIST_INDENT: Margin = Margin {
     horizontal: 1,
@@ -1055,76 +1124,13 @@ fn truncate_ellipsis(s: &str, max: usize) -> String {
     format!("{keep}…")
 }
 
-/// Draw the search box: a 2-row-tall filled box carrying a `🔍 Search` label on
-/// the left and a right-aligned palette-chord hint (e.g. `⌃P`). The box is
-/// drawn across three cell rows with the same half-block bleed the nav
-/// selection bar uses — a lower-half-block row on top (fill in its bottom half,
-/// a half-row of padding above the label), the label row on a solid fill, and
-/// an upper-half-block row below (fill in its top half, a half-row of padding
-/// below). The half-block glyphs carry the fill as their *foreground* on the
-/// terminal's default (transparent) background, so the eye reads the fill as
-/// half a cell tall on those rows. The chord is dropped when there isn't room.
-fn render_search_box(buf: &mut Buffer, area: Rect, chord: &str) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let width = area.width as usize;
-
-    // The box occupies rows [top, top+2]: `▄` bleed, label, `▀` bleed. When the
-    // area is shorter (a clamped header) we draw what fits, label row first.
-    let top = area.top();
-    let label_y = (top + 1).min(area.bottom().saturating_sub(1));
-    let bottom = top + 2;
-
-    // Top / bottom half-block bleed rows: the fill as the glyph's foreground on
-    // the terminal's default (transparent) background, exactly like the nav
-    // selection bleed (and the settings' text fields, which share the caps).
-    let (above, below) = crate::textbox::caps(width, palette().search);
-    if label_y > top {
-        Paragraph::new(above).render(Rect { y: top, height: 1, ..area }, buf);
-    }
-    if bottom < area.bottom() {
-        Paragraph::new(below).render(Rect { y: bottom, height: 1, ..area }, buf);
-    }
-
-    // Label row, on the solid search fill. Measure in *display* columns, not
-    // chars: the `🔍` is one `char` but two cells wide, so a char count would
-    // undercount the label by a column and push the right-aligned chord one cell
-    // past where the padding math intends — clipping the trailing inset and
-    // leaving the chord flush against the box's right edge.
-    let label = " 🔍 Search";
-    let label_w = UnicodeWidthStr::width(label);
-    let chord_w = UnicodeWidthStr::width(chord);
-
-    // Both the label and the shortcut are the normal `color/gray` (#bababa), not
-    // dimmed — the Figma search box reads them at the same weight.
-    let mut spans = vec![Span::styled(
-        label.to_string(),
-        Style::default().fg(palette().gray).bg(palette().search),
-    )];
-    // Append the chord hint only when the label, the chord, and a one-column
-    // right inset all fit. The chord sits one column in from the box's right
-    // edge, mirroring the label's one-column inset on the left; that final
-    // column is a blank fill cell (RIGHT_INSET wide).
-    const RIGHT_INSET: usize = 1;
-    if chord_w > 0 && label_w + chord_w + RIGHT_INSET <= width {
-        let pad = width - label_w - chord_w - RIGHT_INSET;
-        spans.push(Span::styled(" ".repeat(pad), Style::default().bg(palette().search)));
-        spans.push(Span::styled(chord.to_string(), Style::default().fg(palette().gray).bg(palette().search)));
-        spans.push(Span::styled(
-            " ".repeat(RIGHT_INSET),
-            Style::default().bg(palette().search),
-        ));
-    }
-    Paragraph::new(Line::from(spans)).render(Rect { y: label_y, height: 1, ..area }, buf);
-    // Re-fill the label row's background last: a double-width glyph resets its
-    // trailing continuation cell when the text is laid down, so paint over every
-    // cell to keep the row a solid bar. Only the label row is re-filled — the
-    // bleed rows must keep their default background so the half-block reads as
-    // half a cell of fill rather than a full one. Setting bg leaves the symbols
-    // and fg intact.
-    for x in area.left()..area.right() {
-        buf[(x, label_y)].set_bg(palette().search);
+/// The Search button's tooltip: its name and the palette chord it shares
+/// (`Search (⌃P)`), just the name while the palette is unbound.
+fn search_tooltip(chord: &str) -> String {
+    if chord.is_empty() || chord == crate::keymap::UNBOUND {
+        "Search".to_string()
+    } else {
+        format!("Search ({chord})")
     }
 }
 
@@ -1426,8 +1432,8 @@ mod tests {
     }
 
     /// The selected nav item's fill and its half-block bleed (U+2584 above,
-    /// U+2580 below) are inset one column from each edge — the same width as the
-    /// search box — with the gutter columns left on the default (transparent)
+    /// U+2580 below) are inset one column from each edge, with the gutter
+    /// columns left on the default (transparent)
     /// background. The selected label is white + bold; an unselected label is
     /// plain #bababa with no fill.
     #[test]
@@ -1809,180 +1815,141 @@ mod tests {
 
     // --- header / search ----------------------------------------------------
 
-    /// The header renders a blank row, the project name in the accent cyan on
-    /// row 1, a blank row, then the filled search box (rows 3–5) carrying
-    /// `🔍 Search` and the resolved palette chord. The area paints no background;
-    /// unfilled cells keep the default (transparent) background.
+    /// The Search button's columns on a `w`-wide sidebar: a square five
+    /// columns wide (the footer's), its right edge two columns in.
+    fn search_cols(w: u16) -> std::ops::Range<u16> {
+        w - 7..w - 2
+    }
+
+    fn header_buf(model: &SidebarModel, chrome: &SidebarChrome, w: u16, h: u16) -> Buffer {
+        let view = SidebarView::build(model);
+        let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+        let area = buf.area;
+        view.render(&mut buf, area, 1, true, chrome); // Issues selected
+        buf
+    }
+
+    /// The header is Figma's `Project` frame: four rows, the bold cyan title
+    /// two columns in on row 1, and the Search button's square (`▄` / `🔍`
+    /// on the search fill / `▀`) two columns in from the right across rows
+    /// 0–2, its glyph on the title's row. Nothing else: no `Search` label and
+    /// no chord.
     #[test]
-    fn header_renders_project_title_and_search_box() {
+    fn header_matches_the_figma_project_frame() {
         let mut model = empty_model();
         model.project_label = "My project".into();
-        let view = SidebarView::build(&model);
-        let backend = TestBackend::new(40, 20);
-        let mut term = Terminal::new(backend).unwrap();
-        term.draw(|f| {
-            let area = f.area();
-            view.render(f.buffer_mut(), area, 1, true, &default_chrome()) // Issues selected
-        })
-        .unwrap();
-        let buf = term.backend().buffer().clone();
-        let rows = dump(&term);
+        let buf = header_buf(&model, &default_chrome(), 40, 20);
+        let rows: Vec<String> = (0..20).map(|y| buf_row(&buf, y)).collect();
         let joined = rows.join("\n");
 
-        // A blank row sits above the title; the title is on row 1, accent cyan.
-        assert!(rows[0].trim().is_empty(), "a blank row sits above the title, got: {:?}", rows[0]);
         assert_eq!(buf[(1, 0)].bg, Color::Reset, "the sidebar paints no background (transparent)");
-        let title_y = row_y(&rows, "My project");
-        assert_eq!(title_y, 1, "project title is on the second row, got:\n{joined}");
-        let title_x = rows[title_y].find('M').unwrap() as u16;
-        assert_eq!(buf[(title_x, title_y as u16)].fg, palette().cyan, "title is the accent cyan #00a6b2");
-        assert!(rows[2].trim().is_empty(), "a blank row sits below the title, got: {:?}", rows[2]);
+        assert_eq!(row_y(&rows, "My project"), 1, "the title is on row 1:\n{joined}");
+        assert_eq!(rows[1].find('M'), Some(2), "the title is two columns in, over the nav glyphs:\n{joined}");
+        for x in 2..12u16 {
+            assert_eq!(buf[(x, 1)].fg, palette().cyan, "the title is the accent cyan, col {x}");
+            assert!(buf[(x, 1)].modifier.contains(Modifier::BOLD), "the title is bold, col {x}");
+        }
 
-        // Search box with the magnifier, label, and the mac/linux palette chord.
-        let search_y = row_y(&rows, "Search");
-        assert_eq!(search_y, 4, "the search label row is row 4, got:\n{joined}");
+        let cols = search_cols(40);
+        assert_square(&buf, cols.clone(), 1, palette().search, "the Search button");
+        assert_eq!(buf[(cols.start + 2, 1)].symbol(), "🔍", "the magnifier is centered in the square");
+        assert_eq!(buf[(cols.start + 2, 1)].fg, palette().gray, "the magnifier is #bababa");
+        for y in 0..3u16 {
+            for x in (cols.start - 1..cols.start).chain(cols.end..40) {
+                assert_eq!(buf[(x, y)].bg, Color::Reset, "outside the square stays clear, ({x}, {y})");
+                assert!(!["▄", "▀"].contains(&buf[(x, y)].symbol()), "no cap outside the square, ({x}, {y})");
+            }
+        }
+        assert!(rows[0].trim_start_matches(['▄', ' ']).is_empty(), "row 0 holds only the cap:\n{joined}");
+        assert!(rows[3].trim().is_empty(), "row 3 is the header's blank last row:\n{joined}");
+        assert!(!joined.contains("Search"), "the button carries no label:\n{joined}");
+        assert!(!joined.contains("⌃P") && !joined.contains("Ctrl+P"), "no chord at rest:\n{joined}");
+    }
+
+    /// The nav sits directly below the four-row header, its labels on rows 5,
+    /// 7 and 9 as in the Figma, each two columns of glyph after a column of
+    /// inset, gray at rest.
+    #[test]
+    fn nav_labels_land_on_the_figma_rows() {
+        let rows = render_rows(&empty_model(), 99, 40, 20);
+        let joined = rows.join("\n");
+        for (label, y) in [("Orchestrator", 5), ("Issues", 7), ("Changelog", 9)] {
+            assert_eq!(row_y(&rows, label), y, "{label} on row {y}:\n{joined}");
+        }
+        let buf = header_buf(&empty_model(), &default_chrome(), 40, 20);
+        assert_eq!(buf[(2, 5)].symbol(), "💬", "the glyph is two columns in");
+        assert_eq!(buf[(5, 5)].symbol(), "O", "the label follows a column after the glyph");
+        assert_eq!(buf[(5, 9)].fg, palette().gray, "an unselected nav label is gray");
+    }
+
+    /// A click anywhere on the square, caps included, maps to the Search
+    /// button (opens the palette); the title, the blank row under it, the
+    /// columns beside it, and the nav below do not.
+    #[test]
+    fn search_button_hit_covers_its_square() {
+        let view = SidebarView::build(&empty_model());
+        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
+        let cols = search_cols(40);
+        for y in 0..3u16 {
+            for x in cols.clone() {
+                assert!(view.search_button_hit(area, x, y), "({x}, {y}) is on the square");
+            }
+            assert!(!view.search_button_hit(area, cols.start - 1, y), "the column before the square, row {y}");
+            assert!(!view.search_button_hit(area, cols.end, y), "the column after the square, row {y}");
+        }
+        assert!(!view.search_button_hit(area, 3, 1), "the title is not the button");
+        for x in cols {
+            assert!(!view.search_button_hit(area, x, 3), "the row under the square, col {x}");
+        }
+        assert_eq!(view.hit(area, 6, 5), Some(0), "the first nav item is on row 5 and selects index 0");
+        assert_eq!(view.hit(area, 6, 4), None, "the nav's leading separator is not selectable");
+    }
+
+    /// Under the pointer the square lifts to `button_hover` and the row under
+    /// it names the button and its chord, right-aligned to the square (the
+    /// desktop's `Search (⌃P)` tooltip); with the palette unbound it's just
+    /// the name.
+    #[test]
+    fn hovered_search_button_lifts_and_names_its_chord() {
         let want_chord = match DisplayStyle::detect() {
             DisplayStyle::Mac => "⌃P",
             DisplayStyle::Linux => "Ctrl+P",
         };
-        assert!(rows[search_y].contains('🔍'), "search box shows the magnifier, got: {:?}", rows[search_y]);
-        assert!(rows[search_y].contains(want_chord), "search box shows the palette chord {want_chord:?}, got: {:?}", rows[search_y]);
-        // The label row is a solid fill. The magnifier is double-width, so the
-        // single column after it is a wide-char continuation the TestBackend
-        // never flushes (the emoji covers it on a real terminal); assert the
-        // leading gutter cell and the whole single-width region past the emoji,
-        // which proves the bar spans the full box width.
-        let sy = search_y as u16;
-        assert_eq!(buf[(1, sy)].bg, palette().search, "search box fills the leading cell");
-        for x in 5..39u16 {
-            assert_eq!(buf[(x, sy)].bg, palette().search, "search box fills its row, col {x}");
+        let cols = search_cols(40);
+        let buf = header_buf(&empty_model(), &default_chrome().with_search_hover(true), 40, 20);
+        assert_square(&buf, cols.clone(), 1, palette().button_hover, "the lit Search button");
+        assert_ne!(palette().button_hover, palette().search, "the lift shows");
+        let tip = format!("Search ({want_chord})");
+        assert_eq!(buf_row(&buf, 3).trim(), tip, "the tooltip on the row under the square");
+        let last = (0..40u16).rev().find(|&x| !buf[(x, 3)].symbol().trim().is_empty()).unwrap();
+        assert_eq!(last, cols.end - 1, "the tooltip ends under the square's right edge");
+        assert_eq!(buf[(last, 3)].fg, palette().gray, "the tooltip is gray");
+
+        let unbound = header_buf(&empty_model(), &chrome(None).with_search_hover(true), 40, 20);
+        assert_eq!(buf_row(&unbound, 3).trim(), "Search", "unbound: just the name");
+    }
+
+    /// A long project name ends in `…` a column short of the square at every
+    /// width the sidebar allows; a terminal without emoji gets the word.
+    #[test]
+    fn long_titles_stop_short_of_the_search_button() {
+        let mut model = empty_model();
+        model.project_label = "an-extremely-long-project-name-that-never-fits-even-a-wide-sidebar".into();
+        for w in [24u16, 39, 60] {
+            let buf = header_buf(&model, &default_chrome(), w, 20);
+            let cols = search_cols(w);
+            let row = buf_row(&buf, 1);
+            assert!(row.contains('…'), "{w} cols: the title is cut short: {row:?}");
+            assert_eq!(buf[(cols.start - 1, 1)].symbol(), " ", "{w} cols: a column between the title and the square");
+            assert_eq!(buf[(cols.start - 2, 1)].symbol(), "…", "{w} cols: the title runs up to that column");
+            assert_square(&buf, cols, 1, palette().search, &format!("{w} cols"));
         }
-        // The label and the shortcut are both the normal #bababa (not dimmed).
-        // (Column math, not `str::find`, since the double-width 🔍 makes byte
-        // offsets diverge from columns.) The label " 🔍 Search" renders from the
-        // box's inset left edge (x=1): space (1), 🔍 (2–3), space (4), S (5).
-        assert_eq!(buf[(5, sy)].fg, palette().gray, "search label 'S' is #bababa");
-        // The shortcut is right-aligned; scan in from the right for its last
-        // glyph (past the one trailing space of inner padding).
-        let chord_cell_x = (6..40u16)
-            .rev()
-            .find(|&x| buf[(x, sy)].symbol().trim() != "")
-            .expect("the shortcut renders a glyph");
-        assert_eq!(buf[(chord_cell_x, sy)].fg, palette().gray, "search shortcut is #bababa, not dimmed");
-
-        // The box is 2 rows tall, drawn with the half-block bleed: a `▄` row of
-        // lower-half blocks above the label and a `▀` row of upper-half blocks
-        // below it, both carrying the search fill as their *foreground* on the
-        // default (transparent) background (the half shows the fill; the cell
-        // background stays the terminal default).
-        let top_y = sy - 1;
-        let bottom_y = sy + 1;
-        for x in 1..39u16 {
-            assert_eq!(buf[(x, top_y)].symbol(), "▄", "top bleed row is lower-half blocks, col {x}");
-            assert_eq!(buf[(x, top_y)].fg, palette().search, "top bleed carries the fill as fg, col {x}");
-            assert_eq!(buf[(x, top_y)].bg, Color::Reset, "top bleed keeps the default background, col {x}");
-            assert_eq!(buf[(x, bottom_y)].symbol(), "▀", "bottom bleed row is upper-half blocks, col {x}");
-            assert_eq!(buf[(x, bottom_y)].fg, palette().search, "bottom bleed carries the fill as fg, col {x}");
-        }
-        // A blank half-row margin sits above the box (below the title).
-        assert!(rows[(top_y - 1) as usize].trim().is_empty(), "blank margin above the box, got: {:?}", rows[(top_y - 1) as usize]);
-    }
-
-    /// The palette-chord hint sits one column in from the search box's right
-    /// edge, mirroring the label's one-column inset on the left — it is never
-    /// flush against the edge. (A char-count of the double-width `🔍` used to
-    /// mis-size the padding by a column and push the chord's last glyph onto the
-    /// box's final column.)
-    #[test]
-    fn search_chord_is_inset_one_column_from_the_box_right_edge() {
-        let view = SidebarView::build(&empty_model());
-        let mut term = Terminal::new(TestBackend::new(40, 20)).unwrap();
-        term.draw(|f| {
-            let area = f.area();
-            view.render(f.buffer_mut(), area, 1, true, &default_chrome())
-        })
-        .unwrap();
-        let buf = term.backend().buffer().clone();
-        let rows = dump(&term);
-        let sy = row_y(&rows, "Search") as u16;
-
-        // The chord still renders (mac `⌃P` / linux `Ctrl+P`).
-        let want_chord = match DisplayStyle::detect() {
-            DisplayStyle::Mac => "⌃P",
-            DisplayStyle::Linux => "Ctrl+P",
-        };
-        assert!(rows[sy as usize].contains(want_chord), "chord renders: {:?}", rows[sy as usize]);
-
-        // The box fills cols 1..=38 on a 40-wide sidebar (a one-column gutter on
-        // each side); col 38 is its right edge. The chord's last glyph must land
-        // on col 37 — one column in — and col 38 must be a blank fill cell.
-        let box_right = 38u16;
-        let last_glyph_x = (0..buf.area.width)
-            .rev()
-            .find(|&x| !buf[(x, sy)].symbol().trim().is_empty())
-            .expect("the chord renders a glyph on the search row");
-        assert_eq!(
-            last_glyph_x,
-            box_right - 1,
-            "the chord's last glyph is one column in from the box's right edge (col {}), got col {last_glyph_x}",
-            box_right - 1
-        );
-        assert_eq!(
-            buf[(box_right, sy)].symbol().trim(),
-            "",
-            "the box's right-edge column is a blank inset"
-        );
-        assert_eq!(
-            buf[(box_right, sy)].bg,
-            palette().search,
-            "the one-column right inset is part of the box fill"
-        );
-    }
-
-    /// A click anywhere in the 2-row box — including the `▄` / `▀` half-block
-    /// rows — maps to the search box (opens the palette); the title above and
-    /// the first nav row below do not.
-    #[test]
-    fn search_box_hit_covers_all_three_cell_rows() {
-        let view = SidebarView::build(&empty_model());
-        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
-        // Rows 3, 4, 5 are the box (`▄`, label, `▀`); row 0 is blank, row 1 the
-        // title, row 2 blank, row 6 the nav's leading separator.
-        for y in 3..=5u16 {
-            assert!(view.search_box_hit(area, 3, y), "click on box row {y} hits the search box");
-        }
-        assert!(!view.search_box_hit(area, 3, 1), "title row is not the search box");
-        assert!(!view.search_box_hit(area, 3, 2), "the margin above the box is not the search box");
-        assert!(!view.search_box_hit(area, 3, 6), "the nav separator below the box is not the search box");
-        // The gutter column (0) and the divider-adjacent last column fall
-        // outside the inset box.
-        assert!(!view.search_box_hit(area, 0, 3), "left gutter is outside the inset box");
-    }
-
-    /// The nav block (and everything below it) shifts down by the taller header,
-    /// and a click on the first nav row still resolves to its selection index.
-    #[test]
-    fn taller_search_box_shifts_nav_click_targets_down() {
-        let view = SidebarView::build(&empty_model());
-        let area = Rect { x: 0, y: 0, width: 40, height: 20 };
-        // Header is 6 rows (0 blank, 1 title, 2 blank, 3–5 box); the nav's
-        // leading separator is row 6, so the first nav item ("Orchestrator") sits on
-        // row 7.
-        assert_eq!(view.hit(area, 3, 7), Some(0), "first nav item is on row 7 and selects index 0");
-        assert_eq!(view.hit(area, 3, 6), None, "the nav separator row is not selectable");
-    }
-
-    /// With no palette chord bound the search box falls back to the `<unbound>`
-    /// marker rather than a key hint.
-    #[test]
-    fn search_box_shows_unbound_when_palette_unbound() {
-        let rows = render_rows_with(&empty_model(), 0, true, &chrome(None), 40, 20);
-        let search_y = row_y(&rows, "Search");
-        assert!(
-            rows[search_y].contains("<unbound>"),
-            "search box shows <unbound> when no palette chord is bound, got: {:?}",
-            rows[search_y]
-        );
+        let view = SidebarView::build(&model).with_emoji(false);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 40, 20));
+        let area = buf.area;
+        view.render(&mut buf, area, 1, true, &default_chrome());
+        assert!(buf_row(&buf, 1).contains(" Search "), "the word in place of the emoji: {:?}", buf_row(&buf, 1));
+        assert!(view.search_button_hit(area, 30, 1), "the wider square is still the button");
     }
 
     // --- footer -------------------------------------------------------------
@@ -2277,16 +2244,6 @@ mod tests {
         assert_eq!(footer[(fx + 2, fy)].symbol(), "⚙");
     }
 
-    /// The title has the whole row now that the gear is gone: a long project
-    /// name only truncates at the row's inset.
-    #[test]
-    fn title_uses_the_whole_row_without_the_gear() {
-        let mut model = empty_model();
-        model.project_label = "abcdefghijklmnopqrstuvwxyz".into();
-        let rows = render_rows(&model, 0, 28, 20);
-        assert_eq!(rows[1].trim_end(), " abcdefghijklmnopqrstuvwxyz");
-    }
-
     /// Under the pointer a button's square lifts to the lighter
     /// `button_hover` across its own columns only; its glyph stays
     /// gray. The other button stays at rest.
@@ -2514,7 +2471,7 @@ mod tests {
     }
 
     /// Every sidebar element (nav selection, workspaces in each badge state,
-    /// reviews in each state, the search box, the Zen band, the unread-errors
+    /// reviews in each state, the Search button at rest and lit, the Zen band, the unread-errors
     /// button, the status line and the version warning) is readable on a light
     /// terminal.
     #[test]
@@ -2547,6 +2504,8 @@ mod tests {
             })
             .unwrap();
             crate::theme::assert_light_readable("shell-sidebar", term.backend().buffer());
+            let hovered = header_buf(&model, &default_chrome().with_search_hover(true), 40, 48);
+            crate::theme::assert_light_readable("shell-sidebar-search-hover", &hovered);
             for hover in [FooterButton::Settings, FooterButton::Feedback, FooterButton::Errors] {
                 let buf = footer_buf(&view, Some(hover), 40, 48);
                 crate::theme::assert_light_readable("shell-sidebar-footer-hover", &buf);
