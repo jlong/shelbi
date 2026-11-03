@@ -55,6 +55,9 @@ const CLEAR: &str = "×";
 /// The empty state, and how to add an entry.
 const EMPTY: &str = "No changelog entries yet. Shipped work shows up here.";
 const EMPTY_HINT: &str = "Add one with: shelbi changelog add --title \"…\"";
+/// Blank rows between one entry's end (its chips, or its body) and the
+/// next entry's top bleed row: they don't belong to either entry.
+const ENTRY_GAP: usize = 1;
 /// The widest the reading column gets: a blog's measure, not the terminal's.
 const MAX_MEASURE: u16 = 100;
 /// The search box's widest.
@@ -164,6 +167,10 @@ impl Doc {
         let mut y = 0;
         let mut rows = Vec::with_capacity(entries.len());
         for e in entries {
+            // Blank rows between one entry's end and the next's bleed row.
+            if !rows.is_empty() {
+                y += ENTRY_GAP;
+            }
             let top = y;
             let folded = collapsed.contains(&e.id);
             let mut body = Vec::new();
@@ -193,6 +200,10 @@ impl Doc {
             });
         }
         let more = has_more.then(|| {
+            // As far under the last entry as the next one would sit.
+            if !rows.is_empty() {
+                y += ENTRY_GAP;
+            }
             y += 1;
             y - 1
         });
