@@ -1794,12 +1794,14 @@ impl ShellState {
     }
 
     /// The per-frame sidebar inputs (the palette chord, the hovered footer
-    /// button, whether the Search button is hovered), owned so the draw
-    /// closure holds no borrow of the rest of the shell state.
+    /// button, whether the Search button or the project name is hovered),
+    /// owned so the draw closure holds no borrow of the rest of the shell
+    /// state.
     fn sidebar_chrome(&self) -> sidebar::SidebarChrome {
         sidebar::SidebarChrome::from_keymaps(&self.keymaps, self.display_style)
             .with_hover(self.footer_hover())
             .with_search_hover(self.search_hover())
+            .with_name_hover(self.name_hover())
     }
 
     /// The pointer, while it is over the nav sidebar and that is what shows
@@ -1831,12 +1833,21 @@ impl ShellState {
         })
     }
 
+    /// Whether the pointer is over the header's project name (see
+    /// [`Self::sidebar_pointer`]).
+    fn name_hover(&self) -> bool {
+        self.sidebar_pointer().is_some_and(|(x, y)| {
+            self.sidebar_view()
+                .is_some_and(|v| v.project_name_hit(self.sidebar_content_rect(), x, y))
+        })
+    }
+
     /// Record where the pointer is (`None`: the terminal lost focus, so it may
     /// be anywhere), repainting when that moves the sidebar's hover.
     fn track_pointer(&mut self, pointer: Option<(u16, u16)>) {
-        let before = (self.footer_hover(), self.search_hover());
+        let before = (self.footer_hover(), self.search_hover(), self.name_hover());
         self.pointer = pointer;
-        if (self.footer_hover(), self.search_hover()) != before {
+        if (self.footer_hover(), self.search_hover(), self.name_hover()) != before {
             self.dirty = true;
         }
         // A Settings table row under the pointer lights; one it left goes
@@ -5149,9 +5160,13 @@ impl ShellState {
                 // focuses the sidebar (hit returns `None`), opening nothing.
                 self.client.focus_sidebar();
                 if let Some(view) = self.sidebar_view() {
-                    // A click on the header's Search button opens the command
-                    // palette, the same as pressing the palette chord.
-                    if view.search_button_hit(self.sidebar_content_rect(), m.column, m.row) {
+                    // A click on the header's Search button or the project
+                    // name opens the command palette, the same as pressing
+                    // the palette chord.
+                    let content = self.sidebar_content_rect();
+                    if view.search_button_hit(content, m.column, m.row)
+                        || view.project_name_hit(content, m.column, m.row)
+                    {
                         self.open_palette();
                         self.dirty = true;
                         return;
@@ -7122,15 +7137,72 @@ mod tests {
         assert!(st.overlay.is_none(), "no overlay before the click");
 
         // The sidebar's content is 27 columns (the last is the divider), so
-        // the five-column square spans columns 20–24. The title beside it
-        // opens nothing.
-        st.handle_mouse(left_click(3, 1));
-        assert!(st.overlay.is_none(), "the title is not the button");
+        // the five-column square spans columns 20–24. The blank cells
+        // between the project name and the square open nothing.
+        st.handle_mouse(left_click(10, 1));
+        assert!(st.overlay.is_none(), "the gap after the name is not a target");
         st.handle_mouse(left_click(22, 1));
         assert!(
             matches!(st.overlay, Some(ActiveOverlay::Palette(_))),
             "clicking the Search button opens the command palette"
         );
+    }
+
+    #[test]
+    fn a_click_on_the_project_name_opens_the_palette() {
+        // The project name ("proj") is drawn on header row 1 from column 2;
+        // a click on any of its cells opens the command palette, as the
+        // palette chord and the Search button do. The cells around it don't.
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        st.main_rect = Rect::new(28, 0, 92, 20);
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        for (x, y) in [(1, 1), (6, 1), (2, 0), (2, 2)] {
+            st.handle_mouse(left_click(x, y));
+            assert!(st.overlay.is_none(), "({x}, {y}) is beside the name");
+        }
+        for x in 2..6 {
+            st.handle_mouse(left_click(x, 1));
+            assert!(
+                matches!(st.overlay, Some(ActiveOverlay::Palette(_))),
+                "clicking the name at column {x} opens the command palette"
+            );
+            st.overlay = None;
+        }
+    }
+
+    /// The project name lifts under the pointer, repaints only when that
+    /// changes, and goes dark off the name and under an overlay.
+    #[test]
+    fn project_name_hover_follows_the_pointer() {
+        let mut st = settings_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (nx, ny) = find_on_screen(&term, "proj").expect("the project name shows");
+        assert!(!st.name_hover(), "no hover before any motion");
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(nx, ny)));
+        assert!(st.name_hover());
+        assert!(!st.search_hover(), "the name is not the Search button");
+        assert!(st.dirty, "a hover change repaints");
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_eq!(term.backend().buffer()[(nx, ny)].bg, palette().button_hover, "lit");
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(nx + 3, ny)));
+        assert!(!st.dirty, "still on the name: no repaint");
+
+        st.handle_event(Event::Mouse(moved(nx + 4, ny)));
+        assert!(!st.name_hover(), "the column after the name");
+        assert!(st.dirty);
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_ne!(term.backend().buffer()[(nx, ny)].bg, palette().button_hover, "dark again");
+
+        st.handle_event(Event::Mouse(moved(nx, ny)));
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        assert!(st.overlay.is_some());
+        assert!(!st.name_hover(), "under the palette");
     }
 
     // --- drag-handle line ---------------------------------------------------

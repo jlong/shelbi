@@ -116,6 +116,9 @@ pub struct SidebarChrome {
     /// The pointer is over the header's Search button: its square lifts and
     /// its tooltip shows.
     search_hover: bool,
+    /// The pointer is over the header's project name: its cells lift to the
+    /// buttons' hover fill (a click there opens the palette too).
+    name_hover: bool,
 }
 
 impl SidebarChrome {
@@ -128,6 +131,7 @@ impl SidebarChrome {
             ),
             hover: None,
             search_hover: false,
+            name_hover: false,
         }
     }
 
@@ -140,6 +144,12 @@ impl SidebarChrome {
     /// [`SidebarView::search_button_hit`]).
     pub fn with_search_hover(self, search_hover: bool) -> Self {
         SidebarChrome { search_hover, ..self }
+    }
+
+    /// Whether the pointer is over the header's project name (see
+    /// [`SidebarView::project_name_hit`]).
+    pub fn with_name_hover(self, name_hover: bool) -> Self {
+        SidebarChrome { name_hover, ..self }
     }
 
     /// The resolved palette-open chord (e.g. `⌃P`, `Ctrl+Space`), for callers
@@ -400,6 +410,42 @@ impl SidebarView {
         })
     }
 
+    /// The row the header's title is laid out in: row 1 (a blank row above
+    /// it), or row 0 on a header clamped to a single row, from
+    /// [`HEADER_INSET`] columns in to a column short of the Search button
+    /// (or [`HEADER_INSET`] columns short of the sidebar's right without
+    /// one).
+    fn title_rect(header: Rect, search: Option<Rect>) -> Rect {
+        let title_y = header.y + if header.height >= 2 { 1 } else { 0 };
+        let title_x = (header.x + HEADER_INSET).min(header.right());
+        let title_end = search.map_or(header.right().saturating_sub(HEADER_INSET), |b| b.x - 1);
+        Rect {
+            x: title_x,
+            y: title_y,
+            width: title_end.saturating_sub(title_x),
+            height: 1,
+        }
+    }
+
+    /// The project name as drawn in `title`: the label, cut with `…` to the
+    /// title's width.
+    fn project_name_text(&self, title: Rect) -> String {
+        truncate_ellipsis(&self.project_label, title.width as usize)
+    }
+
+    /// The cells the project name is drawn in: the title row's leading
+    /// columns, as many as the (possibly `…`-cut) name covers. `None` on an
+    /// empty header or name.
+    fn project_name_rect(&self, header: Rect, search: Option<Rect>) -> Option<Rect> {
+        if header.width == 0 || header.height == 0 {
+            return None;
+        }
+        let title = Self::title_rect(header, search);
+        let drawn = UnicodeWidthStr::width(self.project_name_text(title).as_str()) as u16;
+        let width = drawn.min(title.width);
+        (width > 0).then_some(Rect { width, ..title })
+    }
+
     /// Split the sidebar `area` into (header, search, nav, rest-list, footer)
     /// rects — the shared geometry the renderer and the click map both derive
     /// from. `search` is the Search button's square, `None` when the header
@@ -491,6 +537,18 @@ impl SidebarView {
         self.geometry(area)
             .search
             .is_some_and(|s| contains(s, x, y))
+    }
+
+    /// Whether `(x, y)` lands on the header's project name: exactly the cells
+    /// its text is drawn in. The shell maps a click here to opening the
+    /// command palette, as it does a click on the Search button.
+    pub fn project_name_hit(&self, area: Rect, x: u16, y: u16) -> bool {
+        if area.width == 0 || area.height == 0 || !contains(area, x, y) {
+            return false;
+        }
+        let geo = self.geometry(area);
+        self.project_name_rect(geo.header, geo.search)
+            .is_some_and(|r| contains(r, x, y))
     }
 
     /// The footer button at `(x, y)`, if any: its columns across the three
@@ -620,20 +678,19 @@ impl SidebarView {
         // The title sits on row 1 (a blank row above it); fall back to row 0 on
         // a header clamped to a single row. It stops a column short of the
         // Search button.
-        let title_y = header.y + if header.height >= 2 { 1 } else { 0 };
-        let title_x = (header.x + HEADER_INSET).min(header.right());
-        let title_end = search.map_or(header.right().saturating_sub(HEADER_INSET), |b| b.x - 1);
-        let title_rect = Rect {
-            x: title_x,
-            y: title_y,
-            width: title_end.saturating_sub(title_x),
-            height: 1,
-        };
+        let title_rect = Self::title_rect(header, search);
         Paragraph::new(Line::from(Span::styled(
-            truncate_ellipsis(&self.project_label, title_rect.width as usize),
+            self.project_name_text(title_rect),
             Style::default().fg(palette().cyan).add_modifier(Modifier::BOLD),
         )))
         .render(title_rect, buf);
+        // Under the pointer the name's cells lift to the buttons' hover fill:
+        // a click there opens the palette, as the Search button does.
+        if chrome.name_hover {
+            if let Some(name) = self.project_name_rect(header, search) {
+                buf.set_style(name, Style::default().bg(palette().button_hover));
+            }
+        }
 
         let Some(button) = search else {
             return;
@@ -1950,6 +2007,76 @@ mod tests {
         view.render(&mut buf, area, 1, true, &default_chrome());
         assert!(buf_row(&buf, 1).contains(" Search "), "the word in place of the emoji: {:?}", buf_row(&buf, 1));
         assert!(view.search_button_hit(area, 30, 1), "the wider square is still the button");
+    }
+
+    /// The project name's target is exactly the cells its text is drawn in
+    /// (a short name and one cut with `…`), at narrow and wide sidebars and
+    /// one too narrow for the Search button: nothing beside it or above or
+    /// below it, never the Search button's cells, and never a row.
+    #[test]
+    fn project_name_hit_covers_exactly_the_drawn_name() {
+        for label in ["demo", "an-extremely-long-project-name-that-never-fits-even-a-wide-sidebar"] {
+            let mut model = empty_model();
+            model.project_label = label.into();
+            for w in [6u16, 24, 28, 39, 60] {
+                let buf = header_buf(&model, &default_chrome(), w, 20);
+                let area = buf.area;
+                let view = SidebarView::build(&model);
+                // The name's cells: the bold run from column 2 on row 1.
+                let drawn: Vec<u16> = (0..w)
+                    .filter(|&x| buf[(x, 1)].modifier.contains(Modifier::BOLD))
+                    .collect();
+                assert_eq!(drawn.first(), Some(&2), "{label:?} at {w} cols starts two columns in");
+                let end = drawn.last().unwrap() + 1;
+                assert_eq!(drawn, (2..end).collect::<Vec<_>>(), "{label:?} at {w} cols is one run");
+                if label == "demo" && w >= 24 {
+                    assert_eq!(end, 6, "the short name at {w} cols");
+                } else {
+                    assert_eq!(buf[(end - 1, 1)].symbol(), "…", "the cut name at {w} cols");
+                }
+                for y in 0..area.height {
+                    for x in 0..w {
+                        let on_name = y == 1 && (2..end).contains(&x);
+                        assert_eq!(
+                            view.project_name_hit(area, x, y),
+                            on_name,
+                            "{label:?} at {w} cols: ({x}, {y})"
+                        );
+                        if on_name {
+                            assert!(!view.search_button_hit(area, x, y), "({x}, {y}) is not the Search button");
+                            assert_eq!(view.hit(area, x, y), None, "({x}, {y}) is not a row");
+                        }
+                    }
+                }
+                // Off the sidebar entirely.
+                assert!(!view.project_name_hit(area, 2, 21), "below the area");
+            }
+        }
+        // Offset the sidebar: the target moves with it.
+        let view = SidebarView::build(&empty_model());
+        let area = Rect::new(10, 3, 30, 20);
+        assert!(view.project_name_hit(area, 12, 4));
+        assert!(!view.project_name_hit(area, 2, 1), "the unshifted cell misses");
+    }
+
+    /// Under the pointer the name's cells lift to the buttons' hover fill,
+    /// and only those: the column after it, the Search button and the rest
+    /// of the row keep theirs.
+    #[test]
+    fn hovered_project_name_lifts() {
+        let rest = header_buf(&empty_model(), &default_chrome(), 40, 20);
+        let lit = header_buf(&empty_model(), &default_chrome().with_name_hover(true), 40, 20);
+        for x in 0..40u16 {
+            for y in 0..20u16 {
+                if y == 1 && (2..6).contains(&x) {
+                    assert_eq!(lit[(x, y)].bg, palette().button_hover, "the name is lit at ({x}, {y})");
+                    assert_eq!(lit[(x, y)].symbol(), rest[(x, y)].symbol());
+                    assert_eq!(lit[(x, y)].fg, palette().cyan, "the name keeps its cyan");
+                } else {
+                    assert_eq!(lit[(x, y)], rest[(x, y)], "unchanged at ({x}, {y})");
+                }
+            }
+        }
     }
 
     // --- footer -------------------------------------------------------------
