@@ -32,7 +32,6 @@ use shelbi_state::keymap::{DisplayStyle, Keymaps};
 
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::controls;
-use crate::theme::motion::fill_layer;
 use crate::theme::style::{self, Type, Typography};
 use crate::theme::Theme;
 use crate::views::overlay::{palette_event, palette_top, with_overlay, ActiveOverlay};
@@ -231,6 +230,7 @@ pub fn render<H: OverlayHost>(
             .collect();
         div()
             .id("palette-results")
+            .debug_selector(|| "palette-results".into())
             .flex()
             .flex_col()
             .overflow_y_scroll()
@@ -405,8 +405,11 @@ fn render_result<H: OverlayHost>(
 }
 
 /// A result row's frame: 32pt, 6pt corners, the selected one on the
-/// overlay fill, a fill fading in under the pointer; a click activates row
-/// `index` of the palette's rows.
+/// overlay fill. The pointer over it selects it (the keyboard's highlight,
+/// so ↑/↓ and Enter carry on from there; gpui's hover also settles when a
+/// scroll moves a row under a still pointer, and stands aside after a key
+/// press so the keyboard's moves aren't undone); a click runs row `index`
+/// of the palette's rows, as Enter does.
 fn row_frame<H: OverlayHost>(
     index: usize,
     key: String,
@@ -414,10 +417,9 @@ fn row_frame<H: OverlayHost>(
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> gpui::Stateful<gpui::Div> {
-    let selector = key.clone();
-    let row = div()
+    div()
         .id(("palette-row", index))
-        .debug_selector(move || selector.clone())
+        .debug_selector(move || key.clone())
         .flex()
         .flex_row()
         .items_center()
@@ -427,19 +429,29 @@ fn row_frame<H: OverlayHost>(
         .px(px(6.0))
         .rounded(px(ROW_RADIUS))
         .cursor_pointer()
-        .type_style(Type::Base);
-    let row = if selected {
-        row.bg(theme.background)
-    } else {
-        let clear = theme.background.opacity(0.0);
-        fill_layer(row, key, px(ROW_RADIUS), [clear, theme.background, theme.background])
-    };
-    row.on_click(cx.listener(move |this: &mut H, _, window, cx| {
-        with_overlay(this, window, cx, |o| match o {
-            ActiveOverlay::Palette { palette, .. } => palette_event(palette.click_row(index)),
-            _ => OverlayEvent::Stay,
-        })
-    }))
+        .type_style(Type::Base)
+        .when(selected, |row| row.bg(theme.background))
+        .on_hover(cx.listener(move |this: &mut H, hovered: &bool, _, cx| {
+            if *hovered {
+                hover(this, cx, |palette| palette.hover_row(index));
+            }
+        }))
+        .on_click(cx.listener(move |this: &mut H, _, window, cx| {
+            with_overlay(this, window, cx, |o| match o {
+                ActiveOverlay::Palette { palette, .. } => palette_event(palette.click_row(index)),
+                _ => OverlayEvent::Stay,
+            })
+        }))
+}
+
+/// The pointer moved over the open palette: `f` moves its selection, and
+/// the window redraws when it did.
+fn hover<H: OverlayHost>(host: &mut H, cx: &mut Context<H>, f: impl FnOnce(&mut Palette) -> bool) {
+    if let Some(ActiveOverlay::Palette { palette, .. }) = host.overlay_mut() {
+        if f(palette) {
+            cx.notify();
+        }
+    }
 }
 
 /// A result's name: Base medium, loud and semibold when selected.
@@ -512,43 +524,9 @@ fn render_row<H: OverlayHost>(
     cx: &mut Context<H>,
 ) -> AnyElement {
     let (icon, icon_color) = icon_for(entry, theme);
-    let id = entry.id.clone();
-    let key = format!("palette-row-{id}");
-    let row = div()
-        .id(("palette-row", index))
-        .debug_selector(move || format!("palette-row-{id}"))
-        .flex()
-        .flex_row()
-        .items_center()
-        .flex_none()
-        .gap(px(6.0))
-        .h(px(ROW_H))
-        .px(px(6.0))
-        .rounded(px(ROW_RADIUS))
-        .cursor_pointer()
-        .type_style(Type::Base);
-    let row = if selected {
-        row.bg(theme.background)
-    } else {
-        let clear = theme.background.opacity(0.0);
-        fill_layer(row, key, px(ROW_RADIUS), [clear, theme.background, theme.background])
-    };
-    row.child(heroicon(icon).text_color(icon_color))
-        .child(
-            div()
-                .w(px(NAME_W))
-                .flex_none()
-                .truncate()
-                .when(selected, |l| {
-                    l.debug_selector(|| "palette-selected".into())
-                        .type_style(Type::BaseSemibold)
-                        .text_color(theme.text_loud)
-                })
-                .when(!selected, |l| {
-                    l.type_style(Type::BaseMedium).text_color(theme.foreground)
-                })
-                .child(entry.label.clone()),
-        )
+    row_frame(index, format!("palette-row-{}", entry.id), selected, theme, cx)
+        .child(heroicon(icon).text_color(icon_color))
+        .child(name(&entry.label, selected, theme).w(px(NAME_W)).flex_none())
         .child(
             div()
                 .flex_1()
@@ -557,12 +535,6 @@ fn render_row<H: OverlayHost>(
                 .text_color(if selected { theme.foreground } else { theme.muted })
                 .child(entry.subtitle.clone().unwrap_or_default()),
         )
-        .on_click(cx.listener(move |this: &mut H, _, window, cx| {
-            with_overlay(this, window, cx, |o| match o {
-                ActiveOverlay::Palette { palette, .. } => palette_event(palette.click_row(index)),
-                _ => OverlayEvent::Stay,
-            })
-        }))
         .into_any_element()
 }
 
@@ -605,7 +577,8 @@ fn render_projects<H: OverlayHost>(
         .into_any_element()
 }
 
-/// A Projects-column row that activates through the palette when clicked.
+/// A Projects-column row: the pointer over it focuses the column on it
+/// (as → and ↑/↓ would), and a click activates it through the palette.
 fn clicked<H: OverlayHost>(
     row: gpui::Stateful<gpui::Div>,
     index: usize,
@@ -613,6 +586,9 @@ fn clicked<H: OverlayHost>(
     cx: &mut Context<H>,
 ) -> AnyElement {
     row.when(selected, |r| r.debug_selector(|| "palette-project-selected".into()))
+        .on_mouse_move(cx.listener(move |this: &mut H, _: &gpui::MouseMoveEvent, _, cx| {
+            hover(this, cx, |palette| palette.hover_project(index));
+        }))
         .on_click(cx.listener(move |this: &mut H, _, window, cx| {
             with_overlay(this, window, cx, |o| match o {
                 ActiveOverlay::Palette { palette, .. } => palette_event(palette.click_project(index)),
