@@ -1,7 +1,8 @@
-//! The native remote window (remote-window P6): with the dev flag on and a
-//! host on this exact version, Connect opens the full main window for the far
+//! The native remote window (remote-window P6, the default since P10): a
+//! host on this exact version opens the full main window for the far
 //! project, and every view reads it, and commands it, over the host's relay
-//! link.
+//! link. Open in Terminal View opens the far TUI beside it; a host that
+//! changed while the window was away closes its panes and offers Reopen.
 //!
 //! The far host is [`crate::remote_fixture::FarHost`]: a fixture project read
 //! by the far side's real query handler across an in-process relay, a fake far
@@ -43,11 +44,11 @@ fn setup(cx: &mut TestAppContext) {
     });
 }
 
-/// Open `far`'s project as Connect does with the flag on: the listing
-/// decides (natively: same version), then the window opens over the host's
-/// link. Its commands then run for real.
+/// Open `far`'s project as Connect does: the listing decides (natively:
+/// same version), then the window opens over the host's link. Its commands
+/// then run for real.
 fn open(cx: &mut TestAppContext, far: &FarHost) -> WindowHandle<ShelbiWindow> {
-    let RemoteOpen::Native(listing) = remote_window::choose(true, HOST, || far.remote.listing(HOST)) else {
+    let RemoteOpen::Native(listing) = remote_window::choose(HOST, || far.remote.listing(HOST)) else {
         panic!("a host on this exact version opens natively");
     };
     let remote = RemoteWindow::new(far.session(), listing, far.link.clone(), far.remote.clone());
@@ -288,6 +289,72 @@ fn what_a_remote_window_cant_do_yet_is_refused_with_the_reason(cx: &mut TestAppC
         entry.subtitle,
         remote_window::command_unavailable(&CommandKind::QuitShelbi, HOST)
     );
+}
+
+#[gpui::test]
+fn open_in_terminal_view_opens_the_far_tui_beside_the_native_window(cx: &mut TestAppContext) {
+    use crate::views::remote_session::tests::TERMINAL_OPENED;
+    TERMINAL_OPENED.with(|o| o.borrow_mut().clear());
+    setup(cx);
+    let far = FarHost::new("terminal-view");
+    let handle = open(cx, &far);
+
+    // The palette lists it in a remote window, as available.
+    let entry = read(cx, handle, |w, _| {
+        w.palette_entries()
+            .into_iter()
+            .find(|e| e.id == "action:open-terminal-view")
+    });
+    let entry = entry.expect("a remote window offers Open in Terminal View");
+    assert_eq!(entry.label, "Open in Terminal View");
+    assert!(read(cx, handle, |w, _| w.command_model().unavailable(&CommandKind::OpenTerminalView)).is_none());
+
+    run(cx, handle, CommandKind::OpenTerminalView);
+    let opened = TERMINAL_OPENED.with(|o| o.borrow().clone());
+    assert_eq!(opened, vec![far.session()], "the far TUI opens for this window's project");
+    // The native window stays, as it was.
+    assert!(read(cx, handle, |w, _| w.remote_changed.is_none() && w.is_remote()));
+    assert_eq!(cx.update(|cx| shelbi_windows(cx)).len(), 1);
+}
+
+#[gpui::test]
+fn a_host_that_changed_closes_the_panes_and_reopen_decides_again(cx: &mut TestAppContext) {
+    use crate::views::remote_session::tests::OPENED;
+    OPENED.with(|o| o.borrow_mut().clear());
+    setup(cx);
+    let far = FarHost::new("changed");
+    let handle = open(cx, &far);
+    run(cx, handle, CommandKind::ShowView(View::Issues));
+    draw(cx, handle);
+    assert!(read(cx, handle, |w, _| w.issues.is_some()));
+
+    // The far Shelbi was upgraded while the link was down: the window's own
+    // reconnect check refuses it, and never opens a channel to it.
+    far.remote.set_far_version(HOST, "0.0.2", Some(shelbi_app::launch::NativeCapability::current()));
+    let down = HostLink::new(HOST, |_| panic!("no channel opens to a host that changed"));
+    let refused = RemoteWindow::keep_up(&down, far.remote.as_ref(), &far.session());
+    let Err(Some(RemoteError::NoLongerNative { message, .. })) = refused else {
+        panic!("expected the changed host to be refused, got {refused:?}");
+    };
+    assert!(message.contains("is now 0.0.2"), "{message}");
+
+    // The window shows that with Reopen in place of its shell, and its panes
+    // and views close.
+    update(cx, handle, |w, _, cx| w.host_changed(message.clone(), cx));
+    draw(cx, handle);
+    let (changed, open) = read(cx, handle, |w, _| {
+        (
+            w.remote_changed.clone(),
+            w.chat.is_some() || w.issues.is_some() || w.workspace.is_some() || w.review.is_some(),
+        )
+    });
+    assert_eq!(changed.as_deref(), Some(message.as_str()));
+    assert!(!open, "the panes are closed");
+
+    // Reopen closes the window and opens the project again, deciding afresh.
+    update(cx, handle, |w, window, cx| w.reopen_remote(window, cx));
+    let opened = OPENED.with(|o| o.borrow().clone());
+    assert_eq!(opened, vec![far.session()]);
 }
 
 #[gpui::test]

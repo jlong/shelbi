@@ -36,15 +36,44 @@ most recent, one entry per host, user and project.
 
 ## What a remote session looks like
 
-Shelbi opens the other machine's own Shelbi for that project, running in a
-terminal over SSH (`ssh -t <host> shelbi --project <project>`). Everything
-you see is the remote Shelbi, so it always matches that machine's version and
-configuration.
+How a remote session opens depends on the Shelbi on the other machine.
 
-- In the **desktop app**, the session opens in its own window, with the host
-  and project in the title bar.
-- In the **TUI**, the remote Shelbi takes over the terminal. Quit it as usual
-  to come back.
+**The same version as yours: the full window.** The desktop app opens its
+whole window for the project, as it does for a project on this Mac: the
+sidebar, the Orchestrator, the Issues board and task pane, Workspaces,
+Activity, Machines and Settings. The title bar and the sidebar name the user
+and host (`jlong@devbox`), and the project switcher lists that machine's
+projects. Everything you do runs on the other machine: moving a card, starting
+a review, toggling Zen Mode, saving a workflow or a workspace in Settings,
+checking a machine. **Edit** opens the file in that machine's `$EDITOR`, in a
+terminal there, and a file you drop on one of its terminals is copied there and
+its path pasted.
+
+**Any other version: the terminal view.** The desktop app opens the other
+machine's own Shelbi in its terminal interface, running over SSH
+(`ssh -t <host> shelbi --project <project>`), in a window of its own with the
+host and project in the title bar. A line under the title bar says why:
+
+> Shelbi on devbox is 0.12.1 and this Mac has 0.13.0, so it opens in its
+> terminal view. Update both to get the full window.
+
+The full window needs **exactly** the same version on both machines. Another
+patch release (0.13.0 and 0.13.1) or a Shelbi from before the full window
+opens the terminal view. Update both machines to the same release to get the
+full window.
+
+From a full window you can still use the terminal view: choose
+**View ▸ Open in Terminal View**, or **Open in Terminal View** in the command
+palette. It opens in a window beside the full one, on the same project.
+
+In the **TUI**, a remote session always opens the other machine's Shelbi in the
+terminal: it takes over until you quit it, and then you're back.
+
+A full window leaves a few things to the other machine itself. **Add Project**,
+**New Window**, **Quit Shelbi** and **Detach Other Clients** are grayed out
+with the reason; run them there. A workspace the other machine's project runs
+on yet another of its machines shows a placeholder naming that machine instead
+of its terminal, for now.
 
 ## When the connection drops
 
@@ -58,6 +87,13 @@ In the TUI (and with `shelbi remote connect`), press Esc to stop reconnecting.
 A reconnect never starts the other machine's Shelbi: if it has stopped, the
 retries end with "Shelbi isn't running on *host*." and you're offered
 **Start Shelbi** instead.
+
+A full window also checks the other machine's version each time it
+reconnects, since Shelbi there may have been updated while you were away. If
+the versions no longer match, the window closes its terminals, stops sending
+anything to that machine, and shows **Reopen**. Reopen opens the project again
+in whichever window now fits: the full window if the versions match again,
+otherwise the terminal view.
 
 ## SSH and credentials
 

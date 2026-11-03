@@ -345,6 +345,8 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::RejectReview { .. } => Placement::GoReview,
         CommandKind::ToggleZen => Placement::View,
         CommandKind::OpenErrorLog => Placement::View,
+        // View ▸ Open in Terminal View, live in a native remote window.
+        CommandKind::OpenTerminalView => Placement::View,
         CommandKind::OpenSettings => Placement::App,
         CommandKind::SendFeedback => Placement::Help,
         CommandKind::OpenAbout => Placement::App,
@@ -562,6 +564,10 @@ fn view_menu(
                 global_shortcut(keymaps, GlobalAction::ZenToggle),
             ),
             slot("action:error-log", "Error Log", None),
+            MenuEntry::Separator,
+            // A native remote window's project in the far TUI (`ssh -t`);
+            // gray in a window on this machine.
+            slot("action:open-terminal-view", "Open in Terminal View", None),
         ],
     }
 }
@@ -934,6 +940,10 @@ mod tests {
             assert!(!find(&tree, title).enabled, "{title} is disabled in a remote window");
         }
         assert!(find(&tree, "Quit Project\u{2026}").enabled, "the far project quits over the link");
+        // View ▸ Open in Terminal View keeps the far TUI reachable.
+        assert!(find(&tree, "Open in Terminal View").enabled);
+        let local = build(&fixture(), &Keymaps::default(), WindowFacts::default());
+        assert!(!find(&local, "Open in Terminal View").enabled, "gray in a window on this machine");
     }
 
     #[test]
@@ -1013,6 +1023,8 @@ mod tests {
                 "-",
                 "Turn Zen Mode On",
                 "Error Log",
+                "-",
+                "Open in Terminal View",
             ]
         );
         for (title, command, keystroke, display) in [

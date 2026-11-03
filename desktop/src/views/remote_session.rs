@@ -49,14 +49,12 @@ const DOT: f32 = 8.0;
 /// Open `session`, a remote project the Connect dialog or a recent remote
 /// session just connected to, in a window of its own.
 ///
-/// With the native remote window off (`desktop.native_remote`,
-/// `SHELBI_NATIVE_REMOTE`; the default) this is the terminal window, exactly
-/// as it always was. With it on, the host's listing decides
-/// ([`remote_window::choose`]): the same Shelbi opens the full main window
-/// over the host's relay link ([`crate::app::open_remote_window`]); any
-/// other opens the terminal window with a line saying why. Every check runs
-/// off the UI thread. A test records the session instead
-/// ([`tests::OPENED`]).
+/// The host's listing decides ([`remote_window::choose`]): the same Shelbi
+/// opens the full main window over the host's relay link
+/// ([`crate::app::open_remote_window`]); any other version (or one from
+/// before the native window) opens the terminal window with a line saying
+/// why. Every check runs off the UI thread. A test records the session
+/// instead ([`tests::OPENED`]).
 pub fn open_remote_session(session: RemoteSession, cx: &mut App) {
     #[cfg(test)]
     {
@@ -79,23 +77,22 @@ pub fn open_remote_session(session: RemoteSession, cx: &mut App) {
 }
 
 /// Where `session` opens, and for a native window its host's link, already
-/// up. Blocking (`ssh`): the flag, then the listing, then the link (whose
-/// check is the connector's: the host has the project and its daemon runs;
-/// it is never started here).
+/// up. Blocking (`ssh`): the listing, then the link (whose check is the
+/// connector's: the host has the project and its daemon runs; it is never
+/// started here).
 #[cfg_attr(test, allow(dead_code))]
 pub fn decide(session: &RemoteSession, remote: Arc<dyn RemoteConnector>) -> Decided {
-    decide_with(session, remote, remote_window::native_remote_enabled(), &HostLink::shared)
+    decide_with(session, remote, &HostLink::shared)
 }
 
-/// [`decide`] with the flag given and the host's link from `link_for` (a
-/// test's in-process relay).
+/// [`decide`] with the host's link from `link_for` (a test's in-process
+/// relay).
 pub fn decide_with(
     session: &RemoteSession,
     remote: Arc<dyn RemoteConnector>,
-    flag: bool,
     link_for: &dyn Fn(&str) -> Arc<HostLink>,
 ) -> Decided {
-    match remote_window::choose(flag, &session.host, || remote.listing(&session.host)) {
+    match remote_window::choose(&session.host, || remote.listing(&session.host)) {
         RemoteOpen::Terminal { notice } => Decided::Terminal { notice },
         RemoteOpen::Native(listing) => {
             let link = link_for(&session.host);
@@ -153,6 +150,20 @@ pub fn open_decided(session: RemoteSession, remote: Arc<dyn RemoteConnector>, de
         let _ = cx.update(|cx| open(session, remote, cli, notice, cx));
     })
     .detach();
+}
+
+/// Open in Terminal View: `session`, shown in a native window, in the
+/// terminal window too (the far TUI over `ssh -t`), with no notice: the
+/// user asked for it. A test records the session instead
+/// ([`tests::TERMINAL_OPENED`]).
+pub fn open_terminal_view(session: RemoteSession, remote: Arc<dyn RemoteConnector>, cx: &mut App) {
+    #[cfg(test)]
+    {
+        let _ = (remote, cx);
+        tests::TERMINAL_OPENED.with(|o| o.borrow_mut().push(session));
+    }
+    #[cfg(not(test))]
+    open_decided(session, remote, Decided::Terminal { notice: None }, cx);
 }
 
 /// Open `session` in a window of its own. The connect runs in the window
@@ -416,6 +427,8 @@ pub(crate) mod tests {
     thread_local! {
         /// The sessions [`open_remote_session`] was asked to open, in order.
         pub(crate) static OPENED: RefCell<Vec<RemoteSession>> = const { RefCell::new(Vec::new()) };
+        /// The sessions [`open_terminal_view`] was asked to open, in order.
+        pub(crate) static TERMINAL_OPENED: RefCell<Vec<RemoteSession>> = const { RefCell::new(Vec::new()) };
     }
 
     struct NoIo;
@@ -581,21 +594,49 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_flag_off_opens_the_terminal_view_exactly_as_before() {
-        // A host that would open natively: the flag decides.
-        let remote = Arc::new(FakeRemote::new().with_host("devbox", "jlong", &[("shelbi", "~/shelbi")]));
-        let decided = decide_with(&session(), remote, false, &no_link);
-        assert!(matches!(decided, Decided::Terminal { notice: None }));
+    fn a_host_from_before_the_native_window_opens_the_terminal_view_with_the_notice() {
+        // An old far Shelbi: its listing has no native capability.
+        let remote = Arc::new(
+            FakeRemote::new()
+                .with_host("devbox", "jlong", &[("shelbi", "~/shelbi")])
+                .with_far_version("devbox", "0.0.1", None),
+        );
+        let Decided::Terminal { notice: Some(notice) } = decide_with(&session(), remote, &no_link) else {
+            panic!("an old host opens the terminal view, saying why");
+        };
+        assert!(notice.starts_with("Shelbi on devbox is 0.0.1 and "), "{notice}");
+        assert!(notice.contains("so it opens in its terminal view"), "{notice}");
     }
 
     #[test]
-    fn the_flag_on_with_another_far_version_opens_the_terminal_view_with_the_notice() {
+    fn a_host_another_patch_release_apart_opens_the_terminal_view() {
+        // The same protocols, a patch release apart: exact versions only.
+        let mut parts: Vec<u64> = env!("CARGO_PKG_VERSION")
+            .split(['.', '-'])
+            .take(3)
+            .map(|p| p.parse().unwrap())
+            .collect();
+        parts[2] += 1;
+        let other = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
+        let remote = Arc::new(
+            FakeRemote::new()
+                .with_host("devbox", "jlong", &[("shelbi", "~/shelbi")])
+                .with_far_version("devbox", &other, Some(shelbi_app::launch::NativeCapability::current())),
+        );
+        let Decided::Terminal { notice: Some(notice) } = decide_with(&session(), remote, &no_link) else {
+            panic!("a patch release apart opens the terminal view");
+        };
+        assert!(notice.contains(&other), "{notice}");
+    }
+
+    #[test]
+    fn another_far_version_opens_the_terminal_view_with_the_notice() {
         let remote = Arc::new(
             FakeRemote::new()
                 .with_host("devbox", "jlong", &[("shelbi", "~/shelbi")])
                 .with_far_version("devbox", "0.0.1", Some(shelbi_app::launch::NativeCapability::current())),
         );
-        let Decided::Terminal { notice: Some(notice) } = decide_with(&session(), remote, true, &no_link) else {
+        let Decided::Terminal { notice: Some(notice) } = decide_with(&session(), remote, &no_link) else {
             panic!("another version opens the terminal view, saying why");
         };
         let here = if cfg!(target_os = "macos") { "this Mac" } else { "this computer" };
@@ -610,10 +651,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_flag_on_with_the_same_version_opens_the_full_window_over_the_link() {
+    fn the_same_version_opens_the_full_window_over_the_link() {
         let far = crate::remote_fixture::FarHost::new("decide");
         let link = far.link.clone();
-        let decided = decide_with(&far.session(), far.remote.clone(), true, &move |_| link.clone());
+        let decided = decide_with(&far.session(), far.remote.clone(), &move |_| link.clone());
         let Decided::Native { listing, link } = decided else {
             panic!("the same version opens natively");
         };
@@ -630,7 +671,7 @@ pub(crate) mod tests {
         );
         let link = Arc::new(HostLink::new("devbox", |_| panic!("no channel opens for a stopped daemon")));
         let opened = link.clone();
-        let decided = decide_with(&session(), remote.clone(), true, &move |_| opened.clone());
+        let decided = decide_with(&session(), remote.clone(), &move |_| opened.clone());
         let Decided::Terminal { notice: Some(notice) } = decided else {
             panic!("a stopped far daemon opens nothing natively");
         };

@@ -410,7 +410,7 @@ fn open_window(
 }
 
 /// Open the native window for `remote`'s project on another machine
-/// (remote-window P6, behind `desktop.native_remote`): the main window over
+/// (remote-window; a host on this exact version): the main window over
 /// the host's relay link. A window already showing that project comes up
 /// instead. `None` when the window couldn't open (logged).
 /// What an `edit:*` target opens, named for a far editor window's title.
@@ -621,6 +621,7 @@ pub enum HostCall {
     OpenAddProject,
     ConnectRemote,
     ShowLaunchScreen,
+    OpenTerminalView,
     LoadReview(String),
     ApproveReview(String),
     AskRejectReason(String),
@@ -687,6 +688,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn show_launch_screen(&mut self) {
         self.push(HostCall::ShowLaunchScreen);
+    }
+    fn open_terminal_view(&mut self) {
+        self.push(HostCall::OpenTerminalView);
     }
     fn load_review(&mut self, task_id: &str) {
         self.push(HostCall::LoadReview(task_id.to_string()));
@@ -896,27 +900,35 @@ impl RemoteWindow {
     /// Bring the host's link back up when it is down (blocking: `ssh`). The
     /// panes reconnect on their own; a window showing none (the board, say)
     /// still needs its reads and change stream back, so the window asks
-    /// here too. The check runs first, so a stopped far daemon is reported,
-    /// never started: `Err` carries the line to show, `Ok(true)` that the
-    /// link was down and is up again.
-    fn keep_up(link: &HostLink, remote: &dyn RemoteConnector, session: &RemoteSession) -> Result<bool, Option<String>> {
+    /// here too. The check runs first
+    /// ([`shelbi_app::remote_window::reconnect_check`]), so a stopped far
+    /// daemon is reported, never started, and a host on another version now
+    /// is refused rather than talked to: `Err` carries either refusal,
+    /// `Ok(true)` that the link was down and is up again.
+    fn keep_up(link: &HostLink, remote: &dyn RemoteConnector, session: &RemoteSession) -> Result<bool, Option<RemoteError>> {
         if link.is_up() {
             return Ok(false);
         }
-        match link.connect(&|| remote.connect(session)) {
+        match link.connect(&|| shelbi_app::remote_window::reconnect_check(remote, session)) {
             Ok(_) => Ok(true),
-            Err(error @ RemoteError::DaemonStopped { .. }) => Err(Some(error.to_string())),
-            Err(_) => Err(None),
+            Err(error) => Err(Self::refusal(error)),
         }
     }
 
-    /// The far daemon was found stopped by the last pane reconnect: the
-    /// line to show, offering to start it.
-    fn stopped(&self) -> Option<String> {
-        match self.sessions.as_ref()?.refusal()? {
-            error @ RemoteError::DaemonStopped { .. } => Some(error.to_string()),
+    /// `error` when it is one the window answers (Start for a stopped far
+    /// daemon, Reopen for a host that changed), else `None` (the host is
+    /// only unreachable for now: keep trying).
+    fn refusal(error: RemoteError) -> Option<RemoteError> {
+        match error {
+            error @ (RemoteError::DaemonStopped { .. } | RemoteError::NoLongerNative { .. }) => Some(error),
             _ => None,
         }
+    }
+
+    /// What the last pane reconnect was refused with, when the window
+    /// answers it ([`Self::refusal`]).
+    fn refused(&self) -> Option<RemoteError> {
+        Self::refusal(self.sessions.as_ref()?.refusal()?)
     }
 }
 
@@ -937,6 +949,11 @@ pub struct ShelbiWindow {
     /// A remote window's far daemon was found stopped: the bar offers to
     /// start it (never started implicitly).
     remote_stopped: Option<SharedString>,
+    /// A native remote window's host no longer opens natively (another
+    /// version, or other protocols, since the window opened): the line the
+    /// window shows instead of its shell, with Reopen. Its panes are closed
+    /// and nothing more is sent to the far daemon.
+    remote_changed: Option<SharedString>,
     /// A remote window's link watch ([`Self::watch_remote`]).
     _remote_watch: Option<Task<()>>,
     /// The window slot its frame is saved in.
@@ -1233,7 +1250,10 @@ impl ShelbiWindow {
     /// pane's reconnect, shows the bar that offers to start it.
     fn watch_remote(&mut self, cx: &mut Context<Self>) {
         self._remote_watch = Some(cx.spawn(async move |this, cx| loop {
-            let Ok(Some(remote)) = this.update(cx, |this, _| this.remote.clone()) else {
+            // A host that changed is done with: Reopen decides again.
+            let Ok(Some(remote)) =
+                this.update(cx, |this, _| this.remote.clone().filter(|_| this.remote_changed.is_none()))
+            else {
                 return;
             };
             let (link, connector, session) = (remote.link.clone(), remote.remote.clone(), remote.session.clone());
@@ -1242,12 +1262,16 @@ impl ShelbiWindow {
                 .spawn(async move { RemoteWindow::keep_up(&link, connector.as_ref(), &session) })
                 .await;
             let alive = this.update(cx, |this, cx| {
-                let stopped = match &kept {
-                    Err(Some(line)) => Some(line.clone()),
+                let refused = match &kept {
+                    Err(Some(error)) => Some(error.clone()),
                     Ok(true) => None,
-                    _ => this.remote.as_ref().and_then(RemoteWindow::stopped),
+                    _ => this.remote.as_ref().and_then(RemoteWindow::refused),
                 };
-                let stopped = stopped.map(SharedString::from);
+                if let Some(RemoteError::NoLongerNative { message, .. }) = &refused {
+                    this.host_changed(message.clone(), cx);
+                    return;
+                }
+                let stopped = refused.map(|error| SharedString::from(error.to_string()));
                 if kept == Ok(true) {
                     this.request_refresh();
                 }
@@ -1263,6 +1287,66 @@ impl ShelbiWindow {
         }));
     }
 
+    /// The remote window's host no longer opens natively (it was upgraded,
+    /// or this Mac was, while the window was away): show `line` with Reopen
+    /// in place of the shell. The panes close on the next frame
+    /// ([`Self::close_remote_panes`]) and nothing more is sent to the far
+    /// daemon: every reconnect is refused by the same check.
+    fn host_changed(&mut self, line: String, cx: &mut Context<Self>) {
+        if self.remote_changed.is_some() {
+            return;
+        }
+        tracing::info!(line, "the remote window's host changed; offering Reopen");
+        self.remote_changed = Some(line.into());
+        self.remote_stopped = None;
+        cx.notify();
+    }
+
+    /// Close a changed remote window's panes (their sessions detach; the far
+    /// agents keep running) and its views. Idempotent.
+    fn close_remote_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let open = self.chat.is_some()
+            || self.workspace.is_some()
+            || self.review.is_some()
+            || self.issues.is_some()
+            || self.activity.is_some()
+            || self.machines.is_some()
+            || self.changelog.is_some();
+        if open {
+            self.teardown_project(window, cx);
+        }
+    }
+
+    /// Reopen (a changed remote window's): this window closes and the
+    /// project opens again, in whichever window the host gets now (the
+    /// native one when it matches again, else the terminal view with its
+    /// notice).
+    fn reopen_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(remote) = self.remote.as_ref() else {
+            return;
+        };
+        let session = remote.session.clone();
+        self.close_remote_panes(window, cx);
+        window.remove_window();
+        cx.defer(move |cx| crate::views::remote_session::open_remote_session(session, cx));
+    }
+
+    /// View ▸ Open in Terminal View: this remote window's project in the far
+    /// machine's TUI, in a terminal window of its own beside this one (both
+    /// attach to the same far sessions). A window on this machine has it
+    /// gray (the registry lists it only for a remote window); its project's
+    /// terminal view is `shelbi` in a terminal.
+    fn open_terminal_view(&mut self, cx: &mut Context<Self>) {
+        let Some(remote) = self.remote.as_ref() else {
+            let line = format!("{} is on this Mac: run shelbi in a terminal for its terminal view.", self.model.project_label);
+            self.flash(line, cx);
+            return;
+        };
+        let (session, connector) = (remote.session.clone(), remote.remote.clone());
+        // Its own window, after this update (as New Window).
+        cx.defer(move |cx| crate::views::remote_session::open_terminal_view(session, connector, cx));
+    }
+
     /// The bar's Start: start Shelbi on the remote window's host (only ever
     /// on the user's say-so), then bring the link back up.
     fn start_far_daemon(&mut self, cx: &mut Context<Self>) {
@@ -1275,7 +1359,7 @@ impl ShelbiWindow {
             remote.remote.start_daemon(&remote.session.host)?;
             remote
                 .link
-                .connect(&|| remote.remote.connect(&remote.session))
+                .connect(&|| shelbi_app::remote_window::reconnect_check(remote.remote.as_ref(), &remote.session))
                 .map(|_| ())
         });
         cx.spawn(async move |this, cx| {
@@ -1286,6 +1370,7 @@ impl ShelbiWindow {
                     this.flash(format!("Started Shelbi on {host}."), cx);
                     this.request_refresh();
                 }
+                Err(RemoteError::NoLongerNative { message, .. }) => this.host_changed(message, cx),
                 Err(error) => {
                     this.banner = Some(error.to_string().into());
                     cx.notify();
@@ -1348,6 +1433,7 @@ impl ShelbiWindow {
             project_handle: shelbi_orchestrator::source::local_handle(project),
             remote: None,
             remote_stopped: None,
+            remote_changed: None,
             _remote_watch: None,
             slot: 0,
             chooser: false,
@@ -2647,6 +2733,7 @@ impl ShelbiWindow {
             HostCall::ShowLaunchScreen => cx.defer(|cx| {
                 crate::views::launch::show(cx);
             }),
+            HostCall::OpenTerminalView => self.open_terminal_view(cx),
             HostCall::LoadReview(task_id) => self.load_review(task_id, window, cx),
             HostCall::ApproveReview(id) => {
                 let m = Mutation::ApproveReview {
@@ -5336,19 +5423,31 @@ impl SidebarHost for ShelbiWindow {
 impl Render for ShelbiWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let weak = cx.entity().downgrade();
         match &self.boot {
+            // A native remote window whose host changed: no shell, no panes,
+            // only Reopen.
+            Boot::Ready(_) if self.remote_changed.is_some() => {
+                cx.defer_in(window, |this, window, cx| this.close_remote_panes(window, cx));
+                let line = self.remote_changed.clone().unwrap_or_default();
+                let host = self
+                    .remote
+                    .as_ref()
+                    .map(|r| shelbi_app::remote_window::bare_host(&r.session.host).to_string())
+                    .unwrap_or_default();
+                boot_view::render_remote_changed(&host, &line, &theme, move |window, cx| {
+                    let _ = weak.update(cx, |this, cx| this.reopen_remote(window, cx));
+                })
+            }
             Boot::Ready(_) => self.render_shell(&theme, window, cx),
             Boot::InFlight(state) => boot_view::render_progress(state, &theme),
-            Boot::Failed(failure) => {
-                let weak = cx.entity().downgrade();
-                boot_view::render_failure(
-                    &boot_view::failure_screen(failure),
-                    &theme,
-                    move |action, _, cx| {
-                        let _ = weak.update(cx, |this, cx| this.screen_action(action, cx));
-                    },
-                )
-            }
+            Boot::Failed(failure) => boot_view::render_failure(
+                &boot_view::failure_screen(failure),
+                &theme,
+                move |action, _, cx| {
+                    let _ = weak.update(cx, |this, cx| this.screen_action(action, cx));
+                },
+            ),
         }
     }
 }
