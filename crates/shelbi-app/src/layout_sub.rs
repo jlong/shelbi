@@ -34,11 +34,32 @@ const POLL_SLICE: Duration = Duration::from_millis(500);
 pub struct LayoutSubscription {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
+    /// A remote subscription's relay stream, closed on drop so its thread's
+    /// read ends.
+    stream: Option<crate::source::remote::OpenStream>,
+}
+
+impl LayoutSubscription {
+    /// A remote subscription: its thread, and the stream it reads.
+    pub(crate) fn remote(
+        stop: Arc<AtomicBool>,
+        handle: Option<JoinHandle<()>>,
+        stream: crate::source::remote::OpenStream,
+    ) -> Self {
+        LayoutSubscription {
+            stop,
+            handle,
+            stream: Some(stream),
+        }
+    }
 }
 
 impl Drop for LayoutSubscription {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
+        if let Some(stream) = &self.stream {
+            stream.close();
+        }
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -58,7 +79,14 @@ pub fn spawn(project: &str) -> (LayoutSubscription, Receiver<LayoutEvent>) {
         .name("shelbi-layout-sub".into())
         .spawn(move || subscriber_loop(&project, &tx, &stop_thread))
         .ok();
-    (LayoutSubscription { stop, handle }, rx)
+    (
+        LayoutSubscription {
+            stop,
+            handle,
+            stream: None,
+        },
+        rx,
+    )
 }
 
 /// Connect/subscribe/read loop, reconnecting until `stop` is set or the receiver
@@ -129,7 +157,7 @@ fn connect_and_stream(project: &str, tx: &Sender<LayoutEvent>, stop: &AtomicBool
 /// Split complete `\n`-terminated lines out of `buf`, forwarding each that
 /// parses to one of this project's layout events. Leaves any trailing partial
 /// line in `buf`. `Err(())` means the receiver was dropped.
-fn drain_lines(buf: &mut Vec<u8>, project: &str, tx: &Sender<LayoutEvent>) -> std::result::Result<(), ()> {
+pub(crate) fn drain_lines(buf: &mut Vec<u8>, project: &str, tx: &Sender<LayoutEvent>) -> std::result::Result<(), ()> {
     while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
         let line: Vec<u8> = buf.drain(..=nl).collect();
         let line = &line[..line.len() - 1]; // drop the newline

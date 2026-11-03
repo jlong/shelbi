@@ -243,6 +243,89 @@ impl RemoteListing {
     }
 }
 
+/// Whether a project on a remote host opens in a native window (sidebar,
+/// board and views read over the relay link) or in today's terminal view
+/// (the far TUI over `ssh -t`). [`RemoteListing::window_decision`] makes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowDecision {
+    /// Both sides run the same Shelbi and speak the same protocols.
+    Native,
+    /// Open the terminal view, saying why.
+    Fallback {
+        /// This build's version.
+        local: String,
+        /// The far Shelbi's version, from its listing.
+        remote: String,
+        why: FallbackReason,
+    },
+}
+
+/// Why a remote project opens in the terminal view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackReason {
+    /// The far Shelbi predates the native window (its listing has no
+    /// `native`).
+    NoNative,
+    /// Its relay, control or query protocol differs from this build's.
+    Protocol,
+    /// Its version isn't exactly this build's.
+    Version,
+}
+
+impl WindowDecision {
+    pub fn is_native(&self) -> bool {
+        matches!(self, WindowDecision::Native)
+    }
+
+    /// The one line a fallback window shows about why, naming both
+    /// versions; `None` for a native window.
+    pub fn notice(&self, host: &str) -> Option<String> {
+        let WindowDecision::Fallback { local, remote, .. } = self else {
+            return None;
+        };
+        let here = if cfg!(target_os = "macos") { "this Mac" } else { "this computer" };
+        Some(if local == remote {
+            format!(
+                "Shelbi on {host} can't open a full window here, so it opens in its terminal view."
+            )
+        } else {
+            format!(
+                "Shelbi on {host} is {remote} and {here} has {local}, so it opens in its \
+                 terminal view. Update both to get the full window."
+            )
+        })
+    }
+}
+
+impl RemoteListing {
+    /// Whether this listing's host opens natively for this build.
+    pub fn window_decision(&self) -> WindowDecision {
+        self.window_decision_for(env!("CARGO_PKG_VERSION"), NativeCapability::current())
+    }
+
+    /// [`window_decision`](Self::window_decision) for a build of
+    /// `local_version` speaking `local`. Native only when the listing
+    /// advertises `native`, its relay, control and query protocols equal
+    /// `local`'s, and its version equals `local_version` exactly (the
+    /// maintainer's rule: no release-line leeway, a patch apart falls back).
+    pub fn window_decision_for(&self, local_version: &str, local: NativeCapability) -> WindowDecision {
+        let why = match self.native {
+            None => Some(FallbackReason::NoNative),
+            Some(far) if far != local => Some(FallbackReason::Protocol),
+            Some(_) if self.version != local_version => Some(FallbackReason::Version),
+            Some(_) => None,
+        };
+        match why {
+            None => WindowDecision::Native,
+            Some(why) => WindowDecision::Fallback {
+                local: local_version.to_string(),
+                remote: self.version.clone(),
+                why,
+            },
+        }
+    }
+}
+
 /// The user this process runs as: `$USER`, else `$LOGNAME`, else `id -un`.
 fn local_user() -> String {
     ["USER", "LOGNAME"]
@@ -1147,6 +1230,75 @@ mod tests {
         let text = serde_json::to_string(&new).unwrap();
         assert!(!text.contains("native"), "{text}");
         assert_eq!(serde_json::from_str::<ListingV1>(&text).unwrap(), old);
+    }
+
+    fn native_listing(version: &str, native: Option<NativeCapability>) -> RemoteListing {
+        RemoteListing {
+            native,
+            ..listing(version, true)
+        }
+    }
+
+    #[test]
+    fn the_same_version_and_protocols_open_natively() {
+        let here = NativeCapability::current();
+        let far = native_listing("0.13.0", Some(here));
+        assert_eq!(far.window_decision_for("0.13.0", here), WindowDecision::Native);
+        assert!(far.window_decision_for("0.13.0", here).notice("devbox").is_none());
+        // This build against a listing of itself.
+        let me = native_listing(env!("CARGO_PKG_VERSION"), Some(here));
+        assert!(me.window_decision().is_native());
+    }
+
+    #[test]
+    fn a_different_patch_version_falls_back() {
+        let here = NativeCapability::current();
+        let far = native_listing("0.13.1", Some(here));
+        let decision = far.window_decision_for("0.13.0", here);
+        assert_eq!(
+            decision,
+            WindowDecision::Fallback {
+                local: "0.13.0".into(),
+                remote: "0.13.1".into(),
+                why: FallbackReason::Version,
+            }
+        );
+        let notice = decision.notice("devbox").unwrap();
+        assert!(notice.contains("devbox is 0.13.1"), "{notice}");
+        assert!(notice.contains("has 0.13.0"), "{notice}");
+        assert!(notice.contains("terminal view"), "{notice}");
+    }
+
+    #[test]
+    fn a_listing_without_native_falls_back() {
+        let here = NativeCapability::current();
+        let far = native_listing("0.13.0", None);
+        assert_eq!(
+            far.window_decision_for("0.13.0", here),
+            WindowDecision::Fallback {
+                local: "0.13.0".into(),
+                remote: "0.13.0".into(),
+                why: FallbackReason::NoNative,
+            }
+        );
+    }
+
+    #[test]
+    fn a_protocol_mismatch_falls_back_even_on_the_same_version() {
+        let here = NativeCapability::current();
+        let mismatches = [
+            NativeCapability { relay: here.relay + 1, ..here },
+            NativeCapability { control: here.control + 1, ..here },
+            NativeCapability { query: here.query + 1, ..here },
+        ];
+        for far in mismatches {
+            let decision = native_listing("0.13.0", Some(far)).window_decision_for("0.13.0", here);
+            assert!(
+                matches!(decision, WindowDecision::Fallback { why: FallbackReason::Protocol, .. }),
+                "{far:?}: {decision:?}"
+            );
+            assert!(decision.notice("devbox").unwrap().contains("terminal view"));
+        }
     }
 
     #[test]

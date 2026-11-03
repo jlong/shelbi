@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use shelbi_orchestrator::mutate::{self, MutateError, OutputSink};
 use shelbi_proto::control::{
-    self, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, MutationError,
+    self, AttachedClient, ChangeNote, ClientInfo, ClientKind, ClientMsg, DetachSelector, MutationError,
     MutationKind, MutationRequest, ReviewRole, ReviewSessionOp, ReviewSessionRequest, ServerMsg,
     Stream, WorkspaceSessionOp, WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
 };
@@ -408,6 +408,12 @@ fn handle_client(stream: UnixStream, state: ControlState) {
             }
             ClientMsg::Subscribe { info } => {
                 state.register(conn_id, tx.clone());
+                // A remote window's link (another machine's app, over this
+                // machine's relay) decided on the version before it opened
+                // and can't re-exec this daemon's binary anyway: it is never
+                // told to for a version difference. A deliberate reload still
+                // reaches it (`ReloadClients` broadcasts to every subscriber).
+                let remote = info.as_ref().is_some_and(|i| i.kind == ClientKind::Remote);
                 // When the subscriber announced its identity, track it as an
                 // attached UI client so `shelbi detach` can list and target it.
                 if let Some(info) = info {
@@ -417,7 +423,7 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 // is out of date: tell it to re-exec (a TUI) / prompt for
                 // relaunch (the desktop app) right away, so it stops sending
                 // commands before it does anything else.
-                if let Some(cv) = &client_version {
+                if let Some(cv) = client_version.as_ref().filter(|_| !remote) {
                     if *cv != state.inner.lifecycle.daemon_version() {
                         let _ = tx.send(ServerMsg::Reexec {
                             reason: format!(
@@ -1301,9 +1307,55 @@ mod tests {
         }
     }
 
+    fn remote_info(id: &str) -> shelbi_proto::control::ClientInfo {
+        shelbi_proto::control::ClientInfo {
+            client_id: id.into(),
+            kind: shelbi_proto::control::ClientKind::Remote,
+            host: "laptop".into(),
+            pid: Some(7),
+            project: Some("p".into()),
+        }
+    }
+
+    #[test]
+    fn a_remote_subscriber_on_another_version_is_not_told_to_reexec() {
+        // A remote window's link subscribes as `ClientKind::Remote`. Its
+        // version difference never earns a Reexec: the first push it sees is
+        // the next real one (here a reload), not an "out of date".
+        let life = RecordingLifecycle::new("daemon-NEW");
+        let served = serve_lifecycle(life, "remote-sub");
+        let a = ControlClient::connect(&served.sock, "client-OLD").unwrap();
+        let mut sub = a.subscribe_as(remote_info("far")).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        let mut b = ControlClient::connect(&served.sock, "daemon-NEW").unwrap();
+        b.reload_clients().unwrap();
+        match sub.recv() {
+            Ok(Some(Notice::Reexec { reason })) => assert!(
+                reason.contains("reload") && !reason.contains("out of date"),
+                "a remote subscriber only hears the reload: {reason}"
+            ),
+            other => panic!("expected the reload push, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deliberate_reload_still_reaches_a_remote_subscriber() {
+        let life = RecordingLifecycle::new("v1");
+        let served = serve_lifecycle(life, "remote-reload");
+        let a = ControlClient::connect(&served.sock, "v1").unwrap();
+        let mut sub = a.subscribe_as(remote_info("far")).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        let mut b = ControlClient::connect(&served.sock, "v1").unwrap();
+        b.reload_clients().unwrap();
+        match sub.recv() {
+            Ok(Some(Notice::Reexec { reason })) => assert!(reason.contains("reload"), "{reason}"),
+            other => panic!("a remote subscriber still hears a reload, got {other:?}"),
+        }
+    }
+
     // --- attached-client registry + detach (v4) ------------------------------
 
-    use shelbi_proto::control::{ClientInfo, ClientKind, DetachSelector};
+    use shelbi_proto::control::{ClientInfo, DetachSelector};
 
     fn info(id: &str) -> ClientInfo {
         ClientInfo {

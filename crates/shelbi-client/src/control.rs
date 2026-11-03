@@ -42,8 +42,8 @@ pub enum Notice {
 /// A connection to the daemon's mutation control socket, past the hello
 /// handshake.
 pub struct ControlClient {
-    write: UnixStream,
-    read: FrameReader<BufReader<UnixStream>>,
+    write: Box<dyn Write + Send>,
+    read: FrameReader<BufReader<Box<dyn Read + Send>>>,
     /// The daemon version from its hello, for diagnostics.
     pub daemon_version: String,
 }
@@ -54,8 +54,18 @@ impl ControlClient {
     pub fn connect(path: &Path, client_version: &str) -> Result<Self, ClientError> {
         let stream = UnixStream::connect(path)?;
         let read_half = stream.try_clone()?;
-        let mut write = stream;
-        let mut read = FrameReader::new(BufReader::new(read_half));
+        Self::over(Box::new(read_half), Box::new(stream), client_version)
+    }
+
+    /// [`connect`](Self::connect) over an already open byte stream to the
+    /// daemon's control protocol, given as its two halves: a relay `control`
+    /// stream to a far daemon, say. Sends the hello and reads the daemon's.
+    pub fn over(
+        read: Box<dyn Read + Send>,
+        mut write: Box<dyn Write + Send>,
+        client_version: &str,
+    ) -> Result<Self, ClientError> {
+        let mut read = FrameReader::new(BufReader::new(read));
 
         write.write_all(&control::encode(&ClientMsg::Hello {
             protocol: CONTROL_PROTOCOL_VERSION,
@@ -259,7 +269,10 @@ impl ControlClient {
         self.write
             .write_all(&control::encode(&ClientMsg::Subscribe { info })?)?;
         self.write.flush()?;
-        Ok(Subscription { read: self.read })
+        Ok(Subscription {
+            read: self.read,
+            _write: self.write,
+        })
     }
 
     /// List the attached UI clients (`shelbi detach --list`). Blocks until the
@@ -316,7 +329,10 @@ impl ControlClient {
 
 /// A blocking stream of [`Notice`]s from a subscribed connection.
 pub struct Subscription {
-    read: FrameReader<BufReader<UnixStream>>,
+    read: FrameReader<BufReader<Box<dyn Read + Send>>>,
+    /// The write half, held so the connection stays open: over a relay
+    /// stream, dropping it closes the stream.
+    _write: Box<dyn Write + Send>,
 }
 
 impl Subscription {

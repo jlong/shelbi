@@ -169,7 +169,11 @@ workspaces). Keep it equal to the root `[workspace.package] version`;
   project on another machine can draw the same views; `src/source_gate.rs`
   fails the tests on one that does. What stays the viewer's own (the user
   config, window state, recent remotes, updates, feedback, bootstrap) is read
-  here as before.
+  here as before. For a project on another machine the source is
+  `source::remote::RemoteSource` (each read a round trip to the far
+  `shelbi relay`) and the link `ProjectLink::remote`; its feed polls more
+  slowly (`FeedTiming::remote`) and has no local orchestrator-title probe.
+  Nothing opens such a window yet.
 - **Colors come from `src/theme.rs`**, the shared tokens of
   `shelbi_app::theme` (one named set, dark and light, also used by the TUI)
   as gpui colors. Views read them with `cx.global::<Theme>()`. No color

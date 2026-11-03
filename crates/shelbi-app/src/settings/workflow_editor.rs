@@ -345,7 +345,8 @@ pub struct GitForm {
 
 /// The project's `git:` values a workflow without its own inherits: the
 /// Git fields' placeholders.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct ProjectGit {
     pub base_branch: String,
     pub branch: String,

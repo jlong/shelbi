@@ -4,9 +4,11 @@
 //!
 //! It lives here, beside the orchestrator readers it wraps, because
 //! `shelbi-app` must not depend on this crate. It is also what a far machine
-//! runs to answer a remote window's queries, so a local window and a remote
-//! one read a project through the same code.
+//! runs to answer a remote window's queries ([`QueryAnswers`], the handler
+//! `shelbi relay` serves its `query` service with), so a local window and a
+//! remote one read a project through the same code.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use shelbi_app::activity::{read_activity_window_staged, ActivityMetaCache, ProjectInfo};
@@ -25,10 +27,11 @@ use shelbi_app::source::{
 use shelbi_app::view::{MachinesModel, SidebarModel};
 use shelbi_core::Reachability;
 use shelbi_proto::control::ExpectedState;
-use shelbi_state::agents_config::AgentsConfig;
+use shelbi_app::source::wire::{self, Answer, Query, QueryError};
+use shelbi_state::agents_config::{AgentsConfig, AgentsFiles};
 use shelbi_state::changelog::ChangelogStamp;
 use shelbi_state::keymap::{KeymapDiagnostic, Keymaps};
-use shelbi_state::workflow_config::WorkflowConfig;
+use shelbi_state::workflow_config::{WorkflowConfig, WorkflowFiles};
 use shelbi_state::{ErrorLogEntry, ZenModeState};
 
 /// The handle a window on `name` (on this machine) owns: the local source,
@@ -58,6 +61,114 @@ impl LocalSource {
 
     fn name(&self) -> &str {
         &self.key.name
+    }
+
+    /// The files [`ProjectSource::workflow_config`] builds its model from,
+    /// unparsed: what a remote window is sent, to build the same model.
+    pub fn workflow_files(&self) -> Result<WorkflowFiles, String> {
+        WorkflowConfig::read_files(self.name()).map_err(|e| e.to_string())
+    }
+
+    /// The files [`ProjectSource::agents_config`] builds its model from.
+    pub fn agents_files(&self) -> Result<AgentsFiles, String> {
+        AgentsConfig::read_files(self.name()).map_err(|e| e.to_string())
+    }
+
+    /// The project's section of this machine's `keys.yaml`, the part of
+    /// [`ProjectSource::project_keymap`] a remote window lays over its own
+    /// keys (the rest is this machine's user's own, never sent).
+    pub fn keymap_overlay(&self) -> Option<String> {
+        shelbi_state::keymap::project_overlay(self.name())
+    }
+}
+
+/// How many projects' sources [`QueryAnswers`] keeps between queries.
+const KEPT_SOURCES: usize = 32;
+
+/// Answers a remote window's `query` messages on this machine, each through
+/// the [`LocalSource`] of the project it names: what `shelbi relay` serves
+/// its `query` service with. One source per project is kept for the relay's
+/// lifetime, so the Activity feed's title cache carries over between reads
+/// as it does in a local window.
+///
+/// The answers are this machine's project reads only; its user's own
+/// settings (theme, desktop, the `keys.yaml` defaults) are never sent.
+#[derive(Default)]
+pub struct QueryAnswers {
+    sources: Mutex<HashMap<String, Arc<LocalSource>>>,
+}
+
+impl QueryAnswers {
+    /// These answers as the relay's query handler.
+    pub fn handler(self) -> shelbi_client::QueryHandler {
+        wire::handler(move |query, early: &mut dyn FnMut(Answer)| self.answer(query, early))
+    }
+
+    fn source(&self, project: &str) -> Arc<LocalSource> {
+        let mut sources = self.sources.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(source) = sources.get(project) {
+            return source.clone();
+        }
+        if sources.len() >= KEPT_SOURCES {
+            sources.clear();
+        }
+        // A name that isn't a registered project reads as nothing, never as
+        // a path: every reader behind the source resolves it through the
+        // project registry.
+        let source = Arc::new(LocalSource::new(project));
+        sources.insert(project.to_string(), source.clone());
+        source
+    }
+
+    /// Answer `query`, handing any early answer to `early` first.
+    pub fn answer(&self, query: Query, early: &mut dyn FnMut(Answer)) -> Result<Answer, QueryError> {
+        let source = self.source(query.project());
+        let failed = |message: String| QueryError::Failed { message };
+        Ok(match query {
+            Query::Sidebar { .. } => Answer::Sidebar(source.sidebar()),
+            Query::ConfigSkeleton { .. } => Answer::ConfigSkeleton(source.config_skeleton()),
+            Query::ProjectExists { .. } => Answer::ProjectExists(source.project_exists()),
+            Query::ProjectSummary { .. } => Answer::ProjectSummary(source.project_summary().map_err(failed)?),
+            Query::EditTargets { .. } => Answer::EditTargets(source.edit_targets()),
+            Query::OpenBoard { .. } => Answer::OpenBoard(Box::new(source.open_board())),
+            Query::ClosedPage { .. } => Answer::ClosedPage(source.closed_page()),
+            Query::MoreClosed { cursor, .. } => Answer::MoreClosed(source.more_closed(&cursor).map_err(failed)?),
+            Query::Search { text, page, .. } => Answer::Search(source.search(&text, page)),
+            Query::IssueState { id, .. } => Answer::IssueState(source.issue_state(&id)),
+            Query::ActivityWindow { window, .. } => {
+                let read = source.activity_window(window, &mut |staged| {
+                    early(Answer::ActivityWindow(Box::new(staged)))
+                });
+                Answer::ActivityWindow(Box::new(read))
+            }
+            Query::Changelog { unless, .. } => Answer::Changelog(source.changelog(unless.as_ref())),
+            Query::SearchCorpus { .. } => {
+                let entries = source
+                    .changelog(None)
+                    .ok_or_else(|| failed("the changelog didn't read".into()))?
+                    .entries;
+                Answer::SearchCorpus(shelbi_app::overlay::palette_search::corpus_from_reads(
+                    source.open_board(),
+                    entries,
+                ))
+            }
+            Query::Errors { .. } => Answer::Errors(source.errors().map_err(failed)?),
+            Query::ZenState { .. } => Answer::ZenState(source.zen_state().map_err(failed)?),
+            Query::WorkspaceDetails { workspace, .. } => {
+                Answer::WorkspaceDetails(Box::new(source.workspace_details(&workspace).map_err(failed)?))
+            }
+            Query::ReviewOpenTarget { task, .. } => {
+                Answer::ReviewOpenTarget(Box::new(source.review_open_target(&task).map_err(failed)?))
+            }
+            Query::ReviewSlots { .. } => Answer::ReviewSlots(source.review_slots().map_err(failed)?),
+            Query::Machines { .. } => Answer::Machines(source.machines().map_err(failed)?),
+            Query::MachineReachability { host, .. } => Answer::MachineReachability(source.machine_reachability(&host)),
+            Query::WorkflowConfig { .. } => Answer::WorkflowConfig(Box::new(source.workflow_files().map_err(failed)?)),
+            Query::ProjectGit { .. } => Answer::ProjectGit(source.project_git()),
+            Query::AgentsConfig { .. } => Answer::AgentsConfig(Box::new(source.agents_files().map_err(failed)?)),
+            Query::WorkspacesConfig { .. } => Answer::WorkspacesConfig(source.workspaces_config().map_err(failed)?),
+            Query::ProjectKeymap { .. } => Answer::ProjectKeymap(source.keymap_overlay()),
+        })
     }
 }
 

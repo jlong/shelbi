@@ -547,8 +547,22 @@ impl QueryStream {
     /// [`ClientError::UnexpectedEof`] when the relay closed the stream (or the
     /// channel went down) first.
     pub fn call(&mut self, payload: &[u8]) -> Result<Vec<u8>, ClientError> {
+        self.send(payload)?;
+        self.recv()
+    }
+
+    /// Send one request payload without waiting: read its replies with
+    /// [`recv`](Self::recv) (a request may be answered more than once).
+    pub fn send(&mut self, payload: &[u8]) -> Result<(), ClientError> {
         self.writer.write_all(&services::frame_message(payload)?)?;
         self.writer.flush()?;
+        Ok(())
+    }
+
+    /// Wait for the next reply on the stream.
+    /// [`ClientError::UnexpectedEof`] when the relay closed the stream (or the
+    /// channel went down) first.
+    pub fn recv(&mut self) -> Result<Vec<u8>, ClientError> {
         services::read_message(&mut self.reader)?.ok_or(ClientError::UnexpectedEof)
     }
 }

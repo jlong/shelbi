@@ -37,10 +37,13 @@ use super::{
 };
 use crate::error::ClientError;
 
-/// Answers one `query` request payload with one response payload. Runs on the
-/// stream's worker thread on the far machine. The relay does not look inside
-/// either payload; `shelbi_app::source::wire` defines them.
-pub type QueryHandler = Arc<dyn Fn(&[u8]) -> Vec<u8> + Send + Sync>;
+/// Answers one `query` request payload with one or more response payloads,
+/// each handed to the reply callback in order as soon as it is ready (an
+/// early answer, then the full one). Runs on the stream's worker thread on
+/// the far machine. The relay does not look inside the payloads;
+/// `shelbi_app::source::wire` defines them, including which reply is the
+/// last.
+pub type QueryHandler = Arc<dyn Fn(&[u8], &mut dyn FnMut(Vec<u8>)) + Send + Sync>;
 
 /// Why the relay refuses a control message from a remote window, or `None`
 /// when it may be forwarded to the far daemon. `project` is the window's own
@@ -312,19 +315,35 @@ fn open_query(
                     Ok(None) => break,
                     Err(()) => break 'stream,
                 };
-                // A panicking handler must not leave the client waiting
-                // forever: it closes the stream instead.
-                let answer = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&payload)));
-                let Ok(answer) = answer else { break 'stream };
-                let Ok(framed) = frame_message(&answer) else { break 'stream };
-                for piece in framed.chunks(DATA_CHUNK) {
-                    let data = RelayFrame::Data {
-                        stream,
-                        bytes: piece.to_vec(),
-                    };
-                    if send_out(&out, &data).is_err() {
+                // Each reply goes out as soon as the handler gives it. A reply
+                // that can't be framed or sent ends the stream.
+                let mut sent = true;
+                let mut reply = |answer: Vec<u8>| {
+                    if !sent {
                         return;
                     }
+                    let Ok(framed) = frame_message(&answer) else {
+                        sent = false;
+                        return;
+                    };
+                    for piece in framed.chunks(DATA_CHUNK) {
+                        let data = RelayFrame::Data {
+                            stream,
+                            bytes: piece.to_vec(),
+                        };
+                        if send_out(&out, &data).is_err() {
+                            sent = false;
+                            return;
+                        }
+                    }
+                };
+                // A panicking handler must not leave the client waiting
+                // forever: it closes the stream instead.
+                let answered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handler(&payload, &mut reply)
+                }));
+                if answered.is_err() || !sent {
+                    break 'stream;
                 }
             }
         }

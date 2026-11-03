@@ -116,14 +116,14 @@ fn queries_are_answered_by_the_far_readers() {
     assert!(link.supports_services(), "relay v{}", link.relay_version());
 
     let mut querier = link.querier().unwrap();
-    assert_eq!(
+    assert!(matches!(
         querier.ask(Query::ProjectExists { project: "alpha".into() }).unwrap(),
         Answer::ProjectExists(true)
-    );
-    assert_eq!(
+    ));
+    assert!(matches!(
         querier.ask(Query::ProjectExists { project: "nope".into() }).unwrap(),
         Answer::ProjectExists(false)
-    );
+    ));
     match querier.ask(Query::ConfigSkeleton { project: "alpha".into() }).unwrap() {
         Answer::ConfigSkeleton(Some(model)) => assert_eq!(model.project_label, "alpha"),
         other => panic!("expected alpha's skeleton, got {other:?}"),
@@ -137,8 +137,10 @@ fn queries_are_answered_by_the_far_readers() {
         Answer::OpenBoard(_)
     ));
     assert!(matches!(
-        querier.ask(Query::Changelog { project: "alpha".into() }).unwrap(),
-        Answer::Changelog(_)
+        querier
+            .ask(Query::Changelog { project: "alpha".into(), unless: None })
+            .unwrap(),
+        Answer::Changelog(Some(_))
     ));
     // Nothing the queries did started a daemon.
     assert!(!sandbox.shelbi_home().join("shelbi.pid").exists());

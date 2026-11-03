@@ -14,9 +14,11 @@
 //! the readers it wraps, since this crate must not depend on the orchestrator;
 //! it is also what a far machine's `shelbi relay` answers a remote window's
 //! queries with (over the `query` service, whose messages are [`wire`]), so
-//! local and remote answers come from the same code. Only the local link
-//! exists so far: it uses this machine's daemon sockets, as the clients
-//! always have.
+//! local and remote answers come from the same code. A project on another
+//! machine is read by [`remote::RemoteSource`], which asks that machine's
+//! relay; its link ([`ProjectLink::remote`]) subscribes and commands over the
+//! same relay channel. The local link uses this machine's daemon sockets, as
+//! the clients always have.
 //!
 //! What stays the viewer's own, and so is never asked of a source: the user
 //! config (`load_user_config` / `update_user_config`), window state, recent
@@ -28,6 +30,7 @@
 //! caller showed the error as text, and text crosses a wire as it is.
 
 pub mod answers;
+pub mod remote;
 pub mod wire;
 
 use std::fmt;
@@ -308,11 +311,14 @@ impl SearchWorker {
 /// change and layout subscriptions that wake its feed, and the connector its
 /// terminal panes attach through. Cheap to clone.
 ///
-/// The local link (the only one so far) uses this machine's daemon sockets.
+/// The local link uses this machine's daemon sockets; a remote one
+/// ([`ProjectLink::remote`]) the host's relay channel.
 #[derive(Clone)]
 pub struct ProjectLink {
     key: ProjectKey,
     sessions: Arc<dyn Connector>,
+    /// The host's relay channel, for a project on another machine.
+    relay: Option<Arc<dyn remote::RelayLink>>,
 }
 
 impl fmt::Debug for ProjectLink {
@@ -328,7 +334,32 @@ impl ProjectLink {
         ProjectLink {
             key: ProjectKey::local(name),
             sessions,
+            relay: None,
         }
+    }
+
+    /// The link to `name` on `relay`'s host: subscriptions and commands over
+    /// that host's relay channel, its panes attaching through `sessions`.
+    pub fn remote(name: impl Into<String>, relay: Arc<dyn remote::RelayLink>, sessions: Arc<dyn Connector>) -> Self {
+        ProjectLink {
+            key: ProjectKey::remote(relay.host(), name),
+            sessions,
+            relay: Some(relay),
+        }
+    }
+
+    /// A `control` client on the far daemon, for a remote link.
+    fn far_control(relay: &dyn remote::RelayLink, project: &str) -> Result<shelbi_client::ControlClient, ExecError> {
+        use shelbi_client::transport::Transport;
+        let failed = |e: shelbi_client::ClientError| ExecError::Backend(format!("{}: {e}", relay.host()));
+        let stream = relay
+            .open_service(shelbi_proto::RelayService::Control {
+                project: project.to_string(),
+            })
+            .map_err(failed)?;
+        let (reader, writer, _shutdown) = Box::new(stream).split().map_err(failed)?;
+        let reader: Box<dyn std::io::Read + Send> = reader;
+        shelbi_client::ControlClient::over(reader, writer, shelbi_state::CLIENT_VERSION).map_err(failed)
     }
 
     pub fn key(&self) -> &ProjectKey {
@@ -342,14 +373,30 @@ impl ProjectLink {
 
     /// Subscribe to the daemon's change notes for the project; `connected`
     /// says whether the subscription is open.
+    ///
+    /// A remote link's wakes come from the far hub's change lines and the far
+    /// daemon's `Changed` notes, plus [`ChangeWake::Reload`] when the far
+    /// daemon asks its clients to reload; `connected` follows the far change
+    /// stream.
     pub fn subscribe_changes(&self, connected: Arc<AtomicBool>) -> (ChangeSubscription, Receiver<ChangeWake>) {
-        crate::changes::spawn_observed(&self.key.name, connected)
+        match &self.relay {
+            None => crate::changes::spawn_observed(&self.key.name, connected),
+            Some(relay) => remote::subscribe_changes(relay.clone(), &self.key.name, connected),
+        }
     }
 
     /// Subscribe to the daemon's layout events for the project (a review
     /// slot opening or closing).
     pub fn subscribe_layout(&self) -> (LayoutSubscription, Receiver<LayoutEvent>) {
-        crate::layout_sub::spawn(&self.key.name)
+        match &self.relay {
+            None => crate::layout_sub::spawn(&self.key.name),
+            Some(relay) => remote::subscribe_layout(relay.clone(), &self.key.name),
+        }
+    }
+
+    /// Whether this link reaches a project on another machine.
+    pub fn is_remote(&self) -> bool {
+        self.relay.is_some()
     }
 
     /// Run an issue mutation, expecting the issue at `expected` (`None`: no
@@ -360,12 +407,24 @@ impl ProjectLink {
         expected: Option<ExpectedState>,
         on_line: &mut dyn FnMut(Stream, &str),
     ) -> Result<Option<ExpectedState>, ExecError> {
-        crate::exec_daemon::execute_mutation_expecting(mutation, expected, on_line)
+        match &self.relay {
+            None => crate::exec_daemon::execute_mutation_expecting(mutation, expected, on_line),
+            Some(relay) => {
+                let mut client = Self::far_control(&**relay, &self.key.name)?;
+                crate::exec_daemon::mutate_over(&mut client, mutation, expected, on_line)
+            }
+        }
     }
 
     /// Ask the daemon to start or stop review `task`'s sessions.
     pub fn review_session(&self, task: &str, op: ReviewSessionOp, on_line: &mut dyn FnMut(Stream, &str)) -> ExecOutcome {
-        crate::exec_daemon::review_session(&self.key.name, task, op, on_line)
+        match &self.relay {
+            None => crate::exec_daemon::review_session(&self.key.name, task, op, on_line),
+            Some(relay) => {
+                let mut client = Self::far_control(&**relay, &self.key.name)?;
+                crate::exec_daemon::review_session_over(&mut client, &self.key.name, task, op, on_line)
+            }
+        }
     }
 
     /// Ask the daemon to start or stop workspace `ws`'s sessions.
@@ -375,7 +434,13 @@ impl ProjectLink {
         op: WorkspaceSessionOp,
         on_line: &mut dyn FnMut(Stream, &str),
     ) -> ExecOutcome {
-        crate::exec_daemon::workspace_session(&self.key.name, ws, op, on_line)
+        match &self.relay {
+            None => crate::exec_daemon::workspace_session(&self.key.name, ws, op, on_line),
+            Some(relay) => {
+                let mut client = Self::far_control(&**relay, &self.key.name)?;
+                crate::exec_daemon::workspace_session_over(&mut client, &self.key.name, ws, op, on_line)
+            }
+        }
     }
 }
 
@@ -430,6 +495,7 @@ pub mod null {
                 ProjectLink {
                     key,
                     sessions: Arc::new(NullSessions),
+                    relay: None,
                 },
             )
         }

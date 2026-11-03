@@ -216,6 +216,38 @@ pub struct UnreadableWorkflow {
     status_ids: Vec<String>,
 }
 
+/// The files a [`WorkflowConfig`] is built from, as read
+/// ([`WorkflowConfig::read_files`]) and not yet parsed. Serializable: a far
+/// machine sends them to a remote window, which parses them with the same
+/// loader ([`WorkflowConfig::from_files`]). The paths are the far machine's.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WorkflowFiles {
+    pub project: String,
+    pub dir: PathBuf,
+    pub statuses_path: PathBuf,
+    /// `None` when the file doesn't exist.
+    pub statuses_text: Option<String>,
+    /// Every workflow file, by stem.
+    pub workflows: Vec<WorkflowFile>,
+    /// The project YAML that holds `default_workflow:`.
+    pub project_path: PathBuf,
+    pub project_text: String,
+    /// The default workflow, its alias resolved.
+    pub default_workflow: String,
+    /// The project's agents, or `None` when it has no `agents/` directory.
+    pub agents: Option<Vec<String>>,
+}
+
+/// One workflow file's text.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct WorkflowFile {
+    pub stem: String,
+    pub path: PathBuf,
+    pub text: String,
+}
+
 /// What a save did.
 #[derive(Debug, Clone)]
 pub struct Saved {
@@ -288,9 +320,63 @@ struct Loaded {
 impl WorkflowConfig {
     /// Load `project`'s statuses, workflows and default workflow.
     pub fn load(project: &str) -> Result<Self> {
+        Self::from_files(Self::read_files(project)?)
+    }
+
+    /// Read every file [`load`](Self::load) builds the model from, without
+    /// parsing them: what a far machine sends a remote window, which builds
+    /// the model with [`from_files`](Self::from_files), the same loader.
+    pub fn read_files(project: &str) -> Result<WorkflowFiles> {
         let dir = crate::workflows_dir(project).map_err(other)?;
         let statuses_path = crate::workflows::statuses_read_path(project).map_err(other)?;
         let statuses_text = read_optional(&statuses_path)?;
+        let mut workflows = Vec::new();
+        for (stem, path) in workflow_files(&dir)? {
+            let text = read_optional(&path)?.unwrap_or_default();
+            workflows.push(WorkflowFile { stem, path, text });
+        }
+        let project_path = project_config_file(project)?;
+        let project_text =
+            fs::read_to_string(&project_path).map_err(|e| file_err(&project_path, e))?;
+        let declared = yaml_edit::parse(&project_text)
+            .ok()
+            .and_then(|v| v.get("default_workflow")?.as_str().map(str::to_string))
+            .unwrap_or_else(|| shelbi_core::DEFAULT_WORKFLOW_NAME.to_string());
+        let default_workflow =
+            crate::workflows::resolve_workflow_alias(project, &declared).map_err(other)?;
+        let agents_dir = crate::agents_dir(project).map_err(other)?;
+        let agents = if agents_dir.is_dir() {
+            Some(crate::list_agents(project).map_err(other)?)
+        } else {
+            None
+        };
+        Ok(WorkflowFiles {
+            project: project.to_string(),
+            dir,
+            statuses_path,
+            statuses_text,
+            workflows,
+            project_path,
+            project_text,
+            default_workflow,
+            agents,
+        })
+    }
+
+    /// The model over `files` as [`read_files`](Self::read_files) read them.
+    /// Reads nothing.
+    pub fn from_files(files: WorkflowFiles) -> Result<Self> {
+        let WorkflowFiles {
+            project,
+            dir,
+            statuses_path,
+            statuses_text,
+            workflows: files,
+            project_path,
+            project_text,
+            default_workflow,
+            agents,
+        } = files;
         let catalog = match &statuses_text {
             Some(text) => {
                 ProjectStatuses::from_yaml_str(text).map_err(|e| file_err(&statuses_path, e))?
@@ -300,8 +386,7 @@ impl WorkflowConfig {
 
         let mut workflows = BTreeMap::new();
         let mut unreadable = Vec::new();
-        for (stem, path) in workflow_files(&dir)? {
-            let text = read_optional(&path)?.unwrap_or_default();
+        for WorkflowFile { stem, path, text } in files {
             match parse_workflow(&text, &catalog) {
                 Ok(mut workflow) => {
                     // Workflows load by file stem; the stem is the name.
@@ -317,23 +402,6 @@ impl WorkflowConfig {
             }
         }
 
-        let project_path = project_config_file(project)?;
-        let project_text =
-            fs::read_to_string(&project_path).map_err(|e| file_err(&project_path, e))?;
-        let declared = yaml_edit::parse(&project_text)
-            .ok()
-            .and_then(|v| v.get("default_workflow")?.as_str().map(str::to_string))
-            .unwrap_or_else(|| shelbi_core::DEFAULT_WORKFLOW_NAME.to_string());
-        let default_workflow =
-            crate::workflows::resolve_workflow_alias(project, &declared).map_err(other)?;
-
-        let agents_dir = crate::agents_dir(project).map_err(other)?;
-        let agents = if agents_dir.is_dir() {
-            Some(crate::list_agents(project).map_err(other)?)
-        } else {
-            None
-        };
-
         let entries = workflows
             .iter()
             .map(|(stem, loaded)| Entry {
@@ -342,7 +410,7 @@ impl WorkflowConfig {
             })
             .collect();
         Ok(WorkflowConfig {
-            project: project.to_string(),
+            project,
             statuses: catalog.statuses.clone(),
             workflows: entries,
             default_workflow: default_workflow.clone(),

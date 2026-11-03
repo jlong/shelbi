@@ -18,6 +18,7 @@ pub use contexts::{context, KeymapContext, CONTEXTS};
 pub use key::{Key, Mods};
 pub use display::{format_chord, DisplayStyle};
 pub use loader::{
-    heal_legacy_zen_toggle, load_keymaps, validate_keymaps_yaml, ErrorKind, KeymapDiagnostic,
+    heal_legacy_zen_toggle, load_keymaps, load_keymaps_with_overlay, project_overlay,
+    validate_keymaps_yaml, ErrorKind, KeymapDiagnostic,
     Keymaps, ModeKeymap, WarningKind, KEYS_FILENAME,
 };

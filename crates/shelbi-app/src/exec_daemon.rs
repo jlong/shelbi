@@ -17,6 +17,8 @@ use shelbi_proto::control::{
     ReviewSessionRequest, Stream, WorkspaceSessionOp, WorkspaceSessionRequest,
 };
 
+use shelbi_client::ControlClient;
+
 use crate::exec::{ExecError, ExecOutcome, Mutation};
 
 /// Run one [`Mutation`] against the daemon. Output lines the daemon streams back
@@ -75,10 +77,19 @@ pub fn review_session(
     op: ReviewSessionOp,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> ExecOutcome {
-    shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
-    let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
-    let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)
-        .map_err(|e| ExecError::Backend(e.to_string()))?;
+    let mut client = connect_local()?;
+    review_session_over(&mut client, project, task, op, on_line)
+}
+
+/// [`review_session`] over an already connected control client (a remote
+/// window's, on its host's `control` service).
+pub(crate) fn review_session_over(
+    client: &mut ControlClient,
+    project: &str,
+    task: &str,
+    op: ReviewSessionOp,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> ExecOutcome {
     let req = ReviewSessionRequest {
         request_id: 1,
         project: project.to_string(),
@@ -99,10 +110,18 @@ pub fn workspace_session(
     op: WorkspaceSessionOp,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> ExecOutcome {
-    shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
-    let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
-    let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)
-        .map_err(|e| ExecError::Backend(e.to_string()))?;
+    let mut client = connect_local()?;
+    workspace_session_over(&mut client, project, workspace, op, on_line)
+}
+
+/// [`workspace_session`] over an already connected control client.
+pub(crate) fn workspace_session_over(
+    client: &mut ControlClient,
+    project: &str,
+    workspace: &str,
+    op: WorkspaceSessionOp,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> ExecOutcome {
     let req = WorkspaceSessionRequest {
         request_id: 1,
         project: project.to_string(),
@@ -232,11 +251,42 @@ fn route(
     kind: MutationKind,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> Result<Option<ExpectedState>, ExecError> {
+    let mut client = connect_local()?;
+    send_mutation(&mut client, project, id, expected, kind, on_line)
+}
+
+/// This machine's daemon, started on demand, past the control hello.
+fn connect_local() -> Result<ControlClient, ExecError> {
     shelbi_state::ensure_daemon_running().map_err(|e| ExecError::Backend(e.to_string()))?;
     let sock = shelbi_state::control_socket_path().map_err(|e| ExecError::Backend(e.to_string()))?;
-    let mut client = shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION)
-        .map_err(|e| ExecError::Backend(e.to_string()))?;
+    ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION).map_err(|e| ExecError::Backend(e.to_string()))
+}
 
+/// [`execute_mutation_expecting`] over an already connected control client
+/// (a remote window's, on its host's `control` service).
+pub(crate) fn mutate_over(
+    client: &mut ControlClient,
+    mutation: &Mutation,
+    expected: Option<ExpectedState>,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> Result<Option<ExpectedState>, ExecError> {
+    let (project, id, kind) = map_to_kind(mutation)?;
+    let expected = match &kind {
+        MutationKind::Add(_) => None,
+        _ => expected,
+    };
+    send_mutation(client, &project, &id, expected, kind, on_line)
+}
+
+/// Send one mutation on `client` and map the result to an [`ExecError`].
+fn send_mutation(
+    client: &mut ControlClient,
+    project: &str,
+    id: &str,
+    expected: Option<ExpectedState>,
+    kind: MutationKind,
+    on_line: &mut dyn FnMut(Stream, &str),
+) -> Result<Option<ExpectedState>, ExecError> {
     // Out-of-date gate (removing-tmux Phase 4f, "Versions and upgrades"): if the
     // daemon answered its hello with a different version than ours, this client
     // is out of date and must NOT send a mutation — it should re-exec / relaunch

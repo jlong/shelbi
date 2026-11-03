@@ -40,7 +40,8 @@ pub const CACHE_TTL: Duration = Duration::from_secs(60);
 const CACHE_CAP: usize = 32;
 
 /// One page of search results.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct SearchPage {
     /// The page's matching issues, in the tracker's relevance order.
     pub issues: Vec<IssueFile>,
@@ -49,7 +50,8 @@ pub struct SearchPage {
 }
 
 /// Why a search came back without results.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SearchFailure {
     /// The board's tracker has no remote search: filter locally, silently.
     Unsupported,
