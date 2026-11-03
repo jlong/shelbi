@@ -65,4 +65,10 @@ pub enum ClientError {
     /// and reconnects by sequence number.
     #[error("relay channel is unreachable (no keepalive within the deadline)")]
     RelayUnreachable,
+
+    /// The relay is older than relay protocol v2 and has no services (`query`,
+    /// `control`, `changes`). Its hello said `version`; the client sent it
+    /// nothing it would choke on.
+    #[error("the remote relay speaks protocol {version}, which has no services; update Shelbi there")]
+    RelayServicesUnsupported { version: u16 },
 }

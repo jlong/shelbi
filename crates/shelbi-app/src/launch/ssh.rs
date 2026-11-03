@@ -159,6 +159,31 @@ pub struct RemoteProject {
     pub path: String,
 }
 
+/// The protocols a host's Shelbi speaks for a native remote window (one that
+/// reads, commands and streams the far project over a [`relay_command`]
+/// link instead of running the far TUI in a terminal). Advertised in the
+/// [`RemoteListing`] so a client knows before it tries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeCapability {
+    /// The relay channel protocol (`shelbi_proto::RELAY_PROTOCOL_VERSION`).
+    pub relay: u16,
+    /// The daemon control protocol (`shelbi_proto::control::CONTROL_PROTOCOL_VERSION`).
+    pub control: u32,
+    /// The relay `query` messages ([`crate::source::wire::QUERY_PROTOCOL_VERSION`]).
+    pub query: u32,
+}
+
+impl NativeCapability {
+    /// What this build speaks.
+    pub fn current() -> NativeCapability {
+        NativeCapability {
+            relay: shelbi_proto::RELAY_PROTOCOL_VERSION,
+            control: shelbi_proto::control::CONTROL_PROTOCOL_VERSION,
+            query: crate::source::wire::QUERY_PROTOCOL_VERSION,
+        }
+    }
+}
+
 /// What `shelbi remote list --json` prints: this machine's Shelbi, as another
 /// machine's Connect to Remote Session dialog sees it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,6 +198,12 @@ pub struct RemoteListing {
     pub daemon_running: bool,
     /// The registered projects, most recently opened first.
     pub projects: Vec<RemoteProject>,
+    /// The protocols this Shelbi speaks for a native remote window. `None`
+    /// from a host that predates it (its listing has no `native`), which
+    /// then opens in the terminal view. Additive, so [`REMOTE_PROTOCOL`] is
+    /// unchanged: an older client ignores the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<NativeCapability>,
 }
 
 impl RemoteListing {
@@ -193,6 +224,7 @@ impl RemoteListing {
             user: local_user(),
             daemon_running: super::route::daemon_state() == super::DaemonState::Running,
             projects,
+            native: Some(NativeCapability::current()),
         })
     }
 
@@ -362,6 +394,33 @@ exec \"$P\" --project {}
     argv.extend(["ssh".to_string(), "-t".to_string()]);
     argv.extend(ssh_options(&auth, control_path));
     argv.push(session.host.clone());
+    argv.push("--".to_string());
+    argv.push(remote_sh(&script));
+    argv
+}
+
+/// The command that opens a [`super::link::RemoteLink`] to `host`: the host's
+/// own `shelbi relay` over one `ssh`, its stdio the relay channel.
+///
+/// It finds the far binary the way the probe does, signs in with keys, agent
+/// and config only (`BatchMode=yes`, with the usual keepalives), and allocates
+/// no terminal. It sets up no forward of any kind: no `-R` (this machine's
+/// `hub.sock` is never exposed to the far host), no `-L`, and
+/// `ClearAllForwardings=yes` so a forward in the user's `~/.ssh/config`
+/// isn't set up either. It names no ControlMaster, so it neither opens nor
+/// shares Shelbi's remote-session connection. And it never starts the far
+/// daemon: `shelbi relay` only reads, and connects to the daemon's sockets
+/// when a service asks.
+pub fn relay_command(host: &str) -> Vec<String> {
+    let script = format!(
+        "{FIND_SHELBI}if [ -z \"$P\" ]; then echo 'Shelbi isn'\\''t installed on this machine.' >&2; exit 127; fi
+exec \"$P\" relay
+"
+    );
+    let mut argv = vec!["ssh".to_string(), "-T".to_string()];
+    argv.extend(ssh_options(&SshAuth::Batch, None));
+    argv.extend(["-o".to_string(), "ClearAllForwardings=yes".to_string()]);
+    argv.push(host.to_string());
     argv.push("--".to_string());
     argv.push(remote_sh(&script));
     argv
@@ -700,6 +759,7 @@ mod tests {
                     path: "/srv/web".into(),
                 },
             ],
+            native: None,
         }
     }
 
@@ -1013,6 +1073,89 @@ mod tests {
         assert!(!same_release_line("0.42.0", "nonsense"));
         assert_eq!(version_of("shelbi 0.42.1"), Some("0.42.1".into()));
         assert_eq!(version_of(""), None);
+    }
+
+    #[test]
+    fn the_relay_link_carries_no_forward_and_no_shared_connection() {
+        let argv = relay_command("devbox");
+        assert_eq!(argv[0], "ssh");
+        for arg in &argv[..argv.len() - 1] {
+            // No forward of either direction (or a dynamic one), however spelled.
+            for flag in ["-R", "-L", "-D", "-M", "-S"] {
+                assert!(!arg.starts_with(flag), "relay ssh has {arg}: {argv:?}");
+            }
+            for option in ["Forward", "ControlMaster", "ControlPath", "ControlPersist"] {
+                assert!(
+                    !arg.contains(option) || arg == "ClearAllForwardings=yes",
+                    "relay ssh has {arg}: {argv:?}"
+                );
+            }
+        }
+        assert!(has(&argv, ["-o", "BatchMode=yes"]), "{argv:?}");
+        assert!(has(&argv, ["-o", "ServerAliveInterval=15"]), "{argv:?}");
+        assert!(has(&argv, ["-o", "ClearAllForwardings=yes"]), "{argv:?}");
+        assert!(!argv.iter().any(|a| a == "-t"), "no terminal: {argv:?}");
+        // The host, then the far command: find shelbi, exec its relay.
+        let at = argv.iter().position(|a| a == "devbox").unwrap();
+        assert_eq!(argv[at + 1], "--");
+        let script = &argv[at + 2];
+        assert!(script.starts_with("sh -c "), "{script}");
+        assert!(script.contains("command -v shelbi"), "{script}");
+        assert!(script.contains("exec \"$P\" relay"), "{script}");
+        assert!(!script.contains("ensure-daemon"), "never starts the far daemon: {script}");
+    }
+
+    /// The listing as a Shelbi from before `native` wrote and read it.
+    #[derive(Debug, Serialize, Deserialize, PartialEq)]
+    struct ListingV1 {
+        protocol: u32,
+        version: String,
+        user: String,
+        daemon_running: bool,
+        projects: Vec<RemoteProject>,
+    }
+
+    #[test]
+    fn a_listing_with_native_decodes_on_old_and_new_clients() {
+        let mut new = listing("0.42.0", true);
+        new.native = Some(NativeCapability::current());
+        let text = serde_json::to_string(&new).unwrap();
+        assert!(text.contains("\"native\":{\"relay\":"), "{text}");
+        assert_eq!(serde_json::from_str::<RemoteListing>(&text).unwrap(), new);
+        // An older client ignores the field.
+        let old: ListingV1 = serde_json::from_str(&text).unwrap();
+        assert_eq!(old.projects, new.projects);
+        assert_eq!(old.protocol, REMOTE_PROTOCOL);
+    }
+
+    #[test]
+    fn a_listing_without_native_decodes_on_old_and_new_clients() {
+        // An old host's listing: no `native`, so a new client sees None.
+        let old = ListingV1 {
+            protocol: REMOTE_PROTOCOL,
+            version: "0.41.0".into(),
+            user: "jlong".into(),
+            daemon_running: false,
+            projects: vec![],
+        };
+        let text = serde_json::to_string(&old).unwrap();
+        let new: RemoteListing = serde_json::from_str(&text).unwrap();
+        assert_eq!(new.native, None);
+        assert_eq!(new.version, "0.41.0");
+        // And a new listing without it writes no `native`, which an old
+        // client reads as before.
+        let text = serde_json::to_string(&new).unwrap();
+        assert!(!text.contains("native"), "{text}");
+        assert_eq!(serde_json::from_str::<ListingV1>(&text).unwrap(), old);
+    }
+
+    #[test]
+    fn this_build_advertises_what_it_speaks() {
+        let native = NativeCapability::current();
+        assert_eq!(native.relay, shelbi_proto::RELAY_PROTOCOL_VERSION);
+        assert!(native.relay >= shelbi_proto::RELAY_SERVICES_VERSION);
+        assert_eq!(native.control, shelbi_proto::control::CONTROL_PROTOCOL_VERSION);
+        assert_eq!(native.query, crate::source::wire::QUERY_PROTOCOL_VERSION);
     }
 
     /// The real `ssh` against this machine, for a developer with key-based

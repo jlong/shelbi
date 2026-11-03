@@ -22,6 +22,7 @@
 //!   wizard; connecting remembers the session.
 
 pub mod connect;
+pub mod link;
 pub mod recent;
 pub mod remote;
 pub mod route;
@@ -36,7 +37,8 @@ pub use connect::ConnectFlow;
 pub use recent::{RecentRemote, RecentRemotes, MAX_RECENT_REMOTES, RECENT_REMOTES_FILE};
 pub use remote::{validate_host, RemoteConnector, RemoteError, RemoteSession};
 pub use route::{decide, route, Client, DaemonState, LaunchRoute};
-pub use ssh::{RemoteListing, SshRemote};
+pub use link::RemoteLink;
+pub use ssh::{NativeCapability, RemoteListing, SshRemote};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use remote::FakeRemote;

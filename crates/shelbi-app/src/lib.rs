@@ -90,6 +90,7 @@ pub mod refresh;
 pub mod review;
 pub mod session;
 pub mod settings;
+pub mod source;
 pub mod supervision;
 pub mod task_properties;
 pub mod task_session;

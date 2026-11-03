@@ -99,7 +99,7 @@ fn connect_and_stream(project: &str, tx: &Sender<LayoutEvent>, stop: &AtomicBool
 
     // The subscribe frame names this project so the daemon streams only its
     // changes (the bus is hub-global). The connection then only reads — no ack.
-    let frame = format!("{{\"verb\":\"subscribe\",\"project\":{}}}\n", json_string(project));
+    let frame = shelbi_client::relay::services::subscribe_line(project);
     if stream.write_all(frame.as_bytes()).is_err() {
         return StreamEnd::Disconnected;
     }
@@ -149,23 +149,6 @@ fn parse_layout_line(line: &[u8], project: &str) -> Option<LayoutEvent> {
         return None;
     }
     change.layout().cloned()
-}
-
-/// Minimal JSON string encoder for the project name in the subscribe frame —
-/// enough to keep a name with a quote or backslash well-formed without pulling
-/// the value through a serializer.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Whether a read error is the idle read-timeout (so the loop re-checks `stop`)
@@ -244,11 +227,5 @@ mod tests {
 "#
             .to_vec();
         assert!(drain_lines(&mut buf, "p", &tx).is_err(), "a dropped receiver is reported");
-    }
-
-    #[test]
-    fn json_string_escapes_quotes_and_backslashes() {
-        assert_eq!(json_string("plain"), r#""plain""#);
-        assert_eq!(json_string(r#"a"b\c"#), r#""a\"b\\c""#);
     }
 }
