@@ -631,3 +631,77 @@ fn a_saved_frame_that_no_longer_fits_opens_on_the_display(cx: &mut TestAppContex
         update(cx, h, |_, window, _| window.remove_window());
     }
 }
+
+/// Attach display `id` beside the primary one (the test platform's displays
+/// all share one size; each has its own UUID), as it would be saved.
+fn attach_display(cx: &mut TestAppContext, id: u64) -> DisplayRef {
+    cx.simulate_display_added(gpui::DisplayId::new(id), None);
+    cx.update(|cx| display_ref(&*cx.find_display(gpui::DisplayId::new(id)).unwrap()))
+}
+
+fn primary_id(cx: &mut TestAppContext) -> Option<gpui::DisplayId> {
+    cx.update(|cx| cx.primary_display().map(|d| d.id()))
+}
+
+#[gpui::test]
+fn a_frame_saved_on_an_attached_display_opens_there(cx: &mut TestAppContext) {
+    let external = attach_display(cx, 2);
+    assert_ne!(Some(gpui::DisplayId::new(2)), primary_id(cx));
+    let area = visible_frame(cx);
+    let saved = Frame { x: 300.0, y: area.y + 80.0, width: 1000.0, height: 700.0 };
+    let mut state = WindowState {
+        frame: Some(saved),
+        display: Some(external),
+        ..WindowState::default()
+    };
+    let (bounds, display) = cx.update(|cx| placement(&state, None, cx));
+    assert_eq!(display, Some(gpui::DisplayId::new(2)), "it opens on the display it was saved on");
+    assert_eq!(bounds_frame(bounds), saved, "at exactly its saved frame");
+
+    // That display is gone: the primary one, fully on screen.
+    cx.simulate_display_removed(gpui::DisplayId::new(2));
+    let off = Frame { x: area.x + area.width + 200.0, y: area.y + 100.0, width: 900.0, height: 700.0 };
+    state.frame = Some(off);
+    let (bounds, display) = cx.update(|cx| placement(&state, None, cx));
+    assert_eq!(display, primary_id(cx));
+    assert_eq!(bounds_frame(bounds), off.fit_within(area));
+
+    // Another display attached under the gone one's id isn't it.
+    attach_display(cx, 2);
+    let (_, display) = cx.update(|cx| placement(&state, None, cx));
+    assert_eq!(display, primary_id(cx), "a reused id doesn't match a saved UUID");
+}
+
+#[gpui::test]
+fn a_frame_saved_before_displays_opens_on_the_primary_unchanged(cx: &mut TestAppContext) {
+    attach_display(cx, 2);
+    // A session file from before this change: no display, a frame filling
+    // the primary's visible area (the full-width restore holds).
+    let full = Frame { x: -0.0, ..visible_frame(cx) };
+    let state = WindowState {
+        frame: Some(full),
+        ..WindowState::default()
+    };
+    let (bounds, display) = cx.update(|cx| placement(&state, None, cx));
+    assert_eq!(display, primary_id(cx));
+    assert_eq!(bounds_frame(bounds), full);
+}
+
+#[gpui::test]
+fn a_window_saves_the_display_its_frame_is_on(cx: &mut TestAppContext) {
+    let _f = fixture(cx);
+    attach_display(cx, 2);
+    let area = visible_frame(cx);
+    cx.update(|cx| open_launch_windows(launch_with_frame(area), cx));
+    let h = h_of(cx);
+    let primary = cx.update(|cx| display_ref(&*cx.primary_display().unwrap()));
+    assert!(primary.uuid.is_some(), "the UUID is saved, not only the id");
+    // The user resizes it: the frame is saved with the display it's on (what
+    // the window's bounds and display observers do; an inert test window
+    // has none).
+    VisualTestContext::from_window(h.into(), cx).simulate_resize(gpui::size(px(1000.0), px(700.0)));
+    update(cx, h, |w, window, cx| w.record_frame(window, cx));
+    let state = read(cx, h, |w, _| w.window_state.clone());
+    assert_eq!(state.frame.map(|f| (f.width, f.height)), Some((1000.0, 700.0)));
+    assert_eq!(state.display, Some(primary));
+}

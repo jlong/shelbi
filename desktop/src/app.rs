@@ -149,7 +149,7 @@ use crate::views::workspace::{WorkspaceDeps, WorkspaceEvent, WorkspaceView};
 use crate::views::settings::{SettingsEvent, SettingsView};
 use crate::views::settings_nav::{self, PageLook, SettingsNav, SettingsPage};
 use crate::views::sidebar::{self, SidebarEvent, SidebarHost, SidebarProps};
-use crate::window_state::{self, Frame, LaunchWindow, ProjectViewState, WindowSession, WindowState};
+use crate::window_state::{self, DisplayRef, Frame, LaunchWindow, ProjectViewState, WindowSession, WindowState};
 use crate::theme::style::{Type, Typography};
 
 actions!(
@@ -307,17 +307,18 @@ fn windows_showing_key(key: &ProjectKey, me: Option<WindowId>, cx: &App) -> Vec<
 }
 
 /// File ▸ New Window: another window on `project`, cascaded off the
-/// frontmost one (whose sidebar width and collapse it takes), in the lowest
-/// free slot. `None` when the window couldn't open (logged).
+/// frontmost one (on its display, taking its sidebar width and collapse), in
+/// the lowest free slot. `None` when the window couldn't open (logged).
 pub fn open_new_window(project: &str, cx: &mut App) -> Option<WindowHandle<ShelbiWindow>> {
     let mut state = WindowState::default();
     let mut cascade = None;
     if let Some(from) = frontmost(cx) {
-        let _ = from.update(cx, |w, window, _| {
+        let _ = from.update(cx, |w, window, cx| {
             state.sidebar_width = w.window_state.sidebar_width;
             state.sidebar_collapsed = w.window_state.sidebar_collapsed;
             state.task_pane_width = w.window_state.task_pane_width;
             cascade = Some(window.window_bounds().get_bounds());
+            state.display = window_display(window, cx);
         });
     }
     let taken: Vec<usize> = cx
@@ -398,7 +399,8 @@ pub fn open_notice_tag(tag: &str, cx: &mut App) {
 }
 
 /// Open a window on `project` in `slot`: at `bounds` when given (a cascade),
-/// else at the slot's saved frame, else centered.
+/// else at the slot's saved frame, else centered; on the state's display when
+/// it's attached, else the primary one.
 fn open_window(
     project: &str,
     slot: usize,
@@ -465,28 +467,7 @@ fn open_window_with(
 ) -> Option<WindowHandle<ShelbiWindow>> {
     let project = handle.name().to_string();
     let project = project.as_str();
-    let bounds = bounds.unwrap_or_else(|| match state.frame {
-        Some(f) if f.width >= 400.0 && f.height >= 300.0 => frame_bounds(f),
-        _ => {
-            let mut b =
-                Bounds::centered(None, gpui::size(px(DEFAULT_WIDTH), px(DEFAULT_HEIGHT)), cx);
-            // Cascade a new window off the ones already open, so it doesn't
-            // land exactly on top of them.
-            let offset = px(CASCADE * cx.windows().len() as f32);
-            b.origin.x += offset;
-            b.origin.y += offset;
-            b
-        }
-    });
-    // Keep it on the display it opens on (gpui places it on the primary): a
-    // frame that fits there is kept exactly.
-    let bounds = match cx.primary_display() {
-        Some(display) => {
-            let area = bounds_frame(display.visible_bounds());
-            frame_bounds(bounds_frame(bounds).fit_within(area))
-        }
-        None => bounds,
-    };
+    let (bounds, display_id) = placement(&state, bounds, cx);
     if !cx.has_global::<Shell>() {
         cx.set_global(Shell::default());
     }
@@ -497,6 +478,9 @@ fn open_window_with(
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
+            // gpui places the bounds relative to this display (the primary
+            // when it's `None` or not found).
+            display_id,
             titlebar: Some(TitlebarOptions {
                 title: Some(project.to_string().into()),
                 // The sidebar runs under a transparent title bar, the usual
@@ -558,6 +542,67 @@ fn hold_size(window: &mut Window, bounds: Bounds<gpui::Pixels>) {
         bounds.size.width - (got.width - content.width),
         bounds.size.height - (got.height - content.height),
     ));
+}
+
+/// Where a window opens: the bounds (`bounds` when given, a cascade; else
+/// the state's saved frame; else a default-sized window centered) and the
+/// display they're relative to. That's the state's saved display when it's
+/// still attached, else the primary one. The bounds are kept on that
+/// display's visible area: a frame that fits there is kept exactly, so a
+/// frame saved on a display that's gone opens fitted onto the primary.
+fn placement(
+    state: &WindowState,
+    bounds: Option<Bounds<gpui::Pixels>>,
+    cx: &App,
+) -> (Bounds<gpui::Pixels>, Option<gpui::DisplayId>) {
+    let display = state
+        .display
+        .as_ref()
+        .and_then(|saved| find_display(saved, cx))
+        .or_else(|| cx.primary_display());
+    let display_id = display.as_ref().map(|d| d.id());
+    let bounds = bounds.unwrap_or_else(|| match state.frame {
+        Some(f) if f.width >= 400.0 && f.height >= 300.0 => frame_bounds(f),
+        _ => {
+            let mut b = Bounds::centered(display_id, gpui::size(px(DEFAULT_WIDTH), px(DEFAULT_HEIGHT)), cx);
+            // Cascade a new window off the ones already open, so it doesn't
+            // land exactly on top of them.
+            let offset = px(CASCADE * cx.windows().len() as f32);
+            b.origin.x += offset;
+            b.origin.y += offset;
+            b
+        }
+    });
+    let bounds = match &display {
+        Some(display) => {
+            let area = bounds_frame(display.visible_bounds());
+            frame_bounds(bounds_frame(bounds).fit_within(area))
+        }
+        None => bounds,
+    };
+    (bounds, display_id)
+}
+
+/// The attached display `saved` names, if it's still attached.
+fn find_display(saved: &DisplayRef, cx: &App) -> Option<Rc<dyn gpui::PlatformDisplay>> {
+    cx.displays().into_iter().find(|d| {
+        let uuid = d.uuid().ok().map(|u| u.to_string());
+        saved.matches(uuid.as_deref(), d.id().into())
+    })
+}
+
+/// `display` as saved beside a frame.
+fn display_ref(display: &dyn gpui::PlatformDisplay) -> DisplayRef {
+    DisplayRef {
+        uuid: display.uuid().ok().map(|u| u.to_string()),
+        id: Some(display.id().into()),
+    }
+}
+
+/// The display `window` is on, as saved beside its frame (which gpui
+/// reports relative to that display).
+fn window_display(window: &Window, cx: &App) -> Option<DisplayRef> {
+    window.display(cx).map(|d| display_ref(&*d))
 }
 
 /// gpui bounds as a saved [`Frame`].
@@ -1232,9 +1277,16 @@ impl ShelbiWindow {
             Some(ready) => this.on_ready(ready, cx),
             None => this.start_bootstrap(cx),
         }
+        // The frame is relative to the window's display, so the two are saved
+        // together. gpui reads a window's bounds from its current screen but
+        // updates the window's display only on AppKit's screen-change
+        // notification, so a move onto another display can report the new
+        // bounds with the old display: the display change records both again.
         this._subscriptions.push(cx.observe_window_bounds(window, |this, window, cx| {
-            this.window_state.frame = Some(bounds_frame(window.window_bounds().get_bounds()));
-            this.schedule_save(cx);
+            this.record_frame(window, cx);
+        }));
+        this._subscriptions.push(cx.observe_window_display(window, |this, window, cx| {
+            this.record_frame(window, cx);
         }));
         this._subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
             this.active = window.is_window_active();
@@ -2356,6 +2408,14 @@ impl ShelbiWindow {
             self.focus_handle.focus(window, cx);
         }
         cx.notify();
+    }
+
+    /// Remember the window's frame and the display it's relative to, and
+    /// save them.
+    fn record_frame(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.window_state.frame = Some(bounds_frame(window.window_bounds().get_bounds()));
+        self.window_state.display = window_display(window, cx);
+        self.schedule_save(cx);
     }
 
     /// Record this window's slot (its project and frame) and save the slots.
