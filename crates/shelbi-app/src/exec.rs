@@ -166,11 +166,13 @@ pub enum Mutation {
     ToggleZen { project: String },
     /// Scaffold and open a new project (payload collected by the host's
     /// add-project form): the raw name, the repo path as typed (resolved
-    /// against the host's working directory), and where its config lives.
+    /// against the host's working directory), where its config lives, and
+    /// the agents' default runner and model (the Agent defaults step).
     AddProject {
         name: String,
         root: String,
         mode: shelbi_core::ConfigMode,
+        defaults: shelbi_core::AgentDefaults,
     },
 }
 

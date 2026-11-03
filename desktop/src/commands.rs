@@ -220,7 +220,9 @@ pub fn run_add_project(
 ) -> Result<String, shelbi_orchestrator::project_create::AddProjectError> {
     use shelbi_orchestrator::project_create::{add_project, AddProjectError};
     match mutation {
-        Mutation::AddProject { name, root, mode } => add_project(name, root, *mode, cwd, attempt, out),
+        Mutation::AddProject { name, root, mode, defaults } => {
+            add_project(name, root, *mode, defaults, cwd, attempt, out)
+        }
         other => Err(AddProjectError::Failed(format!("not an add-project mutation: {other:?}"))),
     }
 }

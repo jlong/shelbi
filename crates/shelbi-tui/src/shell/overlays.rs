@@ -60,6 +60,7 @@ pub enum OverlayEvent {
         name: String,
         root: String,
         mode: ConfigMode,
+        defaults: shelbi_core::AgentDefaults,
     },
     /// The Add-project form was cancelled.
     AddProjectCancel,
@@ -312,15 +313,10 @@ impl ActiveOverlay {
                     },
                 }
             }
-            ActiveOverlay::AddProject { form } => match form.handle_key(ev) {
-                overlay::add_project::Step::Continue => OverlayEvent::Stay,
-                overlay::add_project::Step::Cancel => OverlayEvent::AddProjectCancel,
-                overlay::add_project::Step::Submit => OverlayEvent::AddProjectSubmit {
-                    name: form.name().to_string(),
-                    root: form.root().to_string(),
-                    mode: form.mode(),
-                },
-            },
+            ActiveOverlay::AddProject { form } => {
+                let step = form.handle_key(ev);
+                add_project_event(form, step)
+            }
             ActiveOverlay::About(about) => about_event(about.handle_key(ev)),
             ActiveOverlay::Feedback(dialog) => feedback_event(dialog.handle_key(ev)),
             ActiveOverlay::Launch(screen) => OverlayEvent::Launch(screen.handle_key(ev)),
@@ -425,6 +421,12 @@ impl ActiveOverlay {
                 }
                 OverlayEvent::Stay
             }
+            // Clicks press its buttons, open its pickers and choose their
+            // rows, and pick a location.
+            ActiveOverlay::AddProject { form } => {
+                let step = form.handle_mouse(m);
+                add_project_event(form, step)
+            }
             // Both track the pointer themselves (their rows light under it).
             ActiveOverlay::Launch(screen) => OverlayEvent::Launch(screen.handle_mouse(m)),
             ActiveOverlay::ConnectRemote(dialog) => connect_event(dialog.handle_mouse(m)),
@@ -454,7 +456,7 @@ impl ActiveOverlay {
             // The form fills a generous share of the main area so long repo
             // paths and validation messages never truncate (the tmux dialog
             // filled the whole palette window for the same reason).
-            ActiveOverlay::AddProject { .. } => centered_pct(area, 70, 60, 48, 14),
+            ActiveOverlay::AddProject { .. } => centered_pct(area, 70, 60, 60, 26),
             // Sized to its content, and to the window when that's smaller.
             ActiveOverlay::About(about) => about.rect(area),
             // Centered and as tall as its content (the desktop's dialog).
@@ -543,6 +545,22 @@ fn dialog_rows(dialog: &overlay::review_confirm::Dialog) -> usize {
         4
     } else {
         2
+    }
+}
+
+/// What a key or click on the add-project form means to the shell.
+fn add_project_event(form: &overlay::add_project::Form, step: overlay::add_project::Step) -> OverlayEvent {
+    use overlay::add_project::Step;
+    match step {
+        // Page 1's validation and the pickers' menus are the form's own.
+        Step::Continue | Step::Validate | Step::Menu(_) => OverlayEvent::Stay,
+        Step::Cancel => OverlayEvent::AddProjectCancel,
+        Step::Submit => OverlayEvent::AddProjectSubmit {
+            name: form.name().to_string(),
+            root: form.root().to_string(),
+            mode: form.mode(),
+            defaults: form.defaults(),
+        },
     }
 }
 

@@ -2,6 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use super::*;
+use crate::settings::agent_editor::RUNNER_DEFAULT;
 use crate::settings::agents::fixture::Home;
 
 const PROJECT: &str = "onb";

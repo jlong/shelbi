@@ -31,7 +31,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Clear, Paragraph},
+    widgets::Paragraph,
     Frame,
 };
 use shelbi_app::onboarding::{
@@ -44,6 +44,7 @@ use shelbi_app::view::{OnboardingModel, OnboardingStep};
 
 use crate::button::{self, Align, Button};
 use crate::panel;
+use crate::picker::{self, select_lines};
 use crate::textbox::{self, Textbox};
 use crate::theme::palette;
 
@@ -54,8 +55,6 @@ const INTRO_W: usize = 60;
 /// The instructions editor's rows at most (the frame's 400pt box).
 const AREA_MAX: usize = 22;
 const AREA_MIN: usize = 4;
-/// The Default model picker's last entry: a name typed in.
-const CUSTOM_MODEL: &str = "Custom model…";
 
 /// A control the keys stop on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,11 +69,7 @@ pub(crate) enum Item {
 }
 
 /// An open picker and its highlighted choice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Menu {
-    item: Item,
-    selected: usize,
-}
+type Menu = picker::Menu<Item>;
 
 /// What a click hits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,22 +279,8 @@ impl OnboardingPage {
     fn choices(&self, item: Item) -> (Vec<String>, Option<usize>) {
         let m = self.state.model();
         match item {
-            Item::Harness => {
-                let labels = m
-                    .harnesses
-                    .iter()
-                    .map(|h| match &h.provider {
-                        Some(p) => format!("{}  {p}", h.label),
-                        None => h.label.clone(),
-                    })
-                    .collect();
-                (labels, m.harnesses.iter().position(|h| h.selected))
-            }
-            Item::Model => {
-                let mut labels: Vec<String> = m.models.iter().map(|o| o.label.clone()).collect();
-                labels.push(CUSTOM_MODEL.into());
-                (labels, m.models.iter().position(|o| o.selected))
-            }
+            Item::Harness => picker::harness_labels(&m.harnesses),
+            Item::Model => picker::model_labels(&m.models),
             _ => (Vec::new(), None),
         }
     }
@@ -611,28 +592,7 @@ impl OnboardingPage {
     }
 
     fn render_menu(&mut self, f: &mut Frame, area: Rect, at: Rect, labels: &[String], chosen: Option<usize>, selected: usize) {
-        let w = at.width as usize;
-        let bg = palette().dialog;
-        for (i, label) in labels.iter().enumerate() {
-            let y = at.y + i as u16;
-            if y >= area.bottom() {
-                break;
-            }
-            let rect = Rect { y, height: 1, ..at };
-            let lit = i == selected;
-            let fill = if lit { palette().input_focus } else { bg };
-            let mark = if Some(i) == chosen { "✓ " } else { "  " };
-            let text = panel::truncate_right(&format!(" {mark}{label}"), w);
-            let pad = w.saturating_sub(panel::display_width(&text));
-            let fg = if lit { palette().white } else { palette().foreground };
-            f.render_widget(Clear, rect);
-            f.render_widget(
-                Paragraph::new(Line::from(vec![
-                    Span::styled(text, Style::default().fg(fg).bg(fill)),
-                    Span::styled(" ".repeat(pad), Style::default().bg(fill)),
-                ])),
-                rect,
-            );
+        for (rect, i) in picker::render_menu(f, area, at, labels, chosen, selected) {
             self.hits.push((rect, Hit::Choice(i)));
         }
     }
@@ -777,35 +737,6 @@ fn centered(spans: Vec<Span<'static>>, w: usize) -> Line<'static> {
     let mut out = vec![Span::raw(" ".repeat(w.saturating_sub(used) / 2))];
     out.extend(spans);
     Line::from(out)
-}
-
-/// A picker's box: the choice (and its provider, muted) and a `▾` at the
-/// right, on the text field's fill.
-fn select_lines(label: &str, secondary: Option<&str>, focused: bool, disabled: bool, w: usize) -> [Line<'static>; 3] {
-    let fill = textbox::fill(focused, disabled, false);
-    let (above, below) = textbox::caps(w, fill);
-    let on = Style::default().bg(fill);
-    let fg = if disabled {
-        palette().muted
-    } else if focused {
-        palette().white
-    } else {
-        palette().foreground
-    };
-    let room = w.saturating_sub(2 * textbox::INSET + 2);
-    let label = panel::truncate_right(label, room);
-    let mut used = panel::display_width(&label);
-    let mut spans = vec![Span::styled(" ".repeat(textbox::INSET), on), Span::styled(label, on.fg(fg))];
-    if let Some(s) = secondary.filter(|_| used + 2 < room) {
-        let s = panel::truncate_right(s, room - used - 2);
-        used += 2 + panel::display_width(&s);
-        spans.push(Span::styled("  ", on));
-        spans.push(Span::styled(s, on.fg(palette().muted)));
-    }
-    spans.push(Span::styled(" ".repeat(room.saturating_sub(used) + 1), on));
-    spans.push(Span::styled("▾", on.fg(if disabled { palette().muted } else { palette().gray })));
-    spans.push(Span::styled(" ".repeat(textbox::INSET), on));
-    [above, Line::from(spans), below]
 }
 
 /// `text` word-wrapped to `w` columns.

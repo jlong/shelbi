@@ -22,7 +22,7 @@
 
 use gpui::{
     div, prelude::*, px, App, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Focusable,
-    KeyDownEvent, SharedString, Stateful, Subscription, Window,
+    KeyDownEvent, Subscription, Window,
 };
 use gpui_kit::component::input::{Escape, InputEvent, TextareaState};
 use shelbi_app::onboarding::{
@@ -33,7 +33,9 @@ use shelbi_app::onboarding::{
 use shelbi_app::view::{OnboardingModel, OnboardingStep};
 
 use super::agent_editor::markdown_area;
-use super::workflow_editor::{dropdown, error_line, footnote};
+pub use super::harness_picker::Menu;
+use super::harness_picker::{self as pickers, Fields, Handlers, Host};
+use super::workflow_editor::error_line;
 use crate::assets::{glyph, glyphs};
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
@@ -48,8 +50,6 @@ const INTRO_W: f32 = 520.0;
 const COLUMN_W: f32 = 620.0;
 /// The intro's disc and the gaps between its pieces.
 const DISC: f32 = 56.0;
-/// A picker's height (the frame's 36pt Opus / Claude Code buttons).
-const PICKER_H: f32 = 36.0;
 /// The instructions editor (`Instructions · Editable Markdown`).
 const EDITOR_H: f32 = 400.0;
 
@@ -61,12 +61,6 @@ pub enum OnboardingEvent {
     Launched,
 }
 
-/// A picker that is open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Menu {
-    Harness,
-    Model,
-}
 
 pub struct OnboardingView {
     state: OnboardingState,
@@ -351,123 +345,35 @@ impl OnboardingView {
         div().flex_none().h(px(1.0)).w_full().bg(theme.divider)
     }
 
-    /// A picker's button: `label` (Base Medium) and `secondary` (Small,
-    /// muted) at the left, the dropdown chevron at the right, 36pt tall
-    /// across the column.
-    fn picker_button(id: &'static str, label: String, secondary: Option<String>, theme: &Theme) -> Stateful<Div> {
-        style::button_base(id, ButtonKind::Secondary, ButtonSize::Base, false, theme)
-            .h(px(PICKER_H))
-            .w_full()
-            .justify_between()
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_baseline()
-                    .gap(px(8.0))
-                    .min_w_0()
-                    .child(div().debug_selector(move || format!("{id}-label")).truncate().child(label))
-                    .children(secondary.map(|s| {
-                        div()
-                            .debug_selector(move || format!("{id}-provider"))
-                            .type_style(Type::Small)
-                            .text_color(theme.muted)
-                            .child(s)
-                    })),
-            )
-            .child(style::dropdown_slot(ButtonSize::Base, theme.button_icon))
-    }
-
     /// `01 · Orchestrator · Choose provider and model`.
     fn render_harness(&self, m: &OnboardingModel, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let harness = m.harnesses.iter().find(|h| h.selected);
-        let (label, provider) = match harness {
-            Some(h) if !m.loading => (h.label.clone(), h.provider.clone()),
-            _ => (LOADING.to_string(), None),
-        };
-        let harness_button = Self::picker_button("onboarding-harness", label, provider, theme);
-        let harness_picker = if m.loading || m.busy {
-            div().w_full().child(harness_button.opacity(0.4).cursor_default())
-        } else {
-            let items = m.harnesses.clone();
-            dropdown(
-                self.menu == Some(Menu::Harness),
-                &self.menu_anchor,
-                "onboarding-harness-menu",
-                harness_button,
-                move |cx| {
-                    let theme = *cx.global::<Theme>();
-                    items
-                        .into_iter()
-                        .map(|h| {
-                            let kind = h.kind;
-                            style::menu_row(format!("onboarding-harness-{}", kind.as_str()), h.selected, &theme)
-                                .child(h.label)
-                                .children(h.provider.map(|p| div().type_style(Type::Small).text_color(theme.muted).child(p)))
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    this.select_runner(kind, cx);
-                                }))
-                                .into_any_element()
-                        })
-                        .collect()
-                },
-                COLUMN_W,
-                false,
-                |this: &mut Self, cx| this.toggle_menu(Menu::Harness, cx),
-                |this: &mut Self, _| this.menu = None,
-                cx,
-            )
-            .w_full()
-        };
-
-        let shown = if m.loading { LOADING.to_string() } else { m.model_label.clone() };
-        let model_button = Self::picker_button("onboarding-model", shown, None, theme);
-        let model_picker = if !m.model_enabled || m.busy {
-            div().w_full().child(model_button.opacity(0.4).cursor_default())
-        } else {
-            let items = m.models.clone();
-            dropdown(
-                self.menu == Some(Menu::Model),
-                &self.menu_anchor,
-                "onboarding-model-menu",
-                model_button,
-                move |cx| {
-                    let theme = *cx.global::<Theme>();
-                    items
-                        .into_iter()
-                        .enumerate()
-                        .map(|(i, o)| {
-                            let model = o.model.clone();
-                            super::workflow_editor::menu_item(format!("onboarding-model-{i}"), o.label, o.selected, &theme)
-                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    cx.stop_propagation();
-                                    this.select_model(model.clone(), cx);
-                                }))
-                                .into_any_element()
-                        })
-                        .collect()
-                },
-                COLUMN_W,
-                false,
-                |this: &mut Self, cx| this.toggle_menu(Menu::Model, cx),
-                |this: &mut Self, _| this.menu = None,
-                cx,
-            )
-            .w_full()
-        };
-        let model_help: SharedString = m.model_note.clone().unwrap_or_else(|| FIELD_HELP.to_string()).into();
-
-        let field = |label: &'static str, picker: Div, help: SharedString| {
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .w_full()
-                .child(Self::label(label, theme))
-                .child(picker)
-                .child(footnote(help, theme))
-        };
+        let fields = pickers::fields(
+            Fields {
+                host: Host::Onboarding,
+                harness_label: HARNESS_LABEL,
+                model_label: MODEL_LABEL,
+                help: FIELD_HELP,
+                harnesses: &m.harnesses,
+                models: &m.models,
+                model_choice: m.model_label.clone(),
+                loading: m.loading,
+                enabled: !m.loading && !m.busy,
+                model_enabled: m.model_enabled,
+                model_note: m.model_note.clone(),
+                width: COLUMN_W,
+                ring: (false, false),
+            },
+            self.menu,
+            &self.menu_anchor,
+            Handlers {
+                select_runner: |this: &mut Self, kind, cx| this.select_runner(kind, cx),
+                select_model: |this: &mut Self, model, cx| this.select_model(model, cx),
+                toggle: |this: &mut Self, menu, cx| this.toggle_menu(menu, cx),
+                close: |this: &mut Self, _| this.menu = None,
+            },
+            theme,
+            cx,
+        );
         let cont = if m.loading || m.busy {
             let label = if m.busy { "Saving…" } else { CONTINUE };
             style::disabled_button("onboarding-continue", label, ButtonKind::Primary, ButtonSize::Large, theme)
@@ -483,15 +389,7 @@ impl OnboardingView {
             .gap(px(32.0))
             .w(px(COLUMN_W))
             .child(Self::heading(HARNESS_TITLE, HARNESS_BODY, theme))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(24.0))
-                    .w_full()
-                    .child(field(HARNESS_LABEL, harness_picker, FIELD_HELP.into()))
-                    .child(field(MODEL_LABEL, model_picker, model_help)),
-            )
+            .child(fields)
             .children(m.error.as_deref().map(|e| error_line("onboarding-error".into(), e, theme)))
             .child(Self::rule(theme))
             .child(div().flex().flex_row().w_full().justify_end().child(cont))

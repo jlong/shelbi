@@ -96,6 +96,7 @@ pub mod workspace;
 pub mod workspace_layout;
 pub mod external_edit;
 pub mod feedback;
+pub mod harness_picker;
 pub mod font_picker;
 pub mod issues;
 pub mod keybindings;

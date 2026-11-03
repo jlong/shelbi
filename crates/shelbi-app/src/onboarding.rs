@@ -28,12 +28,13 @@
 //! with the matching `*ed` method.
 
 use shelbi_core::RunnerKind;
-use shelbi_state::agents_config::{runner_options, AgentError, AgentsConfig};
+use shelbi_state::agents_config::{AgentError, AgentsConfig};
 use shelbi_state::orchestrator_setup::{self, RunnerSetupError};
 
-use crate::settings::agent_editor::RUNNER_DEFAULT;
+use crate::harness_picker::HarnessPicker;
+pub use crate::harness_picker::{model_label, provider};
 use crate::settings::agents::{runner_label, sentence};
-use crate::view::{HarnessOption, ModelOption, OnboardingModel, OnboardingStep};
+use crate::view::{OnboardingModel, OnboardingStep};
 
 // ---------------------------------------------------------------------------
 // Copy both clients show (the Figma frames 2709:10719, 2709:11068, 2709:11492)
@@ -70,28 +71,6 @@ pub const AGENT: &str = shelbi_state::ORCHESTRATOR_AGENT;
 /// paths: cheap, but disk.
 pub fn needs_onboarding(project: &str) -> bool {
     !shelbi_state::orchestrator_onboarded(project)
-}
-
-/// The company behind a runner, shown beside its name.
-pub fn provider(kind: RunnerKind) -> Option<&'static str> {
-    match kind {
-        RunnerKind::Claude => Some("Anthropic"),
-        RunnerKind::Codex => Some("OpenAI"),
-        RunnerKind::Generic => None,
-    }
-}
-
-/// A model's name as the picker shows it: the suggested aliases by their
-/// product names, anything else as typed.
-pub fn model_label(model: &str) -> String {
-    match model {
-        "opus" => "Opus".into(),
-        "sonnet" => "Sonnet".into(),
-        "haiku" => "Haiku".into(),
-        "gpt-5" => "GPT-5".into(),
-        "gpt-5-codex" => "GPT-5 Codex".into(),
-        other => other.into(),
-    }
 }
 
 /// What [`load`] reads: the project's agents and the runner the
@@ -190,9 +169,8 @@ pub struct OnboardingState {
     step: OnboardingStep,
     setup: Option<Setup>,
     load_error: Option<String>,
-    /// Step 2's choices.
-    runner: RunnerKind,
-    model: Option<String>,
+    /// Step 2's choices (the shared Harness / Default model pickers).
+    picker: HarnessPicker,
     /// Step 3's draft, and the text as loaded (or last saved).
     instructions: String,
     saved_instructions: String,
@@ -210,8 +188,7 @@ impl OnboardingState {
             step: OnboardingStep::Intro,
             setup: None,
             load_error: None,
-            runner: RunnerKind::Claude,
-            model: None,
+            picker: HarnessPicker::default(),
             instructions: String::new(),
             saved_instructions: String::new(),
             error: None,
@@ -249,11 +226,11 @@ impl OnboardingState {
         match setup {
             Ok(setup) => {
                 let text = setup.config.agent(AGENT).map(|a| a.instructions().to_string()).unwrap_or_default();
-                self.runner = setup.runner;
+                let runner = setup.runner;
                 self.saved_instructions = text.clone();
                 self.instructions = text;
                 self.setup = Some(setup);
-                self.model = self.effective_model(self.runner);
+                self.picker = HarnessPicker::new(runner, self.effective_model(runner));
                 self.load_error = None;
             }
             Err(e) => self.load_error = Some(format!("Couldn’t read the orchestrator’s settings: {e}")),
@@ -289,21 +266,21 @@ impl OnboardingState {
 
     /// The runner chosen.
     pub fn runner(&self) -> RunnerKind {
-        self.runner
+        self.picker.runner()
     }
 
     /// The model chosen (`None`: the runner's default).
     pub fn model_choice(&self) -> Option<&str> {
-        self.model.as_deref()
+        self.picker.model()
     }
 
     /// Choose the runner. Its model starts as the one it already uses.
     pub fn select_runner(&mut self, kind: RunnerKind) {
-        if self.busy || kind == self.runner {
+        if self.busy || kind == self.runner() {
             return;
         }
-        self.runner = kind;
-        self.model = self.effective_model(kind);
+        let model = self.effective_model(kind);
+        self.picker.set_runner(kind, model);
         self.error = None;
     }
 
@@ -313,13 +290,13 @@ impl OnboardingState {
         if self.busy || !self.takes_model() {
             return;
         }
-        self.model = model.map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
+        self.picker.set_model(model);
         self.error = None;
     }
 
     /// The chosen runner takes a model Shelbi can set.
     pub fn takes_model(&self) -> bool {
-        !shelbi_core::model_suggestions(self.runner).is_empty()
+        self.picker.takes_model()
     }
 
     /// The model `kind` launches with now: the project's
@@ -341,29 +318,31 @@ impl OnboardingState {
             return None;
         }
         let setup = self.setup.as_ref()?;
-        if !setup.declared.contains(&self.runner) && self.runner == RunnerKind::Generic {
-            self.error = Some(RunnerSetupError::NotDeclared(self.runner).to_string());
+        let runner = self.runner();
+        if !setup.declared.contains(&runner) && runner == RunnerKind::Generic {
+            self.error = Some(RunnerSetupError::NotDeclared(runner).to_string());
             return None;
         }
         let mut config = setup.config.clone();
         let agent = config.agent(AGENT)?;
-        if agent.preferred_runner() != Some(self.runner) {
-            config = match config.set_preferred_runner(AGENT, Some(self.runner)) {
+        if agent.preferred_runner() != Some(runner) {
+            config = match config.set_preferred_runner(AGENT, Some(runner)) {
                 Ok(c) => c,
                 Err(e) => return self.refuse(&e),
             };
         }
         // Only a model that differs from what already applies is written: a
         // kept default writes nothing.
-        if self.takes_model() && self.model != self.effective_model(self.runner) {
-            config = match config.set_model(AGENT, self.runner, self.model.as_deref()) {
+        let model = self.picker.model().map(str::to_string);
+        if self.takes_model() && model != self.effective_model(runner) {
+            config = match config.set_model(AGENT, runner, model.as_deref()) {
                 Ok(c) => c,
                 Err(e) => return self.refuse(&e),
             };
         }
         self.busy = true;
         self.error = None;
-        Some(ContinueJob { project: self.project.clone(), config, runner: self.runner })
+        Some(ContinueJob { project: self.project.clone(), config, runner })
     }
 
     fn refuse<T>(&mut self, e: &AgentError) -> Option<T> {
@@ -378,9 +357,10 @@ impl OnboardingState {
             Ok(config) => {
                 if let Some(setup) = self.setup.as_mut() {
                     setup.config = config;
-                    setup.runner = self.runner;
-                    if !setup.declared.contains(&self.runner) {
-                        setup.declared.push(self.runner);
+                    let runner = self.picker.runner();
+                    setup.runner = runner;
+                    if !setup.declared.contains(&runner) {
+                        setup.declared.push(runner);
                     }
                 }
                 self.step = OnboardingStep::Instructions;
@@ -452,24 +432,13 @@ impl OnboardingState {
 
     /// The view model for the current state.
     pub fn model(&self) -> OnboardingModel {
-        let harnesses = runner_options()
-            .into_iter()
-            .map(|r| HarnessOption {
-                kind: r.kind,
-                label: runner_label(r.kind).into(),
-                provider: provider(r.kind).map(str::to_string),
-                selected: r.kind == self.runner,
-            })
-            .collect();
         let takes_model = self.takes_model();
-        let models = if takes_model { self.model_options() } else { Vec::new() };
-        let model_label = self.model.as_deref().map_or_else(|| RUNNER_DEFAULT.to_string(), model_label);
         OnboardingModel {
             step: self.step,
             loading: self.setup.is_none(),
-            harnesses,
-            models,
-            model_label,
+            harnesses: self.picker.harnesses(),
+            models: self.picker.models(),
+            model_label: self.picker.model_label(),
             model_enabled: takes_model && self.setup.is_some(),
             model_note: self.model_note(),
             instructions: self.instructions.clone(),
@@ -478,39 +447,17 @@ impl OnboardingState {
         }
     }
 
-    /// Default model's choices: the runner's default, its suggestions, and
-    /// the chosen model when it's none of them.
-    fn model_options(&self) -> Vec<ModelOption> {
-        let mut out = vec![ModelOption {
-            model: None,
-            label: RUNNER_DEFAULT.into(),
-            selected: self.model.is_none(),
-        }];
-        let mut models: Vec<String> =
-            shelbi_core::model_suggestions(self.runner).iter().map(|m| m.to_string()).collect();
-        if let Some(own) = &self.model {
-            if !models.contains(own) {
-                models.push(own.clone());
-            }
-        }
-        out.extend(models.into_iter().map(|m| ModelOption {
-            label: model_label(&m),
-            selected: self.model.as_deref() == Some(m.as_str()),
-            model: Some(m),
-        }));
-        out
-    }
-
     fn model_note(&self) -> Option<String> {
+        let runner = self.runner();
         if !self.takes_model() {
-            return Some(format!("{} runners take no model.", runner_label(self.runner)));
+            return Some(crate::harness_picker::no_model_note(runner));
         }
-        let project = self.setup.as_ref()?.config.project_model(self.runner)?;
-        (self.model.as_deref() != Some(project)).then(|| {
+        let project = self.setup.as_ref()?.config.project_model(runner)?;
+        (self.picker.model() != Some(project)).then(|| {
             format!(
                 "The project’s settings set {} for every {} agent, over this choice.",
                 model_label(project),
-                runner_label(self.runner)
+                runner_label(runner)
             )
         })
     }
