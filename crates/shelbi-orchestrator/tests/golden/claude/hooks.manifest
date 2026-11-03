@@ -131,7 +131,16 @@ rm "$PROC"
 exec
 ----
 #!/bin/sh
-printf '\033]2;shelbi:idle\007'
+MARKER=idle
+if [ ! -t 0 ]; then
+  PENDING=$(tr '\n' ' ' \
+    | sed -n 's/.*"background_tasks"[[:space:]]*:[[:space:]]*\[//p' \
+    | grep -o '"type"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | sed 's/.*"\([^"]*\)"$/\1/' \
+    | grep -v -x -e 'dream' -e 'auto-mode scan' -e 'memory import' -e 'memory save')
+  [ -n "$PENDING" ] && MARKER=background
+fi
+printf '\033]2;shelbi:%s\007' "$MARKER"
 
 ========
 .shelbi/hooks/pane-working.sh

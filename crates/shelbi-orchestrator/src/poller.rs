@@ -2276,7 +2276,11 @@ fn record_limit_recovery_from_screen(
     if !workspace_is_paused(&workspace.name, last_known) {
         return false;
     }
-    let observed = if crate::ready::is_claude_working(screen) {
+    // Background work in flight reads as working here too (see
+    // [`live_workspace_state`]).
+    let observed = if crate::ready::is_claude_working(screen)
+        || crate::ready::has_background_tasks(screen)
+    {
         Some(WorkspaceState::Working)
     } else if crate::ready::is_input_ready(screen)
         && !crate::submit::input_holds_unsubmitted_prompt(screen, LIMIT_RESUME_PROMPT)
@@ -4464,8 +4468,18 @@ struct PollOutcome {
 /// the input box footer *even mid-turn* and drop the `esc to interrupt` hint
 /// from their compact spinner (`✻ Crunching… (1m · ↓ 39k tokens)`), so the
 /// live spinner row — not the footer alone — is what proves a turn is running.
+///
+/// A turn that ended with background work still in flight (a backgrounded
+/// shell, a monitor, a subagent: [`ready::has_background_tasks`]) is also
+/// `Working`, even though Claude draws the ready input box. Claude Code resumes
+/// the agent when that work finishes, so nobody needs to answer it: reading it
+/// as `AwaitingInput` posted a false "finished a turn and needs input"
+/// notification and logged a `working -> awaiting_input` workspace-free edge
+/// for a worker that was waiting on its own `cargo test`. When the work exits
+/// and the agent resumes, the spinner row keeps it `Working`, so the resume
+/// never flaps; only a turn that ends with nothing in flight goes idle.
 fn live_workspace_state(screen: &str) -> Option<WorkspaceState> {
-    if crate::ready::is_claude_working(screen) {
+    if crate::ready::is_claude_working(screen) || crate::ready::has_background_tasks(screen) {
         Some(WorkspaceState::Working)
     } else if crate::ready::is_input_ready(screen) {
         Some(WorkspaceState::AwaitingInput)
@@ -7279,6 +7293,123 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // Neither signal (startup, a modal, a mid-repaint capture) → fall back
         // to the title marker at the call site.
         assert_eq!(live_workspace_state("Do you trust the files?"), None);
+    }
+
+    /// Run a sequence of captured frames through the same classify → debounce →
+    /// decide path `poll_one` takes, returning every committed transition as
+    /// `(from, to)`. The prior starts at `Working` (a worker mid-turn).
+    fn transitions_for(frames: &[&str]) -> Vec<(Option<WorkspaceState>, WorkspaceState)> {
+        let mut prior = Some(PriorState {
+            state: WorkspaceState::Working,
+            last_transition: Some(ts(0)),
+        });
+        let mut streak = 0;
+        let mut edges = Vec::new();
+        for (i, frame) in frames.iter().enumerate() {
+            let observed = live_workspace_state(frame).expect("every frame classifies");
+            let (state, next_streak) =
+                debounce_idle_edge(prior.map(|p| p.state), observed, streak);
+            streak = next_streak;
+            let out = decide("alpha", Some("t".into()), prior, state, ts(100 + i as i64));
+            if out.transitioned {
+                edges.push((out.prev_state, out.status.state));
+            }
+            prior = Some(PriorState {
+                state: out.status.state,
+                last_transition: Some(out.status.last_transition),
+            });
+        }
+        edges
+    }
+
+    const MID_TURN: &str = "\
+⏺ Bash(cargo test --workspace) running in background
+· Sautéing… (6m 10s · ↓ 2.1k tokens)
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on · 1 shell";
+
+    /// The 2026-11-03 false positive: turn over, `cargo test` still running.
+    const TURN_END_BACKGROUND_SHELL: &str = "\
+⏺ Committed. Waiting on the root cargo test --workspace run before rebasing and writing the marker.
+
+✻ Sautéed for 6m 20s · done 11:32 AM · 1 shell still running
+
+────────────────────────────────────────────────────
+❯ Show me the test results when they finish
+────────────────────────────────────────────────────
+  Model: Opus 5.5 | Ctx: 103.9k | ⎇ jlong/panel-description-plain-text | (+0,-0)
+  ⏵⏵ auto mode on · 1 shell";
+
+    /// The job exited and Claude resumed the agent on its own.
+    const RESUMED_AFTER_JOB: &str = "\
+⏺ Background command \"cargo test --workspace\" completed (exit code 0)
+✻ Pondering… (4s · ↓ 120 tokens)
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)";
+
+    /// A turn that ends with nothing in flight: really waiting on a person.
+    const TURN_END_NOTHING_PENDING: &str = "\
+⏺ Tests pass. Rebased and wrote the marker.
+
+✻ Sautéed for 8m 2s · done 11:40 AM
+
+────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)";
+
+    #[test]
+    fn turn_end_with_a_background_shell_stays_working() {
+        // No `working -> awaiting_input` edge: no notification, no
+        // workspace-free event, however long the job runs.
+        assert_eq!(
+            live_workspace_state(TURN_END_BACKGROUND_SHELL),
+            Some(WorkspaceState::Working)
+        );
+        let edges = transitions_for(&[
+            MID_TURN,
+            TURN_END_BACKGROUND_SHELL,
+            TURN_END_BACKGROUND_SHELL,
+            TURN_END_BACKGROUND_SHELL,
+            TURN_END_BACKGROUND_SHELL,
+        ]);
+        assert!(edges.is_empty(), "unexpected transitions: {edges:?}");
+    }
+
+    #[test]
+    fn background_job_exit_and_resume_does_not_flap() {
+        // The job exits, Claude resumes the agent, and the agent then ends a turn
+        // with nothing pending: exactly one edge, the real one at the end.
+        let edges = transitions_for(&[
+            MID_TURN,
+            TURN_END_BACKGROUND_SHELL,
+            TURN_END_BACKGROUND_SHELL,
+            RESUMED_AFTER_JOB,
+            RESUMED_AFTER_JOB,
+            TURN_END_NOTHING_PENDING,
+            TURN_END_NOTHING_PENDING,
+        ]);
+        assert_eq!(
+            edges,
+            vec![(Some(WorkspaceState::Working), WorkspaceState::AwaitingInput)]
+        );
+    }
+
+    #[test]
+    fn turn_end_with_nothing_pending_still_awaits_input() {
+        assert_eq!(
+            live_workspace_state(TURN_END_NOTHING_PENDING),
+            Some(WorkspaceState::AwaitingInput)
+        );
+        let edges = transitions_for(&[MID_TURN, TURN_END_NOTHING_PENDING, TURN_END_NOTHING_PENDING]);
+        assert_eq!(
+            edges,
+            vec![(Some(WorkspaceState::Working), WorkspaceState::AwaitingInput)]
+        );
     }
 
     #[test]
