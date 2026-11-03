@@ -22,12 +22,18 @@
 //! - What a remote window can't do yet, each with the sentence a client shows
 //!   instead of doing it: [`command_unavailable`] (the command registry
 //!   carries it, [`crate::command::CommandModel::remote_host`], so menus draw
-//!   the item disabled and the palette lists the reason), [`settings_read_only`]
-//!   (config saves, P8), and [`drop_refused`] (image drops into a far
-//!   terminal). The project-state writes (the board's workspace filter and
-//!   column overrides, Zen Mode, the error log and its read marks, a pane's
-//!   reopen marker) go to the far daemon like issue mutations
-//!   ([`crate::state_write`]).
+//!   the item disabled and the palette lists the reason). The project-state
+//!   writes (the board's workspace filter and column overrides, Zen Mode, the
+//!   error log and its read marks, a pane's reopen marker) go to the far
+//!   daemon like issue mutations ([`crate::state_write`]).
+//!
+//! What a remote window does on the far side instead of here (P8): Settings
+//! saves its config through the far daemon (`SaveConfig`,
+//! [`crate::settings::store`]); workspace and machine changes and machine
+//! checks run from the far hub ([`crate::far`]); Edit opens the far file in
+//! the far `$EDITOR`, in a terminal session there ([`crate::far::FarFile`]);
+//! and a file dropped on a far terminal is uploaded there and its far path
+//! pasted ([`crate::far::upload`]).
 //!
 //! The far daemon is never started implicitly: the window's link only
 //! reconnects after [`RemoteConnector::connect`] says the daemon runs, and a
@@ -150,23 +156,21 @@ pub fn remote_handle(
 
 /// Why `kind` can't run in a window on a project on `host`, or `None` when it
 /// can. These are the actions that still write this machine's files or
-/// command this machine's daemon, the ones the far side can't take yet (config
-/// saves, P8; Edit in editor), and the ones a remote window never sends (Quit
-/// Shelbi, denylisted by the relay). Issue mutations, project-state writes
-/// (Zen Mode among them), reviews and Quit Project go to the far daemon.
+/// command this machine's daemon, and the ones a remote window never sends
+/// (Quit Shelbi, denylisted by the relay). Issue mutations, project-state
+/// writes (Zen Mode among them), reviews, Quit Project and Edit (an editor
+/// session on the far machine) go to the far side.
 pub fn command_unavailable(kind: &CommandKind, host: &str) -> Option<String> {
     let host = bare_host(host);
     let reason = match kind {
-        CommandKind::OpenEditor { .. } => {
-            format!("Opening {host}'s files in an editor isn't available in a remote window yet.")
-        }
         CommandKind::AddProject => format!("Add a project on {host} from Shelbi there."),
         CommandKind::QuitShelbi => format!("Quit Shelbi on {host} from Shelbi there."),
         CommandKind::DetachOtherClients => {
             format!("Detaching {host}'s other clients isn't available in a remote window.")
         }
         CommandKind::NewWindow => "Another window on a remote project isn't available yet.".to_string(),
-        CommandKind::ShowView(_)
+        CommandKind::OpenEditor { .. }
+        | CommandKind::ShowView(_)
         | CommandKind::ToggleZen
         | CommandKind::FocusWorkspace { .. }
         | CommandKind::LoadReview { .. }
@@ -196,30 +200,11 @@ pub fn command_unavailable(kind: &CommandKind, host: &str) -> Option<String> {
     Some(reason)
 }
 
-/// Why Settings in a window on `host`'s project is read-only: saving the
-/// far project's workflows, agents, workspaces and machines (and running
-/// machine checks from the far hub) comes later (P8).
-pub fn settings_read_only(host: &str) -> String {
-    format!(
-        "{}'s settings are read-only in a remote window for now. Change them in Shelbi there.",
-        bare_host(host)
-    )
-}
-
 /// Why a panel's open-in-app or reveal-folder does nothing in a remote
 /// window: the worktree is on `host`, not this machine.
 pub fn local_open_unavailable(host: &str) -> String {
     format!(
         "That folder is on {}: opening it from a remote window isn't available yet.",
-        bare_host(host)
-    )
-}
-
-/// Why a file or image dropped on a far terminal isn't pasted: its path is
-/// on this machine, not on `host`.
-pub fn drop_refused(host: &str) -> String {
-    format!(
-        "Dropping files into {}'s terminals isn't available in a remote window yet.",
         bare_host(host)
     )
 }
@@ -288,9 +273,6 @@ mod tests {
     #[test]
     fn far_writes_and_local_only_actions_are_unavailable_with_a_reason() {
         let unavailable = [
-            CommandKind::OpenEditor {
-                target: crate::exec::EditTarget::ZenMode,
-            },
             CommandKind::AddProject,
             CommandKind::QuitShelbi,
             CommandKind::DetachOtherClients,
@@ -311,6 +293,10 @@ mod tests {
             CommandKind::ToggleZen,
             CommandKind::ShowView(crate::nav::View::Issues),
             CommandKind::OpenSettings,
+            // An editor session on the far machine.
+            CommandKind::OpenEditor {
+                target: crate::exec::EditTarget::ZenMode,
+            },
         ] {
             assert_eq!(command_unavailable(&kind, "devbox"), None, "{kind:?}");
         }

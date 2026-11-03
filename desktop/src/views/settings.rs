@@ -692,7 +692,12 @@ impl SettingsView {
                     });
                     return;
                 };
-                let home = std::env::var_os("HOME").map(PathBuf::from);
+                // A far machine's directory isn't under this Mac's home.
+                let home = if self.project.link.is_remote() {
+                    None
+                } else {
+                    std::env::var_os("HOME").map(PathBuf::from)
+                };
                 machine_form_state::configure(&project, &row.config, row.workspaces, home.as_deref())
             }
             // The window's workspace dialog (`ShelbiWindow::open_pool_form`).
@@ -702,7 +707,12 @@ impl SettingsView {
             return;
         }
         let restore = window.focused(cx);
-        let engine = machine_form::Engine::current(cx);
+        // A remote project's machines are saved and checked by the far hub.
+        let engine = if self.project.link.is_remote() {
+            machine_form::Engine::far(&self.project.link)
+        } else {
+            machine_form::Engine::current(cx)
+        };
         let view = cx.new(|cx| MachineFormView::new(form, engine, window, cx));
         let sub = cx.subscribe_in(&view, window, |this, _, event: &MachineFormEvent, window, cx| {
             let saved = matches!(event, MachineFormEvent::Saved(_));

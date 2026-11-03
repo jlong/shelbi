@@ -59,7 +59,16 @@ use crate::error::ProtoError;
 /// relaunch) go to the daemon, the single writer, which announces each with a
 /// [`ServerMsg::Changed`]. A remote window sends the same message over the
 /// relay (`rw-remote-state-writes`).
-pub const CONTROL_PROTOCOL_VERSION: u32 = 7;
+///
+/// v8 adds the settings writes a window makes through the daemon, so a
+/// window on a project on another machine makes them there (remote-window
+/// P8): [`ClientMsg::SaveConfig`] (a config save the client planned, with the
+/// content hash of every file it was planned against, refused as
+/// [`MutationError::ConfigChanged`] when one changed since) and
+/// [`ClientMsg::AppRequest`] / [`ServerMsg::Reply`] (the app's own requests:
+/// workspace and machine changes, machine checks, an editor session; their
+/// bodies are `shelbi_app::far`'s).
+pub const CONTROL_PROTOCOL_VERSION: u32 = 8;
 
 /// Upper bound on a single control frame. Generous enough for a large issue body
 /// in an `edit`/`add`, far below the session [`crate::MAX_FRAME_LEN`].
@@ -394,6 +403,37 @@ pub struct StateWriteRequest {
     pub write: StateWrite,
 }
 
+/// Client → daemon: write a config save the client planned with its own
+/// comment-preserving patcher (protocol v8). `plan` is a
+/// `shelbi_state::config_write::Plan`: the content hash each file it touches
+/// had when the client read it, then the writes in order. The daemon
+/// validates it against the project (every path inside `surface`'s config,
+/// every YAML re-parsed with its own loader), refuses it with
+/// [`MutationError::ConfigChanged`] when a file changed since, and otherwise
+/// writes it, each file atomically. Replies [`ServerMsg::Done`] or
+/// [`ServerMsg::Failed`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveConfigRequest {
+    pub request_id: u64,
+    pub project: String,
+    /// The plan's surface (`workflows`, `agents`), for logs and the relay.
+    pub surface: String,
+    pub plan: serde_json::Value,
+}
+
+/// Client → daemon: one of the app's own requests about `project` that run
+/// where the project lives (protocol v8): add, change or remove a workspace
+/// or machine, check a machine's readiness, open a file in an editor
+/// session. `body` is a `shelbi_app::far::Request`; the daemon answers with
+/// [`ServerMsg::Reply`] carrying a `shelbi_app::far::Reply`, or
+/// [`ServerMsg::Failed`] when it couldn't read the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppRequest {
+    pub request_id: u64,
+    pub project: String,
+    pub body: serde_json::Value,
+}
+
 /// What kind of UI client is attached to a session. Room is left for the
 /// Desktop app attaching to a running CLI session (the detach task's
 /// motivating case). [`ClientKind::Remote`] is a remote window's link: another
@@ -520,6 +560,32 @@ pub enum ClientMsg {
     /// Make one write to a project's state files (protocol v7): the daemon is
     /// the single writer, and announces the change to every other subscriber.
     WriteState(StateWriteRequest),
+    /// Write a config save the client planned (protocol v8).
+    SaveConfig(SaveConfigRequest),
+    /// One of the app's requests that run where the project lives
+    /// (protocol v8).
+    AppRequest(AppRequest),
+}
+
+impl ClientMsg {
+    /// The project a request is about, for the requests that name one.
+    pub fn project(&self) -> Option<&str> {
+        match self {
+            ClientMsg::Mutate(r) => Some(&r.project),
+            ClientMsg::QuitProject { project, .. } => Some(project),
+            ClientMsg::ReviewSession(r) => Some(&r.project),
+            ClientMsg::WorkspaceSession(r) => Some(&r.project),
+            ClientMsg::WriteState(r) => Some(&r.project),
+            ClientMsg::SaveConfig(r) => Some(&r.project),
+            ClientMsg::AppRequest(r) => Some(&r.project),
+            ClientMsg::Hello { .. }
+            | ClientMsg::Subscribe { .. }
+            | ClientMsg::QuitShelbi { .. }
+            | ClientMsg::ReloadClients { .. }
+            | ClientMsg::ListClients { .. }
+            | ClientMsg::DetachClients { .. } => None,
+        }
+    }
 }
 
 /// Why a mutation did not run (or could not be accepted). `Display` is the
@@ -539,6 +605,9 @@ pub enum MutationError {
     VersionMismatch { message: String },
     /// Anything the library returned as an error. `message` is verbatim.
     Backend { message: String },
+    /// A [`ClientMsg::SaveConfig`] was refused: these files changed since
+    /// the client read them (protocol v8). Nothing was written.
+    ConfigChanged { paths: Vec<String> },
 }
 
 impl std::fmt::Display for MutationError {
@@ -553,6 +622,9 @@ impl std::fmt::Display for MutationError {
             MutationError::NotFound { id } => write!(f, "issue `{id}` not found"),
             MutationError::VersionMismatch { message } => write!(f, "{message}"),
             MutationError::Backend { message } => write!(f, "{message}"),
+            MutationError::ConfigChanged { paths } => {
+                write!(f, "changed since it was loaded: {}", paths.join(", "))
+            }
         }
     }
 }
@@ -645,6 +717,12 @@ pub enum ServerMsg {
     /// message the client prints on exit. Broadcast to the targets; no
     /// `request_id`.
     Detach { reason: String },
+    /// The answer to a [`ClientMsg::AppRequest`] (protocol v8): a
+    /// `shelbi_app::far::Reply`.
+    Reply {
+        request_id: u64,
+        body: serde_json::Value,
+    },
 }
 
 /// Encode a message to its full wire bytes (`[len: u32 BE][json]`).
@@ -912,6 +990,51 @@ mod tests {
         assert_eq!(back, ServerMsg::Done { request_id: 4, state: None, id: None });
         let bytes = encode(&ServerMsg::Done { request_id: 4, state: None, id: None }).unwrap();
         assert_eq!(&bytes[LEN_PREFIX..], old);
+    }
+
+    #[test]
+    fn round_trips_the_settings_messages() {
+        let msgs = [
+            ClientMsg::SaveConfig(SaveConfigRequest {
+                request_id: 11,
+                project: "alpha".into(),
+                surface: "workflows".into(),
+                plan: serde_json::json!({"surface": "workflows", "checks": [], "ops": []}),
+            }),
+            ClientMsg::AppRequest(AppRequest {
+                request_id: 12,
+                project: "alpha".into(),
+                body: serde_json::json!({"check_machine": {"host": "devbox"}}),
+            }),
+        ];
+        for msg in msgs {
+            let (back, _): (ClientMsg, usize) = decode(&encode(&msg).unwrap()).unwrap();
+            assert_eq!(back.project(), Some("alpha"));
+            assert_eq!(back, msg);
+        }
+        let replies = [
+            ServerMsg::Reply {
+                request_id: 12,
+                body: serde_json::json!({"ok": true}),
+            },
+            ServerMsg::Failed {
+                request_id: 11,
+                error: MutationError::ConfigChanged {
+                    paths: vec!["/p/workflows/task.yaml".into()],
+                },
+            },
+        ];
+        for msg in replies {
+            let (back, _): (ServerMsg, usize) = decode(&encode(&msg).unwrap()).unwrap();
+            assert_eq!(back, msg);
+        }
+        assert_eq!(
+            MutationError::ConfigChanged {
+                paths: vec!["a".into(), "b".into()]
+            }
+            .to_string(),
+            "changed since it was loaded: a, b"
+        );
     }
 
     #[test]

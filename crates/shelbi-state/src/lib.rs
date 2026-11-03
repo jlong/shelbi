@@ -23,6 +23,7 @@ mod agent_workspaces;
 pub mod board_index;
 pub mod change_bus;
 pub mod changelog;
+pub mod config_write;
 mod daemon_lifecycle;
 mod daemon_poller;
 pub mod disk;

@@ -118,6 +118,11 @@ pub struct WorkspacesPage {
 }
 
 impl WorkspacesPage {
+    /// Whether the project lives on another machine.
+    pub fn is_remote(&self) -> bool {
+        !self.source.key().is_local()
+    }
+
     pub fn new(handle: &ProjectHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut page = WorkspacesPage {
             state: WorkspacesState::new(handle.name()),

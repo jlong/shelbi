@@ -123,7 +123,13 @@ impl Body {
             let source = state.index()?.source.clone()?.0;
             (state.project().to_string(), source, machine_choices(state))
         };
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        // A far project's machines are the far hub's: this Mac's home means
+        // nothing there.
+        let home = if page.read(cx).is_remote() {
+            None
+        } else {
+            std::env::var_os("HOME").map(PathBuf::from)
+        };
         Some(match intent {
             Intent::NewWorkspace => Body::Form(Box::new(WorkspaceForm::new_workspace(&project, source, machines, home))),
             Intent::EditWorkspace(name) => {
@@ -139,11 +145,22 @@ impl Body {
 
 impl WorkspaceDialog {
     /// The dialog showing `body` (from [`Body::for_intent`]) over `page`.
-    pub fn new(body: Body, page: Entity<WorkspacesPage>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let service = cx
-            .try_global::<DialogService>()
-            .map(|s| s.0.clone())
-            .unwrap_or_else(shelbi_orchestrator::pool_admin::workspace_service);
+    /// `far` is a remote window's link: the project's workspaces change on
+    /// the far hub, through it.
+    pub fn new(
+        body: Body,
+        page: Entity<WorkspacesPage>,
+        far: Option<shelbi_app::source::ProjectLink>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let service = match &far {
+            Some(link) => shelbi_app::far::pool_service(link),
+            None => cx
+                .try_global::<DialogService>()
+                .map(|s| s.0.clone())
+                .unwrap_or_else(shelbi_orchestrator::pool_admin::workspace_service),
+        };
         let focus = cx.focus_handle();
         let input = |text: &str, window: &mut Window, cx: &mut Context<Self>| {
             let text = text.to_string();

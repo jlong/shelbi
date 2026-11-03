@@ -52,6 +52,7 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
+use shelbi_app::settings::store::Local;
 use shelbi_app::settings::agent_editor::{
     delete_title, import_path, leave_title, run_delete, run_duplicate, run_save, AgentEditorState, AgentFile,
     Change, Choice, Field, Leave, SaveJob, SaveOutcome, Source, APPLY_NOTE, ASSIGNMENTS_HELPER, CONFLICT_MESSAGE,
@@ -275,12 +276,19 @@ pub(crate) enum AgentDone {
 pub(crate) fn run_work(work: AgentWork, read: &dyn Fn(&str) -> Result<AgentsConfig, String>) -> AgentDone {
     match work {
         AgentWork::Load { project } => AgentDone::Loaded(read(&project)),
-        AgentWork::Save(job) => AgentDone::Saved(run_save(job)),
+        AgentWork::Save(job) => {
+            let store = Local { project: job.project().to_string() };
+            AgentDone::Saved(run_save(job, &store))
+        }
         AgentWork::Duplicate { base, name, copy } => {
-            let done = run_duplicate(base, &name, &copy);
+            let store = Local { project: base.project().to_string() };
+            let done = run_duplicate(base, &name, &copy, &store);
             AgentDone::Duplicated(done, copy)
         }
-        AgentWork::Delete { base, name } => AgentDone::Deleted(run_delete(base, &name)),
+        AgentWork::Delete { base, name } => {
+            let store = Local { project: base.project().to_string() };
+            AgentDone::Deleted(run_delete(base, &name, &store))
+        }
     }
 }
 

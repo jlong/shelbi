@@ -84,6 +84,7 @@ pub mod command;
 pub mod command_model;
 pub mod exec;
 pub mod exec_daemon;
+pub mod far;
 pub mod issue_edit;
 pub mod new_task;
 pub mod feedback;

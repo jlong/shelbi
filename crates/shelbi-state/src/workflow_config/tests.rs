@@ -1149,3 +1149,51 @@ fn a_deleted_file_counts_as_a_change() {
     );
     assert!(!home.path("task.yaml").exists());
 }
+
+#[test]
+fn a_save_plan_applies_where_the_project_lives_and_refuses_what_it_shouldnt() {
+    // The plan a remote window sends the far daemon: applied by
+    // `config_write::apply`, which validates it first.
+    let home = Home::new();
+    let before = home.read("statuses.yaml");
+    let cfg = load().rename_status("todo", "Up next").unwrap();
+    let plan = cfg.save_plan().unwrap();
+    crate::config_write::apply(PROJECT, &plan.plan).unwrap();
+    let after = home.read("statuses.yaml");
+    assert!(after.contains("Up next"), "{after}");
+    assert_eq!(before.lines().count(), after.lines().count(), "comments and layout kept");
+
+    // The same plan again: the file isn't what it was planned against.
+    let again = crate::config_write::apply(PROJECT, &plan.plan).unwrap_err();
+    assert_eq!(again, crate::config_write::WriteError::Changed(vec![home.path("statuses.yaml")]));
+
+    // A path outside the project's workflows, and YAML the loader can't
+    // read, are refused before anything is written.
+    let mut outside = plan.plan.clone();
+    outside.checks.clear();
+    outside.ops = vec![crate::config_write::Op::Write {
+        path: home.root.join("elsewhere.yaml"),
+        contents: crate::config_write::Contents::Text("a: 1\n".into()),
+    }];
+    let refused = crate::config_write::apply(PROJECT, &outside).unwrap_err();
+    assert!(refused.to_string().contains("outside project `wfc`"), "{refused}");
+    let mut climbing = outside.clone();
+    climbing.ops = vec![crate::config_write::Op::Write {
+        path: home.path("../../escape.yaml"),
+        contents: crate::config_write::Contents::Text("a: 1\n".into()),
+    }];
+    assert!(matches!(
+        crate::config_write::apply(PROJECT, &climbing),
+        Err(crate::config_write::WriteError::Refused { .. })
+    ));
+    let mut broken = outside.clone();
+    broken.ops = vec![crate::config_write::Op::Write {
+        path: home.path("statuses.yaml"),
+        contents: crate::config_write::Contents::Text("statuses: [unclosed\n".into()),
+    }];
+    assert!(matches!(
+        crate::config_write::apply(PROJECT, &broken),
+        Err(crate::config_write::WriteError::Refused { .. })
+    ));
+    assert_eq!(home.read("statuses.yaml"), after, "nothing written");
+}

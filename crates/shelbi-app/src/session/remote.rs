@@ -138,16 +138,38 @@ pub fn attach_over(link: &dyn RelayLink, project: &str, target: &SessionRef) -> 
             }
         });
     };
+    attach_stream(link, &session.short_id, &want)
+}
+
+/// Attach to the far session named `name` (one with no [`SessionRef`]: an
+/// editor session a remote window asked the far daemon for) with a full
+/// replay. A name not live yet is [`ConnectFailure::Starting`]; one that
+/// exited, a message. Blocking.
+pub fn attach_named_over(link: &dyn RelayLink, name: &str) -> Result<Connected, ConnectFailure> {
+    let sessions = link.list_sessions().map_err(|e| relay_failure(link.host(), name, e))?;
+    let Some(session) = sessions.iter().find(|s| s.alive && s.name == name) else {
+        return Err(if sessions.iter().any(|s| s.name == name) {
+            ConnectFailure::Message(no_live_session_error(name, None))
+        } else {
+            ConnectFailure::Starting(starting_error(name))
+        });
+    };
+    attach_stream(link, &session.short_id, name)
+}
+
+/// Open far session `short_id` (named `want`) and attach with a replay.
+fn attach_stream(link: &dyn RelayLink, short_id: &str, want: &str) -> Result<Connected, ConnectFailure> {
+    let host = link.host();
     let stream = link
-        .open_session(&session.short_id)
-        .map_err(|e| relay_failure(host, &want, e))?;
+        .open_session(short_id)
+        .map_err(|e| relay_failure(host, want, e))?;
     let (conn, events) =
-        Connection::connect(Box::new(stream), None, capability::ALL).map_err(|e| relay_failure(host, &want, e))?;
+        Connection::connect(Box::new(stream), None, capability::ALL).map_err(|e| relay_failure(host, want, e))?;
     let size = match conn.info() {
         Ok(info) => GridSize::new(info.cols.max(1), info.rows.max(1)),
         Err(_) => GridSize::new(80, 24),
     };
-    conn.attach(None).map_err(|e| relay_failure(host, &want, e))?;
+    conn.attach(None).map_err(|e| relay_failure(host, want, e))?;
     Ok(Connected { conn, events, size })
 }
 

@@ -214,14 +214,11 @@ fn the_remote_window_opens_every_view_over_the_relay(cx: &mut TestAppContext) {
         update(cx, handle, |w, window, cx| w.open_settings(Some(page), window, cx));
         draw(cx, handle);
     }
-    // Read-only: an editor doesn't open, saying why.
+    // Settings edits: the workflow editor opens on the far project.
     update(cx, handle, |w, window, cx| w.edit_workflow("task".into(), window, cx));
     let (edited, banner) = read(cx, handle, |w, _| (w.edited_workflows.clone(), w.banner.clone()));
-    assert!(edited.is_empty(), "no editor opens on a remote project's workflow");
-    assert_eq!(
-        banner.as_deref(),
-        Some(remote_window::settings_read_only(HOST).as_str())
-    );
+    assert_eq!(edited, ["task"], "a remote project's workflow opens its editor");
+    assert_eq!(banner, None);
 }
 
 #[gpui::test]
@@ -269,9 +266,6 @@ fn what_a_remote_window_cant_do_yet_is_refused_with_the_reason(cx: &mut TestAppC
         CommandKind::QuitShelbi,
         CommandKind::AddProject,
         CommandKind::NewWindow,
-        CommandKind::OpenEditor {
-            target: EditTarget::ZenMode,
-        },
     ] {
         update(cx, handle, |w, _, _| w.banner = None);
         run(cx, handle, kind.clone());
@@ -333,3 +327,161 @@ fn zen_and_the_error_log_are_written_by_the_far_daemon(cx: &mut TestAppContext) 
     assert!(shelbi_state::read_errors(PROJECT).unwrap().is_empty());
 }
 
+
+#[gpui::test]
+fn a_workflow_saved_in_a_remote_window_writes_the_far_file_and_a_far_edit_is_refused(cx: &mut TestAppContext) {
+    use shelbi_app::settings::workflows::{commit, Edit};
+    setup(cx);
+    let far = FarHost::new("save");
+    let statuses = shelbi_state::workflows_dir(PROJECT).unwrap().join("statuses.yaml");
+    let text = std::fs::read_to_string(&statuses).unwrap();
+    std::fs::write(&statuses, format!("# The far team's catalog.\n{text}")).unwrap();
+    let handle = open(cx, &far);
+    let project = read(cx, handle, |w, _| w.project_handle.clone());
+
+    // The page's save, as it runs it: through the window's handle, so the
+    // far daemon writes the far file, with its comment kept.
+    let config = project.source.workflow_config().unwrap();
+    let rename = || Edit::RenameStatus {
+        id: "todo".into(),
+        name: "Up next".into(),
+    };
+    let done = commit(&project, &config, rename());
+    assert_eq!(done.error, None);
+    let saved = std::fs::read_to_string(&statuses).unwrap();
+    assert!(saved.starts_with("# The far team's catalog.\n"), "{saved}");
+    assert!(saved.contains("name: Up next"), "{saved}");
+    assert_eq!(saved.lines().count(), text.lines().count() + 1, "only the one line changed");
+
+    // Someone on the far host edits it meanwhile: a save from the model the
+    // window read before that is refused, naming the host, and nothing is
+    // written.
+    let stale = done.config.expect("the model as saved, read back from the far side");
+    std::fs::write(&statuses, format!("{saved}# edited on {HOST}\n")).unwrap();
+    let refused = commit(
+        &project,
+        &stale,
+        Edit::RenameStatus {
+            id: "todo".into(),
+            name: "Later".into(),
+        },
+    );
+    let error = refused.error.expect("a stale save is refused");
+    assert!(error.starts_with(&format!("Changed on {HOST} since it was loaded")), "{error}");
+    assert!(std::fs::read_to_string(&statuses).unwrap().ends_with(&format!("# edited on {HOST}\n")));
+    assert!(
+        refused.config.is_some_and(|c| c.status("todo").unwrap().name == "Up next"),
+        "the page reloads the far files"
+    );
+
+    // The workflow editor: its save writes the far workflow file, and one
+    // made over a far edit says so, offering the reload.
+    use shelbi_app::settings::workflow_editor::{run_save, Change, EditorState, Field};
+    let task_yaml = shelbi_state::workflows_dir(PROJECT).unwrap().join("task.yaml");
+    let mut editor = EditorState::new(project.source.workflow_config().unwrap(), "task");
+    editor.change(Change::Description("Far work.".into()));
+    let job = editor.begin_save(Vec::new()).expect("a save");
+    editor.saved(run_save(job, &project));
+    assert_eq!(editor.error_at(&Field::Save), None);
+    let task = std::fs::read_to_string(&task_yaml).unwrap();
+    assert!(task.contains("description: Far work."), "{task}");
+
+    std::fs::write(&task_yaml, format!("{task}# edited on {HOST}\n")).unwrap();
+    editor.change(Change::Description("Nearer work.".into()));
+    let job = editor.begin_save(Vec::new()).expect("a save");
+    editor.saved(run_save(job, &project));
+    let error = editor.error_at(&Field::Save).expect("refused").to_string();
+    assert!(error.starts_with(&format!("Changed on {HOST} since it was loaded")), "{error}");
+    assert!(error.ends_with("Discard to reload them."), "{error}");
+    assert!(editor.discard(), "Discard reads the far files again");
+    assert!(std::fs::read_to_string(&task_yaml).unwrap().contains("description: Far work."));
+}
+
+#[gpui::test]
+fn edit_in_a_remote_window_opens_the_far_editor_in_a_far_session(cx: &mut TestAppContext) {
+    setup(cx);
+    let far = FarHost::new("edit");
+    let handle = open(cx, &far);
+    crate::views::far_editor::tests::SHOWN.with(|s| s.borrow_mut().clear());
+
+    run(
+        cx,
+        handle,
+        CommandKind::OpenEditor {
+            target: EditTarget::Workflows,
+        },
+    );
+    settle(cx, "the far editor session", |_| {
+        crate::views::far_editor::tests::SHOWN.with(|s| !s.borrow().is_empty())
+    });
+    let (session, label) = crate::views::far_editor::tests::SHOWN.with(|s| s.borrow()[0].clone());
+    assert_eq!(label, "workflows");
+    assert!(session.starts_with(&format!("{PROJECT}/edit/")), "{session}");
+    let asked = far.asked.lock().unwrap();
+    let (name, cwd, argv) = &asked.editors[0];
+    assert_eq!(name, &session, "the window attaches to the session the far daemon started");
+    let dir = shelbi_state::workflows_dir(PROJECT).unwrap();
+    assert_eq!(cwd, &dir, "the far $EDITOR opens in the far directory");
+    assert_eq!(argv[4], dir.to_string_lossy(), "on the far path: {argv:?}");
+    assert_eq!(read(cx, handle, |w, _| w.banner.clone()), None);
+}
+
+#[gpui::test]
+fn a_file_dropped_on_a_far_terminal_lands_on_the_far_machine(cx: &mut TestAppContext) {
+    setup(cx);
+    let far = FarHost::new("drop");
+    let handle = open(cx, &far);
+    let link = read(cx, handle, |w, _| w.project_handle.link.clone());
+    let local = std::env::temp_dir().join(format!("rwf-drop-{}.png", std::process::id()));
+    std::fs::write(&local, b"\x89PNG not really").unwrap();
+
+    let pasted = shelbi_app::far::upload(&link, std::slice::from_ref(&local)).unwrap();
+    assert_eq!(pasted.len(), 1);
+    assert!(pasted[0].starts_with(far.drops()), "a far temp path: {pasted:?}");
+    assert_eq!(pasted[0].file_name(), local.file_name());
+    assert_eq!(std::fs::read(&pasted[0]).unwrap(), b"\x89PNG not really", "the far file holds the drop");
+
+    // A folder isn't sent.
+    let folder = shelbi_app::far::upload(&link, &[std::env::temp_dir()]).unwrap_err();
+    assert!(folder.contains("is a folder") && folder.contains(HOST), "{folder}");
+    let _ = std::fs::remove_file(&local);
+}
+
+#[gpui::test]
+fn a_remote_windows_machine_form_checks_and_saves_on_the_far_hub(cx: &mut TestAppContext) {
+    use shelbi_app::far::Request;
+    use shelbi_app::settings::machine_check::{ReadinessIntent, ReadinessRequest, ReadinessTarget};
+    use shelbi_app::settings::machine_form::SaveRequest;
+    setup(cx);
+    let far = FarHost::new("machine");
+    let handle = open(cx, &far);
+    let link = read(cx, handle, |w, _| w.project_handle.link.clone());
+    let engine = crate::views::machine_form::Engine::far(&link);
+
+    let request = ReadinessRequest {
+        run: 1,
+        intent: ReadinessIntent::Test,
+        target: ReadinessTarget {
+            project: PROJECT.into(),
+            machine: None,
+            name: "Build".into(),
+            host: "build".into(),
+            work_dir: "/srv/far".into(),
+            record_as: None,
+        },
+    };
+    let outcome = (engine.readiness)(&request, Default::default());
+    assert!(outcome.is_ready(), "the far hub's answer: {outcome:?}");
+
+    let fields = shelbi_core::pool::MachineFields {
+        name: "Build".into(),
+        kind: shelbi_core::MachineKind::Ssh,
+        host: Some("build".into()),
+        work_dir: "/srv/far".into(),
+        tags: Vec::new(),
+    };
+    let change = (engine.save)(PROJECT, &SaveRequest::Add(fields.clone())).unwrap();
+    assert_eq!(change.machine.name, "Build");
+    let asked = far.asked.lock().unwrap().requests.clone();
+    assert_eq!(asked, [Request::CheckMachine(request), Request::AddMachine(fields)]);
+}

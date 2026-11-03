@@ -47,6 +47,7 @@ use shelbi_state::agents_config::{
 };
 
 use super::agents::{runner_label, sentence};
+use super::store::{save_agents, ConfigStore};
 use super::LeaveGuard;
 
 // ---------------------------------------------------------------------------
@@ -268,38 +269,52 @@ pub struct SaveJob {
     rename: Option<String>,
 }
 
+impl SaveJob {
+    /// The project the save writes.
+    pub fn project(&self) -> &str {
+        self.config.project()
+    }
+}
+
 /// What a save did: the model as saved and the agent's name, or the error
 /// and where it shows.
 pub type SaveOutcome = Result<(Saved, String), (Field, String)>;
 
-/// Rename (when the name changed) and save, off the UI thread.
-pub fn run_save(job: SaveJob) -> SaveOutcome {
+/// Rename (when the name changed) and save through `store`, off the UI
+/// thread.
+pub fn run_save(job: SaveJob, store: &dyn ConfigStore) -> SaveOutcome {
     let mut config = job.config;
     let mut name = job.name;
     if let Some(new) = job.rename {
         config = config.rename_agent(&name, &new).map_err(|e| (Field::Name, message(&e)))?;
         name = new;
     }
-    let saved = config.save().map_err(|e| (Field::Save, message(&e)))?;
+    let saved = save_agents(store, &config).map_err(|e| (Field::Save, message(&e)))?;
     Ok((saved, name))
 }
 
-/// Copy agent `name` (as saved) as `copy` and save it, off the UI thread.
-pub fn run_duplicate(base: AgentsConfig, name: &str, copy: &str) -> Result<AgentsConfig, String> {
+/// Copy agent `name` (as saved) as `copy` and save it through `store`, off
+/// the UI thread.
+pub fn run_duplicate(base: AgentsConfig, name: &str, copy: &str, store: &dyn ConfigStore) -> Result<AgentsConfig, String> {
     base.duplicate_agent(name, copy)
-        .and_then(|c| c.save())
+        .and_then(|c| save_agents(store, &c))
         .map(|s| s.config)
         .map_err(|e| message(&e))
 }
 
-/// Delete agent `name` and save, off the UI thread.
-pub fn run_delete(base: AgentsConfig, name: &str) -> Result<(), String> {
-    base.delete_agent(name).and_then(|c| c.save()).map(|_| ()).map_err(|e| message(&e))
+/// Delete agent `name` and save through `store`, off the UI thread.
+pub fn run_delete(base: AgentsConfig, name: &str, store: &dyn ConfigStore) -> Result<(), String> {
+    base.delete_agent(name)
+        .and_then(|c| save_agents(store, &c))
+        .map(|_| ())
+        .map_err(|e| message(&e))
 }
 
 fn message(e: &AgentError) -> String {
     match e {
-        AgentError::Conflict(_) => format!("{} Discard to reload them.", sentence(&e.to_string())),
+        AgentError::Conflict(_) | AgentError::ChangedOn { .. } => {
+            format!("{} Discard to reload them.", sentence(&e.to_string()))
+        }
         e => sentence(&e.to_string()),
     }
 }
@@ -876,7 +891,7 @@ impl AgentEditorState {
                 then
             }
             Err((field, e)) => {
-                self.stale = e.starts_with("Changed on disk");
+                self.stale = e.starts_with("Changed on ");
                 self.set_error(field, e);
                 self.guard.forget_save();
                 None

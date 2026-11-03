@@ -23,6 +23,7 @@ pub mod branch;
 pub mod cancel;
 pub(crate) mod codex_rpc;
 pub mod dispatch;
+pub mod far;
 mod git;
 pub mod githook;
 pub mod handoff;

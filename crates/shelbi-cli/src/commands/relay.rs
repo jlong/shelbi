@@ -19,6 +19,8 @@
 //!   project source.
 //! - `control`: this machine's `control.sock` (filtered by the relay).
 //! - `changes`: this machine's `hub.sock` (subscribe only).
+//! - `put`: files a remote window drops on a terminal here, saved under this
+//!   user's temp directory.
 //!
 //! It never starts the daemon: `control` and `changes` fail to open while it
 //! is stopped. Not intended for direct use by hand.
@@ -54,5 +56,22 @@ fn services() -> RelayServices {
         query: Some(shelbi_orchestrator::source::QueryAnswers::default().handler()),
         control_socket: shelbi_state::control_socket_path().ok(),
         hub_socket: shelbi_state::hub_socket_path().ok(),
+        put_dir: put_dir(),
+    }
+}
+
+/// Where `put` saves the files a remote window drops on this machine's
+/// terminals: this user's own temp directory (`$XDG_RUNTIME_DIR`, else
+/// `$TMPDIR`), else `~/.shelbi/tmp`. Never a shared `/tmp`, where another
+/// user could get there first.
+fn put_dir() -> Option<std::path::PathBuf> {
+    let private = ["XDG_RUNTIME_DIR", "TMPDIR"]
+        .iter()
+        .filter_map(std::env::var_os)
+        .map(std::path::PathBuf::from)
+        .find(|p| p.is_absolute() && p.is_dir() && p != std::path::Path::new("/tmp"));
+    match private {
+        Some(dir) => Some(dir.join("shelbi-drops")),
+        None => shelbi_state::shelbi_home().ok().map(|home| home.join("tmp").join("drops")),
     }
 }

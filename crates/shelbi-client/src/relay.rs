@@ -567,6 +567,24 @@ impl QueryStream {
     }
 }
 
+/// Send `bytes` on an open `put` stream ([`RelayService::Put`]) and wait for
+/// the far path the relay saved them at. Blocking.
+pub fn put_file(stream: RelayStream, bytes: &[u8]) -> Result<String, ClientError> {
+    if bytes.len() > services::MAX_PUT_LEN {
+        return Err(shelbi_proto::ProtoError::FrameTooLarge(bytes.len()).into());
+    }
+    let (mut reader, mut writer, shutdown) = Box::new(stream).split()?;
+    let answer = (|| {
+        writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
+        writer.write_all(bytes)?;
+        writer.flush()?;
+        let path = services::read_message(&mut reader)?.ok_or(ClientError::UnexpectedEof)?;
+        String::from_utf8(path).map_err(|_| ClientError::Relay("the far path isn't UTF-8".into()))
+    })();
+    shutdown();
+    answer
+}
+
 impl Drop for QueryStream {
     fn drop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
@@ -782,6 +800,9 @@ pub struct RelayServices {
     /// The far daemon's `hub.sock`, which the `changes` service subscribes on.
     /// Only the relay's own `subscribe` frame is ever written to it.
     pub hub_socket: Option<PathBuf>,
+    /// Where the `put` service saves the files a remote window drops on a
+    /// far terminal (each in a fresh directory under it). `None`: no `put`.
+    pub put_dir: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for RelayServices {
@@ -790,6 +811,7 @@ impl std::fmt::Debug for RelayServices {
             .field("query", &self.query.is_some())
             .field("control_socket", &self.control_socket)
             .field("hub_socket", &self.hub_socket)
+            .field("put_dir", &self.put_dir)
             .finish()
     }
 }

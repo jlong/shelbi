@@ -16,6 +16,11 @@ use shelbi_state::workflow_config::WorkflowConfig;
 
 const PROJECT: &str = "my-project";
 
+/// The fixture project's files, written directly.
+fn disk() -> shelbi_app::settings::store::Disk {
+    shelbi_app::settings::store::Disk { project: PROJECT.into() }
+}
+
 /// Serializes the tests: `SHELBI_HOME` is process-wide.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -59,7 +64,7 @@ fn editor(name: &str) -> EditorState {
 /// Save as the view does, here rather than off the UI thread.
 fn save(state: &mut EditorState, texts: Vec<Change>) -> Option<Leave> {
     let job = state.begin_save(texts)?;
-    state.saved(run_save(job))
+    state.saved(run_save(job, &disk()))
 }
 
 fn on_disk(name: &str) -> Workflow {
@@ -418,7 +423,7 @@ fn leaving_with_edits_asks_first() {
     state.change(Change::Description("Saved this time.".into()));
     state.leave(Leave::Back);
     let job = state.save_and_leave(vec![]).unwrap();
-    assert_eq!(state.saved(run_save(job)), Some(Leave::Back));
+    assert_eq!(state.saved(run_save(job, &disk())), Some(Leave::Back));
     assert_eq!(on_disk("task").description.as_deref(), Some("Saved this time."));
 }
 
@@ -443,14 +448,14 @@ fn duplicate_and_delete_run_on_the_saved_model() {
     let mut state = editor("subtask");
     assert_eq!(state.duplicate_name(), "subtask-copy");
     let base = state.begin_job().unwrap();
-    let copy = run_duplicate(base, "subtask", "subtask-copy").unwrap();
+    let copy = run_duplicate(base, "subtask", "subtask-copy", &disk()).unwrap();
     assert!(copy.workflow("subtask-copy").is_some());
     assert!(home.workflows().join("subtask-copy.yaml").exists());
 
     let mut state = EditorState::new(copy, "subtask-copy");
     assert_eq!(state.delete_blocked(), None);
     let base = state.begin_job().unwrap();
-    run_delete(base, "subtask-copy").unwrap();
+    run_delete(base, "subtask-copy", &disk()).unwrap();
     assert!(!home.workflows().join("subtask-copy.yaml").exists());
     assert!(editor("task").delete_blocked().is_some_and(|e| e.contains("default")));
 }
@@ -510,7 +515,7 @@ fn the_text_form_round_trips_the_draft_and_keeps_refused_text_out_of_it() {
     assert!(state.begin_save(state.text_changes(&typed)).is_none());
     typed.script.as_mut().unwrap().1.ready_timeout = "90".into();
     let job = state.begin_save(state.text_changes(&typed)).expect("a save");
-    assert_eq!(state.saved(run_save(job)), None);
+    assert_eq!(state.saved(run_save(job, &disk())), None);
     assert!(!state.has_errors());
     let w = on_disk("task");
     assert_eq!(w.transitions.unwrap()[0].ready_timeout, Some(Duration::from_secs(90)));
@@ -532,7 +537,7 @@ fn an_unchanged_legacy_prefix_survives_an_unrelated_save() {
     let mut typed = form.clone();
     typed.description = "Something else.".into();
     let job = state.begin_save(state.text_changes(&typed)).unwrap();
-    state.saved(run_save(job));
+    state.saved(run_save(job, &disk()));
     let saved = home.read("task.yaml");
     assert!(saved.contains("branch_prefix: team") && !saved.contains("\n  branch: "), "{saved}");
 }
@@ -546,12 +551,12 @@ fn a_conflict_holds_until_discard_reads_the_files_again() {
     std::fs::write(home.workflows().join("task.yaml"), &edited).unwrap();
     state.change(Change::Description("Mine.".into()));
     let job = state.begin_save(vec![]).unwrap();
-    assert_eq!(state.saved(run_save(job)), None);
+    assert_eq!(state.saved(run_save(job, &disk())), None);
     assert!(state.conflict() && state.is_dirty(), "the draft is kept");
     assert!(state.error_at(&Field::Save).unwrap().contains("Discard to reload"));
     // Saving again is refused again: nothing overwrites the hand edit.
     let job = state.begin_save(vec![]).unwrap();
-    state.saved(run_save(job));
+    state.saved(run_save(job, &disk()));
     assert_eq!(home.read("task.yaml"), edited);
     assert!(state.discard());
     assert!(state.reloaded(WorkflowConfig::load(PROJECT).unwrap()));
@@ -566,7 +571,7 @@ fn rename_and_delete_are_refused_while_open_issues_use_the_workflow() {
     let mut state = editor("subtask");
     state.type_name("child");
     let job = state.begin_save(vec![]).unwrap();
-    state.saved(run_save(job));
+    state.saved(run_save(job, &disk()));
     let error = state.error_at(&Field::Name).unwrap().to_string();
     assert!(error.contains("sub-1"), "{error}");
     assert_eq!(state.name(), "subtask");
@@ -575,7 +580,7 @@ fn rename_and_delete_are_refused_while_open_issues_use_the_workflow() {
 
     assert_eq!(state.delete_blocked(), None, "the board is read when the delete runs");
     let base = state.begin_job().unwrap();
-    let e = run_delete(base, "subtask").unwrap_err();
+    let e = run_delete(base, "subtask", &disk()).unwrap_err();
     state.job_failed(e);
     assert!(state.error_at(&Field::Save).unwrap().contains("sub-1"));
     assert!(home.workflows().join("subtask.yaml").exists());
