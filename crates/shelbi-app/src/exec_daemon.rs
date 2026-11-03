@@ -271,7 +271,9 @@ fn out_of_date_gate(daemon_version: &str, client_version: &str) -> Option<ExecEr
     )))
 }
 
-fn read_expected(project: &str, id: &str) -> Option<ExpectedState> {
+/// Issue `id`'s `(status, revision)` as `project`'s store has it now: what a
+/// mutation sent without a client snapshot expects. Blocking (a store read).
+pub fn read_expected(project: &str, id: &str) -> Option<ExpectedState> {
     let store = shelbi_state::issue_store_for(project).ok()?;
     let tf = store.get(id).ok()??;
     Some(ExpectedState {

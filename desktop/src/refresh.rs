@@ -6,11 +6,12 @@
 //! project (`crate::feeds`):
 //!
 //! - a [`shelbi_app::spawn_refresher`] worker that runs the injected reader
-//!   (the shared `shelbi_orchestrator::sidebar_model::read_sidebar_model`) and
+//!   (the window's project source's `sidebar`, the shared sidebar model) and
 //!   publishes immutable [`Snapshot`]s;
-//! - the hub-socket change subscriber ([`shelbi_app::changes`]), which wakes a
-//!   refresh whenever the daemon's poller sees a board or workspace change;
-//! - the hub-socket layout subscriber ([`shelbi_app::layout_sub`]), whose
+//! - the project link's change subscription ([`shelbi_app::changes`] over
+//!   this machine's hub socket), which wakes a refresh whenever the daemon's
+//!   poller sees a board or workspace change;
+//! - the link's layout subscription ([`shelbi_app::layout_sub`]), whose
 //!   events (a review slot opening or closing) cross to the window as
 //!   [`FeedEvent::Layout`];
 //! - a polling fallback: while that subscription is down (no daemon), the feed
@@ -41,6 +42,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use shelbi_app::source::{ProjectHandle, ProjectSource};
 use shelbi_app::{spawn_refresher, Snapshot};
 use shelbi_client::{ControlClient, Notice, SessionEvent};
 
@@ -48,14 +50,15 @@ use shelbi_client::{ControlClient, Notice, SessionEvent};
 /// SSH probe for a remote review slot); always called on the refresh worker.
 pub type Reader = Arc<dyn Fn(&str, u64) -> Snapshot + Send + Sync>;
 
-/// The production reader: the sidebar model both clients share, less the
-/// warm board's age (`crate::views::sidebar::board_warning`), which would
-/// otherwise differ on every read and repaint the window for nothing.
-pub fn sidebar_reader() -> Reader {
-    Arc::new(|project, generation| Snapshot {
+/// The production reader: the sidebar model both clients share, read
+/// through the window's project `source`, less the warm board's age
+/// (`crate::views::sidebar::board_warning`), which would otherwise differ on
+/// every read and repaint the window for nothing.
+pub fn sidebar_reader(source: Arc<dyn ProjectSource>) -> Reader {
+    Arc::new(move |_project, generation| Snapshot {
         generation,
         taken_at: Some(std::time::SystemTime::now()),
-        sidebar: shelbi_orchestrator::sidebar_model::read_sidebar_model(project).map(|mut m| {
+        sidebar: source.sidebar().map(|mut m| {
             m.board_banner = crate::views::sidebar::board_warning(m.board_banner.take());
             m
         }),
@@ -166,16 +169,16 @@ pub struct ProjectFeed {
 }
 
 impl ProjectFeed {
-    /// The production feed for `project`: the shared sidebar reader, the hub
-    /// change subscription, and the default timing.
-    pub fn spawn(project: &str) -> (ProjectFeed, UnboundedReceiver<FeedEvent>) {
+    /// The production feed for `project`: the sidebar read through its
+    /// source, the change and layout subscriptions on its link, and the
+    /// default timing.
+    pub fn spawn(project: &ProjectHandle) -> (ProjectFeed, UnboundedReceiver<FeedEvent>) {
         let connected = Arc::new(AtomicBool::new(false));
-        let (subscription, changes) =
-            shelbi_app::changes::spawn_observed(project, connected.clone());
-        let (layout_subscription, layout) = shelbi_app::layout_sub::spawn(project);
+        let (subscription, changes) = project.link.subscribe_changes(connected.clone());
+        let (layout_subscription, layout) = project.link.subscribe_layout();
         Self::spawn_with(
-            project,
-            sidebar_reader(),
+            project.name(),
+            sidebar_reader(project.source.clone()),
             FeedSources {
                 connected,
                 changes: Some(changes),

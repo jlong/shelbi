@@ -47,6 +47,7 @@ pub mod session_connect;
 pub mod session_guard;
 pub mod session_process_backend;
 pub mod sidebar_model;
+pub mod source;
 pub mod submit;
 pub mod supervision;
 pub mod system_plugin;

@@ -891,6 +891,35 @@ pub fn read_activity_window(
     }
 }
 
+/// What the feed needs from the project's config, read beside the log: the
+/// header's name and the workspaces that review (their actor reads cyan).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProjectInfo {
+    /// The project's display name (`name:`), when it has one.
+    pub label: Option<String>,
+    /// The `review`-tagged workspaces.
+    pub reviewers: HashSet<String>,
+}
+
+impl ProjectInfo {
+    /// Read `project`'s config; the default when it won't load.
+    pub fn read(project: &str) -> Self {
+        let Ok(p) = shelbi_state::load_project(project) else {
+            return Self::default();
+        };
+        ProjectInfo {
+            label: p.display_name.clone().or_else(|| p.label.clone()),
+            reviewers: p
+                .workspaces
+                .iter()
+                .filter(|w| p.effective_tags(w).contains("review"))
+                .map(|w| w.name.clone())
+                .collect(),
+        }
+    }
+}
+
 /// A [`read_activity_window_staged`] read.
 #[derive(Debug, Clone, Default)]
 pub struct WindowRead {

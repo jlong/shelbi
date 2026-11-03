@@ -419,6 +419,7 @@ mod tests {
 
     use super::*;
     use crate::platform::bootstrap::Failure;
+    use shelbi_app::source::ProjectKey;
     use crate::platform::discovery::{Candidate, CliSource};
     use crate::platform::install::{self, InstallError, InstallErrorKind};
     use crate::window_state::WindowState;
@@ -561,7 +562,7 @@ mod tests {
     fn a_returning_user_restores_the_launch_windows(cx: &mut TestAppContext) {
         let plan = vec![LaunchWindow {
             slot: 0,
-            project: "shelbi".into(),
+            project: ProjectKey::local("shelbi"),
             state: WindowState::default(),
         }];
         let mut r = rig(cx, plan.clone());

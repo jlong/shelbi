@@ -48,6 +48,7 @@
 //! injected, so the attach state machine is tested in a gpui test context with
 //! a fake session (below).
 
+use shelbi_app::source::{ProjectHandle, ProjectLink};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -87,20 +88,20 @@ pub trait SessionConnector: Send + Sync {
     ) -> Result<Connected, ConnectFailure>;
 }
 
-/// The production connector: [`shelbi_orchestrator::session_connect`]'s
-/// attach with replay (this machine's sessions directory, or the workspace
-/// machine's relay), retried, then wired onto the pane's threads.
-pub struct LiveConnector;
+/// The production connector: the project link's sessions (locally,
+/// `shelbi_orchestrator::session_connect`'s attach with replay: this
+/// machine's sessions directory, or the workspace machine's relay), retried,
+/// then wired onto the pane's threads.
+pub struct LiveConnector {
+    sessions: Arc<dyn app_session::Connector>,
+}
 
-struct AppConnector;
-
-impl app_session::Connector for AppConnector {
-    fn connect(
-        &self,
-        project: &str,
-        target: &SessionRef,
-    ) -> Result<app_session::Connected, ConnectFailure> {
-        shelbi_orchestrator::session_connect::connect(project, target)
+impl LiveConnector {
+    /// The connector over `project`'s link.
+    pub fn over(project: &ProjectLink) -> Self {
+        LiveConnector {
+            sessions: project.sessions(),
+        }
     }
 }
 
@@ -111,7 +112,7 @@ impl SessionConnector for LiveConnector {
         target: &SessionRef,
         retry: RetryPolicy,
     ) -> Result<Connected, ConnectFailure> {
-        let c = app_session::retry_connect(&AppConnector, project, target, retry)?;
+        let c = app_session::retry_connect(self.sessions.as_ref(), project, target, retry)?;
         pane_session::wire(
             c.conn,
             c.events,
@@ -135,10 +136,11 @@ pub struct SessionDeps {
 }
 
 impl SessionDeps {
-    /// The real sessions, `relauncher`, and the wall clock.
-    pub fn live_with(relauncher: Arc<dyn Relauncher>) -> Self {
+    /// The real sessions over `project`'s link, `relauncher`, and the wall
+    /// clock.
+    pub fn live_with(project: &ProjectLink, relauncher: Arc<dyn Relauncher>) -> Self {
         Self {
-            connector: Arc::new(LiveConnector),
+            connector: Arc::new(LiveConnector::over(project)),
             relauncher,
             retry: RetryPolicy::default(),
             reconnect: ReconnectPolicy::default(),
@@ -148,10 +150,13 @@ impl SessionDeps {
 
     /// The real session, the orchestrator's daemon-side relaunch markers, and
     /// the wall clock.
-    pub fn live(project: &str) -> Self {
-        Self::live_with(Arc::new(PersistentRelauncher {
-            project: project.to_string(),
-        }))
+    pub fn live(project: &ProjectHandle) -> Self {
+        Self::live_with(
+            &project.link,
+            Arc::new(PersistentRelauncher {
+                project: project.name().to_string(),
+            }),
+        )
     }
 }
 

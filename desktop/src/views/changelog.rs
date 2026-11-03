@@ -15,8 +15,9 @@
 //! The band's subtitle is the month of the entry at the top of the view, so
 //! the date stays in sight however far down a long entry the reader is.
 //!
-//! Reads never run on the UI thread: a background worker re-reads when the
-//! changelog directory's stamp changes ([`ChangelogWatch`]), polled on the
+//! Reads never run on the UI thread: a background worker re-reads, through
+//! the window's project source, when the changelog directory's stamp changes
+//! since the last read (the source's `changelog`), polled on the
 //! TUI's 750ms cadence, so an entry the orchestrator adds appears live. The
 //! entries are a virtualized `gpui::list` that builds only the ones in
 //! view; the model shows [`shelbi_app::changelog::PAGE_SIZE`] at a time and
@@ -34,6 +35,7 @@
 //! [`ChangelogEvent::OpenIssue`]); a PR or URL chip opens the browser. A PR
 //! number with no known GitHub repository draws disabled.
 
+use shelbi_app::source::ProjectHandle;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Mutex;
@@ -47,7 +49,7 @@ use gpui::{
 use gpui_kit::base::text::{RangeHighlight, RenderedText, TextViewState};
 use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
 use shelbi_app::changelog::{
-    self, ChangelogData, ChangelogEntryView, ChangelogLink, ChangelogModel, ChangelogWatch, LinkKind, LinkTarget,
+    self, ChangelogData, ChangelogEntryView, ChangelogLink, ChangelogModel, LinkKind, LinkTarget,
 };
 
 use super::activity_list::FeedList;
@@ -181,11 +183,15 @@ pub struct ChangelogView {
 impl EventEmitter<ChangelogEvent> for ChangelogView {}
 
 impl ChangelogView {
-    pub fn new(project: String, cx: &mut Context<Self>) -> Self {
-        let watch = Mutex::new(ChangelogWatch::new(project.clone()));
+    pub fn new(project: &ProjectHandle, cx: &mut Context<Self>) -> Self {
+        let source = project.source.clone();
+        // The stamp of the last read: the next reads only when it changed.
+        let last = Mutex::new(None);
         let refresher = shelbi_app::spawn_worker(move |_| {
-            let changed = watch.lock().map(|mut w| w.changed()).unwrap_or(true);
-            changed.then(|| changelog::read_changelog(&project))
+            let mut last = last.lock().unwrap_or_else(|p| p.into_inner());
+            let data = source.changelog(last.as_ref())?;
+            *last = Some(data.stamp);
+            Some(data)
         });
         refresher.request();
         let poll = cx.spawn(async move |this, cx| loop {
@@ -964,7 +970,7 @@ mod tests {
             gpui_kit::init(cx);
         });
         let handle = cx.update(|cx| {
-            cx.open_window(Default::default(), |_, cx| cx.new(|cx| ChangelogView::new(project.into(), cx)))
+            cx.open_window(Default::default(), |_, cx| cx.new(|cx| ChangelogView::new(&shelbi_orchestrator::source::local_handle(project), cx)))
                 .unwrap()
         });
         let mut vcx = VisualTestContext::from_window(handle.into(), cx);
@@ -1019,7 +1025,7 @@ mod tests {
             gpui_kit::init(cx);
         });
         let handle = cx.update(|cx| {
-            cx.open_window(Default::default(), |_, cx| cx.new(|cx| ChangelogView::new(project.into(), cx)))
+            cx.open_window(Default::default(), |_, cx| cx.new(|cx| ChangelogView::new(&shelbi_orchestrator::source::local_handle(project), cx)))
                 .unwrap()
         });
         let mut vcx = VisualTestContext::from_window(handle.into(), cx);
@@ -1088,7 +1094,7 @@ mod tests {
             gpui_kit::init(cx);
         });
         let handle = cx.update(|cx| {
-            cx.open_window(Default::default(), |_, cx| cx.new(|cx| ChangelogView::new("cl-empty".into(), cx)))
+            cx.open_window(Default::default(), |_, cx| cx.new(|cx| ChangelogView::new(&shelbi_orchestrator::source::local_handle("cl-empty"), cx)))
                 .unwrap()
         });
         let mut vcx = VisualTestContext::from_window(handle.into(), cx);

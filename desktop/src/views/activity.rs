@@ -26,6 +26,7 @@
 //! window to open the task's detail ([`ActivityEvent::OpenTask`]); a workspace
 //! row runs `CommandKind::FocusWorkspace` through the window's dispatch.
 
+use shelbi_app::source::ProjectHandle;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -117,15 +118,16 @@ enum Trailing {
 impl EventEmitter<ActivityEvent> for ActivityView {}
 
 impl ActivityView {
-    pub fn new(project: String, cx: &mut Context<Self>) -> Self {
-        let reader = ActivityReader::spawn(project.clone());
+    pub fn new(project: &ProjectHandle, cx: &mut Context<Self>) -> Self {
+        let reader = ActivityReader::spawn(project.source.clone());
         Self::with_reader(project, reader, cx)
     }
 
     /// The view over `reader`, which the window may have started when it
     /// opened: a read that has already landed is shown on the first frame.
-    pub fn with_reader(project: String, reader: ActivityReader, cx: &mut Context<Self>) -> Self {
-        let (keymaps, diagnostics) = shelbi_state::keymap::load_keymaps(Some(&project));
+    pub fn with_reader(handle: &ProjectHandle, reader: ActivityReader, cx: &mut Context<Self>) -> Self {
+        let project = handle.name().to_string();
+        let (keymaps, diagnostics) = handle.source.project_keymap();
         for d in diagnostics {
             tracing::warn!("keys.yaml: {d:?}");
         }

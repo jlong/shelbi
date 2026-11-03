@@ -10,8 +10,13 @@
 //!   slot, not the project: a window keeps its frame across project switches.
 //! - [`ProjectViewState`]: where a project was left (view, sidebar selection
 //!   and scroll, open review, board filter), in
-//!   `~/.shelbi/projects/<name>/desktop-view.json`, so switching back to a
-//!   project (in any window) lands where it was.
+//!   `~/.shelbi/projects/<name>/desktop-view.json` (a remote project's in
+//!   `~/.shelbi/remote/<host>/<name>/`, on this machine), so switching back to
+//!   a project (in any window) lands where it was.
+//!
+//! Slots and view state are keyed by [`ProjectKey`], so a remote project named
+//! like a local one never shares either. A local key is stored as the bare
+//! project name, so session files written before keys read unchanged.
 //!
 //! Before window slots, the frame was saved per project in
 //! `projects/<name>/desktop-window.json` ([`LEGACY_FILE_NAME`]); the first
@@ -25,6 +30,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use shelbi_app::nav::DEFAULT_SIDEBAR_WIDTH;
+use shelbi_app::source::ProjectKey;
 
 use crate::views::pane_width::DEFAULT_W;
 
@@ -109,7 +115,7 @@ impl WindowState {
 #[serde(default)]
 pub struct Slot {
     /// The project the window last showed (`None`: the empty-state chooser).
-    pub project: Option<String>,
+    pub project: Option<ProjectKey>,
     /// The window was open when the app last ran (a closed slot keeps its
     /// frame for the next window that takes it).
     pub open: bool,
@@ -171,15 +177,16 @@ impl WindowSession {
 #[derive(Debug, Clone, PartialEq)]
 pub struct LaunchWindow {
     pub slot: usize,
-    pub project: String,
+    pub project: ProjectKey,
     pub state: WindowState,
 }
 
 /// The windows a launch opens:
 ///
 /// - With a session, every slot that was open on a project that still
-///   exists, each on its project and state. A project named on the command
-///   line (`named`) takes the first window unless one already shows it.
+///   exists (`exists`), each on its project and state. A project named on
+///   the command line (`named`, on this machine) takes the first window
+///   unless one already shows it.
 /// - Without one (the first launch after the upgrade), one window on `named`
 ///   or else `fallback` (the launch project), with that project's pre-slot
 ///   frame (`legacy`).
@@ -190,16 +197,18 @@ pub fn launch_plan(
     session: Option<&WindowSession>,
     named: Option<&str>,
     fallback: Option<&str>,
-    exists: &dyn Fn(&str) -> bool,
+    exists: &dyn Fn(&ProjectKey) -> bool,
     legacy: &dyn Fn(&str) -> WindowState,
 ) -> Vec<LaunchWindow> {
+    let named = named.map(ProjectKey::local);
     let Some(session) = session else {
         return named
-            .or(fallback)
+            .map(|n| n.name)
+            .or(fallback.map(str::to_string))
             .map(|project| LaunchWindow {
                 slot: 0,
-                project: project.to_string(),
-                state: legacy(project),
+                state: legacy(&project),
+                project: ProjectKey::local(project),
             })
             .into_iter()
             .collect();
@@ -210,23 +219,23 @@ pub fn launch_plan(
         .enumerate()
         .filter(|(_, s)| s.open)
         .filter_map(|(slot, s)| {
-            let project = s.project.as_deref().filter(|p| exists(p))?;
+            let project = s.project.as_ref().filter(|p| exists(p))?;
             Some(LaunchWindow {
                 slot,
-                project: project.to_string(),
+                project: project.clone(),
                 state: s.state.clone(),
             })
         })
         .collect();
-    let shows_named = named.is_some_and(|n| windows.iter().any(|w| w.project == n));
+    let shows_named = named.as_ref().is_some_and(|n| windows.iter().any(|w| w.project == *n));
     match (windows.first_mut(), named) {
-        (Some(first), Some(named)) if !shows_named => first.project = named.to_string(),
+        (Some(first), Some(named)) if !shows_named => first.project = named,
         (Some(_), _) => {}
-        (None, _) => {
-            if let Some(project) = named.or(fallback) {
+        (None, named) => {
+            if let Some(project) = named.or(fallback.map(ProjectKey::local)) {
                 windows.push(LaunchWindow {
                     slot: 0,
-                    project: project.to_string(),
+                    project,
                     state: session.slots.first().map(|s| s.state.clone()).unwrap_or_default(),
                 });
             }
@@ -264,19 +273,19 @@ pub struct ProjectViewState {
 }
 
 impl ProjectViewState {
-    pub fn path(project: &str) -> Option<PathBuf> {
-        shelbi_state::project_dir(project)
-            .ok()
-            .map(|dir| dir.join(VIEW_FILE_NAME))
+    /// Where `project`'s is kept: under its state directory on this machine
+    /// ([`ProjectKey::state_dir`]).
+    pub fn path(project: &ProjectKey) -> Option<PathBuf> {
+        project.state_dir().ok().map(|dir| dir.join(VIEW_FILE_NAME))
     }
 
     /// `project`'s saved view state, or the default.
-    pub fn load(project: &str) -> ProjectViewState {
+    pub fn load(project: &ProjectKey) -> ProjectViewState {
         Self::path(project).map(|p| load_json(&p)).unwrap_or_default()
     }
 
     /// Save it for `project`. Blocking disk IO: call it off the UI thread.
-    pub fn save(&self, project: &str) -> std::io::Result<()> {
+    pub fn save(&self, project: &ProjectKey) -> std::io::Result<()> {
         let path = Self::path(project)
             .ok_or_else(|| std::io::Error::other(format!("no state directory for `{project}`")))?;
         write_json(&path, self)
@@ -385,13 +394,13 @@ mod tests {
 
     fn slot(project: &str, open: bool, x: f32) -> Slot {
         Slot {
-            project: Some(project.into()),
+            project: Some(ProjectKey::local(project)),
             open,
             state: state(x),
         }
     }
 
-    fn all_exist(_: &str) -> bool {
+    fn all_exist(_: &ProjectKey) -> bool {
         true
     }
 
@@ -405,13 +414,13 @@ mod tests {
             plan,
             [LaunchWindow {
                 slot: 0,
-                project: "web".into(),
+                project: ProjectKey::local("web"),
                 state: state(40.0),
             }]
         );
         // A project named on the command line wins over the launch project.
         let plan = launch_plan(None, Some("api"), Some("web"), &all_exist, &legacy);
-        assert_eq!(plan[0].project, "api");
+        assert_eq!(plan[0].project, ProjectKey::local("api"));
         assert_eq!(plan[0].state, WindowState::default());
         // No project at all: nothing to open.
         assert!(launch_plan(None, None, None, &all_exist, &legacy).is_empty());
@@ -429,7 +438,7 @@ mod tests {
                 slot("gone", true, 40.0),
             ],
         };
-        let exists = |p: &str| p != "gone";
+        let exists = |p: &ProjectKey| p.name != "gone";
         let never = |_: &str| -> WindowState { panic!("a session never reads the legacy file") };
         let plan = launch_plan(Some(&session), None, Some("api"), &exists, &never);
         assert_eq!(
@@ -437,22 +446,22 @@ mod tests {
             [
                 LaunchWindow {
                     slot: 0,
-                    project: "web".into(),
+                    project: ProjectKey::local("web"),
                     state: state(10.0),
                 },
                 LaunchWindow {
                     slot: 2,
-                    project: "docs".into(),
+                    project: ProjectKey::local("docs"),
                     state: state(30.0),
                 },
             ]
         );
         // A named project takes the first window unless one shows it.
         let plan = launch_plan(Some(&session), Some("api"), None, &exists, &never);
-        assert_eq!(plan[0].project, "api");
+        assert_eq!(plan[0].project, ProjectKey::local("api"));
         assert_eq!(plan[0].state, state(10.0), "the window keeps its slot's frame");
         let plan = launch_plan(Some(&session), Some("docs"), None, &exists, &never);
-        assert_eq!(plan[0].project, "web");
+        assert_eq!(plan[0].project, ProjectKey::local("web"));
         // Nothing left open: one window, in slot 0's frame.
         let closed = WindowSession {
             slots: vec![slot("web", false, 10.0)],
@@ -462,7 +471,7 @@ mod tests {
             plan,
             [LaunchWindow {
                 slot: 0,
-                project: "api".into(),
+                project: ProjectKey::local("api"),
                 state: state(10.0),
             }]
         );
@@ -507,5 +516,28 @@ mod tests {
     fn default_width_is_the_shared_nav_default() {
         assert_eq!(WindowState::default().sidebar_width, DEFAULT_SIDEBAR_WIDTH);
         assert_eq!(WindowState::default().task_pane_width, 640.0);
+    }
+
+    #[test]
+    fn slots_key_projects_and_read_a_bare_name_as_a_local_one() {
+        // A session file from before keys: the bare name is a local project.
+        let old = r#"{"slots":[{"project":"web","open":true}]}"#;
+        let session: WindowSession = serde_json::from_str(old).unwrap();
+        assert_eq!(session.slots[0].project, Some(ProjectKey::local("web")));
+        // A local key writes back the same bare name.
+        let json = serde_json::to_value(&session).unwrap();
+        assert_eq!(json["slots"][0]["project"], "web");
+        // A remote one keeps its host, and is another project than the
+        // local one of the same name.
+        let mut remote = session.clone();
+        remote.slots[0].project = Some(ProjectKey::remote("devbox", "web"));
+        let back: WindowSession = serde_json::from_str(&serde_json::to_string(&remote).unwrap()).unwrap();
+        assert_eq!(back, remote);
+        assert_ne!(back.slots[0].project, session.slots[0].project);
+        // A slot whose project isn't there to open (a remote one, until
+        // remote windows open natively) isn't restored.
+        let local_only = |p: &ProjectKey| p.is_local();
+        let never = |_: &str| -> WindowState { panic!("a session never reads the legacy file") };
+        assert!(launch_plan(Some(&remote), None, None, &local_only, &never).is_empty());
     }
 }

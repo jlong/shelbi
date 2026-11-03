@@ -73,39 +73,9 @@ fn in_progress_task_for(
         .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace)))
 }
 
-/// Everything a client's workspace view shows about a workspace, on any
-/// machine: where it lives, its worktree, and the task it is working.
-///
-/// Serializable for the remote window's query service, which resolves it on
-/// the far machine; `#[serde(default)]` so a field added later still decodes.
-/// The JSON shape is pinned by `workspace_details_json_shape_is_pinned`.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-pub struct WorkspaceDetails {
-    /// The machine the workspace is declared on.
-    pub machine: String,
-    /// Whether that machine is reached over SSH.
-    pub is_remote: bool,
-    /// Absolute workspace worktree path (on the workspace's machine).
-    pub worktree: String,
-    /// A remote worktree's `<ssh host>:<path>` address (what Reveal copies,
-    /// since there's no local folder to show). `None` for a local workspace.
-    pub remote_address: Option<String>,
-    /// Display name of the resolved editor (`Vim`, `Helix`, `Zed`, …): for a
-    /// remote workspace, the terminal editor its Edit pane runs there.
-    pub editor_name: String,
-    /// Which of Edit and View Diff open an app instead of a pane
-    /// ([`crate::tools::app_tools`]). Neither, for a remote workspace: an
-    /// app opens local worktrees only, so both open panes on its machine.
-    pub apps: shelbi_state::AppTools,
-    /// The branch the workspace is on: its in-progress task's branch, else
-    /// the worktree's checked-out branch (read on its machine). `None` when
-    /// unknown.
-    pub branch: Option<String>,
-    /// The in-progress task on this workspace, from the published board index
-    /// (see [`in_progress_task_for`]).
-    pub task: Option<Box<shelbi_state::IssueFile>>,
-}
+/// What a workspace view shows about a workspace; the type lives in
+/// `shelbi_app::source` so a project source can return it.
+pub use shelbi_app::source::WorkspaceDetails;
 
 /// Resolve a workspace's [`WorkspaceDetails`], local or remote. Errors only
 /// when the workspace or its machine is unknown. Blocking (a config load, the

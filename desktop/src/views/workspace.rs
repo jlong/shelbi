@@ -58,6 +58,7 @@
 //! panel draws at once, and the session's connect, replay and first layout
 //! land after the push has settled.
 
+use shelbi_app::source::ProjectHandle;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -110,14 +111,17 @@ pub trait WorkspaceOps: Send + Sync {
     }
 }
 
-/// The real thing: the orchestrator's details reader, the daemon's control
-/// socket, and `open`.
-pub struct LiveOps;
+/// The real thing: the details read through the window's project source,
+/// the daemon's session ops through its link, and `open`. Answers for the
+/// window's project only (the `project` its methods are handed).
+pub struct LiveOps {
+    project: ProjectHandle,
+}
 
 impl WorkspaceOps for LiveOps {
     fn details(&self, project: &str, workspace: &str) -> Result<WorkspaceDetailsInfo, String> {
-        let d = shelbi_orchestrator::workspace_session::workspace_details(project, workspace)
-            .map_err(|e| e.to_string())?;
+        debug_assert_eq!(project, self.project.name());
+        let d = self.project.source.workspace_details(workspace)?;
         Ok(WorkspaceDetailsInfo {
             task: d.task.as_ref().map(|t| (t.task.id.clone(), t.task.title.clone())),
             body: d.task.map(|t| t.body).unwrap_or_default(),
@@ -134,7 +138,10 @@ impl WorkspaceOps for LiveOps {
     }
 
     fn session_op(&self, project: &str, workspace: &str, op: WorkspaceSessionOp) -> Result<(), String> {
-        shelbi_app::workspace_session(project, workspace, op, &mut |_, _| {})
+        debug_assert_eq!(project, self.project.name());
+        self.project
+            .link
+            .workspace_session(workspace, op, &mut |_, _| {})
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
@@ -166,14 +173,19 @@ impl WorkspaceDeps {
     /// The real daemon and sessions for `project`: agents re-open through the
     /// daemon's relaunch markers, content sessions and the shell are
     /// re-ensured.
-    pub fn live(project: &str) -> Self {
-        let project = project.to_string();
+    pub fn live(project: &ProjectHandle) -> Self {
+        let handle = project.clone();
         Self {
-            ops: Arc::new(LiveOps),
+            ops: Arc::new(LiveOps {
+                project: project.clone(),
+            }),
             sessions: Rc::new(move || {
-                SessionDeps::live_with(Arc::new(WorkspaceContentRelauncher {
-                    project: project.clone(),
-                }))
+                SessionDeps::live_with(
+                    &handle.link,
+                    Arc::new(WorkspaceContentRelauncher {
+                        project: handle.name().to_string(),
+                    }),
+                )
             }),
         }
     }

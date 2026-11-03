@@ -40,7 +40,7 @@ impl Settings {
         h.window.update(&mut h.cx, |w, _| {
             w.clock = Rc::new(move || n.get());
             w.reduce_motion = Rc::new(|| false);
-            w.review_ops = ops;
+            w.review_ops = Some(ops);
             w.review_deps = Some(deps);
             w.model.reviews.push(row(ReviewState::Serving));
         });
