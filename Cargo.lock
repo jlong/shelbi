@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1713,14 +1713,14 @@ dependencies = [
 
 [[package]]
 name = "shelbi-agent"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "shelbi-core",
 ]
 
 [[package]]
 name = "shelbi-app"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "chrono",
  "serde",
@@ -1737,7 +1737,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-client"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -1751,7 +1751,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-core"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "chrono",
  "libc",
@@ -1763,7 +1763,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-orchestrator"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1792,7 +1792,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-palette"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "nucleo-matcher",
  "shelbi-core",
@@ -1800,7 +1800,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-proto"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1809,7 +1809,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-session"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1828,7 +1828,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-ssh"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "libc",
  "shelbi-core",
@@ -1840,7 +1840,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-state"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "chrono",
  "dirs",
@@ -1856,7 +1856,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-term"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "alacritty_terminal",
  "shelbi-proto",
@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "shelbi-tui"
-version = "0.13.1"
+version = "0.13.2"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
