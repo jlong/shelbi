@@ -209,6 +209,48 @@ fn apply_prioritize_lands_the_issue_at_the_slot_and_shifts_the_rest() {
 }
 
 #[test]
+fn apply_add_lands_at_the_end_by_default_and_at_the_top_when_asked() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    for (i, id) in ["a", "b"].iter().enumerate() {
+        let mut t = task(Column::todo(), id);
+        t.priority = i as u32;
+        shelbi_state::save_task("p", &t, "").unwrap();
+    }
+    let add = |id: &str, top: bool| {
+        MutationKind::Add(Box::new(AddSpec {
+            title: id.to_uppercase(),
+            id: Some(id.into()),
+            status: "todo".into(),
+            body: Some(format!("{id} body")),
+            depends_on: vec![],
+            prefers_machine: None,
+            workflow: None,
+            branch: None,
+            top,
+        }))
+    };
+
+    let mut sink = RecordingSink::default();
+    let note = apply("p", "", &add("end", false), &mut sink, &mut no_recheck()).unwrap();
+    assert_eq!(note.id, "end", "the note names the created issue");
+    assert_eq!(column_ids(Column::todo()), ["a", "b", "end"]);
+
+    apply("p", "", &add("first", true), &mut sink, &mut no_recheck()).unwrap();
+    assert_eq!(column_ids(Column::todo()), ["first", "a", "b", "end"]);
+    assert_eq!(shelbi_state::load_task("p", "first").unwrap().body.trim(), "first body");
+    assert!(
+        sink.lines.iter().any(|(_, t)| t == "✓ first created in todo (top of the queue)"),
+        "stdout lines: {:?}",
+        sink.lines
+    );
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn apply_prioritize_aborts_without_reordering_when_the_recheck_reports_stale() {
     let _g = crate::test_lock::acquire();
     let home = fresh_home();
@@ -336,6 +378,7 @@ fn apply_add_into_a_ready_status_wakes_the_orchestrator_but_backlog_stays_quiet(
             prefers_machine: None,
             workflow: None,
             branch: None,
+            top: false,
         })),
         &mut sink,
         &mut recheck,
@@ -357,6 +400,7 @@ fn apply_add_into_a_ready_status_wakes_the_orchestrator_but_backlog_stays_quiet(
             prefers_machine: None,
             workflow: None,
             branch: None,
+            top: false,
         })),
         &mut sink,
         &mut no_recheck(),

@@ -189,6 +189,7 @@ pub fn command_unavailable(kind: &CommandKind, host: &str) -> Option<String> {
         | CommandKind::RejectReview { .. }
         | CommandKind::EditIssue { .. }
         | CommandKind::AddIssue { .. }
+        | CommandKind::NewIssue
         | CommandKind::PrioritizeIssue { .. }
         | CommandKind::SetIssueWorkflow { .. } => return None,
     };

@@ -48,6 +48,9 @@ pub enum Effect {
     /// Show Acknowledgements: the bundled software and each license (a
     /// client-local view; nothing stops).
     OpenAcknowledgements,
+    /// Open the New task dialog over the current view (a client-local
+    /// dialog; its create is a [`Mutation::AddIssue`]).
+    NewIssue { project: String },
     /// Switch the client to another project.
     SwitchProject { project: String },
     /// Begin the add-project flow (the host collects the form, then calls
@@ -150,11 +153,18 @@ pub enum Mutation {
         expect_title: Option<String>,
         expect_body: Option<String>,
     },
-    /// Add a new issue.
+    /// Add a new issue (the New task dialog's create, `shelbi issue add`'s
+    /// fields): its title, its Markdown body (`None` defaults it to the
+    /// title), the workflow (`None` follows the project's default), the
+    /// status it starts in (`None` is `backlog`), and whether it lands at the
+    /// top of that status's queue rather than the end.
     AddIssue {
         project: String,
         title: String,
+        body: Option<String>,
         workflow: Option<String>,
+        status: Option<String>,
+        top: bool,
     },
     /// Reorder an issue within its status column: land it at absolute slot
     /// `position` (0 is the top) of the column's priority order.
@@ -167,11 +177,13 @@ pub enum Mutation {
     ToggleZen { project: String },
     /// Scaffold and open a new project (payload collected by the host's
     /// add-project form): the raw name, the repo path as typed (resolved
-    /// against the host's working directory), and where its config lives.
+    /// against the host's working directory), where its config lives, and
+    /// the agents' default runner and model (the Agent defaults step).
     AddProject {
         name: String,
         root: String,
         mode: shelbi_core::ConfigMode,
+        defaults: shelbi_core::AgentDefaults,
     },
 }
 

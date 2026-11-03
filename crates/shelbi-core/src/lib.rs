@@ -16,7 +16,8 @@ pub mod workflow;
 pub mod workspace_names;
 
 pub use agent_manifest::{
-    clamp_permission_mode, is_known_permission_mode, model_suggestions, reasoning_efforts,
+    clamp_permission_mode, is_known_permission_mode, model_suggestions, orchestrator_model,
+    reasoning_efforts,
     resolve_agent_launch, AgentManifest, AgentRequires, ReasoningEffort, ResolvedAgentLaunch,
     RunnerManifestConfig, PERMISSION_MODES,
 };
@@ -32,7 +33,7 @@ pub use model::{
     danger_paths_for_project, danger_paths_for_workflow, default_dialog_signatures,
     default_prompt_injection, detect_project_shapes, normalize_project_name, validate_agent_id,
     validate_branch, validate_branch_prefix, validate_project_name, validate_task_id,
-    validate_workflow_name, Agent,
+    validate_workflow_name, Agent, AgentDefaults,
     AgentRunnerSpec, BudgetConfig, Column, ConfigMode, DialogSignature, DiskConfig, ForwardMode,
     GitConfig,
     HeartbeatConfig, GithubConnection, Host, IssueTrackerBackend, IssueTrackerConfig, JiraConnection,

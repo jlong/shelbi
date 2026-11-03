@@ -91,7 +91,7 @@ pub fn open_remote(session: &RemoteSession) -> Result<()> {
 
 /// What's drawn over the launch screen.
 enum Layer {
-    AddProject(add_project::Form),
+    AddProject(Box<add_project::Form>),
     Connect(Box<ConnectDialog>),
 }
 
@@ -155,11 +155,8 @@ impl LaunchApp {
         match ev {
             Event::Key(key) if key.kind != KeyEventKind::Release => match self.layer.as_mut() {
                 Some(Layer::AddProject(form)) => {
-                    match form.handle_key(key) {
-                        add_project::Step::Continue => {}
-                        add_project::Step::Cancel => self.layer = None,
-                        add_project::Step::Submit => self.submit_project(),
-                    }
+                    let step = form.handle_key(key);
+                    self.add_project_step(step);
                     None
                 }
                 Some(Layer::Connect(dialog)) => {
@@ -176,8 +173,11 @@ impl LaunchApp {
                     let step = dialog.handle_mouse(m);
                     self.connect_step(step)
                 }
-                // The form takes keys only; a click elsewhere keeps it.
-                Some(Layer::AddProject(_)) => None,
+                Some(Layer::AddProject(form)) => {
+                    let step = form.handle_mouse(m);
+                    self.add_project_step(step);
+                    None
+                }
                 None => {
                     if self.create_job.is_some() && m.kind == MouseEventKind::Down(MouseButton::Left) {
                         return None;
@@ -226,7 +226,7 @@ impl LaunchApp {
             LaunchStep::Connected(session) => Some(LaunchExit::OpenRemote(session)),
             LaunchStep::Quit => Some(LaunchExit::Quit),
             LaunchStep::AddProject => {
-                self.layer = Some(Layer::AddProject(add_project::Form::new(&self.cwd)));
+                self.layer = Some(Layer::AddProject(Box::new(add_project::Form::new(&self.cwd))));
                 None
             }
             LaunchStep::ConnectDialog => {
@@ -261,23 +261,34 @@ impl LaunchApp {
         }
     }
 
-    /// Validate the form; scaffold the project off the UI thread, or say
-    /// what's wrong on the form.
+    fn add_project_step(&mut self, step: add_project::Step) {
+        match step {
+            // Page 1's validation and the pickers' menus are the form's own.
+            add_project::Step::Continue | add_project::Step::Validate | add_project::Step::Menu(_) => {}
+            add_project::Step::Cancel => self.layer = None,
+            add_project::Step::Submit => self.submit_project(),
+        }
+    }
+
+    /// Validate the form; scaffold the project off the UI thread with the
+    /// agent defaults it chose, or say what's wrong on the form.
     fn submit_project(&mut self) {
         let Some(Layer::AddProject(form)) = self.layer.as_mut() else {
             return;
         };
         let mode = form.mode();
+        let defaults = form.defaults();
         match project_create::validate_add_project(form.name(), form.root(), &self.cwd) {
             Ok(resolved) => {
                 self.layer = None;
                 let (tx, rx) = std::sync::mpsc::channel();
                 let spawned = std::thread::Builder::new().name("shelbi-add-project".into()).spawn(move || {
                     let slug = resolved.name.clone();
-                    let created = project_create::scaffold_project(
+                    let created = project_create::scaffold_project_with(
                         &resolved,
                         mode,
                         &IssueTrackerConfig::default(),
+                        &defaults,
                         &mut project_create::NullReporter,
                     );
                     let _ = tx.send(created.map(|()| slug).map_err(|e| format!("Add project failed: {e}")));
@@ -323,7 +334,7 @@ impl LaunchApp {
         }
         match self.layer.as_mut() {
             Some(Layer::AddProject(form)) => {
-                let rect = overlay::centered_pct(area, 70, 60, 48, 14);
+                let rect = overlay::centered_pct(area, 70, 60, 60, 26);
                 f.render_widget(Clear, rect);
                 form.render(f, rect);
             }

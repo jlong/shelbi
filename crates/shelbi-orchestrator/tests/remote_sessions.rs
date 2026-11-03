@@ -438,7 +438,7 @@ fn serve_one_request(listener: &UnixListener) -> ClientMsg {
         ClientMsg::WriteState(r) => r.request_id,
         other => panic!("unexpected request {other:?}"),
     };
-    let done = ServerMsg::Done { request_id, state: None };
+    let done = ServerMsg::Done { request_id, state: None, id: None };
     stream.write_all(&control::encode(&done).unwrap()).unwrap();
     request
 }

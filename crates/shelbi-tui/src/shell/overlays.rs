@@ -60,6 +60,7 @@ pub enum OverlayEvent {
         name: String,
         root: String,
         mode: ConfigMode,
+        defaults: shelbi_core::AgentDefaults,
     },
     /// The Add-project form was cancelled.
     AddProjectCancel,
@@ -68,6 +69,9 @@ pub enum OverlayEvent {
     /// Contact Us sent this: the shell posts it off the UI thread and hands
     /// the answer back to the dialog.
     FeedbackSend(shelbi_app::feedback::Submission),
+    /// New task's Create Task: the shell runs the create off the UI thread
+    /// and hands the answer back to the dialog.
+    NewTaskCreate(shelbi_app::new_task::CreateRequest),
     /// About Shelbi's Acknowledgements link: the bundled software, in its
     /// place.
     OpenAcknowledgements,
@@ -103,6 +107,9 @@ pub enum ActiveOverlay {
     About(overlay::about::About),
     /// Contact Us (boxed: its draft is the largest of the overlays').
     Feedback(Box<overlay::feedback::FeedbackDialog>),
+    /// New task (the board's `n` and New issue chip, the palette's New
+    /// Issue).
+    NewTask(Box<overlay::new_task::NewTaskDialog>),
     /// The launch screen (the palette's "Show Launch Screen"), over the
     /// whole window.
     Launch(Box<crate::launch::LaunchScreen>),
@@ -217,6 +224,12 @@ impl ActiveOverlay {
         ActiveOverlay::Feedback(Box::new(overlay::feedback::FeedbackDialog::new(remembered, emoji)))
     }
 
+    /// Open New task for `project` over its loaded `workflows`, on
+    /// `default_workflow`.
+    pub fn new_task(project: &str, workflows: &[shelbi_core::Workflow], default_workflow: &str) -> Self {
+        ActiveOverlay::NewTask(Box::new(overlay::new_task::NewTaskDialog::new(project, workflows, default_workflow)))
+    }
+
     /// Open Connect to Remote Session, connecting through `remote` and
     /// remembering what connects in `recents`.
     pub fn connect_remote(
@@ -232,6 +245,7 @@ impl ActiveOverlay {
     pub fn paste(&mut self, text: &str) -> bool {
         match self {
             ActiveOverlay::Feedback(dialog) => dialog.paste(text),
+            ActiveOverlay::NewTask(dialog) => dialog.paste(text),
             ActiveOverlay::ConnectRemote(dialog) => dialog.paste(text),
             _ => false,
         }
@@ -312,17 +326,13 @@ impl ActiveOverlay {
                     },
                 }
             }
-            ActiveOverlay::AddProject { form } => match form.handle_key(ev) {
-                overlay::add_project::Step::Continue => OverlayEvent::Stay,
-                overlay::add_project::Step::Cancel => OverlayEvent::AddProjectCancel,
-                overlay::add_project::Step::Submit => OverlayEvent::AddProjectSubmit {
-                    name: form.name().to_string(),
-                    root: form.root().to_string(),
-                    mode: form.mode(),
-                },
-            },
+            ActiveOverlay::AddProject { form } => {
+                let step = form.handle_key(ev);
+                add_project_event(form, step)
+            }
             ActiveOverlay::About(about) => about_event(about.handle_key(ev)),
             ActiveOverlay::Feedback(dialog) => feedback_event(dialog.handle_key(ev)),
+            ActiveOverlay::NewTask(dialog) => new_task_event(dialog.handle_key(ev)),
             ActiveOverlay::Launch(screen) => OverlayEvent::Launch(screen.handle_key(ev)),
             ActiveOverlay::ConnectRemote(dialog) => connect_event(dialog.handle_key(ev)),
             ActiveOverlay::TaskDescription { scroll, .. } => {
@@ -360,24 +370,20 @@ impl ActiveOverlay {
         }
     }
 
-    /// Feed a mouse event. Only the clickable overlays (the review dialogs and
-    /// the error log's wheel) care; everything else is ignored so a stray click
+    /// Feed a mouse event. Only the clickable overlays (the palette, the
+    /// review dialogs and the error log's wheel) care; everything else is ignored so a stray click
     /// doesn't leak to the agent underneath.
     pub fn handle_mouse(&mut self, m: MouseEvent, area: Rect) -> OverlayEvent {
         let rect = self.rect(area);
         match self {
-            ActiveOverlay::Palette(p) => {
-                if m.kind == MouseEventKind::Down(MouseButton::Left) {
-                    match p.handle_click(rect, m.column, m.row) {
-                        overlay::palette::PaletteStep::Continue => OverlayEvent::Stay,
-                        overlay::palette::PaletteStep::Close => OverlayEvent::Close,
-                        overlay::palette::PaletteStep::FocusSidebar => OverlayEvent::FocusSidebar,
-                        overlay::palette::PaletteStep::Activate(e) => OverlayEvent::RunEntry(e),
-                    }
-                } else {
-                    OverlayEvent::Stay
-                }
-            }
+            // Clicks run results (or close it from outside the panel), the
+            // pointer hovers them, the wheel scrolls them.
+            ActiveOverlay::Palette(p) => match p.handle_mouse(rect, m) {
+                overlay::palette::PaletteStep::Continue => OverlayEvent::Stay,
+                overlay::palette::PaletteStep::Close => OverlayEvent::Close,
+                overlay::palette::PaletteStep::FocusSidebar => OverlayEvent::FocusSidebar,
+                overlay::palette::PaletteStep::Activate(e) => OverlayEvent::RunEntry(e),
+            },
             ActiveOverlay::ReviewConfirm { task_id, dialog } => {
                 if m.kind == MouseEventKind::Down(MouseButton::Left) {
                     match dialog.handle_click(rect, m.column, m.row) {
@@ -421,6 +427,14 @@ impl ActiveOverlay {
                     OverlayEvent::Stay
                 }
             }
+            ActiveOverlay::NewTask(dialog) => match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => new_task_event(dialog.handle_click(m.column, m.row)),
+                MouseEventKind::Moved => {
+                    dialog.handle_hover(m.column, m.row);
+                    OverlayEvent::Stay
+                }
+                _ => OverlayEvent::Stay,
+            },
             ActiveOverlay::TaskDescription { scroll, .. } => {
                 match m.kind {
                     MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(1),
@@ -428,6 +442,12 @@ impl ActiveOverlay {
                     _ => {}
                 }
                 OverlayEvent::Stay
+            }
+            // Clicks press its buttons, open its pickers and choose their
+            // rows, and pick a location.
+            ActiveOverlay::AddProject { form } => {
+                let step = form.handle_mouse(m);
+                add_project_event(form, step)
             }
             // Both track the pointer themselves (their rows light under it).
             ActiveOverlay::Launch(screen) => OverlayEvent::Launch(screen.handle_mouse(m)),
@@ -458,11 +478,12 @@ impl ActiveOverlay {
             // The form fills a generous share of the main area so long repo
             // paths and validation messages never truncate (the tmux dialog
             // filled the whole palette window for the same reason).
-            ActiveOverlay::AddProject { .. } => centered_pct(area, 70, 60, 48, 14),
+            ActiveOverlay::AddProject { .. } => centered_pct(area, 70, 60, 60, 26),
             // Sized to its content, and to the window when that's smaller.
             ActiveOverlay::About(about) => about.rect(area),
             // Centered and as tall as its content (the desktop's dialog).
             ActiveOverlay::Feedback(dialog) => dialog.rect(area),
+            ActiveOverlay::NewTask(dialog) => dialog.rect(area),
             ActiveOverlay::ConnectRemote(dialog) => dialog.rect(area),
             // The whole window, as the launch screen is the whole terminal.
             ActiveOverlay::Launch(_) => area,
@@ -478,6 +499,7 @@ impl ActiveOverlay {
     pub fn not_buttons(&self) -> Vec<Rect> {
         match self {
             ActiveOverlay::Feedback(dialog) => dialog.not_buttons(),
+            ActiveOverlay::NewTask(dialog) => dialog.not_buttons(),
             _ => Vec::new(),
         }
     }
@@ -509,6 +531,7 @@ impl ActiveOverlay {
             ActiveOverlay::AddProject { form } => form.render(f, rect),
             ActiveOverlay::About(about) => about.render(f.buffer_mut(), area),
             ActiveOverlay::Feedback(dialog) => dialog.render(f, rect),
+            ActiveOverlay::NewTask(dialog) => dialog.render(f, rect),
             ActiveOverlay::Launch(screen) => screen.render(f.buffer_mut(), rect),
             ActiveOverlay::ConnectRemote(dialog) => dialog.render(f, rect),
             ActiveOverlay::TaskDescription {
@@ -550,6 +573,22 @@ fn dialog_rows(dialog: &overlay::review_confirm::Dialog) -> usize {
     }
 }
 
+/// What a key or click on the add-project form means to the shell.
+fn add_project_event(form: &overlay::add_project::Form, step: overlay::add_project::Step) -> OverlayEvent {
+    use overlay::add_project::Step;
+    match step {
+        // Page 1's validation and the pickers' menus are the form's own.
+        Step::Continue | Step::Validate | Step::Menu(_) => OverlayEvent::Stay,
+        Step::Cancel => OverlayEvent::AddProjectCancel,
+        Step::Submit => OverlayEvent::AddProjectSubmit {
+            name: form.name().to_string(),
+            root: form.root().to_string(),
+            mode: form.mode(),
+            defaults: form.defaults(),
+        },
+    }
+}
+
 fn about_event(step: overlay::about::Step) -> OverlayEvent {
     match step {
         overlay::about::Step::Stay => OverlayEvent::Stay,
@@ -565,6 +604,14 @@ pub(super) fn connect_event(step: crate::launch::ConnectStep) -> OverlayEvent {
         crate::launch::ConnectStep::Stay => OverlayEvent::Stay,
         crate::launch::ConnectStep::Close => OverlayEvent::Close,
         crate::launch::ConnectStep::Connected(session) => OverlayEvent::RemoteConnected(session),
+    }
+}
+
+fn new_task_event(step: overlay::new_task::Step) -> OverlayEvent {
+    match step {
+        overlay::new_task::Step::Stay => OverlayEvent::Stay,
+        overlay::new_task::Step::Create(request) => OverlayEvent::NewTaskCreate(request),
+        overlay::new_task::Step::Close => OverlayEvent::Close,
     }
 }
 
@@ -654,6 +701,7 @@ mod tests {
             ActiveOverlay::add_project(Path::new("/tmp/alpha")),
             ActiveOverlay::about(true),
             ActiveOverlay::feedback(shelbi_app::feedback::Remembered::default(), true),
+            ActiveOverlay::new_task("alpha", &[shelbi_core::task_workflow()], "task"),
             ActiveOverlay::task_description(
                 sample_task(),
                 keymaps(),
@@ -821,6 +869,7 @@ mod tests {
             ActiveOverlay::AddProject { .. } => "add-project",
             ActiveOverlay::About(_) => "about",
             ActiveOverlay::Feedback(_) => "feedback",
+            ActiveOverlay::NewTask(_) => "new-task",
             ActiveOverlay::TaskDescription { .. } => "task-description",
             ActiveOverlay::ConnectRemote(_) => "connect-remote",
             ActiveOverlay::Launch(_) => "launch-screen",
@@ -833,7 +882,7 @@ mod tests {
     fn every_overlay_draws_the_shared_dialog_border() {
         let names: std::collections::BTreeSet<_> = every_overlay().iter().map(overlay_name).collect();
         // Every variant but the launch screen ([`launch_overlay`]).
-        assert_eq!(names.len(), 10, "every variant is in every_overlay(): {names:?}");
+        assert_eq!(names.len(), 11, "every variant is in every_overlay(): {names:?}");
         for (w, h) in [(100, 30), (60, 20), (120, 40)] {
             for mut ov in every_overlay() {
                 let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();

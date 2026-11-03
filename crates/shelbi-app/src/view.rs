@@ -1538,6 +1538,171 @@ impl ErrorLogModel {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Orchestrator onboarding
+// ---------------------------------------------------------------------------
+
+/// The Orchestrator view's onboarding, as a client draws it: the step, its
+/// pickers' choices, the instructions draft, and the error to show. Built by
+/// [`crate::onboarding::OnboardingState::model`]; the copy is in
+/// [`crate::onboarding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardingModel {
+    pub step: OnboardingStep,
+    /// The project's agents are still being read (step 2 and 3 wait).
+    pub loading: bool,
+    /// The harnesses Shelbi supports, in picker order.
+    pub harnesses: Vec<HarnessOption>,
+    /// The selected harness's models, after "Use runner default". Empty for a
+    /// runner that takes none.
+    pub models: Vec<ModelOption>,
+    /// What the Default model picker shows.
+    pub model_label: String,
+    /// The Default model picker can be used (the runner takes a model).
+    pub model_enabled: bool,
+    /// A note under Default model in place of its helper: why it's disabled,
+    /// or that the project's settings set the model over it.
+    pub model_note: Option<String>,
+    /// The orchestrator instructions draft (step 3's editor).
+    pub instructions: String,
+    /// The error the current step shows above its buttons.
+    pub error: Option<String>,
+    /// A save is running: the step's buttons wait.
+    pub busy: bool,
+}
+
+/// Which onboarding step shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnboardingStep {
+    /// "Your project’s orchestrator" with Get started.
+    Intro,
+    /// "Choose your Orchestrator": Harness and Default model.
+    Harness,
+    /// "Make it yours": the orchestrator instructions.
+    Instructions,
+}
+
+/// One Harness choice: the runner, its label, the provider shown beside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessOption {
+    pub kind: shelbi_core::RunnerKind,
+    pub label: String,
+    pub provider: Option<String>,
+    pub selected: bool,
+}
+
+/// One Default model choice (`model: None` is "Use runner default").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOption {
+    pub model: Option<String>,
+    pub label: String,
+    pub selected: bool,
+}
+
+/// The New task dialog, as a client draws it: the draft, each picker's
+/// value and rows, the switch, where the keyboard is, the open picker, and
+/// the create's state. Built by [`crate::new_task::NewTaskForm::model`]; the
+/// copy is in [`crate::new_task`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTaskModel {
+    pub title: String,
+    /// The Workflow picker's value (`Task`) and its rows.
+    pub workflow: String,
+    pub workflows: Vec<NewTaskOption>,
+    /// The Status picker's value, its glyph's category, and its rows (the
+    /// chosen workflow's statuses).
+    pub status: String,
+    pub status_category: StatusCategory,
+    pub statuses: Vec<NewTaskOption>,
+    /// The Priority picker's value (`End of queue`) and its rows.
+    pub priority: String,
+    pub priorities: Vec<NewTaskOption>,
+    /// The Markdown body.
+    pub description: String,
+    /// "Let Orchestrator write this up" is on.
+    pub write_up: bool,
+    pub focus: NewTaskField,
+    /// The open picker and its keyboard row.
+    pub menu: Option<(NewTaskMenu, usize)>,
+    /// Create Task is enabled (a title, nothing out).
+    pub can_create: bool,
+    /// The create is out: Create Task reads "Creating…", nothing else acts.
+    pub creating: bool,
+    /// A failed create, shown over the footer.
+    pub error: Option<String>,
+}
+
+/// One row of a New task picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewTaskOption {
+    pub label: String,
+    /// A status row's category (its glyph); `None` for the other pickers.
+    pub category: Option<StatusCategory>,
+    pub selected: bool,
+}
+
+/// A New task control the keyboard can be on, in visual (and Tab) order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewTaskField {
+    Title,
+    Workflow,
+    Status,
+    Priority,
+    Description,
+    WriteUp,
+    Cancel,
+    Create,
+}
+
+impl NewTaskField {
+    /// Tab order.
+    pub const ALL: [NewTaskField; 8] = [
+        NewTaskField::Title,
+        NewTaskField::Workflow,
+        NewTaskField::Status,
+        NewTaskField::Priority,
+        NewTaskField::Description,
+        NewTaskField::WriteUp,
+        NewTaskField::Cancel,
+        NewTaskField::Create,
+    ];
+
+    /// Whether it's a text field (which takes typing, Space and the
+    /// arrows).
+    pub fn is_text(self) -> bool {
+        matches!(self, NewTaskField::Title | NewTaskField::Description)
+    }
+}
+
+/// A New task picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewTaskMenu {
+    Workflow,
+    Status,
+    Priority,
+}
+
+impl NewTaskMenu {
+    /// The field the picker belongs to.
+    pub fn field(self) -> NewTaskField {
+        match self {
+            NewTaskMenu::Workflow => NewTaskField::Workflow,
+            NewTaskMenu::Status => NewTaskField::Status,
+            NewTaskMenu::Priority => NewTaskField::Priority,
+        }
+    }
+
+    /// The picker a field opens, if it's a picker.
+    pub fn of(field: NewTaskField) -> Option<NewTaskMenu> {
+        match field {
+            NewTaskField::Workflow => Some(NewTaskMenu::Workflow),
+            NewTaskField::Status => Some(NewTaskMenu::Status),
+            NewTaskField::Priority => Some(NewTaskMenu::Priority),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

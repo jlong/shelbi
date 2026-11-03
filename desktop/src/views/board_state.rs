@@ -80,8 +80,6 @@ pub enum Mode {
     WorkflowDropdown { cursor: usize },
     /// Pick the workspace to assign `id` to.
     AssignPicker { id: String, cursor: usize },
-    /// The new-issue title prompt (its text input owns the keys).
-    AddPrompt,
 }
 
 /// Something the view must do. The board never performs IO itself.
@@ -111,8 +109,6 @@ pub enum Intent {
     Save(SaveJob),
     /// Open `id`'s body in the user's configured editor.
     OpenInEditor(String),
-    /// Show the new-issue title prompt.
-    BeginAdd,
     /// Put the keyboard in the toolbar's search field (`/`).
     FocusSearch,
     /// The search was cleared from the board (Esc): empty the field to match.
@@ -1249,13 +1245,6 @@ impl BoardState {
             Mode::WorkspaceDropdown { cursor } => Some(self.workspace_dropdown_key(cursor, chord)),
             Mode::WorkflowDropdown { cursor } => Some(self.workflow_dropdown_key(cursor, chord)),
             Mode::AssignPicker { id, cursor } => Some(self.assign_key(&id, cursor, chord)),
-            Mode::AddPrompt => {
-                if chord.code == Key::Esc {
-                    self.mode = self.rest();
-                    return Some(Vec::new());
-                }
-                None
-            }
         }
     }
 
@@ -1528,9 +1517,16 @@ impl BoardState {
         Vec::new()
     }
 
+    /// New issue (`n`, the toolbar's): the window's New task dialog, over
+    /// the board.
     pub fn begin_add(&mut self) -> Vec<Intent> {
-        self.mode = Mode::AddPrompt;
-        vec![Intent::BeginAdd]
+        vec![Intent::Command(CommandKind::NewIssue)]
+    }
+
+    /// The workflows New task offers and the project's default among them,
+    /// from the board's read.
+    pub fn new_task_workflows(&self) -> (Vec<shelbi_core::Workflow>, String) {
+        (self.input.workflows.clone(), self.input.default_workflow_name.clone())
     }
 
     /// Edit `id`'s body (`e`, More > Edit description, the palette's Edit):
@@ -1727,17 +1723,6 @@ impl BoardState {
             .collect()
     }
 
-    pub fn submit_add(&mut self, title: &str) -> Vec<Intent> {
-        self.mode = self.rest();
-        let title = title.trim();
-        if title.is_empty() {
-            return Vec::new();
-        }
-        vec![Intent::Command(CommandKind::AddIssue {
-            title: title.to_string(),
-        })]
-    }
-
     fn load_more(&mut self) -> Vec<Intent> {
         if self.model.has_more_done {
             vec![Intent::LoadMore]
@@ -1787,7 +1772,7 @@ impl BoardState {
             CommandKind::SetIssueWorkflow { id, workflow } => {
                 (id.clone(), format!("Moving to the {workflow} workflow…"), None, None)
             }
-            CommandKind::AddIssue { title } => {
+            CommandKind::AddIssue { title, .. } => {
                 if self.pending.contains_key(ADD_KEY) {
                     self.status = Some("an issue is already being added".into());
                     return Err(Vec::new());
@@ -2965,19 +2950,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn add_prompt_submits_add_issue_and_e_shift_opens_the_editor() {
+    fn n_opens_new_task_an_add_has_no_prior_state_and_e_shift_opens_the_editor() {
         let mut b = board(vec![issue("A", "todo")]);
-        assert_eq!(press(&mut b, "n"), vec![Intent::BeginAdd]);
-        assert_eq!(b.mode, Mode::AddPrompt);
-        assert_eq!(
-            b.submit_add("  Write docs "),
-            vec![Intent::Command(CommandKind::AddIssue {
-                title: "Write docs".into()
-            })]
-        );
+        assert_eq!(press(&mut b, "n"), vec![Intent::Command(CommandKind::NewIssue)], "`n` opens New task");
+        assert_eq!(b.mode, Mode::Board, "the board keeps its keys under the dialog");
         let job = b
             .begin_mutation(&CommandKind::AddIssue {
                 title: "Write docs".into(),
+                body: None,
+                workflow: None,
+                status: None,
+                top: false,
             })
             .unwrap();
         assert_eq!(job.expected, None, "an add has no prior state");

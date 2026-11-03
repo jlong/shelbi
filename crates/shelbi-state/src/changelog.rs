@@ -45,7 +45,12 @@
 //! A new entry's description is the project's `changelog-template.md` (in the
 //! config half, beside `pr-template.md`) filled with [`fill_template`]. The file
 //! is user-owned: it ships with every new project and is materialized for older
-//! ones on boot, never overwritten.
+//! ones on boot, never overwritten, except that a copy still byte-identical to
+//! an earlier shipped default ([`PRIOR_CHANGELOG_TEMPLATES`]) is upgraded. The
+//! default is the description alone: the links live in the frontmatter, which
+//! the clients draw as chips. `{{links}}` still fills for a template that
+//! wants the list, and [`strip_link_list`] removes one that only repeats the
+//! frontmatter from an older entry.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -69,6 +74,19 @@ pub const CHANGELOG_TEMPLATE_FILE: &str = "changelog-template.md";
 
 /// The shipped `changelog-template.md`.
 pub const DEFAULT_CHANGELOG_TEMPLATE: &str = include_str!("default_changelog_template.md.template");
+
+/// Earlier shipped `changelog-template.md`s, oldest first. The first ended
+/// every entry with `{{links}}`, a list repeating the links the Changelog page
+/// already draws as chips. A project whose template is still byte-identical to
+/// one of these never chose its layout, so the config-upgrade pass moves it to
+/// [`DEFAULT_CHANGELOG_TEMPLATE`]; an edited one is the project's own.
+pub const PRIOR_CHANGELOG_TEMPLATES: &[&str] =
+    &[include_str!("changelog/prior_default_template_v1.md")];
+
+/// Whether `text` is a [`PRIOR_CHANGELOG_TEMPLATES`] entry, byte for byte.
+pub fn is_prior_default_changelog_template(text: &str) -> bool {
+    PRIOR_CHANGELOG_TEMPLATES.contains(&text)
+}
 
 /// The author an entry gets when none is named.
 pub const DEFAULT_AUTHOR: &str = "user";
@@ -388,6 +406,14 @@ impl ChangelogEntry {
     /// Every link on the entry: the frontmatter's first, then the ones written
     /// in the description, de-duplicated, PR numbers resolved against `repo`.
     pub fn links(&self, repo: Option<&str>) -> Vec<Link> {
+        let mut links = self.front_links(repo);
+        links.extend(parse_body_links(&self.body, repo));
+        dedup(links)
+    }
+
+    /// The frontmatter's links alone (`issues:`, `prs:`, `links:`): the ones
+    /// the clients draw as chips whatever the description says.
+    pub fn front_links(&self, repo: Option<&str>) -> Vec<Link> {
         let mut links: Vec<Link> = self
             .issues
             .iter()
@@ -400,7 +426,6 @@ impl ChangelogEntry {
                 .map(|p| p.to_link(repo)),
         );
         links.extend(self.urls.iter().map(|u| url_link(u)));
-        links.extend(parse_body_links(&self.body, repo));
         dedup(links)
     }
 
@@ -585,12 +610,29 @@ pub fn add_entry_in(
         ));
     }
     let date = new.date.with_nanosecond(0).unwrap_or(new.date);
-    let flag_links: Vec<Link> = new
+    // Each link once: a `--link` naming a `--pr`'s URL (or a repeated flag)
+    // would otherwise be stored twice and draw two chips for one PR.
+    let mut seen = HashSet::new();
+    let issues: Vec<String> = new
         .issues
+        .into_iter()
+        .filter(|id| seen.insert(Link::Issue { id: id.clone() }.key()))
+        .collect();
+    let prs: Vec<PrRef> = new
+        .prs
+        .into_iter()
+        .filter(|p| seen.insert(p.to_link(repo).key()))
+        .collect();
+    let urls: Vec<String> = new
+        .urls
+        .into_iter()
+        .filter(|u| seen.insert(url_link(u).key()))
+        .collect();
+    let flag_links: Vec<Link> = issues
         .iter()
         .map(|id| Link::Issue { id: id.clone() })
-        .chain(new.prs.iter().map(|p| p.to_link(repo)))
-        .chain(new.urls.iter().map(|u| url_link(u)))
+        .chain(prs.iter().map(|p| p.to_link(repo)))
+        .chain(urls.iter().map(|u| url_link(u)))
         .collect();
     let body = fill_template(
         template,
@@ -606,14 +648,73 @@ pub fn add_entry_in(
         title,
         date: date.to_rfc3339(),
         author,
-        issues: new.issues,
-        prs: new.prs,
-        links: new.urls,
+        issues,
+        prs,
+        links: urls,
     };
     let text = crate::render_frontmatter(&front, &body)?;
     let path = write_new_file(dir, &file_stem(date, &front.title), &text)?;
     let id = entry_id(&path).unwrap_or_default();
     parse_entry(&id, &path, &text)
+}
+
+// ---------------------------------------------------------------------------
+// Redundant link lists
+
+/// `body` without the trailing list of links the template's `{{links}}` used
+/// to end every entry with, when that list only repeats `front` (the entry's
+/// frontmatter links, which the clients already draw as chips). `None` when
+/// there is no such list: no trailing list, an item that isn't exactly one
+/// link, a link the frontmatter doesn't have, or a list right under a line of
+/// prose (the prose's own list, not the template's).
+pub fn body_without_link_list(body: &str, front: &[Link], repo: Option<&str>) -> Option<String> {
+    let front: HashSet<String> = front.iter().map(Link::key).collect();
+    let lines: Vec<&str> = body.trim_end().lines().collect();
+    let mut start = lines.len();
+    while start > 0 {
+        let Some(item) = lines[start - 1].trim().strip_prefix("- ") else {
+            break;
+        };
+        let item = item.trim();
+        let parsed = parse_body_links(item, repo);
+        let [link] = parsed.as_slice() else {
+            return None;
+        };
+        let exact = link.label() == item || link.url() == Some(item);
+        if !exact || !front.contains(&link.key()) {
+            return None;
+        }
+        start -= 1;
+    }
+    if start == lines.len() {
+        return None;
+    }
+    if start > 0 && !lines[start - 1].trim().is_empty() {
+        return None;
+    }
+    Some(lines[..start].join("\n").trim_end().to_string())
+}
+
+/// Rewrite `entry`'s file without its redundant trailing link list
+/// ([`body_without_link_list`]), leaving the frontmatter byte-for-byte.
+/// Returns whether the file changed; with `dry_run` it reports without
+/// writing.
+pub fn strip_link_list(entry: &ChangelogEntry, repo: Option<&str>, dry_run: bool) -> Result<bool> {
+    let text = fs::read_to_string(&entry.path).map_err(|e| crate::annotate_io_error(&entry.path, e))?;
+    let (_, body) = crate::split_frontmatter(&text)
+        .ok_or_else(|| Error::Other(format!("{}: missing frontmatter", entry.path.display())))?;
+    let Some(stripped) = body_without_link_list(body, &entry.front_links(repo), repo) else {
+        return Ok(false);
+    };
+    if !dry_run {
+        let mut out = text[..text.len() - body.len()].to_string();
+        out.push_str(&stripped);
+        if !stripped.is_empty() {
+            out.push('\n');
+        }
+        atomic_write(&entry.path, out.as_bytes())?;
+    }
+    Ok(true)
 }
 
 /// `<YYYY-MM-DD>-<HHMMSS>-<slug>` from the UTC date, so names sort by date.

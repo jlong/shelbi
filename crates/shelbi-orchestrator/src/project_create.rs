@@ -35,7 +35,7 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
-use shelbi_core::{ConfigMode, IssueTrackerConfig};
+use shelbi_core::{AgentDefaults, ConfigMode, IssueTrackerConfig, RunnerKind};
 use shelbi_state::AgentMaterializeOutcome;
 
 /// Filename of the committed, in-repo project config, written under
@@ -372,22 +372,40 @@ pub enum Attempt {
 
 /// Run a `Mutation::AddProject`: validate the form's values (resolving the
 /// repo path against `cwd`), then scaffold the project with a `file_system`
-/// board, the way the TUI's form does, reporting progress to `out`. Returns
+/// board and the agent defaults the flow chose ([`scaffold_project_with`]),
+/// reporting progress to `out`. Returns
 /// the new project's slug. Blocking (file IO and git); run it off the UI
 /// thread.
 pub fn add_project(
     name: &str,
     root: &str,
     mode: ConfigMode,
+    defaults: &AgentDefaults,
     cwd: &Path,
     attempt: Attempt,
     out: &mut dyn ScaffoldReporter,
 ) -> std::result::Result<String, AddProjectError> {
+    check_agent_defaults(defaults).map_err(|e| AddProjectError::Invalid(e.to_string()))?;
     let retry = (attempt == Attempt::Retry).then_some(mode);
     let resolved = validate_request(name, root, cwd, retry).map_err(AddProjectError::Invalid)?;
-    scaffold_project(&resolved, mode, &IssueTrackerConfig::default(), out)
+    scaffold_project_with(&resolved, mode, &IssueTrackerConfig::default(), defaults, out)
         .map_err(|e| AddProjectError::Failed(format!("Add project failed: {e}")))?;
     Ok(resolved.name)
+}
+
+/// Whether a new project can be created with `defaults`: a generic runner
+/// has no command Shelbi could scaffold, so a new project (which declares
+/// only Claude Code and Codex) can't default to one. The same refusal the
+/// orchestrator onboarding gives an undeclared generic runner.
+pub fn check_agent_defaults(
+    defaults: &AgentDefaults,
+) -> std::result::Result<(), shelbi_state::orchestrator_setup::RunnerSetupError> {
+    match defaults.runner {
+        RunnerKind::Generic => {
+            Err(shelbi_state::orchestrator_setup::RunnerSetupError::NotDeclared(RunnerKind::Generic))
+        }
+        RunnerKind::Claude | RunnerKind::Codex => Ok(()),
+    }
 }
 
 /// Validate the "Add project" form (a name + a repo path, resolved against
@@ -526,6 +544,12 @@ struct ProjectYaml<'a> {
     default_workflow: Option<&'a str>,
     machines: Vec<MachineYaml<'a>>,
     orchestrator: OrchestratorYaml<'a>,
+    /// The runner fleet's house model, written only when the new-project
+    /// flow chose a model ([`AgentDefaults::model`]). Before `workspaces:`
+    /// so the decorator's workspace and runner hints still land where they
+    /// belong.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    runners: BTreeMap<&'a str, FleetRunnerYaml<'a>>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     workspaces: Vec<WorkspaceYaml<'a>>,
     agent_runners: BTreeMap<&'a str, RunnerYaml<'a>>,
@@ -560,9 +584,19 @@ struct RunnerYaml<'a> {
     flags: Vec<&'a str>,
 }
 
+/// A `runners.<kind>` fleet entry: the launcher (the same command as its
+/// `agent_runners` entry) and the model every agent of that kind runs.
+#[derive(serde::Serialize)]
+struct FleetRunnerYaml<'a> {
+    command: &'a str,
+    model: &'a str,
+}
+
 /// Render the starter project YAML via serde (never string interpolation).
 /// Validates `name` first so a value that can't round-trip through the
-/// filesystem path or YAML can never reach disk.
+/// filesystem path or YAML can never reach disk. The stock agent defaults
+/// (Claude Code on its default model); [`render_project_yaml_with`] takes
+/// the new-project flow's.
 pub fn render_project_yaml(
     name: &str,
     display_name: Option<&str>,
@@ -571,7 +605,27 @@ pub fn render_project_yaml(
     config_mode: Option<&str>,
     issue_tracker: &IssueTrackerConfig,
 ) -> Result<String> {
+    render_project_yaml_with(name, display_name, repo, work_dir, config_mode, issue_tracker, &AgentDefaults::default())
+}
+
+/// [`render_project_yaml`] with the agents' default runner and model:
+/// `orchestrator.runner` names the chosen kind's `agent_runners` entry (the
+/// project's baseline runner), and a chosen model is the fleet's house model
+/// (`runners.<kind>.model`). The stock defaults render exactly what
+/// [`render_project_yaml`] always has. A generic runner has no entry to name
+/// ([`check_agent_defaults`]).
+pub fn render_project_yaml_with(
+    name: &str,
+    display_name: Option<&str>,
+    repo: &str,
+    work_dir: &Path,
+    config_mode: Option<&str>,
+    issue_tracker: &IssueTrackerConfig,
+    defaults: &AgentDefaults,
+) -> Result<String> {
     validate_project_name(name)?;
+    check_agent_defaults(defaults).map_err(|e| anyhow!(e))?;
+    let runner = defaults.runner.as_str();
     let work_dir = work_dir.to_string_lossy();
     let mut agent_runners = BTreeMap::new();
     agent_runners.insert(
@@ -599,7 +653,13 @@ pub fn render_project_yaml(
             kind: "local",
             work_dir: &work_dir,
         }],
-        orchestrator: OrchestratorYaml { runner: "claude" },
+        orchestrator: OrchestratorYaml { runner },
+        runners: defaults
+            .model
+            .as_deref()
+            .map(|model| (runner, FleetRunnerYaml { command: runner, model }))
+            .into_iter()
+            .collect(),
         workspaces: vec![
             WorkspaceYaml {
                 name: "dev",
@@ -631,7 +691,21 @@ pub fn render_split_project_yaml(
     work_dir: &Path,
     issue_tracker: &IssueTrackerConfig,
 ) -> Result<(String, String)> {
-    let flat = render_project_yaml(name, None, repo, work_dir, Some("in-repo"), issue_tracker)?;
+    render_split_project_yaml_with(name, display_name, repo, work_dir, issue_tracker, &AgentDefaults::default())
+}
+
+/// [`render_split_project_yaml`] with the agents' default runner and model
+/// ([`render_project_yaml_with`]); both land in the committed half.
+pub fn render_split_project_yaml_with(
+    name: &str,
+    display_name: Option<&str>,
+    repo: &str,
+    work_dir: &Path,
+    issue_tracker: &IssueTrackerConfig,
+    defaults: &AgentDefaults,
+) -> Result<(String, String)> {
+    let flat =
+        render_project_yaml_with(name, None, repo, work_dir, Some("in-repo"), issue_tracker, defaults)?;
     let mut project = shelbi_core::Project::from_yaml_str(&flat).map_err(|e| anyhow!(e))?;
     // The id lives in the filename/registry dir, never a YAML key, but the
     // committed file's `name:` is pick-up's anchor — force it to the id.
@@ -863,15 +937,37 @@ pub fn scaffold_project(
     issue_tracker: &IssueTrackerConfig,
     out: &mut dyn ScaffoldReporter,
 ) -> Result<()> {
+    scaffold_project_with(resolved, mode, issue_tracker, &AgentDefaults::default(), out)
+}
+
+/// [`scaffold_project`] with the agents' default runner and model, as the
+/// new-project flow's Agent defaults step chose them: the project YAML gets
+/// them ([`render_project_yaml_with`]), and for a runner other than Claude
+/// Code the shipped agents this scaffold writes recommend it
+/// ([`shelbi_state::recommend_runner_for_new_agents`], which leaves any
+/// `agent.yaml` that isn't the shipped text alone). The stock defaults
+/// scaffold exactly what [`scaffold_project`] always has.
+pub fn scaffold_project_with(
+    resolved: &ResolvedProjectRoot,
+    mode: ConfigMode,
+    issue_tracker: &IssueTrackerConfig,
+    defaults: &AgentDefaults,
+    out: &mut dyn ScaffoldReporter,
+) -> Result<()> {
+    check_agent_defaults(defaults).map_err(|e| anyhow!(e))?;
     // Held from the collision check through the last write.
     let _scaffold_lock = run_stage(out, ScaffoldStage::Config, |out| {
-        scaffold_config(resolved, mode, issue_tracker, out)
+        scaffold_config(resolved, mode, issue_tracker, defaults, out)
     })?;
     run_stage(out, ScaffoldStage::Agents, |out| {
         let outcomes =
             shelbi_state::self_heal_default_agents(&resolved.name).map_err(|e| anyhow!(e))?;
         for outcome in outcomes {
             out.note(&render_agent_materialize_outcome(&outcome));
+        }
+        if defaults.runner != RunnerKind::Claude {
+            shelbi_state::recommend_runner_for_new_agents(&resolved.name, defaults.runner)
+                .map_err(|e| anyhow!(e))?;
         }
         Ok(())
     })?;
@@ -905,6 +1001,7 @@ fn scaffold_config(
     resolved: &ResolvedProjectRoot,
     mode: ConfigMode,
     issue_tracker: &IssueTrackerConfig,
+    defaults: &AgentDefaults,
     out: &mut dyn ScaffoldReporter,
 ) -> Result<shelbi_state::ProjectScaffoldLock> {
     let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
@@ -928,12 +1025,13 @@ fn scaffold_config(
     }
 
     let in_repo_split = if mode == ConfigMode::InRepo {
-        Some(render_split_project_yaml(
+        Some(render_split_project_yaml_with(
             &resolved.name,
             resolved.display_name.as_deref(),
             &resolved.path.to_string_lossy(),
             &resolved.path,
             issue_tracker,
+            defaults,
         )?)
     } else {
         None
@@ -968,13 +1066,14 @@ fn scaffold_config(
                 }
             }
             ConfigMode::Global => {
-                let yaml = render_project_yaml(
+                let yaml = render_project_yaml_with(
                     &resolved.name,
                     resolved.display_name.as_deref(),
                     "",
                     &resolved.path,
                     None,
                     issue_tracker,
+                    defaults,
                 )?;
                 if write_new_project_registration(&resolved.name, &yaml_path, &yaml)? {
                     out.note(&format!("✓ wrote project: {}", yaml_path.display()));
@@ -1179,20 +1278,20 @@ mod tests {
 
         // Bad input stays on the form; nothing is written.
         assert_eq!(
-            add_project("", "web", ConfigMode::Global, &home, Attempt::New, &mut NullReporter),
+            add_project("", "web", ConfigMode::Global, &AgentDefaults::default(), &home, Attempt::New, &mut NullReporter),
             Err(AddProjectError::Invalid("Enter a project name.".into()))
         );
         assert!(!home.join("projects/web.yaml").exists());
 
         // Good input scaffolds and names the new project.
         assert_eq!(
-            add_project("Web", "web", ConfigMode::Global, &home, Attempt::New, &mut NullReporter),
+            add_project("Web", "web", ConfigMode::Global, &AgentDefaults::default(), &home, Attempt::New, &mut NullReporter),
             Ok("web".to_string())
         );
         assert!(home.join("projects/web.yaml").exists());
         // The second time the name is taken.
         assert!(matches!(
-            add_project("web", "web", ConfigMode::Global, &home, Attempt::New, &mut NullReporter),
+            add_project("web", "web", ConfigMode::Global, &AgentDefaults::default(), &home, Attempt::New, &mut NullReporter),
             Err(AddProjectError::Invalid(msg)) if msg.contains("already")
         ));
 
@@ -1265,10 +1364,188 @@ mod tests {
 
         let c = check_folder(&home, &wt.display().to_string(), None);
         let (name, root) = (c.name.unwrap(), c.path.display().to_string());
-        assert_eq!(add_project(&name, &root, ConfigMode::InRepo, &home, Attempt::New, &mut NullReporter), Ok("alpha-wt".to_string()));
+        assert_eq!(add_project(&name, &root, ConfigMode::InRepo, &AgentDefaults::default(), &home, Attempt::New, &mut NullReporter), Ok("alpha-wt".to_string()));
         assert!(wt.join(IN_REPO_CONFIG_REL).is_file());
         assert!(shelbi_state::has_project_registration("alpha-wt").unwrap());
 
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Every file a created project has, by path relative to `home` (and
+    /// `repo`, under `repo/`), with its text.
+    fn project_files(home: &Path, repo: &Path) -> std::collections::BTreeMap<String, String> {
+        fn walk(root: &Path, dir: &Path, tag: &str, out: &mut std::collections::BTreeMap<String, String>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, tag, out);
+                } else if let Ok(text) = std::fs::read_to_string(&path) {
+                    let rel = path.strip_prefix(root).unwrap().display().to_string();
+                    out.insert(format!("{tag}{rel}"), text);
+                }
+            }
+        }
+        let mut out = std::collections::BTreeMap::new();
+        walk(home, &home.join("projects"), "", &mut out);
+        if repo.join(".shelbi").is_dir() {
+            walk(repo, &repo.join(".shelbi"), "repo/", &mut out);
+        }
+        out
+    }
+
+    /// `files` with `home` (as given and as macOS resolves it) written `<home>`.
+    fn normalized(
+        files: std::collections::BTreeMap<String, String>,
+        home: &Path,
+    ) -> std::collections::BTreeMap<String, String> {
+        let real = home.canonicalize().unwrap().display().to_string();
+        let given = home.display().to_string();
+        files.into_iter().map(|(k, v)| (k, v.replace(&real, "<home>").replace(&given, "<home>"))).collect()
+    }
+
+    /// Create `acme` in a fresh home with `defaults` (in `mode`): the home,
+    /// the repo, and the loaded project.
+    fn create_with(mode: ConfigMode, defaults: &AgentDefaults) -> (PathBuf, PathBuf, shelbi_core::Project) {
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let repo = home.join("acme");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let slug = add_project("acme", "acme", mode, defaults, &home, Attempt::New, &mut NullReporter).unwrap();
+        let project = shelbi_state::load_project(&slug).unwrap();
+        (home, repo, project)
+    }
+
+    fn manifest(home: &Path, agent: &str) -> String {
+        std::fs::read_to_string(home.join(format!("projects/acme/agents/{agent}/agent.yaml"))).unwrap()
+    }
+
+    #[test]
+    fn claude_on_its_default_model_creates_exactly_todays_project() {
+        let _g = lock_env();
+        for mode in [ConfigMode::Global, ConfigMode::InRepo] {
+            // Today's path: the scaffold `shelbi init` runs, no defaults.
+            let home = fresh_home();
+            std::env::set_var("SHELBI_HOME", &home);
+            let repo = home.join("acme");
+            std::fs::create_dir_all(repo.join(".git")).unwrap();
+            let resolved = validate_add_project("acme", "acme", &home).unwrap();
+            scaffold_project(&resolved, mode, &IssueTrackerConfig::default(), &mut NullReporter).unwrap();
+            let today = normalized(project_files(&home, &repo), &home);
+
+            let (home2, repo2, project) = create_with(mode, &AgentDefaults::default());
+            let chosen = normalized(project_files(&home2, &repo2), &home2);
+            // `state.json` and the Welcome task carry the time they were
+            // written; everything else is byte-identical.
+            let strip = |m: &std::collections::BTreeMap<String, String>| {
+                m.iter()
+                    .filter(|(k, _)| !k.ends_with("state.json"))
+                    .map(|(k, v)| {
+                        let v: Vec<&str> = v.lines().filter(|l| !l.starts_with("created_at: ") && !l.starts_with("updated_at: ")).collect();
+                        (k.clone(), v.join("\n"))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(strip(&chosen), strip(&today), "{mode:?}");
+            assert_eq!(project.orchestrator.runner, "claude");
+            assert!(project.runners.is_empty());
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn the_default_runner_becomes_the_orchestrators_runner() {
+        let _g = lock_env();
+        for mode in [ConfigMode::Global, ConfigMode::InRepo] {
+            let codex = AgentDefaults { runner: RunnerKind::Codex, model: None };
+            let (_home, _repo, project) = create_with(mode, &codex);
+            assert_eq!(project.orchestrator.runner, "codex", "{mode:?}");
+            assert_eq!(project.default_runner_spec().map(|r| r.command.as_str()), Some("codex"));
+            assert!(project.runners.is_empty(), "the runner's default model writes no fleet entry");
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_chosen_model_is_the_fleets_house_model() {
+        let _g = lock_env();
+        for mode in [ConfigMode::Global, ConfigMode::InRepo] {
+            let chosen = AgentDefaults { runner: RunnerKind::Codex, model: Some("gpt-5-codex".into()) };
+            let (home, repo, project) = create_with(mode, &chosen);
+            let fleet = project.runners.get(&RunnerKind::Codex).expect("runners.codex");
+            assert_eq!(fleet.model.as_deref(), Some("gpt-5-codex"), "{mode:?}");
+            assert_eq!(fleet.spec.command, "codex");
+            assert_eq!(project.runners.len(), 1);
+            // The orchestrator launches on it, and the agents config reads it.
+            assert_eq!(shelbi_core::orchestrator_model(&project, None).as_deref(), Some("gpt-5-codex"));
+            let config = shelbi_state::agents_config::AgentsConfig::load("acme").unwrap();
+            assert_eq!(config.project_model(RunnerKind::Codex), Some("gpt-5-codex"));
+            // In-repo, it's committed with the rest of the shared settings.
+            if mode == ConfigMode::InRepo {
+                let shared = std::fs::read_to_string(repo.join(IN_REPO_CONFIG_REL)).unwrap();
+                assert!(shared.contains("gpt-5-codex"), "{shared}");
+            } else {
+                let yaml = std::fs::read_to_string(home.join("projects/acme.yaml")).unwrap();
+                assert!(yaml.contains("runners:\n  codex:\n    command: codex\n    model: gpt-5-codex\n"), "{yaml}");
+            }
+
+            // Claude with a model: the same, on its own kind.
+            let claude = AgentDefaults { runner: RunnerKind::Claude, model: Some("opus".into()) };
+            let (_h, _r, project) = create_with(mode, &claude);
+            assert_eq!(project.orchestrator.runner, "claude");
+            assert_eq!(project.runners.get(&RunnerKind::Claude).and_then(|r| r.model.as_deref()), Some("opus"));
+        }
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_non_claude_default_is_every_shipped_agents_recommendation() {
+        let _g = lock_env();
+        let codex = AgentDefaults { runner: RunnerKind::Codex, model: None };
+        let (home, _repo, project) = create_with(ConfigMode::Global, &codex);
+        for agent in shelbi_state::DEFAULT_AGENTS {
+            let text = manifest(&home, agent.name);
+            assert!(text.contains("\npreferred_runner: codex\n"), "{}: {text}", agent.name);
+            assert!(!text.contains("preferred_runner: claude"), "{}", agent.name);
+            // So an agent the project doesn't pin launches on it.
+            let parsed = shelbi_core::AgentManifest::from_yaml_str(&text).unwrap();
+            let launch = shelbi_core::resolve_agent_launch(&project, agent.name, Some(&parsed), None);
+            assert_eq!(launch.kind, RunnerKind::Codex, "{}", agent.name);
+        }
+
+        // An `agent.yaml` that isn't the shipped text is never rewritten.
+        let path = home.join("projects/acme/agents/developer/agent.yaml");
+        std::fs::write(&path, "name: developer\npreferred_runner: claude\n").unwrap();
+        assert_eq!(shelbi_state::recommend_runner_for_new_agents("acme", RunnerKind::Codex).unwrap(), Vec::<String>::new());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "name: developer\npreferred_runner: claude\n");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn the_orchestrator_onboarding_starts_on_the_chosen_defaults() {
+        let _g = lock_env();
+        let chosen = AgentDefaults { runner: RunnerKind::Codex, model: Some("gpt-5-codex".into()) };
+        let (_home, _repo, _project) = create_with(ConfigMode::Global, &chosen);
+        let mut onboarding = shelbi_app::onboarding::OnboardingState::new("acme");
+        onboarding.loaded(shelbi_app::onboarding::load("acme"));
+        assert_eq!(onboarding.runner(), RunnerKind::Codex);
+        assert_eq!(onboarding.model_choice(), Some("gpt-5-codex"));
+        assert_eq!(onboarding.model().model_note, None, "the choice is the project's own");
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_generic_default_is_refused_before_anything_is_written() {
+        let _g = lock_env();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::create_dir_all(home.join("acme/.git")).unwrap();
+        let generic = AgentDefaults { runner: RunnerKind::Generic, model: None };
+        assert!(matches!(
+            add_project("acme", "acme", ConfigMode::Global, &generic, &home, Attempt::New, &mut NullReporter),
+            Err(AddProjectError::Invalid(msg)) if msg.contains("generic")
+        ));
+        assert!(!home.join("projects/acme.yaml").exists());
+        assert!(!home.join("projects/acme").exists());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -1468,7 +1745,7 @@ mod tests {
             let repo = home.join("acme");
             std::fs::create_dir_all(repo.join(".git")).unwrap();
             let mut out = DiskChecker { slug: "acme".into(), events: Vec::new() };
-            let slug = add_project("acme", "acme", mode, &home, Attempt::New, &mut out).unwrap();
+            let slug = add_project("acme", "acme", mode, &AgentDefaults::default(), &home, Attempt::New, &mut out).unwrap();
             assert_eq!(slug, "acme");
             assert_eq!(out.events, all_stages(), "{mode:?}");
             only_registration(&home, "acme");
@@ -1508,7 +1785,7 @@ mod tests {
                 let case = format!("{mode:?} {stage:?}");
 
                 let mut out = CollectReporter::default();
-                let failed = add_project("acme", "acme", mode, &home, Attempt::New, &mut out);
+                let failed = add_project("acme", "acme", mode, &AgentDefaults::default(), &home, Attempt::New, &mut out);
                 assert!(matches!(failed, Err(AddProjectError::Failed(_))), "{case}: {failed:?}");
                 let mut expected = all_stages()[..i * 2].to_vec();
                 expected.push(StageEvent::Started(stage));
@@ -1543,7 +1820,7 @@ mod tests {
                     // A plain second request clashes with the partial project...
                     assert!(
                         matches!(
-                            add_project("acme", "acme", mode, &home, Attempt::New, &mut NullReporter),
+                            add_project("acme", "acme", mode, &AgentDefaults::default(), &home, Attempt::New, &mut NullReporter),
                             Err(AddProjectError::Invalid(m)) if m.contains("already")
                         ),
                         "{case}"
@@ -1552,7 +1829,7 @@ mod tests {
                 // ...and a retry of this one finishes it.
                 let mut out = CollectReporter::default();
                 assert_eq!(
-                    add_project("acme", "acme", mode, &home, Attempt::Retry, &mut out),
+                    add_project("acme", "acme", mode, &AgentDefaults::default(), &home, Attempt::Retry, &mut out),
                     Ok("acme".to_string()),
                     "{case}"
                 );
@@ -1584,18 +1861,18 @@ mod tests {
             std::fs::create_dir_all(home.join(dir).join(".git")).unwrap();
         }
         // Someone else's project already has the id.
-        add_project("acme", "theirs/acme", ConfigMode::Global, &home, Attempt::New, &mut NullReporter)
+        add_project("acme", "theirs/acme", ConfigMode::Global, &AgentDefaults::default(), &home, Attempt::New, &mut NullReporter)
             .unwrap();
         let theirs = std::fs::read_to_string(home.join("projects/acme.yaml")).unwrap();
 
         let mut out = CollectReporter::default();
         let other_folder =
-            add_project("acme", "mine/acme", ConfigMode::Global, &home, Attempt::Retry, &mut out);
+            add_project("acme", "mine/acme", ConfigMode::Global, &AgentDefaults::default(), &home, Attempt::Retry, &mut out);
         assert!(matches!(other_folder, Err(AddProjectError::Invalid(m)) if m.contains("already")));
         assert!(out.stages.is_empty(), "nothing ran");
         // The same folder in the other config mode isn't this request either.
         assert!(matches!(
-            add_project("acme", "theirs/acme", ConfigMode::InRepo, &home, Attempt::Retry, &mut NullReporter),
+            add_project("acme", "theirs/acme", ConfigMode::InRepo, &AgentDefaults::default(), &home, Attempt::Retry, &mut NullReporter),
             Err(AddProjectError::Invalid(_))
         ));
         assert!(!home.join("theirs/acme/.shelbi/project.yaml").exists());
@@ -1604,7 +1881,7 @@ mod tests {
 
         // A retry of the request that made it is welcome, and changes nothing.
         assert_eq!(
-            add_project("acme", "theirs/acme", ConfigMode::Global, &home, Attempt::Retry, &mut NullReporter),
+            add_project("acme", "theirs/acme", ConfigMode::Global, &AgentDefaults::default(), &home, Attempt::Retry, &mut NullReporter),
             Ok("acme".to_string())
         );
         assert_eq!(std::fs::read_to_string(home.join("projects/acme.yaml")).unwrap(), theirs);

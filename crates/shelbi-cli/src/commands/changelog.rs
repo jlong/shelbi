@@ -5,7 +5,9 @@
 //! file; `list`, `search` and `show` read them back as a compact text list,
 //! blog-style markdown, or JSON for agents and scripts. The JSON shape is
 //! versioned by `schema_version` and documented on the CLI docs page
-//! (`site/content/docs/cli/changelog.mdx`).
+//! (`site/content/docs/cli/changelog.mdx`). `strip-links` cleans up older
+//! entries whose description ends with a list that only repeats their
+//! frontmatter links.
 
 use std::io::{IsTerminal, Read};
 
@@ -64,6 +66,14 @@ pub enum ChangelogCmd {
         entry_id: String,
         #[arg(long, value_enum, default_value_t = Format::Markdown)]
         format: Format,
+    },
+    /// Remove the list of links older entries end with, where it only repeats
+    /// the entry's issue, PR and link fields (the links the Changelog page
+    /// shows under every entry). Any other list is left alone.
+    StripLinks {
+        /// List the entries that would change without writing them.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -167,6 +177,18 @@ pub fn run(project_opt: Option<String>, cmd: ChangelogCmd) -> Result<()> {
                 Format::Json => render_json_one(&project, &entry, repo)?,
             };
             print!("{out}");
+        }
+        ChangelogCmd::StripLinks { dry_run } => {
+            let entries = read(&project)?;
+            let mut changed = 0;
+            for entry in &entries {
+                if changelog::strip_link_list(entry, repo, dry_run).map_err(|e| anyhow!(e))? {
+                    changed += 1;
+                    println!("{} {}", if dry_run { "would strip" } else { "✓ stripped" }, entry.id);
+                }
+            }
+            let verb = if dry_run { "would change" } else { "changed" };
+            println!("{changed} of {} entries {verb}", entries.len());
         }
     }
     Ok(())
@@ -504,6 +526,14 @@ mod tests {
                 format: Format::Markdown,
                 ..
             }
+        ));
+        assert!(matches!(
+            parse(&["strip-links"]),
+            ChangelogCmd::StripLinks { dry_run: false }
+        ));
+        assert!(matches!(
+            parse(&["strip-links", "--dry-run"]),
+            ChangelogCmd::StripLinks { dry_run: true }
         ));
     }
 

@@ -20,7 +20,11 @@
 //! What stays the viewer's own (and so isn't listed): the user config,
 //! window state, recent remotes, the update check, feedback, bootstrap and
 //! discovery, the project list, and the writes later phases move behind the
-//! daemon.
+//! daemon. The orchestrator onboarding (`views::onboarding`, over
+//! `shelbi_app::onboarding`) and the Add Project wizard's Agent defaults
+//! step read and write this machine's files: only a local window shows
+//! them (`open_project` returns before the onboarding check for a remote
+//! project, the far Shelbi's to run, and Add Project is unavailable there).
 
 use std::path::{Path, PathBuf};
 

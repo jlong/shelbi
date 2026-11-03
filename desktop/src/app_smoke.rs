@@ -260,7 +260,7 @@ fn keystrokes_for(text: &str) -> String {
 fn every_registry_command_runs_from_the_palette(cx: &mut TestAppContext) {
     let mut h = Harness::open(cx);
     let commands = h.commands();
-    assert_eq!(commands.len(), 30, "the fixture offers every kind of command");
+    assert_eq!(commands.len(), 31, "the fixture offers every kind of command");
     for command in &commands {
         h.focus_window();
         h.key("ctrl-space");
@@ -508,4 +508,173 @@ fn typing_in_the_palette_searches_issues_and_changelog_entries(cx: &mut TestAppC
     h.click_selector("palette-entry-2026-10-28-login");
     assert!(!h.overlay_open());
     assert_eq!(h.take_calls(), [HostCall::OpenChangelogEntry("2026-10-28-login".into())]);
+}
+
+// ---------------------------------------------------------------------------
+// The palette by mouse: hover, click-to-run, the wheel, outside clicks
+// ---------------------------------------------------------------------------
+
+impl Harness {
+    fn bounds_of(&mut self, selector: &'static str) -> gpui::Bounds<gpui::Pixels> {
+        self.draw();
+        self.cx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector} is drawn"))
+    }
+
+    fn mouse_to(&mut self, at: gpui::Point<gpui::Pixels>) {
+        self.cx.simulate_mouse_move(at, None, gpui::Modifiers::none());
+        self.cx.run_until_parked();
+        self.draw();
+    }
+
+    fn click_at(&mut self, at: gpui::Point<gpui::Pixels>) {
+        self.cx.simulate_click(at, gpui::Modifiers::none());
+        self.cx.run_until_parked();
+    }
+
+    fn wheel(&mut self, at: gpui::Point<gpui::Pixels>, dy: f32) {
+        self.cx.simulate_event(gpui::ScrollWheelEvent {
+            position: at,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(dy))),
+            modifiers: gpui::Modifiers::none(),
+            touch_phase: gpui::TouchPhase::Moved,
+        });
+        self.cx.run_until_parked();
+        self.draw();
+        // The hover a scroll moves under a still pointer settles a frame on.
+        self.draw();
+    }
+
+    /// The id of the open palette's selected result.
+    fn selected_id(&self) -> Option<String> {
+        self.palette(|p| {
+            let row = p.selected_row()?;
+            p.rows()[row].item()?.entry().map(|e| e.id)
+        })
+    }
+
+    fn open_palette(&mut self) {
+        self.focus_window();
+        self.key("ctrl-space");
+        assert!(self.overlay_open(), "Ctrl+Space opens the palette");
+        self.draw();
+    }
+
+    fn command_calls(&self, id: &str) -> Vec<HostCall> {
+        let command = self.commands().into_iter().find(|c| c.id() == id).unwrap_or_else(|| panic!("{id}"));
+        expected_calls(command.kind())
+    }
+}
+
+#[gpui::test]
+fn hovering_a_palette_result_selects_it_and_the_keyboard_continues(cx: &mut TestAppContext) {
+    let mut h = Harness::open(cx);
+    h.window.update(&mut h.cx, |w, _| {
+        w.palette_inputs.projects = vec![PaletteProject {
+            slug: "beta".into(),
+            label: "Beta".into(),
+            indicator: shelbi_app::overlay::palette::ProjectIndicator::LoadedIdle,
+        }];
+    });
+    h.open_palette();
+    assert_eq!(h.selected_id().as_deref(), Some("view:orch"));
+    let activity = h.bounds_of("palette-row-view:activity");
+    h.mouse_to(activity.center());
+    assert_eq!(h.selected_id().as_deref(), Some("view:activity"), "hover selects the row");
+    assert!(h.cx.debug_bounds("palette-selected").is_some_and(|b| activity.intersects(&b)), "drawn as the selection");
+    // Its description end is the same row.
+    h.mouse_to(gpui::point(activity.right() - gpui::px(8.0), activity.center().y));
+    assert_eq!(h.selected_id().as_deref(), Some("view:activity"));
+    // The keyboard continues from the hovered row.
+    h.key("down");
+    assert_eq!(h.selected_id().as_deref(), Some("view:machines"));
+    // A Projects row hovers too, and Enter runs it.
+    let beta = h.bounds_of("palette-project-Beta");
+    h.mouse_to(beta.center());
+    assert_eq!(h.palette(|p| p.project_selection()), Some(0), "hover focuses the project");
+    // Back over a result, the results have the keys again.
+    let at = h.bounds_of("palette-row-view:tasks").center();
+    h.mouse_to(at);
+    assert_eq!(h.selected_id().as_deref(), Some("view:tasks"));
+    assert_eq!(h.palette(|p| p.project_selection()), None);
+    h.key("enter");
+    assert!(!h.overlay_open());
+    assert_eq!(h.take_calls(), h.command_calls("view:tasks"), "Enter runs the hovered row");
+}
+
+#[gpui::test]
+fn clicking_a_palette_result_runs_it_and_outside_closes(cx: &mut TestAppContext) {
+    let mut h = Harness::open(cx);
+    // A click on the name runs the row, as Enter does.
+    h.open_palette();
+    let row = h.bounds_of("palette-row-view:changelog");
+    h.click_at(row.center());
+    assert!(!h.overlay_open(), "running a result closes the palette");
+    assert_eq!(h.take_calls(), h.command_calls("view:changelog"));
+    // So does one on its description, at the row's far end.
+    h.open_palette();
+    let row = h.bounds_of("palette-row-view:machines");
+    h.click_at(gpui::point(row.right() - gpui::px(8.0), row.center().y));
+    assert!(!h.overlay_open());
+    assert_eq!(h.take_calls(), h.command_calls("view:machines"));
+    // A click on the panel off any row (the query line) does nothing.
+    h.open_palette();
+    let at = h.bounds_of("palette-query").center();
+    h.click_at(at);
+    assert!(h.overlay_open(), "the query line keeps it open");
+    // One outside the panel closes it, running nothing.
+    let panel = h.bounds_of("palette");
+    h.click_at(gpui::point(panel.left() + gpui::px(20.0), panel.bottom() + gpui::px(20.0)));
+    assert!(!h.overlay_open(), "an outside click closes the palette");
+    assert!(h.take_calls().is_empty());
+    // While searching, a group heading does nothing.
+    h.open_search_palette();
+    h.key("l o g i n");
+    let at = h.bounds_of("palette-heading-Issues").center();
+    h.click_at(at);
+    assert!(h.overlay_open(), "a heading isn't a result");
+    assert!(h.take_calls().is_empty());
+    let at = h.bounds_of("palette-issue-1944").center();
+    h.click_at(at);
+    assert!(!h.overlay_open());
+    assert_eq!(h.take_calls(), [HostCall::OpenIssue("1944".into())]);
+}
+
+#[gpui::test]
+fn the_wheel_scrolls_the_palette_and_hover_and_clicks_follow(cx: &mut TestAppContext) {
+    let mut h = Harness::open(cx);
+    // Short enough that the ten commands scroll.
+    h.cx.simulate_resize(gpui::size(gpui::px(900.0), gpui::px(380.0)));
+    h.open_palette();
+    let results = h.bounds_of("palette-results");
+    let last = h.bounds_of("palette-row-action:quit-shelbi");
+    assert!(last.top() >= results.bottom(), "the last row starts below the fold");
+    let first = h.bounds_of("palette-row-view:orch");
+    let at = first.center();
+    h.mouse_to(at);
+    assert_eq!(h.selected_id().as_deref(), Some("view:orch"));
+    // Three rows down.
+    h.wheel(at, -3.0 * crate::views::palette::ROW_H);
+    let first_after = h.bounds_of("palette-row-view:orch");
+    assert!(first_after.top() < first.top(), "the wheel scrolled the results");
+    // The row now under the still pointer is the selection.
+    let under = [
+        ("palette-row-view:tasks", "view:tasks"),
+        ("palette-row-view:changelog", "view:changelog"),
+        ("palette-row-view:activity", "view:activity"),
+        ("palette-row-view:machines", "view:machines"),
+        ("palette-row-action:toggle-zen", "action:toggle-zen"),
+    ]
+    .into_iter()
+    .find(|(sel, _)| h.cx.debug_bounds(sel).is_some_and(|b| b.contains(&at)))
+    .map(|(_, id)| id)
+    .expect("a row sits under the pointer");
+    assert_eq!(h.selected_id().as_deref(), Some(under), "hover follows the scroll");
+    // Hover and clicks land on the rows where they're drawn now.
+    let log = h.bounds_of("palette-row-action:error-log");
+    assert!(log.bottom() <= results.bottom() + gpui::px(1.0), "scrolled into view");
+    h.mouse_to(log.center());
+    assert_eq!(h.selected_id().as_deref(), Some("action:error-log"));
+    h.click_at(log.center());
+    assert!(!h.overlay_open());
+    assert_eq!(h.take_calls(), h.command_calls("action:error-log"));
 }

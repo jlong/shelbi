@@ -101,10 +101,19 @@ pub(crate) fn add(
         }
     }
 
-    sink.out(&format!(
-        "✓ {} created in {column} (priority {})",
-        created.id, created.priority
-    ));
+    // An add lands at the end of its status's queue; `top` moves it to the
+    // front, through the same reorder `issue prioritize --top` runs.
+    if spec.top {
+        store
+            .set_priority(&created.id, shelbi_state::PrioMove::Top)
+            .map_err(MutateError::backend)?;
+        sink.out(&format!("✓ {} created in {column} (top of the queue)", created.id));
+    } else {
+        sink.out(&format!(
+            "✓ {} created in {column} (priority {})",
+            created.id, created.priority
+        ));
+    }
     Ok(created.id)
 }
 

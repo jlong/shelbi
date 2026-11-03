@@ -97,6 +97,7 @@ Pass `--status todo` to skip triage when you're already sure.
 | `--prefers-machine <NAME>` | string | — | Hint for the orchestrator to route this issue to a workspace on a specific machine. |
 | `--workflow <NAME>` | string | project default | Workflow this issue runs under. Names a file in `workflows/<NAME>.yaml`. Omit to inherit the project's default workflow. |
 | `--branch <BRANCH>` | string | generated at dispatch | Pre-fill the issue's `branch:` frontmatter field. Omit to let the orchestrator generate `<prefix>/<task-id>` from workflow config, project config, or your GitHub username; supply a value to point the issue at an existing branch (the *release issue* pattern). |
+| `--top` | flag | off | Land the new issue at the top of its status's queue instead of the end. |
 
 ## list
 

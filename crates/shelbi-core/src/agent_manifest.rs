@@ -408,6 +408,21 @@ pub fn resolve_agent_launch(
     }
 }
 
+/// The model the orchestrator launches with: the project's
+/// `runners.<kind>.model`, else `agents/orchestrator/agent.yaml`'s
+/// `runners.<kind>.model`, where `<kind>` is the kind of the runner
+/// `orchestrator.runner` names (the orchestrator always launches on that
+/// runner: unlike a dispatched agent, it has no runner-kind chain). `None`
+/// when neither sets one, and then the launch passes no model at all.
+pub fn orchestrator_model(project: &Project, manifest: Option<&AgentManifest>) -> Option<String> {
+    let kind = RunnerKind::detect(project.runner(&project.orchestrator.runner)?);
+    project
+        .runners
+        .get(&kind)
+        .and_then(|r| r.model.clone())
+        .or_else(|| manifest.and_then(|m| m.runners.get(&kind)).and_then(|r| r.model.clone()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,6 +530,49 @@ workspaces: []
 "#,
         )
         .unwrap()
+    }
+
+    fn spec(command: &str) -> AgentRunnerSpec {
+        AgentRunnerSpec {
+            command: command.into(),
+            flags: Vec::new(),
+            prompt_injection: None,
+            dialog_signatures: Vec::new(),
+            integration: None,
+        }
+    }
+
+    #[test]
+    fn orchestrator_model_is_none_when_nothing_sets_one() {
+        // The guard: no model anywhere launches exactly as before.
+        let project = base_project();
+        assert_eq!(orchestrator_model(&project, None), None);
+        let bare = AgentManifest::from_yaml_str("name: orchestrator\npreferred_runner: claude\n").unwrap();
+        assert_eq!(orchestrator_model(&project, Some(&bare)), None);
+    }
+
+    #[test]
+    fn orchestrator_model_reads_the_manifest_under_the_project() {
+        let mut project = base_project();
+        let m = AgentManifest::from_yaml_str(
+            "name: orchestrator\nrunners:\n  claude:\n    model: opus\n  codex:\n    model: gpt-5\n",
+        )
+        .unwrap();
+        assert_eq!(orchestrator_model(&project, Some(&m)).as_deref(), Some("opus"));
+        project.runners.insert(
+            RunnerKind::Claude,
+            ProjectRunnerConfig {
+                spec: spec("claude"),
+                model: Some("sonnet".into()),
+                reasoning_effort: None,
+            },
+        );
+        assert_eq!(orchestrator_model(&project, Some(&m)).as_deref(), Some("sonnet"), "the project's wins");
+        // The kind is the orchestrator runner's, not the manifest's preference.
+        project.runners.clear();
+        project.agent_runners.insert("cx".into(), spec("codex"));
+        project.orchestrator.runner = "cx".into();
+        assert_eq!(orchestrator_model(&project, Some(&m)).as_deref(), Some("gpt-5"));
     }
 
     #[test]

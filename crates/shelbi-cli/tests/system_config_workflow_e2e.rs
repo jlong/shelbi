@@ -113,7 +113,7 @@ fn scaffold_assets(config_root: &Path) {
     );
     write(
         config_root.join("changelog-template.md"),
-        "{{description}}\n\n{{links}}\n",
+        "{{description}}\n",
     );
     for agent in [
         "orchestrator",

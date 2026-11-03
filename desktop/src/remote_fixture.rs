@@ -225,6 +225,7 @@ fn serve_connection(mut stream: UnixStream, took: &Took, subscribers: &Arc<Mutex
                 let done = ServerMsg::Done {
                     request_id: req.request_id,
                     state: None,
+                    id: None,
                 };
                 let _ = stream.write_all(&control::encode(&done).unwrap());
                 if let MutationKind::Move { to, .. } = &req.kind {
@@ -239,6 +240,7 @@ fn serve_connection(mut stream: UnixStream, took: &Took, subscribers: &Arc<Mutex
                     Ok(()) => ServerMsg::Done {
                         request_id: req.request_id,
                         state: None,
+                        id: None,
                     },
                     Err(message) => ServerMsg::Failed {
                         request_id: req.request_id,

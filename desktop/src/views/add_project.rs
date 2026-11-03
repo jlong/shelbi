@@ -21,6 +21,12 @@
 //!   thread ([`Engine::check`]); an answer for an older path is dropped.
 //!   Continue waits for a usable answer. A folder whose name is already a
 //!   project's gets a name field (only then).
+//! - **Agent defaults** ("02 · Agent defaults" 2720:33054) picks the runner
+//!   and model the project's agents use by default: Default Harness and
+//!   Default model, the orchestrator onboarding's pickers
+//!   ([`super::harness_picker`]) over the wizard's shared choice. A generic
+//!   runner is refused with the reason under them (a new project declares
+//!   none).
 //! - **02** picks where settings live: two cards, one selected, with the
 //!   real paths for the chosen folder.
 //! - **Create Project** runs [`Engine::create`] (the shared
@@ -47,7 +53,9 @@
 //!
 //! Keys: Tab / ⇧Tab move focus (the focus ring shows once the keyboard is
 //! used), Return is the enabled primary action, Space activates the focused
-//! button or card, the arrows move between the cards, Esc and ⌘W cancel
+//! button or card (or opens a picker's menu), the arrows move between the
+//! cards and step a focused picker's choice in place, Esc closes an open
+//! menu, and otherwise Esc and ⌘W cancel
 //! (Esc waits while the engine runs, and while Okay opens the project).
 //! Cancelling before Create Project writes nothing.
 
@@ -69,6 +77,8 @@ use shelbi_core::ConfigMode;
 use shelbi_orchestrator::project_create::{self as engine, AddProjectError, ScaffoldReporter, ScaffoldStage};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
+use super::harness_picker::{self as pickers, Fields, Handlers, Host, Menu};
+use super::workflow_editor::error_line;
 use crate::app::{CloseWindow, ShelbiWindow};
 use crate::commands;
 use crate::assets::{heroicon, icons};
@@ -82,6 +92,8 @@ use crate::theme::{self, Theme};
 pub const SIZE: (f32, f32) = (800.0, 580.0);
 /// The intro line's width.
 const INTRO_W: f32 = 600.0;
+/// The Agent defaults screen's column (`Provider and model`).
+const DEFAULTS_W: f32 = 620.0;
 
 /// [`Engine::check`]'s signature: the launch directory, the path field's
 /// text, the typed name.
@@ -123,6 +135,7 @@ impl Engine {
                     name: request.name.clone(),
                     root: request.root.clone(),
                     mode: request.mode,
+                    defaults: request.defaults.clone(),
                 };
                 let attempt = match request.attempt {
                     Attempt::New => engine::Attempt::New,
@@ -263,6 +276,9 @@ pub struct AddProjectView {
     run: u64,
     /// Screen 04's cards.
     workflows: Vec<WorkflowOverview>,
+    /// The Agent defaults picker whose menu is open.
+    menu: Option<Menu>,
+    menu_anchor: style::Anchor,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -344,6 +360,8 @@ impl AddProjectView {
             on_created,
             run: 0,
             workflows: wiz::created_workflows(),
+            menu: None,
+            menu_anchor: Default::default(),
             _subscriptions: subscriptions,
         }
     }
@@ -368,6 +386,11 @@ impl AddProjectView {
         if !taken {
             return false;
         }
+        // An open picker's menu takes Esc; any other key closes it ([`Self::act`]).
+        if chord.code == Key::Esc && self.menu.take().is_some() {
+            cx.notify();
+            return true;
+        }
         if chord.code != Key::Enter && chord.code != Key::Esc {
             self.keyboard = true;
         }
@@ -383,8 +406,15 @@ impl AddProjectView {
     }
 
     fn act(&mut self, action: Action, window: &mut Window, cx: &mut Context<Self>) {
+        let menu = match action {
+            Action::Menu(Focus::Harness) => Some(Menu::Harness),
+            Action::Menu(Focus::Model) => Some(Menu::Model),
+            _ => None,
+        };
+        // A picker's button toggles its menu; anything else closes it.
+        self.menu = menu.filter(|m| self.menu != Some(*m));
         match action {
-            Action::Stay => {}
+            Action::Stay | Action::Menu(_) => {}
             Action::Browse => self.browse(window, cx),
             Action::Close => {
                 window.remove_window();
@@ -540,7 +570,8 @@ impl AddProjectView {
 
     /// Screen 03 as the engine's `reports` leave it, and its `result` if
     /// it has ended, without running the engine (the visual harness, tests):
-    /// the chosen folder's Continue and Create Project, the request dropped.
+    /// the chosen folder's Continue, the Agent defaults' Continue and Create
+    /// Project, the request dropped.
     #[cfg(any(test, feature = "visual-check"))]
     pub(crate) fn preview_creating(
         &mut self,
@@ -549,6 +580,9 @@ impl AddProjectView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Continue past the folder and the Agent defaults, then Create
+        // Project (the engine never runs).
+        self.wizard.primary();
         self.wizard.primary();
         let _ = self.wizard.primary();
         for report in reports {
@@ -605,6 +639,75 @@ impl AddProjectView {
         self.after_change(window, cx);
     }
 
+    /// A Default Harness row.
+    fn select_runner(&mut self, kind: shelbi_core::RunnerKind, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.wizard.select_runner(kind);
+        cx.notify();
+    }
+
+    /// A Default model row.
+    fn select_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.wizard.select_model(model.as_deref());
+        cx.notify();
+    }
+
+    /// A picker's button: its menu opens (or closes), and it takes focus.
+    fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
+        self.wizard.set_focus(match menu {
+            Menu::Harness => Focus::Harness,
+            Menu::Model => Focus::Model,
+        });
+        self.menu = if self.menu == Some(menu) { None } else { Some(menu) };
+        cx.notify();
+    }
+
+    /// The Agent defaults screen: Default Harness and Default model over a
+    /// 620pt column, and why Continue was refused.
+    fn defaults(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let p = self.wizard.picker();
+        let harnesses = p.harnesses();
+        let models = p.models();
+        let fields = pickers::fields(
+            Fields {
+                host: Host::AddProject,
+                harness_label: wiz::HARNESS_LABEL,
+                model_label: wiz::MODEL_LABEL,
+                help: wiz::FIELD_HELP,
+                harnesses: &harnesses,
+                models: &models,
+                model_choice: p.model_label(),
+                loading: false,
+                enabled: true,
+                model_enabled: p.takes_model(),
+                model_note: self.wizard.model_note(),
+                width: DEFAULTS_W,
+                ring: (self.ring(Focus::Harness, window), self.ring(Focus::Model, window)),
+            },
+            self.menu,
+            &self.menu_anchor,
+            Handlers {
+                select_runner: |this: &mut Self, kind, cx| this.select_runner(kind, cx),
+                select_model: |this: &mut Self, model, cx| this.select_model(model, cx),
+                toggle: |this: &mut Self, menu, cx| this.toggle_menu(menu, cx),
+                close: |this: &mut Self, _| this.menu = None,
+            },
+            theme,
+            cx,
+        );
+        div().flex().flex_row().justify_center().w_full().child(
+            div()
+                .debug_selector(|| "add-project-defaults".into())
+                .flex()
+                .flex_col()
+                .gap(px(16.0))
+                .w(px(DEFAULTS_W))
+                .child(fields)
+                .children(self.wizard.defaults_error().map(|e| error_line("add-project-defaults-error".into(), e, theme))),
+        )
+    }
+
     /// Whether `focus` shows the keyboard's ring.
     fn ring(&self, focus: Focus, window: &Window) -> bool {
         self.keyboard && self.wizard.focus() == focus && self.focus.is_focused(window)
@@ -640,7 +743,7 @@ impl AddProjectView {
             style::disabled_button("add-project-back", "Back", ButtonKind::Secondary, ButtonSize::Base, theme)
         };
         let label = match screen {
-            Screen::Folder => "Continue",
+            Screen::Folder | Screen::Defaults => "Continue",
             _ => "Create Project",
         };
         let primary = if self.wizard.primary_enabled() {
@@ -1074,6 +1177,7 @@ impl Render for AddProjectView {
         // Screen 03 has its title alone.
         let intro = match screen {
             Screen::Folder => Some(wiz::FOLDER_INTRO.to_string()),
+            Screen::Defaults => Some(wiz::DEFAULTS_INTRO.to_string()),
             Screen::Settings => Some(wiz::SETTINGS_INTRO.to_string()),
             Screen::Creating => None,
             Screen::Created => Some(wiz::CREATED_INTRO.to_string()),
@@ -1088,6 +1192,7 @@ impl Render for AddProjectView {
             .w_full();
         let details = match screen {
             Screen::Folder => details.child(self.folder_box(window, &theme, cx)),
+            Screen::Defaults => details.child(self.defaults(window, &theme, cx)),
             Screen::Settings => details
                 .child(self.card(ConfigMode::InRepo, window, &theme, cx))
                 .child(self.card(ConfigMode::Global, window, &theme, cx)),
@@ -1400,6 +1505,19 @@ mod tests {
         let mut r = rig(cx, Origin::Workspace, Ok("repo".into()));
         r.pick(Some("/repo"));
         r.click("add-project-primary");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Defaults);
+        assert!(r.drawn("add-project-step"));
+        // The Agent defaults: Codex from Default Harness's menu, GPT-5 from
+        // Default model's.
+        r.click("add-project-harness");
+        r.click("add-project-harness-codex");
+        r.click("add-project-model");
+        r.click("add-project-model-1");
+        assert_eq!(
+            r.wizard(|w| w.picker().defaults()),
+            shelbi_core::AgentDefaults { runner: shelbi_core::RunnerKind::Codex, model: Some("gpt-5".into()) }
+        );
+        r.click("add-project-primary");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
         let path = |r: &mut Rig, id: &'static str| {
             let _ = r.cx.debug_bounds(id).expect("drawn");
@@ -1414,7 +1532,11 @@ mod tests {
         r.click("add-project-card-in-repo");
         assert_eq!(r.wizard(|w| w.mode()), ConfigMode::InRepo);
         r.click("add-project-back");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Defaults);
+        r.click("add-project-back");
         assert_eq!(r.wizard(|w| (w.screen(), w.path().to_string())), (Screen::Folder, "/repo".into()));
+        r.click("add-project-primary");
+        assert_eq!(r.wizard(|w| w.picker().model().map(str::to_string)).as_deref(), Some("gpt-5"), "the defaults hold");
         r.click("add-project-primary");
         assert_eq!(r.wizard(|w| w.mode()), ConfigMode::InRepo);
 
@@ -1426,6 +1548,10 @@ mod tests {
                 name: "repo".into(),
                 root: "/repo".into(),
                 mode: ConfigMode::InRepo,
+                defaults: shelbi_core::AgentDefaults {
+                    runner: shelbi_core::RunnerKind::Codex,
+                    model: Some("gpt-5".into()),
+                },
                 attempt: Attempt::New,
             }]
         );
@@ -1444,7 +1570,8 @@ mod tests {
     fn screen_four_shows_the_created_workflows_and_its_okay(cx: &mut TestAppContext) {
         let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
         r.pick(Some("/repo"));
-        r.keys("enter enter");
+        // Continue, Continue (the Agent defaults kept), Create Project.
+        r.keys("enter enter enter");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Created);
         for drawn in [
             "add-project-workflow-task",
@@ -1481,7 +1608,8 @@ mod tests {
     fn a_failed_creation_never_reaches_screen_four(cx: &mut TestAppContext) {
         let mut r = rig_with(cx, Origin::Workspace, scripted(Some(Stage::Workflows), "repo"));
         r.pick(Some("/repo"));
-        r.keys("enter enter");
+        // Continue, Continue (the Agent defaults kept), Create Project.
+        r.keys("enter enter enter");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Creating);
         assert!(!r.drawn("add-project-workflow-task"));
         assert!(r.drawn("add-project-row-workflows-failed"));
@@ -1495,7 +1623,8 @@ mod tests {
         let mut r = rig_with(cx, Origin::FirstLaunch, scripted(None, "repo"));
         r.open_fails.set(1);
         r.pick(Some("/repo"));
-        r.keys("enter enter");
+        // Continue, Continue (the Agent defaults kept), Create Project.
+        r.keys("enter enter enter");
         r.keys("enter");
         assert_eq!(*r.opened.borrow(), ["repo"]);
         assert!(r.window_open(), "the wizard stays for another try");
@@ -1549,6 +1678,7 @@ mod tests {
                 vcx.run_until_parked();
             };
             step(&mut vcx, Focus::Primary);
+            step(&mut vcx, Focus::Primary);
             step(&mut vcx, Focus::Card(mode));
             step(&mut vcx, Focus::Primary);
             let (screen, slug, shown) = view.read_with(&vcx, |v, _| {
@@ -1592,7 +1722,8 @@ mod tests {
     fn okay_pressed_again_while_it_opens_does_nothing(cx: &mut TestAppContext) {
         let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
         r.pick(Some("/repo"));
-        r.keys("enter enter");
+        // Continue, Continue (the Agent defaults kept), Create Project.
+        r.keys("enter enter enter");
         // Three presses before anything runs: one open.
         let view = r.view.clone();
         r.cx.update(|window, cx| {
@@ -1615,7 +1746,8 @@ mod tests {
     fn the_engines_stages_check_the_rows_and_its_warnings_carry_over(cx: &mut TestAppContext) {
         let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
         r.pick(Some("/repo"));
-        r.keys("enter enter");
+        // Continue, Continue (the Agent defaults kept), Create Project.
+        r.keys("enter enter enter");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Created);
         // 04 draws the workflows in the checklist's place; every row was
         // checked on the way.
@@ -1633,7 +1765,8 @@ mod tests {
     fn a_failed_stage_keeps_its_rows_and_try_again_finishes_the_project(cx: &mut TestAppContext) {
         let mut r = rig_with(cx, Origin::Workspace, scripted(Some(Stage::Agents), "repo"));
         r.pick(Some("/repo"));
-        r.keys("enter enter");
+        // Continue, Continue (the Agent defaults kept), Create Project.
+        r.keys("enter enter enter");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Creating, "it stays on the checklist");
         assert!(r.drawn("add-project-row-config-done"));
         assert!(r.drawn("add-project-row-agents-failed"));
@@ -1688,7 +1821,7 @@ mod tests {
     fn closing_mid_creation_drops_its_reports_and_opens_nothing(cx: &mut TestAppContext) {
         let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
         r.pick(Some("/repo"));
-        r.keys("enter");
+        r.keys("enter enter");
         // Create Project, and the window closes before the engine reports.
         let view = r.view.clone();
         r.cx.update(|window, cx| {
@@ -1713,7 +1846,23 @@ mod tests {
         r.keys("tab");
         assert_eq!(r.wizard(|w| w.focus()), Focus::Primary);
         r.keys("space");
-        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings, "Space presses Continue");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Defaults, "Space presses Continue");
+        assert_eq!(r.wizard(|w| w.focus()), Focus::Harness);
+        // An arrow steps the focused picker; Space opens its menu, Esc
+        // closes only the menu.
+        r.keys("right");
+        assert_eq!(r.wizard(|w| w.picker().runner()), shelbi_core::RunnerKind::Codex);
+        r.keys("space");
+        assert!(r.drawn("add-project-harness-codex"), "the menu is open");
+        r.keys("escape");
+        assert!(r.window_open(), "Esc closed the menu, not the window");
+        assert!(!r.drawn("add-project-harness-codex"));
+        r.keys("tab");
+        assert_eq!(r.wizard(|w| w.focus()), Focus::Model);
+        r.keys("down");
+        assert_eq!(r.wizard(|w| w.picker().model().map(str::to_string)).as_deref(), Some("gpt-5"));
+        r.keys("enter");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings, "Return continues");
         assert_eq!(r.wizard(|w| w.focus()), Focus::Card(ConfigMode::Global));
         r.keys("up");
         assert_eq!(r.wizard(|w| w.mode()), ConfigMode::InRepo, "an arrow moves the choice");
@@ -1722,6 +1871,28 @@ mod tests {
         r.keys("escape");
         assert!(!r.window_open(), "Esc cancels");
         assert!(r.created.lock().unwrap().is_empty(), "cancelling creates nothing");
+    }
+
+    #[gpui::test]
+    fn agent_defaults_draws_the_frames_copy_and_refuses_generic(cx: &mut TestAppContext) {
+        let mut r = rig(cx, Origin::Workspace, Ok("repo".into()));
+        r.pick(Some("/repo"));
+        r.keys("enter");
+        assert_eq!(r.wizard(|w| (w.screen(), w.screen().title())), (Screen::Defaults, "Agent defaults"));
+        assert_eq!(wiz::step_label(r.wizard(|w| w.screen())), "Step 2 of 3");
+        for drawn in ["add-project-defaults", "add-project-harness", "add-project-harness-provider", "add-project-model"] {
+            assert!(r.drawn(drawn), "{drawn}");
+        }
+        r.click("add-project-harness");
+        r.click("add-project-harness-generic");
+        r.click("add-project-primary");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Defaults, "a generic default is refused");
+        assert!(r.drawn("add-project-defaults-error"));
+        r.click("add-project-harness");
+        r.click("add-project-harness-claude");
+        assert!(!r.drawn("add-project-defaults-error"));
+        r.click("add-project-primary");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
     }
 
     #[gpui::test]

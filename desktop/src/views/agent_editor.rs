@@ -685,7 +685,7 @@ fn rule(theme: &Theme) -> Div {
 
 /// A monospace text area (`Desktop/Terminal`) in the text box's edge and
 /// well, `height` tall.
-fn markdown_area(
+pub(super) fn markdown_area(
     input: &Entity<TextareaState>,
     selector: &'static str,
     height: f32,

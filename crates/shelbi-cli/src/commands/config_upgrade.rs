@@ -436,6 +436,8 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_tmux_commands(entry, &text, out);
     } else if id.ends_with(SHARED_PREAMBLE_SURFACE_SUFFIX) {
         sniff_shared_preamble(entry, &text, out);
+    } else if id.ends_with(".changelog-template") {
+        sniff_changelog_template(entry, &text, out);
     } else if id.ends_with(".zenmode") {
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_pr_create_published_head(entry, &text, out);
@@ -2376,6 +2378,32 @@ pub(crate) const PR_TEMPLATE_MISSING: &str = "PR_TEMPLATE_MISSING";
 /// The stable code for "the project has no `changelog-template.md`". The apply
 /// layer materializes the shipped default for it.
 pub(crate) const CHANGELOG_TEMPLATE_MISSING: &str = "CHANGELOG_TEMPLATE_MISSING";
+
+/// The stable code for "the project's `changelog-template.md` is still an
+/// earlier shipped default, byte for byte". The apply layer replaces it with
+/// the current default.
+pub(crate) const CHANGELOG_TEMPLATE_PRIOR_DEFAULT: &str = "CHANGELOG_TEMPLATE_PRIOR_DEFAULT";
+
+/// Flag a `changelog-template.md` that is still byte-identical to an earlier
+/// shipped default ([`shelbi_state::changelog::PRIOR_CHANGELOG_TEMPLATES`]):
+/// the first one ended every entry with a `{{links}}` list repeating the links
+/// the Changelog page already draws as chips. An identical copy holds no user
+/// choice, so replacing it is a non-lossy auto-heal; any edit at all makes the
+/// file the project's own, and it is never flagged.
+fn sniff_changelog_template(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    if !shelbi_state::changelog::is_prior_default_changelog_template(text) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::AutoHeal,
+        CHANGELOG_TEMPLATE_PRIOR_DEFAULT,
+        "`changelog-template.md` is an earlier shipped default that ends every entry with \
+         a `{{links}}` list, repeating the links the Changelog page already shows",
+        "Replace it with the current shipped default, which ends with the description.",
+        Location { line: 1, column: 1 },
+    ));
+}
 
 /// Flag lifecycle-owned shipped defaults that a project is missing because it
 /// predates their addition — the per-project `pr-template.md` and
@@ -5576,6 +5604,62 @@ Finalize by moving the card: `shelbi task move <task> --to done`.
         assert!(!report.findings.iter().any(|f| f.code == CHANGELOG_TEMPLATE_MISSING));
         run_for_project("demo");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), custom);
+    }
+
+    #[test]
+    fn prior_default_changelog_template_is_upgraded_and_an_edited_one_kept() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+        std::fs::write(home.join("projects/demo.yaml"), DEMO_YAML).unwrap();
+        let path = home.join("projects/demo/changelog-template.md");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // A project still on the old shipped default (ends with `{{links}}`).
+        let prior = shelbi_state::changelog::PRIOR_CHANGELOG_TEMPLATES[0];
+        std::fs::write(&path, prior).unwrap();
+        let report = detect(&["demo".to_string()]).unwrap();
+        let f = report
+            .findings
+            .iter()
+            .find(|f| f.code == CHANGELOG_TEMPLATE_PRIOR_DEFAULT)
+            .expect("prior default changelog template not detected");
+        assert_eq!(f.classification, Classification::AutoHeal);
+
+        // The on-start pass moves it to the current default...
+        let outcome = run_for_project("demo");
+        assert!(
+            outcome
+                .applied
+                .iter()
+                .any(|c| c.code == CHANGELOG_TEMPLATE_PRIOR_DEFAULT),
+            "prior changelog template not upgraded: {:?}",
+            outcome.applied
+        );
+        let healed = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(healed, shelbi_state::DEFAULT_CHANGELOG_TEMPLATE);
+        assert!(!healed.trim_end().ends_with("{{links}}"), "{healed}");
+
+        // ...once: the current default is never flagged.
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.code == CHANGELOG_TEMPLATE_PRIOR_DEFAULT));
+
+        // An edited copy of the old default (still with `{{links}}`) is the
+        // project's own: never flagged, never rewritten.
+        let edited = prior.replace("{{description}}", "## {{title}}\n\n{{description}}");
+        std::fs::write(&path, &edited).unwrap();
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.code == CHANGELOG_TEMPLATE_PRIOR_DEFAULT));
+        run_for_project("demo");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), edited);
     }
 
     const DEMO_YAML: &str = "name: demo\nrepo: /tmp/demo\nmachines:\n- name: hub\n  kind: local\n  work_dir: /tmp/demo\norchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\nworkspaces:\n- name: w1\n  machine: hub\n";

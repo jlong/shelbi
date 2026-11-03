@@ -1,8 +1,8 @@
-//! The settings screens' text field, drawn the way the sidebar's search box
-//! is: a `▄` row above, the text on a solid fill, a `▀` row below. The caps'
-//! glyphs carry the fill as their foreground over the terminal's default
-//! background, so the box reads as a filled bar with half-cell padding above
-//! and below, and no border.
+//! The settings screens' text field, drawn with the half-block caps the
+//! sidebar's buttons and selection use: a `▄` row above, the text on a solid
+//! fill, a `▀` row below. The caps' glyphs carry the fill as their
+//! foreground over the terminal's default background, so the box reads as a
+//! filled bar with half-cell padding above and below, and no border.
 //!
 //! ```text
 //!   Name
