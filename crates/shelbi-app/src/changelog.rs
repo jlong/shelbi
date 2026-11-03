@@ -141,9 +141,11 @@ impl ChangelogEntryView {
     }
 
     /// The description for a client that draws every link as a chip under
-    /// it: without the list of bare links the template's `{{links}}` ends it
-    /// with (each item one `issue:<id>`, `#<n>` or URL), which the chips
-    /// show. Any other description is the whole of it.
+    /// it: without a trailing list of bare links (each item one `issue:<id>`,
+    /// `#<n>` or URL), which the chips show. The shipped template no longer
+    /// writes one, but entries from the old default and templates that keep
+    /// `{{links}}` still end with it. Any other description is the whole of
+    /// it.
     pub fn prose(&self) -> &str {
         let text = self.description.trim_end();
         let mut cut = text.len();

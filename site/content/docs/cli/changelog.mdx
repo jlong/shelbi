@@ -47,10 +47,6 @@ links:
 - https://shelbi.dev/docs/cli/changelog
 ---
 The sidebar's Activity row becomes Changelog.
-
-- issue:changelog
-- https://github.com/jlong/shelbi/pull/1953
-- https://shelbi.dev/docs/cli/changelog
 ```
 
 The frontmatter holds the title, the date (with time and offset), the author
@@ -102,9 +98,17 @@ Settings, or from the command palette's **Edit Changelog Template**.
 | `{{description}}` | The description from `-d` or stdin. |
 | `{{links}}` | The flag links, one per line as a markdown list. |
 
-The default template is the description followed by the links. A comment at
-the top of the template (`<!-- ... -->`) explains the placeholders and is left
-out of every entry. Blank lines left by an empty placeholder are tidied away.
+The default template is the description alone. The links live in the entry's
+frontmatter, and the Changelog page in the TUI and the desktop app shows them
+under every entry, so the default leaves `{{links}}` out. Add it back to your
+template if you want the list in the description too. A comment at the top of
+the template (`<!-- ... -->`) explains the placeholders and is left out of
+every entry. Blank lines left by an empty placeholder are tidied away.
+
+Older Shelbi releases shipped a template that ended with `{{links}}`. A project
+whose template is still exactly that default moves to the current one on
+start. A template you have edited is never changed. Entries written with the
+old template keep their list until you run [`strip-links`](#strip-links).
 
 ## add
 
@@ -120,6 +124,9 @@ Adds an entry and prints its id and file.
 | `--link <URL>` | Link any other URL. Repeatable. |
 | `-d`, `--description <DESC>` | The description, in markdown. Without it, the description is read from stdin when stdin is not a terminal. |
 | `--format <FORMAT>` | How to print the new entry. Default `text`. |
+
+Each link is stored once: a `--link` that is the URL of a `--pr` is dropped,
+as is a flag given twice.
 
 `add` refuses an `--issue` that isn't a valid issue id, a `--pr` that isn't a
 number or URL, a `--link` that isn't an `http(s)` URL, an unreadable `--date`,
@@ -152,6 +159,18 @@ of the query, ignoring case, newest first. Link targets include issue ids
 Prints one entry. `<ENTRY-ID>` is the id `list` shows, or any prefix of it that
 names one entry (`2026-10-28-2130`). The default format is `markdown`.
 
+## strip-links
+
+Removes the list of links at the end of an entry's description when every item
+in it is a link the entry already has in its frontmatter (`issues:`, `prs:` and
+`links:`). That is the list the old default template wrote. A list with
+anything else in it, or one that sits right under a line of prose, is left
+alone, and the frontmatter is never changed. Prints each entry it changes.
+
+| Option | Meaning |
+| --- | --- |
+| `--dry-run` | List the entries that would change without writing them. |
+
 ## Formats
 
 **text** is a compact list: the date and title, then the id, the author and
@@ -182,7 +201,7 @@ the entries; `show` and `add` print one entry:
       "title": "Changelog lands in the sidebar",
       "date": "2026-10-28T14:30:05-07:00",
       "author": "orchestrator",
-      "description": "The sidebar's Activity row becomes Changelog.\n\n- issue:changelog\n...",
+      "description": "The sidebar's Activity row becomes Changelog.",
       "links": [
         { "kind": "issue", "id": "changelog" },
         { "kind": "pr", "number": 1953, "url": "https://github.com/jlong/shelbi/pull/1953" },
