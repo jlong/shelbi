@@ -3,9 +3,10 @@ import type { ReactNode } from "react"
 // The show/hide classes for each client's content, keyed off `<html
 // data-client>` (see `lib/client-preference.ts`). Shown as `display: contents`,
 // so a wrapper adds no box: its children sit in the parent (a grid cell, a
-// flex row, a paragraph) as if unwrapped.
-const SHOW_TUI = "contents client-desktop:hidden"
-const SHOW_DESKTOP = "hidden client-desktop:contents"
+// flex row, a paragraph) as if unwrapped. Desktop, the default, is the base;
+// the TUI swaps in under `client-tui:`.
+const SHOW_TUI = "hidden client-tui:contents"
+const SHOW_DESKTOP = "contents client-tui:hidden"
 
 /**
  * Render one child per Shelbi client and show only the chosen one. Both are

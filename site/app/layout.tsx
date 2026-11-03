@@ -5,7 +5,7 @@ import { Source_Code_Pro } from "next/font/google"
 import { Header } from "@/components/Header"
 import { Footer } from "@/components/Footer"
 import { getSections, humanizeSection } from "@/lib/docs"
-import { CLIENT_BOOT_SCRIPT } from "@/lib/client-preference"
+import { CLIENT_BOOT_SCRIPT, DEFAULT_CLIENT } from "@/lib/client-preference"
 import "./globals.css"
 
 // Mono family for code, CLI hints, and the hero mockup. Self-hosted via
@@ -66,6 +66,10 @@ export default function RootLayout({
   return (
     <html
       lang="en"
+      // The TUI / Desktop choice (lib/client-preference.ts): the SSR HTML
+      // carries the default so it paints with JS off; the boot script below
+      // rewrites it to a stored choice (hence suppressHydrationWarning).
+      data-client={DEFAULT_CLIENT}
       suppressHydrationWarning
       className={`${GeistSans.variable} ${sourceCodePro.variable} antialiased`}
     >
