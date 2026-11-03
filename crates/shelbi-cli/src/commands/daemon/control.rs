@@ -33,7 +33,7 @@ use shelbi_orchestrator::mutate::{self, MutateError, OutputSink};
 use shelbi_proto::control::{
     self, AttachedClient, ChangeNote, ClientInfo, ClientKind, ClientMsg, DetachSelector, MutationError,
     MutationKind, MutationRequest, ReviewRole, ReviewSessionOp, ReviewSessionRequest, ServerMsg,
-    Stream, WorkspaceSessionOp, WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
+    StateWriteRequest, Stream, WorkspaceSessionOp, WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
 };
 use shelbi_state::CLIENT_VERSION;
 
@@ -497,6 +497,13 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 let count = state.detach_clients(&selector, &reason);
                 let _ = tx.send(ServerMsg::Detached { request_id, count });
             }
+            ClientMsg::WriteState(req) => {
+                // Detached like a mutation, so a client that leaves right after
+                // asking still gets its write made (and announced).
+                let state = state.clone();
+                let tx = tx.clone();
+                thread::spawn(move || run_state_write(conn_id, req, state, tx));
+            }
         }
     }
 
@@ -595,6 +602,38 @@ fn run_job(origin: u64, req: MutationRequest, state: ControlState, tx: Sender<Se
                 error: e.into(),
             });
         }
+    }
+}
+
+/// Make one project-state write (protocol v7) through
+/// [`shelbi_orchestrator::state_write::apply`], reply to the requester, and
+/// announce it to every other subscriber, so their views of the project
+/// refresh. Not an issue mutation: no per-issue lock or expected state (the
+/// state files carry their own locks), and the note names no issue.
+fn run_state_write(origin: u64, req: StateWriteRequest, state: ControlState, tx: Sender<ServerMsg>) {
+    let request_id = req.request_id;
+    match shelbi_orchestrator::state_write::apply(&req.project, &req.write) {
+        Ok(()) => {
+            let _ = tx.send(ServerMsg::Done { request_id, state: None });
+            state.broadcast(origin, &state_write_note(&req));
+        }
+        Err(message) => {
+            let _ = tx.send(ServerMsg::Failed {
+                request_id,
+                error: MutationError::Backend { message },
+            });
+        }
+    }
+}
+
+/// The `Changed` note announcing `req`: the project, no issue, the write's verb.
+fn state_write_note(req: &StateWriteRequest) -> ChangeNote {
+    ChangeNote {
+        project: req.project.clone(),
+        id: String::new(),
+        verb: req.write.verb().to_string(),
+        status: String::new(),
+        updated_at: String::new(),
     }
 }
 
@@ -1177,6 +1216,89 @@ mod tests {
             home.column_of("t1")
         );
         assert_eq!(rec.merges.load(AOrd::SeqCst), 1);
+    }
+
+    // --- project-state writes (protocol v7) ----------------------------------
+
+    #[test]
+    fn a_state_write_lands_on_disk_and_is_announced_to_the_other_subscribers() {
+        use shelbi_proto::control::{StateWrite, StateWriteRequest};
+        let _home = Home::new("statewr");
+        let served = serve_bg(ControlState::new(), "statewr");
+
+        let watcher = ControlClient::connect(&served.sock, CLIENT_VERSION).unwrap();
+        let mut sub = watcher.subscribe().unwrap();
+        // Give the daemon a moment to register the watcher.
+        thread::sleep(Duration::from_millis(150));
+
+        let mut client = ControlClient::connect(&served.sock, CLIENT_VERSION).unwrap();
+        client
+            .write_state(&StateWriteRequest {
+                request_id: 3,
+                project: "p".into(),
+                write: StateWrite::SetWorkspaceFilter {
+                    filter: Some("ws:dev".into()),
+                },
+            })
+            .unwrap();
+        assert_eq!(
+            shelbi_state::read_state("p").unwrap().workspace_filter.as_deref(),
+            Some("ws:dev")
+        );
+        match sub.recv() {
+            Ok(Some(Notice::Changed(note))) => {
+                assert_eq!(note.project, "p");
+                assert_eq!(note.id, "", "a state write names no issue");
+                assert_eq!(note.verb, "workspace-filter");
+            }
+            other => panic!("the watcher should hear of the write, got {other:?}"),
+        }
+
+        client
+            .write_state(&StateWriteRequest {
+                request_id: 4,
+                project: "p".into(),
+                write: StateWrite::AppendError {
+                    message: "boom".into(),
+                    source: Some("zen".into()),
+                },
+            })
+            .unwrap();
+        let errors = shelbi_state::read_errors("p").unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].message, "boom");
+    }
+
+    #[test]
+    fn a_state_write_that_fails_says_why_and_announces_nothing() {
+        use shelbi_proto::control::{StateWrite, StateWriteRequest};
+        let home = Home::new("statewf");
+        // A directory where state.json belongs: nothing can be written there.
+        std::fs::create_dir_all(home.path.join("projects/p/state.json")).unwrap();
+        let state = ControlState::new();
+        let (tx, rx) = std::sync::mpsc::channel();
+        state.register(7, tx);
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        run_state_write(
+            1,
+            StateWriteRequest {
+                request_id: 9,
+                project: "p".into(),
+                write: StateWrite::ToggleZen {
+                    source: "user:palette".into(),
+                },
+            },
+            state,
+            reply_tx,
+        );
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Ok(ServerMsg::Failed {
+                request_id: 9,
+                error: MutationError::Backend { .. }
+            })
+        ));
+        assert!(rx.try_recv().is_err(), "a failed write announces nothing");
     }
 
     // --- lifecycle commands (Phase 4f) ---------------------------------------

@@ -38,20 +38,27 @@ Settings keeps it. The far machine's config never decides it.
   `control` service, as do review and workspace content sessions and Quit
   Project. The window never brings the far orchestrator up and never runs
   this machine's `shelbi open` for it.
-- **Not yet available** (P7, P8, plan 8.4), each disabled with its reason
+- **Project-state writes** (P7, `rw-remote-state-writes`): Toggle Zen, the
+  board's workspace filter and column overrides, the error log's read marks
+  and Clear, a failed toggle's error entry, and a reopened pane's relaunch
+  marker go to the far daemon as `ClientMsg::WriteState` (control protocol
+  v7) over the same `control` service. A local window sends the same message
+  to this machine's daemon (`shelbi_app::state_write`), so the daemon is the
+  one writer either way and tells its other clients with a `Changed` note.
+  The relay refuses a write to any project but the window's own. The Zen
+  intro's "don't show again" stays the viewer's own, on this machine.
+- **Not yet available** (P8, plan 8.4), each disabled with its reason
   through the command path: the registry lists the command with the reason
   as its subtitle (`CommandModel::remote_host`, `CommandModel::unavailable`),
   the menu bar draws it disabled, and the window refuses it with that line
-  before any dispatch (no dispatch arm changes). Toggle Zen, Open in editor
+  before any dispatch (no dispatch arm changes). Open in editor
   (edit targets), Add Project, Quit Shelbi (denylisted by the relay), Detach
   Other Clients and New Window. Settings is read-only: the Workflows and
   Agents pages refuse an edit or Edit YAML with the reason, the workflow and
   agent editors and the workspace and machine forms (and so machine checks)
   don't open. A panel's open-in-app and reveal-folder say the folder is on
   the host. Files dropped on a far terminal aren't pasted: the pane shows
-  why for a few seconds. The board's workspace filter and column overrides
-  and the error log's read marks stay in the window and are never written;
-  Clear on the error log says why.
+  why for a few seconds.
 - **Notifications** are on: a remote window's notices are tagged
   `host:project`, and a click opens only that window.
 - **Keybindings**: the viewer's keys plus the far project's overlay
@@ -72,8 +79,9 @@ Settings keeps it. The far machine's config never decides it.
   `QueryAnswers` over an in-process relay, a fake far daemon on its
   `control.sock`, a fake far hub). Every view opens and reads the far
   project; a card moved in the window lands on the far board, and a far move
-  reaches the window; refused commands give their reason; the switcher and
-  title name the host.
+  reaches the window; Toggle Zen and the error log's read marks and Clear
+  are made by the far daemon (`StateWrite`s it records); refused commands
+  give their reason; the switcher and title name the host.
 - `refresh::tests::a_far_changed_note_wakes_a_remote_feed`: a far `Changed`
   wakes a remote feed at once.
 - `views::remote_session::tests`: the flag off opens the terminal window
@@ -86,5 +94,5 @@ Settings keeps it. The far machine's config never decides it.
 ## Left for later phases
 
 A far reload (`ChangeWake::Reload`) doesn't yet close the window's panes and
-offer Reopen (plan 6); the writes above (P7, P8); sessions on the far
+offer Reopen (plan 6); config saves (P8); sessions on the far
 project's own machines (P9).

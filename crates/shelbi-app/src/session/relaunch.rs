@@ -15,12 +15,11 @@
 //!   daemon's spent budget.
 //!
 //! A relauncher given the window's [`ProjectLink`] asks through it, so a
-//! remote window re-ensures content sessions on the far daemon (its `control`
-//! service). The reopen markers are files in this machine's Shelbi home, so a
-//! remote link writes none: the far daemon's supervision budget stays its own
-//! until that write moves behind the daemon.
+//! remote window re-ensures content sessions, and drops reopen markers, on the
+//! far daemon (its `control` service). The markers are written by the
+//! project's daemon ([`RelaunchPane`]), never by the client.
 
-use shelbi_state::supervision_relaunch as sr;
+use crate::state_write::{self, RelaunchPane, StateWrite};
 
 use super::SessionRef;
 use crate::source::ProjectLink;
@@ -64,36 +63,23 @@ fn role_from_str(s: &str) -> Option<ReviewRole> {
     }
 }
 
-/// Drop the reopen markers that reset a persistent pane's *daemon* supervision
-/// budget. A `Workspace` pane can be governed by more than one daemon pass (the
-/// per-workspace supervisor and the stranded-dev / stranded-review resume
-/// passes), and the client can't tell which gave up, so it writes every key that
-/// could apply — each pass consumes only its own.
+/// Ask the project's daemon to drop the reopen markers that reset a persistent
+/// pane's supervision budget. A `Workspace` pane can be governed by more than
+/// one daemon pass, and the client can't tell which gave up, so the daemon
+/// writes every key that could apply ([`RelaunchPane::Workspace`]); each pass
+/// consumes only its own.
 fn write_persistent_reopen_markers(
     project: &str,
     link: Option<&ProjectLink>,
     target: &SessionRef,
 ) -> Result<(), String> {
-    if link.is_some_and(ProjectLink::is_remote) {
-        return Ok(());
-    }
-    let res = match target {
-        SessionRef::Orchestrator => {
-            sr::request_supervision_relaunch(project, &sr::orchestrator_relaunch_key())
-        }
-        SessionRef::Workspace(w) => {
-            sr::request_supervision_relaunch(project, &sr::workspace_supervise_relaunch_key(w))
-                .and_then(|()| {
-                    sr::request_supervision_relaunch(project, &sr::workspace_resume_relaunch_key(w))
-                })
-                .and_then(|()| {
-                    sr::request_supervision_relaunch(project, &sr::review_resume_relaunch_key(w))
-                })
-        }
+    let pane = match target {
+        SessionRef::Orchestrator => RelaunchPane::Orchestrator,
+        SessionRef::Workspace(w) => RelaunchPane::Workspace { workspace: w.clone() },
         // Content targets are never persistent.
-        SessionRef::Review { .. } | SessionRef::WorkspaceContent { .. } => Ok(()),
+        SessionRef::Review { .. } | SessionRef::WorkspaceContent { .. } => return Ok(()),
     };
-    res.map_err(|e| e.to_string())
+    state_write::write(project, link, StateWrite::RequestRelaunch { pane })
 }
 
 /// Relauncher for the main area, which shows only the orchestrator and agent

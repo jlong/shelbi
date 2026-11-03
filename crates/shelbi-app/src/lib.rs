@@ -96,6 +96,7 @@ pub mod review;
 pub mod session;
 pub mod settings;
 pub mod source;
+pub mod state_write;
 pub mod supervision;
 pub mod task_properties;
 pub mod task_session;
@@ -109,7 +110,7 @@ pub mod zen;
 pub use command::{Command, CommandKind, CommandModel, CommandRegistry};
 pub use exec::{EditTarget, Effect, ExecError, ExecOutcome, Executor, Mutation};
 pub use exec_daemon::{
-    execute_mutation, execute_mutation_expecting, review_session, workspace_session,
+    execute_mutation, execute_mutation_expecting, review_session, workspace_session, write_state,
 };
 pub use shelbi_proto::control::{ExpectedState, ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
 pub use nav::{ClientState, Focus, GlobalFlags, Overlay, View};

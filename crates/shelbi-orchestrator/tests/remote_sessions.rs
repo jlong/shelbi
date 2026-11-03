@@ -33,7 +33,8 @@ use shelbi_app::source::remote::{ChannelLink, RelayLink};
 use shelbi_app::source::ProjectLink;
 use shelbi_client::{Connection, RelayChannel, RelayServices, SessionEvent};
 use shelbi_proto::control::{
-    self, ClientMsg, ReviewRole, ReviewSessionOp, ServerMsg, WorkspaceSessionOp, CONTROL_PROTOCOL_VERSION,
+    self, ClientMsg, RelaunchPane, ReviewRole, ReviewSessionOp, ServerMsg, StateWrite, WorkspaceSessionOp,
+    CONTROL_PROTOCOL_VERSION,
 };
 use shelbi_proto::capability;
 use shelbi_session::layout::SessionPaths;
@@ -434,6 +435,7 @@ fn serve_one_request(listener: &UnixListener) -> ClientMsg {
     let request_id = match &request {
         ClientMsg::ReviewSession(r) => r.request_id,
         ClientMsg::WorkspaceSession(r) => r.request_id,
+        ClientMsg::WriteState(r) => r.request_id,
         other => panic!("unexpected request {other:?}"),
     };
     let done = ServerMsg::Done { request_id, state: None };
@@ -450,7 +452,10 @@ fn content_sessions_are_ensured_through_the_far_control_service() {
     let project = ProjectLink::remote(PROJECT, link.clone(), connector);
     link.connect(&|| Ok(())).unwrap();
 
-    let far_daemon = std::thread::spawn(move || (serve_one_request(&control), serve_one_request(&control)));
+    let far_daemon = {
+        let control = control.try_clone().unwrap();
+        std::thread::spawn(move || (serve_one_request(&control), serve_one_request(&control)))
+    };
     let review = ReviewRelauncher {
         project: PROJECT.into(),
         task: "t-7".into(),
@@ -483,9 +488,22 @@ fn content_sessions_are_ensured_through_the_far_control_service() {
         other => panic!("expected the shell ensure, got {other:?}"),
     }
 
-    // A reopen of a persistent pane writes no marker into this machine's
-    // Shelbi home for the far project.
+    // A reopen of a persistent pane asks the far daemon for the relaunch
+    // marker, and writes none into this machine's Shelbi home.
+    let far_daemon = std::thread::spawn(move || serve_one_request(&control));
     review.relaunch(&SessionRef::Orchestrator, true).unwrap();
+    match far_daemon.join().unwrap() {
+        ClientMsg::WriteState(w) => {
+            assert_eq!(w.project, PROJECT);
+            assert_eq!(
+                w.write,
+                StateWrite::RequestRelaunch {
+                    pane: RelaunchPane::Orchestrator
+                }
+            );
+        }
+        other => panic!("expected the relaunch request, got {other:?}"),
+    }
     assert!(!shelbi_state::project_dir(PROJECT).unwrap().exists());
 }
 

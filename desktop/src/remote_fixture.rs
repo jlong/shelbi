@@ -7,7 +7,9 @@
 //! The far daemon answers the hello with this build's version, takes
 //! subscriptions, and applies an issue move to the far board index as the
 //! real daemon would (the store write, then a `Changed` note to every
-//! subscriber), recording each mutation it saw. Nothing reaches the real
+//! subscriber), recording each mutation it saw. A project-state write it
+//! makes with the real daemon's own function
+//! (`shelbi_orchestrator::state_write::apply`) and records too. Nothing reaches the real
 //! `~/.shelbi`, the real hub or a network; both "sides" share the temp home,
 //! as one process.
 
@@ -23,7 +25,9 @@ use shelbi_app::settings::agents::fixture::Home;
 use shelbi_app::source::remote::{ChannelLink, RelayLink};
 use shelbi_client::{RelayChannel, RelayServices};
 use shelbi_core::{Column, Issue};
-use shelbi_proto::control::{self, ChangeNote, ClientMsg, MutationKind, ServerMsg, CONTROL_PROTOCOL_VERSION};
+use shelbi_proto::control::{
+    self, ChangeNote, ClientMsg, MutationError, MutationKind, ServerMsg, StateWrite, CONTROL_PROTOCOL_VERSION,
+};
 use shelbi_state::IssueFile;
 
 /// The far project.
@@ -41,6 +45,8 @@ pub struct FarHost {
     dir: PathBuf,
     /// The mutations the far daemon took, in order.
     pub taken: Arc<Mutex<Vec<Taken>>>,
+    /// The project-state writes the far daemon made, in order.
+    pub writes: Arc<Mutex<Vec<StateWrite>>>,
     /// The far daemon's change subscribers (for a pushed `Changed`).
     subscribers: Arc<Mutex<Vec<UnixStream>>>,
     /// The host's link, already up, over the in-process relay.
@@ -102,11 +108,15 @@ impl FarHost {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
         let taken: Arc<Mutex<Vec<Taken>>> = Arc::default();
+        let writes: Arc<Mutex<Vec<StateWrite>>> = Arc::default();
         let subscribers: Arc<Mutex<Vec<UnixStream>>> = Arc::default();
         serve_hub(UnixListener::bind(dir.join("hub.sock")).unwrap());
         serve_daemon(
             UnixListener::bind(dir.join("control.sock")).unwrap(),
-            taken.clone(),
+            Took {
+                taken: taken.clone(),
+                writes: writes.clone(),
+            },
             subscribers.clone(),
         );
 
@@ -118,6 +128,7 @@ impl FarHost {
             _home: home,
             dir,
             taken,
+            writes,
             subscribers,
             link,
             remote,
@@ -177,17 +188,24 @@ fn serve_hub(listener: UnixListener) {
     });
 }
 
+/// What the far daemon records.
+#[derive(Clone)]
+struct Took {
+    taken: Arc<Mutex<Vec<Taken>>>,
+    writes: Arc<Mutex<Vec<StateWrite>>>,
+}
+
 /// The far daemon: one thread per connection.
-fn serve_daemon(listener: UnixListener, taken: Arc<Mutex<Vec<Taken>>>, subscribers: Arc<Mutex<Vec<UnixStream>>>) {
+fn serve_daemon(listener: UnixListener, took: Took, subscribers: Arc<Mutex<Vec<UnixStream>>>) {
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
-            let (taken, subscribers) = (taken.clone(), subscribers.clone());
-            std::thread::spawn(move || serve_connection(stream, &taken, &subscribers));
+            let (took, subscribers) = (took.clone(), subscribers.clone());
+            std::thread::spawn(move || serve_connection(stream, &took, &subscribers));
         }
     });
 }
 
-fn serve_connection(mut stream: UnixStream, taken: &Mutex<Vec<Taken>>, subscribers: &Arc<Mutex<Vec<UnixStream>>>) {
+fn serve_connection(mut stream: UnixStream, took: &Took, subscribers: &Arc<Mutex<Vec<UnixStream>>>) {
     let mut buf = Vec::new();
     while let Some(msg) = read_frame::<ClientMsg>(&mut stream, &mut buf) {
         let reply = match msg {
@@ -203,7 +221,7 @@ fn serve_connection(mut stream: UnixStream, taken: &Mutex<Vec<Taken>>, subscribe
                 if let MutationKind::Move { to, .. } = &req.kind {
                     move_on_board(&req.id, to);
                 }
-                taken.lock().unwrap().push((req.id.clone(), req.kind.clone()));
+                took.taken.lock().unwrap().push((req.id.clone(), req.kind.clone()));
                 let done = ServerMsg::Done {
                     request_id: req.request_id,
                     state: None,
@@ -213,6 +231,20 @@ fn serve_connection(mut stream: UnixStream, taken: &Mutex<Vec<Taken>>, subscribe
                     push_changed(subscribers, &req.id, to);
                 }
                 None
+            }
+            ClientMsg::WriteState(req) => {
+                let result = shelbi_orchestrator::state_write::apply(&req.project, &req.write);
+                took.writes.lock().unwrap().push(req.write);
+                Some(match result {
+                    Ok(()) => ServerMsg::Done {
+                        request_id: req.request_id,
+                        state: None,
+                    },
+                    Err(message) => ServerMsg::Failed {
+                        request_id: req.request_id,
+                        error: MutationError::Backend { message },
+                    },
+                })
             }
             _ => None,
         };

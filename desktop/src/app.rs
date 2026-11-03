@@ -91,6 +91,7 @@ use shelbi_app::overlay::palette::ProjectEntry as PaletteProject;
 use shelbi_app::overlay::palette_search::{issue_docs, IssueDoc, PaletteSearch, SearchCorpus};
 use shelbi_app::overlay::review_confirm::Slot;
 use shelbi_app::review::{LoadStep, ReviewInfo, ReviewLoader};
+use shelbi_app::state_write::StateWrite;
 use shelbi_app::view::{SidebarModel, SidebarTarget};
 use shelbi_app::{CommandKind, CommandRegistry, EditTarget, Mutation};
 use shelbi_proto::control::DetachSelector;
@@ -1188,6 +1189,7 @@ impl ShelbiWindow {
     }
 
     /// Whether this window's project is on another machine.
+    #[cfg(test)]
     pub fn is_remote(&self) -> bool {
         self.remote.is_some()
     }
@@ -4303,11 +4305,6 @@ impl ShelbiWindow {
                 self.close_overlay(window, cx);
                 self.run_zen(project, Some((confirmed, dont_show_again)), cx);
             }
-            OverlayEvent::ClearErrors { .. } if self.is_remote() => {
-                let host = self.remote.as_ref().map(|r| r.session.host.clone()).unwrap_or_default();
-                self.banner = Some(shelbi_app::remote_window::error_log_clear_unavailable(&host).into());
-                cx.notify();
-            }
             OverlayEvent::ClearErrors { project } => {
                 if let Some(ActiveOverlay::ErrorLog {
                     viewer: Some(viewer),
@@ -4316,9 +4313,12 @@ impl ShelbiWindow {
                 {
                     viewer.clear();
                 }
-                let clear = cx
-                    .background_executor()
-                    .spawn(async move { shelbi_state::clear_errors(&project).map_err(|e| e.to_string()) });
+                // The project's daemon empties it: this machine's, or the far
+                // host's for a remote window.
+                let link = self.project_handle.link.clone();
+                let clear = cx.background_executor().spawn(async move {
+                    shelbi_app::state_write::write(&project, Some(&link), StateWrite::ClearErrors)
+                });
                 cx.spawn(async move |this, cx| {
                     let result = clear.await;
                     this.update(cx, |this, cx| {
@@ -4368,7 +4368,8 @@ impl ShelbiWindow {
     }
 
     /// `ToggleZen`: through the first-run intro on a first off-to-on toggle
-    /// (both checks read small local files, off the UI thread).
+    /// (both checks read small files off the UI thread: the project's Zen
+    /// state through the window's source, the viewer's intro flag locally).
     fn toggle_zen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let source = self.project_handle.source.clone();
         let check = cx
@@ -4389,18 +4390,21 @@ impl ShelbiWindow {
         .detach();
     }
 
-    /// Toggle Zen (or apply the intro's answer) off the UI thread, then
+    /// Toggle Zen (or apply the intro's answer) off the UI thread, through
+    /// the project's daemon (the far host's, for a remote window), then
     /// refresh the sidebar so its Zen band (or, on a failure, the error
     /// badge) follows. Success flashes nothing: the band is the indicator.
     fn run_zen(&mut self, project: String, intro: Option<(bool, bool)>, cx: &mut Context<Self>) {
+        let link = self.project_handle.link.clone();
         let work = cx.background_executor().spawn(async move {
+            let link = Some(&link);
             let result = match intro {
                 Some((confirmed, dont_show_again)) => {
-                    shelbi_app::zen::apply_intro(&project, confirmed, dont_show_again)
+                    shelbi_app::zen::apply_intro(&project, link, confirmed, dont_show_again)
                 }
-                None => shelbi_app::zen::toggle(&project),
+                None => shelbi_app::zen::toggle(&project, link),
             };
-            shelbi_app::zen::report(&project, result)
+            shelbi_app::zen::report(&project, link, result)
         });
         cx.spawn(async move |this, cx| {
             let message = work.await;
@@ -4420,17 +4424,14 @@ impl ShelbiWindow {
     fn open_error_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let project = self.project.clone();
         self.open_overlay(ActiveOverlay::error_log(project.clone()), window, cx);
-        // A remote project's read marks are the far machine's state (P7): its
-        // window reads the log and leaves the marks as they are.
-        let local = !self.is_remote();
+        // The read marks are the project's state: its daemon (the far host's,
+        // for a remote window) marks them.
         let read = cx.background_executor().spawn({
             let project = project.clone();
-            let source = self.project_handle.source.clone();
+            let handle = self.project_handle.clone();
             async move {
-                let rows = source.errors().unwrap_or_default();
-                if local {
-                    let _ = shelbi_state::mark_errors_read(&project);
-                }
+                let rows = handle.source.errors().unwrap_or_default();
+                let _ = shelbi_app::state_write::write(&project, Some(&handle.link), StateWrite::MarkErrorsRead);
                 rows
             }
         });

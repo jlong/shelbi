@@ -52,7 +52,14 @@ use crate::error::ProtoError;
 /// v6 adds [`WorkspaceSessionOp::EnsureShell`] / [`WorkspaceSessionOp::CloseShell`]:
 /// the desktop app's Workspace view asks the daemon for a plain user shell in
 /// the workspace's worktree, shown beside the agent (`dt-workspace-view`).
-pub const CONTROL_PROTOCOL_VERSION: u32 = 6;
+///
+/// v7 adds [`ClientMsg::WriteState`]: the project-state writes a client used
+/// to make on this machine's disk (the board's workspace filter and column
+/// overrides, Zen Mode, the error log and its read mark, a pane's supervision
+/// relaunch) go to the daemon, the single writer, which announces each with a
+/// [`ServerMsg::Changed`]. A remote window sends the same message over the
+/// relay (`rw-remote-state-writes`).
+pub const CONTROL_PROTOCOL_VERSION: u32 = 7;
 
 /// Upper bound on a single control frame. Generous enough for a large issue body
 /// in an `edit`/`add`, far below the session [`crate::MAX_FRAME_LEN`].
@@ -304,6 +311,84 @@ pub struct WorkspaceSessionRequest {
     pub op: WorkspaceSessionOp,
 }
 
+/// A board column's persisted collapse override, for
+/// [`StateWrite::SetColumnOverride`]. Mirrors `shelbi_state::KanbanColumnOverride`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ColumnOverride {
+    Collapsed,
+    Expanded,
+}
+
+/// The persistent pane a [`StateWrite::RequestRelaunch`] resets the daemon's
+/// supervision budget for. The daemon writes every relaunch key a pass could
+/// consume for it (a workspace is governed by more than one pass).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RelaunchPane {
+    /// The project's orchestrator.
+    Orchestrator,
+    /// A workspace's agent pane (a dev workspace or a review slot).
+    Workspace { workspace: String },
+}
+
+/// One write to a project's state files that the daemon makes on a client's
+/// behalf (protocol v7). Each was a direct disk write in the client; behind
+/// the daemon there is one writer, the change is announced to every other
+/// client, and a remote window sends the same message over the relay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StateWrite {
+    /// The board's workspace filter (`state.json`), in its persisted form;
+    /// `None` clears it.
+    SetWorkspaceFilter { filter: Option<String> },
+    /// A board column's collapse override (`state.json`); `None` clears it.
+    SetColumnOverride {
+        workflow: String,
+        status: String,
+        value: Option<ColumnOverride>,
+    },
+    /// Flip Zen Mode (`state.json`) and log the change; `source` is the
+    /// event's actor (`user:palette`).
+    ToggleZen { source: String },
+    /// Append an entry to the project's error log.
+    AppendError {
+        message: String,
+        source: Option<String>,
+    },
+    /// Empty the project's error log (and its read mark).
+    ClearErrors,
+    /// Mark every entry in the project's error log read.
+    MarkErrorsRead,
+    /// Reset a persistent pane's supervision budget so the daemon relaunches
+    /// it now (the reopen marker).
+    RequestRelaunch { pane: RelaunchPane },
+}
+
+impl StateWrite {
+    /// A short noun for the `Changed` notification and logging.
+    pub fn verb(&self) -> &'static str {
+        match self {
+            StateWrite::SetWorkspaceFilter { .. } => "workspace-filter",
+            StateWrite::SetColumnOverride { .. } => "column-override",
+            StateWrite::ToggleZen { .. } => "zen",
+            StateWrite::AppendError { .. } => "append-error",
+            StateWrite::ClearErrors => "clear-errors",
+            StateWrite::MarkErrorsRead => "mark-errors-read",
+            StateWrite::RequestRelaunch { .. } => "request-relaunch",
+        }
+    }
+}
+
+/// Client → daemon request to make one [`StateWrite`] to `project`'s state
+/// (protocol v7). Replies reuse [`ServerMsg::Done`] / [`ServerMsg::Failed`]
+/// keyed by `request_id`; every other subscriber gets a [`ServerMsg::Changed`]
+/// naming the project, with an empty issue id and [`StateWrite::verb`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateWriteRequest {
+    pub request_id: u64,
+    pub project: String,
+    pub write: StateWrite,
+}
+
 /// What kind of UI client is attached to a session. Room is left for the
 /// Desktop app attaching to a running CLI session (the detach task's
 /// motivating case). [`ClientKind::Remote`] is a remote window's link: another
@@ -427,6 +512,9 @@ pub enum ClientMsg {
         selector: DetachSelector,
         reason: String,
     },
+    /// Make one write to a project's state files (protocol v7): the daemon is
+    /// the single writer, and announces the change to every other subscriber.
+    WriteState(StateWriteRequest),
 }
 
 /// Why a mutation did not run (or could not be accepted). `Display` is the
@@ -623,6 +711,57 @@ mod tests {
         let (back, _): (ClientMsg, usize) = decode(&bytes).unwrap();
         assert_eq!(back, msg);
         assert_eq!(MutationKind::Prioritize { position: 0 }.verb(), "prioritize");
+    }
+
+    #[test]
+    fn round_trips_every_state_write() {
+        let writes = [
+            StateWrite::SetWorkspaceFilter {
+                filter: Some("ws:alpha".into()),
+            },
+            StateWrite::SetWorkspaceFilter { filter: None },
+            StateWrite::SetColumnOverride {
+                workflow: "task".into(),
+                status: "done".into(),
+                value: Some(ColumnOverride::Collapsed),
+            },
+            StateWrite::SetColumnOverride {
+                workflow: "task".into(),
+                status: "done".into(),
+                value: None,
+            },
+            StateWrite::ToggleZen {
+                source: "user:palette".into(),
+            },
+            StateWrite::AppendError {
+                message: "Zen toggle failed: x".into(),
+                source: Some("zen".into()),
+            },
+            StateWrite::ClearErrors,
+            StateWrite::MarkErrorsRead,
+            StateWrite::RequestRelaunch {
+                pane: RelaunchPane::Orchestrator,
+            },
+            StateWrite::RequestRelaunch {
+                pane: RelaunchPane::Workspace {
+                    workspace: "alpha".into(),
+                },
+            },
+        ];
+        let mut verbs = std::collections::BTreeSet::new();
+        for (n, write) in writes.into_iter().enumerate() {
+            verbs.insert(write.verb());
+            let msg = ClientMsg::WriteState(StateWriteRequest {
+                request_id: n as u64,
+                project: "p".into(),
+                write,
+            });
+            let bytes = encode(&msg).unwrap();
+            let (back, used): (ClientMsg, usize) = decode(&bytes).unwrap();
+            assert_eq!(used, bytes.len());
+            assert_eq!(back, msg);
+        }
+        assert_eq!(verbs.len(), 7, "each kind of write has its own verb");
     }
 
     #[test]

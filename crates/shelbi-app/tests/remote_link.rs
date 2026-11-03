@@ -231,3 +231,74 @@ fn far_changed_notes_and_a_reload_arrive_over_control_as_a_remote_client() {
     assert!(matches!(subscribe, ClientMsg::Subscribe { info: Some(ref i) } if i.kind == ClientKind::Remote));
     drop(subscription);
 }
+
+/// Panes never attach: the state-write test needs only the link's control.
+struct NoSessions;
+
+impl shelbi_app::session::Connector for NoSessions {
+    fn connect(
+        &self,
+        _project: &str,
+        _target: &shelbi_app::session::SessionRef,
+    ) -> Result<shelbi_app::session::Connected, shelbi_app::session::ConnectFailure> {
+        Err(shelbi_app::session::ConnectFailure::Message("no sessions here".into()))
+    }
+}
+
+#[test]
+fn a_project_state_write_goes_to_the_far_daemon_as_one_control_message() {
+    use shelbi_app::source::ProjectLink;
+    use shelbi_app::state_write::{self, ColumnOverride, StateWrite};
+    use shelbi_proto::control::MutationError;
+
+    let far = Far::new("sw");
+    let _hub = bind(&far.hub());
+    let control = bind(&far.control());
+    let link = ProjectLink::remote("demo", far.link(), Arc::new(NoSessions));
+
+    // Another project's state is never this window's to write.
+    let other = state_write::write("other", Some(&link), StateWrite::ClearErrors).unwrap_err();
+    assert!(other.contains("`other`"), "{other}");
+
+    let write = StateWrite::SetColumnOverride {
+        workflow: "task".into(),
+        status: "done".into(),
+        value: Some(ColumnOverride::Collapsed),
+    };
+    let writer = {
+        let (link, write) = (link.clone(), write.clone());
+        std::thread::spawn(move || state_write::write("demo", Some(&link), write))
+    };
+    let (mut daemon, msg) = accept_control(&control, env!("CARGO_PKG_VERSION"));
+    let ClientMsg::WriteState(req) = msg else {
+        panic!("expected the state write, got {msg:?}");
+    };
+    assert_eq!(req.project, "demo");
+    assert_eq!(req.write, write);
+    let done = ServerMsg::Done {
+        request_id: req.request_id,
+        state: None,
+    };
+    daemon.write_all(&control::encode(&done).unwrap()).unwrap();
+    assert_eq!(writer.join().unwrap(), Ok(()));
+
+    // A write the far daemon refuses comes back with the host and its reason.
+    let writer = {
+        let link = link.clone();
+        std::thread::spawn(move || link.write_state(StateWrite::MarkErrorsRead))
+    };
+    let (mut daemon, msg) = accept_control(&control, env!("CARGO_PKG_VERSION"));
+    let ClientMsg::WriteState(req) = msg else {
+        panic!("expected the state write, got {msg:?}");
+    };
+    assert_eq!(req.write, StateWrite::MarkErrorsRead);
+    let failed = ServerMsg::Failed {
+        request_id: req.request_id,
+        error: MutationError::Backend {
+            message: "disk full".into(),
+        },
+    };
+    daemon.write_all(&control::encode(&failed).unwrap()).unwrap();
+    let err = writer.join().unwrap().unwrap_err();
+    assert!(err.starts_with("devbox: ") && err.contains("disk full"), "{err}");
+}
