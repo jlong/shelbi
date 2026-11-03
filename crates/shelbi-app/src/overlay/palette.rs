@@ -497,6 +497,37 @@ impl Palette {
         }
     }
 
+    /// The pointer moved onto the `index`-th row of [`Self::rows`]: select
+    /// it (the keyboard's highlight, so ↑/↓ and Enter continue from it),
+    /// with the results holding focus. A header, or a row that's gone,
+    /// leaves the selection where it was. Returns whether anything changed
+    /// (the host redraws).
+    pub fn hover_row(&mut self, index: usize) -> bool {
+        let rows = self.rows();
+        if rows.get(index).and_then(ResultRow::item).is_none() {
+            return false;
+        }
+        let item = rows[..index].iter().filter(|r| r.item().is_some()).count();
+        let before = (self.selected, self.focus, self.filter_focus);
+        self.selected = item;
+        self.focus = PaletteFocus::Commands;
+        self.filter_focus = false;
+        before != (self.selected, self.focus, self.filter_focus)
+    }
+
+    /// The pointer moved onto the `index`-th Projects-column row
+    /// (`projects().len()` is the "Add project" row): focus the column on
+    /// it, as → and ↑/↓ would. Returns whether anything changed.
+    pub fn hover_project(&mut self, index: usize) -> bool {
+        if self.projects.is_empty() || !self.shows_projects() {
+            return false;
+        }
+        let before = (self.focus, self.project_selected);
+        self.focus = PaletteFocus::Projects;
+        self.project_selected = index.min(self.projects.len());
+        before != (self.focus, self.project_selected)
+    }
+
     /// A click on the `index`-th Projects-column row (`projects().len()` is
     /// the "Add project" row): select and activate it.
     pub fn click_project(&mut self, index: usize) -> PaletteStep {
@@ -809,6 +840,47 @@ mod tests {
         p.click_filter(SearchFilter::Commands);
         assert_eq!(p.filter(), SearchFilter::Commands);
         assert_eq!(p.click_row(0), PaletteStep::Activate(entry("action:log-out", "Log out of GitHub")));
+    }
+
+    #[test]
+    fn hover_moves_the_selection_and_the_keyboard_continues_from_it() {
+        let mut p = Palette::new(
+            vec![entry("a", "Alpha"), entry("b", "Beta"), entry("c", "Charlie")],
+            vec![project("web")],
+        );
+        assert!(p.hover_row(1), "hovering a row selects it");
+        assert!(!p.hover_row(1), "the same row again changes nothing");
+        assert_eq!(p.selected_row(), Some(1));
+        press(&mut p, key(Key::Down));
+        assert_eq!(p.selected(), 2, "↓ continues from the hovered row");
+        assert!(!p.hover_row(9), "a row that's gone leaves the selection");
+        assert_eq!(p.selected(), 2);
+        // Hovering a project focuses the column; a result takes it back.
+        assert!(p.hover_project(1));
+        assert_eq!(p.project_selection(), Some(1), "the Add project row");
+        assert_eq!(press(&mut p, key(Key::Enter)), PaletteStep::Activate(p.project_entry()));
+        assert!(p.hover_row(0));
+        assert_eq!(p.focus(), PaletteFocus::Commands);
+        assert_eq!(press(&mut p, key(Key::Enter)), PaletteStep::Activate(entry("a", "Alpha")));
+    }
+
+    #[test]
+    fn hovering_a_header_does_nothing_and_a_result_leaves_the_filter_row() {
+        let mut p = searchable();
+        type_query(&mut p, "lo");
+        press(&mut p, key(Key::Down));
+        assert!(!p.hover_row(0), "a header");
+        assert_eq!(p.selected_row(), Some(3), "the selection stays");
+        press(&mut p, key(Key::Up));
+        press(&mut p, key(Key::Up));
+        assert!(p.filter_focused());
+        assert!(p.hover_row(4));
+        assert!(!p.filter_focused(), "the results have the keys again");
+        let PaletteStep::Activate(e) = press(&mut p, key(Key::Enter)) else {
+            panic!("Enter runs the hovered result");
+        };
+        assert_eq!(e.id, "action:open-issue:1931");
+        assert!(!p.hover_project(0), "no Projects column while searching");
     }
 
     #[test]

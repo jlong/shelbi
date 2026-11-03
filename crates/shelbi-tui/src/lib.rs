@@ -21,6 +21,7 @@ mod markdown;
 mod modal_form;
 pub mod overlay;
 mod panel;
+mod picker;
 mod review_panel;
 mod shell;
 mod sidebar;

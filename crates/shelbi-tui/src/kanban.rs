@@ -117,6 +117,11 @@ pub struct KanbanApp {
     /// each frame by the renderer so a click on the chip can open the
     /// dropdown without keyboard.
     pub filter_chip_hit: Option<Rect>,
+    /// Draw the title row's `+ New issue` (the single-process shell, which
+    /// opens New task from it; the standalone board has no dialog).
+    pub show_new_issue: bool,
+    /// Where `+ New issue` was drawn last, for clicks.
+    pub new_issue_hit: Option<Rect>,
     /// Hit-test entries for the open dropdown's option rows. Empty when
     /// the dropdown is closed.
     pub dropdown_hits: Vec<DropdownHit>,
@@ -491,6 +496,8 @@ impl KanbanApp {
             workspace_filter: None,
             workspace_dropdown: None,
             filter_chip_hit: None,
+            show_new_issue: false,
+            new_issue_hit: None,
             dropdown_hits: Vec::new(),
             workflows: vec![default_workflow()],
             default_workflow_name: DEFAULT_WORKFLOW_NAME.to_string(),
@@ -1490,6 +1497,12 @@ impl KanbanApp {
         }
     }
 
+    /// True when the screen coordinate falls on the title row's
+    /// `+ New issue`.
+    pub fn new_issue_at(&self, x: u16, y: u16) -> bool {
+        self.new_issue_hit.is_some_and(|r| x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height))
+    }
+
     pub fn maybe_refresh(&mut self) {
         if self.last_refresh.elapsed() >= Duration::from_millis(750) {
             self.refresh();
@@ -2099,34 +2112,50 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let show_workflow_chip = app.workflows.len() > 1;
     let workspace_w = workspace_text.chars().count() as u16;
     let workflow_w = workflow_text.chars().count() as u16;
+    // The desktop's New issue, at the far right.
+    let new_w = if app.show_new_issue { NEW_ISSUE.chars().count() as u16 + 1 } else { 0 };
     let total_chip_w = if show_workflow_chip {
         workspace_w + workflow_w
     } else {
         workspace_w
-    };
+    } + new_w;
 
-    let (left_area, workflow_area, workspace_area) = if area.width > total_chip_w {
-        let mut constraints = Vec::with_capacity(3);
+    let (left_area, workflow_area, workspace_area, new_area) = if area.width > total_chip_w {
+        let mut constraints = Vec::with_capacity(4);
         constraints.push(Constraint::Min(0));
         if show_workflow_chip {
             constraints.push(Constraint::Length(workflow_w));
         }
         constraints.push(Constraint::Length(workspace_w));
+        if new_w > 0 {
+            constraints.push(Constraint::Length(new_w));
+        }
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints(constraints)
             .split(area);
+        let new_area = (new_w > 0).then(|| chunks[chunks.len() - 1]);
         if show_workflow_chip {
-            (chunks[0], Some(chunks[1]), Some(chunks[2]))
+            (chunks[0], Some(chunks[1]), Some(chunks[2]), new_area)
         } else {
-            (chunks[0], None, Some(chunks[1]))
+            (chunks[0], None, Some(chunks[1]), new_area)
         }
     } else {
         // Title bar is too narrow for the chips — drop them and give
         // all the space to the left. Dropdowns remain reachable by
         // hotkey; the chips are just a hint.
-        (area, None, None)
+        (area, None, None, None)
     };
+
+    match new_area {
+        Some(r) => {
+            let hit = Rect { x: r.x + 1, width: r.width - 1, ..r };
+            let style = Style::default().fg(palette().white).bg(palette().button);
+            f.render_widget(Paragraph::new(Line::from(Span::styled(NEW_ISSUE, style))), hit);
+            app.new_issue_hit = Some(hit);
+        }
+        None => app.new_issue_hit = None,
+    }
 
     let mut left_spans = vec![
         Span::styled("Issues · ", Style::default().fg(palette().ansi_dark_gray)),
@@ -2188,6 +2217,9 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         app.filter_chip_hit = None;
     }
 }
+
+/// The title row's New issue: opens New task (the board's `n`).
+const NEW_ISSUE: &str = " + New issue ";
 
 /// The title row's search: `/query` (with a cursor while it's typed), a
 /// quiet `…` while a GitHub search is on its way, and the match count or the
@@ -2749,6 +2781,9 @@ fn render_footer(f: &mut Frame, app: &KanbanApp, area: Rect) {
         fc(km.kanban.first_chord_for(KanbanAction::CycleWorkflowFilter)),
         fc(km.kanban.first_chord_for(KanbanAction::Refresh)),
     );
+    if app.show_new_issue {
+        text.push_str("   n new");
+    }
     // Only advertise the workspace jump when the selected card actually has
     // one — its absence from the footer is the board-side "no workspace to
     // open" signal, mirroring the status-line message pressing `o` yields.

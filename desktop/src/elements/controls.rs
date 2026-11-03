@@ -345,6 +345,35 @@ pub fn check(selected: bool, focused: bool, theme: &Theme) -> Div {
         .when(focused, |d| d.child(glow(3.0, glow_color)))
 }
 
+/// The Switch (`2739:1615`): a 36 × 22 pill with an 18pt white thumb 2pt
+/// in, at the left when off on the Default control fill (`background`),
+/// at the right when on in the checked-control tint (`check_fill`, the
+/// checkbox's). The caller gives it a visible label beside it and its role.
+pub fn switch(on: bool, theme: &Theme) -> Div {
+    const W: f32 = 36.0;
+    const H: f32 = 22.0;
+    const THUMB: f32 = 18.0;
+    const INSET: f32 = (H - THUMB) / 2.0;
+    let track = if on { theme.check_fill } else { theme.background };
+    div()
+        .debug_selector(move || if on { "switch-on".into() } else { "switch-off".into() })
+        .relative()
+        .flex_none()
+        .w(px(W))
+        .h(px(H))
+        .rounded_full()
+        .bg(track)
+        .child(
+            div()
+                .absolute()
+                .top(px(INSET))
+                .left(px(if on { W - THUMB - INSET } else { INSET }))
+                .size(px(THUMB))
+                .rounded_full()
+                .bg(gpui::white()),
+        )
+}
+
 /// A checkbox: the [`check`] and its label (Base; loud when checked,
 /// `form_text` when not), 8px apart, 2px in.
 pub fn checkbox(

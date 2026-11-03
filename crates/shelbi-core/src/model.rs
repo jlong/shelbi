@@ -1869,6 +1869,25 @@ pub struct ProjectAgentConfig {
     pub runner: Option<RunnerKind>,
 }
 
+/// The runner and model a new project's agents use by default, as the
+/// new-project flow's "Agent defaults" step chooses them. The project
+/// creation engine writes them into the new project's config
+/// (`shelbi_orchestrator::project_create`); a create without the step (`shelbi
+/// init`) writes the stock defaults, the same as [`AgentDefaults::default`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentDefaults {
+    pub runner: RunnerKind,
+    /// `None`: the runner's own default model (nothing is written).
+    pub model: Option<String>,
+}
+
+impl Default for AgentDefaults {
+    /// Claude Code on its default model.
+    fn default() -> Self {
+        AgentDefaults { runner: RunnerKind::Claude, model: None }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptInjectionSpec {
     pub kind: PromptInjectionKind,

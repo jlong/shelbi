@@ -239,6 +239,7 @@ impl Executor for Scenario {
             // the TUI's overlay): the view, focus and overlay stack stay put.
             Effect::LoadReview { .. }
             | Effect::SendFeedback
+            | Effect::NewIssue { .. }
             | Effect::OpenEditor { .. }
             | Effect::Detach
             | Effect::DetachOtherClients
@@ -272,6 +273,7 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::OpenErrorLog => "the_error_log_opens_its_overlay",
         CommandKind::OpenSettings => "settings_opens_over_the_view_on_the_last_page",
         CommandKind::SendFeedback => "send_feedback_reaches_the_host_and_leaves_the_view",
+        CommandKind::NewIssue => "new_issue_opens_the_new_task_dialog_over_the_view",
         CommandKind::OpenAbout => "about_reaches_the_host_with_or_without_a_project",
         CommandKind::OpenAcknowledgements => "acknowledgements_reach_the_host_with_or_without_a_project",
         CommandKind::SwitchProject { .. } => "switch_project_moves_the_client_or_opens_the_switcher",
@@ -323,6 +325,7 @@ fn every_command_kind_has_a_scenario() {
             "review:T-9",
             "action:approve-review:T-9",
             "action:reject-review:T-9",
+            "action:new-issue",
             "action:error-log",
             "action:settings",
             "action:send-feedback",
@@ -552,6 +555,22 @@ fn send_feedback_reaches_the_host_and_leaves_the_view() {
 }
 
 #[test]
+fn new_issue_opens_the_new_task_dialog_over_the_view() {
+    let mut s = Scenario::new();
+    s.client.set_view(View::Activity);
+    let want = Effect::NewIssue { project: PROJECT.to_string() };
+    assert_eq!(s.invoke("action:new-issue"), want);
+    assert_eq!(s.last(), &Performed::Host(want), "the host opens its dialog; nothing reaches the daemon yet");
+    assert_eq!(s.client.view(), &View::Activity, "the view under the dialog stays");
+    assert_eq!(s.client.overlay(), None);
+
+    // There's nowhere to add an issue without a project.
+    let mut m = fixture();
+    m.project = None;
+    assert!(CommandRegistry::new().resolve("action:new-issue", &m).is_none());
+}
+
+#[test]
 fn about_reaches_the_host_with_or_without_a_project() {
     let mut s = Scenario::new();
     s.client.set_view(View::Activity);
@@ -656,19 +675,25 @@ fn add_project_collects_the_form_then_mutates() {
     assert_eq!(s.client.overlay(), Some(&Overlay::AddProject));
 
     // The shared form: the path prefills to the working directory; type a
-    // name and submit.
+    // name, Continue (the host validates), choose the agent defaults, then
+    // Continue and Create Project.
     let mut form = add_project::Form::new(Path::new("/src/web"));
     type_into("Web App", |c| {
         form.handle_key(c);
     });
-    assert_eq!(
-        form.handle_key(KeyChord::new(Key::Enter, Mods::NONE)),
-        add_project::Step::Submit
-    );
+    let enter = KeyChord::new(Key::Enter, Mods::NONE);
+    assert_eq!(form.handle_key(enter), add_project::Step::Validate);
+    form.folder_valid();
+    assert_eq!(form.page(), add_project::Page::Defaults);
+    form.select_runner(shelbi_core::RunnerKind::Codex);
+    form.select_model(Some("gpt-5"));
+    assert_eq!(form.handle_key(enter), add_project::Step::Continue);
+    assert_eq!(form.handle_key(enter), add_project::Step::Submit);
     let m = Mutation::AddProject {
         name: form.name().to_string(),
         root: form.root().to_string(),
         mode: form.mode(),
+        defaults: form.defaults(),
     };
     s.run(Effect::Mutate(m.clone())).unwrap();
     assert_eq!(
@@ -677,6 +702,10 @@ fn add_project_collects_the_form_then_mutates() {
             name: "Web App".into(),
             root: "/src/web".into(),
             mode: ConfigMode::Global,
+            defaults: shelbi_core::AgentDefaults {
+                runner: shelbi_core::RunnerKind::Codex,
+                model: Some("gpt-5".into()),
+            },
         })
     );
 }
@@ -908,12 +937,22 @@ fn board_mutations_carry_the_project() {
                 expect_body: None,
             },
         ),
+        // The New task dialog's create: every field rides the one add.
         (
-            CommandKind::AddIssue { title: s("New") },
+            CommandKind::AddIssue {
+                title: s("New"),
+                body: Some(s("The body")),
+                workflow: Some(s("subtask")),
+                status: Some(s("todo")),
+                top: true,
+            },
             Mutation::AddIssue {
                 project: s(PROJECT),
                 title: s("New"),
-                workflow: None,
+                body: Some(s("The body")),
+                workflow: Some(s("subtask")),
+                status: Some(s("todo")),
+                top: true,
             },
         ),
         (

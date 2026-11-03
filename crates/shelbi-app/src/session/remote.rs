@@ -179,6 +179,29 @@ pub fn orchestrator_title_over(link: &dyn RelayLink, project: &str) -> Option<St
     rx.recv_timeout(TITLE_DEADLINE).ok().flatten()
 }
 
+/// Type `text` into `project`'s orchestrator on `link`'s host (New task's
+/// write-up hand-off), over a stream the relay opens to its session.
+pub fn message_orchestrator_over(
+    link: &dyn RelayLink,
+    project: &str,
+    text: &str,
+) -> Result<(), crate::new_task::HandoffError> {
+    use crate::new_task::HandoffError;
+    let want = discovery_name(project, &SessionRef::Orchestrator);
+    let sessions = link
+        .list_sessions()
+        .map_err(|e| HandoffError::Failed(format!("{}: {e}", link.host())))?;
+    let Some(session) = sessions.iter().find(|s| s.alive && s.name == want) else {
+        return Err(HandoffError::NotRunning);
+    };
+    let stream = link
+        .open_session(&session.short_id)
+        .map_err(|e| HandoffError::Failed(format!("{}: {e}", link.host())))?;
+    let (conn, _events) = Connection::connect(Box::new(stream), None, capability::ALL)
+        .map_err(|e| HandoffError::Failed(format!("{}: {e}", link.host())))?;
+    crate::new_task::paste_then_return(&conn, text)
+}
+
 /// This machine's orchestrator's window title, from its session socket.
 /// `None` when there is no live session, it doesn't answer within half a
 /// second, or it has set no title.

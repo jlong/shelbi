@@ -69,7 +69,8 @@
 //! `SHELBI_VISUAL_ONLY=about` renders just those;
 //! `SHELBI_VISUAL_ONLY=workspaces` renders just Settings ▸ Workspaces and its
 //! machine dialogs.
-//! `add-project-*-<theme>.png` are the Add Project wizard's screens 01, 02,
+//! `add-project-*-<theme>.png` are the Add Project wizard's screens 01, the
+//! Agent defaults (`add-project-defaults`), 02,
 //! 03 (`add-project-writing-config`, `-creating-agents`,
 //! `-adding-workflows`) and 04 (`add-project-ready`) at 800 × 580;
 //! `SHELBI_VISUAL_ONLY=add-project` renders just those.
@@ -1321,6 +1322,45 @@ impl Run {
         }
     }
 
+    /// The Orchestrator view's onboarding (`orch-onboarding`): the
+    /// Welcome (2709:10719), Choose provider and model (2709:11068) and
+    /// Review instructions (2709:11492) frames, over the fixture project's
+    /// shipped orchestrator (Continue writes into the run's sandbox home).
+    fn orchestrator_onboarding(&mut self, orch: &View) {
+        use crate::views::onboarding::OnboardingView;
+        type Step = dyn Fn(&mut OnboardingView, &mut gpui::Window, &mut gpui::Context<OnboardingView>);
+        let workflows = shelbi_state::workflows_dir(PROJECT).expect("the workflows directory");
+        let project_dir = workflows.parent().expect("the project directory").to_path_buf();
+        let agents = project_dir.join("agents");
+        let had_agents = agents.exists();
+        crate::views::agents_state::fixture::write(&project_dir, PROJECT);
+        let shot = |run: &mut Self, screen: &str, steps: &[&Step]| {
+            let handle = run.open();
+            run.click(handle, orch.clone());
+            let view = handle.update(&mut run.cx, |w, window, cx| w.offscreen_onboarding(window, cx)).unwrap();
+            run.settle(handle);
+            for step in steps {
+                handle.update(&mut run.cx, |_, window, cx| view.update(cx, |v, cx| step(v, window, cx))).unwrap();
+                run.settle(handle);
+            }
+            run.save(handle, screen);
+        };
+        shot(self, "orchestrator-onboarding-1-welcome", &[]);
+        // The fixture project runs Codex; the frames show Claude Code on
+        // Opus, chosen here (nothing is written before Continue).
+        let choose: &Step = &|v, window, cx| {
+            v.get_started(window, cx);
+            v.select_runner(shelbi_core::RunnerKind::Claude, cx);
+            v.select_model(Some("opus".into()), cx);
+        };
+        shot(self, "orchestrator-onboarding-2-harness", &[choose]);
+        shot(self, "orchestrator-onboarding-3-instructions", &[choose, &|v, window, cx| v.continue_(window, cx)]);
+        let _ = std::fs::remove_dir_all(&workflows);
+        if !had_agents {
+            let _ = std::fs::remove_dir_all(&agents);
+        }
+    }
+
     /// Settings ▸ Agents (the Agents frame, 2377:41040, reference
     /// `agents/1-agents-index.png`) over the frame's agents
     /// (`agents_state::fixture`: the shipped six, the orchestrator and the
@@ -1516,6 +1556,43 @@ impl Run {
             self.save(handle, screen);
         }
         self.cx.update(|cx| cx.remove_global::<FeedbackGlobal>());
+    }
+
+    /// New task (`new-task-dialog`, Figma "New task · Dark" `2730:10845`)
+    /// over the Issues board, filled as the frame shows it, the keyboard in
+    /// Title (`state-new-task`); and with the write-up switched on
+    /// (`state-new-task-write-up`, checked by eye).
+    /// `SHELBI_VISUAL_ONLY=new-task` renders just these.
+    fn new_task_states(&mut self) {
+        for (screen, write_up) in [("state-new-task", false), ("state-new-task-write-up", true)] {
+            let handle = self.open();
+            self.click(handle, View::Issues);
+            self.wait_for_board(handle);
+            let dialog = handle
+                .update(&mut self.cx, |w, window, cx| {
+                    w.open_new_task(window, cx);
+                    w.offscreen_new_task()
+                })
+                .unwrap()
+                .expect("New task opened");
+            handle
+                .update(&mut self.cx, |_, window, cx| {
+                    dialog.update(cx, |d, cx| {
+                        d.offscreen_fill(
+                            "Restore the last active project on launch",
+                            "Reopen the project that was active when Shelbi last closed.\n\n\u{2022} Restore the last active project after restarting the app.\n\u{2022} Show the project picker if its directory is unavailable.",
+                            window,
+                            cx,
+                        );
+                        if write_up {
+                            d.offscreen_write_up(cx);
+                        }
+                    })
+                })
+                .unwrap();
+            self.settle(handle);
+            self.save(handle, screen);
+        }
     }
 
     /// Settings ▸ Workspaces' machine dialogs over the page: Add machine
@@ -2205,9 +2282,10 @@ impl Run {
     /// window, over a canned folder check (nothing reads the disk): `add-
     /// project-folder` (no folder yet, Figma 2481:8574), `add-project-
     /// folder-selected` (`~/Projects/my-project`, a Git repository,
-    /// 2481:8810) and `add-project-settings-in-repo` / `-global` (each card
-    /// selected, 2483:8653 / 2483:8897). `SHELBI_VISUAL_ONLY=add-project`
-    /// renders just these.
+    /// 2481:8810), `add-project-defaults` (the Agent defaults, Claude Code on
+    /// its default model, 2720:33054) and `add-project-settings-in-repo` /
+    /// `-global` (each card selected, 2483:8653 / 2483:8897).
+    /// `SHELBI_VISUAL_ONLY=add-project` renders just these.
     fn add_project_windows(&mut self) {
         use crate::views::add_project::{AddProjectView, Engine, SIZE};
         use shelbi_app::add_project_wizard::{FolderCheck, Focus, Origin, Repo};
@@ -2234,13 +2312,16 @@ impl Run {
             create: Arc::new(|_, _, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
             refresh: Arc::new(|| {}),
         };
-        let states: [(&str, Option<ConfigMode>, bool); 4] = [
-            ("add-project-folder", None, false),
-            ("add-project-folder-selected", None, true),
-            ("add-project-settings-in-repo", Some(ConfigMode::InRepo), true),
-            ("add-project-settings-global", Some(ConfigMode::Global), true),
+        // Each state: its name, Continues pressed, the card chosen, whether a
+        // folder is picked.
+        let states: [(&str, usize, Option<ConfigMode>, bool); 5] = [
+            ("add-project-folder", 0, None, false),
+            ("add-project-folder-selected", 0, None, true),
+            ("add-project-defaults", 1, None, true),
+            ("add-project-settings-in-repo", 2, Some(ConfigMode::InRepo), true),
+            ("add-project-settings-global", 2, Some(ConfigMode::Global), true),
         ];
-        for (screen, mode, pick) in states {
+        for (screen, continues, mode, pick) in states {
             let engine = engine.clone();
             let handle = self
                 .cx
@@ -2260,16 +2341,18 @@ impl Run {
                     .unwrap();
                 self.settle_sheet(window);
             }
-            if let Some(mode) = mode {
-                self.cx
-                    .update_window(window, |_, window, cx| {
-                        view.update(cx, |v, cx| {
+            self.cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |v, cx| {
+                        for _ in 0..continues {
                             v.click(Focus::Primary, window, cx);
+                        }
+                        if let Some(mode) = mode {
                             v.click(Focus::Card(mode), window, cx);
-                        })
+                        }
                     })
-                    .unwrap();
-            }
+                })
+                .unwrap();
             self.settle_sheet(window);
             self.settle_sheet(window);
             self.write_sized(window, screen, SIZE.0 as u32);
@@ -2664,6 +2747,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "new-task") {
+            self.new_task_states();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "changelog") {
             self.changelog();
             return;
@@ -2697,6 +2785,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "onboarding") {
+            self.orchestrator_onboarding(&orch);
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "buttons") {
             self.components();
             self.review_confirm_states(&orch);
@@ -2709,6 +2802,7 @@ impl Run {
         self.settle(handle);
         self.save(handle, "orchestrator");
         self.terminal_states(&orch);
+        self.orchestrator_onboarding(&orch);
 
         self.issues();
 
@@ -2795,6 +2889,7 @@ impl Run {
         self.add_project_windows();
         self.cli_setup_windows();
         self.feedback_states();
+        self.new_task_states();
         self.launch_windows();
 
         let missing: Vec<&str> = SCREENS

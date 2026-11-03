@@ -27,6 +27,7 @@ pub mod remote_session;
 use shelbi_app::session::relaunch;
 mod review;
 mod keybindings;
+mod onboarding;
 mod session;
 mod settings;
 mod sidebar;
@@ -159,6 +160,15 @@ enum SettingsMsg {
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
 type SettingsReader = Arc<dyn Fn(Option<&str>) -> GeneralSummary + Send + Sync>;
+
+/// Runs New task's create in `project` (the daemon's add, then the
+/// orchestrator hand-off): [`shelbi_app::new_task::create_live`], or a
+/// test's recorder. Called off the UI thread.
+type NewTaskRunner = Arc<
+    dyn Fn(&str, &shelbi_app::new_task::CreateRequest) -> Result<shelbi_app::new_task::Created, String>
+        + Send
+        + Sync,
+>;
 
 /// Reads a project's workflow config for Settings ▸ Workflows (blocking; run
 /// off the UI thread).
@@ -633,10 +643,16 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if state.poll_feedback_job() {
             state.dirty = true;
         }
+        if state.poll_new_task_job() {
+            state.dirty = true;
+        }
         if state.poll_launch() {
             state.dirty = true;
         }
         if state.poll_startup() {
+            state.dirty = true;
+        }
+        if state.poll_onboarding() {
             state.dirty = true;
         }
         if state.poll_settings() {
@@ -944,6 +960,26 @@ trait Bootstrap: Send + Sync {
     /// orchestrator dashboard. Blocking; returns a user-facing message on
     /// failure.
     fn bootstrap(&self, project: &str) -> Result<(), String>;
+
+    /// Whether `project`'s Orchestrator view shows the onboarding
+    /// (`orch-onboarding`): then the startup brings the daemon up but not the
+    /// orchestrator. A stub says no, so tests see today's startup.
+    fn needs_onboarding(&self, _project: &str) -> bool {
+        false
+    }
+
+    /// Start the daemon only (a project still onboarding). Blocking.
+    fn start_daemon(&self) {}
+}
+
+/// What the startup job did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Started {
+    /// The orchestrator is up.
+    Orchestrator,
+    /// The project's orchestrator isn't set up: the Orchestrator view shows
+    /// the onboarding, and nothing was launched.
+    Onboarding,
 }
 
 /// The production [`Bootstrap`]: start the hub daemon, then bootstrap the
@@ -966,6 +1002,16 @@ impl Bootstrap for DaemonBootstrap {
         shelbi_orchestrator::ensure_dashboard(project)
             .map(|_status| ())
             .map_err(|e| format!("couldn't bring up the orchestrator: {e}"))
+    }
+
+    fn needs_onboarding(&self, project: &str) -> bool {
+        shelbi_app::onboarding::needs_onboarding(project)
+    }
+
+    fn start_daemon(&self) {
+        if let Err(e) = shelbi_state::ensure_daemon_running() {
+            tracing::warn!(error = %e, "could not start the hub daemon");
+        }
     }
 }
 
@@ -1128,6 +1174,7 @@ fn production_workers(project: &str, activity_cache: Arc<Mutex<ActivityMetaCache
 fn build_embedded_apps(project: &str, keymaps: &Keymaps) -> (KanbanApp, ActivityApp, MachinesApp) {
     let mut kanban = KanbanApp::new(project);
     kanban.keymaps = keymaps.clone();
+    kanban.show_new_issue = true;
     // Board moves go through the shelbi-app executor (daemon-backed when
     // `dev.daemon_mutations` is on); the standalone process keeps its direct path.
     kanban.move_persister = Some(Arc::new(ExecutorMovePersister));
@@ -1175,7 +1222,12 @@ struct ShellState {
     /// while it is still pending. A project switch replaces it (dropping the old
     /// project's receiver), so a late result for a project the user already left
     /// never lands in the new project's view or status.
-    startup_rx: Option<(String, Receiver<Result<(), String>>)>,
+    startup_rx: Option<(String, Receiver<Result<Started, String>>)>,
+    /// The Orchestrator view's onboarding for the current project, while its
+    /// orchestrator isn't set up (`orch-onboarding`): shown in place of the
+    /// orchestrator's terminal. Dropped when its Launch Orchestrator lands
+    /// or the project switches.
+    onboarding: Option<onboarding::OnboardingPage>,
     /// The open review interface (panel + content terminal view), when
     /// `main_view` is [`MainView::Review`]. `rt-tui-review`.
     review: Option<ReviewInterface>,
@@ -1420,6 +1472,11 @@ struct ShellState {
     feedback_service: shelbi_app::feedback::FeedbackService,
     /// The Contact Us send that's out, off the UI thread.
     feedback_job: Option<Receiver<Result<(), shelbi_app::feedback::FeedbackError>>>,
+    /// New task's create that's out, off the UI thread.
+    new_task_job: Option<Receiver<Result<shelbi_app::new_task::Created, String>>>,
+    /// Runs New task's create (the daemon's add, then the orchestrator
+    /// hand-off): the live one, or a test's recorder.
+    new_task_runner: NewTaskRunner,
     /// How the launch screen and Connect to Remote Session reach another
     /// machine (`None`: connecting isn't offered, so the palette doesn't
     /// list it), and start the daemon for a project they open: the live
@@ -1581,6 +1638,7 @@ impl ShellState {
             lifecycle,
             bootstrap,
             startup_rx: None,
+            onboarding: None,
             review: None,
             review_rx: None,
             review_backend: Arc::new(DaemonReviewBackend),
@@ -1661,6 +1719,10 @@ impl ShellState {
             create_job: None,
             feedback_service,
             feedback_job: None,
+            new_task_job: None,
+            new_task_runner: Arc::new(|project: &str, request: &shelbi_app::new_task::CreateRequest| {
+                shelbi_app::new_task::create_live(project, request)
+            }),
             remote: crate::launch::remote_connector(),
             launch_daemon: Arc::new(shelbi_app::launch::SharedDaemon),
             should_quit: false,
@@ -1795,36 +1857,60 @@ impl ShellState {
     }
 
     /// The per-frame sidebar inputs (the palette chord, the hovered footer
-    /// button), owned so the draw closure holds no borrow of the rest of the
-    /// shell state.
+    /// button, whether the Search button or the project name is hovered),
+    /// owned so the draw closure holds no borrow of the rest of the shell
+    /// state.
     fn sidebar_chrome(&self) -> sidebar::SidebarChrome {
         sidebar::SidebarChrome::from_keymaps(&self.keymaps, self.display_style)
             .with_hover(self.footer_hover())
+            .with_search_hover(self.search_hover())
+            .with_name_hover(self.name_hover())
     }
 
-    /// The sidebar footer button under the pointer, while the nav sidebar is
-    /// what shows there: never under an overlay, Settings, or a review or
-    /// workspace panel in the sidebar's column.
-    fn footer_hover(&self) -> Option<FooterButton> {
+    /// The pointer, while it is over the nav sidebar and that is what shows
+    /// there: never under an overlay, Settings, or a review or workspace
+    /// panel in the sidebar's column.
+    fn sidebar_pointer(&self) -> Option<(u16, u16)> {
         let (x, y) = self.pointer?;
-        if self.overlay.is_some()
+        let hidden = self.overlay.is_some()
             || self.settings_open()
             || self.acknowledgements_open()
-            || matches!(self.main_view, MainView::Review(_) | MainView::Workspace(_))
-            || !contains(self.sidebar_rect, x, y)
-        {
-            return None;
-        }
+            || matches!(self.main_view, MainView::Review(_) | MainView::Workspace(_));
+        (!hidden && contains(self.sidebar_rect, x, y)).then_some((x, y))
+    }
+
+    /// The sidebar footer button under the pointer (see
+    /// [`Self::sidebar_pointer`]).
+    fn footer_hover(&self) -> Option<FooterButton> {
+        let (x, y) = self.sidebar_pointer()?;
         self.sidebar_view()?
             .footer_button_at(self.sidebar_content_rect(), x, y)
     }
 
+    /// Whether the pointer is over the header's Search button (see
+    /// [`Self::sidebar_pointer`]).
+    fn search_hover(&self) -> bool {
+        self.sidebar_pointer().is_some_and(|(x, y)| {
+            self.sidebar_view()
+                .is_some_and(|v| v.search_button_hit(self.sidebar_content_rect(), x, y))
+        })
+    }
+
+    /// Whether the pointer is over the header's project name (see
+    /// [`Self::sidebar_pointer`]).
+    fn name_hover(&self) -> bool {
+        self.sidebar_pointer().is_some_and(|(x, y)| {
+            self.sidebar_view()
+                .is_some_and(|v| v.project_name_hit(self.sidebar_content_rect(), x, y))
+        })
+    }
+
     /// Record where the pointer is (`None`: the terminal lost focus, so it may
-    /// be anywhere), repainting when that moves the footer's hover.
+    /// be anywhere), repainting when that moves the sidebar's hover.
     fn track_pointer(&mut self, pointer: Option<(u16, u16)>) {
-        let before = self.footer_hover();
+        let before = (self.footer_hover(), self.search_hover(), self.name_hover());
         self.pointer = pointer;
-        if self.footer_hover() != before {
+        if (self.footer_hover(), self.search_hover(), self.name_hover()) != before {
             self.dirty = true;
         }
         // A Settings table row under the pointer lights; one it left goes
@@ -2154,6 +2240,9 @@ impl ShellState {
         // open/load still in flight for it, whose late result must not land in
         // the new project.
         let old_interfaces = (self.review.take(), self.workspace.take());
+        // The onboarding belongs to the project we left too; the target's
+        // startup brings its own up if it needs one.
+        self.onboarding = None;
         self.review_rx = None;
         self.review_opening = None;
         self.review_open_pending = None;
@@ -2396,6 +2485,13 @@ impl ShellState {
             return;
         }
         match self.main_view {
+            MainView::Session if self.onboarding_shown() => {
+                self.client.focus_main();
+                if let Some(page) = self.onboarding.as_mut() {
+                    page.paste(text);
+                }
+                self.dirty = true;
+            }
             MainView::Session => {
                 self.client.focus_main();
                 self.sessions.send_paste(text);
@@ -3494,11 +3590,12 @@ impl ShellState {
                 self.overlay = None;
                 self.client.focus_main();
             }
-            OverlayEvent::AddProjectSubmit { name, root, mode } => {
-                self.submit_add_project(name, root, mode)
+            OverlayEvent::AddProjectSubmit { name, root, mode, defaults } => {
+                self.submit_add_project(name, root, mode, defaults)
             }
             OverlayEvent::OpenUrl(url) => self.open_url(url),
             OverlayEvent::FeedbackSend(submission) => self.send_feedback(submission),
+            OverlayEvent::NewTaskCreate(request) => self.create_new_task(request),
             OverlayEvent::OpenAcknowledgements => {
                 self.overlay = None;
                 self.open_acknowledgements(AckReturn { about: true });
@@ -3543,6 +3640,69 @@ impl ShellState {
         }
     }
 
+    /// Open New task for `project` over the current view, its pickers from
+    /// the board's loaded workflows.
+    fn open_new_task(&mut self, project: &str) {
+        let dialog = ActiveOverlay::new_task(project, &self.kanban.workflows, &self.kanban.default_workflow_name);
+        self.overlay = Some(dialog);
+        self.dirty = true;
+    }
+
+    /// Run New task's create off the UI thread; [`Self::poll_new_task_job`]
+    /// hands the answer back. The dialog stays up meanwhile, "Creating…".
+    fn create_new_task(&mut self, request: shelbi_app::new_task::CreateRequest) {
+        let Some(ActiveOverlay::NewTask(dialog)) = self.overlay.as_ref() else {
+            return;
+        };
+        let project = dialog.project().to_string();
+        let runner = self.new_task_runner.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-new-task".into())
+            .spawn(move || {
+                let _ = tx.send(runner(&project, &request));
+            });
+        match spawned {
+            Ok(_) => self.new_task_job = Some(rx),
+            Err(e) => self.new_task_landed(Err(e.to_string())),
+        }
+    }
+
+    /// New task's create came back: hand it to the dialog. Returns `true`
+    /// when it did (so the caller redraws).
+    fn poll_new_task_job(&mut self) -> bool {
+        let result = match &self.new_task_job {
+            Some(rx) => match rx.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => Err("the create stopped unexpectedly".to_string()),
+            },
+            None => return false,
+        };
+        self.new_task_job = None;
+        self.new_task_landed(result);
+        true
+    }
+
+    /// Created: close the dialog and say so (and what became of the
+    /// write-up) on the status line; failed: the error under the form.
+    fn new_task_landed(&mut self, result: Result<shelbi_app::new_task::Created, String>) {
+        let message = result.as_ref().ok().map(|c| c.message());
+        let Some(ActiveOverlay::NewTask(dialog)) = self.overlay.as_mut() else {
+            self.status = message;
+            return;
+        };
+        let step = dialog.finished(result.map(|_| ()));
+        if step == crate::overlay::new_task::Step::Close {
+            self.overlay = None;
+            self.client.focus_main();
+        }
+        if message.is_some() {
+            self.status = message;
+        }
+        self.dirty = true;
+    }
+
     /// The Contact Us send came back: hand it to the dialog. Returns `true`
     /// when it did (so the caller redraws).
     fn poll_feedback_job(&mut self) -> bool {
@@ -3575,13 +3735,13 @@ impl ShellState {
     /// scaffold + switch off the UI thread; on failure, keep the form open with
     /// the inline error so the user can fix the input. Validation itself is
     /// cheap (a slug check, a collision lookup, a path stat) so it runs here.
-    fn submit_add_project(&mut self, name: String, root: String, mode: ConfigMode) {
+    fn submit_add_project(&mut self, name: String, root: String, mode: ConfigMode, defaults: shelbi_core::AgentDefaults) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         match project_create::validate_add_project(&name, &root, &cwd) {
             Ok(resolved) => {
                 self.overlay = None;
                 self.client.focus_main();
-                self.create_project(resolved, mode);
+                self.create_project(resolved, mode, defaults);
             }
             Err(msg) => {
                 if let Some(ActiveOverlay::AddProject { form }) = self.overlay.as_mut() {
@@ -3593,18 +3753,20 @@ impl ShellState {
     }
 
     /// Scaffold the validated project off the UI thread (file IO can block),
-    /// pinning the `file_system` board the form has no control over. On success
-    /// [`Self::poll_create_job`] switches to it on the UI thread.
-    fn create_project(&mut self, resolved: ResolvedProjectRoot, mode: ConfigMode) {
+    /// pinning the `file_system` board the form has no control over, with the
+    /// agent defaults it chose. On success [`Self::poll_create_job`] switches
+    /// to it on the UI thread.
+    fn create_project(&mut self, resolved: ResolvedProjectRoot, mode: ConfigMode, defaults: shelbi_core::AgentDefaults) {
         let (tx, rx) = std::sync::mpsc::channel();
         let slug = resolved.name.clone();
         if std::thread::Builder::new()
             .name("shelbi-add-project".into())
             .spawn(move || {
-                let outcome = match project_create::scaffold_project(
+                let outcome = match project_create::scaffold_project_with(
                     &resolved,
                     mode,
                     &IssueTrackerConfig::default(),
+                    &defaults,
                     &mut project_create::NullReporter,
                 ) {
                     Ok(()) => CreateOutcome::Created(slug),
@@ -3671,7 +3833,13 @@ impl ShellState {
         if std::thread::Builder::new()
             .name("shelbi-shell-startup".into())
             .spawn(move || {
-                let _ = tx.send(bootstrap.bootstrap(&job_project));
+                let started = if bootstrap.needs_onboarding(&job_project) {
+                    bootstrap.start_daemon();
+                    Ok(Started::Onboarding)
+                } else {
+                    bootstrap.bootstrap(&job_project).map(|()| Started::Orchestrator)
+                };
+                let _ = tx.send(started);
             })
             .is_ok()
         {
@@ -3703,7 +3871,20 @@ impl ShellState {
         };
         self.startup_rx = None;
         match result {
-            Ok(()) => {
+            Ok(Started::Onboarding) => {
+                // Nothing launched: the Orchestrator view shows the onboarding
+                // until its Launch Orchestrator.
+                if let Some(project) = self.client.project() {
+                    if self.onboarding.as_ref().map(|o| o.project()) != Some(project) {
+                        self.onboarding = Some(onboarding::OnboardingPage::new(project));
+                    }
+                }
+                if self.status.as_deref() == Some(STARTUP_STATUS) {
+                    self.status = None;
+                }
+            }
+            Ok(Started::Orchestrator) => {
+                self.onboarding = None;
                 // The orchestrator session exists now; re-attach if the main area
                 // is showing a session (a native view doesn't need it).
                 if matches!(self.main_view, MainView::Session) {
@@ -3716,6 +3897,38 @@ impl ShellState {
             Err(msg) => self.status = Some(msg),
         }
         true
+    }
+
+    /// Whether the main area shows the onboarding: the Orchestrator view of
+    /// a project whose orchestrator isn't set up (`orch-onboarding`).
+    fn onboarding_shown(&self) -> bool {
+        self.onboarding.is_some()
+            && matches!(self.main_view, MainView::Session)
+            && self.sessions.current_target() == Some(&SessionRef::Orchestrator)
+    }
+
+    /// Fold in the onboarding's finished reads and saves. Launch
+    /// Orchestrator's landing starts the orchestrator through the usual
+    /// startup (the project counts as set up now, so it launches) and the
+    /// view attaches its terminal once it is up.
+    fn poll_onboarding(&mut self) -> bool {
+        let Some(page) = self.onboarding.as_mut() else {
+            return false;
+        };
+        let (changed, action) = page.poll();
+        self.apply_onboarding_action(action);
+        changed
+    }
+
+    fn apply_onboarding_action(&mut self, action: onboarding::PageAction) {
+        match action {
+            onboarding::PageAction::Stay => {}
+            onboarding::PageAction::Launch => {
+                self.status = Some(STARTUP_STATUS.to_string());
+                self.spawn_startup();
+            }
+        }
+        self.dirty = true;
     }
 
     /// Resolve a palette entry to its command effect and dispatch it.
@@ -3843,8 +4056,8 @@ impl ShellState {
                 self.spawn_mutation(m, "rejected", "reject failed")
             }
             // The form's submit, wherever it came from: validate, scaffold, switch.
-            Effect::Mutate(Mutation::AddProject { name, root, mode }) => {
-                self.submit_add_project(name, root, mode)
+            Effect::Mutate(Mutation::AddProject { name, root, mode, defaults }) => {
+                self.submit_add_project(name, root, mode, defaults)
             }
             // The board's card mutations. The embedded board sends its own
             // through its move persister; one arriving here (no palette entry
@@ -3858,6 +4071,8 @@ impl ShellState {
             }
             Effect::Mutate(m @ Mutation::EditIssue { .. }) => self.spawn_mutation(m, "edited", "edit failed"),
             Effect::Mutate(m @ Mutation::AddIssue { .. }) => self.spawn_mutation(m, "added", "add failed"),
+            // New task, over whatever is showing, on the board's workflows.
+            Effect::NewIssue { project } => self.open_new_task(&project),
             Effect::Mutate(m @ Mutation::PrioritizeIssue { .. }) => {
                 self.spawn_mutation(m, "reordered", "reorder failed")
             }
@@ -4822,6 +5037,15 @@ impl ShellState {
             }
             _ => {}
         }
+        // The onboarding stands in for the orchestrator's terminal: it takes
+        // the main area's keys, and none reaches a session.
+        if self.onboarding_shown() {
+            if let Some(page) = self.onboarding.as_mut() {
+                let action = page.handle_key(k);
+                self.apply_onboarding_action(action);
+            }
+            return;
+        }
 
         // Cmd+C / Ctrl+Shift+C copies the current selection to the clipboard
         // and is consumed here — never forwarded — so no stray `c` / Ctrl+C
@@ -4927,6 +5151,8 @@ impl ShellState {
             // In one process there's no board process to quit, and the palette is
             // a later phase; both are no-ops here.
             Outcome::Quit | Outcome::OpenPalette | Outcome::Continue => {}
+            // `n`: New task, as the palette's New Issue.
+            Outcome::NewIssue => self.run_command(CommandKind::NewIssue),
         }
     }
 
@@ -5138,9 +5364,13 @@ impl ShellState {
                 // focuses the sidebar (hit returns `None`), opening nothing.
                 self.client.focus_sidebar();
                 if let Some(view) = self.sidebar_view() {
-                    // A click on the search box opens the command palette, the
-                    // same as pressing the palette chord.
-                    if view.search_box_hit(self.sidebar_content_rect(), m.column, m.row) {
+                    // A click on the header's Search button or the project
+                    // name opens the command palette, the same as pressing
+                    // the palette chord.
+                    let content = self.sidebar_content_rect();
+                    if view.search_button_hit(content, m.column, m.row)
+                        || view.project_name_hit(content, m.column, m.row)
+                    {
                         self.open_palette();
                         self.dirty = true;
                         return;
@@ -5196,6 +5426,13 @@ impl ShellState {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
             self.client.focus_main();
         }
+        if self.onboarding_shown() {
+            if let Some(page) = self.onboarding.as_mut() {
+                let action = page.handle_mouse(m);
+                self.apply_onboarding_action(action);
+            }
+            return;
+        }
 
         // Native views handle their own mouse. The board's hit maps and the
         // feed's pill hits are recorded in `render_full` against `main_rect`
@@ -5203,6 +5440,18 @@ impl ShellState {
         // coordinate math applies unchanged.
         match &self.main_view {
             MainView::Native(View::Issues) => {
+                // The title row's `+ New issue` opens New task (no menu or
+                // detail is up over it then).
+                if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                    && !self.kanban.popover_is_open()
+                    && !self.kanban.workspace_dropdown_is_open()
+                    && !self.kanban.workflow_dropdown_is_open()
+                    && self.kanban.new_issue_at(m.column, m.row)
+                {
+                    self.run_command(CommandKind::NewIssue);
+                    self.dirty = true;
+                    return;
+                }
                 crate::handlers::kanban::handle_kanban_mouse(&mut self.kanban, m);
                 self.dirty = true;
                 return;
@@ -5472,6 +5721,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
         .unwrap_or_else(|| "No project".to_string());
     let has_project = state.client.project().is_some();
     let settings_covers = state.settings.covers_columns();
+    let onboarding_shown = state.onboarding_shown();
     let settings = &mut state.settings;
     let keymaps = &state.keymaps;
     let display_style = state.display_style;
@@ -5479,6 +5729,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
     let activity = &mut state.activity;
     let machines = &mut state.machines;
     let changelog = &mut state.changelog;
+    let onboarding = &mut state.onboarding;
     let sessions = &state.sessions;
 
     let mut cursor: Option<(u16, u16)> = None;
@@ -5487,6 +5738,13 @@ fn draw_frame<B: ratatui::backend::Backend>(
         // they must run before the shared buffer is taken below.
         match &main_view {
             _ if is_settings || is_ack => {}
+            // The onboarding draws through the frame too, in place of the
+            // orchestrator's terminal.
+            MainView::Session if onboarding_shown => {
+                if let Some(page) = onboarding.as_mut() {
+                    page.render(frame, main_rect);
+                }
+            }
             MainView::Native(View::Issues) => crate::kanban::render_full(frame, kanban, main_rect),
             MainView::Native(View::Activity) => {
                 crate::activity::render_full(frame, activity, main_rect)
@@ -5526,6 +5784,7 @@ fn draw_frame<B: ratatui::backend::Backend>(
             );
             match &main_view {
                 _ if is_settings || is_ack => {}
+                MainView::Session if onboarding_shown => {}
                 MainView::Session if orch_down.is_some() => {
                     render_placeholder(buf, main_rect, orch_down.as_deref().unwrap_or_default())
                 }
@@ -6140,6 +6399,9 @@ mod tests {
     mod stray_output;
     // Contact Us opened, typed into and sent (`tests/feedback.rs`).
     mod feedback;
+    // New task opened from the board and the palette, and created
+    // (`tests/new_task.rs`).
+    mod new_task;
 
     #[test]
     fn orchestrator_view_names_the_supervisor_failure_while_down() {
@@ -6639,6 +6901,53 @@ mod tests {
     }
 
     #[test]
+    fn the_palette_hovers_runs_and_closes_by_mouse_through_the_shell() {
+        // The live path: `handle_event` → the overlay's `handle_mouse` →
+        // the palette, against the rect the frame drew it in.
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut st = test_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 60)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        st.open_palette();
+        draw_frame(&mut term, &mut st).unwrap();
+        let palette = |st: &ShellState| -> (Rect, usize, Vec<String>) {
+            let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+                panic!("the palette is open");
+            };
+            let ids = p.results().into_iter().map(|(e, _)| e.id).collect();
+            (p.overlay_rect(st.full_area()), p.selected(), ids)
+        };
+        let (rect, _, ids) = palette(&st);
+        let at = ids.iter().position(|id| id == "view:machines").expect("the palette lists Machines");
+        // Machines' label, inside the panel (the sidebar names it too).
+        let buf = term.backend().buffer().clone();
+        let (x, y) = (rect.y..rect.y + rect.height)
+            .find_map(|y| {
+                let row: String = (rect.x..rect.x + rect.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                row.find("Machines").map(|i| (rect.x + row[..i].chars().count() as u16, y))
+            })
+            .expect("Machines is drawn in the panel");
+        let mouse = |kind, column, row| Event::Mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+
+        st.handle_event(mouse(MouseEventKind::Moved, x, y));
+        assert_eq!(palette(&st).1, at, "hovering Machines selects it");
+        // A click outside the panel closes it, as Escape does.
+        st.handle_event(mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left), 0, rect.y + rect.height + 1));
+        assert!(st.overlay.is_none(), "an outside click closes the palette");
+        assert!(!matches!(st.main_view, MainView::Native(View::Machines)));
+
+        // Reopened, a click on the row runs it.
+        st.open_palette();
+        draw_frame(&mut term, &mut st).unwrap();
+        st.handle_event(mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left), x, y));
+        assert!(st.overlay.is_none(), "running a result closes the palette");
+        assert!(
+            matches!(st.main_view, MainView::Native(View::Machines)),
+            "the click ran Machines, as Enter would"
+        );
+    }
+
+    #[test]
     fn machines_opens_from_the_command_palette() {
         // Requirement: Ctrl+P → Machines opens the Machines view even though it
         // has no sidebar nav row.
@@ -6721,11 +7030,11 @@ mod tests {
         // The user has tabbed into the nav, so focus starts on the sidebar.
         st.client.focus_sidebar();
 
-        // The nav block renders two-row bleed pills below the 6-row header: the
-        // label for nav item `k` sits on row `6 + 2k + 1`. Rows are Orchestrator
-        // (k=0 → row 7), Issues (k=1 → row 9), Activity (k=2 → row 11). Click the
+        // The nav block renders two-row bleed pills below the 4-row header: the
+        // label for nav item `k` sits on row `4 + 2k + 1`. Rows are Orchestrator
+        // (k=0 → row 5), Issues (k=1 → row 7), Changelog (k=2 → row 9). Click the
         // Issues label.
-        st.handle_event(Event::Mouse(left_click(5, 9)));
+        st.handle_event(Event::Mouse(left_click(5, 7)));
         assert!(
             matches!(st.main_view, MainView::Native(View::Issues)),
             "the click opened the Issues view",
@@ -7059,7 +7368,8 @@ mod tests {
 
     #[test]
     fn a_click_on_the_search_box_opens_the_palette() {
-        // The search box sits on header rows 3–5; clicking it opens the command
+        // The header's Search button is a square across header rows 0–2, two
+        // columns in from the sidebar's right; clicking it opens the command
         // palette, the same as the palette chord.
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
@@ -7067,13 +7377,73 @@ mod tests {
         st.show(RowTarget::Session(SessionRef::Orchestrator));
         assert!(st.overlay.is_none(), "no overlay before the click");
 
-        // Header layout: blank (row 0), title (row 1), blank (row 2), search
-        // box (rows 3–5).
-        st.handle_mouse(left_click(3, 4));
+        // The sidebar's content is 27 columns (the last is the divider), so
+        // the five-column square spans columns 20–24. The blank cells
+        // between the project name and the square open nothing.
+        st.handle_mouse(left_click(10, 1));
+        assert!(st.overlay.is_none(), "the gap after the name is not a target");
+        st.handle_mouse(left_click(22, 1));
         assert!(
             matches!(st.overlay, Some(ActiveOverlay::Palette(_))),
-            "clicking the search box opens the command palette"
+            "clicking the Search button opens the command palette"
         );
+    }
+
+    #[test]
+    fn a_click_on_the_project_name_opens_the_palette() {
+        // The project name ("proj") is drawn on header row 1 from column 2;
+        // a click on any of its cells opens the command palette, as the
+        // palette chord and the Search button do. The cells around it don't.
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 20);
+        st.main_rect = Rect::new(28, 0, 92, 20);
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        for (x, y) in [(1, 1), (6, 1), (2, 0), (2, 2)] {
+            st.handle_mouse(left_click(x, y));
+            assert!(st.overlay.is_none(), "({x}, {y}) is beside the name");
+        }
+        for x in 2..6 {
+            st.handle_mouse(left_click(x, 1));
+            assert!(
+                matches!(st.overlay, Some(ActiveOverlay::Palette(_))),
+                "clicking the name at column {x} opens the command palette"
+            );
+            st.overlay = None;
+        }
+    }
+
+    /// The project name lifts under the pointer, repaints only when that
+    /// changes, and goes dark off the name and under an overlay.
+    #[test]
+    fn project_name_hover_follows_the_pointer() {
+        let mut st = settings_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (nx, ny) = find_on_screen(&term, "proj").expect("the project name shows");
+        assert!(!st.name_hover(), "no hover before any motion");
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(nx, ny)));
+        assert!(st.name_hover());
+        assert!(!st.search_hover(), "the name is not the Search button");
+        assert!(st.dirty, "a hover change repaints");
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_eq!(term.backend().buffer()[(nx, ny)].bg, palette().button_hover, "lit");
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(nx + 3, ny)));
+        assert!(!st.dirty, "still on the name: no repaint");
+
+        st.handle_event(Event::Mouse(moved(nx + 4, ny)));
+        assert!(!st.name_hover(), "the column after the name");
+        assert!(st.dirty);
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_ne!(term.backend().buffer()[(nx, ny)].bg, palette().button_hover, "dark again");
+
+        st.handle_event(Event::Mouse(moved(nx, ny)));
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        assert!(st.overlay.is_some());
+        assert!(!st.name_hover(), "under the palette");
     }
 
     // --- drag-handle line ---------------------------------------------------
@@ -7295,11 +7665,12 @@ mod tests {
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_main();
-        // Sidebar geometry: rows 0-5 are the header (title, margin, the 2-row
-        // search box across rows 2-4, margin), then the nav block interleaves
-        // items with separator lines — Chat on y=7, Issues on y=9, Activity on
-        // y=11 (even rows between are inert separators). Click Issues.
-        st.handle_mouse(left_click(2, 9));
+        // Sidebar geometry: rows 0-3 are the header (the title on row 1 beside
+        // the Search button's square across rows 0-2), then the nav block
+        // interleaves items with separator lines — Chat on y=5, Issues on
+        // y=7, the third item on y=9 (even rows between are inert
+        // separators). Click Issues.
+        st.handle_mouse(left_click(2, 7));
         assert_eq!(st.selection(), 1, "selection moved to Issues");
         assert!(
             matches!(st.main_view, MainView::Native(View::Issues)),
@@ -7309,9 +7680,9 @@ mod tests {
         // same as a session (so the click lands the user on what they opened).
         assert_eq!(st.client.focus(), Focus::Main);
 
-        // Clicking Activity (y=11) switches the main area again and keeps main
+        // Clicking Activity (y=9) switches the main area again and keeps main
         // focus.
-        st.handle_mouse(left_click(2, 11));
+        st.handle_mouse(left_click(2, 9));
         assert_eq!(st.selection(), 2, "selection moved to Activity");
         assert!(matches!(st.main_view, MainView::Native(View::Activity)));
         assert_eq!(st.client.focus(), Focus::Main);
@@ -7322,10 +7693,10 @@ mod tests {
         let mut st = test_state();
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_sidebar();
-        // After the nav block (ends y=12) comes a blank (y=13), the
-        // "— Workspaces —" header (y=14), then the single flat workspace alpha
-        // on y=15 (selectable ordinal 3).
-        st.handle_mouse(left_click(2, 15));
+        // After the nav block (ends y=10) comes a blank (y=11), the
+        // "— Workspaces —" header (y=12), then the single flat workspace alpha
+        // on y=13 (selectable ordinal 3).
+        st.handle_mouse(left_click(2, 13));
         assert_eq!(st.selection(), 3, "selection moved to alpha");
         assert!(
             matches!(st.main_view, MainView::Session),
@@ -7363,8 +7734,8 @@ mod tests {
         }));
         st.sidebar_rect = Rect::new(0, 0, 28, 20);
         st.client.focus_sidebar();
-        // The single flat workspace `alpha` sits on y=15 (see the click test).
-        st.handle_mouse(left_click(2, 15));
+        // The single flat workspace `alpha` sits on y=13 (see the click test).
+        st.handle_mouse(left_click(2, 13));
         assert!(matches!(st.main_view, MainView::Session));
         assert_eq!(
             st.sessions.current_target(),
@@ -8284,6 +8655,64 @@ mod tests {
         open_gate.send(()).unwrap();
         let done = wait_until(Duration::from_secs(2), || st.poll_startup());
         assert!(done, "poll_startup reports completion once the bootstrap returns");
+    }
+
+    /// A bootstrap whose project needs onboarding until the test says not,
+    /// recording what it brought up (`orch-onboarding`).
+    #[derive(Default)]
+    struct OnboardingBootstrap {
+        set_up: std::sync::atomic::AtomicBool,
+        launched: Mutex<Vec<String>>,
+    }
+    impl Bootstrap for OnboardingBootstrap {
+        fn bootstrap(&self, project: &str) -> Result<(), String> {
+            self.launched.lock().unwrap().push(project.to_string());
+            Ok(())
+        }
+        fn needs_onboarding(&self, _project: &str) -> bool {
+            !self.set_up.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn a_project_that_needs_onboarding_shows_it_and_starts_no_orchestrator() {
+        use std::sync::atomic::Ordering;
+        let lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _home = shelbi_app::settings::agents::fixture::Home::new("shell-onb", "proj", lock);
+        let caps = Caps { kitty: true, truecolor: true, nested: None, emoji: true };
+        let boot = Arc::new(OnboardingBootstrap::default());
+        let mut st = ShellState::new_with(
+            "proj",
+            Arc::new(NoopConnector),
+            caps,
+            Arc::new(RecordingLifecycle::default()),
+            boot.clone(),
+        );
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        st.spawn_startup();
+        assert!(wait_until(Duration::from_secs(2), || st.poll_startup()));
+        assert!(st.onboarding_shown(), "the Orchestrator view shows the onboarding");
+        assert!(boot.launched.lock().unwrap().is_empty(), "no orchestrator started on its own");
+
+        // Its keys reach the page, not a session: Enter is Get started.
+        st.client.focus_main();
+        st.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            st.onboarding.as_ref().map(|p| p.step()),
+            Some(shelbi_app::view::OnboardingStep::Harness)
+        );
+        // Another view hides it; the Orchestrator view shows it again.
+        st.show(RowTarget::Native(View::Issues));
+        assert!(!st.onboarding_shown());
+        st.show(RowTarget::Session(SessionRef::Orchestrator));
+        assert!(st.onboarding_shown());
+
+        // Launch Orchestrator's save landed: the startup launches it now.
+        boot.set_up.store(true, Ordering::SeqCst);
+        st.apply_onboarding_action(onboarding::PageAction::Launch);
+        assert!(wait_until(Duration::from_secs(2), || st.poll_startup()));
+        assert_eq!(*boot.launched.lock().unwrap(), ["proj"]);
+        assert!(st.onboarding.is_none() && !st.onboarding_shown(), "the terminal shows");
     }
 
     /// A bootstrap that records every project it was asked to bring up. A project
@@ -9530,6 +9959,45 @@ mod tests {
         st.effect_tap = None;
         st.dispatch_effect(Effect::SendFeedback);
         assert!(matches!(st.overlay, Some(ActiveOverlay::Feedback(_))));
+    }
+
+    /// The header's Search button lights and names its chord under the
+    /// pointer, repaints only when that changes, and goes dark off the
+    /// button, on focus loss, and under an overlay.
+    #[test]
+    fn search_button_hover_follows_the_pointer() {
+        let mut st = settings_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let (sx, sy) = find_on_screen(&term, "🔍").expect("the Search button shows");
+        assert!(!st.search_hover(), "no hover before any motion");
+        assert!(!screen_text(&term).contains("Search ("), "no tooltip at rest");
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(sx, sy)));
+        assert!(st.search_hover());
+        assert!(st.dirty, "a hover change repaints");
+        assert_eq!(st.footer_hover(), None, "the footer stays dark");
+        draw_frame(&mut term, &mut st).unwrap();
+        assert_eq!(term.backend().buffer()[(sx, sy)].bg, palette().button_hover, "lit");
+        assert!(screen_text(&term).contains("Search ("), "the tooltip names the chord");
+
+        st.dirty = false;
+        st.handle_event(Event::Mouse(moved(sx, sy - 1)));
+        assert!(!st.dirty, "still on the button (its top cap): no repaint");
+
+        st.handle_event(Event::Mouse(moved(3, sy)));
+        assert!(!st.search_hover(), "the title is not the button");
+        assert!(st.dirty);
+
+        st.handle_event(Event::Mouse(moved(sx, sy)));
+        st.handle_event(Event::FocusLost);
+        assert!(!st.search_hover(), "the pointer may be anywhere once focus goes");
+
+        st.handle_event(Event::Mouse(moved(sx, sy)));
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL)));
+        assert!(st.overlay.is_some());
+        assert!(!st.search_hover(), "under the palette");
     }
 
     /// The footer's hover follows the pointer, repaints only when it changes,

@@ -65,6 +65,9 @@ fn mods_from(m: KeyModifiers) -> Mods {
     out
 }
 
+/// The marker [`format_chord_or_unbound`] shows for an action with no binding.
+pub const UNBOUND: &str = "<unbound>";
+
 /// Render a chord for a help footer, falling back to `<unbound>` when the
 /// action has no binding. Help rows reference actions by enum, so a user
 /// who unbinds a help-referenced action (via `keys.yaml`) gets a visible
@@ -72,7 +75,7 @@ fn mods_from(m: KeyModifiers) -> Mods {
 pub fn format_chord_or_unbound(chord: Option<&KeyChord>, style: DisplayStyle) -> String {
     match chord {
         Some(c) => format_chord(c, style),
-        None => "<unbound>".to_string(),
+        None => UNBOUND.to_string(),
     }
 }
 

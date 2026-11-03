@@ -246,7 +246,6 @@ pub struct IssuesView {
     /// The saves a test's view sent (a test never reaches the daemon).
     #[cfg(test)]
     sent_saves: Vec<SaveJob>,
-    add_input: Option<Entity<InputState>>,
     /// The toolbar's search field, made on first draw (an input needs the
     /// window).
     search_input: Option<Entity<InputState>>,
@@ -337,7 +336,6 @@ impl IssuesView {
             pane_editors: None,
             #[cfg(test)]
             sent_saves: Vec::new(),
-            add_input: None,
             search_input: None,
             search_worker: None,
             project: handle.clone(),
@@ -648,7 +646,6 @@ impl IssuesView {
         self.floating = false;
         if close {
             self.close_editors();
-            self.add_input = None;
             self.state.close_pane();
             // The screen it was over went away: so does the pane, at once.
             self.state.take_closed();
@@ -709,7 +706,6 @@ impl IssuesView {
     /// screen, the window hands them back to it).
     pub(super) fn close_pane(&mut self, cx: &mut Context<Self>) {
         self.close_editors();
-        self.add_input = None;
         self.state.close_pane();
         self.needs_focus = true;
         cx.notify();
@@ -855,6 +851,18 @@ impl IssuesView {
         cx.notify();
     }
 
+    /// The workflows New task offers, and the project's default (the
+    /// board's read).
+    pub fn new_task_workflows(&self) -> (Vec<shelbi_core::Workflow>, String) {
+        self.state.new_task_workflows()
+    }
+
+    /// Read the board again now (New task created an issue).
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        self.refresh();
+        cx.notify();
+    }
+
     fn refresh(&mut self) {
         self.open_refresher.request();
         self.closed_refresher.request();
@@ -976,7 +984,6 @@ impl IssuesView {
                 Intent::BeginEdit(id) => self.begin_edit(&id, window, cx),
                 Intent::Save(job) => self.spawn_save(job),
                 Intent::OpenInEditor(id) => self.open_in_editor(&id),
-                Intent::BeginAdd => self.begin_add(window, cx),
                 Intent::FocusSearch => {
                     let input = self.search_field(window, cx);
                     input.update(cx, |s, cx| s.focus(window, cx));
@@ -1235,23 +1242,6 @@ impl IssuesView {
         external_edit::open(&self.state.project, id, &body, self.editor_tx.clone());
     }
 
-    fn begin_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("Issue title"));
-        input.update(cx, |s, cx| s.focus(window, cx));
-        let sub = cx.subscribe_in(&input, window, |this, input, ev: &InputEvent, window, cx| {
-            if let InputEvent::PressEnter { .. } = ev {
-                let title = input.read(cx).value().to_string();
-                this.add_input = None;
-                this.needs_focus = true;
-                let intents = this.state.submit_add(&title);
-                this.apply_intents(intents, window, cx);
-                cx.notify();
-            }
-        });
-        self._subscriptions.push(sub);
-        self.add_input = Some(input);
-    }
-
     /// The toolbar's search field: typing narrows the board as it goes.
     fn search_field(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<InputState> {
         if let Some(input) = &self.search_input {
@@ -1317,10 +1307,6 @@ impl IssuesView {
             return;
         };
         cx.stop_propagation();
-        if self.state.mode != Mode::AddPrompt && self.add_input.is_some() {
-            self.add_input = None;
-            self.needs_focus = true;
-        }
         self.apply_intents(intents, window, cx);
         if before != (self.state.selected_column, self.state.selected_row) {
             self.scroll_selection_into_view();
@@ -2225,31 +2211,12 @@ impl IssuesView {
                 .children(items),
         ))
     }
-
-    fn render_add(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        let input = self.add_input.as_ref()?;
-        Some(centered(
-            backdrop(theme, cx),
-            panel(theme)
-                .w(px(420.0))
-                .gap_2()
-                .child(panel_title(theme, "New issue"))
-                .child(div().px_2().child(Input::new(input)))
-                .child(
-                    div()
-                        .px_2()
-                        .type_style(Type::XSmall)
-                        .text_color(theme.muted)
-                        .child("Enter adds it to Backlog · Esc cancels"),
-                ),
-        ))
-    }
 }
 
 impl Render for IssuesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_pane_editors(window, cx);
-        if self.needs_focus && !self.editor_focused(cx) && self.add_input.is_none() {
+        if self.needs_focus && !self.editor_focused(cx) {
             self.needs_focus = false;
             window.focus(&self.focus, cx);
         }
@@ -2313,7 +2280,6 @@ impl Render for IssuesView {
             .children(detail)
             .children(self.render_dropdown(&theme, cx))
             .children(self.render_assign(&theme, cx))
-            .children(self.render_add(&theme, cx))
             .into_any_element()
     }
 }
@@ -2544,7 +2510,6 @@ pub(super) fn backdrop(theme: &Theme, cx: &mut Context<IssuesView>) -> gpui::Sta
         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
             if !this.editor_focused(cx) {
                 this.state.close_overlay();
-                this.add_input = None;
                 this.needs_focus = true;
                 cx.notify();
             }

@@ -40,12 +40,14 @@ paths on every `cargo test`.
 | Approve | `action:approve-review:<id>` | Reached the daemon; the sandbox's gated merge refused (no `origin` to push to) and the status line said so | Reached the daemon; refused (the slot never loaded the task) and the banner said so |
 | Reject | `action:reject-review:<id>` | Reason prompt; Ctrl+D sent it; the task went back to `todo` | Same (Reviews ▸ … ▸ Reject…) |
 | Zen toggle | `action:toggle-zen` | First off-to-on shows the intro; confirm turned Zen on; again turned it off | Same; the View menu item relabels on/off |
+| New Issue | `action:new-issue` | Added after this walk (`new-task-dialog`), covered by both smoke tests: the New task overlay over the view (also the board's `n` and its `+ New issue`), Ctrl+Enter creates | The New task dialog over the window (`views/new_task.rs`; also the board's New issue and `n`, File ▸ New Issue…), ⌘Return creates; the window flashes the outcome |
 | Error log | `action:error-log` | Overlay ("No errors logged.") | Same (View ▸ Error Log) |
 | Settings | `action:settings` | Added after this walk (`tui-settings-shell`), covered by both smoke tests: Settings over the view, its sidebar in the sidebar's column (also `,` in the sidebar and the ⚙ beside the project title) | The existing Settings, on the page last used (Shelbi ▸ Settings…, ⌘,) |
 | Switch Project | `action:switch-project` | Fixed here: was a switch to an empty project name; now the palette's Projects column, focused | The sidebar's project switcher (File ▸ Switch Project…) |
 | Switch to a project | `action:switch-project:<slug>` | The client moves to `pb`, and back | The window switches to `pb` in place, and back to where `pa` was left (File ▸ Open Project ▸ pb; `dt-switch-project-in-window`) |
 | New Window | `action:new-window` | Not offered: the registry lists it only for a multi-window client (`CommandModel::multi_window`); the TUI's arm says to run `shelbi` in another terminal | A second window on the current project, cascaded (File ▸ New Window, ⌘⇧N, and the palette) |
-| Add project | `action:add-project` | Form with detection and the derived id; cancelled before creating (submit would launch a real agent) | The Add Project wizard's own window (`dt-add-project-wizard`): folder, then where settings live, then Create Project through the same `project_create::add_project`, its checklist, and the created workflows, whose Okay opens the project on its Orchestrator; also File ▸ Add Project…, the switcher and the chooser. The TUI keeps its one-form overlay over the same engine |
+| Add project | `action:add-project` | Form with detection and the derived id; cancelled before creating (submit would launch a real agent). Since `project-defaults-step` the form is three pages in the wizard's order and copy (`overlay/add_project.rs` over `shelbi_app::overlay::add_project`): the folder, Agent defaults, where settings live, each "Step N of 3" with Back and Continue / Create Project, by keys and mouse | The Add Project wizard's own window (`dt-add-project-wizard`): folder, then Agent defaults, then where settings live, then Create Project through the same `project_create::add_project`, its checklist, and the created workflows, whose Okay opens the project on its Orchestrator; also File ▸ Add Project…, the switcher and the chooser |
+| Add project ▸ Agent defaults | (step 2 of `action:add-project`, and of the first-run flow that creates a project) | Default Harness and Default model as the onboarding's pickers (`picker.rs`: the box, its menu, ← →, "Custom model…"), over the form's shared `HarnessPicker`; the choice goes to `scaffold_project_with` (`shell/mod.rs` `create_project`, `launch/mod.rs` `submit_project`) | The same two pickers (`views/harness_picker.rs`, shared with the onboarding) over the wizard's `HarnessPicker` (Figma 2720:33054); the choice rides `CreateRequest::defaults` into `project_create::add_project`. Both clients refuse a generic default inline (a new project declares no generic runner) |
 | Connect to Remote Session… | `action:connect-remote` | Not offered until its dialog lands (`launch-tui`; the registry lists it only for a client with `CommandModel::remote_connect`) | Added after this walk (`launch-desktop`), covered by the smoke tests: the Connect to Remote Session dialog over the window (Shelbi ▸ Connect to Remote Session…, the palette); over the launch window with no project window |
 | Show Launch Screen | `action:launch-screen` | Not offered until its launch screen lands (`launch-tui`, `CommandModel::launch_screen`) | Added after this walk (`launch-desktop`): the launch window, or the open one to the front (File ▸ Show Launch Screen, the palette) |
 | Edit Project Settings | `edit:project` | Made real here: the editor ran on `projects/pa.yaml` with the terminal handed over (checked with `vi`), then the shell repainted | Made real here: the editor ran on the same path ("Opened pa.yaml in …") |
@@ -68,6 +70,18 @@ paths on every `cargo test`.
 
 ## Platform differences (by design)
 
+- **Orchestrator onboarding** (`orch-onboarding`): the same three steps,
+  copy and saves in both clients (`shelbi_app::onboarding`). The TUI's
+  Default model ends with "Custom model…", typed in the box, as its agent
+  editor offers one; the desktop's menu lists the suggestions and any
+  model already on disk, as its agent editor does. The TUI walks the steps
+  by keys (Tab, arrows, Enter, Esc for Back) as well as the mouse.
+- **Agent defaults** in the new-project flow (`project-defaults-step`): the
+  same step, copy, order and saves in both clients, on the onboarding's
+  shared picker model (`shelbi_app::harness_picker`). As in the onboarding,
+  the TUI's Default model ends with "Custom model…" and the desktop's menu
+  lists the suggestions. The desktop wizard's three steps are screens of its
+  own window; the TUI's are pages of its Add project dialog.
 - **Drag and drop** on the board: desktop only. The TUI moves and reorders
   with the same ⇧H/⇧L/⇧K/⇧J keys the desktop also has.
 - **Native menus** with `keys.yaml` key equivalents, and **system
@@ -600,6 +614,69 @@ The desktop renders `ReviewPanelModel` directly (`views/review.rs` builds it wit
 | `remote_machine` | not shown: the TUI has no remote info for a review | not shown as text: `is_remote` drops Open from the worktree row and Diff/Editor from `switch_items` (`views/review.rs` `render_panel`) |
 | `switch_items` | own fixed list Reviewer / View Diff / Edit in / (Open Browser) (`review_panel.rs` `rows` / `switch_entry`) | nav rows iterated from the model with ⌘N hints, the browser labelled "Web Browser", then Shell (`views/review.rs` `render_panel`) |
 | `server` | state glyph + sub-state name and location under the folder row, live from the sidebar row (`review_panel.rs` `render_server_line`, fed by `shell/mod.rs` `apply_snapshot`); no health check or sub-state detail (the TUI has no `ready:` facts for the slot) | the Web Browser row: inert with a muted "loading…" in place of its ⌘4 hint until serving, the sub-state, detail and health check in its tooltip (`views/review.rs` `render_waiting_browser`); State=Review draws no server block |
+
+### `OnboardingModel`
+The Orchestrator view's onboarding (`orch-onboarding`), built by `shelbi_app::onboarding::OnboardingState::model` and shown in place of the orchestrator's terminal while the project's orchestrator isn't set up.
+
+| Field | TUI | Desktop |
+|---|---|---|
+| `step` | which step the page draws: intro, harness, instructions (`shell/onboarding.rs` `render`) | which step the view draws (`views/onboarding.rs` `render`, `render_intro`, `render_harness`, `render_instructions`) |
+| `loading` | "Loading…" in the pickers and the editor, Continue and Launch dimmed (`shell/onboarding.rs` `render_harness`, `area_lines`) | "Loading…" in the pickers and in place of the editor, Continue and Launch disabled (`views/onboarding.rs` `render_harness`, `render_instructions`) |
+| `harnesses` | the Harness box (the selected one's label, its provider muted) and its picker's rows; ← → step through them (`picker.rs` `select_lines`, `harness_labels`, `render_menu` via `shell/onboarding.rs` `choices`) | the Harness picker's button (label, provider muted) and its menu rows (`views/harness_picker.rs` `picker_button`, `fields`, from `views/onboarding.rs` `render_harness`) |
+| `models` | the Default model picker's rows, then "Custom model…" (typed in the box) (`shell/onboarding.rs` `choices`, `render_menu`) | the Default model menu's rows (`views/onboarding.rs` `render_harness`); a model already on disk is kept as a row, as the agent editor keeps it |
+| `model_label` | the Default model box's text (`shell/onboarding.rs` `render_harness`) | the Default model button's label (`views/onboarding.rs` `render_harness`) |
+| `model_enabled` | a disabled box, out of the Tab order (`shell/onboarding.rs` `items`, `render_harness`) | the button dimmed with no menu (`views/onboarding.rs` `render_harness`) |
+| `model_note` | in place of the helper under Default model (`shell/onboarding.rs` `render_harness`) | in place of the helper under Default model (`views/onboarding.rs` `render_harness`) |
+| `instructions` | the editor's text, kept in the page's `TextArea` (`shell/onboarding.rs` `area_lines`) | the editor's text, kept in its `TextareaState` (`views/onboarding.rs` `loaded`, `render_instructions`) |
+| `error` | red, over the step's rule (`shell/onboarding.rs` `error_rows`) | red, over the step's rule (`views/onboarding.rs` `render_harness`, `render_instructions`) |
+| `busy` | "Saving…" / "Launching…" on a disabled button; keys and clicks wait (`shell/onboarding.rs` `render_harness`, `render_instructions`) | the same labels on disabled buttons (`views/onboarding.rs` `render_harness`, `render_instructions`) |
+
+### `HarnessOption`
+Built by `shelbi_app::harness_picker::HarnessPicker::harnesses` for the onboarding's Harness and the new-project flow's Default Harness.
+
+| Field | TUI | Desktop |
+|---|---|---|
+| `kind` | not shown: what choosing the row selects (`shell/onboarding.rs` `choose`, `overlay/add_project.rs` `choose`) | not shown: what choosing the row selects; the row's selector (`views/harness_picker.rs` `fields`) |
+| `label` | box text and picker row (`picker.rs` `select_lines`, `harness_labels`) | button label and menu row (`views/harness_picker.rs` `picker_button`, `fields`) |
+| `provider` | muted after the label in the box and the row (`picker.rs` `select_lines`, `harness_labels`) | muted after the label on the button and the row (`views/harness_picker.rs` `picker_button`, `fields`) |
+| `selected` | the box's choice and the row's ✓ (`picker.rs` `render_menu`; `shell/onboarding.rs` `render_harness`, `overlay/add_project.rs` `defaults_rows`) | the button's choice and the row's selected fill (`views/harness_picker.rs` `fields`) |
+
+### `ModelOption`
+Built by `shelbi_app::harness_picker::HarnessPicker::models` for both Default model pickers.
+
+| Field | TUI | Desktop |
+|---|---|---|
+| `model` | not shown: what choosing the row selects (`shell/onboarding.rs` `choose`, `overlay/add_project.rs` `choose`) | not shown: what choosing the row selects (`views/harness_picker.rs` `fields`) |
+| `label` | picker row (`picker.rs` `model_labels`) | menu row (`views/harness_picker.rs` `fields`) |
+| `selected` | the row's ✓ (`picker.rs` `render_menu`) | the row's selected fill (`views/harness_picker.rs` `fields`) |
+
+### `NewTaskModel`
+The New task dialog (`new-task-dialog`), built by `shelbi_app::new_task::NewTaskForm::model`; the copy is in `shelbi_app::new_task`. TUI: `overlay/new_task.rs`. Desktop: `views/new_task.rs` (Figma `2730:10845`).
+
+| Field | TUI | Desktop |
+|---|---|---|
+| `title` | the Title box's text, the caret while typed in (`overlay/new_task.rs` `title_field`; typing kept in the dialog's `TextArea`) | the Title field's text (`views/new_task.rs` `render`, kept in its `InputState`) |
+| `workflow` | the Workflow box's value (`overlay/new_task.rs` `pickers`) | the Workflow button's label (`views/new_task.rs` `render_pickers`) |
+| `workflows` | the Workflow picker's rows, the chosen one ✓ (`overlay/new_task.rs` `render_menu`) | the Workflow menu's rows, the chosen one checked (`views/new_task.rs` `menu_row`) |
+| `status` | the Status box's value (`overlay/new_task.rs` `pickers`) | the Status button's label (`views/new_task.rs` `render_pickers`) |
+| `status_category` | the status glyph before the Status value, in its category color (`overlay/new_task.rs` `select_lines`) | the status glyph in the Status button's Left Icon slot (`views/new_task.rs` `render_pickers`) |
+| `statuses` | the Status picker's rows, each with its glyph (`overlay/new_task.rs` `render_menu`) | the Status menu's rows, each with its glyph (`views/new_task.rs` `menu_row`) |
+| `priority` | the Priority box's value (`overlay/new_task.rs` `pickers`) | the Priority button's label (`views/new_task.rs` `render_pickers`) |
+| `priorities` | the Priority picker's rows (`overlay/new_task.rs` `render_menu`) | the Priority menu's rows (`views/new_task.rs` `menu_row`) |
+| `description` | the Description box's wrapped text, the placeholder while empty (`overlay/new_task.rs` `description_field`) | the Description box's text, the placeholder while empty (`views/new_task.rs` `render_description`) |
+| `write_up` | `( ● )` / `( ○ )` on the write-up card (`overlay/new_task.rs` `write_up`) | the Switch on the write-up card (`views/new_task.rs` `render_write_up`, `controls::switch`) |
+| `focus` | the lit box, label or button (`overlay/new_task.rs` `title_field`, `pickers`, `write_up`, `footer`) | the field with the keyboard, the focus ring on the rest once the keyboard is used (`views/new_task.rs` `sync_focus`, `ring`) |
+| `menu` | the open picker's rows dropped below its box, the keyboard's row lit (`overlay/new_task.rs` `render_menu`) | the open menu under its button, the keyboard's row selected (`views/new_task.rs` `render_pickers`) |
+| `can_create` | Create Task enabled or dimmed (`overlay/new_task.rs` `footer`) | Create Task enabled or disabled (`views/new_task.rs` `render_footer`) |
+| `creating` | "Creating…" on a disabled Create Task, Cancel disabled (`overlay/new_task.rs` `footer`) | "Creating…" with a spinner, Cancel disabled (`views/new_task.rs` `render_footer`) |
+| `error` | red, over the footer's rule (`overlay/new_task.rs` `lines`) | red, over the footer (`views/new_task.rs` `render`) |
+
+### `NewTaskOption`
+| Field | TUI | Desktop |
+|---|---|---|
+| `label` | the picker row's text (`overlay/new_task.rs` `render_menu`) | the menu row's text (`views/new_task.rs` `menu_row`) |
+| `category` | a status row's glyph (`overlay/new_task.rs` `render_menu`) | a status row's glyph (`views/new_task.rs` `menu_row`) |
+| `selected` | the row's ✓ (`overlay/new_task.rs` `render_menu`) | the row's check mark (`views/new_task.rs` `menu_row`) |
 
 ### `ErrorLogModel`
 Neither client consumes `ErrorLogModel`. Both render `shelbi_state::read_errors_with_unread` rows (`(ErrorLogEntry, bool)`) through the shared `shelbi_app::overlay::error_log::Viewer`. Mapped to that datum:

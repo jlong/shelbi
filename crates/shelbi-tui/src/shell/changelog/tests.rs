@@ -168,9 +168,12 @@ fn entries_read_as_a_blog_newest_first_at_every_size() {
             "{w}x{h}: date at the right: {title_row:?}"
         );
         // A rule under the title (it's the selection's bleed on the
-        // focused first entry, so look under the second).
-        let rule = &rows(&buf)[second.1 as usize + 1];
-        assert!(rule.trim().chars().all(|c| c == '─') && !rule.trim().is_empty(), "{w}x{h}: {rule:?}");
+        // focused first entry, so look under the second), when it's on
+        // screen.
+        if second.1 + 1 < plan(Rect::new(0, 0, w, h)).viewport.bottom() {
+            let rule = &rows(&buf)[second.1 as usize + 1];
+            assert!(rule.trim().chars().all(|c| c == '─') && !rule.trim().is_empty(), "{w}x{h}: {rule:?}");
+        }
         // The links as chips: the issue and the PR from the frontmatter.
         assert!(text.contains("⧉ tui-settings-polish"), "{w}x{h}\n{text}");
         assert!(text.contains("↗ #1942"), "{w}x{h}\n{text}");
@@ -178,6 +181,66 @@ fn entries_read_as_a_blog_newest_first_at_every_size() {
         let (cx, cy) = find(&buf, "textbox").expect("code span");
         assert_eq!(buf[(cx, cy)].bg, palette().code_bg, "{w}x{h}: code span tinted");
     }
+}
+
+#[test]
+fn a_blank_row_more_separates_consecutive_entries() {
+    let mut entries = sample();
+    // One with a body and no links, so the gap after a body shows too.
+    entries.insert(
+        1,
+        entry("b", "Body only", "2026-10-28T12:00:00-07:00", &[], &[], "Just words."),
+    );
+    let mut page = page_with(entries);
+    let buf = render(&mut page, 100, 45);
+    let text = rows(&buf);
+    let blank = |from: u16, to: u16| (from..to).all(|y| text[y as usize].trim().is_empty());
+    // Chips, then the gap and the next title's top bleed (which is the
+    // chips' bottom bleed too): two blanks, one more than before.
+    let (_, chips) = find(&buf, "#1942").unwrap();
+    let (_, next) = find(&buf, "Body only").unwrap();
+    assert_eq!(next, chips + 3, "{}", text.join("\n"));
+    assert!(blank(chips + 1, next), "{}", text.join("\n"));
+    // A body with no links: its trailing blank, the gap, the bleed (one
+    // more than before).
+    let (_, body) = find(&buf, "Just words.").unwrap();
+    let (_, after) = find(&buf, "Contact Us feedback dialog").unwrap();
+    assert_eq!(after, body + 4, "{}", text.join("\n"));
+    assert!(blank(body + 1, after), "{}", text.join("\n"));
+    // Within an entry nothing moves: title, rule, body.
+    let (_, title) = find(&buf, "Body only").unwrap();
+    assert_eq!(body, title + 2);
+    // The first entry still starts at the top of the document.
+    assert_eq!(page.doc.entries[0].top, 0);
+    for pair in page.doc.entries.windows(2) {
+        assert_eq!(pair[1].top, pair[0].end + ENTRY_GAP, "the gap belongs to neither entry");
+    }
+}
+
+#[test]
+fn the_gap_row_hits_nothing_and_scrolling_onto_it_focuses_the_next_entry() {
+    let mut page = page_with(sample());
+    let area = Rect::new(0, 0, 100, 30);
+    render(&mut page, 100, 30);
+    let gap = page.doc.entries[0].end;
+    let vp = plan(area).viewport;
+    for x in vp.x.saturating_sub(1)..vp.right() + 1 {
+        assert_eq!(page.hit(x, vp.y + gap as u16), None, "column {x}");
+    }
+    // A click on the next title still folds that entry, not the first.
+    let title = page.doc.entries[1].title();
+    page.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), vp.x + 2, vp.y + title as u16), area);
+    assert!(page.collapsed.contains("2026-10-28-170000-contact-us-feedback-dialog"));
+    assert!(!page.collapsed.contains("2026-10-28-213005-settings-polish-pass"));
+    // With the screen starting on the gap, the focus is on the next entry.
+    let mut page = page_with(sample());
+    render(&mut page, 60, 20);
+    let gap = page.doc.entries[0].end;
+    for _ in 0..gap {
+        press(&mut page, KeyCode::Char('j'));
+    }
+    assert_eq!(page.scroll, gap);
+    assert_eq!(page.selected_ix(), Some(1));
 }
 
 #[test]

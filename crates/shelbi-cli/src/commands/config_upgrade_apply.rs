@@ -51,7 +51,7 @@ use super::config_upgrade::{
     apply_tracker_ownership_rewrites, TRACKER_OWNERSHIP_AUTOHEAL_CODE,
     cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
     scope_label, Classification, UpgradeFinding, UpgradeReport, CHANGELOG_TEMPLATE_MISSING,
-    PR_TEMPLATE_MISSING,
+    CHANGELOG_TEMPLATE_PRIOR_DEFAULT, PR_TEMPLATE_MISSING,
     ORCH_CHANGELOG_RULE_MISSING, REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
 };
 
@@ -207,6 +207,11 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
             CHANGELOG_TEMPLATE_MISSING,
             applied,
         );
+    }
+    // Move a changelog template still on an earlier shipped default to the
+    // current one (an edited one is never flagged).
+    if codes.contains(CHANGELOG_TEMPLATE_PRIOR_DEFAULT) {
+        heal_prior_changelog_template(entry, applied);
     }
     // Same shape for the shared agent preamble that carries the hub-safety
     // rules (`agents/_shared/preamble.md`).
@@ -1017,6 +1022,30 @@ fn heal_missing_default(
         return;
     }
     record(applied, entry, code, path, "materialize-shipped-default".into());
+}
+
+/// Replace a `changelog-template.md` that is still byte-identical to an earlier
+/// shipped default with the current one. Re-checked against the file at apply
+/// time, so a template edited between detection and apply is never clobbered.
+fn heal_prior_changelog_template(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    if !shelbi_state::changelog::is_prior_default_changelog_template(&text) {
+        return;
+    }
+    if let Err(e) = write_atomic(path, shelbi_state::DEFAULT_CHANGELOG_TEMPLATE) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(
+        applied,
+        entry,
+        CHANGELOG_TEMPLATE_PRIOR_DEFAULT,
+        path,
+        "prior-shipped-default->current".into(),
+    );
 }
 
 /// Rewrite every exact legacy tmux-command passage in an agent's instructions /

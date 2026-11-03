@@ -278,6 +278,7 @@ fn a_project_state_write_goes_to_the_far_daemon_as_one_control_message() {
     let done = ServerMsg::Done {
         request_id: req.request_id,
         state: None,
+        id: None,
     };
     daemon.write_all(&control::encode(&done).unwrap()).unwrap();
     assert_eq!(writer.join().unwrap(), Ok(()));
@@ -301,4 +302,48 @@ fn a_project_state_write_goes_to_the_far_daemon_as_one_control_message() {
     daemon.write_all(&control::encode(&failed).unwrap()).unwrap();
     let err = writer.join().unwrap().unwrap_err();
     assert!(err.starts_with("devbox: ") && err.contains("disk full"), "{err}");
+}
+
+#[test]
+fn a_new_task_add_goes_to_the_far_daemon_and_answers_its_id() {
+    use shelbi_app::exec::Mutation;
+    use shelbi_app::source::ProjectLink;
+    use shelbi_proto::control::MutationKind;
+
+    let far = Far::new("add");
+    let _hub = bind(&far.hub());
+    let control = bind(&far.control());
+    let link = ProjectLink::remote("demo", far.link(), Arc::new(NoSessions));
+
+    let mutation = Mutation::AddIssue {
+        project: "demo".into(),
+        title: "Write docs".into(),
+        body: Some("the body".into()),
+        workflow: None,
+        status: Some("todo".into()),
+        top: true,
+    };
+    let adder = {
+        let link = link.clone();
+        std::thread::spawn(move || link.add_issue(&mutation, &mut |_, _| {}))
+    };
+    let (mut daemon, msg) = accept_control(&control, env!("CARGO_PKG_VERSION"));
+    let ClientMsg::Mutate(req) = msg else {
+        panic!("expected the add, got {msg:?}");
+    };
+    assert_eq!(req.project, "demo");
+    let MutationKind::Add(spec) = &req.kind else {
+        panic!("expected an add, got {:?}", req.kind);
+    };
+    assert_eq!(
+        (spec.title.as_str(), spec.status.as_str(), spec.body.as_deref(), spec.top),
+        ("Write docs", "todo", Some("the body"), true)
+    );
+    let done = ServerMsg::Done {
+        request_id: req.request_id,
+        state: None,
+        id: Some("write-docs".into()),
+    };
+    daemon.write_all(&control::encode(&done).unwrap()).unwrap();
+    assert_eq!(adder.join().unwrap().unwrap(), Some("write-docs".to_string()));
 }

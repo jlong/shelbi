@@ -445,10 +445,21 @@ fn add_project_creates_the_project_and_opens_it() {
     press(&mut app, KeyCode::Enter);
     assert!(app.adding_project());
     type_text(&mut app, "acme");
+    // Folder, then Agent defaults (Codex, by keyboard), then where settings
+    // live, whose Create Project is clicked.
     press(&mut app, KeyCode::Enter);
+    assert!(text(&draw(&mut app, 100, 32)).contains("Agent defaults"));
+    press(&mut app, KeyCode::Right);
+    press(&mut app, KeyCode::Enter);
+    let buf = draw(&mut app, 100, 32);
+    assert!(text(&buf).contains("Step 3 of 3"));
+    let at = find(&buf, "Create Project").unwrap();
+    assert_eq!(click(&mut app, at), None);
     let exit = settle(&mut app, |_| false);
     assert_eq!(exit, Some(LaunchExit::Open("acme".into())));
     assert!(shelbi_app::launch::route::project_registered("acme"));
+    let project = shelbi_state::load_project("acme").unwrap();
+    assert_eq!(project.orchestrator.runner, "codex", "the chosen default runner");
 }
 
 #[test]

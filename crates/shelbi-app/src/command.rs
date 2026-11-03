@@ -95,7 +95,18 @@ pub enum CommandKind {
     ApproveReview { id: String },
     RejectReview { id: String, reason: String },
     EditIssue { id: String },
-    AddIssue { title: String },
+    /// Create an issue (the New task dialog's Create Task): the fields of
+    /// [`Mutation::AddIssue`]. Never listed in the palette.
+    AddIssue {
+        title: String,
+        body: Option<String>,
+        workflow: Option<String>,
+        status: Option<String>,
+        top: bool,
+    },
+    /// Open the New task dialog (the palette's New Issue, the board's `n`
+    /// and its New issue button).
+    NewIssue,
     /// Reorder an issue within its column: land it at absolute slot
     /// `position` (0 is the top) of the column's priority order. The board
     /// computes the slot from the unfiltered column
@@ -251,11 +262,21 @@ impl CommandKind {
                 expect_title: None,
                 expect_body: None,
             }),
-            CommandKind::AddIssue { title } => Effect::Mutate(Mutation::AddIssue {
+            CommandKind::AddIssue {
+                title,
+                body,
+                workflow,
+                status,
+                top,
+            } => Effect::Mutate(Mutation::AddIssue {
                 project: p(),
                 title: title.clone(),
-                workflow: None,
+                body: body.clone(),
+                workflow: workflow.clone(),
+                status: status.clone(),
+                top: *top,
             }),
+            CommandKind::NewIssue => Effect::NewIssue { project: p() },
             CommandKind::PrioritizeIssue { id, position } => {
                 Effect::Mutate(Mutation::PrioritizeIssue {
                     project: p(),
@@ -531,6 +552,24 @@ impl CommandRegistry {
                 subtitle: Some("Send it back with a reason".to_string()),
                 shortcut: None,
                 hidden_until_query: true,
+            });
+        }
+
+        // New Issue: the New task dialog, over whatever is showing. Needs a
+        // project to add to.
+        if model.project.is_some() {
+            out.push(Command {
+                id: "action:new-issue".to_string(),
+                title: "New Issue".to_string(),
+                kind: CommandKind::NewIssue,
+                entry_kind: EntryKind::Action,
+                decoration: Some(Decoration {
+                    glyph: "📝".into(),
+                    color: DecorationColor::Default,
+                }),
+                subtitle: Some("Add work for your Orchestrator and agents".to_string()),
+                shortcut: None,
+                hidden_until_query: false,
             });
         }
 
@@ -856,6 +895,7 @@ impl CommandKind {
             "action:error-log" => Some(CommandKind::OpenErrorLog),
             "action:settings" => Some(CommandKind::OpenSettings),
             "action:send-feedback" => Some(CommandKind::SendFeedback),
+            "action:new-issue" => Some(CommandKind::NewIssue),
             "action:about" => Some(CommandKind::OpenAbout),
             "action:acknowledgements" => Some(CommandKind::OpenAcknowledgements),
             "action:switch-project" => Some(CommandKind::SwitchProject {
@@ -976,6 +1016,7 @@ mod tests {
             "review:T-12",
             "action:approve-review:T-12",
             "action:reject-review:T-12",
+            "action:new-issue",
             "action:error-log",
             "action:settings",
             "action:send-feedback",

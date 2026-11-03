@@ -516,9 +516,14 @@ pub mod glyphs {
     /// The workflow editor's Discard changes link (the Header's `Discard
     /// Link`, 2342:39062): John's 10pt drawing, a 1pt stroke.
     pub const DISCARD: Glyph = Glyph { name: "discard", size: 10 };
+    /// The Orchestrator onboarding's intro mark (the Welcome frame's
+    /// `chat-bubble-oval-left`, 2710:31727): the Heroicons outline
+    /// chat-bubble-oval-left-ellipsis on a 40pt grid with a 1.25pt stroke,
+    /// as the frame draws it.
+    pub const CHAT_BUBBLE: Glyph = Glyph { name: "chat-bubble", size: 40 };
 
     #[cfg(test)]
-    pub const ALL: &[Glyph] = &[PLAY, CHECK, DOT, QUESTION, CHEVRON_DOWN, DISCARD];
+    pub const ALL: &[Glyph] = &[PLAY, CHECK, DOT, QUESTION, CHEVRON_DOWN, DISCARD, CHAT_BUBBLE];
 }
 
 /// Every glyph drawing, by asset path.
@@ -529,6 +534,7 @@ const GLYPHS: &[(&str, &[u8])] = &[
     ("icons/glyphs/question.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/question.svg"))),
     ("icons/glyphs/chevron-down.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/chevron-down.svg"))),
     ("icons/glyphs/discard.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/discard.svg"))),
+    ("icons/glyphs/chat-bubble.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/chat-bubble.svg"))),
 ];
 
 /// The Heroicons license, for Acknowledgements (`crate::licenses`): the

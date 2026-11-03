@@ -197,6 +197,7 @@ fn fake_daemon(path: &Path) -> Receiver<ClientMsg> {
                         ClientMsg::QuitProject { request_id, .. } => Some(ServerMsg::Done {
                             request_id: *request_id,
                             state: None,
+                            id: None,
                         }),
                         ClientMsg::ListClients { request_id } => Some(ServerMsg::ClientList {
                             request_id: *request_id,
@@ -325,7 +326,8 @@ fn control_bridges_the_daemon_and_refuses_the_denylist() {
         read_server_msg(&mut halves, &mut buf),
         ServerMsg::Done {
             request_id: 5,
-            state: None
+            state: None,
+            id: None,
         }
     );
     send(&mut halves, &ClientMsg::ListClients { request_id: 6 });

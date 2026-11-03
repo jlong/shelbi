@@ -22,6 +22,13 @@
 //! are driven by activating the matching registry entry, so the shell's
 //! existing [`run_entry`](crate) path carries them out unchanged.
 //!
+//! The mouse ([`Palette::handle_mouse`]) does what the keys do: the pointer
+//! over a result (or a Projects row) selects it, a click runs it as Enter
+//! does, the wheel scrolls the results, and a click outside the panel closes
+//! it as Escape does. The band keeps its own scroll, which only a key moves
+//! to follow the selection, so hovering never slides the list under the
+//! pointer.
+//!
 //! Typing also searches the project's issues and Changelog entries (the
 //! shared [`shelbi_app::overlay::palette_search`]): while searching, the
 //! Projects column steps aside, the filter row (All / Issues / Changelog
@@ -29,9 +36,10 @@
 //! sits under the search line, and the results are grouped by kind with a
 //! muted header per group.
 
+use std::cell::Cell;
 use std::time::Instant;
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -162,6 +170,8 @@ pub struct PaletteView<'a> {
     pub empty: &'a str,
     /// The one-line footer hint.
     pub footer: &'a str,
+    /// The results band's scroll, in band lines (clamped to the list).
+    pub scroll: usize,
 }
 
 /// The rows for a list of commands alone (an empty query's list).
@@ -219,10 +229,10 @@ pub fn render(f: &mut Frame, area: Rect, view: &PaletteView) {
         let shown = selected.filter(|_| commands_focused);
         let content = build_row_lines(view.rows, commands_area.width as usize, shown);
         let lines = bleed_block_lines(content, shown, commands_area.width as usize, palette().selection);
-        // Scroll the band to keep the selected pill visible when the list is
-        // taller than the band (the half-block pitch doubles the row count).
+        // The band's scroll (the half-block pitch doubles the row count),
+        // clamped so a list that shrank doesn't leave the band blank.
         let band_h = commands_area.height as usize;
-        let off = command_scroll_offset(view.rows.len(), selected.unwrap_or(0), band_h);
+        let off = view.scroll.min(max_scroll(view.rows.len(), band_h));
         let visible: Vec<Line> = lines.into_iter().skip(off).take(band_h).collect();
         f.render_widget(Paragraph::new(visible), commands_area);
     }
@@ -330,20 +340,30 @@ fn results_band_rows(result_count: usize, project_count: Option<usize>) -> u16 {
     commands.max(projects)
 }
 
-/// The vertical scroll offset (in band rows) that keeps the selected command's
-/// pill — its content row at `2*sel + 1` and the half-block bleed rows at
-/// `2*sel` and `2*sel + 2` — fully inside a band `band_h` rows tall. The full
-/// bleed block is `nav_lines(n)` rows; when it fits, no scrolling is needed.
-fn command_scroll_offset(n: usize, sel: usize, band_h: usize) -> usize {
-    let total = nav_lines(n);
-    if band_h == 0 || total <= band_h {
+/// The furthest the results band scrolls (in band rows): the `nav_lines(n)`
+/// bleed block's foot at the band's foot, or 0 when it fits.
+fn max_scroll(n: usize, band_h: usize) -> usize {
+    nav_lines(n).saturating_sub(band_h)
+}
+
+/// The least scroll from `scroll` (in band rows) that shows the selected
+/// command's whole pill (its bleed-above row at `2*sel`, its content at
+/// `2*sel + 1`, its bleed-below at `2*sel + 2`) in a band `band_h` rows
+/// tall: a selection already in view leaves the band where it is, one above
+/// it brings the pill to the top, one below to the foot.
+fn scroll_into_view(scroll: usize, sel: usize, n: usize, band_h: usize) -> usize {
+    if band_h == 0 {
         return 0;
     }
-    // Keep the selected item's bleed-below row (`2*sel + 2`) as the last visible
-    // row when we must scroll; its content and bleed-above then sit just above
-    // it, so the whole pill stays on screen.
-    let bot = 2 * sel + 2;
-    (bot + 1).saturating_sub(band_h).min(total - band_h)
+    let (top, bot) = (2 * sel, 2 * sel + 2);
+    let scroll = if top < scroll {
+        top
+    } else if bot >= scroll + band_h {
+        (bot + 1).saturating_sub(band_h)
+    } else {
+        scroll
+    };
+    scroll.min(max_scroll(n, band_h))
 }
 
 /// The palette's overlay rect within `area` (the main area). Horizontally
@@ -658,6 +678,11 @@ fn project_row_line(glyph: &str, glyph_color: Color, label: &str, width: usize) 
     ]))
 }
 
+/// Whether terminal cell (`col`, `row`) lies inside `r`.
+fn contains(r: Rect, col: u16, row: u16) -> bool {
+    col >= r.x && col < r.x.saturating_add(r.width) && row >= r.y && row < r.y.saturating_add(r.height)
+}
+
 /// Truncate `s` to at most `max` display columns, dropping whole characters.
 fn truncate_to_width(s: &str, max: usize) -> String {
     let mut width = 0;
@@ -698,6 +723,14 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
 pub struct Palette {
     inner: shared::Palette,
     opened_at: Instant,
+    /// The results band's scroll in band rows, as last drawn: clicks and
+    /// hover map through it, the wheel moves it.
+    scroll: Cell<usize>,
+    /// Whether the next draw scrolls the selection into view: set by a key
+    /// (and on open), not by the pointer, so hovering a row never slides
+    /// the list out from under it and the wheel can leave the selection
+    /// behind.
+    follow: Cell<bool>,
 }
 
 impl Palette {
@@ -707,6 +740,8 @@ impl Palette {
         Self {
             inner: shared::Palette::new(entries, projects),
             opened_at: Instant::now(),
+            scroll: Cell::new(0),
+            follow: Cell::new(true),
         }
     }
 
@@ -776,9 +811,109 @@ impl Palette {
     /// chars are handled by raw key so they behave regardless of bindings
     /// ([`shared::Palette::handle_key`]).
     pub fn handle_key(&mut self, ev: KeyEvent, action: Option<PaletteAction>) -> PaletteStep {
+        self.follow.set(true);
         match crate::keymap::chord_from_event(ev) {
             Some(chord) => self.inner.handle_key(chord, action),
             None => PaletteStep::Continue,
+        }
+    }
+
+    /// Feed a mouse event over the palette panel `rect` (the overlay rect
+    /// [`overlay_rect`] returned):
+    ///
+    /// - a left-click inside runs [`Self::handle_click`]; one outside the
+    ///   panel closes the palette, as Escape does;
+    /// - a move hovers the result (or Projects-column row) under the
+    ///   pointer, selecting it as ↑/↓ would;
+    /// - the wheel over the results scrolls them a row at a time, leaving
+    ///   the selection to the row then under the pointer.
+    ///
+    /// [`overlay_rect`]: Palette::overlay_rect
+    pub fn handle_mouse(&mut self, rect: Rect, m: MouseEvent) -> PaletteStep {
+        let (col, row) = (m.column, m.row);
+        match m.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if contains(rect, col, row) {
+                    self.handle_click(rect, col, row)
+                } else {
+                    PaletteStep::Close
+                }
+            }
+            MouseEventKind::Moved => {
+                self.hover(rect, col, row);
+                PaletteStep::Continue
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let Some(band) = self.commands_area(rect) else {
+                    return PaletteStep::Continue;
+                };
+                if contains(band, col, row) {
+                    // One result (its two-row pitch) per wheel step.
+                    let max = max_scroll(self.inner.rows().len(), band.height as usize);
+                    let at = self.scroll.get().min(max);
+                    let to = if m.kind == MouseEventKind::ScrollDown {
+                        (at + 2).min(max)
+                    } else {
+                        at.saturating_sub(2)
+                    };
+                    self.scroll.set(to);
+                    self.hover(rect, col, row);
+                }
+                PaletteStep::Continue
+            }
+            _ => PaletteStep::Continue,
+        }
+    }
+
+    /// Where the results list sits within the panel `rect`.
+    fn commands_area(&self, rect: Rect) -> Option<Rect> {
+        let panel = panel_rows(rect, self.inner.searching())?;
+        Some(split_results(panel.band, self.inner.shows_projects()).0)
+    }
+
+    /// The row of [`shared::Palette::rows`] drawn at terminal row `row`
+    /// within the results list `band`, through the band's scroll. Each row
+    /// owns a two-row band (its bleed-above and its label row), so the
+    /// line's half resolves it; the trailing bleed row is the last one's.
+    fn row_at(&self, band: Rect, row: u16) -> Option<usize> {
+        let n = self.inner.rows().len();
+        if n == 0 || row < band.y || row >= band.y.saturating_add(band.height) {
+            return None;
+        }
+        let scroll = self.scroll.get().min(max_scroll(n, band.height as usize));
+        let line = (row - band.y) as usize + scroll;
+        (line < nav_lines(n)).then(|| (line / 2).min(n - 1))
+    }
+
+    /// The Projects-column row at (`col`, `row`) within the panel `rect`
+    /// (`projects().len()` is "Add project"), when the column shows.
+    fn project_at(&self, rect: Rect, col: u16, row: u16) -> Option<usize> {
+        let panel = panel_rows(rect, self.inner.searching())?;
+        let (_, Some(area)) = split_results(panel.band, self.inner.shows_projects()) else {
+            return None;
+        };
+        // A heading row, then a row per project and the Add row.
+        let first = area.y + 1;
+        let count = self.inner.projects().len() + 1;
+        let i = row.checked_sub(first)? as usize;
+        (contains(area, col, row) && i < count).then_some(i)
+    }
+
+    /// Select whatever is under the pointer at (`col`, `row`): a result, or
+    /// a Projects-column row. Headers, the search line and the gaps leave
+    /// the selection be. Returns whether it changed.
+    fn hover(&mut self, rect: Rect, col: u16, row: u16) -> bool {
+        if let Some(band) = self.commands_area(rect) {
+            if col >= band.x && col < band.x.saturating_add(band.width) {
+                if let Some(i) = self.row_at(band, row) {
+                    return self.inner.hover_row(i);
+                }
+                return false;
+            }
+        }
+        match self.project_at(rect, col, row) {
+            Some(i) => self.inner.hover_project(i),
+            None => false,
         }
     }
 
@@ -786,9 +921,10 @@ impl Palette {
     /// `rect` (the overlay rect [`overlay_rect`] returned). A click on a filter
     /// chip shows that filter. A click anywhere on a result's band (its label
     /// row or either half-block bleed row) selects that result and activates
-    /// it; a group's header does nothing. A click outside the results (the
-    /// Projects column, the search line, the footer, or the blank area below a
-    /// short list) leaves the palette open unchanged.
+    /// it, as Enter does; a group's header does nothing. A click on a
+    /// Projects-column row switches to that project (or adds one). A click
+    /// elsewhere in the panel (the search line, the footer, the blank area
+    /// below a short list) leaves the palette open unchanged.
     ///
     /// [`overlay_rect`]: Palette::overlay_rect
     pub fn handle_click(&mut self, rect: Rect, col: u16, row: u16) -> PaletteStep {
@@ -802,6 +938,7 @@ impl Palette {
                 for (chip, (x, w)) in chips.iter().zip(filter_hits(chips_area, &chips)) {
                     if col >= x && col < x + w {
                         self.inner.click_filter(chip.filter);
+                        self.scroll.set(0);
                         return PaletteStep::Continue;
                     }
                 }
@@ -810,32 +947,44 @@ impl Palette {
                 return PaletteStep::Continue;
             }
         }
-        let rows = self.inner.rows();
-        let n = rows.len();
-        if n == 0 {
+        if let Some(i) = self.project_at(rect, col, row) {
+            return self.inner.click_project(i);
+        }
+        let Some(band) = self.commands_area(rect) else {
+            return PaletteStep::Continue;
+        };
+        if col < band.x || col >= band.x.saturating_add(band.width) {
             return PaletteStep::Continue;
         }
-        let (commands_area, _) = split_results(panel.band, self.inner.shows_projects());
-        // Horizontal + vertical bounds of the results band.
-        if col < commands_area.x
-            || col >= commands_area.x.saturating_add(commands_area.width)
-            || row < commands_area.y
-            || row >= commands_area.y.saturating_add(commands_area.height)
-        {
-            return PaletteStep::Continue;
+        match self.row_at(band, row) {
+            Some(i) => {
+                let step = self.inner.click_row(i);
+                // A "Show all" row swaps the list for its filter's, from the top.
+                if step == PaletteStep::Continue {
+                    self.follow.set(true);
+                }
+                step
+            }
+            None => PaletteStep::Continue,
         }
-        // Map the clicked row back through the scroll offset to a line in the
-        // full `2n + 1`-row bleed block. Each row owns a 2-row band (its
-        // bleed-above and its label row), so `line / 2` resolves the row; the
-        // final trailing bleed row clamps to the last one.
-        let selected = self.inner.selected_row().unwrap_or(0);
-        let band_h = commands_area.height as usize;
-        let off = command_scroll_offset(n, selected, band_h);
-        let line = (row - commands_area.y) as usize + off;
-        if line >= nav_lines(n) {
-            return PaletteStep::Continue;
+    }
+
+    /// The results band's scroll for this draw: the last one's, moved just
+    /// enough to show the selection after a key moved it.
+    fn scroll_for(&self, rect: Rect) -> usize {
+        let n = self.inner.rows().len();
+        let Some(band) = self.commands_area(rect) else {
+            return 0;
+        };
+        let band_h = band.height as usize;
+        let mut scroll = self.scroll.get().min(max_scroll(n, band_h));
+        if self.follow.replace(false) {
+            if let Some(sel) = self.inner.selected_row() {
+                scroll = scroll_into_view(scroll, sel, n, band_h);
+            }
         }
-        self.inner.click_row((line / 2).min(n - 1))
+        self.scroll.set(scroll);
+        scroll
     }
 
     /// The Projects column view, or `None` when there are no projects.
@@ -881,6 +1030,7 @@ impl Palette {
             }),
             empty,
             footer: &footer,
+            scroll: self.scroll_for(area),
         };
         render(f, area, &view);
     }
@@ -1120,6 +1270,7 @@ mod tests {
                     filters: None,
                     empty: "No matching commands",
                     footer: "↑↓ select · → projects · Ctrl+P close",
+                    scroll: 0,
                 };
                 let mut term = Terminal::new(TestBackend::new(100, 18)).unwrap();
                 term.draw(|f| render(f, f.area(), &view)).unwrap();
@@ -1374,6 +1525,7 @@ mod tests {
             filters: None,
             empty: "No matching commands",
             footer: "footer",
+            scroll: 0,
         };
         let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
         term.draw(|f| render(f, f.area(), &view)).unwrap();
@@ -1571,6 +1723,8 @@ mod tests {
             filters: None,
             empty: "No matching commands",
             footer: "footer",
+            // What a draw after ↓ to the last row scrolls to.
+            scroll: scroll_into_view(0, 11, 12, 5),
         };
         // Height 11: 6 chrome rows leave a 5-row band for 12 items, so the band
         // must scroll. The selected last row must stay visible; the top ones
@@ -1874,6 +2028,206 @@ mod tests {
             PaletteStep::Continue,
             "a click outside the commands band is a no-op"
         );
+    }
+
+    // -- The mouse: hover, click-to-run, the wheel, outside clicks ----------
+
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    fn moved(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Moved, column, row)
+    }
+
+    fn down(column: u16, row: u16) -> MouseEvent {
+        mouse(MouseEventKind::Down(MouseButton::Left), column, row)
+    }
+
+    /// Twelve commands, `Command00`..`Command11`.
+    fn long_palette() -> Palette {
+        Palette::new(
+            (0..12)
+                .map(|i| entry(&format!("view:v{i:02}"), &format!("Command{i:02}")))
+                .collect(),
+            Vec::new(),
+        )
+    }
+
+    /// The label of the selected (filled) result row on screen.
+    fn selected_label(buf: &ratatui::buffer::Buffer) -> Option<String> {
+        (0..buf.area.height).find_map(|y| {
+            let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            let filled = (0..buf.area.width).any(|x| buf[(x, y)].bg == palette().selection);
+            let at = row.find("Command")?;
+            filled.then(|| row[at..at + 9].to_string())
+        })
+    }
+
+    #[test]
+    fn hovering_a_result_selects_it_and_the_keyboard_continues_from_there() {
+        let mut p = long_palette();
+        let (buf, rect) = draw(&p, 80, 40);
+        let (x, y) = find_cell(&buf, "Command03").unwrap();
+        assert_eq!(p.handle_mouse(rect, moved(x, y)), PaletteStep::Continue);
+        assert_eq!(p.selected(), 3, "the hovered row is the selection");
+        let (buf, _) = draw(&p, 80, 40);
+        assert_eq!(selected_label(&buf).as_deref(), Some("Command03"), "drawn as the keyboard's highlight");
+        // Its bleed-above row (one up) is still that row; the header-free
+        // gap below the list leaves the selection be.
+        p.handle_mouse(rect, moved(x, y - 1));
+        assert_eq!(p.selected(), 3);
+        p.handle_mouse(rect, moved(x, rect.y + 1));
+        assert_eq!(p.selected(), 3, "the search line hovers nothing");
+        // The keyboard picks up from the hovered row.
+        p.handle_key(key(KeyCode::Down), Some(PaletteAction::NavDown));
+        assert_eq!(p.selected(), 4);
+        match p.handle_key(key(KeyCode::Enter), Some(PaletteAction::Activate)) {
+            PaletteStep::Activate(e) => assert_eq!(e.id, "view:v04"),
+            other => panic!("Enter runs the row after the hovered one, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_click_runs_the_result_like_enter_and_one_outside_closes() {
+        let mut p = long_palette();
+        let (buf, rect) = draw(&p, 80, 40);
+        let (x, y) = find_cell(&buf, "Command05").unwrap();
+        match p.handle_mouse(rect, down(x, y)) {
+            PaletteStep::Activate(e) => assert_eq!(e.id, "view:v05"),
+            other => panic!("a click on a row runs it, got {other:?}"),
+        }
+        // Anywhere on the row's band: its right edge too.
+        match p.handle_mouse(rect, down(rect.x + rect.width - 3, y)) {
+            PaletteStep::Activate(e) => assert_eq!(e.id, "view:v05"),
+            other => panic!("the whole band is the row, got {other:?}"),
+        }
+        // Inside the panel but on no row: nothing.
+        assert_eq!(p.handle_mouse(rect, down(x, rect.y + 1)), PaletteStep::Continue);
+        assert_eq!(p.handle_mouse(rect, down(rect.x, y)), PaletteStep::Continue, "the border");
+        // Outside the panel: closes, as Escape does.
+        assert_eq!(p.handle_mouse(rect, down(rect.x + 2, rect.y + rect.height)), PaletteStep::Close);
+        assert_eq!(p.handle_mouse(rect, down(0, y)), PaletteStep::Close);
+        // A right click or a release does nothing.
+        assert_eq!(
+            p.handle_mouse(rect, mouse(MouseEventKind::Up(MouseButton::Left), 0, y)),
+            PaletteStep::Continue
+        );
+    }
+
+    #[test]
+    fn the_wheel_scrolls_the_results_and_hover_and_clicks_follow_the_scroll() {
+        let mut p = long_palette();
+        // 18 rows: a 10-row band for a 25-row list.
+        let (buf, rect) = draw(&p, 80, 18);
+        assert!(find_cell(&buf, "Command00").is_some());
+        assert!(find_cell(&buf, "Command11").is_none(), "the list is taller than the band");
+        let (x, y) = find_cell(&buf, "Command02").unwrap();
+        // Three wheel steps, a row each.
+        for _ in 0..3 {
+            p.handle_mouse(rect, mouse(MouseEventKind::ScrollDown, x, y));
+        }
+        let (buf, _) = draw(&p, 80, 18);
+        assert!(find_cell(&buf, "Command00").is_none(), "scrolled: {}", dump(&buf));
+        assert_eq!(find_cell(&buf, "Command05").map(|(_, y)| y), Some(y), "three rows up");
+        // The pointer stayed put: the row now under it is the selection.
+        assert_eq!(p.selected(), 5);
+        assert_eq!(selected_label(&buf).as_deref(), Some("Command05"));
+        // Hover lands on the row drawn there, and doesn't slide the list.
+        let (x7, y7) = find_cell(&buf, "Command07").unwrap();
+        p.handle_mouse(rect, moved(x7, y7));
+        assert_eq!(p.selected(), 7);
+        let (buf, _) = draw(&p, 80, 18);
+        assert_eq!(find_cell(&buf, "Command07"), Some((x7, y7)), "the list holds still under the pointer");
+        // So does a click.
+        let (x9, y9) = find_cell(&buf, "Command04").unwrap();
+        match p.handle_mouse(rect, down(x9, y9)) {
+            PaletteStep::Activate(e) => assert_eq!(e.id, "view:v04"),
+            other => panic!("a click after scrolling runs the row drawn there, got {other:?}"),
+        }
+        // The wheel stops at the ends.
+        for _ in 0..20 {
+            p.handle_mouse(rect, mouse(MouseEventKind::ScrollDown, x, y));
+        }
+        let (buf, _) = draw(&p, 80, 18);
+        assert!(find_cell(&buf, "Command11").is_some(), "the foot: {}", dump(&buf));
+        for _ in 0..20 {
+            p.handle_mouse(rect, mouse(MouseEventKind::ScrollUp, x, y));
+        }
+        let (buf, _) = draw(&p, 80, 18);
+        assert!(find_cell(&buf, "Command00").is_some(), "the top: {}", dump(&buf));
+        // The keyboard scrolls the selection back into view.
+        for _ in 0..10 {
+            p.handle_key(key(KeyCode::Down), Some(PaletteAction::NavDown));
+        }
+        let (buf, _) = draw(&p, 80, 18);
+        assert_eq!(selected_label(&buf).as_deref(), Some(format!("Command{:02}", p.selected()).as_str()));
+    }
+
+    #[test]
+    fn the_wheel_outside_the_results_does_nothing() {
+        let mut p = long_palette();
+        let (_, rect) = draw(&p, 80, 18);
+        p.handle_mouse(rect, mouse(MouseEventKind::ScrollDown, rect.x + 3, rect.y + 1));
+        p.handle_mouse(rect, mouse(MouseEventKind::ScrollDown, 0, 0));
+        let (buf, _) = draw(&p, 80, 18);
+        assert!(find_cell(&buf, "Command00").is_some(), "still at the top");
+    }
+
+    #[test]
+    fn a_projects_row_hovers_and_clicks_too() {
+        let mut p = Palette::new(
+            vec![entry("view:tasks", "Issues"), entry("view:activity", "Activity")],
+            vec![
+                project("website", "Website", ProjectIndicator::Active),
+                project("docs", "Docs", ProjectIndicator::LoadedIdle),
+            ],
+        );
+        let (buf, rect) = draw(&p, 100, 30);
+        let (x, y) = find_cell(&buf, "Docs").unwrap();
+        p.handle_mouse(rect, moved(x, y));
+        assert_eq!(p.inner().project_selection(), Some(1));
+        // Back on a result, the results have the keys again.
+        let (ax, ay) = find_cell(&buf, "Activity").unwrap();
+        p.handle_mouse(rect, moved(ax, ay));
+        assert_eq!((p.inner().focus(), p.selected()), (Focus::Commands, 1));
+        match p.handle_mouse(rect, down(x, y)) {
+            PaletteStep::Activate(e) => assert_eq!(e.id, "action:switch-project:docs"),
+            other => panic!("a click on a project switches to it, got {other:?}"),
+        }
+        let (x, y) = find_cell(&buf, "Add project").unwrap();
+        match p.handle_mouse(rect, down(x, y)) {
+            PaletteStep::Activate(e) => assert_eq!(e.id, "action:add-project"),
+            other => panic!("a click on Add project adds one, got {other:?}"),
+        }
+        // The heading is no row.
+        let (x, y) = find_cell(&buf, "Projects").unwrap();
+        assert_eq!(p.handle_mouse(rect, down(x, y)), PaletteStep::Continue);
+    }
+
+    #[test]
+    fn while_searching_a_header_hovers_nothing_and_a_chip_click_filters() {
+        let mut p = search_palette();
+        type_in(&mut p, "login");
+        let (buf, rect) = draw(&p, 100, 30);
+        let y = find_row_with(&buf, " Issues  ").unwrap();
+        p.handle_key(key(KeyCode::Down), Some(PaletteAction::NavDown));
+        let before = p.inner().selected_row();
+        p.handle_mouse(rect, moved(rect.x + 3, y));
+        assert_eq!(p.inner().selected_row(), before, "a header isn't a result");
+        let (x, y) = find_cell(&buf, "Login form validation").unwrap();
+        p.handle_mouse(rect, moved(x, y));
+        let rows = p.inner().rows();
+        let hovered = &rows[p.inner().selected_row().unwrap()];
+        assert!(matches!(hovered, ResultRow::Item(ResultItem::Issue(d)) if d.id == "1944"));
+        let (x, y) = find_cell(&buf, "Issues 2").unwrap();
+        assert_eq!(p.handle_mouse(rect, down(x, y)), PaletteStep::Continue);
+        assert_eq!(p.inner().filter(), SearchFilter::Issues);
     }
 
 }

@@ -427,6 +427,32 @@ impl ProjectLink {
         }
     }
 
+    /// Add the issue [`Mutation::AddIssue`] describes and answer with the id
+    /// the daemon created (`None` from a daemon that doesn't report one).
+    pub fn add_issue(
+        &self,
+        mutation: &Mutation,
+        on_line: &mut dyn FnMut(Stream, &str),
+    ) -> Result<Option<String>, ExecError> {
+        match &self.relay {
+            None => crate::exec_daemon::add_issue(mutation, on_line),
+            Some(relay) => {
+                let mut client = Self::far_control(&**relay, &self.key.name)?;
+                crate::exec_daemon::add_issue_over(&mut client, mutation, on_line)
+            }
+        }
+    }
+
+    /// Type `text` into the project's orchestrator session (a paste, then
+    /// Return), on this machine or over the host's relay. Blocking.
+    pub fn message_orchestrator(&self, text: &str) -> Result<(), crate::new_task::HandoffError> {
+        use crate::new_task::OrchestratorMessenger;
+        match &self.relay {
+            None => crate::new_task::SessionMessenger.send(&self.key.name, text),
+            Some(relay) => crate::session::remote::message_orchestrator_over(&**relay, &self.key.name, text),
+        }
+    }
+
     /// Quit the project on the far daemon (its agents stop; the far Shelbi
     /// keeps running), for a remote link: the relay allows Quit Project only
     /// for the window's own project. `None` for a local link, whose client
