@@ -134,6 +134,9 @@ impl WorkspaceOps for LiveOps {
     }
 
     fn open_in_app(&self, project: &str, workspace: &str, role: ReviewRole) -> Result<String, String> {
+        if let Some(host) = self.project.key().host() {
+            return Err(shelbi_app::remote_window::local_open_unavailable(host));
+        }
         shelbi_orchestrator::workspace_session::open_in_app(project, workspace, role.into()).map_err(|e| e.to_string())
     }
 
@@ -147,6 +150,9 @@ impl WorkspaceOps for LiveOps {
     }
 
     fn reveal(&self, path: &str) -> Result<(), String> {
+        if let Some(host) = self.project.key().host() {
+            return Err(shelbi_app::remote_window::local_open_unavailable(host));
+        }
         std::process::Command::new("open")
             .arg(path)
             .status()

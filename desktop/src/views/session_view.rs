@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     div, prelude::*, AnyWindowHandle, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Subscription, Task, Window,
+    SharedString, Subscription, Task, Window,
 };
 use shelbi_app::session::{
     self as app_session, ConnectFailure, DeathAction, IdleInfo, PersistentRelauncher,
@@ -73,6 +73,9 @@ use crate::theme::Theme;
 /// How often a pane waiting out its restart backoff re-asks the controller
 /// (the TUI asks once per event-loop turn). Only runs while waiting.
 const RESTART_TICK: Duration = Duration::from_millis(250);
+
+/// How long a refused drop's reason shows.
+const DROP_NOTE: Duration = Duration::from_secs(4);
 
 /// The blocking work of reaching a session: the relaunch-tolerant connect and
 /// wiring it onto the pane's reader/writer threads. Injectable so the view's
@@ -92,6 +95,13 @@ pub trait SessionConnector: Send + Sync {
     /// view whose own machine isn't set ([`SessionView::set_remote_machine`])
     /// reconnects to this host when its stream drops.
     fn machine(&self) -> Option<&str> {
+        None
+    }
+
+    /// Why files dropped on this connector's panes aren't pasted, when they
+    /// aren't: a remote window's sessions run on another machine, where a
+    /// dropped file's path doesn't exist.
+    fn drop_refusal(&self) -> Option<String> {
         None
     }
 }
@@ -120,6 +130,10 @@ impl LiveConnector {
 impl SessionConnector for LiveConnector {
     fn machine(&self) -> Option<&str> {
         self.host.as_deref()
+    }
+
+    fn drop_refusal(&self) -> Option<String> {
+        self.host.as_deref().map(shelbi_app::remote_window::drop_refused)
     }
 
     fn connect(
@@ -243,6 +257,10 @@ pub enum SessionPhase {
 
 /// One session in the main area of a project window.
 pub struct SessionView {
+    /// Why the last drop wasn't pasted, shown over the terminal for
+    /// [`DROP_NOTE`] ([`TerminalPane::refuse_drops`]).
+    drop_note: Option<SharedString>,
+    drop_note_generation: u64,
     project: String,
     target: SessionRef,
     /// The `View::Session` name this view is shown for (`orch`, a workspace),
@@ -313,6 +331,8 @@ impl SessionView {
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
+            drop_note: None,
+            drop_note_generation: 0,
             project: project.to_string(),
             target,
             view_name: view_name.to_string(),
@@ -709,7 +729,12 @@ impl SessionView {
                     || self.dead_pane_focus.take().is_some_and(|old| {
                         window.focused(cx).is_none_or(|now| now == old)
                     });
-                let pane = cx.new(|cx| TerminalPane::attached_to(connected, window, cx));
+                let refusal = self.deps.connector.drop_refusal();
+                let pane = cx.new(|cx| {
+                    let mut pane = TerminalPane::attached_to(connected, window, cx);
+                    pane.refuse_drops(refusal);
+                    pane
+                });
                 let pane_focus = pane.read(cx).focus_handle(cx);
                 self._pane_subscriptions = vec![
                     cx.subscribe_in(&pane, window, |this, pane, event: &PaneEvent, window, cx| {
@@ -780,7 +805,29 @@ impl SessionView {
             // away under it (an SSH drop): reconnect.
             PaneEvent::Closed if self.machine().is_some() => self.link_lost(cx),
             PaneEvent::Closed => self.live_pane_died(app_session::exit_line(None), cx),
+            PaneEvent::DropRefused(reason) => self.note_drop_refused(reason.clone(), cx),
         }
+    }
+
+    /// Show why a drop wasn't pasted, over the terminal's foot, for a few
+    /// seconds.
+    fn note_drop_refused(&mut self, reason: String, cx: &mut Context<Self>) {
+        self.drop_note_generation += 1;
+        let generation = self.drop_note_generation;
+        self.drop_note = Some(reason.into());
+        cx.notify();
+        let timer = cx.background_executor().timer(DROP_NOTE);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if this.drop_note_generation == generation {
+                    this.drop_note = None;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn forward(&self, event: shelbi_client::SessionEvent) {
@@ -959,7 +1006,25 @@ impl Render for SessionView {
                 bottom: self.inset_bottom,
             };
             pane.update(cx, |pane, _| pane.set_scrollbar_padding(padding));
+            let note = self.drop_note.clone().map(|note| {
+                div()
+                    .debug_selector(|| "session-drop-note".into())
+                    .absolute()
+                    .bottom(gpui::px(self.inset_bottom))
+                    .left(gpui::px(self.inset_x))
+                    .right(gpui::px(self.inset_x))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(theme.notice)
+                    .border_1()
+                    .border_color(theme.divider)
+                    .type_style(Type::Small)
+                    .text_color(theme.text_loud)
+                    .child(note)
+            });
             return root
+                .relative()
                 // The grid's insets are the terminal's background, not the
                 // canvas the contrast setting moves.
                 .bg(theme.nested(theme.terminal_canvas()))
@@ -967,7 +1032,8 @@ impl Render for SessionView {
                 .pr(gpui::px(self.inset_x))
                 .pt(gpui::px(self.inset_top))
                 .pb(gpui::px(self.inset_bottom))
-                .child(pane.clone());
+                .child(pane.clone())
+                .children(note);
         }
         if let Some(lines) = self.idle_lines() {
             // The TUI's idle placeholder, as the Workspace idle frame draws
@@ -1013,6 +1079,18 @@ mod tests {
     use shelbi_app::theme::ThemePreference;
 
     use crate::elements::terminal::session::SessionIo;
+
+    #[test]
+    fn a_remote_windows_panes_refuse_drops_with_the_reason() {
+        use shelbi_app::source::{ProjectHandle, ProjectKey};
+        let remote = ProjectHandle::null(ProjectKey::remote("jlong@devbox", "far"));
+        assert_eq!(
+            LiveConnector::over(&remote.link).drop_refusal(),
+            Some(shelbi_app::remote_window::drop_refused("devbox"))
+        );
+        let local = ProjectHandle::null(ProjectKey::local("far"));
+        assert_eq!(LiveConnector::over(&local.link).drop_refusal(), None, "a local pane pastes drops");
+    }
 
     /// What the fake session's input side saw.
     #[derive(Default)]

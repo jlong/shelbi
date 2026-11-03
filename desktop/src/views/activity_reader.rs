@@ -29,6 +29,10 @@ use shelbi_app::source::ProjectSource;
 use super::activity::now;
 use super::activity_state::Read;
 
+/// A test reader's read, run on the asking thread.
+#[cfg(test)]
+type InlineRead = Box<dyn Fn(&ActivityReader)>;
+
 pub struct ActivityReader {
     requests: Option<mpsc::Sender<()>>,
     reads: async_channel::Receiver<Read>,
@@ -37,6 +41,10 @@ pub struct ActivityReader {
     /// The filter the view shows, which each read's feed is built under.
     filter: Arc<Mutex<ActivityFilter>>,
     stop: Arc<AtomicBool>,
+    /// A test's reader reads on the asking thread (a reader thread's send
+    /// would wake gpui's test scheduler off its thread).
+    #[cfg(test)]
+    inline: Option<InlineRead>,
 }
 
 impl ActivityReader {
@@ -44,6 +52,10 @@ impl ActivityReader {
     /// read. The source keeps the title cache, so each read only resolves
     /// ids it hasn't seen.
     pub fn spawn(source: Arc<dyn ProjectSource>) -> Self {
+        #[cfg(test)]
+        if tests::INLINE.with(|i| i.get()) {
+            return Self::inline(source);
+        }
         let (requests, request_rx) = mpsc::channel::<()>();
         let (tx, reads) = async_channel::unbounded::<Read>();
         let window = Arc::new(AtomicUsize::new(ACTIVITY_PAGE));
@@ -79,6 +91,28 @@ impl ActivityReader {
             window,
             filter,
             stop,
+            #[cfg(test)]
+            inline: None,
+        };
+        reader.request();
+        reader
+    }
+
+    /// A reader that reads `source` on the thread that asks ([`tests::INLINE`]).
+    #[cfg(test)]
+    fn inline(source: Arc<dyn ProjectSource>) -> Self {
+        let (tx, reads) = async_channel::unbounded::<Read>();
+        let reader = ActivityReader {
+            requests: None,
+            reads,
+            window: Arc::new(AtomicUsize::new(ACTIVITY_PAGE)),
+            filter: Arc::new(Mutex::new(ActivityFilter::default())),
+            stop: Arc::new(AtomicBool::new(false)),
+            inline: Some(Box::new(move |reader: &ActivityReader| {
+                let shown = reader.filter.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                let read = source.activity_window(reader.window.load(Ordering::Acquire), &mut |_| {});
+                let _ = tx.try_send(Read::new(read.data, read.info, shown, now()));
+            })),
         };
         reader.request();
         reader
@@ -86,6 +120,10 @@ impl ActivityReader {
 
     /// Ask for a read. Requests that pile up while one is in flight coalesce.
     pub fn request(&self) {
+        #[cfg(test)]
+        if let Some(read) = &self.inline {
+            return read(self);
+        }
         if let Some(tx) = &self.requests {
             let _ = tx.send(());
         }
@@ -132,5 +170,16 @@ impl ActivityReader {
 impl Drop for ActivityReader {
     fn drop(&mut self) {
         self.stop_without_waiting();
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Readers made on this thread read inline: a gpui test's window
+        /// reading a real source sets it.
+        pub(crate) static INLINE: Cell<bool> = const { Cell::new(false) };
     }
 }

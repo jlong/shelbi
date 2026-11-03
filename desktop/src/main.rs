@@ -35,6 +35,8 @@ mod source_gate;
 mod spike;
 #[cfg(test)]
 mod test_env;
+#[cfg(test)]
+mod remote_fixture;
 mod theme;
 mod views;
 #[cfg(feature = "visual-check")]

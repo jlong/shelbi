@@ -626,6 +626,10 @@ impl RemoteConnector for SshRemote {
         }
         Ok(())
     }
+
+    fn listing(&self, host: &str) -> Result<RemoteListing, RemoteError> {
+        self.probe(host).map(|found| found.listing)
+    }
 }
 
 /// Read the probe script's answer from `host`.

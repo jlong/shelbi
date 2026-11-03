@@ -268,8 +268,8 @@ impl ActivityView {
         start.elapsed()
     }
 
-    /// The view's state, for the offscreen views check.
-    #[cfg(feature = "visual-check")]
+    /// The view's state, for the offscreen views check (and tests).
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn state(&self) -> &ActivityState {
         &self.state
     }

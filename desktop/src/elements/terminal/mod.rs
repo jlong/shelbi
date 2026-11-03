@@ -205,6 +205,10 @@ pub enum PaneEvent {
     /// The connection ended without an exit: the session process went away
     /// (killed, or replaced by a relaunch).
     Closed,
+    /// Files were dropped on a pane that doesn't take them (a remote
+    /// window's: their paths are on this machine, not the session's), with
+    /// the reason to show.
+    DropRefused(String),
 }
 
 impl gpui::EventEmitter<PaneEvent> for TerminalPane {}
@@ -312,6 +316,9 @@ struct ScrollbarDrag {
 /// One session in a terminal element.
 pub struct TerminalPane {
     selector: String,
+    /// Why dropped files aren't pasted here, when they aren't
+    /// ([`Self::refuse_drops`]).
+    drop_refusal: Option<String>,
     title: Option<String>,
     status: PaneStatus,
     view: TerminalView,
@@ -670,6 +677,7 @@ impl TerminalPane {
         let size = Size::new(80, 24);
         Self {
             selector,
+            drop_refusal: None,
             title: None,
             status: PaneStatus::Connecting,
             view: TerminalView::new(size),
@@ -1045,12 +1053,22 @@ impl TerminalPane {
     /// A Finder drop arrives straight from gpui; an image or file-promise drop
     /// is first written to a file by `crate::drops`, then replayed here.
     fn drop_paths(&mut self, paths: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(reason) = self.drop_refusal.clone() {
+            cx.emit(PaneEvent::DropRefused(reason));
+            return;
+        }
         let text = input::dropped_paths_text(paths.paths());
         if text.is_empty() || self.io.is_none() {
             return;
         }
         window.focus(&self.focus_handle, cx);
         self.paste(text, cx);
+    }
+
+    /// Don't paste dropped files' paths, saying `reason` instead (a remote
+    /// window's sessions run on another machine). `None` takes drops again.
+    pub fn refuse_drops(&mut self, reason: Option<String>) {
+        self.drop_refusal = reason;
     }
 
     fn paste(&mut self, text: String, cx: &mut Context<Self>) {

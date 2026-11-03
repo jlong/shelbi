@@ -104,6 +104,7 @@ fn fixture() -> CommandModel {
         // A client with the launch screen and the Connect dialog.
         launch_screen: true,
         remote_connect: true,
+        remote_host: None,
     }
 }
 

@@ -171,6 +171,9 @@ impl ReviewOps for LiveOps {
     }
 
     fn open_in_app(&self, project: &str, task: &str, role: ReviewRole) -> Result<(), String> {
+        if let Some(host) = self.project.key().host() {
+            return Err(shelbi_app::remote_window::local_open_unavailable(host));
+        }
         shelbi_orchestrator::review_session::open_in_app(project, task, role.into())
             .map(|_| ())
             .map_err(|e| e.to_string())
@@ -181,6 +184,9 @@ impl ReviewOps for LiveOps {
     }
 
     fn reveal(&self, path: &str) -> Result<(), String> {
+        if let Some(host) = self.project.key().host() {
+            return Err(shelbi_app::remote_window::local_open_unavailable(host));
+        }
         run_open(path)
     }
 
