@@ -1194,4 +1194,56 @@ transitions:
             "the pre-merge prefix must push the review commit to origin before merging"
         );
     }
+
+    /// The remote-window umbrella incident at the gate level: the task's
+    /// branch exists only on origin (created there, advanced by subtask
+    /// merges) and the assigned review worktree is detached with no local
+    /// branch of that name. The `[push_branch, merge]` accept edge used to
+    /// abort in its pre-merge prefix with `src refspec <branch> does not
+    /// match any`; the prefix must now pass so the merge is attempted.
+    ///
+    /// As in the test above, the merge step itself reaches `gh`, which can't
+    /// serve this plain bare origin, so the gate may still return `Err` — but
+    /// never the pre-merge push failure. (`actions` covers the hub-side merge
+    /// of an origin-only branch end to end.)
+    #[test]
+    fn gated_merge_prefix_passes_when_branch_exists_only_on_origin() {
+        let (tmp, local, mut project) = origin_clone_with_workspace();
+        let remote = tmp.path().join("origin.git");
+
+        // Create `umbrella` on origin from a separate clone; `local` never
+        // sees it as a branch.
+        let other = tmp.path().join("other");
+        run_git(tmp.path(), &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()]);
+        run_git(&other, &["config", "user.email", "test@example.com"]);
+        run_git(&other, &["config", "user.name", "Test"]);
+        run_git(&other, &["checkout", "-q", "--no-track", "-b", "umbrella", "origin/main"]);
+        run_git(&other, &["commit", "-q", "--allow-empty", "-m", "feat: subtask"]);
+        run_git(&other, &["push", "-q", "origin", "HEAD:refs/heads/umbrella"]);
+
+        // A review slot detached at the initial commit.
+        let review_wt = local.join(".shelbi").join("wt").join("review");
+        run_git(&local, &["worktree", "add", "--detach", review_wt.to_str().unwrap(), "main"]);
+        project.workspaces.push(WorkspaceSpec {
+            name: "review".into(),
+            machine: "hub".into(),
+            tags: Vec::new(),
+            slot: None,
+        });
+
+        let wf = workflow_with_edge("push_branch, merge", Some("main"));
+        let mut task = bare_task("remote-window");
+        task.branch = Some("umbrella".into());
+        task.assigned_to = Some("review".into());
+
+        if let Err(e) = run_gated_merge(
+            &project, "fixture", &task, "body", &wf, "review", "done", "review",
+        ) {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("src refspec") && !msg.contains("nor on origin"),
+                "the pre-merge push_branch must not fail on an origin-only branch: {msg}"
+            );
+        }
+    }
 }
