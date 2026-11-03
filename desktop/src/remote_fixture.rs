@@ -192,6 +192,8 @@ fn relay(dir: &std::path::Path) -> ChannelLink {
         hub_socket: Some(dir.join("hub.sock")),
         control_socket: Some(dir.join("control.sock")),
         put_dir: Some(dir.join("drops")),
+        // The far side's real opener, as `shelbi relay` injects it.
+        session: Some(shelbi_orchestrator::session_connect::relay_opener()),
     };
     let root = dir.join("sessions");
     std::thread::spawn(move || {

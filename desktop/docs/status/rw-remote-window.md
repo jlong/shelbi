@@ -98,5 +98,5 @@ Settings keeps it. The far machine's config never decides it.
 ## Left for later phases
 
 A far reload (`ChangeWake::Reload`) doesn't yet close the window's panes and
-offer Reopen (plan 6); sessions on the far
-project's own machines (P9).
+offer Reopen (plan 6). Sessions on the far project's own machines landed in
+P9 ([`rw-remote-two-hop.md`](rw-remote-two-hop.md)).

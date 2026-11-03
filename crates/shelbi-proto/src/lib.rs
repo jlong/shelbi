@@ -53,7 +53,8 @@ pub use ext::{
 };
 pub use frame::{frame_boundary, Frame, FrameType, MAX_FRAME_LEN};
 pub use relay::{
-    RelayFrame, RelayService, RelaySession, RelayType, RELAY_PROTOCOL_VERSION, RELAY_SERVICES_VERSION,
+    RelayFrame, RelayService, RelaySession, RelayType, SessionOpenError, SessionTarget, RELAY_PROTOCOL_VERSION,
+    RELAY_SERVICES_VERSION,
 };
 pub use message::{
     Attach, ClientColors, Exited, Hello, Input, Kill, Output, Resize, Rgb, Snapshot, SnapshotData,

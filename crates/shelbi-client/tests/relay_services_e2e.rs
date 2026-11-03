@@ -600,3 +600,161 @@ fn put_file_names_keep_only_a_plain_base_name() {
     assert_eq!(put_file_name(".hidden"), "hidden");
     assert_eq!(put_file_name("a\nb"), "ab");
 }
+
+// --- session (the second hop) ----------------------------------------------
+
+/// A "third machine": a relay over its own pipe whose sessions root holds one
+/// session socket, `short_id`, served by the test. Returns the channel the far
+/// side holds to it, the near end of its pipe (to cut it, as an SSH drop
+/// does), and the session's accepted connections.
+fn third_machine(dir: &Path, short_id: &str) -> (Arc<RelayChannel>, UnixStream, Receiver<UnixStream>) {
+    let root = dir.join("third-sessions");
+    std::fs::create_dir_all(root.join(short_id)).unwrap();
+    let listener = UnixListener::bind(root.join(short_id).join("sock")).unwrap();
+    let (accepted, conns) = channel();
+    std::thread::spawn(move || {
+        while let Ok((conn, _)) = listener.accept() {
+            if accepted.send(conn).is_err() {
+                return;
+            }
+        }
+    });
+    let (far, third) = UnixStream::pair().unwrap();
+    let third_read = third.try_clone().unwrap();
+    std::thread::spawn(move || {
+        let _ = shelbi_client::serve_relay(Box::new(third_read), Box::new(third), &root);
+    });
+    let cut = far.try_clone().unwrap();
+    let far_read = far.try_clone().unwrap();
+    let channel = RelayChannel::new(Box::new(far_read), Box::new(far)).unwrap();
+    (Arc::new(channel), cut, conns)
+}
+
+/// Read until `buf` holds `want` bytes (or the deadline passes).
+fn read_exactly(read: &mut dyn Read, want: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; want];
+    let mut got = 0;
+    while got < want {
+        match read.read(&mut buf[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) => panic!("reading the session: {e}"),
+        }
+    }
+    buf.truncate(got);
+    buf
+}
+
+#[test]
+fn session_bridges_a_second_hop_both_ways_and_closes_with_it() {
+    use shelbi_proto::{Frame, Output, SessionTarget};
+    let dir = tempfile::tempdir().unwrap();
+    let (third, cut, conns) = third_machine(dir.path(), "gammaagent0");
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    let opener: shelbi_client::SessionOpener = {
+        let (third, asked) = (third.clone(), asked.clone());
+        Arc::new(move |project: &str, target: &SessionTarget| {
+            asked.lock().unwrap().push((project.to_string(), target.clone()));
+            let stream = third.open("gammaagent0").map_err(|e| shelbi_proto::SessionOpenError::Unreachable {
+                message: e.to_string(),
+            })?;
+            Ok(Box::new(stream) as Box<dyn Transport>)
+        })
+    };
+    let relay = start_relay(
+        dir.path(),
+        RelayServices {
+            session: Some(opener),
+            ..RelayServices::default()
+        },
+    );
+    let target = SessionTarget::Workspace {
+        workspace: "gamma".into(),
+    };
+    let stream = relay
+        .open_service(RelayService::Session {
+            project: "demo".into(),
+            target: target.clone(),
+        })
+        .expect("the far side opens the second hop");
+    assert_eq!(*asked.lock().unwrap(), vec![("demo".to_string(), target)]);
+    let mut session = conns.recv_timeout(DEADLINE).expect("the session on the third machine is connected");
+    session.set_read_timeout(Some(DEADLINE)).unwrap();
+    let mut near = split(stream);
+
+    // Client to session, unchanged.
+    near.write.write_all(b"typed").unwrap();
+    near.write.flush().unwrap();
+    assert_eq!(read_exactly(&mut session, 5), b"typed");
+
+    // Session to client: whole session frames, unchanged.
+    let frame = Frame::Output(Output {
+        seq: 7,
+        data: b"from gamma".to_vec(),
+    })
+    .encode()
+    .unwrap();
+    session.write_all(&frame).unwrap();
+    assert_eq!(read_exactly(&mut *near.read, frame.len()), frame);
+
+    // The second hop drops: the client's stream ends (EOF), the channel stays.
+    cut.shutdown(std::net::Shutdown::Both).unwrap();
+    let mut rest = Vec::new();
+    near.read.read_to_end(&mut rest).unwrap();
+    assert!(rest.is_empty(), "{rest:?}");
+    assert!(relay.is_reachable(), "only the stream closes, not the channel");
+}
+
+#[test]
+fn a_session_that_cant_be_opened_says_why_and_keeps_the_channel() {
+    use shelbi_proto::{SessionOpenError, SessionTarget};
+    let dir = tempfile::tempdir().unwrap();
+    let opener: shelbi_client::SessionOpener = Arc::new(|_: &str, target: &SessionTarget| {
+        Err(match target {
+            SessionTarget::Orchestrator => SessionOpenError::NoSession { exited: true },
+            _ => SessionOpenError::Unreachable {
+                message: "`gpu-box` is unreachable".into(),
+            },
+        })
+    });
+    let relay = start_relay(
+        dir.path(),
+        RelayServices {
+            session: Some(opener),
+            ..RelayServices::default()
+        },
+    );
+    let open = |target: SessionTarget| {
+        match relay.open_service(RelayService::Session {
+            project: "demo".into(),
+            target,
+        }) {
+            Err(ClientError::Relay(error)) => SessionOpenError::from_wire(&error),
+            other => panic!("expected an open error, got {:?}", other.map(|_| ())),
+        }
+    };
+    assert_eq!(
+        open(SessionTarget::Workspace {
+            workspace: "gamma".into()
+        }),
+        SessionOpenError::Unreachable {
+            message: "`gpu-box` is unreachable".into()
+        }
+    );
+    assert_eq!(open(SessionTarget::Orchestrator), SessionOpenError::NoSession { exited: true });
+    assert!(matches!(open(SessionTarget::Unknown), SessionOpenError::Failed { .. }));
+    assert!(relay.is_reachable());
+
+    // A relay with no session service says so at open.
+    let bare = start_relay(dir.path(), RelayServices::default());
+    match bare.open_service(RelayService::Session {
+        project: "demo".into(),
+        target: SessionTarget::Orchestrator,
+    }) {
+        Err(ClientError::Relay(error)) => assert!(
+            matches!(SessionOpenError::from_wire(&error), SessionOpenError::Failed { ref message } if message.contains("session")),
+            "{error}"
+        ),
+        other => panic!("expected an open error, got {:?}", other.map(|_| ())),
+    }
+}

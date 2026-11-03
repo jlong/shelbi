@@ -29,10 +29,19 @@
 //! [`RemoteSessionConnector::refusal`] for the window to offer Start. Sessions
 //! resume by attach and resync (the replay); the agents never stopped.
 //!
-//! Sessions on the far project's own remote machines (a second hop) are not
-//! on the far host's session list; until the relay can reach them (P9) such a
-//! workspace's pane shows a placeholder naming its machine
-//! ([`crate::remote_window::two_hop_placeholder`]).
+//! **Two hops.** A workspace the far project runs on another of its own
+//! machines is not on the far host's session list, and this machine has no
+//! route (and maybe no credentials) to that machine. When a workspace-scoped
+//! target misses on the far list and the far project says the workspace is
+//! remote ([`crate::source::WorkspaceDetails::is_remote`]), the pane opens the
+//! relay's `session` service instead: the far `shelbi relay` resolves the
+//! target as the far hub does, through the far side's own relay to that
+//! machine, and bridges the session's frames, so the pane speaks the session
+//! protocol end to end ([`attach_through`]). This machine's `ssh` gains no
+//! `-R` or `-L`; the far side's relay and forward stay there. Either hop
+//! dropping ends the stream, and the pane reconnects as for any drop: the
+//! far machine being unreachable is [`ConnectFailure::Unreachable`] (the
+//! shared notice), and so is the third machine, named in the reason.
 //!
 //! **Version.** Every reconnect checks the host with
 //! [`crate::remote_window::reconnect_check`]: the far Shelbi may have been
@@ -113,25 +122,83 @@ impl Connector for RemoteSessionConnector {
     fn connect(&self, project: &str, target: &SessionRef) -> Result<Connected, ConnectFailure> {
         let link = self.channel()?;
         match attach_over(&*link, project, target) {
-            Err(ConnectFailure::Idle(idle)) => Err(second_hop(link, project, idle)),
+            Err(miss @ (ConnectFailure::Idle(_) | ConnectFailure::Starting(_))) => {
+                second_hop(link, project, target, miss)
+            }
             attached => attached,
         }
     }
 }
 
-/// A workspace with no session on the far host: idle there, or (when the far
-/// project declares it on another of its machines) out of this window's
-/// reach until the relay can take a second hop (P9), which its placeholder
-/// says, naming the machine.
-fn second_hop(link: Arc<dyn RelayLink>, project: &str, idle: IdleInfo) -> ConnectFailure {
+/// A workspace-scoped target with no session on the far host: idle (or not
+/// started yet) there, or, when the far project runs the workspace on another
+/// of its machines, attached through the far side ([`attach_through`]).
+/// `miss` is the far-host outcome, kept for a target that isn't remote.
+fn second_hop(
+    link: Arc<dyn RelayLink>,
+    project: &str,
+    target: &SessionRef,
+    miss: ConnectFailure,
+) -> Result<Connected, ConnectFailure> {
     use crate::source::ProjectSource;
-    let source = crate::source::remote::RemoteSource::new(project, link);
-    match source.workspace_details(&idle.name) {
-        Ok(details) if details.is_remote => {
-            ConnectFailure::Message(crate::remote_window::two_hop_placeholder(&idle.name, &details.machine))
-        }
-        _ => ConnectFailure::Idle(idle),
+    let Some(workspace) = target.workspace() else {
+        return Err(miss);
+    };
+    let source = crate::source::remote::RemoteSource::new(project, link.clone());
+    match source.workspace_details(workspace) {
+        Ok(details) if details.is_remote => attach_through(&*link, project, target, &details.machine),
+        _ => Err(miss),
     }
+}
+
+/// Attach to `target` in `project` through the far side: the relay's
+/// `session` service resolves it where the far project runs it (on
+/// `machine`, another of its machines, through the far side's own relay
+/// there) and bridges its frames. A full replay, as [`attach_over`].
+/// Blocking.
+///
+/// Classified as a far-local attach is: either hop unreachable is
+/// [`ConnectFailure::Unreachable`] (the reason names the far side's view of
+/// it), a workspace agent with no session [`ConnectFailure::Idle`] on
+/// `machine`, a content session not registered yet
+/// [`ConnectFailure::Starting`], one that exited a message.
+pub fn attach_through(
+    link: &dyn RelayLink,
+    project: &str,
+    target: &SessionRef,
+    machine: &str,
+) -> Result<Connected, ConnectFailure> {
+    use shelbi_proto::{RelayService, SessionOpenError};
+    let host = link.host();
+    let want = discovery_name(project, target);
+    let service = RelayService::Session {
+        project: project.to_string(),
+        target: target.to_target(),
+    };
+    let stream = match link.open_service(service) {
+        Ok(stream) => stream,
+        Err(ClientError::Relay(error)) => {
+            return Err(match SessionOpenError::from_wire(&error) {
+                SessionOpenError::Unreachable { message } => ConnectFailure::Unreachable(message),
+                SessionOpenError::NoSession { exited: true } => {
+                    ConnectFailure::Message(no_live_session_error(&want, None))
+                }
+                SessionOpenError::NoSession { exited: false } => match target {
+                    SessionRef::Workspace(name) => ConnectFailure::Idle(IdleInfo {
+                        name: name.clone(),
+                        machine: machine.to_string(),
+                        branch: None,
+                    }),
+                    _ => ConnectFailure::Starting(starting_error(&want)),
+                },
+                SessionOpenError::Failed { message } => {
+                    ConnectFailure::Message(format!("attaching to `{want}` on `{machine}` through `{host}`: {message}"))
+                }
+            })
+        }
+        Err(other) => return Err(relay_failure(host, &want, other)),
+    };
+    connect_stream(stream, host, &want)
 }
 
 /// `error` from the relay as a connect failure: the channel going away is
@@ -190,6 +257,11 @@ fn attach_stream(link: &dyn RelayLink, short_id: &str, want: &str) -> Result<Con
     let stream = link
         .open_session(short_id)
         .map_err(|e| relay_failure(host, want, e))?;
+    connect_stream(stream, host, want)
+}
+
+/// Connect over an open relay `stream` to `want` and attach with a replay.
+fn connect_stream(stream: shelbi_client::RelayStream, host: &str, want: &str) -> Result<Connected, ConnectFailure> {
     let (conn, events) =
         Connection::connect(Box::new(stream), None, capability::ALL).map_err(|e| relay_failure(host, want, e))?;
     let size = match conn.info() {

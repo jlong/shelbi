@@ -7,9 +7,12 @@
 //! a far-local workspace's agent, review content, a user shell), the shared
 //! "Reconnecting to <host>… (attempt N)" loop after the channel drops, resuming
 //! the same session by attach and replay, a reconnect that never starts the
-//! far daemon, content sessions ensured through the far `control` service, and
-//! the orchestrator's title asked over the link. No SSH, no real daemon,
-//! nothing of the real `~/.shelbi`.
+//! far daemon, content sessions ensured through the far `control` service, the
+//! orchestrator's title asked over the link, and a workspace on another of the
+//! far project's machines (a third machine only the far side's own relay
+//! reaches) streamed through the far relay's `session` service and reconnected
+//! when either hop drops. No SSH, no real daemon, nothing of the real
+//! `~/.shelbi`.
 
 #![cfg(unix)]
 
@@ -63,6 +66,8 @@ struct Far {
     control: Option<PathBuf>,
     /// The far relay's `query` service, when a test answers one.
     query: Option<shelbi_client::QueryHandler>,
+    /// The far relay's `session` service, when a test offers one.
+    sessions: Option<shelbi_client::SessionOpener>,
 }
 
 impl Far {
@@ -84,6 +89,7 @@ impl Far {
             down: Arc::default(),
             control: None,
             query: None,
+            sessions: None,
         }
     }
 
@@ -129,12 +135,13 @@ impl Far {
     /// Opens a relay to the far machine over a fresh socket pair, refusing
     /// the next [`Far::go_down`] opens as unreachable.
     fn opener(&self) -> impl Fn(&str) -> Result<Arc<dyn RelayLink>, RemoteError> + Send + Sync + 'static {
-        let (root, channels, down, control, query) = (
+        let (root, channels, down, control, query, sessions) = (
             self.root.clone(),
             self.channels.clone(),
             self.down.clone(),
             self.control.clone(),
             self.query.clone(),
+            self.sessions.clone(),
         );
         move |host: &str| {
             if down.load(Ordering::SeqCst) > 0 {
@@ -149,6 +156,7 @@ impl Far {
             let services = RelayServices {
                 control_socket: control.clone(),
                 query: query.clone(),
+                session: sessions.clone(),
                 ..RelayServices::default()
             };
             let root = root.clone();
@@ -684,14 +692,108 @@ fn a_far_upgrade_while_away_refuses_the_reconnect_and_offers_reopen() {
     assert_eq!(connector.refusal(), None);
 }
 
-#[test]
-fn a_workspace_on_another_far_machine_shows_a_placeholder_naming_it() {
+// --- two hops: a workspace on another of the far project's machines --------
+
+/// The far project's other machine, which this machine has no route to.
+const THIRD: &str = "gpu-box";
+
+/// The far project: workspace `alpha` on the far host itself, `gamma` on
+/// [`THIRD`], another of its machines.
+fn write_far_project(far: &Far) {
+    // `Far::new` pointed `SHELBI_HOME` at the far home.
+    let projects = shelbi_state::projects_dir().unwrap();
+    assert!(projects.starts_with(far.home.path()), "write into the far home");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(
+        projects.join(format!("{PROJECT}.yaml")),
+        format!(
+            "name: {PROJECT}\nrepo: ''\ndefault_branch: main\n\
+             orchestrator:\n  runner: claude\n\
+             agent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+             machines:\n  - name: hub\n    kind: local\n    work_dir: /tmp\n\
+             \x20 - name: {THIRD}\n    kind: ssh\n    host: {THIRD}\n    work_dir: /tmp\n\
+             workspaces:\n  - {{ name: alpha, machine: hub, runner: claude }}\n\
+             \x20 - {{ name: gamma, machine: {THIRD}, runner: claude }}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// The third machine as the far side reaches it: the far hub's relay seam
+/// (`remote_session`'s, in place of `ssh gpu-box shelbi relay` with its own
+/// `-R` forward) opening an in-process relay over this machine's own sessions
+/// directory. Only the far side ever opens it.
+struct ThirdMachine {
+    root: PathBuf,
+    /// The far side's ends of the relay channels opened so far, to cut them.
+    channels: Mutex<Vec<UnixStream>>,
+    /// How many opens to refuse as unreachable before opening again.
+    down: AtomicUsize,
+    opens: AtomicUsize,
+}
+
+impl ThirdMachine {
+    fn cut(&self) {
+        for channel in self.channels.lock().unwrap().drain(..) {
+            let _ = channel.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+impl shelbi_orchestrator::remote_session::RemoteSsh for ThirdMachine {
+    fn launch(&self, _: &shelbi_core::Host, _: &str, _: &shelbi_session::SpawnSpec) -> shelbi_core::Result<()> {
+        Err(shelbi_core::Error::Other("nothing is launched in this test".into()))
+    }
+
+    fn open_relay(
+        &self,
+        host: &shelbi_core::Host,
+        _bin: &str,
+    ) -> shelbi_core::Result<shelbi_orchestrator::remote_session::RelayHandle> {
+        assert_eq!(
+            host,
+            &shelbi_core::Host::Ssh { host: THIRD.into() },
+            "the far side only reaches its own machine"
+        );
+        if self.down.load(Ordering::SeqCst) > 0 {
+            self.down.fetch_sub(1, Ordering::SeqCst);
+            return Err(shelbi_core::Error::Other("Network is unreachable".into()));
+        }
+        self.opens.fetch_add(1, Ordering::SeqCst);
+        let (near, far) = UnixStream::pair().unwrap();
+        let far_read = far.try_clone().unwrap();
+        let root = self.root.clone();
+        std::thread::spawn(move || {
+            let _ = shelbi_client::serve_relay(Box::new(far_read), Box::new(far), &root);
+        });
+        self.channels.lock().unwrap().push(near.try_clone().unwrap());
+        let near_read = near.try_clone().unwrap();
+        let channel = RelayChannel::new(Box::new(near_read), Box::new(near)).unwrap();
+        Ok(shelbi_orchestrator::remote_session::RelayHandle::new(channel, Box::new(())))
+    }
+}
+
+/// Installs a [`ThirdMachine`] as the far side's relay seam; clears it on drop.
+struct Seam(Arc<ThirdMachine>);
+
+impl Drop for Seam {
+    fn drop(&mut self) {
+        self.0.cut();
+        shelbi_orchestrator::remote_session::set_test_seam(None);
+    }
+}
+
+/// The far machine with the far project written, its relay answering
+/// `session` (the real far-side opener) and `query` (workspace details as the
+/// project declares them), and the third machine behind its seam.
+fn two_hop_far() -> (Far, Seam) {
     use shelbi_app::source::wire::{Answer, Query, QueryError};
     use shelbi_app::source::WorkspaceDetails;
     let mut far = Far::new();
+    write_far_project(&far);
     far.answer_queries(|query: Query, _early: &mut dyn FnMut(Answer)| match query {
         Query::WorkspaceDetails { workspace, .. } => Ok(Answer::WorkspaceDetails(Box::new(WorkspaceDetails {
-            machine: if workspace == "gamma" { "gpu-box".into() } else { "local".into() },
+            machine: if workspace == "gamma" { THIRD.into() } else { "hub".into() },
             is_remote: workspace == "gamma",
             ..WorkspaceDetails::default()
         }))),
@@ -699,18 +801,176 @@ fn a_workspace_on_another_far_machine_shows_a_placeholder_naming_it() {
             message: format!("{other:?}"),
         }),
     });
-    let connector = RemoteSessionConnector::new(far.link(), session(), healthy());
+    far.sessions = Some(shelbi_orchestrator::session_connect::relay_opener());
+    let third = Arc::new(ThirdMachine {
+        root: far.home.path().join("third").join("sessions"),
+        channels: Mutex::default(),
+        down: AtomicUsize::new(0),
+        opens: AtomicUsize::new(0),
+    });
+    std::fs::create_dir_all(&third.root).unwrap();
+    shelbi_orchestrator::remote_session::set_test_seam(Some(third.clone()));
+    (far, Seam(third))
+}
 
-    // On the far project's own other machine: out of reach until P9.
-    match connector.connect(PROJECT, &SessionRef::Workspace("gamma".into())) {
-        Err(ConnectFailure::Message(message)) => {
-            assert_eq!(message, shelbi_app::remote_window::two_hop_placeholder("gamma", "gpu-box"));
-            assert!(message.contains("gpu-box"), "{message}");
+/// Start a real session named `name` on the third machine: started as
+/// [`Far::start`] does, then moved into the third machine's own sessions
+/// directory, so the far host's session list never shows it.
+fn start_on_third(far: &mut Far, seam: &Seam, name: &str, script: &str) {
+    far.start(name, script);
+    let sock = far.sockets.pop().unwrap();
+    let dir = sock.parent().unwrap();
+    let moved = seam.0.root.join(dir.file_name().unwrap());
+    std::fs::rename(dir, &moved).unwrap();
+    far.sockets.push(moved.join("sock"));
+}
+
+/// Reconnect `target` as a pane does after its stream ended, collecting the
+/// shared notice for each attempt, until it attaches.
+fn reconnect(connector: &dyn Connector, target: &SessionRef) -> (Connected, Vec<String>) {
+    let policy = ReconnectPolicy {
+        first_backoff: Duration::from_millis(20),
+        max_backoff: Duration::from_millis(40),
+    };
+    let mut reconnect = ReconnectController::new(policy);
+    reconnect.link_lost(CONNECTION_LOST, Instant::now());
+    let mut notices = Vec::new();
+    loop {
+        let now = Instant::now();
+        if reconnect.take_due(now).is_none() {
+            std::thread::sleep(reconnect.wait(now).unwrap_or_default());
+            continue;
         }
-        other => panic!("expected the placeholder, got {:?}", other.err()),
+        notices.push(reconnecting_notice(HOST, reconnect.attempt(), reconnect.reason()));
+        match connector.connect(PROJECT, target) {
+            Ok(c) => return (c, notices),
+            Err(ConnectFailure::Unreachable(reason)) => reconnect.unreachable(&reason, Instant::now()),
+            Err(other) => panic!("expected to reconnect, got {other:?}"),
+        }
+        assert!(notices.len() < 10, "never reconnected: {notices:?}");
     }
+}
+
+#[test]
+fn a_workspace_on_another_far_machine_streams_through_the_far_side() {
+    let (mut far, seam) = two_hop_far();
+    // The far hub's dispatch names a remote workspace's agent this way.
+    start_on_third(&mut far, &seam, "w-gamma/ws/agent", "printf 'i am gamma on the gpu box\\n'; exec cat");
+    far.start("demo/ws/alpha", "printf 'i am alpha on devbox\\n'; exec cat");
+    let link = far.link();
+    let connector = RemoteSessionConnector::new(link.clone(), session(), healthy());
+
+    let (pane, events) = attach(&connector, &SessionRef::Workspace("gamma".into()));
+    read_until(&events, "i am gamma on the gpu box");
+    // Not on the far host's own list: only the far side can reach it.
+    assert!(
+        !link.list_sessions().unwrap().iter().any(|s| s.name.contains("gamma")),
+        "the third machine's sessions aren't the far host's"
+    );
+    assert!(pane.size.cols > 0 && pane.size.rows > 0);
+    pane.conn.input(b"typed on this mac\n").unwrap();
+    read_until(&events, "typed on this mac");
+    assert_eq!(seam.0.opens.load(Ordering::SeqCst), 1, "the far side opened its own relay to the third machine");
+    assert_eq!(link.opens(), 1, "this machine opened one channel, to the far host only");
+
+    // A far-local workspace still attaches straight from the far list.
+    let (_alpha, alpha_events) = attach(&connector, &SessionRef::Workspace("alpha".into()));
+    read_until(&alpha_events, "i am alpha on devbox");
+    assert_eq!(seam.0.opens.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_two_hop_pane_reconnects_when_the_far_side_s_hop_drops() {
+    let (mut far, seam) = two_hop_far();
+    start_on_third(&mut far, &seam, "w-gamma/ws/agent", "printf 'gamma ready\\n'; exec cat");
+    let link = far.link();
+    let connector = RemoteSessionConnector::new(link.clone(), session(), healthy());
+    let (pane, events) = attach(&connector, &SessionRef::Workspace("gamma".into()));
+    read_until(&events, "gamma ready");
+    pane.conn.input(b"before-the-drop\n").unwrap();
+    read_until(&events, "before-the-drop");
+
+    // The far side's connection to the third machine drops, and the third
+    // machine doesn't answer the first attempt: the pane's stream ends with
+    // no exit while this machine's channel stays up, and it reconnects.
+    seam.0.down.store(1, Ordering::SeqCst);
+    seam.0.cut();
+    read_to_end(&events);
+    drop(pane);
+    assert!(link.is_up(), "only the second hop dropped");
+    let (resumed, notices) = reconnect(&connector, &SessionRef::Workspace("gamma".into()));
+    assert_eq!(
+        notices,
+        vec![
+            "Reconnecting to devbox… (attempt 1) The connection was lost.".to_string(),
+            "Reconnecting to devbox… (attempt 2) `gpu-box` is unreachable".to_string(),
+        ]
+    );
+
+    // The same session, its screen replayed, and still taking input.
+    let events = resumed.events.into_inner();
+    let replay = read_until(&events, "before-the-drop");
+    assert!(replay.contains("gamma ready"), "{replay:?}");
+    resumed.conn.input(b"after-the-drop\n").unwrap();
+    read_until(&events, "after-the-drop");
+    assert_eq!(seam.0.opens.load(Ordering::SeqCst), 2, "a fresh far-side relay after the drop");
+    assert_eq!(link.opens(), 1, "this machine's channel never dropped");
+}
+
+#[test]
+fn a_two_hop_pane_reconnects_when_this_machine_s_hop_drops() {
+    let (mut far, seam) = two_hop_far();
+    start_on_third(&mut far, &seam, "w-gamma/ws/agent", "printf 'gamma ready\\n'; exec cat");
+    let link = far.link();
+    let remote = healthy();
+    let connector = RemoteSessionConnector::new(link.clone(), session(), remote.clone());
+    let (pane, events) = attach(&connector, &SessionRef::Workspace("gamma".into()));
+    read_until(&events, "gamma ready");
+    pane.conn.input(b"before-the-drop\n").unwrap();
+    read_until(&events, "before-the-drop");
+
+    // This machine's SSH connection to the far host drops, and the far host
+    // doesn't answer the first attempt.
+    far.go_down(1);
+    far.drop_channels();
+    read_to_end(&events);
+    drop(pane);
+    until("the link to notice", || (!link.is_up()).then_some(()));
+    let (resumed, notices) = reconnect(&connector, &SessionRef::Workspace("gamma".into()));
+    assert_eq!(
+        notices,
+        vec![
+            "Reconnecting to devbox… (attempt 1) The connection was lost.".to_string(),
+            "Reconnecting to devbox… (attempt 2) Network is unreachable".to_string(),
+        ]
+    );
+    let events = resumed.events.into_inner();
+    let replay = read_until(&events, "before-the-drop");
+    assert!(replay.contains("gamma ready"), "{replay:?}");
+    resumed.conn.input(b"after-the-drop\n").unwrap();
+    read_until(&events, "after-the-drop");
+    assert!(remote.started().is_empty(), "a reconnect never starts the far daemon");
+    assert_eq!(link.opens(), 2, "one channel at first, one after the drop");
+}
+
+#[test]
+fn a_two_hop_workspace_with_no_session_is_idle_on_its_own_machine() {
+    let (far, _seam) = two_hop_far();
+    let connector = RemoteSessionConnector::new(far.link(), session(), healthy());
+    match connector.connect(PROJECT, &SessionRef::Workspace("gamma".into())) {
+        Err(ConnectFailure::Idle(info)) => {
+            assert_eq!(info.name, "gamma");
+            assert_eq!(info.machine, THIRD, "idle on the machine the far project runs it on");
+        }
+        other => panic!("expected idle, got {:?}", other.err()),
+    }
+    // Its shell, just asked for, is still starting there.
+    assert!(matches!(
+        connector.connect(PROJECT, &SessionRef::workspace_shell("gamma")),
+        Err(ConnectFailure::Starting(_))
+    ));
     // On the far host itself, with no session: idle there, as before.
-    match connector.connect(PROJECT, &SessionRef::Workspace("beta".into())) {
+    match connector.connect(PROJECT, &SessionRef::Workspace("alpha".into())) {
         Err(ConnectFailure::Idle(info)) => assert_eq!(info.machine, HOST),
         other => panic!("expected idle, got {:?}", other.err()),
     }

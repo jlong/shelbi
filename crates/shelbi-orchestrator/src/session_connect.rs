@@ -15,6 +15,14 @@
 //! It lives here, not in `shelbi-app`, because resolving the machine and the
 //! relay are the orchestrator's.
 //!
+//! [`open_transport`] is the same resolution for a caller that speaks the
+//! session protocol itself: the relay's `session` service ([`relay_opener`]),
+//! which bridges the stream to a remote window on another machine. For a
+//! workspace on another of this project's machines that is a stream through
+//! this machine's own relay to it (its relay cache and its `-R` forward stay
+//! here, on this side), so a window with no route to that machine still shows
+//! the workspace: the second hop.
+//!
 //! A remote workspace's **agent** is not registered under the client's
 //! discovery name (`<project>/ws/<ws>`): dispatch spawns it at
 //! [`crate::workspace::workspace_target`] (`shelbi-w-<ws>`, slot `agent`),
@@ -23,8 +31,12 @@
 //! workspace's user shell is spawned under its discovery name
 //! (`<project>/ws/<ws>/shell`), so content targets keep it.
 
+use std::sync::Arc;
+
 use shelbi_app::session::{self as app_session, ConnectFailure, Connected, GridSize, IdleInfo, SessionRef};
+use shelbi_client::{LocalTransport, SessionOpener, Transport};
 use shelbi_core::{Host, Project, WorkspaceSpec};
+use shelbi_proto::{SessionOpenError, SessionTarget};
 
 use crate::remote_session::{self, RemoteAttachError};
 
@@ -35,6 +47,48 @@ pub fn connect(project: &str, target: &SessionRef) -> Result<Connected, ConnectF
         return connect_remote(project, target, &host, &want);
     }
     app_session::connect(project, target, local_idle_info)
+}
+
+/// A raw transport to `target` in `project`, on whichever machine it runs:
+/// its socket on this machine, or a stream through this machine's relay to
+/// the workspace's own machine. Nothing is sent on it (the caller does its own
+/// hello and attach). Classified as [`connect`] classifies: a machine that
+/// can't be reached is [`SessionOpenError::Unreachable`] (keep reconnecting),
+/// one that answered with no live session is [`SessionOpenError::NoSession`].
+/// Blocking.
+pub fn open_transport(project: &str, target: &SessionRef) -> Result<Box<dyn Transport>, SessionOpenError> {
+    if let Some((host, want)) = remote_lookup(project, target) {
+        return crate::remote_session::open_stream(&host, &want)
+            .map(|stream| Box::new(stream) as Box<dyn Transport>)
+            .map_err(|e| match e {
+                RemoteAttachError::Unreachable(message) => SessionOpenError::Unreachable { message },
+                RemoteAttachError::NoSession { exited } => SessionOpenError::NoSession { exited },
+                RemoteAttachError::Failed(message) => SessionOpenError::Failed { message },
+            });
+    }
+    let failed = |message: String| SessionOpenError::Failed { message };
+    let root = shelbi_state::sessions_dir().map_err(|e| failed(e.to_string()))?;
+    let want = app_session::discovery_name(project, target);
+    let sessions = shelbi_client::list(&root).map_err(|e| failed(e.to_string()))?;
+    let Some(session) = shelbi_client::choose_session(&sessions, &want) else {
+        return Err(SessionOpenError::NoSession {
+            exited: sessions.iter().any(|s| s.meta.name == want),
+        });
+    };
+    let sock = std::os::unix::net::UnixStream::connect(&session.sock)
+        .map_err(|e| failed(format!("connect {}: {e}", session.sock.display())))?;
+    Ok(Box::new(LocalTransport(sock)))
+}
+
+/// The relay `session` service's opener: [`open_transport`] for the target
+/// the stream names. `shelbi relay` injects it.
+pub fn relay_opener() -> SessionOpener {
+    Arc::new(|project: &str, target: &SessionTarget| {
+        let target = SessionRef::from_target(target).ok_or_else(|| SessionOpenError::Failed {
+            message: "unknown session target".into(),
+        })?;
+        open_transport(project, &target)
+    })
 }
 
 /// For a target on a remote workspace: the SSH host it lives on and the name
