@@ -68,6 +68,12 @@ paths on every `cargo test`.
 
 ## Platform differences (by design)
 
+- **Orchestrator onboarding** (`orch-onboarding`): the same three steps,
+  copy and saves in both clients (`shelbi_app::onboarding`). The TUI's
+  Default model ends with "Custom model…", typed in the box, as its agent
+  editor offers one; the desktop's menu lists the suggestions and any
+  model already on disk, as its agent editor does. The TUI walks the steps
+  by keys (Tab, arrows, Enter, Esc for Back) as well as the mouse.
 - **Drag and drop** on the board: desktop only. The TUI moves and reorders
   with the same ⇧H/⇧L/⇧K/⇧J keys the desktop also has.
 - **Native menus** with `keys.yaml` key equivalents, and **system
@@ -600,6 +606,37 @@ The desktop renders `ReviewPanelModel` directly (`views/review.rs` builds it wit
 | `remote_machine` | not shown: the TUI has no remote info for a review | not shown as text: `is_remote` drops Open from the worktree row and Diff/Editor from `switch_items` (`views/review.rs` `render_panel`) |
 | `switch_items` | own fixed list Reviewer / View Diff / Edit in / (Open Browser) (`review_panel.rs` `rows` / `switch_entry`) | nav rows iterated from the model with ⌘N hints, the browser labelled "Web Browser", then Shell (`views/review.rs` `render_panel`) |
 | `server` | state glyph + sub-state name and location under the folder row, live from the sidebar row (`review_panel.rs` `render_server_line`, fed by `shell/mod.rs` `apply_snapshot`); no health check or sub-state detail (the TUI has no `ready:` facts for the slot) | the Web Browser row: inert with a muted "loading…" in place of its ⌘4 hint until serving, the sub-state, detail and health check in its tooltip (`views/review.rs` `render_waiting_browser`); State=Review draws no server block |
+
+### `OnboardingModel`
+The Orchestrator view's onboarding (`orch-onboarding`), built by `shelbi_app::onboarding::OnboardingState::model` and shown in place of the orchestrator's terminal while the project's orchestrator isn't set up.
+
+| Field | TUI | Desktop |
+|---|---|---|
+| `step` | which step the page draws: intro, harness, instructions (`shell/onboarding.rs` `render`) | which step the view draws (`views/onboarding.rs` `render`, `render_intro`, `render_harness`, `render_instructions`) |
+| `loading` | "Loading…" in the pickers and the editor, Continue and Launch dimmed (`shell/onboarding.rs` `render_harness`, `area_lines`) | "Loading…" in the pickers and in place of the editor, Continue and Launch disabled (`views/onboarding.rs` `render_harness`, `render_instructions`) |
+| `harnesses` | the Harness box (the selected one's label, its provider muted) and its picker's rows; ← → step through them (`shell/onboarding.rs` `select_lines`, `choices`, `render_menu`) | the Harness picker's button (label, provider muted) and its menu rows (`views/onboarding.rs` `picker_button`, `render_harness`) |
+| `models` | the Default model picker's rows, then "Custom model…" (typed in the box) (`shell/onboarding.rs` `choices`, `render_menu`) | the Default model menu's rows (`views/onboarding.rs` `render_harness`); a model already on disk is kept as a row, as the agent editor keeps it |
+| `model_label` | the Default model box's text (`shell/onboarding.rs` `render_harness`) | the Default model button's label (`views/onboarding.rs` `render_harness`) |
+| `model_enabled` | a disabled box, out of the Tab order (`shell/onboarding.rs` `items`, `render_harness`) | the button dimmed with no menu (`views/onboarding.rs` `render_harness`) |
+| `model_note` | in place of the helper under Default model (`shell/onboarding.rs` `render_harness`) | in place of the helper under Default model (`views/onboarding.rs` `render_harness`) |
+| `instructions` | the editor's text, kept in the page's `TextArea` (`shell/onboarding.rs` `area_lines`) | the editor's text, kept in its `TextareaState` (`views/onboarding.rs` `loaded`, `render_instructions`) |
+| `error` | red, over the step's rule (`shell/onboarding.rs` `error_rows`) | red, over the step's rule (`views/onboarding.rs` `render_harness`, `render_instructions`) |
+| `busy` | "Saving…" / "Launching…" on a disabled button; keys and clicks wait (`shell/onboarding.rs` `render_harness`, `render_instructions`) | the same labels on disabled buttons (`views/onboarding.rs` `render_harness`, `render_instructions`) |
+
+### `HarnessOption`
+| Field | TUI | Desktop |
+|---|---|---|
+| `kind` | not shown: what choosing the row selects (`shell/onboarding.rs` `choose`) | not shown: what choosing the row selects; the row's selector (`views/onboarding.rs` `render_harness`) |
+| `label` | box text and picker row (`shell/onboarding.rs` `select_lines`, `choices`) | button label and menu row (`views/onboarding.rs` `picker_button`, `render_harness`) |
+| `provider` | muted after the label in the box and the row (`shell/onboarding.rs` `select_lines`, `choices`) | muted after the label on the button and the row (`views/onboarding.rs` `picker_button`, `render_harness`) |
+| `selected` | the box's choice and the row's ✓ (`shell/onboarding.rs` `render_harness`, `render_menu`) | the button's choice and the row's selected fill (`views/onboarding.rs` `render_harness`) |
+
+### `ModelOption`
+| Field | TUI | Desktop |
+|---|---|---|
+| `model` | not shown: what choosing the row selects (`shell/onboarding.rs` `choose`) | not shown: what choosing the row selects (`views/onboarding.rs` `render_harness`) |
+| `label` | picker row (`shell/onboarding.rs` `choices`) | menu row (`views/onboarding.rs` `render_harness`) |
+| `selected` | the row's ✓ (`shell/onboarding.rs` `render_menu`) | the row's selected fill (`views/onboarding.rs` `render_harness`) |
 
 ### `ErrorLogModel`
 Neither client consumes `ErrorLogModel`. Both render `shelbi_state::read_errors_with_unread` rows (`(ErrorLogEntry, bool)`) through the shared `shelbi_app::overlay::error_log::Viewer`. Mapped to that datum:

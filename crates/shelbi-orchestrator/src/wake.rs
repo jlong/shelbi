@@ -292,6 +292,44 @@ fn register_shutdown_signals() -> Result<Arc<AtomicBool>> {
     Ok(shutdown)
 }
 
+/// `runner` with the orchestrator's model ([`shelbi_core::orchestrator_model`])
+/// as a `-c model="…"` config override: the bridge runs `codex app-server`
+/// and `codex resume`, which take config overrides but not the interactive
+/// CLI's `--model`. No model set leaves `runner` unchanged.
+fn with_codex_model(
+    project: &shelbi_core::Project,
+    mut runner: shelbi_core::AgentRunnerSpec,
+) -> shelbi_core::AgentRunnerSpec {
+    let manifest = shelbi_state::load_agent_manifest(&project.name, shelbi_state::ORCHESTRATOR_AGENT)
+        .ok()
+        .flatten();
+    if let Some(model) = shelbi_core::orchestrator_model(project, manifest.as_ref()) {
+        runner.flags.push("-c".into());
+        runner.flags.push(codex_model_override(&model));
+    }
+    runner
+}
+
+/// The `-c` value selecting `model` (a TOML string).
+fn codex_model_override(model: &str) -> String {
+    format!("model={}", toml_string(model))
+}
+
+/// `s` as a TOML basic string.
+fn toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// Run the project-scoped Codex bridge in the orchestrator pane.
 ///
 /// Positive native protocol/capability incompatibility falls back to the
@@ -320,6 +358,7 @@ fn run_codex_bridge_until_shutdown(
             project.orchestrator.runner
         )));
     }
+    let runner = with_codex_model(&project, runner);
 
     let workdir = shelbi_state::project_dir(project_name)?;
     let repo_root = project
@@ -3147,6 +3186,12 @@ mod batch_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_codex_model_is_a_toml_config_override() {
+        assert_eq!(codex_model_override("gpt-5"), r#"model="gpt-5""#);
+        assert_eq!(codex_model_override(r#"we"ird\"#), r#"model="we\"ird\\""#);
+    }
 
     #[test]
     fn first_launch_bootstrap_id_is_stable_across_thread_resume_generations() {

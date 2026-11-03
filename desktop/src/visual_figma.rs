@@ -1321,6 +1321,45 @@ impl Run {
         }
     }
 
+    /// The Orchestrator view's onboarding (`orch-onboarding`): the
+    /// Welcome (2709:10719), Choose provider and model (2709:11068) and
+    /// Review instructions (2709:11492) frames, over the fixture project's
+    /// shipped orchestrator (Continue writes into the run's sandbox home).
+    fn orchestrator_onboarding(&mut self, orch: &View) {
+        use crate::views::onboarding::OnboardingView;
+        type Step = dyn Fn(&mut OnboardingView, &mut gpui::Window, &mut gpui::Context<OnboardingView>);
+        let workflows = shelbi_state::workflows_dir(PROJECT).expect("the workflows directory");
+        let project_dir = workflows.parent().expect("the project directory").to_path_buf();
+        let agents = project_dir.join("agents");
+        let had_agents = agents.exists();
+        crate::views::agents_state::fixture::write(&project_dir, PROJECT);
+        let shot = |run: &mut Self, screen: &str, steps: &[&Step]| {
+            let handle = run.open();
+            run.click(handle, orch.clone());
+            let view = handle.update(&mut run.cx, |w, window, cx| w.offscreen_onboarding(window, cx)).unwrap();
+            run.settle(handle);
+            for step in steps {
+                handle.update(&mut run.cx, |_, window, cx| view.update(cx, |v, cx| step(v, window, cx))).unwrap();
+                run.settle(handle);
+            }
+            run.save(handle, screen);
+        };
+        shot(self, "orchestrator-onboarding-1-welcome", &[]);
+        // The fixture project runs Codex; the frames show Claude Code on
+        // Opus, chosen here (nothing is written before Continue).
+        let choose: &Step = &|v, window, cx| {
+            v.get_started(window, cx);
+            v.select_runner(shelbi_core::RunnerKind::Claude, cx);
+            v.select_model(Some("opus".into()), cx);
+        };
+        shot(self, "orchestrator-onboarding-2-harness", &[choose]);
+        shot(self, "orchestrator-onboarding-3-instructions", &[choose, &|v, window, cx| v.continue_(window, cx)]);
+        let _ = std::fs::remove_dir_all(&workflows);
+        if !had_agents {
+            let _ = std::fs::remove_dir_all(&agents);
+        }
+    }
+
     /// Settings ▸ Agents (the Agents frame, 2377:41040, reference
     /// `agents/1-agents-index.png`) over the frame's agents
     /// (`agents_state::fixture`: the shipped six, the orchestrator and the
@@ -2697,6 +2736,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "onboarding") {
+            self.orchestrator_onboarding(&orch);
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "buttons") {
             self.components();
             self.review_confirm_states(&orch);
@@ -2709,6 +2753,7 @@ impl Run {
         self.settle(handle);
         self.save(handle, "orchestrator");
         self.terminal_states(&orch);
+        self.orchestrator_onboarding(&orch);
 
         self.issues();
 

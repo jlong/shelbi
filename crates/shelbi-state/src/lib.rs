@@ -43,6 +43,7 @@ mod hub_version;
 mod issue_cache;
 pub mod machine_state;
 pub mod migration;
+pub mod orchestrator_setup;
 pub mod ownership;
 pub mod questions;
 pub use migration::{
@@ -119,6 +120,7 @@ pub use issue_store::{
     resolve_issue_store, BoardRead, BoardState, ClosedPage, Cursor, FileSystemStore, IssueChange,
     IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
+pub use orchestrator_setup::{mark_orchestrator_onboarded, orchestrator_onboarded};
 pub use ownership::{OwnershipGate, TrackerOwner};
 pub use project_paths::ProjectPaths;
 pub use supervision_status::{
@@ -1644,6 +1646,13 @@ pub struct State {
     /// the contextual greeting; legacy projects default to `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub contextual_greeting_pending: bool,
+    /// The project's orchestrator was set up through the Orchestrator view's
+    /// onboarding (its Launch Orchestrator). One of the signals
+    /// [`orchestrator_onboarded`] reads; an orchestrator that ran before
+    /// this existed counts without it. Skipped when `false`, so an untouched
+    /// `state.json` stays byte-identical.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub orchestrator_onboarded: bool,
     /// Explicit Kanban-column collapse overrides keyed by
     /// `"<workflow_name>:<status_id>"`. Only deviations from the
     /// auto-default are persisted — an empty / non-existent entry means

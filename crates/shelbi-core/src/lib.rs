@@ -16,7 +16,8 @@ pub mod workflow;
 pub mod workspace_names;
 
 pub use agent_manifest::{
-    clamp_permission_mode, is_known_permission_mode, model_suggestions, reasoning_efforts,
+    clamp_permission_mode, is_known_permission_mode, model_suggestions, orchestrator_model,
+    reasoning_efforts,
     resolve_agent_launch, AgentManifest, AgentRequires, ReasoningEffort, ResolvedAgentLaunch,
     RunnerManifestConfig, PERMISSION_MODES,
 };
