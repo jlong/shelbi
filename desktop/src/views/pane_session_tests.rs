@@ -150,7 +150,7 @@ fn open_sized(cx: &mut TestAppContext, size: GpuiSize<gpui::Pixels>) -> Pane {
         ..Default::default()
     };
     let handle = cx.update(|cx| {
-        cx.open_window(options, |_, cx| cx.new(|cx| IssuesView::new(PROJECT.into(), cx))).unwrap()
+        cx.open_window(options, |_, cx| cx.new(|cx| IssuesView::new(&shelbi_orchestrator::source::local_handle(PROJECT), cx))).unwrap()
     });
     let mut vcx = VisualTestContext::from_window(handle.into(), cx);
     let view = handle.root(&mut vcx).unwrap();

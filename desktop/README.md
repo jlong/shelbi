@@ -160,6 +160,16 @@ workspaces). Keep it equal to the root `[workspace.package] version`;
   `optimized/24/outline/` at that tag, then adding a row to the `heroicons!`
   list in `src/assets.rs`. Don't use gpui-kit's bundled icon catalog in
   Shelbi's own UI.
+- **Views read a project through its source.** A window owns a
+  `shelbi_app::source::ProjectHandle`: the `ProjectKey` it shows (a name and
+  where it lives), the `ProjectSource` every view asks for its reads, and the
+  `ProjectLink` for mutations, session ops, subscriptions and the session
+  connector. No view, feed or window code calls a `shelbi_state` or
+  `shelbi_orchestrator` reader for the project directly, so a window for a
+  project on another machine can draw the same views; `src/source_gate.rs`
+  fails the tests on one that does. What stays the viewer's own (the user
+  config, window state, recent remotes, updates, feedback, bootstrap) is read
+  here as before.
 - **Colors come from `src/theme.rs`**, the shared tokens of
   `shelbi_app::theme` (one named set, dark and light, also used by the TUI)
   as gpui colors. Views read them with `cx.global::<Theme>()`. No color
@@ -214,11 +224,13 @@ desktop/
   src/app_smoke.rs     the smoke test: every registry command via the palette and the menus
   src/app_window_tests.rs  the window model: switch in place, A→B→A, New Window, notices, quit, launch
   src/keys.rs          gpui keystrokes to shelbi_state::keymap KeyChords (so keys.yaml applies)
-  src/refresh.rs       the refresh pipeline: a project's feed (refresher, change
-                       subscription, polling fallback) and the control-socket watcher
-  src/feeds.rs         one feed per project, shared by the windows that show it
+  src/refresh.rs       the refresh pipeline: a project's feed (its source's sidebar read,
+                       its link's change subscription, polling fallback) and the
+                       control-socket watcher
+  src/feeds.rs         one feed per project (by ProjectKey), shared by the windows that show it
   src/projects.rs      the project catalog (+ skeleton prefetch) and opening a project
-  src/window_state.rs  window slots (frame, sidebar), the launch plan, per-project view state
+  src/window_state.rs  window slots (frame, sidebar), the launch plan, per-project view state, by ProjectKey
+  src/source_gate.rs   the test that keeps views reading through the window's ProjectSource
   src/commands.rs      exhaustive dispatch over CommandKind and View
   src/theme.rs         shelbi_app::theme tokens as gpui colors; theme: setting, live system appearance
   src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)

@@ -273,9 +273,17 @@ impl SearchCorpus {
 /// same read the board makes, so no GitHub call) and the changelog
 /// directory. Touches disk; run it off the UI thread.
 pub fn read_corpus(project: &str) -> SearchCorpus {
+    corpus_from_reads(
+        crate::board::read_open_board(project),
+        crate::changelog::read_changelog(project).entries,
+    )
+}
+
+/// The corpus from an open-board read and the Changelog's entries, however
+/// they were read (a window composes it from its project source's answers).
+pub fn corpus_from_reads(open: crate::board::BoardRead, changelog: Vec<ChangelogEntryView>) -> SearchCorpus {
     let mut board = BoardInput::default();
-    board.apply_open(crate::board::read_open_board(project));
-    let changelog = crate::changelog::read_changelog(project).entries;
+    board.apply_open(open);
     SearchCorpus::from_board(&board, changelog)
 }
 

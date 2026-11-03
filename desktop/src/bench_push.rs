@@ -266,10 +266,11 @@ fn parse(args: &[String]) -> Options {
 /// The real resolve of `task` (read-only), timed five times; the median.
 fn time_resolve(project: &str, task: &str) -> Duration {
     use crate::views::review::LiveOps;
+    let ops = LiveOps::new(shelbi_orchestrator::source::local_handle(project));
     let mut times = Vec::new();
     for _ in 0..5 {
         let t = Instant::now();
-        let r = LiveOps.resolve(project, task);
+        let r = ops.resolve(project, task);
         times.push(t.elapsed());
         if let Err(e) = r {
             eprintln!("resolve {task}: {e}");

@@ -16,8 +16,15 @@ const ERROR_SOURCE: &str = "zen";
 /// `project`: only on an off-to-on toggle, and only while the global
 /// `zen_intro_seen` flag is unset.
 pub fn should_show_intro(project: &str) -> bool {
-    let project_off = shelbi_state::read_state(project)
-        .map(|s| s.zen_mode == shelbi_state::ZenModeState::Off)
+    intro_due(shelbi_state::read_state(project).map(|s| s.zen_mode).ok())
+}
+
+/// [`should_show_intro`] over the project's Zen state as the window's project
+/// source read it (`None` when it couldn't be read, which counts as off). The
+/// `zen_intro_seen` flag is the viewer's own, so it is always read here.
+pub fn intro_due(project_zen: Option<shelbi_state::ZenModeState>) -> bool {
+    let project_off = project_zen
+        .map(|z| z == shelbi_state::ZenModeState::Off)
         .unwrap_or(true);
     project_off
         && !shelbi_state::read_global_state()

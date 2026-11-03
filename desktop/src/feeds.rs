@@ -16,11 +16,12 @@ use std::rc::{Rc, Weak};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use gpui::{App, Global, Task};
+use shelbi_app::source::{ProjectHandle, ProjectKey};
 
 use crate::refresh::{ControlWatcher, FeedEvent, ProjectFeed, SessionSink};
 
-/// Starts a project's feed.
-pub type FeedSpawner = Rc<dyn Fn(&str) -> (ProjectFeed, UnboundedReceiver<FeedEvent>)>;
+/// Starts a project's feed, reading through the window's handle.
+pub type FeedSpawner = Rc<dyn Fn(&ProjectHandle) -> (ProjectFeed, UnboundedReceiver<FeedEvent>)>;
 
 /// The app's project feeds, shared by the windows that show each project.
 /// Cheap to clone; UI thread only.
@@ -33,7 +34,9 @@ impl Global for FeedHub {}
 
 struct Hub {
     spawner: FeedSpawner,
-    feeds: HashMap<String, Shared>,
+    /// Keyed by [`ProjectKey`]: a remote project named like a local one is
+    /// another feed.
+    feeds: HashMap<ProjectKey, Shared>,
     next_id: u64,
     /// Feeds started, ever (tests count them).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -55,10 +58,11 @@ impl FeedHub {
     /// The production hub: real feeds, with `control`'s change notes routed
     /// to each.
     pub fn live(control: Option<ControlWatcher>) -> Self {
-        Self::with_spawner(Rc::new(move |project: &str| {
+        Self::with_spawner(Rc::new(move |project: &ProjectHandle| {
             let (feed, events) = ProjectFeed::spawn(project);
-            if let Some(control) = &control {
-                control.watch(project, &feed);
+            // This machine's control socket notes this machine's projects.
+            if let (Some(control), true) = (&control, project.key().is_local()) {
+                control.watch(project.name(), &feed);
             }
             (feed, events)
         }))
@@ -98,16 +102,17 @@ impl FeedHub {
     /// Subscribe to `project`'s feed, starting it if no window has yet.
     pub fn subscribe(
         &self,
-        project: &str,
+        project: &ProjectHandle,
         cx: &mut App,
     ) -> (FeedSubscription, UnboundedReceiver<FeedEvent>) {
         let (tx, rx) = unbounded();
-        let started = !self.inner.borrow().feeds.contains_key(project);
+        let key = project.key().clone();
+        let started = !self.inner.borrow().feeds.contains_key(&key);
         if started {
             let spawner = self.inner.borrow().spawner.clone();
             let (feed, events) = spawner(project);
             let weak = Rc::downgrade(&self.inner);
-            let name = project.to_string();
+            let name = key.clone();
             let pump = cx.spawn(async move |_| {
                 let mut events = events;
                 while let Some(event) = events.next().await {
@@ -120,7 +125,7 @@ impl FeedHub {
             let mut hub = self.inner.borrow_mut();
             hub.spawned += 1;
             hub.feeds.insert(
-                project.to_string(),
+                key.clone(),
                 Shared {
                     feed,
                     subscribers: Vec::new(),
@@ -135,7 +140,7 @@ impl FeedHub {
         hub.next_id += 1;
         let shared = hub
             .feeds
-            .get_mut(project)
+            .get_mut(&key)
             .expect("the feed was just found or started");
         for event in [&shared.last_link, &shared.last_snapshot].into_iter().flatten() {
             let _ = tx.unbounded_send(event.clone());
@@ -145,7 +150,7 @@ impl FeedHub {
         (
             FeedSubscription {
                 hub: Rc::downgrade(&self.inner),
-                project: project.to_string(),
+                project: key,
                 id,
                 sink,
             },
@@ -155,8 +160,8 @@ impl FeedHub {
 
     /// Each running feed's project and subscriber count, by project.
     #[cfg(test)]
-    pub fn subscribers(&self) -> Vec<(String, usize)> {
-        let mut out: Vec<(String, usize)> = self
+    pub fn subscribers(&self) -> Vec<(ProjectKey, usize)> {
+        let mut out: Vec<(ProjectKey, usize)> = self
             .inner
             .borrow()
             .feeds
@@ -177,7 +182,7 @@ impl FeedHub {
 impl Hub {
     /// Hand `event` to every window on `project`, remembering the latest
     /// snapshot and link for the next one to subscribe.
-    fn broadcast(&mut self, project: &str, event: FeedEvent) {
+    fn broadcast(&mut self, project: &ProjectKey, event: FeedEvent) {
         let Some(shared) = self.feeds.get_mut(project) else {
             return;
         };
@@ -196,7 +201,7 @@ impl Hub {
 /// one dropped stops the feed.
 pub struct FeedSubscription {
     hub: Weak<RefCell<Hub>>,
-    project: String,
+    project: ProjectKey,
     id: u64,
     sink: SessionSink,
 }
@@ -253,6 +258,11 @@ pub(crate) mod tests {
     use shelbi_app::view::SidebarModel;
     use shelbi_app::Snapshot;
 
+    /// A local project's handle; nothing is read through it here.
+    fn local(name: &str) -> ProjectHandle {
+        ProjectHandle::null(ProjectKey::local(name))
+    }
+
     /// The stop flag of every feed a canned hub started.
     #[derive(Clone, Default)]
     pub(crate) struct Started(Arc<Mutex<Vec<Arc<AtomicBool>>>>);
@@ -274,7 +284,7 @@ pub(crate) mod tests {
     pub(crate) fn canned_hub() -> (FeedHub, Started) {
         let started = Started::default();
         let record = started.clone();
-        let hub = FeedHub::with_spawner(Rc::new(move |_: &str| {
+        let hub = FeedHub::with_spawner(Rc::new(move |_: &ProjectHandle| {
             let (feed, events, stop) = ProjectFeed::inert();
             record.0.lock().unwrap().push(stop);
             (feed, events)
@@ -285,12 +295,12 @@ pub(crate) mod tests {
     #[gpui::test]
     fn windows_on_one_project_share_its_feed(cx: &mut TestAppContext) {
         let (hub, started) = canned_hub();
-        let (a, _ra) = cx.update(|cx| hub.subscribe("web", cx));
-        let (b, _rb) = cx.update(|cx| hub.subscribe("web", cx));
-        assert_eq!(hub.subscribers(), [("web".to_string(), 2)]);
+        let (a, _ra) = cx.update(|cx| hub.subscribe(&local("web"), cx));
+        let (b, _rb) = cx.update(|cx| hub.subscribe(&local("web"), cx));
+        assert_eq!(hub.subscribers(), [(ProjectKey::local("web"), 2)]);
         assert_eq!(hub.spawned(), 1, "the second window shares the first's feed");
         drop(a);
-        assert_eq!(hub.subscribers(), [("web".to_string(), 1)]);
+        assert_eq!(hub.subscribers(), [(ProjectKey::local("web"), 1)]);
         assert_eq!(started.running(), 1);
         drop(b);
         assert!(hub.subscribers().is_empty(), "the last one out stops it");
@@ -300,9 +310,9 @@ pub(crate) mod tests {
     #[gpui::test]
     fn a_late_subscriber_gets_the_last_snapshot_and_link(cx: &mut TestAppContext) {
         let (hub, _started) = canned_hub();
-        let (_a, _ra) = cx.update(|cx| hub.subscribe("web", cx));
+        let (_a, _ra) = cx.update(|cx| hub.subscribe(&local("web"), cx));
         hub.inner.borrow_mut().broadcast(
-            "web",
+            &ProjectKey::local("web"),
             FeedEvent::Snapshot(Box::new(Snapshot {
                 generation: 7,
                 sidebar: Some(SidebarModel::skeleton("Web")),
@@ -311,8 +321,8 @@ pub(crate) mod tests {
         );
         hub.inner
             .borrow_mut()
-            .broadcast("web", FeedEvent::Link(crate::refresh::DaemonLink::Live));
-        let (_b, mut rb) = cx.update(|cx| hub.subscribe("web", cx));
+            .broadcast(&ProjectKey::local("web"), FeedEvent::Link(crate::refresh::DaemonLink::Live));
+        let (_b, mut rb) = cx.update(|cx| hub.subscribe(&local("web"), cx));
         let first = rb.try_recv().unwrap();
         let second = rb.try_recv().unwrap();
         assert!(matches!(first, FeedEvent::Link(_)));
@@ -322,9 +332,9 @@ pub(crate) mod tests {
     #[gpui::test]
     fn a_feeds_events_reach_every_window_on_it(cx: &mut TestAppContext) {
         let (hub, _started) = canned_hub();
-        let (a, mut ra) = cx.update(|cx| hub.subscribe("web", cx));
-        let (_b, mut rb) = cx.update(|cx| hub.subscribe("web", cx));
-        let (_other, mut rother) = cx.update(|cx| hub.subscribe("api", cx));
+        let (a, mut ra) = cx.update(|cx| hub.subscribe(&local("web"), cx));
+        let (_b, mut rb) = cx.update(|cx| hub.subscribe(&local("web"), cx));
+        let (_other, mut rother) = cx.update(|cx| hub.subscribe(&local("api"), cx));
         // What a session view reports goes through the feed to both windows.
         let sink = a.session_sink();
         sink.forward("orch", &shelbi_client::SessionEvent::Title("busy".into()));
@@ -333,5 +343,20 @@ pub(crate) mod tests {
             assert!(matches!(rx.try_recv(), Ok(FeedEvent::Session(n)) if n.session == "orch"));
         }
         assert!(rother.try_recv().is_err(), "another project's window hears nothing");
+    }
+
+    #[gpui::test]
+    fn a_remote_project_named_like_a_local_one_gets_its_own_feed(cx: &mut TestAppContext) {
+        let (hub, started) = canned_hub();
+        let (_l, _rl) = cx.update(|cx| hub.subscribe(&local("web"), cx));
+        let remote = ProjectHandle::null(ProjectKey::remote("devbox", "web"));
+        let (r, _rr) = cx.update(|cx| hub.subscribe(&remote, cx));
+        assert_eq!(hub.spawned(), 2, "the same name on another machine is another feed");
+        assert_eq!(
+            hub.subscribers(),
+            [(ProjectKey::local("web"), 1), (ProjectKey::remote("devbox", "web"), 1)]
+        );
+        drop(r);
+        assert_eq!(started.running(), 1, "dropping the remote window leaves the local feed");
     }
 }

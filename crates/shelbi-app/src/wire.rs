@@ -4,9 +4,10 @@
 //! runs these readers on the far machine and sends their results back over
 //! one SSH relay channel. So every model a client reads — [`SidebarModel`],
 //! [`BoardRead`], [`ClosedPage`], [`MachinesModel`], [`ActivityData`],
-//! [`ChangelogData`], [`ProjectSummary`], [`SearchCorpus`], and from the
-//! lower crates `WorkspaceDetails` and `BoardReport` — derives
-//! `Serialize`/`Deserialize`.
+//! [`ChangelogData`], [`ProjectSummary`], [`SearchCorpus`], the
+//! orchestrator's answers in [`crate::source::answers`] (`WorkspaceDetails`,
+//! the review targets and slots), and `shelbi-state`'s `BoardReport` —
+//! derives `Serialize`/`Deserialize`.
 //!
 //! Two rules hold for all of them:
 //!

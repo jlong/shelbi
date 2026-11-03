@@ -28,6 +28,8 @@
 //! window comes back to the front after one, the files are read again to
 //! show the hand edit.
 
+use std::sync::Arc;
+use shelbi_app::source::{ProjectHandle, ProjectSource};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -122,6 +124,8 @@ impl Render for StatusGhost {
 /// The Workflows page.
 pub struct WorkflowsPage {
     state: WorkflowsState,
+    /// The window's project, read through its source.
+    source: Arc<dyn ProjectSource>,
     /// Each status's name field, by id.
     names: HashMap<String, (Entity<InputState>, Subscription)>,
     /// The new row's name field (a workflow's or a status's).
@@ -141,7 +145,8 @@ pub struct WorkflowsPage {
 }
 
 impl WorkflowsPage {
-    pub fn new(project: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(handle: &ProjectHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let project = handle.name();
         let draft_input = cx.new(|cx| InputState::new(window, cx));
         let subscriptions = vec![
             cx.subscribe_in(&draft_input, window, |this, _, event: &InputEvent, window, cx| {
@@ -160,6 +165,7 @@ impl WorkflowsPage {
         ];
         let mut page = WorkflowsPage {
             state: WorkflowsState::new(project),
+            source: handle.source.clone(),
             names: HashMap::new(),
             draft_input,
             menu: None,
@@ -179,10 +185,8 @@ impl WorkflowsPage {
     /// Read the project's workflow config off the UI thread (again, to pick
     /// up hand edits) and show it.
     pub fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.state.project().to_string();
-        let read = cx
-            .background_executor()
-            .spawn(async move { WorkflowConfig::load(&project).map_err(|e| e.to_string()) });
+        let source = self.source.clone();
+        let read = cx.background_executor().spawn(async move { source.workflow_config() });
         cx.spawn_in(window, async move |this, cx| {
             let config = read.await;
             this.update_in(cx, |this, window, cx| {

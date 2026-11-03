@@ -100,40 +100,9 @@ fn resolve_review_slot(project_name: &str, project: &Project, task_id: &str) -> 
     Ok(Some(ws_name))
 }
 
-/// Everything the single-process TUI needs to build its review panel for a
-/// task, resolved from durable state in one place (so the client stays thin and
-/// the slot resolution matches the spawn path).
-#[derive(Debug, Clone)]
-pub struct ReviewOpenInfo {
-    /// The review slot (workspace) the task is loaded on.
-    pub slot: String,
-    /// Absolute review worktree path (shown truncated, revealed on click).
-    pub worktree: String,
-    /// Display name of the resolved editor (`Vim`, `Helix`, `Zed`, …).
-    pub editor_name: String,
-    /// Which of Edit and View Diff open an app instead of a pane
-    /// ([`crate::tools::app_tools`]).
-    pub apps: shelbi_state::AppTools,
-    /// Whether the workflow declares a review URL (gates the Browser entry).
-    pub has_review_url: bool,
-    /// The review URL itself (the workflow's `review:` template with the
-    /// slot's `$PORT` / `$SLOT` substituted), when declared.
-    pub review_url: Option<String>,
-    /// Whether the workflow declares a `ready:` health check for the review
-    /// server (`crate::workspace::workflow_declares_health_check`).
-    pub has_health_check: bool,
-    /// The slot's machine when it is remote (reached over SSH), `None` for a
-    /// local slot.
-    pub remote_machine: Option<String>,
-    /// The reviewed task as read from the issue store, for the panel's title /
-    /// description preview and the full-description popover. `None` when the
-    /// store couldn't produce it (the panel degrades to no task info).
-    /// [`IssueFile`](shelbi_state::IssueFile) isn't `Eq`, so this struct drops
-    /// the `PartialEq`/`Eq` derives it carried while it was all scalars; it's
-    /// also large (~500 bytes), so it's boxed to keep the enclosing
-    /// [`ReviewOpenTarget`] variants balanced.
-    pub task: Option<Box<shelbi_state::IssueFile>>,
-}
+/// The review panel's inputs and how to open a review-column task; the types
+/// live in `shelbi_app::source` so a project source can return them.
+pub use shelbi_app::source::{ReviewOpenInfo, ReviewOpenTarget};
 
 /// Resolve the panel inputs for `task_id`. Errors when the task is not loaded on
 /// a review slot (the interface can't open yet).
@@ -219,21 +188,6 @@ fn substitute_slot_url(template: &str, ws: &shelbi_core::WorkspaceSpec) -> Strin
     shelbi_core::substitute_review_url(template, port)
 }
 
-/// How the single-process TUI should open a review-column task, resolved from
-/// durable state in one read (`rt-tui-review-load-queued`): either it is already
-/// loaded on a review slot — open the interface straight away — or it is still
-/// queued and must be loaded onto a slot first.
-#[derive(Debug, Clone)]
-pub enum ReviewOpenTarget {
-    /// The task is on a review slot; open the interface with these inputs
-    /// (the same the tmux runtime and [`review_open_info`] resolve).
-    Serving(ReviewOpenInfo),
-    /// The task is a review-column task not yet on a review slot; the client
-    /// must load it onto one (the slot picker, then a daemon
-    /// [`Load`](shelbi_proto::control::ReviewSessionOp::Load)). `title` is the
-    /// card title the picker shows.
-    Queued { title: String },
-}
 
 /// Resolve how to open `task_id`: serving on a slot, or still queued. The
 /// decision the shell makes between opening the native review interface

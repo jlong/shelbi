@@ -15,7 +15,7 @@
 //! behavior lives in [`shelbi_client::serve_relay_with`]; this is the thin CLI
 //! seam that injects the services:
 //!
-//! - `query`: [`answer`], backed by this machine's readers.
+//! - `query`: [`answer`], backed by this machine's project source.
 //! - `control`: this machine's `control.sock` (filtered by the relay).
 //! - `changes`: this machine's `hub.sock` (subscribe only).
 //!
@@ -54,39 +54,36 @@ fn services() -> RelayServices {
     }
 }
 
-/// Answer one `query` from this machine's own readers: the same functions a
-/// local window calls, so a remote window sees what a local one would.
+/// Answer one `query` through this machine's project source
+/// (`shelbi_orchestrator::source::LocalSource`): the code a local window reads
+/// its project through, so a remote window sees what a local one would.
 fn answer(query: Query) -> Result<Answer, QueryError> {
+    use shelbi_app::source::ProjectSource;
     // A name that isn't a registered project reads as nothing, never as a
-    // path: every reader below resolves it through the project registry.
+    // path: every reader behind the source resolves it through the project
+    // registry.
+    let source = shelbi_orchestrator::source::LocalSource::new(query.project());
+    let changelog = |source: &dyn ProjectSource| {
+        // No stamp to match: the source always reads.
+        source.changelog(None).ok_or_else(|| QueryError::Failed {
+            message: "the changelog didn't read".into(),
+        })
+    };
     Ok(match query {
-        Query::Sidebar { project } => {
-            Answer::Sidebar(shelbi_orchestrator::sidebar_model::read_sidebar_model(&project))
-        }
-        Query::ConfigSkeleton { project } => {
-            Answer::ConfigSkeleton(shelbi_orchestrator::sidebar_model::read_config_skeleton(&project))
-        }
-        Query::OpenBoard { project } => {
-            Answer::OpenBoard(Box::new(shelbi_app::board::read_open_board(&project)))
-        }
-        Query::ClosedPage { project } => {
-            Answer::ClosedPage(shelbi_app::board::read_closed_page(&project))
-        }
-        Query::Changelog { project } => {
-            Answer::Changelog(shelbi_app::changelog::read_changelog(&project))
-        }
-        Query::SearchCorpus { project } => {
-            Answer::SearchCorpus(shelbi_app::overlay::palette_search::read_corpus(&project))
-        }
-        Query::Machines { project } => Answer::Machines(
-            shelbi_orchestrator::machines_model::read_machines_model(&project).map_err(|e| {
-                QueryError::Failed {
-                    message: format!("{e:#}"),
-                }
-            })?,
+        Query::Sidebar { .. } => Answer::Sidebar(source.sidebar()),
+        Query::ConfigSkeleton { .. } => Answer::ConfigSkeleton(source.config_skeleton()),
+        Query::OpenBoard { .. } => Answer::OpenBoard(Box::new(source.open_board())),
+        Query::ClosedPage { .. } => Answer::ClosedPage(source.closed_page()),
+        Query::Changelog { .. } => Answer::Changelog(changelog(&source)?),
+        Query::SearchCorpus { .. } => Answer::SearchCorpus(shelbi_app::overlay::palette_search::corpus_from_reads(
+            source.open_board(),
+            changelog(&source)?.entries,
+        )),
+        Query::Machines { .. } => Answer::Machines(
+            source
+                .machines()
+                .map_err(|message| QueryError::Failed { message })?,
         ),
-        Query::ProjectExists { project } => {
-            Answer::ProjectExists(shelbi_state::load_project(&project).is_ok())
-        }
+        Query::ProjectExists { .. } => Answer::ProjectExists(source.project_exists()),
     })
 }

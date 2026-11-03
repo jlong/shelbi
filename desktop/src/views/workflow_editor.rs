@@ -47,6 +47,8 @@
 //! not: the keys the row can't show (`target`, `url`). The button takes the
 //! Select style when the transition sets either.
 
+use std::sync::Arc;
+use shelbi_app::source::{ProjectHandle, ProjectSource};
 use std::collections::HashMap;
 
 use gpui::{
@@ -59,7 +61,7 @@ use shelbi_state::workflow_config::WorkflowConfig;
 
 use super::workflow_editor_state::{
     action_label, owner_label, run_delete, run_duplicate, run_save, strategy_label, Change, DetailsForm, EditorState,
-    Field, GitForm, Leave, Mode, ProjectGit, ReviewForm, ReviewMode, SaveJob, SaveOutcome, ScriptForm, TextForm, ACTIONS,
+    Field, GitForm, Leave, Mode, ReviewForm, ReviewMode, SaveJob, SaveOutcome, ScriptForm, TextForm, ACTIONS,
     ADD_COMMAND, DETAILS_TARGET, DETAILS_URL, RUN_HELP, RUN_PLACEHOLDER, RUN_SCRIPT, SCRIPT_READY, SCRIPT_TIMEOUT,
     STRATEGIES,
 };
@@ -217,7 +219,8 @@ struct ReviewInputs {
 
 /// The workflow editor.
 pub struct WorkflowEditor {
-    project: String,
+    /// The window's project, read through its source.
+    source: Arc<dyn ProjectSource>,
     /// `None` until the workflow config has loaded.
     pub(super) state: Option<EditorState>,
     load_error: Option<String>,
@@ -265,7 +268,7 @@ impl WorkflowEditor {
     /// it loaded (else it is read off the UI thread; a test's editor reads
     /// no disk).
     pub fn new(
-        project: &str,
+        handle: &ProjectHandle,
         name: &str,
         config: Option<WorkflowConfig>,
         window: &mut Window,
@@ -304,7 +307,7 @@ impl WorkflowEditor {
             }));
         }
         let mut editor = WorkflowEditor {
-            project: project.to_string(),
+            source: handle.source.clone(),
             state: None,
             load_error: None,
             name: name_input,
@@ -339,8 +342,8 @@ impl WorkflowEditor {
         // The project's own git values, the Git fields' placeholders (a
         // test's editor keeps the defaults, reading no disk).
         if !cfg!(test) {
-            let project = project.to_string();
-            let read = cx.background_executor().spawn(async move { ProjectGit::load(&project) });
+            let source = handle.source.clone();
+            let read = cx.background_executor().spawn(async move { source.project_git() });
             cx.spawn(async move |this, cx| {
                 let git = read.await;
                 this.update(cx, |this, cx| {
@@ -358,8 +361,8 @@ impl WorkflowEditor {
 
     /// Read the workflow config off the UI thread and edit `name`.
     fn load(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.project.clone();
-        let read = cx.background_executor().spawn(async move { WorkflowConfig::load(&project) });
+        let source = self.source.clone();
+        let read = cx.background_executor().spawn(async move { source.workflow_config() });
         cx.spawn_in(window, async move |this, cx| {
             let config = read.await;
             this.update_in(cx, |this, window, cx| {
@@ -617,8 +620,8 @@ impl WorkflowEditor {
     /// save is running) by the time they're read. Closes when the workflow
     /// is gone from them.
     fn read_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.project.clone();
-        let read = cx.background_executor().spawn(async move { WorkflowConfig::load(&project) });
+        let source = self.source.clone();
+        let read = cx.background_executor().spawn(async move { source.workflow_config() });
         cx.spawn_in(window, async move |this, cx| {
             let config = read.await;
             this.update_in(cx, |this, window, cx| {

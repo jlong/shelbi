@@ -53,6 +53,10 @@
 //! - [`about`] — About Shelbi's words and links (the tagline, the project's
 //!   URLs, the copyright and license), so both clients' About screens read
 //!   the same.
+//! - [`source`] — the seam between a client's views and every read they
+//!   make of a project ([`source::ProjectSource`]), named by a
+//!   [`source::ProjectKey`], and the window's link for everything that isn't
+//!   a read ([`source::ProjectLink`]).
 //! - [`licenses`] — Acknowledgements: the bundled software's entries and
 //!   license tables, the search / selection browser over them, and a
 //!   license text's paragraph layout.

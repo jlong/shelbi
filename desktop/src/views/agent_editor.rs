@@ -35,6 +35,8 @@
 //! clean draft (a draft edited meanwhile is kept, and its save is refused
 //! should it overwrite the hand edit).
 
+use std::sync::Arc;
+use shelbi_app::source::{ProjectHandle, ProjectSource};
 use gpui::{
     div, prelude::*, px, AnyElement, App, ClickEvent, Context, Div, Entity, EventEmitter, Focusable,
     PathPromptOptions, ScrollHandle, SharedString, Stateful, Subscription, Window,
@@ -103,7 +105,8 @@ struct SkillForm {
 
 /// The agent details editor.
 pub struct AgentEditor {
-    project: String,
+    /// The window's project, read through its source.
+    source: Arc<dyn ProjectSource>,
     /// `None` until the agents have loaded.
     state: Option<AgentEditorState>,
     load_error: Option<String>,
@@ -128,7 +131,7 @@ impl AgentEditor {
     /// loaded (else it is read off the UI thread; a test's editor reads no
     /// disk).
     pub fn new(
-        project: &str,
+        handle: &ProjectHandle,
         name: &str,
         config: Option<AgentsConfig>,
         window: &mut Window,
@@ -164,7 +167,7 @@ impl AgentEditor {
             }),
         ];
         let mut editor = AgentEditor {
-            project: project.to_string(),
+            source: handle.source.clone(),
             state: None,
             load_error: None,
             name: name_input,
@@ -188,8 +191,8 @@ impl AgentEditor {
 
     /// Read the agents off the UI thread and edit `name`.
     fn load(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.project.clone();
-        let read = cx.background_executor().spawn(async move { AgentsConfig::load(&project) });
+        let source = self.source.clone();
+        let read = cx.background_executor().spawn(async move { source.agents_config() });
         cx.spawn_in(window, async move |this, cx| {
             let config = read.await;
             this.update_in(cx, |this, window, cx| {
@@ -400,8 +403,8 @@ impl AgentEditor {
     /// save is running) by the time they're read. Closes when the agent is
     /// gone from them.
     fn read_again(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.project.clone();
-        let read = cx.background_executor().spawn(async move { AgentsConfig::load(&project) });
+        let source = self.source.clone();
+        let read = cx.background_executor().spawn(async move { source.agents_config() });
         cx.spawn_in(window, async move |this, cx| {
             let config = read.await;
             this.update_in(cx, |this, window, cx| {

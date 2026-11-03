@@ -114,6 +114,7 @@ use shelbi_state::keymap::{
 use crate::assets::{heroicon, icons};
 use crate::commands::{self, CommandHost};
 use crate::feeds::{FeedHub, FeedSubscription};
+use shelbi_app::source::{ProjectHandle, ProjectKey, ProjectSource};
 use crate::elements::terminal::{ResizeHold, TerminalSettings};
 use crate::keys::{
     chord_from_keystroke, font_zoom, is_new_window, nav_chord, overlay_chord, paste_chords, NavChord,
@@ -254,7 +255,8 @@ pub fn shared_ready(cx: &App) -> Option<Ready> {
 /// Open the windows a launch restores (`window_state::launch_plan`).
 pub fn open_launch_windows(plan: Vec<LaunchWindow>, cx: &mut App) {
     for w in plan {
-        open_window(&w.project, w.slot, w.state, None, cx);
+        // The plan holds this machine's projects only (`read_launch_plan`).
+        open_window(&w.project.name, w.slot, w.state, None, cx);
     }
 }
 
@@ -342,7 +344,7 @@ pub fn open_added_project(slug: &str, from: Option<WindowHandle<ShelbiWindow>>, 
         if !catalog.lists(slug) {
             return Err(format!("Shelbi can’t find the project “{slug}” yet."));
         }
-        catalog.forget_view(slug);
+        catalog.forget_view(&ProjectKey::local(slug));
     }
     let shown = windows_showing(slug, None, cx).into_iter().next();
     for handle in shown.into_iter().chain(from) {
@@ -637,8 +639,14 @@ pub struct PaletteInputs {
 }
 
 impl PaletteInputs {
-    /// Read them (blocking: small local files and one control-socket call).
-    fn read(project: &str, control: Option<crate::platform::control::ControlHandle>, client_id: &str) -> Self {
+    /// Read them (blocking: small local files, the project's edit targets
+    /// through its source, and one control-socket call).
+    fn read(
+        project: &str,
+        source: &dyn ProjectSource,
+        control: Option<crate::platform::control::ControlHandle>,
+        client_id: &str,
+    ) -> Self {
         let summaries = shelbi_state::list_projects().unwrap_or_default();
         let open: std::collections::HashSet<String> = shelbi_state::list_open_projects()
             .unwrap_or_default()
@@ -657,7 +665,7 @@ impl PaletteInputs {
                     label: p.display_label().to_string(),
                 })
                 .collect(),
-            edit_targets: shelbi_app::command_model::edit_targets(project),
+            edit_targets: source.edit_targets(),
             projects: shelbi_app::command_model::projects_column_from(
                 project,
                 summaries
@@ -711,6 +719,10 @@ struct PendingRows {
 pub struct ShelbiWindow {
     /// The project the window shows (meaningless while [`Self::chooser`]).
     project: String,
+    /// What the window owns for that project: its key, the source every
+    /// view reads it through, and the link for everything else
+    /// (`shelbi_app::source`). Replaced with [`Self::project`] on a switch.
+    project_handle: ProjectHandle,
     /// The window slot its frame is saved in.
     slot: usize,
     /// No project is shown: the empty-state chooser (the last open project
@@ -819,8 +831,10 @@ pub struct ShelbiWindow {
     /// The switch's first frame is still to come or to finish.
     switch_hold: Option<SwitchHold>,
     pending_rows: Option<PendingRows>,
-    /// The blocking review work (resolve, load, the content sessions).
-    review_ops: Arc<dyn ReviewOps>,
+    /// Test seam: the blocking review work (resolve, load, the content
+    /// sessions) in place of the live one over [`Self::project_handle`]
+    /// ([`Self::review_ops`]).
+    review_ops: Option<Arc<dyn ReviewOps>>,
     /// The "Not implemented yet" (or failure) banner.
     banner: Option<SharedString>,
     /// A transient status note (the orchestrator coming up, a failure).
@@ -903,7 +917,7 @@ impl ShelbiWindow {
         // Where the project was left (a small local read: a new window may
         // open before the catalog has prefetched it).
         let saved = if persists(cx) {
-            ProjectViewState::load(project)
+            ProjectViewState::load(this.project_handle.key())
         } else {
             ProjectViewState::default()
         };
@@ -987,7 +1001,7 @@ impl ShelbiWindow {
 
         let model = cx
             .try_global::<Catalog>()
-            .map(|c| c.first_frame_sidebar(project))
+            .map(|c| c.first_frame_sidebar(&ProjectKey::local(project)))
             .unwrap_or_else(|| SidebarModel::skeleton(project));
         // The built-in keymaps until the user's `keys.yaml` is read (below).
         let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
@@ -998,6 +1012,7 @@ impl ShelbiWindow {
 
         ShelbiWindow {
             project: project.to_string(),
+            project_handle: shelbi_orchestrator::source::local_handle(project),
             slot: 0,
             chooser: false,
             chooser_highlight: 0,
@@ -1055,7 +1070,7 @@ impl ShelbiWindow {
             quiet_review: None,
             switch_hold: None,
             pending_rows: None,
-            review_ops: Arc::new(crate::views::review::LiveOps),
+            review_ops: None,
             banner: None,
             status: None,
             focus_handle,
@@ -1182,6 +1197,7 @@ impl ShelbiWindow {
             return;
         }
         let project = self.project.clone();
+        let source = self.project_handle.source.clone();
         let control = self.ready().map(|r| r.control.clone());
         let client_id = cx
             .try_global::<Shell>()
@@ -1190,7 +1206,7 @@ impl ShelbiWindow {
         let reading = project.clone();
         let read = cx
             .background_executor()
-            .spawn(async move { PaletteInputs::read(&project, control, &client_id) });
+            .spawn(async move { PaletteInputs::read(&project, source.as_ref(), control, &client_id) });
         cx.spawn(async move |this, cx| {
             let inputs = read.await;
             this.update(cx, |this, cx| {
@@ -1294,7 +1310,7 @@ impl ShelbiWindow {
     /// project) and pump its events into this view.
     fn start_feed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let hub = FeedHub::global(cx);
-        let (feed, mut events) = hub.subscribe(&self.project, cx);
+        let (feed, mut events) = hub.subscribe(&self.project_handle, cx);
         self._feed = Some(feed);
         self._feed_task = Some(cx.spawn_in(window, async move |this, cx| {
             while let Some(event) = events.next().await {
@@ -1363,11 +1379,9 @@ impl ShelbiWindow {
 
     /// Read the user's merged keymaps (`keys.yaml`) off the UI thread.
     fn load_keymaps(&mut self, cx: &mut Context<Self>) {
-        let project = self.project.clone();
-        let reading = project.clone();
-        let read = cx
-            .background_executor()
-            .spawn(async move { shelbi_state::keymap::load_keymaps(Some(&project)).0 });
+        let source = self.project_handle.source.clone();
+        let reading = self.project.clone();
+        let read = cx.background_executor().spawn(async move { source.project_keymap().0 });
         cx.spawn(async move |this, cx| {
             let keymaps = read.await;
             this.update(cx, |this, cx| {
@@ -1522,6 +1536,14 @@ impl ShelbiWindow {
 
     // --- switching projects ------------------------------------------------
 
+    /// The review work: the test seam's, else the live one over the
+    /// window's project source and link.
+    fn review_ops(&self) -> Arc<dyn ReviewOps> {
+        self.review_ops
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::views::review::LiveOps::new(self.project_handle.clone())))
+    }
+
     /// Whether the window shows `project` (not the chooser).
     pub fn shows(&self, project: &str) -> bool {
         !self.chooser && self.project == project
@@ -1546,17 +1568,18 @@ impl ShelbiWindow {
         self.teardown_project(window, cx);
         self.chooser = false;
         self.project = project.to_string();
+        self.project_handle = shelbi_orchestrator::source::local_handle(project);
         self.client.switch_project(project);
         self.model = cx
             .try_global::<Catalog>()
-            .map(|c| c.first_frame_sidebar(project))
+            .map(|c| c.first_frame_sidebar(self.project_handle.key()))
             .unwrap_or_else(|| SidebarModel::skeleton(project));
         self.notifier = notify::Tracker::new(project);
         self.palette_inputs = PaletteInputs::default();
         window.set_window_title(&self.model.project_label);
         let saved = cx
             .try_global::<Catalog>()
-            .map(|c| c.view_state(project))
+            .map(|c| c.view_state(self.project_handle.key()))
             .unwrap_or_default();
         self.adopt_view_state(saved);
         self.start_feed(window, cx);
@@ -1672,7 +1695,7 @@ impl ShelbiWindow {
 
     /// Where the shown project is left: its view, focus, sidebar selection
     /// and scroll, open review and board filter. `None` for the chooser.
-    fn view_state_to_save(&self, cx: &App) -> Option<(String, ProjectViewState)> {
+    fn view_state_to_save(&self, cx: &App) -> Option<(ProjectKey, ProjectViewState)> {
         if self.chooser {
             return None;
         }
@@ -1690,7 +1713,7 @@ impl ShelbiWindow {
                 .unwrap_or_else(|| self.pending_workflow_filter.clone()),
             collapsed_sections: self.collapsed_sections.iter().map(|s| s.key().to_string()).collect(),
         };
-        Some((self.project.clone(), state))
+        Some((self.project_handle.key().clone(), state))
     }
 
     /// Remember where the shown project is left: in the catalog at once (a
@@ -1813,7 +1836,7 @@ impl ShelbiWindow {
     /// Record this window's slot (its project and frame) and save the slots.
     fn record_slot(&mut self, cx: &mut Context<Self>) {
         let entry = window_state::Slot {
-            project: (!self.chooser).then(|| self.project.clone()),
+            project: (!self.chooser).then(|| self.project_handle.key().clone()),
             open: true,
             state: self.window_state.clone(),
         };
@@ -2475,8 +2498,8 @@ impl ShelbiWindow {
         if let Some(issues) = &self.issues {
             return issues.clone();
         }
-        let project = self.project.clone();
-        let issues = cx.new(|cx| IssuesView::new(project.clone(), cx));
+        let project = self.project_handle.clone();
+        let issues = cx.new(|cx| IssuesView::new(&project, cx));
         // The task pane's live session: attach only, through the same
         // sessions the Workspace view reaches.
         let handle = window.window_handle();
@@ -2559,7 +2582,7 @@ impl ShelbiWindow {
         let project = self.project.clone();
         let handle = window.window_handle();
         let sink = self._feed.as_ref().map(|f| f.session_sink());
-        let deps = ChatDeps::live(&project);
+        let deps = ChatDeps::live(&self.project_handle);
         #[cfg(any(test, feature = "visual-check"))]
         let deps = self.chat_deps.as_ref().map(|make| make()).unwrap_or(deps);
         let chat = cx.new(|cx| ChatView::orchestrator(&project, handle, deps, sink, cx));
@@ -2602,7 +2625,7 @@ impl ShelbiWindow {
         let handle = window.window_handle();
         let sink = self._feed.as_ref().map(|f| f.session_sink());
         let chord = self.palette_chord.clone();
-        let deps = WorkspaceDeps::live(&project);
+        let deps = WorkspaceDeps::live(&self.project_handle);
         #[cfg(any(test, feature = "visual-check"))]
         let deps = self.workspace_deps.clone().unwrap_or(deps);
         let ws = cx.new(|cx| {
@@ -2632,8 +2655,8 @@ impl ShelbiWindow {
         let handle = window.window_handle();
         let sink = self._feed.as_ref().map(|f| f.session_sink());
         let deps = ReviewDeps {
-            ops: self.review_ops.clone(),
-            ..ReviewDeps::live(&project)
+            ops: self.review_ops(),
+            ..ReviewDeps::live(&self.project_handle)
         };
         #[cfg(any(test, feature = "visual-check"))]
         let deps = self.review_deps.take().unwrap_or(deps);
@@ -3003,7 +3026,7 @@ impl ShelbiWindow {
     /// first read is done before the feed is first shown.
     fn prefetch_activity(&mut self) {
         if self.prefetch_activity && !self.chooser && self.activity.is_none() {
-            self.activity_reader = Some(ActivityReader::spawn(self.project.clone()));
+            self.activity_reader = Some(ActivityReader::spawn(self.project_handle.source.clone()));
         }
     }
 
@@ -3026,10 +3049,10 @@ impl ShelbiWindow {
         if let Some(activity) = &self.activity {
             return activity.clone();
         }
-        let project = self.project.clone();
+        let project = self.project_handle.clone();
         let activity = match self.activity_reader.take() {
-            Some(reader) => cx.new(|cx| ActivityView::with_reader(project, reader, cx)),
-            None => cx.new(|cx| ActivityView::new(project, cx)),
+            Some(reader) => cx.new(|cx| ActivityView::with_reader(&project, reader, cx)),
+            None => cx.new(|cx| ActivityView::new(&project, cx)),
         };
         let sub = cx.subscribe_in(&activity, window, |this, _, ev: &ActivityEvent, window, cx| {
             match ev {
@@ -3051,8 +3074,8 @@ impl ShelbiWindow {
         if let Some(machines) = &self.machines {
             return machines.clone();
         }
-        let project = self.project.clone();
-        let machines = cx.new(|cx| MachinesView::new(project, cx));
+        let project = self.project_handle.clone();
+        let machines = cx.new(|cx| MachinesView::new(&project, cx));
         let sub = cx.subscribe_in(&machines, window, |this, _, ev: &MachinesEvent, window, cx| {
             let MachinesEvent::Command(kind) = ev;
             this.run(kind.clone(), window, cx);
@@ -3072,8 +3095,8 @@ impl ShelbiWindow {
         if let Some(changelog) = &self.changelog {
             return changelog.clone();
         }
-        let project = self.project.clone();
-        let changelog = cx.new(|cx| ChangelogView::new(project, cx));
+        let project = self.project_handle.clone();
+        let changelog = cx.new(|cx| ChangelogView::new(&project, cx));
         let sub = cx.subscribe_in(&changelog, window, |this, _, ev: &ChangelogEvent, window, cx| {
             let ChangelogEvent::OpenIssue(id) = ev;
             this.open_task(id, window, cx);
@@ -3497,7 +3520,7 @@ impl ShelbiWindow {
             Route::Settings(view) => view.update(cx, |v, cx| v.show_page(page, cx)),
             route => {
                 self.settings_over_review = matches!(route, Route::Review) && self.review.is_some();
-                let project = self.project.clone();
+                let project = self.project_handle.clone();
                 let view = cx.new(|cx| {
                     let mut view = SettingsView::new(&project, window, cx);
                     view.show_page(page, cx);
@@ -3750,11 +3773,12 @@ impl ShelbiWindow {
         if self.tap.is_some() {
             return;
         }
-        let project = self.project.clone();
-        let reading = project.clone();
-        let read = cx
-            .background_executor()
-            .spawn(async move { shelbi_app::overlay::palette_search::read_corpus(&project) });
+        let source = self.project_handle.source.clone();
+        let reading = self.project.clone();
+        let read = cx.background_executor().spawn(async move {
+            let changelog = source.changelog(None).map(|c| c.entries).unwrap_or_default();
+            shelbi_app::overlay::palette_search::corpus_from_reads(source.open_board(), changelog)
+        });
         cx.spawn(async move |this, cx| {
             let read = read.await;
             this.update(cx, |this, cx| {
@@ -3933,10 +3957,10 @@ impl ShelbiWindow {
     /// `ToggleZen`: through the first-run intro on a first off-to-on toggle
     /// (both checks read small local files, off the UI thread).
     fn toggle_zen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.project.clone();
+        let source = self.project_handle.source.clone();
         let check = cx
             .background_executor()
-            .spawn(async move { shelbi_app::zen::should_show_intro(&project) });
+            .spawn(async move { shelbi_app::zen::intro_due(source.zen_state().ok()) });
         cx.spawn_in(window, async move |this, cx| {
             let intro = check.await;
             this.update_in(cx, |this, window, cx| {
@@ -3985,8 +4009,9 @@ impl ShelbiWindow {
         self.open_overlay(ActiveOverlay::error_log(project.clone()), window, cx);
         let read = cx.background_executor().spawn({
             let project = project.clone();
+            let source = self.project_handle.source.clone();
             async move {
-                let rows = shelbi_state::read_errors_with_unread(&project).unwrap_or_default();
+                let rows = source.errors().unwrap_or_default();
                 let _ = shelbi_state::mark_errors_read(&project);
                 rows
             }
@@ -4055,7 +4080,7 @@ impl ShelbiWindow {
         match step {
             LoadStep::None => {}
             LoadStep::Resolve(task) => {
-                let (ops, project, t) = (self.review_ops.clone(), self.project.clone(), task.clone());
+                let (ops, project, t) = (self.review_ops(), self.project.clone(), task.clone());
                 let resolve = cx.background_executor().spawn(async move { ops.resolve(&project, &t) });
                 cx.spawn_in(window, async move |this, cx| {
                     let result = resolve.await;
@@ -4101,7 +4126,7 @@ impl ShelbiWindow {
             }
             LoadStep::Load { task, slot } => {
                 self.status = Some(format!("Loading {task} onto {slot}…").into());
-                let (ops, project) = (self.review_ops.clone(), self.project.clone());
+                let (ops, project) = (self.review_ops(), self.project.clone());
                 let (t, workspace) = (task.clone(), slot.clone());
                 let load = cx.background_executor().spawn(async move {
                     ops.session_op(&project, &t, shelbi_app::ReviewSessionOp::Load { workspace })
@@ -4165,8 +4190,14 @@ impl ShelbiWindow {
             Some(r) => r.update(cx, |r, cx| r.set_merging(true, cx)),
             None => self.flash(format!("{} {id}…", decision.working), cx),
         }
+        let ProjectHandle { source, link } = self.project_handle.clone();
+        let id_for_state = id.clone();
         let work = cx.background_executor().spawn(async move {
-            shelbi_app::execute_mutation(&m, &mut |_, _| {}).map_err(|e| e.to_string())
+            // The issue as its store has it now: the daemon refuses the
+            // mutation if another client moved it meanwhile.
+            link.mutate(&m, source.issue_state(&id_for_state), &mut |_, _| {})
+                .map(|_| ())
+                .map_err(|e| e.to_string())
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = work.await;
@@ -5232,7 +5263,7 @@ impl ShelbiWindow {
         w.boot = Boot::Ready(Box::new(inert_ready()));
         w.model = model;
         w.tap = Some(Default::default());
-        w.review_ops = deps.ops.clone();
+        w.review_ops = Some(deps.ops.clone());
         w.review_deps = Some(deps);
         w.clock = clock;
         w.reduce_motion = Rc::new(|| false);

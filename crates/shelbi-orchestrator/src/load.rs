@@ -157,26 +157,9 @@ pub fn free_review_workspaces(project_name: &str) -> Result<Vec<WorkspaceSpec>> 
         .collect())
 }
 
-/// One review-tagged workspace and the active task (if any) currently loaded
-/// on it. The sidebar's "load onto which review workspace?" picker reads this
-/// to list *every* review slot with its free/occupied state — the superset of
-/// [`free_review_workspaces`], which drops the occupied ones. Eviction (below)
-/// then lets a load target an occupied slot, so the picker must show them.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewSlot {
-    /// The `review`-tagged workspace name.
-    pub name: String,
-    /// The task currently loaded on this slot, or `None` when it's free.
-    pub occupant: Option<ReviewSlotOccupant>,
-}
-
-/// The task currently occupying a [`ReviewSlot`] — its id (what eviction acts
-/// on) and title (what the picker shows in quotes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReviewSlotOccupant {
-    pub task_id: String,
-    pub title: String,
-}
+/// One review-tagged workspace and the active task (if any) loaded on it;
+/// the type lives in `shelbi_app::source` so a project source can return it.
+pub use shelbi_app::source::{ReviewSlot, ReviewSlotOccupant};
 
 /// Every `review`-tagged workspace for `project_name`, in declaration order,
 /// each paired with the active task currently loaded on it (`None` when free).

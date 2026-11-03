@@ -13,7 +13,7 @@
 //! status badge; Configure) and its footnote.
 //!
 //! The config is read off the UI thread
-//! ([`shelbi_app::settings::workspaces::read`]), and
+//! (its project source's `workspaces_config`), and
 //! read again each time the page is shown and when the window comes back to
 //! the front after an edit sent the user to their editor. Until it lands
 //! the table says it's loading; a config that can't be read shows its error
@@ -35,6 +35,8 @@
 //! focus returns there ([`WorkspacesPage::restore_focus`]), to the renamed
 //! row's button after a rename, or to the next row's after a removal.
 
+use std::sync::Arc;
+use shelbi_app::source::{ProjectHandle, ProjectSource};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -48,7 +50,7 @@ use shelbi_core::MachineKind;
 use super::workflows::{popup, row_button, table, MENU_GAP};
 use shelbi_app::settings::workspace_form::Outcome;
 use shelbi_app::settings::workspaces::{
-    kind_label, read, workspace_count, Intent, Load, MachineRow, MachineStatus, PoolIndex, WorkspaceRow,
+    kind_label, workspace_count, Intent, Load, MachineRow, MachineStatus, PoolIndex, WorkspaceRow,
     WorkspacesState,
 };
 use crate::assets::{heroicon, icons};
@@ -97,6 +99,8 @@ enum Origin {
 /// The Workspaces page.
 pub struct WorkspacesPage {
     state: WorkspacesState,
+    /// The window's project, read through its source.
+    source: Arc<dyn ProjectSource>,
     /// The workspace whose ⋮ menu is open.
     menu: Option<String>,
     /// Where the open menu's button last painted (its own click toggles it).
@@ -114,9 +118,10 @@ pub struct WorkspacesPage {
 }
 
 impl WorkspacesPage {
-    pub fn new(project: &str, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(handle: &ProjectHandle, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut page = WorkspacesPage {
-            state: WorkspacesState::new(project),
+            state: WorkspacesState::new(handle.name()),
+            source: handle.source.clone(),
             menu: None,
             menu_anchor: Default::default(),
             new_focus: cx.focus_handle(),
@@ -137,10 +142,8 @@ impl WorkspacesPage {
     /// edit) and show it.
     pub fn load(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let project = self.state.project().to_string();
-        let read = cx.background_executor().spawn({
-            let project = project.clone();
-            async move { read(&project) }
-        });
+        let source = self.source.clone();
+        let read = cx.background_executor().spawn(async move { source.workspaces_config() });
         cx.spawn_in(window, async move |this, cx| {
             let index = read.await;
             this.update(cx, |this, cx| this.loaded(&project, index, cx)).ok();
@@ -189,10 +192,11 @@ impl WorkspacesPage {
             if targets.is_empty() || cfg!(test) {
                 return;
             }
+            let source = self.source.clone();
             self.prober = Some(ReachabilityProber::spawn(
                 REACHABILITY_CADENCE,
                 REACHABILITY_BACKOFF_MAX,
-                |_key: &str, host: &str| super::machines::probe(host),
+                move |_key: &str, host: &str| super::machines::probe(source.as_ref(), host),
             ));
             self._poll = Some(cx.spawn(async move |this, cx| loop {
                 cx.background_executor().timer(POLL_INTERVAL).await;
