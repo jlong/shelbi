@@ -798,7 +798,7 @@ fn run_save_config(req: SaveConfigRequest, state: ControlState, tx: Sender<Serve
     let _guard = lock.lock().unwrap_or_else(|p| p.into_inner());
     match config_write::apply(&req.project, &plan) {
         Ok(()) => {
-            let _ = tx.send(ServerMsg::Done { request_id, state: None });
+            let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
         }
         Err(WriteError::Changed(paths)) => failed(MutationError::ConfigChanged {
             paths: paths.iter().map(|p| p.display().to_string()).collect(),

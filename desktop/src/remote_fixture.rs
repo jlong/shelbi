@@ -328,6 +328,7 @@ fn serve_connection(mut stream: UnixStream, took: &Took, subscribers: &Arc<Mutex
                     Ok(()) => ServerMsg::Done {
                         request_id: req.request_id,
                         state: None,
+                        id: None,
                     },
                     Err(WriteError::Changed(paths)) => ServerMsg::Failed {
                         request_id: req.request_id,
