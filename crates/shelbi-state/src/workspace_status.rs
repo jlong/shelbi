@@ -1,7 +1,7 @@
 //! Workspace state observed from each workspace's tmux pane title.
 //!
-//! Workspace `.claude/settings.json` hooks emit `shelbi:working|idle|blocked`
-//! markers via OSC pane-title escapes (see
+//! Workspace `.claude/settings.json` hooks emit
+//! `shelbi:working|idle|background|blocked` markers via OSC pane-title escapes (see
 //! `default_workspace_settings.json.template`); the hub-side sidebar poll loop
 //! reads the current pane title with `tmux display-message`, parses the
 //! trailing marker, and persists any transition to
@@ -86,6 +86,18 @@ impl std::fmt::Display for WorkspaceState {
 pub enum PaneMarker {
     Working,
     Idle,
+    /// A turn ended while background work it started (a backgrounded shell, a
+    /// monitor, a subagent, ...) is still in flight. Claude Code resumes the
+    /// agent by itself when that work finishes, so nobody needs to answer it:
+    /// the `Stop` hook writes `shelbi:background` instead of `shelbi:idle`
+    /// (from the `background_tasks` array in its payload). On a worker pane it
+    /// reads as [`WorkspaceState::Working`] ([`PaneMarker::workspace_state`]):
+    /// it never notifies and is never a workspace-free signal. The orchestrator
+    /// is different ([`PaneMarker::orchestrator_state`]): it holds a persistent
+    /// event-feed monitor for its whole session, so every turn it ends carries
+    /// background work, and ending a turn still means it is waiting for the
+    /// user.
+    Background,
     Review,
     Blocked,
 }
@@ -95,11 +107,29 @@ impl PaneMarker {
     /// collapse to `AwaitingInput` — the status file just records that
     /// claude is sitting at a prompt; the review-handoff side effect
     /// happens elsewhere.
+    ///
+    /// This is the *worker* (workspace pane) reading: `Background` is
+    /// `Working`. Never use it for the orchestrator's session; use
+    /// [`PaneMarker::orchestrator_state`].
     pub fn workspace_state(self) -> WorkspaceState {
         match self {
-            PaneMarker::Working => WorkspaceState::Working,
+            PaneMarker::Working | PaneMarker::Background => WorkspaceState::Working,
             PaneMarker::Idle | PaneMarker::Review => WorkspaceState::AwaitingInput,
             PaneMarker::Blocked => WorkspaceState::Blocked,
+        }
+    }
+
+    /// The orchestrator session's reading of this marker. It differs from
+    /// [`PaneMarker::workspace_state`] only for `Background`, which is
+    /// `AwaitingInput` here: the orchestrator runs its `shelbi events tail
+    /// --follow` Monitor for the whole session, so every turn it ends lists
+    /// background work, and an orchestrator that ended its turn is waiting for
+    /// the user whatever watches it holds. The background suppression applies
+    /// to worker panes only.
+    pub fn orchestrator_state(self) -> WorkspaceState {
+        match self {
+            PaneMarker::Background => WorkspaceState::AwaitingInput,
+            other => other.workspace_state(),
         }
     }
 }
@@ -124,6 +154,7 @@ pub fn parse_pane_title_marker(title: &str) -> Option<PaneMarker> {
     match marker {
         "working" => Some(PaneMarker::Working),
         "idle" => Some(PaneMarker::Idle),
+        "background" => Some(PaneMarker::Background),
         "review" => Some(PaneMarker::Review),
         "blocked" => Some(PaneMarker::Blocked),
         _ => None,
@@ -133,8 +164,19 @@ pub fn parse_pane_title_marker(title: &str) -> Option<PaneMarker> {
 /// Convenience: just the persisted state, dropping the marker
 /// distinction. Callers that need to know `review` vs `idle` should use
 /// [`parse_pane_title_marker`] instead.
+///
+/// Worker (workspace pane) semantics: `shelbi:background` is `Working`. The
+/// orchestrator's title goes through [`parse_orchestrator_title_state`].
 pub fn parse_pane_title_state(title: &str) -> Option<WorkspaceState> {
     parse_pane_title_marker(title).map(PaneMarker::workspace_state)
+}
+
+/// The orchestrator session's state from its title marker
+/// ([`PaneMarker::orchestrator_state`]): `shelbi:background` is
+/// `AwaitingInput`, since the orchestrator ending a turn means it is waiting
+/// for the user, whatever background watches (its event-feed Monitor) it holds.
+pub fn parse_orchestrator_title_state(title: &str) -> Option<WorkspaceState> {
+    parse_pane_title_marker(title).map(PaneMarker::orchestrator_state)
 }
 
 /// `~/.shelbi/workspaces` — root for per-workspace status dirs.
@@ -446,6 +488,42 @@ mod tests {
     }
 
     #[test]
+    fn background_marker_reads_as_working_not_awaiting_input() {
+        // A turn that ended with a background job still running is not waiting
+        // on a human: Claude Code resumes the agent when the job exits. It must
+        // never surface as awaiting input (no notification, no
+        // workspace-free signal).
+        assert_eq!(
+            parse_pane_title_state("shelbi:background"),
+            Some(WorkspaceState::Working)
+        );
+        assert_eq!(
+            parse_pane_title_state("✳ Claude shelbi:background\u{0007}"),
+            Some(WorkspaceState::Working)
+        );
+    }
+
+    #[test]
+    fn background_marker_is_awaiting_input_for_the_orchestrator() {
+        // The orchestrator's persistent event-feed Monitor rides along on every
+        // turn it ends, so `shelbi:background` must still read as waiting for
+        // the user there, while every other marker reads as it does on a worker.
+        assert_eq!(
+            parse_orchestrator_title_state("✳ Claude shelbi:background"),
+            Some(WorkspaceState::AwaitingInput)
+        );
+        for marker in [
+            PaneMarker::Working,
+            PaneMarker::Idle,
+            PaneMarker::Review,
+            PaneMarker::Blocked,
+        ] {
+            assert_eq!(marker.orchestrator_state(), marker.workspace_state());
+        }
+        assert!(parse_orchestrator_title_state("vim").is_none());
+    }
+
+    #[test]
     fn marker_parser_distinguishes_idle_from_review() {
         assert_eq!(
             parse_pane_title_marker("shelbi:idle"),
@@ -462,6 +540,10 @@ mod tests {
         assert_eq!(
             parse_pane_title_marker("shelbi:blocked"),
             Some(PaneMarker::Blocked)
+        );
+        assert_eq!(
+            parse_pane_title_marker("shelbi:background"),
+            Some(PaneMarker::Background)
         );
         assert!(parse_pane_title_marker("shelbi:bogus").is_none());
     }

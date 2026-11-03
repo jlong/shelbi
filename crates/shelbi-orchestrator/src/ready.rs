@@ -286,15 +286,113 @@ fn has_elapsed_timer(line: &str) -> bool {
     })
 }
 
+/// True when Claude shows background work it will resume on by itself: a
+/// backgrounded shell, a monitor, a subagent, a workflow, ... still in flight.
+///
+/// A worker that backgrounds `cargo test --workspace` and ends its turn
+/// "waiting on the run" draws the ready input box, so [`is_input_ready`] reads
+/// it as awaiting input. It isn't: Claude Code resumes the agent when the job
+/// exits. Claude draws the in-flight work in two places, both from the same
+/// live task list (they drop the count the moment the work finishes):
+///
+/// ```text
+/// ✻ Sautéed for 6m 20s · done 11:32 AM · 1 shell still running
+///
+/// ─────────────────────────────────────────────────────
+/// ❯ Show me the test results when they finish
+/// ─────────────────────────────────────────────────────
+///   Model: Opus 5.5 | Ctx: 103.9k | ⎇ jlong/some-task
+///   ⏵⏵ auto mode on · 1 shell
+/// ```
+///
+/// - the footer pill under the input box (`· 1 shell`), and
+/// - the turn summary row right above it (`· 1 shell still running`).
+///
+/// Either one counts. Both are positional (the footer below the live box, the
+/// summary the row directly above it), so a `1 shell` the agent printed into
+/// the scrollback never matches. The phrase must be one of Claude's counted
+/// task kinds ([`is_background_tasks_phrase`]); Claude's own housekeeping
+/// (`dreaming`, `saving memories`, `auto-mode scan`) and an Artifact comment
+/// monitor (which waits on a person) never resume the agent's work, so they
+/// don't count.
+pub fn has_background_tasks(screen: &str) -> bool {
+    let Some((top, bottom)) = input_box_bounds(screen) else {
+        return false;
+    };
+    let lines: Vec<&str> = screen.lines().collect();
+    let footer = lines[bottom + 1..]
+        .iter()
+        .flat_map(|line| line.split('·'))
+        .any(is_background_tasks_phrase);
+    if footer {
+        return true;
+    }
+    lines[..top]
+        .iter()
+        .map(|l| l.trim())
+        .rev()
+        .find(|l| !l.is_empty() && !is_continuation_row(l))
+        .and_then(|row| row.strip_suffix("still running"))
+        .and_then(|row| row.rsplit('·').next())
+        .is_some_and(is_background_tasks_phrase)
+}
+
+/// True when `segment` is Claude Code's count of in-flight background work that
+/// resumes the agent: `1 shell`, `2 shells, 1 monitor`, `1 local agent`,
+/// `3 background tasks`, `⧈ 1 cloud session`, ... Every comma-separated part
+/// must be a positive count and one of [`RESUMING_TASK_KINDS`].
+fn is_background_tasks_phrase(segment: &str) -> bool {
+    // The cloud-session form leads with an icon glyph.
+    let segment = segment
+        .trim()
+        .trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+    !segment.is_empty()
+        && segment.split(',').all(|part| {
+            part.trim().split_once(' ').is_some_and(|(count, kind)| {
+                count.parse::<u32>().is_ok_and(|n| n > 0)
+                    && RESUMING_TASK_KINDS.contains(&kind.trim())
+            })
+        })
+}
+
+/// The task kinds Claude Code counts in its background-work pill whose
+/// completion wakes the agent (both plural forms Claude renders).
+const RESUMING_TASK_KINDS: &[&str] = &[
+    "shell",
+    "shells",
+    "monitor",
+    "monitors",
+    "local agent",
+    "local agents",
+    "team",
+    "teams",
+    "MCP task",
+    "MCP tasks",
+    "background task",
+    "background tasks",
+    "background dynamic workflow",
+    "background dynamic workflows",
+    "remote dynamic workflow",
+    "remote dynamic workflows",
+    "cloud session",
+    "cloud sessions",
+];
+
 /// Index of the top border of the last live input box in `screen`, or `None`
 /// when no box is drawn (a modal, or a capture taken before Claude drew it).
 fn input_box_top(screen: &str) -> Option<usize> {
+    input_box_bounds(screen).map(|(top, _)| top)
+}
+
+/// Indexes of the top and bottom borders of the last live input box in
+/// `screen`, or `None` when no box is drawn.
+fn input_box_bounds(screen: &str) -> Option<(usize, usize)> {
     let rules: Vec<usize> = screen
         .lines()
         .enumerate()
         .filter_map(|(index, line)| is_input_box_rule(line).then_some(index))
         .collect();
-    (rules.len() >= 2).then(|| rules[rules.len() - 2])
+    (rules.len() >= 2).then(|| (rules[rules.len() - 2], rules[rules.len() - 1]))
 }
 
 /// A plain horizontal border that can fence Claude's live input box.
@@ -812,6 +910,130 @@ mod tests {
 ❯ 
 ────────────────────────────────────────────────────
   ⏵⏵ auto mode on (shift+tab to cycle)";
+
+    /// Captured 2026-11-03 from workspace alpha: the worker committed,
+    /// backgrounded `cargo test --workspace`, and ended its turn waiting on it.
+    /// Shelbi read this as awaiting input and posted a false "needs input"
+    /// notification. The `❯` row is Claude's suggested-prompt ghost text.
+    const BACKGROUND_SHELL_TURN_END: &str = "\
+⏺ Committed. Waiting on the root cargo test --workspace run before rebasing and writing the marker.
+
+✻ Sautéed for 6m 20s · done 11:32 AM · 1 shell still running
+
+───────────────────────────────────────────────────────────────────────────
+❯ Show me the test results when they finish
+───────────────────────────────────────────────────────────────────────────
+  Model: Opus 5.5 | Ctx: 103.9k | ⎇ jlong/panel-description-plain-text | (+0,-0)
+  ⏵⏵ auto mode on · 1 shell";
+
+    /// The same pane once the job exited and the agent finished: no pill, no
+    /// `still running`.
+    const PLAIN_TURN_END: &str = "\
+⏺ Tests pass. Rebased and wrote the marker.
+
+✻ Sautéed for 8m 2s · done 11:40 AM
+
+───────────────────────────────────────────────────────────────────────────
+❯
+───────────────────────────────────────────────────────────────────────────
+  Model: Opus 5.5 | Ctx: 110.2k | ⎇ jlong/panel-description-plain-text | (+0,-0)
+  ⏵⏵ auto mode on (shift+tab to cycle)";
+
+    #[test]
+    fn background_shell_at_turn_end_is_background_work() {
+        assert!(is_input_ready(BACKGROUND_SHELL_TURN_END));
+        assert!(!is_claude_working(BACKGROUND_SHELL_TURN_END));
+        assert!(has_background_tasks(BACKGROUND_SHELL_TURN_END));
+    }
+
+    #[test]
+    fn plain_turn_end_has_no_background_work() {
+        assert!(is_input_ready(PLAIN_TURN_END));
+        assert!(!has_background_tasks(PLAIN_TURN_END));
+        assert!(!has_background_tasks(IDLE_FRAME));
+    }
+
+    #[test]
+    fn either_the_footer_pill_or_the_summary_row_is_enough() {
+        // Footer pill alone (the summary row already scrolled or redrawn).
+        let pill_only = "\
+⏺ Started the dev server.
+─────────────────────────────
+❯
+─────────────────────────────
+  ? for shortcuts · 2 shells, 1 monitor";
+        assert!(has_background_tasks(pill_only));
+        // Summary row alone (a footer that doesn't draw the pill).
+        let summary_only = "\
+✻ Brewed for 1m 1s · 1 local agent still running
+─────────────────────────────
+❯
+─────────────────────────────
+  ? for shortcuts";
+        assert!(has_background_tasks(summary_only));
+    }
+
+    #[test]
+    fn every_resuming_task_kind_counts() {
+        for phrase in [
+            "1 shell",
+            "3 shells",
+            "1 monitor",
+            "2 shells, 1 monitor",
+            "1 local agent",
+            "4 local agents",
+            "1 team",
+            "1 MCP task",
+            "5 background tasks",
+            "1 background dynamic workflow",
+            "⧈ 1 cloud session",
+            "⧈ 2 remote dynamic workflows",
+        ] {
+            let screen = format!(
+                "─────────────────\n❯ \n─────────────────\n  ⏵⏵ auto mode on · {phrase}"
+            );
+            assert!(has_background_tasks(&screen), "{phrase:?} must count");
+        }
+    }
+
+    #[test]
+    fn housekeeping_and_human_waits_do_not_count() {
+        for phrase in [
+            "dreaming",
+            "saving memories",
+            "auto-mode scan",
+            "memory import 1/3",
+            "1 Artifact comment monitor",
+            "⧈ ultraplan needs your input",
+            "← for agents",
+            "0 shells",
+        ] {
+            let screen = format!(
+                "─────────────────\n❯ \n─────────────────\n  ⏵⏵ auto mode on · {phrase}"
+            );
+            assert!(!has_background_tasks(&screen), "{phrase:?} must not count");
+        }
+    }
+
+    #[test]
+    fn background_count_in_the_scrollback_does_not_count() {
+        // An old summary row (or agent output) further up the scrollback is not
+        // the row directly above the live box, and the box needs a footer pill
+        // of its own.
+        let screen = "\
+✻ Sautéed for 6m 20s · 1 shell still running
+
+⏺ Background job finished; all green.
+
+✻ Worked for 12s
+─────────────────────────────
+❯
+─────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)";
+        assert!(!has_background_tasks(screen));
+        // No input box at all (a modal): never background work.
+        assert!(!has_background_tasks("1 shell still running\n· 1 shell"));
+    }
 
     #[test]
     fn a_ready_frame_from_a_session_that_is_not_live_is_not_ready() {

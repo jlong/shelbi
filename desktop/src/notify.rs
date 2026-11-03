@@ -180,9 +180,13 @@ impl Tracker {
 
     /// Take the orchestrator session's latest title (its `shelbi:<state>`
     /// marker). `label` is the project's display name.
+    ///
+    /// Read with the orchestrator's semantics, not a worker's: its
+    /// `shelbi:background` (a turn ended while its persistent event-feed
+    /// Monitor runs, i.e. every turn) is waiting for the user.
     pub fn observe_orchestrator(&mut self, title: &str, label: &str) -> Changes {
         let mut changes = Changes::default();
-        let Some(next) = shelbi_state::parse_pane_title_state(title) else {
+        let Some(next) = shelbi_state::parse_orchestrator_title_state(title) else {
             return changes;
         };
         let before = self.orchestrator.replace(next);
@@ -455,6 +459,23 @@ mod tests {
         assert_eq!(t.observe_orchestrator("shelbi:working", "Web").cleared, ["shelbi/web/orch"]);
         let c = t.observe_orchestrator("shelbi:blocked", "Web");
         assert_eq!(c.notices[0].title, "The orchestrator needs permission");
+    }
+
+    #[test]
+    fn the_orchestrator_ending_a_turn_with_its_monitor_running_is_noticed() {
+        // The orchestrator keeps its `shelbi events tail --follow` Monitor up
+        // for the whole session, so its Stop hook writes `shelbi:background` at
+        // every turn end. That is still the orchestrator waiting for the user:
+        // the worker-only background suppression must not swallow it.
+        let mut t = Tracker::new("web");
+        t.observe_orchestrator("shelbi:working", "Web");
+        let c = t.observe_orchestrator("✳ Claude shelbi:background", "Web");
+        assert_eq!(targets(&c), [Target::Orchestrator]);
+        assert_eq!(c.notices[0].title, "The orchestrator is waiting for you");
+        // The next turn clears it, and the next turn end notices again.
+        assert_eq!(t.observe_orchestrator("shelbi:working", "Web").cleared, ["shelbi/web/orch"]);
+        let c = t.observe_orchestrator("shelbi:background", "Web");
+        assert_eq!(c.notices[0].title, "The orchestrator is waiting for you");
     }
 
     fn notice(target: Target, kind: Kind) -> Notice {

@@ -4654,7 +4654,39 @@ fi
 rm "$PROC"
 "#;
 
-const PANE_IDLE_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:idle\\007'\n";
+// Stop hook: mark the pane idle (awaiting input) at the end of a turn, unless
+// the turn left background work in flight.
+//
+// A worker that backgrounds a long command (`cargo test --workspace`) and ends
+// its turn "waiting on the run" is not waiting on a human: Claude Code resumes
+// it by itself when the job exits. Claude Code's Stop payload (JSON on stdin)
+// carries a `background_tasks` array for exactly this ("session is paused
+// waiting for background work to wake it"; empty when nothing is in flight), so
+// a non-empty one writes `shelbi:background`, which on a worker pane reads as
+// working: no awaiting-input notification and no `-> awaiting_input`
+// workspace-free event. The orchestrator reads the same marker as waiting for
+// the user (`PaneMarker::orchestrator_state`): its event-feed Monitor is in
+// flight at every turn end, so the suppression is the reader's call, not ours.
+// Claude's own housekeeping (`dream` memory consolidation, `auto-mode scan`,
+// `memory import`, `memory save`) never resumes the agent's work, so it doesn't
+// count. The payload is one line of JSON and `jq` is absent on stock macOS, so
+// the entries' `"type"` values are pulled out with POSIX tools: string values
+// escape their quotes, so a bare `"type":"` can only be a real key, and
+// everything before the `background_tasks` key (including
+// `last_assistant_message`) is cut off first. A missing or unreadable payload
+// (an older Claude Code, a manual run on a tty) falls back to `shelbi:idle`.
+const PANE_IDLE_SH: &str = r#"#!/bin/sh
+MARKER=idle
+if [ ! -t 0 ]; then
+  PENDING=$(tr '\n' ' ' \
+    | sed -n 's/.*"background_tasks"[[:space:]]*:[[:space:]]*\[//p' \
+    | grep -o '"type"[[:space:]]*:[[:space:]]*"[^"]*"' \
+    | sed 's/.*"\([^"]*\)"$/\1/' \
+    | grep -v -x -e 'dream' -e 'auto-mode scan' -e 'memory import' -e 'memory save')
+  [ -n "$PENDING" ] && MARKER=background
+fi
+printf '\033]2;shelbi:%s\007' "$MARKER"
+"#;
 const PANE_WORKING_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:working\\007'\n";
 const PANE_BLOCKED_SH: &str = "#!/bin/sh\nprintf '\\033]2;shelbi:blocked\\007'\n";
 
@@ -10128,6 +10160,63 @@ statuses:
             integration: None,
         };
         require_auto_mode_supported(&Host::Local, &runner, Some("auto")).unwrap();
+    }
+
+    /// Run the deployed `pane-idle.sh` (the `Stop` hook) with `payload` on
+    /// stdin, the way Claude Code invokes it, and return the title it writes.
+    fn run_pane_idle(payload: &str) -> String {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!(
+            "shelbi-pane-idle-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        deploy_runner_hooks(&Host::Local, &tmp).unwrap();
+        let mut child = std::process::Command::new(tmp.join(".shelbi/hooks/pane-idle.sh"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    #[test]
+    fn stop_hook_reports_background_when_a_background_task_is_in_flight() {
+        // The 2026-11-03 false positive: the worker ended its turn waiting on a
+        // backgrounded `cargo test`. Claude Code lists it in the Stop payload's
+        // `background_tasks`, so the hook must not report idle.
+        let payload = r#"{"session_id":"s","transcript_path":"/t.jsonl","cwd":"/wt","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Committed. Waiting on the root cargo test --workspace run.","background_tasks":[{"id":"bq1","type":"shell","status":"running","description":"Root workspace tests","command":"cargo test --workspace 2>&1 | tail -40"}],"session_crons":[]}"#;
+        assert_eq!(run_pane_idle(payload), "\x1b]2;shelbi:background\x07");
+        let agent = r#"{"hook_event_name":"Stop","background_tasks":[{"id":"a1","type":"subagent","status":"running","description":"explore","agent_type":"Explore"}],"session_crons":[]}"#;
+        assert_eq!(run_pane_idle(agent), "\x1b]2;shelbi:background\x07");
+    }
+
+    #[test]
+    fn stop_hook_reports_idle_when_nothing_is_in_flight() {
+        let payload = r#"{"session_id":"s","hook_event_name":"Stop","stop_hook_active":false,"last_assistant_message":"Done.","background_tasks":[],"session_crons":[]}"#;
+        assert_eq!(run_pane_idle(payload), "\x1b]2;shelbi:idle\x07");
+        // Claude's own housekeeping never resumes the agent's work.
+        let housekeeping = r#"{"hook_event_name":"Stop","background_tasks":[{"id":"d1","type":"dream","status":"running","description":"consolidating"},{"id":"m1","type":"auto-mode scan","status":"running","description":"scan"}],"session_crons":[]}"#;
+        assert_eq!(run_pane_idle(housekeeping), "\x1b]2;shelbi:idle\x07");
+        // A `"type":"shell"` inside a string value is escaped JSON, not a task.
+        let quoted = r#"{"hook_event_name":"Stop","last_assistant_message":"see {\"type\":\"shell\"}","background_tasks":[],"session_crons":[]}"#;
+        assert_eq!(run_pane_idle(quoted), "\x1b]2;shelbi:idle\x07");
+        // An older Claude Code with no `background_tasks`, or no payload at all.
+        assert_eq!(run_pane_idle(r#"{"hook_event_name":"Stop"}"#), "\x1b]2;shelbi:idle\x07");
+        assert_eq!(run_pane_idle(""), "\x1b]2;shelbi:idle\x07");
     }
 
     #[test]
