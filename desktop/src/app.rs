@@ -466,10 +466,7 @@ fn open_window_with(
     let project = handle.name().to_string();
     let project = project.as_str();
     let bounds = bounds.unwrap_or_else(|| match state.frame {
-        Some(f) if f.width >= 400.0 && f.height >= 300.0 => Bounds {
-            origin: gpui::point(px(f.x), px(f.y)),
-            size: gpui::size(px(f.width), px(f.height)),
-        },
+        Some(f) if f.width >= 400.0 && f.height >= 300.0 => frame_bounds(f),
         _ => {
             let mut b =
                 Bounds::centered(None, gpui::size(px(DEFAULT_WIDTH), px(DEFAULT_HEIGHT)), cx);
@@ -481,6 +478,15 @@ fn open_window_with(
             b
         }
     });
+    // Keep it on the display it opens on (gpui places it on the primary): a
+    // frame that fits there is kept exactly.
+    let bounds = match cx.primary_display() {
+        Some(display) => {
+            let area = bounds_frame(display.visible_bounds());
+            frame_bounds(bounds_frame(bounds).fit_within(area))
+        }
+        None => bounds,
+    };
     if !cx.has_global::<Shell>() {
         cx.set_global(Shell::default());
     }
@@ -517,6 +523,7 @@ fn open_window_with(
     );
     match opened {
         Ok(handle) => {
+            let _ = handle.update(cx, |_, window, _| hold_size(window, bounds));
             cx.global_mut::<Shell>().windows.push(OpenWindow { handle, slot });
             let _ = handle.update(cx, |w, _, cx| w.record_slot(cx));
             // A project is open: the launch window, if up, is done.
@@ -527,6 +534,47 @@ fn open_window_with(
             tracing::error!(project, error = %e, "could not open a window");
             None
         }
+    }
+}
+
+/// Give a just-opened window the size it was asked for, when the platform
+/// opened it at another.
+///
+/// macOS Stage Manager squeezes a window into the stage beside its strip as
+/// the window first orders front (on a 1710pt-wide display: x from 215, at
+/// most 1495 wide). gpui moves the window back to the asked-for origin
+/// afterwards, but not to the asked-for size, so a window saved filling the
+/// screen reopened about 1495 wide, and the bounds observer then saved that.
+/// A resize once the window is on screen is honored.
+fn hold_size(window: &mut Window, bounds: Bounds<gpui::Pixels>) {
+    let got = window.window_bounds().get_bounds().size;
+    if got == bounds.size {
+        return;
+    }
+    // gpui sizes the content; take off whatever frame the window draws
+    // around it (none under the transparent title bar).
+    let content = window.viewport_size();
+    window.resize(gpui::size(
+        bounds.size.width - (got.width - content.width),
+        bounds.size.height - (got.height - content.height),
+    ));
+}
+
+/// gpui bounds as a saved [`Frame`].
+fn bounds_frame(b: Bounds<gpui::Pixels>) -> Frame {
+    Frame {
+        x: b.origin.x.as_f32(),
+        y: b.origin.y.as_f32(),
+        width: b.size.width.as_f32(),
+        height: b.size.height.as_f32(),
+    }
+}
+
+/// A saved [`Frame`] as gpui bounds.
+fn frame_bounds(f: Frame) -> Bounds<gpui::Pixels> {
+    Bounds {
+        origin: gpui::point(px(f.x), px(f.y)),
+        size: gpui::size(px(f.width), px(f.height)),
     }
 }
 
@@ -1185,13 +1233,7 @@ impl ShelbiWindow {
             None => this.start_bootstrap(cx),
         }
         this._subscriptions.push(cx.observe_window_bounds(window, |this, window, cx| {
-            let b = window.window_bounds().get_bounds();
-            this.window_state.frame = Some(Frame {
-                x: b.origin.x.as_f32(),
-                y: b.origin.y.as_f32(),
-                width: b.size.width.as_f32(),
-                height: b.size.height.as_f32(),
-            });
+            this.window_state.frame = Some(bounds_frame(window.window_bounds().get_bounds()));
             this.schedule_save(cx);
         }));
         this._subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {

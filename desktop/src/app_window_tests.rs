@@ -535,3 +535,99 @@ fn okay_for_a_project_the_catalog_lacks_is_an_error(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(windows(cx), [("alpha".to_string(), 0)]);
 }
+
+/// The primary display's visible area, as a saved frame.
+fn visible_frame(cx: &mut TestAppContext) -> Frame {
+    cx.update(|cx| bounds_frame(cx.primary_display().unwrap().visible_bounds()))
+}
+
+fn frame_of(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) -> Frame {
+    cx.update(|cx| {
+        handle
+            .update(cx, |_, window, _| bounds_frame(window.window_bounds().get_bounds()))
+            .unwrap()
+    })
+}
+
+fn launch_with_frame(frame: Frame) -> Vec<LaunchWindow> {
+    vec![LaunchWindow {
+        slot: 0,
+        project: ProjectKey::local("alpha"),
+        state: WindowState {
+            frame: Some(frame),
+            ..WindowState::default()
+        },
+    }]
+}
+
+#[gpui::test]
+fn a_window_saved_filling_the_screen_reopens_filling_it(cx: &mut TestAppContext) {
+    let _f = fixture(cx);
+    // The display's whole visible area, as a window zoomed or dragged to fill
+    // it saves it (x is -0.0 as AppKit reports a window at the left edge).
+    let full = Frame {
+        x: -0.0,
+        ..visible_frame(cx)
+    };
+    cx.update(|cx| {
+        cx.on_window_closed(|cx, id| window_closed(id, cx)).detach();
+        open_launch_windows(launch_with_frame(full), cx);
+    });
+    let h = cx.update(|cx| cx.global::<Shell>().windows[0].handle);
+    assert_eq!(frame_of(cx, h), full, "it opens at exactly its saved frame");
+    // Relaunch from what this launch saved, twice: the full frame stays.
+    for launch in 1..=2 {
+        let session = cx.update(|cx| cx.global::<Shell>().session.clone());
+        assert_eq!(session.slots[0].state.frame, Some(full), "launch {launch} saved the full frame");
+        let h = h_of(cx);
+        update(cx, h, |_, window, _| window.remove_window());
+        let plan = window_state::launch_plan(Some(&session), None, None, &|_| true, &|_| WindowState::default());
+        cx.update(|cx| open_launch_windows(plan, cx));
+        assert_eq!({ let h = h_of(cx); frame_of(cx, h) }, full, "relaunch {launch} opens it full");
+    }
+}
+
+fn h_of(cx: &mut TestAppContext) -> WindowHandle<ShelbiWindow> {
+    cx.update(|cx| cx.global::<Shell>().windows[0].handle)
+}
+
+#[gpui::test]
+fn a_window_opened_narrower_than_asked_is_given_its_size(cx: &mut TestAppContext) {
+    let _f = fixture(cx);
+    let full = visible_frame(cx);
+    cx.update(|cx| open_launch_windows(launch_with_frame(full), cx));
+    let h = h_of(cx);
+    // What Stage Manager does as the window first orders front: a narrower
+    // window (gpui has already put the origin back).
+    VisualTestContext::from_window(h.into(), cx)
+        .simulate_resize(gpui::size(px(full.width * 0.87), px(full.height)));
+    assert_ne!(frame_of(cx, h), full);
+    update(cx, h, |_, window, _| hold_size(window, frame_bounds(full)));
+    assert_eq!(frame_of(cx, h), full, "the window gets back its asked-for size");
+}
+
+#[gpui::test]
+fn a_saved_frame_that_no_longer_fits_opens_on_the_display(cx: &mut TestAppContext) {
+    let _f = fixture(cx);
+    let area = visible_frame(cx);
+    cx.update(|cx| cx.on_window_closed(|cx, id| window_closed(id, cx)).detach());
+    for saved in [
+        // On a display to the right that's gone.
+        Frame { x: area.x + area.width + 200.0, y: area.y + 100.0, width: 900.0, height: 700.0 },
+        // Bigger than this display (a larger one, or a higher resolution).
+        Frame { x: area.x - 50.0, y: area.y, width: area.width + 400.0, height: area.height + 300.0 },
+    ] {
+        cx.update(|cx| open_launch_windows(launch_with_frame(saved), cx));
+        let at = { let h = h_of(cx); frame_of(cx, h) };
+        assert!(
+            at.x >= area.x
+                && at.y >= area.y
+                && at.x + at.width <= area.x + area.width
+                && at.y + at.height <= area.y + area.height,
+            "{saved:?} opened at {at:?}, off the visible area {area:?}"
+        );
+        assert_eq!(at, saved.fit_within(area));
+        let h = h_of(cx);
+        update(cx, h, |_, window, _| window.remove_window());
+    }
+}

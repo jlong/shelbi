@@ -50,6 +50,28 @@ pub struct Frame {
     pub height: f32,
 }
 
+impl Frame {
+    /// This frame placed inside `area` (a display's visible area): exactly
+    /// itself when it fits there, a frame filling the whole area included;
+    /// otherwise shrunk to fit and moved just far enough to be on it, so a
+    /// frame saved on a display that's gone (or at a resolution that no
+    /// longer holds it) still opens on screen.
+    pub fn fit_within(self, area: Frame) -> Frame {
+        let sane = |v: f32| v.is_finite() && v > 0.0;
+        if !(sane(area.width) && sane(area.height) && area.x.is_finite() && area.y.is_finite()) {
+            return self;
+        }
+        let width = self.width.min(area.width);
+        let height = self.height.min(area.height);
+        Frame {
+            x: self.x.clamp(area.x, area.x + area.width - width),
+            y: self.y.clamp(area.y, area.y + area.height - height),
+            width,
+            height,
+        }
+    }
+}
+
 /// What a window remembers of itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -376,6 +398,57 @@ mod tests {
         assert_eq!(partial.frame, None);
         assert!(!partial.sidebar_collapsed);
         assert_eq!(partial.task_pane_width, DEFAULT_W, "a file from before the pane resized");
+    }
+
+    fn frame(x: f32, y: f32, width: f32, height: f32) -> Frame {
+        Frame { x, y, width, height }
+    }
+
+    #[test]
+    fn a_frame_that_fits_the_visible_area_is_kept_exactly() {
+        // A 1710x1112pt laptop display under a 39pt menu bar.
+        let area = frame(0.0, 39.0, 1710.0, 1073.0);
+        // Filling the whole visible area (AppKit reports the left edge as -0.0).
+        let full = frame(-0.0, 39.0, 1710.0, 1073.0);
+        assert_eq!(full.fit_within(area), full);
+        let small = frame(200.0, 150.0, 1200.0, 800.0);
+        assert_eq!(small.fit_within(area), small);
+        // Touching the bottom-right corner.
+        let corner = frame(710.0, 112.0, 1000.0, 1000.0);
+        assert_eq!(corner.fit_within(area), corner);
+        // And it survives the file the way it's saved.
+        let json = serde_json::to_string(&full).unwrap();
+        assert_eq!(json, r#"{"x":-0.0,"y":39.0,"width":1710.0,"height":1073.0}"#);
+        let back: Frame = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.fit_within(area), full);
+    }
+
+    #[test]
+    fn a_frame_that_no_longer_fits_is_pulled_onto_the_visible_area() {
+        let area = frame(0.0, 39.0, 1710.0, 1073.0);
+        // Saved on a display to the right that's gone: moved on, size kept.
+        assert_eq!(
+            frame(2000.0, 300.0, 900.0, 700.0).fit_within(area),
+            frame(810.0, 300.0, 900.0, 700.0)
+        );
+        // Above and left of it.
+        assert_eq!(
+            frame(-500.0, -200.0, 900.0, 700.0).fit_within(area),
+            frame(0.0, 39.0, 900.0, 700.0)
+        );
+        // Saved on a bigger display: shrunk to the area.
+        assert_eq!(
+            frame(-0.0, 25.0, 2560.0, 1400.0).fit_within(area),
+            frame(0.0, 39.0, 1710.0, 1073.0)
+        );
+        // Half off the bottom: moved up, size kept.
+        assert_eq!(
+            frame(100.0, 800.0, 1000.0, 600.0).fit_within(area),
+            frame(100.0, 512.0, 1000.0, 600.0)
+        );
+        // A degenerate area (no display read) leaves the frame alone.
+        let any = frame(5000.0, 5000.0, 900.0, 700.0);
+        assert_eq!(any.fit_within(frame(0.0, 0.0, 0.0, 0.0)), any);
     }
 
     fn state(x: f32) -> WindowState {
