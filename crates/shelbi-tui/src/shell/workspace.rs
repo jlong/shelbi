@@ -101,6 +101,7 @@ impl WorkspaceInterface {
         let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
             shelbi_app::session::WorkspaceContentRelauncher {
                 project: project.to_string(),
+                link: None,
             },
         ));
         // Agent is the default view: bind to the workspace's agent session.

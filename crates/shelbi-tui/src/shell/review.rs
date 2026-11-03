@@ -119,6 +119,7 @@ impl ReviewInterface {
             shelbi_app::session::ReviewRelauncher {
                 project: project.to_string(),
                 task: task_id.clone(),
+                link: None,
             },
         ));
         // Chat is the default view: bind to the review agent's workspace session.

@@ -13,10 +13,17 @@
 //!   manager just re-attaches once the daemon brings the pane back) and only a
 //!   *reopen* drops [`shelbi_state::supervision_relaunch`] markers to reset the
 //!   daemon's spent budget.
+//!
+//! A relauncher given the window's [`ProjectLink`] asks through it, so a
+//! remote window re-ensures content sessions on the far daemon (its `control`
+//! service). The reopen markers are files in this machine's Shelbi home, so a
+//! remote link writes none: the far daemon's supervision budget stays its own
+//! until that write moves behind the daemon.
 
 use shelbi_state::supervision_relaunch as sr;
 
 use super::SessionRef;
+use crate::source::ProjectLink;
 use crate::{ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
 
 /// How a dead pane is brought back before the view re-attaches, abstracted so
@@ -62,7 +69,14 @@ fn role_from_str(s: &str) -> Option<ReviewRole> {
 /// per-workspace supervisor and the stranded-dev / stranded-review resume
 /// passes), and the client can't tell which gave up, so it writes every key that
 /// could apply — each pass consumes only its own.
-fn write_persistent_reopen_markers(project: &str, target: &SessionRef) -> Result<(), String> {
+fn write_persistent_reopen_markers(
+    project: &str,
+    link: Option<&ProjectLink>,
+    target: &SessionRef,
+) -> Result<(), String> {
+    if link.is_some_and(ProjectLink::is_remote) {
+        return Ok(());
+    }
     let res = match target {
         SessionRef::Orchestrator => {
             sr::request_supervision_relaunch(project, &sr::orchestrator_relaunch_key())
@@ -87,12 +101,14 @@ fn write_persistent_reopen_markers(project: &str, target: &SessionRef) -> Result
 /// orchestrator too.
 pub struct PersistentRelauncher {
     pub project: String,
+    /// The window's link (`None`: this machine's daemon).
+    pub link: Option<ProjectLink>,
 }
 
 impl Relauncher for PersistentRelauncher {
     fn relaunch(&self, target: &SessionRef, reopen: bool) -> Result<(), String> {
         if reopen {
-            write_persistent_reopen_markers(&self.project, target)
+            write_persistent_reopen_markers(&self.project, self.link.as_ref(), target)
         } else {
             // The daemon owns the auto-restart; just re-attach.
             Ok(())
@@ -106,6 +122,8 @@ impl Relauncher for PersistentRelauncher {
 pub struct ReviewRelauncher {
     pub project: String,
     pub task: String,
+    /// The window's link (`None`: this machine's daemon).
+    pub link: Option<ProjectLink>,
 }
 
 impl Relauncher for ReviewRelauncher {
@@ -115,18 +133,17 @@ impl Relauncher for ReviewRelauncher {
                 let Some(role) = role_from_str(role) else {
                     return Ok(());
                 };
-                crate::review_session(
-                    &self.project,
-                    &self.task,
-                    ReviewSessionOp::Ensure { role },
-                    &mut |_, _| {},
-                )
+                let op = ReviewSessionOp::Ensure { role };
+                match &self.link {
+                    Some(link) => link.review_session(&self.task, op, &mut |_, _| {}),
+                    None => crate::review_session(&self.project, &self.task, op, &mut |_, _| {}),
+                }
                 .map(|_| ())
                 .map_err(|e| e.to_string())
             }
             SessionRef::Workspace(_) | SessionRef::Orchestrator => {
                 if reopen {
-                    write_persistent_reopen_markers(&self.project, target)
+                    write_persistent_reopen_markers(&self.project, self.link.as_ref(), target)
                 } else {
                     Ok(())
                 }
@@ -142,6 +159,8 @@ impl Relauncher for ReviewRelauncher {
 /// name).
 pub struct WorkspaceContentRelauncher {
     pub project: String,
+    /// The window's link (`None`: this machine's daemon).
+    pub link: Option<ProjectLink>,
 }
 
 impl Relauncher for WorkspaceContentRelauncher {
@@ -156,13 +175,16 @@ impl Relauncher for WorkspaceContentRelauncher {
                     };
                     WorkspaceSessionOp::Ensure { role }
                 };
-                crate::workspace_session(&self.project, workspace, op, &mut |_, _| {})
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+                match &self.link {
+                    Some(link) => link.workspace_session(workspace, op, &mut |_, _| {}),
+                    None => crate::workspace_session(&self.project, workspace, op, &mut |_, _| {}),
+                }
+                .map(|_| ())
+                .map_err(|e| e.to_string())
             }
             SessionRef::Workspace(_) | SessionRef::Orchestrator => {
                 if reopen {
-                    write_persistent_reopen_markers(&self.project, target)
+                    write_persistent_reopen_markers(&self.project, self.link.as_ref(), target)
                 } else {
                     Ok(())
                 }

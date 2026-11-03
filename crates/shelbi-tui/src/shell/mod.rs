@@ -1574,6 +1574,7 @@ impl ShellState {
             sessions: SessionManager::new(project, connector.clone()).with_relauncher(
                 std::sync::Arc::new(relaunch::PersistentRelauncher {
                     project: project.to_string(),
+                    link: None,
                 }),
             ),
             connector,
@@ -2120,6 +2121,7 @@ impl ShellState {
             SessionManager::new(project, self.connector.clone()).with_relauncher(
                 std::sync::Arc::new(relaunch::PersistentRelauncher {
                     project: project.to_string(),
+                    link: None,
                 }),
             ),
         );

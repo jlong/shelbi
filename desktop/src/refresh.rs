@@ -29,7 +29,8 @@
 //! Session events (title, exit) arrive from the terminal views'
 //! `shelbi-client` connections through a feed's [`SessionSink`]. The
 //! orchestrator's title is also probed after every refresh
-//! ([`orchestrator_title`]), since its chat is only attached while shown and
+//! (`ProjectLink::orchestrator_title`, over the host's relay for a remote
+//! project), since its chat is only attached while shown and
 //! its `shelbi:<state>` marker drives the "orchestrator is waiting" notice.
 //!
 //! Nothing here ever blocks the caller: spawning returns at once, a refresh
@@ -75,28 +76,6 @@ pub type TitleProbe = Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
 /// The orchestrator chat's view name: what [`SessionNotice::session`] carries
 /// for its titles, from the chat view and the probe alike.
 pub const ORCHESTRATOR_SESSION: &str = "orch";
-
-/// The production probe: find the project's live orchestrator session and
-/// ask it for its title over a short-lived, never-attached connection (the
-/// session protocol's `info` request). `None` when there is no live session,
-/// it doesn't answer within half a second, or it has set no title.
-pub fn orchestrator_title(project: &str) -> Option<String> {
-    use shelbi_app::session::{discovery_name, SessionRef};
-    let root = shelbi_state::sessions_dir().ok()?;
-    let sessions = shelbi_client::list(&root).ok()?;
-    let session = shelbi_client::choose_session(
-        &sessions,
-        &discovery_name(project, &SessionRef::Orchestrator),
-    )?;
-    let (conn, _events) = shelbi_client::Connection::open_with_timeout(
-        &session.sock,
-        None,
-        &[shelbi_proto::capability::INFO],
-        Duration::from_millis(500),
-    )
-    .ok()?;
-    conn.info().ok()?.title
-}
 
 /// Whether the daemon is pushing changes or the feed is polling for them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,12 +181,11 @@ impl ProjectFeed {
         let connected = Arc::new(AtomicBool::new(false));
         let (subscription, changes) = project.link.subscribe_changes(connected.clone());
         let (layout_subscription, layout) = project.link.subscribe_layout();
-        // The title probe reads this machine's sessions, so only a local
-        // project's orchestrator answers it.
-        let orchestrator: Option<TitleProbe> = project
-            .key()
-            .is_local()
-            .then(|| Arc::new(orchestrator_title) as TitleProbe);
+        // The orchestrator's title, asked of its session without attaching:
+        // this machine's socket, or over the host's relay link for a remote
+        // project.
+        let link = project.link.clone();
+        let orchestrator: Option<TitleProbe> = Some(Arc::new(move |_: &str| link.orchestrator_title()));
         Self::spawn_with(
             project.name(),
             sidebar_reader(project.source.clone()),

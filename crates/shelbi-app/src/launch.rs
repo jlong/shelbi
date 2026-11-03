@@ -37,7 +37,7 @@ pub use connect::ConnectFlow;
 pub use recent::{RecentRemote, RecentRemotes, MAX_RECENT_REMOTES, RECENT_REMOTES_FILE};
 pub use remote::{validate_host, RemoteConnector, RemoteError, RemoteSession};
 pub use route::{decide, route, Client, DaemonState, LaunchRoute};
-pub use link::RemoteLink;
+pub use link::{HostLink, RemoteLink};
 pub use ssh::{FallbackReason, NativeCapability, RemoteListing, SshRemote, WindowDecision};
 
 #[cfg(any(test, feature = "test-support"))]

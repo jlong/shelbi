@@ -228,6 +228,7 @@ impl ReviewDeps {
                     Arc::new(ReviewRelauncher {
                         project: handle.name().to_string(),
                         task: task.to_string(),
+                        link: Some(handle.link.clone()),
                     }),
                 )
             }),

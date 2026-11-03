@@ -184,6 +184,7 @@ impl WorkspaceDeps {
                     &handle.link,
                     Arc::new(WorkspaceContentRelauncher {
                         project: handle.name().to_string(),
+                        link: Some(handle.link.clone()),
                     }),
                 )
             }),
