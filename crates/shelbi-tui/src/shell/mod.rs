@@ -6650,6 +6650,53 @@ mod tests {
     }
 
     #[test]
+    fn the_palette_hovers_runs_and_closes_by_mouse_through_the_shell() {
+        // The live path: `handle_event` → the overlay's `handle_mouse` →
+        // the palette, against the rect the frame drew it in.
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut st = test_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 60)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        st.open_palette();
+        draw_frame(&mut term, &mut st).unwrap();
+        let palette = |st: &ShellState| -> (Rect, usize, Vec<String>) {
+            let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+                panic!("the palette is open");
+            };
+            let ids = p.results().into_iter().map(|(e, _)| e.id).collect();
+            (p.overlay_rect(st.full_area()), p.selected(), ids)
+        };
+        let (rect, _, ids) = palette(&st);
+        let at = ids.iter().position(|id| id == "view:machines").expect("the palette lists Machines");
+        // Machines' label, inside the panel (the sidebar names it too).
+        let buf = term.backend().buffer().clone();
+        let (x, y) = (rect.y..rect.y + rect.height)
+            .find_map(|y| {
+                let row: String = (rect.x..rect.x + rect.width).map(|x| buf[(x, y)].symbol().to_string()).collect();
+                row.find("Machines").map(|i| (rect.x + row[..i].chars().count() as u16, y))
+            })
+            .expect("Machines is drawn in the panel");
+        let mouse = |kind, column, row| Event::Mouse(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+
+        st.handle_event(mouse(MouseEventKind::Moved, x, y));
+        assert_eq!(palette(&st).1, at, "hovering Machines selects it");
+        // A click outside the panel closes it, as Escape does.
+        st.handle_event(mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left), 0, rect.y + rect.height + 1));
+        assert!(st.overlay.is_none(), "an outside click closes the palette");
+        assert!(!matches!(st.main_view, MainView::Native(View::Machines)));
+
+        // Reopened, a click on the row runs it.
+        st.open_palette();
+        draw_frame(&mut term, &mut st).unwrap();
+        st.handle_event(mouse(MouseEventKind::Down(crossterm::event::MouseButton::Left), x, y));
+        assert!(st.overlay.is_none(), "running a result closes the palette");
+        assert!(
+            matches!(st.main_view, MainView::Native(View::Machines)),
+            "the click ran Machines, as Enter would"
+        );
+    }
+
+    #[test]
     fn machines_opens_from_the_command_palette() {
         // Requirement: Ctrl+P → Machines opens the Machines view even though it
         // has no sidebar nav row.

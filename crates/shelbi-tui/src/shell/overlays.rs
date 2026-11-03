@@ -360,24 +360,20 @@ impl ActiveOverlay {
         }
     }
 
-    /// Feed a mouse event. Only the clickable overlays (the review dialogs and
-    /// the error log's wheel) care; everything else is ignored so a stray click
+    /// Feed a mouse event. Only the clickable overlays (the palette, the
+    /// review dialogs and the error log's wheel) care; everything else is ignored so a stray click
     /// doesn't leak to the agent underneath.
     pub fn handle_mouse(&mut self, m: MouseEvent, area: Rect) -> OverlayEvent {
         let rect = self.rect(area);
         match self {
-            ActiveOverlay::Palette(p) => {
-                if m.kind == MouseEventKind::Down(MouseButton::Left) {
-                    match p.handle_click(rect, m.column, m.row) {
-                        overlay::palette::PaletteStep::Continue => OverlayEvent::Stay,
-                        overlay::palette::PaletteStep::Close => OverlayEvent::Close,
-                        overlay::palette::PaletteStep::FocusSidebar => OverlayEvent::FocusSidebar,
-                        overlay::palette::PaletteStep::Activate(e) => OverlayEvent::RunEntry(e),
-                    }
-                } else {
-                    OverlayEvent::Stay
-                }
-            }
+            // Clicks run results (or close it from outside the panel), the
+            // pointer hovers them, the wheel scrolls them.
+            ActiveOverlay::Palette(p) => match p.handle_mouse(rect, m) {
+                overlay::palette::PaletteStep::Continue => OverlayEvent::Stay,
+                overlay::palette::PaletteStep::Close => OverlayEvent::Close,
+                overlay::palette::PaletteStep::FocusSidebar => OverlayEvent::FocusSidebar,
+                overlay::palette::PaletteStep::Activate(e) => OverlayEvent::RunEntry(e),
+            },
             ActiveOverlay::ReviewConfirm { task_id, dialog } => {
                 if m.kind == MouseEventKind::Down(MouseButton::Left) {
                     match dialog.handle_click(rect, m.column, m.row) {
