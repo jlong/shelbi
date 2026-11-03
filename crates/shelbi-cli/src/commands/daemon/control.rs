@@ -443,14 +443,14 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 // have their own threads). Ends the project's sessions, drains
                 // its quit barrier, marks it closed, then acks.
                 state.inner.lifecycle.quit_project(&project);
-                let _ = tx.send(ServerMsg::Done { request_id, state: None });
+                let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
             }
             ClientMsg::QuitShelbi { request_id } => {
                 // Close every project and end all sessions, ACK the client, then
                 // stop the daemon — acking before the stop so the reply isn't
                 // lost to the shutdown race.
                 state.inner.lifecycle.quit_shelbi();
-                let _ = tx.send(ServerMsg::Done { request_id, state: None });
+                let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
                 state.inner.lifecycle.stop_daemon();
             }
             ClientMsg::ReloadClients { request_id } => {
@@ -458,7 +458,7 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 state.broadcast_all(&ServerMsg::Reexec {
                     reason: "shelbi reload".to_string(),
                 });
-                let _ = tx.send(ServerMsg::Done { request_id, state: None });
+                let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
             }
             ClientMsg::ReviewSession(req) => {
                 // Detached like a mutation: the daemon owns the review sessions'
@@ -579,6 +579,8 @@ fn run_job(origin: u64, req: MutationRequest, state: ControlState, tx: Sender<Se
             let _ = tx.send(ServerMsg::Done {
                 request_id,
                 state: note.state(),
+                // The issue it acted on: for an add, the id just created.
+                id: (!note.id.is_empty()).then(|| note.id.clone()),
             });
             // Announce to the other connected clients.
             state.broadcast(origin, &note);
@@ -636,7 +638,7 @@ fn run_review_session_job(req: ReviewSessionRequest, tx: Sender<ServerMsg>) {
     };
     match result {
         Ok(()) => {
-            let _ = tx.send(ServerMsg::Done { request_id, state: None });
+            let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
         }
         Err(e) => {
             let _ = tx.send(ServerMsg::Failed {
@@ -680,7 +682,7 @@ fn run_workspace_session_job(req: WorkspaceSessionRequest, tx: Sender<ServerMsg>
     };
     match result {
         Ok(()) => {
-            let _ = tx.send(ServerMsg::Done { request_id, state: None });
+            let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
         }
         Err(e) => {
             let _ = tx.send(ServerMsg::Failed {

@@ -351,6 +351,7 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::OpenAcknowledgements => Placement::Help,
         CommandKind::SwitchProject { .. } => Placement::File,
         CommandKind::AddProject => Placement::File,
+        CommandKind::NewIssue => Placement::File,
         // Shelbi ▸ Connect to Remote Session…, under Settings… (Figma's
         // application menu).
         CommandKind::ConnectRemote => Placement::App,
@@ -487,6 +488,8 @@ fn file_menu<'a, I: Iterator<Item = &'a Command>>(
             slot("action:add-project", "Add Project…", None),
             slot("action:switch-project", "Switch Project…", None),
             submenu("Open Project", projects, "No Other Projects"),
+            MenuEntry::Separator,
+            slot("action:new-issue", "New Issue…", None),
             MenuEntry::Separator,
             submenu("Edit Configuration", editors, "Nothing to Edit"),
             MenuEntry::Separator,

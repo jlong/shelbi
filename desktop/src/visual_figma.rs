@@ -1558,6 +1558,43 @@ impl Run {
         self.cx.update(|cx| cx.remove_global::<FeedbackGlobal>());
     }
 
+    /// New task (`new-task-dialog`, Figma "New task · Dark" `2730:10845`)
+    /// over the Issues board, filled as the frame shows it, the keyboard in
+    /// Title (`state-new-task`); and with the write-up switched on
+    /// (`state-new-task-write-up`, checked by eye).
+    /// `SHELBI_VISUAL_ONLY=new-task` renders just these.
+    fn new_task_states(&mut self) {
+        for (screen, write_up) in [("state-new-task", false), ("state-new-task-write-up", true)] {
+            let handle = self.open();
+            self.click(handle, View::Issues);
+            self.wait_for_board(handle);
+            let dialog = handle
+                .update(&mut self.cx, |w, window, cx| {
+                    w.open_new_task(window, cx);
+                    w.offscreen_new_task()
+                })
+                .unwrap()
+                .expect("New task opened");
+            handle
+                .update(&mut self.cx, |_, window, cx| {
+                    dialog.update(cx, |d, cx| {
+                        d.offscreen_fill(
+                            "Restore the last active project on launch",
+                            "Reopen the project that was active when Shelbi last closed.\n\n\u{2022} Restore the last active project after restarting the app.\n\u{2022} Show the project picker if its directory is unavailable.",
+                            window,
+                            cx,
+                        );
+                        if write_up {
+                            d.offscreen_write_up(cx);
+                        }
+                    })
+                })
+                .unwrap();
+            self.settle(handle);
+            self.save(handle, screen);
+        }
+    }
+
     /// Settings ▸ Workspaces' machine dialogs over the page: Add machine
     /// (Figma 2526:9557) with the frame's sample values typed, and Configure
     /// machine on the gpu box (2528:9870), each with a passing readiness
@@ -2710,6 +2747,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "new-task") {
+            self.new_task_states();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "changelog") {
             self.changelog();
             return;
@@ -2847,6 +2889,7 @@ impl Run {
         self.add_project_windows();
         self.cli_setup_windows();
         self.feedback_states();
+        self.new_task_states();
         self.launch_windows();
 
         let missing: Vec<&str> = SCREENS

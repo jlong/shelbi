@@ -212,6 +212,11 @@ pub struct AddArgs {
     /// `Plans/workflows.md` §12).
     #[arg(long = "branch", value_name = "BRANCH")]
     pub branch: Option<String>,
+    /// Land the new issue at the top of its status's queue instead of the
+    /// end (the default), as `shelbi issue prioritize --top` would. The app's
+    /// New task dialog sends the same for its "Top of queue" priority.
+    #[arg(long)]
+    pub top: bool,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -523,6 +528,7 @@ fn add(project: &str, args: AddArgs) -> Result<()> {
         prefers_machine: args.prefers_machine,
         workflow: args.workflow,
         branch: args.branch,
+        top: args.top,
     };
     mutate_client::run_mutation(project, "", MutationKind::Add(Box::new(spec)))
 }
@@ -1489,6 +1495,7 @@ mod tests {
             prefers_machine: None,
             workflow: None,
             branch: None,
+            top: false,
         }
     }
 

@@ -25,6 +25,7 @@ mod about_icon;
 pub mod add_project;
 pub mod error_log;
 pub mod feedback;
+pub mod new_task;
 pub mod palette;
 pub mod review_confirm;
 pub mod review_reject;

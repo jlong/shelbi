@@ -49,6 +49,8 @@ pub trait CommandHost {
     fn open_settings(&mut self);
     /// Open Contact Us over the window.
     fn send_feedback(&mut self);
+    /// Open New task over the window.
+    fn new_issue(&mut self);
     /// Show the About Shelbi window (or the open one to the front).
     fn open_about(&mut self);
     /// Show the Acknowledgements window (or the open one to the front).
@@ -98,6 +100,9 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         // The sidebar footer's megaphone, Help ▸ Send Feedback… and the
         // palette's entry: Contact Us.
         CommandKind::SendFeedback => host.send_feedback(),
+        // The board's New issue and `n`, File ▸ New Issue… and the
+        // palette's entry: New task, over the window.
+        CommandKind::NewIssue => host.new_issue(),
         // Shelbi ▸ About Shelbi: its own small window.
         CommandKind::OpenAbout => host.open_about(),
         // About's Acknowledgements link, Help ▸ Acknowledgements: its own
@@ -167,6 +172,8 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::OpenSettings => false,
         // The dialog's send goes to the feedback endpoint, not the daemon.
         CommandKind::SendFeedback => false,
+        // Opens the dialog; its Create Task is its own add.
+        CommandKind::NewIssue => false,
         // Only shows this build's version and the project's links.
         CommandKind::OpenAbout => false,
         // Only shows the bundled software's licenses, built in.
@@ -289,6 +296,9 @@ mod tests {
         fn send_feedback(&mut self) {
             self.0.push("send-feedback".into());
         }
+        fn new_issue(&mut self) {
+            self.0.push("new-issue".into());
+        }
         fn open_about(&mut self) {
             self.0.push("about".into());
         }
@@ -362,6 +372,7 @@ mod tests {
             (CommandKind::OpenErrorLog, "error-log"),
             (CommandKind::OpenSettings, "settings"),
             (CommandKind::SendFeedback, "send-feedback"),
+            (CommandKind::NewIssue, "new-issue"),
             (CommandKind::OpenAbout, "about"),
             (CommandKind::OpenAcknowledgements, "acknowledgements"),
             (
@@ -442,7 +453,16 @@ mod tests {
                 "reject:t1:nope",
             ),
             (CommandKind::EditIssue { id: s("t1") }, "issue:edit:t1"),
-            (CommandKind::AddIssue { title: s("New") }, "issue:add"),
+            (
+                CommandKind::AddIssue {
+                    title: s("New"),
+                    body: None,
+                    workflow: None,
+                    status: None,
+                    top: false,
+                },
+                "issue:add",
+            ),
             (
                 CommandKind::PrioritizeIssue {
                     id: s("t1"),
@@ -478,6 +498,7 @@ mod tests {
                 "error-log",
                 "settings",
                 "send-feedback",
+                "new-issue",
                 "about",
                 "acknowledgements",
                 "connect-remote",

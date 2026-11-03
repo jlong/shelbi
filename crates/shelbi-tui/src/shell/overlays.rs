@@ -69,6 +69,9 @@ pub enum OverlayEvent {
     /// Contact Us sent this: the shell posts it off the UI thread and hands
     /// the answer back to the dialog.
     FeedbackSend(shelbi_app::feedback::Submission),
+    /// New task's Create Task: the shell runs the create off the UI thread
+    /// and hands the answer back to the dialog.
+    NewTaskCreate(shelbi_app::new_task::CreateRequest),
     /// About Shelbi's Acknowledgements link: the bundled software, in its
     /// place.
     OpenAcknowledgements,
@@ -104,6 +107,9 @@ pub enum ActiveOverlay {
     About(overlay::about::About),
     /// Contact Us (boxed: its draft is the largest of the overlays').
     Feedback(Box<overlay::feedback::FeedbackDialog>),
+    /// New task (the board's `n` and New issue chip, the palette's New
+    /// Issue).
+    NewTask(Box<overlay::new_task::NewTaskDialog>),
     /// The launch screen (the palette's "Show Launch Screen"), over the
     /// whole window.
     Launch(Box<crate::launch::LaunchScreen>),
@@ -218,6 +224,12 @@ impl ActiveOverlay {
         ActiveOverlay::Feedback(Box::new(overlay::feedback::FeedbackDialog::new(remembered, emoji)))
     }
 
+    /// Open New task for `project` over its loaded `workflows`, on
+    /// `default_workflow`.
+    pub fn new_task(project: &str, workflows: &[shelbi_core::Workflow], default_workflow: &str) -> Self {
+        ActiveOverlay::NewTask(Box::new(overlay::new_task::NewTaskDialog::new(project, workflows, default_workflow)))
+    }
+
     /// Open Connect to Remote Session, connecting through `remote` and
     /// remembering what connects in `recents`.
     pub fn connect_remote(
@@ -233,6 +245,7 @@ impl ActiveOverlay {
     pub fn paste(&mut self, text: &str) -> bool {
         match self {
             ActiveOverlay::Feedback(dialog) => dialog.paste(text),
+            ActiveOverlay::NewTask(dialog) => dialog.paste(text),
             ActiveOverlay::ConnectRemote(dialog) => dialog.paste(text),
             _ => false,
         }
@@ -319,6 +332,7 @@ impl ActiveOverlay {
             }
             ActiveOverlay::About(about) => about_event(about.handle_key(ev)),
             ActiveOverlay::Feedback(dialog) => feedback_event(dialog.handle_key(ev)),
+            ActiveOverlay::NewTask(dialog) => new_task_event(dialog.handle_key(ev)),
             ActiveOverlay::Launch(screen) => OverlayEvent::Launch(screen.handle_key(ev)),
             ActiveOverlay::ConnectRemote(dialog) => connect_event(dialog.handle_key(ev)),
             ActiveOverlay::TaskDescription { scroll, .. } => {
@@ -413,6 +427,14 @@ impl ActiveOverlay {
                     OverlayEvent::Stay
                 }
             }
+            ActiveOverlay::NewTask(dialog) => match m.kind {
+                MouseEventKind::Down(MouseButton::Left) => new_task_event(dialog.handle_click(m.column, m.row)),
+                MouseEventKind::Moved => {
+                    dialog.handle_hover(m.column, m.row);
+                    OverlayEvent::Stay
+                }
+                _ => OverlayEvent::Stay,
+            },
             ActiveOverlay::TaskDescription { scroll, .. } => {
                 match m.kind {
                     MouseEventKind::ScrollUp => *scroll = scroll.saturating_sub(1),
@@ -461,6 +483,7 @@ impl ActiveOverlay {
             ActiveOverlay::About(about) => about.rect(area),
             // Centered and as tall as its content (the desktop's dialog).
             ActiveOverlay::Feedback(dialog) => dialog.rect(area),
+            ActiveOverlay::NewTask(dialog) => dialog.rect(area),
             ActiveOverlay::ConnectRemote(dialog) => dialog.rect(area),
             // The whole window, as the launch screen is the whole terminal.
             ActiveOverlay::Launch(_) => area,
@@ -476,6 +499,7 @@ impl ActiveOverlay {
     pub fn not_buttons(&self) -> Vec<Rect> {
         match self {
             ActiveOverlay::Feedback(dialog) => dialog.not_buttons(),
+            ActiveOverlay::NewTask(dialog) => dialog.not_buttons(),
             _ => Vec::new(),
         }
     }
@@ -507,6 +531,7 @@ impl ActiveOverlay {
             ActiveOverlay::AddProject { form } => form.render(f, rect),
             ActiveOverlay::About(about) => about.render(f.buffer_mut(), area),
             ActiveOverlay::Feedback(dialog) => dialog.render(f, rect),
+            ActiveOverlay::NewTask(dialog) => dialog.render(f, rect),
             ActiveOverlay::Launch(screen) => screen.render(f.buffer_mut(), rect),
             ActiveOverlay::ConnectRemote(dialog) => dialog.render(f, rect),
             ActiveOverlay::TaskDescription {
@@ -579,6 +604,14 @@ pub(super) fn connect_event(step: crate::launch::ConnectStep) -> OverlayEvent {
         crate::launch::ConnectStep::Stay => OverlayEvent::Stay,
         crate::launch::ConnectStep::Close => OverlayEvent::Close,
         crate::launch::ConnectStep::Connected(session) => OverlayEvent::RemoteConnected(session),
+    }
+}
+
+fn new_task_event(step: overlay::new_task::Step) -> OverlayEvent {
+    match step {
+        overlay::new_task::Step::Stay => OverlayEvent::Stay,
+        overlay::new_task::Step::Create(request) => OverlayEvent::NewTaskCreate(request),
+        overlay::new_task::Step::Close => OverlayEvent::Close,
     }
 }
 
@@ -668,6 +701,7 @@ mod tests {
             ActiveOverlay::add_project(Path::new("/tmp/alpha")),
             ActiveOverlay::about(true),
             ActiveOverlay::feedback(shelbi_app::feedback::Remembered::default(), true),
+            ActiveOverlay::new_task("alpha", &[shelbi_core::task_workflow()], "task"),
             ActiveOverlay::task_description(
                 sample_task(),
                 keymaps(),
@@ -835,6 +869,7 @@ mod tests {
             ActiveOverlay::AddProject { .. } => "add-project",
             ActiveOverlay::About(_) => "about",
             ActiveOverlay::Feedback(_) => "feedback",
+            ActiveOverlay::NewTask(_) => "new-task",
             ActiveOverlay::TaskDescription { .. } => "task-description",
             ActiveOverlay::ConnectRemote(_) => "connect-remote",
             ActiveOverlay::Launch(_) => "launch-screen",
@@ -847,7 +882,7 @@ mod tests {
     fn every_overlay_draws_the_shared_dialog_border() {
         let names: std::collections::BTreeSet<_> = every_overlay().iter().map(overlay_name).collect();
         // Every variant but the launch screen ([`launch_overlay`]).
-        assert_eq!(names.len(), 10, "every variant is in every_overlay(): {names:?}");
+        assert_eq!(names.len(), 11, "every variant is in every_overlay(): {names:?}");
         for (w, h) in [(100, 30), (60, 20), (120, 40)] {
             for mut ov in every_overlay() {
                 let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();

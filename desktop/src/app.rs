@@ -109,6 +109,7 @@ use crate::views::update::{self as update_view, UpdateState};
 use crate::views::workspace_dialog::{Body as DialogBody, WorkspaceDialog, WorkspaceDialogEvent};
 use crate::views::connect_remote::{ConnectDialog, ConnectEvent};
 use crate::views::feedback::{FeedbackDialog, FeedbackEvent};
+use crate::views::new_task::{NewTaskDialog, NewTaskEvent};
 use shelbi_app::settings::workspaces::Intent;
 use shelbi_state::keymap::{
     DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
@@ -535,6 +536,7 @@ pub enum HostCall {
     OpenErrorLog,
     OpenSettings,
     SendFeedback,
+    NewIssue,
     OpenAbout,
     OpenAcknowledgements,
     OpenAddProject,
@@ -588,6 +590,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn send_feedback(&mut self) {
         self.push(HostCall::SendFeedback);
+    }
+    fn new_issue(&mut self) {
+        self.push(HostCall::NewIssue);
     }
     fn open_about(&mut self) {
         self.push(HostCall::OpenAbout);
@@ -874,6 +879,9 @@ pub struct ShelbiWindow {
     /// Contact Us, over the whole window, with the focus to hand back when
     /// it closes. It belongs to no project, so a switch keeps it.
     feedback: Option<(Entity<FeedbackDialog>, Subscription, Option<FocusHandle>)>,
+    /// New task, over the whole window, with the focus to hand back when it
+    /// closes.
+    new_task: Option<(Entity<NewTaskDialog>, Subscription, Option<FocusHandle>)>,
     /// Connect to Remote Session, over the whole window, with the focus to
     /// hand back when it closes. Like Contact Us, a switch keeps it.
     connect: Option<(Entity<ConnectDialog>, Subscription, Option<FocusHandle>)>,
@@ -1098,6 +1106,7 @@ impl ShelbiWindow {
             pool_forms: Vec::new(),
             pool_dialog: None,
             feedback: None,
+            new_task: None,
             connect: None,
             #[cfg(test)]
             pool_refreshes: 0,
@@ -2236,6 +2245,7 @@ impl ShelbiWindow {
             HostCall::OpenErrorLog => self.open_error_log(window, cx),
             HostCall::OpenSettings => self.open_settings(None, window, cx),
             HostCall::SendFeedback => self.open_feedback(window, cx),
+            HostCall::NewIssue => self.open_new_task(window, cx),
             // After this update, so the window's first frame isn't nested in
             // ours (as New Window).
             HostCall::OpenAbout => cx.defer(crate::views::about::show_about),
@@ -2387,6 +2397,63 @@ impl ShelbiWindow {
         cx.notify();
     }
 
+    /// Open New task (the board's New issue and `n`, File ▸ New Issue…, the
+    /// palette's New Issue) over the window, closing an overlay first. Its
+    /// pickers list the board's workflows (read from disk when the board
+    /// hasn't loaded). It waits while another dialog is up, and opens once.
+    pub(crate) fn open_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let machine_form = matches!(&self.route, Route::Settings(view) if view.read(cx).machine_form().is_some());
+        if self.modal_open() || machine_form || self.chooser {
+            return;
+        }
+        if self.overlay.is_some() {
+            self.close_overlay(window, cx);
+        }
+        let project = self.project.clone();
+        let loaded = self
+            .issues
+            .as_ref()
+            .map(|issues| issues.read(cx).new_task_workflows())
+            .filter(|(workflows, _)| !workflows.is_empty());
+        let (workflows, default_workflow) = loaded.unwrap_or_else(|| {
+            let workflows = shelbi_state::list_workflows(&project).unwrap_or_default();
+            let default = shelbi_state::load_project(&project)
+                .map(|p| p.default_workflow_name().to_string())
+                .unwrap_or_else(|_| shelbi_core::DEFAULT_WORKFLOW_NAME.to_string());
+            (workflows, default)
+        });
+        let restore = window.focused(cx);
+        let dialog = cx.new(|cx| NewTaskDialog::new(&project, &workflows, &default_workflow, window, cx));
+        let sub = cx.subscribe_in(&dialog, window, |this, _, event: &NewTaskEvent, window, cx| {
+            if let Some((_, _, Some(restore))) = this.new_task.take() {
+                window.focus(&restore, cx);
+            }
+            if let NewTaskEvent::Created(message) = event {
+                // The board reads again now (the daemon's change note would
+                // wake it too), and the window says what happened.
+                if let Some(issues) = &this.issues {
+                    issues.update(cx, |view, cx| view.reload(cx));
+                }
+                this.flash(message.clone(), cx);
+            }
+            cx.notify();
+        });
+        self.new_task = Some((dialog, sub, restore));
+        cx.notify();
+    }
+
+    /// The open New task dialog (tests).
+    #[cfg(test)]
+    pub(crate) fn new_task(&self) -> Option<Entity<NewTaskDialog>> {
+        self.new_task.as_ref().map(|(d, _, _)| d.clone())
+    }
+
+    /// The open New task dialog (`--visual-figma`).
+    #[cfg(feature = "visual-check")]
+    pub(crate) fn offscreen_new_task(&self) -> Option<Entity<NewTaskDialog>> {
+        self.new_task.as_ref().map(|(d, _, _)| d.clone())
+    }
+
     /// Open Connect to Remote Session (Shelbi ▸ Connect to Remote Session…,
     /// the palette) over the window, closing an overlay first. It waits
     /// while another dialog is up, and opens once.
@@ -2420,6 +2487,8 @@ impl ShelbiWindow {
     fn dismiss_dialog(&self, cx: &mut Context<Self>) {
         if let Some((d, _, _)) = &self.feedback {
             d.update(cx, |d, cx| d.dismiss(cx));
+        } else if let Some((d, _, _)) = &self.new_task {
+            d.update(cx, |d, cx| d.dismiss(cx));
         } else if let Some((d, _, _)) = &self.connect {
             d.update(cx, |d, cx| d.dismiss(cx));
         }
@@ -2428,7 +2497,7 @@ impl ShelbiWindow {
     /// A modal dialog is up over the window (Contact Us, Connect to Remote
     /// Session, a workspace dialog).
     fn modal_open(&self) -> bool {
-        self.feedback.is_some() || self.connect.is_some() || self.pool_dialog.is_some()
+        self.feedback.is_some() || self.new_task.is_some() || self.connect.is_some() || self.pool_dialog.is_some()
     }
 
     /// The open Connect dialog (tests).
@@ -4339,7 +4408,7 @@ impl ShelbiWindow {
         // Contact Us and Connect to Remote Session are modal like a
         // workspace dialog: ⌘W cancels them, the rest wait (their own menu
         // items included: they're already open).
-        if self.feedback.is_some() || self.connect.is_some() {
+        if self.feedback.is_some() || self.new_task.is_some() || self.connect.is_some() {
             match &invoke.target {
                 MenuAction::App(AppCommand::CloseWindow) => self.dismiss_dialog(cx),
                 MenuAction::App(AppCommand::Minimize) => window.minimize_window(),
@@ -5182,6 +5251,8 @@ impl ShelbiWindow {
         });
         // Contact Us, over the whole window.
         let feedback = self.feedback.as_ref().map(|(dialog, _, _)| dialog.clone());
+        // New task, over the whole window.
+        let new_task = self.new_task.as_ref().map(|(dialog, _, _)| dialog.clone());
         // Connect to Remote Session, over the whole window.
         let connect = self.connect.as_ref().map(|(dialog, _, _)| dialog.clone());
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
@@ -5254,6 +5325,7 @@ impl ShelbiWindow {
             .children(machine_form)
             .children(pool_dialog)
             .children(feedback)
+            .children(new_task)
             .children(connect)
             .children(layer)
             .children(probe)
@@ -5559,6 +5631,10 @@ mod settings_tests;
 #[cfg(test)]
 #[path = "app_feedback_tests.rs"]
 mod feedback_tests;
+
+#[cfg(test)]
+#[path = "app_new_task_tests.rs"]
+mod new_task_tests;
 
 #[cfg(test)]
 #[path = "app_connect_tests.rs"]

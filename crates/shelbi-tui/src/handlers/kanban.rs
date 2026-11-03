@@ -19,6 +19,8 @@ pub enum Outcome {
     Continue,
     Quit,
     OpenPalette,
+    /// `n`: open New task (the single-process shell's dialog).
+    NewIssue,
 }
 
 pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Outcome {
@@ -103,6 +105,9 @@ pub fn handle_kanban_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) -> Ou
                 // The text search, as the desktop board's `/` and Esc: routed
                 // directly like the keys above, so `keys.yaml` is untouched.
                 KeyCode::Char('/') => app.begin_search(),
+                // New task, as the desktop board's `n`: routed directly like
+                // the keys above, so `keys.yaml` is untouched.
+                KeyCode::Char('n') if key.modifiers.is_empty() => return Outcome::NewIssue,
                 KeyCode::Esc if app.search.is_active() => app.clear_search(),
                 _ => {}
             }

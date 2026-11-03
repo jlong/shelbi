@@ -39,6 +39,15 @@ pub enum Notice {
     Detach { reason: String },
 }
 
+/// What a finished mutation reports ([`ControlClient::mutate_done`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MutationDone {
+    /// The issue's `(status, revision)` right after the change, when known.
+    pub state: Option<ExpectedState>,
+    /// The issue the mutation acted on; for an add, the id it created.
+    pub id: Option<String>,
+}
+
 /// A connection to the daemon's mutation control socket, past the hello
 /// handshake.
 pub struct ControlClient {
@@ -98,6 +107,17 @@ impl ControlClient {
         req: &MutationRequest,
         on_line: &mut dyn FnMut(OutStream, &str),
     ) -> Result<Option<ExpectedState>, ClientError> {
+        self.mutate_done(req, on_line).map(|done| done.state)
+    }
+
+    /// [`Self::mutate`], answering with everything [`ServerMsg::Done`] carries:
+    /// the post-change state and the issue it acted on (for an add, the id the
+    /// daemon created).
+    pub fn mutate_done(
+        &mut self,
+        req: &MutationRequest,
+        on_line: &mut dyn FnMut(OutStream, &str),
+    ) -> Result<MutationDone, ClientError> {
         self.write
             .write_all(&control::encode(&ClientMsg::Mutate(req.clone()))?)?;
         self.write.flush()?;
@@ -110,8 +130,8 @@ impl ControlClient {
                     stream,
                     text,
                 } if request_id == req.request_id => on_line(stream, &text),
-                ServerMsg::Done { request_id, state } if request_id == req.request_id => {
-                    return Ok(state)
+                ServerMsg::Done { request_id, state, id } if request_id == req.request_id => {
+                    return Ok(MutationDone { state, id })
                 }
                 ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
                     return Err(ClientError::Mutation(error))
