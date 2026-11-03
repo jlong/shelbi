@@ -24,6 +24,16 @@
 //! restarted and keeps a continuous output sequence counter, a client reattach
 //! (`Attach { since_seq }`) resumes with no lost or duplicated output.
 //!
+//! **Services (relay protocol v2).** Besides sessions, a stream can be opened
+//! to a relay-side [`RelayService`] with
+//! [`RelayChannel::open_service`]: the far project's read `query` handler, a
+//! filtered bridge to the far daemon's `control.sock`, and a one-way `changes`
+//! subscription on the far `hub.sock` (see [`services`] for the server end and
+//! its rules). The remote desktop window rides these. A v1 relay ends the
+//! channel on the new frame, so [`RelayChannel::open_service`] first reads the
+//! relay's hello and refuses, without sending anything, when the relay is
+//! older ([`ClientError::RelayServicesUnsupported`]).
+//!
 //! **Backpressure.** The shared channel must never let one session's slow
 //! consumer stall another's. Each hub-side stream has a bounded inbound queue
 //! of whole frames; when it overflows the demux **drops the queue and asks the
@@ -36,13 +46,20 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use shelbi_proto::{frame_boundary, Attach, ExtType, Frame, ProtoError, RelayFrame, RelaySession};
+use shelbi_proto::{
+    frame_boundary, Attach, ExtType, Frame, ProtoError, RelayFrame, RelayService, RelaySession,
+    RELAY_SERVICES_VERSION,
+};
+
+pub mod services;
+
+pub use services::{control_refusal, QueryHandler};
 
 use crate::error::ClientError;
 use crate::transport::{Transport, TransportHalves};
@@ -59,6 +76,20 @@ const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Default silence deadline: no inbound byte for this long marks the channel
 /// unreachable.
 const DEFAULT_UNREACHABLE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long [`RelayChannel::open_service`] waits for the relay's hello before
+/// giving up on the channel. The relay sends it first thing, so this only runs
+/// out on a far side that never started `shelbi relay` at all.
+pub const PEER_HELLO_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The most bytes one [`RelayFrame::Data`] carries from a stream writer or a
+/// service. A larger write (a big query answer or issue body) goes out as
+/// several `Data` frames; the far side reads a stream as bytes, so the split
+/// is invisible, and no frame ever nears [`shelbi_proto::MAX_FRAME_LEN`].
+pub const DATA_CHUNK: usize = 1024 * 1024;
+
+/// The largest single `query` message, either way.
+pub const MAX_QUERY_LEN: usize = 32 * 1024 * 1024;
 
 /// Keepalive timing, overridable for tests.
 #[derive(Debug, Clone, Copy)]
@@ -96,18 +127,30 @@ struct Inbound {
     replay_pending: bool,
 }
 
+/// What a logical stream carries, which decides what an inbound overflow does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamKind {
+    /// Session frames: an overflow drops to a replay (a fresh `attach`).
+    Session,
+    /// A relay service's bytes: there is no replay, so an overflow closes the
+    /// stream and its owner reopens it.
+    Service,
+}
+
 /// State for one logical stream: its inbound buffer and a condvar the reader
 /// parks on.
 struct StreamState {
     stream: u32,
+    kind: StreamKind,
     inbound: Mutex<Inbound>,
     cv: Condvar,
 }
 
 impl StreamState {
-    fn new(stream: u32) -> Self {
+    fn new(stream: u32, kind: StreamKind) -> Self {
         Self {
             stream,
+            kind,
             inbound: Mutex::new(Inbound::default()),
             cv: Condvar::new(),
         }
@@ -134,6 +177,10 @@ struct Inner {
     pending_list: Mutex<VecDeque<SyncSender<Vec<RelaySession>>>>,
     /// Waiters for an `Opened`/`OpenError` reply, by stream id.
     pending_open: Mutex<HashMap<u32, SyncSender<Result<(), String>>>>,
+    /// The relay's protocol version, from its hello; `None` until it arrives.
+    peer_version: Mutex<Option<u16>>,
+    /// Woken when the hello arrives or the channel is torn down.
+    peer_cv: Condvar,
     /// Last time any byte arrived on the channel, for the keepalive deadline.
     last_activity: Mutex<Instant>,
     /// False once the channel is declared unreachable.
@@ -166,6 +213,9 @@ impl Inner {
         // Dropping the senders makes any waiting `recv` return `Err`.
         self.pending_list.lock().unwrap().clear();
         self.pending_open.lock().unwrap().clear();
+        // Wake anyone still waiting for the relay's hello.
+        let _guard = self.peer_version.lock().unwrap();
+        self.peer_cv.notify_all();
     }
 }
 
@@ -205,6 +255,8 @@ impl RelayChannel {
             next_stream: AtomicU32::new(1),
             pending_list: Mutex::new(VecDeque::new()),
             pending_open: Mutex::new(HashMap::new()),
+            peer_version: Mutex::new(None),
+            peer_cv: Condvar::new(),
             last_activity: Mutex::new(Instant::now()),
             reachable: AtomicBool::new(true),
             closed: AtomicBool::new(false),
@@ -249,17 +301,76 @@ impl RelayChannel {
     /// [`Transport`]. Pass the result to
     /// [`Connection::connect`](crate::Connection::connect).
     pub fn open(&self, short_id: &str) -> Result<RelayStream, ClientError> {
+        self.open_stream(StreamKind::Session, |stream| RelayFrame::Open {
+            stream,
+            short_id: short_id.to_string(),
+        })
+    }
+
+    /// The relay's protocol version from its hello, waiting up to `timeout`
+    /// for it. The relay sends its hello first thing, so this normally returns
+    /// at once. [`ClientError::RelayUnreachable`] when the channel closed (or
+    /// the time ran out) before a hello arrived.
+    pub fn peer_version(&self, timeout: Duration) -> Result<u16, ClientError> {
+        let deadline = Instant::now() + timeout;
+        let mut version = self.inner.peer_version.lock().unwrap();
+        loop {
+            if let Some(v) = *version {
+                return Ok(v);
+            }
+            let now = Instant::now();
+            if self.inner.closed.load(Ordering::Relaxed) || now >= deadline {
+                return Err(ClientError::RelayUnreachable);
+            }
+            version = self.inner.peer_cv.wait_timeout(version, deadline - now).unwrap().0;
+        }
+    }
+
+    /// Whether the relay speaks the v2 services, from its hello (waiting up to
+    /// [`PEER_HELLO_DEADLINE`] for it).
+    pub fn supports_services(&self) -> Result<bool, ClientError> {
+        Ok(self.peer_version(PEER_HELLO_DEADLINE)? >= RELAY_SERVICES_VERSION)
+    }
+
+    /// Open a logical stream to the relay-side `service` (relay protocol v2)
+    /// and return it as a [`Transport`].
+    ///
+    /// Reads the relay's hello first: a relay older than
+    /// [`RELAY_SERVICES_VERSION`] would end the whole channel on the
+    /// `OpenService` frame, so it is never sent one and this returns
+    /// [`ClientError::RelayServicesUnsupported`] instead.
+    pub fn open_service(&self, service: RelayService) -> Result<RelayStream, ClientError> {
+        let version = self.peer_version(PEER_HELLO_DEADLINE)?;
+        if version < RELAY_SERVICES_VERSION {
+            return Err(ClientError::RelayServicesUnsupported { version });
+        }
+        self.open_stream(StreamKind::Service, |stream| RelayFrame::OpenService {
+            stream,
+            service: service.clone(),
+        })
+    }
+
+    /// Open a [`query`](RelayService::Query) stream and wrap it for
+    /// request/response use.
+    pub fn open_query(&self) -> Result<QueryStream, ClientError> {
+        QueryStream::new(self.open_service(RelayService::Query)?)
+    }
+
+    /// Allocate a stream id, register it, send the `open` frame `frame`
+    /// builds for it, and wait for `Opened` / `OpenError`.
+    fn open_stream(
+        &self,
+        kind: StreamKind,
+        frame: impl FnOnce(u32) -> RelayFrame,
+    ) -> Result<RelayStream, ClientError> {
         let stream = self.inner.next_stream.fetch_add(1, Ordering::Relaxed);
-        let state = Arc::new(StreamState::new(stream));
+        let state = Arc::new(StreamState::new(stream, kind));
         self.inner.streams.lock().unwrap().insert(stream, state.clone());
 
         let (tx, rx) = sync_channel(1);
         self.inner.pending_open.lock().unwrap().insert(stream, tx);
 
-        if let Err(e) = self.inner.send(&RelayFrame::Open {
-            stream,
-            short_id: short_id.to_string(),
-        }) {
+        if let Err(e) = self.inner.send(&frame(stream)) {
             self.inner.streams.lock().unwrap().remove(&stream);
             self.inner.pending_open.lock().unwrap().remove(&stream);
             return Err(e);
@@ -375,15 +486,19 @@ struct RelayStreamWriter {
 
 impl Write for RelayStreamWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        // The connection always hands us one whole encoded session frame per
-        // `write_all`, so one `Data` carries one frame.
+        // A session connection hands us one whole encoded session frame per
+        // `write_all`, so one `Data` normally carries one frame. A write larger
+        // than `DATA_CHUNK` (a big query or control message) goes out in
+        // pieces: `write_all` calls again with the rest, and the far side reads
+        // the stream as bytes.
+        let n = buf.len().min(DATA_CHUNK);
         self.inner
             .send(&RelayFrame::Data {
                 stream: self.stream,
-                bytes: buf.to_vec(),
+                bytes: buf[..n].to_vec(),
             })
             .map_err(io::Error::other)?;
-        Ok(buf.len())
+        Ok(n)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -407,6 +522,45 @@ impl Drop for RelayStreamWriter {
     }
 }
 
+/// A [`query`](RelayService::Query) stream used request/response: each call
+/// writes one `[len: u32 BE][payload]` message and reads the one answer. The
+/// payloads are opaque here (JSON from `shelbi_app::source::wire`).
+pub struct QueryStream {
+    reader: Box<dyn crate::transport::ReadTimeout + Send>,
+    writer: Box<dyn Write + Send>,
+    shutdown: Option<crate::transport::ShutdownHandle>,
+}
+
+impl QueryStream {
+    /// Wrap an open query stream.
+    pub fn new(stream: RelayStream) -> Result<Self, ClientError> {
+        let (reader, writer, shutdown) = Box::new(stream).split()?;
+        Ok(Self {
+            reader,
+            writer,
+            shutdown: Some(shutdown),
+        })
+    }
+
+    /// Send one request payload and wait for its answer. Calls on one stream
+    /// are answered in order; use one stream per concurrent caller.
+    /// [`ClientError::UnexpectedEof`] when the relay closed the stream (or the
+    /// channel went down) first.
+    pub fn call(&mut self, payload: &[u8]) -> Result<Vec<u8>, ClientError> {
+        self.writer.write_all(&services::frame_message(payload)?)?;
+        self.writer.flush()?;
+        services::read_message(&mut self.reader)?.ok_or(ClientError::UnexpectedEof)
+    }
+}
+
+impl Drop for QueryStream {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown();
+        }
+    }
+}
+
 /// Deliver one whole session frame to a stream's reader, honoring backpressure.
 /// Never blocks the demux: on overflow it drops the queue and asks the session
 /// to replay (a fresh `attach`, answered with a `resync`). While that replay is
@@ -414,6 +568,10 @@ impl Drop for RelayStreamWriter {
 /// session applies to a lagging client — so the reader next sees a coherent
 /// snapshot, never a torn mid-drop stream.
 fn deliver(inner: &Arc<Inner>, state: &Arc<StreamState>, bytes: Vec<u8>) {
+    if state.kind == StreamKind::Service {
+        deliver_service(inner, state, bytes);
+        return;
+    }
     let trigger_replay = {
         let mut st = state.inbound.lock().unwrap();
         if st.closed {
@@ -456,6 +614,30 @@ fn deliver(inner: &Arc<Inner>, state: &Arc<StreamState>, bytes: Vec<u8>) {
     }
 }
 
+/// Deliver a service stream's bytes. A service has no replay, so an overflow
+/// (its reader stopped draining) closes the stream: the reader sees EOF once it
+/// drains what is queued, and the relay drops its end. The owner reopens it.
+/// Never blocks the demux.
+fn deliver_service(inner: &Arc<Inner>, state: &Arc<StreamState>, bytes: Vec<u8>) {
+    {
+        let mut st = state.inbound.lock().unwrap();
+        if st.closed {
+            return;
+        }
+        if st.queue.len() < STREAM_QUEUE_LIMIT {
+            st.queue.push_back(bytes);
+            state.cv.notify_one();
+            return;
+        }
+        st.closed = true;
+        state.cv.notify_all();
+    }
+    inner.streams.lock().unwrap().remove(&state.stream);
+    let _ = inner.send(&RelayFrame::Close {
+        stream: state.stream,
+    });
+}
+
 /// The demux thread: read relay frames off the channel and route them.
 fn demux_loop(inner: Arc<Inner>, mut read: Box<dyn Read + Send>) {
     let mut buf: Vec<u8> = Vec::new();
@@ -490,7 +672,11 @@ fn demux_loop(inner: Arc<Inner>, mut read: Box<dyn Read + Send>) {
 
 fn route_relay_frame(inner: &Arc<Inner>, frame: RelayFrame) {
     match frame {
-        RelayFrame::Hello { .. } => {} // diagnostic only
+        RelayFrame::Hello { version } => {
+            // Recorded so `open_service` can tell a v1 relay from a v2 one.
+            *inner.peer_version.lock().unwrap() = Some(version);
+            inner.peer_cv.notify_all();
+        }
         RelayFrame::SessionList { sessions } => {
             if let Some(tx) = inner.pending_list.lock().unwrap().pop_front() {
                 let _ = tx.send(sessions);
@@ -522,7 +708,10 @@ fn route_relay_frame(inner: &Arc<Inner>, frame: RelayFrame) {
             let _ = inner.send(&RelayFrame::Pong);
         }
         // Pong (activity already recorded) and requests the hub never receives.
-        RelayFrame::Pong | RelayFrame::ListSessions | RelayFrame::Open { .. } => {}
+        RelayFrame::Pong
+        | RelayFrame::ListSessions
+        | RelayFrame::Open { .. }
+        | RelayFrame::OpenService { .. } => {}
     }
 }
 
@@ -562,30 +751,66 @@ fn send_out(out: &SharedOut, frame: &RelayFrame) -> io::Result<()> {
     w.flush()
 }
 
-/// One bridged session on the relay: the socket write half for hub→session
-/// bytes. The session→hub forwarder thread owns the read half.
-struct SessionLink {
-    sock_write: std::os::unix::net::UnixStream,
+/// The open streams on the relay, by id.
+type Links = Arc<Mutex<HashMap<u32, services::Link>>>;
+
+/// What a relay serves besides sessions (relay protocol v2). Each is optional:
+/// a stream opened to a service that is not configured is answered with
+/// [`RelayFrame::OpenError`], and the channel stays up.
+#[derive(Clone, Default)]
+pub struct RelayServices {
+    /// Answers the `query` service. The far CLI injects one backed by its
+    /// readers.
+    pub query: Option<QueryHandler>,
+    /// The far daemon's `control.sock`, bridged (filtered) by the `control`
+    /// service. Connected per stream; the relay never starts the daemon.
+    pub control_socket: Option<PathBuf>,
+    /// The far daemon's `hub.sock`, which the `changes` service subscribes on.
+    /// Only the relay's own `subscribe` frame is ever written to it.
+    pub hub_socket: Option<PathBuf>,
 }
 
-/// Run the `shelbi relay` server: bridge the stdio channel (`read`/`write`) to
-/// every session socket under `sessions_root` (`~/.shelbi/sessions/`).
-///
-/// It answers discovery, connects a session socket per `Open`, and forwards
-/// whole frames both ways unchanged. Returns when the channel closes (the SSH
-/// connection dropped, EOF on `read`); the hub then starts a fresh relay. The
-/// relay holds no session state, so there is nothing to clean up but the
-/// in-flight socket connections, which close with it.
+impl std::fmt::Debug for RelayServices {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayServices")
+            .field("query", &self.query.is_some())
+            .field("control_socket", &self.control_socket)
+            .field("hub_socket", &self.hub_socket)
+            .finish()
+    }
+}
+
+/// Run the `shelbi relay` server with sessions only: [`serve_relay_with`] and
+/// no [`RelayServices`].
 pub fn serve_relay(
     read: Box<dyn Read + Send>,
     write: Box<dyn Write + Send>,
     sessions_root: &Path,
 ) -> Result<(), ClientError> {
+    serve_relay_with(read, write, sessions_root, RelayServices::default())
+}
+
+/// Run the `shelbi relay` server: bridge the stdio channel (`read`/`write`) to
+/// every session socket under `sessions_root` (`~/.shelbi/sessions/`), and to
+/// the configured `services`.
+///
+/// It answers discovery, connects a session socket per `Open`, and forwards
+/// whole frames both ways unchanged; an `OpenService` opens one of `services`
+/// (see [`services`]). Returns when the channel closes (the SSH connection
+/// dropped, EOF on `read`); the hub then starts a fresh relay. The relay holds
+/// no session state, so there is nothing to clean up but the in-flight socket
+/// connections, which close with it.
+pub fn serve_relay_with(
+    read: Box<dyn Read + Send>,
+    write: Box<dyn Write + Send>,
+    sessions_root: &Path,
+    services: RelayServices,
+) -> Result<(), ClientError> {
     let out: SharedOut = Arc::new(Mutex::new(write));
-    let links: Arc<Mutex<HashMap<u32, SessionLink>>> = Arc::new(Mutex::new(HashMap::new()));
+    let links: Links = Arc::new(Mutex::new(HashMap::new()));
     let sessions_root = sessions_root.to_path_buf();
 
-    // Announce ourselves (diagnostic).
+    // Announce ourselves: the client reads this to know it may open services.
     send_out(
         &out,
         &RelayFrame::Hello {
@@ -601,7 +826,7 @@ pub fn serve_relay(
             match RelayFrame::decode(&buf) {
                 Ok((frame, consumed)) => {
                     buf.drain(..consumed);
-                    handle_server_frame(frame, &out, &links, &sessions_root);
+                    handle_server_frame(frame, &out, &links, &sessions_root, &services);
                 }
                 Err(ProtoError::Incomplete { .. }) => break,
                 Err(_) => {
@@ -623,8 +848,9 @@ pub fn serve_relay(
 fn handle_server_frame(
     frame: RelayFrame,
     out: &SharedOut,
-    links: &Arc<Mutex<HashMap<u32, SessionLink>>>,
+    links: &Links,
     sessions_root: &Path,
+    services: &RelayServices,
 ) {
     match frame {
         RelayFrame::Hello { .. } => {}
@@ -635,25 +861,29 @@ fn handle_server_frame(
         RelayFrame::Open { stream, short_id } => {
             open_session_stream(stream, &short_id, out, links, sessions_root);
         }
+        RelayFrame::OpenService { stream, service } => {
+            services::open(stream, service, services, out, links);
+        }
         RelayFrame::Data { stream, bytes } => {
-            // hub → session: write the bytes straight to the socket. The session
-            // reassembles whole frames itself, so no splitting is needed here.
+            // hub → far end: the stream's link decides where the bytes go (a
+            // session socket gets them straight; a service filters or drops
+            // them). A link that fails is dropped and the hub told.
             let mut guard = links.lock().unwrap();
             let drop_it = match guard.get_mut(&stream) {
-                Some(link) => link.sock_write.write_all(&bytes).is_err(),
+                Some(link) => link.accept(stream, &bytes, out).is_err(),
                 None => false,
             };
             if drop_it {
-                guard.remove(&stream);
+                if let Some(link) = guard.remove(&stream) {
+                    link.shutdown();
+                }
                 drop(guard);
                 let _ = send_out(out, &RelayFrame::Close { stream });
             }
         }
         RelayFrame::Close { stream } => {
             if let Some(link) = links.lock().unwrap().remove(&stream) {
-                let _ = link
-                    .sock_write
-                    .shutdown(std::net::Shutdown::Both);
+                link.shutdown();
             }
         }
         RelayFrame::Ping => {
@@ -670,7 +900,7 @@ fn open_session_stream(
     stream: u32,
     short_id: &str,
     out: &SharedOut,
-    links: &Arc<Mutex<HashMap<u32, SessionLink>>>,
+    links: &Links,
     sessions_root: &Path,
 ) {
     let sock = sessions_root.join(short_id).join("sock");
@@ -703,7 +933,7 @@ fn open_session_stream(
     links
         .lock()
         .unwrap()
-        .insert(stream, SessionLink { sock_write: conn });
+        .insert(stream, services::Link::Session(conn));
     let _ = send_out(out, &RelayFrame::Opened { stream });
 
     // Forward session → hub: peel whole frames (by the length prefix alone, so
@@ -711,43 +941,66 @@ fn open_session_stream(
     // wrap each in a `Data`.
     let out = out.clone();
     let links = links.clone();
-    std::thread::spawn(move || forward_session_to_hub(stream, read_half, out, links));
+    std::thread::spawn(move || forward_to_hub(stream, read_half, Peel::SessionFrames, out, links));
 }
 
-fn forward_session_to_hub(
+/// How [`forward_to_hub`] cuts what it reads into `Data` frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Peel {
+    /// Whole session frames, one per `Data`: the hub-side demux's drop-to-replay
+    /// needs each `Data` to start at a frame boundary.
+    SessionFrames,
+    /// Bytes as they arrive (a service stream, read as a byte stream).
+    Raw,
+}
+
+fn forward_to_hub(
     stream: u32,
     mut sock_read: std::os::unix::net::UnixStream,
+    peel: Peel,
     out: SharedOut,
-    links: Arc<Mutex<HashMap<u32, SessionLink>>>,
+    links: Links,
 ) {
     let mut buf: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 8192];
     'outer: loop {
-        loop {
-            match frame_boundary(&buf) {
-                Ok(total) => {
-                    let frame: Vec<u8> = buf.drain(..total).collect();
-                    if send_out(&out, &RelayFrame::Data { stream, bytes: frame }).is_err() {
-                        break 'outer;
+        if peel == Peel::SessionFrames {
+            loop {
+                match frame_boundary(&buf) {
+                    Ok(total) => {
+                        let frame: Vec<u8> = buf.drain(..total).collect();
+                        if send_out(&out, &RelayFrame::Data { stream, bytes: frame }).is_err() {
+                            break 'outer;
+                        }
                     }
+                    Err(ProtoError::Incomplete { .. }) => break,
+                    Err(_) => break 'outer, // malformed from the session: stop
                 }
-                Err(ProtoError::Incomplete { .. }) => break,
-                Err(_) => break 'outer, // malformed from the session: stop
             }
         }
         match sock_read.read(&mut chunk) {
             Ok(0) | Err(_) => break,
+            Ok(n) if peel == Peel::Raw => {
+                let bytes = chunk[..n].to_vec();
+                if send_out(&out, &RelayFrame::Data { stream, bytes }).is_err() {
+                    break;
+                }
+            }
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     }
-    // The session closed (or we stopped): tell the hub and forget the link.
-    links.lock().unwrap().remove(&stream);
-    let _ = send_out(&out, &RelayFrame::Close { stream });
+    // The far end closed (or we stopped): tell the hub and forget the link. A
+    // stream the hub already closed is gone from `links`; it needs no `Close`.
+    let known = links.lock().unwrap().remove(&stream);
+    if let Some(link) = known {
+        link.shutdown();
+        let _ = send_out(&out, &RelayFrame::Close { stream });
+    }
 }
 
-fn shutdown_links(links: &Arc<Mutex<HashMap<u32, SessionLink>>>) {
+fn shutdown_links(links: &Links) {
     for (_, link) in links.lock().unwrap().drain() {
-        let _ = link.sock_write.shutdown(std::net::Shutdown::Both);
+        link.shutdown();
     }
 }
 

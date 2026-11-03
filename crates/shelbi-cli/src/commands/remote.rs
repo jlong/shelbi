@@ -192,6 +192,7 @@ mod tests {
                     path: "/srv/web".into(),
                 },
             ],
+            native: None,
         };
         assert_eq!(
             human(&listing),
