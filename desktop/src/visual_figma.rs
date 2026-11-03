@@ -69,7 +69,8 @@
 //! `SHELBI_VISUAL_ONLY=about` renders just those;
 //! `SHELBI_VISUAL_ONLY=workspaces` renders just Settings ▸ Workspaces and its
 //! machine dialogs.
-//! `add-project-*-<theme>.png` are the Add Project wizard's screens 01, 02,
+//! `add-project-*-<theme>.png` are the Add Project wizard's screens 01, the
+//! Agent defaults (`add-project-defaults`), 02,
 //! 03 (`add-project-writing-config`, `-creating-agents`,
 //! `-adding-workflows`) and 04 (`add-project-ready`) at 800 × 580;
 //! `SHELBI_VISUAL_ONLY=add-project` renders just those.
@@ -2244,9 +2245,10 @@ impl Run {
     /// window, over a canned folder check (nothing reads the disk): `add-
     /// project-folder` (no folder yet, Figma 2481:8574), `add-project-
     /// folder-selected` (`~/Projects/my-project`, a Git repository,
-    /// 2481:8810) and `add-project-settings-in-repo` / `-global` (each card
-    /// selected, 2483:8653 / 2483:8897). `SHELBI_VISUAL_ONLY=add-project`
-    /// renders just these.
+    /// 2481:8810), `add-project-defaults` (the Agent defaults, Claude Code on
+    /// its default model, 2720:33054) and `add-project-settings-in-repo` /
+    /// `-global` (each card selected, 2483:8653 / 2483:8897).
+    /// `SHELBI_VISUAL_ONLY=add-project` renders just these.
     fn add_project_windows(&mut self) {
         use crate::views::add_project::{AddProjectView, Engine, SIZE};
         use shelbi_app::add_project_wizard::{FolderCheck, Focus, Origin, Repo};
@@ -2273,13 +2275,16 @@ impl Run {
             create: Arc::new(|_, _, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
             refresh: Arc::new(|| {}),
         };
-        let states: [(&str, Option<ConfigMode>, bool); 4] = [
-            ("add-project-folder", None, false),
-            ("add-project-folder-selected", None, true),
-            ("add-project-settings-in-repo", Some(ConfigMode::InRepo), true),
-            ("add-project-settings-global", Some(ConfigMode::Global), true),
+        // Each state: its name, Continues pressed, the card chosen, whether a
+        // folder is picked.
+        let states: [(&str, usize, Option<ConfigMode>, bool); 5] = [
+            ("add-project-folder", 0, None, false),
+            ("add-project-folder-selected", 0, None, true),
+            ("add-project-defaults", 1, None, true),
+            ("add-project-settings-in-repo", 2, Some(ConfigMode::InRepo), true),
+            ("add-project-settings-global", 2, Some(ConfigMode::Global), true),
         ];
-        for (screen, mode, pick) in states {
+        for (screen, continues, mode, pick) in states {
             let engine = engine.clone();
             let handle = self
                 .cx
@@ -2299,16 +2304,18 @@ impl Run {
                     .unwrap();
                 self.settle_sheet(window);
             }
-            if let Some(mode) = mode {
-                self.cx
-                    .update_window(window, |_, window, cx| {
-                        view.update(cx, |v, cx| {
+            self.cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |v, cx| {
+                        for _ in 0..continues {
                             v.click(Focus::Primary, window, cx);
+                        }
+                        if let Some(mode) = mode {
                             v.click(Focus::Card(mode), window, cx);
-                        })
+                        }
                     })
-                    .unwrap();
-            }
+                })
+                .unwrap();
             self.settle_sheet(window);
             self.settle_sheet(window);
             self.write_sized(window, screen, SIZE.0 as u32);

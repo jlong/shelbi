@@ -144,7 +144,7 @@ pub use agent_workspaces::{
     content_hash, count_agent_skills, default_agent_body, default_agent_settings, is_default_agent,
     legacy_claude_md_path, list_agents, load_agent_manifest, load_agent_settings,
     load_shared_preamble,
-    materialize_default_agents, maybe_emit_claude_md_migration_hint, orchestrator_handoff_path,
+    materialize_default_agents, maybe_emit_claude_md_migration_hint, recommend_runner_for_new_agents, orchestrator_handoff_path,
     reset_claude_md_migration_hint, self_heal_default_agents, self_heal_orchestrator_agent,
     take_orchestrator_handoff, AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill,
     ADVERSARIAL_AGENT,

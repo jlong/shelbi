@@ -38,7 +38,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use shelbi_core::{Error, Result};
+use shelbi_core::{Error, Result, RunnerKind};
 
 use crate::{
     agents_dir, atomic_write, ensure_dir, project_dir, read_state, update_state,
@@ -1149,6 +1149,34 @@ fn write_bundled_agent(project: &str, agent: &BundledAgent) -> Result<()> {
         write_bundled_skill(project, agent.name, skill)?;
     }
     Ok(())
+}
+
+/// Point the shipped agents of a project being created at `runner`: each
+/// default agent whose `agent.yaml` is still exactly the shipped text gets
+/// `preferred_runner: <runner>` in place of `claude`, so every agent the
+/// project doesn't pin runs on the new-project flow's default runner. Any
+/// other `agent.yaml` (edited, or missing) is left alone, so this never
+/// rewrites a file a user wrote. Returns the agents it changed. Only the
+/// project creation engine calls it, for a runner other than Claude Code.
+pub fn recommend_runner_for_new_agents(project: &str, runner: RunnerKind) -> Result<Vec<String>> {
+    let mut changed = Vec::new();
+    if runner == RunnerKind::Claude {
+        return Ok(changed);
+    }
+    for agent in DEFAULT_AGENTS {
+        let path = agent_manifest_path(project, agent.name)?;
+        let shipped = bundled_agent_manifest_yaml(agent);
+        match fs::read_to_string(&path) {
+            Ok(text) if text == shipped => {}
+            _ => continue,
+        }
+        let from = "\npreferred_runner: claude\n";
+        debug_assert_eq!(shipped.matches(from).count(), 1);
+        let text = shipped.replacen(from, &format!("\npreferred_runner: {}\n", runner.as_str()), 1);
+        atomic_write(&path, text.as_bytes())?;
+        changed.push(agent.name.to_string());
+    }
+    Ok(changed)
 }
 
 /// Self-heal seam for the per-agent `agent.yaml` manifest. Existence-guarded,

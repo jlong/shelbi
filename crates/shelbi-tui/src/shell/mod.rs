@@ -3566,8 +3566,8 @@ impl ShellState {
                 self.overlay = None;
                 self.client.focus_main();
             }
-            OverlayEvent::AddProjectSubmit { name, root, mode } => {
-                self.submit_add_project(name, root, mode)
+            OverlayEvent::AddProjectSubmit { name, root, mode, defaults } => {
+                self.submit_add_project(name, root, mode, defaults)
             }
             OverlayEvent::OpenUrl(url) => self.open_url(url),
             OverlayEvent::FeedbackSend(submission) => self.send_feedback(submission),
@@ -3647,13 +3647,13 @@ impl ShellState {
     /// scaffold + switch off the UI thread; on failure, keep the form open with
     /// the inline error so the user can fix the input. Validation itself is
     /// cheap (a slug check, a collision lookup, a path stat) so it runs here.
-    fn submit_add_project(&mut self, name: String, root: String, mode: ConfigMode) {
+    fn submit_add_project(&mut self, name: String, root: String, mode: ConfigMode, defaults: shelbi_core::AgentDefaults) {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         match project_create::validate_add_project(&name, &root, &cwd) {
             Ok(resolved) => {
                 self.overlay = None;
                 self.client.focus_main();
-                self.create_project(resolved, mode);
+                self.create_project(resolved, mode, defaults);
             }
             Err(msg) => {
                 if let Some(ActiveOverlay::AddProject { form }) = self.overlay.as_mut() {
@@ -3665,18 +3665,20 @@ impl ShellState {
     }
 
     /// Scaffold the validated project off the UI thread (file IO can block),
-    /// pinning the `file_system` board the form has no control over. On success
-    /// [`Self::poll_create_job`] switches to it on the UI thread.
-    fn create_project(&mut self, resolved: ResolvedProjectRoot, mode: ConfigMode) {
+    /// pinning the `file_system` board the form has no control over, with the
+    /// agent defaults it chose. On success [`Self::poll_create_job`] switches
+    /// to it on the UI thread.
+    fn create_project(&mut self, resolved: ResolvedProjectRoot, mode: ConfigMode, defaults: shelbi_core::AgentDefaults) {
         let (tx, rx) = std::sync::mpsc::channel();
         let slug = resolved.name.clone();
         if std::thread::Builder::new()
             .name("shelbi-add-project".into())
             .spawn(move || {
-                let outcome = match project_create::scaffold_project(
+                let outcome = match project_create::scaffold_project_with(
                     &resolved,
                     mode,
                     &IssueTrackerConfig::default(),
+                    &defaults,
                     &mut project_create::NullReporter,
                 ) {
                     Ok(()) => CreateOutcome::Created(slug),
@@ -3966,8 +3968,8 @@ impl ShellState {
                 self.spawn_mutation(m, "rejected", "reject failed")
             }
             // The form's submit, wherever it came from: validate, scaffold, switch.
-            Effect::Mutate(Mutation::AddProject { name, root, mode }) => {
-                self.submit_add_project(name, root, mode)
+            Effect::Mutate(Mutation::AddProject { name, root, mode, defaults }) => {
+                self.submit_add_project(name, root, mode, defaults)
             }
             // The board's card mutations. The embedded board sends its own
             // through its move persister; one arriving here (no palette entry

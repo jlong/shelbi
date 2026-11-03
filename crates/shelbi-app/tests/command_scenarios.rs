@@ -648,19 +648,25 @@ fn add_project_collects_the_form_then_mutates() {
     assert_eq!(s.client.overlay(), Some(&Overlay::AddProject));
 
     // The shared form: the path prefills to the working directory; type a
-    // name and submit.
+    // name, Continue (the host validates), choose the agent defaults, then
+    // Continue and Create Project.
     let mut form = add_project::Form::new(Path::new("/src/web"));
     type_into("Web App", |c| {
         form.handle_key(c);
     });
-    assert_eq!(
-        form.handle_key(KeyChord::new(Key::Enter, Mods::NONE)),
-        add_project::Step::Submit
-    );
+    let enter = KeyChord::new(Key::Enter, Mods::NONE);
+    assert_eq!(form.handle_key(enter), add_project::Step::Validate);
+    form.folder_valid();
+    assert_eq!(form.page(), add_project::Page::Defaults);
+    form.select_runner(shelbi_core::RunnerKind::Codex);
+    form.select_model(Some("gpt-5"));
+    assert_eq!(form.handle_key(enter), add_project::Step::Continue);
+    assert_eq!(form.handle_key(enter), add_project::Step::Submit);
     let m = Mutation::AddProject {
         name: form.name().to_string(),
         root: form.root().to_string(),
         mode: form.mode(),
+        defaults: form.defaults(),
     };
     s.run(Effect::Mutate(m.clone())).unwrap();
     assert_eq!(
@@ -669,6 +675,10 @@ fn add_project_collects_the_form_then_mutates() {
             name: "Web App".into(),
             root: "/src/web".into(),
             mode: ConfigMode::Global,
+            defaults: shelbi_core::AgentDefaults {
+                runner: shelbi_core::RunnerKind::Codex,
+                model: Some("gpt-5".into()),
+            },
         })
     );
 }

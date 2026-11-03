@@ -1,9 +1,12 @@
 //! The Add Project wizard's state machine (`dt-add-project-wizard`).
 //!
 //! The desktop app adds a project through a small wizard rather than one
-//! form: screen 01 picks the project's folder (the name is the folder's), and
-//! screen 02 picks where its settings live ([`ConfigMode`]). Create Project
-//! then hands the host one [`CreateRequest`] for
+//! form: screen 01 picks the project's folder (the name is the folder's),
+//! the Agent defaults screen ([`Screen::Defaults`]) picks the runner and
+//! model the project's agents use by default (the shared
+//! [`HarnessPicker`], the orchestrator onboarding's pickers), and screen 02
+//! picks where its settings live ([`ConfigMode`]). Create Project then hands
+//! the host one [`CreateRequest`] for
 //! `shelbi_orchestrator::project_create::add_project`, the engine `shelbi
 //! init` and the TUI's form use, and screen 03 ([`Screen::Creating`]) shows
 //! the engine's progress as a checklist of [`Stage`]s, from the stage events
@@ -30,17 +33,28 @@
 
 use std::path::{Path, PathBuf};
 
-use shelbi_core::{ConfigMode, StatusCategory, Workflow};
+use shelbi_core::{AgentDefaults, ConfigMode, RunnerKind, StatusCategory, Workflow};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
+use shelbi_state::orchestrator_setup::RunnerSetupError;
 
-/// The footer's step count ("Step 1 of 3"): the folder, the settings, the
-/// creation.
+pub use crate::harness_picker::HarnessPicker;
+
+/// The footer's step count ("Step 1 of 3"): the folder, the agent defaults,
+/// the settings.
 pub const STEPS: usize = 3;
 
 /// The title and the line under it, per screen.
 pub const FOLDER_TITLE: &str = "Add project";
 pub const FOLDER_INTRO: &str =
     "Select the folder that contains the project you want to work on with Shelbi.";
+/// The Agent defaults screen (Figma "02 · Agent defaults" 2720:33054).
+pub const DEFAULTS_TITLE: &str = "Agent defaults";
+pub const DEFAULTS_INTRO: &str = "Choose the provider and model that agents should use by default.";
+pub const HARNESS_LABEL: &str = "Default Harness";
+pub const MODEL_LABEL: &str = "Default model";
+/// The helper under both pickers (the frame's, also the orchestrator
+/// onboarding's).
+pub const FIELD_HELP: &str = crate::onboarding::FIELD_HELP;
 pub const SETTINGS_TITLE: &str = "Where should settings live?";
 pub const SETTINGS_INTRO: &str =
     "Choose how Shelbi stores settings, agent instructions, and workflows for this project.";
@@ -83,11 +97,13 @@ pub enum Origin {
     Workspace,
 }
 
-/// The wizard's screens (the Figma frames 01, 02 and 03, then the created
-/// project).
+/// The wizard's screens (the Figma frames 01, Agent defaults, 02 and 03,
+/// then the created project).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Folder,
+    /// The agents' default runner and model.
+    Defaults,
     Settings,
     /// 03: the creation's checklist.
     Creating,
@@ -97,18 +113,19 @@ pub enum Screen {
 }
 
 impl Screen {
-    /// The footer's "Step N of 3".
+    /// The footer's "Step N of 3" (the creation has no footer step).
     pub fn step(self) -> usize {
         match self {
             Screen::Folder => 1,
-            Screen::Settings => 2,
-            Screen::Creating | Screen::Created => 3,
+            Screen::Defaults => 2,
+            Screen::Settings | Screen::Creating | Screen::Created => 3,
         }
     }
 
     pub fn title(self) -> &'static str {
         match self {
             Screen::Folder => FOLDER_TITLE,
+            Screen::Defaults => DEFAULTS_TITLE,
             Screen::Settings => SETTINGS_TITLE,
             Screen::Creating => CREATING_TITLE,
             Screen::Created => CREATED_TITLE,
@@ -387,6 +404,9 @@ pub enum Focus {
     Browse,
     /// Screen 01's name field (shown when the folder's name clashes).
     Name,
+    /// The Agent defaults screen's pickers.
+    Harness,
+    Model,
     /// Screen 02's cards.
     Card(ConfigMode),
     Back,
@@ -401,6 +421,10 @@ pub enum Action {
     /// Open the native folder picker; its answer goes to
     /// [`Wizard::folder_picked`].
     Browse,
+    /// Open (or close) a picker's menu ([`Focus::Harness`] or
+    /// [`Focus::Model`]); its choice goes to [`Wizard::select_runner`] /
+    /// [`Wizard::select_model`].
+    Menu(Focus),
     /// Close the wizard (before Create Project, nothing was written).
     Close,
     /// Run the creation engine for this request (once per press: a running
@@ -427,6 +451,8 @@ pub struct CreateRequest {
     /// The resolved folder.
     pub root: String,
     pub mode: ConfigMode,
+    /// The Agent defaults screen's runner and model.
+    pub defaults: AgentDefaults,
     pub attempt: Attempt,
 }
 
@@ -459,6 +485,10 @@ pub struct Wizard {
     /// The name typed after a clash; `None` uses the folder's name.
     name: Option<String>,
     mode: ConfigMode,
+    /// The Agent defaults screen's choice.
+    picker: HarnessPicker,
+    /// Why the Agent defaults screen's Continue was refused.
+    defaults_error: Option<String>,
     /// The latest check, and the text it was for.
     check: Option<(CheckKey, FolderCheck)>,
     /// The text a check is running for.
@@ -484,6 +514,8 @@ impl Wizard {
             chosen: false,
             name: None,
             mode: ConfigMode::Global,
+            picker: HarnessPicker::default(),
+            defaults_error: None,
             check: None,
             in_flight: None,
             progress: Progress::default(),
@@ -521,6 +553,65 @@ impl Wizard {
 
     pub fn mode(&self) -> ConfigMode {
         self.mode
+    }
+
+    /// The Agent defaults screen's choice (Claude Code on its default model
+    /// until changed).
+    pub fn picker(&self) -> &HarnessPicker {
+        &self.picker
+    }
+
+    /// The Agent defaults screen's line under Default model in place of its
+    /// helper: why it's disabled.
+    pub fn model_note(&self) -> Option<String> {
+        (!self.picker.takes_model()).then(|| crate::harness_picker::no_model_note(self.picker.runner()))
+    }
+
+    /// Why the Agent defaults screen's Continue was refused.
+    pub fn defaults_error(&self) -> Option<&str> {
+        self.defaults_error.as_deref()
+    }
+
+    /// Choose the default runner (a Harness row). Its model starts on the
+    /// runner's default.
+    pub fn select_runner(&mut self, kind: RunnerKind) {
+        if self.screen == Screen::Defaults {
+            self.picker.set_runner(kind, None);
+            self.defaults_error = None;
+            self.settle_focus();
+        }
+    }
+
+    /// Choose the default model (a Default model row, or a typed name;
+    /// `None` and blank are the runner's default).
+    pub fn select_model(&mut self, model: Option<&str>) {
+        if self.screen == Screen::Defaults {
+            self.picker.set_model(model);
+            self.defaults_error = None;
+        }
+    }
+
+    /// ← → / ↑ ↓ on a focused picker: its previous or next choice, in place.
+    fn step_choice(&mut self, picker: Focus, forward: bool) {
+        match picker {
+            Focus::Harness => {
+                let rows = self.picker.harnesses();
+                let at = rows.iter().position(|h| h.selected).unwrap_or(0);
+                let next = if forward { (at + 1).min(rows.len() - 1) } else { at.saturating_sub(1) };
+                self.select_runner(rows[next].kind);
+            }
+            Focus::Model => {
+                let rows = self.picker.models();
+                if rows.is_empty() {
+                    return;
+                }
+                let at = rows.iter().position(|o| o.selected).unwrap_or(0);
+                let next = if forward { (at + 1).min(rows.len() - 1) } else { at.saturating_sub(1) };
+                let model = rows[next].model.clone();
+                self.select_model(model.as_deref());
+            }
+            _ => {}
+        }
     }
 
     /// Screen 03: how `stage`'s row shows.
@@ -639,8 +730,9 @@ impl Wizard {
     /// Continue / Create Project can be pressed.
     pub fn primary_enabled(&self) -> bool {
         match self.screen {
-            Screen::Folder => self.check().is_some_and(FolderCheck::usable),
-            Screen::Settings => self.check().is_some_and(FolderCheck::usable),
+            Screen::Folder | Screen::Defaults | Screen::Settings => {
+                self.check().is_some_and(FolderCheck::usable)
+            }
             // Try Again, once a creation has failed.
             Screen::Creating => !self.progress.running && self.progress.failed.is_some(),
             Screen::Created => self.created.is_some() && !self.opening,
@@ -651,7 +743,7 @@ impl Wizard {
     pub fn back_enabled(&self) -> bool {
         match self.screen {
             Screen::Folder => self.origin == Origin::Workspace,
-            Screen::Settings => true,
+            Screen::Defaults | Screen::Settings => true,
             Screen::Creating | Screen::Created => false,
         }
     }
@@ -696,6 +788,12 @@ impl Wizard {
                 order.push(Focus::Browse);
                 if self.name.is_some() {
                     order.push(Focus::Name);
+                }
+            }
+            Screen::Defaults => {
+                order.push(Focus::Harness);
+                if self.picker.takes_model() {
+                    order.push(Focus::Model);
                 }
             }
             Screen::Settings => {
@@ -753,16 +851,24 @@ impl Wizard {
         }
     }
 
-    /// Back: screen 02 returns to the chosen folder; screen 01 closes the
-    /// wizard when it was opened from a project window.
+    /// Back: screen 02 returns to the Agent defaults, they to the chosen
+    /// folder (every choice kept); screen 01 closes the wizard when it was
+    /// opened from a project window.
     pub fn back(&mut self) -> Action {
         if !self.back_enabled() {
             return Action::Stay;
         }
         match self.screen {
             Screen::Folder => Action::Close,
-            Screen::Settings => {
+            Screen::Defaults => {
                 self.screen = Screen::Folder;
+                self.defaults_error = None;
+                self.focus = Focus::Primary;
+                self.settle_focus();
+                Action::Stay
+            }
+            Screen::Settings => {
+                self.screen = Screen::Defaults;
                 self.focus = Focus::Primary;
                 self.settle_focus();
                 Action::Stay
@@ -782,6 +888,18 @@ impl Wizard {
         }
         match self.screen {
             Screen::Folder => {
+                self.screen = Screen::Defaults;
+                self.focus = Focus::Harness;
+                Action::Stay
+            }
+            Screen::Defaults => {
+                // A new project declares no generic runner, so it can't
+                // default to one (the orchestrator onboarding's refusal).
+                if self.picker.runner() == RunnerKind::Generic {
+                    self.defaults_error = Some(RunnerSetupError::NotDeclared(RunnerKind::Generic).to_string());
+                    return Action::Stay;
+                }
+                self.defaults_error = None;
                 self.screen = Screen::Settings;
                 self.focus = Focus::Card(self.mode);
                 Action::Stay
@@ -794,6 +912,7 @@ impl Wizard {
                     name: check.name.clone().unwrap_or_default(),
                     root: check.path.display().to_string(),
                     mode: self.mode,
+                    defaults: self.picker.defaults(),
                     attempt: Attempt::New,
                 };
                 self.screen = Screen::Creating;
@@ -905,6 +1024,10 @@ impl Wizard {
         self.focus = focus;
         match focus {
             Focus::Browse if self.screen == Screen::Folder => Action::Browse,
+            Focus::Harness if self.screen == Screen::Defaults => Action::Menu(Focus::Harness),
+            Focus::Model if self.screen == Screen::Defaults && self.picker.takes_model() => {
+                Action::Menu(Focus::Model)
+            }
             Focus::Card(mode) => {
                 self.select_mode(mode);
                 Action::Stay
@@ -945,6 +1068,13 @@ impl Wizard {
                 }
             }
             Key::Char(' ') if bare && !in_text => self.activate(self.focus),
+            Key::Up | Key::Down | Key::Left | Key::Right
+                if bare && !in_text && matches!(self.focus, Focus::Harness | Focus::Model) =>
+            {
+                let forward = matches!(chord.code, Key::Down | Key::Right);
+                self.step_choice(self.focus, forward);
+                Action::Stay
+            }
             Key::Up | Key::Down | Key::Left | Key::Right if bare && !in_text => {
                 if let Focus::Card(_) = self.focus {
                     let other = match self.mode {
@@ -1166,12 +1296,106 @@ mod tests {
         assert_eq!(w.name(), None);
     }
 
+    /// Through the Agent defaults screen, keeping its choice.
+    fn to_settings(w: &mut Wizard) {
+        assert_eq!(w.primary(), Action::Stay);
+        assert_eq!(w.screen(), Screen::Defaults);
+        assert_eq!(w.primary(), Action::Stay);
+        assert_eq!(w.screen(), Screen::Settings);
+    }
+
+    #[test]
+    fn the_flow_is_folder_then_agent_defaults_then_settings() {
+        let mut w = chosen(Origin::Workspace);
+        assert_eq!(step_label(w.screen()), "Step 1 of 3");
+        assert_eq!(w.handle_key(key(Key::Enter), false), Action::Stay);
+        assert_eq!(w.screen(), Screen::Defaults);
+        assert_eq!(w.screen().title(), "Agent defaults");
+        assert_eq!(step_label(w.screen()), "Step 2 of 3");
+        assert_eq!(w.focus(), Focus::Harness);
+        assert_eq!(w.tab_order(), [Focus::Harness, Focus::Model, Focus::Back, Focus::Primary]);
+        // Claude Code on its default model until changed.
+        assert_eq!(w.picker().runner(), RunnerKind::Claude);
+        assert_eq!(w.picker().model(), None);
+        assert_eq!(w.model_note(), None);
+
+        assert_eq!(w.handle_key(key(Key::Enter), false), Action::Stay);
+        assert_eq!(w.screen(), Screen::Settings);
+        assert_eq!(step_label(w.screen()), "Step 3 of 3");
+        assert_eq!(w.back(), Action::Stay);
+        assert_eq!(w.screen(), Screen::Defaults);
+        assert_eq!(w.back(), Action::Stay);
+        assert_eq!(w.screen(), Screen::Folder);
+    }
+
+    #[test]
+    fn agent_defaults_pick_by_click_or_arrow_and_survive_back_and_continue() {
+        let mut w = chosen(Origin::Workspace);
+        w.primary();
+        assert_eq!(w.activate(Focus::Harness), Action::Menu(Focus::Harness), "a click opens its menu");
+        w.select_runner(RunnerKind::Codex);
+        assert_eq!(w.picker().runner(), RunnerKind::Codex);
+        assert_eq!(w.picker().model(), None, "a new runner starts on its default");
+        assert_eq!(w.activate(Focus::Model), Action::Menu(Focus::Model));
+        w.select_model(Some("gpt-5-codex"));
+
+        // Arrows on a focused picker step its choice in place.
+        w.set_focus(Focus::Model);
+        w.handle_key(key(Key::Up), false);
+        assert_eq!(w.picker().model(), Some("gpt-5"));
+        w.set_focus(Focus::Harness);
+        w.handle_key(key(Key::Left), false);
+        assert_eq!(w.picker().runner(), RunnerKind::Claude);
+        w.handle_key(key(Key::Right), false);
+        assert_eq!(w.picker().runner(), RunnerKind::Codex);
+        w.set_focus(Focus::Model);
+        w.handle_key(key(Key::Down), false);
+        w.handle_key(key(Key::Down), false);
+        assert_eq!(w.picker().model(), Some("gpt-5-codex"));
+        w.handle_key(key(Key::Down), false);
+        assert_eq!(w.picker().model(), Some("gpt-5-codex"), "it stops at the last");
+
+        // Back to the folder and forward again keeps the choice; so does a
+        // trip back from the settings.
+        w.back();
+        assert_eq!(w.screen(), Screen::Folder);
+        w.primary();
+        assert_eq!((w.picker().runner(), w.picker().model()), (RunnerKind::Codex, Some("gpt-5-codex")));
+        w.primary();
+        w.select_mode(ConfigMode::InRepo);
+        w.back();
+        assert_eq!((w.picker().runner(), w.picker().model()), (RunnerKind::Codex, Some("gpt-5-codex")));
+        w.primary();
+        assert_eq!(w.mode(), ConfigMode::InRepo);
+        let Action::Create(request) = w.primary() else { panic!("Create Project") };
+        assert_eq!(
+            request.defaults,
+            AgentDefaults { runner: RunnerKind::Codex, model: Some("gpt-5-codex".into()) }
+        );
+    }
+
+    #[test]
+    fn a_generic_default_is_refused_with_the_reason() {
+        let mut w = chosen(Origin::Workspace);
+        w.primary();
+        w.select_runner(RunnerKind::Generic);
+        assert_eq!(w.tab_order(), [Focus::Harness, Focus::Back, Focus::Primary], "no model to pick");
+        assert_eq!(w.model_note().as_deref(), Some("Generic runners take no model."));
+        assert_eq!(w.activate(Focus::Model), Action::Stay);
+        assert_eq!(w.primary(), Action::Stay);
+        assert_eq!(w.screen(), Screen::Defaults);
+        assert!(w.defaults_error().is_some_and(|e| e.contains("generic")), "{:?}", w.defaults_error());
+        w.select_runner(RunnerKind::Claude);
+        assert_eq!(w.defaults_error(), None, "a new choice clears it");
+        w.primary();
+        assert_eq!(w.screen(), Screen::Settings);
+    }
+
     #[test]
     fn settings_cards_select_and_persist_through_back_and_continue() {
         let mut w = chosen(Origin::Workspace);
-        assert_eq!(w.handle_key(key(Key::Enter), false), Action::Stay);
-        assert_eq!(w.screen(), Screen::Settings);
-        assert_eq!(step_label(w.screen()), "Step 2 of 3");
+        to_settings(&mut w);
+        assert_eq!(step_label(w.screen()), "Step 3 of 3");
         assert_eq!(w.mode(), ConfigMode::Global);
         assert_eq!(w.focus(), Focus::Card(ConfigMode::Global));
 
@@ -1181,12 +1405,12 @@ mod tests {
         assert_eq!(w.focus(), Focus::Card(ConfigMode::InRepo));
 
         assert_eq!(w.back(), Action::Stay);
+        assert_eq!(w.back(), Action::Stay);
         assert_eq!(w.screen(), Screen::Folder);
         assert_eq!(w.path(), "~/Projects/acme", "the folder survives Back");
         assert!(w.primary_enabled());
 
-        w.primary();
-        assert_eq!(w.screen(), Screen::Settings);
+        to_settings(&mut w);
         assert_eq!(w.mode(), ConfigMode::InRepo, "the card survives Back / Continue");
 
         // A click on the other card.
@@ -1197,7 +1421,7 @@ mod tests {
     #[test]
     fn storage_paths_come_from_the_folder_and_the_shelbi_home() {
         let mut w = chosen(Origin::Workspace);
-        w.primary();
+        to_settings(&mut w);
         assert_eq!(w.storage_path(ConfigMode::InRepo).as_deref(), Some("acme/.shelbi"));
         assert_eq!(
             w.storage_path(ConfigMode::Global).as_deref(),
@@ -1208,12 +1432,13 @@ mod tests {
     #[test]
     fn create_is_requested_once() {
         let mut w = chosen(Origin::Workspace);
-        w.primary();
+        to_settings(&mut w);
         w.select_mode(ConfigMode::InRepo);
         let request = CreateRequest {
             name: "acme".into(),
             root: "/Users/me/Projects/acme".into(),
             mode: ConfigMode::InRepo,
+            defaults: AgentDefaults::default(),
             attempt: Attempt::New,
         };
         assert_eq!(w.handle_key(key(Key::Enter), false), Action::Create(request));
@@ -1231,7 +1456,7 @@ mod tests {
     /// The wizard on screen 03, its engine running.
     fn creating() -> Wizard {
         let mut w = chosen(Origin::Workspace);
-        w.primary();
+        to_settings(&mut w);
         assert!(matches!(w.primary(), Action::Create(_)));
         w
     }
@@ -1387,6 +1612,7 @@ mod tests {
             name: "acme".into(),
             root: "/Users/me/Projects/acme".into(),
             mode: ConfigMode::Global,
+            defaults: AgentDefaults::default(),
             attempt: Attempt::Retry,
         };
         assert_eq!(w.handle_key(key(Key::Enter), false), Action::Create(again));

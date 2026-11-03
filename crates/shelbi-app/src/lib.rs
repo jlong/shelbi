@@ -79,6 +79,7 @@ pub mod exec;
 pub mod exec_daemon;
 pub mod issue_edit;
 pub mod feedback;
+pub mod harness_picker;
 pub mod launch;
 pub mod layout_sub;
 pub mod licenses;
