@@ -330,6 +330,19 @@ fn connect_local() -> Result<ControlClient, ExecError> {
     ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION).map_err(|e| ExecError::Backend(e.to_string()))
 }
 
+/// This machine's daemon past the control hello, when it is running: `None`
+/// when nothing answers its control socket (nothing is started).
+pub(crate) fn connect_running() -> Option<ControlClient> {
+    let sock = shelbi_state::control_socket_path().ok()?;
+    ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION).ok()
+}
+
+/// The out-of-date refusal for a request on `client`: `Some` when its
+/// daemon runs another version than this client, which must relaunch first.
+pub(crate) fn out_of_date(client: &ControlClient) -> Option<ExecError> {
+    out_of_date_gate(&client.daemon_version, shelbi_state::CLIENT_VERSION)
+}
+
 /// [`execute_mutation_expecting`] over an already connected control client
 /// (a remote window's, on its host's `control` service).
 pub(crate) fn mutate_over(

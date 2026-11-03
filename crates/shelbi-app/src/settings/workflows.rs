@@ -18,6 +18,8 @@ use std::collections::VecDeque;
 use std::path::Path;
 
 use shelbi_core::StatusCategory;
+
+use super::store::ConfigStore;
 use shelbi_state::workflow_config::{
     ConfigError, StatusSummary, UnreadableWorkflow, WorkflowConfig, WorkflowSummary,
 };
@@ -164,12 +166,14 @@ pub struct Committed {
     pub dropped_comments: Vec<String>,
 }
 
-/// Apply `edit` to `config` and save it, off the UI thread. A refusal or a
-/// failed save writes nothing; the model is reloaded from disk then, so the
-/// page shows the files as they are (a conflict means they changed under
-/// it).
-pub fn commit(project: &str, config: &WorkflowConfig, edit: Edit) -> Committed {
-    let saved = edit.apply(config).and_then(|next| next.save());
+/// Apply `edit` to `config` and save it through `store` (the window's
+/// project, wherever it lives), off the UI thread. A refusal or a failed
+/// save writes nothing; the model is read back then, so the page shows the
+/// files as they are (a conflict means they changed under it).
+pub fn commit(store: &dyn ConfigStore, config: &WorkflowConfig, edit: Edit) -> Committed {
+    let saved = edit
+        .apply(config)
+        .and_then(|next| super::store::save_workflows(store, &next));
     match saved {
         Ok(saved) => Committed {
             dropped_comments: saved
@@ -189,7 +193,7 @@ pub fn commit(project: &str, config: &WorkflowConfig, edit: Edit) -> Committed {
         },
         Err(e) => Committed {
             edit,
-            config: WorkflowConfig::load(project).ok(),
+            config: store.workflows().ok(),
             error: Some(sentence(&e.to_string())),
             dropped_comments: Vec::new(),
         },

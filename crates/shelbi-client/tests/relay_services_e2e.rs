@@ -508,3 +508,95 @@ fn a_v1_relay_is_detected_from_its_hello_and_never_sent_open_service() {
     );
     assert!(relay.is_reachable(), "the v1 relay kept the channel up");
 }
+
+// --- settings writes and put -----------------------------------------------
+
+#[test]
+fn a_settings_write_for_another_project_is_refused_by_the_relay() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("control.sock");
+    let _daemon = fake_daemon(&sock);
+    let relay = start_relay(
+        dir.path(),
+        RelayServices {
+            control_socket: Some(sock),
+            ..RelayServices::default()
+        },
+    );
+    let stream = relay
+        .open_service(RelayService::Control {
+            project: "mine".into(),
+        })
+        .expect("open control");
+    let mut halves = split(stream);
+    let mut buf = Vec::new();
+    send(
+        &mut halves,
+        &ClientMsg::SaveConfig(control::SaveConfigRequest {
+            request_id: 7,
+            project: "theirs".into(),
+            surface: "workflows".into(),
+            plan: serde_json::json!({}),
+        }),
+    );
+    let (id, why) = refusal(read_server_msg(&mut halves, &mut buf));
+    assert_eq!(id, 7);
+    assert!(why.contains("theirs"), "{why}");
+    send(
+        &mut halves,
+        &ClientMsg::AppRequest(control::AppRequest {
+            request_id: 8,
+            project: "theirs".into(),
+            body: serde_json::json!({}),
+        }),
+    );
+    assert_eq!(refusal(read_server_msg(&mut halves, &mut buf)).0, 8);
+}
+
+#[test]
+fn put_saves_a_dropped_file_far_side_and_answers_its_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let drops = dir.path().join("drops");
+    let relay = start_relay(
+        dir.path(),
+        RelayServices {
+            put_dir: Some(drops.clone()),
+            ..RelayServices::default()
+        },
+    );
+    // Bigger than one relay data chunk, so it crosses in pieces.
+    let bytes: Vec<u8> = (0..DATA_CHUNK + 4096).map(|i| (i % 251) as u8).collect();
+    let stream = relay
+        .open_service(RelayService::Put {
+            file: "../../Screen Shot.png".into(),
+        })
+        .expect("open put");
+    let far = PathBuf::from(shelbi_client::put_file(stream, &bytes).unwrap());
+    assert!(far.starts_with(&drops), "{}", far.display());
+    assert_eq!(far.file_name().unwrap(), "Screen Shot.png", "only the base name is kept");
+    assert_eq!(std::fs::read(&far).unwrap(), bytes);
+
+    // Two drops of one name never collide.
+    let again = relay.open_service(RelayService::Put { file: "Screen Shot.png".into() }).unwrap();
+    let second = PathBuf::from(shelbi_client::put_file(again, b"two").unwrap());
+    assert_ne!(second, far);
+    assert_eq!(std::fs::read(&far).unwrap(), bytes, "the first stays");
+
+    // A relay with nowhere to put files says so at open.
+    let bare = start_relay(dir.path(), RelayServices::default());
+    let err = bare
+        .open_service(RelayService::Put { file: "x".into() })
+        .err()
+        .expect("no put service");
+    assert!(matches!(&err, ClientError::Relay(m) if m.contains("put")), "{err:?}");
+}
+
+#[test]
+fn put_file_names_keep_only_a_plain_base_name() {
+    use shelbi_client::relay::services::put_file_name;
+    assert_eq!(put_file_name("/Users/me/Desktop/shot.png"), "shot.png");
+    assert_eq!(put_file_name("..\\..\\evil.txt"), "evil.txt");
+    assert_eq!(put_file_name(".."), "drop");
+    assert_eq!(put_file_name(".hidden"), "hidden");
+    assert_eq!(put_file_name("a\nb"), "ab");
+}

@@ -79,7 +79,7 @@ fn typed(page: &mut WorkflowsPage, text: &str) {
 fn drain(page: &mut WorkflowsPage) -> usize {
     let mut saved = 0;
     while let Some((ticket, project, config, edit)) = page.begin_commit() {
-        let done = commit(&project, &config, edit);
+        let done = commit(&shelbi_app::settings::store::Disk { project: project.clone() }, &config, edit);
         if page.committed(&ticket, done) {
             saved += 1;
         }
@@ -490,7 +490,7 @@ fn edits_made_while_one_saves_queue_and_all_land() {
     assert!(page.begin_commit().is_none(), "one save at a time");
     assert!(render(&mut page, 100, 40).contains("saving… (2 more queued)"));
     let (ticket, project, config, edit) = first;
-    assert!(page.committed(&ticket, commit(&project, &config, edit)));
+    assert!(page.committed(&ticket, commit(&shelbi_app::settings::store::Disk { project: project.clone() }, &config, edit)));
     assert_eq!(drain(&mut page), 2);
     let back = WorkflowConfig::load(PROJECT).unwrap();
     assert_eq!(back.status("todo").unwrap().name, "To Do!");
@@ -509,7 +509,7 @@ fn a_save_for_a_project_no_longer_shown_is_dropped() {
     // The user switches project while it saves.
     page.project_changed();
     let ticket2 = page.begin_load(Some("beta"), false).unwrap();
-    let done = commit(&project, &config, edit);
+    let done = commit(&shelbi_app::settings::store::Disk { project: project.clone() }, &config, edit);
     assert!(!page.committed(&ticket, done), "dropped");
     assert_eq!(page.dropped(), 1);
     assert!(page.begin_commit().is_none(), "nothing of the old project's queue runs");

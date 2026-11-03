@@ -122,7 +122,7 @@ use crate::agent_workspaces::{
     SHARED_PREAMBLE_FILE,
 };
 use crate::workflow_config::WorkflowFile;
-use crate::{yaml_edit, AgentDivergence};
+use crate::{config_write, yaml_edit, AgentDivergence};
 
 const MANIFEST_FILE: &str = "agent.yaml";
 const INSTRUCTIONS_FILE: &str = "instructions.md";
@@ -130,9 +130,6 @@ const SKILLS_DIR: &str = "skills";
 const SKILL_FILE: &str = "SKILL.md";
 /// An agent directory's files, by `/`-separated path relative to it.
 type Files = BTreeMap<String, Vec<u8>>;
-
-/// Deeper than any real skill tree; stops a symlink loop.
-const MAX_DEPTH: usize = 16;
 
 /// Why an edit, load or save was refused.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -175,9 +172,24 @@ pub enum AgentError {
     /// written; reload and redo the edit.
     #[error("changed on disk since it was loaded: {}", display_paths(.0))]
     Conflict(Vec<PathBuf>),
+    /// Files changed on `host` (a project on another machine) since the
+    /// model was loaded. Nothing was written there.
+    #[error("changed on {host} since it was loaded: {}", display_paths(.paths))]
+    ChangedOn { host: String, paths: Vec<PathBuf> },
     /// A file couldn't be read, parsed or written.
     #[error("{path}: {message}")]
     File { path: PathBuf, message: String },
+}
+
+impl From<config_write::WriteError> for AgentError {
+    fn from(e: config_write::WriteError) -> Self {
+        match e {
+            config_write::WriteError::Changed(paths) => AgentError::Conflict(paths),
+            config_write::WriteError::Refused { path, message } | config_write::WriteError::Io { path, message } => {
+                AgentError::File { path, message }
+            }
+        }
+    }
 }
 
 fn display_paths(paths: &[PathBuf]) -> String {
@@ -496,6 +508,27 @@ pub struct Saved {
     /// Comments an `agent.yaml` lost: lines whose entry the edit removed, or
     /// the whole file's when its layout couldn't be followed.
     pub dropped_comments: Vec<(PathBuf, Vec<String>)>,
+}
+
+/// A save, planned ([`AgentsConfig::save_plan`]) and not yet written.
+#[derive(Debug, Clone)]
+pub struct SavePlan {
+    pub plan: config_write::Plan,
+    pub written: Vec<PathBuf>,
+    pub removed: Vec<PathBuf>,
+    pub dropped_comments: Vec<(PathBuf, Vec<String>)>,
+}
+
+impl SavePlan {
+    /// What the save did, once its plan ran and `config` was read back.
+    pub fn saved(self, config: AgentsConfig) -> Saved {
+        Saved {
+            config,
+            written: self.written,
+            removed: self.removed,
+            dropped_comments: self.dropped_comments,
+        }
+    }
 }
 
 /// The editable agents and shared instructions of one project.
@@ -1114,70 +1147,91 @@ impl AgentsConfig {
     /// preamble) changed on disk since the load, or a new agent's directory
     /// appeared.
     pub fn save(&self) -> Result<Saved> {
-        let plan = self.plan()?;
-        let mut conflicts = Vec::new();
-        for op in &plan {
+        let plan = self.save_plan()?;
+        config_write::check_and_run(&plan.plan).map_err(AgentError::from)?;
+        Ok(plan.saved(AgentsConfig::load(&self.project)?))
+    }
+
+    /// What [`save`](Self::save) does, as a [`config_write::Plan`]: each
+    /// agent directory (and the preamble) it changes as loaded, by content
+    /// hash, and each new directory absent; then removals, renames through
+    /// a parking name (so a swap or chain works), new directories, edits and
+    /// the preamble. A window on a project on another machine sends this to
+    /// that machine's daemon instead of writing it here.
+    pub fn save_plan(&self) -> Result<SavePlan> {
+        let ops = self.plan()?;
+        let mut plan = config_write::Plan::new(config_write::Surface::Agents);
+        let loaded_hash = |dir: &Path| {
+            let name = file_name(dir);
+            Some(config_write::dir_hash(&self.disk.agents[&name].files))
+        };
+        for op in &ops {
             match op {
                 Op::Remove { dir, .. } | Op::Rename { from: dir, .. } | Op::Edit { dir, .. } => {
-                    let name = file_name(dir);
-                    if snapshot(dir).ok().as_ref() != Some(&self.disk.agents[&name].files) {
-                        conflicts.push(dir.clone());
-                    }
+                    plan.checks.push(config_write::Check::Dir {
+                        path: dir.clone(),
+                        hash: loaded_hash(dir),
+                    });
                 }
                 Op::Create { .. } | Op::Preamble { .. } => {}
             }
         }
         // A new or renamed-to directory must not exist, unless the save
         // first moves or removes what's there.
-        let freed: Vec<&PathBuf> = plan
+        let freed: Vec<&PathBuf> = ops
             .iter()
             .filter_map(|op| match op {
                 Op::Remove { dir, .. } | Op::Rename { from: dir, .. } => Some(dir),
                 _ => None,
             })
             .collect();
-        for op in &plan {
+        for op in &ops {
             let target = match op {
                 Op::Create { dir, .. } | Op::Rename { to: dir, .. } => dir,
                 _ => continue,
             };
-            if target.exists() && !freed.contains(&target) {
-                conflicts.push(target.clone());
+            if !freed.contains(&target) {
+                plan.checks.push(config_write::Check::Dir {
+                    path: target.clone(),
+                    hash: None,
+                });
             }
         }
-        if plan.iter().any(|op| matches!(op, Op::Preamble { .. }))
-            && read_optional(&self.disk.preamble_path)? != self.disk.preamble
-        {
-            conflicts.push(self.disk.preamble_path.clone());
-        }
-        conflicts.dedup();
-        if !conflicts.is_empty() {
-            return Err(AgentError::Conflict(conflicts));
+        if ops.iter().any(|op| matches!(op, Op::Preamble { .. })) {
+            plan.checks.push(config_write::Check::File {
+                path: self.disk.preamble_path.clone(),
+                hash: self
+                    .disk
+                    .preamble
+                    .as_deref()
+                    .map(|t| config_write::content_hash(t.as_bytes())),
+            });
         }
 
         let mut written = Vec::new();
         let mut removed = Vec::new();
         let mut dropped_comments = Vec::new();
-        // Removals, then renames through a parking name (so a swap or chain
-        // works), then new directories, then edits.
-        for op in &plan {
+        for op in &ops {
             if let Op::Remove { dir } = op {
-                fs::remove_dir_all(dir).map_err(|e| file_err(dir, e))?;
+                plan.ops.push(config_write::Op::RemoveDir { path: dir.clone() });
                 removed.push(dir.clone());
             }
         }
         let mut parked = Vec::new();
-        for op in &plan {
+        for op in &ops {
             if let Op::Rename { from, to } = op {
                 let park = self.disk.dir.join(format!(".renaming-{}", file_name(from)));
-                fs::rename(from, &park).map_err(|e| file_err(from, e))?;
+                plan.ops.push(config_write::Op::Rename {
+                    from: from.clone(),
+                    to: park.clone(),
+                });
                 parked.push((park, to.clone()));
             }
         }
         for (park, to) in parked {
-            fs::rename(&park, &to).map_err(|e| file_err(&to, e))?;
+            plan.ops.push(config_write::Op::Rename { from: park, to });
         }
-        for op in &plan {
+        for op in &ops {
             match op {
                 Op::Create {
                     dir,
@@ -1190,20 +1244,27 @@ impl AgentsConfig {
                     comments,
                     ..
                 } => {
-                    crate::ensure_dir(&dir.join(SKILLS_DIR)).map_err(|e| file_err(dir, e))?;
+                    plan.ops.push(config_write::Op::EnsureDir {
+                        path: dir.join(SKILLS_DIR),
+                    });
                     for (rel, change) in files {
                         let path = dir.join(rel);
                         match change {
                             Some(bytes) => {
-                                if let Some(parent) = path.parent() {
-                                    crate::ensure_dir(parent).map_err(|e| file_err(parent, e))?;
-                                }
-                                crate::atomic_write(&path, bytes)
-                                    .map_err(|e| file_err(&path, e))?;
+                                plan.ops.push(config_write::Op::Write {
+                                    path: path.clone(),
+                                    contents: config_write::Contents::from_bytes(bytes.clone()),
+                                });
                                 written.push(path);
                             }
                             None => {
-                                remove_file_and_empty_parents(&path, dir)?;
+                                plan.ops.push(config_write::Op::RemoveFile {
+                                    path: path.clone(),
+                                    prune: Some(config_write::Prune {
+                                        root: dir.clone(),
+                                        keep: vec![dir.join(SKILLS_DIR)],
+                                    }),
+                                });
                                 removed.push(path);
                             }
                         }
@@ -1213,18 +1274,18 @@ impl AgentsConfig {
                     }
                 }
                 Op::Preamble { text } => {
-                    let path = &self.disk.preamble_path;
-                    if let Some(parent) = path.parent() {
-                        crate::ensure_dir(parent).map_err(|e| file_err(parent, e))?;
-                    }
-                    crate::atomic_write(path, text.as_bytes()).map_err(|e| file_err(path, e))?;
-                    written.push(path.clone());
+                    let path = self.disk.preamble_path.clone();
+                    plan.ops.push(config_write::Op::Write {
+                        path: path.clone(),
+                        contents: config_write::Contents::Text(text.clone()),
+                    });
+                    written.push(path);
                 }
                 Op::Remove { .. } | Op::Rename { .. } => {}
             }
         }
-        Ok(Saved {
-            config: AgentsConfig::load(&self.project)?,
+        Ok(SavePlan {
+            plan,
             written,
             removed,
             dropped_comments,
@@ -1616,60 +1677,10 @@ fn pins_from(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Every file under `dir`, by `/`-separated relative path, reading through
-/// symlinks. Empty when `dir` doesn't exist.
+/// Every file under `dir`, by `/`-separated relative path, following
+/// symlinks ([`config_write::snapshot`]). Empty when `dir` doesn't exist.
 fn snapshot(dir: &Path) -> Result<Files> {
-    let mut out = BTreeMap::new();
-    if dir.is_dir() {
-        walk(dir, "", 0, &mut out)?;
-    }
-    Ok(out)
-}
-
-fn walk(dir: &Path, prefix: &str, depth: usize, out: &mut Files) -> Result<()> {
-    if depth > MAX_DEPTH {
-        return Err(file_err(dir, "is nested too deeply (a symlink loop?)"));
-    }
-    for entry in fs::read_dir(dir).map_err(|e| file_err(dir, e))? {
-        let entry = entry.map_err(|e| file_err(dir, e))?;
-        let path = entry.path();
-        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-            continue;
-        };
-        let rel = format!("{prefix}{name}");
-        // A dangling symlink has nothing to read; skip it like the mount
-        // would fail to.
-        let Ok(meta) = fs::metadata(&path) else {
-            continue;
-        };
-        if meta.is_dir() {
-            walk(&path, &format!("{rel}/"), depth + 1, out)?;
-        } else {
-            out.insert(rel, fs::read(&path).map_err(|e| file_err(&path, e))?);
-        }
-    }
-    Ok(())
-}
-
-/// Remove `path`, then any directories it leaves empty, up to `root`.
-fn remove_file_and_empty_parents(path: &Path, root: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(file_err(path, e)),
-    }
-    let skills = root.join(SKILLS_DIR);
-    let mut dir = path.parent();
-    while let Some(d) = dir {
-        if d == root || d == skills || !d.starts_with(root) {
-            break;
-        }
-        if fs::remove_dir(d).is_err() {
-            break;
-        }
-        dir = d.parent();
-    }
-    Ok(())
+    config_write::snapshot(dir).map_err(|e| file_err(dir, e))
 }
 
 /// A skill name the runner accepts: lowercase letters, digits and `-`,

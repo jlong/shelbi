@@ -1407,7 +1407,7 @@ mod tests {
         }
 
         fn commit(&mut self, job: CommitJob) {
-            let done = commit(&job.project, &job.config, job.edit);
+            let done = commit(&shelbi_app::settings::store::Disk { project: job.project.clone() }, &job.config, job.edit);
             let (next, action) = self.s.agents_committed(job.id, done);
             if let Some(next) = next {
                 self.commit(next);

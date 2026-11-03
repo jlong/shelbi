@@ -59,6 +59,7 @@ use crate::command::EditItem;
 use crate::exec::{ExecError, ExecOutcome, Mutation};
 use crate::layout_sub::LayoutSubscription;
 use crate::session::Connector;
+use crate::settings::store::WriteFailure;
 use crate::settings::summary::ProjectSummary;
 use crate::settings::workflow_editor::ProjectGit;
 use crate::settings::workspaces::PoolIndex;
@@ -478,6 +479,76 @@ impl ProjectLink {
                 let mut client = Self::far_control(&**relay, &self.key.name)?;
                 crate::exec_daemon::review_session_over(&mut client, &self.key.name, task, op, on_line)
             }
+        }
+    }
+
+    /// Write a config save planned by Settings (`SaveConfig`): the project's
+    /// daemon checks each file is as the plan read it and writes the plan,
+    /// or refuses it whole. A local project's daemon when it's running (with
+    /// none, nothing else writes through it, and the plan is written here);
+    /// a remote project's far daemon, whose refusal names the host.
+    /// Blocking.
+    pub fn save_config(&self, plan: &shelbi_state::config_write::Plan) -> Result<(), WriteFailure> {
+        match &self.relay {
+            None => crate::settings::store::save_here(&self.key.name, plan),
+            Some(relay) => {
+                let host = crate::remote_window::bare_host(relay.host()).to_string();
+                let mut client = Self::far_control(&**relay, &self.key.name)
+                    .map_err(|e| WriteFailure::Failed(e.to_string()))?;
+                crate::settings::store::send_save(&mut client, &self.key.name, plan, Some(host))
+            }
+        }
+    }
+
+    /// Run one of the app's requests on a remote project's far daemon
+    /// ([`crate::far`]): a workspace or machine change, a machine check, an
+    /// editor session. `Err` for a local link (its client runs these
+    /// itself) and when the far daemon can't be asked. Blocking.
+    pub fn far_request(&self, request: &crate::far::Request) -> Result<crate::far::Reply, String> {
+        let relay = self.relay.as_ref().ok_or_else(|| "not a project on another machine".to_string())?;
+        let host = relay.host().to_string();
+        let mut client = Self::far_control(&**relay, &self.key.name).map_err(|e| e.to_string())?;
+        let request = shelbi_proto::control::AppRequest {
+            request_id: 1,
+            project: self.key.name.clone(),
+            body: serde_json::to_value(request).map_err(|e| e.to_string())?,
+        };
+        let body = client.app_request(&request).map_err(|e| format!("{host}: {e}"))?;
+        serde_json::from_value(body).map_err(|e| format!("{host} answered something this build can't read: {e}"))
+    }
+
+    /// Save `bytes` as `file` in a fresh directory under the far machine's
+    /// temp directory (the relay's `put`), for a remote project, and answer
+    /// its far path. Blocking.
+    pub fn put_file(&self, file: &str, bytes: &[u8]) -> Result<String, String> {
+        let relay = self.relay.as_ref().ok_or_else(|| "not a project on another machine".to_string())?;
+        let host = relay.host().to_string();
+        let stream = relay
+            .open_service(shelbi_proto::RelayService::Put { file: file.to_string() })
+            .map_err(|e| format!("{host}: {e}"))?;
+        shelbi_client::put_file(stream, bytes).map_err(|e| format!("{host}: {e}"))
+    }
+
+    /// Start an editor session on the far machine for `file` (the far
+    /// `$EDITOR`, in a terminal session there), for a remote project, and
+    /// answer the session's name for [`ProjectLink::attach_named`].
+    /// Blocking.
+    pub fn open_far_editor(&self, file: crate::far::FarFile) -> Result<String, String> {
+        let key = crate::far::fresh_editor_key();
+        match self.far_request(&crate::far::Request::OpenEditor { key, file })? {
+            crate::far::Reply::Editor(result) => result,
+            other => Err(format!("the far daemon answered something else ({other:?})")),
+        }
+    }
+
+    /// Attach to the session named `name` on a remote project's host (an
+    /// editor session [`ProjectLink::open_far_editor`] started). Blocking.
+    pub fn attach_named(&self, name: &str) -> Result<crate::session::Connected, crate::session::ConnectFailure> {
+        match &self.relay {
+            Some(relay) => crate::session::remote::attach_named_over(&**relay, name),
+            None => Err(crate::session::ConnectFailure::Message(format!(
+                "`{name}` isn't a session on another machine"
+            ))),
         }
     }
 

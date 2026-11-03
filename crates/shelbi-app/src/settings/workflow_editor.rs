@@ -51,6 +51,7 @@ use shelbi_core::{
 };
 use shelbi_state::workflow_config::{ConfigError, Saved, WorkflowConfig};
 
+use super::store::{save_workflows, ConfigStore};
 use super::workflows::sentence;
 use super::LeaveGuard;
 
@@ -483,38 +484,53 @@ pub struct SaveJob {
     rename: Option<String>,
 }
 
+impl SaveJob {
+    /// The project the save writes.
+    pub fn project(&self) -> &str {
+        self.config.project()
+    }
+}
+
 /// What a save did: the model as saved and the workflow's name, or the error
 /// and where it shows.
 pub type SaveOutcome = Result<(Saved, String), (Field, String)>;
 
-/// Rename (when the name changed) and save, off the UI thread.
-pub fn run_save(job: SaveJob) -> SaveOutcome {
+/// Rename (when the name changed) and save through `store`, off the UI
+/// thread.
+pub fn run_save(job: SaveJob, store: &dyn ConfigStore) -> SaveOutcome {
     let mut config = job.config;
     let mut name = job.name;
     if let Some(new) = job.rename {
         config = config.rename_workflow(&name, &new).map_err(|e| (Field::Name, message(&e)))?;
         name = new;
     }
-    let saved = config.save().map_err(|e| (Field::Save, message(&e)))?;
+    let saved = save_workflows(store, &config).map_err(|e| (Field::Save, message(&e)))?;
     Ok((saved, name))
 }
 
-/// Copy workflow `name` (as saved) as `copy` and save it, off the UI thread.
-pub fn run_duplicate(base: WorkflowConfig, name: &str, copy: &str) -> Result<WorkflowConfig, String> {
+/// Copy workflow `name` (as saved) as `copy` and save it through `store`,
+/// off the UI thread.
+pub fn run_duplicate(base: WorkflowConfig, name: &str, copy: &str, store: &dyn ConfigStore) -> Result<WorkflowConfig, String> {
     base.duplicate_workflow(name, copy)
-        .and_then(|c| c.save())
+        .and_then(|c| save_workflows(store, &c))
         .map(|s| s.config)
         .map_err(|e| message(&e))
 }
 
-/// Delete workflow `name` and save, off the UI thread (it reads the board).
-pub fn run_delete(base: WorkflowConfig, name: &str) -> Result<(), String> {
-    base.delete_workflow(name).and_then(|c| c.save()).map(|_| ()).map_err(|e| message(&e))
+/// Delete workflow `name` and save through `store`, off the UI thread (it
+/// reads the board).
+pub fn run_delete(base: WorkflowConfig, name: &str, store: &dyn ConfigStore) -> Result<(), String> {
+    base.delete_workflow(name)
+        .and_then(|c| save_workflows(store, &c))
+        .map(|_| ())
+        .map_err(|e| message(&e))
 }
 
 fn message(e: &ConfigError) -> String {
     match e {
-        ConfigError::Conflict(_) => format!("{} Discard to reload them.", sentence(&e.to_string())),
+        ConfigError::Conflict(_) | ConfigError::ChangedOn { .. } => {
+            format!("{} Discard to reload them.", sentence(&e.to_string()))
+        }
         e => sentence(&e.to_string()),
     }
 }
@@ -1083,7 +1099,7 @@ impl EditorState {
                 then
             }
             Err((field, e)) => {
-                self.stale = e.starts_with("Changed on disk");
+                self.stale = e.starts_with("Changed on ");
                 self.set_error(field, e);
                 self.guard.forget_save();
                 None

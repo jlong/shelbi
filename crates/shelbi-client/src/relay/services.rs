@@ -20,6 +20,11 @@
 //!   down. Nothing the client writes on the stream ever reaches `hub.sock`, so
 //!   a remote client cannot inject worker events.
 //!
+//! - **`put`**: one file a remote window drops on a far terminal. The client
+//!   writes its bytes as one framed message; the relay saves them under a
+//!   fresh directory in [`RelayServices::put_dir`] and answers the far path,
+//!   which the window pastes. Capped at [`MAX_PUT_LEN`].
+//!
 //! None of them starts the far daemon: `control` and `changes` connect to its
 //! sockets and fail the open with [`RelayFrame::OpenError`] when it is not
 //! running.
@@ -44,6 +49,9 @@ use crate::error::ClientError;
 /// `shelbi_app::source::wire` defines them, including which reply is the
 /// last.
 pub type QueryHandler = Arc<dyn Fn(&[u8], &mut dyn FnMut(Vec<u8>)) + Send + Sync>;
+
+/// The largest file the `put` service takes.
+pub const MAX_PUT_LEN: usize = 64 * 1024 * 1024;
 
 /// Why the relay refuses a control message from a remote window, or `None`
 /// when it may be forwarded to the far daemon. `project` is the window's own
@@ -74,6 +82,16 @@ pub fn control_refusal(msg: &ClientMsg, project: &str) -> Option<(u64, String)> 
             req.request_id,
             why(&format!("Changing project `{}` from a window on `{project}`", req.project)),
         )),
+        // Settings writes and the app's requests are the window's own
+        // project's.
+        ClientMsg::SaveConfig(r) if r.project != project => Some((
+            r.request_id,
+            why(&format!("Changing project `{}`'s settings from a window on `{project}`", r.project)),
+        )),
+        ClientMsg::AppRequest(r) if r.project != project => Some((
+            r.request_id,
+            why(&format!("Changing project `{}` from a window on `{project}`", r.project)),
+        )),
         ClientMsg::Hello { .. }
         | ClientMsg::Subscribe { .. }
         | ClientMsg::Mutate(_)
@@ -82,7 +100,9 @@ pub fn control_refusal(msg: &ClientMsg, project: &str) -> Option<(u64, String)> 
         | ClientMsg::WorkspaceSession(_)
         | ClientMsg::ListClients { .. }
         | ClientMsg::DetachClients { .. }
-        | ClientMsg::WriteState(_) => None,
+        | ClientMsg::WriteState(_)
+        | ClientMsg::SaveConfig(_)
+        | ClientMsg::AppRequest(_) => None,
     }
 }
 
@@ -158,6 +178,8 @@ pub(crate) enum Link {
     Changes(UnixStream),
     /// The query worker's inbox.
     Query(Sender<Vec<u8>>),
+    /// The `put` worker's inbox.
+    Put(Sender<Vec<u8>>),
 }
 
 impl Link {
@@ -169,9 +191,9 @@ impl Link {
             Link::Control(link) => link.accept(stream, bytes, out),
             // One way: the client never writes to hub.sock.
             Link::Changes(_) => Ok(()),
-            Link::Query(inbox) => inbox
+            Link::Query(inbox) | Link::Put(inbox) => inbox
                 .send(bytes.to_vec())
-                .map_err(|_| io::Error::other("query worker stopped")),
+                .map_err(|_| io::Error::other("worker stopped")),
         }
     }
 
@@ -184,7 +206,7 @@ impl Link {
             Link::Control(link) => {
                 let _ = link.sock.shutdown(std::net::Shutdown::Both);
             }
-            Link::Query(_) => {}
+            Link::Query(_) | Link::Put(_) => {}
         }
     }
 }
@@ -239,6 +261,7 @@ pub(crate) fn open(
         RelayService::Query => open_query(stream, services, out, links),
         RelayService::Control { project } => open_control(stream, project, services, links),
         RelayService::Changes { project } => open_changes(stream, &project, services, links),
+        RelayService::Put { file } => open_put(stream, &file, services, out, links),
         RelayService::Unknown => Err("unknown relay service".to_string()),
     };
     match opened {
@@ -295,6 +318,91 @@ fn open_changes(
         .map_err(|e| format!("subscribe: {e}"))?;
     links.lock().unwrap().insert(stream, Link::Changes(sock));
     Ok(Some(read))
+}
+
+/// A name `put` may save a dropped file as: `file`'s last component, with
+/// nothing that could climb or hide it; `drop` when nothing is left.
+pub fn put_file_name(file: &str) -> String {
+    let base = file.rsplit(['/', '\\']).next().unwrap_or_default();
+    let clean: String = base.chars().filter(|c| !c.is_control()).collect();
+    let clean = clean.trim().trim_start_matches('.').to_string();
+    if clean.is_empty() {
+        "drop".to_string()
+    } else {
+        clean
+    }
+}
+
+/// A fresh, private directory under `root` for one dropped file.
+fn fresh_put_dir(root: &std::path::Path) -> io::Result<std::path::PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(root)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let dir = root.join(format!(
+        "{:x}-{:x}-{}",
+        std::process::id(),
+        nanos,
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
+}
+
+fn open_put(
+    stream: u32,
+    file: &str,
+    services: &RelayServices,
+    out: &SharedOut,
+    links: &Links,
+) -> Result<Option<UnixStream>, String> {
+    let root = services
+        .put_dir
+        .clone()
+        .ok_or_else(|| "the put service isn't available on this relay".to_string())?;
+    let name = put_file_name(file);
+    let (inbox, chunks) = channel::<Vec<u8>>();
+    let out = out.clone();
+    let worker_links = links.clone();
+    std::thread::spawn(move || {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut want: Option<usize> = None;
+        while let Ok(bytes) = chunks.recv() {
+            buf.extend_from_slice(&bytes);
+            if want.is_none() && buf.len() >= 4 {
+                let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+                if len > MAX_PUT_LEN {
+                    break;
+                }
+                want = Some(len);
+            }
+            if want.is_some_and(|len| buf.len() >= 4 + len) {
+                break;
+            }
+        }
+        let saved = match want {
+            Some(len) if buf.len() >= 4 + len => fresh_put_dir(&root).and_then(|dir| {
+                let path = dir.join(&name);
+                std::fs::write(&path, &buf[4..4 + len]).map(|_| path)
+            }),
+            _ => Err(io::Error::other("the file didn't arrive whole")),
+        };
+        // The answer: the far path, or nothing (the client reads the close).
+        if let Ok(path) = saved {
+            if let Ok(framed) = frame_message(path.to_string_lossy().as_bytes()) {
+                let _ = send_out(&out, &RelayFrame::Data { stream, bytes: framed });
+            }
+        }
+        if worker_links.lock().unwrap().remove(&stream).is_some() {
+            let _ = send_out(&out, &RelayFrame::Close { stream });
+        }
+    });
+    links.lock().unwrap().insert(stream, Link::Put(inbox));
+    Ok(None)
 }
 
 fn open_query(

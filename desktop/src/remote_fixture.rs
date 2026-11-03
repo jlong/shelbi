@@ -9,7 +9,12 @@
 //! real daemon would (the store write, then a `Changed` note to every
 //! subscriber), recording each mutation it saw. A project-state write it
 //! makes with the real daemon's own function
-//! (`shelbi_orchestrator::state_write::apply`) and records too. Nothing reaches the real
+//! (`shelbi_orchestrator::state_write::apply`) and records too. A config save
+//! it writes with the real `config_write::apply` (so a changed file is
+//! refused as the real one refuses it); an app request it answers with the
+//! real `shelbi_orchestrator::far::answer_with` over recording fakes (no SSH,
+//! no session spawned). The relay's `put` saves under the fixture's
+//! directory. Nothing reaches the real
 //! `~/.shelbi`, the real hub or a network; both "sides" share the temp home,
 //! as one process.
 
@@ -40,6 +45,14 @@ pub const USER: &str = "jlong";
 /// One mutation the fake far daemon took: the issue and what it was asked.
 pub type Taken = (String, MutationKind);
 
+/// The app requests the fake far daemon answered, and the editor sessions
+/// it was asked to spawn (name, directory, command).
+#[derive(Default)]
+pub struct FarAsked {
+    pub requests: Vec<shelbi_app::far::Request>,
+    pub editors: Vec<(String, PathBuf, Vec<String>)>,
+}
+
 pub struct FarHost {
     _home: Home,
     dir: PathBuf,
@@ -49,6 +62,8 @@ pub struct FarHost {
     pub writes: Arc<Mutex<Vec<StateWrite>>>,
     /// The far daemon's change subscribers (for a pushed `Changed`).
     subscribers: Arc<Mutex<Vec<UnixStream>>>,
+    /// The app requests the far daemon answered.
+    pub asked: Arc<Mutex<FarAsked>>,
     /// The host's link, already up, over the in-process relay.
     pub link: Arc<HostLink>,
     pub remote: Arc<FakeRemote>,
@@ -110,12 +125,15 @@ impl FarHost {
         let taken: Arc<Mutex<Vec<Taken>>> = Arc::default();
         let writes: Arc<Mutex<Vec<StateWrite>>> = Arc::default();
         let subscribers: Arc<Mutex<Vec<UnixStream>>> = Arc::default();
+        let asked: Arc<Mutex<FarAsked>> = Arc::default();
         serve_hub(UnixListener::bind(dir.join("hub.sock")).unwrap());
         serve_daemon(
             UnixListener::bind(dir.join("control.sock")).unwrap(),
             Took {
                 taken: taken.clone(),
                 writes: writes.clone(),
+                services: far_services(asked.clone()),
+                asked: asked.clone(),
             },
             subscribers.clone(),
         );
@@ -130,9 +148,15 @@ impl FarHost {
             taken,
             writes,
             subscribers,
+            asked,
             link,
             remote,
         }
+    }
+
+    /// Where the relay's `put` saves dropped files.
+    pub fn drops(&self) -> PathBuf {
+        self.dir.join("drops")
     }
 
     /// The far host's listing, as the Connect dialog's probe reads it.
@@ -167,6 +191,7 @@ fn relay(dir: &std::path::Path) -> ChannelLink {
         query: Some(shelbi_orchestrator::source::QueryAnswers::default().handler()),
         hub_socket: Some(dir.join("hub.sock")),
         control_socket: Some(dir.join("control.sock")),
+        put_dir: Some(dir.join("drops")),
     };
     let root = dir.join("sessions");
     std::thread::spawn(move || {
@@ -188,11 +213,59 @@ fn serve_hub(listener: UnixListener) {
     });
 }
 
+/// The far side's app request services: the machine and workspace changes
+/// answer as the real ones would for the fixture's machine, a check is
+/// ready, an editor session is recorded rather than spawned.
+fn far_services(asked: Arc<Mutex<FarAsked>>) -> shelbi_orchestrator::far::FarServices {
+    use shelbi_app::settings::machine_check::{samples, CheckOutcome, ReadinessService};
+    use shelbi_app::settings::machine_form::MachineService;
+    use shelbi_app::settings::workspace_form::PoolService;
+    use shelbi_core::pool::{MachineChange, PoolError};
+    let machine = |fields: &shelbi_core::pool::MachineFields| MachineChange {
+        machine: shelbi_core::Machine {
+            name: fields.name.clone(),
+            kind: fields.kind,
+            host: fields.host.clone(),
+            work_dir: PathBuf::from(&fields.work_dir),
+            tags: fields.tags.clone(),
+            forward: None,
+        },
+        previous_name: None,
+        workspaces: Vec::new(),
+    };
+    shelbi_orchestrator::far::FarServices {
+        pool: PoolService {
+            add: Arc::new(|_, _| Err(PoolError::Unsafe("not in the fixture".into()))),
+            update: Arc::new(|_, _| Err(PoolError::Unsafe("not in the fixture".into()))),
+            remove: Arc::new(|_, _| Err(PoolError::Unsafe("not in the fixture".into()))),
+        },
+        machines: MachineService {
+            add: Arc::new(move |_, fields| Ok(machine(fields))),
+            update: Arc::new(move |_, req| Ok(machine(&req.fields))),
+        },
+        readiness: ReadinessService {
+            check: Arc::new(|_, _| CheckOutcome::Checked(samples::ready())),
+            record: Arc::new(|_| {}),
+        },
+        spawn_editor: Arc::new(move |name, cwd, argv| {
+            asked
+                .lock()
+                .unwrap()
+                .editors
+                .push((name.to_string(), cwd.to_path_buf(), argv));
+            Ok(())
+        }),
+    }
+}
+
 /// What the far daemon records.
 #[derive(Clone)]
 struct Took {
     taken: Arc<Mutex<Vec<Taken>>>,
     writes: Arc<Mutex<Vec<StateWrite>>>,
+    /// Answers app requests (and records what they asked).
+    services: shelbi_orchestrator::far::FarServices,
+    asked: Arc<Mutex<FarAsked>>,
 }
 
 /// The far daemon: one thread per connection.
@@ -246,6 +319,35 @@ fn serve_connection(mut stream: UnixStream, took: &Took, subscribers: &Arc<Mutex
                         request_id: req.request_id,
                         error: MutationError::Backend { message },
                     },
+                })
+            }
+            ClientMsg::SaveConfig(req) => {
+                use shelbi_state::config_write::{self, WriteError};
+                let plan: config_write::Plan = serde_json::from_value(req.plan).unwrap();
+                Some(match config_write::apply(&req.project, &plan) {
+                    Ok(()) => ServerMsg::Done {
+                        request_id: req.request_id,
+                        state: None,
+                    },
+                    Err(WriteError::Changed(paths)) => ServerMsg::Failed {
+                        request_id: req.request_id,
+                        error: control::MutationError::ConfigChanged {
+                            paths: paths.iter().map(|p| p.display().to_string()).collect(),
+                        },
+                    },
+                    Err(e) => ServerMsg::Failed {
+                        request_id: req.request_id,
+                        error: control::MutationError::Backend { message: e.to_string() },
+                    },
+                })
+            }
+            ClientMsg::AppRequest(req) => {
+                let request: shelbi_app::far::Request = serde_json::from_value(req.body).unwrap();
+                took.asked.lock().unwrap().requests.push(request.clone());
+                let reply = shelbi_orchestrator::far::answer_with(&took.services, &req.project, request);
+                Some(ServerMsg::Reply {
+                    request_id: req.request_id,
+                    body: serde_json::to_value(reply).unwrap(),
                 })
             }
             _ => None,

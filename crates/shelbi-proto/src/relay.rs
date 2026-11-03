@@ -147,6 +147,11 @@ pub struct RelaySession {
 /// - [`Changes`](RelayService::Changes): the relay subscribes to the far
 ///   `hub.sock` for `project` itself and forwards the notification lines
 ///   down. One way: nothing the client writes reaches `hub.sock`.
+/// - [`Put`](RelayService::Put): a file dropped on a far terminal. The
+///   client writes its bytes as one message framed `[len: u32 BE][bytes]`;
+///   the relay saves them as `file` in a fresh directory under the far
+///   machine's temp directory and answers one framed message, the file's
+///   far path (UTF-8), then closes the stream.
 ///
 /// On the wire it is `{"name": "<service>", ...}`. A name this build does not
 /// know decodes as [`Unknown`](RelayService::Unknown), which the relay answers
@@ -166,6 +171,13 @@ pub enum RelayService {
         /// The project to subscribe to.
         project: String,
     },
+    /// Save one file the client sends in the far temp directory and answer
+    /// its path.
+    Put {
+        /// The file's name (its base name is kept; anything else is
+        /// dropped).
+        file: String,
+    },
     /// A service this build does not know (a newer client's).
     #[serde(other)]
     Unknown,
@@ -178,6 +190,7 @@ impl RelayService {
             RelayService::Query => "query",
             RelayService::Control { .. } => "control",
             RelayService::Changes { .. } => "changes",
+            RelayService::Put { .. } => "put",
             RelayService::Unknown => "unknown",
         }
     }
@@ -512,6 +525,10 @@ mod tests {
         assert_eq!(
             json(&RelayService::Changes { project: "p".into() }),
             r#"{"name":"changes","project":"p"}"#
+        );
+        assert_eq!(
+            json(&RelayService::Put { file: "shot.png".into() }),
+            r#"{"name":"put","file":"shot.png"}"#
         );
         for s in [
             RelayService::Query,

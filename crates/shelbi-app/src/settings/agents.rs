@@ -20,6 +20,8 @@
 use std::collections::VecDeque;
 
 use shelbi_core::{RunnerKind, StatusCategory};
+
+use super::store::ConfigStore;
 use shelbi_state::agents_config::{AgentSummary, AgentsConfig, Provenance};
 
 /// `text` as a sentence: its first letter capitalized (the model's errors
@@ -131,10 +133,10 @@ impl Committed {
 /// failed save writes nothing; the model is reloaded from disk then, so the
 /// page shows the files as they are (a conflict means they changed under
 /// it).
-pub fn commit(project: &str, config: &AgentsConfig, edit: Edit) -> Committed {
+pub fn commit(store: &dyn ConfigStore, config: &AgentsConfig, edit: Edit) -> Committed {
     let saved = edit
         .apply(config)
-        .and_then(|next| next.save().map_err(|e| e.to_string()));
+        .and_then(|next| super::store::save_agents(store, &next).map_err(|e| e.to_string()));
     match saved {
         Ok(saved) => Committed {
             dropped_comments: saved
@@ -151,7 +153,7 @@ pub fn commit(project: &str, config: &AgentsConfig, edit: Edit) -> Committed {
         },
         Err(e) => Committed {
             edit,
-            config: AgentsConfig::load(project).ok(),
+            config: store.agents().ok(),
             error: Some(sentence(&e)),
             dropped_comments: Vec::new(),
         },
@@ -780,7 +782,7 @@ mod tests {
     fn make(state: &mut AgentsState, edit: Edit) {
         let mut job = state.request(edit);
         while let Some((config, edit)) = job {
-            let done = commit(PROJECT, &config, edit);
+            let done = commit(&crate::settings::store::Disk { project: PROJECT.into() }, &config, edit);
             job = state.committed(done);
         }
     }
@@ -945,9 +947,9 @@ mod tests {
         let mut state = loaded();
         let (config, first) = state.request(Edit::CreateAgent { name: "a".into() }).unwrap();
         assert!(state.request(Edit::CreateAgent { name: "b".into() }).is_none());
-        let (config2, second) = state.committed(commit(PROJECT, &config, first)).expect("the queued one");
+        let (config2, second) = state.committed(commit(&crate::settings::store::Disk { project: PROJECT.into() }, &config, first)).expect("the queued one");
         assert!(config2.agent("a").is_some(), "builds on the first save");
-        assert!(state.committed(commit(PROJECT, &config2, second)).is_none());
+        assert!(state.committed(commit(&crate::settings::store::Disk { project: PROJECT.into() }, &config2, second)).is_none());
         let back = AgentsConfig::load(PROJECT).unwrap();
         assert!(back.agent("a").is_some() && back.agent("b").is_some());
     }

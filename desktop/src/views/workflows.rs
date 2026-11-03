@@ -126,6 +126,8 @@ pub struct WorkflowsPage {
     state: WorkflowsState,
     /// The window's project, read through its source.
     source: Arc<dyn ProjectSource>,
+    /// The window's project, saved through it (wherever it lives).
+    handle: ProjectHandle,
     /// Each status's name field, by id.
     names: HashMap<String, (Entity<InputState>, Subscription)>,
     /// The new row's name field (a workflow's or a status's).
@@ -166,6 +168,7 @@ impl WorkflowsPage {
         let mut page = WorkflowsPage {
             state: WorkflowsState::new(project),
             source: handle.source.clone(),
+            handle: handle.clone(),
             names: HashMap::new(),
             draft_input,
             menu: None,
@@ -273,33 +276,18 @@ impl WorkflowsPage {
     /// Make `edit` and save it (after the save in flight, if any).
     fn request(&mut self, edit: Edit, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
-        if self.read_only(cx) {
-            return;
-        }
         if let Some(job) = self.state.request(edit) {
             self.start(job, window, cx);
         }
         cx.notify();
     }
 
-    /// A remote window's project: its settings are read-only for now (P8),
-    /// so a change shows why under the page's header and writes nothing.
-    fn read_only(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(host) = self.source.key().host() else {
-            return false;
-        };
-        self.state
-            .set_error(Target::Page, shelbi_app::remote_window::settings_read_only(host));
-        cx.notify();
-        true
-    }
-
     /// Save one edit off the UI thread; when it lands, start the next.
     fn start(&mut self, (config, edit): (WorkflowConfig, Edit), window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.state.project().to_string();
+        let store = self.handle.clone();
         let save = cx
             .background_executor()
-            .spawn(async move { commit(&project, &config, edit) });
+            .spawn(async move { commit(&store, &config, edit) });
         cx.spawn_in(window, async move |this, cx| {
             let done = save.await;
             this.update_in(cx, |this, window, cx| this.committed(done, window, cx)).ok();
@@ -395,6 +383,17 @@ impl WorkflowsPage {
         }
     }
 
+    /// Open a far file in an editor session on the far machine (a remote
+    /// window's Edit YAML); an error shows at `target`. The files are read
+    /// again when the window comes back to the front.
+    fn open_far(&mut self, file: shelbi_app::far::FarFile, label: String, target: Target, cx: &mut Context<Self>) {
+        self.reload_on_return = true;
+        super::far_editor::open_from(&self.handle.link, file, label, cx, move |this: &mut Self, e, cx| {
+            this.state.set_error(target, e);
+            cx.notify();
+        });
+    }
+
     fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
         self.menu = if self.menu.as_ref() == Some(&menu) { None } else { Some(menu) };
         cx.notify();
@@ -406,6 +405,11 @@ impl WorkflowsPage {
         let Some(path) = self.state.config().map(|c| c.statuses_path().to_path_buf()) else {
             return;
         };
+        if self.handle.link.is_remote() {
+            // The far daemon writes the shipped catalog first, there.
+            self.open_far(shelbi_app::far::FarFile::Statuses, "statuses.yaml".into(), Target::Page, cx);
+            return;
+        }
         let project = self.state.project().to_string();
         let prepare = move |path: &Path| prepare_statuses_yaml(&project, path);
         self.open_yaml(path, Target::Page, prepare, window, cx);
@@ -435,8 +439,10 @@ impl WorkflowsPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // The file is on the far machine.
-        if self.read_only(cx) {
+        if self.handle.link.is_remote() {
+            let file = shelbi_app::far::FarFile::path(path.to_string_lossy());
+            let label = super::far_editor::label_of(&path.to_string_lossy());
+            self.open_far(file, label, target, cx);
             return;
         }
         self.reload_on_return = true;

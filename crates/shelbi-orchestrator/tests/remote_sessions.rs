@@ -525,3 +525,104 @@ fn the_orchestrator_title_comes_over_the_link() {
     until("the link to notice", || (!link.is_up()).then_some(()));
     assert_eq!(project.orchestrator_title(), None, "a dropped link has no title to give");
 }
+
+/// One control frame off `stream`.
+fn read_msg(stream: &mut UnixStream, buf: &mut Vec<u8>) -> ClientMsg {
+    loop {
+        match control::decode::<ClientMsg>(buf) {
+            Ok((msg, used)) => {
+                buf.drain(..used);
+                return msg;
+            }
+            Err(shelbi_proto::ProtoError::Incomplete { .. }) => {
+                let mut chunk = [0u8; 4096];
+                let n = stream.read(&mut chunk).unwrap();
+                assert!(n > 0, "the link hung up mid-frame");
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Err(e) => panic!("bad control frame: {e}"),
+        }
+    }
+}
+
+#[test]
+fn edit_starts_a_far_editor_session_the_window_attaches_to_by_name() {
+    use shelbi_app::far::{FarFile, Request};
+    let mut far = Far::new();
+    let control = far.control_socket();
+    let link = far.link();
+    let connector = Arc::new(RemoteSessionConnector::new(link.clone(), session(), healthy()));
+    let project = ProjectLink::remote(PROJECT, link.clone(), connector);
+    link.connect(&|| Ok(())).unwrap();
+    let file = far.home.path().join("notes.md");
+    std::fs::write(&file, "far notes\n").unwrap();
+
+    // The far daemon answers with the real far side, its editor a session
+    // in the far sessions directory that names the file it was given.
+    let root = far.root.clone();
+    let started: Arc<Mutex<Vec<PathBuf>>> = Arc::default();
+    let sockets = started.clone();
+    let far_daemon = std::thread::spawn(move || {
+        let (mut stream, _) = control.accept().unwrap();
+        let mut buf = Vec::new();
+        assert!(matches!(read_msg(&mut stream, &mut buf), ClientMsg::Hello { .. }));
+        let hello = ServerMsg::Hello {
+            protocol: CONTROL_PROTOCOL_VERSION,
+            daemon_version: shelbi_state::CLIENT_VERSION.to_string(),
+        };
+        stream.write_all(&control::encode(&hello).unwrap()).unwrap();
+        let ClientMsg::AppRequest(req) = read_msg(&mut stream, &mut buf) else {
+            panic!("expected an app request");
+        };
+        let request: Request = serde_json::from_value(req.body).unwrap();
+        let services = shelbi_orchestrator::far::FarServices {
+            pool: shelbi_orchestrator::pool_admin::workspace_service(),
+            machines: shelbi_orchestrator::pool_admin::machine_service(),
+            readiness: shelbi_orchestrator::machine_readiness::service(),
+            spawn_editor: Arc::new(move |name, cwd, argv| {
+                let id = shelbi_session::layout::derive_id_now(name);
+                let paths = SessionPaths::new(&root, &id);
+                let args = RunArgs {
+                    id,
+                    name: name.to_string(),
+                    cwd: cwd.to_path_buf(),
+                    cols: 80,
+                    rows: 24,
+                    task: None,
+                    raw_output_log: false,
+                    child_argv: vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "printf 'editing %s\\n' \"$1\"; exec cat".into(),
+                        "edit".into(),
+                        argv[4].clone(),
+                    ],
+                    manage_daemon: false,
+                };
+                std::thread::spawn(move || {
+                    let _ = shelbi_session::run(args);
+                });
+                until("the editor session's socket", || UnixStream::connect(paths.sock()).ok().map(drop));
+                sockets.lock().unwrap().push(paths.sock());
+                Ok(())
+            }),
+        };
+        let reply = shelbi_orchestrator::far::answer_with(&services, &req.project, request);
+        let reply = ServerMsg::Reply {
+            request_id: req.request_id,
+            body: serde_json::to_value(reply).unwrap(),
+        };
+        stream.write_all(&control::encode(&reply).unwrap()).unwrap();
+    });
+
+    let name = project
+        .open_far_editor(FarFile::path(file.to_string_lossy()))
+        .expect("the far daemon starts the editor");
+    far_daemon.join().unwrap();
+    assert!(name.starts_with(&format!("{PROJECT}/edit/")), "{name}");
+    let Connected { conn, events, .. } = project.attach_named(&name).expect("the window attaches by name");
+    let shown = read_until(&events.into_inner(), "editing");
+    assert!(shown.contains(&format!("editing {}", file.display())), "{shown:?}");
+    let _ = conn.kill(Some(9));
+    far.sockets.extend(started.lock().unwrap().drain(..));
+}

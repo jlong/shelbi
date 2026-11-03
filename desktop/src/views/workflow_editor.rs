@@ -221,6 +221,8 @@ struct ReviewInputs {
 pub struct WorkflowEditor {
     /// The window's project, read through its source.
     source: Arc<dyn ProjectSource>,
+    /// The window's project, saved through it (wherever it lives).
+    handle: ProjectHandle,
     /// `None` until the workflow config has loaded.
     pub(super) state: Option<EditorState>,
     load_error: Option<String>,
@@ -308,6 +310,7 @@ impl WorkflowEditor {
         }
         let mut editor = WorkflowEditor {
             source: handle.source.clone(),
+            handle: handle.clone(),
             state: None,
             load_error: None,
             name: name_input,
@@ -583,7 +586,8 @@ impl WorkflowEditor {
             cx.notify();
             return;
         };
-        let save = cx.background_executor().spawn(async move { run_save(job) });
+        let store = self.handle.clone();
+        let save = cx.background_executor().spawn(async move { run_save(job, &store) });
         cx.spawn_in(window, async move |this, cx| {
             let outcome = save.await;
             this.update_in(cx, |this, window, cx| this.saved(outcome, window, cx)).ok();
@@ -656,6 +660,19 @@ impl WorkflowEditor {
         };
         let path = state.file();
         self.reload_on_return = true;
+        if self.handle.link.is_remote() {
+            // The file is on the far machine: an editor session there.
+            let path = path.to_string_lossy().into_owned();
+            let label = super::far_editor::label_of(&path);
+            let file = shelbi_app::far::FarFile::path(path);
+            super::far_editor::open_from(&self.handle.link, file, label, cx, |this: &mut Self, e, cx| {
+                if let Some(state) = this.state.as_mut() {
+                    state.open_failed(e);
+                    cx.notify();
+                }
+            });
+            return;
+        }
         let open = cx.background_executor().spawn(async move {
             let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
             if !path.exists() {
@@ -734,7 +751,8 @@ impl WorkflowEditor {
         };
         let job = cx.background_executor().spawn({
             let copy = copy.clone();
-            async move { run_duplicate(base, &name, &copy) }
+            let store = self.handle.clone();
+            async move { run_duplicate(base, &name, &copy, &store) }
         });
         cx.spawn_in(window, async move |this, cx| {
             let done = job.await;
@@ -767,7 +785,8 @@ impl WorkflowEditor {
         let Some(base) = state.begin_job() else {
             return;
         };
-        let job = cx.background_executor().spawn(async move { run_delete(base, &name) });
+        let store = self.handle.clone();
+        let job = cx.background_executor().spawn(async move { run_delete(base, &name, &store) });
         cx.spawn_in(window, async move |this, cx| {
             let done = job.await;
             this.update(cx, |this, cx| {

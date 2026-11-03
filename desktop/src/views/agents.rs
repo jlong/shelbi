@@ -78,6 +78,8 @@ pub struct AgentsPage {
     state: AgentsState,
     /// The window's project, read through its source.
     source: Arc<dyn ProjectSource>,
+    /// The window's project, saved through it (wherever it lives).
+    handle: ProjectHandle,
     /// The new row's name field.
     draft_input: Entity<InputState>,
     /// The shared instructions' text area, while they're being edited.
@@ -113,6 +115,7 @@ impl AgentsPage {
         let mut page = AgentsPage {
             state: AgentsState::new(project),
             source: handle.source.clone(),
+            handle: handle.clone(),
             draft_input,
             shared_input: None,
             menu: None,
@@ -193,33 +196,18 @@ impl AgentsPage {
     /// Make `edit` and save it (after the save in flight, if any).
     fn request(&mut self, edit: Edit, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
-        if self.read_only(cx) {
-            return;
-        }
         if let Some(job) = self.state.request(edit) {
             self.start(job, window, cx);
         }
         cx.notify();
     }
 
-    /// A remote window's project: its settings are read-only for now (P8),
-    /// so a change shows why under the page's header and writes nothing.
-    fn read_only(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(host) = self.source.key().host() else {
-            return false;
-        };
-        self.state
-            .set_error(Target::Page, shelbi_app::remote_window::settings_read_only(host));
-        cx.notify();
-        true
-    }
-
     /// Save one edit off the UI thread; when it lands, start the next.
     fn start(&mut self, (config, edit): (AgentsConfig, Edit), window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.state.project().to_string();
+        let store = self.handle.clone();
         let save = cx
             .background_executor()
-            .spawn(async move { commit(&project, &config, edit) });
+            .spawn(async move { commit(&store, &config, edit) });
         cx.spawn_in(window, async move |this, cx| {
             let done = save.await;
             this.update_in(cx, |this, window, cx| this.committed(done, window, cx)).ok();
@@ -285,7 +273,7 @@ impl AgentsPage {
 
     /// Open the shared instructions in the text area, focused.
     fn edit_shared(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.state.config().is_none() || self.read_only(cx) {
+        if self.state.config().is_none() {
             return;
         }
         let text = self.state.shared_instructions().to_string();
@@ -317,12 +305,19 @@ impl AgentsPage {
     /// `dir` is the agent's directory.
     fn edit_yaml(&mut self, name: &str, dir: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
-        // The file is on the far machine.
-        if self.read_only(cx) {
-            return;
-        }
         self.reload_on_return = true;
         let target = Target::Agent(name.to_string());
+        if self.handle.link.is_remote() {
+            // The file is on the far machine: an editor session there.
+            let path = dir.join("agent.yaml").to_string_lossy().into_owned();
+            let file = shelbi_app::far::FarFile::path(path);
+            super::far_editor::open_from(&self.handle.link, file, "agent.yaml".into(), cx, move |this: &mut Self, e, cx| {
+                this.state.set_error(target, e);
+                cx.notify();
+            });
+            cx.notify();
+            return;
+        }
         let open = cx.background_executor().spawn(async move {
             let path = dir.join("agent.yaml");
             if !path.exists() {

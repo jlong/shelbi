@@ -17,8 +17,8 @@ use std::path::Path;
 
 use serde::de::DeserializeOwned;
 use shelbi_proto::control::{
-    self, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, ExpectedState,
-    MutationRequest, ReviewSessionRequest, ServerMsg, StateWriteRequest, Stream as OutStream,
+    self, AppRequest, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, ExpectedState,
+    MutationRequest, ReviewSessionRequest, SaveConfigRequest, ServerMsg, StateWriteRequest, Stream as OutStream,
     WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
 };
 
@@ -283,6 +283,44 @@ impl ControlClient {
             let msg: ServerMsg = self.read.read_frame()?.ok_or(ClientError::UnexpectedEof)?;
             match msg {
                 ServerMsg::Done { request_id, .. } if request_id == req.request_id => return Ok(()),
+                ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
+                    return Err(ClientError::Mutation(error))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Write a config save the client planned (protocol v8). Blocks until the
+    /// daemon reports [`ServerMsg::Done`] (`Ok`) or [`ServerMsg::Failed`]
+    /// ([`ClientError::Mutation`]; a changed file is
+    /// `MutationError::ConfigChanged`).
+    pub fn save_config(&mut self, req: &SaveConfigRequest) -> Result<(), ClientError> {
+        self.write
+            .write_all(&control::encode(&ClientMsg::SaveConfig(req.clone()))?)?;
+        self.write.flush()?;
+        loop {
+            let msg: ServerMsg = self.read.read_frame()?.ok_or(ClientError::UnexpectedEof)?;
+            match msg {
+                ServerMsg::Done { request_id, .. } if request_id == req.request_id => return Ok(()),
+                ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
+                    return Err(ClientError::Mutation(error))
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Run one of the app's requests where the project lives (protocol v8)
+    /// and return the daemon's [`ServerMsg::Reply`] body. Blocks.
+    pub fn app_request(&mut self, req: &AppRequest) -> Result<serde_json::Value, ClientError> {
+        self.write
+            .write_all(&control::encode(&ClientMsg::AppRequest(req.clone()))?)?;
+        self.write.flush()?;
+        loop {
+            let msg: ServerMsg = self.read.read_frame()?.ok_or(ClientError::UnexpectedEof)?;
+            match msg {
+                ServerMsg::Reply { request_id, body } if request_id == req.request_id => return Ok(body),
                 ServerMsg::Failed { request_id, error } if request_id == req.request_id => {
                     return Err(ClientError::Mutation(error))
                 }

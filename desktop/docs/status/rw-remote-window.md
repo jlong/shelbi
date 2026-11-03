@@ -47,7 +47,8 @@ Settings keeps it. The far machine's config never decides it.
   one writer either way and tells its other clients with a `Changed` note.
   The relay refuses a write to any project but the window's own. The Zen
   intro's "don't show again" stays the viewer's own, on this machine.
-- **Not yet available** (P8, plan 8.4), each disabled with its reason
+- **Not yet available** (P8, plan 8.4; P8 since landed, see
+  [`rw-remote-config-writes.md`](rw-remote-config-writes.md)), each disabled with its reason
   through the command path: the registry lists the command with the reason
   as its subtitle (`CommandModel::remote_host`, `CommandModel::unavailable`),
   the menu bar draws it disabled, and the window refuses it with that line
@@ -94,5 +95,5 @@ Settings keeps it. The far machine's config never decides it.
 ## Left for later phases
 
 A far reload (`ChangeWake::Reload`) doesn't yet close the window's panes and
-offer Reopen (plan 6); config saves (P8); sessions on the far
+offer Reopen (plan 6); sessions on the far
 project's own machines (P9).

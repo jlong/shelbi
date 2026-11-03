@@ -98,10 +98,11 @@ pub trait SessionConnector: Send + Sync {
         None
     }
 
-    /// Why files dropped on this connector's panes aren't pasted, when they
-    /// aren't: a remote window's sessions run on another machine, where a
-    /// dropped file's path doesn't exist.
-    fn drop_refusal(&self) -> Option<String> {
+    /// The link to the machine this connector's panes' sessions run on,
+    /// when that is another one (a remote window's): a file dropped on a
+    /// pane is uploaded there and its far path pasted, and a path
+    /// Cmd+clicked in one opens in an editor session there.
+    fn far_files(&self) -> Option<ProjectLink> {
         None
     }
 }
@@ -115,6 +116,8 @@ pub struct LiveConnector {
     sessions: Arc<dyn app_session::Connector>,
     /// The remote window's host, `None` for this machine's project.
     host: Option<String>,
+    /// A remote window's link, for its panes' files.
+    far: Option<ProjectLink>,
 }
 
 impl LiveConnector {
@@ -123,6 +126,7 @@ impl LiveConnector {
         LiveConnector {
             sessions: project.sessions(),
             host: project.key().host().map(str::to_string),
+            far: project.key().host().is_some().then(|| project.clone()),
         }
     }
 }
@@ -132,8 +136,8 @@ impl SessionConnector for LiveConnector {
         self.host.as_deref()
     }
 
-    fn drop_refusal(&self) -> Option<String> {
-        self.host.as_deref().map(shelbi_app::remote_window::drop_refused)
+    fn far_files(&self) -> Option<ProjectLink> {
+        self.far.clone()
     }
 
     fn connect(
@@ -257,8 +261,8 @@ pub enum SessionPhase {
 
 /// One session in the main area of a project window.
 pub struct SessionView {
-    /// Why the last drop wasn't pasted, shown over the terminal for
-    /// [`DROP_NOTE`] ([`TerminalPane::refuse_drops`]).
+    /// The pane's last note (why a drop wasn't pasted), shown over the
+    /// terminal for [`DROP_NOTE`] ([`PaneEvent::Note`]).
     drop_note: Option<SharedString>,
     drop_note_generation: u64,
     project: String,
@@ -729,10 +733,10 @@ impl SessionView {
                     || self.dead_pane_focus.take().is_some_and(|old| {
                         window.focused(cx).is_none_or(|now| now == old)
                     });
-                let refusal = self.deps.connector.drop_refusal();
+                let far = self.deps.connector.far_files();
                 let pane = cx.new(|cx| {
                     let mut pane = TerminalPane::attached_to(connected, window, cx);
-                    pane.refuse_drops(refusal);
+                    pane.set_far_files(far);
                     pane
                 });
                 let pane_focus = pane.read(cx).focus_handle(cx);
@@ -805,13 +809,13 @@ impl SessionView {
             // away under it (an SSH drop): reconnect.
             PaneEvent::Closed if self.machine().is_some() => self.link_lost(cx),
             PaneEvent::Closed => self.live_pane_died(app_session::exit_line(None), cx),
-            PaneEvent::DropRefused(reason) => self.note_drop_refused(reason.clone(), cx),
+            PaneEvent::Note(note) => self.note(note.clone(), cx),
         }
     }
 
-    /// Show why a drop wasn't pasted, over the terminal's foot, for a few
-    /// seconds.
-    fn note_drop_refused(&mut self, reason: String, cx: &mut Context<Self>) {
+    /// Show a pane's note (why a drop wasn't pasted, why a far file didn't
+    /// open), over the terminal's foot, for a few seconds.
+    fn note(&mut self, reason: String, cx: &mut Context<Self>) {
         self.drop_note_generation += 1;
         let generation = self.drop_note_generation;
         self.drop_note = Some(reason.into());
@@ -1081,15 +1085,13 @@ mod tests {
     use crate::elements::terminal::session::SessionIo;
 
     #[test]
-    fn a_remote_windows_panes_refuse_drops_with_the_reason() {
+    fn a_remote_windows_panes_send_their_files_to_the_far_machine() {
         use shelbi_app::source::{ProjectHandle, ProjectKey};
         let remote = ProjectHandle::null(ProjectKey::remote("jlong@devbox", "far"));
-        assert_eq!(
-            LiveConnector::over(&remote.link).drop_refusal(),
-            Some(shelbi_app::remote_window::drop_refused("devbox"))
-        );
+        let far = LiveConnector::over(&remote.link).far_files().expect("a remote pane's files go far");
+        assert_eq!(far.key(), remote.key());
         let local = ProjectHandle::null(ProjectKey::local("far"));
-        assert_eq!(LiveConnector::over(&local.link).drop_refusal(), None, "a local pane pastes drops");
+        assert!(LiveConnector::over(&local.link).far_files().is_none(), "a local pane pastes drops");
     }
 
     /// What the fake session's input side saw.

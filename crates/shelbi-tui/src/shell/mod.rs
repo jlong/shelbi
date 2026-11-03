@@ -3075,7 +3075,11 @@ impl ShellState {
         let spawned = std::thread::Builder::new()
             .name("shelbi-shell-settings-commit".into())
             .spawn(move || {
-                let done = shelbi_app::settings::agents::commit(&project, &config, edit);
+                let done = shelbi_app::settings::agents::commit(
+                    &shelbi_app::settings::store::Local { project: project.clone() },
+                    &config,
+                    edit,
+                );
                 let _ = tx.send(SettingsMsg::AgentsCommitted(id, Box::new(done)));
             });
         if let Err(e) = spawned {
@@ -3196,7 +3200,11 @@ impl ShellState {
         let spawned = std::thread::Builder::new()
             .name("shelbi-shell-settings-save".into())
             .spawn(move || {
-                let done = shelbi_app::settings::workflows::commit(&project, &config, work);
+                let done = shelbi_app::settings::workflows::commit(
+                    &shelbi_app::settings::store::Local { project: project.clone() },
+                    &config,
+                    work,
+                );
                 let _ = tx.send(SettingsMsg::WorkflowsCommitted(sent, Box::new(done)));
             });
         if let Err(e) = spawned {

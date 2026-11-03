@@ -413,6 +413,17 @@ fn open_window(
 /// (remote-window P6, behind `desktop.native_remote`): the main window over
 /// the host's relay link. A window already showing that project comes up
 /// instead. `None` when the window couldn't open (logged).
+/// What an `edit:*` target opens, named for a far editor window's title.
+fn edit_target_label(target: &EditTarget) -> String {
+    match target {
+        EditTarget::Project => "project settings".to_string(),
+        EditTarget::Agent(agent) => format!("{agent}/instructions.md"),
+        EditTarget::ZenMode => "zenmode.md".to_string(),
+        EditTarget::Workflows => "workflows".to_string(),
+        EditTarget::ChangelogTemplate => "changelog-template.md".to_string(),
+    }
+}
+
 pub fn open_remote_window(mut remote: RemoteWindow, cx: &mut App) -> Option<WindowHandle<ShelbiWindow>> {
     let key = ProjectKey::remote(remote.session.host.clone(), remote.session.project.clone());
     if let Some(handle) = windows_showing_key(&key, None, cx).first().copied() {
@@ -2541,14 +2552,6 @@ impl ShelbiWindow {
         shelbi_app::remote_window::command_unavailable(kind, host)
     }
 
-    /// Why Settings can't change this window's project: a remote one's are
-    /// read-only for now.
-    pub(crate) fn settings_read_only(&self) -> Option<String> {
-        self.remote
-            .as_ref()
-            .map(|r| shelbi_app::remote_window::settings_read_only(&r.session.host))
-    }
-
     fn perform(&mut self, call: HostCall, window: &mut Window, cx: &mut Context<Self>) {
         match call {
             HostCall::ShowView(view) => {
@@ -2665,7 +2668,25 @@ impl ShelbiWindow {
     /// `edit:workflows`) in the user's editor, the path the TUI opens
     /// (`edit_target_path`). The lookup and the launch run off the UI thread;
     /// a terminal editor opens in Terminal.app, a GUI editor directly.
+    ///
+    /// A remote window's files are on the far machine: the far daemon opens
+    /// the target in an editor session there, shown in a window of its own
+    /// (`views::far_editor`).
     fn open_editor(&mut self, target: EditTarget, cx: &mut Context<Self>) {
+        if self.project_handle.link.is_remote() {
+            let label = edit_target_label(&target);
+            crate::views::far_editor::open_from(
+                &self.project_handle.link,
+                shelbi_app::far::FarFile::Target(target),
+                label,
+                cx,
+                |this: &mut Self, e, cx| {
+                    this.banner = Some(e.into());
+                    cx.notify();
+                },
+            );
+            return;
+        }
         let project = self.project.clone();
         self.open_in_editor(move || shelbi_app::command_model::edit_target_path(&project, &target), cx);
     }
@@ -2674,11 +2695,6 @@ impl ShelbiWindow {
     /// row's click, a workflow just created): it takes the whole window,
     /// the settings sidebar hidden, until it closes back onto the page.
     fn edit_workflow(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(reason) = self.settings_read_only() {
-            self.banner = Some(reason.into());
-            cx.notify();
-            return;
-        }
         #[cfg(test)]
         self.edited_workflows.push(name.clone());
         if let Route::Settings(view) = &self.route {
@@ -2691,11 +2707,6 @@ impl ShelbiWindow {
     /// click, an agent just created): like the workflow editor, it takes
     /// the whole window until it closes back onto the page.
     fn edit_agent(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(reason) = self.settings_read_only() {
-            self.banner = Some(reason.into());
-            cx.notify();
-            return;
-        }
         #[cfg(test)]
         self.edited_agents.push(name.clone());
         if let Route::Settings(view) = &self.route {
@@ -2709,13 +2720,8 @@ impl ShelbiWindow {
     /// a workspace dialog over the window; Add machine and Configure go to
     /// the settings view, which opens its machine form. One dialog at a time.
     fn open_pool_form(&mut self, intent: Intent, window: &mut Window, cx: &mut Context<Self>) {
-        // A remote project's workspaces and machines change on the far hub
-        // (P8): no form, and no machine check run from here.
-        if let Some(reason) = self.settings_read_only() {
-            self.banner = Some(reason.into());
-            cx.notify();
-            return;
-        }
+        // A remote project's workspaces and machines change on the far hub:
+        // the forms' services send their requests there.
         #[cfg(test)]
         self.pool_forms.push(intent.clone());
         let Route::Settings(view) = &self.route else {
@@ -2731,7 +2737,10 @@ impl ShelbiWindow {
             // gone) leaves the page as it was.
             Intent::NewWorkspace | Intent::EditWorkspace(_) | Intent::RemoveWorkspace(_) => {
                 DialogBody::for_intent(&intent, &page, cx)
-                    .map(|body| cx.new(|cx| WorkspaceDialog::new(body, page, window, cx)))
+                    .map(|body| {
+                        let far = self.project_handle.link.is_remote().then(|| self.project_handle.link.clone());
+                        cx.new(|cx| WorkspaceDialog::new(body, page, far, window, cx))
+                    })
             }
             Intent::AddMachine | Intent::ConfigureMachine(_) => {
                 view.update(cx, |v, cx| v.open_pool_form(&intent, window, cx));

@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use crate::{Machine, MachineKind, Project, WorkspaceSpec};
 
 /// The form field a validation error belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PoolField {
     Name,
     Machine,
@@ -36,7 +36,7 @@ pub enum PoolField {
 }
 
 /// Why an operation was refused or failed.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, serde::Serialize, serde::Deserialize)]
 pub enum PoolError {
     /// The request doesn't validate. `field` is the form field to mark, when
     /// there is one.
@@ -91,7 +91,7 @@ pub type Result<T, E = PoolError> = std::result::Result<T, E>;
 // Requests and results
 
 /// A new workspace. `machine: None` places it on the project's local machine.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AddWorkspace {
     pub name: String,
     pub machine: Option<String>,
@@ -101,7 +101,7 @@ pub struct AddWorkspace {
 }
 
 /// An edit of workspace `name`: every field as it should be afterwards.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateWorkspace {
     /// The workspace's current name.
     pub name: String,
@@ -115,7 +115,7 @@ pub struct UpdateWorkspace {
 }
 
 /// Removing workspace `name`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RemoveWorkspace {
     pub name: String,
     pub expected: Option<WorkspaceSpec>,
@@ -124,7 +124,7 @@ pub struct RemoveWorkspace {
 }
 
 /// A machine's editable fields.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MachineFields {
     pub name: String,
     pub kind: MachineKind,
@@ -137,7 +137,7 @@ pub struct MachineFields {
 }
 
 /// An edit of machine `name`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdateMachine {
     pub name: String,
     pub expected: Option<Machine>,
@@ -145,7 +145,7 @@ pub struct UpdateMachine {
 }
 
 /// What became of the hook wiring in the workspace's worktree.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum HooksOutcome {
     /// Nothing to wire: the project's runner isn't Claude Code, or the
     /// worktree didn't change.
@@ -158,7 +158,7 @@ pub enum HooksOutcome {
 }
 
 /// A workspace as now configured.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceChange {
     pub workspace: WorkspaceSpec,
     /// Its name before the change, when it was renamed.
@@ -176,7 +176,7 @@ pub struct WorkspaceChange {
 }
 
 /// A removed workspace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct WorkspaceRemoved {
     pub name: String,
     pub machine: String,
@@ -184,7 +184,7 @@ pub struct WorkspaceRemoved {
 }
 
 /// A machine as now configured.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MachineChange {
     pub machine: Machine,
     pub previous_name: Option<String>,

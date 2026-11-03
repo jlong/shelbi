@@ -17,10 +17,15 @@ fn editor(name: &str) -> AgentEditorState {
     AgentEditorState::new(AgentsConfig::load(PROJECT).unwrap(), name)
 }
 
+/// The fixture project's files, written directly.
+fn disk() -> crate::settings::store::Disk {
+    crate::settings::store::Disk { project: PROJECT.into() }
+}
+
 /// Save as a client does, here rather than off the UI thread.
 fn save(state: &mut AgentEditorState, texts: Vec<Change>) -> Option<Leave> {
     let job = state.begin_save(texts)?;
-    state.saved(run_save(job))
+    state.saved(run_save(job, &disk()))
 }
 
 fn on_disk(name: &str) -> Agent {
@@ -349,7 +354,7 @@ fn leaving_with_edits_asks_first() {
     state.change(Change::Permissions(Some("plan".into())));
     state.leave(Leave::Workflows);
     let job = state.save_and_leave(vec![]).unwrap();
-    assert_eq!(state.saved(run_save(job)), Some(Leave::Workflows));
+    assert_eq!(state.saved(run_save(job, &disk())), Some(Leave::Workflows));
     assert_eq!(on_disk("developer").permissions_mode(), Some("plan"));
 }
 
@@ -398,7 +403,7 @@ fn duplicate_and_delete_run_on_the_saved_model() {
 
     let base = state.begin_job().unwrap();
     assert!(state.begin_job().is_none(), "one at a time");
-    let config = run_duplicate(base, "developer", "developer-copy").unwrap();
+    let config = run_duplicate(base, "developer", "developer-copy", &disk()).unwrap();
     assert!(agent_file(&home, "developer-copy", "instructions.md").exists());
 
     let mut copy = AgentEditorState::new(config, "developer-copy");
@@ -408,7 +413,7 @@ fn duplicate_and_delete_run_on_the_saved_model() {
     assert!(copy.confirming_delete());
     let base = copy.begin_job().unwrap();
     assert!(!copy.confirming_delete());
-    run_delete(base, "developer-copy").unwrap();
+    run_delete(base, "developer-copy", &disk()).unwrap();
     assert!(!agent_file(&home, "developer-copy", "agent.yaml").exists());
 }
 
