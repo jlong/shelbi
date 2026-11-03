@@ -170,6 +170,37 @@ fn the_default_template_names_every_placeholder() {
 }
 
 #[test]
+fn the_default_template_ends_with_the_description_alone() {
+    // `{{links}}` is documented in the comment but not used: the Changelog
+    // page draws every frontmatter link as a chip, so a list would repeat them.
+    let body = strip_leading_comment(DEFAULT_CHANGELOG_TEMPLATE);
+    assert_eq!(body.trim(), "{{description}}");
+    let links = [Link::Issue { id: "x".into() }];
+    let filled = fill_template(
+        DEFAULT_CHANGELOG_TEMPLATE,
+        &TemplateValues {
+            title: "T",
+            date: at("2026-10-28T14:30:00-07:00"),
+            author: "user",
+            description: "Did the thing.\n",
+            links: &links,
+        },
+    );
+    assert_eq!(filled, "Did the thing.");
+}
+
+#[test]
+fn the_prior_default_is_recognized_byte_for_byte() {
+    let prior = PRIOR_CHANGELOG_TEMPLATES[0];
+    assert!(prior.trim_end().ends_with("{{description}}\n\n{{links}}"));
+    assert!(is_prior_default_changelog_template(prior));
+    assert!(!is_prior_default_changelog_template(DEFAULT_CHANGELOG_TEMPLATE));
+    let edited = prior.replace("{{links}}", "Thanks for reading.\n\n{{links}}");
+    assert!(!is_prior_default_changelog_template(&edited));
+    assert!(!is_prior_default_changelog_template(prior.trim_end()));
+}
+
+#[test]
 fn filling_drops_the_comment_and_lays_out_links() {
     let links = [
         Link::Issue {
@@ -187,8 +218,10 @@ fn filling_drops_the_comment_and_lays_out_links() {
             url: "https://x.dev".into(),
         },
     ];
+    // A template that keeps `{{links}}` (the prior default) still gets the
+    // list.
     let body = fill_template(
-        DEFAULT_CHANGELOG_TEMPLATE,
+        PRIOR_CHANGELOG_TEMPLATES[0],
         &TemplateValues {
             title: "T",
             date: at("2026-10-28T14:30:00-07:00"),
@@ -279,11 +312,126 @@ fn add_writes_a_dated_markdown_file_that_reads_back() {
     assert!(read.skipped.is_empty());
     assert_eq!(read.entries, vec![entry.clone()]);
     assert_eq!(entry.date, at("2026-10-28T14:30:05-07:00"));
+    // The body is the description alone; the links live in the frontmatter.
+    assert_eq!(entry.body, "The sidebar's Activity row becomes Changelog.");
+    assert_eq!(entry.links(REPO).len(), 3);
+}
+
+#[test]
+fn add_keeps_the_list_for_a_template_that_asks_for_it() {
+    let dir = scratch("add-links");
+    let mut new = new_entry("Links kept", "2026-10-28T14:30:05-07:00");
+    new.issues = vec!["changelog".into()];
+    new.prs = vec![PrRef::Number(1953)];
+    new.description = "Sidebar row.".into();
+    let entry = add_entry_in(&dir, "{{description}}\n\n{{links}}\n", REPO, new).unwrap();
     assert_eq!(
         entry.body,
-        "The sidebar's Activity row becomes Changelog.\n\n- issue:changelog\n- https://github.com/jlong/shelbi/pull/1953\n- https://shelbi.dev"
+        "Sidebar row.\n\n- issue:changelog\n- https://github.com/jlong/shelbi/pull/1953"
     );
+}
+
+#[test]
+fn add_stores_a_pr_once_when_link_repeats_its_url() {
+    let dir = scratch("add-dedupe");
+    let mut new = new_entry("Once", "2026-10-28T14:30:05-07:00");
+    new.issues = vec!["a".into(), "a".into()];
+    new.prs = vec![PrRef::Number(2099)];
+    new.urls = vec![
+        "https://github.com/jlong/shelbi/pull/2099".into(),
+        "https://shelbi.dev".into(),
+        "https://shelbi.dev".into(),
+    ];
+    let entry = add_entry_in(&dir, "{{description}}\n\n{{links}}\n", REPO, new).unwrap();
+    assert_eq!(entry.issues, vec!["a".to_string()]);
+    assert_eq!(entry.prs, vec![PrRef::Number(2099)]);
+    assert_eq!(entry.urls, vec!["https://shelbi.dev".to_string()]);
     assert_eq!(entry.links(REPO).len(), 3);
+    assert_eq!(
+        entry.body,
+        "- issue:a\n- https://github.com/jlong/shelbi/pull/2099\n- https://shelbi.dev"
+    );
+    let text = fs::read_to_string(&entry.path).unwrap();
+    assert!(!text.contains("links:\n- https://github.com"), "{text}");
+}
+
+// ---- redundant link lists -------------------------------------------------
+
+fn front(issues: &[&str], prs: &[u64], urls: &[&str]) -> Vec<Link> {
+    let entry = ChangelogEntry {
+        id: "e".into(),
+        title: "t".into(),
+        date: at("2026-10-28T14:30:00-07:00"),
+        author: "user".into(),
+        issues: issues.iter().map(|s| s.to_string()).collect(),
+        prs: prs.iter().map(|n| PrRef::Number(*n)).collect(),
+        urls: urls.iter().map(|s| s.to_string()).collect(),
+        body: String::new(),
+        path: PathBuf::new(),
+    };
+    entry.front_links(REPO)
+}
+
+#[test]
+fn a_trailing_list_that_only_repeats_the_frontmatter_is_cut() {
+    let f = front(&["orch-onboarding"], &[2099], &["https://shelbi.dev"]);
+    let body = "Onboarding.\n\n- issue:orch-onboarding\n- https://github.com/jlong/shelbi/pull/2099\n- #2099\n- https://shelbi.dev\n";
+    assert_eq!(
+        body_without_link_list(body, &f, REPO).as_deref(),
+        Some("Onboarding.")
+    );
+    // A body that is nothing but the list empties.
+    assert_eq!(
+        body_without_link_list("- issue:orch-onboarding", &f, REPO).as_deref(),
+        Some("")
+    );
+}
+
+#[test]
+fn a_list_with_anything_else_in_it_stays() {
+    let f = front(&["a"], &[5], &[]);
+    for body in [
+        // A link the frontmatter doesn't have.
+        "Done.\n\n- issue:a\n- issue:b",
+        // An item that is more than a link.
+        "Done.\n\n- issue:a\n- faster boards #5",
+        "Done.\n\n- issue:a,",
+        // Right under a line of prose: the prose's own list.
+        "Changes:\n- issue:a\n- #5",
+        // No list at all.
+        "Done.",
+        "",
+    ] {
+        assert_eq!(body_without_link_list(body, &f, REPO), None, "{body:?}");
+    }
+}
+
+#[test]
+fn strip_link_list_rewrites_only_the_body() {
+    let dir = scratch("strip");
+    let mut new = new_entry("Strip me", "2026-10-28T14:30:05-07:00");
+    new.issues = vec!["changelog".into()];
+    new.prs = vec![PrRef::Number(1953)];
+    new.description = "Sidebar row.".into();
+    let entry = add_entry_in(&dir, PRIOR_CHANGELOG_TEMPLATES[0], REPO, new).unwrap();
+    let before = fs::read_to_string(&entry.path).unwrap();
+    assert!(before.ends_with("- https://github.com/jlong/shelbi/pull/1953\n"), "{before}");
+
+    // A dry run reports without writing.
+    assert!(strip_link_list(&entry, REPO, true).unwrap());
+    assert_eq!(fs::read_to_string(&entry.path).unwrap(), before);
+
+    assert!(strip_link_list(&entry, REPO, false).unwrap());
+    let after = fs::read_to_string(&entry.path).unwrap();
+    let front_end = before.find("---\nSidebar row.").unwrap() + 4;
+    assert_eq!(&after[..front_end], &before[..front_end], "frontmatter kept");
+    assert!(after.ends_with("---\nSidebar row.\n"), "{after}");
+
+    // Idempotent.
+    let reread = read_entries_in(&dir).unwrap().entries.remove(0);
+    assert_eq!(reread.body, "Sidebar row.");
+    assert_eq!(reread.links(REPO).len(), 2);
+    assert!(!strip_link_list(&reread, REPO, false).unwrap());
 }
 
 #[test]
