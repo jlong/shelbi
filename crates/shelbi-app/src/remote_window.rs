@@ -1,21 +1,25 @@
-//! A native window for a project on another machine (remote-window P6),
-//! behind a developer setting.
+//! A native window for a project on another machine (remote-window P6,
+//! the default since P10).
 //!
-//! Connect to Remote Session and a recent remote session open, today, the
-//! far machine's TUI in a terminal over `ssh -t`. With the dev flag on
-//! ([`native_remote_enabled`]: `desktop.native_remote: true` in the viewer's
-//! `config.yaml`, or `SHELBI_NATIVE_REMOTE=1`), a host running exactly this
-//! build opens the full main window instead: sidebar, Orchestrator, Issues,
-//! the task pane, Workspaces, Activity, Machines and Settings, read through a
-//! [`RemoteSource`] and attached through a [`RemoteSessionConnector`], both
-//! over the host's one shared relay link ([`HostLink::shared`]).
+//! Connect to Remote Session and a recent remote session open the full main
+//! window for a host running exactly this build: sidebar, Orchestrator,
+//! Issues, the task pane, Workspaces, Activity, Machines and Settings, read
+//! through a [`RemoteSource`] and attached through a
+//! [`RemoteSessionConnector`], both over the host's one shared relay link
+//! ([`HostLink::shared`]). A host on any other version (a patch release
+//! apart, or one that predates the native window) opens the far machine's
+//! TUI in a terminal over `ssh -t`, with a line naming both versions.
 //!
 //! This module is the toolkit-free half a client builds that window from:
 //!
 //! - [`choose`]: native or terminal, and the terminal view's one-line notice
-//!   when the versions differ ([`RemoteListing::window_decision`]). With the
-//!   flag off it asks the host nothing, so the terminal window opens exactly
-//!   as it did.
+//!   when the versions differ ([`RemoteListing::window_decision`]).
+//! - [`reconnect_check`]: what every reconnect of a native window checks
+//!   first. The far side may have been upgraded while the window was away, so
+//!   the decision is made again; a host that no longer matches refuses the
+//!   reconnect ([`RemoteError::NoLongerNative`]) and the window closes its
+//!   panes and offers Reopen (which decides again) rather than send commands
+//!   to a daemon that may reject them.
 //! - [`remote_handle`]: the window's [`ProjectHandle`] for a project on the
 //!   host (its source, link and session connector).
 //! - [`window_title`]: `jlong@devbox · Shelbi`.
@@ -26,6 +30,8 @@
 //!   writes (the board's workspace filter and column overrides, Zen Mode, the
 //!   error log and its read marks, a pane's reopen marker) go to the far
 //!   daemon like issue mutations ([`crate::state_write`]).
+//! - Open in Terminal View ([`crate::CommandKind::OpenTerminalView`]) keeps
+//!   the terminal window reachable from a native one.
 //!
 //! What a remote window does on the far side instead of here (P8): Settings
 //! saves its config through the far daemon (`SaveConfig`,
@@ -38,42 +44,20 @@
 //! The far daemon is never started implicitly: the window's link only
 //! reconnects after [`RemoteConnector::connect`] says the daemon runs, and a
 //! stopped one is offered to the user to start ([`RemoteConnector::start_daemon`]).
+//!
+//! A workspace the far project runs on its own other machine (a second hop)
+//! isn't reachable over the link yet (P9): its pane shows a placeholder
+//! naming that machine ([`two_hop_placeholder`]).
 
 use std::sync::Arc;
 
 use crate::command::CommandKind;
 use crate::launch::link::HostLink;
 use crate::launch::remote::{RemoteConnector, RemoteError, RemoteSession};
-use crate::launch::RemoteListing;
+use crate::launch::{RemoteListing, WindowDecision};
 use crate::session::remote::RemoteSessionConnector;
 use crate::source::remote::{RelayLink, RemoteSource};
 use crate::source::{ProjectHandle, ProjectLink};
-
-/// The environment variable that turns the native remote window on for one
-/// launch (`SHELBI_NATIVE_REMOTE=1`).
-pub const NATIVE_REMOTE_ENV: &str = "SHELBI_NATIVE_REMOTE";
-
-/// Whether the native remote window is on, from the viewer's setting and the
-/// environment override: the variable set to `1`, `true` or `yes` turns it
-/// on, `0`, `false` or `no` off; unset (or anything else), the setting
-/// decides.
-pub fn native_remote_from(setting: Option<bool>, env: Option<&str>) -> bool {
-    match env.map(|v| v.trim().to_ascii_lowercase()) {
-        Some(v) if matches!(v.as_str(), "1" | "true" | "yes") => true,
-        Some(v) if matches!(v.as_str(), "0" | "false" | "no") => false,
-        _ => setting.unwrap_or(false),
-    }
-}
-
-/// Whether the native remote window is on for this process: the viewer's
-/// `desktop.native_remote` and [`NATIVE_REMOTE_ENV`]. Reads `config.yaml`;
-/// call it off the UI thread.
-pub fn native_remote_enabled() -> bool {
-    let setting = shelbi_state::load_user_config()
-        .ok()
-        .and_then(|cfg| cfg.desktop.native_remote);
-    native_remote_from(setting, std::env::var(NATIVE_REMOTE_ENV).ok().as_deref())
-}
 
 /// Which window a remote session opens in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,21 +71,12 @@ pub enum RemoteOpen {
     Terminal { notice: Option<String> },
 }
 
-/// Decide where `host`'s project opens: with the flag off, the terminal view
-/// with no notice, and `listing` is never asked (the host is probed exactly
-/// as before). With it on, `listing` is read: a host on this exact version
-/// speaking this build's protocols opens natively; any other opens the
-/// terminal view with the notice naming both versions. A listing that can't
-/// be read opens the terminal view, which says what's wrong on its own.
-/// Blocking when the flag is on (`listing` runs `ssh`).
-pub fn choose(
-    flag: bool,
-    host: &str,
-    listing: impl FnOnce() -> Result<RemoteListing, RemoteError>,
-) -> RemoteOpen {
-    if !flag {
-        return RemoteOpen::Terminal { notice: None };
-    }
+/// Decide where `host`'s project opens: `listing` is read, and a host on
+/// this exact version speaking this build's protocols opens natively; any
+/// other opens the terminal view with the notice naming both versions. A
+/// listing that can't be read opens the terminal view, which says what's
+/// wrong on its own. Blocking (`listing` runs `ssh`).
+pub fn choose(host: &str, listing: impl FnOnce() -> Result<RemoteListing, RemoteError>) -> RemoteOpen {
     match listing() {
         Ok(listing) => {
             let decision = listing.window_decision();
@@ -118,6 +93,44 @@ pub fn choose(
             RemoteOpen::Terminal { notice: None }
         }
     }
+}
+
+/// What a native window checks before its link to `session`'s host comes
+/// back up (a pane's reconnect, the window's own watch, Start Shelbi): the
+/// host answers, still has the project and its daemon runs
+/// ([`RemoteConnector::connect`], which never starts it), and then the
+/// decision again, from a fresh listing, since the far Shelbi may have been
+/// upgraded meanwhile. A host that no longer opens natively refuses with
+/// [`RemoteError::NoLongerNative`] carrying the line to show. Blocking
+/// (`ssh`).
+pub fn reconnect_check(remote: &dyn RemoteConnector, session: &RemoteSession) -> Result<(), RemoteError> {
+    remote.connect(session)?;
+    let listing = remote.listing(&session.host)?;
+    match listing.window_decision() {
+        WindowDecision::Native => Ok(()),
+        WindowDecision::Fallback { local, remote, .. } => Err(RemoteError::NoLongerNative {
+            message: changed_notice(bare_host(&session.host), &local, &remote),
+            host: session.host.clone(),
+        }),
+    }
+}
+
+/// The line a native window shows once its host stops matching: the far
+/// version when it moved, and what Reopen does.
+pub fn changed_notice(host: &str, local: &str, remote: &str) -> String {
+    let here = if cfg!(target_os = "macos") { "this Mac" } else { "this computer" };
+    if local == remote {
+        format!("Shelbi on {host} changed since this window opened. Reopen to continue in its terminal view.")
+    } else {
+        format!("Shelbi on {host} is now {remote} and {here} has {local}. Reopen to continue in its terminal view.")
+    }
+}
+
+/// What a pane for workspace `workspace` shows when the far project runs it
+/// on `machine`, another of its own machines: the window can't reach a
+/// second hop yet (P9).
+pub fn two_hop_placeholder(workspace: &str, machine: &str) -> String {
+    format!("{workspace} runs on {machine}. A remote window can't show a workspace on another of its machines yet.")
 }
 
 /// `host` without a `user@` the user typed.
@@ -182,6 +195,7 @@ pub fn command_unavailable(kind: &CommandKind, host: &str) -> Option<String> {
         | CommandKind::SwitchProject { .. }
         | CommandKind::ConnectRemote
         | CommandKind::ShowLaunchScreen
+        | CommandKind::OpenTerminalView
         | CommandKind::Detach
         | CommandKind::QuitProject
         | CommandKind::OpenIssue { .. }
@@ -215,31 +229,9 @@ mod tests {
     use crate::launch::{FakeRemote, NativeCapability};
 
     #[test]
-    fn the_flag_is_the_setting_unless_the_environment_says() {
-        assert!(!native_remote_from(None, None));
-        assert!(native_remote_from(Some(true), None));
-        assert!(!native_remote_from(Some(false), None));
-        assert!(native_remote_from(None, Some("1")));
-        assert!(native_remote_from(Some(false), Some(" TRUE ")));
-        assert!(!native_remote_from(Some(true), Some("0")));
-        assert!(native_remote_from(Some(true), Some("maybe")), "an unknown value leaves the setting");
-    }
-
-    #[test]
-    fn with_the_flag_off_the_host_is_never_asked() {
-        let asked = std::cell::Cell::new(false);
-        let open = choose(false, "devbox", || {
-            asked.set(true);
-            Err(RemoteError::Failed("never".into()))
-        });
-        assert_eq!(open, RemoteOpen::Terminal { notice: None });
-        assert!(!asked.get(), "the flag off opens the terminal view exactly as before");
-    }
-
-    #[test]
     fn the_same_version_opens_natively_and_another_one_in_the_terminal_with_a_notice() {
         let fake = FakeRemote::new().with_host("devbox", "jlong", &[("shelbi", "~/shelbi")]);
-        match choose(true, "devbox", || fake.listing("devbox")) {
+        match choose("devbox", || fake.listing("devbox")) {
             RemoteOpen::Native(listing) => {
                 assert_eq!(listing.user, "jlong");
                 assert_eq!(listing.projects[0].name, "shelbi");
@@ -250,7 +242,7 @@ mod tests {
         let older = FakeRemote::new()
             .with_host("devbox", "jlong", &[("shelbi", "~/shelbi")])
             .with_far_version("devbox", "0.0.1", Some(NativeCapability::current()));
-        let RemoteOpen::Terminal { notice: Some(notice) } = choose(true, "devbox", || older.listing("devbox")) else {
+        let RemoteOpen::Terminal { notice: Some(notice) } = choose("devbox", || older.listing("devbox")) else {
             panic!("a different version opens the terminal view with a notice");
         };
         assert!(notice.starts_with("Shelbi on devbox is 0.0.1 and "), "{notice}");
@@ -259,7 +251,7 @@ mod tests {
 
         let unreachable = FakeRemote::new();
         assert_eq!(
-            choose(true, "nowhere", || unreachable.listing("nowhere")),
+            choose("nowhere", || unreachable.listing("nowhere")),
             RemoteOpen::Terminal { notice: None }
         );
     }

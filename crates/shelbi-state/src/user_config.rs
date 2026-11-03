@@ -182,16 +182,6 @@ pub struct DesktopConfig {
         deserialize_with = "lenient_app_icon"
     )]
     pub app_icon: Option<AppIcon>,
-
-    /// A developer setting (`native_remote: true`): Connect to Remote
-    /// Session and a recent remote session open the full desktop window for
-    /// a project on another machine (its sidebar, board and views read over
-    /// the SSH relay) when that machine runs this exact Shelbi, instead of
-    /// the far TUI in a terminal. `SHELBI_NATIVE_REMOTE=1` turns it on for
-    /// one launch. Unset means off. It is the viewer's setting: the far
-    /// machine's config never decides it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub native_remote: Option<bool>,
 }
 
 /// Which Option keys act as Meta in the desktop app's terminals
@@ -367,7 +357,6 @@ impl DesktopConfig {
             && self.window_blur.is_none()
             && self.contrast.is_none()
             && self.app_icon.is_none()
-            && self.native_remote.is_none()
     }
 }
 

@@ -31,7 +31,14 @@
 //!
 //! Sessions on the far project's own remote machines (a second hop) are not
 //! on the far host's session list; until the relay can reach them (P9) such a
-//! workspace reads as idle on the host.
+//! workspace's pane shows a placeholder naming its machine
+//! ([`crate::remote_window::two_hop_placeholder`]).
+//!
+//! **Version.** Every reconnect checks the host with
+//! [`crate::remote_window::reconnect_check`]: the far Shelbi may have been
+//! upgraded while the channel was down, and a host that no longer opens
+//! natively refuses ([`RemoteError::NoLongerNative`], kept as the refusal
+//! for the window to offer Reopen) rather than have commands sent to it.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -83,7 +90,9 @@ impl RemoteSessionConnector {
     /// The host's channel: the current one, or a fresh one once the host
     /// checks out.
     fn channel(&self) -> Result<Arc<dyn RelayLink>, ConnectFailure> {
-        let opened = self.link.connect(&|| self.remote.connect(&self.session));
+        let opened = self
+            .link
+            .connect(&|| crate::remote_window::reconnect_check(self.remote.as_ref(), &self.session));
         let mut refusal = self.refusal.lock().unwrap_or_else(|p| p.into_inner());
         match opened {
             Ok(link) => {
@@ -103,7 +112,25 @@ impl RemoteSessionConnector {
 impl Connector for RemoteSessionConnector {
     fn connect(&self, project: &str, target: &SessionRef) -> Result<Connected, ConnectFailure> {
         let link = self.channel()?;
-        attach_over(&*link, project, target)
+        match attach_over(&*link, project, target) {
+            Err(ConnectFailure::Idle(idle)) => Err(second_hop(link, project, idle)),
+            attached => attached,
+        }
+    }
+}
+
+/// A workspace with no session on the far host: idle there, or (when the far
+/// project declares it on another of its machines) out of this window's
+/// reach until the relay can take a second hop (P9), which its placeholder
+/// says, naming the machine.
+fn second_hop(link: Arc<dyn RelayLink>, project: &str, idle: IdleInfo) -> ConnectFailure {
+    use crate::source::ProjectSource;
+    let source = crate::source::remote::RemoteSource::new(project, link);
+    match source.workspace_details(&idle.name) {
+        Ok(details) if details.is_remote => {
+            ConnectFailure::Message(crate::remote_window::two_hop_placeholder(&idle.name, &details.machine))
+        }
+        _ => ConnectFailure::Idle(idle),
     }
 }
 

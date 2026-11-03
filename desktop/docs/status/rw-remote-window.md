@@ -5,6 +5,9 @@ Phase P6 of the remote-window plan (ContextStore `Shelbi`,
 native main window for a project on another machine, behind a developer
 setting. With the setting off, nothing changes.
 
+> Since P10 (`rw-remote-cutover`) there is no setting: the native window is
+> the default, and the section below is history.
+
 ## Turning it on
 
 `desktop.native_remote: true` in the viewer's `~/.shelbi/config.yaml`, or

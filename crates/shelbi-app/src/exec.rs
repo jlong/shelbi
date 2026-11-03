@@ -65,6 +65,11 @@ pub enum Effect {
     /// Open another window on `project` (a multi-window client only; the
     /// registry never offers it to the TUI).
     NewWindow { project: String },
+    /// Open `project`, a project on another machine shown in a native
+    /// window, in its terminal view: that machine's own Shelbi over `ssh -t`
+    /// (the registry lists it only in a remote window,
+    /// [`crate::CommandModel::remote_host`]). Nothing reaches a daemon.
+    OpenTerminalView { project: String },
     /// Detach this client: stop rendering and drop its connections, leaving
     /// every session and agent running (the palette's "Detach"; the same
     /// client-local stop `q` performs).

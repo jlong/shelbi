@@ -69,6 +69,11 @@ pub enum CommandKind {
     /// Open another window on the current project. Offered only by a client
     /// that has windows to open ([`CommandModel::multi_window`]).
     NewWindow,
+    /// Open this remote window's project in its terminal view: the far
+    /// machine's TUI over `ssh -t`, the window a host on another version
+    /// opens. Offered only in a native remote window
+    /// ([`CommandModel::remote_host`]), so that view stays reachable.
+    OpenTerminalView,
     /// Detach this client (leave Shelbi running in the background).
     Detach,
     /// Detach every other client attached to this session.
@@ -215,6 +220,7 @@ impl CommandKind {
             CommandKind::ConnectRemote => Effect::ConnectRemote,
             CommandKind::ShowLaunchScreen => Effect::ShowLaunchScreen,
             CommandKind::NewWindow => Effect::NewWindow { project: p() },
+            CommandKind::OpenTerminalView => Effect::OpenTerminalView { project: p() },
             CommandKind::Detach => Effect::Detach,
             CommandKind::DetachOtherClients => Effect::DetachOtherClients,
             CommandKind::QuitProject => Effect::QuitProject { project: p() },
@@ -731,6 +737,21 @@ impl CommandRegistry {
             });
         }
 
+        // The terminal view of a remote window's project (hidden until
+        // query), only in a remote window: the far TUI over `ssh -t`.
+        if model.remote_host.is_some() && model.project.is_some() {
+            out.push(Command {
+                id: "action:open-terminal-view".to_string(),
+                title: "Open in Terminal View".to_string(),
+                kind: CommandKind::OpenTerminalView,
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some("Open this project in Shelbi's terminal interface".to_string()),
+                shortcut: None,
+                hidden_until_query: true,
+            });
+        }
+
         // Edit targets (hidden until query).
         for e in &model.edit_targets {
             out.push(Command {
@@ -905,6 +926,7 @@ impl CommandKind {
             "action:connect-remote" => Some(CommandKind::ConnectRemote),
             "action:launch-screen" => Some(CommandKind::ShowLaunchScreen),
             "action:new-window" => Some(CommandKind::NewWindow),
+            "action:open-terminal-view" => Some(CommandKind::OpenTerminalView),
             "action:detach" => Some(CommandKind::Detach),
             "action:detach-others" => Some(CommandKind::DetachOtherClients),
             "action:quit-project" => Some(CommandKind::QuitProject),
@@ -1136,11 +1158,12 @@ mod tests {
 
         m.remote_host = Some("jlong@devbox".into());
         let remote = reg.commands(&m);
-        assert_eq!(
-            remote.iter().map(Command::id).collect::<Vec<_>>(),
-            local.iter().map(Command::id).collect::<Vec<_>>(),
-            "nothing is dropped: a refused command stays listed",
-        );
+        // Nothing is dropped (a refused command stays listed); the one
+        // command a remote window adds is Open in Terminal View.
+        let mut expected: Vec<&str> = local.iter().map(Command::id).collect();
+        let at = expected.iter().position(|id| id.starts_with("edit:")).unwrap_or(expected.len());
+        expected.insert(at, "action:open-terminal-view");
+        assert_eq!(remote.iter().map(Command::id).collect::<Vec<_>>(), expected);
         let quit = reg.resolve("action:quit-shelbi", &m).unwrap();
         let reason = m.unavailable(quit.kind()).expect("Quit Shelbi never reaches the far host");
         assert!(reason.contains("devbox"));

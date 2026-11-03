@@ -61,6 +61,8 @@ struct Far {
     down: Arc<AtomicUsize>,
     /// The far daemon's control socket, when a test runs one.
     control: Option<PathBuf>,
+    /// The far relay's `query` service, when a test answers one.
+    query: Option<shelbi_client::QueryHandler>,
 }
 
 impl Far {
@@ -81,7 +83,16 @@ impl Far {
             channels: Arc::default(),
             down: Arc::default(),
             control: None,
+            query: None,
         }
+    }
+
+    /// Answer the far relay's `query` service with `answer`.
+    fn answer_queries<F>(&mut self, answer: F)
+    where
+        F: shelbi_app::source::wire::Answerer + Send + Sync + 'static,
+    {
+        self.query = Some(shelbi_app::source::wire::handler(answer));
     }
 
     /// Start a real session named `name` running `script` under `sh`, and
@@ -118,8 +129,13 @@ impl Far {
     /// Opens a relay to the far machine over a fresh socket pair, refusing
     /// the next [`Far::go_down`] opens as unreachable.
     fn opener(&self) -> impl Fn(&str) -> Result<Arc<dyn RelayLink>, RemoteError> + Send + Sync + 'static {
-        let (root, channels, down, control) =
-            (self.root.clone(), self.channels.clone(), self.down.clone(), self.control.clone());
+        let (root, channels, down, control, query) = (
+            self.root.clone(),
+            self.channels.clone(),
+            self.down.clone(),
+            self.control.clone(),
+            self.query.clone(),
+        );
         move |host: &str| {
             if down.load(Ordering::SeqCst) > 0 {
                 down.fetch_sub(1, Ordering::SeqCst);
@@ -132,6 +148,7 @@ impl Far {
             let far_read = far.try_clone().unwrap();
             let services = RelayServices {
                 control_socket: control.clone(),
+                query: query.clone(),
                 ..RelayServices::default()
             };
             let root = root.clone();
@@ -436,9 +453,12 @@ fn serve_one_request(listener: &UnixListener) -> ClientMsg {
         ClientMsg::ReviewSession(r) => r.request_id,
         ClientMsg::WorkspaceSession(r) => r.request_id,
         ClientMsg::WriteState(r) => r.request_id,
+        ClientMsg::Mutate(r) => r.request_id,
         other => panic!("unexpected request {other:?}"),
     };
-    let done = ServerMsg::Done { request_id, state: None, id: None };
+    // An add reports the new issue's id, as the far daemon does.
+    let id = matches!(request, ClientMsg::Mutate(_)).then(|| "42".to_string());
+    let done = ServerMsg::Done { request_id, state: None, id };
     stream.write_all(&control::encode(&done).unwrap()).unwrap();
     request
 }
@@ -625,4 +645,105 @@ fn edit_starts_a_far_editor_session_the_window_attaches_to_by_name() {
     assert!(shown.contains(&format!("editing {}", file.display())), "{shown:?}");
     let _ = conn.kill(Some(9));
     far.sockets.extend(started.lock().unwrap().drain(..));
+}
+
+#[test]
+fn a_far_upgrade_while_away_refuses_the_reconnect_and_offers_reopen() {
+    let mut far = Far::new();
+    far.start("demo/orch", "printf 'orch ready\\n'; exec cat");
+    let link = far.link();
+    let remote = healthy();
+    let connector = RemoteSessionConnector::new(link.clone(), session(), remote.clone());
+    let (pane, events) = attach(&connector, &SessionRef::Orchestrator);
+    read_until(&events, "orch ready");
+
+    // The far Shelbi is upgraded while the connection is down.
+    far.drop_channels();
+    read_to_end(&events);
+    drop(pane);
+    remote.set_far_version(HOST, "0.0.2", Some(shelbi_app::launch::NativeCapability::current()));
+    match connector.connect(PROJECT, &SessionRef::Orchestrator) {
+        Err(ConnectFailure::Message(message)) => {
+            assert!(message.starts_with("Shelbi on devbox is now 0.0.2 and "), "{message}");
+            assert!(message.ends_with("Reopen to continue in its terminal view."), "{message}");
+        }
+        Err(other) => panic!("expected the refusal, got {other:?}"),
+        Ok(_) => panic!("a changed host was reconnected"),
+    }
+    assert!(
+        matches!(connector.refusal(), Some(RemoteError::NoLongerNative { ref host, .. }) if host == HOST),
+        "the window offers Reopen: {:?}",
+        connector.refusal()
+    );
+    assert_eq!(link.opens(), 1, "nothing is sent to a daemon that may reject it");
+
+    // Back on this build (say both were updated), the next attempt gets through.
+    remote.set_far_version(HOST, env!("CARGO_PKG_VERSION"), Some(shelbi_app::launch::NativeCapability::current()));
+    let (_pane, events) = attach(&connector, &SessionRef::Orchestrator);
+    read_until(&events, "orch ready");
+    assert_eq!(connector.refusal(), None);
+}
+
+#[test]
+fn a_workspace_on_another_far_machine_shows_a_placeholder_naming_it() {
+    use shelbi_app::source::wire::{Answer, Query, QueryError};
+    use shelbi_app::source::WorkspaceDetails;
+    let mut far = Far::new();
+    far.answer_queries(|query: Query, _early: &mut dyn FnMut(Answer)| match query {
+        Query::WorkspaceDetails { workspace, .. } => Ok(Answer::WorkspaceDetails(Box::new(WorkspaceDetails {
+            machine: if workspace == "gamma" { "gpu-box".into() } else { "local".into() },
+            is_remote: workspace == "gamma",
+            ..WorkspaceDetails::default()
+        }))),
+        other => Err(QueryError::Unsupported {
+            message: format!("{other:?}"),
+        }),
+    });
+    let connector = RemoteSessionConnector::new(far.link(), session(), healthy());
+
+    // On the far project's own other machine: out of reach until P9.
+    match connector.connect(PROJECT, &SessionRef::Workspace("gamma".into())) {
+        Err(ConnectFailure::Message(message)) => {
+            assert_eq!(message, shelbi_app::remote_window::two_hop_placeholder("gamma", "gpu-box"));
+            assert!(message.contains("gpu-box"), "{message}");
+        }
+        other => panic!("expected the placeholder, got {:?}", other.err()),
+    }
+    // On the far host itself, with no session: idle there, as before.
+    match connector.connect(PROJECT, &SessionRef::Workspace("beta".into())) {
+        Err(ConnectFailure::Idle(info)) => assert_eq!(info.machine, HOST),
+        other => panic!("expected idle, got {:?}", other.err()),
+    }
+}
+
+#[test]
+fn new_task_hands_the_write_up_to_the_far_orchestrator() {
+    use shelbi_app::new_task::{create_linked, CreateRequest, WriteUp};
+    let mut far = Far::new();
+    let control = far.control_socket();
+    far.start("demo/orch", "printf 'orch ready\\n'; exec cat");
+    let link = far.link();
+    let connector = Arc::new(RemoteSessionConnector::new(link.clone(), session(), healthy()));
+    let project = ProjectLink::remote(PROJECT, link.clone(), connector.clone());
+    // Watch the far orchestrator as the window's pane does.
+    let (_pane, events) = attach(&*connector, &SessionRef::Orchestrator);
+    read_until(&events, "orch ready");
+
+    let served = std::thread::spawn(move || serve_one_request(&control));
+    let request = CreateRequest {
+        command: shelbi_app::CommandKind::AddIssue {
+            title: "Warm the cache".into(),
+            body: None,
+            workflow: None,
+            status: None,
+            top: false,
+        },
+        write_up: true,
+    };
+    let created = create_linked(&project, &request).expect("created on the far daemon");
+    assert!(matches!(served.join().unwrap(), ClientMsg::Mutate(_)), "the add went to the far daemon");
+    assert_eq!(created.id.as_deref(), Some("42"));
+    assert_eq!(created.write_up, WriteUp::Requested, "the far orchestrator is running");
+    // The write-up was typed into the far orchestrator, not a local one.
+    read_until(&events, "Please write up issue 42");
 }

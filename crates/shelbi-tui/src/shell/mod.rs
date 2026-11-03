@@ -4034,6 +4034,14 @@ impl ShellState {
                     "New Window is a desktop command: run shelbi in another terminal".to_string(),
                 )
             }
+            // The registry lists Open in Terminal View only in a native
+            // remote window (`CommandModel::remote_host`, the desktop's): this
+            // client is already the project's terminal view, and a remote
+            // project opens here over `ssh -t` (`remote_connected`).
+            Effect::OpenTerminalView { .. } => {
+                self.client.focus_main();
+                self.status = Some("You're in Shelbi's terminal view.".to_string());
+            }
             Effect::Detach => self.quit(QuitAction::CloseUi),
             Effect::DetachOtherClients => self.detach_other_clients(),
             Effect::QuitProject { .. } => self.quit(QuitAction::QuitProject),
@@ -9597,6 +9605,24 @@ mod tests {
         assert!(screen_text(&term).contains("Connect to Remote Session"));
         st.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(st.overlay.is_none(), "Esc cancels");
+    }
+
+    #[test]
+    fn open_in_terminal_view_is_never_listed_and_says_this_is_it() {
+        // A native remote window's command: the TUI's model has no remote
+        // host, so its palette never lists it.
+        let mut st = smoke_state();
+        assert!(!st
+            .palette_entries_from_model()
+            .iter()
+            .any(|e| e.id == "action:open-terminal-view"));
+        // Arriving anyway, it lands on the terminal view this already is.
+        st.effect_tap = None;
+        st.client.focus_sidebar();
+        st.dispatch_effect(Effect::OpenTerminalView { project: "proj".into() });
+        assert_eq!(st.client.focus(), shelbi_app::Focus::Main);
+        assert_eq!(st.status.as_deref(), Some("You're in Shelbi's terminal view."));
+        assert!(st.opened_remotes.is_empty(), "nothing opens over ssh");
     }
 
     #[test]
