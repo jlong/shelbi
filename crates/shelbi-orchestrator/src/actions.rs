@@ -13,9 +13,10 @@
 //!
 //! All actions are idempotent and silently no-op when not applicable:
 //!
-//! - `push_branch` pushes the task's branch from the workspace's worktree.
-//!   Pushing an up-to-date branch reports `Everything up-to-date` and
-//!   still succeeds.
+//! - `push_branch` pushes the task's branch from the workspace's worktree
+//!   when the local branch has commits origin lacks. A branch that is up to
+//!   date, behind origin, or present only on origin is a no-op (origin
+//!   already has the work); one missing everywhere is an error.
 //! - `open_pr` opens a PR for the task's branch. If one is already open,
 //!   returns its number unchanged. The base branch is picked by a fallback
 //!   chain — see [`open_pr`].
@@ -237,6 +238,26 @@ impl RestackOutcome {
 
 /// Push the task's branch from the workspace's worktree to `origin`.
 ///
+/// The purpose is publishing local work origin doesn't have yet, so the
+/// push only runs when the local branch could add something:
+///
+/// | local branch           | origin branch | result                        |
+/// |------------------------|---------------|-------------------------------|
+/// | same tip as origin     | present       | no-op                         |
+/// | absent                 | present       | no-op: origin is the branch   |
+/// | behind (ancestor of) origin | present  | no-op: never rewind origin    |
+/// | ahead / diverged       | present       | `git push` (as before)        |
+/// | present                | absent        | `git push` (first publish)    |
+/// | absent                 | absent        | error naming the branch       |
+///
+/// The "absent locally" row is the umbrella shape: a branch created on
+/// origin and only ever advanced there (subtasks squash-merged into it),
+/// assigned to a review worktree detached elsewhere. Every downstream
+/// consumer (`merge`, `open_pr`) reads `origin/<branch>`, so there is
+/// nothing a local ref would add. The local branch is deliberately left
+/// alone in the "behind" case too: fast-forwarding it could move a branch a
+/// worktree has checked out.
+///
 /// Errors when the task has no assigned workspace or no `branch` field — both
 /// are caller bugs (the workflow contract guarantees both fields by the
 /// time this fires). Re-pushing an up-to-date branch is a clean success.
@@ -255,8 +276,41 @@ pub fn push_branch(project: &Project, task: &Issue) -> Result<()> {
     // `open_pr` — the exact review-with-no-PR incident this guards against.
     // The comparison is a purely local ref read (no network), so it can't
     // itself wedge.
-    if branch_tip_already_on_origin(&host, &wt, &branch)? {
-        return Ok(());
+    let local = rev_parse_commit(&host, &wt, &format!("refs/heads/{branch}"))?;
+    let tracking = rev_parse_commit(&host, &wt, &format!("refs/remotes/origin/{branch}"))?;
+    if let (Some(l), Some(r)) = (&local, &tracking) {
+        if l == r {
+            return Ok(());
+        }
+    }
+
+    // Past the fast path the tracking ref is stale or missing, and we are
+    // about to talk to origin anyway, so refresh it: the decision below has
+    // to be made against what origin holds *now*.
+    let origin = fetch_origin_branch(&host, &wt, &branch)?;
+
+    let Some(local) = local else {
+        return match origin {
+            // Branch lives only on origin: nothing local to publish.
+            OriginBranch::Present(_) => Ok(()),
+            OriginBranch::Missing => Err(Error::Other(format!(
+                "branch `{branch}` exists neither in workspace worktree {wt} nor on \
+                 origin — nothing to push or merge; check the task's `branch:` field"
+            ))),
+            OriginBranch::Unknown(e) => Err(Error::Other(format!(
+                "branch `{branch}` has no local ref in workspace worktree {wt}, and \
+                 checking origin for it failed: {e}"
+            ))),
+        };
+    };
+
+    if let OriginBranch::Present(remote) = &origin {
+        // Up to date, or behind: origin already has every local commit. A push
+        // would be a no-op or a non-fast-forward rejection — and must never
+        // move origin backwards — so skip it.
+        if *remote == local || is_ancestor(&host, &wt, &local, remote)? {
+            return Ok(());
+        }
     }
 
     let out = run_in_dir(&host, &wt, &["git", "push", "-u", "origin", "--", &branch])?;
@@ -270,19 +324,73 @@ pub fn push_branch(project: &Project, task: &Issue) -> Result<()> {
     Ok(())
 }
 
-/// True when the local `refs/heads/<branch>` tip equals the remote-tracking
-/// `refs/remotes/origin/<branch>` tip — i.e. this exact commit is already
-/// published on origin, so a `git push` would be a no-op. Both refs are read
-/// locally (`git rev-parse`); a missing tracking ref (branch never pushed)
-/// or an unreadable local branch is treated as "not yet on origin" so the
-/// caller pushes.
-fn branch_tip_already_on_origin(host: &Host, wt: &str, branch: &str) -> Result<bool> {
-    let local = rev_parse_commit(host, wt, &format!("refs/heads/{branch}"))?;
-    let remote = rev_parse_commit(host, wt, &format!("refs/remotes/origin/{branch}"))?;
-    Ok(match (local, remote) {
-        (Some(l), Some(r)) => l == r,
-        _ => false,
+/// What [`fetch_origin_branch`] learned about `origin/<branch>`.
+#[derive(Debug)]
+enum OriginBranch {
+    /// Fetched; the tracking ref now points at this SHA.
+    Present(String),
+    /// Origin answered and has no such branch.
+    Missing,
+    /// The fetch failed for some other reason (network, auth). Carries the
+    /// error so a caller with nothing else to go on can surface it.
+    Unknown(Error),
+}
+
+/// Refresh `refs/remotes/origin/<branch>` from origin and report what origin
+/// holds. A failed fetch is classified with `git ls-remote --exit-code`
+/// (exit 2 = no matching ref, locale-independent) so "origin has no such
+/// branch" is told apart from "origin couldn't be reached".
+fn fetch_origin_branch(host: &Host, wt: &str, branch: &str) -> Result<OriginBranch> {
+    let refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let out = run_in_dir(host, wt, &["git", "fetch", "-q", "origin", "--", &refspec])?;
+    if out.status.success() {
+        return Ok(
+            match rev_parse_commit(host, wt, &format!("refs/remotes/origin/{branch}"))? {
+                Some(sha) => OriginBranch::Present(sha),
+                None => OriginBranch::Missing,
+            },
+        );
+    }
+    let fetch_err = Error::Command {
+        cmd: format!("git -C {wt} fetch -q origin -- {refspec}"),
+        status: out.status.to_string(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    };
+    let probe = run_in_dir(
+        host,
+        wt,
+        &[
+            "git",
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    Ok(match probe.status.code() {
+        Some(2) => OriginBranch::Missing,
+        _ => OriginBranch::Unknown(fetch_err),
     })
+}
+
+/// `git merge-base --is-ancestor <ancestor> <descendant>`: exit 0 is yes,
+/// 1 is no, anything else (bad object) is a real error.
+fn is_ancestor(host: &Host, wt: &str, ancestor: &str, descendant: &str) -> Result<bool> {
+    let out = run_in_dir(
+        host,
+        wt,
+        &["git", "merge-base", "--is-ancestor", ancestor, descendant],
+    )?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(Error::Command {
+            cmd: format!("git -C {wt} merge-base --is-ancestor {ancestor} {descendant}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        }),
+    }
 }
 
 /// Resolve `refspec` to its commit SHA via `git rev-parse --verify --quiet`,
@@ -1952,7 +2060,29 @@ mod tests {
             repo,
             &["worktree", "add", wt_path.to_str().unwrap(), branch],
         );
+        project_with_workspace(repo, workspace)
+    }
 
+    /// Like [`project_with_local_workspace_holding`], but the workspace
+    /// worktree is *detached* at `commit` — the shape of a review slot that
+    /// synced to some old commit and never checked the task's branch out.
+    fn project_with_detached_workspace(
+        repo: &std::path::Path,
+        workspace: &str,
+        commit: &str,
+    ) -> Project {
+        let wt_path = repo.join(".shelbi").join("wt").join(workspace);
+        std::fs::create_dir_all(wt_path.parent().unwrap()).unwrap();
+        run_git(
+            repo,
+            &["worktree", "add", "--detach", wt_path.to_str().unwrap(), commit],
+        );
+        project_with_workspace(repo, workspace)
+    }
+
+    /// A project whose single local workspace `workspace` lives at
+    /// `<repo>/.shelbi/wt/<workspace>` (the caller materializes it).
+    fn project_with_workspace(repo: &std::path::Path, workspace: &str) -> Project {
         let mut runners = BTreeMap::new();
         runners.insert(
             "claude".to_string(),
@@ -2359,6 +2489,175 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(local_tip, remote_tip, "origin/feature should now match local");
+    }
+
+    /// Advance `branch` on `remote` from a separate clone, so the fixture's
+    /// `local` repo has neither the commit nor an up-to-date tracking ref —
+    /// the shape of a branch other workspaces moved on origin. `start` is
+    /// the origin branch the new branch is cut from when it doesn't exist
+    /// yet. Returns the new origin tip.
+    fn commit_on_origin_from_other_clone(
+        remote: &std::path::Path,
+        branch: &str,
+        start: &str,
+        subject: &str,
+    ) -> String {
+        let parent = remote.parent().unwrap();
+        let other = parent.join(format!("other-{}", branch.replace('/', "-")));
+        if !other.exists() {
+            run_git(
+                parent,
+                &["clone", "-q", remote.to_str().unwrap(), other.to_str().unwrap()],
+            );
+            run_git(&other, &["config", "user.email", "test@example.com"]);
+            run_git(&other, &["config", "user.name", "Test"]);
+        }
+        run_git(&other, &["fetch", "-q", "origin"]);
+        let exists = Command::new("git")
+            .current_dir(&other)
+            .args(["rev-parse", "--verify", "--quiet", &format!("refs/remotes/origin/{branch}")])
+            .status()
+            .unwrap()
+            .success();
+        let from = if exists { branch } else { start };
+        run_git(
+            &other,
+            &["checkout", "-q", "--no-track", "-B", branch, &format!("origin/{from}")],
+        );
+        let stem: String = subject
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let file = format!("{stem}.txt");
+        std::fs::write(other.join(&file), format!("{subject}\n")).unwrap();
+        run_git(&other, &["add", &file]);
+        run_git(&other, &["commit", "-q", "-m", subject]);
+        run_git(&other, &["push", "-q", "origin", &format!("HEAD:refs/heads/{branch}")]);
+        let wt = other.to_string_lossy().into_owned();
+        rev_parse_commit(&Host::Local, &wt, "HEAD").unwrap().unwrap()
+    }
+
+    /// The remote-window umbrella incident: the task's branch was created on
+    /// origin and only ever advanced there, and the assigned review worktree
+    /// is detached at an old commit with no local branch of that name.
+    /// `push_branch` used to run `git push -u origin -- <branch>` and die on
+    /// `src refspec <branch> does not match any`, aborting the merge. It must
+    /// now skip the push, and the merge must integrate what origin has.
+    #[test]
+    fn push_branch_skips_branch_that_exists_only_on_origin_and_merge_lands_it() {
+        let (_tmp, remote, local) = fixture_repo_with_origin();
+        commit_on_origin_from_other_clone(&remote, "umbrella", "main", "feat: subtask one");
+        commit_on_origin_from_other_clone(&remote, "umbrella", "main", "feat: subtask two");
+        // The review slot: detached at the initial commit, no `umbrella` ref.
+        let project = project_with_detached_workspace(&local, "review", "main");
+        let wt = local.to_string_lossy().into_owned();
+        assert!(!local_branch_exists(&Host::Local, &wt, "umbrella").unwrap());
+        let mut task = task_on_branch("remote-window", "umbrella");
+        task.assigned_to = Some("review".into());
+
+        crate::git::record_git_invocations();
+        push_branch(&project, &task).expect("push_branch must not fail on an origin-only branch");
+        let invocations = crate::git::take_git_invocations();
+        assert!(
+            !invocations.iter().any(|argv| argv.iter().any(|a| a == "push")),
+            "nothing local to publish, so no `git push`; ran: {invocations:?}"
+        );
+        // No local branch was invented as a side effect.
+        assert!(!local_branch_exists(&Host::Local, &wt, "umbrella").unwrap());
+
+        // The merge that follows integrates origin's branch.
+        expect_merged_sha(
+            merge_hub_side(&Host::Local, &wt, "umbrella", "main", MergeStrategy::Squash, "t")
+                .unwrap(),
+        );
+        run_git(&local, &["fetch", "-q", "origin"]);
+        let tree = run_capture_stdout(
+            &Host::Local,
+            &wt,
+            &["git", "ls-tree", "--name-only", "origin/main"],
+        )
+        .unwrap();
+        assert!(tree.contains("feat--subtask-one.txt"), "{tree}");
+        assert!(tree.contains("feat--subtask-two.txt"), "{tree}");
+    }
+
+    #[test]
+    fn push_branch_skips_local_branch_behind_origin_without_rewinding_it() {
+        // The local `feature` stays at `init` while another clone advances
+        // origin/feature. The tracking ref is refreshed so the fast path
+        // can't hide the gap: local != tracking, and local is the ancestor.
+        let (_tmp, remote, local) = fixture_repo_with_origin();
+        let origin_tip =
+            commit_on_origin_from_other_clone(&remote, "feature", "main", "feat: from elsewhere");
+        run_git(&local, &["fetch", "-q", "origin"]);
+        let project = project_with_detached_workspace(&local, "review", "main");
+        let mut task = task_on_branch("t", "feature");
+        task.assigned_to = Some("review".into());
+
+        crate::git::record_git_invocations();
+        push_branch(&project, &task).expect("a behind branch must not fail push_branch");
+        let invocations = crate::git::take_git_invocations();
+        assert!(
+            !invocations.iter().any(|argv| argv.iter().any(|a| a == "push")),
+            "origin already has every local commit, so no `git push`; ran: {invocations:?}"
+        );
+
+        // Origin was not moved backwards.
+        let bare = remote.to_string_lossy().into_owned();
+        let tip = rev_parse_commit(&Host::Local, &bare, "refs/heads/feature")
+            .unwrap()
+            .unwrap();
+        assert_eq!(tip, origin_tip);
+    }
+
+    #[test]
+    fn push_branch_skips_behind_branch_even_with_a_stale_tracking_ref() {
+        // Same as above but the hub never fetched: local == tracking (stale),
+        // origin is ahead. The local fast path already treats that as done;
+        // pin it so a future change doesn't start pushing a stale tip.
+        let (_tmp, remote, local) = fixture_repo_with_origin();
+        let origin_tip =
+            commit_on_origin_from_other_clone(&remote, "feature", "main", "feat: from elsewhere");
+        let project = project_with_detached_workspace(&local, "review", "main");
+        let mut task = task_on_branch("t", "feature");
+        task.assigned_to = Some("review".into());
+
+        push_branch(&project, &task).expect("push_branch");
+        let bare = remote.to_string_lossy().into_owned();
+        let tip = rev_parse_commit(&Host::Local, &bare, "refs/heads/feature")
+            .unwrap()
+            .unwrap();
+        assert_eq!(tip, origin_tip);
+    }
+
+    #[test]
+    fn push_branch_pushes_a_branch_origin_has_never_seen() {
+        // Local-only branch: the first publish still happens.
+        let (_tmp, remote, local) = fixture_repo_with_origin();
+        run_git(&local, &["branch", "fresh"]);
+        let project = project_with_detached_workspace(&local, "review", "main");
+        let mut task = task_on_branch("t", "fresh");
+        task.assigned_to = Some("review".into());
+
+        push_branch(&project, &task).expect("push_branch");
+        let bare = remote.to_string_lossy().into_owned();
+        assert!(rev_parse_commit(&Host::Local, &bare, "refs/heads/fresh")
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn push_branch_errors_naming_a_branch_missing_everywhere() {
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        let project = project_with_detached_workspace(&local, "review", "main");
+        let mut task = task_on_branch("t", "ghost-branch");
+        task.assigned_to = Some("review".into());
+
+        let err = push_branch(&project, &task).expect_err("no branch anywhere must fail");
+        let msg = err.to_string();
+        assert!(msg.contains("`ghost-branch`"), "{msg}");
+        assert!(msg.contains("nor on origin"), "{msg}");
+        assert!(!msg.contains("src refspec"), "{msg}");
     }
 
     #[test]
