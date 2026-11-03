@@ -488,6 +488,58 @@ mod tests {
         assert!(remote.poll_interval > local.poll_interval);
         assert!(remote.live_interval > local.live_interval);
     }
+
+    /// A remote window's feed, over the far host's relay link: the far
+    /// daemon's `Changed` (another client there moved a card) wakes it at
+    /// once, long before its 20s safety refresh, and its snapshot is the far
+    /// project's.
+    #[test]
+    fn a_far_changed_note_wakes_a_remote_feed() {
+        let far = crate::remote_fixture::FarHost::new("feed");
+        let mut remote = crate::app::RemoteWindow::new(far.session(), far.listing(), far.link.clone(), far.remote.clone());
+        let handle = remote.handle_for_test(crate::remote_fixture::PROJECT);
+        let (feed, mut events) = ProjectFeed::spawn(&handle);
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Some(event) = futures::executor::block_on(events.next()) {
+                if tx.send(event).is_err() {
+                    return;
+                }
+            }
+        });
+        let wait = Duration::from_secs(10);
+        let mut snapshots = 0;
+        let mut live = false;
+        let deadline = Instant::now() + wait;
+        while !(live && snapshots > 0) {
+            assert!(Instant::now() < deadline, "the feed never went live over the link");
+            match rx.recv_timeout(wait).expect("the feed's first events") {
+                FeedEvent::Link(DaemonLink::Live) => live = true,
+                FeedEvent::Snapshot(snapshot) => {
+                    let sidebar = snapshot.sidebar.expect("the far project's sidebar");
+                    // The far fixture project's display name, read far side.
+                    assert_eq!(sidebar.project_label, "My project");
+                    snapshots += 1;
+                }
+                _ => {}
+            }
+        }
+        // Let the far daemon's subscription land, then drain what came.
+        thread::sleep(Duration::from_millis(300));
+        while rx.try_recv().is_ok() {}
+
+        far.far_move("t-2", "todo");
+        let woke = Instant::now();
+        loop {
+            match rx.recv_timeout(Duration::from_secs(5)).expect("a far Changed wakes the feed") {
+                FeedEvent::Snapshot(_) => break,
+                _ => continue,
+            }
+        }
+        assert!(woke.elapsed() < FeedTiming::remote().live_interval / 4, "{:?}", woke.elapsed());
+        drop(feed);
+    }
+
     use futures::StreamExt;
     use shelbi_app::view::SidebarModel;
 

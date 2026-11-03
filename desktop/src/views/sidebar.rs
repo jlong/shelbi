@@ -447,6 +447,17 @@ pub struct SidebarProps<'a> {
     pub track: SharedTrack,
     /// The sliding selection chip's bounds while it moves between rows.
     pub chip: Option<Bounds<Pixels>>,
+    /// A remote window's host (`jlong@devbox`), drawn over the project with
+    /// its link's dot; `None` for a project on this machine.
+    pub remote: Option<RemoteBadge>,
+}
+
+/// A remote window's host row: who and where, and whether the far link is
+/// live (a green dot) or reconnecting (yellow).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteBadge {
+    pub address: String,
+    pub connected: bool,
 }
 
 /// The switcher menu, as one frame draws it.
@@ -905,6 +916,29 @@ fn render_project<H: SidebarHost>(
         .as_ref()
         .map(|switcher| switcher_menu(switcher, &props.switcher_button, props.width, theme, cx));
 
+    let remote = props.remote.as_ref().map(|badge| {
+        let dot = if badge.connected { theme.success } else { theme.warning };
+        div()
+            .debug_selector(|| "sidebar-remote-host".into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px_2()
+            .max_w_full()
+            .type_style(Type::Small)
+            .text_color(theme.muted)
+            .child(
+                div()
+                    .debug_selector(|| "sidebar-remote-dot".into())
+                    .flex_none()
+                    .size(px(REMOTE_DOT))
+                    .rounded_full()
+                    .bg(dot),
+            )
+            .child(div().truncate().child(badge.address.clone()))
+    });
+
     div()
         .relative()
         .flex()
@@ -915,9 +949,13 @@ fn render_project<H: SidebarHost>(
         .min_h(px(PROJECT_BLOCK_H))
         .px(px(BLOCK_X))
         .py(px(BLOCK_Y))
+        .children(remote)
         .child(button)
         .children(menu)
 }
+
+/// A remote window's link dot.
+const REMOTE_DOT: f32 = 7.0;
 
 /// The project switcher's trigger: the project's `label` and an up-down
 /// chevron, holding its pressed fill while the menu is `open`; it records
@@ -2103,6 +2141,7 @@ mod render_tests {
                     scroll: gpui::ScrollHandle::new(),
                     track: motion::SlideTrack::shared(),
                     chip: None,
+                    remote: None,
                 },
                 &theme,
                 cx,

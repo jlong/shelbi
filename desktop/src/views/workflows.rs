@@ -273,10 +273,25 @@ impl WorkflowsPage {
     /// Make `edit` and save it (after the save in flight, if any).
     fn request(&mut self, edit: Edit, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
+        if self.read_only(cx) {
+            return;
+        }
         if let Some(job) = self.state.request(edit) {
             self.start(job, window, cx);
         }
         cx.notify();
+    }
+
+    /// A remote window's project: its settings are read-only for now (P8),
+    /// so a change shows why under the page's header and writes nothing.
+    fn read_only(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(host) = self.source.key().host() else {
+            return false;
+        };
+        self.state
+            .set_error(Target::Page, shelbi_app::remote_window::settings_read_only(host));
+        cx.notify();
+        true
     }
 
     /// Save one edit off the UI thread; when it lands, start the next.
@@ -420,6 +435,10 @@ impl WorkflowsPage {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // The file is on the far machine.
+        if self.read_only(cx) {
+            return;
+        }
         self.reload_on_return = true;
         let open = cx.background_executor().spawn(async move {
             prepare(&path)?;

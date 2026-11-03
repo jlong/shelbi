@@ -306,6 +306,8 @@ impl SettingsValues {
             // Written once picked, whichever it is, so the choice outlives
             // a change of default.
             app_icon: self.app_icon,
+            // A developer setting Settings doesn't show: kept as written.
+            native_remote: cfg.desktop.native_remote,
         };
         self.translucency.apply(&mut cfg.desktop);
         contrast::apply(self.contrast, &mut cfg.desktop);

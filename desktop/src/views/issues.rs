@@ -80,6 +80,9 @@ use crate::theme::style::{Type, Typography};
 
 /// The fallback refresh cadence (the TUI's).
 const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+/// The re-read cadence for a project on another machine: each read is a
+/// round trip over the host's relay link.
+const REMOTE_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 /// How often the view drains its channels.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// An expanded column's width.
@@ -815,7 +818,12 @@ impl IssuesView {
             self.close_editors();
             changed = true;
         }
-        if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
+        let interval = if self.project.key().is_local() {
+            REFRESH_INTERVAL
+        } else {
+            REMOTE_REFRESH_INTERVAL
+        };
+        if self.last_refresh.elapsed() >= interval {
             self.refresh();
         }
         if changed {
@@ -991,7 +999,14 @@ impl IssuesView {
     }
 
     /// Small `state.json` writes, off the UI thread.
+    /// Write a board setting (the workspace filter, a column override) off
+    /// the UI thread. A remote window's project keeps them in the window:
+    /// they are the far machine's project state, which it doesn't write yet
+    /// (P7), and never this machine's.
     fn persist(&self, f: impl FnOnce() -> Result<(), String> + Send + 'static) {
+        if !self.project.key().is_local() {
+            return;
+        }
         let tx = self.done_tx.clone();
         std::thread::spawn(move || {
             let _ = tx.send(Done::Persisted(f()));

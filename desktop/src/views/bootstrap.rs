@@ -546,6 +546,46 @@ pub fn render_relaunch_bar(
         .into_any_element()
 }
 
+/// A bar like the relaunch bar: `message` and one button, `label`. A remote
+/// window's "Shelbi isn't running on devbox." with Start Shelbi draws it.
+pub fn render_action_bar(
+    id: &'static str,
+    message: impl Into<gpui::SharedString>,
+    label: &'static str,
+    theme: &Theme,
+    on_click: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    div()
+        .debug_selector(move || id.into())
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .min_h(px(sidebar::TITLEBAR_H))
+        .pl(px(sidebar::BESIDE_TRAFFIC_LIGHTS))
+        .pr_4()
+        .py_2()
+        .bg(theme.notice)
+        .border_b_1()
+        .border_color(theme.divider)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_2()
+                .text_color(theme.text_loud)
+                .child(heroicon(icons::EXCLAMATION_TRIANGLE).text_color(theme.warning))
+                .child(message.into()),
+        )
+        .child(
+            style::button(id, label, ButtonKind::Success, ButtonSize::Base, false, theme)
+                .on_click(move |_, window, cx| on_click(window, cx)),
+        )
+        .into_any_element()
+}
+
 /// A full-window, centered, scrollable stage.
 fn centered(theme: &Theme) -> gpui::Stateful<gpui::Div> {
     div()

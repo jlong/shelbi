@@ -385,7 +385,14 @@ pub struct WindowFacts {
 
 /// The menu bar for `model` with `keymaps`' shortcuts.
 pub fn build(model: &CommandModel, keymaps: &Keymaps, facts: WindowFacts) -> MenuTree {
-    let commands = CommandRegistry::new().commands(model);
+    // What this window can't run (a remote window's far writes) is drawn
+    // disabled: dropped here, so its fixed slot shows gray and a family
+    // (the edit targets) shows its empty placeholder.
+    let commands: Vec<Command> = CommandRegistry::new()
+        .commands(model)
+        .into_iter()
+        .filter(|c| model.unavailable(c.kind()).is_none())
+        .collect();
     let available: HashSet<&str> = commands.iter().map(Command::id).collect();
     let by_place = |p: Placement| commands.iter().filter(move |c| place(c.kind()) == p);
 
@@ -780,6 +787,7 @@ mod tests {
             // The desktop has the launch screen and the Connect dialog.
             launch_screen: true,
             remote_connect: true,
+            remote_host: None,
         }
     }
 
@@ -912,6 +920,17 @@ mod tests {
                 &MenuAction::Command("action:reject-review:T-1".into()),
             ]
         );
+    }
+
+    #[test]
+    fn a_remote_windows_unavailable_commands_are_disabled() {
+        let mut model = fixture();
+        model.remote_host = Some("devbox".into());
+        let tree = build(&model, &Keymaps::default(), WindowFacts::default());
+        for title in ["Add Project\u{2026}", "Quit Shelbi and Stop All Agents\u{2026}", "New Window"] {
+            assert!(!find(&tree, title).enabled, "{title} is disabled in a remote window");
+        }
+        assert!(find(&tree, "Quit Project\u{2026}").enabled, "the far project quits over the link");
     }
 
     #[test]

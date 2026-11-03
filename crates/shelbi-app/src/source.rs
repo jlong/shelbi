@@ -427,6 +427,23 @@ impl ProjectLink {
         }
     }
 
+    /// Quit the project on the far daemon (its agents stop; the far Shelbi
+    /// keeps running), for a remote link: the relay allows Quit Project only
+    /// for the window's own project. `None` for a local link, whose client
+    /// quits through its own control connection.
+    pub fn quit_far_project(&self) -> Option<Result<(), String>> {
+        let relay = self.relay.as_ref()?;
+        Some(
+            Self::far_control(&**relay, &self.key.name)
+                .map_err(|e| e.to_string())
+                .and_then(|mut client| {
+                    client
+                        .quit_project(&self.key.name)
+                        .map_err(|e| format!("{}: {e}", relay.host()))
+                }),
+        )
+    }
+
     /// Ask the daemon to start or stop review `task`'s sessions.
     pub fn review_session(&self, task: &str, op: ReviewSessionOp, on_line: &mut dyn FnMut(Stream, &str)) -> ExecOutcome {
         match &self.relay {

@@ -375,6 +375,21 @@ pub struct CommandModel {
     /// "Connect to Remote Session…"; a client turns it on once its dialog is
     /// built.
     pub remote_connect: bool,
+    /// The host a remote window's project lives on (`None` on this
+    /// machine). Commands such a window can't run yet stay listed, each
+    /// with the reason as its subtitle ([`CommandModel::unavailable`]): a
+    /// menu draws them disabled and the client refuses them with that line.
+    pub remote_host: Option<String>,
+}
+
+impl CommandModel {
+    /// Why `kind` can't run in this window, or `None` when it can: only a
+    /// remote window's ([`Self::remote_host`]) refuses any
+    /// ([`crate::remote_window::command_unavailable`]).
+    pub fn unavailable(&self, kind: &CommandKind) -> Option<String> {
+        let host = self.remote_host.as_deref()?;
+        crate::remote_window::command_unavailable(kind, host)
+    }
 }
 
 /// The one-line description shown beside a nav view in the command palette's
@@ -756,6 +771,13 @@ impl CommandRegistry {
             hidden_until_query: false,
         });
 
+        // A remote window lists what it can't run yet with the reason.
+        for c in &mut out {
+            if let Some(reason) = model.unavailable(&c.kind) {
+                c.subtitle = Some(reason);
+                c.shortcut = None;
+            }
+        }
         out
     }
 
@@ -937,6 +959,7 @@ mod tests {
             multi_window: true,
             launch_screen: true,
             remote_connect: true,
+            remote_host: None,
         }
     }
 
@@ -1061,6 +1084,32 @@ mod tests {
         assert!(reg.resolve("action:launch-screen", &m).is_none());
         let fresh = CommandModel::default();
         assert!(!fresh.launch_screen && !fresh.remote_connect);
+    }
+
+    #[test]
+    fn a_remote_window_lists_what_it_cant_run_with_the_reason() {
+        let reg = CommandRegistry::new();
+        let mut m = model();
+        let local = reg.commands(&m);
+        assert!(local.iter().all(|c| m.unavailable(c.kind()).is_none()), "a local window refuses nothing");
+
+        m.remote_host = Some("jlong@devbox".into());
+        let remote = reg.commands(&m);
+        assert_eq!(
+            remote.iter().map(Command::id).collect::<Vec<_>>(),
+            local.iter().map(Command::id).collect::<Vec<_>>(),
+            "nothing is dropped: a refused command stays listed",
+        );
+        let zen = reg.resolve("action:toggle-zen", &m).unwrap();
+        let reason = m.unavailable(zen.kind()).expect("zen is a far state write");
+        assert_eq!(zen.to_entry().subtitle.as_deref(), Some(reason.as_str()));
+        assert!(zen.to_entry().shortcut.is_none(), "a refused command shows no shortcut");
+        let quit = reg.resolve("action:quit-shelbi", &m).unwrap();
+        assert!(m.unavailable(quit.kind()).unwrap().contains("devbox"));
+        // What goes to the far daemon stays available.
+        let quit_project = reg.resolve("action:quit-project", &m).unwrap();
+        assert_eq!(m.unavailable(quit_project.kind()), None);
+        assert_eq!(m.unavailable(&CommandKind::ShowView(View::Issues)), None);
     }
 
     #[test]
