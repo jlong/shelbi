@@ -693,6 +693,36 @@ pub fn attach(host: &Host, name: &str) -> std::result::Result<RemoteAttach, Remo
     })
 }
 
+/// A raw stream to the live session `name` on `host`, through the machine's
+/// cached relay (replaced once if it turns out dead), for a caller that speaks
+/// the session protocol itself: the relay's `session` service, which bridges
+/// it to a remote window on yet another machine (the second hop). Nothing is
+/// sent on it: the far client does its own hello and attach.
+///
+/// Unlike [`attach`] it never signs in: the relay that calls it runs over a
+/// non-interactive SSH channel, with nobody to ask, so it relies on the
+/// machine's credentials as the hub's own background polling does.
+/// Blocking.
+pub fn open_stream(host: &Host, name: &str) -> std::result::Result<shelbi_client::RelayStream, RemoteAttachError> {
+    let bin = relay_bin_for_host(host);
+    let unreachable = |e: ClientError| match e {
+        ClientError::RelayUnreachable => {
+            RemoteAttachError::Unreachable(format!("`{}` is unreachable", host_label(host)))
+        }
+        other => RemoteAttachError::Unreachable(format!("relay to `{}` failed: {other}", host_label(host))),
+    };
+    let sessions = with_channel(host, &bin, |ch| ch.list_sessions()).map_err(unreachable)?;
+    let Some(session) = sessions.iter().find(|s| s.alive && s.name == name) else {
+        return Err(RemoteAttachError::NoSession {
+            exited: sessions.iter().any(|s| s.name == name),
+        });
+    };
+    with_channel(host, &bin, |ch| ch.open(&session.short_id)).map_err(|e| match e {
+        ClientError::RelayUnreachable => unreachable(e),
+        other => RemoteAttachError::Failed(format!("opening `{name}` on `{}`: {other}", host_label(host))),
+    })
+}
+
 /// Build the default-size `SpawnSpec` for a remote dispatch launch line. The
 /// launch already `cd`s into the worktree and sets the hub env before `exec`, so
 /// it is run under the login shell (`$SHELL -lc`).

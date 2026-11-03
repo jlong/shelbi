@@ -46,10 +46,9 @@ is the default for a remote project. The P6 dev setting
   `open_in_terminal_view_reaches_the_host_only_in_a_remote_window`.
 - **Two hops, until P9.** A workspace pane whose far session is missing asks
   the far source for the workspace's details; when the far project declares
-  it on another of its machines (`is_remote`), the pane shows
-  `remote_window::two_hop_placeholder` ("gamma runs on gpu-box. A remote
-  window can't show a workspace on another of its machines yet.") instead
-  of idle.
+  it on another of its machines (`is_remote`), the pane showed a placeholder
+  naming the machine instead of idle. P9 (`rw-remote-two-hop`) replaced it
+  with the real stream.
 - **New task over the link.** The New task dialog's write-up hand-off goes
   through the window's `ProjectLink` (`new_task::create_linked`, already
   wired by the merge of #2106); now covered end to end
@@ -59,7 +58,7 @@ is the default for a remote project. The P6 dev setting
 
 ## Not in this phase
 
-- Two-hop sessions (P9, `rw-remote-two-hop`).
+- Two-hop sessions (P9, `rw-remote-two-hop`, since landed).
 - An existing `desktop.native_remote:` line in a user's `config.yaml` is
   ignored on read (the desktop block doesn't deny unknown keys) and dropped
   the next time Settings saves the desktop block. No config-upgrade sniffer:

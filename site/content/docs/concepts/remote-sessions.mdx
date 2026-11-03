@@ -71,9 +71,12 @@ terminal: it takes over until you quit it, and then you're back.
 
 A full window leaves a few things to the other machine itself. **Add Project**,
 **New Window**, **Quit Shelbi** and **Detach Other Clients** are grayed out
-with the reason; run them there. A workspace the other machine's project runs
-on yet another of its machines shows a placeholder naming that machine instead
-of its terminal, for now.
+with the reason; run them there.
+
+A workspace the other machine's project runs on yet another of its machines
+streams into the full window too. The other machine reaches it the way it
+always does, over its own connection to that machine, and passes the terminal
+through, so your Mac needs no route to that machine and no credentials for it.
 
 ## When the connection drops
 
@@ -81,7 +84,8 @@ Sessions on the other machine never depend on your connection: agents keep
 working when your Wi-Fi blinks or your laptop sleeps. If SSH drops, Shelbi
 shows "Reconnecting to *host*… (attempt N)" and tries again, quickly at
 first and then backing off, until the machine answers. You land back where you
-were.
+were. A workspace on yet another machine reconnects the same way when either
+connection drops, yours to the other machine or the other machine's to it.
 
 In the TUI (and with `shelbi remote connect`), press Esc to stop reconnecting.
 A reconnect never starts the other machine's Shelbi: if it has stopped, the

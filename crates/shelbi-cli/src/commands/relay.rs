@@ -21,6 +21,11 @@
 //! - `changes`: this machine's `hub.sock` (subscribe only).
 //! - `put`: files a remote window drops on a terminal here, saved under this
 //!   user's temp directory.
+//! - `session`: a session of a project here, on whichever of its machines it
+//!   runs (`shelbi_orchestrator::session_connect::relay_opener`). One on
+//!   another machine is reached through this machine's own relay to it, so a
+//!   remote window streams it with no route of its own there (the second
+//!   hop). That relay's SSH, and its `-R` forward, are this machine's.
 //!
 //! It never starts the daemon: `control` and `changes` fail to open while it
 //! is stopped. Not intended for direct use by hand.
@@ -57,6 +62,7 @@ fn services() -> RelayServices {
         control_socket: shelbi_state::control_socket_path().ok(),
         hub_socket: shelbi_state::hub_socket_path().ok(),
         put_dir: put_dir(),
+        session: Some(shelbi_orchestrator::session_connect::relay_opener()),
     }
 }
 

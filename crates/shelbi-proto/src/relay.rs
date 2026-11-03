@@ -31,7 +31,9 @@
 //! Version 2 adds one frame, [`RelayFrame::OpenService`], which opens a logical
 //! stream to a named [`RelayService`] rather than a session: the far project's
 //! read `query` handler, a filtered bridge to the far daemon's `control.sock`,
-//! or a one-way `changes` subscription on the far `hub.sock`. It is answered by
+//! a one-way `changes` subscription on the far `hub.sock`, a file `put`, or a
+//! `session` of the far project on whichever of its machines it runs (a second
+//! hop through the far side's own relay). It is answered by
 //! [`RelayFrame::Opened`] / [`RelayFrame::OpenError`] exactly like
 //! [`RelayFrame::Open`], and the stream's bytes then ride [`RelayFrame::Data`].
 //! A v1 relay ends the channel on a frame type it does not know, so a client
@@ -152,6 +154,15 @@ pub struct RelaySession {
 ///   the relay saves them as `file` in a fresh directory under the far
 ///   machine's temp directory and answers one framed message, the file's
 ///   far path (UTF-8), then closes the stream.
+/// - [`Session`](RelayService::Session): a session of `project`, wherever the
+///   far project runs it. The far relay resolves `target` as the far hub
+///   would (`shelbi_orchestrator::session_connect`): a session on the far
+///   machine itself, or one on another of the far project's machines, reached
+///   through the far side's own relay to it (a second hop). The stream then
+///   carries that session's frames both ways unchanged, like an
+///   [`Open`](RelayFrame::Open)ed one, so the client speaks the session
+///   protocol end to end. A failed open answers [`RelayFrame::OpenError`]
+///   whose `error` is a [`SessionOpenError`] ([`SessionOpenError::to_wire`]).
 ///
 /// On the wire it is `{"name": "<service>", ...}`. A name this build does not
 /// know decodes as [`Unknown`](RelayService::Unknown), which the relay answers
@@ -178,6 +189,13 @@ pub enum RelayService {
         /// dropped).
         file: String,
     },
+    /// A session of `project`, on whichever of its machines it runs.
+    Session {
+        /// The project the session belongs to.
+        project: String,
+        /// Which of the project's sessions.
+        target: SessionTarget,
+    },
     /// A service this build does not know (a newer client's).
     #[serde(other)]
     Unknown,
@@ -191,7 +209,98 @@ impl RelayService {
             RelayService::Control { .. } => "control",
             RelayService::Changes { .. } => "changes",
             RelayService::Put { .. } => "put",
+            RelayService::Session { .. } => "session",
             RelayService::Unknown => "unknown",
+        }
+    }
+}
+
+/// Which of a project's sessions a [`RelayService::Session`] stream attaches
+/// to: `shelbi_app::session::SessionRef` on the wire.
+///
+/// On the wire it is `{"kind": "<kind>", ...}`. A kind this build does not
+/// know decodes as [`Unknown`](SessionTarget::Unknown), which the relay
+/// refuses with [`RelayFrame::OpenError`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionTarget {
+    /// The project's orchestrator.
+    Orchestrator,
+    /// A workspace's agent.
+    Workspace {
+        /// The workspace.
+        workspace: String,
+    },
+    /// A review slot's content session (`role` is `editor` / `diff`).
+    Review {
+        /// The review workspace.
+        slot: String,
+        /// The content role.
+        role: String,
+    },
+    /// A dev workspace's content session (`role` is `editor` / `diff` /
+    /// `shell`).
+    WorkspaceContent {
+        /// The dev workspace.
+        workspace: String,
+        /// The content role.
+        role: String,
+    },
+    /// A kind this build does not know (a newer client's).
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why a [`RelayService::Session`] stream did not open. It rides the
+/// [`RelayFrame::OpenError`] `error` string as JSON ([`to_wire`]), so the
+/// client can tell a machine it merely can't reach (keep reconnecting) from
+/// one that answered.
+///
+/// [`to_wire`]: SessionOpenError::to_wire
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "session_error", rename_all = "snake_case")]
+pub enum SessionOpenError {
+    /// The machine the session runs on couldn't be reached (the far side's
+    /// relay to it won't start or died). The session may well still run.
+    Unreachable {
+        /// A short human-readable reason.
+        message: String,
+    },
+    /// The machine answered and has no live session by that name. `exited`:
+    /// one ran and stopped there, rather than none ever having run.
+    NoSession {
+        /// Whether a dead session by that name is on record.
+        exited: bool,
+    },
+    /// Anything else.
+    Failed {
+        /// A short human-readable reason.
+        message: String,
+    },
+}
+
+impl SessionOpenError {
+    /// The [`RelayFrame::OpenError`] `error` string carrying this.
+    pub fn to_wire(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| self.to_string())
+    }
+
+    /// Read an [`RelayFrame::OpenError`] `error` string. One that is not a
+    /// [`SessionOpenError`] (a relay that doesn't know the service, a plain
+    /// reason) is [`Failed`](SessionOpenError::Failed) with it as the message.
+    pub fn from_wire(error: &str) -> SessionOpenError {
+        serde_json::from_str(error).unwrap_or_else(|_| SessionOpenError::Failed {
+            message: error.to_string(),
+        })
+    }
+}
+
+impl std::fmt::Display for SessionOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionOpenError::Unreachable { message } | SessionOpenError::Failed { message } => f.write_str(message),
+            SessionOpenError::NoSession { exited: true } => f.write_str("the session exited"),
+            SessionOpenError::NoSession { exited: false } => f.write_str("no live session"),
         }
     }
 }
@@ -530,6 +639,25 @@ mod tests {
             json(&RelayService::Put { file: "shot.png".into() }),
             r#"{"name":"put","file":"shot.png"}"#
         );
+        assert_eq!(
+            json(&RelayService::Session {
+                project: "p".into(),
+                target: SessionTarget::Workspace { workspace: "gamma".into() },
+            }),
+            r#"{"name":"session","project":"p","target":{"kind":"workspace","workspace":"gamma"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionTarget::WorkspaceContent {
+                workspace: "gamma".into(),
+                role: "shell".into(),
+            })
+            .unwrap(),
+            r#"{"kind":"workspace_content","workspace":"gamma","role":"shell"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&SessionTarget::Orchestrator).unwrap(),
+            r#"{"kind":"orchestrator"}"#
+        );
         for s in [
             RelayService::Query,
             RelayService::Control { project: "p".into() },
@@ -537,6 +665,34 @@ mod tests {
         ] {
             assert!(json(&s).contains(s.name()));
         }
+    }
+
+    #[test]
+    fn a_session_open_error_round_trips_through_the_open_error_string() {
+        for e in [
+            SessionOpenError::Unreachable {
+                message: "`gpu-box` is unreachable".into(),
+            },
+            SessionOpenError::NoSession { exited: false },
+            SessionOpenError::NoSession { exited: true },
+            SessionOpenError::Failed { message: "boom".into() },
+        ] {
+            assert_eq!(SessionOpenError::from_wire(&e.to_wire()), e);
+        }
+        assert_eq!(
+            SessionOpenError::NoSession { exited: true }.to_wire(),
+            r#"{"session_error":"no_session","exited":true}"#
+        );
+        // A relay that doesn't know the service answers a plain reason.
+        assert_eq!(
+            SessionOpenError::from_wire("unknown relay service"),
+            SessionOpenError::Failed {
+                message: "unknown relay service".into()
+            }
+        );
+        // An unknown target kind still decodes, so the relay can refuse it.
+        let target: SessionTarget = serde_json::from_str(r#"{"kind":"hologram","x":1}"#).unwrap();
+        assert_eq!(target, SessionTarget::Unknown);
     }
 
     #[test]

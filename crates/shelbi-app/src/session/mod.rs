@@ -106,6 +106,44 @@ impl SessionRef {
         }
     }
 
+    /// This target as the relay's `session` service names it on the wire.
+    pub fn to_target(&self) -> shelbi_proto::SessionTarget {
+        use shelbi_proto::SessionTarget;
+        match self {
+            SessionRef::Orchestrator => SessionTarget::Orchestrator,
+            SessionRef::Workspace(workspace) => SessionTarget::Workspace {
+                workspace: workspace.clone(),
+            },
+            SessionRef::Review { slot, role } => SessionTarget::Review {
+                slot: slot.clone(),
+                role: role.clone(),
+            },
+            SessionRef::WorkspaceContent { workspace, role } => SessionTarget::WorkspaceContent {
+                workspace: workspace.clone(),
+                role: role.clone(),
+            },
+        }
+    }
+
+    /// The target a relay `session` stream names, or `None` for a kind this
+    /// build does not know.
+    pub fn from_target(target: &shelbi_proto::SessionTarget) -> Option<SessionRef> {
+        use shelbi_proto::SessionTarget;
+        Some(match target {
+            SessionTarget::Orchestrator => SessionRef::Orchestrator,
+            SessionTarget::Workspace { workspace } => SessionRef::Workspace(workspace.clone()),
+            SessionTarget::Review { slot, role } => SessionRef::Review {
+                slot: slot.clone(),
+                role: role.clone(),
+            },
+            SessionTarget::WorkspaceContent { workspace, role } => SessionRef::WorkspaceContent {
+                workspace: workspace.clone(),
+                role: role.clone(),
+            },
+            SessionTarget::Unknown => return None,
+        })
+    }
+
     /// The workspace a workspace-scoped target belongs to (its agent, editor,
     /// diff or shell), `None` for the orchestrator and review sessions.
     pub fn workspace(&self) -> Option<&str> {

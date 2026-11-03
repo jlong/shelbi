@@ -59,7 +59,7 @@ use shelbi_proto::{
 
 pub mod services;
 
-pub use services::{control_refusal, QueryHandler};
+pub use services::{control_refusal, QueryHandler, SessionOpener};
 
 use crate::error::ClientError;
 use crate::transport::{Transport, TransportHalves};
@@ -344,7 +344,13 @@ impl RelayChannel {
         if version < RELAY_SERVICES_VERSION {
             return Err(ClientError::RelayServicesUnsupported { version });
         }
-        self.open_stream(StreamKind::Service, |stream| RelayFrame::OpenService {
+        // A `session` stream carries session frames, so an overflow drops to a
+        // replay like an `Open`ed one; any other service has no replay.
+        let kind = match service {
+            RelayService::Session { .. } => StreamKind::Session,
+            _ => StreamKind::Service,
+        };
+        self.open_stream(kind, |stream| RelayFrame::OpenService {
             stream,
             service: service.clone(),
         })
@@ -803,6 +809,10 @@ pub struct RelayServices {
     /// Where the `put` service saves the files a remote window drops on a
     /// far terminal (each in a fresh directory under it). `None`: no `put`.
     pub put_dir: Option<PathBuf>,
+    /// Resolves the `session` service's target to a transport to that
+    /// session, wherever the far project runs it. The far CLI injects one
+    /// backed by `shelbi_orchestrator::session_connect`. `None`: no `session`.
+    pub session: Option<SessionOpener>,
 }
 
 impl std::fmt::Debug for RelayServices {
@@ -812,6 +822,7 @@ impl std::fmt::Debug for RelayServices {
             .field("control_socket", &self.control_socket)
             .field("hub_socket", &self.hub_socket)
             .field("put_dir", &self.put_dir)
+            .field("session", &self.session.is_some())
             .finish()
     }
 }
@@ -992,7 +1003,7 @@ enum Peel {
 
 fn forward_to_hub(
     stream: u32,
-    mut sock_read: std::os::unix::net::UnixStream,
+    mut sock_read: impl Read,
     peel: Peel,
     out: SharedOut,
     links: Links,

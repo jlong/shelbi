@@ -46,8 +46,10 @@
 //! stopped one is offered to the user to start ([`RemoteConnector::start_daemon`]).
 //!
 //! A workspace the far project runs on its own other machine (a second hop)
-//! isn't reachable over the link yet (P9): its pane shows a placeholder
-//! naming that machine ([`two_hop_placeholder`]).
+//! streams through the far side: the far relay's `session` service reaches it
+//! over the far hub's own relay to that machine
+//! ([`crate::session::remote::attach_through`]), so this machine needs no
+//! route there.
 
 use std::sync::Arc;
 
@@ -124,13 +126,6 @@ pub fn changed_notice(host: &str, local: &str, remote: &str) -> String {
     } else {
         format!("Shelbi on {host} is now {remote} and {here} has {local}. Reopen to continue in its terminal view.")
     }
-}
-
-/// What a pane for workspace `workspace` shows when the far project runs it
-/// on `machine`, another of its own machines: the window can't reach a
-/// second hop yet (P9).
-pub fn two_hop_placeholder(workspace: &str, machine: &str) -> String {
-    format!("{workspace} runs on {machine}. A remote window can't show a workspace on another of its machines yet.")
 }
 
 /// `host` without a `user@` the user typed.

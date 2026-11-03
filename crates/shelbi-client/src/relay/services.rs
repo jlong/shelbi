@@ -25,6 +25,16 @@
 //!   fresh directory in [`RelayServices::put_dir`] and answers the far path,
 //!   which the window pastes. Capped at [`MAX_PUT_LEN`].
 //!
+//! - **`session`**: a session of the far project, on whichever of its
+//!   machines it runs. A [`SessionOpener`] the far CLI injects resolves the
+//!   target as the far hub does (a session socket on this machine, or a
+//!   stream through this side's own relay to another of the project's
+//!   machines: the second hop) on a worker thread, so a slow SSH start never
+//!   holds up the channel. The stream then carries the session's frames both
+//!   ways unchanged, peeled whole as an `Open`ed session's are, and closes
+//!   when either hop does. A failed open answers [`RelayFrame::OpenError`]
+//!   with a [`SessionOpenError`] ([`SessionOpenError::to_wire`]).
+//!
 //! None of them starts the far daemon: `control` and `changes` connect to its
 //! sockets and fail the open with [`RelayFrame::OpenError`] when it is not
 //! running.
@@ -35,12 +45,13 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::Arc;
 
 use shelbi_proto::control::{self, ClientMsg, DetachSelector, MutationError, ServerMsg};
-use shelbi_proto::{ProtoError, RelayFrame, RelayService};
+use shelbi_proto::{ProtoError, RelayFrame, RelayService, SessionOpenError, SessionTarget};
 
 use super::{
     forward_to_hub, send_out, Links, Peel, RelayServices, SharedOut, DATA_CHUNK, MAX_QUERY_LEN,
 };
 use crate::error::ClientError;
+use crate::transport::{ShutdownHandle, Transport};
 
 /// Answers one `query` request payload with one or more response payloads,
 /// each handed to the reply callback in order as soon as it is ready (an
@@ -49,6 +60,14 @@ use crate::error::ClientError;
 /// `shelbi_app::source::wire` defines them, including which reply is the
 /// last.
 pub type QueryHandler = Arc<dyn Fn(&[u8], &mut dyn FnMut(Vec<u8>)) + Send + Sync>;
+
+/// Resolves a [`RelayService::Session`] stream's `project` and `target` to a
+/// transport to that session (a socket on this machine, or a stream through
+/// this side's own relay to another machine). Blocking; runs on the stream's
+/// worker thread on the far machine. The relay does not look inside the
+/// session's frames.
+pub type SessionOpener =
+    Arc<dyn Fn(&str, &SessionTarget) -> Result<Box<dyn Transport>, SessionOpenError> + Send + Sync>;
 
 /// The largest file the `put` service takes.
 pub const MAX_PUT_LEN: usize = 64 * 1024 * 1024;
@@ -180,6 +199,13 @@ pub(crate) enum Link {
     Query(Sender<Vec<u8>>),
     /// The `put` worker's inbox.
     Put(Sender<Vec<u8>>),
+    /// A `session` stream: the write half of the transport the
+    /// [`SessionOpener`] gave (bytes go straight in, as for
+    /// [`Link::Session`]), and what closes it.
+    Bridge {
+        write: Box<dyn Write + Send>,
+        shutdown: ShutdownHandle,
+    },
 }
 
 impl Link {
@@ -188,6 +214,10 @@ impl Link {
     pub(crate) fn accept(&mut self, stream: u32, bytes: &[u8], out: &SharedOut) -> io::Result<()> {
         match self {
             Link::Session(sock) => sock.write_all(bytes),
+            Link::Bridge { write, .. } => {
+                write.write_all(bytes)?;
+                write.flush()
+            }
             Link::Control(link) => link.accept(stream, bytes, out),
             // One way: the client never writes to hub.sock.
             Link::Changes(_) => Ok(()),
@@ -206,6 +236,7 @@ impl Link {
             Link::Control(link) => {
                 let _ = link.sock.shutdown(std::net::Shutdown::Both);
             }
+            Link::Bridge { shutdown, .. } => shutdown(),
             Link::Query(_) | Link::Put(_) => {}
         }
     }
@@ -262,6 +293,10 @@ pub(crate) fn open(
         RelayService::Control { project } => open_control(stream, project, services, links),
         RelayService::Changes { project } => open_changes(stream, &project, services, links),
         RelayService::Put { file } => open_put(stream, &file, services, out, links),
+        RelayService::Session { project, target } => {
+            open_session(stream, project, target, services, out, links);
+            return;
+        }
         RelayService::Unknown => Err("unknown relay service".to_string()),
     };
     match opened {
@@ -403,6 +438,71 @@ fn open_put(
     });
     links.lock().unwrap().insert(stream, Link::Put(inbox));
     Ok(None)
+}
+
+/// Open a `session` stream: resolve it on a worker thread (the second hop
+/// may start an SSH connection), then register its [`Link::Bridge`], answer
+/// `Opened` and forward the session's frames down whole; or answer the
+/// [`SessionOpenError`]. The client sends nothing on the stream before
+/// `Opened`, so no byte arrives before the link is there to take it.
+fn open_session(
+    stream: u32,
+    project: String,
+    target: SessionTarget,
+    services: &RelayServices,
+    out: &SharedOut,
+    links: &Links,
+) {
+    let refuse = |error: SessionOpenError| {
+        let _ = send_out(
+            out,
+            &RelayFrame::OpenError {
+                stream,
+                error: error.to_wire(),
+            },
+        );
+    };
+    let Some(opener) = services.session.clone() else {
+        return refuse(SessionOpenError::Failed {
+            message: "the session service isn't available on this relay".into(),
+        });
+    };
+    if target == SessionTarget::Unknown {
+        return refuse(SessionOpenError::Failed {
+            message: "unknown session target".into(),
+        });
+    }
+    let (out, links) = (out.clone(), links.clone());
+    std::thread::spawn(move || {
+        let halves = opener(&project, &target).and_then(|transport| {
+            transport.split().map_err(|e| SessionOpenError::Failed {
+                message: format!("opening the session: {e}"),
+            })
+        });
+        let (read, write, shutdown) = match halves {
+            Ok(halves) => halves,
+            Err(error) => {
+                let _ = send_out(
+                    &out,
+                    &RelayFrame::OpenError {
+                        stream,
+                        error: error.to_wire(),
+                    },
+                );
+                return;
+            }
+        };
+        links.lock().unwrap().insert(stream, Link::Bridge { write, shutdown });
+        if send_out(&out, &RelayFrame::Opened { stream }).is_err() {
+            if let Some(link) = links.lock().unwrap().remove(&stream) {
+                link.shutdown();
+            }
+            return;
+        }
+        // The session's frames, whole, until it or its hop closes; then the
+        // client is told the stream is gone and reconnects.
+        forward_to_hub(stream, read, Peel::SessionFrames, out, links);
+    });
 }
 
 fn open_query(
