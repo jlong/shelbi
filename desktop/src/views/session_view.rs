@@ -86,14 +86,25 @@ pub trait SessionConnector: Send + Sync {
         target: &SessionRef,
         retry: RetryPolicy,
     ) -> Result<Connected, ConnectFailure>;
+
+    /// The host every session this connector reaches lives on, when that is
+    /// another machine (a remote window's panes), `None` on this machine. A
+    /// view whose own machine isn't set ([`SessionView::set_remote_machine`])
+    /// reconnects to this host when its stream drops.
+    fn machine(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The production connector: the project link's sessions (locally,
 /// `shelbi_orchestrator::session_connect`'s attach with replay: this
-/// machine's sessions directory, or the workspace machine's relay), retried,
-/// then wired onto the pane's threads.
+/// machine's sessions directory, or the workspace machine's relay; for a
+/// remote window, `shelbi_app::session::remote::RemoteSessionConnector` over
+/// the host's relay link), retried, then wired onto the pane's threads.
 pub struct LiveConnector {
     sessions: Arc<dyn app_session::Connector>,
+    /// The remote window's host, `None` for this machine's project.
+    host: Option<String>,
 }
 
 impl LiveConnector {
@@ -101,11 +112,16 @@ impl LiveConnector {
     pub fn over(project: &ProjectLink) -> Self {
         LiveConnector {
             sessions: project.sessions(),
+            host: project.key().host().map(str::to_string),
         }
     }
 }
 
 impl SessionConnector for LiveConnector {
+    fn machine(&self) -> Option<&str> {
+        self.host.as_deref()
+    }
+
     fn connect(
         &self,
         project: &str,
@@ -155,6 +171,7 @@ impl SessionDeps {
             &project.link,
             Arc::new(PersistentRelauncher {
                 project: project.name().to_string(),
+                link: Some(project.link.clone()),
             }),
         )
     }
@@ -341,9 +358,16 @@ impl SessionView {
         self.on_death = on_death;
     }
 
-    /// The machine the session runs on when it is remote, `None` when local.
+    /// The machine the session runs on when it is remote, `None` when local
+    /// (a remote window's panes then default to its host).
     pub fn set_remote_machine(&mut self, machine: Option<String>) {
         self.remote_machine = machine;
+    }
+
+    /// The machine the session runs on when it isn't this one: the one set
+    /// for it, else the remote window's host.
+    fn machine(&self) -> Option<&str> {
+        self.remote_machine.as_deref().or_else(|| self.deps.connector.machine())
     }
 
     /// The session is a remote Shelbi's terminal over `ssh -t` to the
@@ -460,7 +484,7 @@ impl SessionView {
             Slot::Failed(e) => app_session::failed_notice(&self.target, e),
             Slot::GaveUp { last_line } => app_session::gave_up_notice(last_line),
             Slot::Reconnecting => app_session::reconnecting_notice(
-                self.remote_machine.as_deref().unwrap_or("the machine"),
+                self.machine().unwrap_or("the machine"),
                 self.reconnect.attempt().max(1),
                 self.reconnect.reason(),
             ),
@@ -742,7 +766,7 @@ impl SessionView {
             // terminal: reconnect, as for a relay drop.
             PaneEvent::Exited(exited)
                 if self.ssh_terminal
-                    && self.remote_machine.is_some()
+                    && self.machine().is_some()
                     && exit_meaning(exited.code) == TerminalExit::ConnectionLost =>
             {
                 self.forward(shelbi_client::SessionEvent::Exited(exited.clone()));
@@ -754,7 +778,7 @@ impl SessionView {
             }
             // A remote session's stream ending with no exit is the relay going
             // away under it (an SSH drop): reconnect.
-            PaneEvent::Closed if self.remote_machine.is_some() => self.link_lost(cx),
+            PaneEvent::Closed if self.machine().is_some() => self.link_lost(cx),
             PaneEvent::Closed => self.live_pane_died(app_session::exit_line(None), cx),
         }
     }
@@ -774,7 +798,7 @@ impl SessionView {
         }
         let now = (self.deps.clock)();
         self.restart.alive(now);
-        let machine = self.remote_machine.clone().unwrap_or_default();
+        let machine = self.machine().unwrap_or_default().to_string();
         tracing::info!(project = %self.project, session = %self.target.display(), %machine, "lost the connection; reconnecting");
         self.reconnect.link_lost("The connection was lost.", now);
         self._pane_subscriptions.clear();
@@ -1038,16 +1062,11 @@ mod tests {
         wire: Arc<Mutex<Wire>>,
         /// `reopen` flag of every relaunch step.
         relaunches: Mutex<Vec<bool>>,
+        /// The remote window's host its sessions live on, if any.
+        host: Option<&'static str>,
     }
 
     impl FakeSession {
-        fn with(script: Vec<Outcome>) -> Arc<Self> {
-            Arc::new(FakeSession {
-                script: Mutex::new(script),
-                ..FakeSession::default()
-            })
-        }
-
         fn connects(&self) -> u32 {
             *self.connects.lock().unwrap()
         }
@@ -1073,6 +1092,10 @@ mod tests {
     }
 
     impl SessionConnector for FakeSession {
+        fn machine(&self) -> Option<&str> {
+            self.host
+        }
+
         fn connect(
             &self,
             project: &str,
@@ -1189,10 +1212,19 @@ mod tests {
     }
 
     fn open(cx: &mut TestAppContext, script: Vec<Outcome>) -> Harness {
+        open_on(cx, script, None)
+    }
+
+    /// [`open`] with every session on `host`, as a remote window's are.
+    fn open_on(cx: &mut TestAppContext, script: Vec<Outcome>, host: Option<&'static str>) -> Harness {
         cx.update(|cx| {
             cx.set_global(Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark));
         });
-        let session = FakeSession::with(script);
+        let session = Arc::new(FakeSession {
+            script: Mutex::new(script),
+            host,
+            ..FakeSession::default()
+        });
         let now = Rc::new(Cell::new(Instant::now()));
         let deps = {
             let now = now.clone();
@@ -1919,6 +1951,39 @@ mod tests {
         h.settle();
         assert_eq!(h.phase(), SessionPhase::Live);
         assert_eq!(*h.session.relaunches.lock().unwrap(), vec![false]);
+    }
+
+    #[gpui::test]
+    fn a_remote_window_pane_reconnects_to_its_host_unasked(cx: &mut TestAppContext) {
+        // A remote window's orchestrator: its connector reaches every
+        // session over the host's relay link, so the view reconnects to that
+        // host without being told a machine of its own.
+        let mut h = open_on(
+            cx,
+            vec![
+                Outcome::Live(Size::new(80, 24)),
+                Outcome::Unreachable,
+                Outcome::Live(Size::new(80, 24)),
+            ],
+            Some("devbox"),
+        );
+        h.update(|c, cx| c.show(cx));
+        assert_eq!(h.phase(), SessionPhase::Live);
+
+        h.session.close();
+        h.settle();
+        assert_eq!(h.phase(), SessionPhase::Reconnecting(2));
+        assert_eq!(
+            h.chat.read_with(&h.cx, |c, _| c.notice()).as_deref(),
+            Some("Reconnecting to devbox… (attempt 2) `gpu` is unreachable")
+        );
+        h.advance(Duration::from_secs(1));
+        assert_eq!(h.phase(), SessionPhase::Live, "the same session, attached again");
+        assert!(h.session.relaunches.lock().unwrap().is_empty(), "a reconnect relaunches nothing");
+
+        // A pane set to another machine names that one.
+        h.update(|c, _| c.set_remote_machine(Some("gpu".into())));
+        assert_eq!(h.chat.read_with(&h.cx, |c, _| c.machine().map(str::to_string)), Some("gpu".into()));
     }
 
     #[gpui::test]

@@ -24,12 +24,17 @@
 //!   restart, a backoff wait, a give-up, or standing down.
 //! - [`Relauncher`] ([`relaunch`]): how a dead pane is brought back before
 //!   the client re-attaches.
+//! - [`ReconnectController`] ([`reconnect`]): riding out a lost connection
+//!   to a session on another machine.
+//! - [`remote::RemoteSessionConnector`] ([`remote`]): a remote window's
+//!   panes, attached over the host's relay link.
 //! - The notices the views show ([`connecting_notice`], [`failed_notice`],
 //!   [`restarting_notice`], [`gave_up_notice`], [`orchestrator_down_notice`],
 //!   [`exit_line`]), so both
 //!   clients word them identically.
 
 pub mod reconnect;
+pub mod remote;
 pub mod relaunch;
 pub mod restart;
 

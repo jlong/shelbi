@@ -12,17 +12,26 @@
 //! files, and this machine's `hub.sock` never reaches the far host. It never
 //! starts the far daemon; a service that needs it fails to open while it is
 //! stopped.
+//!
+//! A window holds the host's [`HostLink`] ([`HostLink::shared`]), not a
+//! [`RemoteLink`]: when the channel drops (the keepalive goes unanswered, or
+//! `ssh` exits) every stream on it ends, and the next reconnect attempt
+//! ([`HostLink::connect`]) checks the host first and then opens a fresh
+//! channel, which every pane, read and subscription on that host then uses.
 
+use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::{Duration, Instant};
 
-use shelbi_client::{ClientError, RelayChannel, RelayStream};
-use shelbi_proto::{RelayService, RELAY_SERVICES_VERSION};
+use shelbi_client::{ClientError, QueryStream, RelayChannel, RelayStream};
+use shelbi_proto::{RelayService, RelaySession, RELAY_SERVICES_VERSION};
 
 use super::remote::{validate_host, RemoteError};
 use super::ssh::{relay_command, STEP_DEADLINE};
+use crate::source::remote::RelayLink;
 use crate::source::wire::Querier;
 
 /// How much of `ssh`'s stderr a link keeps, for the reason a link failed.
@@ -34,7 +43,7 @@ pub struct RemoteLink {
     host: String,
     channel: RelayChannel,
     relay_version: u16,
-    child: Child,
+    child: Mutex<Child>,
     stderr: Arc<Mutex<String>>,
 }
 
@@ -114,7 +123,7 @@ impl RemoteLink {
             host: host.to_string(),
             channel,
             relay_version,
-            child,
+            child: Mutex::new(child),
             stderr,
         })
     }
@@ -136,8 +145,9 @@ impl RemoteLink {
     }
 
     /// Whether the channel is still up (keepalive answered, `ssh` running).
-    pub fn is_reachable(&mut self) -> bool {
-        self.channel.is_reachable() && matches!(self.child.try_wait(), Ok(None))
+    pub fn is_reachable(&self) -> bool {
+        self.channel.is_reachable()
+            && matches!(self.child.lock().unwrap_or_else(|p| p.into_inner()).try_wait(), Ok(None))
     }
 
     /// What `ssh` last printed on stderr, for a client explaining a drop.
@@ -175,7 +185,158 @@ impl RemoteLink {
 
 impl Drop for RemoteLink {
     fn drop(&mut self) {
-        end(&mut self.child);
+        end(self.child.get_mut().unwrap_or_else(|p| p.into_inner()));
+    }
+}
+
+/// Opens a fresh channel to a host: [`RemoteLink::open`] for a real one.
+pub type LinkOpener = dyn Fn(&str) -> Result<Arc<dyn RelayLink>, RemoteError> + Send + Sync;
+
+/// After a reopen fails, how long [`HostLink::connect`] answers with that
+/// failure before it tries again, so the panes of a window reconnecting at
+/// once share one `ssh` rather than each starting their own.
+pub const REOPEN_PAUSE: Duration = Duration::from_secs(1);
+
+/// A host's relay channel as every window and pane on that host shares it:
+/// the current channel while it is up, and a fresh one on the next
+/// [`connect`](Self::connect) after it drops.
+///
+/// Reads, subscriptions and session attaches use the current channel through
+/// [`RelayLink`], and fail with [`ClientError::RelayUnreachable`] while it is
+/// down; only [`connect`](Self::connect) opens a new one, and it runs the
+/// caller's check first (the session connector's is
+/// [`super::RemoteConnector::connect`]: the host answers, it still has the
+/// project, its daemon runs). So a reconnect never starts the far daemon: a
+/// stopped one fails the check, and no channel is opened.
+pub struct HostLink {
+    host: String,
+    open: Box<LinkOpener>,
+    pause: Duration,
+    current: Mutex<Option<Arc<dyn RelayLink>>>,
+    /// Held while a channel is being opened; the last failure and when.
+    opening: Mutex<Option<(Instant, RemoteError)>>,
+    opens: AtomicU64,
+}
+
+impl HostLink {
+    /// A link to `host` whose channels `open` opens. Nothing opens until the
+    /// first [`connect`](Self::connect).
+    pub fn new(
+        host: impl Into<String>,
+        open: impl Fn(&str) -> Result<Arc<dyn RelayLink>, RemoteError> + Send + Sync + 'static,
+    ) -> HostLink {
+        HostLink {
+            host: host.into(),
+            open: Box::new(open),
+            pause: REOPEN_PAUSE,
+            current: Mutex::new(None),
+            opening: Mutex::new(None),
+            opens: AtomicU64::new(0),
+        }
+    }
+
+    /// A link to `host` over `ssh` ([`RemoteLink::open`]).
+    pub fn over_ssh(host: &str) -> HostLink {
+        HostLink::new(host, |host| RemoteLink::open(host).map(|link| Arc::new(link) as Arc<dyn RelayLink>))
+    }
+
+    /// The one link to `host` this process shares between its windows (over
+    /// `ssh`), while any of them holds it.
+    pub fn shared(host: &str) -> Arc<HostLink> {
+        static LINKS: OnceLock<Mutex<HashMap<String, Weak<HostLink>>>> = OnceLock::new();
+        let mut links = LINKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        links.retain(|_, link| link.strong_count() > 0);
+        if let Some(link) = links.get(host).and_then(Weak::upgrade) {
+            return link;
+        }
+        let link = Arc::new(HostLink::over_ssh(host));
+        links.insert(host.to_string(), Arc::downgrade(&link));
+        link
+    }
+
+    /// How long a failed reopen is answered from memory ([`REOPEN_PAUSE`]).
+    pub fn with_pause(mut self, pause: Duration) -> HostLink {
+        self.pause = pause;
+        self
+    }
+
+    /// Whether the current channel is up.
+    pub fn is_up(&self) -> bool {
+        self.live().is_some()
+    }
+
+    /// How many channels this link has opened.
+    pub fn opens(&self) -> u64 {
+        self.opens.load(Ordering::SeqCst)
+    }
+
+    /// The current channel while it is up. A channel found down is let go
+    /// (ending its `ssh`).
+    pub fn live(&self) -> Option<Arc<dyn RelayLink>> {
+        let mut current = self.current.lock().unwrap_or_else(|p| p.into_inner());
+        if current.as_ref().is_some_and(|link| !link.is_reachable()) {
+            *current = None;
+        }
+        current.clone()
+    }
+
+    /// The channel, opening a fresh one when it is down: `check` first (an
+    /// error from it is returned and nothing opens), then the opener. Callers
+    /// arriving while another opens wait for it and share its channel; for
+    /// [`REOPEN_PAUSE`] after a failure, they get that failure back.
+    pub fn connect(&self, check: &dyn Fn() -> Result<(), RemoteError>) -> Result<Arc<dyn RelayLink>, RemoteError> {
+        if let Some(link) = self.live() {
+            return Ok(link);
+        }
+        let mut opening = self.opening.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(link) = self.live() {
+            return Ok(link);
+        }
+        if let Some((at, error)) = opening.as_ref() {
+            if at.elapsed() < self.pause {
+                return Err(error.clone());
+            }
+        }
+        match check().and_then(|()| (self.open)(&self.host)) {
+            Ok(link) => {
+                *opening = None;
+                self.opens.fetch_add(1, Ordering::SeqCst);
+                *self.current.lock().unwrap_or_else(|p| p.into_inner()) = Some(link.clone());
+                Ok(link)
+            }
+            Err(error) => {
+                *opening = Some((Instant::now(), error.clone()));
+                Err(error)
+            }
+        }
+    }
+
+    fn channel(&self) -> Result<Arc<dyn RelayLink>, ClientError> {
+        self.live().ok_or(ClientError::RelayUnreachable)
+    }
+}
+
+impl RelayLink for HostLink {
+    fn host(&self) -> &str {
+        &self.host
+    }
+    fn is_reachable(&self) -> bool {
+        self.is_up()
+    }
+    fn open_query(&self) -> Result<QueryStream, ClientError> {
+        self.channel()?.open_query()
+    }
+    fn open_service(&self, service: RelayService) -> Result<RelayStream, ClientError> {
+        self.channel()?.open_service(service)
+    }
+    fn list_sessions(&self) -> Result<Vec<RelaySession>, ClientError> {
+        self.channel()?.list_sessions()
+    }
+    fn open_session(&self, short_id: &str) -> Result<RelayStream, ClientError> {
+        self.channel()?.open_session(short_id)
     }
 }
 
@@ -188,6 +349,104 @@ fn end(child: &mut Child) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// A channel that is up until [`Fake::cut`] and serves nothing.
+    struct Fake {
+        up: AtomicBool,
+    }
+
+    impl RelayLink for Fake {
+        fn host(&self) -> &str {
+            "devbox"
+        }
+        fn is_reachable(&self) -> bool {
+            self.up.load(Ordering::SeqCst)
+        }
+        fn open_query(&self) -> Result<QueryStream, ClientError> {
+            Err(ClientError::Relay("fake".into()))
+        }
+        fn open_service(&self, _: RelayService) -> Result<RelayStream, ClientError> {
+            Err(ClientError::Relay("fake".into()))
+        }
+        fn list_sessions(&self) -> Result<Vec<RelaySession>, ClientError> {
+            Ok(Vec::new())
+        }
+        fn open_session(&self, _: &str) -> Result<RelayStream, ClientError> {
+            Err(ClientError::Relay("fake".into()))
+        }
+    }
+
+    /// A host link over [`Fake`] channels, and the channels it opened.
+    fn fake_link() -> (HostLink, Arc<Mutex<Vec<Arc<Fake>>>>) {
+        let opened: Arc<Mutex<Vec<Arc<Fake>>>> = Arc::default();
+        let keep = opened.clone();
+        let link = HostLink::new("devbox", move |_| {
+            let fake = Arc::new(Fake { up: AtomicBool::new(true) });
+            keep.lock().unwrap().push(fake.clone());
+            Ok(fake as Arc<dyn RelayLink>)
+        })
+        .with_pause(Duration::ZERO);
+        (link, opened)
+    }
+
+    #[test]
+    fn a_host_link_opens_only_after_the_check_and_reuses_a_live_channel() {
+        let (link, opened) = fake_link();
+        assert!(!link.is_up());
+        assert!(matches!(link.list_sessions(), Err(ClientError::RelayUnreachable)), "nothing opens on a read");
+
+        let stopped = || Err(RemoteError::DaemonStopped { host: "devbox".into() });
+        assert_eq!(link.connect(&stopped).err(), Some(RemoteError::DaemonStopped { host: "devbox".into() }));
+        assert_eq!(link.opens(), 0, "a refused check opens no channel");
+
+        let checks = AtomicU64::new(0);
+        let check = || {
+            checks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+        link.connect(&check).unwrap();
+        link.connect(&check).unwrap();
+        assert_eq!((link.opens(), checks.load(Ordering::SeqCst)), (1, 1), "a live channel is shared, unchecked");
+        assert!(link.list_sessions().unwrap().is_empty());
+
+        // The channel drops: reads fail until a reconnect checks and reopens.
+        opened.lock().unwrap()[0].up.store(false, Ordering::SeqCst);
+        assert!(!link.is_up());
+        assert!(matches!(link.list_sessions(), Err(ClientError::RelayUnreachable)));
+        link.connect(&check).unwrap();
+        assert_eq!((link.opens(), checks.load(Ordering::SeqCst)), (2, 2));
+        assert!(link.is_up());
+    }
+
+    #[test]
+    fn a_failed_reopen_is_answered_from_memory_for_the_pause() {
+        let tries = Arc::new(AtomicU64::new(0));
+        let count = tries.clone();
+        let link = HostLink::new("devbox", move |host| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Err(RemoteError::Unreachable {
+                host: host.into(),
+                reason: "Network is unreachable".into(),
+            })
+        })
+        .with_pause(Duration::from_secs(60));
+        let ok = || Ok(());
+        for _ in 0..3 {
+            assert!(matches!(link.connect(&ok), Err(RemoteError::Unreachable { .. })));
+        }
+        assert_eq!(tries.load(Ordering::SeqCst), 1, "panes reconnecting at once share one attempt");
+    }
+
+    #[test]
+    fn one_host_link_per_host_while_held() {
+        let a = HostLink::shared("rl-shared-a");
+        let again = HostLink::shared("rl-shared-a");
+        let b = HostLink::shared("rl-shared-b");
+        assert!(Arc::ptr_eq(&a, &again));
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(a.opens(), 0, "sharing a link opens nothing");
+    }
 
     #[test]
     fn an_invalid_host_never_runs_ssh() {

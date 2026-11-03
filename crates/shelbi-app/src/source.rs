@@ -399,6 +399,17 @@ impl ProjectLink {
         self.relay.is_some()
     }
 
+    /// The project's orchestrator window title, asked of its session without
+    /// attaching (the session protocol's `info`): this machine's session
+    /// socket, or over the host's relay for a remote project. `None` when it
+    /// isn't running or has set no title. Blocking.
+    pub fn orchestrator_title(&self) -> Option<String> {
+        match &self.relay {
+            None => crate::session::remote::local_orchestrator_title(&self.key.name),
+            Some(relay) => crate::session::remote::orchestrator_title_over(&**relay, &self.key.name),
+        }
+    }
+
     /// Run an issue mutation, expecting the issue at `expected` (`None`: no
     /// expectation). Answers the issue's state right after the change.
     pub fn mutate(

@@ -30,7 +30,7 @@ use shelbi_client::transport::{ShutdownHandle, Transport};
 use shelbi_client::{ClientError, ControlClient, Notice, QueryStream, RelayChannel, RelayStream};
 use shelbi_core::Reachability;
 use shelbi_proto::control::{ClientInfo, ClientKind, ExpectedState};
-use shelbi_proto::RelayService;
+use shelbi_proto::{RelayService, RelaySession};
 use shelbi_state::agents_config::AgentsConfig;
 use shelbi_state::changelog::ChangelogStamp;
 use shelbi_state::keymap::{KeymapDiagnostic, Keymaps};
@@ -53,21 +53,40 @@ use crate::settings::workspaces::PoolIndex;
 use crate::view::{MachinesModel, SidebarModel};
 
 /// What a remote source and link need of a host's relay channel: its
-/// `query` streams and its named services. [`RemoteLink`] is the real one
-/// (one `ssh` per host); [`ChannelLink`] wraps any [`RelayChannel`] (tests
-/// run an in-process relay).
+/// `query` streams, its named services, and its sessions. [`RemoteLink`] is
+/// the real one (one `ssh` per host); [`ChannelLink`] wraps any
+/// [`RelayChannel`] (tests run an in-process relay); and
+/// [`crate::launch::link::HostLink`] is the one a window holds, which
+/// replaces a lost channel with a fresh one.
 pub trait RelayLink: Send + Sync {
     /// The host as the user typed it.
     fn host(&self) -> &str;
+    /// Whether the channel is still up (the keepalive answered and the far
+    /// end hasn't closed it).
+    fn is_reachable(&self) -> bool;
     /// A fresh `query` stream.
     fn open_query(&self) -> Result<QueryStream, ClientError>;
     /// A fresh stream to one of the relay's services.
     fn open_service(&self, service: RelayService) -> Result<RelayStream, ClientError>;
+    /// The sessions on the far machine (the relay's `ListSessions`).
+    fn list_sessions(&self) -> Result<Vec<RelaySession>, ClientError>;
+    /// A stream to the far session `short_id`, for
+    /// [`shelbi_client::Connection::connect`].
+    fn open_session(&self, short_id: &str) -> Result<RelayStream, ClientError>;
 }
 
 impl RelayLink for RemoteLink {
     fn host(&self) -> &str {
         RemoteLink::host(self)
+    }
+    fn is_reachable(&self) -> bool {
+        RemoteLink::is_reachable(self)
+    }
+    fn list_sessions(&self) -> Result<Vec<RelaySession>, ClientError> {
+        self.channel().list_sessions()
+    }
+    fn open_session(&self, short_id: &str) -> Result<RelayStream, ClientError> {
+        self.channel().open(short_id)
     }
     fn open_query(&self) -> Result<QueryStream, ClientError> {
         self.channel().open_query()
@@ -99,6 +118,15 @@ impl ChannelLink {
 impl RelayLink for ChannelLink {
     fn host(&self) -> &str {
         &self.host
+    }
+    fn is_reachable(&self) -> bool {
+        self.channel.is_reachable()
+    }
+    fn list_sessions(&self) -> Result<Vec<RelaySession>, ClientError> {
+        self.channel.list_sessions()
+    }
+    fn open_session(&self, short_id: &str) -> Result<RelayStream, ClientError> {
+        self.channel.open(short_id)
     }
     fn open_query(&self) -> Result<QueryStream, ClientError> {
         self.channel.open_query()
@@ -144,11 +172,18 @@ impl RemoteSource {
 
     fn ask_staged(&self, query: Query, early: &mut dyn FnMut(Answer)) -> Result<Answer, AskError> {
         let idle = self.idle.lock().unwrap_or_else(|p| p.into_inner()).pop();
+        let reused = idle.is_some();
         let mut querier = match idle {
             Some(querier) => querier,
             None => Querier::new(self.link.open_query()?),
         };
-        let answer = querier.ask_staged(query, early);
+        let mut answer = querier.ask_staged(query.clone(), early);
+        // A kept stream may belong to a channel that has since dropped (and
+        // been replaced, `HostLink`): ask once more on a fresh stream.
+        if reused && matches!(answer, Err(AskError::Link(_))) {
+            querier = Querier::new(self.link.open_query()?);
+            answer = querier.ask_staged(query, early);
+        }
         // A stream that failed or answered out of turn is dropped (closing
         // it); one whose query merely failed far side is still good.
         if matches!(answer, Ok(_) | Err(AskError::Query(_))) {
