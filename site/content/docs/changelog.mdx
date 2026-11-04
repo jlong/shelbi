@@ -11,6 +11,36 @@ are prose with `code` and links where they earn their place.
 
 ### November 3, 2026
 
+**v0.13.3. Remote projects on password-only hosts, desktop windows that reopen where you left them, and no false "needs input".**
+
+**Remote full window on password-only hosts.** A remote project on a host that
+only takes a password (or a key whose passphrase isn't in the agent) now opens
+the full native window after one sign-in, instead of falling back to the
+terminal view. The window's relay shares the SSH connection you just signed
+into, still with no port forwarding. Cancelling the sign-in shows a Sign In bar
+rather than asking again, and a connection that can't be made suggests
+`ssh-copy-id` ([#2127](https://github.com/jlong/shelbi/pull/2127)).
+
+**Desktop windows reopen where you left them.** A window sized to fill the
+screen reopens at full width. macOS Stage Manager was narrowing it on launch,
+and the narrower size was then saved over yours. Each window also remembers
+which display it was on and reopens there when that display is still attached
+([#2113](https://github.com/jlong/shelbi/pull/2113), [#2117](https://github.com/jlong/shelbi/pull/2117)).
+
+**No false "needs input".** A worker that ends its turn while a background
+command, monitor or subagent is still running stays working. It no longer
+sends a "finished a turn and needs input" notification or tells the
+orchestrator the workspace is free. The orchestrator ending a turn still
+notifies you ([#2125](https://github.com/jlong/shelbi/pull/2125)).
+
+**Task previews read as plain prose.** The task description in the desktop's
+Workspace and Review panels and the TUI's review panel drops markdown syntax:
+links show their text, and headings, code blocks, mockups and tables are left
+out ([#2124](https://github.com/jlong/shelbi/pull/2124)).
+
+**Site.** shelbi.dev shows the desktop app by default; a visitor who picks
+TUI keeps it ([#2121](https://github.com/jlong/shelbi/pull/2121)).
+
 **v0.13.2. Remote projects in the native desktop window, a New task dialog, and onboarding for new orchestrators.**
 
 **Remote projects open natively.** Opening a project on another machine in the
