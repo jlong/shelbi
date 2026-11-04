@@ -117,6 +117,46 @@ pub fn reconnect_check(remote: &dyn RemoteConnector, session: &RemoteSession) ->
     }
 }
 
+/// The line the terminal view shows when `host`'s listing said it could have
+/// the full window but its link wouldn't open: what went wrong, where the
+/// project opened instead, and what to do about it.
+pub fn link_failed_notice(host: &str, error: &RemoteError) -> String {
+    if let RemoteError::AuthFailed { reason, asked, .. } = error {
+        let or = if *asked {
+            "open it again and sign in"
+        } else {
+            "load your key with `ssh-add`"
+        };
+        return format!(
+            "Shelbi couldn't sign in to {host} for the full window, so it opens in its terminal view. \
+             To get the full window, set up SSH key login to {host} (`ssh-copy-id {host}`) or {or}. \
+             ssh said: {reason}"
+        );
+    }
+    let said = error.to_string();
+    let said = said.trim_end().trim_end_matches('.');
+    let next = match error {
+        // It already says what to do.
+        RemoteError::HostKey { .. } => String::new(),
+        RemoteError::Unreachable { .. } => format!(" Open it again once {host} answers."),
+        RemoteError::DaemonStopped { .. } => " Start Shelbi there, then open it again.".to_string(),
+        _ => " Open it again to retry.".to_string(),
+    };
+    format!("Shelbi couldn't open the full window for {host}: {said}. It opens in its terminal view.{next}")
+}
+
+/// The line a native window shows beside [`crate::launch::remote::SIGN_IN_LABEL`]
+/// after a refused sign-in on reconnect.
+pub fn sign_in_notice(error: &RemoteError) -> String {
+    let said = error.to_string();
+    match error {
+        RemoteError::AuthFailed { host, .. } => format!(
+            "{said} Sign in again, or set up SSH key login to {host} (`ssh-copy-id {host}`)."
+        ),
+        _ => said,
+    }
+}
+
 /// The line a native window shows once its host stops matching: the far
 /// version when it moved, and what Reopen does.
 pub fn changed_notice(host: &str, local: &str, remote: &str) -> String {
@@ -216,6 +256,66 @@ pub fn local_open_unavailable(host: &str) -> String {
         "That folder is on {}: opening it from a remote window isn't available yet.",
         bare_host(host)
     )
+}
+
+#[cfg(test)]
+mod link_notice_tests {
+    use super::*;
+
+    fn denied(asked: bool) -> RemoteError {
+        RemoteError::AuthFailed {
+            host: "alex@studio".into(),
+            reason: "alex@studio: Permission denied (publickey,password,keyboard-interactive).".into(),
+            asked,
+        }
+    }
+
+    #[test]
+    fn a_refused_sign_in_says_what_to_do_in_plain_words() {
+        assert_eq!(
+            link_failed_notice("alex@studio", &denied(false)),
+            "Shelbi couldn't sign in to alex@studio for the full window, so it opens in its terminal view. \
+             To get the full window, set up SSH key login to alex@studio (`ssh-copy-id alex@studio`) or load \
+             your key with `ssh-add`. ssh said: alex@studio: Permission denied (publickey,password,keyboard-interactive)."
+        );
+        // Asked and refused (a wrong password, a Cancel): asking again can work.
+        let asked = link_failed_notice("alex@studio", &denied(true));
+        assert!(asked.contains("`ssh-copy-id alex@studio`"), "{asked}");
+        assert!(asked.contains("open it again and sign in"), "{asked}");
+        assert!(!asked.contains("ssh-add"), "{asked}");
+    }
+
+    #[test]
+    fn every_other_failure_also_says_what_next() {
+        let down = RemoteError::Unreachable {
+            host: "devbox".into(),
+            reason: "Connection refused".into(),
+        };
+        assert_eq!(
+            link_failed_notice("devbox", &down),
+            "Shelbi couldn't open the full window for devbox: Couldn't connect to devbox: Connection refused. \
+             It opens in its terminal view. Open it again once devbox answers."
+        );
+        let stopped = link_failed_notice("devbox", &RemoteError::DaemonStopped { host: "devbox".into() });
+        assert!(stopped.contains("Shelbi isn't running on devbox. "), "{stopped}");
+        assert!(stopped.ends_with("Start Shelbi there, then open it again."), "{stopped}");
+        let key = link_failed_notice("devbox", &RemoteError::HostKey { host: "devbox".into() });
+        assert!(key.contains("Run `ssh devbox` in a terminal"), "{key}");
+        assert!(key.ends_with("It opens in its terminal view."), "{key}");
+        let other = link_failed_notice("devbox", &RemoteError::Failed("Something broke.".into()));
+        assert!(other.contains("Something broke. It opens"), "{other}");
+        assert!(other.ends_with("Open it again to retry."), "{other}");
+    }
+
+    #[test]
+    fn the_sign_in_bar_names_both_ways_on() {
+        assert_eq!(
+            sign_in_notice(&denied(true)),
+            "Couldn't sign in to alex@studio: alex@studio: Permission denied \
+             (publickey,password,keyboard-interactive). Sign in again, or set up SSH key login to alex@studio \
+             (`ssh-copy-id alex@studio`)."
+        );
+    }
 }
 
 #[cfg(test)]

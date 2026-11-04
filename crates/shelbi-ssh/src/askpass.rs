@@ -41,6 +41,7 @@
 
 use std::ffi::OsString;
 use std::io::{ErrorKind, Read};
+use std::os::fd::{AsFd, AsRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -223,8 +224,8 @@ pub fn auth_failed_message(host: &str, reason: &str, asked: bool) -> String {
     } else {
         format!(
             "Couldn't sign in to {host}: {reason}. If it wants a password or a key passphrase, \
-             Shelbi can't ask for one here: add an SSH key for it, or load yours into the agent \
-             with `ssh-add`."
+             Shelbi can't ask for one here: add an SSH key for it (`ssh-copy-id {host}`), or load \
+             yours into the agent with `ssh-add`."
         )
     }
 }
@@ -458,6 +459,74 @@ impl Drop for PromptWatch {
     }
 }
 
+/// A deadline's clock, which stands still while a helper has a dialog open.
+struct AskingClock<'a> {
+    watch: Option<&'a mut PromptWatch>,
+    counted: Duration,
+    last: Instant,
+}
+
+impl<'a> AskingClock<'a> {
+    fn start(watch: Option<&'a mut PromptWatch>) -> Self {
+        AskingClock {
+            watch,
+            counted: Duration::ZERO,
+            last: Instant::now(),
+        }
+    }
+
+    /// Whether `deadline` has run out.
+    fn expired(&mut self, deadline: Duration) -> bool {
+        let now = Instant::now();
+        let prompting = self.watch.as_deref_mut().is_some_and(PromptWatch::prompting);
+        if !prompting {
+            self.counted += now - self.last;
+        }
+        self.last = now;
+        self.counted >= deadline
+    }
+}
+
+fn no_answer(deadline: Duration) -> std::io::Error {
+    std::io::Error::new(
+        ErrorKind::TimedOut,
+        format!("no answer after {}s", deadline.as_secs()),
+    )
+}
+
+/// Wait until `pipe` has something to read (or its writer hung up), for an
+/// `ssh` whose first output only comes once it has signed in. Consumes
+/// nothing. A `deadline` that runs out, not counting time a dialog was open
+/// (`watch`), is `ErrorKind::TimedOut`.
+pub fn wait_for_output(
+    pipe: &impl AsFd,
+    watch: Option<&mut PromptWatch>,
+    deadline: Duration,
+) -> std::io::Result<()> {
+    let mut clock = AskingClock::start(watch);
+    let mut poll = libc::pollfd {
+        fd: pipe.as_fd().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: `poll` points at one valid pollfd for the length of the call.
+        match unsafe { libc::poll(&mut poll, 1, 50) } {
+            n if n > 0 => return Ok(()),
+            0 => {}
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        if clock.expired(deadline) {
+            return Err(no_answer(deadline));
+        }
+    }
+}
+
 /// Run `cmd` (stdin null, stdout and stderr captured) until it exits,
 /// killing it once it has run for `deadline` — not counting time a dialog
 /// was open. `askpass` is the setup to ask through, `None` to run `cmd` as
@@ -485,25 +554,15 @@ pub fn run_until(
         .spawn()?;
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
-    let mut counted = Duration::ZERO;
-    let mut last = Instant::now();
+    let mut clock = AskingClock::start(watch.as_mut());
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
         }
-        let now = Instant::now();
-        let prompting = watch.as_mut().is_some_and(PromptWatch::prompting);
-        if !prompting {
-            counted += now - last;
-        }
-        last = now;
-        if counted >= deadline {
+        if clock.expired(deadline) {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(std::io::Error::new(
-                ErrorKind::TimedOut,
-                format!("no answer after {}s", deadline.as_secs()),
-            ));
+            return Err(no_answer(deadline));
         }
         std::thread::sleep(Duration::from_millis(50));
     };
@@ -701,6 +760,7 @@ mod tests {
             .starts_with("Couldn't sign in to devbox: Permission denied (publickey,password). "));
         assert!(batch.contains("password"), "{batch}");
         assert!(batch.contains("ssh-add"), "{batch}");
+        assert!(batch.contains("`ssh-copy-id devbox`"), "{batch}");
     }
 
     #[test]
@@ -766,5 +826,49 @@ mod tests {
         slow.arg("5");
         let err = run_until(&mut slow, None, Duration::from_millis(200)).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::TimedOut);
+    }
+
+    /// `sh -c script` with its stdout piped.
+    fn piped(script: &str) -> (std::process::Child, std::process::ChildStdout) {
+        let mut child = Command::new("sh")
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        (child, stdout)
+    }
+
+    #[test]
+    fn waiting_for_output_ends_on_output_or_a_hang_up_and_consumes_nothing() {
+        let (mut child, mut stdout) = piped("echo hello");
+        wait_for_output(&stdout, None, Duration::from_secs(10)).unwrap();
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "hello\n", "the first bytes are still there");
+        child.wait().unwrap();
+
+        let (mut child, stdout) = piped("exit 255");
+        wait_for_output(&stdout, None, Duration::from_secs(10)).unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn waiting_for_output_doesnt_count_a_dialog_that_is_open() {
+        let (mut child, stdout) = piped("sleep 1; echo in");
+        let mut watch = PromptWatch::new().unwrap();
+        // A helper with its dialog up for longer than the whole deadline.
+        let helper = UnixStream::connect(watch.path()).unwrap();
+        wait_for_output(&stdout, Some(&mut watch), Duration::from_millis(200))
+            .expect("the time spent asking isn't counted");
+        drop(helper);
+        child.wait().unwrap();
+
+        // Without one the same wait runs out.
+        let (mut child, stdout) = piped("sleep 2; echo in");
+        let err = wait_for_output(&stdout, None, Duration::from_millis(200)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
