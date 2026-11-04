@@ -26,8 +26,11 @@
 //! then opens a fresh channel. A reconnect therefore never starts the far
 //! daemon: a stopped one ends the pane's loop with the
 //! [`RemoteError::DaemonStopped`] message, kept as
-//! [`RemoteSessionConnector::refusal`] for the window to offer Start. Sessions
-//! resume by attach and resync (the replay); the agents never stopped.
+//! [`RemoteSessionConnector::refusal`] for the window to offer Start. A sign-in
+//! the user refused is kept the same way for the window to offer Sign In, but
+//! the pane keeps waiting: the link asks nothing until the user says to
+//! ([`HostLink::allow_sign_in`]), and the pane comes back once it is up.
+//! Sessions resume by attach and resync (the replay); the agents never stopped.
 //!
 //! **Two hops.** A workspace the far project runs on another of its own
 //! machines is not on the far host's session list, and this machine has no
@@ -59,7 +62,7 @@ use super::{
     discovery_name, no_live_session_error, starting_error, ConnectFailure, Connected, Connector,
     GridSize, IdleInfo, SessionRef,
 };
-use crate::launch::link::HostLink;
+use crate::launch::link::{sign_in_refused, HostLink};
 use crate::launch::remote::{RemoteConnector, RemoteError, RemoteSession};
 use crate::source::remote::RelayLink;
 
@@ -91,9 +94,12 @@ impl RemoteSessionConnector {
 
     /// Why the last reconnect was refused, when the host answered but
     /// wouldn't have it ([`RemoteError::DaemonStopped`]: the window offers to
-    /// start Shelbi there). Cleared by the next attempt that gets through.
+    /// start Shelbi there). Cleared by the next attempt that gets through; a
+    /// refused sign-in is over as soon as the link is up, whether or not this
+    /// connector's panes have been back yet.
     pub fn refusal(&self) -> Option<RemoteError> {
-        self.refusal.lock().unwrap_or_else(|p| p.into_inner()).clone()
+        let refusal = self.refusal.lock().unwrap_or_else(|p| p.into_inner()).clone()?;
+        (!sign_in_refused(&refusal) || !self.link.is_up()).then_some(refusal)
     }
 
     /// The host's channel: the current one, or a fresh one once the host
@@ -111,8 +117,16 @@ impl RemoteSessionConnector {
             Err(RemoteError::Unreachable { reason, .. }) => Err(ConnectFailure::Unreachable(reason)),
             Err(error) => {
                 let message = error.to_string();
+                // The user said no to a sign-in: the link holds that answer,
+                // so this pane's retries ask nothing, and it comes back by
+                // itself once the user signs in from the window's bar.
+                let waiting = sign_in_refused(&error);
                 *refusal = Some(error);
-                Err(ConnectFailure::Message(message))
+                Err(if waiting {
+                    ConnectFailure::Unreachable(message)
+                } else {
+                    ConnectFailure::Message(message)
+                })
             }
         }
     }

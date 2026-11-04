@@ -96,15 +96,15 @@ pub fn decide_with(
         RemoteOpen::Terminal { notice } => Decided::Terminal { notice },
         RemoteOpen::Native(listing) => {
             let link = link_for(&session.host);
+            // The user is opening this host, and its listing just came back:
+            // an earlier No to a sign-in no longer stands.
+            link.allow_sign_in();
             match link.connect(&|| remote.connect(session)) {
                 Ok(_) => Decided::Native { listing, link },
                 Err(error) => {
                     tracing::warn!(host = %session.host, %error, "the remote link didn't open");
                     Decided::Terminal {
-                        notice: Some(format!(
-                            "Shelbi couldn't open the full window for {}: {error} It opens in its terminal view.",
-                            session.host
-                        )),
+                        notice: Some(remote_window::link_failed_notice(&session.host, &error)),
                     }
                 }
             }
@@ -422,6 +422,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::elements::terminal::session::SessionIo;
+    use shelbi_app::launch::remote::RemoteError;
     use shelbi_app::launch::FakeRemote;
 
     thread_local! {
@@ -660,6 +661,141 @@ pub(crate) mod tests {
         };
         assert_eq!(listing.projects[0].name, crate::remote_fixture::PROJECT);
         assert!(link.is_up());
+    }
+
+    /// A host that only takes a password: the first step to reach it asks the
+    /// user, and everything after rides that sign-in, as the shared
+    /// connection does for real. `accept` is the user's answer.
+    struct PasswordOnly {
+        far: Arc<FakeRemote>,
+        accept: bool,
+        asked: Arc<std::sync::atomic::AtomicU32>,
+        signed_in: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl PasswordOnly {
+        fn new(far: Arc<FakeRemote>, accept: bool) -> PasswordOnly {
+            PasswordOnly {
+                far,
+                accept,
+                asked: Arc::default(),
+                signed_in: Arc::default(),
+            }
+        }
+
+        fn sign_in(&self, host: &str) -> Result<(), RemoteError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            if self.signed_in.load(SeqCst) {
+                return Ok(());
+            }
+            self.asked.fetch_add(1, SeqCst);
+            if !self.accept {
+                return Err(denied(host, true));
+            }
+            self.signed_in.store(true, SeqCst);
+            Ok(())
+        }
+
+        /// The relay's link to this host: it opens over `channel` when a sign-in
+        /// is there to ride, and with none, as a key-only `ssh` would, it's
+        /// refused.
+        fn link(&self, channel: Arc<dyn shelbi_app::source::remote::RelayLink>) -> Arc<HostLink> {
+            let signed_in = self.signed_in.clone();
+            Arc::new(HostLink::new("alex@studio", move |host| {
+                if signed_in.load(std::sync::atomic::Ordering::SeqCst) {
+                    Ok(channel.clone())
+                } else {
+                    Err(denied(host, false))
+                }
+            }))
+        }
+    }
+
+    fn denied(host: &str, asked: bool) -> RemoteError {
+        RemoteError::AuthFailed {
+            host: host.into(),
+            reason: format!("{host}: Permission denied (publickey,password,keyboard-interactive)."),
+            asked,
+        }
+    }
+
+    impl RemoteConnector for PasswordOnly {
+        fn find_sessions(&self, host: &str) -> Result<(String, Vec<RemoteSession>), RemoteError> {
+            self.sign_in(host)?;
+            self.far.find_sessions(host)
+        }
+        fn connect(&self, session: &RemoteSession) -> Result<(), RemoteError> {
+            self.sign_in(&session.host)?;
+            self.far.connect(session)
+        }
+        fn start_daemon(&self, host: &str) -> Result<(), RemoteError> {
+            self.sign_in(host)?;
+            self.far.start_daemon(host)
+        }
+        fn listing(&self, host: &str) -> Result<RemoteListing, RemoteError> {
+            self.sign_in(host)?;
+            self.far.listing(host)
+        }
+    }
+
+    fn studio_session() -> RemoteSession {
+        RemoteSession {
+            host: "alex@studio".into(),
+            user: "alex".into(),
+            project: "dxc4".into(),
+            label: None,
+            path: "~/dxc4".into(),
+        }
+    }
+
+    fn studio() -> Arc<FakeRemote> {
+        Arc::new(FakeRemote::new().with_host("alex@studio", "alex", &[("dxc4", "~/dxc4")]))
+    }
+
+    #[test]
+    fn a_password_only_host_opens_the_full_window_after_one_sign_in() {
+        let far = crate::remote_fixture::FarHost::new("password");
+        let host = Arc::new(PasswordOnly::new(studio(), true));
+        let link = host.link(far.link.clone());
+        let asked = host.asked.clone();
+        let opened = link.clone();
+        let decided = decide_with(&studio_session(), host, &move |_| opened.clone());
+        assert!(matches!(decided, Decided::Native { .. }), "the full window, not the terminal view");
+        assert!(link.is_up());
+        assert_eq!(asked.load(std::sync::atomic::Ordering::SeqCst), 1, "the user was asked once");
+    }
+
+    #[test]
+    fn a_link_that_cant_sign_in_says_what_to_do() {
+        // The steps got in (their connection is up), but the relay couldn't
+        // use it and had no way to ask: the banner from the report.
+        let far = Arc::new(FakeRemote::new().with_host("alex@studio", "alex", &[("dxc4", "~/dxc4")]));
+        let link = Arc::new(HostLink::new("alex@studio", |host| Err(denied(host, false))));
+        let decided = decide_with(&studio_session(), far, &move |_| link.clone());
+        let Decided::Terminal { notice: Some(notice) } = decided else {
+            panic!("it opens the terminal view, saying why");
+        };
+        assert!(notice.contains("ssh-copy-id alex@studio"), "{notice}");
+        assert!(notice.contains("set up SSH key login to alex@studio"), "{notice}");
+        assert!(notice.contains("terminal view"), "{notice}");
+        assert!(notice.contains("Permission denied"), "ssh's own words stay: {notice}");
+    }
+
+    #[test]
+    fn opening_a_host_again_may_ask_again_after_a_no() {
+        // The window's reconnect heard No, and the link holds that answer;
+        // the user opening the host afresh has changed their mind.
+        let far = crate::remote_fixture::FarHost::new("again");
+        let channel = far.link.clone();
+        let link = Arc::new(HostLink::new("alex@studio", move |_| {
+            Ok(channel.clone() as Arc<dyn shelbi_app::source::remote::RelayLink>)
+        }));
+        let no = || Err(denied("alex@studio", true));
+        assert!(link.connect(&no).is_err());
+        assert!(link.connect(&|| Ok(())).is_err(), "held: nothing asks");
+        let opened = link.clone();
+        let decided = decide_with(&studio_session(), studio(), &move |_| opened.clone());
+        assert!(matches!(decided, Decided::Native { .. }));
     }
 
     #[test]

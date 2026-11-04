@@ -119,6 +119,7 @@ use shelbi_state::keymap::{
 use crate::assets::{heroicon, icons};
 use crate::commands::{self, CommandHost};
 use crate::feeds::{FeedHub, FeedSubscription};
+use shelbi_app::launch::link::sign_in_refused;
 use shelbi_app::launch::remote::{RemoteConnector, RemoteError, RemoteSession};
 use shelbi_app::launch::{HostLink, RemoteListing};
 use shelbi_app::session::remote::RemoteSessionConnector;
@@ -1009,11 +1010,13 @@ impl RemoteWindow {
     }
 
     /// `error` when it is one the window answers (Start for a stopped far
-    /// daemon, Reopen for a host that changed), else `None` (the host is
-    /// only unreachable for now: keep trying).
+    /// daemon, Reopen for a host that changed, Sign In for a sign-in the user
+    /// refused), else `None` (the host is only unreachable for now: keep
+    /// trying).
     fn refusal(error: RemoteError) -> Option<RemoteError> {
         match error {
             error @ (RemoteError::DaemonStopped { .. } | RemoteError::NoLongerNative { .. }) => Some(error),
+            error if sign_in_refused(&error) => Some(error),
             _ => None,
         }
     }
@@ -1022,6 +1025,48 @@ impl RemoteWindow {
     /// answers it ([`Self::refusal`]).
     fn refused(&self) -> Option<RemoteError> {
         Self::refusal(self.sessions.as_ref()?.refusal()?)
+    }
+}
+
+/// The bar a remote window shows above its shell when its host is waiting on
+/// the user, with the one thing they can do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteBar {
+    /// The far daemon isn't running: Start Shelbi.
+    Stopped(SharedString),
+    /// The user refused a sign-in on reconnect, and the link won't ask again
+    /// unprompted: Sign In.
+    SignIn(SharedString),
+}
+
+impl RemoteBar {
+    /// The bar for `error`, one of [`RemoteWindow::refusal`]'s.
+    fn of(error: &RemoteError) -> RemoteBar {
+        if sign_in_refused(error) {
+            RemoteBar::SignIn(shelbi_app::remote_window::sign_in_notice(error).into())
+        } else {
+            RemoteBar::Stopped(error.to_string().into())
+        }
+    }
+
+    fn id(&self) -> &'static str {
+        match self {
+            RemoteBar::Stopped(_) => "remote-stopped",
+            RemoteBar::SignIn(_) => "remote-sign-in",
+        }
+    }
+
+    fn line(&self) -> SharedString {
+        match self {
+            RemoteBar::Stopped(line) | RemoteBar::SignIn(line) => line.clone(),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            RemoteBar::Stopped(_) => shelbi_app::launch::remote::START_DAEMON_LABEL,
+            RemoteBar::SignIn(_) => shelbi_app::launch::remote::SIGN_IN_LABEL,
+        }
     }
 }
 
@@ -1041,7 +1086,7 @@ pub struct ShelbiWindow {
     remote: Option<RemoteWindow>,
     /// A remote window's far daemon was found stopped: the bar offers to
     /// start it (never started implicitly).
-    remote_stopped: Option<SharedString>,
+    remote_bar: Option<RemoteBar>,
     /// A native remote window's host no longer opens natively (another
     /// version, or other protocols, since the window opened): the line the
     /// window shows instead of its shell, with Reopen. Its panes are closed
@@ -1340,8 +1385,8 @@ impl ShelbiWindow {
 
     /// Keep a remote window's link up: every [`REMOTE_WATCH`], a link found
     /// down is reopened off the UI thread after the host checks out (never
-    /// starting its daemon), and a stopped far daemon, found here or by a
-    /// pane's reconnect, shows the bar that offers to start it.
+    /// starting its daemon). A stopped far daemon or a refused sign-in, found
+    /// here or by a pane's reconnect, shows the bar that offers the way on.
     fn watch_remote(&mut self, cx: &mut Context<Self>) {
         self._remote_watch = Some(cx.spawn(async move |this, cx| loop {
             // A host that changed is done with: Reopen decides again.
@@ -1365,12 +1410,12 @@ impl ShelbiWindow {
                     this.host_changed(message.clone(), cx);
                     return;
                 }
-                let stopped = refused.map(|error| SharedString::from(error.to_string()));
+                let bar = refused.as_ref().map(RemoteBar::of);
                 if kept == Ok(true) {
                     this.request_refresh();
                 }
-                if stopped != this.remote_stopped {
-                    this.remote_stopped = stopped;
+                if bar != this.remote_bar {
+                    this.remote_bar = bar;
                     cx.notify();
                 }
             });
@@ -1392,7 +1437,7 @@ impl ShelbiWindow {
         }
         tracing::info!(line, "the remote window's host changed; offering Reopen");
         self.remote_changed = Some(line.into());
-        self.remote_stopped = None;
+        self.remote_bar = None;
         cx.notify();
     }
 
@@ -1456,15 +1501,48 @@ impl ShelbiWindow {
                 .connect(&|| shelbi_app::remote_window::reconnect_check(remote.remote.as_ref(), &remote.session))
                 .map(|_| ())
         });
+        self.after_far_action(work, format!("Started Shelbi on {host}."), cx);
+    }
+
+    /// The bar's Sign In: the user wants the host again after refusing a
+    /// sign-in, so the link may ask once more.
+    fn sign_in_to_far_host(&mut self, cx: &mut Context<Self>) {
+        let Some(remote) = self.remote.clone() else {
+            return;
+        };
+        let host = remote.session.host.clone();
+        self.flash(format!("Signing in to {host}…"), cx);
+        let work = cx.background_executor().spawn(async move {
+            remote.link.allow_sign_in();
+            remote
+                .link
+                .connect(&|| shelbi_app::remote_window::reconnect_check(remote.remote.as_ref(), &remote.session))
+                .map(|_| ())
+        });
+        self.after_far_action(work, format!("Signed in to {host}."), cx);
+    }
+
+    /// A far action that brings the link back up has finished: say `done`, or
+    /// what stands in its way.
+    fn after_far_action(
+        &mut self,
+        work: gpui::Task<Result<(), RemoteError>>,
+        done: String,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
-            let started = work.await;
-            this.update(cx, |this, cx| match started {
+            let result = work.await;
+            this.update(cx, |this, cx| match result {
                 Ok(()) => {
-                    this.remote_stopped = None;
-                    this.flash(format!("Started Shelbi on {host}."), cx);
+                    this.remote_bar = None;
+                    this.flash(done, cx);
                     this.request_refresh();
                 }
                 Err(RemoteError::NoLongerNative { message, .. }) => this.host_changed(message, cx),
+                Err(error) if sign_in_refused(&error) => {
+                    this.remote_bar = Some(RemoteBar::of(&error));
+                    cx.notify();
+                }
                 Err(error) => {
                     this.banner = Some(error.to_string().into());
                     cx.notify();
@@ -1473,6 +1551,15 @@ impl ShelbiWindow {
             .ok();
         })
         .detach();
+    }
+
+    /// The remote bar's button.
+    fn remote_bar_action(&mut self, cx: &mut Context<Self>) {
+        match self.remote_bar {
+            Some(RemoteBar::Stopped(_)) => self.start_far_daemon(cx),
+            Some(RemoteBar::SignIn(_)) => self.sign_in_to_far_host(cx),
+            None => {}
+        }
     }
 
     /// A window that reaches nothing (a test's): the shell over the
@@ -1526,7 +1613,7 @@ impl ShelbiWindow {
             project: project.to_string(),
             project_handle: shelbi_orchestrator::source::local_handle(project),
             remote: None,
-            remote_stopped: None,
+            remote_bar: None,
             remote_changed: None,
             _remote_watch: None,
             slot: 0,
@@ -2140,7 +2227,7 @@ impl ShelbiWindow {
             Some(remote) => remote.handle_for(project),
             None => shelbi_orchestrator::source::local_handle(project),
         };
-        self.remote_stopped = None;
+        self.remote_bar = None;
         self.client.switch_project(project);
         self.model = cx
             .try_global::<Catalog>()
@@ -5924,8 +6011,8 @@ impl ShelbiWindow {
         let connect = self.connect.as_ref().map(|(dialog, _, _)| dialog.clone());
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
         let weak = cx.entity().downgrade();
-        let start_weak = weak.clone();
-        let remote_stopped = self.remote_stopped.clone();
+        let bar_weak = weak.clone();
+        let remote_bar = self.remote_bar.clone();
         let layer = self.overlay.as_ref().map(|o| {
             let entering = if reduce_motion {
                 None
@@ -5990,14 +6077,14 @@ impl ShelbiWindow {
                     });
                 }))
             })
-            .when_some(remote_stopped, |col, line| {
+            .when_some(remote_bar, |col, bar| {
                 col.child(boot_view::render_action_bar(
-                    "remote-stopped",
-                    line,
-                    shelbi_app::launch::remote::START_DAEMON_LABEL,
+                    bar.id(),
+                    bar.line(),
+                    bar.label(),
                     &theme,
                     move |_, cx| {
-                        let _ = start_weak.update(cx, |this, cx| this.start_far_daemon(cx));
+                        let _ = bar_weak.update(cx, |this, cx| this.remote_bar_action(cx));
                     },
                 ))
             })

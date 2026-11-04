@@ -21,12 +21,15 @@
 //!   nothing but the host as typed (in the recent remote sessions).
 //! - **One sign-in.** Every step shares a ControlMaster
 //!   ([`remote_control_path`], kept for [`CONTROL_PERSIST`] after the last
-//!   use), so the user is asked once: the later steps and the session's
-//!   terminal ride the connection the first one opened.
+//!   use), so the user is asked once: the later steps, the session's terminal
+//!   and a native window's relay link ride the connection the first one
+//!   opened.
 //! - **No hub forward.** Unlike the hub's own machine connections
 //!   (`shelbi_ssh`), these never carry the `-R` forward of this machine's hub
 //!   socket: the far side has its own Shelbi, and its `hub.sock` must stay its
-//!   own.
+//!   own. The shared connection isn't the hub's (its own path, `r-%C`), and
+//!   the steps and the relay clear any forward in the user's `~/.ssh/config`
+//!   ([`NO_FORWARDS`]), so a connection they open carries none.
 //! - **The daemon.** Finding and connecting only read; the far daemon is
 //!   started only by [`RemoteConnector::start_daemon`], which a client calls
 //!   when the user asks ([`super::remote::START_DAEMON_LABEL`]).
@@ -74,8 +77,15 @@ const COMMON_OPTIONS: &[&str] = &[
     "LogLevel=ERROR",
 ];
 
-/// How long the shared connection outlives its last step or terminal.
+/// How long the shared connection outlives its last step, terminal or relay
+/// link. OpenSSH only counts this down while nothing rides the connection, so
+/// it never ends a link that is up.
 pub const CONTROL_PERSIST: &str = "600";
+
+/// Set up none of the forwards in the user's `~/.ssh/config`. The steps and
+/// the relay need none, and the relay keeps the shared connection alive for
+/// as long as its window is open, so one a step opened must not carry them.
+const NO_FORWARDS: [&str; 2] = ["-o", "ClearAllForwardings=yes"];
 
 /// How a remote-session `ssh` signs in.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,7 +154,11 @@ pub fn ssh_options(auth: &SshAuth, control_path: Option<&str>) -> Vec<String> {
 pub fn remote_control_path() -> Option<String> {
     shelbi_state::ensure_ssh_control_dir().ok()?;
     let dir = shelbi_state::ssh_control_dir().ok()?;
-    Some(format!("{}/r-%C", dir.display()))
+    Some(remote_control_path_in(&dir))
+}
+
+fn remote_control_path_in(dir: &std::path::Path) -> String {
+    format!("{}/r-%C", dir.display())
 }
 
 /// One project in a [`RemoteListing`].
@@ -372,11 +386,9 @@ pub struct OpenSsh;
 impl SshTransport for OpenSsh {
     fn run(&self, host: &str, script: &str, deadline: Duration) -> std::io::Result<SshOutput> {
         let auth = SshAuth::detect().for_host(host);
-        let mut cmd = Command::new("ssh");
-        cmd.args(ssh_options(&auth, remote_control_path().as_deref()))
-            .arg(host)
-            .arg("--")
-            .arg(remote_sh(script));
+        let argv = step_command(host, script, &auth, remote_control_path().as_deref());
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
         let out = shelbi_ssh::askpass::run_until(&mut cmd, auth.askpass(), deadline)?;
         Ok(SshOutput {
             code: out.status.code(),
@@ -385,6 +397,15 @@ impl SshTransport for OpenSsh {
             asked: auth.askpass().is_some(),
         })
     }
+}
+
+/// The `ssh` that runs one step: `script` on `host`, on the shared connection.
+pub fn step_command(host: &str, script: &str, auth: &SshAuth, control_path: Option<&str>) -> Vec<String> {
+    let mut argv = vec!["ssh".to_string()];
+    argv.extend(ssh_options(auth, control_path));
+    argv.extend(NO_FORWARDS.map(String::from));
+    argv.extend([host.to_string(), "--".to_string(), remote_sh(script)]);
+    argv
 }
 
 /// `script` as the one remote command word `ssh` hands the far login shell:
@@ -485,24 +506,36 @@ exec \"$P\" --project {}
 /// The command that opens a [`super::link::RemoteLink`] to `host`: the host's
 /// own `shelbi relay` over one `ssh`, its stdio the relay channel.
 ///
-/// It finds the far binary the way the probe does, signs in with keys, agent
-/// and config only (`BatchMode=yes`, with the usual keepalives), and allocates
-/// no terminal. It sets up no forward of any kind: no `-R` (this machine's
-/// `hub.sock` is never exposed to the far host), no `-L`, and
-/// `ClearAllForwardings=yes` so a forward in the user's `~/.ssh/config`
-/// isn't set up either. It names no ControlMaster, so it neither opens nor
-/// shares Shelbi's remote-session connection. And it never starts the far
-/// daemon: `shelbi relay` only reads, and connects to the daemon's sockets
-/// when a service asks.
-pub fn relay_command(host: &str) -> Vec<String> {
+/// It finds the far binary the way the probe does, signs in as `auth` says
+/// (with the usual keepalives), and allocates no terminal.
+///
+/// It rides the remote-session connection on `control_path`
+/// ([`remote_control_path`]), which the connect steps signed in just before,
+/// so a host that only takes a password doesn't ask again. If that connection
+/// is gone it opens it, and if the host refuses it another session (sshd's
+/// `MaxSessions`), ssh signs in on its own; `auth` is what may ask then, once.
+/// A link depends on the connection while it is up: [`CONTROL_PERSIST`] doesn't
+/// run while the link rides it, and if it closes, `ssh` exits at once, so the
+/// link reads as down and reconnects ([`super::link::HostLink`]).
+///
+/// It sets up no forward of any kind: no `-R` (this machine's `hub.sock` is
+/// never exposed to the far host, and the hub's own connection, which forwards
+/// it, has another path), no `-L`, and [`NO_FORWARDS`] so a forward in the
+/// user's `~/.ssh/config` isn't set up either, by this `ssh` or by a connection
+/// it or a connect step opens. And it never starts the far daemon: `shelbi
+/// relay` only reads, and connects to the daemon's sockets when a service asks.
+///
+/// [`SshAuth::askpass`]'s environment isn't in the argv: run it with
+/// [`super::link::RemoteLink::spawn_asking`].
+pub fn relay_command(host: &str, auth: &SshAuth, control_path: Option<&str>) -> Vec<String> {
     let script = format!(
         "{FIND_SHELBI}if [ -z \"$P\" ]; then echo 'Shelbi isn'\\''t installed on this machine.' >&2; exit 127; fi
 exec \"$P\" relay
 "
     );
     let mut argv = vec!["ssh".to_string(), "-T".to_string()];
-    argv.extend(ssh_options(&SshAuth::Batch, None));
-    argv.extend(["-o".to_string(), "ClearAllForwardings=yes".to_string()]);
+    argv.extend(ssh_options(auth, control_path));
+    argv.extend(NO_FORWARDS.map(String::from));
     argv.push(host.to_string());
     argv.push("--".to_string());
     argv.push(remote_sh(&script));
@@ -1162,22 +1195,87 @@ mod tests {
         assert_eq!(version_of(""), None);
     }
 
-    #[test]
-    fn the_relay_link_carries_no_forward_and_no_shared_connection() {
-        let argv = relay_command("devbox");
-        assert_eq!(argv[0], "ssh");
+    /// What every remote-session `ssh` that opens a connection must hold to:
+    /// no forward of either direction (or a dynamic one), however spelled.
+    fn assert_no_forwards(argv: &[String]) {
         for arg in &argv[..argv.len() - 1] {
-            // No forward of either direction (or a dynamic one), however spelled.
-            for flag in ["-R", "-L", "-D", "-M", "-S"] {
-                assert!(!arg.starts_with(flag), "relay ssh has {arg}: {argv:?}");
+            for flag in ["-R", "-L", "-D", "-M", "-S", "-O"] {
+                assert!(!arg.starts_with(flag), "ssh has {arg}: {argv:?}");
             }
-            for option in ["Forward", "ControlMaster", "ControlPath", "ControlPersist"] {
-                assert!(
-                    !arg.contains(option) || arg == "ClearAllForwardings=yes",
-                    "relay ssh has {arg}: {argv:?}"
-                );
-            }
+            assert!(
+                !arg.contains("Forward") || arg == "ClearAllForwardings=yes",
+                "ssh has {arg}: {argv:?}"
+            );
         }
+        assert!(has(argv, ["-o", "ClearAllForwardings=yes"]), "{argv:?}");
+    }
+
+    const CONTROL_PATH: &str = "/Users/alex/.shelbi/ssh/r-%C";
+
+    fn asking() -> SshAuth {
+        SshAuth::Ask(shelbi_ssh::askpass::Askpass::new("/Applications/Shelbi.app/Contents/MacOS/shelbi-desktop"))
+    }
+
+    #[test]
+    fn the_relay_rides_the_connection_the_steps_signed_in() {
+        let argv = relay_command("alex@studio", &asking(), Some(CONTROL_PATH));
+        assert_no_forwards(&argv);
+        assert!(has(&argv, ["-o", "ControlMaster=auto"]), "{argv:?}");
+        assert!(has(&argv, ["-o", "ControlPersist=600"]), "{argv:?}");
+        assert!(has(&argv, ["-o", "ControlPath=/Users/alex/.shelbi/ssh/r-%C"]), "{argv:?}");
+        assert!(has(&argv, ["-o", "BatchMode=no"]), "it may ask when it must: {argv:?}");
+        assert_eq!(argv[0], "ssh", "the askpass environment is the link's to set: {argv:?}");
+
+        // On the same connection as a step, under the same options.
+        let step = step_command("alex@studio", "true", &asking(), Some(CONTROL_PATH));
+        assert_eq!(
+            step.iter().position(|a| a == "alex@studio").map(|at| &step[1..at]),
+            argv.iter().position(|a| a == "alex@studio").map(|at| &argv[2..at]),
+        );
+    }
+
+    #[test]
+    fn a_relay_that_cant_ask_never_prompts_and_can_still_go_alone() {
+        let argv = relay_command("devbox", &SshAuth::Batch, None);
+        assert_no_forwards(&argv);
+        assert!(has(&argv, ["-o", "BatchMode=yes"]), "{argv:?}");
+        assert!(!argv.iter().any(|a| a.contains("Control")), "{argv:?}");
+    }
+
+    #[test]
+    fn the_steps_open_a_shared_connection_with_no_forwards() {
+        for auth in [SshAuth::Batch, asking()] {
+            let argv = step_command("devbox", &probe_script(), &auth, Some(CONTROL_PATH));
+            assert_no_forwards(&argv);
+            assert!(has(&argv, ["-o", "ControlMaster=auto"]), "{argv:?}");
+        }
+    }
+
+    #[test]
+    fn a_shared_connection_is_named_apart_from_the_hubs() {
+        // The hub's own connection (`%C` in the same directory) forwards this
+        // machine's hub socket; a remote session's is `r-%C`.
+        assert_eq!(remote_control_path_in(std::path::Path::new("/h/ssh")), "/h/ssh/r-%C");
+    }
+
+    #[test]
+    fn a_password_only_host_answers_once_it_has_asked() {
+        // ssh could ask and the user answered: the host's listing comes back
+        // as from any other, and later steps ride that sign-in.
+        let mut out = ok_host("0.42.0", true);
+        out.asked = true;
+        let (remote, fake) = remote(FakeSsh::default().answer("alex@studio", out));
+        let session = remote.find_sessions("alex@studio").unwrap().1.remove(0);
+        remote.connect(&session).unwrap();
+        assert!(remote.listing("alex@studio").is_ok());
+        assert_eq!(fake.runs.lock().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn the_relay_link_carries_no_forward() {
+        let argv = relay_command("devbox", &SshAuth::Batch, Some(CONTROL_PATH));
+        assert_eq!(argv[0], "ssh");
+        assert_no_forwards(&argv);
         assert!(has(&argv, ["-o", "BatchMode=yes"]), "{argv:?}");
         assert!(has(&argv, ["-o", "ServerAliveInterval=15"]), "{argv:?}");
         assert!(has(&argv, ["-o", "ClearAllForwardings=yes"]), "{argv:?}");

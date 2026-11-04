@@ -13,9 +13,11 @@
 //! threads would wake gpui's test scheduler off its thread. The far `Changed`
 //! reaching a feed is `refresh::tests`'s; here the board's own reads show it.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use gpui::{TestAppContext, VisualTestContext, WindowAppearance};
+use shelbi_app::launch::FakeRemote;
 use shelbi_app::remote_window::{self, RemoteOpen};
 use shelbi_app::session::RetryPolicy;
 use shelbi_app::theme::ThemePreference;
@@ -355,6 +357,66 @@ fn a_host_that_changed_closes_the_panes_and_reopen_decides_again(cx: &mut TestAp
     update(cx, handle, |w, window, cx| w.reopen_remote(window, cx));
     let opened = OPENED.with(|o| o.borrow().clone());
     assert_eq!(opened, vec![far.session()]);
+}
+
+#[gpui::test]
+fn a_refused_sign_in_stops_asking_and_the_bar_signs_in_again(cx: &mut TestAppContext) {
+    setup(cx);
+    let far = FarHost::new("signin");
+    let handle = open(cx, &far);
+    draw(cx, handle);
+
+    // The link dropped and the master went with it. The reconnect's sign-in
+    // dialog got Cancel: from here on nothing may put it back up unasked.
+    let refused = RemoteError::AuthFailed {
+        host: HOST.into(),
+        reason: "Permission denied (publickey,password).".into(),
+        asked: true,
+    };
+    let saying_no = FakeRemote::new().failing_connect(refused.clone());
+    let down = HostLink::new(HOST, |_| panic!("no channel opens without a sign-in"))
+        .with_pause(Duration::ZERO);
+    let session = far.session();
+    for _ in 0..3 {
+        let kept = RemoteWindow::keep_up(&down, &saying_no, &session);
+        assert_eq!(kept, Err(Some(refused.clone())), "the window answers this one");
+    }
+    let asks = AtomicU32::new(0);
+    let answered = down.connect(&|| {
+        asks.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    });
+    assert_eq!(answered.err(), Some(refused.clone()));
+    assert_eq!(asks.load(Ordering::SeqCst), 0, "the held answer runs no check, so no dialog");
+
+    // The window shows it with Sign In, in plain words.
+    update(cx, handle, |w, _, cx| {
+        w.remote_bar = Some(RemoteBar::of(&refused));
+        cx.notify();
+    });
+    draw(cx, handle);
+    let bar = read(cx, handle, |w, _| w.remote_bar.clone()).expect("the bar");
+    assert_eq!(bar.label(), shelbi_app::launch::remote::SIGN_IN_LABEL);
+    assert!(bar.line().contains(&format!("ssh-copy-id {HOST}")), "{}", bar.line());
+    let mut vcx = VisualTestContext::from_window(handle.into(), cx);
+    assert!(vcx.debug_bounds("remote-sign-in").is_some());
+    assert!(vcx.debug_bounds("remote-stopped").is_none());
+
+    // Sign In: the link comes up, and the bar goes.
+    update(cx, handle, |w, _, cx| w.remote_bar_action(cx));
+    settle(cx, "the bar to clear", |cx| read(cx, handle, |w, _| w.remote_bar.is_none()));
+}
+
+#[test]
+fn a_stopped_far_daemon_keeps_its_start_bar() {
+    let bar = RemoteBar::of(&RemoteError::DaemonStopped { host: "devbox".into() });
+    assert_eq!(bar.id(), "remote-stopped");
+    assert_eq!(bar.label(), shelbi_app::launch::remote::START_DAEMON_LABEL);
+    assert_eq!(bar.line().as_ref(), "Shelbi isn't running on devbox.");
+    // An unreachable host, or a refusal nobody was asked for, just keeps trying.
+    assert!(RemoteWindow::refusal(RemoteError::Unreachable { host: "devbox".into(), reason: "x".into() }).is_none());
+    let unasked = RemoteError::AuthFailed { host: "devbox".into(), reason: "x".into(), asked: false };
+    assert!(RemoteWindow::refusal(unasked).is_none());
 }
 
 #[gpui::test]

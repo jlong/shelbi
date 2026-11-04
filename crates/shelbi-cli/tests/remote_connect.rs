@@ -160,6 +160,9 @@ fn connecting_opens_the_hosts_shelbi_and_remembers_the_session() {
         assert!(!run.contains(" -R "), "never forwards this hub: {run}");
     }
     assert!(runs[0].contains("remote list --json"));
+    for step in &runs[..2] {
+        assert!(step.contains("ClearAllForwardings=yes"), "a step opens a connection with no forwards: {step}");
+    }
     assert!(runs[2].starts_with("-t "), "the terminal gets a tty: {}", runs[2]);
     assert!(runs[2].contains("--project alpha"), "{}", runs[2]);
 

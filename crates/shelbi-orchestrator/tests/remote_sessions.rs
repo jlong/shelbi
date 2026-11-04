@@ -384,6 +384,39 @@ fn a_reconnect_to_a_stopped_far_daemon_is_refused_and_never_starts_it() {
 }
 
 #[test]
+fn a_refused_sign_in_leaves_the_pane_waiting_and_it_comes_back_after_sign_in() {
+    let mut far = Far::new();
+    far.start("demo/orch", "printf 'orch ready\\n'; exec cat");
+    let link = far.link();
+    let refused = RemoteError::AuthFailed {
+        host: HOST.into(),
+        reason: "Permission denied (publickey,password).".into(),
+        asked: true,
+    };
+    let saying_no = Arc::new(FakeRemote::new().failing_connect(refused.clone()));
+    let connector = RemoteSessionConnector::new(link.clone(), session(), saying_no);
+    for _ in 0..3 {
+        // Waiting, not dead: a pane keeps its backoff, and nothing is asked
+        // (the link holds the answer).
+        match connector.connect(PROJECT, &SessionRef::Orchestrator) {
+            Err(ConnectFailure::Unreachable(line)) => assert!(line.contains("Couldn't sign in to"), "{line}"),
+            Err(other) => panic!("expected the pane to keep waiting, got {other:?}"),
+            Ok(_) => panic!("no channel opens past a refused sign-in"),
+        }
+        assert_eq!(connector.refusal(), Some(refused.clone()), "the window offers Sign In");
+    }
+    assert_eq!(link.opens(), 0);
+
+    // The user signs in from the bar: the window's refusal is over at once,
+    // and the pane's next attempt attaches.
+    link.allow_sign_in();
+    link.connect(&|| Ok(())).unwrap();
+    assert_eq!(connector.refusal(), None, "over before the pane has been back");
+    let (_pane, events) = attach(&connector, &SessionRef::Orchestrator);
+    read_until(&events, "orch ready");
+}
+
+#[test]
 fn every_far_pane_kind_attaches_over_the_link() {
     let mut far = Far::new();
     far.start("demo/orch", "printf 'i am the orchestrator\\n'; exec cat");

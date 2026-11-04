@@ -31,6 +31,11 @@ pub const CONNECT_LABEL: &str = "Connect";
 /// starts Shelbi on another machine ([`RemoteConnector::start_daemon`]).
 pub const START_DAEMON_LABEL: &str = "Start Shelbi";
 
+/// The button a native remote window offers once the user's answer to a
+/// sign-in on reconnect was no ([`super::link::sign_in_refused`]): ask again.
+/// The link doesn't, on its own.
+pub const SIGN_IN_LABEL: &str = "Sign In";
+
 /// The line under the title on the Choose session screen.
 pub fn choose_intro(host: &str) -> String {
     format!("Choose a session on {host}.")
@@ -453,7 +458,7 @@ mod tests {
             ),
             (
                 RemoteError::AuthFailed { host: "devbox".into(), reason: "Permission denied (publickey,password).".into(), asked: false },
-                "Couldn't sign in to devbox: Permission denied (publickey,password). If it wants a password or a key passphrase, Shelbi can't ask for one here: add an SSH key for it, or load yours into the agent with `ssh-add`.",
+                "Couldn't sign in to devbox: Permission denied (publickey,password). If it wants a password or a key passphrase, Shelbi can't ask for one here: add an SSH key for it (`ssh-copy-id devbox`), or load yours into the agent with `ssh-add`.",
             ),
             (
                 RemoteError::HostKey { host: "devbox".into() },

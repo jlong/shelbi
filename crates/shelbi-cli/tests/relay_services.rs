@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::channel;
 use std::time::Duration;
 
-use shelbi_app::launch::ssh::relay_command;
+use shelbi_app::launch::ssh::{relay_command, SshAuth};
 use shelbi_app::launch::RemoteLink;
 use shelbi_app::source::wire::{Answer, Query};
 use shelbi_client::relay::services::subscribe_line;
@@ -85,7 +85,7 @@ impl Sandbox {
 
     /// The link a remote window would open to this machine, over the stub.
     fn link(&self) -> RemoteLink {
-        let mut argv = relay_command("fakehost");
+        let mut argv = relay_command("fakehost", &SshAuth::Batch, None);
         argv[0] = self.root.join("bin").join("ssh").display().to_string();
         let path = format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", self.root.join("bin").display());
         let mut cmd = Command::new(&argv[0]);

@@ -8,10 +8,18 @@
 //! per host is shared by every window and pane on it, which keeps under
 //! sshd's default limit of ten sessions per connection.
 //!
-//! The link exposes nothing on either machine: no forwarded ports or socket
-//! files, and this machine's `hub.sock` never reaches the far host. It never
+//! The link exposes nothing on either machine: no forwarded ports, no socket
+//! file beyond the shared connection's own in Shelbi's `0700` ssh directory
+//! ([`super::ssh::remote_control_path`], which every connect step already
+//! uses), and this machine's `hub.sock` never reaches the far host. It never
 //! starts the far daemon; a service that needs it fails to open while it is
 //! stopped.
+//!
+//! The `ssh` rides the shared connection the connect steps signed in, so a
+//! host that only takes a password doesn't ask twice. When the sign-in comes
+//! back refused while reconnecting (a wrong password, a Cancel), the host link
+//! holds that answer rather than ask again every few seconds, until the user
+//! says to try again ([`HostLink::allow_sign_in`]).
 //!
 //! A window holds the host's [`HostLink`] ([`HostLink::shared`]), not a
 //! [`RemoteLink`]: when the channel drops (the keepalive goes unanswered, or
@@ -29,8 +37,10 @@ use std::time::{Duration, Instant};
 use shelbi_client::{ClientError, QueryStream, RelayChannel, RelayStream};
 use shelbi_proto::{RelayService, RelaySession, RELAY_SERVICES_VERSION};
 
+use shelbi_ssh::askpass::{wait_for_output, Askpass, PromptWatch};
+
 use super::remote::{validate_host, RemoteError};
-use super::ssh::{relay_command, STEP_DEADLINE};
+use super::ssh::{classify_ssh_failure, relay_command, remote_control_path, SshAuth, SshOutput, STEP_DEADLINE};
 use crate::source::remote::RelayLink;
 use crate::source::wire::Querier;
 
@@ -49,30 +59,45 @@ pub struct RemoteLink {
 
 impl RemoteLink {
     /// Open the link to `host` ([`relay_command`]) and wait for the far
-    /// relay's hello. Fails when `ssh` can't sign in or reach the host, or
-    /// the host has no Shelbi, with `ssh`'s own last line as the reason.
+    /// relay's hello, on the shared connection, asking through the dialog
+    /// when it must ([`SshAuth::detect`]). Fails when `ssh` can't sign in or
+    /// reach the host, or the host has no Shelbi, with `ssh`'s own last line
+    /// as the reason.
     pub fn open(host: &str) -> Result<RemoteLink, RemoteError> {
         let host = validate_host(host)?;
-        let argv = relay_command(&host);
+        let auth = SshAuth::detect().for_host(&host);
+        let argv = relay_command(&host, &auth, remote_control_path().as_deref());
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
-        RemoteLink::spawn(&host, cmd)
+        RemoteLink::spawn_asking(&host, cmd, auth.askpass())
     }
 
     /// Open a link over `cmd`, a command whose stdio speaks the relay
     /// protocol. [`RemoteLink::open`] passes the `ssh` from
     /// [`relay_command`]; tests pass a local `shelbi relay`.
-    pub fn spawn(host: &str, mut cmd: Command) -> Result<RemoteLink, RemoteError> {
-        let failed = |reason: String| RemoteError::Unreachable {
-            host: host.to_string(),
-            reason,
-        };
+    pub fn spawn(host: &str, cmd: Command) -> Result<RemoteLink, RemoteError> {
+        RemoteLink::spawn_asking(host, cmd, None)
+    }
+
+    /// [`spawn`](Self::spawn) with `cmd` an `ssh` that may ask through
+    /// `askpass`: a dialog that is open doesn't count against the wait for the
+    /// hello, and a failure says whether ssh could have asked.
+    pub fn spawn_asking(host: &str, mut cmd: Command, askpass: Option<&Askpass>) -> Result<RemoteLink, RemoteError> {
+        let mut watch = askpass.and_then(|askpass| {
+            askpass.apply(&mut cmd);
+            let watch = PromptWatch::new().ok()?;
+            watch.apply(&mut cmd);
+            Some(watch)
+        });
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| failed(format!("couldn't run ssh: {e}")))?;
+            .map_err(|e| RemoteError::Unreachable {
+                host: host.to_string(),
+                reason: format!("couldn't run ssh: {e}"),
+            })?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = Arc::new(Mutex::new(String::new()));
@@ -94,29 +119,38 @@ impl RemoteLink {
                 }
             });
         }
-        let channel = match RelayChannel::new(Box::new(stdout), Box::new(stdin)) {
-            Ok(channel) => channel,
-            Err(e) => {
-                end(&mut child);
-                return Err(failed(e.to_string()));
-            }
-        };
-        // The relay says hello first thing; no hello means ssh or the far
-        // side failed, and ssh has said why on stderr.
-        let relay_version = match channel.peer_version(STEP_DEADLINE) {
-            Ok(version) => version,
-            Err(_) => {
-                end(&mut child);
+        // No channel yet: its keepalive counts silence as a dead link, and
+        // the far side can't answer until the user has signed in. Whatever
+        // comes first (the hello, or ssh giving up) ends this wait.
+        let answered = wait_for_output(&stdout, watch.as_mut(), STEP_DEADLINE);
+        drop(watch);
+        let hello = answered.map_err(|e| e.to_string()).and_then(|()| {
+            // The relay says hello first thing; no hello (or a channel that
+            // can't even write, ssh having exited) means ssh or the far side
+            // failed, and ssh has said why on stderr.
+            let no_relay = |_| "the relay didn't start".to_string();
+            let channel = RelayChannel::new(Box::new(stdout), Box::new(stdin)).map_err(no_relay)?;
+            let version = channel.peer_version(STEP_DEADLINE).map_err(no_relay)?;
+            Ok((channel, version))
+        });
+        let (channel, relay_version) = match hello {
+            Ok(up) => up,
+            Err(why) => {
+                let code = end(&mut child);
                 // Let the stderr reader catch ssh's last words.
                 std::thread::sleep(Duration::from_millis(50));
                 let said = stderr.lock().unwrap().clone();
-                let reason = said
-                    .lines()
-                    .map(str::trim)
-                    .rfind(|l| !l.is_empty())
-                    .unwrap_or("the relay didn't start")
-                    .to_string();
-                return Err(failed(reason));
+                let reason = said.lines().map(str::trim).rfind(|l| !l.is_empty()).unwrap_or(&why).to_string();
+                let out = SshOutput {
+                    code,
+                    stderr: said,
+                    asked: askpass.is_some(),
+                    ..Default::default()
+                };
+                return Err(classify_ssh_failure(host, &out).unwrap_or_else(|| RemoteError::Unreachable {
+                    host: host.to_string(),
+                    reason,
+                }));
             }
         };
         Ok(RemoteLink {
@@ -194,7 +228,9 @@ pub type LinkOpener = dyn Fn(&str) -> Result<Arc<dyn RelayLink>, RemoteError> + 
 
 /// After a reopen fails, how long [`HostLink::connect`] answers with that
 /// failure before it tries again, so the panes of a window reconnecting at
-/// once share one `ssh` rather than each starting their own.
+/// once share one `ssh` rather than each starting their own. A sign-in the
+/// user was asked for and that was refused is held longer: see
+/// [`HostLink::allow_sign_in`].
 pub const REOPEN_PAUSE: Duration = Duration::from_secs(1);
 
 /// A host's relay channel as every window and pane on that host shares it:
@@ -286,7 +322,9 @@ impl HostLink {
     /// The channel, opening a fresh one when it is down: `check` first (an
     /// error from it is returned and nothing opens), then the opener. Callers
     /// arriving while another opens wait for it and share its channel; for
-    /// [`REOPEN_PAUSE`] after a failure, they get that failure back.
+    /// [`REOPEN_PAUSE`] after a failure, they get that failure back, and after
+    /// a refused sign-in they get it back until
+    /// [`allow_sign_in`](Self::allow_sign_in).
     pub fn connect(&self, check: &dyn Fn() -> Result<(), RemoteError>) -> Result<Arc<dyn RelayLink>, RemoteError> {
         if let Some(link) = self.live() {
             return Ok(link);
@@ -296,7 +334,7 @@ impl HostLink {
             return Ok(link);
         }
         if let Some((at, error)) = opening.as_ref() {
-            if at.elapsed() < self.pause {
+            if at.elapsed() < self.pause || sign_in_refused(error) {
                 return Err(error.clone());
             }
         }
@@ -314,9 +352,27 @@ impl HostLink {
         }
     }
 
+    /// The user wants this host again (they opened it, or chose to sign in):
+    /// the next [`connect`](Self::connect) may ask them, whatever they
+    /// answered last. Waits out a dialog that is open, so call it off the UI
+    /// thread.
+    pub fn allow_sign_in(&self) {
+        let mut opening = self.opening.lock().unwrap_or_else(|p| p.into_inner());
+        if opening.as_ref().is_some_and(|(_, error)| sign_in_refused(error)) {
+            *opening = None;
+        }
+    }
+
     fn channel(&self) -> Result<Arc<dyn RelayLink>, ClientError> {
         self.live().ok_or(ClientError::RelayUnreachable)
     }
+}
+
+/// Whether `error` is the user's own answer: ssh could ask, and the sign-in
+/// was refused (a wrong password, a Cancel). A reconnect that retried on its
+/// own would put the dialog back up every few seconds.
+pub fn sign_in_refused(error: &RemoteError) -> bool {
+    matches!(error, RemoteError::AuthFailed { asked: true, .. })
 }
 
 impl RelayLink for HostLink {
@@ -340,10 +396,11 @@ impl RelayLink for HostLink {
     }
 }
 
-/// End a child this link started and reap it.
-fn end(child: &mut Child) {
+/// End a child this link started and reap it: its exit code, if it had one
+/// of its own before this.
+fn end(child: &mut Child) -> Option<i32> {
     let _ = child.kill();
-    let _ = child.wait();
+    child.wait().ok()?.code()
 }
 
 #[cfg(test)]
@@ -436,6 +493,120 @@ mod tests {
             assert!(matches!(link.connect(&ok), Err(RemoteError::Unreachable { .. })));
         }
         assert_eq!(tries.load(Ordering::SeqCst), 1, "panes reconnecting at once share one attempt");
+    }
+
+    fn refused_sign_in(asked: bool) -> RemoteError {
+        RemoteError::AuthFailed {
+            host: "alex@studio".into(),
+            reason: "Permission denied (publickey,password).".into(),
+            asked,
+        }
+    }
+
+    /// Connect with a check that answers `result`, counting its runs (each
+    /// real check would put the dialog up).
+    fn counting_checks(link: &HostLink, result: impl Fn() -> Result<(), RemoteError>) -> (Result<(), RemoteError>, u64) {
+        let checks = AtomicU64::new(0);
+        let opened = link.connect(&|| {
+            checks.fetch_add(1, Ordering::SeqCst);
+            result()
+        });
+        (opened.map(|_| ()), checks.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn a_refused_sign_in_isnt_asked_again_until_the_user_says() {
+        let (link, _) = fake_link();
+        let refused = || Err(refused_sign_in(true));
+        assert_eq!(counting_checks(&link, refused), (Err(refused_sign_in(true)), 1));
+        for _ in 0..3 {
+            // The window's watch and each pane, with no pause configured.
+            assert_eq!(counting_checks(&link, refused), (Err(refused_sign_in(true)), 0), "no dialog");
+        }
+        assert_eq!(link.opens(), 0);
+
+        link.allow_sign_in();
+        assert_eq!(counting_checks(&link, || Ok(())), (Ok(()), 1), "asked once, and in");
+        assert!(link.is_up());
+        assert_eq!(link.opens(), 1);
+    }
+
+    #[test]
+    fn a_sign_in_that_couldnt_ask_keeps_trying_as_ever() {
+        // Nobody was asked (no dialog here), so the agent may yet have a key.
+        let (link, _) = fake_link();
+        let refused = || Err(refused_sign_in(false));
+        assert_eq!(counting_checks(&link, refused).1, 1);
+        assert_eq!(counting_checks(&link, refused).1, 1);
+        assert_eq!(counting_checks(&link, || Ok(())), (Ok(()), 1));
+    }
+
+    #[test]
+    fn allowing_a_sign_in_leaves_other_failures_paused() {
+        let tries = Arc::new(AtomicU64::new(0));
+        let count = tries.clone();
+        let link = HostLink::new("devbox", move |host| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Err(RemoteError::Unreachable {
+                host: host.into(),
+                reason: "Network is unreachable".into(),
+            })
+        })
+        .with_pause(Duration::from_secs(60));
+        let ok = || Ok(());
+        assert!(link.connect(&ok).is_err());
+        link.allow_sign_in();
+        assert!(link.connect(&ok).is_err());
+        assert_eq!(tries.load(Ordering::SeqCst), 1);
+    }
+
+    /// `sh -c script`, standing in for `ssh`.
+    fn stand_in(script: &str) -> Command {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", script]);
+        cmd
+    }
+
+    #[test]
+    fn a_refused_relay_sign_in_is_a_sign_in_failure_not_unreachable() {
+        const DENIED: &str = "echo 'alex@studio: Permission denied (publickey,password,keyboard-interactive).' >&2; exit 255";
+        let askpass = Askpass::new("/bin/false");
+        let err = RemoteLink::spawn_asking("alex@studio", stand_in(DENIED), Some(&askpass)).err().unwrap();
+        assert_eq!(
+            err,
+            RemoteError::AuthFailed {
+                host: "alex@studio".into(),
+                reason: "alex@studio: Permission denied (publickey,password,keyboard-interactive).".into(),
+                asked: true,
+            }
+        );
+        // With no dialog possible, the same refusal says Shelbi couldn't ask.
+        let err = RemoteLink::spawn("alex@studio", stand_in(DENIED)).err().unwrap();
+        assert!(matches!(err, RemoteError::AuthFailed { asked: false, .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_relay_that_asks_runs_with_the_askpass_environment() {
+        // The stand-in says what it was given, as ssh's stderr would, and exits.
+        let script = "echo \"Permission denied $SSH_ASKPASS $SSH_ASKPASS_REQUIRE $SHELBI_ASKPASS_HOST\" >&2; exit 255";
+        let askpass = Askpass::new("/bin/false").with_host("alex@studio");
+        let err = RemoteLink::spawn_asking("alex@studio", stand_in(script), Some(&askpass)).err().unwrap();
+        let RemoteError::AuthFailed { reason, .. } = err else {
+            panic!("expected a sign-in failure");
+        };
+        assert_eq!(reason, "Permission denied /bin/false force alex@studio");
+    }
+
+    #[test]
+    fn a_relay_that_says_nothing_is_unreachable() {
+        let err = RemoteLink::spawn("devbox", stand_in("exit 3")).err().unwrap();
+        assert_eq!(
+            err,
+            RemoteError::Unreachable {
+                host: "devbox".into(),
+                reason: "the relay didn't start".into(),
+            }
+        );
     }
 
     #[test]

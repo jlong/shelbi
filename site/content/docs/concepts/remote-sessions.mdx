@@ -119,15 +119,18 @@ Shelbi uses your existing SSH setup:
   with the key's fingerprint, in the same kind of dialog, with **Yes** and
   **No**. **No** is the default, so pressing Return refuses; accepting the key
   takes a click on **Yes**. Shelbi never answers it for you.
-- You're asked once. The steps of a connection, and the session's terminal
-  after them, share one SSH connection, which stays open for ten minutes after
-  you leave.
+- You're asked once. The steps of a connection, the session's terminal and a
+  full window's link share one SSH connection, which stays open for ten minutes
+  after you leave.
+- If a full window loses its connection, it asks once to reconnect. If you click
+  **Cancel**, it stops asking and shows **Sign In** until you're ready.
 - Shelbi never stores, logs or sees your password: the dialog hands it straight
   to `ssh`.
 - Where no dialog can be shown (on Linux, or when Shelbi itself runs over SSH
   rather than in your Mac's desktop session), SSH runs in batch mode and never
   prompts. A host that wants a password then fails with "Couldn't sign in to
-  *host*" and a hint to add a key or load yours with `ssh-add`. Set
+  *host*" and a hint to add a key (`ssh-copy-id <host>`) or load yours with
+  `ssh-add`. Set
   `SHELBI_ASKPASS=never` to get that behavior on a Mac too.
 
 ## The other machine's daemon
@@ -145,7 +148,7 @@ explains each thing that can go wrong:
 | Message | What to do |
 | --- | --- |
 | Couldn't connect to *host* | Check the name, your network, or VPN. `ssh <host>` in a terminal shows the same failure. |
-| Couldn't sign in to *host* | The password was wrong, or you clicked **Cancel**: connect again. Without a dialog (see above), load your key (`ssh-add`) or add it to the host's `authorized_keys`. |
+| Couldn't sign in to *host* | The password was wrong, or you clicked **Cancel**: connect again. Without a dialog (see above), load your key (`ssh-add`) or add it to the host (`ssh-copy-id <host>`). |
 | *host*'s host key isn't trusted | You answered **No** to the host-key question, or the key changed. Run `ssh <host>` once to check it. |
 | Shelbi isn't installed on *host* | Install Shelbi there. Shelbi looks on your login shell's `PATH`, then in `~/.shelbi/bin`. |
 | Shelbi on *host* is *X*, and this machine has *Y* | Update one so both share the same major and minor version (patch releases mix fine). |
