@@ -320,6 +320,7 @@ fn a_loaded_review_shows_its_reviewer_and_opens_the_review(cx: &mut TestAppConte
         workspace: Some("review-1".into()),
         state: ReviewState::Serving,
         number: None,
+        pr: None,
     };
     p.view.update(&mut p.cx, |v, cx| v.set_task_rows(vec![ws("alpha", Some("A"))], vec![review], cx));
     p.open_task("B");

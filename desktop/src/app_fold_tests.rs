@@ -263,6 +263,7 @@ fn a_row_arriving_mid_fold_doesnt_break_it(cx: &mut TestAppContext) {
             workspace: None,
             state: ReviewState::Pending,
             number: None,
+            pr: None,
         });
         cx.notify();
     });

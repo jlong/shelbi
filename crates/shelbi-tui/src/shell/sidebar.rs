@@ -1427,6 +1427,7 @@ mod tests {
             workspace: None,
             state,
             number: None,
+            pr: None,
         }
     }
 

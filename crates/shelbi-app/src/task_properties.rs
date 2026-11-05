@@ -299,6 +299,7 @@ mod tests {
                 assigned_to: None,
                 workflow: None,
                 branch: None,
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,

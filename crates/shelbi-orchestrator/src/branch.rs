@@ -210,6 +210,7 @@ mod tests {
             assigned_to: None,
             workflow: workflow.map(str::to_string),
             branch: branch.map(str::to_string),
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,

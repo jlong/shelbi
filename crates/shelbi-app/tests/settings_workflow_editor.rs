@@ -471,6 +471,7 @@ fn save_issue(id: &str, workflow: &str, column: shelbi_core::Column) {
         assigned_to: None,
         workflow: Some(workflow.into()),
         branch: None,
+        pr: None,
         depends_on: vec![],
         prefers_machine: None,
         zen: None,

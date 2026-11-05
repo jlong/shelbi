@@ -353,6 +353,7 @@ mod tests {
             workspace: None,
             state: ReviewState::Pending,
             number: None,
+            pr: None,
         }
     }
 

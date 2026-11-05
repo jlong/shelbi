@@ -46,7 +46,7 @@ use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
     checks_for_task_in_workflow, danger_paths_for_workflow, Column, Error, Host, Machine,
-    MergeStrategy, Project, Result, StatusCategory, Issue, TransitionAction, Workflow, WorkflowStatus,
+    MergeStrategy, PrCi, PrState, Project, Result, StatusCategory, Issue, TransitionAction, Workflow, WorkflowStatus,
     WorkspaceSpec,
 };
 
@@ -348,14 +348,29 @@ pub fn pr_create_at_head(
     task_body: &str,
     expected: &PinnedPrIdentity,
 ) -> Result<u64> {
-    pr_create_impl(
+    let pr = pr_create_impl(
         project,
         project_name,
         task,
         task_body,
         expected,
         PrHeadVerifyRetry::default(),
-    )
+    )?;
+    // Creating or realigning the PR moved its head: `record_opened` replaces
+    // the record and forgets the CI of the old one.
+    if let (Ok((host, worktree)), Some(branch)) =
+        (locate_workspace_worktree(project, task), task.branch.as_deref())
+    {
+        let wt = worktree.to_string_lossy();
+        let repository = lookup_origin_repository(&host, &wt).ok();
+        let repo = crate::pr_record::PrRepo {
+            host: &host,
+            wt: &wt,
+            repository: repository.as_ref().map(|r| r.selector.as_str()),
+        };
+        crate::pr_record::record_opened(project, &repo, task, branch, pr, None);
+    }
+    Ok(pr)
 }
 
 fn pr_create_impl(
@@ -1059,13 +1074,26 @@ fn scoped_ci_poll_at(
     // Drop memory for tasks that have since left the in-review set so the map
     // can't grow without bound across a long-lived hub.
     let live: std::collections::BTreeSet<&str> =
-        in_review.iter().map(|(id, _)| id.as_str()).collect();
+        in_review.iter().map(|(task, _)| task.id.as_str()).collect();
     state.seen.retain(|id, _| live.contains(id.as_str()));
     state.first_seen.retain(|id, _| live.contains(id.as_str()));
 
-    for (task_id, branch) in &in_review {
+    for (task, branch) in &in_review {
+        let task_id = &task.id;
         let pr = match lookup_open_pr_in_repository(&host, &wt, branch, &repository.selector) {
-            Ok(Some(pr)) => pr,
+            Ok(Some(pr)) => {
+                // A task that reached review without its PR recorded (it
+                // predates recording, or a person opened the PR) gets it here.
+                if task.pr.as_ref().map(|p| p.number) != Some(pr) {
+                    let repo = crate::pr_record::PrRepo {
+                        host: &host,
+                        wt: &wt,
+                        repository: Some(&repository.selector),
+                    };
+                    crate::pr_record::record_found(project, &repo, task, branch, pr, None);
+                }
+                pr
+            }
             Ok(None) => continue, // no PR yet — nothing to grade
             Err(e) => {
                 tracing::debug!(
@@ -1105,8 +1133,13 @@ fn scoped_ci_poll_at(
             // `None` = still pending / not yet mergeable; `Timeout` is only
             // produced by the deadline loop, never a single snapshot. Either
             // way there's no terminal transition to emit this tick.
-            Some(CiVerdict::Timeout) | None => continue,
+            Some(CiVerdict::Timeout) | None => {
+                note_pr_ci(project, pr, branch, &head_sha, None);
+                continue;
+            }
         };
+        let ci = if conclusion == "success" { PrCi::Passing } else { PrCi::Failing };
+        note_pr_ci(project, pr, branch, &head_sha, Some(ci));
         if ci_should_emit(state.seen.get(task_id), &head_sha, conclusion) {
             shelbi_state::append_ci_event(
                 &project.name,
@@ -1122,6 +1155,14 @@ fn scoped_ci_poll_at(
         }
     }
     Ok(())
+}
+
+/// What the task sheet shows of a PR's checks. Best-effort, like the rest of
+/// the sweep's bookkeeping.
+fn note_pr_ci(project: &Project, pr: u64, branch: &str, head_sha: &str, verdict: Option<PrCi>) {
+    if let Err(e) = shelbi_state::pr_status::note_ci(&project.name, pr, branch, head_sha, verdict) {
+        tracing::debug!(pr, error = %e, "scoped CI poll: status note failed");
+    }
 }
 
 /// Whether a freshly-observed terminal verdict is a new transition worth
@@ -1142,7 +1183,7 @@ fn ci_should_emit(prev: Option<&(String, String)>, head_sha: &str, conclusion: &
 /// `review` column, so a custom workflow whose handoff status is renamed still
 /// counts. A task whose branch can't be resolved is skipped rather than failing
 /// the whole sweep.
-fn in_review_tasks_with_branch(project: &Project) -> Result<Vec<(String, String)>> {
+fn in_review_tasks_with_branch(project: &Project) -> Result<Vec<(Issue, String)>> {
     let mut out = Vec::new();
     // Only Handoff-category (review) tasks are kept below, and those are always
     // open, so the cheap open-only read suffices.
@@ -1157,7 +1198,7 @@ fn in_review_tasks_with_branch(project: &Project) -> Result<Vec<(String, String)
             continue;
         }
         match branch::branch_name_for_task(project, workflow_ref, &tf.task) {
-            Ok(branch) => out.push((tf.task.id.clone(), branch)),
+            Ok(branch) => out.push((tf.task.clone(), branch)),
             Err(e) => {
                 tracing::debug!(
                     task = %tf.task.id, error = %e,
@@ -1467,6 +1508,7 @@ fn apply_github_merge_reconcile(
     cand: &GithubReconcileCandidate,
     merged: &MergedPr,
 ) -> Result<bool> {
+    crate::pr_record::note_finished(project, merged.pr, cand.task.branch.as_deref(), PrState::Merged);
     let store = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?;
     let Some(shelbi_state::StatusMove { from, to, workflow: wf }) =
         store.move_status(&cand.task.id, &cand.to_column, "github-merge-reconcile")?
@@ -1991,6 +2033,16 @@ fn verify_ci_watch_snapshot(
 /// from the exact reviewed base OID. GitHub's PR mutation is deliberately not
 /// the integration boundary because it cannot lease the base identity.
 pub fn pr_merge(
+    project: &Project,
+    pr: u64,
+    expected: &PinnedPrIdentity,
+) -> Result<PrMergeOutcome> {
+    let outcome = land_pr(project, pr, expected)?;
+    crate::pr_record::note_finished(project, pr, None, PrState::Merged);
+    Ok(outcome)
+}
+
+fn land_pr(
     project: &Project,
     pr: u64,
     expected: &PinnedPrIdentity,
@@ -3535,6 +3587,7 @@ esac
             assigned_to: Some("ws1".into()),
             workflow: None,
             branch: Some(TASK_BRANCH.into()),
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
@@ -6452,12 +6505,20 @@ esac
             // all-passing-but-Actions-free snapshot is pending, so no event.
             scoped_ci_poll_at(&project, &mut state, start, grace).unwrap();
             let within_grace = scoped_ci_event_lines();
+            // The sheet shows what's known meanwhile, and the task in review
+            // got its PR recorded from the same lookup.
+            let status_within_grace = shelbi_state::pr_status::load(PROJECT_NAME).prs[&379].ci;
+            let recorded = shelbi_state::load_task(PROJECT_NAME, &task().id).unwrap().task.pr;
 
             // A later tick, past the grace: the head genuinely carries no Actions
             // CI, so it settles green and emits exactly one success line.
             scoped_ci_poll_at(&project, &mut state, start + grace + Duration::from_secs(1), grace)
                 .unwrap();
             let after_grace = scoped_ci_event_lines();
+            let status_after_grace = shelbi_state::pr_status::load(PROJECT_NAME).prs[&379].ci;
+            assert_eq!(status_within_grace, Some(PrCi::Pending));
+            assert_eq!(status_after_grace, Some(PrCi::Passing));
+            assert_eq!(recorded.map(|p| p.number), Some(379));
             (within_grace, after_grace)
         };
 
@@ -11535,6 +11596,7 @@ mod probe_tests {
             assigned_to: Some("ws1".into()),
             workflow: None,
             branch: Some(branch.into()),
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
@@ -14485,6 +14547,7 @@ mod scan_tests {
             assigned_to: None,
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             prefers_machine: None,
             zen: None,
@@ -15342,6 +15405,7 @@ mod dry_run_tests {
             assigned_to: None,
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,

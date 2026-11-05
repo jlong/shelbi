@@ -85,6 +85,7 @@ pub const CONTEXTS: &[KeymapContext] = &[
             Action::Popover(PopoverAction::MoveLeft),
             Action::Popover(PopoverAction::MoveRight),
             Action::Popover(PopoverAction::OpenWorkspace),
+            Action::Popover(PopoverAction::OpenPr),
         ],
     },
     KeymapContext {

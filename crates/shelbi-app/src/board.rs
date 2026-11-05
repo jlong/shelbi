@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use shelbi_core::{
-    default_project_statuses, default_workflow, Issue, ProjectStatuses, StatusCategory, Workflow,
+    default_project_statuses, default_workflow, Issue, IssuePr, ProjectStatuses, StatusCategory, Workflow,
     DEFAULT_WORKFLOW_NAME,
 };
 use shelbi_state::{IssueFile, KanbanColumnOverride, OwnershipGate};
@@ -424,15 +424,16 @@ pub fn merge_board(
     tasks
 }
 
-/// A pull-request link recorded on the issue, if any: a param whose value is an
-/// `http(s)` URL to a pull request (`…/pull/<n>`). Issues carry no PR record of
-/// their own and a live `gh` lookup would spend GitHub budget, so the board only
-/// surfaces a link someone (an agent, a workflow action) wrote onto the issue.
-pub fn pr_link(task: &Issue) -> Option<String> {
-    task.string_params().into_values().find(|v| {
-        (v.starts_with("https://") || v.starts_with("http://"))
-            && v.contains("/pull/")
-            && !v.contains(char::is_whitespace)
+/// The issue's pull request: its record, filled in by the board's read
+/// (`shelbi_state::pr_status`), or for an issue with no record, a param someone
+/// wrote whose value is a pull-request URL (`pr_url: https://…/pull/12`). A
+/// render never asks GitHub: a live lookup would spend budget.
+pub fn task_pr(task: &Issue) -> Option<IssuePr> {
+    task.pr.clone().or_else(|| {
+        task.string_params().into_values().find_map(|v| {
+            let number = shelbi_core::pr_number_from_url(&v)?;
+            Some(IssuePr::new(number, Some(v)))
+        })
     })
 }
 
@@ -732,10 +733,11 @@ pub fn read_open_board(project: &str) -> BoardRead {
                 let banner = report.freshness.banner();
                 match report.state {
                     shelbi_state::BoardState::Cold => BoardOutcome::Cold { banner },
-                    state => BoardOutcome::Warm {
-                        banner,
-                        base_tasks: state.into_issues(),
-                    },
+                    state => {
+                        let mut base_tasks = state.into_issues();
+                        shelbi_state::pr_status::fold(project, &mut base_tasks);
+                        BoardOutcome::Warm { banner, base_tasks }
+                    }
                 }
             }
         },
@@ -767,10 +769,7 @@ pub fn read_closed_page(project: &str) -> Option<ClosedPage> {
     let store = shelbi_state::issue_store_for(project).ok()?;
     match shelbi_state::read_board_report(project) {
         Ok(report) if report.state.is_cold() => None,
-        Ok(_) => store.closed_page(None).ok().map(|page| ClosedPage {
-            issues: page.issues,
-            next_cursor: page.next_cursor,
-        }),
+        Ok(_) => store.closed_page(None).ok().map(|page| closed_page(project, page)),
         Err(_) => None,
     }
 }
@@ -782,11 +781,18 @@ pub fn load_more_closed(project: &str, cursor: &str) -> Result<ClosedPage, Strin
         shelbi_state::issue_store_for(project).map_err(|e| format!("load more failed: {e}"))?;
     store
         .closed_page(Some(cursor))
-        .map(|page| ClosedPage {
-            issues: page.issues,
-            next_cursor: page.next_cursor,
-        })
+        .map(|page| closed_page(project, page))
         .map_err(|e| format!("load more failed: {e}"))
+}
+
+/// A page from the store, with what the hub knows of each issue's PR.
+fn closed_page(project: &str, page: shelbi_state::ClosedPage) -> ClosedPage {
+    let mut issues = page.issues;
+    shelbi_state::pr_status::fold(project, &mut issues);
+    ClosedPage {
+        issues,
+        next_cursor: page.next_cursor,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,6 +1019,7 @@ mod tests {
                 assigned_to: None,
                 workflow: None,
                 branch: None,
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,
@@ -1180,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn pr_link_finds_a_pull_request_url_param() {
+    fn task_pr_prefers_the_record_and_falls_back_on_a_pull_request_url_param() {
         let parse = |extra: &str| {
             let text = format!(
                 "---\nid: a\ntitle: A\ncolumn: review\npriority: 0\n{extra}\
@@ -1188,16 +1195,24 @@ mod tests {
             );
             shelbi_state::parse_task_file(&text).unwrap().task
         };
-        assert_eq!(pr_link(&parse("")), None);
+        assert_eq!(task_pr(&parse("")), None);
         assert_eq!(
-            pr_link(&parse("note: see https://example.com/docs\n")),
+            task_pr(&parse("note: see https://example.com/docs\n")),
             None,
             "a non-PR URL is not a PR link"
         );
-        assert_eq!(
-            pr_link(&parse("pr: https://github.com/jlong/shelbi/pull/42\n")).as_deref(),
-            Some("https://github.com/jlong/shelbi/pull/42")
-        );
+        let url = "https://github.com/jlong/shelbi/pull/42";
+        // Under the record's own key, as a URL or a bare number (hand-written,
+        // or from before the record existed)...
+        assert_eq!(task_pr(&parse(&format!("pr: {url}\n"))), Some(IssuePr::new(42, Some(url.into()))));
+        assert_eq!(task_pr(&parse("pr: 42\n")), Some(IssuePr::new(42, None)));
+        // ...under any other param...
+        assert_eq!(task_pr(&parse(&format!("pr_url: {url}\n"))), Some(IssuePr::new(42, Some(url.into()))));
+        // ...and the record itself. Anything unreadable is no PR, not a broken card.
+        let record = task_pr(&parse(&format!("pr:\n  number: 42\n  url: {url}\n"))).unwrap();
+        assert_eq!(record, IssuePr::new(42, Some(url.into())));
+        assert_eq!(task_pr(&parse("pr: [1, 2]\n")), None);
+        assert_eq!(task_pr(&parse("pr: not-a-pr\n")), None);
     }
 
     #[test]

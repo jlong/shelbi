@@ -623,6 +623,7 @@ fn review_info() -> ReviewInfo {
         review_url: Some("http://localhost:4101".into()),
         has_health_check: true,
         remote_machine: None,
+        pr: None,
     }
 }
 
@@ -638,6 +639,7 @@ fn review_row(id: &str, title: &str, branch: &str, state: ReviewState) -> Review
         state,
         // The mockups number every review #401.
         number: Some(401),
+        pr: None,
     }
 }
 
@@ -3596,6 +3598,7 @@ fn save_task(id: &str, title: &str, body: &str, column: Column, priority: i64, a
         assigned_to: assigned.map(str::to_string),
         workflow: Some("task".into()),
         branch: Some(format!("jlong/{id}")),
+        pr: None,
         depends_on: vec![],
         prefers_machine: None,
         zen: None,

@@ -776,6 +776,7 @@ fn maybe_github_reconcile(
             "github-merge reconcile pass failed"
         ),
     }
+    crate::pr_record::refresh(project);
 }
 
 /// Per-project state for the external-issue reconcile pass: the poll watermark,
@@ -8268,6 +8269,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
             assigned_to: assigned.map(str::to_string),
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
@@ -8746,6 +8748,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
             assigned_to: Some(workspace.into()),
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,

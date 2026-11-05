@@ -132,6 +132,7 @@ The fields written into the block are:
 | `id` | The full Shelbi id, present **only** when the `shelbi:id/*` anchor label had to be truncated. A short id round-trips through the label alone and omits this. |
 | `workflow` | The [workflow](/docs/guides/getting-started/workflows) the card runs under. |
 | `branch` | The card's `branch:` override, when set. |
+| `pr` | The card's pull request: its `number` and `url`, recorded when the workflow's `open_pr` opens or finds it. Its state and CI aren't stored here: the hub reads them locally, so a CI result never rewrites the issue or moves it in the Done column. |
 | `depends_on` | The card's dependency ids. |
 | `prefers_machine` | The machine-affinity routing hint. |
 | `priority` | A plain integer, renumbered across a column client-side exactly like the file system board. |

@@ -32,8 +32,8 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shelbi_core::{
-    Column, Error, Issue, IssueLaunchConfig, IssueTrackerBackend, IssueTrackerConfig, IssueZenConfig,
-    Result,
+    Column, Error, Issue, IssueLaunchConfig, IssuePr, IssueTrackerBackend, IssueTrackerConfig,
+    IssueZenConfig, Result,
 };
 
 use crate::IssueFile;
@@ -152,6 +152,8 @@ pub struct NewIssue {
     pub prefers_machine: Option<String>,
     pub zen: Option<IssueZenConfig>,
     pub launch: Option<IssueLaunchConfig>,
+    /// A pull-request record to carry over (a backend migration).
+    pub pr: Option<IssuePr>,
     pub params: BTreeMap<String, serde_yaml::Value>,
     /// Explicit position within the destination column. `None` appends to the
     /// end (priority = current column length), matching `shelbi task add`.
@@ -178,6 +180,7 @@ impl NewIssue {
             prefers_machine: None,
             zen: None,
             launch: None,
+            pr: None,
             params: BTreeMap::new(),
             priority: None,
         }
@@ -205,6 +208,10 @@ pub struct IssueFields {
     /// [`IssueStore::set_fields`] touches, so `shelbi issue edit` can rewrite
     /// the body through the same seam as its frontmatter edits.
     pub body: Option<String>,
+    /// The issue's pull-request record. Outer `Some` touches it, inner `None`
+    /// clears it. Only the durable half ([`IssuePr::new`]) belongs here: state
+    /// and CI live in [`crate::pr_status`].
+    pub pr: Option<Option<IssuePr>>,
 }
 
 impl IssueFields {
@@ -218,6 +225,7 @@ impl IssueFields {
             && self.title.is_none()
             && self.workflow.is_none()
             && self.body.is_none()
+            && self.pr.is_none()
     }
 }
 
@@ -799,6 +807,7 @@ impl IssueStore for FileSystemStore {
             assigned_to: None,
             workflow: spec.workflow,
             branch: spec.branch,
+            pr: spec.pr,
             depends_on: spec.depends_on,
             prefers_machine: spec.prefers_machine,
             zen: spec.zen,
@@ -903,6 +912,12 @@ impl IssueStore for FileSystemStore {
         if let Some(body) = fields.body {
             if tf.body != body {
                 tf.body = body;
+                changed = true;
+            }
+        }
+        if let Some(pr) = fields.pr {
+            if tf.task.pr != pr {
+                tf.task.pr = pr;
                 changed = true;
             }
         }
@@ -1611,6 +1626,52 @@ mod tests {
             }
             Err(other) => panic!("expected InvalidIssueTracker, got {other:?}"),
             Ok(_) => panic!("expected an error, got a live store"),
+        }
+    }
+
+    #[test]
+    fn set_fields_records_a_pr_in_the_frontmatter_and_it_round_trips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let store = FileSystemStore::new("p");
+        store.add(spec("a", Column::review())).unwrap();
+
+        let record = IssuePr::new(2137, Some("https://github.com/o/r/pull/2137".into()));
+        store
+            .set_fields("a", IssueFields { pr: Some(Some(record.clone())), ..Default::default() })
+            .unwrap();
+        let tf = store.get("a").unwrap().unwrap();
+        assert_eq!(tf.task.pr.as_ref(), Some(&record));
+
+        let raw = std::fs::read_to_string(crate::task_path("p", "a").unwrap()).unwrap();
+        assert!(raw.contains("pr:\n  number: 2137\n  url: https://github.com/o/r/pull/2137\n"), "{raw}");
+
+        // The same record again writes nothing.
+        let stamp = tf.task.updated_at;
+        store
+            .set_fields("a", IssueFields { pr: Some(Some(record)), ..Default::default() })
+            .unwrap();
+        assert_eq!(store.get("a").unwrap().unwrap().task.updated_at, stamp);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_task_with_an_unreadable_pr_still_loads() {
+        // A hand-edited `pr:` must never drop the card from the board.
+        for (value, want) in [
+            ("2137", Some(2137)),
+            ("https://github.com/o/r/pull/9", Some(9)),
+            ("[1, 2]", None),
+            ("nope", None),
+            ("0", None),
+        ] {
+            let text = format!(
+                "---\nid: a\ntitle: A\ncolumn: review\npriority: 0\npr: {value}\n\
+                 created_at: 2026-10-01T10:00:00Z\nupdated_at: 2026-10-01T10:00:00Z\n---\nbody\n"
+            );
+            let tf = crate::parse_task_file(&text).unwrap_or_else(|e| panic!("`{value}`: {e}"));
+            assert_eq!(tf.task.pr.map(|p| p.number), want, "`{value}`");
         }
     }
 

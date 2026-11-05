@@ -294,6 +294,7 @@ mod tests {
             workspace: None,
             state: ReviewState::Pending,
             number: None,
+            pr: None,
         }];
         s.board_loading = false;
         s.zen_mode = shelbi_state::ZenModeState::On;

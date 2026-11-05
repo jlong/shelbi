@@ -547,6 +547,7 @@ fn write_issue(id: &str, workflow: &str) {
         assigned_to: None,
         workflow: Some(workflow.into()),
         branch: None,
+        pr: None,
         depends_on: vec![],
         prefers_machine: None,
         zen: None,

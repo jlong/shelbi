@@ -76,9 +76,13 @@ impl SearchClient for GithubSearch {
     fn search(&self, project: &str, query: &str, page: u32) -> Result<SearchPage, SearchFailure> {
         use shelbi_state::IssueSearchError as E;
         shelbi_state::search_issues(project, query, page)
-            .map(|p| SearchPage {
-                issues: p.issues,
-                total: p.total_count.min(shelbi_state::ISSUE_SEARCH_MAX_RESULTS),
+            .map(|p| {
+                let mut issues = p.issues;
+                shelbi_state::pr_status::fold(project, &mut issues);
+                SearchPage {
+                    issues,
+                    total: p.total_count.min(shelbi_state::ISSUE_SEARCH_MAX_RESULTS),
+                }
             })
             .map_err(|e| match e {
                 E::NotGithub => SearchFailure::Unsupported,
@@ -544,6 +548,7 @@ mod tests {
                 assigned_to: None,
                 workflow: None,
                 branch: None,
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,

@@ -15,7 +15,7 @@
 use std::collections::{BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
-use shelbi_core::{Column, Machine, MachineKind, Reachability, StatusCategory, WorkspaceSpec};
+use shelbi_core::{Column, IssuePr, Machine, MachineKind, Reachability, StatusCategory, WorkspaceSpec};
 use shelbi_palette::{Decoration, DecorationColor};
 use shelbi_state::machine_state::MachineRecord;
 use shelbi_state::{
@@ -138,6 +138,10 @@ pub struct ReviewRow {
     /// one. `None` on the file-system backend, or before the daemon's board
     /// index has recorded it.
     pub number: Option<i64>,
+    /// The task's pull request, as of the latest board read: what keeps an
+    /// open Review panel's PR current.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr: Option<IssuePr>,
 }
 
 /// Per-workspace state glyph shown in the sidebar's badge column. The plain
@@ -665,6 +669,7 @@ impl SidebarModel {
                 workspace: None,
                 state: ReviewState::Pending,
                 number: None,
+                pr: None,
             })
             .collect();
 
@@ -995,8 +1000,9 @@ pub struct TaskDetailModel {
     pub workflow_name: String,
     pub depends_on: Vec<DepBadge>,
     pub blocked: bool,
-    /// A recorded pull-request link ([`crate::board::pr_link`]).
-    pub pr_link: Option<String>,
+    /// The task's pull request ([`crate::board::task_pr`]): number and link,
+    /// and its state and CI when known.
+    pub pr: Option<IssuePr>,
     /// `YYYY-MM-DD HH:MM UTC`.
     pub created: String,
     pub updated: String,
@@ -1062,7 +1068,7 @@ impl TaskDetailModel {
             workflow_name: card.workflow_name,
             depends_on: card.depends_on,
             blocked: card.blocked,
-            pr_link: board::pr_link(task),
+            pr: board::task_pr(task),
             created: task.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
             updated: task.updated_at.format("%Y-%m-%d %H:%M UTC").to_string(),
             body: tf.body.clone(),
@@ -1723,6 +1729,7 @@ mod tests {
             assigned_to: assigned.map(str::to_string),
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: depends_on.iter().map(|s| s.to_string()).collect(),
             prefers_machine: None,
             zen: None,
@@ -1798,6 +1805,7 @@ mod tests {
             workspace: None,
             state,
             number: None,
+            pr: None,
         }
     }
 

@@ -963,6 +963,7 @@ impl IssuesView {
             match intent {
                 Intent::Command(kind) => cx.emit(IssuesEvent::Command(kind)),
                 Intent::Refresh => self.refresh(),
+                Intent::OpenUrl(url) => cx.open_url(&url),
                 Intent::LoadMore => self.load_more(),
                 Intent::PersistWorkspaceFilter(filter) => {
                     let filter = filter.map(|f| f.to_disk());
@@ -2881,6 +2882,42 @@ mod tests {
         assert!(!drawn(&mut cx, "task-pane-closing"));
         assert!(!drawn(&mut cx, "pane-close"));
         assert!(view.read_with(&cx, |v, _| !v.pane_closing()));
+    }
+
+    #[gpui::test]
+    fn the_pane_shows_the_pr_with_its_state_and_ci(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        use shelbi_core::{IssuePr, PrCi, PrState};
+        let mut with_pr = issue("A", "todo");
+        with_pr.task.pr = Some(IssuePr {
+            state: Some(PrState::Open),
+            ci: Some(PrCi::Passing),
+            ..IssuePr::new(2137, Some("https://github.com/o/r/pull/2137".into()))
+        });
+        let mut bare = issue("B", "todo");
+        bare.task.pr = Some(IssuePr::new(7, None));
+        let (view, mut cx) = open_board_sized(
+            cx,
+            vec![with_pr, bare, issue("C", "todo")],
+            Some(gpui::size(px(1160.0), px(1024.0))),
+        );
+        click(&mut cx, "card-A");
+        assert!(drawn(&mut cx, "pr-link"));
+        assert!(drawn(&mut cx, "pr-state"));
+        assert!(drawn(&mut cx, "pr-ci"));
+        // A click on the link keeps the pane: the browser takes over.
+        click(&mut cx, "pr-link");
+        assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"));
+
+        // A bare number, nothing known about it: just the number.
+        click(&mut cx, "card-B");
+        assert!(drawn(&mut cx, "pr-link"));
+        assert!(!drawn(&mut cx, "pr-state"));
+        assert!(!drawn(&mut cx, "pr-ci"));
+
+        // No PR, no row.
+        click(&mut cx, "card-C");
+        assert!(!drawn(&mut cx, "pr-link"));
     }
 
     #[gpui::test]

@@ -723,6 +723,7 @@ workspaces:
             assigned_to: None,
             workflow: workflow.map(str::to_string),
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,

@@ -404,6 +404,7 @@ mod tests {
             assigned_to: None,
             workflow: None,
             branch: branch.map(|s| s.to_string()),
+            pr: None,
             depends_on: deps.iter().map(|s| s.to_string()).collect(),
             prefers_machine: None,
             zen: None,

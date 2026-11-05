@@ -1792,6 +1792,7 @@ mod tests {
             workspace: None,
             state,
             number,
+            pr: None,
         }
     }
 
@@ -2185,6 +2186,7 @@ mod render_tests {
             workspace: Some("review".into()),
             state: ReviewState::Serving,
             number: Some(401),
+            pr: None,
         }];
         model.zen_mode = ZenModeState::On;
         model.unread_errors = 2;

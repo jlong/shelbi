@@ -711,17 +711,24 @@ fn list(
     Ok(())
 }
 
+/// The issue as `show` prints it, with its PR as the hub knows it: the record's
+/// state and CI, or for a task with no record, the PR found from its branch.
+fn render_shown(project: &str, tf: &mut shelbi_state::IssueFile) -> Result<String> {
+    shelbi_state::pr_status::fold(project, std::slice::from_mut(tf));
+    shelbi_state::render_task_file(tf).map_err(|e| anyhow!(e))
+}
+
 fn show(project: &str, id: &str) -> Result<()> {
     // Render the issue fetched through the store, not the local task file: a
     // `github` backend never writes that file, so reading it would fail on a
     // GitHub-only issue. `render_task_file` reconstructs the exact
     // frontmatter+body representation from any backend's `IssueFile`.
     let store = cached_issue_store(project)?;
-    let tf = store
+    let mut tf = store
         .get(id)
         .map_err(|e| anyhow!(e))?
         .ok_or_else(|| anyhow!("issue `{id}` not found"))?;
-    let text = shelbi_state::render_task_file(&tf).map_err(|e| anyhow!(e))?;
+    let text = render_shown(project, &mut tf)?;
     print!("{text}");
 
     // Footer: tracker ownership, on a remote tracker only (a filesystem board
@@ -1475,6 +1482,7 @@ mod tests {
             assigned_to: None,
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
@@ -2211,6 +2219,52 @@ workspaces:
         );
 
         shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn show_prints_the_pr_with_its_state_and_ci_and_a_backfilled_one() {
+        use shelbi_core::{IssuePr, PrCi, PrState};
+        use shelbi_state::pr_status::{self, PrEntry};
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let url = "https://github.com/o/r/pull/2137";
+        pr_status::note_state("p", 2137, Some("jlong/a"), Some(url), PrState::Open).unwrap();
+        pr_status::note_ci("p", 2137, "jlong/a", "sha", Some(PrCi::Passing)).unwrap();
+        let mut recorded = issue_file(Issue {
+            pr: Some(IssuePr::new(2137, Some(url.into()))),
+            ..task_in(Column::review(), "a")
+        });
+        let text = render_shown("p", &mut recorded).unwrap();
+        assert!(text.contains("pr:\n  number: 2137\n"), "{text}");
+        assert!(text.contains(&format!("url: {url}")), "{text}");
+        assert!(text.contains("state: open"), "{text}");
+        assert!(text.contains("ci: passing"), "{text}");
+
+        // No record: the PR found from the branch shows just the same.
+        let mut old = issue_file(Issue {
+            branch: Some("jlong/old".into()),
+            ..task_in(Column::done(), "old")
+        });
+        pr_status::update("p", |cache| {
+            cache.merge_listing(vec![PrEntry {
+                head: "jlong/old".into(),
+                url: Some("https://github.com/o/r/pull/9".into()),
+                state: Some(PrState::Merged),
+                ..PrEntry::new(9)
+            }]);
+        })
+        .unwrap();
+        let text = render_shown("p", &mut old).unwrap();
+        assert!(text.contains("number: 9") && text.contains("state: merged"), "{text}");
+
+        // No PR at all: no `pr:` line.
+        let mut none = issue_file(task_in(Column::todo(), "none"));
+        assert!(!render_shown("p", &mut none).unwrap().contains("pr:"));
+
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }

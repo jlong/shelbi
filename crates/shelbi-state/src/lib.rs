@@ -60,6 +60,7 @@ pub mod issue_migrate;
 pub mod issue_store;
 pub mod keymap;
 pub mod pool_config;
+pub mod pr_status;
 pub mod workflow_config;
 pub mod yaml_edit;
 mod migrate;
@@ -3071,6 +3072,7 @@ pub fn scaffold_welcome_task(project: &str) -> Result<bool> {
         assigned_to: None,
         workflow: None,
         branch: None,
+        pr: None,
         depends_on: Vec::new(),
         prefers_machine: None,
         zen: None,
@@ -4809,6 +4811,7 @@ mod tests {
             assigned_to: None,
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
@@ -7856,6 +7859,7 @@ workspaces:
                 assigned_to: assigned_to.map(str::to_string),
                 workflow: workflow.map(str::to_string),
                 branch: None,
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,

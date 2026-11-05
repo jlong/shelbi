@@ -36,6 +36,7 @@ pub mod migration;
 pub mod mutate;
 pub mod poller;
 pub mod pool_admin;
+mod pr_record;
 pub mod project_create;
 pub mod quit;
 pub mod ready;

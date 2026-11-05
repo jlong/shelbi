@@ -106,6 +106,7 @@ fn sidebar_model_round_trips() {
             workspace: Some("review-1".into()),
             state: ReviewState::Serving,
             number: Some(401),
+            pr: None,
         }],
         config_error: Some("bad yaml".into()),
         board_loading: true,

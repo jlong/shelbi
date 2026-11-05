@@ -13,7 +13,7 @@
 //! ([`super::sidebar::render_panel_column`]).
 
 use gpui::{div, prelude::*, px, AnyElement, Div, SharedString, Stateful};
-use shelbi_core::StatusCategory;
+use shelbi_core::{IssuePr, PrCi, StatusCategory};
 
 use super::sidebar::nav_item;
 use crate::assets::{heroicon, icons, Icon};
@@ -121,6 +121,62 @@ pub fn summary(
             )
         })
         .children(more)
+}
+
+/// A task's pull request as both task surfaces show it (the task pane's PR
+/// property, the Review panel's row): the link and what's known of the PR.
+pub fn pr_value(link: Stateful<Div>, pr: &IssuePr, theme: &Theme) -> Div {
+    let status = pr.state.map(|s| s.label());
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .min_w_0()
+        .type_style(Type::Small)
+        .child(link)
+        .children(status.map(|s| {
+            div()
+                .debug_selector(|| "pr-state".into())
+                .flex_none()
+                .text_color(theme.muted)
+                .child(s)
+        }))
+        .children(pr.ci.map(|ci| {
+            let color = match ci {
+                PrCi::Pending => theme.warning,
+                PrCi::Passing => theme.success,
+                PrCi::Failing => theme.error,
+            };
+            div()
+                .debug_selector(|| "pr-ci".into())
+                .min_w_0()
+                .truncate()
+                .text_color(color)
+                .child(format!("● {}", ci.label()))
+        }))
+}
+
+/// A pull request's number as a link (`#2137 ↗`, the URL in its tooltip). The
+/// caller adds the click: the pane opens the page, the Review panel runs its
+/// row. Without a URL it reads as plain text, with nowhere to go.
+pub fn pr_link(id: &'static str, pr: &IssuePr, keyboard: bool, theme: &Theme) -> Stateful<Div> {
+    let d = div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .relative()
+        .flex_none()
+        .rounded(px(NAV_RADIUS));
+    match &pr.url {
+        Some(url) => d
+            .text_color(theme.link)
+            .hover(|s| s.underline())
+            .cursor_pointer()
+            .tooltip(style::tooltip(url.clone()))
+            .child(format!("{} ↗", pr.number_label()))
+            .when(keyboard, |d| d.children(style::focus_bands(NAV_RADIUS, theme))),
+        None => d.text_color(theme.foreground).child(pr.number_label()),
+    }
 }
 
 /// The More link under the description, which opens the task detail:

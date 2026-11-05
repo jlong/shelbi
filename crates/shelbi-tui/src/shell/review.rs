@@ -83,6 +83,8 @@ pub enum ReviewAction {
     OpenBrowser,
     /// Reveal the review worktree folder in the OS file manager.
     RevealFolder,
+    /// Open the task's pull request in the system browser.
+    OpenPr,
     /// Open the full task-description popover over the main area (the `More`
     /// link / `m` key). The shell opens the overlay; the content session keeps
     /// running underneath.
@@ -145,7 +147,8 @@ impl ReviewInterface {
         // body opens in the description popover.
         let title = task.as_ref().map(|t| t.task.title.clone()).unwrap_or_default();
         let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
-        let panel = ReviewPanel::new(worktree, editor_name, has_review_url, title, description);
+        let mut panel = ReviewPanel::new(worktree, editor_name, has_review_url, title, description);
+        panel.pr = task.as_ref().and_then(|t| shelbi_app::board::task_pr(&t.task));
         let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
             shelbi_app::session::ReviewRelauncher {
                 project: project.to_string(),
@@ -413,11 +416,24 @@ impl ReviewInterface {
     /// sub-state and location. Returns whether anything changed.
     pub fn set_server(&mut self, row: Option<&shelbi_app::view::ReviewRow>) -> bool {
         let server = row.map(|r| (r.state, r.location.clone()));
-        if self.panel.server == server {
+        let pr = row
+            .and_then(|r| r.pr.clone())
+            .or_else(|| self.task.as_ref().and_then(|t| shelbi_app::board::task_pr(&t.task)));
+        if self.panel.server == server && self.panel.pr == pr {
             return false;
         }
         self.panel.server = server;
+        // The description popover shows the same PR.
+        if let Some(task) = self.task.as_mut() {
+            task.task.pr = pr.clone();
+        }
+        self.panel.set_pr(pr);
         true
+    }
+
+    /// Where the panel's pull request opens, when it has one.
+    pub fn pr_url(&self) -> Option<&str> {
+        self.panel.pr_url()
     }
 
     /// Edit and View Diff open these in their apps (`editor:` /
@@ -820,6 +836,7 @@ fn map_effect(effect: PanelEffect) -> ReviewAction {
         PanelEffect::ShowEditor => ReviewAction::ShowContent(Some(ReviewRole::Editor)),
         PanelEffect::OpenApp(role) => ReviewAction::OpenApp(role),
         PanelEffect::OpenBrowser => ReviewAction::OpenBrowser,
+        PanelEffect::OpenPr => ReviewAction::OpenPr,
         PanelEffect::RevealFolder => ReviewAction::RevealFolder,
         PanelEffect::ShowDescription => ReviewAction::ShowDescription,
         PanelEffect::Approve => ReviewAction::Approve,
@@ -915,6 +932,7 @@ mod tests {
                 assigned_to: Some("review-1".into()),
                 workflow: None,
                 branch: Some("jlong/fix-login".into()),
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,
@@ -1206,6 +1224,70 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn the_panel_shows_the_tasks_pr_and_its_row_opens_it() {
+        use shelbi_core::{IssuePr, PrCi, PrState};
+        let url = "https://github.com/o/r/pull/2137";
+        let mut task = sample_task();
+        task.task.pr = Some(IssuePr::new(2137, Some(url.into())));
+        let mut it = ReviewInterface::new(
+            "proj",
+            Arc::new(NeverConnector),
+            "fix-login",
+            "review-1",
+            "/wt",
+            "Vim",
+            true,
+            Some(task),
+        );
+        assert_eq!(it.pr_url(), Some(url));
+
+        // The sidebar row keeps it live: the panel and its popover follow.
+        let row = shelbi_app::view::ReviewRow {
+            task_id: "fix-login".into(),
+            pr: Some(IssuePr {
+                state: Some(PrState::Open),
+                ci: Some(PrCi::Failing),
+                ..IssuePr::new(2137, Some(url.into()))
+            }),
+            ..Default::default()
+        };
+        assert!(it.set_server(Some(&row)));
+        assert!(!it.set_server(Some(&row)), "nothing new the second time");
+        assert_eq!(it.panel.pr.as_ref().and_then(|p| p.ci), Some(PrCi::Failing));
+        assert_eq!(it.task.as_ref().unwrap().task.pr.as_ref().and_then(|p| p.ci), Some(PrCi::Failing));
+
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 30)).unwrap();
+        let area = Rect::new(0, 0, 60, 30);
+        terminal.draw(|f| crate::review_panel::render_full(f, &mut it.panel, area)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        let y = lines.iter().position(|l| l.contains("PR #2137 ↗")).expect("the PR line is drawn");
+        assert!(lines[y].contains("open") && lines[y].contains("● checks failing"), "{}", lines[y]);
+
+        // A click on it, and Enter once the keys reach it, both open it.
+        assert_eq!(map_effect(it.panel.click(6, y as u16)), ReviewAction::OpenPr);
+        it.panel.nav_up();
+        it.panel.nav_down();
+        assert_eq!(map_effect(it.panel.activate()), ReviewAction::OpenPr);
+    }
+
+    #[test]
+    fn a_pr_arriving_while_the_panel_is_open_keeps_the_selection() {
+        let mut it = iface();
+        let before = map_effect(it.panel.activate());
+        assert_eq!(before, ReviewAction::ShowContent(None), "opens on Chat");
+        let row = shelbi_app::view::ReviewRow {
+            task_id: "fix-login".into(),
+            pr: Some(shelbi_core::IssuePr::new(7, Some("https://h/pull/7".into()))),
+            ..Default::default()
+        };
+        assert!(it.set_server(Some(&row)));
+        assert_eq!(map_effect(it.panel.activate()), before, "still on Chat, not the row above it");
     }
 
     #[test]

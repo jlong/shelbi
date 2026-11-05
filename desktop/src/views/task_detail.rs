@@ -26,6 +26,10 @@
 //! updated dates. The task operations the old modal put on its action row
 //! are in More ([`PaneAction`]) and keep their keys.
 //!
+//! The PR property is the task's pull request: its number links to the page
+//! (`p` opens it too, and More has it), then its state and CI when known
+//! (`task-pr-metadata`).
+//!
 //! Status, Workflow and Priority are edited in place, with no edit mode
 //! (`dt-task-inline-properties`): each value is the Button at Small in the
 //! Ghost style, and a click (or Tab to it, then Enter) opens a picker
@@ -76,6 +80,7 @@ use super::issues::IssuesView;
 use super::pane_session::PaneSession;
 use super::pane_split::{GRIP_H, GRIP_RADIUS, GRIP_W, HANDLE_H, SESSION_H, SESSION_HEADER_H};
 use super::sidebar::{render_glyph, review_glyph, workspace_glyph};
+use super::task_panel;
 use super::workflow_editor::{dropdown, MENU_W};
 use crate::app::RESIZE_GRAB;
 use crate::assets::{heroicon, icons, Icon};
@@ -787,24 +792,15 @@ fn properties(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Co
         let label = if d.blocked { "Blocked by" } else { "Depends on" };
         rows = rows.child(property_row(theme, label, value_text(theme).debug_selector(|| "pane-deps".into()).child(deps)));
     }
-    if let Some(url) = d.pr_link.clone() {
-        let open = url.clone();
+    if let Some(pr) = &d.pr {
+        let mut link = task_panel::pr_link("pr-link", pr, false, theme);
+        if let Some(url) = pr.url.clone() {
+            link = link.on_click(move |_, _, cx| cx.open_url(&url));
+        }
         rows = rows.child(property_row(
             theme,
-            "Pull request",
-            value_text(theme).child(
-                div()
-                    .id("pr-link")
-                    .debug_selector(|| "pr-link".into())
-                    .min_w_0()
-                    .truncate()
-                    .text_color(theme.link)
-                    .hover(|s| s.underline())
-                    .cursor_pointer()
-                    .tooltip(style::tooltip(url.clone()))
-                    .child(url)
-                    .on_click(move |_, _, cx| cx.open_url(&open)),
-            ),
+            "PR",
+            div().flex().flex_row().items_center().min_w_0().px(px(8.0)).child(task_panel::pr_value(link, pr, theme)),
         ));
     }
     rows
@@ -1125,6 +1121,7 @@ pub(super) fn action_hint(view: &IssuesView, action: PaneAction) -> String {
         PaneAction::MoveLeft => view.hint(km.popover.first_chord_for(PopoverAction::MoveLeft)),
         PaneAction::MoveRight => view.hint(km.popover.first_chord_for(PopoverAction::MoveRight)),
         PaneAction::OpenWorkspace => view.hint(km.popover.first_chord_for(PopoverAction::OpenWorkspace)),
+        PaneAction::OpenPr => view.hint(km.popover.first_chord_for(PopoverAction::OpenPr)),
         PaneAction::Start => "s".into(),
         PaneAction::Assign => "a".into(),
         PaneAction::EditDescription => "e".into(),

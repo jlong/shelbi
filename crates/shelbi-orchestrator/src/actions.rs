@@ -43,7 +43,7 @@
 //! cleaning up a branch the branch is on origin, so gh / git from any
 //! hub checkout work fine.
 
-use shelbi_core::{validate_branch, Column, Error, Host, MergeStrategy, Project, Result, Issue};
+use shelbi_core::{validate_branch, Column, Error, Host, MergeStrategy, PrState, Project, Result, Issue};
 
 use crate::git::{
     compose_pr_body, gh_pr_merge, head_commit_subject, locate_hub_workdir,
@@ -454,6 +454,8 @@ pub fn open_pr(
     // PR is already open" case. Picking `state=open` intentionally — a
     // closed/merged PR is stale; the next push warrants a fresh PR.
     if let Some(num) = lookup_open_pr(&host, &wt, &branch)? {
+        let repo = crate::pr_record::PrRepo { host: &host, wt: &wt, repository: None };
+        crate::pr_record::record_opened(project, &repo, task, &branch, num, None);
         return Ok(num);
     }
 
@@ -481,12 +483,15 @@ pub fn open_pr(
         });
     }
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    parse_pr_number_from_url(stdout.trim()).ok_or_else(|| {
+    let num = parse_pr_number_from_url(stdout.trim()).ok_or_else(|| {
         Error::Other(format!(
             "gh pr create returned `{}` — couldn't parse a PR number out of it",
             stdout.trim()
         ))
-    })
+    })?;
+    let repo = crate::pr_record::PrRepo { host: &host, wt: &wt, repository: None };
+    crate::pr_record::record_opened(project, &repo, task, &branch, num, Some(stdout.trim()));
+    Ok(num)
 }
 
 /// Run the [`open_pr`] target resolution chain. Disk lookup for parent
@@ -624,6 +629,7 @@ pub fn merge(
         // restack land on the ref GitHub actually merged into.
         let pr_base = lookup_pr_base(&host, &wt, pr)?;
         let sha = merge_via_pr(&host, &wt, pr, strategy)?;
+        crate::pr_record::note_finished(project, pr, Some(&branch), PrState::Merged);
         (MergeOutcome::ViaPr { pr, sha }, pr_base)
     } else if let Some(merged) = lookup_merged_pr(&host, &wt, &branch)? {
         // No open PR, but GitHub already has a MERGED one for this branch:
@@ -636,6 +642,7 @@ pub fn merge(
         // transition as satisfied: record the *existing* merge SHA and
         // restack children onto the branch GitHub actually merged into
         // (the PR's stored base), mirroring the ViaPr path.
+        crate::pr_record::note_finished(project, merged.pr, Some(&branch), PrState::Merged);
         (
             MergeOutcome::AlreadyMerged {
                 pr: merged.pr,
@@ -1672,6 +1679,7 @@ pub fn close_pr(project: &Project, task: &Issue) -> Result<Option<u64>> {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         });
     }
+    crate::pr_record::note_finished(project, num, Some(&branch), PrState::Closed);
     Ok(Some(num))
 }
 
@@ -1949,6 +1957,7 @@ mod tests {
             assigned_to: None,
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
@@ -4720,6 +4729,139 @@ transitions:
             None => std::env::remove_var("HOME"),
         }
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn open_pr_records_a_new_pr_on_the_task_and_merge_keeps_it() {
+        let _g = auto_fire_lock();
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        let (_stub, prev_shell, prev_home) = install_gh_stub(
+            r#"#!/bin/sh
+case "$*" in
+  *"--state merged"*) echo "2137 abc123 head 2026-11-05T12:00:00Z main" ;;
+  *"pr create"*) echo "https://github.com/o/r/pull/2137" ;;
+  *"pr list"*) : ;;
+esac
+exit 0
+"#,
+        );
+        let home = fresh_shelbi_home("open-pr-records");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut task = bare_task("t");
+        task.branch = Some("topic".into());
+        task.assigned_to = Some("fixture-ws".into());
+        write_task_file("fixture", &task);
+        let project = project_with_workspace(&local, "fixture-ws");
+
+        let wt = workspace_worktree(
+            project.machines.first().unwrap(),
+            project.workspace("fixture-ws").unwrap(),
+        );
+        std::fs::create_dir_all(&wt).unwrap();
+
+        let opened = open_pr(&project, "fixture", &task, "body", None);
+        let stored = shelbi_state::issue_store_for_project(&project)
+            .and_then(|s| s.get("t"))
+            .unwrap()
+            .unwrap()
+            .task;
+        let cache = shelbi_state::pr_status::load("fixture");
+        let merged = merge(&project, "fixture", &stored, None);
+        let after = shelbi_state::pr_status::load("fixture");
+        let kept = shelbi_state::issue_store_for_project(&project)
+            .and_then(|s| s.get("t"))
+            .unwrap()
+            .unwrap()
+            .task;
+        restore_stub_env(prev_shell, prev_home);
+
+        assert_eq!(opened.unwrap(), 2137);
+        assert_eq!(
+            stored.pr,
+            Some(shelbi_core::IssuePr::new(2137, Some("https://github.com/o/r/pull/2137".into())))
+        );
+        assert_eq!(cache.prs[&2137].state, Some(PrState::Open));
+        assert_eq!(cache.prs[&2137].head, "topic");
+        merged.expect("the merge finds the PR merged");
+        assert_eq!(after.prs[&2137].state, Some(PrState::Merged));
+        assert_eq!(kept.pr.map(|p| p.number), Some(2137), "a merged PR keeps its record");
+    }
+
+    #[test]
+    fn open_pr_records_a_pr_it_finds_with_its_url() {
+        let _g = auto_fire_lock();
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        let (_stub, prev_shell, prev_home) = install_gh_stub(
+            r#"#!/bin/sh
+case "$*" in
+  *"pr view"*) echo "https://github.com/o/r/pull/55" ;;
+  *"pr list"*) echo 55 ;;
+esac
+exit 0
+"#,
+        );
+        let home = fresh_shelbi_home("open-pr-finds");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let mut task = bare_task("t");
+        task.branch = Some("topic".into());
+        task.assigned_to = Some("fixture-ws".into());
+        write_task_file("fixture", &task);
+        let project = project_with_workspace(&local, "fixture-ws");
+        std::fs::create_dir_all(workspace_worktree(
+            project.machines.first().unwrap(),
+            project.workspace("fixture-ws").unwrap(),
+        ))
+        .unwrap();
+
+        let opened = open_pr(&project, "fixture", &task, "body", None);
+        let stored = shelbi_state::issue_store_for_project(&project)
+            .and_then(|s| s.get("t"))
+            .unwrap()
+            .unwrap()
+            .task;
+        restore_stub_env(prev_shell, prev_home);
+
+        assert_eq!(opened.unwrap(), 55);
+        assert_eq!(
+            stored.pr,
+            Some(shelbi_core::IssuePr::new(55, Some("https://github.com/o/r/pull/55".into())))
+        );
+    }
+
+    #[test]
+    fn close_pr_notes_the_state_and_keeps_the_record() {
+        let _g = auto_fire_lock();
+        let (_tmp, _remote, local) = fixture_repo_with_origin();
+        let (_stub, prev_shell, prev_home) = install_gh_stub(
+            r#"#!/bin/sh
+case "$*" in
+  *"pr list"*) echo 55 ;;
+esac
+exit 0
+"#,
+        );
+        let home = fresh_shelbi_home("close-pr-notes");
+        std::env::set_var("SHELBI_HOME", &home);
+        let mut task = bare_task("t");
+        task.branch = Some("topic".into());
+        task.pr = Some(shelbi_core::IssuePr::new(55, Some("https://h/pull/55".into())));
+        write_task_file("fixture", &task);
+        let project = project_with_no_workspaces(&local);
+
+        let closed = close_pr(&project, &task);
+        let cache = shelbi_state::pr_status::load("fixture");
+        let stored = shelbi_state::issue_store_for_project(&project)
+            .and_then(|s| s.get("t"))
+            .unwrap()
+            .unwrap()
+            .task;
+        restore_stub_env(prev_shell, prev_home);
+
+        assert_eq!(closed.unwrap(), Some(55));
+        assert_eq!(cache.prs[&55].state, Some(PrState::Closed));
+        assert_eq!(stored.pr.map(|p| p.number), Some(55));
     }
 
     #[test]

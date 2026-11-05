@@ -470,6 +470,7 @@ mod tests {
                 assigned_to: Some("alpha".into()),
                 workflow: None,
                 branch: Some("shelbi/cold-start".into()),
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,

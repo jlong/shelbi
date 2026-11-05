@@ -89,6 +89,8 @@ pub enum Intent {
     Command(CommandKind),
     /// Re-read the board now.
     Refresh,
+    /// Open this page in the browser.
+    OpenUrl(String),
     /// Fetch the next page of done history.
     LoadMore,
     /// Persist the workspace filter (`state.json`).
@@ -128,6 +130,7 @@ pub enum PaneAction {
     EditDescription,
     OpenInEditor,
     OpenWorkspace,
+    OpenPr,
     CopyBranch,
 }
 
@@ -141,6 +144,7 @@ impl PaneAction {
             PaneAction::EditDescription => "Edit description",
             PaneAction::OpenInEditor => "Open in editor",
             PaneAction::OpenWorkspace => "Open workspace",
+            PaneAction::OpenPr => "Open pull request",
             PaneAction::CopyBranch => "Copy branch name",
         }
     }
@@ -155,6 +159,7 @@ impl PaneAction {
             PaneAction::EditDescription => "edit",
             PaneAction::OpenInEditor => "editor",
             PaneAction::OpenWorkspace => "workspace",
+            PaneAction::OpenPr => "pr",
             PaneAction::CopyBranch => "copy-branch",
         }
     }
@@ -765,10 +770,31 @@ impl BoardState {
         if card.assignee.is_some() {
             out.push(PaneAction::OpenWorkspace);
         }
+        if self.pr_url(id).is_some() {
+            out.push(PaneAction::OpenPr);
+        }
         if card.branch.is_some() {
             out.push(PaneAction::CopyBranch);
         }
         out
+    }
+
+    /// Where issue `id`'s pull request opens, when it has one to open.
+    fn pr_url(&self, id: &str) -> Option<String> {
+        let tasks = self.input.tasks();
+        let tf = tasks.iter().find(|tf| tf.task.id == id)?;
+        shelbi_app::board::task_pr(&tf.task)?.url
+    }
+
+    /// Open issue `id`'s pull request (`p`, More). A card with none says so.
+    fn open_pr(&mut self, id: &str) -> Vec<Intent> {
+        match self.pr_url(id) {
+            Some(url) => vec![Intent::OpenUrl(url)],
+            None => {
+                self.status = Some(format!("{id} has no pull request to open"));
+                Vec::new()
+            }
+        }
     }
 
     /// Open the More menu, or close it when it is open (its button's click).
@@ -801,6 +827,7 @@ impl BoardState {
                 let ws = self.model.card(&id).and_then(|c| c.assignee.clone());
                 self.open_workspace(ws)
             }
+            PaneAction::OpenPr => self.open_pr(&id),
             PaneAction::CopyBranch => match self.model.card(&id).and_then(|c| c.branch.clone()) {
                 Some(branch) => {
                     self.status = Some(format!("copied {branch}"));
@@ -1368,6 +1395,7 @@ impl BoardState {
                     }
                     out
                 }
+                PopoverAction::OpenPr => self.open_pr(id),
             };
         }
         match desktop_key(chord) {
@@ -2183,6 +2211,7 @@ pub(crate) mod tests {
                 assigned_to: None,
                 workflow: None,
                 branch: None,
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,
@@ -2504,6 +2533,25 @@ pub(crate) mod tests {
         assert_eq!(b.detail_id(), Some("B"));
         press(&mut b, "esc");
         assert_eq!((b.mode.clone(), b.detail_id()), (Mode::Board, None));
+    }
+
+    #[test]
+    fn p_and_more_open_the_tasks_pr_and_a_card_with_none_says_so() {
+        let url = "https://github.com/o/r/pull/2137";
+        let mut with_pr = issue("A", "review");
+        with_pr.task.pr = Some(shelbi_core::IssuePr::new(2137, Some(url.into())));
+        let mut b = board(vec![with_pr, issue("B", "review")]);
+
+        b.open_detail("A");
+        assert!(b.pane_actions().contains(&PaneAction::OpenPr));
+        let out = press(&mut b, "p");
+        assert!(matches!(out.as_slice(), [Intent::OpenUrl(u)] if u == url), "{out:?}");
+        assert_eq!(b.detail_id(), Some("A"), "the pane stays");
+
+        b.open_detail("B");
+        assert!(!b.pane_actions().contains(&PaneAction::OpenPr), "nothing to open, not offered");
+        assert!(press(&mut b, "p").is_empty());
+        assert_eq!(b.status.as_deref(), Some("B has no pull request to open"));
     }
 
     #[test]
