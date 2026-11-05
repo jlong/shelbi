@@ -97,7 +97,14 @@ paths on every `cargo test`.
   chevron folds, the wheel scrolls both ways, a file row jumps and its check marks
   viewed, palette rows and the `Commits: all ▾` button click, a click off an
   overlay closes it. Asking for the desktop's diff hands it the keyboard, and Esc
-  with nothing held gives it back to the panel.
+  with nothing held gives it back to the panel. The TUI (`shell/diff_view.rs`) does
+  the same with its keyboard and Esc, and `Ctrl-h` also returns to the panel; there
+  the diff takes `Ctrl-p` over Shelbi's palette, which stays on `Ctrl-Space`, and
+  `Tab` is the hunk filter, not the panel's focus toggle. Its mouse places the
+  cursor, scrolls, jumps from a file row, marks from its check, and opens
+  `Commits: all ▾`; palette rows, fold chevrons and clicking off an overlay stay
+  desktop only. Below 70 columns the TUI's file list starts hidden. `Ctrl-g` hands
+  its terminal to the editor at the line, or says the file is on another machine.
 - **Drag and drop** on the board: desktop only. The TUI moves and reorders
   with the same ⇧H/⇧L/⇧K/⇧J keys the desktop also has.
 - **Native menus** with `keys.yaml` key equivalents, and **system

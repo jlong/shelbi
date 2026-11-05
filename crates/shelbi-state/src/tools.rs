@@ -162,6 +162,22 @@ pub struct AppTools {
     pub builtin_diff: bool,
 }
 
+/// The arguments that open `path` at `line` in the terminal or GUI editor
+/// `program`, by the spelling each family takes: VS Code's `--goto`, a
+/// `path:line` for those that read one, else the `+line` vi, nano and emacs
+/// share. An editor that doesn't know `+line` still opens the file.
+pub fn editor_args_at_line(program: &str, path: &str, line: Option<u32>) -> Vec<String> {
+    let Some(line) = line else { return vec![path.to_string()] };
+    let name = program.rsplit('/').next().unwrap_or(program);
+    match name {
+        "code" | "code-insiders" | "cursor" | "windsurf" | "codium" => {
+            vec!["--goto".to_string(), format!("{path}:{line}")]
+        }
+        "zed" | "subl" | "hx" | "helix" | "mate" => vec![format!("{path}:{line}")],
+        _ => vec![format!("+{line}"), path.to_string()],
+    }
+}
+
 /// Whether `diff_tool:` set to `choice` means Shelbi's own diff view.
 pub fn is_builtin_diff(choice: Option<&ToolChoice>) -> bool {
     match choice.cloned().and_then(ToolChoice::normalized) {
@@ -775,6 +791,15 @@ mod diff_setting_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_editor_opens_at_a_line_by_its_own_spelling() {
+        assert_eq!(editor_args_at_line("vim", "a.rs", Some(7)), ["+7", "a.rs"]);
+        assert_eq!(editor_args_at_line("/usr/bin/nvim", "a.rs", Some(7)), ["+7", "a.rs"]);
+        assert_eq!(editor_args_at_line("code", "a.rs", Some(7)), ["--goto", "a.rs:7"]);
+        assert_eq!(editor_args_at_line("zed", "a.rs", Some(7)), ["a.rs:7"]);
+        assert_eq!(editor_args_at_line("vim", "a.rs", None), ["a.rs"]);
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("shelbi-tools-{tag}-{}", std::process::id()));

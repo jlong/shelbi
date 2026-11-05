@@ -65,6 +65,53 @@ pub(crate) fn pixel(r: u8, g: u8, b: u8, truecolor: bool) -> Color {
     }
 }
 
+/// A theme color as the terminal can show it: an RGB one becomes its nearest
+/// xterm-256 index when the terminal doesn't advertise truecolor.
+pub(crate) fn fit_color(color: Color, truecolor: bool) -> Color {
+    match color {
+        Color::Rgb(r, g, b) if !truecolor => Color::Indexed(rgb_to_xterm256(r, g, b)),
+        other => other,
+    }
+}
+
+/// The diff view's line tints: a changed line's background, and the stronger
+/// one on the words that changed within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DiffTints {
+    pub add_bg: Color,
+    pub del_bg: Color,
+    pub add_word: Color,
+    pub del_word: Color,
+}
+
+/// The tints for the theme in effect. Each is picked for both color depths:
+/// quantizing the truecolor ones lands the dark pair on one gray, so a 256-color
+/// terminal couldn't tell an addition from a deletion.
+pub(crate) fn diff_tints(truecolor: bool) -> DiffTints {
+    let tint = |(r, g, b): (u8, u8, u8), indexed: u8| {
+        if truecolor {
+            Color::Rgb(r, g, b)
+        } else {
+            Color::Indexed(indexed)
+        }
+    };
+    if appearance() == Appearance::Light {
+        DiffTints {
+            add_bg: tint((218, 245, 224), 194),
+            del_bg: tint((252, 226, 226), 224),
+            add_word: tint((168, 232, 184), 157),
+            del_word: tint((248, 188, 188), 217),
+        }
+    } else {
+        DiffTints {
+            add_bg: tint((22, 52, 34), 22),
+            del_bg: tint((66, 28, 34), 52),
+            add_word: tint((38, 98, 60), 28),
+            del_word: tint((122, 46, 54), 88),
+        }
+    }
+}
+
 /// Quantize a 24-bit color to the closest xterm-256 palette index, using the
 /// standard 6×6×6 color cube plus the 24-step grayscale ramp and keeping
 /// whichever is nearer.
