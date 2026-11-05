@@ -212,6 +212,15 @@ pub struct IssueFields {
     /// clears it. Only the durable half ([`IssuePr::new`]) belongs here: state
     /// and CI live in [`crate::pr_status`].
     pub pr: Option<Option<IssuePr>>,
+    /// The issue's Zen Mode overrides. Outer `Some` touches them, inner `None`
+    /// clears them.
+    pub zen: Option<Option<IssueZenConfig>>,
+    /// The issue's launch overrides. Outer `Some` touches them, inner `None`
+    /// clears them.
+    pub launch: Option<Option<IssueLaunchConfig>>,
+    /// Workflow params to change, by name: `Some` sets the param, `None` removes
+    /// it. Params not named here are left alone.
+    pub params: BTreeMap<String, Option<serde_yaml::Value>>,
 }
 
 impl IssueFields {
@@ -226,7 +235,29 @@ impl IssueFields {
             && self.workflow.is_none()
             && self.body.is_none()
             && self.pr.is_none()
+            && self.zen.is_none()
+            && self.launch.is_none()
+            && self.params.is_empty()
     }
+}
+
+/// Apply a [`IssueFields::params`] change to a stored param map, returning
+/// whether anything actually changed.
+pub(crate) fn apply_param_edits(
+    params: &mut BTreeMap<String, serde_yaml::Value>,
+    edits: BTreeMap<String, Option<serde_yaml::Value>>,
+) -> bool {
+    let mut changed = false;
+    for (key, value) in edits {
+        changed |= match value {
+            Some(value) => params.get(&key) != Some(&value) && {
+                params.insert(key, value);
+                true
+            },
+            None => params.remove(&key).is_some(),
+        };
+    }
+    changed
 }
 
 /// Relative or absolute priority move within an issue's current column.
@@ -921,6 +952,19 @@ impl IssueStore for FileSystemStore {
                 changed = true;
             }
         }
+        if let Some(zen) = fields.zen {
+            if tf.task.zen != zen {
+                tf.task.zen = zen;
+                changed = true;
+            }
+        }
+        if let Some(launch) = fields.launch {
+            if tf.task.launch != launch {
+                tf.task.launch = launch;
+                changed = true;
+            }
+        }
+        changed |= apply_param_edits(&mut tf.task.params, fields.params);
         if !changed {
             return Ok(());
         }
@@ -1321,6 +1365,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.get("a").unwrap().unwrap().task.assigned_to, None);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn set_fields_changes_params_by_key_and_zen_and_launch() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let store = FileSystemStore::new("p");
+        let mut new = spec("a", Column::todo());
+        new.params.insert("keep".into(), serde_yaml::Value::from(3));
+        store.add(new).unwrap();
+
+        let param = |key: &str, value: Option<&str>| IssueFields {
+            params: BTreeMap::from([(key.to_string(), value.map(serde_yaml::Value::from))]),
+            ..Default::default()
+        };
+        store.set_fields("a", param("task", Some("parent"))).unwrap();
+        let after = store.get("a").unwrap().unwrap().task;
+        assert_eq!(after.param_str("task"), Some("parent"));
+        assert_eq!(after.params.get("keep"), Some(&serde_yaml::Value::from(3)));
+
+        // Re-setting the same value and clearing an unset key change nothing.
+        let stamp = after.updated_at;
+        store.set_fields("a", param("task", Some("parent"))).unwrap();
+        store.set_fields("a", param("gone", None)).unwrap();
+        assert_eq!(store.get("a").unwrap().unwrap().task.updated_at, stamp);
+
+        store.set_fields("a", param("task", None)).unwrap();
+        let after = store.get("a").unwrap().unwrap().task;
+        assert_eq!(after.param_str("task"), None);
+        assert_eq!(after.params.len(), 1);
+
+        let zen = IssueZenConfig {
+            checks_only: vec!["lint".into()],
+            ..Default::default()
+        };
+        let launch = IssueLaunchConfig {
+            model: Some("opus".into()),
+            ..Default::default()
+        };
+        store
+            .set_fields(
+                "a",
+                IssueFields {
+                    zen: Some(Some(zen.clone())),
+                    launch: Some(Some(launch.clone())),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let after = store.get("a").unwrap().unwrap().task;
+        assert_eq!(after.zen, Some(zen));
+        assert_eq!(after.launch, Some(launch));
+
+        store
+            .set_fields(
+                "a",
+                IssueFields {
+                    zen: Some(None),
+                    launch: Some(None),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let after = store.get("a").unwrap().unwrap().task;
+        assert_eq!((after.zen, after.launch), (None, None));
 
         std::env::remove_var("SHELBI_HOME");
     }
