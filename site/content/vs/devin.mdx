@@ -3,94 +3,123 @@ competitor: Devin
 slug: devin
 competitorUrl: https://devin.ai/
 summary: >-
-  Devin is a hosted autonomous engineer you delegate tickets to. Shelbi is the
-  open-source control room for the CLI agents you already run. Here is where
-  each one fits.
+  Devin combines cloud agents, a desktop IDE, and a local CLI. Shelbi coordinates
+  your coding agents across your machines, through a native macOS app or TUI.
+  Here is where each one fits.
 ---
 
 ## At a glance
 
 | | Shelbi | Devin (Cognition) |
 |---|---|---|
-| **What it is** | Open-source orchestrator for coding agents in the terminal | Hosted "AI software engineer" you delegate tickets to |
-| **Where it runs** | Your machines — a hub plus any box reachable over SSH | Cognition's cloud, in isolated per-session VMs (enterprise VPC optional) |
-| **Intelligence** | Agent-agnostic: drives Claude Code, Codex, aider — anything with a CLI | Bundled SWE-1.6 plus an Adaptive router over Claude, GPT, and Gemini |
-| **Parallelism** | A fixed worker pool of attachable sessions, spread across machines | Many parallel cloud sessions, each its own VM, plus subagents |
-| **Review** | Two-pane TUI; per-task git worktree; inspect and merge the diff yourself | Autonomous pull request reviewed in your existing SCM |
-| **State** | Plain markdown and YAML files under `~/.shelbi` | Cognition's hosted platform, surfaced via web app, REST API, and dashboards |
-| **Pricing** | Free and open source; you pay only your own compute and agent CLIs | Free → $20 Pro → $200 Max → Teams → Enterprise, metered in ACUs |
-| **License** | MIT, open source | Proprietary, hosted — no open-source edition |
+| **What it is** | Open-source agent orchestrator with a native macOS app and TUI | Cloud engineering agents, a desktop IDE, and a local CLI |
+| **Where it runs** | Your machines, locally and over SSH | Local agents, cloud VMs, or your infrastructure through Outposts |
+| **Intelligence** | Runs Claude Code, Codex, and custom CLI runners | SWE-2 and multiple model providers; Desktop also supports ACP agents |
+| **Parallelism** | A declared workspace pool with persistent worktrees across machines | Parallel cloud sessions and local agents in Desktop's Agent Command Center |
+| **Review** | Review workspace with agent, diff and editor; optional Zen automation | Devin Review with diff explanations, comments and automatic reviews |
+| **State** | Local configuration and logs; local markdown issues or a GitHub Issues board | Cloud account state plus local CLI history and configuration |
+| **Pricing** | Free MIT software; you pay for compute and agent usage | Free, Pro ($20/month), Max ($200/month), Teams and custom Enterprise plans |
+| **License** | MIT, open source | Proprietary product; some integration projects are open source |
+
+Checked November 4, 2026. Devin's [pricing page](https://devin.ai/pricing)
+lists current rates. Self-serve plans use included quotas and optional paid
+extra usage; [Enterprise billing](https://docs.devin.ai/admin/billing/enterprise)
+uses contracted Agent Compute Units (ACUs).
 
 ## Where Shelbi excels
 
-**You own the machines, and there is no meter.** Devin runs work in
-Cognition's cloud VMs and bills it as Agent Compute Units, where roughly one
-ACU is fifteen minutes of active work — great until light or bursty use turns
-into an unpredictable per-task cost. Shelbi runs entirely on hardware you
-already have: no cloud VMs and no hosted platform, just the `shelbi`
-binary, `ssh`, `git`, and your agent CLI. Point it at the Mac mini in your
-closet and a Linux workstation,
-declare a few workers on each, and your spare compute becomes the fleet — with
-no VM clock running.
+**Your worker pool, in either client.** Shelbi's native macOS app and TUI
+share the same application model and command registry. Workspaces keep their
+git worktrees between tasks and switch branches for each assignment. You can
+open a remote workspace's agent, shell, diff and editor from the sidebar.
+A whole remote project opens in the native window over one SSH relay channel
+per host, with no port forwarding. Both machines need the same Shelbi version;
+otherwise Shelbi opens the remote TUI with a version notice.
 
-**Bring your own agent — Shelbi is plumbing, not a model.** Devin's
-intelligence *is* the product: its own SWE-1.6 model and an Adaptive router
-that picks a frontier model per task. Shelbi ships no model at all. It is
-agent-agnostic by design, driving "Claude Code, Codex, aider, anything with a
-CLI," declared per project. Run Claude Code on one worker and Codex on another
-in the same project, then swap a runner by editing a single line of YAML. When
-a better CLI lands next quarter, you adopt it without leaving Shelbi.
+Devin also supports local work and
+[Outposts](https://docs.devin.ai/cloud/outposts/overview) on your own hardware.
+Outposts keeps Devin's planning and inference in its cloud while executing
+tools on your machines. Shelbi's hub and orchestrator run on machines you
+manage. There is no Shelbi service fee, but your chosen agents and model
+providers still have their own costs and data handling.
 
-**Review is a first-class pane, not just a pull request.** Devin leans on
-autonomous PR generation that you review in GitHub or GitLab. Shelbi makes the
-human-in-the-loop step the center of the product: when a worker finishes, its
-card lands in a **review** column, Shelbi checks the branch out into a working
-directory on the machine that ran it, and spawns a fresh agent pane right there
-so you can interrogate the diff before anything merges. Press Enter on a review
-card, ask "why this approach?" in the agent's own pane, then approve and merge
-into your default branch — or push and open a PR with `--pr`.
+**Choose the agents and orchestration policy.** Shelbi launches Claude Code,
+Codex, or a custom CLI command as a runner. Different agents can use different
+runners in the same project. Orchestrator onboarding lets you choose its
+**Harness**, **Default model**, and instructions before launch. Workflow
+definitions and agent instructions remain editable files.
 
-**Everything is plain text you can grep.** Devin's task and run state lives in
-Cognition's platform, read back through a web app, REST endpoints, and
-consumption metrics. Shelbi keeps every task, log, and worker status as a
-markdown or YAML file on your disk — "grep it, version-control it, read it from
-your editor." A task is a markdown file with frontmatter you can diff; every
-column change appends one line to `~/.shelbi/events.log`, so you can tail or
-audit the whole history after the fact. Each task also runs on its own git
-branch in its own worktree, so you review, merge, and archive them
-independently.
+Devin has model choice too: [SWE-2](https://cognition.com/blog/swe-2),
+[models from other providers](https://docs.devin.ai/cli/models), Adaptive
+routing, and Fusion pairings. Its Desktop
+[ACP integration](https://docs.devin.ai/desktop/acp) also accepts third-party
+agents, including Codex and Claude Agent. Shelbi's advantage is owning and
+editing the orchestration itself, with CLI runners across your workspace pool.
+
+**Review manually, or delegate it explicitly.** With Zen Mode off by default,
+the orchestrator dispatches ready work and leaves handoffs for you. The Review
+view brings together the task, a review agent, diff and editor tools, and
+approve or reject actions. Optional [Zen Mode](/docs/concepts/zen-mode) lets
+the orchestrator promote eligible backlog and review and merge passing work
+under your project's `zenmode.md` policy. `shelbi zen on`, `shelbi zen off`
+and `shelbi zen pause` control that delegation.
+
+**A board and history you can keep close to the repo.** Shelbi supports
+local markdown issues and a [GitHub Issues backend](/docs/concepts/github-issues).
+Choosing GitHub makes its issues the board's source of truth. In both clients,
+**New issue** opens **New task** with Title, Workflow, Status, Priority,
+Description, and **Let Orchestrator write this up**. The project's
+**Changelog** records shipped work, with `shelbi changelog add`, `list`,
+`search` and `show` for agents and scripts. Configuration, instructions and
+local logs remain inspectable on disk.
 
 ## Where Devin excels
 
-**Genuine end-to-end autonomy from a ticket.** Among coding agents, Devin is
-one of the furthest toward "ticket in, reviewed PR out": it plans, writes,
-runs tests, and debugs its own failures in one loop inside a real VM, equipped
-with a shell, an editor, and a browser. Shelbi orchestrates and supervises
-agents, but it does not supply that autonomous loop itself — your chosen CLI
-agent does the actual engineering.
+**A managed engineering environment.** Devin supplies the agent and its
+cloud environment, with shell, editor and browser tools. Cognition supports
+Linux, Windows and macOS VMs. Devin can
+[test an application and send a video recording](https://docs.devin.ai/work-with-devin/testing-and-recordings)
+after opening a PR. Shelbi supplies the coordination and sessions; your
+selected agent and installed tools do the engineering and testing.
 
-**Managed parallelism and enterprise governance.** Devin's per-session-VM
-model lets one human supervise many concurrent tickets — Cognition cites 10+
-implementations queued for review at once — and it pairs that with SSO, custom
-RBAC, audit logs, customer-managed keys, and dedicated or VPC deployment. That
-makes it credible inside large, regulated organizations. Shelbi has none of
-that compliance surface; it is your machines and your responsibility.
+**An integrated IDE and review platform.**
+[Devin Desktop](https://docs.devin.ai/desktop/getting-started) is available on
+macOS, Windows and Linux. Its
+[October 23 update](https://docs.devin.ai/desktop/changelog) brought the web interface into
+the Agent Window, including local file diffs and terminals on the session's
+machine. [Devin Review](https://docs.devin.ai/work-with-devin/devin-review)
+organizes PR diffs, explains changes, finds potential bugs, and supports
+comments and automatic reviews. It added Bitbucket Cloud support on October
+21. Reviewing Devin's work does not require leaving its interface for GitHub.
+Shelbi's native desktop client is macOS-only and works with your configured
+editor and diff tools.
 
-**Repo-understanding tooling.** Devin's DeepWiki (auto-generated,
-continuously updated architecture docs) and Ask Devin (semantic Q&A over an
-indexed repo) are well-regarded for onboarding both agents and humans onto an
-unfamiliar codebase. Shelbi has no equivalent built in — understanding the code
-is left to whichever agent you run.
+**Team operations beyond a coding queue.** Devin combines integrations with
+Slack, Teams, Linear and Jira with Enterprise SAML/OIDC SSO and dedicated
+deployment options. [Devin Oncall](https://docs.devin.ai/product-guides/devin-oncall)
+became generally available on October 19 to investigate alerts and incidents.
+[October updates](https://docs.devin.ai/release-notes/overview) also added enterprise budgets and began migrating Playbooks
+to Skills. Shelbi's working issue backends are local files and GitHub Issues;
+Jira and Linear are not implemented. You manage its machines and access.
+
+**Built-in repository explanations.**
+[DeepWiki](https://docs.devin.ai/work-with-devin/deepwiki) generates repository
+documentation, architecture diagrams and source links. Ask Devin uses that
+context for codebase questions and planning. Shelbi's Changelog records what
+shipped; it does not provide an equivalent repository wiki or indexed Q&A
+service. Those capabilities depend on the agents and tools you connect.
 
 ## Choosing
 
-**Choose Shelbi if** you live in the terminal, have spare compute to spread
-agents across, and want your tasks, logs, and state to stay on your own disk in
-plain text. It fits when you want to drive whichever CLI agent is best this
-month and keep a hands-on review loop where you read every diff before it
-merges.
+**Choose Shelbi if** you want an open-source orchestrator for a persistent
+pool of CLI agents on your own machines. Use the native macOS app or TUI,
+keep local issues or connect GitHub Issues, and choose between manual review
+and the policy you give Zen Mode. It fits when control of the workflow and
+infrastructure matters more than having a managed engineering environment.
 
-**Choose Devin if** you want a hosted teammate to delegate well-scoped tickets
-to with minimal setup, need parallel backlog burn-down or large mechanical
-migrations such as framework and Java upgrades or COBOL modernization, or need
-enterprise SSO, RBAC, audit, and VPC compliance out of the box.
+**Choose Devin if** you want cloud delegation, a local agent and an IDE in one
+commercial product, or need Desktop on Windows or Linux. Its managed testing,
+Devin Review, repository wiki and team integrations give you more built-in
+services. Check plan quotas and deployment terms against your workload;
+running on your own hardware through Outposts still uses Devin's cloud agent
+loop.
