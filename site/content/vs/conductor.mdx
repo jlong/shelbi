@@ -21,7 +21,7 @@ summary: A macOS app for parallel coding agents, with local workspaces, cloud sa
 | Where work runs | Your local and SSH-reachable machines | Your Mac or managed cloud sandboxes, with Cloud shutting down November 20, 2026 |
 | Agents | Claude Code, Codex and configurable CLI runners | Claude Code, Codex, Cursor and OpenCode |
 | Orchestration | Configurable orchestrator agent, workflow YAML and optional Zen Mode | Workspace chats, model picker and in-app review/PR actions |
-| Review | Review workspace with Approve/Reject; optional checked automation | Diff viewer, line comments, checks and PR actions |
+| Review | Built-in diff view with line comments, revert, checks and GitHub threads; review workspace with Approve/Reject; optional checked automation | Diff viewer, line comments, checks, todos and PR actions |
 | Source | Open source, MIT | No public app repository found |
 | Cost | Free software; agent usage and machines are yours to pay for | Free for existing users during wind-down; model usage billed separately |
 | Availability | Install locally and configure your project | New sign-ups and app downloads closed November 4, 2026 |
@@ -91,6 +91,26 @@ the implementation as well as change the policy. See
 Conductor also exposes configurable repository prompts and actions. Shelbi
 adds access to the orchestration code and project-level workflow definitions.
 
+### A diff view you drive from the keyboard, in both clients
+
+**View Diff** opens [Shelbi's own diff view](/docs/concepts/diff-view) in the
+desktop app and the TUI, over a review branch or a workspace's live worktree. It
+has unified and split layouts, one commit at a time, syntax and word highlighting,
+search across files, folds, a blame gutter and viewed marks. Its keys follow Skim's
+and are [rebindable](/docs/concepts/diff-view#rebinding).
+
+Line comments are threaded. `gY` sends them to the workspace's agent, which can
+answer in the thread, and in a review it starts a Reject with them as the reason.
+In a workspace, `gr` and `gR` revert a hunk or a file, undoing committed work as an
+uncommitted change. On a task with a PR, the view shows its checks and reviews, and
+GitHub's threads at their lines, where you can reply, resolve and submit a review.
+
+Conductor's viewer covers much of the same ground, with unified diffs, commit
+filtering, line comments and GitHub threads. What's different here is the terminal
+client, split view, the keyboard model and revert from the diff, plus another
+tool one setting away if you prefer it: `diff_tool` and `review.diff_command` still
+open an external diff tool.
+
 ### A board, review step and shipping record
 
 Shelbi can keep its issue board in local files or use
@@ -116,18 +136,22 @@ decisions yourself.
 
 These strengths remain useful to existing users during its wind-down.
 
-### Code review inside the app
+### A guided path from review to merge
 
 Conductor's [diff viewer](https://www.conductor.build/docs/reference/diff-viewer)
-supports unified diffs, filtering by commit and comments attached to changed
-lines that can go back to the agent. Its
+supports unified diffs, filtering by commit and comments on changed lines that go
+back to the agent. Around it, the
 [Checks tab](https://www.conductor.build/docs/reference/checks) collects git
-status, PR details, CI, deployments, GitHub review threads and todos when
-available. That is a useful review surface if you want to inspect code and
-feed back on individual lines without leaving the app.
+status, PR details, CI, deployments, GitHub review threads and todos, and can send
+unresolved GitHub comments to the agent. Conductor also suggests the next step as a
+workspace nears merge, such as creating a PR, fixing checks or merging, and can
+discourage a merge while required work is open.
 
-Shelbi also has a native Review view, with reviewer, diff, editor and shell
-sessions. Conductor's strength here is its integrated code-review interface.
+Shelbi's [diff view](/docs/concepts/diff-view) shows a PR's checks, reviews and
+threads, but not deployments or todos, and `gY` sends your own comments rather than
+GitHub's threads. It doesn't suggest what to do next: opening and merging a PR are
+[workflow actions](/docs/guides/getting-started/workflows) that run on a transition,
+so you set them up once rather than choosing them from the review.
 
 ### Session-level agent and model controls
 
@@ -182,14 +206,16 @@ The announcement gives no separate long-term commitment for that relay.
   keep running on the remote host.
 - You want editable workflow policy, a dedicated review step and optional Zen
   automation, with either local files or GitHub Issues as the tracker.
+- You want to review in a keyboard-driven diff view, in a terminal or the Mac app,
+  with comments that reach the agent and revert in place.
 
 ## Choose Conductor if…
 
 New users cannot choose it today: sign-ups and app downloads are closed.
 For existing users, continuing temporarily may make sense if:
 
-- Its inline code review, model picker or Linear-to-workspace flow is central
-  to your current work.
+- Its Checks tab, model picker or Linear-to-workspace flow is central to your
+  current work.
 - You want to finish work in the local app while it still receives model
   updates and critical fixes, through early 2027.
 - You are transferring cloud workspaces to your Mac and exporting data before

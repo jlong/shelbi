@@ -83,7 +83,7 @@ paths on every `cargo test`.
   the TUI's Default model ends with "Custom model…" and the desktop's menu
   lists the suggestions. The desktop wizard's three steps are screens of its
   own window; the TUI's are pages of its Add project dialog.
-- **Diff comments, sending and revert** (`ndv-comments-agent`): shared state and
+- **Diff comments, sending and revert** (`native-diff-view`): shared state and
   workers, so the same keys, status line and refusals in both. `gY` in a review
   asks each client for its own Reject prompt (`DiffOut::Reject`,
   `DiffViewEvent::Reject`), and Reject from the panel or palette starts from the
@@ -95,13 +95,13 @@ paths on every `cargo test`.
   diff…", 15s limit, cause and retries. The desktop's Retry is a button; the
   TUI's is a clickable row and the `r` key. Selecting View Diff again retries
   in both.
-- **A task's PR in the diff view** (`ndv-pr-threads`): both clients draw
+- **A task's PR in the diff view** (`native-diff-view`): both clients draw
   `DiffState::pr_row` (the description block), `DiffState::thread_tag` (where a
   GitHub thread stands) and `DiffState::pr_info_rows` (the `i` panel), in tones
   each maps to its own colors. GitHub's threads are ordinary `Row::Thread` rows.
   `gh` runs on the project's machine, through `DiffBackend`, so a window on a far
   project reads and writes through that machine's daemon.
-- **Shelbi's own diff view** (`ndv-desktop`, `ndv-tui`): both clients draw
+- **Shelbi's own diff view** (`native-diff-view`): both clients draw
   `shelbi_app::diff::DiffState` and read keys from the `diff` keymap context,
   with the same modes, status line and help contents. Where they collide with
   a global, the diff wins while it has the keyboard (`DiffState::wants_key`). On
@@ -118,6 +118,32 @@ paths on every `cargo test`.
   `Commits: all ▾`; palette rows, fold chevrons and clicking off an overlay stay
   desktop only. Below 70 columns the TUI's file list starts hidden. `Ctrl-g` hands
   its terminal to the editor at the line, or says the file is on another machine.
+- **What the diff view decided, for both clients** (`native-diff-view`):
+  - Asking for it hands it the keyboard. It has nothing to do without keys. Going
+    to another view with it held, by a chord or a click, moves the keyboard to that
+    view (`focus_off_hidden_diff`): a handle that isn't drawn gets no keys, and the
+    window's chords stop with it.
+  - A view keeps its place while another is up, and a workspace's reads rest while
+    it's hidden. A new task on the workspace starts a fresh one.
+  - Rows scroll sideways rather than wrap, so every row is one height and the row
+    table stays the whole layout.
+  - Revert is two steps, so the confirm is honest: `gr` asks the backend what it
+    would do, since only git knows whose work it is, and the status line asks.
+    Uncommitted work restores `HEAD`; committed work is undone as an uncommitted
+    change, commits untouched. `git apply` lands whole or not at all, so only what
+    the worktree can't take is refused, with the reason.
+  - An agent's reply doesn't reopen a thread and a person's does, or `gY` would send
+    the agent its own answer back. A reject's comments stay unsent until it lands.
+  - GitHub's threads are `Comment`s with a `gh:` id, kept beside the task's and never
+    saved. One is placed by the text of its diff hunk, nearest the line GitHub names,
+    so a workspace ahead of its last push still shows it; text that's gone puts it at
+    the top of its file, marked outdated.
+  - A verdict is each reviewer's latest approval, request or dismissal. Neutral and
+    skipped checks count as passed.
+  - `gh` runs on the project's machine, where the token is. Reads are governed by
+    `shelbi_state::graphql_read`, and a parked budget refuses writes up front. Words
+    GitHub refuses aren't lost: a new comment stays local, and a reply or review goes
+    back to its editor, or to the clipboard if the keyboard has moved on.
 - **Drag and drop** on the board: desktop only. The TUI moves and reorders
   with the same ⇧H/⇧L/⇧K/⇧J keys the desktop also has.
 - **Native menus** with `keys.yaml` key equivalents, and **system
@@ -416,6 +442,17 @@ Found by this audit and not closed by it; each is a follow-up.
   during the orchestrator handoff wait and left the orchestrator session
   running. Quit Shelbi cleaned it up. The daemon's idle exit should wait for
   an in-flight quit.
+
+- **The diff view:**
+  - The desktop's scrollbar is an indicator, with no dragging, and its rows have no
+    accessibility tree yet (the terminal's do).
+  - On a pull request: Skim's `e` and `d` on your own GitHub comment, `Ctrl-D` to
+    discard a pending review and `gc` (the conversation view) aren't here. `d` on a
+    GitHub thread says so. `gY` sends the task's own comments, not GitHub's threads.
+    It reads the first 100 threads, 50 comments each, 100 reviews and 100 checks, and
+    the panel says when there are more threads. The block's fold isn't remembered
+    between views. A PR's host is ignored, so GitHub Enterprise isn't reached.
+  - `shelbi diff comment` has no `add`: an agent can answer a thread but not start one.
 
 ## View-model fields
 

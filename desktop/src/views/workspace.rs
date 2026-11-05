@@ -480,6 +480,21 @@ impl WorkspaceView {
         }
     }
 
+    /// Where the keyboard goes when the diff went off screen holding it (a view
+    /// chord, a click on another view): the view that's up now, which takes it
+    /// from its own handle once its pane attaches. Left on a handle that isn't
+    /// drawn, no key would reach anything, the window's chords included.
+    fn focus_off_hidden_diff(&self, window: &Window, cx: &gpui::App) -> Option<FocusHandle> {
+        let (diff, _) = self.diff.as_ref().filter(|(d, _)| d.read(cx).contains_focus(window))?;
+        if self.diff_on_show().is_some_and(|shown| shown == diff) {
+            return None;
+        }
+        Some(match self.focus {
+            WsFocus::Content => self.content.read(cx).focus_target(cx),
+            WsFocus::Panel => self.focus_handle.clone(),
+        })
+    }
+
     /// Give the panel keyboard focus (the sidebar chord while the panel holds
     /// the sidebar's column).
     pub fn focus_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -740,14 +755,11 @@ impl WorkspaceView {
     /// the agent with the error on the status line, as the TUI does.
     pub fn select_view(&mut self, view: ContentView, cx: &mut Context<Self>) {
         self.status_line = None;
-        let had_diff = self.diff_on_show().is_some();
         if view == ContentView::Diff && self.builtin_diff() {
             self.panel.set_active(view);
             self.show_builtin_diff(cx);
             return;
         }
-        // Off the diff with the keyboard in it: it follows to the pane.
-        self.refocus = had_diff && self.focus == WsFocus::Content;
         if let Some((diff, _)) = &self.diff {
             diff.update(cx, |d, _| d.set_visible(false));
         }
@@ -1396,6 +1408,9 @@ fn home_relative(path: &str) -> String {
 /// The view itself renders as the panel; the window sizes and places it.
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(target) = self.focus_off_hidden_diff(window, cx) {
+            window.focus(&target, cx);
+        }
         if std::mem::take(&mut self.refocus) {
             let target = self.focus_target(cx);
             window.focus(&target, cx);
@@ -2152,6 +2167,28 @@ pub(crate) mod tests {
         assert!(h.cx.debug_bounds("diff-view").is_none());
         assert!(h.sessions.attached().len() > attached);
         assert!(h.view.read_with(&h.cx, |v, _| v.diff.is_some()));
+    }
+
+    #[gpui::test]
+    fn a_view_chord_off_the_diff_takes_the_keyboard_with_it(cx: &mut TestAppContext) {
+        let mut h = open_builtin(cx);
+        h.update(|v, cx| v.show("alpha", Some(row("alpha", Some("t-1"), WorkspaceBadge::Working, false)), cx));
+        h.draw();
+        h.click("ws-switch-diff");
+        h.draw();
+        let chord = |h: &mut Harness, n: u8| {
+            h.cx.update(|window, cx| h.view.update(cx, |v, cx| v.view_shortcut(n, window, cx)));
+            h.cx.run_until_parked();
+            h.draw();
+        };
+        chord(&mut h, 1);
+        assert_eq!(h.active(), ContentView::Agent);
+        let in_agent = h.cx.update(|window, cx| h.view.read(cx).content.read(cx).contains_focus(window, cx));
+        assert!(in_agent, "the keyboard follows to the agent's pane");
+        chord(&mut h, 2);
+        h.draw();
+        let in_diff = h.cx.update(|window, cx| h.view.read(cx).diff_with_focus(window, cx).is_some());
+        assert!(in_diff, "and back to the diff");
     }
 
     #[gpui::test]

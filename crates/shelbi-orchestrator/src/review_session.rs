@@ -298,8 +298,7 @@ pub fn ensure_content_session(
         raw_output_log: false,
         child_argv: vec!["sh".into(), "-c".into(), command],
     };
-    backend.spawn_session(spec)?;
-    Ok(())
+    backend.spawn_session_to_attach(spec)
 }
 
 /// The per-session lock [`ensure_content_session`] holds across its live check

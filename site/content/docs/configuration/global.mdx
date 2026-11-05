@@ -86,8 +86,8 @@ terminal editor falls back past an app setting to `$EDITOR`, then `vim`.
 
 1. the project's `review.diff_command`, when it sets one,
 2. `diff_tool`, when set to a tool,
-3. Shelbi's own diff view, which is what `diff_tool: builtin` asks for and what
-   an unset setting means.
+3. [Shelbi's own diff view](/docs/concepts/diff-view), which is what
+   `diff_tool: builtin` asks for and what an unset setting means.
 
 `diff_tool: git` runs git's own difftool (`diff.guitool`, else `diff.tool`). Any
 other `diff_tool` command runs in a pane through `git difftool`, one file at a
@@ -113,9 +113,11 @@ found on your login `PATH` or inside the app bundle:
 Any other app gets the two folders with `open -W -a <app>`. If a listed app's
 helper isn't installed, View Diff says so on the status line.
 
-**Remote workspaces.** Edit and View Diff are offered for workspaces on the hub
-only, in both clients, whatever the setting: an app can't open a worktree on
-another machine, and neither can a pane Shelbi starts on the hub.
+**Remote workspaces.** Shelbi's own diff view reads a worktree on any machine, in
+both clients. A workspace on another machine also offers Edit, and an external diff
+tool, as panes that run on that machine. An app can't open a worktree on another
+machine. A review slot on another machine offers no Edit, and offers View Diff only
+for Shelbi's own view.
 
 **Labels.** "Edit in `<name>`" uses the tool's name: **Edit in Neovim** for
 `nvim`, **Edit in Helix** for `hx`, **Edit in Visual Studio Code** for
@@ -296,6 +298,10 @@ The action names accepted under each mode, with their built-in chords:
 | `diff` | `comment` / `reply_or_refresh` / `toggle_thread` | `enter` / `r` / `o` |
 | `diff` | `delete_comment` / `clear_comments` | `d` / `D` |
 | `diff` | `yank` / `yank_all` / `send_to_agent` | `y` / `Y` / `'g Y'` |
+| `diff` | `send_to_reviewer` | `'g A'` |
+| `diff` | `revert_hunk` / `revert_file` | `'g r'` / `'g R'` |
+| `diff` | `toggle_resolved` / `toggle_comment_target` | `x` / `C` |
+| `diff` | `submit_review` / `pr_info` | `R` / `i` |
 | `diff` | `open_in_editor` | `ctrl-g` |
 | `diff` | `toggle_viewed` / `pick_commit` | `m` / `c` |
 | `palette` | `close` | `esc`,`ctrl-c`,`ctrl-p` |

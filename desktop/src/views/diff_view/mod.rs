@@ -1,4 +1,4 @@
-//! Shelbi's own diff view on the desktop (`ndv-desktop`): the Review view's
+//! Shelbi's own diff view on the desktop: the Review view's
 //! Diff tab and the Workspace view's View Diff when `diff_tool` is `builtin`,
 //! over the shared [`shelbi_app::diff`] (its keys are Skim's, from the `diff`
 //! keymap context; the TUI draws the same state).

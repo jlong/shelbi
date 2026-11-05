@@ -210,24 +210,19 @@ From the review panel you can:
 <Tui>
 
 - **🤓 Reviewer**: talk to the Review agent (the default view).
-- **🔀 View Diff**: open your diff tool over the review branch's changes:
-  your [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) setting,
-  in the main pane for a command or in the app for an app. Unset, it uses git's
-  configured diff tool (`diff.tool`, or `diff.guitool` for a GUI tool) in
-  directory-diff mode; if none is configured the panel shows a short error
-  instead of launching. A
-  diff tool that reviews a **revision range** rather than two directory trees
-  (such as `skim`) cannot read the directory pair directory-diff mode hands
-  it, so set `review.diff_command` in `project.yaml` to run it directly
-  instead. See [Review diff command](#review-diff-command) below.
+- **🔀 View Diff**: read the review branch's changes in
+  [Shelbi's own diff view](/docs/concepts/diff-view), in the main pane. Press `?`
+  there for its keys. `Enter` comments on a line, and `gY` starts a reject with
+  your comments as its reason. To open another tool instead, see
+  [Using another diff tool](#using-another-diff-tool) below.
 - **✍️ Edit in `<editor>`**: open the review worktree in your
   [configured editor](/docs/configuration/global#editor-and-diff-tool): in
   the main pane for a command, in the app for an app.
 - **🌐 Open Browser**: open the served `url` in your system browser. This
   action only appears when the workflow declares a review URL.
 
-On a remote review slot, View Diff and Edit are hidden: they only work on a
-local slot.
+On a remote review slot, Edit is hidden, and View Diff is offered only for
+Shelbi's own view, which reads a worktree on any machine.
 
 </Tui>
 <Desktop>
@@ -236,14 +231,11 @@ The views are numbered, so `⌘1`, `⌘2`, and so on switch between them while
 the review is open.
 
 - **Reviewer**: talk to the Review agent (the default view).
-- **View Diff**: run your diff tool over the review branch's changes: your
-  [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) setting, in
-  the main area for a command or in the app for an app. Unset, it uses git's
-  configured diff tool (`diff.tool`, or `diff.guitool` for a GUI tool) in
-  directory-diff mode; if none is configured the view shows a short error
-  instead. A diff tool that reviews a **revision
-  range** (such as `skim`) needs `review.diff_command` in `project.yaml`; see
-  [Review diff command](#review-diff-command) below.
+- **View Diff**: read the review branch's changes in
+  [Shelbi's own diff view](/docs/concepts/diff-view), in the main area. Press `?`
+  there for its keys. `Enter` comments on a line, and `gY` starts a reject with
+  your comments as its reason. To open another tool instead, see
+  [Using another diff tool](#using-another-diff-tool) below.
 - **Edit in `<editor>`**: open the review worktree in your
   [configured editor](/docs/configuration/global#editor-and-diff-tool):
   inside Shelbi for a command, in the editor app for an app.
@@ -253,8 +245,8 @@ the review is open.
 - **Shell**: a shell in the review worktree, beside the content.
 
 The worktree's folder sits above the views; **Open** reveals it in Finder. On
-a remote review slot, View Diff and Edit are hidden: they only work on a local
-slot.
+a remote review slot, Edit is hidden, and View Diff is offered only for Shelbi's
+own view, which reads a worktree on any machine.
 
 </Desktop>
 
@@ -282,35 +274,34 @@ any.
 </Step>
 </Steps>
 
-## Review diff command
+## Using another diff tool
 
-With no [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) set,
-**View Diff** runs `git difftool -d -y <base> HEAD`, git's
-directory-diff mode, which builds two temp trees and hands your `diff.tool`
-**two directory paths**. Most terminal and GUI diff tools understand that.
-Some tools instead review a **revision range** (`skim <base> <head>`,
-for example): given two directory paths they render nothing and leak git
-warnings into the pane.
+**View Diff** opens [Shelbi's own diff view](/docs/concepts/diff-view) unless you
+choose otherwise. There are two ways to choose:
 
-For those, set a `review.diff_command` in `project.yaml`. It replaces the
-default `git difftool -d` invocation with a command of your own, run in the
+- [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) in
+  `~/.shelbi/config.yaml`, or the **Diff tool** picker in Settings ▸ General, picks
+  a tool for every project. `diff_tool: git` runs git's own difftool (`diff.guitool`,
+  else `diff.tool`). A command runs in the main pane, and an app opens in the app.
+- `review.diff_command` in `project.yaml` runs a command of your own for one project,
+  and takes precedence over `diff_tool`.
+
+Use `review.diff_command` for a tool that reviews a **revision range** rather than
+a pair of files or folders (`skim <base> <head>`, for example). It runs in the
 review worktree, with three placeholders substituted:
 
 - `{worktree}`: the review workspace worktree,
 - `{base}`: `merge-base(<base branch>, HEAD)`, the fork point, and
 - `{head}`: `HEAD`.
 
-`{base}` and `{head}` are exactly the range `shelbi diff` reports, so the
-override reviews the same changeset the default path does:
+`{base}` and `{head}` are the same range the built-in view shows:
 
 ```yaml
 review:
   diff_command: skim {base} {head}
 ```
 
-Leave `review.diff_command` unset (the default) and View Diff keeps using
-`git difftool -d -y`, so existing setups are unchanged. Either way, a diff
-tool that exits without rendering leaves a short message in the pane rather
+A diff tool that exits without rendering leaves a short message in the pane rather
 than only git warnings.
 
 ## Next
