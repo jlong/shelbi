@@ -482,10 +482,9 @@ impl AcceptCleanup {
 /// Reject flow untouched.
 ///
 /// Routes through [`crate::workspace::kill_workspace_pane`] rather than a bare
-/// `kill-window` so the expected-teardown mark is set (the review agent pane's
-/// lifecycle wrapper won't emit a spurious `pane_alive=false reason=signal:SIGHUP`)
-/// and every window bound to the slot is reaped — the invariant that keeps a
-/// half-torn-down review window from resurfacing as an `orphaned session`.
+/// `kill-window` so the kill records why the slot went down and every window
+/// bound to the slot is reaped — the invariant that keeps a half-torn-down review
+/// window from resurfacing as an `orphaned session`.
 /// Best-effort: closing one review slot's window touches only that slot, so
 /// other review windows and the dashboard sidebar are left alone.
 pub fn close_review_window(project_name: &str, task_id: &str) -> Result<()> {
@@ -509,7 +508,12 @@ pub fn close_review_window(project_name: &str, task_id: &str) -> Result<()> {
         .machine(&ws.machine)
         .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
     let addr = crate::workspace::workspace_target(&project, &ws)?;
-    crate::workspace::kill_workspace_pane(&machine.host(), &addr, &ws.name)?;
+    crate::workspace::kill_workspace_pane(
+        &machine.host(),
+        &addr,
+        &ws.name,
+        crate::session_backend::KillReason::Handoff,
+    )?;
     // Drop the freed slot's stale status.yaml so it returns to a clean idle. A
     // killed pane emits no further markers, so the poller can't refresh the file
     // — left in place it would report the review agent's last observed state

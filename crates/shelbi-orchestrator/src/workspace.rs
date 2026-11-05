@@ -20,7 +20,7 @@ use shelbi_core::{
     WorkspaceSpec,
 };
 
-use crate::session_backend::{backend, Liveness, SessionBackend, SessionTarget};
+use crate::session_backend::{backend, KillReason, Liveness, SessionBackend, SessionTarget};
 
 
 /// Filter `git status --porcelain` output down to the lines that represent
@@ -2355,10 +2355,16 @@ fn terminate_process_group(_pgid: i32) -> bool {
 /// covers them all. A no-op when nothing was tracked: dev slots and remote
 /// review slots never record a pgid.
 ///
-/// Marks an "expected teardown" for `workspace_name` before killing so a
-/// shelbi-initiated shutdown isn't mistaken for a crash by the agent session's
-/// lifecycle event.
-pub fn kill_workspace_pane(host: &Host, target: &SessionTarget, workspace_name: &str) -> Result<()> {
+/// `reason` is recorded on the session before the kill, so the supervisor reads
+/// this death as deliberate instead of restarting the slot as a crash. It is
+/// recorded on a slot that is already dead too: stopping a pane that crashed a
+/// moment ago, or handing off from one, must still stand the supervisor down.
+pub fn kill_workspace_pane(
+    host: &Host,
+    target: &SessionTarget,
+    workspace_name: &str,
+    reason: KillReason,
+) -> Result<()> {
     stop_review_server(workspace_name);
     // Kill the slot itself on every host. A remote workspace's slot target
     // (`shelbi-w-<name>`, `agent`) maps to the remote session `w-<name>/ws/agent`;
@@ -2368,11 +2374,16 @@ pub fn kill_workspace_pane(host: &Host, target: &SessionTarget, workspace_name: 
     // "already gone", and the real agent kept running while the orphan reaper
     // logged a reap every pass. A transport-answered "already gone" still
     // short-circuits here.
-    if !workspace_slot_alive(host, target)? {
+    let alive = workspace_slot_alive(host, target)?;
+    let session = crate::session_process_backend::session_name(target);
+    backend().record_kill_reason(host, &session, reason);
+    if !alive {
         return Ok(());
     }
-    let _ = shelbi_state::mark_expected_teardown(workspace_name);
-    backend().kill(host, target)?;
+    if let Err(e) = backend().kill(host, target) {
+        backend().clear_kill_reason(host, &session);
+        return Err(e);
+    }
     if host.is_ssh() {
         // A remote kill rides the relay and tolerates "no live session" as
         // success, so a kill that reached nothing would look identical to one
@@ -3111,7 +3122,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
 
     // 3. Reset the agent session — that's how we clear context. If it doesn't
     //    exist yet, this is a no-op; otherwise the next step recreates it.
-    kill_workspace_pane(a.host, a.addr, &a.workspace.name)?;
+    kill_workspace_pane(a.host, a.addr, &a.workspace.name, KillReason::Redispatch)?;
 
     // 4 + 5. Spawn the agent session and launch the agent.
     //

@@ -83,8 +83,7 @@ pub fn request_supervision_relaunch(project: &str, key: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         crate::ensure_dir(parent)?;
     }
-    // Empty body — presence + the kernel-recorded mtime are the whole signal,
-    // mirroring the expected-teardown marker.
+    // Empty body — presence + the kernel-recorded mtime are the whole signal.
     crate::atomic_write(&path, b"")
 }
 

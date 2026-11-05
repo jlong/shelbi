@@ -48,6 +48,7 @@ use shelbi_session::SpawnSpec;
 
 use crate::remote_session;
 use crate::session_backend::{
+    KillReason, SlotDeath,
     injection_guard, InjectionGuard, Liveness, RespawnOutcome, SessionBackend, SessionTarget,
     SlotInfo, TargetParts,
 };
@@ -496,6 +497,66 @@ impl SessionProcessBackend {
         Ok(())
     }
 
+    /// The most recently launched session directory carrying `name`, alive or
+    /// dead: the one that says how the slot last ended. `launched_at` is a
+    /// fixed-format RFC3339 UTC stamp from one producer, so a lexical compare
+    /// orders it.
+    fn newest_session(&self, name: &str) -> Option<DiscoveredSession> {
+        self.discover()
+            .into_iter()
+            .filter(|s| s.meta.name == name)
+            .max_by(|a, b| a.meta.launched_at.cmp(&b.meta.launched_at))
+    }
+
+    /// Note on the session `name` why it is being ended: the one a kill would
+    /// reach, or the newest dead one when nothing is live (so stopping a slot
+    /// that already crashed still stops it). Local only, because only local
+    /// slots are supervised. Best-effort: a failed write leaves the death looking
+    /// like a crash, which is what a missing record has always meant.
+    pub(crate) fn record_kill_reason(&self, host: &Host, name: &str, reason: KillReason) {
+        if host.is_ssh() {
+            return;
+        }
+        let session = self.find_live(name).or_else(|| self.newest_session(name));
+        if let Some(session) = session {
+            if let Err(e) = session.record_kill_reason(reason.as_str()) {
+                tracing::warn!(session = %name, error = %e, "recording kill reason failed");
+            }
+        }
+    }
+
+    /// Withdraw a recorded kill reason after the kill itself failed, so the
+    /// surviving session's eventual death isn't read as this deliberate one.
+    pub(crate) fn clear_kill_reason(&self, host: &Host, name: &str) {
+        if host.is_ssh() {
+            return;
+        }
+        if let Some(session) = self.find_live(name).or_else(|| self.newest_session(name)) {
+            session.clear_kill_reason();
+        }
+    }
+
+    /// How the slot's most recent session ended. See [`SlotDeath`].
+    pub(crate) fn slot_death(&self, host: &Host, name: &str) -> SlotDeath {
+        if host.is_ssh() {
+            return SlotDeath::Crash;
+        }
+        let Some(session) = self.newest_session(name) else {
+            return SlotDeath::Crash;
+        };
+        let exit = session.exit_record();
+        if exit.is_none() && session.alive && session.exiting() {
+            return SlotDeath::Exiting;
+        }
+        if let Some(reason) = session.kill_reason() {
+            return SlotDeath::Killed(KillReason::parse(&reason));
+        }
+        match exit {
+            Some(rec) if rec.code == Some(0) && rec.signal.is_none() => SlotDeath::CleanExit,
+            _ => SlotDeath::Crash,
+        }
+    }
+
     /// Whether some session carrying `name` is **wedged** — its process is still
     /// up (lifetime lock held) but its socket does not answer the protocol
     /// (refusing connects, or accepting them yet never sending the hello). This
@@ -804,6 +865,148 @@ claude --resume a7b448d4-e35d-4246-9870-953e5ab7a895
         std::fs::write(dir.join("lock"), b"").unwrap();
         std::fs::write(dir.join("final.txt"), frame).unwrap();
         std::fs::write(dir.join("exit.json"), br#"{"code":143}"#).unwrap();
+    }
+
+    /// A dead session directory for `name`, as a real one is left behind.
+    fn write_dead_session(
+        sessions: &std::path::Path,
+        id: &str,
+        name: &str,
+        launched_at: &str,
+        exit_json: Option<&str>,
+        kill_reason: Option<&str>,
+    ) {
+        let dir = sessions.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = shelbi_session::Meta {
+            id: id.into(),
+            name: name.into(),
+            argv: vec!["claude".into()],
+            cwd: dir.clone(),
+            task: None,
+            launched_at: launched_at.into(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(dir.join("meta.json"), meta.to_json().unwrap()).unwrap();
+        std::fs::write(dir.join("lock"), b"").unwrap();
+        if let Some(exit) = exit_json {
+            std::fs::write(dir.join("exit.json"), exit).unwrap();
+        }
+        if let Some(reason) = kill_reason {
+            std::fs::write(dir.join("kill-reason"), reason).unwrap();
+        }
+    }
+
+    const EXIT_0: &str = r#"{"code":0,"exited_at":"2026-11-05T10:00:00Z"}"#;
+    const EXIT_1: &str = r#"{"code":1,"exited_at":"2026-11-05T10:00:00Z"}"#;
+    const EXIT_143: &str = r#"{"code":143,"exited_at":"2026-11-05T10:00:00Z"}"#;
+    const SIGTERMED: &str = r#"{"signal":15,"exited_at":"2026-11-05T10:00:00Z"}"#;
+
+    #[test]
+    fn slot_death_tells_a_crash_from_a_deliberate_end() {
+        let _g = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("SHELBI_HOME", home.path());
+        let sessions = shelbi_state::sessions_dir().unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let b = SessionProcessBackend;
+        let host = Host::Local;
+
+        let cases: &[(&str, Option<&str>, Option<&str>, SlotDeath)] = &[
+            ("clean", Some(EXIT_0), None, SlotDeath::CleanExit),
+            ("code1", Some(EXIT_1), None, SlotDeath::Crash),
+            ("code143", Some(EXIT_143), None, SlotDeath::Crash),
+            ("sig", Some(SIGTERMED), None, SlotDeath::Crash),
+            // A host that vanished without writing its record.
+            ("norec", None, None, SlotDeath::Crash),
+            // An agent can exit any way at all once killed; the reason decides.
+            ("stop", Some(EXIT_143), Some("stop"), SlotDeath::Killed(KillReason::Stop)),
+            ("stop0", Some(EXIT_0), Some("stop"), SlotDeath::Killed(KillReason::Stop)),
+            ("handoff", Some(EXIT_1), Some("handoff"), SlotDeath::Killed(KillReason::Handoff)),
+            ("quit", Some(EXIT_143), Some("quit"), SlotDeath::Killed(KillReason::Quit)),
+            // A reason from another build still means it was on purpose.
+            ("future", Some(EXIT_143), Some("whatever"), SlotDeath::Killed(KillReason::Stop)),
+        ];
+        for (id, exit, reason, want) in cases {
+            let name = format!("demo/ws/{id}");
+            write_dead_session(&sessions, id, &name, "2026-11-05T10:00:00Z", *exit, *reason);
+            assert_eq!(b.slot_death(&host, &name), *want, "case {id}");
+        }
+        assert_eq!(b.slot_death(&host, "demo/ws/never-ran"), SlotDeath::Crash);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn slot_death_reads_the_newest_session_so_a_past_death_cant_leak_forward() {
+        let _g = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("SHELBI_HOME", home.path());
+        let sessions = shelbi_state::sessions_dir().unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let b = SessionProcessBackend;
+        let name = "demo/ws/alpha";
+
+        // A deliberate stop, then a redispatch whose new session really crashes.
+        write_dead_session(&sessions, "aaa", name, "2026-11-05T10:00:00Z", Some(EXIT_143), Some("stop"));
+        write_dead_session(&sessions, "zzz", name, "2026-11-05T09:00:00Z", Some(EXIT_0), None);
+        assert_eq!(
+            b.slot_death(&Host::Local, name),
+            SlotDeath::Killed(KillReason::Stop),
+            "newest by launch time, not by directory name",
+        );
+        write_dead_session(&sessions, "mmm", name, "2026-11-05T11:00:00Z", Some(EXIT_1), None);
+        assert_eq!(b.slot_death(&Host::Local, name), SlotDeath::Crash);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn slot_death_waits_while_a_session_is_still_writing_its_record() {
+        let _g = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("SHELBI_HOME", home.path());
+        let sessions = shelbi_state::sessions_dir().unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let b = SessionProcessBackend;
+        let name = "demo/ws/alpha";
+
+        let (_lock, _listener) = write_session_dir(&sessions, "live", name, "2026-11-05T10:00:00Z", false);
+        std::fs::write(sessions.join("live").join("exiting"), b"").unwrap();
+        assert_eq!(b.slot_death(&Host::Local, name), SlotDeath::Exiting);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn recording_a_reason_marks_the_live_session_or_else_the_newest_dead_one() {
+        let _g = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("SHELBI_HOME", home.path());
+        let sessions = shelbi_state::sessions_dir().unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let b = SessionProcessBackend;
+        let name = "demo/ws/alpha";
+
+        // A slot that already crashed: stopping it still has to stick.
+        write_dead_session(&sessions, "old", name, "2026-11-05T09:00:00Z", Some(EXIT_1), None);
+        write_dead_session(&sessions, "new", name, "2026-11-05T10:00:00Z", Some(EXIT_1), None);
+        b.record_kill_reason(&Host::Local, name, KillReason::Stop);
+        assert!(!sessions.join("old").join("kill-reason").exists());
+        assert_eq!(b.slot_death(&Host::Local, name), SlotDeath::Killed(KillReason::Stop));
+
+        // A failed kill withdraws it.
+        b.clear_kill_reason(&Host::Local, name);
+        assert_eq!(b.slot_death(&Host::Local, name), SlotDeath::Crash);
+
+        // A live session gets the reason, not the dead predecessor.
+        let (_lock, _listener) = write_session_dir(&sessions, "live", name, "2026-11-05T11:00:00Z", false);
+        b.record_kill_reason(&Host::Local, name, KillReason::Redispatch);
+        assert!(sessions.join("live").join("kill-reason").exists());
+        assert!(!sessions.join("new").join("kill-reason").exists());
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

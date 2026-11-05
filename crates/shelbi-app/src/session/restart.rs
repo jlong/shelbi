@@ -121,6 +121,7 @@ impl RestartController {
                 attempt: self.state.restart_count() as u32,
             },
             SupervisionAction::GiveUp => DeathAction::GiveUp,
+            SupervisionAction::StandDown => DeathAction::StandDown,
             SupervisionAction::None if self.deliberate_close => DeathAction::StandDown,
             // Never seen alive: a first-open failure, not a crash.
             SupervisionAction::None if !self.state.ever_alive() => DeathAction::Leave,

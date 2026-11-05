@@ -39,10 +39,13 @@
 //! keeping the state machine pure makes the backoff + give-up rules unit
 //! testable without spinning up panes.
 //!
-//! Crash-vs-deliberate discrimination is done off a dedicated no-restart
-//! marker ([`shelbi_state::supervision_shutdown_key`]): the pane lifecycle
-//! wrapper marks it on a clean/intentional exit, and every shelbi-initiated
-//! teardown routes through it, so a death with no fresh marker is a crash.
+//! Crash-vs-deliberate discrimination comes from the dead session's own
+//! directory, read by the caller (`Backend::slot_death` in
+//! `shelbi-orchestrator`): every shelbi-initiated kill records its reason there
+//! first, and the session's `exit.json` says whether the agent exited 0 on its
+//! own. A death with neither is a crash. A clean exit with a task still assigned
+//! stands down and is surfaced as a `supervision=stand-down` line, never silently
+//! relaunched.
 
 use std::time::{Duration, Instant};
 
@@ -95,9 +98,13 @@ pub struct SupervisionState {
 /// What the supervisor should do this tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupervisionAction {
-    /// Nothing to do — the pane is alive, idle, deliberately down, already
+    /// Nothing to do — the pane is alive, idle, already stood down, already
     /// given up, or still inside its backoff window.
     None,
+    /// The pane went down on purpose with work still assigned, so there would
+    /// have been a restart. Returned once per death, so the caller can surface
+    /// it; later ticks read [`None`](Self::None) until the pane is seen alive.
+    StandDown,
     /// Relaunch the pane now (and re-dispatch its task, for a workspace).
     Restart,
     /// The crash-loop cap tripped — emit the give-up line once and stop.
@@ -110,8 +117,8 @@ pub enum SupervisionAction {
 pub struct SupervisionInputs {
     /// Is the pane alive right now?
     pub alive: bool,
-    /// Was the death deliberate (a fresh no-restart marker was consumed, or
-    /// the caller otherwise knows this was not a crash)? Suppresses restart.
+    /// Was the death deliberate (a recorded kill reason, a clean exit, or the
+    /// caller otherwise knows this was not a crash)? Suppresses restart.
     pub intentional_shutdown: bool,
     /// Is there still work to keep the pane up for — an active task for a
     /// workspace, or "always" for the orchestrator? A dead idle workspace
@@ -156,17 +163,17 @@ impl SupervisionState {
             // Never saw it alive — don't adopt a pre-existing dead pane.
             return SupervisionAction::None;
         }
-        if i.intentional_shutdown {
-            // Deliberate stop / close / clean exit: stand down until the
-            // pane comes back on its own, and forget any crash history.
-            self.reset();
-            return SupervisionAction::None;
-        }
         if !i.has_work {
             // Idle workspace (e.g. closed after a review handoff) — nothing
             // to relaunch for.
             self.reset();
             return SupervisionAction::None;
+        }
+        if i.intentional_shutdown {
+            // Deliberate stop / close / clean exit: stand down until the
+            // pane comes back on its own, and forget any crash history.
+            self.reset();
+            return SupervisionAction::StandDown;
         }
         if self.gave_up {
             // Already gave up on this crash loop; wait for the user (or a
@@ -199,6 +206,12 @@ impl SupervisionState {
         self.ever_alive = false;
         self.restarts.clear();
         self.gave_up = false;
+    }
+
+    /// Stand down from outside [`decide`](Self::decide): the caller found, after
+    /// a `Restart` decision, that the work it would have relaunched for is gone.
+    pub fn stand_down(&mut self) {
+        self.reset();
     }
 
     /// Whether this pane has ever been observed alive (and so is adopted for
@@ -278,11 +291,53 @@ mod tests {
             intentional_shutdown: true,
             has_work: true,
         };
+        // The stand-down is reported once, so the caller can surface it...
+        assert_eq!(s.decide(&stop, t), SupervisionAction::StandDown);
         assert_eq!(s.decide(&stop, t), SupervisionAction::None);
-        // And it stays down on subsequent dead ticks (no marker anymore):
-        // the reset dropped `ever_alive`, so a crash-shaped observation is
-        // treated as a not-yet-seen pane, not a fresh crash.
+        // ...and it stays down on subsequent dead ticks: the reset dropped
+        // `ever_alive`, so a crash-shaped observation is treated as a
+        // not-yet-seen pane, not a fresh crash.
         assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::None);
+    }
+
+    #[test]
+    fn a_deliberate_death_with_no_work_has_nothing_to_report() {
+        let mut s = SupervisionState::default();
+        let t = Instant::now();
+        s.decide(&alive(), t);
+        let closed = SupervisionInputs {
+            alive: false,
+            intentional_shutdown: true,
+            has_work: false,
+        };
+        // A pane closed after its task moved on isn't being kept from anything.
+        assert_eq!(s.decide(&closed, t), SupervisionAction::None);
+    }
+
+    #[test]
+    fn a_reopen_after_a_stand_down_restarts_on_a_crash_shaped_tick() {
+        let mut s = SupervisionState::default();
+        let t = Instant::now();
+        s.decide(&alive(), t);
+        let stop = SupervisionInputs {
+            alive: false,
+            intentional_shutdown: true,
+            has_work: true,
+        };
+        assert_eq!(s.decide(&stop, t), SupervisionAction::StandDown);
+        s.request_relaunch();
+        assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::Restart);
+    }
+
+    #[test]
+    fn stand_down_after_a_restart_decision_forgets_the_spent_budget() {
+        let mut s = SupervisionState::default();
+        let t = Instant::now();
+        s.decide(&alive(), t);
+        assert_eq!(s.decide(&dead_crash(), t), SupervisionAction::Restart);
+        s.stand_down();
+        assert_eq!(s.restart_count(), 0);
+        assert!(!s.ever_alive(), "needs a fresh sighting to supervise again");
     }
 
     #[test]
