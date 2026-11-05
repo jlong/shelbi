@@ -4,7 +4,7 @@
 //! the right host for an operation, looking up an open PR, composing a PR
 //! body, parsing the PR number out of `gh pr create`'s URL.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use chrono::{DateTime, Utc};
@@ -1097,23 +1097,31 @@ pub(crate) fn head_commit_subject(host: &Host, wt: &str) -> Result<String> {
 /// git exclude, so it never dirties `git status` or gets committed.
 pub(crate) const PR_BODY_WORKTREE_PATH: &str = ".shelbi/pr-body.md";
 
-/// Lay out the PR body. When the worker authored a description at
-/// `.shelbi/pr-body.md` in the worktree, *that* is the body (with the footer
-/// appended); otherwise fall back to the task body (or an empty body when the
-/// task has none). Either way the auto-opened footer points the reviewer back
-/// at the task file on disk.
+/// Relative path, inside the worktree, of the stamp naming the task the
+/// worktree's [`PR_BODY_WORKTREE_PATH`] belongs to. Only dispatch writes it
+/// ([`claim_worktree_pr_body`]), so a worker never has to know it exists and a
+/// project's forked agent instructions keep working unchanged.
+pub(crate) const PR_BODY_TASK_WORKTREE_PATH: &str = ".shelbi/pr-body-task";
+
+/// Lay out the PR body for `task_id`. When the worker authored a description
+/// at `.shelbi/pr-body.md` in the worktree, and the worktree is stamped for
+/// this task, *that* is the body (with the footer appended); otherwise fall
+/// back to the task body (or an empty body when the task has none). Either way
+/// the auto-opened footer points the reviewer back at the task file on disk.
 ///
 /// `host`/`worktree` locate the worktree (which may be remote), so the read
 /// goes through the same login-shell transport every other primitive uses. A
-/// missing, empty, or unreadable file quietly falls back to the task-body
-/// path — the author step is best-effort and must never break the handoff.
+/// missing, empty, unreadable, or differently-stamped file quietly falls back
+/// to the task-body path: the author step is best-effort and must never break
+/// the handoff.
 pub(crate) fn compose_pr_body(
     host: &Host,
     worktree: &str,
+    task_id: &str,
     task_body: &str,
     task_path: &str,
 ) -> String {
-    let authored = read_worktree_pr_body(host, worktree);
+    let authored = read_worktree_pr_body(host, worktree, task_id);
     let lead = match authored.as_deref().map(str::trim) {
         Some(body) if !body.is_empty() => format!("{body}\n\n"),
         _ => {
@@ -1128,14 +1136,71 @@ pub(crate) fn compose_pr_body(
     format!("{lead}---\n\nAuto-opened by Shelbi — review at: {task_path}\n")
 }
 
-/// Read the worker-authored `.shelbi/pr-body.md` from the worktree, returning
-/// `None` when the file is absent or the read fails. Best-effort by design.
-fn read_worktree_pr_body(host: &Host, worktree: &str) -> Option<String> {
+/// Read the worker-authored `.shelbi/pr-body.md` for `task_id`, returning
+/// `None` when the file is absent, the read fails, or the worktree isn't
+/// stamped for this task. A missing stamp counts as a mismatch: nothing can
+/// vouch for whose body the file is, and a default body is the safe outcome.
+fn read_worktree_pr_body(host: &Host, worktree: &str, task_id: &str) -> Option<String> {
+    if read_pr_body_task(host, worktree).as_deref() != Some(task_id) {
+        return None;
+    }
     let out = run_in_dir(host, worktree, &["cat", PR_BODY_WORKTREE_PATH]).ok()?;
     if !out.status.success() {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// The task id in the worktree's [`PR_BODY_TASK_WORKTREE_PATH`] stamp, or
+/// `None` when it's absent, blank, or unreadable.
+fn read_pr_body_task(host: &Host, worktree: &str) -> Option<String> {
+    let out = run_in_dir(host, worktree, &["cat", PR_BODY_TASK_WORKTREE_PATH]).ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let id = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+/// Claim the worktree's PR body slot for the task being dispatched onto it.
+///
+/// A worktree stamped for another task (or not stamped at all) has its
+/// `.shelbi/pr-body.md` removed, then the stamp is moved to `task_id`, so only
+/// this task's worker can supply a body. A worktree already stamped for
+/// `task_id` is left alone: a supervised redispatch, a bounce back to the
+/// developer, or a gate landing on the same slot is the same task, and its PR
+/// may not be open yet, so the body written for it has to survive.
+///
+/// The stamp moves only after the removal succeeds. If either step fails the
+/// old stamp stays, so [`compose_pr_body`] keeps refusing the file rather than
+/// trusting one this claim couldn't clear.
+pub(crate) fn claim_worktree_pr_body(host: &Host, worktree: &Path, task_id: &str) -> Result<()> {
+    let wt = worktree.to_string_lossy().into_owned();
+    if read_pr_body_task(host, &wt).as_deref() == Some(task_id) {
+        return Ok(());
+    }
+    let cleared = run_in_dir(host, &wt, &["rm", "-f", PR_BODY_WORKTREE_PATH])?;
+    if !cleared.status.success() {
+        return Err(Error::Command {
+            cmd: format!("rm -f {PR_BODY_WORKTREE_PATH}"),
+            status: cleared.status.to_string(),
+            stderr: String::from_utf8_lossy(&cleared.stderr).into_owned(),
+        });
+    }
+    let script = format!(
+        "mkdir -p .shelbi && printf '%s\\n' {id} > {path}.tmp && mv {path}.tmp {path}",
+        id = shelbi_agent::shell_escape(task_id),
+        path = PR_BODY_TASK_WORKTREE_PATH,
+    );
+    let stamped = run_in_dir(host, &wt, &["sh", "-c", &script])?;
+    if !stamped.status.success() {
+        return Err(Error::Command {
+            cmd: format!("write {PR_BODY_TASK_WORKTREE_PATH}"),
+            status: stamped.status.to_string(),
+            stderr: String::from_utf8_lossy(&stamped.stderr).into_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// `gh pr create` prints the new PR's URL like
@@ -1162,25 +1227,39 @@ mod tests {
     }
 
     /// Create a fresh temp worktree containing `.shelbi/pr-body.md` with
-    /// `contents`. Returns the worktree dir.
-    fn worktree_with_pr_body(contents: &str) -> PathBuf {
+    /// `contents`, stamped for `owner` (unstamped when `None`). Returns the
+    /// worktree dir.
+    fn worktree_with_pr_body(contents: &str, owner: Option<&str>) -> PathBuf {
+        let dir = empty_worktree();
+        std::fs::write(dir.join(PR_BODY_WORKTREE_PATH), contents).unwrap();
+        if let Some(owner) = owner {
+            std::fs::write(dir.join(PR_BODY_TASK_WORKTREE_PATH), format!("{owner}\n")).unwrap();
+        }
+        dir
+    }
+
+    /// A fresh temp worktree with an empty `.shelbi/`.
+    fn empty_worktree() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let dir = std::env::temp_dir().join(format!(
             "shelbi-prbody-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         std::fs::create_dir_all(dir.join(".shelbi")).unwrap();
-        std::fs::write(dir.join(PR_BODY_WORKTREE_PATH), contents).unwrap();
         dir
     }
 
     #[test]
     fn pr_body_includes_summary_and_footer() {
         let wt = no_authored_body_worktree();
-        let body = compose_pr_body(&Host::Local, &wt, "Add foo to bar.", "/tmp/p/tasks/add-foo.md");
+        let body = compose_pr_body(
+            &Host::Local,
+            &wt,
+            "add-foo",
+            "Add foo to bar.",
+            "/tmp/p/tasks/add-foo.md",
+        );
         assert!(body.starts_with("Add foo to bar.\n\n---\n"));
         assert!(body.contains("Auto-opened by Shelbi"));
         assert!(body.contains("/tmp/p/tasks/add-foo.md"));
@@ -1189,7 +1268,7 @@ mod tests {
     #[test]
     fn pr_body_handles_empty_task_body() {
         let wt = no_authored_body_worktree();
-        let body = compose_pr_body(&Host::Local, &wt, "", "/tmp/t.md");
+        let body = compose_pr_body(&Host::Local, &wt, "t", "", "/tmp/t.md");
         assert!(body.starts_with("---\n"));
         assert!(body.contains("Auto-opened by Shelbi"));
     }
@@ -1197,10 +1276,11 @@ mod tests {
     #[test]
     fn pr_body_prefers_worker_authored_file_over_task_body() {
         let authored = "## Summary\n\nFixes the widget.\n\n## QA checklist\n- [ ] click it";
-        let wt = worktree_with_pr_body(authored);
+        let wt = worktree_with_pr_body(authored, Some("widget"));
         let body = compose_pr_body(
             &Host::Local,
             &wt.to_string_lossy(),
+            "widget",
             "RAW TASK REQUIREMENTS — should not appear",
             "/tmp/p/tasks/widget.md",
         );
@@ -1216,15 +1296,122 @@ mod tests {
     fn pr_body_falls_back_when_authored_file_is_empty() {
         // A blank/whitespace-only authored file is treated as "no body" so a
         // worker that touched the file but wrote nothing still gets a real PR.
-        let wt = worktree_with_pr_body("   \n\n");
+        let wt = worktree_with_pr_body("   \n\n", Some("t"));
         let body = compose_pr_body(
             &Host::Local,
             &wt.to_string_lossy(),
+            "t",
             "Issue body fallback.",
             "/tmp/t.md",
         );
         assert!(body.starts_with("Issue body fallback.\n\n---\n"));
         assert!(body.contains("Auto-opened by Shelbi"));
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn pr_body_ignores_a_file_stamped_for_another_task() {
+        // The worktree moved on: the body on disk belongs to `old-task`.
+        let wt = worktree_with_pr_body("STALE BODY", Some("old-task"));
+        let body = compose_pr_body(
+            &Host::Local,
+            &wt.to_string_lossy(),
+            "new-task",
+            "New task's own body.",
+            "/tmp/t.md",
+        );
+        assert!(body.starts_with("New task's own body.\n\n---\n"));
+        assert!(!body.contains("STALE BODY"));
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn pr_body_ignores_an_unstamped_file() {
+        // Nothing vouches for an unstamped file, e.g. one left by a release
+        // from before the stamp existed.
+        let wt = worktree_with_pr_body("STALE BODY", None);
+        let body = compose_pr_body(
+            &Host::Local,
+            &wt.to_string_lossy(),
+            "new-task",
+            "New task's own body.",
+            "/tmp/t.md",
+        );
+        assert!(!body.contains("STALE BODY"));
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn pr_body_falls_back_when_the_stamped_worktree_has_no_file() {
+        let wt = empty_worktree();
+        std::fs::write(wt.join(PR_BODY_TASK_WORKTREE_PATH), "t\n").unwrap();
+        let body = compose_pr_body(
+            &Host::Local,
+            &wt.to_string_lossy(),
+            "t",
+            "Issue body fallback.",
+            "/tmp/t.md",
+        );
+        assert!(body.starts_with("Issue body fallback.\n\n---\n"));
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn claim_clears_another_tasks_body_and_stamps_the_new_task() {
+        let wt = worktree_with_pr_body("STALE BODY", Some("old-task"));
+        claim_worktree_pr_body(&Host::Local, &wt, "new-task").unwrap();
+        assert!(!wt.join(PR_BODY_WORKTREE_PATH).exists());
+        assert_eq!(
+            std::fs::read_to_string(wt.join(PR_BODY_TASK_WORKTREE_PATH)).unwrap(),
+            "new-task\n"
+        );
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn claim_clears_an_unstamped_body() {
+        let wt = worktree_with_pr_body("STALE BODY", None);
+        claim_worktree_pr_body(&Host::Local, &wt, "new-task").unwrap();
+        assert!(!wt.join(PR_BODY_WORKTREE_PATH).exists());
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn claim_keeps_the_body_when_the_same_task_comes_back() {
+        // A bounce or a gate on the same slot: the PR may not be open yet, so
+        // the body this task's worker wrote must survive the re-dispatch.
+        let wt = worktree_with_pr_body("MY BODY", Some("task"));
+        claim_worktree_pr_body(&Host::Local, &wt, "task").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(wt.join(PR_BODY_WORKTREE_PATH)).unwrap(),
+            "MY BODY"
+        );
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn claim_creates_the_scratch_dir_in_a_fresh_worktree() {
+        let wt = empty_worktree();
+        std::fs::remove_dir_all(wt.join(".shelbi")).unwrap();
+        claim_worktree_pr_body(&Host::Local, &wt, "task").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(wt.join(PR_BODY_TASK_WORKTREE_PATH)).unwrap(),
+            "task\n"
+        );
+        std::fs::remove_dir_all(&wt).ok();
+    }
+
+    #[test]
+    fn claim_failure_leaves_the_old_stamp_so_the_stale_body_stays_refused() {
+        // `rm -f` can't remove a directory, standing in for any clear failure.
+        let wt = empty_worktree();
+        std::fs::create_dir_all(wt.join(PR_BODY_WORKTREE_PATH)).unwrap();
+        std::fs::write(wt.join(PR_BODY_TASK_WORKTREE_PATH), "old-task\n").unwrap();
+        assert!(claim_worktree_pr_body(&Host::Local, &wt, "new-task").is_err());
+        assert_eq!(
+            std::fs::read_to_string(wt.join(PR_BODY_TASK_WORKTREE_PATH)).unwrap(),
+            "old-task\n"
+        );
         std::fs::remove_dir_all(&wt).ok();
     }
 

@@ -390,6 +390,17 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
     };
     let id = entry.logical_id.as_str();
 
+    // Runs alongside the per-agent sniffers below, and on agents they don't
+    // know about: a project-defined agent is the case this one exists for.
+    if matches!(entry.format, SurfaceFormat::Markdown)
+        && id.contains(".agent.")
+        && id.ends_with(".instructions")
+        && !id.contains(".agent.orchestrator.")
+        && !id.contains(".agent.review.")
+    {
+        sniff_agent_pr_body_path(entry, &text, out);
+    }
+
     if id.ends_with(".registration")
         || id.ends_with(".registration.shared")
         || id.ends_with(".registration.local")
@@ -684,6 +695,46 @@ fn sniff_developer_instructions(entry: &InventoryEntry, text: &str, out: &mut Ve
     // The MSRV-check reminder is Rust-gated, so it can't be decided from this
     // surface alone — it runs as a cross-surface sniffer ([`sniff_dev_msrv_guidance`])
     // that correlates the dev prose with whether the project is a Rust track.
+}
+
+// ---------------------------------------------------------------------------
+// PR body path in agent instructions (Markdown prose)
+
+/// The only path `open_pr` reads a worker-authored PR body from. Kept in sync
+/// with the shipped default template by the drift guard in this module's tests.
+const PR_BODY_PATH: &str = ".shelbi/pr-body.md";
+
+/// Phrases marking prose that talks about authoring a PR body. Matched against
+/// lowercased text.
+const PR_BODY_PROSE_MARKERS: &[&str] = &[
+    "pr body",
+    "pr description",
+    "pull-request body",
+    "pull request body",
+    "pull-request description",
+    "pull request description",
+];
+
+/// Detect an agent told to write a PR body but not where. A worker in that spot
+/// picks its own filename, `open_pr` never sees the file, and the PR opens with
+/// the default body. This is an **absence** sniff over forkable prose, so it
+/// routes to [`Classification::NeedsJudgment`]. The orchestrator and Review
+/// agents are excluded: they read PRs and don't author bodies.
+fn sniff_agent_pr_body_path(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let lower = text.to_ascii_lowercase();
+    if text.contains(PR_BODY_PATH) || !PR_BODY_PROSE_MARKERS.iter().any(|m| lower.contains(m)) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        "AGENT_INSTRUCTIONS_PR_BODY_PATH_MISSING",
+        "agent prose talks about writing a PR body but doesn't name `.shelbi/pr-body.md`, the \
+         only path `open_pr` reads, so a body saved anywhere else is ignored",
+        "Tell the agent to write the PR body to `.shelbi/pr-body.md` in its worktree, mirroring \
+         the `Writing the PR description` section of the shipped developer template.",
+        Location { line: 1, column: 1 },
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -2949,6 +3000,11 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              fresh-primary base discipline can't be merged in mechanically without risking \
              local edits — the orchestrator refreshes its own copy instead."
         }
+        "AGENT_INSTRUCTIONS_PR_BODY_PATH_MISSING" => {
+            "These are prose instructions a project may have written or customized itself, so \
+             the PR body path can't be merged in mechanically without risking local edits — the \
+             orchestrator updates its own copy instead."
+        }
         "SHARED_PREAMBLE_HUB_SAFETY_MISSING" => {
             "The shared preamble is prose the project wrote itself, so the hub-safety \
              rules can't be merged in mechanically without risking its own content — the \
@@ -4107,6 +4163,75 @@ mod tests {
             "shipped default developer template trips the fresh-primary sniffer: {:?}",
             codes(&out)
         );
+    }
+
+    fn technical_writer_entry() -> InventoryEntry {
+        entry(
+            "project.demo.agent.technical-writer.instructions",
+            "project:demo",
+            SurfaceFormat::Markdown,
+        )
+    }
+
+    const PR_BODY_PATH_CODE: &str = "AGENT_INSTRUCTIONS_PR_BODY_PATH_MISSING";
+
+    #[test]
+    fn agent_told_to_write_a_pr_body_without_the_path_needs_judgment() {
+        let text = "# Writer\n\n## The PR description\n\nWrite the PR body for a human.\n";
+        let mut out = Vec::new();
+        sniff_agent_pr_body_path(&technical_writer_entry(), text, &mut out);
+        let f = find(&out, PR_BODY_PATH_CODE).expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+    }
+
+    #[test]
+    fn agent_naming_the_pr_body_path_or_not_writing_one_is_clean() {
+        for text in [
+            "Write the PR body to `.shelbi/pr-body.md` in your worktree.\n",
+            "# QA\n\nVerify the change and report a verdict.\n",
+        ] {
+            let mut out = Vec::new();
+            sniff_agent_pr_body_path(&technical_writer_entry(), text, &mut out);
+            assert!(find(&out, PR_BODY_PATH_CODE).is_none(), "flagged: {text}");
+        }
+    }
+
+    #[test]
+    fn pr_body_path_sniff_reaches_a_project_defined_agent_but_not_the_orchestrator() {
+        let dir = std::env::temp_dir().join(format!("shelbi-pr-body-sniff-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("instructions.md");
+        std::fs::write(&path, "Write the PR body for a human.\n").unwrap();
+        let run = |id: &str| {
+            let mut e = entry(id, "project:demo", SurfaceFormat::Markdown);
+            e.canonical_path = path.clone();
+            let mut out = Vec::new();
+            sniff_entry(&e, &mut out);
+            find(&out, PR_BODY_PATH_CODE).is_some()
+        };
+        assert!(run("project.demo.agent.technical-writer.instructions"));
+        assert!(run("project.demo.agent.developer.instructions"));
+        assert!(!run("project.demo.agent.orchestrator.instructions"));
+        assert!(!run("project.demo.agent.review.instructions"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Drift guard: no shipped agent trips the sniffer, and the one that writes
+    /// PR bodies names the path, so a fresh project is clean.
+    #[test]
+    fn shipped_default_agents_do_not_trip_the_pr_body_path_sniffer() {
+        for agent in shelbi_state::DEFAULT_AGENTS {
+            let mut out = Vec::new();
+            sniff_agent_pr_body_path(&technical_writer_entry(), agent.instructions, &mut out);
+            assert!(
+                find(&out, PR_BODY_PATH_CODE).is_none(),
+                "shipped `{}` instructions trip the PR body path sniffer",
+                agent.name
+            );
+        }
+        assert!(shelbi_state::DEFAULT_DEVELOPER_INSTRUCTIONS.contains(PR_BODY_PATH));
+        assert!(shelbi_state::DEFAULT_PR_TEMPLATE.contains(PR_BODY_PATH));
     }
 
     // ---- MSRV check: zen.checks.local (project + workflow) --------------
