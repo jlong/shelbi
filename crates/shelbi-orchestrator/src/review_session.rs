@@ -25,6 +25,10 @@
 //! a clear `Err` the client surfaces on its status line rather than a silent
 //! no-op.
 
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::{Arc, Mutex, OnceLock};
+
 use shelbi_core::{Column, Error, Host, Project, Result};
 
 use crate::session_process_backend::SessionProcessBackend;
@@ -245,10 +249,18 @@ pub fn ensure_content_session(
             "review slot `{slot}` is remote; open it over SSH"
         )));
     }
+    let branch = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?
+        .get(task_id)?
+        .and_then(|tf| tf.task.branch);
     let worktree = crate::workspace::workspace_worktree(machine, ws);
 
     let name = content_session_name(project_name, &slot, role);
     let backend = SessionProcessBackend;
+    // Clients and their relaunchers ask concurrently (a retry, a second
+    // client): the check and the spawn are one step, or two askers each find
+    // nothing live and start a session under the one name.
+    let lock = ensure_lock(&name);
+    let _spawning = lock.lock().unwrap_or_else(|e| e.into_inner());
     // Idempotent: a live session under this name is reused as is.
     if backend
         .live_session_names(&Host::Local)
@@ -260,7 +272,18 @@ pub fn ensure_content_session(
 
     let command = match role {
         ReviewContentRole::Editor => crate::review_ui::editor_session_command(&worktree),
-        ReviewContentRole::Diff => crate::review_ui::diff_session_command(&project, &worktree)?,
+        ReviewContentRole::Diff => {
+            // The slot is assigned before its branch is checked out, so a
+            // review can ask for its diff while the load is still running.
+            // Refuse until it's there: a missing worktree would otherwise read
+            // as "no diff tool configured", and the previous task's checkout
+            // would give a live session diffing the wrong commit.
+            let slot_alive = crate::workspace::workspace_target(&project, ws)
+                .and_then(|addr| crate::workspace::workspace_slot_alive(&Host::Local, &addr))
+                .unwrap_or(false);
+            worktree_ready_for_diff(&worktree, branch.as_deref(), slot_alive)?;
+            crate::review_ui::diff_session_command(&project, &worktree)?
+        }
     };
     let (cols, rows) = SessionProcessBackend::default_size();
     let spec = shelbi_session::SpawnSpec {
@@ -274,6 +297,74 @@ pub fn ensure_content_session(
     };
     backend.spawn_session(spec)?;
     Ok(())
+}
+
+/// The per-session lock [`ensure_content_session`] holds across its live check
+/// and spawn. One per name, so a slow first spawn (it asks a login shell for
+/// `PATH`) holds up only the askers for that same session.
+fn ensure_lock(name: &str) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(name.to_string())
+        .or_default()
+        .clone()
+}
+
+/// Whether a review slot's worktree holds what its diff should show. `Err`
+/// names what it's waiting on, and is expected for a moment during a load: the
+/// client retries.
+///
+/// - No worktree or no commit: the load hasn't created it yet.
+/// - At the branch's tip: checked out, whatever else the load is still doing.
+/// - Elsewhere, with the slot's agent running: settled. A load checks out
+///   before it starts the agent, and the branch can move on under a review
+///   that's already up (a push, a fetch), which must not lock its diff out.
+/// - Elsewhere, with no agent: mid-load, still on the slot's previous task.
+///
+/// `branch` is `None` when the board doesn't know it: there is nothing to
+/// compare, so a checked-out worktree is taken as is.
+fn worktree_ready_for_diff(worktree: &Path, branch: Option<&str>, slot_alive: bool) -> Result<()> {
+    let not_there = || {
+        Error::Other(format!(
+            "the review worktree at {} isn't checked out yet",
+            worktree.display()
+        ))
+    };
+    if !worktree.is_dir() {
+        return Err(not_there());
+    }
+    let head = rev_parse(worktree, "HEAD").ok_or_else(not_there)?;
+    let Some(branch) = branch else {
+        return Ok(());
+    };
+    if slot_alive {
+        return Ok(());
+    }
+    let tip = rev_parse(worktree, &format!("refs/remotes/origin/{branch}"))
+        .or_else(|| rev_parse(worktree, &format!("refs/heads/{branch}")));
+    if tip.as_deref() == Some(head.as_str()) {
+        return Ok(());
+    }
+    Err(Error::Other(format!(
+        "the review worktree hasn't checked out `{branch}` yet (it's still at {})",
+        head.get(..8).unwrap_or(&head)
+    )))
+}
+
+/// The commit `rev` names in `worktree`, if it names one.
+fn rev_parse(worktree: &Path, rev: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["rev-parse", "--verify", "--quiet", &format!("{rev}^{{commit}}")])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Open `task_id`'s review worktree (the editor) or its branch diff in the
@@ -434,6 +525,127 @@ mod tests {
             params: std::collections::BTreeMap::new(),
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    /// A repo with `main` and a branch `task` one commit past it, on `origin`
+    /// too, and a worktree detached at `main`: a review slot still holding its
+    /// previous task. Returns the tempdir, the worktree, and the branch tip.
+    fn slot_on_previous_task() -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "core.hooksPath=/dev/null"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "base"]);
+        git(&repo, &["checkout", "-q", "-b", "task"]);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "work"]);
+        let tip = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/task", &tip]);
+        git(&repo, &["checkout", "-q", "main"]);
+        let wt = dir.path().join("slot");
+        git(&repo, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap(), "main"]);
+        (dir, wt, tip)
+    }
+
+    fn checkout(wt: &Path, rev: &str) {
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(wt)
+            .args(["checkout", "-q", "--detach", rev])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+    }
+
+    #[test]
+    fn a_missing_worktree_is_not_ready_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = worktree_ready_for_diff(&dir.path().join("nope"), Some("task"), false).unwrap_err();
+        assert!(err.to_string().contains("isn't checked out yet"), "{err}");
+        // A live agent doesn't change that: there's still nothing to diff.
+        assert!(worktree_ready_for_diff(&dir.path().join("nope"), Some("task"), true).is_err());
+        // A folder that isn't a checkout isn't one either.
+        assert!(worktree_ready_for_diff(dir.path(), Some("task"), false).is_err());
+    }
+
+    #[test]
+    fn a_slot_on_the_previous_task_is_not_ready_until_the_branch_is_checked_out() {
+        let (_dir, wt, tip) = slot_on_previous_task();
+        let err = worktree_ready_for_diff(&wt, Some("task"), false).unwrap_err();
+        assert!(err.to_string().contains("hasn't checked out `task`"), "{err}");
+
+        checkout(&wt, &tip);
+        worktree_ready_for_diff(&wt, Some("task"), false).unwrap();
+    }
+
+    #[test]
+    fn a_branch_with_no_remote_is_compared_by_its_local_ref() {
+        let (_dir, wt, tip) = slot_on_previous_task();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&wt)
+            .args(["update-ref", "-d", "refs/remotes/origin/task"])
+            .status()
+            .unwrap();
+        assert!(out.success());
+        assert!(worktree_ready_for_diff(&wt, Some("task"), false).is_err());
+        checkout(&wt, &tip);
+        worktree_ready_for_diff(&wt, Some("task"), false).unwrap();
+    }
+
+    #[test]
+    fn a_settled_review_is_ready_though_its_branch_moved_on() {
+        // The slot's agent is up, so the load is past its checkout; a push or
+        // fetch that moved the tip must not lock the diff out.
+        let (_dir, wt, _tip) = slot_on_previous_task();
+        worktree_ready_for_diff(&wt, Some("task"), true).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_branch_takes_any_checkout() {
+        let (_dir, wt, _tip) = slot_on_previous_task();
+        worktree_ready_for_diff(&wt, None, false).unwrap();
+    }
+
+    #[test]
+    fn ensure_serializes_per_session_only() {
+        assert!(Arc::ptr_eq(&ensure_lock("demo/review/r/diff"), &ensure_lock("demo/review/r/diff")));
+        assert!(!Arc::ptr_eq(&ensure_lock("demo/review/r/diff"), &ensure_lock("demo/review/r/editor")));
+    }
+
+    /// A load in flight on a fresh slot used to fail its diff with "no diff tool
+    /// configured" (git config read from a folder that isn't there).
+    #[test]
+    fn a_fresh_slots_diff_says_the_worktree_is_not_ready() {
+        let _lock = crate::test_lock::acquire();
+        let proj = format!("rfs-{}", std::process::id());
+        let home = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", home.path());
+
+        let mut project = demo_project(&proj);
+        project.machines[0].work_dir = home.path().join("repo");
+        shelbi_state::save_project(&project).unwrap();
+        shelbi_state::save_task(&proj, &task_on("t-load", "Loading", Some("review-1"), Column::review()), "b").unwrap();
+
+        let err = ensure_content_session(&proj, "t-load", ReviewContentRole::Diff).unwrap_err();
+        assert!(err.to_string().contains("isn't checked out yet"), "{err}");
+
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
         }
     }
 

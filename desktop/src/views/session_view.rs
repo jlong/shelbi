@@ -243,8 +243,7 @@ enum Slot {
     Reconnecting,
 }
 
-/// The view's state without its payloads (the tests' view of the machine).
-#[cfg(test)]
+/// The view's state without its payloads.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionPhase {
     Empty,
@@ -435,8 +434,7 @@ impl SessionView {
     }
 
     /// The session this view shows.
-    #[cfg(test)]
-    pub fn target(&self) -> &SessionRef {
+        pub fn target(&self) -> &SessionRef {
         &self.target
     }
 
@@ -446,8 +444,7 @@ impl SessionView {
     }
 
     /// The view's state.
-    #[cfg(test)]
-    pub fn phase(&self) -> SessionPhase {
+        pub fn phase(&self) -> SessionPhase {
         let max = RestartController::max_restarts();
         match &self.slot {
             Slot::Empty => SessionPhase::Empty,

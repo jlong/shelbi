@@ -83,6 +83,11 @@ paths on every `cargo test`.
   the TUI's Default model ends with "Custom model…" and the desktop's menu
   lists the suggestions. The desktop wizard's three steps are screens of its
   own window; the TUI's are pages of its Add project dialog.
+- **View Diff's wait** (`review-diff-loading-state`): both clients draw the
+  shared `shelbi_app::review::diff_load::DiffLoad`, with the same "Loading
+  diff…", 15s limit, cause and retries. The desktop's Retry is a button; the
+  TUI's is a clickable row and the `r` key. Selecting View Diff again retries
+  in both.
 - **Drag and drop** on the board: desktop only. The TUI moves and reorders
   with the same ⇧H/⇧L/⇧K/⇧J keys the desktop also has.
 - **Native menus** with `keys.yaml` key equivalents, and **system

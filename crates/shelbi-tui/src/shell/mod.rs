@@ -338,8 +338,9 @@ enum ReviewJobMsg {
     /// A queued-review load onto a slot finished (`rt-tui-review-load-queued`).
     /// On success the daemon's `ReviewOpened` event opens the interface.
     LoadDone(Result<(), String>),
-    /// A daemon `Ensure` for a content role finished; bind the view on success.
-    ContentReady(shelbi_app::ReviewRole, Result<(), String>),
+    /// A daemon `Ensure` for the editor finished; bind the view on success. (The
+    /// diff waits for itself: `ReviewInterface::show_diff`.)
+    ContentReady(Result<(), String>),
     /// The gated merge (approve) finished.
     MergeDone(Result<(), String>),
     /// A reject-with-reason finished.
@@ -4381,16 +4382,10 @@ impl ShellState {
         match msg {
             ReviewJobMsg::Resolved(result) => self.on_review_resolved(result),
             ReviewJobMsg::LoadDone(result) => self.on_review_load_done(result),
-            ReviewJobMsg::ContentReady(role, Ok(())) => {
+            ReviewJobMsg::ContentReady(result) => {
                 if let Some(r) = self.review.as_mut() {
-                    r.show_role(role);
+                    r.editor_ready(result);
                     self.reported_main = None;
-                }
-            }
-            ReviewJobMsg::ContentReady(_, Err(e)) => {
-                if let Some(r) = self.review.as_mut() {
-                    r.set_status(format!("open view failed: {e}"));
-                    r.show_chat();
                 }
             }
             ReviewJobMsg::MergeDone(Ok(())) => self.finish_review_close("approved"),
@@ -4429,8 +4424,15 @@ impl ShellState {
                     self.reported_main = None;
                 }
             }
+            // View Diff waits for its diff in its own view.
+            ReviewAction::ShowContent(Some(shelbi_app::ReviewRole::Diff)) => {
+                if let Some(r) = self.review.as_mut() {
+                    r.show_diff();
+                    self.reported_main = None;
+                }
+            }
             ReviewAction::ShowContent(Some(role)) => {
-                // Ask the daemon to ensure the editor/diff session, then bind it.
+                // Ask the daemon to ensure the editor session, then bind it.
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.review_rx = Some(rx);
                 std::thread::Builder::new()
@@ -4439,7 +4441,7 @@ impl ShellState {
                         let op = shelbi_app::ReviewSessionOp::Ensure { role };
                         let res = shelbi_app::review_session(&project, &task, op, &mut |_, _| {})
                             .map_err(|e| e.to_string());
-                        let _ = tx.send(ReviewJobMsg::ContentReady(role, res));
+                        let _ = tx.send(ReviewJobMsg::ContentReady(res));
                     })
                     .ok();
             }

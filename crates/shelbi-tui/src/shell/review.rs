@@ -23,20 +23,35 @@
 //! gated merge is in flight the whole review is inert to competing input
 //! (the panel declines Approve/Reject/quit; this also drops view switches and
 //! Back) so a multi-second `gh` merge can never be raced — plan AC #4.
+//!
+//! **View Diff waits for its diff** (`review-diff-loading-state`): the shared
+//! [`DiffLoad`] retries an `Ensure` the daemon refuses because the worktree is
+//! mid-load, and the view reads "Loading diff…" until the tool has drawn,
+//! rather than falling back to the Reviewer. After 15s it says why it couldn't,
+//! with a Retry (`r`, a click, or selecting View Diff again).
 
+use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
-use ratatui::layout::Rect;
+use ratatui::layout::{Alignment, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 
-use shelbi_app::ReviewRole;
+use shelbi_app::review::diff_load::{
+    DiffLoad, DiffLoadView, DiffSeen, DIFF_FAILED_TITLE, DIFF_RETRY_LABEL, LOADING_DIFF,
+};
+use shelbi_app::{ReviewRole, ReviewSessionOp};
 use shelbi_state::IssueFile;
 use shelbi_term::Size;
 
 use crate::review_panel::{render_full, PanelEffect, ReviewPanel};
 
 use super::session::{Connector, MainState, SessionManager, SessionRef};
+use crate::theme::palette;
 use super::terminal_view::MouseOutcome;
 
 /// Keyboard focus within the review interface.
@@ -79,6 +94,9 @@ pub enum ReviewAction {
     Close,
 }
 
+/// Asks the daemon for the diff session. Runs off the UI thread.
+type DiffEnsure = Arc<dyn Fn() -> Result<(), String> + Send + Sync>;
+
 /// The live review interface for one task.
 pub struct ReviewInterface {
     panel: ReviewPanel,
@@ -93,6 +111,19 @@ pub struct ReviewInterface {
     /// `None` only if the issue store couldn't produce it (the panel then shows
     /// no task info and `More` is inert).
     task: Option<IssueFile>,
+    /// The main area shows View Diff (its wait, or its terminal).
+    diff_active: bool,
+    /// View Diff's wait for its diff, once it was asked for.
+    diff_load: Option<DiffLoad>,
+    /// The answer to the ensure in flight. Its own channel, not the shell's
+    /// one job slot, so another view's job can't lose an answer the wait is
+    /// counting on.
+    diff_answer: Option<Receiver<Result<(), String>>>,
+    diff_ensure: DiffEnsure,
+    /// What the wait last drew, so the shell redraws when that changes.
+    diff_drawn: Option<DiffLoadView>,
+    /// Where the failure's Retry was last drawn.
+    retry_rect: Option<Rect>,
 }
 
 impl ReviewInterface {
@@ -124,6 +155,15 @@ impl ReviewInterface {
         ));
         // Chat is the default view: bind to the review agent's workspace session.
         content.show(SessionRef::Workspace(slot.clone()));
+        let diff_ensure: DiffEnsure = {
+            let (project, task) = (project.to_string(), task_id.clone());
+            Arc::new(move || {
+                let op = ReviewSessionOp::Ensure { role: ReviewRole::Diff };
+                shelbi_app::review_session(&project, &task, op, &mut |_, _| {})
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            })
+        };
         Self {
             panel,
             content,
@@ -131,6 +171,12 @@ impl ReviewInterface {
             slot,
             focus: ReviewFocus::Panel,
             task,
+            diff_active: false,
+            diff_load: None,
+            diff_answer: None,
+            diff_ensure,
+            diff_drawn: None,
+            retry_rect: None,
         }
     }
 
@@ -153,6 +199,13 @@ impl ReviewInterface {
         self.content.reconnect();
     }
 
+    /// Pump the content view (test accessor): the shell's loop, without the wait.
+    #[cfg(test)]
+    pub(crate) fn poll_content_for_test(&mut self, ring: &mut bool) {
+        self.content.poll();
+        self.content.pump_output(ring);
+    }
+
     /// The content view's current [`MainState`] (test accessor).
     #[cfg(test)]
     pub(crate) fn content_state(&self) -> MainState<'_> {
@@ -164,6 +217,7 @@ impl ReviewInterface {
     /// re-attempts a failed/idle binding, so this is the retry path for a content
     /// connect that timed out (`rt-review-screen-hangs-on-connecting`).
     pub fn show_chat(&mut self) {
+        self.leave_diff();
         self.content.show(SessionRef::Workspace(self.slot.clone()));
     }
 
@@ -171,10 +225,158 @@ impl ReviewInterface {
     /// already ensured it exists (the daemon's half). Re-selecting the same role
     /// while it is the current but failed target re-attaches.
     pub fn show_role(&mut self, role: ReviewRole) {
-        self.content.show(SessionRef::Review {
-            slot: self.slot.clone(),
+        self.leave_diff();
+        self.content.show(Self::role_target(&self.slot, role));
+    }
+
+    /// The editor's ensure answered, for a switch to it that may be stale:
+    /// View Diff selected since it was asked for keeps the main area.
+    pub fn editor_ready(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) if !self.diff_active => self.show_role(ReviewRole::Editor),
+            Ok(()) => {}
+            Err(e) => {
+                self.set_status(format!("open view failed: {e}"));
+                if !self.diff_active {
+                    self.show_chat();
+                }
+            }
+        }
+    }
+
+    fn role_target(slot: &str, role: ReviewRole) -> SessionRef {
+        SessionRef::Review {
+            slot: slot.to_string(),
             role: role.as_str().to_string(),
-        });
+        }
+    }
+
+    /// Show View Diff: start or resume the wait for the diff.
+    pub fn show_diff(&mut self) {
+        self.show_diff_at(Instant::now());
+    }
+
+    fn show_diff_at(&mut self, now: Instant) {
+        self.diff_active = true;
+        let seen = self.diff_seen();
+        if DiffLoad::select(&mut self.diff_load, &seen, now) {
+            self.send_diff_ensure();
+        }
+        self.drive_diff(now);
+    }
+
+    /// Retry: start the wait for the diff over.
+    fn retry_diff(&mut self, now: Instant) {
+        if self.diff_load.as_mut().is_some_and(|load| load.retry(now)) {
+            self.send_diff_ensure();
+        }
+        self.drive_diff(now);
+    }
+
+    /// The pane is going to another view; the wait goes on behind it.
+    fn leave_diff(&mut self) {
+        self.diff_active = false;
+        if let Some(load) = self.diff_load.as_mut() {
+            load.left();
+        }
+    }
+
+    fn send_diff_ensure(&mut self) {
+        let (tx, rx) = mpsc::channel();
+        self.diff_answer = Some(rx);
+        let ensure = self.diff_ensure.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-review-ensure".into())
+            .spawn(move || {
+                let _ = tx.send(ensure());
+            });
+        if let (Err(e), Some(load)) = (spawned, self.diff_load.as_mut()) {
+            self.diff_answer = None;
+            load.ensure_answered(Err(e.to_string()), Instant::now());
+        }
+    }
+
+    /// What the pane shows of the diff session.
+    fn diff_seen(&self) -> DiffSeen {
+        let diff = Self::role_target(&self.slot, ReviewRole::Diff);
+        if self.content.current_target() != Some(&diff) {
+            return DiffSeen::NotYet;
+        }
+        match self.content.state() {
+            MainState::Live(pane) if pane.has_drawn() => DiffSeen::Drawn,
+            MainState::Failed(_, why) | MainState::GaveUp(why) => DiffSeen::Ended(why.to_string()),
+            MainState::Idle(_) => DiffSeen::Ended("the diff session isn't running".to_string()),
+            _ => DiffSeen::NotYet,
+        }
+    }
+
+    /// One step of the wait: take the ensure's answer, send a retry that's
+    /// due, attach a session that's up, and note what the pane shows. Returns
+    /// whether what the view draws changed.
+    fn drive_diff(&mut self, now: Instant) -> bool {
+        let Some(load) = self.diff_load.as_mut() else {
+            return false;
+        };
+        if let Some(rx) = &self.diff_answer {
+            match rx.try_recv() {
+                Ok(result) => {
+                    load.ensure_answered(result, now);
+                    self.diff_answer = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    load.ensure_answered(Err("the daemon request ended without an answer".into()), now);
+                    self.diff_answer = None;
+                }
+            }
+        }
+        let send = load.take_due_ensure(now);
+        let attach = self.diff_active && load.needs_attach();
+        if attach {
+            load.mark_attached();
+        }
+        if send {
+            self.send_diff_ensure();
+        }
+        if attach {
+            self.content.show(Self::role_target(&self.slot, ReviewRole::Diff));
+        }
+        let seen = if self.diff_active { self.diff_seen() } else { DiffSeen::NotYet };
+        let Some(load) = self.diff_load.as_mut() else {
+            return false;
+        };
+        load.observe(&seen, now);
+        let drawn = load.view(now);
+        if self.diff_drawn.as_ref() == Some(&drawn) {
+            return false;
+        }
+        self.diff_drawn = Some(drawn);
+        true
+    }
+
+    /// What View Diff's wait draws in place of the terminal now, if anything.
+    /// Before "Loading" is due (a ready diff is up by then) a pane already bound
+    /// to the session is blank, not "Connecting…"; one not bound yet still shows
+    /// the view it came from.
+    fn diff_cover(&self, now: Instant) -> Option<DiffLoadView> {
+        if !self.diff_active {
+            return None;
+        }
+        let load = self.diff_load.as_ref()?;
+        // Asked of the pane, not the wait's last look: a drawn diff shows now.
+        if self.diff_seen() == DiffSeen::Drawn {
+            return None;
+        }
+        match load.view(now) {
+            DiffLoadView::Ready => None,
+            DiffLoadView::Settling if !load.is_attached() => None,
+            view => Some(view),
+        }
+    }
+
+    /// Whether the terminal is hidden behind the wait: input isn't for it yet.
+    fn diff_covered(&self) -> bool {
+        self.diff_cover(Instant::now()).is_some()
     }
 
     /// Drive the busy spinner while a merge is in flight / set the state.
@@ -235,7 +437,8 @@ impl ReviewInterface {
     // -- background plumbing, delegated to the content SessionManager --------
 
     pub fn poll(&mut self) -> bool {
-        self.content.poll()
+        let changed = self.content.poll();
+        self.drive_diff(Instant::now()) || changed
     }
 
     pub fn pump_output(&mut self, ring: &mut bool) -> bool {
@@ -257,6 +460,15 @@ impl ReviewInterface {
     /// Handle a key. `is_palette` is true when the shell already recognized the
     /// palette-open chord (handled by the shell), so it never reaches here.
     pub fn handle_key(&mut self, k: KeyEvent) -> ReviewAction {
+        // `r` on the failure is its Retry, wherever focus sits.
+        if k.code == KeyCode::Char('r')
+            && k.modifiers.is_empty()
+            && !self.panel.merging
+            && matches!(self.diff_cover(Instant::now()), Some(DiffLoadView::Failed { .. }))
+        {
+            self.retry_diff(Instant::now());
+            return ReviewAction::None;
+        }
         match self.focus {
             ReviewFocus::Content => self.handle_content_key(k),
             ReviewFocus::Panel => self.handle_panel_key(k),
@@ -281,7 +493,7 @@ impl ReviewInterface {
         if self.panel.merging {
             return;
         }
-        if matches!(self.content.state(), MainState::Live(_)) {
+        if matches!(self.content.state(), MainState::Live(_)) && !self.diff_covered() {
             self.focus = ReviewFocus::Content;
         }
     }
@@ -300,7 +512,7 @@ impl ReviewInterface {
     /// Inert while a gated merge runs — the review takes no competing input then
     /// (AC #4 parity with the focus-move methods).
     pub fn paste_into_content(&mut self, text: &str) {
-        if self.panel.merging {
+        if self.panel.merging || self.diff_covered() {
             return;
         }
         self.focus_content();
@@ -311,6 +523,9 @@ impl ReviewInterface {
         // Tab returns focus to the panel; everything else goes to the agent.
         if k.code == KeyCode::Tab && k.modifiers.is_empty() {
             self.focus = ReviewFocus::Panel;
+            return ReviewAction::None;
+        }
+        if self.diff_covered() {
             return ReviewAction::None;
         }
         // Cmd+C / Ctrl+Shift+C copies the content view's selection and is
@@ -342,7 +557,7 @@ impl ReviewInterface {
             // Tab moves focus to the content view (so the reviewer can type in
             // the agent / editor) when one is live.
             KeyCode::Tab if k.modifiers.is_empty() => {
-                if matches!(self.content.state(), MainState::Live(_)) {
+                if matches!(self.content.state(), MainState::Live(_)) && !self.diff_covered() {
                     self.focus = ReviewFocus::Content;
                 }
                 ReviewAction::None
@@ -401,6 +616,15 @@ impl ReviewInterface {
             }
             return ReviewAction::None;
         }
+        // The wait's words are over the content: its Retry takes the click, and
+        // nothing reaches a terminal that isn't showing.
+        if self.diff_covered() {
+            let on_retry = self.retry_rect.is_some_and(|r| contains(r, m.column, m.row));
+            if on_retry && matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.retry_diff(Instant::now());
+            }
+            return ReviewAction::None;
+        }
         // Content area: forward to the content session like the main area does.
         let (pane_col, pane_row) = (
             m.column.saturating_sub(content_rect.x),
@@ -434,6 +658,19 @@ impl ReviewInterface {
         render_full(frame, &mut self.panel, panel_rect);
         // Then the content view into the remaining buffer.
         let buf = frame.buffer_mut();
+        self.retry_rect = None;
+        match self.diff_cover(Instant::now()) {
+            Some(DiffLoadView::Loading) => {
+                super::render_placeholder(buf, content_rect, LOADING_DIFF);
+                return None;
+            }
+            Some(DiffLoadView::Failed { cause }) => {
+                self.retry_rect = render_diff_failed(buf, content_rect, &cause);
+                return None;
+            }
+            Some(DiffLoadView::Settling | DiffLoadView::Ready) => return None,
+            None => {}
+        }
         let mut cursor = None;
         match self.content.state() {
             MainState::Empty => {}
@@ -477,6 +714,62 @@ impl ReviewInterface {
         }
         cursor
     }
+}
+
+/// The failed diff, centered in `area`: the heading, why, and the Retry. Returns
+/// where the Retry landed, when there was room for it.
+fn render_diff_failed(buf: &mut ratatui::buffer::Buffer, area: Rect, cause: &str) -> Option<Rect> {
+    let width = area.width.saturating_sub(4);
+    if width == 0 || area.height == 0 {
+        return None;
+    }
+    let cause = wrap_words(cause, usize::from(width));
+    let height = (cause.len() as u16).saturating_add(4).min(area.height);
+    let top = area.y + (area.height - height) / 2;
+    let mut lines = vec![Line::styled(
+        DIFF_FAILED_TITLE,
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    let muted = Style::default().fg(palette().ansi_dark_gray);
+    lines.extend(cause.into_iter().map(|l| Line::styled(l, muted)));
+    let retry_row = top + lines.len() as u16 + 1;
+    Paragraph::new(lines)
+        .alignment(Alignment::Center)
+        .render(Rect::new(area.x + 2, top, width, height), buf);
+
+    if retry_row >= area.bottom() {
+        return None;
+    }
+    let label = format!(" {DIFF_RETRY_LABEL} (r) ");
+    let label_width = (label.chars().count() as u16).min(width);
+    let rect = Rect::new(area.x + (area.width - label_width) / 2, retry_row, label_width, 1);
+    Paragraph::new(label)
+        .style(Style::default().add_modifier(Modifier::REVERSED))
+        .render(rect, buf);
+    Some(rect)
+}
+
+/// `text` broken at spaces to fit `width` columns (a longer word is cut).
+fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        if !line.is_empty() && line.chars().count() + 1 + word.len() > width {
+            lines.push(std::mem::take(&mut line));
+        }
+        while word.len() > width {
+            lines.push(word.drain(..width).collect());
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.extend(word);
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
 }
 
 /// Open the configured review URL for `task` in the system browser (off the UI
@@ -530,6 +823,7 @@ fn contains(area: Rect, x: u16, y: u16) -> bool {
 mod tests {
     use super::*;
     use crate::shell::session::{ConnectFailure, Connected, RetryPolicy};
+    use shelbi_app::review::diff_load::DIFF_LOAD_TIMEOUT;
     use crossterm::event::KeyModifiers;
     use std::os::unix::net::UnixListener;
     use std::path::PathBuf;
@@ -614,6 +908,269 @@ mod tests {
             body: "## Summary\n\nFix the broken login so sessions persist.".into(),
             tracker_assignees: Vec::new(),
         }
+    }
+
+    /// Attaches the diff to a real session running `cat`: blank until something
+    /// is typed at it, so a test decides when the "tool" draws. Everything else
+    /// (the Reviewer) has no session.
+    struct CatDiff {
+        sock: PathBuf,
+    }
+
+    impl Connector for CatDiff {
+        fn connect(&self, _p: &str, target: &SessionRef) -> Result<Connected, ConnectFailure> {
+            use shelbi_client::Connection;
+            if !matches!(target, SessionRef::Review { .. }) {
+                return Err(ConnectFailure::Message("no session".into()));
+            }
+            let (conn, events) = Connection::open(&self.sock, None, shelbi_proto::capability::ALL)
+                .map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            conn.attach(None).map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            let size = shelbi_app::session::GridSize::new(80, 24);
+            Ok(Connected { conn, events, size })
+        }
+    }
+
+    /// The daemon's half, scripted: counts the asks and answers `fail` while set.
+    #[derive(Default)]
+    struct FakeEnsure {
+        asks: std::sync::atomic::AtomicUsize,
+        refusal: std::sync::Mutex<Option<String>>,
+    }
+
+    impl FakeEnsure {
+        fn asks(&self) -> usize {
+            self.asks.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn refuse(&self, why: Option<&str>) {
+            *self.refusal.lock().unwrap() = why.map(str::to_string);
+        }
+    }
+
+    fn with_ensure(mut it: ReviewInterface) -> (ReviewInterface, Arc<FakeEnsure>) {
+        let fake = Arc::new(FakeEnsure::default());
+        let f = fake.clone();
+        it.diff_ensure = Arc::new(move || {
+            f.asks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match f.refusal.lock().unwrap().clone() {
+                Some(why) => Err(why),
+                None => Ok(()),
+            }
+        });
+        (it, fake)
+    }
+
+    /// Wait for the outstanding ensure thread's answer and take it, at `now`.
+    fn settle_ensure(it: &mut ReviewInterface, now: Instant) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while it.diff_answer.is_some() && Instant::now() < deadline {
+            it.drive_diff(now);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(it.diff_answer.is_none(), "the ensure answered");
+    }
+
+    /// Pump the content and the wait until `done`, at the wait's time `now`.
+    fn pump_until(it: &mut ReviewInterface, now: Instant, done: impl Fn(&ReviewInterface) -> bool) -> bool {
+        let mut ring = false;
+        for _ in 0..1500 {
+            it.poll_content_for_test(&mut ring);
+            it.drive_diff(now);
+            if done(it) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    fn render_main(it: &mut ReviewInterface) -> String {
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                it.render(f, Rect::new(0, 0, 28, 20), Rect::new(28, 0, 72, 20), false, true);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        (0..20)
+            .map(|y| (28..100).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_ready_diff_opens_with_no_loading_flash() {
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let (sock, _cleanup) = crate::shell::session::tests::spawn_cat_session(home.path(), "proj/review/review-1/diff");
+        let (mut it, ensure) = with_ensure(ReviewInterface::new(
+            "proj", Arc::new(CatDiff { sock }), "fix-login", "review-1", "/wt", "Vim", true, None,
+        ));
+        let t0 = Instant::now();
+        it.show_diff_at(t0);
+        settle_ensure(&mut it, t0);
+        assert!(pump_until(&mut it, t0, |i| matches!(i.content.state(), MainState::Live(_))));
+        // Attached inside the grace, and the tool draws: Loading is never drawn.
+        assert_eq!(it.diff_load.as_ref().unwrap().view(t0), DiffLoadView::Settling);
+        assert!(!render_main(&mut it).contains(LOADING_DIFF));
+        it.content.send_input(b"diff --git a/x b/x");
+        assert!(pump_until(&mut it, t0, |i| i.diff_seen() == DiffSeen::Drawn));
+        assert_eq!(it.diff_load.as_ref().unwrap().view(t0), DiffLoadView::Ready);
+        assert!(!it.diff_covered());
+        assert_eq!(ensure.asks(), 1);
+
+        // Selected again with the pane showing it: nothing to do, no ensure.
+        it.show_diff_at(t0 + SECOND);
+        settle_ensure(&mut it, t0 + SECOND);
+        assert_eq!(ensure.asks(), 1);
+        assert!(!it.diff_covered());
+    }
+
+    #[test]
+    fn a_worktree_not_ready_loads_then_retries_into_the_diff() {
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let (sock, _cleanup) = crate::shell::session::tests::spawn_cat_session(home.path(), "proj/review/review-1/diff");
+        let (mut it, ensure) = with_ensure(ReviewInterface::new(
+            "proj", Arc::new(CatDiff { sock }), "fix-login", "review-1", "/wt", "Vim", true, None,
+        ));
+        ensure.refuse(Some("the review worktree isn't checked out yet"));
+        let t0 = Instant::now();
+        it.show_diff_at(t0);
+        settle_ensure(&mut it, t0);
+
+        // The refusal is no error: no status, no fallback, Loading.
+        let t1 = t0 + SECOND;
+        it.drive_diff(t1);
+        assert_eq!(it.panel.status_line, "");
+        assert!(it.diff_active);
+        assert_eq!(it.diff_load.as_ref().unwrap().view(t1), DiffLoadView::Loading);
+        assert!(ensure.asks() >= 1);
+        settle_ensure(&mut it, t1);
+
+        // The worktree comes ready; the retry attaches the session.
+        ensure.refuse(None);
+        let t2 = t0 + 3 * SECOND;
+        it.drive_diff(t2);
+        settle_ensure(&mut it, t2);
+        assert!(pump_until(&mut it, t2, |i| matches!(i.content.state(), MainState::Live(_))));
+        assert_eq!(it.diff_load.as_ref().unwrap().view(t2), DiffLoadView::Loading, "attached, not drawn");
+
+        // The tool draws: the terminal replaces Loading, with no key.
+        it.content.send_input(b"diff --git a/x b/x");
+        assert!(pump_until(&mut it, t2, |i| i.diff_seen() == DiffSeen::Drawn));
+        assert!(!it.diff_covered());
+    }
+
+    #[test]
+    fn a_persistent_failure_times_out_with_the_cause_and_retries_on_r() {
+        let (mut it, ensure) = with_ensure(iface());
+        ensure.refuse(Some("git merge-base failed"));
+        let t0 = Instant::now();
+        it.show_diff_at(t0);
+        settle_ensure(&mut it, t0);
+
+        let load = |it: &ReviewInterface, at| it.diff_load.as_ref().unwrap().view(at);
+        let almost = t0 + DIFF_LOAD_TIMEOUT - Duration::from_millis(1);
+        it.drive_diff(almost);
+        settle_ensure(&mut it, almost);
+        assert_eq!(load(&it, almost), DiffLoadView::Loading, "no error before the timeout");
+
+        let up = t0 + DIFF_LOAD_TIMEOUT;
+        it.drive_diff(up);
+        assert_eq!(load(&it, up), DiffLoadView::Failed { cause: "git merge-base failed".into() });
+        assert_eq!(it.panel.status_line, "", "the cause is in the view");
+        assert!(it.diff_active, "and it didn't fall back");
+        let asks = ensure.asks();
+
+        // `r` starts it over. (On the real clock, so it reads the view that way.)
+        ensure.refuse(None);
+        it.diff_load = Some({
+            let mut l = DiffLoad::start(Instant::now() - DIFF_LOAD_TIMEOUT);
+            l.ensure_answered(Err("git merge-base failed".into()), Instant::now());
+            l
+        });
+        it.diff_answer = None;
+        let drawn = render_main(&mut it);
+        assert!(drawn.contains(DIFF_FAILED_TITLE), "{drawn}");
+        assert!(drawn.contains("git merge-base failed"), "{drawn}");
+        assert!(drawn.contains(DIFF_RETRY_LABEL), "{drawn}");
+        assert_eq!(it.handle_key(key(KeyCode::Char('r'))), ReviewAction::None);
+        settle_ensure(&mut it, Instant::now());
+        assert_eq!(ensure.asks(), asks + 1);
+        assert!(it.diff_load.as_ref().unwrap().needs_attach() || it.diff_load.as_ref().unwrap().is_attached());
+    }
+
+    #[test]
+    fn clicking_retry_starts_the_wait_over() {
+        let (mut it, ensure) = with_ensure(iface());
+        it.diff_active = true;
+        it.diff_load = Some({
+            let mut l = DiffLoad::start(Instant::now() - DIFF_LOAD_TIMEOUT);
+            l.ensure_answered(Err("nope".into()), Instant::now());
+            l
+        });
+        let _ = render_main(&mut it);
+        let at = it.retry_rect.expect("the Retry is drawn");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: at.x + 1,
+            row: at.y,
+            modifiers: KeyModifiers::empty(),
+        };
+        it.handle_mouse(click, Rect::new(0, 0, 28, 20), Rect::new(28, 0, 72, 20));
+        settle_ensure(&mut it, Instant::now());
+        assert_eq!(ensure.asks(), 1);
+    }
+
+    #[test]
+    fn switching_away_and_back_mid_load_adds_no_ensure() {
+        let (mut it, ensure) = with_ensure(iface());
+        ensure.refuse(Some("not yet"));
+        let t0 = Instant::now();
+        it.show_diff_at(t0);
+        it.show_chat();
+        it.show_diff_at(t0);
+        settle_ensure(&mut it, t0);
+        assert_eq!(ensure.asks(), 1, "the one in flight serves the wait");
+
+        // During the backoff too.
+        it.show_chat();
+        it.show_diff_at(t0);
+        settle_ensure(&mut it, t0);
+        assert_eq!(ensure.asks(), 1);
+    }
+
+    #[test]
+    fn a_stale_editor_answer_doesnt_take_the_pane_from_view_diff() {
+        let (mut it, _ensure) = with_ensure(iface());
+        it.show_diff_at(Instant::now());
+        it.editor_ready(Ok(()));
+        assert!(it.diff_active);
+        it.editor_ready(Err("no".into()));
+        assert!(it.diff_active);
+        assert_eq!(it.panel.status_line, "open view failed: no");
+    }
+
+    #[test]
+    fn keys_and_focus_dont_reach_a_terminal_behind_the_wait() {
+        let (mut it, ensure) = with_ensure(iface());
+        ensure.refuse(Some("not yet"));
+        it.diff_active = true;
+        it.diff_load = Some(DiffLoad::start(Instant::now() - SECOND));
+        assert!(it.diff_covered());
+        it.focus_content();
+        assert!(!it.content_focused());
+    }
+
+    #[test]
+    fn wrap_words_breaks_at_spaces_and_cuts_a_long_word() {
+        assert_eq!(wrap_words("one two three", 7), vec!["one two", "three"]);
+        assert_eq!(wrap_words("abcdefghij kl", 4), vec!["abcd", "efgh", "ij", "kl"]);
+        assert!(wrap_words("   ", 4).is_empty());
     }
 
     fn iface() -> ReviewInterface {

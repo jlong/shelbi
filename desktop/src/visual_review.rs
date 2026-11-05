@@ -26,6 +26,7 @@
 //!   `dialog-reject.png`, `dialog-zen.png` and
 //!   `dialog-error-log.png`.
 
+use shelbi_app::review::diff_load::DiffLoad;
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -376,6 +377,21 @@ impl Run {
         let active = self.view().read_with(&self.cx, |v, _| v.panel().map(|p| p.active()));
         self.expect("View Diff shows the diff session", active == Some(ActiveView::Diff));
         self.save("review-diff.png");
+
+        // View Diff waiting for its diff, then giving up: over a pane with
+        // something on it (the Reviewer's screen), which the words must hide.
+        self.update(|v, cx| v.apply(PanelEffect::ShowChat, cx));
+        let at = Instant::now();
+        let waiting = DiffLoad::start(at - Duration::from_secs(2));
+        self.update(|v, cx| v.offscreen_diff_wait(waiting, cx));
+        self.save("review-diff-loading.png");
+        let mut failed = DiffLoad::start(at - Duration::from_secs(20));
+        failed.ensure_answered(
+            Err("the review worktree at /Users/me/code/demo/.shelbi/wt/review-1 isn't checked out yet".into()),
+            at,
+        );
+        self.update(|v, cx| v.offscreen_diff_wait(failed, cx));
+        self.save("review-diff-failed.png");
         self.update(|v, cx| v.apply(PanelEffect::ShowChat, cx));
 
         // Still loading.

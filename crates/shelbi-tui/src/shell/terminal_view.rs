@@ -80,6 +80,11 @@ impl TerminalPane {
         self.session_size
     }
 
+    /// Whether the session has put anything on the terminal yet.
+    pub fn has_drawn(&self) -> bool {
+        self.view.emulator().has_content()
+    }
+
     /// True while the view is scrolled up into scrollback (or searching), i.e.
     /// Shelbi — not the agent — owns navigation keys.
     pub fn in_scrollback(&self) -> bool {
