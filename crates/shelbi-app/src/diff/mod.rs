@@ -21,6 +21,8 @@
 //! - [`help`] is the `?` overlay's contents, from the live keymap.
 //! - [`revert`] puts a file or a hunk back in a workspace's worktree, without
 //!   touching a commit.
+//! - [`pr`] is the task's pull request: the description block, checks, GitHub's
+//!   review threads, and what goes back through `gh`.
 //! - [`state`] is the state machine ([`DiffState`]): the cursor, the modes,
 //!   what each action does. [`session`] runs it with the worker threads
 //!   ([`DiffSession`]): this is what a client holds.
@@ -40,6 +42,7 @@ pub mod intraline;
 pub mod model;
 pub mod palette;
 pub mod parse;
+pub mod pr;
 pub mod revert;
 pub mod rows;
 pub mod search;
@@ -52,6 +55,7 @@ pub use backend::{
     DiffTarget, FarBackend, HostBackend, TargetKind,
 };
 pub use model::{Changeset, CommitInfo, CommitScope, DiffLine, Eol, FileDiff, FileStatus, Hunk, LineKind, Side};
+pub use pr::{PrPart, PrSpan, PrTone, PrWrite, ReviewEvent};
 pub use rows::{Folds, HunkFilter, NoticeKind, Row, RowTable, ThreadPart, ViewMode};
 pub use session::{DiffOptions, DiffSession, Wake, WORKSPACE_WATCH};
 pub use shelbi_state::keymap::DiffAction;

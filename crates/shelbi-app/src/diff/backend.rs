@@ -5,6 +5,8 @@
 //! - [`HostBackend`]: a project on this machine. Git runs here, or over SSH
 //!   for a workspace on another machine (the worktree's [`Host`]). Comments
 //!   and viewed marks are in this machine's state directory.
+//!   The task's pull request comes through `gh` on this machine, whichever
+//!   machine the worktree is on.
 //! - [`FarBackend`]: a window on a project on another machine. Each call is a
 //!   control request ([`crate::far::Request::Diff`]) to that machine's daemon,
 //!   which answers it with a [`HostBackend`] of its own ([`answer`]).
@@ -12,11 +14,12 @@
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use shelbi_core::Host;
+use shelbi_core::{Host, IssuePr};
 
 use super::comments::{CommentDoc, CommentOp};
 use super::git::{self, BlameLine, GitRunner, HostGit, RawChangeset};
 use super::model::CommitScope;
+use super::pr::{NoPr, PrDetails, PrSource, PrWrite, ProjectGh, TaskPr};
 use super::revert::{self, RevertPlan, RevertSpec};
 use super::store::{DiffStore, ViewedDoc, ViewedOp};
 use crate::source::ProjectLink;
@@ -86,6 +89,12 @@ pub trait DiffBackend: Send + Sync {
     fn plan_revert(&self, spec: &RevertSpec) -> Result<RevertPlan, String>;
     /// Carry out a checked revert, answering what the status bar says.
     fn revert(&self, plan: &RevertPlan) -> Result<String, String>;
+    /// The task's pull request, if it has one.
+    fn pr_lookup(&self) -> Result<Option<IssuePr>, String>;
+    /// All about that pull request, from GitHub.
+    fn pr_details(&self, pr: &IssuePr) -> Result<PrDetails, String>;
+    /// Change something on it, answering what the status bar says.
+    fn pr_write(&self, pr: &IssuePr, change: &PrWrite) -> Result<String, String>;
 }
 
 /// A target's data on this machine, or on a worktree this machine reaches
@@ -96,6 +105,7 @@ pub struct HostBackend {
     pub git: Arc<dyn GitRunner>,
     pub store: DiffStore,
     pub agent: AgentSend,
+    pub pr: Arc<dyn PrSource>,
 }
 
 impl HostBackend {
@@ -110,14 +120,21 @@ impl HostBackend {
             .machine(&spec.machine)
             .ok_or_else(|| format!("`{}` isn't a machine in `{}`", spec.machine, target.project))?;
         let worktree = shelbi_core::pool::workspace_worktree(machine, spec);
+        let git: Arc<dyn GitRunner> = Arc::new(HostGit {
+            host: machine.host(),
+            worktree: worktree.to_string_lossy().into_owned(),
+        });
         Ok(HostBackend {
             target: target.clone(),
             agent,
             base_branch: project.base_branch().to_string(),
-            git: Arc::new(HostGit {
-                host: machine.host(),
-                worktree: worktree.to_string_lossy().into_owned(),
+            pr: Arc::new(TaskPr {
+                project: target.project.clone(),
+                task: target.task.clone(),
+                gh: Arc::new(ProjectGh { project: target.project.clone() }),
+                git: git.clone(),
             }),
+            git,
             store: DiffStore::for_project(&target.project, &target.state_key())?,
         })
     }
@@ -138,7 +155,14 @@ impl HostBackend {
             base_branch: base_branch.into(),
             git: Arc::new(HostGit { host, worktree: worktree.into() }),
             store,
+            pr: Arc::new(NoPr),
         }
+    }
+
+    /// With this pull request, for a test or a fixture.
+    pub fn with_pr(mut self, pr: Arc<dyn PrSource>) -> HostBackend {
+        self.pr = pr;
+        self
     }
 }
 
@@ -178,6 +202,18 @@ impl DiffBackend for HostBackend {
     fn revert(&self, plan: &RevertPlan) -> Result<String, String> {
         revert::run(&*self.git, self.target.kind, &self.base_branch, plan)
     }
+
+    fn pr_lookup(&self) -> Result<Option<IssuePr>, String> {
+        self.pr.lookup()
+    }
+
+    fn pr_details(&self, pr: &IssuePr) -> Result<PrDetails, String> {
+        self.pr.details(pr)
+    }
+
+    fn pr_write(&self, pr: &IssuePr, change: &PrWrite) -> Result<String, String> {
+        self.pr.write(pr, change)
+    }
 }
 
 /// The most a far daemon sends of a changeset. The control socket's frame
@@ -205,6 +241,9 @@ pub enum DiffOp {
     SendToAgent(String),
     PlanRevert(RevertSpec),
     Revert(RevertPlan),
+    PrLookup,
+    PrDetails(IssuePr),
+    PrWrite(IssuePr, PrWrite),
 }
 
 /// A far daemon's answer to a [`DiffRequest`].
@@ -218,6 +257,9 @@ pub enum DiffReply {
     Sent(Result<AgentDelivery, String>),
     RevertPlanned(Result<RevertPlan, String>),
     Reverted(Result<String, String>),
+    PrLookup(Result<Option<IssuePr>, String>),
+    PrDetails(Box<Result<PrDetails, String>>),
+    PrWritten(Result<String, String>),
 }
 
 /// Answer a [`DiffRequest`] on the machine the project lives on. A task's
@@ -284,6 +326,15 @@ pub fn answer_with(backend: Result<&HostBackend, String>, op: &DiffOp) -> DiffRe
         DiffOp::Revert(plan) => run(
             &|b| DiffReply::Reverted(b.revert(plan)),
             &|e| DiffReply::Reverted(Err(e)),
+        ),
+        DiffOp::PrLookup => run(&|b| DiffReply::PrLookup(b.pr_lookup()), &|e| DiffReply::PrLookup(Err(e))),
+        DiffOp::PrDetails(pr) => run(
+            &|b| DiffReply::PrDetails(Box::new(b.pr_details(pr))),
+            &|e| DiffReply::PrDetails(Box::new(Err(e))),
+        ),
+        DiffOp::PrWrite(pr, change) => run(
+            &|b| DiffReply::PrWritten(b.pr_write(pr, change)),
+            &|e| DiffReply::PrWritten(Err(e)),
         ),
     }
 }
@@ -369,6 +420,27 @@ impl DiffBackend for FarBackend {
     fn revert(&self, plan: &RevertPlan) -> Result<String, String> {
         match self.ask(DiffOp::Revert(plan.clone()))? {
             DiffReply::Reverted(result) => result,
+            other => Err(wrong(other)),
+        }
+    }
+
+    fn pr_lookup(&self) -> Result<Option<IssuePr>, String> {
+        match self.ask(DiffOp::PrLookup)? {
+            DiffReply::PrLookup(result) => result,
+            other => Err(wrong(other)),
+        }
+    }
+
+    fn pr_details(&self, pr: &IssuePr) -> Result<PrDetails, String> {
+        match self.ask(DiffOp::PrDetails(pr.clone()))? {
+            DiffReply::PrDetails(result) => *result,
+            other => Err(wrong(other)),
+        }
+    }
+
+    fn pr_write(&self, pr: &IssuePr, change: &PrWrite) -> Result<String, String> {
+        match self.ask(DiffOp::PrWrite(pr.clone(), change.clone()))? {
+            DiffReply::PrWritten(result) => result,
             other => Err(wrong(other)),
         }
     }

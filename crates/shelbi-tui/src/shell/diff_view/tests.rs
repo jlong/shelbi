@@ -1019,3 +1019,246 @@ fn a_review_offers_no_revert() {
     assert!(!matches!(v.session().state().mode(), Mode::Confirm(_)));
     assert!(v.session().state().flash().unwrap().contains("checkout of the branch"));
 }
+
+// ---- The pull request ------------------------------------------------------
+
+mod pr {
+    use std::sync::Arc;
+
+    use shelbi_app::diff::model::Side;
+    use shelbi_app::diff::pr::{
+        CheckState, PrCheck, PrDetails, PrReview, PrThread, PrThreadComment, PrWrite, ReviewState,
+    };
+    use shelbi_app::diff::{DiffEffect, Mode, PrPart, Row};
+    use shelbi_core::{IssuePr, PrState};
+
+    use super::*;
+
+    fn said(author: &str, body: &str) -> PrThreadComment {
+        PrThreadComment {
+            id: format!("c-{author}"),
+            author: author.into(),
+            body: body.into(),
+            created_at: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+            pending: false,
+        }
+    }
+
+    fn pull() -> PrDetails {
+        PrDetails {
+            number: 2155,
+            title: "Record a task's PR".into(),
+            url: "https://github.com/jlong/shelbi/pull/2155".into(),
+            body: "Why it matters.".into(),
+            author: "jlong".into(),
+            head: "jlong/task-pr".into(),
+            base: "main".into(),
+            state: PrState::Open,
+            draft: false,
+            reviews: vec![
+                PrReview { author: "alice".into(), state: ReviewState::Approved, body: "Reads well.".into() },
+                PrReview { author: "bob".into(), state: ReviewState::ChangesRequested, body: String::new() },
+            ],
+            checks: vec![
+                PrCheck { name: "build".into(), state: CheckState::Passed, detail: "success".into() },
+                PrCheck { name: "lint".into(), state: CheckState::Failed, detail: "failure".into() },
+            ],
+            threads: vec![PrThread {
+                id: "T1".into(),
+                path: "crates/app/src/review.rs".into(),
+                side: Side::New,
+                line: Some(121),
+                original_line: Some(121),
+                start_line: None,
+                code: Some("        self.running.insert(id);".into()),
+                resolved: false,
+                outdated: false,
+                file_level: false,
+                comments: vec![said("bob", "this leaks on early return"), said("jlong", "fixed in 3f2a1c")],
+            }],
+            threads_cut: false,
+        }
+    }
+
+    fn with_pr() -> DiffState {
+        let mut s = state();
+        s.set_pr_lookup(Ok(Some(IssuePr::new(2155, None))));
+        s.set_pr_details(Ok(Arc::new(pull())));
+        s
+    }
+
+    fn found(screen: &[String], needle: &str) -> usize {
+        screen
+            .iter()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle:?} in\n{}", screen.join("\n")))
+    }
+
+    #[test]
+    fn the_block_is_drawn_above_the_first_file() {
+        let mut s = with_pr();
+        let screen = screen(&mut s, 150, 20);
+        let (title, status) = (found(&screen, "▾ #2155 Record a task's PR  jlong · jlong/task-pr → main"), found(&screen, "✓ approved by alice"));
+        assert_eq!(status, title + 1);
+        assert!(screen[status].contains("✗ changes requested by bob · checks ✓1 ✗1 (lint) · 1 thread open"), "{}", screen[status]);
+        assert!(found(&screen, "Why it matters.") > status);
+        assert!(found(&screen, "▾ crates/app/src/review.rs") > found(&screen, "Why it matters."));
+    }
+
+    #[test]
+    fn a_thread_is_drawn_at_its_line_with_its_tag_at_the_end() {
+        let mut s = with_pr();
+        let screen = screen(&mut s, 150, 24);
+        let code = found(&screen, "self.running.insert(id);");
+        let head = found(&screen, "┃ ⎇ bob (GitHub): this leaks on early return");
+        assert_eq!(head, code + 1);
+        assert!(screen[head].trim_end_matches(['│', ' ']).ends_with("[unresolved]"), "{}", screen[head]);
+        assert_eq!(found(&screen, "┃   ↳ jlong: fixed in 3f2a1c"), head + 1);
+    }
+
+    #[test]
+    fn a_narrow_row_keeps_the_tag_over_the_words() {
+        let mut s = with_pr();
+        s.set_file_list(false);
+        let screen = screen(&mut s, 40, 24);
+        let head = found(&screen, "⎇ bob");
+        assert!(screen[head].contains("[unresolved]"), "{}", screen[head]);
+    }
+
+    #[test]
+    fn colors_follow_the_tone_in_a_256_color_terminal_too() {
+        for truecolor in [true, false] {
+            let mut s = with_pr();
+            let colors = Colors::new(truecolor);
+            let buf = draw(&mut s, 150, 20, truecolor);
+            let screen = lines(&buf);
+            let y = found(&screen, "✓ approved by alice") as u16;
+            let x = screen[y as usize].find('✓').map(|b| screen[y as usize][..b].chars().count()).unwrap() as u16;
+            assert_eq!(buf[(x, y)].fg, colors.add_fg, "truecolor {truecolor}");
+            assert_ne!(buf[(x, y)].fg, colors.del_fg);
+        }
+    }
+
+    #[test]
+    fn offline_the_block_says_why_and_the_diff_still_draws() {
+        let mut s = state();
+        s.set_pr_lookup(Ok(Some(IssuePr::new(2155, None))));
+        s.set_pr_details(Err("Can't reach GitHub".to_string()));
+        let screen = screen(&mut s, 120, 20);
+        found(&screen, "▾ #2155");
+        found(&screen, "PR details aren't here: Can't reach GitHub");
+        found(&screen, "fn begin(&mut self, id: &str) {");
+    }
+
+    #[test]
+    fn no_pr_draws_no_block() {
+        let mut s = state();
+        s.set_pr_lookup(Ok(None));
+        let screen = screen(&mut s, 120, 20);
+        assert!(!screen.join("\n").contains("PR details"));
+        assert!(screen[1].contains("▾ crates/app/src/review.rs"), "{}", screen[1]);
+    }
+
+    #[test]
+    fn the_panel_lists_every_check_and_review() {
+        let mut s = with_pr();
+        press(&mut s, "i");
+        assert!(matches!(s.mode(), Mode::PrInfo { .. }));
+        let screen = screen(&mut s, 100, 30);
+        found(&screen, "Pull request");
+        found(&screen, "✗ lint  failure");
+        found(&screen, "✓ build  success");
+        found(&screen, "✓ alice approved: Reads well.");
+        found(&screen, "✗ bob requested changes");
+        found(&screen, "r read again");
+    }
+
+    #[test]
+    fn the_review_editor_shows_its_verdict() {
+        let mut s = with_pr();
+        press(&mut s, "shift-r tab");
+        let screen = screen(&mut s, 120, 24);
+        found(&screen, "Submit review: Comment [Approve] Request changes");
+        found(&screen, "Tab verdict");
+    }
+
+    #[test]
+    fn a_github_comment_and_reply_say_where_they_go() {
+        let mut s = with_pr();
+        press(&mut s, "shift-c");
+        let row = s.table().rows.iter().position(|r| matches!(r, Row::Line { .. })).unwrap();
+        s.click_row(row);
+        press(&mut s, "enter");
+        found(&screen(&mut s, 120, 24), "GitHub comment on crates/app/src/review.rs:120");
+        press(&mut s, "esc esc");
+        let thread = s.table().rows.iter().position(|r| matches!(r, Row::Thread { .. })).unwrap();
+        s.click_row(thread);
+        press(&mut s, "enter");
+        found(&screen(&mut s, 120, 24), "Reply on GitHub");
+    }
+
+    /// A view over [`with_pr`]'s state: the session has no backend, so what it
+    /// would send stays unsent, and only the state is under test.
+    fn view_with_pr() -> DiffView {
+        let mut v = view();
+        v.session().state_mut().set_pr_lookup(Ok(Some(IssuePr::new(2155, None))));
+        v.session().state_mut().set_pr_details(Ok(Arc::new(pull())));
+        v
+    }
+
+    #[test]
+    fn the_keys_reach_the_pr_from_a_real_key_event() {
+        let mut v = view_with_pr();
+        let row = v.session().state().table().rows.iter().position(|r| matches!(r, Row::Thread { .. })).unwrap();
+        v.session().state_mut().click_row(row);
+        assert!(v.claims(&ch('x')));
+        assert_eq!(v.key(ch('x')), DiffOut::None);
+        assert_eq!(v.session().state().flash(), Some("Resolving the thread…"));
+        // A terminal sends these bare, with Shift or without.
+        v.key(ch('C'));
+        assert!(v.session().state().comment_on_github());
+        v.key(ch('R'));
+        assert_eq!(v.session().state().mode().label(), "COMMENT");
+        v.key(key(KeyCode::Esc, KeyModifiers::NONE));
+        v.key(key(KeyCode::Esc, KeyModifiers::NONE));
+        v.key(ch('i'));
+        assert_eq!(v.session().state().mode().label(), "PR INFO");
+        v.key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(v.session().state().mode().label(), "NORMAL", "Esc closes the panel, it doesn't leave the view");
+    }
+
+    #[test]
+    fn a_click_on_the_chevron_folds_the_block_and_one_on_its_words_doesnt() {
+        let mut v = view_with_pr();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 120, 30));
+        v.render(&mut buf, Rect::new(0, 0, 120, 30), true, true);
+        let at = v.last.unwrap();
+        let click = |column: u16, row: u16| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(v.session().state().table().rows[0], Row::Pr { part: PrPart::Title });
+        v.mouse(click(at.rows.x + 8, at.rows.y));
+        assert!(!v.session().state().pr().folded);
+        v.mouse(click(at.rows.x, at.rows.y));
+        assert!(v.session().state().pr().folded);
+    }
+
+    #[test]
+    fn a_refusal_while_typing_elsewhere_reaches_the_clipboard_through_poll() {
+        static COPIED: Mutex<String> = Mutex::new(String::new());
+        let mut v = view_with_pr();
+        v.set_clipboard(|text| *COPIED.lock().unwrap() = text.to_string());
+        v.key(ch('/'));
+        let effects = v.session().state_mut().pr_written(
+            PrWrite::Reply { thread: "T1".into(), body: "my words".into() },
+            Err("no".to_string()),
+        );
+        assert_eq!(effects, [DiffEffect::Yank("my words".into())]);
+        let leftover = v.session().carry_out(effects);
+        v.carry_out(leftover);
+        assert_eq!(*COPIED.lock().unwrap(), "my words");
+    }
+}

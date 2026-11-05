@@ -89,7 +89,7 @@ pub use issue_auth::{
 };
 pub use github_store::GitHubStore;
 pub use github_store::{
-    search_issues, IssueSearchError, IssueSearchPage, ISSUE_SEARCH_MAX_RESULTS,
+    gh_failure_reason, graphql_read, graphql_write, search_issues, IssueSearchError, IssueSearchPage, ISSUE_SEARCH_MAX_RESULTS,
     ISSUE_SEARCH_PAGE_SIZE,
 };
 #[cfg(any(test, feature = "test-support"))]

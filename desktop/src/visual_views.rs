@@ -477,6 +477,34 @@ pub fn run(out: PathBuf) -> ! {
     live.update(&mut cx, |d, _| d.set_visible(false));
     drop(live);
     drop(diff);
+    // ---- The task's pull request in the diff ----
+    let pr_deps = DiffDeps::canned_with(
+        crate::views::diff_view::canned::SAMPLE_PATCH,
+        Some(Ok(crate::views::diff_view::canned::sample_pr())),
+        Default::default(),
+    );
+    let (pr_view, window) = open(&mut cx, |cx| {
+        cx.new(|cx| DiffView::new(target(TargetKind::Review), place.clone(), &pr_deps, cx))
+    });
+    let read = wait(&mut cx, window, Duration::from_secs(10), |cx| {
+        pr_view.update(cx, |d, cx| d.poll_now(cx));
+        pr_view.read_with(cx, |d, _| d.state().pr().details.is_some() && !d.state().loading())
+    });
+    expect("diff: the pull request's block and threads arrive", read);
+    save(&mut cx, window, &out, "diff-pr.png");
+    let press = |cx: &mut VisualTestAppContext, spec: &str| {
+        let chord = shelbi_state::keymap::KeyChord::parse(spec).expect("a key");
+        pr_view.update(cx, |d, cx| d.key(chord, cx));
+    };
+    press(&mut cx, "i");
+    save(&mut cx, window, &out, "diff-pr-info.png");
+    press(&mut cx, "esc");
+    press(&mut cx, "shift-r");
+    press(&mut cx, "tab");
+    save(&mut cx, window, &out, "diff-pr-review.png");
+    press(&mut cx, "esc");
+    press(&mut cx, "esc");
+    drop(pr_view);
 
     let (_, window) = open(&mut cx, |cx| {
         cx.new(|_| Screen(Box::new(|theme, _| {

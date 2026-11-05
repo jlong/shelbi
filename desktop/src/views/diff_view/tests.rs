@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowAppearance};
-use shelbi_app::diff::{HunkFilter, TargetKind, ViewMode};
+use shelbi_app::diff::{HunkFilter, TargetKind, ThreadPart, ViewMode};
 use shelbi_app::theme::ThemePreference;
 
 use super::canned::{Opened, SAMPLE_PATCH};
@@ -670,4 +670,163 @@ fn revert_asks_on_the_status_line_and_a_review_has_none(cx: &mut TestAppContext)
     review.keys("?");
     assert!(!review.drawn("diff-help-RevertFile"), "a review doesn't list it");
     assert!(review.drawn("diff-help-SendToReviewer"));
+}
+
+// ---- The pull request ------------------------------------------------------
+
+fn open_pr(cx: &mut TestAppContext, pr: Result<shelbi_app::diff::pr::PrDetails, String>) -> Harness {
+    cx.update(|cx| {
+        cx.set_global(Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark));
+        gpui_kit::init(cx);
+    });
+    let opened: Opened = Arc::default();
+    let deps = DiffDeps::canned_with(SAMPLE_PATCH, Some(pr), opened.clone());
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| {
+            let view = cx.new(|cx| DiffView::new(target(), FilePlace::Local("/wt".into()), &deps, cx));
+            cx.new(|_| Host { view })
+        })
+        .unwrap()
+    });
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    let view = window.root(&mut vcx).unwrap().read_with(&vcx, |h, _| h.view.clone());
+    vcx.update(|window, cx| {
+        let handle = view.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    let mut h = Harness { view, cx: vcx, opened };
+    h.wait(|s| !s.loading() && (s.pr().details.is_some() || s.pr().why.is_some()));
+    h.draw();
+    h
+}
+
+fn pr_text(h: &Harness, part: shelbi_app::diff::PrPart) -> String {
+    h.read(|v| v.state().pr_row(part).iter().map(|s| s.text.clone()).collect())
+}
+
+fn to_thread(h: &mut Harness) {
+    let row = h
+        .read(|v| v.state().table().rows.iter().position(|r| matches!(r, Row::Thread { .. })))
+        .expect("a thread's row");
+    h.cx.update(|_, cx| h.view.update(cx, |v, cx| {
+        v.session.state_mut().click_row(row);
+        cx.notify();
+    }));
+    h.draw();
+}
+
+#[gpui::test]
+fn the_block_and_the_thread_are_rows_of_the_diff(cx: &mut TestAppContext) {
+    use shelbi_app::diff::PrPart;
+    let mut h = open_pr(cx, Ok(super::canned::sample_pr()));
+    let rows = h.read(|v| v.state().table().rows.clone());
+    assert_eq!(rows[0], Row::Pr { part: PrPart::Title });
+    assert_eq!(h.cursor(), 0, "the block is what a new view opens on");
+    assert_eq!(
+        pr_text(&h, PrPart::Title),
+        "▾ #2155 Record a task's PR  jlong · jlong/task-pr-metadata → main"
+    );
+    assert_eq!(
+        pr_text(&h, PrPart::Status),
+        "✓ approved by alice · ✗ changes requested by bob · checks ✓1 ✗1 ●1 (lint) · 1 thread open"
+    );
+    let head = rows.iter().position(|r| matches!(r, Row::Thread { part: ThreadPart::Head, .. })).unwrap();
+    let Row::Line { file, hunk, line } = rows[head - 1] else { panic!("{:?}", rows[head - 1]) };
+    assert!(h.read(|v| v.state().line(file, hunk, line).unwrap().text.contains("self.running.insert")));
+    let Row::Thread { thread, .. } = rows[head] else { panic!() };
+    assert_eq!(h.read(|v| v.state().thread_tag(thread).unwrap().0), "[unresolved]");
+    // Painting them is the custom element's: it has to get through a frame.
+    h.keys("shift-g");
+    assert!(h.drawn("diff-body"));
+}
+
+#[gpui::test]
+fn o_and_the_chevron_fold_the_block(cx: &mut TestAppContext) {
+    use shelbi_app::diff::PrPart;
+    let mut h = open_pr(cx, Ok(super::canned::sample_pr()));
+    h.keys("o");
+    assert!(h.read(|v| v.state().pr().folded));
+    assert!(matches!(h.read(|v| v.state().table().rows[2]), Row::File { .. }));
+    h.keys("o");
+    assert_eq!(h.read(|v| v.state().table().rows[2]), Row::Pr { part: PrPart::Gap });
+    let body = h.cx.debug_bounds("diff-body").expect("the body").origin;
+    h.cx.simulate_click(body + gpui::point(gpui::px(4.0), gpui::px(4.0)), Modifiers::none());
+    h.cx.run_until_parked();
+    assert!(h.read(|v| v.state().pr().folded), "the chevron");
+}
+
+#[gpui::test]
+fn i_shows_the_panel_and_esc_closes_it(cx: &mut TestAppContext) {
+    let mut h = open_pr(cx, Ok(super::canned::sample_pr()));
+    h.keys("i");
+    assert_eq!(h.mode(), "PR INFO");
+    assert!(h.drawn("diff-pr-info"));
+    assert!(h.drawn("diff-pr-info-row-0"));
+    h.keys("j");
+    h.keys("escape");
+    assert_eq!(h.mode(), "NORMAL");
+    assert!(!h.drawn("diff-pr-info"));
+}
+
+#[gpui::test]
+fn x_goes_to_github_and_says_what_came_back(cx: &mut TestAppContext) {
+    let mut h = open_pr(cx, Ok(super::canned::sample_pr()));
+    to_thread(&mut h);
+    h.keys("x");
+    h.wait(|s| s.flash() == Some("Done on GitHub"));
+}
+
+#[gpui::test]
+fn enter_replies_and_the_editor_says_where_it_goes(cx: &mut TestAppContext) {
+    let mut h = open_pr(cx, Ok(super::canned::sample_pr()));
+    to_thread(&mut h);
+    h.keys("enter");
+    assert_eq!(h.mode(), "COMMENT");
+    assert!(h.drawn("diff-draft"));
+    h.keys("h i enter");
+    assert_eq!(h.mode(), "NORMAL");
+    h.wait(|s| s.flash() == Some("Done on GitHub"));
+}
+
+#[gpui::test]
+fn r_and_c_write_through_gh_with_the_verdict_tab_picks(cx: &mut TestAppContext) {
+    use shelbi_app::diff::draft::DraftTarget;
+    use shelbi_app::diff::ReviewEvent;
+    let mut h = open_pr(cx, Ok(super::canned::sample_pr()));
+    h.keys("shift-c");
+    assert!(h.read(|v| v.state().comment_on_github()));
+    h.keys("shift-r");
+    assert_eq!(h.mode(), "COMMENT");
+    h.keys("tab");
+    let picked = h.read(|v| match v.state().mode() {
+        Mode::Comment(draft) => draft.target.clone(),
+        other => panic!("{other:?}"),
+    });
+    assert_eq!(picked, DraftTarget::Review { event: ReviewEvent::Approve });
+    assert!(h.drawn("diff-draft"));
+    h.keys("enter");
+    h.wait(|s| s.flash() == Some("Done on GitHub"));
+}
+
+#[gpui::test]
+fn github_silent_the_diff_still_opens_and_the_block_says_why(cx: &mut TestAppContext) {
+    use shelbi_app::diff::PrPart;
+    let mut h = open_pr(cx, Err("Can't reach GitHub".to_string()));
+    assert_eq!(h.read(|v| v.state().changeset().files.len()), 5);
+    assert_eq!(pr_text(&h, PrPart::Status), "PR details aren't here: Can't reach GitHub");
+    assert!(h.drawn("diff-body"));
+    h.keys("shift-r");
+    assert_eq!(h.mode(), "NORMAL");
+    assert_eq!(
+        h.read(|v| v.state().flash().map(str::to_string)).as_deref(),
+        Some("The pull request isn't here: Can't reach GitHub")
+    );
+}
+
+#[gpui::test]
+fn the_help_lists_the_pull_request_keys(cx: &mut TestAppContext) {
+    let mut h = open(cx);
+    h.keys("?");
+    assert!(h.drawn("diff-help-ToggleResolved"));
+    assert!(h.drawn("diff-help-PrInfo"));
 }

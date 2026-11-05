@@ -26,7 +26,9 @@ use ratatui::layout::Rect;
 use shelbi_app::diff::backend::backend_for;
 use shelbi_app::diff::comments::Author;
 use shelbi_app::diff::state::normalize_key;
-use shelbi_app::diff::{DiffAction, DiffEffect, DiffOptions, DiffSession, DiffTarget, Mode, TargetKind, WORKSPACE_WATCH};
+use shelbi_app::diff::{
+    DiffAction, DiffEffect, DiffOptions, DiffSession, DiffTarget, Mode, PrPart, Row, TargetKind, WORKSPACE_WATCH,
+};
 use shelbi_orchestrator::agent_send;
 use shelbi_state::keymap::{DisplayStyle, Key, KeyChord, Keymaps, Mods};
 
@@ -165,7 +167,10 @@ impl DiffView {
 
     /// Take in what the session's workers finished. Returns whether to redraw.
     pub fn poll(&mut self) -> bool {
-        self.session.poll()
+        let changed = self.session.poll();
+        let effects = self.session.take_effects();
+        self.carry_out(effects);
+        changed
     }
 
     /// Whether this view takes `k` ahead of the shell's global keys. Shelbi's
@@ -249,7 +254,8 @@ impl DiffView {
                 | DiffEffect::SaveViewed(_)
                 | DiffEffect::SendToAgent { .. }
                 | DiffEffect::PlanRevert(_)
-                | DiffEffect::Revert(_) => {}
+                | DiffEffect::Revert(_)
+                | DiffEffect::PrWrite(_) => {}
             }
         }
         out
@@ -288,8 +294,14 @@ impl DiffView {
                 } else if contains(at.files, m.column, m.row) {
                     self.click_file(at.files, m);
                 } else if contains(at.rows, m.column, m.row) {
-                    let top = self.session.state().top();
-                    self.session.state_mut().click_row(top + usize::from(m.row - at.rows.y));
+                    let row = self.session.state().top() + usize::from(m.row - at.rows.y);
+                    self.session.state_mut().click_row(row);
+                    // The description block's chevron folds it.
+                    let title = self.session.state().table().rows.get(row) == Some(&Row::Pr { part: PrPart::Title });
+                    if title && m.column < at.rows.x + 2 {
+                        let effects = self.session.action(DiffAction::ToggleThread);
+                        self.carry_out(effects);
+                    }
                 }
             }
             _ => {}
@@ -321,6 +333,8 @@ impl DiffView {
         }
         let at = layout(area, self.session.state().file_list_open());
         self.session.state_mut().set_viewport(usize::from(at.rows.height));
+        // The panel's frame and its margin.
+        self.session.state_mut().set_pr_info_height(usize::from(area.height.saturating_sub(4)));
         self.keep_file_in_view(&at);
         self.last = Some(at);
         let colors = Colors::new(truecolor);

@@ -18,8 +18,9 @@ use shelbi_app::diff::draft::{CommentDraft, DraftTarget};
 use shelbi_app::diff::help::help_sections;
 use shelbi_app::diff::highlight::{SyntaxClass, SyntaxSpan};
 use shelbi_app::diff::palette::{DiffPalette, PaletteMode};
+use shelbi_app::diff::pr::review_title;
 use shelbi_app::diff::{
-    DiffLine, DiffState, FileDiff, FileStatus, LineKind, Mode, Row, ThreadPart,
+    DiffLine, DiffState, FileDiff, FileStatus, LineKind, Mode, PrPart, PrSpan, PrTone, Row, ThreadPart,
 };
 use shelbi_state::keymap::{format_chord, DisplayStyle, GlobalAction, Keymaps};
 
@@ -123,6 +124,17 @@ impl Colors {
         }
     }
 
+    /// The color a pull request's words read in.
+    fn tone(&self, tone: PrTone) -> Color {
+        match tone {
+            PrTone::Normal | PrTone::Loud => self.fg,
+            PrTone::Muted => self.muted,
+            PrTone::Good => self.add_fg,
+            PrTone::Bad => self.del_fg,
+            PrTone::Pending => self.thread,
+        }
+    }
+
     /// A syntax class's color. `None` keeps the line's own.
     fn syntax(&self, class: SyntaxClass) -> Option<Color> {
         let p = palette();
@@ -167,6 +179,10 @@ pub(super) fn paint(p: &Paint<'_>, buf: &mut Buffer, area: Rect, at: &DiffLayout
     let overlay_cursor = match p.state.mode() {
         Mode::Help { scroll } => {
             paint_help(p, buf, area, *scroll);
+            None
+        }
+        Mode::PrInfo { scroll } => {
+            paint_pr_info(p, buf, area, *scroll);
             None
         }
         Mode::Palette(palette) => paint_palette(p, buf, area, palette),
@@ -378,6 +394,7 @@ fn paint_row(p: &Paint<'_>, buf: &mut Buffer, row: &Row, at: RowAt) {
         Row::Line { file, hunk, line } => paint_unified(p, buf, file, hunk, line, at),
         Row::Split { file, hunk, old, new } => paint_split(p, buf, file, hunk, old, new, at),
         Row::Thread { thread, part, .. } => paint_thread(p, buf, thread, part, at),
+        Row::Pr { part } => paint_pr_row(p, buf, part, at),
         Row::Notice { file, kind } => {
             let Some(f) = state.file(file) else { return };
             let base = row_base(p, None, at);
@@ -759,7 +776,47 @@ fn paint_thread(p: &Paint<'_>, buf: &mut Buffer, thread: u32, part: ThreadPart, 
         ThreadPart::Summary => base.fg(p.colors.muted),
         _ => base.fg(p.colors.fg),
     };
-    buf.set_stringn(x, at.area.y, text, width, style);
+    // A GitHub thread says where it stands at the end of its first row, ahead of
+    // the words when the row's too narrow for both.
+    let tag = (part == ThreadPart::Head).then(|| state.thread_tag(thread)).flatten();
+    let room = tag.map_or(width, |(tag, _)| width.saturating_sub(tag.width() + 1));
+    buf.set_stringn(x, at.area.y, text, room, style);
+    if let Some((tag, tone)) = tag {
+        let tag_x = at.area.right().saturating_sub(tag.width() as u16);
+        if tag_x >= x {
+            buf.set_string(tag_x, at.area.y, tag, base.fg(p.colors.tone(tone)));
+        }
+    }
+}
+
+/// A row of the pull request's description block.
+fn paint_pr_row(p: &Paint<'_>, buf: &mut Buffer, part: PrPart, at: RowAt) {
+    let base = if at.cursor || at.selected {
+        Style::default().bg(p.colors.selection)
+    } else if part == PrPart::Title {
+        Style::default().bg(p.colors.header)
+    } else {
+        Style::default()
+    };
+    buf.set_style(at.area, base);
+    paint_spans(p, buf, at.area, &p.state.pr_row(part), base);
+}
+
+/// `spans` from the left of `area`, each in its tone, cut at the edge.
+fn paint_spans(p: &Paint<'_>, buf: &mut Buffer, area: Rect, spans: &[PrSpan], base: Style) {
+    let mut x = area.x;
+    for span in spans {
+        let room = usize::from(area.right().saturating_sub(x));
+        if room == 0 {
+            return;
+        }
+        let mut style = base.fg(p.colors.tone(span.tone));
+        if span.tone == PrTone::Loud {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        buf.set_stringn(x, area.y, &span.text, room, style);
+        x = x.saturating_add(span.text.width() as u16);
+    }
 }
 
 // ---- The status line -------------------------------------------------------
@@ -867,6 +924,22 @@ fn paint_help(p: &Paint<'_>, buf: &mut Buffer, area: Rect, scroll: usize) {
     }
 }
 
+/// The `i` panel: every check and review on the pull request.
+fn paint_pr_info(p: &Paint<'_>, buf: &mut Buffer, area: Rect, scroll: usize) {
+    let rows = p.state.pr_info_rows();
+    let height = area.height.saturating_sub(2);
+    let foot = "j k scroll · r read again · i close";
+    let inner = dialog(p, buf, area, 80.min(area.width.saturating_sub(2)), height, "Pull request", foot);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let first = scroll.min(rows.len().saturating_sub(usize::from(inner.height)));
+    let bg = Style::default().bg(p.colors.dialog);
+    for (y, row) in (inner.y..inner.bottom()).zip(rows.iter().skip(first)) {
+        paint_spans(p, buf, Rect::new(inner.x, y, inner.width, 1), row, bg);
+    }
+}
+
 /// The file, command and commit palette. Returns where its cursor goes.
 fn paint_palette(p: &Paint<'_>, buf: &mut Buffer, area: Rect, palette: &DiffPalette) -> Option<(u16, u16)> {
     let items = palette.items(p.state.changeset());
@@ -918,11 +991,19 @@ fn paint_draft(p: &Paint<'_>, buf: &mut Buffer, rows: Rect, draft: &CommentDraft
         DraftTarget::New(anchor) => format!("Comment on {}:{}-{}", anchor.path, anchor.start, anchor.end),
         DraftTarget::Edit { .. } => "Edit comment".to_string(),
         DraftTarget::Reply { .. } => "Reply".to_string(),
+        DraftTarget::GithubNew(anchor) if anchor.start == anchor.end => {
+            format!("GitHub comment on {}:{}", anchor.path, anchor.start)
+        }
+        DraftTarget::GithubNew(anchor) => format!("GitHub comment on {}:{}-{}", anchor.path, anchor.start, anchor.end),
+        DraftTarget::GithubReply { .. } => "Reply on GitHub".to_string(),
+        DraftTarget::Review { event } => review_title(*event),
     };
-    let foot = if draft.inserting {
-        "Enter save · Ctrl-J new line · Esc motions"
-    } else {
-        "Enter save · i insert · Esc cancel"
+    let reviewing = matches!(draft.target, DraftTarget::Review { .. });
+    let foot = match (reviewing, draft.inserting) {
+        (true, true) => "Tab verdict · Enter submit · Ctrl-J new line · Esc motions",
+        (true, false) => "Tab verdict · Enter submit · i insert · Esc cancel",
+        (false, true) => "Enter save · Ctrl-J new line · Esc motions",
+        (false, false) => "Enter save · i insert · Esc cancel",
     };
     let inner = paint_box(p, buf, rect, &title, foot);
     let (row, col) = draft.area.cursor();

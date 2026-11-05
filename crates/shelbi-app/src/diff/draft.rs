@@ -6,6 +6,7 @@
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
 use super::comments::Anchor;
+use super::pr::ReviewEvent;
 use crate::text_area::TextArea;
 
 /// What saving a draft does.
@@ -17,6 +18,12 @@ pub enum DraftTarget {
     Edit { id: String, reply: Option<String> },
     /// A reply to a thread.
     Reply { id: String },
+    /// A new GitHub thread on these lines, in the viewer's pending review.
+    GithubNew(Anchor),
+    /// A reply to the GitHub thread with this id.
+    GithubReply { thread: String },
+    /// A review of the pull request. `Tab` changes the verdict.
+    Review { event: ReviewEvent },
 }
 
 /// What a key did.

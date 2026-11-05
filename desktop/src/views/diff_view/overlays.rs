@@ -5,7 +5,8 @@ use gpui::{div, prelude::*, px, AnyElement, Context, Div, Hsla, MouseButton, Sha
 use shelbi_app::diff::draft::{CommentDraft, DraftTarget};
 use shelbi_app::diff::help::help_sections;
 use shelbi_app::diff::palette::{DiffPalette, PaletteMode};
-use shelbi_app::diff::Mode;
+use shelbi_app::diff::pr::review_title;
+use shelbi_app::diff::{Mode, PrTone};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
 use super::{diff_keys, DiffView, STATUS_H};
@@ -24,7 +25,7 @@ const PALETTE_ROW_H: f32 = 30.0;
 const HELP_W: f32 = 880.0;
 const HELP_ROW_H: f32 = 22.0;
 /// The help's columns: its sections, in the shared order.
-const HELP_COLUMNS: [&[&str]; 3] = [&["Move"], &["Find", "View"], &["Fold", "Comment", "Revert", "Other"]];
+const HELP_COLUMNS: [&[&str]; 3] = [&["Move"], &["Find", "View"], &["Fold", "Comment", "Revert", "Pull request", "Other"]];
 
 /// A chord as the help and Skim's README spell it: `j`, `G`, `gg`, `zM`,
 /// `⌃d`, `Space`, `⇧Tab`.
@@ -162,11 +163,19 @@ impl DiffView {
             DraftTarget::New(anchor) => format!("Comment on {} lines {}–{}", anchor.path, anchor.start, anchor.end),
             DraftTarget::Edit { .. } => "Edit comment".to_string(),
             DraftTarget::Reply { .. } => "Reply".to_string(),
+            DraftTarget::GithubNew(anchor) if anchor.start == anchor.end => {
+                format!("GitHub comment on {} line {}", anchor.path, anchor.start)
+            }
+            DraftTarget::GithubNew(anchor) => format!("GitHub comment on {} lines {}–{}", anchor.path, anchor.start, anchor.end),
+            DraftTarget::GithubReply { .. } => "Reply on GitHub".to_string(),
+            DraftTarget::Review { event } => review_title(*event),
         };
-        let hint = if draft.inserting {
-            "↵ save · ⌃J new line · Esc motions"
-        } else {
-            "↵ save · i insert · Esc cancel"
+        let reviewing = matches!(draft.target, DraftTarget::Review { .. });
+        let hint = match (reviewing, draft.inserting) {
+            (true, true) => "Tab verdict · ↵ submit · ⌃J new line · Esc motions",
+            (true, false) => "Tab verdict · ↵ submit · i insert · Esc cancel",
+            (false, true) => "↵ save · ⌃J new line · Esc motions",
+            (false, false) => "↵ save · i insert · Esc cancel",
         };
         Some(
             div()
@@ -198,6 +207,7 @@ impl DiffView {
         match self.state().mode() {
             Mode::Palette(palette) => Some(self.render_palette(palette, theme, cx)),
             Mode::Help { scroll } => Some(self.render_help(*scroll, theme, window, cx)),
+            Mode::PrInfo { scroll } => Some(self.render_pr_info(*scroll, theme, window, cx)),
             _ => None,
         }
     }
@@ -294,6 +304,52 @@ impl DiffView {
         .into_any_element()
     }
 
+    /// The `i` panel: every check and review, a row at a time.
+    fn render_pr_info(&self, scroll: usize, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let rows = self.state().pr_info_rows();
+        let visible = pr_info_rows_fit(window);
+        let room = visible as f32 * HELP_ROW_H;
+        let first = scroll.min(rows.len().saturating_sub(visible));
+        let shown = rows.into_iter().enumerate().skip(first).take(visible).map(|(index, row)| {
+            let spans = row.into_iter().map(|span| {
+                let color = pr_tone_color(span.tone, theme);
+                div().flex_none().text_color(color).child(span.text)
+            });
+            div()
+                .debug_selector(move || format!("diff-pr-info-row-{index}"))
+                .flex()
+                .flex_row()
+                .items_center()
+                .h(px(HELP_ROW_H))
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .children(spans)
+        });
+        centered(
+            style::popover(div(), theme)
+                .debug_selector(|| "diff-pr-info".into())
+                .flex()
+                .flex_col()
+                .w(px(PALETTE_W))
+                .max_w_full()
+                .px(px(16.0))
+                .py(px(14.0))
+                .gap(px(10.0))
+                .type_style(Type::XSmall)
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .justify_between()
+                        .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child("Pull request"))
+                        .child(div().text_color(theme.muted).child("j / k scroll · r read again · i close")),
+                )
+                .child(div().flex().flex_col().max_h(px(room)).overflow_hidden().children(shown)),
+            cx,
+        )
+        .into_any_element()
+    }
+
     fn render_help(&self, scroll: usize, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let keys = diff_keys(cx);
         let sections = help_sections(&keys, self.state().kind(), help_spelling);
@@ -384,6 +440,24 @@ impl DiffView {
             cx,
         )
         .into_any_element()
+    }
+}
+
+/// How many rows the `i` panel has room for under its title.
+pub(super) fn pr_info_rows_fit(window: &Window) -> usize {
+    let room = (f32::from(window.viewport_size().height) - OVERLAY_TOP * 2.0 - 80.0).max(HELP_ROW_H);
+    (room / HELP_ROW_H) as usize
+}
+
+/// The color a pull request's words read in, over a popover.
+fn pr_tone_color(tone: PrTone, theme: &Theme) -> Hsla {
+    match tone {
+        PrTone::Normal => theme.foreground,
+        PrTone::Loud => theme.text_loud,
+        PrTone::Muted => theme.muted,
+        PrTone::Good => theme.success,
+        PrTone::Bad => theme.error,
+        PrTone::Pending => theme.warning,
     }
 }
 

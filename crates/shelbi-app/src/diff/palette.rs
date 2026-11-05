@@ -62,6 +62,10 @@ const COMMANDS: &[DiffAction] = &[
     DiffAction::RevertHunk,
     DiffAction::RevertFile,
     DiffAction::ClearComments,
+    DiffAction::PrInfo,
+    DiffAction::SubmitReview,
+    DiffAction::ToggleCommentTarget,
+    DiffAction::ToggleResolved,
     DiffAction::OpenInEditor,
     DiffAction::Help,
 ];

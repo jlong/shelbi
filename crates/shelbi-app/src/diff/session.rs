@@ -16,8 +16,12 @@
 //!   [`REVIEW_STATE_WATCH`], so an agent's reply from the CLI shows by itself.
 //! - A **job** runs what can take a while and has to be answered: a message to
 //!   the agent (which waits to see it submitted), a revert's check and write.
+//! - The **PR reader** reads the task's pull request on open, on `r`, after a
+//!   change to it, and every [`PR_WATCH`] while anyone's looking, and carries out
+//!   those changes in order (a comment may have to start the review the next one
+//!   joins). The view never waits on it: what it can't read, the block says.
 //!
-//! Dropping the session ends all three; none is joined, so dropping never
+//! Dropping the session ends them all; none is joined, so dropping never
 //! blocks on a git command still running (each has a deadline).
 
 use std::collections::{HashSet, VecDeque};
@@ -27,6 +31,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use shelbi_core::IssuePr;
 use shelbi_state::keymap::{DiffAction, KeyChord, ModeKeymap};
 
 use super::backend::{backend_for, AgentDelivery, AgentSend, DiffBackend, DiffTarget, TargetKind};
@@ -34,6 +39,7 @@ use super::comments::{Author, CommentDoc, CommentOp};
 use super::git::BlameLine;
 use super::highlight::{highlight_file, FileHighlights};
 use super::model::{Changeset, CommitScope};
+use super::pr::{PrDetails, PrWrite};
 use super::revert::{RevertPlan, RevertSpec};
 use super::state::{DiffEffect, DiffState};
 use super::store::{ViewedDoc, ViewedOp};
@@ -46,6 +52,10 @@ pub const WORKSPACE_WATCH: Duration = Duration::from_secs(2);
 /// How often an open view looks at the task's comments and viewed marks, for
 /// what an agent or another client wrote.
 pub const REVIEW_STATE_WATCH: Duration = Duration::from_secs(2);
+
+/// How often an open view reads the pull request again, for CI and reviewers.
+/// One cheap GraphQL read, spent only while someone's looking.
+pub const PR_WATCH: Duration = Duration::from_secs(60);
 
 /// A watch waits at least this many times as long as its last read took.
 const WATCH_BACKOFF: u32 = 4;
@@ -91,6 +101,9 @@ enum Event {
     AgentSent { ids: Vec<String>, result: Result<AgentDelivery, String> },
     RevertPlanned(Result<RevertPlan, String>),
     Reverted(Result<String, String>),
+    PrLookup(Result<Option<IssuePr>, String>),
+    PrDetails(Result<Arc<PrDetails>, String>),
+    PrWritten { change: PrWrite, result: Result<String, String> },
 }
 
 enum LoadCommand {
@@ -104,6 +117,14 @@ enum StoreCommand {
     Comment(CommentOp),
     Viewed(ViewedOp),
     Job(Job),
+}
+
+enum PrCommand {
+    /// Read it now.
+    Refresh,
+    /// Someone's looking again: read it if it's been a while.
+    Resume,
+    Write(PrWrite),
 }
 
 /// Work that waits on an agent or on git, with an answer to report. Each gets a
@@ -120,6 +141,7 @@ pub struct DiffSession {
     events: Receiver<Event>,
     load: Sender<LoadCommand>,
     store: Sender<StoreCommand>,
+    pr: Sender<PrCommand>,
     /// The newest load asked for.
     generation: u64,
     /// The changeset on show.
@@ -136,6 +158,8 @@ pub struct DiffSession {
     unsaved: VecDeque<CommentOp>,
     /// The blame reads asked for since the last changeset.
     blame_asked: HashSet<String>,
+    /// Effects a worker's answer produced, for [`Self::take_effects`].
+    from_workers: Vec<DiffEffect>,
     /// Nobody's looking: a live watch stops reading until they are.
     paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -157,6 +181,7 @@ impl DiffSession {
         let (events_tx, events) = mpsc::channel();
         let (load, load_rx) = mpsc::channel();
         let (store, store_rx) = mpsc::channel();
+        let (pr, pr_rx) = mpsc::channel();
         let priority = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let paused = Arc::new(AtomicBool::new(false));
@@ -174,6 +199,7 @@ impl DiffSession {
             events,
             load: load.clone(),
             store,
+            pr,
             generation: 0,
             published: 0,
             priority,
@@ -181,12 +207,13 @@ impl DiffSession {
             store_error: None,
             unsaved: VecDeque::new(),
             blame_asked: HashSet::new(),
+            from_workers: Vec::new(),
             paused,
             stop,
         };
         let mut session = session;
         let spawned = thread::Builder::new().name("diff-loader".into()).spawn(move || match open_backend() {
-            Ok(backend) => run_workers(backend, load_rx, store_rx, shared, watch),
+            Ok(backend) => run_workers(backend, load_rx, store_rx, pr_rx, shared, watch),
             Err(e) => shared.send(Event::Loaded {
                 generation: 0,
                 published: 0,
@@ -254,7 +281,13 @@ impl DiffSession {
         let mut for_client = Vec::new();
         for effect in effects {
             match effect {
-                DiffEffect::Refresh => self.request_load(self.scope.clone()),
+                DiffEffect::Refresh => {
+                    self.request_load(self.scope.clone());
+                    let _ = self.pr.send(PrCommand::Refresh);
+                }
+                DiffEffect::PrWrite(change) => {
+                    let _ = self.pr.send(PrCommand::Write(change));
+                }
                 DiffEffect::LoadScope(scope) => {
                     self.scope = scope.clone();
                     self.request_load(scope);
@@ -292,6 +325,7 @@ impl DiffSession {
         let was_paused = self.paused.swap(!visible, Ordering::Relaxed);
         if was_paused && visible {
             let _ = self.load.send(LoadCommand::Resume);
+            let _ = self.pr.send(PrCommand::Resume);
         }
     }
 
@@ -335,6 +369,7 @@ impl DiffSession {
     /// changed, so a client knows to redraw.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
+        let mut for_client = Vec::new();
         // What a click or a scroll moved to, through `state_mut`.
         self.after_input();
         while let Ok(event) = self.events.try_recv() {
@@ -392,9 +427,24 @@ impl DiffSession {
                     self.state.reverted(result);
                     self.refresh();
                 }
+                Event::PrLookup(lookup) => self.state.set_pr_lookup(lookup),
+                Event::PrDetails(details) => self.state.set_pr_details(details),
+                Event::PrWritten { change, result } => {
+                    let effects = self.state.pr_written(change, result);
+                    for effect in self.carry_out(effects) {
+                        for_client.push(effect);
+                    }
+                }
             }
         }
+        self.from_workers.extend(for_client);
         changed
+    }
+
+    /// What a worker's answer left for the client to carry out, like the words
+    /// of a post GitHub refused, on their way to the clipboard.
+    pub fn take_effects(&mut self) -> Vec<DiffEffect> {
+        std::mem::take(&mut self.from_workers)
     }
 }
 
@@ -427,6 +477,7 @@ fn run_workers(
     backend: Arc<dyn DiffBackend>,
     load: Receiver<LoadCommand>,
     store: Receiver<StoreCommand>,
+    pr: Receiver<PrCommand>,
     shared: Shared,
     watch: Option<Duration>,
 ) {
@@ -435,6 +486,14 @@ fn run_workers(
         .name("diff-store".into())
         .spawn(move || run_store(store_backend, store, store_shared))
         .expect("spawning the diff store");
+    let (pr_backend, pr_shared) = (backend.clone(), shared.clone());
+    let spawned = thread::Builder::new()
+        .name("diff-pr".into())
+        .spawn(move || run_pr(pr_backend, pr, pr_shared));
+    // The diff doesn't need it, so losing it costs only the block.
+    if let Err(e) = spawned {
+        tracing::warn!("couldn't start the diff's PR reader: {e}");
+    }
     run_loader(backend, load, shared, watch);
 }
 
@@ -499,6 +558,84 @@ impl SeenState {
                 shared.send(Event::Viewed(doc));
             }
             Err(e) => shared.send(Event::StoreFailed(e)),
+        }
+    }
+}
+
+fn run_pr(backend: Arc<dyn DiffBackend>, commands: Receiver<PrCommand>, shared: Shared) {
+    let mut seen = SeenPr::default();
+    seen.read(&*backend, &shared);
+    loop {
+        if shared.stopped() {
+            return;
+        }
+        match commands.recv_timeout(PR_WATCH) {
+            Ok(PrCommand::Refresh) => seen.read(&*backend, &shared),
+            Ok(PrCommand::Resume) => {
+                if seen.read_at.is_none_or(|at| at.elapsed() >= PR_WATCH) {
+                    seen.read(&*backend, &shared);
+                }
+            }
+            Ok(PrCommand::Write(change)) => {
+                let result = match &seen.record {
+                    Some(pr) => backend.pr_write(pr, &change),
+                    None => Err("This task has no pull request".to_string()),
+                };
+                let wrote = result.is_ok();
+                shared.send(Event::PrWritten { change, result });
+                if wrote {
+                    seen.read(&*backend, &shared);
+                }
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if !shared.paused.load(Ordering::Relaxed) {
+                    seen.read(&*backend, &shared);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+/// What the PR reader last told the session, so an idle view isn't redrawn by
+/// a read that found the same.
+#[derive(Default)]
+struct SeenPr {
+    record: Option<IssuePr>,
+    lookup_failed: Option<String>,
+    details: Option<Result<PrDetails, String>>,
+    read_at: Option<Instant>,
+}
+
+impl SeenPr {
+    fn read(&mut self, backend: &dyn DiffBackend, shared: &Shared) {
+        self.read_at = Some(Instant::now());
+        match backend.pr_lookup() {
+            Ok(None) => {
+                if self.record.take().is_some() || self.lookup_failed.take().is_some() {
+                    self.details = None;
+                    shared.send(Event::PrLookup(Ok(None)));
+                }
+            }
+            Err(why) => {
+                if self.lookup_failed.as_ref() != Some(&why) {
+                    self.lookup_failed = Some(why.clone());
+                    shared.send(Event::PrLookup(Err(why)));
+                }
+            }
+            Ok(Some(pr)) => {
+                // A lookup that failed left its reason on show: this clears it.
+                let recovered = self.lookup_failed.take().is_some();
+                if self.record.as_ref() != Some(&pr) {
+                    self.record = Some(pr.clone());
+                    shared.send(Event::PrLookup(Ok(Some(pr.clone()))));
+                }
+                let details = backend.pr_details(&pr);
+                if recovered || self.details.as_ref() != Some(&details) {
+                    shared.send(Event::PrDetails(details.clone().map(Arc::new)));
+                    self.details = Some(details);
+                }
+            }
         }
     }
 }
