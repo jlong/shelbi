@@ -183,6 +183,14 @@ impl ActiveOverlay {
         }
     }
 
+    /// The reject prompt, starting from `reason`: the review's comments.
+    pub fn reject_with(task_id: impl Into<String>, reason: &str) -> Self {
+        ActiveOverlay::RejectReason {
+            task_id: task_id.into(),
+            prompt: overlay::review_reject::RejectPrompt::with_reason(reason),
+        }
+    }
+
     /// Open the error log for `project`. Snapshots the unread state, then marks
     /// the log read so the sidebar's unread button clears once this closes
     /// (same contract as the tmux popup). Best-effort: a read/mark failure

@@ -48,6 +48,11 @@ impl RejectPrompt {
         Self::default()
     }
 
+    /// A prompt that starts from `reason` (the review's comments).
+    pub fn with_reason(reason: &str) -> Self {
+        RejectPrompt { inner: shared::RejectPrompt::with_reason(reason) }
+    }
+
     /// The composed reason, newlines preserved verbatim. Read this on
     /// [`Step::Submit`].
     pub fn reason(&self) -> String {

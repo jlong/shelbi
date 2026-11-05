@@ -24,7 +24,7 @@ const PALETTE_ROW_H: f32 = 30.0;
 const HELP_W: f32 = 880.0;
 const HELP_ROW_H: f32 = 22.0;
 /// The help's columns: its sections, in the shared order.
-const HELP_COLUMNS: [&[&str]; 3] = [&["Move"], &["Find", "View"], &["Fold", "Comment", "Other"]];
+const HELP_COLUMNS: [&[&str]; 3] = [&["Move"], &["Find", "View"], &["Fold", "Comment", "Revert", "Other"]];
 
 /// A chord as the help and Skim's README spell it: `j`, `G`, `gg`, `zM`,
 /// `⌃d`, `Space`, `⇧Tab`.
@@ -108,6 +108,19 @@ impl DiffView {
                 )
                 .child(caret(theme.focus_ring))
                 .child(div().flex_none().ml(px(8.0)).child("↵ search all files · Esc cancel"));
+        }
+        // A revert's question has to be read: it isn't the usual quiet line.
+        if matches!(state.mode(), Mode::Confirm(_)) {
+            return bar.child(
+                div()
+                    .debug_selector(|| "diff-revert-confirm".into())
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .text_color(theme.text_loud)
+                    .child(state.status()),
+            );
         }
         let mut line = state.status();
         // What's held for a key to come: `3`, `g`, `3g`.
@@ -283,7 +296,7 @@ impl DiffView {
 
     fn render_help(&self, scroll: usize, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let keys = diff_keys(cx);
-        let sections = help_sections(&keys, help_spelling);
+        let sections = help_sections(&keys, self.state().kind(), help_spelling);
         let family = code_font(cx);
         // The rows that fit under the title; `j` / `k` move the columns past.
         let room = (f32::from(window.viewport_size().height) - OVERLAY_TOP * 2.0 - 80.0).max(HELP_ROW_H);

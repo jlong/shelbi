@@ -361,6 +361,8 @@ impl WorkspaceInterface {
                     WorkspaceAction::None
                 }
                 DiffOut::Edit { path, line } => WorkspaceAction::OpenFile { path, line },
+                // A workspace's `gY` goes to its agent: only a review rejects.
+                DiffOut::Reject { .. } => WorkspaceAction::None,
             };
         }
         // Tab returns focus to the panel; everything else goes to the agent.

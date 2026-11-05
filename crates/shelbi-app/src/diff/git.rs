@@ -42,6 +42,9 @@ pub trait GitRunner: Send + Sync {
     /// Run `git <args>` and return stdout (bytes that aren't UTF-8 read as
     /// U+FFFD) when the exit status is one of `ok`.
     fn git(&self, args: &[String], ok: &[i32]) -> Result<String, String>;
+    /// Run `git <args>` with `input` on its stdin, requiring success. Over the
+    /// same path as [`Self::git`], so a patch's line breaks survive SSH.
+    fn git_with_input(&self, args: &[String], input: &str) -> Result<String, String>;
 }
 
 /// [`GitRunner`] for a worktree on `host`: this machine, or another over the
@@ -68,6 +71,13 @@ impl GitRunner for HostGit {
             args.first().map_or("", String::as_str),
             shelbi_ssh::describe_failure(&self.host, &out).trim()
         ))
+    }
+
+    fn git_with_input(&self, args: &[String], input: &str) -> Result<String, String> {
+        let mut argv: Vec<String> = vec!["git".into(), "-C".into(), self.worktree.clone()];
+        argv.extend(pinned_config());
+        argv.extend_from_slice(args);
+        shelbi_ssh::run_with_stdin(&self.host, &argv, input.as_bytes()).map_err(|e| e.to_string())
     }
 }
 
@@ -250,7 +260,7 @@ fn commits(git: &dyn GitRunner, base: &str) -> Result<Vec<CommitInfo>, String> {
 }
 
 /// The first parent of `sha`, or the empty tree for a root commit.
-fn parent_of(git: &dyn GitRunner, sha: &str) -> Result<String, String> {
+pub(super) fn parent_of(git: &dyn GitRunner, sha: &str) -> Result<String, String> {
     match capture(git, &["rev-parse", "--verify", "--quiet", &format!("{sha}^1")]) {
         Ok(parent) => Ok(parent),
         Err(_) => capture(git, &["hash-object", "-t", "tree", "/dev/null"]),

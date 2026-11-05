@@ -748,43 +748,13 @@ fn flush(buf: &mut Buffer, x: u16, y: u16, run: &mut String, style: Option<Style
 /// A part of a thread: `┃ jlong: why not reuse this?`
 fn paint_thread(p: &Paint<'_>, buf: &mut Buffer, thread: u32, part: ThreadPart, at: RowAt) {
     let state = p.state;
-    let Some(comment) = state.thread(thread) else { return };
     let base = row_base(p, None, at);
     buf.set_style(at.area, base);
     let bar = base.fg(p.colors.thread);
     buf.set_stringn(at.area.x, at.area.y, "┃ ", usize::from(at.area.width), bar);
     let x = at.area.x + 2;
     let width = usize::from(at.area.width.saturating_sub(2));
-    let first_line = |body: &str| -> String {
-        let mut lines = body.lines();
-        let first = lines.next().unwrap_or("").to_string();
-        if lines.next().is_some() {
-            format!("{first} …")
-        } else {
-            first
-        }
-    };
-    let text = match part {
-        ThreadPart::Head => {
-            let mut text = String::new();
-            if state.thread_outdated(thread) {
-                text.push_str("(outdated) ");
-            }
-            text.push_str(&format!("{}: {}", comment.author.name, first_line(&comment.body)));
-            if comment.sent {
-                text.push_str("  (sent)");
-            }
-            text
-        }
-        ThreadPart::Reply(i) => match comment.replies.get(usize::from(i)) {
-            Some(reply) => format!("  ↳ {}: {}", reply.author.name, first_line(&reply.body)),
-            None => return,
-        },
-        ThreadPart::Summary => {
-            let n = comment.replies.len();
-            format!("▸ {n} {}", if n == 1 { "reply" } else { "replies" })
-        }
-    };
+    let Some(text) = state.thread_row_text(thread, part) else { return };
     let style = match part {
         ThreadPart::Summary => base.fg(p.colors.muted),
         _ => base.fg(p.colors.fg),
@@ -820,7 +790,9 @@ fn paint_status(p: &Paint<'_>, buf: &mut Buffer, status: Rect) -> Option<(u16, u
     }
     let text = parts.join(" · ");
     let label = state.mode().label();
-    let muted = Style::default().fg(p.colors.muted);
+    // A revert's question has to be read: it isn't the usual quiet line.
+    let asking = matches!(state.mode(), Mode::Confirm(_));
+    let muted = Style::default().fg(if asking { p.colors.fg } else { p.colors.muted });
     buf.set_stringn(status.x, status.y, &text, width, muted);
     if p.focused && label.width() <= width {
         buf.set_string(status.x, status.y, label, Style::default().fg(p.colors.accent).add_modifier(Modifier::BOLD));
@@ -851,7 +823,7 @@ fn paint_box(p: &Paint<'_>, buf: &mut Buffer, rect: Rect, title: &str, foot: &st
 /// The `?` overlay: every key in effect, from the live keymap, and the two ways
 /// out of the view the diff's own keys hide.
 fn paint_help(p: &Paint<'_>, buf: &mut Buffer, area: Rect, scroll: usize) {
-    let sections = help_sections(&p.keymaps.diff, |c| format_chord(c, p.style));
+    let sections = help_sections(&p.keymaps.diff, p.state.kind(), |c| format_chord(c, p.style));
     let mut rows: Vec<(String, String)> = Vec::new();
     for section in &sections {
         if !rows.is_empty() {

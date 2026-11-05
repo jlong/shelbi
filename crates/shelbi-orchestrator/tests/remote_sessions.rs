@@ -667,6 +667,7 @@ fn edit_starts_a_far_editor_session_the_window_attaches_to_by_name() {
                 sockets.lock().unwrap().push(paths.sock());
                 Ok(())
             }),
+            agent_send: shelbi_orchestrator::agent_send::service(),
         };
         let reply = shelbi_orchestrator::far::answer_with(&services, &req.project, request);
         let reply = ServerMsg::Reply {

@@ -19,13 +19,16 @@
 //!   mode, into the row table a client virtualizes over. [`search`] and
 //!   [`palette`] sit beside it.
 //! - [`help`] is the `?` overlay's contents, from the live keymap.
+//! - [`revert`] puts a file or a hunk back in a workspace's worktree, without
+//!   touching a commit.
 //! - [`state`] is the state machine ([`DiffState`]): the cursor, the modes,
 //!   what each action does. [`session`] runs it with the worker threads
 //!   ([`DiffSession`]): this is what a client holds.
 //!
 //! A client's job is then: open a [`DiffSession`], pass it keys, draw
 //! [`DiffState::visible_rows`], and carry out the [`DiffEffect`]s only it can
-//! (copy, open the editor, send to the agent).
+//! (copy, open the editor, ask for the reject prompt). Sending to the agent and
+//! reverting are the session's, through the backend.
 
 pub mod backend;
 pub mod comments;
@@ -37,6 +40,7 @@ pub mod intraline;
 pub mod model;
 pub mod palette;
 pub mod parse;
+pub mod revert;
 pub mod rows;
 pub mod search;
 pub mod session;
@@ -44,7 +48,8 @@ pub mod state;
 pub mod store;
 
 pub use backend::{
-    answer, backend_for, DiffBackend, DiffOp, DiffReply, DiffRequest, DiffTarget, FarBackend, HostBackend, TargetKind,
+    answer, backend_for, comment_access, AgentDelivery, AgentSend, DiffBackend, DiffOp, DiffReply, DiffRequest,
+    DiffTarget, FarBackend, HostBackend, TargetKind,
 };
 pub use model::{Changeset, CommitInfo, CommitScope, DiffLine, Eol, FileDiff, FileStatus, Hunk, LineKind, Side};
 pub use rows::{Folds, HunkFilter, NoticeKind, Row, RowTable, ThreadPart, ViewMode};

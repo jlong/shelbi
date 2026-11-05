@@ -12,7 +12,10 @@
 //! - The **highlighter** works through a changeset's files, the one in view
 //!   first. A newer changeset abandons the old one's.
 //! - The **store** applies comment and viewed changes in order, so a slow
-//!   remote read never delays a save.
+//!   remote read never delays a save, and looks at the task's comments every
+//!   [`REVIEW_STATE_WATCH`], so an agent's reply from the CLI shows by itself.
+//! - A **job** runs what can take a while and has to be answered: a message to
+//!   the agent (which waits to see it submitted), a revert's check and write.
 //!
 //! Dropping the session ends all three; none is joined, so dropping never
 //! blocks on a git command still running (each has a deadline).
@@ -26,11 +29,12 @@ use std::time::{Duration, Instant};
 
 use shelbi_state::keymap::{DiffAction, KeyChord, ModeKeymap};
 
-use super::backend::{backend_for, DiffBackend, DiffTarget, TargetKind};
+use super::backend::{backend_for, AgentDelivery, AgentSend, DiffBackend, DiffTarget, TargetKind};
 use super::comments::{Author, CommentDoc, CommentOp};
 use super::git::BlameLine;
 use super::highlight::{highlight_file, FileHighlights};
 use super::model::{Changeset, CommitScope};
+use super::revert::{RevertPlan, RevertSpec};
 use super::state::{DiffEffect, DiffState};
 use super::store::{ViewedDoc, ViewedOp};
 use crate::source::ProjectLink;
@@ -38,6 +42,10 @@ use crate::source::ProjectLink;
 /// How a live workspace diff re-reads: often enough to follow an agent, slowly
 /// enough not to matter.
 pub const WORKSPACE_WATCH: Duration = Duration::from_secs(2);
+
+/// How often an open view looks at the task's comments and viewed marks, for
+/// what an agent or another client wrote.
+pub const REVIEW_STATE_WATCH: Duration = Duration::from_secs(2);
 
 /// A watch waits at least this many times as long as its last read took.
 const WATCH_BACKOFF: u32 = 4;
@@ -50,6 +58,9 @@ pub type Wake = Arc<dyn Fn() + Send + Sync>;
 pub struct DiffOptions {
     /// Signs new comments.
     pub author: Author,
+    /// What it's a view of, which decides where `gY` goes, whether anything can
+    /// revert, and the reply command a message gives an agent.
+    pub target: DiffTarget,
     /// Re-read this often. `None` reads only when asked (a review's checkout
     /// doesn't move under it).
     pub watch: Option<Duration>,
@@ -77,6 +88,9 @@ enum Event {
     Viewed(ViewedDoc),
     /// A read of the task's review state or a viewed save failed, with why.
     StoreFailed(String),
+    AgentSent { ids: Vec<String>, result: Result<AgentDelivery, String> },
+    RevertPlanned(Result<RevertPlan, String>),
+    Reverted(Result<String, String>),
 }
 
 enum LoadCommand {
@@ -89,6 +103,15 @@ enum LoadCommand {
 enum StoreCommand {
     Comment(CommentOp),
     Viewed(ViewedOp),
+    Job(Job),
+}
+
+/// Work that waits on an agent or on git, with an answer to report. Each gets a
+/// thread: a slow send mustn't hold up a comment being saved.
+enum Job {
+    Send { message: String, ids: Vec<String> },
+    PlanRevert(RevertSpec),
+    Revert(RevertPlan),
 }
 
 /// An open diff view.
@@ -147,7 +170,7 @@ impl DiffSession {
         };
         let watch = options.watch;
         let session = DiffSession {
-            state: DiffState::new(options.author),
+            state: DiffState::new(options.author).for_target(&options.target),
             events,
             load: load.clone(),
             store,
@@ -181,13 +204,20 @@ impl DiffSession {
 
     /// Open a view of `target`, as seen through `link`: a live watch for a
     /// workspace, reads on request for a review.
-    pub fn for_target(target: DiffTarget, link: Option<ProjectLink>, author: Author, wake: Wake) -> DiffSession {
+    pub fn for_target(
+        target: DiffTarget,
+        link: Option<ProjectLink>,
+        author: Author,
+        agent: AgentSend,
+        wake: Wake,
+    ) -> DiffSession {
         let options = DiffOptions {
             author,
+            target: target.clone(),
             watch: (target.kind == TargetKind::Workspace).then_some(WORKSPACE_WATCH),
             wake,
         };
-        DiffSession::open(move || backend_for(&target, link.as_ref()), options)
+        DiffSession::open(move || backend_for(&target, link.as_ref(), agent), options)
     }
 
     pub fn state(&self) -> &DiffState {
@@ -237,9 +267,18 @@ impl DiffSession {
                 DiffEffect::SaveViewed(op) => {
                     let _ = self.store.send(StoreCommand::Viewed(op));
                 }
+                DiffEffect::SendToAgent { message, ids } => {
+                    let _ = self.store.send(StoreCommand::Job(Job::Send { message, ids }));
+                }
+                DiffEffect::PlanRevert(spec) => {
+                    let _ = self.store.send(StoreCommand::Job(Job::PlanRevert(spec)));
+                }
+                DiffEffect::Revert(plan) => {
+                    let _ = self.store.send(StoreCommand::Job(Job::Revert(plan)));
+                }
                 other @ (DiffEffect::Yank(_)
                 | DiffEffect::OpenInEditor { .. }
-                | DiffEffect::SendToAgent { .. }) => for_client.push(other),
+                | DiffEffect::RejectWithComments { .. }) => for_client.push(other),
             }
         }
         self.after_input();
@@ -342,6 +381,17 @@ impl DiffSession {
                     self.state.set_viewed_doc(doc);
                 }
                 Event::StoreFailed(e) => self.store_error = Some(e),
+                Event::AgentSent { ids, result } => {
+                    let effects = self.state.agent_sent(ids, result);
+                    self.carry_out(effects);
+                }
+                Event::RevertPlanned(result) => self.state.revert_planned(result),
+                Event::Reverted(result) => {
+                    // A write that failed changed nothing, but the read it would
+                    // have been is as good a look as any.
+                    self.state.reverted(result);
+                    self.refresh();
+                }
             }
         }
         changed
@@ -389,20 +439,83 @@ fn run_workers(
 }
 
 fn run_store(backend: Arc<dyn DiffBackend>, commands: Receiver<StoreCommand>, shared: Shared) {
-    send_review_state(&*backend, &shared);
-    for command in commands {
-        let event = match command {
-            StoreCommand::Comment(op) => Event::CommentSaved(backend.apply_comment(&op)),
-            StoreCommand::Viewed(op) => backend.apply_viewed(&op).map(Event::Viewed).unwrap_or_else(Event::StoreFailed),
-        };
-        shared.send(event);
+    let mut seen = SeenState::default();
+    seen.send_changed(&*backend, &shared);
+    loop {
+        if shared.stopped() {
+            return;
+        }
+        match commands.recv_timeout(REVIEW_STATE_WATCH) {
+            Ok(StoreCommand::Comment(op)) => {
+                let saved = backend.apply_comment(&op);
+                seen.comments = saved.as_ref().ok().cloned();
+                shared.send(Event::CommentSaved(saved));
+            }
+            Ok(StoreCommand::Viewed(op)) => {
+                let event = match backend.apply_viewed(&op) {
+                    Ok(doc) => {
+                        seen.viewed = Some(doc.clone());
+                        Event::Viewed(doc)
+                    }
+                    Err(e) => Event::StoreFailed(e),
+                };
+                shared.send(event);
+            }
+            Ok(StoreCommand::Job(job)) => start_job(job, backend.clone(), shared.clone()),
+            Err(RecvTimeoutError::Timeout) => {
+                if !shared.paused.load(Ordering::Relaxed) {
+                    seen.send_changed(&*backend, &shared);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
     }
 }
 
-/// Read the task's comments and viewed marks.
-fn send_review_state(backend: &dyn DiffBackend, shared: &Shared) {
-    shared.send(backend.comments().map(Event::Comments).unwrap_or_else(Event::StoreFailed));
-    shared.send(backend.viewed().map(Event::Viewed).unwrap_or_else(Event::StoreFailed));
+/// What the store last told the session. A look that finds the same says
+/// nothing, so an idle view isn't redrawn every couple of seconds.
+#[derive(Default)]
+struct SeenState {
+    comments: Option<CommentDoc>,
+    viewed: Option<ViewedDoc>,
+}
+
+impl SeenState {
+    /// Read the task's comments and viewed marks. Reads are on the same thread
+    /// as saves, so one can't answer with a document older than a save it missed.
+    fn send_changed(&mut self, backend: &dyn DiffBackend, shared: &Shared) {
+        match backend.comments() {
+            Ok(doc) if self.comments.as_ref() == Some(&doc) => {}
+            Ok(doc) => {
+                self.comments = Some(doc.clone());
+                shared.send(Event::Comments(doc));
+            }
+            Err(e) => shared.send(Event::StoreFailed(e)),
+        }
+        match backend.viewed() {
+            Ok(doc) if self.viewed.as_ref() == Some(&doc) => {}
+            Ok(doc) => {
+                self.viewed = Some(doc.clone());
+                shared.send(Event::Viewed(doc));
+            }
+            Err(e) => shared.send(Event::StoreFailed(e)),
+        }
+    }
+}
+
+fn start_job(job: Job, backend: Arc<dyn DiffBackend>, shared: Shared) {
+    let reporter = shared.clone();
+    let spawned = thread::Builder::new().name("diff-job".into()).spawn(move || {
+        let event = match job {
+            Job::Send { message, ids } => Event::AgentSent { ids, result: backend.send_to_agent(&message) },
+            Job::PlanRevert(spec) => Event::RevertPlanned(backend.plan_revert(&spec)),
+            Job::Revert(plan) => Event::Reverted(backend.revert(&plan)),
+        };
+        shared.send(event);
+    });
+    if let Err(e) = spawned {
+        reporter.send(Event::StoreFailed(format!("Couldn't start the work: {e}")));
+    }
 }
 
 fn run_loader(
@@ -447,8 +560,6 @@ fn run_loader(
                     } else if Instant::now() >= next_watch.unwrap_or_else(Instant::now) {
                         let started = Instant::now();
                         read_changeset(&*backend, &scope, generation, &mut digest, &shared);
-                        // An agent's reply from the CLI shows without a refresh.
-                        send_review_state(&*backend, &shared);
                         // A slow read (a remote worktree, a loaded machine)
                         // backs the watch off instead of filling the interval.
                         next_watch = Some(Instant::now() + interval.max(started.elapsed() * WATCH_BACKOFF));

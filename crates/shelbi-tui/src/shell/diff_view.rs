@@ -27,6 +27,7 @@ use shelbi_app::diff::backend::backend_for;
 use shelbi_app::diff::comments::Author;
 use shelbi_app::diff::state::normalize_key;
 use shelbi_app::diff::{DiffAction, DiffEffect, DiffOptions, DiffSession, DiffTarget, Mode, TargetKind, WORKSPACE_WATCH};
+use shelbi_orchestrator::agent_send;
 use shelbi_state::keymap::{DisplayStyle, Key, KeyChord, Keymaps, Mods};
 
 use self::paint::{layout, paint, Colors, DiffLayout, Paint, NARROW_BELOW};
@@ -68,6 +69,8 @@ pub enum DiffOut {
     FocusPanel,
     /// Open this file in the user's editor, at this line.
     Edit { path: PathBuf, line: Option<u32> },
+    /// `gY` in a review: ask for Reject's reason, starting from this.
+    Reject { reason: String },
 }
 
 /// One review's or workspace's diff view.
@@ -123,11 +126,11 @@ impl DiffView {
         };
         Arc::new(move || {
             let target = target.clone();
-            let options = DiffOptions { author: Author::local(), watch: None, wake: no_wake() };
+            let options = DiffOptions { author: Author::local(), target: target.clone(), watch: None, wake: no_wake() };
             DiffSession::open(
                 move || {
                     wait_for_review(&target)?;
-                    backend_for(&target, None)
+                    backend_for(&target, None, agent_send::service())
                 },
                 options,
             )
@@ -144,8 +147,9 @@ impl DiffView {
         };
         Arc::new(move || {
             let target = target.clone();
-            let options = DiffOptions { author: Author::local(), watch: Some(WORKSPACE_WATCH), wake: no_wake() };
-            DiffSession::open(move || backend_for(&target, None), options)
+            let options =
+                DiffOptions { author: Author::local(), target: target.clone(), watch: Some(WORKSPACE_WATCH), wake: no_wake() };
+            DiffSession::open(move || backend_for(&target, None, agent_send::service()), options)
         })
     }
 
@@ -223,7 +227,7 @@ impl DiffView {
         }
     }
 
-    /// Carry out what's left for a client: a copy, an editor, the agent.
+    /// Carry out what's left for a client: a copy, an editor, the reject prompt.
     fn carry_out(&mut self, effects: Vec<DiffEffect>) -> DiffOut {
         let mut out = DiffOut::None;
         for effect in effects {
@@ -236,19 +240,16 @@ impl DiffView {
                     Some(path) => out = DiffOut::Edit { path, line },
                     None => self.session.state_mut().set_flash(format!("{path} isn't on this machine")),
                 },
-                // Delivering these to the agent is `ndv-comments-agent`'s; until
-                // it lands they go on the clipboard and stay unsent, as in Skim's
-                // own `gY`, which stops at the agent's input.
-                DiffEffect::SendToAgent { message, .. } => {
-                    (self.copy)(&message);
-                    self.session.state_mut().set_flash("Comments copied: paste them to the agent");
-                }
-                // The session's own.
+                DiffEffect::RejectWithComments { reason } => out = DiffOut::Reject { reason },
+                // The session's own: it never hands these back.
                 DiffEffect::Refresh
                 | DiffEffect::LoadScope(_)
                 | DiffEffect::LoadBlame { .. }
                 | DiffEffect::SaveComment(_)
-                | DiffEffect::SaveViewed(_) => {}
+                | DiffEffect::SaveViewed(_)
+                | DiffEffect::SendToAgent { .. }
+                | DiffEffect::PlanRevert(_)
+                | DiffEffect::Revert(_) => {}
             }
         }
         out

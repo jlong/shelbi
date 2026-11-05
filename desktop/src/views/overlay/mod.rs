@@ -137,6 +137,18 @@ impl ActiveOverlay {
         }
     }
 
+    /// Start the open reject prompt on `task_id` from `reason`, unless something
+    /// has been typed. Returns whether this is that prompt.
+    pub fn fill_reject_reason(&mut self, task_id: &str, reason: &str) -> bool {
+        match self {
+            ActiveOverlay::RejectReason { task_id: open, prompt, .. } if open == task_id => {
+                prompt.fill(reason);
+                true
+            }
+            _ => false,
+        }
+    }
+
     pub fn zen_intro(project: impl Into<String>) -> Self {
         ActiveOverlay::ZenIntro {
             project: project.into(),

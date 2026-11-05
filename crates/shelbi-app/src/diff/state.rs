@@ -13,6 +13,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use shelbi_state::keymap::{DiffAction, Key, KeyChord, Mods, ModeKeymap};
 
+use super::backend::{AgentDelivery, DiffTarget, TargetKind};
 use super::comments::{
     agent_message, anchor_for, format_comment, format_comments, place, Author, Comment, CommentDoc, CommentOp,
     CommentReply, Placement,
@@ -22,6 +23,7 @@ use super::git::BlameLine;
 use super::highlight::FileHighlights;
 use super::model::{Changeset, CommitScope, DiffLine, FileDiff, LineKind, Side};
 use super::palette::{DiffPalette, PaletteMode, PaletteStep, PaletteTarget};
+use super::revert::{RevertPlan, RevertSpec};
 use super::rows::{build_rows, Folds, HunkFilter, Row, RowInput, RowTable, ThreadPart, Threads, ViewMode};
 use super::search::{matches_on, search, SearchMatch};
 use super::store::{ViewedDoc, ViewedOp};
@@ -33,9 +35,15 @@ pub enum DiffEffect {
     Yank(String),
     /// Open the worktree's file at this line in the user's editor.
     OpenInEditor { path: String, line: Option<u32> },
-    /// Send this message to the target's agent. Once it's delivered,
-    /// [`DiffState::mark_sent`] these threads.
+    /// Send this message to the target's agent. The session does, and marks
+    /// these threads sent once it's delivered.
     SendToAgent { message: String, ids: Vec<String> },
+    /// `gY` in a review: ask for Reject's reason, starting from this.
+    RejectWithComments { reason: String },
+    /// Check a revert, so the confirm can say what it'd do.
+    PlanRevert(RevertSpec),
+    /// Carry out a revert that's been confirmed.
+    Revert(RevertPlan),
     /// Read the changeset again.
     Refresh,
     /// Read another commit's changes.
@@ -71,6 +79,9 @@ pub enum Mode {
     Palette(DiffPalette),
     /// The keys. A client draws them from the live keymap.
     Help { scroll: usize },
+    /// A revert, waiting for `y`. [`RevertPlan::prompt`] is the question, which
+    /// the status bar asks.
+    Confirm(Box<RevertPlan>),
 }
 
 impl Mode {
@@ -84,6 +95,7 @@ impl Mode {
             Mode::Comment(_) => "COMMENT",
             Mode::Palette(_) => "PALETTE",
             Mode::Help { .. } => "HELP",
+            Mode::Confirm(_) => "CONFIRM",
         }
     }
 }
@@ -136,6 +148,16 @@ pub struct DiffState {
     /// `D` was pressed once: the next `D` clears.
     confirm_clear: bool,
     author: Author,
+    /// What this diff is of, which decides where `gY` goes and whether anything
+    /// can revert.
+    kind: TargetKind,
+    /// The project and the task's state key, which a message tells an agent to
+    /// reply through.
+    project: String,
+    key: String,
+    /// A message is on its way to the agent: the comments stay put until it's
+    /// known to have landed, and `gY` doesn't send them twice.
+    sending: bool,
     loading: bool,
     error: Option<String>,
 }
@@ -172,9 +194,25 @@ impl DiffState {
             flash: None,
             confirm_clear: false,
             author,
+            kind: TargetKind::Workspace,
+            project: String::new(),
+            key: String::new(),
+            sending: false,
             loading: true,
             error: None,
         }
+    }
+
+    /// The target it's a view of.
+    pub fn for_target(mut self, target: &DiffTarget) -> Self {
+        self.kind = target.kind;
+        self.project = target.project.clone();
+        self.key = target.state_key();
+        self
+    }
+
+    pub fn kind(&self) -> TargetKind {
+        self.kind
     }
 
     // ---- What a client reads ------------------------------------------------
@@ -332,6 +370,12 @@ impl DiffState {
         self.expanded.contains(id)
     }
 
+    /// The text of a [`Row::Thread`].
+    pub fn thread_row_text(&self, thread: u32, part: ThreadPart) -> Option<String> {
+        let comment = self.thread(thread)?;
+        Some(super::rows::thread_text(comment, part, self.thread_expanded(&comment.id), self.thread_outdated(thread)))
+    }
+
     /// What's shown of the changes: `all`, `uncommitted`, or a commit's short
     /// sha (`Commits: all ▾`).
     pub fn scope_label(&self) -> String {
@@ -376,6 +420,9 @@ impl DiffState {
 
     /// The status bar, in the order the wireframe has it.
     pub fn status(&self) -> String {
+        if let Mode::Confirm(plan) = &self.mode {
+            return format!("{} · {} y revert · n cancel", self.mode.label(), plan.prompt());
+        }
         let mut parts = vec![self.mode.label().to_string(), self.view.label().to_string(), self.filter.label().to_string()];
         let files = self.changeset.files.len();
         if files > 0 {
@@ -384,7 +431,12 @@ impl DiffState {
         let comments = self.comments.comments.len();
         if comments > 0 {
             let noun = if comments == 1 { "comment" } else { "comments" };
-            parts.push(format!("{comments} {noun} (gY send to agent)"));
+            let unsent = self.comments.comments.iter().any(|c| !c.sent);
+            parts.push(match (unsent, self.kind) {
+                (false, _) => format!("{comments} {noun}"),
+                (true, TargetKind::Workspace) => format!("{comments} {noun} (gY send to agent)"),
+                (true, TargetKind::Review) => format!("{comments} {noun} (gY reject with them · gA send to the Reviewer)"),
+            });
         }
         if !self.query.is_empty() {
             match self.current_match() {
@@ -525,8 +577,57 @@ impl DiffState {
     /// `ids` were delivered to the agent.
     pub fn mark_sent(&mut self, ids: Vec<String>) -> Vec<DiffEffect> {
         let op = CommentOp::MarkSent { ids };
-        self.comments.apply(&op);
+        self.apply_comment_op(&op);
         vec![DiffEffect::SaveComment(op)]
+    }
+
+    /// How a message with `ids` went. Comments that didn't get there stay
+    /// unsent, so `gY` sends them again.
+    pub fn agent_sent(&mut self, ids: Vec<String>, result: Result<AgentDelivery, String>) -> Vec<DiffEffect> {
+        self.sending = false;
+        let delivery = match result {
+            Ok(delivery) => delivery,
+            Err(e) => {
+                self.flash = Some(format!("Couldn't send the comments: {e}"));
+                return Vec::new();
+            }
+        };
+        let (count, noun) = (ids.len(), if ids.len() == 1 { "comment" } else { "comments" });
+        let who = self.agent_name();
+        self.flash = Some(match delivery {
+            AgentDelivery::Submitted => format!("Sent {count} {noun} to {who}"),
+            AgentDelivery::Queued => format!("Queued {count} {noun} for {who}: it's mid-turn"),
+            AgentDelivery::Unverified => format!("Sent {count} {noun} to {who} (this agent can't confirm it)"),
+        });
+        self.mark_sent(ids)
+    }
+
+    /// A revert's check came back: ask, or say why not. A key pressed while it
+    /// was out wins over the question.
+    pub fn revert_planned(&mut self, result: Result<RevertPlan, String>) {
+        match result {
+            Ok(plan) if matches!(self.mode, Mode::Normal | Mode::Visual { .. }) => {
+                self.flash = None;
+                self.mode = Mode::Confirm(Box::new(plan));
+            }
+            Ok(_) => {}
+            Err(e) => self.flash = Some(e),
+        }
+    }
+
+    /// A revert finished: what happened, or why it couldn't.
+    pub fn reverted(&mut self, result: Result<String, String>) {
+        self.flash = Some(match result {
+            Ok(done) => done,
+            Err(e) => e,
+        });
+    }
+
+    fn agent_name(&self) -> &'static str {
+        match self.kind {
+            TargetKind::Workspace => "the agent",
+            TargetKind::Review => "the Reviewer",
+        }
     }
 
     // ---- Keys ----------------------------------------------------------------
@@ -542,6 +643,7 @@ impl DiffState {
             Mode::Find { .. } => return self.key_find(chord),
             Mode::Comment(_) => return self.key_comment(chord),
             Mode::Palette(_) => return self.key_palette(chord),
+            Mode::Confirm(_) => return self.key_confirm(chord),
             Mode::Help { scroll } => {
                 match chord.code {
                     Key::Char('j') | Key::Down => *scroll += 1,
@@ -593,6 +695,18 @@ impl DiffState {
         }
         self.count = Some(self.count.unwrap_or(0).saturating_mul(10).saturating_add(digit as usize).min(100_000));
         true
+    }
+
+    /// `y` or `Enter` goes ahead. Anything else keeps the work.
+    fn key_confirm(&mut self, chord: KeyChord) -> Vec<DiffEffect> {
+        let Mode::Confirm(plan) = std::mem::replace(&mut self.mode, Mode::Normal) else { return Vec::new() };
+        let plain = chord.mods == Mods::NONE;
+        if plain && matches!(chord.code, Key::Char('y') | Key::Enter) {
+            self.flash = Some(format!("Reverting {}…", plan.label));
+            return vec![DiffEffect::Revert(*plan)];
+        }
+        self.flash = Some("Not reverted".to_string());
+        Vec::new()
     }
 
     fn key_search(&mut self, chord: KeyChord) -> Vec<DiffEffect> {
@@ -800,8 +914,8 @@ impl DiffState {
             DiffAction::Search => self.mode = Mode::Search { query: String::new() },
             DiffAction::NextMatch => self.goto_next_match(true, n),
             DiffAction::PrevMatch => self.goto_next_match(false, n),
-            DiffAction::FilePalette => self.mode = Mode::Palette(DiffPalette::new(PaletteMode::Files)),
-            DiffAction::CommandPalette => self.mode = Mode::Palette(DiffPalette::new(PaletteMode::Commands)),
+            DiffAction::FilePalette => self.mode = Mode::Palette(DiffPalette::new(PaletteMode::Files).for_kind(self.kind)),
+            DiffAction::CommandPalette => self.mode = Mode::Palette(DiffPalette::new(PaletteMode::Commands).for_kind(self.kind)),
             DiffAction::Help => self.mode = Mode::Help { scroll: 0 },
             DiffAction::ToggleSplit => {
                 self.view = match self.view {
@@ -851,10 +965,15 @@ impl DiffState {
                 }
                 return vec![DiffEffect::Yank(format_comments(&self.comments.comments))];
             }
-            DiffAction::SendToAgent => match agent_message(&self.comments) {
-                Some((message, ids)) => return vec![DiffEffect::SendToAgent { message, ids }],
-                None => self.flash = Some("No comments to send".to_string()),
-            },
+            DiffAction::SendToAgent => return self.send_comments(self.kind == TargetKind::Review),
+            DiffAction::SendToReviewer => {
+                if self.kind == TargetKind::Review {
+                    return self.send_comments(false);
+                }
+                self.flash = Some("There's no Reviewer here: gY sends to this workspace's agent".to_string());
+            }
+            DiffAction::RevertHunk => return self.revert(false),
+            DiffAction::RevertFile => return self.revert(true),
             DiffAction::OpenInEditor => return self.open_in_editor(),
             DiffAction::ToggleViewed => {
                 let Some(file) = self.current_file() else { return Vec::new() };
@@ -1155,7 +1274,7 @@ impl DiffState {
             Row::Thread { thread, part, .. } => {
                 let (comment, _) = self.threads.placed.get(*thread as usize)?;
                 let reply = match part {
-                    ThreadPart::Reply(r) => Some(*r as usize),
+                    ThreadPart::Reply(r) | ThreadPart::More { reply: Some(r), .. } => Some(*r as usize),
                     _ => None,
                 };
                 Some((*comment, reply))
@@ -1301,6 +1420,58 @@ impl DiffState {
                 Vec::new()
             }
         }
+    }
+
+    /// The unsent comments, to Reject's reason or to the target's session.
+    fn send_comments(&mut self, through_reject: bool) -> Vec<DiffEffect> {
+        let Some((message, ids)) = agent_message(&self.comments, &self.project, &self.key) else {
+            self.flash = Some("No comments to send".to_string());
+            return Vec::new();
+        };
+        if through_reject {
+            return vec![DiffEffect::RejectWithComments { reason: message }];
+        }
+        if self.sending {
+            self.flash = Some(format!("Still sending to {}…", self.agent_name()));
+            return Vec::new();
+        }
+        self.sending = true;
+        self.flash = Some(format!("Sending to {}…", self.agent_name()));
+        vec![DiffEffect::SendToAgent { message, ids }]
+    }
+
+    /// The hunk under the cursor. A thread's row is in the hunk its lines are.
+    fn revert_hunk(&self) -> Option<u32> {
+        match *self.table.rows.get(self.cursor)? {
+            Row::Thread { thread, .. } => self.threads.placed.get(thread as usize)?.1.at.map(|(hunk, _)| hunk),
+            row => row.hunk(),
+        }
+    }
+
+    /// Ask for a check of the revert under the cursor. Its answer brings the
+    /// confirm, or why it can't.
+    fn revert(&mut self, whole_file: bool) -> Vec<DiffEffect> {
+        if self.kind == TargetKind::Review {
+            self.flash = Some("A review is a checkout of the branch: there's nothing of its own to revert".to_string());
+            return Vec::new();
+        }
+        let Some(file) = self.current_file().and_then(|f| self.changeset.files.get(f)) else {
+            self.flash = Some("Nothing here to revert".to_string());
+            return Vec::new();
+        };
+        let hunk = self.revert_hunk();
+        if !whole_file && hunk.is_none() {
+            self.flash = Some("Move onto a hunk to revert it: gR reverts the whole file".to_string());
+            return Vec::new();
+        }
+        let spec = RevertSpec {
+            scope: self.changeset.scope.clone(),
+            path: file.path.clone(),
+            hunk: if whole_file { None } else { hunk },
+            fingerprint: file.fingerprint,
+        };
+        self.flash = Some("Checking the worktree…".to_string());
+        vec![DiffEffect::PlanRevert(spec)]
     }
 
     fn open_in_editor(&mut self) -> Vec<DiffEffect> {

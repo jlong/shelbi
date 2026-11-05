@@ -359,6 +359,22 @@ enum ReviewJobMsg {
     ContentReady(Result<(), String>),
 }
 
+/// A reject landed with `reason`: the comments it carried have been sent. Off
+/// the UI thread, and only when the reason holds any.
+fn mark_reject_sent(project: String, task: String, reason: String) {
+    if !shelbi_app::diff::comments::reason_carries_threads(&reason) {
+        return;
+    }
+    let mark = move || {
+        if let Err(e) = shelbi_app::diff::comment_access(&project, &task, None).mark_sent_in(&reason) {
+            tracing::warn!(task = %task, error = %e, "couldn't mark the rejected comments sent");
+        }
+    };
+    if let Err(e) = std::thread::Builder::new().name("shelbi-reject-sent".into()).spawn(mark) {
+        tracing::warn!(error = %e, "couldn't start marking the rejected comments sent");
+    }
+}
+
 /// The daemon's answer to a review decision.
 struct DecisionReply {
     /// The project it was on: the shell may have switched since.
@@ -1275,6 +1291,9 @@ struct ShellState {
     decisions: ReviewDecisions,
     decision_tx: Sender<DecisionReply>,
     decision_rx: Receiver<DecisionReply>,
+    /// The reasons of rejects still running: when one lands, the comments its
+    /// reason carried have been sent.
+    reject_reasons: HashMap<String, String>,
     /// The daemon-facing review operations (resolve / load), behind a seam so the
     /// queued-load flow is testable with a stubbed daemon (`rt-tui-review-load-queued`).
     review_backend: Arc<dyn ReviewBackend>,
@@ -1679,6 +1698,7 @@ impl ShellState {
             decisions: ReviewDecisions::default(),
             decision_tx,
             decision_rx,
+            reject_reasons: HashMap::new(),
             review_backend: Arc::new(DaemonReviewBackend),
             review_opening: None,
             review_open_pending: None,
@@ -4126,9 +4146,7 @@ impl ShellState {
                 self.start_decision(id, Decision::Approve, m);
             }
             Effect::Mutate(Mutation::RejectReview { id, reason, .. }) if reason.trim().is_empty() => {
-                if !self.refuse_second_decision(&id) {
-                    self.overlay = Some(ActiveOverlay::reject_reason(id));
-                }
+                self.ask_reject_reason(id);
             }
             Effect::Mutate(Mutation::RejectReview { project, id, reason }) => {
                 let m = Mutation::RejectReview {
@@ -4507,9 +4525,10 @@ impl ShellState {
                 };
                 self.start_decision(task, Decision::Approve, m);
             }
-            ReviewAction::Reject => {
+            ReviewAction::Reject => self.ask_reject_reason(task),
+            ReviewAction::RejectWith(reason) => {
                 if !self.refuse_second_decision(&task) {
-                    self.overlay = Some(ActiveOverlay::reject_reason(task));
+                    self.overlay = Some(ActiveOverlay::reject_with(task, &reason));
                 }
             }
             ReviewAction::ShowDescription => {
@@ -4690,6 +4709,9 @@ impl ShellState {
             decision,
             result,
         } = reply;
+        if let Some(reason) = self.reject_reasons.remove(&task).filter(|_| result.is_ok()) {
+            mark_reject_sent(project.clone(), task.clone(), reason);
+        }
         match result {
             // The shell switched projects meanwhile: only the sessions are left
             // to see to.
@@ -4755,11 +4777,29 @@ impl ShellState {
         }
     }
 
+    /// Open the reject prompt on `task`, starting from the comments still unsent
+    /// on it. A read of one small local file; if it fails the prompt starts
+    /// empty, since not being able to read comments mustn't stop a reject.
+    fn ask_reject_reason(&mut self, task: String) {
+        if self.refuse_second_decision(&task) {
+            return;
+        }
+        let comments = self
+            .client
+            .project()
+            .and_then(|project| shelbi_app::diff::comment_access(project, &task, None).reject_reason().ok().flatten());
+        self.overlay = Some(match comments {
+            Some(reason) => ActiveOverlay::reject_with(task, &reason),
+            None => ActiveOverlay::reject_reason(task),
+        });
+    }
+
     /// Submit a reject-with-reason (from the reject overlay).
     fn submit_reject(&mut self, task_id: String, reason: String) {
         let Some(project) = self.client.project().map(str::to_string) else {
             return;
         };
+        self.reject_reasons.insert(task_id.clone(), reason.clone());
         let m = Mutation::RejectReview {
             project,
             id: task_id.clone(),

@@ -1457,6 +1457,32 @@ fn approving_the_last_review_returns_to_the_orchestrator_it_was_opened_over(cx: 
 }
 
 #[gpui::test]
+fn gy_in_the_review_opens_reject_with_the_comments_as_its_reason(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Issues, Ok(()));
+    let review = c.review();
+    review.update(&mut c.h.cx, |_, cx| {
+        cx.emit(ReviewEvent::RejectWith { id: "t-1".into(), reason: "[thread c1] a.rs:1\njlong: why?".into() });
+    });
+    c.h.cx.run_until_parked();
+    let reason = c.read(|w, _| match &w.overlay {
+        Some(ActiveOverlay::RejectReason { task_id, prompt, .. }) if task_id == "t-1" => Some(prompt.reason()),
+        _ => None,
+    });
+    assert_eq!(reason.as_deref(), Some("[thread c1] a.rs:1\njlong: why?"));
+    // A later read doesn't write over it, and only this task's prompt takes one.
+    c.update(|w, _, _| {
+        let overlay = w.overlay.as_mut().unwrap();
+        assert!(!overlay.fill_reject_reason("other", "elsewhere"));
+        assert!(overlay.fill_reject_reason("t-1", "late"));
+    });
+    let reason = c.read(|w, _| match &w.overlay {
+        Some(ActiveOverlay::RejectReason { prompt, .. }) => prompt.reason(),
+        _ => String::new(),
+    });
+    assert_eq!(reason, "[thread c1] a.rs:1\njlong: why?");
+}
+
+#[gpui::test]
 fn rejecting_the_last_review_returns_to_the_orchestrator(cx: &mut TestAppContext) {
     let mut c = deciding_over(cx, View::Session("orch".into()), Ok(()));
     c.update(|w, _, _| w.tap = None);

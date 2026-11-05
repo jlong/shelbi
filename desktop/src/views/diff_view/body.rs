@@ -23,7 +23,6 @@ use gpui::{
     InspectorElementId, IntoElement, LayoutId, Pixels, Point, ShapedLine, SharedString, Style, TextAlign, TextRun,
     Window,
 };
-use shelbi_app::diff::comments::Comment;
 use shelbi_app::diff::git::BlameLine;
 use shelbi_app::diff::highlight::SyntaxSpan;
 use shelbi_app::diff::{DiffLine, DiffState, FileDiff, FileStatus, LineKind, Row, ThreadPart};
@@ -219,37 +218,6 @@ pub fn file_title(file: &FileDiff) -> String {
 }
 
 /// A thread row's words, without its leading bar.
-pub fn thread_text(comment: &Comment, part: ThreadPart, outdated: bool) -> String {
-    let first_line = |body: &str| {
-        let mut lines = body.lines();
-        let head = lines.next().unwrap_or("").to_string();
-        if lines.next().is_some() {
-            format!("{head} …")
-        } else {
-            head
-        }
-    };
-    match part {
-        ThreadPart::Head => {
-            let flags = match (outdated, comment.sent) {
-                (true, true) => " (outdated, sent)",
-                (true, false) => " (outdated)",
-                (false, true) => " (sent)",
-                (false, false) => "",
-            };
-            format!("{}{flags}: {}", comment.author.name, first_line(&comment.body))
-        }
-        ThreadPart::Reply(index) => match comment.replies.get(index as usize) {
-            Some(reply) => format!("  ↳ {}: {}", reply.author.name, first_line(&reply.body)),
-            None => String::new(),
-        },
-        ThreadPart::Summary => {
-            let n = comment.replies.len();
-            format!("  ▸ {n} {}", if n == 1 { "reply" } else { "replies" })
-        }
-    }
-}
-
 /// The rows' layout, into a [`Frame`].
 struct Painter<'a> {
     state: &'a DiffState,
@@ -419,9 +387,7 @@ impl<'a> Painter<'a> {
     }
 
     fn thread_row(&mut self, thread: u32, part: ThreadPart, y: Pixels) {
-        let Some(comment) = self.state.thread(thread) else { return };
-        let outdated = self.state.thread_outdated(thread);
-        let text = thread_text(comment, part, outdated);
+        let Some(text) = self.state.thread_row_text(thread, part) else { return };
         let clip = self.row_clip(y);
         let x = self.bounds.origin.x + self.cells(self.gutter_cells());
         let bar = self.colors.thread;
@@ -666,31 +632,6 @@ pub fn blame_text(blame: &BlameLine, now: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shelbi_app::diff::comments::{Anchor, Author, CommentReply};
-    use shelbi_app::diff::Side as AnchorSide;
-
-    fn comment(body: &str, sent: bool) -> Comment {
-        let at = chrono::DateTime::from_timestamp(0, 0).unwrap();
-        Comment {
-            id: "c".into(),
-            anchor: Anchor { path: "a".into(), side: AnchorSide::New, start: 1, end: 1, code: Vec::new() },
-            author: Author::human("jlong"),
-            body: body.into(),
-            created_at: at,
-            replies: vec![CommentReply { id: "r".into(), author: Author::agent("developer"), body: "ok".into(), created_at: at }],
-            sent,
-        }
-    }
-
-    #[test]
-    fn a_thread_reads_as_the_wireframe_has_it() {
-        let c = comment("why not reuse it?", false);
-        assert_eq!(thread_text(&c, ThreadPart::Head, false), "jlong: why not reuse it?");
-        assert_eq!(thread_text(&c, ThreadPart::Reply(0), false), "  ↳ developer: ok");
-        assert_eq!(thread_text(&c, ThreadPart::Summary, false), "  ▸ 1 reply");
-        assert_eq!(thread_text(&comment("one\ntwo", true), ThreadPart::Head, true), "jlong (outdated, sent): one …");
-    }
-
     #[test]
     fn a_blame_gutter_fits_its_cells() {
         let line = |uncommitted| BlameLine {

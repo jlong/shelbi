@@ -1,0 +1,38 @@
+---
+title: shelbi diff
+order: 32.5
+summary: Read and answer the review threads on a task's diff.
+---
+
+```text
+shelbi diff comment list --task <TASK> [--json]
+shelbi diff comment reply --task <TASK> -i <THREAD> [-a <NAME>] <TEXT>
+```
+
+A person reviewing a task in Shelbi's diff view can comment on lines and send
+the comments to the task's agent with `gY`. `shelbi diff comment` is the agent's
+side of those threads, so it can answer a comment where the reviewer reads it.
+
+`TASK` is the task's id, or `ws-<workspace>` for a workspace with no task on it.
+
+## `list`
+
+Prints each thread with its number, id, location, the quoted code, and its
+replies. `--json` prints the threads as JSON.
+
+## `reply`
+
+Adds a reply to a thread. It shows under the comment in both clients within a
+couple of seconds, with no refresh.
+
+- `-i`, `--index`: the thread, as its id, a prefix of its id, or its number in
+  `list`.
+- `-a`, `--author`: the name the reply is signed with. Defaults to
+  `$SHELBI_AGENT`, which Shelbi sets in an agent's session.
+
+An agent's reply doesn't count as a new comment: the thread stays sent, so the
+next `gY` doesn't send the agent its own words back. A person's reply does.
+
+A session on another machine reaches the threads through the hub's address in
+its environment. Without one, `shelbi diff comment` reads and writes this
+machine's copy of the project.

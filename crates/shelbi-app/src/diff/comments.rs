@@ -149,8 +149,12 @@ impl CommentDoc {
                 let Some(comment) = self.comments.iter_mut().find(|c| c.id == *id) else { return };
                 if !comment.replies.iter().any(|r| r.id == reply.id) {
                     comment.replies.push(reply.clone());
-                    // A new reply hasn't been sent, whatever the thread had.
-                    comment.sent = false;
+                    // A person's new reply hasn't been sent, whatever the thread
+                    // had. An agent's is the agent's own answer: telling it back
+                    // would only start a loop.
+                    if reply.author.kind == AuthorKind::Human {
+                        comment.sent = false;
+                    }
                 }
             }
             CommentOp::Delete { id, reply: None } => self.comments.retain(|c| c.id != *id),
@@ -286,16 +290,77 @@ pub fn format_comments<'a>(comments: impl IntoIterator<Item = &'a Comment>) -> S
     parts.join("\n")
 }
 
-/// The message `gY` sends the agent: every thread not sent yet.
-pub fn agent_message(doc: &CommentDoc) -> Option<(String, Vec<String>)> {
+/// One thread as an agent reads it: [`format_comment`] with the id a reply
+/// names.
+fn format_for_agent(comment: &Comment) -> String {
+    format!("[thread {}] {}", comment.id, format_comment(comment))
+}
+
+/// The threads `gY` hasn't sent yet, with what a message about them says: the
+/// quoted code, and how to answer each one inline. `project` and `key` (the
+/// task's state key, [`super::backend::DiffTarget::state_key`]) make the reply
+/// command work from any directory, on any machine.
+pub fn agent_message(doc: &CommentDoc, project: &str, key: &str) -> Option<(String, Vec<String>)> {
     let unsent: Vec<&Comment> = doc.comments.iter().filter(|c| !c.sent).collect();
     if unsent.is_empty() {
         return None;
     }
     let ids = unsent.iter().map(|c| c.id.clone()).collect();
-    let mut message = String::from("Review comments on this branch:\n\n");
-    message.push_str(&format_comments(unsent));
+    let threads: Vec<String> = unsent.into_iter().map(format_for_agent).collect();
+    let message = format!(
+        "Review comments on this branch:\n\n{}\nTo answer a thread where the reviewer reads it, run: \
+         shelbi --project {project} diff comment reply --task {key} -i <thread> \"your reply\"",
+        threads.join("\n")
+    );
     Some((message, ids))
+}
+
+/// Whether a reject's reason carries any threads at all, before anything reads
+/// the store to find out which.
+pub fn reason_carries_threads(reason: &str) -> bool {
+    reason.contains("[thread ")
+}
+
+/// The threads `reason` carries: what's still marked unsent once a reject with
+/// it lands, leaving any the reviewer cut from the reason out.
+pub fn threads_in(reason: &str, doc: &CommentDoc) -> Vec<String> {
+    doc.comments
+        .iter()
+        .filter(|c| !c.sent && reason.contains(&format_for_agent(c)))
+        .map(|c| c.id.clone())
+        .collect()
+}
+
+/// A reply from `author` to the thread `selector` names.
+pub fn reply_to(doc: &CommentDoc, selector: &str, author: Author, body: &str) -> Result<CommentOp, String> {
+    if body.trim().is_empty() {
+        return Err("a reply needs some text".to_string());
+    }
+    let thread = find_thread(doc, selector)?;
+    Ok(CommentOp::Reply {
+        id: thread.id.clone(),
+        reply: CommentReply { id: fresh_id(), author, body: body.trim_end().to_string(), created_at: Utc::now() },
+    })
+}
+
+/// The thread `selector` names: its id, a prefix of it only one thread has, or
+/// its place in the list from 1 (`shelbi diff comment list`).
+pub fn find_thread<'a>(doc: &'a CommentDoc, selector: &str) -> Result<&'a Comment, String> {
+    if let Some(comment) = doc.get(selector) {
+        return Ok(comment);
+    }
+    if let Ok(at) = selector.parse::<usize>() {
+        return at
+            .checked_sub(1)
+            .and_then(|i| doc.comments.get(i))
+            .ok_or_else(|| format!("no thread {at}: this task has {}", doc.comments.len()));
+    }
+    let mut matching = doc.comments.iter().filter(|c| c.id.starts_with(selector));
+    match (matching.next(), matching.next()) {
+        (Some(comment), None) => Ok(comment),
+        (Some(_), Some(_)) => Err(format!("`{selector}` matches more than one thread")),
+        (None, _) => Err(format!("no thread `{selector}` on this task")),
+    }
 }
 
 #[cfg(test)]
@@ -386,6 +451,67 @@ mod tests {
     }
 
     #[test]
+    fn a_message_names_each_thread_and_how_to_answer_it() {
+        let mut sent = comment("old", "a.rs", Side::New, 1, 1, &["x"]);
+        sent.sent = true;
+        let doc = CommentDoc {
+            comments: vec![sent, comment("c1", "a.rs", Side::New, 11, 12, &["TWO", "three"])],
+        };
+        let (message, ids) = agent_message(&doc, "proj", "my-task").unwrap();
+        assert_eq!(ids, ["c1"]);
+        assert!(message.contains("[thread c1] a.rs:11-12\n```\nTWO\nthree\n```\njlong: why?\n"), "{message}");
+        assert!(!message.contains("[thread old]"), "sent threads stay out: {message}");
+        assert!(message.contains("shelbi --project proj diff comment reply --task my-task -i <thread>"), "{message}");
+        assert!(agent_message(&CommentDoc::default(), "p", "t").is_none());
+    }
+
+    #[test]
+    fn a_reject_marks_only_the_threads_its_reason_still_holds() {
+        let doc = CommentDoc {
+            comments: vec![
+                comment("kept", "a.rs", Side::New, 1, 1, &["x"]),
+                comment("cut", "b.rs", Side::New, 2, 2, &["y"]),
+            ],
+        };
+        let (message, _) = agent_message(&doc, "p", "t").unwrap();
+        let start = message.find("[thread cut]").unwrap();
+        let edited = format!("Please redo this.\n\n{}", &message[..start]);
+        assert_eq!(threads_in(&edited, &doc), ["kept"]);
+    }
+
+    #[test]
+    fn a_thread_is_found_by_id_prefix_or_place() {
+        let doc = CommentDoc {
+            comments: vec![
+                comment("abc-1", "a.rs", Side::New, 1, 1, &["x"]),
+                comment("abd-2", "a.rs", Side::New, 2, 2, &["y"]),
+            ],
+        };
+        assert_eq!(find_thread(&doc, "abd-2").unwrap().id, "abd-2");
+        assert_eq!(find_thread(&doc, "abc").unwrap().id, "abc-1");
+        assert_eq!(find_thread(&doc, "2").unwrap().id, "abd-2");
+        assert!(find_thread(&doc, "ab").unwrap_err().contains("more than one"));
+        assert!(find_thread(&doc, "9").unwrap_err().contains("no thread 9"));
+        assert!(find_thread(&doc, "zz").unwrap_err().contains("no thread"));
+    }
+
+    #[test]
+    fn a_persons_reply_reopens_a_thread_and_an_agents_doesnt() {
+        let reply = |id: &str, author: Author| CommentReply {
+            id: id.into(),
+            author,
+            body: "ok".into(),
+            created_at: DateTime::from_timestamp(0, 0).unwrap(),
+        };
+        let mut doc = CommentDoc { comments: vec![comment("c", "a.rs", Side::New, 1, 1, &["x"])] };
+        doc.apply(&CommentOp::MarkSent { ids: vec!["c".into()] });
+        doc.apply(&CommentOp::Reply { id: "c".into(), reply: reply("r1", Author::agent("developer")) });
+        assert!(doc.comments[0].sent, "the agent's own answer needs no sending back");
+        doc.apply(&CommentOp::Reply { id: "c".into(), reply: reply("r2", Author::human("jlong")) });
+        assert!(!doc.comments[0].sent, "the person's follow-up does");
+    }
+
+    #[test]
     fn ops_apply_and_repeat_harmlessly() {
         let mut doc = CommentDoc::default();
         let add = CommentOp::Add(comment("c", "a.rs", Side::New, 1, 1, &["x"]));
@@ -394,7 +520,7 @@ mod tests {
         assert_eq!(doc.comments.len(), 1);
         let reply = CommentReply {
             id: "r".into(),
-            author: Author::agent("developer"),
+            author: Author::human("jlong"),
             body: "fixed".into(),
             created_at: DateTime::from_timestamp(0, 0).unwrap(),
         };
@@ -404,7 +530,7 @@ mod tests {
         doc.apply(&op);
         doc.apply(&op);
         assert_eq!(doc.comments[0].replies.len(), 1);
-        assert!(!doc.comments[0].sent, "a new reply hasn't been sent");
+        assert!(!doc.comments[0].sent, "a person's new reply hasn't been sent");
         doc.apply(&CommentOp::Edit { id: "c".into(), reply: Some("r".into()), body: "done".into() });
         assert_eq!(doc.comments[0].replies[0].body, "done");
         doc.apply(&CommentOp::Delete { id: "c".into(), reply: Some("r".into()) });
@@ -427,13 +553,15 @@ mod tests {
         let mut second = comment("b", "y.rs", Side::Old, 9, 9, &["gone"]);
         second.sent = true;
         let doc = CommentDoc { comments: vec![first, second] };
-        let (message, ids) = agent_message(&doc).unwrap();
+        let (message, ids) = agent_message(&doc, "p", "t").unwrap();
         assert_eq!(ids, ["a"]);
         assert_eq!(
             message,
-            "Review comments on this branch:\n\nx.rs:3-4\n```\nlet a;\nlet b;\n```\njlong: why?\n  ↳ developer: it drops the slot\n"
+            "Review comments on this branch:\n\n[thread a] x.rs:3-4\n```\nlet a;\nlet b;\n```\njlong: why?\n  ↳ developer: it drops the slot\n\n\
+             To answer a thread where the reviewer reads it, run: \
+             shelbi --project p diff comment reply --task t -i <thread> \"your reply\""
         );
-        assert!(agent_message(&CommentDoc::default()).is_none());
+        assert!(agent_message(&CommentDoc::default(), "p", "t").is_none());
     }
 
     #[test]

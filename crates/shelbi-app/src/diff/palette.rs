@@ -6,6 +6,8 @@
 use shelbi_palette::Scorer;
 use shelbi_state::keymap::{DiffAction, Key, KeyChord, Mods};
 
+use super::backend::TargetKind;
+use super::help::{action_label, applies};
 use super::model::{Changeset, CommitScope};
 
 /// What the palette lists.
@@ -56,16 +58,19 @@ const COMMANDS: &[DiffAction] = &[
     DiffAction::OpenAllFolds,
     DiffAction::YankAll,
     DiffAction::SendToAgent,
+    DiffAction::SendToReviewer,
+    DiffAction::RevertHunk,
+    DiffAction::RevertFile,
     DiffAction::ClearComments,
     DiffAction::OpenInEditor,
     DiffAction::Help,
 ];
 
 /// A command's name in the palette.
-fn command_label(action: DiffAction) -> String {
+fn command_label(action: DiffAction, kind: TargetKind) -> String {
     match action {
         DiffAction::ReplyOrRefresh => "Refresh".to_string(),
-        other => shelbi_state::keymap::Action::Diff(other).label().to_string(),
+        other => action_label(other, kind).to_string(),
     }
 }
 
@@ -77,11 +82,20 @@ pub struct DiffPalette {
     pub query: String,
     /// The selected row of [`Self::items`].
     pub selected: usize,
+    /// What the commands are for: a review has no revert, a workspace no
+    /// Reviewer.
+    pub kind: TargetKind,
 }
 
 impl DiffPalette {
     pub fn new(mode: PaletteMode) -> Self {
-        DiffPalette { mode, query: String::new(), selected: 0 }
+        DiffPalette { mode, query: String::new(), selected: 0, kind: TargetKind::Workspace }
+    }
+
+    /// With the commands a `kind` target has.
+    pub fn for_kind(mut self, kind: TargetKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// The rows, best match first.
@@ -99,8 +113,9 @@ impl DiffPalette {
                 .collect::<Vec<_>>(),
             PaletteMode::Commands => COMMANDS
                 .iter()
+                .filter(|a| applies(**a, self.kind))
                 .map(|a| PaletteItem {
-                    label: command_label(*a),
+                    label: command_label(*a, self.kind),
                     detail: String::new(),
                     target: PaletteTarget::Action(*a),
                 })

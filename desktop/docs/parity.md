@@ -83,6 +83,13 @@ paths on every `cargo test`.
   the TUI's Default model ends with "Custom model…" and the desktop's menu
   lists the suggestions. The desktop wizard's three steps are screens of its
   own window; the TUI's are pages of its Add project dialog.
+- **Diff comments, sending and revert** (`ndv-comments-agent`): shared state and
+  workers, so the same keys, status line and refusals in both. `gY` in a review
+  asks each client for its own Reject prompt (`DiffOut::Reject`,
+  `DiffViewEvent::Reject`), and Reject from the panel or palette starts from the
+  unsent comments: the TUI reads them as it opens the prompt, the desktop fills
+  an already open prompt when its read comes back, since a project on another
+  machine answers over a relay. A revert's question is the status line in both.
 - **View Diff's wait** (`review-diff-loading-state`): both clients draw the
   shared `shelbi_app::review::diff_load::DiffLoad`, with the same "Loading
   diff…", 15s limit, cause and retries. The desktop's Retry is a button; the

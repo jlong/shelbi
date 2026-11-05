@@ -272,6 +272,8 @@ pub enum ReviewEvent {
     /// Run a registry command: `ApproveReview`, or `RejectReview` with no
     /// reason (which asks for one).
     Command(CommandKind),
+    /// `gY` in the diff: Reject, its reason starting from the comments.
+    RejectWith { id: String, reason: String },
     /// Leave the review loaded and go back to the previous view.
     Back,
     /// More: open this task's detail over the screen.
@@ -864,6 +866,11 @@ impl ReviewView {
                     this.focus = ReviewFocus::Panel;
                     this.refocus = true;
                     cx.notify();
+                }
+                DiffViewEvent::Reject(reason) => {
+                    if let Some(id) = this.task_id().map(str::to_string) {
+                        cx.emit(ReviewEvent::RejectWith { id, reason: reason.clone() });
+                    }
                 }
             });
             ShownDiff { view, _events: events }

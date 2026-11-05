@@ -814,6 +814,8 @@ impl WorkspaceView {
                     this.refocus = true;
                     cx.notify();
                 }
+                // A workspace's `gY` goes to its agent: only a review rejects.
+                DiffViewEvent::Reject(_) => {}
             });
             self.diff = Some((view, events));
         }

@@ -6,7 +6,8 @@ use std::sync::Mutex;
 use shelbi_app::diff::comments::{CommentDoc, CommentOp};
 use shelbi_app::diff::git::{BlameLine, RawChangeset};
 use shelbi_app::diff::store::{ViewedDoc, ViewedOp};
-use shelbi_app::diff::{CommitInfo, CommitScope, DiffBackend};
+use shelbi_app::diff::revert::{RevertClass, RevertPlan, RevertSpec};
+use shelbi_app::diff::{AgentDelivery, CommitInfo, CommitScope, DiffBackend};
 
 /// Adds, edits, a delete, a rename and a binary, the shapes the view has to
 /// draw, in code the highlighter knows.
@@ -131,5 +132,17 @@ impl DiffBackend for Canned {
         let mut doc = self.viewed.lock().unwrap();
         doc.apply(op);
         Ok(doc.clone())
+    }
+
+    fn send_to_agent(&self, _message: &str) -> Result<AgentDelivery, String> {
+        Ok(AgentDelivery::Submitted)
+    }
+
+    fn plan_revert(&self, spec: &RevertSpec) -> Result<RevertPlan, String> {
+        Ok(RevertPlan { spec: spec.clone(), class: RevertClass::Committed, label: spec.path.clone() })
+    }
+
+    fn revert(&self, plan: &RevertPlan) -> Result<String, String> {
+        Ok(plan.done())
     }
 }

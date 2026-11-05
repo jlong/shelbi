@@ -4,6 +4,8 @@
 
 use shelbi_state::keymap::{Action, DiffAction, KeyChord, ModeKeymap};
 
+use super::backend::TargetKind;
+
 /// One action's row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelpRow {
@@ -96,33 +98,72 @@ pub const SECTIONS: &[(&str, &[DiffAction])] = &[
             DiffAction::Yank,
             DiffAction::YankAll,
             DiffAction::SendToAgent,
+            DiffAction::SendToReviewer,
         ],
     ),
+    ("Revert", &[DiffAction::RevertHunk, DiffAction::RevertFile]),
     ("Other", &[DiffAction::OpenInEditor, DiffAction::Help]),
 ];
 
 /// The overlay's rows for `keymap`, each chord spelled by `spell`.
-pub fn help_sections(keymap: &ModeKeymap<DiffAction>, spell: impl Fn(&KeyChord) -> String) -> Vec<HelpSection> {
+pub fn help_sections(
+    keymap: &ModeKeymap<DiffAction>,
+    kind: TargetKind,
+    spell: impl Fn(&KeyChord) -> String,
+) -> Vec<HelpSection> {
     SECTIONS
         .iter()
         .map(|(title, actions)| HelpSection {
             title,
             rows: actions
                 .iter()
+                .filter(|action| applies(**action, kind))
                 .map(|action| HelpRow {
                     action: *action,
-                    label: Action::Diff(*action).label(),
+                    label: action_label(*action, kind),
                     keys: keymap.chords_for(*action).into_iter().map(&spell).collect(),
                 })
                 .collect(),
         })
+        .filter(|section: &HelpSection| !section.rows.is_empty())
         .collect()
+}
+
+/// Whether `action` means anything on a `kind` target. A review has no worktree
+/// of its own to revert, and a workspace has no Reviewer.
+pub fn applies(action: DiffAction, kind: TargetKind) -> bool {
+    match action {
+        DiffAction::RevertHunk | DiffAction::RevertFile => kind == TargetKind::Workspace,
+        DiffAction::SendToReviewer => kind == TargetKind::Review,
+        _ => true,
+    }
+}
+
+/// `action`'s name on a `kind` target: in a review, `gY` sends the comments back
+/// through Reject.
+pub fn action_label(action: DiffAction, kind: TargetKind) -> &'static str {
+    match (action, kind) {
+        (DiffAction::SendToAgent, TargetKind::Review) => "Reject with the comments as its reason",
+        _ => Action::Diff(action).label(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use shelbi_state::keymap::validate_keymaps_yaml;
+
+    #[test]
+    fn a_review_lists_no_revert_and_a_workspace_no_reviewer() {
+        let km = validate_keymaps_yaml("", None).0.diff;
+        let rows = |kind| -> Vec<DiffAction> {
+            help_sections(&km, kind, |c| c.canonical()).iter().flat_map(|s| s.rows.iter().map(|r| r.action)).collect()
+        };
+        let (review, workspace) = (rows(TargetKind::Review), rows(TargetKind::Workspace));
+        assert!(review.contains(&DiffAction::SendToReviewer) && !review.contains(&DiffAction::RevertFile));
+        assert!(workspace.contains(&DiffAction::RevertHunk) && !workspace.contains(&DiffAction::SendToReviewer));
+        assert_eq!(action_label(DiffAction::SendToAgent, TargetKind::Review), "Reject with the comments as its reason");
+    }
 
     #[test]
     fn every_action_is_listed_once() {
@@ -139,7 +180,7 @@ mod tests {
     #[test]
     fn it_shows_the_keys_in_effect() {
         let km = validate_keymaps_yaml("defaults:\n  diff:\n    cursor_down: e\n    top: 'x y'\n    help: []\n", None).0.diff;
-        let sections = help_sections(&km, |c| c.canonical());
+        let sections = help_sections(&km, TargetKind::Workspace, |c| c.canonical());
         let row = |action| {
             sections.iter().flat_map(|s| &s.rows).find(|r| r.action == action).unwrap().clone()
         };

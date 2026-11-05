@@ -28,9 +28,8 @@ gpui client of it. The TUI's is `ndv-tui`, and comments' delivery and revert are
   wheel scrolls (sideways for long lines, with the stroke's larger axis winning),
   a file row jumps, a check marks viewed, a palette row chooses, a click off an
   overlay closes it.
-- **Comments, basically**: thread rows and the comment editor draw, since the
-  state already takes the keys and a thread can arrive from elsewhere. Their
-  polish is `ndv-comments-agent`'s.
+- **Comments**: thread rows and the comment editor draw. Sending them to the
+  agent and reverting are [`ndv-comments-agent`](ndv-comments-agent.md).
 
 ## Decisions
 
@@ -57,8 +56,6 @@ gpui client of it. The TUI's is `ndv-tui`, and comments' delivery and revert are
 
 ## What's left
 
-- `gY` copies the comments and says so; delivery to the agent is
-  `ndv-comments-agent`.
 - The scrollbar is an indicator: no dragging.
 - No accessibility tree for the rows yet (the terminal has one).
 

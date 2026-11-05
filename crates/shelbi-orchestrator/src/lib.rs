@@ -19,6 +19,7 @@ use shelbi_core::{Error, Host, MachineKind, Result};
 use crate::session_backend::{backend, SessionBackend, SessionTarget};
 
 pub mod actions;
+pub mod agent_send;
 pub mod branch;
 pub mod cancel;
 pub(crate) mod codex_rpc;

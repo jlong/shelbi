@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use super::comments::{CommentDoc, CommentOp};
+use super::comments::{reply_to, Author, CommentDoc, CommentOp};
 
 const COMMENTS_FILE: &str = "comments.json";
 const VIEWED_FILE: &str = "viewed.json";
@@ -109,6 +109,18 @@ impl DiffStore {
         Ok(doc)
     }
 
+    /// A reply to the thread `selector` names ([`super::comments::find_thread`]),
+    /// answering the result. Under one lock, so a thread can't move between
+    /// finding it and replying.
+    pub fn reply(&self, selector: &str, author: Author, body: &str) -> Result<CommentDoc, String> {
+        let _lock = self.lock()?;
+        let mut doc: CommentDoc = self.read(COMMENTS_FILE)?;
+        let op = reply_to(&doc, selector, author, body)?;
+        doc.apply(&op);
+        self.write(COMMENTS_FILE, &doc)?;
+        Ok(doc)
+    }
+
     pub fn viewed(&self) -> Result<ViewedDoc, String> {
         self.read(VIEWED_FILE)
     }
@@ -134,7 +146,7 @@ fn read_json<T: DeserializeOwned + Default>(path: &Path) -> Result<T, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff::comments::{Anchor, Author, Comment};
+    use crate::diff::comments::{Anchor, AuthorKind, Comment};
     use crate::diff::model::Side;
 
     fn comment(id: &str) -> Comment {
@@ -164,6 +176,20 @@ mod tests {
         assert!(!viewed.is_viewed("a.rs", 8), "changing the file clears the mark");
         reopened.apply_viewed(&ViewedOp::Unmark { path: "a.rs".into() }).unwrap();
         assert!(!reopened.viewed().unwrap().is_viewed("a.rs", 7));
+    }
+
+    #[test]
+    fn an_agents_reply_lands_on_its_thread_with_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DiffStore::at(dir.path());
+        store.apply_comment(&CommentOp::Add(comment("thread-a"))).unwrap();
+        let doc = store.reply("thread", Author::agent("developer"), "fixed in abc\n").unwrap();
+        let reply = &doc.comments[0].replies[0];
+        assert_eq!((reply.author.name.as_str(), reply.author.kind), ("developer", AuthorKind::Agent));
+        assert_eq!(reply.body, "fixed in abc");
+        assert_eq!(store.comments().unwrap(), doc, "it's on disk");
+        assert!(store.reply("nope", Author::agent("d"), "x").is_err());
+        assert!(store.reply("thread", Author::agent("d"), "  ").is_err());
     }
 
     #[test]
