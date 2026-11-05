@@ -1395,6 +1395,10 @@ mod two_key_tests {
             ("g Y", DiffAction::SendToAgent),
             ("g A", DiffAction::SendToReviewer),
             ("g r", DiffAction::RevertHunk),
+            ("x", DiffAction::ToggleResolved),
+            ("C", DiffAction::ToggleCommentTarget),
+            ("R", DiffAction::SubmitReview),
+            ("i", DiffAction::PrInfo),
             ("g R", DiffAction::RevertFile),
             ("ctrl-g", DiffAction::OpenInEditor),
         ];
@@ -1407,14 +1411,14 @@ mod two_key_tests {
 
     #[test]
     fn the_diff_context_is_rebindable_with_two_keys() {
-        let (km, diags) = load("defaults:\n  diff:\n    cursor_down: e\n    top: 'x y'\n");
+        let (km, diags) = load("defaults:\n  diff:\n    cursor_down: e\n    top: 'q y'\n");
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(km.diff.dispatch(chord("e")), Some(DiffAction::CursorDown));
         assert_eq!(km.diff.dispatch(chord("j")), None);
-        assert_eq!(km.diff.dispatch(chord("x y")), Some(DiffAction::Top));
+        assert_eq!(km.diff.dispatch(chord("q y")), Some(DiffAction::Top));
         assert_eq!(km.diff.dispatch(chord("g g")), None);
         // `G` is still only the second half of nothing: `g` leads `g Y` alone.
-        assert!(km.diff.is_leader(chord("x")));
+        assert!(km.diff.is_leader(chord("q")));
     }
 
     #[test]

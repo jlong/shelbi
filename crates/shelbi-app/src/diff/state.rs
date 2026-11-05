@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
+use shelbi_core::IssuePr;
 use shelbi_state::keymap::{DiffAction, Key, KeyChord, Mods, ModeKeymap};
 
 use super::backend::{AgentDelivery, DiffTarget, TargetKind};
@@ -23,6 +24,7 @@ use super::git::BlameLine;
 use super::highlight::FileHighlights;
 use super::model::{Changeset, CommitScope, DiffLine, FileDiff, LineKind, Side};
 use super::palette::{DiffPalette, PaletteMode, PaletteStep, PaletteTarget};
+use super::pr::{place_threads, PrDetails, PrPart, PrSpan, PrThread, PrTone, PrView, PrWrite, ReviewEvent};
 use super::revert::{RevertPlan, RevertSpec};
 use super::rows::{build_rows, Folds, HunkFilter, Row, RowInput, RowTable, ThreadPart, Threads, ViewMode};
 use super::search::{matches_on, search, SearchMatch};
@@ -54,6 +56,8 @@ pub enum DiffEffect {
     SaveComment(CommentOp),
     /// Save this change to the task's viewed marks.
     SaveViewed(ViewedOp),
+    /// Change this on the pull request, through `gh`.
+    PrWrite(PrWrite),
 }
 
 /// Which character find.
@@ -82,6 +86,9 @@ pub enum Mode {
     /// A revert, waiting for `y`. [`RevertPlan::prompt`] is the question, which
     /// the status bar asks.
     Confirm(Box<RevertPlan>),
+    /// The `i` panel: every check and review. A client draws
+    /// [`DiffState::pr_info_rows`].
+    PrInfo { scroll: usize },
 }
 
 impl Mode {
@@ -96,6 +103,7 @@ impl Mode {
             Mode::Palette(_) => "PALETTE",
             Mode::Help { .. } => "HELP",
             Mode::Confirm(_) => "CONFIRM",
+            Mode::PrInfo { .. } => "PR INFO",
         }
     }
 }
@@ -107,6 +115,7 @@ enum Spot {
     Hunk { path: String, old_start: u32 },
     Line { path: String, old_start: u32, side: Side, number: u32, text: String },
     Thread { id: String, path: String },
+    Pr(PrPart),
     Nothing,
 }
 
@@ -114,6 +123,16 @@ enum Spot {
 pub struct DiffState {
     changeset: Arc<Changeset>,
     comments: CommentDoc,
+    /// The threads a row can show: the task's comments, then GitHub's.
+    shown: Vec<Comment>,
+    /// The task's pull request.
+    pr: PrView,
+    /// GitHub threads opened or closed against how they open by default.
+    pr_toggled: HashSet<String>,
+    /// New comments go to the pull request's pending review.
+    comment_on_github: bool,
+    /// How many rows the `i` panel shows, which isn't how many the diff does.
+    pr_info_height: usize,
     viewed: ViewedDoc,
     places: HashMap<String, Placement>,
     threads: Threads,
@@ -168,6 +187,11 @@ impl DiffState {
         DiffState {
             changeset: Arc::new(Changeset::default()),
             comments: CommentDoc::default(),
+            shown: Vec::new(),
+            pr: PrView::default(),
+            pr_toggled: HashSet::new(),
+            comment_on_github: false,
+            pr_info_height: 20,
             viewed: ViewedDoc::default(),
             places: HashMap::new(),
             threads: Threads::default(),
@@ -324,9 +348,12 @@ impl DiffState {
         }
     }
 
-    /// The file the cursor is in.
+    /// The file the cursor is in. The description block is in none.
     pub fn current_file(&self) -> Option<usize> {
-        self.table.rows.get(self.cursor).map(|r| r.file() as usize)
+        match self.table.rows.get(self.cursor)? {
+            Row::Pr { .. } => None,
+            row => Some(row.file() as usize),
+        }
     }
 
     pub fn file(&self, index: u32) -> Option<&FileDiff> {
@@ -357,17 +384,67 @@ impl DiffState {
     /// The thread a [`Row::Thread`] shows.
     pub fn thread(&self, index: u32) -> Option<&Comment> {
         let (comment, _) = self.threads.placed.get(index as usize)?;
-        self.comments.comments.get(*comment)
+        self.shown.get(*comment)
     }
 
-    /// Whether a thread is out of date (its lines are gone).
+    /// The GitHub thread behind `shown[comment]`, if that's what it is.
+    fn github_thread(&self, comment: usize) -> Option<&PrThread> {
+        let id = self.shown.get(comment)?.id.as_str();
+        self.pr_thread(id)
+    }
+
+    fn pr_thread(&self, comment_id: &str) -> Option<&PrThread> {
+        self.pr.details.as_ref()?.threads.iter().find(|t| t.comment_id() == comment_id)
+    }
+
+    /// Whether a thread is out of date: GitHub says so of its own, and a task's
+    /// comment is when its lines are gone.
     pub fn thread_outdated(&self, index: u32) -> bool {
-        self.threads.placed.get(index as usize).is_some_and(|(_, p)| p.at.is_none())
+        let Some((comment, place)) = self.threads.placed.get(index as usize) else { return false };
+        match self.github_thread(*comment) {
+            Some(thread) => thread.outdated,
+            None => place.at.is_none(),
+        }
     }
 
     /// Whether a thread's replies are showing.
     pub fn thread_expanded(&self, id: &str) -> bool {
-        self.expanded.contains(id)
+        match self.pr_thread(id) {
+            Some(thread) => thread.opens_expanded() != self.pr_toggled.contains(id),
+            None => self.expanded.contains(id),
+        }
+    }
+
+    /// The tag at the end of a thread's head row: where a GitHub thread stands.
+    pub fn thread_tag(&self, index: u32) -> Option<(&'static str, PrTone)> {
+        let (comment, _) = self.threads.placed.get(index as usize)?;
+        self.github_thread(*comment).map(PrThread::tag)
+    }
+
+    /// What's known of the task's pull request.
+    pub fn pr(&self) -> &PrView {
+        &self.pr
+    }
+
+    /// What a [`Row::Pr`] says.
+    pub fn pr_row(&self, part: PrPart) -> Vec<PrSpan> {
+        self.pr.spans(part)
+    }
+
+    /// The `i` panel's rows.
+    pub fn pr_info_rows(&self) -> Vec<Vec<PrSpan>> {
+        self.pr.info_rows(&self.changeset)
+    }
+
+    /// How many rows the client's `i` panel has room for, so its keys stop at
+    /// the last page.
+    pub fn set_pr_info_height(&mut self, rows: usize) {
+        self.pr_info_height = rows.max(1);
+    }
+
+    /// Whether new comments go to GitHub (`C`).
+    pub fn comment_on_github(&self) -> bool {
+        self.comment_on_github
     }
 
     /// The text of a [`Row::Thread`].
@@ -426,7 +503,11 @@ impl DiffState {
         let mut parts = vec![self.mode.label().to_string(), self.view.label().to_string(), self.filter.label().to_string()];
         let files = self.changeset.files.len();
         if files > 0 {
-            parts.push(format!("{}/{files}", self.current_file().map_or(0, |f| f + 1)));
+            parts.push(match self.current_file() {
+                Some(file) => format!("{}/{files}", file + 1),
+                // On the description block, which is in none of them.
+                None => format!("{files} {}", if files == 1 { "file" } else { "files" }),
+            });
         }
         let comments = self.comments.comments.len();
         if comments > 0 {
@@ -437,6 +518,9 @@ impl DiffState {
                 (true, TargetKind::Workspace) => format!("{comments} {noun} (gY send to agent)"),
                 (true, TargetKind::Review) => format!("{comments} {noun} (gY reject with them · gA send to the Reviewer)"),
             });
+        }
+        if self.comment_on_github {
+            parts.push("new comments go to GitHub (C)".to_string());
         }
         if !self.query.is_empty() {
             match self.current_match() {
@@ -514,7 +598,7 @@ impl DiffState {
         self.blame.clear();
         self.loading = false;
         self.error = None;
-        self.places = place(&self.comments, &self.changeset);
+        self.place_threads();
         if !self.query.is_empty() {
             self.matches = search(&self.changeset, &self.query);
             self.current_match = None;
@@ -544,7 +628,7 @@ impl DiffState {
         }
         let spot = self.spot();
         self.comments = doc;
-        self.places = place(&self.comments, &self.changeset);
+        self.place_threads();
         self.rebuild();
         self.restore(&spot);
         self.keep_cursor_in_view();
@@ -552,6 +636,93 @@ impl DiffState {
         if matches!(self.mode, Mode::Visual { .. }) {
             self.mode = Mode::Normal;
         }
+    }
+
+    /// What looking up the task's pull request found.
+    pub fn set_pr_lookup(&mut self, lookup: Result<Option<IssuePr>, String>) {
+        self.keeping_view(|state| state.pr.set_lookup(lookup));
+        if !self.pr.shows() {
+            self.comment_on_github = false;
+        }
+    }
+
+    /// What a read of the pull request found. The rows change above and among
+    /// what's on show, so the view stays on the same text.
+    pub fn set_pr_details(&mut self, details: Result<Arc<PrDetails>, String>) {
+        self.keeping_view(|state| state.pr.set_details(details));
+    }
+
+    /// Change the threads or the block, with the cursor on the same text at the
+    /// same height in the view.
+    fn keeping_view(&mut self, change: impl FnOnce(&mut Self)) {
+        let spot = self.spot();
+        let offset = self.cursor.saturating_sub(self.top);
+        // Nobody has moved yet: the block that just came is what they should see.
+        let at_start = self.cursor == 0 && self.top == 0;
+        change(self);
+        self.place_threads();
+        self.rebuild();
+        if at_start {
+            return;
+        }
+        self.restore(&spot);
+        self.top = self.cursor.saturating_sub(offset).min(self.max_top());
+        self.keep_cursor_in_view();
+        if matches!(self.mode, Mode::Visual { .. }) {
+            self.mode = Mode::Normal;
+        }
+    }
+
+    /// How a change to the pull request went. Words GitHub refused aren't lost:
+    /// a new comment stays as a local one, and a reply or a review goes back to
+    /// its editor (or to the clipboard if something else has the keyboard now).
+    pub fn pr_written(&mut self, change: PrWrite, result: Result<String, String>) -> Vec<DiffEffect> {
+        let why = match result {
+            Ok(done) => {
+                self.flash = Some(done);
+                return Vec::new();
+            }
+            Err(why) => why,
+        };
+        match change {
+            PrWrite::Resolve { .. } => {
+                self.flash = Some(format!("GitHub didn't take that: {why}"));
+                Vec::new()
+            }
+            PrWrite::AddThread { anchor, body } => {
+                self.flash = Some(format!("Kept as a local comment: {why}"));
+                let comment = Comment {
+                    id: super::comments::fresh_id(),
+                    anchor,
+                    author: self.author.clone(),
+                    body,
+                    created_at: Utc::now(),
+                    replies: Vec::new(),
+                    sent: false,
+                };
+                let op = CommentOp::Add(comment);
+                self.apply_comment_op(&op);
+                vec![DiffEffect::SaveComment(op)]
+            }
+            PrWrite::Reply { thread, body } => {
+                self.back_to_draft(DraftTarget::GithubReply { thread }, body, &why)
+            }
+            PrWrite::SubmitReview { event, body } => {
+                self.back_to_draft(DraftTarget::Review { event }, body, &why)
+            }
+        }
+    }
+
+    /// The editor again with `text`, saying why it's back. If a mode has the
+    /// keyboard, the words go to the clipboard instead of taking it away.
+    fn back_to_draft(&mut self, target: DraftTarget, text: String, why: &str) -> Vec<DiffEffect> {
+        if matches!(self.mode, Mode::Normal) {
+            self.flash = Some(format!("GitHub didn't take that: {why}"));
+            self.mode = Mode::Comment(Box::new(CommentDraft::new(target, &text)));
+            return Vec::new();
+        }
+        self.flash = Some(format!("GitHub didn't take that, so your words are on the clipboard: {why}"));
+        vec![DiffEffect::Yank(text)]
     }
 
     /// The task's viewed marks as stored.
@@ -644,6 +815,7 @@ impl DiffState {
             Mode::Comment(_) => return self.key_comment(chord),
             Mode::Palette(_) => return self.key_palette(chord),
             Mode::Confirm(_) => return self.key_confirm(chord),
+            Mode::PrInfo { .. } => return self.key_pr_info(chord),
             Mode::Help { scroll } => {
                 match chord.code {
                     Key::Char('j') | Key::Down => *scroll += 1,
@@ -695,6 +867,32 @@ impl DiffState {
         }
         self.count = Some(self.count.unwrap_or(0).saturating_mul(10).saturating_add(digit as usize).min(100_000));
         true
+    }
+
+    /// The panel's keys, as Skim's: `j` `k`, `Ctrl-d` `Ctrl-u`, `g` `G`, `r`
+    /// reads it again, and `i`, `q` or `Esc` closes it.
+    fn key_pr_info(&mut self, chord: KeyChord) -> Vec<DiffEffect> {
+        let Mode::PrInfo { scroll } = self.mode else { return Vec::new() };
+        let last = self.pr_info_rows().len().saturating_sub(self.pr_info_height);
+        let page = (self.pr_info_height / 2).max(1);
+        let ctrl = chord.mods.contains(Mods::CONTROL);
+        let shift = chord.mods.contains(Mods::SHIFT);
+        let to = match chord.code {
+            Key::Char('d') if ctrl => scroll + page,
+            Key::Char('u') if ctrl => scroll.saturating_sub(page),
+            Key::Char('j') | Key::Down => scroll + 1,
+            Key::Char('k') | Key::Up => scroll.saturating_sub(1),
+            Key::Char('g') if shift => last,
+            Key::Char('g') => 0,
+            Key::Char('r') => return vec![DiffEffect::Refresh],
+            Key::Char('i' | 'q') | Key::Esc => {
+                self.mode = Mode::Normal;
+                return Vec::new();
+            }
+            _ => scroll,
+        };
+        self.mode = Mode::PrInfo { scroll: to.min(last) };
+        Vec::new()
     }
 
     /// `y` or `Enter` goes ahead. Anything else keeps the work.
@@ -762,6 +960,19 @@ impl DiffState {
 
     fn key_comment(&mut self, chord: KeyChord) -> Vec<DiffEffect> {
         let Mode::Comment(draft) = &mut self.mode else { return Vec::new() };
+        if let DraftTarget::Review { event } = &mut draft.target {
+            match chord.code {
+                Key::Tab => {
+                    *event = event.next();
+                    return Vec::new();
+                }
+                Key::BackTab => {
+                    *event = event.prev();
+                    return Vec::new();
+                }
+                _ => {}
+            }
+        }
         match draft.key(typed(chord)) {
             DraftStep::Editing => Vec::new(),
             DraftStep::Cancel => {
@@ -770,6 +981,16 @@ impl DiffState {
             }
             DraftStep::Save => {
                 let (target, text) = (draft.target.clone(), draft.text());
+                // GitHub would refuse it: the editor's the place to say so.
+                if let DraftTarget::Review { event } = target {
+                    if event.needs_body() && text.is_empty() {
+                        self.flash = Some(format!("{} needs some words: Tab to Approve without any", event.label()));
+                        return Vec::new();
+                    }
+                    self.mode = Mode::Normal;
+                    self.flash = Some("Submitting the review…".to_string());
+                    return vec![DiffEffect::PrWrite(PrWrite::SubmitReview { event, body: text })];
+                }
                 self.mode = Mode::Normal;
                 self.save_draft(target, text)
             }
@@ -782,6 +1003,16 @@ impl DiffState {
         }
         let id = super::comments::fresh_id();
         let (op, focus) = match target {
+            DraftTarget::GithubNew(anchor) => {
+                self.flash = Some("Adding it to your pending review…".to_string());
+                return vec![DiffEffect::PrWrite(PrWrite::AddThread { anchor, body: text })];
+            }
+            DraftTarget::GithubReply { thread } => {
+                self.flash = Some("Replying on GitHub…".to_string());
+                return vec![DiffEffect::PrWrite(PrWrite::Reply { thread, body: text })];
+            }
+            // Only a review saves with no words, and `key_comment` sent it.
+            DraftTarget::Review { .. } => return Vec::new(),
             DraftTarget::New(anchor) => {
                 let comment = Comment {
                     id: id.clone(),
@@ -815,7 +1046,7 @@ impl DiffState {
     fn apply_comment_op(&mut self, op: &CommentOp) {
         let spot = self.spot();
         self.comments.apply(op);
-        self.places = place(&self.comments, &self.changeset);
+        self.place_threads();
         self.rebuild();
         self.restore(&spot);
         self.keep_cursor_in_view();
@@ -982,8 +1213,67 @@ impl DiffState {
             }
             DiffAction::PickCommit => self.mode = Mode::Palette(DiffPalette::new(PaletteMode::Commits)),
             DiffAction::ToggleFileList => self.file_list = !self.file_list,
+            DiffAction::ToggleResolved => return self.toggle_resolved(),
+            DiffAction::ToggleCommentTarget => self.toggle_comment_target(),
+            DiffAction::SubmitReview => self.start_review(),
+            DiffAction::PrInfo => {
+                if self.pr.shows() {
+                    self.mode = Mode::PrInfo { scroll: 0 };
+                } else {
+                    self.flash = Some(NO_PR.to_string());
+                }
+            }
         }
         Vec::new()
+    }
+
+    /// `x`: resolve the GitHub thread here, or reopen it.
+    fn toggle_resolved(&mut self) -> Vec<DiffEffect> {
+        let thread = self.thread_at_cursor().and_then(|(comment, _)| self.github_thread(comment));
+        let Some(thread) = thread else {
+            self.flash = Some("Move onto a GitHub thread to resolve it".to_string());
+            return Vec::new();
+        };
+        let change = PrWrite::Resolve { thread: thread.id.clone(), resolved: !thread.resolved };
+        self.flash = Some(if thread.resolved { "Reopening the thread…" } else { "Resolving the thread…" }.to_string());
+        vec![DiffEffect::PrWrite(change)]
+    }
+
+    /// `C`: where new comments go.
+    fn toggle_comment_target(&mut self) {
+        if self.comment_on_github {
+            self.comment_on_github = false;
+            self.flash = Some("New comments stay here".to_string());
+            return;
+        }
+        match self.pr_needed() {
+            Ok(_) => {
+                self.comment_on_github = true;
+                self.flash = Some("New comments go to your pending review on GitHub".to_string());
+            }
+            Err(why) => self.flash = Some(why),
+        }
+    }
+
+    /// `R`: the review's editor.
+    fn start_review(&mut self) {
+        match self.pr_needed() {
+            Ok(_) => {
+                let target = DraftTarget::Review { event: ReviewEvent::Comment };
+                self.mode = Mode::Comment(Box::new(CommentDraft::new(target, "")));
+            }
+            Err(why) => self.flash = Some(why),
+        }
+    }
+
+    /// The pull request, or why there's nothing to write to.
+    fn pr_needed(&self) -> Result<&PrDetails, String> {
+        match (&self.pr.details, &self.pr.why) {
+            (Some(details), _) => Ok(details),
+            (None, Some(why)) => Err(format!("The pull request isn't here: {why}")),
+            (None, None) if self.pr.shows() => Err("Still reading the pull request".to_string()),
+            (None, None) => Err(NO_PR.to_string()),
+        }
     }
 
     fn max_top(&self) -> usize {
@@ -1018,7 +1308,13 @@ impl DiffState {
     }
 
     fn step_file(&mut self, by: isize) {
-        let Some(file) = self.current_file() else { return };
+        let Some(file) = self.current_file() else {
+            // On the description block, the first file is next.
+            if by > 0 {
+                self.goto_file(by as usize - 1);
+            }
+            return;
+        };
         let last = self.changeset.files.len().saturating_sub(1);
         self.goto_file(file.saturating_add_signed(by).min(last));
     }
@@ -1303,7 +1599,13 @@ impl DiffState {
             return self.comment_on_rows(start, end);
         }
         if let Some((comment, reply)) = self.thread_at_cursor() {
-            let c = &self.comments.comments[comment];
+            // A GitHub thread can't be edited from here: `Enter` answers it.
+            if let Some(thread) = self.github_thread(comment) {
+                let target = DraftTarget::GithubReply { thread: thread.id.clone() };
+                self.mode = Mode::Comment(Box::new(CommentDraft::new(target, "")));
+                return Vec::new();
+            }
+            let c = &self.shown[comment];
             let (id, reply, text) = match reply {
                 Some(r) => (c.id.clone(), Some(c.replies[r].id.clone()), c.replies[r].body.clone()),
                 None => (c.id.clone(), None, c.body.clone()),
@@ -1352,15 +1654,23 @@ impl DiffState {
             self.flash = Some("A comment's lines have to stay within one hunk".to_string());
             return Vec::new();
         };
-        self.mode = Mode::Comment(Box::new(CommentDraft::new(DraftTarget::New(anchor), "")));
+        let target = if self.comment_on_github && self.pr.details.is_some() {
+            DraftTarget::GithubNew(anchor)
+        } else {
+            DraftTarget::New(anchor)
+        };
+        self.mode = Mode::Comment(Box::new(CommentDraft::new(target, "")));
         Vec::new()
     }
 
     fn reply_or_refresh(&mut self) -> Vec<DiffEffect> {
         match self.thread_at_cursor() {
             Some((comment, _)) => {
-                let id = self.comments.comments[comment].id.clone();
-                self.mode = Mode::Comment(Box::new(CommentDraft::new(DraftTarget::Reply { id }, "")));
+                let target = match self.github_thread(comment) {
+                    Some(thread) => DraftTarget::GithubReply { thread: thread.id.clone() },
+                    None => DraftTarget::Reply { id: self.shown[comment].id.clone() },
+                };
+                self.mode = Mode::Comment(Box::new(CommentDraft::new(target, "")));
                 Vec::new()
             }
             None => vec![DiffEffect::Refresh],
@@ -1368,17 +1678,27 @@ impl DiffState {
     }
 
     fn toggle_thread(&mut self) {
+        if matches!(self.table.rows.get(self.cursor), Some(Row::Pr { .. })) {
+            self.pr.folded = !self.pr.folded;
+            self.reflow();
+            return;
+        }
         let Some((comment, _)) = self.thread_at_cursor() else { return };
-        let id = self.comments.comments[comment].id.clone();
-        if !self.expanded.remove(&id) {
-            self.expanded.insert(id);
+        let id = self.shown[comment].id.clone();
+        let toggles = if self.github_thread(comment).is_some() { &mut self.pr_toggled } else { &mut self.expanded };
+        if !toggles.remove(&id) {
+            toggles.insert(id);
         }
         self.reflow();
     }
 
     fn delete_comment(&mut self) -> Vec<DiffEffect> {
         let Some((comment, reply)) = self.thread_at_cursor() else { return Vec::new() };
-        let c = &self.comments.comments[comment];
+        if self.github_thread(comment).is_some() {
+            self.flash = Some("That thread is GitHub's: delete it there".to_string());
+            return Vec::new();
+        }
+        let c = &self.shown[comment];
         let op = CommentOp::Delete { id: c.id.clone(), reply: reply.map(|r| c.replies[r].id.clone()) };
         self.apply_comment_op(&op);
         vec![DiffEffect::SaveComment(op)]
@@ -1414,7 +1734,7 @@ impl DiffState {
             return vec![DiffEffect::Yank(lines.join("\n"))];
         }
         match self.thread_at_cursor() {
-            Some((comment, _)) => vec![DiffEffect::Yank(format_comment(&self.comments.comments[comment]))],
+            Some((comment, _)) => vec![DiffEffect::Yank(format_comment(&self.shown[comment]))],
             None => {
                 self.flash = Some("No comment here to yank".to_string());
                 Vec::new()
@@ -1476,6 +1796,10 @@ impl DiffState {
 
     fn open_in_editor(&mut self) -> Vec<DiffEffect> {
         let Some(row) = self.table.rows.get(self.cursor).copied() else { return Vec::new() };
+        if matches!(row, Row::Pr { .. }) {
+            self.flash = Some("Move onto a file to open it".to_string());
+            return Vec::new();
+        }
         let file = &self.changeset.files[row.file() as usize];
         if file.status == super::model::FileStatus::Deleted {
             self.flash = Some("This file is gone from the worktree".to_string());
@@ -1490,7 +1814,7 @@ impl DiffState {
     // ---- Rows ----------------------------------------------------------------
 
     fn thread_row(&self, id: &str) -> Option<usize> {
-        let thread = self.threads.placed.iter().position(|(c, _)| self.comments.comments[*c].id == id)? as u32;
+        let thread = self.threads.placed.iter().position(|(c, _)| self.shown[*c].id == id)? as u32;
         self.table
             .rows
             .iter()
@@ -1505,20 +1829,50 @@ impl DiffState {
         self.keep_cursor_in_view();
     }
 
+    /// Work out what threads there are and where each one sits: the task's
+    /// comments and GitHub's.
+    fn place_threads(&mut self) {
+        self.shown = self.comments.comments.clone();
+        self.places = place(&self.comments, &self.changeset);
+        if let Some(details) = self.pr.details.clone() {
+            self.shown.extend(details.threads.iter().filter_map(PrThread::as_comment));
+            self.places.extend(place_threads(&details.threads, &self.changeset));
+        }
+    }
+
+    /// The threads whose replies show.
+    fn open_threads(&self) -> HashSet<String> {
+        let mut open = self.expanded.clone();
+        if let Some(details) = &self.pr.details {
+            for thread in &details.threads {
+                let id = thread.comment_id();
+                if thread.opens_expanded() != self.pr_toggled.contains(&id) {
+                    open.insert(id);
+                }
+            }
+        }
+        open
+    }
+
     fn rebuild(&mut self) {
         let show_outdated = self.changeset.scope == CommitScope::All;
-        self.threads = Threads::new(&self.comments.comments, &self.places, self.expanded.clone(), show_outdated);
+        self.threads = Threads::new(&self.shown, &self.places, self.open_threads(), show_outdated);
+        let pr = self.pr.parts();
         self.table = build_rows(&RowInput {
             changeset: &self.changeset,
             mode: self.view,
             filter: self.filter,
             folds: &self.folds,
             threads: &self.threads,
+            pr: &pr,
         });
     }
 
     fn spot(&self) -> Spot {
         let Some(row) = self.table.rows.get(self.cursor) else { return Spot::Nothing };
+        if let Row::Pr { part } = row {
+            return Spot::Pr(*part);
+        }
         let Some(file) = self.changeset.files.get(row.file() as usize) else { return Spot::Nothing };
         let path = file.path.clone();
         match *row {
@@ -1540,6 +1894,7 @@ impl DiffState {
                 Some(comment) => Spot::Thread { id: comment.id.clone(), path },
                 None => Spot::File { path },
             },
+            Row::Pr { .. } => Spot::Nothing,
         }
     }
 
@@ -1548,6 +1903,13 @@ impl DiffState {
     fn restore(&mut self, spot: &Spot) {
         let (path, found) = match spot {
             Spot::Nothing => return,
+            Spot::Pr(part) => {
+                let row = Row::Pr { part: *part };
+                // Its row, or the block's first, or the first file: the block
+                // has gone or shrunk.
+                self.cursor = self.table.rows.iter().position(|r| *r == row).unwrap_or(0);
+                return;
+            }
             Spot::Thread { id, path } => (path, self.thread_row(id)),
             Spot::File { path } => (path, None),
             Spot::Hunk { path, old_start } => (path, self.hunk_row(path, *old_start)),
@@ -1616,6 +1978,9 @@ impl DiffState {
         same_text.map(|(_, at)| at).or(same_number)
     }
 }
+
+/// What a pull request key says when the task hasn't one.
+const NO_PR: &str = "This task has no pull request";
 
 /// `Char('G')` with no Shift, or `Shift` with a symbol, reads as the keymap
 /// spells them: terminals and window systems disagree. Letters become lowercase

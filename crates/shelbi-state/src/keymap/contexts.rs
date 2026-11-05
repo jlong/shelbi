@@ -166,6 +166,10 @@ pub const CONTEXTS: &[KeymapContext] = &[
             Action::Diff(DiffAction::ToggleViewed),
             Action::Diff(DiffAction::PickCommit),
             Action::Diff(DiffAction::ToggleFileList),
+            Action::Diff(DiffAction::ToggleResolved),
+            Action::Diff(DiffAction::ToggleCommentTarget),
+            Action::Diff(DiffAction::SubmitReview),
+            Action::Diff(DiffAction::PrInfo),
         ],
     },
     KeymapContext {

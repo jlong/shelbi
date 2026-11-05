@@ -181,13 +181,13 @@ pub fn fresh_id() -> String {
 }
 
 /// The lines of one side of a file: text and where it is.
-struct SideIndex<'a> {
+pub(super) struct SideIndex<'a> {
     /// `(line number, hunk, line in hunk, text)`, ascending by line number.
     lines: Vec<(u32, u32, u32, &'a str)>,
 }
 
 impl<'a> SideIndex<'a> {
-    fn new(file: &'a FileDiff, side: Side) -> Self {
+    pub(super) fn new(file: &'a FileDiff, side: Side) -> Self {
         let mut lines = Vec::new();
         for (h, hunk) in file.hunks.iter().enumerate() {
             for (l, line) in hunk.lines.iter().enumerate() {
@@ -200,7 +200,7 @@ impl<'a> SideIndex<'a> {
     }
 
     /// Where the whole of `code` sits, with its last line at or nearest `end`.
-    fn find(&self, code: &[String], end: u32) -> Option<(u32, u32, u32, u32)> {
+    pub(super) fn find(&self, code: &[String], end: u32) -> Option<(u32, u32, u32, u32)> {
         let n = code.len().max(1);
         let mut best: Option<(u32, (u32, u32, u32, u32))> = None;
         for window in self.lines.windows(n) {

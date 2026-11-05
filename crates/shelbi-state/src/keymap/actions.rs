@@ -163,6 +163,10 @@ pub enum DiffAction {
     ToggleViewed,
     PickCommit,
     ToggleFileList,
+    ToggleResolved,
+    ToggleCommentTarget,
+    SubmitReview,
+    PrInfo,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -296,6 +300,10 @@ impl Action {
                 DiffAction::ToggleViewed => "Diff: mark the file viewed",
                 DiffAction::PickCommit => "Diff: review one commit",
                 DiffAction::ToggleFileList => "Diff: show or hide the file list",
+                DiffAction::ToggleResolved => "Diff: resolve or reopen the GitHub thread",
+                DiffAction::ToggleCommentTarget => "Diff: new comments go to GitHub or stay here",
+                DiffAction::SubmitReview => "Diff: submit a review of the pull request",
+                DiffAction::PrInfo => "Diff: every check and review on the pull request",
             },
             Action::Palette(a) => match a {
                 PaletteAction::Close => "Palette: close",
@@ -425,6 +433,10 @@ impl Action {
                 DiffAction::ToggleViewed => "Mark the file viewed",
                 DiffAction::PickCommit => "Review one commit",
                 DiffAction::ToggleFileList => "Show or hide the file list",
+                DiffAction::ToggleResolved => "Resolve or reopen the GitHub thread",
+                DiffAction::ToggleCommentTarget => "New comments go to GitHub or stay here",
+                DiffAction::SubmitReview => "Submit a review of the pull request",
+                DiffAction::PrInfo => "Every check and review on the pull request",
             },
             Action::Palette(a) => match a {
                 PaletteAction::Close => "Close command palette",
@@ -568,6 +580,10 @@ impl Action {
                 DiffAction::ToggleViewed => &["m"],
                 DiffAction::PickCommit => &["c"],
                 DiffAction::ToggleFileList => &["ctrl-b", "\\"],
+                DiffAction::ToggleResolved => &["x"],
+                DiffAction::ToggleCommentTarget => &["C"],
+                DiffAction::SubmitReview => &["R"],
+                DiffAction::PrInfo => &["i"],
             },
             Action::Palette(a) => match a {
                 PaletteAction::Close => &["esc", "ctrl-c", "ctrl-p"],
@@ -714,6 +730,10 @@ impl Action {
                 DiffAction::ToggleViewed => "toggle_viewed",
                 DiffAction::PickCommit => "pick_commit",
                 DiffAction::ToggleFileList => "toggle_file_list",
+                DiffAction::ToggleResolved => "toggle_resolved",
+                DiffAction::ToggleCommentTarget => "toggle_comment_target",
+                DiffAction::SubmitReview => "submit_review",
+                DiffAction::PrInfo => "pr_info",
             },
             Action::Palette(a) => match a {
                 PaletteAction::Close => "close",
@@ -839,6 +859,10 @@ impl Action {
             DiffAction::ToggleViewed,
             DiffAction::PickCommit,
             DiffAction::ToggleFileList,
+            DiffAction::ToggleResolved,
+            DiffAction::ToggleCommentTarget,
+            DiffAction::SubmitReview,
+            DiffAction::PrInfo,
         ];
         const PALETTE: &[PaletteAction] = &[
             PaletteAction::Close,

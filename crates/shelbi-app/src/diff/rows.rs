@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use super::comments::{Comment, Placement};
 use super::intraline::hunk_pairs;
 use super::model::{Changeset, FileDiff, Hunk, LineKind};
+use super::pr::PrPart;
 
 /// Unified, or old and new side by side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -184,12 +185,16 @@ pub enum Row {
     Thread { file: u32, thread: u32, part: ThreadPart },
     /// Why a file has no lines.
     Notice { file: u32, kind: NoticeKind },
+    /// A row of the pull request's description block, above the first file.
+    Pr { part: PrPart },
 }
 
 impl Row {
-    /// The file this row is in.
+    /// The file this row is in. The description block comes before them all, so
+    /// it reads as the first.
     pub fn file(&self) -> u32 {
         match *self {
+            Row::Pr { .. } => 0,
             Row::File { file, .. }
             | Row::Hunk { file, .. }
             | Row::Line { file, .. }
@@ -332,6 +337,8 @@ pub struct RowInput<'a> {
     pub filter: HunkFilter,
     pub folds: &'a Folds,
     pub threads: &'a Threads,
+    /// The description block's rows.
+    pub pr: &'a [PrPart],
 }
 
 /// The rows, and where each file's starts.
@@ -363,9 +370,14 @@ impl RowTable {
 pub fn build_rows(input: &RowInput<'_>) -> RowTable {
     let lines = input.changeset.line_count();
     let mut table = RowTable {
-        rows: Vec::with_capacity(lines + input.changeset.files.len() * 2),
+        rows: Vec::with_capacity(lines + input.changeset.files.len() * 2 + input.pr.len()),
         file_rows: Vec::with_capacity(input.changeset.files.len()),
     };
+    // Only above files. An empty table is how a client knows to say the diff is
+    // loading, failed or empty, whatever is known about the PR.
+    if !input.changeset.files.is_empty() {
+        table.rows.extend(input.pr.iter().map(|part| Row::Pr { part: *part }));
+    }
     for (f, file) in input.changeset.files.iter().enumerate() {
         file_rows(input, f as u32, file, &mut table);
     }
@@ -508,7 +520,7 @@ mod tests {
     const PATCH: &str = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,3 +1,4 @@ one\n ctx\n-let total = count + 1;\n+// a comment line\n+let total = amount + 1;\n end\n@@ -20 +20,2 @@ two\n base\n+added\ndiff --git a/i.png b/i.png\nBinary files a/i.png and b/i.png differ\n";
 
     fn rows(cs: &Changeset, mode: ViewMode, filter: HunkFilter, folds: &Folds) -> RowTable {
-        build_rows(&RowInput { changeset: cs, mode, filter, folds, threads: &Threads::default() })
+        build_rows(&RowInput { changeset: cs, mode, filter, folds, threads: &Threads::default(), pr: &[] })
     }
 
     #[test]
@@ -640,7 +652,7 @@ mod tests {
         let doc = CommentDoc { comments: vec![comment("a", 3, "let total = amount + 1;", 2), comment("b", 9, "was rewritten", 0)] };
         let places = place(&doc, &cs);
         let threads = Threads::new(&doc.comments, &places, HashSet::new(), true);
-        let t = build_rows(&RowInput { changeset: &cs, mode: ViewMode::Unified, filter: HunkFilter::All, folds: &Folds::default(), threads: &threads });
+        let t = build_rows(&RowInput { changeset: &cs, mode: ViewMode::Unified, filter: HunkFilter::All, folds: &Folds::default(), threads: &threads, pr: &[] });
         let at = t.rows.iter().position(|r| *r == Row::Line { file: 0, hunk: 0, line: 3 }).unwrap();
         assert_eq!(t.rows[at + 1], Row::Thread { file: 0, thread: 0, part: ThreadPart::Head });
         assert_eq!(t.rows[at + 2], Row::Thread { file: 0, thread: 0, part: ThreadPart::Summary });
@@ -649,7 +661,7 @@ mod tests {
 
         let expanded: HashSet<String> = ["a".to_string()].into();
         let threads = Threads::new(&doc.comments, &places, expanded, false);
-        let t = build_rows(&RowInput { changeset: &cs, mode: ViewMode::Split, filter: HunkFilter::All, folds: &Folds::default(), threads: &threads });
+        let t = build_rows(&RowInput { changeset: &cs, mode: ViewMode::Split, filter: HunkFilter::All, folds: &Folds::default(), threads: &threads, pr: &[] });
         let at = t.rows.iter().position(|r| matches!(r, Row::Split { new: Some(3), .. })).unwrap();
         assert_eq!(t.rows[at + 1], Row::Thread { file: 0, thread: 0, part: ThreadPart::Head });
         assert_eq!(t.rows[at + 2], Row::Thread { file: 0, thread: 0, part: ThreadPart::Reply(0) });
@@ -694,6 +706,7 @@ mod tests {
                 filter: HunkFilter::All,
                 folds: &Folds::default(),
                 threads: &threads,
+                pr: &[],
             };
             build_rows(&input)
                 .rows

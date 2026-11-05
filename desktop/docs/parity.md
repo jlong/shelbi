@@ -95,6 +95,12 @@ paths on every `cargo test`.
   diff…", 15s limit, cause and retries. The desktop's Retry is a button; the
   TUI's is a clickable row and the `r` key. Selecting View Diff again retries
   in both.
+- **A task's PR in the diff view** (`ndv-pr-threads`): both clients draw
+  `DiffState::pr_row` (the description block), `DiffState::thread_tag` (where a
+  GitHub thread stands) and `DiffState::pr_info_rows` (the `i` panel), in tones
+  each maps to its own colors. GitHub's threads are ordinary `Row::Thread` rows.
+  `gh` runs on the project's machine, through `DiffBackend`, so a window on a far
+  project reads and writes through that machine's daemon.
 - **Shelbi's own diff view** (`ndv-desktop`, `ndv-tui`): both clients draw
   `shelbi_app::diff::DiffState` and read keys from the `diff` keymap context,
   with the same modes, status line and help contents. Where they collide with

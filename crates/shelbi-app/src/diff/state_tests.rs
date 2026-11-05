@@ -722,7 +722,7 @@ fn help_opens_and_any_other_key_closes_it() {
 #[test]
 fn keys_come_from_the_keymap_not_the_code() {
     let (km, diags) = validate_keymaps_yaml(
-        "defaults:\n  diff:\n    cursor_down: e\n    top: 'x y'\n    search: ctrl-s\n    next_match: '+'\n    next_change: ', h'\n",
+        "defaults:\n  diff:\n    cursor_down: e\n    top: 'q y'\n    search: ctrl-s\n    next_match: '+'\n    next_change: ', h'\n",
         None,
     );
     assert!(diags.is_empty(), "{diags:?}");
@@ -732,7 +732,7 @@ fn keys_come_from_the_keymap_not_the_code() {
     assert_eq!(d.s.cursor(), 0, "j isn't bound any more");
     d.press("e e");
     assert_eq!(d.s.cursor(), 2);
-    d.press("x y");
+    d.press("q y");
     assert_eq!(d.s.cursor(), 0);
     d.press("ctrl-s");
     assert!(matches!(d.s.mode(), Mode::Search { .. }));
@@ -862,4 +862,478 @@ fn the_scope_label_names_what_is_shown() {
     cs.scope = CommitScope::Commit("abcdef1".into());
     d.s.set_changeset(Arc::new(cs));
     assert_eq!(d.s.scope_label(), "abcdef1");
+}
+
+// ---- The pull request ------------------------------------------------------
+
+mod pr {
+    use std::sync::Arc;
+
+    use chrono::DateTime;
+    use shelbi_core::{IssuePr, PrState};
+    use shelbi_state::keymap::{Key, KeyChord, Mods};
+
+    use super::Driver;
+    use crate::diff::draft::DraftTarget;
+    use crate::diff::model::Side;
+    use crate::diff::pr::{
+        CheckState, PrCheck, PrDetails, PrPart, PrReview, PrThread, PrThreadComment, PrTone, PrWrite, ReviewEvent,
+        ReviewState,
+    };
+    use crate::diff::rows::{Row, ThreadPart};
+    use crate::diff::state::{DiffEffect, Mode};
+    use crate::diff::comments::CommentOp;
+
+    fn said(author: &str, body: &str) -> PrThreadComment {
+        PrThreadComment {
+            id: format!("c-{author}"),
+            author: author.into(),
+            body: body.into(),
+            created_at: DateTime::from_timestamp(0, 0).unwrap(),
+            pending: false,
+        }
+    }
+
+    fn thread(id: &str, path: &str, line: u32, code: &str) -> PrThread {
+        PrThread {
+            id: id.into(),
+            path: path.into(),
+            side: Side::New,
+            line: Some(line),
+            original_line: Some(line),
+            start_line: None,
+            code: Some(code.into()),
+            resolved: false,
+            outdated: false,
+            file_level: false,
+            comments: vec![said("bob", "this leaks on early return"), said("jlong", "fixed in 3f2a1c")],
+        }
+    }
+
+    fn details() -> PrDetails {
+        PrDetails {
+            number: 2155,
+            title: "Record a task's PR".into(),
+            url: "https://github.com/jlong/shelbi/pull/2155".into(),
+            body: "Why.\n\nAnd how.".into(),
+            author: "jlong".into(),
+            head: "jlong/task-pr-metadata".into(),
+            base: "main".into(),
+            state: PrState::Open,
+            draft: false,
+            reviews: vec![PrReview { author: "alice".into(), state: ReviewState::Approved, body: String::new() }],
+            checks: vec![PrCheck { name: "lint".into(), state: CheckState::Failed, detail: "failure".into() }],
+            threads: vec![thread("T1", "a.rs", 4, "new thing")],
+            threads_cut: false,
+        }
+    }
+
+    fn with_pr() -> Driver {
+        let mut d = Driver::new();
+        d.s.set_pr_lookup(Ok(Some(IssuePr::new(2155, None))));
+        d.s.set_pr_details(Ok(Arc::new(details())));
+        d
+    }
+
+    fn head_row(d: &Driver) -> usize {
+        d.s.table()
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Thread { part: ThreadPart::Head, .. }))
+            .expect("a thread's head row")
+    }
+
+    fn to_head(d: &mut Driver) {
+        let row = head_row(d);
+        d.s.click_row(row);
+    }
+
+    fn text_of(d: &Driver, part: PrPart) -> String {
+        d.s.pr_row(part).iter().map(|s| s.text.as_str()).collect()
+    }
+
+    #[test]
+    fn the_block_sits_above_the_first_file_and_file_rows_still_point_at_files() {
+        let d = with_pr();
+        let rows = &d.s.table().rows;
+        assert_eq!(rows[0], Row::Pr { part: PrPart::Title });
+        assert_eq!(rows[1], Row::Pr { part: PrPart::Status });
+        assert_eq!(rows[2], Row::Pr { part: PrPart::Gap });
+        assert_eq!(rows[3], Row::Pr { part: PrPart::Body(0) });
+        let first = d.s.table().file_rows[0] as usize;
+        assert!(matches!(rows[first], Row::File { file: 0, .. }));
+        assert!(matches!(rows[d.s.table().file_rows[1] as usize], Row::File { file: 1, .. }));
+    }
+
+    #[test]
+    fn no_pr_means_no_rows_and_the_keys_say_so() {
+        let mut d = Driver::new();
+        assert!(!d.s.table().rows.iter().any(|r| matches!(r, Row::Pr { .. })));
+        for key in ["x", "shift-c", "shift-r", "i"] {
+            assert_eq!(d.press(key), []);
+            assert_eq!(d.s.mode().label(), "NORMAL", "{key}");
+            assert!(d.s.flash().is_some(), "{key}");
+        }
+        assert!(!d.s.comment_on_github());
+    }
+
+    #[test]
+    fn an_empty_changeset_has_no_block_so_the_client_says_its_empty() {
+        let mut d = Driver::new();
+        d.s.set_changeset(super::changeset(""));
+        d.s.set_pr_details(Ok(Arc::new(details())));
+        assert!(d.s.table().is_empty());
+    }
+
+    #[test]
+    fn the_block_arriving_doesnt_move_the_cursor_off_its_line() {
+        let mut d = Driver::new();
+        d.goto_text("foo again");
+        let top_offset = d.s.cursor() - d.s.top();
+        d.s.set_pr_lookup(Ok(Some(IssuePr::new(2155, None))));
+        d.s.set_pr_details(Ok(Arc::new(details())));
+        assert_eq!(d.text(), "foo again");
+        assert_eq!(d.s.cursor() - d.s.top(), top_offset, "same height in the view");
+    }
+
+    #[test]
+    fn o_folds_the_block_from_any_of_its_rows() {
+        let mut d = with_pr();
+        d.s.click_row(4);
+        assert_eq!(d.row(), Row::Pr { part: PrPart::Body(1) });
+        d.press("o");
+        assert!(d.s.pr().folded);
+        assert_eq!(d.s.table().rows[2], Row::File { file: 0, folded: false });
+        assert_eq!(d.row(), Row::Pr { part: PrPart::Title }, "its row is gone: the title's left");
+        d.press("o");
+        assert!(!d.s.pr().folded);
+        assert_eq!(d.s.table().rows[2], Row::Pr { part: PrPart::Gap });
+    }
+
+    #[test]
+    fn stepping_off_the_block_lands_on_the_first_file_not_the_second() {
+        let mut d = with_pr();
+        assert_eq!(d.s.current_file(), None, "the block is in no file");
+        assert!(d.s.status().contains(" · 3 files · "), "{}", d.s.status());
+        d.press("l");
+        assert_eq!(d.s.current_file(), Some(0));
+        assert!(matches!(d.row(), Row::File { file: 0, .. }));
+        d.press("l");
+        assert_eq!(d.s.current_file(), Some(1));
+    }
+
+    #[test]
+    fn keys_about_a_file_do_nothing_on_the_block() {
+        let mut d = with_pr();
+        assert_eq!(d.press("ctrl-g"), []);
+        assert_eq!(d.press("m"), []);
+        d.press("z shift-c");
+        assert!(d.s.folds().files.is_empty());
+        d.press("enter");
+        assert_eq!(d.s.mode().label(), "NORMAL");
+        assert!(d.s.flash().is_some());
+    }
+
+    #[test]
+    fn a_thread_shows_at_its_line_open_with_its_tag() {
+        let d = with_pr();
+        let head = head_row(&d);
+        let Row::Line { file, hunk, line } = d.s.table().rows[head - 1] else { panic!("{:?}", d.s.table().rows[head - 1]) };
+        assert_eq!(d.s.line(file, hunk, line).unwrap().text, "new thing");
+        let Row::Thread { thread, part: ThreadPart::Head, .. } = d.s.table().rows[head] else { panic!() };
+        assert_eq!(d.s.thread_row_text(thread, ThreadPart::Head).unwrap(), "⎇ bob (GitHub): this leaks on early return");
+        assert_eq!(d.s.thread_row_text(thread, ThreadPart::Reply(0)).unwrap(), "  ↳ jlong: fixed in 3f2a1c");
+        assert!(matches!(d.s.table().rows[head + 1], Row::Thread { part: ThreadPart::Reply(0), .. }), "open by default");
+        assert_eq!(d.s.thread_tag(thread), Some(("[unresolved]", PrTone::Pending)));
+    }
+
+    #[test]
+    fn a_resolved_thread_starts_closed_and_o_opens_it() {
+        let mut d = Driver::new();
+        let mut pull = details();
+        pull.threads[0].resolved = true;
+        d.s.set_pr_details(Ok(Arc::new(pull)));
+        to_head(&mut d);
+        let head = d.s.cursor();
+        assert!(matches!(d.s.table().rows[head + 1], Row::Thread { part: ThreadPart::Summary, .. }));
+        d.press("o");
+        assert!(matches!(d.s.table().rows[head + 1], Row::Thread { part: ThreadPart::Reply(0), .. }));
+        d.press("o");
+        assert!(matches!(d.s.table().rows[head + 1], Row::Thread { part: ThreadPart::Summary, .. }));
+    }
+
+    #[test]
+    fn comment_keys_jump_to_github_threads_too() {
+        let mut d = with_pr();
+        d.press("] c");
+        assert!(matches!(d.row(), Row::Thread { part: ThreadPart::Head, .. }));
+    }
+
+    #[test]
+    fn local_and_github_threads_sit_side_by_side_and_keep_their_own_keys() {
+        let mut d = with_pr();
+        d.goto_text("foo again");
+        d.press("enter");
+        d.typed("mine");
+        let effects = d.press("enter");
+        assert!(matches!(&effects[..], [DiffEffect::SaveComment(CommentOp::Add(_))]), "{effects:?}");
+        assert_eq!(d.s.comments().len(), 1, "GitHub's aren't the task's");
+        // Enter edits the task's, and answers GitHub's.
+        d.press("enter");
+        let Mode::Comment(draft) = d.s.mode() else { panic!() };
+        assert!(matches!(draft.target, DraftTarget::Edit { .. }));
+        d.press("esc esc");
+        to_head(&mut d);
+        d.press("enter");
+        let Mode::Comment(draft) = d.s.mode() else { panic!() };
+        assert_eq!(draft.target, DraftTarget::GithubReply { thread: "T1".into() });
+    }
+
+    #[test]
+    fn enter_and_r_reply_on_github() {
+        for key in ["enter", "r"] {
+            let mut d = with_pr();
+            to_head(&mut d);
+            d.press(key);
+            d.typed("on it");
+            let effects = d.press("enter");
+            assert_eq!(effects, [DiffEffect::PrWrite(PrWrite::Reply { thread: "T1".into(), body: "on it".into() })]);
+            assert_eq!(d.s.mode().label(), "NORMAL");
+            assert_eq!(d.s.flash(), Some("Replying on GitHub…"));
+        }
+    }
+
+    #[test]
+    fn x_resolves_and_reopens_the_thread_here() {
+        let mut d = with_pr();
+        to_head(&mut d);
+        assert_eq!(d.press("x"), [DiffEffect::PrWrite(PrWrite::Resolve { thread: "T1".into(), resolved: true })]);
+        let mut pull = details();
+        pull.threads[0].resolved = true;
+        d.s.set_pr_details(Ok(Arc::new(pull)));
+        assert_eq!(d.press("x"), [DiffEffect::PrWrite(PrWrite::Resolve { thread: "T1".into(), resolved: false })]);
+    }
+
+    #[test]
+    fn x_wants_a_github_thread() {
+        let mut d = with_pr();
+        d.goto_text("foo again");
+        d.press("enter");
+        d.typed("mine");
+        d.press("enter");
+        assert_eq!(d.press("x"), []);
+        assert_eq!(d.s.flash(), Some("Move onto a GitHub thread to resolve it"));
+    }
+
+    #[test]
+    fn a_github_thread_cant_be_deleted_from_here() {
+        let mut d = with_pr();
+        to_head(&mut d);
+        assert_eq!(d.press("d"), []);
+        assert!(d.s.flash().unwrap().contains("GitHub's"));
+        assert_eq!(d.s.table().rows[head_row(&d)], d.row());
+    }
+
+    #[test]
+    fn y_copies_a_github_thread() {
+        let mut d = with_pr();
+        to_head(&mut d);
+        let effects = d.press("y");
+        let [DiffEffect::Yank(text)] = &effects[..] else { panic!("{effects:?}") };
+        assert!(text.contains("⎇ bob (GitHub): this leaks") && text.contains("↳ jlong: fixed"), "{text}");
+    }
+
+    #[test]
+    fn gy_sends_only_the_tasks_own_comments() {
+        let mut d = with_pr();
+        assert_eq!(d.press("g shift-y"), []);
+        assert_eq!(d.s.flash(), Some("No comments to send"));
+    }
+
+    #[test]
+    fn c_sends_new_comments_to_the_pending_review_and_back() {
+        let mut d = with_pr();
+        d.press("shift-c");
+        assert!(d.s.comment_on_github());
+        assert!(d.s.status().contains("new comments go to GitHub"), "{}", d.s.status());
+        d.goto_text("foo again");
+        d.press("enter");
+        let Mode::Comment(draft) = d.s.mode() else { panic!() };
+        assert!(matches!(draft.target, DraftTarget::GithubNew(_)));
+        d.typed("look");
+        let effects = d.press("enter");
+        let [DiffEffect::PrWrite(PrWrite::AddThread { anchor, body })] = &effects[..] else { panic!("{effects:?}") };
+        assert_eq!((anchor.path.as_str(), anchor.side, anchor.end, body.as_str()), ("b.rs", Side::New, 1, "look"));
+        assert!(d.s.comments().is_empty(), "nothing kept locally unless GitHub refuses");
+
+        d.press("shift-c");
+        assert!(!d.s.comment_on_github());
+        d.press("enter");
+        let Mode::Comment(draft) = d.s.mode() else { panic!() };
+        assert!(matches!(draft.target, DraftTarget::New(_)));
+    }
+
+    #[test]
+    fn a_comment_github_refuses_stays_as_a_local_one() {
+        let mut d = with_pr();
+        d.press("shift-c");
+        d.goto_text("foo again");
+        d.press("enter");
+        d.typed("look");
+        let effects = d.press("enter");
+        let [DiffEffect::PrWrite(change)] = &effects[..] else { panic!("{effects:?}") };
+        let change = change.clone();
+        let effects = d.s.pr_written(change, Err("line must be part of the diff".to_string()));
+        assert!(matches!(&effects[..], [DiffEffect::SaveComment(CommentOp::Add(_))]), "{effects:?}");
+        assert_eq!(d.s.comments()[0].body, "look");
+        assert_eq!(d.s.flash(), Some("Kept as a local comment: line must be part of the diff"));
+    }
+
+    #[test]
+    fn a_reply_github_refuses_goes_back_to_its_editor() {
+        let mut d = with_pr();
+        let change = PrWrite::Reply { thread: "T1".into(), body: "my words".into() };
+        assert_eq!(d.s.pr_written(change, Err("no".to_string())), []);
+        let Mode::Comment(draft) = d.s.mode() else { panic!() };
+        assert_eq!(draft.text(), "my words");
+        assert_eq!(draft.target, DraftTarget::GithubReply { thread: "T1".into() });
+        assert_eq!(d.s.flash(), Some("GitHub didn't take that: no"));
+    }
+
+    #[test]
+    fn a_review_refused_while_typing_elsewhere_keeps_the_words_on_the_clipboard() {
+        let mut d = with_pr();
+        d.press("/");
+        let change = PrWrite::SubmitReview { event: ReviewEvent::Approve, body: "lgtm".into() };
+        assert_eq!(d.s.pr_written(change, Err("no".to_string())), [DiffEffect::Yank("lgtm".into())]);
+        assert_eq!(d.s.mode().label(), "SEARCH", "the keyboard stays where it was");
+    }
+
+    #[test]
+    fn a_change_that_landed_says_so() {
+        let mut d = with_pr();
+        let change = PrWrite::Resolve { thread: "T1".into(), resolved: true };
+        assert_eq!(d.s.pr_written(change, Ok("Resolved the thread on GitHub".to_string())), []);
+        assert_eq!(d.s.flash(), Some("Resolved the thread on GitHub"));
+    }
+
+    #[test]
+    fn r_opens_the_review_and_tab_picks_the_verdict() {
+        let mut d = with_pr();
+        d.press("shift-r");
+        let Mode::Comment(draft) = d.s.mode() else { panic!() };
+        assert_eq!(draft.target, DraftTarget::Review { event: ReviewEvent::Comment });
+        d.s.key(KeyChord::new(Key::Tab, Mods::NONE), &d.km);
+        let Mode::Comment(draft) = d.s.mode() else { panic!() };
+        assert_eq!(draft.target, DraftTarget::Review { event: ReviewEvent::Approve });
+        d.s.key(KeyChord::new(Key::BackTab, Mods::NONE), &d.km);
+        d.s.key(KeyChord::new(Key::BackTab, Mods::NONE), &d.km);
+        let Mode::Comment(draft) = d.s.mode() else { panic!() };
+        assert_eq!(draft.target, DraftTarget::Review { event: ReviewEvent::RequestChanges });
+    }
+
+    #[test]
+    fn a_comment_or_a_request_needs_words_and_an_approval_doesnt() {
+        let mut d = with_pr();
+        d.press("shift-r");
+        assert_eq!(d.press("enter"), []);
+        assert_eq!(d.s.mode().label(), "COMMENT", "still open");
+        assert!(d.s.flash().unwrap().contains("needs some words"));
+        d.s.key(KeyChord::new(Key::Tab, Mods::NONE), &d.km);
+        assert_eq!(
+            d.press("enter"),
+            [DiffEffect::PrWrite(PrWrite::SubmitReview { event: ReviewEvent::Approve, body: String::new() })]
+        );
+        assert_eq!(d.s.mode().label(), "NORMAL");
+
+        d.press("shift-r");
+        d.typed("looks wrong");
+        assert_eq!(
+            d.press("enter"),
+            [DiffEffect::PrWrite(PrWrite::SubmitReview { event: ReviewEvent::Comment, body: "looks wrong".into() })]
+        );
+    }
+
+    #[test]
+    fn with_github_silent_the_writing_keys_say_why() {
+        let mut d = Driver::new();
+        d.s.set_pr_lookup(Ok(Some(IssuePr::new(2155, None))));
+        d.press("shift-r");
+        assert_eq!(d.s.flash(), Some("Still reading the pull request"));
+        d.s.set_pr_details(Err("Can't reach GitHub".to_string()));
+        d.press("shift-c");
+        assert_eq!(d.s.flash(), Some("The pull request isn't here: Can't reach GitHub"));
+        assert!(!d.s.comment_on_github());
+        assert_eq!(d.s.mode().label(), "NORMAL");
+        assert_eq!(
+            text_of(&d, PrPart::Status),
+            "PR details aren't here: Can't reach GitHub",
+            "and the diff is still here"
+        );
+        assert!(d.s.table().rows.iter().any(|r| matches!(r, Row::Line { .. })));
+    }
+
+    #[test]
+    fn i_opens_the_panel_and_its_keys_scroll_refresh_and_close() {
+        let mut d = with_pr();
+        d.s.set_pr_info_height(3);
+        d.press("i");
+        assert!(matches!(d.s.mode(), Mode::PrInfo { scroll: 0 }));
+        let last = d.s.pr_info_rows().len() - 3;
+        d.press("j j");
+        assert!(matches!(d.s.mode(), Mode::PrInfo { scroll: 2 }));
+        d.press("k");
+        assert!(matches!(d.s.mode(), Mode::PrInfo { scroll: 1 }));
+        d.press("shift-g");
+        assert!(matches!(d.s.mode(), Mode::PrInfo { scroll } if *scroll == last));
+        d.press("j");
+        assert!(matches!(d.s.mode(), Mode::PrInfo { scroll } if *scroll == last), "stops at the end");
+        d.press("g");
+        assert!(matches!(d.s.mode(), Mode::PrInfo { scroll: 0 }));
+        assert_eq!(d.press("r"), [DiffEffect::Refresh]);
+        assert_eq!(d.s.mode().label(), "PR INFO");
+        for close in ["i", "q", "esc"] {
+            d.s.apply(shelbi_state::keymap::DiffAction::PrInfo, None);
+            d.press(close);
+            assert_eq!(d.s.mode().label(), "NORMAL", "{close}");
+        }
+    }
+
+    #[test]
+    fn the_panel_opens_to_say_why_when_all_there_is_is_a_reason() {
+        let mut d = Driver::new();
+        d.s.set_pr_lookup(Err("Can't reach GitHub".to_string()));
+        d.press("i");
+        assert_eq!(d.s.mode().label(), "PR INFO");
+        let rows = d.s.pr_info_rows();
+        assert_eq!(rows[0][0].text, "Not current: Can't reach GitHub");
+    }
+
+    #[test]
+    fn the_pr_going_away_takes_the_block_and_the_target_with_it() {
+        let mut d = with_pr();
+        d.press("shift-c");
+        d.press("j j j");
+        d.s.set_pr_lookup(Ok(None));
+        assert!(!d.s.comment_on_github());
+        assert!(!d.s.table().rows.iter().any(|r| matches!(r, Row::Pr { .. } | Row::Thread { .. })));
+        assert!(d.s.cursor() < d.s.table().len());
+    }
+
+    #[test]
+    fn the_keys_are_in_the_help_and_the_palette() {
+        use crate::diff::help::help_sections;
+        use crate::diff::palette::{DiffPalette, PaletteMode, PaletteTarget};
+        use crate::diff::TargetKind;
+        use shelbi_state::keymap::DiffAction;
+        let d = Driver::new();
+        let sections = help_sections(&d.km, TargetKind::Review, |c| c.canonical());
+        let section = sections.iter().find(|s| s.title == "Pull request").unwrap();
+        let keys: Vec<&str> = section.rows.iter().map(|r| r.keys[0].as_str()).collect();
+        assert_eq!(keys, ["x", "shift-c", "shift-r", "i"]);
+        let items = DiffPalette::new(PaletteMode::Commands).for_kind(TargetKind::Review).items(d.s.changeset());
+        for action in [DiffAction::ToggleResolved, DiffAction::ToggleCommentTarget, DiffAction::SubmitReview, DiffAction::PrInfo] {
+            assert!(items.iter().any(|i| i.target == PaletteTarget::Action(action)), "{action:?}");
+        }
+    }
 }

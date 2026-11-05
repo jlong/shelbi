@@ -25,7 +25,7 @@ use gpui::{
 };
 use shelbi_app::diff::git::BlameLine;
 use shelbi_app::diff::highlight::SyntaxSpan;
-use shelbi_app::diff::{DiffLine, DiffState, FileDiff, FileStatus, LineKind, Row, ThreadPart};
+use shelbi_app::diff::{DiffLine, DiffState, FileDiff, FileStatus, LineKind, PrPart, PrTone, Row, ThreadPart};
 
 use super::text::{age, digits, stretches, Shown};
 use super::DiffView;
@@ -325,6 +325,7 @@ impl<'a> Painter<'a> {
             Row::Line { file, hunk, line } => self.unified_row(file, hunk, line, y),
             Row::Split { file, hunk, old, new } => self.split_row(file, hunk, old, new, y),
             Row::Thread { thread, part, .. } => self.thread_row(thread, part, y),
+            Row::Pr { part } => self.pr_row(part, y),
             Row::Notice { file, kind } => {
                 let Some(f) = self.state.file(file) else { return };
                 let text = kind.text(f);
@@ -392,7 +393,43 @@ impl<'a> Painter<'a> {
         let x = self.bounds.origin.x + self.cells(self.gutter_cells());
         let bar = self.colors.thread;
         self.fill(x, y, px(2.0), bar);
-        self.plain(text, self.colors.text, x + self.metrics.width, y, clip);
+        // A GitHub thread says where it stands at the end of its first row, and
+        // its words stop short of that.
+        let tag = (part == ThreadPart::Head).then(|| self.state.thread_tag(thread)).flatten();
+        let mut text_clip = clip;
+        if let Some((tag, tone)) = tag {
+            let right = self.bounds.origin.x + self.bounds.size.width - self.metrics.width;
+            let tag_x = right - self.cells(tag.chars().count());
+            let color = self.tone(tone);
+            self.plain(tag, color, tag_x, y, clip);
+            text_clip.size.width = (tag_x - self.metrics.width - clip.origin.x).max(px(0.0));
+        }
+        self.plain(text, self.colors.text, x + self.metrics.width, y, text_clip);
+    }
+
+    /// The color a pull request's words read in.
+    fn tone(&self, tone: PrTone) -> Hsla {
+        match tone {
+            PrTone::Normal => self.colors.text,
+            PrTone::Loud => self.colors.loud,
+            PrTone::Muted => self.colors.muted,
+            PrTone::Good => self.colors.add,
+            PrTone::Bad => self.colors.del,
+            PrTone::Pending => self.theme.warning,
+        }
+    }
+
+    /// A row of the pull request's description block.
+    fn pr_row(&mut self, part: PrPart, y: Pixels) {
+        if part == PrPart::Title {
+            self.fill_row(y, self.colors.file_header);
+        }
+        let clip = self.row_clip(y);
+        let mut x = self.bounds.origin.x + self.metrics.width;
+        for span in self.state.pr_row(part) {
+            let color = self.tone(span.tone);
+            x += self.plain(span.text, color, x, y, clip);
+        }
     }
 
     /// The cells before a unified line's text: blame, both numbers, the rule.

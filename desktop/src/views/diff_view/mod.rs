@@ -27,6 +27,9 @@
 //!   click on it or the file list key opening it): `j` / `k` step through the
 //!   files, `Space` marks one viewed, `Enter` or `Esc` go back to the rows.
 //!   The rest of the keys work as usual from there.
+//! - **The pull request** is rows like any other: the description block above the
+//!   first file and GitHub's threads at their lines (`DiffState::pr_row`,
+//!   `thread_tag`), with the `i` panel over the view. `gh` is the session's.
 //! - **Esc** lets go of what's held (a count, a selection, a search's marks);
 //!   with nothing held it hands the keyboard back to the host's panel.
 
@@ -122,12 +125,26 @@ impl DiffDeps {
     /// checks draw.
     #[cfg(any(test, feature = "visual-check"))]
     pub fn canned(patch: &str, opened: canned::Opened) -> Self {
+        Self::canned_with(patch, None, opened)
+    }
+
+    /// [`Self::canned`], with a pull request (or why GitHub won't answer).
+    #[cfg(any(test, feature = "visual-check"))]
+    pub fn canned_with(
+        patch: &str,
+        pr: Option<Result<shelbi_app::diff::pr::PrDetails, String>>,
+        opened: canned::Opened,
+    ) -> Self {
         let patch = patch.to_string();
         DiffDeps {
             // No wake: a gpui test scheduler refuses one from another thread.
             // A test or a visual check looks with `poll_now`.
             open: Rc::new(move |target, _wake| {
-                let backend = Arc::new(canned::Canned::new(&patch));
+                let mut canned = canned::Canned::new(&patch);
+                if let Some(pr) = pr.clone() {
+                    canned = canned.with_pr(pr);
+                }
+                let backend = Arc::new(canned);
                 let options = shelbi_app::diff::DiffOptions {
                     author: Author::human("jlong"),
                     target,
@@ -216,6 +233,8 @@ impl DiffView {
                 while rx.try_recv().is_ok() {}
                 let alive = this.update(cx, |this, cx| {
                     if this.session.poll() {
+                        let effects = this.session.take_effects();
+                        this.client_effects(effects, cx);
                         this.after_change();
                         cx.notify();
                     }
@@ -254,6 +273,8 @@ impl DiffView {
     #[cfg(any(test, feature = "visual-check"))]
     pub fn poll_now(&mut self, cx: &mut Context<Self>) {
         if self.session.poll() {
+            let effects = self.session.take_effects();
+            self.client_effects(effects, cx);
             self.after_change();
             cx.notify();
         }
@@ -390,7 +411,8 @@ impl DiffView {
                 | DiffEffect::SaveViewed(_)
                 | DiffEffect::SendToAgent { .. }
                 | DiffEffect::PlanRevert(_)
-                | DiffEffect::Revert(_) => {}
+                | DiffEffect::Revert(_)
+                | DiffEffect::PrWrite(_) => {}
             }
         }
     }
@@ -436,9 +458,14 @@ impl DiffView {
         let top = self.state().top();
         if let Some(row) = self.geometry.row_at(event.position, top) {
             self.session.state_mut().click_row(row);
-            let header = matches!(self.state().table().rows.get(row), Some(Row::File { .. } | Row::Hunk { .. }));
-            if header && self.geometry.on_chevron(event.position) {
+            let on_chevron = self.geometry.on_chevron(event.position);
+            let clicked = self.state().table().rows.get(row).copied();
+            let header = matches!(clicked, Some(Row::File { .. } | Row::Hunk { .. }));
+            if header && on_chevron {
                 let effects = self.session.action(DiffAction::ToggleHunkFold);
+                self.client_effects(effects, cx);
+            } else if on_chevron && clicked == Some(Row::Pr { part: shelbi_app::diff::PrPart::Title }) {
+                let effects = self.session.action(DiffAction::ToggleThread);
                 self.client_effects(effects, cx);
             } else {
                 let _ = self.session.carry_out(Vec::new());
@@ -724,6 +751,8 @@ impl Render for DiffView {
             window.focus(&self.focus_handle, cx);
         }
         let theme = *cx.global::<Theme>();
+        let panel_rows = overlays::pr_info_rows_fit(window);
+        self.session.state_mut().set_pr_info_height(panel_rows);
         let placeholder = self.render_placeholder(&theme, cx);
         let empty = self.state().changeset().files.is_empty();
         let list = (self.state().file_list_open() && !empty).then(|| self.render_list(&theme, cx));

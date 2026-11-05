@@ -3773,6 +3773,68 @@ fn graphql_governed_read(
     )
 }
 
+/// A GraphQL read on `project`'s token, for what isn't a board read (the diff
+/// view's pull request). It's governed as every other GraphQL read is: a parked
+/// budget or a dead network answers at once without spawning `gh`, a limit it
+/// hits parks the budget for everyone, and it fails fast rather than waiting a
+/// limit out. `args` are `gh`'s, from `api graphql`.
+pub fn graphql_read(project: &str, args: &[&str]) -> Result<String> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(runner) = test_gh_runner_override() {
+        return runner(args);
+    }
+    graphql_governed_read(project, &crate::gh_retry::RetryPolicy::reads(), args)
+}
+
+/// A GraphQL mutation on `project`'s token. A parked budget refuses it up front,
+/// naming why, instead of a 403 from `gh`. It runs under the create policy,
+/// since most of these post something: a limit is waited out, and a connection
+/// that dropped mid-send isn't replayed, as that could post it twice.
+pub fn graphql_write(project: &str, args: &[&str]) -> Result<String> {
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(runner) = test_gh_runner_override() {
+        return runner(args);
+    }
+    let token = resolve_github_token_by_name(project)?;
+    let key = crate::gh_budget::token_key(token.expose());
+    if let Some(err) = read_park_short_circuit(project, &key, crate::gh_budget::Budget::Graphql, args, read_now()) {
+        return Err(err);
+    }
+    let policy = crate::gh_retry::RetryPolicy::creates();
+    let result = invalidate_token_on_401(project, policy.run(|| run_gh_with_token(&token, args)));
+    let outcome = match &result {
+        Ok(_) => crate::gh_requests::Outcome::Ok,
+        Err(e) => crate::gh_requests::Outcome::Err(crate::gh_retry::error_class(e)),
+    };
+    crate::gh_requests::record_request(crate::gh_budget::Budget::Graphql, "diff-pr-write", outcome);
+    result
+}
+
+/// Why a `gh` call didn't answer, in words for a person: a rate limit with when
+/// it lifts, no network, no login, or what GitHub said.
+pub fn gh_failure_reason(err: &Error) -> String {
+    if crate::gh_retry::is_rate_limit_error(err) {
+        let reset = crate::gh_retry::rate_limit_reset_epoch(err, read_now())
+            .and_then(|at| DateTime::from_timestamp(at, 0))
+            .map(|at| at.with_timezone(&chrono::Local).format("%H:%M").to_string());
+        return match reset {
+            Some(at) => format!("GitHub's rate limit is spent until {at}"),
+            None => "GitHub's rate limit is spent for now".to_string(),
+        };
+    }
+    if crate::gh_retry::is_connection_error(err) {
+        return "Can't reach GitHub".to_string();
+    }
+    match err {
+        Error::MissingIssueTrackerAuth { .. } => "No GitHub login here: run gh auth login".to_string(),
+        Error::Command { stderr, .. } => {
+            let said = stderr.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("gh failed");
+            said.strip_prefix("gh: ").unwrap_or(said).to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
 /// The caller label recorded for a GraphQL read, derived from the query name in
 /// `args` (the `-f query=query <Name>(…)` form field). Lets `shelbi doctor` name
 /// which reader is spending the GraphQL budget: the daemon's board-index refresh,
@@ -3783,7 +3845,9 @@ fn graphql_caller(args: &[&str]) -> &'static str {
         .iter()
         .find_map(|a| a.strip_prefix("query="))
         .unwrap_or("");
-    if query.contains("BoardIndex") {
+    if query.contains("ShelbiDiffPr") {
+        "diff-pr"
+    } else if query.contains("BoardIndex") {
         "board-refresh"
     } else if query.contains("ClosedPage") || query.contains("states: [CLOSED]") {
         "done-page"
@@ -5549,6 +5613,32 @@ mod tests {
                 Ok(issues_json.to_string())
             }
         })
+    }
+
+    #[test]
+    fn a_failure_reads_in_a_persons_words() {
+        let parked = rate_limited_park_error("gh", &["api", "graphql"], 1_700_000_500);
+        let at = DateTime::from_timestamp(1_700_000_500, 0)
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(gh_failure_reason(&parked), format!("GitHub's rate limit is spent until {at}"));
+        let dead = unreachable_park_error("gh", &["api", "graphql"], 1_700_000_500);
+        assert_eq!(gh_failure_reason(&dead), "Can't reach GitHub");
+        let refused = Error::Command {
+            cmd: "gh api graphql".to_string(),
+            status: "exit status: 1".to_string(),
+            stderr: "\ngh: Pull request review thread line must be part of the diff\n".to_string(),
+        };
+        assert_eq!(gh_failure_reason(&refused), "Pull request review thread line must be part of the diff");
+        let no_login = Error::MissingIssueTrackerAuth { backend: "github", token_file: "t".to_string() };
+        assert_eq!(gh_failure_reason(&no_login), "No GitHub login here: run gh auth login");
+    }
+
+    #[test]
+    fn the_diff_views_read_is_named_in_the_request_log() {
+        assert_eq!(graphql_caller(&["api", "graphql", "-f", "query=query ShelbiDiffPr($n: Int!) { x }"]), "diff-pr");
     }
 
     #[test]

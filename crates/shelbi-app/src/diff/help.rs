@@ -102,6 +102,15 @@ pub const SECTIONS: &[(&str, &[DiffAction])] = &[
         ],
     ),
     ("Revert", &[DiffAction::RevertHunk, DiffAction::RevertFile]),
+    (
+        "Pull request",
+        &[
+            DiffAction::ToggleResolved,
+            DiffAction::ToggleCommentTarget,
+            DiffAction::SubmitReview,
+            DiffAction::PrInfo,
+        ],
+    ),
     ("Other", &[DiffAction::OpenInEditor, DiffAction::Help]),
 ];
 
@@ -179,13 +188,13 @@ mod tests {
 
     #[test]
     fn it_shows_the_keys_in_effect() {
-        let km = validate_keymaps_yaml("defaults:\n  diff:\n    cursor_down: e\n    top: 'x y'\n    help: []\n", None).0.diff;
+        let km = validate_keymaps_yaml("defaults:\n  diff:\n    cursor_down: e\n    top: 'q y'\n    help: []\n", None).0.diff;
         let sections = help_sections(&km, TargetKind::Workspace, |c| c.canonical());
         let row = |action| {
             sections.iter().flat_map(|s| &s.rows).find(|r| r.action == action).unwrap().clone()
         };
         assert_eq!(row(DiffAction::CursorDown).keys, ["e"]);
-        assert_eq!(row(DiffAction::Top).keys, ["x y"]);
+        assert_eq!(row(DiffAction::Top).keys, ["q y"]);
         assert_eq!(row(DiffAction::Help).keys, Vec::<String>::new());
         assert_eq!(row(DiffAction::SendToAgent).keys, ["g shift-y"]);
     }

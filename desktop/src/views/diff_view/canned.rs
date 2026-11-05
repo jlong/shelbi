@@ -5,9 +5,13 @@ use std::sync::Mutex;
 
 use shelbi_app::diff::comments::{CommentDoc, CommentOp};
 use shelbi_app::diff::git::{BlameLine, RawChangeset};
+use shelbi_app::diff::pr::{
+    CheckState, PrCheck, PrDetails, PrReview, PrThread, PrThreadComment, PrWrite, ReviewState,
+};
 use shelbi_app::diff::store::{ViewedDoc, ViewedOp};
 use shelbi_app::diff::revert::{RevertClass, RevertPlan, RevertSpec};
-use shelbi_app::diff::{AgentDelivery, CommitInfo, CommitScope, DiffBackend};
+use shelbi_app::diff::{AgentDelivery, CommitInfo, CommitScope, DiffBackend, Side};
+use shelbi_core::{IssuePr, PrState};
 
 /// Adds, edits, a delete, a rename and a binary, the shapes the view has to
 /// draw, in code the highlighter knows.
@@ -61,10 +65,62 @@ Binary files a/site/public/icon.png and b/site/public/icon.png differ
 /// The files asked to open, with their lines.
 pub type Opened = std::sync::Arc<Mutex<Vec<(String, Option<u32>)>>>;
 
+/// A pull request on [`SAMPLE_PATCH`]: a verdict each way, a failed check and a
+/// thread on `begin`.
+pub fn sample_pr() -> PrDetails {
+    let said = |id: &str, author: &str, body: &str| PrThreadComment {
+        id: id.to_string(),
+        author: author.to_string(),
+        body: body.to_string(),
+        created_at: chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+        pending: false,
+    };
+    let check = |name: &str, state, detail: &str| PrCheck { name: name.to_string(), state, detail: detail.to_string() };
+    let review = |author: &str, state, body: &str| PrReview { author: author.to_string(), state, body: body.to_string() };
+    PrDetails {
+        number: 2155,
+        title: "Record a task's PR".to_string(),
+        url: "https://github.com/jlong/shelbi/pull/2155".to_string(),
+        body: "When Shelbi opened a PR it wrote nothing on the task.\n\nNow it does.".to_string(),
+        author: "jlong".to_string(),
+        head: "jlong/task-pr-metadata".to_string(),
+        base: "main".to_string(),
+        state: PrState::Open,
+        draft: false,
+        reviews: vec![
+            review("alice", ReviewState::Approved, "Reads well."),
+            review("bob", ReviewState::ChangesRequested, "See the thread on begin."),
+        ],
+        checks: vec![
+            check("build", CheckState::Passed, "success"),
+            check("lint", CheckState::Failed, "failure"),
+            check("msrv", CheckState::Pending, "in progress"),
+        ],
+        threads: vec![PrThread {
+            id: "T1".to_string(),
+            path: "crates/shelbi-app/src/review.rs".to_string(),
+            side: Side::New,
+            line: Some(122),
+            original_line: Some(122),
+            start_line: None,
+            code: Some("        let fresh = self.running.insert(id.to_string());".to_string()),
+            resolved: false,
+            outdated: false,
+            file_level: false,
+            comments: vec![
+                said("C1", "bob", "this leaks on early return"),
+                said("C2", "jlong", "fixed in 3f2a1c"),
+            ],
+        }],
+        threads_cut: false,
+    }
+}
+
 pub struct Canned {
     raw: RawChangeset,
     comments: Mutex<CommentDoc>,
     viewed: Mutex<ViewedDoc>,
+    pr: Option<Result<PrDetails, String>>,
 }
 
 impl Canned {
@@ -92,7 +148,14 @@ impl Canned {
             },
             comments: Mutex::default(),
             viewed: Mutex::default(),
+            pr: None,
         }
+    }
+
+    /// With a pull request, or a GitHub that won't answer why.
+    pub fn with_pr(mut self, pr: Result<PrDetails, String>) -> Self {
+        self.pr = Some(pr);
+        self
     }
 }
 
@@ -144,5 +207,17 @@ impl DiffBackend for Canned {
 
     fn revert(&self, plan: &RevertPlan) -> Result<String, String> {
         Ok(plan.done())
+    }
+
+    fn pr_lookup(&self) -> Result<Option<IssuePr>, String> {
+        Ok(self.pr.as_ref().map(|_| IssuePr::new(2155, None)))
+    }
+
+    fn pr_details(&self, _pr: &IssuePr) -> Result<PrDetails, String> {
+        self.pr.clone().unwrap_or_else(|| Err("no pull request".to_string()))
+    }
+
+    fn pr_write(&self, _pr: &IssuePr, _change: &PrWrite) -> Result<String, String> {
+        Ok("Done on GitHub".to_string())
     }
 }
