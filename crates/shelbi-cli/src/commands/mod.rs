@@ -13,6 +13,7 @@ pub mod guard;
 pub mod hub_version;
 pub mod init;
 pub mod issue;
+mod issue_editor;
 pub mod issue_store;
 pub mod machine;
 pub mod message;

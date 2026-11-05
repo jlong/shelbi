@@ -282,8 +282,17 @@ Pass exactly one of these flags.
 shelbi issue edit <ID> [OPTIONS]
 ```
 
-With no flags, opens the issue's markdown file in `$EDITOR` for free-form
-edits. Any field flag switches to non-interactive mode, the path for the
+With no flags, opens the issue's frontmatter and body in `$EDITOR` for
+free-form edits. On the `file_system` backend that's the issue's markdown file.
+On a remote tracker such as GitHub it's a local copy of the same document, and
+saving writes back what you changed: the title, the body, and the metadata
+block. A field someone else changed while the editor was open is kept unless
+you changed it too, in which case nothing is saved. The `column`, `priority`,
+and `assigned_to` fields have dedicated commands, so an edit to them on a remote
+tracker is refused. When a save can't land, the error says where your edits were
+kept.
+
+Any field flag switches to non-interactive mode, the path for the
 orchestrator, CI, or a script to revise an issue after creation. A
 non-interactive edit bumps `updated_at`, validates the touched fields
 before writing, and emits an `edited` event so the change is visible to
@@ -301,6 +310,8 @@ command (`move`, `prio`, `assign`, `depends`) are out of scope; use those.
 | `--branch <BRANCH>` | string | Set the `branch:` override. |
 | `--prefers-machine <NAME>` | string | Set the machine-affinity hint. |
 | `--no-prefers-machine` | flag | Clear the machine-affinity hint. |
+| `--param <KEY=VALUE>` | string | Set a workflow param, a free-form frontmatter key a workflow reads as `{{KEY}}`, such as a subtask's `task`. The value is stored as a string. Repeatable. Works on every backend. |
+| `--no-param <KEY>` | string | Clear a workflow param. Repeatable. Works on every backend. |
 | `--sub <OLD> <NEW>` | 2× string | Literal in-place body substitution. Repeatable. |
 | `--sub-regex <PATTERN> <REPLACEMENT>` | 2× string | Regex body substitution; `REPLACEMENT` may reference capture groups (`$1`). Repeatable. |
 | `--allow-no-match` | flag | Permit a substitution that matches zero occurrences (default: error, writing nothing). |

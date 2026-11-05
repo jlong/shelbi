@@ -2389,6 +2389,26 @@ pub struct Issue {
 }
 
 impl Issue {
+    /// The frontmatter keys [`Issue`]'s typed fields own. Every other key is a
+    /// free-form [`params`](Issue::params) entry, so a param can't be named one
+    /// of these: it would read back as the typed field.
+    pub const FIELD_KEYS: &'static [&'static str] = &[
+        "id",
+        "title",
+        "column",
+        "priority",
+        "assigned_to",
+        "workflow",
+        "branch",
+        "pr",
+        "depends_on",
+        "prefers_machine",
+        "zen",
+        "launch",
+        "created_at",
+        "updated_at",
+    ];
+
     /// True iff any id in `depends_on` is not yet `Done` in `columns`.
     /// IDs missing from `columns` are treated as not-done (which matches
     /// the project-wide validation that rejects unknown ids at save time
@@ -3326,6 +3346,41 @@ mod pr_tests {
 mod tests {
     use super::*;
     use crate::WorkflowZenConfig;
+
+    /// A new typed field has to join [`Issue::FIELD_KEYS`], or a `--param` could
+    /// be named after it and read back as the field.
+    #[test]
+    fn field_keys_name_every_typed_issue_field() {
+        let now = chrono::Utc::now();
+        let issue = Issue {
+            id: "t".into(),
+            title: "t".into(),
+            column: Column::todo(),
+            priority: 0,
+            assigned_to: Some("a".into()),
+            workflow: Some("w".into()),
+            branch: Some("b".into()),
+            pr: Some(IssuePr::new(1, None)),
+            depends_on: vec!["d".into()],
+            prefers_machine: Some("m".into()),
+            zen: Some(IssueZenConfig::default()),
+            launch: Some(IssueLaunchConfig::default()),
+            created_at: now,
+            updated_at: now,
+            params: BTreeMap::new(),
+        };
+        let value = serde_yaml::to_value(&issue).unwrap();
+        let mut keys: Vec<&str> = value
+            .as_mapping()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str().unwrap())
+            .collect();
+        let mut expected = Issue::FIELD_KEYS.to_vec();
+        keys.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(keys, expected);
+    }
 
 
 

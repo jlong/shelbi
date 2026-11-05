@@ -149,6 +149,11 @@ prose verbatim. If a human hand-edits the block into something unparseable, the
 write path refuses rather than clobbering the edit with default metadata, and the
 read path renders the card with empty metadata after warning once.
 
+You rarely need to edit the block by hand. `shelbi issue edit <id>` opens the
+card's fields and prose in `$EDITOR` and writes back what you changed, and
+`shelbi issue edit <id> --param <key>=<value>` sets a single param. See
+[`shelbi issue edit`](/docs/cli/issue).
+
 ### Terminal statuses close the issue
 
 Moving a card to a terminal status closes the GitHub issue, encoding *which*

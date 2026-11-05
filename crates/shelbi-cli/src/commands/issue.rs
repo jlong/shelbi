@@ -13,7 +13,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 use shelbi_state::IssueStore;
 use shelbi_core::{
-    default_workflow, Column, Issue, Owner, StatusCategory, Workflow,
+    default_workflow, Column, Issue, IssueTrackerBackend, Owner, StatusCategory, Workflow,
 };
 use shelbi_proto::control::{AddSpec, EditSpec, MutationKind, SubOp};
 
@@ -142,12 +142,13 @@ pub enum IssueCmd {
     },
     /// Re-order an issue within its column.
     Prio(PrioArgs),
-    /// Revise an issue's content. With NO flags, opens the issue file in
-    /// `$EDITOR` (the historical behavior). Any field flag switches to
-    /// non-interactive mode: `--title`, a body source
+    /// Revise an issue's content. With NO flags, opens the issue's frontmatter
+    /// and body in `$EDITOR`, on any issue-tracker backend. Any field flag
+    /// switches to non-interactive mode: `--title`, a body source
     /// (`--body`/`--body-file`/stdin, optionally `--append`), a frontmatter
     /// field (`--workflow`/`--branch`/`--prefers-machine`/`--no-prefers-machine`),
-    /// or in-place body substitutions (`--sub`/`--sub-regex`). Fields with a
+    /// a workflow param (`--param`/`--no-param`), or in-place body
+    /// substitutions (`--sub`/`--sub-regex`). Fields with a
     /// dedicated command — `move`, `prio`, `assign`, `depends` — are out of
     /// scope; use those instead.
     Edit(EditArgs),
@@ -286,6 +287,14 @@ pub struct EditArgs {
     /// `--prefers-machine`.
     #[arg(long = "no-prefers-machine")]
     pub no_prefers_machine: bool,
+    /// Set a workflow param (a free-form frontmatter key a workflow reads as
+    /// `{{KEY}}`, like a subtask's `task:`). The value is stored as a string.
+    /// Repeatable.
+    #[arg(long = "param", value_name = "KEY=VALUE")]
+    pub param: Vec<String>,
+    /// Clear a workflow param. Repeatable.
+    #[arg(long = "no-param", value_name = "KEY")]
+    pub no_param: Vec<String>,
     /// Literal in-place substitution in the body: replace every occurrence of
     /// OLD with NEW. Repeatable; multiple `--sub`/`--sub-regex` apply in
     /// command-line order, each on the previous result. Two values (not
@@ -1269,6 +1278,8 @@ fn edit_has_field_flags(args: &EditArgs, stdin_body: &Option<String>) -> bool {
         || args.branch.is_some()
         || args.prefers_machine.is_some()
         || args.no_prefers_machine
+        || !args.param.is_empty()
+        || !args.no_param.is_empty()
         || !args.sub.is_empty()
         || !args.sub_regex.is_empty()
         || stdin_body.is_some()
@@ -1367,10 +1378,18 @@ fn edit(project: &str, args: EditArgs) -> Result<()> {
     } else {
         None
     };
-    // Zero-flag invocation preserves the historical behavior: open the file in
-    // `$EDITOR`. Any field flag (or a piped body) switches to non-interactive
-    // mode.
+    // Zero-flag invocation opens the issue in `$EDITOR`. Any field flag (or a
+    // piped body) switches to non-interactive mode.
     if !edit_has_field_flags(&args, &stdin_body) {
+        // Only the file backend has a file to open. Any other backend's issue
+        // lives on its tracker, so the editor works on a local copy of it.
+        let backend = shelbi_state::load_project(project)
+            .map_err(|e| anyhow!(e))?
+            .issue_tracker
+            .backend;
+        if backend != IssueTrackerBackend::FileSystem {
+            return super::issue_editor::edit_on_tracker(project, &args.id, args.reason);
+        }
         let path = shelbi_state::task_path(project, &args.id).map_err(|e| anyhow!(e))?;
         if !path.exists() {
             bail!("issue `{}` not found", args.id);
@@ -1380,6 +1399,7 @@ fn edit(project: &str, args: EditArgs) -> Result<()> {
     if args.prefers_machine.is_some() && args.no_prefers_machine {
         bail!("--prefers-machine and --no-prefers-machine are mutually exclusive");
     }
+    let frontmatter = super::issue_editor::param_changes(&args.param, &args.no_param)?;
     // Recover the exact command-line order of `--sub`/`--sub-regex` (clap can't).
     let subs = ordered_substitutions(
         std::env::args_os().map(|s| s.to_string_lossy().into_owned()),
@@ -1432,6 +1452,7 @@ fn edit(project: &str, args: EditArgs) -> Result<()> {
         reason: args.reason,
         expect_title: None,
         expect_body: None,
+        frontmatter,
     };
     mutate_client::run_mutation(project, &args.id, MutationKind::Edit(Box::new(spec)))
 }
@@ -2008,6 +2029,8 @@ statuses:
             branch: None,
             prefers_machine: None,
             no_prefers_machine: false,
+            param: Vec::new(),
+            no_param: Vec::new(),
             sub: Vec::new(),
             sub_regex: Vec::new(),
             allow_no_match: false,

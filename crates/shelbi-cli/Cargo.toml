@@ -49,9 +49,9 @@ unicode-width = { workspace = true }
 regex = { workspace = true }
 signal-hook = "0.3"
 libc = { workspace = true }
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 # The control-socket integration test (`tests/control_socket.rs`) drives a real
 # daemon over the mutation control protocol via the typed client; the
 # session-survival test (`tests/session_survival.rs`) speaks the session

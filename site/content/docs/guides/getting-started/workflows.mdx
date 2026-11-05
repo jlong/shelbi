@@ -633,8 +633,9 @@ adding a dedicated review column and its transitions.
 
 `workflows/subtask.yaml` is for a piece of a parent issue, done on its own
 branch with **no PR and no review**. A subtask names its parent issue's id in
-its `task:` frontmatter, and the templated `base_branch: task/{{task}}`
-renders as `task/<parent-id>`. The subtask branches from and squash-merges
+its `task:` frontmatter, set with
+`shelbi issue edit <id> --param task=<parent-id>`, and the templated
+`base_branch: task/{{task}}` renders as `task/<parent-id>`. The subtask branches from and squash-merges
 into that branch, never `main`, so its work surfaces only on the parent's
 PR. That only matches the parent's actual branch when the parent's branch
 is named `task/<parent-id>`. The shipped `task` workflow names branches

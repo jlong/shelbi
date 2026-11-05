@@ -1493,6 +1493,9 @@ impl IssueStore for GitHubStore {
             && fields.workflow.is_none()
             && fields.body.is_none()
             && fields.pr.is_none()
+            && fields.zen.is_none()
+            && fields.launch.is_none()
+            && fields.params.is_empty()
         {
             // `assigned_to` was the only field — the overlay write above is the
             // whole operation; nothing to PATCH on the remote. But the published
@@ -1542,6 +1545,19 @@ impl IssueStore for GitHubStore {
                 body_changed = true;
             }
         }
+        if let Some(zen) = fields.zen {
+            if meta.zen != zen {
+                meta.zen = zen;
+                body_changed = true;
+            }
+        }
+        if let Some(launch) = fields.launch {
+            if meta.launch != launch {
+                meta.launch = launch;
+                body_changed = true;
+            }
+        }
+        body_changed |= crate::issue_store::apply_param_edits(&mut meta.params, fields.params);
         if let Some(new_prose) = fields.body {
             if prose != new_prose {
                 prose = new_prose;
@@ -7316,6 +7332,59 @@ mod tests {
         let body = "Prose.\n\n<!-- shelbi:begin -->\n```yaml\npr: 2137\n```\n<!-- shelbi:end -->\n";
         let (_, parsed) = split_shelbi_meta(body);
         assert_eq!(parsed.unwrap().pr, Some(IssuePr::new(2137, None)));
+    }
+
+    #[test]
+    fn set_fields_changes_params_by_key_in_the_meta_block() {
+        let _home = HomeGuard::new("set-fields-params");
+        let issue = r#"{"number":7,"title":"T","body":"Prose stays.\n\n<!-- shelbi:begin -->\n```yaml\npriority: 2\nkeep: me\nold: x\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", issue);
+        store
+            .set_fields(
+                "t",
+                IssueFields {
+                    params: BTreeMap::from([
+                        ("task".to_string(), Some(serde_yaml::Value::from("parent"))),
+                        ("old".to_string(), None),
+                    ]),
+                    zen: Some(Some(IssueZenConfig {
+                        checks_only: vec!["lint".into()],
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        let patch = call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/7"])
+            .expect("body PATCH");
+        assert!(patch.contains("task: parent"), "{patch}");
+        assert!(patch.contains("keep: me"), "{patch}");
+        assert!(patch.contains("priority: 2"), "{patch}");
+        assert!(patch.contains("- lint"), "{patch}");
+        assert!(!patch.contains("old:"), "{patch}");
+        assert!(patch.contains("Prose stays."), "{patch}");
+    }
+
+    #[test]
+    fn set_fields_writes_nothing_for_a_param_change_that_changes_nothing() {
+        let _home = HomeGuard::new("set-fields-params-noop");
+        let issue = r#"{"number":7,"title":"T","body":"Prose.\n\n<!-- shelbi:begin -->\n```yaml\nkeep: me\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", issue);
+        store
+            .set_fields(
+                "t",
+                IssueFields {
+                    params: BTreeMap::from([
+                        ("keep".to_string(), Some(serde_yaml::Value::from("me"))),
+                        ("unset".to_string(), None),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        assert!(call_containing(&calls, &["-X PATCH"]).is_none(), "{calls:?}");
     }
 
     #[test]

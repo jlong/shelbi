@@ -18,6 +18,8 @@
 //! the daemon/CLI version. Encoding and decoding here are **pure** (operate on
 //! byte buffers); socket I/O lives in `shelbi-client` and the daemon.
 
+use std::collections::BTreeMap;
+
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::error::ProtoError;
@@ -144,7 +146,9 @@ pub struct EditSpec {
     pub workflow: Option<String>,
     pub branch: Option<String>,
     /// `Some(Some(m))` sets the prefers-machine hint, `Some(None)` clears it,
-    /// `None` leaves it unchanged.
+    /// `None` leaves it unchanged. The clear crosses the wire as an explicit
+    /// `null`, which plain `Option<Option<_>>` would read back as "unchanged".
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "explicit_null")]
     pub prefers_machine: Option<Option<String>>,
     pub reason: Option<String>,
     /// The title this edit replaces: the edit is refused as stale if the
@@ -158,6 +162,25 @@ pub struct EditSpec {
     /// whitespace, which the store folds).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expect_body: Option<String>,
+    /// Frontmatter keys to change, by name: `Some` sets the key, `None` removes
+    /// it. A key a typed issue field owns (`branch`, `depends_on`, ...) is
+    /// validated as that field; any other key is a free-form workflow param.
+    /// `--param` / `--no-param` send param keys, and an `$EDITOR` save on a
+    /// remote tracker sends whichever keys the user changed, so a concurrent
+    /// change to any other key survives. Values are JSON because this crate
+    /// doesn't know the issue types; the daemon decodes them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub frontmatter: BTreeMap<String, Option<serde_json::Value>>,
+}
+
+/// Read a present field as `Some(value)`, so an explicit `null` is `Some(None)`.
+/// An absent field stays `None` through `#[serde(default)]`.
+fn explicit_null<'de, D, T>(de: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(de).map(Some)
 }
 
 /// The mutation to perform. Carries the full CLI argument surface so the
@@ -1035,6 +1058,33 @@ mod tests {
             .to_string(),
             "changed since it was loaded: a, b"
         );
+    }
+
+    /// An edit's "clear" has to survive the JSON wire, where it is a `null`.
+    #[test]
+    fn edit_spec_keeps_a_clear_apart_from_leaving_a_field_alone() {
+        let round_trip = |spec: &EditSpec| -> EditSpec {
+            serde_json::from_slice(&serde_json::to_vec(spec).unwrap()).unwrap()
+        };
+
+        let untouched = EditSpec::default();
+        assert_eq!(round_trip(&untouched).prefers_machine, None);
+
+        let cleared = EditSpec {
+            prefers_machine: Some(None),
+            ..Default::default()
+        };
+        assert_eq!(round_trip(&cleared).prefers_machine, Some(None));
+
+        let set = EditSpec {
+            prefers_machine: Some(Some("m".into())),
+            frontmatter: BTreeMap::from([
+                ("task".to_string(), Some(serde_json::json!("parent"))),
+                ("old".to_string(), None),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(round_trip(&set), set);
     }
 
     #[test]

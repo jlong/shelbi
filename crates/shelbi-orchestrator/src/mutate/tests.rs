@@ -906,6 +906,97 @@ fn apply_edit_refuses_when_the_text_it_replaces_changed() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// `EditSpec::frontmatter`, as an editor save and `--param` send it: each key is
+/// held to its field's rules, invalid input writes nothing, and only the keys
+/// named change.
+#[test]
+fn apply_edit_changes_frontmatter_by_key() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+
+    let mut t = task(Column::backlog(), "t");
+    t.branch = Some("feat/x".into());
+    t.workflow = Some("old".into());
+    t.prefers_machine = Some("m".into());
+    t.params.insert("keep".into(), serde_yaml::Value::from(3));
+    shelbi_state::save_task("p", &t, "body\n").unwrap();
+    shelbi_state::save_task("p", &task(Column::todo(), "dep"), "").unwrap();
+
+    let edit = |pairs: &[(&str, Option<serde_json::Value>)]| {
+        let mut sink = RecordingSink::default();
+        let mut recheck = no_recheck();
+        apply(
+            "p",
+            "t",
+            &MutationKind::Edit(Box::new(EditSpec {
+                frontmatter: pairs.iter().map(|(k, v)| (k.to_string(), v.clone())).collect(),
+                ..Default::default()
+            })),
+            &mut sink,
+            &mut recheck,
+        )
+        .map(|_| sink)
+    };
+    let refused = |pairs: &[(&str, Option<serde_json::Value>)], says: &str| {
+        let before = shelbi_state::load_task("p", "t").unwrap().task;
+        let err = format!("{:?}", edit(pairs).expect_err("refused"));
+        assert!(err.contains(says), "{err}");
+        assert_eq!(shelbi_state::load_task("p", "t").unwrap().task, before, "{says}");
+    };
+    let json = serde_json::Value::from;
+
+    edit(&[
+        ("task", Some(json("parent"))),
+        ("branch", None),
+        ("workflow", None),
+        ("prefers_machine", None),
+        ("depends_on", Some(serde_json::json!(["dep"]))),
+        ("pr", Some(serde_json::json!({"number": 12}))),
+        ("zen", Some(serde_json::json!({"checks_only": ["lint"]}))),
+        ("launch", Some(serde_json::json!({"model": "opus"}))),
+    ])
+    .unwrap();
+    let after = shelbi_state::load_task("p", "t").unwrap().task;
+    assert_eq!(after.param_str("task"), Some("parent"));
+    assert_eq!(after.params.get("keep"), Some(&serde_yaml::Value::from(3)));
+    assert_eq!(after.branch, None);
+    assert_eq!(after.workflow, None);
+    assert_eq!(after.prefers_machine, None);
+    assert_eq!(after.depends_on, vec!["dep".to_string()]);
+    assert_eq!(after.pr.as_ref().map(|p| p.number), Some(12));
+    assert_eq!(after.zen.unwrap().checks_only, vec!["lint".to_string()]);
+    assert_eq!(after.launch.unwrap().model.as_deref(), Some("opus"));
+
+    let events = events_log();
+    assert!(events.contains("depends_on"), "{events}");
+    assert!(events.contains("params"), "{events}");
+
+    refused(&[("column", Some(json("done")))], "can't be changed");
+    refused(&[("priority", Some(serde_json::json!(4)))], "can't be changed");
+    refused(&[("id", Some(json("other")))], "can't be changed");
+    refused(&[("workflow", Some(json("no-such-flow")))], "does not exist");
+    refused(&[("branch", Some(json("bad branch name")))], "branch");
+    refused(&[("depends_on", Some(serde_json::json!(["missing"])))], "missing");
+    refused(&[("depends_on", Some(serde_json::json!(["t"])))], "t → t");
+    refused(&[("zen", Some(json("not a table")))], "invalid value for `zen`");
+    // Valid keys sent alongside an invalid one aren't written either.
+    refused(
+        &[("task", Some(json("other"))), ("column", Some(json("done")))],
+        "can't be changed",
+    );
+
+    // A param change that changes nothing isn't an edit.
+    let sink = edit(&[("task", Some(json("parent"))), ("unset", None)]).unwrap();
+    assert!(format!("{sink:?}").contains("(no change)"), "{sink:?}");
+
+    edit(&[("task", None)]).unwrap();
+    assert_eq!(shelbi_state::load_task("p", "t").unwrap().task.param_str("task"), None);
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// The content guard on a GitHub-backed board, where the revision can't tell
 /// an app editor's save from a change it hasn't seen: a save whose
 /// `expect_body` differs from the issue's body as GitHub has it now is

@@ -7,6 +7,7 @@
 //! composition, substitutions, field validation, the store write, and the wake
 //! event) lives here, so the daemon and the in-process path behave identically.
 
+use std::collections::BTreeMap;
 use std::str::FromStr;
 
 use shelbi_core::{
@@ -143,19 +144,12 @@ pub(crate) fn edit(
     // Validate every touched field BEFORE mutating, so invalid input leaves the
     // issue untouched.
     if let Some(name) = spec.workflow.as_deref() {
-        validate_workflow_name(name).map_err(MutateError::backend)?;
-        let path = shelbi_state::workflow_path(project, name).map_err(MutateError::backend)?;
-        if !path.exists() {
-            return Err(MutateError::Backend(format!(
-                "workflow `{name}` does not exist (no {}) — create it first or pick an \
-                 existing workflow",
-                path.display()
-            )));
-        }
+        validate_workflow(project, name)?;
     }
     if let Some(branch) = spec.branch.as_deref() {
         validate_branch(branch).map_err(MutateError::backend)?;
     }
+    let frontmatter = decode_frontmatter(project, store.as_ref(), &tf, &spec.frontmatter)?;
 
     // Recheck before any write (edit has no irreversible git step, but a queued
     // edit that raced an out-of-band move is refused rather than clobbering).
@@ -223,22 +217,24 @@ pub(crate) fn edit(
         None => {}
     }
 
+    fields.extend(&frontmatter.fields);
+
     if fields.is_empty() {
         sink.out("(no change)");
         return Ok(());
     }
 
-    let mut updates = shelbi_state::IssueFields::default();
+    let mut updates = frontmatter.updates;
     if fields.contains(&"title") {
         updates.title = Some(tf.task.title.clone());
     }
-    if fields.contains(&"workflow") {
+    if spec.workflow.is_some() {
         updates.workflow = Some(tf.task.workflow.clone());
     }
-    if fields.contains(&"branch") {
+    if spec.branch.is_some() {
         updates.branch = Some(tf.task.branch.clone());
     }
-    if fields.contains(&"prefers_machine") {
+    if spec.prefers_machine.is_some() {
         updates.prefers_machine = Some(tf.task.prefers_machine.clone());
     }
     if fields.contains(&"body") {
@@ -261,6 +257,119 @@ pub(crate) fn edit(
         ));
     }
     Ok(())
+}
+
+/// Refuse a workflow name that is malformed or has no file.
+fn validate_workflow(project: &str, name: &str) -> Result<(), MutateError> {
+    validate_workflow_name(name).map_err(MutateError::backend)?;
+    let path = shelbi_state::workflow_path(project, name).map_err(MutateError::backend)?;
+    if !path.exists() {
+        return Err(MutateError::Backend(format!(
+            "workflow `{name}` does not exist (no {}) — create it first or pick an \
+             existing workflow",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// A validated [`EditSpec::frontmatter`]: the store write, and the field names
+/// the `edited` event and the confirmation line report.
+#[derive(Default)]
+struct FrontmatterEdit {
+    updates: shelbi_state::IssueFields,
+    fields: Vec<&'static str>,
+}
+
+/// Validate [`EditSpec::frontmatter`] against the issue, writing nothing. A key
+/// with a typed field is held to that field's rules, the ones with a dedicated
+/// command are refused, and any other key is a free-form param. A param change
+/// that matches what is stored isn't reported as an edit.
+fn decode_frontmatter(
+    project: &str,
+    store: &dyn shelbi_state::IssueStore,
+    tf: &shelbi_state::IssueFile,
+    changes: &BTreeMap<String, Option<serde_json::Value>>,
+) -> Result<FrontmatterEdit, MutateError> {
+    let mut edit = FrontmatterEdit::default();
+    for (key, value) in changes {
+        match key.as_str() {
+            "workflow" => {
+                let name: Option<String> = decode_field(key, value)?;
+                if let Some(name) = name.as_deref() {
+                    validate_workflow(project, name)?;
+                }
+                edit.updates.workflow = Some(name);
+                edit.fields.push("workflow");
+            }
+            "branch" => {
+                let branch: Option<String> = decode_field(key, value)?;
+                if let Some(branch) = branch.as_deref() {
+                    validate_branch(branch).map_err(MutateError::backend)?;
+                }
+                edit.updates.branch = Some(branch);
+                edit.fields.push("branch");
+            }
+            "prefers_machine" => {
+                edit.updates.prefers_machine = Some(decode_field(key, value)?);
+                edit.fields.push("prefers_machine");
+            }
+            "depends_on" => {
+                let deps: Option<Vec<String>> = decode_field(key, value)?;
+                let mut candidate = tf.task.clone();
+                candidate.depends_on = deps.unwrap_or_default();
+                // Only a non-empty list needs the board, a full sweep on a
+                // remote tracker.
+                if !candidate.depends_on.is_empty() {
+                    let board = store.list().map_err(MutateError::backend)?;
+                    shelbi_state::validate_depends_on(&candidate, &board)
+                        .map_err(MutateError::backend)?;
+                }
+                edit.updates.depends_on = Some(candidate.depends_on);
+                edit.fields.push("depends_on");
+            }
+            "pr" => {
+                edit.updates.pr = Some(decode_field(key, value)?);
+                edit.fields.push("pr");
+            }
+            "zen" => {
+                edit.updates.zen = Some(decode_field(key, value)?);
+                edit.fields.push("zen");
+            }
+            "launch" => {
+                edit.updates.launch = Some(decode_field(key, value)?);
+                edit.fields.push("launch");
+            }
+            key if Issue::FIELD_KEYS.contains(&key) => {
+                return Err(MutateError::Backend(format!(
+                    "`{key}` can't be changed by an edit"
+                )));
+            }
+            key => {
+                let value: Option<serde_yaml::Value> = decode_field(key, value)?;
+                if tf.task.params.get(key) != value.as_ref() {
+                    edit.updates.params.insert(key.to_string(), value);
+                    if !edit.fields.contains(&"params") {
+                        edit.fields.push("params");
+                    }
+                }
+            }
+        }
+    }
+    Ok(edit)
+}
+
+/// Decode one [`EditSpec::frontmatter`] value into its field's type; `None`
+/// (remove the key) decodes as the type's empty value.
+fn decode_field<T: serde::de::DeserializeOwned + Default>(
+    key: &str,
+    value: &Option<serde_json::Value>,
+) -> Result<T, MutateError> {
+    match value {
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|e| MutateError::Backend(format!("invalid value for `{key}`: {e}"))),
+        None => Ok(T::default()),
+    }
 }
 
 /// Append `text` to `existing`, with a blank-line separator (the `--append`
