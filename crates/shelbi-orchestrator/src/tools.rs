@@ -30,11 +30,14 @@ const EARLY_EXIT: Duration = Duration::from_millis(1500);
 /// Which of a project's Edit / View Diff entries open in an app, from
 /// `cfg`: the editor when `editor:` is an app, the diff when `diff_tool:`
 /// is one and the project's `review.diff_command` doesn't take precedence.
+/// `builtin_diff` says the diff opens in Shelbi's own view instead, with the
+/// same precedence.
 pub fn app_tools_for(cfg: &UserConfig, project_diff_command: bool) -> AppTools {
     let is_app = |c: &Option<ToolChoice>| c.clone().and_then(ToolChoice::normalized).is_some_and(|c| c.is_app());
     AppTools {
         editor: is_app(&cfg.editor),
         diff: !project_diff_command && is_app(&cfg.diff_tool),
+        builtin_diff: !project_diff_command && shelbi_state::tools::is_builtin_diff(cfg.diff_tool.as_ref()),
     }
 }
 
@@ -46,7 +49,8 @@ pub fn app_tools(project: &Project) -> AppTools {
 
 /// The diff a pane runs when the project has no `review.diff_command`:
 /// `diff_tool:` when it is a command, git's configured difftool when it is
-/// unset or an app (a pane can't show an app).
+/// an app (a pane can't show an app) or Shelbi's own view, which is drawn by
+/// the client and only reaches here on a path that needs a pane.
 pub fn pane_diff_launch(diff_tool: Option<&ToolChoice>, path_dirs: &[std::path::PathBuf]) -> Result<DiffLaunch> {
     match diff_tool {
         Some(choice) if !choice.is_app() => shelbi_state::tools::diff_launch(Some(choice), path_dirs).map_err(Error::Other),
@@ -220,12 +224,18 @@ mod tests {
     fn app_tools_follow_the_settings_and_the_project_override_wins() {
         let zed = Some(ToolChoice::app("/Applications/Zed.app"));
         let ks = Some(ToolChoice::app("/Applications/Kaleidoscope.app"));
-        assert_eq!(app_tools_for(&cfg(None, None), false), AppTools::default());
+        assert_eq!(app_tools_for(&cfg(None, None), false), AppTools { builtin_diff: true, ..Default::default() });
+        assert_eq!(
+            app_tools_for(&cfg(None, Some("builtin".into())), false),
+            AppTools { builtin_diff: true, ..Default::default() }
+        );
+        assert_eq!(app_tools_for(&cfg(None, None), true), AppTools::default(), "review.diff_command takes precedence");
+        assert_eq!(app_tools_for(&cfg(None, Some("git".into())), false), AppTools::default());
         assert_eq!(app_tools_for(&cfg(Some("hx".into()), Some("difft".into())), false), AppTools::default());
-        assert_eq!(app_tools_for(&cfg(zed.clone(), ks.clone()), false), AppTools { editor: true, diff: true });
+        assert_eq!(app_tools_for(&cfg(zed.clone(), ks.clone()), false), AppTools { editor: true, diff: true, ..Default::default() });
         assert_eq!(
             app_tools_for(&cfg(zed, ks), true),
-            AppTools { editor: true, diff: false },
+            AppTools { editor: true, diff: false, ..Default::default() },
             "review.diff_command takes precedence over diff_tool"
         );
     }
@@ -233,6 +243,8 @@ mod tests {
     #[test]
     fn a_pane_runs_a_diff_command_and_falls_back_to_git_for_an_app() {
         assert_eq!(pane_diff_launch(None, &[]).unwrap(), DiffLaunch::GitConfigured);
+        assert_eq!(pane_diff_launch(Some(&"builtin".into()), &[]).unwrap(), DiffLaunch::GitConfigured);
+        assert_eq!(pane_diff_launch(Some(&"git".into()), &[]).unwrap(), DiffLaunch::GitConfigured);
         assert_eq!(
             pane_diff_launch(Some(&ToolChoice::app("/Applications/Kaleidoscope.app")), &[]).unwrap(),
             DiffLaunch::GitConfigured

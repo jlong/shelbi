@@ -33,6 +33,11 @@ tracing = { workspace = true }
 # Task descriptions as plain prose (`review::description_text`).
 pulldown-cmark = { workspace = true }
 thiserror = { workspace = true }
+# The diff view (`diff`): intraline highlights, search, syntax highlighting.
+similar = { workspace = true }
+regex = { workspace = true }
+syntect = { workspace = true }
+two-face = { workspace = true }
 
 [features]
 # Test fixtures other crates' tests build on (`settings::agents::fixture`,
@@ -43,3 +48,4 @@ test-support = []
 [dev-dependencies]
 # The activity title-cache tests drive a stubbed `gh` through the store.
 shelbi-state = { workspace = true, features = ["test-support"] }
+tempfile = "3"

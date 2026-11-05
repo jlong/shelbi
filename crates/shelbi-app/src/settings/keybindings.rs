@@ -20,7 +20,10 @@
 //! cancels; Backspace or Delete removes the picked chord; any other chord
 //! replaces it (or is added). A chord another action in the same context
 //! already has is held as a [`Conflict`]: pressing it again moves it here
-//! (off the other action), Esc keeps both as they were.
+//! (off the other action), Esc keeps both as they were. In a context with
+//! two-key bindings (the diff view's `g g`, `z a`), a key that already starts
+//! one waits for its second key ([`KeyOutcome::Waiting`], [`Capture::leader`]);
+//! Backspace takes the first key back.
 //!
 //! How a chord is spelled on screen is the client's ([`Spell`]): the desktop
 //! app draws keycaps (`⌃P`), the TUI its display style (`⌃P` or `Ctrl+P`).
@@ -51,6 +54,9 @@ pub enum Slot {
 pub struct Capture {
     pub action: Action,
     pub slot: Slot,
+    /// The first key of a two-key binding, pressed and waiting for its
+    /// second.
+    pub leader: Option<KeyChord>,
 }
 
 /// A captured chord another action in the same context already has.
@@ -111,6 +117,9 @@ pub enum KeyOutcome {
     Cancelled,
     /// The chord is another action's: the capture stays open, flagged.
     Conflict,
+    /// The key starts a two-key binding: the capture stays open for the
+    /// second key ([`Capture::leader`]).
+    Waiting,
     /// The capture ended in this change: save it, then hand the result to
     /// [`KeybindingsState::saved`]. Nothing shows as changed until then.
     Save(Change),
@@ -315,7 +324,7 @@ impl KeybindingsState {
         if self.saving {
             return false;
         }
-        self.capture = Some(Capture { action, slot });
+        self.capture = Some(Capture { action, slot, leader: None });
         self.conflict = None;
         true
     }
@@ -328,7 +337,7 @@ impl KeybindingsState {
 
     /// A key while capturing. See the module docs.
     pub fn key(&mut self, chord: KeyChord) -> KeyOutcome {
-        let Some(Capture { action, slot }) = self.capture else {
+        let Some(Capture { action, slot, leader }) = self.capture else {
             return KeyOutcome::Ignored;
         };
         let chord = normalize(chord);
@@ -338,6 +347,16 @@ impl KeybindingsState {
             self.cancel();
             return KeyOutcome::Cancelled;
         }
+        if plain && leader.is_some() && matches!(chord.code, Key::Backspace | Key::Delete) {
+            self.set_leader(None);
+            return KeyOutcome::Waiting;
+        }
+        if leader.is_none() && self.starts_two_keys(action, chord) {
+            self.set_leader(Some(chord));
+            return KeyOutcome::Waiting;
+        }
+        let chord = leader.map_or(chord, |first| chord.after(first));
+        self.set_leader(None);
         if plain && matches!(chord.code, Key::Backspace | Key::Delete) {
             let Slot::Chord(at) = slot else {
                 self.cancel();
@@ -406,6 +425,20 @@ impl KeybindingsState {
     pub fn saved(&mut self, result: Result<String, String>) -> Result<(), String> {
         self.saving = false;
         self.load(result?)
+    }
+
+    fn set_leader(&mut self, leader: Option<KeyChord>) {
+        if let Some(capture) = &mut self.capture {
+            capture.leader = leader;
+        }
+    }
+
+    /// Whether `chord` starts a two-key binding in `action`'s context.
+    fn starts_two_keys(&self, action: Action, chord: KeyChord) -> bool {
+        action.takes_two_keys()
+            && Action::all()
+                .filter(|a| a.mode() == action.mode())
+                .any(|a| self.chords(a).iter().any(|c| c.leader.is_some_and(|l| l.chord() == chord)))
     }
 
     /// The other action in `action`'s context bound to `chord`, if any.
@@ -522,6 +555,77 @@ pub fn read_keys(project: Option<&str>) -> Result<String, String> {
 }
 
 #[cfg(test)]
+mod two_key_tests {
+    use super::*;
+    use shelbi_state::keymap::DiffAction;
+
+    fn chord(spec: &str) -> KeyChord {
+        KeyChord::parse(spec).unwrap()
+    }
+
+    fn state() -> KeybindingsState {
+        KeybindingsState::new(None, |c| c.canonical())
+    }
+
+    const TOP: Action = Action::Diff(DiffAction::Top);
+    const FOLD: Action = Action::Diff(DiffAction::ToggleHunkFold);
+
+    #[test]
+    fn a_key_that_starts_a_binding_waits_for_its_second_key() {
+        let mut s = state();
+        assert!(s.start_capture(FOLD, Slot::Chord(0)));
+        assert_eq!(s.key(chord("z")), KeyOutcome::Waiting);
+        assert_eq!(s.capture().unwrap().leader, Some(chord("z")));
+        match s.key(chord("x")) {
+            KeyOutcome::Save(change) => {
+                let text = change.apply("", None).unwrap();
+                assert!(text.contains("toggle_hunk_fold: 'z x'"), "{text}");
+                assert!(validate_keymaps_yaml(&text, None).0.diff.dispatch(chord("z x")) == Some(DiffAction::ToggleHunkFold));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn backspace_takes_the_first_key_back_and_esc_ends_it() {
+        let mut s = state();
+        s.start_capture(FOLD, Slot::New);
+        s.key(chord("z"));
+        assert_eq!(s.key(chord("backspace")), KeyOutcome::Waiting);
+        assert_eq!(s.capture().unwrap().leader, None);
+        s.key(chord("g"));
+        assert_eq!(s.key(chord("esc")), KeyOutcome::Cancelled);
+        assert!(s.capture().is_none());
+    }
+
+    #[test]
+    fn a_two_key_conflict_moves_on_the_second_press() {
+        let mut s = state();
+        s.start_capture(FOLD, Slot::Chord(0));
+        s.key(chord("g"));
+        assert_eq!(s.key(chord("g")), KeyOutcome::Conflict);
+        assert_eq!(s.conflict().unwrap().other, TOP);
+        assert_eq!(s.key(chord("g")), KeyOutcome::Waiting);
+        match s.key(chord("g")) {
+            KeyOutcome::Save(Change::Set(sets)) => {
+                assert_eq!(sets[0], (TOP, vec![]));
+                assert_eq!(sets[1], (FOLD, vec![chord("g g")]));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_contexts_take_one_key() {
+        let mut s = state();
+        let up = Action::Sidebar(shelbi_state::keymap::SidebarAction::NavUp);
+        s.start_capture(up, Slot::New);
+        // `g` starts a binding in the diff view, not here.
+        assert!(matches!(s.key(chord("g")), KeyOutcome::Save(_)));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use shelbi_state::keymap::{GlobalAction, KanbanAction, SidebarAction};
@@ -570,7 +674,7 @@ mod tests {
         let titles: Vec<&str> = groups.iter().map(|g| g.context.title).collect();
         assert_eq!(
             titles,
-            ["Global", "Sidebar", "Issues board", "Issue details", "Activity", "Command palette"]
+            ["Global", "Sidebar", "Issues board", "Issue details", "Activity", "Diff view", "Command palette"]
         );
         let rows: usize = groups.iter().map(|g| g.rows.len()).sum();
         assert_eq!(rows, Action::all().count());

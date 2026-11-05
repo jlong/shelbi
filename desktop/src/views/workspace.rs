@@ -1987,7 +1987,7 @@ pub(crate) mod tests {
         let mut h = open(cx);
         let mut details = details_for_t1();
         details.editor_name = "Zed".into();
-        details.apps = shelbi_state::AppTools { editor: true, diff: false };
+        details.apps = shelbi_state::AppTools { editor: true, diff: false, ..Default::default() };
         *h.ops.details.lock().unwrap() = Some(details);
         h.update(|v, cx| v.show("alpha", Some(working()), cx));
         h.click("ws-switch-editor");
@@ -2016,7 +2016,7 @@ pub(crate) mod tests {
         // Settings saved Zed (an app) as the editor.
         let mut details = details_for_t1();
         details.editor_name = "Zed".into();
-        details.apps = shelbi_state::AppTools { editor: true, diff: false };
+        details.apps = shelbi_state::AppTools { editor: true, diff: false, ..Default::default() };
         *h.ops.details.lock().unwrap() = Some(details);
         h.update(|v, cx| v.tools_changed(cx));
         assert_eq!(

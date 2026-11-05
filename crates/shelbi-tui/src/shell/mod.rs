@@ -10924,7 +10924,7 @@ mod tests {
         assert_eq!(st.settings_store.lock().unwrap().config.as_ref().unwrap().editor, Some(zed));
         let w = st.workspace.as_ref().unwrap();
         assert_eq!(w.editor_label(), "Edit in Zed", "the open panel follows the setting");
-        assert_eq!(w.apps(), shelbi_state::AppTools { editor: true, diff: false });
+        assert_eq!(w.apps(), shelbi_state::AppTools { editor: true, diff: false, builtin_diff: true });
     }
 
     // --- Settings ▸ Workflows (tui-settings-workflows), through the shell ---

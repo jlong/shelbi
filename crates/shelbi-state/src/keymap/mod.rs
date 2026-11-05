@@ -10,10 +10,10 @@ pub mod key;
 pub mod loader;
 
 pub use actions::{
-    Action, ActivityAction, GlobalAction, KanbanAction, PaletteAction, PopoverAction,
+    Action, ActivityAction, DiffAction, GlobalAction, KanbanAction, PaletteAction, PopoverAction,
     SidebarAction, MODE_NAMES,
 };
-pub use chord::{ChordParseError, KeyChord};
+pub use chord::{ChordParseError, KeyChord, Leader};
 pub use contexts::{context, KeymapContext, CONTEXTS};
 pub use key::{Key, Mods};
 pub use display::{format_chord, DisplayStyle};

@@ -551,7 +551,7 @@ fn entry_help(picker: &ToolPicker, i: usize) -> String {
     match picker.entries().get(i) {
         Some(PickerEntry::Default) => match (&picker.default_detail, picker.setting) {
             (Some(detail), _) => format!("No setting: runs {detail}."),
-            (None, ToolSetting::DiffTool) => "No setting: runs git's difftool (none configured).".to_string(),
+            (None, ToolSetting::DiffTool) => "No setting: Shelbi's own diff view.".to_string(),
             (None, ToolSetting::Editor) => "No setting: $EDITOR, else vim.".to_string(),
         },
         Some(PickerEntry::Tool(t)) if t.kind == ToolKind::App => {

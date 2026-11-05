@@ -390,6 +390,7 @@ mod tests {
             apps: shelbi_state::AppTools {
                 editor: false,
                 diff: true,
+                builtin_diff: false,
             },
             branch: Some("jlong/t-1".into()),
             task: Some(Box::new(task)),
@@ -400,7 +401,7 @@ mod tests {
             "worktree": "/srv/shelbi/.shelbi/wt/alpha",
             "remote_address": "jlong@devbox:/srv/shelbi/.shelbi/wt/alpha",
             "editor_name": "Helix",
-            "apps": { "editor": false, "diff": true },
+            "apps": { "editor": false, "diff": true, "builtin_diff": false },
             "branch": "jlong/t-1",
             "task": {
                 "task": {

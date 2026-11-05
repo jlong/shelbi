@@ -88,6 +88,9 @@ pub enum Request {
     /// Start an editor session on `file`, named [`editor_session_name`] with
     /// `key`.
     OpenEditor { key: String, file: FarFile },
+    /// A read or write for the diff view (`crate::diff`): its changeset,
+    /// blame, comments and viewed marks live on the project's machine.
+    Diff(crate::diff::DiffRequest),
 }
 
 /// The far daemon's answer to a [`Request`].
@@ -101,6 +104,7 @@ pub enum Reply {
     Recorded,
     /// The editor session's name, or why it couldn't start.
     Editor(Result<String, String>),
+    Diff(crate::diff::DiffReply),
 }
 
 /// The far paths a path Cmd+clicked in a far terminal may name: as

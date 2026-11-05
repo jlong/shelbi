@@ -43,11 +43,12 @@ pub struct UserConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor: Option<ToolChoice>,
 
-    /// The diff tool View Diff runs over a branch's changes: a command line
-    /// in a pane (`difft`, `nvim -d`) or an app (`{ app:
-    /// /Applications/Kaleidoscope.app }`). A project's `review.diff_command`
-    /// takes precedence; unset runs git's configured difftool (`diff.tool` /
-    /// `diff.guitool`). See [`crate::tools::diff_launch`].
+    /// What View Diff shows over a branch's changes: `builtin` (Shelbi's own
+    /// diff view, and what unset means), `git` (git's configured difftool,
+    /// `diff.tool` / `diff.guitool`), a command line in a pane (`difft`, `nvim
+    /// -d`) or an app (`{ app: /Applications/Kaleidoscope.app }`). A project's
+    /// `review.diff_command` takes precedence. See
+    /// [`crate::tools::diff_launch`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_tool: Option<ToolChoice>,
 

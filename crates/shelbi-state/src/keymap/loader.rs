@@ -28,7 +28,7 @@ use std::hash::Hash;
 use std::path::Path;
 
 use super::actions::{
-    Action, ActivityAction, GlobalAction, KanbanAction, PaletteAction, PopoverAction,
+    Action, ActivityAction, DiffAction, GlobalAction, KanbanAction, PaletteAction, PopoverAction,
     SidebarAction, MODE_NAMES,
 };
 use super::chord::KeyChord;
@@ -51,6 +51,7 @@ pub struct Keymaps {
     pub kanban: ModeKeymap<KanbanAction>,
     pub popover: ModeKeymap<PopoverAction>,
     pub activity: ModeKeymap<ActivityAction>,
+    pub diff: ModeKeymap<DiffAction>,
     pub palette: ModeKeymap<PaletteAction>,
 }
 
@@ -84,6 +85,7 @@ impl Keymaps {
             Action::Kanban(a) => of(&self.kanban, a),
             Action::Popover(a) => of(&self.popover, a),
             Action::Activity(a) => of(&self.activity, a),
+            Action::Diff(a) => of(&self.diff, a),
             Action::Palette(a) => of(&self.palette, a),
         }
     }
@@ -111,6 +113,14 @@ impl Keymaps {
 }
 
 impl<A: Copy + Eq + Hash> ModeKeymap<A> {
+    /// Whether some binding starts with `chord`, so a client's key layer
+    /// waits for the second key instead of dispatching it.
+    pub fn is_leader(&self, chord: KeyChord) -> bool {
+        self.bindings
+            .keys()
+            .any(|b| b.leader.is_some_and(|l| l.chord() == chord))
+    }
+
     /// Look up the action bound to the chord that fired. The lookup folds
     /// in the implicit-Shift fallback some terminals produce for
     /// uppercase characters (a `Char('A')` with no SHIFT mod is treated
@@ -128,8 +138,8 @@ impl<A: Copy + Eq + Hash> ModeKeymap<A> {
         if let Key::Char(c) = chord.code {
             if c.is_ascii_uppercase() {
                 let alt = KeyChord {
-                    code: Key::Char(c.to_ascii_lowercase()),
-                    mods: chord.mods | Mods::SHIFT,
+                    leader: chord.leader,
+                    ..KeyChord::new(Key::Char(c.to_ascii_lowercase()), chord.mods | Mods::SHIFT)
                 };
                 if let Some(a) = self.bindings.get(&alt) {
                     return Some(*a);
@@ -490,6 +500,18 @@ fn load_keymaps_source(
         let mut ok = Vec::with_capacity(chords.len());
         for raw in chords {
             match KeyChord::parse(raw) {
+                // A two-key binding only fires where a key layer waits for
+                // the second key.
+                Ok(c) if c.leader.is_some() && !action.takes_two_keys() => {
+                    diags.push(KeymapDiagnostic::err(
+                        ErrorKind::ParseError,
+                        format!(
+                            "invalid chord `{raw}`: two-key bindings only work in `diff`, not `{}`",
+                            action.mode()
+                        ),
+                        Some(format!("{}.{}", action.mode(), action.key_name())),
+                    ));
+                }
                 // F10: dedupe within one action's list so `[k, up, k]`
                 // doesn't self-collide (two occurrences of the same chord
                 // for the *same* action isn't a real collision).
@@ -552,6 +574,21 @@ fn load_keymaps_source(
                 }
                 for c in chords {
                     by_chord.entry(*c).or_default().push(*action);
+                }
+            }
+            // A chord bound by itself can't also start a two-key binding: the
+            // first key would fire and the second never reach it. That is the
+            // same clash as two actions on one chord, so it's handled as one
+            // (the two-key action's own entry joins the single key's).
+            let starters: Vec<(KeyChord, Action)> = by_chord
+                .iter()
+                .filter_map(|(c, actions)| Some((c.leader?.chord(), actions[0])))
+                .collect();
+            for (plain, two_key) in starters {
+                if let Some(actions) = by_chord.get_mut(&plain) {
+                    if !actions.contains(&two_key) {
+                        actions.push(two_key);
+                    }
                 }
             }
             for (chord, actions) in by_chord {
@@ -720,6 +757,7 @@ fn build_keymaps(parsed: &HashMap<Action, Vec<KeyChord>>) -> Keymaps {
             Action::Kanban(a) => insert_into(&mut km.kanban, a, chords),
             Action::Popover(a) => insert_into(&mut km.popover, a, chords),
             Action::Activity(a) => insert_into(&mut km.activity, a, chords),
+            Action::Diff(a) => insert_into(&mut km.diff, a, chords),
             Action::Palette(a) => insert_into(&mut km.palette, a, chords),
         }
     }
@@ -1306,6 +1344,104 @@ fn upsert_mapping<'a>(parent: &'a mut Mapping, key: &str) -> Option<&'a mut Mapp
     }
     let entry = parent.get_mut(&k)?;
     entry.as_mapping_mut()
+}
+
+#[cfg(test)]
+mod two_key_tests {
+    use super::*;
+
+    fn chord(s: &str) -> KeyChord {
+        KeyChord::parse(s).unwrap()
+    }
+
+    fn load(text: &str) -> (Keymaps, Vec<KeymapDiagnostic>) {
+        validate_keymaps_yaml(text, None)
+    }
+
+    fn has_error(diags: &[KeymapDiagnostic], kind: ErrorKind) -> bool {
+        diags.iter().any(|d| matches!(d, KeymapDiagnostic::Error { kind: k, .. } if *k == kind))
+    }
+
+    #[test]
+    fn the_diff_context_ships_skims_keys() {
+        let (km, diags) = load("");
+        assert!(diags.is_empty(), "{diags:?}");
+        let cases = [
+            ("j", DiffAction::CursorDown),
+            ("ctrl-n", DiffAction::NextFile),
+            ("space", DiffAction::PageDown),
+            ("g g", DiffAction::Top),
+            ("G", DiffAction::Bottom),
+            ("z z", DiffAction::CenterViewport),
+            ("M", DiffAction::CenterCursor),
+            ("] h", DiffAction::NextChange),
+            ("[ c", DiffAction::PrevComment),
+            ("}", DiffAction::NextEmptyLine),
+            ("f", DiffAction::FindForward),
+            (";", DiffAction::RepeatFind),
+            ("/", DiffAction::Search),
+            ("N", DiffAction::PrevMatch),
+            ("ctrl-p", DiffAction::FilePalette),
+            (":", DiffAction::CommandPalette),
+            ("?", DiffAction::Help),
+            ("tab", DiffAction::NextHunkFilter),
+            ("back-tab", DiffAction::PrevHunkFilter),
+            ("B", DiffAction::ToggleBlame),
+            ("z C", DiffAction::CloseFileFold),
+            ("z R", DiffAction::OpenAllFolds),
+            ("v", DiffAction::VisualSelect),
+            ("enter", DiffAction::Comment),
+            ("r", DiffAction::ReplyOrRefresh),
+            ("g Y", DiffAction::SendToAgent),
+            ("ctrl-g", DiffAction::OpenInEditor),
+        ];
+        for (spec, action) in cases {
+            assert_eq!(km.diff.dispatch(chord(spec)), Some(action), "{spec}");
+        }
+        assert!(km.diff.is_leader(chord("g")) && km.diff.is_leader(chord("z")) && km.diff.is_leader(chord("]")));
+        assert!(!km.diff.is_leader(chord("j")));
+    }
+
+    #[test]
+    fn the_diff_context_is_rebindable_with_two_keys() {
+        let (km, diags) = load("defaults:\n  diff:\n    cursor_down: e\n    top: 'x y'\n");
+        assert!(diags.is_empty(), "{diags:?}");
+        assert_eq!(km.diff.dispatch(chord("e")), Some(DiffAction::CursorDown));
+        assert_eq!(km.diff.dispatch(chord("j")), None);
+        assert_eq!(km.diff.dispatch(chord("x y")), Some(DiffAction::Top));
+        assert_eq!(km.diff.dispatch(chord("g g")), None);
+        // `G` is still only the second half of nothing: `g` leads `g Y` alone.
+        assert!(km.diff.is_leader(chord("x")));
+    }
+
+    #[test]
+    fn a_two_key_binding_outside_the_diff_view_is_refused() {
+        let (km, diags) = load("defaults:\n  sidebar:\n    nav_up: 'g g'\n");
+        assert!(has_error(&diags, ErrorKind::ParseError), "{diags:?}");
+        assert_eq!(km.sidebar.dispatch(chord("k")), Some(SidebarAction::NavUp));
+    }
+
+    #[test]
+    fn a_key_cant_be_bound_and_also_start_a_binding() {
+        let (km, diags) = load("defaults:\n  diff:\n    cursor_down: g\n");
+        assert!(has_error(&diags, ErrorKind::Collision), "{diags:?}");
+        assert_eq!(km.diff.dispatch(chord("j")), Some(DiffAction::CursorDown));
+        assert_eq!(km.diff.dispatch(chord("g")), None);
+    }
+
+    #[test]
+    fn two_key_chords_round_trip() {
+        for spec in ["g g", "z shift-c", "] h", "ctrl-x ctrl-c"] {
+            let c = chord(spec);
+            assert_eq!(KeyChord::parse(&c.canonical()).unwrap(), c, "{spec}");
+        }
+        assert!(KeyChord::parse("gg").is_err());
+        assert!(KeyChord::parse("a b c").is_err());
+        assert_eq!(chord("z C").canonical(), "z shift-c");
+        assert_eq!(crate::keymap::edit::chord_spec(&chord("z shift-c")), "z C");
+        assert_eq!(crate::keymap::edit::chords_yaml(&[chord("] h")]), "'] h'");
+        assert_eq!(crate::keymap::format_chord(&chord("g shift-y"), crate::keymap::DisplayStyle::Linux), "g Shift+y");
+    }
 }
 
 #[cfg(test)]

@@ -68,6 +68,12 @@ pub fn answer_with(services: &FarServices, project: &str, request: Request) -> R
             Reply::Recorded
         }
         Request::OpenEditor { key, file } => Reply::Editor(open_editor(services, project, &key, &file)),
+        // The request's project is the connection's: a window asks about the
+        // project it's on.
+        Request::Diff(mut req) => {
+            req.target.project = project.to_string();
+            Reply::Diff(shelbi_app::diff::answer(&req))
+        }
     }
 }
 

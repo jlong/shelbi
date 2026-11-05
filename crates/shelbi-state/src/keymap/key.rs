@@ -61,6 +61,11 @@ impl Mods {
     }
 
     /// True when `self` and `other` share at least one bit.
+    /// These modifiers with `other` taken off.
+    pub const fn without(self, other: Mods) -> Mods {
+        Mods(self.0 & !other.0)
+    }
+
     pub const fn intersects(self, other: Mods) -> bool {
         (self.0 & other.0) != 0
     }

@@ -109,14 +109,16 @@ impl ToolSetting {
     pub fn default_label(self) -> &'static str {
         match self {
             ToolSetting::Editor => DEFAULT_EDITOR_LABEL,
-            ToolSetting::DiffTool => GIT_DIFFTOOL_LABEL,
+            ToolSetting::DiffTool => BUILTIN_DIFF_LABEL,
         }
     }
 }
 
 /// The editor picker's default entry (`editor:` unset).
 pub const DEFAULT_EDITOR_LABEL: &str = "Default ($EDITOR or vim)";
-/// The diff tool picker's default entry (`diff_tool:` unset).
+/// The diff tool picker's default entry (`diff_tool:` unset or `builtin`).
+pub const BUILTIN_DIFF_LABEL: &str = "Shelbi's diff view";
+/// The diff tool picker's entry for `diff_tool: git`.
 pub const GIT_DIFFTOOL_LABEL: &str = "Git's difftool";
 /// The picker entry that picks an app or a program from disk.
 pub const BROWSE_LABEL: &str = "Browse…";
@@ -133,7 +135,7 @@ pub enum Change {
     AppIcon(AppIcon),
     /// The editor; `None` clears it, so the fallback applies.
     Editor(Option<ToolChoice>),
-    /// The diff tool; `None` clears it, so git's difftool applies.
+    /// The diff tool; `None` clears it, so Shelbi's own diff view applies.
     DiffTool(Option<ToolChoice>),
 }
 
@@ -543,12 +545,14 @@ impl GeneralForm {
         (choice.summary(), source)
     }
 
-    /// What View Diff runs, in words: the setting (a command line or an
-    /// app's name), else git's difftool and the tool git names.
+    /// What View Diff shows, in words: the built-in view, git's difftool and
+    /// the tool git names, or the setting (a command line or an app's name).
     pub fn effective_diff_tool(&self) -> String {
         match self.diff_tool_choice() {
+            None => BUILTIN_DIFF_LABEL.to_string(),
+            Some(choice) if choice.is_builtin_diff() => BUILTIN_DIFF_LABEL.to_string(),
+            Some(choice) if choice.is_git_diff() => self.git_difftool_detail(),
             Some(choice) => choice.summary(),
-            None => self.git_difftool_detail(),
         }
     }
 
@@ -562,11 +566,29 @@ impl GeneralForm {
     /// `setting`'s picker: its entries and the current one.
     pub fn picker(&self, setting: ToolSetting) -> ToolPicker {
         let detected = match setting {
-            ToolSetting::Editor => &self.detected.editors,
-            ToolSetting::DiffTool => &self.detected.diff_tools,
+            ToolSetting::Editor => self.detected.editors.clone(),
+            // Git's difftool is an entry of its own now the default is the
+            // built-in view, named for what it runs.
+            ToolSetting::DiffTool => {
+                let git = ToolOption {
+                    name: match &self.detected.git_difftool {
+                        Some(tool) => format!("{GIT_DIFFTOOL_LABEL} ({tool})"),
+                        None => GIT_DIFFTOOL_LABEL.to_string(),
+                    },
+                    kind: ToolKind::Cli,
+                    choice: ToolChoice::Command(shelbi_state::tools::GIT_DIFF.to_string()),
+                    app_path: None,
+                };
+                std::iter::once(git).chain(self.detected.diff_tools.iter().cloned()).collect()
+            }
         };
         let of_kind = |kind| detected.iter().filter(|t| t.kind == kind).cloned().collect::<Vec<_>>();
-        let current = self.tool(setting).cloned().and_then(ToolChoice::normalized);
+        // `diff_tool: builtin` is the default entry, as if unset.
+        let current = self
+            .tool(setting)
+            .cloned()
+            .and_then(ToolChoice::normalized)
+            .filter(|c| !(setting == ToolSetting::DiffTool && c.is_builtin_diff()));
         let custom = current
             .as_ref()
             .filter(|c| !detected.iter().any(|t| &t.choice == *c))
@@ -576,7 +598,7 @@ impl GeneralForm {
                 let (command, source) = self.fallback_editor();
                 Some(format!("{command}, {}", source_label(source)))
             }
-            ToolSetting::DiffTool => self.detected.git_difftool.as_ref().map(|t| format!("{t}, from git")),
+            ToolSetting::DiffTool => None,
         };
         ToolPicker {
             setting,
@@ -961,13 +983,17 @@ mod tests {
     }
 
     #[test]
-    fn the_diff_tool_saves_like_the_editor_and_defaults_to_git() {
+    fn the_diff_tool_saves_like_the_editor_and_defaults_to_the_built_in_view() {
         let mut f = loaded(ThemePreference::Dark, Some("hx"), None);
         f.set_detected(detected());
-        assert_eq!(f.effective_diff_tool(), "Git's difftool (vimdiff)");
+        assert_eq!(f.effective_diff_tool(), "Shelbi's diff view");
         let p = f.picker(ToolSetting::DiffTool);
-        assert_eq!(entry_labels(&p), ["Git's difftool", "Difftastic", "Kaleidoscope", "Browse…", "Other command…"]);
-        assert_eq!(p.default_detail.as_deref(), Some("vimdiff, from git"));
+        assert_eq!(
+            entry_labels(&p),
+            ["Shelbi's diff view", "Git's difftool (vimdiff)", "Difftastic", "Kaleidoscope", "Browse…", "Other command…"]
+        );
+        assert_eq!(p.selected(), 0);
+        assert_eq!(p.default_detail, None);
 
         assert_eq!(f.choose_tool(ToolSetting::DiffTool, Some("difft".into())), Some(Change::DiffTool(Some("difft".into()))));
         assert_eq!(f.editor(), Some("hx"), "the editor is untouched");
@@ -985,6 +1011,28 @@ mod tests {
         f.saved_result(Ok(UserConfig { diff_tool: Some("nvim -d -R".into()), ..UserConfig::default() }));
         assert_eq!(f.effective_diff_tool(), "nvim -d -R");
         assert_eq!(f.clear_tool(ToolSetting::DiffTool), Some(Change::DiffTool(None)));
+    }
+
+    #[test]
+    fn builtin_and_git_read_as_their_entries_not_as_commands() {
+        let saved = |value: &str| {
+            let mut f = loaded(ThemePreference::Dark, None, None);
+            f.set_detected(detected());
+            assert!(f.choose_tool(ToolSetting::DiffTool, Some(value.into())).is_some());
+            f.saved_result(Ok(UserConfig { diff_tool: Some(value.into()), ..UserConfig::default() }));
+            f
+        };
+        let builtin = saved("builtin");
+        assert_eq!(builtin.diff_tool_choice(), Some(&"builtin".into()));
+        assert_eq!(builtin.effective_diff_tool(), "Shelbi's diff view");
+        let p = builtin.picker(ToolSetting::DiffTool);
+        assert_eq!((p.selected(), p.custom.clone()), (0, None), "the default entry, not a custom command");
+
+        let git = saved("git");
+        assert_eq!(git.effective_diff_tool(), "Git's difftool (vimdiff)");
+        let p = git.picker(ToolSetting::DiffTool);
+        assert_eq!((p.selected(), p.custom.clone()), (1, None));
+        assert_eq!(p.current, Some("git".into()));
     }
 
     #[test]

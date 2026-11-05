@@ -2007,12 +2007,12 @@ pub(crate) mod tests {
         h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
         let mut fresh = info();
         fresh.editor_name = "Zed".into();
-        fresh.apps = shelbi_state::AppTools { editor: true, diff: true };
+        fresh.apps = shelbi_state::AppTools { editor: true, diff: true, ..Default::default() };
         *h.ops.resolve_with.lock().unwrap() = Some(Ok(ReviewTarget::Serving(fresh)));
         h.update(|v, cx| v.tools_changed(cx));
         let model = h.view.read_with(&h.cx, |v, _| v.model().cloned()).unwrap();
         assert_eq!(model.editor_name, "Zed");
-        assert_eq!(model.apps, shelbi_state::AppTools { editor: true, diff: true });
+        assert_eq!(model.apps, shelbi_state::AppTools { editor: true, diff: true, ..Default::default() });
         assert_eq!(model.title, info().title, "the rest of the review is kept");
     }
 

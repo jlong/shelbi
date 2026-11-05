@@ -1025,10 +1025,7 @@ mod tests {
     }
 
     fn chord(code: Key) -> KeyChord {
-        KeyChord {
-            code,
-            mods: Mods::NONE,
-        }
+        KeyChord::new(code, Mods::NONE)
     }
 
     #[test]
@@ -1156,10 +1153,7 @@ mod tests {
         assert_eq!(p.handle_key(chord(Key::Char('m'))), PanelEffect::ShowDescription);
         assert_eq!(p.handle_key(chord(Key::Esc)), PanelEffect::Back);
         assert_eq!(p.handle_key(chord(Key::Char('q'))), PanelEffect::Close);
-        let ctrl_j = KeyChord {
-            code: Key::Char('j'),
-            mods: Mods::CONTROL,
-        };
+        let ctrl_j = KeyChord::new(Key::Char('j'), Mods::CONTROL);
         let before = p.selected();
         assert_eq!(p.handle_key(ctrl_j), PanelEffect::None);
         assert_eq!(p.selected(), before, "a Ctrl chord isn't the panel's");
@@ -1391,7 +1385,7 @@ mod tests {
     fn an_app_editor_or_diff_launches_and_keeps_the_content_view() {
         let mut i = info(false, false);
         i.editor_name = "Zed".into();
-        i.apps = AppTools { editor: true, diff: true };
+        i.apps = AppTools { editor: true, diff: true, ..Default::default() };
         let model = ReviewPanelModel::build(&i, None);
         assert_eq!(model.switch_items.iter().map(|s| s.label(&model.editor_name)).collect::<Vec<_>>(), ["Reviewer", "View Diff", "Edit in Zed"]);
         let mut p = ReviewPanelState::new(&model);

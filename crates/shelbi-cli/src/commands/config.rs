@@ -395,6 +395,7 @@ fn chords_for_action(km: &Keymaps, action: Action) -> Vec<KeyChord> {
         Action::Kanban(a) => km.kanban.by_action.get(&a).cloned().unwrap_or_default(),
         Action::Popover(a) => km.popover.by_action.get(&a).cloned().unwrap_or_default(),
         Action::Activity(a) => km.activity.by_action.get(&a).cloned().unwrap_or_default(),
+        Action::Diff(a) => km.diff.by_action.get(&a).cloned().unwrap_or_default(),
         Action::Palette(a) => km.palette.by_action.get(&a).cloned().unwrap_or_default(),
     }
 }

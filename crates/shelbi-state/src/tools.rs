@@ -19,12 +19,21 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
+/// The `diff_tool:` value for Shelbi's own diff view, what an unset setting
+/// means too.
+pub const BUILTIN_DIFF: &str = "builtin";
+/// The `diff_tool:` value for git's configured difftool (`diff.tool` /
+/// `diff.guitool`).
+pub const GIT_DIFF: &str = "git";
+
 /// An `editor:` or `diff_tool:` setting: a command line or a macOS app.
 ///
 /// ```yaml
 /// editor: hx                              # a CLI command, opened in a pane
 /// editor: code --wait                     # flags are fine
 /// editor: { app: /Applications/Zed.app }  # an app, opened with `open -a`
+/// diff_tool: builtin                      # Shelbi's own view, the default
+/// diff_tool: git                          # git's configured difftool
 /// diff_tool: difft
 /// diff_tool:
 ///   app: /Applications/Kaleidoscope.app
@@ -88,6 +97,16 @@ impl ToolChoice {
         }
     }
 
+    /// Whether this is `diff_tool: builtin`.
+    pub fn is_builtin_diff(&self) -> bool {
+        self.command().is_some_and(|c| c.trim() == BUILTIN_DIFF)
+    }
+
+    /// Whether this is `diff_tool: git`.
+    pub fn is_git_diff(&self) -> bool {
+        self.command().is_some_and(|c| c.trim() == GIT_DIFF)
+    }
+
     /// The bundle path, for an app.
     pub fn app_path(&self) -> Option<&Path> {
         match self {
@@ -138,6 +157,17 @@ pub struct AppTools {
     /// `diff_tool:` is an app, and no project `review.diff_command` takes
     /// precedence over it.
     pub diff: bool,
+    /// View Diff shows Shelbi's own diff view: `diff_tool:` is unset or
+    /// `builtin`, and no project `review.diff_command` takes precedence.
+    pub builtin_diff: bool,
+}
+
+/// Whether `diff_tool:` set to `choice` means Shelbi's own diff view.
+pub fn is_builtin_diff(choice: Option<&ToolChoice>) -> bool {
+    match choice.cloned().and_then(ToolChoice::normalized) {
+        None => true,
+        Some(choice) => choice.is_builtin_diff(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +481,7 @@ pub struct DetectedTools {
     pub editors: Vec<ToolOption>,
     pub diff_tools: Vec<ToolOption>,
     /// The difftool git is configured with (`diff.guitool`, else
-    /// `diff.tool`), what an unset `diff_tool:` runs.
+    /// `diff.tool`), what `diff_tool: git` runs.
     pub git_difftool: Option<String>,
 }
 
@@ -623,7 +653,7 @@ pub fn editor_launch(choice: Option<&ToolChoice>, fallback: &str) -> EditorLaunc
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffLaunch {
     /// `git difftool` with git's own configured tool (`diff.tool` /
-    /// `diff.guitool`): what an unset `diff_tool:` runs.
+    /// `diff.guitool`): what `diff_tool: git` runs.
     GitConfigured,
     /// `git difftool --tool=shelbi` with this as `difftool.shelbi.cmd`
     /// (`$LOCAL` / `$REMOTE` are the sides), per file or over directories.
@@ -659,6 +689,12 @@ pub fn diff_launch(choice: Option<&ToolChoice>, path_dirs: &[PathBuf]) -> Result
     let Some(choice) = choice.cloned().and_then(ToolChoice::normalized) else {
         return Ok(DiffLaunch::GitConfigured);
     };
+    // Neither names a program to run: `git` is git's configured tool, and the
+    // built-in view is no process at all, so a path that needs one (a client
+    // that hasn't routed to the view) falls back to git's.
+    if choice.is_builtin_diff() || choice.is_git_diff() {
+        return Ok(DiffLaunch::GitConfigured);
+    }
     match choice {
         ToolChoice::Command(cmd) => {
             let base = program_basename(&cmd);
@@ -708,6 +744,31 @@ pub fn diff_launch(choice: Option<&ToolChoice>, path_dirs: &[PathBuf]) -> Result
                 })?;
             Ok(with_helper(diff, &helper))
         }
+    }
+}
+
+#[cfg(test)]
+mod diff_setting_tests {
+    use super::*;
+
+    #[test]
+    fn unset_and_builtin_are_the_built_in_view() {
+        assert!(is_builtin_diff(None));
+        assert!(is_builtin_diff(Some(&"builtin".into())));
+        assert!(is_builtin_diff(Some(&"  ".into())), "a blank setting is no setting");
+        assert!(!is_builtin_diff(Some(&"git".into())));
+        assert!(!is_builtin_diff(Some(&"difft".into())));
+        assert!(!is_builtin_diff(Some(&ToolChoice::app("/Applications/Kaleidoscope.app"))));
+    }
+
+    #[test]
+    fn neither_builtin_nor_git_runs_as_a_command() {
+        for value in ["builtin", "git"] {
+            assert_eq!(diff_launch(Some(&value.into()), &[]), Ok(DiffLaunch::GitConfigured), "{value}");
+        }
+        // External tools launch as they did.
+        assert!(matches!(diff_launch(Some(&"difft".into()), &[]), Ok(DiffLaunch::Pager { .. })));
+        assert!(matches!(diff_launch(Some(&"nvim -d".into()), &[]), Ok(DiffLaunch::Difftool { .. })));
     }
 }
 
