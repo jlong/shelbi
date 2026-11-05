@@ -290,24 +290,24 @@ panel is where you drive the review:
   OS file manager.
 - A **view switcher** that swaps the right-hand content pane:
   - **🤓 Reviewer** (default): talk to the Review agent.
-  - **🔀 View Diff**: open your system diff tool over the review branch's
-    changes (the same `merge-base(base, HEAD)..HEAD` range `shelbi diff`
-    shows) in the main pane. By default it launches git's configured diff tool
-    (`diff.tool`, or `diff.guitool` for a GUI tool) in directory-diff mode;
-    with none configured the panel reports a short error rather than launching.
-    A tool that reviews a revision range instead of two directory trees (such
-    as `skim`) needs a `review.diff_command` override in `project.yaml` (see
-    [Project config](/docs/configuration/project)). A diff tool that exits
-    without rendering leaves a short message in the pane rather than only git
-    warnings.
+  - **🔀 View Diff**: read the review branch's changes
+    (`merge-base(base, HEAD)..HEAD`) in [Shelbi's own diff view](/docs/concepts/diff-view),
+    in the main pane. Comment on lines, review one commit at a time, and see the
+    task's pull request with its checks and GitHub threads. To open another tool
+    instead, set [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) or
+    the project's `review.diff_command` (see
+    [Project config](/docs/configuration/project)). A tool that exits without
+    rendering leaves a short message in the pane rather than only git warnings.
   - **✍️ Edit in `<editor>`**: open the worktree in your configured editor
     (see below).
   - **🌐 Open Browser**: open the resolved review `url` in your system
     browser. This entry renders **only** when the workflow declares a review
     URL.
 
-  On a remote review slot only **Reviewer** and **Open Browser** are offered
-  (and no worktree folder is shown).
+  On a remote review slot only **Reviewer**, **View Diff** and **Open Browser**
+  are offered (and no worktree folder is shown). View Diff is there only for
+  Shelbi's own view, which reads a worktree on any machine; another diff tool
+  can't open one.
 - An **Actions** group:
   - **✅ Approve**: move the issue one column forward along the normal accept
     edge (`review → done` in the default workflow), firing that edge's
@@ -329,13 +329,13 @@ panel is where you drive the review:
   Finder (not shown on a remote slot).
 - The **views**, numbered `⌘1`, `⌘2`, … while the review is open:
   - **Reviewer** (default): talk to the Review agent.
-  - **View Diff**: run your diff tool over the review branch's changes (the
-    same `merge-base(base, HEAD)..HEAD` range `shelbi diff` shows) in the main
-    area. By default it launches git's configured diff tool (`diff.tool`, or
-    `diff.guitool` for a GUI tool) in directory-diff mode; with none
-    configured the view reports a short error. A tool that reviews a revision
-    range (such as `skim`) needs a `review.diff_command` override in
-    `project.yaml` (see [Project config](/docs/configuration/project)).
+  - **View Diff**: read the review branch's changes
+    (`merge-base(base, HEAD)..HEAD`) in [Shelbi's own diff view](/docs/concepts/diff-view),
+    in the main area. Comment on lines, review one commit at a time, and see the
+    task's pull request with its checks and GitHub threads. To open another tool
+    instead, set [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) or
+    the project's `review.diff_command` (see
+    [Project config](/docs/configuration/project)).
   - **Edit in `<editor>`**: the worktree in your configured editor, inside
     the app (see below).
   - **Web Browser**: open the resolved review `url` in your browser. It reads
@@ -343,7 +343,8 @@ panel is where you drive the review:
     workflow declares a review URL.
   - **Shell**: a shell in the review worktree, beside the content.
 
-  On a remote review slot, View Diff and Edit are not offered.
+  On a remote review slot, Edit is not offered, and View Diff is offered only
+  for Shelbi's own view, which reads a worktree on any machine.
 - An **Actions** group (also under **Go ▸ Reviews** in the menu bar):
   - **Approve**: move the issue one column forward along the normal accept
     edge (`review → done` in the default workflow), firing that edge's

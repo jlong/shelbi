@@ -9,9 +9,11 @@ shelbi diff comment list --task <TASK> [--json]
 shelbi diff comment reply --task <TASK> -i <THREAD> [-a <NAME>] <TEXT>
 ```
 
-A person reviewing a task in Shelbi's diff view can comment on lines and send
-the comments to the task's agent with `gY`. `shelbi diff comment` is the agent's
-side of those threads, so it can answer a comment where the reviewer reads it.
+A person reviewing a task in [Shelbi's diff view](/docs/concepts/diff-view) can
+comment on lines and send the comments to the task's agent with `gY`. `shelbi diff
+comment` is the agent's side of those threads, so it can answer a comment where the
+reviewer reads it. The view's keys are in its
+[keyboard reference](/docs/concepts/diff-view#keyboard-reference).
 
 `TASK` is the task's id, or `ws-<workspace>` for a workspace with no task on it.
 

@@ -1,0 +1,231 @@
+---
+title: The diff view
+order: 13.5
+summary: "Shelbi's own diff view for a review or a live workspace, in the desktop app and the TUI: Skim's keys, unified and split, comments that reach the agent, revert, and the task's pull request with its checks and GitHub threads."
+---
+
+**View Diff** opens Shelbi's own diff view, in both the desktop app and the TUI.
+It takes over the main area of a [review](/docs/concepts/review-workspaces#the-review-interface)
+or a [workspace](/docs/concepts/workspaces), needs no session and no other tool,
+and is keyboard driven. Its keys follow
+[Skim](https://github.com/ctdio/skim), and you can rebind every one of them.
+
+It's what `diff_tool: builtin` asks for, and what an unset `diff_tool` means. To
+keep using another tool, see [Using another tool](#using-another-tool).
+
+## What it shows
+
+The changeset is everything on the branch since it left its base:
+`merge-base(<base branch>, HEAD)` to the worktree.
+
+- **A review** shows the review slot's worktree: the branch as it was handed off.
+- **A workspace** shows the agent's live worktree, including uncommitted and
+  untracked files. It looks again every couple of seconds and follows the agent's
+  edits by itself.
+
+On the left is the file list: each file's status, name and `+` / `-` counts, and
+a check once you've marked it viewed (`m`). A viewed file loses its check if it
+changes again. Above the list, **Commits: all** (`c`) narrows the diff to one
+commit. On the right are the changes, with syntax highlighting and word-level
+highlights inside changed lines. The status bar shows the mode, the layout, the
+filter, your place in the files, and how many comments are waiting.
+
+Press `?` for every key as it's bound now. `s` switches between unified and split,
+`Tab` filters hunks to additions or deletions, `B` adds a blame gutter, and `/`
+searches every file in the changeset (smart case).
+
+<Desktop>
+
+Asking for the diff hands it the keyboard. `Esc`, with nothing to let go of, gives
+it back to the panel. The mouse works too: a click places the cursor, a chevron
+folds, the wheel scrolls both ways, and a file row jumps to the file. While the
+diff has the keyboard, `Ctrl-p` is its file palette, and the window's palette stays
+on `Ctrl-Space` and `⌘K`. Click the file list to give it the keyboard: `j` and `k`
+step through the files and `Space` marks one viewed.
+
+</Desktop>
+<Tui>
+
+Selecting View Diff moves the keyboard into the diff. `Esc`, with nothing to let go
+of, or `Ctrl-h` goes back to the panel. While the diff has focus its keys win over
+Shelbi's: `Ctrl-p` is the file palette, with Shelbi's palette on `Ctrl-Space`, and
+`Tab` is the hunk filter. The mouse places the cursor, scrolls, jumps from a file
+row and marks a file viewed. Below 70 columns the file list starts hidden; `Ctrl-b`
+or `\` brings it back.
+
+</Tui>
+
+## Comments
+
+`Enter` on a line starts a comment, or edits the one already there. `v` selects a
+range of lines to comment on. Comments are threaded and belong to the task, kept in
+the project's state rather than in the branch, so they survive a refresh and show
+in both clients.
+
+Where they go depends on what you're looking at:
+
+| Target | `gY` | `gA` |
+| --- | --- | --- |
+| Workspace | Sends every unsent comment to the workspace's agent as one message | Not offered |
+| Review | Opens **Reject** with the comments as its reason | Sends them to the Reviewer agent |
+
+A thread is marked sent once the message lands or the reject goes through. A send
+that fails says why in the status bar and leaves the thread unsent. The agent can
+answer a thread where you're reading it with
+[`shelbi diff comment reply`](/docs/cli/diff), and its reply appears within a couple
+of seconds.
+
+## Reverting
+
+In a workspace, `gr` reverts the hunk under the cursor and `gR` the whole file. The
+status bar says what it's about to do, and `y` or `Enter` goes ahead.
+
+- **Uncommitted work** goes back to `HEAD`, in the worktree and the index.
+- **Committed work** is undone as a new uncommitted change. The commits stay as they
+  are, so `git checkout` takes the revert back.
+- **A change that's a bit of both** reverses both the same way.
+
+Shelbi refuses a revert the worktree can't take cleanly, with the reason in the
+status bar: an edit that conflicts on those lines, a change that moved since it was
+drawn, or a merge, rebase or cherry-pick in progress. A review has no revert: it
+shows a branch to decide on, not work in progress.
+
+## The task's pull request
+
+When the task has a pull request, a block above the first file shows its number,
+title, branches, review verdicts, a tally of its checks, and its description. `o`
+folds it. `i` opens a panel with every check and every review.
+
+GitHub's review threads appear at their lines, marked `[unresolved]`, `[resolved]`
+or `[pending]`:
+
+- `Enter` or `r` replies on GitHub, and `x` resolves or reopens the thread.
+- `C` chooses where new comments go: GitHub, as your pending review, or local (the
+  default).
+- `R` opens the review editor. `Tab` chooses Comment, Approve or Request changes,
+  and `Enter` submits.
+
+This goes through `gh` on the project's machine, so that machine needs `gh` signed
+in. It reads when the view opens, on `r`, after a write, and every 60 seconds while
+the view is on screen. If GitHub refuses what you wrote, your words stay: a new
+comment stays local, and a reply or review goes back to its editor.
+
+`gY` sends the task's own comments, not GitHub's threads. Editing or deleting your
+own comment on GitHub, and discarding a pending review, are for GitHub's site.
+
+## Keyboard reference
+
+These are the shipped defaults of the `diff` keymap mode. A two-key binding is written
+with a space and is pressed in order: `g g` is `g`, then `g`. A number before a
+motion repeats it: `3j`, `2]h`.
+
+### Move
+
+| Keys | Action | Name |
+| --- | --- | --- |
+| `j`, `Down` / `k`, `Up` | Line down / up | `cursor_down` / `cursor_up` |
+| `l`, `Ctrl-n`, `Right` / `h`, `Left` | Next / previous file | `next_file` / `prev_file` |
+| `Space`, `Ctrl-f`, `PageDown` / `b`, `PageUp` | Page down / up | `page_down` / `page_up` |
+| `Ctrl-d` / `Ctrl-u` | Half page down / up | `half_page_down` / `half_page_up` |
+| `g g` / `G` | Top / bottom | `top` / `bottom` |
+| `z z` / `M` | Center the viewport on the cursor / the cursor in the viewport | `center_viewport` / `center_cursor` |
+| `] h` / `[ h` | Next / previous change | `next_change` / `prev_change` |
+| `] c` / `[ c` | Next / previous comment | `next_comment` / `prev_comment` |
+| `}` / `{` | Next / previous empty line | `next_empty_line` / `prev_empty_line` |
+
+### Find
+
+| Keys | Action | Name |
+| --- | --- | --- |
+| `f` / `F` + a character | Find it forward / backward on the line | `find_forward` / `find_backward` |
+| `t` / `T` + a character | Stop just before it / just after it | `till_forward` / `till_backward` |
+| `;` | Repeat the character find | `repeat_find` |
+| `/` | Search all files | `search` |
+| `n` / `N` | Next / previous match | `next_match` / `prev_match` |
+| `Ctrl-p` | File palette (`>` switches to commands) | `file_palette` |
+| `:` | Command palette | `command_palette` |
+
+### View
+
+| Keys | Action | Name |
+| --- | --- | --- |
+| `s` | Unified or split | `toggle_split` |
+| `Tab` / `Shift-Tab` | Next / previous hunk filter (all, additions, deletions) | `next_hunk_filter` / `prev_hunk_filter` |
+| `B` | Blame gutter | `toggle_blame` |
+| `Ctrl-b`, `\` | Show or hide the file list | `toggle_file_list` |
+| `c` | Review one commit | `pick_commit` |
+| `m` | Mark the file viewed | `toggle_viewed` |
+
+### Fold
+
+| Keys | Action | Name |
+| --- | --- | --- |
+| `z a` / `z c` / `z o` | Toggle / fold / unfold the hunk | `toggle_hunk_fold` / `close_hunk_fold` / `open_hunk_fold` |
+| `z C` / `z O` | Fold / unfold the file | `close_file_fold` / `open_file_fold` |
+| `z M` / `z R` | Fold / unfold everything | `close_all_folds` / `open_all_folds` |
+
+### Comment
+
+| Keys | Action | Name |
+| --- | --- | --- |
+| `v`, `V` | Select lines (then `j` `k`, `y` to yank, `Enter` to comment) | `visual_select` |
+| `Enter` | Comment on the line, or edit its comment | `comment` |
+| `r` | Reply to the comment. Anywhere else, refresh | `reply_or_refresh` |
+| `o` | Expand or collapse the thread | `toggle_thread` |
+| `d` / `D` | Delete the comment / clear all comments | `delete_comment` / `clear_comments` |
+| `y` / `Y` | Yank the comment or selection / all comments | `yank` / `yank_all` |
+| `g Y` | Send all comments to the agent (in a review, Reject with them) | `send_to_agent` |
+| `g A` | Send all comments to the Reviewer agent (review only) | `send_to_reviewer` |
+
+While you write a comment, `Enter` saves, `Ctrl-J` adds a line and `Esc` leaves
+insert mode, where the usual vim motions work. `Esc` again cancels.
+
+### Revert (workspace only)
+
+| Keys | Action | Name |
+| --- | --- | --- |
+| `g r` | Revert the hunk | `revert_hunk` |
+| `g R` | Revert the file | `revert_file` |
+
+### Pull request
+
+| Keys | Action | Name |
+| --- | --- | --- |
+| `x` | Resolve or reopen the GitHub thread | `toggle_resolved` |
+| `C` | New comments go to GitHub or stay here | `toggle_comment_target` |
+| `R` | Submit a review of the pull request | `submit_review` |
+| `i` | Every check and review on the pull request | `pr_info` |
+
+In the `i` panel, `j` `k` `Ctrl-d` `Ctrl-u` `g` `G` move, `r` reads again, and `i`,
+`q` or `Esc` closes it.
+
+### Other
+
+| Keys | Action | Name |
+| --- | --- | --- |
+| `Ctrl-g` | Open the file at the line in your editor | `open_in_editor` |
+| `?` | Show the keys | `help` |
+
+## Rebinding
+
+The names above go under `diff:` in
+[`keys.yaml`](/docs/configuration/global#keysyaml), or change them in Settings ▸
+Keybindings in either client. Quote a two-key chord, and a character YAML treats
+specially:
+
+```yaml
+defaults:
+  diff:
+    next_change: ['] h', 'J']
+    send_to_agent: 'g s'
+```
+
+A key can't both do something by itself and start a two-key binding.
+
+## Using another tool
+
+Settings ▸ General's **Diff tool** picker chooses what View Diff opens, in both
+clients. **Shelbi's diff view** is the default. `diff_tool: git` runs git's own
+difftool, a command runs in a pane, and an app opens in the app. A project's
+`review.diff_command` takes precedence over all of them, including the built-in
+view. See [Editor and diff tool](/docs/configuration/global#editor-and-diff-tool).

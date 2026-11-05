@@ -735,6 +735,22 @@ impl ReviewView {
         }
     }
 
+    /// Where the keyboard goes when the diff went off screen holding it (a view
+    /// chord, a click on another view): the view that's up now, which takes it
+    /// from its own handle once its pane attaches. Left on a handle that isn't
+    /// drawn, no key would reach anything, the window's chords included.
+    fn focus_off_hidden_diff(&self, window: &Window, cx: &gpui::App) -> Option<FocusHandle> {
+        let r = self.review.as_ref()?;
+        let diff = r.diff.as_ref().filter(|d| d.view.read(cx).contains_focus(window))?;
+        if self.diff_on_show().is_some_and(|shown| shown == &diff.view) {
+            return None;
+        }
+        Some(match self.focus {
+            ReviewFocus::Content => r.content.read(cx).focus_target(cx),
+            ReviewFocus::Panel => self.focus_handle.clone(),
+        })
+    }
+
     /// Give the panel keyboard focus (the sidebar chord while the panel holds
     /// the sidebar's column).
     pub fn focus_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -791,7 +807,6 @@ impl ReviewView {
         let Some(target) = self.content_target(view) else {
             return;
         };
-        let had_diff = self.diff_on_show().is_some();
         if let Some(r) = self.review.as_mut() {
             r.panel.set_active(view);
             if view != ActiveView::Diff {
@@ -808,8 +823,6 @@ impl ReviewView {
             }
             return;
         }
-        // Back from the diff with the keyboard in it: it follows to the pane.
-        self.refocus = had_diff && self.focus == ReviewFocus::Content;
         let Some(role) = view.role() else {
             self.attach(target, cx);
             return;
@@ -1785,6 +1798,9 @@ fn active_switch_id(panel: &ReviewPanelState) -> Option<&'static str> {
 
 impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(target) = self.focus_off_hidden_diff(window, cx) {
+            window.focus(&target, cx);
+        }
         if std::mem::take(&mut self.refocus) {
             let target = self.focus_target(cx);
             window.focus(&target, cx);

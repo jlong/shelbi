@@ -56,7 +56,7 @@ While it has the keyboard its `Ctrl-p` is the file palette (Ctrl+Space and ⌘K
 still open the window's palette), `Ctrl-g` opens the file at the line in your
 editor, and Esc with nothing to let go of goes back to the panel. Clicking the
 file list gives it the keyboard: `j` / `k` step through files and `Space` marks
-one viewed. `docs/status/ndv-desktop.md` has the rest.
+one viewed. `docs/parity.md` has the decisions and known gaps.
 
 ## Settings
 

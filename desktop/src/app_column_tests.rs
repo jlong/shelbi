@@ -1734,6 +1734,32 @@ fn builtin_diff_up(c: &mut Column) -> Entity<crate::views::diff_view::DiffView> 
 }
 
 #[gpui::test]
+fn a_view_chord_and_back_keeps_the_keyboard_in_the_diff(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    let diff = builtin_diff_up(&mut c);
+
+    // To the reviewer's terminal with a chord, and back with another.
+    c.h.cx.simulate_keystrokes("cmd-1");
+    c.advance(Duration::from_secs(1));
+    c.h.cx.run_until_parked();
+    c.h.draw();
+    let review = c.review();
+    let on_chat = c.h.cx.update(|_, cx| review.read(cx).diff_on_show().is_none());
+    assert!(on_chat);
+    let in_reviewer = c.h.cx.update(|window, cx| review.read(cx).contains_focus(window, cx));
+    assert!(in_reviewer, "the keyboard follows to the reviewer's pane");
+    c.h.cx.simulate_keystrokes("cmd-2");
+    c.advance(Duration::from_secs(1));
+    c.h.cx.run_until_parked();
+    c.h.draw();
+    let in_diff = c.h.cx.update(|window, cx| diff.read(cx).contains_focus(window));
+    assert!(in_diff, "the keyboard came back to the diff");
+    c.h.cx.simulate_keystrokes("?");
+    c.h.cx.run_until_parked();
+    assert_eq!(c.h.cx.update(|_, cx| diff.read(cx).state().mode().label()), "HELP");
+}
+
+#[gpui::test]
 fn the_diffs_keys_beat_the_windows_chords_and_the_rest_get_through(cx: &mut TestAppContext) {
     let mut c = Column::open(cx);
     let diff = builtin_diff_up(&mut c);
