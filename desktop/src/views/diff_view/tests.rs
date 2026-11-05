@@ -179,7 +179,7 @@ fn the_movement_keys_reach_the_state(cx: &mut TestAppContext) {
     assert_eq!(h.cursor(), 0);
     h.keys("ctrl-f");
     assert!(h.cursor() > 0);
-    h.keys("ctrl-b");
+    h.keys("pageup");
     assert_eq!(h.cursor(), 0);
     // Changes, and empty lines.
     h.keys("] h");

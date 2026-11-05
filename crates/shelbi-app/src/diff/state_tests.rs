@@ -169,9 +169,17 @@ fn pages_and_centering() {
     assert_eq!(d.s.cursor(), 4);
     d.press("page-down");
     assert_eq!(d.s.cursor(), 8);
-    d.press("ctrl-b");
+    d.press("b");
     d.press("page-up");
     assert_eq!(d.s.cursor(), 0);
+    // As in Skim with its sidebar open, Ctrl-b is the file list's and paging
+    // up stays on `b` and PageUp.
+    assert!(d.s.file_list_open());
+    d.press("ctrl-b");
+    assert!(!d.s.file_list_open());
+    assert_eq!(d.s.cursor(), 0);
+    d.press("\\");
+    assert!(d.s.file_list_open());
     d.press("G");
     assert_eq!(d.s.cursor(), last);
     assert_eq!(d.s.top(), last + 1 - 4);

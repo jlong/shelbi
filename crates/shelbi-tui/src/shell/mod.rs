@@ -19,6 +19,7 @@
 pub(crate) mod caps;
 mod acknowledgements;
 mod changelog;
+mod diff_view;
 mod overlays;
 mod refresh;
 pub mod remote_session;
@@ -522,7 +523,8 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         // An `edit:*` command asked for the user's editor: hand it the terminal
         // and wait (the editor owns the screen meanwhile), then repaint.
         if let Some(path) = state.pending_editor.take() {
-            state.status = Some(run_editor(&mut term, &path));
+            let line = state.pending_editor_line.take();
+            state.status = Some(run_editor(&mut term, &path, line));
             state.reported_main = None;
             // Opened from Settings: what it summarizes may have changed.
             if state.settings_open() {
@@ -1474,6 +1476,8 @@ struct ShellState {
     /// after handling input: it hands the terminal to the editor and waits, then
     /// restores the shell (the TUI's half of the palette's `edit:*` commands).
     pending_editor: Option<PathBuf>,
+    /// The line to open [`Self::pending_editor`] at (the diff's `Ctrl-g`).
+    pending_editor_line: Option<u32>,
     /// A remote session to open. The run loop takes it like
     /// [`Self::pending_editor`]: it hands the terminal to the other machine's
     /// Shelbi over `ssh` and waits (`remote_session`).
@@ -1742,6 +1746,7 @@ impl ShellState {
             full_redraw: false,
             job: None,
             pending_editor: None,
+            pending_editor_line: None,
             pending_remote: None,
             palette_inputs: Arc::new(DiskPaletteInputs),
             #[cfg(test)]
@@ -2696,6 +2701,14 @@ impl ShellState {
             self.apply_settings_action(action);
             return;
         }
+        // Shelbi's own diff, with the keyboard, takes the chords it binds ahead
+        // of the shell's (`Ctrl-p` is its file palette; Ctrl+Space stays
+        // Shelbi's palette) and every key while it's taking text.
+        if !self.settings_open() && self.focus_is_main() && self.diff_claims(&k) {
+            self.handle_main_key(k);
+            self.dirty = true;
+            return;
+        }
         // The palette-open chord opens the command palette from anywhere — a
         // focused terminal view or the sidebar. This replaces the interim
         // Ctrl+Space focus-toggle from rt-tui-shell.
@@ -2730,6 +2743,20 @@ impl ShellState {
         } else {
             self.handle_sidebar_key(k);
         }
+    }
+
+    /// Whether the diff view on show takes `k` ahead of the shell's own keys.
+    fn diff_claims(&self, k: &KeyEvent) -> bool {
+        match self.main_view {
+            MainView::Review(_) => self.review.as_ref().is_some_and(|r| r.diff_claims(k)),
+            MainView::Workspace(_) => self.workspace.as_ref().is_some_and(|w| w.diff_claims(k)),
+            _ => false,
+        }
+    }
+
+    /// What Shelbi's own diff reads from the settings.
+    fn diff_setup(&self) -> diff_view::DiffSetup {
+        diff_view::DiffSetup { keymaps: self.keymaps.clone(), style: self.display_style }
     }
 
     /// Resolve `k` to a focus-move action (`FocusSidebar` / `FocusMain`) via
@@ -3406,6 +3433,13 @@ impl ShellState {
             **k = keymaps.clone();
         }
         self.keymaps = keymaps;
+        let setup = self.diff_setup();
+        if let Some(r) = self.review.as_mut() {
+            r.set_diff_setup(setup.clone());
+        }
+        if let Some(w) = self.workspace.as_mut() {
+            w.set_diff_setup(setup);
+        }
         self.dirty = true;
     }
 
@@ -4302,6 +4336,7 @@ impl ShellState {
             .unwrap_or_default();
         self.main_view = MainView::Review(p.task_id.clone());
         self.client.focus_main();
+        let setup = self.diff_setup();
         self.review = Some(ReviewInterface::new(
             &project,
             self.connector.clone(),
@@ -4312,7 +4347,8 @@ impl ShellState {
             p.has_review_url,
             p.task.map(|b| *b),
         )
-        .with_apps(p.apps));
+        .with_apps(p.apps)
+        .with_diff_setup(setup));
         self.sync_review_decision();
         self.reported_main = None; // re-report size for the content view
         self.status = None;
@@ -4524,7 +4560,15 @@ impl ShellState {
                 self.dirty = true;
             }
             ReviewAction::Close => self.close_review(&project, &task),
+            ReviewAction::OpenFile { path, line } => self.edit_at_line(path, line),
         }
+    }
+
+    /// Hand the terminal to the user's editor at this line.
+    fn edit_at_line(&mut self, path: PathBuf, line: Option<u32>) {
+        self.pending_editor = Some(path);
+        self.pending_editor_line = line;
+        self.dirty = true;
     }
 
     /// Open the browser / reveal the folder for the current review, off-thread.
@@ -4964,6 +5008,7 @@ impl ShellState {
             .unwrap_or_else(default_ws_status);
         self.main_view = MainView::Workspace(p.workspace.clone());
         self.client.focus_main();
+        let setup = self.diff_setup();
         self.workspace = Some(WorkspaceInterface::new(
             &project,
             self.connector.clone(),
@@ -4975,6 +5020,7 @@ impl ShellState {
             task,
         )
         .with_apps(p.apps)
+        .with_diff_setup(setup)
         .with_remote_address(p.remote_address));
         self.reported_main = None;
         self.status = None;
@@ -4996,6 +5042,12 @@ impl ShellState {
             WorkspaceAction::ShowContent(None) => {
                 if let Some(w) = self.workspace.as_mut() {
                     w.show_agent();
+                    self.reported_main = None;
+                }
+            }
+            WorkspaceAction::ShowContent(Some(shelbi_app::ReviewRole::Diff)) if ws.builtin_diff() => {
+                if let Some(w) = self.workspace.as_mut() {
+                    w.show_builtin_diff();
                     self.reported_main = None;
                 }
             }
@@ -5056,6 +5108,7 @@ impl ShellState {
                 self.dirty = true;
             }
             WorkspaceAction::Close => self.close_workspace(&project, &name),
+            WorkspaceAction::OpenFile { path, line } => self.edit_at_line(path, line),
         }
     }
 
@@ -6490,7 +6543,11 @@ fn enter_terminal_modes() -> io::Result<()> {
 /// this thread, so nothing competes with the editor for keys. An app
 /// `editor:` opens the file in the app instead (`open -a`), leaving the
 /// screen as it is.
-fn run_editor(term: &mut Terminal<CrosstermBackend<io::Stdout>>, path: &std::path::Path) -> String {
+fn run_editor(
+    term: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    path: &std::path::Path,
+    line: Option<u32>,
+) -> String {
     if let (shelbi_state::ToolChoice::App { app }, _) = shelbi_state::resolve_editor_choice() {
         let name = shelbi_state::tools::app_display_name(&app);
         return match std::process::Command::new("open").arg("-a").arg(&app).arg(path).status() {
@@ -6505,7 +6562,7 @@ fn run_editor(term: &mut Terminal<CrosstermBackend<io::Stdout>>, path: &std::pat
     restore_terminal();
     let outcome = std::process::Command::new(&program)
         .args(parts)
-        .arg(path)
+        .args(shelbi_state::tools::editor_args_at_line(&program, &path.to_string_lossy(), line))
         .status();
     let _ = enter_terminal_modes();
     let _ = term.clear();
@@ -6550,6 +6607,8 @@ mod tests {
     // New task opened from the board and the palette, and created
     // (`tests/new_task.rs`).
     mod new_task;
+    // Shelbi's own diff in a review and a workspace (`tests/diff_view.rs`).
+    mod diff_view;
 
     #[test]
     fn orchestrator_view_names_the_supervisor_failure_while_down() {

@@ -16,6 +16,10 @@
 //!   they survive a client detach and the daemon frees the slot's port on
 //!   close.
 //!
+//! With `diff_tool: builtin` (the default) View Diff is Shelbi's own diff
+//! ([`DiffView`]) instead of a session, and an external tool keeps the session
+//! below.
+//!
 //! The panel's state machine is pure: a key/click yields a
 //! [`PanelEffect`](crate::review_panel::PanelEffect) which this type maps to a
 //! [`ReviewAction`] for the shell to carry out (switching the content session,
@@ -50,6 +54,7 @@ use shelbi_term::Size;
 
 use crate::review_panel::{render_full, PanelEffect, ReviewPanel};
 
+use super::diff_view::{DiffOpener, DiffOut, DiffSetup, DiffView};
 use super::session::{Connector, MainState, SessionManager, SessionRef};
 use crate::theme::palette;
 use super::terminal_view::MouseOutcome;
@@ -94,6 +99,8 @@ pub enum ReviewAction {
     /// Close the review (q / Esc): tear the interface down (the shell asks the
     /// daemon to end the editor/diff/server sessions and free the port).
     Close,
+    /// The diff's `Ctrl-g`: open this file in the user's editor at this line.
+    OpenFile { path: std::path::PathBuf, line: Option<u32> },
 }
 
 /// Asks the daemon for the diff session. Runs off the UI thread.
@@ -126,6 +133,13 @@ pub struct ReviewInterface {
     diff_drawn: Option<DiffLoadView>,
     /// Where the failure's Retry was last drawn.
     retry_rect: Option<Rect>,
+    project: String,
+    /// Shelbi's own diff, once View Diff has shown it. While `diff_active` and
+    /// this is set, it's what the main area shows: no wait, no session.
+    builtin: Option<DiffView>,
+    diff_setup: DiffSetup,
+    /// A test's session in place of the worktree's.
+    diff_opener: Option<DiffOpener>,
 }
 
 impl ReviewInterface {
@@ -180,7 +194,66 @@ impl ReviewInterface {
             diff_ensure,
             diff_drawn: None,
             retry_rect: None,
+            project: project.to_string(),
+            builtin: None,
+            diff_setup: DiffSetup::default(),
+            diff_opener: None,
         }
+    }
+
+    /// The keys Shelbi's own diff reads.
+    pub fn with_diff_setup(mut self, setup: DiffSetup) -> Self {
+        self.diff_setup = setup;
+        self
+    }
+
+    /// The keymap changed in Settings.
+    pub fn set_diff_setup(&mut self, setup: DiffSetup) {
+        if let Some(diff) = self.builtin.as_mut() {
+            diff.set_setup(setup.clone());
+        }
+        self.diff_setup = setup;
+    }
+
+    /// Answer View Diff's ensures here instead of asking the daemon (test seam).
+    #[cfg(test)]
+    pub(crate) fn set_diff_ensure(&mut self, ensure: DiffEnsure) {
+        self.diff_ensure = ensure;
+    }
+
+    /// Open `opener`'s session instead of the worktree's (test seam).
+    #[cfg(test)]
+    pub(crate) fn set_diff_opener(&mut self, opener: DiffOpener) {
+        self.diff_opener = Some(opener);
+    }
+
+    /// Show Shelbi's own diff, opening it the first time, with the keyboard on
+    /// it: selecting it means reading it.
+    fn show_builtin_diff(&mut self) {
+        if self.builtin.is_none() {
+            let opener = self.diff_opener.clone().unwrap_or_else(|| DiffView::review_opener(&self.project, &self.slot, &self.task_id));
+            let worktree = Some(self.panel.worktree.clone());
+            self.builtin = Some(DiffView::new(opener, self.diff_setup.clone(), worktree, "No changes on this branch"));
+        }
+        // The setting moved from an external tool: its wait mustn't go on to
+        // bind a session behind this.
+        self.diff_load = None;
+        self.diff_answer = None;
+        self.diff_active = true;
+        self.focus = ReviewFocus::Content;
+    }
+
+    /// The diff on show, when it's the one on show.
+    fn showing_builtin(&mut self) -> Option<&mut DiffView> {
+        self.builtin.as_mut().filter(|_| self.diff_active)
+    }
+
+    /// Whether the diff has the keyboard and takes `k` ahead of the shell's own
+    /// keys (`Ctrl-p`, the focus moves it rebinds).
+    pub fn diff_claims(&self, k: &KeyEvent) -> bool {
+        self.focus == ReviewFocus::Content
+            && self.diff_active
+            && self.builtin.as_ref().is_some_and(|diff| diff.claims(k))
     }
 
     /// The review slot the task is loaded on.
@@ -265,6 +338,12 @@ impl ReviewInterface {
     }
 
     fn show_diff_at(&mut self, now: Instant) {
+        if self.panel.apps.builtin_diff {
+            self.show_builtin_diff();
+            return;
+        }
+        // The setting moved to an external tool: that's what shows from now on.
+        self.builtin = None;
         self.diff_active = true;
         let seen = self.diff_seen();
         if DiffLoad::select(&mut self.diff_load, &seen, now) {
@@ -465,7 +544,8 @@ impl ReviewInterface {
 
     pub fn poll(&mut self) -> bool {
         let changed = self.content.poll();
-        self.drive_diff(Instant::now()) || changed
+        let builtin = self.builtin.as_mut().is_some_and(DiffView::poll);
+        self.drive_diff(Instant::now()) || changed || builtin
     }
 
     pub fn pump_output(&mut self, ring: &mut bool) -> bool {
@@ -520,7 +600,9 @@ impl ReviewInterface {
         if self.panel.merging {
             return;
         }
-        if matches!(self.content.state(), MainState::Live(_)) && !self.diff_covered() {
+        if self.showing_builtin().is_some()
+            || (matches!(self.content.state(), MainState::Live(_)) && !self.diff_covered())
+        {
             self.focus = ReviewFocus::Content;
         }
     }
@@ -543,10 +625,24 @@ impl ReviewInterface {
             return;
         }
         self.focus_content();
+        if let Some(diff) = self.showing_builtin() {
+            diff.paste(text);
+            return;
+        }
         self.content.send_paste(text);
     }
 
     fn handle_content_key(&mut self, k: KeyEvent) -> ReviewAction {
+        if let Some(diff) = self.showing_builtin() {
+            return match diff.key(k) {
+                DiffOut::None => ReviewAction::None,
+                DiffOut::FocusPanel => {
+                    self.focus = ReviewFocus::Panel;
+                    ReviewAction::None
+                }
+                DiffOut::Edit { path, line } => ReviewAction::OpenFile { path, line },
+            };
+        }
         // Tab returns focus to the panel; everything else goes to the agent.
         if k.code == KeyCode::Tab && k.modifiers.is_empty() {
             self.focus = ReviewFocus::Panel;
@@ -589,9 +685,7 @@ impl ReviewInterface {
             // Tab moves focus to the content view (so the reviewer can type in
             // the agent / editor) when one is live.
             KeyCode::Tab if k.modifiers.is_empty() => {
-                if matches!(self.content.state(), MainState::Live(_)) && !self.diff_covered() {
-                    self.focus = ReviewFocus::Content;
-                }
+                self.focus_content();
                 ReviewAction::None
             }
             // Esc leaves the review loaded and returns to the nav sidebar (like
@@ -650,6 +744,10 @@ impl ReviewInterface {
             }
             return ReviewAction::None;
         }
+        if let Some(diff) = self.showing_builtin() {
+            diff.mouse(m);
+            return ReviewAction::None;
+        }
         // The wait's words are over the content: its Retry takes the click, and
         // nothing reaches a terminal that isn't showing.
         if self.diff_covered() {
@@ -693,6 +791,10 @@ impl ReviewInterface {
         // Then the content view into the remaining buffer.
         let buf = frame.buffer_mut();
         self.retry_rect = None;
+        let keyboard = focus_main && self.focus == ReviewFocus::Content;
+        if let Some(diff) = self.showing_builtin() {
+            return diff.render(buf, content_rect, truecolor, keyboard);
+        }
         match self.diff_cover(Instant::now()) {
             Some(DiffLoadView::Loading) => {
                 super::render_placeholder(buf, content_rect, LOADING_DIFF);
