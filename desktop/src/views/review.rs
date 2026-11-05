@@ -37,6 +37,12 @@
 //!   (the ENOTCONN re-entry fix), the bounded handshake (the 5s and wedged
 //!   session fixes), give-up to a failed notice, and re-selecting a failed
 //!   view re-attaches.
+//! - **View Diff waits for its diff** (`review-diff-loading-state`): the shared
+//!   [`DiffLoad`] retries an `Ensure` the daemon refuses because the worktree
+//!   is mid-load, and holds "Loading diff…" over the pane until the tool has
+//!   drawn, so it never falls back to the Reviewer. After 15s it says why it
+//!   couldn't, in the view, with a Retry. The pane stays attached and sized
+//!   under the words, so the tool draws at the size it will be shown at.
 //! - **Approve and Reject** go back to the window as registry commands
 //!   (`ApproveReview` / `RejectReview`), which run the daemon's gated merge
 //!   or open the reject-reason overlay. While a decision is in flight the
@@ -56,11 +62,14 @@
 use shelbi_app::source::ProjectHandle;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::{
     div, prelude::*, px, AnyElement, AnyWindowHandle, Bounds, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Pixels, SharedString, Subscription, Window,
+    Focusable, Pixels, SharedString, Subscription, Task, Window,
+};
+use shelbi_app::review::diff_load::{
+    DiffLoad, DiffLoadView, DiffSeen, DIFF_FAILED_TITLE, DIFF_RETRY_LABEL, LOADING_DIFF,
 };
 use shelbi_app::review::{
     sub_state_detail, sub_state_label, ActiveView, PanelEffect, PanelRow, ReviewInfo,
@@ -71,14 +80,16 @@ use shelbi_app::view::{ReviewRow, ReviewState};
 use shelbi_app::{CommandKind, ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
 use shelbi_core::{Column, StatusCategory};
 
-use super::session_view::{OnDeath, SessionDeps, SessionView, SessionViewEvent, REVIEW_TERMINAL_INSET_X};
+use super::session_view::{
+    OnDeath, SessionDeps, SessionPhase, SessionView, SessionViewEvent, REVIEW_TERMINAL_INSET_X,
+};
 use super::task_panel;
 use super::workspace_layout::{render_split, ShellSplit};
 use crate::assets::{icons, Icon};
 use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
 use crate::theme::motion::{self, SharedTrack, SlideTrack};
-use crate::theme::style::{self, ButtonKind, Type, Typography, NAV_RADIUS};
+use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography, NAV_RADIUS};
 use crate::theme::Theme;
 
 /// The blocking work behind a review, run on the background executor:
@@ -266,6 +277,9 @@ enum ReviewFocus {
     Content,
 }
 
+/// How often a running [`DiffLoad`] looks at the pane and its clock.
+const DIFF_TICK: Duration = Duration::from_millis(100);
+
 /// One review shown: its inputs, the panel, and the content pane.
 struct Shown {
     info: ReviewInfo,
@@ -277,6 +291,12 @@ struct Shown {
     /// The load flow has resolved the review: `info` is the daemon's, not
     /// the placeholder built from the sidebar row.
     resolved: bool,
+    /// View Diff's wait for its diff, once it was asked for.
+    diff_load: Option<DiffLoad>,
+    /// What the wait last drew, so the window redraws when that changes.
+    diff_drawn: Option<DiffLoadView>,
+    /// The content pane's clock.
+    clock: Rc<dyn Fn() -> Instant>,
 }
 
 /// The Review view for one project window. It shows one review at a time;
@@ -307,6 +327,8 @@ pub struct ReviewView {
     hold: bool,
     /// The attach that waited for the push.
     held: Option<SessionRef>,
+    /// The next look at a running [`DiffLoad`].
+    _diff_tick: Option<Task<()>>,
     focus_handle: FocusHandle,
 }
 
@@ -355,6 +377,7 @@ impl ReviewView {
             generation: 0,
             hold: false,
             held: None,
+            _diff_tick: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -500,6 +523,7 @@ impl ReviewView {
         // The desktop offers the user shell beside the content (Shell ⌘5).
         let panel = ReviewPanelState::with_shell(&model, true);
         let deps = (self.sessions)(&info.task_id);
+        let clock = deps.clock.clone();
         let (window, sink, project) = (self.window, self.sink.clone(), self.project.clone());
         let slot = info.slot.clone();
         let remote = info.remote_machine.clone();
@@ -526,6 +550,9 @@ impl ReviewView {
             content,
             _content_events: events,
             resolved: true,
+            diff_load: None,
+            diff_drawn: None,
+            clock,
         }
     }
 
@@ -538,7 +565,10 @@ impl ReviewView {
         self.held = None;
         self.split.dragging = false;
         self.close_shell(cx);
-        if let Some(r) = &self.review {
+        if let Some(r) = self.review.as_mut() {
+            if let Some(load) = r.diff_load.as_mut() {
+                load.left();
+            }
             r.content.update(cx, |c, cx| c.hide(cx));
         }
         cx.notify();
@@ -702,15 +732,25 @@ impl ReviewView {
         })
     }
 
-    /// Show the agent, the diff or the editor. Diff and editor are ensured
-    /// through the daemon first; a failure falls back to the agent with the
-    /// error on the status line, as the TUI does.
+    /// Show the agent, the diff or the editor. The editor is ensured through
+    /// the daemon first, a failure falling back to the agent with the error on
+    /// the status line, as the TUI does. The diff waits for itself in its own
+    /// view ([`Self::select_diff`]).
     pub fn select_view(&mut self, view: ActiveView, cx: &mut Context<Self>) {
         let Some(target) = self.content_target(view) else {
             return;
         };
         if let Some(r) = self.review.as_mut() {
             r.panel.set_active(view);
+            if view != ActiveView::Diff {
+                if let Some(load) = r.diff_load.as_mut() {
+                    load.left();
+                }
+            }
+        }
+        if view == ActiveView::Diff {
+            self.select_diff(cx);
+            return;
         }
         let Some(role) = view.role() else {
             self.attach(target, cx);
@@ -730,6 +770,146 @@ impl ReviewView {
                 }
             }
         });
+    }
+
+    /// View Diff was selected: start or resume the wait for the diff.
+    fn select_diff(&mut self, cx: &mut Context<Self>) {
+        let seen = self.diff_seen(cx);
+        let Some(r) = self.review.as_mut() else {
+            return;
+        };
+        let now = (r.clock)();
+        if DiffLoad::select(&mut r.diff_load, &seen, now) {
+            self.send_diff_ensure(cx);
+        }
+        cx.notify();
+        self.drive_diff(cx);
+    }
+
+    /// Show View Diff with this wait, as it stands (the visual check's stand-in
+    /// for a daemon that keeps refusing).
+    #[cfg(feature = "visual-check")]
+    pub fn offscreen_diff_wait(&mut self, load: DiffLoad, cx: &mut Context<Self>) {
+        if let Some(r) = self.review.as_mut() {
+            r.panel.set_active(ActiveView::Diff);
+            r.diff_load = Some(load);
+        }
+        cx.notify();
+    }
+
+    /// Retry: start the wait for the diff over.
+    fn retry_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(r) = self.review.as_mut() else {
+            return;
+        };
+        let now = (r.clock)();
+        if r.diff_load.as_mut().is_some_and(|load| load.retry(now)) {
+            self.send_diff_ensure(cx);
+        }
+        self.drive_diff(cx);
+    }
+
+    /// Ask the daemon for the diff session; the answer lands in the wait.
+    fn send_diff_ensure(&mut self, cx: &mut Context<Self>) {
+        let op = ReviewSessionOp::Ensure { role: ReviewRole::Diff };
+        self.run_op(op, cx, |this, result, cx| {
+            if let Some(r) = this.review.as_mut() {
+                let now = (r.clock)();
+                if let Some(load) = r.diff_load.as_mut() {
+                    load.ensure_answered(result, now);
+                }
+            }
+            this.drive_diff(cx);
+        });
+    }
+
+    /// What the pane shows of the diff session.
+    fn diff_seen(&self, cx: &gpui::App) -> DiffSeen {
+        let (Some(r), Some(target)) = (&self.review, self.content_target(ActiveView::Diff)) else {
+            return DiffSeen::NotYet;
+        };
+        let content = r.content.read(cx);
+        if *content.target() != target {
+            return DiffSeen::NotYet;
+        }
+        match content.phase() {
+            SessionPhase::Live if content.pane().is_some_and(|p| p.read(cx).view().emulator().has_content()) => {
+                DiffSeen::Drawn
+            }
+            SessionPhase::Failed(why) | SessionPhase::GaveUp(why) => DiffSeen::Ended(why),
+            SessionPhase::Idle => DiffSeen::Ended("the diff session isn't running".to_string()),
+            _ => DiffSeen::NotYet,
+        }
+    }
+
+    /// One step of the wait: send a retry that's due, attach a session that's
+    /// up, note what the pane shows, and look again soon if it isn't over.
+    fn drive_diff(&mut self, cx: &mut Context<Self>) {
+        let active = self.shown && self.panel().is_some_and(|p| p.active() == ActiveView::Diff);
+        let target = self.content_target(ActiveView::Diff);
+        let Some(r) = self.review.as_mut() else {
+            return;
+        };
+        let now = (r.clock)();
+        let Some(load) = r.diff_load.as_mut() else {
+            return;
+        };
+        let send = load.take_due_ensure(now);
+        let attach = active && load.needs_attach();
+        if attach {
+            load.mark_attached();
+        }
+        if send {
+            self.send_diff_ensure(cx);
+        }
+        if let (true, Some(target)) = (attach, target) {
+            self.attach(target, cx);
+        }
+        let seen = if active { self.diff_seen(cx) } else { DiffSeen::NotYet };
+        let Some(r) = self.review.as_mut() else {
+            return;
+        };
+        let Some(load) = r.diff_load.as_mut() else {
+            return;
+        };
+        load.observe(&seen, now);
+        let drawn = load.view(now);
+        let tick = load.needs_tick(active);
+        if r.diff_drawn.as_ref() != Some(&drawn) {
+            r.diff_drawn = Some(drawn);
+            cx.notify();
+        }
+        if tick && self._diff_tick.is_none() {
+            let timer = cx.background_executor().timer(DIFF_TICK);
+            self._diff_tick = Some(cx.spawn(async move |this, cx| {
+                timer.await;
+                let _ = this.update(cx, |this, cx| {
+                    this._diff_tick = None;
+                    this.drive_diff(cx);
+                });
+            }));
+        }
+    }
+
+    /// What View Diff's wait draws over the pane now, if anything. Before
+    /// "Loading" is due (a ready diff is up by then) a pane already bound to
+    /// the session is covered bare, so it reads as nothing rather than
+    /// "Connecting…"; one not bound yet still shows the view it came from.
+    fn diff_cover(&self, cx: &gpui::App) -> Option<DiffLoadView> {
+        let r = self.review.as_ref()?;
+        if r.panel.active() != ActiveView::Diff {
+            return None;
+        }
+        let load = r.diff_load.as_ref()?;
+        // Asked of the pane, not the wait's last look: a drawn diff shows now.
+        if self.diff_seen(cx) == DiffSeen::Drawn {
+            return None;
+        }
+        match load.view((r.clock)()) {
+            DiffLoadView::Ready => None,
+            DiffLoadView::Settling if !load.is_attached() => None,
+            view => Some(view),
+        }
     }
 
     fn attach(&mut self, target: SessionRef, cx: &mut Context<Self>) {
@@ -1309,14 +1489,26 @@ impl ReviewView {
         // Not resolved yet, or waiting for the push to settle: an empty
         // canvas, not the content's "no session" notice.
         let waiting = !shown.resolved || self.held.is_some();
+        // The pane stays laid out under the wait, sized for when it shows.
+        let cover = self.diff_cover(cx);
         let content = div()
             .debug_selector(|| "review-content".into())
+            .relative()
             .flex()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .h_full()
-            .child(shown.content.clone())
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .when(cover.is_some(), |d| d.opacity(0.0))
+                    .child(shown.content.clone()),
+            )
+            .children(cover.map(|view| self.render_diff_cover(view, &theme, cx)))
             .into_any_element();
         let shell = self.shell_open.then(|| {
             if self.shell_starting {
@@ -1336,6 +1528,57 @@ impl ReviewView {
             render_split("review", &self.split, |this: &mut Self| &mut this.split, content, shell, &theme, cx)
         });
         root.children(panes).into_any_element()
+    }
+}
+
+impl ReviewView {
+    /// "Loading diff…", or why it couldn't, over the pane.
+    fn render_diff_cover(&self, view: DiffLoadView, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let cover = div()
+            .id("review-diff-cover")
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+            .occlude()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .px_4()
+            .text_center();
+        match view {
+            DiffLoadView::Settling | DiffLoadView::Ready => cover.into_any_element(),
+            DiffLoadView::Loading => cover
+                .debug_selector(|| "review-diff-loading".into())
+                .type_style(Type::Base)
+                .text_color(theme.muted)
+                .child(LOADING_DIFF)
+                .into_any_element(),
+            DiffLoadView::Failed { cause } => cover
+                .debug_selector(|| "review-diff-failed".into())
+                .child(
+                    div()
+                        .type_style(Type::BaseMedium)
+                        .text_color(theme.text_loud)
+                        .child(DIFF_FAILED_TITLE),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "review-diff-cause".into())
+                        .max_w(px(520.0))
+                        .type_style(Type::Base)
+                        .text_color(theme.muted)
+                        .child(cause),
+                )
+                .child(
+                    style::button("review-diff-retry", DIFF_RETRY_LABEL, ButtonKind::Secondary, ButtonSize::Base, false, theme)
+                        .debug_selector(|| "review-diff-retry".into())
+                        .on_click(cx.listener(|this, _, _, cx| this.retry_diff(cx))),
+                )
+                .into_any_element(),
+        }
     }
 }
 
@@ -1434,9 +1677,22 @@ pub(crate) mod tests {
     pub(crate) struct FakeSessions {
         refusing: Mutex<Vec<String>>,
         attaches: Mutex<Vec<(String, UnboundedSender<SessionEvent>)>>,
+        /// How far the fake clock has moved on from where the deps started it.
+        elapsed: Mutex<Duration>,
     }
 
     impl FakeSessions {
+        /// Send output to the latest attach of the session `name`.
+        fn output(&self, name: &str, data: &[u8]) {
+            let attaches = self.attaches.lock().unwrap();
+            let (_, tx) = attaches
+                .iter()
+                .rev()
+                .find(|(n, _)| n == name)
+                .unwrap_or_else(|| panic!("{name} is attached"));
+            tx.unbounded_send(SessionEvent::Output { seq: 0, data: data.to_vec() }).unwrap();
+        }
+
         pub(crate) fn attached(&self) -> Vec<String> {
             self.attaches.lock().unwrap().iter().map(|(n, _)| n.clone()).collect()
         }
@@ -1560,6 +1816,36 @@ pub(crate) mod tests {
             self.cx.run_until_parked();
         }
 
+        /// Move the fake clock and the timers on by `by`, a tick at a time.
+        fn advance(&mut self, by: Duration) {
+            let mut left = by;
+            while !left.is_zero() {
+                let step = left.min(DIFF_TICK);
+                *self.sessions.elapsed.lock().unwrap() += step;
+                self.cx.executor().advance_clock(step);
+                self.cx.run_until_parked();
+                left -= step;
+            }
+        }
+
+        /// Whether `selector` is drawn now.
+        fn drawn(&mut self, selector: &'static str) -> bool {
+            self.draw();
+            self.cx.debug_bounds(selector).is_some()
+        }
+
+        fn cover(&self) -> Option<DiffLoadView> {
+            self.view.read_with(&self.cx, |v, cx| v.diff_cover(cx))
+        }
+
+        fn diff_ensures(&self) -> usize {
+            self.ops().iter().filter(|op| **op == ReviewSessionOp::Ensure { role: ReviewRole::Diff }).count()
+        }
+
+        fn active(&self) -> ActiveView {
+            self.view.read_with(&self.cx, |v, _| v.panel().unwrap().active())
+        }
+
         fn click(&mut self, selector: &'static str) {
             self.draw();
             let at = self
@@ -1626,13 +1912,13 @@ pub(crate) mod tests {
     pub(crate) fn fake_deps() -> (ReviewDeps, Arc<FakeSessions>, Arc<FakeOps>) {
         let sessions = Arc::new(FakeSessions::default());
         let ops = Arc::new(FakeOps::default());
-        let now = Rc::new(Cell::new(Instant::now()));
+        let start = Instant::now();
         let deps = {
             let sessions = sessions.clone();
             ReviewDeps {
                 ops: ops.clone(),
                 sessions: Rc::new(move |_task| {
-                    let now = now.clone();
+                    let clock = sessions.clone();
                     SessionDeps {
                         connector: sessions.clone(),
                         relauncher: sessions.clone(),
@@ -1641,7 +1927,7 @@ pub(crate) mod tests {
                             first_backoff: Duration::from_secs(1),
                             max_backoff: Duration::from_secs(4),
                         },
-                        clock: Rc::new(move || now.get()),
+                        clock: Rc::new(move || start + *clock.elapsed.lock().unwrap()),
                     }
                 }),
             }
@@ -1784,14 +2070,163 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    fn a_view_the_daemon_refuses_falls_back_to_chat(cx: &mut TestAppContext) {
+    fn an_editor_the_daemon_refuses_falls_back_to_chat(cx: &mut TestAppContext) {
         let mut h = open(cx);
         h.update(|v, cx| v.show(info(), None, cx));
         *h.ops.fail_ops.lock().unwrap() = true;
-        h.click("review-switch-diff");
-        assert_eq!(h.view.read_with(&h.cx, |v, _| v.panel().unwrap().active()), ActiveView::Chat);
+        h.click("review-switch-editor");
+        assert_eq!(h.active(), ActiveView::Chat);
         assert_eq!(h.status_line().as_deref(), Some("couldn't open view: the daemon said no"));
         assert_eq!(h.content_phase(), SessionPhase::Live);
+    }
+
+    const DIFF_SESSION: &str = "demo/review/review-1/diff";
+
+    #[gpui::test]
+    fn a_ready_diff_opens_with_no_loading(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
+        h.click("review-switch-diff");
+        assert_eq!(h.sessions.attached().last().map(String::as_str), Some(DIFF_SESSION));
+        // Inside the grace the pane is only covered bare, and the replay ends it.
+        assert_eq!(h.cover(), Some(DiffLoadView::Settling));
+        assert!(!h.drawn("review-diff-loading"));
+        h.sessions.output(DIFF_SESSION, b"diff --git a/x b/x");
+        h.advance(DIFF_TICK);
+        assert_eq!(h.cover(), None, "the terminal shows");
+        assert!(!h.drawn("review-diff-loading"));
+        assert_eq!(h.diff_ensures(), 1);
+
+        // A long while on, with nothing to wait for, there's still no error.
+        h.advance(Duration::from_secs(20));
+        assert_eq!(h.cover(), None);
+    }
+
+    #[gpui::test]
+    fn a_worktree_not_ready_loads_then_retries_into_the_diff(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
+        *h.ops.fail_ops.lock().unwrap() = true;
+        h.click("review-switch-diff");
+
+        // No fallback, no error: the view stays on the diff and says Loading.
+        assert_eq!(h.active(), ActiveView::Diff);
+        assert_eq!(h.status_line(), None);
+        h.advance(Duration::from_secs(2));
+        assert!(h.drawn("review-diff-loading"));
+        assert_eq!(h.active(), ActiveView::Diff);
+        let tries = h.diff_ensures();
+        assert!(tries > 1, "the refused ensure is retried, {tries} so far");
+        assert!(!h.sessions.attached().contains(&DIFF_SESSION.to_string()));
+
+        // The worktree comes ready; the next retry attaches.
+        *h.ops.fail_ops.lock().unwrap() = false;
+        h.advance(Duration::from_secs(2));
+        assert_eq!(h.sessions.attached().last().map(String::as_str), Some(DIFF_SESSION));
+        assert!(h.drawn("review-diff-loading"), "the tool hasn't drawn yet");
+
+        // The tool draws: no click, the diff replaces Loading.
+        h.sessions.output(DIFF_SESSION, b"diff --git a/x b/x");
+        h.advance(DIFF_TICK);
+        assert!(!h.drawn("review-diff-loading"));
+        assert_eq!(h.cover(), None);
+    }
+
+    #[gpui::test]
+    fn a_persistent_failure_times_out_with_the_cause_and_a_retry(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
+        *h.ops.fail_ops.lock().unwrap() = true;
+        h.click("review-switch-diff");
+
+        h.advance(Duration::from_millis(14_800));
+        assert!(h.drawn("review-diff-loading"), "no error before 15s");
+        assert!(!h.drawn("review-diff-failed"));
+        h.advance(Duration::from_millis(300));
+        assert!(h.drawn("review-diff-failed"));
+        assert_eq!(h.cover(), Some(DiffLoadView::Failed { cause: "the daemon said no".into() }));
+        assert_eq!(h.active(), ActiveView::Diff, "still no fallback");
+
+        // It stops asking until told to.
+        let tries = h.diff_ensures();
+        h.advance(Duration::from_secs(10));
+        assert_eq!(h.diff_ensures(), tries);
+
+        // Retry starts it over, and this time it works.
+        *h.ops.fail_ops.lock().unwrap() = false;
+        h.click("review-diff-retry");
+        assert_eq!(h.diff_ensures(), tries + 1);
+        assert_eq!(h.sessions.attached().last().map(String::as_str), Some(DIFF_SESSION));
+        h.sessions.output(DIFF_SESSION, b"diff --git a/x b/x");
+        h.advance(DIFF_TICK);
+        assert_eq!(h.cover(), None);
+    }
+
+    #[gpui::test]
+    fn a_session_that_never_draws_times_out_and_a_late_draw_replaces_the_error(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
+        h.click("review-switch-diff");
+        h.advance(Duration::from_millis(15_100));
+        assert!(matches!(h.cover(), Some(DiffLoadView::Failed { .. })));
+        assert!(h.drawn("review-diff-failed"));
+
+        h.sessions.output(DIFF_SESSION, b"finally");
+        h.advance(DIFF_TICK);
+        assert_eq!(h.cover(), None);
+    }
+
+    #[gpui::test]
+    fn switching_away_and_back_mid_load_adds_no_ensure(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
+        *h.ops.fail_ops.lock().unwrap() = true;
+        h.click("review-switch-diff");
+        assert_eq!(h.diff_ensures(), 1);
+
+        // Away and straight back, inside the first backoff: nothing new is sent.
+        h.click("review-switch-chat");
+        assert_eq!(h.cover(), None, "the Reviewer shows, uncovered");
+        h.click("review-switch-diff");
+        assert_eq!(h.diff_ensures(), 1);
+        assert_eq!(h.active(), ActiveView::Diff);
+
+        // Comes ready while away: nothing attaches until it's back.
+        h.click("review-switch-chat");
+        *h.ops.fail_ops.lock().unwrap() = false;
+        h.advance(Duration::from_secs(2));
+        let tries = h.diff_ensures();
+        assert!(!h.sessions.attached().contains(&DIFF_SESSION.to_string()));
+        assert_eq!(h.sessions.attached().last().map(String::as_str), Some("demo/ws/review-1"));
+        h.click("review-switch-diff");
+        assert_eq!(h.diff_ensures(), tries, "the wait already has its session");
+        assert_eq!(h.sessions.attached().last().map(String::as_str), Some(DIFF_SESSION));
+    }
+
+    #[gpui::test]
+    fn coming_back_to_a_drawn_diff_doesnt_flash_loading(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
+        h.click("review-switch-diff");
+        h.sessions.output(DIFF_SESSION, b"diff --git a/x b/x");
+        h.advance(DIFF_TICK);
+        assert_eq!(h.cover(), None);
+
+        // Clicked again with the pane showing it: nothing to do.
+        let ensures = h.diff_ensures();
+        h.click("review-switch-diff");
+        assert_eq!(h.diff_ensures(), ensures);
+        assert_eq!(h.cover(), None);
+
+        // Via the Reviewer: re-ensured (the session may have gone), attached at
+        // once, its replay in before Loading is due.
+        h.click("review-switch-chat");
+        h.click("review-switch-diff");
+        assert_eq!(h.diff_ensures(), ensures + 1);
+        h.sessions.output(DIFF_SESSION, b"diff --git a/x b/x");
+        h.advance(DIFF_TICK);
+        assert_eq!(h.cover(), None);
+        assert!(!h.drawn("review-diff-loading"));
     }
 
     #[gpui::test]

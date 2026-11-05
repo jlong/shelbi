@@ -239,17 +239,31 @@ impl TermEmulator {
     pub fn content_bottom(&self) -> u16 {
         let grid = self.term.grid();
         let cursor = grid.cursor.point.line.0.max(0) as u16;
-        let cols = grid.columns();
-        let filled = (0..grid.screen_lines()).rev().find(|&row| {
-            let line = &grid[Line(row as i32)];
-            (0..cols).any(|col| {
-                let cell = &line[Column(col)];
-                !matches!(cell.c, ' ' | '\0')
-                    || cell.bg != Color::Named(NamedColor::Background)
-                    || cell.flags.contains(Flags::INVERSE)
-            })
-        });
+        let filled = (0..grid.screen_lines()).rev().find(|&row| self.row_has_content(row));
         filled.map_or(cursor, |row| (row as u16).max(cursor))
+    }
+
+    /// Whether the program has put anything to look at on the terminal: a
+    /// cell on the live screen ([`content_bottom`](Self::content_bottom)'s
+    /// test, without the cursor) or a line already scrolled off it. Mode
+    /// switches alone (entering the alternate screen, hiding the cursor) are
+    /// not, so a tool that is still starting up reads as blank.
+    pub fn has_content(&self) -> bool {
+        self.history_len() > 0
+            || (0..self.term.grid().screen_lines()).any(|row| self.row_has_content(row))
+    }
+
+    /// Whether row `row` of the live screen holds a printed character, a
+    /// non-default background, or reverse video.
+    fn row_has_content(&self, row: usize) -> bool {
+        let grid = self.term.grid();
+        let line = &grid[Line(row as i32)];
+        (0..grid.columns()).any(|col| {
+            let cell = &line[Column(col)];
+            !matches!(cell.c, ' ' | '\0')
+                || cell.bg != Color::Named(NamedColor::Background)
+                || cell.flags.contains(Flags::INVERSE)
+        })
     }
 
     /// The cursor's row on the live screen (0 = its top, whatever the scroll
@@ -328,6 +342,32 @@ mod tests {
 
     fn emu() -> TermEmulator {
         TermEmulator::new(Size::new(80, 24))
+    }
+
+    #[test]
+    fn mode_switches_alone_are_not_content() {
+        let mut e = emu();
+        assert!(!e.has_content());
+        // What a full-screen tool sends before it draws: the alternate screen,
+        // a hidden cursor, a clear.
+        e.feed(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H");
+        assert!(!e.has_content());
+        e.feed(b"diff --git a/x b/x");
+        assert!(e.has_content());
+    }
+
+    #[test]
+    fn a_painted_background_or_scrolled_output_is_content() {
+        let mut e = emu();
+        e.feed(b"\x1b[41m \x1b[0m");
+        assert!(e.has_content(), "a colored cell is something to look at");
+
+        let mut e = emu();
+        for _ in 0..30 {
+            e.feed(b"line\r\n");
+        }
+        e.feed(b"\x1b[2J\x1b[H");
+        assert!(e.has_content(), "output cleared off the screen is still in the history");
     }
 
     #[test]

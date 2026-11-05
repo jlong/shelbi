@@ -604,7 +604,7 @@ impl ConnectJob {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use shelbi_app::session::GridSize;
     use shelbi_app::supervision::{
@@ -850,7 +850,7 @@ mod tests {
     /// thread, returning the bound socket and a guard that kills it on drop. The
     /// caller must hold `ENV_LOCK` (this sets the process-global `SHELBI_HOME`).
     /// Mirrors the real-session scaffolding in `pty_input_tests`.
-    fn spawn_cat_session(home: &std::path::Path, name: &str) -> (std::path::PathBuf, CatCleanup) {
+    pub(crate) fn spawn_cat_session(home: &std::path::Path, name: &str) -> (std::path::PathBuf, CatCleanup) {
         use shelbi_session::layout::SessionPaths;
         use shelbi_session::RunArgs;
         std::env::set_var("SHELBI_HOME", home);
@@ -886,7 +886,7 @@ mod tests {
         (sock.clone(), CatCleanup { sock })
     }
 
-    struct CatCleanup {
+    pub(crate) struct CatCleanup {
         sock: std::path::PathBuf,
     }
 

@@ -13,6 +13,8 @@
 //! off its UI thread (`shelbi_orchestrator::review_session`) and feeds the
 //! results back in.
 
+pub mod diff_load;
+
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 use shelbi_state::AppTools;
 
