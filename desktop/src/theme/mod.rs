@@ -25,6 +25,7 @@
 //! are ([`Theme::with_contrast`]).
 
 pub mod contrast;
+pub mod diff;
 pub mod fold;
 pub mod glass;
 pub mod motion;

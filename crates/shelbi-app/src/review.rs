@@ -175,13 +175,17 @@ impl ReviewPanelModel {
     /// onto a slot, but nothing has confirmed its server.
     ///
     /// The switch is the TUI's (Reviewer / View Diff / Edit in <editor> /
-    /// Open Browser when a URL exists), less Diff and Editor on a remote slot:
-    /// the daemon only spawns those for a local one.
+    /// Open Browser when a URL exists), less Editor on a remote slot, and Diff
+    /// too unless it's Shelbi's own view: the daemon only spawns those panes
+    /// for a local one, while the built-in view reads any machine's worktree.
     pub fn build(info: &ReviewInfo, row: Option<&ReviewRow>) -> ReviewPanelModel {
         let remote = info.remote_machine.is_some();
         let mut switch_items = vec![ReviewSwitch::Chat];
+        if !remote || info.apps.builtin_diff {
+            switch_items.push(ReviewSwitch::Diff);
+        }
         if !remote {
-            switch_items.extend([ReviewSwitch::Diff, ReviewSwitch::Editor]);
+            switch_items.push(ReviewSwitch::Editor);
         }
         if info.review_url.is_some() {
             switch_items.push(ReviewSwitch::Browser);
@@ -1073,6 +1077,14 @@ mod tests {
         assert_eq!(m.switch_items, [ReviewSwitch::Chat, ReviewSwitch::Browser]);
         let p = ReviewPanelState::new(&m);
         assert!(!p.rows().contains(&PanelRow::Folder));
+    }
+
+    #[test]
+    fn a_remote_slot_can_still_show_shelbis_own_diff() {
+        let mut i = info(true, true);
+        i.apps = AppTools { builtin_diff: true, ..Default::default() };
+        let m = ReviewPanelModel::build(&i, None);
+        assert_eq!(m.switch_items, [ReviewSwitch::Chat, ReviewSwitch::Diff, ReviewSwitch::Browser]);
     }
 
     #[test]

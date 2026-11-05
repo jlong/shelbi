@@ -89,6 +89,7 @@ pub mod cli_setup;
 pub mod board_state;
 pub mod chat;
 pub mod column_swap;
+pub mod diff_view;
 pub mod connect_remote;
 pub mod doc_editor;
 pub mod session_view;

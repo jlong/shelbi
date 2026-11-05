@@ -687,6 +687,23 @@ fn a_workspace_session_follows_the_agents_edits() {
 }
 
 #[test]
+fn a_hidden_workspace_rests_and_catches_up_when_shown() {
+    let repo = Repo::with_base(&[("a.txt", TEN)]);
+    let store = tempfile::tempdir().unwrap();
+    // An interval a test would never outlast: only showing it again can read.
+    let (mut s, _) = session_on(&repo, store.path(), TargetKind::Workspace, Some(Duration::from_secs(600)));
+    wait(&mut s, "the empty diff", |s| !s.state().loading());
+    s.set_visible(false);
+    repo.write("a.txt", "1\n2\n3\n4\n5\n6\n7\n8\n9\nten\n");
+    s.set_visible(false);
+    std::thread::sleep(Duration::from_millis(50));
+    s.poll();
+    assert!(s.state().changeset().files.is_empty(), "nobody's looking");
+    s.set_visible(true);
+    wait(&mut s, "the catch-up", |s| s.state().changeset().files.len() == 1);
+}
+
+#[test]
 fn a_session_that_cant_read_says_why_and_keeps_going() {
     let dir = tempfile::tempdir().unwrap();
     let store = tempfile::tempdir().unwrap();

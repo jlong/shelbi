@@ -133,6 +133,28 @@ pub enum NoticeKind {
     Omitted,
 }
 
+impl NoticeKind {
+    /// What a file's notice row says.
+    pub fn text(self, file: &FileDiff) -> String {
+        match self {
+            NoticeKind::Binary => "Binary file".to_string(),
+            NoticeKind::RenameOnly => match (&file.old_path, file.similarity) {
+                (Some(old), Some(similarity)) if similarity < 100 => {
+                    format!("Renamed from {old} ({similarity}% similar)")
+                }
+                (Some(old), _) => format!("Renamed from {old}, no changes"),
+                (None, _) => "Renamed, no changes".to_string(),
+            },
+            NoticeKind::ModeOnly => match &file.mode_change {
+                Some((old, new)) => format!("Mode changed from {old} to {new}"),
+                None => "Mode changed".to_string(),
+            },
+            NoticeKind::Empty => "Empty file".to_string(),
+            NoticeKind::Omitted => file.omitted.clone().unwrap_or_else(|| "Too large to show".to_string()),
+        }
+    }
+}
+
 /// Which part of a thread a row shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ThreadPart {

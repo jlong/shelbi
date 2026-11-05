@@ -1679,3 +1679,67 @@ fn back_returns_to_the_slots_page_a_review_was_opened_over(cx: &mut TestAppConte
     c.back();
     assert_eq!(c.returned_to(), Some(View::Session("review-1".into())), "the review is still loaded");
 }
+
+/// A review up with Shelbi's own diff holding the keyboard.
+fn builtin_diff_up(c: &mut Column) -> Entity<crate::views::diff_view::DiffView> {
+    let mut builtin = info();
+    builtin.apps.builtin_diff = true;
+    c.update(|w, window, cx| {
+        w.select_row(SidebarTarget::Review("t-1".into()), cx);
+        w.open_review(builtin, window, cx);
+    });
+    c.advance(Duration::from_secs(1));
+    let review = c.review();
+    c.h.cx.update(|_, cx| review.update(cx, |r, cx| r.apply(PanelEffect::ShowDiff, cx)));
+    c.h.cx.run_until_parked();
+    c.h.draw();
+    let diff = c.h.cx.update(|_, cx| review.read(cx).diff_on_show().cloned()).expect("the diff is up");
+    let start = Instant::now();
+    loop {
+        c.h.cx.update(|_, cx| diff.update(cx, |d, cx| d.poll_now(cx)));
+        c.h.cx.run_until_parked();
+        if !c.h.cx.update(|_, cx| diff.read(cx).state().loading()) || start.elapsed() > Duration::from_secs(10) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    c.h.draw();
+    diff
+}
+
+#[gpui::test]
+fn the_diffs_keys_beat_the_windows_chords_and_the_rest_get_through(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    let diff = builtin_diff_up(&mut c);
+    let in_diff = c.h.cx.update(|window, cx| diff.read(cx).contains_focus(window));
+    assert!(in_diff, "asking for the diff hands it the keyboard");
+
+    // Ctrl-p is the diff's file palette here, not the window's command palette.
+    c.h.cx.simulate_keystrokes("ctrl-p");
+    c.h.cx.run_until_parked();
+    assert_eq!(c.h.cx.update(|_, cx| diff.read(cx).state().mode().label()), "PALETTE");
+    assert!(c.read(|w, _| w.overlay.is_none()));
+    c.h.cx.simulate_keystrokes("escape");
+    c.h.cx.run_until_parked();
+    assert_eq!(c.h.cx.update(|_, cx| diff.read(cx).state().mode().label()), "NORMAL");
+
+    // `?` is its help.
+    c.h.cx.simulate_keystrokes("?");
+    c.h.cx.run_until_parked();
+    assert_eq!(c.h.cx.update(|_, cx| diff.read(cx).state().mode().label()), "HELP");
+    c.h.cx.simulate_keystrokes("q");
+    c.h.cx.run_until_parked();
+
+    // A rebound key follows `keys.yaml` at once.
+    let km = shelbi_state::keymap::validate_keymaps_yaml("defaults:\n  diff:\n    cursor_down: e\n", None).0;
+    c.update(|w, _, cx| w.adopt_keymaps(km, cx));
+    let top = c.h.cx.update(|_, cx| diff.read(cx).state().cursor());
+    c.h.cx.simulate_keystrokes("e");
+    c.h.cx.run_until_parked();
+    assert_eq!(c.h.cx.update(|_, cx| diff.read(cx).state().cursor()), top + 1);
+
+    // The reserved palette chord still reaches the window from inside the diff.
+    c.h.cx.simulate_keystrokes("ctrl-space");
+    c.h.cx.run_until_parked();
+    assert!(c.read(|w, _| w.overlay.is_some()), "the window's palette");
+}

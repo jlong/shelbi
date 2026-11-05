@@ -43,6 +43,7 @@ use shelbi_term::Size;
 
 use crate::app::{HostCall, ShelbiWindow};
 use crate::elements::terminal::session::{Connected, SessionIo};
+use crate::views::diff_view::DiffDeps;
 use crate::views::review::{ReviewDeps, ReviewOps};
 use crate::views::session_view::{SessionConnector, SessionDeps};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceOps};
@@ -403,11 +404,13 @@ pub(crate) fn fake_deps(latency: Duration, replay_kb: usize) -> (ReviewDeps, Wor
         ReviewDeps {
             ops: ops.clone(),
             sessions: Rc::new(move |_task| d()),
+            diff: DiffDeps::canned("", Arc::default()),
         }
     };
     let workspace = WorkspaceDeps {
         ops,
         sessions: session_deps,
+        diff: DiffDeps::canned("", Arc::default()),
     };
     (review, workspace)
 }
