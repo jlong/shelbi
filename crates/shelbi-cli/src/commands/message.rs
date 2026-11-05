@@ -4,9 +4,14 @@
 //! This is the file-based, robust half of orchestrator↔workspace
 //! communication: it appends one JSON message per line to an append-only log
 //! in the assigned workspace's worktree at
-//! `<worktree>/.shelbi/messages/<task-id>.log`. The workspace tails that file
-//! (Phases 7/8) and acks by `msg_id` (Phase 9). The log persists in the
-//! worktree, so it survives workspace pane restarts.
+//! `<worktree>/.shelbi/messages/<task-id>.log`. The worker reads that file from
+//! a persisted cursor at the end of each turn and acks by `msg_id`. The log and
+//! the cursor persist in the worktree, so an unread message survives a pane
+//! restart.
+//!
+//! A message nothing would read is refused rather than queued: a done task or a
+//! dead session gets `ack=undeliverable` on the events stream and no other side
+//! effect, so the log only ever holds messages that had a reader.
 //!
 //! This is deliberately *not* `shelbi send`. `send` injects keystrokes into a
 //! tmux pane (send-keys-style UI injection) and inherits all the fragility of
@@ -27,7 +32,7 @@ use chrono::{SecondsFormat, Utc};
 use clap::{Subcommand, ValueEnum};
 use serde::Serialize;
 use shelbi_core::{Column, Host};
-use shelbi_state::MessageDelivery;
+use shelbi_state::{MessageDelivery, UndeliverableReason};
 
 use super::require_project;
 
@@ -38,7 +43,7 @@ use super::require_project;
 #[derive(Debug, Subcommand)]
 pub enum MessageStatusCmd {
     /// Report a pushed message's delivery status (`queued` / `delivered` /
-    /// `unconfirmed`) by scanning `events.log` for its `ack=` line. Exits 0
+    /// `unconfirmed` / `undeliverable`) by scanning `events.log` for its `ack=` line. Exits 0
     /// only when the worker has confirmed delivery.
     Status {
         /// The `msg-id` printed by `shelbi message` (e.g.
@@ -137,8 +142,14 @@ fn run_status(msg_id: &str) -> Result<()> {
         }
         MessageDelivery::TimedOut => bail!(
             "unconfirmed {msg_id} — the ack window elapsed with no worker confirmation. \
-             The message is durable and may still be read when the worker's turn ends; \
-             re-check with `shelbi message status {msg_id}`."
+             The message is durable and may still be read when the worker next ends a turn, \
+             including after a resume; re-check with `shelbi message status {msg_id}`."
+        ),
+        MessageDelivery::Undeliverable(reason) => bail!(
+            "undeliverable {msg_id} ({}) — {} It was never written to the task's log, so \
+             send it again if it still applies.",
+            reason.as_str(),
+            undeliverable_why(reason),
         ),
         MessageDelivery::Queued => bail!(
             "queued {msg_id} — durable on disk, no worker ack yet. \
@@ -151,10 +162,38 @@ fn run_status(msg_id: &str) -> Result<()> {
     }
 }
 
+/// Why a message with this verdict will never be read, for the error a caller
+/// sees both when sending and from `message status`.
+fn undeliverable_why(reason: UndeliverableReason) -> &'static str {
+    match reason {
+        UndeliverableReason::TaskDone => {
+            "the task is done, so no worker session will read its messages."
+        }
+        UndeliverableReason::NoSession => "no worker session was running for the task.",
+    }
+}
+
+/// Record the refusal as the message's one and only side effect, then fail the
+/// send. The record is what lets `message status` answer later, so a failure to
+/// write it is reported rather than swallowed.
+fn refuse(msg_id: &str, id: &str, reason: UndeliverableReason) -> Result<()> {
+    shelbi_state::append_message_undeliverable_event(msg_id, id, reason)
+        .map_err(|e| anyhow!(e))?;
+    bail!(
+        "message {msg_id} → {id} is UNDELIVERABLE ({}): {} It was not written to the task's \
+         log, so send it again if it still applies.",
+        reason.as_str(),
+        undeliverable_why(reason),
+    )
+}
+
 /// Push a message onto a task's file-based message log, then report an honest
-/// delivery state: `queued` (durable, awaiting the worker's ack),
-/// `undeliverable` (no live reader will ever pick it up), or — with `--wait` —
-/// `delivered`/timed-out once the events stream resolves it.
+/// delivery state: `queued` (durable, awaiting the worker's ack) or, with
+/// `--wait`, `delivered`/timed-out once the events stream resolves it.
+///
+/// Deliverability is decided first. A message no worker would read is refused
+/// with `ack=undeliverable` before anything else happens: it isn't appended, no
+/// ack timer is armed, and the question it answers stays open.
 fn run_send(
     project_opt: Option<String>,
     id: String,
@@ -174,6 +213,18 @@ fn run_send(
         .get(&id)
         .map_err(|e| anyhow!(e))?
         .ok_or_else(|| anyhow!("issue `{id}` not found"))?;
+
+    // Fresh, opaque, per-task-unique msg_id. Each `shelbi message` is its own
+    // process, so the pid disambiguates two invocations that land in the same
+    // millisecond; a single process only ever emits one id.
+    let ts = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
+    let msg_id = format!("m-{}-{}", Utc::now().timestamp_millis(), std::process::id());
+
+    // A `done` task's workspace has moved on (its worktree may even be gone),
+    // so nothing will read this task's log again.
+    if tf.task.column == Column::done() {
+        return refuse(&msg_id, &id, UndeliverableReason::TaskDone);
+    }
 
     // Resolve the assigned workspace → its worktree + host. The worktree is a
     // per-workspace, per-machine path; without an assignment there is no
@@ -195,14 +246,6 @@ fn run_send(
     let host = machine.host();
     let worktree = shelbi_orchestrator::workspace::workspace_worktree(machine, workspace);
 
-    // A `done` task still has a worktree (the workspace keeps it across tasks),
-    // so the append below is harmless and useful for archival/replay. But the
-    // workspace's next session is a *different* task, so nothing will ever
-    // drain this task's log — the push is undeliverable. We record it anyway
-    // (archival) and report that truth after the write (see below), rather than
-    // claiming a future SessionStart will pick it up.
-    let is_done = tf.task.column == Column::done();
-
     // Worktree must actually exist. A missing worktree is a hard error, never
     // a silent no-op — otherwise the message would vanish and the operator
     // would think it landed.
@@ -214,11 +257,22 @@ fn run_send(
         );
     }
 
-    // Fresh, opaque, per-task-unique msg_id. Each `shelbi message` is its own
-    // process, so the pid disambiguates two invocations that land in the same
-    // millisecond; a single process only ever emits one id.
-    let ts = Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true);
-    let msg_id = format!("m-{}-{}", Utc::now().timestamp_millis(), std::process::id());
+    let messages_dir = worktree.join(".shelbi").join("messages");
+    let session_live = match probe_session_beacon(&host, &messages_dir, &id)? {
+        SessionBeacon::Alive => true,
+        SessionBeacon::Dead => false,
+        // A polling runner has no hook to vouch for it. It reads the log itself
+        // while its pane runs, so the pane is the session.
+        SessionBeacon::Polling => {
+            let target = shelbi_orchestrator::workspace::workspace_target(&project, workspace)
+                .map_err(|e| anyhow!(e))?;
+            shelbi_orchestrator::workspace::workspace_pane_alive(&host, &target)
+                .map_err(|e| anyhow!(e))?
+        }
+    };
+    if !session_live {
+        return refuse(&msg_id, &id, UndeliverableReason::NoSession);
+    }
 
     let message = Message {
         msg_id: &msg_id,
@@ -233,17 +287,16 @@ fn run_send(
     let mut line = serde_json::to_string(&message)?;
     line.push('\n');
 
-    let messages_dir = worktree.join(".shelbi").join("messages");
     let log_path = messages_dir.join(format!("{id}.log"));
     append_line(&host, &messages_dir, &log_path, &line)?;
 
     // Audit the push on the shared events stream.
     shelbi_state::append_message_event(&msg_id, &id).map_err(|e| anyhow!(e))?;
 
-    // The reply is durable in the task's message log now, so the question it
-    // answers is answered whether or not the worker has read it yet. Stamping
-    // the stored question is what drops it off `shelbi question list`; a
-    // failure here never fails the push that already landed.
+    // A live session has the reply queued, and the cursor carries it across a
+    // restart, so the question it answers is answered now. Stamping the stored
+    // question is what drops it off `shelbi question list`; a failure here
+    // never fails the push that already landed.
     if let Some(question_id) = in_response_to.as_deref() {
         match shelbi_state::questions::mark_question_answered(
             Some(&project_name),
@@ -269,39 +322,9 @@ fn run_send(
     // the missing ack themselves.
     notify_daemon_message_pushed(&project_name, &id, &msg_id);
 
-    // Undeliverable #1 — the task is `done`. The record above is durable
-    // (archival/replay), but the assigned workspace has moved on to a
-    // different task and will never tail *this* task's log again. Report that
-    // honestly with a non-zero exit instead of implying a future pickup.
-    if is_done {
-        bail!(
-            "message {msg_id} written to {} but task `{id}` is in `done` — UNDELIVERABLE: \
-             the workspace has moved on to a different task and will not read this task's \
-             log. The record is kept for archival/replay only.",
-            log_path.display(),
-        );
-    }
-
-    // Undeliverable #2 — no live reader right now. The SessionStart hook
-    // writes its `tail -f` pid to `<msgs>/<id>.tail.d/pid`, and its watchdog
-    // removes the dir once the session ends (a dispatch sweep clears any left
-    // over); its absence means nothing is draining the log. The record is
-    // durable and *this* task's next session (a resume) would drain it, but as
-    // of now it is not delivered — surface that with a non-zero exit so no
-    // caller trusts an undelivered push.
-    if !tail_pid_alive(&host, &messages_dir, &id)? {
-        bail!(
-            "message {msg_id} queued to {} but no worker is reading task `{id}` right now \
-             (no live tail pid at .shelbi/messages/{id}.tail.d/pid). It is durable and would \
-             be drained if this task's worker session restarts, but it is NOT delivered.",
-            log_path.display(),
-        );
-    }
-
-    // A live tail is consuming the log, so the message is genuinely queued.
-    // That is still not "delivered": the worker only drains + acks at its next
-    // turn boundary (its `Stop` hook), which for a busy worker can be well
-    // past the daemon's fixed ack window. Confirmation is therefore async.
+    // Queued is still not "delivered": the worker only reads + acks at its next
+    // turn boundary (its `Stop` hook), which for a busy worker can be well past
+    // the daemon's fixed ack window. Confirmation is therefore async.
     if let Some(secs) = wait {
         return wait_for_delivery(&msg_id, &id, kind, secs);
     }
@@ -309,7 +332,7 @@ fn run_send(
     // No `✓`: the push succeeded but delivery is unconfirmed. Say exactly that
     // so the success signal can't be misread as "the worker read it".
     println!(
-        "queued {msg_id} → {id} ({}) — durable and being tailed by the worker, but NOT yet \
+        "queued {msg_id} → {id} ({}) — durable, and a worker session is running, but NOT yet \
          confirmed delivered. Delivery lands when the worker next ends a turn; confirm with \
          `shelbi message status {msg_id}` or re-send with `--wait`.",
         kind.as_str(),
@@ -336,6 +359,9 @@ fn wait_for_delivery(msg_id: &str, id: &str, kind: MessageKind, secs: u64) -> Re
                 );
                 return Ok(());
             }
+            MessageDelivery::Undeliverable(reason) => {
+                bail!("message {msg_id} → {id} is undeliverable ({})", reason.as_str())
+            }
             MessageDelivery::TimedOut | MessageDelivery::Queued | MessageDelivery::Unknown => {
                 if Instant::now() >= deadline {
                     bail!(
@@ -352,44 +378,68 @@ fn wait_for_delivery(msg_id: &str, id: &str, kind: MessageKind, secs: u64) -> Re
     }
 }
 
-/// Check whether the SessionStart hook's `tail -f` pid file exists and
-/// names a live process on `host`. `.tail.d/pid` is the durable
-/// beacon the hook drops when it starts; the hook's watchdog clears it
-/// within a few seconds of the session ending, and the dispatch sweep
-/// (`shelbi_orchestrator::workspace::sweep_message_tails`) clears any that
-/// predate the watchdog.
-/// Absence means no live worker tailing the log — the caller treats that
-/// as a delivery failure so the message doesn't silently vanish.
-fn tail_pid_alive(host: &Host, messages_dir: &std::path::Path, task_id: &str) -> Result<bool> {
-    let pid_path = messages_dir.join(format!("{task_id}.tail.d")).join("pid");
-    match host {
-        Host::Local => {
-            let pid_text = match std::fs::read_to_string(&pid_path) {
-                Ok(s) => s,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-                Err(e) => return Err(anyhow!("reading {}: {e}", pid_path.display())),
-            };
-            let pid: libc::pid_t = match pid_text.trim().parse() {
-                Ok(p) => p,
-                Err(_) => return Ok(false),
-            };
-            // `kill(pid, 0)` is the standard "is this pid alive?" probe on
-            // POSIX. Returns 0 when the process exists; ESRCH otherwise.
-            // SAFETY: no memory dereference, just a syscall.
-            let alive = unsafe { libc::kill(pid, 0) } == 0;
-            Ok(alive)
-        }
-        Host::Ssh { .. } => {
-            // Remote: `test -f pid && kill -0 $(cat pid)` collapses both
-            // presence and liveness into one probe. Any failure (missing
-            // file, dead pid, unreadable pid text) => absent.
-            let script = format!(
-                "test -f '{p}' && kill -0 \"$(cat '{p}')\" 2>/dev/null",
-                p = pid_path.to_string_lossy(),
-            );
-            let out = shelbi_ssh::run(host, ["sh", "-c", &script]).map_err(|e| anyhow!(e))?;
-            Ok(out.status.success())
-        }
+/// What a task's `<task>.session` beacon says about its worker session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionBeacon {
+    /// The session that wrote it is still running.
+    Alive,
+    /// No beacon, or the session that wrote it is gone.
+    Dead,
+    /// Dispatch launched a polling runner, which has no hooks to write one.
+    Polling,
+}
+
+/// Reads the beacon the SessionStart hook writes (see `MESSAGE_SESSION_START_SH`
+/// in `shelbi_orchestrator::workspace`), with the same fixed locale and zone, so
+/// a pid only counts while it's the process that started at the recorded time.
+/// `$1` is the messages dir, `$2` the task id.
+///
+/// The `tail.d` branch covers sessions that started under the tail relay before
+/// this binary was installed: they have no beacon but are alive, and keep their
+/// old hooks until their next dispatch. It can go once none can be left running.
+const SESSION_BEACON_PROBE_SH: &str = r#"BEACON=$1/$2.session
+if [ -f "$BEACON" ]; then
+  read -r PID STARTED < "$BEACON"
+  case "$PID" in
+    polling) echo polling; exit 0 ;;
+    unverified) echo alive; exit 0 ;;
+    ''|*[!0-9]*|0|1) echo dead; exit 0 ;;
+  esac
+  NOW=$(echo $(LC_ALL=C TZ=UTC ps -o lstart= -p "$PID" 2>/dev/null))
+  if [ -n "$NOW" ] && [ "$NOW" = "$STARTED" ]; then echo alive; else echo dead; fi
+  exit 0
+fi
+PID=$(cat "$1/$2.tail.d/pid" 2>/dev/null)
+case "$PID" in ''|*[!0-9]*|0|1) echo dead; exit 0 ;; esac
+case "$(ps -ww -o command= -p "$PID" 2>/dev/null)" in
+  *tail*"$2.log") echo alive ;;
+  *) echo dead ;;
+esac
+"#;
+
+/// Run [`SESSION_BEACON_PROBE_SH`] on `host`. An answer the script didn't give
+/// (SSH down, say) is an error, not `Dead`: nothing is known about the session,
+/// so nothing gets recorded against the message either.
+fn probe_session_beacon(
+    host: &Host,
+    messages_dir: &std::path::Path,
+    task_id: &str,
+) -> Result<SessionBeacon> {
+    let dir = messages_dir.to_string_lossy();
+    let out = shelbi_ssh::run(
+        host,
+        ["sh", "-c", SESSION_BEACON_PROBE_SH, "sh", &dir, task_id],
+    )
+    .map_err(|e| anyhow!(e))?;
+    match String::from_utf8_lossy(&out.stdout).trim() {
+        "alive" => Ok(SessionBeacon::Alive),
+        "dead" => Ok(SessionBeacon::Dead),
+        "polling" => Ok(SessionBeacon::Polling),
+        _ => bail!(
+            "could not check for a worker session for task `{task_id}` ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim(),
+        ),
     }
 }
 
@@ -584,6 +634,17 @@ mod tests {
         shelbi_state::append_message_ack_event("m-ok", "task-a", "worker").unwrap();
         assert!(run_status("m-ok").is_ok());
 
+        // Refused at send time → non-zero, named as such, and the reason survives.
+        for (msg, reason, token) in [
+            ("m-done", UndeliverableReason::TaskDone, "done"),
+            ("m-dead", UndeliverableReason::NoSession, "no_session"),
+        ] {
+            shelbi_state::append_message_undeliverable_event(msg, "task-a", reason).unwrap();
+            let refused = run_status(msg).unwrap_err().to_string();
+            assert!(refused.contains("undeliverable"), "got: {refused}");
+            assert!(refused.contains(token), "got: {refused}");
+        }
+
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -623,14 +684,9 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The tail-liveness probe returns false when no pid file exists —
-    /// that's the "worker's SessionStart hook never ran" case. `shelbi
-    /// message` uses this signal to fail loudly instead of silently
-    /// writing to a log nobody is reading.
-    #[test]
-    fn tail_pid_alive_false_when_no_pid_file() {
+    fn probe_dir(tag: &str) -> std::path::PathBuf {
         let tmp = std::env::temp_dir().join(format!(
-            "shelbi-tail-probe-none-{}-{}",
+            "shelbi-beacon-probe-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -638,62 +694,38 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&tmp).unwrap();
-        assert!(!tail_pid_alive(&Host::Local, &tmp, "feat-x").unwrap());
-        let _ = std::fs::remove_dir_all(&tmp);
+        tmp
     }
 
-    /// The tail-liveness probe returns false when the pid file names a
-    /// process that no longer exists — worker crashed or was killed
-    /// after the previous pane exit didn't clean up. Uses a
-    /// short-lived child so we get a definitely-dead pid without racing
-    /// the OS reaper.
-    #[test]
-    fn tail_pid_alive_false_when_recorded_pid_is_dead() {
-        let tmp = std::env::temp_dir().join(format!(
-            "shelbi-tail-probe-dead-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let lock_dir = tmp.join("feat-x.tail.d");
-        std::fs::create_dir_all(&lock_dir).unwrap();
-
-        // Spawn a short-lived child, wait for it, then reuse its pid.
-        // On POSIX the pid may get recycled — probability is negligible
-        // in a test that lasts milliseconds and doesn't fork thousands
-        // of processes. `sh -c :` is portable across macOS (no /bin/true)
-        // and Linux.
-        let child = std::process::Command::new("sh")
+    /// The beacon line the SessionStart hook writes for a running `pid`.
+    fn beacon_for(pid: u32) -> String {
+        let out = std::process::Command::new("sh")
             .arg("-c")
-            .arg(":")
-            .spawn()
+            .arg(format!("echo {pid} $(LC_ALL=C TZ=UTC ps -o lstart= -p {pid})"))
+            .output()
             .unwrap();
-        let pid = child.id();
-        let _ = child.wait_with_output();
-        std::fs::write(lock_dir.join("pid"), pid.to_string()).unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    }
 
-        assert!(!tail_pid_alive(&Host::Local, &tmp, "feat-x").unwrap());
+    /// No beacon is the "SessionStart hook never ran" case: `shelbi message`
+    /// refuses instead of writing to a log nobody is reading.
+    #[test]
+    fn probe_reports_dead_without_a_beacon() {
+        let tmp = probe_dir("none");
+        assert_eq!(
+            probe_session_beacon(&Host::Local, &tmp, "feat-x").unwrap(),
+            SessionBeacon::Dead
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The tail-liveness probe returns true when the pid file names a
-    /// running process — that's the healthy "worker is tailing" state.
+    /// A running process that started when the beacon says it did is the
+    /// session. A dead one isn't, and neither is a running process with a
+    /// different start time: that's the OS reusing the pid, which `kill -0`
+    /// alone would have called alive.
     #[test]
-    fn tail_pid_alive_true_for_running_pid() {
-        let tmp = std::env::temp_dir().join(format!(
-            "shelbi-tail-probe-live-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let lock_dir = tmp.join("feat-x.tail.d");
-        std::fs::create_dir_all(&lock_dir).unwrap();
-
-        // Sleep child stands in for the SessionStart hook's `tail -f`.
+    fn probe_follows_the_session_not_the_pid() {
+        let tmp = probe_dir("session");
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .stdin(std::process::Stdio::null())
@@ -701,12 +733,79 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
-        std::fs::write(lock_dir.join("pid"), child.id().to_string()).unwrap();
+        let beacon = tmp.join("feat-x.session");
+        let probe = || probe_session_beacon(&Host::Local, &tmp, "feat-x").unwrap();
 
-        assert!(tail_pid_alive(&Host::Local, &tmp, "feat-x").unwrap());
+        std::fs::write(&beacon, beacon_for(child.id())).unwrap();
+        assert_eq!(probe(), SessionBeacon::Alive);
 
+        std::fs::write(
+            &beacon,
+            format!("{} Mon Jan 1 00:00:00 2001\n", child.id()),
+        )
+        .unwrap();
+        assert_eq!(probe(), SessionBeacon::Dead, "reused pid");
+
+        std::fs::write(&beacon, beacon_for(child.id())).unwrap();
         let _ = child.kill();
         let _ = child.wait();
+        assert_eq!(probe(), SessionBeacon::Dead, "session gone");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The tokens that aren't a pid: a polling runner's marker, a host with no
+    /// `ps` to verify against, and a corrupt file.
+    #[test]
+    fn probe_reads_the_non_pid_beacons() {
+        let tmp = probe_dir("tokens");
+        let beacon = tmp.join("feat-x.session");
+        let probe = || probe_session_beacon(&Host::Local, &tmp, "feat-x").unwrap();
+        std::fs::write(&beacon, "polling\n").unwrap();
+        assert_eq!(probe(), SessionBeacon::Polling);
+        std::fs::write(&beacon, "unverified\n").unwrap();
+        assert_eq!(probe(), SessionBeacon::Alive);
+        std::fs::write(&beacon, "garbage here\n").unwrap();
+        assert_eq!(probe(), SessionBeacon::Dead);
+        std::fs::write(&beacon, "").unwrap();
+        assert_eq!(probe(), SessionBeacon::Dead);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A session already running when this binary landed still has the old
+    /// tail and no beacon. Its live tail counts; a stale lock doesn't, and
+    /// neither does a pid the OS reused for something else.
+    #[test]
+    fn probe_honors_a_live_tail_from_before_the_cursor() {
+        let tmp = probe_dir("legacy");
+        let lock = tmp.join("feat-x.tail.d");
+        std::fs::create_dir_all(&lock).unwrap();
+        let log = tmp.join("feat-x.log");
+        std::fs::write(&log, "").unwrap();
+        let spawn = |args: &[&str]| {
+            std::process::Command::new(args[0])
+                .args(&args[1..])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let probe = || probe_session_beacon(&Host::Local, &tmp, "feat-x").unwrap();
+
+        let mut tail = spawn(&["tail", "-f", "-c", "+1", log.to_str().unwrap()]);
+        std::fs::write(lock.join("pid"), tail.id().to_string()).unwrap();
+        assert_eq!(probe(), SessionBeacon::Alive);
+        let _ = tail.kill();
+        let _ = tail.wait();
+        assert_eq!(probe(), SessionBeacon::Dead, "stale lock");
+
+        let mut other = spawn(&["sleep", "30"]);
+        std::fs::write(lock.join("pid"), other.id().to_string()).unwrap();
+        assert_eq!(probe(), SessionBeacon::Dead, "reused pid");
+        let _ = other.kill();
+        let _ = other.wait();
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

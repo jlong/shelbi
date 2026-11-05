@@ -1357,6 +1357,44 @@ pub fn append_message_ack_event(msg_id: &str, task_id: &str, kind: &str) -> Resu
     append_event_line(&format!("{ts} message={msg_id} task={task_id} ack={kind}"))
 }
 
+/// Why a message was refused instead of queued. Written as the `reason=` token
+/// of an `ack=undeliverable` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndeliverableReason {
+    /// The task is `done`, so no session will ever read its log again.
+    TaskDone,
+    /// No worker session was alive for the task when the message was sent.
+    NoSession,
+}
+
+impl UndeliverableReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UndeliverableReason::TaskDone => "done",
+            UndeliverableReason::NoSession => "no_session",
+        }
+    }
+}
+
+/// Append `<rfc3339> message=<msg_id> task=<task-id> ack=undeliverable
+/// reason=<reason>` to `~/.shelbi/events.log`: `shelbi message` refused this
+/// message and never wrote it to the task's log. There is no `push=ok` for it
+/// and no ack timer, so this line is the message's whole record and
+/// `shelbi message status` can report the refusal later.
+pub fn append_message_undeliverable_event(
+    msg_id: &str,
+    task_id: &str,
+    reason: UndeliverableReason,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let msg_id = sanitize_field(msg_id);
+    let task_id = sanitize_field(task_id);
+    let reason = reason.as_str();
+    append_event_line(&format!(
+        "{ts} message={msg_id} task={task_id} ack=undeliverable reason={reason}"
+    ))
+}
+
 /// Delivery state of a pushed message, reconstructed from the `message=`
 /// lines in `events.log`. This is the durable, after-the-fact view the CLI
 /// exposes to a caller (`shelbi message status`, `shelbi message --wait`) so
@@ -1379,6 +1417,9 @@ pub enum MessageDelivery {
     /// not definitively failed — a late ack can still upgrade this to
     /// `Delivered` when the worker's turn ends.
     TimedOut,
+    /// An `ack=undeliverable` line exists: the message was refused when it was
+    /// sent and never reached the task's log, so no ack can follow.
+    Undeliverable(UndeliverableReason),
     /// A `push=ok` line exists with no `ack=` line yet: durable on disk, no
     /// confirmation one way or the other.
     Queued,
@@ -1408,6 +1449,7 @@ pub fn message_delivery_status(msg_id: &str) -> Result<MessageDelivery> {
     let mut queued = false;
     let mut worker = false;
     let mut timed_out = false;
+    let mut undeliverable = None;
     for line in content.lines() {
         // Every message line is a flat space-separated `key=value` record; find
         // the one whose `message=` token matches this exact id, then read its
@@ -1415,6 +1457,7 @@ pub fn message_delivery_status(msg_id: &str) -> Result<MessageDelivery> {
         let mut is_this = false;
         let mut has_push = false;
         let mut ack: Option<&str> = None;
+        let mut reason = UndeliverableReason::NoSession;
         for tok in line.split_whitespace() {
             if let Some(v) = tok.strip_prefix("message=") {
                 is_this = v == msg_id;
@@ -1422,6 +1465,8 @@ pub fn message_delivery_status(msg_id: &str) -> Result<MessageDelivery> {
                 has_push = true;
             } else if let Some(v) = tok.strip_prefix("ack=") {
                 ack = Some(v);
+            } else if tok == "reason=done" {
+                reason = UndeliverableReason::TaskDone;
             }
         }
         if !is_this {
@@ -1433,11 +1478,14 @@ pub fn message_delivery_status(msg_id: &str) -> Result<MessageDelivery> {
         match ack {
             Some("worker") => worker = true,
             Some("timeout") => timed_out = true,
+            Some("undeliverable") => undeliverable = Some(reason),
             _ => {}
         }
     }
     Ok(if worker {
         MessageDelivery::Delivered
+    } else if let Some(reason) = undeliverable {
+        MessageDelivery::Undeliverable(reason)
     } else if timed_out {
         MessageDelivery::TimedOut
     } else if queued {
