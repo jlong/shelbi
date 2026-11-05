@@ -2,139 +2,131 @@
 competitor: Herd
 slug: herd
 competitorUrl: https://joinherd.ai/
-summary: A desktop IDE for parallel coding agents — one window spawns Claude Code, Codex, or Kimi instances across local git worktrees on a single machine.
+summary: A desktop agent IDE for parallel local coding work, with git worktrees, source control, and Claude Code and Codex support.
 ---
 
 ## At a glance
 
-| Dimension          | Shelbi                                       | Herd                                            |
-| ------------------ | -------------------------------------------- | ----------------------------------------------- |
-| Form factor        | Terminal Kanban + attachable sessions        | Desktop GUI (Windows, macOS, Linux `.deb`/`.rpm`) |
-| Concurrency model  | Fixed pool of persistent workers             | Spawn-on-demand agents, capped by your laptop   |
-| Where work runs    | Your machines, your worktrees, SSH-routed    | One local machine, animal-named worktrees       |
-| Work intake        | Five-column Kanban with explicit triage      | Command-palette spawn; no board                 |
-| Scheduler          | LLM orchestrator dispatching from events log | Human-driven; serial "chain" trigger only       |
-| Review flow        | `review` column + file-based marker          | Inline diff in the same window                  |
-| Runners            | Claude Code, Codex (declared per worker)     | Claude Code, Codex, Kimi (mixed per window)     |
-| Source             | Open source, MIT                             | Closed source, free download                    |
+| Dimension         | Shelbi                                      | Herd                                          |
+| ----------------- | ------------------------------------------- | --------------------------------------------- |
+| Form factor       | Native macOS app, TUI, and CLI               | Desktop GUI for Windows, macOS, and Linux      |
+| Concurrency model | Named workspace pool with reused worktrees  | Agents spawned into separate worktrees        |
+| Where work runs   | Local machines and SSH-connected hosts      | Local agents, according to its privacy policy |
+| Work intake       | Configurable Kanban; local files or GitHub Issues | Agent spawn flow and Workspace TODOs     |
+| Automation        | LLM orchestrator; optional Zen Mode         | Agent chaining                                |
+| Review flow       | Workflow handoff and dedicated review workspace | Source Control and inline merge conflicts |
+| Runners           | Claude Code, Codex, configurable CLI runners | Claude Code and Codex; Kimi shown on homepage  |
+| Source            | Open source, MIT                            | [Proprietary redistribution terms](https://joinherd.ai/terms) |
+| Pricing           | Free software; agent usage separate         | No public plan price listed; bring your AI accounts |
+
+Checked November 4, 2026 against Shelbi v0.13.3 and Herd's public materials.
+Herd's [download page](https://joinherd.ai/#download) and
+[changelog](https://joinherd.ai/changelog) still list v0.2.1 (May 2, 2026).
+No newer public release was listed when checked. This comparison uses those
+documented features.
 
 ## Where Shelbi excels
 
-### A pool that spans more than one laptop
+### A native window across machines
 
-Shelbi workers are declared once in project YAML and live across however many
-machines you list. A worker on `devbox` and a worker on `hub` show up as
-named slots — `charlie`, `delta` — that the orchestrator routes work to over
-SSH. Tasks can pin themselves to a host with `prefers_machine: devbox` when
-they need a GPU, a local model, or a specific build environment.
+Shelbi now has a native macOS desktop app alongside its TUI and CLI. The site
+shows the desktop client by default. Both clients share the same application
+models and command registry, including the Issues board and workspace terminals.
 
-Herd's pool is whatever your one laptop can host. There is no remote
-attach and no notion of "this task prefers the Mac with the local model
-loaded" — "ship in parallel" is bounded by RAM on one desk.
+There are two ways to work remotely. Your project can dispatch agents to
+[workspaces on SSH-connected machines](/docs/concepts/workspaces). Or you can
+open an entire [remote project](/docs/concepts/remote-sessions) through
+**Connect to Remote Session…**. The desktop opens its full native window over
+one shared SSH relay channel per host. Both machines need the exact same Shelbi
+version; a mismatch opens the remote TUI in a terminal view instead. On macOS,
+SSH password and passphrase prompts use a native dialog.
 
-### A real task board, not a sidebar of windows
+Remote agents keep running if your viewer disconnects, provided their host
+keeps running. Herd describes local execution in its
+[privacy policy](https://joinherd.ai/privacy); its public materials do not
+document equivalent remote-project access.
 
-Shelbi's surface is a five-column Kanban: `backlog → todo → in_progress →
-review → done`. You triage what's ready; the orchestrator dispatches from
-the top of `todo`; finished work staged for review survives across
-sessions. Priority is explicit (`shelbi issue prio --top|--up|--set N`),
-assignment is explicit (`shelbi issue assign`), and the backlog-versus-ready
-boundary lets you think about what to work on before committing to it.
+### A task board with configurable workflows
 
-Herd's intake is "press Ctrl+K, pick an agent type, pick a workspace, type
-a prompt." The v0.2.1 Workspace TODOs panel is a `TODOS.md` scratchpad
-with a one-way promotion path to GitHub, GitLab, or Gitea issues — once a
-TODO becomes an issue, Herd no longer tracks it.
+Shelbi's board follows your workflow definitions rather than five fixed columns.
+Statuses declare who owns the next step, which agent runs it, and which
+transition actions follow. The board can stay in local markdown or use
+[GitHub Issues](/docs/concepts/github-issues), where each card is a real issue.
 
-### An LLM orchestrator, not a chain trigger
+The **New task** dialog in both clients includes Title, Workflow, Status,
+Priority, Description, and **Let Orchestrator write this up**. The switch asks
+the running orchestrator to expand your draft into a task with acceptance criteria.
 
-The orchestrator is a Claude agent running in the project's Shelbi
-session. It tails `~/.shelbi/events.log`, matches lines like `task=fix-login
-todo -> in_progress` against its reaction rules, and dispatches the next
-ready task to whichever worker just freed up. Its instructions live in a
-prompt file you can fork per project — routing rules, merge policy,
-reporting style, all editable.
+Herd's documented intake includes a spawn palette and `TODOS.md` entries that
+can become GitHub, GitLab, or Gitea issues. Shelbi is the closer fit when you
+want the issue board itself to drive dispatch and review.
 
-Herd's only built-in automation along this axis is the v0.1.0 chain
-primitive: "when one finishes, the next starts automatically." That's a
-serial trigger, not a scheduler. The human stays the dispatcher.
+### An orchestrator you can configure
 
-### Explicit review handoff via file marker
+Shelbi runs an orchestrator agent that reacts to project events and dispatches
+work to available workspaces. Onboarding lets you choose its harness and default
+model, then edit its instructions. Agent instructions and skills are editable
+too. Runner and model settings resolve by agent and task, so mixing Claude Code
+and Codex does not require a fixed runner per workspace.
 
-When a worker finishes a task, it writes its task id to
-`<worktree>/.shelbi/shelbi-ready`. The hub poller picks it up and
-moves the card to `review`. The handoff survives machine sleep, network
-blips, and SSH drops — the marker is the *entire* on-worker protocol,
-which is what lets a remote worker run with nothing installed but `git`,
-the agent CLI, and the `shelbi` binary itself.
+[Zen Mode](/docs/concepts/zen-mode) is optional and off by default. When enabled,
+it lets the orchestrator promote and merge eligible work under your policy.
+Workflow ownership controls where it can act; configured local checks, CI,
+conflict checks, and danger paths inform the merge decision. Individual issues
+can opt out. This is more setup than Herd's documented chaining, but gives you
+control over the path from intake to merge.
 
-Herd's "done" is implicit when the agent's output ends in the same window
-the agent runs in. There is no separate review staging area; when the
-laptop sleeps mid-run, in-flight state goes with it (stranded-worktree
-resume in v0.2.1 recovers what it can).
+### Explicit review and a record of what shipped
 
-### CLI-first, scriptable from anywhere
+A worker signals completion with its task id in
+`<worktree>/.shelbi/shelbi-ready`. Shelbi routes the handoff through the task's
+workflow. The default flow stages finished work in Review, with a dedicated
+review workspace, **View Diff**, **Approve**, and **Reject** controls. Custom
+workflows can define other handoff steps.
 
-Every Shelbi action — `task add`, `task move`, `task start`, `worker list`,
-`events tail` — is a command. Cron jobs, webhooks, shell scripts, or
-other LLMs can add tasks and route work without going through a window.
-The orchestrator drives Shelbi the same way you do.
+The project's [Changelog](/docs/concepts/changelog) records shipped changes and
+links them to issues and PRs. You can read it in either client or through
+`shelbi changelog list`.
 
-Herd exposes its surface only through the desktop GUI. There is no public
-CLI, socket API, or remote-trigger entrypoint, so no external scheduler
-can hand work to a Herd window from outside it.
+### A CLI alongside the app
+
+Scripts and agents use the same commands: `shelbi issue add`,
+`shelbi issue move`, `shelbi issue prio`, `shelbi workspace list`, and
+`shelbi events tail`. The desktop is another way to drive that system, rather
+than the only entry point.
 
 ## Where Herd excels
 
-### A polished desktop GUI Shelbi doesn't try to be
+### A graphical client on more platforms
 
-Herd is unapologetically graphical: VS Code-style title bar and file tabs,
-light and dark modes with platform-aware theme tokens, a command palette,
-an animated brand logo, and per-agent Run panels with auto-open URL chips
-for dev servers. If a beautiful window is on the requirement list, Shelbi
-— a TUI — is the wrong answer.
+Herd offers Windows, macOS, Linux `.deb` and `.rpm` downloads, plus documented
+WSL support. Shelbi's native app requires an Apple silicon Mac running macOS 15
+or later; its TUI is available on macOS and Linux. For a graphical Windows or
+Linux workflow, Herd has the broader platform coverage.
 
-### Three runners in one window today
+### Direct agent spawning and source control
 
-Herd ships first-class support for Claude Code, Codex, and Kimi — three
-agent CLIs, one Ctrl+K. Per-agent CLI args (v0.2.1) let you run one agent
-on Claude Opus and another on Claude Sonnet in the same workspace without
-juggling shells. Shelbi declares a runner per worker, so mixing runners
-means declaring different workers up front; Herd lets you mix on the fly.
+Herd's palette asks for an agent type and workspace. Its Source Control panel,
+inline conflict resolution, and AI-generated commit and PR messages suit someone
+who wants to launch agents and inspect their changes directly. That can be a
+simpler fit than configuring an orchestrator and a workflow.
 
-### Skill preloading via GStack
+### GStack integration
 
-A landing-page feature: preload skill packs so every spawned agent
-inherits the same role personas (CEO, Designer, Eng Manager, Release
-Manager, QA, etc.) without per-agent install. Herd is plugging into
-GStack's network effect rather than asking you to author the personas
-yourself.
-
-### Inline conflict resolution and AI commit messages
-
-The Source Control panel groups Uncommitted and Committed files, the
-merge dialog resolves conflicts inline (v0.1.11), and the agent writes
-its own commit and PR messages from the worktree diff (v0.1.9 / v0.1.10).
-For the "three agents finished at once, now I have three messages to
-write" problem, Herd has a direct answer.
+Herd advertises preloading skills such as GStack, and its live demo shows a
+GStack review pipeline. If you already use that workflow, the integration may
+matter more than Shelbi's configurable agent roles.
 
 ## Choose Shelbi if…
 
-- You want a worker pool that spans more than one machine you already own.
-- A Kanban with explicit triage and review columns matches how you think
-  about work.
-- You want an LLM orchestrator that actively dispatches, not a chain
-  trigger you wire up per pair.
-- You want the orchestration surface scriptable from cron jobs, webhooks,
-  or another agent — not locked inside a GUI.
-- You want workers that survive SSH drops and that you can attach to from any terminal.
+- You want a native Mac app or terminal client controlling local and remote work.
+- You want a configurable issue board to drive dispatch, review, and optional automation.
+- You want editable orchestrator instructions, agent roles, and model settings.
+- You need a CLI for scripts and other agents, and want MIT-licensed source.
 
 ## Choose Herd if…
 
-- You're on a single laptop and don't need cross-machine routing.
-- A polished desktop GUI matters more than a Kanban or a CLI.
-- You want Claude Code, Codex, and Kimi mixed in the same window today.
-- GStack's role-persona pack is something you actively want preloaded
-  into every spawn.
-- Inline merge-conflict resolution and AI commit messages from the
-  worktree diff are load-bearing for your workflow.
+- You need a graphical client on Windows or Linux.
+- You prefer spawning agents directly over defining a board-driven workflow.
+- Inline conflict resolution and generated commit messages are central to your review process.
+- You want its advertised GStack integration.
