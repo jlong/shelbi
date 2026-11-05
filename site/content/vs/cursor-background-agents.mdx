@@ -1,149 +1,162 @@
 ---
 competitor: Cursor Background Agents
 slug: cursor-background-agents
-competitorUrl: https://cursor.com/docs/background-agent
-summary: Cursor's async, cloud-run coding agents — Anysphere-hosted Ubuntu VMs that clone your repo, work on a branch, and open a merge-ready PR. Renamed Cloud Agents in Cursor 2.0.
+competitorUrl: https://cursor.com/docs/cloud-agent
+summary: Cursor's Background Agents are now called Cloud Agents. They run asynchronous coding tasks in managed environments or execute tools on self-hosted machines, with Cursor's cloud running the agent loop.
 ---
 
 ## At a glance
 
-| Dimension          | Shelbi                                          | Cursor Background Agents                              |
-| ------------------ | ----------------------------------------------- | ----------------------------------------------------- |
-| Form factor        | Terminal Kanban + attachable sessions           | Embedded in Cursor editor + cursor.com/agents         |
-| Where work runs    | Your machines, your worktrees                   | Anysphere-managed Ubuntu VMs (cloud, default)         |
-| Concurrency model  | Fixed pool of named, persistent workers         | Spin-up-per-task VMs; up to 8 fan-out per prompt      |
-| Environment        | Long-lived worktrees with warm caches           | Fresh VM per run; configured via `environment.json` / Dockerfile / snapshot |
-| Repo trust surface | Local checkout, no third-party push grant       | Read-write GitHub / GitLab / Bitbucket / Azure access |
-| Review flow        | Explicit `review` column, human signs off       | Agent opens "merge-ready" PR with artifacts           |
-| Model selection    | Per-worker runner (`claude`, `codex`)           | Forced Max Mode; routes to Anthropic / OpenAI / Google / Composer |
-| Source             | Open source, MIT                                | Proprietary, commercial (Anysphere)                   |
-| Pricing            | Free                                            | Pro $20/mo+ with credit pool; usage-based on top      |
+Checked November 4, 2026. Shelbi capabilities below are available in v0.13.3.
+
+| Dimension | Shelbi | Cursor Background Agents (now Cloud Agents) |
+| --- | --- | --- |
+| Form factor | Native macOS app and terminal UI over the same sessions | Desktop, web, and native iOS app; Android via web/PWA |
+| Where work runs | Local or SSH machines you operate | Managed Ubuntu VMs, or self-hosted tool execution with a cloud agent loop |
+| Concurrency model | Configurable pool of named workspaces | Parallel agent runs on managed VMs or self-hosted workers |
+| Environment | Persistent git worktrees across tasks | Prepared Builds for hosted runs; existing checkouts for self-hosted runs |
+| Orchestration | Your agent CLI, instructions, and workflow files | Cursor service; APIs and a separate Agent SDK for customization |
+| Review flow | Workflow handoff, review workspaces, optional Zen automation | Pull requests, artifacts, and remote desktop testing |
+| Model selection | Claude Code, Codex, or a custom CLI runner | Curated Cloud Agent models; context size selectable where supported |
+| Source | Open source, MIT | Proprietary commercial service |
+| Pricing | Free software; agent and machine costs are yours | New individual plans include Cloud Agents from Premium, $30/month before tax; usage terms vary by model and plan |
 
 ## Where Shelbi excels
 
-### Persistent workers, not VMs you re-provision per task
+### Persistent workspaces on machines you operate
 
-Each Shelbi worker owns a named worktree at
-`<machine.work_dir>/.shelbi/wt/<worker-name>` that lives for the whole
-project. Picking up a new task is a branch checkout in a worktree the
-worker already owns — no clone, no `npm install`, no dependency warm-up
-on the hot path. The pool is declared once in YAML and the orchestrator
-routes work into stable slots.
+Each Shelbi workspace keeps a worktree at
+`<machine.work_dir>/.shelbi/wt/<workspace-name>` and switches branches
+between tasks. Existing dependencies and build output can stay on disk.
+The workspace persists; an agent's conversation need not carry over to
+the next assignment.
 
-Each Cursor Cloud Agent run provisions a fresh Ubuntu VM, clones the
-repo (and dependent repos / submodules), and replays the configured
-setup commands before the agent does any real work. That fidelity is
-load-bearing — Cursor's own docs flag that "an agent that can't run
-tests, query services, or reach APIs cannot close the loop" — but you
-pay it on every run.
+Cursor also avoids repeated setup. Its [Builds](https://cursor.com/docs/cloud-agent/builds)
+prepare repositories and dependencies before hosted agents start. Its
+[Self-Hosted Machines](https://cursor.com/docs/cloud-agent/self-hosted)
+can use existing checkouts. Shelbi's advantage is direct control of the
+workspace pool and orchestration through your own configuration.
 
-### Your repo stays on your machines
+### Native desktop access to local and remote projects
 
-A Shelbi worker pulls and pushes from a local checkout. Nothing in the
-loop needs a third-party service to hold a read-write grant against your
-GitHub org.
+Shelbi now has a native macOS app alongside the TUI. Both use the same
+application models and command registry. The desktop requires an Apple
+silicon Mac with macOS 15 or later.
 
-Cursor Cloud Agents require **read-write access** to the repo and any
-dependent repos or submodules, granted to Anysphere's cloud, so that the
-managed VM can clone the code and push the branch back. That is the
-intended design, and it's the right trade-off for some teams — but it is
-a larger trust surface than running the agent against a worktree you
-already have on disk.
+A remote project opens in the full native window over one shared SSH
+relay per host, without port forwarding. Local and remote Shelbi versions
+must match; otherwise the desktop opens the remote TUI in a terminal view
+with a version notice. Password-only hosts are supported. Remote
+workspaces also expose the agent, Shell, View Diff, and Edit in your chosen
+editor from the sidebar.
 
-### A review column, not a merge-ready PR
+### An orchestration loop you control
 
-Shelbi finishes by moving the card to a `review` column. The branch is
-ready to inspect, the diff opens in a review pane, and `review → done`
-is a transition only you can make. Auto-merge is opt-in, per loop, and
-encoded in the orchestrator prompt you can edit.
+Shelbi launches agent CLIs on your machines. You choose the runner and
+model, edit agent instructions, and define workflow statuses and
+transitions. Orchestrator onboarding walks through the harness, default
+model, and instructions before launch.
 
-Cursor's stated output is a "merge-ready pull request" with screenshots,
-videos, and logs — which is great when you trust the run, and a stronger
-nudge toward "click merge" when you don't. The review gate exists
-(it's still a PR) but the framing is merge-first rather than review-first.
+Cursor's [self-hosted option](https://cursor.com/docs/cloud-agent/self-hosted)
+keeps the checkout and tool execution on your hardware, but Cursor still
+runs planning and the agent loop. File contents and tool results needed
+by the agent leave the machine. Shelbi removes that required Cursor
+service from the loop; the CLI and model provider you choose still have
+their own data handling.
 
-### Pricing you can predict
+### Review policy you can configure
 
-Shelbi is free and MIT-licensed. Your model bill is whatever you already
-pay for `claude` or `codex` — no second meter.
+Shelbi's review workspaces can load a finished branch and run a workflow's
+configured server for human inspection. The Review view provides diff
+and editor access plus approve and reject actions.
 
-Cursor Background Agents are bundled into paid plans starting at $20/mo
-for Pro, but **always run in Max Mode** (extended context, no opt-out)
-which "consumes credits faster," and historically gate behind enabling
-usage-based spending plus a $10–$20 minimum-funding prompt. Cost-per-run
-depends on task size, model selection, and how many of the 8-way fan-out
-agents you actually spawn. Predictable if you stay inside the bundle;
-less so the moment you don't.
+[Zen Mode](/docs/concepts/zen-mode) changes who handles eligible work.
+The shipped policy lets the orchestrator review and finalize passing
+handoffs when no review workspace is configured. It preserves the human
+gate for review workspaces. Policy lives in the project's `zenmode.md`;
+human sign-off is not an unconditional property of every Shelbi workflow.
 
-### Scriptable from anything that can shell out
+Cursor also supports review before merging. Its PR artifacts and remote
+desktop are useful ways to inspect a change. The choice is about where
+you configure and conduct that review.
 
-Every Shelbi action is a CLI command: `shelbi issue add`, `shelbi issue
-move`, `shelbi worker list`, `shelbi events tail`. A cron job, a
-webhook, another agent — anything that can run a process — can drop
-work onto the board and watch it move.
+### A shared board and a CLI for automation
 
-Cursor exposes broad launch surfaces — editor, web, Slack, GitHub /
-Bitbucket PR comments, Linear, and an API — which is a real strength
-(see below) but they're the surfaces Cursor ships. Shelbi's surface is
-`exec`.
+Shelbi supports a local file board or [GitHub Issues](/docs/concepts/github-issues)
+as the issue tracker. Both clients offer a New task dialog with Title,
+Workflow, Status, Priority, Description, and “Let Orchestrator write this
+up”. A per-project Changelog records shipped work.
+
+Scripts can use `shelbi issue add`, `shelbi issue move`,
+`shelbi workspace list`, `shelbi events tail`, and `shelbi changelog`.
+Shelbi itself is free under the MIT license. You pay for your agent
+services and compute; that does not make task costs fixed.
 
 ## Where Cursor Background Agents excels
 
-### True close-the-laptop async
+### Managed work that continues with your laptop off
 
-This is the headline feature, and Shelbi does not match it. Cursor's
-agents run on Anysphere's cloud VMs — you start a task, shut your
-laptop, and review the PR later from your phone. A Shelbi worker on your
-hub or laptop needs that machine awake. A remote Shelbi worker on a
-home-lab box only helps if that box is on. If "I want work to keep
-running when my hardware is off" is the requirement, the cloud-hosted
-model wins.
+With Cursor-hosted agents, Cursor operates the VMs and their lifecycle.
+Your laptop can be offline. Shelbi can run work on an always-on remote
+host, but you operate that host. Cursor's self-hosted workers also need
+their own machines online.
 
-### Launch surfaces wherever work already lives
+### Web, mobile, and collaboration integrations
 
-`@cursor` in a Slack thread, a Linear comment, a GitHub or Bitbucket PR
-review, or the cursor.com/agents dashboard — all first-class triggers.
-For teams that don't want to context-switch into a terminal to delegate,
-that integration density matters and Shelbi doesn't have an equivalent.
+Cursor offers desktop and web access, an [iPhone and iPad app](https://cursor.com/docs/cloud-agent/mobile),
+and Slack, Linear, GitHub, and Bitbucket triggers. Android users can use
+the web app/PWA. These are useful entry points for teams delegating away
+from a development machine.
 
-### Rich PR artifacts out of the box
+Its October 20 [Agent SDK release](https://cursor.com/changelog/agent-sdk)
+also supports agents defined in code, evals, webhooks, and schedules,
+deployable to Cursor or your own infrastructure. Shelbi's CLI is not a
+unique automation surface.
 
-Cloud Agents can drive a remote desktop and browser, and ship
-**screenshots, videos, and logs** alongside the diff in the PR. For UI
-changes, "here is a 20-second screen capture of the new flow" is a
-materially better review signal than "the diff says it should work."
-Shelbi leaves verification to whatever you do in the review pane.
+### Visual verification and larger environments
 
-### Editor and platform polish
+Cursor agents can operate a desktop and browser and produce screenshots,
+videos, and logs. You can take control of the remote desktop to test the
+software. [Embedding artifacts in GitHub PR descriptions](https://cursor.com/docs/cloud-agent/capabilities)
+is opt-in. Shelbi's served review branches are useful, but it does not
+provide the same built-in artifact capture workflow.
 
-Cursor 2.0's Composer model is purpose-built for coding turns and
-claims ~4× generation speed for interactive work; Bugbot adds an
-automated review pass; MCP, hooks, secrets, multi-repo, SAML/SCIM, and
-audit logs are all part of the same product. If your team is already
-deep in Cursor, the integrated story is hard to beat by stitching
-external tools together.
+The October 16 [Cloud Agent update](https://cursor.com/changelog/cloud-agent-canvases-and-environments)
+added shareable interactive canvases, a beta Environments API, and support
+for environments with up to 300 repositories.
+
+### A managed product with explicit usage controls
+
+For new individual subscriptions, [Premium is $30/month](https://cursor.com/pricing)
+before tax and includes Cloud Agents. Free and Plus do not. Teams and
+Enterprise also include them. [Legacy paid plans](https://cursor.com/docs/account/pricing/legacy-cursor-plans)
+continue under their existing terms, so $20 Pro remains relevant to
+existing subscribers rather than new-plan pricing.
+
+On current plans, included usage covers Cursor models; third-party
+models are billed separately. You can set a spending cap. Check
+[Models & Pricing](https://cursor.com/docs/models-and-pricing) for your plan.
+Cloud Agents use a curated subset of models, with context size selectable
+where supported. Cursor documents a Max Mode upcharge for legacy
+request-based plans, rather than mandatory Max Mode for every current run.
 
 ## Choose Shelbi if…
 
-- You want work running in worktrees you already have on disk, not
-  cloud VMs cloned per run.
-- A read-write repo grant to a third-party cloud is a non-starter for
-  your org.
-- You want an explicit `review` column with a human signing off, not a
-  merge-ready PR landing in your inbox.
-- A fixed, predictable cost (free + your existing model bill) matters
-  more than managed infrastructure.
-- The orchestration loop being editable code in your repo — prompt and
-  all — is something you actively want.
+- You want a native Mac app or TUI for a persistent workspace pool on
+  local and SSH machines.
+- You want to choose agent CLIs and edit orchestration instructions and
+  workflows yourself.
+- You want a file or GitHub Issues board, configured review workspaces,
+  and a project Changelog in one client.
+- You prefer free orchestration software and managing your own compute
+  and agent costs.
 
 ## Choose Cursor Background Agents if…
 
-- "Close the laptop and let it run" is the core requirement.
-- Triggering work from Slack, Linear, or GitHub PR comments is part of
-  how your team already collaborates.
-- Screenshots, videos, and remote-browser verification on every PR are
-  load-bearing for your review process.
-- You're already on a paid Cursor plan and want the bundled feature
-  rather than a second tool.
-- Anysphere holding a read-write grant to your repos is a trade-off
-  your security review is comfortable with.
+- You want managed execution that keeps running while your laptop is off.
+- Web and mobile access, chat integrations, and hosted automation matter
+  to your team.
+- Built-in browser verification, artifacts, canvases, or large multi-repo
+  environments fit your work.
+- You want Cursor's service to coordinate agents, including when tools
+  execute on your own machines, and its plan and usage costs suit you.
