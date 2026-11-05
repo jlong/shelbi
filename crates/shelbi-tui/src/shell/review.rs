@@ -180,6 +180,11 @@ impl ReviewInterface {
         }
     }
 
+    /// The review slot the task is loaded on.
+    pub fn slot(&self) -> &str {
+        &self.slot
+    }
+
     pub fn task_id(&self) -> &str {
         &self.task_id
     }
@@ -388,6 +393,12 @@ impl ReviewInterface {
         }
     }
 
+    /// The panel's status line, for the shell's tests.
+    #[cfg(test)]
+    pub fn status_line(&self) -> &str {
+        &self.panel.status_line
+    }
+
     pub fn is_merging(&self) -> bool {
         self.panel.merging
     }
@@ -548,10 +559,15 @@ impl ReviewInterface {
     fn handle_panel_key(&mut self, k: KeyEvent) -> ReviewAction {
         // While the gated merge runs the review is inert to competing input:
         // the panel itself declines Approve/Reject/quit, and here we also drop
-        // view switches, Back, and the focus toggle so nothing re-enters
-        // mid-merge (AC #4). The spinner still advances on the loop tick.
+        // view switches and the focus toggle so nothing re-enters mid-merge
+        // (AC #4). Esc still leaves: a review reopened mid-merge never holds
+        // the user. The spinner still advances on the loop tick.
         if self.panel.merging {
-            return ReviewAction::None;
+            return if k.code == KeyCode::Esc {
+                ReviewAction::Back
+            } else {
+                ReviewAction::None
+            };
         }
         match k.code {
             // Tab moves focus to the content view (so the reviewer can type in
@@ -609,7 +625,9 @@ impl ReviewInterface {
         }
         if in_panel {
             if self.panel.merging {
-                return ReviewAction::None;
+                let back = matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+                    && self.panel.back_hit(m.column, m.row);
+                return if back { ReviewAction::Back } else { ReviewAction::None };
             }
             if let MouseEventKind::Down(MouseButton::Left) = m.kind {
                 return map_effect(self.panel.click(m.column, m.row));
@@ -1213,7 +1231,6 @@ mod tests {
             KeyCode::Enter,
             KeyCode::Char(' '),
             KeyCode::Char('q'),
-            KeyCode::Esc,
             KeyCode::Tab,
             KeyCode::Down,
             KeyCode::Up,
@@ -1225,7 +1242,9 @@ mod tests {
             );
         }
         // And it never quit.
-        assert!(!it.panel.should_quit, "q/Esc cannot close during a merge");
+        assert!(!it.panel.should_quit, "q cannot close during a merge");
+        // Esc leaves it loaded: the merge doesn't hold the user here.
+        assert_eq!(it.handle_key(key(KeyCode::Esc)), ReviewAction::Back);
     }
 
     #[test]

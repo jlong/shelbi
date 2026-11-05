@@ -18,7 +18,8 @@ pub mod diff_load;
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 use shelbi_state::AppTools;
 
-use crate::view::{ReviewRow, ReviewState};
+use crate::nav::View;
+use crate::view::{ReviewRow, ReviewState, WorkspaceRow};
 use crate::ReviewRole;
 
 /// The panel's status header, beside the back button (the TUI's wording).
@@ -455,10 +456,164 @@ pub fn description_effect(has_body: bool) -> PanelEffect {
     }
 }
 
+/// The view to return to from a review that has ended (decided, closed, gone),
+/// given the `view` it was opened over: that one, unless it was the review's
+/// own `slot`'s page, which would only look like the review just left, or a
+/// workspace the project no longer has. Those give way to the Orchestrator.
+pub fn ended_review_return(view: View, slot: Option<&str>, workspaces: &[WorkspaceRow]) -> View {
+    let name = match &view {
+        View::Session(name) if name != "orch" => name.as_str(),
+        _ => return view,
+    };
+    let undeclared = !workspaces.is_empty() && !workspaces.iter().any(|w| w.name == name);
+    if slot == Some(name) || undeclared {
+        View::Session("orch".into())
+    } else {
+        view
+    }
+}
+
+/// A decision on a review. The daemon carries it out (the gated merge for an
+/// approve) while the client gets on with something else: see
+/// [`ReviewDecisions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    Approve,
+    Reject,
+}
+
+impl Decision {
+    /// While it runs, on the client's progress line.
+    pub fn working(self, task: &str) -> String {
+        match self {
+            Decision::Approve => format!("Merging {task}…"),
+            Decision::Reject => format!("Rejecting {task}…"),
+        }
+    }
+
+    /// When it lands.
+    pub fn done(self, task: &str) -> String {
+        match self {
+            Decision::Approve => format!("Approved {task}."),
+            Decision::Reject => format!("Rejected {task}."),
+        }
+    }
+
+    /// Why it didn't land, on the review's own panel.
+    pub fn failed(self, error: &str) -> String {
+        match self {
+            Decision::Approve => format!("approve failed: {error}"),
+            Decision::Reject => format!("reject failed: {error}"),
+        }
+    }
+
+    /// Why it didn't land, away from the review: names the task.
+    pub fn failed_on(self, task: &str, error: &str) -> String {
+        match self {
+            Decision::Approve => format!("Couldn't approve {task}: {error}"),
+            Decision::Reject => format!("Couldn't reject {task}: {error}"),
+        }
+    }
+
+    /// The task's review row while it runs.
+    pub fn row_note(self) -> &'static str {
+        match self {
+            Decision::Approve => "Merging…",
+            Decision::Reject => "Rejecting…",
+        }
+    }
+}
+
+/// One decision the client is tracking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionNotice {
+    pub task: String,
+    pub decision: Decision,
+    /// The daemon's refusal, once it has answered with one. `None` while it
+    /// runs.
+    pub failure: Option<String>,
+}
+
+/// The review decisions a client has sent and not yet seen through. A client
+/// leaves the review the moment a decision is accepted, so what it says about
+/// the decision lives here, outside the panel: the progress line, the review
+/// row's note, and a failure that waits for the user to reopen the review
+/// (which stays loaded on its slot) or dismiss it. Oldest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReviewDecisions {
+    notices: Vec<DecisionNotice>,
+}
+
+impl ReviewDecisions {
+    /// Start `decision` on `task`, replacing a failure it left. `false` while
+    /// one is already running on `task`: a review takes one decision at a time.
+    pub fn begin(&mut self, task: &str, decision: Decision) -> bool {
+        if self.running(task).is_some() {
+            return false;
+        }
+        self.notices.retain(|n| n.task != task);
+        self.notices.push(DecisionNotice {
+            task: task.to_string(),
+            decision,
+            failure: None,
+        });
+        true
+    }
+
+    /// The decision running on `task`.
+    pub fn running(&self, task: &str) -> Option<Decision> {
+        self.notices
+            .iter()
+            .find(|n| n.task == task && n.failure.is_none())
+            .map(|n| n.decision)
+    }
+
+    /// The decision running on `task` went through. `Some` only the first time
+    /// it's told, so a client that hears it from both the board and the
+    /// daemon's reply acts once.
+    pub fn landed(&mut self, task: &str) -> Option<Decision> {
+        let decision = self.running(task)?;
+        self.notices.retain(|n| n.task != task);
+        Some(decision)
+    }
+
+    /// The decision running on `task` was refused: it stays, as a failure.
+    /// `None` when none was running.
+    pub fn failed(&mut self, task: &str, error: &str) -> Option<Decision> {
+        let notice = self.notices.iter_mut().find(|n| n.task == task && n.failure.is_none())?;
+        notice.failure = Some(error.to_string());
+        Some(notice.decision)
+    }
+
+    /// Hand over the failure `task` left, for the review's panel to show once
+    /// it's open again: the line for its status, and the notice is gone.
+    pub fn take_failure(&mut self, task: &str) -> Option<String> {
+        let index = self.notices.iter().position(|n| n.task == task && n.failure.is_some())?;
+        let notice = self.notices.remove(index);
+        notice.failure.map(|error| notice.decision.failed(&error))
+    }
+
+    /// The user has seen the failure on `task`.
+    pub fn dismiss(&mut self, task: &str) {
+        self.notices.retain(|n| n.task != task || n.failure.is_none());
+    }
+
+    /// Every decision tracked, oldest first.
+    pub fn notices(&self) -> &[DecisionNotice] {
+        &self.notices
+    }
+
+    /// The project went away; a reply still on its way finds nothing here.
+    pub fn clear(&mut self) {
+        self.notices.clear();
+    }
+}
+
 /// The panel's interactive state over a [`ReviewPanelModel`]: the rows, the
-/// selection, the active content view, and the merge gate. While a gated
-/// merge runs the whole panel is inert (the TUI's review interface drops
-/// every switch, Back and Close too, not only a second Approve).
+/// selection, the active content view, and the merge gate. A review opened
+/// again while its gated merge runs is inert (every switch, Close and a second
+/// decision are dropped, in the TUI's review interface too), except for Back,
+/// so it never holds the window.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewPanelState {
     rows: Vec<PanelRow>,
@@ -581,7 +736,7 @@ impl ReviewPanelState {
     }
 
     fn activate_index(&mut self, idx: usize, row: PanelRow) -> PanelEffect {
-        if self.merging {
+        if self.merging && row != PanelRow::Back {
             return PanelEffect::None;
         }
         self.selected = idx;
@@ -613,6 +768,7 @@ impl ReviewPanelState {
         }
         match chord.code {
             Key::Char('q') => self.request_close(),
+            Key::Esc => PanelEffect::Back,
             _ if self.merging => PanelEffect::None,
             Key::Up | Key::Char('k') => {
                 self.nav(-1);
@@ -624,7 +780,6 @@ impl ReviewPanelState {
             }
             Key::Enter | Key::Char(' ') => self.activate(),
             Key::Char('m') => description_effect(self.has_body),
-            Key::Esc => PanelEffect::Back,
             _ => PanelEffect::None,
         }
     }
@@ -1012,19 +1167,20 @@ mod tests {
         for row in [
             PanelRow::Approve,
             PanelRow::Reject,
-            PanelRow::Back,
             PanelRow::Switch(ReviewSwitch::Diff),
             PanelRow::Folder,
         ] {
             assert_eq!(p.click(row), PanelEffect::None, "{row:?} while merging");
         }
-        for code in [Key::Enter, Key::Esc, Key::Char('j'), Key::Char('m')] {
+        for code in [Key::Enter, Key::Char('j'), Key::Char('m')] {
             assert_eq!(p.handle_key(chord(code)), PanelEffect::None, "{code:?} while merging");
         }
+        assert_eq!(p.handle_key(chord(Key::Esc)), PanelEffect::Back, "Back never held");
         assert_eq!(p.selected(), before.selected());
         assert_eq!(p.active(), before.active());
         assert_eq!(p.handle_key(chord(Key::Char('q'))), PanelEffect::None);
         assert_eq!(p.status_line(), Some(MERGE_IN_PROGRESS));
+        assert_eq!(p.click(PanelRow::Back), PanelEffect::Back, "Back never held");
         p.set_merging(false);
         assert_eq!(p.click(PanelRow::Approve), PanelEffect::Approve);
     }
@@ -1262,5 +1418,93 @@ mod tests {
         );
         // Paragraphs and soft or hard breaks become single spaces.
         assert_eq!(description_text("one  \ntwo\\\nthree\n\n\nfour"), "one two three four");
+    }
+
+    // --- decisions in flight -------------------------------------------------
+
+    #[test]
+    fn an_ended_review_returns_to_a_view_that_still_makes_sense() {
+        let row = WorkspaceRow {
+            name: "dev".into(),
+            ..WorkspaceRow::default()
+        };
+        let workspaces = std::slice::from_ref(&row);
+        let session = |name: &str| View::Session(name.into());
+        let go = |view, slot| ended_review_return(view, slot, workspaces);
+        assert_eq!(go(View::Issues, Some("dev")), View::Issues);
+        assert_eq!(go(session("orch"), Some("dev")), session("orch"));
+        assert_eq!(go(session("dev"), Some("review-1")), session("dev"));
+        assert_eq!(go(session("dev"), Some("dev")), session("orch"), "its own slot's page");
+        assert_eq!(go(session("gone"), None), session("orch"), "a workspace no longer declared");
+        assert_eq!(
+            ended_review_return(session("gone"), None, &[]),
+            session("gone"),
+            "nothing read yet says nothing"
+        );
+    }
+
+    #[test]
+    fn a_review_takes_one_decision_at_a_time() {
+        let mut d = ReviewDecisions::default();
+        assert!(d.begin("a", Decision::Approve));
+        assert!(!d.begin("a", Decision::Reject), "one is running");
+        assert_eq!(d.running("a"), Some(Decision::Approve), "the first stands");
+        assert!(d.begin("b", Decision::Reject), "another review isn't held up");
+        assert_eq!(d.notices().len(), 2);
+    }
+
+    #[test]
+    fn a_decision_lands_once() {
+        let mut d = ReviewDecisions::default();
+        d.begin("a", Decision::Approve);
+        assert_eq!(d.landed("a"), Some(Decision::Approve));
+        assert_eq!(d.landed("a"), None, "the reply follows the board in saying so");
+        assert!(d.notices().is_empty());
+        assert!(d.begin("a", Decision::Approve), "free again");
+    }
+
+    #[test]
+    fn a_failure_waits_and_can_be_retried() {
+        let mut d = ReviewDecisions::default();
+        d.begin("a", Decision::Reject);
+        assert_eq!(d.failed("a", "refused"), Some(Decision::Reject));
+        assert_eq!(d.failed("a", "again"), None, "nothing is running");
+        assert_eq!(d.running("a"), None);
+        assert_eq!(d.landed("a"), None, "a failure didn't land");
+        assert_eq!(d.notices()[0].failure.as_deref(), Some("refused"));
+
+        assert!(d.begin("a", Decision::Approve), "a failure doesn't hold the review");
+        assert_eq!(d.notices().len(), 1, "and goes when it's tried again");
+        assert_eq!(d.notices()[0].failure, None);
+    }
+
+    #[test]
+    fn a_failure_moves_to_the_panel_or_is_dismissed() {
+        let mut d = ReviewDecisions::default();
+        d.begin("a", Decision::Approve);
+        assert_eq!(d.take_failure("a"), None, "still running");
+        d.dismiss("a");
+        assert_eq!(d.running("a"), Some(Decision::Approve), "dismissing leaves a running one");
+
+        d.failed("a", "refused");
+        assert_eq!(d.take_failure("a").as_deref(), Some("approve failed: refused"));
+        assert!(d.notices().is_empty());
+
+        d.begin("a", Decision::Approve);
+        d.failed("a", "refused");
+        d.dismiss("a");
+        assert!(d.notices().is_empty());
+    }
+
+    #[test]
+    fn a_decisions_wording() {
+        assert_eq!(Decision::Approve.working("t"), "Merging t…");
+        assert_eq!(Decision::Reject.working("t"), "Rejecting t…");
+        assert_eq!(Decision::Approve.done("t"), "Approved t.");
+        assert_eq!(Decision::Reject.done("t"), "Rejected t.");
+        assert_eq!(Decision::Approve.failed_on("t", "no"), "Couldn't approve t: no");
+        assert_eq!(Decision::Reject.failed_on("t", "no"), "Couldn't reject t: no");
+        assert_eq!(Decision::Approve.row_note(), "Merging…");
+        assert_eq!(Decision::Reject.row_note(), "Rejecting…");
     }
 }

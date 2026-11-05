@@ -1317,3 +1317,365 @@ fn the_task_panes_session_follows_the_screen_and_never_doubles_the_workspaces(cx
     assert!(!c.drawn("pane-session"), "the screen under the pane already shows it");
     assert_eq!(agent(&c), 1);
 }
+
+// --- a decision on the review -------------------------------------------------
+
+/// Ask for review `t-1`, as a sidebar row, the board's card and the palette's
+/// entry all do (`LoadReview`), with the window on `view`, its daemon answering
+/// each decision with `answer`.
+fn deciding_over(cx: &mut TestAppContext, view: View, answer: Result<(), &'static str>) -> Column {
+    let (ws_deps, _, _) = fake_workspace_deps();
+    let mut c = Column::open_with(cx, move |w| {
+        w.chat_deps = Some(ws_deps.sessions.clone());
+        w.client.set_view(view);
+        // The last item in review.
+        w.model.reviews.retain(|r| r.task_id == "t-1");
+        w.review_mutation = Some(Arc::new(move |_| answer.map_err(str::to_string)));
+    });
+    c.update(|w, window, cx| w.perform(HostCall::LoadReview("t-1".into()), window, cx));
+    c.h.draw();
+    c.advance(SLIDE);
+    assert!(c.drawn("review-panel"), "the review opened");
+    c
+}
+
+impl Column {
+    /// Send `call` to the window without letting its background work (the
+    /// daemon's reply) run: the merge is still in flight afterwards.
+    fn send_decision(&mut self, call: HostCall) {
+        self.on_window(|w, win, cx| w.perform(call, win, cx));
+    }
+
+    /// Run `f` on the window without letting background work run.
+    fn on_window(&mut self, f: impl FnOnce(&mut ShelbiWindow, &mut Window, &mut Context<ShelbiWindow>)) {
+        let window = self.h.window.clone();
+        self.h.cx.update(|win, cx| window.update(cx, |w, cx| f(w, win, cx)));
+    }
+
+    /// The daemon answers.
+    fn reply(&mut self) {
+        self.h.cx.run_until_parked();
+        self.h.draw();
+    }
+
+    /// The sessions closes the window has asked of the daemon, by task.
+    fn closes(&self) -> Vec<String> {
+        let ops = self.ops.ops.lock().unwrap();
+        ops.iter()
+            .filter(|(_, op)| matches!(op, shelbi_app::ReviewSessionOp::Close))
+            .map(|(task, _)| task.clone())
+            .collect()
+    }
+
+    fn status(&self) -> Option<String> {
+        self.read(|w, _| w.status.as_ref().map(|s| s.to_string()))
+    }
+
+    /// The window is off the review: the sidebar in the column, with the keys.
+    /// Reads no timers, so a decision in flight stays in flight.
+    fn assert_off_review(&mut self) {
+        assert!(self.read(|w, _| matches!(w.route, Route::View)), "the review was left");
+        // The reverse push starts on this frame and has run by the next.
+        self.draw_only();
+        self.advance_only(SLIDE);
+        assert!(self.h.cx.debug_bounds("sidebar").is_some(), "the sidebar is back");
+        assert!(self.h.cx.debug_bounds("column-review").is_none(), "the panel has gone");
+        assert_eq!(self.read(|w, _| w.client.focus()), Focus::Sidebar, "keys on the sidebar");
+    }
+
+    /// The view the window returned to, which the tap records in place of
+    /// building it.
+    fn returned_to(&self) -> Option<View> {
+        self.h.tap.borrow().iter().rev().find_map(|call| match call {
+            HostCall::ShowView(view) => Some(view.clone()),
+            _ => None,
+        })
+    }
+
+    fn decisions(&self) -> ReviewDecisions {
+        self.read(|w, _| w.decisions.clone())
+    }
+
+    fn panel_status(&self) -> Option<String> {
+        let review = self.review();
+        review.read_with(&self.h.cx, |r, _| r.panel().and_then(|p| p.status_line().map(str::to_string)))
+    }
+
+    fn panel_merging(&self) -> bool {
+        let review = self.review();
+        review.read_with(&self.h.cx, |r, _| r.panel().is_some_and(|p| p.is_merging()))
+    }
+}
+
+fn approve() -> HostCall {
+    HostCall::ApproveReview("t-1".into())
+}
+
+fn reject() -> HostCall {
+    HostCall::RejectReview("t-1".into(), "flaky".into())
+}
+
+#[gpui::test]
+fn a_decision_leaves_the_review_at_once_and_lands_later(cx: &mut TestAppContext) {
+    for (view, call, working, done) in [
+        (View::Issues, approve(), "Merging t-1…", "Approved t-1."),
+        (View::Issues, reject(), "Rejecting t-1…", "Rejected t-1."),
+        (View::Machines, approve(), "Merging t-1…", "Approved t-1."),
+        (View::Machines, reject(), "Rejecting t-1…", "Rejected t-1."),
+    ] {
+        let mut c = deciding_over(cx, view.clone(), Ok(()));
+        // The daemon hasn't answered: nothing below waits on it.
+        c.send_decision(call);
+        c.assert_off_review();
+        assert_eq!(c.returned_to(), Some(view));
+        assert!(c.h.cx.debug_bounds("decision-notice-t-1").is_some(), "a notice carries the progress");
+        let notice = c.decisions().notices()[0].clone();
+        assert_eq!(notice.decision.working("t-1"), working);
+        assert!(c.closes().is_empty(), "the sessions stay until it lands");
+
+        c.reply();
+        assert_eq!(c.status().as_deref(), Some(done));
+        assert_eq!(c.closes(), ["t-1"], "the review's sessions closed once");
+        assert!(c.h.cx.debug_bounds("decision-notice-t-1").is_none(), "the notice gave way to the flash");
+        assert!(c.decisions().notices().is_empty());
+    }
+}
+
+#[gpui::test]
+fn approving_the_last_review_returns_to_the_orchestrator_it_was_opened_over(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Session("orch".into()), Ok(()));
+    // The real return, not the tap's: it builds the chat.
+    c.update(|w, _, _| w.tap = None);
+    c.send_decision(approve());
+    assert_eq!(c.read(|w, _| w.client.view().clone()), View::Session("orch".into()));
+    assert!(c.read(|w, _| matches!(w.route, Route::View)), "left before the reply");
+    assert_eq!(c.selected(), orchestrator(), "the selection on the main area's row");
+    let chat_shown = c.read(|w, cx| w.chat.as_ref().is_some_and(|chat| chat.read(cx).is_shown()));
+    assert!(chat_shown, "the chat is back in the main area");
+    c.reply();
+    assert_eq!(c.status().as_deref(), Some("Approved t-1."));
+}
+
+#[gpui::test]
+fn rejecting_the_last_review_returns_to_the_orchestrator(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Session("orch".into()), Ok(()));
+    c.update(|w, _, _| w.tap = None);
+    c.send_decision(reject());
+    assert_eq!(c.read(|w, _| w.client.view().clone()), View::Session("orch".into()));
+    assert!(c.read(|w, _| matches!(w.route, Route::View)), "left before the reply");
+    c.reply();
+    assert_eq!(c.status().as_deref(), Some("Rejected t-1."));
+}
+
+#[gpui::test]
+fn the_board_refreshing_mid_merge_changes_nothing_off_the_review(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Issues, Ok(()));
+    c.send_decision(approve());
+
+    // A refresh with the row, then one without it: the window has left already.
+    c.on_window(|w, win, cx| w.update_review_row(win, cx));
+    c.on_window(|w, win, cx| {
+        w.model.reviews.clear();
+        w.update_review_row(win, cx)
+    });
+    c.assert_off_review();
+    assert!(c.h.cx.debug_bounds("decision-notice-t-1").is_some(), "the reply says when it landed");
+
+    c.reply();
+    assert_eq!(c.status().as_deref(), Some("Approved t-1."));
+    assert_eq!(c.closes(), ["t-1"]);
+}
+
+#[gpui::test]
+fn the_row_says_a_decision_is_running_and_the_review_takes_no_second(cx: &mut TestAppContext) {
+    let calls = Arc::new(std::sync::Mutex::new(0));
+    let mut c = deciding_over(cx, View::Issues, Ok(()));
+    let counted = calls.clone();
+    c.update(|w, _, _| {
+        w.review_mutation = Some(Arc::new(move |_| {
+            *counted.lock().unwrap() += 1;
+            Ok(())
+        }))
+    });
+    c.send_decision(approve());
+    c.assert_off_review();
+    assert!(c.h.cx.debug_bounds("sidebar-review-deciding-t-1").is_some(), "the row says so");
+
+    c.send_decision(reject());
+    c.send_decision(approve());
+    c.send_decision(HostCall::AskRejectReason("t-1".into()));
+    assert!(c.read(|w, _| w.overlay.is_none()), "no reason asked for");
+    assert_eq!(c.status().as_deref(), Some("t-1 already has a decision running."));
+
+    c.reply();
+    assert_eq!(*calls.lock().unwrap(), 1, "one decision reached the daemon");
+    assert_eq!(c.closes(), ["t-1"]);
+    assert!(c.h.cx.debug_bounds("sidebar-review-deciding-t-1").is_none(), "the note has gone");
+}
+
+#[gpui::test]
+fn a_failure_landing_later_offers_to_reopen_the_review(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Issues, Err("the merge was refused"));
+    c.send_decision(approve());
+    c.assert_off_review();
+
+    c.reply();
+    c.assert_off_review();
+    assert_eq!(c.closes(), Vec::<String>::new(), "the sessions stay: it's still loaded on its slot");
+    let notice = c.decisions().notices()[0].clone();
+    assert_eq!(notice.failure.as_deref(), Some("the merge was refused"));
+    assert_eq!(
+        notice.decision.failed_on(&notice.task, "the merge was refused"),
+        "Couldn't approve t-1: the merge was refused"
+    );
+    assert!(c.h.cx.debug_bounds("decision-notice-t-1").is_some(), "in the banner");
+    assert!(c.h.cx.debug_bounds("sidebar-review-deciding-t-1").is_none(), "the row is itself again");
+
+    // A move elsewhere keeps it: it isn't the plain banner.
+    c.on_window(|w, win, cx| w.perform(HostCall::ShowView(View::Machines), win, cx));
+    c.draw_only();
+    assert!(c.h.cx.debug_bounds("decision-notice-t-1").is_some());
+
+    // The action: the review as it was, its panel saying why, ready to try again.
+    c.h.click_selector("reopen-review-t-1");
+    c.h.cx.run_until_parked();
+    c.advance(SLIDE);
+    assert!(c.read(|w, _| matches!(w.route, Route::Review)));
+    assert!(c.drawn("review-panel"));
+    assert!(!c.panel_merging(), "the panel takes input");
+    assert_eq!(c.panel_status().as_deref(), Some("approve failed: the merge was refused"));
+    assert!(c.decisions().notices().is_empty(), "the panel has it now");
+    assert!(c.drawn("review-approve"), "the decision can be made again");
+}
+
+#[gpui::test]
+fn a_failure_can_be_dismissed(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Issues, Err("the merge was refused"));
+    c.send_decision(reject());
+    c.reply();
+    assert!(c.h.cx.debug_bounds("decision-notice-t-1").is_some());
+    c.h.click_selector("dismiss-decision-t-1");
+    c.h.cx.run_until_parked();
+    c.draw_only();
+    assert!(c.h.cx.debug_bounds("decision-notice-t-1").is_none());
+    assert!(c.decisions().notices().is_empty());
+    assert!(c.read(|w, _| matches!(w.route, Route::View)), "it doesn't open anything");
+}
+
+#[gpui::test]
+fn a_decision_from_elsewhere_leaves_the_view_alone(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Issues, Err("the merge was refused"));
+    c.back();
+    let taps = c.h.tap.borrow().len();
+    // The palette's entry: the window isn't on the review.
+    c.send_decision(approve());
+    assert_eq!(c.h.tap.borrow().len(), taps, "nothing to leave");
+    c.reply();
+    assert!(c.h.cx.debug_bounds("reopen-review-t-1").is_some());
+}
+
+/// The review opened again while the decision runs.
+fn reopened_mid_merge(c: &mut Column) {
+    c.send_decision(approve());
+    c.on_window(|w, win, cx| w.perform(HostCall::LoadReview("t-1".into()), win, cx));
+    // Its resolve runs here; the decision's reply is what it must not run.
+    c.on_window(|w, win, cx| w.open_review(info(), win, cx));
+    c.advance_only(SLIDE);
+    c.draw_only();
+    assert!(c.h.cx.debug_bounds("review-panel").is_some(), "open again");
+    assert!(c.panel_merging(), "it can't be decided on twice");
+    assert!(c.h.cx.debug_bounds("review-merging").is_some());
+}
+
+#[gpui::test]
+fn a_review_opened_mid_merge_never_holds_the_window(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Issues, Ok(()));
+    reopened_mid_merge(&mut c);
+    let review = c.review();
+    c.h.cx.update(|window, cx| review.update(cx, |r, cx| r.focus_panel(window, cx)));
+    c.h.cx.simulate_keystrokes("escape");
+    assert!(c.read(|w, _| matches!(w.route, Route::View)), "Esc leaves as ever");
+    assert_eq!(c.returned_to(), Some(View::Issues));
+}
+
+#[gpui::test]
+fn the_board_refreshing_on_a_review_opened_mid_merge_lands_the_decision(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Issues, Ok(()));
+    reopened_mid_merge(&mut c);
+
+    // Refreshes that still have the row change nothing.
+    c.on_window(|w, win, cx| w.update_review_row(win, cx));
+    assert!(c.read(|w, _| matches!(w.route, Route::Review)), "still merging");
+
+    // The move has landed: the window doesn't wait for the reply.
+    c.on_window(|w, win, cx| {
+        w.model.reviews.clear();
+        w.update_review_row(win, cx)
+    });
+    assert!(c.read(|w, _| matches!(w.route, Route::View)), "left at once");
+    assert_eq!(c.status().as_deref(), Some("Approved t-1."));
+    assert!(c.decisions().notices().is_empty());
+
+    // The reply then only confirms it.
+    c.reply();
+    assert_eq!(c.closes(), ["t-1"], "closed once");
+    assert_eq!(c.returned_to(), Some(View::Issues));
+}
+
+#[gpui::test]
+fn the_review_closing_on_a_review_opened_mid_merge_lands_the_decision(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Issues, Ok(()));
+    reopened_mid_merge(&mut c);
+    c.on_window(|w, win, cx| {
+        let event = shelbi_state::LayoutEvent::ReviewClosed {
+            workspace: "review-1".into(),
+            task: "t-1".into(),
+        };
+        w.apply_layout(event, win, cx)
+    });
+    assert!(c.read(|w, _| matches!(w.route, Route::View)), "left at once");
+    assert_eq!(c.status().as_deref(), Some("Approved t-1."));
+    c.reply();
+    assert_eq!(c.closes(), ["t-1"], "closed once");
+}
+
+#[gpui::test]
+fn a_failure_on_a_review_opened_mid_merge_stays_on_it(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Issues, Err("the merge was refused"));
+    reopened_mid_merge(&mut c);
+    c.reply();
+    assert!(c.read(|w, _| matches!(w.route, Route::Review)), "still on the review");
+    assert!(!c.panel_merging(), "the panel takes input again");
+    assert_eq!(c.panel_status().as_deref(), Some("approve failed: the merge was refused"));
+    assert!(c.decisions().notices().is_empty(), "the panel says so; no banner too");
+    assert!(c.closes().is_empty(), "the sessions stay");
+}
+
+#[gpui::test]
+fn a_decision_landing_with_another_review_up_closes_its_own_sessions(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Issues, Ok(()));
+    c.send_decision(approve());
+    let mut other = info();
+    other.task_id = "t-2".into();
+    c.on_window(|w, win, cx| w.open_review(other, win, cx));
+    c.reply();
+    assert!(c.read(|w, _| matches!(w.route, Route::Review)), "the other review stays up");
+    assert_eq!(c.read(|w, cx| w.shown_review(cx)).as_deref(), Some("t-2"));
+    assert_eq!(c.closes(), ["t-1"], "not the one on the screen");
+    assert_eq!(c.status().as_deref(), Some("Approved t-1."));
+}
+
+#[gpui::test]
+fn a_decision_never_returns_to_the_reviews_own_slot(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Session("review-1".into()), Ok(()));
+    c.send_decision(approve());
+    c.assert_off_review();
+    assert_eq!(c.returned_to(), Some(View::Session("orch".into())));
+}
+
+#[gpui::test]
+fn back_returns_to_the_slots_page_a_review_was_opened_over(cx: &mut TestAppContext) {
+    let mut c = deciding_over(cx, View::Session("review-1".into()), Ok(()));
+    c.back();
+    assert_eq!(c.returned_to(), Some(View::Session("review-1".into())), "the review is still loaded");
+}

@@ -645,10 +645,6 @@ impl ReviewView {
         }
     }
 
-    pub fn is_merging(&self) -> bool {
-        self.panel().is_some_and(ReviewPanelState::is_merging)
-    }
-
     /// A failure or note on the panel's status line.
     pub fn set_status(&mut self, line: Option<String>, cx: &mut Context<Self>) {
         if let Some(r) = self.review.as_mut() {
@@ -1729,7 +1725,7 @@ pub(crate) mod tests {
 
     #[derive(Default)]
     pub(crate) struct FakeOps {
-        ops: Mutex<Vec<(String, ReviewSessionOp)>>,
+        pub(crate) ops: Mutex<Vec<(String, ReviewSessionOp)>>,
         fail_ops: Mutex<bool>,
         opened: Mutex<Vec<String>>,
         /// Every shell op: the slot and the op.
@@ -2358,17 +2354,21 @@ pub(crate) mod tests {
         assert!(h.cx.debug_bounds("review-merging").is_some(), "the actions become a busy line");
         assert!(h.cx.debug_bounds("review-approve").is_none());
         h.click("review-switch-diff");
-        h.click("review-back");
         h.click("review-switch-browser");
         h.click("review-shell-toggle");
         h.focus_panel();
         h.key("q");
-        h.key("escape");
-        assert!(h.events().is_empty(), "no Back, Close or decision: {:?}", h.events());
+        assert!(h.events().is_empty(), "no Close or decision: {:?}", h.events());
         assert!(h.ops().is_empty(), "no view switch reached the daemon");
         assert!(h.ops.opened.lock().unwrap().is_empty());
         assert!(h.ops.shell_ops.lock().unwrap().is_empty(), "no shell either");
         assert_eq!(h.status_line().as_deref(), Some(shelbi_app::review::MERGE_IN_PROGRESS));
+
+        // Back still leaves: the merge doesn't hold the window here.
+        h.click("review-back");
+        h.key("escape");
+        assert_eq!(h.events(), vec![ReviewEvent::Back, ReviewEvent::Back]);
+        h.events.borrow_mut().clear();
 
         // The decision failed: the panel is live again.
         h.update(|v, cx| {
@@ -2519,7 +2519,7 @@ pub(crate) mod tests {
         h.update(|v, cx| v.finish(cx));
         assert_eq!(h.ops(), vec![ReviewSessionOp::Close]);
         assert!(!h.view.read_with(&h.cx, |v, _| v.is_shown()));
-        assert!(!h.view.read_with(&h.cx, |v, _| v.is_merging()));
+        assert!(!h.view.read_with(&h.cx, |v, _| v.panel().is_some_and(ReviewPanelState::is_merging)));
         assert!(h.events().is_empty(), "the window is already moving on");
     }
 }

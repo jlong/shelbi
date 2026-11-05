@@ -33,6 +33,7 @@ use gpui::{
 };
 use shelbi_app::nav::{clamp_sidebar_width, View};
 use shelbi_app::overlay::palette::ProjectEntry;
+use shelbi_app::review::{Decision, ReviewDecisions};
 use shelbi_app::view::{ReviewState, SidebarModel, SidebarRow, WorkspaceBadge};
 use shelbi_state::ZenModeState;
 
@@ -420,6 +421,8 @@ pub trait SidebarHost: 'static + Sized {
 /// never reads state.
 pub struct SidebarProps<'a> {
     pub model: &'a SidebarModel,
+    /// The review decisions running: their rows say so.
+    pub decisions: &'a ReviewDecisions,
     /// The sections the user has collapsed.
     pub collapsed: &'a BTreeSet<Section>,
     /// The sections and machine groups folding open or closed.
@@ -1503,7 +1506,8 @@ fn render_row<H: SidebarHost>(
                 .children(shortcut)
                 .into_any_element()
         }
-        SidebarRow::Review { state, .. } => {
+        SidebarRow::Review { task_id, state, .. } => {
+            let deciding = props.decisions.running(task_id).map(Decision::row_note);
             let title = div()
                 .flex_1()
                 .min_w_0()
@@ -1524,7 +1528,11 @@ fn render_row<H: SidebarHost>(
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .child(text.branch.unwrap_or_default()),
+                        .when_some(deciding, |line, note| {
+                            let selector = format!("sidebar-review-deciding-{task_id}");
+                            line.debug_selector(move || selector).text_color(theme.warning).child(note)
+                        })
+                        .when(deciding.is_none(), |line| line.child(text.branch.unwrap_or_default())),
                 );
             item(base)
                 .flex_row()
@@ -2128,6 +2136,7 @@ mod render_tests {
             render(
                 SidebarProps {
                     model: &self.model,
+                    decisions: &ReviewDecisions::default(),
                     collapsed: &collapsed,
                     folds: &SidebarFolds::default(),
                     now: Instant::now(),

@@ -471,8 +471,19 @@ fn apply_approve(
 ) -> Result<(), MutateError> {
     // The accept runs a gated merge (irreversible); recheck immediately before.
     recheck()?;
-    crate::review_ui::approve_review_task(project, id).map_err(MutateError::backend)?;
+    let cleanup = crate::review_ui::approve_review_task(project, id).map_err(MutateError::backend)?;
     sink.out(&format!("✓ {id} approved"));
+    // The merge and the move have landed: the reply goes out now, so the client
+    // that asked (a review waiting to close) isn't held up by the branch delete
+    // and the edge's `run:` commands, which talk to the network and the user's
+    // own scripts. They're best-effort either way.
+    let task = id.to_string();
+    let thread = std::thread::Builder::new()
+        .name(format!("accept-cleanup-{task}"))
+        .spawn(move || cleanup.run());
+    if let Err(e) = thread {
+        tracing::warn!(task = %id, error = %e, "couldn't start the accept's cleanup; the branch stays");
+    }
     Ok(())
 }
 
