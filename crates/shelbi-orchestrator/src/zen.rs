@@ -14306,7 +14306,7 @@ pub use shelbi_state::OwnershipGate;
 /// sorted by priority (lower number = higher priority). See module docs for
 /// the rules — and what we *don't* check.
 ///
-/// I/O: loads every task file in the project plus the events log. Returns an
+/// I/O: loads every task file in the project plus its `state.json`. Returns an
 /// empty list when the backlog is empty or every backlog task is blocked.
 pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
     // Runs on the heartbeat cadence, so it must not pay the full `state=all`
@@ -14315,7 +14315,7 @@ pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
     // `Issue::is_blocked`), so assemble the board from the two *cached* scoped
     // reads instead of the live full sweep.
     let tasks = board_from_caches(project)?;
-    let demoted = read_demoted_task_ids()?;
+    let demoted = shelbi_state::zen_demoted_task_ids(&project.name)?;
     let ownership = resolve_ownership_gate(project)?;
     Ok(mechanically_eligible_from(&tasks, &demoted, &ownership))
 }
@@ -14477,57 +14477,6 @@ fn canonical_path_token(raw: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
-}
-
-/// Read every `task=<id> todo -> backlog reason=user:*` line from the
-/// events log and collect the demoted task ids. Once a user demotes a
-/// task, Zen never re-promotes it — see the spec.
-fn read_demoted_task_ids() -> Result<std::collections::HashSet<String>> {
-    let path = shelbi_state::events_log_path()?;
-    if !path.exists() {
-        return Ok(std::collections::HashSet::new());
-    }
-    let text = std::fs::read_to_string(&path).map_err(Error::Io)?;
-    Ok(parse_demoted_task_ids(&text))
-}
-
-/// Pure scan over event-log text. Each matching line contributes one id.
-pub fn parse_demoted_task_ids(log: &str) -> std::collections::HashSet<String> {
-    let mut out = std::collections::HashSet::new();
-    for line in log.lines() {
-        if let Some(id) = parse_user_demotion_line(line) {
-            out.insert(id.to_string());
-        }
-    }
-    out
-}
-
-/// Returns the task id from a line of the form
-/// `<ts> task=<id> todo -> backlog reason=user:<rest>`, or `None` if the
-/// line is anything else (workspace events, other transitions, non-user
-/// reasons, etc.).
-fn parse_user_demotion_line(line: &str) -> Option<&str> {
-    // Cheap prefilter — most lines aren't demotions.
-    if !line.contains(" todo -> backlog ") {
-        return None;
-    }
-    if !line.contains(" reason=user:") {
-        return None;
-    }
-    let after_task = line.split(" task=").nth(1)?;
-    let id_end = after_task.find(' ')?;
-    let id = &after_task[..id_end];
-    // Re-anchor the transition + reason check to the slice *after* the id,
-    // so an unrelated " task=" elsewhere in the line can't fool us.
-    let rest = &after_task[id_end..];
-    if !rest.starts_with(" todo -> backlog ") {
-        return None;
-    }
-    let reason = rest.split(" reason=").nth(1)?;
-    if !reason.starts_with("user:") {
-        return None;
-    }
-    Some(id)
 }
 
 #[cfg(test)]
@@ -14806,29 +14755,6 @@ mod scan_tests {
         // No `.<ext>` segment after the last `/` → drop.
         let toks = extract_path_tokens("See README under crates/shelbi-core directory.");
         assert!(toks.is_empty(), "{toks:?}");
-    }
-
-    #[test]
-    fn parse_demoted_task_ids_matches_user_demotions_only() {
-        let log = "\
-2026-06-24T00:00:00+00:00 workspace=alpha none -> working
-2026-06-24T00:01:00+00:00 task=foo backlog -> todo reason=zen:auto-promote
-2026-06-24T00:02:00+00:00 task=foo todo -> backlog reason=user:cli
-2026-06-24T00:03:00+00:00 task=bar todo -> backlog reason=zen:rollback
-2026-06-24T00:04:00+00:00 task=baz todo -> in_progress reason=user:cli:start
-2026-06-24T00:05:00+00:00 task=qux todo -> backlog reason=user:tui
-";
-        let demoted = parse_demoted_task_ids(log);
-        assert!(demoted.contains("foo"));
-        assert!(demoted.contains("qux"));
-        assert!(!demoted.contains("bar"));
-        assert!(!demoted.contains("baz"));
-        assert_eq!(demoted.len(), 2);
-    }
-
-    #[test]
-    fn parse_demoted_task_ids_handles_empty_log() {
-        assert!(parse_demoted_task_ids("").is_empty());
     }
 
     #[test]

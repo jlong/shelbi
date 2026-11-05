@@ -1260,6 +1260,15 @@ fn resume(
         ) {
             eprintln!("warning: append_task_event failed: {e}");
         }
+        if let Err(e) = shelbi_state::record_zen_user_move(
+            project,
+            id,
+            &prev_column,
+            &Column::in_progress(),
+            &dispatched_reason,
+        ) {
+            eprintln!("warning: saving Zen's record of the move failed: {e}");
+        }
     }
 
     println!("✓ {id} resumed on {workspace_name} ({})", addr.label());
@@ -1463,6 +1472,9 @@ fn rm(project: &str, id: &str) -> Result<()> {
     let store = cached_issue_store(project)?;
     store.delete(id).map_err(|e| anyhow!(e))?;
     store.renumber(&column).map_err(|e| anyhow!(e))?;
+    if let Err(e) = shelbi_state::clear_zen_demotion(project, id) {
+        eprintln!("warning: clearing Zen's record of `{id}` failed: {e}");
+    }
     println!("✓ {id} deleted");
     Ok(())
 }

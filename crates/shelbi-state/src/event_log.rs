@@ -1891,7 +1891,7 @@ pub fn task_event_body(
 /// catalog can't be loaded at all, fall back to [`Column::category`] so a
 /// well-known stock move is still categorized correctly even before a project
 /// materializes its statuses file.
-fn resolve_move_categories(
+pub(crate) fn resolve_move_categories(
     project: &str,
     from: &Column,
     to: &Column,

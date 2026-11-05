@@ -76,6 +76,7 @@ pub mod tools;
 mod user_config;
 mod workflows;
 mod workspace_status;
+mod zen_demotions;
 mod zenmode;
 
 pub use migrate::{
@@ -248,6 +249,7 @@ pub use pr_template::{
     pr_template_path, scaffold_pr_template, PrTemplateOutcome, DEFAULT_PR_TEMPLATE,
     PR_TEMPLATE_FILE,
 };
+pub use zen_demotions::{clear_zen_demotion, record_zen_user_move, zen_demoted_task_ids};
 pub use zenmode::{
     read_zenmode_summary, scaffold_zenmode, zenmode_path, ZenmodeOutcome, DEFAULT_ZENMODE,
     ZENMODE_FILE,
@@ -1687,6 +1689,12 @@ pub struct State {
     /// [`crate::migration`]; `rt-cutover-delete` removes it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspace_migration: BTreeMap<String, MigrationState>,
+    /// Cards the user moved by hand from a ready status back to the backlog,
+    /// keyed by task id, with when. The Zen scan leaves these alone until the
+    /// user moves the card out of the backlog again. See
+    /// [`record_zen_user_move`]. Omitted from the file when empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub zen_demotions: BTreeMap<String, DateTime<Utc>>,
     /// Forward-compat catch-all: any `state.json` key this binary doesn't
     /// recognize (a field a newer binary added) is captured here and written
     /// back verbatim, instead of being silently dropped on the next
