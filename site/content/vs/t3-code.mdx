@@ -1,0 +1,162 @@
+---
+competitor: T3 Code
+slug: t3-code
+competitorUrl: https://t3.codes/
+researchUrl: https://github.com/pingdotgg/t3code/blob/v0.1.7/docs/README.md
+summary: An open-source control surface for coding agents, with an Electron desktop app, web and mobile clients, parallel threads, and local or remote execution using your existing provider accounts.
+---
+
+## At a glance
+
+| Dimension | Shelbi | T3 Code |
+| --------- | ------ | ------- |
+| Form factor | Terminal dashboard and native macOS app | Electron desktop app, web app, and iOS / Android clients |
+| Desktop platforms | macOS app; terminal client on macOS and Linux | macOS, Windows, Linux |
+| Agent integration | Claude Code and Codex integrations, plus configurable CLI runners | Unified interface for providers including Claude Code, Codex, OpenCode, and Antigravity |
+| Work organization | Configurable Kanban statuses, task priorities, and dependencies | Threads with pin, snooze, settle, and archive actions |
+| Parallel work | Declared pool of named workspaces with persistent worktrees | Parallel threads; new or existing worktrees |
+| Where work runs | Local machines and SSH hosts | Machines running a T3 Code server, including remote hosts |
+| Review flow | Explicit Review handoff; optional review workspaces | In-app diffs, pull request review, and merge controls |
+| License | Open source, MIT | Open source, MIT |
+| Cost | Free software; agent usage paid separately | Free software; provider usage paid separately; T3 Connect machine limits apply |
+
+Details checked November 4, 2026, against Shelbi v0.13.3 and T3 Code
+v0.1.7. T3 Code's [README](https://github.com/pingdotgg/t3code/blob/v0.1.7/README.md)
+still describes the project as early and warns readers to expect bugs.
+
+## Where Shelbi excels
+
+### A task queue with explicit ownership
+
+Shelbi separates the task from the agent session doing it. Its default
+board shows Backlog, Todo, In Progress, Review, Done, and Canceled.
+Tasks carry priorities and dependencies. The orchestrator assigns ready
+work to free workspaces, then picks up the next task when a slot becomes
+available. You can change the statuses, agent roles, and transition
+actions in a project's [workflow](/docs/configuration/workflow).
+
+T3 Code's documented work surface is a
+[thread list](https://github.com/pingdotgg/t3code/blob/v0.1.7/docs/user/thread-sidebar.md):
+start a conversation, follow its work, then snooze, settle, or archive it.
+It also tracks delegated subagents. Shelbi is a better fit when you want
+a queue whose triage, execution, and human acceptance stages remain
+visible independently of individual conversations.
+
+### Reuse named workspaces across tasks
+
+Shelbi's [workspace pool](/docs/concepts/workspaces) is declared in project
+configuration. Each named slot belongs to a machine and keeps its git
+worktree between assignments. Dispatch switches branches in that checkout.
+Build output and installed dependencies can stay there for the next task;
+the agent's conversation context is cleared when switching tasks.
+
+This makes capacity explicit: decide how many slots each host should run,
+then let the orchestrator fill them. Machine and workspace tags can route
+workflow stages to slots with the required capabilities.
+
+T3 Code can start each parallel thread in a new worktree or reuse an
+existing one. It also offers optional
+[worktree cleanup policies](https://github.com/pingdotgg/t3code/blob/v0.1.7/docs/user/project-settings.md).
+Choose Shelbi when stable worker identities and reusable checkouts suit
+your repository better than creating worktrees as threads need them.
+
+### A review handoff you can customize
+
+In Shelbi's default flow, a worker writes its task id to
+`.shelbi/shelbi-ready`. The hub advances the task to Review and frees the
+development slot for more work. Human review is a distinct stage. A
+configured [review workspace](/docs/concepts/review-workspaces) can check
+out the branch and serve the app for inspection before you approve or
+reject it.
+
+The orchestrator's project instructions are editable at
+`~/.shelbi/projects/<name>/agents/orchestrator/instructions.md`. You can
+adapt routing and handoff policy to the project. Optional
+[Zen Mode](/docs/concepts/zen-mode) adds autonomy under your configured
+policy; review workspaces retain their human gate.
+
+T3 Code has substantial review tooling of its own. Shelbi's advantage here
+is making the handoff part of the task lifecycle and workspace allocation.
+
+### Keep the agent's terminal interface
+
+Shelbi runs agents in detached PTY sessions that outlive their clients.
+Use the terminal dashboard, the native macOS app, or `shelbi attach <workspace>`
+to reach a workspace's session, including on an SSH host. This suits
+developers who want to keep using their agent CLI's own interface while
+adding a board and scheduler around it.
+
+## Where T3 Code excels
+
+### More ways to work from another device
+
+T3 Code has desktop clients for macOS, Windows, and Linux, a web client,
+and iOS and Android apps. The
+[installation guide](https://github.com/pingdotgg/t3code/blob/v0.1.7/docs/user/install.md)
+also covers running agents inside WSL. Shelbi offers a native macOS app
+and a terminal client on macOS and Linux.
+
+With [T3 Connect](https://github.com/pingdotgg/t3code/blob/v0.1.7/docs/user/remote-access.md),
+you can reach environments without configuring router forwarding.
+Direct network pairing, Tailscale, and SSH routes are alternatives.
+Both products run work on machines you control. T3 Code makes phone and
+browser access a much larger part of the experience. Its host still
+needs to stay running and reachable.
+
+### A common interface across providers
+
+T3 Code presents Claude Code, Codex, OpenCode, Antigravity, and other
+supported providers through a shared chat interface. Its author
+[describes cross-provider delegation](https://t3.gg/blog/post/what-is-a-harness),
+including a Claude Code thread spawning Codex subagents.
+
+That is a useful alternative to interacting with each CLI separately.
+Shelbi supports Claude Code, Codex, and configurable runners, but keeps
+their terminal interfaces. Choose T3 Code when a consistent conversation
+surface across providers matters more to you.
+
+### More review work inside the app
+
+T3 Code's [source control interface](https://github.com/pingdotgg/t3code/blob/v0.1.7/docs/user/source-control.md)
+covers GitHub, GitLab, Forgejo, Gitea, Bitbucket, Azure DevOps, and GitCafe.
+It can generate commit messages and PR descriptions, show turn and branch
+diffs, handle review comments, request reviewers, and merge changes.
+Its mobile app also supports PR review.
+
+Shelbi has workflow actions to push branches, open PRs, merge, and restack
+dependent work. T3 Code is attractive when you want more of the code
+host's review experience directly in the same app as the conversation.
+
+### Scheduled and webhook-driven work
+
+T3 Code supports [scheduled tasks and webhook-triggered prompts](https://github.com/pingdotgg/t3code/blob/v0.1.7/docs/user/project-settings.md#webhook-automations),
+including filters for incoming deliveries. Its
+[v0.1.7 release](https://github.com/pingdotgg/t3code/releases/tag/v0.1.7)
+adds one-time schedules. It also exposes thread control through its CLI
+and an [MCP server](https://github.com/pingdotgg/t3code/blob/v0.1.7/docs/user/outside-agents.md).
+It can participate in automated workflows as well as interactive coding.
+
+## Choose Shelbi if…
+
+- You want a prioritized task board with dependencies and explicit human
+  handoffs.
+- You want a named pool of reusable workspaces across local and SSH hosts.
+- You want to edit the scheduler's instructions and workflow policy per
+  project.
+- You prefer your agents' terminal interfaces, with a terminal dashboard
+  or native macOS client around them.
+
+## Choose T3 Code if…
+
+- You want Windows and Linux desktop support, a web client, or a phone app.
+- You want a common chat interface for several providers and cross-provider
+  delegation.
+- You want integrated PR review across several code hosts.
+- You want scheduled or webhook-triggered agent threads.
+
+Both projects are MIT licensed. T3 Code's
+[FAQ](https://github.com/pingdotgg/t3code/blob/v0.1.7/docs/user/faq.md)
+says the software is free and provider usage remains your expense. T3
+Connect is free for up to three linked machines at the time checked;
+linked paid T3 Chat plans raise that limit. Direct network access remains
+an alternative.
