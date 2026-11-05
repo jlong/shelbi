@@ -2701,6 +2701,22 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
     }
     drop(git_worktree_lock);
 
+    // Claim the worktree's PR body for this task so `open_pr` can't pick up one
+    // a previous task left behind. Resume skips this: it's the same task. A
+    // failure doesn't block the dispatch, because the old stamp stays and
+    // `open_pr` keeps refusing the file. It only costs this task its own body.
+    if let Err(e) = crate::git::claim_worktree_pr_body(&host, &worktree, spec.task_id) {
+        if let Err(log_err) = shelbi_state::append_dispatch_event(
+            &spec.project.name,
+            spec.task_id,
+            &spec.workspace.name,
+            "pr-body-claim-failed",
+            &e.to_string(),
+        ) {
+            eprintln!("shelbi: failed to record PR body claim failure in events.log: {log_err}");
+        }
+    }
+
     // The worktree is now clean and ready, but the old pane is still intact.
     // Validate the runner here so a missing `codex`/`claude` binary is an
     // actionable dispatch error rather than a pane that starts and exits
@@ -15328,6 +15344,82 @@ mod sync_worktree_freshcut_tests {
         assert_eq!(rev_parse(&wt, "HEAD"), remote_tip);
         assert_eq!(head_ref(&wt), "HEAD");
         assert_eq!(head_ref(&machine_repo), "shelbi/feat");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dispatch_keeps_pr_bodies_with_their_own_task() {
+        // End to end through `start_workspace_on_task`. The runner binary is
+        // deliberately missing, so each dispatch stops right after the claim,
+        // before any pane.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_lock::acquire();
+        let (root, machine_repo, _fresh, _stale) = stale_clone_fixture("pr-body-claim");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = dispatch_project(
+            &machine_repo,
+            "shelbi-test-missing-runner-binary",
+            Vec::new(),
+        );
+        let wt = workspace_worktree(&project.machines[0], &project.workspaces[0]);
+        let wt_str = wt.to_string_lossy().into_owned();
+        let dispatch = |task_id: &str, branch: &str| {
+            let _ = start_workspace_on_task(StartSpec {
+                project: &project,
+                workspace: &project.workspaces[0],
+                task_id,
+                branch,
+                task_body: "",
+                agent: None,
+                launch_override: None,
+            });
+        };
+        let body_for = |task_id: &str| {
+            crate::git::compose_pr_body(&Host::Local, &wt_str, task_id, "DEFAULT BODY", "/t.md")
+        };
+        let write_body = |contents: &str| {
+            std::fs::write(wt.join(crate::git::PR_BODY_WORKTREE_PATH), contents).unwrap();
+        };
+
+        // Task A's worker writes a body, and it's what A's PR uses.
+        dispatch("task-a", "shelbi/task-a");
+        write_body("BODY FOR A");
+        let a_first = body_for("task-a");
+
+        // A comes back to the same worktree (a bounce, a redispatch, a gate on
+        // the same slot): its body survives.
+        dispatch("task-a", "shelbi/task-a");
+        let a_again = body_for("task-a");
+
+        // Task B lands on the worktree: A's body is gone, B gets the default.
+        dispatch("task-b", "shelbi/task-b");
+        let b_without_body = body_for("task-b");
+        let stale_cleared = !wt.join(crate::git::PR_BODY_WORKTREE_PATH).exists();
+
+        // B's worker writes its own. A's late `open_pr` can't take B's body.
+        write_body("BODY FOR B");
+        let b_with_body = body_for("task-b");
+        let a_after_b = body_for("task-a");
+
+        match prev_home {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+
+        assert!(a_first.starts_with("BODY FOR A"), "{a_first}");
+        assert!(a_again.starts_with("BODY FOR A"), "{a_again}");
+        assert!(stale_cleared, "dispatching task-b must clear task-a's body");
+        assert!(b_without_body.starts_with("DEFAULT BODY"), "{b_without_body}");
+        assert!(b_with_body.starts_with("BODY FOR B"), "{b_with_body}");
+        assert!(a_after_b.starts_with("DEFAULT BODY"), "{a_after_b}");
 
         let _ = std::fs::remove_dir_all(&root);
     }

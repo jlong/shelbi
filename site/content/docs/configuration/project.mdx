@@ -598,6 +598,11 @@ request. If the file is absent (a worker that genuinely could not produce a
 useful description just does not write it), Shelbi falls back to a
 task-body-based PR, so a missing description never blocks the handoff.
 
+The body belongs to the task it was written for. Dispatching a different task
+onto the worktree removes the file, and a pull request only uses a body from
+the task the worktree is currently on. Sending the same task back to the
+worktree, after a bounce for example, keeps its body.
+
 ## See also
 
 - [Config modes](/docs/concepts/config-modes) — global vs. in-repo layout

@@ -74,9 +74,11 @@ Rust, pin the offending crate back (e.g. `cargo update <crate> --precise
 
 When the work is finished — before or with emitting the ready marker —
 write the pull-request body a human reviewer will read to
-`.shelbi/pr-body.md` in your worktree. The orchestrator picks that file
-up when it opens the PR; if it's absent, Shelbi falls back to a
-task-body-based PR, so this never blocks the handoff.
+`.shelbi/pr-body.md` in your worktree. That exact path is the only one
+the orchestrator reads when it opens the PR; a body saved under any other
+name is ignored. If it's absent, Shelbi falls back to a task-body-based
+PR, so this never blocks the handoff. Dispatch clears a body left by an
+earlier task, so write this one for the task in front of you.
 
 Follow the project's PR template — `~/.shelbi/projects/<name>/pr-template.md`
 for a global project, or `<repo>/.shelbi/pr-template.md` for an in-repo
