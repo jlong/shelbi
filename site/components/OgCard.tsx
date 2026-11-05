@@ -39,7 +39,7 @@ export function OgCard({ title, section }: OgCardProps) {
   // longer titles (e.g. the home-page tagline) get a smaller size to wrap
   // to a balanced 2-3 lines instead of a cramped stack.
   const titleFontSize =
-    title.length > 55 ? 44 : title.length > 40 ? 48 : 56
+    title.length > 70 ? 40 : title.length > 55 ? 44 : title.length > 40 ? 48 : 56
 
   return (
     <div

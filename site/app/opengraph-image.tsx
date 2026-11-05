@@ -4,11 +4,12 @@ import { join } from "node:path"
 import { OG_CARD_SIZE, OgCard } from "@/components/OgCard"
 
 export const alt =
-  "Shelbi: an open-source, personal agent orchestrator for the terminal"
+  "Shelbi: an open-source, personal agent orchestrator for your desktop and terminal"
 export const size = OG_CARD_SIZE
 export const contentType = "image/png"
 
-const TITLE = "An open-source, personal agent orchestrator for the terminal."
+const TITLE =
+  "An open-source, personal agent orchestrator for your desktop and terminal."
 
 export default async function Image() {
   const [geistRegular, geistSemiBold, sourceCodeProRegular] = await Promise.all([

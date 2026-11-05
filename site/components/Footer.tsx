@@ -93,7 +93,8 @@ export function Footer() {
               <Wordmark size="sm" />
             </Link>
             <p className="max-w-xs text-sm leading-relaxed text-gray-7">
-              An open-source, personal agent orchestrator for the terminal.
+              An open-source, personal agent orchestrator for your desktop and
+              terminal.
             </p>
             <Link
               href={REPO_URL}
