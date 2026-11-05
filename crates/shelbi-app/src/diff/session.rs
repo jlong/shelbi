@@ -82,6 +82,8 @@ enum Event {
 enum LoadCommand {
     Load { scope: CommitScope, generation: u64 },
     Blame { path: String, rev: Option<String> },
+    /// The watch is back on: read now, not at the next interval.
+    Resume,
 }
 
 enum StoreCommand {
@@ -111,6 +113,8 @@ pub struct DiffSession {
     unsaved: VecDeque<CommentOp>,
     /// The blame reads asked for since the last changeset.
     blame_asked: HashSet<String>,
+    /// Nobody's looking: a live watch stops reading until they are.
+    paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 }
 
@@ -132,11 +136,13 @@ impl DiffSession {
         let (store, store_rx) = mpsc::channel();
         let priority = Arc::new(AtomicUsize::new(0));
         let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let shared = Shared {
             events: events_tx,
             wake: options.wake.clone(),
             published: Arc::new(AtomicU64::new(0)),
             priority: priority.clone(),
+            paused: paused.clone(),
             stop: stop.clone(),
         };
         let watch = options.watch;
@@ -152,6 +158,7 @@ impl DiffSession {
             store_error: None,
             unsaved: VecDeque::new(),
             blame_asked: HashSet::new(),
+            paused,
             stop,
         };
         let mut session = session;
@@ -237,6 +244,16 @@ impl DiffSession {
         }
         self.after_input();
         for_client
+    }
+
+    /// Whether anyone's looking. A live workspace's watch rests while the view
+    /// is hidden, and catches up the moment it's back, publishing only if
+    /// something changed, so the place and the highlights on show stay.
+    pub fn set_visible(&mut self, visible: bool) {
+        let was_paused = self.paused.swap(!visible, Ordering::Relaxed);
+        if was_paused && visible {
+            let _ = self.load.send(LoadCommand::Resume);
+        }
     }
 
     /// Read the changeset again now.
@@ -339,6 +356,7 @@ struct Shared {
     /// The changeset published last. A highlighter for an older one stops.
     published: Arc<AtomicU64>,
     priority: Arc<AtomicUsize>,
+    paused: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
 }
 
@@ -416,9 +434,17 @@ fn run_loader(
                     shared.send(Event::Blame { path, blame });
                 }
             }
+            Ok(LoadCommand::Resume) => {
+                if watch.is_some() {
+                    next_watch = Some(Instant::now());
+                }
+            }
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(interval) = watch {
-                    if Instant::now() >= next_watch.unwrap_or_else(Instant::now) {
+                    if shared.paused.load(Ordering::Relaxed) {
+                        // Woken by Resume, or another interval from now.
+                        next_watch = Some(Instant::now() + interval);
+                    } else if Instant::now() >= next_watch.unwrap_or_else(Instant::now) {
                         let started = Instant::now();
                         read_changeset(&*backend, &scope, generation, &mut digest, &shared);
                         // An agent's reply from the CLI shows without a refresh.

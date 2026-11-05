@@ -88,6 +88,16 @@ paths on every `cargo test`.
   diff…", 15s limit, cause and retries. The desktop's Retry is a button; the
   TUI's is a clickable row and the `r` key. Selecting View Diff again retries
   in both.
+- **Shelbi's own diff view** (`ndv-desktop`, `ndv-tui`): both clients draw
+  `shelbi_app::diff::DiffState` and read keys from the `diff` keymap context,
+  with the same modes, status line and help contents. Where they collide with
+  a global, the diff wins while it has the keyboard (`DiffState::wants_key`). On
+  the desktop that's `Ctrl-p` over the window's palette chord, whose Ctrl+Space
+  and ⌘K still work. The desktop adds the mouse: a click places the cursor, a
+  chevron folds, the wheel scrolls both ways, a file row jumps and its check marks
+  viewed, palette rows and the `Commits: all ▾` button click, a click off an
+  overlay closes it. Asking for the desktop's diff hands it the keyboard, and Esc
+  with nothing held gives it back to the panel.
 - **Drag and drop** on the board: desktop only. The TUI moves and reorders
   with the same ⇧H/⇧L/⇧K/⇧J keys the desktop also has.
 - **Native menus** with `keys.yaml` key equivalents, and **system

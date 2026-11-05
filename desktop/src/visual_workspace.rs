@@ -7,6 +7,8 @@
 //! - `workspace-back-focused.png`: the same, the keyboard on Back (its
 //!   focus ring);
 //! - `workspace-shell.png`: the user shell open beside the agent;
+//! - `workspace-diff.png`: Shelbi's own diff in the left pane, split beside
+//!   the user shell in `workspace-diff-shell.png`;
 //! - `workspace-idle.png`: an idle workspace's reduced panel and placeholder;
 //! - `workspace-remote-reconnecting.png`: a remote workspace whose SSH
 //!   connection dropped, reconnecting.
@@ -37,6 +39,8 @@ use shelbi_term::Size;
 use crate::elements::terminal::session::{Connected, SessionIo};
 use crate::theme::Theme;
 use crate::views::session_view::{SessionConnector, SessionDeps};
+use crate::views::diff_view::DiffDeps;
+use crate::views::workspace::ContentView;
 use crate::views::workspace::{WorkspaceDeps, WorkspaceOps, WorkspaceView};
 use crate::theme::style::{Type, Typography};
 
@@ -115,7 +119,7 @@ impl WorkspaceOps for Ops {
                 branch: Some("main".into()),
                 worktree: "/Users/me/src/demo/.shelbi/wt/bravo".into(),
                 editor_name: "Vim".into(),
-                apps: Default::default(),
+                apps: shelbi_state::AppTools { builtin_diff: true, ..Default::default() },
                 ..WorkspaceDetailsInfo::default()
             }
         } else {
@@ -129,7 +133,7 @@ impl WorkspaceOps for Ops {
                 branch: Some("jlong/cold-start".into()),
                 worktree: "/Users/me/src/demo/.shelbi/wt/alpha".into(),
                 editor_name: "Vim".into(),
-                apps: Default::default(),
+                apps: shelbi_state::AppTools { builtin_diff: true, ..Default::default() },
             }
         })
     }
@@ -218,6 +222,7 @@ pub fn run(out: PathBuf) -> ! {
                     reconnect: ReconnectPolicy::default(),
                     clock: Rc::new(Instant::now),
                 }),
+                diff: DiffDeps::canned(crate::views::diff_view::canned::SAMPLE_PATCH, Arc::default()),
             };
             let view = cx.new(|cx| {
                 let mut v = WorkspaceView::new("demo", handle, deps, None, cx);
@@ -268,6 +273,11 @@ impl Run {
         for _ in 0..20 {
             self.cx.run_until_parked();
             std::thread::sleep(Duration::from_millis(10));
+            // The canned diff has no wake.
+            let diff = self.view().read_with(&self.cx, |v, _| v.diff_on_show().cloned());
+            if let Some(diff) = diff {
+                diff.update(&mut self.cx, |d, cx| d.poll_now(cx));
+            }
         }
         self.cx
             .update_window(self.window, |_, window, cx| window.draw(cx).clear(cx))
@@ -345,6 +355,18 @@ impl Run {
         self.expect("the shell opens beside the agent", shell);
         self.save("workspace-shell.png");
 
+        // Shelbi's own diff, beside the shell, then alone.
+        self.update(|v, _, cx| v.select_view(ContentView::Diff, cx));
+        self.settle();
+        let drawn = self.view().read_with(&self.cx, |v, _| v.diff_on_show().is_some());
+        self.expect("View Diff shows the built-in view in the left pane", drawn);
+        self.save("workspace-diff-shell.png");
+        self.update(|v, window, cx| v.toggle_shell(window, cx));
+        self.settle();
+        self.save("workspace-diff.png");
+        self.update(|v, _, cx| v.select_view(ContentView::Agent, cx));
+        self.settle();
+
         // An idle workspace.
         self.update(|v, _, cx| v.show("bravo", Some(row("bravo", "hub", false, None, WorkspaceBadge::Idle)), cx));
         self.settle();
@@ -370,8 +392,16 @@ impl Run {
         );
         let rows = self.rows();
         self.expect(
-            "a remote workspace's panel has no folder, diff or editor",
-            rows == [WsRow::Back, WsRow::More, WsRow::Switch(WsSwitch::Agent), WsRow::Shell],
+            "a remote workspace's panel is a local one's",
+            rows == [
+                WsRow::Back,
+                WsRow::More,
+                WsRow::Folder,
+                WsRow::Switch(WsSwitch::Agent),
+                WsRow::Switch(WsSwitch::Diff),
+                WsRow::Switch(WsSwitch::Editor),
+                WsRow::Shell,
+            ],
         );
         self.save("workspace-remote-reconnecting.png");
     }

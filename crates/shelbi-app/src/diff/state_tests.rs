@@ -795,3 +795,63 @@ fn rendering_only_touches_the_rows_in_view() {
     assert_eq!(d.s.visible_rows().len(), 3);
     assert_eq!(d.s.visible_rows()[2], d.row());
 }
+
+#[test]
+fn shift_tab_reads_the_same_however_a_client_reports_it() {
+    let mut d = Driver::new();
+    d.press("tab");
+    assert_eq!(d.s.filter(), HunkFilter::Additions);
+    d.s.key(KeyChord::new(Key::BackTab, Mods::SHIFT), &d.km);
+    assert_eq!(d.s.filter(), HunkFilter::All);
+}
+
+#[test]
+fn it_wants_what_it_would_act_on_and_leaves_the_rest() {
+    let mut d = Driver::new();
+    let km = keymap();
+    let chord = KeyChord::new;
+    let wants = |d: &Driver, c| d.s.wants_key(c, &km);
+    assert!(wants(&d, chord(Key::Char('j'), Mods::NONE)));
+    assert!(wants(&d, chord(Key::Char('p'), Mods::CONTROL)), "the file palette");
+    assert!(wants(&d, chord(Key::Char('g'), Mods::NONE)), "a two-key binding's first");
+    assert!(wants(&d, chord(Key::Char('3'), Mods::NONE)), "a count");
+    assert!(wants(&d, chord(Key::BackTab, Mods::SHIFT)));
+    assert!(!wants(&d, chord(Key::Char('k'), Mods::SUPER)));
+    assert!(!wants(&d, chord(Key::Char(' '), Mods::CONTROL)));
+    assert!(!wants(&d, chord(Key::Esc, Mods::NONE)), "nothing's held");
+    // Held, the next key is the state's whatever it is.
+    d.press("z");
+    assert!(wants(&d, chord(Key::Char('q'), Mods::NONE)));
+    assert!(wants(&d, chord(Key::Esc, Mods::NONE)));
+    d.press("esc");
+    // A modal mode holds the keyboard, short of the window's Cmd chords.
+    d.press("/");
+    assert!(d.s.takes_text());
+    assert!(wants(&d, chord(Key::Char('x'), Mods::NONE)));
+    assert!(!wants(&d, chord(Key::Char('1'), Mods::SUPER)));
+}
+
+#[test]
+fn a_palette_click_chooses_its_row() {
+    let mut d = Driver::new();
+    d.press("ctrl-p");
+    d.s.palette_choose(1);
+    assert_eq!(d.s.mode().label(), "NORMAL");
+    assert_eq!(d.s.current_file(), Some(1));
+}
+
+#[test]
+fn the_scope_label_names_what_is_shown() {
+    let mut d = Driver::new();
+    assert_eq!(d.s.scope_label(), "all");
+    let mut cs = (**d.s.changeset()).clone();
+    cs.scope = CommitScope::Uncommitted;
+    d.s.set_changeset(Arc::new(cs.clone()));
+    assert_eq!(d.s.scope_label(), "uncommitted");
+    cs.scope = CommitScope::Commit("abcdef1234".into());
+    d.s.set_changeset(Arc::new(cs.clone()));
+    assert_eq!(d.s.scope_label(), "abcdef1", "not in the list: the sha's start");
+    cs.scope = CommitScope::Commit("abcdef1".into());
+    d.s.set_changeset(Arc::new(cs));
+    assert_eq!(d.s.scope_label(), "abcdef1");
+}

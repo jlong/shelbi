@@ -16,6 +16,14 @@
 //! - `review-serving.png`: a serving review, the panel in the sidebar's
 //!   column beside the reviewer;
 //! - `review-diff.png`: View Diff, the daemon's diff session;
+//! - Shelbi's own diff (`diff_tool: builtin`), over a patch in memory:
+//!   `diff-unified.png`, `diff-split.png`, `diff-list-focused.png` (the file
+//!   list holding the keyboard, a file marked viewed), `diff-list-hidden.png`,
+//!   `diff-help.png`, `diff-palette-files.png`, `diff-palette-commands.png`,
+//!   `diff-palette-commits.png`, `diff-search.png`, `diff-folded.png`,
+//!   `diff-blame.png`, `diff-filter.png`, `diff-visual.png`,
+//!   `diff-comment.png` (the editor) and `diff-thread.png` (what it left).
+//!   Run with `SHELBI_VISUAL_THEME=light` for the light frames;
 //! - `review-loading.png`: a slot still loading (waiting for its health
 //!   check), no URL location yet;
 //! - `review-merging.png`: an approve in flight, the panel inert;
@@ -38,13 +46,16 @@ use gpui::{px, size, AnyWindowHandle, AppContext, Entity, VisualTestAppContext, 
 use shelbi_app::review::{ActiveView, PanelEffect, ReviewInfo, ReviewTarget};
 use shelbi_app::session::{self as app_session, ConnectFailure, ReconnectPolicy, Relauncher, RetryPolicy, SessionRef};
 use shelbi_app::view::{ReviewRow, ReviewState, SidebarModel, WorkspaceBadge, WorkspaceRow};
+use shelbi_app::diff::ViewMode;
 use shelbi_app::ReviewSessionOp;
+use shelbi_state::keymap::{Key, KeyChord, Mods};
 use shelbi_client::SessionEvent;
 use shelbi_term::Size;
 
 use crate::app::ShelbiWindow;
 use crate::elements::terminal::session::{Connected, SessionIo};
 use crate::views::column_swap::SLIDE;
+use crate::views::diff_view::{DiffDeps, DiffView};
 use crate::views::review::{ReviewDeps, ReviewOps, ReviewView};
 use crate::views::session_view::{SessionConnector, SessionDeps};
 
@@ -230,6 +241,7 @@ pub fn run(out: PathBuf) -> ! {
                     reconnect: ReconnectPolicy::default(),
                     clock: Rc::new(Instant::now),
                 }),
+                diff: DiffDeps::canned(crate::views::diff_view::canned::SAMPLE_PATCH, Arc::default()),
             };
             cx.new(|cx| ShelbiWindow::offscreen("demo", sidebar_model(), deps, Rc::new(move || clock.get()), window, cx))
         })
@@ -267,6 +279,10 @@ impl Run {
         for _ in 0..20 {
             self.cx.run_until_parked();
             std::thread::sleep(Duration::from_millis(10));
+            // The canned diff has no wake.
+            if let Some(diff) = self.diff() {
+                diff.update(&mut self.cx, |d, cx| d.poll_now(cx));
+            }
         }
         self.cx
             .update_window(self.window, |_, window, cx| window.draw(cx).clear(cx))
@@ -302,6 +318,124 @@ impl Run {
         let path = self.out.join(name);
         image.save(&path).expect("save the frame");
         println!("saved {}", path.display());
+    }
+
+    /// The built-in diff on show, if it's up.
+    fn diff(&mut self) -> Option<Entity<DiffView>> {
+        let review = self.handle.update(&mut self.cx, |w, _, _| w.offscreen_review()).ok().flatten()?;
+        review.read_with(&self.cx, |v, _| v.diff_on_show().cloned())
+    }
+
+    /// Press `keys`, space-separated, in the diff.
+    fn diff_keys(&mut self, keys: &str) {
+        let diff = self.diff().expect("the diff is up");
+        for spec in keys.split(' ') {
+            let chord = if spec == "space" {
+                KeyChord::new(Key::Char(' '), Mods::NONE)
+            } else if spec.chars().count() == 1 {
+                KeyChord::new(Key::Char(spec.chars().next().unwrap()), Mods::NONE)
+            } else {
+                KeyChord::parse(spec).expect("a chord")
+            };
+            diff.update(&mut self.cx, |d, cx| {
+                d.key(chord, cx);
+                cx.notify();
+            });
+        }
+        self.settle();
+    }
+
+    fn diff_read<R>(&mut self, f: impl FnOnce(&DiffView) -> R) -> R {
+        let diff = self.diff().expect("the diff is up");
+        diff.read_with(&self.cx, |d, _| f(d))
+    }
+
+    /// Shelbi's own diff in the Review view: every state the frames cover.
+    fn builtin_diff(&mut self) {
+        let mut builtin = info();
+        builtin.apps.builtin_diff = true;
+        self.update(|v, cx| v.show(builtin, Some(row(ReviewState::Serving)), cx));
+        self.update(|v, cx| v.apply(PanelEffect::ShowDiff, cx));
+        self.settle();
+        let files = self.diff_read(|d| d.state().changeset().files.len());
+        self.expect("View Diff opens the built-in view", files == 5);
+
+        // review.rs, its first change and the words that changed in it.
+        self.diff_keys("l ] h");
+        self.settle();
+        self.save("diff-unified.png");
+        let path = self.diff_read(|d| d.state().current_file().map(|f| d.state().changeset().files[f].path.clone()));
+        self.expect("the cursor is on review.rs", path.as_deref() == Some("crates/shelbi-app/src/review.rs"));
+
+        self.diff_keys("s");
+        let split = self.diff_read(|d| d.state().view()) == ViewMode::Split;
+        self.expect("s splits", split);
+        self.save("diff-split.png");
+        self.diff_keys("s");
+
+        self.diff_keys("m \\ \\ j");
+        let viewed = self.diff_read(|d| d.state().is_viewed(&d.state().changeset().files[1]));
+        self.expect("m marks the file viewed", viewed);
+        let list_focus = self.diff_read(DiffView::list_focus);
+        self.expect("the list holds the keyboard", list_focus);
+        self.save("diff-list-focused.png");
+        self.diff_keys("esc \\");
+        self.save("diff-list-hidden.png");
+        self.diff_keys("\\ esc g g l ] h");
+
+        self.diff_keys("?");
+        self.save("diff-help.png");
+        self.diff_keys("q");
+
+        self.diff_keys("ctrl-p");
+        self.save("diff-palette-files.png");
+        self.diff_keys("r e v");
+        self.save("diff-palette-files-typed.png");
+        self.diff_keys("esc :");
+        self.save("diff-palette-commands.png");
+        self.diff_keys("esc c");
+        self.save("diff-palette-commits.png");
+        self.diff_keys("esc");
+
+        self.diff_keys("/ s e l f enter");
+        let matches = self.diff_read(|d| d.state().match_count());
+        self.expect("the search found its matches", matches > 1);
+        self.save("diff-search.png");
+        self.diff_keys("esc");
+
+        self.diff_keys("g g");
+        self.diff_keys("z M");
+        self.diff_keys("l z o");
+        self.save("diff-folded.png");
+        self.diff_keys("z R");
+
+        self.diff_keys("g g l ] h");
+        self.diff_keys("B");
+        self.settle();
+        self.save("diff-blame.png");
+        self.diff_keys("B");
+
+        self.diff_keys("tab");
+        self.save("diff-filter.png");
+        self.diff_keys("back-tab");
+
+        self.diff_keys("v j");
+        self.save("diff-visual.png");
+        self.diff_keys("esc");
+
+        self.diff_keys("enter W h y space t h i s ?");
+        let mode = self.diff_read(|d| d.state().mode().label());
+        self.expect("Enter opens the comment editor", mode == "COMMENT");
+        self.save("diff-comment.png");
+        self.diff_keys("enter");
+        self.save("diff-thread.png");
+        let comments = self.diff_read(|d| d.state().comments().len());
+        self.expect("the comment lands", comments == 1);
+        self.diff_keys("D D");
+
+        // Back to the external path the rest of the frames show.
+        self.update(|v, cx| v.apply(PanelEffect::ShowChat, cx));
+        self.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
     }
 
     fn all(&mut self) {
@@ -399,6 +533,7 @@ impl Run {
         self.update(|v, cx| v.offscreen_diff_wait(failed, cx));
         self.save("review-diff-failed.png");
         self.update(|v, cx| v.apply(PanelEffect::ShowChat, cx));
+        self.builtin_diff();
 
         // Still loading.
         self.update(|v, cx| v.update_row(Some(row(ReviewState::Loading)), cx));

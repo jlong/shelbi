@@ -37,6 +37,10 @@
 //!   here; Close (the × on the active one) ends them, and `q` (the TUI's
 //!   Close) ends them and goes back. They run on the workspace's machine,
 //!   local or remote, as in the TUI.
+//! - **Shelbi's own diff.** With `diff_tool: builtin` (the default), View Diff
+//!   is a [`DiffView`] of the workspace's live changes in the left pane, not a
+//!   daemon session, on any machine. It re-reads while it's up and rests while
+//!   it isn't.
 //! - **The user shell.** The Shell row opens a second terminal beside the
 //!   agent, split with a draggable divider ([`super::workspace_layout`]),
 //!   attached to the workspace's user shell (`<project>/ws/<name>/shell`, a
@@ -67,12 +71,14 @@ use gpui::{
     div, prelude::*, px, AnyElement, AnyWindowHandle, Bounds, ClipboardItem, Context, Entity,
     EventEmitter, FocusHandle, Focusable, Pixels, SharedString, Subscription, Window,
 };
+use shelbi_app::diff::{DiffTarget, TargetKind};
 use shelbi_app::session::{SessionRef, WorkspaceContentRelauncher};
 use shelbi_app::view::{WorkspaceBadge, WorkspaceDetailsInfo, WorkspaceHeader, WorkspaceRow};
 use shelbi_app::workspace_panel::{WorkspacePanelState, WsEffect, WsPanelShape, WsRow};
 use shelbi_app::{ReviewRole, WorkspaceSessionOp};
 use shelbi_core::{Column, StatusCategory};
 
+use super::diff_view::{DiffDeps, DiffView, DiffViewEvent, FilePlace};
 use super::session_view::{OnDeath, SessionDeps, SessionView, SessionViewEvent};
 use super::task_panel;
 use super::workspace_layout::{render_split, ShellSplit};
@@ -173,6 +179,8 @@ pub struct WorkspaceDeps {
     pub ops: Arc<dyn WorkspaceOps>,
     /// Builds the deps of each of the view's two session panes.
     pub sessions: Rc<dyn Fn() -> SessionDeps>,
+    /// Opens Shelbi's own diff view.
+    pub diff: DiffDeps,
 }
 
 impl WorkspaceDeps {
@@ -194,6 +202,7 @@ impl WorkspaceDeps {
                     }),
                 )
             }),
+            diff: DiffDeps::live(project),
         }
     }
 }
@@ -230,6 +239,13 @@ pub struct WorkspaceView {
     focus: WsFocus,
     /// The left pane: the agent, or its diff or editor.
     content: Entity<SessionView>,
+    /// Shelbi's own diff, once View Diff was shown on this task. It keeps its
+    /// place while the agent is up, its reads resting.
+    diff: Option<(Entity<DiffView>, Subscription)>,
+    diff_deps: DiffDeps,
+    /// The keyboard moves to the left pane at the next frame: a view switch
+    /// swapped what it's in.
+    refocus: bool,
     /// The user shell beside it.
     shell: Entity<SessionView>,
     shell_open: bool,
@@ -310,6 +326,9 @@ impl WorkspaceView {
             panel: WorkspacePanelState::new(&WsPanelShape::for_workspace(false, false, true)),
             focus: WsFocus::Panel,
             content,
+            diff: None,
+            diff_deps: deps.diff,
+            refocus: false,
             shell,
             shell_open: false,
             shell_starting: false,
@@ -337,6 +356,7 @@ impl WorkspaceView {
     pub fn show(&mut self, workspace: &str, row: Option<WorkspaceRow>, cx: &mut Context<Self>) {
         if self.workspace.as_deref() != Some(workspace) {
             self.close_panes(cx);
+            self.diff = None;
             self.generation += 1;
             self.workspace = Some(workspace.to_string());
             self.details = None;
@@ -450,6 +470,9 @@ impl WorkspaceView {
         if !self.has_panel() {
             return self.content.read(cx).focus_target(cx);
         }
+        if let (Some(diff), WsFocus::Content) = (self.diff_on_show(), self.focus) {
+            return diff.read(cx).focus_handle(cx);
+        }
         if self.focus == WsFocus::Content && self.content.read(cx).pane().is_some() {
             self.content.read(cx).focus_target(cx)
         } else {
@@ -471,6 +494,17 @@ impl WorkspaceView {
         self.focus_handle.is_focused(window)
             || self.content.read(cx).contains_focus(window, cx)
             || self.shell.read(cx).contains_focus(window, cx)
+            || self.diff_with_focus(window, cx).is_some()
+    }
+
+    /// The built-in diff, while it's what the left pane shows.
+    pub fn diff_on_show(&self) -> Option<&Entity<DiffView>> {
+        (self.panel.active() == ContentView::Diff).then_some(self.diff.as_ref()).flatten().map(|(view, _)| view)
+    }
+
+    /// The built-in diff, while it has the keyboard.
+    pub fn diff_with_focus(&self, window: &Window, cx: &gpui::App) -> Option<&Entity<DiffView>> {
+        self.diff_on_show().filter(|d| d.read(cx).contains_focus(window))
     }
 
     /// The panel's navigation state.
@@ -576,6 +610,7 @@ impl WorkspaceView {
                     Err(e) => tracing::warn!(error = %e, "couldn't read the workspace's details"),
                 }
                 this.sync_panel();
+                this.sync_diff(cx);
                 cx.notify();
             })
             .ok();
@@ -626,7 +661,15 @@ impl WorkspaceView {
             }
             WsEffect::RevealFolder => self.reveal_folder(cx),
             WsEffect::ShowAgent => self.select_view(ContentView::Agent, cx),
-            WsEffect::ShowDiff => self.select_view(ContentView::Diff, cx),
+            WsEffect::ShowDiff => {
+                // Shelbi's own diff is driven from the keyboard: asking for it
+                // hands it the keys, with Esc to come back.
+                if self.builtin_diff() {
+                    self.focus = WsFocus::Content;
+                    cx.emit(WorkspaceEvent::Focused);
+                }
+                self.select_view(ContentView::Diff, cx);
+            }
             WsEffect::ShowEditor => self.select_view(ContentView::Editor, cx),
             WsEffect::OpenApp(role) => self.open_in_app(role, cx),
             // More opens the task's detail over the screen.
@@ -668,7 +711,10 @@ impl WorkspaceView {
         };
         // Tab moves to the agent's terminal once it is live (the TUI's).
         if chord.code == shelbi_state::keymap::Key::Tab && chord.mods.is_empty() {
-            if self.content.read(cx).pane().is_some() {
+            if let Some(target) = self.diff_on_show().map(|d| d.read(cx).focus_handle(cx)) {
+                self.focus = WsFocus::Content;
+                window.focus(&target, cx);
+            } else if self.content.read(cx).pane().is_some() {
                 self.focus = WsFocus::Content;
                 let target = self.content.read(cx).focus_target(cx);
                 window.focus(&target, cx);
@@ -694,6 +740,17 @@ impl WorkspaceView {
     /// the agent with the error on the status line, as the TUI does.
     pub fn select_view(&mut self, view: ContentView, cx: &mut Context<Self>) {
         self.status_line = None;
+        let had_diff = self.diff_on_show().is_some();
+        if view == ContentView::Diff && self.builtin_diff() {
+            self.panel.set_active(view);
+            self.show_builtin_diff(cx);
+            return;
+        }
+        // Off the diff with the keyboard in it: it follows to the pane.
+        self.refocus = had_diff && self.focus == WsFocus::Content;
+        if let Some((diff, _)) = &self.diff {
+            diff.update(cx, |d, _| d.set_visible(false));
+        }
         let Some(role) = view.role() else {
             self.show_agent(cx);
             return;
@@ -719,6 +776,86 @@ impl WorkspaceView {
         });
     }
 
+    /// Whether View Diff is Shelbi's own, as the settings read last.
+    fn builtin_diff(&self) -> bool {
+        self.details.as_ref().is_some_and(|d| d.apps.builtin_diff)
+    }
+
+    /// Show the built-in diff in the left pane, opening it the first time.
+    /// The pane behind it detaches; the sessions stay with the daemon.
+    fn show_builtin_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        self.content.update(cx, |c, cx| c.hide(cx));
+        self.held = None;
+        let task = self.row.as_ref().and_then(|r| r.current_task.clone());
+        let stale = self.diff.as_ref().is_some_and(|(d, _)| d.read(cx).target().task != task);
+        if stale {
+            self.diff = None;
+        }
+        if self.diff.is_none() {
+            let target = DiffTarget {
+                project: self.project.clone(),
+                workspace,
+                kind: TargetKind::Workspace,
+                task,
+            };
+            let place = self.file_place();
+            let deps = self.diff_deps.clone();
+            let view = cx.new(|cx| DiffView::new(target, place, &deps, cx));
+            let events = cx.subscribe(&view, |this, _, ev: &DiffViewEvent, cx| match ev {
+                DiffViewEvent::Focused => {
+                    this.focus = WsFocus::Content;
+                    cx.emit(WorkspaceEvent::Focused);
+                }
+                DiffViewEvent::ReleaseFocus => {
+                    this.focus = WsFocus::Panel;
+                    this.refocus = true;
+                    cx.notify();
+                }
+            });
+            self.diff = Some((view, events));
+        }
+        let focus = self.focus;
+        if let Some((diff, _)) = &self.diff {
+            diff.update(cx, |d, cx| {
+                d.set_visible(true);
+                if focus == WsFocus::Content {
+                    d.request_focus(cx);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    /// Where this workspace's files can be opened from.
+    fn file_place(&self) -> FilePlace {
+        let details = self.details.as_ref();
+        if let Some(why) = &self.diff_deps.far {
+            return FilePlace::Elsewhere(why.clone());
+        }
+        match details.and_then(|d| d.remote_address.as_ref()) {
+            Some(address) => FilePlace::Elsewhere(format!("The file is on {address}: there's no worktree here to open.")),
+            None => FilePlace::Local(details.map(|d| d.worktree.clone()).unwrap_or_default()),
+        }
+    }
+
+    /// The details changed: View Diff may mean something else now, or be about
+    /// another task.
+    fn sync_diff(&mut self, cx: &mut Context<Self>) {
+        let task = self.row.as_ref().and_then(|r| r.current_task.clone());
+        let stale = self.diff.as_ref().is_some_and(|(d, _)| d.read(cx).target().task != task);
+        let wrong_kind = self.diff.is_some() && !self.builtin_diff();
+        let was_on_show = self.diff_on_show().is_some();
+        if stale || wrong_kind {
+            self.diff = None;
+        }
+        if self.panel.active() == ContentView::Diff && (stale || wrong_kind || (self.builtin_diff() && !was_on_show)) {
+            self.select_view(ContentView::Diff, cx);
+        }
+    }
+
     /// Show the agent in the left pane (leaving the status line alone).
     fn show_agent(&mut self, cx: &mut Context<Self>) {
         self.panel.set_active(ContentView::Agent);
@@ -731,6 +868,7 @@ impl WorkspaceView {
     /// active entry; `q` also goes back, as the TUI panel's Close).
     pub fn close_content(&mut self, cx: &mut Context<Self>) {
         self.select_view(ContentView::Agent, cx);
+        self.diff = None;
         self.session_op(WorkspaceSessionOp::Close, cx, |this, result, _| {
             if let Err(e) = result {
                 this.status_line = Some(format!("couldn't close the views: {e}"));
@@ -813,6 +951,9 @@ impl WorkspaceView {
     fn close_panes(&mut self, cx: &mut Context<Self>) {
         self.close_shell(cx);
         self.content.update(cx, |c, cx| c.hide(cx));
+        if let Some((diff, _)) = &self.diff {
+            diff.update(cx, |d, _| d.set_visible(false));
+        }
     }
 
     // --- the panel's other affordances ---------------------------------------
@@ -1096,15 +1237,11 @@ impl WorkspaceView {
                 self.shell.clone().into_any_element()
             }
         });
-        render_split(
-            "ws",
-            &self.split,
-            |this: &mut Self| &mut this.split,
-            self.content.clone().into_any_element(),
-            shell,
-            theme,
-            cx,
-        )
+        let left = match self.diff_on_show() {
+            Some(diff) => diff.clone().into_any_element(),
+            None => self.content.clone().into_any_element(),
+        };
+        render_split("ws", &self.split, |this: &mut Self| &mut this.split, left, shell, theme, cx)
     }
 }
 
@@ -1257,6 +1394,10 @@ fn home_relative(path: &str) -> String {
 /// The view itself renders as the panel; the window sizes and places it.
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if std::mem::take(&mut self.refocus) {
+            let target = self.focus_target(cx);
+            window.focus(&target, cx);
+        }
         let theme = *cx.global::<Theme>();
         // The current view switch's chip slides when the main area changes.
         let chip = {
@@ -1523,6 +1664,7 @@ pub(crate) mod tests {
                 reconnect: ReconnectPolicy::default(),
                 clock: Rc::new(Instant::now),
             }),
+            diff: DiffDeps::canned(crate::views::diff_view::canned::SAMPLE_PATCH, Arc::default()),
         };
         (deps, sessions, ops)
     }
@@ -1581,6 +1723,7 @@ pub(crate) mod tests {
                         clock: Rc::new(move || now.get()),
                     }
                 }),
+                diff: DiffDeps::canned(crate::views::diff_view::canned::SAMPLE_PATCH, Arc::default()),
             }
         };
         let deps = Cell::new(Some(deps));
@@ -1962,6 +2105,83 @@ pub(crate) mod tests {
             h.view.read_with(&h.cx, |v, _| v.status_line.clone()).as_deref(),
             Some("couldn't open a shell: the daemon said no")
         );
+    }
+
+    /// `open`, its details saying View Diff is Shelbi's own.
+    fn open_builtin(cx: &mut TestAppContext) -> Harness {
+        let h = open(cx);
+        h.ops.details.lock().unwrap().as_mut().unwrap().apps.builtin_diff = true;
+        h
+    }
+
+    fn diff_up(h: &Harness) -> bool {
+        h.view.read_with(&h.cx, |v, _| v.diff_on_show().is_some())
+    }
+
+    #[gpui::test]
+    fn the_builtin_diff_replaces_the_pane_with_no_session(cx: &mut TestAppContext) {
+        let mut h = open_builtin(cx);
+        h.update(|v, cx| v.show("alpha", Some(row("alpha", Some("t-1"), WorkspaceBadge::Working, false)), cx));
+        h.draw();
+        let attached = h.sessions.attached().len();
+        h.click("ws-switch-diff");
+        h.draw();
+        assert_eq!(h.active(), ContentView::Diff);
+        assert!(diff_up(&h));
+        assert!(h.cx.debug_bounds("diff-view").is_some(), "drawn in the left pane");
+        assert!(h.ops().is_empty(), "nothing asked of the daemon");
+        assert_eq!(h.sessions.attached().len(), attached, "no diff session");
+        let target = h.view.read_with(&h.cx, |v, cx| v.diff_on_show().unwrap().read(cx).target().clone());
+        assert_eq!(target.kind, shelbi_app::diff::TargetKind::Workspace);
+        assert_eq!(target.workspace, "alpha");
+        assert_eq!(target.task.as_deref(), Some("t-1"));
+        // It takes the keys, and Esc hands them to the panel.
+        h.draw();
+        let in_diff = h.cx.update(|window, cx| h.view.read(cx).diff_with_focus(window, cx).is_some());
+        assert!(in_diff, "asking for it hands it the keyboard");
+        h.key("escape");
+        h.draw();
+        let in_panel = h.cx.update(|window, cx| h.view.read(cx).focus_handle(cx).is_focused(window));
+        assert!(in_panel);
+        // Back to the agent: its pane attaches again, and the diff keeps its place.
+        h.click("ws-switch-agent");
+        h.draw();
+        assert_eq!(h.active(), ContentView::Agent);
+        assert!(h.cx.debug_bounds("diff-view").is_none());
+        assert!(h.sessions.attached().len() > attached);
+        assert!(h.view.read_with(&h.cx, |v, _| v.diff.is_some()));
+    }
+
+    #[gpui::test]
+    fn a_new_task_gets_a_new_diff(cx: &mut TestAppContext) {
+        let mut h = open_builtin(cx);
+        h.update(|v, cx| v.show("alpha", Some(row("alpha", Some("t-1"), WorkspaceBadge::Working, false)), cx));
+        h.draw();
+        h.click("ws-switch-diff");
+        h.draw();
+        let first = h.view.read_with(&h.cx, |v, _| v.diff_on_show().unwrap().entity_id());
+        let mut details = h.ops.details.lock().unwrap().clone().unwrap();
+        details.task = Some(("t-2".into(), "Next".into()));
+        *h.ops.details.lock().unwrap() = Some(details);
+        h.update(|v, cx| v.update_row(Some(row("alpha", Some("t-2"), WorkspaceBadge::Working, false)), cx));
+        h.draw();
+        let (second, task) = h.view.read_with(&h.cx, |v, cx| {
+            let d = v.diff_on_show().expect("still showing a diff");
+            (d.entity_id(), d.read(cx).target().task.clone())
+        });
+        assert_ne!(first, second);
+        assert_eq!(task.as_deref(), Some("t-2"));
+    }
+
+    #[gpui::test]
+    fn an_external_tool_keeps_its_session(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show("alpha", Some(row("alpha", Some("t-1"), WorkspaceBadge::Working, false)), cx));
+        h.draw();
+        h.click("ws-switch-diff");
+        h.draw();
+        assert!(!diff_up(&h));
+        assert_eq!(h.ops(), [WorkspaceSessionOp::Ensure { role: ReviewRole::Diff }]);
     }
 
     #[gpui::test]

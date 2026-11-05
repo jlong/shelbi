@@ -44,6 +44,12 @@ impl Author {
     pub fn agent(name: impl Into<String>) -> Author {
         Author { name: name.into(), kind: AuthorKind::Agent }
     }
+
+    /// Whoever's at this machine: what a client's new comments are signed.
+    pub fn local() -> Author {
+        let name = std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_default();
+        Author::human(if name.is_empty() { "you".to_string() } else { name })
+    }
 }
 
 /// The lines a thread is about.

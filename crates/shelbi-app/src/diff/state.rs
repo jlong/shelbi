@@ -332,6 +332,48 @@ impl DiffState {
         self.expanded.contains(id)
     }
 
+    /// What's shown of the changes: `all`, `uncommitted`, or a commit's short
+    /// sha (`Commits: all ▾`).
+    pub fn scope_label(&self) -> String {
+        match &self.changeset.scope {
+            CommitScope::All => "all".to_string(),
+            CommitScope::Uncommitted => "uncommitted".to_string(),
+            CommitScope::Commit(sha) => self
+                .changeset
+                .commits
+                .iter()
+                .find(|c| c.sha == *sha)
+                .map_or_else(|| sha.chars().take(7).collect(), |c| c.short.clone()),
+        }
+    }
+
+    /// Whether the mode reads typed text rather than the keymap: a client
+    /// passes it the character typed, not the key pressed.
+    pub fn takes_text(&self) -> bool {
+        matches!(self.mode, Mode::Search { .. } | Mode::Find { .. } | Mode::Comment(_) | Mode::Palette(_))
+    }
+
+    /// Whether [`Self::key`] would do something with `chord`. A client gives
+    /// the diff the keys it wants ahead of its own (the umbrella's `Ctrl-p`
+    /// and `?`) and leaves the rest to whatever's behind it.
+    pub fn wants_key(&self, chord: KeyChord, keymap: &ModeKeymap<DiffAction>) -> bool {
+        let chord = normalize_key(chord);
+        match self.mode {
+            Mode::Normal | Mode::Visual { .. } => {}
+            // A modal mode holds the keyboard, short of the window's own
+            // chords (Cmd+anything), which it has no use for.
+            _ => return !chord.mods.contains(Mods::SUPER),
+        }
+        if self.pending.is_some() || self.count.is_some() {
+            return true;
+        }
+        if chord.code == Key::Esc && chord.mods == Mods::NONE {
+            return matches!(self.mode, Mode::Visual { .. }) || !self.query.is_empty();
+        }
+        let digit = matches!(chord.code, Key::Char(c) if c.is_ascii_digit() && c != '0') && chord.mods == Mods::NONE;
+        digit || keymap.is_leader(chord) || keymap.dispatch(chord).is_some()
+    }
+
     /// The status bar, in the order the wireframe has it.
     pub fn status(&self) -> String {
         let mut parts = vec![self.mode.label().to_string(), self.view.label().to_string(), self.filter.label().to_string()];
@@ -472,6 +514,12 @@ impl DiffState {
     /// A file's highlights arrived.
     pub fn set_highlights(&mut self, file: u32, highlights: Arc<FileHighlights>) {
         self.highlights.insert(file, highlights);
+    }
+
+    /// One line for the status bar, until the next key: what a client did
+    /// with an effect.
+    pub fn set_flash(&mut self, line: impl Into<String>) {
+        self.flash = Some(line.into());
     }
 
     /// `ids` were delivered to the agent.
@@ -681,6 +729,14 @@ impl DiffState {
                 }
             }
         }
+    }
+
+    /// Choose the palette's row `index`, as if it were selected and Enter
+    /// pressed (a click).
+    pub fn palette_choose(&mut self, index: usize) -> Vec<DiffEffect> {
+        let Mode::Palette(palette) = &mut self.mode else { return Vec::new() };
+        palette.selected = index;
+        self.key_palette(KeyChord::new(Key::Enter, Mods::NONE))
     }
 
     /// Read another commit's changes (`Commits: all ▾`). Comments stay, shown
@@ -1392,9 +1448,11 @@ impl DiffState {
 
 /// `Char('G')` with no Shift, or `Shift` with a symbol, reads as the keymap
 /// spells them: terminals and window systems disagree. Letters become lowercase
-/// plus Shift; a shifted symbol (`?`, `{`) is just the symbol.
+/// plus Shift; a shifted symbol (`?`, `{`) is just the symbol, and so is
+/// Shift+Tab (`back-tab`), which both clients report with Shift still held.
 pub fn normalize_key(chord: KeyChord) -> KeyChord {
     match chord.code {
+        Key::BackTab => KeyChord::new(Key::BackTab, chord.mods.without(Mods::SHIFT)),
         Key::Char(c) if c.is_ascii_uppercase() => {
             KeyChord::new(Key::Char(c.to_ascii_lowercase()), chord.mods | Mods::SHIFT)
         }

@@ -144,6 +144,7 @@ use crate::views::pane_session::MainShows;
 use crate::views::session_view::SessionDeps;
 use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::changelog::{ChangelogEvent, ChangelogView};
+use crate::views::diff_view::DiffKeys;
 use crate::views::review::{ReviewDeps, ReviewEvent, ReviewOps, ReviewView};
 use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceEvent, WorkspaceView};
@@ -2029,6 +2030,7 @@ impl ShelbiWindow {
     /// Take `keymaps` for the window's keys, its hints and the menu bar.
     fn adopt_keymaps(&mut self, keymaps: Keymaps, cx: &mut Context<Self>) {
         self.palette_chord = palette_chord(&keymaps);
+        cx.set_global(DiffKeys(Rc::new(keymaps.diff.clone())));
         self.keymaps = keymaps;
         if let Some(ws) = self.workspace.clone() {
             let chord = self.palette_chord.clone();
@@ -5196,9 +5198,24 @@ impl ShelbiWindow {
         let Some(chord) = chord_from_keystroke(&event.keystroke) else {
             return;
         };
+        // The diff's keys win while it has the keyboard (its `Ctrl-p` over the
+        // palette chord); Ctrl+Space and ⌘K still reach the window.
+        if self.diff_wants(chord, window, cx) {
+            return;
+        }
         if takes_from_terminal(&self.keymaps, chord) {
             self.on_key_down(event, window, cx);
         }
+    }
+
+    /// Whether the built-in diff has the keyboard and wants this key.
+    fn diff_wants(&self, chord: shelbi_state::keymap::KeyChord, window: &Window, cx: &App) -> bool {
+        let review = self.review.as_ref().filter(|r| r.read(cx).is_shown());
+        let workspace = self.workspace.as_ref().filter(|w| w.read(cx).is_shown());
+        review
+            .and_then(|r| r.read(cx).diff_with_focus(window, cx))
+            .or_else(|| workspace.and_then(|w| w.read(cx).diff_with_focus(window, cx)))
+            .is_some_and(|diff| diff.read(cx).wants_key(chord, cx))
     }
 
     /// Move keyboard focus to the sidebar (the `focus_sidebar` chord).
