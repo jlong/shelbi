@@ -211,7 +211,7 @@ pub use event_log::{
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
     append_limit_resume_event, append_marker_deferred_event, append_marker_skipped_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,
-    append_message_event, append_migration_event, append_project_event,
+    append_message_event, append_message_undeliverable_event, append_migration_event, append_project_event,
     append_push_event, last_pushed_tip_from_events,
     append_rebase_event, append_review_ready_event, append_review_slot_override_event,
     append_send_event, append_settings_selfheal_event, append_supervision_event,
@@ -226,7 +226,7 @@ pub use event_log::{
     message_delivery_status, read_event_log_from, read_event_log_from_deadline,
     read_or_initialize_event_cursor, read_or_initialize_event_cursor_deadline, recent_dispatch_active,
     release_event_follower, task_event_body, write_event_cursor,
-    EventEnvelope, EventKind, EventLogRead, FeedRead, HandoffCause, MessageDelivery, ReviewReadyEvent, ZenHeartbeatCue, ACTIONS_SKIPPED_MARKER, DAEMON_ACK,
+    EventEnvelope, EventKind, EventLogRead, FeedRead, HandoffCause, MessageDelivery, UndeliverableReason, ReviewReadyEvent, ZenHeartbeatCue, ACTIONS_SKIPPED_MARKER, DAEMON_ACK,
     EXTERNAL_ISSUE_COMMENT_CAUSE, EXTERNAL_ISSUE_RECONCILE_CAUSE,
     GITHUB_MERGE_RECONCILE_CAUSE, ISSUE_ADOPTION_CAUSE, ORCH_EVENT_CALLBACK_SOCK_ENV,
     READY_MARKER_HANDOFF_ALIASES, READY_MARKER_HANDOFF_CAUSE,
@@ -307,7 +307,7 @@ pub const DEFAULT_WORKSPACE_SETTINGS_TEMPLATE: &str =
     include_str!("default_workspace_settings.json.template");
 
 /// Workspace settings the **review** agent scaffolds: the same pane-state /
-/// message-tail hooks as [`DEFAULT_WORKSPACE_SETTINGS_TEMPLATE`], plus a
+/// message hooks as [`DEFAULT_WORKSPACE_SETTINGS_TEMPLATE`], plus a
 /// `permissions.deny` block on `Edit`/`Write`/`NotebookEdit`.
 ///
 /// The review agent loads, builds, and serves a finished branch for a human to

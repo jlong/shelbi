@@ -2350,15 +2350,17 @@ pub fn system_row(
             )
         }
         SystemKind::Message => {
-            let verb = if sys.detail.as_deref() == Some("ack") {
-                "ack"
+            let (verb, tone) = if sys.status.as_deref() == Some("undeliverable") {
+                ("undeliverable", Tone::Yellow)
+            } else if sys.detail.as_deref() == Some("ack") {
+                ("ack", Tone::Blue)
             } else {
-                "delivered"
+                ("delivered", Tone::Blue)
             };
             (
                 system_chip("message"),
                 verb,
-                Tone::Blue,
+                tone,
                 title_of(sys.target.as_deref()),
             )
         }
@@ -2914,6 +2916,24 @@ mod tests {
             f.toggle_kind(*kind);
         }
         f
+    }
+
+    /// A refused message reads as a failure in the feed, not as one more ack.
+    #[test]
+    fn undeliverable_message_row_says_so() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 5, 12, 0, 0).unwrap();
+        let row_of = |rest: &str| {
+            let Event::System(sys) = parse_event_line(&format!("2026-11-05T11:00:00Z {rest}"))
+            else {
+                panic!("not a system event: {rest}");
+            };
+            system_row(&sys, &no_cache(), now, 1)
+        };
+        let refused = row_of("message=m-1 task=t ack=undeliverable reason=no_session");
+        assert_eq!(refused.verb, "undeliverable");
+        assert_eq!(refused.verb_tone, Tone::Yellow);
+        assert_eq!(row_of("message=m-1 task=t ack=worker").verb, "ack");
+        assert_eq!(row_of("message=m-1 task=t push=ok").verb, "delivered");
     }
 
     #[test]

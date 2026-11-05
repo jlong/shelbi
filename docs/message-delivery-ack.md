@@ -17,19 +17,39 @@ wrong 100% of the time.
 
 ## How the channel is wired
 
-1. `shelbi message` appends one JSON line to the per-task log and writes
-   `push=ok` to `events.log`. It also sends a best-effort `message-pushed` to
-   the hub daemon, which arms an in-memory timer.
-2. The worker's `SessionStart` hook (`.shelbi/hooks/session-start.sh`) starts
-   `tail -f -n 0 <task>.log > <task>.unread.log`. The tail only appends new
-   lines to `unread.log`; it never acks.
-3. The worker's `Stop` hook (`.shelbi/hooks/stop.sh`) fires at the end of a
-   turn. If `unread.log` is non-empty it drains it into the agent's context as
-   a `<system-reminder>` and sends one `message-ack` per `msg_id` to the hub.
-4. The daemon writes `ack=worker` when that ack arrives, or `ack=timeout` if
-   its timer (default 60s) elapses first.
+1. `shelbi message` checks that something will read the message: the task isn't
+   `done` and its worker session is alive. If not, it appends
+   `ack=undeliverable reason=done|no_session` to `events.log` and fails. Nothing
+   else happens: the message isn't written, no timer is armed, and the question
+   it answers stays open.
+2. Otherwise it appends one JSON line to the per-task log and writes `push=ok` to
+   `events.log`. It also sends a best-effort `message-pushed` to the hub daemon,
+   which arms an in-memory timer.
+3. The worker's `SessionStart` hook (`.shelbi/hooks/session-start.sh`) leaves two
+   files in `.shelbi/messages/` and starts nothing in the background:
+   - `<task>.cursor` is the 1-indexed number of the next unread line, the same
+     format the polling contract uses. It is seeded at the log's end only when
+     missing, so a resume, clear or compact keeps its place.
+   - `<task>.session` is the session's pid and start time. A reused pid has a
+     different start time, so a beacon left by a dead session reads as dead and
+     needs no cleanup.
+4. The worker's `Stop` hook (`.shelbi/hooks/stop.sh`) fires at the end of a turn.
+   It reads the complete lines past the cursor, injects them into the agent's
+   context as a `<system-reminder>`, sends one `message-ack` per `msg_id` to the
+   hub, then advances the cursor atomically. A hook killed before the advance
+   delivers the batch again rather than losing it.
+5. The daemon writes `ack=worker` when that ack arrives, or `ack=timeout` if its
+   timer (default 60s) elapses first.
+
+A polling runner (Codex and anything else without verified hooks) has no hooks to
+write a beacon, so dispatch writes `polling` to `<task>.session` and the CLI goes
+by whether the workspace's pane is alive. The agent reads the log and advances the
+same cursor itself, as its prompt instructs.
 
 ## Root cause
+
+This section records the original finding. A later fault in the same channel is
+under "Messages lost after the first drain" below.
 
 Two compounding faults, both on the worker side of step 3:
 
@@ -79,12 +99,23 @@ than pretending the push is the delivery.
   (exit 0) or the window elapses (exit non-zero). A mid-wait `ack=timeout` is
   not treated as terminal, since a late `ack=worker` still upgrades it.
 - `shelbi message status <msg-id>` reports `delivered` / `queued` /
-  `unconfirmed` / unknown from the durable events stream, exiting 0 only when
+  `unconfirmed` / `undeliverable` / unknown from the durable events stream, exiting 0 only when
   the worker acked.
-- A message to a `done` task is reported `UNDELIVERABLE` (the workspace has
-  moved to a different task and will not read this task's log again) rather than
-  claiming a future `SessionStart` pickup. No live tail is reported as queued
-  but not delivered.
+- A message to a `done` task or with no live worker session is reported
+  `UNDELIVERABLE`, recorded as `ack=undeliverable`, and not written to the log.
+
+### Messages lost after the first drain
+
+`SessionStart` used to run `tail -f <task>.log > <task>.unread.log`, and `Stop`
+drained by renaming `unread.log` away, creating a new one and deleting the old
+one. The tail's stdout stayed bound to the original file, so from the first drain
+on it wrote into a deleted file. Its pid was still alive, so the CLI reported
+`queued` and the message ended in `ack=timeout`. The cursor removes the relay, the
+tail, its watchdog and the dispatch sweep that cleaned up after them.
+
+Sessions already running when this shipped keep their old hooks until their next
+dispatch. They have no beacon, so the CLI's probe counts a live `tail.d` pid as a
+live session for them.
 
 ## Delivery states
 
@@ -92,5 +123,5 @@ than pretending the push is the delivery.
 | --- | --- | --- |
 | delivered | `ack=worker` seen — the worker read it into context | 0 |
 | queued | `push=ok`, no ack yet — durable, unconfirmed | non-zero |
-| unconfirmed | `ack=timeout` and no `ack=worker` — window elapsed, may still land | non-zero |
-| undeliverable | task `done`, or no live reader | non-zero |
+| unconfirmed | `ack=timeout` and no `ack=worker`: window elapsed, may still land at the next turn end, including after a resume | non-zero |
+| undeliverable | `ack=undeliverable`: refused at send time because the task was `done` or no worker session was alive; never written to the log | non-zero |

@@ -4,64 +4,36 @@ exec
 #!/bin/sh
 mkdir -p .shelbi/messages
 if [ -z "${TASK_ID:-}" ]; then
-  printf '%s no TASK_ID in env; message-tail not started (sidebar-click pane, or dispatch env leak)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .shelbi/messages/.no-task-id.log
+  printf '%s no TASK_ID in env; message channel not started (sidebar-click pane, or dispatch env leak)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .shelbi/messages/.no-task-id.log
   echo 'shelbi: SessionStart hook: TASK_ID unset; message channel disabled for this session' >&2
   exit 0
 fi
-LOCKDIR=.shelbi/messages/$TASK_ID.tail.d
 LOG=.shelbi/messages/$TASK_ID.log
-# A pid file can outlive its tail and the OS may have reused the pid, so only
-# ever signal a pid whose command line is still this task's tail (either form:
-# `-n 0` is what hooks started before the relay pinned its start offset).
-is_task_tail() {
-  case "$1" in ''|*[!0-9]*|0|1) return 1 ;; esac
-  case "$(ps -ww -o command= -p "$1" 2>/dev/null)" in
-    "tail -f -c +"[0-9]*" $LOG"|*/"tail -f -c +"[0-9]*" $LOG") return 0 ;;
-    "tail -f -n 0 $LOG"|*/"tail -f -n 0 $LOG") return 0 ;;
-  esac
-  return 1
-}
-if [ -f "$LOCKDIR/pid" ]; then
-  OLD_PID=$(cat "$LOCKDIR/pid" 2>/dev/null)
-  if is_task_tail "$OLD_PID"; then kill "$OLD_PID" 2>/dev/null || true; fi
-  rm -rf "$LOCKDIR"
-fi
-mkdir -p "$LOCKDIR"
+CURSOR=.shelbi/messages/$TASK_ID.cursor
+BEACON=.shelbi/messages/$TASK_ID.session
 touch "$LOG"
-# Relay from the log's end as of now, not wherever it is once `tail` gets
-# around to opening the file: on a loaded machine that can be after this hook
-# returns, and a message appended in between would never be relayed.
-START=$(($(wc -c < "$LOG") + 1))
-tail -f -c +$START "$LOG" > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null </dev/null &
-TAIL_PID=$!
-echo "$TAIL_PID" > "$LOCKDIR/pid"
-# Watchdog: the tail must not outlive the agent session that started it.
-# The session is the first non-shell ancestor (the hook runner may wrap this
-# script in `sh -c`). Every 2s it checks that the session and the tail are alive
-# and the lock still names this tail (a newer session for the task, or
-# Shelbi's dispatch sweep, takes over by replacing or removing it). On exit it
-# stops the tail and removes the lock it still owns. Without `ps` neither the
-# ancestry nor the tail can be verified, so no watchdog runs.
-command -v ps >/dev/null 2>&1 || exit 0
-SESSION_PID=$PPID
-while :; do
-  case "$(ps -o comm= -p "$SESSION_PID" 2>/dev/null)" in
-    sh|bash|dash|zsh|ksh|*/sh|*/bash|*/dash|*/zsh|*/ksh|-*) ;;
-    *) break ;;
-  esac
-  UP=$(ps -o ppid= -p "$SESSION_PID" 2>/dev/null | tr -d ' ')
-  case "$UP" in ''|*[!0-9]*|0|1) break ;; esac
-  SESSION_PID=$UP
-done
-owns_lock() { read -r CUR 2>/dev/null < "$LOCKDIR/pid" && [ "$CUR" = "$TAIL_PID" ]; }
-(
-  trap '' HUP
-  while kill -0 "$SESSION_PID" 2>/dev/null && kill -0 "$TAIL_PID" 2>/dev/null && owns_lock; do
-    sleep 2
+case "$(cat "$CURSOR" 2>/dev/null)" in
+  ''|*[!0-9]*|0)
+    echo $(($(wc -l < "$LOG") + 1)) > "$CURSOR.tmp" && mv "$CURSOR.tmp" "$CURSOR" ;;
+esac
+SESSION=unverified
+if command -v ps >/dev/null 2>&1; then
+  SESSION_PID=$PPID
+  while :; do
+    case "$(ps -o comm= -p "$SESSION_PID" 2>/dev/null)" in
+      sh|bash|dash|zsh|ksh|*/sh|*/bash|*/dash|*/zsh|*/ksh|-*) ;;
+      *) break ;;
+    esac
+    UP=$(ps -o ppid= -p "$SESSION_PID" 2>/dev/null | tr -d ' ')
+    case "$UP" in ''|*[!0-9]*|0|1) break ;; esac
+    SESSION_PID=$UP
   done
-  if is_task_tail "$TAIL_PID"; then kill "$TAIL_PID" 2>/dev/null; fi
-  if owns_lock; then rm -rf "$LOCKDIR"; fi
-) </dev/null >/dev/null 2>&1 &
+  # Fixed locale and zone: `shelbi message` reads this back from another shell,
+  # possibly over SSH. Unquoted to fold the padding `ps` puts in the date.
+  STARTED=$(echo $(LC_ALL=C TZ=UTC ps -o lstart= -p "$SESSION_PID" 2>/dev/null))
+  [ -n "$STARTED" ] && SESSION="$SESSION_PID $STARTED"
+fi
+echo "$SESSION" > "$BEACON.tmp" && mv "$BEACON.tmp" "$BEACON"
 
 ========
 .shelbi/hooks/stop.sh
@@ -69,13 +41,20 @@ exec
 ----
 #!/bin/sh
 [ -n "${TASK_ID:-}" ] || exit 0
-UNREAD=.shelbi/messages/$TASK_ID.unread.log
-PROC=$UNREAD.processing
-[ -s "$UNREAD" ] || exit 0
-mv "$UNREAD" "$PROC"
-touch "$UNREAD"
+LOG=.shelbi/messages/$TASK_ID.log
+CURSOR=.shelbi/messages/$TASK_ID.cursor
+[ -f "$LOG" ] || exit 0
+TOTAL=$(($(wc -l < "$LOG")))
+set_cursor() { echo "$1" > "$CURSOR.tmp" && mv "$CURSOR.tmp" "$CURSOR"; }
+NEXT=$(cat "$CURSOR" 2>/dev/null)
+case "$NEXT" in
+  ''|*[!0-9]*|0) set_cursor $((TOTAL + 1)); exit 0 ;;
+esac
+[ "$NEXT" -le $((TOTAL + 1)) ] || NEXT=1
+[ "$NEXT" -le "$TOTAL" ] || exit 0
+BATCH=$(tail -n +"$NEXT" "$LOG" | head -n $((TOTAL - NEXT + 1)))
 echo "<system-reminder>New orchestrator messages:"
-cat "$PROC"
+printf '%s\n' "$BATCH"
 echo "</system-reminder>"
 HUB_ADDR="${SHELBI_HUB_ADDR:-${SHELBI_HUB_SOCK:+unix:$SHELBI_HUB_SOCK}}"
 # The ack peer must half-close its write side after sending so the hub reader
@@ -118,13 +97,13 @@ except Exception:
   fi
 }
 if [ -n "$HUB_ADDR" ]; then
-  sed -n 's/.*"msg_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PROC" | while IFS= read -r MSG_ID; do
+  printf '%s\n' "$BATCH" | sed -n 's/.*"msg_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | while IFS= read -r MSG_ID; do
     [ -n "$MSG_ID" ] || continue
     ACK=$(printf '{"verb":"message-ack","project":"%s","task_id":"%s","msg_id":"%s"}\n' "$PROJECT" "$TASK_ID" "$MSG_ID")
     shelbi_ack_send "$ACK"
   done
 fi
-rm "$PROC"
+set_cursor $((TOTAL + 1))
 
 ========
 .shelbi/hooks/pane-idle.sh
