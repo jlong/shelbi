@@ -156,6 +156,11 @@ pub fn handle_kanban_mouse(app: &mut KanbanApp, mouse: MouseEvent) {
         match mouse.kind {
             MouseEventKind::ScrollUp => app.popover_scroll_up(),
             MouseEventKind::ScrollDown => app.popover_scroll_down(),
+            MouseEventKind::Down(MouseButton::Left)
+                if app.popover_pr_row_at(mouse.column, mouse.row) =>
+            {
+                app.open_popover_pr();
+            }
             _ => {}
         }
         return;
@@ -235,6 +240,9 @@ pub fn handle_popover_key(app: &mut KanbanApp, key: KeyEvent, km: &Keymaps) {
                 app.close_popover();
             }
         }
+        // Stays open: the browser takes over, and the sheet is still here on
+        // the way back. A card with no PR says so (the hint is suppressed).
+        Some(PopoverAction::OpenPr) => app.open_popover_pr(),
         None => {}
     }
 }
@@ -336,6 +344,7 @@ mod tests {
                 assigned_to: None,
                 workflow: None,
                 branch: None,
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,
@@ -512,12 +521,63 @@ mod tests {
         assert!(app.popover_is_open());
     }
 
+    fn app_with_pr_card(pr: Option<shelbi_core::IssuePr>) -> KanbanApp {
+        let mut app = KanbanApp::new("demo");
+        let tf: IssueFile = shelbi_state::parse_task_file(
+            "---\nid: task-1\ntitle: T\ncolumn: review\npriority: 0\n\
+             created_at: 2026-10-01T10:00:00Z\nupdated_at: 2026-10-01T10:00:00Z\n---\nbody\n",
+        )
+        .unwrap();
+        let mut tf = tf;
+        tf.task.pr = pr;
+        app.tasks = vec![tf];
+        app.popover = Some(TaskPopover {
+            task_id: "task-1".into(),
+            scroll: 0,
+            pr_row: Some(Rect { x: 2, y: 6, width: 40, height: 1 }),
+        });
+        app
+    }
+
+    #[test]
+    fn p_asks_to_open_the_popover_tasks_pr_and_the_sheet_stays() {
+        let url = "https://github.com/o/r/pull/2137";
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let km = fresh_keymaps();
+        let mut app = app_with_pr_card(Some(shelbi_core::IssuePr::new(2137, Some(url.into()))));
+        handle_popover_key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &km);
+        assert_eq!(app.take_open_url().as_deref(), Some(url));
+        assert_eq!(app.take_open_url(), None, "asked once");
+        assert!(app.popover_is_open());
+    }
+
+    #[test]
+    fn p_on_a_card_with_no_pr_says_so() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let km = fresh_keymaps();
+        let mut app = app_with_pr_card(None);
+        handle_popover_key(&mut app, KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &km);
+        assert_eq!(app.take_open_url(), None);
+        assert_eq!(app.status_line, "this card has no pull request to open");
+    }
+
+    #[test]
+    fn a_click_on_the_pr_row_opens_it_and_one_elsewhere_does_not() {
+        let url = "https://github.com/o/r/pull/2137";
+        let mut app = app_with_pr_card(Some(shelbi_core::IssuePr::new(2137, Some(url.into()))));
+        handle_kanban_mouse(&mut app, left_click(10, 9));
+        assert_eq!(app.take_open_url(), None);
+        handle_kanban_mouse(&mut app, left_click(10, 6));
+        assert_eq!(app.take_open_url().as_deref(), Some(url));
+    }
+
     #[test]
     fn wheel_scrolls_open_popover_and_clamps_at_top() {
         let mut app = KanbanApp::new("demo");
         app.popover = Some(TaskPopover {
             task_id: "task-1".into(),
             scroll: 0,
+            pr_row: None,
         });
 
         handle_kanban_mouse(&mut app, wheel(MouseEventKind::ScrollDown));
@@ -553,6 +613,7 @@ mod tests {
         app.popover = Some(TaskPopover {
             task_id: "task-1".into(),
             scroll: 3,
+            pr_row: None,
         });
 
         handle_kanban_mouse(&mut app, left_click(5, 2));
@@ -643,6 +704,7 @@ mod tests {
         app.popover = Some(TaskPopover {
             task_id: "task-1".into(),
             scroll: 0,
+            pr_row: None,
         });
         assert!(app.popover_is_open());
 

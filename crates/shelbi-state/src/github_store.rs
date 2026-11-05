@@ -102,7 +102,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use shelbi_core::{
-    Column, Error, IssueLaunchConfig, IssueZenConfig, Result, DEFAULT_WORKFLOW_NAME,
+    Column, Error, IssueLaunchConfig, IssuePr, IssueZenConfig, Result, DEFAULT_WORKFLOW_NAME,
 };
 
 use crate::issue_store::{BoardRead, Cursor, IssueChange, IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove};
@@ -1237,6 +1237,7 @@ impl IssueStore for GitHubStore {
             assigned_to: None,
             workflow: spec.workflow,
             branch: spec.branch,
+            pr: spec.pr,
             depends_on: spec.depends_on,
             prefers_machine: spec.prefers_machine,
             zen: spec.zen,
@@ -1491,6 +1492,7 @@ impl IssueStore for GitHubStore {
             && fields.title.is_none()
             && fields.workflow.is_none()
             && fields.body.is_none()
+            && fields.pr.is_none()
         {
             // `assigned_to` was the only field — the overlay write above is the
             // whole operation; nothing to PATCH on the remote. But the published
@@ -1531,6 +1533,12 @@ impl IssueStore for GitHubStore {
         if let Some(workflow) = fields.workflow {
             if meta.workflow != workflow {
                 meta.workflow = workflow;
+                body_changed = true;
+            }
+        }
+        if let Some(pr) = fields.pr {
+            if meta.pr != pr {
+                meta.pr = pr;
                 body_changed = true;
             }
         }
@@ -4892,6 +4900,7 @@ impl GhIssue {
             assigned_to: None,
             workflow: meta.workflow,
             branch: meta.branch,
+            pr: meta.pr,
             depends_on: meta.depends_on,
             prefers_machine: meta.prefers_machine,
             zen: meta.zen,
@@ -5104,6 +5113,7 @@ fn meta_from_new(spec: &NewIssue, priority: u32) -> ShelbiMeta {
         id: None,
         workflow: spec.workflow.clone(),
         branch: spec.branch.clone(),
+        pr: spec.pr.clone(),
         depends_on: spec.depends_on.clone(),
         prefers_machine: spec.prefers_machine.clone(),
         priority: Some(priority),
@@ -5161,6 +5171,18 @@ struct ShelbiMeta {
     workflow: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
+    /// The issue's pull-request record: number and URL, written once by
+    /// `open_pr` ([`Issue::pr`]). The metadata block rather than GitHub's own
+    /// PR link: a link exists only for a PR that says `Closes #n`, which would
+    /// also close the issue on merge, behind the workflow's back. Parsed
+    /// tolerantly like the frontmatter's: a hand-edited value must not turn the
+    /// whole block "malformed", which refuses every write to the issue.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "shelbi_core::deserialize_issue_pr"
+    )]
+    pr: Option<IssuePr>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     depends_on: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -7251,6 +7273,49 @@ mod tests {
         assert!(patch.contains("branch: jlong/t"));
         // Human prose is preserved around the block.
         assert!(patch.contains("Prose stays."));
+    }
+
+    #[test]
+    fn set_fields_records_a_pr_in_the_meta_block_and_a_read_returns_it() {
+        let _home = HomeGuard::new("set-fields-pr");
+        let issue = r#"{"number":7,"title":"T","body":"Prose stays.\n\n<!-- shelbi:begin -->\n```yaml\npriority: 0\n```\n<!-- shelbi:end -->","state":"open","labels":[{"name":"shelbi:id/t"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}"#;
+        let (store, calls) = recording_store(issue, issue, "", issue);
+        store
+            .set_fields(
+                "t",
+                IssueFields {
+                    pr: Some(Some(IssuePr::new(2137, Some("https://github.com/owner/repo/pull/2137".into())))),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let calls = calls.lock().unwrap();
+        let patch = call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/7"])
+            .expect("body PATCH");
+        assert!(patch.contains("number: 2137"), "{patch}");
+        assert!(patch.contains("url: https://github.com/owner/repo/pull/2137"), "{patch}");
+        assert!(patch.contains("Prose stays."), "{patch}");
+    }
+
+    #[test]
+    fn a_pr_record_round_trips_through_the_meta_block() {
+        let meta = ShelbiMeta {
+            pr: Some(IssuePr::new(2137, Some("https://github.com/o/r/pull/2137".into()))),
+            ..Default::default()
+        };
+        let body = build_body("Prose.", &meta);
+        let (prose, parsed) = split_shelbi_meta(&body);
+        assert_eq!(prose, "Prose.");
+        let parsed = parsed.unwrap();
+        assert_eq!(parsed.pr, meta.pr);
+        assert!(parsed.params.is_empty(), "the record isn't a free-form param: {:?}", parsed.params);
+    }
+
+    #[test]
+    fn a_bare_number_in_the_meta_block_reads_as_a_pr() {
+        let body = "Prose.\n\n<!-- shelbi:begin -->\n```yaml\npr: 2137\n```\n<!-- shelbi:end -->\n";
+        let (_, parsed) = split_shelbi_meta(body);
+        assert_eq!(parsed.unwrap().pr, Some(IssuePr::new(2137, None)));
     }
 
     #[test]

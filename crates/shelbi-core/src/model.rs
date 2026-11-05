@@ -2186,6 +2186,120 @@ impl<'de> serde::Deserialize<'de> for Column {
     }
 }
 
+/// Where a pull request stands on its host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrState {
+    Open,
+    Merged,
+    Closed,
+}
+
+impl PrState {
+    pub fn label(self) -> &'static str {
+        match self {
+            PrState::Open => "open",
+            PrState::Merged => "merged",
+            PrState::Closed => "closed",
+        }
+    }
+}
+
+/// The CI result for a pull request's head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PrCi {
+    Pending,
+    Passing,
+    Failing,
+}
+
+impl PrCi {
+    pub fn label(self) -> &'static str {
+        match self {
+            PrCi::Pending => "checks pending",
+            PrCi::Passing => "checks passing",
+            PrCi::Failing => "checks failing",
+        }
+    }
+}
+
+/// A task's pull request.
+///
+/// The durable record is [`number`](Self::number) and [`url`](Self::url):
+/// written to the task's frontmatter (or a GitHub issue's metadata block) when
+/// the PR is opened, and kept once the PR closes or merges.
+/// [`state`](Self::state) and [`ci`](Self::ci) change too often to belong on
+/// the task: they stay absent in what's stored, and a read fills them from the
+/// hub's local PR status cache (`shelbi_state::pr_status`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuePr {
+    pub number: u64,
+    /// `None` only for a hand-written `pr: <number>` until a read resolves it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<PrState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<PrCi>,
+}
+
+impl IssuePr {
+    /// The durable record of PR `number`.
+    pub fn new(number: u64, url: Option<String>) -> IssuePr {
+        IssuePr { number, url, state: None, ci: None }
+    }
+
+    /// `#2137`.
+    pub fn number_label(&self) -> String {
+        format!("#{}", self.number)
+    }
+
+    /// What's known about the PR beyond its number, as both clients word it:
+    /// `open · checks passing`. Empty when nothing is.
+    pub fn status_label(&self) -> String {
+        [self.state.map(PrState::label), self.ci.map(PrCi::label)]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ")
+    }
+}
+
+/// `pr:` as it may appear in a task: the record, a bare number (`pr: 2137`,
+/// hand-written), or a pull-request URL. Anything else reads as no PR rather
+/// than failing the parse: an unparseable task file would drop the card from
+/// the board.
+pub fn deserialize_issue_pr<'de, D>(d: D) -> std::result::Result<Option<IssuePr>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(u64),
+        Text(String),
+        Record(IssuePr),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(match Option::<Raw>::deserialize(d)? {
+        Some(Raw::Number(number)) if number > 0 => Some(IssuePr::new(number, None)),
+        Some(Raw::Text(text)) => pr_number_from_url(&text).map(|n| IssuePr::new(n, Some(text.trim().to_string()))),
+        Some(Raw::Record(record)) if record.number > 0 => Some(record),
+        _ => None,
+    })
+}
+
+/// The PR number in a pull-request URL (`https://host/o/r/pull/2137`).
+pub fn pr_number_from_url(url: &str) -> Option<u64> {
+    let url = url.trim();
+    if !(url.starts_with("https://") || url.starts_with("http://")) || url.contains(char::is_whitespace) {
+        return None;
+    }
+    let (_, tail) = url.rsplit_once("/pull/")?;
+    tail.split(['/', '?', '#']).next()?.parse().ok().filter(|n| *n > 0)
+}
+
 /// One Kanban card. Position within a column is given by `priority`
 /// (0 = top); the storage layer keeps these contiguous within each column.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2209,6 +2323,14 @@ pub struct Issue {
     /// means use that branch as-is (the *release task* pattern).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// The pull request opened for this task's branch, recorded by the
+    /// `open_pr` action. See [`IssuePr`].
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_issue_pr"
+    )]
+    pub pr: Option<IssuePr>,
     /// Other task ids this task depends on. A task is **blocked** (see
     /// [`Issue::is_blocked`]) when any of these are not yet in
     /// [`Column::done()`]. Stored as a list rather than a reverse `blocks`
@@ -3165,6 +3287,42 @@ pub fn validate_agent_id(s: &str) -> crate::Result<()> {
 }
 
 #[cfg(test)]
+mod pr_tests {
+    use super::*;
+
+    #[test]
+    fn labels_read_as_both_clients_show_them() {
+        let mut pr = IssuePr::new(2137, Some("https://h/o/r/pull/2137".into()));
+        assert_eq!(pr.number_label(), "#2137");
+        assert_eq!(pr.status_label(), "");
+        pr.state = Some(PrState::Merged);
+        assert_eq!(pr.status_label(), "merged");
+        pr.ci = Some(PrCi::Passing);
+        assert_eq!(pr.status_label(), "merged · checks passing");
+        pr.state = None;
+        pr.ci = Some(PrCi::Failing);
+        assert_eq!(pr.status_label(), "checks failing");
+    }
+
+    #[test]
+    fn a_pr_number_comes_only_from_a_pull_request_url() {
+        assert_eq!(pr_number_from_url("https://github.com/o/r/pull/42"), Some(42));
+        assert_eq!(pr_number_from_url("https://github.com/o/r/pull/42/files"), Some(42));
+        assert_eq!(pr_number_from_url("https://github.com/o/r/pull/42#issuecomment-1"), Some(42));
+        assert_eq!(pr_number_from_url("https://github.com/o/r/issues/42"), None);
+        assert_eq!(pr_number_from_url("https://github.com/o/r/pull/x"), None);
+        assert_eq!(pr_number_from_url("ftp://github.com/o/r/pull/42"), None);
+        assert_eq!(pr_number_from_url("see https://github.com/o/r/pull/42"), None);
+    }
+
+    #[test]
+    fn the_record_stores_only_what_is_set() {
+        let yaml = serde_yaml::to_string(&IssuePr::new(7, Some("https://h/pull/7".into()))).unwrap();
+        assert!(!yaml.contains("state") && !yaml.contains("ci"), "{yaml}");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::WorkflowZenConfig;
@@ -3527,6 +3685,7 @@ agent_runners:
             assigned_to: None,
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: vec!["b".into(), "c".into()],
             prefers_machine: None,
             zen: None,
@@ -3559,6 +3718,7 @@ agent_runners:
             assigned_to: None,
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: vec![],
             prefers_machine: Some("devbox".into()),
             zen: None,
@@ -4477,6 +4637,7 @@ workspaces:
             assigned_to: None,
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: vec![],
             prefers_machine: None,
             zen,

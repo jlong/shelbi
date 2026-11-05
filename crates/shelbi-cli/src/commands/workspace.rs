@@ -837,6 +837,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             assigned_to: assigned_to.map(str::to_string),
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,

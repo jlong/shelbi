@@ -585,6 +585,12 @@ fn run_action(
     }
 }
 
+/// The minimal project the transition tests use, for sibling modules' tests.
+#[cfg(test)]
+pub(crate) fn fixture_project() -> Project {
+    tests::bare_project()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,6 +664,7 @@ mod tests {
             assigned_to: None,
             workflow: None,
             branch: Some(format!("shelbi/{id}")),
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,

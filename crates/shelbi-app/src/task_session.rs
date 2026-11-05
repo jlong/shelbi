@@ -121,6 +121,7 @@ mod tests {
             workspace: slot.map(str::to_string),
             state,
             number: None,
+            pr: None,
         }
     }
 

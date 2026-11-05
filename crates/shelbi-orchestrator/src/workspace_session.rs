@@ -530,6 +530,7 @@ mod tests {
                 assigned_to: assigned_to.map(str::to_string),
                 workflow: None,
                 branch: Some(format!("shelbi/{id}")),
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,

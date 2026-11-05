@@ -191,6 +191,7 @@ fn new_issue_from(tf: &IssueFile) -> NewIssue {
         prefers_machine: tf.task.prefers_machine.clone(),
         zen: tf.task.zen.clone(),
         launch: tf.task.launch.clone(),
+        pr: tf.task.pr.clone(),
         params: tf.task.params.clone(),
         priority: Some(tf.task.priority),
     }

@@ -399,6 +399,7 @@ fn review_info() -> ReviewInfo {
         review_url: None,
         has_health_check: false,
         remote_machine: None,
+        pr: None,
     }
 }
 

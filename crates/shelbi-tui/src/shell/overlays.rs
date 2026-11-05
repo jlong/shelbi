@@ -335,11 +335,11 @@ impl ActiveOverlay {
             ActiveOverlay::NewTask(dialog) => new_task_event(dialog.handle_key(ev)),
             ActiveOverlay::Launch(screen) => OverlayEvent::Launch(screen.handle_key(ev)),
             ActiveOverlay::ConnectRemote(dialog) => connect_event(dialog.handle_key(ev)),
-            ActiveOverlay::TaskDescription { scroll, .. } => {
+            ActiveOverlay::TaskDescription { scroll, task, .. } => {
                 // The popover is read-only here: Esc/q close it, j/k and the page
                 // chords scroll the body. The board's move / open-workspace
                 // chords (H/L/o, shown in the shared footer) have no target in a
-                // review, so they're inert.
+                // review, so they're inert. Its pull request still opens.
                 let action = crate::keymap::chord_from_event(ev)
                     .and_then(|c| keymaps.popover.dispatch(c));
                 match action {
@@ -363,6 +363,12 @@ impl ActiveOverlay {
                     Some(PopoverAction::ScrollHome) => {
                         *scroll = 0;
                         OverlayEvent::Stay
+                    }
+                    Some(PopoverAction::OpenPr) => {
+                        match shelbi_app::board::task_pr(&task.task).and_then(|pr| pr.url) {
+                            Some(url) => OverlayEvent::OpenUrl(url),
+                            None => OverlayEvent::Stay,
+                        }
                     }
                     _ => OverlayEvent::Stay,
                 }
@@ -754,6 +760,7 @@ mod tests {
                 assigned_to: Some("charlie".into()),
                 workflow: None,
                 branch: Some("shelbi/cold-start-cache".into()),
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,
@@ -1136,6 +1143,7 @@ mod tests {
                 workspace: None,
                 state: ReviewState::Pending,
                 number: None,
+                pr: None,
             }],
             config_error: None,
             board_loading: false,

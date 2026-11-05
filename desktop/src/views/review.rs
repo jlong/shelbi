@@ -140,6 +140,7 @@ impl ReviewOps for LiveOps {
                     .as_ref()
                     .map(|t| (t.task.title.clone(), t.body.clone()))
                     .unwrap_or_default();
+                let pr = info.task.as_ref().and_then(|t| shelbi_app::board::task_pr(&t.task));
                 Ok(ReviewTarget::Serving(ReviewInfo {
                     task_id: task.to_string(),
                     slot: info.slot,
@@ -151,6 +152,7 @@ impl ReviewOps for LiveOps {
                     review_url: info.review_url,
                     has_health_check: info.has_health_check,
                     remote_machine: info.remote_machine,
+                    pr,
                 }))
             }
             ReviewOpenTarget::Queued { title } => {
@@ -461,6 +463,7 @@ impl ReviewView {
             review_url: None,
             has_health_check: false,
             remote_machine: None,
+            pr: None,
         };
         let mut shown = self.build(info, row, cx);
         shown.resolved = false;
@@ -1002,6 +1005,11 @@ impl ReviewView {
                 let project = self.project.clone();
                 self.run_opener("open the app", move |ops| ops.open_in_app(&project, &task, role), cx);
             }
+            PanelEffect::OpenPr => {
+                if let Some(url) = self.model().and_then(|m| m.pr_url().map(str::to_string)) {
+                    self.run_opener("open the pull request", move |ops| ops.open_url(&url), cx);
+                }
+            }
             // Inert until the slot's server is serving (the row says so).
             PanelEffect::OpenBrowser => {
                 if self.model().is_some_and(|m| m.server.state == ReviewState::Serving) {
@@ -1255,6 +1263,32 @@ impl ReviewView {
                 );
         }
 
+        // The pull request, under the summary it belongs to.
+        let pr = model.pr.as_ref().map(|pr| {
+            let mut link = task_panel::pr_link("review-pr", pr, selected(PanelRow::Pr), theme);
+            if pr.url.is_some() {
+                link = link.on_click(listen(PanelRow::Pr));
+            }
+            div()
+                .debug_selector(|| "review-pr-row".into())
+                .flex()
+                .flex_row()
+                .flex_none()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(18.0))
+                .pb(px(8.0))
+                .min_w_0()
+                .child(
+                    div()
+                        .flex_none()
+                        .type_style(Type::Small)
+                        .text_color(theme.muted)
+                        .child("PR"),
+                )
+                .child(task_panel::pr_value(link, pr, theme))
+        });
+
         // The worktree, with Open when it can be revealed (a local slot).
         let folder = (!model.worktree.is_empty()).then(|| {
             let open = (!model.is_remote()).then(|| {
@@ -1396,6 +1430,7 @@ impl ReviewView {
         self.panel_root(theme, cx)
             .child(status)
             .child(summary)
+            .children(pr)
             .children(folder)
             .child(views)
             .child(task_panel::section_header("Actions", theme))
@@ -1888,6 +1923,7 @@ pub(crate) mod tests {
             review_url: Some("http://localhost:4101".into()),
             has_health_check: true,
             remote_machine: None,
+            pr: None,
         }
     }
 
@@ -1900,6 +1936,7 @@ pub(crate) mod tests {
             workspace: Some("review-1".into()),
             state,
             number: None,
+            pr: None,
         }
     }
 
@@ -2324,6 +2361,52 @@ pub(crate) mod tests {
         assert!(h.cx.debug_bounds("review-switch-browser").is_none());
         let health = h.view.read_with(&h.cx, |v, _| v.model().unwrap().server.health);
         assert_eq!(health, HealthCheck::NotDeclared);
+    }
+
+    #[gpui::test]
+    fn the_panel_shows_the_pr_and_a_click_opens_it(cx: &mut TestAppContext) {
+        use shelbi_core::{IssuePr, PrCi, PrState};
+        let url = "https://github.com/o/r/pull/2137";
+        let mut h = open(cx);
+        let with_pr = ReviewInfo {
+            pr: Some(IssuePr {
+                state: Some(PrState::Open),
+                ci: Some(PrCi::Failing),
+                ..IssuePr::new(2137, Some(url.into()))
+            }),
+            ..info()
+        };
+        h.update(|v, cx| v.show(with_pr.clone(), Some(row(ReviewState::Serving)), cx));
+        h.draw();
+        assert!(h.cx.debug_bounds("review-pr-row").is_some());
+        assert!(h.cx.debug_bounds("pr-state").is_some());
+        assert!(h.cx.debug_bounds("pr-ci").is_some());
+
+        // It sits under the summary, above the worktree.
+        let summary = h.cx.debug_bounds("review-title").unwrap();
+        let pr_row = h.cx.debug_bounds("review-pr-row").unwrap();
+        let worktree = h.cx.debug_bounds("review-worktree").unwrap();
+        assert!(summary.bottom() <= pr_row.top() && pr_row.bottom() <= worktree.top());
+
+        h.click("review-pr");
+        assert_eq!(h.ops.opened.lock().unwrap().as_slice(), [url.to_string()]);
+
+        // The row keeps up with the board while the panel stays open.
+        let fresh = ReviewRow {
+            pr: Some(IssuePr {
+                state: Some(PrState::Merged),
+                ..IssuePr::new(2137, Some(url.into()))
+            }),
+            ..row(ReviewState::Serving)
+        };
+        h.update(|v, cx| v.update_row(Some(fresh), cx));
+        let pr = h.view.read_with(&h.cx, |v, _| v.model().and_then(|m| m.pr.clone()));
+        assert_eq!(pr.and_then(|p| p.state), Some(PrState::Merged));
+
+        // A task with no PR has no row.
+        h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
+        h.draw();
+        assert!(h.cx.debug_bounds("review-pr-row").is_none());
     }
 
     #[gpui::test]

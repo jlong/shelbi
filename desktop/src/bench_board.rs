@@ -148,6 +148,7 @@ fn save(id: &str, rng: &mut Lcg, column: Column, priority: u32, depends_on: Vec<
         assigned_to: None,
         workflow: Some("task".into()),
         branch: Some(format!("jlong/{id}")),
+        pr: None,
         depends_on,
         prefers_machine: None,
         zen: None,

@@ -83,6 +83,7 @@ pub enum PopoverAction {
     MoveLeft,
     MoveRight,
     OpenWorkspace,
+    OpenPr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -159,6 +160,7 @@ impl Action {
                 PopoverAction::MoveLeft => "Popover: move task to the left column",
                 PopoverAction::MoveRight => "Popover: move task to the right column",
                 PopoverAction::OpenWorkspace => "Popover: open card's assigned workspace",
+                PopoverAction::OpenPr => "Popover: open card's pull request in the browser",
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => "Activity: scroll up",
@@ -229,6 +231,7 @@ impl Action {
                 PopoverAction::MoveLeft => "Move task to previous column",
                 PopoverAction::MoveRight => "Move task to next column",
                 PopoverAction::OpenWorkspace => "Open assigned workspace",
+                PopoverAction::OpenPr => "Open pull request",
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => "Scroll up",
@@ -311,6 +314,7 @@ impl Action {
                 // Mirrors the board's `o` so jumping to the card's workspace
                 // works whether the card is open or closed.
                 PopoverAction::OpenWorkspace => &["o"],
+                PopoverAction::OpenPr => &["p"],
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => &["k", "up"],
@@ -390,6 +394,7 @@ impl Action {
                 PopoverAction::MoveLeft => "move_left",
                 PopoverAction::MoveRight => "move_right",
                 PopoverAction::OpenWorkspace => "open_workspace",
+                PopoverAction::OpenPr => "open_pr",
             },
             Action::Activity(a) => match a {
                 ActivityAction::ScrollUp => "scroll_up",
@@ -456,6 +461,7 @@ impl Action {
             PopoverAction::MoveLeft,
             PopoverAction::MoveRight,
             PopoverAction::OpenWorkspace,
+            PopoverAction::OpenPr,
         ];
         const ACTIVITY: &[ActivityAction] = &[
             ActivityAction::ScrollUp,

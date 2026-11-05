@@ -137,6 +137,11 @@ fn info() -> ReviewInfo {
         review_url: Some("http://localhost:4101".into()),
         has_health_check: true,
         remote_machine: None,
+        pr: Some(shelbi_core::IssuePr {
+            state: Some(shelbi_core::PrState::Open),
+            ci: Some(shelbi_core::PrCi::Passing),
+            ..shelbi_core::IssuePr::new(2137, Some("https://github.com/acme/demo/pull/2137".into()))
+        }),
     }
 }
 
@@ -149,6 +154,7 @@ fn row(state: ReviewState) -> ReviewRow {
         workspace: Some("review-1".into()),
         state,
         number: None,
+        pr: None,
     }
 }
 

@@ -314,6 +314,7 @@ fn a_workflow_open_issues_use_isnt_deleted_and_the_row_says_which() {
         assigned_to: None,
         workflow: Some("subtask".into()),
         branch: None,
+        pr: None,
         depends_on: vec![],
         prefers_machine: None,
         zen: None,

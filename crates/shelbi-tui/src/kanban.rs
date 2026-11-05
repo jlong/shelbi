@@ -37,8 +37,8 @@ use shelbi_app::board_search::{BoardSearch, SearchWorker};
 #[cfg(test)]
 use shelbi_app::board::resolve_task_status;
 use shelbi_core::{
-    default_project_statuses, default_workflow, Column, ProjectStatuses, StatusCategory, Issue,
-    Workflow, DEFAULT_WORKFLOW_NAME,
+    default_project_statuses, default_workflow, Column, IssuePr, PrCi, PrState, ProjectStatuses,
+    StatusCategory, Issue, Workflow, DEFAULT_WORKFLOW_NAME,
 };
 use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps, PopoverAction};
 use shelbi_orchestrator::transition::{
@@ -92,6 +92,9 @@ pub struct KanbanApp {
     /// Selection underneath stays put so closing the popover returns the
     /// cursor to the same card.
     pub popover: Option<TaskPopover>,
+    /// A page the board asked to open (the popover's pull request). The host
+    /// drains it ([`Self::take_open_url`]): the shell owns the opener.
+    open_url: Option<String>,
     /// Screen-space rects for each rendered card cell, written each frame
     /// by the renderer and read by the mouse-click handler to map a click
     /// back to a (column, row) pair.
@@ -452,6 +455,9 @@ pub type KanbanColumn = shelbi_app::view::ColumnDef;
 pub struct TaskPopover {
     pub task_id: String,
     pub scroll: u16,
+    /// Where the pull-request row landed in the last draw, for clicks. `None`
+    /// when the task has none to open.
+    pub pr_row: Option<Rect>,
 }
 
 /// Everything one board refresh reads off disk / the daemon index. Produced by
@@ -490,6 +496,7 @@ impl KanbanApp {
             last_refresh: Instant::now() - Duration::from_secs(60),
             status_line: String::new(),
             popover: None,
+            open_url: None,
             card_hits: Vec::new(),
             workspaces: Vec::new(),
             ownership: OwnershipGate::Unrestricted,
@@ -705,11 +712,36 @@ impl KanbanApp {
         self.popover = Some(TaskPopover {
             task_id: tf.task.id.clone(),
             scroll: 0,
+            pr_row: None,
         });
     }
 
     pub fn close_popover(&mut self) {
         self.popover = None;
+    }
+
+    /// Ask to open the popover task's pull request in the browser.
+    pub fn open_popover_pr(&mut self) {
+        let Some(tf) = self.popover_task() else {
+            return;
+        };
+        match shelbi_app::board::task_pr(&tf.task).and_then(|pr| pr.url) {
+            Some(url) => self.open_url = Some(url),
+            None => self.status_line = "this card has no pull request to open".to_string(),
+        }
+    }
+
+    /// Whether (`column`, `row`) is on the popover's pull-request row.
+    pub fn popover_pr_row_at(&self, column: u16, row: u16) -> bool {
+        self.popover
+            .as_ref()
+            .and_then(|p| p.pr_row)
+            .is_some_and(|r| r.contains(ratatui::layout::Position::new(column, row)))
+    }
+
+    /// The page the board asked to open since the last call.
+    pub fn take_open_url(&mut self) -> Option<String> {
+        self.open_url.take()
     }
 
     pub fn popover_scroll_up(&mut self) {
@@ -1145,7 +1177,8 @@ impl KanbanApp {
             }
         };
         match store.closed_page(Some(&cursor)) {
-            Ok(page) => {
+            Ok(mut page) => {
+                shelbi_state::pr_status::fold(&self.project_name, &mut page.issues);
                 self.closed_next_cursor = page.next_cursor;
                 // Accumulate the new page in `closed_more` (ids not already in the
                 // first page or an earlier "load more"), then rebuild so the merge
@@ -3331,7 +3364,7 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let Some(pop) = app.popover.as_mut() else {
         return;
     };
-    render_task_popover_into(
+    pop.pr_row = render_task_popover_into(
         f,
         popover_area,
         tf.as_ref(),
@@ -3351,7 +3384,8 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
 /// `tf` is the task to show (`None` renders the "issue no longer exists" stub);
 /// `owner` is its tracker ownership (`None` off a remote tracker, or where the
 /// caller has no gate); `columns` resolves dependency labels; `scroll` is clamped against the wrapped
-/// body height in place.
+/// body height in place. Returns where the pull-request row landed, when there
+/// is one to open, for the caller's click map.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_task_popover_into(
     f: &mut Frame,
@@ -3362,7 +3396,7 @@ pub(crate) fn render_task_popover_into(
     scroll: &mut u16,
     keymaps: &Keymaps,
     style: DisplayStyle,
-) {
+) -> Option<Rect> {
     let (header_lines, body_text, title) = match tf {
         Some(tf) => (
             popover_header(tf, owner, columns),
@@ -3392,6 +3426,22 @@ pub(crate) fn render_task_popover_into(
         ])
         .split(inner);
 
+    // The PR row's place, before the header lines are consumed by the widget.
+    let pr = tf.and_then(|tf| shelbi_app::board::task_pr(&tf.task));
+    let pr_row = pr
+        .as_ref()
+        .filter(|pr| pr.url.is_some())
+        .and_then(|_| header_lines.iter().position(|line| {
+            line.spans.first().is_some_and(|s| s.content == meta_label(PR_LABEL).content)
+        }))
+        .and_then(|i| u16::try_from(i).ok())
+        .filter(|i| *i < chunks[0].height)
+        .map(|i| Rect {
+            x: chunks[0].x,
+            y: chunks[0].y + i,
+            width: chunks[0].width,
+            height: 1,
+        });
     if !header_lines.is_empty() {
         f.render_widget(Paragraph::new(header_lines), chunks[0]);
     }
@@ -3441,11 +3491,18 @@ pub(crate) fn render_task_popover_into(
             fc(km.popover.first_chord_for(PopoverAction::OpenWorkspace)),
         ));
     }
+    if pr_row.is_some() {
+        hint_text.push_str(&format!(
+            "      {}  open PR",
+            fc(km.popover.first_chord_for(PopoverAction::OpenPr)),
+        ));
+    }
     let hint = Line::from(Span::styled(
         hint_text,
         Style::default().fg(palette().ansi_dark_gray),
     ));
     f.render_widget(Paragraph::new(hint), chunks[3]);
+    pr_row
 }
 
 pub(crate) fn popover_header(
@@ -3493,6 +3550,15 @@ pub(crate) fn popover_header(
         lines.push(meta_row("branch", branch));
     }
 
+    if let Some(pr) = shelbi_app::board::task_pr(task) {
+        let mut spans = vec![
+            meta_label(PR_LABEL),
+            Span::styled(pr_number_text(&pr), Style::default().fg(palette().cyan)),
+        ];
+        spans.extend(pr_status_spans(&pr));
+        lines.push(Line::from(spans));
+    }
+
     if !task.depends_on.is_empty() {
         let blocked = task.is_blocked(columns);
         let label = if blocked { "blocked by" } else { "depends on" };
@@ -3529,6 +3595,42 @@ pub(crate) fn popover_header(
     ]));
 
     lines
+}
+
+/// The task sheet's label for the pull-request row.
+const PR_LABEL: &str = "pr";
+
+/// `#2137 ↗`, the arrow only when there is somewhere to go.
+pub(crate) fn pr_number_text(pr: &IssuePr) -> String {
+    if pr.url.is_some() {
+        format!("{} ↗", pr.number_label())
+    } else {
+        pr.number_label()
+    }
+}
+
+/// What's known of a pull request after its number: `  open  ● checks
+/// passing`. The same words as the desktop ([`IssuePr::status_label`]), with
+/// the CI result colored and its dot.
+pub(crate) fn pr_status_spans(pr: &IssuePr) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if let Some(state) = pr.state {
+        let color = match state {
+            PrState::Open => palette().ansi_green,
+            PrState::Merged => palette().ansi_magenta,
+            PrState::Closed => palette().ansi_red,
+        };
+        spans.push(Span::styled(format!("  {}", state.label()), Style::default().fg(color)));
+    }
+    if let Some(ci) = pr.ci {
+        let color = match ci {
+            PrCi::Pending => palette().ansi_yellow,
+            PrCi::Passing => palette().ansi_green,
+            PrCi::Failing => palette().ansi_red,
+        };
+        spans.push(Span::styled(format!("  ● {}", ci.label()), Style::default().fg(color)));
+    }
+    spans
 }
 
 fn meta_label(label: &str) -> Span<'static> {
@@ -3671,6 +3773,7 @@ mod tests {
                 assigned_to: assigned_to.map(|s| s.to_string()),
                 workflow: None,
                 branch: None,
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,
@@ -4024,6 +4127,72 @@ mod tests {
         assert_eq!(app.card_at(5, 3), None);
     }
 
+    fn sheet_text(tf: &IssueFile) -> (String, Option<Rect>) {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+        let mut row = None;
+        let mut scroll = 0;
+        let keymaps = Keymaps::default();
+        terminal
+            .draw(|f| {
+                row = render_task_popover_into(
+                    f,
+                    f.area(),
+                    Some(tf),
+                    None,
+                    &HashMap::new(),
+                    &mut scroll,
+                    &keymaps,
+                    DisplayStyle::Mac,
+                );
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let text = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        (text, row)
+    }
+
+    #[test]
+    fn the_task_sheet_shows_the_pr_with_its_state_and_ci() {
+        let mut tf = task_file("a", Column::review(), 0, "2026-06-20T10:00:00Z");
+        tf.task.pr = Some(IssuePr {
+            state: Some(PrState::Open),
+            ci: Some(PrCi::Passing),
+            ..IssuePr::new(2137, Some("https://github.com/o/r/pull/2137".into()))
+        });
+        let (text, row) = sheet_text(&tf);
+        assert!(text.contains("pr: #2137 ↗  open  ● checks passing"), "{text}");
+        assert!(text.contains("open PR"), "the footer offers it: {text}");
+        // The click map lands on the row the text is on.
+        let row = row.expect("a PR with a link has a row");
+        let line = text.lines().nth(row.y as usize).unwrap();
+        assert!(line.contains("#2137"), "{line}");
+    }
+
+    #[test]
+    fn the_task_sheet_shows_a_merged_pr_and_one_with_nothing_known() {
+        let mut tf = task_file("a", Column::done(), 0, "2026-06-20T10:00:00Z");
+        tf.task.pr = Some(IssuePr {
+            state: Some(PrState::Merged),
+            ..IssuePr::new(7, Some("https://h/pull/7".into()))
+        });
+        assert!(sheet_text(&tf).0.contains("pr: #7 ↗  merged"));
+
+        // A bare number shows, with no arrow, no row to click and no hint.
+        tf.task.pr = Some(IssuePr::new(7, None));
+        let (text, row) = sheet_text(&tf);
+        assert!(text.contains("pr: #7"), "{text}");
+        assert!(!text.contains("↗") && !text.contains("open PR"), "{text}");
+        assert_eq!(row, None);
+
+        tf.task.pr = None;
+        let (text, row) = sheet_text(&tf);
+        assert!(!text.contains("pr: "), "{text}");
+        assert_eq!(row, None);
+    }
+
     #[test]
     fn open_popover_at_moves_selection_and_opens() {
         let mut app = KanbanApp::new("demo");
@@ -4326,6 +4495,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             assigned_to: None,
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
@@ -4405,6 +4575,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             assigned_to: None,
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
@@ -4472,6 +4643,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
                     assigned_to: None,
                     workflow: None,
                     branch: None,
+                    pr: None,
                     depends_on: Vec::new(),
                     prefers_machine: None,
                     zen: None,
@@ -4487,6 +4659,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         app.popover = Some(TaskPopover {
             task_id: "task-1".into(),
             scroll: 0,
+            pr_row: None,
         });
 
         app.popover_move_left();
@@ -5263,6 +5436,7 @@ transitions:
                 assigned_to: None,
                 workflow: None,
                 branch: None,
+                pr: None,
                 depends_on: Vec::new(),
                 params: Default::default(),
                 prefers_machine: None,
@@ -5441,6 +5615,7 @@ transitions:
         app.popover = Some(TaskPopover {
             task_id: "task-1".into(),
             scroll: u16::MAX,
+            pr_row: None,
         });
 
         let backend = TestBackend::new(80, 24);
@@ -5555,6 +5730,7 @@ transitions:
         app.popover = Some(TaskPopover {
             task_id: "task-1".into(),
             scroll: 7,
+            pr_row: None,
         });
 
         let backend = TestBackend::new(80, 24);
@@ -5772,6 +5948,7 @@ transitions:
                 assigned_to: None,
                 workflow: workflow.map(|s| s.to_string()),
                 branch: None,
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,
@@ -6732,6 +6909,7 @@ transitions:
             assigned_to: None,
             workflow: workflow.map(|s| s.to_string()),
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,

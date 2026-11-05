@@ -141,7 +141,10 @@ fn review_open_info_for_slot(
     // Read the task once, for both the review-URL gate and the panel's task
     // info (title / description preview / popover).
     let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
-    let task = store.get(task_id)?;
+    let mut task = store.get(task_id)?;
+    if let Some(tf) = task.as_mut() {
+        shelbi_state::pr_status::fold(project_name, std::slice::from_mut(tf));
+    }
     let workflow = task
         .as_ref()
         .and_then(|tf| shelbi_state::load_task_workflow(project_name, project, &tf.task).ok());
@@ -518,6 +521,7 @@ mod tests {
             assigned_to: slot.map(|s| s.into()),
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,

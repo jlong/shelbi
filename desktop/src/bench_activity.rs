@@ -212,6 +212,7 @@ workspaces:
             assigned_to: None,
             workflow: Some("app".into()),
             branch: Some(format!("jlong/{}", task_id(i))),
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,

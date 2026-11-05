@@ -264,7 +264,10 @@ fn derive_workspace_badge(workspace_name: &str, current_task: Option<&str>) -> W
 /// `machine:port` location. A single flat vec is returned — the renderer
 /// partitions it by [`ReviewState`]. When the project can't load, every row
 /// falls back to Pending with no location.
-fn split_reviews(project_name: &str, queue: Vec<IssueFile>) -> Vec<ReviewRow> {
+fn split_reviews(project_name: &str, mut queue: Vec<IssueFile>) -> Vec<ReviewRow> {
+    if !queue.is_empty() {
+        shelbi_state::pr_status::fold(project_name, &mut queue);
+    }
     let project = match load_project(project_name) {
         Ok(p) => p,
         Err(_) => {
@@ -282,6 +285,7 @@ fn split_reviews(project_name: &str, queue: Vec<IssueFile>) -> Vec<ReviewRow> {
                     workspace: None,
                     state: ReviewState::Pending,
                     number: None,
+                    pr: shelbi_app::board::task_pr(&tf.task),
                 })
                 .collect();
         }
@@ -307,6 +311,7 @@ fn split_reviews(project_name: &str, queue: Vec<IssueFile>) -> Vec<ReviewRow> {
             workspace,
             state,
             number: None,
+            pr: shelbi_app::board::task_pr(task),
         }
     };
 

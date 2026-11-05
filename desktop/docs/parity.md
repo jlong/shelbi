@@ -377,7 +377,7 @@ Found by this audit and not closed by it; each is a follow-up.
 - **Board details shown in one client only**: the desktop shows a card's
   excerpt, workflow badge (even on a one-workflow board) and dependencies on
   the card, "Loading history…" in the done
-  column, and the task's workflow and PR link in the detail; the TUI shows
+  column, and the task's workflow in the detail; the TUI shows
   a board total ("N total") and resolves the detail's status and branch
   differently (stored column and raw branch, against the desktop's resolved
   status and templated branch).
@@ -440,6 +440,7 @@ equivalent datum.
 | `branch` | dim `⎇ branch` second line (`shell/sidebar.rs` `render_row`) | muted second line after the number (`views/sidebar.rs` `row_text`, `render_row`) |
 | `location` | right-aligned `machine:port` on the first line (`shell/sidebar.rs` `render_row`) | not shown: State=Review dropped the server block and the sidebar row's right side is its ⌘N hint (the Navigation component); the review URL stands in (the Web Browser row's tooltip) |
 | `workspace` | not used | not used |
+| `pr` | not in the row: keeps the open Review panel's PR current (`shell/review.rs` `set_server`) | not in the row: keeps the open Review panel's PR current (`ReviewPanelModel::build`, via `views/review.rs` `update_row`) |
 | `number` | not shown | `#401` before the branch on the row's second line (`views/sidebar.rs` `row_text`); filled from the board index for a GitHub-backed project (`shelbi-orchestrator` `sidebar_model`) |
 | `state` | section split (Ready vs Queued, via `rows()`) and the badge glyph, bold cyan ✓ when serving (`shell/sidebar.rs` `render_row`) | section split (via `rows()`) and the component's glyph: the cyan check when serving, a quiet dot when queued (`views/sidebar.rs` `review_glyph`); the review panel's Web Browser row, inert with "loading…" until serving, the sub-state and detail in its tooltip (`views/review.rs` `render_waiting_browser`) |
 
@@ -552,7 +553,7 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | `workflow_name` | not shown | Header's `Workflow / id`, and the Workflow picker's value when no change is settling, capitalized (`views/task_detail.rs` `workflow_label`) |
 | `depends_on` | deps row with "[status]" (`kanban.rs` `popover_header`) | Depends on property with "[status]", when any (`views/task_detail.rs` `properties`) |
 | `blocked` | "blocked by" vs "depends on" label (`kanban.rs` `popover_header`) | "Blocked by" vs "Depends on" label (`views/task_detail.rs` `properties`) |
-| `pr_link` | not shown | clickable Pull request property, when recorded (`views/task_detail.rs` `properties`) |
+| `pr` | equivalent `board::task_pr(task)`: "pr:" row, `#2137 ↗` then the state and the colored CI result; `p` or a click on the row opens the page, the footer offers it (`kanban.rs` `popover_header`, `render_task_popover_into`, `handlers/kanban.rs`) | PR property: the `#2137 ↗` link, then the state and the colored CI result; `p` and More's Open pull request open it too (`views/task_detail.rs` `properties`, `views/task_panel.rs` `pr_value`, `views/board_state.rs` `open_pr`) |
 | `created` | "created:" row (`kanban.rs` `popover_header`) | "Created Oct 26" under the body (`views/task_detail.rs` `short_date`) |
 | `updated` | "updated:" on created row (`kanban.rs` `popover_header`) | "Updated Oct 28" beside it (`views/task_detail.rs` `short_date`) |
 | `body` | markdown body, scrollable (`kanban.rs` `render_task_popover_into` via `markdown::render_note`) | the formatted body in the pane's scroll, edited in place WYSIWYG (`shelbi_app::markdown_edit` over the source; checkboxes click; "Write a description…" placeholder when empty); More / `e` put the keys in it (`views/task_detail.rs` `details`, `views/doc_editor`) |
@@ -627,6 +628,7 @@ The desktop renders `ReviewPanelModel` directly (`views/review.rs` builds it wit
 | `editor_name` | "Edit in <editor>" switch label (`review_panel.rs` `switch_entry`) | same label (`views/review.rs` `render_panel`) |
 | `apps` | Edit / View Diff launch the app instead of a pane (`review_panel.rs` `with_apps`) | same (`views/review.rs` `PanelEffect::OpenApp`) |
 | `review_url` | not shown: only a `has_review_url` bool gating the Open Browser switch (`review_panel.rs` `rows`); URL resolved at open time (`review_panel.rs` `review_url`) | the Web Browser row's tooltip (`views/review.rs` `render_panel`, `render_waiting_browser`); gates the row |
+| `pr` | "PR #2137 ↗" under the summary with the state and CI, a row in the panel's keys and a click open it (`review_panel.rs` `render_full`, `render_pr_line`; `PanelEffect::OpenPr` in `shell/mod.rs`) | same, under the summary, a row in the panel's keys and a click (`views/review.rs` `render_panel`, `PanelEffect::OpenPr`) |
 | `remote_machine` | not shown: the TUI has no remote info for a review | not shown as text: `is_remote` drops Open from the worktree row and Diff/Editor from `switch_items` (`views/review.rs` `render_panel`) |
 | `switch_items` | own fixed list Reviewer / View Diff / Edit in / (Open Browser) (`review_panel.rs` `rows` / `switch_entry`) | nav rows iterated from the model with ⌘N hints, the browser labelled "Web Browser", then Shell (`views/review.rs` `render_panel`) |
 | `server` | state glyph + sub-state name and location under the folder row, live from the sidebar row (`review_panel.rs` `render_server_line`, fed by `shell/mod.rs` `apply_snapshot`); no health check or sub-state detail (the TUI has no `ready:` facts for the slot) | the Web Browser row: inert with a muted "loading…" in place of its ⌘4 hint until serving, the sub-state, detail and health check in its tooltip (`views/review.rs` `render_waiting_browser`); State=Review draws no server block |

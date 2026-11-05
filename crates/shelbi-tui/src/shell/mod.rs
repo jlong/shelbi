@@ -4498,6 +4498,12 @@ impl ShellState {
                     }
                 });
             }
+            ReviewAction::OpenPr => {
+                let url = self.review.as_ref().and_then(|r| r.pr_url().map(str::to_string));
+                if let Some(url) = url {
+                    self.open_url(url);
+                }
+            }
             ReviewAction::OpenBrowser | ReviewAction::RevealFolder => {
                 // Openers run inline (spawn+detach); failures land on the status.
                 if let Some(r) = self.review.as_mut() {
@@ -5287,6 +5293,14 @@ impl ShellState {
             // `n`: New task, as the palette's New Issue.
             Outcome::NewIssue => self.run_command(CommandKind::NewIssue),
         }
+        self.open_board_url();
+    }
+
+    /// The board asked for a page (its popover's pull request).
+    fn open_board_url(&mut self) {
+        if let Some(url) = self.kanban.take_open_url() {
+            self.open_url(url);
+        }
     }
 
     /// Route a key to the embedded activity feed. Quit is neutralized (the shell
@@ -5586,6 +5600,7 @@ impl ShellState {
                     return;
                 }
                 crate::handlers::kanban::handle_kanban_mouse(&mut self.kanban, m);
+                self.open_board_url();
                 self.dirty = true;
                 return;
             }
@@ -6861,6 +6876,7 @@ mod tests {
                 assigned_to: None,
                 workflow: None,
                 branch: None,
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,
@@ -8552,6 +8568,7 @@ mod tests {
                 workspace: Some("review-1".into()),
                 state: shelbi_app::view::ReviewState::Serving,
                 number: None,
+                pr: None,
             }];
         }
         st.apply_review_action(ReviewAction::Approve);
@@ -9747,6 +9764,7 @@ mod tests {
                 workspace: None,
                 state: shelbi_app::view::ReviewState::Pending,
                 number: None,
+                pr: None,
             }];
         }
         st.effect_tap = Some(Vec::new());
@@ -12431,6 +12449,7 @@ workspaces:
                 assigned_to: None,
                 workflow: None,
                 branch: None,
+                pr: None,
                 depends_on: Vec::new(),
                 prefers_machine: None,
                 zen: None,
@@ -12556,6 +12575,38 @@ workspaces:
         tx.send(Ok(sample_issue("tui-about", "About Shelbi"))).unwrap();
         assert!(st.poll_changelog());
         assert!(st.overlay.is_none());
+    }
+
+    #[test]
+    fn p_on_the_board_popover_reaches_the_browser() {
+        let mut st = changelog_state();
+        let url = "https://github.com/o/r/pull/2137";
+        let mut issue = sample_issue("t", "T");
+        issue.task.pr = Some(shelbi_core::IssuePr::new(2137, Some(url.into())));
+        st.kanban.tasks = vec![issue];
+        st.kanban.popover = Some(crate::kanban::TaskPopover {
+            task_id: "t".into(),
+            scroll: 0,
+            pr_row: None,
+        });
+        st.handle_issues_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE));
+        assert_eq!(st.opened_urls, [url]);
+    }
+
+    #[test]
+    fn p_on_the_review_description_popover_reaches_the_browser() {
+        let mut st = changelog_state();
+        let url = "https://github.com/o/r/pull/2137";
+        let mut issue = sample_issue("t", "T");
+        issue.task.pr = Some(shelbi_core::IssuePr::new(2137, Some(url.into())));
+        st.overlay = Some(ActiveOverlay::TaskDescription {
+            task: Box::new(issue),
+            scroll: 0,
+            keymaps: Box::new(st.keymaps.clone()),
+            style: DisplayStyle::Mac,
+        });
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)));
+        assert_eq!(st.opened_urls, [url]);
     }
 
     /// Type `query` into the open palette and wait for its issue and

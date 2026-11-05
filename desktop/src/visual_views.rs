@@ -584,6 +584,7 @@ workspaces:
             assigned_to: assigned.map(str::to_string),
             workflow: None,
             branch: Some(format!("jlong/{id}")),
+            pr: None,
             depends_on: vec![],
             prefers_machine: None,
             zen: None,
@@ -595,6 +596,11 @@ workspaces:
         let mut body = "";
         if id == "t1" {
             t.params.insert("agent".into(), "developer".into());
+            t.pr = Some(shelbi_core::IssuePr {
+                state: Some(shelbi_core::PrState::Open),
+                ci: Some(shelbi_core::PrCi::Passing),
+                ..shelbi_core::IssuePr::new(2137, Some("https://github.com/acme/demo/pull/2137".into()))
+            });
             body = T1_BODY;
         }
         shelbi_state::save_task(PROJECT, &t, body).expect("save a fixture task");

@@ -182,6 +182,7 @@ fn info() -> ReviewInfo {
         review_url: Some("http://localhost:4101".into()),
         has_health_check: true,
         remote_machine: None,
+        pr: None,
     }
 }
 
@@ -203,6 +204,7 @@ fn sidebar_model() -> SidebarModel {
         workspace: Some("review-1".into()),
         state: ReviewState::Serving,
         number: None,
+        pr: None,
     }];
     m.board_loading = false;
     m

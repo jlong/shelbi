@@ -15,6 +15,7 @@
 
 pub mod diff_load;
 
+use shelbi_core::IssuePr;
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 use shelbi_state::AppTools;
 
@@ -55,6 +56,8 @@ pub struct ReviewInfo {
     pub has_health_check: bool,
     /// The machine the slot runs on when it is remote (reached over SSH).
     pub remote_machine: Option<String>,
+    /// The task's pull request ([`crate::board::task_pr`]).
+    pub pr: Option<IssuePr>,
 }
 
 /// Where a review slot's server health check stands.
@@ -159,6 +162,8 @@ pub struct ReviewPanelModel {
     pub apps: AppTools,
     pub review_url: Option<String>,
     pub remote_machine: Option<String>,
+    /// The task's pull request, when it has one.
+    pub pr: Option<IssuePr>,
     /// The view-switcher nav items, in order.
     pub switch_items: Vec<ReviewSwitch>,
     pub server: ReviewServer,
@@ -194,6 +199,8 @@ impl ReviewPanelModel {
             apps: info.apps,
             review_url: info.review_url.clone(),
             remote_machine: info.remote_machine.clone(),
+            // The row keeps up with the board while the panel stays open.
+            pr: row.and_then(|r| r.pr.clone()).or_else(|| info.pr.clone()),
             switch_items,
             server: ReviewServer {
                 state,
@@ -205,6 +212,11 @@ impl ReviewPanelModel {
 
     pub fn has_review_url(&self) -> bool {
         self.review_url.is_some()
+    }
+
+    /// Where the pull request opens, when the panel has one to open.
+    pub fn pr_url(&self) -> Option<&str> {
+        self.pr.as_ref().and_then(|pr| pr.url.as_deref())
     }
 
     pub fn has_body(&self) -> bool {
@@ -339,6 +351,8 @@ pub enum PanelRow {
     Back,
     /// The `More` link: the full task description. Only with a body.
     More,
+    /// The task's pull request: open it in the browser. Only with a link.
+    Pr,
     /// The worktree folder: reveal it in the file manager.
     Folder,
     Switch(ReviewSwitch),
@@ -363,6 +377,8 @@ pub enum PanelEffect {
     /// that role; the content view stays as it is.
     OpenApp(ReviewRole),
     OpenBrowser,
+    /// Open the task's pull request in the browser.
+    OpenPr,
     RevealFolder,
     ShowDescription,
     /// Accept: the gated review → done merge.
@@ -376,16 +392,18 @@ pub enum PanelEffect {
     ToggleShell,
 }
 
-/// The panel's rows: Back, `More` (only with a body), the folder (when it can
-/// be revealed), the switch entries, then Approve and Reject.
-pub fn panel_rows(has_body: bool, show_folder: bool, switches: &[ReviewSwitch]) -> Vec<PanelRow> {
-    panel_rows_with_shell(has_body, show_folder, switches, false)
+/// The panel's rows: Back, `More` (only with a body), the pull request (only
+/// with a link), the folder (when it can be revealed), the switch entries, then
+/// Approve and Reject.
+pub fn panel_rows(has_body: bool, has_pr: bool, show_folder: bool, switches: &[ReviewSwitch]) -> Vec<PanelRow> {
+    panel_rows_with_shell(has_body, has_pr, show_folder, switches, false)
 }
 
 /// [`panel_rows`] with the user-shell row after the switch entries when
 /// `shell` (the desktop's).
 pub fn panel_rows_with_shell(
     has_body: bool,
+    has_pr: bool,
     show_folder: bool,
     switches: &[ReviewSwitch],
     shell: bool,
@@ -393,6 +411,9 @@ pub fn panel_rows_with_shell(
     let mut rows = vec![PanelRow::Back];
     if has_body {
         rows.push(PanelRow::More);
+    }
+    if has_pr {
+        rows.push(PanelRow::Pr);
     }
     if show_folder {
         rows.push(PanelRow::Folder);
@@ -431,6 +452,7 @@ pub fn activate_row(row: PanelRow, has_body: bool, merging: bool, apps: AppTools
     match row {
         PanelRow::Back => (PanelEffect::Back, None),
         PanelRow::More => (description_effect(has_body), None),
+        PanelRow::Pr => (PanelEffect::OpenPr, None),
         PanelRow::Folder => (PanelEffect::RevealFolder, None),
         PanelRow::Switch(ReviewSwitch::Chat) => (PanelEffect::ShowChat, Some(ActiveView::Chat)),
         PanelRow::Switch(ReviewSwitch::Diff) if apps.diff => (PanelEffect::OpenApp(ReviewRole::Diff), None),
@@ -654,7 +676,7 @@ impl ReviewPanelState {
     }
 
     fn rows_for(model: &ReviewPanelModel, shell: bool) -> Vec<PanelRow> {
-        panel_rows_with_shell(model.has_body(), !model.is_remote(), &model.switch_items, shell)
+        panel_rows_with_shell(model.has_body(), model.pr_url().is_some(), !model.is_remote(), &model.switch_items, shell)
     }
 
     /// Follow a rebuilt model (a refreshed row): the selection stays on the
@@ -985,6 +1007,7 @@ mod tests {
             review_url: url.then(|| "http://localhost:4101".to_string()),
             has_health_check: true,
             remote_machine: remote.then(|| "gpu".to_string()),
+            pr: None,
         }
     }
 
@@ -997,6 +1020,7 @@ mod tests {
             workspace: Some("review-1".into()),
             state,
             number: None,
+            pr: None,
         }
     }
 
@@ -1379,6 +1403,42 @@ mod tests {
             (PanelEffect::ShowEditor, Some(ActiveView::Editor)),
             "a CLI editor is a pane"
         );
+    }
+
+    #[test]
+    fn the_pr_row_sits_under_the_summary_and_opens_the_page() {
+        let mut with_pr = info(false, false);
+        with_pr.body = "A body.".into();
+        with_pr.pr = Some(IssuePr::new(7, Some("https://h/pull/7".into())));
+        let m = ReviewPanelModel::build(&with_pr, None);
+        assert_eq!(m.pr_url(), Some("https://h/pull/7"));
+        let mut p = ReviewPanelState::new(&m);
+        assert_eq!(&p.rows()[..3], [PanelRow::Back, PanelRow::More, PanelRow::Pr]);
+        assert_eq!(p.click(PanelRow::Pr), PanelEffect::OpenPr);
+
+        // A number with nowhere to go isn't a row, and no PR isn't either.
+        with_pr.pr = Some(IssuePr::new(7, None));
+        let m = ReviewPanelModel::build(&with_pr, None);
+        assert!(!ReviewPanelState::new(&m).rows().contains(&PanelRow::Pr));
+        with_pr.pr = None;
+        let m = ReviewPanelModel::build(&with_pr, None);
+        assert!(!ReviewPanelState::new(&m).rows().contains(&PanelRow::Pr));
+    }
+
+    #[test]
+    fn the_panel_pr_follows_the_row_that_keeps_up_with_the_board() {
+        let mut opened = info(false, false);
+        opened.pr = Some(IssuePr::new(7, Some("https://h/pull/7".into())));
+        let mut fresh = row(ReviewState::Serving);
+        fresh.pr = Some(IssuePr {
+            ci: Some(shelbi_core::PrCi::Failing),
+            ..IssuePr::new(7, Some("https://h/pull/7".into()))
+        });
+        let m = ReviewPanelModel::build(&opened, Some(&fresh));
+        assert_eq!(m.pr.and_then(|p| p.ci), Some(shelbi_core::PrCi::Failing));
+        // A row with none says nothing about it: what opened stands.
+        let m = ReviewPanelModel::build(&opened, Some(&row(ReviewState::Serving)));
+        assert_eq!(m.pr.map(|p| p.number), Some(7));
     }
 
     #[test]

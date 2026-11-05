@@ -60,6 +60,7 @@ pub(crate) fn add(
         depends_on: dedup_preserving_order(spec.depends_on.clone()),
         prefers_machine: spec.prefers_machine.clone(),
         zen: None,
+        pr: None,
         launch: None,
         params: std::collections::BTreeMap::new(),
         priority: None,

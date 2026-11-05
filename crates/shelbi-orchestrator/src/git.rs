@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use chrono::{DateTime, Utc};
-use shelbi_core::{Error, Host, MachineKind, MergeStrategy, Project, Result, Issue};
+use shelbi_core::{Error, Host, MachineKind, MergeStrategy, PrState, Project, Result, Issue};
 
 use crate::workspace::workspace_worktree;
 
@@ -287,6 +287,95 @@ fn lookup_open_pr_impl(
         });
     }
     parse_open_pr_list(&String::from_utf8_lossy(&out.stdout), branch)
+}
+
+/// The URL of PR `pr` in the repo at `wt`, or in `repository` when the caller
+/// has resolved the exact one (a `gh repo set-default` override would otherwise
+/// answer for another repository's PR of that number).
+pub(crate) fn lookup_pr_url(host: &Host, wt: &str, repository: Option<&str>, pr: u64) -> Result<String> {
+    let number = pr.to_string();
+    let mut args = vec!["gh", "pr", "view", number.as_str()];
+    if let Some(repository) = repository {
+        args.extend(["--repo", repository]);
+    }
+    args.extend(["--json", "url", "--jq", ".url"]);
+    let out = run_in_dir(host, wt, &args)?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("gh pr view {pr} --json url"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if url.is_empty() {
+        return Err(Error::Other(format!("gh pr view {pr} returned no URL")));
+    }
+    Ok(url)
+}
+
+/// The repo's `limit` most recent PRs in any state, for the PR status cache
+/// (one listing instead of a lookup per task).
+pub(crate) fn list_recent_prs(
+    host: &Host,
+    wt: &str,
+    limit: u32,
+) -> Result<Vec<shelbi_state::pr_status::PrEntry>> {
+    let limit = limit.to_string();
+    let out = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--limit",
+            &limit,
+            "--json",
+            "number,url,state,headRefName,createdAt",
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("gh pr list --state all --limit {limit}"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    parse_pr_listing(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// One `gh pr list --json number,url,state,headRefName,createdAt` row per PR.
+/// Split out of [`list_recent_prs`] for the tests.
+fn parse_pr_listing(stdout: &str) -> Result<Vec<shelbi_state::pr_status::PrEntry>> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Row {
+        number: u64,
+        url: String,
+        state: String,
+        head_ref_name: String,
+        created_at: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    let rows: Vec<Row> = serde_json::from_str(stdout.trim())
+        .map_err(|e| Error::Other(format!("gh pr list returned unparseable JSON: {e}")))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| shelbi_state::pr_status::PrEntry {
+            head: row.head_ref_name,
+            url: Some(row.url),
+            state: match row.state.as_str() {
+                "OPEN" => Some(PrState::Open),
+                "MERGED" => Some(PrState::Merged),
+                "CLOSED" => Some(PrState::Closed),
+                _ => None,
+            },
+            created_at: row.created_at,
+            ..shelbi_state::pr_status::PrEntry::new(row.number)
+        })
+        .collect())
 }
 
 /// Merge an open pull request through GitHub's own PR merge —
@@ -1514,6 +1603,29 @@ mod tests {
     fn parse_pr_number_rejects_garbage() {
         assert_eq!(parse_pr_number_from_url(""), None);
         assert_eq!(parse_pr_number_from_url("not a url"), None);
+    }
+
+    #[test]
+    fn pr_listing_parses_each_state_and_tolerates_an_unknown_one() {
+        let rows = parse_pr_listing(
+            r#"[
+              {"number":2,"url":"https://h/o/r/pull/2","state":"OPEN","headRefName":"a","createdAt":"2026-11-05T05:00:00Z"},
+              {"number":1,"url":"https://h/o/r/pull/1","state":"MERGED","headRefName":"b","createdAt":"2026-11-04T05:00:00Z"},
+              {"number":3,"url":"https://h/o/r/pull/3","state":"CLOSED","headRefName":"c","createdAt":null},
+              {"number":4,"url":"https://h/o/r/pull/4","state":"DRAFTY","headRefName":"d","createdAt":null}
+            ]"#,
+        )
+        .unwrap();
+        let states: Vec<_> = rows.iter().map(|r| r.state).collect();
+        assert_eq!(
+            states,
+            [Some(PrState::Open), Some(PrState::Merged), Some(PrState::Closed), None]
+        );
+        assert_eq!(rows[0].head, "a");
+        assert_eq!(rows[0].url.as_deref(), Some("https://h/o/r/pull/2"));
+        assert!(rows[0].created_at.is_some());
+        assert!(rows[2].created_at.is_none());
+        assert!(parse_pr_listing("not json").is_err());
     }
 
     #[test]

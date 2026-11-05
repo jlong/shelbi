@@ -84,6 +84,9 @@ pub struct ReviewPanel {
     /// `machine:port`. `None` until the shell has a row for the task. The
     /// desktop's Review view shows the same (`render_server`).
     pub server: Option<(shelbi_app::view::ReviewState, Option<String>)>,
+    /// The task's pull request, live from its sidebar row. The desktop's
+    /// Review view shows the same (`pr_row`).
+    pub pr: Option<shelbi_core::IssuePr>,
 }
 
 impl ReviewPanel {
@@ -110,6 +113,7 @@ impl ReviewPanel {
             hit_targets: Vec::new(),
             more_hit: None,
             server: None,
+            pr: None,
         };
         // Focus the Chat switch initially — it's the default middle-pane view.
         panel.selected = panel
@@ -130,7 +134,23 @@ impl ReviewPanel {
         }
         // `More` sits right under the back button, in reading order with the
         // task-info block it belongs to, and only when there's a body to open.
-        shelbi_app::review::panel_rows(!self.description.trim().is_empty(), true, &switches)
+        shelbi_app::review::panel_rows(!self.description.trim().is_empty(), self.pr_url().is_some(), true, &switches)
+    }
+
+    /// Where the pull request opens, when the panel has one to open.
+    pub fn pr_url(&self) -> Option<&str> {
+        self.pr.as_ref().and_then(|pr| pr.url.as_deref())
+    }
+
+    /// Show `pr`. Its row can come or go while the panel is open, so the
+    /// selection stays on the row it was on.
+    pub fn set_pr(&mut self, pr: Option<shelbi_core::IssuePr>) {
+        let current = self.rows().get(self.selected).copied();
+        self.pr = pr;
+        let rows = self.rows();
+        self.selected = current
+            .and_then(|row| rows.iter().position(|r| *r == row))
+            .unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
     }
 
     /// Start index and count of the contiguous `Switch` run in [`rows`].
@@ -307,6 +327,36 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
         y += used;
     }
 
+    // 2b. The pull request, under the summary it belongs to.
+    if let Some(pr) = app.pr.clone() {
+        let pr_idx = app.rows().iter().position(|r| matches!(r, PanelRow::Pr));
+        if y < bottom {
+            y = advance_blank(y, bottom);
+        }
+        if y < bottom {
+            let line = Rect {
+                x: area.x,
+                y,
+                width: area.width,
+                height: 1,
+            };
+            render_pr_line(f, &pr, pr_idx.is_some_and(|i| app.selected == i), line);
+            if let Some(idx) = pr_idx {
+                push_hit(
+                    app,
+                    Rect {
+                        x: area.x + PAD,
+                        y,
+                        width: area.width.saturating_sub(PAD),
+                        height: 1,
+                    },
+                    idx,
+                );
+            }
+            y += 1;
+        }
+    }
+
     // blank
     y = advance_blank(y, bottom);
 
@@ -409,6 +459,29 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
             },
         );
     }
+}
+
+/// The pull-request line: `PR #2137 ↗  open · ● checks passing`.
+fn render_pr_line(f: &mut Frame, pr: &shelbi_core::IssuePr, selected: bool, area: Rect) {
+    let number = if selected {
+        Style::default().fg(palette().ansi_white).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette().cyan)
+    };
+    let mut spans = vec![
+        Span::styled("PR ", Style::default().fg(palette().gray)),
+        Span::styled(crate::kanban::pr_number_text(pr), number),
+    ];
+    spans.extend(crate::kanban::pr_status_spans(pr));
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect {
+            x: area.x + PAD,
+            y: area.y,
+            width: area.width.saturating_sub(PAD),
+            height: 1,
+        },
+    );
 }
 
 /// The server line: the sub-state's glyph and name (`serving`, `loading`,

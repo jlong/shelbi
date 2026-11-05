@@ -1077,6 +1077,7 @@ fn live_active_task_reads_in_progress_and_review_assignments() {
             assigned_to: Some(ws.into()),
             workflow: None,
             branch: None,
+            pr: None,
             depends_on: Vec::new(),
             prefers_machine: None,
             zen: None,
