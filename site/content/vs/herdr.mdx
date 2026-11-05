@@ -2,155 +2,185 @@
 competitor: Herdr
 slug: herdr
 competitorUrl: https://herdr.dev/
-summary: A terminal-native agent multiplexer in Rust. "tmux for agents" with persistent PTYs, SSH reattach, agent-state awareness, and a local socket API.
+summary: A customizable native app for coding agents, backed by herdr-core. The original Herdr TUI remains available as a separate terminal multiplexer.
 ---
 
 {/*
-  Herdr (herdr.dev) is the closest neighbor to Shelbi in the whole
-  landscape: both are terminal-native, Rust, persistent, SSH-first agent
-  runtimes. Do not conflate it with Herd (joinherd.ai), the desktop IDE
-  covered in `herd.mdx` — different product, confusingly similar name. The
-  honest difference here is the shape of the work surface, not raw
-  capability, so this page stays scrupulous about Herdr's real strengths.
+  Checked 2026-11-05. Herdr (herdr.dev) and Herd (joinherd.ai, covered in
+  herd.mdx) are different products. Herdr's native app uses herdr-core;
+  the original TUI has its own server. Do not transfer capabilities or
+  integration guarantees between them. Research and claim evidence are
+  recorded in the PR description.
 */}
 
 ## At a glance
 
-| Dimension          | Shelbi                                       | Herdr                                            |
-| ------------------ | -------------------------------------------- | ------------------------------------------------ |
-| Form factor        | Terminal Kanban + attachable sessions        | Terminal multiplexer (pane grid), mouse-first    |
-| Work surface       | Five-column Kanban with triage and priority  | Live agent panes, no board                       |
-| Scheduler          | LLM orchestrator dispatching from events log | Human-driven multiplexer, the substrate not a scheduler |
-| Review flow        | `review` column, don't merge until signoff   | Live agent handoff, no board-level review gate   |
-| Autonomy           | Zen Mode (auto-promote, self-review, gated merge) | None                                        |
-| Pool               | Fixed declared workers across machines, `prefers_machine` routing | Ad-hoc panes                |
-| Automation API     | Events log + CLI                             | CLI + JSON socket API + agent-to-agent comms + plugin marketplace |
-| Language / binary  | Rust                                         | Rust, single binary                              |
-| License            | MIT                                          | AGPL-3.0 + commercial                            |
-| Maturity           | Newer                                        | ~16.8k stars, v0.7.4                             |
+Both tools keep agents running on your machines and connect over SSH.
+Shelbi organizes work around issues and workflows. Herdr organizes the
+workspace around live agents and an interface you can reshape.
+
+| Dimension | Shelbi | Herdr |
+| --- | --- | --- |
+| Clients | Native macOS app and TUI over the same models and sessions | Native app over herdr-core; original TUI uses a separate server |
+| Desktop platforms | Apple silicon Mac, macOS 15 or later | Apple silicon Mac, Linux and Windows builds |
+| Work surface | Issues board, Orchestrator, Workspaces, Review and Changelog | Spaces, tabs and panes; customizable layouts and mods |
+| Coordination | Project orchestrator dispatches issues to a declared workspace pool | Agents can start helpers, send work and receive reports through `hc` |
+| Remote work | SSH workspaces; full native remote-project window on matching versions | SSH machines and their agents in the same sidebar |
+| Review and merge | Workflow handoff, human review, optional Zen Mode policy | Reviewer helpers and custom workflows built on the runtime |
+| Agents and models | Claude Code and Codex adapters, plus configurable CLI runners | Terminal programs; app status requires OSC 7501, TUI has agent-specific detection |
+| Automation | CLI, durable task messages and event log | herdr-core CLI and API; TUI CLI, socket API and plugins |
+| License | MIT | Apache 2.0 for app, core and TUI |
+| Tool price | Free; agent and machine costs are separate | Free; bring your own agents and machines |
+
+Herdr's [app FAQ](https://herdr.dev/#faq) explains the split: the
+app and TUI do not share running agents. This comparison covers both,
+with TUI-specific features called out explicitly. Checked November 5, 2026.
 
 ## Where Shelbi excels
 
-### A Kanban board, not a pane grid
+### An issue queue connected to the work
 
-Shelbi's surface is a five-column Kanban: `backlog → todo → in_progress →
-review → done`. Work is typed tasks with explicit triage, priority
-(`shelbi issue prio --top|--up|--set N`), and assignment (`shelbi issue
-assign`). The backlog-versus-ready boundary lets you decide what to work
-on before committing to it.
+Shelbi's Issues board tracks work before an agent starts and after it
+finishes. The default task workflow runs through Backlog, Todo,
+In Progress, Review and Done, with Canceled also available. Workflows
+can add their own statuses, agents and transition actions.
 
-Herdr's surface is a multiplexer: panes of live agents, mouse-first, with
-agent-state awareness layered on top. It is a grid of running terminals,
-not a queue of typed cards with a review gate. If you want a board that
-tracks what's ready, in flight, and waiting on you, that lives outside
-Herdr.
+The **New task** dialog in both clients sets Title, Workflow, Status,
+Priority and Description. **Let Orchestrator write this up** asks the
+orchestrator to expand a draft into a task with acceptance criteria.
+The board can use local markdown or [GitHub Issues](/docs/concepts/github-issues),
+so a card can also be an issue your team reads and comments on in GitHub.
 
-### An LLM orchestrator that dispatches
+Herdr can show a board too. Its [guide](https://herdr.dev/guide/) includes
+agent cards grouped by state and opening a worktree for an issue. Shelbi's
+advantage is the supplied issue-to-delivery workflow: queue, dispatch,
+handoff and merge actions are connected from the start.
 
-The orchestrator is a Claude agent running in the project's Shelbi
-session. It tails `~/.shelbi/events.log`, matches lines like `task=fix-login
-todo -> in_progress` against its reaction rules, and dispatches the next
-ready task to whichever worker just freed up. Its instructions live in a
-prompt file you can fork per project.
+### A project orchestrator with persistent capacity
 
-Herdr multiplexes agents a human drives. It is the substrate that keeps
-agents alive and reachable, not the scheduler that decides what runs next.
-The operator stays the dispatcher.
+Shelbi's orchestrator dispatches ready issues to named workspaces, each
+with a persistent git worktree and session on its assigned machine. The
+issue's `prefers_machine` field can constrain dispatch to a particular
+host. The pool makes available capacity explicit across local and SSH
+machines.
 
-### Review-first, don't merge until signoff
+The orchestrator is no longer limited to Claude Code. Onboarding lets you
+choose its harness and default model, then edit its instructions before
+launch. Claude Code and Codex have dedicated adapters; other CLI runners
+are configurable, with fewer integration guarantees.
 
-Finished work lands in a `review` column with the branch ready to inspect,
-and the default is don't merge until a human signs off. A worker signals
-completion by writing its task id to a marker file the hub poller watches;
-the handoff survives machine sleep, network blips, and SSH drops.
+Herdr also supports agent-led coordination. Its [core](https://herdr.dev/core/)
+lets an agent launch helpers and hear back from them. The choice is
+between Shelbi's supplied project scheduler and composing coordination
+around Herdr's runtime primitives.
 
-Herdr has live handoff between agents, but no board-level review gate. Work
-moves agent to agent in the panes; there is no separate staging column that
-holds a branch until a human promotes it.
+### A review workflow with an explicit human handoff
 
-### Zen Mode for gated autonomy
+With Zen Mode off, finished work waits for your decision. The default
+workflow pushes the branch and opens a PR on the move into Review;
+moving to Done runs the merge action. Review workspaces let you load
+the task, inspect the diff and run the project's review recipe before
+accepting or rejecting it.
 
-Shelbi can act as lead: auto-promote ready work, self-review, and merge
-passing changes through configurable gates (required checks, CI wait,
-danger-path guards). You opt into as much or as little of the loop as you
-trust, and the gates are yours to set.
+Herdr's [reviewer-helper example](https://herdr.dev/guide/)
+can get another agent's findings back to the parent. Shelbi provides the
+issue status and human review path around that kind of work as part of
+its workflow model.
 
-Herdr has no equivalent autonomous merge loop. It keeps agents running and
-reachable; deciding what merges stays with you at every step.
+### Optional autonomy under a project policy
 
-### A fixed pool that spans machines
+`shelbi zen on`, `shelbi zen pause` and `shelbi zen off` control
+[Zen Mode](/docs/concepts/zen-mode). The project's editable `zenmode.md`
+instructs the orchestrator when to promote backlog and finalize work.
+The shipped policy checks local results, conflicts, diff size and danger
+paths, then requires a review against the issue and checks CI before
+moving passing work to Done. The workflow transition owns the merge.
 
-Shelbi workers are named slots declared once in project YAML, living across
-however many machines you list. A worker on `devbox` and a worker on `hub`
-show up as named slots the orchestrator routes work to over SSH, and a task
-can pin itself to a host with `prefers_machine: devbox` when it needs a GPU,
-a local model, or a specific build environment.
+The shipped policy leaves tasks routed to review workspaces for a human.
+Zen is an agent policy supported by CLI primitives, so its prose rules
+depend on the orchestrator following them. Herdr supplies coordination
+and customization tools; Shelbi ships this project-level policy.
 
-Herdr spins up panes ad hoc. It reaches any box over SSH, but there is no
-declared roster of named workers or per-task host routing.
+### Desktop and terminal views of the same project
 
-### MIT, no AGPL obligations
+Shelbi's native macOS app shipped in v0.11.0 and shares its application
+models, command registry and sessions with the TUI. Remote workspaces
+open from the sidebar with shell, diff and editor sessions. Since
+v0.13.2, a remote project can open in the full native window over one
+SSH relay per host. Both machines need matching Shelbi versions;
+otherwise Shelbi opens the remote TUI in a terminal view with a notice.
+v0.13.3 extends the native connection to password-only hosts.
 
-Shelbi is MIT. For a team that wants to embed, fork, or modify the
-orchestration loop without copyleft obligations, that is a real
-differentiator. Herdr is dual-licensed AGPL-3.0-or-later plus a commercial
-license for organizations that cannot comply with AGPL.
+The project's Changelog page, added in v0.12.0, gives both clients a
+searchable record of what shipped. See the [release history](/docs/changelog)
+for these changes. Herdr's app and TUI are separate runtimes, so switching
+between those two interfaces does not expose the same running agents.
 
 ## Where Herdr excels
 
-### More mature and more widely adopted
+### A native app across more operating systems
 
-Herdr is further along its version line than Shelbi, at v0.7.4 with roughly
-16.8k GitHub stars and a single author shipping actively. If proven mileage
-and a large user base matter to you, Herdr has both today.
+Herdr offers [desktop builds](https://herdr.dev/download/) for Apple
+silicon macOS, Linux on x86_64 and arm64, and Windows on x86_64.
+Shelbi's native app requires an Apple silicon Mac with macOS 15 or later;
+its terminal client supports macOS and Linux. If you want a graphical
+workspace on Linux or Windows, Herdr has the broader offering.
 
-### A larger automation surface and plugin ecosystem
+### An interface your agent can rebuild
 
-Herdr exposes a CLI and a local JSON socket API that scripts, tools, and
-agents can use to drive sessions programmatically: spawn panes, read
-output, synchronize work. On top of that sits a GitHub-based plugin
-marketplace the project says carries 150+ community plugins. Shelbi's
-automation surface is the events log and CLI, which is leaner.
+Herdr's [app documentation](https://github.com/herdrdev/herdr-app#make-it-yours)
+describes layouts and JavaScript mods for panels, menus and dialogs.
+Personal files reload when saved. You can ask an agent to build a board,
+add a timer or change the workspace, and share layouts and mods.
 
-### Agent-to-agent socket comms as a first-class primitive
+The original TUI has a separate [plugin marketplace](https://herdr.dev/tui/docs/marketplace/)
+and executable plugin system. Those are distinct extension systems.
+Herdr gives you more scope to invent a work surface; Shelbi supplies
+an opinionated board and workflow with settings you can edit.
 
-Through that same socket API, Herdr agents can coordinate directly with
-each other, not only with a human operator. If agent-to-agent coordination
-is load-bearing in your workflow, Herdr treats it as a built-in primitive
-rather than something you assemble yourself.
+### Direct coordination primitives for agents
 
-### Mouse-first polish lowers the terminal learning curve
+[herdr-core](https://github.com/herdrdev/herdr-core#agents-run-agents)
+provides `hc run`, `hc send`, `hc read` and `hc wait` for starting,
+steering and inspecting helpers. Its API is available to other clients,
+with `hc schema` describing requests and responses. This is a useful
+foundation if you want to build your own coordination tool.
 
-Herdr's pane management is mouse-first, a deliberate departure from the
-keyboard-first tmux and zellij model, with keyboard and mouse both
-first-class. For people who find a keyboard-driven terminal UI a barrier,
-that polish is a genuine on-ramp. Shelbi's TUI is keyboard-first.
+Core status comes from programs reporting through OSC 7501. Programs
+without that protocol still run, but have no reported agent status.
+The [original TUI](https://herdr.dev/tui/docs/agents/) additionally detects
+agents such as Claude Code, Codex, OpenCode, Pi and GitHub Copilot CLI
+from screen rules or integrations. That TUI support list does not imply
+the same status support in the new app. Models come from the agent you run.
 
-### A simpler mental model when you just want the multiplexer
+### A multiplexer without adopting a project workflow
 
-A pure multiplexer is easier to reason about if all you want is "many
-agents, one terminal, over SSH" without a board or an autonomous loop.
-Herdr's persistent PTYs, tmux-style detach and reattach, restart-restore,
-and reattach from any device (including a phone) deliver exactly that,
-with less to learn than a full orchestration model.
+The [Herdr TUI](https://github.com/herdrdev/herdr/blob/master/README.md) keeps keyboard
+prefix controls alongside clicking, dragging and splitting panes. It
+fits a workflow where you want to arrange terminals and keep running
+agents reachable without first defining a dispatch pool or task lifecycle.
+
+Persistence has limits worth understanding. Closing a viewer leaves
+programs running. After a reboot or core crash, the new app restores
+kept panes with fresh shells, not running agents. The original TUI can
+resume supported agent sessions from saved state; the old processes do
+not survive a restart.
 
 ## Choose Shelbi if…
 
-- You want a Kanban queue across machines you already own, with explicit
-  triage, priority, and per-task host routing.
-- Review-before-merge is non-negotiable and you want a staging column that
-  holds a branch until a human signs off.
-- You want the orchestration loop to be inspectable code you can fork per
-  project, not a substrate you drive by hand.
-- You want optional hands-off autonomous merging under your own gates.
-- MIT licensing matters and AGPL obligations are a non-starter.
+- You want issues, priorities, dispatch, review and merges in one workflow.
+- You want a declared pool of workspaces across your machines, with per-task
+  host routing.
+- You want the macOS app and terminal client to access the same sessions,
+  including a native window for a remote project.
+- You want a supplied Zen policy you can tune, while keeping human review
+  for tasks routed to review workspaces.
 
 ## Choose Herdr if…
 
-- You want a polished, mouse-first terminal multiplexer for many agents
-  over SSH, and you don't need a task board or an autonomous merge loop.
-- Agent-to-agent socket coordination is load-bearing for your workflow.
-- A larger plugin ecosystem and a more proven, widely-starred tool matter
-  to you today.
-- You want the simplest possible mental model: many agents, one terminal,
-  reattachable from any device.
+- You want a native agent workspace on Linux or Windows as well as macOS.
+- You want agents to reshape the interface with layouts and mods, or you
+  want the original TUI's plugin system.
+- You want a terminal runtime and API for composing your own agent coordination.
+- You mainly need live terminals and agent visibility, and prefer to arrange
+  the issue and delivery workflow yourself.
