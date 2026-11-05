@@ -365,9 +365,10 @@ pub(crate) fn remote_diff_session_command(
 /// a failed or absent merge never leaves the board reading `done` with an
 /// open PR / unmerged branch. On merge failure the move is abandoned and the
 /// error propagated so the reviewer sees it. The edge's remaining cleanup
-/// (`delete_branch`, review-workspace teardown, slot free) fires after the
-/// move — the teardown half is [`close_review_window`], called by the caller.
-pub fn approve_review_task(project_name: &str, task_id: &str) -> Result<()> {
+/// (`delete_branch`, its `run:` commands, …) is returned for the caller to run:
+/// the decision has landed by then, so a reviewer needn't wait on it. The
+/// teardown half is [`close_review_window`], also the caller's.
+pub fn approve_review_task(project_name: &str, task_id: &str) -> Result<AcceptCleanup> {
     let project = shelbi_state::load_project(project_name)?;
     let store = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?;
     let tf = store
@@ -417,24 +418,56 @@ pub fn approve_review_task(project_name: &str, task_id: &str) -> Result<()> {
         );
     }
 
-    // Fire the edge's remaining actions (delete_branch, …) after the move,
+    // The edge's remaining actions (delete_branch, …) fire after the move,
     // skipping the actions the gate already ran (the pre-merge prefix plus
-    // `merge`) so none is re-run. Best-effort — the move landed.
-    if let Some(gm) = &merged {
+    // `merge`) so none is re-run.
+    Ok(AcceptCleanup(merged.map(|gm| PostMerge {
+        project,
+        project_name: project_name.to_string(),
+        task: tf.task,
+        body: tf.body,
+        workflow,
+        from: from_status,
+        to: to_status,
+        ran: gm.ran,
+    })))
+}
+
+/// What an accept still has to do once its task has moved: the rest of the
+/// edge's actions, when it merged. See [`approve_review_task`].
+#[must_use = "the accept's branch cleanup hasn't run yet"]
+pub struct AcceptCleanup(Option<PostMerge>);
+
+struct PostMerge {
+    project: shelbi_core::Project,
+    project_name: String,
+    task: shelbi_core::Issue,
+    body: String,
+    workflow: shelbi_core::Workflow,
+    from: String,
+    to: String,
+    ran: Vec<shelbi_core::TransitionAction>,
+}
+
+impl AcceptCleanup {
+    /// Fire the edge's remaining actions. Best-effort: the move landed.
+    pub fn run(self) {
+        let Some(m) = self.0 else {
+            return;
+        };
         if let Err(e) = crate::transition::execute_transition_except(
-            &project,
-            project_name,
-            &tf.task,
-            &tf.body,
-            &workflow,
-            &from_status,
-            &to_status,
-            &gm.ran,
+            &m.project,
+            &m.project_name,
+            &m.task,
+            &m.body,
+            &m.workflow,
+            &m.from,
+            &m.to,
+            &m.ran,
         ) {
-            tracing::warn!(task = %task_id, error = %e, "post-merge accept cleanup failed (merge already landed)");
+            tracing::warn!(task = %m.task.id, error = %e, "post-merge accept cleanup failed (merge already landed)");
         }
     }
-    Ok(())
 }
 
 /// Close the review slot's tmux window after acceptance so the slot returns to

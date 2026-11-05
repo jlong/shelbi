@@ -282,12 +282,22 @@ paths on every `cargo test`.
   machine, so the desktop leaves it to the TUI and shows its palette chord in
   the sidebar's search box instead.
 - **Links**: the desktop's review URLs are clickable; the TUI prints them.
+- **A decision leaves the review at once** in both clients: Approve or Reject
+  returns to the view the review was opened over (the Orchestrator if that was
+  the review's own slot or a workspace that's gone), the sidebar holding the
+  keys, while the daemon runs it. `shelbi_app::review::ReviewDecisions` tracks
+  it: the review's row says Merging… or Rejecting… in place of its branch, and
+  a running review takes no second decision. A review opened again meanwhile
+  shows the merge gate, and Back still leaves it. On the desktop a notice over
+  the main area carries the progress, then a failure with Reopen and dismiss
+  actions. The TUI has one status line, so it shows both there, and the review's
+  row is the reopen. Either way the reopened panel shows the error.
 - **The review panel takes the sidebar's place** in both clients: with a
   review open the window is two columns, the panel then the session. The TUI
   swaps them in place. The desktop pushes between them like two levels of a
   navigation stack (`views/column_swap.rs`): going in, the sidebar slides out
   to the left and fades while the panel slides in from the right; Back,
-  Close, a decision landing, or the task leaving review play the reverse. It
+  Close, a decision, or the task leaving review play the reverse. It
   takes about 220ms, ease-out, clipped to the column, which keeps its width
   so the session never moves; a second toggle mid-way turns it around from
   where it stands. Under macOS Reduce Motion it is a crossfade with no

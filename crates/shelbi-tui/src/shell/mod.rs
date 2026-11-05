@@ -65,6 +65,7 @@ use ratatui::Terminal;
 
 use shelbi_app::command::CommandRegistry;
 use shelbi_app::exec::{Effect, Mutation};
+use shelbi_app::review::{Decision, ReviewDecisions};
 use shelbi_app::nav::{ClientState, Focus, View};
 use shelbi_app::view::SidebarModel;
 use shelbi_app::CommandKind;
@@ -272,6 +273,11 @@ trait ReviewBackend: Send + Sync {
     /// Load a queued `task` onto the free review `workspace` through the daemon
     /// (checkout + boot + health-check + agent). Blocking.
     fn load(&self, project: &str, task: &str, workspace: &str) -> Result<(), String>;
+    /// Run a decision on a review through the daemon (the gated merge for an
+    /// approve). Blocking.
+    fn decide(&self, m: &Mutation) -> Result<(), String>;
+    /// Ask the daemon to end a decided review's content sessions. Blocking.
+    fn close(&self, project: &str, task: &str) -> Result<(), String>;
 }
 
 /// The production [`ReviewBackend`]: resolve through the orchestrator's
@@ -328,6 +334,15 @@ impl ReviewBackend for DaemonReviewBackend {
         )
         .map_err(|e| e.to_string())
     }
+
+    fn decide(&self, m: &Mutation) -> Result<(), String> {
+        run_review_mutation(m)
+    }
+
+    fn close(&self, project: &str, task: &str) -> Result<(), String> {
+        let op = shelbi_app::ReviewSessionOp::Close;
+        shelbi_app::review_session(project, task, op, &mut |_, _| {}).map_err(|e| e.to_string())
+    }
 }
 
 /// A message from a review background job (all run off the UI thread).
@@ -341,10 +356,15 @@ enum ReviewJobMsg {
     /// A daemon `Ensure` for the editor finished; bind the view on success. (The
     /// diff waits for itself: `ReviewInterface::show_diff`.)
     ContentReady(Result<(), String>),
-    /// The gated merge (approve) finished.
-    MergeDone(Result<(), String>),
-    /// A reject-with-reason finished.
-    RejectDone(Result<(), String>),
+}
+
+/// The daemon's answer to a review decision.
+struct DecisionReply {
+    /// The project it was on: the shell may have switched since.
+    project: String,
+    task: String,
+    decision: Decision,
+    result: Result<(), String>,
 }
 
 /// The result of the off-thread add-project job: the created project's slug (to
@@ -618,6 +638,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             }
         }
         if state.poll_review() {
+            state.dirty = true;
+        }
+        if state.poll_decisions() {
             state.dirty = true;
         }
         if state.poll_review_reconcile() {
@@ -1244,6 +1267,12 @@ struct ShellState {
     /// In-flight review background work (open resolution, content ensure,
     /// approve, reject). Drained by [`ShellState::poll_review`].
     review_rx: Option<Receiver<ReviewJobMsg>>,
+    /// The review decisions on their way through the daemon, and the failures
+    /// a reopened review will show: the shell leaves a review the moment it's
+    /// decided. Replies come back through [`Self::decision_rx`].
+    decisions: ReviewDecisions,
+    decision_tx: Sender<DecisionReply>,
+    decision_rx: Receiver<DecisionReply>,
     /// The daemon-facing review operations (resolve / load), behind a seam so the
     /// queued-load flow is testable with a stubbed daemon (`rt-tui-review-load-queued`).
     review_backend: Arc<dyn ReviewBackend>,
@@ -1560,6 +1589,7 @@ impl ShellState {
             c
         };
         let (settings_tx, settings_rx) = std::sync::mpsc::channel();
+        let (decision_tx, decision_rx) = std::sync::mpsc::channel();
         // Tests never read the real `~/.shelbi` (and `load_project` may migrate).
         #[cfg(not(test))]
         let settings_reader: SettingsReader =
@@ -1642,6 +1672,9 @@ impl ShellState {
             onboarding: None,
             review: None,
             review_rx: None,
+            decisions: ReviewDecisions::default(),
+            decision_tx,
+            decision_rx,
             review_backend: Arc::new(DaemonReviewBackend),
             review_opening: None,
             review_open_pending: None,
@@ -1854,7 +1887,7 @@ impl ShellState {
     fn sidebar_view(&self) -> Option<SidebarView> {
         self.sidebar_model
             .as_ref()
-            .map(|m| SidebarView::build(m).with_emoji(self.caps.emoji))
+            .map(|m| SidebarView::build(m).with_emoji(self.caps.emoji).with_decisions(&self.decisions))
     }
 
     /// The per-frame sidebar inputs (the palette chord, the hovered footer
@@ -2245,6 +2278,7 @@ impl ShellState {
         // startup brings its own up if it needs one.
         self.onboarding = None;
         self.review_rx = None;
+        self.decisions.clear();
         self.review_opening = None;
         self.review_open_pending = None;
         self.reconcile_rx = None;
@@ -4048,29 +4082,27 @@ impl ShellState {
             Effect::QuitProject { .. } => self.quit(QuitAction::QuitProject),
             Effect::QuitShelbi => self.quit(QuitAction::QuitShelbi),
             Effect::Mutate(Mutation::ToggleZen { project }) => self.toggle_zen(project),
-            // The palette's review decisions. Approving the review that is open
-            // here goes through its panel (so the panel holds while it merges);
-            // any other runs off the UI thread with a status line. Reject asks
+            // The palette's review decisions, the panel's own path. Reject asks
             // for the reason first unless one came with it.
             Effect::Mutate(Mutation::ApproveReview { project, id }) => {
-                if self.review.as_ref().map(|r| r.task_id()) == Some(id.as_str()) {
-                    self.apply_review_action(ReviewAction::Approve);
-                } else {
-                    let m = Mutation::ApproveReview {
-                        project,
-                        id: id.clone(),
-                    };
-                    self.spawn_job(move || match run_review_mutation(&m) {
-                        Ok(()) => format!("approved {id}"),
-                        Err(e) => format!("approve failed: {e}"),
-                    });
-                }
+                let m = Mutation::ApproveReview {
+                    project,
+                    id: id.clone(),
+                };
+                self.start_decision(id, Decision::Approve, m);
             }
             Effect::Mutate(Mutation::RejectReview { id, reason, .. }) if reason.trim().is_empty() => {
-                self.overlay = Some(ActiveOverlay::reject_reason(id));
+                if !self.refuse_second_decision(&id) {
+                    self.overlay = Some(ActiveOverlay::reject_reason(id));
+                }
             }
-            Effect::Mutate(m @ Mutation::RejectReview { .. }) => {
-                self.spawn_mutation(m, "rejected", "reject failed")
+            Effect::Mutate(Mutation::RejectReview { project, id, reason }) => {
+                let m = Mutation::RejectReview {
+                    project,
+                    id: id.clone(),
+                    reason,
+                };
+                self.start_decision(id, Decision::Reject, m);
             }
             // The form's submit, wherever it came from: validate, scaffold, switch.
             Effect::Mutate(Mutation::AddProject { name, root, mode, defaults }) => {
@@ -4281,6 +4313,7 @@ impl ShellState {
             p.task.map(|b| *b),
         )
         .with_apps(p.apps));
+        self.sync_review_decision();
         self.reported_main = None; // re-report size for the content view
         self.status = None;
         self.review_open_pending = None;
@@ -4388,20 +4421,6 @@ impl ShellState {
                     self.reported_main = None;
                 }
             }
-            ReviewJobMsg::MergeDone(Ok(())) => self.finish_review_close("approved"),
-            ReviewJobMsg::MergeDone(Err(e)) => {
-                if let Some(r) = self.review.as_mut() {
-                    r.set_merging(false);
-                    r.set_status(format!("approve failed: {e}"));
-                }
-            }
-            ReviewJobMsg::RejectDone(Ok(())) => self.finish_review_close("rejected"),
-            ReviewJobMsg::RejectDone(Err(e)) => {
-                if let Some(r) = self.review.as_mut() {
-                    r.set_merging(false);
-                    r.set_status(format!("reject failed: {e}"));
-                }
-            }
         }
         true
     }
@@ -4446,25 +4465,16 @@ impl ShellState {
                     .ok();
             }
             ReviewAction::Approve => {
-                if let Some(r) = self.review.as_mut() {
-                    r.set_merging(true);
-                }
-                let (tx, rx) = std::sync::mpsc::channel();
-                self.review_rx = Some(rx);
-                std::thread::Builder::new()
-                    .name("shelbi-review-approve".into())
-                    .spawn(move || {
-                        let m = shelbi_app::Mutation::ApproveReview {
-                            project: project.clone(),
-                            id: task.clone(),
-                        };
-                        let res = run_review_mutation(&m);
-                        let _ = tx.send(ReviewJobMsg::MergeDone(res));
-                    })
-                    .ok();
+                let m = shelbi_app::Mutation::ApproveReview {
+                    project,
+                    id: task.clone(),
+                };
+                self.start_decision(task, Decision::Approve, m);
             }
             ReviewAction::Reject => {
-                self.overlay = Some(ActiveOverlay::reject_reason(task));
+                if !self.refuse_second_decision(&task) {
+                    self.overlay = Some(ActiveOverlay::reject_reason(task));
+                }
             }
             ReviewAction::ShowDescription => {
                 // Open the board's task-detail popover over the main area. The
@@ -4554,53 +4564,158 @@ impl ShellState {
         self.show(RowTarget::Session(SessionRef::Orchestrator));
     }
 
-    /// Finish an approve/reject: the task has left review, so tear the interface
-    /// down (the daemon frees the sessions and port) and return to the chat.
-    fn finish_review_close(&mut self, how: &str) {
-        let project = self
-            .client
-            .project()
-            .map(str::to_string)
-            .unwrap_or_default();
-        if let Some(r) = self.review.as_ref() {
-            let task = r.task_id().to_string();
-            let p = project.clone();
-            self.spawn_job(move || {
-                let op = shelbi_app::ReviewSessionOp::Close;
-                let _ = shelbi_app::review_session(&p, &task, op, &mut |_, _| {});
-                String::new()
-            });
+    /// Send a review decision to the daemon off the UI thread. A review being
+    /// decided on leaves the main area at once for the view it was opened over:
+    /// nothing is left to do on it. Its sessions stay until the decision lands,
+    /// so a refused one can reopen where it was. Meanwhile the status line and
+    /// the review's row carry the news ([`Self::decisions`]).
+    fn start_decision(&mut self, task: String, decision: Decision, m: Mutation) {
+        if self.refuse_second_decision(&task) {
+            return;
         }
-        self.review = None;
-        self.status = Some(format!("review {how}"));
-        self.show(RowTarget::Session(SessionRef::Orchestrator));
+        let Some(project) = self.client.project().map(str::to_string) else {
+            return;
+        };
+        self.decisions.begin(&task, decision);
+        if self.review.as_ref().map(|r| r.task_id()) == Some(task.as_str()) {
+            self.leave_ended_review();
+        }
+        self.status = Some(decision.working(&task));
+        self.dirty = true;
+        let tx = self.decision_tx.clone();
+        let backend = self.review_backend.clone();
+        let (id, name) = (task.clone(), format!("shelbi-review-{decision:?}"));
+        let spawned = std::thread::Builder::new().name(name).spawn(move || {
+            let result = backend.decide(&m);
+            let _ = tx.send(DecisionReply {
+                project,
+                task: id,
+                decision,
+                result,
+            });
+        });
+        if let Err(e) = spawned {
+            self.decision_refused(&task, decision, &e.to_string());
+        }
     }
 
-    /// Submit a reject-with-reason (from the reject overlay) off the UI thread.
-    /// Like approve, the review is held inert while it runs.
+    /// Whether a decision is already running on review `task`, in which case
+    /// it takes no other: say so.
+    fn refuse_second_decision(&mut self, task: &str) -> bool {
+        let running = self.decisions.running(task).is_some();
+        if running {
+            self.status = Some(format!("{task} already has a decision running."));
+            self.dirty = true;
+        }
+        running
+    }
+
+    /// Drop the open review (its daemon sessions stay) and return to the view
+    /// it was opened over, the sidebar holding the keys, as Back does.
+    fn leave_ended_review(&mut self) {
+        let slot = self.review.take().map(|r| r.slot().to_string());
+        let workspaces = self.sidebar_model.as_ref().map_or(&[][..], |m| m.workspaces.as_slice());
+        let view = shelbi_app::review::ended_review_return(self.client.view().clone(), slot.as_deref(), workspaces);
+        self.client.set_view(view.clone());
+        self.apply_restored_view(view);
+        self.client.focus_sidebar();
+        self.dirty = true;
+    }
+
+    /// Apply the daemon's answers to the decisions in flight. Returns whether
+    /// there were any.
+    fn poll_decisions(&mut self) -> bool {
+        let replies: Vec<DecisionReply> = self.decision_rx.try_iter().collect();
+        let any = !replies.is_empty();
+        for reply in replies {
+            self.on_decision_reply(reply);
+        }
+        any
+    }
+
+    fn on_decision_reply(&mut self, reply: DecisionReply) {
+        let DecisionReply {
+            project,
+            task,
+            decision,
+            result,
+        } = reply;
+        match result {
+            // The shell switched projects meanwhile: only the sessions are left
+            // to see to.
+            Ok(()) if self.client.project() != Some(project.as_str()) => self.close_review_sessions(project, task),
+            Ok(()) => {
+                if self.decisions.landed(&task).is_some() {
+                    // Opened again while the decision ran: it goes now.
+                    if self.review.as_ref().map(|r| r.task_id()) == Some(task.as_str()) {
+                        if let Some(r) = self.review.as_mut() {
+                            r.note_deliberate_close();
+                        }
+                        self.leave_ended_review();
+                    }
+                    self.close_review_sessions(project, task.clone());
+                    self.status = Some(decision.done(&task));
+                }
+            }
+            Err(e) => self.decision_refused(&task, decision, &e),
+        }
+        self.request_refresh();
+    }
+
+    /// Ask the daemon to end review `task`'s content sessions, off the UI thread.
+    fn close_review_sessions(&self, project: String, task: String) {
+        let backend = self.review_backend.clone();
+        let close = move || {
+            if let Err(e) = backend.close(&project, &task) {
+                tracing::warn!(task = %task, error = %e, "couldn't close the review's sessions");
+            }
+        };
+        if let Err(e) = std::thread::Builder::new().name("shelbi-review-close".into()).spawn(close) {
+            tracing::warn!(error = %e, "couldn't start the review's close");
+        }
+    }
+
+    /// The daemon refused decision `decision` on review `task`: its panel says
+    /// so if it's open again, otherwise the status line does, and the panel
+    /// will once its row opens it (it stays loaded on its slot).
+    fn decision_refused(&mut self, task: &str, decision: Decision, error: &str) {
+        self.decisions.failed(task, error);
+        if self.review.as_ref().map(|r| r.task_id()) == Some(task) {
+            self.sync_review_decision();
+        } else {
+            let line = decision.failed_on(task, error);
+            self.status = Some(format!("{line} (open its review to try again)"));
+        }
+        self.dirty = true;
+    }
+
+    /// Bring the open review's panel in line with its decision: the merge gate
+    /// while one runs, and the failure one left.
+    fn sync_review_decision(&mut self) {
+        let Some(task) = self.review.as_ref().map(|r| r.task_id().to_string()) else {
+            return;
+        };
+        let merging = self.decisions.running(&task).is_some();
+        let failure = self.decisions.take_failure(&task);
+        if let Some(r) = self.review.as_mut() {
+            r.set_merging(merging);
+            if let Some(line) = failure {
+                r.set_status(line);
+            }
+        }
+    }
+
+    /// Submit a reject-with-reason (from the reject overlay).
     fn submit_reject(&mut self, task_id: String, reason: String) {
         let Some(project) = self.client.project().map(str::to_string) else {
             return;
         };
-        if let Some(r) = self.review.as_mut() {
-            r.set_merging(true);
-        } else {
-            self.status = Some(format!("rejecting {task_id}…"));
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.review_rx = Some(rx);
-        std::thread::Builder::new()
-            .name("shelbi-review-reject".into())
-            .spawn(move || {
-                let m = shelbi_app::Mutation::RejectReview {
-                    project,
-                    id: task_id,
-                    reason,
-                };
-                let res = run_review_mutation(&m);
-                let _ = tx.send(ReviewJobMsg::RejectDone(res));
-            })
-            .ok();
+        let m = Mutation::RejectReview {
+            project,
+            id: task_id.clone(),
+            reason,
+        };
+        self.start_decision(task_id, Decision::Reject, m);
     }
 
     // --- layout events (rt-daemon-layout-split, driven natively) -----------
@@ -8289,6 +8404,11 @@ mod tests {
         resolve: Mutex<Option<Result<ResolvedReview, String>>>,
         load_result: Mutex<Option<Result<(), String>>>,
         load_calls: Mutex<Vec<(String, String, String)>>,
+        /// What each decision answers (`Ok` when nothing's staged), and the
+        /// decisions and closes asked for.
+        decide_result: Mutex<Option<Result<(), String>>>,
+        decided: Mutex<Vec<Mutation>>,
+        closed: Mutex<Vec<String>>,
     }
 
     impl StubReviewBackend {
@@ -8319,6 +8439,192 @@ mod tests {
                 .take()
                 .unwrap_or(Ok(()))
         }
+        fn decide(&self, m: &Mutation) -> Result<(), String> {
+            self.decided.lock().unwrap().push(m.clone());
+            self.decide_result.lock().unwrap().clone().unwrap_or(Ok(()))
+        }
+        fn close(&self, _project: &str, task: &str) -> Result<(), String> {
+            self.closed.lock().unwrap().push(task.into());
+            Ok(())
+        }
+    }
+
+    // --- a decision on the review ---------------------------------------------
+
+    /// A shell over `view` with review `t-1` open on `review-1`.
+    fn deciding_over(view: View) -> (ShellState, Arc<StubReviewBackend>) {
+        let stub = Arc::new(StubReviewBackend::default());
+        let mut st = test_state();
+        st.review_backend = stub.clone();
+        st.client.set_view(view);
+        open_review(&mut st);
+        (st, stub)
+    }
+
+    fn open_review(st: &mut ShellState) {
+        st.build_review_interface(ReviewOpenParams {
+            task_id: "t-1".into(),
+            slot: "review-1".into(),
+            worktree: "/wt".into(),
+            editor_name: "Vim".into(),
+            apps: Default::default(),
+            has_review_url: false,
+            task: None,
+        });
+    }
+
+    /// Wait for the daemon's answer to the decision in flight, and apply it.
+    fn pump_decision(st: &mut ShellState) {
+        for _ in 0..1000 {
+            if st.poll_decisions() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("the decision never answered");
+    }
+
+    /// The closes asked for by now (they run on a thread of their own).
+    fn closed_within_a_moment(stub: &StubReviewBackend) -> Vec<String> {
+        for _ in 0..1000 {
+            if !stub.closed.lock().unwrap().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        stub.closed.lock().unwrap().clone()
+    }
+
+    fn off_the_review(st: &ShellState) {
+        assert!(st.review.is_none(), "the review was left");
+        assert!(!matches!(st.main_view, MainView::Review(_)));
+        assert_eq!(st.client.focus(), Focus::Sidebar, "keys on the sidebar");
+    }
+
+    #[test]
+    fn a_decision_leaves_the_review_at_once_and_lands_later() {
+        // The worker may have answered already; nothing applies it until the poll.
+        let (mut st, stub) = deciding_over(View::Issues);
+        st.apply_review_action(ReviewAction::Approve);
+        off_the_review(&st);
+        assert!(matches!(st.main_view, MainView::Native(View::Issues)), "back where it came from");
+        assert_eq!(st.status.as_deref(), Some("Merging t-1…"));
+        assert_eq!(st.decisions.running("t-1"), Some(Decision::Approve));
+        assert!(stub.closed.lock().unwrap().is_empty(), "the sessions stay until it lands");
+
+        pump_decision(&mut st);
+        assert_eq!(st.status.as_deref(), Some("Approved t-1."));
+        assert!(st.decisions.notices().is_empty());
+        assert_eq!(closed_within_a_moment(&stub), ["t-1"]);
+        off_the_review(&st);
+    }
+
+    #[test]
+    fn a_rejection_leaves_the_same_way() {
+        let (mut st, stub) = deciding_over(View::Session("orch".into()));
+        st.submit_reject("t-1".into(), "flaky".into());
+        off_the_review(&st);
+        assert!(matches!(st.main_view, MainView::Session));
+        assert_eq!(st.status.as_deref(), Some("Rejecting t-1…"));
+        pump_decision(&mut st);
+        assert_eq!(st.status.as_deref(), Some("Rejected t-1."));
+        assert_eq!(closed_within_a_moment(&stub), ["t-1"]);
+    }
+
+    #[test]
+    fn a_decision_never_returns_to_the_reviews_own_slot() {
+        let (mut st, _stub) = deciding_over(View::Session("review-1".into()));
+        st.apply_review_action(ReviewAction::Approve);
+        off_the_review(&st);
+        assert_eq!(*st.client.view(), View::Session("orch".into()));
+        pump_decision(&mut st);
+    }
+
+    #[test]
+    fn the_row_says_a_decision_is_running_and_the_review_takes_no_second() {
+        let (mut st, stub) = deciding_over(View::Issues);
+        if let Some(model) = st.sidebar_model.as_mut() {
+            model.reviews = vec![shelbi_app::view::ReviewRow {
+                task_id: "t-1".into(),
+                title: "Warm the cache".into(),
+                branch: "jlong/t-1".into(),
+                location: None,
+                workspace: Some("review-1".into()),
+                state: shelbi_app::view::ReviewState::Serving,
+                number: None,
+            }];
+        }
+        st.apply_review_action(ReviewAction::Approve);
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("Merging…"), "the row says so:\n{screen}");
+        assert!(!screen.contains("jlong/t-1"), "in place of its branch:\n{screen}");
+
+        st.submit_reject("t-1".into(), "flaky".into());
+        let m = Mutation::ApproveReview {
+            project: "proj".into(),
+            id: "t-1".into(),
+        };
+        st.start_decision("t-1".into(), Decision::Approve, m);
+        assert_eq!(st.status.as_deref(), Some("t-1 already has a decision running."));
+
+        pump_decision(&mut st);
+        assert_eq!(stub.decided.lock().unwrap().len(), 1, "one decision reached the daemon");
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("jlong/t-1"), "the row is itself again");
+    }
+
+    #[test]
+    fn a_failure_landing_later_says_so_and_the_reopened_review_shows_it() {
+        let (mut st, stub) = deciding_over(View::Issues);
+        *stub.decide_result.lock().unwrap() = Some(Err("the merge was refused".into()));
+        st.apply_review_action(ReviewAction::Approve);
+        off_the_review(&st);
+
+        pump_decision(&mut st);
+        off_the_review(&st);
+        assert_eq!(
+            st.status.as_deref(),
+            Some("Couldn't approve t-1: the merge was refused (open its review to try again)")
+        );
+        assert!(stub.closed.lock().unwrap().is_empty(), "the sessions stay: it's still loaded");
+
+        open_review(&mut st);
+        let r = st.review.as_ref().unwrap();
+        assert!(!r.is_merging(), "the panel takes input");
+        assert_eq!(r.status_line(), "approve failed: the merge was refused");
+        assert!(st.decisions.notices().is_empty(), "the panel has it now");
+    }
+
+    #[test]
+    fn a_review_opened_mid_merge_never_holds_the_user() {
+        let (mut st, stub) = deciding_over(View::Issues);
+        st.apply_review_action(ReviewAction::Approve);
+        open_review(&mut st);
+        assert!(st.review.as_ref().unwrap().is_merging(), "it can't be decided on twice");
+
+        // Esc leaves it, as ever.
+        let action = st.review.as_mut().unwrap().handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(action, ReviewAction::Back);
+
+        // Stayed on it: the decision landing takes it down.
+        pump_decision(&mut st);
+        off_the_review(&st);
+        assert_eq!(st.status.as_deref(), Some("Approved t-1."));
+        assert_eq!(closed_within_a_moment(&stub), ["t-1"]);
+    }
+
+    #[test]
+    fn a_failure_on_a_review_opened_mid_merge_stays_on_it() {
+        let (mut st, stub) = deciding_over(View::Issues);
+        *stub.decide_result.lock().unwrap() = Some(Err("the merge was refused".into()));
+        st.apply_review_action(ReviewAction::Approve);
+        open_review(&mut st);
+        pump_decision(&mut st);
+        let r = st.review.as_ref().expect("still open");
+        assert!(!r.is_merging());
+        assert_eq!(r.status_line(), "approve failed: the merge was refused");
     }
 
     fn slot(name: &str) -> Slot {

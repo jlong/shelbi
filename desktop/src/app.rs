@@ -90,7 +90,7 @@ use shelbi_app::changelog::ChangelogEntryView;
 use shelbi_app::overlay::palette::ProjectEntry as PaletteProject;
 use shelbi_app::overlay::palette_search::{issue_docs, IssueDoc, PaletteSearch, SearchCorpus};
 use shelbi_app::overlay::review_confirm::Slot;
-use shelbi_app::review::{LoadStep, ReviewInfo, ReviewLoader};
+use shelbi_app::review::{Decision, LoadStep, ReviewDecisions, ReviewInfo, ReviewLoader};
 use shelbi_app::state_write::StateWrite;
 use shelbi_app::view::{SidebarModel, SidebarTarget};
 use shelbi_app::{CommandKind, CommandRegistry, EditTarget, Mutation};
@@ -1217,6 +1217,12 @@ pub struct ShelbiWindow {
     /// sessions) in place of the live one over [`Self::project_handle`]
     /// ([`Self::review_ops`]).
     review_ops: Option<Arc<dyn ReviewOps>>,
+    /// The review decisions on their way through the daemon, and the failures
+    /// waiting to be seen: the window leaves a review the moment it's decided.
+    decisions: ReviewDecisions,
+    /// What a review decision does in place of asking the daemon.
+    #[cfg(test)]
+    review_mutation: Option<ReviewMutation>,
     /// The "Not implemented yet" (or failure) banner.
     banner: Option<SharedString>,
     /// A transient status note (the orchestrator coming up, a failure).
@@ -1681,6 +1687,9 @@ impl ShelbiWindow {
             switch_hold: None,
             pending_rows: None,
             review_ops: None,
+            decisions: ReviewDecisions::default(),
+            #[cfg(test)]
+            review_mutation: None,
             banner: None,
             status: None,
             focus_handle,
@@ -2348,6 +2357,7 @@ impl ShelbiWindow {
         self.pending_rows = None;
         self.pending_workflow_filter = None;
         self.quiet_review = None;
+        self.decisions.clear();
         self.banner = None;
         self.status = None;
         self.flash_generation += 1;
@@ -2929,9 +2939,12 @@ impl ShelbiWindow {
                     project: self.project.clone(),
                     id: id.clone(),
                 };
-                self.run_review_mutation(id, m, Decision::APPROVE, window, cx);
+                self.run_review_mutation(id, m, Decision::Approve, window, cx);
             }
             HostCall::AskRejectReason(id) => {
+                if self.refuse_second_decision(&id, cx) {
+                    return;
+                }
                 let wrap = crate::views::overlay::review_reject::wrap(cx);
                 self.open_overlay(ActiveOverlay::reject_reason(id, Some(wrap)), window, cx)
             }
@@ -3467,9 +3480,11 @@ impl ShelbiWindow {
         self.quiet_review = None;
         let row = self.review_row(&info.task_id);
         if self.shown_review(cx).as_deref() == Some(info.task_id.as_str()) {
+            let task = info.task_id.clone();
             if let Some(review) = self.review.clone() {
                 review.update(cx, |r, cx| r.show(info, row, cx));
             }
+            self.sync_review_decision(&task, cx);
             cx.notify();
             return;
         }
@@ -3478,10 +3493,12 @@ impl ShelbiWindow {
         let review = self.ensure_review(window, cx);
         let hold = self.push_ahead(Occupant::Review);
         self.set_route(Route::Review);
+        let task = info.task_id.clone();
         review.update(cx, |r, cx| {
             r.hold_content(hold, cx);
             r.show(info, row, cx)
         });
+        self.sync_review_decision(&task, cx);
         self.client.focus_main();
         self.sync_chat(window, cx);
         self.focus_main_view(window, cx);
@@ -3567,7 +3584,7 @@ impl ShelbiWindow {
         if let Some(task) = self.review.as_ref().and_then(|r| r.read(cx).task_id().map(str::to_string)) {
             self.review_loader.cancel(&task);
         }
-        let view = self.client.view().clone();
+        let view = self.review_return_view(cx);
         if !self.tapped_return(&view, window, cx) {
             self.perform(HostCall::ShowView(view), window, cx);
         }
@@ -3576,6 +3593,19 @@ impl ShelbiWindow {
             self.focus_handle.focus(window, cx);
         }
         cx.notify();
+    }
+
+    /// The view leaving the review returns to: the one it was opened over,
+    /// with a review that has ended going through
+    /// [`shelbi_app::review::ended_review_return`]. Back leaves the review
+    /// shown and returns as it came.
+    fn review_return_view(&self, cx: &App) -> View {
+        let view = self.client.view().clone();
+        let Some(review) = self.review.as_ref().map(|r| r.read(cx)).filter(|r| !r.is_shown()) else {
+            return view;
+        };
+        let slot = review.info().map(|info| info.slot);
+        shelbi_app::review::ended_review_return(view, slot.as_deref(), &self.model.workspaces)
     }
 
     /// Leave the workspace for the view it was opened over: the sidebar comes
@@ -3661,9 +3691,78 @@ impl ShelbiWindow {
         let row = self.review_row(&task);
         let gone = row.is_none() && !self.model.board_loading && self.model.config_error.is_none();
         review.update(cx, |r, cx| r.update_row(row, cx));
-        if gone && self.shown_review(cx).as_deref() == Some(task.as_str()) && !review.read(cx).is_merging() {
-            self.review_ended(&task, window, cx);
+        if gone && self.shown_review(cx).as_deref() == Some(task.as_str()) {
+            self.review_left(&task, window, cx);
         }
+    }
+
+    /// The shown review's task has left the review column. A decision running
+    /// on it (the review was opened again while it ran) has landed, whether or
+    /// not the daemon's reply is in yet; otherwise the task left elsewhere.
+    fn review_left(&mut self, task: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match self.decisions.landed(task) {
+            Some(decision) => self.land_decision(task, decision, window, cx),
+            None => self.review_ended(task, window, cx),
+        }
+    }
+
+    /// Decision `decision` on review `task` went through: end the review and,
+    /// if the main area shows it (opened again while the decision ran), return
+    /// to the view it was opened over. [`ReviewDecisions::landed`] has made
+    /// sure this runs once: the reply can follow the board in saying so.
+    fn land_decision(&mut self, task: &str, decision: Decision, window: &mut Window, cx: &mut Context<Self>) {
+        let shown = self.shown_review(cx).as_deref() == Some(task);
+        match self.review.clone().filter(|r| r.read(cx).task_id() == Some(task)) {
+            Some(review) => review.update(cx, |r, cx| r.finish(cx)),
+            // The view has moved on to another review meanwhile.
+            None => close_review_sessions(self.review_ops(), self.project.clone(), task.to_string(), cx),
+        }
+        self.flash(decision.done(task), cx);
+        if shown {
+            self.leave_review(window, cx);
+        }
+    }
+
+    /// The daemon refused decision `decision` on review `task`: its panel says
+    /// so if it's open again, otherwise a notice does, offering to reopen it.
+    fn decision_refused(&mut self, task: &str, decision: Decision, error: &str, cx: &mut Context<Self>) {
+        let recorded = self.decisions.failed(task, error).is_some();
+        if !recorded {
+            // Not this project's any more, or the board had it landing.
+            self.status = None;
+            self.banner = Some(decision.failed_on(task, error).into());
+        }
+        if self.shown_review(cx).as_deref() == Some(task) {
+            self.sync_review_decision(task, cx);
+        } else if let Some(review) = self.review.clone().filter(|r| r.read(cx).task_id() == Some(task)) {
+            review.update(cx, |r, cx| r.set_merging(false, cx));
+        }
+    }
+
+    /// Bring the panel of open review `task` in line with its decision: the
+    /// merge gate while one runs, and the failure one left, which moves from
+    /// the notice to the panel's status line.
+    fn sync_review_decision(&mut self, task: &str, cx: &mut Context<Self>) {
+        let merging = self.decisions.running(task).is_some();
+        let failure = self.decisions.take_failure(task);
+        if let Some(review) = self.review.clone().filter(|r| r.read(cx).task_id() == Some(task)) {
+            review.update(cx, |r, cx| {
+                r.set_merging(merging, cx);
+                if failure.is_some() {
+                    r.set_status(failure, cx);
+                }
+            });
+        }
+    }
+
+    /// Whether a decision is already running on review `task`, in which case
+    /// it takes no other: say so.
+    fn refuse_second_decision(&mut self, task: &str, cx: &mut Context<Self>) -> bool {
+        let running = self.decisions.running(task).is_some();
+        if running {
+            self.flash(format!("{task} already has a decision running."), cx);
+        }
+        running
     }
 
     /// The shown review's task left review elsewhere (merged on GitHub, moved
@@ -3686,9 +3785,8 @@ impl ShelbiWindow {
                 self.run_load_step(step, window, cx);
             }
             LayoutEvent::ReviewClosed { task, .. } => {
-                let merging = self.review.as_ref().is_some_and(|r| r.read(cx).is_merging());
-                if self.shown_review(cx).as_deref() == Some(task.as_str()) && !merging {
-                    self.review_ended(&task, window, cx);
+                if self.shown_review(cx).as_deref() == Some(task.as_str()) {
+                    self.review_left(&task, window, cx);
                 }
             }
             // The content pane reconnects on its own; the chat likewise.
@@ -5014,13 +5112,16 @@ impl ShelbiWindow {
             id: id.clone(),
             reason,
         };
-        self.run_review_mutation(id, m, Decision::REJECT, window, cx);
+        self.run_review_mutation(id, m, Decision::Reject, window, cx);
     }
 
     /// Send a review decision to the daemon off the UI thread. The daemon runs
     /// it (the gated merge for an approve), so it completes even if this app
-    /// quits mid-merge. While it runs, an open Review view of the task is
-    /// inert; when it lands the view closes (success) or shows why not.
+    /// quits mid-merge. A review being decided on leaves the main area at once
+    /// for the view it was opened over: nothing is left to do on it. The
+    /// sessions stay until the decision lands, so a refused one can reopen where
+    /// it was. Meanwhile [`Self::decisions`] carries the news: a notice over
+    /// the main area and a note on the review's row.
     fn run_review_mutation(
         &mut self,
         id: String,
@@ -5029,17 +5130,26 @@ impl ShelbiWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let review = self
-            .review
-            .clone()
-            .filter(|r| r.read(cx).task_id() == Some(id.as_str()));
-        match &review {
-            Some(r) => r.update(cx, |r, cx| r.set_merging(true, cx)),
-            None => self.flash(format!("{} {id}…", decision.working), cx),
+        if self.refuse_second_decision(&id, cx) {
+            return;
+        }
+        self.decisions.begin(&id, decision);
+        if self.shown_review(cx).as_deref() == Some(id.as_str()) {
+            if let Some(review) = self.review.clone() {
+                review.update(cx, |r, cx| r.hide(cx));
+            }
+            self.leave_review(window, cx);
         }
         let ProjectHandle { source, link } = self.project_handle.clone();
+        let (ops, project) = (self.review_ops(), self.project.clone());
         let id_for_state = id.clone();
+        #[cfg(test)]
+        let seam = self.review_mutation.clone();
         let work = cx.background_executor().spawn(async move {
+            #[cfg(test)]
+            if let Some(seam) = seam {
+                return seam(&m);
+            }
             // The issue as its store has it now: the daemon refuses the
             // mutation if another client moved it meanwhile.
             link.mutate(&m, source.issue_state(&id_for_state), &mut |_, _| {})
@@ -5049,29 +5159,16 @@ impl ShelbiWindow {
         cx.spawn_in(window, async move |this, cx| {
             let result = work.await;
             this.update_in(cx, |this, window, cx| {
-                // The view may have moved on to another review meanwhile.
-                let review = review.filter(|r| r.read(cx).task_id() == Some(id.as_str()));
-                let shown = this.shown_review(cx).as_deref() == Some(id.as_str());
                 match result {
+                    // The window switched projects meanwhile: only the sessions
+                    // are left to see to.
+                    Ok(()) if this.project != project => close_review_sessions(ops, project, id, cx),
                     Ok(()) => {
-                        if let Some(r) = &review {
-                            r.update(cx, |r, cx| r.finish(cx));
-                        }
-                        this.flash(format!("{} {id}.", decision.done), cx);
-                        if shown {
-                            this.leave_review(window, cx);
+                        if let Some(decision) = this.decisions.landed(&id) {
+                            this.land_decision(&id, decision, window, cx);
                         }
                     }
-                    Err(e) => match &review {
-                        Some(r) => r.update(cx, |r, cx| {
-                            r.set_merging(false, cx);
-                            r.set_status(Some(format!("{} failed: {e}", decision.verb)), cx);
-                        }),
-                        None => {
-                            this.status = None;
-                            this.banner = Some(e.into());
-                        }
-                    },
+                    Err(e) => this.decision_refused(&id, decision, &e, cx),
                 }
                 this.request_refresh();
                 cx.notify();
@@ -5452,6 +5549,49 @@ impl ShelbiWindow {
                     ),
                 )
             })
+            // The review decisions on their way, and the ones refused: a
+            // refused review reopens from here, loaded on its slot as it was.
+            .children(self.decisions.notices().iter().map(|n| {
+                let task = n.task.clone();
+                let selector = format!("decision-notice-{task}");
+                let Some(error) = &n.failure else {
+                    return notice(n.decision.working(&task).into(), Hue::Neutral)
+                        .debug_selector(move || selector)
+                        .into_any_element();
+                };
+                let line = n.decision.failed_on(&task, error);
+                let reopen = {
+                    let task = task.clone();
+                    style::xsmall_button(format!("reopen-review-{task}"), "Reopen", theme).on_click(cx.listener(
+                        move |this, _, window, cx| this.perform(HostCall::LoadReview(task.clone()), window, cx),
+                    ))
+                };
+                let dismiss = style::icon_button(
+                    format!("dismiss-decision-{task}"),
+                    icons::X_MARK,
+                    IconButtonSize::Small,
+                    false,
+                    theme,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.decisions.dismiss(&task);
+                    cx.notify();
+                }));
+                notice(line.into(), Hue::Yellow)
+                    .debug_selector(move || selector)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_none()
+                            .items_center()
+                            .gap_2()
+                            .ml_4()
+                            .child(reopen)
+                            .child(dismiss),
+                    )
+                    .into_any_element()
+            }))
             .child(body)
             // Show the sidebar: beside the traffic lights and centered on
             // them, put in the window rather than the row, so it stays put
@@ -5544,26 +5684,19 @@ impl OverlayHost for ShelbiWindow {
     }
 }
 
-/// A review decision's wording: the status while it runs, the note when it
-/// lands, and the panel's failure line (the TUI's `approve failed: …`).
-#[derive(Debug, Clone, Copy)]
-struct Decision {
-    working: &'static str,
-    done: &'static str,
-    verb: &'static str,
-}
+/// A window test's stand-in for the daemon's answer to a review decision.
+#[cfg(test)]
+type ReviewMutation = Arc<dyn Fn(&Mutation) -> Result<(), String> + Send + Sync>;
 
-impl Decision {
-    const APPROVE: Decision = Decision {
-        working: "Approving",
-        done: "Approved",
-        verb: "approve",
-    };
-    const REJECT: Decision = Decision {
-        working: "Rejecting",
-        done: "Rejected",
-        verb: "reject",
-    };
+/// Ask the daemon to end review `task`'s content sessions, off the UI thread.
+fn close_review_sessions(ops: Arc<dyn ReviewOps>, project: String, task: String, cx: &mut App) {
+    cx.background_executor()
+        .spawn(async move {
+            if let Err(e) = ops.session_op(&project, &task, shelbi_app::ReviewSessionOp::Close) {
+                tracing::warn!(task = %task, error = %e, "couldn't close the review's sessions");
+            }
+        })
+        .detach();
 }
 
 impl SidebarHost for ShelbiWindow {
@@ -5775,6 +5908,7 @@ impl ShelbiWindow {
                 layer("column-sidebar", l).child(sidebar::render(
                     SidebarProps {
                         model: &self.model,
+                        decisions: &self.decisions,
                         collapsed: &self.collapsed_sections,
                         folds: &self.folds,
                         now,

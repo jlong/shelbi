@@ -211,6 +211,15 @@ impl ReviewPanel {
         PanelEffect::None
     }
 
+    /// Whether a click at (`column`, `row`) is on the Back row: the one row a
+    /// review opened again mid-merge still answers.
+    pub fn back_hit(&self, column: u16, row: u16) -> bool {
+        let rows = self.rows();
+        self.hit_targets
+            .iter()
+            .any(|(rect, idx)| in_rect(*rect, column, row) && matches!(rows.get(*idx), Some(PanelRow::Back)))
+    }
+
     /// Handle a q / Esc quit request. While a gated merge is in flight the quit
     /// is ignored and a short note explains why.
     pub fn request_quit(&mut self) {

@@ -189,6 +189,8 @@ enum Row {
         branch: String,
         location: Option<String>,
         state: ReviewState,
+        /// The decision running on the task, in place of the branch.
+        note: Option<&'static str>,
         target: RowTarget,
     },
 }
@@ -254,6 +256,21 @@ impl SidebarView {
             unread_errors: model.unread_errors,
             emoji: true,
         }
+    }
+
+    /// Note each review row with the decision running on its task.
+    pub fn with_decisions(mut self, decisions: &shelbi_app::review::ReviewDecisions) -> Self {
+        for row in &mut self.rows {
+            if let Row::Review {
+                note,
+                target: RowTarget::Review(task),
+                ..
+            } = row
+            {
+                *note = decisions.running(task).map(|d| d.row_note());
+            }
+        }
+        self
     }
 
     /// Lay the footer's buttons out for a terminal that can (or can't) draw
@@ -983,6 +1000,7 @@ fn build_rows(model: &SidebarModel) -> Vec<Row> {
                 branch,
                 location,
                 state,
+                note: None,
                 target: RowTarget::Review(task_id),
             },
         })
@@ -1078,6 +1096,7 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
             branch,
             location,
             state,
+            note,
             ..
         } => {
             let dec = state.decoration();
@@ -1112,10 +1131,17 @@ fn render_row(row: &Row, selected: bool, focused: bool, width: usize) -> ListIte
             const BRANCH_MARKER: &str = "⎇ ";
             let avail = width.saturating_sub(BRANCH_INDENT.len() + BRANCH_MARKER.chars().count());
             let branch_text = truncate_ellipsis(branch, avail);
-            let line2 = Line::from(Span::styled(
-                format!("{BRANCH_INDENT}{BRANCH_MARKER}{branch_text}"),
-                branch_style,
-            ));
+            // A decision running on it takes the line.
+            let line2 = match note {
+                Some(note) => Line::from(Span::styled(
+                    format!("{BRANCH_INDENT}{}", truncate_ellipsis(note, width.saturating_sub(BRANCH_INDENT.len()))),
+                    Style::default().fg(palette().ansi_yellow),
+                )),
+                None => Line::from(Span::styled(
+                    format!("{BRANCH_INDENT}{BRANCH_MARKER}{branch_text}"),
+                    branch_style,
+                )),
+            };
             ListItem::new(vec![Line::from(line1), line2])
         }
     }

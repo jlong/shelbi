@@ -403,7 +403,7 @@ impl Run {
 
         // An approve in flight.
         self.update(|v, cx| v.set_merging(true, cx));
-        let merging = self.view().read_with(&self.cx, |v, _| v.is_merging());
+        let merging = self.view().read_with(&self.cx, |v, _| v.panel().is_some_and(|p| p.is_merging()));
         self.expect("an approve makes the panel inert", merging);
         self.save("review-merging.png");
         self.update(|v, cx| v.set_merging(false, cx));
