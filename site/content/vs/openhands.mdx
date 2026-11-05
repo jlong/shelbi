@@ -1,108 +1,131 @@
 ---
 competitor: OpenHands
 slug: openhands
-competitorUrl: https://all-hands.dev/
-summary: Shelbi orchestrates the agent CLIs you already trust across every machine you own; OpenHands ships its own sandboxed agent and a cloud automation platform. Here's how to choose.
+competitorUrl: https://openhands.dev/
+summary: Shelbi coordinates coding agents across your machines through a native macOS app or TUI. OpenHands combines Agent Canvas, an agent SDK, and self-hosted or managed backends. Here is how their workflows differ.
 ---
 
-## Shelbi and OpenHands solve the same problem from opposite ends of the stack
+## Shelbi and OpenHands both coordinate agents, with different workflows
 
-Both let you ship real changes with AI coding agents, not just autocomplete.
-But OpenHands gives you *the agent and the sandbox it runs in*, while Shelbi
-gives you *the control room* for running the agents you already trust — many of
-them, in parallel, across your own machines.
+Both can run agents you already use. OpenHands Agent Canvas supports its own
+agent and third-party agents through the Agent Client Protocol (ACP), including
+Claude Code and Codex. Shelbi organizes CLI agents into a persistent workspace
+pool, with an orchestrator, an Issues board, and a review workflow. The choice
+depends on how you want to coordinate work and operate the machines behind it.
 
 ## At a glance
 
 | | Shelbi | OpenHands |
 |---|---|---|
-| What it is | Agent orchestrator for your desktop and terminal | Autonomous coding agent + cloud/enterprise platform |
-| The agent | None of its own — drives your CLI (Claude Code, Codex, aider) | Ships the CodeAct agent, which writes and runs Python + bash to act |
-| Where work runs | Many workers in parallel across laptop + remote machines over SSH | One agent per conversation inside a sandboxed runtime |
-| Isolation unit | A git worktree on its own branch, per task | A Docker / Apptainer / remote container, per conversation |
-| Runtime deps | The `shelbi` binary, `git`, `ssh`, your agent CLI; no Docker, no containers | Docker (often Docker-in-Docker), agent/automation servers, optional Kubernetes |
-| State | Plain markdown + YAML files on disk | An event-sourced action/observation stream inside the platform |
-| Interface | Two-pane terminal TUI | Web GUI (Agent Canvas), CLI, headless, IDE plugins, SDK |
-| Models | Whatever your agent CLI already uses | Model-agnostic via LiteLLM (Claude, OpenAI, Gemini, local, …) |
-| License & cost | MIT; a single self-installed binary | MIT core + paid hosted cloud + custom-priced Enterprise |
+| What it is | Open-source agent orchestrator | Agent Canvas, Software Agent SDK, and backend services |
+| Interface | Native macOS app and terminal TUI | Browser client and desktop preview for macOS, Windows and Linux |
+| Agents and models | Claude Code, Codex, or custom CLI runners; models come from the runner | Built-in OpenHands agent with configurable LLMs, or third-party ACP agents |
+| Parallel work | Declared workspace pool across local and SSH machines | Conversations and automation runs on local, remote or managed backends |
+| Workspaces and isolation | Persistent git worktrees with task branches; host processes, without a container requirement | Local folders, worktrees or containers depending on backend; Canvas itself provides no isolation |
+| Coordination | Issues board, editable workflows, Review view and optional Zen Mode | Conversations, scheduled and event-triggered automations, and backend switching |
+| State | Local configuration and logs; markdown issues or GitHub Issues | Backend-managed conversations, profiles, secrets and automation history |
+| License and cost | Free MIT software; compute and agent usage are separate | MIT Agent Canvas and SDK; free self-hosted Canvas, paid Teams and Enterprise |
+
+Checked November 5, 2026, against Shelbi v0.13.3 and OpenHands' current docs and
+[releases](https://github.com/OpenHands/OpenHands/releases). OpenHands lists
+v1.35.0, released November 3. Its [pricing page](https://openhands.dev/pricing)
+lists self-hosted Teams at $500/month for up to 10 users, with additional seats
+at $50/month and a 5,000-session monthly cap. Enterprise pricing is custom.
+Free Canvas uses a single user or shared identity. These are self-hosted plan
+prices; check Cloud billing separately rather than assuming the same rates.
 
 ## Where Shelbi excels
 
-- **It orchestrates the agents you already trust — it doesn't replace them.**
-  OpenHands is built around its own CodeAct agent. Shelbi ships no agent of its
-  own; you point it at whatever CLI you run — `claude`, `codex`, `aider`,
-  anything you can drive interactively. Runners are declared per project, so you
-  can hand backend tasks to one runner and front-end tasks to another without
-  changing tools or relearning a workflow.
+- **A persistent worker pool in a native app or TUI.** Both clients share
+  Shelbi's application model and command registry. A workspace keeps its git
+  worktree between tasks and switches branches for each assignment. From the
+  sidebar you can open a remote workspace's agent, shell, diff and editor.
+  A whole remote project opens in the native window over one SSH relay channel
+  per host, without port forwarding. Both machines need the same Shelbi version;
+  otherwise Shelbi opens the remote TUI with a version notice. OpenHands also
+  supports remote execution, but connects Canvas to Agent Server backends.
 
-- **Many workers in parallel, across every machine you own.** OpenHands runs one
-  agent per conversation inside a sandbox. Shelbi runs a pool of named workers
-  concurrently — on your laptop *and* on remote boxes reached over SSH — each in
-  its own git worktree on its own branch. A Mac mini in the closet plus a Linux
-  workstation become a worker pool; the orchestrator picks the highest-priority
-  unblocked task and dispatches it the moment a worker frees up.
+- **You configure the agents and their coordinator.** Shelbi launches Claude
+  Code, Codex, or a custom CLI runner. Different agents can use different runners
+  in the same project. Orchestrator onboarding lets you choose its **Harness**,
+  **Default model**, and instructions before launch. Workflow definitions and
+  agent instructions are editable files. OpenHands also lets you bring agents;
+  Shelbi fits when you want that coordination expressed as your own project
+  workflow over a declared pool of machines and workspaces.
 
-- **No containers, no VMs, no Docker-in-Docker.** OpenHands centers on a
-  container runtime — Docker (frequently Docker-in-Docker), agent and automation
-  servers, optional Kubernetes at the enterprise tier — and its docs note the
-  setup "takes real effort." Shelbi runs a small local daemon on the hub and the
-  `shelbi` binary on each worker; past that it needs only `ssh`, `git`, and your
-  agent CLI, with no containers to build. Adding a remote worker is `shelbi
-  machine setup`, a few lines in a YAML file, and a `shelbi reload`.
+- **A board connected to your repository and shipping history.** Keep issues
+  as local markdown, or use [GitHub Issues](/docs/concepts/github-issues) as the
+  board's source of truth. In both clients, **New issue** opens **New task**
+  with Title, Workflow, Status, Priority, Description, and **Let Orchestrator
+  write this up**. The project's **Changelog** records shipped work. Agents
+  and scripts can use `shelbi changelog add`, `list`, `search` and `show`.
+  Configuration, instructions and local logs remain inspectable on disk;
+  choosing GitHub means the issues themselves live there.
 
-- **State is plain text you can grep, diff, and edit.** OpenHands keeps
-  conversation state as an event-sourced stream inside the platform. Shelbi keeps
-  every task, log, and worker status as markdown or YAML under `~/.shelbi/` — no
-  database. A task is just a markdown file with frontmatter (`column`, `branch`,
-  `depends_on`, …); move it between Kanban columns from the TUI or by editing the
-  file in your editor.
-
-- **Review and merge without leaving the terminal.** When a worker finishes, its
-  card lands in a `Ready for Review` queue. Activating it checks the branch out
-  on the machine that ran the task and spawns a fresh agent pane there to
-  interrogate the diff; approve to merge into the default branch, or push and open
-  a PR with `--pr`. The whole loop — dispatch, watch, review, merge — stays in one
-  two-pane TUI.
+- **Explicit control over review and automation.** Zen Mode is off by default.
+  The Review view brings together the task, review agent, diff and editor tools,
+  with **Approve** and **Reject** actions. Optional
+  [Zen Mode](/docs/concepts/zen-mode) lets the orchestrator promote eligible
+  backlog and review and merge passing work under your project's `zenmode.md`
+  policy. `shelbi zen on`, `shelbi zen off` and `shelbi zen pause` control that
+  delegation. OpenHands offers automation too; Shelbi makes this choice part
+  of the project's board and review loop.
 
 ## Where OpenHands excels
 
-- **It brings its own agent — and a strong one.** If you don't already have an
-  agent CLI you trust, OpenHands hands you the CodeAct agent out of the box. It's
-  among the strongest open agents on SWE-bench Verified — independent reviews cite
-  roughly 72% with Claude Sonnet 4.5, with higher figures on newer models and
-  pass@k. Shelbi deliberately ships nothing here; it assumes you bring your own.
+- **An agent framework as well as a control center.** The
+  [Software Agent SDK](https://docs.openhands.dev/sdk/index) provides Python
+  and REST APIs, tools for shell commands, file editing and browsing, and
+  support for multi-agent tasks. You can build an agent with it or use the
+  built-in OpenHands agent in Canvas. Its
+  [LLM configuration](https://docs.openhands.dev/openhands/usage/llms/llms)
+  supports multiple providers and local model servers. Shelbi coordinates
+  installed agent CLIs; their tools and model capabilities come from those agents.
 
-- **A real sandboxed execution environment.** OpenHands runs the agent inside an
-  isolated runtime (Docker, Apptainer, or remote) complete with an in-sandbox
-  VS Code IDE, a VNC desktop, and a persistent Chromium browser, plus an optional
-  action-confirmation gate and security analysis before risky commands run.
-  Shelbi delegates isolation to git worktrees and to your agent CLI's own
-  safeguards; it does not sandbox execution itself.
+- **Broader client platforms and deployment choices.**
+  [Agent Canvas](https://docs.openhands.dev/openhands/usage/agent-canvas/setup)
+  runs in a browser, with a desktop preview for macOS, Windows and Linux.
+  Its backends can run locally, on your infrastructure, or through managed
+  OpenHands Cloud. The
+  [October 27 release](https://docs.openhands.dev/openhands/usage/agent-canvas/release-notes/v1.34.0)
+  added per-conversation **Local**, **Worktree** and **Docker** choices on
+  backends that support them. Canvas is not itself a sandbox: direct local
+  execution uses the host account's permissions. Shelbi's native desktop app
+  is macOS-only, and its worktrees separate branches rather than sandbox commands.
 
-- **Org-wide automation and a GUI for non-terminal users.** OpenHands Cloud and
-  the Agent Canvas add scheduled and event-triggered automation wired into Slack,
-  GitHub, Jira, Linear, Notion, and HubSpot, a browser GUI, and an enterprise tier
-  with SSO and VPC self-hosting. Shelbi is a terminal tool with no hosted SaaS, no
-  GUI, and no per-seat tier.
+- **Service integrations and team administration.** OpenHands includes
+  [automation templates](https://docs.openhands.dev/openhands/usage/agent-canvas/prebuilt-automations)
+  for issue-to-PR work, GitHub PR reviews, repository monitoring and Slack
+  monitoring. Automation Server runs scheduled and event-triggered work on
+  supported backends, including local installations. Paid Teams adds individual
+  identities, role-based access, SSO/SAML and budgeting controls. Shelbi's
+  implemented issue backends are local files and GitHub Issues; you manage its
+  machines and access yourself.
 
-- **Deterministic replay and self-verification.** Because every action and
-  observation is an immutable event, OpenHands can replay and recover runs
-  deterministically, and its 2026 Verification Stack layers critic models so the
-  agent catches its own mistakes before producing output. Shelbi has no
-  equivalent agent-level verification layer — that responsibility lives with the
-  agent you plug in.
+- **Optional feedback within the agent loop.** OpenHands'
+  [critic](https://docs.openhands.dev/openhands/usage/agent-canvas/critic)
+  can evaluate work and trigger iterative refinement after a low score. It is
+  experimental, applies to OpenHands agent conversations, and is not promised
+  for every third-party ACP agent. This is a different layer from Shelbi's
+  workflow checks and review policy. Neither should be treated as a guarantee
+  that a change is correct.
 
 ## Choose Shelbi if…
 
-You live in the terminal, already run an agent CLI you trust, and want to run
-many of them at once across the machines you already own — each task isolated on
-its own branch, all state in plain files you can read, with nothing to host and
-no per-seat bill.
+You want an orchestrator for a persistent pool of CLI agents on your own local
+and SSH machines. Use the native macOS app or TUI, keep local issues or connect
+GitHub Issues, and choose manual review or the policy you give Zen Mode. It
+fits when a shared board, reusable workspaces and control over the workflow
+matter most.
 
 ## Choose OpenHands if…
 
-You want a capable autonomous agent and the sandbox to run it in without
-assembling your own; you need org-wide automation triggered from Slack or Jira,
-or a browser GUI for teammates who don't live in a terminal; or you want
-enterprise SSO and VPC self-hosting with a support SLA, deterministic replay,
-and built-in verification.
+You want a built-in agent and SDK, browser access or a desktop preview on
+Windows or Linux, or a choice of self-hosted and managed backends. Its
+automation templates and paid team controls cover more service integrations
+and administration. Check the backend's agent and runtime support: the
+[ACP guide](https://docs.openhands.dev/openhands/usage/agent-canvas/acp-agents)
+lists Claude Code, Codex and Gemini CLI on Cloud, with Pi and OpenCode available
+only on local or self-hosted backends. The old OpenHands CLI is no longer
+actively maintained, and the legacy `openhands serve` GUI is
+[deprecated](https://docs.openhands.dev/overview/introduction).
