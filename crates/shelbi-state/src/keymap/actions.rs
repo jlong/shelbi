@@ -508,7 +508,7 @@ impl Action {
                 DiffAction::PrevFile => &["h", "left"],
                 DiffAction::NextFile => &["l", "ctrl-n", "right"],
                 DiffAction::PageDown => &["space", "ctrl-f", "page-down"],
-                DiffAction::PageUp => &["b", "ctrl-b", "page-up"],
+                DiffAction::PageUp => &["b", "page-up"],
                 DiffAction::HalfPageDown => &["ctrl-d"],
                 DiffAction::HalfPageUp => &["ctrl-u"],
                 DiffAction::Top => &["g g"],
@@ -555,7 +555,7 @@ impl Action {
                 DiffAction::OpenInEditor => &["ctrl-g"],
                 DiffAction::ToggleViewed => &["m"],
                 DiffAction::PickCommit => &["c"],
-                DiffAction::ToggleFileList => &["\\"],
+                DiffAction::ToggleFileList => &["ctrl-b", "\\"],
             },
             Action::Palette(a) => match a {
                 PaletteAction::Close => &["esc", "ctrl-c", "ctrl-p"],
