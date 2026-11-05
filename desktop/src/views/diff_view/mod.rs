@@ -16,7 +16,8 @@
 //! ```
 //!
 //! - **Keys** go to the session, which reads them through the keymap and answers
-//!   with what only a client can do (copy, open the editor). The window asks
+//!   with what only a client can do (copy, open the editor, ask for Reject's
+//!   reason); sending to the agent and reverting are its own. The window asks
 //!   [`DiffView::wants_key`] before taking a chord for itself, so the diff's
 //!   `Ctrl-p` beats the window's palette chord while it has focus; Ctrl+Space
 //!   and ⌘K still open the window's palette.
@@ -104,7 +105,13 @@ impl DiffDeps {
         let link = project.link.clone();
         DiffDeps {
             open: Rc::new(move |target, wake| {
-                DiffSession::for_target(target, Some(link.clone()), Author::local(), wake)
+                DiffSession::for_target(
+                    target,
+                    Some(link.clone()),
+                    Author::local(),
+                    shelbi_orchestrator::agent_send::service(),
+                    wake,
+                )
             }),
             open_file: Arc::new(open_in_editor),
             far: project.key().host().map(shelbi_app::remote_window::local_open_unavailable),
@@ -119,10 +126,11 @@ impl DiffDeps {
         DiffDeps {
             // No wake: a gpui test scheduler refuses one from another thread.
             // A test or a visual check looks with `poll_now`.
-            open: Rc::new(move |_target, _wake| {
+            open: Rc::new(move |target, _wake| {
                 let backend = Arc::new(canned::Canned::new(&patch));
                 let options = shelbi_app::diff::DiffOptions {
                     author: Author::human("jlong"),
+                    target,
                     watch: None,
                     wake: Arc::new(|| {}),
                 };
@@ -160,12 +168,14 @@ pub enum FilePlace {
 }
 
 /// What the view tells its host.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffViewEvent {
     /// The view took keyboard focus.
     Focused,
     /// Esc with nothing to let go of: the host's panel takes the keyboard.
     ReleaseFocus,
+    /// `gY` in a review: ask for Reject's reason, starting from this.
+    Reject(String),
 }
 
 /// The view.
@@ -371,18 +381,16 @@ impl DiffView {
                     self.session.state_mut().set_flash("Copied");
                 }
                 DiffEffect::OpenInEditor { path, line } => self.open_file(path, line, cx),
-                // Delivery is `ndv-comments-agent`'s, on the pane-send path. Until
-                // it lands the comments aren't lost: they're on the clipboard.
-                DiffEffect::SendToAgent { message, ids: _ } => {
-                    cx.write_to_clipboard(ClipboardItem::new_string(message));
-                    self.session.state_mut().set_flash("Copied the comments: sending them to the agent is coming");
-                }
+                DiffEffect::RejectWithComments { reason } => cx.emit(DiffViewEvent::Reject(reason)),
                 // The session's own: it never hands these back.
                 DiffEffect::Refresh
                 | DiffEffect::LoadScope(_)
                 | DiffEffect::LoadBlame { .. }
                 | DiffEffect::SaveComment(_)
-                | DiffEffect::SaveViewed(_) => {}
+                | DiffEffect::SaveViewed(_)
+                | DiffEffect::SendToAgent { .. }
+                | DiffEffect::PlanRevert(_)
+                | DiffEffect::Revert(_) => {}
             }
         }
     }

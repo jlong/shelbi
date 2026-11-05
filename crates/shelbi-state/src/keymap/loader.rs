@@ -1393,6 +1393,9 @@ mod two_key_tests {
             ("enter", DiffAction::Comment),
             ("r", DiffAction::ReplyOrRefresh),
             ("g Y", DiffAction::SendToAgent),
+            ("g A", DiffAction::SendToReviewer),
+            ("g r", DiffAction::RevertHunk),
+            ("g R", DiffAction::RevertFile),
             ("ctrl-g", DiffAction::OpenInEditor),
         ];
         for (spec, action) in cases {

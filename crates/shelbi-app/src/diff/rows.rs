@@ -162,6 +162,9 @@ pub enum ThreadPart {
     Head,
     /// One reply, by index.
     Reply(u16),
+    /// A line past the first of the comment (`reply: None`) or of a reply,
+    /// expanded. `line` counts from the second line.
+    More { reply: Option<u16>, line: u16 },
     /// `▸ N replies`, collapsed.
     Summary,
 }
@@ -216,8 +219,23 @@ pub struct Threads {
     by_line: HashMap<u32, HashMap<(u32, u32), Vec<u32>>>,
     /// file → outdated thread indexes.
     outdated: HashMap<u32, Vec<u32>>,
-    /// thread index → (replies, thread expanded), for rows.
-    shape: Vec<(u16, bool)>,
+    /// thread index → what its rows are.
+    shape: Vec<ThreadShape>,
+}
+
+/// How many rows a thread takes.
+#[derive(Debug, Clone, Default)]
+struct ThreadShape {
+    /// Lines past the first in the comment.
+    more: u16,
+    /// Lines past the first in each reply.
+    replies: Vec<u16>,
+    expanded: bool,
+}
+
+/// Lines past the first in `body`.
+fn extra_lines(body: &str) -> u16 {
+    body.lines().count().saturating_sub(1).min(usize::from(u16::MAX)) as u16
 }
 
 impl Threads {
@@ -237,7 +255,11 @@ impl Threads {
             }
             let at = out.placed.len() as u32;
             out.placed.push((index, *place));
-            out.shape.push((comment.replies.len() as u16, out.expanded.contains(&comment.id)));
+            out.shape.push(ThreadShape {
+                more: extra_lines(&comment.body),
+                replies: comment.replies.iter().map(|r| extra_lines(&r.body)).collect(),
+                expanded: out.expanded.contains(&comment.id),
+            });
             match place.at {
                 Some(line) => out.by_line.entry(place.file).or_default().entry(line).or_default().push(at),
                 None => out.outdated.entry(place.file).or_default().push(at),
@@ -255,17 +277,50 @@ impl Threads {
     }
 
     fn push_rows(&self, rows: &mut Vec<Row>, file: u32, thread: u32) {
-        let (replies, expanded) = self.shape[thread as usize];
-        rows.push(Row::Thread { file, thread, part: ThreadPart::Head });
-        if replies == 0 {
-            return;
-        }
-        if expanded {
-            for reply in 0..replies {
-                rows.push(Row::Thread { file, thread, part: ThreadPart::Reply(reply) });
+        let shape = &self.shape[thread as usize];
+        let part = |part| Row::Thread { file, thread, part };
+        rows.push(part(ThreadPart::Head));
+        if shape.expanded {
+            rows.extend((0..shape.more).map(|line| part(ThreadPart::More { reply: None, line })));
+            for (reply, more) in shape.replies.iter().enumerate() {
+                let reply = reply as u16;
+                rows.push(part(ThreadPart::Reply(reply)));
+                rows.extend((0..*more).map(|line| part(ThreadPart::More { reply: Some(reply), line })));
             }
-        } else {
-            rows.push(Row::Thread { file, thread, part: ThreadPart::Summary });
+        } else if !shape.replies.is_empty() {
+            rows.push(part(ThreadPart::Summary));
+        }
+    }
+}
+
+/// What a thread's row reads, in both clients. `expanded` says the lines past a
+/// comment's first have rows of their own, so it doesn't trail off.
+pub fn thread_text(comment: &Comment, part: ThreadPart, expanded: bool, outdated: bool) -> String {
+    let first_line = |body: &str| body.lines().next().unwrap_or("").to_string();
+    let nth_more = |body: &str, line: u16| body.lines().nth(usize::from(line) + 1).unwrap_or("").to_string();
+    match part {
+        ThreadPart::Head => {
+            let flags = match (outdated, comment.sent) {
+                (true, true) => " (outdated, sent)",
+                (true, false) => " (outdated)",
+                (false, true) => " (sent)",
+                (false, false) => "",
+            };
+            let trail = if !expanded && comment.body.lines().count() > 1 { " …" } else { "" };
+            format!("{}{flags}: {}{trail}", comment.author.name, first_line(&comment.body))
+        }
+        ThreadPart::Reply(index) => match comment.replies.get(usize::from(index)) {
+            Some(reply) => format!("  ↳ {}: {}", reply.author.name, first_line(&reply.body)),
+            None => String::new(),
+        },
+        ThreadPart::More { reply: None, line } => format!("    {}", nth_more(&comment.body, line)),
+        ThreadPart::More { reply: Some(index), line } => match comment.replies.get(usize::from(index)) {
+            Some(reply) => format!("      {}", nth_more(&reply.body, line)),
+            None => String::new(),
+        },
+        ThreadPart::Summary => {
+            let n = comment.replies.len();
+            format!("  ▸ {n} {}", if n == 1 { "reply" } else { "replies" })
         }
     }
 }
@@ -609,5 +664,65 @@ mod tests {
         assert_eq!(t.slice(0, 3).len(), 3);
         assert_eq!(t.slice(10, 100).len(), 2);
         assert!(t.slice(100, 3).is_empty());
+    }
+
+    #[test]
+    fn an_expanded_thread_gives_every_line_a_row() {
+        use crate::diff::comments::{place, Anchor, Author, Comment, CommentDoc, CommentReply};
+        let cs = Changeset {
+            files: crate::diff::parse::parse_patch("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-x\n+y\n"),
+            ..Changeset::default()
+        };
+        let at = chrono::DateTime::from_timestamp(0, 0).unwrap();
+        let reply = CommentReply { id: "r".into(), author: Author::agent("developer"), body: "a\nb".into(), created_at: at };
+        let doc = CommentDoc {
+            comments: vec![Comment {
+                id: "c".into(),
+                anchor: Anchor { path: "a".into(), side: crate::diff::Side::New, start: 1, end: 1, code: vec!["y".into()] },
+                author: Author::human("jlong"),
+                body: "one\ntwo".into(),
+                created_at: at,
+                replies: vec![reply],
+                sent: false,
+            }],
+        };
+        let parts = |expanded: HashSet<String>| -> Vec<ThreadPart> {
+            let threads = Threads::new(&doc.comments, &place(&doc, &cs), expanded, true);
+            let input = RowInput {
+                changeset: &cs,
+                mode: ViewMode::Unified,
+                filter: HunkFilter::All,
+                folds: &Folds::default(),
+                threads: &threads,
+            };
+            build_rows(&input)
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    Row::Thread { part, .. } => Some(*part),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(parts(HashSet::new()), [ThreadPart::Head, ThreadPart::Summary]);
+        assert_eq!(
+            parts(HashSet::from(["c".to_string()])),
+            [
+                ThreadPart::Head,
+                ThreadPart::More { reply: None, line: 0 },
+                ThreadPart::Reply(0),
+                ThreadPart::More { reply: Some(0), line: 0 },
+            ]
+        );
+        let c = &doc.comments[0];
+        assert_eq!(thread_text(c, ThreadPart::Head, false, false), "jlong: one …");
+        assert_eq!(thread_text(c, ThreadPart::Head, true, false), "jlong: one");
+        assert_eq!(thread_text(c, ThreadPart::More { reply: None, line: 0 }, true, false), "    two");
+        assert_eq!(thread_text(c, ThreadPart::Reply(0), true, false), "  ↳ developer: a");
+        assert_eq!(thread_text(c, ThreadPart::More { reply: Some(0), line: 0 }, true, false), "      b");
+        assert_eq!(thread_text(c, ThreadPart::Summary, false, false), "  ▸ 1 reply");
+        let mut sent = c.clone();
+        sent.sent = true;
+        assert_eq!(thread_text(&sent, ThreadPart::Head, false, true), "jlong (outdated, sent): one …");
     }
 }

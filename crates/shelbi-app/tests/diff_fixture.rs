@@ -485,7 +485,12 @@ fn a_far_daemons_answer_survives_the_wire() {
         task: Some("t-1".into()),
     };
     let ask = |op: DiffOp| -> DiffReply {
-        let reply = shelbi_app::far::Reply::Diff(answer(&DiffRequest { target: target.clone(), op }));
+        let agent: shelbi_app::diff::AgentSend = Arc::new(|target, message| {
+            assert_eq!(target.workspace, "dev");
+            assert!(message.contains("Review comments"), "{message}");
+            Ok(shelbi_app::diff::AgentDelivery::Queued)
+        });
+        let reply = shelbi_app::far::Reply::Diff(answer(&DiffRequest { target: target.clone(), op }, agent));
         let wire = serde_json::to_string(&reply).unwrap();
         match serde_json::from_str(&wire).unwrap() {
             shelbi_app::far::Reply::Diff(reply) => reply,
@@ -516,10 +521,38 @@ fn a_far_daemons_answer_survives_the_wire() {
     };
     assert!(doc.is_viewed("a.txt", 3));
 
-    // What isn't there says so.
-    let bad = DiffRequest { target: DiffTarget { workspace: "nope".into(), ..target.clone() }, op: DiffOp::Comments };
-    let DiffReply::Comments(Err(e)) = answer(&bad) else { panic!() };
+    // Reject reaches them by task alone: its reason starts from what's unsent,
+    // and a reject that lands marks only what its reason still carries.
+    let access = shelbi_app::diff::comment_access("far-project", "t-1", None);
+    let reason = access.reject_reason().unwrap().expect("c1 is unsent");
+    assert!(reason.contains("[thread c1] a.txt:10"), "{reason}");
+    access.mark_sent_in("Nothing of theirs in here").unwrap();
+    assert!(!access.comments().unwrap().comments[0].sent);
+    access.mark_sent_in(&format!("Please redo this.\n\n{reason}")).unwrap();
+    assert!(access.comments().unwrap().comments[0].sent);
+    assert_eq!(access.reject_reason().unwrap(), None);
+
+    // The agent's session and a revert's refusal answer across it too.
+    let reply = ask(DiffOp::SendToAgent("Review comments on this branch:".into()));
+    assert_eq!(reply, DiffReply::Sent(Ok(shelbi_app::diff::AgentDelivery::Queued)));
+    let spec = shelbi_app::diff::revert::RevertSpec {
+        scope: CommitScope::All,
+        path: "a.txt".into(),
+        hunk: None,
+        fingerprint: 0,
+    };
+    let DiffReply::RevertPlanned(Err(e)) = ask(DiffOp::PlanRevert(spec)) else { panic!() };
+    assert!(e.contains("checkout of the branch"), "{e}");
+
+    // What isn't there says so. A task's comments don't need the workspace.
+    let nowhere = DiffTarget { workspace: "nope".into(), ..target.clone() };
+    let no_agent = no_agent();
+    let bad = DiffRequest { target: nowhere.clone(), op: DiffOp::Viewed };
+    let DiffReply::Viewed(Err(e)) = answer(&bad, no_agent.clone()) else { panic!() };
     assert!(e.contains("nope"), "{e}");
+    let still = DiffRequest { target: nowhere, op: DiffOp::Comments };
+    let DiffReply::Comments(Ok(doc)) = answer(&still, no_agent) else { panic!() };
+    assert_eq!(doc.comments[0].id, "c1");
 }
 
 #[test]
@@ -535,7 +568,7 @@ fn a_workspace_on_another_machine_reads_through_its_host() {
         task: None,
     };
     assert_eq!(target.state_key(), "ws-dev");
-    let backend = HostBackend::for_target(&target).unwrap();
+    let backend = HostBackend::for_target(&target, no_agent()).unwrap();
     let raw = backend.changeset(&CommitScope::All).unwrap();
     assert_eq!(raw.untracked, ["b.txt"]);
 }
@@ -569,12 +602,21 @@ fn wait(session: &mut DiffSession, what: &str, done: impl Fn(&DiffSession) -> bo
     }
 }
 
+fn target_of(kind: TargetKind) -> DiffTarget {
+    DiffTarget { project: "fixture".into(), workspace: "alpha".into(), kind, task: Some("t".into()) }
+}
+
+fn no_agent() -> shelbi_app::diff::AgentSend {
+    Arc::new(|_, _| Err("no agent in this test".to_string()))
+}
+
 fn options(watch: Option<Duration>) -> (DiffOptions, Arc<AtomicUsize>) {
     let woken = Arc::new(AtomicUsize::new(0));
     let count = woken.clone();
     (
         DiffOptions {
             author: Author::human("jlong"),
+            target: target_of(TargetKind::Workspace),
             watch,
             wake: Arc::new(move || {
                 count.fetch_add(1, Ordering::SeqCst);
@@ -588,9 +630,10 @@ fn session_on(repo: &Repo, store: &Path, kind: TargetKind, watch: Option<Duratio
     let backend: Arc<dyn DiffBackend> = Arc::new(HostBackend::over(
         Host::Local,
         repo.path.to_string_lossy().into_owned(),
-        kind,
+        target_of(kind),
         "main",
         DiffStore::at(store),
+        no_agent(),
     ));
     let (options, woken) = options(watch);
     (DiffSession::open(move || Ok(backend), options), woken)
@@ -710,9 +753,10 @@ fn a_session_that_cant_read_says_why_and_keeps_going() {
     let backend: Arc<dyn DiffBackend> = Arc::new(HostBackend::over(
         Host::Local,
         dir.path().to_string_lossy().into_owned(),
-        TargetKind::Review,
+        target_of(TargetKind::Review),
         "main",
         DiffStore::at(store.path()),
+        no_agent(),
     ));
     let (options, _) = options(None);
     let mut s = DiffSession::open(move || Ok(backend), options);

@@ -27,6 +27,16 @@ use shelbi_state::keymap::{validate_keymaps_yaml, DisplayStyle, Keymaps};
 use super::paint::{layout, paint, Colors, Paint};
 use super::{DiffOut, DiffSetup, DiffView};
 
+/// A target for a session in a test: nothing reads it but the state.
+fn test_target(kind: TargetKind) -> shelbi_app::diff::DiffTarget {
+    shelbi_app::diff::DiffTarget {
+        project: "demo".to_string(),
+        workspace: "alpha".to_string(),
+        kind,
+        task: Some("t-1".to_string()),
+    }
+}
+
 const PATCH: &str = "diff --git a/crates/app/src/review.rs b/crates/app/src/review.rs
 --- a/crates/app/src/review.rs
 +++ b/crates/app/src/review.rs
@@ -512,7 +522,7 @@ fn a_tiny_area_draws_without_panicking() {
 /// A session that never reads, with `changeset` set directly.
 fn view() -> DiffView {
     let opener: super::DiffOpener = Arc::new(|| {
-        let options = DiffOptions { author: Author::human("j"), watch: None, wake: Arc::new(|| {}) };
+        let options = DiffOptions { author: Author::human("j"), target: test_target(TargetKind::Workspace), watch: None, wake: Arc::new(|| {}) };
         DiffSession::open(|| Err("no backend in this test".to_string()), options)
     });
     let setup = DiffSetup { keymaps: keymaps(), style: DisplayStyle::Linux };
@@ -758,7 +768,7 @@ fn r_reopens_a_session_that_failed_to_open() {
     let count = opens.clone();
     let opener: super::DiffOpener = Arc::new(move || {
         let n = count.fetch_add(1, Ordering::SeqCst);
-        let options = DiffOptions { author: Author::human("j"), watch: None, wake: Arc::new(|| {}) };
+        let options = DiffOptions { author: Author::human("j"), target: test_target(TargetKind::Workspace), watch: None, wake: Arc::new(|| {}) };
         DiffSession::open(move || Err(format!("failure {n}")), options)
     });
     let setup = DiffSetup { keymaps: keymaps(), style: DisplayStyle::Linux };
@@ -824,12 +834,14 @@ fn a_workspace_diff_follows_the_agents_edits_and_rests_off_screen() {
         let backend: Arc<dyn DiffBackend> = Arc::new(HostBackend::over(
             Host::Local,
             worktree.clone(),
-            TargetKind::Workspace,
+            test_target(TargetKind::Workspace),
             "main",
             DiffStore::at(&store_path),
+            Arc::new(|_, _| Err("no agent in this test".to_string())),
         ));
         let options = DiffOptions {
             author: Author::human("j"),
+            target: test_target(TargetKind::Workspace),
             watch: Some(Duration::from_millis(40)),
             wake: Arc::new(|| {}),
         };
@@ -883,4 +895,127 @@ fn comments_and_viewed_marks_come_back_with_the_task() {
     s.set_file_list(false);
     let text = screen(&mut s, 70, 10).join("\n");
     assert!(text.contains("┃ ada: first line …"), "{text}");
+}
+
+// ---- Sending and reverting -------------------------------------------------
+
+/// A view over a real backend's answers: the agent says it took the message.
+fn view_of(kind: TargetKind, patch_files: bool) -> (DiffView, Arc<Mutex<Vec<String>>>, tempfile::TempDir) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let out = Command::new("git").arg("-C").arg(&path).args(args).output().unwrap();
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "F"]);
+    git(&["config", "user.email", "f@example.com"]);
+    fs::write(path.join("a.txt"), "one\ntwo\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "base"]);
+    git(&["checkout", "-q", "-b", "work"]);
+    if patch_files {
+        fs::write(path.join("a.txt"), "one\nTWO\n").unwrap();
+    }
+    let sent: Arc<Mutex<Vec<String>>> = Arc::default();
+    let (record, worktree, store) = (sent.clone(), path.to_string_lossy().into_owned(), path.join(".store"));
+    let opener: super::DiffOpener = Arc::new(move || {
+        let record = record.clone();
+        let backend: Arc<dyn DiffBackend> = Arc::new(HostBackend::over(
+            Host::Local,
+            worktree.clone(),
+            test_target(kind),
+            "main",
+            DiffStore::at(&store),
+            Arc::new(move |_, message: &str| {
+                record.lock().unwrap().push(message.to_string());
+                Ok(shelbi_app::diff::AgentDelivery::Submitted)
+            }),
+        ));
+        let options =
+            DiffOptions { author: Author::human("j"), target: test_target(kind), watch: None, wake: Arc::new(|| {}) };
+        DiffSession::open(move || Ok(backend), options)
+    });
+    let setup = DiffSetup { keymaps: keymaps(), style: DisplayStyle::Linux };
+    let mut v = DiffView::new(opener, setup, Some(path.to_string_lossy().into_owned()), "No changes");
+    v.set_clipboard(|_| {});
+    wait_for(&mut v, "the first read", |v| !v.session().state().loading());
+    (v, sent, dir)
+}
+
+/// Write a comment on the line under the cursor through the keys.
+fn comment_here(v: &mut DiffView, text: &str) {
+    v.key(key(KeyCode::Enter, KeyModifiers::NONE));
+    for c in text.chars() {
+        v.key(ch(c));
+    }
+    v.key(key(KeyCode::Enter, KeyModifiers::NONE));
+}
+
+/// To the line the fixture changed: file header, hunk, `one`, `two`, `TWO`.
+fn onto_the_change(v: &mut DiffView) {
+    for _ in 0..4 {
+        v.key(ch('j'));
+    }
+}
+
+#[test]
+fn gy_sends_the_comments_to_the_agent_and_says_so_in_the_status_line() {
+    let (mut v, sent, _dir) = view_of(TargetKind::Workspace, true);
+    onto_the_change(&mut v);
+    comment_here(&mut v, "why?");
+    assert_eq!(v.session().state().comments().len(), 1);
+    assert_eq!(v.key(ch('g')), DiffOut::None);
+    assert_eq!(v.key(key(KeyCode::Char('Y'), KeyModifiers::SHIFT)), DiffOut::None, "nothing's left for the shell");
+    wait_for(&mut v, "the delivery", |v| v.session().state().comments()[0].sent);
+    let sent = sent.lock().unwrap();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].contains("a.txt:2") && sent[0].contains("TWO") && sent[0].contains("j: why?"), "{}", sent[0]);
+    assert!(lines(&render(&mut v, 120, 10)).join("\n").contains("Sent 1 comment to the agent"));
+}
+
+#[test]
+fn gy_in_a_review_hands_the_comments_to_the_reject_prompt() {
+    let (mut v, sent, _dir) = view_of(TargetKind::Review, false);
+    // A review reads the branch: nothing's committed here, so a comment arrives
+    // from the store.
+    v.session().carry_out(vec![shelbi_app::diff::DiffEffect::SaveComment(CommentOp::Add(Comment {
+        id: "c1".into(),
+        anchor: Anchor { path: "a.txt".into(), side: Side::New, start: 2, end: 2, code: vec!["two".into()] },
+        author: Author::human("j"),
+        body: "why?".into(),
+        created_at: chrono::Utc::now(),
+        replies: Vec::new(),
+        sent: false,
+    }))]);
+    wait_for(&mut v, "the comment", |v| v.session().state().comments().len() == 1);
+    v.key(ch('g'));
+    let out = v.key(key(KeyCode::Char('Y'), KeyModifiers::SHIFT));
+    let DiffOut::Reject { reason } = out else { panic!("{out:?}") };
+    assert!(reason.contains("[thread c1]"), "{reason}");
+    assert!(sent.lock().unwrap().is_empty());
+}
+
+#[test]
+fn revert_asks_on_the_status_line_and_writes_on_yes() {
+    let (mut v, _, dir) = view_of(TargetKind::Workspace, true);
+    onto_the_change(&mut v);
+    v.key(ch('g'));
+    v.key(ch('r'));
+    wait_for(&mut v, "the question", |v| matches!(v.session().state().mode(), Mode::Confirm(_)));
+    let screen = lines(&render(&mut v, 160, 10)).join("\n");
+    assert!(screen.contains("to HEAD? This uncommitted work will be gone."), "{screen}");
+    v.key(ch('y'));
+    wait_for(&mut v, "the write", |v| v.session().state().changeset().files.is_empty());
+    let path = dir.path().canonicalize().unwrap().join("a.txt");
+    assert_eq!(fs::read_to_string(path).unwrap(), "one\ntwo\n");
+}
+
+#[test]
+fn a_review_offers_no_revert() {
+    let (mut v, _, _dir) = view_of(TargetKind::Review, false);
+    v.key(ch('g'));
+    v.key(key(KeyCode::Char('R'), KeyModifiers::SHIFT));
+    assert!(!matches!(v.session().state().mode(), Mode::Confirm(_)));
+    assert!(v.session().state().flash().unwrap().contains("checkout of the branch"));
 }

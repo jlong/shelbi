@@ -103,6 +103,21 @@ the runner hooks live) and is covered by the worktree git exclude, so it
 won't dirty `git status` or get committed. If you genuinely can't produce
 a useful description, just don't write the file.
 
+## Answering review comments
+
+A person reviewing your diff can send you their comments as one prompt: each
+thread with its file, line and the quoted code. Do what they ask. To answer a
+thread where the reviewer reads it, under the comment in the diff view, reply
+through the CLI (the prompt gives the full command, with the project and task):
+
+```sh
+shelbi diff comment list --task <task-id>
+shelbi diff comment reply --task <task-id> -i <thread> "It drops the slot on close"
+```
+
+`-i` takes a thread's id, a prefix of it, or its number in `list`. A reply is
+signed with your agent's name; `-a <name>` signs it with another.
+
 ## Conventions
 
 Follow project conventions in `agents/_shared/preamble.md` (if present)

@@ -6,14 +6,24 @@
 use super::*;
 use crate::shell::diff_view;
 use shelbi_app::diff::comments::Author;
-use shelbi_app::diff::{DiffOptions, DiffSession};
+use shelbi_app::diff::{DiffOptions, DiffSession, TargetKind};
 use shelbi_state::keymap::validate_keymaps_yaml;
 use shelbi_state::AppTools;
+
+/// A target for a session in a test: nothing reads it but the state.
+fn test_target(kind: TargetKind) -> shelbi_app::diff::DiffTarget {
+    shelbi_app::diff::DiffTarget {
+        project: "demo".to_string(),
+        workspace: "alpha".to_string(),
+        kind,
+        task: Some("t-1".to_string()),
+    }
+}
 
 /// A session that fails to open: the view on top of it behaves all the same.
 fn fake_opener() -> diff_view::DiffOpener {
     Arc::new(|| {
-        let options = DiffOptions { author: Author::human("j"), watch: None, wake: Arc::new(|| {}) };
+        let options = DiffOptions { author: Author::human("j"), target: test_target(TargetKind::Workspace), watch: None, wake: Arc::new(|| {}) };
         DiffSession::open(|| Err("no worktree in this test".to_string()), options)
     })
 }
@@ -193,4 +203,15 @@ fn ctrl_g_queues_the_editor_at_the_line() {
     st.apply_review_action(ReviewAction::OpenFile { path: PathBuf::from("/wt/a.rs"), line: Some(12) });
     assert_eq!(st.pending_editor.as_deref(), Some(std::path::Path::new("/wt/a.rs")));
     assert_eq!(st.pending_editor_line, Some(12));
+}
+
+/// `gY` in a review's diff asks for Reject, its reason starting from the comments.
+#[test]
+fn gy_in_a_reviews_diff_opens_reject_with_the_comments() {
+    let mut st = with_review(builtin());
+    st.overlay = None;
+    st.apply_review_action(ReviewAction::RejectWith("[thread c1] a.rs:1\n".to_string()));
+    let Some(ActiveOverlay::RejectReason { task_id, prompt }) = &st.overlay else { panic!("no reject prompt") };
+    assert_eq!(task_id, "t-1");
+    assert_eq!(prompt.reason(), "[thread c1] a.rs:1\n");
 }

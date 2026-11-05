@@ -17,6 +17,7 @@ use shelbi_core::Host;
 use super::comments::{CommentDoc, CommentOp};
 use super::git::{self, BlameLine, GitRunner, HostGit, RawChangeset};
 use super::model::CommitScope;
+use super::revert::{self, RevertPlan, RevertSpec};
 use super::store::{DiffStore, ViewedDoc, ViewedOp};
 use crate::source::ProjectLink;
 
@@ -52,6 +53,24 @@ impl DiffTarget {
     }
 }
 
+/// How a message to an agent landed. Each is a delivery: anything short of one
+/// is an `Err`, and the comments stay unsent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentDelivery {
+    /// Seen submitted.
+    Submitted,
+    /// The agent was mid-turn: it's queued, and goes when the turn ends.
+    Queued,
+    /// Delivered to a runner Shelbi can't read back.
+    Unverified,
+}
+
+/// Puts a message into a target's agent session, verifying it was submitted
+/// and not left in the input. Passed in, because that's the orchestrator's and
+/// this crate sits below it: `shelbi_orchestrator::agent_send::service`.
+pub type AgentSend = Arc<dyn Fn(&DiffTarget, &str) -> Result<AgentDelivery, String> + Send + Sync>;
+
 /// A diff's reads and writes. Blocking: only worker threads call these.
 pub trait DiffBackend: Send + Sync {
     fn changeset(&self, scope: &CommitScope) -> Result<RawChangeset, String>;
@@ -61,21 +80,28 @@ pub trait DiffBackend: Send + Sync {
     fn apply_comment(&self, op: &CommentOp) -> Result<CommentDoc, String>;
     fn viewed(&self) -> Result<ViewedDoc, String>;
     fn apply_viewed(&self, op: &ViewedOp) -> Result<ViewedDoc, String>;
+    /// Send `message` to the agent in the target's session.
+    fn send_to_agent(&self, message: &str) -> Result<AgentDelivery, String>;
+    /// Check a revert, and say what it would do.
+    fn plan_revert(&self, spec: &RevertSpec) -> Result<RevertPlan, String>;
+    /// Carry out a checked revert, answering what the status bar says.
+    fn revert(&self, plan: &RevertPlan) -> Result<String, String>;
 }
 
 /// A target's data on this machine, or on a worktree this machine reaches
 /// over SSH.
 pub struct HostBackend {
-    pub kind: TargetKind,
+    pub target: DiffTarget,
     pub base_branch: String,
     pub git: Arc<dyn GitRunner>,
     pub store: DiffStore,
+    pub agent: AgentSend,
 }
 
 impl HostBackend {
     /// `target`'s backend, from its project's config: the worktree, its
     /// machine, the base branch.
-    pub fn for_target(target: &DiffTarget) -> Result<HostBackend, String> {
+    pub fn for_target(target: &DiffTarget, agent: AgentSend) -> Result<HostBackend, String> {
         let project = shelbi_state::load_project(&target.project).map_err(|e| e.to_string())?;
         let spec = project
             .workspace(&target.workspace)
@@ -85,7 +111,8 @@ impl HostBackend {
             .ok_or_else(|| format!("`{}` isn't a machine in `{}`", spec.machine, target.project))?;
         let worktree = shelbi_core::pool::workspace_worktree(machine, spec);
         Ok(HostBackend {
-            kind: target.kind,
+            target: target.clone(),
+            agent,
             base_branch: project.base_branch().to_string(),
             git: Arc::new(HostGit {
                 host: machine.host(),
@@ -95,16 +122,19 @@ impl HostBackend {
         })
     }
 
-    /// A backend over a worktree on `host`.
+    /// A backend over a worktree on `host`, for tests and a fixture: no project
+    /// config, and an agent that's whatever `agent` does.
     pub fn over(
         host: Host,
         worktree: impl Into<String>,
-        kind: TargetKind,
+        target: DiffTarget,
         base_branch: impl Into<String>,
         store: DiffStore,
+        agent: AgentSend,
     ) -> HostBackend {
         HostBackend {
-            kind,
+            target,
+            agent,
             base_branch: base_branch.into(),
             git: Arc::new(HostGit { host, worktree: worktree.into() }),
             store,
@@ -114,7 +144,7 @@ impl HostBackend {
 
 impl DiffBackend for HostBackend {
     fn changeset(&self, scope: &CommitScope) -> Result<RawChangeset, String> {
-        git::collect(&*self.git, self.kind, &self.base_branch, scope)
+        git::collect(&*self.git, self.target.kind, &self.base_branch, scope)
     }
 
     fn blame(&self, path: &str, rev: Option<&str>) -> Result<Vec<BlameLine>, String> {
@@ -135,6 +165,18 @@ impl DiffBackend for HostBackend {
 
     fn apply_viewed(&self, op: &ViewedOp) -> Result<ViewedDoc, String> {
         self.store.apply_viewed(op)
+    }
+
+    fn send_to_agent(&self, message: &str) -> Result<AgentDelivery, String> {
+        (self.agent)(&self.target, message)
+    }
+
+    fn plan_revert(&self, spec: &RevertSpec) -> Result<RevertPlan, String> {
+        revert::plan(&*self.git, self.target.kind, &self.base_branch, spec)
+    }
+
+    fn revert(&self, plan: &RevertPlan) -> Result<String, String> {
+        revert::run(&*self.git, self.target.kind, &self.base_branch, plan)
     }
 }
 
@@ -160,6 +202,9 @@ pub enum DiffOp {
     ApplyComment(CommentOp),
     Viewed,
     ApplyViewed(ViewedOp),
+    SendToAgent(String),
+    PlanRevert(RevertSpec),
+    Revert(RevertPlan),
 }
 
 /// A far daemon's answer to a [`DiffRequest`].
@@ -170,12 +215,27 @@ pub enum DiffReply {
     Blame(Result<Vec<BlameLine>, String>),
     Comments(Result<CommentDoc, String>),
     Viewed(Result<ViewedDoc, String>),
+    Sent(Result<AgentDelivery, String>),
+    RevertPlanned(Result<RevertPlan, String>),
+    Reverted(Result<String, String>),
 }
 
-/// Answer a [`DiffRequest`] on the machine the project lives on.
-pub fn answer(request: &DiffRequest) -> DiffReply {
-    let backend = HostBackend::for_target(&request.target);
-    answer_with(backend.as_ref().map_err(String::clone), &request.op)
+/// Answer a [`DiffRequest`] on the machine the project lives on. A task's
+/// comments don't need its worktree, so they answer whether or not the target
+/// names a workspace (a Reject from the palette knows only the task).
+pub fn answer(request: &DiffRequest, agent: AgentSend) -> DiffReply {
+    match &request.op {
+        DiffOp::Comments => DiffReply::Comments(store_of(&request.target).and_then(|s| s.comments())),
+        DiffOp::ApplyComment(op) => DiffReply::Comments(store_of(&request.target).and_then(|s| s.apply_comment(op))),
+        op => {
+            let backend = HostBackend::for_target(&request.target, agent);
+            answer_with(backend.as_ref().map_err(String::clone), op)
+        }
+    }
+}
+
+fn store_of(target: &DiffTarget) -> Result<DiffStore, String> {
+    DiffStore::for_project(&target.project, &target.state_key())
 }
 
 /// Answer `op` with `backend`.
@@ -212,6 +272,18 @@ pub fn answer_with(backend: Result<&HostBackend, String>, op: &DiffOp) -> DiffRe
         DiffOp::ApplyViewed(v) => run(
             &|b| DiffReply::Viewed(b.apply_viewed(v)),
             &|e| DiffReply::Viewed(Err(e)),
+        ),
+        DiffOp::SendToAgent(message) => run(
+            &|b| DiffReply::Sent(b.send_to_agent(message)),
+            &|e| DiffReply::Sent(Err(e)),
+        ),
+        DiffOp::PlanRevert(spec) => run(
+            &|b| DiffReply::RevertPlanned(b.plan_revert(spec)),
+            &|e| DiffReply::RevertPlanned(Err(e)),
+        ),
+        DiffOp::Revert(plan) => run(
+            &|b| DiffReply::Reverted(b.revert(plan)),
+            &|e| DiffReply::Reverted(Err(e)),
         ),
     }
 }
@@ -279,13 +351,92 @@ impl DiffBackend for FarBackend {
             other => Err(wrong(other)),
         }
     }
+
+    fn send_to_agent(&self, message: &str) -> Result<AgentDelivery, String> {
+        match self.ask(DiffOp::SendToAgent(message.to_string()))? {
+            DiffReply::Sent(result) => result,
+            other => Err(wrong(other)),
+        }
+    }
+
+    fn plan_revert(&self, spec: &RevertSpec) -> Result<RevertPlan, String> {
+        match self.ask(DiffOp::PlanRevert(spec.clone()))? {
+            DiffReply::RevertPlanned(result) => result,
+            other => Err(wrong(other)),
+        }
+    }
+
+    fn revert(&self, plan: &RevertPlan) -> Result<String, String> {
+        match self.ask(DiffOp::Revert(plan.clone()))? {
+            DiffReply::Reverted(result) => result,
+            other => Err(wrong(other)),
+        }
+    }
 }
 
 /// The backend for `target` as seen through `link`. Blocking the first time
-/// (it reads the project's config), so a worker thread calls it.
-pub fn backend_for(target: &DiffTarget, link: Option<&ProjectLink>) -> Result<Arc<dyn DiffBackend>, String> {
+/// (it reads the project's config), so a worker thread calls it. `agent` is how
+/// this machine reaches an agent's session; a far project's daemon uses its own.
+pub fn backend_for(
+    target: &DiffTarget,
+    link: Option<&ProjectLink>,
+    agent: AgentSend,
+) -> Result<Arc<dyn DiffBackend>, String> {
     if let Some(link) = link.filter(|l| l.is_remote()) {
         return Ok(Arc::new(FarBackend { target: target.clone(), link: link.clone() }));
     }
-    Ok(Arc::new(HostBackend::for_target(target)?))
+    Ok(Arc::new(HostBackend::for_target(target, agent)?))
+}
+
+/// A task's comments, reached without its worktree: on this machine, or through
+/// a far project's daemon. What Reject reads to pre-fill its reason and marks
+/// sent afterwards, and where a CLI reply goes. Blocking.
+pub struct CommentAccess {
+    target: DiffTarget,
+    far: Option<FarBackend>,
+}
+
+/// The access for `task`'s comments.
+pub fn comment_access(project: &str, task: &str, link: Option<&ProjectLink>) -> CommentAccess {
+    let target = DiffTarget {
+        project: project.to_string(),
+        workspace: String::new(),
+        kind: TargetKind::Review,
+        task: Some(task.to_string()),
+    };
+    let far = link
+        .filter(|l| l.is_remote())
+        .map(|link| FarBackend { target: target.clone(), link: link.clone() });
+    CommentAccess { target, far }
+}
+
+impl CommentAccess {
+    pub fn comments(&self) -> Result<CommentDoc, String> {
+        match &self.far {
+            Some(far) => far.comments(),
+            None => store_of(&self.target)?.comments(),
+        }
+    }
+
+    pub fn apply(&self, op: &CommentOp) -> Result<CommentDoc, String> {
+        match &self.far {
+            Some(far) => far.apply_comment(op),
+            None => store_of(&self.target)?.apply_comment(op),
+        }
+    }
+
+    /// The reason a Reject starts from: the task's unsent comments, if any.
+    pub fn reject_reason(&self) -> Result<Option<String>, String> {
+        let doc = self.comments()?;
+        Ok(super::comments::agent_message(&doc, &self.target.project, &self.target.state_key()).map(|(message, _)| message))
+    }
+
+    /// A reject with `reason` landed: the threads it carried have been sent.
+    pub fn mark_sent_in(&self, reason: &str) -> Result<(), String> {
+        let ids = super::comments::threads_in(reason, &self.comments()?);
+        if !ids.is_empty() {
+            self.apply(&CommentOp::MarkSent { ids })?;
+        }
+        Ok(())
+    }
 }

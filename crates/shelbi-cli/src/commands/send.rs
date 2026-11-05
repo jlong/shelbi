@@ -23,9 +23,10 @@
 //! workspace-based projects.
 
 use anyhow::{anyhow, Result};
+use shelbi_app::diff::AgentDelivery;
 use shelbi_core::{AgentRunnerSpec, Host, Project};
+use shelbi_orchestrator::agent_send::send_verified;
 use shelbi_orchestrator::session_backend::SessionTarget;
-use shelbi_orchestrator::submit::{PaneBaseline, SubmitProfile, SubmitStatus};
 use shelbi_orchestrator::workspace as orch_workspace;
 
 use super::require_project;
@@ -56,105 +57,14 @@ pub fn run(project: Option<String>, id: String, message: String) -> Result<()> {
             addr.label(),
         ));
     }
-    let delivery = send_verified(&project_name, &id, &runner, &host, &addr, &message)?;
+    let delivery = send_verified(&project_name, &id, &runner, &host, &addr, &message).map_err(|e| anyhow!(e))?;
+    let delivery = match delivery {
+        AgentDelivery::Submitted => "sent",
+        AgentDelivery::Queued => "queued",
+        AgentDelivery::Unverified => "sent (unverified)",
+    };
     println!("✓ {delivery} to {} ({})", id, addr.label());
     Ok(())
-}
-
-/// Human-facing success wording for a verified pane injection.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SendDelivery {
-    Submitted,
-    /// Claude was already working. The separately-delivered Enter leaves the
-    /// text in its visible queued-input area until the current turn ends; that
-    /// is an accepted delivery, not a stuck idle prompt.
-    Queued,
-    /// The runner has no pane parser Shelbi knows how to verify. Text and
-    /// Enter were still delivered through the shared race-safe primitive,
-    /// but the CLI is explicit that no runner-specific submit signal exists.
-    Unverified,
-}
-
-impl std::fmt::Display for SendDelivery {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            SendDelivery::Submitted => f.write_str("sent"),
-            SendDelivery::Queued => f.write_str("queued"),
-            SendDelivery::Unverified => f.write_str("sent (unverified)"),
-        }
-    }
-}
-
-/// Route `shelbi send` through the orchestrator's shared verified-submit
-/// primitive and record every verdict. A transport failure is also surfaced
-/// as `status=stuck`: without that event, an orchestrator tailing events.log
-/// would still silently assume the nudge arrived.
-pub(super) fn send_verified(
-    project: &str,
-    id: &str,
-    runner: &AgentRunnerSpec,
-    host: &Host,
-    addr: &SessionTarget,
-    message: &str,
-) -> Result<SendDelivery> {
-    let profile = SubmitProfile::for_runner(runner);
-    let baseline = PaneBaseline::capture(host, addr, profile);
-    let status = match shelbi_orchestrator::submit::send_verified(host, addr, message, &baseline) {
-        Ok(status) => status,
-        Err(e) => {
-            shelbi_state::append_send_event(project, id, "stuck", "transport_error")
-                .map_err(|log_err| {
-                    anyhow!(
-                        "sending to `{id}` failed ({e}); recording the stuck delivery also failed: {log_err}"
-                    )
-                })?;
-            return Err(anyhow!("sending to `{id}` failed: {e}"));
-        }
-    };
-
-    // A busy baseline alone is stale by the time the verifier has spent up
-    // to two polling windows waiting. Claude may have completed that turn in
-    // the meantime, leaving a genuinely wedged prompt in an idle input box.
-    // Accept visible input as a queue only when the pane was busy before the
-    // send and still has strong current-turn evidence at the final verdict.
-    let finally_actively_busy = matches!(status, SubmitStatus::StillInBox)
-        && PaneBaseline::capture(host, addr, profile).actively_busy;
-    let (event_status, detail, delivery) =
-        classify_delivery(status, baseline.actively_busy, finally_actively_busy);
-    shelbi_state::append_send_event(project, id, event_status, detail).map_err(|e| anyhow!(e))?;
-    delivery.ok_or_else(|| {
-        anyhow!(
-            "message to `{id}` is stuck in {} after a retry Enter; the failure was recorded in events.log",
-            addr.label()
-        )
-    })
-}
-
-/// Map the transport-neutral verifier result to `shelbi send` semantics.
-/// A visibly parked message is acceptable only when the pane was genuinely
-/// busy both before delivery and at the final verdict: Claude keeps submitted
-/// mid-turn input visible as a queue and consumes it when the current turn
-/// ends. The same screen after that turn has ended is the bug this command
-/// must report as stuck.
-fn classify_delivery(
-    status: SubmitStatus,
-    baseline_actively_busy: bool,
-    finally_actively_busy: bool,
-) -> (&'static str, &'static str, Option<SendDelivery>) {
-    match status {
-        SubmitStatus::Submitted { detail } => ("submitted", detail, Some(SendDelivery::Submitted)),
-        SubmitStatus::DeliveredUnverified { detail } => {
-            ("unverified", detail, Some(SendDelivery::Unverified))
-        }
-        SubmitStatus::EligibilityRevoked => ("stuck", "eligibility_revoked", None),
-        SubmitStatus::StillInBox if baseline_actively_busy && finally_actively_busy => (
-            "queued",
-            "busy_pane_visible_queue",
-            Some(SendDelivery::Queued),
-        ),
-        SubmitStatus::StillInBox => ("stuck", "still_in_input_after_retry", None),
-        SubmitStatus::Unconfirmed => ("stuck", "unconfirmed_after_retry", None),
-    }
 }
 
 /// Where the message should land. The name must match a declared workspace;
@@ -345,7 +255,7 @@ mod tests {
         project.orchestrator.runner = "codex".into();
         let t = resolve_target(&project, "bravo").unwrap();
         assert_eq!(t.runner.command, "/opt/homebrew/bin/codex");
-        let profile = SubmitProfile::for_runner(&t.runner);
+        let profile = shelbi_orchestrator::submit::SubmitProfile::for_runner(&t.runner);
         assert!(profile.has_ui_verifier());
         assert!(!profile.uses_claude_ui());
     }
@@ -406,70 +316,5 @@ mod tests {
             msg.contains("no workspaces declared"),
             "msg should mention empty pool: {msg}"
         );
-    }
-
-    #[test]
-    fn idle_visible_input_is_stuck_but_busy_visible_input_is_queued() {
-        assert_eq!(
-            classify_delivery(SubmitStatus::StillInBox, false, false),
-            ("stuck", "still_in_input_after_retry", None)
-        );
-        assert_eq!(
-            classify_delivery(SubmitStatus::StillInBox, true, true),
-            (
-                "queued",
-                "busy_pane_visible_queue",
-                Some(SendDelivery::Queued)
-            )
-        );
-    }
-
-    #[test]
-    fn stale_busy_baseline_does_not_hide_a_wedged_idle_prompt() {
-        assert_eq!(
-            classify_delivery(SubmitStatus::StillInBox, true, false),
-            ("stuck", "still_in_input_after_retry", None)
-        );
-        assert_eq!(
-            classify_delivery(SubmitStatus::StillInBox, false, true),
-            ("stuck", "still_in_input_after_retry", None)
-        );
-    }
-
-    #[test]
-    fn confirmed_and_unconfirmed_verdicts_map_to_delivery_events() {
-        assert_eq!(
-            classify_delivery(
-                SubmitStatus::Submitted {
-                    detail: "retry_enter"
-                },
-                false,
-                false,
-            ),
-            ("submitted", "retry_enter", Some(SendDelivery::Submitted))
-        );
-        assert_eq!(
-            classify_delivery(SubmitStatus::Unconfirmed, true, true),
-            ("stuck", "unconfirmed_after_retry", None)
-        );
-    }
-
-    #[test]
-    fn unsupported_runner_delivery_is_success_but_explicitly_unverified() {
-        assert_eq!(
-            classify_delivery(
-                SubmitStatus::DeliveredUnverified {
-                    detail: "verification_unsupported"
-                },
-                false,
-                false,
-            ),
-            (
-                "unverified",
-                "verification_unsupported",
-                Some(SendDelivery::Unverified)
-            )
-        );
-        assert_eq!(SendDelivery::Unverified.to_string(), "sent (unverified)");
     }
 }

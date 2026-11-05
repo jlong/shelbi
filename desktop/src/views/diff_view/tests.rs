@@ -1,6 +1,7 @@
 //! The view through its real paths: keys down the focus path, clicks on what's
 //! drawn, the session's worker threads (over a patch in memory).
 
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use gpui::{Modifiers, TestAppContext, VisualTestContext, WindowAppearance};
@@ -578,4 +579,95 @@ fn the_window_keeps_what_the_diff_has_no_use_for(cx: &mut TestAppContext) {
     assert!(!wants(&h, "super-1"), "the sidebar's chord");
     assert!(!wants(&h, "ctrl-h"), "the focus move");
     assert!(!wants(&h, "esc"), "nothing held to let go of");
+}
+
+// ---- Sending and reverting -------------------------------------------------
+
+fn open_kind(cx: &mut TestAppContext, kind: TargetKind) -> (Harness, Arc<Mutex<Vec<DiffViewEvent>>>) {
+    cx.update(|cx| {
+        cx.set_global(Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark));
+        gpui_kit::init(cx);
+    });
+    let opened: Opened = Arc::default();
+    let deps = DiffDeps::canned(SAMPLE_PATCH, opened.clone());
+    let events: Arc<Mutex<Vec<DiffViewEvent>>> = Arc::default();
+    let heard = events.clone();
+    let window = cx.update(|cx| {
+        cx.open_window(Default::default(), |_, cx| {
+            let target = DiffTarget { kind, ..target() };
+            let view = cx.new(|cx| DiffView::new(target, FilePlace::Local("/wt".into()), &deps, cx));
+            cx.subscribe(&view, move |_, ev: &DiffViewEvent, _| heard.lock().unwrap().push(ev.clone())).detach();
+            cx.new(|_| Host { view })
+        })
+        .unwrap()
+    });
+    let mut vcx = VisualTestContext::from_window(window.into(), cx);
+    let view = window.root(&mut vcx).unwrap().read_with(&vcx, |h, _| h.view.clone());
+    vcx.update(|window, cx| {
+        let handle = view.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+    });
+    let mut h = Harness { view, cx: vcx, opened };
+    h.wait(|s| !s.loading());
+    h.draw();
+    (h, events)
+}
+
+/// A comment on the first changed line, through the keys.
+fn comment_on_a_line(h: &mut Harness) {
+    h.keys("j j j");
+    h.keys("enter");
+    assert_eq!(h.mode(), "COMMENT");
+    h.keys("w h y enter");
+    h.wait(|s| s.comments().len() == 1);
+}
+
+#[gpui::test]
+fn gy_in_a_workspace_delivers_and_marks_them_sent(cx: &mut TestAppContext) {
+    let (mut h, events) = open_kind(cx, TargetKind::Workspace);
+    comment_on_a_line(&mut h);
+    h.keys("g shift-y");
+    h.wait(|s| s.comments()[0].sent);
+    assert_eq!(h.read(|v| v.state().flash().map(str::to_string)).as_deref(), Some("Sent 1 comment to the agent"));
+    assert!(!events.lock().unwrap().iter().any(|e| matches!(e, DiffViewEvent::Reject(_))));
+}
+
+#[gpui::test]
+fn gy_in_a_review_asks_its_host_for_reject(cx: &mut TestAppContext) {
+    let (mut h, events) = open_kind(cx, TargetKind::Review);
+    comment_on_a_line(&mut h);
+    h.keys("g shift-y");
+    let asked = events.lock().unwrap().iter().find_map(|e| match e {
+        DiffViewEvent::Reject(reason) => Some(reason.clone()),
+        _ => None,
+    });
+    assert!(asked.expect("a reject").contains("jlong: why"));
+    assert!(!h.read(|v| v.state().comments()[0].sent), "not until the reject lands");
+    // `gA` is the Reviewer's.
+    h.keys("g shift-a");
+    h.wait(|s| s.comments()[0].sent);
+    assert_eq!(h.read(|v| v.state().flash().map(str::to_string)).as_deref(), Some("Sent 1 comment to the Reviewer"));
+}
+
+#[gpui::test]
+fn revert_asks_on_the_status_line_and_a_review_has_none(cx: &mut TestAppContext) {
+    let (mut h, _) = open_kind(cx, TargetKind::Workspace);
+    h.keys("j j g shift-r");
+    h.wait(|s| matches!(s.mode(), Mode::Confirm(_)));
+    assert!(h.drawn("diff-revert-confirm"));
+    h.keys("n");
+    assert_eq!(h.mode(), "NORMAL");
+    assert!(!h.drawn("diff-revert-confirm"));
+    h.keys("g shift-r");
+    h.wait(|s| matches!(s.mode(), Mode::Confirm(_)));
+    h.keys("y");
+    h.wait(|s| s.flash().is_some_and(|f| f.starts_with("Undid")));
+
+    let (mut review, _) = open_kind(cx, TargetKind::Review);
+    review.keys("j j g shift-r");
+    assert_eq!(review.mode(), "NORMAL");
+    assert!(review.read(|v| v.state().flash().unwrap_or("").contains("checkout of the branch")));
+    review.keys("?");
+    assert!(!review.drawn("diff-help-RevertFile"), "a review doesn't list it");
+    assert!(review.drawn("diff-help-SendToReviewer"));
 }

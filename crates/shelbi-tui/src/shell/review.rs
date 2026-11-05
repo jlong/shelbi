@@ -81,6 +81,8 @@ pub enum ReviewAction {
     Approve,
     /// Open the reject-reason overlay.
     Reject,
+    /// `gY` in the diff: Reject, its reason starting from the comments.
+    RejectWith(String),
     /// Open the review worktree (the editor) or its diff in the app chosen
     /// for the role; the content view stays as it is.
     OpenApp(ReviewRole),
@@ -641,6 +643,7 @@ impl ReviewInterface {
                     ReviewAction::None
                 }
                 DiffOut::Edit { path, line } => ReviewAction::OpenFile { path, line },
+                DiffOut::Reject { reason } => ReviewAction::RejectWith(reason),
             };
         }
         // Tab returns focus to the panel; everything else goes to the agent.

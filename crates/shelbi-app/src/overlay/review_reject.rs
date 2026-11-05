@@ -69,6 +69,24 @@ impl RejectPrompt {
         Self::default()
     }
 
+    /// A prompt that starts from `reason` (the review's comments), the caret at
+    /// its end, ready to add to or submit.
+    pub fn with_reason(reason: &str) -> Self {
+        let mut prompt = Self::new();
+        prompt.fill(reason);
+        prompt
+    }
+
+    /// Start from `reason`, unless something's been typed: a read that arrives
+    /// late never writes over a person's words.
+    pub fn fill(&mut self, reason: &str) {
+        if !self.text.text().is_empty() {
+            return;
+        }
+        // Into the area that's there, which knows how the host wraps it.
+        self.text.insert_str(reason);
+    }
+
     /// The composed reason, newlines kept.
     pub fn reason(&self) -> String {
         self.text.text()
@@ -300,5 +318,18 @@ mod tests {
         typed(&mut p, "x");
         assert_eq!(p.click_reject(), Step::Submit);
         assert_eq!(p.click_cancel(), Step::Cancel);
+    }
+
+    #[test]
+    fn a_prompt_can_start_from_the_comments_but_never_writes_over_typing() {
+        let mut p = RejectPrompt::with_reason("a.rs:1\njlong: why?\n");
+        assert_eq!(p.reason(), "a.rs:1\njlong: why?\n");
+        p.handle_key(KeyChord::new(Key::Char('!'), Mods::NONE));
+        assert_eq!(p.reason(), "a.rs:1\njlong: why?\n!", "the caret starts at the end");
+        p.fill("late");
+        assert_eq!(p.reason(), "a.rs:1\njlong: why?\n!");
+        let mut empty = RejectPrompt::new();
+        empty.fill("late");
+        assert_eq!(empty.reason(), "late");
     }
 }
