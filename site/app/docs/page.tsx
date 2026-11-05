@@ -93,9 +93,9 @@ export default function DocsIndex() {
     <main className="max-w-3xl">
       <h1 className="text-3xl font-semibold tracking-tight text-fg">Docs</h1>
       <p className="mt-2 max-w-2xl text-gray-7">
-        Shelbi is an agent orchestrator for the terminal — a board of tasks, a
-        pool of git workspaces, and an orchestrator that keeps them loaded with
-        work. These docs take you from install to a running loop, then explain
+        Shelbi is an agent orchestrator for your desktop and terminal: a board
+        of tasks, a pool of git workspaces, and an orchestrator that keeps them
+        loaded with work. These docs take you from install to a running loop, then explain
         the pieces and the CLI behind it.
       </p>
 

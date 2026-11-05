@@ -25,7 +25,7 @@ export function TerminalBanner() {
         {BANNER_LINES.join("\n")}
       </pre>
       <p className="mt-3 font-mono text-xs text-[var(--tui-gray)]">
-        an open-source agent orchestrator for the terminal
+        an open-source agent orchestrator for your desktop and terminal
       </p>
     </div>
   )

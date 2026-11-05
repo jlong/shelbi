@@ -18,7 +18,8 @@ export function Hero() {
         <h2 className="max-w-2xl text-base font-normal leading-relaxed text-gray-7 sm:text-lg">
           Tired of managing agents in terminal tabs? Struggling to keep track
           of which one needs attention and which one&apos;s stalled? Try
-          Shelbi, an open source, personal agent orchestrator for your terminal.
+          Shelbi, an open source, personal agent orchestrator for your desktop
+          and terminal.
         </h2>
 
         <p className="-my-2.5 font-mono text-xs uppercase tracking-[0.25em] text-accent sm:text-sm">
