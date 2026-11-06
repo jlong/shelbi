@@ -460,6 +460,15 @@ fn pr_create_impl(
     // ancestor/integration fallbacks below then apply exactly as before.
     let published_head = expected.published_head_sha.as_deref();
     let remote_task_head = optional_remote_branch_sha(&host, &wt, &push_target, branch)?;
+    refuse_empty_integration_over_pr_head(
+        &host,
+        &worktree,
+        &push_target,
+        branch,
+        task,
+        expected,
+        remote_task_head.as_deref(),
+    )?;
     let remote_is_reviewed_ancestor = match remote_task_head.as_deref() {
         Some(oid)
             if oid != expected.head_sha
@@ -2087,6 +2096,18 @@ fn land_pr(
         &expected.head_sha,
         &expected.integration_sha,
     )?;
+    if !adds_to_base(
+        &host,
+        std::path::Path::new(&wt),
+        &expected.base_sha,
+        &expected.integration_sha,
+    )? {
+        return Err(Error::Other(format!(
+            "PR #{pr}'s integration commit {} changes nothing on base `{}`; refusing to land an \
+             empty PR. No ref was updated. Re-run `shelbi zen probe`",
+            expected.integration_sha, expected.base_branch
+        )));
+    }
 
     if project.merge_strategy().as_str() != "squash" {
         return Err(unsupported_exact_ref_message(
@@ -4921,6 +4942,140 @@ esac
         assert_eq!(decision.detail, "already-merged");
     }
 
+    /// Model a task built on another machine: origin gets its commit from a
+    /// separate clone, and `worktree`'s repository never sees it. Returns the
+    /// published tip.
+    fn publish_branch_built_elsewhere(base: &Path, origin: &Path) -> String {
+        let devbox = base.join("devbox");
+        run_git(
+            base,
+            &["clone", "-q", origin.to_str().unwrap(), devbox.to_str().unwrap()],
+        );
+        run_git(&devbox, &["config", "user.email", "test@example.com"]);
+        run_git(&devbox, &["config", "user.name", "Test"]);
+        run_git(&devbox, &["checkout", "-q", "-b", TASK_BRANCH]);
+        std::fs::write(devbox.join("devbox.txt"), "built on the devbox\n").unwrap();
+        run_git(&devbox, &["add", "devbox.txt"]);
+        run_git(&devbox, &["commit", "-q", "-m", "devbox work"]);
+        run_git(&devbox, &["push", "-q", "origin", &format!("HEAD:refs/heads/{TASK_BRANCH}")]);
+        git_stdout(&devbox, &["rev-parse", "HEAD"])
+    }
+
+    /// Point the local task ref at `target`, the way dispatch's cut leaves it
+    /// on a hub whose slot never built the branch.
+    fn point_local_task_ref_at(worktree: &Path, target: &str) {
+        run_git(worktree, &["checkout", "-q", "--detach", target]);
+        run_git(worktree, &["branch", "-f", TASK_BRANCH, target]);
+    }
+
+    fn live_probe_error(base: &Path, origin: &Path) -> String {
+        let stub = tempfile::tempdir().unwrap();
+        let _log = install_gh_stub(stub.path(), origin, None, None);
+        let _env = EnvGuard::install(stub.path());
+        let result = probe_in_workflow(
+            &project(base),
+            None,
+            &task(),
+            TASK_BRANCH,
+            RebasePolicy::RebaseOntoDefault,
+        );
+        let error = result.expect_err("the probe must not report a clean result").to_string();
+        assert_eq!(
+            shelbi_state::zen_flow::load(PROJECT_NAME, &task().id).unwrap(),
+            None,
+            "a refused probe must not start a flow"
+        );
+        error
+    }
+
+    #[test]
+    fn reassigned_probe_refuses_a_ref_cut_before_the_branch_was_built_elsewhere() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(false);
+        let cut_point = git_stdout(&worktree, &["rev-parse", "origin/main"]);
+        point_local_task_ref_at(&worktree, &cut_point);
+        let tip = publish_branch_built_elsewhere(base.path(), &origin);
+        // main moves on, so the rebase takes the stale ref all the way to the
+        // new base: the state that reported `head_sha == base_sha`.
+        advance_origin_main_with_base_fix(base.path(), &origin);
+
+        let error = live_probe_error(base.path(), &origin);
+
+        assert!(error.contains(&tip), "must name the published tip: {error}");
+        assert!(error.contains(TASK_BRANCH), "{error}");
+        assert!(error.contains(&format!("git fetch origin +refs/heads/{TASK_BRANCH}")), "{error}");
+        assert_eq!(
+            git_stdout(&worktree, &["rev-parse", &format!("refs/heads/{TASK_BRANCH}")]),
+            cut_point,
+            "a refused probe must not advance the local ref"
+        );
+        assert_eq!(remote_head(&origin), tip, "a refused probe must not touch origin");
+    }
+
+    #[test]
+    fn reprobe_refuses_a_ref_an_earlier_bad_probe_left_at_the_base() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(false);
+        let tip = publish_branch_built_elsewhere(base.path(), &origin);
+        advance_origin_main_with_base_fix(base.path(), &origin);
+        // The bad probe advanced the ref to the new base, which is no ancestor
+        // of a tip built on the older one.
+        run_git(&worktree, &["fetch", "-q", "origin", "main"]);
+        point_local_task_ref_at(&worktree, "FETCH_HEAD");
+
+        let error = live_probe_error(base.path(), &origin);
+
+        assert!(error.contains(&tip), "must name the published tip: {error}");
+        assert!(error.contains("adds nothing"), "{error}");
+    }
+
+    #[test]
+    fn probe_refuses_a_ref_behind_rework_published_from_elsewhere() {
+        let _lock = crate::test_lock::acquire();
+        // Built here, bounced, reworked on another machine, then reassigned
+        // back. The ref carries work, but the integration would drop the rest.
+        let (base, origin, worktree) = setup_repo(true);
+        run_git(&worktree, &["checkout", "-q", "--detach"]);
+        let tip = push_unrelated_remote_task_head(base.path(), &origin);
+
+        let error = live_probe_error(base.path(), &origin);
+
+        assert!(error.contains(&tip), "must name the published tip: {error}");
+        assert!(error.contains("behind the published tip"), "{error}");
+    }
+
+    #[test]
+    fn pr_create_refuses_an_empty_integration_over_a_head_with_changes() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(false);
+        let main = git_stdout(&worktree, &["rev-parse", "origin/main"]);
+        point_local_task_ref_at(&worktree, &main);
+        let tip = publish_branch_built_elsewhere(base.path(), &origin);
+
+        // The exact pin the incident's probe handed over: the head is the base,
+        // and the published tip is whitelisted as the flow's own prior state.
+        let integration = create_squash_integration_commit(&Host::Local, &worktree, &main, &main, "squash")
+            .unwrap();
+        let mut identity = pinned_identity(&main, &main);
+        identity.integration_sha = integration.clone();
+        identity.published_head_sha = Some(tip.clone());
+
+        let stub = tempfile::tempdir().unwrap();
+        let log = install_gh_stub(stub.path(), &origin, Some(379), None);
+        let result = {
+            let _env = EnvGuard::install(stub.path());
+            pr_create_at_head(&project(base.path()), PROJECT_NAME, &task(), "body", &identity)
+        };
+
+        let error = result.expect_err("an empty integration must not replace the head").to_string();
+        assert!(error.contains(&integration), "{error}");
+        assert!(error.contains(&tip), "{error}");
+        assert_eq!(remote_head(&origin), tip, "the PR's head must not move");
+        let calls = gh_calls(&log);
+        assert!(!calls.contains("pr create"), "{calls}");
+        assert!(!calls.contains("pr list"), "the refusal must come before any PR work: {calls}");
+    }
+
     #[test]
     fn current_open_pr_is_verified_and_reused_at_the_probed_head() {
         let _lock = crate::test_lock::acquire();
@@ -5674,6 +5829,34 @@ esac
         assert!(!calls.contains("@github.example"), "{calls}");
         drop(base);
     }
+    #[test]
+    fn pr_merge_refuses_an_empty_integration() {
+        let _lock = crate::test_lock::acquire();
+        let (base, origin, worktree) = setup_repo(true);
+        let main = git_stdout(&worktree, &["rev-parse", "origin/main"]);
+        let integration =
+            create_squash_integration_commit(&Host::Local, &worktree, &main, &main, "squash")
+                .unwrap();
+        let mut expected = pinned_identity(&main, &main);
+        expected.integration_sha = integration;
+        let stub = tempfile::tempdir().unwrap();
+        let (_log, _pr_base) = install_pr_merge_stub(stub.path(), &expected, false);
+
+        let error = {
+            let _env = EnvGuard::install(stub.path());
+            pr_merge(&ci_project(base.path(), &worktree), 379, &expected)
+        }
+        .expect_err("an empty integration must not land")
+        .to_string();
+
+        assert!(error.contains("changes nothing"), "{error}");
+        let landed = git_stdout(
+            origin.parent().unwrap(),
+            &["--git-dir", origin.to_str().unwrap(), "rev-parse", "refs/heads/main"],
+        );
+        assert_eq!(landed, main, "the base must not move");
+    }
+
     #[test]
     fn pr_merge_leases_exact_base_ref_and_retry_recognizes_exact_tuple() {
         let _lock = crate::test_lock::acquire();
@@ -6937,6 +7120,7 @@ case "$1 $2" in
     case "$*" in
       *mergeCommit*) echo "MERGED feedfacecafebeef" ;;
       *"--json title"*) echo "reviewed feature title" ;;
+      *changedFiles*) if [ -f {empty_diff} ]; then echo 0; else echo 1; fi ;;
       *baseRefName*) echo main ;;
     esac
     ;;
@@ -6966,6 +7150,7 @@ esac
                 repo_name = q(ORIGIN_REPOSITORY_NAME),
                 closed = q(&stub_home.join("pr-closed").to_string_lossy()),
                 failing = q(&stub_home.join("ci-failing").to_string_lossy()),
+                empty_diff = q(&stub_home.join("pr-empty-diff").to_string_lossy()),
                 pr = PR,
             );
             let gh = bin.join("gh");
@@ -7161,6 +7346,26 @@ transitions:
             );
             assert!(calls[0].contains("--repo github.com/example/repo"), "{calls:?}");
             assert_eq!(flow.phase(), None, "landing ends the flow");
+        }
+
+        #[test]
+        fn a_green_flow_with_an_empty_pr_diff_is_refused_by_the_done_move() {
+            let flow = Flow::new(false);
+            flow.run_to_green();
+            std::fs::write(flow.stub.path().join("pr-empty-diff"), "").unwrap();
+
+            let error = flow
+                .move_to_done("merge")
+                .expect_err("green CI doesn't make an empty PR mergeable")
+                .to_string();
+
+            assert!(error.contains("empty diff"), "{error}");
+            assert!(flow.merge_calls().is_empty(), "nothing may merge");
+            assert_eq!(
+                flow.phase(),
+                Some(ZenFlowPhase::CiGreen { pr: PR }),
+                "a refusal must leave the flow in place"
+            );
         }
 
         #[test]
@@ -7637,6 +7842,7 @@ pub fn probe_in_workflow(
             &published_head,
             &base_branch,
             &repository,
+            &origin_push_target,
             policy,
         )
     });
@@ -7678,6 +7884,7 @@ fn probe_isolated_task_ref(
     published_head: &str,
     base_branch: &str,
     repository: &RepositoryIdentity,
+    origin_push_target: &str,
     policy: RebasePolicy,
 ) -> Result<ProbeReport> {
     // Freeze the base OID too. A concurrent fetch must not make rebase and
@@ -7693,6 +7900,24 @@ fn probe_isolated_task_ref(
             fetch_probe_base(host, probe_worktree, base_branch)?
         }
     };
+
+    // The rest of the report describes the local ref, so it has to be the
+    // task's real work. Dispatch cuts the ref on the hub before a worker on
+    // another machine builds the branch, so in a slot that didn't build it the
+    // ref can sit far behind the published tip.
+    if published_head != initial_head {
+        let wt = probe_worktree.to_string_lossy();
+        ensure_commit_available(host, &wt, origin_push_target, published_head, "published tip")?;
+    }
+    refuse_ref_behind_published_tip(
+        host,
+        probe_worktree,
+        branch,
+        task,
+        initial_head,
+        published_head,
+        &base_sha,
+    )?;
 
     let rebase_conflict = match policy {
         // AsIs never lands a rebase, but it must still tell the truth about
@@ -7788,6 +8013,19 @@ fn probe_isolated_task_ref(
             project.merge_strategy().as_str(),
         )?)
     };
+    if let Some(integration_sha) = &integration_sha {
+        refuse_empty_integration_over_published_work(
+            host,
+            probe_worktree,
+            branch,
+            task,
+            &head_sha,
+            integration_sha,
+            published_head,
+            base_branch,
+            &base_sha,
+        )?;
+    }
     let diff_size = match &integration_sha {
         Some(integration_sha) => {
             probe_diff_size(host, probe_worktree, &base_sha, integration_sha, false)?
@@ -7864,6 +8102,148 @@ fn require_squash_strategy(strategy: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// The tree landing `commit` on `base_sha` would give the base, or `None` when
+/// the two conflict and no such tree exists.
+fn integration_tree_or_conflict(
+    host: &Host,
+    worktree: &std::path::Path,
+    base_sha: &str,
+    commit: &str,
+) -> Result<Option<String>> {
+    match expected_integration_tree(host, worktree, base_sha, commit) {
+        Ok(tree) => Ok(Some(tree)),
+        Err(Error::Other(_)) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether landing `commit` on `base_sha` would change the base. Content the
+/// base already holds under another SHA doesn't count, which is how a
+/// squash-merged branch stays distinct from a branch this slot never saw. A
+/// conflict counts, because conflicting content can't already be there.
+fn adds_to_base(
+    host: &Host,
+    worktree: &std::path::Path,
+    base_sha: &str,
+    commit: &str,
+) -> Result<bool> {
+    let base_tree = probe_head_sha(host, worktree, &format!("{base_sha}^{{tree}}"))?;
+    let tree = integration_tree_or_conflict(host, worktree, base_sha, commit)?;
+    Ok(tree.as_deref() != Some(base_tree.as_str()))
+}
+
+/// Refuse a local task ref the published tip has moved past: `pr-create` would
+/// replace the tip with an integration of the older ref and lose the difference.
+fn refuse_ref_behind_published_tip(
+    host: &Host,
+    worktree: &std::path::Path,
+    branch: &str,
+    task: &Issue,
+    local_head: &str,
+    published_head: &str,
+    base_sha: &str,
+) -> Result<()> {
+    if local_head == published_head
+        || !probe_is_ancestor(host, worktree, local_head, published_head)?
+    {
+        return Ok(());
+    }
+    let local_tree = integration_tree_or_conflict(host, worktree, base_sha, local_head)?;
+    let published_tree = integration_tree_or_conflict(host, worktree, base_sha, published_head)?;
+    if local_tree == published_tree {
+        return Ok(());
+    }
+    Err(stale_task_ref_error(
+        branch,
+        task,
+        published_head,
+        &format!("the local ref is at {local_head}, behind the published tip"),
+    ))
+}
+
+/// Refuse a probe whose integration commit changes nothing while the published
+/// tip carries work. This also catches the ref a bad probe already advanced to
+/// the base, which is no ancestor of a tip built on an older base.
+#[allow(clippy::too_many_arguments)]
+fn refuse_empty_integration_over_published_work(
+    host: &Host,
+    worktree: &std::path::Path,
+    branch: &str,
+    task: &Issue,
+    head_sha: &str,
+    integration_sha: &str,
+    published_head: &str,
+    base_branch: &str,
+    base_sha: &str,
+) -> Result<()> {
+    if adds_to_base(host, worktree, base_sha, integration_sha)?
+        || !adds_to_base(host, worktree, base_sha, published_head)?
+    {
+        return Ok(());
+    }
+    Err(stale_task_ref_error(
+        branch,
+        task,
+        published_head,
+        &format!(
+            "the local ref (rebased to {head_sha}) adds nothing to base `{base_branch}` at \
+             {base_sha}, but the published tip does"
+        ),
+    ))
+}
+
+fn stale_task_ref_error(branch: &str, task: &Issue, published_head: &str, detail: &str) -> Error {
+    Error::Other(format!(
+        "task branch `{branch}` in the repository of workspace `{assigned}` doesn't hold the \
+         published work: {detail}. The published tip is {published_head}. This usually means the \
+         branch was built on another machine and the card was reassigned here. Refusing to \
+         report this as a clean probe, because `shelbi zen pr-create` would replace that work. \
+         Run `git fetch origin +refs/heads/{branch}:refs/heads/{branch}` in that repository, \
+         then re-run `shelbi zen probe {id}`",
+        assigned = task.assigned_to.as_deref().unwrap_or("(unassigned)"),
+        id = task.id,
+    ))
+}
+
+/// Refuse to publish an integration commit with no changes over a remote task
+/// branch that has some. The check sits here as well as in the probe because
+/// `pr-create` is what overwrites the head, and it can be handed a pin from a
+/// probe that didn't catch this.
+fn refuse_empty_integration_over_pr_head(
+    host: &Host,
+    worktree: &std::path::Path,
+    push_target: &str,
+    branch: &str,
+    task: &Issue,
+    expected: &PinnedPrIdentity,
+    remote_head: Option<&str>,
+) -> Result<()> {
+    let Some(remote_head) = remote_head.filter(|oid| *oid != expected.integration_sha) else {
+        return Ok(());
+    };
+    let tree = |commit: &str| probe_head_sha(host, worktree, &format!("{commit}^{{tree}}"));
+    if tree(&expected.integration_sha)? != tree(&expected.base_sha)? {
+        return Ok(());
+    }
+    let wt = worktree.to_string_lossy();
+    ensure_commit_available(host, &wt, push_target, remote_head, "remote task head")?;
+    // What the PR shows: the head against where it forked from the base. No
+    // shared history counts as changes, since there's nothing to show it empty.
+    let fork = run_in_dir(host, &wt, &["git", "merge-base", &expected.base_sha, remote_head])?;
+    let has_changes = !fork.status.success()
+        || tree(String::from_utf8_lossy(&fork.stdout).trim())? != tree(remote_head)?;
+    if !has_changes {
+        return Ok(());
+    }
+    Err(Error::Other(format!(
+        "refusing to publish: integration commit {} changes nothing on base `{}`, but remote \
+         task branch `{branch}` is at {remote_head}, which has changes. Pushing would empty its \
+         PR. Nothing was pushed. Re-run `shelbi zen probe {}`; if the work really landed another \
+         way, close the PR by hand",
+        expected.integration_sha, expected.base_branch, task.id
+    )))
 }
 
 fn create_squash_integration_commit(
