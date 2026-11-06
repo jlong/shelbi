@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use shelbi_core::Reachability;
@@ -438,6 +439,27 @@ impl ProjectLink {
         }
     }
 
+    /// [`Self::mutate`], waiting at most `deadline` for the answer: a daemon
+    /// that takes the request and never replies is [`ExecError::NoAnswer`].
+    /// The caller gets exactly one result. A later answer is dropped (a read
+    /// shows what it did), and the thread stays parked on the silent daemon
+    /// until its connection closes. The request's expected state still guards
+    /// anything that thread resends after the deadline.
+    pub fn mutate_within(
+        &self,
+        deadline: Duration,
+        mutation: &Mutation,
+        expected: Option<ExpectedState>,
+    ) -> Result<Option<ExpectedState>, ExecError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let link = self.clone();
+        let mutation = mutation.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(link.mutate(&mutation, expected, &mut |_stream, _line| {}));
+        });
+        rx.recv_timeout(deadline).unwrap_or(Err(ExecError::NoAnswer))
+    }
+
     /// Add the issue [`Mutation::AddIssue`] describes and answer with the id
     /// the daemon created (`None` from a daemon that doesn't report one).
     pub fn add_issue(
@@ -794,5 +816,68 @@ mod tests {
         }
         assert_eq!(dir, home.join("remote").join("me@devbox").join("shelbi"));
         assert_eq!(escaped, home.join("remote").join("_._x").join("_._y"));
+    }
+
+    /// A relay whose control service takes the request and never answers
+    /// (`hang`), or refuses it at once.
+    struct ScriptedRelay {
+        hang: bool,
+    }
+
+    impl remote::RelayLink for ScriptedRelay {
+        fn host(&self) -> &str {
+            "devbox"
+        }
+        fn is_reachable(&self) -> bool {
+            true
+        }
+        fn open_query(&self) -> Result<shelbi_client::QueryStream, shelbi_client::ClientError> {
+            Err(shelbi_client::ClientError::UnexpectedEof)
+        }
+        fn open_service(
+            &self,
+            _service: shelbi_proto::RelayService,
+        ) -> Result<shelbi_client::RelayStream, shelbi_client::ClientError> {
+            if self.hang {
+                loop {
+                    std::thread::park();
+                }
+            }
+            Err(shelbi_client::ClientError::UnexpectedEof)
+        }
+        fn list_sessions(&self) -> Result<Vec<shelbi_proto::RelaySession>, shelbi_client::ClientError> {
+            Ok(Vec::new())
+        }
+        fn open_session(&self, _short_id: &str) -> Result<shelbi_client::RelayStream, shelbi_client::ClientError> {
+            Err(shelbi_client::ClientError::UnexpectedEof)
+        }
+    }
+
+    fn link(hang: bool) -> ProjectLink {
+        ProjectLink::remote("demo", Arc::new(ScriptedRelay { hang }), Arc::new(null::NullSessions))
+    }
+
+    fn a_move() -> Mutation {
+        Mutation::MoveIssue {
+            project: "demo".into(),
+            id: "A".into(),
+            to_status: "review".into(),
+        }
+    }
+
+    #[test]
+    fn a_mutation_nothing_answers_fails_at_the_deadline() {
+        let at = std::time::Instant::now();
+        let deadline = Duration::from_millis(50);
+        let result = link(true).mutate_within(deadline, &a_move(), None);
+        assert!(matches!(result, Err(ExecError::NoAnswer)), "{result:?}");
+        assert!(at.elapsed() >= deadline);
+        assert_eq!(ExecError::NoAnswer.to_string(), "no answer from the daemon");
+    }
+
+    #[test]
+    fn a_mutation_answered_in_time_keeps_its_answer() {
+        let result = link(false).mutate_within(Duration::from_secs(30), &a_move(), None);
+        assert!(matches!(result, Err(ExecError::Backend(ref m)) if m.starts_with("devbox:")), "{result:?}");
     }
 }

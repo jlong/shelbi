@@ -312,6 +312,81 @@ fn other_writes_share_the_lane_and_the_landed_revisions() {
 }
 
 #[test]
+fn a_save_with_no_answer_fails_frees_the_lane_and_goes_again_on_retry() {
+    let (mut e, t0) = open();
+    e.edit("T", Field::Body, "mine\n", t0);
+    let save = e.poll(ms(t0, 1000)).pop().unwrap();
+    assert_eq!(e.status("T"), SaveStatus::Saving);
+    e.finish(&save, Err(ExecError::NoAnswer), ms(t0, 61_000));
+    assert!(!e.busy("T"));
+    let status = e.status("T");
+    assert_eq!(status, SaveStatus::Failed("no answer from the daemon".into()));
+    assert_eq!(status.label().as_deref(), Some("Not saved: no answer from the daemon"));
+    assert_eq!(body(&e), "mine\n", "the draft is kept");
+    // The lane takes the next write, and the retry carries the same text.
+    let retried = e.retry("T").unwrap();
+    assert_eq!(retried.body.as_deref(), Some("mine\n"));
+}
+
+#[test]
+fn a_workflow_change_with_no_answer_goes_again_on_retry() {
+    let (mut e, _) = open();
+    e.set_workflow(&Snapshot::of(&read("todo", 0, "Title", BODY)), "subtask");
+    let save = e.flush("T").unwrap();
+    e.finish(&save, Err(ExecError::NoAnswer), Instant::now());
+    let retried = e.retry("T").unwrap();
+    assert_eq!(retried.workflow.as_deref(), Some("subtask"));
+}
+
+#[test]
+fn a_save_with_no_answer_that_landed_after_all_is_saved_once_a_read_shows_it() {
+    let (mut e, t0) = open();
+    e.edit("T", Field::Body, "mine\n", t0);
+    let save = e.poll(ms(t0, 1000)).pop().unwrap();
+    e.finish(&save, Err(ExecError::NoAnswer), ms(t0, 61_000));
+    e.observe(&[read("todo", 70, "Title", "mine\n")]);
+    assert_eq!(e.status("T"), SaveStatus::Saved);
+    assert!(e.unsaved().is_empty());
+}
+
+#[test]
+fn a_no_answer_stands_while_the_read_doesnt_have_the_draft() {
+    let (mut e, t0) = open();
+    e.edit("T", Field::Body, "mine\n", t0);
+    let save = e.poll(ms(t0, 1000)).pop().unwrap();
+    e.finish(&save, Err(ExecError::NoAnswer), ms(t0, 61_000));
+    e.observe(&[read("todo", 0, "Title", BODY)]);
+    assert_eq!(e.status("T"), SaveStatus::Failed("no answer from the daemon".into()));
+}
+
+#[test]
+fn another_failure_outlives_a_read_with_nothing_unsaved() {
+    // A refused workflow change leaves nothing dirty; its reason stays up.
+    let (mut e, _) = open();
+    e.set_workflow(&Snapshot::of(&read("todo", 0, "Title", BODY)), "subtask");
+    let save = e.flush("T").unwrap();
+    e.finish(&save, Err(ExecError::Backend("no such workflow".into())), Instant::now());
+    e.observe(&[read("todo", 5, "Title", BODY)]);
+    assert_eq!(e.status("T"), SaveStatus::Failed("no such workflow".into()));
+}
+
+#[test]
+fn a_move_with_no_answer_frees_the_lane_and_folds_the_read_it_held() {
+    let (mut e, t0) = open();
+    let ticket = e.begin_write("T", &at("todo", 0)).unwrap();
+    e.observe(&[read("todo", 3, "Retitled", BODY)]);
+    assert_eq!(e.text("T", Field::Title), Some("Title"), "held while the move is out");
+    e.edit("T", Field::Body, "mine\n", t0);
+    assert!(e.poll(ms(t0, 1000)).is_empty(), "the save waits for the move");
+    // The worker gave up on the daemon: nothing landed that it knows of.
+    e.end_write(&ticket, None);
+    assert!(!e.busy("T"));
+    assert_eq!(e.text("T", Field::Title), Some("Retitled"));
+    let save = e.poll(ms(t0, 1100)).pop().expect("the save goes now");
+    assert_eq!(save.expected, Some(at("todo", 3)));
+}
+
+#[test]
 fn a_property_write_alone_keeps_its_landed_revision_until_a_read_shows_it() {
     let mut e = IssueEdits::new();
     let t = e.begin_write("X", &at("todo", 0)).unwrap();

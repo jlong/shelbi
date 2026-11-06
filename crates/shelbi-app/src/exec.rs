@@ -216,6 +216,10 @@ pub enum ExecError {
     /// client's own retries (`exec_daemon::retry_through_drain`) ran out.
     #[error("{0}")]
     ShuttingDown(String),
+    /// The daemon didn't answer in time. Unlike the others this says nothing
+    /// about the change itself: it may still land.
+    #[error("no answer from the daemon")]
+    NoAnswer,
 }
 
 impl ExecError {
