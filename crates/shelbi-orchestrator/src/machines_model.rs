@@ -5,9 +5,8 @@
 //! [`MachinesModel::build`] (`shelbi-app`) is the pure mapping; this module
 //! reads what it maps: the project's machines and workspaces, the recorded
 //! remote binaries (`rt-machine-setup`), each workspace's `status.yaml`, and
-//! the board's in-progress and review tasks the same way `shelbi workspace
-//! list` does (the daemon-published board index, with review-slot ownership
-//! from the local assignment overlay). For a review slot it resolves the review
+//! the board's working and serving tasks the same way `shelbi workspace list`
+//! does (the published board index through [`BoardOccupancy`]). For a review slot it resolves the review
 //! server's state (the slot's serving marker, as the sidebar does) and URL.
 //!
 //! Every function here can block (disk, and for a remote review slot an SSH
@@ -18,10 +17,8 @@
 use std::collections::HashMap;
 
 use shelbi_app::view::{MachinesInput, MachinesModel, ReviewSlot, ReviewState};
-use shelbi_core::Column;
 use shelbi_state::{
-    fold_assignment_overlay, load_project, load_task_workflow, load_workspace_status, read_board,
-    IssueFile,
+    load_project, load_task_workflow, load_workspace_status, BoardOccupancy, IssueFile,
 };
 
 /// Read `project`'s machines view. `Err` carries why the project config
@@ -46,24 +43,12 @@ pub fn read_machines_input(project_name: &str) -> anyhow::Result<MachinesInput> 
         })
         .collect();
 
-    // One read of the daemon-owned board index, filtered in memory, exactly as
-    // `shelbi workspace list` does: never a backend sweep from a client.
-    let board = read_board(project_name)
-        .map(|b| b.into_issues())
-        .unwrap_or_default();
-    let in_progress: Vec<IssueFile> = board
-        .iter()
-        .filter(|tf| tf.task.column == Column::in_progress())
-        .cloned()
-        .collect();
-    let mut review: Vec<IssueFile> = board
-        .iter()
-        .filter(|tf| tf.task.column == Column::review())
-        .cloned()
-        .collect();
-    // Review-slot ownership from the local assignment overlay: the index's
-    // publish-time fold can lag a fresh review load.
-    fold_assignment_overlay(project_name, &project.issue_tracker, &mut review);
+    // One read of the daemon-owned board index with owners resolved from the
+    // assignment overlay, exactly as `shelbi workspace list` does: never a
+    // backend sweep from a client.
+    let occupancy = BoardOccupancy::read(&project).unwrap_or_default();
+    let in_progress: Vec<IssueFile> = occupancy.working().cloned().collect();
+    let review: Vec<IssueFile> = occupancy.serving().cloned().collect();
 
     let branch_of = |tf: &IssueFile| {
         let workflow = load_task_workflow(project_name, &project, &tf.task).ok();

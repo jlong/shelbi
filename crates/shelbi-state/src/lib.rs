@@ -44,6 +44,7 @@ mod hub_version;
 mod issue_cache;
 pub mod machine_state;
 pub mod migration;
+pub mod occupancy;
 pub mod orchestrator_setup;
 pub mod ownership;
 pub mod questions;
@@ -99,6 +100,7 @@ pub use issue_migrate::{
     apply_issue_migration, plan_issue_migration, IssueMigrationPlan, MigrationControls,
     PartialMigration,
 };
+pub use occupancy::{BoardOccupancy, SlotOccupancy};
 pub use board_index::{
     board_index_path, board_refresh_error_path, clear_board_refresh_error, expected_board_repo,
     fold_assignment_overlay, github_board_repo, indexed_issue, mark_board_index_stale,
@@ -3325,7 +3327,7 @@ pub fn list_ready(project: &str) -> Result<Vec<IssueFile>> {
 /// `active`-category task. A workspace holds a task when a card on the open
 /// board names it in `assigned_to`; it counts as occupied only when that card's
 /// *workflow-resolved* status category is [`StatusCategory::Active`]
-/// ([`occupied_workspaces_on_board`]). `review`-tagged slots are excluded from
+/// ([`BoardOccupancy`]). `review`-tagged slots are excluded from
 /// the pool entirely — they never take dev dispatch, so an idle review slot is
 /// not spare capacity and a review slot serving a handoff task is not a busy
 /// *dev* slot. This keeps the heartbeat's `idle_workspaces=` equal to the
@@ -3333,8 +3335,7 @@ pub fn list_ready(project: &str) -> Result<Vec<IssueFile>> {
 /// so the orchestrator can tell, at emit time, whether there's spare dev
 /// capacity to absorb eligible backlog work.
 pub fn idle_workspace_count(project: &Project) -> Result<usize> {
-    let board = read_board(&project.name)?.into_issues();
-    let busy = occupied_workspaces_on_board(&project.name, project, &board);
+    let busy = BoardOccupancy::read(project)?.busy_slots(None);
     Ok(idle_dev_workspace_count_from(
         &project.workspaces,
         |w| project.effective_tags(w).contains("review"),
@@ -3360,11 +3361,12 @@ pub fn idle_workspace_count(project: &Project) -> Result<usize> {
 /// board. A `file_system` board's read is always warm (its snapshot is
 /// authoritative), so this returns `Some` for it exactly as before.
 pub fn idle_workspace_count_warm(project: &Project) -> Result<Option<usize>> {
-    let board = match read_board_with_cfg(&project.name, &project.issue_tracker)? {
+    let mut board = match read_board_with_cfg(&project.name, &project.issue_tracker)? {
         BoardState::Warm(board) => board,
         BoardState::Stale(_) | BoardState::Cold => return Ok(None),
     };
-    let busy = occupied_workspaces_on_board(&project.name, project, &board);
+    fold_assignment_overlay(&project.name, &project.issue_tracker, &mut board);
+    let busy = BoardOccupancy::from_board(project, board).busy_slots(None);
     Ok(Some(idle_dev_workspace_count_from(
         &project.workspaces,
         |w| project.effective_tags(w).contains("review"),
@@ -3372,64 +3374,11 @@ pub fn idle_workspace_count_warm(project: &Project) -> Result<Option<usize>> {
     )))
 }
 
-/// Names of the workspaces on `board` **holding an `active`-category task** —
-/// the set the heartbeat subtracts from the dev pool. A workspace is counted
-/// when a card names it in `assigned_to` and that card's *workflow-resolved*
-/// status category is [`StatusCategory::Active`]: the stock `in-progress`, or
-/// any agent-owned active gate (e.g. `review-app`).
-///
-/// A `handoff`-category card (a review task) does **not** occupy the slot it
-/// names, even when `assigned_to` still points at the finishing *developer*
-/// slot before the review slot adopts it: that pane was torn down at the ready
-/// handoff and `shelbi workspace list` probes it as free, so counting it busy
-/// would understate capacity. A review slot *serving* the handoff task isn't
-/// special-cased here either — it's `review`-tagged, and the dev pool filter
-/// ([`idle_dev_workspace_count_from`]) excludes every review slot regardless, so
-/// its occupancy never bears on the count.
-///
-/// Resolving the category through each task's workflow — rather than a fixed
-/// `column == Column::in_progress()` equality — is what keeps an active-category
-/// status that isn't spelled `in-progress` from being invisible to the check
-/// and leaving its holder miscounted idle.
-///
-/// The category lookup is cached by resolved workflow name so a large board
-/// doesn't re-read the same `workflows/*.yaml` once per card. A workflow that
-/// can't be loaded (a project that hasn't materialized its files yet) falls
-/// back to the built-in [`shelbi_core::default_workflow`], matching every other
-/// workflow-resolution call site.
-pub fn occupied_workspaces_on_board(
-    project_name: &str,
-    project: &Project,
-    board: &[IssueFile],
-) -> HashSet<String> {
-    let mut workflow_cache: HashMap<String, shelbi_core::Workflow> = HashMap::new();
-    let mut busy: HashSet<String> = HashSet::new();
-    for tf in board {
-        let Some(ws) = tf.task.assigned_to.as_deref() else {
-            continue;
-        };
-        if busy.contains(ws) {
-            continue;
-        }
-        let wf_name = resolve_task_workflow_name(project, &tf.task).to_string();
-        let workflow = workflow_cache.entry(wf_name.clone()).or_insert_with(|| {
-            load_workflow(project_name, &wf_name).unwrap_or_else(|_| shelbi_core::default_workflow())
-        });
-        let Some(category) = workflow.status(tf.task.column.as_str()).map(|s| s.category) else {
-            continue;
-        };
-        if category == shelbi_core::StatusCategory::Active {
-            busy.insert(ws.to_string());
-        }
-    }
-    busy
-}
-
 /// Pure core of [`idle_workspace_count`]: the dev-pool arithmetic once
 /// occupancy is known. Counts declared workspaces that are **not** review slots
 /// (`is_review` reports a workspace's `review` tag — via the project's effective
 /// tags at the call sites) and whose name is not in `busy` (the active-task set
-/// from [`occupied_workspaces_on_board`]). Split out so unit tests can drive it
+/// from [`BoardOccupancy::busy_slots`]). Split out so unit tests can drive it
 /// with in-memory fixtures without touching disk or `SHELBI_HOME`.
 ///
 /// `review`-tagged slots are filtered out of the pool here, not merely out of
@@ -7962,6 +7911,15 @@ statuses:
         .unwrap();
     }
 
+    /// Write each card's owner to the assignment overlay, as a dispatch does. The
+    /// overlay is the record of who owns a card on a remote board; the published
+    /// index only folds it in.
+    fn seed_assignment_overlay(project: &str, board: &[IssueFile]) {
+        for tf in board {
+            set_task_assignment(project, &tf.task.id, tf.task.assigned_to.as_deref()).unwrap();
+        }
+    }
+
     #[test]
     fn idle_workspace_count_warm_is_none_on_a_stale_or_cold_index() {
         let _g = LOCK.lock().unwrap();
@@ -8005,6 +7963,7 @@ statuses:
         // not this process's per-pane cache. `alpha` is busy → two idle.
         let mut idx = BoardIndex::fresh(vec![in_progress_card("t", Some("alpha"))]);
         idx.repo = Some(github_board_repo("owner/repo"));
+        seed_assignment_overlay(name, &idx.board);
         write_board_index(name, &idx).unwrap();
         let project = load_project(name).unwrap();
         assert_eq!(
@@ -8044,6 +8003,7 @@ statuses:
         let publish = |board: Vec<IssueFile>| {
             let mut idx = BoardIndex::fresh(board);
             idx.repo = Some(github_board_repo("owner/repo"));
+            seed_assignment_overlay(name, &idx.board);
             write_board_index(name, &idx).unwrap();
         };
 
@@ -8111,6 +8071,7 @@ statuses:
             None,
         )]);
         idx.repo = Some(github_board_repo("owner/repo"));
+        seed_assignment_overlay(name, &idx.board);
         write_board_index(name, &idx).unwrap();
         assert_eq!(
             idle_workspace_count_warm(&project).unwrap(),
@@ -8154,6 +8115,7 @@ statuses:
             card_in("g", Column::review(), Some("golf"), None),
         ]);
         idx.repo = Some(github_board_repo("owner/repo"));
+        seed_assignment_overlay(name, &idx.board);
         write_board_index(name, &idx).unwrap();
         assert_eq!(
             idle_workspace_count_warm(&project).unwrap(),
@@ -8186,6 +8148,7 @@ statuses:
             Some("app"),
         )]);
         idx.repo = Some(github_board_repo("owner/repo"));
+        seed_assignment_overlay(name, &idx.board);
         write_board_index(name, &idx).unwrap();
 
         assert_eq!(
