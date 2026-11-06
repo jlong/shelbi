@@ -165,7 +165,8 @@ pub use hub_config::{
 };
 pub use daemon_lifecycle::{
     daemon_lock_held, ensure_daemon_running, ensure_daemon_running_with, hub_lock_path,
-    set_daemon_launcher, stop_daemon, DaemonLauncher, DaemonStartError, StopOutcome,
+    set_daemon_launcher, stop_daemon, stop_daemon_with, DaemonLauncher, DaemonStartError,
+    StopOutcome, DAEMON_JOB_DRAIN, DAEMON_RESTART_WINDOW,
 };
 pub use change_bus::{
     publish_change, publish_layout, subscribe_changes, ChangeNotification, ChangeSubscription,

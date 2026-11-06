@@ -74,8 +74,7 @@ pub fn add_issue(
     mutation: &Mutation,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> Result<Option<String>, ExecError> {
-    let mut client = connect_local()?;
-    add_issue_over(&mut client, mutation, on_line)
+    on_local_daemon(|client| add_issue_over(client, mutation, on_line))
 }
 
 /// [`add_issue`] over an already connected control client (a remote
@@ -116,8 +115,7 @@ pub fn review_session(
     op: ReviewSessionOp,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> ExecOutcome {
-    let mut client = connect_local()?;
-    review_session_over(&mut client, project, task, op, on_line)
+    on_local_daemon(|client| review_session_over(client, project, task, op.clone(), on_line))
 }
 
 /// [`review_session`] over an already connected control client (a remote
@@ -149,8 +147,7 @@ pub fn workspace_session(
     op: WorkspaceSessionOp,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> ExecOutcome {
-    let mut client = connect_local()?;
-    workspace_session_over(&mut client, project, workspace, op, on_line)
+    on_local_daemon(|client| workspace_session_over(client, project, workspace, op.clone(), on_line))
 }
 
 /// [`workspace_session`] over an already connected control client.
@@ -180,8 +177,7 @@ pub fn write_state(project: &str, write: StateWrite) -> ExecOutcome {
     if let Some(writer) = crate::state_write::test_support::local_writer() {
         return writer(project, &write).map_err(ExecError::Backend);
     }
-    let mut client = connect_local()?;
-    write_state_over(&mut client, project, write)
+    on_local_daemon(|client| write_state_over(client, project, write.clone()))
 }
 
 /// [`write_state`] over an already connected control client (a remote
@@ -319,8 +315,24 @@ fn route(
     kind: MutationKind,
     on_line: &mut dyn FnMut(Stream, &str),
 ) -> Result<Option<ExpectedState>, ExecError> {
-    let mut client = connect_local()?;
-    send_mutation(&mut client, project, id, expected, kind, on_line)
+    on_local_daemon(|client| send_mutation(client, project, id, expected.clone(), kind.clone(), on_line))
+}
+
+/// Run one request on this machine's daemon, started on demand. A daemon on its
+/// way out refuses new work, so wait and send it to the one that replaces it.
+fn on_local_daemon<T>(send: impl FnMut(&mut ControlClient) -> Result<T, ExecError>) -> Result<T, ExecError> {
+    retry_through_drain(connect_local, send)
+}
+
+/// [`shelbi_client::retry_through_drain`] for a request with [`ExecError`]s: a
+/// local or a remote project's daemon, by `connect`.
+pub(crate) fn retry_through_drain<T>(
+    connect: impl FnMut() -> Result<ControlClient, ExecError>,
+    send: impl FnMut(&mut ControlClient) -> Result<T, ExecError>,
+) -> Result<T, ExecError> {
+    shelbi_client::retry_through_drain(shelbi_state::DAEMON_RESTART_WINDOW, connect, send, |e| {
+        matches!(e, ExecError::ShuttingDown(_))
+    })
 }
 
 /// This machine's daemon, started on demand, past the control hello.
@@ -413,7 +425,7 @@ pub fn read_expected(project: &str, id: &str) -> Option<ExpectedState> {
     })
 }
 
-fn map_client_err(e: shelbi_client::ClientError) -> ExecError {
+pub(crate) fn map_client_err(e: shelbi_client::ClientError) -> ExecError {
     use shelbi_proto::control::MutationError;
     match e {
         shelbi_client::ClientError::Mutation(MutationError::Stale { expected, actual }) => {
@@ -424,6 +436,9 @@ fn map_client_err(e: shelbi_client::ClientError) -> ExecError {
         }
         shelbi_client::ClientError::Mutation(MutationError::NotFound { id }) => {
             ExecError::NotFound(id)
+        }
+        shelbi_client::ClientError::Mutation(e @ MutationError::ShuttingDown) => {
+            ExecError::ShuttingDown(e.to_string())
         }
         other => ExecError::Backend(other.to_string()),
     }

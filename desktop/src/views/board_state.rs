@@ -1973,7 +1973,7 @@ impl BoardState {
                         format!("Not applied: it changed elsewhere ({detail})")
                     }
                     ExecError::NotFound(_) => "Not applied: the issue no longer exists".to_string(),
-                    ExecError::Backend(msg) => msg.clone(),
+                    ExecError::Backend(msg) | ExecError::ShuttingDown(msg) => msg.clone(),
                 };
                 if id == ADD_KEY {
                     self.status = Some(format!("add failed: {message}"));
