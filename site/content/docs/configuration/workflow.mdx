@@ -164,6 +164,33 @@ transitions:
     actions: [push_branch, merge]
 ```
 
+### Work with no branch
+
+Some issues deliver something outside the repo, like a plan written to a
+document store. Give them a workflow whose edges never push, open a PR, merge,
+or restack. `close_pr` and `delete_branch` only clean up, so they're fine to
+keep.
+
+```yaml
+# workflows/plan.yaml
+name: plan
+statuses:
+  - { id: backlog, owner: user }
+  - { id: todo, owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review, owner: user }
+  - { id: done, owner: user }
+  - { id: canceled, owner: user }
+transitions:
+  - { from: in-progress, to: canceled, actions: [delete_branch] }
+```
+
+A worker on this workflow writes the ready marker with no commits ahead of the
+base. The card moves to review with no PR and no branch on origin, and moving it
+to done merges nothing. If the worker does commit, those commits are still
+pushed at handoff. A workflow with any `push_branch`, `open_pr`, `merge`, or
+`restack` edge, or no `transitions:` block at all, still needs a branch.
+
 ### run, ready, and teardown
 
 Beyond the six git actions, an edge can run arbitrary shell commands. This is
