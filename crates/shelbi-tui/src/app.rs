@@ -71,7 +71,7 @@ pub struct WorkspaceOverview {
 
 /// Per-workspace state glyph shown in the sidebar. Derived each refresh from
 /// the task board (review-ready / idle) and from
-/// `~/.shelbi/workspaces/<name>/status.yaml` (working / awaiting-input /
+/// `~/.shelbi/projects/<project>/workspaces/<name>/status.yaml` (working / awaiting-input /
 /// awaiting-permission), which the [`crate::WorkspacePoller`] writes from the
 /// workspace pane's `shelbi:<state>` title marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1597,7 +1597,7 @@ fn load_workspaces(project: &str, in_progress: &[IssueFile]) -> Result<Vec<Works
                 .map(str::to_string)
                 .unwrap_or_else(|| DEFAULT_TASK_AGENT.to_string())
         });
-        let badge = derive_workspace_badge(&workspace.name, current_task.as_deref());
+        let badge = derive_workspace_badge(project, &workspace.name, current_task.as_deref());
         out.push(WorkspaceOverview {
             name: workspace.name.clone(),
             machine: workspace.machine.clone(),
@@ -1639,11 +1639,15 @@ const DEFAULT_TASK_AGENT: &str = "developer";
 /// so a finished slot simply reads Idle. Completion lives in the sidebar's
 /// review sections, keyed to the review workspace the task is loaded on —
 /// never on the dev workspace that produced it.
-fn derive_workspace_badge(workspace_name: &str, current_task: Option<&str>) -> WorkspaceBadge {
+fn derive_workspace_badge(
+    project: &str,
+    workspace_name: &str,
+    current_task: Option<&str>,
+) -> WorkspaceBadge {
     let Some(task_id) = current_task else {
         return WorkspaceBadge::Idle;
     };
-    match load_workspace_status(workspace_name).ok().flatten() {
+    match load_workspace_status(project, workspace_name).ok().flatten() {
         // A Blocked pane is hard-stuck waiting on a human (a dialog/permission
         // prompt). Surface the red ⚠ badge whether or not `status.yaml` names
         // the task currently assigned to this slot: the state describes the
@@ -3655,7 +3659,7 @@ mod tests {
                 "",
             )
             .unwrap();
-            shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+            shelbi_state::save_workspace_status("demo", &shelbi_state::WorkspaceStatus {
                 workspace: workspace.into(),
                 current_task: Some(id.into()),
                 state,
@@ -3719,7 +3723,7 @@ mod tests {
         )
         .unwrap();
         // Stale status left by the previous task on this slot.
-        shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+        shelbi_state::save_workspace_status("demo", &shelbi_state::WorkspaceStatus {
             workspace: "alpha".into(),
             current_task: Some("t-old".into()),
             state: WorkspaceState::AwaitingInput,
@@ -3771,7 +3775,7 @@ mod tests {
             "",
         )
         .unwrap();
-        shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+        shelbi_state::save_workspace_status("demo", &shelbi_state::WorkspaceStatus {
             workspace: "alpha".into(),
             current_task: Some("t".into()),
             state: WorkspaceState::Blocked,
@@ -3792,7 +3796,7 @@ mod tests {
         // task must still render red: the fresh-dispatch fall-through to green
         // must not mask a live Blocked pane. This is the live case that hid a
         // 10h-stuck slot behind a green triangle.
-        shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+        shelbi_state::save_workspace_status("demo", &shelbi_state::WorkspaceStatus {
             workspace: "alpha".into(),
             current_task: Some("t-other".into()),
             state: WorkspaceState::Blocked,
@@ -3845,7 +3849,7 @@ mod tests {
             "",
         )
         .unwrap();
-        shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+        shelbi_state::save_workspace_status("demo", &shelbi_state::WorkspaceStatus {
             workspace: "alpha".into(),
             current_task: Some("t".into()),
             state: WorkspaceState::Paused,
@@ -3903,7 +3907,7 @@ mod tests {
         .unwrap();
         // A stale "working" status.yaml must not resurrect a badge either —
         // the task is out of the in-progress column, so the row is Idle.
-        shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+        shelbi_state::save_workspace_status("demo", &shelbi_state::WorkspaceStatus {
             workspace: "alpha".into(),
             current_task: None,
             state: WorkspaceState::Working,
@@ -3936,7 +3940,7 @@ mod tests {
         shelbi_state::save_project(&project).unwrap();
 
         let now = Utc::now();
-        shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+        shelbi_state::save_workspace_status("demo", &shelbi_state::WorkspaceStatus {
             workspace: "alpha".into(),
             current_task: None,
             state: WorkspaceState::Working,

@@ -3761,7 +3761,7 @@ workspaces:
     );
 
     let status = |workspace: &str, task: Option<&str>, state| {
-        shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+        shelbi_state::save_workspace_status("demo", &shelbi_state::WorkspaceStatus {
             workspace: workspace.into(),
             current_task: task.map(str::to_string),
             state,

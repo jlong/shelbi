@@ -1530,7 +1530,11 @@ pub fn append_workspace_pause_event(
             line.push_str(&format!(" reset={reset}"));
         }
     }
-    append_event_line(&line)
+    append_event_line(&line)?;
+    // Entering Paused is a workspace transition like any other: a subscribed
+    // client repaints the row now rather than on its next unrelated refresh.
+    crate::publish_change(crate::ChangeNotification::Workspace { project, workspace });
+    Ok(())
 }
 
 /// Append `<rfc3339> message=<msg_id> task=<task-id> push=ok` to
@@ -5630,6 +5634,39 @@ mod tests {
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A subscribed client repaints off the change bus, so entering Paused has
+    /// to publish like every other workspace transition or the ⏸ badge waits on
+    /// some unrelated refresh.
+    #[test]
+    fn entering_paused_publishes_a_workspace_change() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::create_dir_all(events_log_path().unwrap().parent().unwrap()).unwrap();
+
+        // Project name unique to this test: the bus is process-global.
+        let project = "pause-publishes-change";
+        let sub = crate::subscribe_changes();
+        append_workspace_pause_event(project, "alpha", Some(WorkspaceState::Working), None).unwrap();
+
+        let want = crate::ChangeNotification::Workspace {
+            project: project.into(),
+            workspace: "alpha".into(),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let got = loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match sub.recv_timeout(left) {
+                Some(change) if change == want => break true,
+                Some(_) => continue,
+                None => break false,
+            }
+        };
+        assert!(got, "pausing must publish a workspace change");
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

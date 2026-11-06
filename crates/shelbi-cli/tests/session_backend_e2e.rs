@@ -375,7 +375,7 @@ fn a_session_says_how_it_ended() {
             .is_some(),
             "{slot} should come up",
         );
-        shelbi_orchestrator::workspace::kill_workspace_pane(&Host::Local, &target, slot, reason)
+        shelbi_orchestrator::workspace::kill_workspace_pane("demo", &Host::Local, &target, slot, reason)
             .expect("kill");
         settled(&target, SlotDeath::Killed(reason));
     }

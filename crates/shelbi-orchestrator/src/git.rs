@@ -869,6 +869,40 @@ pub(crate) fn lookup_pr_base(host: &Host, wt: &str, pr: u64) -> Result<String> {
     Ok(base)
 }
 
+/// How many files PR `pr`'s diff changes, as GitHub reports them. An unreadable
+/// count is an error, never a zero or a pass, because merging depends on it.
+pub(crate) fn lookup_pr_changed_files(host: &Host, wt: &str, pr: u64) -> Result<u64> {
+    let pr_str = pr.to_string();
+    let out = run_in_dir(
+        host,
+        wt,
+        &[
+            "gh",
+            "pr",
+            "view",
+            &pr_str,
+            "--json",
+            "changedFiles",
+            "--jq",
+            ".changedFiles",
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(Error::Command {
+            cmd: format!("gh pr view {pr_str} --json changedFiles"),
+            status: out.status.to_string(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        });
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout.trim().parse().map_err(|_| {
+        Error::Other(format!(
+            "gh pr view {pr_str}: changedFiles is `{}`, not a count",
+            stdout.trim()
+        ))
+    })
+}
+
 /// A pull request GitHub already reports as **MERGED**, discovered by
 /// [`lookup_merged_pr`]. Carries exactly what [`crate::actions::merge`] needs
 /// to treat an out-of-band merge (`gh pr merge`, a human clicking merge in

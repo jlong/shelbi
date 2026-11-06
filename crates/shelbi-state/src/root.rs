@@ -163,7 +163,7 @@ pub fn expand_tilde_path(p: &std::path::Path) -> PathBuf {
 /// The set of subdirectories that `shelbi init` and `shelbi reload`
 /// guarantee exist under the resolved root. Listed in one place so the
 /// two callers (and the self-heal tests) stay in lockstep.
-pub const STANDARD_SUBDIRS: &[&str] = &["projects", "sessions", "agents", "logs", "workspaces"];
+pub const STANDARD_SUBDIRS: &[&str] = &["projects", "sessions", "agents", "logs"];
 
 /// Create the resolved root + each entry in [`STANDARD_SUBDIRS`] when
 /// missing. Idempotent — existing directories are left alone, and the
