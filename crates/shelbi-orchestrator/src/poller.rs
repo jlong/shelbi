@@ -92,13 +92,14 @@ use shelbi_state::{
     ISSUE_ADOPTION_CAUSE,
 };
 
-/// How often each per-workspace thread re-verifies its host's reverse
-/// forward. Kept well under `ControlPersist=600` (10 min) so a master that
-/// lapses and reopens — the moment a stale remote socket would wedge the
-/// `-R` rebind — gets its forward re-checked and repaired within a couple
-/// of minutes rather than staying silently broken until the thread
-/// restarts. Local workspaces short-circuit the check, so the only cost
-/// this cadence imposes is on SSH hosts.
+/// How often a host's reverse forward is re-verified. Every workspace thread
+/// asks on this cadence, but a per-host gate lets only one of them run the check
+/// each interval, and that check only probes: a healthy master is left alone.
+/// Kept well under `ControlPersist=600` (10 min) so a master that lapses and
+/// reopens — the moment a stale remote socket would wedge the `-R` rebind — gets
+/// its forward re-checked and repaired within a couple of minutes rather than
+/// staying silently broken until the thread restarts. Local workspaces
+/// short-circuit the check, so the only cost this cadence imposes is on SSH hosts.
 const FORWARD_RECHECK_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Default wall-clock bound a poll thread's cancellation scope puts on a single
@@ -583,7 +584,11 @@ fn run_workspace_poll_loop(
         if next_forward_check.is_none_or(|t| Instant::now() >= t) {
             if let Some(machine) = project.machine(&workspace.machine) {
                 let host = machine.host();
-                if let Err(e) = shelbi_ssh::ensure_reverse_forward(&host, machine.forward) {
+                if let Err(e) = shelbi_ssh::recheck_reverse_forward(
+                    &host,
+                    machine.forward,
+                    FORWARD_RECHECK_INTERVAL,
+                ) {
                     tracing::warn!(
                         workspace = %workspace_name,
                         error = %e,

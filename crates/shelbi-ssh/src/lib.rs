@@ -71,8 +71,8 @@ pub fn current_cancel_scope() -> Option<CancelScope> {
 /// `SHELBI_FORWARD_RETRY_ATTEMPTS` (clamped 1..=10) and
 /// `SHELBI_FORWARD_RETRY_BACKOFF_MS` (clamped 0..=5000).
 ///
-/// The forward health check runs on a slow (120s) cadence in its own
-/// per-workspace thread, so the few hundred ms of bounded backoff a retry adds
+/// The forward health check runs on a slow (120s) per-host cadence on a
+/// workspace thread, so the few hundred ms of bounded backoff a retry adds
 /// on a blip is invisible to the rest of the poller — and far cheaper than the
 /// event noise + missed worker→hub messages a spurious `master_open_failed`
 /// costs. `master_open_failed` for devbox was observed recurring *transiently*
@@ -266,19 +266,22 @@ fn base_control_opts() -> Vec<String> {
     opts
 }
 
-/// The `-R` reverse-forward spec to install for `hostname`, honoring the
-/// persisted forward decision: a host that fell back to (or was pinned to)
-/// TCP loopback gets `127.0.0.1:<port>:<hub.sock>`; everyone else gets the
-/// default Unix-socket forward. `None` only when spec resolution itself fails
-/// (no `$HOME`, etc.), in which case the master just won't carry the forward
-/// this round.
+/// The `-R` reverse-forward spec to install for `hostname`, from
+/// [`shelbi_state::effective_forward`]: a host on TCP loopback with a bound port
+/// gets `127.0.0.1:<port>:<hub.sock>`; everyone else gets the default Unix-socket
+/// forward. There's no pin to pass here (the callers only have a hostname), but a
+/// `forward: unix` pin clears any TCP record as soon as a site that knows it
+/// resolves, so this read follows the pin. `None` only when spec resolution
+/// itself fails (no `$HOME`, etc.), in which case the master just won't carry the
+/// forward this round.
 fn forward_spec_for_host(hostname: &str) -> Option<String> {
-    let spec = match shelbi_state::load_host_forward(hostname) {
-        Some(shelbi_state::HostForward {
-            mode: shelbi_core::ForwardMode::Tcp,
-            port: Some(port),
-        }) => shelbi_state::reverse_forward_spec_tcp(port),
-        _ => shelbi_state::reverse_forward_spec(),
+    let spec = match shelbi_state::effective_forward(hostname, None) {
+        shelbi_state::EffectiveForward::Tcp(port) => {
+            shelbi_state::reverse_forward_spec_tcp(port)
+        }
+        shelbi_state::EffectiveForward::Unix | shelbi_state::EffectiveForward::TcpUnbound => {
+            shelbi_state::reverse_forward_spec()
+        }
     };
     spec.map(|os| os.to_string_lossy().into_owned()).ok()
 }
@@ -1268,7 +1271,7 @@ fn log_eperm_once(hostname: &str, remote_sock: &str) {
 }
 
 /// Per-host reverse-forward health as last *reported to the shared board log*.
-/// The forward health check runs on a ~120s cadence per workspace; without this
+/// The forward health check runs on a ~120s cadence per host; without this
 /// gate a declared-but-unreachable machine appends a `status=failed` line to the
 /// shared `events.log` every cycle. That both floods the board feed and starves
 /// the project heartbeat, whose emitter debounces against any `events.log`
@@ -1319,6 +1322,130 @@ fn mark_forward_ok(hostname: &str) {
     let _ = forward_health_changed(hostname, "ok");
 }
 
+/// What a read-only look at a host's forward found. Only [`ForwardProbe::Broken`]
+/// justifies a repair, because a repair drops the master and that ends every
+/// session multiplexed over it (relay channels, in-flight polls, git commands).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForwardProbe {
+    /// The master is up and the forward's listener answers.
+    Healthy,
+    /// The forward can't work as it stands. The payload names why.
+    Broken(&'static str),
+    /// The probe itself didn't get an answer (a transport blip, say). That says
+    /// nothing about the forward, so it isn't grounds for dropping a live master.
+    Inconclusive,
+}
+
+/// Remote exit codes shared by the two probe scripts and
+/// [`classify_forward_probe`]. Away from ssh's 255 and the shell's 126/127, and
+/// from the 0/1 a stray `python3` stub might return.
+const PROBE_EXIT_MISSING: i32 = 10;
+const PROBE_EXIT_UNWRITABLE: i32 = 11;
+const PROBE_EXIT_REFUSED: i32 = 12;
+
+/// Remote `sh -c` script: `$1` is the landing socket. A socket file can outlive
+/// its listener (a master whose `-R` collided with a stale socket looks fine to
+/// `test -S`), so this connects for real, which is also what a worker does. The
+/// hub treats an empty connection as a harmless hello probe.
+///
+/// There's no POSIX way to connect to a socket, so it borrows python3 or perl. A
+/// host with neither falls back to what `test` could see. One line, because it
+/// crosses the remote user's login shell whatever that is.
+const UNIX_FORWARD_PROBE: &str = concat!(
+    r#"s=$1; [ -S "$s" ] || exit 10; [ -w "$s" ] || exit 11; "#,
+    r#"python3 -c "import socket,sys;c=socket.socket(socket.AF_UNIX);c.settimeout(3);sys.exit(12 if c.connect_ex(sys.argv[1]) else 0)" "$s" 2>/dev/null; "#,
+    r#"r=$?; case $r in 0|12) exit $r;; esac; "#,
+    r#"perl -MIO::Socket::UNIX -e "exit(IO::Socket::UNIX->new(Peer=>\$ARGV[0]) ? 0 : 12)" "$s" 2>/dev/null; "#,
+    r#"r=$?; case $r in 0|12) exit $r;; esac; exit 0"#,
+);
+
+/// Remote `sh -c` script: `$1` is the bind address and `$2` the port. The TCP
+/// twin of [`UNIX_FORWARD_PROBE`]. A host with neither tool falls back to the
+/// master being alive, which `ExitOnForwardFailure=yes` ties to the port having
+/// bound when the master opened.
+const TCP_FORWARD_PROBE: &str = concat!(
+    r#"python3 -c "import socket,sys;c=socket.socket();c.settimeout(3);sys.exit(12 if c.connect_ex((sys.argv[1],int(sys.argv[2]))) else 0)" "$1" "$2" 2>/dev/null; "#,
+    r#"r=$?; case $r in 0|12) exit $r;; esac; "#,
+    r#"perl -MIO::Socket::INET -e "exit(IO::Socket::INET->new(PeerAddr=>\$ARGV[0],PeerPort=>\$ARGV[1],Proto=>q(tcp),Timeout=>3) ? 0 : 12)" "$1" "$2" 2>/dev/null; "#,
+    r#"r=$?; case $r in 0|12) exit $r;; esac; exit 0"#,
+);
+
+/// Read a probe script's result. Pure so the mapping is testable without ssh.
+/// Anything but the script's own exit codes is [`ForwardProbe::Inconclusive`].
+fn classify_forward_probe(output: &std::io::Result<Output>) -> ForwardProbe {
+    let Ok(output) = output else {
+        return ForwardProbe::Inconclusive;
+    };
+    match output.status.code() {
+        Some(0) => ForwardProbe::Healthy,
+        Some(PROBE_EXIT_MISSING) => ForwardProbe::Broken("landing_socket_missing"),
+        Some(PROBE_EXIT_UNWRITABLE) => ForwardProbe::Broken("landing_socket_unwritable"),
+        Some(PROBE_EXIT_REFUSED) => ForwardProbe::Broken("forward_connect_refused"),
+        _ => ForwardProbe::Inconclusive,
+    }
+}
+
+/// Check `forward` on `hostname` without changing anything: is the master up,
+/// and does its listener answer? Runs over the no-forward maintenance path so
+/// the probe can't bind the socket it's looking at.
+fn probe_forward(
+    hostname: &str,
+    forward: shelbi_state::EffectiveForward,
+    remote_sock: &str,
+) -> ForwardProbe {
+    use shelbi_state::EffectiveForward;
+    if !master_alive(hostname) {
+        return ForwardProbe::Broken("master_not_running");
+    }
+    let output = match forward {
+        EffectiveForward::Unix => run_without_reverse_forward(
+            hostname,
+            ["sh", "-c", UNIX_FORWARD_PROBE, "shelbi-forward-probe", remote_sock],
+        ),
+        EffectiveForward::Tcp(port) => run_without_reverse_forward(
+            hostname,
+            [
+                "sh",
+                "-c",
+                TCP_FORWARD_PROBE,
+                "shelbi-forward-probe",
+                shelbi_state::TCP_FORWARD_BIND_ADDR,
+                &port.to_string(),
+            ],
+        ),
+        EffectiveForward::TcpUnbound => return ForwardProbe::Broken("tcp_port_unbound"),
+    };
+    classify_forward_probe(&output)
+}
+
+/// When each host's forward was last checked. Lets the workspace threads that
+/// share a host share one check, instead of each running its own every interval.
+fn forward_check_stamps(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static STAMPS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = std::sync::OnceLock::new();
+    STAMPS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Claim this interval's forward check for `hostname`. `true` means the caller
+/// runs it; `false` means another thread already did. Stamped as it's claimed,
+/// not when the check finishes, so siblings skip straight back to polling rather
+/// than queueing on the master lock behind a slow host.
+fn claim_forward_check(hostname: &str, interval: Duration) -> bool {
+    let now = std::time::Instant::now();
+    let mut stamps = forward_check_stamps()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    match stamps.get(hostname) {
+        Some(last) if now.duration_since(*last) < interval => false,
+        _ => {
+            stamps.insert(hostname.to_string(), now);
+            true
+        }
+    }
+}
+
 /// Outcome of the Unix-socket forward attempt, so the caller can tell a
 /// transient network failure (don't fall back) from the Tailscale-SSH wedge
 /// (do fall back to TCP loopback when allowed).
@@ -1338,13 +1465,15 @@ enum UnixForwardOutcome {
 /// refactored to classify its result so [`ensure_reverse_forward`] can decide
 /// whether to fall back to TCP.
 fn ensure_unix_forward(host: &Host, hostname: &str, remote_sock: &str) -> UnixForwardOutcome {
-    // Repair. Drop any existing master first: it may be a master whose
-    // forward never bound (stale socket collided with the `-R`), and
-    // `ControlMaster=auto` would otherwise reuse it and skip the rebind.
+    // Repair. Only reached after `probe_forward` found the forward broken, so
+    // this never costs a healthy master. Drop any existing master first: it may
+    // be a master whose forward never bound (stale socket collided with the
+    // `-R`), and `ControlMaster=auto` would otherwise reuse it and skip the
+    // rebind.
     drop_master(hostname);
-    // Remove the stale landing socket. We only reach here when no live
-    // master owns the forward, so any leftover socket file is a leak from a
-    // dead master — safe to unlink. The cleanup command deliberately bypasses
+    // Remove the stale landing socket. No live master owns the forward at this
+    // point, so any leftover socket file is a leak from a dead master — safe to
+    // unlink. The cleanup command deliberately bypasses
     // shelbi's ControlMaster/`-R` wrapper; otherwise an absent socket can be
     // recreated by SSH and then immediately removed by this `rm`.
     let cleanup = run_without_reverse_forward(hostname, ["rm", "-f", remote_sock]);
@@ -1640,8 +1769,8 @@ fn ensure_tcp_forward(hostname: &str) -> shelbi_core::Result<u16> {
             // opened. Remember the mode + port so subsequent outbound ssh (and
             // the worker env) reuse this exact port; this also *releases* any
             // stale port previously persisted for the host (overwrite). Success
-            // is silent — like the Unix path, we only log failures, so the 120s
-            // rechecks don't flood events.log.
+            // is silent — like the Unix path, we only log failures, so repeated
+            // repairs don't flood events.log.
             let _ = shelbi_state::save_host_forward(
                 hostname,
                 Some(shelbi_state::HostForward {
@@ -1657,7 +1786,7 @@ fn ensure_tcp_forward(hostname: &str) -> shelbi_core::Result<u16> {
         TcpSweepResult::TransportUnstable(port) => {
             // A churning/broken transport, not a full band. Surface it
             // *distinctly* from genuine exhaustion so a re-probe can recover: the
-            // per-workspace ~120s recheck re-enters this path and binds once the
+            // ~120s recheck re-enters this path and binds once the
             // master is healthy again. Never latches "all ports in use" — the bug
             // this fixes (a mux hiccup across every port read as 64 occupied
             // listeners when `ss` showed them free). State-change gated so a
@@ -1703,10 +1832,34 @@ fn ensure_tcp_forward(hostname: &str) -> shelbi_core::Result<u16> {
     }
 }
 
-/// Ensure the hub's reverse forward to `host` is bound and healthy, repairing
-/// a stale-remote-socket wedge if one is present and falling back to a TCP
-/// loopback forward when the Unix landing socket turns out to be unusable
-/// (the Tailscale-SSH root-owned-socket condition).
+/// [`ensure_reverse_forward`] on a per-host cadence: however many workspace
+/// threads ask, `host` gets at most one check per `interval`. A thread that loses
+/// the claim returns `Ok` immediately, since the check belongs to whichever thread
+/// won it and reports its own failures.
+///
+/// `configured` still applies on a skipped cycle, so a `forward: unix` pin clears
+/// a contradicting record no matter which thread gets there first.
+pub fn recheck_reverse_forward(
+    host: &Host,
+    configured: Option<shelbi_core::ForwardMode>,
+    interval: Duration,
+) -> shelbi_core::Result<()> {
+    let hostname = match host {
+        Host::Local => return Ok(()),
+        Host::Ssh { host } => host,
+    };
+    let _ = shelbi_state::effective_forward(hostname, configured);
+    if !claim_forward_check(hostname, interval) {
+        return Ok(());
+    }
+    ensure_reverse_forward(host, configured)
+}
+
+/// Ensure the hub's reverse forward to `host` is bound and healthy. Probes first
+/// and leaves a healthy forward completely alone; only a failed probe repairs,
+/// fixing a stale-remote-socket wedge if one is present and falling back to a TCP
+/// loopback forward when the Unix landing socket turns out to be unusable (the
+/// Tailscale-SSH root-owned-socket condition).
 ///
 /// Every shelbi-routed `ssh` invocation carries `-R <remote>:<local hub.sock>`
 /// so remote workers can write to the hub's `events.log` over the multiplexed
@@ -1744,17 +1897,25 @@ pub fn ensure_reverse_forward(
         .to_string_lossy()
         .into_owned();
 
-    // Decide the mode to attempt and whether auto-fallback is permitted.
-    let (mode, allow_fallback) = match configured {
-        Some(shelbi_core::ForwardMode::Tcp) => (shelbi_core::ForwardMode::Tcp, false),
-        Some(shelbi_core::ForwardMode::Unix) => (shelbi_core::ForwardMode::Unix, false),
-        None => match shelbi_state::load_host_forward(&hostname) {
-            Some(hf) => (hf.mode, true),
-            None => (shelbi_core::ForwardMode::Unix, true),
-        },
-    };
+    let forward = shelbi_state::effective_forward(&hostname, configured);
+    match probe_forward(&hostname, forward, &remote_sock) {
+        ForwardProbe::Healthy => {
+            mark_forward_ok(&hostname);
+            return Ok(());
+        }
+        ForwardProbe::Inconclusive => {
+            tracing::debug!(host = %hostname, "reverse-forward probe got no answer; leaving the master alone");
+            return Ok(());
+        }
+        ForwardProbe::Broken(reason) => {
+            tracing::warn!(host = %hostname, reason, ?forward, "reverse-forward probe failed; repairing");
+        }
+    }
 
-    if mode == shelbi_core::ForwardMode::Tcp {
+    // Only auto may fall back: a pin is respected even when it's failing.
+    let allow_fallback = configured.is_none();
+
+    if !matches!(forward, shelbi_state::EffectiveForward::Unix) {
         return ensure_tcp_forward(&hostname).map(|_| ());
     }
 
@@ -2267,6 +2428,174 @@ mod tests {
         // Local hosts have no reverse forward to establish — the call must
         // short-circuit without shelling out to ssh.
         ensure_reverse_forward(&Host::Local, None).expect("local ensure should be Ok");
+    }
+
+    #[test]
+    fn recheck_is_noop_for_local() {
+        recheck_reverse_forward(&Host::Local, None, Duration::ZERO)
+            .expect("local recheck should be Ok");
+    }
+
+    #[test]
+    fn forward_probe_classifies_only_its_own_exit_codes_as_broken() {
+        let classify = |script: &str| classify_forward_probe(&Ok(output_from(script)));
+        assert_eq!(classify("exit 0"), ForwardProbe::Healthy);
+        assert_eq!(classify("exit 10"), ForwardProbe::Broken("landing_socket_missing"));
+        assert_eq!(classify("exit 11"), ForwardProbe::Broken("landing_socket_unwritable"));
+        assert_eq!(classify("exit 12"), ForwardProbe::Broken("forward_connect_refused"));
+        // ssh's own failure, a missing shell, and anything else say nothing
+        // about the forward, so a live master survives them.
+        assert_eq!(classify("exit 255"), ForwardProbe::Inconclusive);
+        assert_eq!(classify("exit 127"), ForwardProbe::Inconclusive);
+        assert_eq!(classify("exit 1"), ForwardProbe::Inconclusive);
+        let spawn_failed = Err(std::io::Error::other("no ssh"));
+        assert_eq!(classify_forward_probe(&spawn_failed), ForwardProbe::Inconclusive);
+    }
+
+    /// Run a probe script the way ssh delivers it: each argv element wire-escaped,
+    /// joined, and handed to a shell as one string. `path`, when set, limits which
+    /// tools the script can find.
+    fn run_probe_script_on(path: Option<&str>, script: &str, args: &[&str]) -> Option<i32> {
+        let mut argv = vec!["sh", "-c", script, "shelbi-forward-probe"];
+        argv.extend_from_slice(args);
+        let line = argv
+            .iter()
+            .map(|a| escape_for_wire(OsStr::new(a)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(line);
+        if let Some(path) = path {
+            cmd.env("PATH", path);
+        }
+        cmd.output().expect("sh should run").status.code()
+    }
+
+    fn run_probe_script(script: &str, args: &[&str]) -> Option<i32> {
+        run_probe_script_on(None, script, args)
+    }
+
+    #[test]
+    fn unix_probe_script_tells_a_live_listener_from_a_stale_socket() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::path::PathBuf::from(format!("/tmp/shp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("hub.sock");
+        let sock_str = sock.to_str().unwrap();
+
+        assert_eq!(
+            run_probe_script(UNIX_FORWARD_PROBE, &[sock_str]),
+            Some(PROBE_EXIT_MISSING)
+        );
+
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        assert_eq!(run_probe_script(UNIX_FORWARD_PROBE, &[sock_str]), Some(0));
+
+        // The shape `test -S` can't catch: the file outlives its listener.
+        drop(listener);
+        assert!(sock.exists(), "dropping a listener leaves the socket file behind");
+        assert_eq!(
+            run_probe_script(UNIX_FORWARD_PROBE, &[sock_str]),
+            Some(PROBE_EXIT_REFUSED)
+        );
+
+        // root ignores the mode bits, so this shape is only visible unprivileged.
+        if unsafe { libc::geteuid() } != 0 {
+            std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o400)).unwrap();
+            assert_eq!(
+                run_probe_script(UNIX_FORWARD_PROBE, &[sock_str]),
+                Some(PROBE_EXIT_UNWRITABLE)
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tcp_probe_script_tells_a_bound_port_from_a_closed_one() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        assert_eq!(run_probe_script(TCP_FORWARD_PROBE, &["127.0.0.1", &port]), Some(0));
+        drop(listener);
+        assert_eq!(
+            run_probe_script(TCP_FORWARD_PROBE, &["127.0.0.1", &port]),
+            Some(PROBE_EXIT_REFUSED)
+        );
+    }
+
+    /// A `PATH` holding `sh` and `perl` but no `python3`, or `None` if this
+    /// machine has no perl to link.
+    fn perl_only_path(dir: &std::path::Path) -> Option<String> {
+        let perl = which::which("perl").ok()?;
+        std::fs::create_dir_all(dir).unwrap();
+        std::os::unix::fs::symlink(perl, dir.join("perl")).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", dir.join("sh")).unwrap();
+        Some(dir.to_str().unwrap().to_string())
+    }
+
+    #[test]
+    fn probe_scripts_fall_back_to_perl_without_python() {
+        let dir = std::path::PathBuf::from(format!("/tmp/shpp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let Some(path) = perl_only_path(&dir.join("bin")) else {
+            return;
+        };
+        let sock = dir.join("hub.sock");
+        let sock_str = sock.to_str().unwrap();
+        let unix = |want: i32| {
+            assert_eq!(
+                run_probe_script_on(Some(&path), UNIX_FORWARD_PROBE, &[sock_str]),
+                Some(want)
+            );
+        };
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        unix(0);
+        drop(listener);
+        unix(PROBE_EXIT_REFUSED);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port().to_string();
+        let tcp = |want: i32| {
+            assert_eq!(
+                run_probe_script_on(Some(&path), TCP_FORWARD_PROBE, &["127.0.0.1", &port]),
+                Some(want)
+            );
+        };
+        tcp(0);
+        drop(listener);
+        tcp(PROBE_EXIT_REFUSED);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_scripts_trust_what_they_can_see_when_no_tool_is_available() {
+        let dir = std::path::PathBuf::from(format!("/tmp/shpn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", bin.join("sh")).unwrap();
+        let path = bin.to_str().unwrap();
+        let sock = dir.join("hub.sock");
+        let sock_str = sock.to_str().unwrap();
+
+        assert_eq!(
+            run_probe_script_on(Some(path), UNIX_FORWARD_PROBE, &[sock_str]),
+            Some(PROBE_EXIT_MISSING),
+            "`test` still works, so a missing socket is still caught"
+        );
+        // A stale socket reads as present: no tool means no way to connect.
+        drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+        assert_eq!(run_probe_script_on(Some(path), UNIX_FORWARD_PROBE, &[sock_str]), Some(0));
+        assert_eq!(
+            run_probe_script_on(Some(path), TCP_FORWARD_PROBE, &["127.0.0.1", "1"]),
+            Some(0)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn forward_probes_stay_on_one_line_for_the_remote_login_shell() {
+        assert!(!UNIX_FORWARD_PROBE.contains('\n'));
+        assert!(!TCP_FORWARD_PROBE.contains('\n'));
     }
 
     #[test]
