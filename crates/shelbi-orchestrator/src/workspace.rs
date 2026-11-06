@@ -874,8 +874,9 @@ pub fn write_review_loaded_marker(
 }
 
 /// Remove the review-serving marker (idempotent — `rm -f` succeeds if absent).
-/// Called when the poller reaps an orphaned review slot so a stale marker
-/// naming a resolved task can't keep the sidebar showing **Ready for Review**.
+/// Called when a task is dispatched onto the slot, when its review is closed, and
+/// when the poller reaps an orphaned review slot, so a stale marker naming a
+/// resolved task can't keep the sidebar showing **Ready for Review**.
 pub fn clear_review_loaded_marker(host: &Host, marker: &Path) -> Result<()> {
     let path = marker.to_string_lossy().into_owned();
     shelbi_ssh::run(host, ["rm", "-f", path.as_str()]).map_err(Error::Io)?;
@@ -2622,6 +2623,12 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
     let _ = clear_transition_marker(
         &host,
         &legacy_workspace_transition_marker(&machine, spec.workspace),
+    );
+    // And the review-serving marker: a task loading onto a review slot starts
+    // out not serving, whatever the slot's last task got up to.
+    let _ = clear_review_loaded_marker(
+        &host,
+        &workspace_review_loaded_marker(&machine, spec.workspace),
     );
 
     // 1. Make sure the worktree exists + is on the right branch, clean.
