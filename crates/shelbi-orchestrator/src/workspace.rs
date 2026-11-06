@@ -345,6 +345,24 @@ pub fn workspace_ready_deferred_marker(machine: &Machine, workspace: &WorkspaceS
         .join("shelbi-ready-deferred")
 }
 
+/// The transition-marker **deferral** sidecar for a workspace:
+/// `<worktree>/.shelbi/shelbi-transition-deferred`.
+///
+/// The [`workspace_transition_marker`] counterpart of
+/// [`workspace_ready_deferred_marker`]: a gate's verdict is written exactly once,
+/// so a failed read of the task (or a failed move) leaves the marker in place to
+/// retry next tick. This sidecar records the current `<stage>:<class>` token so
+/// the deferral reaches `events.log` once rather than every tick. Consuming the
+/// marker clears it, as does dispatch, which also clears the marker itself.
+pub fn workspace_transition_deferred_marker(
+    machine: &Machine,
+    workspace: &WorkspaceSpec,
+) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".shelbi")
+        .join("shelbi-transition-deferred")
+}
+
 /// The ready-handoff **refusal** sidecar for a workspace:
 /// `<worktree>/.shelbi/shelbi-ready-refused`.
 ///
@@ -451,7 +469,7 @@ pub fn read_deferred_marker(host: &Host, marker: &Path) -> Result<Option<String>
 }
 
 /// Write the deferral sidecar with the current outage's error `class`. The
-/// class is a short internal token (see `poller::classify_load_error`), so no
+/// class is a short internal token (see `poller::classify_store_error`), so no
 /// escaping beyond the shell quoting the remote path needs. Best-effort by
 /// contract: a failed write only risks re-logging the deferral next tick.
 pub fn write_deferred_marker(host: &Host, marker: &Path, class: &str) -> Result<()> {
@@ -2635,6 +2653,10 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
         &host,
         &legacy_workspace_transition_marker(&machine, spec.workspace),
     );
+    let _ = clear_deferred_marker(
+        &host,
+        &workspace_transition_deferred_marker(&machine, spec.workspace),
+    );
     // And the review-serving marker: a task loading onto a review slot starts
     // out not serving, whatever the slot's last task got up to.
     let _ = clear_review_loaded_marker(
@@ -2893,6 +2915,10 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
     let _ = clear_transition_marker(
         &host,
         &legacy_workspace_transition_marker(&machine, spec.workspace),
+    );
+    let _ = clear_deferred_marker(
+        &host,
+        &workspace_transition_deferred_marker(&machine, spec.workspace),
     );
 
     // Preserve the worktree: don't reset the branch, don't bail on a dirty
@@ -9311,6 +9337,10 @@ statuses:
         assert_eq!(
             workspace_ready_deferred_marker(&p.machines[0], ws),
             base.join("shelbi-ready-deferred")
+        );
+        assert_eq!(
+            workspace_transition_deferred_marker(&p.machines[0], ws),
+            base.join("shelbi-transition-deferred")
         );
         assert_eq!(
             workspace_ready_refused_marker(&p.machines[0], ws),

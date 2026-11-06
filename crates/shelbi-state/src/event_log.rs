@@ -3139,6 +3139,44 @@ pub fn append_marker_skipped_event(task_id: &str, workspace: &str, reason: &str)
     ))
 }
 
+/// Append a **transition-marker outcome** line to `~/.shelbi/events.log`. Emitted
+/// by the poller when it reads an agent's `.shelbi/shelbi-transition` marker (a
+/// gate's pass / reject / bounce verdict) and does not apply it. The agent wrote
+/// the verdict exactly once and is finished, so this line is how the orchestrator
+/// learns why a card is still sitting in a gate.
+///
+/// `<rfc3339> transition-marker project=<p> task=<id> workspace=<name> target=<raw> status=<status> reason=<reason>`
+///
+/// `status` says what happened to the marker: `refused` and `dropped` cleared it
+/// (the workflow forbids the request, or it is stale or foreign), `deferred` kept
+/// it to retry after a failed read or move. `reason` is a short internal token
+/// (`edge-not-in-workflow` / `not-owned` / `task-gone` / `load-failed:http-403` /
+/// ...).
+///
+/// Unlike the `marker-*` lines this carries `project=`: `shelbi events tail
+/// --project <you>`, the orchestrator's follower, excludes any line without it.
+/// `target` is whatever the agent wrote, so every field is pinned to the
+/// identifier allowlist to keep the line a single parseable record.
+pub fn append_transition_marker_event(
+    project: &str,
+    task_id: &str,
+    workspace: &str,
+    target: &str,
+    status: &str,
+    reason: &str,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let task_id = sanitize_field(task_id);
+    let workspace = sanitize_field(workspace);
+    let target = sanitize_field(target);
+    let status = sanitize_field(status);
+    let reason = sanitize_field(reason);
+    append_event_line(&format!(
+        "{ts} transition-marker project={project} task={task_id} workspace={workspace} target={target} status={status} reason={reason}"
+    ))
+}
+
 /// Append a **ready-handoff transition-action failure** line to
 /// `~/.shelbi/events.log`. Emitted by the poller's ready-marker handoff when a
 /// review edge's action (`push_branch` / `open_pr`) errors: the card is left in
@@ -5763,6 +5801,37 @@ mod tests {
                 .ends_with(" marker-skipped task=gone-task workspace=bravo reason=marker-skipped:task-gone"),
             "line: {}",
             lines[1]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_transition_marker_event_is_project_scoped_and_names_task_and_reason() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_transition_marker_event(
+            "demo",
+            "fix-login",
+            "alpha",
+            "no such\nstatus",
+            "refused",
+            "unknown-target-status",
+        )
+        .unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 1, "a hostile target must not tear the line: {log}");
+        DateTime::parse_from_rfc3339(lines[0].split_whitespace().next().unwrap()).unwrap();
+        assert!(
+            lines[0].ends_with(
+                " transition-marker project=demo task=fix-login workspace=alpha target=no_such_status status=refused reason=unknown-target-status"
+            ),
+            "line: {}",
+            lines[0]
         );
 
         std::env::remove_var("SHELBI_HOME");

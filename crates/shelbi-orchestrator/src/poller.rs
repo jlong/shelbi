@@ -3248,7 +3248,7 @@ fn maybe_apply_ready_handoff(
             // promotes on the first successful read. Log — and record the
             // deferral on events.log — once per outage, deduped on the error
             // class via the sidecar, rather than every tick.
-            let class = classify_load_error(&e);
+            let class = classify_store_error(&e);
             let already =
                 crate::workspace::read_deferred_marker(host, &deferred_marker)
                     .ok()
@@ -3283,14 +3283,14 @@ fn maybe_apply_ready_handoff(
     }
 }
 
-/// Classify a task-load failure into a short, stable token for the
-/// `reason=marker-deferred:<class>` events.log line and the once-per-outage
-/// WARN. Groups the transient backend failures the ready-marker handoff must
+/// Classify a failed read or write of a task into a short, stable token for the
+/// `reason=marker-deferred:<class>` and `transition-marker` events.log lines and
+/// the once-per-outage WARN. Groups the transient backend failures the ready-marker handoff must
 /// ride out — a network blip, a GitHub 403 / rate-limit, a timeout, a malformed
 /// response — so a reader can see *why* a promotion is deferred without the full
 /// error string. Best-effort: the load is retried regardless of class, so an
 /// imperfect bucket only affects the log token, never the retry.
-fn classify_load_error(err: &shelbi_core::Error) -> &'static str {
+fn classify_store_error(err: &shelbi_core::Error) -> &'static str {
     use shelbi_core::Error;
     let msg = err.to_string().to_ascii_lowercase();
     if msg.contains("403") || msg.contains("rate limit") || msg.contains("rate-limit") {
@@ -3310,7 +3310,7 @@ fn classify_load_error(err: &shelbi_core::Error) -> &'static str {
         // connectivity class — the dominant transient cause.
         "network"
     } else {
-        "load-error"
+        "other"
     }
 }
 
@@ -3446,12 +3446,20 @@ fn decide_transition(
 /// [`crate::workspace::workspace_transition_marker`] for the
 /// marker path + format.
 ///
-/// Best-effort and idempotent, matching the review-marker contract:
+/// Best-effort and idempotent, matching the review-marker contract. The agent
+/// writes its verdict exactly once, so every outcome that doesn't apply it lands
+/// a `transition-marker` line on `events.log`
+/// ([`shelbi_state::append_transition_marker_event`]), which is the only way the
+/// orchestrator can see a card that stopped moving:
 ///
 /// - A marker naming a task **not owned by this workspace** (stale worktree
-///   reuse, or a foreign id a stray program dropped) is cleared without moving.
-/// - A move whose **workflow forbids the edge** is refused (logged) and the
-///   marker cleared, so a persistently-illegal request doesn't re-log forever.
+///   reuse, or a foreign id a stray program dropped) or a task a successful read
+///   shows is **gone** is dropped: cleared without moving.
+/// - A move whose **workflow forbids the edge** is refused and the marker
+///   cleared, so a persistently-illegal request doesn't re-log forever.
+/// - A **failed read of the task** (network, GitHub 403/rate-limit, timeout,
+///   malformed response) proves nothing about the task, so the marker stays and
+///   the next tick retries. Same contract as [`maybe_apply_ready_handoff`].
 /// - A successful move emits a `reason=workspace:agent-transition` task event,
 ///   fires any actions the edge declares (a bounce edge typically has none),
 ///   then **closes the finishing pane** so the orchestrator re-dispatches the
@@ -3459,8 +3467,10 @@ fn decide_transition(
 ///   is load-bearing: move first, then close, never strand work — the move also
 ///   clears the task's owner ([`shelbi_state::move_task_and_unassign`]) so the
 ///   just-closed pane isn't seen by the supervisor as still holding active work.
-/// - Only a genuine move *failure* leaves the marker in place to retry; every
-///   other path consumes it exactly once.
+/// - A failed read or a failed move leaves the marker in place to retry, deduped
+///   to one `events.log` line per failure via the sidecar
+///   ([`crate::workspace::workspace_transition_deferred_marker`]); every other
+///   path consumes the marker exactly once.
 fn maybe_apply_transition(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
@@ -3499,9 +3509,16 @@ fn maybe_apply_transition(
         }
     };
 
-    let task_file = load_issue(project, &req.task_id);
-    match &task_file {
-        Ok(tf) if tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) => {
+    let deferred_marker =
+        crate::workspace::workspace_transition_deferred_marker(machine, workspace);
+
+    // Go straight to the store (rather than `load_issue`, which folds a
+    // successful "no such task" read into an `Err`): only `Ok(None)` proves the
+    // task is gone. See the matching read in `maybe_apply_ready_handoff`.
+    let loaded = shelbi_state::issue_store_for_project(project)
+        .and_then(|store| store.get(&req.task_id));
+    match &loaded {
+        Ok(Some(tf)) if tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) => {
             // Load the task's workflow; fall back to the built-in default
             // (no transitions → any-to-any) if the YAML is missing or invalid,
             // so a transient workflow typo doesn't wedge the bounce.
@@ -3517,6 +3534,7 @@ fn maybe_apply_transition(
                         reason,
                         "agent transition rejected; clearing marker without moving",
                     );
+                    record_transition_outcome(project, workspace, &req, "refused", reason);
                 }
                 TransitionDecision::Apply {
                     from_status,
@@ -3605,26 +3623,112 @@ fn maybe_apply_transition(
                             // race (the task moved between our load and the
                             // move). Nothing to do but clear the marker.
                             tracing::debug!(workspace = %workspace.name, task = %req.task_id, "agent transition no-op (task already at target); clearing marker");
+                            record_transition_outcome(
+                                project,
+                                workspace,
+                                &req,
+                                "dropped",
+                                "already-at-target",
+                            );
                         }
                         Err(e) => {
                             // Leave the marker in place so we retry next tick.
-                            tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "move_task_and_unassign failed");
+                            defer_transition(
+                                project,
+                                workspace,
+                                host,
+                                &deferred_marker,
+                                &req,
+                                "move-failed",
+                                &e,
+                            );
                             return;
                         }
                     }
                 }
             }
         }
-        Ok(_) => {
+        Ok(Some(_)) => {
             tracing::debug!(workspace = %workspace.name, task = %req.task_id, "stale/foreign transition marker (task not owned by this workspace); clearing");
+            record_transition_outcome(project, workspace, &req, "dropped", "not-owned");
+        }
+        Ok(None) => {
+            tracing::warn!(workspace = %workspace.name, task = %req.task_id, "transition marker names a task that no longer exists; clearing");
+            record_transition_outcome(project, workspace, &req, "dropped", "task-gone");
         }
         Err(e) => {
-            tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "transition marker names unloadable task; clearing");
+            // The read FAILED, which is not proof of anything about the task.
+            // Clearing here loses the gate's one-shot verdict and parks the card
+            // in the gate for good, so return with the marker in place.
+            defer_transition(
+                project,
+                workspace,
+                host,
+                &deferred_marker,
+                &req,
+                "load-failed",
+                e,
+            );
+            return;
         }
     }
 
     if let Err(e) = crate::workspace::clear_transition_marker(host, &marker) {
         tracing::warn!(workspace = %workspace.name, error = %e, "clear_transition_marker failed");
+    }
+    // The marker is consumed, so any outage it was riding out is over for this
+    // request. Clear the dedupe token so the next deferral logs afresh.
+    if let Err(e) = crate::workspace::clear_deferred_marker(host, &deferred_marker) {
+        tracing::debug!(workspace = %workspace.name, error = %e, "clear_deferred_marker failed");
+    }
+}
+
+/// Record a transition marker outcome that did not apply the agent's request on
+/// `events.log`. Best-effort: a failed append logs and never blocks the poller.
+fn record_transition_outcome(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    req: &crate::workspace::TransitionRequest,
+    status: &str,
+    reason: &str,
+) {
+    if let Err(e) = shelbi_state::append_transition_marker_event(
+        &project.name,
+        &req.task_id,
+        &workspace.name,
+        &req.target,
+        status,
+        reason,
+    ) {
+        tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "append_transition_marker_event failed");
+    }
+}
+
+/// Keep a transition marker in place across a failed read or move, recording the
+/// deferral once rather than every tick. The sidecar holds the current
+/// `<stage>:<class>` token, so a change of stage or error class logs again but a
+/// repeat of the same failure stays quiet until the marker is consumed.
+fn defer_transition(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    host: &shelbi_core::Host,
+    deferred_marker: &std::path::Path,
+    req: &crate::workspace::TransitionRequest,
+    stage: &str,
+    err: &shelbi_core::Error,
+) {
+    let token = format!("{stage}:{}", classify_store_error(err));
+    let already = crate::workspace::read_deferred_marker(host, deferred_marker)
+        .ok()
+        .flatten();
+    if already.as_deref() == Some(token.as_str()) {
+        tracing::debug!(workspace = %workspace.name, task = %req.task_id, reason = %token, "agent transition still deferred");
+        return;
+    }
+    tracing::warn!(workspace = %workspace.name, task = %req.task_id, reason = %token, error = %err, "agent transition deferred; leaving marker in place");
+    record_transition_outcome(project, workspace, req, "deferred", &token);
+    if let Err(e) = crate::workspace::write_deferred_marker(host, deferred_marker, &token) {
+        tracing::debug!(workspace = %workspace.name, task = %req.task_id, error = %e, "write_deferred_marker failed; may re-log next tick");
     }
 }
 
@@ -10308,6 +10412,232 @@ transitions:
             "task should be promoted once the read succeeds"
         );
         assert!(!marker.exists(), "marker should be consumed after promotion");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A throwaway `SHELBI_HOME` with the local fixture project, for the
+    /// transition-marker outcome tests. Returns the home and the project.
+    fn transition_outcome_fixture(tag: &str) -> (std::path::PathBuf, Project) {
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-transition-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        // The move's daemon-version guard probes this socket. Inside a worker
+        // pane it names the live hub, whose version may not match this build.
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        (home, project)
+    }
+
+    fn write_transition_marker(project: &Project, body: &str) -> std::path::PathBuf {
+        let marker = crate::workspace::workspace_transition_marker(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, body).unwrap();
+        marker
+    }
+
+    fn transition_tick(project: &Project) {
+        maybe_apply_transition(
+            project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &SessionTarget::slot("s", "w"),
+        );
+    }
+
+    fn transition_marker_lines() -> Vec<String> {
+        std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(" transition-marker "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn transition_marker_survives_a_store_read_error_and_applies_on_recovery() {
+        // The regression under test: a gate writes its verdict exactly once, so
+        // a failed read of the task (403, rate limit, network) must not delete
+        // it. The card would stay in the gate with nothing left to retry.
+        let _g = crate::test_lock::acquire();
+        let (home, project) = transition_outcome_fixture("defer");
+
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        // Corrupt the frontmatter so the store's `get` returns `Err` (a stand-in
+        // for any backend read failure) rather than `Ok(None)`.
+        let task_path = shelbi_state::task_path("demo", "fix-login").unwrap();
+        std::fs::write(&task_path, "---\ncolumn: [in_progress\n---\nbody\n").unwrap();
+
+        let marker = write_transition_marker(&project, "fix-login\nreview\n");
+        let sidecar = crate::workspace::workspace_transition_deferred_marker(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+
+        transition_tick(&project);
+        assert!(marker.exists(), "a failed read must not clear the verdict");
+        let lines = transition_marker_lines();
+        assert_eq!(lines.len(), 1, "one deferral line expected: {lines:?}");
+        assert!(
+            lines[0].contains(
+                " transition-marker project=demo task=fix-login workspace=alpha target=review status=deferred reason=load-failed:"
+            ),
+            "line: {}",
+            lines[0]
+        );
+
+        // A repeat of the same failure neither clears nor re-logs.
+        transition_tick(&project);
+        assert!(marker.exists(), "the verdict must outlast a repeat failure");
+        assert_eq!(
+            transition_marker_lines().len(),
+            1,
+            "the deferral must be logged once, not every tick"
+        );
+
+        // The store recovers: the very next tick applies the verdict.
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        transition_tick(&project);
+        let task = shelbi_state::load_task("demo", "fix-login").unwrap().task;
+        assert_eq!(task.column, Column::review(), "the verdict must still apply");
+        assert_eq!(task.assigned_to, None, "an applied verdict releases the card");
+        assert!(!marker.exists(), "an applied verdict consumes the marker");
+        assert!(!sidecar.exists(), "consuming the marker re-arms the next deferral");
+        assert_eq!(
+            transition_marker_lines().len(),
+            1,
+            "an applied verdict is not a non-applied outcome"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn transition_marker_defers_a_failed_move_and_logs_it_once() {
+        // The read succeeds but the write doesn't. The marker has always been
+        // kept here; the outcome used to reach tracing only. A task in a
+        // directory the poller can read but not write fails the move for real.
+        use std::os::unix::fs::PermissionsExt;
+        let _g = crate::test_lock::acquire();
+        let (home, project) = transition_outcome_fixture("move-fail");
+
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        let marker = write_transition_marker(&project, "fix-login\nreview\n");
+        let task_path = shelbi_state::task_path("demo", "fix-login").unwrap();
+        std::fs::set_permissions(&task_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let task_dir = task_path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&task_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        transition_tick(&project);
+        transition_tick(&project);
+
+        std::fs::set_permissions(&task_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&task_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(marker.exists(), "a failed move must keep the verdict");
+        let lines = transition_marker_lines();
+        assert_eq!(lines.len(), 1, "one deferral line expected: {lines:?}");
+        assert!(
+            lines[0].contains(" task=fix-login ")
+                && lines[0].contains(" status=deferred reason=move-failed:"),
+            "line: {}",
+            lines[0]
+        );
+
+        // Writes work again, so the retried verdict lands.
+        transition_tick(&project);
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login").unwrap().task.column,
+            Column::review(),
+        );
+        assert!(!marker.exists());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn refused_transition_marker_is_cleared_and_logged_with_its_reason() {
+        let _g = crate::test_lock::acquire();
+        let (home, project) = transition_outcome_fixture("refused");
+
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        let marker = write_transition_marker(&project, "fix-login\nno-such-status\n");
+
+        transition_tick(&project);
+
+        assert!(!marker.exists(), "a refused request is consumed");
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login").unwrap().task.column,
+            Column::in_progress(),
+            "a refused request moves nothing"
+        );
+        let lines = transition_marker_lines();
+        assert_eq!(lines.len(), 1, "lines: {lines:?}");
+        assert!(
+            lines[0].ends_with(
+                " transition-marker project=demo task=fix-login workspace=alpha target=no-such-status status=refused reason=unknown-target-status"
+            ),
+            "line: {}",
+            lines[0]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn dropped_transition_marker_is_cleared_and_logged_with_its_reason() {
+        let _g = crate::test_lock::acquire();
+        let (home, project) = transition_outcome_fixture("dropped");
+
+        // A task another workspace owns: cleared, not moved.
+        shelbi_state::save_task("demo", &in_progress_task("theirs", "bravo"), "body").unwrap();
+        let marker = write_transition_marker(&project, "theirs\nreview\n");
+        transition_tick(&project);
+        assert!(!marker.exists(), "a foreign marker is consumed");
+        assert_eq!(
+            shelbi_state::load_task("demo", "theirs").unwrap().task.column,
+            Column::in_progress(),
+            "a foreign marker moves nothing"
+        );
+
+        // A successful read that finds no such task: the only other clear.
+        let marker = write_transition_marker(&project, "ghost\nreview\n");
+        transition_tick(&project);
+        assert!(!marker.exists(), "a marker naming a gone task is consumed");
+
+        let lines = transition_marker_lines();
+        assert_eq!(lines.len(), 2, "lines: {lines:?}");
+        assert!(
+            lines[0].ends_with(
+                " transition-marker project=demo task=theirs workspace=alpha target=review status=dropped reason=not-owned"
+            ),
+            "line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with(
+                " transition-marker project=demo task=ghost workspace=alpha target=review status=dropped reason=task-gone"
+            ),
+            "line: {}",
+            lines[1]
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

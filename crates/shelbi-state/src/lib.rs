@@ -215,6 +215,7 @@ pub use event_log::{
     append_orphan_reap_failed_event,
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
     append_limit_resume_event, append_marker_deferred_event, append_marker_skipped_event,
+    append_transition_marker_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,
     append_message_event, append_message_undeliverable_event, append_migration_event, append_project_event,
     append_push_event, last_pushed_tip_from_events,
