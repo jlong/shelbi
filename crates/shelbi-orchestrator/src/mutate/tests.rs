@@ -1055,3 +1055,173 @@ fn apply_edit_on_github_refuses_a_save_over_a_body_it_hasnt_seen() {
     std::env::remove_var("SHELBI_HOME");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// --- `ensure_workspace_dispatchable` (the dispatch guard) --------------------
+//
+// Moved from `shelbi-cli`'s `commands/issue.rs` when its duplicate of this guard
+// was removed, and extended to the slots the literal `in_progress` check missed.
+
+/// Declare an `adversarial-review` agent-owned gate, a renamed primary active
+/// status (`coding`) and a renamed handoff (`signoff`) as `project`'s workflow.
+fn write_gated_workflow(project: &str) {
+    let dir = shelbi_state::workflows_dir(project).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("statuses.yaml"),
+        r#"
+statuses:
+  - { id: backlog,            name: Backlog, category: backlog }
+  - { id: todo,               name: Todo,    category: ready }
+  - { id: coding,             name: Coding,  category: active }
+  - { id: adversarial-review, name: Gate,    category: active }
+  - { id: signoff,            name: Signoff, category: handoff }
+  - { id: done,               name: Done,    category: done }
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("default.yaml"),
+        r#"
+name: default
+statuses:
+  - { id: backlog,            owner: user }
+  - { id: todo,               owner: agent, agent: orchestrator }
+  - { id: coding,             owner: agent, agent: developer }
+  - { id: adversarial-review, owner: agent, agent: adversarial-review }
+  - { id: signoff,            owner: user }
+  - { id: done,               owner: user }
+"#,
+    )
+    .unwrap();
+}
+
+/// A card that finished (its PR merged, moving it to a terminal column
+/// out-of-band) was never cleared from `board-snapshot.json`, so the stale entry
+/// pinned its workspace as `in_progress`. The guard reads the live daemon index
+/// (which drops closed cards) instead, so the stranded entry is inert.
+#[test]
+fn dispatch_guard_ignores_a_done_card_stranded_in_the_stale_snapshot() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_github_project_yaml("gh");
+    shelbi_state::seed_board_snapshot_for_test(
+        "gh",
+        &[issue_file(task_assigned("stranded-done", Column::in_progress(), "dev"))],
+    );
+    shelbi_state::set_task_assignment("gh", "stranded-done", Some("dev")).unwrap();
+    write_gh_index(Vec::new());
+
+    ensure_workspace_dispatchable("gh", "dev", "next-card")
+        .expect("a stale snapshot entry must not manufacture a phantom occupant");
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A genuine in-flight card is refused and named with its real column; the card
+/// excluded by id (a resume, a same-slot restart) never blocks itself.
+#[test]
+fn dispatch_guard_names_a_live_card_and_never_blocks_the_card_itself() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_github_project_yaml("gh");
+    write_gh_index(vec![issue_file(task_assigned("live-1", Column::in_progress(), "dev"))]);
+    shelbi_state::set_task_assignment("gh", "live-1", Some("dev")).unwrap();
+
+    let err = ensure_workspace_dispatchable("gh", "dev", "next-card")
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("live-1") && err.contains("in_progress"),
+        "err should name the blocking card and its real column: {err}"
+    );
+    ensure_workspace_dispatchable("gh", "dev", "live-1").unwrap();
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// `issue start` onto a slot running an agent-owned gate must refuse, not tear
+/// down the gate's agent, and so must a slot on a renamed active status.
+#[test]
+fn start_refuses_a_slot_running_an_agent_owned_gate() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_gated_workflow("p");
+    shelbi_state::save_task(
+        "p",
+        &task_assigned("gate-card", Column::from_status_id("adversarial-review"), "dev"),
+        "body",
+    )
+    .unwrap();
+    shelbi_state::save_task("p", &task(Column::todo(), "next"), "body").unwrap();
+
+    let mut sink = RecordingSink::default();
+    let mut recheck = no_recheck();
+    let result = apply(
+        "p",
+        "next",
+        &MutationKind::Start {
+            workspace: Some("dev".into()),
+            branch: None,
+            reason: None,
+            force: false,
+            take: false,
+        },
+        &mut sink,
+        &mut recheck,
+    );
+
+    let err = result.expect_err("the slot is running a gate").to_string();
+    assert!(
+        err.contains("gate-card") && err.contains("adversarial-review"),
+        "the refusal names the gate card and its status: {err}",
+    );
+    let next = shelbi_state::load_task("p", "next").unwrap();
+    assert_eq!(next.task.column, Column::todo(), "a refused start moves nothing");
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn dispatch_guard_refuses_a_renamed_active_status() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    write_gated_workflow("p");
+    shelbi_state::save_task(
+        "p",
+        &task_assigned("renamed", Column::from_status_id("coding"), "dev"),
+        "body",
+    )
+    .unwrap();
+
+    assert!(ensure_workspace_dispatchable("p", "dev", "next").is_err());
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The dev slot that built a queued review is reusable: its worker closed at the
+/// handoff, and counting the card would lock the slot until the review lands.
+#[test]
+fn dispatch_guard_lets_a_dev_slot_take_new_work_after_a_handoff() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    shelbi_state::save_task(
+        "p",
+        &task_assigned("queued", Column::review(), "dev"),
+        "body",
+    )
+    .unwrap();
+
+    ensure_workspace_dispatchable("p", "dev", "next").unwrap();
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}

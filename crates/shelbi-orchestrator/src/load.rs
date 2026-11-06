@@ -14,27 +14,21 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
-use shelbi_core::{Column, Error, Project, Result, Issue, StatusCategory, WorkspaceSpec, Workflow};
+use shelbi_core::{Column, Error, Project, Result, Issue, WorkspaceSpec, Workflow};
 use shelbi_state::{IssueFile, ReviewLoadFailure};
 
 use crate::branch;
 use crate::supervision::{BASE_BACKOFF, CRASH_LOOP_WINDOW, MAX_RESTARTS_IN_WINDOW};
 use crate::workspace::{start_workspace_on_task, StartSpec};
 
-/// The **active** board for `project` — its in-progress plus review-column cards
-/// — read from the daemon-owned `board-index.json`
-/// (`Plans/github-issue-caching-and-rate-limits.md` §5) via the shared
-/// [`shelbi_state::read_board`] helper, not two backend `list_in_status`
-/// sweeps. Both are open (non-terminal) columns, so the open index carries them.
-///
-/// This is the busy/occupancy scan every load and review-slot picker shares:
-/// they only ever look at these two active columns to decide which workspace is
-/// free. Reading the index (instead of the backend) keeps the autoloader off
-/// GitHub's list budget and consistent with what the sidebar and pollers see.
+/// The cards with a live worker on their slot ([`shelbi_state::SlotOccupancy::is_busy`]),
+/// in board order: what the review-slot picker lists as each slot's occupant.
 fn active_board(project: &Project) -> Result<Vec<IssueFile>> {
-    Ok(overlay_resolved_board(project)?
-        .into_iter()
-        .filter(|tf| tf.task.column == Column::in_progress() || tf.task.column == Column::review())
+    let occupancy = shelbi_state::BoardOccupancy::read(project)?;
+    Ok(occupancy
+        .working()
+        .chain(occupancy.serving())
+        .cloned()
         .collect())
 }
 
@@ -110,14 +104,11 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
         )));
     }
 
-    // Busy = holding some *other* active (in-progress / handoff) task. Read from
-    // the daemon-owned index, not the backend (§5).
-    let active = active_board(&project)?;
-    let busy: HashSet<&str> = active
-        .iter()
-        .filter(|t| t.task.id != task_id)
-        .filter_map(|t| t.task.assigned_to.as_deref())
-        .collect();
+    // Busy = holding some *other* active or handoff task. A status with no tags
+    // can put a review on a dev slot, so a handoff card's slot stays off limits
+    // here even though a dev dispatch may reuse it. Read from the daemon-owned
+    // index, not the backend (§5).
+    let busy = shelbi_state::BoardOccupancy::read(&project)?.claimed_slots(Some(task_id));
 
     let chosen = candidates
         .iter()
@@ -135,20 +126,13 @@ pub fn load_task_by_id(project_name: &str, task_id: &str) -> Result<String> {
 
 /// Idle `review`-tagged workspaces for `project_name`, in declaration order.
 ///
-/// "Idle" = not currently assigned an active (in-progress or review-column)
-/// task. The sidebar's "Load onto a review workspace?" confirm dialog reads
-/// this to pick the slot it will load onto — and to report "none free" when
-/// every review slot is busy. Kept beside [`load_review_task`] so the busy
-/// definition (the same in-progress + review scan the generic loader uses)
-/// lives in one place.
+/// "Idle" = not [`shelbi_state::SlotOccupancy::is_busy`]. The sidebar's "Load
+/// onto a review workspace?" confirm dialog reads this to pick the slot it will
+/// load onto, and to report "none free" when every review slot is busy.
 pub fn free_review_workspaces(project_name: &str) -> Result<Vec<WorkspaceSpec>> {
     let project = shelbi_state::load_project(project_name)?;
     let review_tag: BTreeSet<String> = std::iter::once("review".to_string()).collect();
-    let active = active_board(&project)?;
-    let busy: HashSet<&str> = active
-        .iter()
-        .filter_map(|t| t.task.assigned_to.as_deref())
-        .collect();
+    let busy = shelbi_state::BoardOccupancy::read(&project)?.busy_slots(None);
     Ok(project
         .workspaces_matching(&review_tag)
         .into_iter()
@@ -166,8 +150,8 @@ pub use shelbi_app::source::{ReviewSlot, ReviewSlotOccupant};
 ///
 /// The picker/confirm dialog's data source: unlike [`free_review_workspaces`]
 /// it lists occupied slots too, so a human can deliberately reuse one (evicting
-/// its current task back to the queue). "Occupied" uses the same in-progress +
-/// review-column scan the busy check does, so the two never disagree.
+/// its current task back to the queue). "Occupied" is the same occupancy the
+/// busy check reads, so the two never disagree.
 pub fn review_slots(project_name: &str) -> Result<Vec<ReviewSlot>> {
     let project = shelbi_state::load_project(project_name)?;
     let active = active_board(&project)?;
@@ -464,26 +448,18 @@ fn conflicting_review_slot(project: &Project, task: &Issue, target: &str) -> Opt
         .map(|w| w.name.clone())
 }
 
-/// True iff `workspace_name` is currently assigned to an active
-/// (in-progress or review-column) task other than `task_id`. The same "busy"
-/// definition [`free_review_workspaces`] uses, but asked of one slot — the
+/// True iff `workspace_name` is busy with a task other than `task_id`. The same
+/// "busy" definition [`free_review_workspaces`] uses, but asked of one slot: the
 /// race guard for a targeted load.
 fn review_slot_busy_with_other(
     project_name: &str,
     workspace_name: &str,
     task_id: &str,
 ) -> Result<bool> {
-    // The same active (in-progress + review) scan as [`active_board`], asked of
-    // one slot — read from the daemon-owned index (§5), not the backend, with
-    // ownership resolved from the authoritative overlay so a lagging index can't
-    // mislabel the slot (see [`overlay_resolved_board`]).
     let project = shelbi_state::load_project(project_name)?;
-    let active = overlay_resolved_board(&project)?;
-    Ok(active.iter().any(|t| {
-        (t.task.column == Column::in_progress() || t.task.column == Column::review())
-            && t.task.id != task_id
-            && t.task.assigned_to.as_deref() == Some(workspace_name)
-    }))
+    Ok(shelbi_state::BoardOccupancy::read(&project)?
+        .of_other_than(workspace_name, task_id)
+        .is_busy())
 }
 
 /// Auto-load queued review tasks onto idle review slots, one claim per free
@@ -972,45 +948,10 @@ pub struct DispatchedGate {
     pub workspace: String,
 }
 
-/// Workspaces currently occupied by some *other* task that has a live worker:
-/// any task (except `task_id`) whose current status is an **active** or
-/// **handoff** category on the open board.
-///
-/// Unlike [`active_board`]'s canonical in-progress + review scan, this counts
-/// custom agent-owned active **gates** (e.g. another `adversarial-review` card)
-/// too, so two parked gates can never be dispatched onto the same slot. A
-/// pre-assigned `ready`/`backlog` card is *not* counted — it has no live pane —
-/// so a stale pre-assignment never falsely blocks a gate dispatch.
-fn occupied_workspaces(
-    project: &Project,
-    project_name: &str,
-    task_id: &str,
-) -> Result<HashSet<String>> {
-    let mut busy = HashSet::new();
-    for tf in shelbi_state::read_board(project_name)?.into_issues() {
-        if tf.task.id == task_id {
-            continue;
-        }
-        let Some(ws) = tf.task.assigned_to.clone() else {
-            continue;
-        };
-        let workflow = shelbi_state::load_task_workflow(project_name, project, &tf.task)
-            .unwrap_or_else(|_| shelbi_core::default_workflow());
-        let occupies = workflow
-            .status(tf.task.column.as_str())
-            .map(|s| matches!(s.category, StatusCategory::Active | StatusCategory::Handoff))
-            .unwrap_or(false);
-        if occupies {
-            busy.insert(ws);
-        }
-    }
-    Ok(busy)
-}
-
 /// Pick the workspace an agent-owned active **gate** should launch on: the
 /// first *free eligible* workspace in declaration order — tag-matched to the
 /// gate status's `tags:`, not a `review`-tagged slot (a gate agent is not the
-/// reviewer), and not already `busy` ([`occupied_workspaces`]).
+/// reviewer), and not already `busy` ([`shelbi_state::BoardOccupancy::busy_slots`]).
 ///
 /// Deliberately **does not** reuse the gate task's `assigned_to`, which after a
 /// ready-marker handoff still names the finishing developer workspace that has
@@ -1046,9 +987,10 @@ fn plan_active_gate_workspace<'a>(
 /// ([`plan_active_gate_workspace`]) — it ignores the card's stale `assigned_to`
 /// (the released developer slot), so that value never suppresses the dispatch.
 /// After the new pane is confirmed up, the finishing developer workspace — if a
-/// *different* slot — is released with a best-effort pane teardown, so it is not
-/// left orphaned (the ready handoff normally already killed it; this covers the
-/// swallowed-wake / manual-drag paths). Returns the `(task, workspace)` pair.
+/// *different* slot, and not since re-dispatched to another card — is released
+/// with a best-effort pane teardown, so it is not left orphaned (the ready
+/// handoff normally already killed it; this covers the swallowed-wake /
+/// manual-drag paths). Returns the `(task, workspace)` pair.
 pub fn dispatch_active_gate(project_name: &str, task_id: &str) -> Result<DispatchedGate> {
     shelbi_state::ensure_daemon_matches_for_mutation()?;
     let project = shelbi_state::load_project(project_name)?;
@@ -1083,7 +1025,7 @@ pub fn dispatch_active_gate(project_name: &str, task_id: &str) -> Result<Dispatc
         .unwrap_or_default();
     let agent = status.and_then(|s| s.agent.clone());
 
-    let busy = occupied_workspaces(&project, project_name, task_id)?;
+    let busy = shelbi_state::BoardOccupancy::read(&project)?.busy_slots(Some(task_id));
     let chosen = plan_active_gate_workspace(&project, &required, &busy)
         .ok_or_else(|| {
             Error::Other(format!(
@@ -1113,7 +1055,7 @@ pub fn dispatch_active_gate(project_name: &str, task_id: &str) -> Result<Dispatc
     // the dispatch that already succeeded.
     if let Some(prev) = prior {
         if prev != chosen.name {
-            release_supplanted_workspace(&project, &prev);
+            release_prior_assignee(&project, task_id, &prev, release_supplanted_workspace);
         }
     }
 
@@ -1128,6 +1070,41 @@ pub fn dispatch_active_gate(project_name: &str, task_id: &str) -> Result<Dispatc
         task_id: task_id.to_string(),
         workspace: chosen.name,
     })
+}
+
+/// Run `release` on the gate card's prior assignee only when that slot is still
+/// on this card or idle: the check `issue start` makes before its own supplant
+/// release. A slot that has moved on to another card keeps its live worker, with
+/// a `skipped` event saying why, and a slot we can't confirm is left alone too,
+/// since an orphaned pane is recoverable and a killed worker is not.
+fn release_prior_assignee(
+    project: &Project,
+    task_id: &str,
+    prev: &str,
+    release: impl FnOnce(&Project, &str),
+) {
+    match crate::mutate::workspace_busy_with_other(&project.name, prev, task_id) {
+        Ok(None) => release(project, prev),
+        Ok(Some(busy)) => {
+            let _ = shelbi_state::append_dispatch_event(
+                &project.name,
+                task_id,
+                prev,
+                "skipped",
+                &format!(
+                    "prior assignee is now active on `{}`; its pane was left running",
+                    busy.id
+                ),
+            );
+        }
+        Err(e) => tracing::warn!(
+            project = %project.name,
+            workspace = %prev,
+            task = %task_id,
+            error = %e,
+            "active-gate dispatch: couldn't confirm the prior assignee is free; leaving its pane alone",
+        ),
+    }
 }
 
 /// Best-effort teardown of a workspace pane supplanted by a gate dispatch (the
@@ -2343,15 +2320,107 @@ mod tests {
         let project = gate_project();
         let required = BTreeSet::new();
         // The stale `assigned_to=gamma` is deliberately absent from `busy`:
-        // `occupied_workspaces` never counts the released dev slot (its worker is
-        // gone) nor the gate task's own assignment — see
-        // `occupied_workspaces_counts_active_gates_but_not_a_ready_preassignment`.
+        // `busy_slots` never counts the gate task's own assignment — see
+        // `gate_picker_counts_active_gates_but_not_a_ready_preassignment`.
         let chosen = plan_active_gate_workspace(&project, &required, &busy_set(&[]));
         assert_eq!(
             chosen.map(|w| w.name.as_str()),
             Some("alpha"),
             "a stale assigned_to must not be reused (nor suppress) the gate dispatch",
         );
+    }
+
+    /// Whether [`release_prior_assignee`] released `alpha` for the gate card
+    /// `t-gate`, given the board already seeded on disk.
+    fn released_prior_assignee() -> bool {
+        let mut released = false;
+        release_prior_assignee(&tagged_project(), "t-gate", "alpha", |_, workspace| {
+            assert_eq!(workspace, "alpha");
+            released = true;
+        });
+        released
+    }
+
+    fn with_gate_board(seed: impl FnOnce()) -> std::path::PathBuf {
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&tagged_project()).unwrap();
+        write_gated_workflow();
+        // Card A: its gate has just been dispatched onto `beta`, away from `alpha`.
+        shelbi_state::save_task("demo", &gate_task("t-gate", Some("beta")), "body").unwrap();
+        seed();
+        home
+    }
+
+    /// The incident shape: `alpha` handed card A off and has since been
+    /// re-dispatched to card B. The gate dispatch for A must leave B's worker up.
+    #[test]
+    fn a_gate_dispatch_doesnt_kill_a_prior_slot_thats_now_working_on_another_card() {
+        let _g = crate::test_lock::acquire();
+        let home = with_gate_board(|| {
+            let mut other = todo_task("t-other", &[]);
+            other.column = Column::in_progress();
+            other.assigned_to = Some("alpha".into());
+            shelbi_state::save_task("demo", &other, "body").unwrap();
+        });
+
+        assert!(!released_prior_assignee(), "card B's worker must survive");
+        let events =
+            std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
+        assert!(
+            events.contains("skipped") && events.contains("t-other"),
+            "the non-release must be visible on events.log: {events}",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_gate_dispatch_doesnt_kill_a_prior_slot_running_another_gate() {
+        let _g = crate::test_lock::acquire();
+        let home = with_gate_board(|| {
+            shelbi_state::save_task("demo", &gate_task("t-other-gate", Some("alpha")), "body")
+                .unwrap();
+        });
+
+        assert!(!released_prior_assignee());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_gate_dispatch_releases_a_prior_slot_with_no_other_card() {
+        let _g = crate::test_lock::acquire();
+        let home = with_gate_board(|| {});
+
+        assert!(released_prior_assignee(), "nothing else holds the slot");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A queued review keeps naming the dev slot that built it, but that slot's
+    /// worker closed at the handoff, so a gate may land there.
+    #[test]
+    fn a_queued_review_doesnt_keep_its_dev_slot_from_a_gate() {
+        let _g = crate::test_lock::acquire();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        shelbi_state::save_project(&gate_project()).unwrap();
+        write_gated_workflow();
+        shelbi_state::save_task("demo", &review_task("t-queued", "alpha"), "body").unwrap();
+
+        let busy = shelbi_state::BoardOccupancy::read(&gate_project())
+            .unwrap()
+            .busy_slots(Some("t-gate"));
+        let project = gate_project();
+        let chosen = plan_active_gate_workspace(&project, &BTreeSet::new(), &busy);
+        assert_eq!(chosen.map(|w| w.name.as_str()), Some("alpha"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -2410,7 +2479,7 @@ statuses:
     }
 
     #[test]
-    fn occupied_workspaces_counts_active_gates_but_not_a_ready_preassignment() {
+    fn gate_picker_counts_active_gates_but_not_a_ready_preassignment() {
         // The double-booking guard: a workspace serving another agent-owned
         // active gate must count as busy (so two parked gates never land on one
         // slot), while a pre-assigned `ready` card — which has no live worker —
@@ -2430,7 +2499,9 @@ statuses:
         // The gate we're about to dispatch, still pinned to its released dev slot.
         shelbi_state::save_task("demo", &gate_task("t-self", Some("review-2")), "body").unwrap();
 
-        let busy = occupied_workspaces(&tagged_project(), "demo", "t-self").unwrap();
+        let busy = shelbi_state::BoardOccupancy::read(&tagged_project())
+            .unwrap()
+            .busy_slots(Some("t-self"));
         assert!(busy.contains("alpha"), "an active gate must count as busy: {busy:?}");
         assert!(
             !busy.contains("review-1"),

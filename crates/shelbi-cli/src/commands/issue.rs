@@ -419,68 +419,6 @@ fn cached_issue_store(project: &str) -> Result<Box<dyn IssueStore>> {
     shelbi_state::issue_store_for(project).map_err(|e| anyhow!(e))
 }
 
-/// The card that genuinely occupies `workspace_name`, if any — resolved from the
-/// live, daemon-owned board (`board-index.json`, the same source
-/// `shelbi workspace list` reads) rather than the per-process
-/// `board-snapshot.json`.
-///
-/// Occupancy used to be read from
-/// `cached_issue_store().list_in_status(in_progress)`, which on a remote backend
-/// serves `board-snapshot.json` — a file only a *dispatch* rewrites. A
-/// short-lived CLI one-shot serves that snapshot and kicks only a background
-/// refresh it exits before completing, so a card that reached a terminal column
-/// out-of-band (a merged PR) kept its stale `in_progress` entry indefinitely and
-/// permanently locked its workspace out of every future dispatch.
-///
-/// The board index is open-only, so a card in a terminal column (`done` /
-/// `canceled`) is already absent and can never hold a workspace. We additionally
-/// filter to the active `in_progress` column, matching the previous guard's
-/// intent, and return the whole card so a refusal can name its real column.
-///
-/// A cold board (no index published yet — a remote project whose daemon has not
-/// run) yields `Ok(None)`: erring toward dispatchable is the intended direction
-/// ("the stale side loses rather than blocking work"), and the
-/// persist-before-spawn dispatch ordering still prevents a genuine
-/// double-assignment.
-fn workspace_occupied_by(
-    project: &str,
-    workspace_name: &str,
-    exclude_id: &str,
-) -> Result<Option<Issue>> {
-    Ok(shelbi_state::read_board(project)
-        .map_err(|e| anyhow!(e))?
-        .into_issues()
-        .into_iter()
-        .map(|tf| tf.task)
-        .find(|task| {
-            task.column == Column::in_progress()
-                && task.assigned_to.as_deref() == Some(workspace_name)
-                && task.id != exclude_id
-        }))
-}
-
-/// Refuse to dispatch or assign onto a workspace already running a *different*
-/// in-flight issue. Shared by `issue assign`, `issue start`, and `issue resume`
-/// so an assignment a dispatch would refuse is refused up front — the two can
-/// never disagree, and a card is never left assigned to a workspace that cannot
-/// run it. Sourced from live board state via [`workspace_occupied_by`], so a
-/// stale snapshot entry can no longer manufacture a phantom occupant.
-fn ensure_workspace_dispatchable(
-    project: &str,
-    workspace_name: &str,
-    exclude_id: &str,
-) -> Result<()> {
-    if let Some(other) = workspace_occupied_by(project, workspace_name, exclude_id)? {
-        bail!(
-            "workspace `{workspace_name}` is already on issue `{}` ({}) — \
-             move it to another column first",
-            other.id,
-            other.column,
-        );
-    }
-    Ok(())
-}
-
 /// Whether `status` is a terminal (`done`/`canceled`) column. Those cards live
 /// in the closed history the daemon's open `board-index.json` deliberately
 /// omits, so a listing filtered to one reads it on demand through the store
@@ -1031,7 +969,7 @@ fn prio(project: &str, args: PrioArgs) -> Result<()> {
     // column — and kicks only a background refresh it exits before finishing.
     // `prio` then couldn't reorder a card `list` plainly showed, on any workflow,
     // until the snapshot happened to refresh. Reading the index closes that
-    // divergence (the same fix `workspace_occupied_by` got). A terminal
+    // divergence (the same fix the dispatch guard got). A terminal
     // (`done`/`canceled`) column lives in the on-demand closed history the open
     // index omits, so that one case still reads through the store. Both sources
     // apply the same `sort_board` order (column, then priority, then id), so the
@@ -1161,7 +1099,8 @@ fn resume(
     // same guard as `start`, sourced from live board state rather than the
     // dispatch-only snapshot. Resuming this issue onto a workspace busy with
     // another would leave two agents racing one worktree.
-    ensure_workspace_dispatchable(project, &workspace_name, id)?;
+    shelbi_orchestrator::mutate::ensure_workspace_dispatchable(project, &workspace_name, id)
+        .map_err(|e| anyhow!(e.to_string()))?;
 
     // The same ownership gate as `start`: on a remote tracker, resume only an
     // issue assigned to the user (or claim it first on an explicit `--take`).
@@ -2306,15 +2245,6 @@ workspaces:
 
     // --- occupancy guard: live board, not the dispatch-only snapshot ----------
 
-    /// An [`Issue`] assigned to `ws`, in `column` — the shape a workspace
-    /// occupant takes on the board.
-    fn task_assigned(id: &str, column: Column, ws: &str) -> Issue {
-        Issue {
-            assigned_to: Some(ws.to_string()),
-            ..task_in(column, id)
-        }
-    }
-
     fn issue_file(task: Issue) -> shelbi_state::IssueFile {
         shelbi_state::IssueFile {
             task,
@@ -2329,79 +2259,6 @@ workspaces:
         let mut idx = shelbi_state::BoardIndex::fresh(board);
         idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
         shelbi_state::write_board_index("gh", &idx).unwrap();
-    }
-
-    /// The incident: a card that finished (its PR merged, moving it to a terminal
-    /// column out-of-band) was never cleared from `board-snapshot.json`, so the
-    /// stale entry pinned its workspace as `in_progress` and locked it out of
-    /// every future dispatch. The guard must read the live daemon index (which
-    /// drops closed cards) instead, so the stranded snapshot entry is inert.
-    #[test]
-    fn workspace_occupied_by_ignores_a_done_card_stranded_in_the_stale_snapshot() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-
-        // Snapshot still lists a long-since-done card as in_progress on `dev`.
-        shelbi_state::seed_board_snapshot_for_test(
-            "gh",
-            &[issue_file(task_assigned(
-                "stranded-done",
-                Column::in_progress(),
-                "dev",
-            ))],
-        );
-        // The live index is current: the card has closed and is absent.
-        write_gh_index(Vec::new());
-
-        assert!(
-            workspace_occupied_by("gh", "dev", "next-card")
-                .unwrap()
-                .is_none(),
-            "a stale snapshot entry must not manufacture a phantom occupant"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// A genuine in-flight card is still reported, and the refusal names its real
-    /// column. The card excluded by id is never its own occupant.
-    #[test]
-    fn workspace_occupied_by_reports_a_live_in_progress_card_with_its_real_column() {
-        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-        write_github_project_yaml(&home, "gh");
-        write_gh_index(vec![issue_file(task_assigned(
-            "live-1",
-            Column::in_progress(),
-            "dev",
-        ))]);
-
-        let occ = workspace_occupied_by("gh", "dev", "next-card")
-            .unwrap()
-            .expect("a live in_progress card occupies the workspace");
-        assert_eq!(occ.id, "live-1");
-        assert_eq!(occ.column, Column::in_progress());
-
-        // Excluding the card by id (a resume / same-slot restart) frees it.
-        assert!(workspace_occupied_by("gh", "dev", "live-1")
-            .unwrap()
-            .is_none());
-
-        // The shared bail wording carries the real column.
-        let err = ensure_workspace_dispatchable("gh", "dev", "next-card")
-            .unwrap_err()
-            .to_string();
-        assert!(
-            err.contains("live-1") && err.contains("in_progress"),
-            "err should name the blocking card and its real column: {err}"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-        let _ = std::fs::remove_dir_all(&home);
     }
 
     // --- prio: reorder from the live index, on any workflow ------------------

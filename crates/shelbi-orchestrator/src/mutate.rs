@@ -502,24 +502,6 @@ fn apply_reject(
 
 // --- shared guards (ported from shelbi-cli commands/issue.rs) --------------
 
-/// The card genuinely occupying `workspace_name` right now (live board), if any.
-pub(crate) fn workspace_occupied_by(
-    project: &str,
-    workspace_name: &str,
-    exclude_id: &str,
-) -> Result<Option<Issue>, MutateError> {
-    Ok(shelbi_state::read_board(project)
-        .map_err(MutateError::backend)?
-        .into_issues()
-        .into_iter()
-        .map(|tf| tf.task)
-        .find(|task| {
-            task.column == shelbi_core::Column::in_progress()
-                && task.assigned_to.as_deref() == Some(workspace_name)
-                && task.id != exclude_id
-        }))
-}
-
 /// The issue — other than `exclude_id` — that `workspace_name` is actively
 /// assigned to right now, decided from **local, authoritative** state rather
 /// than the daemon's published index.
@@ -541,7 +523,8 @@ pub(crate) fn workspace_occupied_by(
 /// overlay (`assignments/<id>`), which every dispatch writes synchronously and
 /// `read_board`'s overlay re-resolve folds in. That overlay is the authoritative
 /// routing record here: any non-terminal issue other than `exclude_id` routed to
-/// the workspace counts as busy, whatever column a stale index shows it in.
+/// the workspace counts as busy, whatever column a stale index shows it in. So
+/// this asks for any [`shelbi_state::SlotOccupancy`] but `Idle`, not `is_busy`.
 ///
 /// Returns:
 /// - `Ok(Some(issue))` — the workspace is busy on another non-terminal issue;
@@ -556,23 +539,16 @@ pub(crate) fn workspace_busy_with_other(
     workspace_name: &str,
     exclude_id: &str,
 ) -> Result<Option<Issue>, MutateError> {
-    let cfg = shelbi_state::load_project(project)
-        .map_err(MutateError::backend)?
-        .issue_tracker;
-    if !cfg.backend.is_remote() {
+    let project_yaml = shelbi_state::load_project(project).map_err(MutateError::backend)?;
+    if !project_yaml.issue_tracker.backend.is_remote() {
         // Local (`file_system`) board: assignment lives in the card frontmatter
         // and the directory read is always authoritative (`BoardState::Warm`).
-        // The open board is open-only, so every row is non-terminal — any card
-        // assigned to this workspace other than the one being dispatched counts,
-        // whatever column it is parked in.
-        return Ok(shelbi_state::read_board(project)
+        // Any card assigned to this workspace other than the one being dispatched
+        // counts, whatever column it is parked in.
+        return Ok(shelbi_state::BoardOccupancy::read(&project_yaml)
             .map_err(MutateError::backend)?
-            .into_issues()
-            .into_iter()
-            .map(|tf| tf.task)
-            .find(|task| {
-                task.assigned_to.as_deref() == Some(workspace_name) && task.id != exclude_id
-            }));
+            .of_other_than(workspace_name, exclude_id)
+            .into_issue());
     }
 
     // Remote backend: the local assignment overlay is the authoritative routing
@@ -597,11 +573,13 @@ pub(crate) fn workspace_busy_with_other(
     // for a `Stale` index, which is exactly the incident shape (the routed card
     // still listed, in whatever column).
     let state = shelbi_state::read_board(project).map_err(MutateError::backend)?;
-    if let Some(task) = state
-        .issues()
-        .iter()
-        .find(|tf| others.contains(&tf.task.id))
-        .map(|tf| tf.task.clone())
+    let warm = matches!(state, shelbi_state::BoardState::Warm(_));
+    let mut board = state.into_issues();
+    shelbi_state::fold_assignment_overlay(project, &project_yaml.issue_tracker, &mut board);
+    let occupancy = shelbi_state::BoardOccupancy::from_board(&project_yaml, board);
+    if let Some(task) = occupancy
+        .of_other_than(workspace_name, exclude_id)
+        .into_issue()
     {
         return Ok(Some(task));
     }
@@ -610,34 +588,42 @@ pub(crate) fn workspace_busy_with_other(
     // current open-only set, so their absence proves they have gone terminal and
     // the workspace is free. A board that isn't warm (stale, cold, unreachable)
     // can't prove that, so we can't confirm — err toward NOT releasing.
-    match state {
-        shelbi_state::BoardState::Warm(_) => Ok(None),
-        _ => {
-            others.sort();
-            Err(MutateError::Backend(format!(
-                "the prior assignee `{workspace_name}` is routed to `{}` in the local overlay but \
-                 the board index isn't warm enough to confirm whether it is still active",
-                others.join("`, `"),
-            )))
-        }
+    if warm {
+        return Ok(None);
     }
+    others.sort();
+    Err(MutateError::Backend(format!(
+        "the prior assignee `{workspace_name}` is routed to `{}` in the local overlay but \
+         the board index isn't warm enough to confirm whether it is still active",
+        others.join("`, `"),
+    )))
 }
 
 /// Refuse to dispatch/assign onto a workspace already running a *different*
-/// in-flight issue. Shared by assign and start.
-pub(crate) fn ensure_workspace_dispatchable(
+/// in-flight issue: a developer, an agent-owned gate, or a loaded review. Shared
+/// by `issue assign`, `issue start` and `issue resume`, so an assignment a
+/// dispatch would refuse is refused up front. Sourced from the live board, so a
+/// stale snapshot entry can't manufacture a phantom occupant.
+pub fn ensure_workspace_dispatchable(
     project: &str,
     workspace_name: &str,
     exclude_id: &str,
 ) -> Result<(), MutateError> {
-    if let Some(other) = workspace_occupied_by(project, workspace_name, exclude_id)? {
-        return Err(MutateError::Backend(format!(
-            "workspace `{workspace_name}` is already on issue `{}` ({}) — \
-             move it to another column first",
-            other.id, other.column,
-        )));
+    let project_yaml = shelbi_state::load_project(project).map_err(MutateError::backend)?;
+    let occupancy = shelbi_state::BoardOccupancy::read(&project_yaml)
+        .map_err(MutateError::backend)?
+        .of_other_than(workspace_name, exclude_id);
+    if !occupancy.is_busy() {
+        return Ok(());
     }
-    Ok(())
+    let Some(other) = occupancy.issue() else {
+        return Ok(());
+    };
+    Err(MutateError::Backend(format!(
+        "workspace `{workspace_name}` is already on issue `{}` ({}) — \
+         move it to another column first",
+        other.id, other.column,
+    )))
 }
 
 /// Guard against routing a normal dev issue onto a review slot. A `--force`

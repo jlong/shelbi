@@ -31,7 +31,7 @@
 
 use std::path::Path;
 
-use shelbi_core::{Column, Error, Host, Result};
+use shelbi_core::{Error, Host, Result};
 
 use crate::review_session::ReviewContentRole;
 use crate::session_process_backend::SessionProcessBackend;
@@ -44,9 +44,9 @@ pub fn content_session_name(project_name: &str, workspace: &str, role: ReviewCon
     format!("{project_name}/ws/{workspace}/{}", role.as_str())
 }
 
-/// Find the in-progress task assigned to `workspace`, read from the **same
-/// source the sidebar uses** — the daemon's published board index
-/// ([`shelbi_state::read_board_report_with_cfg`]) — not a fresh backend /
+/// Find the task working on `workspace` (an in-progress card or a running gate),
+/// read from the **same source the sidebar uses** — the daemon's published board
+/// index through [`shelbi_state::BoardOccupancy`] — not a fresh backend /
 /// process-cache read.
 ///
 /// Reading the published index is what keeps the workspace panel's header
@@ -56,21 +56,17 @@ pub fn content_session_name(project_name: &str, workspace: &str, role: ReviewCon
 /// process-local snapshot cache is cold on the first read of a freshly launched
 /// TUI — which surfaced as an `IDLE` header on the first open while the sidebar
 /// already showed the task working, firming up only after a back-out + reopen.
-/// The index is a local file, so this adds no backend round trip. The assignment
-/// is taken straight from the index (the daemon already folded the overlay at
-/// publish), exactly as the sidebar does for its in-progress rows.
-fn in_progress_task_for(
-    project_name: &str,
-    cfg: &shelbi_core::IssueTrackerConfig,
+/// The index is a local file, so this adds no backend round trip.
+fn working_task_for(
+    project: &shelbi_core::Project,
     workspace: &str,
 ) -> Result<Option<shelbi_state::IssueFile>> {
-    let report = shelbi_state::read_board_report_with_cfg(project_name, cfg)?;
-    Ok(report
-        .state
-        .into_issues()
-        .into_iter()
-        .filter(|tf| tf.task.column == Column::in_progress())
-        .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace)))
+    let occupancy = shelbi_state::BoardOccupancy::read(project)?;
+    let task = occupancy
+        .working()
+        .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace))
+        .cloned();
+    Ok(task)
 }
 
 /// What a workspace view shows about a workspace; the type lives in
@@ -103,7 +99,7 @@ pub fn workspace_details(project_name: &str, workspace: &str) -> Result<Workspac
             None,
         ),
     };
-    let task = in_progress_task_for(project_name, &project.issue_tracker, workspace)?;
+    let task = working_task_for(&project, workspace)?;
     let branch = task
         .as_ref()
         .and_then(|t| t.task.branch.clone())
@@ -179,7 +175,7 @@ pub fn ensure_content_session(
     };
     // Tag the session with the current task id when there is one (best-effort —
     // the editor/diff work regardless).
-    let task = in_progress_task_for(project_name, &project.issue_tracker, workspace)
+    let task = working_task_for(&project, workspace)
         .ok()
         .flatten()
         .map(|tf| tf.task.id);
@@ -490,7 +486,6 @@ mod tests {
         );
     }
 
-    use shelbi_core::{GithubConnection, IssueTrackerBackend, IssueTrackerConfig};
 
     fn fresh_shelbi_home(tag: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -506,17 +501,39 @@ mod tests {
         p
     }
 
-    /// A GitHub-backend tracker config pointed at `owner/repo` — the remote case
-    /// where the published-index-vs-live-read divergence shows up (a
-    /// `file_system` board reads the same bytes either way).
-    fn github_cfg() -> IssueTrackerConfig {
-        IssueTrackerConfig {
-            backend: IssueTrackerBackend::Github,
-            github: Some(GithubConnection {
-                repo: "owner/repo".into(),
-            }),
-            ..Default::default()
-        }
+    /// A GitHub-backend project pointed at `owner/repo` — the remote case where
+    /// the published-index-vs-live-read divergence shows up (a `file_system`
+    /// board reads the same bytes either way).
+    fn github_project() -> shelbi_core::Project {
+        let projects = shelbi_state::projects_dir().unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        std::fs::write(
+            projects.join("proj.yaml"),
+            r#"name: proj
+repo: /tmp/proj
+default_branch: main
+issue_tracker:
+  backend: github
+  github:
+    repo: owner/repo
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+machines:
+  - name: local
+    kind: local
+    work_dir: /tmp/proj
+workspaces:
+  - { name: alpha, machine: local }
+  - { name: bravo, machine: local }
+  - { name: charlie, machine: local }
+"#,
+        )
+        .unwrap();
+        shelbi_state::load_project("proj").unwrap()
     }
 
     fn issue(id: &str, column: shelbi_core::Column, assigned_to: Option<&str>) -> shelbi_state::IssueFile {
@@ -549,6 +566,11 @@ mod tests {
     fn publish_index(board: Vec<shelbi_state::IssueFile>) {
         let mut idx = shelbi_state::BoardIndex::fresh(board);
         idx.repo = Some(shelbi_state::github_board_repo("owner/repo"));
+        for tf in &idx.board {
+            if let Some(workspace) = tf.task.assigned_to.as_deref() {
+                shelbi_state::set_task_assignment("proj", &tf.task.id, Some(workspace)).unwrap();
+            }
+        }
         shelbi_state::write_board_index("proj", &idx).unwrap();
     }
 
@@ -571,7 +593,7 @@ mod tests {
             Some("alpha"),
         )]);
 
-        let task = in_progress_task_for("proj", &github_cfg(), "alpha").unwrap();
+        let task = working_task_for(&github_project(), "alpha").unwrap();
         std::env::remove_var("SHELBI_HOME");
         let task = task.expect("the in-progress task is resolved from the published index");
         assert_eq!(task.task.id, "cold-start");
@@ -595,8 +617,9 @@ mod tests {
             issue("other-ws", shelbi_core::Column::in_progress(), Some("bravo")),
         ]);
 
-        let for_alpha = in_progress_task_for("proj", &github_cfg(), "alpha").unwrap();
-        let for_idle = in_progress_task_for("proj", &github_cfg(), "charlie").unwrap();
+        let project = github_project();
+        let for_alpha = working_task_for(&project, "alpha").unwrap();
+        let for_idle = working_task_for(&project, "charlie").unwrap();
         std::env::remove_var("SHELBI_HOME");
         assert!(for_alpha.is_none(), "a review-column task is not the running task");
         assert!(for_idle.is_none(), "an unassigned workspace has no running task");

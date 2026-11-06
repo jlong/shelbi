@@ -34,23 +34,19 @@ fn open(project: &str, name: &str) -> Result<()> {
         })?
         .clone();
 
-    // A workspace with a task assigned is driven by the dispatch path, which
-    // owns its agent session — don't open a user shell over it (that would mark
-    // the slot user-occupied and make dispatch skip it). An idle workspace gets
-    // a plain shell in its worktree so the TUI has a session to show.
-    if workspace_has_assigned_task(project, name) {
+    // A busy workspace is driven by the dispatch path, which owns its agent
+    // session — don't open a user shell over it (that would mark the slot
+    // user-occupied and make dispatch skip it). A workspace `status` reports idle
+    // gets a plain shell in its worktree so the TUI has a session to show.
+    if workspace_is_busy(&p, name) {
         return Ok(());
     }
     orch_workspace::open_user_shell(&p, &workspace).map_err(|e| anyhow!(e))
 }
 
-/// Whether any open board task is assigned to `workspace`.
-fn workspace_has_assigned_task(project: &str, workspace: &str) -> bool {
-    super::read_open_board_for_cli(project)
-        .map(|board| {
-            board
-                .iter()
-                .any(|f| f.task.assigned_to.as_deref() == Some(workspace))
-        })
+/// Whether `workspace` is busy, the same answer `shelbi status` reports.
+pub(crate) fn workspace_is_busy(project: &shelbi_core::Project, workspace: &str) -> bool {
+    shelbi_state::BoardOccupancy::read(project)
+        .map(|occupancy| occupancy.of(workspace).is_busy())
         .unwrap_or(false)
 }
