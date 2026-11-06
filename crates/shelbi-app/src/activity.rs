@@ -29,15 +29,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Datelike, Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use shelbi_core::{Column, StatusCategory, DEFAULT_WORKFLOW_NAME};
-use shelbi_state::{events_log_path, WorkspaceState};
+use shelbi_state::{
+    read_event_log_last_lines, read_event_log_recent, WorkspaceState,
+};
 
 use crate::theme::Tone;
 
@@ -842,17 +842,13 @@ impl Event {
 /// sidebar/board read, so even the first cold hydration pass never delays the
 /// sidebar painting.
 pub fn read_activity_data(project_name: &str, cache: &Mutex<ActivityMetaCache>) -> ActivityData {
-    let path = match events_log_path() {
-        Ok(p) => p,
-        Err(e) => return ActivityData::failed(format!("events.log path failed: {e}")),
-    };
-    // Missing log file → empty feed, no error.
-    let text = match fs::read_to_string(&path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+    // Missing log file → empty feed, no error. A bounded read: this re-runs on
+    // every refresh, and it must not empty the feed the moment the log rotates.
+    let read = match read_event_log_recent() {
+        Ok(read) => read,
         Err(e) => return ActivityData::failed(format!("read events.log: {e}")),
     };
-    let events = parse_lines(&text);
+    let events = parse_lines(&read.text());
     let task_cache = resolve_locked(project_name, &events, cache);
     ActivityData {
         events,
@@ -974,13 +970,8 @@ pub fn read_activity_window_staged(
 /// The newest `window` lines of `events.log`, parsed, and whether older ones
 /// exist; the failed read for the status line when the log won't read.
 fn read_window_events(window: usize) -> Result<(Vec<Event>, bool), ActivityData> {
-    let path = events_log_path()
-        .map_err(|e| ActivityData::failed(format!("events.log path failed: {e}")))?;
-    let (text, has_older) = match read_last_lines(&path, window) {
-        Ok(read) => read,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (String::new(), false),
-        Err(e) => return Err(ActivityData::failed(format!("read events.log: {e}"))),
-    };
+    let (text, has_older) = read_event_log_last_lines(window)
+        .map_err(|e| ActivityData::failed(format!("read events.log: {e}")))?;
     Ok((parse_lines(&text), has_older))
 }
 
@@ -998,55 +989,6 @@ fn resolve_locked(
 ) -> TaskCache {
     let mut guard = cache.lock().unwrap_or_else(|p| p.into_inner());
     resolve_task_meta_into(project_name, events, &mut guard, Instant::now())
-}
-
-/// The last `n` non-empty lines of `path` (oldest first, newline-joined), and
-/// whether the file holds older lines before them. Reads backwards in blocks
-/// until it has `n` complete lines or reaches the start, so the cost tracks
-/// `n`, not the file. Non-UTF-8 bytes become replacement characters.
-pub fn read_last_lines(path: &Path, n: usize) -> std::io::Result<(String, bool)> {
-    const BLOCK: u64 = 64 * 1024;
-    let mut f = fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    let mut pos = len;
-    let mut buf: Vec<u8> = Vec::new();
-    // `n + 1` newlines past the first guarantee `n` complete lines even with a
-    // trailing newline and a partial first line.
-    while pos > 0 && buf.iter().filter(|&&b| b == b'\n').count() <= n + 1 {
-        let step = BLOCK.min(pos);
-        pos -= step;
-        f.seek(SeekFrom::Start(pos))?;
-        let mut chunk = vec![0u8; step as usize];
-        f.read_exact(&mut chunk)?;
-        chunk.extend_from_slice(&buf);
-        buf = chunk;
-    }
-    let text = String::from_utf8_lossy(&buf);
-    let mut lines: Vec<&str> = text.lines().collect();
-    // Started mid-file: the first line is (possibly) a fragment of an older one.
-    if pos > 0 && !lines.is_empty() {
-        lines.remove(0);
-    }
-    let mut lines: Vec<&str> = lines.into_iter().filter(|l| !l.trim().is_empty()).collect();
-    let mut has_older = pos > 0;
-    if lines.len() > n {
-        lines.drain(..lines.len() - n);
-        has_older = true;
-    }
-    Ok((lines.join("\n"), has_older))
-}
-
-/// Read everything past `offset` in `path` as UTF-8: the TUI's standalone
-/// process tails the log with this between full reads. Best-effort: non-UTF-8
-/// bytes become replacement chars rather than failing the whole read.
-pub fn read_tail(path: &PathBuf, offset: u64) -> std::io::Result<String> {
-    let mut f = fs::File::open(path)?;
-    if offset > 0 {
-        f.seek(SeekFrom::Start(offset))?;
-    }
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -4729,7 +4671,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
 
     // --- paging: the windowed tail read ---
 
-    fn temp_dir(tag: &str) -> PathBuf {
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "shelbi-activity-{tag}-{}-{}",
             std::process::id(),
@@ -4752,39 +4694,6 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
                 )
             })
             .collect()
-    }
-
-    #[test]
-    fn read_last_lines_pages_from_the_end() {
-        let dir = temp_dir("tail");
-        let path = dir.join("events.log");
-        // Long enough to span several read blocks.
-        fs::write(&path, log_lines(3000)).unwrap();
-        let all: Vec<String> = log_lines(3000).lines().map(str::to_string).collect();
-
-        let (text, older) = read_last_lines(&path, 10).unwrap();
-        assert!(older);
-        assert_eq!(
-            text.lines().collect::<Vec<_>>(),
-            all[2990..].iter().map(String::as_str).collect::<Vec<_>>()
-        );
-
-        let (text, older) = read_last_lines(&path, 2500).unwrap();
-        assert!(older);
-        assert_eq!(text.lines().count(), 2500);
-        assert_eq!(text.lines().next(), Some(all[500].as_str()));
-
-        // A window past the start returns every line and nothing older.
-        let (text, older) = read_last_lines(&path, 5000).unwrap();
-        assert!(!older);
-        assert_eq!(text.lines().count(), 3000);
-
-        // Blank lines don't count; a missing trailing newline is fine.
-        fs::write(&path, "a\n\nb\nc").unwrap();
-        let (text, older) = read_last_lines(&path, 2).unwrap();
-        assert_eq!(text, "b\nc");
-        assert!(older);
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

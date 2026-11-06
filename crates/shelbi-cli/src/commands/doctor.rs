@@ -15,6 +15,9 @@
 //! - the per-token budget file ([`shelbi_state::gh_budget`]) for the live
 //!   `remaining`, falling back to the published board index's last-seen budget.
 //!
+//! It also reports hub-wide health that isn't about any one budget: the macOS
+//! login session, and whether `events.log` rotation is being held back.
+//!
 //! For each budget it projects a time-to-exhaustion (`remaining / rate`) and, when
 //! that is under [`EXHAUSTION_WARN`], prints a warning naming the top callers so an
 //! operator knows which reader to throttle.
@@ -48,6 +51,7 @@ pub fn run(project: Option<String>) -> Result<()> {
     // the most actionable thing `doctor` can surface (it's why agents silently
     // lost DNS/SSH/user lookups).
     report_session_health();
+    report_event_log_rotation();
 
     let cfg = shelbi_state::load_project(&project)
         .map_err(|e| anyhow!(e))?
@@ -108,6 +112,66 @@ fn report_session_health() {
         }
     }
     println!();
+}
+
+/// Report where `events.log` stands against its rotation limits and, when
+/// rotation is being held back, which projects are holding it. Hub-wide, so like
+/// the session check it runs for every project and backend.
+fn report_event_log_rotation() {
+    match shelbi_state::event_log_rotation_status() {
+        Ok(status) => {
+            for line in event_log_rotation_report(&status, Utc::now()) {
+                println!("{line}");
+            }
+        }
+        Err(e) => println!("events.log rotation: unknown ({e})"),
+    }
+    println!();
+}
+
+/// The lines [`report_event_log_rotation`] prints.
+fn event_log_rotation_report(
+    status: &shelbi_state::EventLogRotationStatus,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let (len, limit, ceiling) = (
+        format_mib(status.len),
+        format_mib(status.limit),
+        format_mib(status.ceiling),
+    );
+    if status.len >= status.limit && status.blockers.is_empty() {
+        return vec![format!(
+            "events.log rotation: ok ({len}, over the {limit} limit, rotates on the next event)"
+        )];
+    }
+    if !status.deferred() {
+        return vec![format!("events.log rotation: ok ({len} of {limit})")];
+    }
+    let mut lines = vec![
+        format!("events.log rotation: DEFERRED ({len}, limit {limit}, forced at {ceiling})"),
+        "  ⚠ held back by projects still reading the previous generation:".to_string(),
+    ];
+    for blocker in &status.blockers {
+        let position = match (blocker.cursor, blocker.behind) {
+            (Some(cursor), Some(behind)) => {
+                format!("cursor {cursor}, {} behind", format_mib(behind))
+            }
+            _ => "unreadable cursor".to_string(),
+        };
+        let acked = blocker.last_ack.map_or_else(
+            || "last ack unknown".to_string(),
+            |at| {
+                let age = (now - at).num_seconds() as f64;
+                format!("last acked {} ago", format_duration(age))
+            },
+        );
+        lines.push(format!("    {}: {position}, {acked}", blocker.project));
+    }
+    lines
+}
+
+fn format_mib(bytes: u64) -> String {
+    format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
 }
 
 /// Print one budget's line plus, when the projected exhaustion is under the
@@ -341,6 +405,56 @@ mod tests {
             err_class: Some(class.to_string()),
             cost: None,
         }
+    }
+
+    #[test]
+    fn rotation_report_names_blockers_only_when_deferred() {
+        const MIB: u64 = 1024 * 1024;
+        let now = Utc::now();
+        let mut status = shelbi_state::EventLogRotationStatus {
+            len: 10 * MIB,
+            limit: 8 * MIB,
+            ceiling: 32 * MIB,
+            blockers: vec![
+                shelbi_state::EventLogBlocker {
+                    project: "chartme".to_string(),
+                    cursor: Some(1234),
+                    behind: Some(3 * MIB),
+                    last_ack: Some(now - chrono::Duration::days(2)),
+                },
+                shelbi_state::EventLogBlocker {
+                    project: "garbled".to_string(),
+                    cursor: None,
+                    behind: None,
+                    last_ack: None,
+                },
+            ],
+        };
+        assert_eq!(
+            event_log_rotation_report(&status, now),
+            vec![
+                "events.log rotation: DEFERRED (10.0 MiB, limit 8.0 MiB, forced at 32.0 MiB)",
+                "  ⚠ held back by projects still reading the previous generation:",
+                "    chartme: cursor 1234, 3.0 MiB behind, last acked 2d ago",
+                "    garbled: unreadable cursor, last ack unknown",
+            ]
+        );
+
+        // A lagging cursor under the limit isn't holding anything back yet.
+        status.len = 2 * MIB;
+        assert_eq!(
+            event_log_rotation_report(&status, now),
+            vec!["events.log rotation: ok (2.0 MiB of 8.0 MiB)"]
+        );
+
+        // Over the limit with nothing in the way isn't a deferral, and doesn't
+        // read like one.
+        status.len = 9 * MIB;
+        status.blockers.clear();
+        assert_eq!(
+            event_log_rotation_report(&status, now),
+            vec!["events.log rotation: ok (9.0 MiB, over the 8.0 MiB limit, rotates on the next event)"]
+        );
     }
 
     #[test]

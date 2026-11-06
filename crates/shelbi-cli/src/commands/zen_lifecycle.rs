@@ -184,12 +184,10 @@ fn capture_pane_tail(_pane: &str) -> String {
 /// `project=<project> config-upgrade …` line inside [`SELF_HEAL_LOOKBACK_SECS`].
 /// Best-effort → `false` on any I/O error or a missing log.
 fn recent_config_self_heal(project: &str) -> bool {
-    let Ok(path) = shelbi_state::events_log_path() else {
+    let Ok(read) = shelbi_state::read_event_log_tail(EVENTS_TAIL_BYTES) else {
         return false;
     };
-    let Ok(text) = read_events_tail(&path, EVENTS_TAIL_BYTES) else {
-        return false;
-    };
+    let text = read.text();
     let needle = format!(" project={project} config-upgrade");
     let cutoff = chrono::Utc::now() - chrono::Duration::seconds(SELF_HEAL_LOOKBACK_SECS);
     for line in text.lines().rev() {
@@ -205,21 +203,6 @@ fn recent_config_self_heal(project: &str) -> bool {
         }
     }
     false
-}
-
-/// Tail-read at most `max_bytes` of `path` as lossy UTF-8, seeking rather than
-/// slurping the (unbounded) events log. Mirrors `status::read_tail`.
-fn read_events_tail(path: &std::path::Path, max_bytes: u64) -> std::io::Result<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    let start = len.saturating_sub(max_bytes);
-    if start > 0 {
-        f.seek(SeekFrom::Start(start))?;
-    }
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Bytes of `events.log` tail scanned for a recent self-heal disclosure.

@@ -217,14 +217,15 @@ shelbi events tail --format envelope    # normalized JSON envelopes instead of r
 `--since` accepts `<n>s|m|h|d` (e.g. `30s`, `5m`, `2h`, `1d`); a bare
 integer is seconds. When `--since` is set, `-n` is ignored and every
 matching line is printed. With `--project`, `-n` and `--since` count
-within that project's lines. `tail` reads only the live `events.log`,
-never the rotated `events.log.1` (see [below](#reading-the-log-from-code)).
+within that project's lines. `tail` reads everything retained, the rotated
+`events.log.1` and then the live `events.log` (see
+[below](#reading-the-log-from-code)).
 
-The follow loop polls the file every 250ms, holding back the final
-fragment until its newline arrives so you never see a half-written event.
-If the file is truncated or rotated underneath it (`len < offset`), it
-restarts from the top rather than silently dropping the next writer's
-content.
+The follow loop polls every 250ms, holding back the final fragment until its
+newline arrives so you never see a half-written event. It tracks a logical
+offset rather than a position in one file, so a rotation between two polls
+doesn't lose a line. If the log is replaced underneath it, it restarts from the
+oldest retained line.
 
 ```text
 2026-06-22T14:24:03+00:00 project=myapp task=fix-login workflow=task backlog -> todo reason=user:cli from_category=backlog to_category=ready
@@ -288,6 +289,12 @@ contract is:
   `events.log.1` (one older generation kept) and tracks offsets in
   `events.log.index.json`. Don't truncate or rotate it yourself; read
   `events.log.1` too if you need older history.
+- Rotation waits while a registered project that has acked events in the last
+  7 days still needs `events.log.1`, up to 32 MiB. Past that, rotation proceeds
+  and each project that lost history gets a line in the new file:
+  `project=<name> event-log data-lost reason=<ceiling|idle|unregistered> cursor=<n> earliest=<n> lost_bytes=<n>`.
+  [`shelbi doctor`](/docs/cli/doctor) shows a deferred rotation and which
+  projects are blocking it.
 - One line per event, RFC3339 timestamp first, ASCII fields separated
   by single spaces.
 - Every state line leads with a `project=<name>` scope; match on the

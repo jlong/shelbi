@@ -22,9 +22,8 @@
 //! [`FeedRow`] out in cells), so both clients show the same rows, in the same
 //! order, with the same glyphs.
 
-use std::fs;
 use std::sync::Mutex;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use ratatui::{
@@ -39,11 +38,10 @@ pub use shelbi_app::activity::{
     parse_event_line, ActivityData, ActivityFilter, ActivityKind, ActivityMetaCache, Event,
 };
 use shelbi_app::activity::{
-    build_feed, read_tail, resolve_task_meta_into, FeedItem, FeedRow, Secondary, TaskCache,
+    build_feed, resolve_task_meta_into, FeedItem, FeedRow, Secondary, TaskCache,
 };
 use shelbi_app::theme::Tone;
 use shelbi_state::keymap::{load_keymaps, ActivityAction, DisplayStyle, Keymaps};
-use shelbi_state::events_log_path;
 
 use crate::theme::palette;
 use crate::keymap::format_chord_or_unbound;
@@ -75,10 +73,9 @@ pub struct ActivityApp {
     /// Parsed events, oldest → newest (file order). Iterate `.rev()`
     /// for rendering so newest sits at the top of the feed.
     pub events: Vec<Event>,
-    /// Bytes already consumed from `events.log` — lets `refresh` only
-    /// read the tail on subsequent ticks.
+    /// Logical offset already consumed from `events.log` — lets `refresh` only
+    /// read what's new on subsequent ticks, across rotations.
     log_offset: u64,
-    log_mtime: Option<SystemTime>,
     /// The render snapshot — the latest resolved metadata the feed draws from. On
     /// the shell path it is folded in by [`apply_activity_data`](Self::apply_activity_data);
     /// on the standalone path it is the snapshot [`resolve_task_meta`](Self::resolve_task_meta)
@@ -138,7 +135,6 @@ impl ActivityApp {
             project_name,
             events: Vec::new(),
             log_offset: 0,
-            log_mtime: None,
             task_cache: TaskCache::new(),
             meta_cache: ActivityMetaCache::default(),
             last_refresh: Instant::now() - Duration::from_secs(60),
@@ -255,57 +251,31 @@ impl ActivityApp {
         }
     }
 
-    /// Re-read the events log if it's grown or rotated. Cheap when
-    /// nothing has changed (mtime + size check then early return).
-    /// Errors surface in `status_line` rather than panicking — a
-    /// missing log file is a normal startup condition.
+    /// Read whatever the events log has gained. Cheap when nothing has
+    /// changed. Errors surface in `status_line` rather than panicking — a
+    /// missing log file is a normal startup condition (an empty read).
     pub fn refresh(&mut self) {
         self.last_refresh = Instant::now();
-        let path = match events_log_path() {
-            Ok(p) => p,
-            Err(e) => {
-                self.fail_status(format!("events.log path failed: {e}"));
-                return;
-            }
-        };
-        let meta = match fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => {
-                // No log file yet — empty feed, no error.
-                self.events.clear();
-                self.log_offset = 0;
-                self.log_mtime = None;
-                return;
-            }
-        };
-        let len = meta.len();
-        let mtime = meta.modified().ok();
-
-        // File shrank (rotated / truncated) — re-read from the top.
-        if len < self.log_offset {
-            self.events.clear();
-            self.log_offset = 0;
-        }
-
-        // Nothing new since last tick.
-        if len == self.log_offset && self.log_mtime == mtime {
-            return;
-        }
-
-        // Read everything we haven't seen yet. The file is small
-        // (a few thousand lines is typical), so even a full re-read
-        // is cheap; reading only the tail is the common path.
-        let text = match read_tail(&path, self.log_offset) {
-            Ok(t) => t,
+        let read = match shelbi_state::read_event_log_since(self.log_offset) {
+            Ok(read) => read,
             Err(e) => {
                 self.fail_status(format!("read events.log: {e}"));
                 return;
             }
         };
-        self.log_offset = len;
-        self.log_mtime = mtime;
 
-        for line in text.lines() {
+        // The log was replaced underneath us — what we hold is gone with it.
+        if read.start < self.log_offset {
+            self.events.clear();
+        }
+        self.log_offset = read.head;
+
+        // Nothing new since last tick.
+        if read.bytes.is_empty() {
+            return;
+        }
+
+        for line in read.text().lines() {
             if line.trim().is_empty() {
                 continue;
             }
@@ -345,7 +315,7 @@ impl ActivityApp {
     /// Fold a freshly-read [`ActivityData`] in — the in-memory half of a refresh.
     /// Replaces the event list and task-meta cache; scroll / auto-scroll / filter
     /// state live on the app and are untouched, so the feed stays where the user
-    /// left it. The incremental `log_offset` / `log_mtime` are reset so a later
+    /// left it. The incremental `log_offset` is reset so a later
     /// call to [`refresh`](Self::refresh) (if any) re-reads cleanly.
     pub(crate) fn apply_activity_data(&mut self, data: ActivityData) {
         if let Some(msg) = data.status {
@@ -356,7 +326,6 @@ impl ActivityApp {
         // A full re-read superseded the incremental offset; forget it so a mixed
         // caller (shell apply then a standalone-style refresh) doesn't skip lines.
         self.log_offset = 0;
-        self.log_mtime = None;
         self.last_refresh = Instant::now();
     }
 
