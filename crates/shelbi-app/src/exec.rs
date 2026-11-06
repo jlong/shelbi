@@ -211,6 +211,26 @@ pub enum ExecError {
     /// The backend refused or failed the operation.
     #[error("{0}")]
     Backend(String),
+    /// The daemon is shutting down and took no new work: nothing was changed,
+    /// and the same request can be sent again. What a caller sees only once the
+    /// client's own retries (`exec_daemon::retry_through_drain`) ran out.
+    #[error("{0}")]
+    ShuttingDown(String),
+    /// The daemon didn't answer in time. Unlike the others this says nothing
+    /// about the change itself: it may still land.
+    #[error("no answer from the daemon")]
+    NoAnswer,
+}
+
+impl ExecError {
+    /// This error with the far machine it came from named in its message: the
+    /// message a remote window shows, the kind (and so any retry) unchanged.
+    pub(crate) fn with_host(self, host: &str) -> Self {
+        match self {
+            ExecError::ShuttingDown(m) => ExecError::ShuttingDown(format!("{host}: {m}")),
+            other => ExecError::Backend(format!("{host}: {other}")),
+        }
+    }
 }
 
 /// The seam the registry calls to perform a command's [`Effect`].

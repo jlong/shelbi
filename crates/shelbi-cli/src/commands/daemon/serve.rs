@@ -146,6 +146,28 @@ const MAX_EVENT_BODY_BYTES: usize = 4000;
 /// client can't hold up a supervisor-initiated restart indefinitely.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// How long a starting daemon retries a busy bind lock before deciding another
+/// daemon holds it. Every client's liveness probe takes that lock for a moment
+/// ([`shelbi_state::daemon_lock_held`]), and a daemon that lost to a probe must
+/// not exit over it. A real holder keeps it far longer than this.
+const BIND_LOCK_RETRY: Duration = Duration::from_millis(500);
+/// How often a start retries a busy bind lock.
+const BIND_LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// How long a takeover successor waits for the daemon it replaces to release the
+/// bind lock. The predecessor holds it through its whole shutdown: up to
+/// [`shelbi_state::DAEMON_JOB_DRAIN`] for control jobs and then up to
+/// [`SHUTDOWN_DRAIN_TIMEOUT`] for hub handlers (see [`serve`]). Derived from both
+/// so it can't fall behind them, with [`TAKEOVER_SLACK_SECS`] for a loaded host.
+/// Past this the predecessor is wedged and the takeover has failed.
+const TAKEOVER_WAIT: Duration = Duration::from_secs(
+    shelbi_state::DAEMON_JOB_DRAIN.as_secs()
+        + SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+        + TAKEOVER_SLACK_SECS,
+);
+const TAKEOVER_SLACK_SECS: u64 = 12;
+const TAKEOVER_WAIT_ENV: &str = "SHELBI_DAEMON_TAKEOVER_WAIT_MS";
+
 /// Upper bound on the number of outstanding (unacked) messages the daemon
 /// tracks at once. Every entry eventually becomes either an `ack=worker`
 /// or a synthesized `ack=timeout` line in `events.log`, so an unbounded
@@ -225,6 +247,23 @@ impl Daemon {
 /// individual clients are swallowed (logged to stderr) so the daemon
 /// keeps serving the rest of the fleet.
 pub(super) fn run_foreground() -> Result<()> {
+    serve_foreground(BIND_LOCK_RETRY)
+}
+
+/// The foreground entry for a successor taking over from a daemon that is
+/// standing down (`shelbi daemon run --takeover`): the same daemon, except it
+/// waits out the predecessor's drain for the bind lock rather than losing to it.
+/// Failing to come up is the end of the recovery attempt that launched it, so it
+/// is recorded before exiting; nothing else would ever close that attempt out.
+pub(super) fn run_takeover() -> Result<()> {
+    serve_foreground(duration_from_env_ms(TAKEOVER_WAIT_ENV, TAKEOVER_WAIT)).inspect_err(|e| {
+        eprintln!("shelbi daemon: takeover failed: {e}");
+        super::session_health::takeover_failed();
+    })
+}
+
+/// [`run_foreground`], waiting up to `lock_wait` for the bind lock.
+fn serve_foreground(lock_wait: Duration) -> Result<()> {
     // Give the hub the descriptor headroom launchd's 256 soft limit denies it:
     // the daemon holds a descriptor per open client connection plus every
     // throwaway session probe its pollers make, and hitting the cap wedges the
@@ -244,7 +283,7 @@ pub(super) fn run_foreground() -> Result<()> {
     // daemons racing through startup can't both hold it, so only the
     // winner ever probes/unlinks/binds/removes the socket — the loser
     // errors out here without touching the winner's live socket.
-    let _bind_lock = acquire_bind_lock(&sock)?;
+    let _bind_lock = acquire_bind_lock(&sock, lock_wait)?;
     prepare_socket(&sock)?;
     prune_stale_control_masters();
     reconcile_forward_modes();
@@ -306,6 +345,13 @@ pub(super) fn run_foreground() -> Result<()> {
 
     install_shutdown_listener(stop.clone(), sock.clone())?;
     spawn_reaper(daemon.clone(), stop.clone());
+    // macOS only: detect a lost GUI login session (user logged out/in while the
+    // daemon kept running) and recover by re-execing into the live session, or
+    // warn. A hermetic no-op on non-macOS, when disabled, and under a non-default
+    // root (every test). See `super::session_health`. Started before the pollers
+    // so a marker left by a predecessor closes the spawn gate before anything can
+    // spawn through it.
+    super::session_health::spawn_session_health_monitor(stop.clone(), sock.clone());
     // The single board reader per hub: one refresh loop per open project,
     // publishing `board-index.json` on each project's configured cadence.
     super::board::spawn_refresh_manager(daemon.board.clone(), stop.clone());
@@ -323,11 +369,6 @@ pub(super) fn run_foreground() -> Result<()> {
         duration_from_env_ms(IDLE_POLL_ENV, IDLE_POLL),
         || daemon_is_idle(shelbi_state::list_open_projects()),
     );
-    // macOS only: detect a lost GUI login session (user logged out/in while the
-    // daemon kept running) and recover by re-execing into the live session, or
-    // warn. A hermetic no-op on non-macOS, when disabled, and under a non-default
-    // root (every test). See `super::session_health`.
-    super::session_health::spawn_session_health_monitor(stop.clone(), sock.clone());
 
     // The mutation control socket, bound and accepting BEFORE the hub serve loop
     // below starts answering hellos — so a client that waits on hub.sock and
@@ -336,6 +377,8 @@ pub(super) fn run_foreground() -> Result<()> {
     // same `stop` flag, so SIGTERM stops both.
     let control_sock = shelbi_state::control_socket_path().map_err(|e| anyhow!(e))?;
     let control_listener = super::control::bind(&control_sock)?;
+    let jobs = super::control::ControlJobs::new(stop.clone());
+    let control_close = Arc::new(AtomicBool::new(false));
     {
         // The lifecycle ops carry the shared stop flag + hub socket so a
         // `QuitShelbi` control command can stop this daemon (Phase 4f).
@@ -343,13 +386,15 @@ pub(super) fn run_foreground() -> Result<()> {
             stop: stop.clone(),
             hub_sock: sock.clone(),
         });
-        let control_state = super::control::ControlState::production(lifecycle);
-        let stop = stop.clone();
-        thread::spawn(move || super::control::serve(control_listener, control_state, stop));
+        let control_state = super::control::ControlState::production(lifecycle, jobs.clone());
+        let close = control_close.clone();
+        thread::spawn(move || super::control::serve(control_listener, control_state, close));
     }
 
-    serve(&listener, &daemon, &stop);
+    serve(&listener, &daemon, &stop, &jobs, shelbi_state::DAEMON_JOB_DRAIN);
 
+    // Only now: until here the control socket told late clients to retry.
+    control_close.store(true, Ordering::SeqCst);
     let _ = fs::remove_file(&control_sock);
     let _ = fs::remove_file(&sock);
     // Best-effort: drop the PID file so the next start's cleanup
@@ -507,10 +552,12 @@ impl Drop for LiveGuard {
 /// signal listener flips it and wakes the blocking `accept()` with a
 /// self-connect), then:
 ///
-/// 1. keeps accepting in non-blocking mode until the listen backlog is
-///    empty — a client whose `connect()` succeeded before the flag
-///    flipped already considers its write in flight, so we must read it
-///    rather than exit with it queued, and
+/// 1. keeps accepting in non-blocking mode until the control `jobs` have
+///    finished (up to `job_drain`) and the listen backlog is empty. A client
+///    whose `connect()` succeeded before the flag flipped already considers its
+///    write in flight, so we must read it rather than exit with it queued. And
+///    a job may be minutes from done, during which workers still send events
+///    and clients still probe: a daemon finishing a merge must not look wedged.
 /// 2. waits (up to [`SHUTDOWN_DRAIN_TIMEOUT`]) for every spawned handler
 ///    to finish, so an accepted connection is never dropped mid-dispatch
 ///    by process exit.
@@ -519,11 +566,22 @@ impl Drop for LiveGuard {
 /// a daemon restart can't silently eat an event: either the handler
 /// finishes (event lands, client sees the ack) or the client never gets
 /// the ack and its file fallback fires.
-fn serve(listener: &UnixListener, daemon: &Daemon, stop: &Arc<AtomicBool>) {
+fn serve(
+    listener: &UnixListener,
+    daemon: &Daemon,
+    stop: &Arc<AtomicBool>,
+    jobs: &super::control::ControlJobs,
+    job_drain: Duration,
+) {
     let live = Arc::new(AtomicUsize::new(0));
+    let mut job_deadline = None;
     for incoming in listener.incoming() {
         match incoming {
             Ok(stream) => {
+                // On macOS/BSD an accepted socket inherits the listener's
+                // non-blocking mode (entered below), which would make the
+                // handler's first read fail and drop the client unread.
+                let _ = stream.set_nonblocking(false);
                 let daemon = daemon.clone();
                 live.fetch_add(1, Ordering::SeqCst);
                 let guard = LiveGuard(live.clone());
@@ -533,31 +591,70 @@ fn serve(listener: &UnixListener, daemon: &Daemon, stop: &Arc<AtomicBool>) {
                 });
             }
             // Non-blocking mode (entered below once stop is set) reports
-            // an empty backlog as WouldBlock — that's the drained-clean
-            // exit path.
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            // an empty backlog as WouldBlock — the exit path once the control
+            // jobs are done, and until then just a pause between clients.
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let out_of_time = job_deadline.is_none_or(|d| Instant::now() >= d);
+                if jobs.is_idle() || out_of_time {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
             Err(e) => {
                 eprintln!("shelbi daemon: accept error: {e}");
             }
         }
-        if stop.load(Ordering::SeqCst) {
+        if job_deadline.is_none() && stop.load(Ordering::SeqCst) {
             // Drain whatever the kernel already queued without blocking
             // for new clients. If the mode switch fails we can't drain
             // safely — bail and rely on the handler wait below.
             if listener.set_nonblocking(true).is_err() {
                 break;
             }
+            job_deadline = Some(Instant::now() + job_drain);
+            announce_draining(jobs);
         }
     }
 
-    let deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
-    while live.load(Ordering::SeqCst) > 0 && Instant::now() < deadline {
+    // A quit arriving just now still runs (see `control::handle_client`), so the
+    // jobs are checked again here along with the handlers.
+    let hub_deadline = Instant::now() + SHUTDOWN_DRAIN_TIMEOUT;
+    let job_deadline = job_deadline.unwrap_or(hub_deadline).max(hub_deadline);
+    loop {
+        let now = Instant::now();
+        let handlers_done = live.load(Ordering::SeqCst) == 0 || now >= hub_deadline;
+        let jobs_done = jobs.is_idle() || now >= job_deadline;
+        if handlers_done && jobs_done {
+            break;
+        }
         thread::sleep(Duration::from_millis(10));
     }
     let leftover = live.load(Ordering::SeqCst);
     if leftover > 0 {
         eprintln!("shelbi daemon: exiting with {leftover} client connection(s) still open");
     }
+    report_abandoned_jobs(jobs);
+}
+
+/// Say on the daemon's stderr what the shutdown is waiting for, when anything.
+fn announce_draining(jobs: &super::control::ControlJobs) {
+    let running = jobs.running();
+    if !running.is_empty() {
+        eprintln!("shelbi daemon: waiting for {} job(s): {}", running.len(), running.join(" "));
+    }
+}
+
+/// A job still running now dies with this process, possibly half-applied. Say
+/// which on `events.log`, the place someone looks afterwards: the daemon's own
+/// stderr usually goes nowhere.
+fn report_abandoned_jobs(jobs: &super::control::ControlJobs) {
+    let running = jobs.running();
+    if running.is_empty() {
+        return;
+    }
+    let names = running.join(",");
+    eprintln!("shelbi daemon: exiting with {} job(s) still running: {names}", running.len());
+    let _ = shelbi_state::append_daemon_event("shutdown-abandoned-jobs", &names);
 }
 
 /// Spawn the unacked-message reaper thread. Wakes every [`REAPER_TICK`],
@@ -711,7 +808,11 @@ fn ensure_socket_dir(sock: &Path) -> Result<()> {
 /// third daemon lock a *fresh* inode while the second still holds the
 /// old one, recreating the race the lock exists to close. An orphaned
 /// `hub.sock.lock` is inert: `flock` locks die with the holder.
-fn acquire_bind_lock(sock: &Path) -> Result<fs::File> {
+///
+/// A held lock is retried until `wait` elapses: [`BIND_LOCK_RETRY`] for any start,
+/// to wait out a liveness probe, and [`TAKEOVER_WAIT`] for a successor waiting out
+/// its predecessor's shutdown (see [`run_takeover`]).
+fn acquire_bind_lock(sock: &Path, wait: Duration) -> Result<fs::File> {
     let mut lock_os = sock.as_os_str().to_os_string();
     lock_os.push(".lock");
     let lock_path = PathBuf::from(lock_os);
@@ -722,17 +823,28 @@ fn acquire_bind_lock(sock: &Path) -> Result<fs::File> {
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("opening daemon lock file {}", lock_path.display()))?;
-    // SAFETY: `flock` on a valid fd we own; no memory is dereferenced.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
+    let deadline = Instant::now() + wait;
+    loop {
+        // SAFETY: `flock` on a valid fd we own; no memory is dereferenced.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(file);
+        }
         let err = std::io::Error::last_os_error();
-        return Err(anyhow!(
-            "another shelbi daemon holds {} ({err}) — refusing to start \
-             (stop the other daemon, or check `shelbi daemon status`)",
-            lock_path.display()
-        ));
+        match err.kind() {
+            std::io::ErrorKind::Interrupted => continue,
+            std::io::ErrorKind::WouldBlock if Instant::now() < deadline => {
+                thread::sleep(BIND_LOCK_POLL);
+            }
+            _ => {
+                return Err(anyhow!(
+                    "another shelbi daemon holds {} ({err}) — refusing to start \
+                     (stop the other daemon, or check `shelbi daemon status`)",
+                    lock_path.display()
+                ));
+            }
+        }
     }
-    Ok(file)
 }
 
 /// Make sure the socket file itself is free for `bind()`. A leftover
@@ -1749,6 +1861,26 @@ mod tests {
     /// F4: the bind lock is exclusive for its lifetime and reacquirable
     /// after release — two daemons racing through startup can't both
     /// hold it, so only one ever unlinks/binds the socket.
+    /// A liveness probe takes the real lock for a moment. A daemon starting in
+    /// that moment waits it out rather than exiting ("another daemon holds it").
+    #[test]
+    fn a_probe_holding_the_bind_lock_for_a_moment_does_not_stop_a_start() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("hub.sock");
+        let lock_path = dir.path().join("hub.sock.lock");
+        let probe = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&lock_path).unwrap();
+        // SAFETY: flock on a valid fd we own.
+        assert_eq!(unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(40));
+            drop(probe);
+        });
+        acquire_bind_lock(&sock, BIND_LOCK_RETRY)
+            .expect("a momentary holder must not stop the start");
+        release.join().unwrap();
+    }
+
     #[test]
     fn acquire_bind_lock_is_exclusive_and_releases_on_drop() {
         let dir = std::env::temp_dir().join(format!(
@@ -1762,8 +1894,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("hub.sock");
 
-        let first = acquire_bind_lock(&sock).expect("first lock");
-        let second = acquire_bind_lock(&sock);
+        let first = acquire_bind_lock(&sock, Duration::ZERO).expect("first lock");
+        let second = acquire_bind_lock(&sock, Duration::ZERO);
         assert!(second.is_err(), "second lock must be refused while held");
         assert!(
             second
@@ -1773,7 +1905,38 @@ mod tests {
             "error should name the culprit"
         );
         drop(first);
-        acquire_bind_lock(&sock).expect("relock after release");
+        acquire_bind_lock(&sock, Duration::ZERO).expect("relock after release");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A takeover successor outwaits a holder that releases within the bound, and
+    /// still gives up on one that doesn't.
+    #[test]
+    fn acquire_bind_lock_waits_out_a_holder_only_up_to_the_bound() {
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-daemon-lock-wait-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("hub.sock");
+
+        let holder = acquire_bind_lock(&sock, Duration::ZERO).expect("holder");
+        assert!(
+            acquire_bind_lock(&sock, Duration::from_millis(150)).is_err(),
+            "a holder that outlasts the bound still wins"
+        );
+
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(holder);
+        });
+        acquire_bind_lock(&sock, Duration::from_secs(10))
+            .expect("the waiter takes the lock once the holder lets go");
+        release.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1879,7 +2042,8 @@ mod tests {
         let daemon = test_daemon();
         let stop = Arc::new(AtomicBool::new(false));
         let (stop2, daemon2) = (stop.clone(), daemon.clone());
-        let server = thread::spawn(move || serve(&listener, &daemon2, &stop2));
+        let jobs = super::super::control::ControlJobs::new(stop.clone());
+        let server = thread::spawn(move || serve(&listener, &daemon2, &stop2, &jobs, Duration::ZERO));
 
         // Connect (so the accept happens) but hold the write back until
         // after shutdown starts — this is exactly the window the old
@@ -1905,6 +2069,67 @@ mod tests {
             1,
             "drained event must land exactly once: {log}"
         );
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// A shutdown waiting on a control job keeps serving the hub socket: a worker
+    /// event sent during a long merge lands, even on macOS where a socket
+    /// accepted in the drain would otherwise inherit non-blocking mode.
+    #[test]
+    fn the_hub_keeps_serving_clients_until_the_control_jobs_finish() {
+        let _iso = IsolatedShelbiHome::new("jobdrain");
+        let sock = PathBuf::from(format!("/tmp/shb-jobdrain-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let jobs = super::super::control::ControlJobs::new(stop.clone());
+        let job = jobs.begin_for_test("slow");
+        let server = {
+            let (stop, jobs, daemon) = (stop.clone(), jobs.clone(), test_daemon());
+            thread::spawn(move || serve(&listener, &daemon, &stop, &jobs, Duration::from_secs(30)))
+        };
+        stop.store(true, Ordering::SeqCst);
+        let _ = UnixStream::connect(&sock); // the shutdown wake-up poke
+        thread::sleep(Duration::from_millis(100));
+        assert!(!server.is_finished(), "serve must wait for the running job");
+
+        let client = UnixStream::connect(&sock).unwrap();
+        thread::sleep(Duration::from_millis(50)); // accepted before anything is written
+        (&client)
+            .write_all(b"{\"verb\":\"event\",\"project\":\"shelbi\",\"line\":\"note=midjob\"}\n")
+            .unwrap();
+        let mut ack = [0u8; 3];
+        (&client).read_exact(&mut ack).unwrap();
+        assert_eq!(&ack, shelbi_state::DAEMON_ACK);
+        drop(client);
+
+        drop(job);
+        server.join().unwrap();
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(log.contains("note=midjob"), "log: {log}");
+        assert!(!log.contains("shutdown-abandoned-jobs"), "log: {log}");
+        let _ = std::fs::remove_file(&sock);
+    }
+
+    /// The drain is bounded: a job that never ends can't hold the daemon up
+    /// forever, and it is named on `events.log` since it may be half-applied.
+    #[test]
+    fn a_job_past_the_drain_deadline_is_abandoned_and_named() {
+        let _iso = IsolatedShelbiHome::new("jobabandon");
+        let sock = PathBuf::from(format!("/tmp/shb-jobabn-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let jobs = super::super::control::ControlJobs::new(stop.clone());
+        let _job = jobs.begin_for_test("approve:p/t1");
+        stop.store(true, Ordering::SeqCst);
+        let _ = UnixStream::connect(&sock); // the shutdown wake-up poke
+
+        serve(&listener, &test_daemon(), &stop, &jobs, Duration::from_millis(50));
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(log.contains("shutdown-abandoned-jobs"), "log: {log}");
+        assert!(log.contains("approve:p/t1"), "log: {log}");
         let _ = std::fs::remove_file(&sock);
     }
 

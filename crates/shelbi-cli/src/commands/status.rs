@@ -6,7 +6,7 @@
 //! - `shelbi status` — one-line-per-section human summary
 //!   (`board:`, `workspaces:`, `zen:`, `handoff:`). Read-only, side-effect free.
 //! - `shelbi status --full` — the full orchestrator bootstrap payload:
-//!   board (all columns), workspaces (idle vs in-progress), zen (mode +
+//!   board (all columns), workspaces (idle vs busy), zen (mode +
 //!   crash flag), and a handoff-presence line. Idempotent — safe to
 //!   re-run. Does NOT print `HANDOFF.md` contents and does NOT delete
 //!   anything.
@@ -24,12 +24,12 @@
 //! snapshot path.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use clap::Subcommand;
-use shelbi_core::{Column, IntegrationMode, MachineKind, Project, StatusCategory};
+use shelbi_core::{IntegrationMode, MachineKind, Project, StatusCategory};
 use shelbi_state::{read_state, ZenModeState};
 
 use super::require_project;
@@ -139,7 +139,7 @@ fn print_summary(project: &str) -> Result<()> {
     if idle + busy == 0 {
         println!("workspaces: (none declared)");
     } else {
-        println!("workspaces: {idle} idle, {busy} in-progress");
+        println!("workspaces: {idle} idle, {busy} busy");
     }
 
     let zen = zen_snapshot(project)?;
@@ -674,33 +674,18 @@ fn category_counts(project: &str) -> Result<CategoryCounts> {
     Ok(c)
 }
 
-/// Count declared workspaces bucketed into idle / in-progress. Reads the
-/// project YAML for the declared pool and the `in_progress` column for
-/// assignment. Also used by the daemon version gate to decide whether an
-/// automatic daemon restart is safe.
+/// Count declared workspaces bucketed into idle / busy
+/// ([`shelbi_state::SlotOccupancy::is_busy`]). Also used by the daemon version
+/// gate to decide whether an automatic daemon restart is safe.
 pub(crate) fn workspace_idle_busy(project: &str) -> Result<(usize, usize)> {
     let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    // The in-progress column comes from the daemon-owned index (§5), filtered in
-    // memory — never a backend `list_in_status` sweep from this CLI.
-    let in_progress: Vec<_> = shelbi_state::read_board(project)
-        .map_err(|e| anyhow!(e))?
-        .into_issues()
-        .into_iter()
-        .filter(|tf| tf.task.column == Column::in_progress())
-        .collect();
-    let mut idle = 0usize;
-    let mut busy = 0usize;
-    for w in &p.workspaces {
-        let has_task = in_progress
-            .iter()
-            .any(|tf| tf.task.assigned_to.as_deref() == Some(w.name.as_str()));
-        if has_task {
-            busy += 1;
-        } else {
-            idle += 1;
-        }
-    }
-    Ok((idle, busy))
+    let occupancy = shelbi_state::BoardOccupancy::read(&p).map_err(|e| anyhow!(e))?;
+    let busy = p
+        .workspaces
+        .iter()
+        .filter(|w| occupancy.of(&w.name).is_busy())
+        .count();
+    Ok((p.workspaces.len() - busy, busy))
 }
 
 #[derive(Debug)]
@@ -760,22 +745,17 @@ fn zen_snapshot(project: &str) -> Result<ZenSnapshot> {
 /// summary already prints the mode, so a missing signal degrades to "no
 /// crash flag" and the orchestrator's first reply is unaffected.
 fn has_recent_crash_event(project: &str) -> Result<bool> {
-    let path = match shelbi_state::events_log_path() {
-        Ok(p) => p,
+    let read = match shelbi_state::read_event_log_tail(CRASH_EVENT_TAIL_BYTES) {
+        Ok(read) => read,
         Err(_) => return Ok(false),
     };
-    let tail = match read_tail(&path, CRASH_EVENT_TAIL_BYTES) {
-        Ok(t) => t,
-        Err(_) => return Ok(false),
-    };
+    let tail = read.text();
     let needle_project = format!(" project={project} ");
     let cutoff = Utc::now() - Duration::seconds(CRASH_EVENT_MAX_AGE_SECS);
     // Newest-first. The first crash line whose timestamp is inside the
-    // window wins; a line whose timestamp doesn't parse (or the partial
-    // leading line left by a mid-line seek) is skipped rather than
-    // trusted. Because we seek to a byte offset, an ancient crash beyond
-    // the tail chunk is simply not seen — which is also beyond the age
-    // window, so the answer is the same.
+    // window wins; a line whose timestamp doesn't parse is skipped rather
+    // than trusted. An ancient crash beyond the tail chunk is simply not
+    // seen — which is also beyond the age window, so the answer is the same.
     for line in tail.lines().rev() {
         if line.contains(&needle_project)
             && line.contains("zen=off")
@@ -789,24 +769,6 @@ fn has_recent_crash_event(project: &str) -> Result<bool> {
         }
     }
     Ok(false)
-}
-
-/// Read at most the last `max_bytes` of `path` as (lossy) UTF-8, seeking
-/// to the tail rather than reading the whole file. A file shorter than
-/// `max_bytes` is returned whole. When the seek lands mid-line the
-/// caller's per-line scan drops the partial leading fragment (it can't
-/// match a full crash-recovery line, and its timestamp won't parse).
-fn read_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    let start = len.saturating_sub(max_bytes);
-    if start > 0 {
-        f.seek(SeekFrom::Start(start))?;
-    }
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    f.read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Parse the leading RFC3339 timestamp off an `events.log` line. Every
@@ -824,8 +786,101 @@ fn event_line_timestamp(line: &str) -> Option<DateTime<Utc>> {
 mod tests {
     use super::*;
     use crate::commands::test_support::ENV_LOCK as TEST_LOCK;
-    use shelbi_core::{default_project_statuses, ProjectStatuses, GIB};
+    use shelbi_core::{default_project_statuses, Column, ProjectStatuses, GIB};
     use std::path::PathBuf;
+
+    /// `status`, `open` and the machines view all answer from
+    /// [`shelbi_state::BoardOccupancy`], so they can't disagree about a slot. The
+    /// board covers each shape the old per-view predicates drifted on: a running
+    /// gate, a dev slot with a queued review, a loaded review, a pre-assignment.
+    #[test]
+    fn status_open_and_machines_report_the_same_occupancy() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::write(
+            home.join("projects").join("occ.yaml"),
+            "name: occ\n\
+repo: /tmp/occ\n\
+default_branch: main\n\
+orchestrator:\n\
+\x20 runner: claude\n\
+agent_runners:\n\
+\x20 claude:\n\
+\x20\x20\x20 command: claude\n\
+\x20\x20\x20 flags: []\n\
+machines:\n\
+\x20 - name: local\n\
+\x20\x20\x20 kind: local\n\
+\x20\x20\x20 work_dir: /tmp/occ\n\
+workspaces:\n\
+\x20 - { name: gate-slot, machine: local }\n\
+\x20 - { name: handed-off, machine: local }\n\
+\x20 - { name: preassigned, machine: local }\n\
+\x20 - { name: idle, machine: local }\n\
+\x20 - { name: review-1, machine: local, tags: [review] }\n",
+        )
+        .unwrap();
+        let workflows = shelbi_state::workflows_dir("occ").unwrap();
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(
+            workflows.join("statuses.yaml"),
+            "statuses:\n\
+\x20 - { id: backlog, name: Backlog, category: backlog }\n\
+\x20 - { id: todo, name: Todo, category: ready }\n\
+\x20 - { id: in-progress, name: InProgress, category: active }\n\
+\x20 - { id: adversarial-review, name: Gate, category: active }\n\
+\x20 - { id: review, name: Review, category: handoff }\n\
+\x20 - { id: done, name: Done, category: done }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workflows.join("default.yaml"),
+            "name: default\n\
+statuses:\n\
+\x20 - { id: backlog, owner: user }\n\
+\x20 - { id: todo, owner: agent, agent: orchestrator }\n\
+\x20 - { id: in-progress, owner: agent, agent: developer }\n\
+\x20 - { id: adversarial-review, owner: agent, agent: adversarial-review }\n\
+\x20 - { id: review, owner: user }\n\
+\x20 - { id: done, owner: user }\n",
+        )
+        .unwrap();
+        for (id, column, workspace) in [
+            ("t-gate", "adversarial-review", "gate-slot"),
+            ("t-queued", "review", "handed-off"),
+            ("t-next", "todo", "preassigned"),
+            ("t-loaded", "review", "review-1"),
+        ] {
+            let mut issue = ifile(id, column).task;
+            issue.assigned_to = Some(workspace.to_string());
+            shelbi_state::save_task("occ", &issue, "").unwrap();
+        }
+
+        let project = shelbi_state::load_project("occ").unwrap();
+        let open_refuses: Vec<&str> = project
+            .workspaces
+            .iter()
+            .filter(|w| super::super::open::workspace_is_busy(&project, &w.name))
+            .map(|w| w.name.as_str())
+            .collect();
+        assert_eq!(open_refuses, ["gate-slot", "review-1"]);
+
+        assert_eq!(workspace_idle_busy("occ").unwrap(), (3, open_refuses.len()));
+
+        let model = shelbi_orchestrator::machines_model::read_machines_model("occ").unwrap();
+        let machines_busy: Vec<String> = model
+            .machines
+            .iter()
+            .flat_map(|m| &m.workspaces)
+            .filter(|w| w.assignment.task().is_some())
+            .map(|w| w.name.clone())
+            .collect();
+        assert_eq!(machines_busy, open_refuses);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn disk_warning_fires_below_threshold_and_is_quiet_above() {

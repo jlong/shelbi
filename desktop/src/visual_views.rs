@@ -715,7 +715,7 @@ workspaces:
     task("b2", "Sync the board's column widths with the TUI", Column::backlog(), None);
     task("c1", "Restyle the command palette", Column::todo(), None);
     task("t2", LONG_TITLE, Column::in_progress(), None);
-    shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+    shelbi_state::save_workspace_status("demo", &shelbi_state::WorkspaceStatus {
         workspace: "alpha".into(),
         current_task: Some("t1".into()),
         state: shelbi_state::WorkspaceState::AwaitingInput,

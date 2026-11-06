@@ -474,7 +474,7 @@ fn collect_project_entries(project: &str, out: &mut Vec<InventoryEntry>) -> Resu
     ));
     // Deployed workspace worktree settings. Each local workspace owns a
     // gitignored `.claude/settings.local.json` where Shelbi wires its
-    // window-title / message-tail hooks. A pre-anchoring shelbi left some of
+    // window-title / message hooks. A pre-anchoring shelbi left some of
     // these with stale (relative / unquoted / pre-rename) hook commands that the
     // deploy-time self-heal only repairs on that workspace's next dispatch. Sniff
     // them here too so a stale-but-idle workspace still surfaces to the

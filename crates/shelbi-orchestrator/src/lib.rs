@@ -60,6 +60,7 @@ pub mod wake;
 pub mod workspace;
 pub mod workspace_session;
 pub mod zen;
+mod zen_flow;
 
 #[cfg(test)]
 mod golden;

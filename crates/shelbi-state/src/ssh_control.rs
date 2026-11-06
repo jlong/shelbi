@@ -580,6 +580,68 @@ pub fn save_host_forward(host: &str, decision: Option<HostForward>) -> Result<()
     crate::atomic_write(&path, &body)
 }
 
+/// The forward a host should actually be using, once the `forward:` pin from
+/// the machine's YAML and the persisted decision have been reconciled. The one
+/// answer the `-R` argv, the health check and the worker endpoint all share.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveForward {
+    /// The default Unix landing socket.
+    Unix,
+    /// TCP loopback on a port a previous forward bound.
+    Tcp(u16),
+    /// TCP loopback, but no port has been bound yet (`forward: tcp` on a host
+    /// that hasn't swept the band). Nothing can connect until one binds.
+    TcpUnbound,
+}
+
+/// The pure half of [`effective_forward`]: a pin beats the record, and a TCP
+/// port only counts when the record is itself a TCP decision.
+fn resolve_forward(
+    record: Option<HostForward>,
+    configured: Option<shelbi_core::ForwardMode>,
+) -> EffectiveForward {
+    use shelbi_core::ForwardMode;
+    let mode = configured
+        .or(record.map(|r| r.mode))
+        .unwrap_or(ForwardMode::Unix);
+    match (mode, record) {
+        (ForwardMode::Unix, _) => EffectiveForward::Unix,
+        (
+            ForwardMode::Tcp,
+            Some(HostForward {
+                mode: ForwardMode::Tcp,
+                port: Some(port),
+            }),
+        ) => EffectiveForward::Tcp(port),
+        (ForwardMode::Tcp, _) => EffectiveForward::TcpUnbound,
+    }
+}
+
+/// Resolve the forward `host` should use. `configured` is the machine's
+/// `forward:` pin, or `None` for auto (or for a caller that only has a hostname,
+/// like the ssh argv builder).
+///
+/// A `forward: unix` pin clears a contradicting TCP record, so callers that
+/// can't see the YAML read the right answer too: this is the only way a pin
+/// reaches them. Every site that knows the pin (the forward recheck, a worker
+/// launch) goes through here, so a stale record survives a pin edit only until
+/// the next of those runs.
+pub fn effective_forward(
+    host: &str,
+    configured: Option<shelbi_core::ForwardMode>,
+) -> EffectiveForward {
+    use shelbi_core::ForwardMode;
+    let record = load_host_forward(host);
+    let contradicted = configured == Some(ForwardMode::Unix)
+        && record.is_some_and(|r| r.mode == ForwardMode::Tcp);
+    if contradicted && save_host_forward(host, None).is_ok() {
+        let _ = crate::emit_event_body(&format!(
+            "ssh reverse-forward host={host} detail=pin_cleared_tcp_record mode=unix"
+        ));
+    }
+    resolve_forward(record, configured)
+}
+
 /// Reconcile the persisted forward decisions against reality and release any
 /// that no longer hold. `still_bound(host, &HostForward)` reports whether that
 /// host's forward still corresponds to a *live* transport (a ControlMaster
@@ -632,20 +694,23 @@ impl HubEndpoint {
     }
 }
 
-/// Resolve the hub endpoint a worker on `host` should connect to, honoring the
-/// persisted forward decision. Defaults to the Unix landing socket
-/// ([`remote_hub_socket_path`]) unless the host has settled on TCP with a bound
-/// port.
-pub fn remote_hub_endpoint(host: &str) -> HubEndpoint {
-    match load_host_forward(host) {
-        Some(HostForward {
-            mode: shelbi_core::ForwardMode::Tcp,
-            port: Some(port),
-        }) => HubEndpoint::Tcp {
+/// Resolve the hub endpoint a worker on `host` should connect to, through
+/// [`effective_forward`] so the endpoint can't disagree with the `-R` forward:
+/// a `configured` pin wins over the persisted decision, and a host on TCP with
+/// a bound port yields [`HubEndpoint::Tcp`]. Everything else gets the default
+/// Unix landing socket ([`remote_hub_socket_path`]).
+pub fn remote_hub_endpoint(
+    host: &str,
+    configured: Option<shelbi_core::ForwardMode>,
+) -> HubEndpoint {
+    match effective_forward(host, configured) {
+        EffectiveForward::Tcp(port) => HubEndpoint::Tcp {
             addr: TCP_FORWARD_BIND_ADDR.to_string(),
             port,
         },
-        _ => HubEndpoint::Unix(remote_hub_socket_path()),
+        EffectiveForward::Unix | EffectiveForward::TcpUnbound => {
+            HubEndpoint::Unix(remote_hub_socket_path())
+        }
     }
 }
 
@@ -1150,13 +1215,13 @@ mod tests {
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
 
         // Default (no decision) → Unix landing socket, `unix:` scheme.
-        match remote_hub_endpoint("fresh") {
+        match remote_hub_endpoint("fresh", None) {
             HubEndpoint::Unix(p) => {
                 assert!(p.to_string_lossy().starts_with("/tmp/shelbi-hub-"));
             }
             other => panic!("expected Unix endpoint, got {other:?}"),
         }
-        assert!(remote_hub_endpoint("fresh")
+        assert!(remote_hub_endpoint("fresh", None)
             .addr_env_value()
             .starts_with("unix:/tmp/shelbi-hub-"));
 
@@ -1170,14 +1235,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            remote_hub_endpoint("tsbox"),
+            remote_hub_endpoint("tsbox", None),
             HubEndpoint::Tcp {
                 addr: "127.0.0.1".into(),
                 port: 47108,
             }
         );
         assert_eq!(
-            remote_hub_endpoint("tsbox").addr_env_value(),
+            remote_hub_endpoint("tsbox", None).addr_env_value(),
             "tcp:127.0.0.1:47108"
         );
 
@@ -1191,11 +1256,76 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            remote_hub_endpoint("halfway"),
+            remote_hub_endpoint("halfway", None),
             HubEndpoint::Unix(_)
         ));
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn resolve_forward_lets_a_pin_win_over_the_record() {
+        use shelbi_core::ForwardMode::{Tcp, Unix};
+        let tcp = Some(HostForward { mode: Tcp, port: Some(47105) });
+        let tcp_no_port = Some(HostForward { mode: Tcp, port: None });
+        let unix = Some(HostForward { mode: Unix, port: None });
+
+        // Auto follows the record, defaulting to Unix.
+        assert_eq!(resolve_forward(None, None), EffectiveForward::Unix);
+        assert_eq!(resolve_forward(unix, None), EffectiveForward::Unix);
+        assert_eq!(resolve_forward(tcp, None), EffectiveForward::Tcp(47105));
+        assert_eq!(resolve_forward(tcp_no_port, None), EffectiveForward::TcpUnbound);
+
+        // A unix pin ignores any record.
+        assert_eq!(resolve_forward(tcp, Some(Unix)), EffectiveForward::Unix);
+        assert_eq!(resolve_forward(None, Some(Unix)), EffectiveForward::Unix);
+
+        // A tcp pin reuses a bound port, and has nothing to reuse otherwise.
+        assert_eq!(resolve_forward(tcp, Some(Tcp)), EffectiveForward::Tcp(47105));
+        assert_eq!(resolve_forward(None, Some(Tcp)), EffectiveForward::TcpUnbound);
+        assert_eq!(resolve_forward(unix, Some(Tcp)), EffectiveForward::TcpUnbound);
+    }
+
+    #[test]
+    fn a_unix_pin_clears_a_tcp_record_for_callers_without_the_pin() {
+        let _g = lock_test();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
+        // Clearing the record emits an event. Keep it off a worker pane's live hub.
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        let tcp = HostForward {
+            mode: shelbi_core::ForwardMode::Tcp,
+            port: Some(47105),
+        };
+        save_host_forward("fellback", Some(tcp)).unwrap();
+        save_host_forward("other", Some(tcp)).unwrap();
+
+        // Reading without a pin never changes anything.
+        assert_eq!(effective_forward("fellback", None), EffectiveForward::Tcp(47105));
+        assert_eq!(load_host_forward("fellback"), Some(tcp));
+        assert!(matches!(
+            remote_hub_endpoint("fellback", None),
+            HubEndpoint::Tcp { port: 47105, .. }
+        ));
+        // A tcp pin agrees with the record, so it stays.
+        assert_eq!(
+            effective_forward("fellback", Some(shelbi_core::ForwardMode::Tcp)),
+            EffectiveForward::Tcp(47105)
+        );
+        assert_eq!(load_host_forward("fellback"), Some(tcp));
+
+        // The unix pin wins for its own caller, on the very first read...
+        let endpoint = remote_hub_endpoint("fellback", Some(shelbi_core::ForwardMode::Unix));
+        assert_eq!(endpoint, HubEndpoint::Unix(remote_hub_socket_path()));
+        // ...and clears the record, so a caller with only a hostname agrees.
+        assert_eq!(load_host_forward("fellback"), None);
+        assert_eq!(effective_forward("fellback", None), EffectiveForward::Unix);
+        // Other hosts keep their decision.
+        assert_eq!(load_host_forward("other"), Some(tcp));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]

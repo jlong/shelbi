@@ -20,6 +20,8 @@ use crate::views::new_task::NewTaskGlobal;
 struct NewTask {
     h: Harness,
     seen: Arc<Mutex<Vec<CreateRequest>>>,
+    /// The project each create went to.
+    projects: Arc<Mutex<Vec<ProjectKey>>>,
 }
 
 impl NewTask {
@@ -28,9 +30,12 @@ impl NewTask {
     fn open(cx: &mut TestAppContext, write_up: WriteUp) -> NewTask {
         let mut h = Harness::open(cx);
         let seen = Arc::new(Mutex::new(Vec::new()));
+        let projects = Arc::new(Mutex::new(Vec::new()));
         let record = seen.clone();
-        let runner = Arc::new(move |_: &shelbi_app::source::ProjectLink, request: &CreateRequest| {
+        let record_project = projects.clone();
+        let runner = Arc::new(move |link: &shelbi_app::source::ProjectLink, request: &CreateRequest| {
             record.lock().unwrap().push(request.clone());
+            record_project.lock().unwrap().push(link.key().clone());
             Ok(Created {
                 id: Some("write-docs".into()),
                 title: request.title().to_string(),
@@ -39,7 +44,7 @@ impl NewTask {
         });
         h.cx.update(|_, cx| cx.set_global(NewTaskGlobal(runner)));
         h.focus_window();
-        NewTask { h, seen }
+        NewTask { h, seen, projects }
     }
 
     fn dialog(&self) -> Option<Entity<NewTaskDialog>> {
@@ -192,6 +197,34 @@ fn create_task_makes_one_create_and_the_window_flashes_it(cx: &mut TestAppContex
     assert!(!seen[0].write_up);
     assert!(t.dialog().is_none(), "created: it closes");
     assert_eq!(t.flashed().as_deref(), Some("Created write-docs"));
+}
+
+#[gpui::test]
+fn a_task_is_created_in_the_project_on_screen_after_a_switch(cx: &mut TestAppContext) {
+    let mut t = NewTask::open(cx, WriteUp::NotAsked);
+    // A switch needs the feeds, and attaches nothing real.
+    let (hub, _feeds) = crate::feeds::tests::canned_hub();
+    let (deps, _sessions, _ops) = crate::views::workspace::tests::fake_deps();
+    t.h.cx.update(|_, cx| cx.set_global(hub));
+    t.h.cx.update(|_, cx| {
+        t.h.window.update(cx, |w, _| {
+            w.chat_deps = Some(deps.sessions.clone());
+            w.workspace_deps = Some(deps);
+        })
+    });
+    t.open_dialog();
+    t.type_title("For alpha");
+    // A notification click, or a quit in another window, switches under it.
+    t.h.perform(vec![HostCall::SwitchProject("beta".into())]);
+    assert!(t.dialog().is_none(), "the dialog over alpha is gone");
+    assert!(t.seen().is_empty(), "and created nothing");
+
+    t.open_dialog();
+    t.type_title("For beta");
+    t.h.key("cmd-enter");
+    t.h.cx.run_until_parked();
+    assert_eq!(*t.projects.lock().unwrap(), [ProjectKey::local("beta")]);
+    assert_eq!(t.seen().len(), 1);
 }
 
 #[gpui::test]

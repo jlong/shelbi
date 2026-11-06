@@ -198,7 +198,7 @@ const REVIEW_SKILLS: &[BundledSkill] = &[BundledSkill {
 
 /// One entry in [`DEFAULT_AGENTS`]: the agent name, its bundled
 /// `instructions.md`, — for Claude-Code-based roles — the bundled
-/// `settings.json` template that ships the message-tail hooks plus the
+/// `settings.json` template that ships the message hooks plus the
 /// pane-title hooks, and any bundled `skills/` files the role ships with.
 /// `settings_template = None` means the role doesn't scaffold a per-role
 /// settings.json (e.g. a future codex role); `skills = &[]` (the common
@@ -919,7 +919,7 @@ fn self_heal_bundled_agents(
             // Make sure the per-role `settings.json` is on disk before we
             // judge `instructions.md` divergence — a half-materialized
             // workspace from an older shelbi version (no settings file)
-            // shouldn't be left without the message-tail hooks.
+            // shouldn't be left without the message hooks.
             ensure_agent_settings_present(project, agent)?;
 
             // Same seam for the runner-agnostic `agent.yaml`: a workspace
@@ -1241,7 +1241,7 @@ fn ensure_agent_settings_present(project: &str, agent: &BundledAgent) -> Result<
         Err(e) => return Err(Error::Io(e)),
     }
     // Atomic write — a torn `settings.json` from a mid-write crash would
-    // drop the message-tail hooks silently (Shelbi ContextStore
+    // drop the message hooks silently (Shelbi ContextStore
     // docs/planning:reviews/adversarial-2026-07/state-runtime.md F8).
     atomic_write(&path, default.as_bytes())
 }

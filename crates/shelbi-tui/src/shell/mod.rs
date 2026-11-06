@@ -597,6 +597,11 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             state.dirty = true;
             corpus_landed = true;
         }
+        // A "load more" page landed (fetched off the UI thread).
+        if state.kanban.poll_load_more() {
+            state.dirty = true;
+            corpus_landed = true;
+        }
         if state.poll_changelog() {
             state.dirty = true;
             corpus_landed = true;
@@ -1850,11 +1855,15 @@ impl ShellState {
             // same source the sidebar badge reads) so a late in-progress
             // assignment — or a handoff that idles the workspace — reflects in
             // the header within a poll tick, instead of freezing at the value it
-            // held when the view opened. Only the header status is re-derived;
-            // the panel's task title / description and content sessions stay put.
+            // held when the view opened. Only the header status and the built-in
+            // diff follow; the panel's task title / description and content
+            // sessions stay put.
             if let Some(ws) = self.workspace.as_mut() {
                 let status = ws_status_from_model(&sidebar, ws.workspace());
                 ws.set_header_status(status);
+                let row = sidebar.workspaces.iter().find(|w| w.name == ws.workspace());
+                let task = row.and_then(|w| w.current_task.clone());
+                ws.follow_task(task.as_deref());
             }
             // An open review's server line follows its sidebar row, as the
             // desktop's Review view does.
@@ -2284,7 +2293,7 @@ impl ShellState {
         let (mut kanban, activity, machines) = build_embedded_apps(project, &self.keymaps);
         // Show the board's own "Loading…" overlay (not bare empty columns) until
         // the first off-thread read for the new project lands.
-        kanban.board_loading = true;
+        kanban.input.loading = true;
         let old_apps = (
             std::mem::replace(&mut self.kanban, kanban),
             std::mem::replace(&mut self.activity, activity),
@@ -2674,10 +2683,10 @@ impl ShellState {
         use shelbi_app::overlay::palette_search::{issue_docs, SearchCorpus};
         let k = &self.kanban;
         let rules = BoardRules {
-            workflows: &k.workflows,
-            default_workflow_name: &k.default_workflow_name,
+            workflows: &k.input.workflows,
+            default_workflow_name: &k.input.default_workflow_name,
         };
-        SearchCorpus::new(issue_docs(&k.tasks, &k.project_statuses, rules), self.changelog.entries())
+        SearchCorpus::new(issue_docs(&k.tasks, &k.input.project_statuses, rules), self.changelog.entries())
     }
 
     /// Hand the open palette's search what the shell holds now (a board or
@@ -3740,7 +3749,7 @@ impl ShellState {
     /// Open New task for `project` over the current view, its pickers from
     /// the board's loaded workflows.
     fn open_new_task(&mut self, project: &str) {
-        let dialog = ActiveOverlay::new_task(project, &self.kanban.workflows, &self.kanban.default_workflow_name);
+        let dialog = ActiveOverlay::new_task(project, &self.kanban.input.workflows, &self.kanban.input.default_workflow_name);
         self.overlay = Some(dialog);
         self.dirty = true;
     }

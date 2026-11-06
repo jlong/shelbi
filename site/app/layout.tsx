@@ -1,21 +1,26 @@
 import type { Metadata } from "next"
 import { Analytics } from "@vercel/analytics/next"
 import { GeistSans } from "geist/font/sans"
-import { Source_Code_Pro } from "next/font/google"
+import localFont from "next/font/local"
 import { Header } from "@/components/Header"
 import { Footer } from "@/components/Footer"
 import { getSections, humanizeSection } from "@/lib/docs"
 import { CLIENT_BOOT_SCRIPT, DEFAULT_CLIENT } from "@/lib/client-preference"
 import "./globals.css"
 
-// Mono family for code, CLI hints, and the hero mockup. Self-hosted via
-// `next/font/google` and exposed as the `--font-source-code-pro` variable,
-// which `--font-mono` (globals.css) points at. Weights: 400 (body/code),
-// 500 (medium labels), 600 (semibold, e.g. Footer headings).
-const sourceCodePro = Source_Code_Pro({
-  subsets: ["latin"],
-  weight: ["400", "500", "600"],
+// Mono family for code, CLI hints, and the hero mockup, exposed as the
+// `--font-source-code-pro` variable that `--font-mono` (globals.css) points at.
+// Vendored so a build never has to reach Google Fonts: this is the variable
+// latin subset Google serves, weights 400 (body/code), 500 (medium labels), and
+// 600 (semibold, e.g. Footer headings). `next/font/google` also declared
+// cyrillic, greek, vietnamese, and latin-ext faces; no page uses those glyphs.
+const sourceCodePro = localFont({
+  src: "./fonts/SourceCodePro-Latin-Variable.woff2",
+  weight: "400 600",
+  style: "normal",
   variable: "--font-source-code-pro",
+  // The Arial fallback is declared in globals.css with pinned metrics.
+  adjustFontFallback: false,
 })
 
 const SITE_URL = "https://shelbi.dev"

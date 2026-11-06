@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 
 use shelbi_core::Host;
 use shelbi_orchestrator::ready;
-use shelbi_orchestrator::session_backend::{backend, Liveness, SessionBackend, SessionTarget};
+use shelbi_orchestrator::session_backend::{
+    backend, KillReason, Liveness, SessionBackend, SessionTarget, SlotDeath,
+};
 use shelbi_session::SpawnSpec;
 use shelbi_state::{parse_pane_title_marker, PaneMarker};
 
@@ -459,4 +461,76 @@ fn diff_comments_reach_a_real_session_as_a_submitted_prompt() {
     }
     let events = std::fs::read_to_string(home.path().join("events.log")).unwrap_or_default();
     assert!(events.contains("status=unverified"), "{events}");
+}
+
+/// The crash-versus-deliberate input to pane supervision, against real session
+/// processes: how each one ended is read back from what it left on disk.
+#[test]
+fn a_session_says_how_it_ended() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    std::env::set_var("SHELBI_HOME", home.path());
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            std::env::remove_var("SHELBI_HOME");
+        }
+    }
+    let _guard = Guard;
+
+    let run = |slot: &str, script: &str| -> SessionTarget {
+        let spec = SpawnSpec {
+            name: format!("demo/ws/{slot}"),
+            cwd: cwd.path().to_path_buf(),
+            cols: 80,
+            rows: 24,
+            task: None,
+            raw_output_log: false,
+            child_argv: vec!["/bin/sh".into(), "-c".into(), script.to_string()],
+        };
+        shelbi_client::spawn_with_exe(Path::new(env!("CARGO_BIN_EXE_shelbi")), &spec)
+            .expect("spawn the session");
+        SessionTarget::slot("shelbi-demo", slot)
+    };
+    let settled = |target: &SessionTarget, want: SlotDeath| {
+        let got = wait_for(Duration::from_secs(10), || {
+            let dead = !backend().probe(&Host::Local, target, None).is_alive();
+            let death = backend().slot_death(&Host::Local, target);
+            (dead && death == want).then_some(death)
+        });
+        assert_eq!(got, Some(want), "{}", target.label());
+    };
+
+    // A user `/exit`: the agent ends with status 0.
+    settled(&run("clean", "exit 0"), SlotDeath::CleanExit);
+    // A crash: the agent ends with anything else.
+    settled(&run("crash", "exit 3"), SlotDeath::Crash);
+
+    // A deliberate kill reads as such whatever the agent exits with, including
+    // an agent that handles the SIGTERM and exits 0.
+    for (slot, script, reason) in [
+        ("stop", "printf READY; exec cat", KillReason::Stop),
+        (
+            "polite",
+            "trap 'exit 0' TERM; printf READY; while :; do sleep 0.05; done",
+            KillReason::Handoff,
+        ),
+    ] {
+        let target = run(slot, script);
+        // Wait on the screen, not `probe`: a session's lock is held before its
+        // socket exists, and the kill has to connect. It also proves the trap is
+        // installed before the signal lands.
+        assert!(
+            wait_for(Duration::from_secs(10), || {
+                let screen = backend().snapshot(&Host::Local, &target).unwrap_or_default();
+                screen.contains("READY").then_some(())
+            })
+            .is_some(),
+            "{slot} should come up",
+        );
+        shelbi_orchestrator::workspace::kill_workspace_pane("demo", &Host::Local, &target, slot, reason)
+            .expect("kill");
+        settled(&target, SlotDeath::Killed(reason));
+    }
 }

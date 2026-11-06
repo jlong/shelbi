@@ -52,7 +52,7 @@
 //!   instead of discovering a wedged board hours later.
 //!
 //! On a state change the poller writes two files:
-//! - `~/.shelbi/workspaces/<name>/status.yaml` — last observed state.
+//! - `~/.shelbi/projects/<project>/workspaces/<name>/status.yaml` — last observed state.
 //! - `~/.shelbi/events.log` — append-only transition history.
 //!
 //! On a same-state observation it still bumps `last_seen` in
@@ -76,7 +76,9 @@ use shelbi_core::{
     default_workflow, Column, IssueTrackerBackend, Project, StatusCategory, Workflow,
     DEFAULT_WORKFLOW_NAME,
 };
-use crate::session_backend::{backend, SessionBackend, SessionTarget};
+use crate::session_backend::{
+    backend, KillReason, Liveness, SessionBackend, SessionTarget, SlotDeath,
+};
 use crate::supervision::{
     SupervisionAction, SupervisionInputs, SupervisionState, BASE_BACKOFF, CRASH_LOOP_WINDOW,
     MAX_RESTARTS_IN_WINDOW, STABLE_RECOVERY,
@@ -92,13 +94,14 @@ use shelbi_state::{
     ISSUE_ADOPTION_CAUSE,
 };
 
-/// How often each per-workspace thread re-verifies its host's reverse
-/// forward. Kept well under `ControlPersist=600` (10 min) so a master that
-/// lapses and reopens — the moment a stale remote socket would wedge the
-/// `-R` rebind — gets its forward re-checked and repaired within a couple
-/// of minutes rather than staying silently broken until the thread
-/// restarts. Local workspaces short-circuit the check, so the only cost
-/// this cadence imposes is on SSH hosts.
+/// How often a host's reverse forward is re-verified. Every workspace thread
+/// asks on this cadence, but a per-host gate lets only one of them run the check
+/// each interval, and that check only probes: a healthy master is left alone.
+/// Kept well under `ControlPersist=600` (10 min) so a master that lapses and
+/// reopens — the moment a stale remote socket would wedge the `-R` rebind — gets
+/// its forward re-checked and repaired within a couple of minutes rather than
+/// staying silently broken until the thread restarts. Local workspaces
+/// short-circuit the check, so the only cost this cadence imposes is on SSH hosts.
 const FORWARD_RECHECK_INTERVAL: Duration = Duration::from_secs(120);
 
 /// Default wall-clock bound a poll thread's cancellation scope puts on a single
@@ -191,6 +194,13 @@ impl WorkspacePoller {
     /// active handles and retries an inert one on its next reconcile tick.
     pub fn is_active(&self) -> bool {
         self.active
+    }
+
+    /// Whether this handle's poll loop has exited. A loop runs until its handle
+    /// drops or a quit cancels it, so this reads true for a poller a quit
+    /// cancelled, which a manager must replace if the project is open again.
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_some_and(JoinHandle::is_finished)
     }
 }
 
@@ -583,7 +593,11 @@ fn run_workspace_poll_loop(
         if next_forward_check.is_none_or(|t| Instant::now() >= t) {
             if let Some(machine) = project.machine(&workspace.machine) {
                 let host = machine.host();
-                if let Err(e) = shelbi_ssh::ensure_reverse_forward(&host, machine.forward) {
+                if let Err(e) = shelbi_ssh::recheck_reverse_forward(
+                    &host,
+                    machine.forward,
+                    FORWARD_RECHECK_INTERVAL,
+                ) {
                     tracing::warn!(
                         workspace = %workspace_name,
                         error = %e,
@@ -1626,12 +1640,28 @@ fn poll_one(
 
     // No pane → no marker. The display-message call would fail anyway,
     // but checking up-front keeps stderr noise out of the log.
-    let alive = crate::workspace::workspace_pane_alive(&host, &addr).unwrap_or(false);
+    let alive = match crate::workspace::workspace_pane_liveness(&host, &addr) {
+        Liveness::Alive => true,
+        Liveness::Dead => false,
+        // The machine couldn't be asked (an SSH relay blip). The session is
+        // most likely still running, so this says nothing about the pane: end
+        // the tick with every latch intact, a scheduled limit-resume above all.
+        // It fires on the first tick the machine answers again.
+        Liveness::Unreachable { reason } => {
+            tracing::debug!(
+                project = %project.name,
+                workspace = %workspace.name,
+                reason,
+                "keeping pane state until the machine answers",
+            );
+            return;
+        }
+    };
 
     // Auto-restart supervision runs off this same liveness read (it's the
     // backstop for a lost `pane_alive=false` event): a pane that crashed with
     // a task still assigned gets relaunched and re-dispatched here.
-    maybe_supervise_workspace(project, workspace, &host, alive, supervision);
+    maybe_supervise_workspace(project, workspace, &host, &addr, alive, supervision);
 
     if !alive {
         // The pane is gone (dispatch teardown, crash, or normal exit). Any
@@ -1737,7 +1767,7 @@ fn poll_one(
                     *last_dialog = None;
                     *unknown_dialog_streak = 0;
                     *idle_debounce_streak = 0;
-                    let prior = load_prior(&workspace.name, last_known);
+                    let prior = load_prior(&project.name, &workspace.name, last_known);
                     let outcome = decide(
                         &workspace.name,
                         Some(task_id),
@@ -1745,7 +1775,7 @@ fn poll_one(
                         WorkspaceState::Blocked,
                         Utc::now(),
                     );
-                    if let Err(e) = save_workspace_status(&outcome.status) {
+                    if let Err(e) = save_workspace_status(&project.name, &outcome.status) {
                         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status failed");
                     }
                     if outcome.transitioned {
@@ -1818,7 +1848,7 @@ fn poll_one(
         if limit_resume
             .tracked_task()
             .is_some_and(|scheduled| scheduled != task_id)
-            || paused_status_belongs_to_other_task(&workspace.name, &task_id)
+            || paused_status_belongs_to_other_task(&project.name, &workspace.name, &task_id)
         {
             suppress_limit_banner(
                 project,
@@ -1879,7 +1909,7 @@ fn poll_one(
             // Do not let the known-stale pane title clear a persisted pause
             // when the screen offered no current recovery proof. A later
             // busy/ready sample, pane death, or lifecycle change advances it.
-            if workspace_is_paused(&workspace.name, last_known) && !recovered {
+            if workspace_is_paused(&project.name, &workspace.name, last_known) && !recovered {
                 *last_dialog = None;
                 return;
             }
@@ -1939,7 +1969,7 @@ fn poll_one(
     // Bootstrap previous state from disk on first sighting so a hub
     // restart doesn't emit a bogus `none -> X` event for state we've
     // already recorded.
-    let prior = load_prior(&workspace.name, last_known);
+    let prior = load_prior(&project.name, &workspace.name, last_known);
 
     // Debounce the false-idle `working -> awaiting_input` edge: a lone
     // mid-repaint capture that misses the live spinner row would otherwise flip a
@@ -1957,12 +1987,14 @@ fn poll_one(
     // it fell through because the probe couldn't be re-confirmed (a board blip or
     // a probe transport hiccup), which otherwise flap `serving -> awaiting_input`
     // and re-emit `review-ready` ~30s later. See [`fold_review_serving`].
-    let new_state = fold_review_serving(
-        new_state,
-        review_slot_has_loaded_marker(project, workspace, machine, &host),
-    );
+    let serving_task = review_slot_serving_task(project, workspace, machine, &host);
+    let new_state = fold_review_serving(new_state, serving_task.is_some());
 
-    let current_task = current_task_for(project, &workspace.name);
+    // A review card isn't an active one, so `current_task_for` can't name it.
+    // Held at `Serving`, the slot goes on naming the task it serves: that's what
+    // tells the next task's serving edge apart ([`record_review_serving`]).
+    let current_task = current_task_for(project, &workspace.name)
+        .or(serving_task.filter(|_| new_state == WorkspaceState::Serving));
     let outcome = decide(
         &workspace.name,
         current_task.clone(),
@@ -1971,7 +2003,7 @@ fn poll_one(
         Utc::now(),
     );
 
-    if let Err(e) = save_workspace_status(&outcome.status) {
+    if let Err(e) = save_workspace_status(&project.name, &outcome.status) {
         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status failed");
     }
     if outcome.transitioned {
@@ -2159,16 +2191,20 @@ fn maybe_emit_dialog_event(
 /// on-disk `status.yaml` on first sighting after a hub restart. Shared by the
 /// title path and the usage-limit pause path so both bootstrap identically and
 /// a restart doesn't emit a bogus `none -> X` for state already recorded.
-fn load_prior(workspace_name: &str, last_known: &Option<WorkspaceState>) -> Option<PriorState> {
+fn load_prior(
+    project: &str,
+    workspace_name: &str,
+    last_known: &Option<WorkspaceState>,
+) -> Option<PriorState> {
     match *last_known {
         Some(s) => Some(PriorState {
             state: s,
-            last_transition: load_workspace_status(workspace_name)
+            last_transition: load_workspace_status(project, workspace_name)
                 .ok()
                 .flatten()
                 .map(|s| s.last_transition),
         }),
-        None => load_workspace_status(workspace_name)
+        None => load_workspace_status(project, workspace_name)
             .ok()
             .flatten()
             .map(|s| PriorState {
@@ -2196,7 +2232,7 @@ fn record_usage_limit_pause(
     last_known: &mut Option<WorkspaceState>,
     reset: Option<&str>,
 ) -> DateTime<Utc> {
-    let prior = load_prior(&workspace.name, last_known);
+    let prior = load_prior(&project.name, &workspace.name, last_known);
     let current_task = current_task_for(project, &workspace.name);
     let outcome = decide(
         &workspace.name,
@@ -2206,7 +2242,7 @@ fn record_usage_limit_pause(
         Utc::now(),
     );
 
-    if let Err(e) = save_workspace_status(&outcome.status) {
+    if let Err(e) = save_workspace_status(&project.name, &outcome.status) {
         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status failed");
     }
     if outcome.transitioned {
@@ -2238,9 +2274,9 @@ fn record_limit_resume_state(
     new_state: WorkspaceState,
     last_known: &mut Option<WorkspaceState>,
 ) {
-    let prior = load_prior(&workspace.name, last_known);
+    let prior = load_prior(&project.name, &workspace.name, last_known);
     let outcome = decide(&workspace.name, current_task, prior, new_state, Utc::now());
-    if let Err(e) = save_workspace_status(&outcome.status) {
+    if let Err(e) = save_workspace_status(&project.name, &outcome.status) {
         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status after limit resume failed");
     }
     if outcome.transitioned {
@@ -2256,10 +2292,14 @@ fn record_limit_resume_state(
     *last_known = Some(new_state);
 }
 
-fn workspace_is_paused(workspace_name: &str, last_known: &Option<WorkspaceState>) -> bool {
+fn workspace_is_paused(
+    project: &str,
+    workspace_name: &str,
+    last_known: &Option<WorkspaceState>,
+) -> bool {
     matches!(last_known, Some(WorkspaceState::Paused))
         || matches!(
-            load_workspace_status(workspace_name),
+            load_workspace_status(project, workspace_name),
             Ok(Some(status)) if status.state == WorkspaceState::Paused
         )
 }
@@ -2274,7 +2314,7 @@ fn record_limit_recovery_from_screen(
     screen: &str,
     last_known: &mut Option<WorkspaceState>,
 ) -> bool {
-    if !workspace_is_paused(&workspace.name, last_known) {
+    if !workspace_is_paused(&project.name, &workspace.name, last_known) {
         return false;
     }
     // Background work in flight reads as working here too (see
@@ -2722,9 +2762,9 @@ fn limit_banner_key(stall: &crate::ready::UsageLimitStall) -> String {
 /// A persisted Paused state survives poller restarts and carries the task that
 /// originally hit the limit. If that task no longer owns the slot, its visible
 /// banner must not seed a schedule for a replacement task.
-fn paused_status_belongs_to_other_task(workspace: &str, task_id: &str) -> bool {
+fn paused_status_belongs_to_other_task(project: &str, workspace: &str, task_id: &str) -> bool {
     matches!(
-        load_workspace_status(workspace),
+        load_workspace_status(project, workspace),
         Ok(Some(status))
             if status.state == WorkspaceState::Paused
                 && status.current_task.as_deref() != Some(task_id)
@@ -3188,9 +3228,13 @@ fn maybe_apply_ready_handoff(
             // idempotent. A `review`-tagged workspace is left running (it holds
             // a loaded task, not a just-finished in-progress one).
             if !project.effective_tags(workspace).contains("review") {
-                if let Err(e) =
-                    crate::workspace::kill_workspace_pane(host, addr, &workspace.name)
-                {
+                if let Err(e) = crate::workspace::kill_workspace_pane(
+                    &project.name,
+                    host,
+                    addr,
+                    &workspace.name,
+                    KillReason::Handoff,
+                ) {
                     tracing::warn!(
                         workspace = %workspace.name,
                         task = %task_id,
@@ -3238,7 +3282,7 @@ fn maybe_apply_ready_handoff(
             // promotes on the first successful read. Log — and record the
             // deferral on events.log — once per outage, deduped on the error
             // class via the sidecar, rather than every tick.
-            let class = classify_load_error(&e);
+            let class = classify_store_error(&e);
             let already =
                 crate::workspace::read_deferred_marker(host, &deferred_marker)
                     .ok()
@@ -3273,14 +3317,14 @@ fn maybe_apply_ready_handoff(
     }
 }
 
-/// Classify a task-load failure into a short, stable token for the
-/// `reason=marker-deferred:<class>` events.log line and the once-per-outage
-/// WARN. Groups the transient backend failures the ready-marker handoff must
+/// Classify a failed read or write of a task into a short, stable token for the
+/// `reason=marker-deferred:<class>` and `transition-marker` events.log lines and
+/// the once-per-outage WARN. Groups the transient backend failures the ready-marker handoff must
 /// ride out — a network blip, a GitHub 403 / rate-limit, a timeout, a malformed
 /// response — so a reader can see *why* a promotion is deferred without the full
 /// error string. Best-effort: the load is retried regardless of class, so an
 /// imperfect bucket only affects the log token, never the retry.
-fn classify_load_error(err: &shelbi_core::Error) -> &'static str {
+fn classify_store_error(err: &shelbi_core::Error) -> &'static str {
     use shelbi_core::Error;
     let msg = err.to_string().to_ascii_lowercase();
     if msg.contains("403") || msg.contains("rate limit") || msg.contains("rate-limit") {
@@ -3300,7 +3344,7 @@ fn classify_load_error(err: &shelbi_core::Error) -> &'static str {
         // connectivity class — the dominant transient cause.
         "network"
     } else {
-        "load-error"
+        "other"
     }
 }
 
@@ -3436,12 +3480,20 @@ fn decide_transition(
 /// [`crate::workspace::workspace_transition_marker`] for the
 /// marker path + format.
 ///
-/// Best-effort and idempotent, matching the review-marker contract:
+/// Best-effort and idempotent, matching the review-marker contract. The agent
+/// writes its verdict exactly once, so every outcome that doesn't apply it lands
+/// a `transition-marker` line on `events.log`
+/// ([`shelbi_state::append_transition_marker_event`]), which is the only way the
+/// orchestrator can see a card that stopped moving:
 ///
 /// - A marker naming a task **not owned by this workspace** (stale worktree
-///   reuse, or a foreign id a stray program dropped) is cleared without moving.
-/// - A move whose **workflow forbids the edge** is refused (logged) and the
-///   marker cleared, so a persistently-illegal request doesn't re-log forever.
+///   reuse, or a foreign id a stray program dropped) or a task a successful read
+///   shows is **gone** is dropped: cleared without moving.
+/// - A move whose **workflow forbids the edge** is refused and the marker
+///   cleared, so a persistently-illegal request doesn't re-log forever.
+/// - A **failed read of the task** (network, GitHub 403/rate-limit, timeout,
+///   malformed response) proves nothing about the task, so the marker stays and
+///   the next tick retries. Same contract as [`maybe_apply_ready_handoff`].
 /// - A successful move emits a `reason=workspace:agent-transition` task event,
 ///   fires any actions the edge declares (a bounce edge typically has none),
 ///   then **closes the finishing pane** so the orchestrator re-dispatches the
@@ -3449,8 +3501,10 @@ fn decide_transition(
 ///   is load-bearing: move first, then close, never strand work — the move also
 ///   clears the task's owner ([`shelbi_state::move_task_and_unassign`]) so the
 ///   just-closed pane isn't seen by the supervisor as still holding active work.
-/// - Only a genuine move *failure* leaves the marker in place to retry; every
-///   other path consumes it exactly once.
+/// - A failed read or a failed move leaves the marker in place to retry, deduped
+///   to one `events.log` line per failure via the sidecar
+///   ([`crate::workspace::workspace_transition_deferred_marker`]); every other
+///   path consumes the marker exactly once.
 fn maybe_apply_transition(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
@@ -3489,9 +3543,16 @@ fn maybe_apply_transition(
         }
     };
 
-    let task_file = load_issue(project, &req.task_id);
-    match &task_file {
-        Ok(tf) if tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) => {
+    let deferred_marker =
+        crate::workspace::workspace_transition_deferred_marker(machine, workspace);
+
+    // Go straight to the store (rather than `load_issue`, which folds a
+    // successful "no such task" read into an `Err`): only `Ok(None)` proves the
+    // task is gone. See the matching read in `maybe_apply_ready_handoff`.
+    let loaded = shelbi_state::issue_store_for_project(project)
+        .and_then(|store| store.get(&req.task_id));
+    match &loaded {
+        Ok(Some(tf)) if tf.task.assigned_to.as_deref() == Some(workspace.name.as_str()) => {
             // Load the task's workflow; fall back to the built-in default
             // (no transitions → any-to-any) if the YAML is missing or invalid,
             // so a transient workflow typo doesn't wedge the bounce.
@@ -3507,6 +3568,7 @@ fn maybe_apply_transition(
                         reason,
                         "agent transition rejected; clearing marker without moving",
                     );
+                    record_transition_outcome(project, workspace, &req, "refused", reason);
                 }
                 TransitionDecision::Apply {
                     from_status,
@@ -3579,9 +3641,11 @@ fn maybe_apply_transition(
                             // gone is a silent no-op — and it runs only AFTER the
                             // move so work is never stranded.
                             if let Err(e) = crate::workspace::kill_workspace_pane(
+                                &project.name,
                                 host,
                                 addr,
                                 &workspace.name,
+                                KillReason::Handoff,
                             ) {
                                 tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "close pane after agent transition failed");
                             } else {
@@ -3594,26 +3658,112 @@ fn maybe_apply_transition(
                             // race (the task moved between our load and the
                             // move). Nothing to do but clear the marker.
                             tracing::debug!(workspace = %workspace.name, task = %req.task_id, "agent transition no-op (task already at target); clearing marker");
+                            record_transition_outcome(
+                                project,
+                                workspace,
+                                &req,
+                                "dropped",
+                                "already-at-target",
+                            );
                         }
                         Err(e) => {
                             // Leave the marker in place so we retry next tick.
-                            tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "move_task_and_unassign failed");
+                            defer_transition(
+                                project,
+                                workspace,
+                                host,
+                                &deferred_marker,
+                                &req,
+                                "move-failed",
+                                &e,
+                            );
                             return;
                         }
                     }
                 }
             }
         }
-        Ok(_) => {
+        Ok(Some(_)) => {
             tracing::debug!(workspace = %workspace.name, task = %req.task_id, "stale/foreign transition marker (task not owned by this workspace); clearing");
+            record_transition_outcome(project, workspace, &req, "dropped", "not-owned");
+        }
+        Ok(None) => {
+            tracing::warn!(workspace = %workspace.name, task = %req.task_id, "transition marker names a task that no longer exists; clearing");
+            record_transition_outcome(project, workspace, &req, "dropped", "task-gone");
         }
         Err(e) => {
-            tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "transition marker names unloadable task; clearing");
+            // The read FAILED, which is not proof of anything about the task.
+            // Clearing here loses the gate's one-shot verdict and parks the card
+            // in the gate for good, so return with the marker in place.
+            defer_transition(
+                project,
+                workspace,
+                host,
+                &deferred_marker,
+                &req,
+                "load-failed",
+                e,
+            );
+            return;
         }
     }
 
     if let Err(e) = crate::workspace::clear_transition_marker(host, &marker) {
         tracing::warn!(workspace = %workspace.name, error = %e, "clear_transition_marker failed");
+    }
+    // The marker is consumed, so any outage it was riding out is over for this
+    // request. Clear the dedupe token so the next deferral logs afresh.
+    if let Err(e) = crate::workspace::clear_deferred_marker(host, &deferred_marker) {
+        tracing::debug!(workspace = %workspace.name, error = %e, "clear_deferred_marker failed");
+    }
+}
+
+/// Record a transition marker outcome that did not apply the agent's request on
+/// `events.log`. Best-effort: a failed append logs and never blocks the poller.
+fn record_transition_outcome(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    req: &crate::workspace::TransitionRequest,
+    status: &str,
+    reason: &str,
+) {
+    if let Err(e) = shelbi_state::append_transition_marker_event(
+        &project.name,
+        &req.task_id,
+        &workspace.name,
+        &req.target,
+        status,
+        reason,
+    ) {
+        tracing::warn!(workspace = %workspace.name, task = %req.task_id, error = %e, "append_transition_marker_event failed");
+    }
+}
+
+/// Keep a transition marker in place across a failed read or move, recording the
+/// deferral once rather than every tick. The sidecar holds the current
+/// `<stage>:<class>` token, so a change of stage or error class logs again but a
+/// repeat of the same failure stays quiet until the marker is consumed.
+fn defer_transition(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    host: &shelbi_core::Host,
+    deferred_marker: &std::path::Path,
+    req: &crate::workspace::TransitionRequest,
+    stage: &str,
+    err: &shelbi_core::Error,
+) {
+    let token = format!("{stage}:{}", classify_store_error(err));
+    let already = crate::workspace::read_deferred_marker(host, deferred_marker)
+        .ok()
+        .flatten();
+    if already.as_deref() == Some(token.as_str()) {
+        tracing::debug!(workspace = %workspace.name, task = %req.task_id, reason = %token, "agent transition still deferred");
+        return;
+    }
+    tracing::warn!(workspace = %workspace.name, task = %req.task_id, reason = %token, error = %err, "agent transition deferred; leaving marker in place");
+    record_transition_outcome(project, workspace, req, "deferred", &token);
+    if let Err(e) = crate::workspace::write_deferred_marker(host, deferred_marker, &token) {
+        tracing::debug!(workspace = %workspace.name, task = %req.task_id, error = %e, "write_deferred_marker failed; may re-log next tick");
     }
 }
 
@@ -4584,7 +4734,7 @@ fn debounce_idle_edge(
 /// [`WorkspaceState::Serving`].
 ///
 /// A `review`-tagged slot the poller already confirmed serving (its
-/// `.shelbi/shelbi-review-loaded` marker is present — see
+/// `.shelbi/shelbi-review-loaded` marker names its task — see
 /// [`ensure_review_marker_and_serving_state`]) sits idle at its ready prompt
 /// between the human's questions. Claude's ready input box — and the
 /// suggested-prompt ghost text it draws under the ready summary (`❯ open it in
@@ -4614,30 +4764,45 @@ fn fold_review_serving(observed: WorkspaceState, confirmed_serving_review: bool)
     }
 }
 
-/// True when `workspace` is a `review`-tagged slot carrying a review-loaded
-/// marker — the durable, board-independent signal that the poller already
-/// confirmed this slot serving (written by
-/// [`ensure_review_marker_and_serving_state`], cleared only on teardown/reap in
-/// [`maybe_reap_orphaned_review_slot`]). Read straight off the marker rather than
-/// the board so the fold holds precisely on the ticks the flap happens — a board
-/// that can't be read warm ([`AssignedReviewTask::Unknown`]) is one of the two
-/// triggers, so resolving "is this slot serving" through the board would go blind
-/// on exactly those ticks.
-fn review_slot_has_loaded_marker(
+/// The task a `review`-tagged slot is confirmed serving: the one its review-loaded
+/// marker names ([`ensure_review_marker_and_serving_state`] writes it), provided
+/// that's the task on the slot now. A marker naming anything else is the last
+/// task's leftover: counting it would fold the new task's idle reading to
+/// `Serving`, so its real serving edge later would be no transition and its
+/// `review-ready` would never fire.
+fn review_slot_serving_task(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     machine: &shelbi_core::Machine,
     host: &shelbi_core::Host,
-) -> bool {
+) -> Option<String> {
     if !project.effective_tags(workspace).contains("review") {
-        return false;
+        return None;
     }
     let marker =
         crate::workspace::workspace_review_loaded_marker(machine, workspace);
-    matches!(
-        crate::workspace::read_review_loaded_marker(host, &marker),
-        Ok(Some(_))
-    )
+    let marked = crate::workspace::read_review_loaded_marker(host, &marker).ok().flatten()?;
+    (slot_current_review_task(project, &workspace.name).as_deref() == Some(marked.as_str()))
+        .then_some(marked)
+}
+
+/// The review task on `workspace_name` as best this tick can tell, for holding a
+/// state rather than for anything destructive (that's
+/// [`assigned_review_task_for`]). The fold exists for the ticks a board can't be
+/// read warm, so this can't go blind on them: a stale board is served as is, with
+/// ownership from the overlay, and with no board at all (a cold index) the slot's
+/// last committed serving task stands.
+fn slot_current_review_task(project: &Project, workspace_name: &str) -> Option<String> {
+    match shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker) {
+        Ok(shelbi_state::BoardState::Warm(board) | shelbi_state::BoardState::Stale(board)) => {
+            review_task_on_board(project, board, workspace_name)
+        }
+        Ok(shelbi_state::BoardState::Cold) | Err(_) => load_workspace_status(&project.name, workspace_name)
+            .ok()
+            .flatten()
+            .filter(|status| status.state == WorkspaceState::Serving)
+            .and_then(|status| status.current_task),
+    }
 }
 
 /// Auto-restart supervision for one workspace's agent pane, run every poll
@@ -4720,6 +4885,7 @@ fn maybe_supervise_workspace(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     host: &shelbi_core::Host,
+    addr: &crate::session_backend::SessionTarget,
     alive: bool,
     state: &mut SupervisionState,
 ) {
@@ -4727,43 +4893,70 @@ fn maybe_supervise_workspace(
         return;
     }
 
-    let (intentional_shutdown, task_id) = if alive {
-        (false, None)
+    // How the slot's session ended, read from its own directory. `Exiting` means
+    // the record isn't written yet, so the verdict waits for the next tick.
+    let death = if alive {
+        SlotDeath::Crash
     } else {
-        // Consume the supervisor's dedicated no-restart marker (distinct from
-        // the wrapper's expected-teardown, which the wrapper already ate).
-        let intentional = shelbi_state::consume_expected_teardown(
-            &shelbi_state::supervision_shutdown_key(&workspace.name),
-        )
-        .unwrap_or(false);
-        // A TUI reopen of a gave-up worker pane drops a relaunch marker; re-arm
-        // the budget so this tick restarts it with a fresh count. Skipped for a
-        // deliberate stop — that must stay down regardless of a stale marker.
-        if !intentional
-            && shelbi_state::supervision_relaunch::consume_supervision_relaunch(
-                &project.name,
-                &shelbi_state::supervision_relaunch::workspace_supervise_relaunch_key(&workspace.name),
-            )
-            .unwrap_or(false)
-        {
-            state.request_relaunch();
-        }
-        (intentional, current_task_for(project, &workspace.name))
+        backend().slot_death(host, addr)
     };
+    if !alive && death == SlotDeath::Exiting {
+        return;
+    }
+
+    // A TUI reopen of a dead worker pane drops a relaunch marker. A live pane
+    // needs no reopen, but its marker is spent here too: left in place it could
+    // outlive the view that wrote it and override a later deliberate stop.
+    let reopened = shelbi_state::supervision_relaunch::consume_supervision_relaunch(
+        &project.name,
+        &shelbi_state::supervision_relaunch::workspace_supervise_relaunch_key(&workspace.name),
+    )
+    .unwrap_or(false);
+
+    let task_id = if alive {
+        None
+    } else {
+        current_task_for(project, &workspace.name)
+    };
+
+    if !alive && reopened {
+        // Re-arm the budget. A crash then restarts on this tick's decision below.
+        state.request_relaunch();
+        if death.deliberate() {
+            // The user asked for a pane back that went down on purpose. There is
+            // no crash to recover from, so bring it back with its conversation
+            // instead of the context-clearing redispatch.
+            resume_stood_down_workspace(project, workspace, task_id.as_deref());
+            return;
+        }
+    }
 
     let inputs = SupervisionInputs {
         alive,
-        intentional_shutdown,
+        intentional_shutdown: !alive && death.deliberate(),
         has_work: task_id.is_some(),
     };
     match state.decide(&inputs, Instant::now()) {
         SupervisionAction::None => {}
+        SupervisionAction::StandDown => {
+            // A redispatch's kill is followed by its own spawn and dispatch
+            // lines: the slot isn't being left down, so there's nothing to report.
+            if death != SlotDeath::Killed(KillReason::Redispatch) {
+                log_stand_down(project, &workspace.name, death.stand_down_reason());
+            }
+        }
         SupervisionAction::Restart => {
             // `Restart` is only returned for a dead pane with work, so a task
             // id is present here; the guard is defensive.
             let Some(task_id) = task_id else { return };
             match redispatch_workspace(project, workspace, &task_id) {
-                Ok(()) => {
+                Ok(Redispatch::Superseded(why)) => {
+                    // The index said this slot had work; the task itself says it
+                    // doesn't. Not a crash to retry, so drop the budget it spent.
+                    state.stand_down();
+                    log_stand_down(project, &workspace.name, why);
+                }
+                Ok(Redispatch::Relaunched) => {
                     if let Err(e) = shelbi_state::append_supervision_event(
                         &project.name,
                         Some(&workspace.name),
@@ -4808,8 +5001,81 @@ fn maybe_supervise_workspace(
     }
 }
 
-/// Relaunch `workspace` on `task_id`, re-sending the task prompt. Reuses the
-/// normal dispatch primitive ([`start_workspace_on_task`], which itself
+/// Record that the supervisor is leaving a dead pane down although the board
+/// shows it with work. Informational for the orchestrator: a stand-down is
+/// someone's decision, not a failure to report.
+fn log_stand_down(project: &Project, workspace: &str, reason: &str) {
+    if let Err(e) =
+        shelbi_state::append_supervision_event(&project.name, Some(workspace), "stand-down", reason)
+    {
+        tracing::warn!(workspace = %workspace, error = %e, "append_supervision_event failed");
+    }
+    tracing::info!(
+        workspace = %workspace,
+        reason = %reason,
+        "supervisor stood down: pane went down on purpose with a task still on the slot",
+    );
+}
+
+/// Bring back a pane the user re-opened after it went down on purpose, with its
+/// conversation (`--continue`). A slot with nothing assigned has nothing to
+/// resume and stays down.
+fn resume_stood_down_workspace(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    task_id: Option<&str>,
+) {
+    let Some(task_id) = task_id else { return };
+    let (action, reason) = match resume_dev_workspace(project, workspace, task_id) {
+        Ok(()) => ("restart", "reopen".to_string()),
+        Err(e) => {
+            tracing::warn!(workspace = %workspace.name, task = %task_id, error = %e, "resume of a re-opened pane failed");
+            ("restart-failed", e)
+        }
+    };
+    if let Err(e) = shelbi_state::append_supervision_event(
+        &project.name,
+        Some(&workspace.name),
+        action,
+        &reason,
+    ) {
+        tracing::warn!(workspace = %workspace.name, error = %e, "append_supervision_event failed");
+    }
+}
+
+/// What [`redispatch_workspace`] did.
+#[derive(Debug, PartialEq, Eq)]
+enum Redispatch {
+    Relaunched,
+    /// The task no longer belongs on this slot; nothing was launched. Carries
+    /// the `reason=` token for the stand-down line.
+    Superseded(&'static str),
+}
+
+/// Why a task can't be relaunched on `workspace_name`, read from the task itself
+/// rather than the board index the supervisor decided from: the index can lag a
+/// `workspace stop`, a reassignment or a move by a tick or more. `None` means it
+/// still belongs on the slot.
+fn redispatch_superseded(
+    project: &Project,
+    workspace_name: &str,
+    task: &shelbi_core::Issue,
+) -> Option<&'static str> {
+    if task.assigned_to.as_deref() != Some(workspace_name) {
+        return Some("task-reassigned");
+    }
+    if !task_is_active(project, task) {
+        return Some("task-not-active");
+    }
+    if shelbi_state::is_task_parked(&project.name, &task.id).unwrap_or(false) {
+        return Some("task-parked");
+    }
+    None
+}
+
+/// Relaunch `workspace` on `task_id`, re-sending the task prompt, unless the
+/// task has since left the slot ([`redispatch_superseded`]). Reuses the normal
+/// dispatch primitive ([`start_workspace_on_task`], which itself
 /// kill-then-respawns the pane and re-pastes the prompt), so a supervised
 /// restart is byte-for-byte the same as a fresh `task start` minus the board
 /// move — the card is already in its active status and stays there.
@@ -4817,8 +5083,16 @@ fn redispatch_workspace(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     task_id: &str,
-) -> std::result::Result<(), String> {
-    let tf = load_issue(project, task_id).map_err(|e| e.to_string())?;
+) -> std::result::Result<Redispatch, String> {
+    let current = shelbi_state::issue_store_for_project(project)
+        .and_then(|store| store.get(task_id))
+        .map_err(|e| e.to_string())?;
+    let Some(tf) = current else {
+        return Ok(Redispatch::Superseded("task-gone"));
+    };
+    if let Some(why) = redispatch_superseded(project, &workspace.name, &tf.task) {
+        return Ok(Redispatch::Superseded(why));
+    }
     let workflow = shelbi_state::load_task_workflow(&project.name, project, &tf.task)
         .map_err(|e| e.to_string())?;
     let branch =
@@ -4837,7 +5111,7 @@ fn redispatch_workspace(
         },
     )
     .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(Redispatch::Relaunched)
 }
 
 
@@ -4880,8 +5154,16 @@ fn maybe_supervise_orchestrator(
         has_work: true,
     };
     match state.decide(&inputs, Instant::now()) {
-        SupervisionAction::None => {}
+        // The orchestrator is always wanted, so it never reads as deliberate.
+        SupervisionAction::None | SupervisionAction::StandDown => {}
         SupervisionAction::Restart => {
+            // A launch like any other, so a quit stops it before it starts: a
+            // project mid-quit has just killed this orchestrator on purpose,
+            // and the kill reads as a crash here.
+            let launch = crate::cancel::register(&project.name, None, crate::cancel::JobKind::Launch);
+            if launch.is_cancelled() {
+                return;
+            }
             // Bring a fresh orchestrator session up (the session half of
             // `ensure_dashboard`, under the dashboard lock) and wait for it to
             // answer. Only a live session is a restart; the layout event then
@@ -5169,6 +5451,8 @@ struct ReviewResumeState {
     /// transient wedged/"not listening" read never relaunches a slot whose agent
     /// is actually alive (`rt-review-slot-relaunch-loop`).
     dead_streak: u32,
+    /// The stand-down line for this death is already in `events.log`.
+    stand_down_logged: bool,
 }
 
 impl ReviewResumeState {
@@ -5178,6 +5462,7 @@ impl ReviewResumeState {
     /// an unrelated crash much later starts counting from zero.
     fn note_alive(&mut self, now: Instant) {
         self.dead_streak = 0;
+        self.stand_down_logged = false;
         match self.restarts.last() {
             Some(&last) if now.duration_since(last) >= STABLE_RECOVERY => {
                 self.restarts.clear();
@@ -5353,16 +5638,32 @@ fn maybe_resume_stranded_review_slots(
             continue;
         }
 
-        // A TUI reopen of a gave-up review slot ("Reviewer") drops a
-        // relaunch marker; re-arm the budget so the slot resumes with a fresh
-        // count instead of staying down behind a latched give-up.
-        if shelbi_state::supervision_relaunch::consume_supervision_relaunch(
+        // A TUI reopen of a review slot ("Reviewer") that gave up or was left
+        // down drops a relaunch marker; re-arm the budget so the slot resumes
+        // with a fresh count instead of staying down. It's an explicit request,
+        // so it skips the wait for a second confirming poll.
+        let reopened = shelbi_state::supervision_relaunch::consume_supervision_relaunch(
             &project.name,
             &shelbi_state::supervision_relaunch::review_resume_relaunch_key(&ws.name),
         )
-        .unwrap_or(false)
-        {
+        .unwrap_or(false);
+        if reopened {
             entry.request_relaunch();
+            entry.dead_streak = CONSECUTIVE_DEAD_BEFORE_RESUME - 1;
+        }
+
+        // A review agent the user `/exit`ed, or a slot stopped or reaped, went
+        // down on purpose. Leave it down until someone asks for it back.
+        let death = backend().slot_death(&host, &addr);
+        if death == SlotDeath::Exiting {
+            continue;
+        }
+        if !reopened && death.keeps_slot_down() {
+            if !entry.stand_down_logged {
+                entry.stand_down_logged = true;
+                log_stand_down(project, &ws.name, death.stand_down_reason());
+            }
+            continue;
         }
 
         // Hysteresis: a stranded slot must read confirmed-dead on two
@@ -5507,6 +5808,18 @@ fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Assigned
     let Some(board) = warm_board(project) else {
         return AssignedReviewTask::Unknown;
     };
+    match review_task_on_board(project, board, workspace_name) {
+        Some(task_id) => AssignedReviewTask::Assigned(task_id),
+        Option::None => AssignedReviewTask::None,
+    }
+}
+
+/// The review-column task on `board` pinned to `workspace_name`.
+fn review_task_on_board(
+    project: &Project,
+    board: Vec<shelbi_state::IssueFile>,
+    workspace_name: &str,
+) -> Option<String> {
     // Resolve ownership through the local assignment overlay for a remote
     // backend, NOT the `assigned_to` the index carries. On a remote (GitHub)
     // board, assignment lives in the daemon's overlay marker files, never on the
@@ -5534,13 +5847,10 @@ fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Assigned
         };
         owner == Some(workspace_name)
     };
-    match board
+    board
         .into_iter()
         .find(|tf| tf.task.column == Column::review() && owner_is_slot(tf))
-    {
-        Some(tf) => AssignedReviewTask::Assigned(tf.task.id),
-        Option::None => AssignedReviewTask::None,
-    }
+        .map(|tf| tf.task.id)
 }
 
 /// The active-category (dev) task assignment of a slot, carrying board freshness
@@ -5617,6 +5927,8 @@ struct DevResumeState {
     /// [`ReviewResumeState::dead_streak`]. A resume fires only once it reaches
     /// [`CONSECUTIVE_DEAD_BEFORE_RESUME`] (`rt-review-slot-relaunch-loop`).
     dead_streak: u32,
+    /// The stand-down line for this death is already in `events.log`.
+    stand_down_logged: bool,
 }
 
 impl DevResumeState {
@@ -5628,6 +5940,7 @@ impl DevResumeState {
     fn note_alive(&mut self, now: Instant) {
         self.ever_alive = true;
         self.dead_streak = 0;
+        self.stand_down_logged = false;
         match self.restarts.last() {
             Some(&last) if now.duration_since(last) >= STABLE_RECOVERY => {
                 self.restarts.clear();
@@ -5712,7 +6025,7 @@ const DISPATCH_CONFIRM_GRACE: Duration = Duration::from_secs(60);
 /// is the supervisor's). If it's dead and never seen alive, and a live
 /// `in_progress` task is still assigned (and not parked), re-probe once more
 /// right before relaunching (the board/park reads aren't free) and resume only
-/// if still dead. Probe failures read as ALIVE so a transient tmux hiccup never
+/// if still dead, unless it went down on purpose ([`SlotDeath::keeps_slot_down`]). Probe failures read as ALIVE so a transient tmux hiccup never
 /// triggers a resume onto a genuinely working slot.
 fn maybe_resume_stranded_dev_slots(
     project: &Project,
@@ -5827,6 +6140,22 @@ fn maybe_resume_stranded_dev_slots(
             || shelbi_state::recent_dispatch_active(&project.name, &ws.name, DISPATCH_CONFIRM_GRACE)
         {
             entry.note_alive(now);
+            continue;
+        }
+
+        // A pane that went down on purpose isn't stranded, even at first sight:
+        // a clean `/exit` or a `workspace stop` from before this poller started
+        // still stands, and only a quit or bounce is meant to come back. Reopening
+        // it is the pane supervisor's to honor, so that marker isn't consumed here.
+        let death = backend().slot_death(&host, &addr);
+        if death == SlotDeath::Exiting {
+            continue;
+        }
+        if death.keeps_slot_down() {
+            if !entry.stand_down_logged {
+                entry.stand_down_logged = true;
+                log_stand_down(project, &ws.name, death.stand_down_reason());
+            }
             continue;
         }
 
@@ -6079,6 +6408,10 @@ fn ensure_review_marker_and_serving_state(
 /// "nothing for the pending-load state, fires once when ready" contract: a slot
 /// still booting never reaches here (its probe hasn't passed), and a slot that
 /// stays serving across ticks doesn't re-emit.
+///
+/// The edge is per task. A slot still reading `Serving` from its last task, in
+/// the status file or only in `last_known` (the status was cleared by a teardown
+/// this loop didn't see), hasn't served this one yet.
 fn record_review_serving(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
@@ -6086,7 +6419,14 @@ fn record_review_serving(
     url: Option<&str>,
     last_known: &mut Option<WorkspaceState>,
 ) {
-    let prior = load_prior(&workspace.name, last_known);
+    let serving_another = match load_workspace_status(&project.name, &workspace.name) {
+        Ok(status) => status.and_then(|s| s.current_task).as_deref() != Some(task_id),
+        // An unreadable status proves nothing, and treating it as an edge would
+        // emit on every tick it stays unreadable.
+        Err(_) => false,
+    };
+    let prior = load_prior(&project.name, &workspace.name, last_known)
+        .filter(|p| !(p.state == WorkspaceState::Serving && serving_another));
     let outcome = decide(
         &workspace.name,
         Some(task_id.to_string()),
@@ -6094,7 +6434,7 @@ fn record_review_serving(
         WorkspaceState::Serving,
         Utc::now(),
     );
-    if let Err(e) = save_workspace_status(&outcome.status) {
+    if let Err(e) = save_workspace_status(&project.name, &outcome.status) {
         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status (serving) failed");
     }
     if outcome.transitioned {
@@ -6180,8 +6520,8 @@ fn emit_review_ready(
 /// Reap a review slot whose task is resolved — no review-column task points at
 /// it, the state a review → done accept (or a bounce / hand move / eviction)
 /// leaves behind. Clears any lingering `.shelbi/shelbi-review-loaded` marker (so
-/// the sidebar drops the phantom **Ready for Review** row) and, on a live
-/// non-user-shell pane, kills it (stopping the server it parented) and drops the
+/// the sidebar drops the phantom **Ready for Review** row), ends its editor and
+/// diff sessions and, on a live non-user-shell pane, kills it (stopping the server it parented) and drops the
 /// slot's stale `status.yaml` so it returns to a clean idle. Returns `true` when
 /// it took authoritative action (killed the pane, or cleared a marker) so the
 /// caller skips the rest of the tick.
@@ -6226,6 +6566,9 @@ fn maybe_reap_orphaned_review_slot(
             tracing::warn!(workspace = %workspace.name, error = %e, "clear_review_loaded_marker failed");
         }
     }
+    // Its editor and diff sessions go whatever the pane's doing: the next task
+    // loaded here must not find them, and a client that went away never asks.
+    crate::review_session::kill_content_sessions(&project.name, &workspace.name);
     // Kill only a live, non-user-shell pane — the same guard the dev orphan
     // path uses so a user shell opened on the idle slot is never reaped. On a
     // dead / unreachable / user-shell verdict there's nothing to reap: report
@@ -6240,13 +6583,19 @@ fn maybe_reap_orphaned_review_slot(
         | crate::workspace::SlotProbe::Dead
         | crate::workspace::SlotProbe::Unreachable { .. } => return had_marker,
     }
-    match crate::workspace::kill_workspace_pane(host, addr, &workspace.name) {
+    match crate::workspace::kill_workspace_pane(
+        &project.name,
+        host,
+        addr,
+        &workspace.name,
+        KillReason::Reap,
+    ) {
         Ok(()) => {
             // Drop the now-idle slot's stale status.yaml so `shelbi workspace
             // status` stops reporting the agent's last observed state (a killed
             // pane emits no further markers, so the poller could never refresh
             // it — it would stay frozen at `working`/`blocked` for hours).
-            if let Err(e) = shelbi_state::clear_workspace_status(&workspace.name) {
+            if let Err(e) = shelbi_state::clear_workspace_status(&project.name, &workspace.name) {
                 tracing::warn!(workspace = %workspace.name, error = %e, "clear_workspace_status failed");
             }
             if let Err(e) = shelbi_state::append_workspace_pane_event(
@@ -6451,17 +6800,21 @@ fn maybe_reconcile_orphaned_pane(
         | crate::workspace::SlotProbe::Unreachable { .. } => return false,
     }
 
-    // Orphan confirmed. Close the slot and record the reap. `kill_workspace_pane`
-    // marks the expected-teardown so the lifecycle wrapper doesn't also emit a
-    // spurious `pane_alive=false reason=signal:SIGHUP`; our own
+    // Orphan confirmed. Close the slot and record the reap. Our own
     // `pane_alive=false reason=orphaned-slot-reaped` is the trail the
     // orchestrator (and `shelbi events tail`) sees for the freed slot.
-    match crate::workspace::kill_workspace_pane(host, addr, &workspace.name) {
+    match crate::workspace::kill_workspace_pane(
+        &project.name,
+        host,
+        addr,
+        &workspace.name,
+        KillReason::Reap,
+    ) {
         Ok(()) => {
             // Drop the freed slot's stale status.yaml (a killed pane emits no
             // further markers, so the poller can't refresh it) so it returns to
             // a clean idle rather than reporting its last observed state.
-            if let Err(e) = shelbi_state::clear_workspace_status(&workspace.name) {
+            if let Err(e) = shelbi_state::clear_workspace_status(&project.name, &workspace.name) {
                 tracing::warn!(workspace = %workspace.name, error = %e, "clear_workspace_status failed");
             }
             if let Err(e) = shelbi_state::append_workspace_pane_event(
@@ -6950,7 +7303,7 @@ mod tests {
         let mut last_known = None;
         record_review_serving(&project, &ws, "t-serve", None, &mut last_known);
 
-        let s = shelbi_state::load_workspace_status(&ws.name)
+        let s = shelbi_state::load_workspace_status(&project.name, &ws.name)
             .unwrap()
             .expect("status.yaml written");
         assert_eq!(s.state, WorkspaceState::Serving);
@@ -6960,7 +7313,7 @@ mod tests {
 
         // Same state again → not a transition; last_transition is preserved.
         record_review_serving(&project, &ws, "t-serve", None, &mut last_known);
-        let s2 = shelbi_state::load_workspace_status(&ws.name).unwrap().unwrap();
+        let s2 = shelbi_state::load_workspace_status(&project.name, &ws.name).unwrap().unwrap();
         assert_eq!(s2.state, WorkspaceState::Serving);
         assert_eq!(s2.last_transition, first_transition);
 
@@ -8465,6 +8818,320 @@ Auto mode works better when it knows your environment. Takes about a minute.
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    // -- review-loaded marker: it only counts for the slot's current task ----
+
+    /// A file-system project whose only workspace is a review slot, in a fresh
+    /// `SHELBI_HOME`. Restores the env when dropped.
+    struct ReviewSlotHome {
+        home: std::path::PathBuf,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl ReviewSlotHome {
+        fn new() -> Self {
+            Self::at(review_serving_home())
+        }
+
+        fn at(home: std::path::PathBuf) -> Self {
+            let prior = std::env::var_os("SHELBI_HOME");
+            std::env::set_var("SHELBI_HOME", &home);
+            Self { home, prior }
+        }
+
+        fn project(&self) -> Project {
+            let work_dir = self.home.join("repo");
+            std::fs::create_dir_all(&work_dir).unwrap();
+            let mut project = local_project(&work_dir);
+            project.name = "demo".into();
+            project.workspaces[0].tags = vec!["review".into()];
+            project.workspaces[0].slot = Some(4310);
+            shelbi_state::save_project(&project).unwrap();
+            project
+        }
+    }
+
+    impl Drop for ReviewSlotHome {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(h) => std::env::set_var("SHELBI_HOME", h),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn save_review_task(project: &Project, id: &str, column: Column) {
+        let mut task = in_progress_task(id, "alpha");
+        task.column = column;
+        shelbi_state::save_task(&project.name, &task, "body").unwrap();
+    }
+
+    fn plant_review_marker(project: &Project, body: &str) -> std::path::PathBuf {
+        let marker = crate::workspace::workspace_review_loaded_marker(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, body).unwrap();
+        marker
+    }
+
+    fn serving_task(project: &Project) -> Option<String> {
+        review_slot_serving_task(
+            project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+        )
+    }
+
+    fn review_ready_tasks() -> Vec<String> {
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default();
+        log.lines()
+            .filter(|l| l.contains(" review-ready "))
+            .filter_map(|l| l.split_whitespace().find_map(|f| f.strip_prefix("task=")))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_review_marker_counts_only_when_it_names_the_slots_task() {
+        let _g = crate::test_lock::acquire();
+        let home = ReviewSlotHome::new();
+        let project = home.project();
+        save_review_task(&project, "task-a", Column::done());
+        save_review_task(&project, "task-b", Column::review());
+
+        // No marker: nothing is confirmed.
+        assert_eq!(serving_task(&project), None);
+
+        // The last task's leftover, on a slot now holding the next one.
+        plant_review_marker(&project, "task-a http://localhost:4310\n");
+        assert_eq!(serving_task(&project), None);
+
+        // The current task's own marker.
+        plant_review_marker(&project, "task-b http://localhost:4310\n");
+        assert_eq!(serving_task(&project).as_deref(), Some("task-b"));
+
+        // The right name, but the task has since left the slot.
+        save_review_task(&project, "task-b", Column::done());
+        assert_eq!(serving_task(&project), None);
+    }
+
+    #[test]
+    fn the_review_marker_check_holds_on_a_stale_board() {
+        // The fold exists for ticks like this one, when the board can't be read
+        // warm: going by the warm read would flap serving -> awaiting_input.
+        let _g = crate::test_lock::acquire();
+        let gh_home = gh_guard_home("marker-stale");
+        let prior = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &gh_home);
+        let work_dir = gh_home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let name = "ghguard-marker-stale";
+        let project = gh_review_project(&work_dir, name);
+        seed_stale_index(name);
+        shelbi_state::set_task_assignment(name, "t", Some("alpha")).unwrap();
+
+        plant_review_marker(&project, "t\n");
+        assert!(matches!(
+            assigned_review_task_for(&project, "alpha"),
+            AssignedReviewTask::Unknown
+        ));
+        assert_eq!(serving_task(&project).as_deref(), Some("t"));
+        plant_review_marker(&project, "other\n");
+        assert_eq!(serving_task(&project), None);
+
+        match prior {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&gh_home);
+    }
+
+    #[test]
+    fn with_no_board_a_review_marker_counts_for_the_task_status_says_is_serving() {
+        let _g = crate::test_lock::acquire();
+        let gh_home = gh_guard_home("marker-cold");
+        let prior = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &gh_home);
+        let work_dir = gh_home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        // No index published: the board is cold.
+        let project = gh_review_project(&work_dir, "ghguard-marker-cold");
+        plant_review_marker(&project, "t\n");
+
+        // Nothing committed: nothing to hold.
+        assert_eq!(serving_task(&project), None);
+
+        let status = |state, task: &str| WorkspaceStatus {
+            workspace: "alpha".into(),
+            current_task: Some(task.into()),
+            state,
+            last_transition: Utc::now(),
+            last_seen: Utc::now(),
+        };
+        save_workspace_status(&project.name, &status(WorkspaceState::Serving, "t")).unwrap();
+        assert_eq!(serving_task(&project).as_deref(), Some("t"));
+
+        // Serving something else, or not serving: the marker doesn't count.
+        save_workspace_status(&project.name, &status(WorkspaceState::Serving, "other")).unwrap();
+        assert_eq!(serving_task(&project), None);
+        save_workspace_status(&project.name, &status(WorkspaceState::AwaitingInput, "t")).unwrap();
+        assert_eq!(serving_task(&project), None);
+
+        match prior {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&gh_home);
+    }
+
+    #[test]
+    fn the_next_tasks_review_ready_fires_over_a_leftover_marker() {
+        let _g = crate::test_lock::acquire();
+        let home = ReviewSlotHome::new();
+        let project = home.project();
+        let ws = project.workspaces[0].clone();
+        save_review_task(&project, "task-a", Column::review());
+        let marker = crate::workspace::workspace_review_loaded_marker(&project.machines[0], &ws);
+
+        // Task A reaches serving and leaves its marker behind when it's approved.
+        let mut last_known = None;
+        ensure_review_marker_and_serving_state(
+            &project, &ws, &Host::Local, &marker, "task-a", None, &mut last_known,
+        );
+        assert_eq!(review_ready_tasks(), ["task-a"]);
+        save_review_task(&project, "task-a", Column::done());
+        save_review_task(&project, "task-b", Column::review());
+
+        // B sitting idle at its prompt isn't serving yet: A's marker must not
+        // fold it, or B's real edge below would be no transition at all.
+        let folded = fold_review_serving(
+            WorkspaceState::AwaitingInput,
+            serving_task(&project).is_some(),
+        );
+        assert_eq!(folded, WorkspaceState::AwaitingInput);
+
+        // A review with nothing to probe goes straight to serving on its first
+        // tick, still reading A's `Serving`. That's B's edge all the same.
+        ensure_review_marker_and_serving_state(
+            &project, &ws, &Host::Local, &marker, "task-b", None, &mut last_known,
+        );
+        assert_eq!(review_ready_tasks(), ["task-a", "task-b"]);
+        assert_eq!(
+            crate::workspace::read_review_loaded_marker(&Host::Local, &marker).unwrap().as_deref(),
+            Some("task-b"),
+        );
+        let status = load_workspace_status(&project.name, &ws.name).unwrap().unwrap();
+        assert_eq!(status.current_task.as_deref(), Some("task-b"));
+
+        // Only the edge fires: B staying serving is silent.
+        ensure_review_marker_and_serving_state(
+            &project, &ws, &Host::Local, &marker, "task-b", None, &mut last_known,
+        );
+        assert_eq!(review_ready_tasks(), ["task-a", "task-b"]);
+    }
+
+    #[test]
+    fn review_ready_fires_when_a_teardown_cleared_the_status_under_last_known() {
+        // A close clears status.yaml from another thread, leaving this loop's
+        // `last_known` at the last task's `Serving`.
+        let _g = crate::test_lock::acquire();
+        let home = ReviewSlotHome::new();
+        let project = home.project();
+        let ws = project.workspaces[0].clone();
+        let mut last_known = None;
+        record_review_serving(&project, &ws, "task-a", None, &mut last_known);
+        shelbi_state::clear_workspace_status(&project.name, &ws.name).unwrap();
+        assert_eq!(last_known, Some(WorkspaceState::Serving));
+
+        record_review_serving(&project, &ws, "task-b", None, &mut last_known);
+        assert_eq!(review_ready_tasks(), ["task-a", "task-b"]);
+    }
+
+    /// Stand in for the live session `name` under the current `SHELBI_HOME`:
+    /// answers the hello and reports each kill it's sent.
+    fn stand_in_session(
+        id: &str,
+        name: &str,
+    ) -> (
+        shelbi_session::lock::SessionLock,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        use std::io::{Read, Write};
+        let dir = shelbi_state::sessions_dir().unwrap().join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = shelbi_session::Meta {
+            id: id.into(),
+            name: name.into(),
+            argv: vec!["cat".into()],
+            cwd: dir.clone(),
+            task: Some("task-a".into()),
+            launched_at: Utc::now().to_rfc3339(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(dir.join("meta.json"), meta.to_json().unwrap()).unwrap();
+        let lock = shelbi_session::lock::SessionLock::acquire(&dir.join("lock")).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(dir.join("sock")).unwrap();
+        let (killed, kills) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let hello = shelbi_proto::Frame::Hello(shelbi_proto::Hello {
+                protocol_version: shelbi_proto::PROTOCOL_VERSION,
+                colors: None,
+                capabilities: Vec::new(),
+            })
+            .encode()
+            .unwrap();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = stream.write_all(&hello);
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 256];
+                while let Ok(n @ 1..) = stream.read(&mut chunk) {
+                    buf.extend_from_slice(&chunk[..n]);
+                    while let Ok((frame, used)) = shelbi_proto::Frame::decode(&buf) {
+                        buf.drain(..used);
+                        if matches!(frame, shelbi_proto::Frame::Kill(_)) {
+                            let _ = killed.send(());
+                        }
+                    }
+                }
+            }
+        });
+        (lock, kills)
+    }
+
+    #[test]
+    fn reaping_a_review_slot_ends_its_content_sessions() {
+        // No marker and a dead pane: the state a client gone before the decision
+        // leaves, where nothing else would ever end the editor and diff.
+        let _g = crate::test_lock::acquire();
+        // A home short enough for the stand-ins' socket paths (SUN_LEN).
+        let home = ReviewSlotHome::at(
+            std::path::Path::new("/tmp").join(format!("shelbi-rap-{}", std::process::id())),
+        );
+        let project = home.project();
+        let ws = project.workspaces[0].clone();
+        let marker = crate::workspace::workspace_review_loaded_marker(&project.machines[0], &ws);
+        let (_editor_lock, editor_kills) = stand_in_session("rev-editor", "demo/review/alpha/editor");
+        let (_diff_lock, diff_kills) = stand_in_session("rev-diff", "demo/review/alpha/diff");
+        let (_other_lock, other_kills) = stand_in_session("rev-other", "demo/review/beta/diff");
+
+        let addr = SessionTarget::slot("shelbi-nonexistent-review-reap", "alpha");
+        maybe_reap_orphaned_review_slot(&project, &ws, &Host::Local, &addr, &marker);
+
+        let wait = std::time::Duration::from_secs(5);
+        assert!(editor_kills.recv_timeout(wait).is_ok(), "the editor session is ended");
+        assert!(diff_kills.recv_timeout(wait).is_ok(), "the diff session is ended");
+        assert!(
+            other_kills.try_recv().is_err(),
+            "another slot's session is none of this reap's business",
+        );
+    }
+
     #[test]
     fn warm_board_is_none_on_a_cold_board_and_some_when_warm() {
         let _g = crate::test_lock::acquire();
@@ -8887,6 +9554,404 @@ Auto mode works better when it knows your environment. Takes about a minute.
 
 
 
+    /// Leave a dead session behind on `project`'s `alpha` slot, the way a real
+    /// one is left: its directory with the exit record and any kill reason.
+    fn seed_dead_alpha_session(project: &Project, exit: &str, kill_reason: Option<&str>) {
+        let addr = crate::workspace::workspace_target(project, &project.workspaces[0]).unwrap();
+        let name = crate::session_process_backend::session_name(&addr);
+        let id = format!(
+            "dead-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = shelbi_state::sessions_dir().unwrap().join(&id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = shelbi_session::Meta {
+            id,
+            name,
+            argv: vec!["claude".into()],
+            cwd: dir.clone(),
+            task: None,
+            launched_at: Utc::now().to_rfc3339(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(dir.join("meta.json"), meta.to_json().unwrap()).unwrap();
+        std::fs::write(dir.join("lock"), b"").unwrap();
+        let record = format!(r#"{{{exit},"exited_at":"2026-11-05T10:00:00Z"}}"#);
+        std::fs::write(dir.join("exit.json"), record).unwrap();
+        if let Some(reason) = kill_reason {
+            std::fs::write(dir.join("kill-reason"), reason).unwrap();
+        }
+    }
+
+    /// Run the per-workspace supervisor for `alpha`: one tick that sees the pane
+    /// up, then `dead_ticks` that see it down.
+    fn supervise_alpha_after_it_dies(project: &Project, state: &mut SupervisionState, dead_ticks: u32) {
+        let ws = &project.workspaces[0];
+        let addr = crate::workspace::workspace_target(project, ws).unwrap();
+        let host = shelbi_core::Host::Local;
+        maybe_supervise_workspace(project, ws, &host, &addr, true, state);
+        for _ in 0..dead_ticks {
+            maybe_supervise_workspace(project, ws, &host, &addr, false, state);
+        }
+    }
+
+    fn events_log() -> String {
+        std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default()
+    }
+
+    /// A `github`-backed project whose board index (warm) shows `t-dev` active on
+    /// `alpha`. The issue itself isn't readable from the fabricated tracker, so a
+    /// supervisor that decided to restart surfaces as a `task-gone` stand-down or
+    /// a `restart-failed`, never as a launched agent.
+    fn gh_project_with_active_task(home: &std::path::Path, name: &str) -> Project {
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = gh_dev_project(&work_dir, name);
+        seed_warm_index(name, vec![idx_issue("t-dev", "in-progress", Some("alpha"))]);
+        project
+    }
+
+    #[test]
+    fn a_user_exit_stands_down_visibly_and_does_not_relaunch() {
+        let _g = crate::test_lock::acquire();
+        let home = gh_guard_home("sup-exit");
+        std::env::set_var("SHELBI_HOME", &home);
+        let project = gh_project_with_active_task(&home, "ghguard-sup-exit");
+        seed_dead_alpha_session(&project, r#""code":0"#, None);
+
+        let mut state = SupervisionState::default();
+        supervise_alpha_after_it_dies(&project, &mut state, 3);
+
+        let log = events_log();
+        assert_eq!(
+            log.matches("workspace=alpha supervision=stand-down reason=clean-exit").count(),
+            1,
+            "the stand-down is surfaced once, not every tick; log:\n{log}"
+        );
+        assert!(!log.contains("supervision=restart"), "no relaunch; log:\n{log}");
+        assert_eq!(state.restart_count(), 0);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn workspace_stop_stays_down_even_while_the_index_still_shows_the_task() {
+        let _g = crate::test_lock::acquire();
+        let home = gh_guard_home("sup-stop");
+        std::env::set_var("SHELBI_HOME", &home);
+        // The stop released the card, but the published index hasn't caught up.
+        let project = gh_project_with_active_task(&home, "ghguard-sup-stop");
+        seed_dead_alpha_session(&project, r#""code":143"#, Some("stop"));
+
+        let mut state = SupervisionState::default();
+        supervise_alpha_after_it_dies(&project, &mut state, 2);
+
+        let log = events_log();
+        assert!(log.contains("supervision=stand-down reason=stop"), "log:\n{log}");
+        assert!(!log.contains("supervision=restart"), "no relaunch; log:\n{log}");
+
+        // Nor does the first-sight resume pass bring it back.
+        let mut resume: HashMap<String, DevResumeState> = HashMap::new();
+        maybe_resume_stranded_dev_slots(&project, &mut resume);
+        maybe_resume_stranded_dev_slots(&project, &mut resume);
+        let log = events_log();
+        assert!(!log.contains("status=dev-resume"), "log:\n{log}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_handoff_into_an_active_gate_does_not_redispatch_the_dev_slot() {
+        // The gate card stays active and assigned to the dev slot, so without the
+        // recorded reason this reads as a crash with work. Covers an agent that
+        // died on its own just before the handoff's kill (the kill then has
+        // nothing to do, but the handoff still has to stick).
+        let _g = crate::test_lock::acquire();
+        let home = gh_guard_home("sup-gate");
+        std::env::set_var("SHELBI_HOME", &home);
+        let project = gh_project_with_active_task(&home, "ghguard-sup-gate");
+        seed_dead_alpha_session(&project, r#""code":1"#, None);
+
+        let ws = &project.workspaces[0];
+        let addr = crate::workspace::workspace_target(&project, ws).unwrap();
+        crate::workspace::kill_workspace_pane(
+            &project.name,
+            &shelbi_core::Host::Local,
+            &addr,
+            &ws.name,
+            KillReason::Handoff,
+        )
+        .unwrap();
+
+        let mut state = SupervisionState::default();
+        supervise_alpha_after_it_dies(&project, &mut state, 2);
+
+        let log = events_log();
+        assert!(log.contains("supervision=stand-down reason=handoff"), "log:\n{log}");
+        assert!(!log.contains("supervision=restart"), "no redispatch; log:\n{log}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_redispatch_kill_stands_down_without_a_line() {
+        // A tick landing between a dispatch's kill and its spawn must neither
+        // restart the slot on top of it nor report it as left down.
+        let _g = crate::test_lock::acquire();
+        let home = gh_guard_home("sup-redispatch");
+        std::env::set_var("SHELBI_HOME", &home);
+        let project = gh_project_with_active_task(&home, "ghguard-sup-redispatch");
+        seed_dead_alpha_session(&project, r#""code":143"#, Some("redispatch"));
+
+        let mut state = SupervisionState::default();
+        supervise_alpha_after_it_dies(&project, &mut state, 1);
+
+        let log = events_log();
+        assert!(!log.contains("supervision="), "log:\n{log}");
+        assert_eq!(state.restart_count(), 0);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_real_crash_still_restarts_within_its_budget() {
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shb-sup-crash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        // The work dir is no git repo, so the attempt fails at the worktree step
+        // long before an agent would launch; `restart-failed` proves it was made.
+        let work_dir = home.join("not-a-repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        shelbi_state::save_project(&project).unwrap();
+        let now = Utc::now();
+        let mut task = idx_issue("t-crash", "in-progress", Some("alpha")).task;
+        task.created_at = now;
+        shelbi_state::save_task(&project.name, &task, "work").unwrap();
+        shelbi_state::set_task_assignment(&project.name, "t-crash", Some("alpha")).unwrap();
+        seed_dead_alpha_session(&project, r#""code":1"#, None);
+
+        let mut state = SupervisionState::default();
+        supervise_alpha_after_it_dies(&project, &mut state, 1);
+
+        let log = events_log();
+        assert!(log.contains("workspace=alpha supervision=restart"), "log:\n{log}");
+        assert!(!log.contains("supervision=stand-down"), "log:\n{log}");
+        assert_eq!(state.restart_count(), 1, "the attempt counts against the budget");
+
+        // Backed off: the very next tick doesn't try again.
+        supervise_alpha_after_it_dies(&project, &mut state, 1);
+        assert_eq!(state.restart_count(), 1);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn redispatch_rechecks_the_task_itself_before_relaunching() {
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shb-sup-recheck-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let project = local_project(&home);
+        shelbi_state::save_project(&project).unwrap();
+
+        let active = idx_issue("t", "in-progress", Some("alpha")).task;
+        assert_eq!(redispatch_superseded(&project, "alpha", &active), None);
+
+        let elsewhere = idx_issue("t", "in-progress", Some("beta")).task;
+        assert_eq!(redispatch_superseded(&project, "alpha", &elsewhere), Some("task-reassigned"));
+        let released = idx_issue("t", "todo", None).task;
+        assert_eq!(redispatch_superseded(&project, "alpha", &released), Some("task-reassigned"));
+        let moved_on = idx_issue("t", "review", Some("alpha")).task;
+        assert_eq!(redispatch_superseded(&project, "alpha", &moved_on), Some("task-not-active"));
+
+        shelbi_state::set_task_parked(&project.name, "t").unwrap();
+        assert_eq!(redispatch_superseded(&project, "alpha", &active), Some("task-parked"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_stale_index_cannot_relaunch_a_crashed_slot_whose_task_has_left() {
+        // The session crashed, so nothing says deliberate, and the warm index
+        // still pins the task here. Reading the task itself is what stops it.
+        let _g = crate::test_lock::acquire();
+        let home = gh_guard_home("sup-stale");
+        std::env::set_var("SHELBI_HOME", &home);
+        let project = gh_project_with_active_task(&home, "ghguard-sup-stale");
+        seed_dead_alpha_session(&project, r#""code":1"#, None);
+
+        let mut state = SupervisionState::default();
+        supervise_alpha_after_it_dies(&project, &mut state, 1);
+
+        let log = events_log();
+        assert!(
+            log.contains("workspace=alpha supervision=stand-down reason=task-gone"),
+            "log:\n{log}"
+        );
+        assert!(!log.contains("supervision=restart"), "nothing relaunched; log:\n{log}");
+        assert_eq!(state.restart_count(), 0, "not a crash, so no budget spent");
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_first_sight_resume_honors_a_clean_exit_but_still_resumes_a_quit() {
+        let _g = crate::test_lock::acquire();
+        let home = gh_guard_home("resume-why");
+        std::env::set_var("SHELBI_HOME", &home);
+        let name = "ghguard-resume-why";
+        let project = gh_project_with_active_task(&home, name);
+        shelbi_state::set_task_assignment(name, "t-dev", Some("alpha")).unwrap();
+        seed_dead_alpha_session(&project, r#""code":0"#, None);
+
+        let mut state: HashMap<String, DevResumeState> = HashMap::new();
+        for _ in 0..3 {
+            maybe_resume_stranded_dev_slots(&project, &mut state);
+        }
+        let log = events_log();
+        assert!(!log.contains("status=dev-resume"), "a clean exit stays down; log:\n{log}");
+        assert_eq!(
+            log.matches("supervision=stand-down reason=clean-exit").count(),
+            1,
+            "log:\n{log}"
+        );
+
+        // The next session on the slot went down with the project instead.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        seed_dead_alpha_session(&project, r#""code":143"#, Some("quit"));
+        let mut state: HashMap<String, DevResumeState> = HashMap::new();
+        maybe_resume_stranded_dev_slots(&project, &mut state);
+        maybe_resume_stranded_dev_slots(&project, &mut state);
+        let log = events_log();
+        assert!(log.contains("status=dev-resume"), "a quit is resumed on reopen; log:\n{log}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn reopening_a_stood_down_pane_brings_it_back() {
+        let _g = crate::test_lock::acquire();
+        let home = gh_guard_home("sup-reopen");
+        std::env::set_var("SHELBI_HOME", &home);
+        let name = "ghguard-sup-reopen";
+        let project = gh_project_with_active_task(&home, name);
+        seed_dead_alpha_session(&project, r#""code":0"#, None);
+
+        let mut state = SupervisionState::default();
+        supervise_alpha_after_it_dies(&project, &mut state, 1);
+        assert!(!events_log().contains("supervision=restart"));
+
+        shelbi_state::supervision_relaunch::request_supervision_relaunch(
+            name,
+            &shelbi_state::supervision_relaunch::workspace_supervise_relaunch_key("alpha"),
+        )
+        .unwrap();
+        let ws = &project.workspaces[0];
+        let addr = crate::workspace::workspace_target(&project, ws).unwrap();
+        maybe_supervise_workspace(&project, ws, &shelbi_core::Host::Local, &addr, false, &mut state);
+
+        // The fabricated issue can't actually launch; the attempt is the point.
+        let log = events_log();
+        assert!(log.contains("workspace=alpha supervision=restart"), "log:\n{log}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_reopen_marker_left_on_a_live_pane_cannot_override_a_later_stop() {
+        let _g = crate::test_lock::acquire();
+        let home = gh_guard_home("sup-reopen-stale");
+        std::env::set_var("SHELBI_HOME", &home);
+        let name = "ghguard-sup-reopen-stale";
+        let project = gh_project_with_active_task(&home, name);
+        shelbi_state::supervision_relaunch::request_supervision_relaunch(
+            name,
+            &shelbi_state::supervision_relaunch::workspace_supervise_relaunch_key("alpha"),
+        )
+        .unwrap();
+        seed_dead_alpha_session(&project, r#""code":143"#, Some("stop"));
+
+        let mut state = SupervisionState::default();
+        // The live tick spends the marker before the pane dies.
+        supervise_alpha_after_it_dies(&project, &mut state, 1);
+
+        let log = events_log();
+        assert!(log.contains("supervision=stand-down reason=stop"), "log:\n{log}");
+        assert!(!log.contains("supervision=restart"), "log:\n{log}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_review_agent_the_user_exited_stays_down_until_reopened() {
+        let _g = crate::test_lock::acquire();
+        let home = gh_guard_home("review-exit");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let name = "ghguard-review-exit";
+        let project = gh_review_project(&work_dir, name);
+        seed_warm_index(name, vec![idx_issue("t-rev", "review", Some("alpha"))]);
+        shelbi_state::set_task_assignment(name, "t-rev", Some("alpha")).unwrap();
+        seed_dead_alpha_session(&project, r#""code":0"#, None);
+
+        let mut state: HashMap<String, ReviewResumeState> = HashMap::new();
+        for _ in 0..3 {
+            maybe_resume_stranded_review_slots(&project, &mut state);
+        }
+        let log = events_log();
+        assert!(!log.contains("status=review-"), "log:\n{log}");
+        assert_eq!(
+            log.matches("supervision=stand-down reason=clean-exit").count(),
+            1,
+            "log:\n{log}"
+        );
+
+        shelbi_state::supervision_relaunch::request_supervision_relaunch(
+            name,
+            &shelbi_state::supervision_relaunch::review_resume_relaunch_key("alpha"),
+        )
+        .unwrap();
+        maybe_resume_stranded_review_slots(&project, &mut state);
+        let log = events_log();
+        assert!(
+            log.contains("status=review-resume") || log.contains("status=review-load-failed"),
+            "a reopen attempts the resume at once; log:\n{log}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     fn write_marker(project: &Project, body: &str) -> std::path::PathBuf {
         let marker = crate::workspace::workspace_ready_marker(
             &project.machines[0],
@@ -8995,6 +10060,94 @@ Auto mode works better when it knows your environment. Takes about a minute.
         std::env::remove_var("SHELBI_HUB_SOCK");
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An SSH relay blip used to read as a dead pane and wipe every latch, so a
+    /// worker waiting out a usage limit lost its scheduled resume and sat paused
+    /// until a human noticed. Only a real death may do that.
+    #[test]
+    fn a_relay_blip_keeps_the_scheduled_limit_resume_and_a_death_drops_it() {
+        use crate::session_backend::Liveness;
+
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-blip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        shelbi_state::save_project(&project).unwrap();
+
+        let scheduled = LimitResumeState::Scheduled {
+            incident: LimitResumeIncident {
+                task_id: "fix-login".into(),
+                banner: "session-limit-11:20".into(),
+                reset_hint: Some("11:20am (America/New_York)".into()),
+            },
+            due: Utc::now() + chrono::Duration::hours(1),
+            attempts: 0,
+        };
+        let mut limit_resume = scheduled.clone();
+        let mut last_dialog = Some("trust".to_string());
+        let mut dialog_streak = 2;
+        let mut idle_streak = 1;
+        let mut agent_exited = true;
+        let tick = |limit_resume: &mut LimitResumeState,
+                        last_dialog: &mut Option<String>,
+                        dialog_streak: &mut u32,
+                        idle_streak: &mut u32,
+                        agent_exited: &mut bool| {
+            poll_one(
+                &project,
+                &project.workspaces[0],
+                &mut None,
+                last_dialog,
+                dialog_streak,
+                idle_streak,
+                agent_exited,
+                &mut SupervisionState::default(),
+                limit_resume,
+                &mut OrphanReap::default(),
+                &mut HashMap::new(),
+            );
+        };
+
+        crate::workspace::set_test_pane_liveness(Some(Liveness::Unreachable {
+            reason: "relay down".into(),
+        }));
+        tick(
+            &mut limit_resume,
+            &mut last_dialog,
+            &mut dialog_streak,
+            &mut idle_streak,
+            &mut agent_exited,
+        );
+        assert_eq!(limit_resume, scheduled, "a blip must keep the schedule");
+        assert_eq!(last_dialog.as_deref(), Some("trust"));
+        assert_eq!((dialog_streak, idle_streak, agent_exited), (2, 1, true));
+
+        crate::workspace::set_test_pane_liveness(Some(Liveness::Dead));
+        tick(
+            &mut limit_resume,
+            &mut last_dialog,
+            &mut dialog_streak,
+            &mut idle_streak,
+            &mut agent_exited,
+        );
+        crate::workspace::set_test_pane_liveness(None);
+        assert_eq!(limit_resume, LimitResumeState::Idle, "no pane left to nudge");
+        assert_eq!(last_dialog, None);
+        assert_eq!((dialog_streak, idle_streak, agent_exited), (0, 0, false));
+
+        std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -9402,6 +10555,232 @@ transitions:
             "task should be promoted once the read succeeds"
         );
         assert!(!marker.exists(), "marker should be consumed after promotion");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A throwaway `SHELBI_HOME` with the local fixture project, for the
+    /// transition-marker outcome tests. Returns the home and the project.
+    fn transition_outcome_fixture(tag: &str) -> (std::path::PathBuf, Project) {
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-transition-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        // The move's daemon-version guard probes this socket. Inside a worker
+        // pane it names the live hub, whose version may not match this build.
+        std::env::remove_var("SHELBI_HUB_SOCK");
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        (home, project)
+    }
+
+    fn write_transition_marker(project: &Project, body: &str) -> std::path::PathBuf {
+        let marker = crate::workspace::workspace_transition_marker(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, body).unwrap();
+        marker
+    }
+
+    fn transition_tick(project: &Project) {
+        maybe_apply_transition(
+            project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &SessionTarget::slot("s", "w"),
+        );
+    }
+
+    fn transition_marker_lines() -> Vec<String> {
+        std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(" transition-marker "))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn transition_marker_survives_a_store_read_error_and_applies_on_recovery() {
+        // The regression under test: a gate writes its verdict exactly once, so
+        // a failed read of the task (403, rate limit, network) must not delete
+        // it. The card would stay in the gate with nothing left to retry.
+        let _g = crate::test_lock::acquire();
+        let (home, project) = transition_outcome_fixture("defer");
+
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        // Corrupt the frontmatter so the store's `get` returns `Err` (a stand-in
+        // for any backend read failure) rather than `Ok(None)`.
+        let task_path = shelbi_state::task_path("demo", "fix-login").unwrap();
+        std::fs::write(&task_path, "---\ncolumn: [in_progress\n---\nbody\n").unwrap();
+
+        let marker = write_transition_marker(&project, "fix-login\nreview\n");
+        let sidecar = crate::workspace::workspace_transition_deferred_marker(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+
+        transition_tick(&project);
+        assert!(marker.exists(), "a failed read must not clear the verdict");
+        let lines = transition_marker_lines();
+        assert_eq!(lines.len(), 1, "one deferral line expected: {lines:?}");
+        assert!(
+            lines[0].contains(
+                " transition-marker project=demo task=fix-login workspace=alpha target=review status=deferred reason=load-failed:"
+            ),
+            "line: {}",
+            lines[0]
+        );
+
+        // A repeat of the same failure neither clears nor re-logs.
+        transition_tick(&project);
+        assert!(marker.exists(), "the verdict must outlast a repeat failure");
+        assert_eq!(
+            transition_marker_lines().len(),
+            1,
+            "the deferral must be logged once, not every tick"
+        );
+
+        // The store recovers: the very next tick applies the verdict.
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        transition_tick(&project);
+        let task = shelbi_state::load_task("demo", "fix-login").unwrap().task;
+        assert_eq!(task.column, Column::review(), "the verdict must still apply");
+        assert_eq!(task.assigned_to, None, "an applied verdict releases the card");
+        assert!(!marker.exists(), "an applied verdict consumes the marker");
+        assert!(!sidecar.exists(), "consuming the marker re-arms the next deferral");
+        assert_eq!(
+            transition_marker_lines().len(),
+            1,
+            "an applied verdict is not a non-applied outcome"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn transition_marker_defers_a_failed_move_and_logs_it_once() {
+        // The read succeeds but the write doesn't. The marker has always been
+        // kept here; the outcome used to reach tracing only. A task in a
+        // directory the poller can read but not write fails the move for real.
+        use std::os::unix::fs::PermissionsExt;
+        let _g = crate::test_lock::acquire();
+        let (home, project) = transition_outcome_fixture("move-fail");
+
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        let marker = write_transition_marker(&project, "fix-login\nreview\n");
+        let task_path = shelbi_state::task_path("demo", "fix-login").unwrap();
+        std::fs::set_permissions(&task_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let task_dir = task_path.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&task_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        transition_tick(&project);
+        transition_tick(&project);
+
+        std::fs::set_permissions(&task_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&task_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(marker.exists(), "a failed move must keep the verdict");
+        let lines = transition_marker_lines();
+        assert_eq!(lines.len(), 1, "one deferral line expected: {lines:?}");
+        assert!(
+            lines[0].contains(" task=fix-login ")
+                && lines[0].contains(" status=deferred reason=move-failed:"),
+            "line: {}",
+            lines[0]
+        );
+
+        // Writes work again, so the retried verdict lands.
+        transition_tick(&project);
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login").unwrap().task.column,
+            Column::review(),
+        );
+        assert!(!marker.exists());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn refused_transition_marker_is_cleared_and_logged_with_its_reason() {
+        let _g = crate::test_lock::acquire();
+        let (home, project) = transition_outcome_fixture("refused");
+
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        let marker = write_transition_marker(&project, "fix-login\nno-such-status\n");
+
+        transition_tick(&project);
+
+        assert!(!marker.exists(), "a refused request is consumed");
+        assert_eq!(
+            shelbi_state::load_task("demo", "fix-login").unwrap().task.column,
+            Column::in_progress(),
+            "a refused request moves nothing"
+        );
+        let lines = transition_marker_lines();
+        assert_eq!(lines.len(), 1, "lines: {lines:?}");
+        assert!(
+            lines[0].ends_with(
+                " transition-marker project=demo task=fix-login workspace=alpha target=no-such-status status=refused reason=unknown-target-status"
+            ),
+            "line: {}",
+            lines[0]
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn dropped_transition_marker_is_cleared_and_logged_with_its_reason() {
+        let _g = crate::test_lock::acquire();
+        let (home, project) = transition_outcome_fixture("dropped");
+
+        // A task another workspace owns: cleared, not moved.
+        shelbi_state::save_task("demo", &in_progress_task("theirs", "bravo"), "body").unwrap();
+        let marker = write_transition_marker(&project, "theirs\nreview\n");
+        transition_tick(&project);
+        assert!(!marker.exists(), "a foreign marker is consumed");
+        assert_eq!(
+            shelbi_state::load_task("demo", "theirs").unwrap().task.column,
+            Column::in_progress(),
+            "a foreign marker moves nothing"
+        );
+
+        // A successful read that finds no such task: the only other clear.
+        let marker = write_transition_marker(&project, "ghost\nreview\n");
+        transition_tick(&project);
+        assert!(!marker.exists(), "a marker naming a gone task is consumed");
+
+        let lines = transition_marker_lines();
+        assert_eq!(lines.len(), 2, "lines: {lines:?}");
+        assert!(
+            lines[0].ends_with(
+                " transition-marker project=demo task=theirs workspace=alpha target=review status=dropped reason=not-owned"
+            ),
+            "line: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].ends_with(
+                " transition-marker project=demo task=ghost workspace=alpha target=review status=dropped reason=task-gone"
+            ),
+            "line: {}",
+            lines[1]
+        );
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -12096,6 +13475,120 @@ transitions:
                 None => std::env::remove_var("SHELBI_HUB_SOCK"),
             }
         }
+    }
+
+    /// Wait for a remote session to read dead, the kill having just been sent.
+    fn assert_remote_session_ends(fx: &RemoteReapFixture, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while backend().probe(&fx.host, &fx.addr, None) != crate::session_backend::Liveness::Dead {
+            assert!(Instant::now() < deadline, "{what} left the remote agent running");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The real path the fakes in `quit` can't cover: quitting a project reaches
+    /// its machine over the relay and ends an agent registered as
+    /// `w-<ws>/ws/agent`, once the open flag no longer names the machine.
+    #[test]
+    fn quit_project_ends_a_real_remote_agent() {
+        let _g = crate::test_lock::acquire();
+        let fx = RemoteReapFixture::new("exec sleep 600");
+        shelbi_state::set_project_open(&fx.project.name, true).unwrap();
+
+        let out = crate::quit::quit_project_with(&fx.project.name, &crate::quit::BackendSessions);
+
+        assert_remote_session_ends(&fx, "Quit Project");
+        assert_eq!(out.ended, vec!["w-delta/ws/agent"]);
+        assert!(!shelbi_state::is_project_open(&fx.project.name).unwrap());
+    }
+
+    #[test]
+    fn quit_shelbi_ends_a_real_remote_agent() {
+        let _g = crate::test_lock::acquire();
+        let fx = RemoteReapFixture::new("exec sleep 600");
+        shelbi_state::set_project_open(&fx.project.name, true).unwrap();
+
+        let out = crate::quit::quit_shelbi_with(&crate::quit::BackendSessions);
+
+        assert_remote_session_ends(&fx, "Quit Shelbi");
+        assert!(out.ended.contains(&"w-delta/ws/agent".to_string()), "{:?}", out.ended);
+        assert_eq!(out.closed, vec![fx.project.name.clone()]);
+    }
+
+    /// A user shell ignores the session's default SIGTERM, so the quit has to
+    /// end it the way a closing terminal would.
+    #[test]
+    fn a_quit_ends_a_real_user_shell_that_ignores_sigterm() {
+        let _g = crate::test_lock::acquire();
+        let fx = RemoteReapFixture::new("exec sleep 600");
+        let name = crate::workspace_session::shell_session_name(&fx.project.name, "delta");
+        let (cols, rows) = crate::session_process_backend::SessionProcessBackend::default_size();
+        crate::remote_session::spawn_remote_session(
+            &fx.host,
+            "shelbi",
+            &shelbi_session::SpawnSpec {
+                name: name.clone(),
+                cwd: std::env::temp_dir(),
+                cols,
+                rows,
+                task: None,
+                raw_output_log: false,
+                child_argv: vec!["trap '' TERM; exec sleep 600".into()],
+            },
+        )
+        .unwrap();
+
+        crate::quit::quit_project_with(&fx.project.name, &crate::quit::BackendSessions);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::remote_session::live_session_names(&fx.host).unwrap().contains(&name) {
+            assert!(Instant::now() < deadline, "the shell outlived the quit");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The orchestrator's relaunch had no job of its own for a quit to refuse:
+    /// a dead orchestrator in a project mid-quit must stay dead, with no
+    /// `restart` line claiming otherwise.
+    #[test]
+    fn a_quitting_project_does_not_relaunch_its_dead_orchestrator() {
+        let _g = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        let prior_home = std::env::var_os("SHELBI_HOME");
+        let prior_hub_sock = std::env::var_os("SHELBI_HUB_SOCK");
+        std::env::set_var("SHELBI_HOME", home.path());
+        std::env::set_var("SHELBI_HUB_SOCK", home.path().join("no-hub.sock"));
+        let mut project = local_project(home.path());
+        // Were the gate ever lost, this test's relaunch must not start a real agent.
+        project.agent_runners.get_mut("claude").unwrap().command = "true".into();
+        shelbi_state::save_project(&project).unwrap();
+
+        // An orchestrator seen alive, now dead: exactly what decides to restart.
+        let now = Instant::now();
+        let alive = SupervisionInputs { alive: true, intentional_shutdown: false, has_work: true };
+        let dead = SupervisionInputs { alive: false, intentional_shutdown: false, has_work: true };
+        let mut control = SupervisionState::default();
+        control.decide(&alive, now);
+        assert_eq!(control.decide(&dead, now), SupervisionAction::Restart);
+        let mut state = SupervisionState::default();
+        state.decide(&alive, now);
+
+        let phase = crate::cancel::begin_quit(&project.name);
+        let mut last_failure = None;
+        maybe_supervise_orchestrator(&project, &mut state, &mut last_failure);
+        drop(phase);
+
+        let events = std::fs::read_to_string(home.path().join("events.log")).unwrap_or_default();
+        match prior_home {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        match prior_hub_sock {
+            Some(v) => std::env::set_var("SHELBI_HUB_SOCK", v),
+            None => std::env::remove_var("SHELBI_HUB_SOCK"),
+        }
+        assert!(!events.contains("supervision=restart"), "{events}");
+        assert_eq!(last_failure, None, "no relaunch was attempted");
     }
 
     /// The remote orphan-reap loop: a card supplanted off an SSH workspace left

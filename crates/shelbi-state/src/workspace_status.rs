@@ -5,12 +5,17 @@
 //! `default_workspace_settings.json.template`); the hub-side sidebar poll loop
 //! reads the current pane title with `tmux display-message`, parses the
 //! trailing marker, and persists any transition to
-//! `~/.shelbi/workspaces/<name>/status.yaml`.
+//! `~/.shelbi/projects/<project>/workspaces/<name>/status.yaml`.
+//!
+//! Every path here takes the project as well as the slot name because slot
+//! names are only unique *within* a project: two projects can each own a
+//! `review`, and they must not share a status row, a teardown marker, or a
+//! review-server record. [`crate::workspace_state_migration`] moves what older
+//! releases left under the hub-global `~/.shelbi/workspaces/` into place.
 //!
 //! This module is limited to pane/status *observation*: the pane-title marker
 //! vocabulary ([`PaneMarker`] / [`WorkspaceState`]), the persisted
-//! [`WorkspaceStatus`], the expected-teardown markers that suppress spurious
-//! pane-death events, and the hub daemon socket path. The durable event stream
+//! [`WorkspaceStatus`], and the hub daemon socket path. The durable event stream
 //! those transitions are appended to — `events.log`, its rotation, the logical
 //! cursors, and the `append_*_event` producers — lives in [`crate::event_log`].
 //!
@@ -19,14 +24,13 @@
 
 use std::fs;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use shelbi_core::Result;
 
-use crate::{atomic_write, ensure_dir, shelbi_home};
+use crate::{atomic_write, ensure_dir, project_dir, shelbi_home};
 
 /// The marker emitted by the workspace's claude hooks. `idle` from the hook
 /// wire-format maps to [`WorkspaceState::AwaitingInput`] — Stop fires when
@@ -179,103 +183,17 @@ pub fn parse_orchestrator_title_state(title: &str) -> Option<WorkspaceState> {
     parse_pane_title_marker(title).map(PaneMarker::orchestrator_state)
 }
 
-/// `~/.shelbi/workspaces` — root for per-workspace status dirs.
-///
-/// As a one-shot migration, if the legacy `~/.shelbi/workers/` directory
-/// exists and the new `workspaces/` doesn't, the legacy dir is renamed in
-/// place. Idempotent and best-effort — any IO error is swallowed; the
-/// poller will recreate either directory on its next write.
-pub fn workspaces_dir() -> Result<PathBuf> {
-    let home = shelbi_home()?;
-    let new = home.join("workspaces");
-    if !new.exists() {
-        let legacy = home.join("workers");
-        if legacy.exists() {
-            let _ = fs::rename(&legacy, &new);
-        }
-    }
-    Ok(new)
+/// `~/.shelbi/projects/<project>/workspaces`: root for one project's
+/// per-workspace runtime state. The same path as
+/// [`crate::ProjectPaths::workspaces_dir`], for callers holding only a name.
+pub fn workspaces_dir(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("workspaces"))
 }
 
-/// `~/.shelbi/workspaces/<name>/status.yaml`.
-pub fn workspace_status_path(workspace: &str) -> Result<PathBuf> {
+/// `~/.shelbi/projects/<project>/workspaces/<name>/status.yaml`.
+pub fn workspace_status_path(project: &str, workspace: &str) -> Result<PathBuf> {
     crate::ensure_flat_path_component("workspace", workspace)?;
-    Ok(workspaces_dir()?.join(workspace).join("status.yaml"))
-}
-
-/// `~/.shelbi/workspaces/<name>/.expected-teardown` — presence signals that
-/// a shelbi-initiated caller (`shelbi task start`, `shelbi workspace stop`,
-/// `shelbi quit`, project quit) is about to kill the workspace's pane, so
-/// the pane's lifecycle wrapper should suppress its `pane_alive=false`
-/// event on exit. Otherwise every dispatch would fire a spurious
-/// `pane_alive=false reason=signal:SIGHUP` right before the new pane comes
-/// up (bug-workspace-pane-alive-false-sighup-fires-spuriously-right-after-dispatch).
-pub fn expected_teardown_marker_path(workspace: &str) -> Result<PathBuf> {
-    Ok(workspaces_dir()?.join(workspace).join(".expected-teardown"))
-}
-
-/// Freshness window on the expected-teardown marker. The wrapper's exit
-/// path runs between the mark and the check: mark → tmux kill-window →
-/// SIGHUP → forward to child → child.wait() → cleanup → consume. That
-/// chain is usually under a second, but claude has its own shutdown flow
-/// and could dawdle. 30 s is more than any observed teardown and still
-/// short enough that a stale marker (e.g. mark→SIGKILL race that never
-/// ran the consume) can't leak past the very next pane's real exit.
-pub const EXPECTED_TEARDOWN_MAX_AGE: Duration = Duration::from_secs(30);
-
-/// Write the expected-teardown marker for `workspace`. Best-effort:
-/// callers use this before `tmux kill-window` (or equivalent), so a
-/// failure to write just means the pane_alive event fires with its
-/// historical `signal:SIGHUP` reason — degraded but not broken.
-pub fn mark_expected_teardown(workspace: &str) -> Result<()> {
-    let path = expected_teardown_marker_path(workspace)?;
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-    // Empty body — the marker's presence + kernel-recorded mtime are the
-    // signal. No timestamp in the body means we don't have to parse
-    // anything on the consume side.
-    atomic_write(&path, b"")
-}
-
-/// If a fresh (< [`EXPECTED_TEARDOWN_MAX_AGE`]) marker exists, remove it
-/// and return `true` — the current pane teardown was intentional and the
-/// caller should suppress the `pane_alive=false` event. If the marker is
-/// older than the window, remove it and return `false` (the recorded
-/// intent is stale — an SIGKILL race or a caller that never got as far
-/// as the actual kill). If no marker exists → `false`.
-///
-/// Always deleting on read keeps a stale marker from leaking into a
-/// later, unrelated exit event.
-pub fn consume_expected_teardown(workspace: &str) -> Result<bool> {
-    let path = expected_teardown_marker_path(workspace)?;
-    let mtime = match fs::metadata(&path).and_then(|m| m.modified()) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(shelbi_core::Error::Io(e)),
-    };
-    let fresh = SystemTime::now()
-        .duration_since(mtime)
-        .map(|elapsed| elapsed < EXPECTED_TEARDOWN_MAX_AGE)
-        // Clock skew (mtime in the future): treat as fresh. That's the
-        // conservative call — we'd rather miss one true pane-death event
-        // than spam the log with a spurious one every dispatch.
-        .unwrap_or(true);
-    let _ = fs::remove_file(&path);
-    Ok(fresh)
-}
-
-/// Unconditionally remove the expected-teardown marker for `workspace`.
-/// Called by the pane wrapper at startup so a marker left behind by a
-/// crashed prior lifecycle (mark → SIGKILL → no consume) can't survive
-/// long enough to accidentally suppress a real exit event later.
-pub fn clear_expected_teardown(workspace: &str) -> Result<()> {
-    let path = expected_teardown_marker_path(workspace)?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(shelbi_core::Error::Io(e)),
-    }
+    Ok(workspaces_dir(project)?.join(workspace).join("status.yaml"))
 }
 
 /// Env var naming the file the `shelbi __review-serve` wrapper records the
@@ -285,17 +203,40 @@ pub fn clear_expected_teardown(workspace: &str) -> Result<()> {
 /// wrapper) can't drift on the spelling.
 pub const REVIEW_SERVE_PGID_FILE_ENV: &str = "SHELBI_REVIEW_PGID_FILE";
 
-/// `~/.shelbi/workspaces/<name>/review-serve.pgid` — records the process-group
+/// `<project>/workspaces/<name>/review-serve.pgid` — records the process-group
 /// id of the review dev server the Review agent launched through the
 /// `shelbi __review-serve` wrapper. Kept hub-side (not in the tmux session env,
 /// which dies with the pane, and not in memory) so any teardown path can signal
 /// the whole server tree even across a hub / daemon restart between launch and
 /// teardown. The wrapper writes it; the orchestrator reads it on teardown and
-/// clears it. Keyed by workspace so the orchestrator's `kill_workspace_pane`
-/// (which only has the workspace name) needs no worktree plumbing to find it.
-pub fn review_serve_pgid_path(workspace: &str) -> Result<PathBuf> {
+/// clears it. Keyed by project and workspace so `kill_workspace_pane` needs no
+/// worktree plumbing to find it, and so one project's teardown can never signal
+/// the server another project's same-named slot started.
+pub fn review_serve_pgid_path(project: &str, workspace: &str) -> Result<PathBuf> {
     crate::ensure_flat_path_component("workspace", workspace)?;
-    Ok(workspaces_dir()?.join(workspace).join("review-serve.pgid"))
+    Ok(workspaces_dir(project)?.join(workspace).join("review-serve.pgid"))
+}
+
+/// Where the `shelbi __review-serve` wrapper should record its server's pgid,
+/// given the path its pane's [`REVIEW_SERVE_PGID_FILE_ENV`] names and the pane's
+/// `PROJECT`.
+///
+/// Sessions outlive an upgrade, so a review pane launched by an older release
+/// still carries the hub-global `~/.shelbi/workspaces/<name>/review-serve.pgid`
+/// in its environment. A record written there is one no teardown reads, and the
+/// server would leak, so that one shape is rewritten to the project's path. Any
+/// other path passes through untouched.
+pub fn rehome_review_serve_pgid_path(path: &std::path::Path, project: Option<&str>) -> PathBuf {
+    let rehomed = (|| {
+        let project = project?;
+        let slot = path.parent()?;
+        let legacy_root = shelbi_home().ok()?.join("workspaces");
+        if slot.parent()? != legacy_root {
+            return None;
+        }
+        review_serve_pgid_path(project, slot.file_name()?.to_str()?).ok()
+    })();
+    rehomed.unwrap_or_else(|| path.to_path_buf())
 }
 
 /// Read the persisted review-server process-group id for `workspace`, if the
@@ -305,8 +246,8 @@ pub fn review_serve_pgid_path(workspace: &str) -> Result<PathBuf> {
 /// record must never wedge teardown, and the `> 1` floor makes it impossible
 /// for a `kill(-pgid, …)` to ever target init / every process). The file is
 /// left in place for [`clear_review_serve_pgid`] to remove.
-pub fn read_review_serve_pgid(workspace: &str) -> Result<Option<i32>> {
-    let path = review_serve_pgid_path(workspace)?;
+pub fn read_review_serve_pgid(project: &str, workspace: &str) -> Result<Option<i32>> {
+    let path = review_serve_pgid_path(project, workspace)?;
     match fs::read_to_string(&path) {
         Ok(s) => Ok(s.trim().parse::<i32>().ok().filter(|&p| p > 1)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -316,8 +257,8 @@ pub fn read_review_serve_pgid(workspace: &str) -> Result<Option<i32>> {
 
 /// Remove a workspace's review-server pgid record, if any. Idempotent and
 /// best-effort — a missing file is not an error.
-pub fn clear_review_serve_pgid(workspace: &str) -> Result<()> {
-    let path = review_serve_pgid_path(workspace)?;
+pub fn clear_review_serve_pgid(project: &str, workspace: &str) -> Result<()> {
+    let path = review_serve_pgid_path(project, workspace)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -369,8 +310,8 @@ pub struct WorkspaceStatus {
     pub last_seen: DateTime<Utc>,
 }
 
-pub fn save_workspace_status(status: &WorkspaceStatus) -> Result<()> {
-    let path = workspace_status_path(&status.workspace)?;
+pub fn save_workspace_status(project: &str, status: &WorkspaceStatus) -> Result<()> {
+    let path = workspace_status_path(project, &status.workspace)?;
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
@@ -378,8 +319,8 @@ pub fn save_workspace_status(status: &WorkspaceStatus) -> Result<()> {
     atomic_write(&path, yaml.as_bytes())
 }
 
-pub fn load_workspace_status(workspace: &str) -> Result<Option<WorkspaceStatus>> {
-    let path = workspace_status_path(workspace)?;
+pub fn load_workspace_status(project: &str, workspace: &str) -> Result<Option<WorkspaceStatus>> {
+    let path = workspace_status_path(project, workspace)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -396,31 +337,13 @@ pub fn load_workspace_status(workspace: &str) -> Result<Option<WorkspaceStatus>>
 /// After clearing, `load_workspace_status` reads `None` (the "not polled" state
 /// a genuinely idle slot has) and the board-derived views render it as idle.
 /// Idempotent and best-effort: a missing file is not an error.
-pub fn clear_workspace_status(workspace: &str) -> Result<()> {
-    let path = workspace_status_path(workspace)?;
+pub fn clear_workspace_status(project: &str, workspace: &str) -> Result<()> {
+    let path = workspace_status_path(project, workspace)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(shelbi_core::Error::Io(e)),
     }
-}
-
-/// The no-restart key the supervisor consumes to tell a crash from a
-/// deliberate shutdown.
-///
-/// The plain [`expected_teardown_marker_path`] marker is consumed by the
-/// pane's lifecycle wrapper on exit (to suppress its `pane_alive=false`
-/// event), so by the time the sidebar supervisor observes the dead pane
-/// that marker is already gone — the two processes would race over one
-/// file. We derive an independent key by suffixing `.supervision` so it
-/// lands in its own `workspaces/<name>.supervision/.expected-teardown`
-/// file and reuses the exact [`mark_expected_teardown`] /
-/// [`consume_expected_teardown`] machinery. The lifecycle wrapper marks it
-/// whenever a death is *not* a crash to restart (a fresh expected-teardown
-/// was present, or the agent exited cleanly with `exit:0`); the supervisor
-/// consumes it on the death edge and treats a fresh hit as "stay down."
-pub fn supervision_shutdown_key(workspace: &str) -> String {
-    format!("{workspace}.supervision")
 }
 
 #[cfg(test)]
@@ -440,25 +363,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
-    }
-
-    #[test]
-    fn supervision_marker_uses_an_independent_key_from_the_wrapper_teardown() {
-        // `expected_teardown_marker_path` resolves a per-project state path, so
-        // mount a throwaway home rather than reading the live `~/.shelbi`.
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        // The supervisor's no-restart marker must land in its own file so it
-        // never races the pane wrapper's expected-teardown consume.
-        assert_eq!(supervision_shutdown_key("alpha"), "alpha.supervision");
-        assert_ne!(
-            expected_teardown_marker_path("alpha").unwrap(),
-            expected_teardown_marker_path(&supervision_shutdown_key("alpha")).unwrap(),
-        );
-
-        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
@@ -623,17 +527,17 @@ mod tests {
             last_transition: now,
             last_seen: now,
         };
-        save_workspace_status(&status).unwrap();
-        let path = workspace_status_path("alpha").unwrap();
+        save_workspace_status("demo", &status).unwrap();
+        let path = workspace_status_path("demo", "alpha").unwrap();
         assert!(path.exists());
-        let back = load_workspace_status("alpha").unwrap().unwrap();
+        let back = load_workspace_status("demo", "alpha").unwrap().unwrap();
         assert_eq!(back.workspace, "alpha");
         assert_eq!(back.state, WorkspaceState::Working);
         assert_eq!(back.current_task.as_deref(), Some("fix-thing"));
 
         // Missing workspace returns None, not an error — the sidebar uses
         // this to bootstrap fresh on first observation.
-        assert!(load_workspace_status("ghost").unwrap().is_none());
+        assert!(load_workspace_status("demo", "ghost").unwrap().is_none());
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -645,10 +549,10 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         // No file yet → clearing is a no-op.
-        clear_workspace_status("alpha").unwrap();
+        clear_workspace_status("demo", "alpha").unwrap();
 
         let now = Utc::now();
-        save_workspace_status(&WorkspaceStatus {
+        save_workspace_status("demo", &WorkspaceStatus {
             workspace: "alpha".into(),
             current_task: None,
             state: WorkspaceState::Working,
@@ -656,17 +560,17 @@ mod tests {
             last_seen: now,
         })
         .unwrap();
-        assert!(workspace_status_path("alpha").unwrap().exists());
+        assert!(workspace_status_path("demo", "alpha").unwrap().exists());
 
-        clear_workspace_status("alpha").unwrap();
+        clear_workspace_status("demo", "alpha").unwrap();
         assert!(
-            !workspace_status_path("alpha").unwrap().exists(),
+            !workspace_status_path("demo", "alpha").unwrap().exists(),
             "clear must remove status.yaml so a reaped slot reads as unpolled/idle"
         );
-        assert!(load_workspace_status("alpha").unwrap().is_none());
+        assert!(load_workspace_status("demo", "alpha").unwrap().is_none());
 
         // Second clear on the now-absent file is also OK.
-        clear_workspace_status("alpha").unwrap();
+        clear_workspace_status("demo", "alpha").unwrap();
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -693,6 +597,66 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
+    /// The bug this layout exists to fix: slot names are only unique within a
+    /// project, so two projects' `review` slots must keep separate rows, and
+    /// reaping one must leave the other's row (and marker, and server record)
+    /// alone.
+    #[test]
+    fn same_named_slots_in_two_projects_keep_separate_state() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let status = |task: &str, state| WorkspaceStatus {
+            workspace: "review".into(),
+            current_task: Some(task.into()),
+            state,
+            last_transition: Utc::now(),
+            last_seen: Utc::now(),
+        };
+        save_workspace_status("app", &status("app-task", WorkspaceState::Serving)).unwrap();
+        save_workspace_status("site", &status("site-task", WorkspaceState::Blocked)).unwrap();
+
+        // Neither write clobbered the other.
+        let app = load_workspace_status("app", "review").unwrap().unwrap();
+        let site = load_workspace_status("site", "review").unwrap().unwrap();
+        assert_eq!(app.current_task.as_deref(), Some("app-task"));
+        assert_eq!(app.state, WorkspaceState::Serving);
+        assert_eq!(site.current_task.as_deref(), Some("site-task"));
+        assert_eq!(site.state, WorkspaceState::Blocked);
+
+        // Reaping `app`'s slot leaves `site`'s row intact.
+        clear_workspace_status("app", "review").unwrap();
+        assert!(load_workspace_status("app", "review").unwrap().is_none());
+        let site = load_workspace_status("site", "review").unwrap().unwrap();
+        assert_eq!(site.current_task.as_deref(), Some("site-task"));
+
+        // Same for the review-server record.
+        let pgid_path = review_serve_pgid_path("app", "review").unwrap();
+        std::fs::create_dir_all(pgid_path.parent().unwrap()).unwrap();
+        std::fs::write(&pgid_path, "4242\n").unwrap();
+        assert_eq!(read_review_serve_pgid("site", "review").unwrap(), None);
+        assert_eq!(read_review_serve_pgid("app", "review").unwrap(), Some(4242));
+
+        // And it all lands under the project's own state root, the same place
+        // `ProjectPaths::workspaces_dir` names.
+        assert_eq!(
+            workspace_status_path("site", "review").unwrap(),
+            home.join("projects/site/workspaces/review/status.yaml"),
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn workspace_status_path_rejects_traversal_project_names() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        assert!(workspace_status_path("../evil", "review").is_err());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
     #[test]
     fn workspace_status_path_rejects_traversal_names() {
         // The accepted name resolves under the hub root, so mount a throwaway
@@ -703,135 +667,37 @@ mod tests {
 
         // Residual chokepoint hardening (Shelbi ContextStore
         // docs/planning:reviews/adversarial-2026-07/state-runtime.md F14): a `..`/absolute/
-        // separator workspace name must not escape `~/.shelbi/workspaces/`.
+        // separator workspace name must not escape the project's `workspaces/`.
         for bad in ["..", "../evil", "a/b", "/abs", "nested/../escape", ""] {
             assert!(
-                workspace_status_path(bad).is_err(),
+                workspace_status_path("demo", bad).is_err(),
                 "workspace_status_path should reject `{bad}`"
             );
         }
         // A normal single-component name still resolves.
-        assert!(workspace_status_path("review-1").is_ok());
+        assert!(workspace_status_path("demo", "review-1").is_ok());
 
         std::env::remove_var("SHELBI_HOME");
     }
 
-    /// Round-trip: `mark_expected_teardown` writes the marker,
-    /// `consume_expected_teardown` finds it fresh, returns true, and
-    /// removes the file. Second consume finds nothing → false.
     #[test]
-    fn expected_teardown_marker_round_trips() {
+    fn a_pre_upgrade_pane_records_its_server_under_the_project() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        mark_expected_teardown("alpha").unwrap();
-        let marker = expected_teardown_marker_path("alpha").unwrap();
-        assert!(marker.exists(), "mark must create the marker file");
-
-        assert!(
-            consume_expected_teardown("alpha").unwrap(),
-            "fresh marker must consume as true"
-        );
-        assert!(
-            !marker.exists(),
-            "consume must remove the marker (one-shot signal)"
-        );
-
-        assert!(
-            !consume_expected_teardown("alpha").unwrap(),
-            "second consume with no marker returns false"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    /// A stale marker (mtime older than [`EXPECTED_TEARDOWN_MAX_AGE`])
-    /// must not suppress: it means an intent was recorded but never
-    /// consumed (a mark→SIGKILL race), and this exit is not the one that
-    /// intent was talking about. Consume still deletes the stale marker
-    /// so it can't leak further forward.
-    #[test]
-    fn expected_teardown_marker_expires() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        mark_expected_teardown("alpha").unwrap();
-        let marker = expected_teardown_marker_path("alpha").unwrap();
-        // Rewind mtime past the freshness window via `libc::utimes` —
-        // avoids pulling in the `filetime` crate just for one test.
-        set_mtime_to(&marker, SystemTime::now() - Duration::from_secs(3600));
-
-        assert!(
-            !consume_expected_teardown("alpha").unwrap(),
-            "stale marker must not suppress"
-        );
-        assert!(
-            !marker.exists(),
-            "stale marker must still be removed on consume so it can't linger"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    /// Set `path`'s access and modification times to `when`. Test-only —
-    /// stdlib doesn't expose a stable mtime setter without opening the
-    /// file (`File::set_modified`), which changes size behavior on some
-    /// FSes; `utimes(2)` is the historical POSIX path and does exactly
-    /// what we need.
-    fn set_mtime_to(path: &std::path::Path, when: SystemTime) {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let secs = when
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("test uses recent-enough times")
-            .as_secs() as libc::time_t;
-        let times = [
-            libc::timeval {
-                tv_sec: secs,
-                tv_usec: 0,
-            },
-            libc::timeval {
-                tv_sec: secs,
-                tv_usec: 0,
-            },
-        ];
-        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
-        // SAFETY: cpath owns the null-terminated bytes for the duration
-        // of the call; `times` is a valid array of two timevals.
-        let rc = unsafe { libc::utimes(cpath.as_ptr(), times.as_ptr()) };
+        let legacy = home.join("workspaces/review/review-serve.pgid");
         assert_eq!(
-            rc,
-            0,
-            "utimes failed: errno={}",
-            std::io::Error::last_os_error()
+            rehome_review_serve_pgid_path(&legacy, Some("app")),
+            review_serve_pgid_path("app", "review").unwrap(),
         );
-    }
-
-    /// `clear_expected_teardown` is idempotent: no marker on disk → OK.
-    /// With a marker on disk → file is removed → returns OK. Second call
-    /// after remove is also OK. Used by the pane wrapper's startup so a
-    /// crashed prior lifecycle can't leak its marker into the new run.
-    #[test]
-    fn clear_expected_teardown_is_idempotent() {
-        let _g = TEST_LOCK.lock().unwrap();
-        let home = fresh_home();
-        std::env::set_var("SHELBI_HOME", &home);
-
-        // No marker yet → noop OK.
-        clear_expected_teardown("alpha").unwrap();
-
-        // Plant a marker, clear it, verify removal.
-        mark_expected_teardown("alpha").unwrap();
-        let marker = expected_teardown_marker_path("alpha").unwrap();
-        assert!(marker.exists());
-        clear_expected_teardown("alpha").unwrap();
-        assert!(!marker.exists());
-
-        // Second clear on the now-absent marker also OK.
-        clear_expected_teardown("alpha").unwrap();
+        // Without a project there is nothing to rehome it to.
+        assert_eq!(rehome_review_serve_pgid_path(&legacy, None), legacy);
+        // A current path, or one somewhere else entirely, is left alone.
+        let current = review_serve_pgid_path("app", "review").unwrap();
+        assert_eq!(rehome_review_serve_pgid_path(&current, Some("site")), current);
+        let elsewhere = std::path::Path::new("/tmp/custom.pgid");
+        assert_eq!(rehome_review_serve_pgid_path(elsewhere, Some("app")), elsewhere);
 
         std::env::remove_var("SHELBI_HOME");
     }

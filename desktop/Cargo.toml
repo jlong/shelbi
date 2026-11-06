@@ -172,6 +172,8 @@ bench = ["dep:flate2", "dep:libc"]
 serde_json = "1"
 
 [dev-dependencies]
+# The Builder's cost test reads this thread's CPU time. Already in the tree.
+libc = "0.2"
 # gpui's test context (`#[gpui::test]`, `VisualTestContext`) for view tests.
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
 # Issue fixtures in the board tests carry timestamps.

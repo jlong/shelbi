@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use shelbi_core::{Column, IntegrationMode, Issue, WorkspaceSpec};
 use shelbi_orchestrator::pool_admin::{self, PoolError};
+use shelbi_orchestrator::session_backend::KillReason;
 use shelbi_orchestrator::workspace as orch_workspace;
 use shelbi_state::WorkspaceStatus;
 
@@ -78,7 +79,7 @@ pub enum WorkspaceCmd {
         keep_task: bool,
     },
     /// Show observed workspace state from the hub-side poller. Reads
-    /// `~/.shelbi/workspaces/<name>/status.yaml` files, no tmux probing.
+    /// `~/.shelbi/projects/<project>/workspaces/<name>/status.yaml` files, no tmux probing.
     /// With NAME, prints a single row + the raw status.yaml.
     Status {
         /// Workspace to inspect. Omit to show every declared workspace.
@@ -200,37 +201,21 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Both the in-progress and review columns come from the daemon-owned
-    // `board-index.json` (§5) in one read, filtered in memory — never a pair of
-    // backend `list_in_status` sweeps from this CLI. Both are open (non-terminal)
-    // columns, so the open index carries them.
-    let board = shelbi_state::read_board(project)
-        .map_err(|e| anyhow!(e))?
-        .into_issues();
+    // One read of the daemon-owned `board-index.json` (§5) with owners resolved
+    // from the assignment overlay, never a backend sweep from this CLI.
+    let occupancy = shelbi_state::BoardOccupancy::read(&p).map_err(|e| anyhow!(e))?;
 
-    // Surfaces every in-progress task assigned to the workspace. There
-    // should normally be at most one, but if shelbi's state diverged we
-    // print all of them in the STATE cell so the user sees the mess.
-    let in_progress: Vec<&shelbi_state::IssueFile> = board
-        .iter()
-        .filter(|tf| tf.task.column == Column::in_progress())
-        .collect();
-    let assigned: Vec<&Issue> = in_progress.iter().map(|tf| &tf.task).collect();
+    // Surfaces every card working on the workspace, an agent-owned gate as much
+    // as an in-progress one. There should normally be at most one, but if
+    // shelbi's state diverged we print all of them in the STATE cell so the user
+    // sees the mess.
+    let assigned: Vec<&Issue> = occupancy.working().map(|tf| &tf.task).collect();
 
-    // A `review`-tagged slot holds a review-column (handoff) task while it
-    // serves the branch for inspection — that task never sits in `in_progress`,
-    // so without this it looks like a live pane no active task points at and
-    // gets mislabeled `orphaned session`. Map each review slot to the task it's
-    // serving so `list` renders it as `review: <id>` (and the probe skips it).
-    let mut review: Vec<shelbi_state::IssueFile> = board
-        .iter()
-        .filter(|tf| tf.task.column == Column::review())
-        .cloned()
-        .collect();
-    // Review-slot ownership comes from the local assignment overlay, not the
-    // index's publish-time `assigned_to` fold, which can lag a fresh review load
-    // and mislabel the serving slot `orphaned session`.
-    shelbi_state::fold_assignment_overlay(project, &p.issue_tracker, &mut review);
+    // A `review`-tagged slot holds a handoff task while it serves the branch for
+    // inspection. Without this it looks like a live pane no active task points
+    // at and gets mislabeled `orphaned session`. Map each review slot to the task
+    // it's serving so `list` renders it as `review: <id>` (and the probe skips it).
+    let review: Vec<shelbi_state::IssueFile> = occupancy.serving().cloned().collect();
     let review_by_ws = review_assignments(&p, &review);
 
     let occupied = occupied_idle_workspaces(&p, &assigned, &review_by_ws)?;
@@ -553,7 +538,13 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
         }
     }
 
-    orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name).map_err(|e| anyhow!(e))?;
+    let reason = if keep_task {
+        KillReason::Bounce
+    } else {
+        KillReason::Stop
+    };
+    orch_workspace::kill_workspace_pane(project, &host, &addr, &workspace.name, reason)
+        .map_err(|e| anyhow!(e))?;
     println!("✓ {name} pane stopped");
     Ok(())
 }
@@ -594,9 +585,9 @@ fn status(project: &str, name: Option<&str>) -> Result<()> {
                     .join(", ")
             ));
         }
-        print_status_table(&[only.to_string()])?;
+        print_status_table(project, &[only.to_string()])?;
         println!();
-        let path = shelbi_state::workspace_status_path(only).map_err(|e| anyhow!(e))?;
+        let path = shelbi_state::workspace_status_path(project, only).map_err(|e| anyhow!(e))?;
         if path.exists() {
             let yaml = fs::read_to_string(&path)
                 .map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
@@ -616,17 +607,17 @@ fn status(project: &str, name: Option<&str>) -> Result<()> {
         return Ok(());
     }
     let names: Vec<String> = p.workspaces.iter().map(|w| w.name.clone()).collect();
-    print_status_table(&names)
+    print_status_table(project, &names)
 }
 
-fn print_status_table(names: &[String]) -> Result<()> {
+fn print_status_table(project: &str, names: &[String]) -> Result<()> {
     let now = Utc::now();
     println!(
         "{:<12} {:<24} {:<14} {:<12} IN STATE",
         "WORKSPACE", "TASK", "STATE", "LAST SEEN"
     );
     for name in names {
-        match shelbi_state::load_workspace_status(name) {
+        match shelbi_state::load_workspace_status(project, name) {
             Ok(Some(s)) => println!(
                 "{:<12} {:<24} {:<14} {:<12} {}",
                 s.workspace,

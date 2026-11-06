@@ -51,6 +51,8 @@ pub type Taken = (String, MutationKind);
 pub struct FarAsked {
     pub requests: Vec<shelbi_app::far::Request>,
     pub editors: Vec<(String, PathBuf, Vec<String>)>,
+    /// The projects the far daemon was asked to quit, in order.
+    pub quits: Vec<String>,
 }
 
 pub struct FarHost {
@@ -345,6 +347,14 @@ fn serve_connection(mut stream: UnixStream, took: &Took, subscribers: &Arc<Mutex
                         request_id: req.request_id,
                         error: control::MutationError::Backend { message: e.to_string() },
                     },
+                })
+            }
+            ClientMsg::QuitProject { request_id, project } => {
+                took.asked.lock().unwrap().quits.push(project);
+                Some(ServerMsg::Done {
+                    request_id,
+                    state: None,
+                    id: None,
                 })
             }
             ClientMsg::AppRequest(req) => {

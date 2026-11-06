@@ -78,7 +78,8 @@ shelbi message add-auth reply "yes, use the existing session table" --in-respons
 
 The reply is appended to the task's message log as usual, and the stored
 question gets `answered_at` (plus the reply's `msg_id`), which drops it from
-`shelbi question list`.
+`shelbi question list`. A reply that can't be delivered, because the task is done
+or no worker session is running, is refused and the question stays open.
 
 ## Examples
 

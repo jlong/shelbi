@@ -3469,6 +3469,10 @@ impl Run {
             .update(&mut self.cx, |w, window, cx| w.offscreen_open_task(IN_PROGRESS[0].0, window, cx))
             .unwrap();
         self.settle(handle);
+        // The pane's slide runs on the executor's clock, not the one `settle`
+        // moves.
+        self.cx.advance_clock(crate::views::column_swap::SLIDE);
+        self.settle(handle);
         handle
     }
 
@@ -3760,7 +3764,7 @@ workspaces:
     );
 
     let status = |workspace: &str, task: Option<&str>, state| {
-        shelbi_state::save_workspace_status(&shelbi_state::WorkspaceStatus {
+        shelbi_state::save_workspace_status("demo", &shelbi_state::WorkspaceStatus {
             workspace: workspace.into(),
             current_task: task.map(str::to_string),
             state,

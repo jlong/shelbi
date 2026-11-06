@@ -51,8 +51,8 @@ fn recorder(seen: Arc<Mutex<Vec<(String, CreateRequest)>>>, write_up: WriteUp) -
 #[test]
 fn the_board_n_its_new_issue_and_the_palette_open_new_task() {
     let mut st = settings_state();
-    st.kanban.workflows = vec![shelbi_core::task_workflow()];
-    st.kanban.default_workflow_name = "task".into();
+    st.kanban.input.workflows = vec![shelbi_core::task_workflow()];
+    st.kanban.input.default_workflow_name = "task".into();
     st.main_view = MainView::Native(View::Issues);
     st.client.focus_main();
     press(&mut st, KeyCode::Char('n'), KeyModifiers::NONE);

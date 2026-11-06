@@ -72,7 +72,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use shelbi_core::{Column, Machine, MachineKind, Project, WorkspaceSpec};
+use shelbi_core::{Machine, MachineKind, Project, WorkspaceSpec};
 use shelbi_state::pool_config::{PoolConfig, PoolConfigError, PoolEntry};
 
 use crate::workspace as ws;
@@ -128,8 +128,8 @@ pub enum HookWiring {
 /// production implementation is [`LiveOps`]; tests script it.
 pub trait PoolOps {
     fn check_version(&self) -> Result<(), String>;
-    /// The in-progress or review task assigned to `workspace`, read from the
-    /// issue store.
+    /// The active or handoff task holding `workspace`
+    /// ([`shelbi_state::SlotOccupancy::is_claimed`]).
     fn active_task(&self, project: &Project, workspace: &str) -> Result<Option<String>, String>;
     /// Every open task assigned to `workspace`.
     fn open_assignments(&self, project: &Project, workspace: &str) -> Result<Vec<String>, String>;
@@ -945,17 +945,15 @@ impl PoolOps for LiveOps {
     }
 
     fn active_task(&self, project: &Project, workspace: &str) -> Result<Option<String>, String> {
-        let store = shelbi_state::issue_store_for(&project.name).map_err(|e| e.to_string())?;
-        for column in [Column::in_progress(), Column::review()] {
-            let tasks = store.list_in_status(&column).map_err(|e| e.to_string())?;
-            if let Some(tf) = tasks
-                .into_iter()
-                .find(|tf| tf.task.assigned_to.as_deref() == Some(workspace))
-            {
-                return Ok(Some(tf.task.id));
-            }
+        let board = shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker)
+            .map_err(|e| e.to_string())?;
+        if board.is_cold() {
+            return Err("the board hasn't loaded yet".to_string());
         }
-        Ok(None)
+        let mut issues = board.into_issues();
+        shelbi_state::fold_assignment_overlay(&project.name, &project.issue_tracker, &mut issues);
+        let slot = shelbi_state::BoardOccupancy::from_board(project, issues).of(workspace);
+        Ok(slot.is_claimed().then(|| slot.into_issue()).flatten().map(|i| i.id))
     }
 
     fn open_assignments(&self, project: &Project, workspace: &str) -> Result<Vec<String>, String> {
@@ -1041,7 +1039,14 @@ impl PoolOps for LiveOps {
             .machine(&workspace.machine)
             .ok_or_else(|| format!("unknown machine `{}`", workspace.machine))?;
         let target = ws::workspace_target(project, workspace).map_err(|e| e.to_string())?;
-        ws::kill_workspace_pane(&machine.host(), &target, &workspace.name).map_err(|e| e.to_string())
+        ws::kill_workspace_pane(
+            &project.name,
+            &machine.host(),
+            &target,
+            &workspace.name,
+            crate::session_backend::KillReason::Stop,
+        )
+        .map_err(|e| e.to_string())
     }
 }
 

@@ -311,6 +311,11 @@ pub fn push_branch(project: &Project, task: &Issue) -> Result<()> {
         if *remote == local || is_ancestor(&host, &wt, &local, remote)? {
             return Ok(());
         }
+        // Zen published the squash of this head as the PR's head. It has
+        // diverged from the local ref on purpose, and it's what CI graded.
+        if crate::zen_flow::published_for_head(project, &task.id, &local, remote) {
+            return Ok(());
+        }
     }
 
     let out = run_in_dir(&host, &wt, &["git", "push", "-u", "origin", "--", &branch])?;
@@ -627,8 +632,12 @@ pub fn merge(
         // workflow the PR merges into a parent branch, not the project
         // base. Read `baseRefName` before merging so the children we
         // restack land on the ref GitHub actually merged into.
+        //
+        // A Zen-flowed task lands only the commit CI graded, on the base it was
+        // graded against. Checked first: a refusal must leave the PR alone.
+        let pin = crate::zen_flow::landing_pin(project, task, &host, &wt, Some(pr))?;
         let pr_base = lookup_pr_base(&host, &wt, pr)?;
-        let sha = merge_via_pr(&host, &wt, pr, strategy)?;
+        let sha = merge_via_pr(&host, &wt, pr, strategy, pin.as_ref())?;
         crate::pr_record::note_finished(project, pr, Some(&branch), PrState::Merged);
         (MergeOutcome::ViaPr { pr, sha }, pr_base)
     } else if let Some(merged) = lookup_merged_pr(&host, &wt, &branch)? {
@@ -658,6 +667,10 @@ pub fn merge(
         // PR records), report the no-op so the transition still advances. This
         // is the PR-less backstop to the already-merged path above; it covers
         // purely-local projects with no `gh` to probe.
+        //
+        // A Zen flow lands through its PR, so a flow that reached this point
+        // has lost it. Integrating the branch here would skip every pin.
+        crate::zen_flow::landing_pin(project, task, &host, &wt, None)?;
         match merge_hub_side(&host, &wt, &branch, &target, strategy, &task.id)? {
             HubMerge::Merged(sha) => (
                 MergeOutcome::HubSide {
@@ -675,6 +688,7 @@ pub fn merge(
         }
     };
 
+    crate::zen_flow::finish(project, &task.id);
     let restacks = restack_children(project, task, &branch, &merged_target);
 
     Ok(MergeResult {
@@ -1145,7 +1159,7 @@ pub fn merge_pr(
     pr: u64,
     strategy: MergeStrategy,
 ) -> Result<Option<String>> {
-    merge_via_pr(host, wt, pr, strategy)
+    merge_via_pr(host, wt, pr, strategy, None)
 }
 
 /// Unique-per-call `$TMPDIR` path for a throwaway git worktree. The
@@ -1188,16 +1202,26 @@ fn sanitize_path_segment(s: &str) -> String {
 /// Returns `None` when the PR reports `MERGED` but GitHub hadn't recorded
 /// the merge commit yet after the polling window — see
 /// [`wait_for_merge_commit_sha`].
-fn merge_via_pr(host: &Host, wt: &str, pr: u64, strategy: MergeStrategy) -> Result<Option<String>> {
+///
+/// With a `pin`, GitHub merges only if the PR's head is still the pinned commit.
+fn merge_via_pr(
+    host: &Host,
+    wt: &str,
+    pr: u64,
+    strategy: MergeStrategy,
+    pin: Option<&crate::zen_flow::LandingPin>,
+) -> Result<Option<String>> {
+    let repo = pin.map(|p| p.repository.as_str());
     // Pin the squash commit's title to the PR title so a bounce-and-rework
     // cycle (feature commit + later fix-up) can't let GitHub title the merge
     // after whichever commit landed last. Only squash needs it — a `--merge`
     // keeps every commit, so there's no single title to get wrong.
     let subject = match strategy {
-        MergeStrategy::Squash => Some(squash_merge_subject(&pr_title(host, wt, pr, None)?, pr)),
+        MergeStrategy::Squash => Some(squash_merge_subject(&pr_title(host, wt, pr, repo)?, pr)),
         _ => None,
     };
-    let out = gh_pr_merge(host, wt, pr, strategy, None, subject.as_deref(), None)?;
+    let head = pin.map(|p| p.integration_sha.as_str());
+    let out = gh_pr_merge(host, wt, pr, strategy, repo, subject.as_deref(), head)?;
     if !out.status.success() {
         return Err(Error::Command {
             cmd: format!("gh pr merge {pr} {}", strategy.gh_flag()),

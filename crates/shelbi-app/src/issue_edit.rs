@@ -31,7 +31,11 @@
 //! then waits for a read of the new copy and rebases on it.
 //!
 //! A failed save keeps the draft, says why ([`SaveStatus`]) and is retried
-//! by the next edit, a flush or [`IssueEdits::retry`]. Closing the editor
+//! by the next edit, a flush or [`IssueEdits::retry`]. A write the daemon
+//! never answers fails after [`WRITE_DEADLINE`], so it can't hold the lane for
+//! good. Whoever runs a write reports its answer here itself, from its own
+//! thread: the store outlives any view, so the lane is freed whichever view
+//! is showing by then. Closing the editor
 //! flushes it; a draft that still holds unsaved work stays here, so
 //! reopening the task (or returning to the project: [`shared`] keeps one
 //! store per project for the life of the process) shows it again.
@@ -61,6 +65,13 @@ pub const SAVE_DEBOUNCE: Duration = Duration::from_millis(800);
 /// How long a save refused as changed elsewhere waits for a read of the new
 /// copy before it says so and stops.
 pub const STALE_WAIT: Duration = Duration::from_secs(15);
+
+/// How long the host waits for the daemon's answer to a write before it
+/// reports [`ExecError::NoAnswer`] and the lane comes free. It outlasts what a
+/// healthy daemon can take: a merge (`shelbi_state::DAEMON_JOB_DRAIN`), or the
+/// client resending through a daemon restart. A shorter limit would call those
+/// failed, and a resend could then still land after the user was told so.
+pub const WRITE_DEADLINE: Duration = shelbi_state::DAEMON_RESTART_WINDOW;
 
 /// Refusals as changed elsewhere in a row (each followed by a read that
 /// showed nothing new) before the draft stops retrying on its own.
@@ -719,7 +730,17 @@ impl IssueEdits {
                     ExecError::NotFound(_) => {
                         draft.failure = Some("the issue no longer exists".into());
                     }
-                    ExecError::Backend(message) => draft.failure = Some(message),
+                    ExecError::Backend(message) | ExecError::ShuttingDown(message) => {
+                        draft.failure = Some(message)
+                    }
+                    ExecError::NoAnswer => {
+                        // Not a refusal: the workflow change goes again with
+                        // a retry, and a read may yet show the save landed.
+                        if draft.workflow.is_none() {
+                            draft.workflow = sent_workflow;
+                        }
+                        draft.failure = Some(ExecError::NoAnswer.to_string());
+                    }
                 }
             }
         }
@@ -755,6 +776,8 @@ impl IssueEdits {
 
     /// The write `ticket` finished: `landed` is the revision an ack
     /// reported, `None` for a failure (or a daemon that doesn't report it).
+    /// The thread that ran the write calls this, so the lane comes free even
+    /// when the view that started the write is gone.
     pub fn end_write(&mut self, ticket: &WriteTicket, landed: Option<ExpectedState>) {
         let Some(lane) = self.lanes.get_mut(&ticket.id) else {
             return;
@@ -871,6 +894,11 @@ impl IssueEdits {
             // The new copy: rebased on it, send again now.
             draft.awaiting = None;
             draft.due = true;
+        }
+        if !draft.dirty() && draft.failure.as_deref() == Some(&ExecError::NoAnswer.to_string()) {
+            // The save that got no answer landed after all.
+            draft.failure = None;
+            draft.saved = true;
         }
         self.collect(id);
     }

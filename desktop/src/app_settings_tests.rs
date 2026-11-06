@@ -2699,23 +2699,103 @@ fn the_canvas_pans_zooms_and_fits(cx: &mut TestAppContext) {
     assert!(graph.top() >= canvas.top() && graph.bottom() <= canvas.bottom() + px(1.0), "{graph:?} in {canvas:?}");
 }
 
+/// This thread's CPU time. Unlike the wall clock it stops while the thread
+/// waits for a core, so a busy machine doesn't bill a frame for the wait.
+fn thread_cpu_time() -> Duration {
+    let mut t = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let status = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut t) };
+    assert_eq!(status, 0, "clock_gettime");
+    Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
+}
+
+/// Fail unless `big` costs under `bound` times what `small` does.
+///
+/// Both run in turn on this thread and each keeps its cheapest run, the one
+/// least disturbed, so what's left of a busy machine (a slower core, cold
+/// caches) falls on both alike. It measures again before failing: load can
+/// spoil a pass for a round, but work the graph really added fails them all.
+fn assert_cost_ratio_under(bound: f64, what: &str, mut small: impl FnMut(), mut big: impl FnMut()) {
+    let cost = |f: &mut dyn FnMut()| {
+        let start = thread_cpu_time();
+        f();
+        thread_cpu_time() - start
+    };
+    let (mut small_cost, mut big_cost) = (Duration::MAX, Duration::MAX);
+    let mut ratio = f64::INFINITY;
+    for _ in 0..5 {
+        for _ in 0..16 {
+            small_cost = small_cost.min(cost(&mut small));
+            big_cost = big_cost.min(cost(&mut big));
+        }
+        ratio = big_cost.as_secs_f64() / small_cost.as_secs_f64();
+        if ratio < bound {
+            return;
+        }
+    }
+    panic!("{what}: {big_cost:?} against {small_cost:?} for a quarter of the graph, {ratio:.1}x (limit {bound}x)");
+}
+
+/// `big_fixture`'s shape at a quarter of its size: every fourth of its
+/// statuses, so the same mix of categories, with two transitions each.
+fn quarter_of_big_fixture() -> String {
+    use crate::views::workflow_graph::big_fixture;
+    let ids: Vec<String> = (0..20).step_by(4).map(big_fixture::id).collect();
+    let mut out = String::from("name: small\ndescription: Five statuses, ten transitions.\nstatuses:\n");
+    for id in &ids {
+        out.push_str(&format!("- id: {id}\n  owner: user\n"));
+    }
+    out.push_str("transitions:\n");
+    for (i, id) in ids.iter().enumerate() {
+        for (to, actions) in [(i + 1, "push_branch"), (i + 7, "merge, delete_branch")] {
+            out.push_str(&format!("- from: {id}\n  to: {}\n  actions: [{actions}]\n", ids[to % ids.len()]));
+        }
+    }
+    out
+}
+
+/// Catches a builder gone quadratic by how its cost grows, not by a time
+/// limit a loaded machine can break: four times the graph against the same
+/// graph at a quarter of the size, in CPU time.
+///
+/// The bounds sit between what the code measures and what a quadratic pass
+/// does to it, in debug builds at load averages of 30 to 350:
+///
+/// - Frames, 2.0x (the window around the graph costs the same in both).
+///   An element per pair of edges makes it 4.2x. Graph layout is too small a
+///   part of a frame to show here, so it gets its own check.
+/// - `Graph::of`, 6.3x. Comparing every pair of edges' segments makes it 10x;
+///   routing every pair of edges, 43x.
 #[gpui::test]
 fn twenty_statuses_and_forty_transitions_draw_in_a_frame(cx: &mut TestAppContext) {
-    use crate::views::workflow_graph::big_fixture;
+    use crate::views::workflow_graph::{big_fixture, Graph};
     let home = Home::with_project("bu-big", "alpha");
     std::fs::write(home.workflows().join("statuses.yaml"), big_fixture::statuses()).unwrap();
     std::fs::write(home.workflows().join("big.yaml"), big_fixture::workflow()).unwrap();
+    std::fs::write(home.workflows().join("small.yaml"), quarter_of_big_fixture()).unwrap();
     let mut s = Settings::open_builder(cx, "big");
     assert_eq!(s.draft().statuses.len(), 20);
     assert!(s.drawn("builder-node-stage-19") && s.drawn("builder-edge-label-39"));
-    // Debug-build frames on a shared machine: a loose bound that still
-    // catches a layout gone quadratic.
-    let start = std::time::Instant::now();
-    for _ in 0..10 {
-        s.h.draw();
-    }
-    let each = start.elapsed() / 10;
-    assert!(each < std::time::Duration::from_millis(250), "{each:?} a frame");
+    let mut small = Settings::open_builder(cx, "small");
+    assert_eq!(small.draft().statuses.len(), 5);
+    assert!(small.drawn("builder-node-stage-16") && small.drawn("builder-edge-label-9"));
+
+    assert_cost_ratio_under(3.0, "a frame", || small.h.draw(), || s.h.draw());
+
+    let inputs = |s: &Settings| {
+        let editor = s.editor().expect("the editor is open");
+        s.read(|_, cx| {
+            let state = editor.read(cx).state().unwrap();
+            (state.workflow().clone(), state.catalog().to_vec())
+        })
+    };
+    let lay_out = |(workflow, catalog): &(shelbi_core::Workflow, Vec<_>)| {
+        for _ in 0..5 {
+            std::hint::black_box(Graph::of(workflow, catalog));
+        }
+    };
+    let (small_graph, big_graph) = (inputs(&small), inputs(&s));
+    assert_cost_ratio_under(8.0, "a layout", || lay_out(&small_graph), || lay_out(&big_graph));
+
     // Switching views keeps the draft as it is.
     s.edit(|e, window, cx| e.show_mode(Mode::Form, window, cx));
     assert!(s.drawn("workflow-form"));

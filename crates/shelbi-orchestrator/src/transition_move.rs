@@ -17,7 +17,8 @@
 //!    plus `merge`). A failure aborts here: nothing is written and the issue
 //!    stays where it was.
 //! 4. Write the status and append the move event (an event that can't be
-//!    appended rolls the status back).
+//!    appended rolls the status back), then record the move's effect on the
+//!    card's Zen demotion.
 //! 5. Fire the merge edge's remaining actions (`delete_branch`, `run:` /
 //!    `ready:`), best-effort — the move already landed.
 //!
@@ -181,6 +182,9 @@ pub enum MoveWarning {
     /// The merge landed and the issue moved, but a remaining edge action
     /// (`delete_branch`, a `run:` command) failed.
     PostMergeCleanup { id: String, error: Error },
+    /// The move landed, but its effect on the card's Zen demotion couldn't be
+    /// saved, so Zen may treat the card as if the move hadn't happened.
+    ZenDemotion { id: String, error: Error },
 }
 
 impl fmt::Display for MoveWarning {
@@ -193,6 +197,10 @@ impl fmt::Display for MoveWarning {
             MoveWarning::PostMergeCleanup { id, error } => write!(
                 f,
                 "post-merge cleanup for `{id}` failed (merge already landed): {error}"
+            ),
+            MoveWarning::ZenDemotion { id, error } => write!(
+                f,
+                "`{id}` moved, but Zen's record of the move couldn't be saved: {error}"
             ),
         }
     }
@@ -418,6 +426,27 @@ pub fn move_issue_with(
                 error: Box::new(error),
                 rollback,
             });
+        }
+        // A user's todo -> backlog tells Zen to leave the card alone, and moving
+        // it back out lifts that. The move already landed, so a failure warns.
+        if let Err(error) =
+            shelbi_state::record_zen_user_move(project, id, &mv.from, &mv.to, reason)
+        {
+            warn(MoveWarning::ZenDemotion {
+                id: id.to_string(),
+                error,
+            });
+        }
+    }
+
+    // A task leaving handoff by any other route than a landing (bounced back to
+    // work, canceled) has ended its Zen flow: what the probe pinned no longer
+    // describes it, and the next handoff probes afresh.
+    if moved.is_some()
+        && workflow.status(&to_status).map(|s| s.category) != Some(StatusCategory::Handoff)
+    {
+        if let Err(error) = shelbi_state::zen_flow::forget(project, id) {
+            tracing::warn!(task = id, %error, "Zen flow record not cleared");
         }
     }
 

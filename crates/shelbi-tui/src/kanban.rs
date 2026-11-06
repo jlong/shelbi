@@ -17,7 +17,7 @@
 //! it in a `while true` loop) — so we deliberately don't bind a quit key.
 //! Switching away is the palette's job.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,20 +31,20 @@ use ratatui::{
 };
 use shelbi_app::board::{
     self as board_rules, card_branch, column_label, columns_from as kanban_columns_from,
-    BoardRules,
+    BoardInput, BoardRules, MoreRequest, LOADING_MORE_STATUS,
 };
 use shelbi_app::board_search::{BoardSearch, SearchWorker};
 #[cfg(test)]
 use shelbi_app::board::resolve_task_status;
 use shelbi_core::{
-    default_project_statuses, default_workflow, Column, IssuePr, PrCi, PrState, ProjectStatuses,
-    StatusCategory, Issue, Workflow, DEFAULT_WORKFLOW_NAME,
+    default_project_statuses, Column, IssuePr, PrCi, PrState,
+    StatusCategory, Issue, Workflow,
 };
 use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps, PopoverAction};
 use shelbi_orchestrator::transition::{
     move_issue_with, GitTransitionRunner, MoveError, MoveRequest, MoveWarning, TransitionRunner,
 };
-use shelbi_state::{KanbanColumnOverride, IssueFile, OwnershipGate, TrackerOwner};
+use shelbi_state::{KanbanColumnOverride, IssueFile, TrackerOwner};
 
 use crate::theme::palette;
 use crate::keymap::format_chord_or_unbound;
@@ -53,41 +53,16 @@ use crate::keymap::format_chord_or_unbound;
 /// index inside the currently focused column.
 pub struct KanbanApp {
     pub project_name: String,
-    /// Human-readable label from the project YAML's `display_name`, reloaded
-    /// each refresh. `None` for legacy projects (and until the first refresh),
-    /// which then show the slug. Rendered via [`KanbanApp::display_label`].
-    pub display_name: Option<String>,
+    /// What the board reads have told us (project config, workflows, statuses,
+    /// the open board, the done history and its paging), folded by the same
+    /// [`BoardInput`] the desktop uses. [`tasks`](Self::tasks) is the merged
+    /// board on top of it, with in-flight moves overlaid.
+    pub input: BoardInput,
     pub tasks: Vec<IssueFile>,
-    /// The **open** board as last read by the core snapshot refresher — the
-    /// in-progress/backlog/review columns, which the board index serves from a
-    /// local cache (fast). Retained separately from [`tasks`](Self::tasks) so a
-    /// closed-page fill (its own, network-capable refresher — see
-    /// [`Self::apply_closed_page`]) can merge the terminal `done`/`canceled`
-    /// lanes back in without the open board being re-read, and vice versa. The
-    /// two reads land independently so a slow (stale-cache) done-history fetch
-    /// never delays the open board's paint.
-    open_tasks: Vec<IssueFile>,
-    /// The first page of terminal `done`/`canceled` history as last read by the
-    /// closed-page refresher. Retained so a core open-board refresh (which no
-    /// longer reads the closed page) never discards the done column, and a
-    /// transient closed-read failure keeps the last-known lanes rather than
-    /// blanking them. User-paged extras live in [`closed_more`](Self::closed_more).
-    closed_first_page: Vec<IssueFile>,
-    /// True on a cold process whose board hasn't loaded yet — no persisted
-    /// snapshot to seed from ([`shelbi_state::BoardState::Cold`]). The board
-    /// paints its column chrome plus a centered "Loading board…" overlay
-    /// instead of blocking on the network or showing bare empty columns as if
-    /// they were real. Cleared on the first refresh that returns data.
-    pub board_loading: bool,
     pub selected_column: usize,
     pub selected_row: usize,
     pub last_refresh: Instant,
     pub status_line: String,
-    /// Board freshness banner for the title bar — `board 12s` when warm, `board
-    /// 4m stale · quota resets 16:03` when the daemon index lags or is parked,
-    /// `board 4m cached · no daemon` on a per-process cache fallback. `None` for a
-    /// local board (always authoritative) or before the first read. Phase 3 §6.
-    pub board_banner: Option<String>,
     /// When `Some`, a modal task detail popover is open for the given task id.
     /// Selection underneath stays put so closing the popover returns the
     /// cursor to the same card.
@@ -99,19 +74,6 @@ pub struct KanbanApp {
     /// by the renderer and read by the mouse-click handler to map a click
     /// back to a (column, row) pair.
     pub card_hits: Vec<CardHit>,
-    /// Declared workspace names from project.yaml, in YAML order. Reloaded
-    /// on every refresh so an edited project file shows up without a
-    /// restart. Empty when the project YAML is missing.
-    pub workspaces: Vec<String>,
-    /// The tracker-ownership gate cards are marked against
-    /// ([`shelbi_state::ownership`]), reloaded each refresh: unrestricted on a
-    /// filesystem board, so nothing is marked there.
-    pub ownership: OwnershipGate,
-    /// Active filter — `None` means "All workspaces".
-    /// [`WorkspaceFilter::Unassigned`] keeps only cards with no `assigned_to`.
-    /// Mirrored to `state.json::workspace_filter` so the chip survives a
-    /// respawn or project switch.
-    pub workspace_filter: Option<WorkspaceFilter>,
     /// When `Some`, the workspace filter dropdown is open; carries the
     /// in-flight cursor position so navigation can move through the
     /// options list. Selection only commits on Enter/Space.
@@ -128,25 +90,8 @@ pub struct KanbanApp {
     /// Hit-test entries for the open dropdown's option rows. Empty when
     /// the dropdown is closed.
     pub dropdown_hits: Vec<DropdownHit>,
-    /// Loaded workflows, in `list_workflows` order (alphabetical by name,
-    /// with `default` last when present unless another workflow sorts
-    /// after it lexicographically). Reloaded each [`refresh`], so an
-    /// edited `workflows/<name>.yaml` shows up on the next poll without
-    /// a respawn. Empty when the loader errors — the board degrades to
-    /// the canonical default workflow.
-    pub workflows: Vec<Workflow>,
-    /// Effective project default workflow name. Defaults to the historical
-    /// `default`, then refreshes from project config when available.
-    pub default_workflow_name: String,
-    /// Project-wide canonical column catalogue, loaded from
-    /// `workflows/statuses.yaml`. Source of truth for column identity
-    /// (id, name, category) and ordering — workflows can no longer
-    /// reorder columns or invent their own. Reloaded each [`refresh`].
-    /// Falls back to [`default_project_statuses`] when the loader
-    /// errors so the board still paints.
-    pub project_statuses: ProjectStatuses,
     /// The active column list: one entry per status from
-    /// [`KanbanApp::project_statuses`], in that file's declared order.
+    /// `workflows/statuses.yaml`, in that file's declared order.
     /// Selection indices ([`KanbanApp::selected_column`]) refer to slots
     /// in this vec, and the renderer walks it left-to-right. When a
     /// workflow filter is active the list narrows to the statuses that
@@ -195,26 +140,11 @@ pub struct KanbanApp {
     /// Used by the mouse handler to toggle collapsed/expanded state on
     /// a click. Re-written each render call by [`render_columns`].
     pub header_hits: Vec<HeaderHit>,
-    /// Explicit user overrides on column collapse state, keyed by
-    /// (workflow_name, status_id). Columns with no entry render in
-    /// `Auto` mode — empty collapses, non-empty expands. Loaded on
-    /// every [`refresh`] and rewritten through
-    /// [`shelbi_state::set_kanban_column_override`] whenever a user
-    /// click toggles a column. The workflow scope is the task's
-    /// `workflow_or_default()` so a `review` column shared by two
-    /// workflows can carry independent overrides per workflow view.
-    pub column_overrides: std::collections::BTreeMap<String, KanbanColumnOverride>,
-    /// Cursor for the next page of terminal `done`/`canceled` history, from the
-    /// on-demand closed page (`Plans/github-issue-caching-and-rate-limits.md`
-    /// §4). `Some` means more history exists and a "load more" row is offered in
-    /// the done column; `None` means the loaded pages are the whole history.
-    /// Refreshed each [`refresh`].
-    pub closed_next_cursor: Option<String>,
-    /// Terminal-history cards fetched by an explicit "load more" (pages *beyond*
-    /// the first). Kept separate from the first page so a periodic [`refresh`] —
-    /// which only re-reads the cached first page — never discards what the user
-    /// paged in. Merged into [`tasks`](Self::tasks) alongside the first page.
-    pub closed_more: Vec<IssueFile>,
+    /// The "load more" fetch running on a background thread, with the receiver
+    /// of its answer. [`poll_load_more`](Self::poll_load_more) folds it.
+    more_fetch: Option<(MoreRequest, Receiver<Result<ClosedPageRead, String>>)>,
+    /// Fetches the page after a cursor: the live read outside tests.
+    more_fetcher: SharedMoreFetcher,
     /// Coalesces the transient GitHub board-refresh failure so a persistent
     /// outage (the board read parks every tick) logs a bounded number of error
     /// entries instead of one per tick. See [`crate::error_report`].
@@ -255,6 +185,9 @@ pub struct KanbanApp {
 
 /// A [`TransitionRunner`] the background persistence threads can share.
 type SharedTransitionRunner = Arc<dyn TransitionRunner + Send + Sync>;
+
+/// Fetches the done-history page after a cursor, for a project.
+type SharedMoreFetcher = Arc<dyn Fn(&str, &str) -> Result<ClosedPageRead, String> + Send + Sync>;
 
 /// How a card move is persisted off the UI thread. The default
 /// ([`LibraryPersister`]) runs the shared in-process move function; a host (the
@@ -485,12 +418,11 @@ impl KanbanApp {
         let all_columns = kanban_columns_from(&project_statuses, None);
         Self {
             project_name: project_name.into(),
-            display_name: None,
+            input: BoardInput {
+                loading: false,
+                ..BoardInput::default()
+            },
             tasks: Vec::new(),
-            open_tasks: Vec::new(),
-            closed_first_page: Vec::new(),
-            board_loading: false,
-            board_banner: None,
             selected_column: 0,
             selected_row: 0,
             last_refresh: Instant::now() - Duration::from_secs(60),
@@ -498,17 +430,11 @@ impl KanbanApp {
             popover: None,
             open_url: None,
             card_hits: Vec::new(),
-            workspaces: Vec::new(),
-            ownership: OwnershipGate::Unrestricted,
-            workspace_filter: None,
             workspace_dropdown: None,
             filter_chip_hit: None,
             show_new_issue: false,
             new_issue_hit: None,
             dropdown_hits: Vec::new(),
-            workflows: vec![default_workflow()],
-            default_workflow_name: DEFAULT_WORKFLOW_NAME.to_string(),
-            project_statuses,
             all_columns,
             workflow_filter: None,
             workflow_dropdown: None,
@@ -519,9 +445,8 @@ impl KanbanApp {
             keymaps: Keymaps::default(),
             display_style: DisplayStyle::detect(),
             header_hits: Vec::new(),
-            column_overrides: std::collections::BTreeMap::new(),
-            closed_next_cursor: None,
-            closed_more: Vec::new(),
+            more_fetch: None,
+            more_fetcher: Arc::new(board_rules::load_more_closed),
             refresh_errors: crate::error_report::TransientErrorLog::new("github"),
             pending_moves: HashMap::new(),
             transition_runner: Arc::new(GitTransitionRunner),
@@ -566,7 +491,7 @@ impl KanbanApp {
     /// set, otherwise the slug `project_name`. Mirrors
     /// [`shelbi_core::Project::display_label`].
     pub fn display_label(&self) -> &str {
-        self.display_name.as_deref().unwrap_or(&self.project_name)
+        self.input.display_name.as_deref().unwrap_or(&self.project_name)
     }
 
     /// Borrow the keymaps the footers render hints from. Populated by
@@ -620,7 +545,7 @@ impl KanbanApp {
         let workflow = self
             .workflow_filter
             .as_deref()
-            .unwrap_or(&self.default_workflow_name);
+            .unwrap_or(&self.input.default_workflow_name);
         Some(shelbi_state::kanban_column_override_key(
             workflow,
             &col.status_id,
@@ -633,7 +558,7 @@ impl KanbanApp {
     pub fn column_expansion(&self, col_idx: usize) -> ColumnExpansion {
         match self
             .override_key_for(col_idx)
-            .and_then(|k| self.column_overrides.get(&k))
+            .and_then(|k| self.input.column_overrides.get(&k))
         {
             Some(KanbanColumnOverride::Collapsed) => ColumnExpansion::Collapsed,
             Some(KanbanColumnOverride::Expanded) => ColumnExpansion::Expanded,
@@ -667,12 +592,12 @@ impl KanbanApp {
         } else {
             KanbanColumnOverride::Collapsed
         };
-        self.column_overrides.insert(key.clone(), new_state);
+        self.input.column_overrides.insert(key.clone(), new_state);
         let col = self.all_columns[col_idx].clone();
         let workflow = self
             .workflow_filter
             .clone()
-            .unwrap_or_else(|| self.default_workflow_name.clone());
+            .unwrap_or_else(|| self.input.default_workflow_name.clone());
         if let Err(e) = shelbi_state::set_kanban_column_override(
             &self.project_name,
             &workflow,
@@ -805,7 +730,7 @@ impl KanbanApp {
     /// status id (looked up against its owning workflow) equals
     /// `ac.status_id`. Tasks from different workflows can share a
     /// column when both workflows declare the same status id. Tasks
-    /// whose declared workflow is missing from `self.workflows` fall
+    /// whose declared workflow is missing from `self.input.workflows` fall
     /// back to the legacy [`Column`]-derived id so they still show up
     /// somewhere instead of vanishing.
     ///
@@ -826,14 +751,14 @@ impl KanbanApp {
     fn task_workflow_name<'a>(&'a self, task: &'a Issue) -> &'a str {
         task.workflow
             .as_deref()
-            .unwrap_or(&self.default_workflow_name)
+            .unwrap_or(&self.input.default_workflow_name)
     }
 
     /// The shared workflow-aware lookups over this board's workflows.
     fn rules(&self) -> BoardRules<'_> {
         BoardRules {
-            workflows: &self.workflows,
-            default_workflow_name: &self.default_workflow_name,
+            workflows: &self.input.workflows,
+            default_workflow_name: &self.input.default_workflow_name,
         }
     }
 
@@ -848,7 +773,7 @@ impl KanbanApp {
     /// active everything passes; otherwise the task's `assigned_to`
     /// must match the filter's predicate.
     fn task_matches_filter(&self, tf: &IssueFile) -> bool {
-        match &self.workspace_filter {
+        match &self.input.workspace_filter {
             None => true,
             Some(f) => f.matches(tf.task.assigned_to.as_deref()),
         }
@@ -861,7 +786,7 @@ impl KanbanApp {
         if !self.search.is_active() {
             return true;
         }
-        let branch = card_branch(&tf.task, &self.workflows, self.task_workflow_name(&tf.task));
+        let branch = card_branch(&tf.task, &self.input.workflows, self.task_workflow_name(&tf.task));
         self.search.shows(&tf.task.title, &tf.task.id, branch.as_deref())
     }
 
@@ -920,72 +845,36 @@ impl KanbanApp {
     /// `refresh` did (status/error lines, the cold loading overlay, the terminal
     /// history merge, selection clamp, and the optimistic-move reconcile).
     pub(crate) fn apply_board_data(&mut self, data: BoardData) {
-        match data.project {
-            Some(p) => {
-                self.default_workflow_name = p.default_workflow_name;
-                self.display_name = p.display_name;
-                self.workspaces = p.workspaces;
-                self.ownership = p.ownership;
-                self.search.set_remote(p.remote_search, Instant::now());
-            }
-            None => {
-                self.default_workflow_name = DEFAULT_WORKFLOW_NAME.to_string();
-                self.display_name = None;
-                self.workspaces = Vec::new();
-                self.ownership = OwnershipGate::Unrestricted;
-                self.search.set_remote(false, Instant::now());
-            }
+        // The fold is shared. What it reports, and how, is the TUI's: a failed
+        // config load logs, and a failing board read logs coalesced.
+        let workflows_error = data.workflows.as_ref().err().cloned();
+        let statuses_error = data.project_statuses.as_ref().err().cloned();
+        let board = match &data.board {
+            BoardOutcome::Failed(msg) => Err(msg.clone()),
+            BoardOutcome::Cold { .. } => Ok(false),
+            BoardOutcome::Warm { .. } => Ok(true),
+        };
+        self.input.apply_open(data);
+        self.search.set_remote(self.input.remote_search, Instant::now());
+        if let Some(msg) = workflows_error {
+            self.fail_status(msg);
         }
-
-        // Reload every tick so a CLI or palette edit shows up without a respawn.
-        // The workflow filter is intentionally NOT loaded here: it's per-session
-        // by design (resets on `shelbi reload`).
-        self.workspace_filter = data
-            .state_snapshot
-            .as_ref()
-            .and_then(|s| s.workspace_filter.clone())
-            .map(|s| WorkspaceFilter::from_disk(&s));
-        self.column_overrides = data
-            .state_snapshot
-            .as_ref()
-            .map(|s| s.kanban_column_overrides.clone())
-            .unwrap_or_default();
-
-        self.workflows = match data.workflows {
-            Ok(wfs) => wfs,
-            Err(msg) => {
-                self.fail_status(msg);
-                vec![default_workflow()]
-            }
-        };
-        self.project_statuses = match data.project_statuses {
-            Ok(ps) => ps,
-            Err(msg) => {
-                self.fail_status(msg);
-                default_project_statuses()
-            }
-        };
+        if let Some(msg) = statuses_error {
+            self.fail_status(msg);
+        }
         self.all_columns = self.compute_all_columns();
 
-        match data.board {
-            BoardOutcome::Failed(msg) => {
-                self.board_banner = None;
-                self.fail_refresh(msg);
-            }
-            BoardOutcome::Cold { banner } => {
-                self.board_banner = banner;
+        match board {
+            Err(msg) => self.fail_refresh(msg),
+            Ok(warm) => {
                 // A board read that returned (cold, warm or stale) is a healthy
                 // refresh: log a single "recovered" line if it had been parked.
                 self.clear_refresh_error();
-                // No data yet; leave `tasks` as-is (empty on first paint) and flag
-                // loading. The daemon's next tick fills the index.
-                self.board_loading = true;
                 self.last_refresh = Instant::now();
-            }
-            BoardOutcome::Warm { banner, base_tasks } => {
-                self.board_banner = banner;
-                self.clear_refresh_error();
-                self.apply_warm_board(base_tasks);
+                if warm {
+                    self.rebuild_tasks();
+                    self.clamp_selection();
+                }
             }
         }
 
@@ -995,19 +884,6 @@ impl KanbanApp {
         self.reconcile_pending_moves();
     }
 
-    /// Fold a warm/stale **open**-board read into the app. The terminal
-    /// `done`/`canceled` lanes are merged separately (their own refresher, via
-    /// [`apply_closed_page`](Self::apply_closed_page)) and retained across this
-    /// read in [`closed_first_page`](Self::closed_first_page) / `closed_more`, so
-    /// refreshing the open board never discards the done column.
-    fn apply_warm_board(&mut self, base_tasks: Vec<IssueFile>) {
-        self.board_loading = false;
-        self.open_tasks = base_tasks;
-        self.rebuild_tasks();
-        self.last_refresh = Instant::now();
-        self.clamp_selection();
-    }
-
     /// Fold a closed-page read (its own refresher, [`read_closed_page`](Self::read_closed_page))
     /// into the terminal `done`/`canceled` lanes without touching the open board.
     /// `None` — the store couldn't be built or the fetch failed — keeps the
@@ -1015,10 +891,7 @@ impl KanbanApp {
     /// Fills in progressively after the open board, so a stale-cache GraphQL fetch
     /// never delays the board's first paint.
     pub(crate) fn apply_closed_page(&mut self, closed: Option<ClosedPageRead>) {
-        if let Some(page) = closed {
-            self.closed_first_page = page.issues;
-            self.closed_next_cursor = page.next_cursor;
-        }
+        self.input.apply_closed(closed);
         self.rebuild_tasks();
         self.clamp_selection();
         // A late closed-page fill can land a card an in-flight move targets, so
@@ -1036,21 +909,8 @@ impl KanbanApp {
     /// An active search's hits the board hasn't loaded (GitHub matches beyond
     /// the loaded done page, say) are merged last, the board's copy winning.
     fn rebuild_tasks(&mut self) {
-        self.tasks = board_rules::merge_board(
-            &self.open_tasks,
-            &self.closed_first_page,
-            &self.closed_more,
-        );
-        let hits = self.search.hits();
-        if !hits.is_empty() {
-            let mut seen: HashSet<String> = self.tasks.iter().map(|tf| tf.task.id.clone()).collect();
-            let extra: Vec<IssueFile> = hits
-                .iter()
-                .filter(|tf| seen.insert(tf.task.id.clone()))
-                .cloned()
-                .collect();
-            self.tasks.extend(extra);
-        }
+        self.input.set_search_hits(&self.search);
+        self.tasks = self.input.tasks();
     }
 
     /// Whether the done column offers "load more": more terminal history (the
@@ -1062,7 +922,16 @@ impl KanbanApp {
         if self.search.showing_results() {
             return self.search.status().is_some_and(|s| s.has_more);
         }
-        self.closed_next_cursor.is_some()
+        self.input.closed.has_more()
+    }
+
+    /// Whether the done column's "load more" is fetching: the history's next
+    /// page, or the next page of a GitHub search's results.
+    pub fn loading_more_done(&self) -> bool {
+        if self.search.showing_results() {
+            return self.search.status().is_some_and(|s| s.searching);
+        }
+        self.input.closed.fetching()
     }
 
     // ---- text search ------------------------------------------------------
@@ -1149,12 +1018,11 @@ impl KanbanApp {
         true
     }
 
-    /// Fetch the next page of terminal `done`/`canceled` history and append it —
-    /// the "load more" action (§4). A live, uncached fetch (the cached page is
-    /// only ever the first 50), so it is explicit and user-driven. New cards are
-    /// accumulated in [`closed_more`](Self::closed_more) so a later [`refresh`]
-    /// keeps them, then merged into the board immediately. A no-op when no more
-    /// history is available.
+    /// Fetch the next page of terminal `done`/`canceled` history — the "load
+    /// more" action (§4). A live, uncached fetch (the cached page is only ever
+    /// the first 50), so it is explicit and user-driven, and runs on a background
+    /// thread: [`poll_load_more`](Self::poll_load_more) folds the answer. A no-op
+    /// when no more history is available or a fetch is already running.
     pub fn load_more_done(&mut self) {
         // While a GitHub search's results show, "load more" pages them.
         if self.search.showing_results() {
@@ -1166,42 +1034,44 @@ impl KanbanApp {
             }
             return;
         }
-        let Some(cursor) = self.closed_next_cursor.clone() else {
+        let Some(request) = self.input.closed.begin_more() else {
             return;
         };
-        let store = match shelbi_state::issue_store_for(&self.project_name) {
-            Ok(store) => store,
-            Err(e) => {
-                self.fail_status(format!("load more failed: {e}"));
-                return;
-            }
+        self.status_line = LOADING_MORE_STATUS.to_string();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let fetch = self.more_fetcher.clone();
+        let project = self.project_name.clone();
+        let cursor = request.cursor.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(fetch(&project, &cursor));
+        });
+        self.more_fetch = Some((request, rx));
+    }
+
+    /// Fold the running "load more" fetch's answer, if it's in; true when the
+    /// board needs a repaint. Never blocks: called from the event loop's tick.
+    pub fn poll_load_more(&mut self) -> bool {
+        let Some((_, rx)) = &self.more_fetch else {
+            return false;
         };
-        match store.closed_page(Some(&cursor)) {
-            Ok(mut page) => {
-                shelbi_state::pr_status::fold(&self.project_name, &mut page.issues);
-                self.closed_next_cursor = page.next_cursor;
-                // Accumulate the new page in `closed_more` (ids not already in the
-                // first page or an earlier "load more"), then rebuild so the merge
-                // order and dedup match every other board fill.
-                let mut seen: HashSet<String> = self
-                    .open_tasks
-                    .iter()
-                    .chain(self.closed_first_page.iter())
-                    .chain(self.closed_more.iter())
-                    .map(|tf| tf.task.id.clone())
-                    .collect();
-                for tf in page.issues {
-                    if seen.insert(tf.task.id.clone()) {
-                        self.closed_more.push(tf);
-                    }
-                }
-                self.rebuild_tasks();
-                self.clamp_selection();
-            }
-            Err(e) => {
-                self.fail_status(format!("load more failed: {e}"));
-            }
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Disconnected) => Err("load more failed: the fetch stopped".to_string()),
+        };
+        let Some((request, _)) = self.more_fetch.take() else {
+            return false;
+        };
+        if self.status_line == LOADING_MORE_STATUS {
+            self.status_line.clear();
         }
+        if let Err(e) = self.input.finish_more(&request, result) {
+            self.fail_status(e);
+        }
+        self.rebuild_tasks();
+        self.clamp_selection();
+        self.reconcile_pending_moves();
+        true
     }
 
     /// Options shown in the workspace dropdown — `All`, then each workspace
@@ -1211,7 +1081,7 @@ impl KanbanApp {
     /// (otherwise the user couldn't pick it to clear a previously-set
     /// filter on another workspace).
     pub fn dropdown_options(&self) -> Vec<DropdownOption> {
-        board_rules::workspace_options(&self.tasks, &self.workspaces)
+        board_rules::workspace_options(&self.tasks, &self.input.workspaces)
     }
 
     /// Index of the option that matches the active filter, used to seed
@@ -1221,7 +1091,7 @@ impl KanbanApp {
     /// was still persisted.
     fn current_filter_idx(&self, opts: &[DropdownOption]) -> usize {
         opts.iter()
-            .position(|o| o.filter == self.workspace_filter)
+            .position(|o| o.filter == self.input.workspace_filter)
             .unwrap_or(0)
     }
 
@@ -1287,7 +1157,7 @@ impl KanbanApp {
     /// in-memory state. Best-effort on the disk write — view state
     /// shouldn't block the UI on a transient FS error.
     fn apply_filter(&mut self, filter: Option<WorkspaceFilter>) {
-        self.workspace_filter = filter.clone();
+        self.input.workspace_filter = filter.clone();
         let disk = filter.as_ref().map(|f| f.to_disk());
         if let Err(e) = shelbi_state::set_workspace_filter(&self.project_name, disk.as_deref()) {
             self.fail_status(format!("filter persist failed: {e}"));
@@ -1295,7 +1165,7 @@ impl KanbanApp {
         // The selection may now point past the end of a column that
         // just shrank; clamp before the next render reads it.
         self.clamp_selection();
-        self.status_line = match &self.workspace_filter {
+        self.status_line = match &self.input.workspace_filter {
             None => "filter: all workspaces".to_string(),
             Some(f) => format!("filter: {}", f.label()),
         };
@@ -1316,15 +1186,15 @@ impl KanbanApp {
     /// only the statuses that workflow declares participate — still
     /// rendered in `statuses.yaml` order (workflows cannot reorder).
     /// If the filter targets a workflow that no longer exists in
-    /// `self.workflows`, the columns fall back to the full list so the
+    /// `self.input.workflows`, the columns fall back to the full list so the
     /// board doesn't go blank and the user can still see the chip to
     /// clear it.
     fn compute_all_columns(&self) -> Vec<KanbanColumn> {
         let workflow = match &self.workflow_filter {
-            Some(name) => self.workflows.iter().find(|w| &w.name == name),
+            Some(name) => self.input.workflows.iter().find(|w| &w.name == name),
             None => None,
         };
-        kanban_columns_from(&self.project_statuses, workflow)
+        kanban_columns_from(&self.input.project_statuses, workflow)
     }
 
     /// Options for the workflow dropdown: `All` (count = all tasks),
@@ -1409,11 +1279,11 @@ impl KanbanApp {
     /// A single-workflow project cycles between `None` and that one
     /// workflow — degenerate but harmless.
     pub fn cycle_workflow_filter(&mut self) {
-        if self.workflows.is_empty() {
+        if self.input.workflows.is_empty() {
             return;
         }
         let next =
-            board_rules::next_workflow_filter(&self.workflows, self.workflow_filter.as_deref());
+            board_rules::next_workflow_filter(&self.input.workflows, self.workflow_filter.as_deref());
         self.apply_workflow_filter(next);
     }
 
@@ -1685,6 +1555,7 @@ impl KanbanApp {
     fn adjacent_column_for_task(&self, task_id: &str, forward: bool, wrap: bool) -> Option<usize> {
         let task = &self.tasks.iter().find(|tf| tf.task.id == task_id)?.task;
         let wf = self
+            .input
             .workflows
             .iter()
             .find(|w| w.name == self.task_workflow_name(task))?;
@@ -2082,7 +1953,7 @@ pub fn render_full(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     // Cold process, board not loaded yet: overlay a centered "Loading board…"
     // banner over the (empty) column chrome so it reads as fetching, not as a
     // real empty board. Suppressed the instant any tasks are present.
-    if app.board_loading && app.tasks.is_empty() {
+    if app.input.loading && app.tasks.is_empty() {
         render_loading_overlay(f, outer[1]);
     }
     render_footer(f, app, outer[2]);
@@ -2142,7 +2013,7 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let total = app.tasks.len();
     let workspace_text = filter_chip_text(app);
     let workflow_text = workflow_chip_text(app);
-    let show_workflow_chip = app.workflows.len() > 1;
+    let show_workflow_chip = app.input.workflows.len() > 1;
     let workspace_w = workspace_text.chars().count() as u16;
     let workflow_w = workflow_text.chars().count() as u16;
     // The desktop's New issue, at the far right.
@@ -2208,7 +2079,7 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     // desktop's Issues header draws it; a stale index or a cache fallback
     // reads yellow so a lagging daemon or an exhausted quota is visible at a
     // glance rather than hidden behind an unchanging board.
-    if let Some(banner) = &app.board_banner {
+    if let Some(banner) = &app.input.banner {
         let stale = banner.contains("stale") || banner.contains("no daemon");
         let color = if stale { palette().ansi_yellow } else { palette().muted };
         left_spans.push(Span::styled(format!("   {banner}"), Style::default().fg(color)));
@@ -2234,7 +2105,7 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     }
 
     if let Some(area) = workspace_area {
-        let style = if app.workspace_filter.is_some() {
+        let style = if app.input.workspace_filter.is_some() {
             Style::default()
                 .fg(palette().ansi_cyan)
                 .add_modifier(Modifier::BOLD)
@@ -2289,7 +2160,7 @@ fn search_spans(app: &KanbanApp) -> Vec<Span<'static>> {
 /// space keeps the chip from sitting flush against the rightmost
 /// column. ▾ glyph hints that it's a dropdown affordance.
 fn filter_chip_text(app: &KanbanApp) -> String {
-    let label = match &app.workspace_filter {
+    let label = match &app.input.workspace_filter {
         None => "All".to_string(),
         Some(f) => f.label(),
     };
@@ -2352,7 +2223,7 @@ fn render_columns(f: &mut Frame, app: &mut KanbanApp, hits: &mut Vec<CardHit>, a
     // actually mix workflows in a single column — i.e. multiple
     // workflows are loaded AND no filter narrows the view to one.
     let show_card_workflow_label = board_rules::show_card_workflow_label(
-        app.workflows.len(),
+        app.input.workflows.len(),
         app.workflow_filter.is_some(),
     );
     let mut header_hits: Vec<HeaderHit> = Vec::with_capacity(widths.len());
@@ -2704,8 +2575,8 @@ fn render_column(
         // height stays 2 (single-line title) or 3 (wrapped title) rows.
         lines.push(card_meta_line(
             &tf.task,
-            app.ownership.owner(&tf.tracker_assignees).as_ref(),
-            &app.workflows,
+            app.input.ownership.owner(&tf.tracker_assignees).as_ref(),
+            &app.input.workflows,
             app.task_workflow_name(&tf.task),
             show_card_workflow_label,
             max_text,
@@ -2740,7 +2611,7 @@ fn render_column(
     // card selection; the bound action (`m`) fetches the next page.
     if column.category == StatusCategory::Done && app.has_more_done() {
         items.push(ListItem::new(Line::from(Span::styled(
-            "↓ load more (m)",
+            if app.loading_more_done() { "loading…" } else { "↓ load more (m)" },
             Style::default()
                 .fg(palette().ansi_dark_gray)
                 .add_modifier(Modifier::ITALIC),
@@ -2913,7 +2784,7 @@ fn render_workspace_dropdown(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let mut hits: Vec<DropdownHit> = Vec::with_capacity(opts.len());
     let mut items: Vec<ListItem> = Vec::with_capacity(opts.len());
     for (idx, opt) in opts.iter().enumerate() {
-        let active = app.workspace_filter == opt.filter;
+        let active = app.input.workspace_filter == opt.filter;
         let label = dropdown_row_text(opt);
         // Active filter gets a leading bullet so the user can tell at
         // a glance which row is currently applied. The selected row
@@ -3315,7 +3186,9 @@ fn persist_move_step(
             MoveWarning::WorkflowFallback { .. } => {
                 tracing::warn!(task = %id, "{w}");
             }
-            MoveWarning::PostMergeCleanup { .. } => cleanup_error = Some(w.to_string()),
+            MoveWarning::PostMergeCleanup { .. } | MoveWarning::ZenDemotion { .. } => {
+                cleanup_error = Some(w.to_string());
+            }
         },
     )
     .map_err(|e| match e {
@@ -3360,7 +3233,7 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         .cloned();
     let columns = app.task_columns();
     let style = app.display_style();
-    let owner = tf.as_ref().and_then(|tf| app.ownership.owner(&tf.tracker_assignees));
+    let owner = tf.as_ref().and_then(|tf| app.input.ownership.owner(&tf.tracker_assignees));
     let Some(pop) = app.popover.as_mut() else {
         return;
     };
@@ -3666,6 +3539,8 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelbi_core::{default_workflow, DEFAULT_WORKFLOW_NAME};
+    use shelbi_state::OwnershipGate;
 
     struct IsolatedKanbanEnv {
         home: std::path::PathBuf,
@@ -3796,7 +3671,7 @@ mod tests {
         // the on-demand closed page reported a next cursor.
         let mut app = KanbanApp::new("demo");
         assert!(!app.has_more_done(), "no cursor ⇒ no load-more row");
-        app.closed_next_cursor = Some("PAGE2".into());
+        app.apply_closed_page(Some(closed(Vec::new(), Some("PAGE2"))));
         assert!(app.has_more_done(), "a cursor ⇒ a load-more row");
     }
 
@@ -3880,8 +3755,150 @@ mod tests {
         app.clear_search();
         assert_eq!(ids_in(&app, todo), ["a", "b"]);
         assert_eq!(ids_in(&app, done), ["d1"]);
-        assert_eq!(app.closed_next_cursor.as_deref(), Some("PAGE2"));
+        assert_eq!(app.input.closed.next_cursor(), Some("PAGE2"));
         assert_eq!(app.selected_task().map(|tf| tf.task.id.as_str()), Some("b"));
+    }
+
+    /// Give `app` a fetcher answering from `pages` (cursor → page), recording
+    /// the cursors it was asked for.
+    fn fetch_from(
+        app: &mut KanbanApp,
+        pages: Vec<(&'static str, Vec<IssueFile>, Option<&'static str>)>,
+    ) -> Arc<std::sync::Mutex<Vec<String>>> {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = asked.clone();
+        app.more_fetcher = Arc::new(move |_project, cursor| {
+            log.lock().unwrap().push(cursor.to_string());
+            pages
+                .iter()
+                .find(|(at, _, _)| *at == cursor)
+                .map(|(_, issues, next)| closed(issues.clone(), *next))
+                .ok_or_else(|| format!("load more failed: no page at {cursor}"))
+        });
+        asked
+    }
+
+    /// Run the event loop's poll until the running fetch's answer lands.
+    fn settle_load_more(app: &mut KanbanApp) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !app.poll_load_more() {
+            assert!(Instant::now() < deadline, "the fetch never answered");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn done_card(id: &str) -> IssueFile {
+        task_file(id, Column::done(), 0, "2026-06-20T10:00:00Z")
+    }
+
+    /// Issue the `m` key through the real key handler.
+    fn press_m(app: &mut KanbanApp) {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        crate::handlers::kanban::handle_kanban_key(
+            app,
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE),
+            &Keymaps::default(),
+        );
+    }
+
+    #[test]
+    fn repeated_m_presses_page_through_the_history_with_refreshes_running() {
+        let mut app = KanbanApp::new("demo");
+        let first_page = || Some(closed(vec![done_card("d1")], Some("PAGE2")));
+        app.apply_closed_page(first_page());
+        let asked = fetch_from(
+            &mut app,
+            vec![
+                ("PAGE2", vec![done_card("d2")], Some("PAGE3")),
+                ("PAGE3", vec![done_card("d3")], Some("PAGE4")),
+                ("PAGE4", vec![done_card("d4")], None),
+            ],
+        );
+
+        for _ in 0..3 {
+            press_m(&mut app);
+            // The refresher keeps landing page 1, while the fetch runs and after.
+            app.apply_closed_page(first_page());
+            settle_load_more(&mut app);
+            app.apply_closed_page(first_page());
+            app.apply_board_data(warm_board(Vec::new()));
+        }
+
+        assert_eq!(*asked.lock().unwrap(), ["PAGE2", "PAGE3", "PAGE4"]);
+        let mut ids = ids_in(&app, DONE_IDX);
+        ids.sort();
+        assert_eq!(ids, ["d1", "d2", "d3", "d4"]);
+        assert!(!app.has_more_done(), "the end of the history stays the end");
+    }
+
+    #[test]
+    fn load_more_runs_off_the_ui_thread() {
+        let mut app = KanbanApp::new("demo");
+        app.apply_closed_page(Some(closed(vec![done_card("d1")], Some("PAGE2"))));
+        // The fetch can't answer until this thread lets it: run inline, the
+        // press would wait out the timeout and answer with a failure.
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = std::sync::Mutex::new(gate);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        app.more_fetcher = Arc::new(move |_project, _cursor| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            gate.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(10))
+                .map_err(|e| format!("load more failed: {e}"))?;
+            Ok(closed(vec![done_card("d2")], None))
+        });
+
+        press_m(&mut app);
+        assert!(app.loading_more_done(), "the row says it's fetching");
+        assert_eq!(app.status_line, LOADING_MORE_STATUS);
+        assert!(!app.poll_load_more(), "no answer yet, and the poll doesn't wait");
+        press_m(&mut app);
+
+        release.send(()).unwrap();
+        settle_load_more(&mut app);
+        assert!(!app.loading_more_done());
+        assert_eq!(app.status_line, "", "the fetch's status clears when it lands");
+        assert_eq!(ids_in(&app, DONE_IDX).len(), 2);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a second press while fetching doesn't start another",
+        );
+    }
+
+    #[test]
+    fn a_new_first_page_resets_the_loaded_pages() {
+        let mut app = KanbanApp::new("demo");
+        app.apply_closed_page(Some(closed(vec![done_card("d1")], Some("PAGE2"))));
+        fetch_from(&mut app, vec![("PAGE2", vec![done_card("d2")], Some("PAGE3"))]);
+        press_m(&mut app);
+        settle_load_more(&mut app);
+        assert_eq!(ids_in(&app, DONE_IDX).len(), 2);
+
+        app.apply_closed_page(Some(closed(vec![done_card("new")], Some("NEW2"))));
+
+        assert_eq!(ids_in(&app, DONE_IDX), ["new"]);
+        assert_eq!(app.input.closed.next_cursor(), Some("NEW2"));
+    }
+
+    #[test]
+    fn a_failed_page_reports_and_the_next_press_tries_it_again() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = IsolatedKanbanEnv::new("load-more-failure");
+        let mut app = KanbanApp::new("demo");
+        app.apply_closed_page(Some(closed(vec![done_card("d1")], Some("PAGE2"))));
+        let asked = fetch_from(&mut app, Vec::new());
+
+        press_m(&mut app);
+        settle_load_more(&mut app);
+        assert_eq!(app.status_line, "load more failed: no page at PAGE2");
+        assert!(app.has_more_done());
+
+        press_m(&mut app);
+        settle_load_more(&mut app);
+        assert_eq!(*asked.lock().unwrap(), ["PAGE2", "PAGE2"]);
     }
 
     #[test]
@@ -4008,7 +4025,8 @@ mod tests {
         app.tasks = vec![task_file("d", Column::done(), 0, "2026-06-20T10:00:00Z")];
         app.load_more_done();
         assert_eq!(app.tasks.len(), 1, "no cursor ⇒ board unchanged");
-        assert!(app.closed_more.is_empty());
+        assert!(app.input.closed.more().is_empty());
+        assert!(!app.loading_more_done(), "and nothing starts fetching");
     }
 
     #[test]
@@ -4246,7 +4264,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         let mut app = KanbanApp::new("demo");
         app.refresh();
         assert!(
-            !app.board_loading,
+            !app.input.loading,
             "a published index is real data, not a loading state"
         );
         assert!(
@@ -4417,7 +4435,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
         let mut app = KanbanApp::new("demo");
         app.move_persister = Some(recorder.clone());
         app.refresh();
-        app.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
+        app.input.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
         app.selected_column = 1;
         app.selected_row = 0;
 
@@ -4539,6 +4557,64 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             "line: {}",
             lines[0]
         );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Dragging a card from `todo` back to `backlog` on the board tells Zen to
+    /// leave it alone, and moving it back out lifts that.
+    #[test]
+    fn board_demotion_latches_zen_until_the_card_is_moved_back() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-zen-demote-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        crate::test_support::provision_hub_repo_for_project(&home, "demo");
+
+        let now = chrono::Utc::now();
+        let task = shelbi_core::Issue {
+            id: "fix-login".into(),
+            title: "fix login".into(),
+            column: Column::todo(),
+            priority: 0,
+            assigned_to: None,
+            workflow: None,
+            branch: None,
+            pr: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            launch: None,
+            created_at: now,
+            updated_at: now,
+            params: std::collections::BTreeMap::new(),
+        };
+        shelbi_state::save_task("demo", &task, "").unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        app.selected_column = 1;
+        app.selected_row = 0;
+        app.move_card_left();
+        app.block_on_pending_moves();
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.contains(" workflow=default todo -> backlog reason=user:tui "),
+            "log: {log}"
+        );
+        assert!(shelbi_state::zen_demoted_task_ids("demo").unwrap().contains("fix-login"));
+
+        app.move_card_right();
+        app.block_on_pending_moves();
+        assert!(shelbi_state::zen_demoted_task_ids("demo").unwrap().is_empty());
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -5150,7 +5226,7 @@ transitions:
         assert_eq!(app.column_tasks(1).len(), 3);
         assert_eq!(app.column_tasks(2).len(), 1);
 
-        app.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
+        app.input.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
         let todo: Vec<&str> = app
             .column_tasks(1)
             .iter()
@@ -5164,7 +5240,7 @@ transitions:
             .collect();
         assert_eq!(wip, vec!["c"]);
 
-        app.workspace_filter = Some(WorkspaceFilter::Unassigned);
+        app.input.workspace_filter = Some(WorkspaceFilter::Unassigned);
         let todo: Vec<&str> = app
             .column_tasks(1)
             .iter()
@@ -5184,7 +5260,7 @@ transitions:
     #[test]
     fn dropdown_options_lists_all_then_workspaces_then_unassigned() {
         let mut app = KanbanApp::new("demo");
-        app.workspaces = vec!["alpha".into(), "bravo".into(), "charlie".into()];
+        app.input.workspaces = vec!["alpha".into(), "bravo".into(), "charlie".into()];
         app.tasks = vec![
             task_file_for(
                 "a",
@@ -5233,7 +5309,7 @@ transitions:
     #[test]
     fn dropdown_options_omits_unassigned_when_zero() {
         let mut app = KanbanApp::new("demo");
-        app.workspaces = vec!["alpha".into()];
+        app.input.workspaces = vec!["alpha".into()];
         app.tasks = vec![task_file_for(
             "a",
             Column::todo(),
@@ -5257,7 +5333,7 @@ transitions:
     #[test]
     fn dropdown_open_seeds_cursor_on_active_filter_and_nav_wraps() {
         let mut app = KanbanApp::new("demo");
-        app.workspaces = vec!["alpha".into(), "bravo".into()];
+        app.input.workspaces = vec!["alpha".into(), "bravo".into()];
         app.tasks = vec![
             task_file_for(
                 "a",
@@ -5274,7 +5350,7 @@ transitions:
                 Some("bravo"),
             ),
         ];
-        app.workspace_filter = Some(WorkspaceFilter::Workspace("bravo".into()));
+        app.input.workspace_filter = Some(WorkspaceFilter::Workspace("bravo".into()));
         app.open_workspace_dropdown();
         // Options are [All, alpha, bravo] → bravo is index 2.
         assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 2);
@@ -5300,8 +5376,8 @@ transitions:
     #[test]
     fn dropdown_open_falls_back_to_all_when_filter_missing_from_options() {
         let mut app = KanbanApp::new("demo");
-        app.workspaces = vec!["alpha".into()];
-        app.workspace_filter = Some(WorkspaceFilter::Workspace("removed".into()));
+        app.input.workspaces = vec!["alpha".into()];
+        app.input.workspace_filter = Some(WorkspaceFilter::Workspace("removed".into()));
         app.open_workspace_dropdown();
         assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 0);
     }
@@ -5393,11 +5469,11 @@ transitions:
         let mut app = KanbanApp::new("demo");
         app.refresh();
         assert!(
-            app.workspace_filter.is_none(),
+            app.input.workspace_filter.is_none(),
             "fresh state.json → no filter"
         );
         assert_eq!(
-            app.workspaces,
+            app.input.workspaces,
             vec!["alpha".to_string(), "bravo".to_string()]
         );
 
@@ -5409,7 +5485,7 @@ transitions:
         app.dropdown_select();
         assert!(!app.workspace_dropdown_is_open());
         assert_eq!(
-            app.workspace_filter,
+            app.input.workspace_filter,
             Some(WorkspaceFilter::Workspace("bravo".into()))
         );
 
@@ -5417,7 +5493,7 @@ transitions:
         let mut app2 = KanbanApp::new("demo");
         app2.refresh();
         assert_eq!(
-            app2.workspace_filter,
+            app2.input.workspace_filter,
             Some(WorkspaceFilter::Workspace("bravo".into()))
         );
 
@@ -5459,7 +5535,7 @@ transitions:
             d.cursor = unassigned_idx;
         }
         app2.dropdown_select();
-        assert_eq!(app2.workspace_filter, Some(WorkspaceFilter::Unassigned));
+        assert_eq!(app2.input.workspace_filter, Some(WorkspaceFilter::Unassigned));
         let on_disk = shelbi_state::read_state("demo").unwrap();
         assert_eq!(
             on_disk.workspace_filter.as_deref(),
@@ -5471,7 +5547,7 @@ transitions:
         // disk so a subsequent refresh sees the cleared filter.
         app2.open_workspace_dropdown();
         app2.dropdown_clear();
-        assert_eq!(app2.workspace_filter, None);
+        assert_eq!(app2.input.workspace_filter, None);
         let on_disk = shelbi_state::read_state("demo").unwrap();
         assert!(on_disk.workspace_filter.is_none());
 
@@ -5503,14 +5579,14 @@ transitions:
         std::env::set_var("SHELBI_HOME", &home);
 
         let mut app = KanbanApp::new("demo");
-        app.workspaces = vec!["alpha".into()];
-        app.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
+        app.input.workspaces = vec!["alpha".into()];
+        app.input.workspace_filter = Some(WorkspaceFilter::Workspace("alpha".into()));
         app.open_workspace_dropdown();
         // Cursor seeds on alpha (idx 1). Walk back to All.
         app.dropdown_nav_up();
         assert_eq!(app.workspace_dropdown.as_ref().unwrap().cursor, 0);
         app.dropdown_select();
-        assert!(app.workspace_filter.is_none());
+        assert!(app.input.workspace_filter.is_none());
         assert!(!app.workspace_dropdown_is_open());
 
         std::env::remove_var("SHELBI_HOME");
@@ -5536,7 +5612,7 @@ transitions:
     fn rendering_dropdown_paints_options_and_chip() {
         use ratatui::{backend::TestBackend, Terminal};
         let mut app = KanbanApp::new("demo");
-        app.workspaces = vec!["alpha".into(), "bravo".into()];
+        app.input.workspaces = vec!["alpha".into(), "bravo".into()];
         app.tasks = vec![
             task_file_for(
                 "a",
@@ -5660,7 +5736,7 @@ transitions:
             ("board 4m cached · no daemon", palette().ansi_yellow),
         ] {
             let mut app = KanbanApp::new("demo");
-            app.board_banner = Some(banner.into());
+            app.input.banner = Some(banner.into());
             let mut term = Terminal::new(TestBackend::new(120, 10)).unwrap();
             term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
             let buf = term.backend().buffer().clone();
@@ -5673,7 +5749,7 @@ transitions:
             }
         }
         let mut app = KanbanApp::new("demo");
-        app.board_banner = None;
+        app.input.banner = None;
         let mut term = Terminal::new(TestBackend::new(120, 10)).unwrap();
         term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
         let buf = term.backend().buffer().clone();
@@ -5801,7 +5877,7 @@ transitions:
     fn cold_board_renders_loading_overlay() {
         use ratatui::{backend::TestBackend, Terminal};
         let mut app = KanbanApp::new("demo");
-        app.board_loading = true;
+        app.input.loading = true;
         assert!(app.tasks.is_empty());
 
         let backend = TestBackend::new(80, 20);
@@ -5828,7 +5904,7 @@ transitions:
     fn loading_overlay_suppressed_once_tasks_present() {
         use ratatui::{backend::TestBackend, Terminal};
         let mut app = KanbanApp::new("demo");
-        app.board_loading = true; // stale flag
+        app.input.loading = true; // stale flag
         app.tasks = vec![task_file("task-1", Column::todo(), 0, "2026-06-20T10:00:00Z")];
 
         let backend = TestBackend::new(80, 20);
@@ -6073,11 +6149,11 @@ transitions:
     #[test]
     fn column_tasks_buckets_tasks_from_all_workflows_by_status_id() {
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![
+        app.input.workflows = vec![
             default_workflow(),
             workflow_using("design-review", &["backlog", "in-progress", "done"]),
         ];
-        app.project_statuses = default_project_statuses();
+        app.input.project_statuses = default_project_statuses();
         app.all_columns = app.compute_all_columns();
         app.tasks = vec![
             // Default-workflow tasks.
@@ -6143,7 +6219,7 @@ transitions:
     #[test]
     fn unused_statuses_render_as_empty_columns() {
         let mut app = KanbanApp::new("demo");
-        app.project_statuses = default_project_statuses();
+        app.input.project_statuses = default_project_statuses();
         app.all_columns = app.compute_all_columns();
         app.tasks = vec![task_in_workflow(
             "only",
@@ -6166,11 +6242,11 @@ transitions:
     #[test]
     fn nav_right_walks_every_column_but_move_card_skips_workflow_gaps() {
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![
+        app.input.workflows = vec![
             default_workflow(),
             workflow_using("design-review", &["backlog", "in-progress", "done"]),
         ];
-        app.project_statuses = default_project_statuses();
+        app.input.project_statuses = default_project_statuses();
         app.all_columns = app.compute_all_columns();
 
         // nav_right walks all six columns and wraps at the end.
@@ -6189,6 +6265,7 @@ transitions:
         // only backlog (0), in-progress (2), done (4) — so a card sitting
         // in `backlog` moves right to `in-progress` (skipping `todo`).
         let design_review = app
+            .input
             .workflows
             .iter()
             .find(|w| w.name == "design-review")
@@ -6210,7 +6287,7 @@ transitions:
         );
 
         // The default workflow's adjacency walks every column (no gaps).
-        let default = app.workflows.iter().find(|w| w.name == "default").unwrap();
+        let default = app.input.workflows.iter().find(|w| w.name == "default").unwrap();
         assert_eq!(
             app.adjacent_column_in_workflow("backlog", default, true, true),
             Some(1),
@@ -6243,8 +6320,8 @@ transitions:
     fn adjacent_column_returns_none_for_singleton_workflow() {
         let solo = workflow_using("solo", &["in-progress"]);
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![solo.clone()];
-        app.project_statuses = default_project_statuses();
+        app.input.workflows = vec![solo.clone()];
+        app.input.project_statuses = default_project_statuses();
         app.all_columns = app.compute_all_columns();
         assert_eq!(
             app.adjacent_column_in_workflow("in-progress", &solo, true, true),
@@ -6265,11 +6342,11 @@ transitions:
     fn rendering_two_workflows_uses_shared_column_set_with_card_labels() {
         use ratatui::{backend::TestBackend, Terminal};
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![
+        app.input.workflows = vec![
             default_workflow(),
             workflow_using("design-review", &["backlog", "in-progress", "done"]),
         ];
-        app.project_statuses = default_project_statuses();
+        app.input.project_statuses = default_project_statuses();
         app.all_columns = app.compute_all_columns();
         // Seed every non-Canceled column with at least one task so the
         // collapse-empty logic doesn't truncate their headers below the
@@ -6336,12 +6413,12 @@ transitions:
         use ratatui::{backend::TestBackend, Terminal};
         use shelbi_app::theme::Appearance;
         let mut app = KanbanApp::new("demo");
-        app.workspaces = vec!["alpha".into(), "bravo".into()];
-        app.workflows = vec![
+        app.input.workspaces = vec!["alpha".into(), "bravo".into()];
+        app.input.workflows = vec![
             default_workflow(),
             workflow_using("design-review", &["backlog", "in-progress", "done"]),
         ];
-        app.project_statuses = default_project_statuses();
+        app.input.project_statuses = default_project_statuses();
         app.all_columns = app.compute_all_columns();
         app.tasks = vec![
             task_in_workflow("d-backlog", Column::backlog(), None, "2026-06-20T10:00:00Z"),
@@ -6377,8 +6454,8 @@ transitions:
     fn cards_render_with_one_blank_row_between_them() {
         use ratatui::{backend::TestBackend, Terminal};
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![default_workflow()];
-        app.project_statuses = default_project_statuses();
+        app.input.workflows = vec![default_workflow()];
+        app.input.project_statuses = default_project_statuses();
         app.all_columns = app.compute_all_columns();
         // Two cards in the same (backlog) column — the gap only appears
         // between cards, so we need at least two.
@@ -6431,11 +6508,11 @@ transitions:
     #[test]
     fn workflow_filter_narrows_columns_to_workflow_statuses() {
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![
+        app.input.workflows = vec![
             default_workflow(),
             workflow_using("design-review", &["backlog", "in-progress", "done"]),
         ];
-        app.project_statuses = default_project_statuses();
+        app.input.project_statuses = default_project_statuses();
         app.all_columns = app.compute_all_columns();
         assert_eq!(app.all_columns.len(), 6, "all six project statuses");
 
@@ -6464,8 +6541,8 @@ transitions:
     #[test]
     fn workflow_filter_for_missing_workflow_falls_back_to_full_set() {
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![default_workflow()];
-        app.project_statuses = default_project_statuses();
+        app.input.workflows = vec![default_workflow()];
+        app.input.project_statuses = default_project_statuses();
         app.workflow_filter = Some("removed".into());
         app.all_columns = app.compute_all_columns();
         assert_eq!(app.all_columns.len(), 6);
@@ -6479,7 +6556,7 @@ transitions:
     fn workflow_dropdown_options_lists_all_then_each_workflow() {
         let design = workflow("design-review", &[("Backlog", StatusCategory::Backlog)]);
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![default_workflow(), design];
+        app.input.workflows = vec![default_workflow(), design];
         app.tasks = vec![
             task_in_workflow("a", Column::todo(), None, "2026-06-20T10:00:00Z"),
             task_in_workflow(
@@ -6527,11 +6604,11 @@ transitions:
     #[test]
     fn cycle_workflow_filter_walks_all_then_each_workflow_then_wraps() {
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![
+        app.input.workflows = vec![
             default_workflow(),
             workflow_using("design-review", &["backlog", "in-progress", "done"]),
         ];
-        app.project_statuses = default_project_statuses();
+        app.input.project_statuses = default_project_statuses();
         app.all_columns = app.compute_all_columns();
         assert!(app.workflow_filter.is_none(), "starts at All");
 
@@ -6555,19 +6632,19 @@ transitions:
     #[test]
     fn cycle_workflow_filter_from_stale_filter_returns_to_all() {
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![default_workflow()];
+        app.input.workflows = vec![default_workflow()];
         app.workflow_filter = Some("removed".into());
         app.cycle_workflow_filter();
         assert!(app.workflow_filter.is_none());
     }
 
     /// `cycle_workflow_filter` with no workflows loaded (the loader
-    /// surfaced an error and `self.workflows` is empty) is a no-op so
+    /// surfaced an error and `self.input.workflows` is empty) is a no-op so
     /// the keybinding can't panic.
     #[test]
     fn cycle_workflow_filter_no_workflows_loaded_is_noop() {
         let mut app = KanbanApp::new("demo");
-        app.workflows = Vec::new();
+        app.input.workflows = Vec::new();
         app.workflow_filter = None;
         app.cycle_workflow_filter();
         assert!(app.workflow_filter.is_none());
@@ -6581,12 +6658,12 @@ transitions:
     #[test]
     fn column_tasks_hides_other_workflow_cards_when_filter_set() {
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![
+        app.input.workflows = vec![
             default_workflow(),
             // design-review shares `backlog` with the default workflow.
             workflow_using("design-review", &["backlog", "in-progress", "done"]),
         ];
-        app.project_statuses = default_project_statuses();
+        app.input.project_statuses = default_project_statuses();
         app.workflow_filter = Some("design-review".into());
         app.all_columns = app.compute_all_columns();
         app.tasks = vec![
@@ -6633,11 +6710,11 @@ transitions:
     #[test]
     fn empty_columns_render_under_workflow_filter() {
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![
+        app.input.workflows = vec![
             default_workflow(),
             workflow_using("design-review", &["backlog", "in-progress", "done"]),
         ];
-        app.project_statuses = default_project_statuses();
+        app.input.project_statuses = default_project_statuses();
         app.workflow_filter = Some("design-review".into());
         app.all_columns = app.compute_all_columns();
         app.tasks = vec![task_in_workflow(
@@ -6691,11 +6768,11 @@ transitions:
         std::fs::create_dir_all(&proj_dir).unwrap();
 
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![
+        app.input.workflows = vec![
             default_workflow(),
             workflow_using("design-review", &["backlog", "in-progress", "done"]),
         ];
-        app.project_statuses = default_project_statuses();
+        app.input.project_statuses = default_project_statuses();
         app.cycle_workflow_filter();
         assert_eq!(app.workflow_filter.as_deref(), Some("default"));
 
@@ -6779,11 +6856,11 @@ transitions:
     fn rendering_workflow_filter_narrows_visible_columns() {
         use ratatui::{backend::TestBackend, Terminal};
         let mut app = KanbanApp::new("demo");
-        app.workflows = vec![
+        app.input.workflows = vec![
             default_workflow(),
             workflow_using("design-review", &["backlog", "in-progress", "done"]),
         ];
-        app.project_statuses = default_project_statuses();
+        app.input.project_statuses = default_project_statuses();
         app.workflow_filter = Some("design-review".into());
         app.all_columns = app.compute_all_columns();
         app.tasks = vec![
@@ -6860,12 +6937,12 @@ transitions:
                 .collect(),
         };
         let mut app = KanbanApp::new("demo");
-        app.project_statuses = ps;
-        app.all_columns = kanban_columns_from(&app.project_statuses, None);
+        app.input.project_statuses = ps;
+        app.all_columns = kanban_columns_from(&app.input.project_statuses, None);
         // Force every synthesized column into the explicit-expanded
         // state. Using `kanban_column_override_key` keeps this in
         // lock-step with the production override path.
-        app.column_overrides = (0..app.all_columns.len())
+        app.input.column_overrides = (0..app.all_columns.len())
             .map(|i| {
                 (
                     shelbi_state::kanban_column_override_key("default", &format!("s{i}")),
@@ -7317,7 +7394,7 @@ transitions:
 
         let mut app = KanbanApp::new("demo");
         app.refresh();
-        assert_eq!(app.default_workflow_name, "app");
+        assert_eq!(app.input.default_workflow_name, "app");
         assert!(app.workflow_filter.is_none(), "precondition: All view");
         assert!(app.is_column_collapsed(0), "empty Backlog auto-collapses");
 
@@ -7325,7 +7402,7 @@ transitions:
         assert_eq!(app.column_expansion(0), ColumnExpansion::Expanded);
 
         app.refresh();
-        assert_eq!(app.default_workflow_name, "app");
+        assert_eq!(app.input.default_workflow_name, "app");
         assert_eq!(
             app.column_expansion(0),
             ColumnExpansion::Expanded,

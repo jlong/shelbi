@@ -482,10 +482,9 @@ impl AcceptCleanup {
 /// Reject flow untouched.
 ///
 /// Routes through [`crate::workspace::kill_workspace_pane`] rather than a bare
-/// `kill-window` so the expected-teardown mark is set (the review agent pane's
-/// lifecycle wrapper won't emit a spurious `pane_alive=false reason=signal:SIGHUP`)
-/// and every window bound to the slot is reaped — the invariant that keeps a
-/// half-torn-down review window from resurfacing as an `orphaned session`.
+/// `kill-window` so the kill records why the slot went down and every window
+/// bound to the slot is reaped — the invariant that keeps a half-torn-down review
+/// window from resurfacing as an `orphaned session`.
 /// Best-effort: closing one review slot's window touches only that slot, so
 /// other review windows and the dashboard sidebar are left alone.
 pub fn close_review_window(project_name: &str, task_id: &str) -> Result<()> {
@@ -509,12 +508,27 @@ pub fn close_review_window(project_name: &str, task_id: &str) -> Result<()> {
         .machine(&ws.machine)
         .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
     let addr = crate::workspace::workspace_target(&project, &ws)?;
-    crate::workspace::kill_workspace_pane(&machine.host(), &addr, &ws.name)?;
+    let host = machine.host();
+    // The slot's next task must find nothing of this one: no editor or diff
+    // session to reuse, and no marker to read as already serving. Before the
+    // pane kill, which can fail.
+    crate::review_session::kill_content_sessions(project_name, &ws.name);
+    let marker = crate::workspace::workspace_review_loaded_marker(machine, &ws);
+    if let Err(e) = crate::workspace::clear_review_loaded_marker(&host, &marker) {
+        tracing::warn!(workspace = %ws.name, error = %e, "clear_review_loaded_marker failed");
+    }
+    crate::workspace::kill_workspace_pane(
+        &project.name,
+        &host,
+        &addr,
+        &ws.name,
+        crate::session_backend::KillReason::Handoff,
+    )?;
     // Drop the freed slot's stale status.yaml so it returns to a clean idle. A
     // killed pane emits no further markers, so the poller can't refresh the file
     // — left in place it would report the review agent's last observed state
     // (frozen) rather than the empty slot it now is.
-    shelbi_state::clear_workspace_status(&ws.name)
+    shelbi_state::clear_workspace_status(&project.name, &ws.name)
 }
 
 /// **Reject**: append the reviewer's `reason` to the task body as a marked
@@ -930,7 +944,7 @@ mod tests {
         let pgid = child.id() as i32;
         let pgroup_alive = |pgid: i32| unsafe { libc::kill(-pgid, 0) == 0 };
 
-        let path = shelbi_state::review_serve_pgid_path("review-1").unwrap();
+        let path = shelbi_state::review_serve_pgid_path(&proj, "review-1").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{pgid}\n")).unwrap();
         assert!(pgroup_alive(pgid), "server group alive before close");
@@ -950,11 +964,80 @@ mod tests {
         }
         assert!(gone, "the dev-server process group must be gone (port freed)");
         assert!(
-            shelbi_state::read_review_serve_pgid("review-1")
+            shelbi_state::read_review_serve_pgid(&proj, "review-1")
                 .unwrap()
                 .is_none(),
             "the pgid record must be cleared after close"
         );
+
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A project whose review slot's worktree lives under a scratch `home`, so a
+    /// test can plant the review-loaded marker there. Returns the marker's path.
+    fn project_with_marker(proj: &str, home: &std::path::Path) -> std::path::PathBuf {
+        let mut project = demo_project(proj);
+        project.machines[0].work_dir = home.join("repo");
+        shelbi_state::save_project(&project).unwrap();
+        let marker = crate::workspace::workspace_review_loaded_marker(
+            &project.machines[0],
+            project.workspace("review-1").unwrap(),
+        );
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        marker
+    }
+
+    /// The client's Close arrives after the decision, with the card already out
+    /// of review. It still clears the marker naming the task, since the next task
+    /// loaded on the slot must not find it, but one naming the next task stays.
+    #[test]
+    fn close_review_after_the_decision_clears_only_the_tasks_own_marker() {
+        let _lock = crate::test_lock::acquire();
+        let proj = format!("close-decided-{}", std::process::id());
+        let home = std::env::temp_dir().join(format!("shelbi-closedec-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let marker = project_with_marker(&proj, &home);
+        shelbi_state::save_task(&proj, &task_on("t-done", "review-1", Column::done()), "b")
+            .unwrap();
+
+        std::fs::write(&marker, "t-done http://localhost:4310\n").unwrap();
+        crate::review_session::close_review(&proj, "t-done").unwrap();
+        assert!(!marker.exists(), "the decided task's marker goes with its close");
+
+        std::fs::write(&marker, "t-next http://localhost:4310\n").unwrap();
+        crate::review_session::close_review(&proj, "t-done").unwrap();
+        assert!(marker.exists(), "a late close leaves the next task's marker alone");
+
+        match prev_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn close_review_window_clears_the_slots_marker() {
+        let _lock = crate::test_lock::acquire();
+        let proj = format!("close-window-{}", std::process::id());
+        let home = std::env::temp_dir().join(format!("shelbi-closewin-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let marker = project_with_marker(&proj, &home);
+        shelbi_state::save_task(&proj, &task_on("t-rev", "review-1", Column::review()), "b")
+            .unwrap();
+        std::fs::write(&marker, "t-rev\n").unwrap();
+
+        close_review_window(&proj, "t-rev").unwrap();
+        assert!(!marker.exists());
 
         match prev_home {
             Some(h) => std::env::set_var("SHELBI_HOME", h),

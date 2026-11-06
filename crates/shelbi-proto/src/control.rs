@@ -631,6 +631,11 @@ pub enum MutationError {
     /// A [`ClientMsg::SaveConfig`] was refused: these files changed since
     /// the client read them (protocol v8). Nothing was written.
     ConfigChanged { paths: Vec<String> },
+    /// The daemon is shutting down and takes no new work: the request did not
+    /// start, so sending it again to the next daemon is safe. It waits for the
+    /// jobs already running before it exits. No protocol bump: a client that
+    /// can't read this variant fails the request either way, and nothing ran.
+    ShuttingDown,
 }
 
 impl std::fmt::Display for MutationError {
@@ -648,6 +653,10 @@ impl std::fmt::Display for MutationError {
             MutationError::ConfigChanged { paths } => {
                 write!(f, "changed since it was loaded: {}", paths.join(", "))
             }
+            MutationError::ShuttingDown => write!(
+                f,
+                "the hub daemon is shutting down; nothing was changed, so try again in a moment"
+            ),
         }
     }
 }
@@ -1045,6 +1054,10 @@ mod tests {
                 error: MutationError::ConfigChanged {
                     paths: vec!["/p/workflows/task.yaml".into()],
                 },
+            },
+            ServerMsg::Failed {
+                request_id: 13,
+                error: MutationError::ShuttingDown,
             },
         ];
         for msg in replies {

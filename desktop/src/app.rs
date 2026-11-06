@@ -280,7 +280,20 @@ fn shelbi_windows(cx: &App) -> Vec<WindowHandle<ShelbiWindow>> {
 /// The frontmost Shelbi window: the key one, else the top of the platform's
 /// window stack, else the first opened.
 fn frontmost(cx: &App) -> Option<WindowHandle<ShelbiWindow>> {
-    let ours = shelbi_windows(cx);
+    frontmost_of(shelbi_windows(cx), cx)
+}
+
+/// The frontmost window on this machine's projects: a remote window switches
+/// among its host's only, so a local project never lands in one.
+fn frontmost_local(cx: &App) -> Option<WindowHandle<ShelbiWindow>> {
+    let local = shelbi_windows(cx)
+        .into_iter()
+        .filter(|h| h.read(cx).is_ok_and(|w| w.remote.is_none()))
+        .collect();
+    frontmost_of(local, cx)
+}
+
+fn frontmost_of(ours: Vec<WindowHandle<ShelbiWindow>>, cx: &App) -> Option<WindowHandle<ShelbiWindow>> {
     let find = |any: AnyWindowHandle| {
         ours.iter()
             .find(|h| h.window_id() == any.window_id())
@@ -377,25 +390,33 @@ pub fn open_added_project(slug: &str, from: Option<WindowHandle<ShelbiWindow>>, 
 }
 
 /// A clicked notification: the window already showing its project comes up
-/// (else the frontmost one, switched to it) and opens the item.
+/// as it is and opens the item. No window shows it: the frontmost local one
+/// switches to it (or a new one opens).
 pub fn open_notice_tag(tag: &str, cx: &mut App) {
-    let Some((project, target)) = notify::parse_tag(tag) else {
+    let Some((id, target)) = notify::parse_tag(tag) else {
         return;
     };
-    // A remote window's notices name its project as `host:project`: only
-    // that window opens them (no local window switches to it).
     let showing = shelbi_windows(cx)
         .into_iter()
-        .find(|h| h.read(cx).is_ok_and(|w| w.shows_id(&project)));
-    let remote = !showing.is_some() && project.contains(':');
-    let Some(handle) = showing.or_else(|| frontmost(cx).filter(|_| !remote)) else {
+        .find(|h| h.read(cx).is_ok_and(|w| w.shows_id(&id)));
+    if let Some(handle) = showing {
+        let _ = handle.update(cx, |this, window, cx| {
+            window.activate_window();
+            this.open_notice(target, window, cx);
+        });
+        return;
+    }
+    // A remote window's notices name its project as `host:project`, an id and
+    // never a project to switch to: only that window opens them.
+    if id.contains(':') {
+        return;
+    }
+    let Some(handle) = frontmost_local(cx).or_else(|| open_new_window(&id, cx)) else {
         return;
     };
     let _ = handle.update(cx, |this, window, cx| {
         window.activate_window();
-        if !this.shows(&project) {
-            this.switch_to(&project, window, cx);
-        }
+        this.switch_to(&id, window, cx);
         this.open_notice(target, window, cx);
     });
 }
@@ -2305,9 +2326,9 @@ impl ShelbiWindow {
         cx.notify();
     }
 
-    /// Drop everything bound to the shown project: its overlay, its views
-    /// and their sessions and subscriptions, the review flow, the panel in
-    /// the column, the feed subscription, its notes.
+    /// Drop everything bound to the shown project: its overlay and dialogs,
+    /// its views and their sessions and subscriptions, the review flow, the
+    /// panel in the column, the feed subscription, its notes.
     fn teardown_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Whatever the review flow still has running opens nothing.
         if let Some(task) = self.review_loader.pending().map(str::to_string) {
@@ -2317,6 +2338,12 @@ impl ShelbiWindow {
         // A workspace dialog's draft is the old project's: it goes unsaved
         // (a job it already sent finishes against that project).
         self.pool_dialog = None;
+        // So does the rest: New task would create in the project it opened
+        // over, and none of them keeps the keyboard or a view to give it back
+        // to once the views below go. A create already sent still lands there.
+        self.new_task = None;
+        self.connect = None;
+        self.feedback = None;
         self.overlay = None;
         self.overlay_opened = None;
         self.client.close_overlay();
@@ -2551,23 +2578,35 @@ impl ShelbiWindow {
         window.remove_window();
     }
 
-    /// The project the shown one was quit: this window moves to another open
-    /// project, or to the chooser when none is left.
-    fn after_quit_project(&mut self, quit: String, window: &mut Window, cx: &mut Context<Self>) {
-        let offline = self.offline();
+    /// `quit` was quit: a window still showing it moves to another open
+    /// project, or to the chooser when none is left. A window the user already
+    /// moved off it stays where they chose (checked by the project, not by a
+    /// count of switches: one that came back to `quit` still has to leave).
+    /// A remote window goes to the chooser: this machine's open projects
+    /// aren't its host's, and its listing doesn't say which of those are open.
+    fn after_quit_project(&mut self, quit: ProjectKey, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.shows_key(&quit) {
+            return;
+        }
+        let none_to_read = self.offline() || self.remote.is_some();
+        let name = quit.name.clone();
         let next = cx.background_executor().spawn(async move {
-            if offline {
+            if none_to_read {
                 return None;
             }
             shelbi_state::list_open_projects()
                 .unwrap_or_default()
                 .into_iter()
-                .find(|p| *p != quit)
+                .find(|p| *p != name)
         });
         cx.spawn_in(window, async move |this, cx| {
             let next = next.await;
-            this.update_in(cx, |this, window, cx| this.leave_quit_project(next, window, cx))
-                .ok();
+            this.update_in(cx, |this, window, cx| {
+                if this.shows_key(&quit) {
+                    this.leave_quit_project(next, window, cx);
+                }
+            })
+            .ok();
         })
         .detach();
     }
@@ -4335,6 +4374,7 @@ impl ShelbiWindow {
             cx,
         );
         let project = self.project.clone();
+        let label = self.model.project_label.clone();
         let quit_key = self.project_handle.key().clone();
         let link = self.project_handle.link.clone();
         let control = self.ready().map(|r| r.control.clone());
@@ -4343,19 +4383,12 @@ impl ShelbiWindow {
                 return;
             }
             // The orchestrator is about to be stopped on purpose: its exit is
-            // not a crash to restart.
+            // not a crash to restart. The prompt named `project`, and that's
+            // what quits; a window a notice switched off it meanwhile holds
+            // another project's views, which aren't closing.
             this.update(cx, |this, cx| {
-                if let Some(chat) = &this.chat {
-                    chat.update(cx, |chat, _| chat.note_deliberate_close());
-                }
-                if let Some(ws) = &this.workspace {
-                    ws.update(cx, |ws, cx| ws.note_deliberate_close(cx));
-                }
-                if let Some(review) = &this.review {
-                    review.update(cx, |r, cx| r.note_deliberate_close(cx));
-                }
-                if let Some(issues) = &this.issues {
-                    issues.update(cx, |v, cx| v.note_deliberate_close(true, cx));
+                if this.shows_key(&quit_key) {
+                    this.mark_deliberate_close(true, cx);
                 }
             })
             .ok();
@@ -4379,10 +4412,9 @@ impl ShelbiWindow {
                 // staying open.
                 Ok(()) => {
                     let me = window.window_handle().window_id();
-                    let quit_project = quit_key.name.clone();
                     for other in windows_showing_key(&quit_key, Some(me), cx) {
                         if other.window_id() != me {
-                            let quit = quit_project.clone();
+                            let quit = quit_key.clone();
                             cx.defer(move |cx| {
                                 let _ = other.update(cx, |w, window, cx| {
                                     w.after_quit_project(quit, window, cx)
@@ -4390,28 +4422,55 @@ impl ShelbiWindow {
                             });
                         }
                     }
-                    this.after_quit_project(quit_project.clone(), window, cx);
+                    this.after_quit_project(quit_key.clone(), window, cx);
                 }
                 Err(e) => {
-                    if let Some(chat) = &this.chat {
-                        chat.update(cx, |chat, _| chat.clear_deliberate_close());
+                    if this.shows_key(&quit_key) {
+                        this.mark_deliberate_close(false, cx);
                     }
-                    if let Some(ws) = &this.workspace {
-                        ws.update(cx, |ws, cx| ws.clear_deliberate_close(cx));
-                    }
-                    if let Some(review) = &this.review {
-                        review.update(cx, |r, cx| r.clear_deliberate_close(cx));
-                    }
-                    if let Some(issues) = &this.issues {
-                        issues.update(cx, |v, cx| v.note_deliberate_close(false, cx));
-                    }
-                    this.banner = Some(format!("Couldn't quit the project: {e}").into());
+                    // Named: the window may show another project by now.
+                    this.banner = Some(format!("Couldn't quit {label}: {e}").into());
                     cx.notify();
                 }
             })
             .ok();
         })
         .detach();
+    }
+
+    /// The shown project's sessions are about to end on purpose (`on`), or
+    /// won't after all: their exit is, or is again, a crash to restart.
+    fn mark_deliberate_close(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(chat) = &self.chat {
+            chat.update(cx, |chat, _| {
+                if on {
+                    chat.note_deliberate_close()
+                } else {
+                    chat.clear_deliberate_close()
+                }
+            });
+        }
+        if let Some(ws) = &self.workspace {
+            ws.update(cx, |ws, cx| {
+                if on {
+                    ws.note_deliberate_close(cx)
+                } else {
+                    ws.clear_deliberate_close(cx)
+                }
+            });
+        }
+        if let Some(review) = &self.review {
+            review.update(cx, |r, cx| {
+                if on {
+                    r.note_deliberate_close(cx)
+                } else {
+                    r.clear_deliberate_close(cx)
+                }
+            });
+        }
+        if let Some(issues) = &self.issues {
+            issues.update(cx, |v, cx| v.note_deliberate_close(on, cx));
+        }
     }
 
     fn confirm_quit_shelbi(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4911,12 +4970,18 @@ impl ShelbiWindow {
     /// state through the window's source, the viewer's intro flag locally).
     fn toggle_zen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let source = self.project_handle.source.clone();
+        let key = self.project_handle.key().clone();
         let check = cx
             .background_executor()
             .spawn(async move { shelbi_app::zen::intro_due(source.zen_state().ok()) });
         cx.spawn_in(window, async move |this, cx| {
             let intro = check.await;
             this.update_in(cx, |this, window, cx| {
+                // The toggle was for the project it read: a switch meanwhile
+                // doesn't carry it over to the next.
+                if !this.shows_key(&key) {
+                    return;
+                }
                 let project = this.project.clone();
                 if intro {
                     this.open_overlay(ActiveOverlay::zen_intro(project), window, cx);
@@ -4935,6 +5000,7 @@ impl ShelbiWindow {
     /// badge) follows. Success flashes nothing: the band is the indicator.
     fn run_zen(&mut self, project: String, intro: Option<(bool, bool)>, cx: &mut Context<Self>) {
         let link = self.project_handle.link.clone();
+        let key = self.project_handle.key().clone();
         let work = cx.background_executor().spawn(async move {
             let link = Some(&link);
             let result = match intro {
@@ -4948,7 +5014,9 @@ impl ShelbiWindow {
         cx.spawn(async move |this, cx| {
             let message = work.await;
             this.update(cx, |this, cx| {
-                if let Some(message) = message {
+                // Its project's error log keeps a failure; the status note is
+                // about the project on screen.
+                if let Some(message) = message.filter(|_| this.shows_key(&key)) {
                     this.flash(message, cx);
                 }
                 this.request_refresh();

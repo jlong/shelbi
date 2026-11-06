@@ -360,6 +360,35 @@ fn accept_edge_merges_before_the_status_write_then_deletes_the_branch() {
 }
 
 #[test]
+fn leaving_handoff_ends_the_tasks_zen_flow_but_moving_within_it_does_not() {
+    use shelbi_state::zen_flow::{self, ZenFlowPhase, ZenFlowRecord};
+
+    let fx = Fixture::new("zen-flow");
+    let record = ZenFlowRecord {
+        task_id: "t".into(),
+        repository: "github.com/example/repo".into(),
+        repository_id: "R_1".into(),
+        base_branch: "main".into(),
+        base_sha: "base".into(),
+        integration_sha: Some("integration".into()),
+        head_sha: "head".into(),
+        published_head_sha: "head".into(),
+        phase: ZenFlowPhase::CiGreen { pr: 7 },
+    };
+    zen_flow::save(PROJECT, &record).unwrap();
+
+    // Arriving in review is still handoff: the flow carries on.
+    let store = fx.store(Column::in_progress());
+    move_issue_with(&store, &fx.runner(), &board_request("review"), &mut no_warnings).unwrap();
+    assert!(zen_flow::load(PROJECT, "t").unwrap().is_some());
+
+    // Bounced back to work: what the probe pinned no longer describes the task.
+    let store = fx.store(Column::review());
+    move_issue_with(&store, &fx.runner(), &board_request("todo"), &mut no_warnings).unwrap();
+    assert_eq!(zen_flow::load(PROJECT, "t").unwrap(), None);
+}
+
+#[test]
 fn board_and_cli_moves_run_the_same_transition_actions() {
     // Same edge, driven the way each surface drives it. Apart from the
     // caller's own labels (`reason=`, the merge event's fallback `workspace=`)
@@ -593,4 +622,103 @@ fn non_handoff_move_of_an_assigned_card_detaches_nothing() {
         "a handoff→done accept must not reach the detach seam: {:?}",
         fx.calls(),
     );
+}
+
+/// The fixture task, saved at `column` on the project's real filesystem board,
+/// so a test can run a real move and read it back through the real Zen scan.
+fn real_board(column: Column) -> Box<dyn IssueStore> {
+    let store = shelbi_state::issue_store_for(PROJECT).unwrap();
+    let mut issue = NewIssue::new("t", "t", column, "body");
+    issue.workflow = Some("mergewf".into());
+    store.add(issue).unwrap();
+    store
+}
+
+fn zen_scan() -> Vec<String> {
+    crate::zen::mechanically_eligible(&bare_project()).unwrap()
+}
+
+fn request_with_reason<'a>(to: &'a str, reason: &'a str) -> MoveRequest<'a> {
+    MoveRequest {
+        project: PROJECT,
+        id: "t",
+        to,
+        reason,
+        workspace_fallback: "cli",
+        skip_transition_actions: false,
+    }
+}
+
+#[test]
+fn a_board_demotion_keeps_zen_off_the_card_past_log_rotation_until_re_promoted() {
+    let fx = Fixture::new("demotion");
+    let store = real_board(Column::todo());
+    let runner = fx.runner();
+
+    // The user drags the card back. The real event line carries `workflow=`
+    // between the id and the transition: the shape that used to defeat the latch.
+    move_issue_with(store.as_ref(), &runner, &board_request("backlog"), &mut no_warnings).unwrap();
+    let events = fx.events();
+    assert!(
+        events
+            .iter()
+            .any(|l| l.contains(" task=t workflow=mergewf todo -> backlog reason=user:tui ")),
+        "{events:?}"
+    );
+    assert!(zen_scan().is_empty(), "a demoted card must not be eligible");
+
+    // Rotation drops the line, and the demotion outlives it.
+    std::fs::remove_file(shelbi_state::events_log_path().unwrap()).unwrap();
+    assert!(zen_scan().is_empty(), "the demotion must survive rotation");
+
+    // Re-promoting by hand clears it. A later non-user return to the backlog
+    // (Zen's own rollback) leaves the card eligible again.
+    move_issue_with(store.as_ref(), &runner, &board_request("todo"), &mut no_warnings).unwrap();
+    move_issue_with(
+        store.as_ref(),
+        &runner,
+        &request_with_reason("backlog", "zen:rollback"),
+        &mut no_warnings,
+    )
+    .unwrap();
+    assert_eq!(zen_scan(), ["t"]);
+}
+
+#[test]
+fn a_demotion_from_the_desktop_or_cli_also_stops_zen() {
+    // `user:app` is what the desktop's daemon mutation sends; `user:cli` is the
+    // default for `shelbi issue move`.
+    for reason in ["user:app", "user:cli"] {
+        let fx = Fixture::new("demotion-sources");
+        let store = real_board(Column::todo());
+        move_issue_with(
+            store.as_ref(),
+            &fx.runner(),
+            &request_with_reason("backlog", reason),
+            &mut no_warnings,
+        )
+        .unwrap();
+        assert!(zen_scan().is_empty(), "{reason} should demote");
+    }
+}
+
+#[test]
+fn zen_moving_a_card_does_not_lift_the_users_demotion() {
+    let fx = Fixture::new("demotion-zen");
+    let store = real_board(Column::todo());
+    let runner = fx.runner();
+    move_issue_with(store.as_ref(), &runner, &board_request("backlog"), &mut no_warnings).unwrap();
+    for (to, reason) in [
+        ("todo", "orchestrator:zen-promote category=1"),
+        ("backlog", "zen:rollback"),
+    ] {
+        move_issue_with(
+            store.as_ref(),
+            &runner,
+            &request_with_reason(to, reason),
+            &mut no_warnings,
+        )
+        .unwrap();
+    }
+    assert!(zen_scan().is_empty());
 }

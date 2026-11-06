@@ -38,6 +38,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use shelbi_core::Reachability;
@@ -363,6 +364,17 @@ impl ProjectLink {
         shelbi_client::ControlClient::over(reader, writer, shelbi_state::CLIENT_VERSION).map_err(failed)
     }
 
+    /// Run one request on a remote project's far daemon. One that is on its way
+    /// out refuses new work, so wait and send it to the one that replaces it,
+    /// over a fresh `control` stream each time.
+    fn on_far_daemon<T>(
+        relay: &dyn remote::RelayLink,
+        project: &str,
+        send: impl FnMut(&mut shelbi_client::ControlClient) -> Result<T, ExecError>,
+    ) -> Result<T, ExecError> {
+        crate::exec_daemon::retry_through_drain(|| Self::far_control(relay, project), send)
+    }
+
     pub fn key(&self) -> &ProjectKey {
         &self.key
     }
@@ -421,11 +433,31 @@ impl ProjectLink {
     ) -> Result<Option<ExpectedState>, ExecError> {
         match &self.relay {
             None => crate::exec_daemon::execute_mutation_expecting(mutation, expected, on_line),
-            Some(relay) => {
-                let mut client = Self::far_control(&**relay, &self.key.name)?;
-                crate::exec_daemon::mutate_over(&mut client, mutation, expected, on_line)
-            }
+            Some(relay) => Self::on_far_daemon(&**relay, &self.key.name, |client| {
+                crate::exec_daemon::mutate_over(client, mutation, expected.clone(), on_line)
+            }),
         }
+    }
+
+    /// [`Self::mutate`], waiting at most `deadline` for the answer: a daemon
+    /// that takes the request and never replies is [`ExecError::NoAnswer`].
+    /// The caller gets exactly one result. A later answer is dropped (a read
+    /// shows what it did), and the thread stays parked on the silent daemon
+    /// until its connection closes. The request's expected state still guards
+    /// anything that thread resends after the deadline.
+    pub fn mutate_within(
+        &self,
+        deadline: Duration,
+        mutation: &Mutation,
+        expected: Option<ExpectedState>,
+    ) -> Result<Option<ExpectedState>, ExecError> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let link = self.clone();
+        let mutation = mutation.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(link.mutate(&mutation, expected, &mut |_stream, _line| {}));
+        });
+        rx.recv_timeout(deadline).unwrap_or(Err(ExecError::NoAnswer))
     }
 
     /// Add the issue [`Mutation::AddIssue`] describes and answer with the id
@@ -437,10 +469,9 @@ impl ProjectLink {
     ) -> Result<Option<String>, ExecError> {
         match &self.relay {
             None => crate::exec_daemon::add_issue(mutation, on_line),
-            Some(relay) => {
-                let mut client = Self::far_control(&**relay, &self.key.name)?;
-                crate::exec_daemon::add_issue_over(&mut client, mutation, on_line)
-            }
+            Some(relay) => Self::on_far_daemon(&**relay, &self.key.name, |client| {
+                crate::exec_daemon::add_issue_over(client, mutation, on_line)
+            }),
         }
     }
 
@@ -475,10 +506,9 @@ impl ProjectLink {
     pub fn review_session(&self, task: &str, op: ReviewSessionOp, on_line: &mut dyn FnMut(Stream, &str)) -> ExecOutcome {
         match &self.relay {
             None => crate::exec_daemon::review_session(&self.key.name, task, op, on_line),
-            Some(relay) => {
-                let mut client = Self::far_control(&**relay, &self.key.name)?;
-                crate::exec_daemon::review_session_over(&mut client, &self.key.name, task, op, on_line)
-            }
+            Some(relay) => Self::on_far_daemon(&**relay, &self.key.name, |client| {
+                crate::exec_daemon::review_session_over(client, &self.key.name, task, op.clone(), on_line)
+            }),
         }
     }
 
@@ -493,9 +523,10 @@ impl ProjectLink {
             None => crate::settings::store::save_here(&self.key.name, plan),
             Some(relay) => {
                 let host = crate::remote_window::bare_host(relay.host()).to_string();
-                let mut client = Self::far_control(&**relay, &self.key.name)
-                    .map_err(|e| WriteFailure::Failed(e.to_string()))?;
-                crate::settings::store::send_save(&mut client, &self.key.name, plan, Some(host))
+                crate::settings::store::through_drain(
+                    || Self::far_control(&**relay, &self.key.name).map_err(|e| WriteFailure::Failed(e.to_string())),
+                    |client| crate::settings::store::send_save(client, &self.key.name, plan, Some(host.clone())),
+                )
             }
         }
     }
@@ -507,13 +538,17 @@ impl ProjectLink {
     pub fn far_request(&self, request: &crate::far::Request) -> Result<crate::far::Reply, String> {
         let relay = self.relay.as_ref().ok_or_else(|| "not a project on another machine".to_string())?;
         let host = relay.host().to_string();
-        let mut client = Self::far_control(&**relay, &self.key.name).map_err(|e| e.to_string())?;
         let request = shelbi_proto::control::AppRequest {
             request_id: 1,
             project: self.key.name.clone(),
             body: serde_json::to_value(request).map_err(|e| e.to_string())?,
         };
-        let body = client.app_request(&request).map_err(|e| format!("{host}: {e}"))?;
+        let body = Self::on_far_daemon(&**relay, &self.key.name, |client| {
+            client
+                .app_request(&request)
+                .map_err(|e| crate::exec_daemon::map_client_err(e).with_host(&host))
+        })
+        .map_err(|e| e.to_string())?;
         serde_json::from_value(body).map_err(|e| format!("{host} answered something this build can't read: {e}"))
     }
 
@@ -561,10 +596,9 @@ impl ProjectLink {
     ) -> ExecOutcome {
         match &self.relay {
             None => crate::exec_daemon::workspace_session(&self.key.name, ws, op, on_line),
-            Some(relay) => {
-                let mut client = Self::far_control(&**relay, &self.key.name)?;
-                crate::exec_daemon::workspace_session_over(&mut client, &self.key.name, ws, op, on_line)
-            }
+            Some(relay) => Self::on_far_daemon(&**relay, &self.key.name, |client| {
+                crate::exec_daemon::workspace_session_over(client, &self.key.name, ws, op.clone(), on_line)
+            }),
         }
     }
 
@@ -575,11 +609,11 @@ impl ProjectLink {
     pub fn write_state(&self, write: crate::state_write::StateWrite) -> Result<(), String> {
         match &self.relay {
             None => crate::exec_daemon::write_state(&self.key.name, write).map_err(|e| e.to_string()),
-            Some(relay) => {
-                let mut client = Self::far_control(&**relay, &self.key.name).map_err(|e| e.to_string())?;
-                crate::exec_daemon::write_state_over(&mut client, &self.key.name, write)
-                    .map_err(|e| format!("{}: {e}", relay.host()))
-            }
+            Some(relay) => Self::on_far_daemon(&**relay, &self.key.name, |client| {
+                crate::exec_daemon::write_state_over(client, &self.key.name, write.clone())
+                    .map_err(|e| e.with_host(relay.host()))
+            })
+            .map_err(|e| e.to_string()),
         }
     }
 }
@@ -782,5 +816,68 @@ mod tests {
         }
         assert_eq!(dir, home.join("remote").join("me@devbox").join("shelbi"));
         assert_eq!(escaped, home.join("remote").join("_._x").join("_._y"));
+    }
+
+    /// A relay whose control service takes the request and never answers
+    /// (`hang`), or refuses it at once.
+    struct ScriptedRelay {
+        hang: bool,
+    }
+
+    impl remote::RelayLink for ScriptedRelay {
+        fn host(&self) -> &str {
+            "devbox"
+        }
+        fn is_reachable(&self) -> bool {
+            true
+        }
+        fn open_query(&self) -> Result<shelbi_client::QueryStream, shelbi_client::ClientError> {
+            Err(shelbi_client::ClientError::UnexpectedEof)
+        }
+        fn open_service(
+            &self,
+            _service: shelbi_proto::RelayService,
+        ) -> Result<shelbi_client::RelayStream, shelbi_client::ClientError> {
+            if self.hang {
+                loop {
+                    std::thread::park();
+                }
+            }
+            Err(shelbi_client::ClientError::UnexpectedEof)
+        }
+        fn list_sessions(&self) -> Result<Vec<shelbi_proto::RelaySession>, shelbi_client::ClientError> {
+            Ok(Vec::new())
+        }
+        fn open_session(&self, _short_id: &str) -> Result<shelbi_client::RelayStream, shelbi_client::ClientError> {
+            Err(shelbi_client::ClientError::UnexpectedEof)
+        }
+    }
+
+    fn link(hang: bool) -> ProjectLink {
+        ProjectLink::remote("demo", Arc::new(ScriptedRelay { hang }), Arc::new(null::NullSessions))
+    }
+
+    fn a_move() -> Mutation {
+        Mutation::MoveIssue {
+            project: "demo".into(),
+            id: "A".into(),
+            to_status: "review".into(),
+        }
+    }
+
+    #[test]
+    fn a_mutation_nothing_answers_fails_at_the_deadline() {
+        let at = std::time::Instant::now();
+        let deadline = Duration::from_millis(50);
+        let result = link(true).mutate_within(deadline, &a_move(), None);
+        assert!(matches!(result, Err(ExecError::NoAnswer)), "{result:?}");
+        assert!(at.elapsed() >= deadline);
+        assert_eq!(ExecError::NoAnswer.to_string(), "no answer from the daemon");
+    }
+
+    #[test]
+    fn a_mutation_answered_in_time_keeps_its_answer() {
+        let result = link(false).mutate_within(Duration::from_secs(30), &a_move(), None);
+        assert!(matches!(result, Err(ExecError::Backend(ref m)) if m.starts_with("devbox:")), "{result:?}");
     }
 }

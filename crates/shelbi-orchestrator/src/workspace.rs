@@ -20,7 +20,7 @@ use shelbi_core::{
     WorkspaceSpec,
 };
 
-use crate::session_backend::{backend, Liveness, SessionBackend, SessionTarget};
+use crate::session_backend::{backend, KillReason, Liveness, SessionBackend, SessionTarget};
 
 
 /// Filter `git status --porcelain` output down to the lines that represent
@@ -345,6 +345,24 @@ pub fn workspace_ready_deferred_marker(machine: &Machine, workspace: &WorkspaceS
         .join("shelbi-ready-deferred")
 }
 
+/// The transition-marker **deferral** sidecar for a workspace:
+/// `<worktree>/.shelbi/shelbi-transition-deferred`.
+///
+/// The [`workspace_transition_marker`] counterpart of
+/// [`workspace_ready_deferred_marker`]: a gate's verdict is written exactly once,
+/// so a failed read of the task (or a failed move) leaves the marker in place to
+/// retry next tick. This sidecar records the current `<stage>:<class>` token so
+/// the deferral reaches `events.log` once rather than every tick. Consuming the
+/// marker clears it, as does dispatch, which also clears the marker itself.
+pub fn workspace_transition_deferred_marker(
+    machine: &Machine,
+    workspace: &WorkspaceSpec,
+) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".shelbi")
+        .join("shelbi-transition-deferred")
+}
+
 /// The ready-handoff **refusal** sidecar for a workspace:
 /// `<worktree>/.shelbi/shelbi-ready-refused`.
 ///
@@ -451,7 +469,7 @@ pub fn read_deferred_marker(host: &Host, marker: &Path) -> Result<Option<String>
 }
 
 /// Write the deferral sidecar with the current outage's error `class`. The
-/// class is a short internal token (see `poller::classify_load_error`), so no
+/// class is a short internal token (see `poller::classify_store_error`), so no
 /// escaping beyond the shell quoting the remote path needs. Best-effort by
 /// contract: a failed write only risks re-logging the deferral next tick.
 pub fn write_deferred_marker(host: &Host, marker: &Path, class: &str) -> Result<()> {
@@ -874,8 +892,9 @@ pub fn write_review_loaded_marker(
 }
 
 /// Remove the review-serving marker (idempotent — `rm -f` succeeds if absent).
-/// Called when the poller reaps an orphaned review slot so a stale marker
-/// naming a resolved task can't keep the sidebar showing **Ready for Review**.
+/// Called when a task is dispatched onto the slot, when its review is closed, and
+/// when the poller reaps an orphaned review slot, so a stale marker naming a
+/// resolved task can't keep the sidebar showing **Ready for Review**.
 pub fn clear_review_loaded_marker(host: &Host, marker: &Path) -> Result<()> {
     let path = marker.to_string_lossy().into_owned();
     shelbi_ssh::run(host, ["rm", "-f", path.as_str()]).map_err(Error::Io)?;
@@ -1928,7 +1947,7 @@ pub fn verify_worktree_ready_for_handoff(
 /// Push a one-line `directive` message onto the assigned worker's durable
 /// message log (`<worktree>/.shelbi/messages/<task-id>.log`) — the same
 /// restart-safe, file-based channel `shelbi message` writes and the worker's
-/// SessionStart `tail` injects into its context. Used by the poller to tell a
+/// Stop hook injects into its context. Used by the poller to tell a
 /// worker *why* its ready handoff was refused (uncommitted changes / empty
 /// branch) so the fix is actionable in the pane, not only on `events.log`.
 ///
@@ -2006,23 +2025,55 @@ fn append_message_log_line(
         .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
-/// Every tmux window id currently bound to a local slot's name. Local
-/// workspaces are windows inside the shared project session, so a slot can
-/// (under a raced relaunch — e.g. the crash supervisor and a `shelbi task
-/// resume` both re-running `new-window` before the prior window is torn down)
-/// accrete more than one window sharing its name. Teardown has to reap all of
-/// them, so it enumerates ids here rather than trusting a single name match.
-/// Does the workspace have a live agent session right now? Enumerates the live
-/// slots under the workspace's session and matches its role name.
-pub fn workspace_pane_alive(host: &Host, target: &SessionTarget) -> Result<bool> {
-    let want = target.slot_role().unwrap_or("");
-    match backend()
-        .enumerate_slots(host, &SessionTarget::session(target.session_name()), None)
-        .map_err(Error::Io)?
-    {
-        Some(slots) => Ok(slots.iter().any(|w| w.name == want)),
-        None => Ok(false),
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the probe in a test, which has no relay to lose.
+    static TEST_PANE_LIVENESS: std::cell::RefCell<Option<Liveness>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_pane_liveness(liveness: Option<Liveness>) {
+    TEST_PANE_LIVENESS.with(|c| *c.borrow_mut() = liveness);
+}
+
+/// Classify an [`enumerate_slots`](SessionBackend::enumerate_slots) answer for
+/// the slot named `want`. `Ok(None)` and `Err` both mean the machine could not
+/// be asked, which is not the same as it having no such session.
+fn slot_liveness(
+    slots: std::io::Result<Option<Vec<crate::session_backend::SlotInfo>>>,
+    want: &str,
+) -> Liveness {
+    match slots {
+        Ok(Some(slots)) if slots.iter().any(|w| w.name == want) => Liveness::Alive,
+        Ok(Some(_)) => Liveness::Dead,
+        Ok(None) => Liveness::Unreachable {
+            reason: format!("could not reach the machine to check session `{want}`"),
+        },
+        Err(e) => Liveness::Unreachable {
+            reason: format!("checking session `{want}`: {e}"),
+        },
     }
+}
+
+/// Probe the workspace's agent session: enumerate the live slots under its
+/// session and match its role name.
+pub fn workspace_pane_liveness(host: &Host, target: &SessionTarget) -> Liveness {
+    #[cfg(test)]
+    if let Some(liveness) = TEST_PANE_LIVENESS.with(|c| c.borrow().clone()) {
+        return liveness;
+    }
+    slot_liveness(
+        backend().enumerate_slots(host, &SessionTarget::session(target.session_name()), None),
+        target.slot_role().unwrap_or(""),
+    )
+}
+
+/// Does the workspace have a live agent session right now? `Err` when the
+/// machine could not be asked, so a caller's own policy for uncertainty applies
+/// rather than an unreachable machine reading as a dead session.
+pub fn workspace_pane_alive(host: &Host, target: &SessionTarget) -> Result<bool> {
+    workspace_pane_liveness(host, target).into_exists()
 }
 
 /// Does this workspace slot have a live allocation right now? Probes the
@@ -2264,8 +2315,8 @@ const REVIEW_SERVER_TERM_GRACE: std::time::Duration = std::time::Duration::from_
 /// which is why this is safe on every `kill_workspace_pane` (dev slots and
 /// remote review slots simply have no record). Best-effort throughout: a read
 /// error degrades to the pre-fix behavior rather than blocking teardown.
-pub(crate) fn stop_review_server(workspace: &str) {
-    let pgid = match shelbi_state::read_review_serve_pgid(workspace) {
+pub(crate) fn stop_review_server(project: &str, workspace: &str) {
+    let pgid = match shelbi_state::read_review_serve_pgid(project, workspace) {
         Ok(Some(p)) => p,
         Ok(None) => return,
         Err(e) => {
@@ -2276,7 +2327,7 @@ pub(crate) fn stop_review_server(workspace: &str) {
     if terminate_process_group(pgid) {
         tracing::info!(workspace, pgid, "reaped review dev server process group");
     }
-    let _ = shelbi_state::clear_review_serve_pgid(workspace);
+    let _ = shelbi_state::clear_review_serve_pgid(project, workspace);
 }
 
 /// May we `kill(-pgid, …)` `pgid` from a process whose own group is `own_pgid`?
@@ -2355,11 +2406,18 @@ fn terminate_process_group(_pgid: i32) -> bool {
 /// covers them all. A no-op when nothing was tracked: dev slots and remote
 /// review slots never record a pgid.
 ///
-/// Marks an "expected teardown" for `workspace_name` before killing so a
-/// shelbi-initiated shutdown isn't mistaken for a crash by the agent session's
-/// lifecycle event.
-pub fn kill_workspace_pane(host: &Host, target: &SessionTarget, workspace_name: &str) -> Result<()> {
-    stop_review_server(workspace_name);
+/// `reason` is recorded on the session before the kill, so the supervisor reads
+/// this death as deliberate instead of restarting the slot as a crash. It is
+/// recorded on a slot that is already dead too: stopping a pane that crashed a
+/// moment ago, or handing off from one, must still stand the supervisor down.
+pub fn kill_workspace_pane(
+    project: &str,
+    host: &Host,
+    target: &SessionTarget,
+    workspace_name: &str,
+    reason: KillReason,
+) -> Result<()> {
+    stop_review_server(project, workspace_name);
     // Kill the slot itself on every host. A remote workspace's slot target
     // (`shelbi-w-<name>`, `agent`) maps to the remote session `w-<name>/ws/agent`;
     // re-addressing it as the bare *session* `shelbi-w-<name>` (the tmux-era
@@ -2368,11 +2426,16 @@ pub fn kill_workspace_pane(host: &Host, target: &SessionTarget, workspace_name: 
     // "already gone", and the real agent kept running while the orphan reaper
     // logged a reap every pass. A transport-answered "already gone" still
     // short-circuits here.
-    if !workspace_slot_alive(host, target)? {
+    let alive = workspace_slot_alive(host, target)?;
+    let session = crate::session_process_backend::session_name(target);
+    backend().record_kill_reason(host, &session, reason);
+    if !alive {
         return Ok(());
     }
-    let _ = shelbi_state::mark_expected_teardown(workspace_name);
-    backend().kill(host, target)?;
+    if let Err(e) = backend().kill(host, target) {
+        backend().clear_kill_reason(host, &session);
+        return Err(e);
+    }
     if host.is_ssh() {
         // A remote kill rides the relay and tolerates "no live session" as
         // success, so a kill that reached nothing would look identical to one
@@ -2622,6 +2685,16 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
     let _ = clear_transition_marker(
         &host,
         &legacy_workspace_transition_marker(&machine, spec.workspace),
+    );
+    let _ = clear_deferred_marker(
+        &host,
+        &workspace_transition_deferred_marker(&machine, spec.workspace),
+    );
+    // And the review-serving marker: a task loading onto a review slot starts
+    // out not serving, whatever the slot's last task got up to.
+    let _ = clear_review_loaded_marker(
+        &host,
+        &workspace_review_loaded_marker(&machine, spec.workspace),
     );
 
     // 1. Make sure the worktree exists + is on the right branch, clean.
@@ -2876,6 +2949,10 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
         &host,
         &legacy_workspace_transition_marker(&machine, spec.workspace),
     );
+    let _ = clear_deferred_marker(
+        &host,
+        &workspace_transition_deferred_marker(&machine, spec.workspace),
+    );
 
     // Preserve the worktree: don't reset the branch, don't bail on a dirty
     // tree. Only recreate the worktree if it's gone entirely. A failure here
@@ -3051,7 +3128,6 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         }
     }
     deploy_runner_hooks(a.host, a.worktree)?;
-    disclose_message_tail_sweep(&a, sweep_message_tails(a.host, a.worktree, Some(a.task_id)));
 
     // Decide + record the hub→workspace message channel for THIS launch. The
     // mode is derived from the runner's verified hook health (see
@@ -3070,6 +3146,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         "message-channel",
         &format!("mode={} runner={}", channel.as_str(), runner_name),
     );
+    reset_message_session_beacon(a.host, a.worktree, a.task_id, channel);
 
     // 2b. Compose the dispatched agent's `instructions.md` (+ preamble) and
     //     mount its skills into the worktree's `.claude/` footprint. The skills
@@ -3111,7 +3188,13 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
 
     // 3. Reset the agent session — that's how we clear context. If it doesn't
     //    exist yet, this is a no-op; otherwise the next step recreates it.
-    kill_workspace_pane(a.host, a.addr, &a.workspace.name)?;
+    kill_workspace_pane(
+        &a.project.name,
+        a.host,
+        a.addr,
+        &a.workspace.name,
+        KillReason::Redispatch,
+    )?;
 
     // 4 + 5. Spawn the agent session and launch the agent.
     //
@@ -3159,7 +3242,8 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
             })?;
         }
         Host::Ssh { .. } => {
-            let cd_launch = remote_cd_launch(a.host, a.worktree, &launch, a.port);
+            let pin = a.project.machine(&a.workspace.machine).and_then(|m| m.forward);
+            let cd_launch = remote_cd_launch(a.host, pin, a.worktree, &launch, a.port);
             let bin = crate::remote_session::resolve_remote_bin(&a.workspace.machine).map_err(
                 |e| Error::Other(format!("remote dispatch for workspace `{}`: {e}", a.workspace.name)),
             )?;
@@ -3653,32 +3737,33 @@ fn classify_limit_resume_screen(
     }
 }
 
-/// Best effort: a failed sweep never blocks the dispatch, since the leftover
-/// tails only cost a process each. Silent when there was nothing to sweep.
-fn disclose_message_tail_sweep(a: &SpawnArgs<'_>, swept: Result<Vec<SweptTail>>) {
-    let swept = match swept {
-        Ok(swept) => swept,
-        Err(e) => {
-            tracing::warn!(workspace = %a.workspace.name, error = %e, "sweeping message tails failed");
-            return;
+/// Start this launch's `<task>.session` beacon from a known state: what
+/// `shelbi message` reads to decide whether anything will take a message.
+/// A hooks runner gets no beacon until its SessionStart hook writes one, so the
+/// previous session's can't vouch for this launch. A polling runner has no hook
+/// to write one, so dispatch records that it polls, and the CLI goes by whether
+/// its pane is alive.
+///
+/// Best effort, like the channel event above: on failure a message may be
+/// reported undeliverable, which the sender sees, and the launch is unaffected.
+fn reset_message_session_beacon(
+    host: &Host,
+    worktree: &Path,
+    task_id: &str,
+    channel: shelbi_agent::MessageChannel,
+) {
+    let write = match channel {
+        shelbi_agent::MessageChannel::Hooks => r#"rm -f "$1/$2.session""#,
+        shelbi_agent::MessageChannel::Polling => {
+            r#"mkdir -p "$1" && echo polling > "$1/$2.session.tmp" && mv "$1/$2.session.tmp" "$1/$2.session""#
         }
     };
-    if swept.is_empty() {
-        return;
+    let messages_dir = worktree.join(".shelbi").join("messages");
+    let messages_dir = messages_dir.to_string_lossy();
+    let done = shelbi_ssh::run(host, ["sh", "-c", write, "sh", &messages_dir, task_id]);
+    if !done.is_ok_and(|out| out.status.success()) {
+        tracing::warn!(task = task_id, "resetting the message session beacon failed");
     }
-    let count = |want: fn(&SweptTail) -> bool| swept.iter().filter(|s| want(s)).count();
-    append_dispatch_status(
-        &a.project.name,
-        a.task_id,
-        &a.workspace.name,
-        "message-tails-swept",
-        &format!(
-            "stopped={} stale={} foreign={}",
-            count(|s| matches!(s, SweptTail::Stopped { .. })),
-            count(|s| matches!(s, SweptTail::Stale { .. })),
-            count(|s| matches!(s, SweptTail::Foreign { .. })),
-        ),
-    );
 }
 
 fn append_dispatch_status(project: &str, task_id: &str, workspace: &str, status: &str, detail: &str) {
@@ -3867,7 +3952,7 @@ fn format_version((maj, min, pat): (u32, u32, u32)) -> String {
 /// dispatched agent's per-role `agents/<role>/settings.json` over the
 /// project-wide `workspace-settings.json.template` when one is present.
 ///
-/// Per-role precedence matters because the Phase 7 message-tail hooks
+/// Per-role precedence matters because the Phase 7 message hooks
 /// live in the role's settings file — a user editing
 /// `agents/developer/settings.json` to add a project-specific hook
 /// should see that change on the next dispatch, not silently lose it to
@@ -3953,7 +4038,7 @@ pub fn anchor_shelbi_hook_paths(settings: &str) -> String {
 /// Code runs each hook command through `/bin/sh`, so the unquoted value
 /// `$CLAUDE_PROJECT_DIR/.shelbi/hooks/x.sh` splits on the space in a path like
 /// `/Users/j/To Do/…` — the hook then fires `No such file or directory` and the
-/// pane-state title / message-tail signal is lost.
+/// pane-state title / message signal is lost.
 ///
 /// Rewrites the JSON value `"$CLAUDE_PROJECT_DIR/.shelbi/hooks/x.sh"` to
 /// `"\"$CLAUDE_PROJECT_DIR/.shelbi/hooks/x.sh\""` — the shell double-quotes are
@@ -4014,7 +4099,7 @@ pub fn quote_shelbi_hook_commands(settings: &str) -> String {
 }
 
 /// Relative path (from the worktree root) of Claude Code's local settings
-/// scope, where Shelbi wires its window-title + message-tail hooks. This is
+/// scope, where Shelbi wires its window-title + message hooks. This is
 /// gitignored and merges *additively* with a committed `.claude/settings.json`,
 /// so the user's hooks and Shelbi's both run.
 pub const WORKTREE_SETTINGS_LOCAL_REL: &str = ".claude/settings.local.json";
@@ -4529,78 +4614,69 @@ const WORKTREE_OWNED_SKILLS_REL: &str = ".shelbi/mounted-claude-skills";
 /// `info/exclude`, so a human inspecting the file sees who put the lines there.
 const SHELBI_EXCLUDE_HEADER: &str = "# shelbi-mounted, never-committed agent context (skills/hooks)";
 
-// SessionStart hook: start the `tail -f` that streams the task's message log
-// into `<task>.unread.log` for the Stop hook to drain, plus a watchdog that
-// stops the tail once the agent session that started it is gone. Without the
-// watchdog every dispatch leaked a tail for the life of the machine (the log
-// never goes away, so `tail -f` never exits on its own); the dispatch-time
-// [`sweep_message_tails`] clears any that predate it.
-const MESSAGE_TAIL_START_SH: &str = r#"#!/bin/sh
+// SessionStart hook: make the task's message channel readable by this session.
+// It starts nothing in the background; it only leaves two small files behind.
+//
+// `<task>.cursor` holds the 1-indexed number of the next unread line of
+// `<task>.log`, the same format the polling contract uses
+// ([`message_polling_section`]), so a task that changes runner keeps its place.
+// It is seeded at the log's end only when missing. A cursor that already exists
+// is left alone so a session that resumes, clears or compacts still gets what
+// the last one didn't drain, and never replays what it did.
+//
+// `<task>.session` is the beacon `shelbi message` checks before it accepts a
+// message: the agent session's pid and start time. The start time means a reused
+// pid can't pass for a live session, and a beacon left by a dead session needs no
+// cleanup. The session is the first non-shell ancestor (the hook runner may wrap
+// this script in `sh -c`). Without `ps` neither the ancestry nor the start time
+// can be read, so the beacon says `unverified`, and `shelbi message` takes the
+// session's word for it rather than refusing every message on that host.
+const MESSAGE_SESSION_START_SH: &str = r#"#!/bin/sh
 mkdir -p .shelbi/messages
 if [ -z "${TASK_ID:-}" ]; then
-  printf '%s no TASK_ID in env; message-tail not started (sidebar-click pane, or dispatch env leak)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .shelbi/messages/.no-task-id.log
+  printf '%s no TASK_ID in env; message channel not started (sidebar-click pane, or dispatch env leak)\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> .shelbi/messages/.no-task-id.log
   echo 'shelbi: SessionStart hook: TASK_ID unset; message channel disabled for this session' >&2
   exit 0
 fi
-LOCKDIR=.shelbi/messages/$TASK_ID.tail.d
 LOG=.shelbi/messages/$TASK_ID.log
-# A pid file can outlive its tail and the OS may have reused the pid, so only
-# ever signal a pid whose command line is still this task's tail (either form:
-# `-n 0` is what hooks started before the relay pinned its start offset).
-is_task_tail() {
-  case "$1" in ''|*[!0-9]*|0|1) return 1 ;; esac
-  case "$(ps -ww -o command= -p "$1" 2>/dev/null)" in
-    "tail -f -c +"[0-9]*" $LOG"|*/"tail -f -c +"[0-9]*" $LOG") return 0 ;;
-    "tail -f -n 0 $LOG"|*/"tail -f -n 0 $LOG") return 0 ;;
-  esac
-  return 1
-}
-if [ -f "$LOCKDIR/pid" ]; then
-  OLD_PID=$(cat "$LOCKDIR/pid" 2>/dev/null)
-  if is_task_tail "$OLD_PID"; then kill "$OLD_PID" 2>/dev/null || true; fi
-  rm -rf "$LOCKDIR"
-fi
-mkdir -p "$LOCKDIR"
+CURSOR=.shelbi/messages/$TASK_ID.cursor
+BEACON=.shelbi/messages/$TASK_ID.session
 touch "$LOG"
-# Relay from the log's end as of now, not wherever it is once `tail` gets
-# around to opening the file: on a loaded machine that can be after this hook
-# returns, and a message appended in between would never be relayed.
-START=$(($(wc -c < "$LOG") + 1))
-tail -f -c +$START "$LOG" > .shelbi/messages/$TASK_ID.unread.log 2>/dev/null </dev/null &
-TAIL_PID=$!
-echo "$TAIL_PID" > "$LOCKDIR/pid"
-# Watchdog: the tail must not outlive the agent session that started it.
-# The session is the first non-shell ancestor (the hook runner may wrap this
-# script in `sh -c`). Every 2s it checks that the session and the tail are alive
-# and the lock still names this tail (a newer session for the task, or
-# Shelbi's dispatch sweep, takes over by replacing or removing it). On exit it
-# stops the tail and removes the lock it still owns. Without `ps` neither the
-# ancestry nor the tail can be verified, so no watchdog runs.
-command -v ps >/dev/null 2>&1 || exit 0
-SESSION_PID=$PPID
-while :; do
-  case "$(ps -o comm= -p "$SESSION_PID" 2>/dev/null)" in
-    sh|bash|dash|zsh|ksh|*/sh|*/bash|*/dash|*/zsh|*/ksh|-*) ;;
-    *) break ;;
-  esac
-  UP=$(ps -o ppid= -p "$SESSION_PID" 2>/dev/null | tr -d ' ')
-  case "$UP" in ''|*[!0-9]*|0|1) break ;; esac
-  SESSION_PID=$UP
-done
-owns_lock() { read -r CUR 2>/dev/null < "$LOCKDIR/pid" && [ "$CUR" = "$TAIL_PID" ]; }
-(
-  trap '' HUP
-  while kill -0 "$SESSION_PID" 2>/dev/null && kill -0 "$TAIL_PID" 2>/dev/null && owns_lock; do
-    sleep 2
+case "$(cat "$CURSOR" 2>/dev/null)" in
+  ''|*[!0-9]*|0)
+    echo $(($(wc -l < "$LOG") + 1)) > "$CURSOR.tmp" && mv "$CURSOR.tmp" "$CURSOR" ;;
+esac
+SESSION=unverified
+if command -v ps >/dev/null 2>&1; then
+  SESSION_PID=$PPID
+  while :; do
+    case "$(ps -o comm= -p "$SESSION_PID" 2>/dev/null)" in
+      sh|bash|dash|zsh|ksh|*/sh|*/bash|*/dash|*/zsh|*/ksh|-*) ;;
+      *) break ;;
+    esac
+    UP=$(ps -o ppid= -p "$SESSION_PID" 2>/dev/null | tr -d ' ')
+    case "$UP" in ''|*[!0-9]*|0|1) break ;; esac
+    SESSION_PID=$UP
   done
-  if is_task_tail "$TAIL_PID"; then kill "$TAIL_PID" 2>/dev/null; fi
-  if owns_lock; then rm -rf "$LOCKDIR"; fi
-) </dev/null >/dev/null 2>&1 &
+  # Fixed locale and zone: `shelbi message` reads this back from another shell,
+  # possibly over SSH. Unquoted to fold the padding `ps` puts in the date.
+  STARTED=$(echo $(LC_ALL=C TZ=UTC ps -o lstart= -p "$SESSION_PID" 2>/dev/null))
+  [ -n "$STARTED" ] && SESSION="$SESSION_PID $STARTED"
+fi
+echo "$SESSION" > "$BEACON.tmp" && mv "$BEACON.tmp" "$BEACON"
 "#;
 
-// Stop hook: drain any messages the SessionStart `tail -f` streamed into
-// `<task>.unread.log`, inject them into the agent's context, and ack each one
-// back to the hub so `shelbi message` can report real delivery.
+// Stop hook: inject every message past the task's read cursor into the agent's
+// context, ack each one back to the hub so `shelbi message` can report real
+// delivery, then advance the cursor.
+//
+// The cursor moves last and atomically, so a hook killed part way delivers the
+// batch again next time rather than losing it: at-least-once, never silently
+// dropped. Only complete lines are read (`wc -l` counts newlines, and `head`
+// stops at that count), so a line still being written waits for the next drain.
+// A cursor past the end means the log was replaced, so it starts over. A missing
+// cursor is seeded at the end, not the start: `shelbi message` won't append
+// until SessionStart has written one, so all that can be there is history.
 //
 // Ack robustness (the "0 acks for 12" bug): the ack extraction must NOT depend
 // on `jq`. `jq` is absent on stock macOS and minimal Linux images, and the old
@@ -4612,13 +4688,20 @@ owns_lock() { read -r CUR 2>/dev/null < "$LOCKDIR/pid" && [ "$CUR" = "$TAIL_PID"
 // address is a hard precondition now.
 const MESSAGE_DRAIN_STOP_SH: &str = r#"#!/bin/sh
 [ -n "${TASK_ID:-}" ] || exit 0
-UNREAD=.shelbi/messages/$TASK_ID.unread.log
-PROC=$UNREAD.processing
-[ -s "$UNREAD" ] || exit 0
-mv "$UNREAD" "$PROC"
-touch "$UNREAD"
+LOG=.shelbi/messages/$TASK_ID.log
+CURSOR=.shelbi/messages/$TASK_ID.cursor
+[ -f "$LOG" ] || exit 0
+TOTAL=$(($(wc -l < "$LOG")))
+set_cursor() { echo "$1" > "$CURSOR.tmp" && mv "$CURSOR.tmp" "$CURSOR"; }
+NEXT=$(cat "$CURSOR" 2>/dev/null)
+case "$NEXT" in
+  ''|*[!0-9]*|0) set_cursor $((TOTAL + 1)); exit 0 ;;
+esac
+[ "$NEXT" -le $((TOTAL + 1)) ] || NEXT=1
+[ "$NEXT" -le "$TOTAL" ] || exit 0
+BATCH=$(tail -n +"$NEXT" "$LOG" | head -n $((TOTAL - NEXT + 1)))
 echo "<system-reminder>New orchestrator messages:"
-cat "$PROC"
+printf '%s\n' "$BATCH"
 echo "</system-reminder>"
 HUB_ADDR="${SHELBI_HUB_ADDR:-${SHELBI_HUB_SOCK:+unix:$SHELBI_HUB_SOCK}}"
 # The ack peer must half-close its write side after sending so the hub reader
@@ -4661,13 +4744,13 @@ except Exception:
   fi
 }
 if [ -n "$HUB_ADDR" ]; then
-  sed -n 's/.*"msg_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$PROC" | while IFS= read -r MSG_ID; do
+  printf '%s\n' "$BATCH" | sed -n 's/.*"msg_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | while IFS= read -r MSG_ID; do
     [ -n "$MSG_ID" ] || continue
     ACK=$(printf '{"verb":"message-ack","project":"%s","task_id":"%s","msg_id":"%s"}\n' "$PROJECT" "$TASK_ID" "$MSG_ID")
     shelbi_ack_send "$ACK"
   done
 fi
-rm "$PROC"
+set_cursor $((TOTAL + 1))
 "#;
 
 // Stop hook: mark the pane idle (awaiting input) at the end of a turn, unless
@@ -4715,7 +4798,7 @@ pub(crate) struct RunnerHookFile {
 pub(crate) const RUNNER_HOOK_FILES: &[RunnerHookFile] = &[
     RunnerHookFile {
         rel_path: ".shelbi/hooks/session-start.sh",
-        body: MESSAGE_TAIL_START_SH,
+        body: MESSAGE_SESSION_START_SH,
         executable: true,
     },
     RunnerHookFile {
@@ -4800,106 +4883,6 @@ fn deploy_runner_hook_file(host: &Host, worktree: &Path, file: &RunnerHookFile) 
             Ok(())
         }
     }
-}
-
-/// Stops leftover message tails in one worktree. Arguments: `$1` the
-/// worktree, `$2` the task whose lock to leave alone (empty sweeps them all).
-/// One line per lock visited: `<verdict> <pid|-> <task-id>`. A pid is
-/// signalled only while its command line is that task's `tail -f` (current
-/// `-c +<offset>` form or the older hooks' `-n 0`), the same check the
-/// SessionStart hook makes, so a recycled pid is never hit.
-const MESSAGE_TAIL_SWEEP_SH: &str = r#"MSGS=$1/.shelbi/messages
-KEEP=$2
-for LOCK in "$MSGS"/*.tail.d; do
-  [ -d "$LOCK" ] || continue
-  ID=${LOCK##*/}
-  ID=${ID%.tail.d}
-  [ "$ID" = "$KEEP" ] && continue
-  PID=$(cat "$LOCK/pid" 2>/dev/null)
-  VERDICT=stale
-  case "$PID" in
-    ''|*[!0-9]*|0|1) PID=- ;;
-    *)
-      if kill -0 "$PID" 2>/dev/null; then
-        case "$(ps -ww -o command= -p "$PID" 2>/dev/null)" in
-          "tail -f -c +"[0-9]*" .shelbi/messages/$ID.log"|*/"tail -f -c +"[0-9]*" .shelbi/messages/$ID.log"|\
-          "tail -f -n 0 .shelbi/messages/$ID.log"|*/"tail -f -n 0 .shelbi/messages/$ID.log")
-            kill "$PID" 2>/dev/null && VERDICT=stopped ;;
-          *) VERDICT=foreign ;;
-        esac
-      fi ;;
-  esac
-  rm -rf "$LOCK"
-  printf '%s %s %s\n' "$VERDICT" "$PID" "$ID"
-done
-"#;
-
-/// What [`sweep_message_tails`] did with one `<task>.tail.d` lock. Every
-/// visited lock is removed; only `Stopped` signalled anything.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SweptTail {
-    /// The pid was that task's live `tail -f`, and got SIGTERM.
-    Stopped { task_id: String, pid: u32 },
-    /// The pid file was missing, unparseable, or named a dead process.
-    Stale { task_id: String },
-    /// The pid is alive but is no longer that task's tail (the OS reused it),
-    /// so it was left alone.
-    Foreign { task_id: String, pid: u32 },
-}
-
-/// Stop every message `tail -f` the SessionStart hook left in `worktree`,
-/// except `keep`'s, and remove their `.tail.d` locks.
-///
-/// The hook's watchdog stops a tail once its session is gone, but tails
-/// started by an older hook have no watchdog and run until the machine
-/// reboots. Dispatch runs this before launching the next task, so those
-/// leaks clear the first time each worktree is used again, and so does any
-/// tail a watchdog missed (a host without `ps`).
-pub fn sweep_message_tails(
-    host: &Host,
-    worktree: &Path,
-    keep: Option<&str>,
-) -> Result<Vec<SweptTail>> {
-    let worktree = worktree.to_string_lossy();
-    let out = shelbi_ssh::run(
-        host,
-        [
-            "sh",
-            "-c",
-            MESSAGE_TAIL_SWEEP_SH,
-            "sh",
-            &worktree,
-            keep.unwrap_or(""),
-        ],
-    )
-    .map_err(Error::Io)?;
-    if !out.status.success() {
-        return Err(Error::Command {
-            cmd: format!("sweep message tails in {worktree}"),
-            status: out.status.to_string(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        });
-    }
-    let swept = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let mut parts = line.splitn(3, ' ');
-            let (verdict, pid, task_id) = (parts.next()?, parts.next()?, parts.next()?);
-            let task_id = task_id.to_string();
-            Some(match verdict {
-                "stopped" => SweptTail::Stopped {
-                    task_id,
-                    pid: pid.parse().ok()?,
-                },
-                "foreign" => SweptTail::Foreign {
-                    task_id,
-                    pid: pid.parse().ok()?,
-                },
-                _ => SweptTail::Stale { task_id },
-            })
-        })
-        .collect();
-    Ok(swept)
 }
 
 #[cfg(unix)]
@@ -5688,8 +5671,16 @@ impl LocalDispatchArgs<'_> {
 /// *also* set the legacy `SHELBI_HUB_SOCK` so the plain `nc -U "$SHELBI_HUB_SOCK"`
 /// path keeps working unchanged. A TCP-fallback host (Tailscale SSH) gets only
 /// `SHELBI_HUB_ADDR`, since there is no usable Unix landing socket there.
-fn remote_cd_launch(host: &Host, worktree: &Path, launch: &str, port: Option<u16>) -> String {
-    let hub_env = remote_hub_env_prefix(host);
+/// `forward_pin` is the machine's `forward:` setting, which beats any persisted
+/// decision.
+fn remote_cd_launch(
+    host: &Host,
+    forward_pin: Option<shelbi_core::ForwardMode>,
+    worktree: &Path,
+    launch: &str,
+    port: Option<u16>,
+) -> String {
+    let hub_env = remote_hub_env_prefix(host, forward_pin);
     // Review workspaces (Some port) pin a deterministic dev-server PORT so the
     // review agent binds a slot that won't collide with a concurrent review
     // workspace. Dev workspaces pass `None` and get none.
@@ -5710,12 +5701,15 @@ fn remote_cd_launch(host: &Host, worktree: &Path, launch: &str, port: Option<u16
 /// space included) a remote pane needs to reach the hub daemon, resolving the
 /// per-host forward decision. Shared by [`remote_cd_launch`] and the
 /// `shelbi spawn` path so the two can't drift.
-pub fn remote_hub_env_prefix(host: &Host) -> String {
+pub fn remote_hub_env_prefix(
+    host: &Host,
+    forward_pin: Option<shelbi_core::ForwardMode>,
+) -> String {
     let hostname = match host {
         Host::Local => return String::new(),
         Host::Ssh { host } => host.as_str(),
     };
-    match shelbi_state::remote_hub_endpoint(hostname) {
+    match shelbi_state::remote_hub_endpoint(hostname, forward_pin) {
         endpoint @ shelbi_state::HubEndpoint::Unix(_) => {
             // Unix forward: set both the scheme-tagged addr and the legacy
             // SHELBI_HUB_SOCK path the existing worker snippets consume.
@@ -6265,7 +6259,7 @@ fn review_dispatch_extras(
     // wrapper (shelbi on PATH) and the hub-side pgid file resolve on the same
     // machine the server runs on.
     let pgid_file = matches!(host, Host::Local)
-        .then(|| shelbi_state::review_serve_pgid_path(&workspace.name).ok())
+        .then(|| shelbi_state::review_serve_pgid_path(&project.name, &workspace.name).ok())
         .flatten()
         .map(|p| p.to_string_lossy().into_owned());
     let section = review_recipe_section(project, task_id, port, pgid_file.is_some());
@@ -7327,12 +7321,6 @@ pub fn remove_workspace_worktree(
 
     let repo = machine.work_dir.to_string_lossy().into_owned();
     let wt_str = worktree.to_string_lossy().into_owned();
-
-    // Stop its message tails first: deleting the directory wouldn't end a
-    // `tail -f`, and no later dispatch would ever sweep them.
-    if let Err(e) = sweep_message_tails(&host, &worktree, None) {
-        tracing::warn!(workspace = %workspace.name, error = %e, "sweeping message tails failed");
-    }
 
     // Best-effort git deregistration — a `remove` that finds nothing
     // registered is a harmless non-zero exit — then force-delete the dir so no
@@ -9390,6 +9378,10 @@ statuses:
             base.join("shelbi-ready-deferred")
         );
         assert_eq!(
+            workspace_transition_deferred_marker(&p.machines[0], ws),
+            base.join("shelbi-transition-deferred")
+        );
+        assert_eq!(
             workspace_ready_refused_marker(&p.machines[0], ws),
             base.join("shelbi-ready-refused")
         );
@@ -10147,6 +10139,7 @@ statuses:
             &Host::Ssh {
                 host: "testhost".into(),
             },
+            None,
             Path::new("/work/myapp/.shelbi/wt/bob"),
             &remote_launch,
             None,
@@ -10277,19 +10270,12 @@ statuses:
         );
 
         let start_body = std::fs::read_to_string(&start).unwrap();
-        assert!(start_body.contains(".shelbi/messages/$TASK_ID.tail.d"));
-        assert!(
-            start_body.contains("is_task_tail"),
-            "pid kills must be verified"
-        );
-        assert!(
-            start_body.contains("SESSION_PID"),
-            "tail must be tied to its session"
-        );
+        assert!(start_body.contains(".shelbi/messages/$TASK_ID.cursor"));
+        assert!(start_body.contains(".shelbi/messages/$TASK_ID.session"));
         assert!(start_body.contains(".no-task-id.log"));
 
         let stop_body = std::fs::read_to_string(&stop).unwrap();
-        assert!(stop_body.contains("UNREAD=.shelbi/messages/$TASK_ID.unread.log"));
+        assert!(stop_body.contains("CURSOR=.shelbi/messages/$TASK_ID.cursor"));
         assert!(stop_body.contains("message-ack"));
         assert!(stop_body.contains("$SHELBI_HUB_SOCK"));
 
@@ -10313,7 +10299,7 @@ statuses:
     }
 
     #[test]
-    fn deployed_claude_session_start_hook_starts_tail_and_logs_missing_task_id() {
+    fn deployed_claude_session_start_hook_opens_channel_and_logs_missing_task_id() {
         let tmp = std::env::temp_dir().join(format!(
             "shelbi-runner-hooks-exec-test-{}-{}",
             std::process::id(),
@@ -10350,342 +10336,325 @@ statuses:
             .expect("run hook with task id");
         assert!(out.status.success(), "hook must succeed: {:?}", out.status);
 
-        let pid_path = worktree.join(".shelbi/messages/feat-x.tail.d/pid");
-        assert!(pid_path.is_file(), "tail pid file missing");
-        let pid = std::fs::read_to_string(&pid_path).unwrap();
-        let _ = std::process::Command::new("kill")
-            .arg("-TERM")
-            .arg(pid.trim())
-            .output();
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(".shelbi/messages/feat-x.cursor")).unwrap(),
+            "1\n",
+            "an empty log's next unread line is the first"
+        );
+        assert!(worktree.join(".shelbi/messages/feat-x.session").is_file());
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// `kill(pid, 0)`: is the pid alive? A zombie still answers, so tests reap
-    /// their own children before asking.
-    fn process_alive(pid: u32) -> bool {
-        unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    /// A fake worktree with deployed hooks, run the way the agent CLI runs them.
+    struct HookedWorktree {
+        tmp: PathBuf,
+        worktree: PathBuf,
     }
 
-    /// Poll `done` every 50ms for up to `secs`, returning its last answer.
-    fn wait_until(secs: u64, mut done: impl FnMut() -> bool) -> bool {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
-        while std::time::Instant::now() < deadline {
-            if done() {
-                return true;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
+    impl HookedWorktree {
+        fn new(tag: &str) -> Self {
+            let tmp = agent_test_tmpdir(tag);
+            let worktree = tmp.join("wt");
+            std::fs::create_dir_all(worktree.join(".shelbi/messages")).unwrap();
+            deploy_runner_hooks(&Host::Local, &worktree).unwrap();
+            Self { tmp, worktree }
         }
-        done()
+
+        fn msgs(&self, file: &str) -> PathBuf {
+            self.worktree.join(".shelbi/messages").join(file)
+        }
+
+        fn hook(&self, script: &str) -> std::process::Output {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .env("TASK_ID", "feat-x")
+                .env("PROJECT", "demoproj")
+                .env_remove("SHELBI_HUB_ADDR")
+                .env_remove("SHELBI_HUB_SOCK")
+                .current_dir(&self.worktree)
+                .output()
+                .expect("run hook");
+            assert!(out.status.success(), "{script} failed: {:?}", out.status);
+            out
+        }
+
+        fn session_start(&self) {
+            self.hook(".shelbi/hooks/session-start.sh");
+        }
+
+        /// One Stop hook run: what it injected into the agent's context.
+        fn drain(&self) -> String {
+            let out = self.hook(".shelbi/hooks/stop.sh");
+            String::from_utf8(out.stdout).unwrap()
+        }
+
+        /// Append as `shelbi message` does: one whole line in one write.
+        fn push(&self, msg_id: &str) {
+            let mut log = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(self.msgs("feat-x.log"))
+                .unwrap();
+            let line = format!("{{\"msg_id\":\"{msg_id}\",\"kind\":\"directive\",\"body\":\"b\"}}\n");
+            std::io::Write::write_all(&mut log, line.as_bytes()).unwrap();
+        }
     }
 
-    /// Spawn a long-lived child the test owns (and so can always reap).
-    fn spawn_quiet(worktree: &Path, argv: &[&str]) -> std::process::Child {
-        std::process::Command::new(argv[0])
-            .args(&argv[1..])
-            .current_dir(worktree)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .unwrap()
+    impl Drop for HookedWorktree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.tmp);
+        }
     }
 
-    /// Kill and reap a test-owned child, ignoring "already gone".
-    fn reap(child: &mut std::process::Child) {
-        let _ = child.kill();
-        let _ = child.wait();
+    /// Reads what the Stop hook acked from a real Unix hub socket, so a test can
+    /// check injection and ack per drain. Bounded on every blocking point.
+    fn collect_acks(listener: std::os::unix::net::UnixListener, want: usize) -> Vec<String> {
+        use std::io::Read;
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut received = Vec::new();
+        while received.len() < want && std::time::Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    conn.set_nonblocking(false).ok();
+                    conn.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+                    let mut buf = String::new();
+                    let _ = conn.read_to_string(&mut buf);
+                    received.push(buf);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("accept failed: {e}"),
+            }
+        }
+        received
     }
 
-    fn write_tail_lock(worktree: &Path, task_id: &str, pid: &str) {
-        let lock = worktree.join(format!(".shelbi/messages/{task_id}.tail.d"));
-        std::fs::create_dir_all(&lock).unwrap();
-        std::fs::write(lock.join("pid"), pid).unwrap();
-    }
-
-    /// The leak this hook's watchdog exists for: a worker session ends (here a
-    /// stand-in `perl` process that runs the hook the way the agent CLI does,
-    /// then is killed like a torn-down pane) and its `tail -f` must stop and its
-    /// `.tail.d` lock disappear within a few seconds, instead of running forever.
+    /// The bug this channel was rebuilt for: the tail relay delivered a
+    /// session's first drain and then wrote every later message into a deleted
+    /// file. Send A, drain, send B, drain: each lands, once, and each is acked.
     #[test]
-    fn session_start_hook_tail_stops_when_its_session_exits() {
-        let tmp = agent_test_tmpdir("tail-watchdog");
-        let worktree = tmp.join("wt");
-        std::fs::create_dir_all(&worktree).unwrap();
-        deploy_runner_hooks(&Host::Local, &worktree).unwrap();
+    fn stop_hook_delivers_and_acks_messages_sent_after_an_earlier_drain() {
+        use std::os::unix::net::UnixListener;
 
+        let wt = HookedWorktree::new("cursor-second-message");
+        wt.session_start();
+        // Unix socket paths are length-capped, so keep it out of the worktree.
+        let sock = std::env::temp_dir().join(format!("shelbi-cursor-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let drain_acked = |msg_id: &str| {
+            let listener = UnixListener::bind(&sock).unwrap();
+            let acks = std::thread::spawn(move || collect_acks(listener, 1));
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(".shelbi/hooks/stop.sh")
+                .env("TASK_ID", "feat-x")
+                .env("PROJECT", "demoproj")
+                .env("SHELBI_HUB_ADDR", format!("unix:{}", sock.display()))
+                .env_remove("SHELBI_HUB_SOCK")
+                .current_dir(&wt.worktree)
+                .output()
+                .expect("run stop hook");
+            assert!(out.status.success());
+            let acks = acks.join().unwrap();
+            std::fs::remove_file(&sock).unwrap();
+            assert_eq!(acks.len(), 1, "one ack for {msg_id}: {acks:?}");
+            assert!(acks[0].contains(&format!("\"msg_id\":\"{msg_id}\"")), "{acks:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+
+        wt.push("m-a");
+        let first = drain_acked("m-a");
+        assert!(first.contains("<system-reminder>New orchestrator messages:"), "{first}");
+        assert!(first.contains("m-a"), "{first}");
+
+        wt.push("m-b");
+        let second = drain_acked("m-b");
+        assert!(second.contains("m-b"), "the second message was lost: {second}");
+        assert!(!second.contains("m-a"), "the first message was replayed: {second}");
+
+        assert_eq!(wt.drain(), "", "nothing new, nothing injected");
+    }
+
+    /// A session that ends with a message unread hands it to the next session
+    /// for the task, and a restart never replays what was already drained. That
+    /// holds for a resume, a clear and a compact, which all rerun SessionStart.
+    #[test]
+    fn session_restart_keeps_the_cursor() {
+        let wt = HookedWorktree::new("cursor-restart");
+        wt.session_start();
+        wt.push("m-read");
+        assert!(wt.drain().contains("m-read"));
+        wt.push("m-unread");
+
+        wt.session_start();
+        let after = wt.drain();
+        assert!(after.contains("m-unread"), "undrained message lost: {after}");
+        assert!(!after.contains("m-read\""), "drained message replayed: {after}");
+    }
+
+    /// The first session on a log that already has history starts past it: those
+    /// lines went to an earlier reader, or to none.
+    #[test]
+    fn first_session_starts_past_existing_history() {
+        let wt = HookedWorktree::new("cursor-seed");
+        wt.push("m-old");
+        wt.session_start();
+        assert_eq!(wt.drain(), "");
+        wt.push("m-new");
+        let out = wt.drain();
+        assert!(out.contains("m-new") && !out.contains("m-old"), "{out}");
+    }
+
+    /// The hook advances past what it read, not past the end of the log at the
+    /// time: a line whose newline hasn't landed yet stays for the next drain, so
+    /// it's never injected torn or skipped.
+    #[test]
+    fn stop_hook_leaves_a_partial_line_for_the_next_drain() {
+        let wt = HookedWorktree::new("cursor-partial");
+        wt.session_start();
+        wt.push("m-whole");
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(wt.msgs("feat-x.log"))
+            .unwrap();
+        std::io::Write::write_all(&mut log, b"{\"msg_id\":\"m-torn\",").unwrap();
+
+        let first = wt.drain();
+        assert!(first.contains("m-whole") && !first.contains("m-torn"), "{first}");
+
+        std::io::Write::write_all(&mut log, b"\"body\":\"b\"}\n").unwrap();
+        let second = wt.drain();
+        assert!(second.contains("m-torn") && !second.contains("m-whole"), "{second}");
+    }
+
+    /// A cursor past the end means the log was replaced, so everything in it is
+    /// new. Without the reset the channel would stay silent until the new log
+    /// grew past the old position.
+    #[test]
+    fn stop_hook_rereads_a_log_that_was_replaced() {
+        let wt = HookedWorktree::new("cursor-replaced");
+        wt.session_start();
+        wt.push("m-1");
+        wt.push("m-2");
+        wt.push("m-3");
+        assert!(wt.drain().contains("m-3"));
+
+        std::fs::remove_file(wt.msgs("feat-x.log")).unwrap();
+        wt.push("m-fresh");
+        assert!(wt.drain().contains("m-fresh"));
+    }
+
+    /// A lost cursor can't bring back old directives: `shelbi message` only
+    /// appends once SessionStart has run, so a log with no cursor is history.
+    #[test]
+    fn stop_hook_without_a_cursor_seeds_past_history() {
+        let wt = HookedWorktree::new("cursor-missing");
+        wt.push("m-old");
+        assert_eq!(wt.drain(), "");
+        wt.push("m-new");
+        let out = wt.drain();
+        assert!(out.contains("m-new") && !out.contains("m-old"), "{out}");
+    }
+
+    /// The cursor uses the polling contract's format, so a task that switches
+    /// runner keeps its place in either direction: a line a polling runner has
+    /// read isn't injected again.
+    #[test]
+    fn stop_hook_shares_the_polling_runners_cursor() {
+        let wt = HookedWorktree::new("cursor-polling");
+        wt.push("m-polled");
+        std::fs::write(wt.msgs("feat-x.cursor"), "2\n").unwrap();
+        wt.session_start();
+        wt.push("m-next");
+        let out = wt.drain();
+        assert!(out.contains("m-next") && !out.contains("m-polled"), "{out}");
+    }
+
+    /// A hook killed before it advances the cursor delivers the batch again
+    /// instead of losing it: there's nothing to lose it in, since reading doesn't
+    /// move or delete anything.
+    #[test]
+    fn stop_hook_reads_without_consuming_until_it_advances() {
+        let wt = HookedWorktree::new("cursor-crash");
+        wt.session_start();
+        let before = std::fs::read_to_string(wt.msgs("feat-x.cursor")).unwrap();
+        wt.push("m-1");
+        assert!(wt.drain().contains("m-1"));
+        // Rewind to the state a kill before the advance leaves behind.
+        std::fs::write(wt.msgs("feat-x.cursor"), before).unwrap();
+        assert!(wt.drain().contains("m-1"));
+    }
+
+    /// The beacon names the session, the first non-shell ancestor, not the `sh`
+    /// wrapper or the hook. So it reads as live for as long as the session runs
+    /// after the hook has exited, and the hook leaves no background process.
+    #[test]
+    fn session_start_hook_beacon_names_the_session_and_starts_nothing() {
+        let wt = HookedWorktree::new("beacon-session");
         let mut session = std::process::Command::new("perl")
             .arg("-e")
             .arg(r#"system("sh", "-c", ".shelbi/hooks/session-start.sh"); sleep 60"#)
             .env("TASK_ID", "feat-x")
-            .current_dir(&worktree)
+            .current_dir(&wt.worktree)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn stand-in session");
 
-        let lock = worktree.join(".shelbi/messages/feat-x.tail.d");
-        let pid_path = lock.join("pid");
-        let read_pid =
-            || -> Option<u32> { std::fs::read_to_string(&pid_path).ok()?.trim().parse().ok() };
-        assert!(
-            wait_until(30, || read_pid().is_some()),
-            "hook never wrote the tail pid"
-        );
-        let tail_pid = read_pid().unwrap();
-        assert!(
-            process_alive(tail_pid),
-            "tail should run while its session is alive"
-        );
-
-        // The channel still works while the session lives. The hook pinned the
-        // relay's start offset before writing the pid, so this line is relayed
-        // even if `tail` hasn't opened the log yet.
-        let mut log = std::fs::OpenOptions::new()
-            .append(true)
-            .open(worktree.join(".shelbi/messages/feat-x.log"))
-            .unwrap();
-        std::io::Write::write_all(&mut log, b"{\"msg_id\":\"m-1\"}\n").unwrap();
-        let unread = worktree.join(".shelbi/messages/feat-x.unread.log");
-        assert!(
-            wait_until(30, || std::fs::read_to_string(&unread)
-                .unwrap_or_default()
-                .contains("m-1")),
-            "tail should stream new log lines into unread.log"
-        );
-        // Still running a beat later: the watchdog follows the session, not
-        // the hook process (which exited as soon as it started the tail).
-        std::thread::sleep(std::time::Duration::from_millis(2500));
-        assert!(
-            process_alive(tail_pid),
-            "watchdog must not stop a live session's tail"
-        );
-
-        reap(&mut session);
-        let stopped = wait_until(30, || !process_alive(tail_pid) && !lock.exists());
-        if !stopped && process_alive(tail_pid) {
-            unsafe { libc::kill(tail_pid as libc::pid_t, libc::SIGTERM) };
+        let beacon = wt.msgs("feat-x.session");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !beacon.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        let line = std::fs::read_to_string(&beacon).unwrap();
+        let (pid, started) = line.trim().split_once(' ').expect("pid and start time");
+        assert_eq!(pid, session.id().to_string(), "beacon: {line}");
+        assert!(!started.is_empty(), "beacon: {line}");
+
+        let body = std::fs::read_to_string(wt.worktree.join(".shelbi/hooks/session-start.sh"))
+            .unwrap();
+        assert!(!body.contains("tail -f"), "no background relay");
         assert!(
-            stopped,
-            "tail {tail_pid} and its lock must go once the session exits"
+            !body.lines().any(|l| l.trim_end().ends_with('&')),
+            "the hook must start nothing in the background"
         );
 
-        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = session.kill();
+        let _ = session.wait();
     }
 
-    /// The race behind the watchdog test's old flake: the hook returns (and
-    /// its pid file appears) before the backgrounded `tail` has opened the log.
-    /// A `tail` that takes a second to start stands in for a loaded machine. A
-    /// line appended in that gap must still be relayed, and a line already in
-    /// the log before the hook ran must not be.
+    /// Dispatch resets the beacon so an old session can't vouch for a new launch:
+    /// hooks runners start with none, and polling runners record that they poll.
     #[test]
-    fn session_start_hook_relays_lines_appended_before_tail_starts() {
-        let tmp = agent_test_tmpdir("tail-slow-start");
-        let worktree = tmp.join("wt");
-        std::fs::create_dir_all(&worktree).unwrap();
-        deploy_runner_hooks(&Host::Local, &worktree).unwrap();
-        let msgs = worktree.join(".shelbi/messages");
-        std::fs::create_dir_all(&msgs).unwrap();
-        std::fs::write(msgs.join("feat-x.log"), "{\"msg_id\":\"m-0\"}\n").unwrap();
+    fn dispatch_resets_the_session_beacon_for_the_channel() {
+        let wt = HookedWorktree::new("beacon-reset");
+        let beacon = wt.msgs("feat-x.session");
 
-        let path = std::env::var("PATH").unwrap_or_default();
-        let bin = tmp.join("slow-bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let slow_tail = bin.join("tail");
-        std::fs::write(
-            &slow_tail,
-            format!("#!/bin/sh\nsleep 1\nPATH='{path}' exec tail \"$@\"\n"),
-        )
-        .unwrap();
-        std::fs::set_permissions(
-            &slow_tail,
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
-
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(".shelbi/hooks/session-start.sh")
-            .env("TASK_ID", "feat-x")
-            .env("PATH", format!("{}:{path}", bin.display()))
-            .current_dir(&worktree)
-            .output()
-            .expect("run hook");
-        assert!(out.status.success(), "hook must succeed: {:?}", out.status);
-        let pid: u32 = std::fs::read_to_string(msgs.join("feat-x.tail.d/pid"))
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-
-        let mut log = std::fs::OpenOptions::new()
-            .append(true)
-            .open(msgs.join("feat-x.log"))
-            .unwrap();
-        std::io::Write::write_all(&mut log, b"{\"msg_id\":\"m-1\"}\n").unwrap();
-        let unread = || std::fs::read_to_string(msgs.join("feat-x.unread.log")).unwrap_or_default();
-        let relayed = wait_until(30, || unread().contains("m-1"));
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        assert!(relayed, "a line appended before tail started was dropped");
-        assert!(
-            !unread().contains("m-0"),
-            "lines already in the log must not be relayed: {:?}",
-            unread()
+        std::fs::write(&beacon, "123 stale\n").unwrap();
+        reset_message_session_beacon(
+            &Host::Local,
+            &wt.worktree,
+            "feat-x",
+            shelbi_agent::MessageChannel::Polling,
         );
+        assert_eq!(std::fs::read_to_string(&beacon).unwrap(), "polling\n");
 
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// A restarted session for the same task replaces the old lock, but only
-    /// signals the recorded pid while it is still that task's tail: here the
-    /// pid now belongs to an unrelated `sleep`, which must survive.
-    #[test]
-    fn session_start_hook_never_signals_a_recycled_pid() {
-        let tmp = agent_test_tmpdir("tail-hook-recycled");
-        let worktree = tmp.join("wt");
-        std::fs::create_dir_all(&worktree).unwrap();
-        deploy_runner_hooks(&Host::Local, &worktree).unwrap();
-
-        let mut bystander = spawn_quiet(&worktree, &["sleep", "30"]);
-        write_tail_lock(&worktree, "feat-x", &bystander.id().to_string());
-
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(".shelbi/hooks/session-start.sh")
-            .env("TASK_ID", "feat-x")
-            .current_dir(&worktree)
-            .output()
-            .expect("run hook");
-        assert!(out.status.success());
-
-        assert!(
-            bystander.try_wait().unwrap().is_none(),
-            "recycled pid was signalled"
+        reset_message_session_beacon(
+            &Host::Local,
+            &wt.worktree,
+            "feat-x",
+            shelbi_agent::MessageChannel::Hooks,
         );
-        let pid =
-            std::fs::read_to_string(worktree.join(".shelbi/messages/feat-x.tail.d/pid")).unwrap();
-        let pid: u32 = pid.trim().parse().unwrap();
-        assert_ne!(pid, bystander.id(), "the lock should name the new tail");
-
-        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
-        reap(&mut bystander);
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// The dispatch sweep stops earlier tasks' tails (the current hook's
-    /// `-c +<offset>` form and older hooks' `-n 0`) and clears their locks,
-    /// keeps the task being started, and never signals a pid whose command
-    /// line isn't that task's tail: a recycled pid (a `sleep`) and another
-    /// task's tail recorded under the wrong lock both survive.
-    #[test]
-    fn sweep_message_tails_stops_only_verified_leftover_tails() {
-        let tmp = agent_test_tmpdir("tail-sweep");
-        let worktree = tmp.join("wt");
-        let msgs = worktree.join(".shelbi/messages");
-        std::fs::create_dir_all(&msgs).unwrap();
-        for id in ["old-a", "old-b", "keep-me", "other"] {
-            std::fs::write(msgs.join(format!("{id}.log")), "").unwrap();
-        }
-        let tail = |id: &str| format!(".shelbi/messages/{id}.log");
-
-        let mut old_a = spawn_quiet(&worktree, &["tail", "-f", "-n", "0", &tail("old-a")]);
-        let mut old_b = spawn_quiet(&worktree, &["tail", "-f", "-c", "+1", &tail("old-b")]);
-        let mut keep = spawn_quiet(&worktree, &["tail", "-f", "-n", "0", &tail("keep-me")]);
-        let mut recycled = spawn_quiet(&worktree, &["sleep", "30"]);
-        let mut other_tail = spawn_quiet(&worktree, &["tail", "-f", "-n", "0", &tail("other")]);
-        let dead = {
-            let mut c = spawn_quiet(&worktree, &["sh", "-c", ":"]);
-            let pid = c.id();
-            let _ = c.wait();
-            pid
-        };
-
-        write_tail_lock(&worktree, "old-a", &old_a.id().to_string());
-        write_tail_lock(&worktree, "old-b", &format!("{}\n", old_b.id()));
-        write_tail_lock(&worktree, "keep-me", &keep.id().to_string());
-        write_tail_lock(&worktree, "recycled", &recycled.id().to_string());
-        write_tail_lock(&worktree, "misfiled", &other_tail.id().to_string());
-        write_tail_lock(&worktree, "dead", &dead.to_string());
-        std::fs::create_dir_all(msgs.join("no-pid.tail.d")).unwrap();
-
-        let mut swept = sweep_message_tails(&Host::Local, &worktree, Some("keep-me")).unwrap();
-        swept.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        let mut want = vec![
-            SweptTail::Stopped {
-                task_id: "old-a".into(),
-                pid: old_a.id(),
-            },
-            SweptTail::Stopped {
-                task_id: "old-b".into(),
-                pid: old_b.id(),
-            },
-            SweptTail::Foreign {
-                task_id: "recycled".into(),
-                pid: recycled.id(),
-            },
-            SweptTail::Foreign {
-                task_id: "misfiled".into(),
-                pid: other_tail.id(),
-            },
-            SweptTail::Stale {
-                task_id: "dead".into(),
-            },
-            SweptTail::Stale {
-                task_id: "no-pid".into(),
-            },
-        ];
-        want.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
-        assert_eq!(swept, want);
-
-        let exited =
-            |c: &mut std::process::Child| wait_until(5, || c.try_wait().unwrap().is_some());
-        assert!(exited(&mut old_a), "old-a's tail should be stopped");
-        assert!(exited(&mut old_b), "old-b's tail should be stopped");
-        assert!(
-            keep.try_wait().unwrap().is_none(),
-            "the starting task's tail is kept"
-        );
-        assert!(
-            recycled.try_wait().unwrap().is_none(),
-            "a recycled pid must never be signalled"
-        );
-        assert!(
-            other_tail.try_wait().unwrap().is_none(),
-            "another task's tail must not be signalled"
-        );
-
-        let mut locks: Vec<String> = std::fs::read_dir(&msgs)
-            .unwrap()
-            .filter_map(|e| e.ok()?.file_name().into_string().ok())
-            .filter(|n| n.ends_with(".tail.d"))
-            .collect();
-        locks.sort();
-        assert_eq!(locks, vec!["keep-me.tail.d".to_string()]);
-
-        // A worktree that never had a message channel has nothing to sweep.
-        let bare = tmp.join("bare");
-        std::fs::create_dir_all(&bare).unwrap();
-        assert_eq!(
-            sweep_message_tails(&Host::Local, &bare, None).unwrap(),
-            vec![]
-        );
-
-        for c in [
-            &mut old_a,
-            &mut old_b,
-            &mut keep,
-            &mut recycled,
-            &mut other_tail,
-        ] {
-            reap(c);
-        }
-        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(!beacon.exists());
     }
 
     /// End-to-end proof that the `Stop` hook actually delivers an ack — the
-    /// heart of the "0 acks for 12" bug. We seed `<task>.unread.log` with two
+    /// heart of the "0 acks for 12" bug. We seed `<task>.log` with two
     /// message lines (as `shelbi message` writes them), point the hook at a
     /// real Unix hub socket, run the deployed `stop.sh`, and assert that (a) it
     /// injects the drained bodies as a `<system-reminder>` on stdout and (b) a
@@ -10709,11 +10678,12 @@ statuses:
         std::fs::create_dir_all(&worktree).unwrap();
         deploy_runner_hooks(&Host::Local, &worktree).unwrap();
 
-        // Seed the tail's output file with two pushed messages.
+        // Seed the log with two pushed messages and a cursor before them.
         let msgs = worktree.join(".shelbi/messages");
         std::fs::create_dir_all(&msgs).unwrap();
+        std::fs::write(msgs.join("feat-x.cursor"), "1\n").unwrap();
         std::fs::write(
-            msgs.join("feat-x.unread.log"),
+            msgs.join("feat-x.log"),
             "{\"msg_id\":\"m-1\",\"ts\":\"2026-08-04T00:00:00Z\",\"kind\":\"directive\",\"body\":\"one\"}\n\
              {\"msg_id\":\"m-2\",\"ts\":\"2026-08-04T00:00:01Z\",\"kind\":\"context\",\"body\":\"two\"}\n",
         )
@@ -10803,12 +10773,15 @@ statuses:
             "both msg_ids must be acked: {received}"
         );
 
-        // The drained file is consumed and the unread log reset to empty.
+        // The cursor moved past both, and the log itself is untouched.
         assert_eq!(
-            std::fs::read_to_string(msgs.join("feat-x.unread.log")).unwrap(),
-            ""
+            std::fs::read_to_string(msgs.join("feat-x.cursor")).unwrap(),
+            "3\n"
         );
-        assert!(!msgs.join("feat-x.unread.log.processing").exists());
+        assert_eq!(
+            std::fs::read_to_string(msgs.join("feat-x.log")).unwrap().lines().count(),
+            2
+        );
 
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_dir_all(&tmp);
@@ -11123,6 +11096,7 @@ statuses:
             &Host::Ssh {
                 host: "testhost".into(),
             },
+            None,
             &wt,
             "claude --permission-mode auto",
             None,
@@ -11175,6 +11149,7 @@ statuses:
             &Host::Ssh {
                 host: "testhost".into(),
             },
+            None,
             &wt,
             "claude",
             None,
@@ -11198,11 +11173,17 @@ statuses:
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
+        // The pin below clears a record, which emits an event. Keep it off a
+        // worker pane's live hub.
+        std::env::remove_var("SHELBI_HUB_SOCK");
 
         // Default host (no persisted decision) → Unix: both vars present.
-        let unix = remote_hub_env_prefix(&Host::Ssh {
-            host: "plainbox".into(),
-        });
+        let unix = remote_hub_env_prefix(
+            &Host::Ssh {
+                host: "plainbox".into(),
+            },
+            None,
+        );
         assert!(
             unix.contains("SHELBI_HUB_ADDR=unix:"),
             "unix host must carry a unix: addr: {unix}"
@@ -11221,9 +11202,10 @@ statuses:
             }),
         )
         .unwrap();
-        let tcp = remote_hub_env_prefix(&Host::Ssh {
+        let tsbox = Host::Ssh {
             host: "tsbox".into(),
-        });
+        };
+        let tcp = remote_hub_env_prefix(&tsbox, None);
         assert!(
             tcp.contains("SHELBI_HUB_ADDR=tcp:127.0.0.1:47102"),
             "tcp host must carry the loopback addr: {tcp}"
@@ -11233,8 +11215,17 @@ statuses:
             "tcp host must NOT set a Unix socket var: {tcp}"
         );
 
+        // A later `forward: unix` pin beats the earlier TCP fallback.
+        let pinned = remote_hub_env_prefix(&tsbox, Some(shelbi_core::ForwardMode::Unix));
+        assert!(
+            pinned.contains("SHELBI_HUB_ADDR=unix:") && pinned.contains("SHELBI_HUB_SOCK="),
+            "a unix pin must give a unix endpoint despite the tcp record: {pinned}"
+        );
+        // ...and clears the record, so nothing else keeps reading it as TCP.
+        assert_eq!(shelbi_state::load_host_forward("tsbox"), None);
+
         // Local host has no reverse forward at all → empty prefix.
-        assert_eq!(remote_hub_env_prefix(&Host::Local), "");
+        assert_eq!(remote_hub_env_prefix(&Host::Local, None), "");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -11252,6 +11243,7 @@ statuses:
             &Host::Ssh {
                 host: "testhost".into(),
             },
+            None,
             &wt,
             "claude",
             Some(3010),
@@ -11279,7 +11271,7 @@ statuses:
     /// Phase 7: when the dispatch resolves to an agent that ships a
     /// per-role `agents/<role>/settings.json`, that file's content is
     /// preferred over the project-wide workspace-settings template.
-    /// This is what carries the SessionStart + Stop message-tail hooks
+    /// This is what carries the SessionStart + Stop message hooks
     /// onto the worktree's Claude Code session.
     #[test]
     fn render_workspace_settings_prefers_per_role_when_present() {
@@ -11954,7 +11946,7 @@ mod review_server_tests {
         // kept ONLY so the test can reap the (soon-dead) leader at the end;
         // `stop_review_server` never sees it — it works purely from this file,
         // which is what makes the restart case hold.
-        let path = shelbi_state::review_serve_pgid_path("rev").unwrap();
+        let path = shelbi_state::review_serve_pgid_path("demo", "rev").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{pgid}\n")).unwrap();
 
@@ -11962,7 +11954,7 @@ mod review_server_tests {
         assert!(pid_alive(gc_pid), "grandchild should be alive before teardown");
         assert!(pgroup_alive(pgid), "group should be alive before teardown");
 
-        stop_review_server("rev");
+        stop_review_server("demo", "rev");
 
         // Reap the (now-killed) leader first: it's the test's own child, so
         // until we wait() it, it lingers as a zombie and still answers
@@ -11979,13 +11971,43 @@ mod review_server_tests {
             "the grandchild (pid {gc_pid}) must be gone after teardown"
         );
         assert!(
-            shelbi_state::read_review_serve_pgid("rev")
+            shelbi_state::read_review_serve_pgid("demo", "rev")
                 .unwrap()
                 .is_none(),
             "the pgid record must be cleared after teardown"
         );
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Slots listed means the machine answered. Anything else is "couldn't
+    /// ask", which must stay apart from "no session" (the SSH backend answers
+    /// `Ok(None)` when its relay can't be reached).
+    #[test]
+    fn slot_liveness_keeps_unreachable_apart_from_dead() {
+        let slot = |name: &str| crate::session_backend::SlotInfo {
+            id: name.to_string(),
+            name: name.to_string(),
+        };
+        assert_eq!(slot_liveness(Ok(Some(vec![slot("rev")])), "rev"), Liveness::Alive);
+        assert_eq!(slot_liveness(Ok(Some(vec![slot("other")])), "rev"), Liveness::Dead);
+        assert_eq!(slot_liveness(Ok(Some(vec![])), "rev"), Liveness::Dead);
+        assert!(matches!(slot_liveness(Ok(None), "rev"), Liveness::Unreachable { .. }));
+        assert!(matches!(
+            slot_liveness(Err(std::io::Error::other("ssh died")), "rev"),
+            Liveness::Unreachable { .. }
+        ));
+    }
+
+    /// A caller with its own policy for uncertainty (the poller's "reads as
+    /// alive" probes) gets an error it can apply that policy to, not `false`.
+    #[test]
+    fn workspace_pane_alive_errors_when_the_machine_cannot_be_asked() {
+        set_test_pane_liveness(Some(Liveness::Unreachable { reason: "relay down".into() }));
+        let target = SessionTarget::session("shelbi-demo");
+        let got = workspace_pane_alive(&Host::Local, &target);
+        set_test_pane_liveness(None);
+        assert!(got.is_err(), "unreachable must not read as a dead session: {got:?}");
     }
 
     /// A missing pgid record (a dev slot, a remote review slot, or a load that
@@ -11999,8 +12021,8 @@ mod review_server_tests {
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
         // No pgid file written → must not panic and must leave no record.
-        stop_review_server("rev");
-        assert!(shelbi_state::read_review_serve_pgid("rev").unwrap().is_none());
+        stop_review_server("demo", "rev");
+        assert!(shelbi_state::read_review_serve_pgid("demo", "rev").unwrap().is_none());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -12040,14 +12062,14 @@ mod review_server_tests {
 
         // Safety: `getpgrp()` only reads our process-group id.
         let own_pgid = unsafe { libc::getpgrp() } as i32;
-        let path = shelbi_state::review_serve_pgid_path("rev").unwrap();
+        let path = shelbi_state::review_serve_pgid_path("demo", "rev").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{own_pgid}\n")).unwrap();
 
         // Must not signal our own group; still clears the (bogus) record.
-        stop_review_server("rev");
+        stop_review_server("demo", "rev");
 
-        assert!(shelbi_state::read_review_serve_pgid("rev").unwrap().is_none());
+        assert!(shelbi_state::read_review_serve_pgid("demo", "rev").unwrap().is_none());
         std::env::remove_var("SHELBI_HOME");
     }
 }
@@ -15008,6 +15030,48 @@ mod sync_worktree_freshcut_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The relaunch the quit race produces: a supervisor redispatching a
+    /// workspace after the quit began stands down without touching anything.
+    #[test]
+    fn a_dispatch_during_a_project_quit_is_cancelled_before_it_starts() {
+        let _env = crate::test_lock::acquire();
+        let root = std::env::temp_dir().join(format!(
+            "shelbi-dispatch-mid-quit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let machine_repo = root.join("repo");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = dispatch_project(&machine_repo, "claude", Vec::new());
+        let phase = crate::cancel::begin_quit(&project.name);
+        let result = start_workspace_on_task(StartSpec {
+            project: &project,
+            workspace: &project.workspaces[0],
+            task_id: "task-raced",
+            branch: "shelbi/task-raced",
+            task_body: "",
+            agent: None,
+            launch_override: None,
+        });
+        drop(phase);
+
+        match prev_home {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(matches!(result, Err(Error::Cancelled(_))), "{:?}", result.err());
+        assert!(!machine_repo.exists(), "the cancelled dispatch touched no worktree");
     }
 
     #[test]

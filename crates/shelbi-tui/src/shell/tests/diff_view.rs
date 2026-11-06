@@ -135,6 +135,44 @@ fn a_workspace_shows_the_built_in_diff_and_goes_back_to_the_agent() {
     assert!(!text.contains("NORMAL · unified"), "{text}");
 }
 
+/// The rule #2186 set for a review slot's sessions: what's left by another task
+/// is replaced, here so a comment can't land on the task before.
+#[test]
+fn a_workspace_on_another_task_gets_a_new_diff() {
+    let opened = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted: diff_view::DiffOpener = {
+        let opened = opened.clone();
+        let inner = fake_opener();
+        Arc::new(move || {
+            opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            inner()
+        })
+    };
+    let count = || opened.load(std::sync::atomic::Ordering::SeqCst);
+    let mut st = with_workspace(builtin());
+    let w = st.workspace.as_mut().unwrap();
+    w.set_diff_opener(counted);
+    w.follow_task(Some("t-1"));
+    assert_eq!(count(), 0, "nothing to replace before View Diff");
+
+    w.show_builtin_diff();
+    assert_eq!(count(), 1);
+    w.follow_task(Some("t-1"));
+    assert_eq!(count(), 1, "the same task keeps its diff");
+
+    w.focus_panel();
+    w.follow_task(Some("t-2"));
+    assert_eq!(count(), 2, "a diff on show is replaced at once");
+    assert!(!w.content_focused(), "and the keyboard stays where it was");
+
+    // Off screen, it waits for View Diff.
+    w.show_agent();
+    w.follow_task(None);
+    assert_eq!(count(), 2);
+    w.show_builtin_diff();
+    assert_eq!(count(), 3);
+}
+
 #[test]
 fn a_workspace_with_an_external_tool_doesnt_take_the_built_in_path() {
     // Short of the session ensure itself, which would reach a daemon.

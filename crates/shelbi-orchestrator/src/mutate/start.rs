@@ -323,6 +323,15 @@ pub(crate) fn start(
         ) {
             sink.warn(&format!("warning: append_task_event failed: {e}"));
         }
+        if let Err(e) = shelbi_state::record_zen_user_move(
+            project,
+            id,
+            &prev_column,
+            &dest_column,
+            &dispatched_reason,
+        ) {
+            sink.warn(&format!("warning: saving Zen's record of the move failed: {e}"));
+        }
     }
 
     // Release the workspace this card was previously assigned to — but ONLY when
@@ -456,7 +465,13 @@ fn teardown_workspace_pane(
     })?;
     let host = machine.host();
     let addr = crate::workspace::workspace_target(project_yaml, workspace)?;
-    crate::workspace::kill_workspace_pane(&host, &addr, &workspace.name)
+    crate::workspace::kill_workspace_pane(
+        &project_yaml.name,
+        &host,
+        &addr,
+        &workspace.name,
+        crate::session_backend::KillReason::Redispatch,
+    )
 }
 
 /// Is `workspace`'s session slot live right now? Resolves the machine/target the

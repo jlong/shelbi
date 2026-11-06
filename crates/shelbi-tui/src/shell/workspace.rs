@@ -89,6 +89,9 @@ pub struct WorkspaceInterface {
     project: String,
     /// Shelbi's own diff, once View Diff has shown it.
     diff: Option<DiffView>,
+    /// The task the workspace is on now, which [`Self::diff`] is about. Unlike
+    /// [`Self::task`] this follows the board while the view stays open.
+    diff_task: Option<String>,
     /// The main area shows [`Self::diff`].
     diff_showing: bool,
     diff_setup: DiffSetup,
@@ -112,6 +115,7 @@ impl WorkspaceInterface {
         let workspace = workspace.into();
         let title = task.as_ref().map(|t| t.task.title.clone()).unwrap_or_default();
         let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
+        let diff_task = task.as_ref().map(|t| t.task.id.clone());
         let panel = WorkspacePanel::new(worktree, editor_name, agent_name, title, description, status);
         let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
             shelbi_app::session::WorkspaceContentRelauncher {
@@ -130,6 +134,7 @@ impl WorkspaceInterface {
             remote_address: None,
             project: project.to_string(),
             diff: None,
+            diff_task,
             diff_showing: false,
             diff_setup: DiffSetup::default(),
             diff_opener: None,
@@ -159,7 +164,7 @@ impl WorkspaceInterface {
     /// it: selecting it means reading it.
     pub fn show_builtin_diff(&mut self) {
         if self.diff.is_none() {
-            let task = self.task.as_ref().map(|t| t.task.id.clone());
+            let task = self.diff_task.clone();
             let opener = self.diff_opener.clone().unwrap_or_else(|| DiffView::workspace_opener(&self.project, &self.workspace, task));
             let worktree = self.remote_address.is_none().then(|| self.panel.worktree.clone());
             self.diff = Some(DiffView::new(opener, self.diff_setup.clone(), worktree, "No changes yet"));
@@ -169,6 +174,22 @@ impl WorkspaceInterface {
         }
         self.diff_showing = true;
         self.focus = WsFocus::Content;
+    }
+
+    /// The workspace is on `task` now. A diff left by another task has that
+    /// task's comments and viewed state, so it's replaced: at once when on show,
+    /// otherwise the next time View Diff is selected.
+    pub fn follow_task(&mut self, task: Option<&str>) {
+        if self.diff_task.as_deref() == task {
+            return;
+        }
+        self.diff_task = task.map(str::to_string);
+        self.diff = None;
+        if self.diff_showing {
+            let focus = self.focus;
+            self.show_builtin_diff();
+            self.focus = focus;
+        }
     }
 
     /// The main area is going to a session.

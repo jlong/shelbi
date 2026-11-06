@@ -14,13 +14,17 @@
 //! - **finishes even if the client disconnects** — the job runs on a detached
 //!   thread holding its own output channel clone, so a closed socket only makes
 //!   the output sends no-op; the merge/dispatch still completes;
+//! - **finishes before the daemon exits** — every job is counted in
+//!   [`ControlJobs`], the shutdown drain waits for them, and once a shutdown has
+//!   begun new work is refused with [`MutationError::ShuttingDown`], so a client
+//!   resends it to the next daemon;
 //! - streams progress and the result to the requesting client and **announces
 //!   the change to every other connected client**.
 //!
 //! All std threads, no async — matching the hub socket next door. The hub
 //! socket's worker/event protocol is untouched.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -37,6 +41,118 @@ use shelbi_proto::control::{
     CONTROL_PROTOCOL_VERSION,
 };
 use shelbi_state::CLIENT_VERSION;
+
+/// The control jobs this daemon has accepted and not yet finished: what the
+/// shutdown drain waits for, and the gate that refuses new work once a shutdown
+/// has begun. Reads the daemon's shared stop flag rather than having its own
+/// "draining" state, so every way of stopping the daemon drains the same way.
+///
+/// A job is admitted under the `running` lock, after checking the flag, and the
+/// drain reads `running` under that lock after the flag is set. So an admission
+/// either is seen by the drain or saw the flag: no job can slip past both.
+pub(super) struct ControlJobs {
+    stop: Arc<AtomicBool>,
+    running: Mutex<BTreeMap<u64, String>>,
+    next_id: AtomicU64,
+}
+
+impl ControlJobs {
+    pub(super) fn new(stop: Arc<AtomicBool>) -> Arc<Self> {
+        Arc::new(Self {
+            stop,
+            running: Mutex::new(BTreeMap::new()),
+            next_id: AtomicU64::new(1),
+        })
+    }
+
+    /// Count work that runs whether or not a shutdown has begun.
+    fn track(self: &Arc<Self>, label: String) -> JobGuard {
+        let mut running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        self.insert(&mut running, label)
+    }
+
+    /// Count a new job: `Ok` to run it, `Err` when a shutdown has begun and it
+    /// must be refused. Either way the guard holds the drain until the reply is
+    /// on its way, so the client hears the answer.
+    fn admit(self: &Arc<Self>, label: String) -> Result<JobGuard, JobGuard> {
+        let mut running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        let draining = self.stop.load(Ordering::SeqCst);
+        let guard = self.insert(&mut running, label);
+        if draining {
+            Err(guard)
+        } else {
+            Ok(guard)
+        }
+    }
+
+    fn insert(self: &Arc<Self>, running: &mut BTreeMap<u64, String>, label: String) -> JobGuard {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        running.insert(id, label);
+        JobGuard {
+            jobs: self.clone(),
+            id,
+        }
+    }
+
+    /// Count a job from a test outside this module; dropping the answer ends it.
+    #[cfg(test)]
+    pub(super) fn begin_for_test(self: &Arc<Self>, label: &str) -> impl Drop {
+        self.track(label.to_string())
+    }
+
+    /// Whether nothing is running.
+    pub(super) fn is_idle(&self) -> bool {
+        self.running.lock().unwrap_or_else(|p| p.into_inner()).is_empty()
+    }
+
+    /// The jobs still running, named, oldest first.
+    pub(super) fn running(&self) -> Vec<String> {
+        let running = self.running.lock().unwrap_or_else(|p| p.into_inner());
+        running.values().cloned().collect()
+    }
+}
+
+/// One counted job. Released on drop, so a panicking job can't hold the drain
+/// for its whole deadline.
+struct JobGuard {
+    jobs: Arc<ControlJobs>,
+    id: u64,
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        let mut running = self.jobs.running.lock().unwrap_or_else(|p| p.into_inner());
+        running.remove(&self.id);
+    }
+}
+
+/// What a connection's writer thread takes from its queue.
+enum Outgoing {
+    /// A frame to write to the client.
+    Msg(ServerMsg),
+    /// Queued behind a job's reply: reached once that reply is written, and only
+    /// then does the drain stop counting the job. So a job the drain waited for
+    /// has told its client, rather than exiting with the reply still queued.
+    Flushed(JobGuard),
+}
+
+/// The sending side of a connection's writer queue. Job threads and the
+/// broadcaster push whole messages through it, so frames never interleave.
+#[derive(Clone)]
+struct Outbox(Sender<Outgoing>);
+
+impl Outbox {
+    /// Queue `msg`. A failure means the client is gone, which never stops a job.
+    fn send(&self, msg: ServerMsg) -> Result<(), std::sync::mpsc::SendError<Outgoing>> {
+        self.0.send(Outgoing::Msg(msg))
+    }
+
+    /// Release `job` once everything queued so far is written. With the writer
+    /// gone the send fails and drops the guard, which releases it at once.
+    fn release_after_flush(&self, job: JobGuard) {
+        let _ = self.0.send(Outgoing::Flushed(job));
+    }
+}
 
 /// Shared control-socket state: per-issue serialization locks and the set of
 /// connected subscribers to notify of changes. Cheap to clone (`Arc`).
@@ -141,7 +257,7 @@ struct Inner {
     /// Connected subscriber connections, keyed by connection id, each with the
     /// sender feeding its writer thread. Every subscriber (including an info-less
     /// internal watcher) is here, for `Changed`/`Reexec` broadcasts.
-    subscribers: Mutex<HashMap<u64, Sender<ServerMsg>>>,
+    subscribers: Mutex<HashMap<u64, Outbox>>,
     /// The **attached UI clients** registry: the subset of subscribers that
     /// announced a [`ClientInfo`], keyed by connection id, each with its info,
     /// attach time, and writer sender. This is what `shelbi detach` lists and
@@ -156,6 +272,8 @@ struct Inner {
     lifecycle: Arc<dyn LifecycleOps>,
     /// The app requests' runner (see [`FarFn`]).
     far: Arc<FarFn>,
+    /// The jobs the shutdown drain waits for.
+    jobs: Arc<ControlJobs>,
 }
 
 /// Runs one app request ([`ClientMsg::AppRequest`]) for a project. Defaults
@@ -168,18 +286,20 @@ type FarFn = dyn Fn(&str, shelbi_app::far::Request) -> shelbi_app::far::Reply + 
 struct RegisteredClient {
     info: ClientInfo,
     attached_at: String,
-    tx: Sender<ServerMsg>,
+    tx: Outbox,
 }
 
 impl ControlState {
-    /// Production state: the real `mutate::apply` executor and the given
-    /// lifecycle ops (which capture the daemon's stop flag + hub socket).
-    pub(super) fn production(lifecycle: Arc<dyn LifecycleOps>) -> Self {
-        Self::with_apply_and_lifecycle(
+    /// Production state: the real `mutate::apply` executor, the given lifecycle
+    /// ops (which capture the daemon's stop flag + hub socket), and the job
+    /// count the daemon's shutdown drain watches.
+    pub(super) fn production(lifecycle: Arc<dyn LifecycleOps>, jobs: Arc<ControlJobs>) -> Self {
+        Self::build(
             Box::new(|project, id, kind, sink, recheck| {
                 mutate::apply(project, id, kind, sink, recheck)
             }),
             lifecycle,
+            jobs,
         )
     }
 
@@ -198,7 +318,13 @@ impl ControlState {
         Self::with_apply_and_lifecycle(apply, Arc::new(InertLifecycle))
     }
 
+    #[cfg(test)]
     fn with_apply_and_lifecycle(apply: Box<ApplyFn>, lifecycle: Arc<dyn LifecycleOps>) -> Self {
+        let jobs = ControlJobs::new(Arc::new(AtomicBool::new(false)));
+        Self::build(apply, lifecycle, jobs)
+    }
+
+    fn build(apply: Box<ApplyFn>, lifecycle: Arc<dyn LifecycleOps>, jobs: Arc<ControlJobs>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 issue_locks: Mutex::new(HashMap::new()),
@@ -208,6 +334,7 @@ impl ControlState {
                 apply,
                 lifecycle,
                 far: Arc::new(shelbi_orchestrator::far::answer),
+                jobs,
             }),
         }
     }
@@ -229,7 +356,7 @@ impl ControlState {
             .clone()
     }
 
-    fn register(&self, conn_id: u64, tx: Sender<ServerMsg>) {
+    fn register(&self, conn_id: u64, tx: Outbox) {
         self.inner.subscribers.lock().unwrap().insert(conn_id, tx);
     }
 
@@ -240,7 +367,7 @@ impl ControlState {
 
     /// Register (or refresh, on a reconnect) an attached UI client. Stamps the
     /// attach time daemon-side so a client can't spoof it.
-    fn register_client(&self, conn_id: u64, info: ClientInfo, tx: Sender<ServerMsg>) {
+    fn register_client(&self, conn_id: u64, info: ClientInfo, tx: Outbox) {
         let attached_at = now_rfc3339();
         self.inner.clients.lock().unwrap().insert(
             conn_id,
@@ -356,15 +483,17 @@ pub(super) fn bind(path: &std::path::Path) -> anyhow::Result<UnixListener> {
     Ok(listener)
 }
 
-/// Accept loop for the control socket. Polls `stop` between accepts (nonblocking
-/// listener) so a SIGTERM stops it without a self-connect wake. Detached job
-/// threads a connection spawned keep running to completion past this returning.
-pub(super) fn serve(listener: UnixListener, state: ControlState, stop: Arc<AtomicBool>) {
+/// Accept loop for the control socket. Polls `close` between accepts (nonblocking
+/// listener), so it needs no self-connect wake. `close` is not the daemon's stop
+/// flag: this keeps accepting through the shutdown drain, so a client that
+/// connects then is told to retry (a `ShuttingDown` refusal) instead of being
+/// turned away with a connection error it can't tell from a dead daemon.
+pub(super) fn serve(listener: UnixListener, state: ControlState, close: Arc<AtomicBool>) {
     if listener.set_nonblocking(true).is_err() {
         eprintln!("shelbi daemon: control socket could not enter nonblocking mode; not serving");
         return;
     }
-    while !stop.load(Ordering::SeqCst) {
+    while !close.load(Ordering::SeqCst) {
         match listener.accept() {
             Ok((stream, _)) => {
                 // The listener is nonblocking so we can poll `stop` between
@@ -398,7 +527,8 @@ fn handle_client(stream: UnixStream, state: ControlState) {
     // One writer thread owns the socket write-half; job threads and the
     // broadcaster push whole `ServerMsg`s through this channel, so frames are
     // never interleaved mid-write.
-    let (tx, rx): (Sender<ServerMsg>, Receiver<ServerMsg>) = std::sync::mpsc::channel();
+    let (tx, rx): (Sender<Outgoing>, Receiver<Outgoing>) = std::sync::mpsc::channel();
+    let tx = Outbox(tx);
     let writer = thread::spawn(move || writer_loop(write_half, rx));
 
     // The version the client announced in its hello, so a `Subscribe` can be
@@ -454,26 +584,34 @@ fn handle_client(stream: UnixStream, state: ControlState) {
             ClientMsg::Mutate(req) => {
                 // Detached: the job outlives this connection so a client that
                 // closes mid-merge doesn't abandon the work half-done.
-                let state = state.clone();
-                let tx = tx.clone();
-                thread::spawn(move || run_job(conn_id, req, state, tx));
+                let label = format!("{}:{}/{}", req.kind.verb(), req.project, req.id);
+                let job_state = state.clone();
+                spawn_job(&state, &tx, req.request_id, label, move |tx| {
+                    run_job(conn_id, req, job_state, tx)
+                });
             }
             ClientMsg::QuitProject {
                 request_id,
                 project,
             } => {
                 // Runs inline on this connection's handler thread (other clients
-                // have their own threads). Ends the project's sessions, drains
-                // its quit barrier, marks it closed, then acks.
+                // have their own threads). Marks the project closed, drains its
+                // quit barrier, ends its sessions, then acks. Runs during a
+                // shutdown too (a quit is how a user gets out, and its client
+                // doesn't retry), counted so the daemon doesn't exit mid-quit.
+                let job = state.inner.jobs.track(format!("quit:{project}"));
                 state.inner.lifecycle.quit_project(&project);
                 let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
+                tx.release_after_flush(job);
             }
             ClientMsg::QuitShelbi { request_id } => {
                 // Close every project and end all sessions, ACK the client, then
                 // stop the daemon — acking before the stop so the reply isn't
-                // lost to the shutdown race.
+                // lost to the shutdown race. Counted like a project quit.
+                let job = state.inner.jobs.track("quit-shelbi".to_string());
                 state.inner.lifecycle.quit_shelbi();
                 let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
+                tx.release_after_flush(job);
                 state.inner.lifecycle.stop_daemon();
             }
             ClientMsg::ReloadClients { request_id } => {
@@ -487,14 +625,18 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 // Detached like a mutation: the daemon owns the review sessions'
                 // lifetime, so a client that detaches right after asking doesn't
                 // abandon a half-spawned (or half-torn-down) interface.
-                let tx = tx.clone();
-                thread::spawn(move || run_review_session_job(req, tx));
+                let label = format!("review-session:{}/{}", req.project, req.task);
+                spawn_job(&state, &tx, req.request_id, label, move |tx| {
+                    run_review_session_job(req, tx)
+                });
             }
             ClientMsg::WorkspaceSession(req) => {
                 // The dev-workspace twin of ReviewSession; detached for the same
                 // reason (the daemon owns the editor/diff sessions' lifetime).
-                let tx = tx.clone();
-                thread::spawn(move || run_workspace_session_job(req, tx));
+                let label = format!("workspace-session:{}/{}", req.project, req.workspace);
+                spawn_job(&state, &tx, req.request_id, label, move |tx| {
+                    run_workspace_session_job(req, tx)
+                });
             }
             ClientMsg::ListClients { request_id } => {
                 let clients = state.list_clients();
@@ -517,21 +659,27 @@ fn handle_client(stream: UnixStream, state: ControlState) {
             ClientMsg::WriteState(req) => {
                 // Detached like a mutation, so a client that leaves right after
                 // asking still gets its write made (and announced).
-                let state = state.clone();
-                let tx = tx.clone();
-                thread::spawn(move || run_state_write(conn_id, req, state, tx));
+                let label = format!("write-state:{}", req.project);
+                let job_state = state.clone();
+                spawn_job(&state, &tx, req.request_id, label, move |tx| {
+                    run_state_write(conn_id, req, job_state, tx)
+                });
             }
             ClientMsg::SaveConfig(req) => {
                 // Detached like a mutation: a save the client walked away
                 // from still lands whole (or not at all).
-                let state = state.clone();
-                let tx = tx.clone();
-                thread::spawn(move || run_save_config(req, state, tx));
+                let label = format!("save-config:{}/{}", req.project, req.surface);
+                let job_state = state.clone();
+                spawn_job(&state, &tx, req.request_id, label, move |tx| {
+                    run_save_config(req, job_state, tx)
+                });
             }
             ClientMsg::AppRequest(req) => {
-                let state = state.clone();
-                let tx = tx.clone();
-                thread::spawn(move || run_app_request(req, state, tx));
+                let label = format!("app-request:{}", req.project);
+                let job_state = state.clone();
+                spawn_job(&state, &tx, req.request_id, label, move |tx| {
+                    run_app_request(req, job_state, tx)
+                });
             }
         }
     }
@@ -543,10 +691,45 @@ fn handle_client(stream: UnixStream, state: ControlState) {
     let _ = writer.join();
 }
 
+/// Start one counted job on a detached thread, or, when the daemon is shutting
+/// down, refuse it: the refusal promises it didn't start, so the client can send
+/// it again to the next daemon.
+fn spawn_job(
+    state: &ControlState,
+    tx: &Outbox,
+    request_id: u64,
+    label: String,
+    job: impl FnOnce(Outbox) + Send + 'static,
+) {
+    match state.inner.jobs.admit(label) {
+        Ok(guard) => {
+            let tx = tx.clone();
+            thread::spawn(move || {
+                job(tx.clone());
+                tx.release_after_flush(guard);
+            });
+        }
+        Err(guard) => {
+            let _ = tx.send(ServerMsg::Failed {
+                request_id,
+                error: MutationError::ShuttingDown,
+            });
+            tx.release_after_flush(guard);
+        }
+    }
+}
+
 /// Drain `rx`, encoding each message to a frame on the socket. Exits when the
 /// channel closes (all senders dropped) or a write fails (client gone).
-fn writer_loop(mut sock: UnixStream, rx: Receiver<ServerMsg>) {
-    while let Ok(msg) = rx.recv() {
+fn writer_loop(mut sock: UnixStream, rx: Receiver<Outgoing>) {
+    while let Ok(item) = rx.recv() {
+        let msg = match item {
+            Outgoing::Msg(msg) => msg,
+            Outgoing::Flushed(job) => {
+                drop(job);
+                continue;
+            }
+        };
         let Ok(bytes) = control::encode(&msg) else {
             continue;
         };
@@ -557,12 +740,13 @@ fn writer_loop(mut sock: UnixStream, rx: Receiver<ServerMsg>) {
         }
     }
     // Drain any remaining queued messages so job-thread sends return promptly.
+    // Dropping a queued `Flushed` here is what releases a job whose client left.
     while rx.recv().is_ok() {}
 }
 
 /// Run one mutation under its per-issue lock, with the expected-state gate and
 /// the recheck closure, then report the result and broadcast the change.
-fn run_job(origin: u64, req: MutationRequest, state: ControlState, tx: Sender<ServerMsg>) {
+fn run_job(origin: u64, req: MutationRequest, state: ControlState, tx: Outbox) {
     let request_id = req.request_id;
 
     // Serialize per issue. `add` with no explicit id uses an empty key — those
@@ -641,7 +825,7 @@ fn run_job(origin: u64, req: MutationRequest, state: ControlState, tx: Sender<Se
 /// announce it to every other subscriber, so their views of the project
 /// refresh. Not an issue mutation: no per-issue lock or expected state (the
 /// state files carry their own locks), and the note names no issue.
-fn run_state_write(origin: u64, req: StateWriteRequest, state: ControlState, tx: Sender<ServerMsg>) {
+fn run_state_write(origin: u64, req: StateWriteRequest, state: ControlState, tx: Outbox) {
     let request_id = req.request_id;
     match shelbi_orchestrator::state_write::apply(&req.project, &req.write) {
         Ok(()) => {
@@ -674,7 +858,7 @@ fn state_write_note(req: &StateWriteRequest) -> ChangeNote {
 /// `request_id`. These are not issue mutations (no board change, no
 /// expected-state gate), so they skip the per-issue lock and the recheck; the
 /// orchestrator calls are themselves idempotent and best-effort.
-fn run_review_session_job(req: ReviewSessionRequest, tx: Sender<ServerMsg>) {
+fn run_review_session_job(req: ReviewSessionRequest, tx: Outbox) {
     use shelbi_orchestrator::review_session::{self, ReviewContentRole};
     let request_id = req.request_id;
     let result = match req.op {
@@ -732,7 +916,7 @@ fn run_review_session_job(req: ReviewSessionRequest, tx: Sender<ServerMsg>) {
 /// `request_id`. The dev-workspace twin of [`run_review_session_job`]; like it,
 /// these are not issue mutations, so they skip the per-issue lock and recheck —
 /// the orchestrator calls are idempotent and best-effort.
-fn run_workspace_session_job(req: WorkspaceSessionRequest, tx: Sender<ServerMsg>) {
+fn run_workspace_session_job(req: WorkspaceSessionRequest, tx: Outbox) {
     use shelbi_orchestrator::review_session::ReviewContentRole;
     use shelbi_orchestrator::workspace_session;
     let request_id = req.request_id;
@@ -775,7 +959,7 @@ fn run_workspace_session_job(req: WorkspaceSessionRequest, tx: Sender<ServerMsg>
 /// loader), checks each file is as the client read it, and writes it. Saves
 /// of one project's surface run one at a time, so two can't both pass their
 /// checks before either writes.
-fn run_save_config(req: SaveConfigRequest, state: ControlState, tx: Sender<ServerMsg>) {
+fn run_save_config(req: SaveConfigRequest, state: ControlState, tx: Outbox) {
     use shelbi_state::config_write::{self, WriteError};
     let request_id = req.request_id;
     let failed = |error: MutationError| {
@@ -810,7 +994,7 @@ fn run_save_config(req: SaveConfigRequest, state: ControlState, tx: Sender<Serve
 /// Run one app request (`AppRequest`, protocol v8) and reply with its
 /// answer: a workspace or machine change, a machine check, an editor
 /// session (`shelbi_orchestrator::far`).
-fn run_app_request(req: AppRequest, state: ControlState, tx: Sender<ServerMsg>) {
+fn run_app_request(req: AppRequest, state: ControlState, tx: Outbox) {
     let request_id = req.request_id;
     let request: shelbi_app::far::Request = match serde_json::from_value(req.body) {
         Ok(r) => r,
@@ -842,7 +1026,7 @@ fn run_app_request(req: AppRequest, state: ControlState, tx: Sender<ServerMsg>) 
 /// [`ServerMsg::Line`]. A failed send (client gone) is ignored — the mutation
 /// still runs to completion.
 struct DaemonSink {
-    tx: Sender<ServerMsg>,
+    tx: Outbox,
     request_id: u64,
 }
 
@@ -926,8 +1110,8 @@ mod tests {
     #[test]
     fn broadcast_reaches_other_subscribers_but_not_the_origin() {
         let state = ControlState::new();
-        let (tx1, rx1) = std::sync::mpsc::channel();
-        let (tx2, rx2) = std::sync::mpsc::channel();
+        let (tx1, rx1) = test_outbox();
+        let (tx2, rx2) = test_outbox();
         state.register(1, tx1);
         state.register(2, tx2);
 
@@ -1103,6 +1287,26 @@ mod tests {
                 updated_at: String::new(),
             })
         }))
+    }
+
+    /// A writer queue for a test with no socket: the receiving side yields the
+    /// frames a writer thread would write.
+    fn test_outbox() -> (Outbox, TestInbox) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Outbox(tx), TestInbox(rx))
+    }
+
+    struct TestInbox(Receiver<Outgoing>);
+
+    impl TestInbox {
+        fn try_recv(&self) -> Result<ServerMsg, std::sync::mpsc::TryRecvError> {
+            loop {
+                match self.0.try_recv()? {
+                    Outgoing::Msg(msg) => return Ok(msg),
+                    Outgoing::Flushed(_) => continue,
+                }
+            }
+        }
     }
 
     /// A control server running on a real socket in a background thread.
@@ -1376,9 +1580,9 @@ mod tests {
         // A directory where state.json belongs: nothing can be written there.
         std::fs::create_dir_all(home.path.join("projects/p/state.json")).unwrap();
         let state = ControlState::new();
-        let (tx, rx) = std::sync::mpsc::channel();
+        let (tx, rx) = test_outbox();
         state.register(7, tx);
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        let (reply_tx, reply_rx) = test_outbox();
         run_state_write(
             1,
             StateWriteRequest {
@@ -1595,8 +1799,8 @@ mod tests {
         // right ones: All (everyone), AllExcept (everyone but the named id — the
         // "detach other clients" case), and One (just that id).
         let state = ControlState::new();
-        let (tx1, rx1) = std::sync::mpsc::channel();
-        let (tx2, rx2) = std::sync::mpsc::channel();
+        let (tx1, rx1) = test_outbox();
+        let (tx2, rx2) = test_outbox();
         state.register_client(1, info("aaa"), tx1);
         state.register_client(2, info("bbb"), tx2);
 
@@ -1644,7 +1848,7 @@ mod tests {
         // A plain Subscribe (an internal watcher) still gets pushes but must not
         // appear in the attached-clients registry.
         let state = ControlState::new();
-        let (tx, _rx) = std::sync::mpsc::channel();
+        let (tx, _rx) = test_outbox();
         state.register(9, tx);
         assert!(state.list_clients().is_empty());
     }
@@ -1783,5 +1987,239 @@ mod tests {
             .unwrap();
         assert_eq!(serde_json::from_value::<Reply>(body).unwrap(), Reply::Editor(Ok("p/edit/k1".into())));
         assert_eq!(seen.lock().unwrap().clone(), [("p".to_string(), request)]);
+    }
+
+    // --- the shutdown drain ---------------------------------------------------
+
+    /// A mutation that runs until the test lets it go, reporting when it began
+    /// and finished. Everything the drain cares about, with no real git.
+    struct SlowJob {
+        began: Arc<AtomicBool>,
+        finished: Arc<AtomicBool>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl SlowJob {
+        fn new() -> Self {
+            Self {
+                began: Arc::default(),
+                finished: Arc::default(),
+                calls: Arc::default(),
+                release: Arc::default(),
+            }
+        }
+
+        fn apply(&self) -> Box<ApplyFn> {
+            let (began, finished, calls, release) = (
+                self.began.clone(),
+                self.finished.clone(),
+                self.calls.clone(),
+                self.release.clone(),
+            );
+            Box::new(move |project, id, kind, _sink, _recheck| {
+                calls.fetch_add(1, AOrd::SeqCst);
+                began.store(true, AOrd::SeqCst);
+                while !release.load(AOrd::SeqCst) {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                finished.store(true, AOrd::SeqCst);
+                Ok(ChangeNote {
+                    project: project.to_string(),
+                    id: id.to_string(),
+                    verb: kind.verb().to_string(),
+                    status: "todo".to_string(),
+                    updated_at: String::new(),
+                })
+            })
+        }
+
+        fn wait_began(&self) {
+            assert!(
+                wait_until(Duration::from_secs(5), || self.began.load(AOrd::SeqCst)),
+                "the job never started"
+            );
+        }
+    }
+
+    /// A served state whose jobs answer to `stop`, standing in for the daemon's
+    /// stop flag.
+    fn serve_draining(job: &SlowJob, tag: &str) -> (Served, Arc<ControlJobs>, Arc<AtomicBool>) {
+        let stop = Arc::new(AtomicBool::new(false));
+        let jobs = ControlJobs::new(stop.clone());
+        let state = ControlState::build(job.apply(), Arc::new(InertLifecycle), jobs.clone());
+        (serve_bg(state, tag), jobs, stop)
+    }
+
+    fn unassign(request_id: u64) -> MutationRequest {
+        MutationRequest {
+            request_id,
+            project: "p".into(),
+            id: "t1".into(),
+            expected: None,
+            kind: MutationKind::Unassign,
+        }
+    }
+
+    fn is_shutting_down<T>(r: &Result<T, shelbi_client::ClientError>) -> bool {
+        matches!(
+            r,
+            Err(shelbi_client::ClientError::Mutation(MutationError::ShuttingDown))
+        )
+    }
+
+    #[test]
+    fn a_running_job_holds_the_drain_until_it_finishes_and_its_client_is_told() {
+        let job = SlowJob::new();
+        let (served, jobs, stop) = serve_draining(&job, "dr-hold");
+        let sock = served.sock.clone();
+        let client = thread::spawn(move || {
+            ControlClient::connect(&sock, "test")
+                .unwrap()
+                .mutate(&unassign(1), &mut |_, _| {})
+                .map(|_| ())
+        });
+        job.wait_began();
+        assert_eq!(jobs.running(), vec!["unassign:p/t1".to_string()]);
+
+        stop.store(true, AOrd::SeqCst);
+        thread::sleep(Duration::from_millis(50));
+        assert!(!jobs.is_idle(), "the shutdown must wait for a running job");
+
+        job.release.store(true, AOrd::SeqCst);
+        assert!(wait_until(Duration::from_secs(5), || jobs.is_idle()), "the job never drained");
+        assert!(job.finished.load(AOrd::SeqCst));
+        // Idle means the reply is written, not merely queued: this is the moment
+        // the process would exit, and the client still gets its answer.
+        client.join().unwrap().expect("the client hears the job's result");
+    }
+
+    #[test]
+    fn new_work_during_a_drain_is_refused_and_does_not_run() {
+        let job = SlowJob::new();
+        let (served, jobs, stop) = serve_draining(&job, "dr-refuse");
+        // A client connected before the shutdown, like an open TUI or desktop app.
+        let mut before = ControlClient::connect(&served.sock, "test").unwrap();
+        let _in_flight = {
+            let sock = served.sock.clone();
+            thread::spawn(move || {
+                let _ = ControlClient::connect(&sock, "test")
+                    .unwrap()
+                    .mutate(&unassign(1), &mut |_, _| {});
+            })
+        };
+        job.wait_began();
+        stop.store(true, AOrd::SeqCst);
+
+        // The listener is still up, so a client connecting now hears why.
+        let mut during = ControlClient::connect(&served.sock, "test").unwrap();
+        assert!(is_shutting_down(&before.mutate(&unassign(2), &mut |_, _| {})));
+        assert!(is_shutting_down(&during.mutate(&unassign(3), &mut |_, _| {})));
+        assert!(is_shutting_down(&during.write_state(&StateWriteRequest {
+            request_id: 4,
+            project: "p".into(),
+            write: shelbi_proto::control::StateWrite::ToggleZen { source: "user:palette".into() },
+        })));
+        assert!(is_shutting_down(&during.save_config(&SaveConfigRequest {
+            request_id: 5,
+            project: "p".into(),
+            surface: "workflows".into(),
+            plan: serde_json::Value::Null,
+        })));
+        assert!(is_shutting_down(&during.app_request(&AppRequest {
+            request_id: 6,
+            project: "p".into(),
+            body: serde_json::Value::Null,
+        })));
+        assert!(is_shutting_down(&during.review_session(
+            &ReviewSessionRequest {
+                request_id: 7,
+                project: "p".into(),
+                task: "t1".into(),
+                op: ReviewSessionOp::Close,
+            },
+            &mut |_, _| {},
+        )));
+        assert!(is_shutting_down(&during.workspace_session(
+            &WorkspaceSessionRequest {
+                request_id: 8,
+                project: "p".into(),
+                workspace: "dev".into(),
+                op: WorkspaceSessionOp::Close,
+            },
+            &mut |_, _| {},
+        )));
+        assert_eq!(job.calls.load(AOrd::SeqCst), 1, "only the job from before the shutdown ran");
+
+        job.release.store(true, AOrd::SeqCst);
+        assert!(wait_until(Duration::from_secs(5), || jobs.is_idle()));
+    }
+
+    #[test]
+    fn a_job_whose_client_left_still_holds_the_drain_then_releases_it() {
+        let job = SlowJob::new();
+        let (served, jobs, stop) = serve_draining(&job, "dr-left");
+        let sock = served.sock.clone();
+        {
+            // A raw hello + mutate, then gone: the client never reads a reply.
+            let mut raw = UnixStream::connect(&sock).unwrap();
+            let hello = ClientMsg::Hello {
+                protocol: CONTROL_PROTOCOL_VERSION,
+                client_version: "test".into(),
+            };
+            raw.write_all(&control::encode(&hello).unwrap()).unwrap();
+            raw.write_all(&control::encode(&ClientMsg::Mutate(unassign(1))).unwrap()).unwrap();
+            job.wait_began();
+        }
+        stop.store(true, AOrd::SeqCst);
+        thread::sleep(Duration::from_millis(50));
+        assert!(!jobs.is_idle(), "the client leaving doesn't end the job");
+        job.release.store(true, AOrd::SeqCst);
+        assert!(wait_until(Duration::from_secs(5), || jobs.is_idle()));
+        assert!(job.finished.load(AOrd::SeqCst));
+    }
+
+    #[test]
+    fn a_panicking_job_releases_the_drain() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let jobs = ControlJobs::new(stop);
+        let apply: Box<ApplyFn> = Box::new(|_, _, _, _, _| panic!("a job bug"));
+        let state = ControlState::build(apply, Arc::new(InertLifecycle), jobs.clone());
+        let served = serve_bg(state, "dr-panic");
+        let mut raw = UnixStream::connect(&served.sock).unwrap();
+        let hello = ClientMsg::Hello {
+            protocol: CONTROL_PROTOCOL_VERSION,
+            client_version: "test".into(),
+        };
+        raw.write_all(&control::encode(&hello).unwrap()).unwrap();
+        raw.write_all(&control::encode(&ClientMsg::Mutate(unassign(1))).unwrap()).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert!(wait_until(Duration::from_secs(5), || jobs.is_idle()));
+    }
+
+    #[test]
+    fn a_quit_during_a_drain_still_runs_and_is_waited_for() {
+        let stop = Arc::new(AtomicBool::new(true));
+        let jobs = ControlJobs::new(stop);
+        let life = RecordingLifecycle::new("v1");
+        let job = SlowJob::new();
+        let state = ControlState::build(job.apply(), life.clone(), jobs.clone());
+        let served = serve_bg(state, "dr-quit");
+        let mut client = ControlClient::connect(&served.sock, "v1").unwrap();
+        client.quit_project("p").expect("a quit isn't refused");
+        assert!(life.calls().iter().any(|c| c.contains("quit_project")), "{:?}", life.calls());
+        assert!(wait_until(Duration::from_secs(5), || jobs.is_idle()));
+    }
+
+    #[test]
+    fn a_job_admitted_before_the_flag_flips_is_seen_by_the_drain() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let jobs = ControlJobs::new(stop.clone());
+        let held = jobs.admit("a".into()).ok().expect("no shutdown yet");
+        stop.store(true, AOrd::SeqCst);
+        assert!(!jobs.is_idle());
+        assert!(jobs.admit("b".into()).is_err(), "a shutdown refuses new work");
+        drop(held);
+        assert!(jobs.is_idle(), "a refusal's guard is gone once dropped too");
     }
 }

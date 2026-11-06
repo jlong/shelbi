@@ -18,8 +18,9 @@ mockup and the earlier docked-pane draft.
   (0 8 32) in the `shadow` role. It paints from `theme.opaque()` like every
   overlay. There is no scrim, no push, and no column resize.
 - **The motion.** The pane slides in from past the window's right edge over
-  `column_swap::SLIDE` on `ease_out_expo`, through gpui's `with_animation`,
-  which renders the end state under Reduce Motion (`sync_reduce_motion`).
+  `column_swap::SLIDE` on `ease_out_expo`, through `clocked_animation` (gpui's
+  one-shot animation on the executor's clock, so tests can stop it), which
+  renders the end state under Reduce Motion (`sync_reduce_motion`).
   Switching cards keeps the same element, so only an open slides.
 - **The Header** follows the Header pattern: 52pt, `toolbar`, the 1px
   canvas edge on its left, `Workflow / id` in Base semibold loud (the

@@ -210,6 +210,8 @@ pub fn detect(projects: &[String]) -> Result<UpgradeReport> {
     // Missing lifecycle-owned shipped defaults added in a newer release —
     // materialize them into projects that predate the addition.
     sniff_missing_lifecycle_defaults(&entries, &mut findings);
+    // Runtime state, not a config surface, so it reads the hub root directly.
+    sniff_legacy_workspace_state(&mut findings);
 
     findings.sort_by(|a, b| {
         (&a.file, a.location.line, a.location.column, &a.code).cmp(&(
@@ -2436,6 +2438,50 @@ fn sniff_renamed_siblings(entries: &[InventoryEntry], out: &mut Vec<UpgradeFindi
                 }
             }
         }
+    }
+}
+
+/// The stable code for "workspace runtime state is still under the hub-global
+/// `~/.shelbi/workspaces/` (or `workers/`)". The apply layer moves it.
+pub(crate) const WORKSPACE_STATE_HUB_GLOBAL: &str = "WORKSPACE_STATE_HUB_GLOBAL";
+
+/// Flag each per-slot directory an older release left under a hub-global root.
+///
+/// Slot names are only unique within a project, so that state now lives under
+/// `~/.shelbi/projects/<project>/workspaces/`, and nothing reads the old place.
+/// It's an auto-heal: every directory has one deterministic outcome (see
+/// [`shelbi_state::migrate_legacy_workspace_state_dir`]), the outcome keeps a
+/// copy of anything it can't attribute, and the state is a cache the poller
+/// rebuilds anyway.
+///
+/// Not tied to the selected projects: which project owns a slot depends on every
+/// registered project, so a single-project pass still reports the whole root.
+fn sniff_legacy_workspace_state(out: &mut Vec<UpgradeFinding>) {
+    let Ok(dirs) = shelbi_state::legacy_workspace_state_dirs() else {
+        return;
+    };
+    for dir in dirs {
+        let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let message = format!("runtime state for workspace `{name}` is not scoped to a project");
+        let proposed_fix = "Move it under its project's `workspaces/` directory.";
+        out.push(UpgradeFinding {
+            id: finding_id(
+                "global",
+                "global.workspace-state",
+                WORKSPACE_STATE_HUB_GLOBAL,
+                &message,
+                proposed_fix,
+            ),
+            logical_id: "global.workspace-state".to_string(),
+            scope: "global".to_string(),
+            file: dir,
+            location: Location { line: 1, column: 1 },
+            classification: Classification::AutoHeal,
+            code: WORKSPACE_STATE_HUB_GLOBAL.to_string(),
+            message,
+            proposed_fix: proposed_fix.to_string(),
+            rationale: String::new(),
+        });
     }
 }
 
@@ -5153,6 +5199,114 @@ mod tests {
         ));
         std::fs::create_dir_all(p.join("projects")).unwrap();
         p
+    }
+
+    fn register_with_slot(home: &Path, project: &str, slot: &str) {
+        std::fs::write(
+            home.join("projects").join(format!("{project}.yaml")),
+            format!(
+                "name: {project}\nrepo: /tmp/{project}\nmachines:\n- name: hub\n  kind: local\n  work_dir: /tmp/{project}\norchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\nworkspaces:\n- name: {slot}\n  machine: hub\n  runner: claude\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn legacy_status(home: &Path, key: &str, task: &str) -> PathBuf {
+        let dir = home.join("workspaces").join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("status.yaml"),
+            format!(
+                "workspace: {key}\ncurrent_task: {task}\nstate: working\nlast_transition: 2026-11-05T00:00:00Z\nlast_seen: 2026-11-05T00:00:00Z\n"
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// What an existing install sees on upgrade: the hub-start pass moves the
+    /// state it can attribute, retires what it can't, says so on `events.log`,
+    /// and has nothing left to do on the next boot.
+    #[test]
+    fn startup_pass_migrates_hub_global_workspace_state_once() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        // The pass discloses on the hub socket when one is set, and a worker
+        // pane inherits the live hub's. Point it inside the sandbox.
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", home.to_str().unwrap());
+        guard.set("SHELBI_HUB_SOCK", home.join("hub.sock"));
+        register_with_slot(&home, "app", "solo");
+        register_with_slot(&home, "site", "review");
+        register_with_slot(&home, "docs", "review");
+        let solo = legacy_status(&home, "solo", "t-1");
+        let shared = legacy_status(&home, "review", "unknown-task");
+
+        let report = detect(&["app".to_string()]).unwrap();
+        let state: Vec<&UpgradeFinding> = report
+            .findings
+            .iter()
+            .filter(|f| f.code == WORKSPACE_STATE_HUB_GLOBAL)
+            .collect();
+        assert_eq!(state.len(), 2, "a one-project pass reports the whole root: {report:?}");
+        assert!(state.iter().all(|f| f.classification == Classification::AutoHeal));
+
+        let outcome = run_startup_pass();
+
+        let applied = outcome
+            .applied
+            .iter()
+            .filter(|c| c.code == WORKSPACE_STATE_HUB_GLOBAL)
+            .count();
+        assert_eq!(applied, 2, "{:?}", outcome.applied);
+        assert!(
+            !outcome.residual.findings.iter().any(|f| f.code == WORKSPACE_STATE_HUB_GLOBAL),
+            "{:?}",
+            outcome.residual,
+        );
+        assert!(!solo.exists() && !shared.exists());
+        let moved = shelbi_state::load_workspace_status("app", "solo").unwrap().unwrap();
+        assert_eq!(moved.current_task.as_deref(), Some("t-1"));
+        // Two projects declare `review` and neither board holds the task, so
+        // neither inherits the row. It is retired, not lost.
+        for project in ["site", "docs"] {
+            assert!(shelbi_state::load_workspace_status(project, "review").unwrap().is_none());
+        }
+        assert!(home.join("workspaces.migrated/review/status.yaml").exists());
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.contains("project=app config-upgrade code=WORKSPACE_STATE_HUB_GLOBAL"),
+            "{log}",
+        );
+        assert!(
+            log.contains("project=global config-upgrade code=WORKSPACE_STATE_HUB_GLOBAL"),
+            "{log}",
+        );
+
+        let again = detect(&["app".to_string()]).unwrap();
+        assert!(!again.findings.iter().any(|f| f.code == WORKSPACE_STATE_HUB_GLOBAL));
+    }
+
+    /// `shelbi reload` selects one project, but who owns a slot depends on all
+    /// of them: `review` here must not read as `site`'s alone.
+    #[test]
+    fn a_single_project_pass_still_judges_ownership_against_every_project() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        // The pass discloses on the hub socket when one is set, and a worker
+        // pane inherits the live hub's. Point it inside the sandbox.
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", home.to_str().unwrap());
+        guard.set("SHELBI_HUB_SOCK", home.join("hub.sock"));
+        register_with_slot(&home, "site", "review");
+        register_with_slot(&home, "docs", "review");
+        legacy_status(&home, "review", "unknown-task");
+
+        run_for_project("site");
+
+        assert!(shelbi_state::load_workspace_status("site", "review").unwrap().is_none());
+        assert!(home.join("workspaces.migrated/review/status.yaml").exists());
     }
 
     #[test]

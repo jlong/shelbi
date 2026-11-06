@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use shelbi_core::{Column, Error, Host, Project, Result};
 
@@ -54,6 +55,9 @@ impl From<shelbi_proto::control::ReviewRole> for ReviewContentRole {
 }
 
 impl ReviewContentRole {
+    /// Every content session a review slot can have.
+    const ALL: [ReviewContentRole; 2] = [ReviewContentRole::Editor, ReviewContentRole::Diff];
+
     /// The `<role>` component of the session name.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -225,15 +229,32 @@ pub fn review_open_target(project_name: &str, task_id: &str) -> Result<ReviewOpe
 }
 
 /// Ensure the `role` content session for `task_id`'s review slot is spawned and
-/// live, so the TUI client can attach a terminal view to it. Idempotent: a
-/// session already live under the name is left as is. Builds the same editor /
-/// diff command the tmux panes run (see
-/// [`crate::review_ui::editor_session_command`] /
+/// live, so the TUI client can attach a terminal view to it. Idempotent for the
+/// task: a session already live under the name and spawned for `task_id` is left
+/// as is. The name is the slot's, and slots outlive their tasks, so a live
+/// session spawned for anything else is ended and replaced: its diff has the
+/// other task's merge-base baked in. Builds the same editor / diff command the
+/// tmux panes run (see [`crate::review_ui::editor_session_command`] /
 /// [`diff_session_command`](crate::review_ui)).
 pub fn ensure_content_session(
     project_name: &str,
     task_id: &str,
     role: ReviewContentRole,
+) -> Result<()> {
+    ensure_content_session_with(project_name, task_id, role, |spec| {
+        SessionProcessBackend.spawn_session_to_attach(spec)
+    })
+}
+
+/// [`ensure_content_session`] with the spawn supplied. A cargo test's
+/// `current_exe` is the harness, so an end-to-end test spawns the real `shelbi`
+/// binary through this.
+#[doc(hidden)]
+pub fn ensure_content_session_with(
+    project_name: &str,
+    task_id: &str,
+    role: ReviewContentRole,
+    spawn: impl FnOnce(shelbi_session::SpawnSpec) -> Result<()>,
 ) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
     let Some(slot) = resolve_review_slot(project_name, &project, task_id)? else {
@@ -264,13 +285,17 @@ pub fn ensure_content_session(
     // nothing live and start a session under the one name.
     let lock = ensure_lock(&name);
     let _spawning = lock.lock().unwrap_or_else(|e| e.into_inner());
-    // Idempotent: a live session under this name is reused as is.
-    if backend
-        .live_session_names(&Host::Local)
-        .map(|names| names.iter().any(|n| n == &name))
-        .unwrap_or(false)
-    {
-        return Ok(());
+    match backend.live_session_task(&name) {
+        // Idempotent: this task's live session is reused as is.
+        Some(Some(owner)) if owner == task_id => return Ok(()),
+        // Left over from another task, or from nobody we can name. This comes
+        // before building the command so a diff still waiting on its checkout
+        // doesn't leave the old one up in the meantime.
+        Some(owner) => {
+            tracing::info!(session = %name, task = %task_id, owner = ?owner, "replacing another task's review content session");
+            end_session(&backend, &name);
+        }
+        None => {}
     }
 
     let command = match role {
@@ -298,7 +323,30 @@ pub fn ensure_content_session(
         raw_output_log: false,
         child_argv: vec!["sh".into(), "-c".into(), command],
     };
-    backend.spawn_session_to_attach(spec)
+    spawn(spec)
+}
+
+/// How long a session gets to exit after each signal [`end_session`] sends.
+const SESSION_EXIT_WAIT: Duration = Duration::from_secs(2);
+
+/// End the live session `name` and wait for it to go, so the name is free for
+/// its replacement. A child ignoring SIGTERM gets SIGKILL. One that outlasts
+/// both only warrants a warning: the replacement is newer, so it's the one
+/// clients and later lookups find under the name.
+fn end_session(backend: &SessionProcessBackend, name: &str) {
+    for signal in [None, Some(libc::SIGKILL)] {
+        if let Err(e) = backend.signal_by_name(&Host::Local, name, signal) {
+            tracing::warn!(session = %name, error = %e, "couldn't signal a review content session");
+        }
+        let deadline = Instant::now() + SESSION_EXIT_WAIT;
+        while Instant::now() < deadline {
+            if backend.live_session_task(name).is_none() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    tracing::warn!(session = %name, "a review content session outlived its kill");
 }
 
 /// The per-session lock [`ensure_content_session`] holds across its live check
@@ -419,32 +467,91 @@ pub fn open_in_app(project_name: &str, task_id: &str, role: ReviewContentRole) -
     crate::tools::open_in_app(role, &worktree, project.base_branch())
 }
 
+/// End every content session of review slot `slot`, whichever task it was
+/// spawned for: the slot is being torn down or has been left with no task.
+/// Best-effort, and cheap when there are none (the poller's reap asks on every
+/// tick of an idle slot). Always local: this daemon only ever spawns them on
+/// its own machine ([`ensure_content_session`]).
+pub(crate) fn kill_content_sessions(project_name: &str, slot: &str) {
+    let backend = SessionProcessBackend;
+    let Ok(live) = backend.live_session_names(&Host::Local) else {
+        return;
+    };
+    for role in ReviewContentRole::ALL {
+        let name = content_session_name(project_name, slot, role);
+        if live.contains(&name) {
+            let _ = backend.kill_by_name(&Host::Local, &name);
+        }
+    }
+}
+
 /// Tear the review interface for `task_id` down: end its editor and diff
-/// sessions and reap the slot's dev-server process group (which frees the
-/// port). Idempotent and best-effort — an already-gone session or a slot with
-/// no server record is fine. The agent (chat) session is left for the slot's
-/// normal teardown ([`crate::workspace::kill_workspace_pane`] on accept).
+/// sessions, clear the review-loaded marker naming it, and reap the slot's
+/// dev-server process group (which frees the port). Idempotent and best-effort:
+/// an already-gone session or a slot with no server record is fine. The agent
+/// (chat) session is left for the slot's normal teardown
+/// ([`crate::workspace::kill_workspace_pane`] on accept).
 ///
 /// This is the daemon's half of AC "closing a review leaves no editor, diff or
 /// server process running and the port free": the client never kills these
 /// itself, so detaching can't orphan a half-torn-down interface.
+///
+/// A client closes after a decision has landed, when the card has already left
+/// review and the board no longer says where it was. So the sessions and marker
+/// are found by the task they name, on every review slot. That also keeps a
+/// close arriving late from touching the next task loaded onto the slot. The
+/// server has no such record, so it's only reaped while the card still holds the
+/// slot; once it has left, the poller's reap takes the server with the pane.
 pub fn close_review(project_name: &str, task_id: &str) -> Result<()> {
     let project = shelbi_state::load_project(project_name)?;
-    let Some(slot) = resolve_review_slot(project_name, &project, task_id)? else {
-        // Not on a review slot (already advanced / unassigned): nothing to tear
-        // down. Benign.
-        return Ok(());
-    };
+    let resolved = resolve_review_slot(project_name, &project, task_id);
+    let holding = resolved.as_ref().ok().and_then(|slot| slot.as_deref());
     let backend = SessionProcessBackend;
-    for role in [ReviewContentRole::Editor, ReviewContentRole::Diff] {
-        let name = content_session_name(project_name, &slot, role);
-        // Best-effort: an already-dead session is fine.
-        let _ = backend.kill_by_name(&Host::Local, &name);
+    for ws in project
+        .workspaces
+        .iter()
+        .filter(|ws| project.effective_tags(ws).contains("review"))
+    {
+        let holds_task = holding == Some(ws.name.as_str());
+        for role in ReviewContentRole::ALL {
+            let name = content_session_name(project_name, &ws.name, role);
+            let owner = backend.live_session_task(&name).flatten();
+            if holds_task || owner.as_deref() == Some(task_id) {
+                // Best-effort: an already-dead session is fine.
+                let _ = backend.kill_by_name(&Host::Local, &name);
+            }
+        }
+        clear_marker_naming(&project, ws, task_id);
     }
     // Reap the setsid'd dev server's whole process group, freeing the port it
     // held. No-op without a pgid record.
-    crate::workspace::stop_review_server(&slot);
+    if let Some(slot) = resolved? {
+        crate::workspace::stop_review_server(project_name, &slot);
+    }
     Ok(())
+}
+
+/// Clear local slot `ws`'s review-loaded marker if it names `task_id`. A remote
+/// slot is left to the poller's reap and the next dispatch, rather than an SSH
+/// round trip per slot on every close. Best-effort.
+fn clear_marker_naming(project: &Project, ws: &shelbi_core::WorkspaceSpec, task_id: &str) {
+    let Some(machine) = project.machine(&ws.machine) else {
+        return;
+    };
+    let host = machine.host();
+    if !host.is_local() {
+        return;
+    }
+    let marker = crate::workspace::workspace_review_loaded_marker(machine, ws);
+    let names_task = matches!(
+        crate::workspace::read_review_loaded_marker(&host, &marker),
+        Ok(Some(marked)) if marked == task_id
+    );
+    if names_task {
+        if let Err(e) = crate::workspace::clear_review_loaded_marker(&host, &marker) {
+            tracing::warn!(workspace = %ws.name, error = %e, "clear_review_loaded_marker failed");
+        }
+    }
 }
 
 #[cfg(test)]

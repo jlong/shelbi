@@ -262,7 +262,8 @@ impl NewTaskDialog {
     }
 
     /// Run `request` off the UI thread; the answer comes back to the form.
-    /// A dialog closed meanwhile (its window gone) drops it.
+    /// A dialog closed meanwhile (its window gone or switched to another
+    /// project) drops it.
     fn create(&mut self, request: CreateRequest, window: &mut Window, cx: &mut Context<Self>) {
         let runner = self.runner.clone();
         let link = self.link.clone();
