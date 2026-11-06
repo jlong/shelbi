@@ -39,6 +39,8 @@
 //! - [`output_split`] — rest-boundary framing of the live output stream, so a
 //!   frame edge (and the replay/live split a client resumes at) never lands mid
 //!   escape sequence or mid UTF-8.
+//! - `vt` — the tokenizer the splitter and responder share, following the same
+//!   transitions as the emulator's parser so the three agree on sequence ends.
 //! - [`daemon_watchdog`] — a background thread that restarts a crashed hub
 //!   daemon while this session's project is open (the service units are retired,
 //!   so sessions are the watchers).
@@ -56,6 +58,7 @@ pub mod responder;
 pub mod session;
 pub mod spawn;
 pub mod transport;
+mod vt;
 
 pub use layout::{SessionPaths, MAX_SOCKET_PATH};
 pub use meta::{ExitRecord, Meta};
