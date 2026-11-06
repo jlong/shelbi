@@ -57,7 +57,7 @@ pub mod spawn;
 pub mod transport;
 
 pub use connect::{probe_handshake, Connection, SessionEvents};
-pub use control::{fresh_client_id, hostname, ControlClient, Notice, Subscription};
+pub use control::{fresh_client_id, hostname, retry_through_drain, ControlClient, Notice, Subscription};
 pub use discovery::{
     choose_session, list, probe_reachable, probe_socket, reap_dead, reap_dead_keeping_recent,
     zombies_to_reap, DiscoveredSession, SocketReachability,

@@ -30,6 +30,10 @@ pub enum WriteFailure {
     Changed { paths: Vec<PathBuf>, host: Option<String> },
     /// Anything else, said for the user.
     Failed(String),
+    /// The daemon is shutting down and took no new work: nothing was written,
+    /// and the plan can be sent again. A store's caller sees this only once the
+    /// retries in [`through_drain`] ran out.
+    ShuttingDown(String),
 }
 
 /// Where a project's config saves are written, and read back from.
@@ -122,10 +126,24 @@ impl ConfigStore for Local {
 /// with none running nothing else writes through it, and the plan is
 /// written here. Blocking.
 pub fn save_here(project: &str, plan: &Plan) -> Result<(), WriteFailure> {
-    match crate::exec_daemon::connect_running() {
-        Some(mut client) => send_save(&mut client, project, plan, None),
-        None => shelbi_state::config_write::check_and_run(plan).map_err(local_failure),
-    }
+    through_drain(
+        || Ok(crate::exec_daemon::connect_running()),
+        |client| match client {
+            Some(client) => send_save(client, project, plan, None),
+            None => shelbi_state::config_write::check_and_run(plan).map_err(local_failure),
+        },
+    )
+}
+
+/// Save a plan with `send`, on what `connect` answers. A daemon on its way out
+/// refuses new work, so wait and send it again to the one that replaces it.
+pub(crate) fn through_drain<C>(
+    connect: impl FnMut() -> Result<C, WriteFailure>,
+    send: impl FnMut(&mut C) -> Result<(), WriteFailure>,
+) -> Result<(), WriteFailure> {
+    shelbi_client::retry_through_drain(shelbi_state::DAEMON_RESTART_WINDOW, connect, send, |e| {
+        matches!(e, WriteFailure::ShuttingDown(_))
+    })
 }
 
 /// Send `plan` for `project` as one `SaveConfig` on `client` (the daemon
@@ -157,6 +175,12 @@ pub(crate) fn send_save(
                 host,
             })
         }
+        Err(shelbi_client::ClientError::Mutation(e @ shelbi_proto::control::MutationError::ShuttingDown)) => {
+            Err(WriteFailure::ShuttingDown(match &host {
+                Some(host) => format!("{host}: {e}"),
+                None => e.to_string(),
+            }))
+        }
         Err(e) => Err(failed(e.to_string())),
     }
 }
@@ -176,7 +200,7 @@ pub fn save_workflows(store: &dyn ConfigStore, config: &WorkflowConfig) -> Resul
     store.write(&plan.plan).map_err(|e| match e {
         WriteFailure::Changed { paths, host: None } => ConfigError::Conflict(paths),
         WriteFailure::Changed { paths, host: Some(host) } => ConfigError::ChangedOn { host, paths },
-        WriteFailure::Failed(message) => ConfigError::Invalid(message),
+        WriteFailure::Failed(message) | WriteFailure::ShuttingDown(message) => ConfigError::Invalid(message),
     })?;
     let config = store.workflows().map_err(ConfigError::Invalid)?;
     Ok(plan.saved(config))
@@ -189,7 +213,7 @@ pub fn save_agents(store: &dyn ConfigStore, config: &AgentsConfig) -> Result<age
     store.write(&plan.plan).map_err(|e| match e {
         WriteFailure::Changed { paths, host: None } => AgentError::Conflict(paths),
         WriteFailure::Changed { paths, host: Some(host) } => AgentError::ChangedOn { host, paths },
-        WriteFailure::Failed(message) => AgentError::Invalid(message),
+        WriteFailure::Failed(message) | WriteFailure::ShuttingDown(message) => AgentError::Invalid(message),
     })?;
     let config = store.agents().map_err(AgentError::Invalid)?;
     Ok(plan.saved(config))

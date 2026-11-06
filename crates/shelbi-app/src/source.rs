@@ -363,6 +363,17 @@ impl ProjectLink {
         shelbi_client::ControlClient::over(reader, writer, shelbi_state::CLIENT_VERSION).map_err(failed)
     }
 
+    /// Run one request on a remote project's far daemon. One that is on its way
+    /// out refuses new work, so wait and send it to the one that replaces it,
+    /// over a fresh `control` stream each time.
+    fn on_far_daemon<T>(
+        relay: &dyn remote::RelayLink,
+        project: &str,
+        send: impl FnMut(&mut shelbi_client::ControlClient) -> Result<T, ExecError>,
+    ) -> Result<T, ExecError> {
+        crate::exec_daemon::retry_through_drain(|| Self::far_control(relay, project), send)
+    }
+
     pub fn key(&self) -> &ProjectKey {
         &self.key
     }
@@ -421,10 +432,9 @@ impl ProjectLink {
     ) -> Result<Option<ExpectedState>, ExecError> {
         match &self.relay {
             None => crate::exec_daemon::execute_mutation_expecting(mutation, expected, on_line),
-            Some(relay) => {
-                let mut client = Self::far_control(&**relay, &self.key.name)?;
-                crate::exec_daemon::mutate_over(&mut client, mutation, expected, on_line)
-            }
+            Some(relay) => Self::on_far_daemon(&**relay, &self.key.name, |client| {
+                crate::exec_daemon::mutate_over(client, mutation, expected.clone(), on_line)
+            }),
         }
     }
 
@@ -437,10 +447,9 @@ impl ProjectLink {
     ) -> Result<Option<String>, ExecError> {
         match &self.relay {
             None => crate::exec_daemon::add_issue(mutation, on_line),
-            Some(relay) => {
-                let mut client = Self::far_control(&**relay, &self.key.name)?;
-                crate::exec_daemon::add_issue_over(&mut client, mutation, on_line)
-            }
+            Some(relay) => Self::on_far_daemon(&**relay, &self.key.name, |client| {
+                crate::exec_daemon::add_issue_over(client, mutation, on_line)
+            }),
         }
     }
 
@@ -475,10 +484,9 @@ impl ProjectLink {
     pub fn review_session(&self, task: &str, op: ReviewSessionOp, on_line: &mut dyn FnMut(Stream, &str)) -> ExecOutcome {
         match &self.relay {
             None => crate::exec_daemon::review_session(&self.key.name, task, op, on_line),
-            Some(relay) => {
-                let mut client = Self::far_control(&**relay, &self.key.name)?;
-                crate::exec_daemon::review_session_over(&mut client, &self.key.name, task, op, on_line)
-            }
+            Some(relay) => Self::on_far_daemon(&**relay, &self.key.name, |client| {
+                crate::exec_daemon::review_session_over(client, &self.key.name, task, op.clone(), on_line)
+            }),
         }
     }
 
@@ -493,9 +501,10 @@ impl ProjectLink {
             None => crate::settings::store::save_here(&self.key.name, plan),
             Some(relay) => {
                 let host = crate::remote_window::bare_host(relay.host()).to_string();
-                let mut client = Self::far_control(&**relay, &self.key.name)
-                    .map_err(|e| WriteFailure::Failed(e.to_string()))?;
-                crate::settings::store::send_save(&mut client, &self.key.name, plan, Some(host))
+                crate::settings::store::through_drain(
+                    || Self::far_control(&**relay, &self.key.name).map_err(|e| WriteFailure::Failed(e.to_string())),
+                    |client| crate::settings::store::send_save(client, &self.key.name, plan, Some(host.clone())),
+                )
             }
         }
     }
@@ -507,13 +516,17 @@ impl ProjectLink {
     pub fn far_request(&self, request: &crate::far::Request) -> Result<crate::far::Reply, String> {
         let relay = self.relay.as_ref().ok_or_else(|| "not a project on another machine".to_string())?;
         let host = relay.host().to_string();
-        let mut client = Self::far_control(&**relay, &self.key.name).map_err(|e| e.to_string())?;
         let request = shelbi_proto::control::AppRequest {
             request_id: 1,
             project: self.key.name.clone(),
             body: serde_json::to_value(request).map_err(|e| e.to_string())?,
         };
-        let body = client.app_request(&request).map_err(|e| format!("{host}: {e}"))?;
+        let body = Self::on_far_daemon(&**relay, &self.key.name, |client| {
+            client
+                .app_request(&request)
+                .map_err(|e| crate::exec_daemon::map_client_err(e).with_host(&host))
+        })
+        .map_err(|e| e.to_string())?;
         serde_json::from_value(body).map_err(|e| format!("{host} answered something this build can't read: {e}"))
     }
 
@@ -561,10 +574,9 @@ impl ProjectLink {
     ) -> ExecOutcome {
         match &self.relay {
             None => crate::exec_daemon::workspace_session(&self.key.name, ws, op, on_line),
-            Some(relay) => {
-                let mut client = Self::far_control(&**relay, &self.key.name)?;
-                crate::exec_daemon::workspace_session_over(&mut client, &self.key.name, ws, op, on_line)
-            }
+            Some(relay) => Self::on_far_daemon(&**relay, &self.key.name, |client| {
+                crate::exec_daemon::workspace_session_over(client, &self.key.name, ws, op.clone(), on_line)
+            }),
         }
     }
 
@@ -575,11 +587,11 @@ impl ProjectLink {
     pub fn write_state(&self, write: crate::state_write::StateWrite) -> Result<(), String> {
         match &self.relay {
             None => crate::exec_daemon::write_state(&self.key.name, write).map_err(|e| e.to_string()),
-            Some(relay) => {
-                let mut client = Self::far_control(&**relay, &self.key.name).map_err(|e| e.to_string())?;
-                crate::exec_daemon::write_state_over(&mut client, &self.key.name, write)
-                    .map_err(|e| format!("{}: {e}", relay.host()))
-            }
+            Some(relay) => Self::on_far_daemon(&**relay, &self.key.name, |client| {
+                crate::exec_daemon::write_state_over(client, &self.key.name, write.clone())
+                    .map_err(|e| e.with_host(relay.host()))
+            })
+            .map_err(|e| e.to_string()),
         }
     }
 }

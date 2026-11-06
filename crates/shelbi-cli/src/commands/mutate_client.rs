@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use shelbi_orchestrator::mutate;
-use shelbi_proto::control::{MutationKind, MutationRequest, Stream};
+use shelbi_proto::control::{MutationError, MutationKind, MutationRequest, Stream};
 
 /// Run a mutation against issue `id` in `project`, routed through the daemon's
 /// control socket (the one runtime).
@@ -32,10 +32,6 @@ fn run_via_daemon(project: &str, id: &str, kind: MutationKind) -> Result<()> {
         _ => mutate::current_state(project, id).ok(),
     };
 
-    shelbi_state::ensure_daemon_running().map_err(|e| anyhow!(e))?;
-    let sock = shelbi_state::control_socket_path().map_err(|e| anyhow!(e))?;
-    let mut client = connect_with_retry(&sock)?;
-
     let req = MutationRequest {
         request_id: 1,
         project: project.to_string(),
@@ -47,10 +43,25 @@ fn run_via_daemon(project: &str, id: &str, kind: MutationKind) -> Result<()> {
         Stream::Stdout => println!("{text}"),
         Stream::Stderr => eprintln!("{text}"),
     };
-    client
-        .mutate(&req, &mut on_line)
-        .map(|_| ())
-        .map_err(map_client_err)
+    // A daemon on its way out refuses new work, having promised to finish what
+    // it already took: wait, then send this to the one that replaces it.
+    let mut told = false;
+    shelbi_client::retry_through_drain(
+        shelbi_state::DAEMON_RESTART_WINDOW,
+        || {
+            shelbi_state::ensure_daemon_running().map_err(|e| anyhow!(e))?;
+            let sock = shelbi_state::control_socket_path().map_err(|e| anyhow!(e))?;
+            connect_with_retry(&sock)
+        },
+        |client| client.mutate(&req, &mut on_line).map(|_| ()).map_err(map_client_err),
+        |e| {
+            let refused = matches!(e.downcast_ref(), Some(MutationError::ShuttingDown));
+            if refused && !std::mem::replace(&mut told, true) {
+                eprintln!("shelbi: the hub daemon is restarting; waiting to send this to the next one...");
+            }
+            refused
+        },
+    )
 }
 
 /// Connect to the control socket, retrying briefly: `ensure_daemon_running`
@@ -79,5 +90,9 @@ fn connect_with_retry(sock: &std::path::Path) -> Result<shelbi_client::ControlCl
 /// failed carries its typed [`MutationError`](shelbi_proto::control::MutationError),
 /// whose `Display` is the operator-facing message.
 fn map_client_err(e: shelbi_client::ClientError) -> anyhow::Error {
-    anyhow!("{e}")
+    match e {
+        // Kept typed for the drain retry; its `Display` is the same message.
+        shelbi_client::ClientError::Mutation(e) => anyhow::Error::new(e),
+        e => anyhow!("{e}"),
+    }
 }

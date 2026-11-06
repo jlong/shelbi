@@ -719,7 +719,9 @@ impl IssueEdits {
                     ExecError::NotFound(_) => {
                         draft.failure = Some("the issue no longer exists".into());
                     }
-                    ExecError::Backend(message) => draft.failure = Some(message),
+                    ExecError::Backend(message) | ExecError::ShuttingDown(message) => {
+                        draft.failure = Some(message)
+                    }
                 }
             }
         }
