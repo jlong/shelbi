@@ -101,7 +101,9 @@ paths on every `cargo test`.
   more windows (File ▸ New Window, ⌘⇧N), each switching on its own; two may
   show one project and share its feed (`crate::feeds`), the first of them
   posting its notifications. A notification goes to a window already showing
-  its project, else switches the frontmost. Window frames persist per window
+  its project, which keeps it; else it switches the frontmost local window (a
+  remote window's notice opens only in that window). A switch closes the
+  dialogs open over the old project (New task, Connect, Contact Us). Window frames persist per window
   slot (`~/.shelbi/desktop-windows.json`), and a launch reopens the windows
   that were open, each on its last project (the first launch after the change
   migrates the old per-project frame to one window). Where a project was left
