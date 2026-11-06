@@ -23,12 +23,16 @@
 //! [`controls`] holds the Figma form components (segmented control,
 //! labeled control, textbox, picker, checkbox) every form composes.
 //!
+//! [`clocked_animation`] is gpui's one-shot animation on the executor's clock,
+//! for a motion a test has to stop at an exact point.
+//!
 //! [`spinner`] is the Figma Spinner: the progress ring a running step shows.
 //!
 //! [`placed`] places every dropdown and menu against its control: below or
 //! flipped above, capped to the window and scrolling, shifted inside it.
 
 pub mod clamped_text;
+pub mod clocked_animation;
 pub mod controls;
 pub mod exact_text;
 pub mod placed;

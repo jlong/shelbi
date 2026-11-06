@@ -2863,9 +2863,13 @@ mod tests {
         use crate::views::board_state::tests::issue;
         let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
         view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        // Its left edge at the window's right edge: all of it is out of sight.
         let first = bounds(&mut cx, "task-pane");
-        assert!(first.left() > px(512.0), "it starts to the right of its place: {first:?}");
-        std::thread::sleep(super::super::column_swap::SLIDE + Duration::from_millis(60));
+        assert_eq!(first.left(), px(1160.0), "it starts past the window's edge: {first:?}");
+        cx.executor().advance_clock(SLIDE / 2);
+        let mid = bounds(&mut cx, "task-pane");
+        assert!(mid.left() > px(512.0) && mid.left() < first.left(), "{mid:?} between {first:?} and its place");
+        cx.executor().advance_clock(SLIDE / 2);
         let settled = bounds(&mut cx, "task-pane");
         assert_eq!(settled.left(), px(512.0), "and lands 8pt in from the right");
         assert_eq!(settled.top(), first.top(), "sliding, not dropping");
@@ -2876,7 +2880,8 @@ mod tests {
         use crate::views::board_state::tests::issue;
         let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
         view.update(&mut cx, |v, cx| v.open_task("A", cx));
-        std::thread::sleep(SLIDE + Duration::from_millis(60));
+        assert!(drawn(&mut cx, "task-pane"));
+        cx.executor().advance_clock(SLIDE);
         let open = bounds(&mut cx, "task-pane");
 
         click(&mut cx, "pane-close");
@@ -2885,15 +2890,22 @@ mod tests {
         // Still drawn, starting back out from where it stood.
         let leaving = bounds(&mut cx, "task-pane-closing");
         assert!(!drawn(&mut cx, "task-pane"));
-        assert!(leaving.left() >= open.left() && leaving.left() < px(1160.0), "{leaving:?} from {open:?}");
+        assert_eq!(leaving.left(), open.left(), "{leaving:?} from {open:?}");
         assert_eq!(leaving.top(), open.top(), "sliding, not dropping");
-        // The slide ends past the window's right edge, the way it came in.
-        std::thread::sleep(SLIDE + Duration::from_millis(60));
+        // On its way.
+        cx.executor().advance_clock(SLIDE / 2);
+        let mid = bounds(&mut cx, "task-pane-closing");
+        assert!(mid.left() > open.left() && mid.left() < px(1160.0), "{mid:?} from {open:?}");
+        assert_eq!(mid.top(), open.top(), "sliding, not dropping");
+        // The slide ends past the window's right edge, the way it came in:
+        // a moment before it ends, it's all but there.
+        let moment = Duration::from_micros(100);
+        cx.executor().advance_clock(SLIDE / 2 - moment);
         let out = bounds(&mut cx, "task-pane-closing");
-        assert_eq!(out.left(), px(1160.0), "{out:?}");
+        assert!(out.left() > px(1156.0) && out.left() <= px(1160.0), "{out:?}");
 
         // Then it's gone: nothing of it is drawn, and it takes no clicks.
-        cx.executor().advance_clock(SLIDE);
+        cx.executor().advance_clock(moment);
         cx.run_until_parked();
         assert!(!drawn(&mut cx, "task-pane-closing"));
         assert!(!drawn(&mut cx, "pane-close"));
@@ -3102,7 +3114,7 @@ mod tests {
         });
         let first = bounds(&mut cx, "task-pane");
         assert!(first.left() > px(252.0), "it starts to the right of its place: {first:?}");
-        std::thread::sleep(super::super::column_swap::SLIDE + Duration::from_millis(60));
+        cx.executor().advance_clock(SLIDE);
         let settled = bounds(&mut cx, "task-pane");
         assert_eq!((settled.left(), settled.size.width), (px(252.0), px(900.0)));
     }
