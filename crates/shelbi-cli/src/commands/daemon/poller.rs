@@ -100,6 +100,12 @@ fn reconcile(running: &mut HashMap<String, WorkspacePoller>) {
     // sidebar) is dropped so the next tick retries, rather than cached as a
     // dead entry that would never poll.
     for project in &open {
+        // A quit cancelled this poller and the project reopened before a tick
+        // saw it closed, or while the quit was still running (a poller started
+        // then is cancelled from birth). Its loop is gone; replace it.
+        if running.get(project).is_some_and(WorkspacePoller::is_finished) {
+            running.remove(project);
+        }
         if running.contains_key(project) {
             continue;
         }
@@ -256,6 +262,40 @@ mod tests {
 
         std::env::remove_var("SHELBI_QUIT_BARRIER_MS");
         std::env::remove_var("SHELBI_POLL_SUBPROC_DEADLINE_MS");
+    }
+
+    #[test]
+    fn reconcile_replaces_a_poller_a_quit_cancelled_once_the_project_is_open_again() {
+        // A reopen inside the manager's tick: no reconcile ever saw the project
+        // closed, so the cancelled poller was still in `running`, and an open
+        // project would have gone unpolled until the daemon restarted.
+        let home = DaemonPollerHome::new("reopen");
+        home.open_project("alpha");
+        let mut running: HashMap<String, WorkspacePoller> = HashMap::new();
+        reconcile(&mut running);
+        // A cancelled supervisor notices at the top of its next 5s tick.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while shelbi_orchestrator::cancel::live_job_count("alpha") == 0 {
+            assert!(std::time::Instant::now() < deadline, "the poller never registered");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        // A quit that finished between ticks, the project already open again.
+        let phase = shelbi_orchestrator::cancel::begin_quit("alpha");
+        while !running["alpha"].is_finished() {
+            assert!(std::time::Instant::now() < deadline, "the poller ignored the quit");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        drop(phase);
+        while shelbi_orchestrator::cancel::live_job_count("alpha") > 0 {
+            assert!(std::time::Instant::now() < deadline, "the poller's jobs never drained");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        reconcile(&mut running);
+
+        assert!(!running["alpha"].is_finished(), "the open project gets a live poller");
+        drop(home);
     }
 
     #[test]

@@ -261,6 +261,14 @@ pub fn shell_session_name(project_name: &str, workspace: &str) -> String {
     format!("{project_name}/ws/{workspace}/{SHELL_ROLE}")
 }
 
+/// Whether the session `name` is a workspace's user shell
+/// ([`shell_session_name`]), and not an agent in a workspace called `shell`.
+pub(crate) fn is_user_shell_session(name: &str) -> bool {
+    name.rsplit_once("/ws/")
+        .and_then(|(_, rest)| rest.split_once('/'))
+        .is_some_and(|(_, role)| role == SHELL_ROLE)
+}
+
 /// What a user shell runs, and where: `(cwd, argv)`. A local shell starts in
 /// the worktree (the machine's `work_dir` when the worktree is gone, as after a
 /// handoff) as a login shell of the daemon's `$SHELL`. A remote one can't test
@@ -337,7 +345,7 @@ pub fn ensure_user_shell(project_name: &str, workspace: &str) -> Result<()> {
 
 /// SIGHUP: what a terminal sends its shell when it closes. An interactive
 /// shell ignores the session's default SIGTERM.
-const SIGHUP: i32 = 1;
+pub(crate) const SIGHUP: i32 = 1;
 
 /// End `workspace`'s user shell, on whichever machine it runs, as closing its
 /// terminal would (SIGHUP, which the shell passes on to its jobs). Idempotent
@@ -454,6 +462,16 @@ mod tests {
         let editor = content_session_name("myapp", "alpha", ReviewContentRole::Editor);
         assert_ne!(agent, editor);
         assert!(editor.starts_with(&format!("{agent}/")));
+    }
+
+    #[test]
+    fn only_a_shell_session_reads_as_a_user_shell() {
+        assert!(is_user_shell_session(&shell_session_name("myapp", "alpha")));
+        assert!(is_user_shell_session(&shell_session_name("myapp", "shell")));
+        assert!(!is_user_shell_session("myapp/ws/shell"), "an agent in a workspace called shell");
+        assert!(!is_user_shell_session("w-shell/ws/agent"));
+        assert!(!is_user_shell_session("myapp/ws/alpha/editor"));
+        assert!(!is_user_shell_session("myapp/orch"));
     }
 
     #[test]
