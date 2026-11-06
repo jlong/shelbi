@@ -1962,12 +1962,14 @@ fn poll_one(
     // it fell through because the probe couldn't be re-confirmed (a board blip or
     // a probe transport hiccup), which otherwise flap `serving -> awaiting_input`
     // and re-emit `review-ready` ~30s later. See [`fold_review_serving`].
-    let new_state = fold_review_serving(
-        new_state,
-        review_slot_has_loaded_marker(project, workspace, machine, &host),
-    );
+    let serving_task = review_slot_serving_task(project, workspace, machine, &host);
+    let new_state = fold_review_serving(new_state, serving_task.is_some());
 
-    let current_task = current_task_for(project, &workspace.name);
+    // A review card isn't an active one, so `current_task_for` can't name it.
+    // Held at `Serving`, the slot goes on naming the task it serves: that's what
+    // tells the next task's serving edge apart ([`record_review_serving`]).
+    let current_task = current_task_for(project, &workspace.name)
+        .or(serving_task.filter(|_| new_state == WorkspaceState::Serving));
     let outcome = decide(
         &workspace.name,
         current_task.clone(),
@@ -4589,7 +4591,7 @@ fn debounce_idle_edge(
 /// [`WorkspaceState::Serving`].
 ///
 /// A `review`-tagged slot the poller already confirmed serving (its
-/// `.shelbi/shelbi-review-loaded` marker is present — see
+/// `.shelbi/shelbi-review-loaded` marker names its task — see
 /// [`ensure_review_marker_and_serving_state`]) sits idle at its ready prompt
 /// between the human's questions. Claude's ready input box — and the
 /// suggested-prompt ghost text it draws under the ready summary (`❯ open it in
@@ -4619,30 +4621,45 @@ fn fold_review_serving(observed: WorkspaceState, confirmed_serving_review: bool)
     }
 }
 
-/// True when `workspace` is a `review`-tagged slot carrying a review-loaded
-/// marker — the durable, board-independent signal that the poller already
-/// confirmed this slot serving (written by
-/// [`ensure_review_marker_and_serving_state`], cleared only on teardown/reap in
-/// [`maybe_reap_orphaned_review_slot`]). Read straight off the marker rather than
-/// the board so the fold holds precisely on the ticks the flap happens — a board
-/// that can't be read warm ([`AssignedReviewTask::Unknown`]) is one of the two
-/// triggers, so resolving "is this slot serving" through the board would go blind
-/// on exactly those ticks.
-fn review_slot_has_loaded_marker(
+/// The task a `review`-tagged slot is confirmed serving: the one its review-loaded
+/// marker names ([`ensure_review_marker_and_serving_state`] writes it), provided
+/// that's the task on the slot now. A marker naming anything else is the last
+/// task's leftover: counting it would fold the new task's idle reading to
+/// `Serving`, so its real serving edge later would be no transition and its
+/// `review-ready` would never fire.
+fn review_slot_serving_task(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
     machine: &shelbi_core::Machine,
     host: &shelbi_core::Host,
-) -> bool {
+) -> Option<String> {
     if !project.effective_tags(workspace).contains("review") {
-        return false;
+        return None;
     }
     let marker =
         crate::workspace::workspace_review_loaded_marker(machine, workspace);
-    matches!(
-        crate::workspace::read_review_loaded_marker(host, &marker),
-        Ok(Some(_))
-    )
+    let marked = crate::workspace::read_review_loaded_marker(host, &marker).ok().flatten()?;
+    (slot_current_review_task(project, &workspace.name).as_deref() == Some(marked.as_str()))
+        .then_some(marked)
+}
+
+/// The review task on `workspace_name` as best this tick can tell, for holding a
+/// state rather than for anything destructive (that's
+/// [`assigned_review_task_for`]). The fold exists for the ticks a board can't be
+/// read warm, so this can't go blind on them: a stale board is served as is, with
+/// ownership from the overlay, and with no board at all (a cold index) the slot's
+/// last committed serving task stands.
+fn slot_current_review_task(project: &Project, workspace_name: &str) -> Option<String> {
+    match shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker) {
+        Ok(shelbi_state::BoardState::Warm(board) | shelbi_state::BoardState::Stale(board)) => {
+            review_task_on_board(project, board, workspace_name)
+        }
+        Ok(shelbi_state::BoardState::Cold) | Err(_) => load_workspace_status(workspace_name)
+            .ok()
+            .flatten()
+            .filter(|status| status.state == WorkspaceState::Serving)
+            .and_then(|status| status.current_task),
+    }
 }
 
 /// Auto-restart supervision for one workspace's agent pane, run every poll
@@ -5512,6 +5529,18 @@ fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Assigned
     let Some(board) = warm_board(project) else {
         return AssignedReviewTask::Unknown;
     };
+    match review_task_on_board(project, board, workspace_name) {
+        Some(task_id) => AssignedReviewTask::Assigned(task_id),
+        Option::None => AssignedReviewTask::None,
+    }
+}
+
+/// The review-column task on `board` pinned to `workspace_name`.
+fn review_task_on_board(
+    project: &Project,
+    board: Vec<shelbi_state::IssueFile>,
+    workspace_name: &str,
+) -> Option<String> {
     // Resolve ownership through the local assignment overlay for a remote
     // backend, NOT the `assigned_to` the index carries. On a remote (GitHub)
     // board, assignment lives in the daemon's overlay marker files, never on the
@@ -5539,13 +5568,10 @@ fn assigned_review_task_for(project: &Project, workspace_name: &str) -> Assigned
         };
         owner == Some(workspace_name)
     };
-    match board
+    board
         .into_iter()
         .find(|tf| tf.task.column == Column::review() && owner_is_slot(tf))
-    {
-        Some(tf) => AssignedReviewTask::Assigned(tf.task.id),
-        Option::None => AssignedReviewTask::None,
-    }
+        .map(|tf| tf.task.id)
 }
 
 /// The active-category (dev) task assignment of a slot, carrying board freshness
@@ -6084,6 +6110,10 @@ fn ensure_review_marker_and_serving_state(
 /// "nothing for the pending-load state, fires once when ready" contract: a slot
 /// still booting never reaches here (its probe hasn't passed), and a slot that
 /// stays serving across ticks doesn't re-emit.
+///
+/// The edge is per task. A slot still reading `Serving` from its last task, in
+/// the status file or only in `last_known` (the status was cleared by a teardown
+/// this loop didn't see), hasn't served this one yet.
 fn record_review_serving(
     project: &Project,
     workspace: &shelbi_core::WorkspaceSpec,
@@ -6091,7 +6121,14 @@ fn record_review_serving(
     url: Option<&str>,
     last_known: &mut Option<WorkspaceState>,
 ) {
-    let prior = load_prior(&workspace.name, last_known);
+    let serving_another = match load_workspace_status(&workspace.name) {
+        Ok(status) => status.and_then(|s| s.current_task).as_deref() != Some(task_id),
+        // An unreadable status proves nothing, and treating it as an edge would
+        // emit on every tick it stays unreadable.
+        Err(_) => false,
+    };
+    let prior = load_prior(&workspace.name, last_known)
+        .filter(|p| !(p.state == WorkspaceState::Serving && serving_another));
     let outcome = decide(
         &workspace.name,
         Some(task_id.to_string()),
@@ -6185,8 +6222,8 @@ fn emit_review_ready(
 /// Reap a review slot whose task is resolved — no review-column task points at
 /// it, the state a review → done accept (or a bounce / hand move / eviction)
 /// leaves behind. Clears any lingering `.shelbi/shelbi-review-loaded` marker (so
-/// the sidebar drops the phantom **Ready for Review** row) and, on a live
-/// non-user-shell pane, kills it (stopping the server it parented) and drops the
+/// the sidebar drops the phantom **Ready for Review** row), ends its editor and
+/// diff sessions and, on a live non-user-shell pane, kills it (stopping the server it parented) and drops the
 /// slot's stale `status.yaml` so it returns to a clean idle. Returns `true` when
 /// it took authoritative action (killed the pane, or cleared a marker) so the
 /// caller skips the rest of the tick.
@@ -6231,6 +6268,9 @@ fn maybe_reap_orphaned_review_slot(
             tracing::warn!(workspace = %workspace.name, error = %e, "clear_review_loaded_marker failed");
         }
     }
+    // Its editor and diff sessions go whatever the pane's doing: the next task
+    // loaded here must not find them, and a client that went away never asks.
+    crate::review_session::kill_content_sessions(&project.name, &workspace.name);
     // Kill only a live, non-user-shell pane — the same guard the dev orphan
     // path uses so a user shell opened on the idle slot is never reaped. On a
     // dead / unreachable / user-shell verdict there's nothing to reap: report
@@ -8468,6 +8508,320 @@ Auto mode works better when it knows your environment. Takes about a minute.
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // -- review-loaded marker: it only counts for the slot's current task ----
+
+    /// A file-system project whose only workspace is a review slot, in a fresh
+    /// `SHELBI_HOME`. Restores the env when dropped.
+    struct ReviewSlotHome {
+        home: std::path::PathBuf,
+        prior: Option<std::ffi::OsString>,
+    }
+
+    impl ReviewSlotHome {
+        fn new() -> Self {
+            Self::at(review_serving_home())
+        }
+
+        fn at(home: std::path::PathBuf) -> Self {
+            let prior = std::env::var_os("SHELBI_HOME");
+            std::env::set_var("SHELBI_HOME", &home);
+            Self { home, prior }
+        }
+
+        fn project(&self) -> Project {
+            let work_dir = self.home.join("repo");
+            std::fs::create_dir_all(&work_dir).unwrap();
+            let mut project = local_project(&work_dir);
+            project.name = "demo".into();
+            project.workspaces[0].tags = vec!["review".into()];
+            project.workspaces[0].slot = Some(4310);
+            shelbi_state::save_project(&project).unwrap();
+            project
+        }
+    }
+
+    impl Drop for ReviewSlotHome {
+        fn drop(&mut self) {
+            match self.prior.take() {
+                Some(h) => std::env::set_var("SHELBI_HOME", h),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn save_review_task(project: &Project, id: &str, column: Column) {
+        let mut task = in_progress_task(id, "alpha");
+        task.column = column;
+        shelbi_state::save_task(&project.name, &task, "body").unwrap();
+    }
+
+    fn plant_review_marker(project: &Project, body: &str) -> std::path::PathBuf {
+        let marker = crate::workspace::workspace_review_loaded_marker(
+            &project.machines[0],
+            &project.workspaces[0],
+        );
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, body).unwrap();
+        marker
+    }
+
+    fn serving_task(project: &Project) -> Option<String> {
+        review_slot_serving_task(
+            project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+        )
+    }
+
+    fn review_ready_tasks() -> Vec<String> {
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default();
+        log.lines()
+            .filter(|l| l.contains(" review-ready "))
+            .filter_map(|l| l.split_whitespace().find_map(|f| f.strip_prefix("task=")))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_review_marker_counts_only_when_it_names_the_slots_task() {
+        let _g = crate::test_lock::acquire();
+        let home = ReviewSlotHome::new();
+        let project = home.project();
+        save_review_task(&project, "task-a", Column::done());
+        save_review_task(&project, "task-b", Column::review());
+
+        // No marker: nothing is confirmed.
+        assert_eq!(serving_task(&project), None);
+
+        // The last task's leftover, on a slot now holding the next one.
+        plant_review_marker(&project, "task-a http://localhost:4310\n");
+        assert_eq!(serving_task(&project), None);
+
+        // The current task's own marker.
+        plant_review_marker(&project, "task-b http://localhost:4310\n");
+        assert_eq!(serving_task(&project).as_deref(), Some("task-b"));
+
+        // The right name, but the task has since left the slot.
+        save_review_task(&project, "task-b", Column::done());
+        assert_eq!(serving_task(&project), None);
+    }
+
+    #[test]
+    fn the_review_marker_check_holds_on_a_stale_board() {
+        // The fold exists for ticks like this one, when the board can't be read
+        // warm: going by the warm read would flap serving -> awaiting_input.
+        let _g = crate::test_lock::acquire();
+        let gh_home = gh_guard_home("marker-stale");
+        let prior = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &gh_home);
+        let work_dir = gh_home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let name = "ghguard-marker-stale";
+        let project = gh_review_project(&work_dir, name);
+        seed_stale_index(name);
+        shelbi_state::set_task_assignment(name, "t", Some("alpha")).unwrap();
+
+        plant_review_marker(&project, "t\n");
+        assert!(matches!(
+            assigned_review_task_for(&project, "alpha"),
+            AssignedReviewTask::Unknown
+        ));
+        assert_eq!(serving_task(&project).as_deref(), Some("t"));
+        plant_review_marker(&project, "other\n");
+        assert_eq!(serving_task(&project), None);
+
+        match prior {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&gh_home);
+    }
+
+    #[test]
+    fn with_no_board_a_review_marker_counts_for_the_task_status_says_is_serving() {
+        let _g = crate::test_lock::acquire();
+        let gh_home = gh_guard_home("marker-cold");
+        let prior = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &gh_home);
+        let work_dir = gh_home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        // No index published: the board is cold.
+        let project = gh_review_project(&work_dir, "ghguard-marker-cold");
+        plant_review_marker(&project, "t\n");
+
+        // Nothing committed: nothing to hold.
+        assert_eq!(serving_task(&project), None);
+
+        let status = |state, task: &str| WorkspaceStatus {
+            workspace: "alpha".into(),
+            current_task: Some(task.into()),
+            state,
+            last_transition: Utc::now(),
+            last_seen: Utc::now(),
+        };
+        save_workspace_status(&status(WorkspaceState::Serving, "t")).unwrap();
+        assert_eq!(serving_task(&project).as_deref(), Some("t"));
+
+        // Serving something else, or not serving: the marker doesn't count.
+        save_workspace_status(&status(WorkspaceState::Serving, "other")).unwrap();
+        assert_eq!(serving_task(&project), None);
+        save_workspace_status(&status(WorkspaceState::AwaitingInput, "t")).unwrap();
+        assert_eq!(serving_task(&project), None);
+
+        match prior {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&gh_home);
+    }
+
+    #[test]
+    fn the_next_tasks_review_ready_fires_over_a_leftover_marker() {
+        let _g = crate::test_lock::acquire();
+        let home = ReviewSlotHome::new();
+        let project = home.project();
+        let ws = project.workspaces[0].clone();
+        save_review_task(&project, "task-a", Column::review());
+        let marker = crate::workspace::workspace_review_loaded_marker(&project.machines[0], &ws);
+
+        // Task A reaches serving and leaves its marker behind when it's approved.
+        let mut last_known = None;
+        ensure_review_marker_and_serving_state(
+            &project, &ws, &Host::Local, &marker, "task-a", None, &mut last_known,
+        );
+        assert_eq!(review_ready_tasks(), ["task-a"]);
+        save_review_task(&project, "task-a", Column::done());
+        save_review_task(&project, "task-b", Column::review());
+
+        // B sitting idle at its prompt isn't serving yet: A's marker must not
+        // fold it, or B's real edge below would be no transition at all.
+        let folded = fold_review_serving(
+            WorkspaceState::AwaitingInput,
+            serving_task(&project).is_some(),
+        );
+        assert_eq!(folded, WorkspaceState::AwaitingInput);
+
+        // A review with nothing to probe goes straight to serving on its first
+        // tick, still reading A's `Serving`. That's B's edge all the same.
+        ensure_review_marker_and_serving_state(
+            &project, &ws, &Host::Local, &marker, "task-b", None, &mut last_known,
+        );
+        assert_eq!(review_ready_tasks(), ["task-a", "task-b"]);
+        assert_eq!(
+            crate::workspace::read_review_loaded_marker(&Host::Local, &marker).unwrap().as_deref(),
+            Some("task-b"),
+        );
+        let status = load_workspace_status(&ws.name).unwrap().unwrap();
+        assert_eq!(status.current_task.as_deref(), Some("task-b"));
+
+        // Only the edge fires: B staying serving is silent.
+        ensure_review_marker_and_serving_state(
+            &project, &ws, &Host::Local, &marker, "task-b", None, &mut last_known,
+        );
+        assert_eq!(review_ready_tasks(), ["task-a", "task-b"]);
+    }
+
+    #[test]
+    fn review_ready_fires_when_a_teardown_cleared_the_status_under_last_known() {
+        // A close clears status.yaml from another thread, leaving this loop's
+        // `last_known` at the last task's `Serving`.
+        let _g = crate::test_lock::acquire();
+        let home = ReviewSlotHome::new();
+        let project = home.project();
+        let ws = project.workspaces[0].clone();
+        let mut last_known = None;
+        record_review_serving(&project, &ws, "task-a", None, &mut last_known);
+        shelbi_state::clear_workspace_status(&ws.name).unwrap();
+        assert_eq!(last_known, Some(WorkspaceState::Serving));
+
+        record_review_serving(&project, &ws, "task-b", None, &mut last_known);
+        assert_eq!(review_ready_tasks(), ["task-a", "task-b"]);
+    }
+
+    /// Stand in for the live session `name` under the current `SHELBI_HOME`:
+    /// answers the hello and reports each kill it's sent.
+    fn stand_in_session(
+        id: &str,
+        name: &str,
+    ) -> (
+        shelbi_session::lock::SessionLock,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        use std::io::{Read, Write};
+        let dir = shelbi_state::sessions_dir().unwrap().join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let meta = shelbi_session::Meta {
+            id: id.into(),
+            name: name.into(),
+            argv: vec!["cat".into()],
+            cwd: dir.clone(),
+            task: Some("task-a".into()),
+            launched_at: Utc::now().to_rfc3339(),
+            protocol_version: shelbi_proto::PROTOCOL_VERSION,
+            pid: 0,
+        };
+        std::fs::write(dir.join("meta.json"), meta.to_json().unwrap()).unwrap();
+        let lock = shelbi_session::lock::SessionLock::acquire(&dir.join("lock")).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(dir.join("sock")).unwrap();
+        let (killed, kills) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let hello = shelbi_proto::Frame::Hello(shelbi_proto::Hello {
+                protocol_version: shelbi_proto::PROTOCOL_VERSION,
+                colors: None,
+                capabilities: Vec::new(),
+            })
+            .encode()
+            .unwrap();
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let _ = stream.write_all(&hello);
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 256];
+                while let Ok(n @ 1..) = stream.read(&mut chunk) {
+                    buf.extend_from_slice(&chunk[..n]);
+                    while let Ok((frame, used)) = shelbi_proto::Frame::decode(&buf) {
+                        buf.drain(..used);
+                        if matches!(frame, shelbi_proto::Frame::Kill(_)) {
+                            let _ = killed.send(());
+                        }
+                    }
+                }
+            }
+        });
+        (lock, kills)
+    }
+
+    #[test]
+    fn reaping_a_review_slot_ends_its_content_sessions() {
+        // No marker and a dead pane: the state a client gone before the decision
+        // leaves, where nothing else would ever end the editor and diff.
+        let _g = crate::test_lock::acquire();
+        // A home short enough for the stand-ins' socket paths (SUN_LEN).
+        let home = ReviewSlotHome::at(
+            std::path::Path::new("/tmp").join(format!("shelbi-rap-{}", std::process::id())),
+        );
+        let project = home.project();
+        let ws = project.workspaces[0].clone();
+        let marker = crate::workspace::workspace_review_loaded_marker(&project.machines[0], &ws);
+        let (_editor_lock, editor_kills) = stand_in_session("rev-editor", "demo/review/alpha/editor");
+        let (_diff_lock, diff_kills) = stand_in_session("rev-diff", "demo/review/alpha/diff");
+        let (_other_lock, other_kills) = stand_in_session("rev-other", "demo/review/beta/diff");
+
+        let addr = SessionTarget::slot("shelbi-nonexistent-review-reap", "alpha");
+        maybe_reap_orphaned_review_slot(&project, &ws, &Host::Local, &addr, &marker);
+
+        let wait = std::time::Duration::from_secs(5);
+        assert!(editor_kills.recv_timeout(wait).is_ok(), "the editor session is ended");
+        assert!(diff_kills.recv_timeout(wait).is_ok(), "the diff session is ended");
+        assert!(
+            other_kills.try_recv().is_err(),
+            "another slot's session is none of this reap's business",
+        );
     }
 
     #[test]
