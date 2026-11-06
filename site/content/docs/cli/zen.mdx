@@ -101,7 +101,8 @@ Print backlog task ids that are *mechanically* eligible for Zen
 auto-promotion, one per line, in priority order. "Mechanical" means
 not blocked on dependencies, not opted out via task frontmatter, and
 no file overlap with anything currently in flight. It also skips tasks you
-demoted back to the backlog. On a GitHub board, it only considers backlog
+moved from `todo` back to `backlog` by hand, until you move them out of
+`backlog` again. On a GitHub board, it only considers backlog
 issues assigned to you, and lists nothing if your login can't be resolved.
 Ties in priority are broken by id. File overlap is a heuristic: a file path
 named in the task's body also appears in an in-progress task's body. The orchestrator's

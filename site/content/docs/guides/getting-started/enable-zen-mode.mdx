@@ -315,9 +315,9 @@ Three flavors of "stop", in increasing severity:
   completion on its current trajectory.
 - **Per issue**: set `zen: { enabled: false }` in the issue's
   frontmatter to keep Zen from auto-promoting it, without changing the
-  global mode. Moving a card back to `backlog` alone doesn't stop Zen
-  from re-promoting it later (only your own `todo → backlog` demotion
-  does).
+  global mode. Moving a card from `todo` back to `backlog` yourself also
+  stops Zen from promoting it, until you move it out of `backlog` again. A
+  card that reaches `backlog` any other way can still be promoted.
 
 ### Crash recovery
 

@@ -3315,7 +3315,9 @@ fn persist_move_step(
             MoveWarning::WorkflowFallback { .. } => {
                 tracing::warn!(task = %id, "{w}");
             }
-            MoveWarning::PostMergeCleanup { .. } => cleanup_error = Some(w.to_string()),
+            MoveWarning::PostMergeCleanup { .. } | MoveWarning::ZenDemotion { .. } => {
+                cleanup_error = Some(w.to_string());
+            }
         },
     )
     .map_err(|e| match e {
@@ -4539,6 +4541,64 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
             "line: {}",
             lines[0]
         );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Dragging a card from `todo` back to `backlog` on the board tells Zen to
+    /// leave it alone, and moving it back out lifts that.
+    #[test]
+    fn board_demotion_latches_zen_until_the_card_is_moved_back() {
+        let _g = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-tui-zen-demote-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        crate::test_support::provision_hub_repo_for_project(&home, "demo");
+
+        let now = chrono::Utc::now();
+        let task = shelbi_core::Issue {
+            id: "fix-login".into(),
+            title: "fix login".into(),
+            column: Column::todo(),
+            priority: 0,
+            assigned_to: None,
+            workflow: None,
+            branch: None,
+            pr: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            launch: None,
+            created_at: now,
+            updated_at: now,
+            params: std::collections::BTreeMap::new(),
+        };
+        shelbi_state::save_task("demo", &task, "").unwrap();
+
+        let mut app = KanbanApp::new("demo");
+        app.refresh();
+        app.selected_column = 1;
+        app.selected_row = 0;
+        app.move_card_left();
+        app.block_on_pending_moves();
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(
+            log.contains(" workflow=default todo -> backlog reason=user:tui "),
+            "log: {log}"
+        );
+        assert!(shelbi_state::zen_demoted_task_ids("demo").unwrap().contains("fix-login"));
+
+        app.move_card_right();
+        app.block_on_pending_moves();
+        assert!(shelbi_state::zen_demoted_task_ids("demo").unwrap().is_empty());
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
