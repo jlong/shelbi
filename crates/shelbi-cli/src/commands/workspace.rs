@@ -79,7 +79,7 @@ pub enum WorkspaceCmd {
         keep_task: bool,
     },
     /// Show observed workspace state from the hub-side poller. Reads
-    /// `~/.shelbi/workspaces/<name>/status.yaml` files, no tmux probing.
+    /// `~/.shelbi/projects/<project>/workspaces/<name>/status.yaml` files, no tmux probing.
     /// With NAME, prints a single row + the raw status.yaml.
     Status {
         /// Workspace to inspect. Omit to show every declared workspace.
@@ -543,7 +543,7 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
     } else {
         KillReason::Stop
     };
-    orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name, reason)
+    orch_workspace::kill_workspace_pane(project, &host, &addr, &workspace.name, reason)
         .map_err(|e| anyhow!(e))?;
     println!("✓ {name} pane stopped");
     Ok(())
@@ -585,9 +585,9 @@ fn status(project: &str, name: Option<&str>) -> Result<()> {
                     .join(", ")
             ));
         }
-        print_status_table(&[only.to_string()])?;
+        print_status_table(project, &[only.to_string()])?;
         println!();
-        let path = shelbi_state::workspace_status_path(only).map_err(|e| anyhow!(e))?;
+        let path = shelbi_state::workspace_status_path(project, only).map_err(|e| anyhow!(e))?;
         if path.exists() {
             let yaml = fs::read_to_string(&path)
                 .map_err(|e| anyhow!("reading {}: {e}", path.display()))?;
@@ -607,17 +607,17 @@ fn status(project: &str, name: Option<&str>) -> Result<()> {
         return Ok(());
     }
     let names: Vec<String> = p.workspaces.iter().map(|w| w.name.clone()).collect();
-    print_status_table(&names)
+    print_status_table(project, &names)
 }
 
-fn print_status_table(names: &[String]) -> Result<()> {
+fn print_status_table(project: &str, names: &[String]) -> Result<()> {
     let now = Utc::now();
     println!(
         "{:<12} {:<24} {:<14} {:<12} IN STATE",
         "WORKSPACE", "TASK", "STATE", "LAST SEEN"
     );
     for name in names {
-        match shelbi_state::load_workspace_status(name) {
+        match shelbi_state::load_workspace_status(project, name) {
             Ok(Some(s)) => println!(
                 "{:<12} {:<24} {:<14} {:<12} {}",
                 s.workspace,

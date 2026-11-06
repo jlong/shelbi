@@ -174,7 +174,7 @@ shelbi workspace status [NAME]
 ```
 
 Print observed workspace state from the hub-side poller. Reads
-`~/.shelbi/workspaces/<name>/status.yaml` files; no live session probing. Cheaper
+`~/.shelbi/projects/<project>/workspaces/<name>/status.yaml` files; no live session probing. Cheaper
 than `list` and safe to call repeatedly. With a `NAME`, prints a single row
 plus the raw status.yaml contents.
 

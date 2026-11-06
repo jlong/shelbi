@@ -83,6 +83,8 @@ pub fn apply_auto_heal(projects: &[String], report: &UpgradeReport) -> Vec<Appli
     if report.auto_heal_count() == 0 {
         return applied;
     }
+    // Not a config surface, so it has no inventory entry to dispatch on below.
+    heal_workspace_state(report, &mut applied);
     // Re-enumerate the live surfaces so each finding is matched to its entry
     // (for `format` / `lifecycle_owned` / the canonical path a sibling-rename
     // targets). The report alone doesn't carry those.
@@ -113,6 +115,62 @@ pub fn apply_auto_heal(projects: &[String], report: &UpgradeReport) -> Vec<Appli
         heal_surface(entry, &findings, &mut applied);
     }
     applied
+}
+
+/// Move each hub-global workspace state directory a report names to wherever
+/// [`shelbi_state::migrate_legacy_workspace_state_dir`] attributes it, judging
+/// ownership against every registered project rather than the pass's selection
+/// (a slot two projects declare must not read as uniquely owned because only one
+/// of them was selected).
+fn heal_workspace_state(report: &UpgradeReport, applied: &mut Vec<AppliedChange>) {
+    let dirs: Vec<&UpgradeFinding> = report
+        .findings
+        .iter()
+        .filter(|f| {
+            f.classification == Classification::AutoHeal
+                && f.code == super::config_upgrade::WORKSPACE_STATE_HUB_GLOBAL
+        })
+        .collect();
+    if dirs.is_empty() {
+        return;
+    }
+    let projects = match super::config_surfaces::discover_project_names() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("shelbi config-upgrade: could not enumerate projects for workspace state: {e}");
+            return;
+        }
+    };
+    for finding in dirs {
+        let disposition =
+            match shelbi_state::migrate_legacy_workspace_state_dir(&finding.file, &projects) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!(
+                        "shelbi config-upgrade: moving {} failed: {e}",
+                        finding.file.display()
+                    );
+                    continue;
+                }
+            };
+        let (scope, target) = match disposition {
+            shelbi_state::LegacyStateDisposition::Project { project, target } => {
+                (format!("project:{project}"), target)
+            }
+            shelbi_state::LegacyStateDisposition::Retired { target } => {
+                ("global".to_string(), target)
+            }
+        };
+        let change = AppliedChange {
+            scope,
+            logical_id: finding.logical_id.clone(),
+            code: finding.code.clone(),
+            detail: format!("{}->{}", finding.file.display(), target.display()),
+            file: target,
+        };
+        disclose(&change);
+        applied.push(change);
+    }
 }
 
 /// Needs-judgment codes that have a deterministic resolution the user can

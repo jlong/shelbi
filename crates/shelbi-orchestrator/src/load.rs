@@ -1122,6 +1122,7 @@ fn release_supplanted_workspace(project: &Project, workspace_name: &str) {
         return;
     };
     if let Err(e) = crate::workspace::kill_workspace_pane(
+        &project.name,
         &host,
         &addr,
         workspace_name,

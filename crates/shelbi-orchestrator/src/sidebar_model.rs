@@ -228,7 +228,7 @@ fn load_workspaces(project: &str, in_progress: &[IssueFile]) -> anyhow::Result<V
                 .map(str::to_string)
                 .unwrap_or_else(|| DEFAULT_TASK_AGENT.to_string())
         });
-        let badge = derive_workspace_badge(&workspace.name, current_task.as_deref());
+        let badge = derive_workspace_badge(project, &workspace.name, current_task.as_deref());
         out.push(WorkspaceRow {
             name: workspace.name.clone(),
             machine: workspace.machine.clone(),
@@ -244,11 +244,15 @@ fn load_workspaces(project: &str, in_progress: &[IssueFile]) -> anyhow::Result<V
 /// Pick the badge for a workspace from the task-board signal + its on-disk
 /// `status.yaml`. Idle wins when there is no in-progress task, so a stale
 /// status file never shows "working" for an idle slot.
-fn derive_workspace_badge(workspace_name: &str, current_task: Option<&str>) -> WorkspaceBadge {
+fn derive_workspace_badge(
+    project: &str,
+    workspace_name: &str,
+    current_task: Option<&str>,
+) -> WorkspaceBadge {
     let Some(task_id) = current_task else {
         return WorkspaceBadge::Idle;
     };
-    match load_workspace_status(workspace_name).ok().flatten() {
+    match load_workspace_status(project, workspace_name).ok().flatten() {
         // A Blocked pane is hard-stuck on a human — surface the red ⚠ whether
         // or not the status names the currently-assigned task.
         Some(s) if s.state == WorkspaceState::Blocked => WorkspaceBadge::AwaitingPermission,

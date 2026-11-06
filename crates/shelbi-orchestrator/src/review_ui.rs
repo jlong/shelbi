@@ -518,6 +518,7 @@ pub fn close_review_window(project_name: &str, task_id: &str) -> Result<()> {
         tracing::warn!(workspace = %ws.name, error = %e, "clear_review_loaded_marker failed");
     }
     crate::workspace::kill_workspace_pane(
+        &project.name,
         &host,
         &addr,
         &ws.name,
@@ -527,7 +528,7 @@ pub fn close_review_window(project_name: &str, task_id: &str) -> Result<()> {
     // killed pane emits no further markers, so the poller can't refresh the file
     // — left in place it would report the review agent's last observed state
     // (frozen) rather than the empty slot it now is.
-    shelbi_state::clear_workspace_status(&ws.name)
+    shelbi_state::clear_workspace_status(&project.name, &ws.name)
 }
 
 /// **Reject**: append the reviewer's `reason` to the task body as a marked
@@ -943,7 +944,7 @@ mod tests {
         let pgid = child.id() as i32;
         let pgroup_alive = |pgid: i32| unsafe { libc::kill(-pgid, 0) == 0 };
 
-        let path = shelbi_state::review_serve_pgid_path("review-1").unwrap();
+        let path = shelbi_state::review_serve_pgid_path(&proj, "review-1").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{pgid}\n")).unwrap();
         assert!(pgroup_alive(pgid), "server group alive before close");
@@ -963,7 +964,7 @@ mod tests {
         }
         assert!(gone, "the dev-server process group must be gone (port freed)");
         assert!(
-            shelbi_state::read_review_serve_pgid("review-1")
+            shelbi_state::read_review_serve_pgid(&proj, "review-1")
                 .unwrap()
                 .is_none(),
             "the pgid record must be cleared after close"

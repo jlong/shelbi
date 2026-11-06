@@ -466,6 +466,7 @@ fn teardown_workspace_pane(
     let host = machine.host();
     let addr = crate::workspace::workspace_target(project_yaml, workspace)?;
     crate::workspace::kill_workspace_pane(
+        &project_yaml.name,
         &host,
         &addr,
         &workspace.name,
