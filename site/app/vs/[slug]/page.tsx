@@ -16,6 +16,12 @@ type ComparisonPageProps = {
   params: Promise<{ slug: string }>
 }
 
+// Every valid slug is known at build time. Without this, an unknown slug renders
+// on demand and `notFound()` makes browsers get Next's bare error shell, with no
+// theme boot script in <head>, so the 404 flashes unthemed until hydration.
+// Unknown slugs now get the prerendered app/not-found.tsx, same as any bad URL.
+export const dynamicParams = false
+
 export function generateStaticParams() {
   return visibleComparisons.map((comparison) => ({ slug: comparison.slug }))
 }
