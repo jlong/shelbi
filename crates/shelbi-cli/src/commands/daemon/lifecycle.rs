@@ -107,10 +107,11 @@ fn should_retire_units() -> bool {
     if std::env::var_os(NO_RETIRE_ENV).is_some() {
         return false;
     }
-    matches!(
-        shelbi_state::resolve_root(),
-        Ok((_, RootSource::CompileTime | RootSource::HomeFallback))
-    )
+    shelbi_state::resolve_root().is_ok_and(|(_, source)| source_may_retire(source))
+}
+
+fn source_may_retire(source: RootSource) -> bool {
+    matches!(source, RootSource::CompileTime | RootSource::HomeFallback)
 }
 
 /// The side-effecting operations [`retire_units_with`] performs, behind a seam
@@ -483,17 +484,15 @@ mod tests {
 
     #[test]
     fn gate_allows_default_installed_root() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let guard = EnvGuard::new(&["SHELBI_ROOT", "SHELBI_HOME", "SHELBI_NO_RETIRE_UNITS"]);
-        guard.remove("SHELBI_ROOT");
-        guard.remove("SHELBI_HOME");
-        guard.remove("SHELBI_NO_RETIRE_UNITS");
         // The default installed root (the compile-time install bake or the
         // ~/.shelbi fallback) is the one real upgrade path that should retire.
-        assert!(
-            should_retire_units(),
-            "the default installed root must allow the one-time retire"
-        );
+        // Asked of the source, not the resolver: a test resolving the default
+        // root is what the suite's home guard refuses.
+        assert!(source_may_retire(RootSource::CompileTime));
+        assert!(source_may_retire(RootSource::HomeFallback));
+        assert!(!source_may_retire(RootSource::CliFlag));
+        assert!(!source_may_retire(RootSource::EnvRoot));
+        assert!(!source_may_retire(RootSource::EnvHome));
     }
 
     // ---- regression: a temp-root daemon with the real $HOME is hermetic ----

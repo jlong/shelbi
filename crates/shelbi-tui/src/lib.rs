@@ -36,6 +36,35 @@ pub(crate) mod test_support {
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
+    /// Every thread in this binary falls back to one throwaway home, mounted
+    /// before main because a resolve runs from the first test on. The shell's
+    /// fixtures start the same background jobs a real shell does (startup,
+    /// settings reads, session relaunches), and those outlive the test that
+    /// started them. A test about specific state still mounts its own under
+    /// [`ENV_LOCK`].
+    #[used]
+    #[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
+    #[cfg_attr(target_os = "linux", link_section = ".init_array")]
+    static MOUNT_SHARED_HOME: extern "C" fn() = {
+        extern "C" fn mount() {
+            shelbi_state::mount_shared_test_home();
+        }
+        mount
+    };
+
+    #[test]
+    fn a_test_with_no_home_of_its_own_gets_the_binarys() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let saved = std::env::var_os("SHELBI_HOME");
+        std::env::remove_var("SHELBI_HOME");
+        let root = shelbi_state::root();
+        if let Some(saved) = saved {
+            std::env::set_var("SHELBI_HOME", saved);
+        }
+        let expected = format!("shelbi-test-home-{}", std::process::id());
+        assert!(root.unwrap().ends_with(expected));
+    }
+
     /// Serializes any test that mutates the process-global `SHELBI_HOME`
     /// env var. Tests across modules share one binary (and thus one env),
     /// so they must all lock the *same* mutex or they race each other.

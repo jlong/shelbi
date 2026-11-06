@@ -16,7 +16,7 @@
 //! can type `~/work/.shelbi` in any of (1)/(2)/(3) and have it land in the
 //! right place. Anything past the first segment is left alone.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use shelbi_core::{Error, Result};
@@ -70,33 +70,173 @@ pub fn set_root_override(path: PathBuf) {
 /// it. Errors only when *every* step fails — concretely, when the home
 /// directory can't be located and no other source was set.
 pub fn resolve() -> Result<(PathBuf, RootSource)> {
-    #[cfg(test)]
-    assert_test_home_is_isolated();
-    resolve_with(ROOT_OVERRIDE.get().cloned(), COMPILE_TIME_DEFAULT)
+    let resolved = resolve_with(ROOT_OVERRIDE.get().cloned(), COMPILE_TIME_DEFAULT)?;
+    if in_test_binary() {
+        return Ok(isolate_test_home(resolved, SHARED_TEST_HOME.get()));
+    }
+    Ok(resolved)
+}
+
+/// A test binary's own home, for when no test has mounted one
+/// ([`mount_shared_test_home`]).
+static SHARED_TEST_HOME: OnceLock<PathBuf> = OnceLock::new();
+
+/// Give this test binary one throwaway home that every thread falls back to,
+/// removed when the process exits. A no-op outside a test binary.
+///
+/// For a binary whose fixtures reach the home from background threads that
+/// outlive any one test, so a per-test home can't cover them: the two UI clients
+/// start the same jobs a real window does. Call it before main, from a load-time
+/// constructor: a later call would leave earlier resolves to the guard, in an
+/// order that changes from run to run. Every other binary gets no such fallback,
+/// and a test with no home of its own fails.
+pub fn mount_shared_test_home() {
+    extern "C" fn remove() {
+        if let Some(home) = SHARED_TEST_HOME.get() {
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
+    if in_test_binary() {
+        let home = std::env::temp_dir().join(format!("shelbi-test-home-{}", std::process::id()));
+        let _ = SHARED_TEST_HOME.set(home);
+        // SAFETY: registers a plain function that captures nothing.
+        unsafe { libc::atexit(remove) };
+    }
 }
 
 /// Suite-wide guard against a test resolving the developer's **live** hub home.
 ///
-/// A test that reaches [`resolve`] with no explicit root — no `--root`
-/// override, no `$SHELBI_ROOT`, no `$SHELBI_HOME` — would fall through to the
-/// `~/.shelbi` fallback and read/write the real hub state. That is exactly the
-/// leak this guard closes: it scribbled a fixture `projects/test-project/
-/// board-index.json` into a developer's `~/.shelbi` during `cargo test`. Every
-/// state test must mount a throwaway home first (the crate's `fresh_home()`
-/// helpers do this); the guard turns a silent leak into an immediate,
-/// self-describing panic.
+/// A test that reaches [`resolve`] with no explicit root, or with one naming the
+/// live home, would read and write the real hub state, or find the live
+/// daemon's sockets under it and have that daemon write for it. That is how
+/// fixture projects (`demo`, `proj`, `beta`, `test-project`) landed in a
+/// developer's `~/.shelbi/projects`. Every test mounts a throwaway home first;
+/// the guard turns a silent leak into an immediate, self-describing panic.
 ///
-/// Compiled only under `cfg(test)`, so it governs this crate's own test binary
-/// (where the leaking `github_store` fixtures live) and never the shipped
-/// resolution path. To exercise the fallback *logic* without tripping the
-/// guard, call the pure [`resolve_with`] directly.
-#[cfg(test)]
-fn assert_test_home_is_isolated() {
-    let has_override = ROOT_OVERRIDE.get().is_some();
-    let env_set = |k: &str| std::env::var(k).map(|v| !v.is_empty()).unwrap_or(false);
-    if !has_override && !env_set("SHELBI_ROOT") && !env_set("SHELBI_HOME") {
-        panic!("tests must set SHELBI_HOME (use fresh_home())");
+/// It runs in every crate's test binaries ([`in_test_binary`]), not only this
+/// crate's, and never in a shipped binary. To exercise the fallback *logic*
+/// without tripping the guard, call the pure [`resolve_with`] directly.
+fn isolate_test_home(
+    resolved: (PathBuf, RootSource),
+    shared: Option<&PathBuf>,
+) -> (PathBuf, RootSource) {
+    let (path, source) = resolved;
+    if is_live_home(&path) && !fell_through(source) {
+        panic!(
+            "tests must set SHELBI_HOME to a throwaway directory: the {} names the live hub home {}",
+            source.describe(),
+            path.display(),
+        );
     }
+    if !fell_through(source) {
+        return (path, source);
+    }
+    match shared {
+        Some(home) => (home.clone(), RootSource::EnvHome),
+        None => panic!(
+            "tests must set SHELBI_HOME to a throwaway directory (use fresh_home()): \
+             this test resolved the live hub home {} from the {}",
+            path.display(),
+            source.describe(),
+        ),
+    }
+}
+
+/// Nothing named a root, so the resolver landed on the machine's default.
+fn fell_through(source: RootSource) -> bool {
+    matches!(source, RootSource::CompileTime | RootSource::HomeFallback)
+}
+
+/// Whether this process is a `cargo test` harness binary, in any crate.
+///
+/// `cfg(test)` can't answer this: it is per compilation, so it is off for this
+/// crate when another crate's tests link it. The harness is recognised by where
+/// cargo puts it instead ([`is_cargo_test_binary_path`]). Compiled out of
+/// release builds, so nothing a user runs can ever take the test paths.
+#[cfg(debug_assertions)]
+pub(crate) fn in_test_binary() -> bool {
+    static IN_TEST_BINARY: OnceLock<bool> = OnceLock::new();
+    *IN_TEST_BINARY.get_or_init(|| {
+        cfg!(test)
+            || std::env::current_exe()
+                .map(|exe| is_cargo_test_binary_path(&exe))
+                .unwrap_or(false)
+    })
+}
+
+#[cfg(not(debug_assertions))]
+pub(crate) fn in_test_binary() -> bool {
+    false
+}
+
+/// `<target>/<profile>/deps/<name>-<16 hex digits>`, where cargo builds a test
+/// harness. A plain `cargo build` or `cargo run` binary runs from
+/// `<target>/<profile>/<name>`, so it never matches.
+#[cfg_attr(not(debug_assertions), allow(dead_code))]
+fn is_cargo_test_binary_path(exe: &Path) -> bool {
+    let in_deps = exe.parent().and_then(Path::file_name).is_some_and(|dir| dir == "deps");
+    let hashed = exe
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.rsplit_once('-'))
+        .is_some_and(|(_, hash)| hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()));
+    in_deps && hashed
+}
+
+/// The home a daemon on this machine uses when nothing overrides it.
+fn live_home() -> Option<PathBuf> {
+    resolve_live_home(COMPILE_TIME_DEFAULT)
+}
+
+fn resolve_live_home(compile_time: &str) -> Option<PathBuf> {
+    if !compile_time.is_empty() {
+        return Some(expand_tilde_str(compile_time));
+    }
+    dirs::home_dir().map(|home| home.join(".shelbi"))
+}
+
+/// `~/.shelbi` by the password database, which a test can't move. Several swap
+/// `$HOME` for a fixture's (so a spawned shell finds a stub `gh`), and the
+/// developer's live hub is still there while they do.
+fn account_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    // SAFETY: `getpwuid` returns null or a record valid until the next call on
+    // this thread; the path is copied out before anything else runs.
+    unsafe {
+        let record = libc::getpwuid(libc::getuid());
+        if record.is_null() || (*record).pw_dir.is_null() {
+            return None;
+        }
+        let dir = std::ffi::CStr::from_ptr((*record).pw_dir);
+        Some(Path::new(std::ffi::OsStr::from_bytes(dir.to_bytes())).join(".shelbi"))
+    }
+}
+
+fn is_live_home(path: &Path) -> bool {
+    [live_home(), account_home()]
+        .into_iter()
+        .flatten()
+        .any(|live| path == live || same_existing_path(path, &live))
+}
+
+/// `a` and `b` are the same existing directory, seen through any symlink.
+fn same_existing_path(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The socket path `var` overrides to, for [`crate::hub_socket_path`] and
+/// [`crate::control_socket_path`]. A worker pane exports the live hub's socket
+/// to its agents, so a `cargo test` run from one inherits it, and a test that
+/// mounted its own home would still send to the live daemon. In a test binary
+/// a socket beside the live home reads as unset: the test gets the socket in
+/// its own home.
+pub(crate) fn socket_override(var: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(std::env::var_os(var)?);
+    let live_socket = in_test_binary() && path.parent().is_some_and(is_live_home);
+    (!live_socket).then_some(path)
 }
 
 /// Pure-function form of [`resolve`] — the override + compile-time
@@ -386,30 +526,127 @@ mod tests {
     fn resolve_panics_when_no_home_is_set_under_test() {
         // The suite-wide guard: a test that reaches `resolve()` with no explicit
         // root would otherwise read/write the developer's live `~/.shelbi`.
-        // Under `cfg(test)` it must fail immediately with the fix instead — this
+        // In a test binary it must fail immediately with the fix instead — this
         // is exactly what keeps a fixture `test-project/` out of the real hub.
         //
-        // The panic is caught in-closure with `catch_unwind` (rather than
-        // `#[should_panic]`) so the lock guard unwinds normally and never
-        // poisons the shared `LOCK` for the rest of the suite. The panic hook is
-        // muted for the duration so the expected panic doesn't print a scary
-        // backtrace in an otherwise-green run.
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         clear_env();
-        let prev_hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let result = std::panic::catch_unwind(resolve);
-        std::panic::set_hook(prev_hook);
-        let err = result.expect_err("resolve() must panic when no home is set under test");
-        let msg = err
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| err.downcast_ref::<String>().cloned())
-            .unwrap_or_default();
+        let msg = resolve_panic_message();
         assert!(
             msg.contains("tests must set SHELBI_HOME"),
             "panic must name the fix, got: {msg:?}"
         );
+    }
+
+    /// What `resolve()` panics with under the guard, muted so the expected
+    /// panic doesn't print a backtrace. Caught in-closure so the lock unwinds
+    /// normally and never poisons the shared `LOCK`.
+    fn resolve_panic_message() -> String {
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let result = std::panic::catch_unwind(resolve);
+        std::panic::set_hook(prev_hook);
+        let err = result.expect_err("resolve() must panic under the guard");
+        err.downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| err.downcast_ref::<String>().cloned())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn resolve_panics_when_an_env_var_names_the_live_home() {
+        // A pane or shell that exports the live home must not satisfy the guard
+        // just because the variable is set.
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear_env();
+        let live = live_home().unwrap();
+        std::env::set_var("SHELBI_HOME", &live);
+        let msg = resolve_panic_message();
+        clear_env();
+        assert!(msg.contains("tests must set SHELBI_HOME"), "{msg:?}");
+        assert!(msg.contains(live.to_str().unwrap()), "panic must name the path: {msg:?}");
+    }
+
+    #[test]
+    fn the_live_home_stays_live_while_a_test_swaps_home() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        const VAR: &str = "SHELBI_ROOT_TEST_SWAPPED_HOME";
+        let account = account_home().unwrap();
+        let saved = std::env::var_os("HOME");
+        std::env::set_var("HOME", "/tmp/a-fixture-home");
+        std::env::set_var(VAR, account.join("hub.sock"));
+        let inherited = socket_override(VAR);
+        std::env::remove_var(VAR);
+        match saved {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+        assert_eq!(inherited, None, "the live hub's socket must not reach a test");
+    }
+
+    #[test]
+    fn a_shared_test_home_catches_a_fall_through_but_not_a_named_root() {
+        let shared = PathBuf::from("/tmp/shared-test-home");
+        let (path, source) = isolate_test_home(
+            (live_home().unwrap(), RootSource::HomeFallback),
+            Some(&shared),
+        );
+        assert_eq!(path, shared);
+        // Never a default source: `should_retire_units` reads that as a real install.
+        assert_eq!(source, RootSource::EnvHome);
+        let named = (PathBuf::from("/tmp/a-test-home"), RootSource::EnvHome);
+        assert_eq!(isolate_test_home(named.clone(), Some(&shared)), named);
+    }
+
+    #[test]
+    fn the_live_home_is_recognised_through_a_symlink() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = std::env::temp_dir().join(format!("shelbi-root-symlink-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let real = tmp.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(same_existing_path(&link, &real));
+        assert!(!same_existing_path(&link, &tmp));
+        assert!(!same_existing_path(&tmp.join("missing"), &tmp.join("missing")));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn the_compile_time_default_is_the_live_home_when_baked_in() {
+        assert_eq!(resolve_live_home("/opt/shelbi"), Some(PathBuf::from("/opt/shelbi")));
+        assert_eq!(resolve_live_home(""), dirs::home_dir().map(|h| h.join(".shelbi")));
+    }
+
+    #[test]
+    fn only_a_hashed_binary_under_deps_is_a_test_harness() {
+        let is = |p: &str| is_cargo_test_binary_path(Path::new(p));
+        // Every crate's unit and integration harness, in any target layout.
+        assert!(is("/w/target/debug/deps/shelbi_tui-0123456789abcdef"));
+        assert!(is("/w/target/debug/deps/shelbi-0123456789abcdef"));
+        assert!(is("/w/target/aarch64-apple-darwin/debug/deps/remote_sessions-fedcba9876543210"));
+        // What a user or `cargo run` runs.
+        assert!(!is("/w/target/debug/shelbi"));
+        assert!(!is("/opt/homebrew/bin/shelbi"));
+        assert!(!is("/Applications/Shelbi.app/Contents/MacOS/shelbi-desktop"));
+        // Near misses: a binary that merely lives in a dir called `deps`, or
+        // is hyphenated like a hash but isn't one.
+        assert!(!is("/w/deps/shelbi"));
+        assert!(!is("/w/deps/shelbi-desktop"));
+        assert!(!is("/w/target/debug/shelbi-0123456789abcdef"));
+    }
+
+    #[test]
+    fn a_socket_override_beside_the_live_home_reads_as_unset_under_test() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        const VAR: &str = "SHELBI_ROOT_TEST_SOCKET_OVERRIDE";
+        std::env::set_var(VAR, live_home().unwrap().join("hub.sock"));
+        assert_eq!(socket_override(VAR), None, "the live hub's socket must not reach a test");
+        std::env::set_var(VAR, "/tmp/sandbox/hub.sock");
+        assert_eq!(socket_override(VAR), Some(PathBuf::from("/tmp/sandbox/hub.sock")));
+        std::env::remove_var(VAR);
+        assert_eq!(socket_override(VAR), None);
     }
 
     #[test]

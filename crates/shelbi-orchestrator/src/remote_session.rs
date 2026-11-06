@@ -780,7 +780,7 @@ mod tests {
 
     #[test]
     fn only_a_users_attach_signs_in_and_background_operations_never_do() {
-        let _g = crate::test_lock::acquire();
+        let _g = crate::test_lock::isolated_home();
         let seam = sign_in_seam(false);
         set_test_seam(Some(seam.clone()));
         let host = Host::Ssh { host: "box".into() };

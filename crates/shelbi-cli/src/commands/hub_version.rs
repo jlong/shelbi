@@ -283,6 +283,10 @@ mod tests {
     #[test]
     fn mutation_gate_fails_fast_with_actionable_error_on_mismatch() {
         let _l = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        // The gate counts busy workspaces across the home's projects.
+        let home = tempfile::tempdir().unwrap();
+        let home_env = EnvGuard::new(&["SHELBI_HOME"]);
+        home_env.set("SHELBI_HOME", home.path());
         let sock = short_sock("gate");
         let _ = std::fs::remove_file(&sock);
         let listener = UnixListener::bind(&sock).unwrap();

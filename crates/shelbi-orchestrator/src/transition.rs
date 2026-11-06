@@ -1159,6 +1159,7 @@ transitions:
     /// real GitHub, mirroring the hub-side merge tests in `actions`.)
     #[test]
     fn gated_merge_pushes_unpushed_review_commit_before_merging() {
+        let _home = crate::test_lock::isolated_home();
         let (_tmp, local, project) = origin_clone_with_workspace();
         let wt = local.join(".shelbi").join("wt").join("alice");
 
@@ -1215,6 +1216,7 @@ transitions:
     /// of an origin-only branch end to end.)
     #[test]
     fn gated_merge_prefix_passes_when_branch_exists_only_on_origin() {
+        let _home = crate::test_lock::isolated_home();
         let (tmp, local, mut project) = origin_clone_with_workspace();
         let remote = tmp.path().join("origin.git");
 

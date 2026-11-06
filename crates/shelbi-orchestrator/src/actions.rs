@@ -2371,6 +2371,7 @@ mod tests {
 
     #[test]
     fn delete_branch_removes_remote_but_defers_local_when_review_slot_holds_it() {
+        let _home = crate::test_lock::isolated_home();
         // Accept path: the branch is merged, but the review slot still has it
         // checked out. `git branch -D` from the hub can't run (git refuses to
         // delete a branch checked out in a linked worktree), but the REMOTE
@@ -2407,6 +2408,7 @@ mod tests {
 
     #[test]
     fn delete_branch_not_present_when_branch_already_gone() {
+        let _home = crate::test_lock::isolated_home();
         // Use the origin-bearing fixture so `remote_branch_exists` has
         // a remote to probe; a hub repo without `origin` configured is
         // not a realistic shape for this primitive.
@@ -2524,6 +2526,7 @@ mod tests {
 
     #[test]
     fn push_branch_pushes_when_local_is_ahead_of_origin() {
+        let _home = crate::test_lock::isolated_home();
         // Local `feature` advanced past `origin/feature` (a normal commit the
         // worker made) — `push_branch` must actually push it.
         let (_tmp, _remote, local) = fixture_repo_with_origin();
@@ -2725,6 +2728,7 @@ mod tests {
 
     #[test]
     fn delete_branch_removes_local_and_remote() {
+        let _home = crate::test_lock::isolated_home();
         let (_tmp, _remote, local) = fixture_repo_with_origin();
 
         let mut runners = BTreeMap::new();

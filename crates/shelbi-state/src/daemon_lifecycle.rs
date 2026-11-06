@@ -177,6 +177,15 @@ pub fn ensure_daemon_running() -> Result<()> {
     let installed = LAUNCHER.read().unwrap_or_else(|p| p.into_inner()).clone();
     let launcher = match installed {
         Some(l) => l,
+        // `current_exe` is the test harness here, and `<harness> daemon` runs its
+        // tests whose names contain "daemon", detached, over and over.
+        None if crate::root::in_test_binary() => {
+            return if socket_answers() {
+                Ok(())
+            } else {
+                Err(Error::Other("a test binary can't start a daemon".into()))
+            };
+        }
         None => DaemonLauncher {
             exe: std::env::current_exe().map_err(Error::Io)?,
             env: None,
