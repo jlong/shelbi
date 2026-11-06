@@ -345,6 +345,35 @@ fn child_gets_scrubbed_login_environment_with_shelbi_term_vars() {
     sess.kill_and_join().unwrap();
 }
 
+/// An OSC interrupted by an ESC used to wedge the splitter and the responder
+/// together: the query never reached the responder, which would have ignored it
+/// anyway, so a program waiting on its cursor position hung.
+#[test]
+fn a_query_after_an_esc_interrupted_osc_is_answered() {
+    let _g = serial();
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("reply.bin");
+    let script = format!(
+        "stty raw -echo 2>/dev/null; printf '\\033]0;x\\033[31m\\033[6n'; /usr/bin/head -c 6 > {}; sleep 10",
+        out.display()
+    );
+    let mut sess = RunningSession::start(
+        "demo/ws/wedge",
+        dir.path(),
+        80,
+        24,
+        vec!["/bin/sh".into(), "-c".into(), script],
+    );
+
+    let reply = wait_for(SETTLE, || std::fs::read(&out).ok().filter(|b| b.len() >= 6));
+    sess.kill_and_join().unwrap();
+
+    assert_eq!(
+        reply.expect("the query after the interrupted OSC must be answered"),
+        b"\x1b[1;1R"
+    );
+}
+
 #[test]
 fn responder_answers_queries_with_no_client_attached() {
     let _g = serial();
