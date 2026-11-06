@@ -50,7 +50,7 @@ use shelbi_app::board::DropTarget;
 use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
 use shelbi_app::board::{BoardRead, ClosedPage};
 use shelbi_app::board_search::SearchWorker;
-use shelbi_app::source::ProjectHandle;
+use shelbi_app::source::{ProjectHandle, ProjectLink};
 use shelbi_app::state_write::{self, StateWrite};
 use shelbi_app::{
     CommandKind, ExecError, ExpectedState, IssueCard, IssueColumn, TaskDetailModel,
@@ -61,7 +61,7 @@ use shelbi_state::keymap::{DisplayStyle, KanbanAction, Keymaps};
 use super::board_list::{self, ColumnList, Item};
 use super::board_scroll::{self, BoardScroll};
 use super::board_state::{BoardState, Intent, Mode, MutationJob, Property, Scroll};
-use shelbi_app::issue_edit::{Field, SaveJob};
+use shelbi_app::issue_edit::{self, Field, SaveJob, SharedEdits};
 use super::doc_editor::layout::Field as DocField;
 use super::doc_editor::{DocEditor, DocEvent};
 use super::external_edit::{self, EditorEvent};
@@ -188,6 +188,25 @@ enum Done {
     Saved { id: String },
     More(Result<ClosedPage, String>),
     Persisted(Result<(), String>),
+}
+
+/// A mutation's worker: send `job`, record the answer in the project's draft
+/// store (so the issue's lane comes free even if the view is gone by then),
+/// and tell the view.
+fn run_mutation(
+    link: &ProjectLink,
+    project: &str,
+    job: MutationJob,
+    edits: &SharedEdits,
+    tx: &Sender<Done>,
+    deadline: Duration,
+) {
+    let result = match job.mutation(project) {
+        Some(m) => link.mutate_within(deadline, &m, job.expected.clone()),
+        None => Err(ExecError::Backend("not an issue mutation".into())),
+    };
+    BoardState::record_mutation(edits, &job, &result);
+    let _ = tx.send(Done::Mutation { id: job.id, result });
 }
 
 /// The open task's title and body editors.
@@ -904,13 +923,10 @@ impl IssuesView {
     fn spawn_mutation(&self, job: MutationJob) {
         let project = self.state.project.clone();
         let link = self.project.link.clone();
+        let edits = self.state.edits();
         let tx = self.done_tx.clone();
         std::thread::spawn(move || {
-            let result = match job.mutation(&project) {
-                Some(m) => link.mutate(&m, job.expected.clone(), &mut |_stream, _line| {}),
-                None => Err(ExecError::Backend("not an issue mutation".into())),
-            };
-            let _ = tx.send(Done::Mutation { id: job.id, result });
+            run_mutation(&link, &project, job, &edits, &tx, issue_edit::WRITE_DEADLINE);
         });
     }
 
@@ -931,7 +947,7 @@ impl IssuesView {
         let edits = self.state.edits();
         let tx = self.done_tx.clone();
         std::thread::spawn(move || {
-            let result = link.mutate(&job.mutation(&project), job.expected.clone(), &mut |_stream, _line| {});
+            let result = link.mutate_within(issue_edit::WRITE_DEADLINE, &job.mutation(&project), job.expected.clone());
             if let Err(e) = &result {
                 tracing::warn!("saving {}/{} failed: {e}", project, job.id);
             }
@@ -3425,5 +3441,87 @@ mod tests {
         let read = |title: &str| vec![("id-1", title.to_string()), ("id-2", "Other".to_string())];
         assert_eq!(fingerprint(&read("Title")), fingerprint(&read("Title")));
         assert_ne!(fingerprint(&read("Title")), fingerprint(&read("Retitled")));
+    }
+
+    /// A relay whose control service never answers (`hang`), or refuses at once.
+    struct ScriptedRelay {
+        hang: bool,
+    }
+
+    impl shelbi_app::source::remote::RelayLink for ScriptedRelay {
+        fn host(&self) -> &str {
+            "devbox"
+        }
+        fn is_reachable(&self) -> bool {
+            true
+        }
+        fn open_query(&self) -> Result<shelbi_client::QueryStream, shelbi_client::ClientError> {
+            Err(shelbi_client::ClientError::UnexpectedEof)
+        }
+        fn open_service(
+            &self,
+            _service: shelbi_proto::RelayService,
+        ) -> Result<shelbi_client::RelayStream, shelbi_client::ClientError> {
+            if self.hang {
+                loop {
+                    std::thread::park();
+                }
+            }
+            Err(shelbi_client::ClientError::UnexpectedEof)
+        }
+        fn list_sessions(&self) -> Result<Vec<shelbi_proto::RelaySession>, shelbi_client::ClientError> {
+            Ok(Vec::new())
+        }
+        fn open_session(&self, _short_id: &str) -> Result<shelbi_client::RelayStream, shelbi_client::ClientError> {
+            Err(shelbi_client::ClientError::UnexpectedEof)
+        }
+    }
+
+    /// A board with a move of `A` sent (its lane taken), and a link to send it on.
+    fn a_sent_move(hang: bool) -> (BoardState, MutationJob, ProjectLink) {
+        let keymaps = shelbi_state::keymap::validate_keymaps_yaml("{}", None).0;
+        let mut board = BoardState::with_edits("demo", keymaps, Default::default());
+        board.apply_open(super::super::board_state::tests::read(vec![
+            super::super::board_state::tests::issue("A", "todo"),
+        ]));
+        board.apply_closed(None);
+        let job = board
+            .begin_mutation(&CommandKind::MoveIssue { id: "A".into(), to_status: "review".into() })
+            .unwrap();
+        let link = ProjectLink::remote(
+            "demo",
+            std::sync::Arc::new(ScriptedRelay { hang }),
+            std::sync::Arc::new(shelbi_app::source::null::NullSessions),
+        );
+        (board, job, link)
+    }
+
+    #[test]
+    fn the_worker_frees_the_lane_with_the_views_receiver_gone() {
+        // A project switch dropped the view, and its receiver with it.
+        let (board, job, link) = a_sent_move(false);
+        let edits = board.edits();
+        let (tx, rx) = mpsc::channel();
+        drop(rx);
+        drop(board);
+        assert!(issue_edit::lock(&edits).busy("A"));
+        run_mutation(&link, "demo", job, &edits, &tx, Duration::from_secs(30));
+        assert!(!issue_edit::lock(&edits).busy("A"));
+    }
+
+    #[test]
+    fn a_mutation_with_no_reply_fails_after_the_deadline_and_unlocks_the_lane() {
+        let (mut board, job, link) = a_sent_move(true);
+        let edits = board.edits();
+        let (tx, rx) = mpsc::channel();
+        run_mutation(&link, "demo", job, &edits, &tx, Duration::from_millis(50));
+        assert!(!issue_edit::lock(&edits).busy("A"), "the lane is free");
+        let Ok(Done::Mutation { id, result }) = rx.try_recv() else {
+            panic!("the view is told");
+        };
+        assert!(matches!(result, Err(ExecError::NoAnswer)), "{result:?}");
+        board.finish_mutation(&id, result);
+        assert_eq!(board.notice("A"), Some("no answer from the daemon"));
+        assert!(board.pending("A").is_none());
     }
 }

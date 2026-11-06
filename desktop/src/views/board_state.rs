@@ -289,6 +289,9 @@ pub struct MutationJob {
     pub kind: CommandKind,
     /// The state the user was looking at. `None` only for `AddIssue`.
     pub expected: Option<ExpectedState>,
+    /// The issue's lane, held until the answer is recorded
+    /// ([`BoardState::record_mutation`]).
+    pub ticket: Option<issue_edit::WriteTicket>,
 }
 
 impl MutationJob {
@@ -369,8 +372,9 @@ pub struct BoardState {
     /// Mutations held for an issue's lane (a save is out, or goes first),
     /// in the order asked.
     held: BTreeMap<String, Vec<CommandKind>>,
-    /// The lane each in-flight mutation holds.
-    tickets: BTreeMap<String, issue_edit::WriteTicket>,
+    /// The mutations sent, for a test to answer ([`BoardState::answer`]).
+    #[cfg(test)]
+    sent: BTreeMap<String, MutationJob>,
     /// The card being dragged, while a drag is on.
     dragging: Option<String>,
     /// One line of feedback under the board.
@@ -415,7 +419,8 @@ impl BoardState {
             notices: BTreeMap::new(),
             edits,
             held: BTreeMap::new(),
-            tickets: BTreeMap::new(),
+            #[cfg(test)]
+            sent: BTreeMap::new(),
             dragging: None,
             status: None,
             generation: 0,
@@ -1673,13 +1678,21 @@ impl BoardState {
         }
     }
 
-    /// The saves due now, across the project's drafts.
+    /// The saves due now, across the project's drafts, and the changes held
+    /// for a lane that has come free. A lane can free up with no word to this
+    /// view: the write may belong to the view it replaced, or another window.
     pub fn poll_saves(&mut self, now: std::time::Instant) -> Vec<Intent> {
-        issue_edit::lock(&self.edits)
-            .poll(now)
-            .into_iter()
-            .map(Intent::Save)
-            .collect()
+        let saves = issue_edit::lock(&self.edits).poll(now);
+        let mut out: Vec<Intent> = saves.into_iter().map(Intent::Save).collect();
+        let ids: Vec<String> = self.held.keys().cloned().collect();
+        for id in ids {
+            // Not while this view's own write is unanswered: its answer is on
+            // the way, and a change sent before then is refused, not held.
+            if !self.change_in_progress(&id) {
+                out.extend(self.release_held(&id));
+            }
+        }
+        out
     }
 
     /// Flush every draft with unsaved work (the view is going away: a
@@ -1827,21 +1840,18 @@ impl BoardState {
                     },
                 );
                 self.status = Some(format!("adding “{title}”…"));
-                return Ok(MutationJob {
+                return Ok(self.sending(MutationJob {
                     id: ADD_KEY.to_string(),
                     kind: kind.clone(),
                     expected: None,
-                });
+                    ticket: None,
+                }));
             }
             _ => return Err(Vec::new()),
         };
         // A change the daemon hasn't answered yet blocks a second one; an
         // acked one whose landed state we know is followed on from that state.
-        if self
-            .pending
-            .get(&id)
-            .is_some_and(|p| !p.acked || p.landed.is_none())
-        {
+        if self.change_in_progress(&id) {
             self.status = Some(format!("{id}: a change is already in progress"));
             return Err(Vec::new());
         }
@@ -1903,9 +1913,7 @@ impl BoardState {
             None => (sent_from.clone(), to_status, to_slot),
         };
         self.notices.remove(&id);
-        if let Some(ticket) = issue_edit::lock(&self.edits).begin_write(&id, &sent_from) {
-            self.tickets.insert(id.clone(), ticket);
-        }
+        let ticket = issue_edit::lock(&self.edits).begin_write(&id, &sent_from);
         self.pending.insert(
             id.clone(),
             Pending {
@@ -1922,14 +1930,53 @@ impl BoardState {
             },
         );
         self.rebuild();
-        Ok(MutationJob {
+        Ok(self.sending(MutationJob {
             id,
             kind: kind.clone(),
             expected,
-        })
+            ticket,
+        }))
     }
 
-    /// The daemon answered `id`'s mutation. An ack leaves the card pending
+    /// A mutation about to go out. A test keeps it, to answer it later
+    /// ([`BoardState::answer`]).
+    fn sending(&mut self, job: MutationJob) -> MutationJob {
+        #[cfg(test)]
+        self.sent.insert(job.id.clone(), job.clone());
+        job
+    }
+
+    /// Answer a mutation sent earlier, as its worker does: record it, then
+    /// tell the view.
+    #[cfg(test)]
+    fn answer(&mut self, id: &str, result: Result<Option<ExpectedState>, ExecError>) -> Vec<Intent> {
+        let job = self.sent.remove(id).expect("a mutation of this issue was sent");
+        Self::record_mutation(&self.edits, &job, &result);
+        self.finish_mutation(id, result)
+    }
+
+    /// Whether `id` has a change this view must hear about before it can send
+    /// another.
+    fn change_in_progress(&self, id: &str) -> bool {
+        self.pending.get(id).is_some_and(|p| !p.acked || p.landed.is_none())
+    }
+
+    /// A mutation's answer, recorded off the UI thread like a save's
+    /// ([`BoardState::record_save`]): it frees the issue's lane in the shared
+    /// store even when the view that sent it is gone.
+    pub fn record_mutation(
+        edits: &SharedEdits,
+        job: &MutationJob,
+        result: &Result<Option<ExpectedState>, ExecError>,
+    ) {
+        if let Some(ticket) = &job.ticket {
+            let landed = result.as_ref().ok().cloned().flatten();
+            issue_edit::lock(edits).end_write(ticket, landed);
+        }
+    }
+
+    /// The daemon answered `id`'s mutation, and the worker has recorded it
+    /// ([`BoardState::record_mutation`]). An ack leaves the card pending
     /// until a read shows the change, holding the state the daemon says the
     /// change landed at, so the card's next mutation can be sent against it
     /// at once (the card shows in the landed status meanwhile). A refusal
@@ -1941,10 +1988,6 @@ impl BoardState {
         id: &str,
         result: Result<Option<ExpectedState>, ExecError>,
     ) -> Vec<Intent> {
-        if let Some(ticket) = self.tickets.remove(id) {
-            let landed = result.as_ref().ok().cloned().flatten();
-            issue_edit::lock(&self.edits).end_write(&ticket, landed);
-        }
         let released = self.release_held(id);
         match result {
             Ok(landed) => {
@@ -1974,6 +2017,7 @@ impl BoardState {
                     }
                     ExecError::NotFound(_) => "Not applied: the issue no longer exists".to_string(),
                     ExecError::Backend(msg) | ExecError::ShuttingDown(msg) => msg.clone(),
+                    ExecError::NoAnswer => e.to_string(),
                 };
                 if id == ADD_KEY {
                     self.status = Some(format!("add failed: {message}"));
@@ -2650,7 +2694,7 @@ pub(crate) mod tests {
         assert!(b.begin_mutation(&kind).is_err());
 
         // Meanwhile another client moved it to review; the daemon refuses.
-        let out = b.finish_mutation(
+        let out = b.answer(
             "A",
             Err(ExecError::Conflict(
                 "you saw `todo` rev 1, it is now `review` rev 2".into(),
@@ -2682,7 +2726,7 @@ pub(crate) mod tests {
             to_status: "in-progress".into(),
         };
         b.begin_mutation(&kind).unwrap();
-        b.finish_mutation("A", Ok(None));
+        b.answer("A", Ok(None));
         assert!(b.pending("A").unwrap().acked);
         // A read from before the daemon applied it: still pending.
         b.apply_open(read(vec![issue("A", "todo")]));
@@ -2725,7 +2769,7 @@ pub(crate) mod tests {
         assert!(b.begin_mutation(&start).is_err());
 
         // The assign lands at a new revision; no read has seen it yet.
-        b.finish_mutation("A", Ok(Some(at("todo", 5))));
+        b.answer("A", Ok(Some(at("todo", 5))));
         // Start goes at once, against the state the assign produced rather
         // than the read's (which the daemon would refuse as changed elsewhere).
         let job = b.begin_mutation(&start).unwrap();
@@ -2735,7 +2779,7 @@ pub(crate) mod tests {
         assert!(b.pending("A").is_some());
 
         // Start lands too; the card shows in its landed status before a read.
-        b.finish_mutation("A", Ok(Some(at("in-progress", 6))));
+        b.answer("A", Ok(Some(at("in-progress", 6))));
         assert_eq!(b.model().card("A").unwrap().status_id, "in-progress");
         // A read that shows only the assign still predates the start: the
         // card keeps the start's state for its next change.
@@ -2756,7 +2800,7 @@ pub(crate) mod tests {
         let mut b = board(vec![issue("A", "todo"), issue("B", "todo")]);
         b.begin_mutation(&CommandKind::StartIssue { id: "A".into() })
             .unwrap();
-        b.finish_mutation("A", Ok(Some(at("in-progress", 5))));
+        b.answer("A", Ok(Some(at("in-progress", 5))));
         // A's follow-up rides on the landed start...
         let job = b
             .begin_mutation(&CommandKind::AssignIssue {
@@ -2770,7 +2814,7 @@ pub(crate) mod tests {
             .begin_mutation(&CommandKind::StartIssue { id: "B".into() })
             .is_err());
         assert!(b.status.as_deref().unwrap().contains("waiting for the last change"));
-        b.finish_mutation("A", Ok(Some(at("in-progress", 6))));
+        b.answer("A", Ok(Some(at("in-progress", 6))));
         b.apply_open(read(vec![issue_at("A", "in-progress", 6), issue_at("B", "todo", 5)]));
         assert!(b.pending("A").is_none());
         let job = b
@@ -2789,7 +2833,7 @@ pub(crate) mod tests {
             workspace: "alpha".into(),
         };
         b.begin_mutation(&assign).unwrap();
-        b.finish_mutation("A", Ok(Some(at("todo", 5))));
+        b.answer("A", Ok(Some(at("todo", 5))));
 
         // Another client moved it after the assign: the daemon refuses the
         // start sent against the assign's landed state.
@@ -2797,7 +2841,7 @@ pub(crate) mod tests {
             .begin_mutation(&CommandKind::StartIssue { id: "A".into() })
             .unwrap();
         assert_eq!(job.expected, Some(at("todo", 5)));
-        let out = b.finish_mutation(
+        let out = b.answer(
             "A",
             Err(ExecError::Conflict(format!(
                 "you saw `todo` rev {}, it is now `review` rev {}",
@@ -2820,7 +2864,7 @@ pub(crate) mod tests {
             .begin_mutation(&CommandKind::StartIssue { id: "A".into() })
             .unwrap();
         assert_eq!(job.expected, Some(at("review", 7)));
-        b.finish_mutation("A", Ok(Some(at("in-progress", 8))));
+        b.answer("A", Ok(Some(at("in-progress", 8))));
 
         // The editor opened before the other client's change, but its draft
         // follows the reads (and is guarded by the text it replaces), so its
@@ -2922,7 +2966,7 @@ pub(crate) mod tests {
         let t0 = std::time::Instant::now();
         b.edit_text("A", Field::Body, "typed during the move", t0);
         assert!(saves_after_pause(&mut b, t0).is_empty(), "the save waits for the move");
-        assert_eq!(b.finish_mutation("A", Ok(Some(at("review", 4)))), vec![Intent::Refresh]);
+        assert_eq!(b.answer("A", Ok(Some(at("review", 4)))), vec![Intent::Refresh]);
         // The board's read lags: it still has the card in todo at rev 0.
         b.apply_open(read(vec![issue("A", "todo")]));
         let save = saves_after_pause(&mut b, t0).pop().unwrap();
@@ -3020,7 +3064,7 @@ pub(crate) mod tests {
     fn jobs_become_the_registrys_daemon_mutations() {
         let mut b = board(vec![issue("A", "todo")]);
         b.begin_mutation(&CommandKind::StartIssue { id: "A".into() }).unwrap();
-        b.finish_mutation("A", Err(ExecError::Backend("boom".into())));
+        b.answer("A", Err(ExecError::Backend("boom".into())));
         assert_eq!(b.notice("A"), Some("boom"));
         let job = b
             .begin_mutation(&CommandKind::MoveIssue {
@@ -3041,6 +3085,7 @@ pub(crate) mod tests {
             id: "x".into(),
             kind: CommandKind::ToggleZen,
             expected: None,
+            ticket: None,
         };
         assert_eq!(not_issue.mutation("demo"), None);
     }
@@ -3149,7 +3194,7 @@ pub(crate) mod tests {
         assert!(!b.begin_drag("R"), "a pending card can't be dragged again");
 
         // Accepted: stays pending (and in place) until a read shows it.
-        b.finish_mutation("R", Ok(None));
+        b.answer("R", Ok(None));
         b.apply_open(shipped_read(vec![issue("R", "review")]));
         assert_eq!(ids_in(&b, "done"), ["R"]);
         assert!(b.pending("R").is_some());
@@ -3169,7 +3214,7 @@ pub(crate) mod tests {
         b.begin_mutation(&kind).unwrap();
         assert_eq!(ids_in(&b, "done"), ["R"]);
         // The gated merge failed on the daemon.
-        b.finish_mutation(
+        b.answer(
             "R",
             Err(ExecError::Backend("merge failed: conflicts in src/lib.rs".into())),
         );
@@ -3216,7 +3261,7 @@ pub(crate) mod tests {
         let status = b.status.clone().unwrap();
         assert!(status.contains("waiting for the last change in TO DO"), "{status}");
 
-        b.finish_mutation("C", Ok(None));
+        b.answer("C", Ok(None));
         let mut after = vec![prio("C", "todo", 0), prio("A", "todo", 1), prio("B", "todo", 2)];
         for tf in &mut after {
             tf.task.updated_at += chrono::Duration::seconds(1);
@@ -3266,7 +3311,7 @@ pub(crate) mod tests {
         };
         b.begin_mutation(&kind).unwrap();
         assert_eq!(ids_in(&b, "todo"), ["B", "A"]);
-        b.finish_mutation(
+        b.answer(
             "B",
             Err(ExecError::Conflict("you saw `todo` rev 1, it is now `review` rev 2".into())),
         );
@@ -3465,7 +3510,7 @@ pub(crate) mod tests {
         // A second change while that one is unanswered is held off.
         assert!(b.property_refusal(Property::Status).is_some());
         // A refusal puts it back, with the daemon's reason on the task.
-        b.finish_mutation("A", Err(ExecError::Backend("workflow `subtask` does not exist".into())));
+        b.answer("A", Err(ExecError::Backend("workflow `subtask` does not exist".into())));
         assert_eq!(b.pane_properties("A").unwrap().workflow_name, "default");
         assert!(b.notice("A").unwrap().contains("does not exist"));
 
@@ -3505,5 +3550,90 @@ pub(crate) mod tests {
         let actions = b.pane_actions();
         let ix = actions.iter().position(|a| *a == PaneAction::CopyBranch).unwrap();
         assert_eq!(b.choose_pane_action(ix), vec![Intent::Copy("jlong/a".into())]);
+    }
+
+    /// The window comes back to a project whose last view is gone: a new
+    /// board over the project's one draft store, with the same read.
+    fn board_again(b: &BoardState, tasks: Vec<IssueFile>) -> BoardState {
+        let mut again = BoardState::with_edits("demo", default_keymaps(), b.edits());
+        again.apply_open(read(tasks));
+        again.apply_closed(None);
+        again
+    }
+
+    #[test]
+    fn a_move_answered_after_its_view_is_gone_leaves_the_issue_editable_and_saving() {
+        let mut gone = board(vec![issue("A", "todo")]);
+        let mv = CommandKind::MoveIssue { id: "A".into(), to_status: "review".into() };
+        let job = gone.begin_mutation(&mv).unwrap();
+
+        // Back on the project with the move still out: everything waits for it.
+        let mut b = board_again(&gone, vec![issue("A", "todo")]);
+        b.begin_edit("A");
+        let t0 = std::time::Instant::now();
+        b.edit_text("A", Field::Body, "typed on return", t0);
+        assert!(saves_after_pause(&mut b, t0).is_empty(), "the save waits for the move");
+        let assign = CommandKind::AssignIssue { id: "A".into(), workspace: "alpha".into() };
+        let held = b.begin_mutation(&assign).unwrap_err();
+        assert_eq!(b.status.as_deref(), Some("A: waiting for the save in progress"));
+
+        // The worker records the answer; the view that sent it never hears.
+        BoardState::record_mutation(&b.edits(), &job, &Ok(Some(at("review", 4))));
+        assert!(held.is_empty());
+        let out = b.poll_saves(t0 + std::time::Duration::from_secs(1));
+        let [Intent::Save(save)] = &out[..] else {
+            panic!("the typing saves first: {out:?}");
+        };
+        assert_eq!(save.body.as_deref(), Some("typed on return"));
+        assert_eq!(save.expected, Some(at("review", 4)), "it follows the move that landed");
+        BoardState::record_save(&b.edits(), save, Ok(Some(at("review", 5))));
+
+        // With the lane free, the change held for it comes back on the next tick.
+        assert_eq!(
+            b.poll_saves(t0 + std::time::Duration::from_secs(2)),
+            vec![Intent::Command(assign.clone())]
+        );
+        let job = b.begin_mutation(&assign).expect("nothing holds it now");
+        assert_eq!(job.expected, Some(at("review", 5)));
+        assert_eq!(b.save_status("A"), SaveStatus::Saved);
+    }
+
+    #[test]
+    fn a_held_change_waits_for_this_views_own_answer_not_just_the_lane() {
+        let mut b = board(vec![issue("A", "todo")]);
+        let edits = b.edits();
+        b.begin_edit("A");
+        b.edit_text("A", Field::Body, "mine", std::time::Instant::now());
+        let mv = CommandKind::MoveIssue { id: "A".into(), to_status: "review".into() };
+        let out = b.begin_mutation(&mv).unwrap_err();
+        let [Intent::Save(save)] = &out[..] else {
+            panic!("the typing goes first: {out:?}");
+        };
+        // The save lands, and an assign gets in ahead of the held move.
+        BoardState::record_save(&edits, save, Ok(Some(at("todo", 2))));
+        let assign = CommandKind::AssignIssue { id: "A".into(), workspace: "alpha".into() };
+        let job = b.begin_mutation(&assign).unwrap();
+        // The assign's worker has recorded its answer; the view hasn't drained
+        // it. Sending the move now would be refused as "in progress" and lost.
+        BoardState::record_mutation(&edits, &job, &Ok(Some(at("todo", 3))));
+        assert_eq!(b.poll_saves(std::time::Instant::now()), Vec::new());
+        assert_eq!(
+            b.finish_mutation("A", Ok(Some(at("todo", 3)))),
+            vec![Intent::Refresh, Intent::Command(mv)]
+        );
+    }
+
+    #[test]
+    fn a_move_with_no_answer_puts_the_card_back_and_says_so() {
+        let mut b = board(vec![issue("A", "todo")]);
+        let mv = CommandKind::MoveIssue { id: "A".into(), to_status: "review".into() };
+        b.begin_mutation(&mv).unwrap();
+        assert!(issue_edit::lock(&b.edits()).busy("A"));
+        assert_eq!(b.answer("A", Err(ExecError::NoAnswer)), vec![Intent::Refresh]);
+        assert!(!issue_edit::lock(&b.edits()).busy("A"));
+        assert!(b.pending("A").is_none());
+        assert_eq!(b.notice("A"), Some("no answer from the daemon"));
+        // The card takes its next command.
+        assert!(b.begin_mutation(&mv).is_ok());
     }
 }
