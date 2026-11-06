@@ -215,6 +215,7 @@ pub use event_log::{
     append_orphan_reap_failed_event,
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
     append_limit_resume_event, append_marker_deferred_event, append_marker_skipped_event,
+    append_transition_marker_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,
     append_message_event, append_message_undeliverable_event, append_migration_event, append_project_event,
     append_push_event, last_pushed_tip_from_events,
@@ -240,13 +241,11 @@ pub use event_log::{
     READY_MARKER_HANDOFF_ALIASES, READY_MARKER_HANDOFF_CAUSE,
 };
 pub use workspace_status::{
-    clear_expected_teardown, clear_review_serve_pgid, clear_workspace_status,
-    consume_expected_teardown, control_socket_path, expected_teardown_marker_path, hub_socket_path,
-    load_workspace_status, mark_expected_teardown, parse_orchestrator_title_state,
-    parse_pane_title_marker, parse_pane_title_state,
-    read_review_serve_pgid, review_serve_pgid_path, save_workspace_status, supervision_shutdown_key,
+    clear_review_serve_pgid, clear_workspace_status, control_socket_path, hub_socket_path,
+    load_workspace_status, parse_orchestrator_title_state, parse_pane_title_marker,
+    parse_pane_title_state, read_review_serve_pgid, review_serve_pgid_path, save_workspace_status,
     workspace_status_path, workspaces_dir, PaneMarker, WorkspaceState, WorkspaceStatus,
-    EXPECTED_TEARDOWN_MAX_AGE, REVIEW_SERVE_PGID_FILE_ENV,
+    REVIEW_SERVE_PGID_FILE_ENV,
 };
 pub use changelog::{
     changelog_template_path, scaffold_changelog_template, ChangelogTemplateOutcome,

@@ -20,7 +20,7 @@ use shelbi_core::{
     WorkspaceSpec,
 };
 
-use crate::session_backend::{backend, Liveness, SessionBackend, SessionTarget};
+use crate::session_backend::{backend, KillReason, Liveness, SessionBackend, SessionTarget};
 
 
 /// Filter `git status --porcelain` output down to the lines that represent
@@ -345,6 +345,24 @@ pub fn workspace_ready_deferred_marker(machine: &Machine, workspace: &WorkspaceS
         .join("shelbi-ready-deferred")
 }
 
+/// The transition-marker **deferral** sidecar for a workspace:
+/// `<worktree>/.shelbi/shelbi-transition-deferred`.
+///
+/// The [`workspace_transition_marker`] counterpart of
+/// [`workspace_ready_deferred_marker`]: a gate's verdict is written exactly once,
+/// so a failed read of the task (or a failed move) leaves the marker in place to
+/// retry next tick. This sidecar records the current `<stage>:<class>` token so
+/// the deferral reaches `events.log` once rather than every tick. Consuming the
+/// marker clears it, as does dispatch, which also clears the marker itself.
+pub fn workspace_transition_deferred_marker(
+    machine: &Machine,
+    workspace: &WorkspaceSpec,
+) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".shelbi")
+        .join("shelbi-transition-deferred")
+}
+
 /// The ready-handoff **refusal** sidecar for a workspace:
 /// `<worktree>/.shelbi/shelbi-ready-refused`.
 ///
@@ -451,7 +469,7 @@ pub fn read_deferred_marker(host: &Host, marker: &Path) -> Result<Option<String>
 }
 
 /// Write the deferral sidecar with the current outage's error `class`. The
-/// class is a short internal token (see `poller::classify_load_error`), so no
+/// class is a short internal token (see `poller::classify_store_error`), so no
 /// escaping beyond the shell quoting the remote path needs. Best-effort by
 /// contract: a failed write only risks re-logging the deferral next tick.
 pub fn write_deferred_marker(host: &Host, marker: &Path, class: &str) -> Result<()> {
@@ -2356,10 +2374,16 @@ fn terminate_process_group(_pgid: i32) -> bool {
 /// covers them all. A no-op when nothing was tracked: dev slots and remote
 /// review slots never record a pgid.
 ///
-/// Marks an "expected teardown" for `workspace_name` before killing so a
-/// shelbi-initiated shutdown isn't mistaken for a crash by the agent session's
-/// lifecycle event.
-pub fn kill_workspace_pane(host: &Host, target: &SessionTarget, workspace_name: &str) -> Result<()> {
+/// `reason` is recorded on the session before the kill, so the supervisor reads
+/// this death as deliberate instead of restarting the slot as a crash. It is
+/// recorded on a slot that is already dead too: stopping a pane that crashed a
+/// moment ago, or handing off from one, must still stand the supervisor down.
+pub fn kill_workspace_pane(
+    host: &Host,
+    target: &SessionTarget,
+    workspace_name: &str,
+    reason: KillReason,
+) -> Result<()> {
     stop_review_server(workspace_name);
     // Kill the slot itself on every host. A remote workspace's slot target
     // (`shelbi-w-<name>`, `agent`) maps to the remote session `w-<name>/ws/agent`;
@@ -2369,11 +2393,16 @@ pub fn kill_workspace_pane(host: &Host, target: &SessionTarget, workspace_name: 
     // "already gone", and the real agent kept running while the orphan reaper
     // logged a reap every pass. A transport-answered "already gone" still
     // short-circuits here.
-    if !workspace_slot_alive(host, target)? {
+    let alive = workspace_slot_alive(host, target)?;
+    let session = crate::session_process_backend::session_name(target);
+    backend().record_kill_reason(host, &session, reason);
+    if !alive {
         return Ok(());
     }
-    let _ = shelbi_state::mark_expected_teardown(workspace_name);
-    backend().kill(host, target)?;
+    if let Err(e) = backend().kill(host, target) {
+        backend().clear_kill_reason(host, &session);
+        return Err(e);
+    }
     if host.is_ssh() {
         // A remote kill rides the relay and tolerates "no live session" as
         // success, so a kill that reached nothing would look identical to one
@@ -2623,6 +2652,10 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
     let _ = clear_transition_marker(
         &host,
         &legacy_workspace_transition_marker(&machine, spec.workspace),
+    );
+    let _ = clear_deferred_marker(
+        &host,
+        &workspace_transition_deferred_marker(&machine, spec.workspace),
     );
     // And the review-serving marker: a task loading onto a review slot starts
     // out not serving, whatever the slot's last task got up to.
@@ -2883,6 +2916,10 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
         &host,
         &legacy_workspace_transition_marker(&machine, spec.workspace),
     );
+    let _ = clear_deferred_marker(
+        &host,
+        &workspace_transition_deferred_marker(&machine, spec.workspace),
+    );
 
     // Preserve the worktree: don't reset the branch, don't bail on a dirty
     // tree. Only recreate the worktree if it's gone entirely. A failure here
@@ -3118,7 +3155,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
 
     // 3. Reset the agent session — that's how we clear context. If it doesn't
     //    exist yet, this is a no-op; otherwise the next step recreates it.
-    kill_workspace_pane(a.host, a.addr, &a.workspace.name)?;
+    kill_workspace_pane(a.host, a.addr, &a.workspace.name, KillReason::Redispatch)?;
 
     // 4 + 5. Spawn the agent session and launch the agent.
     //
@@ -9286,6 +9323,10 @@ statuses:
             base.join("shelbi-ready-deferred")
         );
         assert_eq!(
+            workspace_transition_deferred_marker(&p.machines[0], ws),
+            base.join("shelbi-transition-deferred")
+        );
+        assert_eq!(
             workspace_ready_refused_marker(&p.machines[0], ws),
             base.join("shelbi-ready-refused")
         );
@@ -14912,6 +14953,48 @@ mod sync_worktree_freshcut_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The relaunch the quit race produces: a supervisor redispatching a
+    /// workspace after the quit began stands down without touching anything.
+    #[test]
+    fn a_dispatch_during_a_project_quit_is_cancelled_before_it_starts() {
+        let _env = crate::test_lock::acquire();
+        let root = std::env::temp_dir().join(format!(
+            "shelbi-dispatch-mid-quit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let machine_repo = root.join("repo");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = dispatch_project(&machine_repo, "claude", Vec::new());
+        let phase = crate::cancel::begin_quit(&project.name);
+        let result = start_workspace_on_task(StartSpec {
+            project: &project,
+            workspace: &project.workspaces[0],
+            task_id: "task-raced",
+            branch: "shelbi/task-raced",
+            task_body: "",
+            agent: None,
+            launch_override: None,
+        });
+        drop(phase);
+
+        match prev_home {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(matches!(result, Err(Error::Cancelled(_))), "{:?}", result.err());
+        assert!(!machine_repo.exists(), "the cancelled dispatch touched no worktree");
     }
 
     #[test]

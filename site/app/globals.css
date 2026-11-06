@@ -11,8 +11,8 @@
 /* ============================================================
    Mono symbol supplement (box-drawing, arrows, block/geometry)
    ============================================================
-   Source Code Pro is loaded via `next/font/google` with only the
-   `latin` subset, whose unicode-range stops short of the arrows
+   Source Code Pro is loaded via `next/font/local` from a vendored
+   `latin` subset, which stops short of the arrows
    (U+2190–21FF) and box-drawing (U+2500–257F) glyphs. Those fall
    back to `ui-monospace` at a different advance width, which breaks
    the alignment of every ASCII `text` diagram on the site (closed
@@ -37,6 +37,19 @@
     U+2580-259F, U+25A0-25FF;
 }
 
+/* Metric-matched Arial, used until Source Code Pro loads and, permanently,
+   for glyphs the mono faces above lack that Arial has. These are the values
+   `next/font/google` generated for this font. `next/font/local` would compute
+   a narrower size-adjust (131.49%) from the subset file, moving text at swap. */
+@font-face {
+  font-family: "Source Code Pro Fallback";
+  src: local("Arial");
+  ascent-override: 73.11%;
+  descent-override: 20.28%;
+  line-gap-override: 0%;
+  size-adjust: 134.59%;
+}
+
 /* ============================================================
    Theme — fonts, spacing, and strict-mono palette (light mode)
    ============================================================
@@ -49,10 +62,10 @@
    `.dark` class on `<html>` swaps both modes at the cascade.
    ============================================================ */
 @theme {
-  /* ----- Fonts (Geist Sans via `geist`; Source Code Pro via next/font) ----- */
+  /* ----- Fonts (Geist Sans via `geist`; Source Code Pro via next/font/local) ----- */
   --font-sans: var(--font-geist-sans), system-ui, sans-serif;
   --font-mono: "Source Code Pro Symbols", var(--font-source-code-pro),
-    ui-monospace, monospace;
+    "Source Code Pro Fallback", ui-monospace, monospace;
 
   /* ----- Palette (strict monochrome — light) ----- */
   --color-bg: #FFFFFF;

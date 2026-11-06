@@ -112,11 +112,18 @@ pub enum HealthTransition {
 /// `threshold` consecutive `Lost` readings, and only once (further losses are
 /// `None` until a recovery resets it). A `Healthy` reading resets the counter
 /// and, if we had declared loss, yields `Recovered`.
+///
+/// A tracker [seeded](Self::seed_declared_lost) from a predecessor's marker runs
+/// the same debounce once more: `BecameLost` then means "this daemon confirmed
+/// what the predecessor reported".
 #[derive(Debug, Clone)]
 pub struct SessionHealthTracker {
     threshold: u32,
     consecutive_lost: u32,
     declared_lost: bool,
+    /// Declared by a predecessor and not yet confirmed by this tracker's own
+    /// readings.
+    awaiting_confirmation: bool,
 }
 
 impl SessionHealthTracker {
@@ -127,16 +134,20 @@ impl SessionHealthTracker {
             threshold: threshold.max(1),
             consecutive_lost: 0,
             declared_lost: false,
+            awaiting_confirmation: false,
         }
     }
 
     /// Seed the tracker as already having declared loss. The daemon's monitor
     /// calls this at startup when a session-lost marker is already on disk, so
     /// the first *healthy* reading yields [`HealthTransition::Recovered`]
-    /// (clearing the marker) and a still-lost session is not re-announced.
+    /// (clearing the marker), and `threshold` consecutive lost readings yield one
+    /// [`HealthTransition::BecameLost`], which lets the monitor act on the
+    /// marker's recovery state (a re-exec that didn't take escalates to gave-up).
     pub fn seed_declared_lost(&mut self) {
         self.declared_lost = true;
-        self.consecutive_lost = self.threshold;
+        self.awaiting_confirmation = true;
+        self.consecutive_lost = 0;
     }
 
     /// Whether loss is currently declared (past the threshold, not yet
@@ -150,6 +161,7 @@ impl SessionHealthTracker {
         match verdict {
             TickVerdict::Healthy => {
                 self.consecutive_lost = 0;
+                self.awaiting_confirmation = false;
                 if self.declared_lost {
                     self.declared_lost = false;
                     HealthTransition::Recovered
@@ -159,8 +171,10 @@ impl SessionHealthTracker {
             }
             TickVerdict::Lost { reason } => {
                 self.consecutive_lost = self.consecutive_lost.saturating_add(1);
-                if !self.declared_lost && self.consecutive_lost >= self.threshold {
+                let unannounced = !self.declared_lost || self.awaiting_confirmation;
+                if unannounced && self.consecutive_lost >= self.threshold {
                     self.declared_lost = true;
+                    self.awaiting_confirmation = false;
                     HealthTransition::BecameLost { reason }
                 } else {
                     HealthTransition::None
@@ -352,16 +366,32 @@ mod tests {
     #[test]
     fn seed_declared_lost_recovers_on_first_healthy_reading() {
         // The daemon-startup case: a marker already on disk seeds the tracker so
-        // a healthy first reading clears it, and a still-lost one is not
-        // re-announced.
+        // a healthy first reading clears it.
         let mut t = SessionHealthTracker::new(3);
         t.seed_declared_lost();
         assert!(t.is_declared_lost());
         assert_eq!(
             t.observe(TickVerdict::Lost { reason: "x".into() }),
             HealthTransition::None,
-            "a still-lost session must not re-announce BecameLost"
+            "one lost reading is below the debounce"
         );
+        assert_eq!(t.observe(TickVerdict::Healthy), HealthTransition::Recovered);
+    }
+
+    #[test]
+    fn seed_declared_lost_confirms_once_after_a_full_debounce() {
+        // The re-exec'd successor that is still lost: its own debounced readings
+        // must surface, once, so the monitor can escalate the marker.
+        let lost = || TickVerdict::Lost { reason: "x".into() };
+        let mut t = SessionHealthTracker::new(2);
+        t.seed_declared_lost();
+        assert_eq!(t.observe(lost()), HealthTransition::None);
+        assert_eq!(
+            t.observe(lost()),
+            HealthTransition::BecameLost { reason: "x".into() }
+        );
+        assert_eq!(t.observe(lost()), HealthTransition::None, "only once");
+        assert!(t.is_declared_lost());
         assert_eq!(t.observe(TickVerdict::Healthy), HealthTransition::Recovered);
     }
 

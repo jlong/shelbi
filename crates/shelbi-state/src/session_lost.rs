@@ -4,13 +4,17 @@
 //! module), but the *warning* has to reach every attached TUI, `shelbi status`,
 //! and `shelbi doctor` — none of which share the daemon's process. So the daemon
 //! records the condition as a small JSON file under the shelbi root and the
-//! surfaces read it back. Clearing the file (on recovery, or a clean reopen)
-//! retracts the warning everywhere at once.
+//! surfaces read it back. Clearing the file retracts the warning everywhere at
+//! once: a daemon clears it as soon as it reads a healthy session, which a fresh
+//! daemon checks the moment it starts, so a clean reopen retracts it too.
 //!
 //! The file also carries the recovery bookkeeping: whether the daemon has
 //! already tried to re-exec itself into the live GUI session. A fresh daemon
 //! reads it at startup so an attempt that didn't take can't turn into a re-exec
 //! loop.
+//!
+//! This module is only the file. The daemon's `session_health` module owns the
+//! lifecycle, and keeps this marker and the spawn gate in step.
 
 use std::path::PathBuf;
 
@@ -32,10 +36,12 @@ pub enum RecoveryState {
     NotAttempted,
     /// A re-exec into the GUI session was launched. A fresh daemon that finds
     /// this and is *still* lost escalates to [`RecoveryState::GaveUp`] rather
-    /// than re-execing again.
+    /// than re-execing again. Transient: a daemon that finds this always settles
+    /// it, on a healthy reading (marker cleared) or a confirmed lost one.
     Attempted,
-    /// Recovery was tried and did not restore a healthy session (or a second
-    /// detection found the attempt hadn't taken). Warn-only from here.
+    /// Recovery was tried and did not restore a healthy session (the re-exec
+    /// could not launch, its successor could not take over, or the successor
+    /// found itself still lost). Warn-only from here.
     GaveUp,
 }
 

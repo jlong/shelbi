@@ -207,7 +207,39 @@ impl DiscoveredSession {
     pub fn exiting(&self) -> bool {
         self.dir.join("exiting").exists() || self.dir.join("exit.json").exists()
     }
+
+    /// The record the session wrote on its way out, if it got that far and the
+    /// record parses. Absent for a live session and for one whose host was
+    /// SIGKILLed.
+    pub fn exit_record(&self) -> Option<shelbi_session::ExitRecord> {
+        let text = std::fs::read_to_string(self.dir.join("exit.json")).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Record why this session is being ended on purpose, before the kill that
+    /// ends it. The reason lives in the session's own directory, so it describes
+    /// this one session and can't be mistaken for the death of a later session
+    /// on the same slot. Kept on disk rather than sent over the socket so a
+    /// session started by an older build still gets one.
+    pub fn record_kill_reason(&self, reason: &str) -> std::io::Result<()> {
+        std::fs::write(self.dir.join(KILL_REASON_FILE), reason)
+    }
+
+    /// Forget a recorded kill reason (the kill it announced never landed).
+    pub fn clear_kill_reason(&self) {
+        let _ = std::fs::remove_file(self.dir.join(KILL_REASON_FILE));
+    }
+
+    /// The reason recorded by [`record_kill_reason`](Self::record_kill_reason):
+    /// `Some` means someone ended this session on purpose.
+    pub fn kill_reason(&self) -> Option<String> {
+        let text = std::fs::read_to_string(self.dir.join(KILL_REASON_FILE)).ok()?;
+        Some(text.trim().to_string()).filter(|reason| !reason.is_empty())
+    }
 }
+
+/// The file in a session directory holding why it was ended on purpose.
+const KILL_REASON_FILE: &str = "kill-reason";
 
 /// Enumerate sessions under `root`, newest unspecified order. Directories with
 /// no readable `meta.json` are skipped (a session mid-creation, or a non-session

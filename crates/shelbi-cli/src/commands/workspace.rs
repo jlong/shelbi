@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use shelbi_core::{Column, IntegrationMode, Issue, WorkspaceSpec};
 use shelbi_orchestrator::pool_admin::{self, PoolError};
+use shelbi_orchestrator::session_backend::KillReason;
 use shelbi_orchestrator::workspace as orch_workspace;
 use shelbi_state::WorkspaceStatus;
 
@@ -537,7 +538,13 @@ fn stop(project: &str, name: &str, keep_task: bool) -> Result<()> {
         }
     }
 
-    orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name).map_err(|e| anyhow!(e))?;
+    let reason = if keep_task {
+        KillReason::Bounce
+    } else {
+        KillReason::Stop
+    };
+    orch_workspace::kill_workspace_pane(&host, &addr, &workspace.name, reason)
+        .map_err(|e| anyhow!(e))?;
     println!("✓ {name} pane stopped");
     Ok(())
 }

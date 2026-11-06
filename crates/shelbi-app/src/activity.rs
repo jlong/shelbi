@@ -1473,6 +1473,29 @@ pub fn parse_event_line(line: &str) -> Event {
         });
     }
 
+    // `transition-marker project=<p> task=<id> workspace=<name> target=<t>
+    // status=<s> reason=<r>` — a gate's verdict that didn't apply. `project=` is
+    // a field here too, like `send`. `Other`, not a new kind: `SystemKind` is on
+    // the remote window's wire and a far host can be newer than the client.
+    if let Some(body) = rest.strip_prefix("transition-marker ") {
+        let kv = parse_kv(body);
+        let status = kv.get("status").cloned();
+        let detail = match (status.as_deref(), kv.get("reason")) {
+            (Some(s), Some(r)) => format!("verdict {s}: {}", humanize_token(r)),
+            (Some(s), None) => format!("verdict {s}"),
+            (None, _) => "verdict not applied".to_string(),
+        };
+        return Event::System(SystemEvent {
+            ts,
+            kind: SystemKind::Other,
+            project: kv.get("project").cloned().or(project),
+            target: kv.get("task").cloned(),
+            status,
+            detail: Some(detail),
+            raw,
+        });
+    }
+
     // `send project=<p> workspace=<name> status=<s> detail=<d>` — the
     // `project=` here is a field, not the leading scope, so it survived the
     // prefix peel and we read it back out of the k=v tail.
@@ -3242,6 +3265,24 @@ mod tests {
                 assert_eq!(sys.status.as_deref(), Some("false"));
             }
             other => panic!("expected System(PaneDeath), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_transition_marker_event_with_task_and_reason() {
+        let line = "2026-07-22T14:00:00+00:00 transition-marker project=demo task=fix-login workspace=alpha target=review status=deferred reason=load-failed:http-403";
+        match parse_event_line(line) {
+            Event::System(sys) => {
+                assert_eq!(sys.kind, SystemKind::Other);
+                assert_eq!(sys.project.as_deref(), Some("demo"));
+                assert_eq!(sys.target.as_deref(), Some("fix-login"));
+                assert_eq!(sys.status.as_deref(), Some("deferred"));
+                assert_eq!(
+                    sys.detail.as_deref(),
+                    Some("verdict deferred: load failed:http 403")
+                );
+            }
+            other => panic!("expected System(Other), got {other:?}"),
         }
     }
 

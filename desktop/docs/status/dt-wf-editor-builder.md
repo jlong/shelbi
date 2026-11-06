@@ -178,9 +178,10 @@ gpui has already shaped. Before that change the same sweep had a p99 of
 8.3 ms.
 
 The layout is redone each frame (it's under a millisecond: the unit test
-holds it to 4ms in a debug build), and a gpui test draws the big workflow
-in the debug build under a loose 250ms a frame bound, to catch a layout gone
-quadratic.
+holds it to 4ms in a debug build). To catch a layout gone quadratic, a gpui
+test compares the big workflow against one a quarter of its size, frames and
+`Graph::of` alike, in CPU time: a time limit failed on a loaded machine
+(`deflake-builder-frame-test`).
 
 ## Tests
 
