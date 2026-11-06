@@ -180,13 +180,13 @@ pub use resolve::{
 };
 pub use ssh_control::{
     cleanup_stale_control_masters, daemon_pid_file_path, ensure_ssh_control_dir,
-    forward_state_path, is_process_alive, load_forward_state, load_host_forward, read_daemon_pid,
+    effective_forward, forward_state_path, is_process_alive, load_forward_state, load_host_forward, read_daemon_pid,
     read_daemon_pid_record, recorded_daemon_is_same_process, reconcile_forward_state,
     remote_hub_endpoint, remote_hub_socket_path,
     remove_daemon_pid_file, reverse_forward_spec, reverse_forward_spec_tcp, save_host_forward,
     ssh_control_dir, ssh_control_path_template, tcp_forward_port_base, tcp_forward_port_span,
     write_daemon_pid,
-    CmCleanupOutcome, DaemonPidRecord, HostForward, HubEndpoint, TCP_FORWARD_BIND_ADDR,
+    CmCleanupOutcome, DaemonPidRecord, EffectiveForward, HostForward, HubEndpoint, TCP_FORWARD_BIND_ADDR,
     TCP_FORWARD_PORT_BASE, TCP_FORWARD_PORT_SPAN,
 };
 pub use tools::{AppTools, ToolChoice, ToolKind};
