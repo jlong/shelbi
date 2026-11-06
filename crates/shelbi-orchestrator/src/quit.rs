@@ -44,7 +44,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use shelbi_core::{Host, MachineKind};
 
-use crate::session_backend::{backend, Backend};
+use crate::session_backend::{backend, Backend, KillReason};
 
 /// The session-termination seam the quit compositions drive. Hiding IO behind a
 /// trait keeps the ordering/scoping logic testable without real sessions.
@@ -230,6 +230,9 @@ impl Sessions for BackendSessions {
 
     fn kill(&self, name: &str) {
         let backend = backend();
+        // A reopen resumes these slots; the reason tells any supervisor pass that
+        // still gets a tick before the poller stops that this is not a crash.
+        backend.record_kill_reason(&Host::Local, name, KillReason::Quit);
         // Local first; if it wasn't a local session the remote sweep handles it.
         if backend.kill_window(&Host::Local, name).is_ok() {
             // best-effort; a non-matching local kill is harmless.

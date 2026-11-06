@@ -177,6 +177,101 @@ impl Liveness {
     }
 }
 
+/// Why Shelbi is ending a slot's session on purpose. Recorded in the session's
+/// own directory just before the kill ([`Backend::record_kill_reason`]), so the
+/// supervisor can tell the death from a crash when it next reads the slot
+/// ([`Backend::slot_death`]). Every caller of
+/// [`kill_workspace_pane`](crate::workspace::kill_workspace_pane) names one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillReason {
+    /// `shelbi workspace stop` or a pool removal: the slot stays down.
+    Stop,
+    /// `shelbi workspace stop --keep-task`: the pane is being bounced with its
+    /// task left in place, so a resume pass may bring it back.
+    Bounce,
+    /// A dispatch is replacing the pane with a fresh one.
+    Redispatch,
+    /// The task moved on (ready handoff, agent transition, closed review) and
+    /// the slot's job is done.
+    Handoff,
+    /// A reaper reclaimed an orphaned slot.
+    Reap,
+    /// The project is closing. A reopen resumes the slot.
+    Quit,
+}
+
+impl KillReason {
+    /// The token written to the session directory and to `events.log`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KillReason::Stop => "stop",
+            KillReason::Bounce => "bounce",
+            KillReason::Redispatch => "redispatch",
+            KillReason::Handoff => "handoff",
+            KillReason::Reap => "reap",
+            KillReason::Quit => "quit",
+        }
+    }
+
+    /// Read a recorded token back. A token this build doesn't know still means
+    /// someone killed the session on purpose, so it reads as the conservative
+    /// [`Stop`](Self::Stop) rather than as a crash.
+    pub fn parse(token: &str) -> Self {
+        match token {
+            "bounce" => KillReason::Bounce,
+            "redispatch" => KillReason::Redispatch,
+            "handoff" => KillReason::Handoff,
+            "reap" => KillReason::Reap,
+            "quit" => KillReason::Quit,
+            _ => KillReason::Stop,
+        }
+    }
+}
+
+/// How a slot's most recent session ended, read from its directory. This is the
+/// crash-versus-deliberate input to pane supervision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlotDeath {
+    /// The child is gone but the session hasn't written its exit record yet.
+    /// Decide on a later tick, once the record is there.
+    Exiting,
+    /// Shelbi ended it on purpose.
+    Killed(KillReason),
+    /// The agent exited 0 on its own, as a user `/exit` does.
+    CleanExit,
+    /// Anything else: a non-zero exit, a signal, a session host that vanished
+    /// without a record, or no session on the slot at all.
+    Crash,
+}
+
+impl SlotDeath {
+    /// Was this death meant to happen? The per-workspace supervisor restarts
+    /// only a death that wasn't.
+    pub fn deliberate(self) -> bool {
+        matches!(self, SlotDeath::Killed(_) | SlotDeath::CleanExit)
+    }
+
+    /// Should the resume passes, which adopt a pane dead at first sight, leave
+    /// this slot down too? A quit, a bounce and an interrupted redispatch are
+    /// all meant to come back.
+    pub fn keeps_slot_down(self) -> bool {
+        matches!(
+            self,
+            SlotDeath::CleanExit
+                | SlotDeath::Killed(KillReason::Stop | KillReason::Handoff | KillReason::Reap)
+        )
+    }
+
+    /// The `reason=` token of the `supervision=stand-down` line for this death.
+    pub fn stand_down_reason(self) -> &'static str {
+        match self {
+            SlotDeath::Killed(reason) => reason.as_str(),
+            SlotDeath::CleanExit => "clean-exit",
+            SlotDeath::Exiting | SlotDeath::Crash => "crash",
+        }
+    }
+}
+
 /// One live slot under a session, as returned by
 /// [`SessionBackend::enumerate_slots`]. `id` is a **backend-opaque** stable
 /// handle (a tmux window id `@<n>`, never spaced, for the tmux backend) that
@@ -363,6 +458,23 @@ impl Backend {
     /// Best-effort kill the session whose logical name is `pane_id`.
     pub fn kill_pane(&self, host: &Host, pane_id: &str) -> Result<()> {
         self.0.kill_by_name(host, pane_id)
+    }
+
+    /// Note why the session `name` is about to be ended. See [`KillReason`].
+    pub fn record_kill_reason(&self, host: &Host, name: &str, reason: KillReason) {
+        self.0.record_kill_reason(host, name, reason);
+    }
+
+    /// Withdraw a recorded reason because the kill it announced failed.
+    pub fn clear_kill_reason(&self, host: &Host, name: &str) {
+        self.0.clear_kill_reason(host, name);
+    }
+
+    /// How `target`'s most recent session ended. See [`SlotDeath`]. Only local
+    /// slots are supervised; a remote one reads as [`SlotDeath::Crash`].
+    pub fn slot_death(&self, host: &Host, target: &SessionTarget) -> SlotDeath {
+        self.0
+            .slot_death(host, &crate::session_process_backend::session_name(target))
     }
 
     /// The logical names of every live session (so a caller confirming a

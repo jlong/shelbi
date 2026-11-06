@@ -2224,8 +2224,10 @@ pub fn append_integration_event(
 ///
 /// Emitted by the sidebar supervisor when it relaunches a shelbi-managed
 /// pane that died unexpectedly (`action=restart`), when a relaunch attempt
-/// itself failed (`action=restart-failed`), or when it stops trying after
-/// the crash-loop cap (`action=gave-up reason=crash-loop`). Every line
+/// itself failed (`action=restart-failed`), when it stops trying after
+/// the crash-loop cap (`action=gave-up reason=crash-loop`), or when it leaves
+/// down a pane that went down on purpose with a task still on the slot
+/// (`action=stand-down reason=clean-exit|stop|handoff|…`). Every line
 /// carries the leading `project=<name>` scope — same rationale as
 /// [`append_workspace_pane_event`] — so a hub-global tail can tell two
 /// projects' same-named workspaces apart. `action`/`reason` fold whitespace
