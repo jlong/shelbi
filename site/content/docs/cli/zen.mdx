@@ -159,8 +159,15 @@ files and `integration_sha` is `null`: there is nothing to publish or land.
 
 The probe fails closed (exit 3 with a JSON error naming the reason) instead of
 reporting a candidate it can't vouch for: a branch whose history carries merge
-commits and doesn't rebase cleanly onto the base, or a candidate that would
-drop or rewrite a file present at `base_sha` that the branch never touched.
+commits and doesn't rebase cleanly onto the base, a candidate that would
+drop or rewrite a file present at `base_sha` that the branch never touched, or a
+local task ref that doesn't hold the published work.
+
+That last case comes up when a card built on one machine is reassigned to a slot
+on another, where the local ref can still sit where dispatch cut it. The error
+names the published tip and the `git fetch` that brings the ref up to date. A
+branch whose content already landed on the base under another commit isn't this
+case: the probe reports it with `branch_divergence.already_merged`.
 
 | Argument | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -199,6 +206,10 @@ pre-rebase tip. It lets `pr-create` recognize that pre-rebase remote tip as the
 flow's own prior state rather than a concurrent update. Omit it to preserve the
 default acceptance rules. (`ci-watch` and `pr-merge` also accept the flag
 because they share the same pinned-identity group, but neither acts on it.)
+
+`pr-create` refuses to replace a remote task branch that has changes with an
+integration commit that has none, and pushes nothing. If the work really landed
+another way, close the PR by hand.
 
 | Argument or flag | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -253,6 +264,12 @@ that record and refuses to land a probed task unless all of these hold:
 A refusal fails the move and merges nothing, and the card stays where it is. To
 recover, run `shelbi zen probe <task-id>` again and restart the flow. To override,
 merge the PR by hand: the move then finds it already merged and completes.
+
+The `merge` action also refuses a PR with an empty diff, with Zen on or off,
+because every check passes on one and merging it lands nothing. The exception is
+a workflow that produces no branch: none of its edges push, open a PR, merge, or
+restack. If the work really landed another way, close the PR and move the card
+with `--skip-transition-actions`.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |

@@ -48,6 +48,7 @@ use shelbi_core::{validate_branch, Column, Error, Host, MergeStrategy, PrState, 
 use crate::git::{
     compose_pr_body, gh_pr_merge, head_commit_subject, locate_hub_workdir,
     locate_workspace_worktree, lookup_merged_pr, lookup_open_pr, lookup_pr_base,
+    lookup_pr_changed_files,
     parse_pr_number_from_url, pr_title, run_in_dir, squash_merge_subject,
     wait_for_merge_commit_sha,
 };
@@ -636,6 +637,7 @@ pub fn merge(
         // A Zen-flowed task lands only the commit CI graded, on the base it was
         // graded against. Checked first: a refusal must leave the PR alone.
         let pin = crate::zen_flow::landing_pin(project, task, &host, &wt, Some(pr))?;
+        refuse_empty_pr(project, project_name, task, &host, &wt, pr)?;
         let pr_base = lookup_pr_base(&host, &wt, pr)?;
         let sha = merge_via_pr(&host, &wt, pr, strategy, pin.as_ref())?;
         crate::pr_record::note_finished(project, pr, Some(&branch), PrState::Merged);
@@ -695,6 +697,34 @@ pub fn merge(
         merge: outcome,
         restacks,
     })
+}
+
+/// Refuse to merge a PR that changes nothing: every check passes on it, and the
+/// merge lands no work while the card reads as done. A workflow that produces
+/// no branch has nothing to land, so an empty PR is expected there. An unreadable
+/// workflow can't claim that, so it gets the refusal.
+fn refuse_empty_pr(
+    project: &Project,
+    project_name: &str,
+    task: &Issue,
+    host: &Host,
+    wt: &str,
+    pr: u64,
+) -> Result<()> {
+    if lookup_pr_changed_files(host, wt, pr)? > 0 {
+        return Ok(());
+    }
+    let produces_no_branch = shelbi_state::load_task_workflow(project_name, project, task)
+        .is_ok_and(|workflow| workflow.produces_no_branch());
+    if produces_no_branch {
+        return Ok(());
+    }
+    Err(Error::Other(format!(
+        "refusing to merge `{}`: PR #{pr} has an empty diff. Nothing was merged. Check that its \
+         head still holds the work, then re-run `shelbi zen probe {}`. If the work really landed \
+         another way, close the PR and move the card with `--skip-transition-actions`",
+        task.id, task.id
+    )))
 }
 
 /// Resolve the branch a `merge` for `task` integrates into when the caller
@@ -4487,6 +4517,7 @@ mod tests {
 case "$*" in
   *"pr list"*"--head parent"*) echo 7 ;;
   *"pr list"*) : ;;
+  *"changedFiles"*) echo 1 ;;
   *"baseRefName"*) echo develop ;;
   *"--json title"*) echo "squash parent feature" ;;
   *"pr merge"*) : ;;
@@ -4952,6 +4983,122 @@ exit 0
             main_after, main_before,
             "origin/main must NOT advance for an already-merged PR"
         );
+    }
+
+    /// A `gh` stub for `merge`'s open-PR path, with PR #7 for branch `topic`
+    /// reporting `changed_files`. `pr merge` leaves a mark to assert on.
+    fn empty_pr_merge_stub(changed_files: u64, merged_mark: &std::path::Path) -> String {
+        format!(
+            r#"#!/bin/sh
+case "$*" in
+  *"pr list"*"--state merged"*) : ;;
+  *"pr list"*) echo 7 ;;
+  *"changedFiles"*) echo {changed_files} ;;
+  *"baseRefName"*) echo main ;;
+  *"--json title"*) echo "topic work" ;;
+  *"pr merge"*) : > '{mark}' ;;
+  *"state,mergeCommit"*) echo "MERGED feedfacecafebeef" ;;
+esac
+exit 0
+"#,
+            mark = merged_mark.display()
+        )
+    }
+
+    #[test]
+    fn merge_refuses_an_empty_pr_diff_and_never_calls_merge() {
+        let _g = auto_fire_lock();
+        let (tmp, _remote, local) = fixture_repo_with_origin();
+        let mark = tmp.path().join("merged");
+        let (_stub, prev_shell, prev_home) = install_gh_stub(&empty_pr_merge_stub(0, &mark));
+        std::env::set_var("SHELBI_HOME", fresh_shelbi_home("empty-pr-refused"));
+        let mut task = bare_task("t");
+        task.branch = Some("topic".into());
+        write_task_file("fixture", &task);
+
+        let result = merge(&project_with_no_workspaces(&local), "fixture", &task, None);
+        restore_stub_env(prev_shell, prev_home);
+
+        let error = result.expect_err("an empty PR must not merge").to_string();
+        assert!(error.contains("PR #7"), "{error}");
+        assert!(error.contains("empty diff"), "{error}");
+        assert!(!mark.exists(), "`gh pr merge` must not run");
+    }
+
+    #[test]
+    fn merge_refuses_when_the_diff_size_is_unreadable() {
+        let _g = auto_fire_lock();
+        let (tmp, _remote, local) = fixture_repo_with_origin();
+        let mark = tmp.path().join("merged");
+        let stub_script = empty_pr_merge_stub(0, &mark).replace("echo 0 ;;", "echo null ;;");
+        let (_stub, prev_shell, prev_home) = install_gh_stub(&stub_script);
+        std::env::set_var("SHELBI_HOME", fresh_shelbi_home("empty-pr-unreadable"));
+        let mut task = bare_task("t");
+        task.branch = Some("topic".into());
+        write_task_file("fixture", &task);
+
+        let result = merge(&project_with_no_workspaces(&local), "fixture", &task, None);
+        restore_stub_env(prev_shell, prev_home);
+
+        let error = result.expect_err("an unread diff must not merge").to_string();
+        assert!(error.contains("changedFiles"), "{error}");
+        assert!(!mark.exists(), "`gh pr merge` must not run");
+    }
+
+    #[test]
+    fn merge_lands_a_pr_with_changes() {
+        let _g = auto_fire_lock();
+        let (tmp, _remote, local) = fixture_repo_with_origin();
+        let mark = tmp.path().join("merged");
+        let (_stub, prev_shell, prev_home) = install_gh_stub(&empty_pr_merge_stub(1, &mark));
+        std::env::set_var("SHELBI_HOME", fresh_shelbi_home("empty-pr-with-changes"));
+        let mut task = bare_task("t");
+        task.branch = Some("topic".into());
+        write_task_file("fixture", &task);
+
+        let result = merge(&project_with_no_workspaces(&local), "fixture", &task, None);
+        restore_stub_env(prev_shell, prev_home);
+
+        result.expect("a PR with changes merges");
+        assert!(mark.exists(), "`gh pr merge` must run");
+    }
+
+    #[test]
+    fn merge_lets_a_workflow_that_produces_no_branch_land_an_empty_pr() {
+        let _g = auto_fire_lock();
+        let (tmp, _remote, local) = fixture_repo_with_origin();
+        let mark = tmp.path().join("merged");
+        let (_stub, prev_shell, prev_home) = install_gh_stub(&empty_pr_merge_stub(0, &mark));
+        std::env::set_var("SHELBI_HOME", fresh_shelbi_home("empty-pr-no-branch-workflow"));
+
+        shelbi_state::materialize_default_agents("fixture").unwrap();
+        shelbi_state::save_project_statuses("fixture", &shelbi_core::default_project_statuses())
+            .unwrap();
+        let wf_path = shelbi_state::workflow_path("fixture", "plan").unwrap();
+        std::fs::create_dir_all(wf_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &wf_path,
+            r#"
+name: plan
+statuses:
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: done,        owner: user }
+transitions:
+  - { from: in-progress, to: done }
+"#,
+        )
+        .unwrap();
+
+        let mut task = bare_task("t");
+        task.branch = Some("topic".into());
+        task.workflow = Some("plan".into());
+        write_task_file("fixture", &task);
+
+        let result = merge(&project_with_no_workspaces(&local), "fixture", &task, None);
+        restore_stub_env(prev_shell, prev_home);
+
+        result.expect("a workflow with no branch expects an empty PR");
+        assert!(mark.exists(), "`gh pr merge` must run");
     }
 
     #[test]
