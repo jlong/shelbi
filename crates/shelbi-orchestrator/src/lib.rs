@@ -349,14 +349,28 @@ pub fn supervise_restart_orchestrator<B: session_backend::SessionBackend>(
 
     // Hold the lock until the session is live, so a TUI bootstrap racing this
     // relaunch sees the new session instead of spawning a duplicate beside it.
-    let name = session_process_backend::session_name(&target);
+    wait_for_orchestrator_ready(backend, &host, &target, timing)
+}
+
+/// The orchestrator's ready check: a just-spawned session must answer the probe
+/// within `timing.ready_timeout` and still answer after `timing.settle`. A session
+/// that never comes up, or one that exits right after launch, is an `Err` carrying
+/// the reason (for the last, the final line its screen printed).
+fn wait_for_orchestrator_ready<B: session_backend::SessionBackend>(
+    backend: &B,
+    host: &Host,
+    target: &SessionTarget,
+    timing: OrchRelaunchTiming,
+) -> Result<()> {
+    let deadline = crate::workspace::probe_deadline();
+    let name = session_process_backend::session_name(target);
     let started = std::time::Instant::now();
-    let mut last = backend.probe(&host, &target, Some(deadline));
+    let mut last = backend.probe(host, target, Some(deadline));
     while !last.is_alive() {
         if started.elapsed() >= timing.ready_timeout {
             let detail = match last {
                 session_backend::Liveness::Unreachable { reason } => format!(" ({reason})"),
-                _ => last_screen_line(backend, &host, &target)
+                _ => last_screen_line(backend, host, target)
                     .map(|line| format!(": {line}"))
                     .unwrap_or_default(),
             };
@@ -366,12 +380,12 @@ pub fn supervise_restart_orchestrator<B: session_backend::SessionBackend>(
             )));
         }
         std::thread::sleep(ORCH_RELAUNCH_POLL.min(timing.ready_timeout));
-        last = backend.probe(&host, &target, Some(deadline));
+        last = backend.probe(host, target, Some(deadline));
     }
 
     std::thread::sleep(timing.settle);
-    if !backend.probe(&host, &target, Some(deadline)).is_alive() {
-        let detail = last_screen_line(backend, &host, &target)
+    if !backend.probe(host, target, Some(deadline)).is_alive() {
+        let detail = last_screen_line(backend, host, target)
             .map(|line| format!(": {line}"))
             .unwrap_or_default();
         return Err(Error::Other(format!(
@@ -619,8 +633,8 @@ fn orchestrator_spec(
     shelbi_agent::with_model(spec, shelbi_core::orchestrator_model(project, manifest).as_deref())
 }
 
-/// Deploy the orchestrator's agent context into its workdir and bring its
-/// session up. Shared by [`ensure_dashboard`] and
+/// Bring the orchestrator's session up unless it is already alive: deploy its
+/// agent context into its workdir and spawn it. Shared by [`ensure_dashboard`] and
 /// [`relaunch_orchestrator_session`]; the caller holds the dashboard lock.
 fn spawn_orchestrator_locked(
     project_name: &str,
@@ -629,31 +643,94 @@ fn spawn_orchestrator_locked(
     runner_spec: &shelbi_core::AgentRunnerSpec,
 ) -> Result<BootstrapStatus> {
     let session = format!("shelbi-{project_name}");
-    // Materialize the orchestrator's workdir upfront — needed whether we
-    // create the session from scratch or just the right pane. The
-    // orchestrator's agent context (composed preamble +
-    // `agents/orchestrator/instructions.md` + skills) is deployed into
-    // the workdir's `.claude/` footprint and wired through claude's
-    // `--append-system-prompt` flag below; the legacy
-    // `<workdir>/CLAUDE.md` write is gone (see `aw-deprecate-claude-md-…`
-    // task). A missing `agents/orchestrator/` is best-effort — the user
-    // may have nuked it; the launch still succeeds, just without the
-    // bundled orchestrator prompt.
+    // The orchestrator's agent context (composed preamble +
+    // `agents/orchestrator/instructions.md` + skills) is deployed into the
+    // workdir's `.claude/` footprint and wired through claude's
+    // `--append-system-prompt` flag; the legacy `<workdir>/CLAUDE.md` write is
+    // gone (see `aw-deprecate-claude-md-…` task). A missing `agents/orchestrator/`
+    // is best-effort — the user may have nuked it; the launch still succeeds, just
+    // without the bundled orchestrator prompt.
     let workdir = shelbi_state::project_dir(project_name)?;
     shelbi_state::ensure_dir(&workdir)?;
-    let _ = workspace::deploy_agent_context(
-        host,
-        &workdir,
-        project_name,
-        shelbi_state::ORCHESTRATOR_AGENT,
-    );
 
     // The orchestrator runs as a detached session process (owning its own PTY,
     // no tmux pane) through the backend seam — no `$TMUX_PANE`, no duplicated
-    // pane stdin. Everything above (project-open, the commit guard refresh,
-    // agent-context deploy) is backend-agnostic and has already run; the session
-    // itself is brought up here.
-    ensure_orchestrator_session(host, project_name, &session, runner_spec, &workdir, hub_work_dir)
+    // pane stdin.
+    launch_orchestrator(
+        &backend(),
+        host,
+        &SessionTarget::session(session.as_str()),
+        project_name,
+        OrchRelaunchTiming::default(),
+        |handoff| {
+            workspace::deploy_agent_context(
+                host,
+                &workdir,
+                project_name,
+                shelbi_state::ORCHESTRATOR_AGENT,
+                handoff,
+            )
+        },
+        || ensure_orchestrator_session(project_name, &session, runner_spec, &workdir, hub_work_dir),
+    )
+}
+
+/// The orchestrator launch sequence, and the lifecycle of the handoff through it:
+///
+/// - A live session is an attach. Nothing is deployed and `handoff.md` isn't
+///   touched: `shelbi reload` signals clients to re-exec while the old orchestrator
+///   is still up, and that handoff belongs to its replacement.
+/// - A launch claims the handoff and splices it into the new prompt.
+/// - The handoff is deleted only once the new session passes the ready check. A
+///   spawn that fails, or a session that doesn't come up or exits right away,
+///   restores it for the next attempt.
+///
+/// A launch with no handoff to protect skips the ready check, so a cold start pays
+/// nothing for it. Deploy failures stay best-effort as they always were, but a
+/// handoff that didn't reach the prompt isn't spent on that launch.
+fn launch_orchestrator<B: session_backend::SessionBackend>(
+    backend: &B,
+    host: &Host,
+    target: &SessionTarget,
+    project_name: &str,
+    timing: OrchRelaunchTiming,
+    deploy: impl FnOnce(Option<&str>) -> Result<()>,
+    spawn: impl FnOnce() -> Result<()>,
+) -> Result<BootstrapStatus> {
+    // Idempotent: a live orchestrator session is left alone.
+    if backend.probe(host, target, None).is_alive() {
+        return Ok(BootstrapStatus::AlreadyRunning);
+    }
+
+    let mut claim = shelbi_state::claim_orchestrator_handoff(project_name).unwrap_or_else(|e| {
+        // A degraded start (the new instance is cold), not a broken one. The
+        // file, if there is one, stays on disk.
+        tracing::warn!(
+            project = project_name,
+            error = %e,
+            "claiming the orchestrator handoff failed; starting orchestrator cold",
+        );
+        None
+    });
+
+    if let Err(e) = deploy(claim.as_ref().map(|c| c.contents())) {
+        tracing::warn!(
+            project = project_name,
+            error = %e,
+            "deploying the orchestrator's agent context failed",
+        );
+        if let Some(claim) = claim.take() {
+            claim.restore();
+        }
+    }
+
+    // Dropping the claim on either early return restores the handoff.
+    spawn()?;
+    if let Some(claim) = claim {
+        wait_for_orchestrator_ready(backend, host, target, timing)?;
+        claim.commit();
+    }
+    Ok(BootstrapStatus::Started)
 }
 
 
@@ -1038,23 +1115,13 @@ pub fn orchestrator_session_spec(
 /// orchestrator process itself (the AC4 scope) and leaves the view layout to a
 /// later phase. tmux stays the default runtime; this runs only behind the flag.
 fn ensure_orchestrator_session(
-    host: &Host,
     project_name: &str,
     session: &str,
     runner_spec: &shelbi_core::AgentRunnerSpec,
     workdir: &std::path::Path,
     hub_work_dir: &std::path::Path,
-) -> Result<BootstrapStatus> {
-    use crate::session_backend::{backend, SessionBackend, SessionTarget};
-
+) -> Result<()> {
     let b = backend();
-    let target = SessionTarget::session(session.to_string());
-
-    // Idempotent: a live orchestrator session is the session-backend equivalent
-    // of the tmux "dashboard already has 2+ panes" early return.
-    if b.probe(host, &target, None).is_alive() {
-        return Ok(BootstrapStatus::AlreadyRunning);
-    }
 
     // Claim the one-shot first-project greeting exactly as the tmux path does, so
     // the orchestrator's first turn gets the onboarding prompt. Re-armed below if
@@ -1086,7 +1153,7 @@ fn ensure_orchestrator_session(
         return Err(error);
     }
 
-    Ok(BootstrapStatus::Started)
+    Ok(())
 }
 
 
@@ -1178,6 +1245,9 @@ mod orchestrator_model_tests {
 
 #[cfg(test)]
 mod supervise_restart_orchestrator_tests {
+    //! The orchestrator launch sequence ([`launch_orchestrator`]) and the handoff
+    //! through it, with a stub backend, no session process.
+    //!
     //! The supervisor's orchestrator relaunch ([`supervise_restart_orchestrator`])
     //! counts as a restart only once the new session is live
     //! (`orch-relaunch-noop-after-session-death`): a spawn that errors, or one
@@ -1354,6 +1424,185 @@ mod supervise_restart_orchestrator_tests {
         ready_timeout: Duration::from_millis(300),
         settle: Duration::from_millis(10),
     };
+
+    /// Seed project `name` with a handoff; returns its live path.
+    fn seed_handoff(name: &str, contents: &str) -> std::path::PathBuf {
+        let path = shelbi_state::orchestrator_handoff_path(name).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn launch(
+        backend: &StubBackend,
+        project: &str,
+        deploy: impl FnOnce(Option<&str>) -> Result<()>,
+        spawn: impl FnOnce() -> Result<()>,
+    ) -> Result<BootstrapStatus> {
+        launch_orchestrator(
+            backend,
+            &Host::Local,
+            &SessionTarget::session(format!("shelbi-{project}")),
+            project,
+            SHORT,
+            deploy,
+            spawn,
+        )
+    }
+
+    #[test]
+    fn attaching_to_a_live_orchestrator_leaves_the_handoff_in_place() {
+        // A client re-exec during `shelbi reload` attaches while the old
+        // orchestrator is still up. The handoff it just wrote is for its
+        // replacement, so the attach must neither deploy nor consume it.
+        let _fx = seed("alpha");
+        let path = seed_handoff("alpha", "watching: task xyz\n");
+        let backend = StubBackend::scripted(&[Liveness::Alive]);
+
+        let status = launch(
+            &backend,
+            "alpha",
+            |_| panic!("an attach must not deploy"),
+            || panic!("an attach must not spawn"),
+        )
+        .unwrap();
+
+        assert_eq!(status, BootstrapStatus::AlreadyRunning);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "watching: task xyz\n");
+    }
+
+    #[test]
+    fn a_launch_hands_the_handoff_to_the_prompt_and_deletes_it_once_ready() {
+        let _fx = seed("alpha");
+        let path = seed_handoff("alpha", "watching: task xyz\n");
+        let backend = StubBackend::scripted(&[Liveness::Dead, Liveness::Alive]);
+        let mut deployed = None;
+
+        let status = launch(
+            &backend,
+            "alpha",
+            |handoff| {
+                deployed = handoff.map(str::to_string);
+                Ok(())
+            },
+            || {
+                assert!(!path.exists(), "the file is claimed for the whole launch");
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(status, BootstrapStatus::Started);
+        assert_eq!(deployed.as_deref(), Some("watching: task xyz\n"));
+        assert!(!path.exists(), "a ready launch spends the handoff");
+        assert!(
+            shelbi_state::claim_orchestrator_handoff("alpha").unwrap().is_none(),
+            "nothing is left to re-ingest"
+        );
+    }
+
+    #[test]
+    fn a_failed_spawn_restores_the_handoff() {
+        let _fx = seed("alpha");
+        let path = seed_handoff("alpha", "watching: task xyz\n");
+        let backend = StubBackend::scripted(&[Liveness::Dead]);
+
+        let err = launch(
+            &backend,
+            "alpha",
+            |_| Ok(()),
+            || Err(Error::Other("no session".into())),
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("no session"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "watching: task xyz\n");
+    }
+
+    #[test]
+    fn a_session_that_never_comes_up_restores_the_handoff() {
+        let _fx = seed("alpha");
+        let path = seed_handoff("alpha", "watching: task xyz\n");
+        let backend = StubBackend::scripted(&[Liveness::Dead]);
+
+        let err = launch(&backend, "alpha", |_| Ok(()), || Ok(())).unwrap_err();
+
+        assert!(err.to_string().contains("did not come up"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "watching: task xyz\n");
+    }
+
+    #[test]
+    fn a_session_that_exits_right_after_launch_restores_the_handoff() {
+        // The missing-runner shape: it answers once, then its child is gone.
+        let _fx = seed("alpha");
+        let path = seed_handoff("alpha", "watching: task xyz\n");
+        let backend =
+            StubBackend::scripted(&[Liveness::Dead, Liveness::Alive, Liveness::Dead]);
+
+        let err = launch(&backend, "alpha", |_| Ok(()), || Ok(())).unwrap_err();
+
+        assert!(err.to_string().contains("exited right after launch"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "watching: task xyz\n");
+
+        // The next attempt gets the same handoff.
+        let retry = StubBackend::scripted(&[Liveness::Dead, Liveness::Alive]);
+        let mut deployed = None;
+        launch(
+            &retry,
+            "alpha",
+            |handoff| {
+                deployed = handoff.map(str::to_string);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(deployed.as_deref(), Some("watching: task xyz\n"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_failed_deploy_keeps_the_handoff_for_the_next_launch() {
+        // The launch goes ahead cold, as a deploy failure always has, but the
+        // handoff never reached this prompt so it isn't spent.
+        let _fx = seed("alpha");
+        let path = seed_handoff("alpha", "watching: task xyz\n");
+        let backend = StubBackend::scripted(&[Liveness::Dead]);
+
+        let status = launch(
+            &backend,
+            "alpha",
+            |_| Err(Error::Other("no agents dir".into())),
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(status, BootstrapStatus::Started);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "watching: task xyz\n");
+    }
+
+    #[test]
+    fn a_launch_with_no_handoff_skips_the_ready_check() {
+        // Nothing to protect, so a cold start pays nothing: only the attach probe.
+        let _fx = seed("alpha");
+        let backend = StubBackend::scripted(&[Liveness::Dead]);
+        let mut deployed = Some("unset".to_string());
+
+        let status = launch(
+            &backend,
+            "alpha",
+            |handoff| {
+                deployed = handoff.map(str::to_string);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(status, BootstrapStatus::Started);
+        assert_eq!(deployed, None);
+        assert_eq!(*backend.probe_count.lock().unwrap(), 1);
+    }
 
     #[test]
     fn a_relaunch_succeeds_only_once_the_new_session_is_live() {

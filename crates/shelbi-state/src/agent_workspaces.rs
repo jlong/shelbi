@@ -36,7 +36,7 @@
 //! agent" notice.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use shelbi_core::{Error, Result, RunnerKind};
 
@@ -402,8 +402,8 @@ pub fn agent_shared_preamble_path(project: &str) -> Result<PathBuf> {
 
 /// `~/.shelbi/projects/<project>/agents/orchestrator/handoff.md` — the
 /// orchestrator's one-shot state-transfer file. Written by the outgoing
-/// orchestrator on `shelbi reload` / `shelbi quit` and ingested
-/// (then deleted) by the next instance on startup. Same path the
+/// orchestrator on `shelbi reload` / `shelbi quit` and claimed by the launch
+/// that starts the next instance ([`claim_orchestrator_handoff`]). Same path the
 /// orchestrator's instructions reference, so the directory layout the
 /// running orchestrator sees agrees with the path callers compute.
 pub fn orchestrator_handoff_path(project: &str) -> Result<PathBuf> {
@@ -418,38 +418,134 @@ pub fn orchestrator_handoff_path(project: &str) -> Result<PathBuf> {
     Ok(project_dir(project)?.join(ORCHESTRATOR_HANDOFF_REL))
 }
 
-/// Read and delete the orchestrator's handoff file. Returns `Ok(None)`
-/// when the file isn't there — the normal case on a clean start.
-///
-/// "Take" semantics (read-then-delete) keep the handoff one-shot: even
-/// if a downstream caller crashes between the read and the next
-/// orchestrator launch, the stale file is already gone so the next
-/// instance won't re-ingest it. A failed delete is logged but not
-/// surfaced as an error — leaving the file behind degrades to a
-/// (re-)ingest on the next start, which is recoverable, whereas
-/// failing the launch on a stuck `rm` would be worse.
-///
-/// Best-effort: malformed UTF-8 or partial writes are returned to the
-/// caller as-is; the [`compose_agent_prompt`] splice path treats the
-/// content as opaque text, and the orchestrator can sanity-check what
-/// it received when ingesting.
-pub fn take_orchestrator_handoff(project: &str) -> Result<Option<String>> {
-    let path = orchestrator_handoff_path(project)?;
-    match fs::read_to_string(&path) {
-        Ok(s) => {
-            if let Err(e) = fs::remove_file(&path) {
-                tracing::warn!(
-                    project,
-                    handoff = %path.display(),
-                    error = %e,
-                    "failed to delete handoff.md after ingestion (will re-ingest on next start)",
-                );
-            }
-            Ok(Some(s))
+/// Where a launch holds the handoff it has claimed: the live file's sibling, so
+/// the claim is a same-directory rename and the file is never missing from disk
+/// between the claim and the launch's verdict.
+fn claimed_handoff_path(handoff: &Path) -> PathBuf {
+    let mut name = handoff.file_name().unwrap_or_default().to_os_string();
+    name.push(".claimed");
+    handoff.with_file_name(name)
+}
+
+/// A handoff one orchestrator launch has claimed. Its fate follows the launch:
+/// [`commit`](Self::commit) deletes it once the new session is up, and
+/// [`restore`](Self::restore) puts it back for the next attempt. Dropping an
+/// unsettled claim restores it, so an early return or a panic in the launch
+/// can't lose the handoff.
+#[must_use = "dropping a claim restores the handoff; commit it once the launch is up"]
+#[derive(Debug)]
+pub struct OrchestratorHandoffClaim {
+    project: String,
+    path: PathBuf,
+    claimed: PathBuf,
+    contents: String,
+    settled: bool,
+}
+
+impl OrchestratorHandoffClaim {
+    /// The handoff text, opaque to Shelbi. Malformed or partial writes are
+    /// passed through for the orchestrator to sanity-check when it ingests them.
+    pub fn contents(&self) -> &str {
+        &self.contents
+    }
+
+    /// The launch came up: the handoff has been delivered, so delete it. A
+    /// failed delete is logged, not surfaced: the leftover degrades to a
+    /// re-ingest on the next launch, which is recoverable, whereas failing a
+    /// launch that already succeeded would not be.
+    pub fn commit(mut self) {
+        self.settled = true;
+        if let Err(e) = fs::remove_file(&self.claimed) {
+            tracing::warn!(
+                project = %self.project,
+                handoff = %self.claimed.display(),
+                error = %e,
+                "failed to delete claimed handoff after launch (will re-ingest on next start)",
+            );
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    }
+
+    /// The launch failed: hand the file back for the next attempt.
+    pub fn restore(mut self) {
+        self.put_back();
+    }
+
+    fn put_back(&mut self) {
+        self.settled = true;
+        // Nothing should write a new handoff while a launch holds the dashboard
+        // lock, but if one did land it is the fresher state, so it wins.
+        let result = if self.path.exists() {
+            fs::remove_file(&self.claimed)
+        } else {
+            fs::rename(&self.claimed, &self.path)
+        };
+        if let Err(e) = result {
+            tracing::warn!(
+                project = %self.project,
+                handoff = %self.claimed.display(),
+                error = %e,
+                "failed to restore claimed handoff (the next launch still recovers it)",
+            );
+        }
+    }
+}
+
+impl Drop for OrchestratorHandoffClaim {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.put_back();
+        }
+    }
+}
+
+/// Claim the orchestrator's handoff for a launch by renaming it aside. Returns
+/// `Ok(None)` when there is nothing to claim, the normal case on a clean start.
+/// The caller holds the project's dashboard lock, so only one launch claims at a
+/// time.
+///
+/// Only a launch may call this: an attach to a live orchestrator must leave the
+/// file alone, because it may be the state the next instance is waiting for.
+///
+/// A claim left by a launcher that died before settling it is recovered here,
+/// so a crash mid-launch doesn't lose the handoff. A `handoff.md` written since
+/// then is fresher and replaces it.
+pub fn claim_orchestrator_handoff(project: &str) -> Result<Option<OrchestratorHandoffClaim>> {
+    let path = orchestrator_handoff_path(project)?;
+    let claimed = claimed_handoff_path(&path);
+    match fs::rename(&path, &claimed) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(Error::Io(e)),
+    }
+    let mut claim = OrchestratorHandoffClaim {
+        project: project.to_string(),
+        path,
+        claimed,
+        contents: String::new(),
+        settled: false,
+    };
+    match fs::read_to_string(&claim.claimed) {
+        Ok(contents) => {
+            claim.contents = contents;
+            Ok(Some(claim))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            claim.settled = true;
+            Ok(None)
+        }
+        // Dropping the claim puts the unreadable file back.
         Err(e) => Err(Error::Io(e)),
     }
+}
+
+/// Remove any handoff on disk, live or claimed, so a poll for a fresh write can't
+/// be satisfied by (and a later launch can't ingest) a leftover. Best-effort: a
+/// failure degrades to a stale-handoff ingest, the documented fallback.
+pub fn discard_orchestrator_handoff(project: &str) -> Result<()> {
+    let path = orchestrator_handoff_path(project)?;
+    let _ = fs::remove_file(claimed_handoff_path(&path));
+    let _ = fs::remove_file(&path);
+    Ok(())
 }
 
 /// Read the per-project shared preamble if it exists, otherwise return
@@ -2420,39 +2516,118 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
         std::env::remove_var("SHELBI_HOME");
     }
 
-    #[test]
-    fn take_orchestrator_handoff_reads_then_deletes_the_file() {
-        // Acceptance criterion: handoff is one-shot. Read returns
-        // the body and the file is gone afterwards so a second
-        // ingestion on the next reload doesn't replay stale state.
-        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    /// A fresh `SHELBI_HOME` with `contents` as the handoff for project `p`.
+    /// Returns the live path and the path a claim moves it to.
+    fn seed_handoff(contents: &str) -> (PathBuf, PathBuf) {
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-
         let path = orchestrator_handoff_path("p").unwrap();
         fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "in-flight: X\n").unwrap();
+        fs::write(&path, contents).unwrap();
+        let claimed = claimed_handoff_path(&path);
+        (path, claimed)
+    }
 
-        let got = take_orchestrator_handoff("p").unwrap();
-        assert_eq!(got.as_deref(), Some("in-flight: X\n"));
-        assert!(
-            !path.exists(),
-            "handoff.md must be deleted after take_orchestrator_handoff"
-        );
+    #[test]
+    fn a_committed_claim_deletes_the_handoff() {
+        // Handoff is one-shot: once the launch is up, a second launch must not
+        // replay stale state.
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (path, claimed) = seed_handoff("in-flight: X\n");
+
+        let claim = claim_orchestrator_handoff("p").unwrap().expect("a handoff");
+        assert_eq!(claim.contents(), "in-flight: X\n");
+        assert!(!path.exists(), "the claim moves handoff.md aside");
+        assert!(claimed.exists());
+
+        claim.commit();
+        assert!(!path.exists() && !claimed.exists());
+        assert!(claim_orchestrator_handoff("p").unwrap().is_none());
 
         std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
-    fn take_orchestrator_handoff_returns_none_when_absent() {
-        // Cold-start case — no handoff on disk is normal, not an
-        // error. Caller treats `None` as "start fresh".
+    fn a_restored_or_dropped_claim_puts_the_handoff_back() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (path, claimed) = seed_handoff("in-flight: X\n");
+
+        claim_orchestrator_handoff("p").unwrap().unwrap().restore();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "in-flight: X\n");
+        assert!(!claimed.exists());
+
+        // An early return or a panic in the launch drops the claim unsettled.
+        drop(claim_orchestrator_handoff("p").unwrap().unwrap());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "in-flight: X\n");
+        assert!(!claimed.exists());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_claim_abandoned_by_a_dead_launcher_is_recovered() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (path, claimed) = seed_handoff("in-flight: X\n");
+        // What a launcher that died mid-launch leaves behind.
+        fs::rename(&path, &claimed).unwrap();
+
+        let claim = claim_orchestrator_handoff("p").unwrap().expect("recovered");
+        assert_eq!(claim.contents(), "in-flight: X\n");
+        claim.restore();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "in-flight: X\n");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_newer_handoff_beats_an_abandoned_claim() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (_, claimed) = seed_handoff("fresh\n");
+        fs::write(&claimed, "stale\n").unwrap();
+
+        let claim = claim_orchestrator_handoff("p").unwrap().unwrap();
+        assert_eq!(claim.contents(), "fresh\n");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn restoring_never_overwrites_a_newer_handoff() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (path, claimed) = seed_handoff("old\n");
+
+        let claim = claim_orchestrator_handoff("p").unwrap().unwrap();
+        fs::write(&path, "new\n").unwrap();
+        claim.restore();
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert!(!claimed.exists());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn claiming_returns_none_when_absent() {
+        // Cold-start case: no handoff on disk is normal, not an error.
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
-        let got = take_orchestrator_handoff("p").unwrap();
-        assert!(got.is_none());
+        assert!(claim_orchestrator_handoff("p").unwrap().is_none());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn discarding_removes_live_and_claimed_handoffs() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (path, claimed) = seed_handoff("live\n");
+        fs::write(&claimed, "abandoned\n").unwrap();
+
+        discard_orchestrator_handoff("p").unwrap();
+        assert!(!path.exists() && !claimed.exists());
+        // Nothing on disk is fine too.
+        discard_orchestrator_handoff("p").unwrap();
 
         std::env::remove_var("SHELBI_HOME");
     }

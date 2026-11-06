@@ -153,7 +153,7 @@ pub use agent_workspaces::{
     load_shared_preamble,
     materialize_default_agents, maybe_emit_claude_md_migration_hint, recommend_runner_for_new_agents, orchestrator_handoff_path,
     reset_claude_md_migration_hint, self_heal_default_agents, self_heal_orchestrator_agent,
-    take_orchestrator_handoff, AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill,
+    claim_orchestrator_handoff, discard_orchestrator_handoff, OrchestratorHandoffClaim, AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill,
     ADVERSARIAL_AGENT,
     DEFAULT_ADVERSARIAL_INSTRUCTIONS, DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS,
     DEFAULT_ORCHESTRATOR_INSTRUCTIONS, DEFAULT_QA_INSTRUCTIONS, DEFAULT_REVIEW_INSTRUCTIONS,

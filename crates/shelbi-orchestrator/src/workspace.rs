@@ -4911,9 +4911,8 @@ fn set_executable(_path: &Path) -> Result<()> {
 /// context reflects the *current* agent while any user-authored
 /// `.claude/skills/` content is left untouched — the same
 /// own-only-what-you-own discipline [`wire_settings_local`] uses.
-/// Compose the agent's instruction body (preamble + `instructions.md`, plus the
-/// orchestrator handoff splice for the orchestrator) and mount its skills into
-/// the worktree. Returns the composed body **without** writing
+/// Compose the agent's instruction body (preamble + `instructions.md`) and mount
+/// its skills into the worktree. Returns the composed body **without** writing
 /// `.claude/agent-instructions.md`, so each caller decides how the body is
 /// delivered:
 ///
@@ -4937,34 +4936,8 @@ fn compose_and_mount_agent_context(
     // handles the missing-preamble case (just the agent's prompt). Any
     // file-read failure surfaces from there with the same shape the old
     // direct-read used.
-    let mut composed = shelbi_state::compose_agent_prompt(project_name, agent)
+    let composed = shelbi_state::compose_agent_prompt(project_name, agent)
         .map_err(|e| Error::Other(format!("{e}")))?;
-    // Orchestrator-only: if a `handoff.md` was left by the previous
-    // instance (on `shelbi reload` or `shelbi quit`), splice it onto
-    // the end of the system prompt as a `<system-reminder>` block so
-    // the new instance picks up where the old one left off. Read-and-
-    // delete — handoff is one-shot; persistent state lives in
-    // `state.json`. Skipped silently for every non-orchestrator agent
-    // (developer dispatches, custom agents) so a worktree's deploy
-    // never ingests handoff data meant for the dashboard.
-    if agent == shelbi_state::ORCHESTRATOR_AGENT {
-        match shelbi_state::take_orchestrator_handoff(project_name) {
-            Ok(Some(handoff)) => {
-                composed = splice_orchestrator_handoff(&composed, &handoff);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                // Surface but don't fail the deploy — a missing handoff
-                // is a degraded start (new instance is cold), not a
-                // broken one.
-                tracing::warn!(
-                    project = project_name,
-                    error = %e,
-                    "take_orchestrator_handoff failed; starting orchestrator cold",
-                );
-            }
-        }
-    }
 
     let skills_src = shelbi_state::agent_skills_dir(project_name, agent)?;
     refresh_agent_skills(host, worktree, &skills_src)?;
@@ -4986,13 +4959,24 @@ fn compose_and_mount_agent_context(
 /// the orchestrator's file-staging path: its launch and reload paths still
 /// `cat` that file through `--append-system-prompt`. Worker dispatch does not
 /// call this — it inlines the composed body into the startup prompt instead.
+///
+/// `handoff` is the previous orchestrator's state, which the launch has already
+/// claimed ([`shelbi_state::claim_orchestrator_handoff`]). It is spliced onto the
+/// end of the body as a `<system-reminder>` block so the new instance picks up
+/// where the old one left off. This function never reads `handoff.md` itself:
+/// whether the launch succeeded, and so what becomes of the file, is the
+/// launch's call.
 pub fn deploy_agent_context(
     host: &Host,
     worktree: &Path,
     project_name: &str,
     agent: &str,
+    handoff: Option<&str>,
 ) -> Result<()> {
-    let composed = compose_and_mount_agent_context(host, worktree, project_name, agent)?;
+    let mut composed = compose_and_mount_agent_context(host, worktree, project_name, agent)?;
+    if let Some(handoff) = handoff {
+        composed = splice_orchestrator_handoff(&composed, handoff);
+    }
     deploy_agent_instructions(host, worktree, &composed)?;
     Ok(())
 }
@@ -11407,7 +11391,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         assert_eq!(
@@ -11571,7 +11555,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         let body = std::fs::read_to_string(&instructions).unwrap();
@@ -11606,12 +11590,10 @@ statuses:
     }
 
     #[test]
-    fn deploy_agent_context_splices_handoff_into_orchestrator_prompt_then_deletes_file() {
-        // Acceptance criterion: on orchestrator (re)launch, if
-        // `agents/orchestrator/handoff.md` exists, the deploy step
-        // splices it in as a <system-reminder> block AND deletes the
-        // file so the next launch doesn't double-ingest the same
-        // handoff.
+    fn deploy_agent_context_splices_the_claimed_handoff_and_leaves_the_file_to_the_launch() {
+        // The deploy splices what the launch claimed as a <system-reminder>
+        // block. It has no say over the file: deleting it is for the launch,
+        // once the new session is up.
         let _g = crate::test_lock::acquire();
         let tmp = agent_test_tmpdir("ctx-handoff-splice");
         let home = tmp.join("home");
@@ -11619,15 +11601,20 @@ statuses:
         std::env::set_var("SHELBI_HOME", &home);
         install_default_agents_under_home(&home, "p");
 
-        // Seed the handoff file the previous instance would have left
-        // behind on `shelbi reload` / `shelbi quit`.
         let handoff_path = shelbi_state::orchestrator_handoff_path("p").unwrap();
-        std::fs::write(&handoff_path, "watching: task xyz\n").unwrap();
+        std::fs::write(&handoff_path, "on disk, unclaimed\n").unwrap();
 
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        deploy_agent_context(
+            &Host::Local,
+            &worktree,
+            "p",
+            "orchestrator",
+            Some("watching: task xyz\n"),
+        )
+        .unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         let body = std::fs::read_to_string(&instructions).unwrap();
@@ -11640,8 +11627,13 @@ statuses:
             "handoff must be spliced as a system-reminder block: {body}"
         );
         assert!(
-            !handoff_path.exists(),
-            "handoff.md must be deleted after ingestion (one-shot transfer file)"
+            !body.contains("on disk, unclaimed"),
+            "the deploy must not read handoff.md itself: {body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&handoff_path).unwrap(),
+            "on disk, unclaimed\n",
+            "the deploy must not touch handoff.md"
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -11667,7 +11659,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         let body = std::fs::read_to_string(&instructions).unwrap();
@@ -11709,7 +11701,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         let body = std::fs::read_to_string(&instructions).unwrap();
@@ -11741,7 +11733,7 @@ statuses:
         std::fs::create_dir_all(&worktree).unwrap();
 
         // Dispatch 1 — developer.
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
         let instructions = worktree.join(".claude/agent-instructions.md");
         let skills_dir = worktree.join(".claude/skills");
         assert!(skills_dir.join("debug.md").exists());
@@ -11752,7 +11744,7 @@ statuses:
         // Dispatch 2 — orchestrator. The developer's `debug.md` must NOT
         // survive the swap; the instructions file is overwritten and the
         // Shelbi-owned system skill is installed for both built-in runners.
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
         assert!(
             !skills_dir.join("debug.md").exists(),
             "developer's skill leaked into orchestrator dispatch",
@@ -11780,7 +11772,7 @@ statuses:
         // A resumed/reloaded orchestrator re-resolves and re-stages the same
         // bundle rather than inheriting mutable session state.
         let first_bytes = std::fs::read(&staged_skill).unwrap();
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
         assert_eq!(std::fs::read(&staged_skill).unwrap(), first_bytes);
         assert!(std::fs::read_to_string(&instructions)
             .unwrap()
@@ -11814,7 +11806,7 @@ statuses:
 
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(worktree.join(".claude/agent-instructions.md")).unwrap(),
