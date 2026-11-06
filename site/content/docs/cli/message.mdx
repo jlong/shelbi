@@ -113,8 +113,8 @@ Report a pushed message's delivery state from `events.log`, keyed on the
 worker has acked, so a script can gate on it. Otherwise it exits non-zero with
 `queued` (no ack yet), `unconfirmed` (the daemon's ack window passed with no
 ack; a late ack can still land), `undeliverable` (refused when it was sent, with
-the reason), or `unknown message id` (never pushed, or rotated out of
-`events.log`).
+the reason), or `unknown message id` (never pushed, or too old to still be in
+recent `events.log` history).
 
 ## Examples
 

@@ -24,7 +24,7 @@
 //! snapshot path.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -745,22 +745,17 @@ fn zen_snapshot(project: &str) -> Result<ZenSnapshot> {
 /// summary already prints the mode, so a missing signal degrades to "no
 /// crash flag" and the orchestrator's first reply is unaffected.
 fn has_recent_crash_event(project: &str) -> Result<bool> {
-    let path = match shelbi_state::events_log_path() {
-        Ok(p) => p,
+    let read = match shelbi_state::read_event_log_tail(CRASH_EVENT_TAIL_BYTES) {
+        Ok(read) => read,
         Err(_) => return Ok(false),
     };
-    let tail = match read_tail(&path, CRASH_EVENT_TAIL_BYTES) {
-        Ok(t) => t,
-        Err(_) => return Ok(false),
-    };
+    let tail = read.text();
     let needle_project = format!(" project={project} ");
     let cutoff = Utc::now() - Duration::seconds(CRASH_EVENT_MAX_AGE_SECS);
     // Newest-first. The first crash line whose timestamp is inside the
-    // window wins; a line whose timestamp doesn't parse (or the partial
-    // leading line left by a mid-line seek) is skipped rather than
-    // trusted. Because we seek to a byte offset, an ancient crash beyond
-    // the tail chunk is simply not seen — which is also beyond the age
-    // window, so the answer is the same.
+    // window wins; a line whose timestamp doesn't parse is skipped rather
+    // than trusted. An ancient crash beyond the tail chunk is simply not
+    // seen — which is also beyond the age window, so the answer is the same.
     for line in tail.lines().rev() {
         if line.contains(&needle_project)
             && line.contains("zen=off")
@@ -774,24 +769,6 @@ fn has_recent_crash_event(project: &str) -> Result<bool> {
         }
     }
     Ok(false)
-}
-
-/// Read at most the last `max_bytes` of `path` as (lossy) UTF-8, seeking
-/// to the tail rather than reading the whole file. A file shorter than
-/// `max_bytes` is returned whole. When the seek lands mid-line the
-/// caller's per-line scan drops the partial leading fragment (it can't
-/// match a full crash-recovery line, and its timestamp won't parse).
-fn read_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut f = fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    let start = len.saturating_sub(max_bytes);
-    if start > 0 {
-        f.seek(SeekFrom::Start(start))?;
-    }
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    f.read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Parse the leading RFC3339 timestamp off an `events.log` line. Every

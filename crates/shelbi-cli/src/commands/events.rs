@@ -6,12 +6,10 @@
 //! <prev> -> <new>`. Filtering by project is out of scope here — the
 //! orchestrator can grep its own workspaces out of the stream.
 
-use std::fs;
-use std::io::{Read, Seek, SeekFrom};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use clap::{Subcommand, ValueEnum};
 
@@ -84,44 +82,32 @@ fn tail(
     follow: bool,
     format: EventFormat,
 ) -> Result<()> {
-    let path = shelbi_state::events_log_path().map_err(|e| anyhow!(e))?;
     let project = project.as_deref();
 
-    let (initial, end_offset) = match fs::read(&path) {
-        Ok(buf) => {
-            let len = buf.len() as u64;
-            let text = String::from_utf8_lossy(&buf).into_owned();
-            // Project scoping applies at every stage: the `-n` window and the
-            // `--since` cutoff both count from the project's own lines, not the
-            // hub-global stream, so `-n 20 --project foo` shows the last 20 foo
-            // lines rather than whatever 20 happen to trail the shared log.
-            let scoped: Vec<&str> = text
-                .lines()
-                .filter(|line| line_in_project(line, project))
-                .collect();
-            let filtered: Vec<&str> = if let Some(spec) = since.as_deref() {
-                let cutoff = Utc::now()
-                    - chrono::Duration::from_std(parse_duration(spec)?)
-                        .map_err(|e| anyhow!("duration `{spec}` out of range: {e}"))?;
-                scoped
-                    .into_iter()
-                    .filter(|line| line_after(line, cutoff))
-                    .collect()
-            } else {
-                let start = scoped.len().saturating_sub(lines);
-                scoped[start..].to_vec()
-            };
-            let initial = filtered
-                .iter()
-                .map(|l| (*l).to_string())
-                .collect::<Vec<_>>();
-            (initial, len)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (Vec::new(), 0),
-        Err(e) => return Err(anyhow::Error::new(e).context("reading events.log")),
+    let snapshot = shelbi_state::read_event_log_retained().map_err(|e| anyhow!(e))?;
+    let text = snapshot.text();
+    // Project scoping applies at every stage: the `-n` window and the
+    // `--since` cutoff both count from the project's own lines, not the
+    // hub-global stream, so `-n 20 --project foo` shows the last 20 foo
+    // lines rather than whatever 20 happen to trail the shared log.
+    let scoped: Vec<&str> = text
+        .lines()
+        .filter(|line| line_in_project(line, project))
+        .collect();
+    let initial: Vec<&str> = if let Some(spec) = since.as_deref() {
+        let cutoff = Utc::now()
+            - chrono::Duration::from_std(parse_duration(spec)?)
+                .map_err(|e| anyhow!("duration `{spec}` out of range: {e}"))?;
+        scoped
+            .into_iter()
+            .filter(|line| line_after(line, cutoff))
+            .collect()
+    } else {
+        let start = scoped.len().saturating_sub(lines);
+        scoped[start..].to_vec()
     };
 
-    for line in &initial {
+    for line in initial {
         print_event(line, format)?;
     }
 
@@ -129,48 +115,33 @@ fn tail(
         return Ok(());
     }
 
-    follow_from(&path, end_offset, project, format)
+    follow_from(snapshot.head, project, format)
 }
 
-/// `tail -f` shape: park at `start_offset` and print any newly appended
-/// bytes. Polling cadence (250ms) matches the workspace poller's typical
-/// inter-tick gap — fast enough to feel live, slow enough that a 10-workspace
-/// project barely touches the filesystem.
-fn follow_from(
-    path: &std::path::PathBuf,
-    start_offset: u64,
-    project: Option<&str>,
-    format: EventFormat,
-) -> Result<()> {
+/// `tail -f` shape: park at logical `start_offset` and print any newly appended
+/// bytes. Logical offsets stay valid across a rotation, so a line that lands in
+/// the old file just before it rotates still gets read. Polling cadence (250ms)
+/// matches the workspace poller's typical inter-tick gap — fast enough to feel
+/// live, slow enough that a 10-workspace project barely touches the filesystem.
+fn follow_from(start_offset: u64, project: Option<&str>, format: EventFormat) -> Result<()> {
     let interval = Duration::from_millis(250);
     let mut offset = start_offset;
     let mut pending = String::new();
     loop {
         thread::sleep(interval);
 
-        let mut file = match fs::File::open(path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(anyhow::Error::new(e).context("opening events.log")),
-        };
-        let len = file.metadata().context("stat events.log")?.len();
-
-        // File was truncated or rotated — restart from the top so we
-        // don't silently drop the new content the next writer added.
-        if len < offset {
-            offset = 0;
+        let read = shelbi_state::read_event_log_since(offset).map_err(|e| anyhow!(e))?;
+        // The offset no longer resolves (log replaced, or rotated past us):
+        // whatever fragment we were holding can't be completed.
+        if read.start != offset {
             pending.clear();
         }
-        if len == offset {
+        offset = read.head;
+        if read.bytes.is_empty() {
             continue;
         }
-        file.seek(SeekFrom::Start(offset))
-            .context("seek events.log")?;
-        let mut buf = Vec::with_capacity((len - offset) as usize);
-        file.read_to_end(&mut buf).context("read events.log")?;
-        offset = len;
 
-        pending.push_str(&String::from_utf8_lossy(&buf));
+        pending.push_str(&read.text());
         // Hold back the final fragment until its newline arrives so we
         // never print a half-written event.
         while let Some(nl) = pending.find('\n') {
