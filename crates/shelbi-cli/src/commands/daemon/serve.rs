@@ -151,6 +151,22 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// ([`shelbi_state::daemon_lock_held`]), and a daemon that lost to a probe must
 /// not exit over it. A real holder keeps it far longer than this.
 const BIND_LOCK_RETRY: Duration = Duration::from_millis(500);
+/// How often a start retries a busy bind lock.
+const BIND_LOCK_POLL: Duration = Duration::from_millis(10);
+
+/// How long a takeover successor waits for the daemon it replaces to release the
+/// bind lock. The predecessor holds it through its whole shutdown: up to
+/// [`shelbi_state::DAEMON_JOB_DRAIN`] for control jobs and then up to
+/// [`SHUTDOWN_DRAIN_TIMEOUT`] for hub handlers (see [`serve`]). Derived from both
+/// so it can't fall behind them, with [`TAKEOVER_SLACK_SECS`] for a loaded host.
+/// Past this the predecessor is wedged and the takeover has failed.
+const TAKEOVER_WAIT: Duration = Duration::from_secs(
+    shelbi_state::DAEMON_JOB_DRAIN.as_secs()
+        + SHUTDOWN_DRAIN_TIMEOUT.as_secs()
+        + TAKEOVER_SLACK_SECS,
+);
+const TAKEOVER_SLACK_SECS: u64 = 12;
+const TAKEOVER_WAIT_ENV: &str = "SHELBI_DAEMON_TAKEOVER_WAIT_MS";
 
 /// Upper bound on the number of outstanding (unacked) messages the daemon
 /// tracks at once. Every entry eventually becomes either an `ack=worker`
@@ -231,6 +247,23 @@ impl Daemon {
 /// individual clients are swallowed (logged to stderr) so the daemon
 /// keeps serving the rest of the fleet.
 pub(super) fn run_foreground() -> Result<()> {
+    serve_foreground(BIND_LOCK_RETRY)
+}
+
+/// The foreground entry for a successor taking over from a daemon that is
+/// standing down (`shelbi daemon run --takeover`): the same daemon, except it
+/// waits out the predecessor's drain for the bind lock rather than losing to it.
+/// Failing to come up is the end of the recovery attempt that launched it, so it
+/// is recorded before exiting; nothing else would ever close that attempt out.
+pub(super) fn run_takeover() -> Result<()> {
+    serve_foreground(duration_from_env_ms(TAKEOVER_WAIT_ENV, TAKEOVER_WAIT)).inspect_err(|e| {
+        eprintln!("shelbi daemon: takeover failed: {e}");
+        super::session_health::takeover_failed();
+    })
+}
+
+/// [`run_foreground`], waiting up to `lock_wait` for the bind lock.
+fn serve_foreground(lock_wait: Duration) -> Result<()> {
     // Give the hub the descriptor headroom launchd's 256 soft limit denies it:
     // the daemon holds a descriptor per open client connection plus every
     // throwaway session probe its pollers make, and hitting the cap wedges the
@@ -250,7 +283,7 @@ pub(super) fn run_foreground() -> Result<()> {
     // daemons racing through startup can't both hold it, so only the
     // winner ever probes/unlinks/binds/removes the socket — the loser
     // errors out here without touching the winner's live socket.
-    let _bind_lock = acquire_bind_lock(&sock)?;
+    let _bind_lock = acquire_bind_lock(&sock, lock_wait)?;
     prepare_socket(&sock)?;
     prune_stale_control_masters();
     reconcile_forward_modes();
@@ -312,6 +345,13 @@ pub(super) fn run_foreground() -> Result<()> {
 
     install_shutdown_listener(stop.clone(), sock.clone())?;
     spawn_reaper(daemon.clone(), stop.clone());
+    // macOS only: detect a lost GUI login session (user logged out/in while the
+    // daemon kept running) and recover by re-execing into the live session, or
+    // warn. A hermetic no-op on non-macOS, when disabled, and under a non-default
+    // root (every test). See `super::session_health`. Started before the pollers
+    // so a marker left by a predecessor closes the spawn gate before anything can
+    // spawn through it.
+    super::session_health::spawn_session_health_monitor(stop.clone(), sock.clone());
     // The single board reader per hub: one refresh loop per open project,
     // publishing `board-index.json` on each project's configured cadence.
     super::board::spawn_refresh_manager(daemon.board.clone(), stop.clone());
@@ -329,11 +369,6 @@ pub(super) fn run_foreground() -> Result<()> {
         duration_from_env_ms(IDLE_POLL_ENV, IDLE_POLL),
         || daemon_is_idle(shelbi_state::list_open_projects()),
     );
-    // macOS only: detect a lost GUI login session (user logged out/in while the
-    // daemon kept running) and recover by re-execing into the live session, or
-    // warn. A hermetic no-op on non-macOS, when disabled, and under a non-default
-    // root (every test). See `super::session_health`.
-    super::session_health::spawn_session_health_monitor(stop.clone(), sock.clone());
 
     // The mutation control socket, bound and accepting BEFORE the hub serve loop
     // below starts answering hellos — so a client that waits on hub.sock and
@@ -773,7 +808,11 @@ fn ensure_socket_dir(sock: &Path) -> Result<()> {
 /// third daemon lock a *fresh* inode while the second still holds the
 /// old one, recreating the race the lock exists to close. An orphaned
 /// `hub.sock.lock` is inert: `flock` locks die with the holder.
-fn acquire_bind_lock(sock: &Path) -> Result<fs::File> {
+///
+/// A held lock is retried until `wait` elapses: [`BIND_LOCK_RETRY`] for any start,
+/// to wait out a liveness probe, and [`TAKEOVER_WAIT`] for a successor waiting out
+/// its predecessor's shutdown (see [`run_takeover`]).
+fn acquire_bind_lock(sock: &Path, wait: Duration) -> Result<fs::File> {
     let mut lock_os = sock.as_os_str().to_os_string();
     lock_os.push(".lock");
     let lock_path = PathBuf::from(lock_os);
@@ -784,7 +823,7 @@ fn acquire_bind_lock(sock: &Path) -> Result<fs::File> {
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("opening daemon lock file {}", lock_path.display()))?;
-    let deadline = Instant::now() + BIND_LOCK_RETRY;
+    let deadline = Instant::now() + wait;
     loop {
         // SAFETY: `flock` on a valid fd we own; no memory is dereferenced.
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -795,7 +834,7 @@ fn acquire_bind_lock(sock: &Path) -> Result<fs::File> {
         match err.kind() {
             std::io::ErrorKind::Interrupted => continue,
             std::io::ErrorKind::WouldBlock if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(5));
+                thread::sleep(BIND_LOCK_POLL);
             }
             _ => {
                 return Err(anyhow!(
@@ -1803,7 +1842,8 @@ mod tests {
             thread::sleep(Duration::from_millis(40));
             drop(probe);
         });
-        acquire_bind_lock(&sock).expect("a momentary holder must not stop the start");
+        acquire_bind_lock(&sock, BIND_LOCK_RETRY)
+            .expect("a momentary holder must not stop the start");
         release.join().unwrap();
     }
 
@@ -1820,8 +1860,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("hub.sock");
 
-        let first = acquire_bind_lock(&sock).expect("first lock");
-        let second = acquire_bind_lock(&sock);
+        let first = acquire_bind_lock(&sock, Duration::ZERO).expect("first lock");
+        let second = acquire_bind_lock(&sock, Duration::ZERO);
         assert!(second.is_err(), "second lock must be refused while held");
         assert!(
             second
@@ -1831,7 +1871,38 @@ mod tests {
             "error should name the culprit"
         );
         drop(first);
-        acquire_bind_lock(&sock).expect("relock after release");
+        acquire_bind_lock(&sock, Duration::ZERO).expect("relock after release");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A takeover successor outwaits a holder that releases within the bound, and
+    /// still gives up on one that doesn't.
+    #[test]
+    fn acquire_bind_lock_waits_out_a_holder_only_up_to_the_bound() {
+        let dir = std::env::temp_dir().join(format!(
+            "shelbi-daemon-lock-wait-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("hub.sock");
+
+        let holder = acquire_bind_lock(&sock, Duration::ZERO).expect("holder");
+        assert!(
+            acquire_bind_lock(&sock, Duration::from_millis(150)).is_err(),
+            "a holder that outlasts the bound still wins"
+        );
+
+        let release = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            drop(holder);
+        });
+        acquire_bind_lock(&sock, Duration::from_secs(10))
+            .expect("the waiter takes the lock once the holder lets go");
+        release.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
