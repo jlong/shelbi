@@ -938,10 +938,10 @@ impl IssuesModel {
             loading: input.loading,
             banner: input.banner.clone(),
             error: input.error.clone(),
-            done_loading: !input.closed_loaded && !search.showing_results(),
+            done_loading: !input.closed.landed() && !search.showing_results(),
             has_more_done: match search.status() {
                 Some(status) if search.showing_results() => status.has_more,
-                _ => input.closed_next_cursor.is_some(),
+                _ => input.closed.has_more(),
             },
             search: search.status(),
             show_workflow_badges: board::show_card_workflow_label(
@@ -2005,12 +2005,16 @@ mod tests {
     }
 
     fn board_input(open: Vec<IssueFile>) -> BoardInput {
-        BoardInput {
+        let mut input = BoardInput {
             open,
             loading: false,
-            closed_loaded: true,
             ..BoardInput::default()
-        }
+        };
+        input.apply_closed(Some(board::ClosedPage {
+            issues: Vec::new(),
+            next_cursor: None,
+        }));
+        input
     }
 
     #[test]
@@ -2075,8 +2079,11 @@ mod tests {
 
     #[test]
     fn issues_board_done_column_fills_from_the_closed_page_newest_first() {
-        let mut input = board_input(vec![issue("T-1", "todo")]);
-        input.closed_loaded = false;
+        let mut input = BoardInput {
+            open: vec![issue("T-1", "todo")],
+            loading: false,
+            ..BoardInput::default()
+        };
         let model = IssuesModel::build(&input, &BoardFilters::default());
         assert!(model.done_loading, "done is still filling until a closed page lands");
         assert_eq!(model.columns[1].cards.len(), 1, "the open board never waits on history");

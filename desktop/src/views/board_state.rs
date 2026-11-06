@@ -43,8 +43,8 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use shelbi_app::board::{
-    self, BoardInput, BoardRead, ClosedPage, DropTarget, WorkflowOption, WorkspaceFilter,
-    WorkspaceOption,
+    self, BoardInput, BoardRead, ClosedPage, DropTarget, MoreRequest, WorkflowOption, WorkspaceFilter,
+    WorkspaceOption, LOADING_MORE_STATUS,
 };
 use shelbi_app::board_search::{BoardSearch, SearchRequest, SearchWorker};
 use shelbi_app::issue_edit::{self, Field, SaveJob, SaveStatus, SharedEdits, Snapshot};
@@ -504,14 +504,24 @@ impl BoardState {
         self.rebuild();
     }
 
-    pub fn apply_more(&mut self, page: Result<ClosedPage, String>) {
-        match page {
-            Ok(page) => {
-                self.input.apply_more(page);
-                self.rebuild();
-            }
-            Err(e) => self.status = Some(e),
+    /// Start a "load more" fetch of the done history. `None` when there's
+    /// nothing to fetch, or one is already running.
+    pub fn begin_more(&mut self) -> Option<MoreRequest> {
+        let request = self.input.closed.begin_more()?;
+        self.status = Some(LOADING_MORE_STATUS.into());
+        Some(request)
+    }
+
+    /// Fold the answer to [`begin_more`](Self::begin_more)'s fetch.
+    pub fn apply_more(&mut self, request: &MoreRequest, page: Result<ClosedPage, String>) {
+        let result = self.input.finish_more(request, page);
+        if !self.input.closed.fetching() && self.status.as_deref() == Some(LOADING_MORE_STATUS) {
+            self.status = None;
         }
+        if let Err(e) = result {
+            self.status = Some(e);
+        }
+        self.rebuild();
     }
 
     fn rebuild(&mut self) {
@@ -1772,8 +1782,9 @@ impl BoardState {
         }
     }
 
+    #[cfg(test)]
     pub fn closed_cursor(&self) -> Option<&str> {
-        self.input.closed_next_cursor.as_deref()
+        self.input.closed.next_cursor()
     }
 
     // ---- mutations --------------------------------------------------------
@@ -3102,6 +3113,86 @@ pub(crate) mod tests {
         }));
         assert!(!b.model().done_loading);
         assert_eq!(press(&mut b, "m"), vec![Intent::LoadMore]);
+    }
+
+    // ---- done-history paging ----------------------------------------------
+
+    fn closed_page(ids: &[&str], next: Option<&str>) -> ClosedPage {
+        ClosedPage {
+            issues: ids.iter().map(|id| issue(id, "done")).collect(),
+            next_cursor: next.map(str::to_string),
+        }
+    }
+
+    /// Run "load more" as the view does, answered with `page`; the cursor asked for.
+    fn load_more(b: &mut BoardState, page: ClosedPage) -> String {
+        let request = b.begin_more().expect("a next page");
+        b.apply_more(&request, Ok(page));
+        request.cursor
+    }
+
+    #[test]
+    fn loaded_pages_survive_a_refresh_that_keeps_page_one() {
+        let mut b = fresh_board();
+        b.apply_open(read(vec![issue("A", "todo")]));
+        b.apply_closed(Some(closed_page(&["D-1"], Some("p2"))));
+        assert_eq!(load_more(&mut b, closed_page(&["D-2"], Some("p3"))), "p2");
+
+        // The refresher's read differs (its fingerprint does, so it's folded),
+        // but page 1 holds the same card.
+        let mut edited = closed_page(&["D-1"], Some("p2"));
+        edited.issues[0].task.title = "edited".into();
+        b.apply_closed(Some(edited));
+
+        assert!(b.model().card("D-2").is_some(), "the loaded page stays");
+        assert_eq!(b.model().card("D-1").unwrap().title, "edited");
+        assert_eq!(b.closed_cursor(), Some("p3"));
+        assert_eq!(load_more(&mut b, closed_page(&["D-3"], None)), "p3", "page 2 isn't fetched again");
+        assert!(!b.model().has_more_done);
+    }
+
+    #[test]
+    fn a_refresh_that_changes_page_one_resets_the_loaded_pages() {
+        let mut b = fresh_board();
+        b.apply_open(read(vec![issue("A", "todo")]));
+        b.apply_closed(Some(closed_page(&["D-1"], Some("p2"))));
+        load_more(&mut b, closed_page(&["D-2"], Some("p3")));
+
+        b.apply_closed(Some(closed_page(&["NEW"], Some("p2-new"))));
+
+        assert!(b.model().card("D-2").is_none());
+        assert_eq!(b.closed_cursor(), Some("p2-new"));
+    }
+
+    #[test]
+    fn a_fetch_a_new_page_one_abandoned_doesnt_land() {
+        let mut b = fresh_board();
+        b.apply_open(read(vec![issue("A", "todo")]));
+        b.apply_closed(Some(closed_page(&["D-1"], Some("p2"))));
+        let stale = b.begin_more().expect("a next page");
+        assert_eq!(b.status.as_deref(), Some(LOADING_MORE_STATUS));
+
+        b.apply_closed(Some(closed_page(&["NEW"], Some("p2-new"))));
+        b.apply_more(&stale, Ok(closed_page(&["OLD"], Some("p3-old"))));
+
+        assert!(b.model().card("OLD").is_none());
+        assert_eq!(b.closed_cursor(), Some("p2-new"));
+        assert_eq!(b.status, None, "and the fetch's status clears with it");
+    }
+
+    #[test]
+    fn load_more_shows_its_status_until_it_lands_and_a_failure_retries_the_page() {
+        let mut b = fresh_board();
+        b.apply_open(read(vec![issue("A", "todo")]));
+        b.apply_closed(Some(closed_page(&["D-1"], Some("p2"))));
+
+        let request = b.begin_more().expect("a next page");
+        assert!(b.begin_more().is_none(), "one fetch at a time");
+        b.apply_more(&request, Err("load more failed: boom".into()));
+        assert_eq!(b.status.as_deref(), Some("load more failed: boom"));
+
+        assert_eq!(load_more(&mut b, closed_page(&["D-2"], None)), "p2");
+        assert_eq!(b.status, None);
     }
 
     // ---- drag and drop (dt-board-dnd) -------------------------------------
