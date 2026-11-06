@@ -395,12 +395,10 @@ pub trait SessionBackend {
 
     // --- enumerate ------------------------------------------------------
 
-    /// Enumerate the live slots bound under a session. `Ok(None)` when the
-    /// command ran but the session/server is absent; `Err` only on a
-    /// transport/spawn failure (so a probe can distinguish "no session" from
-    /// "couldn't ask"). `deadline` bounds the call when `Some`. For the tmux
-    /// backend a local slot is a window inside the shared project session, so
-    /// this lists that session's windows.
+    /// Enumerate the live slots bound under a session. An empty list means the
+    /// machine answered and has none; `Ok(None)` or `Err` means it could not be
+    /// asked, which [`Liveness::Unreachable`] keeps apart from "no session".
+    /// `deadline` bounds the call when `Some`.
     fn enumerate_slots(
         &self,
         host: &Host,

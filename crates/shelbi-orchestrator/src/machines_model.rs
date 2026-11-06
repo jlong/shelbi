@@ -36,7 +36,7 @@ pub fn read_machines_input(project_name: &str) -> anyhow::Result<MachinesInput> 
         .workspaces
         .iter()
         .filter_map(|w| {
-            load_workspace_status(&w.name)
+            load_workspace_status(project_name, &w.name)
                 .ok()
                 .flatten()
                 .map(|s| (w.name.clone(), s))

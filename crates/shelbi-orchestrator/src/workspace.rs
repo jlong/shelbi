@@ -2025,23 +2025,55 @@ fn append_message_log_line(
         .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
-/// Every tmux window id currently bound to a local slot's name. Local
-/// workspaces are windows inside the shared project session, so a slot can
-/// (under a raced relaunch — e.g. the crash supervisor and a `shelbi task
-/// resume` both re-running `new-window` before the prior window is torn down)
-/// accrete more than one window sharing its name. Teardown has to reap all of
-/// them, so it enumerates ids here rather than trusting a single name match.
-/// Does the workspace have a live agent session right now? Enumerates the live
-/// slots under the workspace's session and matches its role name.
-pub fn workspace_pane_alive(host: &Host, target: &SessionTarget) -> Result<bool> {
-    let want = target.slot_role().unwrap_or("");
-    match backend()
-        .enumerate_slots(host, &SessionTarget::session(target.session_name()), None)
-        .map_err(Error::Io)?
-    {
-        Some(slots) => Ok(slots.iter().any(|w| w.name == want)),
-        None => Ok(false),
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the probe in a test, which has no relay to lose.
+    static TEST_PANE_LIVENESS: std::cell::RefCell<Option<Liveness>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_pane_liveness(liveness: Option<Liveness>) {
+    TEST_PANE_LIVENESS.with(|c| *c.borrow_mut() = liveness);
+}
+
+/// Classify an [`enumerate_slots`](SessionBackend::enumerate_slots) answer for
+/// the slot named `want`. `Ok(None)` and `Err` both mean the machine could not
+/// be asked, which is not the same as it having no such session.
+fn slot_liveness(
+    slots: std::io::Result<Option<Vec<crate::session_backend::SlotInfo>>>,
+    want: &str,
+) -> Liveness {
+    match slots {
+        Ok(Some(slots)) if slots.iter().any(|w| w.name == want) => Liveness::Alive,
+        Ok(Some(_)) => Liveness::Dead,
+        Ok(None) => Liveness::Unreachable {
+            reason: format!("could not reach the machine to check session `{want}`"),
+        },
+        Err(e) => Liveness::Unreachable {
+            reason: format!("checking session `{want}`: {e}"),
+        },
     }
+}
+
+/// Probe the workspace's agent session: enumerate the live slots under its
+/// session and match its role name.
+pub fn workspace_pane_liveness(host: &Host, target: &SessionTarget) -> Liveness {
+    #[cfg(test)]
+    if let Some(liveness) = TEST_PANE_LIVENESS.with(|c| c.borrow().clone()) {
+        return liveness;
+    }
+    slot_liveness(
+        backend().enumerate_slots(host, &SessionTarget::session(target.session_name()), None),
+        target.slot_role().unwrap_or(""),
+    )
+}
+
+/// Does the workspace have a live agent session right now? `Err` when the
+/// machine could not be asked, so a caller's own policy for uncertainty applies
+/// rather than an unreachable machine reading as a dead session.
+pub fn workspace_pane_alive(host: &Host, target: &SessionTarget) -> Result<bool> {
+    workspace_pane_liveness(host, target).into_exists()
 }
 
 /// Does this workspace slot have a live allocation right now? Probes the
@@ -2283,8 +2315,8 @@ const REVIEW_SERVER_TERM_GRACE: std::time::Duration = std::time::Duration::from_
 /// which is why this is safe on every `kill_workspace_pane` (dev slots and
 /// remote review slots simply have no record). Best-effort throughout: a read
 /// error degrades to the pre-fix behavior rather than blocking teardown.
-pub(crate) fn stop_review_server(workspace: &str) {
-    let pgid = match shelbi_state::read_review_serve_pgid(workspace) {
+pub(crate) fn stop_review_server(project: &str, workspace: &str) {
+    let pgid = match shelbi_state::read_review_serve_pgid(project, workspace) {
         Ok(Some(p)) => p,
         Ok(None) => return,
         Err(e) => {
@@ -2295,7 +2327,7 @@ pub(crate) fn stop_review_server(workspace: &str) {
     if terminate_process_group(pgid) {
         tracing::info!(workspace, pgid, "reaped review dev server process group");
     }
-    let _ = shelbi_state::clear_review_serve_pgid(workspace);
+    let _ = shelbi_state::clear_review_serve_pgid(project, workspace);
 }
 
 /// May we `kill(-pgid, …)` `pgid` from a process whose own group is `own_pgid`?
@@ -2379,12 +2411,13 @@ fn terminate_process_group(_pgid: i32) -> bool {
 /// recorded on a slot that is already dead too: stopping a pane that crashed a
 /// moment ago, or handing off from one, must still stand the supervisor down.
 pub fn kill_workspace_pane(
+    project: &str,
     host: &Host,
     target: &SessionTarget,
     workspace_name: &str,
     reason: KillReason,
 ) -> Result<()> {
-    stop_review_server(workspace_name);
+    stop_review_server(project, workspace_name);
     // Kill the slot itself on every host. A remote workspace's slot target
     // (`shelbi-w-<name>`, `agent`) maps to the remote session `w-<name>/ws/agent`;
     // re-addressing it as the bare *session* `shelbi-w-<name>` (the tmux-era
@@ -3155,7 +3188,13 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
 
     // 3. Reset the agent session — that's how we clear context. If it doesn't
     //    exist yet, this is a no-op; otherwise the next step recreates it.
-    kill_workspace_pane(a.host, a.addr, &a.workspace.name, KillReason::Redispatch)?;
+    kill_workspace_pane(
+        &a.project.name,
+        a.host,
+        a.addr,
+        &a.workspace.name,
+        KillReason::Redispatch,
+    )?;
 
     // 4 + 5. Spawn the agent session and launch the agent.
     //
@@ -6220,7 +6259,7 @@ fn review_dispatch_extras(
     // wrapper (shelbi on PATH) and the hub-side pgid file resolve on the same
     // machine the server runs on.
     let pgid_file = matches!(host, Host::Local)
-        .then(|| shelbi_state::review_serve_pgid_path(&workspace.name).ok())
+        .then(|| shelbi_state::review_serve_pgid_path(&project.name, &workspace.name).ok())
         .flatten()
         .map(|p| p.to_string_lossy().into_owned());
     let section = review_recipe_section(project, task_id, port, pgid_file.is_some());
@@ -11907,7 +11946,7 @@ mod review_server_tests {
         // kept ONLY so the test can reap the (soon-dead) leader at the end;
         // `stop_review_server` never sees it — it works purely from this file,
         // which is what makes the restart case hold.
-        let path = shelbi_state::review_serve_pgid_path("rev").unwrap();
+        let path = shelbi_state::review_serve_pgid_path("demo", "rev").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{pgid}\n")).unwrap();
 
@@ -11915,7 +11954,7 @@ mod review_server_tests {
         assert!(pid_alive(gc_pid), "grandchild should be alive before teardown");
         assert!(pgroup_alive(pgid), "group should be alive before teardown");
 
-        stop_review_server("rev");
+        stop_review_server("demo", "rev");
 
         // Reap the (now-killed) leader first: it's the test's own child, so
         // until we wait() it, it lingers as a zombie and still answers
@@ -11932,13 +11971,43 @@ mod review_server_tests {
             "the grandchild (pid {gc_pid}) must be gone after teardown"
         );
         assert!(
-            shelbi_state::read_review_serve_pgid("rev")
+            shelbi_state::read_review_serve_pgid("demo", "rev")
                 .unwrap()
                 .is_none(),
             "the pgid record must be cleared after teardown"
         );
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Slots listed means the machine answered. Anything else is "couldn't
+    /// ask", which must stay apart from "no session" (the SSH backend answers
+    /// `Ok(None)` when its relay can't be reached).
+    #[test]
+    fn slot_liveness_keeps_unreachable_apart_from_dead() {
+        let slot = |name: &str| crate::session_backend::SlotInfo {
+            id: name.to_string(),
+            name: name.to_string(),
+        };
+        assert_eq!(slot_liveness(Ok(Some(vec![slot("rev")])), "rev"), Liveness::Alive);
+        assert_eq!(slot_liveness(Ok(Some(vec![slot("other")])), "rev"), Liveness::Dead);
+        assert_eq!(slot_liveness(Ok(Some(vec![])), "rev"), Liveness::Dead);
+        assert!(matches!(slot_liveness(Ok(None), "rev"), Liveness::Unreachable { .. }));
+        assert!(matches!(
+            slot_liveness(Err(std::io::Error::other("ssh died")), "rev"),
+            Liveness::Unreachable { .. }
+        ));
+    }
+
+    /// A caller with its own policy for uncertainty (the poller's "reads as
+    /// alive" probes) gets an error it can apply that policy to, not `false`.
+    #[test]
+    fn workspace_pane_alive_errors_when_the_machine_cannot_be_asked() {
+        set_test_pane_liveness(Some(Liveness::Unreachable { reason: "relay down".into() }));
+        let target = SessionTarget::session("shelbi-demo");
+        let got = workspace_pane_alive(&Host::Local, &target);
+        set_test_pane_liveness(None);
+        assert!(got.is_err(), "unreachable must not read as a dead session: {got:?}");
     }
 
     /// A missing pgid record (a dev slot, a remote review slot, or a load that
@@ -11952,8 +12021,8 @@ mod review_server_tests {
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
         // No pgid file written → must not panic and must leave no record.
-        stop_review_server("rev");
-        assert!(shelbi_state::read_review_serve_pgid("rev").unwrap().is_none());
+        stop_review_server("demo", "rev");
+        assert!(shelbi_state::read_review_serve_pgid("demo", "rev").unwrap().is_none());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -11993,14 +12062,14 @@ mod review_server_tests {
 
         // Safety: `getpgrp()` only reads our process-group id.
         let own_pgid = unsafe { libc::getpgrp() } as i32;
-        let path = shelbi_state::review_serve_pgid_path("rev").unwrap();
+        let path = shelbi_state::review_serve_pgid_path("demo", "rev").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{own_pgid}\n")).unwrap();
 
         // Must not signal our own group; still clears the (bogus) record.
-        stop_review_server("rev");
+        stop_review_server("demo", "rev");
 
-        assert!(shelbi_state::read_review_serve_pgid("rev").unwrap().is_none());
+        assert!(shelbi_state::read_review_serve_pgid("demo", "rev").unwrap().is_none());
         std::env::remove_var("SHELBI_HOME");
     }
 }

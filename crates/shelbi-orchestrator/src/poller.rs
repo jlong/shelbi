@@ -52,7 +52,7 @@
 //!   instead of discovering a wedged board hours later.
 //!
 //! On a state change the poller writes two files:
-//! - `~/.shelbi/workspaces/<name>/status.yaml` — last observed state.
+//! - `~/.shelbi/projects/<project>/workspaces/<name>/status.yaml` — last observed state.
 //! - `~/.shelbi/events.log` — append-only transition history.
 //!
 //! On a same-state observation it still bumps `last_seen` in
@@ -76,7 +76,9 @@ use shelbi_core::{
     default_workflow, Column, IssueTrackerBackend, Project, StatusCategory, Workflow,
     DEFAULT_WORKFLOW_NAME,
 };
-use crate::session_backend::{backend, KillReason, SessionBackend, SessionTarget, SlotDeath};
+use crate::session_backend::{
+    backend, KillReason, Liveness, SessionBackend, SessionTarget, SlotDeath,
+};
 use crate::supervision::{
     SupervisionAction, SupervisionInputs, SupervisionState, BASE_BACKOFF, CRASH_LOOP_WINDOW,
     MAX_RESTARTS_IN_WINDOW, STABLE_RECOVERY,
@@ -1638,7 +1640,23 @@ fn poll_one(
 
     // No pane → no marker. The display-message call would fail anyway,
     // but checking up-front keeps stderr noise out of the log.
-    let alive = crate::workspace::workspace_pane_alive(&host, &addr).unwrap_or(false);
+    let alive = match crate::workspace::workspace_pane_liveness(&host, &addr) {
+        Liveness::Alive => true,
+        Liveness::Dead => false,
+        // The machine couldn't be asked (an SSH relay blip). The session is
+        // most likely still running, so this says nothing about the pane: end
+        // the tick with every latch intact, a scheduled limit-resume above all.
+        // It fires on the first tick the machine answers again.
+        Liveness::Unreachable { reason } => {
+            tracing::debug!(
+                project = %project.name,
+                workspace = %workspace.name,
+                reason,
+                "keeping pane state until the machine answers",
+            );
+            return;
+        }
+    };
 
     // Auto-restart supervision runs off this same liveness read (it's the
     // backstop for a lost `pane_alive=false` event): a pane that crashed with
@@ -1749,7 +1767,7 @@ fn poll_one(
                     *last_dialog = None;
                     *unknown_dialog_streak = 0;
                     *idle_debounce_streak = 0;
-                    let prior = load_prior(&workspace.name, last_known);
+                    let prior = load_prior(&project.name, &workspace.name, last_known);
                     let outcome = decide(
                         &workspace.name,
                         Some(task_id),
@@ -1757,7 +1775,7 @@ fn poll_one(
                         WorkspaceState::Blocked,
                         Utc::now(),
                     );
-                    if let Err(e) = save_workspace_status(&outcome.status) {
+                    if let Err(e) = save_workspace_status(&project.name, &outcome.status) {
                         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status failed");
                     }
                     if outcome.transitioned {
@@ -1830,7 +1848,7 @@ fn poll_one(
         if limit_resume
             .tracked_task()
             .is_some_and(|scheduled| scheduled != task_id)
-            || paused_status_belongs_to_other_task(&workspace.name, &task_id)
+            || paused_status_belongs_to_other_task(&project.name, &workspace.name, &task_id)
         {
             suppress_limit_banner(
                 project,
@@ -1891,7 +1909,7 @@ fn poll_one(
             // Do not let the known-stale pane title clear a persisted pause
             // when the screen offered no current recovery proof. A later
             // busy/ready sample, pane death, or lifecycle change advances it.
-            if workspace_is_paused(&workspace.name, last_known) && !recovered {
+            if workspace_is_paused(&project.name, &workspace.name, last_known) && !recovered {
                 *last_dialog = None;
                 return;
             }
@@ -1951,7 +1969,7 @@ fn poll_one(
     // Bootstrap previous state from disk on first sighting so a hub
     // restart doesn't emit a bogus `none -> X` event for state we've
     // already recorded.
-    let prior = load_prior(&workspace.name, last_known);
+    let prior = load_prior(&project.name, &workspace.name, last_known);
 
     // Debounce the false-idle `working -> awaiting_input` edge: a lone
     // mid-repaint capture that misses the live spinner row would otherwise flip a
@@ -1985,7 +2003,7 @@ fn poll_one(
         Utc::now(),
     );
 
-    if let Err(e) = save_workspace_status(&outcome.status) {
+    if let Err(e) = save_workspace_status(&project.name, &outcome.status) {
         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status failed");
     }
     if outcome.transitioned {
@@ -2173,16 +2191,20 @@ fn maybe_emit_dialog_event(
 /// on-disk `status.yaml` on first sighting after a hub restart. Shared by the
 /// title path and the usage-limit pause path so both bootstrap identically and
 /// a restart doesn't emit a bogus `none -> X` for state already recorded.
-fn load_prior(workspace_name: &str, last_known: &Option<WorkspaceState>) -> Option<PriorState> {
+fn load_prior(
+    project: &str,
+    workspace_name: &str,
+    last_known: &Option<WorkspaceState>,
+) -> Option<PriorState> {
     match *last_known {
         Some(s) => Some(PriorState {
             state: s,
-            last_transition: load_workspace_status(workspace_name)
+            last_transition: load_workspace_status(project, workspace_name)
                 .ok()
                 .flatten()
                 .map(|s| s.last_transition),
         }),
-        None => load_workspace_status(workspace_name)
+        None => load_workspace_status(project, workspace_name)
             .ok()
             .flatten()
             .map(|s| PriorState {
@@ -2210,7 +2232,7 @@ fn record_usage_limit_pause(
     last_known: &mut Option<WorkspaceState>,
     reset: Option<&str>,
 ) -> DateTime<Utc> {
-    let prior = load_prior(&workspace.name, last_known);
+    let prior = load_prior(&project.name, &workspace.name, last_known);
     let current_task = current_task_for(project, &workspace.name);
     let outcome = decide(
         &workspace.name,
@@ -2220,7 +2242,7 @@ fn record_usage_limit_pause(
         Utc::now(),
     );
 
-    if let Err(e) = save_workspace_status(&outcome.status) {
+    if let Err(e) = save_workspace_status(&project.name, &outcome.status) {
         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status failed");
     }
     if outcome.transitioned {
@@ -2252,9 +2274,9 @@ fn record_limit_resume_state(
     new_state: WorkspaceState,
     last_known: &mut Option<WorkspaceState>,
 ) {
-    let prior = load_prior(&workspace.name, last_known);
+    let prior = load_prior(&project.name, &workspace.name, last_known);
     let outcome = decide(&workspace.name, current_task, prior, new_state, Utc::now());
-    if let Err(e) = save_workspace_status(&outcome.status) {
+    if let Err(e) = save_workspace_status(&project.name, &outcome.status) {
         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status after limit resume failed");
     }
     if outcome.transitioned {
@@ -2270,10 +2292,14 @@ fn record_limit_resume_state(
     *last_known = Some(new_state);
 }
 
-fn workspace_is_paused(workspace_name: &str, last_known: &Option<WorkspaceState>) -> bool {
+fn workspace_is_paused(
+    project: &str,
+    workspace_name: &str,
+    last_known: &Option<WorkspaceState>,
+) -> bool {
     matches!(last_known, Some(WorkspaceState::Paused))
         || matches!(
-            load_workspace_status(workspace_name),
+            load_workspace_status(project, workspace_name),
             Ok(Some(status)) if status.state == WorkspaceState::Paused
         )
 }
@@ -2288,7 +2314,7 @@ fn record_limit_recovery_from_screen(
     screen: &str,
     last_known: &mut Option<WorkspaceState>,
 ) -> bool {
-    if !workspace_is_paused(&workspace.name, last_known) {
+    if !workspace_is_paused(&project.name, &workspace.name, last_known) {
         return false;
     }
     // Background work in flight reads as working here too (see
@@ -2736,9 +2762,9 @@ fn limit_banner_key(stall: &crate::ready::UsageLimitStall) -> String {
 /// A persisted Paused state survives poller restarts and carries the task that
 /// originally hit the limit. If that task no longer owns the slot, its visible
 /// banner must not seed a schedule for a replacement task.
-fn paused_status_belongs_to_other_task(workspace: &str, task_id: &str) -> bool {
+fn paused_status_belongs_to_other_task(project: &str, workspace: &str, task_id: &str) -> bool {
     matches!(
-        load_workspace_status(workspace),
+        load_workspace_status(project, workspace),
         Ok(Some(status))
             if status.state == WorkspaceState::Paused
                 && status.current_task.as_deref() != Some(task_id)
@@ -3203,6 +3229,7 @@ fn maybe_apply_ready_handoff(
             // a loaded task, not a just-finished in-progress one).
             if !project.effective_tags(workspace).contains("review") {
                 if let Err(e) = crate::workspace::kill_workspace_pane(
+                    &project.name,
                     host,
                     addr,
                     &workspace.name,
@@ -3614,6 +3641,7 @@ fn maybe_apply_transition(
                             // gone is a silent no-op — and it runs only AFTER the
                             // move so work is never stranded.
                             if let Err(e) = crate::workspace::kill_workspace_pane(
+                                &project.name,
                                 host,
                                 addr,
                                 &workspace.name,
@@ -4769,7 +4797,7 @@ fn slot_current_review_task(project: &Project, workspace_name: &str) -> Option<S
         Ok(shelbi_state::BoardState::Warm(board) | shelbi_state::BoardState::Stale(board)) => {
             review_task_on_board(project, board, workspace_name)
         }
-        Ok(shelbi_state::BoardState::Cold) | Err(_) => load_workspace_status(workspace_name)
+        Ok(shelbi_state::BoardState::Cold) | Err(_) => load_workspace_status(&project.name, workspace_name)
             .ok()
             .flatten()
             .filter(|status| status.state == WorkspaceState::Serving)
@@ -6391,13 +6419,13 @@ fn record_review_serving(
     url: Option<&str>,
     last_known: &mut Option<WorkspaceState>,
 ) {
-    let serving_another = match load_workspace_status(&workspace.name) {
+    let serving_another = match load_workspace_status(&project.name, &workspace.name) {
         Ok(status) => status.and_then(|s| s.current_task).as_deref() != Some(task_id),
         // An unreadable status proves nothing, and treating it as an edge would
         // emit on every tick it stays unreadable.
         Err(_) => false,
     };
-    let prior = load_prior(&workspace.name, last_known)
+    let prior = load_prior(&project.name, &workspace.name, last_known)
         .filter(|p| !(p.state == WorkspaceState::Serving && serving_another));
     let outcome = decide(
         &workspace.name,
@@ -6406,7 +6434,7 @@ fn record_review_serving(
         WorkspaceState::Serving,
         Utc::now(),
     );
-    if let Err(e) = save_workspace_status(&outcome.status) {
+    if let Err(e) = save_workspace_status(&project.name, &outcome.status) {
         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status (serving) failed");
     }
     if outcome.transitioned {
@@ -6555,13 +6583,19 @@ fn maybe_reap_orphaned_review_slot(
         | crate::workspace::SlotProbe::Dead
         | crate::workspace::SlotProbe::Unreachable { .. } => return had_marker,
     }
-    match crate::workspace::kill_workspace_pane(host, addr, &workspace.name, KillReason::Reap) {
+    match crate::workspace::kill_workspace_pane(
+        &project.name,
+        host,
+        addr,
+        &workspace.name,
+        KillReason::Reap,
+    ) {
         Ok(()) => {
             // Drop the now-idle slot's stale status.yaml so `shelbi workspace
             // status` stops reporting the agent's last observed state (a killed
             // pane emits no further markers, so the poller could never refresh
             // it — it would stay frozen at `working`/`blocked` for hours).
-            if let Err(e) = shelbi_state::clear_workspace_status(&workspace.name) {
+            if let Err(e) = shelbi_state::clear_workspace_status(&project.name, &workspace.name) {
                 tracing::warn!(workspace = %workspace.name, error = %e, "clear_workspace_status failed");
             }
             if let Err(e) = shelbi_state::append_workspace_pane_event(
@@ -6769,12 +6803,18 @@ fn maybe_reconcile_orphaned_pane(
     // Orphan confirmed. Close the slot and record the reap. Our own
     // `pane_alive=false reason=orphaned-slot-reaped` is the trail the
     // orchestrator (and `shelbi events tail`) sees for the freed slot.
-    match crate::workspace::kill_workspace_pane(host, addr, &workspace.name, KillReason::Reap) {
+    match crate::workspace::kill_workspace_pane(
+        &project.name,
+        host,
+        addr,
+        &workspace.name,
+        KillReason::Reap,
+    ) {
         Ok(()) => {
             // Drop the freed slot's stale status.yaml (a killed pane emits no
             // further markers, so the poller can't refresh it) so it returns to
             // a clean idle rather than reporting its last observed state.
-            if let Err(e) = shelbi_state::clear_workspace_status(&workspace.name) {
+            if let Err(e) = shelbi_state::clear_workspace_status(&project.name, &workspace.name) {
                 tracing::warn!(workspace = %workspace.name, error = %e, "clear_workspace_status failed");
             }
             if let Err(e) = shelbi_state::append_workspace_pane_event(
@@ -7263,7 +7303,7 @@ mod tests {
         let mut last_known = None;
         record_review_serving(&project, &ws, "t-serve", None, &mut last_known);
 
-        let s = shelbi_state::load_workspace_status(&ws.name)
+        let s = shelbi_state::load_workspace_status(&project.name, &ws.name)
             .unwrap()
             .expect("status.yaml written");
         assert_eq!(s.state, WorkspaceState::Serving);
@@ -7273,7 +7313,7 @@ mod tests {
 
         // Same state again → not a transition; last_transition is preserved.
         record_review_serving(&project, &ws, "t-serve", None, &mut last_known);
-        let s2 = shelbi_state::load_workspace_status(&ws.name).unwrap().unwrap();
+        let s2 = shelbi_state::load_workspace_status(&project.name, &ws.name).unwrap().unwrap();
         assert_eq!(s2.state, WorkspaceState::Serving);
         assert_eq!(s2.last_transition, first_transition);
 
@@ -8932,13 +8972,13 @@ Auto mode works better when it knows your environment. Takes about a minute.
             last_transition: Utc::now(),
             last_seen: Utc::now(),
         };
-        save_workspace_status(&status(WorkspaceState::Serving, "t")).unwrap();
+        save_workspace_status(&project.name, &status(WorkspaceState::Serving, "t")).unwrap();
         assert_eq!(serving_task(&project).as_deref(), Some("t"));
 
         // Serving something else, or not serving: the marker doesn't count.
-        save_workspace_status(&status(WorkspaceState::Serving, "other")).unwrap();
+        save_workspace_status(&project.name, &status(WorkspaceState::Serving, "other")).unwrap();
         assert_eq!(serving_task(&project), None);
-        save_workspace_status(&status(WorkspaceState::AwaitingInput, "t")).unwrap();
+        save_workspace_status(&project.name, &status(WorkspaceState::AwaitingInput, "t")).unwrap();
         assert_eq!(serving_task(&project), None);
 
         match prior {
@@ -8984,7 +9024,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
             crate::workspace::read_review_loaded_marker(&Host::Local, &marker).unwrap().as_deref(),
             Some("task-b"),
         );
-        let status = load_workspace_status(&ws.name).unwrap().unwrap();
+        let status = load_workspace_status(&project.name, &ws.name).unwrap().unwrap();
         assert_eq!(status.current_task.as_deref(), Some("task-b"));
 
         // Only the edge fires: B staying serving is silent.
@@ -9004,7 +9044,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         let ws = project.workspaces[0].clone();
         let mut last_known = None;
         record_review_serving(&project, &ws, "task-a", None, &mut last_known);
-        shelbi_state::clear_workspace_status(&ws.name).unwrap();
+        shelbi_state::clear_workspace_status(&project.name, &ws.name).unwrap();
         assert_eq!(last_known, Some(WorkspaceState::Serving));
 
         record_review_serving(&project, &ws, "task-b", None, &mut last_known);
@@ -9641,6 +9681,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
         let ws = &project.workspaces[0];
         let addr = crate::workspace::workspace_target(&project, ws).unwrap();
         crate::workspace::kill_workspace_pane(
+            &project.name,
             &shelbi_core::Host::Local,
             &addr,
             &ws.name,
@@ -10019,6 +10060,94 @@ Auto mode works better when it knows your environment. Takes about a minute.
         std::env::remove_var("SHELBI_HUB_SOCK");
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An SSH relay blip used to read as a dead pane and wipe every latch, so a
+    /// worker waiting out a usage limit lost its scheduled resume and sat paused
+    /// until a human noticed. Only a real death may do that.
+    #[test]
+    fn a_relay_blip_keeps_the_scheduled_limit_resume_and_a_death_drops_it() {
+        use crate::session_backend::Liveness;
+
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-blip-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let project = local_project(&work_dir);
+        shelbi_state::save_project(&project).unwrap();
+
+        let scheduled = LimitResumeState::Scheduled {
+            incident: LimitResumeIncident {
+                task_id: "fix-login".into(),
+                banner: "session-limit-11:20".into(),
+                reset_hint: Some("11:20am (America/New_York)".into()),
+            },
+            due: Utc::now() + chrono::Duration::hours(1),
+            attempts: 0,
+        };
+        let mut limit_resume = scheduled.clone();
+        let mut last_dialog = Some("trust".to_string());
+        let mut dialog_streak = 2;
+        let mut idle_streak = 1;
+        let mut agent_exited = true;
+        let tick = |limit_resume: &mut LimitResumeState,
+                        last_dialog: &mut Option<String>,
+                        dialog_streak: &mut u32,
+                        idle_streak: &mut u32,
+                        agent_exited: &mut bool| {
+            poll_one(
+                &project,
+                &project.workspaces[0],
+                &mut None,
+                last_dialog,
+                dialog_streak,
+                idle_streak,
+                agent_exited,
+                &mut SupervisionState::default(),
+                limit_resume,
+                &mut OrphanReap::default(),
+                &mut HashMap::new(),
+            );
+        };
+
+        crate::workspace::set_test_pane_liveness(Some(Liveness::Unreachable {
+            reason: "relay down".into(),
+        }));
+        tick(
+            &mut limit_resume,
+            &mut last_dialog,
+            &mut dialog_streak,
+            &mut idle_streak,
+            &mut agent_exited,
+        );
+        assert_eq!(limit_resume, scheduled, "a blip must keep the schedule");
+        assert_eq!(last_dialog.as_deref(), Some("trust"));
+        assert_eq!((dialog_streak, idle_streak, agent_exited), (2, 1, true));
+
+        crate::workspace::set_test_pane_liveness(Some(Liveness::Dead));
+        tick(
+            &mut limit_resume,
+            &mut last_dialog,
+            &mut dialog_streak,
+            &mut idle_streak,
+            &mut agent_exited,
+        );
+        crate::workspace::set_test_pane_liveness(None);
+        assert_eq!(limit_resume, LimitResumeState::Idle, "no pane left to nudge");
+        assert_eq!(last_dialog, None);
+        assert_eq!((dialog_streak, idle_streak, agent_exited), (0, 0, false));
+
+        std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
     }
 

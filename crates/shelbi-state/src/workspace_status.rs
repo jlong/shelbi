@@ -5,7 +5,13 @@
 //! `default_workspace_settings.json.template`); the hub-side sidebar poll loop
 //! reads the current pane title with `tmux display-message`, parses the
 //! trailing marker, and persists any transition to
-//! `~/.shelbi/workspaces/<name>/status.yaml`.
+//! `~/.shelbi/projects/<project>/workspaces/<name>/status.yaml`.
+//!
+//! Every path here takes the project as well as the slot name because slot
+//! names are only unique *within* a project: two projects can each own a
+//! `review`, and they must not share a status row, a teardown marker, or a
+//! review-server record. [`crate::workspace_state_migration`] moves what older
+//! releases left under the hub-global `~/.shelbi/workspaces/` into place.
 //!
 //! This module is limited to pane/status *observation*: the pane-title marker
 //! vocabulary ([`PaneMarker`] / [`WorkspaceState`]), the persisted
@@ -24,7 +30,7 @@ use serde::{Deserialize, Serialize};
 
 use shelbi_core::Result;
 
-use crate::{atomic_write, ensure_dir, shelbi_home};
+use crate::{atomic_write, ensure_dir, project_dir, shelbi_home};
 
 /// The marker emitted by the workspace's claude hooks. `idle` from the hook
 /// wire-format maps to [`WorkspaceState::AwaitingInput`] — Stop fires when
@@ -177,28 +183,17 @@ pub fn parse_orchestrator_title_state(title: &str) -> Option<WorkspaceState> {
     parse_pane_title_marker(title).map(PaneMarker::orchestrator_state)
 }
 
-/// `~/.shelbi/workspaces` — root for per-workspace status dirs.
-///
-/// As a one-shot migration, if the legacy `~/.shelbi/workers/` directory
-/// exists and the new `workspaces/` doesn't, the legacy dir is renamed in
-/// place. Idempotent and best-effort — any IO error is swallowed; the
-/// poller will recreate either directory on its next write.
-pub fn workspaces_dir() -> Result<PathBuf> {
-    let home = shelbi_home()?;
-    let new = home.join("workspaces");
-    if !new.exists() {
-        let legacy = home.join("workers");
-        if legacy.exists() {
-            let _ = fs::rename(&legacy, &new);
-        }
-    }
-    Ok(new)
+/// `~/.shelbi/projects/<project>/workspaces`: root for one project's
+/// per-workspace runtime state. The same path as
+/// [`crate::ProjectPaths::workspaces_dir`], for callers holding only a name.
+pub fn workspaces_dir(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join("workspaces"))
 }
 
-/// `~/.shelbi/workspaces/<name>/status.yaml`.
-pub fn workspace_status_path(workspace: &str) -> Result<PathBuf> {
+/// `~/.shelbi/projects/<project>/workspaces/<name>/status.yaml`.
+pub fn workspace_status_path(project: &str, workspace: &str) -> Result<PathBuf> {
     crate::ensure_flat_path_component("workspace", workspace)?;
-    Ok(workspaces_dir()?.join(workspace).join("status.yaml"))
+    Ok(workspaces_dir(project)?.join(workspace).join("status.yaml"))
 }
 
 /// Env var naming the file the `shelbi __review-serve` wrapper records the
@@ -208,17 +203,40 @@ pub fn workspace_status_path(workspace: &str) -> Result<PathBuf> {
 /// wrapper) can't drift on the spelling.
 pub const REVIEW_SERVE_PGID_FILE_ENV: &str = "SHELBI_REVIEW_PGID_FILE";
 
-/// `~/.shelbi/workspaces/<name>/review-serve.pgid` — records the process-group
+/// `<project>/workspaces/<name>/review-serve.pgid` — records the process-group
 /// id of the review dev server the Review agent launched through the
 /// `shelbi __review-serve` wrapper. Kept hub-side (not in the tmux session env,
 /// which dies with the pane, and not in memory) so any teardown path can signal
 /// the whole server tree even across a hub / daemon restart between launch and
 /// teardown. The wrapper writes it; the orchestrator reads it on teardown and
-/// clears it. Keyed by workspace so the orchestrator's `kill_workspace_pane`
-/// (which only has the workspace name) needs no worktree plumbing to find it.
-pub fn review_serve_pgid_path(workspace: &str) -> Result<PathBuf> {
+/// clears it. Keyed by project and workspace so `kill_workspace_pane` needs no
+/// worktree plumbing to find it, and so one project's teardown can never signal
+/// the server another project's same-named slot started.
+pub fn review_serve_pgid_path(project: &str, workspace: &str) -> Result<PathBuf> {
     crate::ensure_flat_path_component("workspace", workspace)?;
-    Ok(workspaces_dir()?.join(workspace).join("review-serve.pgid"))
+    Ok(workspaces_dir(project)?.join(workspace).join("review-serve.pgid"))
+}
+
+/// Where the `shelbi __review-serve` wrapper should record its server's pgid,
+/// given the path its pane's [`REVIEW_SERVE_PGID_FILE_ENV`] names and the pane's
+/// `PROJECT`.
+///
+/// Sessions outlive an upgrade, so a review pane launched by an older release
+/// still carries the hub-global `~/.shelbi/workspaces/<name>/review-serve.pgid`
+/// in its environment. A record written there is one no teardown reads, and the
+/// server would leak, so that one shape is rewritten to the project's path. Any
+/// other path passes through untouched.
+pub fn rehome_review_serve_pgid_path(path: &std::path::Path, project: Option<&str>) -> PathBuf {
+    let rehomed = (|| {
+        let project = project?;
+        let slot = path.parent()?;
+        let legacy_root = shelbi_home().ok()?.join("workspaces");
+        if slot.parent()? != legacy_root {
+            return None;
+        }
+        review_serve_pgid_path(project, slot.file_name()?.to_str()?).ok()
+    })();
+    rehomed.unwrap_or_else(|| path.to_path_buf())
 }
 
 /// Read the persisted review-server process-group id for `workspace`, if the
@@ -228,8 +246,8 @@ pub fn review_serve_pgid_path(workspace: &str) -> Result<PathBuf> {
 /// record must never wedge teardown, and the `> 1` floor makes it impossible
 /// for a `kill(-pgid, …)` to ever target init / every process). The file is
 /// left in place for [`clear_review_serve_pgid`] to remove.
-pub fn read_review_serve_pgid(workspace: &str) -> Result<Option<i32>> {
-    let path = review_serve_pgid_path(workspace)?;
+pub fn read_review_serve_pgid(project: &str, workspace: &str) -> Result<Option<i32>> {
+    let path = review_serve_pgid_path(project, workspace)?;
     match fs::read_to_string(&path) {
         Ok(s) => Ok(s.trim().parse::<i32>().ok().filter(|&p| p > 1)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -239,8 +257,8 @@ pub fn read_review_serve_pgid(workspace: &str) -> Result<Option<i32>> {
 
 /// Remove a workspace's review-server pgid record, if any. Idempotent and
 /// best-effort — a missing file is not an error.
-pub fn clear_review_serve_pgid(workspace: &str) -> Result<()> {
-    let path = review_serve_pgid_path(workspace)?;
+pub fn clear_review_serve_pgid(project: &str, workspace: &str) -> Result<()> {
+    let path = review_serve_pgid_path(project, workspace)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -292,8 +310,8 @@ pub struct WorkspaceStatus {
     pub last_seen: DateTime<Utc>,
 }
 
-pub fn save_workspace_status(status: &WorkspaceStatus) -> Result<()> {
-    let path = workspace_status_path(&status.workspace)?;
+pub fn save_workspace_status(project: &str, status: &WorkspaceStatus) -> Result<()> {
+    let path = workspace_status_path(project, &status.workspace)?;
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
@@ -301,8 +319,8 @@ pub fn save_workspace_status(status: &WorkspaceStatus) -> Result<()> {
     atomic_write(&path, yaml.as_bytes())
 }
 
-pub fn load_workspace_status(workspace: &str) -> Result<Option<WorkspaceStatus>> {
-    let path = workspace_status_path(workspace)?;
+pub fn load_workspace_status(project: &str, workspace: &str) -> Result<Option<WorkspaceStatus>> {
+    let path = workspace_status_path(project, workspace)?;
     if !path.exists() {
         return Ok(None);
     }
@@ -319,8 +337,8 @@ pub fn load_workspace_status(workspace: &str) -> Result<Option<WorkspaceStatus>>
 /// After clearing, `load_workspace_status` reads `None` (the "not polled" state
 /// a genuinely idle slot has) and the board-derived views render it as idle.
 /// Idempotent and best-effort: a missing file is not an error.
-pub fn clear_workspace_status(workspace: &str) -> Result<()> {
-    let path = workspace_status_path(workspace)?;
+pub fn clear_workspace_status(project: &str, workspace: &str) -> Result<()> {
+    let path = workspace_status_path(project, workspace)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -509,17 +527,17 @@ mod tests {
             last_transition: now,
             last_seen: now,
         };
-        save_workspace_status(&status).unwrap();
-        let path = workspace_status_path("alpha").unwrap();
+        save_workspace_status("demo", &status).unwrap();
+        let path = workspace_status_path("demo", "alpha").unwrap();
         assert!(path.exists());
-        let back = load_workspace_status("alpha").unwrap().unwrap();
+        let back = load_workspace_status("demo", "alpha").unwrap().unwrap();
         assert_eq!(back.workspace, "alpha");
         assert_eq!(back.state, WorkspaceState::Working);
         assert_eq!(back.current_task.as_deref(), Some("fix-thing"));
 
         // Missing workspace returns None, not an error — the sidebar uses
         // this to bootstrap fresh on first observation.
-        assert!(load_workspace_status("ghost").unwrap().is_none());
+        assert!(load_workspace_status("demo", "ghost").unwrap().is_none());
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -531,10 +549,10 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         // No file yet → clearing is a no-op.
-        clear_workspace_status("alpha").unwrap();
+        clear_workspace_status("demo", "alpha").unwrap();
 
         let now = Utc::now();
-        save_workspace_status(&WorkspaceStatus {
+        save_workspace_status("demo", &WorkspaceStatus {
             workspace: "alpha".into(),
             current_task: None,
             state: WorkspaceState::Working,
@@ -542,17 +560,17 @@ mod tests {
             last_seen: now,
         })
         .unwrap();
-        assert!(workspace_status_path("alpha").unwrap().exists());
+        assert!(workspace_status_path("demo", "alpha").unwrap().exists());
 
-        clear_workspace_status("alpha").unwrap();
+        clear_workspace_status("demo", "alpha").unwrap();
         assert!(
-            !workspace_status_path("alpha").unwrap().exists(),
+            !workspace_status_path("demo", "alpha").unwrap().exists(),
             "clear must remove status.yaml so a reaped slot reads as unpolled/idle"
         );
-        assert!(load_workspace_status("alpha").unwrap().is_none());
+        assert!(load_workspace_status("demo", "alpha").unwrap().is_none());
 
         // Second clear on the now-absent file is also OK.
-        clear_workspace_status("alpha").unwrap();
+        clear_workspace_status("demo", "alpha").unwrap();
 
         std::env::remove_var("SHELBI_HOME");
     }
@@ -579,6 +597,66 @@ mod tests {
         std::env::remove_var("SHELBI_HOME");
     }
 
+    /// The bug this layout exists to fix: slot names are only unique within a
+    /// project, so two projects' `review` slots must keep separate rows, and
+    /// reaping one must leave the other's row (and marker, and server record)
+    /// alone.
+    #[test]
+    fn same_named_slots_in_two_projects_keep_separate_state() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let status = |task: &str, state| WorkspaceStatus {
+            workspace: "review".into(),
+            current_task: Some(task.into()),
+            state,
+            last_transition: Utc::now(),
+            last_seen: Utc::now(),
+        };
+        save_workspace_status("app", &status("app-task", WorkspaceState::Serving)).unwrap();
+        save_workspace_status("site", &status("site-task", WorkspaceState::Blocked)).unwrap();
+
+        // Neither write clobbered the other.
+        let app = load_workspace_status("app", "review").unwrap().unwrap();
+        let site = load_workspace_status("site", "review").unwrap().unwrap();
+        assert_eq!(app.current_task.as_deref(), Some("app-task"));
+        assert_eq!(app.state, WorkspaceState::Serving);
+        assert_eq!(site.current_task.as_deref(), Some("site-task"));
+        assert_eq!(site.state, WorkspaceState::Blocked);
+
+        // Reaping `app`'s slot leaves `site`'s row intact.
+        clear_workspace_status("app", "review").unwrap();
+        assert!(load_workspace_status("app", "review").unwrap().is_none());
+        let site = load_workspace_status("site", "review").unwrap().unwrap();
+        assert_eq!(site.current_task.as_deref(), Some("site-task"));
+
+        // Same for the review-server record.
+        let pgid_path = review_serve_pgid_path("app", "review").unwrap();
+        std::fs::create_dir_all(pgid_path.parent().unwrap()).unwrap();
+        std::fs::write(&pgid_path, "4242\n").unwrap();
+        assert_eq!(read_review_serve_pgid("site", "review").unwrap(), None);
+        assert_eq!(read_review_serve_pgid("app", "review").unwrap(), Some(4242));
+
+        // And it all lands under the project's own state root, the same place
+        // `ProjectPaths::workspaces_dir` names.
+        assert_eq!(
+            workspace_status_path("site", "review").unwrap(),
+            home.join("projects/site/workspaces/review/status.yaml"),
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn workspace_status_path_rejects_traversal_project_names() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        assert!(workspace_status_path("../evil", "review").is_err());
+        std::env::remove_var("SHELBI_HOME");
+    }
+
     #[test]
     fn workspace_status_path_rejects_traversal_names() {
         // The accepted name resolves under the hub root, so mount a throwaway
@@ -589,15 +667,37 @@ mod tests {
 
         // Residual chokepoint hardening (Shelbi ContextStore
         // docs/planning:reviews/adversarial-2026-07/state-runtime.md F14): a `..`/absolute/
-        // separator workspace name must not escape `~/.shelbi/workspaces/`.
+        // separator workspace name must not escape the project's `workspaces/`.
         for bad in ["..", "../evil", "a/b", "/abs", "nested/../escape", ""] {
             assert!(
-                workspace_status_path(bad).is_err(),
+                workspace_status_path("demo", bad).is_err(),
                 "workspace_status_path should reject `{bad}`"
             );
         }
         // A normal single-component name still resolves.
-        assert!(workspace_status_path("review-1").is_ok());
+        assert!(workspace_status_path("demo", "review-1").is_ok());
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_pre_upgrade_pane_records_its_server_under_the_project() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let legacy = home.join("workspaces/review/review-serve.pgid");
+        assert_eq!(
+            rehome_review_serve_pgid_path(&legacy, Some("app")),
+            review_serve_pgid_path("app", "review").unwrap(),
+        );
+        // Without a project there is nothing to rehome it to.
+        assert_eq!(rehome_review_serve_pgid_path(&legacy, None), legacy);
+        // A current path, or one somewhere else entirely, is left alone.
+        let current = review_serve_pgid_path("app", "review").unwrap();
+        assert_eq!(rehome_review_serve_pgid_path(&current, Some("site")), current);
+        let elsewhere = std::path::Path::new("/tmp/custom.pgid");
+        assert_eq!(rehome_review_serve_pgid_path(elsewhere, Some("app")), elsewhere);
 
         std::env::remove_var("SHELBI_HOME");
     }

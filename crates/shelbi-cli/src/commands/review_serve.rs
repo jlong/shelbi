@@ -26,7 +26,7 @@
 /// Env var naming the file this wrapper writes the launched server's
 /// process-group id into. The orchestrator injects it into the review pane
 /// (see `local_pane_tmux_argv`); its value is
-/// `shelbi_state::review_serve_pgid_path(workspace)`. Absent on a manual
+/// `shelbi_state::review_serve_pgid_path(project, workspace)`. Absent on a manual
 /// invocation, in which case the server still runs but isn't orchestrator
 /// -tracked. Spelled once in `shelbi_state` so producer and consumer can't
 /// drift.
@@ -83,10 +83,9 @@ pub fn run(cmd: Vec<String>) -> anyhow::Result<()> {
 /// Best-effort: a write failure just means this server won't be auto-reaped on
 /// teardown (the pre-fix behavior), so it must never abort the launch.
 fn record_pgid(pgid: i32) {
-    let Some(path) = std::env::var_os(PGID_FILE_ENV) else {
+    let Some(path) = pgid_file() else {
         return;
     };
-    let path = std::path::PathBuf::from(path);
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -95,7 +94,19 @@ fn record_pgid(pgid: i32) {
 
 /// Remove the pgid record on a clean exit. Best-effort and idempotent.
 fn clear_pgid_record() {
-    if let Some(path) = std::env::var_os(PGID_FILE_ENV) {
+    if let Some(path) = pgid_file() {
         let _ = std::fs::remove_file(path);
     }
+}
+
+/// The pgid record's path: what `$SHELBI_REVIEW_PGID_FILE` names, with the
+/// hub-global path a pane launched before an upgrade still carries rehomed under
+/// the pane's `$PROJECT`, where teardown looks.
+fn pgid_file() -> Option<std::path::PathBuf> {
+    let path = std::env::var_os(PGID_FILE_ENV)?;
+    let project = std::env::var("PROJECT").ok();
+    Some(shelbi_state::rehome_review_serve_pgid_path(
+        std::path::Path::new(&path),
+        project.as_deref(),
+    ))
 }
