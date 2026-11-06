@@ -874,8 +874,9 @@ pub fn write_review_loaded_marker(
 }
 
 /// Remove the review-serving marker (idempotent — `rm -f` succeeds if absent).
-/// Called when the poller reaps an orphaned review slot so a stale marker
-/// naming a resolved task can't keep the sidebar showing **Ready for Review**.
+/// Called when a task is dispatched onto the slot, when its review is closed, and
+/// when the poller reaps an orphaned review slot, so a stale marker naming a
+/// resolved task can't keep the sidebar showing **Ready for Review**.
 pub fn clear_review_loaded_marker(host: &Host, marker: &Path) -> Result<()> {
     let path = marker.to_string_lossy().into_owned();
     shelbi_ssh::run(host, ["rm", "-f", path.as_str()]).map_err(Error::Io)?;
@@ -2634,6 +2635,12 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
         &host,
         &legacy_workspace_transition_marker(&machine, spec.workspace),
     );
+    // And the review-serving marker: a task loading onto a review slot starts
+    // out not serving, whatever the slot's last task got up to.
+    let _ = clear_review_loaded_marker(
+        &host,
+        &workspace_review_loaded_marker(&machine, spec.workspace),
+    );
 
     // 1. Make sure the worktree exists + is on the right branch, clean.
     //    Lock order is workspace -> Git worktrees/refs everywhere. Hold the
@@ -3170,7 +3177,8 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
             })?;
         }
         Host::Ssh { .. } => {
-            let cd_launch = remote_cd_launch(a.host, a.worktree, &launch, a.port);
+            let pin = a.project.machine(&a.workspace.machine).and_then(|m| m.forward);
+            let cd_launch = remote_cd_launch(a.host, pin, a.worktree, &launch, a.port);
             let bin = crate::remote_session::resolve_remote_bin(&a.workspace.machine).map_err(
                 |e| Error::Other(format!("remote dispatch for workspace `{}`: {e}", a.workspace.name)),
             )?;
@@ -5598,8 +5606,16 @@ impl LocalDispatchArgs<'_> {
 /// *also* set the legacy `SHELBI_HUB_SOCK` so the plain `nc -U "$SHELBI_HUB_SOCK"`
 /// path keeps working unchanged. A TCP-fallback host (Tailscale SSH) gets only
 /// `SHELBI_HUB_ADDR`, since there is no usable Unix landing socket there.
-fn remote_cd_launch(host: &Host, worktree: &Path, launch: &str, port: Option<u16>) -> String {
-    let hub_env = remote_hub_env_prefix(host);
+/// `forward_pin` is the machine's `forward:` setting, which beats any persisted
+/// decision.
+fn remote_cd_launch(
+    host: &Host,
+    forward_pin: Option<shelbi_core::ForwardMode>,
+    worktree: &Path,
+    launch: &str,
+    port: Option<u16>,
+) -> String {
+    let hub_env = remote_hub_env_prefix(host, forward_pin);
     // Review workspaces (Some port) pin a deterministic dev-server PORT so the
     // review agent binds a slot that won't collide with a concurrent review
     // workspace. Dev workspaces pass `None` and get none.
@@ -5620,12 +5636,15 @@ fn remote_cd_launch(host: &Host, worktree: &Path, launch: &str, port: Option<u16
 /// space included) a remote pane needs to reach the hub daemon, resolving the
 /// per-host forward decision. Shared by [`remote_cd_launch`] and the
 /// `shelbi spawn` path so the two can't drift.
-pub fn remote_hub_env_prefix(host: &Host) -> String {
+pub fn remote_hub_env_prefix(
+    host: &Host,
+    forward_pin: Option<shelbi_core::ForwardMode>,
+) -> String {
     let hostname = match host {
         Host::Local => return String::new(),
         Host::Ssh { host } => host.as_str(),
     };
-    match shelbi_state::remote_hub_endpoint(hostname) {
+    match shelbi_state::remote_hub_endpoint(hostname, forward_pin) {
         endpoint @ shelbi_state::HubEndpoint::Unix(_) => {
             // Unix forward: set both the scheme-tagged addr and the legacy
             // SHELBI_HUB_SOCK path the existing worker snippets consume.
@@ -10051,6 +10070,7 @@ statuses:
             &Host::Ssh {
                 host: "testhost".into(),
             },
+            None,
             Path::new("/work/myapp/.shelbi/wt/bob"),
             &remote_launch,
             None,
@@ -11007,6 +11027,7 @@ statuses:
             &Host::Ssh {
                 host: "testhost".into(),
             },
+            None,
             &wt,
             "claude --permission-mode auto",
             None,
@@ -11059,6 +11080,7 @@ statuses:
             &Host::Ssh {
                 host: "testhost".into(),
             },
+            None,
             &wt,
             "claude",
             None,
@@ -11082,11 +11104,17 @@ statuses:
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
+        // The pin below clears a record, which emits an event. Keep it off a
+        // worker pane's live hub.
+        std::env::remove_var("SHELBI_HUB_SOCK");
 
         // Default host (no persisted decision) → Unix: both vars present.
-        let unix = remote_hub_env_prefix(&Host::Ssh {
-            host: "plainbox".into(),
-        });
+        let unix = remote_hub_env_prefix(
+            &Host::Ssh {
+                host: "plainbox".into(),
+            },
+            None,
+        );
         assert!(
             unix.contains("SHELBI_HUB_ADDR=unix:"),
             "unix host must carry a unix: addr: {unix}"
@@ -11105,9 +11133,10 @@ statuses:
             }),
         )
         .unwrap();
-        let tcp = remote_hub_env_prefix(&Host::Ssh {
+        let tsbox = Host::Ssh {
             host: "tsbox".into(),
-        });
+        };
+        let tcp = remote_hub_env_prefix(&tsbox, None);
         assert!(
             tcp.contains("SHELBI_HUB_ADDR=tcp:127.0.0.1:47102"),
             "tcp host must carry the loopback addr: {tcp}"
@@ -11117,8 +11146,17 @@ statuses:
             "tcp host must NOT set a Unix socket var: {tcp}"
         );
 
+        // A later `forward: unix` pin beats the earlier TCP fallback.
+        let pinned = remote_hub_env_prefix(&tsbox, Some(shelbi_core::ForwardMode::Unix));
+        assert!(
+            pinned.contains("SHELBI_HUB_ADDR=unix:") && pinned.contains("SHELBI_HUB_SOCK="),
+            "a unix pin must give a unix endpoint despite the tcp record: {pinned}"
+        );
+        // ...and clears the record, so nothing else keeps reading it as TCP.
+        assert_eq!(shelbi_state::load_host_forward("tsbox"), None);
+
         // Local host has no reverse forward at all → empty prefix.
-        assert_eq!(remote_hub_env_prefix(&Host::Local), "");
+        assert_eq!(remote_hub_env_prefix(&Host::Local, None), "");
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -11136,6 +11174,7 @@ statuses:
             &Host::Ssh {
                 host: "testhost".into(),
             },
+            None,
             &wt,
             "claude",
             Some(3010),

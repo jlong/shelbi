@@ -1,4 +1,5 @@
 use super::*;
+use shelbi_core::Column;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;

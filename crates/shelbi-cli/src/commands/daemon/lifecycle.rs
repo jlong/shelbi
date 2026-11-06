@@ -211,13 +211,22 @@ impl RetireHost for RealSystemd {
 // stop / restart / status
 // --------------------------------------------------------------------------
 
+/// Tell the user why a stop is taking a while: the daemon finishes the jobs it
+/// already accepted (a merge, say) before it exits.
+fn say_waiting_for_jobs() {
+    println!(
+        "shelbi daemon: waiting for running jobs to finish (at most {}s)...",
+        shelbi_state::DAEMON_JOB_DRAIN.as_secs()
+    );
+}
+
 /// Stop this root's daemon without starting a new one. Signals only the pid in
 /// this root's `shelbi.pid` (see [`shelbi_state::stop_daemon`]). Sessions keep
 /// running: they outlive the daemon, and the next client (or a session's
 /// watchdog, while a project is open) starts a fresh daemon that finds them.
 pub(super) fn stop() -> Result<()> {
     let pid_file = shelbi_state::daemon_pid_file_path()?;
-    match shelbi_state::stop_daemon().context("stopping the hub daemon")? {
+    match shelbi_state::stop_daemon_with(&mut say_waiting_for_jobs).context("stopping the hub daemon")? {
         shelbi_state::StopOutcome::Stopped { pid } => {
             println!("✓ stopped the hub daemon (pid {pid}, from {})", pid_file.display());
             Ok(())
@@ -244,7 +253,7 @@ pub(super) fn restart() -> Result<()> {
         println!("✓ retired leftover supervisor unit {}", path.display());
     }
 
-    match shelbi_state::stop_daemon().context("stopping the running hub daemon")? {
+    match shelbi_state::stop_daemon_with(&mut say_waiting_for_jobs).context("stopping the running hub daemon")? {
         shelbi_state::StopOutcome::Stopped { pid } => {
             println!("✓ stopped the running hub daemon (pid {pid})");
         }

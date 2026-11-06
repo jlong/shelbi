@@ -323,6 +323,15 @@ pub(crate) fn start(
         ) {
             sink.warn(&format!("warning: append_task_event failed: {e}"));
         }
+        if let Err(e) = shelbi_state::record_zen_user_move(
+            project,
+            id,
+            &prev_column,
+            &dest_column,
+            &dispatched_reason,
+        ) {
+            sink.warn(&format!("warning: saving Zen's record of the move failed: {e}"));
+        }
     }
 
     // Release the workspace this card was previously assigned to — but ONLY when

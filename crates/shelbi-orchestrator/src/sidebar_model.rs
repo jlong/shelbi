@@ -21,8 +21,8 @@ use shelbi_core::Column;
 use shelbi_state::{
     daemon_version_status, fold_assignment_overlay, issue_store_for, load_project,
     load_task_workflow, load_workspace_status, read_board_index_numbers, read_board_report, read_state,
-    sidebar_collapsed_machines, unread_error_count, DaemonVersionStatus, IssueFile, WorkspaceState,
-    ZenModeState,
+    sidebar_collapsed_machines, unread_error_count, BoardOccupancy, DaemonVersionStatus, IssueFile,
+    WorkspaceState, ZenModeState,
 };
 
 /// Read every surface the sidebar needs for `project` and assemble the model.
@@ -98,11 +98,19 @@ pub fn read_sidebar_model(project: &str) -> Option<SidebarModel> {
                 for row in &mut model.reviews {
                     row.number = numbers.get(&row.task_id).copied();
                 }
-                let in_progress: Vec<IssueFile> = board
-                    .iter()
-                    .filter(|f| f.task.column == Column::in_progress())
-                    .cloned()
-                    .collect();
+                // Which card each workspace row shows, by status category so a
+                // running gate reads as working. No project config means no
+                // rows: `apply_workspaces` reports that case itself.
+                let in_progress: Vec<IssueFile> = load_project(project)
+                    .map(|p| {
+                        let mut board = board;
+                        fold_assignment_overlay(project, &p.issue_tracker, &mut board);
+                        BoardOccupancy::from_board(&p, board)
+                            .working()
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 apply_workspaces(project, &in_progress, &mut model);
             }
             // The board read itself failed: keep the (empty) sections rather
@@ -379,6 +387,86 @@ fn probe_daemon_version() -> (String, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A workspace row shows the card running on it by status category, so a
+    /// slot running an agent-owned gate reads as working rather than idle, and a
+    /// dev slot whose card moved on to review reads as idle.
+    #[test]
+    fn a_workspace_row_shows_a_running_gate_and_not_a_queued_review() {
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-sidebar-gate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        std::fs::write(
+            home.join("projects/demo.yaml"),
+            "name: demo\nrepo: ''\ndefault_branch: main\n\
+             orchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+             machines:\n- name: hub\n  kind: local\n  work_dir: /tmp/demo\n\
+             workspaces:\n- name: alpha\n  machine: hub\n- name: beta\n  machine: hub\n",
+        )
+        .unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let workflows = shelbi_state::workflows_dir("demo").unwrap();
+        std::fs::create_dir_all(&workflows).unwrap();
+        std::fs::write(
+            workflows.join("statuses.yaml"),
+            "statuses:\n\
+             - { id: todo, name: Todo, category: ready }\n\
+             - { id: in-progress, name: InProgress, category: active }\n\
+             - { id: adversarial-review, name: Gate, category: active }\n\
+             - { id: review, name: Review, category: handoff }\n\
+             - { id: done, name: Done, category: done }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workflows.join("default.yaml"),
+            "name: default\nstatuses:\n\
+             - { id: todo, owner: agent, agent: orchestrator }\n\
+             - { id: in-progress, owner: agent, agent: developer }\n\
+             - { id: adversarial-review, owner: agent, agent: adversarial-review }\n\
+             - { id: review, owner: user }\n\
+             - { id: done, owner: user }\n",
+        )
+        .unwrap();
+        for (id, column, workspace) in [
+            ("t-gate", "adversarial-review", "alpha"),
+            ("t-queued", "review", "beta"),
+        ] {
+            let now = chrono::Utc::now();
+            let issue = shelbi_core::Issue {
+                id: id.into(),
+                title: id.into(),
+                column: Column::from_status_id(column),
+                priority: 0,
+                assigned_to: Some(workspace.into()),
+                workflow: None,
+                branch: None,
+                pr: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                created_at: now,
+                updated_at: now,
+                params: Default::default(),
+            };
+            shelbi_state::save_task("demo", &issue, "").unwrap();
+        }
+
+        let model = read_sidebar_model("demo").expect("a sidebar for the project");
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+
+        let row = |name: &str| model.workspaces.iter().find(|w| w.name == name).unwrap();
+        assert_eq!(row("alpha").current_task.as_deref(), Some("t-gate"));
+        assert_eq!(row("beta").current_task, None);
+    }
 
     #[test]
     fn read_config_skeleton_lists_declared_workspaces_awaiting_state() {

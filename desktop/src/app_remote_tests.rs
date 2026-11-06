@@ -115,6 +115,16 @@ fn settle(cx: &mut TestAppContext, what: &str, mut done: impl FnMut(&mut TestApp
     panic!("timed out waiting for {what}");
 }
 
+/// Long enough for anything still in flight to land (for a thing that must
+/// not happen).
+fn linger(cx: &mut TestAppContext) {
+    for _ in 0..20 {
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// Where `id` sits on the window's board, once it has read it.
 fn column_of(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, id: &str) -> Option<Column> {
     read(cx, handle, |w, cx| {
@@ -157,6 +167,123 @@ fn the_remote_window_names_its_host_and_switches_among_its_projects(cx: &mut Tes
     let (switcher, model) = read(cx, handle, |w, cx| (w.switcher_projects(cx), w.command_model()));
     assert_eq!(switcher.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), [PROJECT]);
     assert_eq!(model.remote_host.as_deref(), Some(HOST));
+}
+
+#[gpui::test]
+fn a_clicked_notice_opens_in_its_remote_window_and_keeps_the_project(cx: &mut TestAppContext) {
+    setup(cx);
+    let far = FarHost::new("notice");
+    let handle = open(cx, &far);
+    update(cx, handle, |w, _, _| {
+        w.tap = Some(Rc::default());
+    });
+    let key = read(cx, handle, |w, _| w.project_handle.key().clone());
+    // The tag the window's own notifier writes.
+    let tag = format!("shelbi/{key}/orch");
+    assert_eq!(tag, format!("shelbi/{HOST}:{PROJECT}/orch"));
+
+    cx.update(|cx| open_notice_tag(&tag, cx));
+    cx.run_until_parked();
+
+    let shows = |cx: &mut TestAppContext| {
+        read(cx, handle, |w, _| {
+            (
+                w.project.clone(),
+                w.project_handle.key().clone(),
+                w.remote.as_ref().unwrap().session.project.clone(),
+            )
+        })
+    };
+    assert_eq!(shows(cx), (PROJECT.to_string(), key.clone(), PROJECT.to_string()), "no bogus switch");
+    assert_eq!(
+        read(cx, handle, |w, _| w.tap.as_ref().unwrap().borrow().clone()),
+        [HostCall::ShowView(View::Session("orch".into()))],
+        "and the item opens there"
+    );
+
+    // Another far project no window shows has nowhere to go: nothing moves.
+    cx.update(|cx| open_notice_tag(&format!("shelbi/{HOST}:elsewhere/orch"), cx));
+    cx.run_until_parked();
+    assert_eq!(shows(cx), (PROJECT.to_string(), key.clone(), PROJECT.to_string()));
+}
+
+#[gpui::test]
+fn a_local_notice_never_lands_in_a_remote_window(cx: &mut TestAppContext) {
+    setup(cx);
+    let far = FarHost::new("localnotice");
+    let handle = open(cx, &far);
+    let key = read(cx, handle, |w, _| w.project_handle.key().clone());
+    update(cx, handle, |_, window, _| window.activate_window());
+
+    cx.update(|cx| open_notice_tag("shelbi/gamma/orch", cx));
+    cx.run_until_parked();
+
+    assert_eq!(read(cx, handle, |w, _| w.project_handle.key().clone()), key);
+    assert_eq!(
+        cx.update(|cx| windows_showing("gamma", None, cx)).len(),
+        1,
+        "a local window opens on it instead"
+    );
+}
+
+#[gpui::test]
+fn a_notice_switching_the_window_under_the_quit_prompt_keeps_it_there(cx: &mut TestAppContext) {
+    setup(cx);
+    let far = FarHost::new("quitswitch");
+    let handle = open(cx, &far);
+    update(cx, handle, |w, window, cx| w.confirm_quit_project(window, cx));
+    assert!(cx.has_pending_prompt());
+
+    // Moved on (a shown chat, the view a close would mark), then the answer.
+    update(cx, handle, |w, window, cx| w.switch_to("other", window, cx));
+    draw(cx, handle);
+    assert!(read(cx, handle, |w, _| w.chat.is_some()), "the new project's chat");
+    cx.simulate_prompt_answer("Quit Project");
+    settle(cx, "the far daemon to quit the project", |_| !far.asked.lock().unwrap().quits.is_empty());
+    linger(cx);
+
+    assert_eq!(far.asked.lock().unwrap().quits, [PROJECT], "the project the prompt named");
+    let (project, chooser, closing) = read(cx, handle, |w, cx| {
+        let closing = w.chat.as_ref().is_some_and(|c| c.read(cx).closing_deliberately());
+        (w.project.clone(), w.chooser, closing)
+    });
+    assert_eq!(project, "other", "the window stays on the project on screen");
+    assert!(!chooser);
+    assert!(!closing, "other's orchestrator isn't closing");
+}
+
+#[gpui::test]
+fn quitting_a_remote_windows_project_goes_to_the_chooser(cx: &mut TestAppContext) {
+    setup(cx);
+    let far = FarHost::new("quitfar");
+    // Open on this machine, so never for a window on another one.
+    std::fs::write(shelbi_state::projects_dir().unwrap().join("here.yaml"), b"").unwrap();
+    shelbi_state::set_project_open("here", true).unwrap();
+    let handle = open(cx, &far);
+    update(cx, handle, |w, window, cx| w.confirm_quit_project(window, cx));
+    cx.simulate_prompt_answer("Quit Project");
+    settle(cx, "the window to leave the project", |cx| read(cx, handle, |w, _| w.chooser));
+    assert_eq!(far.asked.lock().unwrap().quits, [PROJECT]);
+    assert_eq!(read(cx, handle, |w, _| w.remote.as_ref().unwrap().session.project.clone()), PROJECT);
+}
+
+#[gpui::test]
+fn a_switch_during_the_zen_check_drops_the_toggle(cx: &mut TestAppContext) {
+    use shelbi_proto::control::StateWrite;
+    setup(cx);
+    let far = FarHost::new("zenswitch");
+    shelbi_state::mark_zen_intro_seen().unwrap();
+    let handle = open(cx, &far);
+    update(cx, handle, |w, window, cx| {
+        w.toggle_zen(window, cx);
+        w.switch_to("other", window, cx);
+    });
+    linger(cx);
+    assert!(
+        !far.writes.lock().unwrap().iter().any(|w| matches!(w, StateWrite::ToggleZen { .. })),
+        "the toggle was for the project the check read"
+    );
+    assert!(read(cx, handle, |w, _| w.overlay.is_none()));
 }
 
 #[gpui::test]

@@ -362,7 +362,7 @@ fn quitting_the_shown_project_keeps_the_window(cx: &mut TestAppContext) {
     update(cx, h, |w, window, cx| w.leave_quit_project(Some("beta".into()), window, cx));
     assert_eq!(windows(cx), [("beta".to_string(), 0)]);
     // None left (a test window finds none): the chooser, window still open.
-    update(cx, h, |w, window, cx| w.after_quit_project("beta".into(), window, cx));
+    update(cx, h, |w, window, cx| w.after_quit_project(ProjectKey::local("beta"), window, cx));
     assert!(read(cx, h, |w, _| w.chooser));
     assert_eq!(cx.update(|cx| cx.windows().len()), 1, "the window stays");
     assert!(f.hub.subscribers().is_empty(), "the quit project's feed is dropped");
@@ -394,6 +394,65 @@ fn quitting_the_shown_project_keeps_the_window(cx: &mut TestAppContext) {
     update(cx, h, |w, window, cx| w.switch_to("alpha", window, cx));
     assert!(!read(cx, h, |w, _| w.chooser));
     assert_eq!(windows(cx), [("alpha".to_string(), 0)]);
+}
+
+#[gpui::test]
+fn a_quit_finishing_after_a_switch_leaves_the_window_on_the_chosen_project(cx: &mut TestAppContext) {
+    let f = fixture(cx);
+    let h = open(cx, &f, "alpha", 0);
+    // The switch lands while the quit's completion looks for the next project.
+    update(cx, h, |w, window, cx| {
+        w.after_quit_project(ProjectKey::local("alpha"), window, cx);
+        w.switch_to("beta", window, cx);
+    });
+    assert_eq!(windows(cx), [("beta".to_string(), 0)]);
+    assert!(!read(cx, h, |w, _| w.chooser), "the quit doesn't move it off beta");
+    // It lands before the quit finishes.
+    update(cx, h, |w, window, cx| w.after_quit_project(ProjectKey::local("alpha"), window, cx));
+    assert_eq!(windows(cx), [("beta".to_string(), 0)]);
+    assert!(!read(cx, h, |w, _| w.chooser));
+    // Another machine's project of the same name isn't this one.
+    update(cx, h, |w, window, cx| w.after_quit_project(ProjectKey::remote("devbox", "beta"), window, cx));
+    assert!(!read(cx, h, |w, _| w.chooser));
+    // Back on the quit project by the time it finishes: it still has to go.
+    update(cx, h, |w, window, cx| {
+        w.after_quit_project(ProjectKey::local("beta"), window, cx);
+        w.switch_to("alpha", window, cx);
+        w.switch_to("beta", window, cx);
+    });
+    assert!(read(cx, h, |w, _| w.chooser), "beta is gone: the chooser");
+}
+
+#[gpui::test]
+fn a_switch_closes_the_dialogs_opened_over_the_old_project(cx: &mut TestAppContext) {
+    let f = fixture(cx);
+    let h = open(cx, &f, "alpha", 0);
+    update(cx, h, |w, window, cx| w.open_connect(window, cx));
+    assert!(read(cx, h, |w, _| w.connect.is_some()));
+    update(cx, h, |w, window, cx| w.switch_to("beta", window, cx));
+    assert!(read(cx, h, |w, _| !w.modal_open()), "Connect closed");
+
+    update(cx, h, |w, window, cx| w.open_feedback(window, cx));
+    assert!(read(cx, h, |w, _| w.feedback.is_some()));
+    update(cx, h, |w, window, cx| w.switch_to("alpha", window, cx));
+    assert!(read(cx, h, |w, _| !w.modal_open()), "Contact Us closed");
+
+    update(cx, h, |w, window, cx| w.open_new_task(window, cx));
+    assert!(read(cx, h, |w, _| w.new_task.is_some()));
+    // The chooser is a switch away from the project too.
+    update(cx, h, |w, window, cx| w.show_chooser(window, cx));
+    assert!(read(cx, h, |w, _| !w.modal_open()), "New task closed");
+}
+
+#[gpui::test]
+fn a_notice_for_the_shown_project_leaves_its_dialog_alone(cx: &mut TestAppContext) {
+    let f = fixture(cx);
+    let h = open(cx, &f, "alpha", 0);
+    update(cx, h, |w, window, cx| w.open_new_task(window, cx));
+    cx.update(|cx| open_notice_tag("shelbi/alpha/orch", cx));
+    cx.run_until_parked();
+    assert_eq!(windows(cx), [("alpha".to_string(), 0)]);
+    assert!(read(cx, h, |w, _| w.new_task.is_some()), "nothing switched");
 }
 
 #[gpui::test]

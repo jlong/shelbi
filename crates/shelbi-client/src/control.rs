@@ -14,6 +14,7 @@
 use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
 use shelbi_proto::control::{
@@ -430,6 +431,44 @@ impl Subscription {
     }
 }
 
+/// How long [`retry_through_drain`] waits between attempts.
+const DRAIN_RETRY_PAUSE: Duration = Duration::from_millis(200);
+
+/// Send one request, riding out a daemon that is shutting down: while `refused`
+/// says the answer was the daemon's "shutting down, nothing ran" refusal
+/// ([`MutationError::ShuttingDown`](shelbi_proto::control::MutationError::ShuttingDown)),
+/// connect and send again, for up to `window` from the first refusal.
+///
+/// Only that refusal resends the request, because it alone promises the request
+/// didn't run. Any other answer, including losing the connection partway, is
+/// the caller's result. A failed *connect* is retried only after a refusal: the
+/// daemon that refused is on its way out and the next one may not be up yet.
+pub fn retry_through_drain<C, T, E>(
+    window: Duration,
+    mut connect: impl FnMut() -> Result<C, E>,
+    mut send: impl FnMut(&mut C) -> Result<T, E>,
+    mut refused: impl FnMut(&E) -> bool,
+) -> Result<T, E> {
+    let mut deadline: Option<Instant> = None;
+    loop {
+        let error = match connect() {
+            Ok(mut client) => match send(&mut client) {
+                Err(e) if refused(&e) => {
+                    deadline.get_or_insert_with(|| Instant::now() + window);
+                    e
+                }
+                answer => return answer,
+            },
+            Err(e) if deadline.is_some() => e,
+            Err(e) => return Err(e),
+        };
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(error);
+        }
+        std::thread::sleep(DRAIN_RETRY_PAUSE);
+    }
+}
+
 /// This host's name, for a [`ClientInfo::host`] / a detach reason. Best-effort:
 /// falls back to `"localhost"` if the lookup fails. Trimmed of a trailing dot
 /// and kept whole (not split on `.`), so a fully-qualified name is preserved.
@@ -526,5 +565,105 @@ impl<R: Read> FrameReader<R> {
                 Err(e) => return Err(ClientError::Protocol(e)),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    const WINDOW: Duration = Duration::from_secs(30);
+
+    #[derive(Debug, PartialEq)]
+    enum Failure {
+        Refused,
+        Connect,
+        Other,
+    }
+
+    fn is_refusal(e: &Failure) -> bool {
+        *e == Failure::Refused
+    }
+
+    #[test]
+    fn a_refused_request_is_sent_again_until_the_next_daemon_answers() {
+        let sends = Cell::new(0);
+        let out = retry_through_drain(
+            WINDOW,
+            || Ok(()),
+            |_| {
+                sends.set(sends.get() + 1);
+                if sends.get() < 3 {
+                    Err(Failure::Refused)
+                } else {
+                    Ok("landed")
+                }
+            },
+            is_refusal,
+        );
+        assert_eq!(out, Ok("landed"));
+        assert_eq!(sends.get(), 3);
+    }
+
+    #[test]
+    fn any_other_failure_is_final_so_a_request_that_may_have_run_is_never_resent() {
+        let sends = Cell::new(0);
+        let out: Result<(), _> = retry_through_drain(
+            WINDOW,
+            || Ok(()),
+            |_| {
+                sends.set(sends.get() + 1);
+                Err(Failure::Other)
+            },
+            is_refusal,
+        );
+        assert_eq!(out, Err(Failure::Other));
+        assert_eq!(sends.get(), 1);
+    }
+
+    #[test]
+    fn a_failed_connect_is_final_until_a_daemon_has_refused() {
+        let connects = Cell::new(0);
+        let out: Result<(), _> = retry_through_drain(
+            WINDOW,
+            || {
+                connects.set(connects.get() + 1);
+                Err::<(), _>(Failure::Connect)
+            },
+            |_| Ok(()),
+            is_refusal,
+        );
+        assert_eq!(out, Err(Failure::Connect));
+        assert_eq!(connects.get(), 1);
+    }
+
+    #[test]
+    fn a_failed_connect_after_a_refusal_waits_for_the_next_daemon() {
+        let connects = Cell::new(0);
+        let out = retry_through_drain(
+            WINDOW,
+            || {
+                connects.set(connects.get() + 1);
+                match connects.get() {
+                    2 => Err(Failure::Connect),
+                    n => Ok(n),
+                }
+            },
+            |n: &mut i32| if *n == 1 { Err(Failure::Refused) } else { Ok(*n) },
+            is_refusal,
+        );
+        assert_eq!(out, Ok(3));
+    }
+
+    #[test]
+    fn a_daemon_that_keeps_refusing_is_given_up_on_after_the_window() {
+        let out: Result<(), _> = retry_through_drain(
+            Duration::from_millis(1),
+            || Ok(()),
+            |_| Err(Failure::Refused),
+            is_refusal,
+        );
+        assert_eq!(out, Err(Failure::Refused));
     }
 }

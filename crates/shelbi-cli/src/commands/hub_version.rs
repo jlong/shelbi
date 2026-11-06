@@ -61,7 +61,7 @@ pub fn ensure_daemon_matches_for_mutation() -> Result<()> {
     }
     let busy_note = if busy > 0 {
         format!(
-            " ({busy} workspace(s) are in progress — the supervisor relaunches the daemon \
+            " ({busy} workspace(s) are busy — the supervisor relaunches the daemon \
              in about a second, so restarting is safe once you're ready)"
         )
     } else {
@@ -138,8 +138,7 @@ fn restart_daemon_and_verify() -> Result<()> {
     )
 }
 
-/// Count of workspaces with in-progress tasks across every registered
-/// project. Restarting the hub daemon affects the whole hub, so checking
+/// Count of busy workspaces across every registered project. Restarting the hub daemon affects the whole hub, so checking
 /// only the command's project could bounce it while another project's
 /// workers are active. Best-effort: an unreadable registry or board
 /// counts as busy so we never auto-restart on missing information.

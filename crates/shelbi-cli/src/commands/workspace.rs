@@ -201,37 +201,21 @@ pub(crate) fn print_workspaces(project: &str) -> Result<()> {
         return Ok(());
     }
 
-    // Both the in-progress and review columns come from the daemon-owned
-    // `board-index.json` (§5) in one read, filtered in memory — never a pair of
-    // backend `list_in_status` sweeps from this CLI. Both are open (non-terminal)
-    // columns, so the open index carries them.
-    let board = shelbi_state::read_board(project)
-        .map_err(|e| anyhow!(e))?
-        .into_issues();
+    // One read of the daemon-owned `board-index.json` (§5) with owners resolved
+    // from the assignment overlay, never a backend sweep from this CLI.
+    let occupancy = shelbi_state::BoardOccupancy::read(&p).map_err(|e| anyhow!(e))?;
 
-    // Surfaces every in-progress task assigned to the workspace. There
-    // should normally be at most one, but if shelbi's state diverged we
-    // print all of them in the STATE cell so the user sees the mess.
-    let in_progress: Vec<&shelbi_state::IssueFile> = board
-        .iter()
-        .filter(|tf| tf.task.column == Column::in_progress())
-        .collect();
-    let assigned: Vec<&Issue> = in_progress.iter().map(|tf| &tf.task).collect();
+    // Surfaces every card working on the workspace, an agent-owned gate as much
+    // as an in-progress one. There should normally be at most one, but if
+    // shelbi's state diverged we print all of them in the STATE cell so the user
+    // sees the mess.
+    let assigned: Vec<&Issue> = occupancy.working().map(|tf| &tf.task).collect();
 
-    // A `review`-tagged slot holds a review-column (handoff) task while it
-    // serves the branch for inspection — that task never sits in `in_progress`,
-    // so without this it looks like a live pane no active task points at and
-    // gets mislabeled `orphaned session`. Map each review slot to the task it's
-    // serving so `list` renders it as `review: <id>` (and the probe skips it).
-    let mut review: Vec<shelbi_state::IssueFile> = board
-        .iter()
-        .filter(|tf| tf.task.column == Column::review())
-        .cloned()
-        .collect();
-    // Review-slot ownership comes from the local assignment overlay, not the
-    // index's publish-time `assigned_to` fold, which can lag a fresh review load
-    // and mislabel the serving slot `orphaned session`.
-    shelbi_state::fold_assignment_overlay(project, &p.issue_tracker, &mut review);
+    // A `review`-tagged slot holds a handoff task while it serves the branch for
+    // inspection. Without this it looks like a live pane no active task points
+    // at and gets mislabeled `orphaned session`. Map each review slot to the task
+    // it's serving so `list` renders it as `review: <id>` (and the probe skips it).
+    let review: Vec<shelbi_state::IssueFile> = occupancy.serving().cloned().collect();
     let review_by_ws = review_assignments(&p, &review);
 
     let occupied = occupied_idle_workspaces(&p, &assigned, &review_by_ws)?;

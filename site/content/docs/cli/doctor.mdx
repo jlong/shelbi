@@ -18,6 +18,12 @@ It checks:
   (the state that makes agents silently lose DNS, SSH, and user lookups). It
   prints `macOS login session: ok`, or `LOST` with when and why it was
   detected.
+- **`events.log` rotation.** Hub-wide, like the session check. The log rotates
+  at 8 MiB, but waits while a registered project that has read events in the
+  last 7 days still needs the previous generation. It prints
+  `events.log rotation: ok`, or `DEFERRED` with each blocking project, its
+  position, and when it last read. Rotation is forced at 32 MiB, and the project
+  that lost history gets a `data-lost` line in `events.log`.
 - **GitHub API budget.** For a project whose board lives on
   [GitHub Issues](/docs/concepts/github-issues), the observed request rate over
   the last hour for the GraphQL and REST budgets, the remaining budget, and the
@@ -33,10 +39,12 @@ reader to throttle. It also flags a parked connection circuit breaker
 board isn't refreshing.
 
 A project on the local `file_system` board has no API budget, so only the
-session check runs:
+hub-wide checks run:
 
 ```text
 macOS login session: ok
+
+events.log rotation: ok (2.1 MiB of 8.0 MiB)
 
 doctor: project `repo` uses a local (file_system) issue backend — no API budget to check
 ```
@@ -45,6 +53,10 @@ On a GitHub-backed project:
 
 ```text
 macOS login session: ok
+
+events.log rotation: DEFERRED (10.2 MiB, limit 8.0 MiB, forced at 32.0 MiB)
+  ⚠ held back by projects still reading the previous generation:
+    chartme: cursor 25566576, 3.0 MiB behind, last acked 2d ago
 
 GitHub API budget health for `shelbi`:
   graphql: ~321 points/hr (205 requests, 321 points) · 4411 remaining · exhausts in ~13h

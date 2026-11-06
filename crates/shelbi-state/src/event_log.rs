@@ -34,6 +34,19 @@
 //!   `<project>/event-cursor.hwm` — the monotonic high-water mark of everything
 //!   it has ever acked. The mark only moves forward, so the reader treats a
 //!   cursor found behind it as a rewind ([`reconcile_cursor_with_hwm`]).
+//!
+//! ## Retention
+//!
+//! A cursor holds rotation back only while its project is registered and it has
+//! acked within [`EVENT_CURSOR_ACTIVE_WINDOW`], and only up to
+//! [`events_log_ceiling`]; rotating past a cursor logs the consumer that lost
+//! data ([`ConsumerLoss`]). `shelbi doctor` reports a deferral through
+//! [`event_log_rotation_status`]. Readers that aren't consumers use the
+//! generation-aware readers ([`read_event_log_tail`], [`read_event_log_since`]
+//! and friends), which read under the lock.
+//!
+//! ## Also in this module
+//!
 //! - the normalized, harness-neutral [`EventEnvelope`] and its [`EventKind`]
 //!   vocabulary, plus the [`HandoffCause`] reason classification shared with
 //!   `shelbi orchestrator events drain`;
@@ -55,9 +68,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use shelbi_core::{Column, IntegrationMode, Result, StatusCategory, DEFAULT_WORKFLOW_NAME};
@@ -300,6 +313,13 @@ struct EventLogIndex {
     current_base: u64,
 }
 
+impl EventLogIndex {
+    /// Logical offset of the oldest byte the index says is retained.
+    fn earliest(&self) -> u64 {
+        self.previous_base.unwrap_or(self.current_base)
+    }
+}
+
 impl Default for EventLogIndex {
     fn default() -> Self {
         Self {
@@ -333,6 +353,14 @@ pub struct EventLogRead {
     pub start: u64,
     pub head: u64,
     pub bytes: Vec<u8>,
+}
+
+impl EventLogRead {
+    /// The bytes as text, with anything that isn't UTF-8 replaced so one damaged
+    /// line can't hide the rest of the log.
+    pub fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.bytes)
+    }
 }
 
 fn event_log_index_path(path: &Path) -> PathBuf {
@@ -786,7 +814,7 @@ fn read_event_log_locked(cursor: u64) -> Result<FeedRead> {
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
     let head = index.current_base.saturating_add(current_len);
-    let earliest = index.previous_base.unwrap_or(index.current_base);
+    let earliest = index.earliest();
     if cursor < earliest {
         return Ok(FeedRead::CursorExpired {
             earliest,
@@ -843,6 +871,144 @@ fn read_event_log_locked(cursor: u64) -> Result<FeedRead> {
         head,
         bytes,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Generation-aware readers
+//
+// Every reader that isn't a consumer cursor goes through these: they take the
+// index snapshot and read under `events.log.lock`, so a rotation can't slip
+// between the two and hide the generation that just moved to `.1`. They differ
+// from `read_event_log_from` only in how they treat the edges of the retained
+// range: a best-effort view degrades to what is readable instead of failing
+// closed, because nothing is lost by showing a shorter history.
+
+/// Bytes a "recent history" read spans: one full generation, so the view doesn't
+/// fall off a cliff right after a rotation, without paying for all of `.1`.
+const EVENT_LOG_RECENT_BYTES: u64 = EVENTS_LOG_MAX_BYTES;
+
+/// First window [`read_event_log_last_lines`] tries before widening.
+const EVENT_LOG_LINES_WINDOW: u64 = 64 * 1024;
+
+/// Take `events.log.lock` for a read. `None` when this process may not touch the
+/// lock file (a sandboxed worker, the same case [`write_task_event_line`] routes
+/// through the hub socket): it may still read the log, as it always could, and a
+/// rotation racing that read costs it a generation, not a torn line.
+fn lock_event_log_for_read(path: &Path) -> Result<Option<crate::FileLockGuard>> {
+    match acquire_file_lock(&event_log_lock_path(path)) {
+        Ok(guard) => Ok(Some(guard)),
+        Err(error) if is_permission_denied(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// The logical range these readers can serve, `(earliest, head)`. A `.1` that is
+/// missing or the wrong length (removed by hand, say) narrows the range to the
+/// current file rather than failing every view of the log. The caller holds the
+/// lock.
+fn readable_event_log_range(path: &Path) -> Result<(u64, u64)> {
+    let index = load_event_log_index(path)?;
+    let current_len = match fs::metadata(path) {
+        Ok(metadata) => metadata.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    let retained_ok = index.previous_base.is_some_and(|previous_base| {
+        fs::metadata(path.with_extension("log.1"))
+            .is_ok_and(|m| Some(m.len()) == index.current_base.checked_sub(previous_base))
+    });
+    let earliest = if retained_ok {
+        index.earliest()
+    } else {
+        index.current_base
+    };
+    Ok((earliest, index.current_base.saturating_add(current_len)))
+}
+
+/// Read `start..head` under the lock the caller holds. `start` is already inside
+/// the range [`readable_event_log_range`] returned.
+fn read_event_log_range_locked(start: u64) -> Result<EventLogRead> {
+    match read_event_log_locked(start)? {
+        FeedRead::Read(read) => Ok(read),
+        FeedRead::CursorExpired { earliest, .. } => Err(shelbi_core::Error::Other(format!(
+            "event-log offset {start} predates earliest retained offset {earliest}"
+        ))),
+        FeedRead::LockUnavailable => unreachable!("the locked read never takes the lock"),
+    }
+}
+
+/// The last `max_bytes` of the log, whole lines only, and whether that reached
+/// the oldest readable byte.
+fn read_event_log_tail_reached(max_bytes: u64) -> Result<(EventLogRead, bool)> {
+    let path = events_log_path()?;
+    let _lock = lock_event_log_for_read(&path)?;
+    let (earliest, head) = readable_event_log_range(&path)?;
+    let wanted = head.saturating_sub(max_bytes);
+    if wanted <= earliest {
+        return Ok((read_event_log_range_locked(earliest)?, true));
+    }
+    // Start one byte early: if that byte ends the previous line, the window
+    // already starts on a line and dropping through it keeps the first line.
+    let mut read = read_event_log_range_locked(wanted - 1)?;
+    let skip = read
+        .bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(read.bytes.len(), |newline| newline + 1);
+    read.bytes.drain(..skip);
+    read.start += skip as u64;
+    Ok((read, false))
+}
+
+/// The last `max_bytes` of the log across `.1` and the current file, starting on
+/// a line boundary. A missing log reads as empty.
+pub fn read_event_log_tail(max_bytes: u64) -> Result<EventLogRead> {
+    Ok(read_event_log_tail_reached(max_bytes)?.0)
+}
+
+/// One generation's worth of recent history (see [`EVENT_LOG_RECENT_BYTES`]).
+pub fn read_event_log_recent() -> Result<EventLogRead> {
+    read_event_log_tail(EVENT_LOG_RECENT_BYTES)
+}
+
+/// Everything retained, `.1` then the current file.
+pub fn read_event_log_retained() -> Result<EventLogRead> {
+    read_event_log_tail(u64::MAX)
+}
+
+/// Bytes from logical `offset` to the head, for a reader tailing the log across
+/// rotations. Never fails on the offset itself: one that has expired, or that is
+/// past the head because the log was replaced, restarts at the oldest readable
+/// byte. `start` says which happened: greater than `offset` means history was
+/// skipped, less means the log was replaced underneath the reader.
+pub fn read_event_log_since(offset: u64) -> Result<EventLogRead> {
+    let path = events_log_path()?;
+    let _lock = lock_event_log_for_read(&path)?;
+    let (earliest, head) = readable_event_log_range(&path)?;
+    let start = if (earliest..=head).contains(&offset) {
+        offset
+    } else {
+        earliest
+    };
+    read_event_log_range_locked(start)
+}
+
+/// The newest `n` non-blank lines, joined with newlines, and whether older lines
+/// exist. Widens its window until it holds more than `n` lines or reaches the
+/// oldest readable byte, so a short read never crosses a generation by accident.
+pub fn read_event_log_last_lines(n: usize) -> Result<(String, bool)> {
+    let mut window = EVENT_LOG_LINES_WINDOW;
+    loop {
+        let (read, reached_start) = read_event_log_tail_reached(window)?;
+        let text = read.text();
+        let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.len() > n || reached_start {
+            let has_older = lines.len() > n;
+            lines.drain(..lines.len().saturating_sub(n));
+            return Ok((lines.join("\n"), has_older));
+        }
+        window = window.saturating_mul(2);
+    }
 }
 
 pub fn event_cursor_path(project: &str) -> Result<PathBuf> {
@@ -982,7 +1148,8 @@ pub fn read_or_initialize_event_cursor(project: &str) -> Result<u64> {
             let stored = text.trim().parse().map_err(|_| {
                 shelbi_core::Error::Other(format!("invalid event cursor in {}", path.display()))
             })?;
-            resolve_and_repair_cursor(project, &path, stored)
+            let cursor = resolve_and_repair_cursor(project, &path, stored)?;
+            fast_forward_expired_cursor(project, &path, &log_path, cursor)
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             let _log_lock = acquire_file_lock(&event_log_lock_path(&log_path))?;
@@ -996,6 +1163,43 @@ pub fn read_or_initialize_event_cursor(project: &str) -> Result<u64> {
         }
         Err(e) => Err(shelbi_core::Error::Io(e)),
     }
+}
+
+/// Move a cursor rotation has left behind up to the earliest retained byte. An
+/// idle project's cursor is allowed to expire, so its next drain must resume
+/// rather than fail closed forever; the rotation that lost the bytes already
+/// logged it. The feed's own reader reports this as [`FeedRead::CursorExpired`]
+/// and resynchronizes with a notice, so only this blocking path needs it.
+///
+/// The peek at the index needs no log lock (the file is replaced atomically and
+/// the common answer is "still retained"), which keeps a cursor read on its own
+/// uncontended lock. The caller holds the per-project cursor lock.
+fn fast_forward_expired_cursor(
+    project: &str,
+    path: &Path,
+    log_path: &Path,
+    cursor: u64,
+) -> Result<u64> {
+    let peeked = fs::read_to_string(event_log_index_path(log_path))
+        .ok()
+        .and_then(|text| serde_json::from_str::<EventLogIndex>(&text).ok());
+    if peeked.is_none_or(|index| cursor >= index.earliest()) {
+        return Ok(cursor);
+    }
+    let _log_lock = acquire_file_lock(&event_log_lock_path(log_path))?;
+    let earliest = load_event_log_index(log_path)?.earliest();
+    if cursor >= earliest {
+        return Ok(cursor);
+    }
+    tracing::warn!(
+        project,
+        expired_cursor = cursor,
+        earliest,
+        "event cursor predates the retained log; resuming from the earliest retained byte"
+    );
+    atomic_write(path, earliest.to_string().as_bytes())?;
+    bump_event_cursor_hwm(project, earliest)?;
+    Ok(earliest)
 }
 
 /// Deadline/cancel-aware sibling of [`read_or_initialize_event_cursor`] for the
@@ -1423,29 +1627,20 @@ pub enum MessageDelivery {
     /// A `push=ok` line exists with no `ack=` line yet: durable on disk, no
     /// confirmation one way or the other.
     Queued,
-    /// No `message=<msg_id>` line at all — the id was never pushed (or the
-    /// events.log has since rotated the record out of the live file).
+    /// No `message=<msg_id>` line at all — the id was never pushed (or its
+    /// record has aged out of the recent history this scan covers).
     Unknown,
 }
 
-/// Reconstruct a message's [`MessageDelivery`] by scanning the live
-/// `events.log` for its `message=<msg_id>` lines. Reads only the current
-/// (post-rotation) file: message delivery is checked seconds-to-minutes after
-/// the push, so the record is always in the live file within any realistic
-/// wait window. A missing log is [`MessageDelivery::Unknown`], never an error,
-/// so a status query on a fresh install doesn't blow up.
+/// Reconstruct a message's [`MessageDelivery`] by scanning recent `events.log`
+/// history for its `message=<msg_id>` lines. Message delivery is checked
+/// seconds-to-minutes after the push, so [`read_event_log_recent`] covers any
+/// realistic wait window, including one a rotation lands in. A missing log is
+/// [`MessageDelivery::Unknown`], never an error, so a status query on a fresh
+/// install doesn't blow up.
 pub fn message_delivery_status(msg_id: &str) -> Result<MessageDelivery> {
-    let path = events_log_path()?;
-    let content = match fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(MessageDelivery::Unknown),
-        Err(e) => {
-            return Err(shelbi_core::Error::Other(format!(
-                "reading {}: {e}",
-                path.display()
-            )))
-        }
-    };
+    let read = read_event_log_recent()?;
+    let content = read.text();
     let mut queued = false;
     let mut worker = false;
     let mut timed_out = false;
@@ -1891,7 +2086,7 @@ pub fn task_event_body(
 /// catalog can't be loaded at all, fall back to [`Column::category`] so a
 /// well-known stock move is still categorized correctly even before a project
 /// materializes its statuses file.
-fn resolve_move_categories(
+pub(crate) fn resolve_move_categories(
     project: &str,
     from: &Column,
     to: &Column,
@@ -2402,12 +2597,10 @@ pub fn recent_dispatch_active(project: &str, workspace: &str, within: Duration) 
     let Ok(within) = chrono::Duration::from_std(within) else {
         return false;
     };
-    let Ok(path) = events_log_path() else {
+    let Ok(read) = read_event_log_tail(DISPATCH_ACTIVE_TAIL_BYTES) else {
         return false;
     };
-    let Ok(text) = read_events_tail(&path, DISPATCH_ACTIVE_TAIL_BYTES) else {
-        return false;
-    };
+    let text = read.text();
     let proj = sanitize_field(project);
     let ws = sanitize_field(workspace);
     let cutoff = Utc::now() - within;
@@ -2442,21 +2635,6 @@ pub fn recent_dispatch_active(project: &str, workspace: &str, within: Duration) 
         }
     }
     false
-}
-
-/// Tail-read at most `max_bytes` of `path` as lossy UTF-8, seeking rather than
-/// slurping the (unbounded) events log. Mirrors
-/// `zen_lifecycle::read_events_tail`.
-fn read_events_tail(path: &Path, max_bytes: u64) -> std::io::Result<String> {
-    let mut f = fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    let start = len.saturating_sub(max_bytes);
-    if start > 0 {
-        f.seek(SeekFrom::Start(start))?;
-    }
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Append `<rfc3339> review-slot-override task=<id> workspace=<ws> reason=<reason>`
@@ -2775,19 +2953,12 @@ pub fn append_push_event(
 /// (`pushed` / `force-pushed` / `up-to-date`); a `failed` or `blocked` line left
 /// origin unchanged.
 pub fn last_pushed_tip_from_events(branch: &str) -> Result<Option<String>> {
-    let path = events_log_path()?;
-    let mut last = None;
-    for p in [path.with_extension("log.1"), path] {
-        let text = match fs::read(&p) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(shelbi_core::Error::Io(crate::annotate_io_error(&p, e))),
-        };
-        if let Some(tip) = text.lines().rev().find_map(|l| pushed_tip_from_push_line(l, branch)) {
-            last = Some(tip);
-        }
-    }
-    Ok(last)
+    let read = read_event_log_retained()?;
+    Ok(read
+        .text()
+        .lines()
+        .rev()
+        .find_map(|line| pushed_tip_from_push_line(line, branch)))
 }
 
 /// The abbreviated sha a handed-off `push` line for `branch` left on origin, or
@@ -3189,15 +3360,23 @@ fn append_event_line(line: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
-    let mut buf = String::with_capacity(line.len() + 1);
-    buf.push_str(line);
-    buf.push('\n');
+    // Lines naming the consumers a rotation just cost history. They go in the
+    // new generation ahead of the line that triggered it, under the same lock:
+    // appending them separately would re-enter this lock and deadlock.
+    let mut loss_lines = Vec::new();
     {
         let _lock = acquire_file_lock(&event_log_lock_path(&path))?;
         match load_event_log_index(&path) {
             Ok(mut index) => {
                 match maybe_rotate_events_log(&path, EVENTS_LOG_MAX_BYTES, &mut index) {
-                    Ok(_) => {}
+                    Ok(losses) => {
+                        let ts = Utc::now().to_rfc3339();
+                        loss_lines = losses
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|loss| loss.log_line(&ts, index.earliest()))
+                            .collect();
+                    }
                     Err(EventLogRotationFailure::BeforeRename(error)) => {
                         tracing::warn!(
                             %error,
@@ -3225,6 +3404,13 @@ fn append_event_line(line: &str) -> Result<()> {
                 );
             }
         }
+        let mut buf = String::with_capacity(line.len() + 1);
+        for loss_line in &loss_lines {
+            buf.push_str(loss_line);
+            buf.push('\n');
+        }
+        buf.push_str(line);
+        buf.push('\n');
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -3232,6 +3418,9 @@ fn append_event_line(line: &str) -> Result<()> {
             .map_err(|e| shelbi_core::Error::Io(crate::annotate_io_error(&path, e)))?;
         f.write_all(buf.as_bytes())
             .map_err(|e| shelbi_core::Error::Io(crate::annotate_io_error(&path, e)))?;
+    }
+    for loss_line in &loss_lines {
+        deliver_event_envelope(&EventEnvelope::from_log_line(loss_line));
     }
     deliver_event_envelope(&EventEnvelope::from_log_line(line));
     Ok(())
@@ -3276,6 +3465,21 @@ fn deliver_event_envelope(envelope: &EventEnvelope) {
 /// `commands::status`). One `.1` generation is kept; older history is
 /// dropped on the next rotation.
 const EVENTS_LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// How far past the size limit a live consumer can hold rotation back, as a
+/// multiple of the limit. At this size rotation proceeds anyway and logs who
+/// lost data: one stuck consumer must not grow the log, and slow every whole-log
+/// reader, for every project on the hub.
+const EVENTS_LOG_CEILING_FACTOR: u64 = 4;
+
+/// How long after its last ack a project's cursor still holds rotation back.
+/// An orchestrator that is running drains constantly, so a week of silence means
+/// nobody is coming back soon, and if they do the cursor resynchronizes.
+const EVENT_CURSOR_ACTIVE_WINDOW: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn events_log_ceiling(max_bytes: u64) -> u64 {
+    max_bytes.saturating_mul(EVENTS_LOG_CEILING_FACTOR)
+}
 
 #[derive(Debug)]
 enum EventLogRotationFailure {
@@ -3351,16 +3555,72 @@ fn malformed_journal_is_definitely_pre_rename(path: &Path) -> bool {
     }) && current.is_file()
 }
 
-/// Return true when an indexed `.1` still contains bytes needed by any
-/// registered project cursor. Malformed cursors block destructive rotation;
-/// preserving the log is safer than guessing that corrupt state was applied.
-fn prior_generation_is_needed(current_base: u64) -> Result<bool> {
+/// Why a project's cursor does or doesn't count toward holding rotation back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CursorLiveness {
+    /// Registered and acked within [`EVENT_CURSOR_ACTIVE_WINDOW`]: holds rotation.
+    Active,
+    /// Registered, but silent past the window.
+    Idle,
+    /// A leftover directory with no project registration behind it.
+    Unregistered,
+}
+
+/// A project cursor still inside (or behind) the previous generation.
+#[derive(Debug, Clone)]
+struct LaggingCursor {
+    project: String,
+    /// `None` when the file doesn't parse.
+    cursor: Option<u64>,
+    last_ack: Option<SystemTime>,
+    liveness: CursorLiveness,
+}
+
+/// A consumer a rotation just cost history, as the event line names it.
+#[derive(Debug, Clone)]
+struct ConsumerLoss {
+    project: String,
+    cursor: Option<u64>,
+    liveness: CursorLiveness,
+    /// Unread bytes the rotation discarded; `None` for an unreadable cursor.
+    lost_bytes: Option<u64>,
+}
+
+impl ConsumerLoss {
+    /// `<rfc3339> project=<p> event-log data-lost reason=<why> cursor=<c>
+    /// earliest=<e> [lost_bytes=<n>]`, project-scoped so the consumer that lost
+    /// the data sees it in its own feed when it next drains.
+    fn log_line(&self, ts: &str, earliest: u64) -> String {
+        let reason = match self.liveness {
+            CursorLiveness::Active => "ceiling",
+            CursorLiveness::Idle => "idle",
+            CursorLiveness::Unregistered => "unregistered",
+        };
+        let project = sanitize_field(&self.project);
+        let cursor = self
+            .cursor
+            .map_or_else(|| "malformed".to_string(), |cursor| cursor.to_string());
+        let lost = self
+            .lost_bytes
+            .map_or_else(String::new, |bytes| format!(" lost_bytes={bytes}"));
+        format!(
+            "{ts} project={project} event-log data-lost reason={reason} \
+             cursor={cursor} earliest={earliest}{lost}"
+        )
+    }
+}
+
+/// Every project cursor below `current_base`, classified. A cursor at or past it
+/// needs nothing from `.1`, and a project with no cursor has never consumed.
+fn lagging_event_cursors(current_base: u64) -> Result<Vec<LaggingCursor>> {
     let dir = projects_dir()?;
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(shelbi_core::Error::Io(e)),
     };
+    let now = SystemTime::now();
+    let mut lagging = Vec::new();
     for entry in entries {
         let entry = entry.map_err(shelbi_core::Error::Io)?;
         if !entry.file_type().map_err(shelbi_core::Error::Io)?.is_dir() {
@@ -3372,33 +3632,139 @@ fn prior_generation_is_needed(current_base: u64) -> Result<bool> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(shelbi_core::Error::Io(e)),
         };
-        let Ok(cursor) = text.trim().parse::<u64>() else {
-            tracing::warn!(
-                path = %cursor_path.display(),
-                "malformed event cursor blocks destructive log rotation"
-            );
-            return Ok(true);
-        };
-        if cursor < current_base {
-            return Ok(true);
+        let cursor = text.trim().parse::<u64>().ok();
+        if cursor.is_some_and(|cursor| cursor >= current_base) {
+            continue;
         }
+        let project = entry.file_name().to_string_lossy().into_owned();
+        let last_ack = fs::metadata(&cursor_path).and_then(|m| m.modified()).ok();
+        let liveness = if !crate::has_project_registration(&project).unwrap_or(false) {
+            CursorLiveness::Unregistered
+        } else if last_ack
+            .and_then(|at| now.duration_since(at).ok())
+            .is_some_and(|age| age > EVENT_CURSOR_ACTIVE_WINDOW)
+        {
+            CursorLiveness::Idle
+        } else {
+            // An unreadable or future mtime can't prove the consumer is gone.
+            CursorLiveness::Active
+        };
+        lagging.push(LaggingCursor {
+            project,
+            cursor,
+            last_ack,
+            liveness,
+        });
     }
-    Ok(false)
+    lagging.sort_by(|a, b| a.project.cmp(&b.project));
+    Ok(lagging)
+}
+
+/// Who loses data if `.1` is replaced now. A live consumer is always named. An
+/// idle or unregistered one is named only the first time it loses readable
+/// bytes: once its cursor is below `previous_base` it has nothing left to lose,
+/// and repeating it at every rotation would only be noise.
+fn rotation_losses(
+    lagging: Vec<LaggingCursor>,
+    previous_base: u64,
+    current_base: u64,
+) -> Vec<ConsumerLoss> {
+    lagging
+        .into_iter()
+        .filter(|lag| {
+            lag.liveness == CursorLiveness::Active
+                || lag.cursor.is_some_and(|cursor| cursor >= previous_base)
+        })
+        .map(|lag| ConsumerLoss {
+            lost_bytes: lag
+                .cursor
+                .map(|cursor| current_base - cursor.max(previous_base)),
+            project: lag.project,
+            cursor: lag.cursor,
+            liveness: lag.liveness,
+        })
+        .collect()
+}
+
+/// A project cursor holding rotation back, for `shelbi doctor`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventLogBlocker {
+    pub project: String,
+    /// `None` when the cursor file doesn't parse.
+    pub cursor: Option<u64>,
+    /// Unread bytes the cursor still needs from the previous generation.
+    pub behind: Option<u64>,
+    pub last_ack: Option<DateTime<Utc>>,
+}
+
+/// Where `events.log` stands against its rotation limits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EventLogRotationStatus {
+    pub len: u64,
+    pub limit: u64,
+    /// Size at which rotation proceeds despite [`Self::blockers`].
+    pub ceiling: u64,
+    /// Live consumers that still need the previous generation.
+    pub blockers: Vec<EventLogBlocker>,
+}
+
+impl EventLogRotationStatus {
+    /// Over the limit and not rotating, because of [`Self::blockers`].
+    pub fn deferred(&self) -> bool {
+        self.len >= self.limit && !self.blockers.is_empty()
+    }
+}
+
+/// Report the log's size against its limits and which projects are blocking
+/// rotation, using the same rule the append path does.
+pub fn event_log_rotation_status() -> Result<EventLogRotationStatus> {
+    let path = events_log_path()?;
+    let _lock = lock_event_log_for_read(&path)?;
+    let index = load_event_log_index(&path)?;
+    let len = match fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(shelbi_core::Error::Io(e)),
+    };
+    // With no `.1` yet there is nothing to protect, so nothing can block.
+    let blockers = match index.previous_base {
+        None => Vec::new(),
+        Some(_) => lagging_event_cursors(index.current_base)?
+            .into_iter()
+            .filter(|lag| lag.liveness == CursorLiveness::Active)
+            .map(|lag| EventLogBlocker {
+                behind: lag
+                    .cursor
+                    .map(|cursor| index.current_base.saturating_sub(cursor)),
+                project: lag.project,
+                cursor: lag.cursor,
+                last_ack: lag.last_ack.map(DateTime::<Utc>::from),
+            })
+            .collect(),
+    };
+    Ok(EventLogRotationStatus {
+        len,
+        limit: EVENTS_LOG_MAX_BYTES,
+        ceiling: events_log_ceiling(EVENTS_LOG_MAX_BYTES),
+        blockers,
+    })
 }
 
 /// Size-based rotation with monotonic logical offsets. The caller holds the
-/// event-log lock. A second rotation is deferred while a registered cursor
-/// still needs `.1`; the current file may temporarily exceed the soft size
-/// bound, but durable facts are never discarded to enforce that bound.
+/// event-log lock. A second rotation is deferred while a live consumer's cursor
+/// still needs `.1`, so the current file may exceed the soft size bound, but only
+/// up to [`events_log_ceiling`]: past that, liveness of the whole hub outranks one
+/// consumer's history. Returns `None` when nothing rotated, otherwise the
+/// consumers this rotation cost data, for the caller to log.
 fn maybe_rotate_events_log(
     path: &Path,
     max_bytes: u64,
     index: &mut EventLogIndex,
-) -> std::result::Result<bool, EventLogRotationFailure> {
+) -> std::result::Result<Option<Vec<ConsumerLoss>>, EventLogRotationFailure> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) if metadata.len() >= max_bytes => metadata,
-        Ok(_) => return Ok(false),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Ok(_) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
             return Err(EventLogRotationFailure::BeforeRename(
                 shelbi_core::Error::Io(e),
@@ -3406,12 +3772,17 @@ fn maybe_rotate_events_log(
         }
     };
     let len = metadata.len();
-    if index.previous_base.is_some() {
-        match prior_generation_is_needed(index.current_base) {
-            Ok(true) => return Ok(false),
-            Ok(false) => {}
-            Err(error) => return Err(EventLogRotationFailure::BeforeRename(error)),
+    let mut losses = Vec::new();
+    if let Some(previous_base) = index.previous_base {
+        let lagging = lagging_event_cursors(index.current_base)
+            .map_err(EventLogRotationFailure::BeforeRename)?;
+        let held = lagging
+            .iter()
+            .any(|lag| lag.liveness == CursorLiveness::Active);
+        if held && len < events_log_ceiling(max_bytes) {
+            return Ok(None);
         }
+        losses = rotation_losses(lagging, previous_base, index.current_base);
     }
 
     let journal = EventLogRotation {
@@ -3466,7 +3837,15 @@ fn maybe_rotate_events_log(
             );
         }
     }
-    Ok(true)
+    for loss in &losses {
+        tracing::warn!(
+            project = %loss.project,
+            cursor = ?loss.cursor,
+            lost_bytes = ?loss.lost_bytes,
+            "event-log rotation discarded history this consumer had not read"
+        );
+    }
+    Ok(Some(losses))
 }
 
 fn sanitize_reason(s: &str) -> String {
@@ -3709,6 +4088,15 @@ mod tests {
              status=pushed detail=ff_(new)..1111111\n\
              2026-10-01T05:00:01Z push task=feat workspace=alpha branch=jlong/feat \
              status=pushed detail=ff_(new)..2222222\n",
+        )
+        .unwrap();
+        save_event_log_index(
+            &events_log_path().unwrap(),
+            &EventLogIndex {
+                version: EVENT_LOG_INDEX_VERSION,
+                previous_base: Some(0),
+                current_base: std::fs::metadata(&rotated).unwrap().len(),
+            },
         )
         .unwrap();
         assert_eq!(
@@ -4106,14 +4494,14 @@ mod tests {
 
         // Under the (test) threshold: no rotation, file untouched.
         std::fs::write(&path, "small\n").unwrap();
-        assert!(!maybe_rotate_events_log(&path, 1024, &mut index).unwrap());
+        assert!(maybe_rotate_events_log(&path, 1024, &mut index).unwrap().is_none());
         assert!(path.exists());
         assert!(!rotated.exists());
 
         // At/over the threshold: current log renames to `.1`, leaving room
         // for a fresh file on the next append.
         std::fs::write(&path, "x".repeat(2048)).unwrap();
-        assert!(maybe_rotate_events_log(&path, 1024, &mut index).unwrap());
+        assert!(maybe_rotate_events_log(&path, 1024, &mut index).unwrap().is_some());
         assert!(!path.exists(), "over-size log should be rotated away");
         assert!(rotated.exists(), "rotated generation should exist");
         assert_eq!(index.previous_base, Some(0));
@@ -4121,7 +4509,7 @@ mod tests {
 
         // A second rotation replaces the prior `.1` rather than erroring.
         std::fs::write(&path, "y".repeat(2048)).unwrap();
-        assert!(maybe_rotate_events_log(&path, 1024, &mut index).unwrap());
+        assert!(maybe_rotate_events_log(&path, 1024, &mut index).unwrap().is_some());
         assert!(rotated.exists());
         assert_eq!(std::fs::read(&rotated).unwrap(), b"y".repeat(2048));
         assert_eq!(index.previous_base, Some(2048));
@@ -4174,7 +4562,7 @@ mod tests {
         {
             let _lock = acquire_file_lock(&event_log_lock_path(&path)).unwrap();
             let mut index = load_event_log_index(&path).unwrap();
-            assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+            assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap().is_some());
         }
         assert!(path.with_extension("log.1").exists());
 
@@ -4618,7 +5006,7 @@ mod tests {
         std::fs::write(&path, &old).unwrap();
         let cursor = old_first.len() as u64;
         let mut index = load_event_log_index(&path).unwrap();
-        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap().is_some());
 
         // Grow current beyond the old physical cursor. A length-only reader
         // would now seek `cursor` into this generation and skip its prefix.
@@ -4646,7 +5034,7 @@ mod tests {
         let path = events_log_path().unwrap();
         std::fs::write(&path, b"complete-generation\n").unwrap();
         let mut index = load_event_log_index(&path).unwrap();
-        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap().is_some());
         std::fs::write(path.with_extension("log.1"), b"short\n").unwrap();
         std::fs::write(&path, b"current\n").unwrap();
 
@@ -4659,6 +5047,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// Register `project` the way a real install does, so its cursor counts.
+    fn register_project(project: &str) {
+        let dir = projects_dir().unwrap();
+        std::fs::create_dir_all(dir.join(project)).unwrap();
+        std::fs::write(dir.join(format!("{project}.yaml")), "name: test\n").unwrap();
+    }
+
+    /// Age a project's cursor as if its last ack was `age` ago.
+    fn age_cursor(project: &str, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(event_cursor_path(project).unwrap())
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    /// A hub past its first rotation: `.1` holds `first` bytes, `index` says so.
+    fn rotated_once(path: &Path, first: usize) -> EventLogIndex {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "f".repeat(first)).unwrap();
+        let mut index = load_event_log_index(path).unwrap();
+        assert!(maybe_rotate_events_log(path, 1, &mut index).unwrap().is_some());
+        index
+    }
+
+    const LIMIT: u64 = 1024;
+    const OVER_LIMIT: usize = 1100;
+    const IDLE: Duration = Duration::from_secs(8 * 24 * 60 * 60);
+
     #[test]
     fn rotation_waits_for_slowest_of_two_project_cursors() {
         let _g = TEST_LOCK.lock().unwrap();
@@ -4666,22 +5084,414 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         let path = events_log_path().unwrap();
-        std::fs::write(&path, b"first-generation\n").unwrap();
-        let mut index = load_event_log_index(&path).unwrap();
-        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+        let mut index = rotated_once(&path, 64);
         let current_base = index.current_base;
 
-        std::fs::create_dir_all(project_dir("fast").unwrap()).unwrap();
-        std::fs::create_dir_all(project_dir("slow").unwrap()).unwrap();
+        register_project("fast");
+        register_project("slow");
         write_event_cursor("fast", current_base).unwrap();
         write_event_cursor("slow", 0).unwrap();
-        std::fs::write(&path, b"second-generation\n").unwrap();
-        assert!(!maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+        std::fs::write(&path, "s".repeat(OVER_LIMIT)).unwrap();
+        assert!(maybe_rotate_events_log(&path, LIMIT, &mut index).unwrap().is_none());
         assert_eq!(index.current_base, current_base);
 
         write_event_cursor("slow", current_base).unwrap();
-        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap());
+        assert_eq!(
+            maybe_rotate_events_log(&path, LIMIT, &mut index)
+                .unwrap()
+                .map(|losses| losses.len()),
+            Some(0),
+            "a caught-up hub rotates and nobody lost anything"
+        );
         assert!(index.current_base > current_base);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn unregistered_or_idle_cursors_do_not_hold_rotation_back() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let mut index = rotated_once(&path, 64);
+        let first_base = index.current_base;
+
+        // A leftover directory with no registration behind it (freshly written,
+        // so only the registration rule can excuse it), a registered project
+        // nobody has opened in over a week, and one whose file doesn't parse.
+        std::fs::create_dir_all(project_dir("leftover").unwrap()).unwrap();
+        write_event_cursor("leftover", 0).unwrap();
+        register_project("dormant");
+        write_event_cursor("dormant", 0).unwrap();
+        age_cursor("dormant", IDLE);
+        register_project("garbled");
+        std::fs::write(event_cursor_path("garbled").unwrap(), "not-a-cursor").unwrap();
+        age_cursor("garbled", IDLE);
+        std::fs::write(&path, "x".repeat(OVER_LIMIT)).unwrap();
+
+        let status_before = lagging_event_cursors(index.current_base).unwrap();
+        assert_eq!(status_before.len(), 3);
+
+        let losses = maybe_rotate_events_log(&path, LIMIT, &mut index)
+            .unwrap()
+            .expect("idle and unregistered cursors must not defer rotation");
+        assert!(index.current_base > first_base);
+
+        // Both readable cursors were inside `.1`, so both lost bytes and are
+        // named once with why they didn't count. Nothing can be said about the
+        // bytes of the garbled one, which was idle anyway.
+        let lines: Vec<String> = losses.iter().map(|l| l.log_line("T", 7)).collect();
+        assert_eq!(
+            lines,
+            vec![
+                "T project=dormant event-log data-lost reason=idle cursor=0 earliest=7 \
+                 lost_bytes=64",
+                "T project=leftover event-log data-lost reason=unregistered cursor=0 earliest=7 \
+                 lost_bytes=64",
+            ]
+        );
+
+        // Their cursors are now behind `.1` entirely: the next rotation has
+        // nothing more to take from them and doesn't repeat itself.
+        std::fs::write(&path, "y".repeat(OVER_LIMIT)).unwrap();
+        let losses = maybe_rotate_events_log(&path, LIMIT, &mut index).unwrap().unwrap();
+        assert!(losses.is_empty(), "already-expired consumers repeat: {losses:?}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn recently_acked_registered_cursor_defers_until_the_ceiling_then_loses_data() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let mut index = rotated_once(&path, 64);
+        let (first_previous, first_current) = (index.previous_base, index.current_base);
+        register_project("stuck");
+        write_event_cursor("stuck", 10).unwrap();
+
+        // Over the limit but under the ceiling: deferred.
+        std::fs::write(&path, "x".repeat(events_log_ceiling(LIMIT) as usize - 1)).unwrap();
+        assert!(maybe_rotate_events_log(&path, LIMIT, &mut index).unwrap().is_none());
+        assert_eq!(index.previous_base, first_previous);
+        assert_eq!(index.current_base, first_current);
+
+        // At the ceiling: rotation proceeds and names the consumer.
+        std::fs::write(&path, "x".repeat(events_log_ceiling(LIMIT) as usize)).unwrap();
+        let losses = maybe_rotate_events_log(&path, LIMIT, &mut index).unwrap().unwrap();
+        assert_eq!(index.previous_base, Some(first_current));
+        assert_eq!(losses.len(), 1);
+        assert_eq!(losses[0].project, "stuck");
+        assert_eq!(losses[0].lost_bytes, Some(first_current - 10));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn append_past_the_ceiling_logs_the_consumer_that_lost_data() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let mut index = rotated_once(&path, 64);
+        let first_current = index.current_base;
+        register_project("stuck");
+        write_event_cursor("stuck", 10).unwrap();
+
+        // The real path, at the real limits: sparse, so the test stays cheap.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(events_log_ceiling(EVENTS_LOG_MAX_BYTES))
+            .unwrap();
+        append_daemon_event("session-lost", "test").unwrap();
+
+        index = load_event_log_index(&path).unwrap();
+        assert_eq!(index.previous_base, Some(first_current));
+        let log = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 2, "log: {log}");
+        let loss = EventEnvelope::from_log_line(lines[0]);
+        assert_eq!(loss.kind, EventKind::Project);
+        assert_eq!(loss.project.as_deref(), Some("stuck"));
+        assert!(
+            lines[0].contains(&format!(
+                " project=stuck event-log data-lost reason=ceiling cursor=10 \
+                 earliest={first_current} lost_bytes={}",
+                first_current - 10
+            )),
+            "line: {}",
+            lines[0]
+        );
+        assert!(lines[1].contains(" daemon session-lost reason=test"));
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn rotation_status_names_blockers_only_for_live_consumers() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let index = rotated_once(&path, 64);
+        register_project("stuck");
+        write_event_cursor("stuck", 10).unwrap();
+        register_project("dormant");
+        write_event_cursor("dormant", 0).unwrap();
+        age_cursor("dormant", IDLE);
+        std::fs::create_dir_all(project_dir("leftover").unwrap()).unwrap();
+        write_event_cursor("leftover", 0).unwrap();
+        register_project("current");
+        write_event_cursor("current", index.current_base).unwrap();
+
+        // Under the limit: blockers are known but rotation isn't due.
+        std::fs::write(&path, "x").unwrap();
+        let status = event_log_rotation_status().unwrap();
+        assert!(!status.deferred());
+        assert_eq!(status.ceiling, status.limit * EVENTS_LOG_CEILING_FACTOR);
+
+        // Over it: deferred, and only the live consumer is named.
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(EVENTS_LOG_MAX_BYTES)
+            .unwrap();
+        let status = event_log_rotation_status().unwrap();
+        assert!(status.deferred());
+        assert_eq!(status.blockers.len(), 1);
+        let blocker = &status.blockers[0];
+        assert_eq!(blocker.project, "stuck");
+        assert_eq!(blocker.cursor, Some(10));
+        assert_eq!(blocker.behind, Some(index.current_base - 10));
+        assert!(blocker.last_ack.is_some());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn an_expired_cursor_resumes_at_the_earliest_retained_byte() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let mut index = rotated_once(&path, 64);
+        register_project("demo");
+        write_event_cursor("demo", 0).unwrap();
+        age_cursor("demo", IDLE);
+        std::fs::write(&path, "x".repeat(OVER_LIMIT)).unwrap();
+        assert!(maybe_rotate_events_log(&path, LIMIT, &mut index).unwrap().is_some());
+        let earliest = index.earliest();
+        assert!(earliest > 0);
+
+        // The blocking read fails closed on this cursor, so the cursor read that
+        // feeds it must not hand it one.
+        assert!(read_event_log_from(0).is_err());
+        assert_eq!(read_or_initialize_event_cursor("demo").unwrap(), earliest);
+        assert_eq!(
+            std::fs::read_to_string(event_cursor_path("demo").unwrap()).unwrap(),
+            earliest.to_string()
+        );
+        assert!(read_event_log_from(earliest).is_ok());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `.1` holds `previous`, the current file holds `current`, indexed.
+    fn two_generations(path: &Path, previous: &str, current: &str) -> EventLogIndex {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, previous).unwrap();
+        let mut index = load_event_log_index(path).unwrap();
+        assert!(maybe_rotate_events_log(path, 1, &mut index).unwrap().is_some());
+        std::fs::write(path, current).unwrap();
+        index
+    }
+
+    #[test]
+    fn tail_spans_generations_and_starts_on_a_line_boundary() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        two_generations(&path, "old-1\nold-2\n", "new-1\nnew-2\n");
+
+        // Everything: `.1` then current.
+        let all = read_event_log_retained().unwrap();
+        assert_eq!(all.start, 0);
+        assert_eq!(all.text(), "old-1\nold-2\nnew-1\nnew-2\n");
+        assert_eq!(all.start + all.bytes.len() as u64, all.head);
+
+        // Exactly on a line boundary: that line is kept.
+        assert_eq!(read_event_log_tail(12).unwrap().text(), "new-1\nnew-2\n");
+        // Across the seam, mid-line: the torn fragment is dropped.
+        assert_eq!(read_event_log_tail(14).unwrap().text(), "new-1\nnew-2\n");
+        assert_eq!(read_event_log_tail(18).unwrap().text(), "old-2\nnew-1\nnew-2\n");
+        // Inside current, mid-line.
+        let tail = read_event_log_tail(8).unwrap();
+        assert_eq!(tail.text(), "new-2\n");
+        assert_eq!(tail.start, tail.head - 6);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn readers_degrade_to_the_current_file_when_the_retained_generation_is_unusable() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        two_generations(&path, "old-1\n", "new-1\n");
+        std::fs::write(path.with_extension("log.1"), "wrong length\n").unwrap();
+        assert_eq!(read_event_log_retained().unwrap().text(), "new-1\n");
+        std::fs::remove_file(path.with_extension("log.1")).unwrap();
+        assert_eq!(read_event_log_retained().unwrap().text(), "new-1\n");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn readers_treat_a_missing_log_as_empty() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        assert!(read_event_log_retained().unwrap().bytes.is_empty());
+        assert_eq!(read_event_log_last_lines(5).unwrap(), (String::new(), false));
+        assert_eq!(message_delivery_status("m1").unwrap(), MessageDelivery::Unknown);
+        assert!(!event_log_rotation_status().unwrap().deferred());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readers_still_read_when_the_lock_file_is_off_limits() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        two_generations(&path, "old-1\n", "new-1\n");
+        let lock = event_log_lock_path(&path);
+        std::fs::write(&lock, b"").unwrap();
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o400)).unwrap();
+        // Root ignores file modes, so this only proves anything when it applies.
+        if std::fs::OpenOptions::new().write(true).open(&lock).is_err() {
+            assert_eq!(read_event_log_retained().unwrap().text(), "old-1\nnew-1\n");
+        }
+        std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn read_since_follows_across_a_rotation_without_losing_a_line() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let path = events_log_path().unwrap();
+        let mut index = rotated_once(&path, 6);
+        std::fs::write(&path, "seen\n").unwrap();
+        let first = read_event_log_since(index.current_base).unwrap();
+        assert_eq!(first.text(), "seen\n");
+        let offset = first.head;
+
+        // A line lands in the old file, and it rotates, between two polls.
+        std::fs::write(&path, "seen\nraced\n").unwrap();
+        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap().is_some());
+        std::fs::write(&path, "fresh\n").unwrap();
+        let next = read_event_log_since(offset).unwrap();
+        assert_eq!(next.start, offset);
+        assert_eq!(next.text(), "raced\nfresh\n");
+
+        // Nothing new reads as nothing.
+        assert!(read_event_log_since(next.head).unwrap().bytes.is_empty());
+        // An expired offset restarts forward, a replaced log restarts backward.
+        let expired = read_event_log_since(0).unwrap();
+        assert_eq!(expired.start, index.earliest());
+        let past_head = read_event_log_since(next.head + 100).unwrap();
+        assert!(past_head.start < next.head + 100);
+        assert_eq!(past_head.start, index.earliest());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn last_lines_pages_back_across_generations() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let line = |i: usize| format!("line-{i:05}-padding-to-span-several-read-windows\n");
+        let older: String = (0..3000).map(line).collect();
+        let newer: String = (3000..6000).map(line).collect();
+        let path = events_log_path().unwrap();
+        two_generations(&path, &older, &newer);
+        let all: Vec<String> = (0..6000).map(|i| line(i).trim().to_string()).collect();
+
+        let (text, has_older) = read_event_log_last_lines(10).unwrap();
+        assert!(has_older);
+        assert_eq!(text.lines().collect::<Vec<_>>(), all[5990..].to_vec());
+
+        // Reaches back through the seam into `.1`.
+        let (text, has_older) = read_event_log_last_lines(5000).unwrap();
+        assert!(has_older);
+        assert_eq!(text.lines().count(), 5000);
+        assert_eq!(text.lines().next(), Some(all[1000].as_str()));
+
+        // A window past the start returns every line and nothing older.
+        let (text, has_older) = read_event_log_last_lines(9000).unwrap();
+        assert!(!has_older);
+        assert_eq!(text.lines().count(), 6000);
+
+        // Blank lines don't count; a missing trailing newline is fine.
+        std::fs::remove_file(path.with_extension("log.1")).unwrap();
+        std::fs::write(&path, "a\n\nb\nc").unwrap();
+        let (text, has_older) = read_event_log_last_lines(2).unwrap();
+        assert_eq!(text, "b\nc");
+        assert!(has_older);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_rotation_does_not_hide_a_message_or_a_dispatch_from_their_readers() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_message_event("m1", "t1").unwrap();
+        append_message_ack_event("m1", "t1", "worker").unwrap();
+        append_dispatch_event("demo", "t1", "alpha", "confirmed", "-").unwrap();
+        // Force the rotation the append path would do, right after those lines.
+        let path = events_log_path().unwrap();
+        let mut index = load_event_log_index(&path).unwrap();
+        assert!(maybe_rotate_events_log(&path, 1, &mut index).unwrap().is_some());
+        assert!(!path.exists(), "the current generation is empty");
+
+        assert_eq!(message_delivery_status("m1").unwrap(), MessageDelivery::Delivered);
+        assert!(recent_dispatch_active("demo", "alpha", Duration::from_secs(60)));
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);

@@ -490,9 +490,18 @@ impl SessionProcessBackend {
             return remote_session::signal(host, name, signal);
         }
         if let Some(session) = self.find_live(name) {
-            let conn = self.connect(&session)?;
-            conn.kill(signal)
-                .map_err(|e| Error::Other(format!("killing session `{name}`: {e}")))?;
+            match self.connect(&session) {
+                Ok(conn) => conn
+                    .kill(signal)
+                    .map_err(|e| Error::Other(format!("killing session `{name}`: {e}")))?,
+                // A session binds its socket only after spawning its child, which
+                // can take a login shell's time, so a session that has only just
+                // been asked for can't be reached this way yet (and a wedged one
+                // never can). Its process can: it holds its lock, so the recorded
+                // pid is really its own, and SIGTERM ends it once it's up.
+                Err(_) if session.meta.pid > 1 => terminate_pid(session.meta.pid),
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -569,6 +578,13 @@ impl SessionProcessBackend {
         self.discover()
             .iter()
             .any(|s| s.meta.name == name && s.not_listening())
+    }
+
+    /// The task the live session `name` was spawned for: `None` when no usable
+    /// session carries the name, `Some(None)` when one does but names no task.
+    /// Local only: it reads the session's `meta.json`.
+    pub(crate) fn live_session_task(&self, name: &str) -> Option<Option<String>> {
+        self.find_live(name).map(|session| session.meta.task)
     }
 
     /// The logical names of every live session. Stands in for the tmux backend's
@@ -1067,6 +1083,49 @@ claude --resume a7b448d4-e35d-4246-9870-953e5ab7a895
         assert!(b.final_screen(&Host::Local, &target).unwrap().contains("Zigzagging"));
 
         drop(probers);
+        match prev {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_kill_reaches_a_session_whose_socket_cant_be_connected_to_yet() {
+        // A session still capturing its login environment holds its lock and has
+        // recorded its pid, but hasn't bound its socket. Connecting fails, and
+        // that must not lose the kill. The `sleep` is this test's own child,
+        // standing in for the session process.
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!("shelbi-kss-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+
+        let id = "cccccccccccccccc";
+        let (_lock, _none) =
+            write_session_dir(&sessions, id, "demo/review/r1/diff", "2026-01-01T00:00:00Z", true);
+        let _ = std::fs::remove_file(sessions.join(id).join("sock"));
+        let mut starting = std::process::Command::new("sleep").arg("300").spawn().unwrap();
+        let meta_path = sessions.join(id).join("meta.json");
+        let mut meta: shelbi_session::Meta =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.pid = starting.id();
+        std::fs::write(&meta_path, meta.to_json().unwrap()).unwrap();
+
+        SessionProcessBackend
+            .kill_by_name(&Host::Local, "demo/review/r1/diff")
+            .unwrap();
+
+        let status = starting.wait().unwrap();
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(libc::SIGTERM),
+        );
+
         match prev {
             Some(h) => std::env::set_var("SHELBI_HOME", h),
             None => std::env::remove_var("SHELBI_HOME"),

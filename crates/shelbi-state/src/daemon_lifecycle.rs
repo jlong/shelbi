@@ -28,6 +28,25 @@ const START_DEADLINE: Duration = Duration::from_secs(10);
 /// TIMEOUT`); this leaves margin before falling back to a stronger signal.
 const STOP_DEADLINE: Duration = Duration::from_secs(8);
 
+/// How long a stopping daemon waits for the control jobs it already accepted
+/// (a merge, a board move, a config save) before it exits anyway. Long enough
+/// for a merge, whose `gh` calls alone can each take 45s. A job past this is
+/// abandoned, and the daemon says so on `events.log`.
+pub const DAEMON_JOB_DRAIN: Duration = Duration::from_secs(120);
+
+/// The most [`stop_daemon`] waits for a daemon that keeps answering its hello:
+/// it is draining ([`DAEMON_JOB_DRAIN`]), not wedged.
+const DRAINING_STOP_DEADLINE: Duration = Duration::from_secs(DAEMON_JOB_DRAIN.as_secs() + STOP_DEADLINE.as_secs());
+
+/// How long a client keeps resending a request a stopping daemon refused
+/// (`MutationError::ShuttingDown`) before giving up: the longest a daemon can
+/// take to stop, then the time its successor can take to start.
+pub const DAEMON_RESTART_WINDOW: Duration =
+    Duration::from_secs(DRAINING_STOP_DEADLINE.as_secs() + START_DEADLINE.as_secs());
+
+/// After how long a stop tells its caller it is still waiting on a drain.
+const STOP_NOTICE_AFTER: Duration = Duration::from_secs(2);
+
 /// Poll granularity for the two deadlines above.
 const POLL_SLICE: Duration = Duration::from_millis(100);
 
@@ -340,6 +359,14 @@ fn decide_stop(
     StopDecision::Signal(pid)
 }
 
+/// Whether a stop gives up on the daemon it signalled and sends SIGKILL, given
+/// how long ago it signalled and how long ago the daemon last answered a hello.
+/// A draining daemon keeps answering, because its hub socket serves until its
+/// jobs are done; only a daemon that stopped answering is treated as wedged.
+fn should_escalate_stop(since_signal: Duration, since_answered: Duration) -> bool {
+    since_answered >= STOP_DEADLINE || since_signal >= DRAINING_STOP_DEADLINE
+}
+
 /// Stop this root's hub daemon and wait for it to exit. Used by `shelbi daemon
 /// stop` and `shelbi daemon restart`.
 ///
@@ -353,10 +380,19 @@ fn decide_stop(
 /// session hosts run in their own sessions, outlive the daemon, and a restarted
 /// daemon finds them on disk.)
 ///
-/// Sends SIGTERM (the daemon drains and exits on it), then waits up to
-/// [`STOP_DEADLINE`] for the process to go away or its single-instance lock to
-/// release. A SIGKILL fallback fires only if that same process is still there.
+/// Sends SIGTERM (the daemon drains and exits on it), then waits for the
+/// process to go away or its single-instance lock to release. A daemon that
+/// keeps answering its hello is draining: it gets [`DRAINING_STOP_DEADLINE`],
+/// so a merge it is finishing isn't killed. One that goes silent for
+/// [`STOP_DEADLINE`] is wedged (see [`should_escalate_stop`]). The SIGKILL
+/// fallback fires only if that same process is still there.
 pub fn stop_daemon() -> Result<StopOutcome> {
+    stop_daemon_with(&mut || {})
+}
+
+/// [`stop_daemon`], calling `on_draining` once if the daemon is still finishing
+/// its jobs a moment after the signal, so a command can say why it is waiting.
+pub fn stop_daemon_with(on_draining: &mut dyn FnMut()) -> Result<StopOutcome> {
     let up = daemon_lock_held() || socket_answers();
     if !up {
         // Nothing under this root: the fast path a sandbox stop takes, which
@@ -389,8 +425,17 @@ pub fn stop_daemon() -> Result<StopOutcome> {
     unsafe { libc::kill(pid, libc::SIGTERM) };
 
     let start = Instant::now();
+    let mut last_answered = start;
+    let mut noticed = false;
     while still_there() && daemon_lock_held() {
-        if start.elapsed() >= STOP_DEADLINE {
+        if matches!(probe_daemon_hello(), DaemonProbe::Hello(_)) {
+            last_answered = Instant::now();
+            if !noticed && start.elapsed() >= STOP_NOTICE_AFTER {
+                noticed = true;
+                on_draining();
+            }
+        }
+        if should_escalate_stop(start.elapsed(), last_answered.elapsed()) {
             // The drain wedged. Escalate once so a restart isn't blocked
             // forever by a stuck daemon — re-checking identity first.
             if still_there() {
@@ -479,6 +524,27 @@ mod tests {
         // Releasing it flips the answer back.
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
         assert!(!daemon_lock_held(), "released lock must read as free");
+    }
+
+    #[test]
+    fn a_stop_never_kills_a_daemon_that_is_still_answering_within_the_drain() {
+        let just_now = Duration::from_millis(100);
+        // Well past the old flat deadline, mid merge, still answering.
+        assert!(!should_escalate_stop(Duration::from_secs(60), just_now));
+        assert!(!should_escalate_stop(DAEMON_JOB_DRAIN, just_now));
+        // Its last moments: jobs done, the hub socket no longer accepting.
+        assert!(!should_escalate_stop(Duration::from_secs(60), Duration::from_secs(3)));
+        // Silent for the wedged deadline, however recent the signal.
+        assert!(should_escalate_stop(STOP_DEADLINE, STOP_DEADLINE));
+        assert!(should_escalate_stop(Duration::from_secs(60), STOP_DEADLINE));
+        // Answering but never leaving: the drain's own bound still holds.
+        assert!(should_escalate_stop(DRAINING_STOP_DEADLINE, just_now));
+    }
+
+    #[test]
+    fn a_stop_outwaits_the_job_drain_and_a_client_outwaits_the_stop() {
+        assert!(DRAINING_STOP_DEADLINE > DAEMON_JOB_DRAIN);
+        assert!(DAEMON_RESTART_WINDOW > DRAINING_STOP_DEADLINE);
     }
 
     #[test]

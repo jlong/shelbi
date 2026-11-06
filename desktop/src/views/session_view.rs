@@ -610,6 +610,12 @@ impl SessionView {
         self.restart.note_deliberate_close();
     }
 
+    /// Whether the pane's exit is marked as deliberate (tests).
+    #[cfg(test)]
+    pub fn closing_deliberately(&self) -> bool {
+        self.restart.deliberate_close()
+    }
+
     /// The deliberate teardown didn't happen after all (the quit failed).
     pub fn clear_deliberate_close(&mut self) {
         self.restart.clear_deliberate_close();
