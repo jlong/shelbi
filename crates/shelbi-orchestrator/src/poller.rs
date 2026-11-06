@@ -193,6 +193,13 @@ impl WorkspacePoller {
     pub fn is_active(&self) -> bool {
         self.active
     }
+
+    /// Whether this handle's poll loop has exited. A loop runs until its handle
+    /// drops or a quit cancels it, so this reads true for a poller a quit
+    /// cancelled, which a manager must replace if the project is open again.
+    pub fn is_finished(&self) -> bool {
+        self.handle.as_ref().is_some_and(JoinHandle::is_finished)
+    }
 }
 
 impl Drop for WorkspacePoller {
@@ -5122,6 +5129,13 @@ fn maybe_supervise_orchestrator(
         // The orchestrator is always wanted, so it never reads as deliberate.
         SupervisionAction::None | SupervisionAction::StandDown => {}
         SupervisionAction::Restart => {
+            // A launch like any other, so a quit stops it before it starts: a
+            // project mid-quit has just killed this orchestrator on purpose,
+            // and the kill reads as a crash here.
+            let launch = crate::cancel::register(&project.name, None, crate::cancel::JobKind::Launch);
+            if launch.is_cancelled() {
+                return;
+            }
             // Bring a fresh orchestrator session up (the session half of
             // `ensure_dashboard`, under the dashboard lock) and wait for it to
             // answer. Only a live session is a restart; the layout event then
@@ -13332,6 +13346,120 @@ transitions:
                 None => std::env::remove_var("SHELBI_HUB_SOCK"),
             }
         }
+    }
+
+    /// Wait for a remote session to read dead, the kill having just been sent.
+    fn assert_remote_session_ends(fx: &RemoteReapFixture, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while backend().probe(&fx.host, &fx.addr, None) != crate::session_backend::Liveness::Dead {
+            assert!(Instant::now() < deadline, "{what} left the remote agent running");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The real path the fakes in `quit` can't cover: quitting a project reaches
+    /// its machine over the relay and ends an agent registered as
+    /// `w-<ws>/ws/agent`, once the open flag no longer names the machine.
+    #[test]
+    fn quit_project_ends_a_real_remote_agent() {
+        let _g = crate::test_lock::acquire();
+        let fx = RemoteReapFixture::new("exec sleep 600");
+        shelbi_state::set_project_open(&fx.project.name, true).unwrap();
+
+        let out = crate::quit::quit_project_with(&fx.project.name, &crate::quit::BackendSessions);
+
+        assert_remote_session_ends(&fx, "Quit Project");
+        assert_eq!(out.ended, vec!["w-delta/ws/agent"]);
+        assert!(!shelbi_state::is_project_open(&fx.project.name).unwrap());
+    }
+
+    #[test]
+    fn quit_shelbi_ends_a_real_remote_agent() {
+        let _g = crate::test_lock::acquire();
+        let fx = RemoteReapFixture::new("exec sleep 600");
+        shelbi_state::set_project_open(&fx.project.name, true).unwrap();
+
+        let out = crate::quit::quit_shelbi_with(&crate::quit::BackendSessions);
+
+        assert_remote_session_ends(&fx, "Quit Shelbi");
+        assert!(out.ended.contains(&"w-delta/ws/agent".to_string()), "{:?}", out.ended);
+        assert_eq!(out.closed, vec![fx.project.name.clone()]);
+    }
+
+    /// A user shell ignores the session's default SIGTERM, so the quit has to
+    /// end it the way a closing terminal would.
+    #[test]
+    fn a_quit_ends_a_real_user_shell_that_ignores_sigterm() {
+        let _g = crate::test_lock::acquire();
+        let fx = RemoteReapFixture::new("exec sleep 600");
+        let name = crate::workspace_session::shell_session_name(&fx.project.name, "delta");
+        let (cols, rows) = crate::session_process_backend::SessionProcessBackend::default_size();
+        crate::remote_session::spawn_remote_session(
+            &fx.host,
+            "shelbi",
+            &shelbi_session::SpawnSpec {
+                name: name.clone(),
+                cwd: std::env::temp_dir(),
+                cols,
+                rows,
+                task: None,
+                raw_output_log: false,
+                child_argv: vec!["trap '' TERM; exec sleep 600".into()],
+            },
+        )
+        .unwrap();
+
+        crate::quit::quit_project_with(&fx.project.name, &crate::quit::BackendSessions);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::remote_session::live_session_names(&fx.host).unwrap().contains(&name) {
+            assert!(Instant::now() < deadline, "the shell outlived the quit");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The orchestrator's relaunch had no job of its own for a quit to refuse:
+    /// a dead orchestrator in a project mid-quit must stay dead, with no
+    /// `restart` line claiming otherwise.
+    #[test]
+    fn a_quitting_project_does_not_relaunch_its_dead_orchestrator() {
+        let _g = crate::test_lock::acquire();
+        let home = tempfile::tempdir().unwrap();
+        let prior_home = std::env::var_os("SHELBI_HOME");
+        let prior_hub_sock = std::env::var_os("SHELBI_HUB_SOCK");
+        std::env::set_var("SHELBI_HOME", home.path());
+        std::env::set_var("SHELBI_HUB_SOCK", home.path().join("no-hub.sock"));
+        let mut project = local_project(home.path());
+        // Were the gate ever lost, this test's relaunch must not start a real agent.
+        project.agent_runners.get_mut("claude").unwrap().command = "true".into();
+        shelbi_state::save_project(&project).unwrap();
+
+        // An orchestrator seen alive, now dead: exactly what decides to restart.
+        let now = Instant::now();
+        let alive = SupervisionInputs { alive: true, intentional_shutdown: false, has_work: true };
+        let dead = SupervisionInputs { alive: false, intentional_shutdown: false, has_work: true };
+        let mut control = SupervisionState::default();
+        control.decide(&alive, now);
+        assert_eq!(control.decide(&dead, now), SupervisionAction::Restart);
+        let mut state = SupervisionState::default();
+        state.decide(&alive, now);
+
+        let phase = crate::cancel::begin_quit(&project.name);
+        let mut last_failure = None;
+        maybe_supervise_orchestrator(&project, &mut state, &mut last_failure);
+        drop(phase);
+
+        let events = std::fs::read_to_string(home.path().join("events.log")).unwrap_or_default();
+        match prior_home {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        match prior_hub_sock {
+            Some(v) => std::env::set_var("SHELBI_HUB_SOCK", v),
+            None => std::env::remove_var("SHELBI_HUB_SOCK"),
+        }
+        assert!(!events.contains("supervision=restart"), "{events}");
+        assert_eq!(last_failure, None, "no relaunch was attempted");
     }
 
     /// The remote orphan-reap loop: a card supplanted off an SSH workspace left

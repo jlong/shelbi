@@ -14963,6 +14963,48 @@ mod sync_worktree_freshcut_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The relaunch the quit race produces: a supervisor redispatching a
+    /// workspace after the quit began stands down without touching anything.
+    #[test]
+    fn a_dispatch_during_a_project_quit_is_cancelled_before_it_starts() {
+        let _env = crate::test_lock::acquire();
+        let root = std::env::temp_dir().join(format!(
+            "shelbi-dispatch-mid-quit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let machine_repo = root.join("repo");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = dispatch_project(&machine_repo, "claude", Vec::new());
+        let phase = crate::cancel::begin_quit(&project.name);
+        let result = start_workspace_on_task(StartSpec {
+            project: &project,
+            workspace: &project.workspaces[0],
+            task_id: "task-raced",
+            branch: "shelbi/task-raced",
+            task_body: "",
+            agent: None,
+            launch_override: None,
+        });
+        drop(phase);
+
+        match prev_home {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(matches!(result, Err(Error::Cancelled(_))), "{:?}", result.err());
+        assert!(!machine_repo.exists(), "the cancelled dispatch touched no worktree");
+    }
+
     #[test]
     fn sync_failure_emits_dispatch_event_and_aborts_start() {
         // Acceptance criterion: the aborted dispatch is VISIBLE — a
