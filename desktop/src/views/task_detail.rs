@@ -10,8 +10,8 @@
 //! too), keeps its scroll and selection, and stays usable where the pane
 //! doesn't cover it: a click on another card shows that card here. The pane
 //! is opaque in every window, with Figma's `shadow/hard` drop over the board. It slides in from the right
-//! as it opens ([`SLIDE`], gpui's animation, so Reduce Motion shows it in
-//! place). Closing it, by any path, plays that in reverse ([`PaneMotion::Out`]):
+//! as it opens ([`SLIDE`], on the executor's clock, so tests can stop it and Reduce Motion
+//! shows it in place). Closing it, by any path, plays that in reverse ([`PaneMotion::Out`]):
 //! the view keeps the closed pane drawn, inert, for one [`SLIDE`] as it slides
 //! back out, then drops it. The same pane shows over Review and Workspace (their More), drawn
 //! by a floating board ([`IssuesView::open_task_over`]).
@@ -63,7 +63,7 @@
 //! show in the same shell.
 
 use gpui::{
-    canvas, div, prelude::*, px, Animation, AnimationExt, AnyElement, BoxShadow, ClickEvent, Context, CursorStyle,
+    canvas, div, prelude::*, px, AnyElement, BoxShadow, ClickEvent, Context, CursorStyle,
     DispatchPhase, Div, ElementId, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollHandle, SharedString,
     Stateful, Window,
 };
@@ -84,6 +84,7 @@ use super::task_panel;
 use super::workflow_editor::{dropdown, MENU_W};
 use crate::app::RESIZE_GRAB;
 use crate::assets::{heroicon, icons, Icon};
+use crate::elements::clocked_animation::clocked_animation;
 use crate::elements::placed::MenuScroll;
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::theme::motion::{ease_out_expo, ease_out_expo_reversed, fill_layer};
@@ -222,17 +223,15 @@ pub fn render(
     let travel = width + EDGE;
     let pane = match motion {
         // In from past the window's right edge.
-        PaneMotion::In => pane
-            .with_animation("task-pane-in", Animation::new(SLIDE).with_easing(ease_out_expo), move |pane, t| {
-                pane.left(px((1.0 - t) * travel))
-            })
-            .into_any_element(),
+        PaneMotion::In => clocked_animation("task-pane-in", pane, SLIDE, ease_out_expo, move |pane, t| {
+            pane.left(px((1.0 - t) * travel))
+        })
+        .into_any_element(),
         // Back out the way it came, along the same curve backwards.
-        PaneMotion::Out => pane
-            .with_animation("task-pane-out", Animation::new(SLIDE).with_easing(ease_out_expo_reversed), move |pane, t| {
-                pane.left(px(t * travel))
-            })
-            .into_any_element(),
+        PaneMotion::Out => clocked_animation("task-pane-out", pane, SLIDE, ease_out_expo_reversed, move |pane, t| {
+            pane.left(px(t * travel))
+        })
+        .into_any_element(),
     };
     div()
         .absolute()

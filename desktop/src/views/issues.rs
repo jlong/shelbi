@@ -48,7 +48,7 @@ use gpui::{
 };
 use shelbi_app::board::DropTarget;
 use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
-use shelbi_app::board::{BoardRead, ClosedPage};
+use shelbi_app::board::{BoardRead, ClosedPage, MoreRequest};
 use shelbi_app::board_search::SearchWorker;
 use shelbi_app::source::{ProjectHandle, ProjectLink};
 use shelbi_app::state_write::{self, StateWrite};
@@ -186,7 +186,7 @@ enum Done {
     /// A test's saves are recorded, not run.
     #[cfg_attr(test, allow(dead_code))]
     Saved { id: String },
-    More(Result<ClosedPage, String>),
+    More(MoreRequest, Result<ClosedPage, String>),
     Persisted(Result<(), String>),
 }
 
@@ -249,7 +249,6 @@ pub struct IssuesView {
     editor_tx: Sender<EditorEvent>,
     editor_rx: Receiver<EditorEvent>,
     last_refresh: Instant,
-    load_more_in_flight: bool,
     board_scroll: BoardScroll,
     /// Each expanded column's virtualized card list, by status id (a column
     /// keeps its scroll position across a filter change or a collapse).
@@ -340,7 +339,6 @@ impl IssuesView {
             editor_tx,
             editor_rx,
             last_refresh: Instant::now(),
-            load_more_in_flight: false,
             board_scroll: BoardScroll::default(),
             column_lists: HashMap::new(),
             search_lists: HashMap::new(),
@@ -780,10 +778,7 @@ impl IssuesView {
                     let intents = self.state.finish_save(&id);
                     self.apply_intents_bg(intents, cx);
                 }
-                Done::More(page) => {
-                    self.load_more_in_flight = false;
-                    self.state.apply_more(page);
-                }
+                Done::More(request, page) => self.state.apply_more(&request, page),
                 Done::Persisted(result) => {
                     // The next read is folded either way: it carries what
                     // was persisted (or puts back what wasn't).
@@ -1055,18 +1050,14 @@ impl IssuesView {
             }
             return;
         }
-        let Some(cursor) = self.state.closed_cursor().map(str::to_string) else {
+        let Some(request) = self.state.begin_more() else {
             return;
         };
-        if self.load_more_in_flight {
-            return;
-        }
-        self.load_more_in_flight = true;
-        self.state.status = Some("loading more history…".into());
         let source = self.project.source.clone();
         let tx = self.done_tx.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(Done::More(source.more_closed(&cursor)));
+            let page = source.more_closed(&request.cursor);
+            let _ = tx.send(Done::More(request, page));
         });
     }
 
@@ -1877,7 +1868,7 @@ impl IssuesView {
                         .text_color(theme.link)
                         .hover(|s| s.text_color(theme.link_hover))
                         .cursor_pointer()
-                        .child(if self.load_more_in_flight
+                        .child(if self.state.input().closed.fetching()
                             || self.state.model().search.as_ref().is_some_and(|s| s.searching)
                         {
                             "Loading…".to_string()
@@ -2629,6 +2620,38 @@ mod tests {
         cx.update(|window, cx| view.read(cx).search_focused(window, cx))
     }
 
+    /// "Load more" through the view's own folds: its answer on the done
+    /// channel, then a refresher read that differs from the last one (so it's
+    /// folded), which is the read that used to rewind the cursor.
+    #[gpui::test]
+    fn loaded_history_survives_the_views_next_refresh(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        let page = |id: &str, title: &str, next: &str| ClosedPage {
+            issues: vec![{
+                let mut card = issue(id, "done");
+                card.task.title = title.into();
+                card
+            }],
+            next_cursor: Some(next.into()),
+        };
+        let (view, mut cx) = open_board(cx, vec![issue("A", "todo")]);
+        view.update(&mut cx, |v, cx| {
+            v.fold_reads(None, Some((Some(page("D-1", "first", "p2")), 1)));
+            let request = v.state.begin_more().expect("a next page");
+            assert_eq!(request.cursor, "p2");
+            v.done_tx.send(Done::More(request, Ok(page("D-2", "second", "p3")))).unwrap();
+            v.tick(cx);
+            assert!(v.state.model().card("D-2").is_some());
+            assert!(!v.state.input().closed.fetching());
+
+            assert!(v.fold_reads(None, Some((Some(page("D-1", "edited", "p2")), 2))));
+
+            assert_eq!(v.state.model().card("D-1").unwrap().title, "edited");
+            assert!(v.state.model().card("D-2").is_some(), "the loaded page stays");
+            assert_eq!(v.state.begin_more().expect("a next page").cursor, "p3");
+        });
+    }
+
     #[gpui::test]
     fn the_clear_button_shows_with_a_query_and_clears_it(cx: &mut gpui::TestAppContext) {
         use crate::views::board_state::tests::issue;
@@ -2863,9 +2886,13 @@ mod tests {
         use crate::views::board_state::tests::issue;
         let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
         view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        // Its left edge at the window's right edge: all of it is out of sight.
         let first = bounds(&mut cx, "task-pane");
-        assert!(first.left() > px(512.0), "it starts to the right of its place: {first:?}");
-        std::thread::sleep(super::super::column_swap::SLIDE + Duration::from_millis(60));
+        assert_eq!(first.left(), px(1160.0), "it starts past the window's edge: {first:?}");
+        cx.executor().advance_clock(SLIDE / 2);
+        let mid = bounds(&mut cx, "task-pane");
+        assert!(mid.left() > px(512.0) && mid.left() < first.left(), "{mid:?} between {first:?} and its place");
+        cx.executor().advance_clock(SLIDE / 2);
         let settled = bounds(&mut cx, "task-pane");
         assert_eq!(settled.left(), px(512.0), "and lands 8pt in from the right");
         assert_eq!(settled.top(), first.top(), "sliding, not dropping");
@@ -2876,7 +2903,8 @@ mod tests {
         use crate::views::board_state::tests::issue;
         let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
         view.update(&mut cx, |v, cx| v.open_task("A", cx));
-        std::thread::sleep(SLIDE + Duration::from_millis(60));
+        assert!(drawn(&mut cx, "task-pane"));
+        cx.executor().advance_clock(SLIDE);
         let open = bounds(&mut cx, "task-pane");
 
         click(&mut cx, "pane-close");
@@ -2885,15 +2913,22 @@ mod tests {
         // Still drawn, starting back out from where it stood.
         let leaving = bounds(&mut cx, "task-pane-closing");
         assert!(!drawn(&mut cx, "task-pane"));
-        assert!(leaving.left() >= open.left() && leaving.left() < px(1160.0), "{leaving:?} from {open:?}");
+        assert_eq!(leaving.left(), open.left(), "{leaving:?} from {open:?}");
         assert_eq!(leaving.top(), open.top(), "sliding, not dropping");
-        // The slide ends past the window's right edge, the way it came in.
-        std::thread::sleep(SLIDE + Duration::from_millis(60));
+        // On its way.
+        cx.executor().advance_clock(SLIDE / 2);
+        let mid = bounds(&mut cx, "task-pane-closing");
+        assert!(mid.left() > open.left() && mid.left() < px(1160.0), "{mid:?} from {open:?}");
+        assert_eq!(mid.top(), open.top(), "sliding, not dropping");
+        // The slide ends past the window's right edge, the way it came in:
+        // a moment before it ends, it's all but there.
+        let moment = Duration::from_micros(100);
+        cx.executor().advance_clock(SLIDE / 2 - moment);
         let out = bounds(&mut cx, "task-pane-closing");
-        assert_eq!(out.left(), px(1160.0), "{out:?}");
+        assert!(out.left() > px(1156.0) && out.left() <= px(1160.0), "{out:?}");
 
         // Then it's gone: nothing of it is drawn, and it takes no clicks.
-        cx.executor().advance_clock(SLIDE);
+        cx.executor().advance_clock(moment);
         cx.run_until_parked();
         assert!(!drawn(&mut cx, "task-pane-closing"));
         assert!(!drawn(&mut cx, "pane-close"));
@@ -3102,7 +3137,7 @@ mod tests {
         });
         let first = bounds(&mut cx, "task-pane");
         assert!(first.left() > px(252.0), "it starts to the right of its place: {first:?}");
-        std::thread::sleep(super::super::column_swap::SLIDE + Duration::from_millis(60));
+        cx.executor().advance_clock(SLIDE);
         let settled = bounds(&mut cx, "task-pane");
         assert_eq!((settled.left(), settled.size.width), (px(252.0), px(900.0)));
     }

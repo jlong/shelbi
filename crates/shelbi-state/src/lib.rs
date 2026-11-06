@@ -77,6 +77,7 @@ pub mod supervision_status;
 pub mod tools;
 mod user_config;
 mod workflows;
+mod workspace_state_migration;
 mod workspace_status;
 mod zen_demotions;
 mod zenmode;
@@ -152,7 +153,7 @@ pub use agent_workspaces::{
     load_shared_preamble,
     materialize_default_agents, maybe_emit_claude_md_migration_hint, recommend_runner_for_new_agents, orchestrator_handoff_path,
     reset_claude_md_migration_hint, self_heal_default_agents, self_heal_orchestrator_agent,
-    take_orchestrator_handoff, AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill,
+    claim_orchestrator_handoff, discard_orchestrator_handoff, OrchestratorHandoffClaim, AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill,
     ADVERSARIAL_AGENT,
     DEFAULT_ADVERSARIAL_INSTRUCTIONS, DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS,
     DEFAULT_ORCHESTRATOR_INSTRUCTIONS, DEFAULT_QA_INSTRUCTIONS, DEFAULT_REVIEW_INSTRUCTIONS,
@@ -215,6 +216,7 @@ pub use event_log::{
     append_orphan_reap_failed_event,
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
     append_limit_resume_event, append_marker_deferred_event, append_marker_skipped_event,
+    append_transition_marker_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,
     append_message_event, append_message_undeliverable_event, append_migration_event, append_project_event,
     append_push_event, last_pushed_tip_from_events,
@@ -239,14 +241,15 @@ pub use event_log::{
     GITHUB_MERGE_RECONCILE_CAUSE, ISSUE_ADOPTION_CAUSE, ORCH_EVENT_CALLBACK_SOCK_ENV,
     READY_MARKER_HANDOFF_ALIASES, READY_MARKER_HANDOFF_CAUSE,
 };
+pub use workspace_state_migration::{
+    legacy_workspace_state_dirs, migrate_legacy_workspace_state_dir, LegacyStateDisposition,
+};
 pub use workspace_status::{
-    clear_expected_teardown, clear_review_serve_pgid, clear_workspace_status,
-    consume_expected_teardown, control_socket_path, expected_teardown_marker_path, hub_socket_path,
-    load_workspace_status, mark_expected_teardown, parse_orchestrator_title_state,
-    parse_pane_title_marker, parse_pane_title_state,
-    read_review_serve_pgid, review_serve_pgid_path, save_workspace_status, supervision_shutdown_key,
-    workspace_status_path, workspaces_dir, PaneMarker, WorkspaceState, WorkspaceStatus,
-    EXPECTED_TEARDOWN_MAX_AGE, REVIEW_SERVE_PGID_FILE_ENV,
+    clear_review_serve_pgid, clear_workspace_status, control_socket_path, hub_socket_path,
+    load_workspace_status, parse_orchestrator_title_state, parse_pane_title_marker,
+    parse_pane_title_state, read_review_serve_pgid, rehome_review_serve_pgid_path,
+    review_serve_pgid_path, save_workspace_status, workspace_status_path, workspaces_dir,
+    PaneMarker, WorkspaceState, WorkspaceStatus, REVIEW_SERVE_PGID_FILE_ENV,
 };
 pub use changelog::{
     changelog_template_path, scaffold_changelog_template, ChangelogTemplateOutcome,
@@ -439,7 +442,7 @@ pub fn config_project_dir(project: &str) -> Result<PathBuf> {
 /// the workspace/agent chokepoints #137's hardening didn't cover
 /// (Shelbi ContextStore docs/planning:reviews/adversarial-2026-07/state-runtime.md
 /// F14): a hostile or synced workspace/agent name could
-/// otherwise escape `~/.shelbi/workspaces/` or `~/.shelbi/projects/<p>/agents/`.
+/// otherwise escape a project's `workspaces/` or `~/.shelbi/projects/<p>/agents/`.
 pub(crate) fn ensure_flat_path_component(kind: &str, name: &str) -> Result<()> {
     use std::path::{Component, Path};
     let mut comps = Path::new(name).components();

@@ -12,7 +12,10 @@
 //! The ordering is load-bearing and lives in [`run`]:
 //!
 //! 1. **Handoff** — ask the still-live orchestrator to write its handoff file,
-//!    exactly as the tmux path does, so the replacement starts with context.
+//!    exactly as the tmux path does, so the replacement starts with context. The
+//!    runner-switch preflight runs here too: if it refuses, reload stops with
+//!    nothing torn down, because the replacement launch would be refused as well
+//!    and leave the project with no orchestrator.
 //! 2. **Signal clients** — tell the (soon-to-be-stale, after the restart)
 //!    attached clients to re-exec / prompt for relaunch. This must happen
 //!    *before* the daemon restarts, because it is the running daemon that
@@ -28,14 +31,24 @@
 //! untouched" contract — is unit-testable without a daemon, a control socket,
 //! or real sessions.
 
+use std::time::Duration;
+
 use anyhow::Result;
+use shelbi_orchestrator::session_backend::{SessionBackend, SessionTarget};
+
+/// How long reload waits for the signalled orchestrator session to exit before
+/// bringing up its replacement.
+const ORCH_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const ORCH_EXIT_POLL: Duration = Duration::from_millis(100);
 
 /// The side effects a session-runtime reload performs, behind a trait so the
 /// orchestration order is testable with a recording stub.
 pub(crate) trait ReloadOps {
     /// Ask the live orchestrator to write its handoff file. Returns a short
-    /// status line for the user; best-effort (never fails the reload).
-    fn request_handoff(&self) -> String;
+    /// status line for the user. A handoff that doesn't land is degraded, not
+    /// fatal; `Err` means the replacement launch can't go ahead (the
+    /// runner-switch preflight refused) and the reload must stop here.
+    fn request_handoff(&self) -> Result<String>;
     /// Tell every attached client to re-exec (a TUI) / prompt for relaunch (the
     /// desktop app). Best-effort.
     fn signal_clients_reexec(&self);
@@ -57,8 +70,9 @@ pub(crate) struct ReloadReport {
 
 /// Run the session-runtime reload in the required order (see module docs).
 pub(crate) fn run(ops: &dyn ReloadOps) -> Result<ReloadReport> {
-    // 1. Handoff while the old orchestrator session is still alive.
-    let handoff_status = ops.request_handoff();
+    // 1. Handoff while the old orchestrator session is still alive. A refusal
+    //    stops here, before anything is signalled, restarted or killed.
+    let handoff_status = ops.request_handoff()?;
     // 2. Signal clients to re-exec — the running daemon broadcasts this, so it
     //    must precede the restart.
     ops.signal_clients_reexec();
@@ -80,11 +94,10 @@ pub(crate) struct LiveReload {
 }
 
 impl ReloadOps for LiveReload {
-    fn request_handoff(&self) -> String {
-        match shelbi_orchestrator::handoff::request_orchestrator_handoff(&self.project) {
-            Ok(outcome) => format!("{outcome:?}"),
-            Err(e) => format!("handoff request failed: {e}"),
-        }
+    fn request_handoff(&self) -> Result<String> {
+        shelbi_orchestrator::handoff::request_orchestrator_handoff(&self.project)
+            .map(|outcome| format!("{outcome:?}"))
+            .map_err(|e| anyhow::anyhow!("reload stopped, the orchestrator was left running: {e}"))
     }
 
     fn signal_clients_reexec(&self) {
@@ -118,6 +131,18 @@ impl ReloadOps for LiveReload {
         let orch = format!("{}/orch", self.project);
         let backend = shelbi_orchestrator::session_backend::backend();
         let _ = backend.kill_window(&shelbi_core::Host::Local, &orch);
+        // The kill only signals. Until the session has exited, the bootstrap
+        // below would see it as live and attach, launching nothing and leaving
+        // the replacement to the supervisor. If this runs out of time (or a
+        // re-exec'd client has already launched the replacement) the bootstrap
+        // attaches and the handoff stays on disk for whichever launch comes next.
+        let target = SessionTarget::session(format!("shelbi-{}", self.project));
+        let deadline = std::time::Instant::now() + ORCH_EXIT_TIMEOUT;
+        while backend.probe(&shelbi_core::Host::Local, &target, None).is_alive()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(ORCH_EXIT_POLL);
+        }
         // Bring a fresh orchestrator session up; it ingests the handoff file.
         shelbi_orchestrator::ensure_dashboard(&self.project)
             .map(|_| ())
@@ -136,9 +161,9 @@ mod tests {
         order: Mutex<Vec<&'static str>>,
     }
     impl ReloadOps for RecordingOps {
-        fn request_handoff(&self) -> String {
+        fn request_handoff(&self) -> Result<String> {
             self.order.lock().unwrap().push("handoff");
-            "Written".into()
+            Ok("Written".into())
         }
         fn signal_clients_reexec(&self) {
             self.order.lock().unwrap().push("signal");
@@ -187,8 +212,8 @@ mod tests {
         // orchestrator against a dead daemon.
         struct FailRestart;
         impl ReloadOps for FailRestart {
-            fn request_handoff(&self) -> String {
-                "Written".into()
+            fn request_handoff(&self) -> Result<String> {
+                Ok("Written".into())
             }
             fn signal_clients_reexec(&self) {}
             fn restart_daemon(&self) -> Result<()> {
@@ -200,5 +225,32 @@ mod tests {
         }
         let err = run(&FailRestart).unwrap_err();
         assert!(err.to_string().contains("come back"), "err: {err}");
+    }
+    #[test]
+    fn reload_stops_before_any_teardown_when_the_preflight_refuses() {
+        // A refused runner switch (Codex batches still undelivered) would refuse
+        // the replacement launch too, so killing the orchestrator first would
+        // leave the project with none. Nothing past the handoff step may run.
+        #[derive(Default)]
+        struct Refuses(RecordingOps);
+        impl ReloadOps for Refuses {
+            fn request_handoff(&self) -> Result<String> {
+                self.0.request_handoff()?;
+                anyhow::bail!("the Codex event queue still holds 1 undelivered batch")
+            }
+            fn signal_clients_reexec(&self) {
+                self.0.signal_clients_reexec();
+            }
+            fn restart_daemon(&self) -> Result<()> {
+                self.0.restart_daemon()
+            }
+            fn replace_orchestrator_session(&self) -> Result<()> {
+                self.0.replace_orchestrator_session()
+            }
+        }
+        let ops = Refuses::default();
+        let err = run(&ops).unwrap_err();
+        assert!(err.to_string().contains("undelivered"), "err: {err}");
+        assert_eq!(*ops.0.order.lock().unwrap(), vec!["handoff"]);
     }
 }

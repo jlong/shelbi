@@ -277,12 +277,15 @@ fn a_board_move_from_a_stale_card_is_refused_after_a_cli_move() {
     let read_card = |home: &Home| {
         let text =
             std::fs::read_to_string(home.path.join("projects/p/tasks/t1.md")).unwrap();
-        let input = shelbi_app::board::BoardInput {
+        let mut input = shelbi_app::board::BoardInput {
             open: vec![shelbi_state::parse_task_file(&text).unwrap()],
             loading: false,
-            closed_loaded: true,
             ..Default::default()
         };
+        input.apply_closed(Some(shelbi_app::board::ClosedPage {
+            issues: Vec::new(),
+            next_cursor: None,
+        }));
         let model =
             shelbi_app::IssuesModel::build(&input, &shelbi_app::BoardFilters::default());
         model.card("t1").cloned().unwrap()

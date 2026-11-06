@@ -25,8 +25,7 @@
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::sync::Arc;
 
-const ESC: u8 = 0x1b;
-const BEL: u8 = 0x07;
+use crate::vt::{Token, Tokenizer};
 
 /// Shared, lock-free view of the active Kitty keyboard-protocol flags. The
 /// responder updates it as the child pushes/pops/sets; an input encoder reads it
@@ -129,91 +128,74 @@ impl CursorSource for FixedCursor {
 
 /// The scanning state machine. One per session, fed every chunk of child output.
 pub struct Responder {
-    kitty: KittyFlags,
-    colors: ColorState,
-    kitty_stack: Vec<u8>,
-    // Carry a partial trailing escape sequence across read boundaries.
-    residual: Vec<u8>,
+    // Tracks sequences across read boundaries, on the same transitions the
+    // output splitter uses, and retains only a capped run of bytes to read.
+    tokenizer: Tokenizer,
+    queries: Queries,
 }
 
 impl Responder {
     /// Build a responder sharing the given Kitty-flag and color state.
     pub fn new(kitty: KittyFlags, colors: ColorState) -> Self {
         Self {
-            kitty,
-            colors,
-            kitty_stack: Vec::new(),
-            residual: Vec::new(),
+            tokenizer: Tokenizer::default(),
+            queries: Queries {
+                kitty,
+                colors,
+                kitty_stack: Vec::new(),
+            },
         }
     }
 
     /// Handle to the shared Kitty flags (for the input encoder).
     pub fn flags(&self) -> KittyFlags {
-        self.kitty.clone()
+        self.queries.kitty.clone()
     }
 
     /// Scan one chunk of child output. Returns the replies to write back to the
     /// PTY master, in order. Recognized query bytes are *not* stripped — the
     /// render emulator still sees (and harmlessly ignores) them.
     pub fn scan<C: CursorSource>(&mut self, chunk: &[u8], cursor: &C) -> Vec<Answer> {
-        let mut buf = std::mem::take(&mut self.residual);
-        buf.extend_from_slice(chunk);
         let mut answers = Vec::new();
-        let mut i = 0;
-        while i < buf.len() {
-            if buf[i] != ESC {
-                i += 1;
-                continue;
-            }
-            match self.match_at(&buf[i..], cursor) {
-                Match::Answered(consumed, answer) => {
-                    answers.push(answer);
-                    i += consumed;
+        for &b in chunk {
+            let answer = match self.tokenizer.advance(b) {
+                Some(Token::Csi { params, final_byte }) => {
+                    self.queries.on_csi(params, final_byte, cursor)
                 }
-                Match::Consumed(consumed) => i += consumed,
-                Match::Incomplete => {
-                    // Possibly a query split across reads; stash the tail.
-                    self.residual = buf[i..].to_vec();
-                    return answers;
-                }
-                Match::NotAQuery => i += 1,
-            }
+                Some(Token::Osc { body }) => self.queries.on_osc(body),
+                None => None,
+            };
+            answers.extend(answer);
         }
         answers
     }
+}
 
-    fn match_at<C: CursorSource>(&mut self, s: &[u8], cursor: &C) -> Match {
-        if s.len() >= 2 && s[1] == b'[' {
-            return self.match_csi(s, cursor);
-        }
-        if s.len() >= 2 && s[1] == b']' {
-            return self.match_osc(s);
-        }
-        if s.len() < 2 {
-            return Match::Incomplete;
-        }
-        Match::NotAQuery
-    }
+/// What the responder knows and tracks, separate from the tokenizer whose
+/// buffer the sequence being handled is borrowed from.
+struct Queries {
+    kitty: KittyFlags,
+    colors: ColorState,
+    kitty_stack: Vec<u8>,
+}
 
-    fn match_csi<C: CursorSource>(&mut self, s: &[u8], cursor: &C) -> Match {
-        // Find the final byte (0x40..=0x7e) that terminates the CSI.
-        let mut j = 2;
-        while j < s.len() && !(0x40..=0x7e).contains(&s[j]) {
-            j += 1;
-        }
-        if j >= s.len() {
-            return Match::Incomplete;
-        }
-        let params = &s[2..j];
-        let final_byte = s[j];
-        let consumed = j + 1;
-        let answer = |query, reply: Vec<u8>| Match::Answered(consumed, Answer { query, reply });
+impl Queries {
+    fn on_csi<C: CursorSource>(
+        &mut self,
+        params: &[u8],
+        final_byte: u8,
+        cursor: &C,
+    ) -> Option<Answer> {
+        let answer = |query, reply: Vec<u8>| Some(Answer { query, reply });
         match final_byte {
             b'n' => match params {
                 b"5" => answer("DSR-5 status", b"\x1b[0n".to_vec()),
                 b"6" => {
                     let (r, c) = cursor.cursor_1based();
-                    answer("DSR-6 cursor position", format!("\x1b[{r};{c}R").into_bytes())
+                    answer(
+                        "DSR-6 cursor position",
+                        format!("\x1b[{r};{c}R").into_bytes(),
+                    )
                 }
                 b"?6" => {
                     let (r, c) = cursor.cursor_1based();
@@ -222,7 +204,7 @@ impl Responder {
                         format!("\x1b[?{r};{c};1R").into_bytes(),
                     )
                 }
-                _ => Match::Consumed(consumed),
+                _ => None,
             },
             b'c' => {
                 if params.is_empty() || params == b"0" {
@@ -232,48 +214,40 @@ impl Responder {
                     // Secondary DA: report a terminal version.
                     answer("DA2 secondary attributes", b"\x1b[>1;9500;0c".to_vec())
                 } else {
-                    Match::Consumed(consumed)
+                    None
                 }
             }
-            b'q' if params == b">0" || params == b">" => answer(
-                "XTVERSION",
-                b"\x1bP>|shelbi\x1b\\".to_vec(),
-            ),
-            b'u' => self.match_kitty(params, consumed),
-            _ => Match::NotAQuery,
+            b'q' if params == b">0" || params == b">" => {
+                answer("XTVERSION", b"\x1bP>|shelbi\x1b\\".to_vec())
+            }
+            b'u' => self.on_kitty(params),
+            _ => None,
         }
     }
 
-    fn match_kitty(&mut self, params: &[u8], consumed: usize) -> Match {
+    fn on_kitty(&mut self, params: &[u8]) -> Option<Answer> {
         // CSI ? u              -> query current flags: reply CSI ? <flags> u
         // CSI > flags u        -> push flags
         // CSI < number u       -> pop <number> entries
         // CSI = flags ; mode u -> set flags (mode 1=set,2=add,3=remove)
         if params == b"?" {
             let reply = format!("\x1b[?{}u", self.kitty.get());
-            return Match::Answered(
-                consumed,
-                Answer {
-                    query: "Kitty keyboard flags query",
-                    reply: reply.into_bytes(),
-                },
-            );
+            return Some(Answer {
+                query: "Kitty keyboard flags query",
+                reply: reply.into_bytes(),
+            });
         }
         if let Some(rest) = params.strip_prefix(b">") {
             let flags = parse_u8(rest).unwrap_or(0);
             self.kitty_stack.push(self.kitty.get());
             self.kitty.set(flags);
-            return Match::Consumed(consumed);
-        }
-        if let Some(rest) = params.strip_prefix(b"<") {
+        } else if let Some(rest) = params.strip_prefix(b"<") {
             let n = parse_u8(rest).unwrap_or(1).max(1);
             for _ in 0..n {
                 let prev = self.kitty_stack.pop().unwrap_or(0);
                 self.kitty.set(prev);
             }
-            return Match::Consumed(consumed);
-        }
-        if let Some(rest) = params.strip_prefix(b"=") {
+        } else if let Some(rest) = params.strip_prefix(b"=") {
             let mut it = rest.split(|&b| b == b';');
             let flags = it.next().and_then(parse_u8).unwrap_or(0);
             let mode = it.next().and_then(parse_u8).unwrap_or(1);
@@ -284,68 +258,27 @@ impl Responder {
                 _ => flags,
             };
             self.kitty.set(next);
-            return Match::Consumed(consumed);
         }
-        Match::NotAQuery
+        None
     }
 
-    fn match_osc(&mut self, s: &[u8]) -> Match {
-        // OSC ... terminated by BEL or ESC \ (ST).
-        let mut j = 2;
-        let mut term_len = 0;
-        while j < s.len() {
-            if s[j] == BEL {
-                term_len = 1;
-                break;
-            }
-            if s[j] == ESC && j + 1 < s.len() && s[j + 1] == b'\\' {
-                term_len = 2;
-                break;
-            }
-            if s[j] == ESC {
-                // ESC not yet followed by its pair; wait for more.
-                return Match::Incomplete;
-            }
-            j += 1;
-        }
-        if term_len == 0 {
-            return Match::Incomplete;
-        }
-        let body = &s[2..j];
-        let consumed = j + term_len;
+    fn on_osc(&self, body: &[u8]) -> Option<Answer> {
         // Only answer the "?" color *queries*; ignore sets.
-        let is_query = body.ends_with(b";?");
-        match () {
-            _ if body.starts_with(b"10;") && is_query => Match::Answered(
-                consumed,
-                Answer {
-                    query: "OSC 10 foreground color",
-                    reply: format!("\x1b]10;{}\x07", rgb_string(self.colors.foreground()))
-                        .into_bytes(),
-                },
-            ),
-            _ if body.starts_with(b"11;") && is_query => Match::Answered(
-                consumed,
-                Answer {
-                    query: "OSC 11 background color",
-                    reply: format!("\x1b]11;{}\x07", rgb_string(self.colors.background()))
-                        .into_bytes(),
-                },
-            ),
-            _ => Match::Consumed(consumed),
+        if !body.ends_with(b";?") {
+            return None;
         }
+        let (query, code, color) = if body.starts_with(b"10;") {
+            ("OSC 10 foreground color", 10, self.colors.foreground())
+        } else if body.starts_with(b"11;") {
+            ("OSC 11 background color", 11, self.colors.background())
+        } else {
+            return None;
+        };
+        Some(Answer {
+            query,
+            reply: format!("\x1b]{code};{}\x07", rgb_string(color)).into_bytes(),
+        })
     }
-}
-
-enum Match {
-    /// A query we recognized and answered. (bytes consumed, the answer)
-    Answered(usize, Answer),
-    /// A sequence we recognized but do not answer. (bytes consumed)
-    Consumed(usize),
-    /// The sequence runs past the end of the buffer; wait for more bytes.
-    Incomplete,
-    /// Not a sequence we care about; advance one byte.
-    NotAQuery,
 }
 
 fn parse_u8(bytes: &[u8]) -> Option<u8> {
@@ -358,6 +291,7 @@ fn parse_u8(bytes: &[u8]) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vt::MAX_RESIDUAL;
 
     fn resp() -> Responder {
         Responder::new(KittyFlags::default(), ColorState::default())
@@ -437,5 +371,95 @@ mod tests {
         assert!(r
             .scan(b"hello \x1b[1mworld\x1b[0m\r\n", &FixedCursor(1, 1))
             .is_empty());
+    }
+
+    /// The audit's wedge: an ESC that isn't ST aborts the OSC, here in the same
+    /// read as the query that follows and in separate ones.
+    #[test]
+    fn a_query_after_an_esc_interrupted_osc_is_answered() {
+        let mut r = resp();
+        let a = r.scan(b"\x1b]0;x\x1b[31m\x1b[6n", &FixedCursor(3, 4));
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].reply, b"\x1b[3;4R");
+
+        let mut r = resp();
+        assert!(r.scan(b"\x1b]0;x\x1b[31m", &FixedCursor(3, 4)).is_empty());
+        assert_eq!(r.tokenizer.residual_len(), "31".len());
+        assert_eq!(
+            r.scan(b"\x1b[6n", &FixedCursor(3, 4))[0].reply,
+            b"\x1b[3;4R"
+        );
+    }
+
+    #[test]
+    fn can_and_sub_abort_a_sequence_and_answer_what_follows() {
+        for abort in [0x18u8, 0x1a] {
+            let mut r = resp();
+            // Aborted before its final byte or terminator, so never a query.
+            assert!(r
+                .scan(
+                    &[b"\x1b[6".as_slice(), &[abort], b"n"].concat(),
+                    &FixedCursor(1, 1)
+                )
+                .is_empty());
+            assert!(r
+                .scan(
+                    &[b"\x1b]11;?".as_slice(), &[abort]].concat(),
+                    &FixedCursor(1, 1)
+                )
+                .is_empty());
+            assert_eq!(r.scan(b"\x1b[6n", &FixedCursor(1, 1)).len(), 1);
+        }
+    }
+
+    #[test]
+    fn an_esc_interrupted_color_query_is_not_answered() {
+        let mut r = resp();
+        assert!(r.scan(b"\x1b]11;?\x1b[0m", &FixedCursor(1, 1)).is_empty());
+    }
+
+    #[test]
+    fn esc_inside_a_csi_starts_the_query_it_introduces() {
+        let mut r = resp();
+        let a = r.scan(b"\x1b[3\x1b[6n", &FixedCursor(1, 2));
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].reply, b"\x1b[1;2R");
+    }
+
+    #[test]
+    fn st_split_across_reads_still_answers_the_osc() {
+        let mut r = resp();
+        assert!(r.scan(b"\x1b]10;?\x1b", &FixedCursor(1, 1)).is_empty());
+        assert_eq!(
+            r.scan(b"\\", &FixedCursor(1, 1))[0].query,
+            "OSC 10 foreground color"
+        );
+    }
+
+    #[test]
+    fn residual_never_grows_past_the_cap() {
+        // Each opener would hold every later byte if it were left to run: a
+        // string with no terminator, and a CSI whose final byte never comes.
+        for (opener, filler) in [(b"\x1b]0;".as_slice(), b'x'), (b"\x1b[".as_slice(), b';')] {
+            let mut r = resp();
+            assert!(r.scan(opener, &FixedCursor(1, 1)).is_empty());
+            let chunk = [filler; 8192];
+            for _ in 0..16 {
+                assert!(r.scan(&chunk, &FixedCursor(1, 1)).is_empty());
+                assert!(r.tokenizer.residual_len() <= MAX_RESIDUAL);
+            }
+            // An ESC still gets the responder out, and the next query answers.
+            assert_eq!(r.scan(b"\x1b[6n", &FixedCursor(1, 1)).len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_query_too_long_to_retain_is_not_answered() {
+        let mut r = resp();
+        let mut body = b"\x1b]11;".to_vec();
+        body.resize(MAX_RESIDUAL + 16, b'x');
+        body.extend_from_slice(b";?\x07");
+        assert!(r.scan(&body, &FixedCursor(1, 1)).is_empty());
+        assert_eq!(r.scan(b"\x1b]11;?\x07", &FixedCursor(1, 1)).len(), 1);
     }
 }

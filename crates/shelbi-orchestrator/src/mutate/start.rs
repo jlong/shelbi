@@ -465,7 +465,13 @@ fn teardown_workspace_pane(
     })?;
     let host = machine.host();
     let addr = crate::workspace::workspace_target(project_yaml, workspace)?;
-    crate::workspace::kill_workspace_pane(&host, &addr, &workspace.name)
+    crate::workspace::kill_workspace_pane(
+        &project_yaml.name,
+        &host,
+        &addr,
+        &workspace.name,
+        crate::session_backend::KillReason::Redispatch,
+    )
 }
 
 /// Is `workspace`'s session slot live right now? Resolves the machine/target the

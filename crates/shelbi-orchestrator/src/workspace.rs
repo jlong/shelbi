@@ -20,7 +20,7 @@ use shelbi_core::{
     WorkspaceSpec,
 };
 
-use crate::session_backend::{backend, Liveness, SessionBackend, SessionTarget};
+use crate::session_backend::{backend, KillReason, Liveness, SessionBackend, SessionTarget};
 
 
 /// Filter `git status --porcelain` output down to the lines that represent
@@ -345,6 +345,24 @@ pub fn workspace_ready_deferred_marker(machine: &Machine, workspace: &WorkspaceS
         .join("shelbi-ready-deferred")
 }
 
+/// The transition-marker **deferral** sidecar for a workspace:
+/// `<worktree>/.shelbi/shelbi-transition-deferred`.
+///
+/// The [`workspace_transition_marker`] counterpart of
+/// [`workspace_ready_deferred_marker`]: a gate's verdict is written exactly once,
+/// so a failed read of the task (or a failed move) leaves the marker in place to
+/// retry next tick. This sidecar records the current `<stage>:<class>` token so
+/// the deferral reaches `events.log` once rather than every tick. Consuming the
+/// marker clears it, as does dispatch, which also clears the marker itself.
+pub fn workspace_transition_deferred_marker(
+    machine: &Machine,
+    workspace: &WorkspaceSpec,
+) -> PathBuf {
+    workspace_worktree(machine, workspace)
+        .join(".shelbi")
+        .join("shelbi-transition-deferred")
+}
+
 /// The ready-handoff **refusal** sidecar for a workspace:
 /// `<worktree>/.shelbi/shelbi-ready-refused`.
 ///
@@ -451,7 +469,7 @@ pub fn read_deferred_marker(host: &Host, marker: &Path) -> Result<Option<String>
 }
 
 /// Write the deferral sidecar with the current outage's error `class`. The
-/// class is a short internal token (see `poller::classify_load_error`), so no
+/// class is a short internal token (see `poller::classify_store_error`), so no
 /// escaping beyond the shell quoting the remote path needs. Best-effort by
 /// contract: a failed write only risks re-logging the deferral next tick.
 pub fn write_deferred_marker(host: &Host, marker: &Path, class: &str) -> Result<()> {
@@ -2020,23 +2038,55 @@ fn append_message_log_line(
         .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
-/// Every tmux window id currently bound to a local slot's name. Local
-/// workspaces are windows inside the shared project session, so a slot can
-/// (under a raced relaunch — e.g. the crash supervisor and a `shelbi task
-/// resume` both re-running `new-window` before the prior window is torn down)
-/// accrete more than one window sharing its name. Teardown has to reap all of
-/// them, so it enumerates ids here rather than trusting a single name match.
-/// Does the workspace have a live agent session right now? Enumerates the live
-/// slots under the workspace's session and matches its role name.
-pub fn workspace_pane_alive(host: &Host, target: &SessionTarget) -> Result<bool> {
-    let want = target.slot_role().unwrap_or("");
-    match backend()
-        .enumerate_slots(host, &SessionTarget::session(target.session_name()), None)
-        .map_err(Error::Io)?
-    {
-        Some(slots) => Ok(slots.iter().any(|w| w.name == want)),
-        None => Ok(false),
+#[cfg(test)]
+thread_local! {
+    /// Stands in for the probe in a test, which has no relay to lose.
+    static TEST_PANE_LIVENESS: std::cell::RefCell<Option<Liveness>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_pane_liveness(liveness: Option<Liveness>) {
+    TEST_PANE_LIVENESS.with(|c| *c.borrow_mut() = liveness);
+}
+
+/// Classify an [`enumerate_slots`](SessionBackend::enumerate_slots) answer for
+/// the slot named `want`. `Ok(None)` and `Err` both mean the machine could not
+/// be asked, which is not the same as it having no such session.
+fn slot_liveness(
+    slots: std::io::Result<Option<Vec<crate::session_backend::SlotInfo>>>,
+    want: &str,
+) -> Liveness {
+    match slots {
+        Ok(Some(slots)) if slots.iter().any(|w| w.name == want) => Liveness::Alive,
+        Ok(Some(_)) => Liveness::Dead,
+        Ok(None) => Liveness::Unreachable {
+            reason: format!("could not reach the machine to check session `{want}`"),
+        },
+        Err(e) => Liveness::Unreachable {
+            reason: format!("checking session `{want}`: {e}"),
+        },
     }
+}
+
+/// Probe the workspace's agent session: enumerate the live slots under its
+/// session and match its role name.
+pub fn workspace_pane_liveness(host: &Host, target: &SessionTarget) -> Liveness {
+    #[cfg(test)]
+    if let Some(liveness) = TEST_PANE_LIVENESS.with(|c| c.borrow().clone()) {
+        return liveness;
+    }
+    slot_liveness(
+        backend().enumerate_slots(host, &SessionTarget::session(target.session_name()), None),
+        target.slot_role().unwrap_or(""),
+    )
+}
+
+/// Does the workspace have a live agent session right now? `Err` when the
+/// machine could not be asked, so a caller's own policy for uncertainty applies
+/// rather than an unreachable machine reading as a dead session.
+pub fn workspace_pane_alive(host: &Host, target: &SessionTarget) -> Result<bool> {
+    workspace_pane_liveness(host, target).into_exists()
 }
 
 /// Does this workspace slot have a live allocation right now? Probes the
@@ -2278,8 +2328,8 @@ const REVIEW_SERVER_TERM_GRACE: std::time::Duration = std::time::Duration::from_
 /// which is why this is safe on every `kill_workspace_pane` (dev slots and
 /// remote review slots simply have no record). Best-effort throughout: a read
 /// error degrades to the pre-fix behavior rather than blocking teardown.
-pub(crate) fn stop_review_server(workspace: &str) {
-    let pgid = match shelbi_state::read_review_serve_pgid(workspace) {
+pub(crate) fn stop_review_server(project: &str, workspace: &str) {
+    let pgid = match shelbi_state::read_review_serve_pgid(project, workspace) {
         Ok(Some(p)) => p,
         Ok(None) => return,
         Err(e) => {
@@ -2290,7 +2340,7 @@ pub(crate) fn stop_review_server(workspace: &str) {
     if terminate_process_group(pgid) {
         tracing::info!(workspace, pgid, "reaped review dev server process group");
     }
-    let _ = shelbi_state::clear_review_serve_pgid(workspace);
+    let _ = shelbi_state::clear_review_serve_pgid(project, workspace);
 }
 
 /// May we `kill(-pgid, …)` `pgid` from a process whose own group is `own_pgid`?
@@ -2369,11 +2419,18 @@ fn terminate_process_group(_pgid: i32) -> bool {
 /// covers them all. A no-op when nothing was tracked: dev slots and remote
 /// review slots never record a pgid.
 ///
-/// Marks an "expected teardown" for `workspace_name` before killing so a
-/// shelbi-initiated shutdown isn't mistaken for a crash by the agent session's
-/// lifecycle event.
-pub fn kill_workspace_pane(host: &Host, target: &SessionTarget, workspace_name: &str) -> Result<()> {
-    stop_review_server(workspace_name);
+/// `reason` is recorded on the session before the kill, so the supervisor reads
+/// this death as deliberate instead of restarting the slot as a crash. It is
+/// recorded on a slot that is already dead too: stopping a pane that crashed a
+/// moment ago, or handing off from one, must still stand the supervisor down.
+pub fn kill_workspace_pane(
+    project: &str,
+    host: &Host,
+    target: &SessionTarget,
+    workspace_name: &str,
+    reason: KillReason,
+) -> Result<()> {
+    stop_review_server(project, workspace_name);
     // Kill the slot itself on every host. A remote workspace's slot target
     // (`shelbi-w-<name>`, `agent`) maps to the remote session `w-<name>/ws/agent`;
     // re-addressing it as the bare *session* `shelbi-w-<name>` (the tmux-era
@@ -2382,11 +2439,16 @@ pub fn kill_workspace_pane(host: &Host, target: &SessionTarget, workspace_name: 
     // "already gone", and the real agent kept running while the orphan reaper
     // logged a reap every pass. A transport-answered "already gone" still
     // short-circuits here.
-    if !workspace_slot_alive(host, target)? {
+    let alive = workspace_slot_alive(host, target)?;
+    let session = crate::session_process_backend::session_name(target);
+    backend().record_kill_reason(host, &session, reason);
+    if !alive {
         return Ok(());
     }
-    let _ = shelbi_state::mark_expected_teardown(workspace_name);
-    backend().kill(host, target)?;
+    if let Err(e) = backend().kill(host, target) {
+        backend().clear_kill_reason(host, &session);
+        return Err(e);
+    }
     if host.is_ssh() {
         // A remote kill rides the relay and tolerates "no live session" as
         // success, so a kill that reached nothing would look identical to one
@@ -2636,6 +2698,10 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
     let _ = clear_transition_marker(
         &host,
         &legacy_workspace_transition_marker(&machine, spec.workspace),
+    );
+    let _ = clear_deferred_marker(
+        &host,
+        &workspace_transition_deferred_marker(&machine, spec.workspace),
     );
     // And the review-serving marker: a task loading onto a review slot starts
     // out not serving, whatever the slot's last task got up to.
@@ -2896,6 +2962,10 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
         &host,
         &legacy_workspace_transition_marker(&machine, spec.workspace),
     );
+    let _ = clear_deferred_marker(
+        &host,
+        &workspace_transition_deferred_marker(&machine, spec.workspace),
+    );
 
     // Preserve the worktree: don't reset the branch, don't bail on a dirty
     // tree. Only recreate the worktree if it's gone entirely. A failure here
@@ -3131,7 +3201,13 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
 
     // 3. Reset the agent session — that's how we clear context. If it doesn't
     //    exist yet, this is a no-op; otherwise the next step recreates it.
-    kill_workspace_pane(a.host, a.addr, &a.workspace.name)?;
+    kill_workspace_pane(
+        &a.project.name,
+        a.host,
+        a.addr,
+        &a.workspace.name,
+        KillReason::Redispatch,
+    )?;
 
     // 4 + 5. Spawn the agent session and launch the agent.
     //
@@ -4848,9 +4924,8 @@ fn set_executable(_path: &Path) -> Result<()> {
 /// context reflects the *current* agent while any user-authored
 /// `.claude/skills/` content is left untouched — the same
 /// own-only-what-you-own discipline [`wire_settings_local`] uses.
-/// Compose the agent's instruction body (preamble + `instructions.md`, plus the
-/// orchestrator handoff splice for the orchestrator) and mount its skills into
-/// the worktree. Returns the composed body **without** writing
+/// Compose the agent's instruction body (preamble + `instructions.md`) and mount
+/// its skills into the worktree. Returns the composed body **without** writing
 /// `.claude/agent-instructions.md`, so each caller decides how the body is
 /// delivered:
 ///
@@ -4874,34 +4949,8 @@ fn compose_and_mount_agent_context(
     // handles the missing-preamble case (just the agent's prompt). Any
     // file-read failure surfaces from there with the same shape the old
     // direct-read used.
-    let mut composed = shelbi_state::compose_agent_prompt(project_name, agent)
+    let composed = shelbi_state::compose_agent_prompt(project_name, agent)
         .map_err(|e| Error::Other(format!("{e}")))?;
-    // Orchestrator-only: if a `handoff.md` was left by the previous
-    // instance (on `shelbi reload` or `shelbi quit`), splice it onto
-    // the end of the system prompt as a `<system-reminder>` block so
-    // the new instance picks up where the old one left off. Read-and-
-    // delete — handoff is one-shot; persistent state lives in
-    // `state.json`. Skipped silently for every non-orchestrator agent
-    // (developer dispatches, custom agents) so a worktree's deploy
-    // never ingests handoff data meant for the dashboard.
-    if agent == shelbi_state::ORCHESTRATOR_AGENT {
-        match shelbi_state::take_orchestrator_handoff(project_name) {
-            Ok(Some(handoff)) => {
-                composed = splice_orchestrator_handoff(&composed, &handoff);
-            }
-            Ok(None) => {}
-            Err(e) => {
-                // Surface but don't fail the deploy — a missing handoff
-                // is a degraded start (new instance is cold), not a
-                // broken one.
-                tracing::warn!(
-                    project = project_name,
-                    error = %e,
-                    "take_orchestrator_handoff failed; starting orchestrator cold",
-                );
-            }
-        }
-    }
 
     let skills_src = shelbi_state::agent_skills_dir(project_name, agent)?;
     refresh_agent_skills(host, worktree, &skills_src)?;
@@ -4923,13 +4972,24 @@ fn compose_and_mount_agent_context(
 /// the orchestrator's file-staging path: its launch and reload paths still
 /// `cat` that file through `--append-system-prompt`. Worker dispatch does not
 /// call this — it inlines the composed body into the startup prompt instead.
+///
+/// `handoff` is the previous orchestrator's state, which the launch has already
+/// claimed ([`shelbi_state::claim_orchestrator_handoff`]). It is spliced onto the
+/// end of the body as a `<system-reminder>` block so the new instance picks up
+/// where the old one left off. This function never reads `handoff.md` itself:
+/// whether the launch succeeded, and so what becomes of the file, is the
+/// launch's call.
 pub fn deploy_agent_context(
     host: &Host,
     worktree: &Path,
     project_name: &str,
     agent: &str,
+    handoff: Option<&str>,
 ) -> Result<()> {
-    let composed = compose_and_mount_agent_context(host, worktree, project_name, agent)?;
+    let mut composed = compose_and_mount_agent_context(host, worktree, project_name, agent)?;
+    if let Some(handoff) = handoff {
+        composed = splice_orchestrator_handoff(&composed, handoff);
+    }
     deploy_agent_instructions(host, worktree, &composed)?;
     Ok(())
 }
@@ -6226,7 +6286,7 @@ fn review_dispatch_extras(
     // wrapper (shelbi on PATH) and the hub-side pgid file resolve on the same
     // machine the server runs on.
     let pgid_file = matches!(host, Host::Local)
-        .then(|| shelbi_state::review_serve_pgid_path(&workspace.name).ok())
+        .then(|| shelbi_state::review_serve_pgid_path(&project.name, &workspace.name).ok())
         .flatten()
         .map(|p| p.to_string_lossy().into_owned());
     let section = review_recipe_section(project, task_id, port, pgid_file.is_some());
@@ -9423,6 +9483,10 @@ statuses:
             base.join("shelbi-ready-deferred")
         );
         assert_eq!(
+            workspace_transition_deferred_marker(&p.machines[0], ws),
+            base.join("shelbi-transition-deferred")
+        );
+        assert_eq!(
             workspace_ready_refused_marker(&p.machines[0], ws),
             base.join("shelbi-ready-refused")
         );
@@ -11448,7 +11512,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         assert_eq!(
@@ -11612,7 +11676,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         let body = std::fs::read_to_string(&instructions).unwrap();
@@ -11647,12 +11711,10 @@ statuses:
     }
 
     #[test]
-    fn deploy_agent_context_splices_handoff_into_orchestrator_prompt_then_deletes_file() {
-        // Acceptance criterion: on orchestrator (re)launch, if
-        // `agents/orchestrator/handoff.md` exists, the deploy step
-        // splices it in as a <system-reminder> block AND deletes the
-        // file so the next launch doesn't double-ingest the same
-        // handoff.
+    fn deploy_agent_context_splices_the_claimed_handoff_and_leaves_the_file_to_the_launch() {
+        // The deploy splices what the launch claimed as a <system-reminder>
+        // block. It has no say over the file: deleting it is for the launch,
+        // once the new session is up.
         let _g = crate::test_lock::acquire();
         let tmp = agent_test_tmpdir("ctx-handoff-splice");
         let home = tmp.join("home");
@@ -11660,15 +11722,20 @@ statuses:
         std::env::set_var("SHELBI_HOME", &home);
         install_default_agents_under_home(&home, "p");
 
-        // Seed the handoff file the previous instance would have left
-        // behind on `shelbi reload` / `shelbi quit`.
         let handoff_path = shelbi_state::orchestrator_handoff_path("p").unwrap();
-        std::fs::write(&handoff_path, "watching: task xyz\n").unwrap();
+        std::fs::write(&handoff_path, "on disk, unclaimed\n").unwrap();
 
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        deploy_agent_context(
+            &Host::Local,
+            &worktree,
+            "p",
+            "orchestrator",
+            Some("watching: task xyz\n"),
+        )
+        .unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         let body = std::fs::read_to_string(&instructions).unwrap();
@@ -11681,8 +11748,13 @@ statuses:
             "handoff must be spliced as a system-reminder block: {body}"
         );
         assert!(
-            !handoff_path.exists(),
-            "handoff.md must be deleted after ingestion (one-shot transfer file)"
+            !body.contains("on disk, unclaimed"),
+            "the deploy must not read handoff.md itself: {body}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&handoff_path).unwrap(),
+            "on disk, unclaimed\n",
+            "the deploy must not touch handoff.md"
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -11708,7 +11780,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         let body = std::fs::read_to_string(&instructions).unwrap();
@@ -11750,7 +11822,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         let body = std::fs::read_to_string(&instructions).unwrap();
@@ -11782,7 +11854,7 @@ statuses:
         std::fs::create_dir_all(&worktree).unwrap();
 
         // Dispatch 1 — developer.
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
         let instructions = worktree.join(".claude/agent-instructions.md");
         let skills_dir = worktree.join(".claude/skills");
         assert!(skills_dir.join("debug.md").exists());
@@ -11793,7 +11865,7 @@ statuses:
         // Dispatch 2 — orchestrator. The developer's `debug.md` must NOT
         // survive the swap; the instructions file is overwritten and the
         // Shelbi-owned system skill is installed for both built-in runners.
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
         assert!(
             !skills_dir.join("debug.md").exists(),
             "developer's skill leaked into orchestrator dispatch",
@@ -11821,7 +11893,7 @@ statuses:
         // A resumed/reloaded orchestrator re-resolves and re-stages the same
         // bundle rather than inheriting mutable session state.
         let first_bytes = std::fs::read(&staged_skill).unwrap();
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
         assert_eq!(std::fs::read(&staged_skill).unwrap(), first_bytes);
         assert!(std::fs::read_to_string(&instructions)
             .unwrap()
@@ -11855,7 +11927,7 @@ statuses:
 
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator").unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(worktree.join(".claude/agent-instructions.md")).unwrap(),
@@ -11987,7 +12059,7 @@ mod review_server_tests {
         // kept ONLY so the test can reap the (soon-dead) leader at the end;
         // `stop_review_server` never sees it — it works purely from this file,
         // which is what makes the restart case hold.
-        let path = shelbi_state::review_serve_pgid_path("rev").unwrap();
+        let path = shelbi_state::review_serve_pgid_path("demo", "rev").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{pgid}\n")).unwrap();
 
@@ -11995,7 +12067,7 @@ mod review_server_tests {
         assert!(pid_alive(gc_pid), "grandchild should be alive before teardown");
         assert!(pgroup_alive(pgid), "group should be alive before teardown");
 
-        stop_review_server("rev");
+        stop_review_server("demo", "rev");
 
         // Reap the (now-killed) leader first: it's the test's own child, so
         // until we wait() it, it lingers as a zombie and still answers
@@ -12012,13 +12084,43 @@ mod review_server_tests {
             "the grandchild (pid {gc_pid}) must be gone after teardown"
         );
         assert!(
-            shelbi_state::read_review_serve_pgid("rev")
+            shelbi_state::read_review_serve_pgid("demo", "rev")
                 .unwrap()
                 .is_none(),
             "the pgid record must be cleared after teardown"
         );
 
         std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Slots listed means the machine answered. Anything else is "couldn't
+    /// ask", which must stay apart from "no session" (the SSH backend answers
+    /// `Ok(None)` when its relay can't be reached).
+    #[test]
+    fn slot_liveness_keeps_unreachable_apart_from_dead() {
+        let slot = |name: &str| crate::session_backend::SlotInfo {
+            id: name.to_string(),
+            name: name.to_string(),
+        };
+        assert_eq!(slot_liveness(Ok(Some(vec![slot("rev")])), "rev"), Liveness::Alive);
+        assert_eq!(slot_liveness(Ok(Some(vec![slot("other")])), "rev"), Liveness::Dead);
+        assert_eq!(slot_liveness(Ok(Some(vec![])), "rev"), Liveness::Dead);
+        assert!(matches!(slot_liveness(Ok(None), "rev"), Liveness::Unreachable { .. }));
+        assert!(matches!(
+            slot_liveness(Err(std::io::Error::other("ssh died")), "rev"),
+            Liveness::Unreachable { .. }
+        ));
+    }
+
+    /// A caller with its own policy for uncertainty (the poller's "reads as
+    /// alive" probes) gets an error it can apply that policy to, not `false`.
+    #[test]
+    fn workspace_pane_alive_errors_when_the_machine_cannot_be_asked() {
+        set_test_pane_liveness(Some(Liveness::Unreachable { reason: "relay down".into() }));
+        let target = SessionTarget::session("shelbi-demo");
+        let got = workspace_pane_alive(&Host::Local, &target);
+        set_test_pane_liveness(None);
+        assert!(got.is_err(), "unreachable must not read as a dead session: {got:?}");
     }
 
     /// A missing pgid record (a dev slot, a remote review slot, or a load that
@@ -12032,8 +12134,8 @@ mod review_server_tests {
         std::fs::create_dir_all(&home).unwrap();
         std::env::set_var("SHELBI_HOME", &home);
         // No pgid file written → must not panic and must leave no record.
-        stop_review_server("rev");
-        assert!(shelbi_state::read_review_serve_pgid("rev").unwrap().is_none());
+        stop_review_server("demo", "rev");
+        assert!(shelbi_state::read_review_serve_pgid("demo", "rev").unwrap().is_none());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -12073,14 +12175,14 @@ mod review_server_tests {
 
         // Safety: `getpgrp()` only reads our process-group id.
         let own_pgid = unsafe { libc::getpgrp() } as i32;
-        let path = shelbi_state::review_serve_pgid_path("rev").unwrap();
+        let path = shelbi_state::review_serve_pgid_path("demo", "rev").unwrap();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, format!("{own_pgid}\n")).unwrap();
 
         // Must not signal our own group; still clears the (bogus) record.
-        stop_review_server("rev");
+        stop_review_server("demo", "rev");
 
-        assert!(shelbi_state::read_review_serve_pgid("rev").unwrap().is_none());
+        assert!(shelbi_state::read_review_serve_pgid("demo", "rev").unwrap().is_none());
         std::env::remove_var("SHELBI_HOME");
     }
 }
@@ -15041,6 +15143,48 @@ mod sync_worktree_freshcut_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The relaunch the quit race produces: a supervisor redispatching a
+    /// workspace after the quit began stands down without touching anything.
+    #[test]
+    fn a_dispatch_during_a_project_quit_is_cancelled_before_it_starts() {
+        let _env = crate::test_lock::acquire();
+        let root = std::env::temp_dir().join(format!(
+            "shelbi-dispatch-mid-quit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let machine_repo = root.join("repo");
+        let home = root.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let prev_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = dispatch_project(&machine_repo, "claude", Vec::new());
+        let phase = crate::cancel::begin_quit(&project.name);
+        let result = start_workspace_on_task(StartSpec {
+            project: &project,
+            workspace: &project.workspaces[0],
+            task_id: "task-raced",
+            branch: "shelbi/task-raced",
+            task_body: "",
+            agent: None,
+            launch_override: None,
+        });
+        drop(phase);
+
+        match prev_home {
+            Some(v) => std::env::set_var("SHELBI_HOME", v),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(matches!(result, Err(Error::Cancelled(_))), "{:?}", result.err());
+        assert!(!machine_repo.exists(), "the cancelled dispatch touched no worktree");
     }
 
     #[test]

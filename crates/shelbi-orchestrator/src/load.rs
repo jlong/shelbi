@@ -1121,7 +1121,13 @@ fn release_supplanted_workspace(project: &Project, workspace_name: &str) {
     let Ok(addr) = crate::workspace::workspace_target(project, ws) else {
         return;
     };
-    if let Err(e) = crate::workspace::kill_workspace_pane(&host, &addr, workspace_name) {
+    if let Err(e) = crate::workspace::kill_workspace_pane(
+        &project.name,
+        &host,
+        &addr,
+        workspace_name,
+        crate::session_backend::KillReason::Handoff,
+    ) {
         tracing::warn!(
             project = %project.name,
             workspace = %workspace_name,

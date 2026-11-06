@@ -499,7 +499,7 @@ pub fn close_review(project_name: &str, task_id: &str) -> Result<()> {
     // Reap the setsid'd dev server's whole process group, freeing the port it
     // held. No-op without a pgid record.
     if let Some(slot) = resolved? {
-        crate::workspace::stop_review_server(&slot);
+        crate::workspace::stop_review_server(project_name, &slot);
     }
     Ok(())
 }

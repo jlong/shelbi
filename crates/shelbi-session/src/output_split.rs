@@ -19,9 +19,13 @@
 //!
 //! One edge case: a program that writes an incomplete sequence and then pauses
 //! would have its bytes held until it completes (correct — you must not split a
-//! sequence). A pathological stream that never reaches Ground is bounded by
+//! sequence). Rest is judged by the transitions in [`crate::vt`], the emulator's
+//! own, so an ESC, CAN or SUB ends an open string here exactly when it does
+//! there. A pathological stream that never reaches Ground is bounded by
 //! [`MAX_HELD`]; past that the buffer is flushed anyway, accepting a torn edge
 //! rather than growing without bound.
+
+use crate::vt::State;
 
 /// Hold at most this many un-rested bytes before flushing regardless. Larger
 /// than any real escape sequence (OSC titles, DCS) a child emits in one burst.
@@ -32,6 +36,10 @@ const MAX_HELD: usize = 1 << 20; // 1 MiB
 #[derive(Default)]
 pub struct RestSplitter {
     pending: Vec<u8>,
+    /// The parser state after everything fed so far, emitted or still pending.
+    state: State,
+    /// The last offset in `pending` at which the parser was at rest.
+    rest: usize,
 }
 
 impl RestSplitter {
@@ -43,100 +51,46 @@ impl RestSplitter {
     /// emit (empty if the whole buffer is mid-sequence and under [`MAX_HELD`]).
     /// The returned bytes are drained from the pending buffer.
     pub fn push(&mut self, data: &[u8]) -> Vec<u8> {
+        let start = self.pending.len();
         self.pending.extend_from_slice(data);
-        let mut cut = rest_cut(&self.pending);
-        if cut == 0 && self.pending.len() >= MAX_HELD {
-            // Pathological: never reached Ground. Flush to stay bounded.
+        for (i, &b) in data.iter().enumerate() {
+            if self.state.at_rest() {
+                self.rest = start + i;
+            }
+            self.state = self.state.step(b);
+        }
+        if self.state.at_rest() {
+            self.rest = self.pending.len();
+        }
+        let mut cut = self.rest;
+        if self.pending.len() - cut >= MAX_HELD {
+            // Pathological: never reached Ground. Flush to stay bounded. The
+            // state carries on, so the rest of this sequence is still tracked.
             cut = self.pending.len();
         }
+        self.rest = 0;
         self.pending.drain(..cut).collect()
     }
 
     /// Flush any remaining buffered bytes (called at EOF, when no more input can
     /// complete a trailing partial sequence).
     pub fn flush(&mut self) -> Vec<u8> {
+        self.rest = 0;
         std::mem::take(&mut self.pending)
-    }
-}
-
-/// Parser rest states: enough of a VT state machine to know when the parser sits
-/// at a token boundary (Ground, no pending UTF-8 continuation).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum St {
-    Ground,
-    Esc,
-    Csi,
-    /// OSC/DCS-style string; `true` once an ESC was seen (awaiting `\` for ST).
-    Str(bool),
-    Charset,
-    /// UTF-8 continuation bytes still expected.
-    Utf8(u8),
-}
-
-fn step(st: St, b: u8) -> St {
-    match st {
-        St::Ground => match b {
-            0x1b => St::Esc,
-            0xc2..=0xdf => St::Utf8(1),
-            0xe0..=0xef => St::Utf8(2),
-            0xf0..=0xf4 => St::Utf8(3),
-            _ => St::Ground,
-        },
-        St::Utf8(n) => {
-            if (0x80..=0xbf).contains(&b) {
-                if n == 1 {
-                    St::Ground
-                } else {
-                    St::Utf8(n - 1)
-                }
-            } else {
-                // Malformed; re-interpret this byte from Ground.
-                step(St::Ground, b)
-            }
-        }
-        St::Esc => match b {
-            b'[' => St::Csi,
-            b']' | b'P' | b'X' | b'^' | b'_' => St::Str(false),
-            b'(' | b')' | b'*' | b'+' => St::Charset,
-            _ => St::Ground, // two-byte escape (ESC 7, ESC c, ...)
-        },
-        St::Csi => match b {
-            0x40..=0x7e => St::Ground, // final byte
-            _ => St::Csi,              // params / intermediates
-        },
-        St::Str(seen_esc) => match b {
-            0x07 => St::Ground,              // BEL terminates
-            b'\\' if seen_esc => St::Ground, // ST (ESC \)
-            0x1b => St::Str(true),
-            _ => St::Str(false),
-        },
-        St::Charset => St::Ground,
-    }
-}
-
-/// The largest offset `<= bytes.len()` at which the parser is at rest (Ground,
-/// before that byte). Walking from Ground, this is the last position before a
-/// byte where the state is Ground, or `bytes.len()` when the whole buffer ends
-/// at Ground. Complete tokens before a trailing partial sequence are included.
-fn rest_cut(bytes: &[u8]) -> usize {
-    let mut st = St::Ground;
-    let mut last = 0usize;
-    for (i, &b) in bytes.iter().enumerate() {
-        if st == St::Ground {
-            last = i;
-        }
-        st = step(st, b);
-    }
-    if st == St::Ground {
-        bytes.len()
-    } else {
-        last
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// True if a fresh parser reading `bytes` finishes at Ground.
+    fn ends_at_rest(bytes: &[u8]) -> bool {
+        bytes
+            .iter()
+            .fold(State::Ground, |st, &b| st.step(b))
+            .at_rest()
+    }
 
     #[test]
     fn whole_rested_stream_passes_through() {
@@ -172,7 +126,7 @@ mod tests {
         for &b in stream {
             let piece = s.push(&[b]);
             if !piece.is_empty() {
-                assert_eq!(rest_cut(&piece), piece.len(), "emitted a torn chunk");
+                assert!(ends_at_rest(&piece), "emitted a torn chunk");
             }
             out.extend_from_slice(&piece);
         }
@@ -185,5 +139,103 @@ mod tests {
         let mut s = RestSplitter::new();
         assert_eq!(s.push(b"ok\x1b["), b"ok");
         assert_eq!(s.flush(), b"\x1b[");
+    }
+
+    /// The audit's freeze: nothing later reaches Ground for a parser that lets
+    /// an OSC run through an ESC, so output is held until BEL or 1 MiB.
+    #[test]
+    fn output_passes_through_after_an_esc_interrupted_osc() {
+        let mut s = RestSplitter::new();
+        assert_eq!(s.push(b"\x1b]0;x\x1b[31mhi"), b"\x1b]0;x\x1b[31mhi");
+
+        let mut s = RestSplitter::new();
+        assert_eq!(s.push(b"\x1b]0;x"), b"");
+        assert_eq!(s.push(b"\x1b[31m"), b"\x1b]0;x\x1b[31m");
+        assert_eq!(s.push(b"hi"), b"hi");
+    }
+
+    #[test]
+    fn esc_interrupts_every_kind_of_string_and_a_csi() {
+        for opener in [
+            b"\x1bPqdata".as_slice(),
+            b"\x1b_data",
+            b"\x1bXdata",
+            b"\x1b^data",
+            b"\x1b[1;2",
+        ] {
+            let mut s = RestSplitter::new();
+            assert_eq!(s.push(opener), b"", "{opener:?} should be held");
+            assert_eq!(s.push(b"\x1b[0mok"), [opener, b"\x1b[0mok"].concat());
+        }
+    }
+
+    #[test]
+    fn can_and_sub_end_a_sequence() {
+        for abort in [0x18u8, 0x1a] {
+            for opener in [
+                b"\x1b]0;x".as_slice(),
+                b"\x1bPqx",
+                b"\x1b_x",
+                b"\x1b[1",
+                b"\x1b",
+            ] {
+                let mut s = RestSplitter::new();
+                assert_eq!(s.push(opener), b"", "{opener:?} should be held");
+                let want = [opener, &[abort], b"ok"].concat();
+                assert_eq!(s.push(&[&[abort], b"ok".as_slice()].concat()), want);
+            }
+        }
+    }
+
+    #[test]
+    fn st_split_across_pushes_ends_the_string() {
+        let mut s = RestSplitter::new();
+        assert_eq!(s.push(b"\x1b]0;x\x1b"), b"");
+        assert_eq!(s.push(b"\\z"), b"\x1b]0;x\x1b\\z");
+    }
+
+    /// BEL ends an OSC but not a DCS or APC, to the emulator as here. Cutting a
+    /// frame there would resume a client mid-string, misreading the rest as text.
+    #[test]
+    fn bel_does_not_end_a_dcs_or_apc() {
+        for opener in [b"\x1bPqx\x07".as_slice(), b"\x1b_x\x07"] {
+            let mut s = RestSplitter::new();
+            assert_eq!(s.push(opener), b"");
+            assert_eq!(s.push(b"\x1b\\"), [opener, b"\x1b\\"].concat());
+        }
+    }
+
+    #[test]
+    fn multi_byte_intermediates_are_held_to_their_final_byte() {
+        let mut s = RestSplitter::new();
+        assert_eq!(s.push(b"\x1b#"), b"");
+        assert_eq!(s.push(b"8ok"), b"\x1b#8ok");
+    }
+
+    #[test]
+    fn a_string_past_the_limit_flushes_and_stays_tracked() {
+        let mut s = RestSplitter::new();
+        assert_eq!(s.push(b"ok\x1b]0;"), b"ok");
+        let chunk = vec![b'x'; 8192];
+        let mut released = 0;
+        for _ in 0..(MAX_HELD / chunk.len()) {
+            released += s.push(&chunk).len();
+            assert!(s.pending.len() <= MAX_HELD, "held {}", s.pending.len());
+        }
+        assert!(released > 0, "a string past the limit must be flushed");
+        // Still inside the string: a resumed read of its tail stays held, and
+        // isn't taken for text just because the earlier part went out.
+        assert_eq!(s.push(b"more"), b"");
+        assert_eq!(s.push(b"\x07z"), b"more\x07z");
+    }
+
+    #[test]
+    fn the_rest_offset_stays_correct_across_drains() {
+        let mut s = RestSplitter::new();
+        assert_eq!(s.push(b"ok\x1b]0;"), b"ok");
+        // The rest offset moves back to zero after a drain; a later sequence
+        // must still cut at the point it reached rest, not at the old offset.
+        assert_eq!(s.push(b"\x07ab\x1b["), b"\x1b]0;\x07ab");
+        assert_eq!(s.push(b"0m"), b"\x1b[0m");
     }
 }

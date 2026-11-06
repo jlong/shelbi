@@ -1039,7 +1039,14 @@ impl PoolOps for LiveOps {
             .machine(&workspace.machine)
             .ok_or_else(|| format!("unknown machine `{}`", workspace.machine))?;
         let target = ws::workspace_target(project, workspace).map_err(|e| e.to_string())?;
-        ws::kill_workspace_pane(&machine.host(), &target, &workspace.name).map_err(|e| e.to_string())
+        ws::kill_workspace_pane(
+            &project.name,
+            &machine.host(),
+            &target,
+            &workspace.name,
+            crate::session_backend::KillReason::Stop,
+        )
+        .map_err(|e| e.to_string())
     }
 }
 

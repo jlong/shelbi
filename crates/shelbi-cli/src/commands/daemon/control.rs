@@ -595,8 +595,8 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 project,
             } => {
                 // Runs inline on this connection's handler thread (other clients
-                // have their own threads). Ends the project's sessions, drains
-                // its quit barrier, marks it closed, then acks. Runs during a
+                // have their own threads). Marks the project closed, drains its
+                // quit barrier, ends its sessions, then acks. Runs during a
                 // shutdown too (a quit is how a user gets out, and its client
                 // doesn't retry), counted so the daemon doesn't exit mid-quit.
                 let job = state.inner.jobs.track(format!("quit:{project}"));

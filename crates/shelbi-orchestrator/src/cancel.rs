@@ -21,7 +21,9 @@
 //!   generation marker: a [`bump_workspace`] (a launch timeout) trips the flag
 //!   of every live job for that workspace, and a job registered *after* the
 //!   bump gets a fresh flag — so it belongs to the new generation and survives.
-//!   A [`quit_project`] trips every live job's flag for the project.
+//!   A [`quit_project`] trips every live job's flag for the project. So does
+//!   [`begin_quit`], which also opens the project's quitting phase: until the
+//!   quit finishes, a job registered for the project starts out cancelled.
 //!
 //! - **Deadlines.** Subprocess calls (SSH, git, `gh`) a job makes run with a
 //!   wall-clock deadline and are killed — process group included — on
@@ -33,10 +35,10 @@
 //!
 //! - **The quit barrier.** [`quit_project`] trips the project's jobs and
 //!   returns a [`QuitBarrier`]; [`QuitBarrier::wait`] blocks up to a bound for
-//!   those jobs to acknowledge cancellation (drop their guards) before the
-//!   caller marks the project closed. That is what makes "closed" mean "no job
-//!   for this project is still running," and — because the registry is keyed
-//!   per project — quitting one project never touches another's jobs.
+//!   those jobs to acknowledge cancellation (drop their guards). The project is
+//!   marked closed *before* this runs ([`crate::quit`] explains why), so "closed"
+//!   does not by itself mean drained: a finished quit does. Because the registry
+//!   is keyed per project, quitting one project never touches another's jobs.
 //!
 //! The registry is process-global (the daemon's jobs run on many threads with
 //! no single owner to thread a handle through, matching how the daemon already
@@ -49,8 +51,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Default wall-clock bound the quit barrier waits for a project's in-flight
-/// jobs to acknowledge cancellation before the project is marked closed.
-/// Generous enough to cover an in-flight SSH/git call being killed on its
+/// jobs to acknowledge cancellation. Generous enough to cover an in-flight SSH/git call being killed on its
 /// deadline and the thread unwinding, while still bounding a genuinely wedged
 /// job so a quit never hangs the daemon.
 pub const DEFAULT_QUIT_BARRIER_MS: u64 = 10_000;
@@ -107,6 +108,18 @@ struct LiveJob {
 #[derive(Default)]
 struct ProjectState {
     live: HashMap<u64, LiveJob>,
+    /// How many quits ([`begin_quit`]) are running for this project. The project
+    /// is in its quitting phase while this is above zero. A count rather than a
+    /// flag because a Quit Project and a Quit Shelbi can overlap, and the first
+    /// to finish must not end the other's phase.
+    quits: usize,
+}
+
+impl ProjectState {
+    /// Nothing left to remember about this project: no jobs and no quit running.
+    fn is_idle(&self) -> bool {
+        self.live.is_empty() && self.quits == 0
+    }
 }
 
 #[derive(Default)]
@@ -164,7 +177,7 @@ impl Drop for JobGuard {
         let mut reg = lock();
         if let Some(ps) = reg.projects.get_mut(&self.project) {
             ps.live.remove(&self.id);
-            if ps.live.is_empty() {
+            if ps.is_idle() {
                 reg.projects.remove(&self.project);
             }
         }
@@ -174,12 +187,14 @@ impl Drop for JobGuard {
 /// Register an in-flight daemon job for `project`, scoped to `workspace` (or
 /// `None` for project-wide work) and of the given [`JobKind`]. The returned
 /// [`JobGuard`] belongs to the current generation (a fresh, untripped flag);
-/// hold it for the job's whole lifetime.
+/// hold it for the job's whole lifetime. While the project is quitting
+/// ([`begin_quit`]) the guard comes back already cancelled, so a relaunch that
+/// races the quit stands down at its first check.
 pub fn register(project: &str, workspace: Option<&str>, kind: JobKind) -> JobGuard {
-    let flag = Arc::new(AtomicBool::new(false));
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     let mut reg = lock();
     let ps = reg.projects.entry(project.to_string()).or_default();
+    let flag = Arc::new(AtomicBool::new(ps.quits > 0));
     ps.live.insert(
         id,
         LiveJob {
@@ -213,10 +228,65 @@ pub fn bump_workspace(project: &str, workspace: &str) {
     }
 }
 
-/// Quit a project: trip the cancellation flag of every live job for it
-/// (workspace-scoped and project-wide alike) and return a [`QuitBarrier`] the
-/// caller waits on before marking the project closed. Jobs for *other*
-/// projects are untouched.
+/// Open `project`'s quitting phase: trip every live job for it and make every
+/// job registered from now on start out cancelled, until the returned
+/// [`QuitPhase`] drops. Taken before the project's open flag clears, so nothing
+/// new can start in any later step of the quit, however the poller's ticks line
+/// up with it. Jobs for *other* projects are untouched.
+pub fn begin_quit(project: &str) -> QuitPhase {
+    let mut reg = lock();
+    let ps = reg.projects.entry(project.to_string()).or_default();
+    ps.quits += 1;
+    for job in ps.live.values() {
+        job.flag.store(true, Ordering::SeqCst);
+    }
+    QuitPhase {
+        project: project.to_string(),
+    }
+}
+
+/// Whether `project` is in its quitting phase ([`begin_quit`]).
+pub fn is_quitting(project: &str) -> bool {
+    lock().projects.get(project).is_some_and(|ps| ps.quits > 0)
+}
+
+/// A running quit of one project, from [`begin_quit`] until it drops. Drop-based
+/// so a panicking quit can't leave the project refusing every later launch; the
+/// phase ends with the quit, so a reopened project's jobs run normally.
+#[must_use = "the project only counts as quitting while this is held"]
+pub struct QuitPhase {
+    project: String,
+}
+
+impl QuitPhase {
+    /// Wait up to [`quit_barrier_bound`] for the project's jobs to acknowledge
+    /// cancellation. Same result as [`QuitBarrier::wait`].
+    pub fn wait(&self) -> bool {
+        QuitBarrier {
+            project: self.project.clone(),
+        }
+        .wait()
+    }
+}
+
+impl Drop for QuitPhase {
+    fn drop(&mut self) {
+        let mut reg = lock();
+        if let Some(ps) = reg.projects.get_mut(&self.project) {
+            ps.quits = ps.quits.saturating_sub(1);
+            if ps.is_idle() {
+                reg.projects.remove(&self.project);
+            }
+        }
+    }
+}
+
+/// Trip the cancellation flag of every live job for a project (workspace-scoped
+/// and project-wide alike) and return a [`QuitBarrier`] to wait on. Jobs for
+/// *other* projects are untouched. This has no quitting phase, so a job
+/// registered afterward runs normally: the poller manager uses it to clean up
+/// after a project it found closed, where [`begin_quit`] has already had its say
+/// if a quit was involved.
 pub fn quit_project(project: &str) -> QuitBarrier {
     let reg = lock();
     if let Some(ps) = reg.projects.get(project) {
@@ -240,8 +310,7 @@ pub fn live_job_count(project: &str) -> usize {
 }
 
 /// Returned by [`quit_project`]: a handle to wait for the project's cancelled
-/// jobs to acknowledge cancellation (drop their guards) before the project is
-/// marked closed.
+/// jobs to acknowledge cancellation (drop their guards).
 pub struct QuitBarrier {
     project: String,
 }
@@ -520,6 +589,76 @@ mod tests {
         let res = worker.join().unwrap();
         let err = res.expect_err("the scoped run was killed, not completed");
         assert_eq!(err.kind(), std::io::ErrorKind::Interrupted, "err: {err}");
+    }
+
+    #[test]
+    fn beginning_a_quit_cancels_live_jobs_and_every_job_registered_during_it() {
+        let p = proj("phase");
+        let live = register(&p, None, JobKind::Poll);
+
+        let phase = begin_quit(&p);
+        assert!(is_quitting(&p));
+        assert!(live.is_cancelled(), "a job already running is cancelled");
+
+        for kind in [JobKind::Launch, JobKind::Poll] {
+            let raced = register(&p, Some("alpha"), kind);
+            assert!(raced.is_cancelled(), "{kind:?} registered mid-quit starts cancelled");
+        }
+        drop(live);
+        assert!(phase.wait(), "a born-cancelled job that dropped doesn't hold the barrier");
+    }
+
+    #[test]
+    fn a_born_cancelled_job_still_holds_the_barrier_until_it_acknowledges() {
+        let p = proj("phase-barrier");
+        let phase = begin_quit(&p);
+        let raced = register(&p, Some("alpha"), JobKind::Launch);
+        assert_eq!(live_job_count(&p), 1);
+        let barrier = QuitBarrier { project: p.clone() };
+        assert!(!barrier.wait_for(Duration::from_millis(30)));
+        drop(raced);
+        assert!(barrier.wait_for(Duration::from_secs(1)));
+        drop(phase);
+    }
+
+    #[test]
+    fn a_job_registered_after_the_quit_finishes_runs_normally() {
+        // A reopen must work: the phase ends with the quit rather than leaving
+        // the project refusing every launch.
+        let p = proj("phase-end");
+        drop(begin_quit(&p));
+        assert!(!is_quitting(&p));
+        assert!(register(&p, None, JobKind::Launch).is_current());
+    }
+
+    #[test]
+    fn the_quitting_phase_survives_its_jobs_draining_and_an_overlapping_quit() {
+        let p = proj("phase-overlap");
+        let job = register(&p, None, JobKind::Poll);
+        let first = begin_quit(&p);
+        let second = begin_quit(&p);
+
+        // The last job dropping must not forget the phase with the project entry.
+        drop(job);
+        assert!(is_quitting(&p));
+
+        // Quit Project finishing doesn't end Quit Shelbi's phase.
+        drop(first);
+        assert!(is_quitting(&p));
+        assert!(register(&p, None, JobKind::Launch).is_cancelled());
+
+        drop(second);
+        assert!(!is_quitting(&p));
+    }
+
+    #[test]
+    fn a_quitting_phase_leaves_another_project_alone() {
+        let quitting = proj("phase-iso-quit");
+        let other = proj("phase-iso-other");
+        let survivor = register(&other, None, JobKind::Poll);
+        let _phase = begin_quit(&quitting);
+        assert!(survivor.is_current());
+        assert!(register(&other, None, JobKind::Launch).is_current());
     }
 
     #[test]

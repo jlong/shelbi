@@ -90,10 +90,9 @@ pub trait ProjectPaths {
     /// `state_root`.
     fn events_log_path(&self) -> Result<PathBuf>;
 
-    /// `<state_root>/workspaces/` — per-project workspace status
-    /// directory. Distinct from the cross-project
-    /// [`crate::workspaces_dir`] free function that returns
-    /// `~/.shelbi/workspaces/`.
+    /// `<state_root>/workspaces/` — the project's per-workspace runtime
+    /// state. The same path as the [`crate::workspaces_dir`] free function,
+    /// which takes a project name.
     fn workspaces_dir(&self) -> Result<PathBuf>;
 
     /// `<state_root>/.claude/` — the orchestrator dashboard workdir's

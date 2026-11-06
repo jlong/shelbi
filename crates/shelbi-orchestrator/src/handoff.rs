@@ -3,10 +3,11 @@
 //! and respawn it (on `shelbi reload`) or tear it down (on
 //! `shelbi quit`).
 //!
-//! The next orchestrator instance ingests the file via the
-//! `deploy_agent_context` splice path (see
-//! [`crate::workspace::deploy_agent_context`]) and deletes it after
-//! reading — handoff is one-shot, not persistent state.
+//! The launch that starts the next orchestrator instance claims the file and
+//! splices it into the new prompt (see
+//! [`crate::workspace::deploy_agent_context`]), then deletes it once the new
+//! session is up, or restores it if the launch fails. An attach to a live
+//! orchestrator never touches it. Handoff is one-shot, not persistent state.
 //!
 //! Mechanism: for Claude, custom runners, and a one-time migration from a
 //! standalone Codex pane, we deliver a request into the orchestrator pane
@@ -51,7 +52,7 @@ pub enum HandoffOutcome {
     /// must not paste a handoff request into the visible remote-TUI composer.
     NativeThread,
     /// Orchestrator wrote the file within the timeout. Caller should
-    /// proceed; the next launch will splice and delete it.
+    /// proceed; the next launch will claim and splice it.
     Written {
         /// Absolute path of the file the orchestrator just wrote.
         path: PathBuf,
@@ -127,6 +128,11 @@ impl HandoffOutcome {
 /// proceeding with the rest of its teardown regardless of which
 /// outcome variant comes back — every variant of [`HandoffOutcome`] is
 /// "okay to proceed" semantics, distinguished only for logging.
+///
+/// An `Err` is different: the runner-transition preflight refused, or the project
+/// can't be resolved. The replacement launch runs the same checks and would fail
+/// the same way, so a caller replacing the orchestrator must stop before it kills
+/// the live one.
 pub fn request_orchestrator_handoff(project_name: &str) -> Result<HandoffOutcome> {
     let outcome = request_orchestrator_handoff_inner(project_name)?;
     // Make the whole handoff flow diagnosable post-hoc — it used to be
@@ -170,7 +176,7 @@ fn request_orchestrator_handoff_inner(project_name: &str) -> Result<HandoffOutco
     // missing file is fine; a permissions error is rare and the caller
     // would degrade to a stale-handoff ingest, which is the documented
     // fallback anyway.
-    let _ = std::fs::remove_file(&handoff_path);
+    let _ = shelbi_state::discard_orchestrator_handoff(project_name);
 
     let request = handoff_request_message();
     // Deliver AND verify the submission through the shared verified-submit path
@@ -670,6 +676,13 @@ mod tests {
             // The switch is refused, so the native thread is left intact.
             assert_eq!(fs::read(&state_path).unwrap(), before);
             assert!(crate::wake::has_persisted_codex_thread("demo").unwrap());
+
+            // The handoff request surfaces the refusal as a hard error rather
+            // than an "okay to proceed" outcome: reload aborts on it.
+            let error = request_orchestrator_handoff("demo")
+                .expect_err("a refused preflight must not read as a handoff outcome")
+                .to_string();
+            assert!(error.contains("undelivered"), "{error}");
         });
     }
 
