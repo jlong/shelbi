@@ -796,6 +796,161 @@ fn closed_page(project: &str, page: shelbi_state::ClosedPage) -> ClosedPage {
 }
 
 // ---------------------------------------------------------------------------
+// Done-history paging
+// ---------------------------------------------------------------------------
+
+/// What a client shows while a "load more" fetch runs.
+pub const LOADING_MORE_STATUS: &str = "loading more history…";
+
+/// One "load more" fetch, from [`ClosedHistory::begin_more`]. Fetch the page
+/// after [`cursor`](Self::cursor), off the UI thread, and hand this back with
+/// the answer to [`ClosedHistory::finish_more`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoreRequest {
+    pub cursor: String,
+    /// The paging run this fetch belongs to. A reset starts a new one, so an
+    /// answer anchored on the old first page can't land on the new one.
+    run: u64,
+}
+
+/// How far into the history the board has paged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Depth {
+    /// No closed page has landed yet: the done column is still filling.
+    #[default]
+    Unread,
+    /// Only page 1 is loaded, so the next cursor is page 1's and a first-page
+    /// refresh moves it.
+    FirstPage,
+    /// At least one "load more" page landed, so the next cursor is the deepest
+    /// page's and a first-page refresh that keeps the same cards leaves it be.
+    /// Counted by landed pages, not by cards: a page whose cards were all
+    /// already on the board still moved the cursor.
+    Paged,
+}
+
+/// The terminal `done`/`canceled` history a board has loaded: page 1 as last
+/// read by the closed-page refresher, the pages beyond it from an explicit
+/// "load more", and the one cursor that says what comes next.
+///
+/// The refresher re-reads page 1 on every tick while "load more" walks forward,
+/// so both write the cursor, and they only agree through this state:
+///
+/// - A refresh with the same page-1 cards updates those cards and keeps the
+///   loaded pages and the cursor. The same cards in a new order count as the
+///   same: nothing crossed the page boundary.
+/// - A refresh with different page-1 cards resets the pages and the cursor
+///   together, and abandons a fetch in flight. Cards crossed the page boundary,
+///   so keeping the old pages could leave a hole in the history (the card that
+///   fell off page 1 is on none of them).
+#[derive(Debug, Clone, Default)]
+pub struct ClosedHistory {
+    first: Vec<IssueFile>,
+    more: Vec<IssueFile>,
+    next_cursor: Option<String>,
+    depth: Depth,
+    run: u64,
+    fetching: bool,
+}
+
+impl ClosedHistory {
+    /// Whether a closed page has landed yet.
+    pub fn landed(&self) -> bool {
+        self.depth != Depth::Unread
+    }
+
+    /// Page 1 as last read.
+    pub fn first(&self) -> &[IssueFile] {
+        &self.first
+    }
+
+    /// The pages beyond the first.
+    pub fn more(&self) -> &[IssueFile] {
+        &self.more
+    }
+
+    /// Where the next page starts; `None` when the history is all loaded.
+    pub fn next_cursor(&self) -> Option<&str> {
+        self.next_cursor.as_deref()
+    }
+
+    pub fn has_more(&self) -> bool {
+        self.next_cursor.is_some()
+    }
+
+    /// Whether a "load more" fetch is running.
+    pub fn fetching(&self) -> bool {
+        self.fetching
+    }
+
+    /// Fold a read of page 1. See the type's docs for what happens to the
+    /// pages beyond it.
+    pub fn apply_first(&mut self, page: ClosedPage) {
+        if !same_cards(&self.first, &page.issues) {
+            self.more.clear();
+            self.fetching = false;
+            self.run += 1;
+            self.depth = Depth::FirstPage;
+        }
+        self.first = page.issues;
+        if self.depth != Depth::Paged {
+            self.next_cursor = page.next_cursor;
+            self.depth = Depth::FirstPage;
+        }
+    }
+
+    /// Start a "load more" fetch. `None` when there's nothing to fetch, or one
+    /// is already running.
+    pub fn begin_more(&mut self) -> Option<MoreRequest> {
+        if self.fetching {
+            return None;
+        }
+        let cursor = self.next_cursor.clone()?;
+        self.fetching = true;
+        Some(MoreRequest {
+            cursor,
+            run: self.run,
+        })
+    }
+
+    /// Fold a "load more" answer, keeping only cards not already on the board
+    /// (`open`, or a loaded page). A failure keeps the cursor so the next try
+    /// fetches the same page, and comes back for the client to show. An answer
+    /// to a fetch a reset abandoned is dropped, failure included.
+    pub fn finish_more(
+        &mut self,
+        request: &MoreRequest,
+        result: Result<ClosedPage, String>,
+        open: &[IssueFile],
+    ) -> Result<(), String> {
+        if request.run != self.run {
+            return Ok(());
+        }
+        self.fetching = false;
+        let page = result?;
+        let mut seen: HashSet<String> = open
+            .iter()
+            .chain(&self.first)
+            .chain(&self.more)
+            .map(|tf| tf.task.id.clone())
+            .collect();
+        self.more
+            .extend(page.issues.into_iter().filter(|tf| seen.insert(tf.task.id.clone())));
+        self.next_cursor = page.next_cursor;
+        self.depth = Depth::Paged;
+        Ok(())
+    }
+}
+
+/// Whether two pages hold the same cards, in any order.
+fn same_cards(a: &[IssueFile], b: &[IssueFile]) -> bool {
+    let ids = |page: &[IssueFile]| -> HashSet<String> {
+        page.iter().map(|tf| tf.task.id.clone()).collect()
+    };
+    ids(a) == ids(b)
+}
+
+// ---------------------------------------------------------------------------
 // The board input a client accumulates
 // ---------------------------------------------------------------------------
 
@@ -817,14 +972,8 @@ pub struct BoardInput {
     pub column_overrides: BTreeMap<String, KanbanColumnOverride>,
     /// The open board as last read.
     pub open: Vec<IssueFile>,
-    /// The first terminal-history page as last read.
-    pub closed_first: Vec<IssueFile>,
-    /// History pages beyond the first, from explicit "load more".
-    pub closed_more: Vec<IssueFile>,
-    pub closed_next_cursor: Option<String>,
-    /// Whether a closed page has landed yet (the done column is still filling
-    /// until it has).
-    pub closed_loaded: bool,
+    /// The terminal history: its pages, and where the next one starts.
+    pub closed: ClosedHistory,
     /// True until the first warm read (a cold index, or nothing read yet).
     pub loading: bool,
     /// The board freshness banner (`board 12s`, `board 4m stale …`).
@@ -852,10 +1001,7 @@ impl Default for BoardInput {
             workspace_filter: None,
             column_overrides: BTreeMap::new(),
             open: Vec::new(),
-            closed_first: Vec::new(),
-            closed_more: Vec::new(),
-            closed_next_cursor: None,
-            closed_loaded: false,
+            closed: ClosedHistory::default(),
             loading: true,
             banner: None,
             error: None,
@@ -933,33 +1079,23 @@ impl BoardInput {
     /// last-known lanes rather than blanking the done column.
     pub fn apply_closed(&mut self, closed: Option<ClosedPage>) {
         if let Some(page) = closed {
-            self.closed_first = page.issues;
-            self.closed_next_cursor = page.next_cursor;
-            self.closed_loaded = true;
+            self.closed.apply_first(page);
         }
     }
 
-    /// Append a "load more" page, keeping only ids not already on the board.
-    pub fn apply_more(&mut self, page: ClosedPage) {
-        self.closed_next_cursor = page.next_cursor;
-        let mut seen: HashSet<String> = self
-            .open
-            .iter()
-            .chain(self.closed_first.iter())
-            .chain(self.closed_more.iter())
-            .map(|tf| tf.task.id.clone())
-            .collect();
-        for tf in page.issues {
-            if seen.insert(tf.task.id.clone()) {
-                self.closed_more.push(tf);
-            }
-        }
+    /// Fold the answer to a "load more" fetch ([`ClosedHistory::begin_more`]).
+    pub fn finish_more(
+        &mut self,
+        request: &MoreRequest,
+        result: Result<ClosedPage, String>,
+    ) -> Result<(), String> {
+        self.closed.finish_more(request, result, &self.open)
     }
 
     /// The merged board (open first, then terminal history, then any search
     /// hits the board hasn't loaded).
     pub fn tasks(&self) -> Vec<IssueFile> {
-        let mut tasks = merge_board(&self.open, &self.closed_first, &self.closed_more);
+        let mut tasks = merge_board(&self.open, self.closed.first(), self.closed.more());
         if !self.search_hits.is_empty() {
             let mut seen: HashSet<String> = tasks.iter().map(|tf| tf.task.id.clone()).collect();
             tasks.extend(
@@ -1234,16 +1370,162 @@ mod tests {
             issues: vec![issue("d", "done")],
             next_cursor: Some("c1".into()),
         }));
-        assert!(input.closed_loaded);
+        assert!(input.closed.landed());
         assert_eq!(input.tasks().len(), 2);
         input.apply_closed(None);
         assert_eq!(input.tasks().len(), 2, "a failed closed read keeps the last lanes");
-        input.apply_more(ClosedPage {
-            issues: vec![issue("d", "done"), issue("e", "done")],
-            next_cursor: None,
-        });
+        let request = input.closed.begin_more().expect("a next page");
+        input
+            .finish_more(
+                &request,
+                Ok(ClosedPage {
+                    issues: vec![issue("d", "done"), issue("e", "done")],
+                    next_cursor: None,
+                }),
+            )
+            .unwrap();
         assert_eq!(input.tasks().len(), 3, "load more dedups against the board");
-        assert!(input.closed_next_cursor.is_none());
+        assert!(!input.closed.has_more());
+    }
+
+    // ---- done-history paging ------------------------------------------------
+
+    fn page(ids: &[&str], next: Option<&str>) -> ClosedPage {
+        ClosedPage {
+            issues: ids.iter().map(|id| issue(id, "done")).collect(),
+            next_cursor: next.map(str::to_string),
+        }
+    }
+
+    /// Fetch the next page, answered with `answer`; the cursor it asked for.
+    fn load_more(input: &mut BoardInput, answer: ClosedPage) -> String {
+        let request = input.closed.begin_more().expect("a next page");
+        input.finish_more(&request, Ok(answer)).unwrap();
+        request.cursor
+    }
+
+    fn history_ids(input: &BoardInput) -> Vec<String> {
+        input.tasks().into_iter().map(|tf| tf.task.id).collect()
+    }
+
+    #[test]
+    fn refreshes_never_rewind_the_cursor_past_a_loaded_page() {
+        let mut input = BoardInput::default();
+        let first = || page(&["a"], Some("p2"));
+        input.apply_closed(Some(first()));
+
+        assert_eq!(load_more(&mut input, page(&["b"], Some("p3"))), "p2");
+        input.apply_closed(Some(first()));
+        assert_eq!(load_more(&mut input, page(&["c"], Some("p4"))), "p3");
+        input.apply_closed(Some(first()));
+        assert_eq!(load_more(&mut input, page(&["d"], None)), "p4");
+        input.apply_closed(Some(first()));
+
+        assert_eq!(history_ids(&input), ["a", "b", "c", "d"]);
+        assert!(!input.closed.has_more(), "a refresh doesn't bring back the end");
+    }
+
+    #[test]
+    fn a_refresh_moves_the_cursor_while_only_page_one_is_loaded() {
+        let mut input = BoardInput::default();
+        input.apply_closed(Some(page(&["a"], Some("p2"))));
+        input.apply_closed(Some(page(&["a"], Some("p2-again"))));
+        assert_eq!(input.closed.next_cursor(), Some("p2-again"));
+    }
+
+    #[test]
+    fn an_empty_first_page_still_counts_as_landed() {
+        let mut input = BoardInput::default();
+        input.apply_closed(Some(page(&[], None)));
+        assert!(input.closed.landed());
+    }
+
+    #[test]
+    fn a_page_of_only_known_cards_still_moves_the_cursor_for_good() {
+        let mut input = BoardInput::default();
+        let first = || page(&["a"], Some("p2"));
+        input.apply_closed(Some(first()));
+        load_more(&mut input, page(&["a"], Some("p3")));
+        assert!(input.closed.more().is_empty(), "nothing new on that page");
+        input.apply_closed(Some(first()));
+        assert_eq!(input.closed.next_cursor(), Some("p3"), "and page 2 isn't fetched again");
+    }
+
+    #[test]
+    fn a_refresh_that_changes_page_one_resets_the_pages_and_the_cursor_together() {
+        let mut input = BoardInput::default();
+        input.apply_closed(Some(page(&["a", "b"], Some("p2"))));
+        load_more(&mut input, page(&["c"], Some("p3")));
+
+        // A card closed: "b" fell off page 1, onto no loaded page.
+        input.apply_closed(Some(page(&["new", "a"], Some("p2-new"))));
+
+        assert!(input.closed.more().is_empty());
+        assert_eq!(input.closed.next_cursor(), Some("p2-new"));
+        assert_eq!(load_more(&mut input, page(&["b", "c"], None)), "p2-new");
+        assert_eq!(history_ids(&input), ["new", "a", "b", "c"], "no hole");
+    }
+
+    #[test]
+    fn page_one_changing_only_inside_keeps_the_loaded_pages() {
+        let mut input = BoardInput::default();
+        input.apply_closed(Some(page(&["a", "b"], Some("p2"))));
+        load_more(&mut input, page(&["c"], Some("p3")));
+
+        // The same cards, reordered (one was edited), with a new title.
+        let mut edited = page(&["b", "a"], Some("p2-moved"));
+        edited.issues[0].task.title = "edited".into();
+        input.apply_closed(Some(edited));
+
+        assert_eq!(input.closed.more().len(), 1);
+        assert_eq!(input.closed.next_cursor(), Some("p3"));
+        assert_eq!(input.closed.first()[0].task.title, "edited", "the read still lands");
+    }
+
+    #[test]
+    fn one_fetch_runs_at_a_time_and_a_failure_keeps_the_cursor() {
+        let mut input = BoardInput::default();
+        input.apply_closed(Some(page(&["a"], Some("p2"))));
+        let request = input.closed.begin_more().expect("a next page");
+        assert!(input.closed.fetching());
+        assert!(input.closed.begin_more().is_none(), "one at a time");
+
+        assert_eq!(input.finish_more(&request, Err("boom".into())), Err("boom".to_string()));
+        assert!(!input.closed.fetching());
+        assert_eq!(input.closed.begin_more().expect("a retry").cursor, "p2");
+    }
+
+    #[test]
+    fn a_reset_abandons_the_fetch_in_flight() {
+        let mut input = BoardInput::default();
+        input.apply_closed(Some(page(&["a"], Some("p2"))));
+        let stale = input.closed.begin_more().expect("a next page");
+
+        input.apply_closed(Some(page(&["new"], Some("p2-new"))));
+        assert!(!input.closed.fetching(), "the next press fetches from the new page 1");
+        let current = input.closed.begin_more().expect("a next page");
+        assert_eq!(current.cursor, "p2-new");
+
+        // The abandoned answer drops, whichever way it went.
+        input.finish_more(&stale, Ok(page(&["old"], Some("p3-old")))).unwrap();
+        input.finish_more(&stale, Err("boom".into())).unwrap();
+        assert!(input.closed.more().is_empty());
+        assert_eq!(input.closed.next_cursor(), Some("p2-new"));
+        assert!(input.closed.fetching(), "and the current fetch is still running");
+
+        input.finish_more(&current, Ok(page(&["b"], None))).unwrap();
+        assert_eq!(history_ids(&input), ["new", "b"]);
+    }
+
+    #[test]
+    fn a_refresh_of_the_same_cards_keeps_the_fetch_in_flight() {
+        let mut input = BoardInput::default();
+        input.apply_closed(Some(page(&["a"], Some("p2"))));
+        let request = input.closed.begin_more().expect("a next page");
+        input.apply_closed(Some(page(&["a"], Some("p2"))));
+        assert!(input.closed.fetching());
+        input.finish_more(&request, Ok(page(&["b"], Some("p3")))).unwrap();
+        assert_eq!(input.closed.next_cursor(), Some("p3"));
     }
 
     // ---- drag and drop ------------------------------------------------------

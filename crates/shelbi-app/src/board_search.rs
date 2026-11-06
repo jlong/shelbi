@@ -701,7 +701,7 @@ mod tests {
         assert!(model.search.is_none());
         assert_eq!(model.columns.iter().map(|c| c.cards.len()).sum::<usize>(), 3);
         assert!(model.has_more_done, "the history cursor is untouched");
-        assert_eq!(input.closed_next_cursor.as_deref(), Some("c"));
+        assert_eq!(input.closed.next_cursor(), Some("c"));
     }
 
     #[test]
