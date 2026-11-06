@@ -239,6 +239,21 @@ There is no separate check-result read that a brief A-to-B-to-A head change
 could confuse. Incomplete, paginated, or moved-head results fail closed and
 the whole pinned flow must restart from a fresh probe.
 
+### The landing is pinned to what CI graded
+
+`probe`, `pr-create`, and `ci-watch` keep a record of each task's flow in
+`<project>/zen-flow/<task-id>.json`, so the `done` move that lands the task takes
+no extra flags. While Zen is on or paused, the workflow's `merge` action reads
+that record and refuses to land a probed task unless all of these hold:
+
+- `ci-watch` last reported `green` for the commit the latest probe pinned.
+- The task's open PR is the one CI graded, and its head is still that commit.
+- The base branch is still at the commit CI graded against.
+
+A refusal fails the move and merges nothing, and the card stays where it is. To
+recover, run `shelbi zen probe <task-id>` again and restart the flow. To override,
+merge the PR by hand: the move then finds it already merged and completes.
+
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
 | `<PR_NUMBER>` | integer | — | The PR number returned by `pr-create` (required). |

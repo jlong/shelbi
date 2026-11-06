@@ -360,6 +360,35 @@ fn accept_edge_merges_before_the_status_write_then_deletes_the_branch() {
 }
 
 #[test]
+fn leaving_handoff_ends_the_tasks_zen_flow_but_moving_within_it_does_not() {
+    use shelbi_state::zen_flow::{self, ZenFlowPhase, ZenFlowRecord};
+
+    let fx = Fixture::new("zen-flow");
+    let record = ZenFlowRecord {
+        task_id: "t".into(),
+        repository: "github.com/example/repo".into(),
+        repository_id: "R_1".into(),
+        base_branch: "main".into(),
+        base_sha: "base".into(),
+        integration_sha: Some("integration".into()),
+        head_sha: "head".into(),
+        published_head_sha: "head".into(),
+        phase: ZenFlowPhase::CiGreen { pr: 7 },
+    };
+    zen_flow::save(PROJECT, &record).unwrap();
+
+    // Arriving in review is still handoff: the flow carries on.
+    let store = fx.store(Column::in_progress());
+    move_issue_with(&store, &fx.runner(), &board_request("review"), &mut no_warnings).unwrap();
+    assert!(zen_flow::load(PROJECT, "t").unwrap().is_some());
+
+    // Bounced back to work: what the probe pinned no longer describes the task.
+    let store = fx.store(Column::review());
+    move_issue_with(&store, &fx.runner(), &board_request("todo"), &mut no_warnings).unwrap();
+    assert_eq!(zen_flow::load(PROJECT, "t").unwrap(), None);
+}
+
+#[test]
 fn board_and_cli_moves_run_the_same_transition_actions() {
     // Same edge, driven the way each surface drives it. Apart from the
     // caller's own labels (`reason=`, the merge event's fallback `workspace=`)

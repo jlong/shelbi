@@ -439,6 +439,17 @@ pub fn move_issue_with(
         }
     }
 
+    // A task leaving handoff by any other route than a landing (bounced back to
+    // work, canceled) has ended its Zen flow: what the probe pinned no longer
+    // describes it, and the next handoff probes afresh.
+    if moved.is_some()
+        && workflow.status(&to_status).map(|s| s.category) != Some(StatusCategory::Handoff)
+    {
+        if let Err(error) = shelbi_state::zen_flow::forget(project, id) {
+            tracing::warn!(task = id, %error, "Zen flow record not cleared");
+        }
+    }
+
     // Non-marker active→handoff move (an orchestrator heartbeat recovery, a
     // hand `shelbi issue move`, a board drag): release the worker's worktree
     // from the task branch exactly as the poller's ready-marker handoff does,
