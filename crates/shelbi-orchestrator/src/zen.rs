@@ -370,6 +370,7 @@ pub fn pr_create_at_head(
         };
         crate::pr_record::record_opened(project, &repo, task, branch, pr, None);
     }
+    crate::zen_flow::note_published(project, &task.id, pr, expected);
     Ok(pr)
 }
 
@@ -848,7 +849,7 @@ fn verify_task_branch_head(
 /// Resolve one branch through the exact remote target whose repository
 /// identity was frozen above. This avoids re-reading a mutable `origin`
 /// between provenance verification and publication.
-fn remote_branch_sha(
+pub(crate) fn remote_branch_sha(
     host: &Host,
     wt: &str,
     remote: &str,
@@ -967,6 +968,19 @@ pub fn ci_watch(
 }
 
 fn ci_watch_with_poll_interval(
+    project: &Project,
+    pr: u64,
+    expected: &PinnedPrIdentity,
+    timeout: Duration,
+    poll_interval: Duration,
+    settle_grace: Duration,
+) -> Result<CiVerdict> {
+    let verdict = poll_ci_until_verdict(project, pr, expected, timeout, poll_interval, settle_grace)?;
+    crate::zen_flow::note_ci_verdict(project, pr, expected, &verdict);
+    Ok(verdict)
+}
+
+fn poll_ci_until_verdict(
     project: &Project,
     pr: u64,
     expected: &PinnedPrIdentity,
@@ -1509,6 +1523,7 @@ fn apply_github_merge_reconcile(
     merged: &MergedPr,
 ) -> Result<bool> {
     crate::pr_record::note_finished(project, merged.pr, cand.task.branch.as_deref(), PrState::Merged);
+    crate::zen_flow::finish(project, &cand.task.id);
     let store = shelbi_state::resolve_issue_store(&project.name, &project.issue_tracker)?;
     let Some(shelbi_state::StatusMove { from, to, workflow: wf }) =
         store.move_status(&cand.task.id, &cand.to_column, "github-merge-reconcile")?
@@ -6873,6 +6888,438 @@ esac
             "a human-review-only umbrella task must never be auto-reconciled"
         );
     }
+
+    /// The whole pinned flow against a real bare origin: the real probe,
+    /// `pr-create`, `ci-watch`, and the gated merge a `done` move runs. Only
+    /// GitHub is stubbed, and it reads the PR's head and base from the origin,
+    /// so moving a commit there moves the PR the way a real push would.
+    mod landing {
+        use super::*;
+        use shelbi_state::zen_flow::{self, ZenFlowPhase};
+        use shelbi_state::ZenModeState;
+
+        use crate::transition::{run_gated_merge, GatedMerge};
+
+        const PR: u64 = 379;
+
+        struct Flow {
+            _lock: std::sync::MutexGuard<'static, ()>,
+            _env: EnvGuard,
+            stub: tempfile::TempDir,
+            log: PathBuf,
+            base: tempfile::TempDir,
+            origin: PathBuf,
+            _worktree: PathBuf,
+            project: Project,
+        }
+
+        fn install_stub(stub_home: &Path, origin: &Path) -> PathBuf {
+            let bin = stub_home.join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let log = stub_home.join("gh.log");
+            let q = shelbi_agent::shell_escape;
+            let script = format!(
+                r#"#!/bin/sh
+{json_guard}
+printf '%s\n' "$*" >> {log}
+head=$(git --git-dir={origin} rev-parse refs/heads/{branch})
+base=$(git --git-dir={origin} rev-parse refs/heads/main)
+case "$1 $2" in
+  "repo view")
+    printf '%s\n' {repo_id} {repo_name} https://github.com/example/repo
+    ;;
+  "pr list")
+    case "$*" in
+      *"--state open"*) [ -f {closed} ] || echo {pr} ;;
+    esac
+    ;;
+  "pr view")
+    case "$*" in
+      *mergeCommit*) echo "MERGED feedfacecafebeef" ;;
+      *"--json title"*) echo "reviewed feature title" ;;
+      *baseRefName*) echo main ;;
+    esac
+    ;;
+  "pr merge") ;;
+  "api graphql")
+    case "$*" in
+      *ShelbiPrIdentity*)
+        printf '%s\n' "$head" {branch} main "$base" {repo_id} {repo_name}
+        ;;
+      *ShelbiCiSnapshot*)
+        conclusion=SUCCESS
+        [ -f {failing} ] && conclusion=FAILURE
+        printf '{{"data":{{"repository":{{"id":"%s","pullRequest":{{"state":"OPEN","baseRefName":"main","baseRefOid":"%s","headRefOid":"%s","headRepository":{{"id":"%s"}},"mergeStateStatus":"CLEAN","commits":{{"nodes":[{{"commit":{{"oid":"%s","statusCheckRollup":{{"contexts":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"__typename":"CheckRun","name":"build","status":"COMPLETED","conclusion":"%s","detailsUrl":"https://example/build","isRequired":true}}]}}}}}}}}]}}}}}}}}}}\n' \
+          {repo_id} "$base" "$head" {repo_id} "$head" "$conclusion"
+        ;;
+      *) echo "unexpected gh graphql: $*" >&2; exit 64 ;;
+    esac
+    ;;
+  *) echo "unexpected gh: $*" >&2; exit 64 ;;
+esac
+"#,
+                json_guard = gh_json_field_guard(),
+                log = q(&log.to_string_lossy()),
+                origin = q(&origin.to_string_lossy()),
+                branch = q(TASK_BRANCH),
+                repo_id = q(ORIGIN_REPOSITORY_ID),
+                repo_name = q(ORIGIN_REPOSITORY_NAME),
+                closed = q(&stub_home.join("pr-closed").to_string_lossy()),
+                failing = q(&stub_home.join("ci-failing").to_string_lossy()),
+                pr = PR,
+            );
+            let gh = bin.join("gh");
+            std::fs::write(&gh, script).unwrap();
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(
+                stub_home.join(".profile"),
+                format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+            )
+            .unwrap();
+            log
+        }
+
+        impl Flow {
+            /// A task in review with Zen on. `stale_base` lands a commit on
+            /// main first, so the probe has to rebase and the local task ref
+            /// ends up apart from anything on origin.
+            fn new(stale_base: bool) -> Flow {
+                let lock = crate::test_lock::acquire();
+                let (base, origin, worktree) = setup_repo(true);
+                // Handoff released the branch; the slot no longer holds it.
+                run_git(&worktree, &["checkout", "-q", "--detach"]);
+                if stale_base {
+                    advance_origin_main_with_base_fix(base.path(), &origin);
+                }
+                // The hub checkout `ci-watch` and `merge` run from.
+                run_git(base.path(), &["init", "-q", "-b", "main"]);
+                run_git(base.path(), &["remote", "add", "origin", origin.to_str().unwrap()]);
+
+                let stub = tempfile::tempdir().unwrap();
+                let log = install_stub(stub.path(), &origin);
+                let env = EnvGuard::install(stub.path());
+                let mut project = project(base.path());
+                project.zen.checks.local = vec!["true".into()];
+                let flow = Flow {
+                    _lock: lock,
+                    _env: env,
+                    stub,
+                    log,
+                    base,
+                    origin,
+                    _worktree: worktree,
+                    project,
+                };
+                flow.set_zen(ZenModeState::On);
+                flow
+            }
+
+            fn set_zen(&self, zen_mode: ZenModeState) {
+                let mut state = shelbi_state::read_state(PROJECT_NAME).unwrap();
+                state.zen_mode = zen_mode;
+                shelbi_state::write_state(PROJECT_NAME, &state).unwrap();
+            }
+
+            fn probe(&self) -> PinnedPrIdentity {
+                let report = probe_in_workflow(
+                    &self.project,
+                    None,
+                    &task(),
+                    TASK_BRANCH,
+                    RebasePolicy::RebaseOntoDefault,
+                )
+                .unwrap();
+                report_identity(&report)
+            }
+
+            fn publish(&self, identity: &PinnedPrIdentity) {
+                let pr =
+                    pr_create_at_head(&self.project, PROJECT_NAME, &task(), "body", identity).unwrap();
+                assert_eq!(pr, PR);
+            }
+
+            fn watch(&self, identity: &PinnedPrIdentity) -> CiVerdict {
+                ci_watch_with_poll_interval(
+                    &self.project,
+                    PR,
+                    identity,
+                    Duration::from_secs(30),
+                    Duration::from_millis(1),
+                    Duration::ZERO,
+                )
+                .unwrap()
+            }
+
+            /// Everything the orchestrator does before it moves the card.
+            fn run_to_green(&self) -> PinnedPrIdentity {
+                let identity = self.probe();
+                self.publish(&identity);
+                assert_eq!(self.watch(&identity), CiVerdict::Green);
+                identity
+            }
+
+            /// What moving the card to `done` runs.
+            fn move_to_done(&self, actions: &str) -> Result<Option<GatedMerge>> {
+                let workflow = Workflow::from_yaml_str(&format!(
+                    r#"
+name: default
+statuses:
+  - {{ id: review, name: Review, category: handoff, owner: user, agent: orchestrator }}
+  - {{ id: done,   name: Done,   category: done,    owner: user }}
+transitions:
+  - {{ from: review, to: done, actions: [{actions}] }}
+"#
+                ))
+                .unwrap();
+                run_gated_merge(
+                    &self.project,
+                    PROJECT_NAME,
+                    &task(),
+                    "body",
+                    &workflow,
+                    "review",
+                    "done",
+                    "cli",
+                )
+            }
+
+            fn phase(&self) -> Option<ZenFlowPhase> {
+                zen_flow::load(PROJECT_NAME, &task().id)
+                    .unwrap()
+                    .map(|record| record.phase)
+            }
+
+            fn merge_calls(&self) -> Vec<String> {
+                gh_calls(&self.log)
+                    .lines()
+                    .filter(|line| line.starts_with("pr merge"))
+                    .map(str::to_string)
+                    .collect()
+            }
+
+            /// Push a commit onto `branch` on the origin, from outside the flow.
+            fn push_to_origin(&self, branch: &str) {
+                let clone = self.base.path().join("outside-push");
+                let _ = std::fs::remove_dir_all(&clone);
+                run_git(
+                    self.base.path(),
+                    &["clone", "-q", self.origin.to_str().unwrap(), clone.to_str().unwrap()],
+                );
+                run_git(&clone, &["config", "user.email", "test@example.com"]);
+                run_git(&clone, &["config", "user.name", "Test"]);
+                run_git(&clone, &["checkout", "-q", branch]);
+                std::fs::write(clone.join("outside.txt"), "not graded\n").unwrap();
+                run_git(&clone, &["add", "outside.txt"]);
+                run_git(&clone, &["commit", "-q", "-m", "outside push"]);
+                run_git(&clone, &["push", "-q", "origin", branch]);
+            }
+
+            fn origin_main(&self) -> String {
+                git_stdout(
+                    self.origin.parent().unwrap(),
+                    &["--git-dir", self.origin.to_str().unwrap(), "rev-parse", "refs/heads/main"],
+                )
+            }
+
+            /// The move refused for `expected` and nothing reached the base.
+            fn assert_refused(&self, actions: &str, expected: &str) {
+                let main_before = self.origin_main();
+                let error = self
+                    .move_to_done(actions)
+                    .expect_err("the done move must refuse")
+                    .to_string();
+                assert!(error.contains("refusing to land"), "{error}");
+                assert!(error.contains(expected), "{error}");
+                assert!(self.merge_calls().is_empty(), "{:?}", self.merge_calls());
+                assert_eq!(self.origin_main(), main_before, "nothing may reach the base");
+            }
+        }
+
+        #[test]
+        fn a_green_flow_lands_pinned_to_the_graded_commit_with_no_extra_flags() {
+            let flow = Flow::new(false);
+            let identity = flow.probe();
+
+            let record = zen_flow::load(PROJECT_NAME, &task().id).unwrap().unwrap();
+            assert_eq!(record.phase, ZenFlowPhase::Probed);
+            assert_eq!(record.integration_sha.as_deref(), Some(identity.integration_sha.as_str()));
+            assert_eq!(record.base_sha, identity.base_sha);
+            assert_eq!(record.head_sha, identity.head_sha);
+
+            flow.publish(&identity);
+            assert_eq!(flow.phase(), Some(ZenFlowPhase::Published { pr: PR }));
+            assert_eq!(flow.watch(&identity), CiVerdict::Green);
+            assert_eq!(flow.phase(), Some(ZenFlowPhase::CiGreen { pr: PR }));
+
+            flow.move_to_done("merge").unwrap().expect("the edge merges");
+
+            let calls = flow.merge_calls();
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            assert!(
+                calls[0].contains(&format!("--match-head-commit {}", identity.integration_sha)),
+                "{calls:?}"
+            );
+            assert!(calls[0].contains("--repo github.com/example/repo"), "{calls:?}");
+            assert_eq!(flow.phase(), None, "landing ends the flow");
+        }
+
+        #[test]
+        fn a_rebased_flow_lands_through_a_workflow_that_pushes_before_merging() {
+            // `[push_branch, merge]` is the edge the Zen prompt describes. After
+            // a rebasing probe the local ref is the rebased head and origin holds
+            // its squash. They diverge by design, and the push must not fail the
+            // move or replace the commit CI graded.
+            let flow = Flow::new(true);
+            let identity = flow.run_to_green();
+            assert_ne!(identity.head_sha, identity.published_head_sha.clone().unwrap());
+
+            flow.move_to_done("push_branch, merge").unwrap().expect("the edge merges");
+
+            assert_eq!(remote_head(&flow.origin), identity.integration_sha);
+            let calls = flow.merge_calls();
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            assert!(calls[0].contains(&identity.integration_sha), "{calls:?}");
+        }
+
+        #[test]
+        fn a_pr_head_moved_after_green_ci_refuses_the_done_move() {
+            let flow = Flow::new(false);
+            let identity = flow.run_to_green();
+
+            flow.push_to_origin(TASK_BRANCH);
+            assert_ne!(remote_head(&flow.origin), identity.integration_sha);
+
+            flow.assert_refused("merge", "head moved after CI went green");
+            assert_eq!(
+                flow.phase(),
+                Some(ZenFlowPhase::CiGreen { pr: PR }),
+                "a refusal keeps the record, so the next try refuses too"
+            );
+            flow.assert_refused("merge", "head moved after CI went green");
+        }
+
+        #[test]
+        fn a_base_moved_after_green_ci_refuses_the_done_move() {
+            let flow = Flow::new(false);
+            flow.run_to_green();
+
+            flow.push_to_origin("main");
+
+            flow.assert_refused("merge", "base `main` moved after CI went green");
+        }
+
+        #[test]
+        fn a_move_before_ci_went_green_is_refused() {
+            let flow = Flow::new(false);
+            let identity = flow.probe();
+            flow.assert_refused("merge", "CI hasn't reported green");
+
+            flow.publish(&identity);
+            flow.assert_refused("merge", "CI hasn't reported green");
+        }
+
+        #[test]
+        fn red_ci_takes_back_an_earlier_green() {
+            let flow = Flow::new(false);
+            let identity = flow.run_to_green();
+
+            std::fs::write(flow.stub.path().join("ci-failing"), "").unwrap();
+            assert!(matches!(flow.watch(&identity), CiVerdict::Red { .. }));
+
+            assert_eq!(flow.phase(), Some(ZenFlowPhase::Published { pr: PR }));
+            flow.assert_refused("merge", "CI hasn't reported green");
+        }
+
+        #[test]
+        fn a_new_probe_takes_back_an_earlier_green() {
+            let flow = Flow::new(false);
+            let graded = flow.run_to_green();
+
+            let repinned = flow.probe();
+            assert_ne!(repinned.integration_sha, graded.integration_sha);
+
+            assert_eq!(flow.phase(), Some(ZenFlowPhase::Probed));
+            flow.assert_refused("merge", "CI hasn't reported green");
+        }
+
+        #[test]
+        fn a_watch_holding_an_older_probes_identity_advances_nothing() {
+            let flow = Flow::new(false);
+            let older = flow.probe();
+            flow.publish(&older);
+            let newer = flow.probe();
+            assert_ne!(older.integration_sha, newer.integration_sha);
+
+            // The PR still holds the older commit, so CI can grade it green.
+            assert_eq!(flow.watch(&older), CiVerdict::Green);
+
+            assert_eq!(flow.phase(), Some(ZenFlowPhase::Probed));
+            flow.assert_refused("merge", "CI hasn't reported green");
+        }
+
+        #[test]
+        fn a_flow_whose_pr_is_gone_does_not_fall_through_to_a_hub_side_merge() {
+            let flow = Flow::new(false);
+            flow.run_to_green();
+
+            std::fs::write(flow.stub.path().join("pr-closed"), "").unwrap();
+
+            flow.assert_refused("merge", "no longer open");
+        }
+
+        #[test]
+        fn zen_off_hands_the_merge_back_to_the_human() {
+            let flow = Flow::new(false);
+            let identity = flow.probe();
+            flow.publish(&identity);
+            flow.set_zen(ZenModeState::Off);
+
+            flow.move_to_done("merge").unwrap().expect("the edge merges");
+
+            let calls = flow.merge_calls();
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            assert!(!calls[0].contains("--match-head-commit"), "{calls:?}");
+        }
+
+        #[test]
+        fn paused_zen_still_pins_a_flow_already_on_the_track() {
+            let flow = Flow::new(false);
+            let identity = flow.run_to_green();
+            flow.set_zen(ZenModeState::Paused);
+
+            flow.move_to_done("merge").unwrap().expect("the edge merges");
+
+            assert!(
+                flow.merge_calls()[0].contains(&identity.integration_sha),
+                "{:?}",
+                flow.merge_calls()
+            );
+        }
+
+        #[test]
+        fn a_task_zen_never_probed_merges_as_it_always_did() {
+            let flow = Flow::new(false);
+
+            flow.move_to_done("merge").unwrap().expect("the edge merges");
+
+            let calls = flow.merge_calls();
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            assert!(!calls[0].contains("--match-head-commit"), "{calls:?}");
+        }
+
+        #[test]
+        fn the_read_only_preview_probe_leaves_the_flow_alone() {
+            let flow = Flow::new(false);
+            let preview = || probe(&flow.project, &task(), TASK_BRANCH).unwrap();
+
+            preview();
+            assert_eq!(flow.phase(), None, "a preview starts no flow");
+
+            flow.run_to_green();
+            preview();
+            assert_eq!(flow.phase(), Some(ZenFlowPhase::CiGreen { pr: PR }));
+        }
+    }
 }
 
 // ===========================================================================
@@ -7202,7 +7649,16 @@ pub fn probe_in_workflow(
         ))),
         (Err(probe_err), Ok(())) => Err(probe_err),
         (Ok(_), Err(cleanup_err)) => Err(cleanup_err),
-        (Ok(report), Ok(())) => Ok(report),
+        (Ok(report), Ok(())) => {
+            // Only the live flow's probe starts a flow. `AsIs` is the read-only
+            // preview (`zen dry-run`), which must not disturb a flow in progress.
+            // Failing the probe on a failed write keeps a flow from running
+            // without the record that pins its landing.
+            if policy == RebasePolicy::RebaseOntoDefault {
+                crate::zen_flow::record_probe(project, &task.id, &report)?;
+            }
+            Ok(report)
+        }
     }
 }
 
