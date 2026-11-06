@@ -3466,6 +3466,10 @@ impl Run {
             .update(&mut self.cx, |w, window, cx| w.offscreen_open_task(IN_PROGRESS[0].0, window, cx))
             .unwrap();
         self.settle(handle);
+        // The pane's slide runs on the executor's clock, not the one `settle`
+        // moves.
+        self.cx.advance_clock(crate::views::column_swap::SLIDE);
+        self.settle(handle);
         handle
     }
 
