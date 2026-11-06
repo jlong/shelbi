@@ -39,7 +39,13 @@ use anyhow::Result;
 pub enum DaemonCmd {
     /// (default) Bind the hub socket and accept worker messages in the
     /// foreground until killed or until no project is open.
-    Run,
+    Run {
+        /// Wait a bounded time for the daemon being replaced to release the bind
+        /// lock instead of refusing at once. Internal: how a daemon that lost its
+        /// macOS login session hands over to its re-exec'd successor.
+        #[arg(long, hide = true)]
+        takeover: bool,
+    },
     /// Print a short human-readable status from the single-instance lock and
     /// the socket (no supervisor involved).
     Status,
@@ -55,7 +61,8 @@ pub enum DaemonCmd {
 
 pub fn run(cmd: Option<DaemonCmd>) -> Result<()> {
     match cmd {
-        None | Some(DaemonCmd::Run) => serve::run_foreground(),
+        None | Some(DaemonCmd::Run { takeover: false }) => serve::run_foreground(),
+        Some(DaemonCmd::Run { takeover: true }) => serve::run_takeover(),
         Some(DaemonCmd::Status) => lifecycle::status(),
         Some(DaemonCmd::Stop) => lifecycle::stop(),
         Some(DaemonCmd::Restart) => lifecycle::restart(),

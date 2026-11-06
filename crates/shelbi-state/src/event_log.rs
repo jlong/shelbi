@@ -2121,9 +2121,9 @@ pub fn append_project_event(project: &str, action: &str, reason: &str) -> Result
 /// process itself, not one project's board). Used by the macOS login-session
 /// health monitor: `session-lost`, `session-recovered`,
 /// `session-recovery-attempting`, `session-recovery-failed`,
-/// `session-recovery-gave-up`. Both fields fold to single tokens so the line
-/// stays parseable. Written directly (not via the socket) because the caller is
-/// the daemon itself.
+/// `session-recovery-gave-up`, `session-lost-marker-retired`. Both fields fold
+/// to single tokens so the line stays parseable. Written directly (not via the
+/// socket) because the caller is the daemon itself.
 pub fn append_daemon_event(action: &str, reason: &str) -> Result<()> {
     let ts = Utc::now().to_rfc3339();
     let action = sanitize_reason(action);
