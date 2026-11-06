@@ -1852,6 +1852,19 @@ fn rev_list_count(host: &Host, wt: &str, range: &str) -> Option<usize> {
     String::from_utf8_lossy(&out.stdout).trim().parse().ok()
 }
 
+/// True only when `branch` is positively confirmed to carry no commits over
+/// `base_ref`. An unresolvable range answers `false`, so a caller deciding to
+/// skip the push never skips it on a transport hiccup.
+pub fn branch_has_no_commits_ahead(
+    host: &Host,
+    worktree: &Path,
+    branch: &str,
+    base_ref: &str,
+) -> bool {
+    let wt = worktree.to_string_lossy();
+    rev_list_count(host, &wt, &format!("{base_ref}..refs/heads/{branch}")) == Some(0)
+}
+
 /// Verify a workspace's worktree is safe to hand off *before* the poller pushes
 /// its branch and runs the handoff edge's `open_pr` / `merge` actions.
 ///
@@ -5883,6 +5896,10 @@ enum HandoffPlan {
     /// The default developer flow: rebase onto the base branch, then write the
     /// ready marker to hand off forward. The overwhelming common case.
     Developer,
+    /// A worker on a workflow that produces no branch
+    /// ([`shelbi_core::Workflow::produces_no_branch`]): just the ready marker,
+    /// with no commit or rebase asked of it.
+    NoBranch,
     /// A custom agent-owned active **gate** (e.g. `adversarial-review`) sitting
     /// between the developer's active status and the human handoff status. It
     /// *reviews* the branch — it never rebases or resumes development — and
@@ -5919,7 +5936,8 @@ enum HandoffPlan {
 ///   contract ([`HandoffPlan::Gate`]); everything else — and any failure to
 ///   load the task or its workflow — gets the default developer handoff
 ///   ([`HandoffPlan::Developer`]), so the common path is byte-identical and
-///   degradations are safe.
+///   degradations are safe. The one exception is a workflow that produces no
+///   branch, whose worker gets [`HandoffPlan::NoBranch`].
 fn classify_handoff(project: &Project, workspace: &WorkspaceSpec, task_id: &str) -> HandoffPlan {
     if project.effective_tags(workspace).contains("review") {
         return HandoffPlan::Serve;
@@ -5939,7 +5957,11 @@ fn classify_handoff(project: &Project, workspace: &WorkspaceSpec, task_id: &str)
     };
     let current = tf.task.column.as_str();
     if !workflow.is_agent_active_gate(current) {
-        return HandoffPlan::Developer;
+        return if workflow.produces_no_branch() {
+            HandoffPlan::NoBranch
+        } else {
+            HandoffPlan::Developer
+        };
     }
     match (
         workflow.gate_pass_status(current),
@@ -6040,6 +6062,27 @@ fn compose_prompt(
         PathBuf::from(s)
     };
     let marker_tmp_esc = shelbi_agent::shell_escape(&marker_tmp.to_string_lossy());
+    if matches!(handoff, HandoffPlan::NoBranch) {
+        return format!(
+            "{body_section}\n\n\
+             ---\n\
+             You are working on task `{task_id}`. Its workflow produces no branch: \
+             no edge pushes, opens a PR, or merges, so the handoff needs no commits \
+             and no rebase. Your worktree sits on `{branch}` only so you have a \
+             checkout. If you do commit something there, it is still pushed at \
+             handoff.\n\
+             \n\
+             When the deliverable is finished, signal that it's ready for handoff \
+             by writing the task id to the ready marker file:\n\
+             \n\
+             mkdir -p {marker_dir_esc} && printf '%s\\n' {id_esc} > {marker_tmp_esc} && mv {marker_tmp_esc} {marker_esc}\n\
+             \n\
+             The hub watches for this file and moves your task to the review \
+             column on its next poll. Write the marker once; you can keep \
+             working in this pane and talk to the user afterward without \
+             affecting the handoff.{polling_section}"
+        );
+    }
     format!(
         "{body_section}\n\n\
          ---\n\
@@ -8251,6 +8294,84 @@ mod tests {
         );
         assert!(prompt.contains("# Task fix-login"));
         assert!(prompt.contains(".shelbi/shelbi-ready"));
+    }
+
+    #[test]
+    fn a_no_branch_worker_is_asked_for_the_marker_and_no_rebase() {
+        let marker = PathBuf::from("/work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready");
+        let prompt = compose_prompt(
+            "write-plan",
+            "shelbi/write-plan",
+            "Write the plan.",
+            &marker,
+            "main",
+            "myapp",
+            false,
+            &HandoffPlan::NoBranch,
+        );
+        assert!(prompt.contains("Write the plan."));
+        assert!(prompt.contains("/work/myapp/.shelbi/wt/alice/.shelbi/shelbi-ready"));
+        assert!(prompt.contains("needs no commits"));
+        assert!(!prompt.contains("git rebase"), "{prompt}");
+    }
+
+    #[test]
+    fn classify_handoff_gives_only_a_no_branch_workflow_the_no_branch_plan() {
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("no-branch-plan");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let project = fixture_project();
+        let wf_dir = shelbi_state::workflows_dir("myapp").unwrap();
+        std::fs::create_dir_all(&wf_dir).unwrap();
+        shelbi_state::save_project_statuses("myapp", &shelbi_core::default_project_statuses())
+            .unwrap();
+        shelbi_state::materialize_default_agents("myapp").unwrap();
+        for (name, edge) in [
+            ("plan", "{ from: in-progress, to: review }"),
+            ("app", "{ from: in-progress, to: review, actions: [push_branch, open_pr] }"),
+        ] {
+            std::fs::write(
+                wf_dir.join(format!("{name}.yaml")),
+                format!(
+                    "name: {name}\nstatuses:\n  \
+                     - {{ id: in-progress, owner: agent, agent: developer }}\n  \
+                     - {{ id: review,      owner: user }}\n\
+                     transitions:\n  - {edge}\n"
+                ),
+            )
+            .unwrap();
+            let task = shelbi_core::Issue {
+                id: name.into(),
+                title: name.into(),
+                column: shelbi_core::Column::in_progress(),
+                priority: 0,
+                assigned_to: Some("alice".into()),
+                workflow: Some(name.into()),
+                branch: Some(format!("shelbi/{name}")),
+                pr: None,
+                depends_on: Vec::new(),
+                prefers_machine: None,
+                zen: None,
+                launch: None,
+                params: BTreeMap::new(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            shelbi_state::save_task("myapp", &task, "").unwrap();
+        }
+
+        let alice = project.workspace("alice").unwrap();
+        let plan = classify_handoff(&project, alice, "plan");
+        let app = classify_handoff(&project, alice, "app");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert_eq!(plan, HandoffPlan::NoBranch);
+        assert_eq!(app, HandoffPlan::Developer);
     }
 
     #[test]

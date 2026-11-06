@@ -2957,6 +2957,13 @@ fn maybe_apply_ready_handoff(
                 return;
             }
 
+            // A workflow that produces no branch, on a branch with nothing on
+            // it, has no git work to hand off: publishing it would only leave
+            // an empty branch on origin. Real commits still go through the
+            // rebase and push below, so nothing a worker committed is stranded.
+            let no_branch_work =
+                handoff_has_no_branch_work(project, workspace, machine, host, &workflow, &tf.task);
+
             // Auto-rebase the workspace's branch onto its base branch (the
             // branch the work merges into — see
             // `rebase_workspace_branch_before_handoff`) before the column
@@ -2965,7 +2972,9 @@ fn maybe_apply_ready_handoff(
             // (rather than blocking on it) so the
             // row showing up already reflects the rewritten branch; a conflict
             // is logged but doesn't block the handoff.
-            rebase_workspace_branch_before_handoff(project, workspace, machine, host, &task_id);
+            if !no_branch_work {
+                rebase_workspace_branch_before_handoff(project, workspace, machine, host, &task_id);
+            }
 
             // Push the workspace's (possibly rebased/amended) local branch tip
             // to origin BEFORE the column move, force-with-lease when the branch
@@ -2976,7 +2985,9 @@ fn maybe_apply_ready_handoff(
             // leave the marker in place (so we retry next tick) and return
             // WITHOUT moving the task, rather than silently advancing to review
             // on the stale tip. The push step logs its own event either way.
-            if !push_workspace_branch_before_handoff(project, workspace, machine, host, &task_id) {
+            if !no_branch_work
+                && !push_workspace_branch_before_handoff(project, workspace, machine, host, &task_id)
+            {
                 tracing::warn!(
                     workspace = %workspace.name,
                     task = %task_id,
@@ -3761,6 +3772,36 @@ fn verify_handoff_or_refuse(
         "ready handoff refused: worktree not safe to hand off; leaving card in-progress with marker in place",
     );
     false
+}
+
+/// True when a ready handoff has no git work to do: the task's workflow produces
+/// no branch ([`Workflow::produces_no_branch`]) and the branch is confirmed to
+/// carry nothing over its base. Anything short of that answers `false`, which
+/// keeps the normal rebase and push, so a workflow whose worker did commit still
+/// publishes its work.
+fn handoff_has_no_branch_work(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    machine: &shelbi_core::Machine,
+    host: &shelbi_core::Host,
+    workflow: &Workflow,
+    task: &shelbi_core::Issue,
+) -> bool {
+    if !workflow.produces_no_branch() {
+        return false;
+    }
+    let Ok(branch) = crate::branch::branch_name_for_task(project, Some(workflow), task) else {
+        return false;
+    };
+    let base_branch = workflow
+        .resolve_git(&task.string_params())
+        .ok()
+        .flatten()
+        .and_then(|g| g.base_branch)
+        .unwrap_or_else(|| project.default_branch.clone());
+    let worktree = crate::workspace::workspace_worktree(machine, workspace);
+    let base_ref = crate::workspace::fetch_origin_base_ref(host, &worktree, &base_branch);
+    crate::workspace::branch_has_no_commits_ahead(host, &worktree, &branch, &base_ref)
 }
 
 /// The in-pane message a worker gets when its ready handoff is refused — names
@@ -10579,6 +10620,229 @@ transitions:
             std::fs::read_to_string(&msg_log).unwrap_or_default().matches("Handoff refused").count(),
             1,
             "the worker must not be re-nudged every tick",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A plan-shaped workflow: no edge pushes, opens a PR, or merges.
+    const NO_BRANCH_WORKFLOW: &str = r#"
+name: plan
+statuses:
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user }
+  - { id: done,        owner: user }
+  - { id: canceled,    owner: user }
+transitions:
+  - { from: in-progress, to: canceled, actions: [delete_branch] }
+"#;
+
+    /// The events logged for `task`.
+    fn task_events(task: &str) -> Vec<String> {
+        std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(&format!(" task={task} ")))
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_no_branch_issue_reaches_review_with_zero_commits_and_done_without_a_merge() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-nobranch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let branch = "shelbi/write-plan";
+        let (project, wt, bare) = push_fixture(&home, branch);
+        assert!(git_in(&wt, &["reset", "-q", "--hard", "main"]).status.success());
+        shelbi_state::save_project(&project).unwrap();
+        write_project_workflow("plan", NO_BRANCH_WORKFLOW);
+
+        let mut task = in_progress_task("write-plan", "alpha");
+        task.workflow = Some("plan".into());
+        task.branch = Some(branch.into());
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+        let marker = write_marker(&project, "write-plan\n");
+
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &SessionTarget::slot("s", "w"),
+        );
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "write-plan").unwrap().task.column,
+            Column::review(),
+            "events: {:?}",
+            task_events("write-plan"),
+        );
+        assert!(!marker.exists(), "the handoff consumes the marker");
+        let on_origin = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&bare)
+            .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+            .output()
+            .unwrap();
+        assert!(!on_origin.status.success(), "no empty branch may reach origin");
+        let handoff = task_events("write-plan");
+        assert!(
+            !handoff.iter().any(|l| l.contains(" status=refused ") || l.contains(" push task=")),
+            "{handoff:?}",
+        );
+
+        // Accepting it crosses an edge with no merge, so nothing tries to merge.
+        let outcome = crate::transition::move_issue(
+            &crate::transition::MoveRequest {
+                project: "demo",
+                id: "write-plan",
+                to: "done",
+                reason: "user:cli",
+                workspace_fallback: "cli",
+                skip_transition_actions: false,
+            },
+            &mut |warning| panic!("unexpected warning: {warning:?}"),
+        )
+        .unwrap();
+        assert_eq!(outcome.column, Column::done());
+        assert_eq!(outcome.merge, None);
+        assert_eq!(
+            shelbi_state::load_task("demo", "write-plan").unwrap().task.column,
+            Column::done(),
+        );
+        let events = task_events("write-plan");
+        assert!(!events.iter().any(|l| l.contains(" merge ")), "{events:?}");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_commit_on_a_no_branch_workflow_is_still_pushed_at_handoff() {
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-nobranch-commit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let branch = "shelbi/write-plan";
+        let (project, wt, bare) = push_fixture(&home, branch);
+        write_project_workflow("plan", NO_BRANCH_WORKFLOW);
+        let mut task = in_progress_task("write-plan", "alpha");
+        task.workflow = Some("plan".into());
+        task.branch = Some(branch.into());
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+        write_marker(&project, "write-plan\n");
+
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &SessionTarget::slot("s", "w"),
+        );
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "write-plan").unwrap().task.column,
+            Column::review(),
+        );
+        assert_eq!(
+            rev(&bare, &format!("refs/heads/{branch}")),
+            rev(&wt, "HEAD"),
+            "the worker's commit must reach origin",
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_workflow_that_pushes_at_handoff_still_refuses_a_no_commit_handoff() {
+        // The `app` shape: `in-progress -> review` pushes and opens a PR, so the
+        // no-branch carve-out must not reach it.
+        if !git_available() {
+            eprintln!("skipping: git not on PATH");
+            return;
+        }
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-app-refuses-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let branch = "shelbi/write-plan";
+        let (project, wt, _bare) = push_fixture(&home, branch);
+        assert!(git_in(&wt, &["reset", "-q", "--hard", "main"]).status.success());
+        write_project_workflow(
+            "app",
+            r#"
+name: app
+statuses:
+  - { id: todo,        owner: agent, agent: orchestrator }
+  - { id: in-progress, owner: agent, agent: developer }
+  - { id: review,      owner: user }
+  - { id: done,        owner: user }
+transitions:
+  - { from: in-progress, to: review, actions: [push_branch, open_pr] }
+  - { from: review, to: done, actions: [push_branch, merge] }
+"#,
+        );
+        let mut task = in_progress_task("write-plan", "alpha");
+        task.workflow = Some("app".into());
+        task.branch = Some(branch.into());
+        shelbi_state::save_task("demo", &task, "body").unwrap();
+        let marker = write_marker(&project, "write-plan\n");
+
+        maybe_apply_ready_handoff(
+            &project,
+            &project.workspaces[0],
+            &project.machines[0],
+            &Host::Local,
+            &SessionTarget::slot("s", "w"),
+        );
+
+        assert_eq!(
+            shelbi_state::load_task("demo", "write-plan").unwrap().task.column,
+            Column::in_progress(),
+        );
+        assert!(marker.exists(), "the refusal keeps the marker");
+        let events = task_events("write-plan");
+        assert!(
+            events.iter().any(|l| l.contains(" status=refused ")
+                && l.contains(" reason=no-commits-ahead")),
+            "{events:?}",
         );
 
         std::env::remove_var("SHELBI_HOME");

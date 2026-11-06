@@ -531,6 +531,31 @@ impl Workflow {
         }
     }
 
+    /// True iff this workflow declares work that produces no branch: its
+    /// `transitions:` block has no edge that pushes, opens a PR, merges, or
+    /// restacks. Its deliverable lives outside the repo (a plan written to a
+    /// document store, say), so a worker hands off with zero commits and the
+    /// review card has nothing to merge.
+    ///
+    /// Judged across the whole workflow, not one edge: a pure status-move
+    /// handoff followed by `review -> done: [merge]` still needs a branch.
+    /// `close_pr` and `delete_branch` only clean up, so they don't count. A
+    /// workflow with no `transitions:` block is the legacy implicit flow, which
+    /// pushes and opens a PR regardless, so it is never branch-free.
+    pub fn produces_no_branch(&self) -> bool {
+        self.transitions.as_ref().is_some_and(|ts| {
+            !ts.iter().flat_map(|t| &t.actions).any(|a| {
+                matches!(
+                    a,
+                    TransitionAction::PushBranch
+                        | TransitionAction::OpenPr
+                        | TransitionAction::Merge
+                        | TransitionAction::Restack
+                )
+            })
+        })
+    }
+
     /// Full semantic check. Run after deserialization to catch the
     /// cross-reference errors that serde alone can't see: duplicate
     /// status ids, an `initial_status` pointing at nothing, a transition
@@ -2958,6 +2983,38 @@ transitions:
             .map(|t| t.to.as_str())
             .collect();
         assert_eq!(outgoing, vec!["Done"]);
+    }
+
+    #[test]
+    fn produces_no_branch_reads_every_edge_of_the_workflow() {
+        let shaped = |edges: &str| {
+            Workflow::from_yaml_str(&format!(
+                "name: w\nstatuses:\n  \
+                 - {{ name: Doing,  category: active,   owner: agent, agent: developer }}\n  \
+                 - {{ name: Review, category: handoff,  owner: user }}\n  \
+                 - {{ name: Done,   category: done,     owner: user }}\n  \
+                 - {{ name: Gone,   category: archived, owner: user }}\n\
+                 transitions:\n{edges}"
+            ))
+            .unwrap()
+        };
+        // The plan shape, with and without an edge that only cleans up.
+        assert!(shaped("  - { from: Doing, to: Review }\n  - { from: Review, to: Done }\n")
+            .produces_no_branch());
+        assert!(shaped("  - { from: Doing, to: Gone, actions: [close_pr, delete_branch] }\n")
+            .produces_no_branch());
+        // Any edge doing branch work rules it out, even past the handoff edge.
+        for action in ["push_branch", "open_pr", "merge", "restack"] {
+            let edges = format!(
+                "  - {{ from: Doing, to: Review }}\n  \
+                 - {{ from: Review, to: Done, actions: [{action}] }}\n"
+            );
+            assert!(!shaped(&edges).produces_no_branch(), "{action} needs a branch");
+        }
+        // The shipped workflows and the legacy implicit flow all need one.
+        assert!(!task_workflow().produces_no_branch());
+        assert!(!subtask_workflow().produces_no_branch());
+        assert!(!default_workflow().produces_no_branch());
     }
 
     #[test]
