@@ -445,7 +445,7 @@ mod tests {
     use super::*;
 
     fn chord(code: Key) -> KeyChord {
-        KeyChord { code, mods: Mods::NONE }
+        KeyChord::new(code, Mods::NONE)
     }
 
     #[test]
@@ -472,7 +472,7 @@ mod tests {
         }
         assert!(t.edit(chord(Key::Enter), false, 5));
         assert!(!t.edit(chord(Key::Esc), false, 5));
-        assert!(!t.edit(KeyChord { code: Key::Char('s'), mods: Mods::CONTROL }, false, 5));
+        assert!(!t.edit(KeyChord::new(Key::Char('s'), Mods::CONTROL), false, 5));
         assert_eq!(t.text(), "hi\n");
         let mut name = TextArea::default();
         assert!(!name.edit(chord(Key::Enter), true, 5), "Enter is the caller's on one line");

@@ -31,6 +31,8 @@ pub struct FarServices {
     pub machines: MachineService,
     pub readiness: ReadinessService,
     pub spawn_editor: Arc<SpawnEditor>,
+    /// How a diff view's `gY` reaches an agent's session here.
+    pub agent_send: shelbi_app::diff::AgentSend,
 }
 
 impl FarServices {
@@ -41,6 +43,7 @@ impl FarServices {
             machines: crate::pool_admin::machine_service(),
             readiness: crate::machine_readiness::service(),
             spawn_editor: Arc::new(spawn_editor),
+            agent_send: crate::agent_send::service(),
         }
     }
 }
@@ -68,6 +71,12 @@ pub fn answer_with(services: &FarServices, project: &str, request: Request) -> R
             Reply::Recorded
         }
         Request::OpenEditor { key, file } => Reply::Editor(open_editor(services, project, &key, &file)),
+        // The request's project is the connection's: a window asks about the
+        // project it's on.
+        Request::Diff(mut req) => {
+            req.target.project = project.to_string();
+            Reply::Diff(shelbi_app::diff::answer(&req, services.agent_send.clone()))
+        }
     }
 }
 
@@ -187,6 +196,7 @@ mod tests {
             machines: crate::pool_admin::machine_service(),
             readiness: crate::machine_readiness::service(),
             spawn_editor: Arc::new(|_, _, _| panic!("never spawned")),
+            agent_send: crate::agent_send::service(),
         };
         let reply = answer_with(
             &services,

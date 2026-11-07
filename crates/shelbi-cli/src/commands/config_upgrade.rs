@@ -694,6 +694,23 @@ fn sniff_developer_instructions(entry: &InventoryEntry, text: &str, out: &mut Ve
         ));
     }
 
+    // Rule 2: how to answer a review comment where the reviewer reads it. The
+    // prompt carrying the comments says so too, so a project without this still
+    // works: this is what teaches it ahead of time.
+    if !lower.contains("diff comment reply") {
+        out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            "DEV_INSTRUCTIONS_DIFF_COMMENT_REPLY_MISSING",
+            "developer agent prose doesn't teach answering a diff view review comment with \
+             `shelbi diff comment reply`, so a reviewer's thread goes unanswered where they read it",
+            "Add an `Answering review comments` section: `shelbi diff comment list --task <id>` and \
+             `shelbi diff comment reply --task <id> -i <thread> \"...\"` answer a thread inline, \
+             mirroring the shipped default template.",
+            Location { line: 1, column: 1 },
+        ));
+    }
+
     // The MSRV-check reminder is Rust-gated, so it can't be decided from this
     // surface alone — it runs as a cross-surface sniffer ([`sniff_dev_msrv_guidance`])
     // that correlates the dev prose with whether the project is a Rust track.
@@ -3046,6 +3063,11 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              fresh-primary base discipline can't be merged in mechanically without risking \
              local edits — the orchestrator refreshes its own copy instead."
         }
+        "DEV_INSTRUCTIONS_DIFF_COMMENT_REPLY_MISSING" => {
+            "These are prose instructions a project may have forked and customized, so the \
+             review-comment guidance can't be merged in mechanically without risking local \
+             edits — the orchestrator refreshes its own copy instead."
+        }
         "AGENT_INSTRUCTIONS_PR_BODY_PATH_MISSING" => {
             "These are prose instructions a project may have written or customized itself, so \
              the PR body path can't be merged in mechanically without risking local edits — the \
@@ -4207,6 +4229,27 @@ mod tests {
         assert!(
             find(&out, "DEV_INSTRUCTIONS_FRESH_PRIMARY_MISSING").is_none(),
             "shipped default developer template trips the fresh-primary sniffer: {:?}",
+            codes(&out)
+        );
+    }
+
+    #[test]
+    fn developer_instructions_without_the_comment_reply_are_needs_judgment() {
+        let mut out = Vec::new();
+        sniff_developer_instructions(&dev_instr_entry(), "# Developer\n\nWrite the ready marker.\n", &mut out);
+        let f = find(&out, "DEV_INSTRUCTIONS_DIFF_COMMENT_REPLY_MISSING").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty(), "needs-judgment finding needs a rationale");
+
+        let mut out = Vec::new();
+        sniff_developer_instructions(&dev_instr_entry(), "Use `shelbi diff comment reply` to answer.\n", &mut out);
+        assert!(find(&out, "DEV_INSTRUCTIONS_DIFF_COMMENT_REPLY_MISSING").is_none());
+
+        let mut out = Vec::new();
+        sniff_developer_instructions(&dev_instr_entry(), shelbi_state::DEFAULT_DEVELOPER_INSTRUCTIONS, &mut out);
+        assert!(
+            find(&out, "DEV_INSTRUCTIONS_DIFF_COMMENT_REPLY_MISSING").is_none(),
+            "the shipped template trips its own sniffer: {:?}",
             codes(&out)
         );
     }

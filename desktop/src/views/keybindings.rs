@@ -156,7 +156,7 @@ impl KeybindingsPage {
     fn settle(&mut self, outcome: KeyOutcome, cx: &mut Context<Self>) -> bool {
         match outcome {
             KeyOutcome::Ignored => return false,
-            KeyOutcome::Cancelled | KeyOutcome::Conflict => {}
+            KeyOutcome::Cancelled | KeyOutcome::Conflict | KeyOutcome::Waiting => {}
             KeyOutcome::Save(change) => {
                 self.error = None;
                 // A test's window never writes the real `~/.shelbi`: it takes

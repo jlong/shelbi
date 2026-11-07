@@ -81,6 +81,12 @@ enum Cmd {
     /// agent). Resolves NAME against the project YAML's `workspaces:`
     /// block first, then falls back to the legacy spawn agent registry.
     Send { id: String, message: String },
+    /// The built-in diff view's review threads: read them, and answer one where
+    /// the reviewer reads it.
+    Diff {
+        #[command(subcommand)]
+        cmd: commands::diff_comment::DiffCmd,
+    },
     /// Push a message to a task's workspace via the file-based message log
     /// (`<worktree>/.shelbi/messages/<task-id>.log`). Distinct from `send`:
     /// `send` injects keystrokes into the agent session; `message` appends a
@@ -490,6 +496,7 @@ fn main() -> Result<()> {
             commands::status::run(cli.project, cmd, full, handoff)
         }
         Some(Cmd::Send { id, message }) => commands::send::run(cli.project, id, message),
+        Some(Cmd::Diff { cmd }) => commands::diff_comment::run(cli.project, cmd),
         Some(Cmd::Message {
             status,
             id,

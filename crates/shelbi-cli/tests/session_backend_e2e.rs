@@ -309,6 +309,160 @@ fn orchestrator_runs_as_a_session_without_tmux_pane_and_delivers_input_once() {
     );
 }
 
+/// `gY`: a thread's message reaches a real session as a submitted prompt, the
+/// text and then its Enter, and the thread is marked sent. A workspace with no
+/// session refuses it, and the thread stays unsent.
+#[test]
+fn diff_comments_reach_a_real_session_as_a_submitted_prompt() {
+    use shelbi_app::diff::backend::{DiffBackend, DiffTarget, HostBackend, TargetKind};
+    use shelbi_app::diff::comments::{Anchor, Author, Comment, CommentOp};
+    use shelbi_app::diff::model::Side;
+    use shelbi_app::diff::store::DiffStore;
+    use shelbi_app::diff::{DiffOptions, DiffSession};
+    use shelbi_state::keymap::{validate_keymaps_yaml, KeyChord};
+
+    let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    let work_dir = tempfile::tempdir().unwrap();
+    std::env::set_var("SHELBI_HOME", home.path());
+    struct Guard(SessionTarget);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = backend().kill(&Host::Local, &self.0);
+            std::env::remove_var("SHELBI_HOME");
+        }
+    }
+    let target = SessionTarget::slot("shelbi-demo", "alice");
+    let _guard = Guard(target.clone());
+
+    // The project: a custom runner, which gets the race-safe delivery without a
+    // parser for a screen this stub doesn't have.
+    let projects = shelbi_state::projects_dir().unwrap();
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(
+        projects.join("demo.yaml"),
+        format!(
+            "repo: {dir}\nbase_branch: main\nagent_runners:\n  stub: {{ command: stub-agent, flags: [] }}\n\
+             orchestrator: {{ runner: stub }}\nmachines:\n  - {{ name: hub, kind: local, work_dir: {dir} }}\n\
+             workspaces:\n  - {{ name: alice, machine: hub, runner: stub }}\n  - {{ name: bob, machine: hub, runner: stub }}\n",
+            dir = work_dir.path().display(),
+        ),
+    )
+    .unwrap();
+
+    // A worktree with a change on it.
+    let worktree = work_dir.path().join("wt");
+    std::fs::create_dir_all(&worktree).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").arg("-C").arg(&worktree).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "F"]);
+    git(&["config", "user.email", "f@example.com"]);
+    std::fs::write(worktree.join("a.txt"), "one\n").unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "base"]);
+    std::fs::write(worktree.join("a.txt"), "ONE\n").unwrap();
+
+    // The agent: `cat` on the session's terminal, so a line lands in the file
+    // only when its Enter arrives. Multi-line text comes as a bracketed paste
+    // to a real agent; this one asks for none, so each line is its own.
+    let received = home.path().join("received.txt");
+    let spec = SpawnSpec {
+        name: "demo/ws/alice".into(),
+        cwd: work_dir.path().to_path_buf(),
+        cols: 80,
+        rows: 24,
+        task: None,
+        raw_output_log: false,
+        child_argv: vec!["/bin/sh".into(), "-c".into(), format!("exec cat > {}", received.display())],
+    };
+    shelbi_client::spawn_with_exe(Path::new(env!("CARGO_BIN_EXE_shelbi")), &spec).expect("spawn the worker session");
+    // Up and accepting: alive by its lock comes a moment before its socket.
+    assert!(
+        wait_for(Duration::from_secs(10), || backend().snapshot(&Host::Local, &target).ok()).is_some(),
+        "the session should come up"
+    );
+
+    let open = |workspace: &str, store: &Path| {
+        let target = DiffTarget {
+            project: "demo".into(),
+            workspace: workspace.into(),
+            kind: TargetKind::Workspace,
+            task: Some("t-1".into()),
+        };
+        let store = DiffStore::at(store);
+        store
+            .apply_comment(&CommentOp::Add(Comment {
+                id: "c1".into(),
+                anchor: Anchor { path: "a.txt".into(), side: Side::New, start: 1, end: 1, code: vec!["ONE".into()] },
+                author: Author::human("jlong"),
+                body: "why upper case?".into(),
+                created_at: chrono::Utc::now(),
+                replies: Vec::new(),
+                sent: false,
+            }))
+            .unwrap();
+        let backend: std::sync::Arc<dyn DiffBackend> = std::sync::Arc::new(HostBackend::over(
+            Host::Local,
+            worktree.to_string_lossy().into_owned(),
+            target.clone(),
+            "main",
+            store,
+            shelbi_orchestrator::agent_send::service(),
+        ));
+        let options =
+            DiffOptions { author: Author::human("jlong"), target, watch: None, wake: std::sync::Arc::new(|| {}) };
+        DiffSession::open(move || Ok(backend), options)
+    };
+    let keymap = validate_keymaps_yaml("", None).0.diff;
+    let send = |session: &mut DiffSession| {
+        wait_for(Duration::from_secs(10), || {
+            session.poll();
+            (session.state().comments().len() == 1).then_some(())
+        })
+        .expect("the thread loads");
+        for chord in ["g", "shift-y"] {
+            session.key(KeyChord::parse(chord).unwrap(), &keymap);
+        }
+    };
+
+    // No session on `bob`: refused, and the thread is still to send.
+    let bob_store = tempfile::tempdir().unwrap();
+    let mut bob = open("bob", bob_store.path());
+    send(&mut bob);
+    wait_for(Duration::from_secs(40), || {
+        bob.poll();
+        bob.state().flash().filter(|f| f.starts_with("Couldn't")).map(str::to_string)
+    })
+    .map(|flash| assert!(flash.contains("no agent is running on `bob`"), "{flash}"))
+    .expect("a refusal");
+    assert!(!bob.state().comments()[0].sent);
+
+    // `alice` receives it.
+    let alice_store = tempfile::tempdir().unwrap();
+    let mut alice = open("alice", alice_store.path());
+    send(&mut alice);
+    wait_for(Duration::from_secs(40), || {
+        alice.poll();
+        alice.state().comments()[0].sent.then_some(())
+    })
+    .unwrap_or_else(|| panic!("the delivery should land: {:?}", alice.state().flash()));
+    assert_eq!(alice.state().flash(), Some("Sent 1 comment to the agent (this agent can't confirm it)"));
+
+    let got = wait_for(Duration::from_secs(10), || {
+        let text = std::fs::read_to_string(&received).ok()?;
+        text.contains("your reply").then_some(text)
+    })
+    .unwrap_or_else(|| panic!("the prompt's last line needs its Enter: {:?}", std::fs::read_to_string(&received)));
+    for piece in ["[thread c1] a.txt:1", "ONE", "jlong: why upper case?", "diff comment reply --task t-1"] {
+        assert!(got.contains(piece), "{piece} in {got:?}");
+    }
+    let events = std::fs::read_to_string(home.path().join("events.log")).unwrap_or_default();
+    assert!(events.contains("status=unverified"), "{events}");
+}
+
 /// The crash-versus-deliberate input to pane supervision, against real session
 /// processes: how each one ended is read back from what it left on disk.
 #[test]

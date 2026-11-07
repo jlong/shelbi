@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn an_app_editor_or_diff_launches_and_keeps_the_view() {
         let mut app = panel(true);
-        app.apps = shelbi_state::AppTools { editor: true, diff: true };
+        app.apps = shelbi_state::AppTools { editor: true, diff: true, ..Default::default() };
         select_switch(&mut app, SwitchItem::Editor);
         assert_eq!(app.activate(), PanelEffect::OpenApp(shelbi_app::ReviewRole::Editor));
         select_switch(&mut app, SwitchItem::Diff);

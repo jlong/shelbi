@@ -312,10 +312,7 @@ mod tests {
     use super::*;
 
     fn chord(code: Key) -> KeyChord {
-        KeyChord {
-            code,
-            mods: Mods::NONE,
-        }
+        KeyChord::new(code, Mods::NONE)
     }
 
     #[test]
@@ -366,10 +363,7 @@ mod tests {
         assert_eq!(panel.handle_key(chord(Key::Char('m'))), WsEffect::ShowDescription);
         assert_eq!(panel.handle_key(chord(Key::Esc)), WsEffect::Back);
         assert_eq!(panel.handle_key(chord(Key::Char('q'))), WsEffect::Close);
-        let cmd = KeyChord {
-            code: Key::Char('k'),
-            mods: Mods::SUPER,
-        };
+        let cmd = KeyChord::new(Key::Char('k'), Mods::SUPER);
         assert_eq!(panel.handle_key(cmd), WsEffect::None);
         assert_eq!(panel.selected_row(), Some(WsRow::Shell), "a Cmd chord is not the panel's");
     }
@@ -406,7 +400,7 @@ mod tests {
 
     #[test]
     fn an_app_editor_or_diff_launches_and_keeps_the_view() {
-        let apps = AppTools { editor: true, diff: false };
+        let apps = AppTools { editor: true, diff: false, ..Default::default() };
         let shape = WsPanelShape::for_workspace(true, true, false).with_apps(apps);
         let mut panel = WorkspacePanelState::new(&shape);
         assert_eq!(panel.click(WsRow::Switch(WsSwitch::Editor)), WsEffect::OpenApp(ReviewRole::Editor));
@@ -416,7 +410,7 @@ mod tests {
         assert_eq!(panel.active(), WsSwitch::Diff);
 
         // The setting changed: a synced shape takes it.
-        panel.sync(&shape.clone().with_apps(AppTools { editor: false, diff: true }));
+        panel.sync(&shape.clone().with_apps(AppTools { editor: false, diff: true, ..Default::default() }));
         assert_eq!(panel.click(WsRow::Switch(WsSwitch::Diff)), WsEffect::OpenApp(ReviewRole::Diff));
         assert_eq!(panel.active(), WsSwitch::Diff, "still the pane it showed");
         assert_eq!(panel.click(WsRow::Switch(WsSwitch::Editor)), WsEffect::ShowEditor);

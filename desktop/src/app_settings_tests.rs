@@ -507,7 +507,7 @@ fn the_editor_picker_lists_the_choices_and_a_pick_saves_it(cx: &mut TestAppConte
         s.h.cx.update(|_, cx| view.read(cx).tools().picker(setting).current_label())
     };
     assert_eq!(label(&mut s, ToolSetting::Editor), "Default ($EDITOR or vim)");
-    assert_eq!(label(&mut s, ToolSetting::DiffTool), "Git's difftool");
+    assert_eq!(label(&mut s, ToolSetting::DiffTool), "Shelbi's diff view");
 
     // Default, Neovim, Zed, Browse…, Other command….
     open_picker(&mut s, &view, ToolSetting::Editor);

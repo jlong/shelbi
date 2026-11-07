@@ -1115,6 +1115,19 @@ struct Message {
     /// `message-pushed` (the CLI announcing the push to the daemon).
     #[serde(default)]
     msg_id: Option<String>,
+    /// `diff-comment`'s operation: `list` or `reply`.
+    #[serde(default)]
+    op: Option<String>,
+    /// The thread a `diff-comment` reply goes on: an id, a prefix, or its place
+    /// in the list.
+    #[serde(default)]
+    thread: Option<String>,
+    /// Who a `diff-comment` reply is from.
+    #[serde(default)]
+    author: Option<String>,
+    /// A `diff-comment` reply's text. Newlines are escaped by the JSON.
+    #[serde(default)]
+    body: Option<String>,
 }
 
 /// Dispatch one client frame. `Ok(None)` means "reply with the standard
@@ -1129,6 +1142,14 @@ fn dispatch(raw: &str, daemon: &Daemon) -> Result<Option<String>> {
         "message-pushed" => handle_message_pushed(&msg, daemon).map(|()| None),
         "message-ack" => handle_message_ack(&msg, daemon).map(|()| None),
         "refresh-board" => handle_refresh_board(&msg, daemon).map(Some),
+        "diff-comment" => Ok(Some(super::super::diff_comment::answer_hub(
+            msg.project.as_deref(),
+            msg.task_id.as_deref(),
+            msg.op.as_deref(),
+            msg.thread.as_deref(),
+            msg.author.as_deref(),
+            msg.body.as_deref(),
+        ))),
         // Debug-escaped so a control-byte-laden verb can't smuggle ANSI
         // sequences into the daemon log.
         other => Err(anyhow!("unknown verb {other:?}")),
@@ -1397,6 +1418,19 @@ mod tests {
     fn dispatch_rejects_malformed_json() {
         let err = dispatch("not json", &test_daemon()).unwrap_err();
         assert!(err.to_string().contains("invalid JSON"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_answers_a_diff_comment_with_a_line_of_json() {
+        let reply = dispatch(
+            r#"{"verb":"diff-comment","project":"p","op":"reply","thread":"1","body":"hi"}"#,
+            &test_daemon(),
+        )
+        .unwrap()
+        .expect("a reply line");
+        let answer: serde_json::Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(answer["ok"], false);
+        assert!(answer["error"].as_str().unwrap().contains("needs a task"), "{answer}");
     }
 
     #[test]

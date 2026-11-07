@@ -41,17 +41,11 @@ pub(crate) fn is_bare(chord: &KeyChord, key: Key) -> bool {
 
 /// Ctrl+Space: the palette chord every client reserves, whatever `keys.yaml`
 /// binds (many terminals deliver it as Ctrl+@, which the TUI also accepts).
-pub const RESERVED_PALETTE_CHORD: KeyChord = KeyChord {
-    code: Key::Char(' '),
-    mods: Mods::CONTROL,
-};
+pub const RESERVED_PALETTE_CHORD: KeyChord = KeyChord::new(Key::Char(' '), Mods::CONTROL);
 
 /// Cmd+K: the desktop's conventional palette chord. A terminal never delivers
 /// Super, so it only ever reaches the desktop app.
-pub const PLATFORM_PALETTE_CHORD: KeyChord = KeyChord {
-    code: Key::Char('k'),
-    mods: Mods::SUPER,
-};
+pub const PLATFORM_PALETTE_CHORD: KeyChord = KeyChord::new(Key::Char('k'), Mods::SUPER);
 
 /// Every chord that opens the palette: the user's `open_palette` bindings
 /// (`keys.yaml`, default Ctrl+P) plus the two reserved chords. The configured

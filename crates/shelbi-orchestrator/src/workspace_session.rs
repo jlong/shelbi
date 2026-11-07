@@ -90,7 +90,7 @@ pub fn workspace_details(project_name: &str, workspace: &str) -> Result<Workspac
     let (editor_name, apps, remote_address) = match &host {
         Host::Ssh { host } => (
             shelbi_state::ToolChoice::Command(shelbi_state::resolve_editor()).display_name(),
-            shelbi_state::AppTools::default(),
+            remote_tools(crate::tools::app_tools(&project)),
             Some(format!("{host}:{worktree_str}")),
         ),
         Host::Local => (
@@ -204,8 +204,7 @@ pub fn ensure_content_session(
         raw_output_log: false,
         child_argv: vec!["sh".into(), "-c".into(), command],
     };
-    backend.spawn_session(spec)?;
-    Ok(())
+    backend.spawn_session_to_attach(spec)
 }
 
 /// Open `workspace`'s worktree (the editor) or its branch diff in the app
@@ -226,6 +225,12 @@ pub fn open_in_app(project_name: &str, workspace: &str, role: ReviewContentRole)
     }
     let worktree = crate::workspace::workspace_worktree(machine, ws);
     crate::tools::open_in_app(role, &worktree, project.base_branch())
+}
+
+/// What a workspace on another machine can use of `tools`: no app can open its
+/// worktree, while Shelbi's own diff view reads any machine's.
+fn remote_tools(tools: shelbi_state::AppTools) -> shelbi_state::AppTools {
+    shelbi_state::AppTools { builtin_diff: tools.builtin_diff, ..Default::default() }
 }
 
 /// End `workspace`'s editor and diff content sessions, on whichever machine
@@ -339,7 +344,7 @@ pub fn ensure_user_shell(project_name: &str, workspace: &str) -> Result<()> {
         let bin = crate::remote_session::resolve_remote_bin(&ws.machine)?;
         crate::remote_session::spawn_remote_session(&host, &bin, &spec)
     } else {
-        backend.spawn_session(spec).map(|_| ())
+        backend.spawn_session_to_attach(spec)
     }
 }
 
@@ -369,6 +374,14 @@ pub fn close_user_shell(project_name: &str, workspace: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_remote_workspace_keeps_the_built_in_diff_and_no_app() {
+        let tools = shelbi_state::AppTools { editor: true, diff: true, builtin_diff: false };
+        assert_eq!(remote_tools(tools), shelbi_state::AppTools::default());
+        let tools = shelbi_state::AppTools { editor: true, diff: false, builtin_diff: true };
+        assert_eq!(remote_tools(tools), shelbi_state::AppTools { builtin_diff: true, ..Default::default() });
+    }
+
     /// `WorkspaceDetails` is a remote-window wire type: pin its JSON shape,
     /// decode it back equal, and decode `{}` (every field defaults).
     #[test]
@@ -394,6 +407,7 @@ mod tests {
             apps: shelbi_state::AppTools {
                 editor: false,
                 diff: true,
+                builtin_diff: false,
             },
             branch: Some("jlong/t-1".into()),
             task: Some(Box::new(task)),
@@ -404,7 +418,7 @@ mod tests {
             "worktree": "/srv/shelbi/.shelbi/wt/alpha",
             "remote_address": "jlong@devbox:/srv/shelbi/.shelbi/wt/alpha",
             "editor_name": "Helix",
-            "apps": { "editor": false, "diff": true },
+            "apps": { "editor": false, "diff": true, "builtin_diff": false },
             "branch": "jlong/t-1",
             "task": {
                 "task": {

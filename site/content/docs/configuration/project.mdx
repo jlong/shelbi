@@ -129,7 +129,7 @@ workspaces:
 | `heartbeat` | [Heartbeat](#heartbeat) | no | `60s` / `5m` | Adaptive hub heartbeat written to `events.log`: the orchestrator's fallback wake-up on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
 | `disk` | [Disk](#disk) | no | `20` / `20` | Hub disk management: the size cap on the shared cargo `target/` and the low-disk free-space warning threshold. Both default to 20 GiB and are elided from the wire form when unset. |
 | `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for the review merge and Zen's auto-merge. |
-| `review` | [Review](#review) | no | all defaults | Review-interface behavior. Today just `diff_command`, the **View Diff** escape hatch for a diff tool that reviews a revision range instead of git's directory-diff pair. |
+| `review` | [Review](#review) | no | all defaults | Review-interface behavior. Today just `diff_command`, which makes **View Diff** run a command of your own, such as a tool that reviews a revision range. |
 | `issue_tracker` | [IssueTracker](#issue_tracker) | no | `file_system` | Which backend the board lives in: `file_system` (local markdown, the default) or `github` (issues in a repo). See [GitHub Issues backend](/docs/concepts/github-issues). |
 | `session` | `{ raw_output_log }` | no | off | `raw_output_log: true` keeps a full raw output log of every session at `~/.shelbi/sessions/<id>/raw.log`. Opt-in, for debugging: the log is mostly repaint noise for full-screen agents and captures anything pasted into a session. |
 
@@ -452,34 +452,29 @@ Behavior of the [review interface](/docs/concepts/review-workspaces#the-review-i
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `diff_command` | string | no | none | Command **View Diff** runs for this project instead of your [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) or the default `git difftool -d -y <base> HEAD`. Set it when your diff tool reviews a **revision range** rather than git's directory-diff pair. See below. |
+| `diff_command` | string | no | none | Command **View Diff** runs for this project instead of [Shelbi's own diff view](/docs/concepts/diff-view) or your [`diff_tool`](/docs/configuration/global#editor-and-diff-tool). See below. |
 
-By default **View Diff** runs `git difftool -d -y <base> HEAD` — git's
-directory-diff mode, which invokes your `diff.tool` with **two directory
-paths**. A tool whose CLI takes a revision range instead (such as `skim`,
-invoked `skim <base> <head>`) can't interpret those directories: it renders
-nothing and leaks git warnings into the pane. Point `review.diff_command` at
-the tool's revision-range invocation to bypass directory-diff entirely.
+By default **View Diff** opens Shelbi's own diff view. Set `diff_command` for a
+tool whose CLI takes a revision range (such as `skim`, invoked `skim <base> <head>`),
+which [`diff_tool`](/docs/configuration/global#editor-and-diff-tool) can't express:
+that setting hands a tool a pair of files or folders.
 
 The command runs in the review worktree with three placeholders substituted
 (shell-escaped):
 
-- `{worktree}` — the review workspace worktree,
-- `{base}` — `merge-base(<base branch>, HEAD)`, the fork point, and
-- `{head}` — `HEAD`.
+- `{worktree}`: the review workspace worktree,
+- `{base}`: `merge-base(<base branch>, HEAD)`, the fork point, and
+- `{head}`: `HEAD`.
 
-`{base}` and `{head}` are the same range `shelbi diff` reports, so the
-override reviews the same changeset the default path does.
+`{base}` and `{head}` are the same range the built-in view shows.
 
 ```yaml
 review:
   diff_command: skim {base} {head}
 ```
 
-Leave `diff_command` unset and **View Diff** keeps the default `git difftool
--d -y` path, so existing setups are unchanged. Either way, a diff tool that
-exits without rendering leaves a short message in the pane rather than only
-git warnings.
+A diff tool that exits without rendering leaves a short message in the pane rather
+than only git warnings.
 
 The [config-upgrade pass](/docs/concepts/config-upgrade) currently misreports a
 `review:` block as a removed key (`PROJECT_REMOVED_KEY`). The block is live:

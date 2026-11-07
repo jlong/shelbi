@@ -41,7 +41,7 @@ defaults in the tables below (`auto`, contrast `0`, an opaque window).
 | `theme` | `auto` \| `dark` \| `light` | no | `auto` | Color theme for the TUI and the desktop app. See [Theme](#theme). |
 | `desktop` | [Desktop](#desktop) | no | — | Desktop app settings. Ignored by the CLI and the TUI (except `app_icon`, which the TUI's About draws and its Settings ▸ General picks). |
 | `editor` | command \| `{ app: <path> }` | no | `$EDITOR`, else `vim` | Editor Shelbi opens for "Edit in `<editor>`" (in the [review interface](/docs/concepts/review-workspaces#the-review-editor) and the workspace panel) and for the desktop app's external edits (an issue body, a workflow's Edit YAML). Hub-wide, so it follows you across projects. A command (`hx`, `code --wait`) runs in a pane; an app opens in the app. See [Editor and diff tool](#editor-and-diff-tool). |
-| `diff_tool` | command \| `{ app: <path> }` | no | git's difftool | Diff tool View Diff runs over a branch's changes. A command runs in a pane; an app opens in the app. A project's `review.diff_command` takes precedence. See [Editor and diff tool](#editor-and-diff-tool). |
+| `diff_tool` | `builtin` \| `git` \| command \| `{ app: <path> }` | no | `builtin` | What View Diff shows over a branch's changes: Shelbi's own diff view, git's difftool, a command in a pane, or an app. A project's `review.diff_command` takes precedence. See [Editor and diff tool](#editor-and-diff-tool). |
 
 ```yaml
 # ~/.shelbi/config.yaml
@@ -82,13 +82,15 @@ current view selected rather than switching to a pane. Unset, Shelbi runs
 terminal editor falls back past an app setting to `$EDITOR`, then `vim`.
 
 **Diff tool.** View Diff compares the branch with its base
-(`merge-base(<base branch>, HEAD)..HEAD`). In precedence order it runs:
+(`merge-base(<base branch>, HEAD)..HEAD`). In precedence order it shows:
 
 1. the project's `review.diff_command`, when it sets one,
-2. `diff_tool`, when set,
-3. git's own difftool (`diff.guitool`, else `diff.tool`).
+2. `diff_tool`, when set to a tool,
+3. [Shelbi's own diff view](/docs/concepts/diff-view), which is what
+   `diff_tool: builtin` asks for and what an unset setting means.
 
-A `diff_tool` command runs in a pane through `git difftool`, one file at a
+`diff_tool: git` runs git's own difftool (`diff.guitool`, else `diff.tool`). Any
+other `diff_tool` command runs in a pane through `git difftool`, one file at a
 time, with the two files appended (`nvim -d`, `vimdiff`). A command that names
 `$LOCAL` and `$REMOTE` itself is run as written. `difft`
 ([difftastic](https://difftastic.wilfred.me.uk/)) runs as git's external diff
@@ -111,9 +113,11 @@ found on your login `PATH` or inside the app bundle:
 Any other app gets the two folders with `open -W -a <app>`. If a listed app's
 helper isn't installed, View Diff says so on the status line.
 
-**Remote workspaces.** Edit and View Diff are offered for workspaces on the hub
-only, in both clients, whatever the setting: an app can't open a worktree on
-another machine, and neither can a pane Shelbi starts on the hub.
+**Remote workspaces.** Shelbi's own diff view reads a worktree on any machine, in
+both clients. A workspace on another machine also offers Edit, and an external diff
+tool, as panes that run on that machine. An app can't open a worktree on another
+machine. A review slot on another machine offers no Edit, and offers View Diff only
+for Shelbi's own view.
 
 **Labels.** "Edit in `<name>`" uses the tool's name: **Edit in Neovim** for
 `nvim`, **Edit in Helix** for `hx`, **Edit in Visual Studio Code** for
@@ -226,11 +230,15 @@ itself:
 | `[]` (empty list) | Deliberately unbind the action. |
 | `null` | No override — fall through to the layer below. |
 
+In the `diff` mode a chord can be two keys, separated by a space (`'g g'`,
+`'z C'`, `'] h'`). Quote them: a bare `]` isn't YAML. A key can't both do
+something by itself and start a two-key binding.
+
 ### Modes
 
 The valid top-level keys under `defaults` and each `projects.<name>`:
 
-`global`, `sidebar`, `kanban`, `popover`, `activity`, `palette`.
+`global`, `sidebar`, `kanban`, `popover`, `activity`, `diff`, `palette`.
 
 `global` bindings apply everywhere; the rest scope to their pane.
 
@@ -267,6 +275,35 @@ The action names accepted under each mode, with their built-in chords:
 | `activity` | `reset_filter` | `a` |
 | `activity` | `toggle_zen_filter` | `z` |
 | `activity` | `toggle_workspaces_filter` | `w` |
+| `diff` | `cursor_down` / `cursor_up` | `j`,`down` / `k`,`up` |
+| `diff` | `next_file` / `prev_file` | `l`,`ctrl-n`,`right` / `h`,`left` |
+| `diff` | `page_down` / `page_up` | `space`,`ctrl-f`,`page-down` / `b`,`page-up` |
+| `diff` | `half_page_down` / `half_page_up` | `ctrl-d` / `ctrl-u` |
+| `diff` | `top` / `bottom` | `'g g'` / `G` |
+| `diff` | `center_viewport` / `center_cursor` | `'z z'` / `M` |
+| `diff` | `next_change` / `prev_change` | `'] h'` / `'[ h'` |
+| `diff` | `next_comment` / `prev_comment` | `'] c'` / `'[ c'` |
+| `diff` | `next_empty_line` / `prev_empty_line` | `'}'` / `'{'` |
+| `diff` | `find_forward` / `find_backward` | `f` / `F` |
+| `diff` | `till_forward` / `till_backward` | `t` / `T` |
+| `diff` | `repeat_find` | `';'` |
+| `diff` | `search` / `next_match` / `prev_match` | `/` / `n` / `N` |
+| `diff` | `file_palette` / `command_palette` / `help` | `ctrl-p` / `':'` / `'?'` |
+| `diff` | `toggle_split` / `toggle_blame` / `toggle_file_list` | `s` / `B` / `ctrl-b`,`\` |
+| `diff` | `next_hunk_filter` / `prev_hunk_filter` | `tab` / `back-tab` |
+| `diff` | `toggle_hunk_fold` / `close_hunk_fold` / `open_hunk_fold` | `'z a'` / `'z c'` / `'z o'` |
+| `diff` | `close_file_fold` / `open_file_fold` | `'z C'` / `'z O'` |
+| `diff` | `close_all_folds` / `open_all_folds` | `'z M'` / `'z R'` |
+| `diff` | `visual_select` | `v`,`V` |
+| `diff` | `comment` / `reply_or_refresh` / `toggle_thread` | `enter` / `r` / `o` |
+| `diff` | `delete_comment` / `clear_comments` | `d` / `D` |
+| `diff` | `yank` / `yank_all` / `send_to_agent` | `y` / `Y` / `'g Y'` |
+| `diff` | `send_to_reviewer` | `'g A'` |
+| `diff` | `revert_hunk` / `revert_file` | `'g r'` / `'g R'` |
+| `diff` | `toggle_resolved` / `toggle_comment_target` | `x` / `C` |
+| `diff` | `submit_review` / `pr_info` | `R` / `i` |
+| `diff` | `open_in_editor` | `ctrl-g` |
+| `diff` | `toggle_viewed` / `pick_commit` | `m` / `c` |
 | `palette` | `close` | `esc`,`ctrl-c`,`ctrl-p` |
 | `palette` | `activate` | `enter` |
 | `palette` | `nav_up` / `nav_down` | `up` / `down` |
@@ -281,7 +318,8 @@ dump-keybindings` prints the whole default keymap as a starting `keys.yaml`, and
 
 A mode binding that reuses a `global` chord is dead in the `sidebar`, `kanban`,
 and `activity` modes: global bindings fire first. `shelbi config check` warns
-about it.
+about it. The `diff` mode is the other way around: its bindings win while the
+diff view has focus, so `ctrl-p` opens its file palette there.
 
 ```yaml
 # rebind the palette opener globally, and add a second chord in one project

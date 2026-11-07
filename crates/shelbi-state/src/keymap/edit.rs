@@ -179,11 +179,13 @@ pub fn builtin_chords(action: Action) -> Vec<KeyChord> {
 /// shifted letter is its capital (`K`, as the built-in defaults write it;
 /// it parses to the same `shift-k`).
 pub fn chord_spec(chord: &KeyChord) -> String {
-    match chord.code {
-        Key::Char(c) if c.is_ascii_alphabetic() && chord.mods == Mods::SHIFT => {
-            c.to_ascii_uppercase().to_string()
-        }
-        _ => chord.canonical(),
+    let stroke = |code: Key, mods: Mods| match code {
+        Key::Char(c) if c.is_ascii_alphabetic() && mods == Mods::SHIFT => c.to_ascii_uppercase().to_string(),
+        _ => KeyChord::new(code, mods).canonical(),
+    };
+    match chord.leader {
+        Some(l) => format!("{} {}", stroke(l.code, l.mods), stroke(chord.code, chord.mods)),
+        None => stroke(chord.code, chord.mods),
     }
 }
 

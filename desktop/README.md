@@ -46,6 +46,18 @@ shell's `PATH` lacks `~/bin`, Settings ▸ General says so under Shelbi CLI;
 to run `shelbi` in a terminal, add `export PATH="$HOME/bin:$PATH"` to
 `~/.zshrc` (or your shell's startup file).
 
+## The diff view
+
+With `diff_tool: builtin` (the default), View Diff in a review or a workspace is
+Shelbi's own view (`src/views/diff_view/`, over `shelbi_app::diff`), not a pane
+running an external tool. A workspace's follows the worktree live. Its keys are
+Skim's, rebindable under `diff:` in `keys.yaml`, and `?` lists them as bound.
+While it has the keyboard its `Ctrl-p` is the file palette (Ctrl+Space and ⌘K
+still open the window's palette), `Ctrl-g` opens the file at the line in your
+editor, and Esc with nothing to let go of goes back to the panel. Clicking the
+file list gives it the keyboard: `j` / `k` step through files and `Space` marks
+one viewed. `docs/parity.md` has the decisions and known gaps.
+
 ## Settings
 
 The app reads `~/.shelbi/config.yaml` (shared with the CLI and the TUI). The

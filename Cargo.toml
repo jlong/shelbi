@@ -54,6 +54,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 tokio = { version = "1", features = ["full"] }
 strip-ansi-escapes = "0.2"
 similar = { version = "2", features = ["text"] }
+# Syntax highlighting for `shelbi_app::diff` (MIT). Line-at-a-time, so it reads
+# hunks; pure Rust with the `fancy-regex` engine (no C dependency on either
+# workspace). Only the parser is used: no themes, no HTML. two-face adds bat's
+# grammar bundle (TypeScript, TOML, Swift, Zig, ...), which syntect's own lacks.
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 ratatui = "0.28"
 crossterm = "0.28"
 nucleo-matcher = "0.3"

@@ -15,6 +15,8 @@ doesn't read them.
   buttons, icon buttons, dropdowns, segmented controls, keycaps and the
   sidebar's plain hotkeys, popovers, dialogs, chips, the
   focus ring and glow, empty states, tooltips).
+- `src/theme/diff.rs`: the diff view's colors, as meanings over the roles
+  (`DiffColors`, `syntax_color`). Derived, since Figma has no diff frame yet.
 - `src/theme/motion.rs`: the motion: the easing curve, the spring the
   selection chip slides on, and the fades every hover and press runs.
 - `src/theme/mod.rs`: the resolved `Theme` global (views read `theme.muted`,

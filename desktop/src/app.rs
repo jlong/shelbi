@@ -70,7 +70,7 @@
 //! ([`IssuesView`], `dt-issues-board`), built for the window's project the
 //! first time it is shown, and rebuilt for the new project after a switch.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -144,6 +144,7 @@ use crate::views::pane_session::MainShows;
 use crate::views::session_view::SessionDeps;
 use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::changelog::{ChangelogEvent, ChangelogView};
+use crate::views::diff_view::DiffKeys;
 use crate::views::review::{ReviewDeps, ReviewEvent, ReviewOps, ReviewView};
 use crate::views::overlay::{self, ActiveOverlay, OverlayEvent, OverlayHost};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceEvent, WorkspaceView};
@@ -1241,6 +1242,9 @@ pub struct ShelbiWindow {
     /// The review decisions on their way through the daemon, and the failures
     /// waiting to be seen: the window leaves a review the moment it's decided.
     decisions: ReviewDecisions,
+    /// The reasons of rejects still running: when one lands, the comments its
+    /// reason carried have been sent.
+    reject_reasons: HashMap<String, String>,
     /// What a review decision does in place of asking the daemon.
     #[cfg(test)]
     review_mutation: Option<ReviewMutation>,
@@ -1709,6 +1713,7 @@ impl ShelbiWindow {
             pending_rows: None,
             review_ops: None,
             decisions: ReviewDecisions::default(),
+            reject_reasons: HashMap::new(),
             #[cfg(test)]
             review_mutation: None,
             banner: None,
@@ -2050,6 +2055,7 @@ impl ShelbiWindow {
     /// Take `keymaps` for the window's keys, its hints and the menu bar.
     fn adopt_keymaps(&mut self, keymaps: Keymaps, cx: &mut Context<Self>) {
         self.palette_chord = palette_chord(&keymaps);
+        cx.set_global(DiffKeys(Rc::new(keymaps.diff.clone())));
         self.keymaps = keymaps;
         if let Some(ws) = self.workspace.clone() {
             let chord = self.palette_chord.clone();
@@ -2984,8 +2990,7 @@ impl ShelbiWindow {
                 if self.refuse_second_decision(&id, cx) {
                     return;
                 }
-                let wrap = crate::views::overlay::review_reject::wrap(cx);
-                self.open_overlay(ActiveOverlay::reject_reason(id, Some(wrap)), window, cx)
+                self.ask_reject_reason(id, window, cx);
             }
             HostCall::RejectReview(id, reason) => self.reject(id, reason, window, cx),
             HostCall::OpenEditor(target) => self.open_editor(target, cx),
@@ -3490,6 +3495,14 @@ impl ShelbiWindow {
             // Approve, or Reject (which asks for the reason): the registry's
             // commands, through the same gates as the palette's.
             ReviewEvent::Command(kind) => this.run(kind.clone(), window, cx),
+            ReviewEvent::RejectWith { id, reason } => {
+                if !this.refuse_second_decision(id, cx) {
+                    let wrap = crate::views::overlay::review_reject::wrap(cx);
+                    let mut overlay = ActiveOverlay::reject_reason(id.clone(), Some(wrap));
+                    overlay.fill_reject_reason(id, reason);
+                    this.open_overlay(overlay, window, cx);
+                }
+            }
             ReviewEvent::Back | ReviewEvent::Closed => this.leave_review(window, cx),
             ReviewEvent::OpenTask(id) => this.open_task_over(id, window, cx),
         });
@@ -5174,7 +5187,54 @@ impl ShelbiWindow {
         cx.notify();
     }
 
+    /// Open the reject prompt on `id`. It opens at once, and starts from the
+    /// comments still unsent on the task when the read comes back (over a relay
+    /// for a project on another machine, so not on this thread). If the read
+    /// fails it just stays empty: comments mustn't stand in the way of a reject.
+    fn ask_reject_reason(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        let wrap = crate::views::overlay::review_reject::wrap(cx);
+        self.open_overlay(ActiveOverlay::reject_reason(id.clone(), Some(wrap)), window, cx);
+        let (project, link) = (self.project.clone(), self.project_handle.link.clone());
+        let task = id.clone();
+        let read = cx.background_executor().spawn(async move {
+            shelbi_app::diff::comment_access(&project, &task, Some(&link)).reject_reason()
+        });
+        cx.spawn(async move |this, cx| {
+            let reason = read.await;
+            this.update(cx, |this, cx| match reason {
+                Ok(Some(reason)) => {
+                    if let Some(overlay) = this.overlay.as_mut() {
+                        overlay.fill_reject_reason(&id, &reason);
+                        cx.notify();
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "couldn't read the review's comments"),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A reject landed: the comments its reason carried have been sent.
+    fn mark_reject_sent(&mut self, id: &str, project: &str, cx: &mut Context<Self>) {
+        let Some(reason) = self.reject_reasons.remove(id) else { return };
+        if !shelbi_app::diff::comments::reason_carries_threads(&reason) {
+            return;
+        }
+        let (project, task, link) = (project.to_string(), id.to_string(), self.project_handle.link.clone());
+        cx.background_executor()
+            .spawn(async move {
+                let access = shelbi_app::diff::comment_access(&project, &task, Some(&link));
+                if let Err(e) = access.mark_sent_in(&reason) {
+                    tracing::warn!(error = %e, "couldn't mark the rejected comments sent");
+                }
+            })
+            .detach();
+    }
+
     fn reject(&mut self, id: String, reason: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.reject_reasons.insert(id.clone(), reason.clone());
         let m = Mutation::RejectReview {
             project: self.project.clone(),
             id: id.clone(),
@@ -5230,13 +5290,22 @@ impl ShelbiWindow {
                 match result {
                     // The window switched projects meanwhile: only the sessions
                     // are left to see to.
-                    Ok(()) if this.project != project => close_review_sessions(ops, project, id, cx),
+                    Ok(()) if this.project != project => {
+                        // Its reason is another project's: the link has moved on,
+                        // so the threads just stay unsent.
+                        this.reject_reasons.remove(&id);
+                        close_review_sessions(ops, project, id, cx);
+                    }
                     Ok(()) => {
+                        this.mark_reject_sent(&id, &project, cx);
                         if let Some(decision) = this.decisions.landed(&id) {
                             this.land_decision(&id, decision, window, cx);
                         }
                     }
-                    Err(e) => this.decision_refused(&id, decision, &e, cx),
+                    Err(e) => {
+                        this.reject_reasons.remove(&id);
+                        this.decision_refused(&id, decision, &e, cx);
+                    }
                 }
                 this.request_refresh();
                 cx.notify();
@@ -5264,9 +5333,24 @@ impl ShelbiWindow {
         let Some(chord) = chord_from_keystroke(&event.keystroke) else {
             return;
         };
+        // The diff's keys win while it has the keyboard (its `Ctrl-p` over the
+        // palette chord); Ctrl+Space and ⌘K still reach the window.
+        if self.diff_wants(chord, window, cx) {
+            return;
+        }
         if takes_from_terminal(&self.keymaps, chord) {
             self.on_key_down(event, window, cx);
         }
+    }
+
+    /// Whether the built-in diff has the keyboard and wants this key.
+    fn diff_wants(&self, chord: shelbi_state::keymap::KeyChord, window: &Window, cx: &App) -> bool {
+        let review = self.review.as_ref().filter(|r| r.read(cx).is_shown());
+        let workspace = self.workspace.as_ref().filter(|w| w.read(cx).is_shown());
+        review
+            .and_then(|r| r.read(cx).diff_with_focus(window, cx))
+            .or_else(|| workspace.and_then(|w| w.read(cx).diff_with_focus(window, cx)))
+            .is_some_and(|diff| diff.read(cx).wants_key(chord, cx))
     }
 
     /// Move keyboard focus to the sidebar (the `focus_sidebar` chord).

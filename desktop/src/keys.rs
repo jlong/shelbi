@@ -88,7 +88,8 @@ pub fn chord_text(chord: &KeyChord, style: DisplayStyle) -> String {
 /// (`back-tab`) is `⇧`, `Tab`.
 pub fn keycap_keys(chord: &KeyChord) -> Vec<String> {
     let m = chord.mods;
-    let mut keys = Vec::new();
+    // A two-key binding's first key, as caps of its own (`G`, `G`).
+    let mut keys = chord.leader.map_or_else(Vec::new, |leader| keycap_keys(&leader.chord()));
     for (bit, glyph) in [(Mods::CONTROL, "⌃"), (Mods::ALT, "⌥"), (Mods::SHIFT, "⇧"), (Mods::SUPER, "⌘")] {
         let back_tab = bit == Mods::SHIFT && chord.code == Key::BackTab;
         if m.contains(bit) || back_tab {

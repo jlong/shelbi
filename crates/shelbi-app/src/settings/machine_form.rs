@@ -601,7 +601,7 @@ mod tests {
     }
 
     fn chord(code: Key, mods: Mods) -> KeyChord {
-        KeyChord { code, mods }
+        KeyChord::new(code, mods)
     }
 
     #[test]

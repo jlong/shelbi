@@ -1,9 +1,13 @@
 //! Chord parsing — strings ↔ ([`Key`], [`Mods`]) pairs.
 //!
-//! Grammar (single chord only — multi-key sequences like `gg` or
-//! `ctrl-x-ctrl-c` are deliberately rejected as out of scope):
+//! Grammar: one key, or two keys separated by a space (`g g`, `z shift-c`,
+//! `] h`). Run-together sequences like `gg` or `ctrl-x-ctrl-c` are rejected,
+//! and so are three or more keys. Only the diff view's key layer waits for a
+//! second key, so the loader refuses a two-key binding in any other mode
+//! ([`super::Action::takes_two_keys`]).
 //!
 //! ```text
+//! binding   := chord | chord ' ' chord
 //! chord     := (modifier '-')* keyname
 //! modifier  := ctrl | alt | shift | super
 //! keyname   := single character | named-key
@@ -34,6 +38,23 @@ use super::key::{Key, Mods};
 pub struct KeyChord {
     pub code: Key,
     pub mods: Mods,
+    /// The key pressed first, for a two-key binding (`g` in `g g`). Always
+    /// `None` on a chord an input source delivers: a key layer pairs them up.
+    pub leader: Option<Leader>,
+}
+
+/// The first key of a two-key binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Leader {
+    pub code: Key,
+    pub mods: Mods,
+}
+
+impl Leader {
+    /// The leader as the chord that presses it.
+    pub const fn chord(self) -> KeyChord {
+        KeyChord::new(self.code, self.mods)
+    }
 }
 
 /// Reasons the parser rejects an input string.
@@ -62,6 +83,15 @@ impl KeyChord {
         if raw.is_empty() {
             return Err(ChordParseError::Empty);
         }
+        let mut strokes = raw.split_whitespace();
+        if let (Some(first), Some(second)) = (strokes.next(), strokes.next()) {
+            if strokes.next().is_some() {
+                return Err(ChordParseError::MultiKeyNotSupported(raw.to_string()));
+            }
+            let first = Self::parse(first)?;
+            let second = Self::parse(second)?;
+            return Ok(second.after(first));
+        }
 
         // Single character "fast path" — skips the dash splitter so we
         // don't choke on `-` as a key (`-` is its own valid keyname).
@@ -70,15 +100,9 @@ impl KeyChord {
             let ch = raw.chars().next().unwrap();
             return Ok(if ch.is_ascii_uppercase() {
                 let lower = ch.to_ascii_lowercase();
-                KeyChord {
-                    code: Key::Char(lower),
-                    mods: Mods::SHIFT,
-                }
+                KeyChord::new(Key::Char(lower), Mods::SHIFT)
             } else {
-                KeyChord {
-                    code: Key::Char(ch),
-                    mods: Mods::NONE,
-                }
+                KeyChord::new(Key::Char(ch), Mods::NONE)
             });
         }
 
@@ -144,10 +168,7 @@ impl KeyChord {
             return Err(ChordParseError::MultiKeyNotSupported(raw.to_string()));
         }
 
-        Ok(KeyChord {
-            code,
-            mods: mods | key_mods,
-        })
+        Ok(KeyChord::new(code, mods | key_mods))
     }
 
     /// Build a chord from a raw ([`Key`], [`Mods`]) pair — what the edge
@@ -157,8 +178,16 @@ impl KeyChord {
     /// that report an uppercase `Char('A')` with no SHIFT bit are reconciled
     /// at lookup time by [`super::ModeKeymap::dispatch`], which retries the
     /// `shift-a` form before giving up.
-    pub fn new(code: Key, mods: Mods) -> Self {
-        KeyChord { code, mods }
+    pub const fn new(code: Key, mods: Mods) -> Self {
+        KeyChord { code, mods, leader: None }
+    }
+
+    /// This chord as the second key of a two-key binding started by `first`.
+    pub const fn after(self, first: KeyChord) -> Self {
+        KeyChord {
+            leader: Some(Leader { code: first.code, mods: first.mods }),
+            ..self
+        }
     }
 
 
@@ -186,6 +215,10 @@ impl KeyChord {
             other => (other, false),
         };
         let mut out = String::new();
+        if let Some(leader) = self.leader {
+            out.push_str(&leader.chord().canonical());
+            out.push(' ');
+        }
         if self.mods.contains(Mods::CONTROL) {
             out.push_str("ctrl-");
         }

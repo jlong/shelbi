@@ -64,6 +64,25 @@ const DEFAULT_ROWS: u16 = 40;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SessionProcessBackend;
 
+/// How long [`SessionProcessBackend::spawn_session_to_attach`] waits for a new
+/// session to be found. Generous for a loaded machine; normally a few polls.
+const ATTACH_WAIT: Duration = Duration::from_secs(5);
+const ATTACH_POLL: Duration = Duration::from_millis(25);
+
+/// Poll `found` until it holds or `limit` passes. Returns whether it held.
+fn wait_until_found(limit: Duration, poll: Duration, found: impl Fn() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if found() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(poll);
+    }
+}
+
 /// Derive the logical session name (the `meta.json` name a session is keyed by)
 /// from a backend-neutral target. Pure, so spawn and every later lookup agree.
 ///
@@ -587,6 +606,20 @@ impl SessionProcessBackend {
         self.find_live(name).map(|session| session.meta.task)
     }
 
+    /// [`spawn_session`](Self::spawn_session) for a session a client attaches to
+    /// as soon as this answers. A spawn returns once the process is started, a
+    /// moment before it holds its lock and discovery can see it, and a client
+    /// that looks in that moment settles on "no live session". So this waits for
+    /// the name to show up, and leaves a session that never does to the client.
+    pub(crate) fn spawn_session_to_attach(&self, spec: SpawnSpec) -> Result<()> {
+        let name = spec.name.clone();
+        self.spawn_session(spec)?;
+        wait_until_found(ATTACH_WAIT, ATTACH_POLL, || {
+            self.live_session_names(&Host::Local).is_ok_and(|names| names.iter().any(|n| n == &name))
+        });
+        Ok(())
+    }
+
     /// The logical names of every live session. Stands in for the tmux backend's
     /// `live_pane_ids` (there are no panes): a caller confirming a specific
     /// handle still gets a definitive membership answer.
@@ -689,6 +722,18 @@ impl SessionProcessBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn it_waits_for_a_session_to_be_found_and_no_longer_than_the_limit() {
+        let polls = std::cell::Cell::new(0);
+        let found = wait_until_found(Duration::from_secs(5), Duration::from_millis(1), || {
+            polls.set(polls.get() + 1);
+            polls.get() == 3
+        });
+        assert!(found);
+        assert_eq!(polls.get(), 3);
+        assert!(!wait_until_found(Duration::from_millis(5), Duration::from_millis(1), || false));
+    }
 
     #[test]
     fn slot_target_maps_to_the_plan_workspace_name() {

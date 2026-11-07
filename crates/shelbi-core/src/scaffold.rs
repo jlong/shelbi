@@ -477,11 +477,12 @@ keymap:
 ## to $EDITOR, then vim. The label is the editor's name (Edit in Neovim).
 # editor: vim
 
-## Diff tool View Diff runs over a branch's changes: a command in a pane
-## (difft, nvim -d) or an app: diff_tool: { app: /Applications/Kaleidoscope.app }.
-## Unset runs git's configured difftool (diff.tool / diff.guitool). A project's
+## What View Diff shows over a branch's changes: builtin (Shelbi's own diff
+## view, the default), git (git's configured difftool, diff.tool / diff.guitool),
+## a command in a pane (difft, nvim -d) or an app:
+## diff_tool: { app: /Applications/Kaleidoscope.app }. A project's
 ## review.diff_command takes precedence.
-# diff_tool: difft
+# diff_tool: builtin
 
 ## Color theme for the TUI and the desktop app: auto, dark, light. auto (what
 ## a config without this key gets) follows the system appearance in the

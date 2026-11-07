@@ -3873,6 +3873,8 @@ mod tests {
         }
         s.handle_key(key(KeyCode::Enter), &km);
         assert_eq!(s.tool_layer().setting(), Some(ToolSetting::DiffTool));
+        // Past Git's difftool, to Difftastic.
+        s.handle_key(key(KeyCode::Down), &km);
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(
             s.handle_key(key(KeyCode::Enter), &km),
@@ -3881,8 +3883,8 @@ mod tests {
         assert!(screen(&mut s, 100, 40).contains("Difftastic (difft)"), "pending shows the pick");
         s.config_written(Err("Couldn't save config.yaml: read-only".into()));
         let text = screen(&mut s, 100, 40);
-        assert!(text.contains("read-only") && text.contains("Git's difftool"), "{text}");
-        assert!(text.contains("Shelbi runs      Git's difftool (vimdiff)"), "{text}");
+        assert!(text.contains("read-only") && text.contains("Shelbi's diff view"), "{text}");
+        assert!(text.contains("Shelbi runs      Shelbi's diff view"), "{text}");
     }
 
     #[test]

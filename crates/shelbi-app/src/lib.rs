@@ -37,6 +37,8 @@
 //!   both clients' toolkit-free states type into.
 //! - [`theme`] — the named color tokens (dark and light) both clients
 //!   paint with, and the `theme:` preference resolution.
+//! - [`diff`] — Shelbi's own diff view: reading a changeset on any machine,
+//!   its model, comments, keys and state machine, for both clients to draw.
 //! - [`refresh`] — a runtime-agnostic background refresh worker that reads
 //!   state off the caller's thread and publishes immutable snapshots over a
 //!   channel. Threads and channels only, so a gpui client can consume it
@@ -82,6 +84,7 @@ pub mod changelog;
 pub mod changes;
 pub mod command;
 pub mod command_model;
+pub mod diff;
 pub mod exec;
 pub mod exec_daemon;
 pub mod far;

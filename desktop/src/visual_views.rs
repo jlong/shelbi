@@ -35,7 +35,11 @@
 //! (`about-command-grille.png`, `about-retro.png`, `about-racing-s.png`,
 //! `about-retro-racing-s.png`), the bootstrap
 //! screens (`bootstrap-progress.png`, `bootstrap-failure.png`) and the
-//! notice bars (`notice-bars.png`: the update and relaunch bars). It prints
+//! notice bars (`notice-bars.png`: the update and relaunch bars), and the
+//! built-in diff over a real worktree through the live deps, as a window opens
+//! it: `diff-review.png` (the branch), `diff-workspace.png` (plus what isn't
+//! committed), `diff-workspace-edited.png` (after an edit it noticed by itself).
+//! It prints
 //! one line per check and exits non-zero if any failed.
 
 use std::path::PathBuf;
@@ -46,7 +50,10 @@ use chrono::Utc;
 use gpui::{px, size, AnyWindowHandle, AppContext, Entity, VisualTestAppContext};
 use shelbi_core::{Column, Issue};
 
+use shelbi_app::diff::{DiffTarget, TargetKind};
+
 use crate::views::activity::ActivityView;
+use crate::views::diff_view::{DiffDeps, DiffView, FilePlace};
 use crate::views::issues::IssuesView;
 use crate::views::machines::MachinesView;
 use crate::theme::style::{Type, Typography};
@@ -428,6 +435,77 @@ pub fn run(out: PathBuf) -> ! {
         })))
     });
     save(&mut cx, window, &out, "bootstrap-failure.png");
+    // ---- The built-in diff, on real git, through the deps a window uses ----
+    let worktree = write_diff_worktree(&home);
+    let handle = shelbi_orchestrator::source::local_handle(PROJECT);
+    let deps = DiffDeps::live(&handle);
+    let target = |kind| DiffTarget {
+        project: PROJECT.to_string(),
+        workspace: "alpha".to_string(),
+        kind,
+        task: Some("diff-check".to_string()),
+    };
+    let place = FilePlace::Local(worktree.to_string_lossy().into_owned());
+    let (diff, window) = open(&mut cx, |cx| {
+        cx.new(|cx| DiffView::new(target(TargetKind::Review), place.clone(), &deps, cx))
+    });
+    let read = wait(&mut cx, window, Duration::from_secs(10), |cx| {
+        diff.read_with(cx, |d, _| !d.state().loading())
+    });
+    let paths = |cx: &mut VisualTestAppContext, diff: &Entity<DiffView>| -> Vec<String> {
+        diff.read_with(cx, |d, _| d.state().changeset().files.iter().map(|f| f.path.clone()).collect())
+    };
+    expect("diff: a worker's wake reaches the view", read);
+    expect("diff: a review shows the branch as it would merge", paths(&mut cx, &diff) == ["src/app.rs", "src/new.rs"]);
+    save(&mut cx, window, &out, "diff-review.png");
+
+    let (live, window) = open(&mut cx, |cx| {
+        cx.new(|cx| DiffView::new(target(TargetKind::Workspace), place.clone(), &deps, cx))
+    });
+    wait(&mut cx, window, Duration::from_secs(10), |cx| live.read_with(cx, |d, _| !d.state().loading()));
+    expect(
+        "diff: a workspace adds what isn't committed",
+        paths(&mut cx, &live) == ["src/app.rs", "src/new.rs", "src/untracked.rs"],
+    );
+    save(&mut cx, window, &out, "diff-workspace.png");
+    std::fs::write(worktree.join("src/later.rs"), "fn later() {}\n").unwrap();
+    let noticed = wait(&mut cx, window, Duration::from_secs(10), |cx| {
+        live.read_with(cx, |d, _| d.state().changeset().file_index("src/later.rs").is_some())
+    });
+    expect("diff: a workspace refreshes as the agent edits", noticed);
+    save(&mut cx, window, &out, "diff-workspace-edited.png");
+    live.update(&mut cx, |d, _| d.set_visible(false));
+    drop(live);
+    drop(diff);
+    // ---- The task's pull request in the diff ----
+    let pr_deps = DiffDeps::canned_with(
+        crate::views::diff_view::canned::SAMPLE_PATCH,
+        Some(Ok(crate::views::diff_view::canned::sample_pr())),
+        Default::default(),
+    );
+    let (pr_view, window) = open(&mut cx, |cx| {
+        cx.new(|cx| DiffView::new(target(TargetKind::Review), place.clone(), &pr_deps, cx))
+    });
+    let read = wait(&mut cx, window, Duration::from_secs(10), |cx| {
+        pr_view.update(cx, |d, cx| d.poll_now(cx));
+        pr_view.read_with(cx, |d, _| d.state().pr().details.is_some() && !d.state().loading())
+    });
+    expect("diff: the pull request's block and threads arrive", read);
+    save(&mut cx, window, &out, "diff-pr.png");
+    let press = |cx: &mut VisualTestAppContext, spec: &str| {
+        let chord = shelbi_state::keymap::KeyChord::parse(spec).expect("a key");
+        pr_view.update(cx, |d, cx| d.key(chord, cx));
+    };
+    press(&mut cx, "i");
+    save(&mut cx, window, &out, "diff-pr-info.png");
+    press(&mut cx, "esc");
+    press(&mut cx, "shift-r");
+    press(&mut cx, "tab");
+    save(&mut cx, window, &out, "diff-pr-review.png");
+    press(&mut cx, "esc");
+    press(&mut cx, "esc");
+    drop(pr_view);
+
     let (_, window) = open(&mut cx, |cx| {
         cx.new(|_| Screen(Box::new(|theme, _| {
             use gpui::{div, IntoElement, ParentElement, Styled};
@@ -533,6 +611,31 @@ fn save(cx: &mut VisualTestAppContext, window: AnyWindowHandle, out: &std::path:
     let path = out.join(name);
     image.save(&path).expect("save the frame");
     println!("saved {}", path.display());
+}
+
+/// The fixture workspace's worktree: a branch off `main` with a commit, an
+/// uncommitted edit and a new file.
+fn write_diff_worktree(home: &std::path::Path) -> PathBuf {
+    let worktree = home.join("work/.shelbi/wt/alpha");
+    std::fs::create_dir_all(worktree.join("src")).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").args(args).current_dir(&worktree).output().expect("run git");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q", "-b", "main"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["config", "user.email", "fixture@example.com"]);
+    let write = |path: &str, text: &str| std::fs::write(worktree.join(path), text).unwrap();
+    write("src/app.rs", "fn main() {\n    println!(\"hello\");\n}\n");
+    git(&["add", "."]);
+    git(&["commit", "-qm", "base"]);
+    git(&["checkout", "-qb", "jlong/diff-check"]);
+    write("src/app.rs", "fn main() {\n    println!(\"hello, world\");\n}\n");
+    write("src/new.rs", "pub fn added() -> u32 {\n    42\n}\n");
+    git(&["add", "."]);
+    git(&["commit", "-qm", "the branch"]);
+    write("src/untracked.rs", "// not committed yet\n");
+    worktree
 }
 
 fn write_fixtures(home: &std::path::Path) {

@@ -242,7 +242,7 @@ pub fn ensure_content_session(
     role: ReviewContentRole,
 ) -> Result<()> {
     ensure_content_session_with(project_name, task_id, role, |spec| {
-        SessionProcessBackend.spawn_session(spec).map(drop)
+        SessionProcessBackend.spawn_session_to_attach(spec)
     })
 }
 
@@ -402,6 +402,33 @@ fn worktree_ready_for_diff(worktree: &Path, branch: Option<&str>, slot_alive: bo
         "the review worktree hasn't checked out `{branch}` yet (it's still at {})",
         head.get(..8).unwrap_or(&head)
     )))
+}
+
+/// Whether `task_id`'s review worktree is checked out, so its diff is the
+/// task's and not the slot's previous one. Blocking (git, the board): for
+/// Shelbi's own diff view to wait on, off the UI thread. A slot on another
+/// machine has no local worktree to look at, so it's taken as ready.
+pub fn diff_ready(project_name: &str, task_id: &str) -> Result<()> {
+    let project = shelbi_state::load_project(project_name)?;
+    let Some(slot) = resolve_review_slot(project_name, &project, task_id)? else {
+        return Err(Error::Other(format!("`{task_id}` is not loaded on a review slot")));
+    };
+    let ws = project
+        .workspace(&slot)
+        .ok_or_else(|| Error::Other(format!("unknown review slot `{slot}`")))?;
+    let machine = project
+        .machine(&ws.machine)
+        .ok_or_else(|| Error::UnknownMachine(ws.machine.clone()))?;
+    if machine.host() != Host::Local {
+        return Ok(());
+    }
+    let branch = shelbi_state::resolve_issue_store(project_name, &project.issue_tracker)?
+        .get(task_id)?
+        .and_then(|tf| tf.task.branch);
+    let slot_alive = crate::workspace::workspace_target(&project, ws)
+        .and_then(|addr| crate::workspace::workspace_slot_alive(&Host::Local, &addr))
+        .unwrap_or(false);
+    worktree_ready_for_diff(&crate::workspace::workspace_worktree(machine, ws), branch.as_deref(), slot_alive)
 }
 
 /// The commit `rev` names in `worktree`, if it names one.

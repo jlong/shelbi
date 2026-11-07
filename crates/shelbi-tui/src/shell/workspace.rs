@@ -15,6 +15,10 @@
 //!   On any machine: a remote workspace's editor and diff run there, and
 //!   they (like its agent) attach through the machine's relay.
 //!
+//! With `diff_tool: builtin` (the default) View Diff is Shelbi's own live diff
+//! ([`DiffView`]) instead of a session; it's kept while the panel is open, so
+//! going to the agent and back keeps the cursor and folds.
+//!
 //! The panel's state machine is pure: a key/click yields a
 //! [`WsEffect`](crate::workspace_panel::WsEffect) which this type maps to a
 //! [`WorkspaceAction`] for the shell to carry out (switching the content
@@ -32,6 +36,7 @@ use shelbi_term::Size;
 
 use crate::workspace_panel::{render_full, WorkspacePanel, WsEffect, WsStatus};
 
+use super::diff_view::{DiffOpener, DiffOut, DiffSetup, DiffView};
 use super::session::{Connector, MainState, SessionManager, SessionRef};
 use super::terminal_view::MouseOutcome;
 
@@ -65,6 +70,8 @@ pub enum WorkspaceAction {
     /// Close (q): tear the content sessions down (the shell asks the daemon to
     /// end the editor/diff sessions) and return to the nav sidebar.
     Close,
+    /// The diff's `Ctrl-g`: open this file in the user's editor at this line.
+    OpenFile { path: std::path::PathBuf, line: Option<u32> },
 }
 
 /// The live workspace interface for one dev workspace.
@@ -79,6 +86,17 @@ pub struct WorkspaceInterface {
     task: Option<IssueFile>,
     /// A remote worktree's `host:path` (what the folder row copies).
     remote_address: Option<String>,
+    project: String,
+    /// Shelbi's own diff, once View Diff has shown it.
+    diff: Option<DiffView>,
+    /// The task the workspace is on now, which [`Self::diff`] is about. Unlike
+    /// [`Self::task`] this follows the board while the view stays open.
+    diff_task: Option<String>,
+    /// The main area shows [`Self::diff`].
+    diff_showing: bool,
+    diff_setup: DiffSetup,
+    /// A test's session in place of the worktree's.
+    diff_opener: Option<DiffOpener>,
 }
 
 impl WorkspaceInterface {
@@ -97,6 +115,7 @@ impl WorkspaceInterface {
         let workspace = workspace.into();
         let title = task.as_ref().map(|t| t.task.title.clone()).unwrap_or_default();
         let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
+        let diff_task = task.as_ref().map(|t| t.task.id.clone());
         let panel = WorkspacePanel::new(worktree, editor_name, agent_name, title, description, status);
         let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
             shelbi_app::session::WorkspaceContentRelauncher {
@@ -113,7 +132,85 @@ impl WorkspaceInterface {
             focus: WsFocus::Panel,
             task,
             remote_address: None,
+            project: project.to_string(),
+            diff: None,
+            diff_task,
+            diff_showing: false,
+            diff_setup: DiffSetup::default(),
+            diff_opener: None,
         }
+    }
+
+    /// The keys Shelbi's own diff reads.
+    pub fn with_diff_setup(mut self, setup: DiffSetup) -> Self {
+        self.diff_setup = setup;
+        self
+    }
+
+    /// The keymap changed in Settings.
+    pub fn set_diff_setup(&mut self, setup: DiffSetup) {
+        if let Some(diff) = self.diff.as_mut() {
+            diff.set_setup(setup.clone());
+        }
+        self.diff_setup = setup;
+    }
+
+    /// Whether View Diff is Shelbi's own view, not a session.
+    pub fn builtin_diff(&self) -> bool {
+        self.panel.apps.builtin_diff
+    }
+
+    /// Show Shelbi's own diff, opening it the first time, with the keyboard on
+    /// it: selecting it means reading it.
+    pub fn show_builtin_diff(&mut self) {
+        if self.diff.is_none() {
+            let task = self.diff_task.clone();
+            let opener = self.diff_opener.clone().unwrap_or_else(|| DiffView::workspace_opener(&self.project, &self.workspace, task));
+            let worktree = self.remote_address.is_none().then(|| self.panel.worktree.clone());
+            self.diff = Some(DiffView::new(opener, self.diff_setup.clone(), worktree, "No changes yet"));
+        }
+        if let Some(diff) = self.diff.as_mut() {
+            diff.set_showing(true);
+        }
+        self.diff_showing = true;
+        self.focus = WsFocus::Content;
+    }
+
+    /// The workspace is on `task` now. A diff left by another task has that
+    /// task's comments and viewed state, so it's replaced: at once when on show,
+    /// otherwise the next time View Diff is selected.
+    pub fn follow_task(&mut self, task: Option<&str>) {
+        if self.diff_task.as_deref() == task {
+            return;
+        }
+        self.diff_task = task.map(str::to_string);
+        self.diff = None;
+        if self.diff_showing {
+            let focus = self.focus;
+            self.show_builtin_diff();
+            self.focus = focus;
+        }
+    }
+
+    /// The main area is going to a session.
+    fn leave_diff(&mut self) {
+        self.diff_showing = false;
+        if let Some(diff) = self.diff.as_mut() {
+            diff.set_showing(false);
+        }
+    }
+
+    /// The diff on show, when it's the one on show.
+    fn showing_diff(&mut self) -> Option<&mut DiffView> {
+        self.diff.as_mut().filter(|_| self.diff_showing)
+    }
+
+    /// Whether the diff has the keyboard and takes `k` ahead of the shell's own
+    /// keys (`Ctrl-p`, the focus moves it rebinds).
+    pub fn diff_claims(&self, k: &KeyEvent) -> bool {
+        self.focus == WsFocus::Content
+            && self.diff_showing
+            && self.diff.as_ref().is_some_and(|diff| diff.claims(k))
     }
 
     /// Edit and View Diff open these in their apps (`editor:` /
@@ -121,6 +218,12 @@ impl WorkspaceInterface {
     pub fn with_apps(mut self, apps: shelbi_state::AppTools) -> Self {
         self.panel.apps = apps;
         self
+    }
+
+    /// Open `opener`'s session instead of the worktree's (test seam).
+    #[cfg(test)]
+    pub(crate) fn set_diff_opener(&mut self, opener: DiffOpener) {
+        self.diff_opener = Some(opener);
     }
 
     /// The workspace is on a remote machine at `address` (`host:path`): its
@@ -166,12 +269,14 @@ impl WorkspaceInterface {
     /// Bind the content view to the agent session (the already-live workspace
     /// session). Re-selecting it while failed re-attaches.
     pub fn show_agent(&mut self) {
+        self.leave_diff();
         self.content.show(SessionRef::Workspace(self.workspace.clone()));
     }
 
     /// Bind the content view to a daemon-spawned role session (the caller has
     /// already ensured it exists).
     pub fn show_role(&mut self, role: ReviewRole) {
+        self.leave_diff();
         self.content.show(SessionRef::WorkspaceContent {
             workspace: self.workspace.clone(),
             role: role.as_str().to_string(),
@@ -206,7 +311,8 @@ impl WorkspaceInterface {
     // -- background plumbing, delegated to the content SessionManager --------
 
     pub fn poll(&mut self) -> bool {
-        self.content.poll()
+        let changed = self.content.poll();
+        self.diff.as_mut().is_some_and(DiffView::poll) || changed
     }
 
     pub fn pump_output(&mut self, ring: &mut bool) -> bool {
@@ -244,7 +350,7 @@ impl WorkspaceInterface {
     /// only when a content session is live — so focus never lands on an
     /// empty/connecting content pane.
     pub fn focus_content(&mut self) {
-        if matches!(self.content.state(), MainState::Live(_)) {
+        if self.diff_showing || matches!(self.content.state(), MainState::Live(_)) {
             self.focus = WsFocus::Content;
         }
     }
@@ -260,10 +366,26 @@ impl WorkspaceInterface {
     /// the drop; the paste is best-effort and reaches only a live session.
     pub fn paste_into_content(&mut self, text: &str) {
         self.focus_content();
+        if let Some(diff) = self.showing_diff() {
+            diff.paste(text);
+            return;
+        }
         self.content.send_paste(text);
     }
 
     fn handle_content_key(&mut self, k: KeyEvent) -> WorkspaceAction {
+        if let Some(diff) = self.showing_diff() {
+            return match diff.key(k) {
+                DiffOut::None => WorkspaceAction::None,
+                DiffOut::FocusPanel => {
+                    self.focus = WsFocus::Panel;
+                    WorkspaceAction::None
+                }
+                DiffOut::Edit { path, line } => WorkspaceAction::OpenFile { path, line },
+                // A workspace's `gY` goes to its agent: only a review rejects.
+                DiffOut::Reject { .. } => WorkspaceAction::None,
+            };
+        }
         // Tab returns focus to the panel; everything else goes to the agent.
         if k.code == KeyCode::Tab && k.modifiers.is_empty() {
             self.focus = WsFocus::Panel;
@@ -288,9 +410,7 @@ impl WorkspaceInterface {
             // Tab moves focus to the content view (so the user can type in the
             // agent / editor) when one is live.
             KeyCode::Tab if k.modifiers.is_empty() => {
-                if matches!(self.content.state(), MainState::Live(_)) {
-                    self.focus = WsFocus::Content;
-                }
+                self.focus_content();
                 WorkspaceAction::None
             }
             // Esc returns to the nav sidebar (like the back arrow), leaving the
@@ -334,6 +454,10 @@ impl WorkspaceInterface {
             }
             return WorkspaceAction::None;
         }
+        if let Some(diff) = self.showing_diff() {
+            diff.mouse(m);
+            return WorkspaceAction::None;
+        }
         // Content area: forward to the content session like the main area does.
         let (pane_col, pane_row) = (
             m.column.saturating_sub(content_rect.x),
@@ -365,6 +489,10 @@ impl WorkspaceInterface {
     ) -> Option<(u16, u16)> {
         render_full(frame, &mut self.panel, panel_rect);
         let buf = frame.buffer_mut();
+        let keyboard = focus_main && self.focus == WsFocus::Content;
+        if let Some(diff) = self.showing_diff() {
+            return diff.render(buf, content_rect, truecolor, keyboard);
+        }
         let mut cursor = None;
         match self.content.state() {
             MainState::Empty => {}

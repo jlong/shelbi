@@ -93,7 +93,7 @@ pub use issue_auth::{
 };
 pub use github_store::GitHubStore;
 pub use github_store::{
-    search_issues, IssueSearchError, IssueSearchPage, ISSUE_SEARCH_MAX_RESULTS,
+    gh_failure_reason, graphql_read, graphql_write, search_issues, IssueSearchError, IssueSearchPage, ISSUE_SEARCH_MAX_RESULTS,
     ISSUE_SEARCH_PAGE_SIZE,
 };
 #[cfg(any(test, feature = "test-support"))]
@@ -1051,6 +1051,17 @@ pub struct ReviewLoadLock(#[allow(dead_code)] FileLockGuard);
 pub fn lock_review_load(project: &str) -> Result<ReviewLoadLock> {
     let path = project_dir(project)?.join("review-load.lock");
     Ok(ReviewLoadLock(acquire_file_lock(&path)?))
+}
+
+/// Public RAII handle for the lock on one task's stored diff review state.
+#[must_use = "the lock is released as soon as the guard is dropped"]
+pub struct DiffStateLock(#[allow(dead_code)] FileLockGuard);
+
+/// Block until the lock at `path` is held: the read-modify-write of a task's
+/// comments and viewed marks (`shelbi_app::diff::store`), across every client
+/// and the agents replying from the CLI.
+pub fn lock_diff_state(path: &Path) -> Result<DiffStateLock> {
+    Ok(DiffStateLock(acquire_file_lock(path)?))
 }
 
 /// Public RAII handle for the per-project Git worktree/ref lock.
@@ -4151,7 +4162,7 @@ fn split_frontmatter(s: &str) -> Option<(&str, &str)> {
 /// process writing the same target (TUI input thread + poller) can't
 /// scribble on each other's temp file. A failed write or rename removes
 /// its temp file instead of leaving litter.
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
 

@@ -52,6 +52,10 @@ impl DisplayStyle {
 /// since the `⇧` glyph already conveys the shift — no point doubling up.
 pub fn format_chord(chord: &KeyChord, style: DisplayStyle) -> String {
     let mut out = String::new();
+    if let Some(leader) = chord.leader {
+        out.push_str(&format_chord(&leader.chord(), style));
+        out.push(' ');
+    }
     let m = chord.mods;
     if m.contains(Mods::CONTROL) {
         out.push_str(match style {

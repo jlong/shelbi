@@ -118,6 +118,7 @@ use shelbi_term::Size;
 
 use crate::app::{HostCall, NativeViews, ShelbiWindow};
 use crate::elements::terminal::session::{Connected, SessionIo};
+use crate::views::diff_view::DiffDeps;
 use crate::views::review::{ReviewDeps, ReviewOps};
 use crate::views::session_view::{SessionConnector, SessionDeps};
 use crate::views::workspace::{WorkspaceDeps, WorkspaceOps};
@@ -1050,11 +1051,13 @@ impl Run {
                 ReviewDeps {
                     ops: Arc::new(Ops),
                     sessions: Rc::new(move |_task| d()),
+                    diff: DiffDeps::canned("", Arc::default()),
                 }
             };
             let workspace = WorkspaceDeps {
                 ops: Arc::new(Ops),
                 sessions: session_deps.clone(),
+                diff: DiffDeps::canned("", Arc::default()),
             };
             cx.new(|cx| {
                 ShelbiWindow::figma(

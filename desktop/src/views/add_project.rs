@@ -1731,8 +1731,8 @@ mod tests {
                 v.click(Focus::Primary, window, cx);
                 assert!(v.wizard().opening());
                 v.click(Focus::Primary, window, cx);
-                v.key(KeyChord { code: Key::Enter, mods: Mods::NONE }, window, cx);
-                v.key(KeyChord { code: Key::Esc, mods: Mods::NONE }, window, cx);
+                v.key(KeyChord::new(Key::Enter, Mods::NONE), window, cx);
+                v.key(KeyChord::new(Key::Esc, Mods::NONE), window, cx);
             })
         });
         assert!(r.drawn("add-project-opening"), "the spinner shows while it opens");

@@ -43,6 +43,10 @@
 //!   drawn, so it never falls back to the Reviewer. After 15s it says why it
 //!   couldn't, in the view, with a Retry. The pane stays attached and sized
 //!   under the words, so the tool draws at the size it will be shown at.
+//! - **Shelbi's own diff.** With `diff_tool: builtin` (the default), View Diff
+//!   is a [`DiffView`] in the content's place, not a pane: nothing to ensure
+//!   and no wait, on a remote slot too. An external tool keeps the paragraph
+//!   above.
 //! - **Approve and Reject** go back to the window as registry commands
 //!   (`ApproveReview` / `RejectReview`), which run the daemon's gated merge
 //!   or open the reject-reason overlay. While a decision is in flight the
@@ -68,6 +72,7 @@ use gpui::{
     div, prelude::*, px, AnyElement, AnyWindowHandle, Bounds, Context, Entity, EventEmitter, FocusHandle,
     Focusable, Pixels, SharedString, Subscription, Task, Window,
 };
+use shelbi_app::diff::{DiffTarget, TargetKind};
 use shelbi_app::review::diff_load::{
     DiffLoad, DiffLoadView, DiffSeen, DIFF_FAILED_TITLE, DIFF_RETRY_LABEL, LOADING_DIFF,
 };
@@ -80,6 +85,7 @@ use shelbi_app::view::{ReviewRow, ReviewState};
 use shelbi_app::{CommandKind, ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
 use shelbi_core::{Column, StatusCategory};
 
+use super::diff_view::{DiffDeps, DiffView, DiffViewEvent, FilePlace};
 use super::session_view::{
     OnDeath, SessionDeps, SessionPhase, SessionView, SessionViewEvent, REVIEW_TERMINAL_INSET_X,
 };
@@ -233,6 +239,8 @@ pub struct ReviewDeps {
     /// Builds the content pane's session deps for a review task (its
     /// relauncher re-ensures that task's editor and diff).
     pub sessions: Rc<dyn Fn(&str) -> SessionDeps>,
+    /// Opens Shelbi's own diff view.
+    pub diff: DiffDeps,
 }
 
 impl ReviewDeps {
@@ -251,6 +259,7 @@ impl ReviewDeps {
                     }),
                 )
             }),
+            diff: DiffDeps::live(project),
         }
     }
 }
@@ -263,6 +272,8 @@ pub enum ReviewEvent {
     /// Run a registry command: `ApproveReview`, or `RejectReview` with no
     /// reason (which asks for one).
     Command(CommandKind),
+    /// `gY` in the diff: Reject, its reason starting from the comments.
+    RejectWith { id: String, reason: String },
     /// Leave the review loaded and go back to the previous view.
     Back,
     /// More: open this task's detail over the screen.
@@ -299,6 +310,14 @@ struct Shown {
     diff_drawn: Option<DiffLoadView>,
     /// The content pane's clock.
     clock: Rc<dyn Fn() -> Instant>,
+    /// Shelbi's own diff, once View Diff was shown. It keeps its place while
+    /// another view is up; a review's checkout doesn't move, so it's idle.
+    diff: Option<ShownDiff>,
+}
+
+struct ShownDiff {
+    view: Entity<DiffView>,
+    _events: Subscription,
 }
 
 /// The Review view for one project window. It shows one review at a time;
@@ -310,6 +329,10 @@ pub struct ReviewView {
     window: AnyWindowHandle,
     ops: Arc<dyn ReviewOps>,
     sessions: Rc<dyn Fn(&str) -> SessionDeps>,
+    diff_deps: DiffDeps,
+    /// The keyboard moves to the content at the next frame: a view switch
+    /// swapped what it's in.
+    refocus: bool,
     sink: Option<SessionSink>,
     review: Option<Shown>,
     shown: bool,
@@ -366,6 +389,8 @@ impl ReviewView {
             window,
             ops: deps.ops,
             sessions: deps.sessions,
+            diff_deps: deps.diff,
+            refocus: false,
             shell,
             shell_open: false,
             shell_starting: false,
@@ -556,6 +581,7 @@ impl ReviewView {
             diff_load: None,
             diff_drawn: None,
             clock,
+            diff: None,
         }
     }
 
@@ -573,6 +599,9 @@ impl ReviewView {
                 load.left();
             }
             r.content.update(cx, |c, cx| c.hide(cx));
+            if let Some(diff) = &r.diff {
+                diff.view.update(cx, |d, _| d.set_visible(false));
+            }
         }
         cx.notify();
     }
@@ -614,10 +643,18 @@ impl ReviewView {
                 if r.info.editor_name == fresh.editor_name && r.info.apps == fresh.apps {
                     return;
                 }
+                let diff_changed = r.info.apps.builtin_diff != fresh.apps.builtin_diff;
                 r.info.editor_name = fresh.editor_name;
                 r.info.apps = fresh.apps;
                 r.model = ReviewPanelModel::build(&r.info, r.row.as_ref());
                 r.panel.sync(&r.model);
+                // View Diff is up, and now means the other thing.
+                if diff_changed {
+                    r.diff = None;
+                    if r.panel.active() == ActiveView::Diff {
+                        this.select_view(ActiveView::Diff, cx);
+                    }
+                }
                 cx.notify();
             })
             .ok();
@@ -687,12 +724,31 @@ impl ReviewView {
     /// Where keyboard focus goes when the main area takes it: the content
     /// terminal once the user moved there, else the panel.
     pub fn focus_target(&self, cx: &gpui::App) -> FocusHandle {
+        if let (Some(diff), ReviewFocus::Content) = (self.diff_on_show(), self.focus) {
+            return diff.read(cx).focus_handle(cx);
+        }
         match (&self.review, self.focus) {
             (Some(r), ReviewFocus::Content) if r.content.read(cx).pane().is_some() => {
                 r.content.read(cx).focus_target(cx)
             }
             _ => self.focus_handle.clone(),
         }
+    }
+
+    /// Where the keyboard goes when the diff went off screen holding it (a view
+    /// chord, a click on another view): the view that's up now, which takes it
+    /// from its own handle once its pane attaches. Left on a handle that isn't
+    /// drawn, no key would reach anything, the window's chords included.
+    fn focus_off_hidden_diff(&self, window: &Window, cx: &gpui::App) -> Option<FocusHandle> {
+        let r = self.review.as_ref()?;
+        let diff = r.diff.as_ref().filter(|d| d.view.read(cx).contains_focus(window))?;
+        if self.diff_on_show().is_some_and(|shown| shown == &diff.view) {
+            return None;
+        }
+        Some(match self.focus {
+            ReviewFocus::Content => r.content.read(cx).focus_target(cx),
+            ReviewFocus::Panel => self.focus_handle.clone(),
+        })
     }
 
     /// Give the panel keyboard focus (the sidebar chord while the panel holds
@@ -711,6 +767,18 @@ impl ReviewView {
                 .review
                 .as_ref()
                 .is_some_and(|r| r.content.read(cx).contains_focus(window, cx))
+            || self.diff_with_focus(window, cx).is_some()
+    }
+
+    /// The built-in diff, while it's what the main area shows.
+    pub fn diff_on_show(&self) -> Option<&Entity<DiffView>> {
+        let r = self.review.as_ref()?;
+        (r.panel.active() == ActiveView::Diff).then_some(r.diff.as_ref()).flatten().map(|d| &d.view)
+    }
+
+    /// The built-in diff, while it has the keyboard.
+    pub fn diff_with_focus(&self, window: &Window, cx: &gpui::App) -> Option<&Entity<DiffView>> {
+        self.diff_on_show().filter(|d| d.read(cx).contains_focus(window))
     }
 
     fn show_active(&mut self, cx: &mut Context<Self>) {
@@ -748,7 +816,11 @@ impl ReviewView {
             }
         }
         if view == ActiveView::Diff {
-            self.select_diff(cx);
+            if self.review.as_ref().is_some_and(|r| r.info.apps.builtin_diff) {
+                self.show_builtin_diff(cx);
+            } else {
+                self.select_diff(cx);
+            }
             return;
         }
         let Some(role) = view.role() else {
@@ -769,6 +841,60 @@ impl ReviewView {
                 }
             }
         });
+    }
+
+    /// View Diff is Shelbi's own: show the view, opening it the first time.
+    /// The pane behind it detaches; the sessions stay with the daemon.
+    fn show_builtin_diff(&mut self, cx: &mut Context<Self>) {
+        let far = self.diff_deps.far.clone();
+        let deps = self.diff_deps.clone();
+        let project = self.project.clone();
+        let focus = self.focus;
+        // A pane waiting for the push no longer has anything to attach to.
+        self.held = None;
+        let Some(r) = self.review.as_mut() else {
+            return;
+        };
+        r.content.update(cx, |c, cx| c.hide(cx));
+        let info = &r.info;
+        let opened = r.diff.get_or_insert_with(|| {
+            let target = DiffTarget {
+                project,
+                workspace: info.slot.clone(),
+                kind: TargetKind::Review,
+                task: Some(info.task_id.clone()),
+            };
+            let place = match (far, &info.remote_machine) {
+                (Some(why), _) => FilePlace::Elsewhere(why),
+                (None, Some(machine)) => FilePlace::Elsewhere(format!("The file is on {machine}: there's no worktree here to open.")),
+                (None, None) => FilePlace::Local(info.worktree.clone()),
+            };
+            let view = cx.new(|cx| DiffView::new(target, place, &deps, cx));
+            let events = cx.subscribe(&view, |this, _, ev: &DiffViewEvent, cx| match ev {
+                DiffViewEvent::Focused => {
+                    this.focus = ReviewFocus::Content;
+                    cx.emit(ReviewEvent::Focused);
+                }
+                DiffViewEvent::ReleaseFocus => {
+                    this.focus = ReviewFocus::Panel;
+                    this.refocus = true;
+                    cx.notify();
+                }
+                DiffViewEvent::Reject(reason) => {
+                    if let Some(id) = this.task_id().map(str::to_string) {
+                        cx.emit(ReviewEvent::RejectWith { id, reason: reason.clone() });
+                    }
+                }
+            });
+            ShownDiff { view, _events: events }
+        });
+        opened.view.update(cx, |d, cx| {
+            d.set_visible(true);
+            if focus == ReviewFocus::Content {
+                d.request_focus(cx);
+            }
+        });
+        cx.notify();
     }
 
     /// View Diff was selected: start or resume the wait for the diff.
@@ -993,6 +1119,12 @@ impl ReviewView {
             }
             PanelEffect::ShowDiff => {
                 self.set_status(None, cx);
+                // Shelbi's own diff is driven from the keyboard: asking for it
+                // hands it the keys, with Esc to come back.
+                if self.review.as_ref().is_some_and(|r| r.info.apps.builtin_diff) {
+                    self.focus = ReviewFocus::Content;
+                    cx.emit(ReviewEvent::Focused);
+                }
                 self.select_view(ActiveView::Diff, cx);
             }
             PanelEffect::ShowEditor => {
@@ -1180,7 +1312,10 @@ impl ReviewView {
         };
         // Tab moves to the content terminal once it is live (the TUI's).
         if chord.code == shelbi_state::keymap::Key::Tab && chord.mods.is_empty() {
-            if let Some(r) = &self.review {
+            if let Some(target) = self.diff_on_show().map(|d| d.read(cx).focus_handle(cx)) {
+                self.focus = ReviewFocus::Content;
+                window.focus(&target, cx);
+            } else if let Some(r) = &self.review {
                 if r.content.read(cx).pane().is_some() && !r.panel.is_merging() {
                     self.focus = ReviewFocus::Content;
                     let target = r.content.read(cx).focus_target(cx);
@@ -1522,7 +1657,19 @@ impl ReviewView {
         let waiting = !shown.resolved || self.held.is_some();
         // The pane stays laid out under the wait, sized for when it shows.
         let cover = self.diff_cover(cx);
-        let content = div()
+        let builtin = self.diff_on_show().cloned();
+        let content = match builtin {
+            Some(diff) => div()
+                .debug_selector(|| "review-content".into())
+                .relative()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .h_full()
+                .child(diff)
+                .into_any_element(),
+            None => div()
             .debug_selector(|| "review-content".into())
             .relative()
             .flex()
@@ -1540,7 +1687,8 @@ impl ReviewView {
                     .child(shown.content.clone()),
             )
             .children(cover.map(|view| self.render_diff_cover(view, &theme, cx)))
-            .into_any_element();
+            .into_any_element(),
+        };
         let shell = self.shell_open.then(|| {
             if self.shell_starting {
                 div()
@@ -1650,6 +1798,13 @@ fn active_switch_id(panel: &ReviewPanelState) -> Option<&'static str> {
 
 impl Render for ReviewView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(target) = self.focus_off_hidden_diff(window, cx) {
+            window.focus(&target, cx);
+        }
+        if std::mem::take(&mut self.refocus) {
+            let target = self.focus_target(cx);
+            window.focus(&target, cx);
+        }
         let theme = *cx.global::<Theme>();
         // The current view switch's chip slides when the main area changes.
         let chip = {
@@ -1963,6 +2118,7 @@ pub(crate) mod tests {
                         clock: Rc::new(move || start + *clock.elapsed.lock().unwrap()),
                     }
                 }),
+                diff: DiffDeps::canned(crate::views::diff_view::canned::SAMPLE_PATCH, Arc::default()),
             }
         };
         (deps, sessions, ops)
@@ -2007,12 +2163,12 @@ pub(crate) mod tests {
         h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
         let mut fresh = info();
         fresh.editor_name = "Zed".into();
-        fresh.apps = shelbi_state::AppTools { editor: true, diff: true };
+        fresh.apps = shelbi_state::AppTools { editor: true, diff: true, ..Default::default() };
         *h.ops.resolve_with.lock().unwrap() = Some(Ok(ReviewTarget::Serving(fresh)));
         h.update(|v, cx| v.tools_changed(cx));
         let model = h.view.read_with(&h.cx, |v, _| v.model().cloned()).unwrap();
         assert_eq!(model.editor_name, "Zed");
-        assert_eq!(model.apps, shelbi_state::AppTools { editor: true, diff: true });
+        assert_eq!(model.apps, shelbi_state::AppTools { editor: true, diff: true, ..Default::default() });
         assert_eq!(model.title, info().title, "the rest of the review is kept");
     }
 
@@ -2114,6 +2270,106 @@ pub(crate) mod tests {
     }
 
     const DIFF_SESSION: &str = "demo/review/review-1/diff";
+
+    fn builtin_info() -> ReviewInfo {
+        let mut i = info();
+        i.apps.builtin_diff = true;
+        i
+    }
+
+    fn diff_up(h: &Harness) -> bool {
+        h.view.read_with(&h.cx, |v, _| v.diff_on_show().is_some())
+    }
+
+    /// Let the canned diff's worker land.
+    fn load_diff(h: &mut Harness) {
+        let diff = h.view.read_with(&h.cx, |v, _| v.diff_on_show().cloned()).expect("the diff is up");
+        let start = Instant::now();
+        loop {
+            h.cx.update(|_, cx| diff.update(cx, |d, cx| d.poll_now(cx)));
+            h.cx.run_until_parked();
+            if !h.cx.update(|_, cx| diff.read(cx).state().loading()) || start.elapsed() > Duration::from_secs(10) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        h.draw();
+    }
+
+    #[gpui::test]
+    fn the_builtin_diff_replaces_the_pane_with_no_session(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(builtin_info(), None, cx));
+        h.click("review-switch-diff");
+        h.draw();
+        assert_eq!(h.active(), ActiveView::Diff);
+        assert!(diff_up(&h));
+        assert!(h.drawn("diff-view"));
+        assert_eq!(h.diff_ensures(), 0, "nothing asked of the daemon");
+        assert!(!h.sessions.attached().iter().any(|n| n == DIFF_SESSION));
+        let target = h.view.read_with(&h.cx, |v, cx| v.diff_on_show().unwrap().read(cx).target().clone());
+        assert_eq!(target.kind, shelbi_app::diff::TargetKind::Review);
+        assert_eq!(target.workspace, "review-1");
+        assert_eq!(target.task.as_deref(), Some("t-1"));
+        // It takes the keys, and Esc hands them to the panel.
+        let in_diff = h.cx.update(|window, cx| h.view.read(cx).diff_with_focus(window, cx).is_some());
+        assert!(in_diff, "asking for it hands it the keyboard");
+        load_diff(&mut h);
+        h.key("j");
+        let moved = h.view.read_with(&h.cx, |v, cx| v.diff_on_show().unwrap().read(cx).state().cursor());
+        assert_eq!(moved, 1);
+        h.key("escape");
+        h.draw();
+        let in_panel = h.cx.update(|window, cx| h.view.read(cx).focus_handle.is_focused(window));
+        assert!(in_panel);
+        // Reviewer again: the pane reattaches and the diff keeps its place.
+        h.click("review-switch-chat");
+        h.draw();
+        assert!(!h.drawn("diff-view"));
+        assert_eq!(h.content_phase(), SessionPhase::Live);
+        h.click("review-switch-diff");
+        h.draw();
+        let kept = h.view.read_with(&h.cx, |v, cx| v.diff_on_show().unwrap().read(cx).state().cursor());
+        assert_eq!(kept, 1);
+    }
+
+    #[gpui::test]
+    fn an_external_tool_keeps_its_pane(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), None, cx));
+        h.click("review-switch-diff");
+        h.draw();
+        assert!(!diff_up(&h));
+        assert!(!h.drawn("diff-view"));
+        assert_eq!(h.diff_ensures(), 1);
+    }
+
+    #[gpui::test]
+    fn a_remote_slot_offers_the_builtin_diff(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        let mut remote = builtin_info();
+        remote.remote_machine = Some("gpu".into());
+        h.update(|v, cx| v.show(remote, None, cx));
+        h.draw();
+        assert!(h.drawn("review-switch-diff"));
+        assert!(!h.drawn("review-switch-editor"));
+        h.click("review-switch-diff");
+        assert!(diff_up(&h));
+    }
+
+    #[gpui::test]
+    fn the_tool_changing_swaps_what_view_diff_shows(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(builtin_info(), None, cx));
+        h.click("review-switch-diff");
+        assert!(diff_up(&h));
+        *h.ops.resolve_with.lock().unwrap() = Some(Ok(ReviewTarget::Serving(info())));
+        h.update(|v, cx| v.tools_changed(cx));
+        h.draw();
+        assert!(!diff_up(&h), "the external tool now");
+        assert_eq!(h.active(), ActiveView::Diff);
+        assert_eq!(h.diff_ensures(), 1);
+    }
 
     #[gpui::test]
     fn a_ready_diff_opens_with_no_loading(cx: &mut TestAppContext) {

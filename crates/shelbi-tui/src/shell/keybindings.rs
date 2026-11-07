@@ -311,7 +311,7 @@ impl KeysPage {
 
     fn settle(&mut self, outcome: KeyOutcome) -> KeysAction {
         match outcome {
-            KeyOutcome::Ignored | KeyOutcome::Cancelled | KeyOutcome::Conflict => KeysAction::Stay,
+            KeyOutcome::Ignored | KeyOutcome::Cancelled | KeyOutcome::Conflict | KeyOutcome::Waiting => KeysAction::Stay,
             KeyOutcome::Save(change) => {
                 self.error = None;
                 KeysAction::Save(change)
