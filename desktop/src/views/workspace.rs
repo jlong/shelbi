@@ -246,6 +246,10 @@ pub struct WorkspaceView {
     /// The keyboard moves to the left pane at the next frame: a view switch
     /// swapped what it's in.
     refocus: bool,
+    /// A click asked for the content (the workspace's sidebar row, a panel
+    /// view): the next frame hands it the keys
+    /// ([`Self::land_wanted_content`]), unless they've left the view since.
+    content_wanted: bool,
     /// The user shell beside it.
     shell: Entity<SessionView>,
     shell_open: bool,
@@ -329,6 +333,7 @@ impl WorkspaceView {
             diff: None,
             diff_deps: deps.diff,
             refocus: false,
+            content_wanted: false,
             shell,
             shell_open: false,
             shell_starting: false,
@@ -416,6 +421,7 @@ impl WorkspaceView {
         self.shown = false;
         self.split.dragging = false;
         self.held = None;
+        self.content_wanted = false;
         self.close_panes(cx);
         cx.notify();
     }
@@ -499,8 +505,67 @@ impl WorkspaceView {
     /// the sidebar's column).
     pub fn focus_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus = WsFocus::Panel;
+        self.content_wanted = false;
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    /// Whether the content's terminal has the keys, for the window's tests.
+    #[cfg(test)]
+    pub(crate) fn content_has_keys(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.content
+            .read(cx)
+            .pane()
+            .is_some_and(|p| p.read(cx).focus_handle(cx).is_focused(window))
+    }
+
+    /// A click opened this workspace (its sidebar row) or one of its views:
+    /// the content takes the keys, its terminal once the pane attaches. The
+    /// keyboard's Enter leaves them on the panel. Lands at the next frame;
+    /// without the panel (an idle workspace) the agent pane has them already.
+    pub fn want_content(&mut self, cx: &mut Context<Self>) {
+        if self.has_panel() {
+            self.content_wanted = true;
+            cx.notify();
+        }
+    }
+
+    /// Hand the keys to the content a click asked for, unless they've left the
+    /// view (a dialog, a field, the palette took them). The terminal takes
+    /// them when its pane is the shown view's; otherwise its session view
+    /// does, which hands them on when the pane attaches.
+    fn land_wanted_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !std::mem::take(&mut self.content_wanted) {
+            return;
+        }
+        if !self.shown || !self.contains_focus(window, cx) {
+            return;
+        }
+        let target = match self.diff_on_show() {
+            Some(diff) => diff.read(cx).focus_handle(cx),
+            None => {
+                let content = self.content.read(cx);
+                let shown = self.view_target(self.panel.active());
+                match content.pane() {
+                    Some(pane) if &shown == content.target() => pane.read(cx).focus_handle(cx),
+                    _ => Focusable::focus_handle(content, cx),
+                }
+            }
+        };
+        self.focus = WsFocus::Content;
+        window.focus(&target, cx);
+        cx.emit(WorkspaceEvent::Focused);
+    }
+
+    /// The session `view` shows in the left pane (an external diff's too).
+    fn view_target(&self, view: ContentView) -> SessionRef {
+        match view.role() {
+            None => self.agent_target(),
+            Some(role) => SessionRef::WorkspaceContent {
+                workspace: self.workspace.clone().unwrap_or_default(),
+                role: role.as_str().to_string(),
+            },
+        }
     }
 
     /// Whether keyboard focus is in the view: its panel or one of its
@@ -700,9 +765,15 @@ impl WorkspaceView {
     /// A click on a panel row.
     fn click(&mut self, row: WsRow, window: &mut Window, cx: &mut Context<Self>) {
         self.focus = WsFocus::Panel;
+        self.content_wanted = false;
         window.focus(&self.focus_handle, cx);
         let effect = self.panel.click(row);
+        // A view picked with the mouse is ready for the keyboard.
+        let view = matches!(effect, WsEffect::ShowAgent | WsEffect::ShowDiff | WsEffect::ShowEditor);
         self.apply(effect, window, cx);
+        if view {
+            self.want_content(cx);
+        }
         cx.notify();
     }
 
@@ -823,6 +894,7 @@ impl WorkspaceView {
                 }
                 DiffViewEvent::ReleaseFocus => {
                     this.focus = WsFocus::Panel;
+                    this.content_wanted = false;
                     this.refocus = true;
                     cx.notify();
                 }
@@ -1415,6 +1487,7 @@ impl Render for WorkspaceView {
             let target = self.focus_target(cx);
             window.focus(&target, cx);
         }
+        self.land_wanted_content(window, cx);
         let theme = *cx.global::<Theme>();
         // The current view switch's chip slides when the main area changes.
         let chip = {
@@ -2469,7 +2542,11 @@ pub(crate) mod tests {
 
         // Back.
         h.click("ws-back");
-        assert_eq!(h.events(), vec![WorkspaceEvent::OpenTask("t-1".into()), WorkspaceEvent::Back]);
+        let events = h.events();
+        // A view clicked hands its content the keys (`nav-click-focuses-content`).
+        assert!(events.contains(&WorkspaceEvent::Focused), "{events:?}");
+        let rest: Vec<_> = events.into_iter().filter(|e| *e != WorkspaceEvent::Focused).collect();
+        assert_eq!(rest, vec![WorkspaceEvent::OpenTask("t-1".into()), WorkspaceEvent::Back]);
     }
 
     #[gpui::test]

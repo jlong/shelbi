@@ -234,6 +234,12 @@ impl ChangelogView {
         self.needs_focus = true;
     }
 
+    /// Whether the view's own handle has the keys, for the window's tests.
+    #[cfg(test)]
+    pub(crate) fn has_keys(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
+    }
+
     fn tick(&mut self, cx: &mut Context<Self>) {
         if let Some(Some(data)) = self.refresher.latest() {
             self.model.set_data(data);

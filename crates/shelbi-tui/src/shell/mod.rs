@@ -1306,6 +1306,11 @@ struct ShellState {
     /// after the user navigated away (or started opening a different review) is
     /// dropped (`rt-tui-review-load-queued`).
     review_opening: Option<String>,
+    /// A click opened the review or workspace being opened: once its interface
+    /// is up, its content takes the keys (the keyboard's Enter leaves them on
+    /// the panel). Any other open starts it over, as does a slot picker in
+    /// between (the dialog's answer reopens it).
+    content_on_open: bool,
     /// The task this client loaded onto a slot and is now waiting to see serve:
     /// the matching daemon `ReviewOpened` opens the interface, while a
     /// background `ReviewOpened` (another client's load, a poller resume) for
@@ -1706,6 +1711,7 @@ impl ShellState {
             reject_reasons: HashMap::new(),
             review_backend: Arc::new(DaemonReviewBackend),
             review_opening: None,
+            content_on_open: false,
             review_open_pending: None,
             workspace: None,
             workspace_rx: None,
@@ -2314,6 +2320,7 @@ impl ShellState {
         self.review_rx = None;
         self.decisions.clear();
         self.review_opening = None;
+        self.content_on_open = false;
         self.review_open_pending = None;
         self.reconcile_rx = None;
         self.workspace_rx = None;
@@ -4308,7 +4315,34 @@ impl ShellState {
     /// either builds the interface or raises the slot picker. The main view is
     /// left alone until that lands, so a queued task raises the picker rather
     /// than flashing an empty review.
+    /// A click opened a review or workspace row (see `content_on_open`): an
+    /// interface already up wants its content now, one still opening once it
+    /// is built.
+    fn want_content_on_open(&mut self) {
+        if self.review_opening.is_some() || self.workspace_opening.is_some() {
+            self.content_on_open = true;
+            return;
+        }
+        match &self.main_view {
+            MainView::Review(_) => {
+                if let Some(r) = self.review.as_mut() {
+                    r.want_content();
+                }
+            }
+            MainView::Workspace(_) => {
+                if let Some(w) = self.workspace.as_mut() {
+                    w.want_content();
+                }
+            }
+            // An idle workspace's session (or anything else) is the main
+            // area itself, already focused by `show`.
+            _ => {}
+        }
+    }
+
     fn begin_review(&mut self, task_id: String) {
+        // A click sets it again once this returns (`want_content_on_open`).
+        self.content_on_open = false;
         // Already showing this review — no-op.
         if self.review.as_ref().map(|r| r.task_id()) == Some(task_id.as_str())
             && matches!(self.main_view, MainView::Review(_))
@@ -4376,6 +4410,11 @@ impl ShellState {
         )
         .with_apps(p.apps)
         .with_diff_setup(setup));
+        if std::mem::take(&mut self.content_on_open) {
+            if let Some(r) = self.review.as_mut() {
+                r.want_content();
+            }
+        }
         self.sync_review_decision();
         self.reported_main = None; // re-report size for the content view
         self.status = None;
@@ -4959,6 +4998,8 @@ impl ShellState {
     /// (worktree, editor, in-progress task) off the UI thread, then build the
     /// interface when the resolve lands. Mirrors [`begin_review`](Self::begin_review).
     fn begin_workspace(&mut self, name: String) {
+        // A click sets it again once this returns (`want_content_on_open`).
+        self.content_on_open = false;
         if self.workspace.as_ref().map(|w| w.workspace()) == Some(name.as_str())
             && matches!(self.main_view, MainView::Workspace(_))
         {
@@ -5071,6 +5112,11 @@ impl ShellState {
         .with_apps(p.apps)
         .with_diff_setup(setup)
         .with_remote_address(p.remote_address));
+        if std::mem::take(&mut self.content_on_open) {
+            if let Some(w) = self.workspace.as_mut() {
+                w.want_content();
+            }
+        }
         self.reported_main = None;
         self.status = None;
         self.dirty = true;
@@ -5658,7 +5704,16 @@ impl ShellState {
                         // native view, session, review, or workspace — so the
                         // next keystroke drives what was opened.
                         if let Some(target) = view.target_at(sel) {
+                            let task_panel = matches!(
+                                target,
+                                RowTarget::Review(_) | RowTarget::Session(SessionRef::Workspace(_))
+                            );
                             self.show(target);
+                            // A click lands the keys on what it opened: a
+                            // review or workspace's content, past its panel.
+                            if task_panel {
+                                self.want_content_on_open();
+                            }
                         }
                     }
                 }
@@ -7968,6 +8023,26 @@ mod tests {
         assert_eq!(st.client.focus(), Focus::Main);
     }
 
+    #[test]
+    fn clicking_any_nav_row_hands_the_keys_to_the_main_pane() {
+        // nav-click-focuses-content: every nav row, the one already shown
+        // included, leaves the keyboard on what it opened, wherever focus was.
+        let mut st = test_state();
+        st.sidebar_rect = Rect::new(0, 0, 28, 40);
+        st.main_rect = Rect::new(28, 0, 92, 40);
+        // Orchestrator (y=5), Issues (y=7), Changelog (y=9); Issues twice, the
+        // second time while it already shows.
+        for (y, label) in [(5, "Orchestrator"), (7, "Issues"), (9, "Changelog"), (7, "Issues"), (7, "Issues again")] {
+            st.client.focus_sidebar();
+            st.handle_event(Event::Mouse(left_click(5, y)));
+            assert_eq!(st.client.focus(), Focus::Main, "{label}: the click focused the main pane");
+            let sel = st.selection();
+            st.handle_event(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+            assert_eq!(st.selection(), sel, "{label}: the next key went to the main pane, not the sidebar");
+        }
+        assert!(matches!(st.main_view, MainView::Native(View::Issues)));
+    }
+
     /// Poll the main-area session manager until its in-flight connect settles,
     /// so a test can assert the resolved [`MainState`].
     fn settle_sessions(st: &mut ShellState) {
@@ -8919,6 +8994,56 @@ mod tests {
         assert!(matches!(st.main_view, MainView::Review(id) if id == "T-1"));
         assert_eq!(st.review.as_ref().map(|r| r.task_id()), Some("T-1"));
         assert!(st.review_open_pending.is_none());
+    }
+
+    #[test]
+    fn a_clicked_review_row_hands_its_content_the_keys_once_it_is_up() {
+        // nav-click-focuses-content: the click's wish rides the async open to
+        // the interface; Enter's open (show alone) leaves the keys on the panel.
+        let stub = Arc::new(StubReviewBackend::default());
+        let mut st = test_state();
+        st.review_backend = stub.clone();
+        let serving = |task: &str| {
+            Ok(ResolvedReview::Serving(ReviewOpenParams {
+                task_id: task.into(),
+                slot: "review-1".into(),
+                worktree: "/wt".into(),
+                editor_name: "Vim".into(),
+                apps: Default::default(),
+                has_review_url: false,
+                task: None,
+            }))
+        };
+
+        // Enter: no wish.
+        stub.stage_resolve(serving("T-1"));
+        st.show(RowTarget::Review("T-1".into()));
+        pump_review(&mut st);
+        assert!(matches!(st.main_view, MainView::Review(ref id) if id == "T-1"));
+        assert!(!st.review.as_ref().unwrap().wants_content(), "Enter keeps the panel's keys");
+
+        // A click on the review already shown: its content wants the keys now.
+        st.show(RowTarget::Review("T-1".into()));
+        st.want_content_on_open();
+        assert!(st.review.as_ref().unwrap().wants_content());
+        assert!(!st.content_on_open);
+
+        // A click on another review: the wish waits for its interface.
+        stub.stage_resolve(serving("T-2"));
+        st.show(RowTarget::Review("T-2".into()));
+        st.want_content_on_open();
+        assert!(st.content_on_open, "the open is still in flight");
+        pump_review(&mut st);
+        assert!(matches!(st.main_view, MainView::Review(ref id) if id == "T-2"));
+        assert!(st.review.as_ref().unwrap().wants_content(), "the new review wants its content");
+        assert!(!st.content_on_open, "taken by the interface");
+
+        // A keyboard open after a click starts over.
+        st.content_on_open = true;
+        stub.stage_resolve(serving("T-3"));
+        st.show(RowTarget::Review("T-3".into()));
+        pump_review(&mut st);
+        assert!(!st.review.as_ref().unwrap().wants_content());
     }
 
     #[test]

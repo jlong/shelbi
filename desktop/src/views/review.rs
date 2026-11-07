@@ -333,6 +333,10 @@ pub struct ReviewView {
     /// The keyboard moves to the content at the next frame: a view switch
     /// swapped what it's in.
     refocus: bool,
+    /// A click asked for the content (the review's sidebar row, a panel
+    /// view): the next frame that finds the review resolved hands it the keys
+    /// ([`Self::land_wanted_content`]), unless they've left the view since.
+    content_wanted: bool,
     sink: Option<SessionSink>,
     review: Option<Shown>,
     shown: bool,
@@ -391,6 +395,7 @@ impl ReviewView {
             sessions: deps.sessions,
             diff_deps: deps.diff,
             refocus: false,
+            content_wanted: false,
             shell,
             shell_open: false,
             shell_starting: false,
@@ -592,6 +597,7 @@ impl ReviewView {
         }
         self.shown = false;
         self.held = None;
+        self.content_wanted = false;
         self.split.dragging = false;
         self.close_shell(cx);
         if let Some(r) = self.review.as_mut() {
@@ -755,8 +761,66 @@ impl ReviewView {
     /// the sidebar's column).
     pub fn focus_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus = ReviewFocus::Panel;
+        self.content_wanted = false;
         window.focus(&self.focus_handle, cx);
         cx.notify();
+    }
+
+    /// Whether the content's terminal has the keys, for the window's tests.
+    #[cfg(test)]
+    pub(crate) fn content_has_keys(&self, window: &Window, cx: &gpui::App) -> bool {
+        self.review
+            .as_ref()
+            .and_then(|r| r.content.read(cx).pane().map(|p| p.read(cx).focus_handle(cx)))
+            .is_some_and(|h| h.is_focused(window))
+    }
+
+    /// A click opened this review (its sidebar row) or one of its views: the
+    /// content takes the keys, its terminal once the pane attaches. The
+    /// keyboard's Enter leaves them on the panel. Lands at the next frame.
+    pub fn want_content(&mut self, cx: &mut Context<Self>) {
+        self.content_wanted = true;
+        cx.notify();
+    }
+
+    /// Hand the keys to the content a click asked for. Waits while the review
+    /// is a placeholder (its content is rebuilt when it resolves); gives up
+    /// when the keys have left the view (a dialog, a field, the palette took
+    /// them) or a merge holds the review still. The terminal takes them when
+    /// its pane is the shown view's; otherwise its session view does, which
+    /// hands them on when the pane attaches.
+    fn land_wanted_content(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.content_wanted {
+            return;
+        }
+        if !self.shown || !self.contains_focus(window, cx) {
+            self.content_wanted = false;
+            return;
+        }
+        let Some((resolved, merging)) = self.review.as_ref().map(|r| (r.resolved, r.panel.is_merging())) else {
+            return;
+        };
+        if !resolved {
+            return;
+        }
+        self.content_wanted = false;
+        let Some(r) = self.review.as_ref().filter(|_| !merging) else {
+            return;
+        };
+        let target = match self.diff_on_show() {
+            Some(diff) => diff.read(cx).focus_handle(cx),
+            None => {
+                let content = r.content.read(cx);
+                let shown = self.content_target(r.panel.active());
+                match content.pane() {
+                    Some(pane) if shown.as_ref() == Some(content.target()) => pane.read(cx).focus_handle(cx),
+                    _ => Focusable::focus_handle(content, cx),
+                }
+            }
+        };
+        self.focus = ReviewFocus::Content;
+        window.focus(&target, cx);
+        cx.emit(ReviewEvent::Focused);
     }
 
     /// Whether keyboard focus is in the view (its panel or its terminal).
@@ -877,6 +941,7 @@ impl ReviewView {
                 }
                 DiffViewEvent::ReleaseFocus => {
                     this.focus = ReviewFocus::Panel;
+                    this.content_wanted = false;
                     this.refocus = true;
                     cx.notify();
                 }
@@ -1297,11 +1362,17 @@ impl ReviewView {
     /// A click on a panel row.
     fn click(&mut self, row: PanelRow, window: &mut Window, cx: &mut Context<Self>) {
         self.focus = ReviewFocus::Panel;
+        self.content_wanted = false;
         window.focus(&self.focus_handle, cx);
         let Some(effect) = self.review.as_mut().map(|r| r.panel.click(row)) else {
             return;
         };
+        // A view picked with the mouse is ready for the keyboard.
+        let view = matches!(effect, PanelEffect::ShowChat | PanelEffect::ShowDiff | PanelEffect::ShowEditor);
         self.apply(effect, cx);
+        if view && !self.is_pending() {
+            self.want_content(cx);
+        }
         cx.notify();
     }
 
@@ -1805,6 +1876,7 @@ impl Render for ReviewView {
             let target = self.focus_target(cx);
             window.focus(&target, cx);
         }
+        self.land_wanted_content(window, cx);
         let theme = *cx.global::<Theme>();
         // The current view switch's chip slides when the main area changes.
         let chip = {
