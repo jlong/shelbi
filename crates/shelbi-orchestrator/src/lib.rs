@@ -84,6 +84,37 @@ pub(crate) mod test_lock {
     pub fn acquire() -> MutexGuard<'static, ()> {
         LOCK.lock().unwrap_or_else(|p| p.into_inner())
     }
+
+    /// [`LOCK`] held and `SHELBI_HOME` on a throwaway directory, until dropped.
+    /// For a test that reaches the Shelbi home only in passing (an ssh argv
+    /// builder creating the control directory, a merge appending its event):
+    /// without a home of its own it would write into the developer's live one.
+    pub struct IsolatedHome {
+        previous: Option<std::ffi::OsString>,
+        _home: tempfile::TempDir,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    pub fn isolated_home() -> IsolatedHome {
+        let lock = acquire();
+        let home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", home.path());
+        IsolatedHome {
+            previous,
+            _home: home,
+            _lock: lock,
+        }
+    }
+
+    impl Drop for IsolatedHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(previous) => std::env::set_var("SHELBI_HOME", previous),
+                None => std::env::remove_var("SHELBI_HOME"),
+            }
+        }
+    }
 }
 
 /// Bundled orchestrator system prompt. The template file lives in

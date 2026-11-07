@@ -53,6 +53,25 @@ a Rust workspace plus a Next.js marketing/docs site.
   ...) runs both sets, and must not move the root `Cargo.lock` (root MSRV is
   Rust 1.88: `cargo check --workspace --locked`).
 
+## Tests never touch the real Shelbi home
+
+Every test that touches project state runs under its own `SHELBI_HOME` or
+`SHELBI_ROOT`. Two things enforce it:
+
+- `shelbi_state::root` panics when a `cargo test` binary, in any crate, resolves
+  the live home, and ignores a live hub socket inherited from a worker pane. A
+  panic naming `SHELBI_HOME` means the test needs a home of its own (each crate
+  has a helper, such as `crate::test_lock::isolated_home()` in
+  `shelbi-orchestrator`). A panic on a background thread doesn't fail the test,
+  but it stops the write, and it shows in the `--nocapture` output. The two UI
+  clients' test binaries (`shelbi-tui`, `desktop/`) instead fall back to one
+  throwaway home per process (`mount_shared_test_home`), because their fixtures
+  start background jobs that outlive any one test.
+- `scripts/ci/check-test-home.sh` runs the root suite under a throwaway `$HOME`
+  and fails if a `.shelbi` appears there, including from a `shelbi` binary a test
+  spawned. CI runs its `--verify` mode after the tests. It is the run to use from
+  a worker pane, since the live hub's own writes can't be mistaken for a leak.
+
 ## Two clients, one model (TUI and desktop parity)
 
 The TUI and the desktop app render the same `shelbi-app` models and run the

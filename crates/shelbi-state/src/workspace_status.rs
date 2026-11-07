@@ -271,8 +271,8 @@ pub fn clear_review_serve_pgid(project: &str, workspace: &str) -> Result<()> {
 /// XDG_RUNTIME_DIR layouts can re-home it without touching `SHELBI_HOME`.
 /// Default is `~/.shelbi/hub.sock`.
 pub fn hub_socket_path() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("SHELBI_HUB_SOCK") {
-        return Ok(PathBuf::from(p));
+    if let Some(p) = crate::root::socket_override("SHELBI_HUB_SOCK") {
+        return Ok(p);
     }
     Ok(shelbi_home()?.join("hub.sock"))
 }
@@ -283,8 +283,8 @@ pub fn hub_socket_path() -> Result<PathBuf> {
 /// [`hub_socket_path`]; default is `~/.shelbi/control.sock`. The daemon binds
 /// both in one process.
 pub fn control_socket_path() -> Result<PathBuf> {
-    if let Some(p) = std::env::var_os("SHELBI_CONTROL_SOCK") {
-        return Ok(PathBuf::from(p));
+    if let Some(p) = crate::root::socket_override("SHELBI_CONTROL_SOCK") {
+        return Ok(p);
     }
     Ok(shelbi_home()?.join("control.sock"))
 }

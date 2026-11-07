@@ -86,6 +86,12 @@ jobs:
           echo "::error::cargo test --workspace did not pass after 2 attempts"
           exit 1
 
+      # The runner's home starts with no Shelbi state, so anything there now came
+      # from a test. Catches what the in-process guard can't see: a `shelbi` binary
+      # a test spawned, or a path that never went through the resolver.
+      - name: Check that the tests left the Shelbi home alone
+        run: scripts/ci/check-test-home.sh --verify
+
   # Nesting smoke: the single-process TUI is an ordinary full-screen program, so
   # it must launch, render, and tear down cleanly inside tmux and inside GNU
   # Screen (the `$TMUX` branching that used to special-case this is gone). The

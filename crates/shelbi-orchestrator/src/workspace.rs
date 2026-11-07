@@ -10210,6 +10210,7 @@ statuses:
 
     #[test]
     fn both_host_kinds_construct_the_same_launch_command() {
+        let _home = crate::test_lock::isolated_home();
         // Shelbi ContextStore
         // docs/planning:reviews/adversarial-2026-07/cli-session-ux.md F12:
         // the local dispatch path (via the `shelbi open --as-pane`
@@ -11194,7 +11195,7 @@ statuses:
     /// The default landing path is `/tmp/shelbi-hub-<uid>.sock`.
     #[test]
     fn remote_cd_launch_prefixes_exec_with_hub_socket_env_var() {
-        let _g = crate::test_lock::acquire();
+        let _g = crate::test_lock::isolated_home();
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/bob");
         let line = remote_cd_launch(
@@ -11247,7 +11248,7 @@ statuses:
     /// must follow.
     #[test]
     fn remote_cd_launch_honors_remote_hub_socket_path_override() {
-        let _g = crate::test_lock::acquire();
+        let _g = crate::test_lock::isolated_home();
         std::env::set_var("SHELBI_REMOTE_HUB_SOCK", "/run/user/1000/shelbi.sock");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/bob");
         let line = remote_cd_launch(
@@ -11341,7 +11342,7 @@ statuses:
     /// drop it), alongside the hub socket.
     #[test]
     fn remote_cd_launch_injects_port_when_provided() {
-        let _g = crate::test_lock::acquire();
+        let _g = crate::test_lock::isolated_home();
         std::env::remove_var("SHELBI_REMOTE_HUB_SOCK");
         let wt = PathBuf::from("/work/myapp/.shelbi/wt/slot-1");
         let line = remote_cd_launch(
@@ -12744,6 +12745,7 @@ mod rebase_git_tests {
     /// that used to be destroyed survives.
     #[test]
     fn refresh_skills_rm_cannot_escape_spaced_worktree() {
+        let _home = crate::test_lock::isolated_home();
         let root = std::env::temp_dir().join(format!("shelbi-rm-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         // Sibling that the buggy word-split (`rm -rf <root>/my`) would nuke.
