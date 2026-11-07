@@ -1932,6 +1932,7 @@ mod tests {
     /// survive: only if the whole chain holds does the second clause run.
     #[test]
     fn ssh_login_shell_script_round_trips_through_remote_shell() {
+        let _home = crate::test_lock::isolated_home();
         let host = Host::Ssh {
             host: "devbox".into(),
         };
@@ -1972,6 +1973,7 @@ mod tests {
     /// characters back. Assert the payload comes through byte-for-byte.
     #[test]
     fn ssh_login_shell_script_is_not_double_escaped() {
+        let _home = crate::test_lock::isolated_home();
         let host = Host::Ssh {
             host: "devbox".into(),
         };

@@ -780,7 +780,7 @@ mod tests {
 
     #[test]
     fn remote_operations_against_an_unreachable_machine() {
-        let _g = crate::test_lock::acquire();
+        let _g = crate::test_lock::isolated_home();
         remote_session::set_test_seam(Some(std::sync::Arc::new(UnreachableSeam)));
 
         let b = SessionProcessBackend;

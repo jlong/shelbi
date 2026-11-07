@@ -139,8 +139,8 @@ pub use session_lost::{
     write_session_lost, RecoveryState, SessionLostRecord, SESSION_LOST_BANNER,
 };
 pub use root::{
-    ensure_root_subdirs, expand_tilde_path, expand_tilde_str, resolve as resolve_root, root,
-    set_root_override, RootSource, STANDARD_SUBDIRS,
+    ensure_root_subdirs, expand_tilde_path, expand_tilde_str, mount_shared_test_home,
+    resolve as resolve_root, root, set_root_override, RootSource, STANDARD_SUBDIRS,
 };
 
 pub use agent_workspaces::{

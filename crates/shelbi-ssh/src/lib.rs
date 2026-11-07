@@ -2021,19 +2021,38 @@ where
 mod tests {
     use super::*;
 
-    /// Serializes tests that read or write `SHELBI_SSH_LOG_LEVEL`.
+    /// Serializes tests that build an ssh argv, and gives them a Shelbi home.
     ///
     /// `ssh_log_level()` (and thus every arg builder that embeds `LogLevel=`)
     /// reads a process-global env var, so a test that toggles the level races
     /// any concurrent test that asserts a built ssh argv. Both sides take this
-    /// lock so no test can observe another's toggle. Poison is fine — a panic
+    /// lock so no test can observe another's toggle. Poison is fine: a panic
     /// under the lock doesn't corrupt the env, so recover the guard.
-    static SSH_LOG_LEVEL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SSH_TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    fn ssh_log_level_guard() -> std::sync::MutexGuard<'static, ()> {
-        SSH_LOG_LEVEL_LOCK
+    /// [`SSH_TEST_ENV_LOCK`] held and `SHELBI_HOME` on a throwaway directory.
+    /// The arg builders create the control-socket directory under the home, so
+    /// without one a test would create it in the developer's live `~/.shelbi`.
+    struct SshTestEnv {
+        home: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for SshTestEnv {
+        fn drop(&mut self) {
+            std::env::remove_var("SHELBI_HOME");
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    fn ssh_test_env() -> SshTestEnv {
+        let lock = SSH_TEST_ENV_LOCK
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let home = std::env::temp_dir().join(format!("shelbi-ssh-test-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        SshTestEnv { home, _lock: lock }
     }
 
     #[test]
@@ -2048,7 +2067,7 @@ mod tests {
     fn ssh_command_args() {
         // Held across both the actual build and the `expected` rebuild below so
         // a concurrent `SHELBI_SSH_LOG_LEVEL` toggle can't diverge the two.
-        let _env = ssh_log_level_guard();
+        let _env = ssh_test_env();
         let cmd = build_command(
             &Host::Ssh {
                 host: "m2.local".into(),
@@ -2071,7 +2090,7 @@ mod tests {
     fn ssh_pty_command_uses_t_flag() {
         // Held across both the actual build and the `expected` rebuild below so
         // a concurrent `SHELBI_SSH_LOG_LEVEL` toggle can't diverge the two.
-        let _env = ssh_log_level_guard();
+        let _env = ssh_test_env();
         let cmd = build_pty_command(
             &Host::Ssh {
                 host: "m2.local".into(),
@@ -2089,6 +2108,7 @@ mod tests {
 
     #[test]
     fn ssh_command_args_include_reverse_forward() {
+        let _env = ssh_test_env();
         // Belt-and-suspenders pin on the Phase 4 behavior the hub
         // depends on: every outbound ssh command carries a `-R` flag
         // mapping the remote landing socket onto the hub's local
@@ -2129,7 +2149,7 @@ mod tests {
 
     #[test]
     fn sign_in_asks_only_when_interactive_and_keeps_the_hub_forward() {
-        let _env = ssh_log_level_guard();
+        let _env = ssh_test_env();
         let opts = build_ssh_control_opts("m2.local");
         let has = |argv: &[String], pair: [&str; 2]| argv.windows(2).any(|w| w == pair);
 
@@ -2149,7 +2169,7 @@ mod tests {
     fn background_ssh_never_asks() {
         // Every command the hub's polling builds stays in batch mode and
         // carries no askpass setup, so it can never pop a dialog.
-        let _env = ssh_log_level_guard();
+        let _env = ssh_test_env();
         let host = Host::Ssh {
             host: "m2.local".into(),
         };
@@ -2216,6 +2236,7 @@ mod tests {
 
     #[test]
     fn ssh_argv_survives_remote_shell_byte_for_byte() {
+        let _env = ssh_test_env();
         // F1/F2: args with spaces, comment markers, expansions, and command
         // separators must reach the remote program as distinct literal
         // words. We replay the exact wire ssh would emit through a local
@@ -2622,6 +2643,7 @@ mod tests {
 
     #[test]
     fn tcp_master_args_force_exit_on_forward_failure_and_carry_tcp_r() {
+        let _env = ssh_test_env();
         // The TCP master open must (a) set ExitOnForwardFailure=yes so a bind
         // collision fails the open (letting the caller sweep ports), placed
         // BEFORE the static ExitOnForwardFailure=no so its value wins, and
@@ -2657,6 +2679,7 @@ mod tests {
 
     #[test]
     fn stream_local_unlink_master_args_carry_the_unlink_option_and_reverse_forward() {
+        let _env = ssh_test_env();
         // Issue #319, fix #2: the master that (re)binds the Unix `-R` forward
         // must set StreamLocalBindUnlink=yes so a pre-existing/stale remote
         // landing socket at the target path is unlinked on bind instead of
@@ -2974,7 +2997,7 @@ mod tests {
     #[test]
     fn ssh_log_level_defaults_to_error_and_honors_override() {
         // Serialize against the arg-builder tests that read the same env var.
-        let _env = ssh_log_level_guard();
+        let _env = ssh_test_env();
         std::env::remove_var("SHELBI_SSH_LOG_LEVEL");
         assert_eq!(ssh_log_level(), "ERROR");
 
@@ -2999,6 +3022,7 @@ mod tests {
 
     #[test]
     fn master_control_opts_carry_keepalive() {
+        let _env = ssh_test_env();
         // Acceptance: the master carries keepalive opts so a long remote op /
         // idle NAT blip doesn't silently drop it. They ride on every
         // control-master-carrying invocation via `base_control_opts`.
