@@ -117,6 +117,9 @@ pub struct ReviewInterface {
     task_id: String,
     slot: String,
     focus: ReviewFocus,
+    /// A click asked for the content (its sidebar row, a panel view): it
+    /// takes the keys once it is live, unless they move first.
+    content_wanted: bool,
     /// The reviewed task, when resolvable — the source of the panel's title and
     /// description preview, and the data the `More` description popover shows.
     /// `None` only if the issue store couldn't produce it (the panel then shows
@@ -189,6 +192,7 @@ impl ReviewInterface {
             task_id,
             slot,
             focus: ReviewFocus::Panel,
+            content_wanted: false,
             task,
             diff_active: false,
             diff_load: None,
@@ -472,6 +476,8 @@ impl ReviewInterface {
     pub fn set_merging(&mut self, on: bool) {
         self.panel.merging = on;
         if on {
+            // The merge holds the review still: no focus lands mid-merge.
+            self.content_wanted = false;
             self.panel.spinner = 0;
             self.panel.status_line.clear();
         }
@@ -547,7 +553,8 @@ impl ReviewInterface {
     pub fn poll(&mut self) -> bool {
         let changed = self.content.poll();
         let builtin = self.builtin.as_mut().is_some_and(DiffView::poll);
-        self.drive_diff(Instant::now()) || changed || builtin
+        let diff = self.drive_diff(Instant::now());
+        self.settle_wanted_content() || diff || changed || builtin
     }
 
     pub fn pump_output(&mut self, ring: &mut bool) -> bool {
@@ -591,7 +598,47 @@ impl ReviewInterface {
         if self.panel.merging {
             return;
         }
+        self.keys_to_panel();
+    }
+
+    /// The panel takes the keys, and a click's wait for the content is over.
+    fn keys_to_panel(&mut self) {
         self.focus = ReviewFocus::Panel;
+        self.content_wanted = false;
+    }
+
+    /// Whether the content can take the keys: Shelbi's diff, or a live session
+    /// no wait covers.
+    fn content_focusable(&mut self) -> bool {
+        self.showing_builtin().is_some()
+            || (matches!(self.content.state(), MainState::Live(_)) && !self.diff_covered())
+    }
+
+    /// A click opened this review or one of its views: the content takes the
+    /// keys as soon as it is live ([`Self::poll`] lands them), unless they move
+    /// first. The keyboard's Enter leaves them on the panel. Inert mid-merge.
+    pub fn want_content(&mut self) {
+        if !self.panel.merging {
+            self.content_wanted = true;
+        }
+    }
+
+    /// Whether a click's wish for the content is waiting, for the shell's tests.
+    #[cfg(test)]
+    pub fn wants_content(&self) -> bool {
+        self.content_wanted
+    }
+
+    /// Land a click's wanted focus once the content can take it. Whether focus
+    /// moved.
+    fn settle_wanted_content(&mut self) -> bool {
+        if !self.content_wanted || self.panel.merging || !self.content_focusable() {
+            return false;
+        }
+        self.content_wanted = false;
+        let moved = self.focus != ReviewFocus::Content;
+        self.focus = ReviewFocus::Content;
+        moved
     }
 
     /// Move focus to the content view (the shell's `FocusMain` / Ctrl+L),
@@ -602,9 +649,7 @@ impl ReviewInterface {
         if self.panel.merging {
             return;
         }
-        if self.showing_builtin().is_some()
-            || (matches!(self.content.state(), MainState::Live(_)) && !self.diff_covered())
-        {
+        if self.content_focusable() {
             self.focus = ReviewFocus::Content;
         }
     }
@@ -639,7 +684,7 @@ impl ReviewInterface {
             return match diff.key(k) {
                 DiffOut::None => ReviewAction::None,
                 DiffOut::FocusPanel => {
-                    self.focus = ReviewFocus::Panel;
+                    self.keys_to_panel();
                     ReviewAction::None
                 }
                 DiffOut::Edit { path, line } => ReviewAction::OpenFile { path, line },
@@ -648,7 +693,7 @@ impl ReviewInterface {
         }
         // Tab returns focus to the panel; everything else goes to the agent.
         if k.code == KeyCode::Tab && k.modifiers.is_empty() {
-            self.focus = ReviewFocus::Panel;
+            self.keys_to_panel();
             return ReviewAction::None;
         }
         if self.diff_covered() {
@@ -730,11 +775,12 @@ impl ReviewInterface {
     ) -> ReviewAction {
         let in_panel = contains(panel_rect, m.column, m.row);
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            self.focus = if in_panel {
-                ReviewFocus::Panel
+            if in_panel {
+                self.keys_to_panel();
             } else {
-                ReviewFocus::Content
-            };
+                self.focus = ReviewFocus::Content;
+                self.content_wanted = false;
+            }
         }
         if in_panel {
             if self.panel.merging {
@@ -743,7 +789,13 @@ impl ReviewInterface {
                 return if back { ReviewAction::Back } else { ReviewAction::None };
             }
             if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-                return map_effect(self.panel.click(m.column, m.row));
+                let effect = self.panel.click(m.column, m.row);
+                // A view picked with the mouse is ready for the keyboard: its
+                // content takes the keys once it is live.
+                if matches!(effect, PanelEffect::ShowChat | PanelEffect::ShowDiff | PanelEffect::ShowEditor) {
+                    self.want_content();
+                }
+                return map_effect(effect);
             }
             return ReviewAction::None;
         }
@@ -1504,6 +1556,83 @@ mod tests {
         assert_eq!(it.focus, ReviewFocus::Panel);
         it.focus_panel();
         assert_eq!(it.focus, ReviewFocus::Panel);
+    }
+
+    /// Attaches every target to one real session running `cat`, so the content
+    /// goes live.
+    struct CatAll {
+        sock: PathBuf,
+    }
+
+    impl Connector for CatAll {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+            use shelbi_client::Connection;
+            let (conn, events) = Connection::open(&self.sock, None, shelbi_proto::capability::ALL)
+                .map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            conn.attach(None).map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            Ok(Connected { conn, events, size: shelbi_app::session::GridSize::new(80, 24) })
+        }
+    }
+
+    /// Poll (what the shell's loop does each tick) until `done`.
+    fn poll_until(it: &mut ReviewInterface, done: impl Fn(&ReviewInterface) -> bool) -> bool {
+        let mut ring = false;
+        for _ in 0..1500 {
+            it.poll();
+            it.pump_output(&mut ring);
+            if done(it) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_click_on_a_view_lands_the_keys_on_its_content_once_live() {
+        // nav-click-focuses-content: a mouse click on a panel view hands the
+        // keys to its content (Enter keeps them on the panel); a merge holds
+        // them still.
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let (sock, _cleanup) = crate::shell::session::tests::spawn_cat_session(home.path(), "proj/ws/review-1");
+        let mut it = ReviewInterface::new(
+            "proj", Arc::new(CatAll { sock }), "fix-login", "review-1", "/wt", "Vim", true, Some(sample_task()),
+        );
+        let (panel, content) = (Rect::new(0, 0, 40, 30), Rect::new(40, 0, 60, 30));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| { it.render(f, panel, content, false, true); }).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..30).map(|y| (0..40).map(|x| buf[(x, y)].symbol()).collect()).collect();
+        let chat_y = rows.iter().position(|r| r.contains("Reviewer")).expect("the chat's row") as u16;
+        let col = rows[chat_y as usize].find("Reviewer").unwrap() as u16;
+
+        // A merge holds the review still: the click's wish doesn't land.
+        it.set_merging(true);
+        it.want_content();
+        assert!(poll_until(&mut it, |i| matches!(i.content_state(), MainState::Live(_))));
+        it.poll();
+        assert!(!it.content_focused(), "no focus lands mid-merge");
+        it.set_merging(false);
+
+        // The click on Chat (already shown): the keys move to its terminal.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row: chat_y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(it.handle_mouse(click, panel, content), ReviewAction::ShowContent(None));
+        assert!(poll_until(&mut it, |i| i.content_focused()), "the chat's terminal took the keys");
+
+        // Enter on a view keeps the keys on the panel.
+        it.focus_panel();
+        it.handle_key(key(KeyCode::Up));
+        it.handle_key(key(KeyCode::Enter));
+        for _ in 0..20 {
+            it.poll();
+        }
+        assert!(!it.content_focused(), "the keyboard moves on through the panel");
     }
 
     /// Drive `it.poll()` until the content view leaves Connecting, or the budget

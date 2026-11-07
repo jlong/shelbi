@@ -81,6 +81,9 @@ pub struct WorkspaceInterface {
     content: SessionManager,
     workspace: String,
     focus: WsFocus,
+    /// A click asked for the content (its sidebar row, a panel view): it
+    /// takes the keys once it is live, unless they move first.
+    content_wanted: bool,
     /// The in-progress task on this workspace, when resolvable — the source of
     /// the panel's title / description preview and the `More` popover's data.
     task: Option<IssueFile>,
@@ -130,6 +133,7 @@ impl WorkspaceInterface {
             content,
             workspace,
             focus: WsFocus::Panel,
+            content_wanted: false,
             task,
             remote_address: None,
             project: project.to_string(),
@@ -312,7 +316,8 @@ impl WorkspaceInterface {
 
     pub fn poll(&mut self) -> bool {
         let changed = self.content.poll();
-        self.diff.as_mut().is_some_and(DiffView::poll) || changed
+        let diff = self.diff.as_mut().is_some_and(DiffView::poll);
+        self.settle_wanted_content() || diff || changed
     }
 
     pub fn pump_output(&mut self, ring: &mut bool) -> bool {
@@ -343,16 +348,46 @@ impl WorkspaceInterface {
 
     /// Move focus to the panel (the shell's `FocusSidebar` / Ctrl+H).
     pub fn focus_panel(&mut self) {
+        self.keys_to_panel();
+    }
+
+    /// The panel takes the keys, and a click's wait for the content is over.
+    fn keys_to_panel(&mut self) {
         self.focus = WsFocus::Panel;
+        self.content_wanted = false;
+    }
+
+    /// Whether the content can take the keys: the diff, or a live session.
+    fn content_focusable(&self) -> bool {
+        self.diff_showing || matches!(self.content.state(), MainState::Live(_))
     }
 
     /// Move focus to the content view (the shell's `FocusMain` / Ctrl+L), but
     /// only when a content session is live — so focus never lands on an
     /// empty/connecting content pane.
     pub fn focus_content(&mut self) {
-        if self.diff_showing || matches!(self.content.state(), MainState::Live(_)) {
+        if self.content_focusable() {
             self.focus = WsFocus::Content;
         }
+    }
+
+    /// A click opened this workspace or one of its views: the content takes
+    /// the keys as soon as it is live ([`Self::poll`] lands them), unless they
+    /// move first. The keyboard's Enter leaves them on the panel.
+    pub fn want_content(&mut self) {
+        self.content_wanted = true;
+    }
+
+    /// Land a click's wanted focus once the content can take it. Whether focus
+    /// moved.
+    fn settle_wanted_content(&mut self) -> bool {
+        if !self.content_wanted || !self.content_focusable() {
+            return false;
+        }
+        self.content_wanted = false;
+        let moved = self.focus != WsFocus::Content;
+        self.focus = WsFocus::Content;
+        moved
     }
 
     #[cfg(test)]
@@ -378,7 +413,7 @@ impl WorkspaceInterface {
             return match diff.key(k) {
                 DiffOut::None => WorkspaceAction::None,
                 DiffOut::FocusPanel => {
-                    self.focus = WsFocus::Panel;
+                    self.keys_to_panel();
                     WorkspaceAction::None
                 }
                 DiffOut::Edit { path, line } => WorkspaceAction::OpenFile { path, line },
@@ -388,7 +423,7 @@ impl WorkspaceInterface {
         }
         // Tab returns focus to the panel; everything else goes to the agent.
         if k.code == KeyCode::Tab && k.modifiers.is_empty() {
-            self.focus = WsFocus::Panel;
+            self.keys_to_panel();
             return WorkspaceAction::None;
         }
         if super::terminal_view::is_copy_key(&k) {
@@ -442,15 +477,22 @@ impl WorkspaceInterface {
     ) -> WorkspaceAction {
         let in_panel = contains(panel_rect, m.column, m.row);
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left)) {
-            self.focus = if in_panel {
-                WsFocus::Panel
+            if in_panel {
+                self.keys_to_panel();
             } else {
-                WsFocus::Content
-            };
+                self.focus = WsFocus::Content;
+                self.content_wanted = false;
+            }
         }
         if in_panel {
             if let MouseEventKind::Down(MouseButton::Left) = m.kind {
-                return map_effect(self.panel.click(m.column, m.row));
+                let effect = self.panel.click(m.column, m.row);
+                // A view picked with the mouse is ready for the keyboard: its
+                // content takes the keys once it is live.
+                if matches!(effect, WsEffect::ShowAgent | WsEffect::ShowDiff | WsEffect::ShowEditor) {
+                    self.want_content();
+                }
+                return map_effect(effect);
             }
             return WorkspaceAction::None;
         }
@@ -685,6 +727,91 @@ mod tests {
         assert!(!it.content_focused());
         it.focus_content();
         assert!(!it.content_focused(), "focus does not move until content is live");
+    }
+
+    /// Attaches every target to one real session running `cat`, so the content
+    /// goes live.
+    struct CatAll {
+        sock: std::path::PathBuf,
+    }
+
+    impl Connector for CatAll {
+        fn connect(&self, _p: &str, _t: &SessionRef) -> Result<Connected, ConnectFailure> {
+            use shelbi_client::Connection;
+            let (conn, events) = Connection::open(&self.sock, None, shelbi_proto::capability::ALL)
+                .map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            conn.attach(None).map_err(|e| ConnectFailure::Message(e.to_string()))?;
+            Ok(Connected { conn, events, size: shelbi_app::session::GridSize::new(80, 24) })
+        }
+    }
+
+    /// Poll (what the shell's loop does each tick) until `done`.
+    fn poll_until(it: &mut WorkspaceInterface, done: impl Fn(&WorkspaceInterface) -> bool) -> bool {
+        let mut ring = false;
+        for _ in 0..1500 {
+            it.poll();
+            it.pump_output(&mut ring);
+            if done(it) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[test]
+    fn a_click_on_a_view_lands_the_keys_on_its_content_once_live() {
+        // nav-click-focuses-content: a mouse click on a panel view hands the
+        // keys to its content (Enter keeps them on the panel).
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let (sock, _cleanup) = crate::shell::session::tests::spawn_cat_session(home.path(), "proj/ws/alpha");
+        let mut it = WorkspaceInterface::new(
+            "proj",
+            Arc::new(CatAll { sock }),
+            "alpha",
+            "/wt/alpha",
+            "Vim",
+            "Builder",
+            status(),
+            Some(sample_task()),
+        );
+        let (panel, content) = (Rect::new(0, 0, 40, 30), Rect::new(40, 0, 60, 30));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|f| { it.render(f, panel, content, false, true); }).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..30).map(|y| (0..40).map(|x| buf[(x, y)].symbol()).collect()).collect();
+        let diff_y = rows.iter().position(|r| r.contains("View Diff")).expect("View Diff drawn");
+        let agent_y = (0..diff_y).rev().find(|&y| rows[y].contains("Builder")).expect("the agent's row") as u16;
+        let col = rows[agent_y as usize].find("Builder").unwrap() as u16;
+
+        // The click (the agent's view, already shown): the keys wait on the
+        // panel until the agent's terminal is live, then move there.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row: agent_y,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(it.handle_mouse(click, panel, content), WorkspaceAction::ShowContent(None));
+        assert!(poll_until(&mut it, |i| i.content_focused()), "the agent's terminal took the keys");
+
+        // Back to the panel by key before the content is up again: the wish is
+        // over, the keys stay where the user put them.
+        it.focus_panel();
+        it.want_content();
+        it.focus_panel();
+        for _ in 0..20 {
+            it.poll();
+        }
+        assert!(!it.content_focused(), "a move to the panel cancels the click's wish");
+
+        // Enter on a view keeps the keys on the panel.
+        assert_eq!(it.handle_key(key(KeyCode::Enter)), WorkspaceAction::ShowContent(None));
+        for _ in 0..20 {
+            it.poll();
+        }
+        assert!(!it.content_focused(), "the keyboard moves on through the panel");
     }
 
     #[test]

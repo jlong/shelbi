@@ -2805,6 +2805,26 @@ impl ShelbiWindow {
         }
     }
 
+    /// A click opened a workspace or review row: what it opened hands the
+    /// keys past its panel to its content (the keys' Enter leaves them on the
+    /// panel, to move through it). The view lands them at its next frame,
+    /// once a review still loading has resolved, unless they've moved on.
+    fn want_content(&mut self, cx: &mut Context<Self>) {
+        match self.route {
+            Route::Review => {
+                if let Some(review) = self.review.clone() {
+                    review.update(cx, |r, cx| r.want_content(cx));
+                }
+            }
+            Route::View if workspace_name(self.client.view()).is_some() => {
+                if let Some(ws) = self.workspace.clone() {
+                    ws.update(cx, |w, cx| w.want_content(cx));
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Collapse or expand a machine group: at once in the model, persisted
     /// off the UI thread (to `state.json`, shared with the TUI).
     fn toggle_machine(&mut self, name: String, cx: &mut Context<Self>) {
@@ -5854,9 +5874,14 @@ fn close_review_sessions(ops: Arc<dyn ReviewOps>, project: String, task: String,
 impl SidebarHost for ShelbiWindow {
     fn sidebar_event(&mut self, event: SidebarEvent, window: &mut Window, cx: &mut Context<Self>) {
         match event {
+            // A click (the keys' Enter is `activate_selection`).
             SidebarEvent::Activate(ordinal) => {
                 if let Some(target) = self.target_at(ordinal) {
+                    let task_panel = matches!(target, SidebarTarget::Workspace(_) | SidebarTarget::Review(_));
                     self.activate_target(target, window, cx);
+                    if task_panel {
+                        self.want_content(cx);
+                    }
                 }
             }
             SidebarEvent::OpenSearch => self.open_palette(window, cx),
@@ -6704,6 +6729,10 @@ mod remote_tests;
 #[cfg(test)]
 #[path = "app_onboarding_tests.rs"]
 mod onboarding_tests;
+
+#[cfg(test)]
+#[path = "app_nav_focus_tests.rs"]
+mod nav_focus_tests;
 
 #[cfg(test)]
 mod tests {

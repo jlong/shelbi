@@ -498,6 +498,12 @@ impl IssuesView {
         self.needs_focus = true;
     }
 
+    /// Whether the view's own handle has the keys, for the window's tests.
+    #[cfg(test)]
+    pub(crate) fn has_keys(&self, window: &Window) -> bool {
+        self.focus.is_focused(window)
+    }
+
     /// What the board has read (the palette searches its issues).
     pub fn board_input(&self) -> &shelbi_app::board::BoardInput {
         self.state.input()

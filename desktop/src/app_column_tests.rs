@@ -1795,3 +1795,117 @@ fn the_diffs_keys_beat_the_windows_chords_and_the_rest_get_through(cx: &mut Test
     c.h.cx.run_until_parked();
     assert!(c.read(|w, _| w.overlay.is_some()), "the window's palette");
 }
+
+// --- a click lands the keys on the content (`nav-click-focuses-content`) ---
+
+impl Column {
+    /// Let commands run for real (the harness's tap only records them), so a
+    /// click opens what it names.
+    fn live(&mut self) {
+        self.h.window.update(&mut self.h.cx, |w, _| w.tap = None);
+    }
+
+    /// Let the push settle and the content attach.
+    fn settle(&mut self) {
+        for _ in 0..3 {
+            self.advance(SLIDE);
+        }
+    }
+
+    fn review_content_has_keys(&mut self) -> bool {
+        let review = self.review();
+        self.h.cx.update(|window, cx| review.read(cx).content_has_keys(window, cx))
+    }
+
+    fn workspace_content_has_keys(&mut self) -> bool {
+        let ws = self.workspace();
+        self.h.cx.update(|window, cx| ws.read(cx).content_has_keys(window, cx))
+    }
+
+    fn review_panel_focused(&mut self) -> bool {
+        let review = self.review();
+        self.h.cx.update(|window, cx| review.read(cx).focus_handle(cx).is_focused(window))
+    }
+}
+
+#[gpui::test]
+fn a_click_on_a_review_row_hands_the_keys_to_its_terminal(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.live();
+    c.h.click_selector("sidebar-review-t-1");
+    c.settle();
+    assert_eq!(c.read(|w, _| w.client.focus()), Focus::Main);
+    assert!(c.review_content_has_keys(), "the review's terminal has the keys, not its panel");
+    assert!(!c.review_panel_focused());
+}
+
+#[gpui::test]
+fn enter_on_a_review_row_still_leaves_the_keys_on_the_panel(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.live();
+    c.update(|w, window, cx| {
+        w.select_row(SidebarTarget::Review("t-1".into()), cx);
+        w.activate_selection(window, cx);
+    });
+    c.settle();
+    assert!(c.review_panel_focused(), "the keyboard moves on through the panel");
+    assert!(!c.review_content_has_keys());
+}
+
+#[gpui::test]
+fn a_click_on_a_workspace_row_hands_the_keys_to_its_terminal(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.live();
+    c.h.click_selector("sidebar-ws-alpha-1");
+    c.settle();
+    assert_eq!(c.read(|w, _| w.client.focus()), Focus::Main);
+    assert!(c.workspace_content_has_keys(), "the agent's terminal has the keys, not the panel");
+    assert!(!c.workspace_panel_focused());
+}
+
+#[gpui::test]
+fn a_click_on_a_review_panel_view_hands_the_keys_to_it_even_the_one_shown(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.live();
+    c.open_review();
+    c.settle();
+    assert!(c.review_panel_focused(), "opened from the keyboard: the panel has the keys");
+    // The view already shown: its terminal takes the keys.
+    c.h.click_selector("review-switch-chat");
+    c.settle();
+    assert!(c.review_content_has_keys(), "Chat, already shown, has the keys");
+    // Another view: its terminal, once attached.
+    c.h.click_selector("review-switch-editor");
+    c.settle();
+    assert!(c.review_content_has_keys(), "the editor's terminal has the keys");
+    assert!(!c.review_panel_focused());
+}
+
+#[gpui::test]
+fn a_click_on_a_workspace_panel_view_hands_the_keys_to_it(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.live();
+    c.open_workspace();
+    c.settle();
+    assert!(c.workspace_panel_focused());
+    c.h.click_selector("ws-switch-agent");
+    c.settle();
+    assert!(c.workspace_content_has_keys(), "the agent's terminal has the keys");
+    c.h.click_selector("ws-switch-editor");
+    c.settle();
+    assert!(c.workspace_content_has_keys(), "the editor's terminal has the keys");
+}
+
+#[gpui::test]
+fn a_dialog_opened_before_the_content_attaches_keeps_the_keys(cx: &mut TestAppContext) {
+    let mut c = Column::open(cx);
+    c.live();
+    c.h.click_selector("sidebar-ws-alpha-1");
+    // Mid-push, before the terminal attaches: the palette opens over it.
+    c.update(|w, window, cx| w.open_palette(window, cx));
+    c.settle();
+    assert!(c.read(|w, _| w.overlay.is_some()), "the palette is still up");
+    let window_focused = c.h.cx.update(|window, cx| c.h.window.read(cx).focus_handle.is_focused(window));
+    assert!(window_focused, "the palette's keys stay with it");
+    assert!(!c.workspace_content_has_keys(), "the attach didn't take them");
+}
