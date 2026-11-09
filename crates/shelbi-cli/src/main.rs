@@ -459,6 +459,8 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // The clock the startup phases in `tui.log` are measured against.
+    shelbi_tui::startup::mark_launch();
     // ssh running Shelbi as its askpass program: exactly `shelbi "<prompt>"`,
     // with `SHELBI_ASKPASS_HELPER=1` and `SSH_ASKPASS_REQUIRE` set. Before anything parses, logs or touches
     // state: this process only shows the dialog.
@@ -664,6 +666,7 @@ fn default_entry(explicit: Option<String>) -> Result<()> {
     let resolved = resolve_or_onboard(commands::require_project(explicit))?;
     let missing_project = match classify_default_route(resolved, project_registration_exists) {
         DefaultRoute::Dashboard(name) => {
+            shelbi_tui::startup::log_phase("resolve project", shelbi_tui::startup::since_launch());
             return shelbi_tui::run_main(&name).context("launching shelbi");
         }
         DefaultRoute::Onboarding { missing_project } => missing_project,

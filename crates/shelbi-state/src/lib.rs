@@ -50,7 +50,8 @@ pub mod ownership;
 pub mod questions;
 pub use migration::{
     all_workspace_migration_states, set_workspace_migration_state, workspace_migrated,
-    workspace_migration_state, MigrationState,
+    workspace_migration_state, migration_unreachable_machines, set_migration_machine_unreachable,
+    MigrationState,
 };
 pub use issue_cache::BOARD_CACHE_TTL;
 #[cfg(any(test, feature = "test-support"))]
@@ -1710,6 +1711,13 @@ pub struct State {
     /// [`crate::migration`]; `rt-cutover-delete` removes it.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workspace_migration: BTreeMap<String, MigrationState>,
+    /// Remote machines whose last migration probe didn't answer
+    /// (`cli-startup-speed`). The open doesn't wait on these in the foreground:
+    /// they're probed in the background and dropped from the set once one
+    /// answers. Omitted from the file when empty; `rt-cutover-delete` removes
+    /// it with the rest of the migration state.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub migration_unreachable_machines: std::collections::BTreeSet<String>,
     /// Cards the user moved by hand from a ready status back to the backlog,
     /// keyed by task id, with when. The Zen scan leaves these alone until the
     /// user moves the card out of the backlog again. See
