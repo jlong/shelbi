@@ -17,6 +17,7 @@ use shelbi_proto::control::{EditSpec, MutationKind};
 use shelbi_state::{IssueFile, IssueStore};
 
 use super::mutate_client;
+use super::temp_dir::TempDir;
 
 /// Changed frontmatter keys: `Some` sets the key, `None` removes it.
 type Changes = BTreeMap<String, Option<serde_yaml::Value>>;
@@ -86,10 +87,7 @@ pub(super) fn edit_on_tracker(project: &str, id: &str, reason: Option<String>) -
         .ok_or_else(|| anyhow!("issue `{id}` not found"))?;
     let original = shelbi_state::render_task_file(&base).map_err(|e| anyhow!(e))?;
 
-    let dir = tempfile::Builder::new()
-        .prefix("shelbi-issue-")
-        .tempdir()
-        .context("creating a temp dir for the editor")?;
+    let dir = TempDir::create("shelbi-issue-").context("creating a temp dir for the editor")?;
     let path = dir.path().join(draft_file_name(&base.task.id));
     std::fs::write(&path, &original)
         .with_context(|| format!("writing {}", path.display()))?;

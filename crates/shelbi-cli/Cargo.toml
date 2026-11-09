@@ -46,9 +46,11 @@ inquire = { workspace = true }
 unicode-width = { workspace = true }
 signal-hook = "0.3"
 libc = { workspace = true }
-tempfile = "3"
 
 [dev-dependencies]
+# Tests only: the binary's one temp dir (the issue editor's draft) uses the
+# small guard in `commands/temp_dir.rs`.
+tempfile = "3"
 # The control-socket integration test (`tests/control_socket.rs`) drives a real
 # daemon over the mutation control protocol via the typed client; the
 # session-survival test (`tests/session_survival.rs`) speaks the session
