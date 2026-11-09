@@ -6491,7 +6491,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "chrono-tz",
- "globset",
  "libc",
  "regex",
  "serde",

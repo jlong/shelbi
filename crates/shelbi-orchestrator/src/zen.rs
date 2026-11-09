@@ -42,7 +42,6 @@ use std::path::{Component, PathBuf};
 use std::process::Output;
 use std::time::{Duration, Instant};
 
-use globset::{Glob, GlobSetBuilder};
 use serde::Serialize;
 use shelbi_core::{
     checks_for_task_in_workflow, danger_paths_for_workflow, Column, Error, Host, Machine,
@@ -51,6 +50,7 @@ use shelbi_core::{
 };
 
 use crate::branch;
+use crate::danger_glob::Glob;
 use crate::git::{
     commit_subject, compose_pr_body, gh_pr_merge, locate_hub_workdir, locate_workspace_worktree,
     login_shell_prefix, lookup_merged_pr, lookup_open_pr_in_repository, lookup_origin_repository,
@@ -11280,27 +11280,18 @@ fn probe_danger_paths(
     Ok(match_danger_paths(&patterns, &changed))
 }
 
-/// Match `changed` paths against `patterns` (any-of). A bad glob is
+/// Match `changed` paths against `patterns` (any-of), with globset's
+/// default semantics (see [`crate::danger_glob`]). A bad glob is
 /// silently skipped — the project YAML is user-authored and we'd rather
 /// over-report than blow up the whole probe over one typo. The orchestrator
 /// already validates the YAML on save; this is belt-and-suspenders.
 pub fn match_danger_paths(patterns: &[String], changed: &[&str]) -> DangerPaths {
-    let mut builder = GlobSetBuilder::new();
-    for p in patterns {
-        if let Ok(g) = Glob::new(p) {
-            builder.add(g);
-        }
-    }
-    let set = match builder.build() {
-        Ok(s) => s,
-        Err(_) => return DangerPaths::default(),
-    };
-    let mut matched = Vec::new();
-    for path in changed {
-        if set.is_match(path) {
-            matched.push((*path).to_string());
-        }
-    }
+    let globs: Vec<Glob> = patterns.iter().filter_map(|p| Glob::new(p).ok()).collect();
+    let matched = changed
+        .iter()
+        .filter(|path| globs.iter().any(|g| g.is_match(path)))
+        .map(|path| (*path).to_string())
+        .collect();
     DangerPaths { matched }
 }
 

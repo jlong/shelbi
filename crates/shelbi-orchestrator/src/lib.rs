@@ -25,6 +25,7 @@ pub mod cancel;
 pub(crate) mod codex_rpc;
 pub mod dispatch;
 pub mod far;
+mod danger_glob;
 mod git;
 pub mod githook;
 pub mod handoff;
