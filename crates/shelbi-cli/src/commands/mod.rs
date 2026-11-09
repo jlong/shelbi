@@ -36,6 +36,7 @@ pub mod session;
 pub mod session_attach;
 pub mod session_cli;
 pub mod status;
+mod temp_dir;
 pub mod wizard;
 pub mod workflow;
 pub mod workspace;

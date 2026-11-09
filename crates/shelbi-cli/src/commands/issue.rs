@@ -2197,6 +2197,60 @@ workspaces:
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// `issue edit` on a tracker issue opens a local draft in `$EDITOR`. The
+    /// draft's temp dir goes away when nothing needs it, and survives a failed
+    /// save so the edits aren't lost. Neither path reaches the daemon: an
+    /// untouched draft saves nothing, and an unreadable one fails before the
+    /// mutation is sent.
+    #[test]
+    fn tracker_edit_drops_an_untouched_draft_and_keeps_a_failed_one() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        write_github_project_yaml(&home, "gh");
+        install_gh_issue_runner(gh_issue_json("t", "todo"));
+        let opened = home.join("editor-opened");
+        let editor = |name: &str, script: &str| {
+            let path = home.join(name);
+            std::fs::write(&path, format!("printf '%s' \"$1\" > '{}'\n{script}", opened.display()))
+                .unwrap();
+            std::env::set_var("EDITOR", format!("sh {}", path.display()));
+        };
+        let opened_draft = || PathBuf::from(std::fs::read_to_string(&opened).unwrap());
+        std::env::remove_var("VISUAL");
+
+        // Untouched: nothing to save, and the draft's dir is removed.
+        editor("look.sh", "");
+        super::super::issue_editor::edit_on_tracker("gh", "t", None)
+            .expect("an untouched draft saves nothing");
+        let draft = opened_draft();
+        assert!(draft.ends_with("t.md"), "{}", draft.display());
+        let dir = draft.parent().unwrap();
+        assert!(
+            dir.file_name().unwrap().to_str().unwrap().starts_with("shelbi-issue-"),
+            "{}",
+            dir.display()
+        );
+        assert!(!dir.exists(), "the untouched draft's dir should be removed");
+
+        // A save that fails keeps the draft, and says where.
+        editor("break.sh", "printf 'no frontmatter here\\n' > \"$1\"");
+        let err = super::super::issue_editor::edit_on_tracker("gh", "t", None)
+            .expect_err("an unreadable draft can't be saved");
+        let draft = opened_draft();
+        assert!(
+            format!("{err:#}").contains(&format!("Your edits are kept in {}", draft.display())),
+            "{err:#}"
+        );
+        assert_eq!(std::fs::read_to_string(&draft).unwrap(), "no frontmatter here\n");
+        std::fs::remove_dir_all(draft.parent().unwrap()).unwrap();
+
+        std::env::remove_var("EDITOR");
+        shelbi_state::clear_test_gh_runner();
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn show_prints_the_pr_with_its_state_and_ci_and_a_backfilled_one() {
         use shelbi_core::{IssuePr, PrCi, PrState};
