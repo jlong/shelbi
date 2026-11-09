@@ -1,36 +1,50 @@
 ---
 title: shelbi init
 order: 10
-summary: Create a project from Shelbi's detected setup plan, interactively or without prompts for automation.
+summary: Create a project by answering four steps, interactively or with every detected default accepted for automation.
 ---
 
 ```text
 shelbi init [OPTIONS]
 ```
 
-`shelbi init` has two setup paths:
+`shelbi init` walks the same four steps as first-run `shelbi`,
+[`shelbi project add`](/docs/cli/project), the TUI's **Add project** dialog and
+the desktop app's **Add Project** wizard. Every one of them creates the project
+through the same engine, so the same answers produce the same files no matter
+where you start.
 
-- Run it normally for the existing config-location and pick-up workflows.
-- Add `-y` to detect the same plan as first-run `shelbi`, accept it without a
-  prompt, and write the standard global project layout.
+1. **Folder.** The repository to manage and the project's name. The folder
+   defaults to the top of the Git checkout you're in, and the name to the
+   folder's. If the folder isn't a Git repository yet, Shelbi offers to
+   initialize one (`git init -b <branch>`). If it holds a teammate's committed
+   `.shelbi/project.yaml`, Shelbi offers to pick that up, which registers it on
+   this machine and skips the remaining steps.
+2. **Agents.** The runner and model the project's agents use by default. The
+   installed runner is preselected (Claude Code when both Claude Code and Codex
+   are installed), on the runner's own default model.
+3. **Issues.** Where the board lives: GitHub Issues or the file system. See
+   [Where your issues live](#where-your-issues-live).
+4. **Settings.** Where the project's settings live: outside the repository
+   (global, under `~/.shelbi/projects/`) or inside it (in-repo, committed at
+   `<repo>/.shelbi/`). Shelbi recommends in-repo when the repository has an
+   origin remote and at least two committers, and global otherwise, and shows
+   why (for example `Recommended: In repo (origin remote + 3 committers)`).
 
-The `-y` path performs the full prerequisite and project validation before it
-writes anything. It uses the current directory by default, detects the Git
-root, branch, origin, and runner, then creates the same project and
-Welcome card as Enter on the interactive setup card. If the directory isn't a
-Git repository yet, `-y` initializes one with `git init -b main` first
-(interactive setup asks before doing so). Running `init -y` again in a directory
-that already belongs to a project prints `✓ Project <name> is already
-configured.` and changes nothing.
+Every step starts on what Shelbi detected: the default branch (origin's `HEAD`,
+then the checked-out branch, then `main`), the origin remote with any
+credentials removed, the installed runners, and whether a pick-up applies. The
+project records the detected branch and remote.
 
-The `-y` path creates the project with an **empty workspace pool**; the
-orchestrator sets the pool up on first boot by asking how many workspaces and
-which naming scheme you want, then creating each one with
-[`shelbi workspace add`](/docs/cli/workspace). Run `shelbi` interactively for that
-first-boot interview. The config-location path (without `-y`) instead writes a
-starter pool of two hub workspaces: `dev` and a `review`-tagged `review` slot.
+Nothing is written until every step is answered. Then Shelbi checks that every
+place it writes to is usable, initializes Git if you accepted that, and
+creates the project with an **empty workspace pool**: the orchestrator sets the
+pool up on first boot by asking how many workspaces and which naming scheme you
+want, then creating each one (on the runner you chose) with
+[`shelbi workspace add`](/docs/cli/workspace). Run `shelbi` interactively for
+that first-boot interview.
 
-Every setup path also installs a `pre-commit` hook in the repository that blocks
+Every setup also installs a `pre-commit` hook in the repository that blocks
 commits to the default branch from inside Shelbi's agent sessions only; your own
 shell is unaffected. Shelbi prints a notice the first time it installs the hook,
 and an existing hook of your own is left untouched (with a warning). Manage or
@@ -38,10 +52,8 @@ remove it with [`shelbi guard`](/docs/cli/guard).
 
 ## Where your issues live
 
-Interactive setup asks where the project's board should live:
-
 - **GitHub Issues** stores each card as a GitHub issue, so teammates and
-  contributors can see and file them. It is pre-selected, with the `owner/repo`
+  contributors can see and file them. It is preselected, with the `owner/repo`
   pre-filled, when the origin remote is a GitHub repo. Choosing it runs a
   preflight first: `gh` must be installed and authenticated, and your account
   must be able to read issues and create labels on the repo (Issues enabled plus
@@ -51,8 +63,7 @@ Interactive setup asks where the project's board should live:
   labels on first use and stores a small metadata block in each issue's body.
 - **File system** keeps the board as private markdown files on this machine
   under `~/.shelbi/projects/<name>/tasks/`. No GitHub needed. It's
-  pre-selected when the origin isn't on GitHub, and it's what `-y` uses unless
-  you pass `--issue-tracker github`.
+  preselected when the origin isn't on GitHub.
 
 The choice is written as an `issue_tracker:` block in the project config: the
 shared `project.yaml` for in-repo mode, or `~/.shelbi/projects/<name>.yaml` for
@@ -62,76 +73,44 @@ of a project that already has issues without pointing you there first.
 
 ## Automation
 
-From a repository with exactly one supported runner on `PATH`, this is the
-copy-pasteable zero-prompt setup:
+`-y` (or running without a terminal) answers every step with its detected
+default, exactly what the interactive prompts preselect, and asks nothing:
 
 ```bash
 shelbi init -y
 ```
 
-If both Claude Code and Codex are installed, runner selection is ambiguous.
-Disambiguate it explicitly:
+With `-y`, a preselected GitHub board still has to pass its preflight; if it
+doesn't, Shelbi says why and uses File system instead. Passing
+`--issue-tracker github` makes a preflight failure a hard error instead.
+
+Each flag pre-answers its step, with or without `-y`:
 
 ```bash
-shelbi init -y --runner codex
-```
-
-For a different checkout or CI workspace:
-
-```bash
-shelbi init -y --root /workspace/myapp --runner claude
-```
-
-`--runner` selects the runner for the workspaces the orchestrator later creates
-and is also the default orchestrator runner. Use `--orchestrator-runner` only
-when those should differ. The selected runners must be installed on `PATH`.
-
-<Callout type="warning" title="Do not omit --runner when both are installed">
-
-`shelbi init -y` will stop rather than guess between Claude Code and Codex.
-Pass `--runner claude` or `--runner codex` to make automation deterministic.
-
-</Callout>
-
-## Detected-plan options
-
-| Flag | Type | Default | Description |
-| --- | --- | --- | --- |
-| `-y, --yes` | flag | off | Accept the detected plan without prompts. This is a global flag and may appear before or after `init`. |
-| `--project <PROJECT>` | string | project-root basename | Override the generated project name. Shelbi lowercases it and replaces characters a project id can't hold with `-`, and tells you when it does (`Using project name 'my_thing' (normalized from 'My_Thing')`). |
-| `--root <ROOT>` | path | current directory with `-y` | Repository Shelbi will manage. Put it after `init`: `shelbi --root PATH init` sets the Shelbi state directory instead. A relative path is resolved against the current directory and must exist. |
-| `--runner <RUNNER>` | `claude` \| `codex` | the only detected runner | Runner for the workspaces the orchestrator creates on first boot. Required when both supported runners are installed. |
-| `--default-branch <BRANCH>` | string | detected branch, then `main` | Override the detected default branch. `--branch` is an alias. |
-| `--github-url <URL>` | string | detected origin | Override the detected origin URL. `--remote` is an alias; pass an empty value to omit it. |
-| `--orchestrator-runner <RUNNER>` | `claude` \| `codex` | selected `--runner` | Use a different installed runner for the orchestrator. |
-| `--issue-tracker <BACKEND>` | `github` \| `file_system` | `file_system` | Where the board lives. `github` is preflighted before anything is written; a failure is a hard error naming the fix (no silent fall-back). Omit to keep `file_system`. |
-| `--github-repo <OWNER/REPO>` | string | detected origin repo | The repo for `--issue-tracker github`. Required when the origin remote is not a GitHub repo. |
-
-`--runner`, `--default-branch`, `--github-url`, `--orchestrator-runner`,
-`--issue-tracker`, and `--github-repo` require `-y`; without it they fail with a
-`detected-plan overrides require shelbi init -y` error. `--project` and `--root`
-work on both paths. The `-y` path cannot be combined with
-`--mode` or `--pick-up`. Without `--issue-tracker`, `-y` keeps the `file_system`
-default so existing scripted setups are unchanged. The chosen backend is printed
-in the plan summary.
-
-Create a project whose board is GitHub Issues without prompts:
-
-```bash
+shelbi init -y --root /workspace/myapp --runner codex --mode global
 shelbi init -y --issue-tracker github --github-repo acme/myapp
 ```
 
-## Config-location and pick-up options
+Running `init -y` again in a directory that already belongs to a project prints
+`✓ Project <name> is already configured.` and changes nothing.
 
-Without `-y`, `shelbi init` uses the explicit config-mode workflow:
+## Options
 
-| Flag | Type | Default | Description |
+| Flag | Step | Default | Description |
 | --- | --- | --- | --- |
-| `--mode <MODE>` | `in-repo` \| `global` | asked interactively | Choose committed in-repo config or per-user global config. Required for this path when stdin is not a TTY. |
-| `--root <ROOT>` | path | asked interactively | Project root. Skips the "Project root?" prompt; required when stdin is not a TTY. |
-| `--pick-up` | flag | off | Register an existing committed `<repo>/.shelbi/project.yaml` after cloning a teammate's project. |
+| `-y, --yes` | all | off | Accept every detected default without prompts. This is a global flag and may appear before or after `init`. |
+| `--root <ROOT>` | Folder | the current Git checkout's top | Repository Shelbi will manage. Put it after `init`: `shelbi --root PATH init` sets the Shelbi state directory instead. A relative path is resolved against the current directory and must exist. |
+| `--project <PROJECT>` | Folder | the folder's name | The project's name. Shelbi lowercases it and replaces characters a project id can't hold with `-` for the id, keeping what you typed as the display name. With a pick-up, the local alias. |
+| `--pick-up` | Folder | offered when found | Take the committed `<repo>/.shelbi/project.yaml` (searching parent folders when `--root` isn't given). A committed name that's taken locally gets a suffixed alias (`-2`, `-3`, and so on). |
+| `--runner <RUNNER>` | Agents | the installed runner, Claude Code first | `claude` or `codex`. With `-y` it must be installed on `PATH`. |
+| `--model <MODEL>` | Agents | the runner's default | The agents' default model. |
+| `--issue-tracker <BACKEND>` | Issues | GitHub for a GitHub origin that passes the preflight, else `file_system` | `github` or `file_system`. `github` is preflighted before anything is written; a failure is a hard error naming the fix. |
+| `--github-repo <OWNER/REPO>` | Issues | detected origin repo | The repo for `--issue-tracker github`. Required when the origin remote is not a GitHub repo. |
+| `--mode <MODE>` | Settings | the recommendation | `global` or `in-repo`. |
+| `--default-branch <BRANCH>` | | detected branch, then `main` | Override the detected default branch (also the branch a `git init` creates). `--branch` is an alias. |
+| `--github-url <URL>` | | detected origin | Override the detected origin URL; credentials are removed before it's written. `--remote` is an alias; pass an empty value to omit it. |
 
-Register an existing in-repo project like this:
+Register a teammate's in-repo project like this:
 
 ```bash
 git clone git@github.com:acme/myapp.git && cd myapp
@@ -144,7 +123,7 @@ and migration path.
 ## See also
 
 - [Set up your first project](/docs/guides/getting-started/first-project) for
-  the visible preflight and one-confirmation experience.
+  the first-run walkthrough.
 - [`shelbi wizard`](/docs/cli/wizard) for the explicit interactive entry point.
 - [`shelbi project`](/docs/cli/project) for adding or migrating projects.
 - [`shelbi guard`](/docs/cli/guard) for the default-branch commit guard setup

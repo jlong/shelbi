@@ -3,7 +3,6 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 mod issue_tracker_setup;
-mod project_root;
 mod wizard;
 
 #[derive(Debug, Parser)]
@@ -748,14 +747,14 @@ fn project_registration_exists(name: &str) -> bool {
 /// Onboarding dispatcher when `default_entry` cannot resolve this cwd to a
 /// locally registered project.
 /// Prints the brand banner (only on a truly-fresh install), then runs the
-/// shared detected-plan flow and launches the TUI only when that flow creates
-/// a project.
+/// shared new-project flow (the steps `shelbi init`, the TUI and the desktop
+/// app walk) and launches the TUI only when that flow creates a project.
 ///
 /// `first_run` is true when `~/.shelbi/` did not exist before this
 /// invocation; the banner only prints in that case.
 ///
-/// Cancellation (`Ctrl-C` / `Esc`) and the plan card's explicit `q` both
-/// resolve to `SetupOutcome::Quit` and exit cleanly without launching.
+/// Cancellation (`Ctrl-C` / `Esc` at a prompt) resolves to
+/// `SetupOutcome::Quit` and exits cleanly without launching.
 fn run_wizard_then_dispatch(first_run: bool) -> Result<()> {
     if first_run {
         wizard::print_banner();
@@ -1012,10 +1011,13 @@ mod cli_tests {
             "--root <ROOT>",
             "--default-branch <BRANCH>",
             "--github-url <URL>",
-            "--orchestrator-runner <RUNNER>",
+            "--model <MODEL>",
+            "--mode <MODE>",
+            "--issue-tracker <BACKEND>",
         ] {
             assert!(help.contains(expected), "missing `{expected}` in:\n{help}");
         }
+        assert!(!help.contains("--orchestrator-runner"), "the retired flag stays hidden:\n{help}");
         assert!(
             help.contains("claude"),
             "runner values missing from:\n{help}"

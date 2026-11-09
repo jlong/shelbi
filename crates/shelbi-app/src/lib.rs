@@ -97,6 +97,7 @@ pub mod layout_sub;
 pub mod licenses;
 pub mod markdown_edit;
 pub mod nav;
+pub mod new_project;
 pub mod onboarding;
 pub mod overlay;
 pub mod reachability;

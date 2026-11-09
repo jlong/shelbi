@@ -48,7 +48,6 @@ use ratatui::{backend::CrosstermBackend, widgets::Clear, Frame, Terminal};
 use shelbi_app::launch::{
     DaemonStarter, LaunchModel, RecentRemotes, RemoteConnector, RemoteSession, SharedDaemon, SshRemote,
 };
-use shelbi_core::IssueTrackerConfig;
 use shelbi_orchestrator::project_create;
 
 pub use connect::{ConnectDialog, ConnectStep};
@@ -264,44 +263,43 @@ impl LaunchApp {
     fn add_project_step(&mut self, step: add_project::Step) {
         match step {
             // Page 1's validation and the pickers' menus are the form's own.
-            add_project::Step::Continue | add_project::Step::Validate | add_project::Step::Menu(_) => {}
+            add_project::Step::Continue
+            | add_project::Step::Validate
+            | add_project::Step::Preflight(_)
+            | add_project::Step::Menu(_) => {}
             add_project::Step::Cancel => self.layer = None,
             add_project::Step::Submit => self.submit_project(),
         }
     }
 
-    /// Validate the form; scaffold the project off the UI thread with the
-    /// agent defaults it chose, or say what's wrong on the form.
+    /// Create the form's answers off the UI thread through the one creation
+    /// engine, or say what's wrong on the form.
     fn submit_project(&mut self) {
         let Some(Layer::AddProject(form)) = self.layer.as_mut() else {
             return;
         };
-        let mode = form.mode();
-        let defaults = form.defaults();
-        match project_create::validate_add_project(form.name(), form.root(), &self.cwd) {
-            Ok(resolved) => {
-                self.layer = None;
-                let (tx, rx) = std::sync::mpsc::channel();
-                let spawned = std::thread::Builder::new().name("shelbi-add-project".into()).spawn(move || {
-                    let slug = resolved.name.clone();
-                    let created = project_create::scaffold_project_with(
-                        &resolved,
-                        mode,
-                        &IssueTrackerConfig::default(),
-                        &defaults,
-                        &mut project_create::NullReporter,
-                    );
-                    let _ = tx.send(created.map(|()| slug).map_err(|e| format!("Add project failed: {e}")));
-                });
-                match spawned {
-                    Ok(_) => {
-                        self.create_job = Some(rx);
-                        self.screen.set_notice(Notice::Info("Creating project…".to_string()));
-                    }
-                    Err(e) => self.screen.set_notice(Notice::Error(format!("Add project failed: {e}"))),
-                }
+        let Some(plan) = form.plan() else {
+            return;
+        };
+        self.layer = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new().name("shelbi-add-project".into()).spawn(move || {
+            let created = project_create::create_project(
+                &plan,
+                project_create::Attempt::New,
+                &mut project_create::NullReporter,
+            );
+            let _ = tx.send(created.map_err(|e| match e {
+                project_create::AddProjectError::Invalid(msg) => format!("Add project failed: {msg}"),
+                project_create::AddProjectError::Failed(msg) => msg,
+            }));
+        });
+        match spawned {
+            Ok(_) => {
+                self.create_job = Some(rx);
+                self.screen.set_notice(Notice::Info("Creating project…".to_string()));
             }
-            Err(msg) => form.set_error(msg),
+            Err(e) => self.screen.set_notice(Notice::Error(format!("Add project failed: {e}"))),
         }
     }
 

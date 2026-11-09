@@ -678,38 +678,59 @@ fn add_project_collects_the_form_then_mutates() {
     assert_eq!(s.invoke("action:add-project"), Effect::AddProject);
     assert_eq!(s.client.overlay(), Some(&Overlay::AddProject));
 
-    // The shared form: the path prefills to the working directory; type a
-    // name, Continue (the host validates), choose the agent defaults, then
-    // Continue and Create Project.
+    // The shared form, over the steps every front end walks: the path
+    // prefills to the working directory; type a name, Continue (the host
+    // checks the folder, then validates), choose the agent defaults, the
+    // board, then Create Project.
     let mut form = add_project::Form::new(Path::new("/src/web"));
     type_into("Web App", |c| {
         form.handle_key(c);
     });
     let enter = KeyChord::new(Key::Enter, Mods::NONE);
     assert_eq!(form.handle_key(enter), add_project::Step::Validate);
+    let path = std::path::PathBuf::from("/src/web");
+    let check = shelbi_app::new_project::FolderCheck {
+        in_repo_dir: path.join(".shelbi"),
+        path: path.clone(),
+        name: Some("Web App".into()),
+        slug: Some("web-app".into()),
+        repo: Some(shelbi_app::new_project::Repo::Git),
+        problem: None,
+        global_dir: None,
+        facts: shelbi_app::new_project::Facts {
+            default_branch: "trunk".into(),
+            ..Default::default()
+        },
+    };
+    assert_eq!(form.folder_checked(check), add_project::Step::Validate);
     form.folder_valid();
     assert_eq!(form.page(), add_project::Page::Defaults);
     form.select_runner(shelbi_core::RunnerKind::Codex);
     form.select_model(Some("gpt-5"));
     assert_eq!(form.handle_key(enter), add_project::Step::Continue);
+    assert_eq!(form.page(), add_project::Page::Issues);
+    assert_eq!(form.handle_key(enter), add_project::Step::Continue);
     assert_eq!(form.handle_key(enter), add_project::Step::Submit);
-    let m = Mutation::AddProject {
-        name: form.name().to_string(),
-        root: form.root().to_string(),
-        mode: form.mode(),
-        defaults: form.defaults(),
-    };
+    let plan = form.plan().expect("the folder was checked");
+    let m = Mutation::AddProject { plan: Box::new(plan) };
     s.run(Effect::Mutate(m.clone())).unwrap();
     assert_eq!(
         s.last(),
         &Performed::Mutation(Mutation::AddProject {
-            name: "Web App".into(),
-            root: "/src/web".into(),
-            mode: ConfigMode::Global,
-            defaults: shelbi_core::AgentDefaults {
-                runner: shelbi_core::RunnerKind::Codex,
-                model: Some("gpt-5".into()),
-            },
+            plan: Box::new(shelbi_app::new_project::NewProject {
+                root: path,
+                name: "Web App".into(),
+                pick_up: false,
+                git_init: false,
+                defaults: shelbi_core::AgentDefaults {
+                    runner: shelbi_core::RunnerKind::Codex,
+                    model: Some("gpt-5".into()),
+                },
+                issue_tracker: shelbi_core::IssueTrackerConfig::default(),
+                mode: ConfigMode::Global,
+                default_branch: "trunk".into(),
+                remote: None,
+            }),
         })
     );
 }

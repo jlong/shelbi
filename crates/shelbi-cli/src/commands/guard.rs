@@ -57,34 +57,13 @@ fn hub_work_dir(project: &Project) -> Result<&Path> {
         .ok_or_else(|| anyhow!("project `{}` has no local hub machine", project.name))
 }
 
-/// Install the guard, creating it if absent. Shared by `shelbi guard install`
-/// and the `shelbi init` disclosure path so both write the same hook.
+/// Install the guard, creating it if absent (`shelbi guard install`; the
+/// creation engine installs the same hook when it creates a project).
 pub fn install(project: &Project, work_dir: &Path) -> Result<HookInstall> {
     let protected = shelbi_orchestrator::protected_default_branches(project);
     let refs: Vec<&str> = protected.iter().map(String::as_str).collect();
     githook::install_hub_branch_guard(work_dir, &refs, InstallMode::CreateIfMissing)
         .map_err(|e| anyhow!(e))
-}
-
-/// Install the guard from the `-y` wizard's consented setup path: disclose on a
-/// fresh install, warn (stderr) when a foreign hook blocks it, and stay silent
-/// on the "already there" refresh and on best-effort failures. Never fails
-/// setup: a hook is a convenience, not a precondition. (The shared
-/// `project_create` scaffold engine installs the guard the same way for the
-/// `shelbi init` / palette / TUI add-project paths.)
-pub fn install_at_init(project: &Project, work_dir: &Path) {
-    match install(project, work_dir) {
-        Ok(HookInstall::Installed) => disclose_on_first_install(work_dir),
-        Ok(HookInstall::SkippedForeignHook) => {
-            eprintln!(
-                "shelbi: {}/.git/hooks/pre-commit is user-authored — left untouched. \
-                 The default-branch commit guard was NOT installed.",
-                work_dir.display()
-            );
-        }
-        // Refreshed (already installed) and any best-effort error stay quiet.
-        _ => {}
-    }
 }
 
 /// One-time disclosure printed when `shelbi guard install` (or the shared

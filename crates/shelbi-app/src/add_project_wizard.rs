@@ -1,13 +1,18 @@
 //! The Add Project wizard's state machine (`dt-add-project-wizard`).
 //!
-//! The desktop app adds a project through a small wizard rather than one
-//! form: screen 01 picks the project's folder (the name is the folder's),
-//! the Agent defaults screen ([`Screen::Defaults`]) picks the runner and
-//! model the project's agents use by default (the shared
-//! [`HarnessPicker`], the orchestrator onboarding's pickers), and screen 02
-//! picks where its settings live ([`ConfigMode`]). Create Project then hands
-//! the host one [`CreateRequest`] for
-//! `shelbi_orchestrator::project_create::add_project`, the engine `shelbi
+//! The desktop app adds a project through a small wizard over the steps
+//! every front end shares ([`crate::new_project::Step`]): screen 01 picks
+//! the project's folder (the name is the folder's), offering to initialize
+//! Git in a plain folder and to pick up a committed config (which creates
+//! the project from there); the Agent defaults screen ([`Screen::Defaults`])
+//! picks the runner and model the project's agents use by default (the
+//! shared [`HarnessPicker`], the detected install preselected); the Issues
+//! screen ([`Screen::Issues`]) picks where the board lives, a GitHub repo
+//! verified by the `gh` preflight ([`Action::Preflight`]); and screen 02
+//! picks where its settings live ([`ConfigMode`], the folder's
+//! recommendation preselected and explained). Create Project then hands the
+//! host one [`CreateRequest`] for
+//! `shelbi_orchestrator::project_create::create_project`, the engine `shelbi
 //! init` and the TUI's form use, and screen 03 ([`Screen::Creating`]) shows
 //! the engine's progress as a checklist of [`Stage`]s, from the stage events
 //! the host forwards ([`Wizard::stage_started`], [`Wizard::stage_finished`],
@@ -33,15 +38,17 @@
 
 use std::path::{Path, PathBuf};
 
-use shelbi_core::{AgentDefaults, ConfigMode, RunnerKind, StatusCategory, Workflow};
+use shelbi_core::{ConfigMode, RunnerKind, StatusCategory, Workflow};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 use shelbi_state::orchestrator_setup::RunnerSetupError;
 
 pub use crate::harness_picker::HarnessPicker;
+pub use crate::new_project::{folder_name, Facts, FolderCheck, PickUp, Problem, Repo, Tone, Tracker};
+use crate::new_project::{IssuesChoice, NewProject};
 
-/// The footer's step count ("Step 1 of 3"): the folder, the agent defaults,
-/// the settings.
-pub const STEPS: usize = 3;
+/// The footer's step count ("Step 1 of 4"): the folder, the agent defaults,
+/// the issues, the settings.
+pub const STEPS: usize = crate::new_project::STEPS;
 
 /// The title and the line under it, per screen.
 pub const FOLDER_TITLE: &str = "Add project";
@@ -104,6 +111,8 @@ pub enum Screen {
     Folder,
     /// The agents' default runner and model.
     Defaults,
+    /// Where the board lives.
+    Issues,
     Settings,
     /// 03: the creation's checklist.
     Creating,
@@ -113,19 +122,23 @@ pub enum Screen {
 }
 
 impl Screen {
-    /// The footer's "Step N of 3" (the creation has no footer step).
+    /// The footer's "Step N of 4" (the creation has no footer step).
     pub fn step(self) -> usize {
+        use crate::new_project::Step;
         match self {
-            Screen::Folder => 1,
-            Screen::Defaults => 2,
-            Screen::Settings | Screen::Creating | Screen::Created => 3,
+            Screen::Folder => Step::Folder,
+            Screen::Defaults => Step::Agents,
+            Screen::Issues => Step::Issues,
+            Screen::Settings | Screen::Creating | Screen::Created => Step::Settings,
         }
+        .number()
     }
 
     pub fn title(self) -> &'static str {
         match self {
             Screen::Folder => FOLDER_TITLE,
             Screen::Defaults => DEFAULTS_TITLE,
+            Screen::Issues => crate::new_project::ISSUES_TITLE,
             Screen::Settings => SETTINGS_TITLE,
             Screen::Creating => CREATING_TITLE,
             Screen::Created => CREATED_TITLE,
@@ -273,122 +286,6 @@ pub fn step_label(screen: Screen) -> String {
     format!("Step {} of {STEPS}", screen.step())
 }
 
-/// What the chosen folder is under version control.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Repo {
-    /// A Git repository (its own `.git` directory, or inside one).
-    Git,
-    /// A Git worktree (its `.git` is a file pointing at the main repo).
-    Worktree,
-    /// Not under Git: allowed, with the shared warning.
-    NotGit,
-}
-
-/// Why the chosen folder can't be added (Continue stays disabled).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Problem {
-    /// The path field is empty.
-    Empty,
-    NotFound,
-    NotDirectory,
-    /// The name has no letters or digits to build a project id from.
-    NoName,
-    /// A project with this id is already registered.
-    Taken { slug: String },
-    /// The check itself failed (the Shelbi home is unreadable).
-    Unreadable(String),
-}
-
-/// What the chosen folder turned out to be: the host's answer to a check.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FolderCheck {
-    /// The folder, resolved (`~` expanded, made absolute).
-    pub path: PathBuf,
-    /// The project's name: the folder's, or the one typed after a clash.
-    pub name: Option<String>,
-    /// The id `name` slugifies to (the settings folder's name).
-    pub slug: Option<String>,
-    /// `None` while the folder doesn't exist as a directory.
-    pub repo: Option<Repo>,
-    pub problem: Option<Problem>,
-    /// Where settings go in the project (`<folder>/.shelbi`).
-    pub in_repo_dir: PathBuf,
-    /// Where settings go outside it (`<Shelbi home>/projects/<id>`), when
-    /// there is an id.
-    pub global_dir: Option<PathBuf>,
-}
-
-impl FolderCheck {
-    /// The folder can be added.
-    pub fn usable(&self) -> bool {
-        self.problem.is_none()
-    }
-
-    /// A check that didn't get as far as the folder: `problem` for `path`.
-    pub fn failed(path: PathBuf, problem: Problem) -> Self {
-        Self {
-            in_repo_dir: path.join(".shelbi"),
-            path,
-            name: None,
-            slug: None,
-            repo: None,
-            problem: Some(problem),
-            global_dir: None,
-        }
-    }
-
-    /// The box's line under the name: what was found, or what's wrong.
-    pub fn message(&self) -> String {
-        match &self.problem {
-            Some(Problem::Empty) => "Enter the path to your project folder.".into(),
-            Some(Problem::NotFound) => "This folder doesn't exist.".into(),
-            Some(Problem::NotDirectory) => "This path is a file, not a folder.".into(),
-            Some(Problem::NoName) => {
-                "This name has no letters or digits to build a project id from. Enter a name for the project."
-                    .into()
-            }
-            Some(Problem::Taken { slug }) => format!(
-                "A project named “{slug}” already exists. Enter a different name for this one."
-            ),
-            Some(Problem::Unreadable(e)) => format!("Couldn't check this folder: {e}"),
-            None => match self.repo {
-                Some(Repo::Git) => {
-                    "Git repository detected. Shelbi will use this folder as your project.".into()
-                }
-                Some(Repo::Worktree) => {
-                    "Git worktree detected. Shelbi will use this folder as your project.".into()
-                }
-                // The shared warning (`Detected::NotGitRepo`): allowed, flagged.
-                Some(Repo::NotGit) | None => {
-                    "Not a Git repository. Shelbi expects Git, but will continue.".into()
-                }
-            },
-        }
-    }
-
-    /// How [`Self::message`] reads: good news, a warning, or an error.
-    pub fn tone(&self) -> Tone {
-        match (&self.problem, self.repo) {
-            (Some(_), _) => Tone::Error,
-            (None, Some(Repo::Git | Repo::Worktree)) => Tone::Normal,
-            (None, _) => Tone::Warning,
-        }
-    }
-
-    /// A name typed into the clash field would fix this.
-    fn wants_name(&self) -> bool {
-        matches!(self.problem, Some(Problem::Taken { .. } | Problem::NoName))
-    }
-}
-
-/// How a status line reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tone {
-    Normal,
-    Warning,
-    Error,
-}
-
 /// The text a check is for: the path field, and the typed name if any.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckKey {
@@ -407,6 +304,13 @@ pub enum Focus {
     /// The Agent defaults screen's pickers.
     Harness,
     Model,
+    /// Screen 01's offers (once the check makes them): initialize Git, pick
+    /// up the committed config.
+    GitInit,
+    PickUp,
+    /// The Issues screen's cards, and its GitHub repo field.
+    Tracker(Tracker),
+    Repo,
     /// Screen 02's cards.
     Card(ConfigMode),
     Back,
@@ -427,9 +331,12 @@ pub enum Action {
     Menu(Focus),
     /// Close the wizard (before Create Project, nothing was written).
     Close,
+    /// Run the `gh` preflight for this GitHub repo; its answer goes to
+    /// [`Wizard::preflight_passed`] / [`Wizard::preflight_failed`].
+    Preflight(String),
     /// Run the creation engine for this request (once per press: a running
     /// creation takes no second one).
-    Create(CreateRequest),
+    Create(Box<CreateRequest>),
     /// Open the created project (its Orchestrator), then close the wizard.
     /// The host answers a failure with [`Wizard::open_failed`].
     Open(Created),
@@ -444,15 +351,10 @@ pub enum Attempt {
     Retry,
 }
 
-/// The values Create Project hands the creation engine.
+/// What Create Project hands the creation engine: every step's answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateRequest {
-    pub name: String,
-    /// The resolved folder.
-    pub root: String,
-    pub mode: ConfigMode,
-    /// The Agent defaults screen's runner and model.
-    pub defaults: AgentDefaults,
+    pub plan: NewProject,
     pub attempt: Attempt,
 }
 
@@ -500,6 +402,18 @@ pub struct Wizard {
     /// Why the last open failed (Okay tries again).
     open_error: Option<String>,
     home: Option<PathBuf>,
+    /// Screen 01's offers.
+    git_init: bool,
+    pick_up: bool,
+    /// The Issues screen's choice, and the repo a preflight is running for.
+    issues: IssuesChoice,
+    preflighting: Option<String>,
+    /// The folder whose defaults the later screens were seeded with, and
+    /// the screens the user changed since (a new folder leaves those alone).
+    seeded: Option<PathBuf>,
+    chose_runner: bool,
+    chose_issues: bool,
+    chose_mode: bool,
 }
 
 impl Wizard {
@@ -523,6 +437,14 @@ impl Wizard {
             opening: false,
             open_error: None,
             home,
+            git_init: true,
+            pick_up: true,
+            issues: IssuesChoice::default(),
+            preflighting: None,
+            seeded: None,
+            chose_runner: false,
+            chose_issues: false,
+            chose_mode: false,
         }
     }
 
@@ -576,6 +498,7 @@ impl Wizard {
     /// runner's default.
     pub fn select_runner(&mut self, kind: RunnerKind) {
         if self.screen == Screen::Defaults {
+            self.chose_runner = true;
             self.picker.set_runner(kind, None);
             self.defaults_error = None;
             self.settle_focus();
@@ -711,6 +634,7 @@ impl Wizard {
         if key != self.key() {
             return;
         }
+        self.seed(&check);
         if self.name.is_none() && check.wants_name() {
             let seed = check
                 .name
@@ -727,12 +651,113 @@ impl Wizard {
         self.check = Some((key, check));
     }
 
+    /// A check for a new folder brings its defaults to every later screen
+    /// the user hasn't changed: the detected runner, the recommended board
+    /// and settings location, and both offers on.
+    fn seed(&mut self, check: &FolderCheck) {
+        if check.problem.is_some() || self.seeded.as_ref() == Some(&check.path) {
+            return;
+        }
+        self.seeded = Some(check.path.clone());
+        let facts = &check.facts;
+        if !self.chose_runner {
+            self.picker = HarnessPicker::new(facts.recommended_runner(), None);
+        }
+        if !self.chose_issues {
+            self.issues = facts.recommended_issues();
+        }
+        if !self.chose_mode {
+            self.mode = facts.recommended_mode;
+        }
+        self.git_init = true;
+        self.pick_up = true;
+    }
+
+    /// Screen 01's offers for the checked folder: (initialize Git, pick up
+    /// the committed config), each `Some(on)` while it applies. A pick-up
+    /// takes the committed config as it is, so no Git offer shows with one.
+    pub fn offers(&self) -> (Option<bool>, Option<bool>) {
+        let Some(check) = self.check().filter(|c| c.usable()) else {
+            return (None, None);
+        };
+        let pick_up = check.facts.pick_up.as_ref().map(|_| self.pick_up);
+        let git_init = (check.offers_git_init() && pick_up != Some(true)).then_some(self.git_init);
+        (git_init, pick_up)
+    }
+
+    /// The checked folder's committed config is to be picked up.
+    pub fn picking_up(&self) -> bool {
+        self.offers().1 == Some(true)
+    }
+
+    /// The Issues screen's choice.
+    pub fn issues(&self) -> &IssuesChoice {
+        &self.issues
+    }
+
+    /// A preflight is running for the GitHub repo.
+    pub fn preflighting(&self) -> bool {
+        self.preflighting.is_some()
+    }
+
+    /// The Issues screen's repo field changed.
+    pub fn set_repo(&mut self, text: impl Into<String>) {
+        self.issues.set_repo(text);
+    }
+
+    /// Choose the board (a card, or an arrow on one).
+    pub fn select_tracker(&mut self, tracker: Tracker) {
+        if self.screen == Screen::Issues {
+            self.issues.select(tracker);
+            self.chose_issues = true;
+            self.focus = Focus::Tracker(tracker);
+        }
+    }
+
+    /// `repo` passed the preflight: on to the settings.
+    pub fn preflight_passed(&mut self, repo: &str) {
+        if self.preflighting.as_deref() == Some(repo) {
+            self.preflighting = None;
+        }
+        self.issues.preflight_passed(repo);
+        if self.screen == Screen::Issues && self.issues.ready() {
+            self.screen = Screen::Settings;
+            self.focus = Focus::Card(self.mode);
+        }
+    }
+
+    /// `repo` failed the preflight with `message` (the fix to show).
+    pub fn preflight_failed(&mut self, repo: &str, message: impl Into<String>) {
+        if self.preflighting.as_deref() == Some(repo) {
+            self.preflighting = None;
+        }
+        self.issues.preflight_failed(repo, message);
+    }
+
+    /// Screen 02's line under the cards: the recommendation and why.
+    pub fn mode_recommendation(&self) -> Option<String> {
+        self.check().filter(|c| c.usable()).map(|c| c.facts.mode_recommendation())
+    }
+
+    /// The answers Create Project creates, once the folder checked out.
+    pub fn plan(&self) -> Option<NewProject> {
+        let check = self.check().filter(|c| c.usable())?;
+        let mut plan = NewProject::detected(check);
+        plan.pick_up = self.picking_up();
+        plan.git_init = self.offers().0 == Some(true);
+        plan.defaults = self.picker.defaults();
+        plan.issue_tracker = self.issues.config();
+        plan.mode = self.mode;
+        Some(plan)
+    }
+
     /// Continue / Create Project can be pressed.
     pub fn primary_enabled(&self) -> bool {
         match self.screen {
             Screen::Folder | Screen::Defaults | Screen::Settings => {
                 self.check().is_some_and(FolderCheck::usable)
             }
+            Screen::Issues => self.check().is_some_and(FolderCheck::usable) && self.preflighting.is_none(),
             // Try Again, once a creation has failed.
             Screen::Creating => !self.progress.running && self.progress.failed.is_some(),
             Screen::Created => self.created.is_some() && !self.opening,
@@ -743,7 +768,7 @@ impl Wizard {
     pub fn back_enabled(&self) -> bool {
         match self.screen {
             Screen::Folder => self.origin == Origin::Workspace,
-            Screen::Defaults | Screen::Settings => true,
+            Screen::Defaults | Screen::Issues | Screen::Settings => true,
             Screen::Creating | Screen::Created => false,
         }
     }
@@ -788,6 +813,20 @@ impl Wizard {
                 order.push(Focus::Browse);
                 if self.name.is_some() {
                     order.push(Focus::Name);
+                }
+                let (git_init, pick_up) = self.offers();
+                if pick_up.is_some() {
+                    order.push(Focus::PickUp);
+                }
+                if git_init.is_some() {
+                    order.push(Focus::GitInit);
+                }
+            }
+            Screen::Issues => {
+                order.push(Focus::Tracker(Tracker::Github));
+                order.push(Focus::Tracker(Tracker::FileSystem));
+                if self.issues.tracker() == Tracker::Github {
+                    order.push(Focus::Repo);
                 }
             }
             Screen::Defaults => {
@@ -846,6 +885,7 @@ impl Wizard {
     /// one).
     pub fn select_mode(&mut self, mode: ConfigMode) {
         if self.screen == Screen::Settings {
+            self.chose_mode = true;
             self.mode = mode;
             self.focus = Focus::Card(mode);
         }
@@ -867,8 +907,14 @@ impl Wizard {
                 self.settle_focus();
                 Action::Stay
             }
-            Screen::Settings => {
+            Screen::Issues => {
                 self.screen = Screen::Defaults;
+                self.focus = Focus::Primary;
+                self.settle_focus();
+                Action::Stay
+            }
+            Screen::Settings => {
+                self.screen = Screen::Issues;
                 self.focus = Focus::Primary;
                 self.settle_focus();
                 Action::Stay
@@ -887,6 +933,8 @@ impl Wizard {
             return Action::Stay;
         }
         match self.screen {
+            // A pick-up takes the committed config: nothing else to ask.
+            Screen::Folder if self.picking_up() => self.create_now(),
             Screen::Folder => {
                 self.screen = Screen::Defaults;
                 self.focus = Focus::Harness;
@@ -900,25 +948,25 @@ impl Wizard {
                     return Action::Stay;
                 }
                 self.defaults_error = None;
-                self.screen = Screen::Settings;
-                self.focus = Focus::Card(self.mode);
+                self.screen = Screen::Issues;
+                self.focus = Focus::Tracker(self.issues.tracker());
                 Action::Stay
             }
-            Screen::Settings => {
-                let Some(check) = self.check() else {
+            Screen::Issues => {
+                if self.issues.ready() {
+                    self.screen = Screen::Settings;
+                    self.focus = Focus::Card(self.mode);
                     return Action::Stay;
-                };
-                let request = CreateRequest {
-                    name: check.name.clone().unwrap_or_default(),
-                    root: check.path.display().to_string(),
-                    mode: self.mode,
-                    defaults: self.picker.defaults(),
-                    attempt: Attempt::New,
-                };
-                self.screen = Screen::Creating;
-                self.focus = Focus::Primary;
-                self.start(request)
+                }
+                match self.issues.preflight_due() {
+                    Some(repo) => {
+                        self.preflighting = Some(repo.clone());
+                        Action::Preflight(repo)
+                    }
+                    None => Action::Stay,
+                }
             }
+            Screen::Settings => self.create_now(),
             Screen::Creating => self.retry(),
             Screen::Created => match &self.created {
                 Some(created) => {
@@ -931,6 +979,17 @@ impl Wizard {
         }
     }
 
+    /// Create Project (or a pick-up's Continue): on to the checklist with
+    /// every step's answer.
+    fn create_now(&mut self) -> Action {
+        let Some(plan) = self.plan() else {
+            return Action::Stay;
+        };
+        self.screen = Screen::Creating;
+        self.focus = Focus::Primary;
+        self.start(CreateRequest { plan, attempt: Attempt::New })
+    }
+
     /// Run `request`: a fresh checklist.
     fn start(&mut self, request: CreateRequest) -> Action {
         self.progress = Progress {
@@ -938,7 +997,7 @@ impl Wizard {
             running: true,
             ..Progress::default()
         };
-        Action::Create(request)
+        Action::Create(Box::new(request))
     }
 
     /// Try Again: the failed request again, as a retry. The checklist starts
@@ -1006,7 +1065,7 @@ impl Wizard {
         if !self.creating() {
             return;
         }
-        let name = self.progress.request.as_ref().map(|r| r.name.clone()).unwrap_or_default();
+        let name = self.progress.request.as_ref().map(|r| r.plan.name.clone()).unwrap_or_default();
         self.progress.running = false;
         self.progress.active = None;
         self.progress.done = Stage::ALL.to_vec();
@@ -1030,6 +1089,18 @@ impl Wizard {
             }
             Focus::Card(mode) => {
                 self.select_mode(mode);
+                Action::Stay
+            }
+            Focus::GitInit if self.offers().0.is_some() => {
+                self.git_init = !self.git_init;
+                Action::Stay
+            }
+            Focus::PickUp if self.offers().1.is_some() => {
+                self.pick_up = !self.pick_up;
+                Action::Stay
+            }
+            Focus::Tracker(tracker) => {
+                self.select_tracker(tracker);
                 Action::Stay
             }
             Focus::Back => self.back(),
@@ -1073,6 +1144,14 @@ impl Wizard {
             {
                 let forward = matches!(chord.code, Key::Down | Key::Right);
                 self.step_choice(self.focus, forward);
+                Action::Stay
+            }
+            Key::Up | Key::Down | Key::Left | Key::Right if bare && !in_text && matches!(self.focus, Focus::Tracker(_)) => {
+                let other = match self.issues.tracker() {
+                    Tracker::Github => Tracker::FileSystem,
+                    Tracker::FileSystem => Tracker::Github,
+                };
+                self.select_tracker(other);
                 Action::Stay
             }
             Key::Up | Key::Down | Key::Left | Key::Right if bare && !in_text => {
@@ -1154,14 +1233,6 @@ pub fn prose(warning: &str) -> String {
     }
 }
 
-/// A folder's own name (its last component), if it has one.
-pub fn folder_name(path: &Path) -> Option<String> {
-    path.file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,6 +1256,7 @@ mod tests {
             repo: Some(repo),
             problem: None,
             global_dir: Some(home().join(".shelbi/projects").join(name.to_lowercase())),
+            facts: Facts::default(),
         }
     }
 
@@ -1211,7 +1283,7 @@ mod tests {
         assert_eq!(w.path(), "");
         assert_eq!(w.check_due(), None, "nothing to check before a folder is chosen");
         assert!(!w.primary_enabled());
-        assert_eq!(step_label(w.screen()), "Step 1 of 3");
+        assert_eq!(step_label(w.screen()), "Step 1 of 4");
         assert_eq!(w.tab_order(), [Focus::Browse, Focus::Back]);
         assert_eq!(w.focus(), Focus::Browse);
     }
@@ -1301,17 +1373,34 @@ mod tests {
         assert_eq!(w.primary(), Action::Stay);
         assert_eq!(w.screen(), Screen::Defaults);
         assert_eq!(w.primary(), Action::Stay);
+        assert_eq!(w.screen(), Screen::Issues);
+        assert_eq!(w.primary(), Action::Stay, "no GitHub origin: the file system");
         assert_eq!(w.screen(), Screen::Settings);
+    }
+
+    /// The plan Create Project hands over for the `chosen` folder.
+    fn plan_for(mode: ConfigMode) -> NewProject {
+        NewProject {
+            root: "/Users/me/Projects/acme".into(),
+            name: "acme".into(),
+            pick_up: false,
+            git_init: false,
+            defaults: shelbi_core::AgentDefaults::default(),
+            issue_tracker: shelbi_core::IssueTrackerConfig::default(),
+            mode,
+            default_branch: "main".into(),
+            remote: None,
+        }
     }
 
     #[test]
     fn the_flow_is_folder_then_agent_defaults_then_settings() {
         let mut w = chosen(Origin::Workspace);
-        assert_eq!(step_label(w.screen()), "Step 1 of 3");
+        assert_eq!(step_label(w.screen()), "Step 1 of 4");
         assert_eq!(w.handle_key(key(Key::Enter), false), Action::Stay);
         assert_eq!(w.screen(), Screen::Defaults);
         assert_eq!(w.screen().title(), "Agent defaults");
-        assert_eq!(step_label(w.screen()), "Step 2 of 3");
+        assert_eq!(step_label(w.screen()), "Step 2 of 4");
         assert_eq!(w.focus(), Focus::Harness);
         assert_eq!(w.tab_order(), [Focus::Harness, Focus::Model, Focus::Back, Focus::Primary]);
         // Claude Code on its default model until changed.
@@ -1320,8 +1409,16 @@ mod tests {
         assert_eq!(w.model_note(), None);
 
         assert_eq!(w.handle_key(key(Key::Enter), false), Action::Stay);
+        assert_eq!(w.screen(), Screen::Issues);
+        assert_eq!(w.screen().title(), "Where should issues live?");
+        assert_eq!(step_label(w.screen()), "Step 3 of 4");
+        assert_eq!(w.focus(), Focus::Tracker(Tracker::FileSystem));
+        assert_eq!(w.handle_key(key(Key::Enter), false), Action::Stay);
         assert_eq!(w.screen(), Screen::Settings);
-        assert_eq!(step_label(w.screen()), "Step 3 of 3");
+        assert_eq!(step_label(w.screen()), "Step 4 of 4");
+        assert_eq!(w.mode_recommendation().as_deref(), Some("Recommended: Global (not a Git repo yet)"));
+        assert_eq!(w.back(), Action::Stay);
+        assert_eq!(w.screen(), Screen::Issues);
         assert_eq!(w.back(), Action::Stay);
         assert_eq!(w.screen(), Screen::Defaults);
         assert_eq!(w.back(), Action::Stay);
@@ -1362,15 +1459,18 @@ mod tests {
         w.primary();
         assert_eq!((w.picker().runner(), w.picker().model()), (RunnerKind::Codex, Some("gpt-5-codex")));
         w.primary();
+        w.primary();
         w.select_mode(ConfigMode::InRepo);
         w.back();
+        w.back();
         assert_eq!((w.picker().runner(), w.picker().model()), (RunnerKind::Codex, Some("gpt-5-codex")));
+        w.primary();
         w.primary();
         assert_eq!(w.mode(), ConfigMode::InRepo);
         let Action::Create(request) = w.primary() else { panic!("Create Project") };
         assert_eq!(
-            request.defaults,
-            AgentDefaults { runner: RunnerKind::Codex, model: Some("gpt-5-codex".into()) }
+            request.plan.defaults,
+            shelbi_core::AgentDefaults { runner: RunnerKind::Codex, model: Some("gpt-5-codex".into()) }
         );
     }
 
@@ -1388,14 +1488,14 @@ mod tests {
         w.select_runner(RunnerKind::Claude);
         assert_eq!(w.defaults_error(), None, "a new choice clears it");
         w.primary();
-        assert_eq!(w.screen(), Screen::Settings);
+        assert_eq!(w.screen(), Screen::Issues);
     }
 
     #[test]
     fn settings_cards_select_and_persist_through_back_and_continue() {
         let mut w = chosen(Origin::Workspace);
         to_settings(&mut w);
-        assert_eq!(step_label(w.screen()), "Step 3 of 3");
+        assert_eq!(step_label(w.screen()), "Step 4 of 4");
         assert_eq!(w.mode(), ConfigMode::Global);
         assert_eq!(w.focus(), Focus::Card(ConfigMode::Global));
 
@@ -1404,6 +1504,7 @@ mod tests {
         assert_eq!(w.mode(), ConfigMode::InRepo);
         assert_eq!(w.focus(), Focus::Card(ConfigMode::InRepo));
 
+        assert_eq!(w.back(), Action::Stay);
         assert_eq!(w.back(), Action::Stay);
         assert_eq!(w.back(), Action::Stay);
         assert_eq!(w.screen(), Screen::Folder);
@@ -1434,17 +1535,11 @@ mod tests {
         let mut w = chosen(Origin::Workspace);
         to_settings(&mut w);
         w.select_mode(ConfigMode::InRepo);
-        let request = CreateRequest {
-            name: "acme".into(),
-            root: "/Users/me/Projects/acme".into(),
-            mode: ConfigMode::InRepo,
-            defaults: AgentDefaults::default(),
-            attempt: Attempt::New,
-        };
-        assert_eq!(w.handle_key(key(Key::Enter), false), Action::Create(request));
+        let request = CreateRequest { plan: plan_for(ConfigMode::InRepo), attempt: Attempt::New };
+        assert_eq!(w.handle_key(key(Key::Enter), false), Action::Create(Box::new(request)));
         assert_eq!(w.screen(), Screen::Creating);
         assert!(w.running());
-        assert_eq!(step_label(w.screen()), "Step 3 of 3");
+        assert_eq!(step_label(w.screen()), "Step 4 of 4");
         assert_eq!(w.handle_key(key(Key::Enter), false), Action::Stay, "no second submit");
         assert_eq!(w.activate(Focus::Primary), Action::Stay);
         assert_eq!(w.retry(), Action::Stay, "nothing to retry while it runs");
@@ -1608,14 +1703,8 @@ mod tests {
         assert_eq!(w.mode(), ConfigMode::Global);
         assert_eq!(w.tab_order(), [Focus::Primary], "Try Again, and no Back");
 
-        let again = CreateRequest {
-            name: "acme".into(),
-            root: "/Users/me/Projects/acme".into(),
-            mode: ConfigMode::Global,
-            defaults: AgentDefaults::default(),
-            attempt: Attempt::Retry,
-        };
-        assert_eq!(w.handle_key(key(Key::Enter), false), Action::Create(again));
+        let again = CreateRequest { plan: plan_for(ConfigMode::Global), attempt: Attempt::Retry };
+        assert_eq!(w.handle_key(key(Key::Enter), false), Action::Create(Box::new(again)));
         assert!(w.running());
         assert_eq!(rows(&w), [Pending, Pending, Pending], "the engine confirms each stage again");
         assert_eq!(w.failure(), None);
@@ -1708,5 +1797,69 @@ mod tests {
         assert_eq!(tilde(Path::new("/Users/me/a b"), Some(home)), "~/a b");
         assert_eq!(tilde(Path::new("/Users/meg/x"), Some(home)), "/Users/meg/x");
         assert_eq!(tilde(Path::new("/opt/x"), None), "/opt/x");
+    }
+
+    #[test]
+    fn a_folders_defaults_seed_the_later_screens_and_github_waits_for_its_preflight() {
+        let mut w = wizard(Origin::Workspace);
+        w.folder_picked(Some(Path::new("/Users/me/Projects/acme")));
+        let mut check = found("/Users/me/Projects/acme", "acme", Repo::Git);
+        check.facts = Facts {
+            default_branch: "trunk".into(),
+            remote: Some("git@github.com:acme/acme.git".into()),
+            github_repo: Some("acme/acme".into()),
+            recommended_mode: ConfigMode::InRepo,
+            mode_reason: "origin remote + 3 committers".into(),
+            runners: vec![RunnerKind::Codex],
+            ..Facts::default()
+        };
+        answer(&mut w, check);
+        w.primary();
+        assert_eq!(w.picker().runner(), RunnerKind::Codex, "the detected install");
+        w.primary();
+        assert_eq!(w.issues().tracker(), Tracker::Github, "a GitHub origin");
+        assert_eq!(
+            w.tab_order(),
+            [Focus::Tracker(Tracker::Github), Focus::Tracker(Tracker::FileSystem), Focus::Repo, Focus::Back, Focus::Primary]
+        );
+        assert_eq!(w.primary(), Action::Preflight("acme/acme".into()));
+        assert!(w.preflighting() && !w.primary_enabled(), "one preflight at a time");
+        w.preflight_failed("acme/acme", "gh is not signed in");
+        assert_eq!((w.screen(), w.issues().error()), (Screen::Issues, Some("gh is not signed in")));
+        assert_eq!(w.primary(), Action::Preflight("acme/acme".into()), "Continue tries again");
+        w.preflight_passed("acme/acme");
+        assert_eq!(w.screen(), Screen::Settings);
+        assert_eq!(w.mode(), ConfigMode::InRepo, "the recommendation");
+        assert_eq!(
+            w.mode_recommendation().as_deref(),
+            Some("Recommended: In repo (origin remote + 3 committers)")
+        );
+        let Action::Create(request) = w.primary() else { panic!("Create Project") };
+        assert_eq!(request.plan.default_branch, "trunk");
+        assert_eq!(request.plan.remote.as_deref(), Some("git@github.com:acme/acme.git"));
+        assert_eq!(request.plan.issue_tracker.github.unwrap().repo, "acme/acme");
+    }
+
+    #[test]
+    fn screen_one_offers_git_init_and_a_pick_up_creates_from_there() {
+        let mut w = wizard(Origin::Workspace);
+        w.folder_picked(Some(Path::new("/Users/me/Projects/plain")));
+        answer(&mut w, found("/Users/me/Projects/plain", "plain", Repo::NotGit));
+        assert_eq!(w.offers(), (Some(true), None));
+        assert!(w.tab_order().contains(&Focus::GitInit));
+        w.activate(Focus::GitInit);
+        assert_eq!(w.offers(), (Some(false), None), "a click turns it off");
+        w.activate(Focus::GitInit);
+        assert!(w.plan().unwrap().git_init);
+
+        let mut w = wizard(Origin::Workspace);
+        w.folder_picked(Some(Path::new("/Users/me/Projects/clone")));
+        let mut check = found("/Users/me/Projects/clone", "team", Repo::Git);
+        check.facts.pick_up = Some(PickUp { name: "team".into(), config: "/Users/me/Projects/clone/.shelbi/project.yaml".into() });
+        answer(&mut w, check);
+        assert_eq!(w.offers(), (None, Some(true)));
+        let Action::Create(request) = w.primary() else { panic!("a pick-up creates from screen 01") };
+        assert!(request.plan.pick_up);
+        assert_eq!(w.screen(), Screen::Creating);
     }
 }

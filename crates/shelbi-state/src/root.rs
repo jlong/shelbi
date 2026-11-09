@@ -154,7 +154,7 @@ fn fell_through(source: RootSource) -> bool {
 /// cargo puts it instead ([`is_cargo_test_binary_path`]). Compiled out of
 /// release builds, so nothing a user runs can ever take the test paths.
 #[cfg(debug_assertions)]
-pub(crate) fn in_test_binary() -> bool {
+pub fn in_test_binary() -> bool {
     static IN_TEST_BINARY: OnceLock<bool> = OnceLock::new();
     *IN_TEST_BINARY.get_or_init(|| {
         cfg!(test)
@@ -165,7 +165,7 @@ pub(crate) fn in_test_binary() -> bool {
 }
 
 #[cfg(not(debug_assertions))]
-pub(crate) fn in_test_binary() -> bool {
+pub fn in_test_binary() -> bool {
     false
 }
 

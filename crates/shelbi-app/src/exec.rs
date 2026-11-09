@@ -180,16 +180,10 @@ pub enum Mutation {
     },
     /// Toggle Zen Mode for a project.
     ToggleZen { project: String },
-    /// Scaffold and open a new project (payload collected by the host's
-    /// add-project form): the raw name, the repo path as typed (resolved
-    /// against the host's working directory), where its config lives, and
-    /// the agents' default runner and model (the Agent defaults step).
-    AddProject {
-        name: String,
-        root: String,
-        mode: shelbi_core::ConfigMode,
-        defaults: shelbi_core::AgentDefaults,
-    },
+    /// Create and open a new project: the answers the host's new-project
+    /// flow collected (the steps every front end shares,
+    /// [`crate::new_project`]), for the one creation engine.
+    AddProject { plan: Box<crate::new_project::NewProject> },
 }
 
 /// The result of running an [`Effect`].

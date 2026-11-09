@@ -1,14 +1,17 @@
-//! The new-project flow in the TUI: the shared three-page form
-//! ([`shelbi_app::overlay::add_project`]: the folder, the Agent defaults, where
-//! settings live) drawn in one dialog, in the desktop wizard's order and with
-//! its copy (`desktop/src/views/add_project.rs` draws the same steps over
-//! [`shelbi_app::add_project_wizard`]).
+//! The new-project flow in the TUI: the shared four-step form
+//! ([`shelbi_app::overlay::add_project`] over the steps every front end
+//! shares, [`shelbi_app::new_project::Step`]) drawn in one dialog, in the
+//! desktop wizard's order and with its copy (`desktop/src/views/add_project.rs`
+//! draws the same steps over [`shelbi_app::add_project_wizard`], and `shelbi
+//! init` asks them at the terminal).
 //!
 //! ```text
 //!   1  Add a project · Name · Repo path · Detected: · Folder / id:
+//!        [x] Use the committed settings · [x] Initialize a Git repository here
 //!   2  Agent defaults · Default Harness ▾ · Default model ▾
-//!   3  Where should settings live? · (•) In the project · ( ) Outside the project
-//!      Step N of 3                                 [ Back ] [ Continue ]
+//!   3  Where should issues live? · (•) GitHub Issues · ( ) File system · repo
+//!   4  Where should settings live? · (•) In the project · ( ) Outside the project
+//!      Step N of 4                                 [ Back ] [ Continue ]
 //! ```
 //!
 //! The pickers are the orchestrator onboarding's ([`crate::picker`] over
@@ -18,11 +21,13 @@
 //!
 //! One implementation, two callers: the in-process TUI overlay
 //! (`crate::shell`) and the launch screen (`crate::launch`), each feeding it
-//! keys and clicks. Continue on page 1 validates the name and path here
-//! ([`shelbi_orchestrator::project_create::validate_add_project`]: a slug
-//! check, a collision lookup, a path stat), so a taken name shows before the
-//! later pages; Create Project hands back [`Step::Submit`] and the caller
-//! validates again and scaffolds off the UI thread with [`Form::defaults`].
+//! keys and clicks. Continue on page 1 runs the shared folder check
+//! ([`shelbi_orchestrator::project_create::check_folder`]) and validates the
+//! name and path ([`shelbi_orchestrator::project_create::validate_add_project`])
+//! here, so a taken name shows before the later pages; Continue on a GitHub
+//! board runs its `gh` preflight here. Create Project hands back
+//! [`Step::Submit`] and the caller creates [`Form::plan`] off the UI thread
+//! through `project_create::create_project`.
 //!
 //! Keys: Tab / Shift+Tab move between the page's controls, Enter presses the
 //! primary button from anywhere, Space presses the focused button, opens the
@@ -42,7 +47,9 @@ use ratatui::{
 };
 
 use shelbi_app::add_project_wizard as wiz;
+use shelbi_app::new_project::{self as np, NewProject, Tracker};
 use shelbi_core::ConfigMode;
+use shelbi_orchestrator::project_create;
 use crate::button::{self, Align, Button};
 use crate::panel;
 use crate::picker::{self, select_lines};
@@ -63,8 +70,10 @@ enum Hit {
     Field(Field),
     /// A row of the open menu.
     Choice(usize),
-    /// Page 3's location rows.
+    /// Page 4's location rows.
     Mode(ConfigMode),
+    /// Page 3's board rows.
+    Tracker(Tracker),
 }
 
 /// The add-project form: the shared state machine, with the "Detected:" check
@@ -86,6 +95,11 @@ impl Form {
     /// its default model; config location defaults to `global`, the
     /// low-ceremony solo choice.
     pub fn new(cwd: &Path) -> Self {
+        // The folder check lists the installed runners, probed once per
+        // process; warm that off the UI thread so page 1's Continue needn't.
+        let _ = std::thread::Builder::new().name("shelbi-runner-probe".into()).spawn(|| {
+            project_create::installed_runners();
+        });
         let mut form = Self {
             inner: shared::Form::new(cwd),
             menu: None,
@@ -114,6 +128,11 @@ impl Form {
     /// The agents' default runner and model (page 2).
     pub fn defaults(&self) -> shelbi_core::AgentDefaults {
         self.inner.defaults()
+    }
+
+    /// The answers Create Project creates.
+    pub fn plan(&self) -> Option<NewProject> {
+        self.inner.plan()
     }
 
     /// The page shown.
@@ -191,13 +210,25 @@ impl Form {
         match step {
             Step::Validate => {
                 self.close_menus();
-                match shelbi_orchestrator::project_create::validate_add_project(
-                    self.inner.name(),
-                    self.inner.root(),
-                    self.inner.cwd(),
-                ) {
-                    Ok(_) => self.inner.folder_valid(),
-                    Err(msg) => self.inner.set_error(msg),
+                let name = Some(self.inner.name().trim()).filter(|n| !n.is_empty());
+                let check = project_create::check_folder(self.inner.cwd(), self.inner.root(), name);
+                match self.inner.folder_checked(check) {
+                    Step::Validate => {
+                        match project_create::validate_add_project(self.inner.name(), self.inner.root(), self.inner.cwd()) {
+                            Ok(_) => self.inner.folder_valid(),
+                            Err(msg) => self.inner.set_error(msg),
+                        }
+                        Step::Continue
+                    }
+                    other => other,
+                }
+            }
+            Step::Preflight(repo) => {
+                self.close_menus();
+                // One `gh api` round trip: brief enough to wait for here.
+                match project_create::issues::preflight_github(&repo) {
+                    Ok(()) => self.inner.preflight_passed(&repo),
+                    Err(msg) => self.inner.preflight_failed(&repo, msg),
                 }
                 Step::Continue
             }
@@ -243,6 +274,11 @@ impl Form {
             Some(Hit::Mode(mode)) => {
                 self.close_menus();
                 self.inner.select_mode(mode);
+                Step::Continue
+            }
+            Some(Hit::Tracker(tracker)) => {
+                self.close_menus();
+                self.inner.select_tracker(tracker);
                 Step::Continue
             }
             None => {
@@ -330,7 +366,7 @@ type Rows = Vec<(Line<'static>, Option<Hit>)>;
 /// Paint the dialog. The card **fills** `area` (rather than a small centered
 /// box), so the fields, the derived-slug preview, and long error/notice text
 /// always have room and never truncate. The page's rows run from the top;
-/// its footer ("Step N of 3", Back and the primary button) sits at the
+/// its footer ("Step N of 4", Back and the primary button) sits at the
 /// bottom.
 fn render(f: &mut Frame, area: Rect, form: &mut Form) {
     f.render_widget(Clear, area);
@@ -357,6 +393,7 @@ fn render(f: &mut Frame, area: Rect, form: &mut Form) {
     match page {
         Page::Folder => folder_rows(&mut rows, form),
         Page::Defaults => menu_at = defaults_rows(&mut rows, form, w),
+        Page::Issues => issues_rows(&mut rows, form, w),
         Page::Settings => settings_rows(&mut rows, form, w),
     }
     // The error row is reserved so the footer doesn't jump when one shows.
@@ -410,6 +447,77 @@ fn folder_rows(rows: &mut Rows, form: &Form) {
     rows.push((Line::raw(""), None));
     rows.push((Line::from(detected_line(form.inner.detected())), None));
     rows.push((preview_line(&form.inner), None));
+    let (git_init, pick_up) = form.inner.offers();
+    if git_init.is_some() || pick_up.is_some() {
+        rows.push((Line::raw(""), None));
+    }
+    if let Some(on) = pick_up {
+        let label = match form.inner.check().and_then(|c| c.facts.pick_up.as_ref()) {
+            Some(p) => format!("{} (“{}”)", np::PICK_UP_LABEL, p.name),
+            None => np::PICK_UP_LABEL.to_string(),
+        };
+        rows.push((check_line(&label, on, focus == Field::PickUp), Some(Hit::Field(Field::PickUp))));
+    }
+    if let Some(on) = git_init {
+        rows.push((check_line(np::GIT_INIT_LABEL, on, focus == Field::GitInit), Some(Hit::Field(Field::GitInit))));
+    }
+}
+
+/// One of page 1's offers: a checkbox and its label.
+fn check_line(label: &str, on: bool, focused: bool) -> Line<'static> {
+    let mut style = Style::default().fg(if on { palette().white } else { palette().gray });
+    if focused {
+        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    }
+    Line::from(vec![
+        Span::styled(if on { "[x] " } else { "[ ] " }, Style::default().fg(if on { palette().cyan } else { palette().gray })),
+        Span::styled(label.to_string(), style),
+    ])
+}
+
+/// Page 3: the two boards, each a radio with its description, then the
+/// GitHub repo field when GitHub is chosen (and what a GitHub board writes,
+/// once the repo passed).
+fn issues_rows(rows: &mut Rows, form: &Form, w: usize) {
+    let focus = form.inner.focus();
+    let issues = form.inner.issues();
+    for (tracker, title, body) in [
+        (Tracker::Github, np::GITHUB_TITLE, np::GITHUB_BODY),
+        (Tracker::FileSystem, np::FILE_SYSTEM_TITLE, np::FILE_SYSTEM_BODY),
+    ] {
+        radio_rows(rows, issues.tracker() == tracker, focus == Field::Tracker, title, body, Hit::Tracker(tracker), w);
+    }
+    if issues.tracker() == Tracker::Github {
+        rows.push((field_line(np::GITHUB_REPO_LABEL, issues.repo(), focus == Field::Repo), Some(Hit::Field(Field::Repo))));
+        if issues.verified() {
+            for line in wrap_text(&format!("✓ {}", np::GITHUB_DISCLOSURE), w) {
+                rows.push((Line::from(Span::styled(line, Style::default().fg(palette().ansi_green))), None));
+            }
+        }
+    }
+}
+
+/// A radio row (its mark and title) and its wrapped description.
+fn radio_rows(rows: &mut Rows, on: bool, focused: bool, title: &str, body: &str, hit: Hit, w: usize) {
+    let mark = if on { "(•) " } else { "( ) " };
+    let mut style = Style::default().fg(if on { palette().white } else { palette().gray });
+    if on && focused {
+        style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    }
+    rows.push((
+        Line::from(vec![
+            Span::styled(mark, Style::default().fg(if on { palette().cyan } else { palette().gray })),
+            Span::styled(title.to_string(), style),
+        ]),
+        Some(hit),
+    ));
+    for line in wrap_text(body, w.saturating_sub(4)) {
+        rows.push((
+            Line::from(vec![Span::raw("    "), Span::styled(line, Style::default().fg(palette().muted))]),
+            Some(hit),
+        ));
+    }
+    rows.push((Line::raw(""), None));
 }
 
 /// Page 2: Default Harness and Default model, each a picker box with the
@@ -453,35 +561,21 @@ fn defaults_rows(rows: &mut Rows, form: &Form, w: usize) -> Option<(usize, usize
 /// derived id with where its config lands.
 fn settings_rows(rows: &mut Rows, form: &Form, w: usize) {
     let focused = form.inner.focus() == Field::Config;
+    let recommended = form.inner.check().map(|c| c.facts.recommended_mode);
     for (mode, title, body) in [
         (ConfigMode::InRepo, wiz::IN_REPO_TITLE, wiz::IN_REPO_BODY),
         (ConfigMode::Global, wiz::GLOBAL_TITLE, wiz::GLOBAL_BODY),
     ] {
-        let on = form.mode() == mode;
-        let mark = if on { "(•) " } else { "( ) " };
-        let mut style = Style::default().fg(if on { palette().white } else { palette().gray });
-        if on && focused {
-            style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
-        }
-        rows.push((
-            Line::from(vec![
-                Span::styled(mark, Style::default().fg(if on { palette().cyan } else { palette().gray })),
-                Span::styled(title, style),
-            ]),
-            Some(Hit::Mode(mode)),
-        ));
-        for line in wrap_text(body, w.saturating_sub(4)) {
-            rows.push((
-                Line::from(vec![Span::raw("    "), Span::styled(line, Style::default().fg(palette().muted))]),
-                Some(Hit::Mode(mode)),
-            ));
-        }
-        rows.push((Line::raw(""), None));
+        let title = if recommended == Some(mode) { format!("{title} (recommended)") } else { title.to_string() };
+        radio_rows(rows, form.mode() == mode, focused, &title, body, Hit::Mode(mode), w);
+    }
+    if let Some(check) = form.inner.check() {
+        rows.push((help_line(&check.facts.mode_recommendation(), w), None));
     }
     rows.push((preview_line(&form.inner), None));
 }
 
-/// "Step N of 3" at the left, Back and the page's primary button at the
+/// "Step N of 4" at the left, Back and the page's primary button at the
 /// right.
 fn footer(f: &mut Frame, form: &mut Form, rect: Rect) {
     let w = rect.width as usize;
@@ -680,14 +774,24 @@ mod tests {
             assert!(f.menu.is_none());
             assert_eq!(f.defaults(), AgentDefaults { runner: RunnerKind::Codex, model: Some("gpt-5".into()) });
             assert_eq!(f.handle_key(key(KeyCode::Enter)), Step::Continue);
+            assert_eq!(f.page(), Page::Issues);
+            assert_eq!(f.handle_key(key(KeyCode::Enter)), Step::Continue, "no GitHub origin: the file system");
             assert_eq!(f.page(), Page::Settings);
             // Back keeps the choice, Continue returns.
+            f.inner.set_focus(Field::Back);
+            f.handle_key(key(KeyCode::Char(' ')));
+            assert_eq!(f.page(), Page::Issues);
             f.inner.set_focus(Field::Back);
             f.handle_key(key(KeyCode::Char(' ')));
             assert_eq!(f.page(), Page::Defaults);
             assert_eq!(f.defaults().model.as_deref(), Some("gpt-5"));
             f.handle_key(key(KeyCode::Enter));
+            f.handle_key(key(KeyCode::Enter));
             assert_eq!(f.handle_key(key(KeyCode::Enter)), Step::Submit);
+            let plan = f.plan().unwrap();
+            assert_eq!(plan.root, repo);
+            assert_eq!(plan.name, "acme");
+            assert_eq!(plan.defaults, AgentDefaults { runner: RunnerKind::Codex, model: Some("gpt-5".into()) });
             assert_eq!(f.handle_key(key(KeyCode::Esc)), Step::Cancel);
         });
     }
@@ -749,12 +853,23 @@ mod tests {
             click(&mut f, &buf, "GPT-5 Codex");
             assert_eq!(f.defaults().model.as_deref(), Some("gpt-5-codex"));
 
-            // Back, then Continue twice, then a location row, Create Project.
+            // Back, then Continue to the board, a board row each way, then
+            // Continue, a location row, Create Project.
             let buf = draw(&mut f);
             click(&mut f, &buf, "Back");
             assert_eq!(f.page(), Page::Folder);
             let buf = draw(&mut f);
             click(&mut f, &buf, "Continue");
+            let buf = draw(&mut f);
+            click(&mut f, &buf, "Continue");
+            assert_eq!(f.page(), Page::Issues);
+            let buf = draw(&mut f);
+            click(&mut f, &buf, np::GITHUB_TITLE);
+            assert_eq!(f.inner.issues().tracker(), Tracker::Github);
+            let buf = draw(&mut f);
+            assert!(text(&buf).contains(np::GITHUB_REPO_LABEL), "the repo field shows:\n{}", text(&buf));
+            click(&mut f, &buf, np::FILE_SYSTEM_TITLE);
+            assert_eq!(f.inner.issues().tracker(), Tracker::FileSystem);
             let buf = draw(&mut f);
             click(&mut f, &buf, "Continue");
             assert_eq!(f.page(), Page::Settings);
@@ -782,7 +897,7 @@ mod tests {
                 "Default model",
                 "Use runner default",
                 "Used for new Orchestrator sessions in Shelbi.",
-                "Step 2 of 3",
+                "Step 2 of 4",
                 "Back",
                 "Continue",
             ] {
@@ -798,13 +913,18 @@ mod tests {
             let mut f = Form::new(repo);
             typed(&mut f, "acme");
             let out = text(&draw(&mut f));
-            for needle in ["Add a project", "Name", "Repo path", "Detected:", "Folder / id:", "Step 1 of 3"] {
+            for needle in ["Add a project", "Name", "Repo path", "Detected:", "Folder / id:", "Step 1 of 4"] {
                 assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
             }
             f.handle_key(key(KeyCode::Enter));
             f.handle_key(key(KeyCode::Enter));
             let out = text(&draw(&mut f));
-            for needle in ["Where should settings live?", "In the project", "Outside the project", "Step 3 of 3", "Create Project"] {
+            for needle in ["Where should issues live?", np::GITHUB_TITLE, np::FILE_SYSTEM_TITLE, "Step 3 of 4"] {
+                assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+            }
+            f.handle_key(key(KeyCode::Enter));
+            let out = text(&draw(&mut f));
+            for needle in ["Where should settings live?", "In the project", "Outside the project", "Recommended: Global", "Step 4 of 4", "Create Project"] {
                 assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
             }
         });

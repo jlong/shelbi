@@ -71,7 +71,7 @@ fn prose_block(prose: &[&str]) -> String {
 /// Render a list of optional sections into a single trailing block:
 /// each section is its prose header, its commented example, and a blank
 /// separator line.
-fn render_sections(sections: &[Section]) -> String {
+fn render_sections<'a>(sections: impl IntoIterator<Item = &'a Section>) -> String {
     let mut out = String::new();
     for s in sections {
         out.push_str(&prose_block(s.prose));
@@ -139,6 +139,19 @@ const WORKSPACES_EXTRA: Section = Section {
         "also accepted).",
     ],
     yaml: "- { name: bob, machine: hub, tags: [gpu] }\n",
+};
+
+/// The pool example for a project with no workspaces yet (a new project:
+/// the orchestrator's first boot provisions the pool). Uncommenting it adds
+/// the `workspaces:` key the required file leaves out.
+const WORKSPACES_POOL: Section = Section {
+    prose: &[
+        "Workspaces: the pool of slots agents work in. A new project starts empty",
+        "and the orchestrator creates the pool on first boot (`shelbi workspace add`",
+        "adds one by hand). Each owns a worktree at <machine.work_dir>/.shelbi/wt/<name>;",
+        "a slot tagged `review` is where the Reviewer loads a branch for a human.",
+    ],
+    yaml: "workspaces:\n- { name: dev, machine: hub }\n- { name: review, machine: hub, tags: [review] }\n",
 };
 
 /// Optional top-level project keys, none of which the required file emits, so
@@ -276,8 +289,15 @@ pub fn decorate_project_yaml(active: &str) -> String {
             out.push_str(&machines_hint);
             spliced_machines = true;
         }
-        if !spliced_workspaces && saw_workspaces && line == "agent_runners:" {
-            out.push_str(&workspaces_hint);
+        if !spliced_workspaces && line == "agent_runners:" {
+            if saw_workspaces {
+                out.push_str(&workspaces_hint);
+            } else {
+                // An empty pool (a new project's): the orchestrator fills it
+                // on first boot, and the example shows the shape.
+                out.push_str(&prose_block(WORKSPACES_POOL.prose));
+                out.push_str(&comment_block(WORKSPACES_POOL.yaml));
+            }
             spliced_workspaces = true;
         }
         out.push_str(line);
@@ -289,7 +309,13 @@ pub fn decorate_project_yaml(active: &str) -> String {
     out.push_str(&comment_block(RUNNER_DIALOG.yaml));
     out.push('\n');
 
-    out.push_str(&render_sections(PROJECT_SECTIONS));
+    // A section whose key the required fields already carry (a recorded
+    // `github_url:`) stays out: uncommenting it would duplicate the key.
+    let present = |section: &&Section| {
+        let key = section.yaml.split(':').next().unwrap_or_default();
+        !active.lines().any(|line| line.strip_prefix(key).is_some_and(|rest| rest.starts_with(':')))
+    };
+    out.push_str(&render_sections(PROJECT_SECTIONS.iter().filter(present)));
     out
 }
 

@@ -1,32 +1,23 @@
-//! Shared project-creation engine (removing-tmux `rt-tui-add-project`).
+//! The one project-creation engine. Every front end that creates a project
+//! calls it: `shelbi init` (interactive and `-y`), bare `shelbi`'s first run,
+//! `shelbi project add`, the TUI's Add project dialog and the desktop's Add
+//! Project wizard. They walk the same steps (`shelbi_app::new_project::Step`),
+//! start every step on the same detected defaults ([`check_folder`]), and hand
+//! the answers ([`NewProject`]) to [`create_project`], which validates them and
+//! writes the project. Nothing else writes one, so the same answers produce the
+//! same files from every front end.
 //!
-//! This module owns everything it takes to validate, scaffold, register, and
-//! open a new Shelbi project: the project-root validators, the starter YAML
-//! renderers, the atomic registration writer, the agents/workflows/statuses/Zen
-//! materialization, and the context-scoped commit-guard install. It used to
-//! live inside `shelbi-cli`'s `init`/`project_root`, reachable only by the CLI.
-//! It moved here so the single-process TUI (`shelbi-tui`, which can depend on
-//! `shelbi-orchestrator` but not on `shelbi-cli`) can create a project through
-//! the *same* path the CLI uses — no second implementation to drift.
+//! The engine owns detection ([`detect`]), the issue-tracker checks
+//! ([`issues`]), validation ([`validate_add_project`]), the starter YAML
+//! ([`render_project_yaml`]), the atomic registration
+//! ([`write_new_project_registration`]), the agents/workflows/statuses/Zen
+//! scaffold, the commit-guard install, and picking up a teammate's committed
+//! config ([`pick_up`]).
 //!
-//! Three callers share this one engine:
-//!
-//! - `shelbi init` (the CLI wizard): resolves root/mode/tracker interactively,
-//!   then calls [`scaffold_project`] with a reporter that prints every line to
-//!   the terminal — byte-identical to the pre-move inline `println!`s.
-//! - the CLI command palette's "Add project" dialog: validates the form with
-//!   [`validate_add_project`] and calls [`scaffold_project`] with a
-//!   `file_system` board, non-interactively.
-//! - the in-process TUI overlay: the same [`validate_add_project`] +
-//!   [`scaffold_project`] pair, with a [`NullReporter`] (the TUI shows a single
-//!   status line instead of a scrolling log).
-//! - the desktop Add Project wizard: [`add_project`], whose reporter turns the
-//!   [`ScaffoldStage`] callbacks into its checklist and keeps the warnings.
-//!
-//! Human-readable progress is emitted through the [`ScaffoldReporter`] seam
-//! rather than written straight to stdout/stderr, so a caller inside a ratatui
-//! alt-screen (the TUI) doesn't corrupt its own display, while the CLI keeps its
-//! exact wording.
+//! Human-readable progress goes through the [`ScaffoldReporter`] seam rather
+//! than straight to stdout/stderr, so the TUI (inside a ratatui alt-screen)
+//! drops it, the desktop draws its checklist from the [`ScaffoldStage`]
+//! callbacks, and the CLI prints every line.
 
 use std::collections::BTreeMap;
 use std::io;
@@ -35,8 +26,16 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+pub use shelbi_app::new_project::NewProject;
 use shelbi_core::{AgentDefaults, ConfigMode, IssueTrackerConfig, RunnerKind};
 use shelbi_state::AgentMaterializeOutcome;
+
+pub mod detect;
+pub mod issues;
+mod pick_up;
+
+pub use detect::{check_folder, installed_runners, remote_url_for_storage, InstalledRunner};
+pub use pick_up::{pick_up, PickedUp};
 
 /// Filename of the committed, in-repo project config, written under
 /// `<repo>/.shelbi/project.yaml` for `mode: in-repo`.
@@ -292,63 +291,7 @@ pub fn detect_root(cwd: &Path, root: &str) -> shelbi_app::overlay::add_project::
     }
 }
 
-/// The desktop Add Project wizard's folder check for the path field's text
-/// `root` (resolved against `cwd`, `~` expanded) and, after a clash, the
-/// typed `name`: what the folder is (a repo, a worktree, a plain folder),
-/// the project name and id it gives (the folder's own name unless `name` is
-/// given), whether that id is already registered, and where each config mode
-/// would keep its settings. The same checks [`validate_add_project`] runs at
-/// creation, so the wizard can't continue with a folder that would fail them.
-/// Runs git and reads the Shelbi home: keep it off any UI thread.
-pub fn check_folder(
-    cwd: &Path,
-    root: &str,
-    name: Option<&str>,
-) -> shelbi_app::add_project_wizard::FolderCheck {
-    use shelbi_app::add_project_wizard::{FolderCheck, Problem, Repo};
-    let trimmed = root.trim();
-    if trimmed.is_empty() {
-        return FolderCheck::failed(PathBuf::new(), Problem::Empty);
-    }
-    let path = absolutize(cwd, Path::new(trimmed));
-    let repo = match validate_root(&path) {
-        RootValidation::NotExists => return FolderCheck::failed(path, Problem::NotFound),
-        RootValidation::NotDirectory => return FolderCheck::failed(path, Problem::NotDirectory),
-        RootValidation::NotGitRepo => Repo::NotGit,
-        // A worktree's `.git` is a file pointing at the main repo's gitdir.
-        RootValidation::Ok if path.join(".git").is_file() => Repo::Worktree,
-        RootValidation::Ok => Repo::Git,
-    };
-    let name = match name.map(str::trim) {
-        Some(n) => Some(n.to_string()),
-        None => project_name_from_root(&path),
-    };
-    let slug = name
-        .as_deref()
-        .and_then(|n| shelbi_core::normalize_project_name(n.trim()).ok());
-    let problem = match &slug {
-        None => Some(Problem::NoName),
-        Some(slug) => match project_name_collides(slug) {
-            Ok(true) => Some(Problem::Taken { slug: slug.clone() }),
-            Ok(false) => None,
-            Err(e) => Some(Problem::Unreadable(e.to_string())),
-        },
-    };
-    let global_dir = slug
-        .as_deref()
-        .and_then(|s| shelbi_state::projects_dir().ok().map(|d| d.join(s)));
-    FolderCheck {
-        in_repo_dir: path.join(".shelbi"),
-        path,
-        name,
-        slug,
-        repo: Some(repo),
-        problem,
-        global_dir,
-    }
-}
-
-/// Why [`add_project`] didn't create the project.
+/// Why [`create_project`] didn't create the project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AddProjectError {
     /// The form's input doesn't validate: show it on the form and keep it open.
@@ -370,27 +313,122 @@ pub enum Attempt {
     Retry,
 }
 
-/// Run a `Mutation::AddProject`: validate the form's values (resolving the
-/// repo path against `cwd`), then scaffold the project with a `file_system`
-/// board and the agent defaults the flow chose ([`scaffold_project_with`]),
-/// reporting progress to `out`. Returns
-/// the new project's slug. Blocking (file IO and git); run it off the UI
-/// thread.
-pub fn add_project(
-    name: &str,
-    root: &str,
-    mode: ConfigMode,
-    defaults: &AgentDefaults,
-    cwd: &Path,
+/// Create the project `plan` describes: the one path every front end
+/// takes. Validates the answers (the name and folder with
+/// [`validate_add_project`], or under [`Attempt::Retry`] its retry form; the
+/// agent defaults; the branch; that a GitHub board won't strand a local one),
+/// then runs the [`ScaffoldStage`]s, reporting to `out`: initialize Git when
+/// the plan approved it, make sure the Shelbi home is laid out, register the
+/// project and write its config (the detected branch and remote recorded, an
+/// empty workspace pool the orchestrator fills on first boot), its agents
+/// (recommending the chosen runner), and its workflows, Zen policy and
+/// templates, then install the commit guard. A plan that picks up a committed
+/// config runs [`pick_up`] instead. Returns the project's id. Blocking (file
+/// IO and git); run it off any UI thread.
+pub fn create_project(
+    plan: &NewProject,
     attempt: Attempt,
     out: &mut dyn ScaffoldReporter,
 ) -> std::result::Result<String, AddProjectError> {
-    check_agent_defaults(defaults).map_err(|e| AddProjectError::Invalid(e.to_string()))?;
-    let retry = (attempt == Attempt::Retry).then_some(mode);
-    let resolved = validate_request(name, root, cwd, retry).map_err(AddProjectError::Invalid)?;
-    scaffold_project_with(&resolved, mode, &IssueTrackerConfig::default(), defaults, out)
+    if plan.pick_up {
+        // A name other than the committed one is the local alias to use.
+        let committed = detect::read_in_repo_name(&plan.root.join(IN_REPO_CONFIG_REL));
+        let name = plan.name.trim();
+        let alias = (!name.is_empty() && committed.as_deref() != Some(name)).then_some(name);
+        return pick_up(&plan.root, alias, out)
+            .map(|picked| picked.alias)
+            .map_err(|e| AddProjectError::Failed(format!("Add project failed: {e:#}")));
+    }
+    check_agent_defaults(&plan.defaults).map_err(|e| AddProjectError::Invalid(e.to_string()))?;
+    let retry = (attempt == Attempt::Retry).then_some(plan.mode);
+    let root = plan.root.to_string_lossy();
+    let resolved = validate_request(&plan.name, &root, &plan.root, retry).map_err(AddProjectError::Invalid)?;
+    let branch = plan.default_branch.trim();
+    shelbi_core::validate_branch(branch)
+        .map_err(|e| AddProjectError::Invalid(format!("`{branch}` isn't a usable default branch: {e}")))?;
+    issues::ensure_board_not_stranded(&resolved.name, &plan.issue_tracker)
+        .map_err(|e| AddProjectError::Invalid(e.to_string()))?;
+    if plan.git_init && validate_root(&resolved.path) == RootValidation::NotGitRepo && !git_available() {
+        return Err(AddProjectError::Invalid(
+            "Git was not found on PATH. Install Git, then try again.".into(),
+        ));
+    }
+    // Everything that could stop the scaffold halfway is checked before the
+    // first write (a `git init` included).
+    preflight_persistence(&resolved.name).map_err(|e| AddProjectError::Failed(format!("Add project failed: {e:#}")))?;
+    scaffold_project(&resolved, plan, out)
         .map_err(|e| AddProjectError::Failed(format!("Add project failed: {e}")))?;
     Ok(resolved.name)
+}
+
+/// `git` runs on this machine.
+fn git_available() -> bool {
+    Command::new("git").arg("--version").output().is_ok_and(|o| o.status.success())
+}
+
+/// Verify every state destination the scaffold writes is a usable, writable
+/// directory (or can become one) before anything is written, so a blocked
+/// destination fails the creation with nothing changed, not halfway through.
+/// Write probes are sibling temp files removed at once.
+fn preflight_persistence(project: &str) -> Result<()> {
+    let err = |e| anyhow!("{e}");
+    let home = shelbi_state::shelbi_home().map_err(err)?;
+    let projects = shelbi_state::projects_dir().map_err(err)?;
+    let sessions = shelbi_state::sessions_dir().map_err(err)?;
+    let project_dir = shelbi_state::project_dir(project).map_err(err)?;
+    let agents = shelbi_state::agents_dir(project).map_err(err)?;
+    let workflows = shelbi_state::workflows_dir(project).map_err(err)?;
+    let tasks = shelbi_state::tasks_dir(project).map_err(err)?;
+    let ssh = shelbi_state::ssh_control_dir().map_err(err)?;
+    for directory in [&home, &projects, &sessions, &project_dir, &agents, &workflows, &tasks] {
+        ensure_directory_or_missing(directory)?;
+        probe_nearest_writable_directory(directory)?;
+    }
+    for directory in shelbi_state::STANDARD_SUBDIRS.iter().map(|name| home.join(name)).chain(std::iter::once(ssh)) {
+        ensure_directory_or_missing(&directory)?;
+    }
+    let default_session = sessions.join("default.yaml");
+    if default_session.exists() {
+        let text = std::fs::read_to_string(&default_session)
+            .with_context(|| format!("reading {}", default_session.display()))?;
+        serde_yaml::from_str::<shelbi_core::Session>(&text).with_context(|| {
+            format!(
+                "{} is not a valid Shelbi session; repair or remove it, then try again",
+                default_session.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn ensure_directory_or_missing(path: &Path) -> Result<()> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(_) => bail!("{} exists but is not a directory", path.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
+    }
+}
+
+fn probe_nearest_writable_directory(path: &Path) -> Result<()> {
+    let mut ancestor = path;
+    loop {
+        match std::fs::metadata(ancestor) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => bail!("{} exists but is not a directory", ancestor.display()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ancestor = ancestor
+                    .parent()
+                    .ok_or_else(|| anyhow!("no existing parent directory for {}", path.display()))?;
+            }
+            Err(error) => return Err(error).with_context(|| format!("inspecting {}", ancestor.display())),
+        }
+    }
+    let (temp, file) = create_sibling_temp(&ancestor.join(".shelbi-init-write-probe"))
+        .with_context(|| format!("Shelbi state destination {} is not writable", path.display()))?;
+    drop(file);
+    std::fs::remove_file(&temp).with_context(|| format!("removing state write probe {}", temp.display()))?;
+    Ok(())
 }
 
 /// Whether a new project can be created with `defaults`: a generic runner
@@ -542,6 +580,9 @@ struct ProjectYaml<'a> {
     config_mode: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_workflow: Option<&'a str>,
+    /// The origin remote, credentials removed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github_url: Option<&'a str>,
     machines: Vec<MachineYaml<'a>>,
     orchestrator: OrchestratorYaml<'a>,
     /// The runner fleet's house model, written only when the new-project
@@ -550,8 +591,6 @@ struct ProjectYaml<'a> {
     /// belong.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     runners: BTreeMap<&'a str, FleetRunnerYaml<'a>>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    workspaces: Vec<WorkspaceYaml<'a>>,
     agent_runners: BTreeMap<&'a str, RunnerYaml<'a>>,
     #[serde(skip_serializing_if = "IssueTrackerConfig::is_default")]
     issue_tracker: &'a IssueTrackerConfig,
@@ -570,15 +609,6 @@ struct OrchestratorYaml<'a> {
 }
 
 #[derive(serde::Serialize)]
-struct WorkspaceYaml<'a> {
-    name: &'a str,
-    machine: &'a str,
-    runner: &'a str,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tags: Vec<&'a str>,
-}
-
-#[derive(serde::Serialize)]
 struct RunnerYaml<'a> {
     command: &'a str,
     flags: Vec<&'a str>,
@@ -592,90 +622,62 @@ struct FleetRunnerYaml<'a> {
     model: &'a str,
 }
 
-/// Render the starter project YAML via serde (never string interpolation).
-/// Validates `name` first so a value that can't round-trip through the
-/// filesystem path or YAML can never reach disk. The stock agent defaults
-/// (Claude Code on its default model); [`render_project_yaml_with`] takes
-/// the new-project flow's.
-pub fn render_project_yaml(
-    name: &str,
-    display_name: Option<&str>,
-    repo: &str,
-    work_dir: &Path,
-    config_mode: Option<&str>,
-    issue_tracker: &IssueTrackerConfig,
-) -> Result<String> {
-    render_project_yaml_with(name, display_name, repo, work_dir, config_mode, issue_tracker, &AgentDefaults::default())
+/// What a new project's registration records: the answers that land in its
+/// YAML.
+#[derive(Debug, Clone, Copy)]
+pub struct Starter<'a> {
+    /// The id.
+    pub name: &'a str,
+    /// The human label, when slugifying changed the entered name.
+    pub display_name: Option<&'a str>,
+    /// The folder: the `repo` and the hub machine's `work_dir`.
+    pub work_dir: &'a Path,
+    pub default_branch: &'a str,
+    /// The origin remote (credentials already removed).
+    pub github_url: Option<&'a str>,
+    pub issue_tracker: &'a IssueTrackerConfig,
+    pub defaults: &'a AgentDefaults,
 }
 
-/// [`render_project_yaml`] with the agents' default runner and model:
-/// `orchestrator.runner` names the chosen kind's `agent_runners` entry (the
-/// project's baseline runner), and a chosen model is the fleet's house model
-/// (`runners.<kind>.model`). The stock defaults render exactly what
-/// [`render_project_yaml`] always has. A generic runner has no entry to name
-/// ([`check_agent_defaults`]).
-pub fn render_project_yaml_with(
-    name: &str,
-    display_name: Option<&str>,
-    repo: &str,
-    work_dir: &Path,
-    config_mode: Option<&str>,
-    issue_tracker: &IssueTrackerConfig,
-    defaults: &AgentDefaults,
-) -> Result<String> {
-    validate_project_name(name)?;
-    check_agent_defaults(defaults).map_err(|e| anyhow!(e))?;
-    let runner = defaults.runner.as_str();
-    let work_dir = work_dir.to_string_lossy();
+/// Render the starter project YAML via serde (never string interpolation),
+/// so a `work_dir` containing ` #` or a name containing `: ` is quoted
+/// rather than corrupting the file. Validates the name and the agent
+/// defaults first. `orchestrator.runner` names the chosen kind's
+/// `agent_runners` entry, a chosen model is the fleet's house model
+/// (`runners.<kind>.model`), and the workspace pool starts empty: the
+/// orchestrator's first boot provisions it, on the chosen runner.
+pub fn render_project_yaml(starter: &Starter, config_mode: Option<&str>) -> Result<String> {
+    validate_project_name(starter.name)?;
+    check_agent_defaults(starter.defaults).map_err(|e| anyhow!(e))?;
+    let runner = starter.defaults.runner.as_str();
+    let work_dir = starter.work_dir.to_string_lossy();
     let mut agent_runners = BTreeMap::new();
-    agent_runners.insert(
-        "claude",
-        RunnerYaml {
-            command: "claude",
-            flags: vec![],
-        },
-    );
-    agent_runners.insert(
-        "codex",
-        RunnerYaml {
-            command: "codex",
-            flags: vec![],
-        },
-    );
+    for kind in detect::SUPPORTED_RUNNERS {
+        let command = kind.as_str();
+        agent_runners.insert(command, RunnerYaml { command, flags: vec![] });
+    }
     let doc = ProjectYaml {
-        label: display_name,
-        repo,
-        default_branch: "main",
+        label: starter.display_name,
+        repo: &work_dir,
+        default_branch: starter.default_branch,
         config_mode,
         default_workflow: Some(shelbi_core::TASK_WORKFLOW_NAME),
+        github_url: starter.github_url,
         machines: vec![MachineYaml {
             name: "hub",
             kind: "local",
             work_dir: &work_dir,
         }],
         orchestrator: OrchestratorYaml { runner },
-        runners: defaults
+        runners: starter
+            .defaults
             .model
             .as_deref()
             .map(|model| (runner, FleetRunnerYaml { command: runner, model }))
             .into_iter()
             .collect(),
-        workspaces: vec![
-            WorkspaceYaml {
-                name: "dev",
-                machine: "hub",
-                runner: "claude",
-                tags: vec![],
-            },
-            WorkspaceYaml {
-                name: "review",
-                machine: "hub",
-                runner: "claude",
-                tags: vec!["review"],
-            },
-        ],
         agent_runners,
-        issue_tracker,
+        issue_tracker: starter.issue_tracker,
     };
     let active = serde_yaml::to_string(&doc).context("serializing project YAML")?;
     Ok(shelbi_core::scaffold::decorate_project_yaml(&active))
@@ -684,34 +686,14 @@ pub fn render_project_yaml_with(
 /// Render the two halves of an in-repo project's config: the committed shared
 /// half (`<repo>/.shelbi/project.yaml`) and the user-local half
 /// (`~/.shelbi/projects/<id>/local.yaml`). Returns `(shared_body, local_body)`.
-pub fn render_split_project_yaml(
-    name: &str,
-    display_name: Option<&str>,
-    repo: &str,
-    work_dir: &Path,
-    issue_tracker: &IssueTrackerConfig,
-) -> Result<(String, String)> {
-    render_split_project_yaml_with(name, display_name, repo, work_dir, issue_tracker, &AgentDefaults::default())
-}
-
-/// [`render_split_project_yaml`] with the agents' default runner and model
-/// ([`render_project_yaml_with`]); both land in the committed half.
-pub fn render_split_project_yaml_with(
-    name: &str,
-    display_name: Option<&str>,
-    repo: &str,
-    work_dir: &Path,
-    issue_tracker: &IssueTrackerConfig,
-    defaults: &AgentDefaults,
-) -> Result<(String, String)> {
-    let flat =
-        render_project_yaml_with(name, None, repo, work_dir, Some("in-repo"), issue_tracker, defaults)?;
+pub fn render_split_project_yaml(starter: &Starter) -> Result<(String, String)> {
+    let flat = render_project_yaml(&Starter { display_name: None, ..*starter }, Some("in-repo"))?;
     let mut project = shelbi_core::Project::from_yaml_str(&flat).map_err(|e| anyhow!(e))?;
     // The id lives in the filename/registry dir, never a YAML key, but the
     // committed file's `name:` is pick-up's anchor — force it to the id.
-    project.name = name.to_string();
-    project.label = Some(name.to_string());
-    project.display_name = display_name.map(str::to_string);
+    project.name = starter.name.to_string();
+    project.label = Some(starter.name.to_string());
+    project.display_name = starter.display_name.map(str::to_string);
     project.config_mode = Some(ConfigMode::InRepo);
     let shared = project.to_shared_yaml_string().map_err(|e| anyhow!(e))?;
     let local = project.to_local_yaml_string().map_err(|e| anyhow!(e))?;
@@ -920,58 +902,76 @@ fn install_guard_at_scaffold(
     }
 }
 
-/// Write the project YAML, workspace-settings template, default agents, and
-/// project-wide statuses/workflows/Zen/PR-template. Every step is individually
-/// idempotent so a run interrupted after registration can finish materializing
-/// on retry. In-repo mode also writes the committed
-/// `<repo>/.shelbi/project.yaml` that `shelbi init --pick-up` consumes.
-///
-/// Human-readable progress is emitted through `out`; the CLI passes a reporter
-/// that prints to the terminal (byte-identical to the pre-move `println!`s),
-/// the TUI a [`NullReporter`]. The work runs as the [`ScaffoldStage`]s, in
+/// Write the project [`create_project`] validated: the [`ScaffoldStage`]s, in
 /// order, each reported started then finished (or failed, which stops the
-/// scaffold there).
-pub fn scaffold_project(
-    resolved: &ResolvedProjectRoot,
-    mode: ConfigMode,
-    issue_tracker: &IssueTrackerConfig,
-    out: &mut dyn ScaffoldReporter,
-) -> Result<()> {
-    scaffold_project_with(resolved, mode, issue_tracker, &AgentDefaults::default(), out)
+/// scaffold there). Every step is individually idempotent, so a run
+/// interrupted after registration finishes on retry. In-repo mode also
+/// writes the committed `<repo>/.shelbi/project.yaml` a teammate's
+/// [`pick_up`] consumes. For a runner other than Claude Code the shipped
+/// agents recommend it ([`shelbi_state::recommend_runner_for_new_agents`],
+/// which leaves any `agent.yaml` that isn't the shipped text alone).
+fn scaffold_project(resolved: &ResolvedProjectRoot, plan: &NewProject, out: &mut dyn ScaffoldReporter) -> Result<()> {
+    // Held from the collision check through the last write.
+    let _scaffold_lock = run_stage(out, ScaffoldStage::Config, |out| scaffold_config(resolved, plan, out))?;
+    run_stage(out, ScaffoldStage::Agents, |out| scaffold_agents(&resolved.name, plan.defaults.runner, out))?;
+    run_stage(out, ScaffoldStage::Workflows, |out| scaffold_workflows(&resolved.name, out))?;
+    // Disclose and install the context-scoped default-branch commit guard
+    // now, with the user's knowledge: this is the consented install. Project
+    // open only *refreshes* an already-installed hook, so it's never created
+    // silently. Best-effort: a non-git root or a foreign hook degrades quietly.
+    if let Ok(project) = shelbi_state::load_project(&resolved.name) {
+        install_guard_at_scaffold(&project, &resolved.path, out);
+    }
+    Ok(())
 }
 
-/// [`scaffold_project`] with the agents' default runner and model, as the
-/// new-project flow's Agent defaults step chose them: the project YAML gets
-/// them ([`render_project_yaml_with`]), and for a runner other than Claude
-/// Code the shipped agents this scaffold writes recommend it
-/// ([`shelbi_state::recommend_runner_for_new_agents`], which leaves any
-/// `agent.yaml` that isn't the shipped text alone). The stock defaults
-/// scaffold exactly what [`scaffold_project`] always has.
-pub fn scaffold_project_with(
-    resolved: &ResolvedProjectRoot,
-    mode: ConfigMode,
-    issue_tracker: &IssueTrackerConfig,
-    defaults: &AgentDefaults,
-    out: &mut dyn ScaffoldReporter,
-) -> Result<()> {
-    check_agent_defaults(defaults).map_err(|e| anyhow!(e))?;
-    // Held from the collision check through the last write.
-    let _scaffold_lock = run_stage(out, ScaffoldStage::Config, |out| {
-        scaffold_config(resolved, mode, issue_tracker, defaults, out)
-    })?;
-    run_stage(out, ScaffoldStage::Agents, |out| {
-        let outcomes =
-            shelbi_state::self_heal_default_agents(&resolved.name).map_err(|e| anyhow!(e))?;
-        for outcome in outcomes {
-            out.note(&render_agent_materialize_outcome(&outcome));
-        }
-        if defaults.runner != RunnerKind::Claude {
-            shelbi_state::recommend_runner_for_new_agents(&resolved.name, defaults.runner)
-                .map_err(|e| anyhow!(e))?;
-        }
-        Ok(())
-    })?;
-    run_stage(out, ScaffoldStage::Workflows, |out| scaffold_workflows(resolved, out))
+/// [`ScaffoldStage::Agents`]: the default agents, recommending `runner`.
+fn scaffold_agents(project: &str, runner: RunnerKind, out: &mut dyn ScaffoldReporter) -> Result<()> {
+    let outcomes = shelbi_state::self_heal_default_agents(project).map_err(|e| anyhow!(e))?;
+    for outcome in outcomes {
+        out.note(&render_agent_materialize_outcome(&outcome));
+    }
+    if runner != RunnerKind::Claude {
+        shelbi_state::recommend_runner_for_new_agents(project, runner).map_err(|e| anyhow!(e))?;
+    }
+    Ok(())
+}
+
+/// Lay out the Shelbi home every project needs: the standard directories,
+/// the default session (`sessions/default.yaml`) and the self-documenting
+/// hub-wide `config.yaml`. Idempotent: an existing file is never touched.
+pub fn ensure_home(out: &mut dyn ScaffoldReporter) -> Result<()> {
+    let home = shelbi_state::ensure_root_subdirs().map_err(|e| anyhow!(e))?;
+    let default_session = shelbi_state::sessions_dir().map_err(|e| anyhow!(e))?.join("default.yaml");
+    if !default_session.exists() {
+        std::fs::write(&default_session, "name: default\nprojects: []\nstartup: []\n")
+            .with_context(|| format!("writing {}", default_session.display()))?;
+    }
+    if shelbi_state::scaffold_user_config_if_missing().map_err(|e| anyhow!(e))? {
+        let path = shelbi_state::user_config_path().map_err(|e| anyhow!(e))?;
+        out.note(&format!("✓ wrote global config: {}", path.display()));
+    }
+    out.note(&format!("✓ scaffolded {}", home.display()));
+    Ok(())
+}
+
+/// Initialize a Git repository at `root` on `branch`, unless it already is
+/// one.
+fn git_init(root: &Path, branch: &str, out: &mut dyn ScaffoldReporter) -> Result<()> {
+    if validate_root(root) != RootValidation::NotGitRepo {
+        return Ok(());
+    }
+    let output = Command::new("git")
+        .args(["init", "-b", branch])
+        .current_dir(root)
+        .output()
+        .with_context(|| format!("running git init in {}", root.display()))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!("git init failed in {}: {detail}", root.display());
+    }
+    out.note(&format!("✓ initialized a Git repository in {} on {branch}", root.display()));
+    Ok(())
 }
 
 /// Run `work` as `stage`: report it started, then finished or failed.
@@ -993,17 +993,30 @@ fn run_stage<T>(
     }
 }
 
-/// [`ScaffoldStage::Config`]: take the scaffold lock (returned, for the
-/// caller to hold through the remaining stages), seed onboarding, publish the
-/// registration, and write the committed in-repo half and the
-/// workspace-settings template.
+/// [`ScaffoldStage::Config`]: initialize Git (when approved) and lay out the
+/// home, take the scaffold lock (returned, for the caller to hold through the
+/// remaining stages), seed onboarding, publish the registration, and write
+/// the committed in-repo half and the workspace-settings template.
 fn scaffold_config(
     resolved: &ResolvedProjectRoot,
-    mode: ConfigMode,
-    issue_tracker: &IssueTrackerConfig,
-    defaults: &AgentDefaults,
+    plan: &NewProject,
     out: &mut dyn ScaffoldReporter,
 ) -> Result<shelbi_state::ProjectScaffoldLock> {
+    if plan.git_init {
+        git_init(&resolved.path, plan.default_branch.trim(), out)?;
+    }
+    ensure_home(out)?;
+    let mode = plan.mode;
+    let github_url = plan.remote.as_deref().and_then(remote_url_for_storage);
+    let starter = Starter {
+        name: &resolved.name,
+        display_name: resolved.display_name.as_deref(),
+        work_dir: &resolved.path,
+        default_branch: plan.default_branch.trim(),
+        github_url: github_url.as_deref(),
+        issue_tracker: &plan.issue_tracker,
+        defaults: &plan.defaults,
+    };
     let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
     let scaffold_lock = shelbi_state::lock_project_scaffold().map_err(|e| anyhow!(e))?;
     let yaml_path = projects_dir.join(format!("{}.yaml", resolved.name));
@@ -1025,14 +1038,7 @@ fn scaffold_config(
     }
 
     let in_repo_split = if mode == ConfigMode::InRepo {
-        Some(render_split_project_yaml_with(
-            &resolved.name,
-            resolved.display_name.as_deref(),
-            &resolved.path.to_string_lossy(),
-            &resolved.path,
-            issue_tracker,
-            defaults,
-        )?)
+        Some(render_split_project_yaml(&starter)?)
     } else {
         None
     };
@@ -1066,15 +1072,7 @@ fn scaffold_config(
                 }
             }
             ConfigMode::Global => {
-                let yaml = render_project_yaml_with(
-                    &resolved.name,
-                    resolved.display_name.as_deref(),
-                    "",
-                    &resolved.path,
-                    None,
-                    issue_tracker,
-                    defaults,
-                )?;
+                let yaml = render_project_yaml(&starter, None)?;
                 if write_new_project_registration(&resolved.name, &yaml_path, &yaml)? {
                     out.note(&format!("✓ wrote project: {}", yaml_path.display()));
                 } else {
@@ -1093,24 +1091,24 @@ fn scaffold_config(
 }
 
 /// [`ScaffoldStage::Workflows`]: the workflows and statuses, then the rest of
-/// the project-wide scaffold (Zen policy, PR template, shared preamble, commit
-/// guard).
-fn scaffold_workflows(resolved: &ResolvedProjectRoot, out: &mut dyn ScaffoldReporter) -> Result<()> {
-    for path in shelbi_state::scaffold_project_workflow(&resolved.name).map_err(|e| anyhow!(e))? {
+/// the project-wide scaffold (Zen policy, PR template, changelog template,
+/// shared preamble).
+fn scaffold_workflows(project: &str, out: &mut dyn ScaffoldReporter) -> Result<()> {
+    for path in shelbi_state::scaffold_project_workflow(project).map_err(|e| anyhow!(e))? {
         out.note(&format!("✓ wrote project workflow: {}", path.display()));
     }
-    let statuses_path = shelbi_state::statuses_path(&resolved.name).map_err(|e| anyhow!(e))?;
+    let statuses_path = shelbi_state::statuses_path(project).map_err(|e| anyhow!(e))?;
     if !statuses_path.exists() {
-        shelbi_state::scaffold_project_statuses(&resolved.name).map_err(|e| anyhow!(e))?;
+        shelbi_state::scaffold_project_statuses(project).map_err(|e| anyhow!(e))?;
         out.note(&format!("✓ wrote project statuses: {}", statuses_path.display()));
     }
-    match shelbi_state::scaffold_zenmode(&resolved.name).map_err(|e| anyhow!(e))? {
+    match shelbi_state::scaffold_zenmode(project).map_err(|e| anyhow!(e))? {
         shelbi_state::ZenmodeOutcome::Created => {
-            let path = shelbi_state::zenmode_path(&resolved.name).map_err(|e| anyhow!(e))?;
+            let path = shelbi_state::zenmode_path(project).map_err(|e| anyhow!(e))?;
             out.note(&format!("✓ wrote Zen policy: {}", path.display()));
         }
         shelbi_state::ZenmodeOutcome::Migrated => {
-            let path = shelbi_state::zenmode_path(&resolved.name).map_err(|e| anyhow!(e))?;
+            let path = shelbi_state::zenmode_path(project).map_err(|e| anyhow!(e))?;
             out.note(&format!(
                 "✓ pinned legacy Zen PR commands in {} (custom prose preserved)",
                 path.display()
@@ -1120,32 +1118,25 @@ fn scaffold_workflows(resolved: &ResolvedProjectRoot, out: &mut dyn ScaffoldRepo
     }
 
     if let shelbi_state::PrTemplateOutcome::Created =
-        shelbi_state::scaffold_pr_template(&resolved.name).map_err(|e| anyhow!(e))?
+        shelbi_state::scaffold_pr_template(project).map_err(|e| anyhow!(e))?
     {
-        let path = shelbi_state::pr_template_path(&resolved.name).map_err(|e| anyhow!(e))?;
+        let path = shelbi_state::pr_template_path(project).map_err(|e| anyhow!(e))?;
         out.note(&format!("✓ wrote PR template: {}", path.display()));
     }
     if let shelbi_state::ChangelogTemplateOutcome::Created =
-        shelbi_state::scaffold_changelog_template(&resolved.name).map_err(|e| anyhow!(e))?
+        shelbi_state::scaffold_changelog_template(project).map_err(|e| anyhow!(e))?
     {
-        let path = shelbi_state::changelog_template_path(&resolved.name).map_err(|e| anyhow!(e))?;
+        let path = shelbi_state::changelog_template_path(project).map_err(|e| anyhow!(e))?;
         out.note(&format!("✓ wrote changelog template: {}", path.display()));
     }
     if let shelbi_state::SharedPreambleOutcome::Created =
-        shelbi_state::scaffold_shared_preamble(&resolved.name).map_err(|e| anyhow!(e))?
+        shelbi_state::scaffold_shared_preamble(project).map_err(|e| anyhow!(e))?
     {
         let path =
-            shelbi_state::agent_shared_preamble_path(&resolved.name).map_err(|e| anyhow!(e))?;
+            shelbi_state::agent_shared_preamble_path(project).map_err(|e| anyhow!(e))?;
         out.note(&format!("✓ wrote shared agent preamble (hub safety): {}", path.display()));
     }
 
-    // Disclose and install the context-scoped default-branch commit guard now,
-    // with the user's knowledge — this is the consented install. Project open
-    // only *refreshes* an already-installed hook, so it's never created
-    // silently. Best-effort: a non-git root or a foreign hook degrades quietly.
-    if let Ok(project) = shelbi_state::load_project(&resolved.name) {
-        install_guard_at_scaffold(&project, &resolved.path, out);
-    }
     Ok(())
 }
 
@@ -1176,6 +1167,45 @@ mod tests {
         p
     }
 
+    /// The answers a front end would hand the engine for `name` in `root`
+    /// (resolved against `cwd`), with the stock defaults.
+    fn plan(name: &str, root: &str, mode: ConfigMode, defaults: &AgentDefaults, cwd: &Path) -> NewProject {
+        NewProject {
+            root: absolutize(cwd, Path::new(root.trim())),
+            name: name.to_string(),
+            pick_up: false,
+            git_init: false,
+            defaults: defaults.clone(),
+            issue_tracker: IssueTrackerConfig::default(),
+            mode,
+            default_branch: "main".into(),
+            remote: None,
+        }
+    }
+
+    /// [`create_project`] for the plan [`plan`] builds.
+    fn add_project(
+        name: &str,
+        root: &str,
+        mode: ConfigMode,
+        defaults: &AgentDefaults,
+        cwd: &Path,
+        attempt: Attempt,
+        out: &mut dyn ScaffoldReporter,
+    ) -> std::result::Result<String, AddProjectError> {
+        if root.trim().is_empty() {
+            return Err(AddProjectError::Invalid("Enter the project's repo path.".into()));
+        }
+        create_project(&plan(name, root, mode, defaults, cwd), attempt, out)
+    }
+
+    /// Scaffold the already-validated `resolved` with the stock defaults.
+    fn scaffold(resolved: &ResolvedProjectRoot, mode: ConfigMode, tracker: &IssueTrackerConfig, out: &mut dyn ScaffoldReporter) -> Result<()> {
+        let mut p = plan(&resolved.name, &resolved.path.to_string_lossy(), mode, &AgentDefaults::default(), &resolved.path);
+        p.issue_tracker = tracker.clone();
+        scaffold_project(resolved, &p, out)
+    }
+
     #[test]
     fn validate_root_reports_each_state() {
         let tmp = fresh_home();
@@ -1203,27 +1233,60 @@ mod tests {
         assert_eq!(absolutize(&cwd, Path::new("/abs")), PathBuf::from("/abs"));
     }
 
+    fn starter<'a>(name: &'a str, work_dir: &'a Path, tracker: &'a IssueTrackerConfig, defaults: &'a AgentDefaults) -> Starter<'a> {
+        Starter {
+            name,
+            display_name: None,
+            work_dir,
+            default_branch: "main",
+            github_url: None,
+            issue_tracker: tracker,
+            defaults,
+        }
+    }
+
     #[test]
     fn render_project_yaml_round_trips_and_elides_defaults() {
-        let yaml = render_project_yaml(
-            "my-app",
-            None,
-            "",
-            Path::new("/tmp/my-app"),
-            None,
-            &IssueTrackerConfig::default(),
-        )
-        .unwrap();
+        let tracker = IssueTrackerConfig::default();
+        let defaults = AgentDefaults::default();
+        let yaml = render_project_yaml(&starter("my-app", Path::new("/tmp/my-app"), &tracker, &defaults), None).unwrap();
         let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
         // A file_system board is the default → no `issue_tracker:` block.
         assert!(!yaml.contains("issue_tracker"));
         assert_eq!(project.label, None);
         assert_eq!(project.default_branch, "main");
+        assert_eq!(project.repo, "/tmp/my-app");
+        assert_eq!(project.github_url, None);
+        assert!(project.workspaces.is_empty(), "the orchestrator provisions the pool on first boot");
         assert_eq!(project.machines.len(), 1);
         assert_eq!(project.machines[0].work_dir, PathBuf::from("/tmp/my-app"));
         // A hostile name can never reach disk.
-        assert!(render_project_yaml("../../evil", None, "", Path::new("/tmp"), None, &IssueTrackerConfig::default()).is_err());
-        assert!(render_project_yaml("has\nnewline", None, "", Path::new("/tmp"), None, &IssueTrackerConfig::default()).is_err());
+        let tmp = Path::new("/tmp");
+        assert!(render_project_yaml(&starter("../../evil", tmp, &tracker, &defaults), None).is_err());
+        assert!(render_project_yaml(&starter("has\nnewline", tmp, &tracker, &defaults), None).is_err());
+    }
+
+    #[test]
+    fn render_project_yaml_records_the_detected_branch_remote_and_runner() {
+        let tracker = IssueTrackerConfig::default();
+        let defaults = AgentDefaults { runner: RunnerKind::Codex, model: Some("gpt-5".into()) };
+        let yaml = render_project_yaml(
+            &Starter {
+                default_branch: "trunk",
+                github_url: Some("git@github.com:acme/app.git"),
+                ..starter("app", Path::new("/code/app"), &tracker, &defaults)
+            },
+            None,
+        )
+        .unwrap();
+        let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(project.default_branch, "trunk");
+        assert_eq!(project.github_url.as_deref(), Some("git@github.com:acme/app.git"));
+        assert_eq!(project.orchestrator.runner, "codex");
+        assert!(project.workspaces.is_empty());
+        assert!(!yaml.contains("runner: claude"), "nothing is pinned to Claude:\n{yaml}");
+        // The commented github_url example stays out once the key is set.
+        assert_eq!(yaml.matches("github_url:").count(), 1, "{yaml}");
     }
 
     #[test]
@@ -1429,7 +1492,7 @@ mod tests {
             let repo = home.join("acme");
             std::fs::create_dir_all(repo.join(".git")).unwrap();
             let resolved = validate_add_project("acme", "acme", &home).unwrap();
-            scaffold_project(&resolved, mode, &IssueTrackerConfig::default(), &mut NullReporter).unwrap();
+            scaffold(&resolved, mode, &IssueTrackerConfig::default(), &mut NullReporter).unwrap();
             let today = normalized(project_files(&home, &repo), &home);
 
             let (home2, repo2, project) = create_with(mode, &AgentDefaults::default());
@@ -1568,7 +1631,7 @@ mod tests {
         };
 
         let mut out = CollectReporter::default();
-        scaffold_project(&resolved, ConfigMode::Global, &IssueTrackerConfig::default(), &mut out)
+        scaffold(&resolved, ConfigMode::Global, &IssueTrackerConfig::default(), &mut out)
             .unwrap();
 
         let yaml = home.join("projects/acme.yaml");
@@ -1585,9 +1648,17 @@ mod tests {
         // The project YAML line, the workspace-settings line, the agent-create
         // lines (one per shipped wired agent, order from self_heal), then the
         // workflow/statuses/Zen/PR-template lines.
-        assert_eq!(out.notes[0], format!("✓ wrote project: {}", yaml.display()));
+        // The home's layout first (a fresh home gets the hub-wide config),
+        // then the project YAML line, the workspace-settings line, …
+        let config = shelbi_state::user_config_path().unwrap();
         assert_eq!(
-            out.notes[1],
+            out.notes[..2],
+            [format!("✓ wrote global config: {}", config.display()), format!("✓ scaffolded {}", home.display())]
+        );
+        let notes = &out.notes[2..];
+        assert_eq!(notes[0], format!("✓ wrote project: {}", yaml.display()));
+        assert_eq!(
+            notes[1],
             format!("✓ wrote workspace settings template: {}", settings.display())
         );
         // Agent-workspace lines: every shipped wired agent is Created on a
@@ -1648,12 +1719,12 @@ mod tests {
             display_name: None,
         };
 
-        scaffold_project(&resolved, ConfigMode::Global, &IssueTrackerConfig::default(), &mut NullReporter)
+        scaffold(&resolved, ConfigMode::Global, &IssueTrackerConfig::default(), &mut NullReporter)
             .unwrap();
         // A second run must not error and must report the registration as
         // already existing rather than double-writing it.
         let mut out = CollectReporter::default();
-        scaffold_project(&resolved, ConfigMode::Global, &IssueTrackerConfig::default(), &mut out)
+        scaffold(&resolved, ConfigMode::Global, &IssueTrackerConfig::default(), &mut out)
             .unwrap();
         assert!(
             out.notes.iter().any(|l| l.contains("already exists")),
@@ -1787,6 +1858,18 @@ mod tests {
                 let mut out = CollectReporter::default();
                 let failed = add_project("acme", "acme", mode, &AgentDefaults::default(), &home, Attempt::New, &mut out);
                 assert!(matches!(failed, Err(AddProjectError::Failed(_))), "{case}: {failed:?}");
+                if mode == ConfigMode::Global {
+                    // Every global destination is checked before the first
+                    // write: the creation stops before any stage, nothing
+                    // registered, and once it's clear a new attempt works.
+                    assert!(out.stages.is_empty(), "{case}: {:?}", out.stages);
+                    assert!(!shelbi_state::has_project_registration("acme").unwrap(), "{case}");
+                    std::fs::remove_file(&blocker).unwrap();
+                    let slug = add_project("acme", "acme", mode, &AgentDefaults::default(), &home, Attempt::New, &mut NullReporter);
+                    assert_eq!(slug, Ok("acme".into()), "{case}");
+                    std::env::remove_var("SHELBI_HOME");
+                    continue;
+                }
                 let mut expected = all_stages()[..i * 2].to_vec();
                 expected.push(StageEvent::Started(stage));
                 assert_eq!(out.stages[..expected.len()], expected[..], "{case}");
