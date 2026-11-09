@@ -112,6 +112,7 @@ pub mod task_properties;
 pub mod task_session;
 pub mod text_area;
 pub mod theme;
+pub mod toast;
 pub mod view;
 pub mod wire;
 pub mod workspace_panel;

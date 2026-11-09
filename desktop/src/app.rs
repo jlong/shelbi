@@ -1252,6 +1252,10 @@ pub struct ShelbiWindow {
     banner: Option<SharedString>,
     /// A transient status note (the orchestrator coming up, a failure).
     status: Option<SharedString>,
+    /// The floating toast over the main area (`Launching Zed…`), which the
+    /// Workspace and Review views put up. Painted only; it takes itself
+    /// down after its lifetime ([`Self::show_toast`]).
+    toast: shelbi_app::toast::ToastSlot,
     focus_handle: FocusHandle,
     keymaps: Keymaps,
     palette_chord: String,
@@ -1717,6 +1721,7 @@ impl ShelbiWindow {
             #[cfg(test)]
             review_mutation: None,
             banner: None,
+            toast: Default::default(),
             status: None,
             focus_handle,
             keymaps,
@@ -3486,10 +3491,37 @@ impl ShelbiWindow {
             }
             WorkspaceEvent::Back => this.leave_workspace(window, cx),
             WorkspaceEvent::OpenTask(id) => this.open_task_over(id, window, cx),
+            WorkspaceEvent::Toast(toast) => this.show_toast(toast.clone(), cx),
         });
         self._view_subscriptions.push(sub);
         self.workspace = Some(ws.clone());
         ws
+    }
+
+    /// Put `toast` up over the main area, replacing the one showing, and
+    /// take it down once its lifetime is over (a newer toast keeps its own
+    /// timer). `None` takes the one showing down now.
+    fn show_toast(&mut self, toast: Option<shelbi_app::toast::Toast>, cx: &mut Context<Self>) {
+        let Some(toast) = toast else {
+            if self.toast.dismiss() {
+                cx.notify();
+            }
+            return;
+        };
+        let lifetime = toast.lifetime;
+        let generation = self.toast.show(toast, std::time::Instant::now());
+        cx.notify();
+        let timer = cx.background_executor().timer(lifetime);
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if this.toast.dismiss_generation(generation) {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The Review view for the window's project, created on first use.
@@ -3525,6 +3557,7 @@ impl ShelbiWindow {
             }
             ReviewEvent::Back | ReviewEvent::Closed => this.leave_review(window, cx),
             ReviewEvent::OpenTask(id) => this.open_task_over(id, window, cx),
+            ReviewEvent::Toast(toast) => this.show_toast(toast.clone(), cx),
         });
         self._view_subscriptions.push(sub);
         self.review = Some(review.clone());
@@ -5785,6 +5818,16 @@ impl ShelbiWindow {
             // The task detail over the Review or Workspace screen: the board
             // draws it, sized to the main area as it is over the board.
             .when_some(detail_over, |main, issues| main.relative().child(issues))
+            // The toast floats over all of it, painted only.
+            .when_some(self.toast_showing(), |main, toast| {
+                main.relative().child(crate::views::toast::render(&toast, theme))
+            })
+    }
+
+    /// The toast to paint now, if one is up. Its timer takes it down; the
+    /// lifetime check covers a frame drawn before that lands.
+    fn toast_showing(&self) -> Option<shelbi_app::toast::Toast> {
+        self.toast.current(std::time::Instant::now()).cloned()
     }
 }
 
@@ -6733,6 +6776,10 @@ mod onboarding_tests;
 #[cfg(test)]
 #[path = "app_nav_focus_tests.rs"]
 mod nav_focus_tests;
+
+#[cfg(test)]
+#[path = "app_toast_tests.rs"]
+mod toast_tests;
 
 #[cfg(test)]
 mod tests {
