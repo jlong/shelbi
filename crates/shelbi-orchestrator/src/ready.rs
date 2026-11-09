@@ -779,7 +779,7 @@ pub fn next_reset_instant(
 ) -> Option<chrono::DateTime<chrono::Utc>> {
     let time = parse_wall_time(hint)?;
     match parse_hint_zone(hint) {
-        HintZone::Named(tz) => next_occurrence(time, &tz, reference),
+        HintZone::Named(zone) => next_occurrence(time, &zone, reference),
         HintZone::LocalImplied if allow_local_implied => {
             next_occurrence(time, &chrono::Local, reference)
         }
@@ -792,9 +792,11 @@ pub fn next_reset_instant(
 /// failure-ish shapes must behave differently: no parens at all means claude
 /// printed a bare time (assume the hub's zone), while parens holding
 /// something we can't map to an IANA zone means we *know* the time is in a
-/// zone we can't resolve — guessing would risk a wrong-time resume.
+/// zone we can't resolve — guessing would risk a wrong-time resume. Named
+/// zones come from the system's zone files ([`crate::zoneinfo`]), so a name
+/// missing there is unrecognized too.
 enum HintZone {
-    Named(chrono_tz::Tz),
+    Named(crate::zoneinfo::Zone),
     LocalImplied,
     Unrecognized,
 }
@@ -810,9 +812,9 @@ fn parse_hint_zone(hint: &str) -> HintZone {
     if !hint[end + 1..].trim().is_empty() {
         return HintZone::Unrecognized;
     }
-    match hint[start + 1..start + 1 + len].trim().parse() {
-        Ok(tz) => HintZone::Named(tz),
-        Err(_) => HintZone::Unrecognized,
+    match crate::zoneinfo::Zone::load(hint[start + 1..start + 1 + len].trim()) {
+        Some(zone) => HintZone::Named(zone),
+        None => HintZone::Unrecognized,
     }
 }
 
@@ -868,14 +870,52 @@ fn parse_wall_time(hint: &str) -> Option<chrono::NaiveTime> {
     chrono::NaiveTime::from_hms_opt(hour, minute, 0)
 }
 
+/// The two lookups [`next_occurrence`] needs from a zone: the hub's own
+/// (`chrono::Local`) or a named one read from the system's zone files.
+trait ResetZone {
+    /// The local calendar date at UTC instant `at`.
+    fn local_date(&self, at: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate;
+    /// The UTC instant(s) whose local reading is `local`.
+    fn resolve(
+        &self,
+        local: chrono::NaiveDateTime,
+    ) -> chrono::LocalResult<chrono::DateTime<chrono::Utc>>;
+}
+
+impl ResetZone for chrono::Local {
+    fn local_date(&self, at: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate {
+        at.with_timezone(self).date_naive()
+    }
+
+    fn resolve(
+        &self,
+        local: chrono::NaiveDateTime,
+    ) -> chrono::LocalResult<chrono::DateTime<chrono::Utc>> {
+        chrono::TimeZone::from_local_datetime(self, &local).map(|dt| dt.to_utc())
+    }
+}
+
+impl ResetZone for crate::zoneinfo::Zone {
+    fn local_date(&self, at: chrono::DateTime<chrono::Utc>) -> chrono::NaiveDate {
+        crate::zoneinfo::Zone::local_date(self, at)
+    }
+
+    fn resolve(
+        &self,
+        local: chrono::NaiveDateTime,
+    ) -> chrono::LocalResult<chrono::DateTime<chrono::Utc>> {
+        self.utc_from_local(local)
+    }
+}
+
 /// The next occurrence of wall time `t` in zone `tz`, strictly after
 /// `reference`, as a UTC instant.
-fn next_occurrence<Tz: chrono::TimeZone>(
+fn next_occurrence(
     t: chrono::NaiveTime,
-    tz: &Tz,
+    tz: &impl ResetZone,
     reference: chrono::DateTime<chrono::Utc>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    let today = reference.with_timezone(tz).date_naive();
+    let today = tz.local_date(reference);
     let mut candidate = resolve_local(tz, today, t)?;
     if candidate <= reference {
         candidate = resolve_local(tz, today.succ_opt()?, t)?;
@@ -887,15 +927,14 @@ fn next_occurrence<Tz: chrono::TimeZone>(
 /// an ambiguous fall-back time takes the later reading so an auto-resume can
 /// be late but never an hour early; a nonexistent spring-forward time is
 /// rejected rather than shifted to a guessed instant.
-fn resolve_local<Tz: chrono::TimeZone>(
-    tz: &Tz,
+fn resolve_local(
+    tz: &impl ResetZone,
     date: chrono::NaiveDate,
     t: chrono::NaiveTime,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
-    let naive = date.and_time(t);
-    match tz.from_local_datetime(&naive) {
-        chrono::LocalResult::Single(dt) => Some(dt.with_timezone(&chrono::Utc)),
-        chrono::LocalResult::Ambiguous(_, later) => Some(later.with_timezone(&chrono::Utc)),
+    match tz.resolve(date.and_time(t)) {
+        chrono::LocalResult::Single(dt) => Some(dt),
+        chrono::LocalResult::Ambiguous(_, later) => Some(later),
         chrono::LocalResult::None => None,
     }
 }
@@ -1895,6 +1934,52 @@ Auto mode works better when it knows your environment. Takes about a minute.
         // A remote pane must refuse the same zone-less hint: the remote and
         // hub timezones are not assumed to match.
         assert_eq!(next_reset_instant("7:20am", reference, false), None);
+    }
+
+    #[test]
+    fn next_reset_instant_reads_named_zones_from_the_system() {
+        use chrono::{TimeZone, Utc};
+        let at = |y, mo, d, h, mi| Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap();
+        // Los Angeles: PST in January, PDT in July.
+        assert_eq!(
+            next_reset_instant(
+                "7:20am (America/Los_Angeles)",
+                at(2026, 1, 10, 12, 0),
+                false
+            ),
+            Some(at(2026, 1, 10, 15, 20)),
+        );
+        assert_eq!(
+            next_reset_instant(
+                "7:20am (America/Los_Angeles)",
+                at(2026, 7, 10, 12, 0),
+                false
+            ),
+            Some(at(2026, 7, 10, 14, 20)),
+        );
+        // London: GMT in January, BST in July.
+        assert_eq!(
+            next_reset_instant("9pm (Europe/London)", at(2026, 1, 10, 12, 0), false),
+            Some(at(2026, 1, 10, 21, 0)),
+        );
+        assert_eq!(
+            next_reset_instant("9pm (Europe/London)", at(2026, 7, 10, 12, 0), false),
+            Some(at(2026, 7, 10, 20, 0)),
+        );
+        // Tokyo: the local date is already the next day at 20:00 UTC.
+        assert_eq!(
+            next_reset_instant("8am (Asia/Tokyo)", at(2026, 7, 10, 20, 0), false),
+            Some(at(2026, 7, 10, 23, 0)),
+        );
+        // Unknown zones and path-shaped names are unrecognized, never guessed.
+        for hint in [
+            "7:20am (Mars/Olympus_Mons)",
+            "7:20am (../../etc/passwd)",
+            "7:20am (/usr/share/zoneinfo/UTC)",
+            "7:20am (America)",
+        ] {
+            assert_eq!(next_reset_instant(hint, at(2026, 7, 10, 12, 0), true), None, "{hint}");
+        }
     }
 
     #[test]
