@@ -196,7 +196,9 @@ fn ctrl_f_and_cmd_f_focus_the_search_and_a_paste_types_into_it() {
     v.paste("rata\n");
     assert_eq!(v.focus(), Focus::Search);
     assert_eq!(v.browser().query(), "rata");
-    assert_eq!(names_shown(&v), ["Ratatui"]);
+    // Ratatui's own entry, and the long tail for its ratatui-core,
+    // ratatui-widgets and ratatui-crossterm crates.
+    assert_eq!(names_shown(&v), ["Ratatui", "Rust crates"]);
     v.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
     assert_eq!(v.browser().query(), "", "Ctrl+U clears it");
 }

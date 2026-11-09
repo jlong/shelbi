@@ -369,6 +369,49 @@ fn notice(p: &Package, all: &[Package]) -> String {
     parts.join("\n\n")
 }
 
+/// The optional dependencies the features enabled on package `p` (its
+/// resolve `node`) turn on, by the name its manifest gives them. `cargo
+/// metadata`'s resolve keeps an edge to every optional dependency the
+/// lockfile holds, enabled or not (ratatui's `termina` and `termwiz`
+/// backends, its `palette` and `serde` support), so the walk asks the
+/// features: `dep:x` and `x/feature` turn `x` on, `x?/feature` doesn't, and
+/// neither does a feature that only names `x`'s own features.
+fn optional_deps_on<'a>(p: &'a Value, node: &'a Value) -> BTreeSet<&'a str> {
+    let mut on = BTreeSet::new();
+    for feature in node["features"].as_array().into_iter().flatten().filter_map(Value::as_str) {
+        // An implicit feature: an optional dependency's own name.
+        on.insert(feature);
+        for item in p["features"][feature].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            if let Some(dep) = item.strip_prefix("dep:") {
+                on.insert(dep);
+            } else if let Some((dep, _)) = item.split_once('/') {
+                if !dep.ends_with('?') {
+                    on.insert(dep);
+                }
+            }
+        }
+    }
+    on
+}
+
+/// Whether package `p`'s normal dependency on the package named `dep`
+/// ships: it does unless every manifest entry for it is optional and none
+/// is turned on (`on`, from [`optional_deps_on`]). An entry is matched by
+/// package name, and turned on by its rename when it has one.
+fn ships(p: &Value, dep: &str, on: &BTreeSet<&str>) -> bool {
+    let mut entries = p["dependencies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|d| d["kind"].is_null() && d["name"] == dep)
+        .peekable();
+    entries.peek().is_none()
+        || entries.any(|d| {
+            !d["optional"].as_bool().unwrap_or(false)
+                || on.contains(d["rename"].as_str().unwrap_or(dep))
+        })
+}
+
 /// Run `cargo metadata` and walk what `root`'s binary ships (`None`: the
 /// crate in `manifest_dir`).
 fn shipped(manifest_dir: &Path, target: &str, root: Option<&str>) -> Vec<Package> {
@@ -439,14 +482,16 @@ fn shipped(manifest_dir: &Path, target: &str, root: Option<&str>) -> Vec<Package
         if proc_macro(p) {
             continue;
         }
+        let on = optional_deps_on(p, nodes[id]);
         for dep in nodes[id]["deps"].as_array().into_iter().flatten() {
             let normal = dep["dep_kinds"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .any(|k| k["kind"].is_null());
-            if normal {
-                stack.push(dep["pkg"].as_str().expect("pkg"));
+            let pkg = dep["pkg"].as_str().expect("pkg");
+            if normal && ships(p, packages[pkg]["name"].as_str().unwrap_or_default(), &on) {
+                stack.push(pkg);
             }
         }
         if id == root {
