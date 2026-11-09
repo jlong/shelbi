@@ -15,9 +15,11 @@ mod licenses;
 
 /// The app's list: the crates `shelbi_app::licenses::shared_entries` shows
 /// (`SHARED_FEATURED` / `SHARED_FILES`) and the app's own featured crates
-/// (`src/licenses.rs`). gpui-kit's package ships no license file, so its
-/// entry shows gpui-base's (the same repository's Apache License); Lucide's
-/// icons ship inside gpui-kit-assets.
+/// (`src/licenses.rs`): option-ext (MPL 2.0, inside the dirs crate gpui's font
+/// loading uses; the `shelbi` binary no longer links it), GPUI and gpui-kit.
+/// gpui-kit's package ships no license file, so its entry shows gpui-base's
+/// (the same repository's Apache License); Lucide's icons ship inside
+/// gpui-kit-assets.
 const LICENSES: licenses::Config = licenses::Config {
     root: None,
     subject: "the app",

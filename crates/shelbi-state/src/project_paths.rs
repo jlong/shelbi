@@ -496,7 +496,7 @@ mod tests {
             p.workspace_settings_template = Some(PathBuf::from("~/custom/tpl.json"));
             assert_eq!(
                 p.workspace_settings_template_path().unwrap(),
-                dirs::home_dir().unwrap().join("custom/tpl.json"),
+                shelbi_core::home_dir().unwrap().join("custom/tpl.json"),
             );
         }
         std::env::remove_var("SHELBI_HOME");

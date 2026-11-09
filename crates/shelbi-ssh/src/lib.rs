@@ -2543,10 +2543,18 @@ mod tests {
         );
     }
 
+    /// The first executable file named `bin` on `$PATH`, as a shell finds it.
+    fn find_on_path(bin: &str) -> Option<std::path::PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|dir| dir.join(bin))
+            .find(|p| p.metadata().is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+    }
+
     /// A `PATH` holding `sh` and `perl` but no `python3`, or `None` if this
     /// machine has no perl to link.
     fn perl_only_path(dir: &std::path::Path) -> Option<String> {
-        let perl = which::which("perl").ok()?;
+        let perl = find_on_path("perl")?;
         std::fs::create_dir_all(dir).unwrap();
         std::os::unix::fs::symlink(perl, dir.join("perl")).unwrap();
         std::os::unix::fs::symlink("/bin/sh", dir.join("sh")).unwrap();

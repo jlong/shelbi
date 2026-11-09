@@ -124,6 +124,15 @@ fn build() -> Vec<Entry> {
             TABLE.text("gpui-kit-assets", "LICENSE-LUCIDE"),
         ),
         entry(
+            "option-ext",
+            "MPL 2.0",
+            format!("Simon Ochsenreither · Rust library {}", TABLE.version("option-ext")),
+            "A helper inside the dirs crate, which GPUI's font loading uses to find your font folders.",
+            "https://github.com/soc/option-ext",
+            "Mozilla Public License 2.0",
+            TABLE.text("option-ext", "LICENSE.txt"),
+        ),
+        entry(
             "Source Code Pro",
             "SIL OFL 1.1",
             "Adobe · Terminal typeface".into(),
@@ -236,7 +245,7 @@ mod tests {
     #[test]
     fn the_list_is_what_ships() {
         let mut featured = shared::SHARED_FEATURED.to_vec();
-        featured.extend(["gpui-pre", "gpui-kit"]);
+        featured.extend(["option-ext", "gpui-pre", "gpui-kit"]);
         for name in featured.iter().chain(&["gpui-kit-assets"]) {
             assert!(SHIPPED.iter().any(|c| c.name == *name), "{name} doesn't ship");
         }

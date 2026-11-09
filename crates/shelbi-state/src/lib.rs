@@ -4422,7 +4422,7 @@ mod tests {
     fn workspace_settings_template_path_expands_tilde_in_override() {
         let p = fixture_project("myapp", Some(PathBuf::from("~/custom/p.json")));
         let path = workspace_settings_template_path(&p).unwrap();
-        let expected = dirs::home_dir().unwrap().join("custom/p.json");
+        let expected = shelbi_core::home_dir().unwrap().join("custom/p.json");
         assert_eq!(path, expected);
     }
 

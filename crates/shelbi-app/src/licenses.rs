@@ -105,21 +105,19 @@ impl Table {
 
 /// The crates [`shared_entries`] lists on their own, so a binary's build
 /// script leaves them out of its long tail.
-pub const SHARED_FEATURED: &[&str] = &["alacritty_terminal", "nucleo-matcher", "option-ext", "portable-pty", "termwiz"];
+pub const SHARED_FEATURED: &[&str] = &["alacritty_terminal", "nucleo-matcher", "portable-pty", "termwiz"];
 
 /// The license files [`shared_entries`] shows, `(crate, file)`, for the
 /// build scripts to read.
 pub const SHARED_FILES: &[(&str, &str)] = &[
     ("alacritty_terminal", "LICENSE-APACHE"),
     ("nucleo-matcher", "LICENSE"),
-    ("option-ext", "LICENSE.txt"),
     ("portable-pty", "LICENSE.md"),
     ("termwiz", "LICENSE.md"),
 ];
 
 /// The crate entries both binaries ship: the terminal emulator, the
-/// palette's matcher, the MPL-licensed helper, the pseudoterminals and the
-/// escape-sequence parser.
+/// palette's matcher, the pseudoterminals and the escape-sequence parser.
 pub fn shared_entries(table: &Table) -> Vec<Entry> {
     let entry = |name, license, attribution: String, description, source, license_title, text| Entry {
         name,
@@ -149,15 +147,6 @@ pub fn shared_entries(table: &Table) -> Vec<Entry> {
             "https://github.com/helix-editor/nucleo",
             "Mozilla Public License 2.0",
             table.text("nucleo-matcher", "LICENSE"),
-        ),
-        entry(
-            "option-ext",
-            "MPL 2.0",
-            format!("Simon Ochsenreither · Rust library {}", table.version("option-ext")),
-            "A helper inside the dirs crate, which finds your home and config folders.",
-            "https://github.com/soc/option-ext",
-            "Mozilla Public License 2.0",
-            table.text("option-ext", "LICENSE.txt"),
         ),
         entry(
             "portable-pty",

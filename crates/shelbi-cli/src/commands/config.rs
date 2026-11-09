@@ -571,7 +571,7 @@ fn format_diag_line(
 /// → `~/.shelbi/keys.yaml`. Falls back to the raw display form if no home
 /// directory is set or the path doesn't sit under it.
 fn display_path(p: &Path) -> String {
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = shelbi_core::home_dir() {
         if let Ok(rel) = p.strip_prefix(&home) {
             return format!("~/{}", rel.display());
         }
