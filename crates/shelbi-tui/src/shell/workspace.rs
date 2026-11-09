@@ -237,6 +237,11 @@ impl WorkspaceInterface {
         self
     }
 
+    /// The editor's display name, as "Edit in <name>" shows it.
+    pub fn editor_name(&self) -> &str {
+        &self.panel.editor_name
+    }
+
     /// A remote worktree's `host:path`, `None` for a local workspace.
     pub fn remote_address(&self) -> Option<&str> {
         self.remote_address.as_deref()

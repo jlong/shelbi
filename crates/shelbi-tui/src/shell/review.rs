@@ -530,6 +530,11 @@ impl ReviewInterface {
         self
     }
 
+    /// The editor's display name, as "Edit in <name>" shows it.
+    pub fn editor_name(&self) -> &str {
+        &self.panel.editor_name
+    }
+
     /// The editor and diff settings changed: "Edit in <name>" and which of
     /// Edit / View Diff open an app follow them.
     pub fn set_tools(&mut self, editor_name: String, apps: shelbi_state::AppTools) {

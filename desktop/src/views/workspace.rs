@@ -73,6 +73,7 @@ use gpui::{
 };
 use shelbi_app::diff::{DiffTarget, TargetKind};
 use shelbi_app::session::{SessionRef, WorkspaceContentRelauncher};
+use shelbi_app::toast::Toast;
 use shelbi_app::view::{WorkspaceBadge, WorkspaceDetailsInfo, WorkspaceHeader, WorkspaceRow};
 use shelbi_app::workspace_panel::{WorkspacePanelState, WsEffect, WsPanelShape, WsRow};
 use shelbi_app::{ReviewRole, WorkspaceSessionOp};
@@ -218,6 +219,9 @@ pub enum WorkspaceEvent {
     Back,
     /// More: open this task's detail over the screen.
     OpenTask(String),
+    /// Put this toast up over the main area (`Launching Zed…`), or take the
+    /// one showing down (`None`: a terminal editor takes the main area).
+    Toast(Option<Toast>),
 }
 
 /// The Workspace view for one project window. It shows one workspace at a
@@ -750,7 +754,11 @@ impl WorkspaceView {
                 }
                 self.select_view(ContentView::Diff, cx);
             }
-            WsEffect::ShowEditor => self.select_view(ContentView::Editor, cx),
+            WsEffect::ShowEditor => {
+                // A terminal editor: never under a toast.
+                cx.emit(WorkspaceEvent::Toast(None));
+                self.select_view(ContentView::Editor, cx);
+            }
             WsEffect::OpenApp(role) => self.open_in_app(role, cx),
             // More opens the task's detail over the screen.
             WsEffect::ShowDescription => {
@@ -1086,6 +1094,13 @@ impl WorkspaceView {
             return;
         };
         self.status_line = None;
+        // The editor app takes a moment to show: a toast says it's coming,
+        // and its failure replaces it.
+        let editor = (role == ReviewRole::Editor)
+            .then(|| self.details.as_ref().map(|d| d.editor_name.clone()).unwrap_or_default());
+        if let Some(name) = &editor {
+            cx.emit(WorkspaceEvent::Toast(Some(Toast::launching_editor(name))));
+        }
         let ops = self.ops.clone();
         let project = self.project.clone();
         let work = cx
@@ -1094,7 +1109,10 @@ impl WorkspaceView {
         cx.spawn(async move |this, cx| {
             if let Err(e) = work.await {
                 this.update(cx, |this, cx| {
-                    this.status_line = Some(format!("couldn't open the app: {e}"));
+                    match &editor {
+                        Some(name) => cx.emit(WorkspaceEvent::Toast(Some(Toast::editor_launch_failed(name, &e)))),
+                        None => this.status_line = Some(format!("couldn't open the app: {e}")),
+                    }
                     cx.notify();
                 })
                 .ok();
@@ -1980,7 +1998,8 @@ pub(crate) mod tests {
         assert_eq!(h.active(), ContentView::Agent, "⌘1 is the agent");
         shortcut(&mut h, 5);
         assert_eq!(h.active(), ContentView::Agent, "no fifth view");
-        assert!(h.events().is_empty());
+        // Only the Vim pane's "no toast over me".
+        assert_eq!(h.events(), vec![WorkspaceEvent::Toast(None)]);
     }
 
     #[gpui::test]
@@ -2327,17 +2346,51 @@ pub(crate) mod tests {
         assert_eq!(h.active(), ContentView::Agent, "no editor pane: the agent stays");
         assert!(h.ops().is_empty(), "the daemon spawns no editor session");
         assert_eq!(h.sessions.attached(), vec!["demo/ws/alpha"]);
+        // A toast says the app is on its way, named as the nav names it.
+        let toasts = |h: &Harness| -> Vec<Option<Toast>> {
+            h.events()
+                .into_iter()
+                .filter_map(|e| match e {
+                    WorkspaceEvent::Toast(t) => Some(t),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(toasts(&h), vec![Some(Toast::launching_editor("Zed"))]);
+        assert_eq!(h.view.read_with(&h.cx, |v, _| v.status_line.clone()), None);
 
         // The diff is still a pane.
         h.click("ws-switch-diff");
         assert_eq!(h.active(), ContentView::Diff);
 
-        // A launch that fails says why.
+        // A launch that fails replaces the toast with one saying why.
         *h.ops.fail_ops.lock().unwrap() = true;
+        h.events.borrow_mut().clear();
         h.click("ws-switch-editor");
         assert_eq!(
-            h.view.read_with(&h.cx, |v, _| v.status_line.clone()).as_deref(),
-            Some("couldn't open the app: Zed isn't installed")
+            toasts(&h),
+            vec![
+                Some(Toast::launching_editor("Zed")),
+                Some(Toast::editor_launch_failed("Zed", "Zed isn't installed")),
+            ]
+        );
+        assert_eq!(h.view.read_with(&h.cx, |v, _| v.status_line.clone()), None);
+    }
+
+    #[gpui::test]
+    fn a_pane_editor_takes_the_toast_down(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show("alpha", Some(working()), cx));
+        h.click("ws-switch-editor");
+        assert_eq!(h.active(), ContentView::Editor, "Vim is a pane");
+        assert!(
+            h.events().contains(&WorkspaceEvent::Toast(None)),
+            "a terminal editor never sits under a toast: {:?}",
+            h.events()
+        );
+        assert!(
+            !h.events().iter().any(|e| matches!(e, WorkspaceEvent::Toast(Some(_)))),
+            "and it puts none up"
         );
     }
 
@@ -2545,7 +2598,12 @@ pub(crate) mod tests {
         let events = h.events();
         // A view clicked hands its content the keys (`nav-click-focuses-content`).
         assert!(events.contains(&WorkspaceEvent::Focused), "{events:?}");
-        let rest: Vec<_> = events.into_iter().filter(|e| *e != WorkspaceEvent::Focused).collect();
+        // The Vim pane takes any toast down.
+        assert!(events.contains(&WorkspaceEvent::Toast(None)), "{events:?}");
+        let rest: Vec<_> = events
+            .into_iter()
+            .filter(|e| !matches!(e, WorkspaceEvent::Focused | WorkspaceEvent::Toast(None)))
+            .collect();
         assert_eq!(rest, vec![WorkspaceEvent::OpenTask("t-1".into()), WorkspaceEvent::Back]);
     }
 

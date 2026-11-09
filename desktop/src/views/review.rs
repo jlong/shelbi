@@ -81,6 +81,7 @@ use shelbi_app::review::{
     ReviewPanelModel, ReviewPanelState, ReviewSwitch, ReviewTarget,
 };
 use shelbi_app::session::{ReviewRelauncher, SessionRef};
+use shelbi_app::toast::Toast;
 use shelbi_app::view::{ReviewRow, ReviewState};
 use shelbi_app::{CommandKind, ReviewRole, ReviewSessionOp, WorkspaceSessionOp};
 use shelbi_core::{Column, StatusCategory};
@@ -281,6 +282,9 @@ pub enum ReviewEvent {
     /// The review was torn down (the daemon was asked to end its sessions):
     /// go back to the previous view.
     Closed,
+    /// Put this toast up over the main area (`Launching Zed…`), or take the
+    /// one showing down (`None`: a terminal editor takes the main area).
+    Toast(Option<Toast>),
 }
 
 /// Where keyboard focus sits inside the review.
@@ -1194,7 +1198,32 @@ impl ReviewView {
             }
             PanelEffect::ShowEditor => {
                 self.set_status(None, cx);
+                // A terminal editor: never under a toast.
+                cx.emit(ReviewEvent::Toast(None));
                 self.select_view(ActiveView::Editor, cx);
+            }
+            // The editor app takes a moment to show: a toast says it's
+            // coming, and its failure replaces it. The content view stays.
+            PanelEffect::OpenApp(ReviewRole::Editor) => {
+                self.set_status(None, cx);
+                let name = self.model().map(|m| m.editor_name.clone()).unwrap_or_default();
+                cx.emit(ReviewEvent::Toast(Some(Toast::launching_editor(&name))));
+                let project = self.project.clone();
+                let ops = self.ops.clone();
+                let work = cx
+                    .background_executor()
+                    .spawn(async move { ops.open_in_app(&project, &task, ReviewRole::Editor) });
+                // The toast is the window's, so the failure shows even after
+                // the review moved on: it names the editor, not the task.
+                cx.spawn(async move |this, cx| {
+                    if let Err(e) = work.await {
+                        this.update(cx, |_, cx| {
+                            cx.emit(ReviewEvent::Toast(Some(Toast::editor_launch_failed(&name, &e))));
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
             }
             // The app opens; the content view stays as it is.
             PanelEffect::OpenApp(role) => {
@@ -2816,6 +2845,34 @@ pub(crate) mod tests {
         assert_eq!(h.events()[1], ReviewEvent::OpenTask("t-1".into()));
         h.key("escape");
         assert_eq!(h.events().last(), Some(&ReviewEvent::Back));
+    }
+
+    #[gpui::test]
+    fn edit_in_an_app_toasts_and_a_failed_launch_replaces_it(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        let mut info = info();
+        info.editor_name = "Zed".into();
+        info.apps = shelbi_state::AppTools { editor: true, ..Default::default() };
+        h.update(|v, cx| v.show(info, None, cx));
+        h.update(|v, cx| v.apply(PanelEffect::OpenApp(ReviewRole::Editor), cx));
+        // The fake ops can't open apps: the launch fails with that reason.
+        assert_eq!(
+            h.events(),
+            vec![
+                ReviewEvent::Toast(Some(Toast::launching_editor("Zed"))),
+                ReviewEvent::Toast(Some(Toast::editor_launch_failed("Zed", "apps can't be opened here"))),
+            ]
+        );
+        assert_eq!(h.status_line(), None, "the toast says it, not the status line");
+        assert!(h.ops().is_empty(), "no editor pane was asked for");
+    }
+
+    #[gpui::test]
+    fn a_pane_editor_takes_the_toast_down(cx: &mut TestAppContext) {
+        let mut h = open(cx);
+        h.update(|v, cx| v.show(info(), None, cx));
+        h.update(|v, cx| v.apply(PanelEffect::ShowEditor, cx));
+        assert_eq!(h.events(), vec![ReviewEvent::Toast(None)]);
     }
 
     #[gpui::test]

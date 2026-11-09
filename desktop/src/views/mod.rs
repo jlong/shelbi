@@ -93,6 +93,7 @@ pub mod diff_view;
 pub mod connect_remote;
 pub mod doc_editor;
 pub mod session_view;
+pub mod toast;
 pub mod workspace;
 pub mod workspace_layout;
 pub mod external_edit;

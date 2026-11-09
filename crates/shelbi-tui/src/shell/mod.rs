@@ -586,6 +586,8 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         // and wait (the editor owns the screen meanwhile), then repaint.
         if let Some(path) = state.pending_editor.take() {
             let line = state.pending_editor_line.take();
+            // The editor owns the screen; a toast never comes back over it.
+            state.toast.dismiss();
             state.status = Some(run_editor(&mut term, &path, line));
             state.reported_main = None;
             // Opened from Settings: what it summarizes may have changed.
@@ -755,6 +757,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             state.dirty = true;
         }
         if state.poll_retry_notices(Instant::now()) {
+            state.dirty = true;
+        }
+        if state.poll_toast(Instant::now()) {
             state.dirty = true;
         }
         if ring {
@@ -1546,6 +1551,13 @@ struct ShellState {
     /// The newest retry notice and when it stops showing. It takes the status
     /// band over [`Self::status`] while it shows, without replacing it.
     retry_notice: Option<(String, Instant)>,
+    /// The floating toast over the main area (`Launching Zed…`): painted
+    /// only, never focused; it expires on its own ([`Self::poll_toast`]).
+    toast: shelbi_app::toast::ToastSlot,
+    /// Editor app launches report a failure here (the error toast that
+    /// replaces `Launching …`). Several may be in flight at once.
+    toast_tx: std::sync::mpsc::Sender<shelbi_app::toast::Toast>,
+    toast_rx: Receiver<shelbi_app::toast::Toast>,
     /// Clear the terminal and paint every cell on the next draw: Ctrl+L, a
     /// resize, focus regained. Recovers the screen from anything written over
     /// it outside ratatui.
@@ -1676,6 +1688,7 @@ impl ShellState {
         };
         let (settings_tx, settings_rx) = std::sync::mpsc::channel();
         let (decision_tx, decision_rx) = std::sync::mpsc::channel();
+        let (toast_tx, toast_rx) = std::sync::mpsc::channel();
         // Tests never read the real `~/.shelbi` (and `load_project` may migrate).
         #[cfg(not(test))]
         let settings_reader: SettingsReader =
@@ -1828,6 +1841,9 @@ impl ShellState {
             status: None,
             retry_notices: None,
             retry_notice: None,
+            toast: shelbi_app::toast::ToastSlot::default(),
+            toast_tx,
+            toast_rx,
             full_redraw: false,
             job: None,
             pending_editor: None,
@@ -1886,6 +1902,40 @@ impl ShellState {
             changed = true;
         }
         changed
+    }
+
+    /// Fold in an editor launch's failure (its error toast replaces
+    /// `Launching …`) and drop a toast whose time is up. Returns whether the
+    /// toast changed (the frame repaints).
+    fn poll_toast(&mut self, now: Instant) -> bool {
+        let mut changed = false;
+        while let Ok(toast) = self.toast_rx.try_recv() {
+            self.toast.show(toast, now);
+            changed = true;
+        }
+        self.toast.expire(now) || changed
+    }
+
+    /// Edit in <editor> opens an app: say so with a `Launching <editor>…`
+    /// toast at once, and run `launch` off the UI thread. A failure comes
+    /// back as the error toast that replaces it ([`Self::poll_toast`]); a
+    /// success shows nothing more (the app's window is the news).
+    fn launch_editor_app(&mut self, editor_name: String, launch: impl FnOnce() -> Result<(), String> + Send + 'static) {
+        use shelbi_app::toast::Toast;
+        self.toast.show(Toast::launching_editor(&editor_name), Instant::now());
+        self.dirty = true;
+        let tx = self.toast_tx.clone();
+        let name = editor_name.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-editor-launch".into())
+            .spawn(move || {
+                if let Err(reason) = launch() {
+                    let _ = tx.send(Toast::editor_launch_failed(&name, &reason));
+                }
+            });
+        if let Err(e) = spawned {
+            let _ = self.toast_tx.send(Toast::editor_launch_failed(&editor_name, &e.to_string()));
+        }
     }
 
     /// The status band's text: a showing retry notice, else the status line.
@@ -4634,6 +4684,8 @@ impl ShellState {
                 }
             }
             ReviewAction::ShowContent(Some(role)) => {
+                // A terminal editor takes the main area: no toast over it.
+                self.toast.dismiss();
                 // Ask the daemon to ensure the editor session, then bind it.
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.review_rx = Some(rx);
@@ -4672,6 +4724,15 @@ impl ShellState {
                         self.display_style,
                     ));
                 }
+            }
+            ReviewAction::OpenApp(shelbi_app::ReviewRole::Editor) => {
+                // The app launches off the UI thread; the content view stays.
+                let editor = review.editor_name().to_string();
+                self.launch_editor_app(editor, move || {
+                    shelbi_orchestrator::review_session::open_in_app(&project, &task, shelbi_app::ReviewRole::Editor.into())
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                });
             }
             ReviewAction::OpenApp(role) => {
                 // The app launches off the UI thread; the content view stays.
@@ -5228,6 +5289,9 @@ impl ShellState {
                 }
             }
             WorkspaceAction::ShowContent(Some(role)) => {
+                // A terminal editor (or diff) takes the main area: no toast
+                // over it.
+                self.toast.dismiss();
                 // Ask the daemon to ensure the editor/diff session, then bind it.
                 let (tx, rx) = std::sync::mpsc::channel();
                 self.workspace_rx = Some(rx);
@@ -5241,6 +5305,15 @@ impl ShellState {
                         let _ = tx.send(WorkspaceJobMsg::ContentReady(role, res));
                     })
                     .ok();
+            }
+            WorkspaceAction::OpenApp(shelbi_app::ReviewRole::Editor) => {
+                // The app launches off the UI thread; the content view stays.
+                let editor = ws.editor_name().to_string();
+                self.launch_editor_app(editor, move || {
+                    shelbi_orchestrator::workspace_session::open_in_app(&project, &name, shelbi_app::ReviewRole::Editor.into())
+                        .map(|_| ())
+                        .map_err(|e| e.to_string())
+                });
             }
             WorkspaceAction::OpenApp(role) => {
                 // The app launches off the UI thread; the content view stays.
@@ -6059,6 +6132,8 @@ fn draw_frame<B: ratatui::backend::Backend>(
     let notice = state.notice_text(Instant::now());
     let searching = state.search_input.clone();
     let status = state.status_text();
+    // The floating toast (`Launching Zed…`), painted over the main area.
+    let toast = state.toast.current(Instant::now()).cloned();
     // Take the overlay out so the draw closure can render it with a mutable
     // borrow while it holds shared borrows of the rest of `state`; it is put
     // back right after the draw.
@@ -6287,6 +6362,12 @@ fn draw_frame<B: ratatui::backend::Backend>(
             if overlay.is_none() {
                 cursor = cur;
             }
+        }
+
+        // The toast floats over the main area's top-right corner, under any
+        // overlay. It's only painted: it never takes focus or input.
+        if let Some(t) = toast.as_ref().filter(|_| !is_ack) {
+            render_toast(frame.buffer_mut(), main_rect, t);
         }
 
         // Dim the main area under an open overlay so the modal reads as on top
@@ -6600,6 +6681,67 @@ fn render_search_prompt(buf: &mut ratatui::buffer::Buffer, area: Rect, query: &s
             cell.set_style(style);
         }
     }
+}
+
+/// Paint `toast` as a small box floating in `area`'s top-right corner (the
+/// dialogs' frame, [`crate::overlay::dialog_frame`]): one line of text, red
+/// for an error. Text too long for the area is cut with `…`; an area too
+/// small for a box gets none.
+fn render_toast(buf: &mut ratatui::buffer::Buffer, area: Rect, toast: &shelbi_app::toast::Toast) {
+    use unicode_width::UnicodeWidthStr;
+    // Two cells of margin from the area's right edge, one row from its top.
+    const MARGIN_X: u16 = 2;
+    const MARGIN_Y: u16 = 1;
+    // A cell of padding inside the dialog frame's own, each side.
+    const PAD: u16 = 1;
+    const CHROME: u16 = 2 + 2 * (crate::overlay::DIALOG_PAD_X + PAD);
+    let room = area.width.saturating_sub(2 * MARGIN_X);
+    if room <= CHROME || area.height < 3 + MARGIN_Y {
+        return;
+    }
+    let text_width = (toast.text.width() as u16).min(room - CHROME);
+    let text = truncate_to_width(&toast.text, text_width as usize);
+    let width = text_width + CHROME;
+    let rect = Rect {
+        x: area.right() - MARGIN_X - width,
+        y: area.top() + MARGIN_Y,
+        width,
+        height: 3,
+    };
+    let p = palette();
+    let fg = match toast.tone {
+        shelbi_app::toast::ToastTone::Info => p.foreground,
+        shelbi_app::toast::ToastTone::Error => p.red,
+    };
+    ratatui::widgets::Widget::render(ratatui::widgets::Clear, rect, buf);
+    let content = crate::overlay::dialog_frame(buf, rect, Some(p.dialog), None);
+    buf.set_stringn(
+        content.x + PAD,
+        content.y,
+        &text,
+        text_width as usize,
+        Style::default().fg(fg).bg(p.dialog),
+    );
+}
+
+/// `s` cut to at most `width` columns, ending in `…` when it was cut.
+fn truncate_to_width(s: &str, width: usize) -> String {
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+    if s.width() <= width {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let w = ch.width().unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('\u{2026}');
+    out
 }
 
 fn render_notice(buf: &mut ratatui::buffer::Buffer, area: Rect, text: &str) {
@@ -10096,6 +10238,89 @@ mod tests {
             KeyModifiers::NONE
         };
         st.handle_event(Event::Key(KeyEvent::new(KeyCode::Char(c), mods)));
+    }
+
+    /// Wait (bounded) for an editor launch's failure to reach the toast.
+    fn await_toast_change(st: &mut ShellState) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !st.poll_toast(Instant::now()) {
+            assert!(Instant::now() < deadline, "the launch never reported back");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn edit_in_an_editor_app_floats_a_launching_toast_that_expires() {
+        use shelbi_app::toast::TOAST_LIFETIME;
+        let mut st = test_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let focus_main = st.focus_is_main();
+
+        st.launch_editor_app("Zed".into(), || Ok(()));
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        let row = screen
+            .lines()
+            .position(|l| l.contains("Launching Zed\u{2026}"))
+            .expect("the toast shows at once");
+        // It floats in the main area's top-right corner, boxed.
+        let line = screen.lines().nth(row).unwrap();
+        let main = st.main_rect;
+        assert_eq!(row as u16, main.top() + 2, "one row below the top margin and the border");
+        assert!(line.trim_end().ends_with('\u{2502}'), "boxed: {line:?}");
+        let right = line.trim_end().chars().count() as u16;
+        assert_eq!(right, main.right() - 2, "two cells in from the right edge");
+        // Painted only: focus and overlays are as they were.
+        assert_eq!(st.focus_is_main(), focus_main);
+        assert!(st.overlay.is_none());
+
+        // A success says nothing more; the toast goes after its lifetime.
+        assert!(!st.poll_toast(Instant::now()));
+        assert!(st.poll_toast(Instant::now() + TOAST_LIFETIME));
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(!screen_text(&term).contains("Launching"), "the toast dismissed itself");
+    }
+
+    #[test]
+    fn a_failed_editor_launch_replaces_the_toast_with_its_reason() {
+        let mut st = test_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        // Hold the launch until the launching toast has been seen.
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        st.launch_editor_app("Zed".into(), move || {
+            let _ = go_rx.recv();
+            Err("Unable to find application named 'Zed'".into())
+        });
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("Launching Zed\u{2026}"));
+
+        go_tx.send(()).unwrap();
+        await_toast_change(&mut st);
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(!screen.contains("Launching Zed"), "the error replaces it");
+        assert!(screen.contains("Couldn't launch Zed: Unable to find application named 'Zed'"), "{screen}");
+        let toast = st.toast.current(Instant::now()).expect("the error shows");
+        assert_eq!(toast.tone, shelbi_app::toast::ToastTone::Error);
+    }
+
+    #[test]
+    fn a_long_toast_is_cut_to_the_main_area() {
+        let mut st = test_state();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(70, 20)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        st.toast.show(
+            shelbi_app::toast::Toast::editor_launch_failed("Zed", &"a very long reason ".repeat(10)),
+            Instant::now(),
+        );
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        let line = screen.lines().find(|l| l.contains("Couldn't launch Zed")).expect("drawn");
+        assert!(line.contains('\u{2026}'), "cut with an ellipsis: {line:?}");
+        let main = st.main_rect;
+        let start = line.chars().position(|c| c == '\u{2502}').unwrap() as u16;
+        assert!(start >= main.left(), "stays inside the main area");
     }
 
     fn screen_text(term: &Terminal<ratatui::backend::TestBackend>) -> String {
