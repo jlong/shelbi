@@ -208,6 +208,14 @@ fn a_successor_outlasts_the_drain_serves_and_clears_the_marker() {
         "a healthy successor settles the marker; it says {:?}",
         home.marker_recovery()
     );
+    // The daemon clears the marker first and appends the event after (a clear
+    // that fails must log nothing), so the line can trail the marker under load.
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            home.event_count("session-recovered") >= 1
+        }),
+        "clearing the marker is followed by a session-recovered event"
+    );
     assert_eq!(home.event_count("session-recovered"), 1);
     assert_eq!(home.event_count("session-recovery-gave-up"), 0);
     drop(client);
