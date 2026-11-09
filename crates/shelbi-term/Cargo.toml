@@ -14,6 +14,3 @@ shelbi-proto = { workspace = true }
 # fork under `vendor/alacritty_terminal`). `shelbi-term` drives it headless as
 # the client-side emulator and reads its grid/mode for rendering.
 alacritty_terminal = { workspace = true }
-# Key-input encoder (MIT). Used only for its `input` encode tables; wrapped
-# behind this crate's neutral key types so no termwiz type is in the public API.
-termwiz = { workspace = true }

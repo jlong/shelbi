@@ -116,7 +116,7 @@ sample; each was checked against what the app actually ships:
 | portable-pty | 0.9.0 (MIT) | via `shelbi-session` (the client links it) |
 | Source Code Pro | `assets/fonts/source-code-pro/` (OFL 1.1) | `assets.rs`; its `LICENSE.md` |
 | Symbols Nerd Font Mono | `assets/fonts/nerd-symbols/` (MIT build, glyph sets under their own) | its `LICENSE` and README |
-| termwiz | 0.23.3 (MIT) | via `shelbi-term` |
+| termwiz | 0.23.3 (MIT), ported, not linked | `shelbi-term`'s key encoder ports its rules; the license is vendored at `crates/shelbi-app/licenses/termwiz-LICENSE.md` (`SHARED_PORTED`) |
 | **Rust crates** (added, last) | the other 465 shipped crates | generated, below |
 
 Nothing in the sample was dropped: all 12 ship. The other icon folders

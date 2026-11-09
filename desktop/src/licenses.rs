@@ -235,7 +235,7 @@ mod tests {
         assert!(text("nucleo-matcher").starts_with("Mozilla Public License Version 2.0"));
         assert!(text("option-ext").starts_with("Mozilla Public License Version 2.0"));
         assert!(text("portable-pty").contains("Wez Furlong"));
-        assert!(text("termwiz").contains("Wez Furlong"));
+        assert!(text("termwiz").contains("Copyright (c) 2018 Wez Furlong"));
         assert!(text("Symbols Nerd Font Mono").contains("Ryan L McIntyre"));
         assert!(text("Symbols Nerd Font Mono").contains("Font Awesome"));
     }
@@ -259,6 +259,9 @@ mod tests {
                 c.name,
                 c.version
             );
+        }
+        for name in shared::SHARED_PORTED {
+            assert!(!SHIPPED.iter().any(|c| c.name == *name), "{name} is credited as ported, yet ships");
         }
         // A proc-macro runs in the compiler; it isn't shipped code.
         assert!(!SHIPPED.iter().any(|c| c.name == "serde_derive"));

@@ -105,7 +105,7 @@ impl Table {
 
 /// The crates [`shared_entries`] lists on their own, so a binary's build
 /// script leaves them out of its long tail.
-pub const SHARED_FEATURED: &[&str] = &["alacritty_terminal", "nucleo-matcher", "portable-pty", "termwiz"];
+pub const SHARED_FEATURED: &[&str] = &["alacritty_terminal", "nucleo-matcher", "portable-pty"];
 
 /// The license files [`shared_entries`] shows, `(crate, file)`, for the
 /// build scripts to read.
@@ -113,11 +113,25 @@ pub const SHARED_FILES: &[(&str, &str)] = &[
     ("alacritty_terminal", "LICENSE-APACHE"),
     ("nucleo-matcher", "LICENSE"),
     ("portable-pty", "LICENSE.md"),
-    ("termwiz", "LICENSE.md"),
 ];
 
+/// Crates Shelbi ported code from but no longer links. Their licenses still
+/// apply to the port, so [`shared_entries`] credits each by hand, with its
+/// license text vendored under `crates/shelbi-app/licenses/` (no package
+/// to read it from). A build links none of these: each binary's tests
+/// check, since a linked one belongs in [`SHARED_FEATURED`] instead.
+pub const SHARED_PORTED: &[&str] = &["termwiz"];
+
+/// The termwiz release `shelbi-term`'s key encoder ports
+/// (`crates/shelbi-term/src/input.rs`).
+const TERMWIZ_VERSION: &str = "0.23.3";
+
+/// termwiz's license, as its 0.23.3 package shipped it.
+const TERMWIZ_LICENSE: &str = include_str!("../licenses/termwiz-LICENSE.md");
+
 /// The crate entries both binaries ship: the terminal emulator, the
-/// palette's matcher, the pseudoterminals and the escape-sequence parser.
+/// palette's matcher, the pseudoterminals, and termwiz, whose key-encoding
+/// rules `shelbi-term`'s encoder ports.
 pub fn shared_entries(table: &Table) -> Vec<Entry> {
     let entry = |name, license, attribution: String, description, source, license_title, text| Entry {
         name,
@@ -160,11 +174,11 @@ pub fn shared_entries(table: &Table) -> Vec<Entry> {
         entry(
             "termwiz",
             "MIT",
-            format!("Wez Furlong · Terminal toolkit {}", table.version("termwiz")),
-            "Parses the escape sequences in session output.",
-            "https://github.com/wezterm/wezterm",
+            format!("Wez Furlong · Terminal toolkit {TERMWIZ_VERSION}, ported"),
+            "Shelbi's key encoder is a port of its rules for the bytes each key sends to a session.",
+            "https://github.com/wezterm/wezterm/tree/main/termwiz",
             "MIT License",
-            table.text("termwiz", "LICENSE.md"),
+            TERMWIZ_LICENSE,
         ),
     ]
 }
@@ -470,6 +484,28 @@ mod tests {
         assert_eq!(table.version("crossterm"), "0.28.1");
         assert_eq!(table.version("nothing"), "");
         assert_eq!(table.text("crossterm", "LICENSE"), "MIT text");
+    }
+
+    /// termwiz no longer ships, but the key encoder ports it, so the shared
+    /// list credits it with its MIT text and copyright line, read from the
+    /// vendored file rather than a build's table.
+    #[test]
+    fn the_shared_list_credits_the_ported_termwiz() {
+        let table = Table {
+            crates: &[],
+            notices: "",
+            shipped: &[],
+            crate_text: |_, _| Some(("1.0.0", "text")),
+        };
+        let shared = shared_entries(&table);
+        let termwiz = shared.iter().find(|e| e.name == "termwiz").expect("termwiz is credited");
+        assert_eq!(termwiz.license, "MIT");
+        assert!(termwiz.text.starts_with("MIT License"));
+        assert!(termwiz.text.contains("Copyright (c) 2018 Wez Furlong"));
+        assert!(termwiz.text.contains("Permission is hereby granted, free of charge"));
+        assert!(termwiz.attribution.contains(TERMWIZ_VERSION));
+        assert!(!SHARED_FEATURED.contains(&"termwiz"), "a ported crate isn't a linked one");
+        assert_eq!(SHARED_PORTED, ["termwiz"]);
     }
 
     #[test]
