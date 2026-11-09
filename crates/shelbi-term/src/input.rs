@@ -7,9 +7,16 @@
 //! events onto [`Key`], [`Modifiers`], and [`MouseEvent`], so no crossterm or
 //! gpui type crosses this boundary.
 //!
-//! Key encoding is delegated to termwiz's encoder (the fiddly
-//! application-cursor-key, modify-other-keys, and CSI-u tables), wrapped here
-//! so termwiz types stay internal.
+//! Key encoding is this crate's own table ([`encode_key`]): legacy/xterm
+//! sequences, application cursor keys (DECCKM), newline mode (LNM), and the
+//! CSI-u form of the kitty keyboard protocol. It replaced termwiz's encoder
+//! and is pinned byte-for-byte to it by the golden table in
+//! `tests/fixtures/key_encoding_golden.tsv` (see
+//! `tests/key_encoding_golden.rs`), quirks included: where the two could
+//! disagree, the table is what programs already saw.
+//! termwiz is MIT (Copyright (c) 2018 Wez Furlong), and its license covers
+//! this port: Acknowledgements keeps crediting it as a ported crate
+//! (`shelbi_app::licenses::SHARED_PORTED`).
 //!
 //! ## Kitty keyboard protocol
 //!
@@ -30,7 +37,7 @@
 //! - Shift+wheel and Shift+drag are **always** Shelbi's;
 //! - with no program mouse mode, plain wheel and drag are Shelbi's.
 
-use termwiz::input::{KeyCode, KeyCodeEncodeModes, KeyboardEncoding, Modifiers as TwMods};
+use std::fmt::Write as _;
 
 use crate::viewport::Placement;
 
@@ -57,21 +64,21 @@ impl Modifiers {
     /// Alt only.
     pub const ALT: Modifiers = Modifiers { shift: false, alt: true, ctrl: false, sup: false };
 
-    fn to_termwiz(self) -> TwMods {
-        let mut m = TwMods::NONE;
-        if self.shift {
-            m |= TwMods::SHIFT;
-        }
-        if self.alt {
-            m |= TwMods::ALT;
-        }
-        if self.ctrl {
-            m |= TwMods::CTRL;
-        }
-        if self.sup {
-            m |= TwMods::SUPER;
-        }
-        m
+    fn is_empty(self) -> bool {
+        self == Modifiers::NONE
+    }
+
+    /// Shift, Alt, or Control is held (the modifiers an xterm sequence can
+    /// carry; Super alone leaves a navigation key unmodified).
+    fn any_xterm(self) -> bool {
+        self.shift || self.alt || self.ctrl
+    }
+
+    /// The xterm modifier parameter, `1 + shift + 2*alt + 4*ctrl`. Super is
+    /// deliberately not encoded (xterm's own `+8` for Meta is never sent):
+    /// termwiz never encoded it, and the golden table pins that.
+    fn xterm_param(self) -> u8 {
+        1 + u8::from(self.shift) + 2 * u8::from(self.alt) + 4 * u8::from(self.ctrl)
     }
 }
 
@@ -112,29 +119,6 @@ pub enum Key {
     Function(u8),
 }
 
-impl Key {
-    fn to_termwiz(self) -> KeyCode {
-        match self {
-            Key::Char(c) => KeyCode::Char(c),
-            Key::Enter => KeyCode::Enter,
-            Key::Tab => KeyCode::Tab,
-            Key::Backspace => KeyCode::Backspace,
-            Key::Escape => KeyCode::Escape,
-            Key::Delete => KeyCode::Delete,
-            Key::Insert => KeyCode::Insert,
-            Key::Up => KeyCode::UpArrow,
-            Key::Down => KeyCode::DownArrow,
-            Key::Left => KeyCode::LeftArrow,
-            Key::Right => KeyCode::RightArrow,
-            Key::Home => KeyCode::Home,
-            Key::End => KeyCode::End,
-            Key::PageUp => KeyCode::PageUp,
-            Key::PageDown => KeyCode::PageDown,
-            Key::Function(n) => KeyCode::Function(n),
-        }
-    }
-}
-
 /// The terminal modes that change how a key is encoded. A caller derives these
 /// from the emulator's current mode (see
 /// [`KeyEncoding::from_term_mode`]).
@@ -149,38 +133,205 @@ pub struct KeyEncoding {
     pub newline_mode: bool,
 }
 
-impl KeyEncoding {
-    fn modes(self) -> KeyCodeEncodeModes {
-        KeyCodeEncodeModes {
-            encoding: if self.kitty { KeyboardEncoding::CsiU } else { KeyboardEncoding::Xterm },
-            application_cursor_keys: self.application_cursor_keys,
-            newline_mode: self.newline_mode,
-            modify_other_keys: None,
-        }
-    }
-}
-
 /// Encode a key press into the bytes to write to the PTY.
 ///
-/// Returns an empty vector for a key that has no encoding in the current mode
-/// (e.g. a lone modifier, which callers should not pass here).
+/// Returns an empty vector for a key that has no encoding (a function key
+/// outside F1..=F24).
+///
+/// The rules, in the order they are tried:
+///
+/// - **Normalize.** Shift+a-z becomes A-Z; Shift is then dropped from an
+///   uppercase letter or ASCII punctuation (the character already carries
+///   it). `Char('\x7f')` is Delete and `Char('\x08')` is Backspace.
+/// - **Characters.** Ctrl+letter, Ctrl+uppercase, and (under kitty) Ctrl on a
+///   key that is ambiguous as a C0 byte (`i m [ { @`) become CSI-u
+///   `ESC[{codepoint};{m}u`, falling back to the C0 byte outside kitty.
+///   Otherwise Ctrl maps to its C0 byte, Alt prefixes ESC, and any other
+///   modified character is CSI-u under kitty and the bare character outside it.
+/// - **Enter / Escape / Backspace.** Bare bytes (`\r`, `\r\n` under LNM,
+///   ESC, DEL) with an ESC prefix for Alt; with Shift or Ctrl they are CSI-u
+///   under kitty (Ctrl+Backspace is BS).
+/// - **Tab.** `\t`, Shift+Tab `ESC[Z`, Ctrl+Tab `ESC[9;5u`, Ctrl+Shift+Tab
+///   `ESC[1;5Z`, Alt prefixes ESC; unmodified Tab under kitty is `ESC[9u`.
+/// - **Navigation.** Arrows, Home (`H`), and End (`F`) are `ESC[x` (`ESC O x`
+///   under DECCKM) and `ESC[1;{m}x` when modified; Insert, Delete, PgUp, and
+///   PgDn are `ESC[{2,3,5,6}~` and `ESC[{n};{m}~`.
+/// - **Function keys.** F1-F4 are SS3 `P`-`S` (`ESC[1;{m}P` modified); F5-F24
+///   are `ESC[{n}~` / `ESC[{n};{m}~` with xterm's key numbers.
+///
+/// `m` is the xterm modifier parameter, `1 + shift + 2*alt + 4*ctrl`.
 pub fn encode_key(key: Key, mods: Modifiers, encoding: KeyEncoding) -> Vec<u8> {
     // Under the kitty keyboard protocol, the unmodified Tab *key* is the CSI-u
-    // event `ESC[9u` (9 = HT's codepoint). termwiz encodes plain Tab as a bare
-    // `\t` regardless of the protocol (its Tab arm never consults the encoding),
-    // and a program that enabled the protocol — Claude Code does, pushing
-    // `CSI > 5 u` — reads that bare `\t` as literal tab *text*, not a Tab key
-    // press, so completion (file paths, slash commands) never fires. Emitting
-    // the CSI-u form makes the Tab key register. Modified Tab is left to
-    // termwiz: Shift+Tab stays the legacy backtab `ESC[Z`, which Claude Code
-    // maps to its Shift+Tab mode cycle (the CSI-u `ESC[9;2u` does not drive it).
+    // event `ESC[9u` (9 = HT's codepoint). A bare `\t` there is read as literal
+    // tab *text*, not a Tab key press, by a program that enabled the protocol
+    // (Claude Code does, pushing `CSI > 5 u`), so completion (file paths,
+    // slash commands) would never fire. Modified Tab keeps its legacy forms:
+    // Shift+Tab stays the backtab `ESC[Z`, which Claude Code maps to its
+    // Shift+Tab mode cycle (the CSI-u `ESC[9;2u` does not drive it).
     if encoding.kitty && key == Key::Tab && mods == Modifiers::NONE {
         return b"\x1b[9u".to_vec();
     }
-    key.to_termwiz()
-        .encode(mods.to_termwiz(), encoding.modes(), /* is_down */ true)
-        .unwrap_or_default()
-        .into_bytes()
+
+    // Normalize Shift onto the character, then drop it where the character
+    // already says it (uppercase letters and punctuation).
+    let mut mods = mods;
+    let key = match key {
+        Key::Char(c) => {
+            let c = if mods.shift { c.to_ascii_uppercase() } else { c };
+            if mods.shift && (c.is_ascii_uppercase() || c.is_ascii_punctuation()) {
+                mods.shift = false;
+            }
+            match c {
+                '\x7f' => Key::Delete,
+                '\x08' => Key::Backspace,
+                c => Key::Char(c),
+            }
+        }
+        other => other,
+    };
+
+    let mut buf = String::new();
+    let alt_prefix = |buf: &mut String| {
+        if mods.alt {
+            buf.push('\x1b');
+        }
+    };
+    match key {
+        Key::Char(c) => {
+            let ambiguous = matches!(c, 'i' | 'I' | 'm' | 'M' | '[' | '{' | '@');
+            if mods.ctrl && (c.is_ascii_uppercase() || (ambiguous && encoding.kitty)) {
+                csi_u(&mut buf, c, mods, encoding);
+            } else if let Some(c0) = ctrl_byte(c).filter(|_| mods.ctrl) {
+                alt_prefix(&mut buf);
+                buf.push(c0);
+            } else if mods.alt && (c.is_ascii_alphanumeric() || c.is_ascii_punctuation()) {
+                buf.push('\x1b');
+                buf.push(c);
+            } else if mods.is_empty() {
+                buf.push(c);
+            } else {
+                csi_u(&mut buf, c, mods, encoding);
+            }
+        }
+        Key::Backspace => {
+            // Backspace sends DEL (the default VERASE); BS only with Ctrl.
+            if mods.ctrl {
+                csi_u(&mut buf, '\x08', mods, encoding);
+            } else if mods.shift {
+                csi_u(&mut buf, '\x7f', mods, encoding);
+            } else {
+                alt_prefix(&mut buf);
+                buf.push('\x7f');
+            }
+        }
+        Key::Enter | Key::Escape => {
+            let c = if key == Key::Enter { '\r' } else { '\x1b' };
+            if mods.shift || mods.ctrl {
+                csi_u(&mut buf, c, mods, encoding);
+            } else {
+                alt_prefix(&mut buf);
+                buf.push(c);
+                if key == Key::Enter && encoding.newline_mode {
+                    buf.push('\n');
+                }
+            }
+        }
+        Key::Tab => {
+            alt_prefix(&mut buf);
+            let rest = Modifiers { alt: false, ..mods };
+            buf.push_str(if rest == Modifiers::CTRL {
+                "\x1b[9;5u"
+            } else if rest == (Modifiers { shift: true, ..Modifiers::CTRL }) {
+                "\x1b[1;5Z"
+            } else if rest == Modifiers::SHIFT {
+                "\x1b[Z"
+            } else {
+                "\t"
+            });
+        }
+        Key::Up | Key::Down | Key::Right | Key::Left | Key::Home | Key::End => {
+            let c = match key {
+                Key::Up => 'A',
+                Key::Down => 'B',
+                Key::Right => 'C',
+                Key::Left => 'D',
+                Key::Home => 'H',
+                _ => 'F',
+            };
+            if mods.any_xterm() {
+                let _ = write!(buf, "\x1b[1;{}{c}", mods.xterm_param());
+            } else if encoding.application_cursor_keys {
+                let _ = write!(buf, "\x1bO{c}");
+            } else {
+                let _ = write!(buf, "\x1b[{c}");
+            }
+        }
+        Key::Insert | Key::Delete | Key::PageUp | Key::PageDown => {
+            let n = match key {
+                Key::Insert => 2,
+                Key::Delete => 3,
+                Key::PageUp => 5,
+                _ => 6,
+            };
+            if mods.any_xterm() {
+                let _ = write!(buf, "\x1b[{n};{}~", mods.xterm_param());
+            } else {
+                let _ = write!(buf, "\x1b[{n}~");
+            }
+        }
+        Key::Function(n @ 1..=4) => {
+            let c = char::from(b'P' + (n - 1));
+            if mods.is_empty() {
+                let _ = write!(buf, "\x1bO{c}");
+            } else {
+                let _ = write!(buf, "\x1b[1;{}{c}", mods.xterm_param());
+            }
+        }
+        Key::Function(n @ 5..=24) => {
+            // The VT220-style key numbers, with their gaps (16, 22, 27, 30, 35-41).
+            const CODES: [u8; 20] = [15, 17, 18, 19, 20, 21, 23, 24, 25, 26, 28, 29, 31, 32, 33, 34, 42, 43, 44, 45];
+            let code = CODES[usize::from(n - 5)];
+            if mods.any_xterm() {
+                let _ = write!(buf, "\x1b[{code};{}~", mods.xterm_param());
+            } else {
+                let _ = write!(buf, "\x1b[{code}~");
+            }
+        }
+        Key::Function(_) => {}
+    }
+    buf.into_bytes()
+}
+
+/// A character that carries modifiers the legacy encodings can't express.
+/// Under kitty an ASCII character is the CSI-u event `ESC[{codepoint};{m}u`;
+/// otherwise Ctrl folds to the C0 byte where one exists and Alt prefixes ESC.
+fn csi_u(buf: &mut String, c: char, mods: Modifiers, encoding: KeyEncoding) {
+    if encoding.kitty && c.is_ascii() {
+        let _ = write!(buf, "\x1b[{};{}u", u32::from(c), mods.xterm_param());
+        return;
+    }
+    let c = ctrl_byte(c).filter(|_| mods.ctrl).unwrap_or(c);
+    if mods.alt {
+        buf.push('\x1b');
+    }
+    buf.push(c);
+}
+
+/// The C0 control byte Ctrl+`c` sends on a US layout, where there is one
+/// (including the digit-row aliases `2`-`8` that xterm honors).
+fn ctrl_byte(c: char) -> Option<char> {
+    Some(match c {
+        '@' | '`' | ' ' | '2' => '\x00',
+        'a'..='z' => char::from(c as u8 - b'a' + 1),
+        'A'..='Z' => char::from(c as u8 - b'A' + 1),
+        '[' | '3' | '{' => '\x1b',
+        '\\' | '4' | '|' => '\x1c',
+        ']' | '5' | '}' => '\x1d',
+        '^' | '6' | '~' => '\x1e',
+        '_' | '7' | '/' => '\x1f',
+        '8' | '?' => '\x7f',
+        _ => return None,
+    })
 }
 
 /// Wrap `text` for delivery to the PTY. With `bracketed` set (the program

@@ -121,7 +121,7 @@ mod tests {
         assert!(text("Crossterm").contains("Timon"));
         assert!(text("nucleo-matcher").starts_with("Mozilla Public License Version 2.0"));
         assert!(text("portable-pty").contains("Wez Furlong"));
-        assert!(text("termwiz").contains("Wez Furlong"));
+        assert!(text("termwiz").contains("Copyright (c) 2018 Wez Furlong"));
         let attribution = |name: &str| entries().iter().find(|e| e.name == name).unwrap().attribution.clone();
         assert!(attribution("Ratatui").ends_with(TABLE.version("ratatui")));
         assert!(!TABLE.version("ratatui").is_empty());
@@ -141,6 +141,9 @@ mod tests {
         for c in SHIPPED {
             let own = c.name.starts_with("shelbi");
             assert_eq!(CRATES.contains(c), !own && !featured.contains(&c.name), "{} {}", c.name, c.version);
+        }
+        for name in shelbi_app::licenses::SHARED_PORTED {
+            assert!(!SHIPPED.iter().any(|c| c.name == *name), "{name} is credited as ported, yet ships");
         }
         assert!(SHIPPED.iter().any(|c| c.name == "inquire"), "the CLI's crates ship too");
         assert!(SHIPPED.iter().any(|c| c.name == "shelbi-tui"));

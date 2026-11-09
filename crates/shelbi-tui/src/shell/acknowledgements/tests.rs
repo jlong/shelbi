@@ -217,12 +217,19 @@ fn nothing_matching_empties_the_detail_and_tab_skips_view_source() {
     assert_eq!(v.focus(), Focus::List);
 }
 
+/// A screen height whose list shows every entry but the last, so it scrolls
+/// by exactly one: the list starts under the three-row header, the three-row
+/// search box, and one padding row, at three rows an entry. Derived from the
+/// entry count so dropping a bundled crate doesn't make the list fit.
+fn overflowing_height() -> u16 {
+    7 + 3 * (crate::licenses::entries().len() as u16 - 1)
+}
+
 #[test]
 fn the_arrows_move_the_selection_and_the_list_follows_it() {
-    // Short enough that the list (three rows an entry) scrolls.
-    const H: u16 = 26;
+    let h = overflowing_height();
     let mut v = view();
-    draw(&mut v, 100, H);
+    draw(&mut v, 100, h);
     v.handle_key(key(KeyCode::Down));
     v.handle_key(key(KeyCode::Char('j')));
     assert_eq!(v.browser().selected(), Some(2));
@@ -231,14 +238,14 @@ fn the_arrows_move_the_selection_and_the_list_follows_it() {
     v.handle_key(key(KeyCode::End));
     let last = crate::licenses::entries().len() - 1;
     assert_eq!(v.browser().selected(), Some(last));
-    let (buf, _) = draw(&mut v, 100, H);
+    let (buf, _) = draw(&mut v, 100, h);
     let (x, y) = find_row(&buf, "Rust crates").expect("the list scrolled to the last row");
     assert_eq!(buf[(x, y)].bg, palette().selection);
     assert!(!text(&buf).contains("Alacritty Terminal"), "scrolled off the top");
     assert!(text(&buf).contains("Licenses and notices"));
     v.handle_key(key(KeyCode::Home));
     assert_eq!(v.browser().selected(), Some(0));
-    let (buf, _) = draw(&mut v, 100, H);
+    let (buf, _) = draw(&mut v, 100, h);
     assert!(text(&buf).contains("Alacritty Terminal"), "and back");
 }
 
@@ -327,16 +334,15 @@ fn view_source_and_done_answer_the_keyboard() {
 
 #[test]
 fn the_license_scrolls_with_the_keys_and_the_wheel_and_stops_at_its_end() {
-    // Short enough that the list (three rows an entry) scrolls.
-    const H: u16 = 26;
-    let area = Rect::new(0, 0, 100, H);
+    let h = overflowing_height();
+    let area = Rect::new(0, 0, 100, h);
     let mut v = view();
-    let (buf, _) = draw(&mut v, 100, H);
+    let (buf, _) = draw(&mut v, 100, h);
     let (_, title_y) = find(&buf, "Apache License 2.0").unwrap();
     v.handle_key(key(KeyCode::PageDown));
     let page = v.scroll();
     assert!(page > 5, "a page: {page}");
-    let (buf, _) = draw(&mut v, 100, H);
+    let (buf, _) = draw(&mut v, 100, h);
     assert!(!text(&buf).contains("Apache License 2.0"), "the license's name scrolled off");
     assert!(text(&buf).contains("Alacritty Terminal"), "the header stays");
     v.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
@@ -348,9 +354,9 @@ fn the_license_scrolls_with_the_keys_and_the_wheel_and_stops_at_its_end() {
     // The wheel over the detail scrolls it; over the list, the list.
     v.handle_mouse(mouse(MouseEventKind::ScrollDown, 60, title_y), area);
     assert_eq!(v.scroll(), 3);
-    v.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 20), area);
+    v.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, h - 2), area);
     assert_eq!(v.scroll(), 3, "the list's wheel leaves the license");
-    let (buf, _) = draw(&mut v, 100, H);
+    let (buf, _) = draw(&mut v, 100, h);
     assert!(find_row(&buf, "Alacritty Terminal").is_none(), "the list scrolled a row");
     assert!(text(&buf).contains("Rust crates"));
     // To the end, and no further: the last line at the bottom.
@@ -360,7 +366,7 @@ fn the_license_scrolls_with_the_keys_and_the_wheel_and_stops_at_its_end() {
     let end = v.scroll();
     v.handle_key(key(KeyCode::PageDown));
     assert_eq!(v.scroll(), end);
-    let (buf, _) = draw(&mut v, 100, H);
+    let (buf, _) = draw(&mut v, 100, h);
     let screen = text(&buf);
     let last = screen.lines().last().unwrap();
     assert!(last.contains("limitations under the License."), "{screen}");
