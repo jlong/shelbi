@@ -56,11 +56,11 @@ similar = { version = "2", features = ["text"] }
 # grammar bundle (TypeScript, TOML, Swift, Zig, ...), which syntect's own lacks.
 syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
-ratatui = "0.28"
-crossterm = "0.28"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "underline-color", "layout-cache"] }
+crossterm = "0.29"
 nucleo-matcher = "0.3"
-inquire = "0.7"
-unicode-width = "0.1"
+inquire = { version = "0.9", default-features = false, features = ["crossterm"] }
+unicode-width = "0.2"
 libc = "0.2"
 regex = "1"
 tungstenite = "0.29"

@@ -6058,7 +6058,12 @@ fn draw(
 fn draw_frame<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     state: &mut ShellState,
-) -> Result<()> {
+) -> Result<()>
+where
+    // ratatui 0.30 gives each backend its own error type (io::Error for
+    // crossterm, Infallible for `TestBackend`); anyhow needs it thread-safe.
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     // Ctrl+L / resize / focus regained: clear the screen and forget the last
     // frame, so every cell is painted again (stray text over the frame is
     // wiped, not just the cells ratatui thinks changed).
