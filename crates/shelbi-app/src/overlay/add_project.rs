@@ -1,22 +1,28 @@
-//! The TUI's new-project flow: three pages in one dialog, in the desktop
-//! wizard's order ([`crate::add_project_wizard`]) with its copy:
+//! The TUI's new-project flow: the steps every front end shares
+//! ([`crate::new_project::Step`]), as pages of one dialog, with the desktop
+//! wizard's copy ([`crate::add_project_wizard`]):
 //!
 //! 1. **Folder** ("Add a project"): the project's **name** and **repo path**,
-//!    with the "Detected:" line and the derived id.
-//! 2. **Agent defaults**: the runner and model the project's agents use by
-//!    default, on the shared [`HarnessPicker`] (the orchestrator onboarding's
-//!    pickers).
-//! 3. **Settings** ("Where should settings live?"): the **config location**
-//!    (in the project vs outside it).
+//!    with the "Detected:" line and the derived id. Continue asks the host to
+//!    check the folder ([`Step::Validate`]: it runs
+//!    `shelbi_orchestrator::project_create::check_folder`, the shared
+//!    detection, and answers with [`Form::folder_checked`]). When the check
+//!    offers to initialize Git or to pick up a committed config, the page
+//!    shows the offer (on, as every front end defaults it) and the next
+//!    Continue takes it; a pick-up creates the project from there
+//!    ([`Step::Submit`]).
+//! 2. **Agent defaults**: the runner (the detected install preselected) and
+//!    model, on the shared [`HarnessPicker`].
+//! 3. **Issues** ("Where should issues live?"): GitHub Issues (preselected
+//!    for a GitHub origin) or the file system ([`IssuesChoice`]). A GitHub
+//!    repo has to pass the `gh` preflight first ([`Step::Preflight`]).
+//! 4. **Settings** ("Where should settings live?"): the **config location**,
+//!    the folder's recommendation preselected.
 //!
 //! Each page has Back and its primary button (Continue, then Create Project)
-//! under a "Step N of 3" line. Continue on page 1 asks the host to validate
-//! the name and path ([`Step::Validate`]; the host runs
-//! `shelbi_orchestrator::project_create::validate_add_project` and answers
-//! with [`Form::folder_valid`] or [`Form::set_error`]); Create Project hands
-//! back [`Step::Submit`] and the host scaffolds the project through the same
-//! engine `shelbi init` uses, with [`Form::defaults`]. The form never touches
-//! the filesystem itself.
+//! under a "Step N of 4" line. Create Project hands back [`Step::Submit`] and
+//! the host creates [`Form::plan`] through the one engine every front end
+//! uses. The form never touches the filesystem itself.
 //!
 //! The "Detected:" line reports whether the repo path is a git repo. Checking
 //! means running git, so the form only says *when* a check is due
@@ -26,6 +32,8 @@
 use std::path::{Path, PathBuf};
 
 use shelbi_core::{AgentDefaults, ConfigMode, RunnerKind};
+
+use crate::new_project::{FolderCheck, IssuesChoice, NewProject, Problem, Tracker};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 use shelbi_state::orchestrator_setup::RunnerSetupError;
 
@@ -46,28 +54,32 @@ pub const CREATE: &str = "Create Project";
 pub enum Page {
     Folder,
     Defaults,
+    Issues,
     Settings,
 }
 
 impl Page {
-    /// The footer's "Step N of 3".
-    pub fn step(self) -> usize {
+    /// The shared step this page is.
+    pub fn step(self) -> crate::new_project::Step {
+        use crate::new_project::Step as S;
         match self {
-            Page::Folder => 1,
-            Page::Defaults => 2,
-            Page::Settings => 3,
+            Page::Folder => S::Folder,
+            Page::Defaults => S::Agents,
+            Page::Issues => S::Issues,
+            Page::Settings => S::Settings,
         }
     }
 
-    /// "Step 2 of 3".
+    /// "Step 2 of 4".
     pub fn step_label(self) -> String {
-        format!("Step {} of {}", self.step(), wiz::STEPS)
+        self.step().label()
     }
 
     pub fn title(self) -> &'static str {
         match self {
             Page::Folder => TITLE,
             Page::Defaults => wiz::DEFAULTS_TITLE,
+            Page::Issues => crate::new_project::ISSUES_TITLE,
             Page::Settings => wiz::SETTINGS_TITLE,
         }
     }
@@ -77,6 +89,7 @@ impl Page {
         match self {
             Page::Folder => None,
             Page::Defaults => Some(wiz::DEFAULTS_INTRO),
+            Page::Issues => Some(crate::new_project::ISSUES_INTRO),
             Page::Settings => Some(wiz::SETTINGS_INTRO),
         }
     }
@@ -84,7 +97,7 @@ impl Page {
     /// The primary button's label.
     pub fn primary(self) -> &'static str {
         match self {
-            Page::Folder | Page::Defaults => CONTINUE,
+            Page::Folder | Page::Defaults | Page::Issues => CONTINUE,
             Page::Settings => CREATE,
         }
     }
@@ -96,6 +109,13 @@ pub enum Field {
     /// Page 1's text fields.
     Name,
     Root,
+    /// Page 1's offers, once the check makes them: initialize Git, pick up
+    /// the committed config.
+    GitInit,
+    PickUp,
+    /// Page 3's board choice, and its GitHub repo field.
+    Tracker,
+    Repo,
     /// Page 2's pickers.
     Harness,
     Model,
@@ -107,16 +127,21 @@ pub enum Field {
 }
 
 /// What one key or click resolved to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Step {
     /// Keep editing.
     Continue,
-    /// Page 1's Continue: validate the name and path, then answer with
-    /// [`Form::folder_valid`] or [`Form::set_error`].
+    /// Page 1's Continue: check the folder and answer with
+    /// [`Form::folder_checked`]; when that returns `Validate` again, validate
+    /// the name and path and answer with [`Form::folder_valid`] or
+    /// [`Form::set_error`].
     Validate,
-    /// Create Project: read [`Form::name`] / [`Form::root`] /
-    /// [`Form::mode`] / [`Form::defaults`].
+    /// Create [`Form::plan`]'s project.
     Submit,
+    /// Page 3's Continue on GitHub: run the `gh` preflight for this repo,
+    /// then answer with [`Form::preflight_passed`] or
+    /// [`Form::preflight_failed`].
+    Preflight(String),
     Cancel,
     /// Open (or close) a picker's menu ([`Field::Harness`] /
     /// [`Field::Model`]); its choice goes to [`Form::select_runner`] /
@@ -138,9 +163,7 @@ impl Detected {
         match self {
             Detected::NotFound => "Detected: path not found",
             Detected::GitRepo => "Detected: git repo ✓",
-            Detected::NotGitRepo => {
-                "Detected: not a git repo (shelbi expects git, but will continue)"
-            }
+            Detected::NotGitRepo => "Detected: not a git repo (Continue offers to initialize one)",
         }
     }
 
@@ -165,12 +188,27 @@ pub struct Form {
     cwd: PathBuf,
     /// The latest detection, and the root text it was computed for.
     detected: Option<(String, Detected)>,
+    /// The folder check page 1's Continue ran: the defaults the later steps
+    /// start on, and the offers it makes.
+    check: Option<FolderCheck>,
+    /// The folder whose offers page 1 has shown (the next Continue takes
+    /// them).
+    offered: Option<PathBuf>,
+    /// Page 1's offers.
+    git_init: bool,
+    pick_up: bool,
+    /// Page 3's choice.
+    issues: IssuesChoice,
+    /// The steps the user changed, which a new folder's defaults leave alone.
+    chose_runner: bool,
+    chose_issues: bool,
+    chose_mode: bool,
 }
 
 impl Form {
     /// Seed the form: the repo path prefills to `cwd` (the default `shelbi
-    /// init` offers), the agents default to Claude Code on its default
-    /// model, and the config location to global.
+    /// init` offers). The later steps start on Claude Code, the file system
+    /// and global until the folder check brings the folder's defaults.
     pub fn new(cwd: &Path) -> Self {
         Self {
             page: Page::Folder,
@@ -182,6 +220,14 @@ impl Form {
             error: None,
             cwd: cwd.to_path_buf(),
             detected: None,
+            check: None,
+            offered: None,
+            git_init: true,
+            pick_up: true,
+            issues: IssuesChoice::default(),
+            chose_runner: false,
+            chose_issues: false,
+            chose_mode: false,
         }
     }
 
@@ -226,7 +272,10 @@ impl Form {
     }
 
     pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+        match self.page {
+            Page::Issues => self.error.as_deref().or(self.issues.error()),
+            _ => self.error.as_deref(),
+        }
     }
 
     /// The name or path didn't validate (page 1's Continue, or Create
@@ -246,6 +295,123 @@ impl Form {
             self.focus = Field::Harness;
             self.error = None;
         }
+    }
+
+    /// The folder check page 1's Continue asked for landed. A folder that
+    /// can't be added shows why. A new folder brings its defaults to every
+    /// step the user hasn't changed (the detected runner, the recommended
+    /// board and settings location) and its offers (initialize Git, pick up
+    /// a committed config, both on), which page 1 shows before the next
+    /// Continue takes them. Returns what's next: [`Step::Continue`] (stay on
+    /// page 1), [`Step::Submit`] (pick the committed config up), or
+    /// [`Step::Validate`] (the host validates the name and path).
+    pub fn folder_checked(&mut self, check: FolderCheck) -> Step {
+        if self.page != Page::Folder {
+            return Step::Continue;
+        }
+        if let Some(Problem::Empty | Problem::NotFound | Problem::NotDirectory | Problem::Unreadable(_)) = &check.problem {
+            self.error = Some(check.message());
+            return Step::Continue;
+        }
+        let new_folder = self.check.as_ref().map(|c| &c.path) != Some(&check.path);
+        if new_folder {
+            let facts = &check.facts;
+            if !self.chose_runner {
+                self.picker = HarnessPicker::new(facts.recommended_runner(), None);
+            }
+            if !self.chose_issues {
+                self.issues = facts.recommended_issues();
+            }
+            if !self.chose_mode {
+                self.mode = facts.recommended_mode;
+            }
+            self.git_init = true;
+            self.pick_up = true;
+        }
+        let offers = check.facts.pick_up.is_some() || check.offers_git_init();
+        let shown = self.offered.as_ref() == Some(&check.path);
+        let picking_up = self.pick_up && check.facts.pick_up.is_some();
+        self.check = Some(check);
+        if offers && !shown {
+            self.offered = self.check.as_ref().map(|c| c.path.clone());
+            self.error = None;
+            self.settle();
+            self.focus = self.fields()[0];
+            if let Some(f) = self.fields().into_iter().find(|f| matches!(f, Field::PickUp | Field::GitInit)) {
+                self.focus = f;
+            }
+            return Step::Continue;
+        }
+        if picking_up {
+            Step::Submit
+        } else {
+            Step::Validate
+        }
+    }
+
+    /// The folder check page 1 last ran.
+    pub fn check(&self) -> Option<&FolderCheck> {
+        self.check.as_ref()
+    }
+
+    /// Page 1's offers as shown: (initialize Git, pick up), each `Some(on)`
+    /// while page 1 offers it for the folder in the path field.
+    pub fn offers(&self) -> (Option<bool>, Option<bool>) {
+        let Some(check) = self.check.as_ref().filter(|c| self.offered.as_ref() == Some(&c.path)) else {
+            return (None, None);
+        };
+        if self.detection_due().is_some() || check.path != absolute(&self.cwd, &self.root) {
+            return (None, None);
+        }
+        let pick_up = check.facts.pick_up.is_some().then_some(self.pick_up);
+        // A pick-up takes the committed config as it is.
+        let git_init = (check.offers_git_init() && !(self.pick_up && pick_up.is_some())).then_some(self.git_init);
+        (git_init, pick_up)
+    }
+
+    /// Page 3's choice.
+    pub fn issues(&self) -> &IssuesChoice {
+        &self.issues
+    }
+
+    /// Choose the board (page 3's rows).
+    pub fn select_tracker(&mut self, tracker: Tracker) {
+        if self.page == Page::Issues {
+            self.issues.select(tracker);
+            self.chose_issues = true;
+            self.focus = Field::Tracker;
+            self.error = None;
+        }
+    }
+
+    /// The GitHub repo passed the preflight: on to the settings.
+    pub fn preflight_passed(&mut self, repo: &str) {
+        self.issues.preflight_passed(repo);
+        if self.page == Page::Issues && self.issues.ready() {
+            self.page = Page::Settings;
+            self.focus = Field::Config;
+        }
+    }
+
+    /// The GitHub repo failed the preflight with `message` (the fix to show).
+    pub fn preflight_failed(&mut self, repo: &str, message: impl Into<String>) {
+        self.issues.preflight_failed(repo, message);
+    }
+
+    /// The answers [`Step::Submit`] creates: the checked folder with every
+    /// step's choice, `None` before page 1's check.
+    pub fn plan(&self) -> Option<NewProject> {
+        let check = self.check.as_ref()?;
+        let mut plan = NewProject::detected(check);
+        if !self.name.trim().is_empty() {
+            plan.name = self.name.trim().to_string();
+        }
+        plan.pick_up = self.pick_up && check.facts.pick_up.is_some();
+        plan.git_init = self.git_init && check.offers_git_init();
+        plan.defaults = self.picker.defaults();
+        plan.issue_tracker = self.issues.config();
+        plan.mode = self.mode;
+        Some(plan)
     }
 
     /// The latest detection, possibly for an earlier root text while a new
@@ -274,7 +440,19 @@ impl Form {
     /// The controls the page shows, in Tab order.
     pub fn fields(&self) -> Vec<Field> {
         let mut out = match self.page {
-            Page::Folder => vec![Field::Name, Field::Root],
+            Page::Folder => {
+                let mut f = vec![Field::Name, Field::Root];
+                let (git_init, pick_up) = self.offers();
+                if pick_up.is_some() {
+                    f.push(Field::PickUp);
+                }
+                if git_init.is_some() {
+                    f.push(Field::GitInit);
+                }
+                f
+            }
+            Page::Issues if self.issues.tracker() == Tracker::Github => vec![Field::Tracker, Field::Repo],
+            Page::Issues => vec![Field::Tracker],
             Page::Defaults if self.picker.takes_model() => vec![Field::Harness, Field::Model],
             Page::Defaults => vec![Field::Harness],
             Page::Settings => vec![Field::Config],
@@ -304,6 +482,7 @@ impl Form {
     /// Choose the default runner. Its model starts on the runner's default.
     pub fn select_runner(&mut self, kind: RunnerKind) {
         if self.page == Page::Defaults {
+            self.chose_runner = true;
             self.picker.set_runner(kind, None);
             self.error = None;
             self.settle();
@@ -351,14 +530,16 @@ impl Form {
         match self.page {
             Page::Folder => return Step::Cancel,
             Page::Defaults => self.page = Page::Folder,
-            Page::Settings => self.page = Page::Defaults,
+            Page::Issues => self.page = Page::Defaults,
+            Page::Settings => self.page = Page::Issues,
         }
         self.focus = Field::Primary;
         Step::Continue
     }
 
-    /// The page's primary button: Continue (page 1 asks the host to
-    /// validate first), then Create Project. A generic default runner is
+    /// The page's primary button: Continue (page 1 asks the host to check
+    /// the folder first, and a GitHub board its preflight), then Create
+    /// Project. A generic default runner is
     /// refused: a new project declares none (the orchestrator onboarding's
     /// refusal).
     pub fn primary(&mut self) -> Step {
@@ -370,9 +551,20 @@ impl Form {
                     return Step::Continue;
                 }
                 self.error = None;
-                self.page = Page::Settings;
-                self.focus = Field::Config;
+                self.page = Page::Issues;
+                self.focus = Field::Tracker;
                 Step::Continue
+            }
+            Page::Issues => {
+                if self.issues.ready() {
+                    self.page = Page::Settings;
+                    self.focus = Field::Config;
+                    return Step::Continue;
+                }
+                match self.issues.preflight_due() {
+                    Some(repo) => Step::Preflight(repo),
+                    None => Step::Continue,
+                }
             }
             Page::Settings => Step::Submit,
         }
@@ -408,7 +600,22 @@ impl Form {
                     Step::Continue
                 }
                 Field::Config => {
-                    toggle_config(&mut self.mode, &mut self.error, chord);
+                    if toggle_config(&mut self.mode, &mut self.error, chord) {
+                        self.chose_mode = true;
+                    }
+                    Step::Continue
+                }
+                Field::GitInit | Field::PickUp | Field::Tracker => match chord.code {
+                    Key::Char(' ') | Key::Left | Key::Right | Key::Up | Key::Down if bare => {
+                        self.toggle(self.focus);
+                        Step::Continue
+                    }
+                    _ => Step::Continue,
+                },
+                Field::Repo => {
+                    let mut repo = self.issues.repo().to_string();
+                    edit_text(&mut repo, &mut self.error, chord);
+                    self.issues.set_repo(repo);
                     Step::Continue
                 }
                 Field::Harness | Field::Model => match chord.code {
@@ -460,20 +667,49 @@ impl Form {
             Field::Config => {
                 if refocus {
                     self.mode = flip(self.mode);
+                    self.chose_mode = true;
                 }
                 self.error = None;
                 Step::Continue
             }
-            Field::Name | Field::Root => {
+            Field::GitInit | Field::PickUp => {
+                self.toggle(field);
+                Step::Continue
+            }
+            Field::Tracker => {
+                if refocus {
+                    self.toggle(field);
+                }
+                Step::Continue
+            }
+            Field::Name | Field::Root | Field::Repo => {
                 self.error = None;
                 Step::Continue
             }
         }
     }
 
-    /// Pick where settings live (page 3's rows).
+    /// Flip a toggle: page 1's offers, page 3's board.
+    fn toggle(&mut self, field: Field) {
+        match field {
+            Field::GitInit => self.git_init = !self.git_init,
+            Field::PickUp => {
+                self.pick_up = !self.pick_up;
+                self.settle();
+            }
+            Field::Tracker => {
+                self.issues.toggle();
+                self.chose_issues = true;
+            }
+            _ => return,
+        }
+        self.error = None;
+    }
+
+    /// Pick where settings live (page 4's rows).
     pub fn select_mode(&mut self, mode: ConfigMode) {
         if self.page == Page::Settings {
+            self.chose_mode = true;
             self.mode = mode;
             self.focus = Field::Config;
         }
@@ -507,14 +743,37 @@ fn edit_text(buf: &mut String, error: &mut Option<String>, chord: KeyChord) {
     }
 }
 
-fn toggle_config(mode: &mut ConfigMode, error: &mut Option<String>, chord: KeyChord) {
+/// Flip the location on Space or an arrow: `true` when it flipped.
+fn toggle_config(mode: &mut ConfigMode, error: &mut Option<String>, chord: KeyChord) -> bool {
     if matches!(
         chord.code,
         Key::Left | Key::Right | Key::Up | Key::Down | Key::Char(' ')
     ) {
         *mode = flip(*mode);
         *error = None;
+        return true;
     }
+    false
+}
+
+/// The path field's text as the check resolves it.
+fn absolute(cwd: &Path, root: &str) -> PathBuf {
+    let raw = root.trim();
+    let expanded = match raw.strip_prefix("~/") {
+        Some(rest) => dirs_home().map(|h| h.join(rest)),
+        None if raw == "~" => dirs_home(),
+        None => None,
+    }
+    .unwrap_or_else(|| PathBuf::from(raw));
+    if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    }
+}
+
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 fn flip(mode: ConfigMode) -> ConfigMode {
@@ -533,6 +792,21 @@ mod tests {
         Form::new(Path::new("/tmp/alpha"))
     }
 
+    /// The host's folder check for `path`: a git repo with `facts`.
+    fn checked(path: &str, repo: crate::new_project::Repo, facts: crate::new_project::Facts) -> FolderCheck {
+        let path = PathBuf::from(path);
+        FolderCheck {
+            in_repo_dir: path.join(".shelbi"),
+            name: crate::new_project::folder_name(&path),
+            slug: crate::new_project::folder_name(&path),
+            path,
+            repo: Some(repo),
+            problem: None,
+            global_dir: None,
+            facts,
+        }
+    }
+
     /// `f` past page 1, its name and path validated.
     fn on_defaults() -> Form {
         let mut f = form();
@@ -541,6 +815,8 @@ mod tests {
         }
         assert_eq!(f.handle_key(key(Key::Enter)), Step::Validate);
         assert_eq!(f.page(), Page::Folder, "it waits for the host");
+        let check = checked("/tmp/alpha", crate::new_project::Repo::Git, Default::default());
+        assert_eq!(f.folder_checked(check), Step::Validate, "no offers: the host validates");
         f.folder_valid();
         f
     }
@@ -549,7 +825,7 @@ mod tests {
     fn new_prefills_the_root_and_defaults_to_claude_and_global() {
         let f = form();
         assert_eq!(f.page(), Page::Folder);
-        assert_eq!(f.page().step_label(), "Step 1 of 3");
+        assert_eq!(f.page().step_label(), "Step 1 of 4");
         assert_eq!(f.name(), "");
         assert_eq!(f.root(), "/tmp/alpha");
         assert_eq!(f.mode(), ConfigMode::Global);
@@ -559,18 +835,23 @@ mod tests {
     }
 
     #[test]
-    fn the_pages_are_folder_then_agent_defaults_then_settings() {
+    fn the_pages_are_folder_then_agent_defaults_then_issues_then_settings() {
         let mut f = on_defaults();
         assert_eq!(f.page(), Page::Defaults);
         assert_eq!(f.page().title(), "Agent defaults");
         assert_eq!(f.page().intro(), Some("Choose the provider and model that agents should use by default."));
-        assert_eq!(f.page().step_label(), "Step 2 of 3");
+        assert_eq!(f.page().step_label(), "Step 2 of 4");
         assert_eq!(f.focus(), Field::Harness);
         assert_eq!(f.fields(), [Field::Harness, Field::Model, Field::Back, Field::Primary]);
         assert_eq!(f.handle_key(key(Key::Enter)), Step::Continue);
+        assert_eq!(f.page(), Page::Issues);
+        assert_eq!(f.page().title(), "Where should issues live?");
+        assert_eq!(f.page().step_label(), "Step 3 of 4");
+        assert_eq!(f.fields(), [Field::Tracker, Field::Back, Field::Primary], "no GitHub origin: the file system");
+        assert_eq!(f.handle_key(key(Key::Enter)), Step::Continue);
         assert_eq!(f.page(), Page::Settings);
         assert_eq!(f.page().title(), "Where should settings live?");
-        assert_eq!(f.page().step_label(), "Step 3 of 3");
+        assert_eq!(f.page().step_label(), "Step 4 of 4");
         assert_eq!(f.page().primary(), "Create Project");
         assert_eq!(f.handle_key(key(Key::Enter)), Step::Submit);
     }
@@ -582,7 +863,10 @@ mod tests {
         f.select_runner(RunnerKind::Codex);
         f.select_model(Some("gpt-5"));
         f.primary();
+        f.primary();
         f.select_mode(ConfigMode::InRepo);
+        assert_eq!(f.back(), Step::Continue);
+        assert_eq!(f.page(), Page::Issues);
         assert_eq!(f.back(), Step::Continue);
         assert_eq!(f.page(), Page::Defaults);
         assert_eq!(f.click(Field::Back), Step::Continue);
@@ -592,6 +876,14 @@ mod tests {
         f.folder_valid();
         assert_eq!(f.defaults(), AgentDefaults { runner: RunnerKind::Codex, model: Some("gpt-5".into()) });
         f.primary();
+        assert_eq!(f.mode(), ConfigMode::InRepo);
+        // The same folder checked again keeps every choice.
+        f.back();
+        f.back();
+        f.back();
+        let check = checked("/tmp/alpha", crate::new_project::Repo::Git, Default::default());
+        assert_eq!(f.folder_checked(check), Step::Validate);
+        assert_eq!(f.defaults().runner, RunnerKind::Codex);
         assert_eq!(f.mode(), ConfigMode::InRepo);
     }
 
@@ -672,6 +964,7 @@ mod tests {
     fn config_toggles_and_never_types() {
         let mut f = on_defaults();
         f.primary();
+        f.primary();
         assert_eq!(f.focus(), Field::Config);
         f.handle_key(ch(' '));
         assert_eq!(f.mode(), ConfigMode::InRepo);
@@ -718,8 +1011,99 @@ mod tests {
         assert_eq!(path, "~/.shelbi/projects/web-app.yaml");
         f.folder_valid();
         f.primary();
+        f.primary();
         f.click(Field::Config);
         assert_eq!(f.mode(), ConfigMode::InRepo, "a click on the focused location flips it");
         assert_eq!(f.preview().unwrap().1, "<repo>/.shelbi/project.yaml");
+    }
+
+    #[test]
+    fn a_folders_defaults_seed_the_later_steps() {
+        use crate::new_project::{Facts, Repo};
+        let mut f = form();
+        f.handle_key(ch('a'));
+        f.handle_key(key(Key::Enter));
+        let facts = Facts {
+            default_branch: "trunk".into(),
+            remote: Some("git@github.com:acme/app.git".into()),
+            github_repo: Some("acme/app".into()),
+            recommended_mode: ConfigMode::InRepo,
+            mode_reason: "origin remote + 2 committers".into(),
+            runners: vec![RunnerKind::Codex],
+            ..Facts::default()
+        };
+        assert_eq!(f.folder_checked(checked("/tmp/alpha", Repo::Git, facts)), Step::Validate);
+        f.folder_valid();
+        assert_eq!(f.defaults().runner, RunnerKind::Codex, "the detected install");
+        f.primary();
+        assert_eq!(f.issues().tracker(), Tracker::Github, "a GitHub origin");
+        assert_eq!(f.fields(), [Field::Tracker, Field::Repo, Field::Back, Field::Primary]);
+        assert_eq!(f.handle_key(key(Key::Enter)), Step::Preflight("acme/app".into()));
+        assert_eq!(f.page(), Page::Issues, "it waits for the preflight");
+        f.preflight_failed("acme/app", "gh is not signed in");
+        assert_eq!(f.error(), Some("gh is not signed in"));
+        assert_eq!(f.handle_key(key(Key::Enter)), Step::Preflight("acme/app".into()), "Continue retries");
+        f.preflight_passed("acme/app");
+        assert_eq!(f.page(), Page::Settings);
+        assert_eq!(f.mode(), ConfigMode::InRepo, "the recommendation");
+        let plan = f.plan().unwrap();
+        assert_eq!(plan.default_branch, "trunk");
+        assert_eq!(plan.remote.as_deref(), Some("git@github.com:acme/app.git"));
+        assert_eq!(plan.issue_tracker.github.unwrap().repo, "acme/app");
+        assert_eq!(plan.name, "a");
+        assert_eq!(plan.mode, ConfigMode::InRepo);
+    }
+
+    #[test]
+    fn page_one_shows_the_offers_before_continuing() {
+        use crate::new_project::{Facts, PickUp, Repo};
+        // Not a repo: offer to initialize one, on.
+        let mut f = form();
+        f.set_detected("/tmp/alpha", Detected::NotGitRepo);
+        f.handle_key(ch('a'));
+        assert_eq!(f.handle_key(key(Key::Enter)), Step::Validate);
+        let plain = checked("/tmp/alpha", Repo::NotGit, Facts::default());
+        assert_eq!(f.folder_checked(plain.clone()), Step::Continue, "the offer shows first");
+        assert_eq!(f.offers(), (Some(true), None));
+        assert_eq!(f.focus(), Field::GitInit);
+        f.handle_key(ch(' '));
+        assert_eq!(f.offers(), (Some(false), None), "Space turns it off");
+        f.handle_key(ch(' '));
+        assert_eq!(f.handle_key(key(Key::Enter)), Step::Validate);
+        assert_eq!(f.folder_checked(plain), Step::Validate, "the next Continue takes it");
+        f.folder_valid();
+        assert!(f.plan().unwrap().git_init);
+
+        // A committed config: offer to pick it up, which creates from page 1.
+        let mut f = form();
+        f.set_detected("/tmp/alpha", Detected::GitRepo);
+        let facts = Facts {
+            pick_up: Some(PickUp { name: "team".into(), config: "/tmp/alpha/.shelbi/project.yaml".into() }),
+            ..Facts::default()
+        };
+        let clone = checked("/tmp/alpha", Repo::Git, facts);
+        assert_eq!(f.handle_key(key(Key::Enter)), Step::Validate);
+        assert_eq!(f.folder_checked(clone.clone()), Step::Continue);
+        assert_eq!(f.offers(), (None, Some(true)));
+        assert_eq!(f.handle_key(key(Key::Enter)), Step::Validate);
+        assert_eq!(f.folder_checked(clone.clone()), Step::Submit);
+        let plan = f.plan().unwrap();
+        assert!(plan.pick_up);
+        assert_eq!(plan.name, "alpha", "an empty name keeps the check's");
+        // Declined: the usual steps follow.
+        f.click(Field::PickUp);
+        assert_eq!(f.offers(), (None, Some(false)));
+        assert_eq!(f.folder_checked(clone), Step::Validate);
+        assert!(!f.plan().unwrap().pick_up);
+    }
+
+    #[test]
+    fn a_missing_folder_fails_on_page_one() {
+        let mut f = form();
+        f.handle_key(key(Key::Enter));
+        let gone = FolderCheck::failed("/tmp/alpha".into(), Problem::NotFound);
+        assert_eq!(f.folder_checked(gone), Step::Continue);
+        assert_eq!(f.error(), Some("This folder doesn't exist."));
+        assert_eq!(f.page(), Page::Folder);
     }
 }

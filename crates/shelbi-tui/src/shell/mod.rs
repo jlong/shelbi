@@ -72,8 +72,8 @@ use shelbi_app::view::SidebarModel;
 use shelbi_app::CommandKind;
 use shelbi_app::launch::remote::RemoteSession;
 use shelbi_app::launch::SshRemote;
-use shelbi_core::{ConfigMode, IssueTrackerConfig};
-use shelbi_orchestrator::project_create::{self, ResolvedProjectRoot};
+
+use shelbi_orchestrator::project_create;
 use shelbi_state::keymap::{
     load_keymaps, DisplayStyle, GlobalAction, KeyChord, Keymaps, SidebarAction,
 };
@@ -3845,9 +3845,7 @@ impl ShellState {
                 self.overlay = None;
                 self.client.focus_main();
             }
-            OverlayEvent::AddProjectSubmit { name, root, mode, defaults } => {
-                self.submit_add_project(name, root, mode, defaults)
-            }
+            OverlayEvent::AddProjectSubmit(plan) => self.submit_add_project(plan),
             OverlayEvent::OpenUrl(url) => self.open_url(url),
             OverlayEvent::FeedbackSend(submission) => self.send_feedback(submission),
             OverlayEvent::NewTaskCreate(request) => self.create_new_task(request),
@@ -3986,46 +3984,28 @@ impl ShellState {
         self.dirty = true;
     }
 
-    /// Validate the submitted add-project form. On success, close the form and
-    /// scaffold + switch off the UI thread; on failure, keep the form open with
-    /// the inline error so the user can fix the input. Validation itself is
-    /// cheap (a slug check, a collision lookup, a path stat) so it runs here.
-    fn submit_add_project(&mut self, name: String, root: String, mode: ConfigMode, defaults: shelbi_core::AgentDefaults) {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        match project_create::validate_add_project(&name, &root, &cwd) {
-            Ok(resolved) => {
-                self.overlay = None;
-                self.client.focus_main();
-                self.create_project(resolved, mode, defaults);
-            }
-            Err(msg) => {
-                if let Some(ActiveOverlay::AddProject { form }) = self.overlay.as_mut() {
-                    form.set_error(msg);
-                }
-                self.dirty = true;
-            }
-        }
-    }
-
-    /// Scaffold the validated project off the UI thread (file IO can block),
-    /// pinning the `file_system` board the form has no control over, with the
-    /// agent defaults it chose. On success [`Self::poll_create_job`] switches
-    /// to it on the UI thread.
-    fn create_project(&mut self, resolved: ResolvedProjectRoot, mode: ConfigMode, defaults: shelbi_core::AgentDefaults) {
+    /// Create the add-project form's answers off the UI thread (file IO and
+    /// git can block) through the one creation engine. Bad input (a name
+    /// taken since the form checked it) reopens nothing: the form already
+    /// closed, so the status line says what's wrong. On success
+    /// [`Self::poll_create_job`] switches to the new project on the UI thread.
+    fn submit_add_project(&mut self, plan: shelbi_app::new_project::NewProject) {
+        self.overlay = None;
+        self.client.focus_main();
         let (tx, rx) = std::sync::mpsc::channel();
-        let slug = resolved.name.clone();
         if std::thread::Builder::new()
             .name("shelbi-add-project".into())
             .spawn(move || {
-                let outcome = match project_create::scaffold_project_with(
-                    &resolved,
-                    mode,
-                    &IssueTrackerConfig::default(),
-                    &defaults,
+                let outcome = match project_create::create_project(
+                    &plan,
+                    project_create::Attempt::New,
                     &mut project_create::NullReporter,
                 ) {
-                    Ok(()) => CreateOutcome::Created(slug),
-                    Err(e) => CreateOutcome::Failed(format!("Add project failed: {e}")),
+                    Ok(slug) => CreateOutcome::Created(slug),
+                    Err(project_create::AddProjectError::Invalid(msg)) => {
+                        CreateOutcome::Failed(format!("Add project failed: {msg}"))
+                    }
+                    Err(project_create::AddProjectError::Failed(msg)) => CreateOutcome::Failed(msg),
                 };
                 let _ = tx.send(outcome);
             })
@@ -4329,9 +4309,7 @@ impl ShellState {
                 self.start_decision(id, Decision::Reject, m);
             }
             // The form's submit, wherever it came from: validate, scaffold, switch.
-            Effect::Mutate(Mutation::AddProject { name, root, mode, defaults }) => {
-                self.submit_add_project(name, root, mode, defaults)
-            }
+            Effect::Mutate(Mutation::AddProject { plan }) => self.submit_add_project(*plan),
             // The board's card mutations. The embedded board sends its own
             // through its move persister; one arriving here (no palette entry
             // produces them) goes straight to the daemon.

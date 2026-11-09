@@ -1,13 +1,13 @@
 ---
 title: Set up your first project
 order: 12
-summary: Let Shelbi inspect your repo and machine, confirm one setup card, and land on a dashboard that is ready to use.
+summary: Answer four short steps, each starting on what Shelbi detected, and land on a dashboard that is ready to use.
 ---
 
-<CopyPromptBanner prompt="Set up Shelbi for the Git repository in my current directory. Run `shelbi project add` in this repository, review the preflight and detected setup card with me, and press Enter only after I approve it. If I want to change a detected value, use `c` to Customize. Do not hand-write the generated config." />
+<CopyPromptBanner prompt="Set up Shelbi for the Git repository in my current directory. Run `shelbi project add` in this repository and walk me through its four steps (folder, agents, issues, settings). Keep each detected default unless I ask to change it. Do not hand-write the generated config." />
 
-From the Git repository you want Shelbi to manage, install Shelbi and run
-its detected setup:
+From the Git repository you want Shelbi to manage, install Shelbi and add the
+project:
 
 <Tui>
 
@@ -26,22 +26,23 @@ shelbi project add
 
 </Desktop>
 
-Shelbi runs a preflight, asks where issues should live (and which runner, if
-you have both), then shows one plan card to confirm. It does not write project
-state until you confirm the card.
+Shelbi asks four steps, each prompt starting on what it detected, and writes
+nothing until you've answered the last one. Every way of adding a project walks
+the same steps and creates the same files: `shelbi project add`, first-run
+`shelbi`, [`shelbi init`](/docs/cli/init) (add `-y` to accept every default
+without prompts), the TUI's **Add project** dialog, and the desktop app's
+**Add Project** wizard.
 
 <Tui>
 
 <Callout type="note" title="Plain shelbi opens the launch screen">
 
 On a fresh machine with no hub daemon running, plain `shelbi` opens the
-**Welcome to Shelbi** launch screen instead. Its **Add project** button opens a
-short three-step form (the project name and repo path, prefilled to the
-current directory; **Agent defaults**, the harness and model the project's
-agents use by default; and where settings live) that creates the project with
-a file-system board and opens it, without the preflight or plan card. The rest of this page follows
-`shelbi project add`. With a daemon already running, plain `shelbi` outside a
-project starts this same setup for the current directory.
+**Welcome to Shelbi** launch screen instead. Its **Add project** button opens
+the same four steps as one dialog (Step 1 of 4 through Step 4 of 4), with the
+repo path prefilled to the current directory. With a daemon already running,
+plain `shelbi` outside a project starts this same setup for the current
+directory.
 
 </Callout>
 
@@ -50,62 +51,76 @@ project starts this same setup for the current directory.
 
 <Callout type="note" title="The desktop app's Add Project wizard">
 
-The desktop app adds a project with its own short wizard instead: **Add
-project** on the **Welcome to Shelbi** window, **+ Add project** in the
-project switcher (click the project name at the top of the sidebar), or
-**File ▸ Add Project…**. It asks for the **Project folder** (Browse, or type a
-path), then **Agent defaults** (the **Default Harness**, Claude Code or Codex,
-and its **Default model**), then **Where should settings live?** (**In the
-project** or **Outside the project**), and **Create Project** writes the
-config, agents, and workflows. **Okay** on **You're all set!** opens the project on its
+The desktop app asks the same four steps in its own wizard: **Add project** on
+the **Welcome to Shelbi** window, **+ Add project** in the project switcher
+(click the project name at the top of the sidebar), or **File ▸ Add
+Project…**. Pick the **Project folder** (Browse, or type a path), then the
+**Agent defaults**, then **Where should issues live?**, then **Where should
+settings live?**, and **Create Project** writes the config, agents, and
+workflows. **Okay** on **You're all set!** opens the project on its
 Orchestrator.
-
-The wizard creates a file-system board, without the preflight, the
-issue-tracker questions, or the plan card. For those, run
-`shelbi project add` in the repo as below; the project then shows up in the
-desktop app too, since both clients share one daemon.
 
 </Callout>
 
 </Desktop>
 
-## 1. Watch the preflight
+## 1. Folder
 
-Setup checks the environment in front of you. A typical preflight looks like this:
-
-```text
-  ✓ git repo            ~/code/myapp
-  ✓ default branch      main
-  ✓ remote              github.com/you/myapp
-  ✓ agent               codex 0.27.0 on PATH
-  ✓ machine             10 cores
-```
-
-Shelbi detects the repository root, default branch, origin, supported agent
-runners, and the machine's core count. The values appear as each check
-completes. With both runners installed, the agent row lists both
-(`claude <version> + codex <version> on PATH`).
-
-<Callout type="note" title="If both runners are installed">
-
-When both Claude Code and Codex are on `PATH`, Shelbi cannot infer which one
-you prefer. It asks exactly one runner question before the plan card:
+The folder defaults to the top of the Git checkout you're in, and the project's
+name to the folder's:
 
 ```text
-? Which agent?
-  claude (<detected version>)
-  codex (<detected version>)
+Step 1 of 4 · Folder
+? Project folder: ~/code/myapp
+? Project name: myapp
+  Git repository detected. Shelbi will use this folder as your project.
 ```
 
-Choose one and setup continues.
+Shelbi also reads the folder's default branch (origin's `HEAD`, then the
+checked-out branch, then `main`) and its origin remote, and records both in the
+project. Credentials embedded in a remote URL are never written.
 
-</Callout>
+Two offers can follow, both on by default:
 
-## 2. Choose where your issues live
+- **Not a Git repository yet.** Shelbi offers to initialize one:
+
+  ```text
+  ? ~/code/myapp is not a Git repo. Initialize one here with git init -b main? (Y/n)
+  ```
+
+  Decline and setup continues without Git; Shelbi works best in a repository.
+- **A teammate's committed settings.** When the folder holds a committed
+  `.shelbi/project.yaml` this machine hasn't registered, Shelbi offers to pick
+  it up. That registers the project here, using the committed settings, and
+  skips the remaining steps. See [Config modes](/docs/concepts/config-modes).
+
+## 2. Agents
+
+Choose the runner and model your project's agents use by default. The installed
+runner is preselected (Claude Code when both Claude Code and Codex are), on the
+runner's own default model:
+
+```text
+Step 2 of 4 · Agents
+? Agent runner:
+> Claude Code (2.1.0)
+  Codex (0.27.0)
+? Default model:
+> Use runner default
+  Opus
+  Sonnet
+```
+
+The runner becomes the orchestrator's runner, and the shipped agents recommend
+it. Both built-in runner declarations stay in the project config, so you can
+switch later.
+
+## 3. Issues
 
 Next, Shelbi asks where this project's board should live:
 
 ```text
+Step 3 of 4 · Issues
 Where should this project's issues live?
   GitHub Issues  cards are GitHub issues your team can see and file (requires `gh` logged in)
   File system    private markdown files on this machine (no GitHub needed)
@@ -114,7 +129,7 @@ Where should this project's issues live?
   File system
 ```
 
-- **GitHub Issues** stores each card as a GitHub issue. It is pre-selected, with
+- **GitHub Issues** stores each card as a GitHub issue. It is preselected, with
   the `owner/repo` pre-filled, when your origin remote is a GitHub repo. Shelbi
   preflights first: `gh` must be installed and authenticated, and your account
   must be able to read issues and create labels on the repo (Issues enabled plus
@@ -123,7 +138,8 @@ Where should this project's issues live?
   never written. On success it creates `shelbi:id/*` and `shelbi:status/*` labels
   on first use and stores a small metadata block in each issue's body.
 - **File system** keeps the board as private markdown under
-  `~/.shelbi/projects/<name>/tasks/`. No GitHub needed, and it is the default.
+  `~/.shelbi/projects/<name>/tasks/`. No GitHub needed. It's preselected when
+  the origin isn't on GitHub.
 
 You can move a board between backends later with
 [`shelbi issue-store migrate`](/docs/cli/issue#issue-store-migrate). For the full
@@ -131,70 +147,35 @@ picture of what the GitHub backend writes onto your repo (the label scheme, the
 metadata block, and how assignees gate Zen Mode), see the
 [GitHub Issues backend](/docs/concepts/github-issues).
 
-## 3. Confirm the setup card
+## 4. Settings
 
-After preflight, Shelbi summarizes everything it will create:
-
-```text
-  ┌─ myapp ────────────────────────────────────────────────────┐
-  │                                                            │
-  │  repo        ~/code/myapp (main)                           │
-  │  github      github.com/you/myapp                          │
-  │  agent       codex                                         │
-  │  issues      GitHub · you/myapp                            │
-  │  workspaces  created at first boot (orchestrator interview)│
-  │  workflows   task (branch → PR → review) · subtask         │
-  │  agents      orchestrator · developer · review             │
-  │              (+ qa, security, adversarial, opt-in)         │
-  │                                                            │
-  │  Everything above is editable later: Ctrl+Space → "Edit"   │
-  └────────────────────────────────────────────────────────────┘
-
-  Enter launch    c customize    q quit
-```
-
-- Press **Enter** to create the project and open the dashboard.
-- Press **`c`** to customize the detected values before creating anything.
-- Press **`q`**, **Esc**, or **Ctrl+C** to quit without writing project state.
-
-On a file-system board the issues row reads `file system (local markdown)`.
-The written plan also declares the local `hub` machine, the shipped `task` and
-`subtask` workflows, and the default agent roles. The detected runner becomes
-the orchestrator's runner; both built-in runner declarations stay in the
-project config, so agents can use either. The **workspace pool starts
-empty**: the orchestrator provisions it on first boot, asking how many
-workspaces and which naming scheme you want and creating each with `shelbi
-workspace add`.
-
-### Customize instead
-
-Pressing `c` opens the detailed path. Each detected value is prefilled, so
-press Enter to keep it or edit it:
+Last, choose where the project's settings live: **global** keeps them under
+`~/.shelbi/projects/<name>/`, personal to you; **in-repo** commits them at
+`<repo>/.shelbi/` to share with your team. Shelbi recommends one and says why:
 
 ```text
-Customize setup. Press Enter to keep each detected value.
-
-? Project name:
-? Path to the repo:
-? Default branch:
-? GitHub repo URL (optional):
-? Agent runner (used by every workspace):
-? Orchestrator runner:
-? Issue tracker:
+Step 4 of 4 · Settings
+  Recommended: In repo (origin remote + 3 committers)
+? Settings location:
+  global
+> in-repo (recommended)
 ```
 
-This is where you can choose a different project name or root, change the
-branch or remote, or use a different runner for the orchestrator. Only the
-**Orchestrator runner** answer is saved today; the **Agent runner** answer is
-not written, and each agent resolves its own runner. Workspaces themselves are
-sized and named later, in the orchestrator's first-boot interview.
+It recommends in-repo when the repository has an origin remote and at least
+two committers, and global otherwise.
 
-## 4. Land on the dashboard
+Shelbi then creates the project: its config (declaring the local `hub`
+machine), the default agents, and the shipped `task` and `subtask` workflows.
+The **workspace pool starts empty**: the orchestrator provisions it on first
+boot, asking how many workspaces and which naming scheme you want and creating
+each with `shelbi workspace add`.
+
+## Land on the dashboard
 
 <Tui>
 
-After Enter, Shelbi prints `✓ Project <name> created.` and launches the TUI.
-On a file-system board, the new board contains one Backlog card named
+Shelbi prints `✓ Project <name> created.` and launches the TUI. On a
+file-system board, the new board contains one Backlog card named
 **Welcome to Shelbi** (a GitHub Issues board shows your repo's issues
 instead). The first time you set up a project on this machine, the sidebar
 also briefly shows:
@@ -217,8 +198,8 @@ the repository.
 </Tui>
 <Desktop>
 
-After Enter, Shelbi prints `✓ Project <name> created.` and launches the TUI in
-that terminal. The desktop app is a second client over the same daemon, so open
+Shelbi prints `✓ Project <name> created.` and launches the TUI in that
+terminal. The desktop app is a second client over the same daemon, so open
 **Shelbi.app** and pick the project under **Projects on this Mac**, or from the
 project switcher at the top of the sidebar if the app is already open.
 
@@ -239,40 +220,22 @@ the repository.
 
 </Desktop>
 
-## Edge cases before the card
+## If something is missing
 
-### The directory is not a Git repository
-
-Shelbi asks before initializing Git:
-
-```text
-? <path> is not a Git repo. Initialize one here with git init -b main? (Y/n)
-```
-
-Accept to continue. Decline and Shelbi writes nothing, then prints:
+Press Esc or Ctrl+C at any prompt to leave; nothing has been written yet. If a
+place Shelbi writes to is unusable (a file where a directory should be), setup
+stops before writing anything, Git initialization included, and names the
+path. Without a terminal, or with `shelbi init -y`, a missing runner stops
+setup with an install hint:
 
 ```text
-No files were written. Run git init -b main and try Shelbi again.
-```
-
-### A prerequisite is missing
-
-Failed checks are shown with `✗`, and setup stops with a concrete next step.
-For example:
-
-```text
-  ✗ agent               claude and codex not found on PATH
-  ✓ machine             10 cores
-
 No supported agent runner was found on PATH. Install and authenticate Claude Code (https://docs.claude.com/en/docs/claude-code) or Codex (npm install -g @openai/codex), then start Shelbi again.
 ```
 
-No partial project is left behind.
-
 ## Add another project
 
-Run `shelbi project add` from another repository. It uses the same preflight,
-card, Customize path, and dashboard launch described above. You can also use
+Run `shelbi project add` from another repository. It asks the same four steps
+and launches the dashboard. You can also use
 <Tui>**Add project** on the launch screen</Tui><Desktop>the desktop app's Add Project wizard (**File ▸ Add Project…**)</Desktop>.
 
 ## Next

@@ -22,7 +22,7 @@ use std::path::Path;
 
 use std::collections::HashMap;
 
-use shelbi_core::{Column, ConfigMode};
+use shelbi_core::Column;
 use shelbi_palette::Entry;
 use shelbi_state::keymap::{DisplayStyle, Keymaps, PopoverAction};
 use shelbi_state::IssueFile;
@@ -53,15 +53,9 @@ pub enum OverlayEvent {
         confirmed: bool,
         dont_show_again: bool,
     },
-    /// The Add-project form submitted; the shell validates these values and
-    /// either scaffolds the project (off-thread) or stashes an inline error
-    /// back on the form.
-    AddProjectSubmit {
-        name: String,
-        root: String,
-        mode: ConfigMode,
-        defaults: shelbi_core::AgentDefaults,
-    },
+    /// The Add-project form submitted these answers; the shell creates the
+    /// project off-thread through the one creation engine.
+    AddProjectSubmit(shelbi_app::new_project::NewProject),
     /// The Add-project form was cancelled.
     AddProjectCancel,
     /// About Shelbi asked to open this page in the browser; it stays open.
@@ -101,7 +95,7 @@ pub enum ActiveOverlay {
         state: overlay::zen_intro::IntroState,
     },
     AddProject {
-        form: overlay::add_project::Form,
+        form: Box<overlay::add_project::Form>,
     },
     /// About Shelbi (the palette's "About Shelbi", Settings ▸ General).
     About(overlay::about::About),
@@ -216,7 +210,7 @@ impl ActiveOverlay {
     /// Open the Add-project form, prefilling the repo path from `cwd`.
     pub fn add_project(cwd: &Path) -> Self {
         ActiveOverlay::AddProject {
-            form: overlay::add_project::Form::new(cwd),
+            form: Box::new(overlay::add_project::Form::new(cwd)),
         }
     }
 
@@ -592,13 +586,11 @@ fn add_project_event(form: &overlay::add_project::Form, step: overlay::add_proje
     use overlay::add_project::Step;
     match step {
         // Page 1's validation and the pickers' menus are the form's own.
-        Step::Continue | Step::Validate | Step::Menu(_) => OverlayEvent::Stay,
+        Step::Continue | Step::Validate | Step::Preflight(_) | Step::Menu(_) => OverlayEvent::Stay,
         Step::Cancel => OverlayEvent::AddProjectCancel,
-        Step::Submit => OverlayEvent::AddProjectSubmit {
-            name: form.name().to_string(),
-            root: form.root().to_string(),
-            mode: form.mode(),
-            defaults: form.defaults(),
+        Step::Submit => match form.plan() {
+            Some(plan) => OverlayEvent::AddProjectSubmit(plan),
+            None => OverlayEvent::Stay,
         },
     }
 }

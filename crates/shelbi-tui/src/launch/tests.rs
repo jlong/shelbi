@@ -445,14 +445,19 @@ fn add_project_creates_the_project_and_opens_it() {
     press(&mut app, KeyCode::Enter);
     assert!(app.adding_project());
     type_text(&mut app, "acme");
-    // Folder, then Agent defaults (Codex, by keyboard), then where settings
-    // live, whose Create Project is clicked.
+    // Folder (a plain folder: the first Continue shows the offer to
+    // initialize Git, on), then Agent defaults (Codex, by keyboard), the
+    // board, then where settings live, whose Create Project is clicked.
+    press(&mut app, KeyCode::Enter);
+    assert!(text(&draw(&mut app, 100, 32)).contains(shelbi_app::new_project::GIT_INIT_LABEL));
     press(&mut app, KeyCode::Enter);
     assert!(text(&draw(&mut app, 100, 32)).contains("Agent defaults"));
     press(&mut app, KeyCode::Right);
     press(&mut app, KeyCode::Enter);
+    assert!(text(&draw(&mut app, 100, 32)).contains("Where should issues live?"));
+    press(&mut app, KeyCode::Enter);
     let buf = draw(&mut app, 100, 32);
-    assert!(text(&buf).contains("Step 3 of 3"));
+    assert!(text(&buf).contains("Step 4 of 4"));
     let at = find(&buf, "Create Project").unwrap();
     assert_eq!(click(&mut app, at), None);
     let exit = settle(&mut app, |_| false);
@@ -460,6 +465,9 @@ fn add_project_creates_the_project_and_opens_it() {
     assert!(shelbi_app::launch::route::project_registered("acme"));
     let project = shelbi_state::load_project("acme").unwrap();
     assert_eq!(project.orchestrator.runner, "codex", "the chosen default runner");
+    assert!(project.workspaces.is_empty(), "the orchestrator provisions the pool");
+    assert_eq!(project.default_branch, "main");
+    assert!(repo.join(".git").is_dir(), "the offer initialized Git");
 }
 
 #[test]

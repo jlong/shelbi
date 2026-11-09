@@ -68,11 +68,10 @@ slots* the orchestrator routes work to. That gives you:
   the parallelism cap; the orchestrator can't accidentally outrun your RAM
   by spawning more.
 
-A project created with `shelbi project add` (or `shelbi init -y`) starts
-with an empty pool, and the orchestrator asks how many workspaces you want on
-its first boot. `shelbi init` without `-y` and the app's Add project form
-instead start you with two workspaces on `hub`: `dev` and `review` (tagged
-`review`). Add or remove workspaces later with `shelbi workspace add <name>` /
+A new project starts with an empty pool however you create it (`shelbi
+project add`, `shelbi init`, or the apps' Add project), and the orchestrator
+asks how many workspaces you want on its first boot, creating each on the
+runner you chose. Add or remove workspaces later with `shelbi workspace add <name>` /
 `shelbi workspace rm <name>`, or in Settings ▸ Workspaces. (`rm` refuses a
 workspace with an active issue or unpushed work unless you pass `--force`.)
 

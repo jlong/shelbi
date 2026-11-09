@@ -70,9 +70,10 @@ use gpui::{
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use shelbi_app::add_project_wizard::{
     self as wiz, Action, Attempt, CreateRequest, FolderCheck, Focus, Origin, RowState, Screen, Stage,
-    Tone, Wizard, WorkflowOverview,
+    Tone, Tracker, Wizard, WorkflowOverview,
 };
 use shelbi_app::exec::Mutation;
+use shelbi_app::new_project as np;
 use shelbi_core::ConfigMode;
 use shelbi_orchestrator::project_create::{self as engine, AddProjectError, ScaffoldReporter, ScaffoldStage};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
@@ -106,6 +107,10 @@ pub type CreateFn =
 /// [`Engine::refresh`]'s signature.
 pub type RefreshFn = dyn Fn() + Send + Sync;
 
+/// [`Engine::preflight`]'s signature: the GitHub repo; the fix to show on a
+/// failure.
+pub type PreflightFn = dyn Fn(&str) -> Result<(), String> + Send + Sync;
+
 /// The blocking work the wizard runs off the UI thread. A test swaps in its
 /// own, so nothing reads or writes a real Shelbi home.
 #[derive(Clone)]
@@ -117,6 +122,8 @@ pub struct Engine {
     /// Re-read the project catalog, so the created project is in it before
     /// it opens (Okay).
     pub refresh: Arc<RefreshFn>,
+    /// The Issues screen's `gh` check of a GitHub repo.
+    pub preflight: Arc<PreflightFn>,
 }
 
 impl Engine {
@@ -130,19 +137,15 @@ impl Engine {
                 }
             }),
             check: Arc::new(shelbi_orchestrator::project_create::check_folder),
-            create: Arc::new(|request, cwd, out| {
-                let mutation = Mutation::AddProject {
-                    name: request.name.clone(),
-                    root: request.root.clone(),
-                    mode: request.mode,
-                    defaults: request.defaults.clone(),
-                };
+            create: Arc::new(|request, _cwd, out| {
+                let mutation = Mutation::AddProject { plan: Box::new(request.plan.clone()) };
                 let attempt = match request.attempt {
                     Attempt::New => engine::Attempt::New,
                     Attempt::Retry => engine::Attempt::Retry,
                 };
-                commands::run_add_project(&mutation, attempt, cwd, out)
+                commands::run_add_project(&mutation, attempt, out)
             }),
+            preflight: Arc::new(engine::issues::preflight_github),
         }
     }
 }
@@ -265,6 +268,8 @@ pub struct AddProjectView {
     focus: FocusHandle,
     path_input: Entity<InputState>,
     name_input: Entity<InputState>,
+    /// The Issues screen's GitHub repo field.
+    repo_input: Entity<InputState>,
     /// The keyboard has moved focus: focus rings show from then on.
     keyboard: bool,
     from: Option<WindowHandle<ShelbiWindow>>,
@@ -298,6 +303,7 @@ impl AddProjectView {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let path_input = cx.new(|cx| InputState::new(window, cx).placeholder("~/Projects/my-project"));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Project name"));
+        let repo_input = cx.new(|cx| InputState::new(window, cx).placeholder("owner/repo"));
         let this_window = window.window_handle();
         let me = cx.weak_entity();
         let subscriptions = vec![
@@ -330,6 +336,20 @@ impl AddProjectView {
                     _ => {}
                 }
             }),
+            cx.subscribe_in(&repo_input, window, |this, input, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::Change => {
+                        let text = input.read(cx).value().to_string();
+                        this.wizard.set_repo(text);
+                        this.after_change(window, cx);
+                    }
+                    InputEvent::Focus => {
+                        this.wizard.set_focus(Focus::Repo);
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            }),
             // Ahead of the text fields' own bindings (Tab indents, Return
             // and Esc are theirs otherwise): the wizard's keys are its own
             // everywhere in the window.
@@ -353,6 +373,7 @@ impl AddProjectView {
             focus,
             path_input,
             name_input,
+            repo_input,
             keyboard: false,
             from,
             cwd,
@@ -375,7 +396,7 @@ impl AddProjectView {
     /// A key the wizard takes: Tab and ⇧Tab, Return and Esc anywhere;
     /// Space and the arrows off the text fields. `false` lets it through.
     fn key(&mut self, chord: KeyChord, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let in_text = matches!(self.wizard.focus(), Focus::Path | Focus::Name);
+        let in_text = matches!(self.wizard.focus(), Focus::Path | Focus::Name | Focus::Repo);
         let bare = chord.mods == Mods::NONE;
         let taken = match chord.code {
             Key::Tab | Key::BackTab => bare || chord.mods == Mods::SHIFT,
@@ -420,7 +441,8 @@ impl AddProjectView {
                 window.remove_window();
                 return;
             }
-            Action::Create(request) => self.create(request, window, cx),
+            Action::Preflight(repo) => self.preflight(repo, window, cx),
+            Action::Create(request) => self.create(*request, window, cx),
             Action::Open(created) => self.open(created.slug, window, cx),
         }
         self.after_change(window, cx);
@@ -430,6 +452,7 @@ impl AddProjectView {
     /// keyboard there, start a due check, repaint.
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.wizard.settle_focus();
+        self.sync_repo(window, cx);
         self.sync_focus(window, cx);
         self.run_checks(window, cx);
         cx.notify();
@@ -442,6 +465,7 @@ impl AddProjectView {
         let handle = match self.wizard.focus() {
             Focus::Path => self.path_input.read(cx).focus_handle(cx),
             Focus::Name => self.name_input.read(cx).focus_handle(cx),
+            Focus::Repo => self.repo_input.read(cx).focus_handle(cx),
             _ => self.focus.clone(),
         };
         if !handle.is_focused(window) {
@@ -477,6 +501,37 @@ impl AddProjectView {
             .ok();
         })
         .detach();
+    }
+
+    /// The Issues screen's Continue on GitHub: the `gh` preflight off the UI
+    /// thread, its answer back to the wizard (which moves on when it passed).
+    fn preflight(&mut self, repo: String, window: &mut Window, cx: &mut Context<Self>) {
+        let check = self.engine.preflight.clone();
+        let task = cx.background_executor().spawn({
+            let repo = repo.clone();
+            async move { check(&repo) }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(()) => this.wizard.preflight_passed(&repo),
+                    Err(why) => this.wizard.preflight_failed(&repo, why),
+                }
+                this.after_change(window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// The seeded repo field shows the wizard's repo (a new folder's GitHub
+    /// origin) when they differ.
+    fn sync_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repo = self.wizard.issues().repo().to_string();
+        if self.repo_input.read(cx).value() != repo.as_str() {
+            self.repo_input.update(cx, |s, cx| s.set_value(repo, window, cx));
+        }
     }
 
     /// Browse: the native folder picker. A cancel keeps the folder there
@@ -580,8 +635,9 @@ impl AddProjectView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Continue past the folder and the Agent defaults, then Create
-        // Project (the engine never runs).
+        // Continue past the folder, the Agent defaults and the Issues, then
+        // Create Project (the engine never runs).
+        self.wizard.primary();
         self.wizard.primary();
         self.wizard.primary();
         let _ = self.wizard.primary();
@@ -743,9 +799,15 @@ impl AddProjectView {
             style::disabled_button("add-project-back", "Back", ButtonKind::Secondary, ButtonSize::Base, theme)
         };
         let label = match screen {
-            Screen::Folder | Screen::Defaults => "Continue",
+            Screen::Folder | Screen::Defaults | Screen::Issues => "Continue",
             _ => "Create Project",
         };
+        let pending = self.wizard.preflighting().then(|| {
+            div()
+                .debug_selector(|| "add-project-preflight".into())
+                .flex_none()
+                .child(spinner::spinner_sized("add-project-preflight", theme.progress, 16.0))
+        });
         let primary = if self.wizard.primary_enabled() {
             style::button("add-project-primary", label, ButtonKind::Primary, ButtonSize::Base, self.ring(Focus::Primary, window), theme)
                 .on_click(cx.listener(|this, _, window, cx| this.click(Focus::Primary, window, cx)))
@@ -767,6 +829,7 @@ impl AddProjectView {
                     .child(wiz::step_label(screen)),
             )
             .child(div().flex_1())
+            .children(pending)
             .child(back)
             .child(primary)
     }
@@ -886,6 +949,17 @@ impl AddProjectView {
                 )
                 .child(div().flex().w_full().child(field(&self.name_input, "add-project-name", cx)))
         });
+        let (git_init, pick_up) = self.wizard.offers();
+        let offer = |id: &'static str, label: String, on: bool, focus: Focus, cx: &mut Context<Self>| {
+            controls::checkbox(id, label, on, self.ring(focus, window), theme)
+                .on_click(cx.listener(move |this, _, window, cx| this.click(focus, window, cx)))
+        };
+        let pick_up_row = pick_up.map(|on| {
+            let name = check.and_then(|c| c.facts.pick_up.as_ref()).map(|p| p.name.clone()).unwrap_or_default();
+            offer("add-project-pick-up", format!("{} (“{name}”)", np::PICK_UP_LABEL), on, Focus::PickUp, cx)
+        });
+        let git_init_row =
+            git_init.map(|on| offer("add-project-git-init", np::GIT_INIT_LABEL.to_string(), on, Focus::GitInit, cx));
         shell
             .flex_col()
             .items_start()
@@ -906,6 +980,69 @@ impl AddProjectView {
             )
             .child(path_row)
             .children(name_row)
+            .children(pick_up_row)
+            .children(git_init_row)
+    }
+
+    /// One of the Issues screen's cards.
+    fn tracker_card(&self, tracker: Tracker, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        let (id, title, body) = match tracker {
+            Tracker::Github => ("add-project-card-github", np::GITHUB_TITLE, np::GITHUB_BODY),
+            Tracker::FileSystem => ("add-project-card-file-system", np::FILE_SYSTEM_TITLE, np::FILE_SYSTEM_BODY),
+        };
+        let selected = self.wizard.issues().tracker() == tracker;
+        choice_card(id, title, body, None, selected, self.ring(Focus::Tracker(tracker), window), theme)
+            .on_click(cx.listener(move |this, _, window, cx| this.click(Focus::Tracker(tracker), window, cx)))
+    }
+
+    /// The Issues screen: the two cards, then (on GitHub) the repo field,
+    /// and why the last preflight failed or what a GitHub board writes.
+    fn issues(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let issues = self.wizard.issues();
+        let repo = (issues.tracker() == Tracker::Github).then(|| {
+            let focused = self.repo_input.read(cx).focus_handle(cx).is_focused(window);
+            let field = controls::textbox(
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.repo_input)
+                        .appearance(false)
+                        .h_full()
+                        .px_0()
+                        .type_style(Type::Base)
+                        .text_color(theme.form_text),
+                ),
+                focused,
+                theme,
+            )
+            .debug_selector(|| "add-project-repo".into())
+            .flex_1();
+            let note = match (issues.error(), issues.verified()) {
+                (Some(why), _) => Some((why.to_string(), theme.error)),
+                (None, true) => Some((np::GITHUB_DISCLOSURE.to_string(), theme.muted)),
+                (None, false) => None,
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .w_full()
+                .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child(np::GITHUB_REPO_LABEL))
+                .child(div().flex().w_full().child(field))
+                .children(note.map(|(text, color)| {
+                    div()
+                        .debug_selector(|| "add-project-repo-note".into())
+                        .type_style(Type::Small)
+                        .text_color(color)
+                        .child(text)
+                }))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .w_full()
+            .child(self.tracker_card(Tracker::Github, window, theme, cx))
+            .child(self.tracker_card(Tracker::FileSystem, window, theme, cx))
+            .children(repo)
     }
 
     /// One of screen 02's cards.
@@ -916,49 +1053,61 @@ impl AddProjectView {
         };
         let selected = self.wizard.mode() == mode;
         let path = self.wizard.storage_path(mode).unwrap_or_default();
-        div()
-            .id(id)
-            .debug_selector(move || id.into())
-            .relative()
-            .flex()
-            .flex_row()
-            .items_start()
-            .gap(px(16.0))
-            .w_full()
-            .p(px(20.0))
-            .rounded(px(12.0))
-            .border_1()
-            .cursor_pointer()
-            .when(selected, |d| d.bg(theme.primary_fill).border_color(theme.focus_ring))
-            .when(!selected, |d| {
-                d.bg(theme.toolbar)
-                    .border_color(theme.divider)
-                    .hover(|s| s.bg(theme.background_hover))
-            })
-            .when(self.ring(Focus::Card(mode), window), |d| {
-                d.children(style::focus_bands_past(12.0, 1.0, theme))
-            })
-            .child(radio(selected, theme))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(8.0))
-                    .child(div().type_style(Type::BaseSemibold).text_color(theme.text_loud).child(title))
-                    .child(div().type_style(Type::Base).text_color(theme.foreground).child(body))
-                    .child(
-                        div()
-                            .debug_selector(move || format!("{id}-path"))
-                            .type_style(Type::Small)
-                            .text_color(theme.muted)
-                            .truncate()
-                            .child(path),
-                    ),
-            )
+        choice_card(id, title, body, Some(path), selected, self.ring(Focus::Card(mode), window), theme)
             .on_click(cx.listener(move |this, _, window, cx| this.click(Focus::Card(mode), window, cx)))
     }
+}
+
+/// A card to choose (screen 02's locations, the Issues screen's boards): its
+/// radio, title, description and (`detail`) a muted line under them.
+fn choice_card(
+    id: &'static str,
+    title: &'static str,
+    body: &'static str,
+    detail: Option<String>,
+    selected: bool,
+    ring: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .relative()
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(16.0))
+        .w_full()
+        .p(px(20.0))
+        .rounded(px(12.0))
+        .border_1()
+        .cursor_pointer()
+        .when(selected, |d| d.bg(theme.primary_fill).border_color(theme.focus_ring))
+        .when(!selected, |d| {
+            d.bg(theme.toolbar)
+                .border_color(theme.divider)
+                .hover(|s| s.bg(theme.background_hover))
+        })
+        .when(ring, |d| d.children(style::focus_bands_past(12.0, 1.0, theme)))
+        .child(radio(selected, theme))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(px(8.0))
+                .child(div().type_style(Type::BaseSemibold).text_color(theme.text_loud).child(title))
+                .child(div().type_style(Type::Base).text_color(theme.foreground).child(body))
+                .children(detail.map(|path| {
+                    div()
+                        .debug_selector(move || format!("{id}-path"))
+                        .type_style(Type::Small)
+                        .text_color(theme.muted)
+                        .truncate()
+                        .child(path)
+                })),
+        )
 }
 
 /// One of screen 04's cards: the workflow's name (and Default badge), what
@@ -1178,6 +1327,7 @@ impl Render for AddProjectView {
         let intro = match screen {
             Screen::Folder => Some(wiz::FOLDER_INTRO.to_string()),
             Screen::Defaults => Some(wiz::DEFAULTS_INTRO.to_string()),
+            Screen::Issues => Some(np::ISSUES_INTRO.to_string()),
             Screen::Settings => Some(wiz::SETTINGS_INTRO.to_string()),
             Screen::Creating => None,
             Screen::Created => Some(wiz::CREATED_INTRO.to_string()),
@@ -1193,9 +1343,17 @@ impl Render for AddProjectView {
         let details = match screen {
             Screen::Folder => details.child(self.folder_box(window, &theme, cx)),
             Screen::Defaults => details.child(self.defaults(window, &theme, cx)),
+            Screen::Issues => details.child(self.issues(window, &theme, cx)),
             Screen::Settings => details
                 .child(self.card(ConfigMode::InRepo, window, &theme, cx))
-                .child(self.card(ConfigMode::Global, window, &theme, cx)),
+                .child(self.card(ConfigMode::Global, window, &theme, cx))
+                .children(self.wizard.mode_recommendation().map(|line| {
+                    div()
+                        .debug_selector(|| "add-project-recommendation".into())
+                        .type_style(Type::Small)
+                        .text_color(theme.muted)
+                        .child(line)
+                })),
             Screen::Creating => details.child(checklist(&self.wizard, &theme)),
             // The workflows, then what the engine warned about (the commit
             // guard it installed, a hook it left alone: its disclosure) and
@@ -1306,6 +1464,7 @@ mod tests {
             slug,
             repo: Some(repo),
             problem,
+            facts: Default::default(),
         }
     }
 
@@ -1366,6 +1525,7 @@ mod tests {
                     create(request, cwd, out)
                 }
             }),
+            preflight: Arc::new(|repo| if repo == "acme/ok" { Ok(()) } else { Err("gh is not signed in".into()) }),
         };
         let on_created: OnCreated = Rc::new({
             let (opened, open_fails) = (opened.clone(), open_fails.clone());
@@ -1518,7 +1678,12 @@ mod tests {
             shelbi_core::AgentDefaults { runner: shelbi_core::RunnerKind::Codex, model: Some("gpt-5".into()) }
         );
         r.click("add-project-primary");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Issues);
+        assert!(r.drawn("add-project-card-github") && r.drawn("add-project-card-file-system"));
+        assert!(!r.drawn("add-project-repo"), "no GitHub origin: the file system, no repo field");
+        r.click("add-project-primary");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
+        assert!(r.drawn("add-project-recommendation"));
         let path = |r: &mut Rig, id: &'static str| {
             let _ = r.cx.debug_bounds(id).expect("drawn");
             r.wizard(|w| (w.storage_path(ConfigMode::InRepo), w.storage_path(ConfigMode::Global)))
@@ -1532,11 +1697,14 @@ mod tests {
         r.click("add-project-card-in-repo");
         assert_eq!(r.wizard(|w| w.mode()), ConfigMode::InRepo);
         r.click("add-project-back");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Issues);
+        r.click("add-project-back");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Defaults);
         r.click("add-project-back");
         assert_eq!(r.wizard(|w| (w.screen(), w.path().to_string())), (Screen::Folder, "/repo".into()));
         r.click("add-project-primary");
         assert_eq!(r.wizard(|w| w.picker().model().map(str::to_string)).as_deref(), Some("gpt-5"), "the defaults hold");
+        r.click("add-project-primary");
         r.click("add-project-primary");
         assert_eq!(r.wizard(|w| w.mode()), ConfigMode::InRepo);
 
@@ -1545,12 +1713,19 @@ mod tests {
         assert_eq!(
             *r.created.lock().unwrap(),
             [CreateRequest {
-                name: "repo".into(),
-                root: "/repo".into(),
-                mode: ConfigMode::InRepo,
-                defaults: shelbi_core::AgentDefaults {
-                    runner: shelbi_core::RunnerKind::Codex,
-                    model: Some("gpt-5".into()),
+                plan: shelbi_app::new_project::NewProject {
+                    root: "/repo".into(),
+                    name: "repo".into(),
+                    pick_up: false,
+                    git_init: false,
+                    defaults: shelbi_core::AgentDefaults {
+                        runner: shelbi_core::RunnerKind::Codex,
+                        model: Some("gpt-5".into()),
+                    },
+                    issue_tracker: shelbi_core::IssueTrackerConfig::default(),
+                    mode: ConfigMode::InRepo,
+                    default_branch: "main".into(),
+                    remote: None,
                 },
                 attempt: Attempt::New,
             }]
@@ -1571,7 +1746,7 @@ mod tests {
         let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
         r.pick(Some("/repo"));
         // Continue, Continue (the Agent defaults kept), Create Project.
-        r.keys("enter enter enter");
+        r.keys("enter enter enter enter");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Created);
         for drawn in [
             "add-project-workflow-task",
@@ -1609,7 +1784,7 @@ mod tests {
         let mut r = rig_with(cx, Origin::Workspace, scripted(Some(Stage::Workflows), "repo"));
         r.pick(Some("/repo"));
         // Continue, Continue (the Agent defaults kept), Create Project.
-        r.keys("enter enter enter");
+        r.keys("enter enter enter enter");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Creating);
         assert!(!r.drawn("add-project-workflow-task"));
         assert!(r.drawn("add-project-row-workflows-failed"));
@@ -1624,7 +1799,7 @@ mod tests {
         r.open_fails.set(1);
         r.pick(Some("/repo"));
         // Continue, Continue (the Agent defaults kept), Create Project.
-        r.keys("enter enter enter");
+        r.keys("enter enter enter enter");
         r.keys("enter");
         assert_eq!(*r.opened.borrow(), ["repo"]);
         assert!(r.window_open(), "the wizard stays for another try");
@@ -1679,6 +1854,7 @@ mod tests {
             };
             step(&mut vcx, Focus::Primary);
             step(&mut vcx, Focus::Primary);
+            step(&mut vcx, Focus::Primary);
             step(&mut vcx, Focus::Card(mode));
             step(&mut vcx, Focus::Primary);
             let (screen, slug, shown) = view.read_with(&vcx, |v, _| {
@@ -1692,6 +1868,8 @@ mod tests {
 
             let project = shelbi_state::load_project(&slug).unwrap();
             assert_eq!(project.default_workflow.as_deref(), Some(shelbi_core::TASK_WORKFLOW_NAME));
+            assert!(project.workspaces.is_empty(), "the orchestrator provisions the pool");
+            assert_eq!(project.repo, repo.display().to_string());
             for card in &shown {
                 let on_disk = shelbi_state::load_workflow(&slug, &card.name).unwrap();
                 let ids: Vec<&str> = on_disk
@@ -1723,7 +1901,7 @@ mod tests {
         let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
         r.pick(Some("/repo"));
         // Continue, Continue (the Agent defaults kept), Create Project.
-        r.keys("enter enter enter");
+        r.keys("enter enter enter enter");
         // Three presses before anything runs: one open.
         let view = r.view.clone();
         r.cx.update(|window, cx| {
@@ -1747,7 +1925,7 @@ mod tests {
         let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
         r.pick(Some("/repo"));
         // Continue, Continue (the Agent defaults kept), Create Project.
-        r.keys("enter enter enter");
+        r.keys("enter enter enter enter");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Created);
         // 04 draws the workflows in the checklist's place; every row was
         // checked on the way.
@@ -1766,7 +1944,7 @@ mod tests {
         let mut r = rig_with(cx, Origin::Workspace, scripted(Some(Stage::Agents), "repo"));
         r.pick(Some("/repo"));
         // Continue, Continue (the Agent defaults kept), Create Project.
-        r.keys("enter enter enter");
+        r.keys("enter enter enter enter");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Creating, "it stays on the checklist");
         assert!(r.drawn("add-project-row-config-done"));
         assert!(r.drawn("add-project-row-agents-failed"));
@@ -1778,7 +1956,7 @@ mod tests {
         r.click("add-project-primary");
         let attempts: Vec<Attempt> = r.created.lock().unwrap().iter().map(|c| c.attempt).collect();
         assert_eq!(attempts, [Attempt::New, Attempt::Retry], "Try Again retries the same request");
-        assert_eq!(r.created.lock().unwrap()[1].root, "/repo");
+        assert_eq!(r.created.lock().unwrap()[1].plan.root.to_string_lossy(), "/repo");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Created);
         r.keys("enter");
         assert_eq!(*r.opened.borrow(), ["repo"]);
@@ -1821,7 +1999,7 @@ mod tests {
     fn closing_mid_creation_drops_its_reports_and_opens_nothing(cx: &mut TestAppContext) {
         let mut r = rig_with(cx, Origin::Workspace, scripted(None, "repo"));
         r.pick(Some("/repo"));
-        r.keys("enter enter");
+        r.keys("enter enter enter");
         // Create Project, and the window closes before the engine reports.
         let view = r.view.clone();
         r.cx.update(|window, cx| {
@@ -1862,7 +2040,14 @@ mod tests {
         r.keys("down");
         assert_eq!(r.wizard(|w| w.picker().model().map(str::to_string)).as_deref(), Some("gpt-5"));
         r.keys("enter");
-        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings, "Return continues");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Issues, "Return continues");
+        assert_eq!(r.wizard(|w| w.focus()), Focus::Tracker(Tracker::FileSystem));
+        r.keys("up");
+        assert_eq!(r.wizard(|w| w.issues().tracker()), Tracker::Github, "an arrow moves the board");
+        assert_eq!(r.wizard(|w| w.focus()), Focus::Tracker(Tracker::Github));
+        r.keys("down");
+        r.keys("enter");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
         assert_eq!(r.wizard(|w| w.focus()), Focus::Card(ConfigMode::Global));
         r.keys("up");
         assert_eq!(r.wizard(|w| w.mode()), ConfigMode::InRepo, "an arrow moves the choice");
@@ -1879,7 +2064,7 @@ mod tests {
         r.pick(Some("/repo"));
         r.keys("enter");
         assert_eq!(r.wizard(|w| (w.screen(), w.screen().title())), (Screen::Defaults, "Agent defaults"));
-        assert_eq!(wiz::step_label(r.wizard(|w| w.screen())), "Step 2 of 3");
+        assert_eq!(wiz::step_label(r.wizard(|w| w.screen())), "Step 2 of 4");
         for drawn in ["add-project-defaults", "add-project-harness", "add-project-harness-provider", "add-project-model"] {
             assert!(r.drawn(drawn), "{drawn}");
         }
@@ -1892,7 +2077,51 @@ mod tests {
         r.click("add-project-harness-claude");
         assert!(!r.drawn("add-project-defaults-error"));
         r.click("add-project-primary");
-        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Issues);
+    }
+
+    #[gpui::test]
+    fn github_issues_wait_for_the_preflight_and_show_its_fix(cx: &mut TestAppContext) {
+        let mut r = rig(cx, Origin::Workspace, Ok("repo".into()));
+        r.pick(Some("/repo"));
+        r.keys("enter enter");
+        r.click("add-project-card-github");
+        assert!(r.drawn("add-project-repo"), "GitHub shows its repo field");
+        let view = r.view.clone();
+        let set = |r: &mut Rig, repo: &str| {
+            let repo = repo.to_string();
+            r.cx.update(|window, cx| {
+                view.update(cx, |v, cx| {
+                    v.repo_input.update(cx, |s, cx| s.set_value(repo, window, cx));
+                    let text = v.repo_input.read(cx).value().to_string();
+                    v.wizard.set_repo(text);
+                    v.after_change(window, cx);
+                })
+            });
+            r.cx.run_until_parked();
+        };
+        set(&mut r, "acme/nope");
+        r.click("add-project-primary");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Issues, "a failed preflight stays");
+        assert!(r.drawn("add-project-repo-note"), "with its fix");
+        set(&mut r, "acme/ok");
+        r.click("add-project-primary");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings, "a passed one moves on");
+        r.keys("enter");
+        let created = r.created.lock().unwrap().clone();
+        assert_eq!(created[0].plan.issue_tracker.github.as_ref().map(|g| g.repo.as_str()), Some("acme/ok"));
+    }
+
+    #[gpui::test]
+    fn a_plain_folder_offers_to_initialize_git(cx: &mut TestAppContext) {
+        let mut r = rig(cx, Origin::Workspace, Ok("plain".into()));
+        r.pick(Some("/plain"));
+        assert!(r.drawn("add-project-git-init"));
+        r.click("add-project-git-init");
+        assert_eq!(r.wizard(|w| w.offers()), (Some(false), None), "a click turns it off");
+        r.click("add-project-git-init");
+        r.keys("enter enter enter enter");
+        assert!(r.created.lock().unwrap()[0].plan.git_init);
     }
 
     #[gpui::test]

@@ -9,8 +9,8 @@ pub enum WizardOutcome {
     /// All requested phases ran to completion (each phase is independently
     /// idempotent, so "completion" includes "skipped because already done").
     Completed,
-    /// User chose q or pressed Ctrl-C / Esc. Confirmation-card cancellation
-    /// leaves no project state on disk.
+    /// User pressed Ctrl-C / Esc at a prompt. Every prompt comes before the
+    /// first write, so no project state is left on disk.
     Cancelled,
 }
 
@@ -46,12 +46,13 @@ fn has_any_project_registration() -> Result<bool> {
     shelbi_state::has_any_project_registration().map_err(|error| anyhow::anyhow!(error))
 }
 
-/// Run the shared one-project setup flow, translating prompt cancellation
-/// into the same write-free quit outcome as an explicit `q` on the plan card.
+/// Run the shared new-project flow ([`wizard::setup`]: the same steps `shelbi
+/// init`, the TUI and the desktop app walk), translating prompt cancellation
+/// (Esc / Ctrl-C, before anything is written) into a write-free quit.
 /// Callers use the created project name to launch the same dashboard from
 /// bare `shelbi` and `shelbi project add`.
 pub fn run_one_project() -> Result<wizard::SetupOutcome> {
-    match wizard::setup_one_project() {
+    match wizard::setup(wizard::Preset::default(), &mut wizard::Prompts) {
         Ok(outcome) => Ok(outcome),
         Err(e) if is_cancel(&e) => Ok(wizard::SetupOutcome::Quit),
         Err(e) => Err(e),

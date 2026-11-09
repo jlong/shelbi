@@ -1,7 +1,7 @@
 ---
 title: shelbi wizard
 order: 11
-summary: Run the same detected, one-confirmation project setup used by first-run Shelbi.
+summary: Run the same four-step project setup used by first-run Shelbi, the TUI and the desktop app.
 ---
 
 ```text
@@ -9,16 +9,30 @@ shelbi wizard [OPTIONS]
 ```
 
 `shelbi wizard` is the explicit interactive entry point for Shelbi's first
-project setup. It inspects the current Git checkout and machine, prints the
-preflight results, and presents one setup card:
+project setup. It walks the four steps every way of adding a project shares
+(first-run `shelbi`, [`shelbi init`](/docs/cli/init), `shelbi project add`, the
+TUI's **Add project** dialog and the desktop app's **Add Project** wizard),
+each prompt starting on what Shelbi detected:
 
-```text
-Enter launch    c customize    q quit
-```
+1. **Folder**: the repository (the top of the Git checkout you're in) and the
+   project's name. A folder that isn't a Git repository gets an offer to run
+   `git init -b <branch>`; a folder holding a teammate's committed
+   `.shelbi/project.yaml` gets an offer to pick it up, which skips the other
+   steps.
+2. **Agents**: the default runner (the installed one preselected, Claude Code
+   when both are) and model.
+3. **Issues**: GitHub Issues or File system. GitHub is preselected, with the
+   `owner/repo` pre-filled, when the origin remote is a GitHub repo, and is
+   preflighted (`gh` installed and authenticated, Issues enabled, push access
+   for labels) before setup moves on. On a failure Shelbi explains the fix and
+   offers to retry or fall back to File system. See
+   [`shelbi init`](/docs/cli/init#where-your-issues-live).
+4. **Settings**: global (under `~/.shelbi/projects/`) or in-repo (committed at
+   `<repo>/.shelbi/`), with Shelbi's recommendation and why.
 
-Press Enter to create the detected plan and launch the dashboard. Press `c` to
-edit the prefilled project, repository, branch, remote, runner, orchestrator, and
-issue-tracker values. Press `q`, Esc, or Ctrl+C to leave without project state.
+Nothing is written until the last answer. Press Esc or Ctrl+C at any prompt to
+leave without project state. Creating the project prints its progress, then
+`✓ Project <name> created.`, and launches the dashboard.
 
 Creating the project also installs a Shelbi `pre-commit` hook in the repo and
 prints a one-time disclosure. The hook blocks commits to the default branch only
@@ -26,31 +40,15 @@ from Shelbi's agent sessions, never from your own shell, and it leaves a
 user-authored hook untouched. Remove it with
 [`shelbi guard uninstall`](/docs/cli/guard).
 
-If both Claude Code and Codex are detected, the wizard first asks `Which
-agent?`. If the current directory is not a Git repository, it first asks
-permission to run `git init -b main`. A missing runner prerequisite stops
-setup before the card and prints an install-and-retry message.
-
-The wizard also asks **where the project's issues should live**: GitHub Issues
-(a card is a GitHub issue your team can see and file) or File system (private
-markdown on this machine). GitHub is pre-selected, with the `owner/repo`
-pre-filled, when the origin remote is a GitHub repo; otherwise File system is the
-default. Choosing GitHub preflights `gh` (installed, authenticated, Issues
-enabled, and push access for label creation) before anything is written, and on
-a failure explains the fix and offers to retry or fall back to File system. The
-chosen backend shows on the setup card and is written as an `issue_tracker:`
-block in the project config. See [`shelbi init`](/docs/cli/init#where-your-issues-live)
-for the full behavior and [`shelbi issue-store migrate`](/docs/cli/issue#issue-store-migrate) to move
-an existing board between backends.
-
 The command is idempotent at the project-registration level. If any project is
 already registered, it exits quietly, without creating another one or opening
-the dashboard. Use
-`shelbi project add` to run the shared setup flow for an additional project.
+the dashboard. Use `shelbi project add` to run the same steps for an additional
+project.
 
 `wizard` honors the global `--root <PATH>` (the Shelbi state directory). The
-global `-p` and `-y` flags parse but have no effect here: the card is always
-interactive. For an unattended setup use [`shelbi init -y`](/docs/cli/init).
+global `-p` and `-y` flags parse but have no effect here: the wizard is always
+interactive. For an unattended setup use [`shelbi init -y`](/docs/cli/init),
+which takes every step's detected default.
 
 ## Examples
 
@@ -61,7 +59,7 @@ cd ~/code/myapp
 shelbi wizard
 ```
 
-For automation, use the non-interactive detected-plan path instead:
+For automation, accept every detected default instead:
 
 ```bash
 shelbi init -y --runner codex
@@ -70,6 +68,6 @@ shelbi init -y --runner codex
 ## See also
 
 - [Set up your first project](/docs/guides/getting-started/first-project) for
-  every happy-path and edge-path screen.
+  the walkthrough.
 - [`shelbi init`](/docs/cli/init) for scriptable setup and config pick-up.
 - [`shelbi project`](/docs/cli/project) for additional projects.

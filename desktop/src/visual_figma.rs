@@ -2311,20 +2311,23 @@ impl Run {
                         slug: Some("my-project".into()),
                         repo: Some(Repo::Git),
                         problem: None,
+                        facts: Default::default(),
                     }
                 }
             }),
             create: Arc::new(|_, _, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
             refresh: Arc::new(|| {}),
+            preflight: Arc::new(|_| Ok(())),
         };
         // Each state: its name, Continues pressed, the card chosen, whether a
         // folder is picked.
-        let states: [(&str, usize, Option<ConfigMode>, bool); 5] = [
+        let states: [(&str, usize, Option<ConfigMode>, bool); 6] = [
             ("add-project-folder", 0, None, false),
             ("add-project-folder-selected", 0, None, true),
             ("add-project-defaults", 1, None, true),
-            ("add-project-settings-in-repo", 2, Some(ConfigMode::InRepo), true),
-            ("add-project-settings-global", 2, Some(ConfigMode::Global), true),
+            ("add-project-issues", 2, None, true),
+            ("add-project-settings-in-repo", 3, Some(ConfigMode::InRepo), true),
+            ("add-project-settings-global", 3, Some(ConfigMode::Global), true),
         ];
         for (screen, continues, mode, pick) in states {
             let engine = engine.clone();

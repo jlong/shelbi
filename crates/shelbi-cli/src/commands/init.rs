@@ -1,79 +1,20 @@
+//! `shelbi init`: the shared new-project flow ([`crate::wizard`]) with its
+//! steps pre-answered by flags. Interactive at a terminal; `-y` (or no
+//! terminal) takes every detected default instead of asking.
+
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
-use inquire::Select;
+use shelbi_core::ConfigMode;
+use shelbi_orchestrator::project_create::{self, IN_REPO_CONFIG_REL};
 use shelbi_state::AgentMaterializeOutcome;
 
-use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig};
-use shelbi_orchestrator::project_create::{
-    self, render_project_yaml, render_split_project_yaml, write_new_project_registration,
-    write_workspace_settings_template, ScaffoldReporter,
-};
+use crate::issue_tracker_setup::RealGhProbe;
+use crate::wizard::{self, Defaults, IssuesPreset, Preset, Prompts, Runner, SetupOutcome};
 
-use crate::issue_tracker_setup::{self, RealGhProbe};
-use crate::project_root::{
-    project_name_collides, resolve_root_for_init, validate_project_name, validate_root,
-    ResolvedProjectRoot, RootValidation,
-};
-use crate::wizard::{self, Runner, SetupPlanOverrides};
-
-/// Prints scaffold progress to the terminal — the CLI's [`ScaffoldReporter`],
-/// byte-identical to the pre-move inline `println!` / `eprintln!` wording the
-/// `project_create` engine used to emit directly.
-struct StdoutReporter;
-
-impl ScaffoldReporter for StdoutReporter {
-    fn note(&mut self, line: &str) {
-        println!("{line}");
-    }
-    fn warn(&mut self, line: &str) {
-        eprintln!("{line}");
-    }
-}
-
-/// Scaffold a project through the shared [`project_create`] engine, printing its
-/// progress to the terminal. One call site for both `shelbi init` and the
-/// init-path tests, so the CLI keeps `InitMode` while the engine speaks
-/// [`shelbi_core::ConfigMode`].
-fn scaffold_project(
-    resolved: &ResolvedProjectRoot,
-    mode: InitMode,
-    issue_tracker: &IssueTrackerConfig,
-) -> Result<()> {
-    project_create::scaffold_project(resolved, mode.config_mode(), issue_tracker, &mut StdoutReporter)
-}
-
-pub mod heuristic;
-
-use heuristic::{probe_team_signals, recommend_mode};
-
-/// Filename of the committed, in-repo project config. Written under
-/// `<repo>/.shelbi/project.yaml` when the user picks `--mode in-repo`;
-/// read by `--pick-up` to register a teammate's already-committed
-/// project into the local registry.
-///
-/// The committed file is the **shared half** of the two-file split
-/// ([`shelbi_core::SHARED_PROJECT_FIELDS`]): the canonical `name:`,
-/// `config_mode: in-repo`, `default_branch`, `orchestrator`,
-/// `agent_runners`, and the rest of the shared surface. `--pick-up`
-/// stays name-anchored — it reads `name:` back as the canonical id — so
-/// the `name:` key must always carry a valid id slug regardless of what
-/// else the shared half grows. The user-local half (`repo`, `machines`,
-/// `workspaces`) lives per-machine in `~/.shelbi/projects/<id>/local.yaml`
-/// and is never committed.
-///
-/// A legacy committed file that predates the split (just `name:`) is
-/// still honored: `--pick-up` detects the incomplete shared half and
-/// falls back to a flat local registration so the project still loads.
-pub const IN_REPO_CONFIG_REL: &str = ".shelbi/project.yaml";
-
-/// Where the project config should live. Chosen once at `shelbi init`
-/// time and rendered into the on-disk layout the loader reads. In
-/// interactive mode the picker offers both with a heuristic-driven
-/// prefill; in non-interactive mode this flag is required (no silent
-/// default — the wrong choice is destructive enough that we won't guess).
+/// Where the project config should live (`--mode`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum InitMode {
     /// Committed to the repo at `<repo>/.shelbi/project.yaml`. Shared
@@ -86,8 +27,17 @@ pub enum InitMode {
     Global,
 }
 
-/// The `--issue-tracker` backend choice for non-interactive (`-y`) init. Only
-/// the two live backends are selectable; jira/linear parse but have no store.
+impl InitMode {
+    fn config_mode(self) -> ConfigMode {
+        match self {
+            InitMode::InRepo => ConfigMode::InRepo,
+            InitMode::Global => ConfigMode::Global,
+        }
+    }
+}
+
+/// The `--issue-tracker` backend choice. Only the two live backends are
+/// selectable; jira/linear parse but have no store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum IssueTrackerArg {
     /// Store issues as GitHub issues in `--github-repo` (or the detected repo).
@@ -96,23 +46,6 @@ pub enum IssueTrackerArg {
     /// Keep issues as local markdown under `~/.shelbi/projects/<name>/tasks/`.
     #[value(name = "file_system", alias = "file-system")]
     FileSystem,
-}
-
-impl InitMode {
-    fn short_label(self) -> &'static str {
-        match self {
-            InitMode::InRepo => "in-repo",
-            InitMode::Global => "global",
-        }
-    }
-
-    /// Map the CLI's init-mode flag to the shared engine's config-mode enum.
-    fn config_mode(self) -> shelbi_core::ConfigMode {
-        match self {
-            InitMode::InRepo => shelbi_core::ConfigMode::InRepo,
-            InitMode::Global => shelbi_core::ConfigMode::Global,
-        }
-    }
 }
 
 #[derive(Debug, ClapArgs)]
@@ -129,30 +62,37 @@ pub struct Args {
     #[arg(long)]
     pub root: Option<PathBuf>,
 
-    /// Agent runner for every generated workspace. In `-y` mode Shelbi
-    /// detects this when exactly one supported runner is on PATH. When both
-    /// are installed, pass `--runner claude` or `--runner codex`.
+    /// The agents' default runner (the Agents step). Defaults to the
+    /// installed runner (Claude Code when both are), which `-y` must find on
+    /// PATH.
     #[arg(long, value_enum, value_name = "RUNNER")]
     pub(crate) runner: Option<Runner>,
 
-    /// Override the detected default Git branch in `-y` mode.
+    /// The agents' default model (the Agents step). Defaults to the
+    /// runner's own default.
+    #[arg(long, value_name = "MODEL")]
+    pub(crate) model: Option<String>,
+
+    /// Override the detected default Git branch (also the branch a `git
+    /// init` creates).
     #[arg(long, alias = "branch", value_name = "BRANCH")]
     pub(crate) default_branch: Option<String>,
 
-    /// Override the detected origin URL in `-y` mode. Credentials are removed
-    /// before the URL is written. Pass an empty value to omit the URL.
+    /// Override the detected origin URL. Credentials are removed before the
+    /// URL is written. Pass an empty value to omit the URL.
     #[arg(long, alias = "remote", value_name = "URL")]
     pub(crate) github_url: Option<String>,
 
-    /// Override the orchestrator runner in `-y` mode. Defaults to `--runner`
-    /// (or the single detected runner) and must also be installed on PATH.
-    #[arg(long, value_enum, value_name = "RUNNER")]
+    /// Deprecated: the orchestrator runs on `--runner`, the agents' default.
+    /// Accepted as `--runner` when that flag is absent.
+    #[arg(long, value_enum, value_name = "RUNNER", hide = true)]
     pub(crate) orchestrator_runner: Option<Runner>,
 
-    /// Where the project's issues live, in `-y` mode: `github` stores them as
-    /// GitHub issues (preflighted before anything is written); `file_system`
-    /// (the default) keeps them as local markdown. Omit to keep `file_system`,
-    /// so existing scripted setups are unchanged.
+    /// Where the project's issues live (the Issues step): `github` stores
+    /// them as GitHub issues (preflighted before anything is written);
+    /// `file_system` keeps them as local markdown. Defaults to GitHub when
+    /// the origin is a GitHub repo that passes the preflight, else
+    /// `file_system`.
     #[arg(long, value_enum, value_name = "BACKEND")]
     pub(crate) issue_tracker: Option<IssueTrackerArg>,
 
@@ -162,751 +102,103 @@ pub struct Args {
     #[arg(long, value_name = "OWNER/REPO")]
     pub(crate) github_repo: Option<String>,
 
-    /// Where the project config should live: `in-repo` writes a
-    /// committed `<repo>/.shelbi/project.yaml` shared with the team;
-    /// `global` keeps everything under `~/.shelbi/projects/`. In
-    /// interactive contexts this may be omitted — the wizard asks and
-    /// prefills a recommendation. In the legacy flow, non-interactive callers
-    /// must choose it explicitly. It cannot be combined with `-y`, whose
-    /// detected plan uses the onboarding card's global layout.
+    /// Where the project's settings live (the Settings step): `in-repo`
+    /// writes a committed `<repo>/.shelbi/project.yaml` shared with the
+    /// team; `global` keeps everything under `~/.shelbi/projects/`. Defaults
+    /// to the folder's recommendation: in-repo when it has an origin and
+    /// more than one committer, else global.
     #[arg(long, value_enum)]
     pub mode: Option<InitMode>,
 
-    /// Register an existing `<repo>/.shelbi/project.yaml` into the
-    /// local registry — the flow for cloning a teammate's shelbi
-    /// project. Skips mode selection (the mode is already `in-repo`
-    /// by virtue of the committed file existing) and prompts only for
-    /// the user-local fields. If the canonical name collides with an
-    /// existing local project, the local alias is auto-suffixed
-    /// (`-2`, `-3`, …) — the committed YAML is never touched. See
-    /// `site/content/docs/concepts/config-modes.mdx` for the full
-    /// pick-up walkthrough.
+    /// Register an existing `<repo>/.shelbi/project.yaml` (a teammate's
+    /// committed project) on this machine. The Folder step offers this on
+    /// its own when it finds one; the flag also looks in parent folders and
+    /// takes the offer without asking. If the committed name is taken
+    /// locally, the local alias is suffixed (`-2`, `-3`, …). See
+    /// `site/content/docs/concepts/config-modes.mdx`.
     #[arg(long)]
     pub pick_up: bool,
 }
 
-impl Args {
-    fn has_detected_plan_overrides(&self) -> bool {
-        self.runner.is_some()
-            || self.default_branch.is_some()
-            || self.github_url.is_some()
-            || self.orchestrator_runner.is_some()
-            || self.issue_tracker.is_some()
-            || self.github_repo.is_some()
-    }
-}
-
 pub fn run(args: Args, assume_yes: bool) -> Result<()> {
-    if assume_yes {
-        return run_detected_plan(args);
-    }
-    if args.has_detected_plan_overrides() {
-        bail!(
-            "detected-plan overrides require `shelbi init -y`; without `-y`, use the existing interactive init flow"
-        );
-    }
-
-    if args.pick_up {
-        let outcome = run_pick_up(args)?;
-        println!();
-        println!("next:");
-        println!(
-            "  1. add machines/workspaces to {} if needed",
-            outcome.registration_path.display()
-        );
-        if outcome.suffixed_from.is_some() {
-            println!(
-                "  2. pass `-p {}` on the command line to target this project",
-                outcome.local_alias
-            );
-            println!(
-                "     (the committed name `{}` was already taken locally — the alias only \
-                 affects your machine)",
-                outcome.canonical_name
-            );
-        } else {
-            println!(
-                "  2. spawn your first agent: shelbi spawn TASK --on hub --runner claude \"…\""
-            );
+    let interactive = !assume_yes && std::io::stdin().is_terminal();
+    let preset = preset(args)?;
+    let outcome = if interactive {
+        wizard::setup(preset, &mut Prompts)?
+    } else {
+        wizard::setup(preset, &mut Defaults { gh: &mut RealGhProbe })?
+    };
+    if let SetupOutcome::Created(project) = outcome {
+        if interactive {
+            println!();
+            println!("next: run `shelbi` here to open {project}; its orchestrator sets up your workspaces.");
         }
-        return Ok(());
     }
-
-    let resolved = scaffold_with_prompt(args)?;
-    println!();
-    println!("next:");
-    println!(
-        "  1. add machines to ~/.shelbi/projects/{}.yaml if you have remote hubs",
-        resolved.name
-    );
-    println!("  2. add the project to ~/.shelbi/sessions/default.yaml's projects: list");
-    println!("  3. spawn your first agent: shelbi spawn TASK --on hub --runner claude \"…\"");
     Ok(())
 }
 
-/// Resolve, validate, and commit the detected onboarding plan without ever
-/// consulting stdin or terminal state. Legacy config-mode and pick-up setup
-/// stay on the existing path because neither is represented by the detected
-/// card model.
-fn run_detected_plan(args: Args) -> Result<()> {
-    if args.pick_up || args.mode.is_some() {
-        bail!(
-            "`shelbi init -y` cannot be combined with `--pick-up` or `--mode`; run those legacy flows without `-y`"
-        );
-    }
-
-    let root = noninteractive_project_root(args.root.as_deref())?;
-    if let Some(project) =
-        shelbi_state::resolve_project_for_cwd(&root).map_err(|error| anyhow!(error))?
-    {
-        println!("✓ Project {project} is already configured.");
-        return Ok(());
-    }
-
-    let mut plan = wizard::detect_setup_plan(&root, args.runner)?;
-    // Resolve the issue-tracker choice before any write. A `github` choice is
-    // preflighted here (non-interactively: a failure is a hard error naming the
-    // fix, never a silent fall-back), so `-y` never writes a GitHub config that
-    // won't load. Absent `--issue-tracker` keeps `file_system`.
-    let issue_tracker = resolve_noninteractive_issue_tracker(
-        args.issue_tracker,
-        args.github_repo.as_deref(),
-        plan.remote_url.as_deref(),
-        &mut RealGhProbe,
-    )?;
-    plan.apply_overrides(SetupPlanOverrides {
-        project_name: args.project,
-        default_branch: args.default_branch,
-        remote_url: args.github_url,
-        orchestrator_runner: args.orchestrator_runner,
-        issue_tracker,
-    })?;
-    print_issue_tracker_plan(&plan.issue_tracker);
-    match wizard::accept_setup_plan(plan)? {
-        wizard::SetupOutcome::Created(_) => Ok(()),
-        wizard::SetupOutcome::Quit => {
-            bail!("non-interactive setup quit before creating the project")
-        }
-    }
-}
-
-/// Resolve the `-y` issue-tracker override from the flags, preflighting a
-/// `github` choice before it can be written. Returns `None` when no
-/// `--issue-tracker` was passed (keep the `file_system` default), so existing
-/// scripted setups are unchanged.
-fn resolve_noninteractive_issue_tracker<P: issue_tracker_setup::GhProbe + ?Sized>(
-    arg: Option<IssueTrackerArg>,
-    github_repo: Option<&str>,
-    detected_remote: Option<&str>,
-    probe: &mut P,
-) -> Result<Option<IssueTrackerConfig>> {
-    match arg {
-        None => {
-            if github_repo.is_some() {
-                bail!("--github-repo requires `--issue-tracker github`");
-            }
-            Ok(None)
-        }
-        Some(IssueTrackerArg::FileSystem) => {
-            if github_repo.is_some() {
-                bail!("--github-repo requires `--issue-tracker github`");
-            }
-            Ok(Some(issue_tracker_setup::file_system_config()))
-        }
-        Some(IssueTrackerArg::Github) => {
-            let repo = github_repo
-                .map(str::to_string)
-                .or_else(|| issue_tracker_setup::detect_github_repo(detected_remote))
-                .ok_or_else(|| {
-                    anyhow!(
-                        "no GitHub repo for `--issue-tracker github`: the origin remote isn't a \
-                         GitHub repo. Pass `--github-repo owner/repo`."
-                    )
-                })?;
-            let cfg = issue_tracker_setup::github_config(&repo)?;
-            // Never write a GitHub config that won't load — preflight first.
-            if let Err(failure) = issue_tracker_setup::github_preflight(&repo, probe) {
-                bail!("{}", failure.guidance());
-            }
-            Ok(Some(cfg))
-        }
-    }
-}
-
-/// Print the resolved issue-tracker choice in the `-y` plan summary. For GitHub
-/// it also discloses the labels and body metadata Shelbi will write.
-fn print_issue_tracker_plan(tracker: &IssueTrackerConfig) {
-    match tracker.backend {
-        IssueTrackerBackend::Github => {
-            let repo = tracker
-                .github
-                .as_ref()
-                .map(|g| g.repo.as_str())
-                .unwrap_or("");
-            println!("✓ issue tracker: GitHub ({repo})");
-            println!("  {}", issue_tracker_setup::GITHUB_DISCLOSURE);
-        }
-        _ => println!("✓ issue tracker: file system (local markdown)"),
-    }
-}
-
-fn noninteractive_project_root(requested: Option<&Path>) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("reading current directory")?;
-    let root = match requested {
-        Some(path) if path.is_absolute() => path.to_path_buf(),
-        Some(path) => cwd.join(path),
-        None => cwd,
+/// The steps `args` pre-answer.
+fn preset(args: Args) -> Result<Preset> {
+    let runner = match (args.runner, args.orchestrator_runner) {
+        (Some(runner), Some(orchestrator)) if runner != orchestrator => bail!(
+            "`--orchestrator-runner` is retired: the orchestrator runs on the agents' default              runner. Pass only `--runner {orchestrator}`."
+        ),
+        (runner, orchestrator) => runner.or(orchestrator),
     };
+    let issues = match (args.issue_tracker, args.github_repo) {
+        (None | Some(IssueTrackerArg::FileSystem), Some(_)) => {
+            bail!("--github-repo requires `--issue-tracker github`")
+        }
+        (None, None) => None,
+        (Some(IssueTrackerArg::FileSystem), None) => Some(IssuesPreset::FileSystem),
+        (Some(IssueTrackerArg::Github), repo) => Some(IssuesPreset::Github { repo }),
+    };
+    let cwd = std::env::current_dir().context("reading current directory")?;
+    let root = match args.root {
+        Some(root) => Some(canonical_root(&cwd, &root)?),
+        // `--pick-up` looks for the committed config from here up.
+        None if args.pick_up => Some(find_in_repo_config_ancestor(&cwd).ok_or_else(|| {
+            anyhow!(
+                "no `.shelbi/project.yaml` found in {} or any parent — pass --root <path> to \
+                 point shelbi at the checkout, or drop the --pick-up flag for a fresh project.",
+                cwd.display()
+            )
+        })?),
+        None => None,
+    };
+    Ok(Preset {
+        root,
+        project: args.project,
+        pick_up: args.pick_up,
+        runner,
+        model: args.model,
+        issues,
+        mode: args.mode.map(InitMode::config_mode),
+        default_branch: args.default_branch,
+        remote: args.github_url,
+    })
+}
+
+/// `--root`, resolved against `cwd`, which must name an existing folder.
+fn canonical_root(cwd: &Path, root: &Path) -> Result<PathBuf> {
+    let root = project_create::absolutize(cwd, root);
     if !root.exists() {
         bail!("project root {} does not exist", root.display());
     }
     if !root.is_dir() {
         bail!("project root {} is not a directory", root.display());
     }
-    std::fs::canonicalize(&root)
-        .with_context(|| format!("resolving project root {}", root.display()))
-}
-
-/// `shelbi init` entry point factored so the no-subcommand first-run
-/// path can share the same scaffolding without printing the trailing
-/// `next:` block (that path is about to launch the TUI, so the hints
-/// would just scroll off-screen).
-///
-/// Resolves the project root (prompting interactively, or honoring
-/// `--root` when supplied), asks the mode question (or reads it from
-/// `--mode`), then writes the project config, workspace-settings template,
-/// default agent workspaces, and the project-wide statuses catalogue.
-/// Global mode writes the flat `~/.shelbi/projects/<name>.yaml`; in-repo
-/// mode writes the two-file split — the committed shared half at
-/// `<repo>/.shelbi/project.yaml` plus the user-local half at
-/// `~/.shelbi/projects/<name>/local.yaml`, and no flat registry YAML. No
-/// `.shelbi/project` marker is written — resolution reverse-looks-up the
-/// directory against the registered projects (see
-/// [`shelbi_state::resolve_project_for_cwd`]).
-pub fn scaffold_with_prompt(args: Args) -> Result<ResolvedProjectRoot> {
-    // Hard-fail with a clear, source-tagged error if the shelbi root is
-    // unwritable; otherwise materialize the standard layout
-    // (projects/, sessions/, agents/, logs/, workspaces/).
-    let home = shelbi_state::ensure_root_subdirs().map_err(|e| anyhow!(e))?;
-
-    let sessions_dir = shelbi_state::sessions_dir().map_err(|e| anyhow!(e))?;
-
-    let default_session = sessions_dir.join("default.yaml");
-    if !default_session.exists() {
-        std::fs::write(
-            &default_session,
-            "name: default\nprojects: []\nstartup: []\n",
-        )?;
-    }
-
-    // Drop a self-documenting hub-wide `config.yaml` if one isn't present yet,
-    // so the UI preferences (and the pointer to keys.yaml) are discoverable
-    // inline. Idempotent — never clobbers an existing config.
-    if shelbi_state::scaffold_user_config_if_missing().map_err(|e| anyhow!(e))? {
-        let cfg_path = shelbi_state::user_config_path().map_err(|e| anyhow!(e))?;
-        println!("✓ wrote global config: {}", cfg_path.display());
-    }
-
-    println!("✓ scaffolded {}", home.display());
-
-    // Interactivity is purely a function of the TTY. `--root` only skips
-    // the "Project root?" prompt (that's all its help promises); it must
-    // NOT flip us to non-interactive and thereby hard-error on a missing
-    // `--mode` when the user is sitting at a terminal ready to answer the
-    // mode picker.
-    let interactive = std::io::stdin().is_terminal();
-    if interactive {
-        println!();
-        println!("shelbi setup — let's get your project configured.");
-        println!();
-    }
-
-    let cwd = std::env::current_dir()?;
-    let resolved = resolve_root_for_init(&cwd, args.root.clone(), args.project.as_deref())?;
-
-    // Half-set-up detection: a bare `shelbi init` (no --mode, no --pick-up)
-    // that lands on a repo already carrying a committed
-    // `<repo>/.shelbi/project.yaml` but no matching local registry entry
-    // is the pick-up scenario in disguise. Surface it and bail rather
-    // than silently scaffolding a second (conflicting) local project on
-    // top of the committed one.
-    let in_repo_config = resolved.path.join(IN_REPO_CONFIG_REL);
-    if in_repo_config.is_file() && args.mode.is_none() {
-        if let Some(committed_name) = read_in_repo_name(&in_repo_config)? {
-            // Only nag when there's no local mirror yet — a re-run of
-            // `shelbi init` inside a project where both files exist is
-            // handled by the collision check below.
-            if !project_name_collides(&committed_name)? {
-                bail!(
-                    "found {} (committed) but no local registry entry for `{committed_name}` — \
-                     this repo looks like a teammate's shelbi project. Run \
-                     `shelbi init --pick-up` to register it locally.",
-                    in_repo_config.display()
-                );
-            }
-        }
-    }
-
-    let mode = resolve_mode(args.mode, interactive, &resolved.path)?;
-
-    let issue_tracker = resolve_issue_tracker_for_scaffold(&args, interactive, &resolved)?;
-
-    scaffold_project(&resolved, mode, &issue_tracker)?;
-    Ok(resolved)
-}
-
-/// Resolve the board backend for the legacy / palette scaffold path.
-///
-/// Precedence mirrors the mode picker: an explicit `--issue-tracker` flag wins
-/// (and is preflighted, never a silent fall-back — the same contract `-y`
-/// uses); an interactive terminal is asked with GitHub pre-selected and the
-/// origin repo pre-filled; a non-interactive caller with no flag (the palette
-/// "Add project" dialog) keeps the `file_system` default. A GitHub choice on a
-/// project that already has a non-empty local board is refused with a pointer to
-/// `issue-store migrate`, so setup never strands existing cards.
-fn resolve_issue_tracker_for_scaffold(
-    args: &Args,
-    interactive: bool,
-    resolved: &ResolvedProjectRoot,
-) -> Result<IssueTrackerConfig> {
-    let remote = detect_origin_remote(&resolved.path);
-    let tracker = if args.issue_tracker.is_some() {
-        resolve_noninteractive_issue_tracker(
-            args.issue_tracker,
-            args.github_repo.as_deref(),
-            remote.as_deref(),
-            &mut RealGhProbe,
-        )?
-        .unwrap_or_else(issue_tracker_setup::file_system_config)
-    } else if interactive {
-        let suggestion = crate::issue_tracker_setup::GithubSuggestion {
-            repo: issue_tracker_setup::detect_github_repo(remote.as_deref()),
-        };
-        issue_tracker_setup::choose_issue_tracker_interactive(&suggestion, &mut RealGhProbe)?
-    } else {
-        issue_tracker_setup::file_system_config()
-    };
-
-    issue_tracker_setup::ensure_board_not_stranded(&resolved.name, &tracker)?;
-    Ok(tracker)
-}
-
-/// Best-effort read of the origin remote URL for issue-tracker repo detection.
-/// Any git failure (missing binary, non-repo, no remote) resolves to `None`.
-fn detect_origin_remote(root: &Path) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(["config", "--get", "remote.origin.url"])
-        .current_dir(root)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    (!url.is_empty()).then_some(url)
-}
-
-/// Decide the [`InitMode`] using the precedence documented on the flag:
-/// `--mode` wins when set; interactive mode falls back to the picker
-/// (prefilled from the heuristic); non-interactive without `--mode` is
-/// a hard error so scripts can't silently pick the wrong side.
-fn resolve_mode(from_flag: Option<InitMode>, interactive: bool, root: &Path) -> Result<InitMode> {
-    if let Some(m) = from_flag {
-        return Ok(m);
-    }
-    if !interactive {
-        bail!(
-            "shelbi init: pass `--mode in-repo` or `--mode global` — non-interactive callers \
-             must choose explicitly (no silent default)."
-        );
-    }
-    prompt_mode(root)
-}
-
-/// Interactive mode picker. Prefills the selection cursor with the
-/// heuristic's recommendation so a team repo lands on `in-repo` by
-/// default (but the user still confirms).
-fn prompt_mode(root: &Path) -> Result<InitMode> {
-    let signals = probe_team_signals(root);
-    let recommended = recommend_mode(&signals);
-    let recommendation_hint = match recommended {
-        InitMode::InRepo => {
-            "  (recommended: in-repo — multiple committers and a remote origin were detected)"
-        }
-        InitMode::Global => {
-            "  (recommended: global — this looks like a solo checkout: no remote or single committer)"
-        }
-    };
-    println!();
-    println!("Where should this project's shelbi config live?");
-    println!("  in-repo — committed at <repo>/.shelbi/project.yaml, shared with the team.");
-    println!("  global  — per-user under ~/.shelbi/projects/<name>.yaml, not committed.");
-    println!("{recommendation_hint}");
-
-    let options = vec![ModeChoice(InitMode::InRepo), ModeChoice(InitMode::Global)];
-    let starting_cursor = match recommended {
-        InitMode::InRepo => 0,
-        InitMode::Global => 1,
-    };
-    let picked = Select::new("Config location:", options)
-        .with_starting_cursor(starting_cursor)
-        .prompt()
-        .context("mode prompt")?;
-    Ok(picked.0)
-}
-
-struct ModeChoice(InitMode);
-
-impl std::fmt::Display for ModeChoice {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0.short_label())
-    }
-}
-
-/// Best-effort read of the canonical `name:` from a committed
-/// `<repo>/.shelbi/project.yaml`. Returns `Ok(None)` when the file
-/// isn't a YAML map with a `name` key — we don't want a malformed
-/// commit to abort `shelbi init` on every clone.
-fn read_in_repo_name(path: &Path) -> Result<Option<String>> {
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    #[derive(serde::Deserialize)]
-    struct Head {
-        name: Option<String>,
-    }
-    let head: Head = match serde_yaml::from_str(&text) {
-        Ok(h) => h,
-        Err(_) => return Ok(None),
-    };
-    Ok(head.name.and_then(|n| {
-        let t = n.trim().to_string();
-        if t.is_empty() {
-            None
-        } else {
-            Some(t)
-        }
-    }))
-}
-
-/// `shelbi init --pick-up`: register a teammate's committed
-/// `<repo>/.shelbi/project.yaml` into the local registry.
-///
-/// The scoping rule: nothing about the committed file changes; only
-/// the local `~/.shelbi/projects/<alias>.yaml` is written. If the
-/// canonical name already exists locally (a common case when two
-/// teammates share the same project name from different repos), the
-/// local alias is auto-suffixed — the user picks the alias out of the
-/// success message and passes it to `shelbi -p`.
-fn run_pick_up(args: Args) -> Result<PickUpOutcome> {
-    // Same root-resolution flow as fresh init — TTY-gated for the
-    // prompt-based branch, honors `--root` when scripted. `--project`
-    // still works: it lets the user override the local alias even
-    // before the auto-suffix kicks in.
-    let home = shelbi_state::ensure_root_subdirs().map_err(|e| anyhow!(e))?;
-    let sessions_dir = shelbi_state::sessions_dir().map_err(|e| anyhow!(e))?;
-    let default_session = sessions_dir.join("default.yaml");
-    if !default_session.exists() {
-        std::fs::write(
-            &default_session,
-            "name: default\nprojects: []\nstartup: []\n",
-        )?;
-    }
-    println!("✓ scaffolded {}", home.display());
-
-    let cwd = std::env::current_dir()?;
-    let repo_root = resolve_repo_root_for_pick_up(&cwd, args.root.as_deref())?;
-
-    let config_path = repo_root.join(IN_REPO_CONFIG_REL);
-    if !config_path.is_file() {
-        bail!(
-            "no committed config at {} — expected `<repo>/{}`. Did you mean plain \
-             `shelbi init` for a fresh project?",
-            config_path.display(),
-            IN_REPO_CONFIG_REL
-        );
-    }
-    let canonical_name = read_in_repo_name(&config_path)?.ok_or_else(|| {
-        anyhow!(
-            "the committed {} is missing a `name:` key — refusing to pick up an unnamed project. \
-             Ask a teammate to fix the committed file, or scaffold a fresh one with `shelbi init`.",
-            config_path.display()
-        )
-    })?;
-    // The committed name is attacker-influenced by design — `--pick-up`
-    // runs on a repo we didn't create — so it must clear the same charset
-    // gate as any other project name BEFORE it's joined into
-    // `~/.shelbi/projects/<name>.yaml`. Rejects `../…` traversal and
-    // newline-injected registry keys.
-    validate_project_name(&canonical_name).with_context(|| {
-        format!(
-            "the committed {} carries an unusable project name",
-            config_path.display()
-        )
-    })?;
-
-    // Share the same registration transaction lock as fresh scaffolding.
-    // Without it, a fresh init could seed Welcome state for an alias just
-    // before this existing-project path claimed the registration.
-    let _scaffold_lock = shelbi_state::lock_project_scaffold().map_err(|e| anyhow!(e))?;
-
-    // Honor `--project` as an explicit override (the user picking their
-    // own local alias up front); otherwise walk the collision ladder
-    // starting from the canonical name.
-    let (local_alias, suffixed_from) = if let Some(raw_override) = args.project.clone() {
-        // `--project` is an explicit name the user typed, so normalize it into
-        // the agent-id charset (announcing the change) rather than rejecting a
-        // folder-style value like `My-Repo`.
-        let override_name = crate::project_root::normalize_project_name_announced(&raw_override)?;
-        if project_name_collides(&override_name)? {
-            bail!(
-                "a shelbi project named `{override_name}` already exists locally — pick a \
-                 different `--project` name or omit the flag to let shelbi auto-suffix from \
-                 `{canonical_name}`."
-            );
-        }
-        (override_name, None)
-    } else {
-        next_available_alias(&canonical_name)?
-    };
-
-    if let Some(from) = &suffixed_from {
-        println!(
-            "note: local alias `{}` was already taken — using `{}` on this machine instead \
-             (the committed name is unchanged)",
-            from, local_alias
-        );
-    }
-
-    // Pick-up is inherently an in-repo project: the repo already carries a
-    // committed `<repo>/.shelbi/project.yaml`, which we NEVER rewrite. So we
-    // register only the user-local half at
-    // `~/.shelbi/projects/<alias>/local.yaml` (repo/work_dir default to the
-    // checkout; the user can add remote machines and workspaces later) and read
-    // the committed shared half in place. The teammate's agents/workflows/
-    // statuses then resolve to — and materialize under — the repo's committed
-    // `.shelbi/`, not a divergent global copy.
-    //
-    // That split only loads when the committed file is a COMPLETE shared half.
-    // A repo whose committed config predates the shared/local split is a
-    // name-only stub (see the `IN_REPO_CONFIG_REL` doc comment), and a split
-    // registration against it wouldn't merge into a valid project. For that
-    // legacy shape we fall back to the historical flat registration so pick-up
-    // still yields a loadable project.
-    let projects_dir = shelbi_state::projects_dir().map_err(|e| anyhow!(e))?;
-    // The committed `<repo>/.shelbi/project.yaml` already carries any
-    // `display_name`; the local mirror keys everything on the alias slug.
-    // Pick-up registers an existing project; its board backend lives in the
-    // committed shared config (a SHARED field), never set here — the local
-    // mirror carries only the user-local fields, so the default is inert.
-    let fs_tracker = issue_tracker_setup::file_system_config();
-    let (_shared, local_body) = render_split_project_yaml(
-        &local_alias,
-        None,
-        &repo_root.to_string_lossy(),
-        &repo_root,
-        &fs_tracker,
-    )?;
-    let committed_text = std::fs::read_to_string(&config_path)
-        .with_context(|| format!("reading {}", config_path.display()))?;
-    let committed_is_complete_shared =
-        shelbi_core::Project::from_split_yaml_str(&committed_text, &local_body).is_ok();
-
-    let registration_path = if committed_is_complete_shared {
-        let local_path = projects_dir.join(&local_alias).join("local.yaml");
-        if !write_new_project_registration(&local_alias, &local_path, &local_body)? {
-            bail!(
-                "a shelbi project named `{local_alias}` was registered concurrently; retry \
-                 `shelbi init --pick-up` to choose the next available local alias"
-            );
-        }
-        println!("✓ registered project (in-repo): {}", local_path.display());
-        local_path
-    } else {
-        // Legacy name-only committed config: keep the full picture locally in a
-        // flat registration so the project opens without a complete shared half.
-        let yaml_path = projects_dir.join(format!("{}.yaml", local_alias));
-        let yaml = render_project_yaml(
-            &local_alias,
-            None,
-            &repo_root.to_string_lossy(),
-            &repo_root,
-            Some("in-repo"),
-            &fs_tracker,
-        )?;
-        if !write_new_project_registration(&local_alias, &yaml_path, &yaml)? {
-            bail!(
-                "a shelbi project named `{local_alias}` was registered concurrently; retry \
-                 `shelbi init --pick-up` to choose the next available local alias"
-            );
-        }
-        println!("✓ registered project: {}", yaml_path.display());
-        yaml_path
-    };
-
-    write_workspace_settings_template(&local_alias, &mut StdoutReporter)?;
-    let outcomes = shelbi_state::self_heal_default_agents(&local_alias).map_err(|e| anyhow!(e))?;
-    for outcome in outcomes {
-        print_agent_materialize_outcome(&outcome);
-    }
-
-    let statuses_path = shelbi_state::statuses_path(&local_alias).map_err(|e| anyhow!(e))?;
-    if !statuses_path.exists() {
-        shelbi_state::scaffold_project_statuses(&local_alias).map_err(|e| anyhow!(e))?;
-        println!("✓ wrote project statuses: {}", statuses_path.display());
-    }
-    for path in shelbi_state::scaffold_project_workflow(&local_alias).map_err(|e| anyhow!(e))? {
-        println!("✓ wrote project workflow: {}", path.display());
-    }
-    match shelbi_state::scaffold_zenmode(&local_alias).map_err(|e| anyhow!(e))? {
-        shelbi_state::ZenmodeOutcome::Created => {
-            let path = shelbi_state::zenmode_path(&local_alias).map_err(|e| anyhow!(e))?;
-            println!("✓ wrote Zen policy: {}", path.display());
-        }
-        shelbi_state::ZenmodeOutcome::Migrated => {
-            let path = shelbi_state::zenmode_path(&local_alias).map_err(|e| anyhow!(e))?;
-            println!(
-                "✓ pinned legacy Zen PR commands in {} (custom prose preserved)",
-                path.display()
-            );
-        }
-        shelbi_state::ZenmodeOutcome::Unchanged => {}
-    }
-    if let shelbi_state::PrTemplateOutcome::Created =
-        shelbi_state::scaffold_pr_template(&local_alias).map_err(|e| anyhow!(e))?
-    {
-        let path = shelbi_state::pr_template_path(&local_alias).map_err(|e| anyhow!(e))?;
-        println!("✓ wrote PR template: {}", path.display());
-    }
-    if let shelbi_state::ChangelogTemplateOutcome::Created =
-        shelbi_state::scaffold_changelog_template(&local_alias).map_err(|e| anyhow!(e))?
-    {
-        let path = shelbi_state::changelog_template_path(&local_alias).map_err(|e| anyhow!(e))?;
-        println!("✓ wrote changelog template: {}", path.display());
-    }
-    if let shelbi_state::SharedPreambleOutcome::Created =
-        shelbi_state::scaffold_shared_preamble(&local_alias).map_err(|e| anyhow!(e))?
-    {
-        let path =
-            shelbi_state::agent_shared_preamble_path(&local_alias).map_err(|e| anyhow!(e))?;
-        println!("✓ wrote shared agent preamble (hub safety): {}", path.display());
-    }
-
-    println!();
-    if suffixed_from.is_some() {
-        println!(
-            "✓ picked up `{canonical_name}` from {} as local alias `{local_alias}`.",
-            config_path.display()
-        );
-        println!(
-            "  Tip: `shelbi project rename` can retitle the local alias to something friendlier."
-        );
-    } else {
-        println!(
-            "✓ picked up `{canonical_name}` from {}.",
-            config_path.display()
-        );
-    }
-
-    Ok(PickUpOutcome {
-        canonical_name,
-        local_alias,
-        suffixed_from,
-        registration_path,
-    })
-}
-
-/// Result of the `--pick-up` flow, threaded through to the top-level
-/// `next:` renderer so it knows whether to nudge the user about the
-/// suffix or not.
-struct PickUpOutcome {
-    canonical_name: String,
-    local_alias: String,
-    /// `Some(canonical_name)` when the local alias diverged from the
-    /// canonical due to a collision, `None` when they match.
-    suffixed_from: Option<String>,
-    /// The local registration file that was written — the split
-    /// `~/.shelbi/projects/<alias>/local.yaml` for a normal in-repo pick-up,
-    /// or the flat `~/.shelbi/projects/<alias>.yaml` for the legacy fallback.
-    /// Threaded out so the `next:` hint points at the file the user actually
-    /// edits to add machines/workspaces.
-    registration_path: PathBuf,
-}
-
-/// Resolve the repo root for `--pick-up`: `--root` wins, otherwise walk
-/// up from `cwd` looking for `<parent>/.shelbi/project.yaml`. Doesn't
-/// prompt — `--pick-up` is deliberately a low-ceremony flow.
-fn resolve_repo_root_for_pick_up(cwd: &Path, force_root: Option<&Path>) -> Result<PathBuf> {
-    if let Some(root) = force_root {
-        let path = absolutize(cwd, root);
-        match validate_root(&path) {
-            RootValidation::Ok | RootValidation::NotGitRepo => Ok(path),
-            RootValidation::NotExists => bail!("{} doesn't exist", path.display()),
-            RootValidation::NotDirectory => bail!("{} is not a directory", path.display()),
-        }
-    } else {
-        find_in_repo_config_ancestor(cwd).ok_or_else(|| {
-            anyhow!(
-                "no `.shelbi/project.yaml` found in {} or any parent — pass --root <path> to \
-                 point shelbi at the checkout, or drop the --pick-up flag for a fresh project.",
-                cwd.display()
-            )
-        })
-    }
+    std::fs::canonicalize(&root).with_context(|| format!("resolving project root {}", root.display()))
 }
 
 /// Walk from `start` up to the filesystem root looking for a
-/// `.shelbi/project.yaml`. Returns the ancestor that contains it (i.e.
-/// the repo root), not the config path itself. `--pick-up` is
-/// convenience wiring, so we handle nested cwds transparently — the
-/// user shouldn't have to `cd` to the repo root before invoking it.
+/// `.shelbi/project.yaml`: the ancestor holding it (the repo root).
 fn find_in_repo_config_ancestor(start: &Path) -> Option<PathBuf> {
-    let mut cur = Some(start);
-    while let Some(dir) = cur {
-        if dir.join(IN_REPO_CONFIG_REL).is_file() {
-            return Some(dir.to_path_buf());
-        }
-        cur = dir.parent();
-    }
-    None
+    start.ancestors().find(|dir| dir.join(IN_REPO_CONFIG_REL).is_file()).map(Path::to_path_buf)
 }
 
-fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    }
-}
-
-/// Given a canonical project name, return `(local_alias, suffixed_from)`
-/// where `local_alias` is a name that doesn't collide with any existing
-/// registered project and `suffixed_from` is `Some(canonical)` when a
-/// suffix was applied (`None` on a clean pass-through).
-///
-/// The suffix ladder is deterministic and starts at `-2` (skipping `-1`
-/// so the sequence matches the plan's `shelbi → shelbi-2 → shelbi-3`
-/// example). Gives up after a large sentinel — nobody has 1000 clones
-/// of the same project and the loop shouldn't spin forever if the
-/// scanner is misbehaving.
-fn next_available_alias(canonical: &str) -> Result<(String, Option<String>)> {
-    if !project_name_collides(canonical)? {
-        return Ok((canonical.to_string(), None));
-    }
-    for n in 2..=999 {
-        let candidate = format!("{canonical}-{n}");
-        if !project_name_collides(&candidate)? {
-            return Ok((candidate, Some(canonical.to_string())));
-        }
-    }
-    bail!(
-        "couldn't allocate a local alias for `{canonical}` — every suffix up to `{canonical}-999` \
-         is taken. Rename or remove an existing project YAML in ~/.shelbi/projects/ first."
-    )
-}
-
-/// Print a [`shelbi_state::AgentMaterializeOutcome`] for the init / reload
-/// report. Delegates to the shared [`project_create::render_agent_materialize_outcome`]
-/// renderer so init and reload show the same wording for the same outcome.
+/// Print a [`shelbi_state::AgentMaterializeOutcome`] for the reload report,
+/// in the engine's wording ([`project_create::render_agent_materialize_outcome`]).
 pub(super) fn print_agent_materialize_outcome(outcome: &AgentMaterializeOutcome) {
     println!("{}", project_create::render_agent_materialize_outcome(outcome));
 }
@@ -914,926 +206,62 @@ pub(super) fn print_agent_materialize_outcome(outcome: &AgentMaterializeOutcome)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::test_support::ENV_LOCK;
 
-    fn fresh_dir(tag: &str) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "shelbi-init-{tag}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        p
-    }
-
-    /// The serde-rendered YAML must parse back into a real
-    /// `shelbi_core::Project` — the whole point of F8 is that the file we
-    /// write is the file the loader reads.
-    #[test]
-    fn render_project_yaml_round_trips_through_the_loader() {
-        let yaml = render_project_yaml(
-            "my-app",
-            None,
-            "",
-            Path::new("/tmp/my-app"),
-            None,
-            &crate::issue_tracker_setup::file_system_config(),
-        )
-        .unwrap();
-        let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
-        // A file_system board is the default, so no `issue_tracker:` block is
-        // written and the project parses back to the default.
-        assert!(!yaml.contains("issue_tracker"));
-        assert!(project.issue_tracker.is_default());
-        // The id `my-app` lives in the filename; an already-clean id supplies
-        // no `name:` label, so the parsed label is absent.
-        assert_eq!(project.label, None);
-        assert_eq!(project.default_branch, "main");
-        assert_eq!(project.machines.len(), 1);
-        assert_eq!(project.machines[0].name, "hub");
-        assert_eq!(project.machines[0].work_dir, PathBuf::from("/tmp/my-app"));
-        assert_eq!(project.orchestrator.runner, "claude");
-        assert!(project.agent_runners.contains_key("claude"));
-        assert!(project.agent_runners.contains_key("codex"));
-        // Fresh projects default to `task` and ship a starter pool including a
-        // review-tagged slot for the `task` workflow's review status.
-        assert_eq!(project.default_workflow.as_deref(), Some("task"));
-        assert_eq!(project.workspaces.len(), 2);
-        assert!(project
-            .workspaces
-            .iter()
-            .any(|w| w.name == "review" && project.effective_tags(w).contains("review")));
-    }
-
-    /// The id lives in the filename, so the scaffolded YAML carries the
-    /// original human-readable name as the free-form `name:` *label* only when
-    /// the entered name was slugified; an already-clean name emits no top-level
-    /// `name:` key at all (the id-as-filename doubles as the label).
-    #[test]
-    fn render_project_yaml_records_label_only_when_slugified() {
-        // Slug differs from the entered label → `name:` (the label) is emitted.
-        let yaml = render_project_yaml(
-            "contextstore",
-            Some("ContextStore"),
-            "",
-            Path::new("/tmp/cs"),
-            None,
-            &crate::issue_tracker_setup::file_system_config(),
-        )
-        .unwrap();
-        assert!(
-            yaml.lines().any(|l| l == "name: ContextStore"),
-            "the free-form label belongs under the top-level `name:` key:\n{yaml}"
-        );
-        let mut project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(project.label.as_deref(), Some("ContextStore"));
-        // The loader fills the id from the filename; simulate that here.
-        project.name = "contextstore".to_string();
-        assert_eq!(project.display_label(), "ContextStore");
-
-        // Already-clean name → no label supplied → no top-level `name:` key.
-        let plain =
-            render_project_yaml("my-app", None, "", Path::new("/tmp/my-app"), None, &crate::issue_tracker_setup::file_system_config()).unwrap();
-        assert!(
-            !plain.lines().any(|l| l.starts_with("name:")),
-            "an already-clean id needs no `name:` label key:\n{plain}"
-        );
-        let mut project: shelbi_core::Project = serde_yaml::from_str(&plain).unwrap();
-        assert_eq!(project.label, None);
-        project.name = "my-app".to_string();
-        assert_eq!(project.display_label(), "my-app");
-    }
-
-    /// The scaffolded project YAML is self-documenting: a docs-linked header
-    /// plus commented-out examples for optional features. As written those
-    /// blocks are inert (only the required fields are active), and the docs
-    /// pointer matches the Configuration section's route.
-    #[test]
-    fn render_project_yaml_is_self_documenting() {
-        let yaml = render_project_yaml("my-app", None, "", Path::new("/tmp/my-app"), None, &crate::issue_tracker_setup::file_system_config()).unwrap();
-        assert!(
-            yaml.contains("https://shelbi.dev/docs/configuration/project"),
-            "missing docs header: {yaml}"
-        );
-        // Representative optional features appear as commented examples.
-        // (`workspaces:` is now an active starter pool, so the commented hint
-        // is an extra list item under it rather than a `#workspaces:` key.)
-        for needle in ["#zen:", "#git:", "#- { name: bob"] {
-            assert!(yaml.contains(needle), "missing commented section {needle}");
+    fn args() -> Args {
+        Args {
+            project: None,
+            root: None,
+            runner: None,
+            model: None,
+            default_branch: None,
+            github_url: None,
+            orchestrator_runner: None,
+            issue_tracker: None,
+            github_repo: None,
+            mode: None,
+            pick_up: false,
         }
-        // The commented extras stay inert: the parsed project carries only the
-        // active starter pool (dev + review) and one machine until the user opts in.
-        let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(project.workspaces.len(), 2);
-        assert_eq!(project.machines.len(), 1);
-    }
-
-    /// A `work_dir` that would truncate as a YAML comment under the old
-    /// `format!` builder (` #…`) must survive intact through serde, and a
-    /// name that can't round-trip is rejected before anything is written.
-    #[test]
-    fn render_project_yaml_escapes_hostile_work_dir_and_rejects_bad_names() {
-        let tricky = Path::new("/tmp/weird #dir: value");
-        let yaml = render_project_yaml("safe", None, "", tricky, None, &crate::issue_tracker_setup::file_system_config()).unwrap();
-        let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
-        assert_eq!(project.machines[0].work_dir, tricky.to_path_buf());
-
-        assert!(render_project_yaml("../../evil", None, "", Path::new("/tmp"), None, &crate::issue_tracker_setup::file_system_config()).is_err());
-        assert!(render_project_yaml("has\nnewline", None, "", Path::new("/tmp"), None, &crate::issue_tracker_setup::file_system_config()).is_err());
-    }
-
-    /// F4: a scaffold that crashed after writing the YAML but before
-    /// materializing agents must be completable on re-run — the function
-    /// no longer short-circuits on a pre-existing YAML.
-    #[test]
-    fn scaffold_project_is_idempotent_and_completes_half_init() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_dir("half-home");
-        let project_root = fresh_dir("half-repo");
-        std::env::set_var("SHELBI_HOME", &home);
-        shelbi_state::ensure_root_subdirs().unwrap();
-
-        let resolved = ResolvedProjectRoot {
-            path: project_root.clone(),
-            name: "halfapp".to_string(),
-            display_name: None,
-        };
-
-        // Simulate a crash right after the YAML was written: the project
-        // YAML exists, but the agents/ workspaces and statuses do not.
-        let yaml_path = home.join("projects/halfapp.yaml");
-        std::fs::write(&yaml_path, "name: halfapp\nrepo: \n").unwrap();
-        let workflow_path =
-            shelbi_state::workflow_path("halfapp", shelbi_core::TASK_WORKFLOW_NAME).unwrap();
-        let subtask_path =
-            shelbi_state::workflow_path("halfapp", shelbi_core::SUBTASK_WORKFLOW_NAME).unwrap();
-        let statuses_path = shelbi_state::statuses_path("halfapp").unwrap();
-        assert!(!workflow_path.exists());
-        assert!(!subtask_path.exists());
-        assert!(!statuses_path.exists());
-
-        // Re-running scaffold must NOT bail with a bogus "already exists"
-        // success — it must finish the remaining steps.
-        scaffold_project(&resolved, InitMode::Global, &crate::issue_tracker_setup::file_system_config()).unwrap();
-        assert!(
-            statuses_path.is_file(),
-            "re-run should have written the statuses catalogue"
-        );
-        assert!(
-            workflow_path.is_file() && subtask_path.is_file(),
-            "re-run should have written the task + subtask workflows"
-        );
-        assert!(
-            shelbi_state::project_dir("halfapp")
-                .unwrap()
-                .join("agents")
-                .exists(),
-            "re-run should have materialized default agents"
-        );
-
-        // Simulate an existing installation whose customized policy still
-        // carries the exact stock head-only command snippets. Idempotent init
-        // must apply the narrow safety migration before this automation can
-        // be reloaded, while retaining all surrounding prose.
-        let orchestrator_path =
-            shelbi_state::agent_instructions_path("halfapp", shelbi_state::ORCHESTRATOR_AGENT)
-                .unwrap();
-        let mut orchestrator = std::fs::read_to_string(&orchestrator_path)
-            .unwrap()
-            .replace(
-                "shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>",
-                "shelbi zen pr-create <task-id> --match-head-commit <head_sha>",
-            )
-            .replace(
-                "shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>",
-                "shelbi zen ci-watch <pr> --match-head-commit <head_sha>",
-            )
-            .replace(
-                "shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>",
-                "shelbi zen pr-merge <pr> --match-head-commit <head_sha>",
-            );
-        orchestrator.push_str("\nLocal orchestrator suffix.\n");
-        std::fs::write(&orchestrator_path, orchestrator).unwrap();
-
-        let zenmode_path = shelbi_state::zenmode_path("halfapp").unwrap();
-        let mut zenmode = std::fs::read_to_string(&zenmode_path)
-            .unwrap()
-            .replace(
-                "shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>",
-                "shelbi zen pr-create <task-id> --match-head-commit <head_sha>",
-            )
-            .replace(
-                "shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m",
-                "shelbi zen ci-watch <pr-number> --match-head-commit <head_sha> --timeout 15m",
-            )
-            .replace(
-                "shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>",
-                "shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>",
-            );
-        zenmode.push_str("\nLocal Zen suffix.\n");
-        std::fs::write(&zenmode_path, zenmode).unwrap();
-
-        scaffold_project(&resolved, InitMode::Global, &crate::issue_tracker_setup::file_system_config()).unwrap();
-        let migrated_orchestrator = std::fs::read_to_string(&orchestrator_path).unwrap();
-        assert!(migrated_orchestrator.contains("shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"));
-        assert!(migrated_orchestrator.contains("shelbi zen ci-watch <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"));
-        assert!(migrated_orchestrator.contains("shelbi zen pr-merge <pr> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"));
-        assert!(migrated_orchestrator.contains("Local orchestrator suffix."));
-        let migrated_zenmode = std::fs::read_to_string(&zenmode_path).unwrap();
-        assert!(migrated_zenmode.contains("shelbi zen pr-create <task-id> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"));
-        assert!(migrated_zenmode.contains("shelbi zen ci-watch <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha> --timeout 15m"));
-        assert!(migrated_zenmode.contains("shelbi zen pr-merge <pr-number> --match-repository <repository> --match-repository-id <repository_id> --match-base-branch <base_branch> --match-base-commit <base_sha> --match-integration-commit <integration_sha> --match-head-commit <head_sha>"));
-        assert!(migrated_zenmode.contains("Local Zen suffix."));
-
-        // A later re-run is a clean no-op (still idempotent).
-        let orchestrator_after_migration = migrated_orchestrator.clone();
-        let zenmode_after_migration = migrated_zenmode.clone();
-        scaffold_project(&resolved, InitMode::Global, &crate::issue_tracker_setup::file_system_config()).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&orchestrator_path).unwrap(),
-            orchestrator_after_migration
-        );
-        assert_eq!(
-            std::fs::read_to_string(&zenmode_path).unwrap(),
-            zenmode_after_migration
-        );
-
-        assert!(
-            !shelbi_state::task_path("halfapp", shelbi_state::WELCOME_TASK_ID)
-                .unwrap()
-                .exists(),
-            "a pre-existing registration must remain Welcome-free on re-run"
-        );
-        assert!(
-            shelbi_state::read_global_state().unwrap().first_run_seen,
-            "re-running init for an existing project must not arm onboarding"
-        );
-        assert!(
-            !shelbi_state::claim_contextual_greeting("halfapp").unwrap(),
-            "repairing an existing registration must not arm a first-launch greeting"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
-    fn new_registration_is_complete_and_armed_before_it_becomes_discoverable() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_dir("publish-home");
-        std::env::set_var("SHELBI_HOME", &home);
-        shelbi_state::ensure_root_subdirs().unwrap();
-
-        let yaml_path = home.join("projects/race.yaml");
-        let dashboard_lock = shelbi_state::lock_dashboard("race").unwrap();
-        let path_for_thread = yaml_path.clone();
-        let writer = std::thread::spawn(move || {
-            write_new_project_registration(
-                "race",
-                &path_for_thread,
-                "name: race\nrepo: ''\nmachines: []\n",
-            )
-            .unwrap()
-        });
-
-        let mut temp_visible = false;
-        for _ in 0..100 {
-            temp_visible = std::fs::read_dir(home.join("projects"))
-                .unwrap()
-                .filter_map(|entry| entry.ok())
-                .any(|entry| entry.file_name().to_string_lossy().starts_with(".race.yaml.tmp-"));
-            if temp_visible {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(temp_visible, "writer never reached its complete temp file");
-        assert!(!yaml_path.exists(), "registration leaked before the latch lock");
-        assert!(
-            !shelbi_state::read_state("race")
-                .unwrap()
-                .contextual_greeting_pending,
-            "the writer should still be blocked before arming"
-        );
-
-        drop(dashboard_lock);
-        assert!(writer.join().unwrap());
-        assert_eq!(
-            std::fs::read_to_string(&yaml_path).unwrap(),
-            "name: race\nrepo: ''\nmachines: []\n"
-        );
-        assert!(shelbi_state::claim_contextual_greeting("race").unwrap());
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn split_registration_is_not_shadowed_or_rearmed() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_dir("split-home");
-        std::env::set_var("SHELBI_HOME", &home);
-        shelbi_state::ensure_root_subdirs().unwrap();
-
-        let split = home.join("projects/existing/local.yaml");
-        std::fs::create_dir_all(split.parent().unwrap()).unwrap();
-        std::fs::write(&split, "name: existing\nrepo: /tmp/existing\n").unwrap();
-        let flat = home.join("projects/existing.yaml");
-        assert!(!write_new_project_registration("existing", &flat, "name: existing\n").unwrap());
-        assert!(!flat.exists());
-        assert!(!shelbi_state::claim_contextual_greeting("existing").unwrap());
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn scaffold_writes_yaml_but_no_marker_global_mode() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_dir("home");
-        let project_root = fresh_dir("repo");
-        std::env::set_var("SHELBI_HOME", &home);
-        shelbi_state::ensure_root_subdirs().unwrap();
-
-        let resolved = ResolvedProjectRoot {
-            path: project_root.clone(),
-            name: "myapp".to_string(),
-            display_name: None,
-        };
-        scaffold_project(&resolved, InitMode::Global, &crate::issue_tracker_setup::file_system_config()).unwrap();
-
-        let yaml = home.join("projects/myapp.yaml");
-        assert!(
-            yaml.is_file(),
-            "expected project YAML at {}",
-            yaml.display()
-        );
-        let body = std::fs::read_to_string(&yaml).unwrap();
-        assert!(body.contains(&format!("work_dir: {}", project_root.display())));
-        let tasks = shelbi_state::list_tasks("myapp").unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].task.title, shelbi_state::WELCOME_TASK_TITLE);
-        assert_eq!(tasks[0].task.column, shelbi_core::Column::backlog());
-        assert!(!shelbi_state::read_global_state().unwrap().first_run_seen);
-        assert!(shelbi_state::claim_contextual_greeting("myapp").unwrap());
-
-        scaffold_project(&resolved, InitMode::Global, &crate::issue_tracker_setup::file_system_config()).unwrap();
-        assert!(
-            !shelbi_state::claim_contextual_greeting("myapp").unwrap(),
-            "an idempotent init must not re-arm a consumed greeting"
-        );
-
-        // Global mode: no in-repo file, no `.shelbi/project` marker,
-        // no `.shelbi` directory in the repo tree.
-        assert!(
-            !project_root.join(".shelbi/project").exists(),
-            "init must not write a .shelbi/project marker"
-        );
-        assert!(
-            !project_root.join(IN_REPO_CONFIG_REL).exists(),
-            "global mode must not write the committed <repo>/.shelbi/project.yaml"
-        );
-        assert!(
-            !project_root.join(".shelbi").exists(),
-            "global mode must not create a .shelbi directory in the project tree"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn scaffold_writes_in_repo_config_for_in_repo_mode() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_dir("home");
-        let project_root = fresh_dir("repo-in");
-        std::env::set_var("SHELBI_HOME", &home);
-        shelbi_state::ensure_root_subdirs().unwrap();
-
-        let resolved = ResolvedProjectRoot {
-            path: project_root.clone(),
-            name: "team-app".to_string(),
-            display_name: None,
-        };
-        scaffold_project(&resolved, InitMode::InRepo, &crate::issue_tracker_setup::file_system_config()).unwrap();
-
-        // In-repo projects are born split: NO flat `<name>.yaml`. The
-        // registration is the user-local half under the registry dir.
-        assert!(
-            !home.join("projects/team-app.yaml").is_file(),
-            "in-repo mode must NOT write a flat registry YAML"
-        );
-        let local = home.join("projects/team-app/local.yaml");
-        assert!(local.is_file(), "expected user-local half at {}", local.display());
-        let local_body = std::fs::read_to_string(&local).unwrap();
-        // The user-local half carries repo/machines; shared fields (name,
-        // config_mode, orchestrator, …) must NOT leak into it.
-        assert!(
-            local_body.contains(&format!("repo: {}", project_root.display())),
-            "local.yaml must record the repo path, got: {local_body}"
-        );
-        assert!(
-            !local_body.contains("config_mode"),
-            "config_mode is a shared field — it must not appear in local.yaml: {local_body}"
-        );
-        assert!(
-            !local_body.contains("orchestrator"),
-            "orchestrator is a shared field — it must not appear in local.yaml: {local_body}"
-        );
-
-        // The committed shared half is what pick-up detects on a teammate's
-        // clone. It now carries the full shared surface, anchored on the id.
-        let committed = project_root.join(IN_REPO_CONFIG_REL);
-        assert!(committed.is_file());
-        let body = std::fs::read_to_string(&committed).unwrap();
-        assert!(
-            body.lines().any(|l| l == "name: team-app"),
-            "committed config must anchor the canonical id under `name:`, got: {body}"
-        );
-        assert!(
-            body.contains("config_mode: in-repo"),
-            "committed config must record the mode, got: {body}"
-        );
-        assert!(
-            body.contains("orchestrator:") && body.contains("agent_runners:"),
-            "committed config must carry the shared fields, got: {body}"
-        );
-        assert!(
-            !body.contains("\nrepo:") && !body.starts_with("repo:"),
-            "repo is a user-local field — it must not appear in the committed half: {body}"
-        );
-        // pick-up's name anchor still resolves off the committed file.
-        assert_eq!(
-            read_in_repo_name(&committed).unwrap().as_deref(),
-            Some("team-app")
-        );
-        // The split round-trips back through the loader into an in-repo project.
-        let loaded = shelbi_state::load_project("team-app").unwrap();
-        assert_eq!(loaded.config_mode, Some(shelbi_core::ConfigMode::InRepo));
-        assert_eq!(loaded.repo, project_root.to_string_lossy());
-        assert_eq!(loaded.workspaces.len(), 2);
-        let tasks = shelbi_state::list_tasks("team-app").unwrap();
-        assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].task.title, shelbi_state::WELCOME_TASK_TITLE);
-        assert_eq!(tasks[0].task.column, shelbi_core::Column::backlog());
-        assert!(!shelbi_state::read_global_state().unwrap().first_run_seen);
-
-        // Acceptance: agents/, statuses.yaml, and the workspace-settings
-        // template all land under the repo's `.shelbi/`, NOT the global
-        // per-project dir.
-        let cfg = project_root.join(".shelbi");
-        assert!(
-            cfg.join("agents/developer/instructions.md").is_file(),
-            "default agents must materialize under <repo>/.shelbi/agents/"
-        );
-        assert!(
-            cfg.join("workflows/statuses.yaml").is_file(),
-            "statuses catalogue must materialize under <repo>/.shelbi/workflows/"
-        );
-        assert!(
-            cfg.join("workspace-settings.json.template").is_file(),
-            "workspace-settings template must materialize under <repo>/.shelbi/"
-        );
-        assert!(
-            !home.join("projects/team-app/agents").exists(),
-            "in-repo agents must not leak into the global per-project dir"
-        );
-        assert!(
-            !home.join("projects/team-app/workflows").exists(),
-            "in-repo workflows must not leak into the global per-project dir"
-        );
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn read_in_repo_name_returns_none_for_malformed_yaml() {
-        let tmp = fresh_dir("malformed");
-        let path = tmp.join("project.yaml");
-        std::fs::write(&path, "this is not: [valid: yaml").unwrap();
-        assert_eq!(read_in_repo_name(&path).unwrap(), None);
-    }
-
-    #[test]
-    fn read_in_repo_name_returns_none_for_missing_name_key() {
-        let tmp = fresh_dir("no-name");
-        let path = tmp.join("project.yaml");
-        std::fs::write(&path, "repo: /some/path\n").unwrap();
-        assert_eq!(read_in_repo_name(&path).unwrap(), None);
-    }
-
-    #[test]
-    fn read_in_repo_name_returns_trimmed_name() {
-        let tmp = fresh_dir("name");
-        let path = tmp.join("project.yaml");
-        std::fs::write(&path, "name: my-app\nrepo: /x\n").unwrap();
-        assert_eq!(
-            read_in_repo_name(&path).unwrap(),
-            Some("my-app".to_string())
-        );
-    }
-
-    /// The auto-suffix ladder skips `-1` and starts at `-2`, per the
-    /// plan (`shelbi → shelbi-2 → shelbi-3`). The committed name never
-    /// changes; only the local alias.
-    #[test]
-    fn next_available_alias_deterministic_ladder() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_dir("alias");
-        std::env::set_var("SHELBI_HOME", &home);
-        std::fs::create_dir_all(home.join("projects")).unwrap();
-
-        // Clean case: no collision → canonical passes through.
-        let (alias, from) = next_available_alias("solo").unwrap();
-        assert_eq!(alias, "solo");
-        assert!(from.is_none());
-
-        // Single collision → `-2`.
-        std::fs::write(home.join("projects/shelbi.yaml"), "name: shelbi\n").unwrap();
-        let (alias, from) = next_available_alias("shelbi").unwrap();
-        assert_eq!(alias, "shelbi-2");
-        assert_eq!(from.as_deref(), Some("shelbi"));
-
-        // Two collisions → `-3`, deterministically.
-        std::fs::write(home.join("projects/shelbi-2.yaml"), "name: shelbi\n").unwrap();
-        let (alias, from) = next_available_alias("shelbi").unwrap();
-        assert_eq!(alias, "shelbi-3");
-        assert_eq!(from.as_deref(), Some("shelbi"));
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    #[test]
-    fn pick_up_arms_the_new_local_alias_only() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_dir("pickup-home");
-        let repo_root = fresh_dir("pickup-repo");
-        std::env::set_var("SHELBI_HOME", &home);
-        shelbi_state::ensure_root_subdirs().unwrap();
-
-        std::fs::create_dir_all(repo_root.join(".shelbi")).unwrap();
-        std::fs::write(repo_root.join(IN_REPO_CONFIG_REL), "name: shared\n").unwrap();
-        std::fs::write(home.join("projects/shared.yaml"), "name: shared\n").unwrap();
-
-        let outcome = run_pick_up(Args {
-            project: None,
-            root: Some(repo_root),
-            runner: None,
-            default_branch: None,
-            github_url: None,
-            orchestrator_runner: None,
-            issue_tracker: None,
-            github_repo: None,
-            mode: None,
-            pick_up: true,
+    fn flags_map_onto_the_steps_they_answer() {
+        let p = preset(Args {
+            runner: Some(Runner::Codex),
+            model: Some("gpt-5".into()),
+            issue_tracker: Some(IssueTrackerArg::Github),
+            github_repo: Some("acme/app".into()),
+            mode: Some(InitMode::InRepo),
+            ..args()
         })
         .unwrap();
+        assert_eq!(p.runner, Some(Runner::Codex));
+        assert_eq!(p.model.as_deref(), Some("gpt-5"));
+        assert_eq!(p.issues, Some(IssuesPreset::Github { repo: Some("acme/app".into()) }));
+        assert_eq!(p.mode, Some(ConfigMode::InRepo));
 
-        assert_eq!(outcome.local_alias, "shared-2");
-        assert!(shelbi_state::claim_contextual_greeting("shared-2").unwrap());
-        assert!(!shelbi_state::claim_contextual_greeting("shared-2").unwrap());
-        assert!(!shelbi_state::claim_contextual_greeting("shared").unwrap());
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    /// A teammate's repo whose committed `<repo>/.shelbi/project.yaml` is a
-    /// COMPLETE shared half (the new fresh-init shape) is picked up as the
-    /// two-file split: only the user-local half is written, and no flat
-    /// `<alias>.yaml` is created. The committed file is never touched.
-    #[test]
-    fn pick_up_writes_split_for_complete_committed_config() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_dir("pickup-split-home");
-        let repo_root = fresh_dir("pickup-split-repo");
-        std::env::set_var("SHELBI_HOME", &home);
-        shelbi_state::ensure_root_subdirs().unwrap();
-
-        // Commit a complete shared half exactly as fresh in-repo init would.
-        let (shared, _local) = render_split_project_yaml(
-            "teamproj",
-            None,
-            &repo_root.to_string_lossy(),
-            &repo_root,
-            &crate::issue_tracker_setup::file_system_config(),
-        )
-        .unwrap();
-        std::fs::create_dir_all(repo_root.join(".shelbi")).unwrap();
-        std::fs::write(repo_root.join(IN_REPO_CONFIG_REL), &shared).unwrap();
-        let committed_before = std::fs::read_to_string(repo_root.join(IN_REPO_CONFIG_REL)).unwrap();
-
-        let outcome = run_pick_up(Args {
-            project: None,
-            root: Some(repo_root.clone()),
-            runner: None,
-            default_branch: None,
-            github_url: None,
-            orchestrator_runner: None,
-            issue_tracker: None,
-            github_repo: None,
-            mode: None,
-            pick_up: true,
+        let p = preset(Args { orchestrator_runner: Some(Runner::Codex), ..args() }).unwrap();
+        assert_eq!(p.runner, Some(Runner::Codex), "the retired flag stands in for --runner");
+        assert!(preset(Args {
+            runner: Some(Runner::Claude),
+            orchestrator_runner: Some(Runner::Codex),
+            ..args()
         })
-        .unwrap();
-        assert_eq!(outcome.local_alias, "teamproj");
-
-        // Split registration: local.yaml present, no flat file.
-        assert!(
-            home.join("projects/teamproj/local.yaml").is_file(),
-            "pick-up must write the user-local half"
-        );
-        assert!(
-            !home.join("projects/teamproj.yaml").exists(),
-            "pick-up of a complete committed config must NOT write a flat registry YAML"
-        );
+        .is_err());
+        assert!(preset(Args { github_repo: Some("a/b".into()), ..args() }).is_err());
         assert_eq!(
-            outcome.registration_path,
-            home.join("projects/teamproj/local.yaml")
+            preset(Args { issue_tracker: Some(IssueTrackerArg::FileSystem), ..args() }).unwrap().issues,
+            Some(IssuesPreset::FileSystem)
         );
-        // The committed file is a read-only contract — pick-up never rewrites it.
-        assert_eq!(
-            std::fs::read_to_string(repo_root.join(IN_REPO_CONFIG_REL)).unwrap(),
-            committed_before
-        );
-        // It loads back as an in-repo project through the split.
-        let loaded = shelbi_state::load_project("teamproj").unwrap();
-        assert_eq!(loaded.config_mode, Some(shelbi_core::ConfigMode::InRepo));
-        assert_eq!(loaded.repo, repo_root.to_string_lossy());
-
-        std::env::remove_var("SHELBI_HOME");
     }
 
-    /// Reverse of the above: a repo whose committed config is the legacy
-    /// name-only stub can't form a loadable split, so pick-up falls back to the
-    /// historical flat registration rather than writing an unloadable
-    /// `local.yaml`.
-    #[test]
-    fn pick_up_falls_back_to_flat_for_legacy_committed_stub() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_dir("pickup-legacy-home");
-        let repo_root = fresh_dir("pickup-legacy-repo");
-        std::env::set_var("SHELBI_HOME", &home);
-        shelbi_state::ensure_root_subdirs().unwrap();
-
-        std::fs::create_dir_all(repo_root.join(".shelbi")).unwrap();
-        std::fs::write(repo_root.join(IN_REPO_CONFIG_REL), "name: legacy\n").unwrap();
-
-        let outcome = run_pick_up(Args {
-            project: None,
-            root: Some(repo_root.clone()),
-            runner: None,
-            default_branch: None,
-            github_url: None,
-            orchestrator_runner: None,
-            issue_tracker: None,
-            github_repo: None,
-            mode: None,
-            pick_up: true,
-        })
-        .unwrap();
-        assert_eq!(outcome.local_alias, "legacy");
-        assert!(
-            home.join("projects/legacy.yaml").is_file(),
-            "legacy stub pick-up must fall back to a flat registration"
-        );
-        assert!(!home.join("projects/legacy/local.yaml").exists());
-        // The flat fallback is itself loadable.
-        let loaded = shelbi_state::load_project("legacy").unwrap();
-        assert_eq!(loaded.config_mode, Some(shelbi_core::ConfigMode::InRepo));
-
-        std::env::remove_var("SHELBI_HOME");
-    }
-
-    /// The picker's ancestor walk locates a committed config from a
-    /// nested cwd. `--pick-up` should be usable without having to `cd`
-    /// up to the repo root first.
     #[test]
     fn find_in_repo_config_ancestor_walks_up() {
-        let root = fresh_dir("ancestor");
-        std::fs::create_dir_all(root.join(".shelbi")).unwrap();
-        std::fs::write(root.join(IN_REPO_CONFIG_REL), "name: nested\n").unwrap();
-        let deep = root.join("src/mod/leaf");
-        std::fs::create_dir_all(&deep).unwrap();
-
-        let found = find_in_repo_config_ancestor(&deep).unwrap();
-        // Canonicalize both sides so temp-dir symlinks (macOS
-        // `/tmp -> /private/tmp`) don't upset the equality check.
-        assert_eq!(
-            std::fs::canonicalize(found).unwrap(),
-            std::fs::canonicalize(&root).unwrap()
-        );
-    }
-
-    #[test]
-    fn find_in_repo_config_ancestor_returns_none_when_absent() {
-        let root = fresh_dir("no-config");
-        assert!(find_in_repo_config_ancestor(&root).is_none());
-    }
-
-    /// Non-interactive callers that omit `--mode` get a hard error, not
-    /// a silent default. `cargo test` runs without a TTY on stdin, so
-    /// this exercises the real non-interactive branch.
-    #[test]
-    fn resolve_mode_errors_without_tty_and_no_flag() {
-        assert!(!std::io::stdin().is_terminal());
-        let tmp = fresh_dir("no-flag");
-        let err = resolve_mode(None, false, &tmp).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("--mode"), "expected --mode hint, got: {msg}");
-        assert!(
-            msg.contains("no silent default"),
-            "expected the 'no silent default' rationale in the message, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn resolve_mode_passes_through_explicit_flag() {
-        let tmp = fresh_dir("explicit");
-        assert_eq!(
-            resolve_mode(Some(InitMode::InRepo), false, &tmp).unwrap(),
-            InitMode::InRepo
-        );
-        assert_eq!(
-            resolve_mode(Some(InitMode::Global), false, &tmp).unwrap(),
-            InitMode::Global
-        );
-    }
-
-    /// A scripted probe for the non-interactive `--issue-tracker github`
-    /// preflight: canned `gh` results, no shelling out.
-    struct FakeGhProbe {
-        version: Option<String>,
-        api: crate::issue_tracker_setup::GhCommandResult,
-    }
-
-    impl FakeGhProbe {
-        fn ready() -> Self {
-            Self {
-                version: Some("gh version 2.40.0".into()),
-                api: crate::issue_tracker_setup::GhCommandResult {
-                    success: true,
-                    stdout: "{\"has_issues\": true, \"permissions\": {\"push\": true}}".into(),
-                    stderr: String::new(),
-                },
-            }
-        }
-    }
-
-    impl crate::issue_tracker_setup::GhProbe for FakeGhProbe {
-        fn gh_version(&mut self) -> Option<String> {
-            self.version.clone()
-        }
-        fn gh_api_repo(
-            &mut self,
-            _repo: &str,
-        ) -> crate::issue_tracker_setup::GhCommandResult {
-            self.api.clone()
-        }
-    }
-
-    #[test]
-    fn noninteractive_issue_tracker_defaults_and_rejects_stray_repo() {
-        // No flag → None (keep the file_system default); existing scripts unchanged.
-        let mut probe = FakeGhProbe::ready();
-        assert!(resolve_noninteractive_issue_tracker(None, None, None, &mut probe)
-            .unwrap()
-            .is_none());
-
-        // --issue-tracker file_system → an explicit, elided default.
-        let cfg = resolve_noninteractive_issue_tracker(
-            Some(IssueTrackerArg::FileSystem),
-            None,
-            None,
-            &mut probe,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(cfg.is_default());
-
-        // --github-repo without `--issue-tracker github` is a usage error.
-        let err = resolve_noninteractive_issue_tracker(
-            None,
-            Some("jlong/shelbi"),
-            None,
-            &mut probe,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("--issue-tracker github"));
-    }
-
-    #[test]
-    fn noninteractive_github_uses_flag_then_detection_then_errors() {
-        // Explicit --github-repo wins.
-        let mut probe = FakeGhProbe::ready();
-        let cfg = resolve_noninteractive_issue_tracker(
-            Some(IssueTrackerArg::Github),
-            Some("acme/widgets"),
-            Some("git@github.com:other/repo.git"),
-            &mut probe,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(cfg.github.as_ref().unwrap().repo, "acme/widgets");
-
-        // Falls back to the detected origin repo when no flag is given.
-        let cfg = resolve_noninteractive_issue_tracker(
-            Some(IssueTrackerArg::Github),
-            None,
-            Some("https://github.com/jlong/shelbi.git"),
-            &mut probe,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(cfg.github.as_ref().unwrap().repo, "jlong/shelbi");
-
-        // No flag and a non-GitHub remote → a clear error, no guess.
-        let err = resolve_noninteractive_issue_tracker(
-            Some(IssueTrackerArg::Github),
-            None,
-            Some("git@gitlab.com:jlong/shelbi.git"),
-            &mut probe,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("--github-repo"));
-    }
-
-    #[test]
-    fn noninteractive_github_surfaces_preflight_failure() {
-        let mut probe = FakeGhProbe {
-            version: None, // gh not installed
-            api: FakeGhProbe::ready().api,
-        };
-        let err = resolve_noninteractive_issue_tracker(
-            Some(IssueTrackerArg::Github),
-            Some("jlong/shelbi"),
-            None,
-            &mut probe,
-        )
-        .unwrap_err();
-        assert!(err.to_string().contains("gh"), "got: {err}");
-    }
-
-    #[test]
-    fn github_choice_writes_block_in_both_config_modes() {
-        let tracker = crate::issue_tracker_setup::github_config("jlong/shelbi").unwrap();
-
-        // Global mode: the flat YAML carries the issue_tracker block and loads.
-        let flat = render_project_yaml(
-            "shelbi",
-            None,
-            "",
-            Path::new("/tmp/shelbi"),
-            None,
-            &tracker,
-        )
-        .unwrap();
-        assert!(flat.contains("issue_tracker:"));
-        assert!(flat.contains("backend: github"));
-        assert!(flat.contains("repo: jlong/shelbi"));
-        let global_project: shelbi_core::Project = serde_yaml::from_str(&flat).unwrap();
-        assert_eq!(global_project.issue_tracker.backend, IssueTrackerBackend::Github);
-        global_project.issue_tracker.validate().unwrap();
-
-        // In-repo mode: the block rides in the committed SHARED half (never the
-        // user-local half).
-        let (shared, local) = render_split_project_yaml(
-            "shelbi",
-            None,
-            "/tmp/shelbi",
-            Path::new("/tmp/shelbi"),
-            &tracker,
-        )
-        .unwrap();
-        assert!(shared.contains("issue_tracker:"), "shared half: {shared}");
-        assert!(shared.contains("repo: jlong/shelbi"));
-        assert!(
-            !local.contains("issue_tracker:"),
-            "issue_tracker is a shared field, never the local half: {local}"
-        );
-        let merged = shelbi_core::Project::from_split_yaml_str(&shared, &local).unwrap();
-        assert_eq!(merged.issue_tracker.backend, IssueTrackerBackend::Github);
-        merged.issue_tracker.validate().unwrap();
-    }
-
-    #[test]
-    fn stranded_board_guard_blocks_github_but_allows_file_system() {
-        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-        let home = fresh_dir("stranded-home");
-        std::env::set_var("SHELBI_HOME", &home);
-        let tasks = shelbi_state::tasks_dir("boardy").unwrap();
-        std::fs::create_dir_all(&tasks).unwrap();
-        std::fs::write(tasks.join("existing-card.md"), "---\nid: x\n---\nbody\n").unwrap();
-
-        use crate::issue_tracker_setup::ensure_board_not_stranded;
-        let github = crate::issue_tracker_setup::github_config("jlong/shelbi").unwrap();
-        let err = ensure_board_not_stranded("boardy", &github).unwrap_err();
-        assert!(err.to_string().contains("issue-store migrate"), "got: {err}");
-
-        // The file_system choice is always allowed (no stranding).
-        ensure_board_not_stranded("boardy", &crate::issue_tracker_setup::file_system_config())
-            .unwrap();
-        // A project with no board is never blocked.
-        ensure_board_not_stranded("emptyproj", &github).unwrap();
-
-        std::env::remove_var("SHELBI_HOME");
+        let temp = tempfile::TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".shelbi")).unwrap();
+        std::fs::create_dir_all(repo.join("a/b")).unwrap();
+        std::fs::write(repo.join(IN_REPO_CONFIG_REL), "name: x\n").unwrap();
+        assert_eq!(find_in_repo_config_ancestor(&repo.join("a/b")), Some(repo.clone()));
+        assert_eq!(find_in_repo_config_ancestor(temp.path()), None);
     }
 }

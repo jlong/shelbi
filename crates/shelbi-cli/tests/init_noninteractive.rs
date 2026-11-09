@@ -436,9 +436,9 @@ fn root_before_init_selects_state_while_project_defaults_to_cwd() {
 }
 
 #[test]
-fn ambiguous_runners_fail_without_state_until_runner_flag_resolves_them() {
+fn both_runners_default_to_claude_like_the_interactive_flow_and_runner_picks_codex() {
     let temp = TempDir::new().unwrap();
-    let repo = temp.path().join("ambiguous");
+    let repo = temp.path().join("both");
     git_init(&repo);
     let bin = fake_path(
         &temp.path().join("path"),
@@ -450,30 +450,22 @@ fn ambiguous_runners_fail_without_state_until_runner_flag_resolves_them() {
         },
     );
 
-    let ambiguous_home = temp.path().join("ambiguous-home");
-    let ambiguous = run_init(&repo, &ambiguous_home, &bin, &["init", "-y"]);
-    assert!(!ambiguous.status.success());
-    assert!(ambiguous.stderr.contains("both claude and codex"));
-    assert!(ambiguous.stderr.contains("--runner claude"));
-    assert!(!ambiguous_home.exists(), "ambiguity must be write-free");
+    // `-y` takes the Agents step's preselection: Claude Code.
+    let default_home = temp.path().join("default-home");
+    let default = run_init(&repo, &default_home, &bin, &["init", "-y"]);
+    assert!(default.status.success(), "stdout:\n{}\nstderr:\n{}", default.stdout, default.stderr);
+    assert_eq!(load_project(&default_home, "both").orchestrator.runner, "claude");
 
-    let resolved_home = temp.path().join("resolved-home");
-    let resolved = run_init(
-        &repo,
-        &resolved_home,
-        &bin,
-        &["init", "-y", "--runner", "codex"],
-    );
-    assert!(
-        resolved.status.success(),
-        "stdout:\n{}\nstderr:\n{}",
-        resolved.stdout,
-        resolved.stderr
-    );
-    let project = load_project(&resolved_home, "ambiguous");
+    let codex_home = temp.path().join("codex-home");
+    let codex = run_init(&repo, &codex_home, &bin, &["init", "-y", "--runner", "codex"]);
+    assert!(codex.status.success(), "stdout:\n{}\nstderr:\n{}", codex.stdout, codex.stderr);
+    let project = load_project(&codex_home, "both");
     assert_eq!(project.orchestrator.runner, "codex");
-    // The pool is provisioned by the orchestrator's first-boot interview.
+    // The pool is provisioned by the orchestrator's first-boot interview, so
+    // nothing is pinned to a runner the user didn't choose.
     assert!(project.workspaces.is_empty());
+    let yaml = fs::read_to_string(codex_home.join("projects/both.yaml")).unwrap();
+    assert!(!yaml.contains("runner: claude"), "{yaml}");
 }
 
 #[test]
@@ -599,8 +591,8 @@ fn all_explicit_plan_flags_override_detected_defaults() {
             "develop",
             "--github-url",
             "https://user:secret@github.com/example/scripted.git?token=hidden",
-            "--orchestrator-runner",
-            "claude",
+            "--mode",
+            "global",
         ],
     );
     assert!(
@@ -617,7 +609,8 @@ fn all_explicit_plan_flags_override_detected_defaults() {
         project.github_url.as_deref(),
         Some("https://github.com/example/scripted.git")
     );
-    assert_eq!(project.orchestrator.runner, "claude");
+    assert_eq!(project.orchestrator.runner, "codex");
+    assert!(!repo.join(".shelbi/project.yaml").exists(), "global: nothing committed");
     // Workspace provisioning moved to the orchestrator's first-boot interview,
     // so a freshly-init'd project ships with an empty pool.
     assert!(project.workspaces.is_empty());
@@ -661,33 +654,29 @@ fn configured_repository_is_a_write_free_success_even_without_prerequisites() {
 }
 
 #[test]
-fn yes_mode_rejects_legacy_prompting_flows_while_stdin_is_open() {
+fn yes_mode_picks_up_a_committed_config_and_fails_clearly_without_one() {
     let temp = TempDir::new().unwrap();
-    let repo = temp.path().join("repo");
-    fs::create_dir_all(&repo).unwrap();
-    let bin = fake_path(
-        &temp.path().join("empty-path"),
-        FakePath {
-            git: false,
-            claude: false,
-            codex: false,
-            gh_ok: false,
-        },
-    );
+    let bin = fake_path(&temp.path().join("path"), FakePath::one_runner());
 
-    for (flag, value) in [("--pick-up", None), ("--mode", Some("global"))] {
-        let home = temp.path().join(flag.trim_start_matches('-'));
-        let mut args = vec!["init", "-y", flag];
-        if let Some(value) = value {
-            args.push(value);
-        }
-        let result = run_init(&repo, &home, &bin, &args);
-        assert!(!result.status.success());
-        assert!(
-            result.stderr.contains("cannot be combined"),
-            "stderr for {flag}: {}",
-            result.stderr
-        );
-        assert!(!home.exists());
-    }
+    // A teammate's project: the Folder step's pick-up, taken by default.
+    let home = temp.path().join("home");
+    let first = temp.path().join("teamproj");
+    git_init(&first);
+    let created = run_init(&first, &home, &bin, &["init", "-y", "--mode", "in-repo"]);
+    assert!(created.status.success(), "stdout:\n{}\nstderr:\n{}", created.stdout, created.stderr);
+    let clone_home = temp.path().join("clone-home");
+    assert!(first.join(".shelbi/project.yaml").is_file(), "`--mode in-repo` wrote the committed half");
+    let picked = run_init(&first, &clone_home, &bin, &["init", "-y"]);
+    assert!(picked.status.success(), "stdout:\n{}\nstderr:\n{}", picked.stdout, picked.stderr);
+    assert!(picked.stdout.contains("picked up `teamproj`"), "stdout:\n{}", picked.stdout);
+    assert!(clone_home.join("projects/teamproj/local.yaml").is_file());
+
+    // `--pick-up` with nothing committed says so and writes nothing.
+    let repo = temp.path().join("bare");
+    fs::create_dir_all(&repo).unwrap();
+    let none_home = temp.path().join("none-home");
+    let result = run_init(&repo, &none_home, &bin, &["init", "-y", "--pick-up"]);
+    assert!(!result.status.success());
+    assert!(result.stderr.contains(".shelbi/project.yaml"), "stderr: {}", result.stderr);
+    assert!(!none_home.exists());
 }

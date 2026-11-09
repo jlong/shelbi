@@ -12,7 +12,6 @@
 //! last arms (`OpenEditor`, and `FocusSession`, retired upstream with the
 //! tmux-era legacy agents it focused) were done.
 
-use std::path::Path;
 
 use shelbi_app::{CommandKind, EditTarget, Mutation, View};
 
@@ -222,22 +221,18 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
     }
 }
 
-/// Run a `Mutation::AddProject` the add-project wizard produced: validate it
-/// (its repo path resolved against `cwd`) and scaffold the project, reporting
-/// each stage and warning to `out`. `attempt` says whether this finishes an
-/// earlier failed run of the same request. Returns the new project's slug.
-/// Blocking.
+/// Run a `Mutation::AddProject` the add-project wizard produced: its answers
+/// through the one creation engine, reporting each stage and warning to
+/// `out`. `attempt` says whether this finishes an earlier failed run of the
+/// same request. Returns the new project's id. Blocking.
 pub fn run_add_project(
     mutation: &Mutation,
     attempt: shelbi_orchestrator::project_create::Attempt,
-    cwd: &Path,
     out: &mut dyn shelbi_orchestrator::project_create::ScaffoldReporter,
 ) -> Result<String, shelbi_orchestrator::project_create::AddProjectError> {
-    use shelbi_orchestrator::project_create::{add_project, AddProjectError};
+    use shelbi_orchestrator::project_create::{create_project, AddProjectError};
     match mutation {
-        Mutation::AddProject { name, root, mode, defaults } => {
-            add_project(name, root, *mode, defaults, cwd, attempt, out)
-        }
+        Mutation::AddProject { plan } => create_project(plan, attempt, out),
         other => Err(AddProjectError::Failed(format!("not an add-project mutation: {other:?}"))),
     }
 }
