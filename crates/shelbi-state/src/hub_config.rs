@@ -41,7 +41,7 @@ pub fn hub_config_path() -> Result<PathBuf> {
 pub fn load_hub_config() -> Result<HubConfig> {
     let path = hub_config_path()?;
     match fs::read_to_string(&path) {
-        Ok(s) => Ok(serde_yaml::from_str(&s).unwrap_or_default()),
+        Ok(s) => Ok(yaml_serde::from_str(&s).unwrap_or_default()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HubConfig::default()),
         Err(e) => Err(shelbi_core::Error::Io(e)),
     }
@@ -50,7 +50,7 @@ pub fn load_hub_config() -> Result<HubConfig> {
 pub fn save_hub_config(cfg: &HubConfig) -> Result<()> {
     let path = hub_config_path()?;
     ensure_dir(path.parent().unwrap())?;
-    atomic_write(&path, serde_yaml::to_string(cfg)?.as_bytes())
+    atomic_write(&path, yaml_serde::to_string(cfg)?.as_bytes())
 }
 
 /// Stamp `project`'s `last_launched` to now. Creates the entry (and the
@@ -137,7 +137,7 @@ pub fn list_projects() -> Result<Vec<ProjectSummary>> {
             Ok(t) => t,
             Err(_) => continue,
         };
-        let project: Project = match serde_yaml::from_str(&text) {
+        let project: Project = match yaml_serde::from_str(&text) {
             Ok(p) => p,
             Err(_) => continue,
         };

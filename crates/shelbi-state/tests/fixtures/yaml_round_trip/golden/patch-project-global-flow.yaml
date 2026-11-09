@@ -1,0 +1,32 @@
+name: Acme
+default_branch: main
+default_workflow: task
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+  codex:
+    command: codex
+    flags: []
+workspace_poll_interval_secs: 5
+github_reconcile_interval_secs: 900
+zen:
+  checks:
+    local:
+    - cd Packages/AcmeCore && swift test
+    - xcodebuild build -project Acme.xcodeproj -scheme Acme -destination 'generic/platform=iOS Simulator' -derivedDataPath build
+  ci_timeout: 900
+  danger_paths:
+    extend: []
+heartbeat: 1m
+git:
+  merge_strategy: squash
+repo: /Users/someone/Workspaces/Acme
+machines:
+- name: hub
+  kind: local
+  work_dir: /Users/someone/Workspaces/Acme
+editor: null
+workspaces: [{name: star, machine: hub}, {name: trophy, machine: hub}, {name: reward, machine: hub}, {name: medal, machine: hub, tags: [review]}]

@@ -1,0 +1,48 @@
+## Shelbi workflow — full reference: https://shelbi.dev/docs/configuration/workflow
+## Statuses are reference-only (id + owner + optional agent); each status's
+## display name & category live in workflows/statuses.yaml. Commented blocks
+## below are optional: uncomment to enable.
+
+name: subtask
+description: A piece of a parent task, squash-merged into the parent's branch with no PR or review.
+statuses:
+- id: backlog
+  owner: user
+  agent: orchestrator
+- id: todo
+  owner: agent
+  agent: orchestrator
+- id: in-progress
+  owner: agent
+  agent: developer
+- id: done
+  owner: user
+- id: canceled
+  owner: user
+transitions:
+- from: in-progress
+  to: done
+  actions:
+  - push_branch
+  - merge
+- from: in-progress
+  to: canceled
+  actions:
+  - delete_branch
+required_params:
+- task
+git:
+  base_branch: task/{{task}}
+  branch: subtask/{{id}}
+  merge_strategy: squash
+
+## Stable id a new task lands in. Defaults to the first status when unset.
+#initial_status: backlog
+
+## Per-workflow Zen override — each subfield independently optional. The
+## canonical use is a research workflow opting out of the project's checks.
+#zen:
+#  checks:
+#    local: []                # replace the project's checks for this workflow
+#  ci_timeout: 900
+

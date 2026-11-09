@@ -1,0 +1,19 @@
+name: default
+description: The standard one-track flow shipped with every project.
+statuses:
+- id: backlog
+  owner: user
+  agent: orchestrator
+- id: todo
+  owner: agent
+  agent: orchestrator
+- id: in-progress
+  owner: agent
+  agent: developer
+- id: review
+  owner: user
+  agent: orchestrator
+- id: done
+  owner: user
+- id: canceled
+  owner: user

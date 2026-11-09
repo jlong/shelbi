@@ -178,7 +178,7 @@ pub fn record_question(q: NewQuestion<'_>) -> Result<Question> {
 }
 
 fn write_question(q: &Question) -> Result<()> {
-    let front = serde_yaml::to_string(&q.meta)?;
+    let front = yaml_serde::to_string(&q.meta)?;
     // The body always gets exactly one trailing newline, which `read_question`
     // strips, so the text round-trips byte for byte.
     let doc = format!("---\n{front}---\n{}\n", q.text);
@@ -195,7 +195,7 @@ pub fn read_question(path: &Path) -> Result<Option<Question>> {
     let (front, body) = crate::split_frontmatter(&raw).ok_or_else(|| {
         Error::Other(format!("question file has no frontmatter: {}", path.display()))
     })?;
-    let meta: QuestionMeta = serde_yaml::from_str(front)?;
+    let meta: QuestionMeta = yaml_serde::from_str(front)?;
     let text = body.strip_suffix('\n').unwrap_or(body).to_string();
     Ok(Some(Question {
         meta,

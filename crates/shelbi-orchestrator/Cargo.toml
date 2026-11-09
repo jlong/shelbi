@@ -30,7 +30,7 @@ serde_json = { workspace = true }
 # in a repo path, and reports scaffold failures as context-tagged `anyhow`
 # errors to match the CLI's existing init surface.
 anyhow = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 signal-hook = "0.3"
@@ -45,7 +45,7 @@ test-support = []
 
 [dev-dependencies]
 tempfile = "3"
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 # The agents/workflows fixture project (`settings::agents::fixture`) the
 # remote-source parity test reads through both sources.
 shelbi-app = { workspace = true, features = ["test-support"] }

@@ -31,7 +31,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use serde_yaml::Value;
+use yaml_serde::Value;
 use shelbi_core::{ConfigMode, Machine, Project, WorkspaceSpec};
 
 use crate::yaml_edit;
@@ -340,7 +340,7 @@ fn merge_list<T: Serialize + Named>(
 }
 
 fn to_value(v: &impl Serialize) -> Result<Value> {
-    serde_yaml::to_value(v).map_err(|e| PoolConfigError::Invalid(e.to_string()))
+    yaml_serde::to_value(v).map_err(|e| PoolConfigError::Invalid(e.to_string()))
 }
 
 /// Parse the pool file (with its shared half, in-repo) as a whole project.

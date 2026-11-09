@@ -1,0 +1,19 @@
+statuses:
+- id: backlog
+  name: Backlog
+  category: backlog
+- id: todo
+  name: Todo
+  category: ready
+- id: in-progress
+  name: In Progress
+  category: active
+- id: review
+  name: Review
+  category: handoff
+- id: done
+  name: Done
+  category: done
+- id: canceled
+  name: Canceled
+  category: archived

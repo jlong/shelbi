@@ -1,0 +1,57 @@
+u64_max: 18446744073709551615
+i64_min: -9223372036854775808
+i128: -170141183460469231731687303715884105728
+floats:
+- 0.0
+- -0.0
+- 0.5
+- 1.0
+- 1e20
+- 1e-7
+- 123456.789
+- 1.7976931348623157e308
+- 2.2250738585072014e-308
+- .nan
+- .inf
+- -.inf
+f32: 0.1
+bools:
+- true
+- false
+none: null
+some: x
+unit: null
+chr: '#'
+variants:
+- Unit
+- !Newtype n
+- !Tuple
+  - 1
+  - t
+- !Struct
+  a: 2
+  b: null
+variant_field: !Struct
+  a: 3
+  b: yes
+int_keys:
+  -1: minus
+  2: two
+bool_keys:
+  false: f
+  true: t
+empty_seq: []
+empty_map: {}
+nested:
+- []
+- - k:
+    - 1
+    - 2
+  - {}
+tuple:
+- a
+- 1
+- null
+bytes:
+- 104
+- 105

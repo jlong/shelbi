@@ -390,7 +390,7 @@ fn read_token_file(path: &Path) -> Result<Option<String>> {
 
     ensure_private_permissions(path)?;
 
-    let parsed: TokensFile = serde_yaml::from_str(&contents)?;
+    let parsed: TokensFile = yaml_serde::from_str(&contents)?;
     Ok(parsed
         .github
         .and_then(|g| g.token)

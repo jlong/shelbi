@@ -1,0 +1,17 @@
+repo: git@github.com:me/myapp.git
+machines:
+- name: hub
+  kind: local
+  work_dir: ~/Workspaces/myapp
+- name: m2
+  kind: ssh
+  work_dir: ~/work/myapp
+  host: m2.local
+editor: null
+workspaces:
+- name: alice
+  machine: hub
+- name: bob
+  machine: m2
+- name: carol
+  machine: m2

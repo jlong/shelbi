@@ -14,7 +14,7 @@ pub struct Session {
     #[serde(default)]
     pub projects: Vec<SessionProject>,
     #[serde(default)]
-    pub startup: Vec<serde_yaml::Value>,
+    pub startup: Vec<yaml_serde::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1340,11 +1340,11 @@ impl Project {
 
     /// Parse a `Project` from a single YAML — the [`ConfigMode::Global`]
     /// on-disk shape, matching the historical behavior of
-    /// `serde_yaml::from_str::<Project>`.
+    /// `yaml_serde::from_str::<Project>`.
     ///
     /// The split-mode counterpart is [`Project::from_split_yaml_str`].
     pub fn from_yaml_str(text: &str) -> crate::Result<Self> {
-        Ok(serde_yaml::from_str(text)?)
+        Ok(yaml_serde::from_str(text)?)
     }
 
     /// Parse a `Project` from the two YAML halves of
@@ -1359,8 +1359,8 @@ impl Project {
     /// are rejected: which side wins is not a decision this layer should
     /// make, so the merge refuses instead of silently dropping one.
     pub fn from_split_yaml_str(shared_yaml: &str, local_yaml: &str) -> crate::Result<Self> {
-        let shared_val: serde_yaml::Value = serde_yaml::from_str(shared_yaml)?;
-        let local_val: serde_yaml::Value = serde_yaml::from_str(local_yaml)?;
+        let shared_val: yaml_serde::Value = yaml_serde::from_str(shared_yaml)?;
+        let local_val: yaml_serde::Value = yaml_serde::from_str(local_yaml)?;
 
         let shared_map = require_mapping(&shared_val, "shared")?;
         let local_map = require_mapping(&local_val, "user-local")?;
@@ -1380,7 +1380,7 @@ impl Project {
             "shared",
         )?;
 
-        let mut merged = serde_yaml::Mapping::new();
+        let mut merged = yaml_serde::Mapping::new();
         for (k, v) in shared_map {
             merged.insert(k.clone(), v.clone());
         }
@@ -1394,32 +1394,32 @@ impl Project {
             }
             merged.insert(k.clone(), v.clone());
         }
-        Ok(serde_yaml::from_value(serde_yaml::Value::Mapping(merged))?)
+        Ok(yaml_serde::from_value(yaml_serde::Value::Mapping(merged))?)
     }
 
     /// Serialize the shared half of this project — the committed
     /// `<repo>/.shelbi/project.yaml` under [`ConfigMode::InRepo`].
     /// User-local and runtime fields are omitted.
     pub fn to_shared_yaml_string(&self) -> crate::Result<String> {
-        let mut value = serde_yaml::to_value(self)?;
+        let mut value = yaml_serde::to_value(self)?;
         retain_fields(&mut value, SHARED_PROJECT_FIELDS);
-        Ok(serde_yaml::to_string(&value)?)
+        Ok(yaml_serde::to_string(&value)?)
     }
 
     /// Serialize the user-local half of this project — the gitignored
     /// `~/.shelbi/projects/<name>/local.yaml` under
     /// [`ConfigMode::InRepo`]. Shared and runtime fields are omitted.
     pub fn to_local_yaml_string(&self) -> crate::Result<String> {
-        let mut value = serde_yaml::to_value(self)?;
+        let mut value = yaml_serde::to_value(self)?;
         retain_fields(&mut value, LOCAL_PROJECT_FIELDS);
-        Ok(serde_yaml::to_string(&value)?)
+        Ok(yaml_serde::to_string(&value)?)
     }
 }
 
 fn require_mapping<'a>(
-    value: &'a serde_yaml::Value,
+    value: &'a yaml_serde::Value,
     file_kind: &'static str,
-) -> crate::Result<&'a serde_yaml::Mapping> {
+) -> crate::Result<&'a yaml_serde::Mapping> {
     value.as_mapping().ok_or_else(|| {
         crate::Error::Other(format!(
             "{file_kind} project YAML must be a mapping at the top level"
@@ -1428,7 +1428,7 @@ fn require_mapping<'a>(
 }
 
 fn check_field_placement(
-    map: &serde_yaml::Mapping,
+    map: &yaml_serde::Mapping,
     found_in: &'static str,
     valid_here: &[&str],
     valid_elsewhere: &[&str],
@@ -1452,7 +1452,7 @@ fn check_field_placement(
     Ok(())
 }
 
-fn retain_fields(value: &mut serde_yaml::Value, keep: &[&str]) {
+fn retain_fields(value: &mut yaml_serde::Value, keep: &[&str]) {
     if let Some(map) = value.as_mapping_mut() {
         map.retain(|k, _| k.as_str().map(|s| keep.contains(&s)).unwrap_or(false));
     }
@@ -2367,14 +2367,14 @@ pub struct Issue {
     /// docs and `feature-task` example assume.
     ///
     /// Anything that is not a typed Issue field lands here — and the value is
-    /// kept as a raw [`serde_yaml::Value`], not narrowed to `String`. This
+    /// kept as a raw [`yaml_serde::Value`], not narrowed to `String`. This
     /// is the task half of the forward-compat contract (see the module docs
     /// on `shelbi_state`): when a *newer* binary adds a typed scalar field
     /// (say `retries: 2`) and an *older* binary reads the file, that field
     /// flattens in here. A `String`-typed map would fail flatten-deserialize
     /// on the non-string value and make the whole task file unparseable — the
     /// card would silently vanish from the board and `renumber_column` would
-    /// renumber around it. Holding `serde_yaml::Value` lets any unknown field
+    /// renumber around it. Holding `yaml_serde::Value` lets any unknown field
     /// survive a read-modify-write on the old binary untouched.
     ///
     /// `{{var}}` substitution is still string-only by design: [`param_str`]
@@ -2385,7 +2385,7 @@ pub struct Issue {
     /// [`param_str`]: Issue::param_str
     /// [`string_params`]: Issue::string_params
     #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub params: BTreeMap<String, serde_yaml::Value>,
+    pub params: BTreeMap<String, yaml_serde::Value>,
 }
 
 impl Issue {
@@ -2434,7 +2434,7 @@ impl Issue {
     /// non-string value from a newer binary reads as absent rather than
     /// panicking a `String`-typed lookup.
     pub fn param_str(&self, key: &str) -> Option<&str> {
-        self.params.get(key).and_then(serde_yaml::Value::as_str)
+        self.params.get(key).and_then(yaml_serde::Value::as_str)
     }
 
     /// The string-valued subset of [`Issue::params`], for `{{var}}`
@@ -2457,7 +2457,7 @@ impl Issue {
     ///
     /// This is a *diagnostic* layered on top of a deliberately tolerant
     /// parse — it never mutates and never fails. [`Issue::params`] holds raw
-    /// [`serde_yaml::Value`]s so a newer binary's typed field survives a
+    /// [`yaml_serde::Value`]s so a newer binary's typed field survives a
     /// read-modify-write on an older one (see the field docs and the
     /// `non_string_params_round_trip…` test); that tolerance is what lets a
     /// misspelled optional field (`asigned_to:`) slip in as an anonymous
@@ -2583,15 +2583,15 @@ fn closest_optional_field(key: &str) -> Option<&'static str> {
 
 /// The YAML type name of `value`, for a diagnostic that tells the user what
 /// kind of non-string value they wrote.
-fn yaml_value_kind(value: &serde_yaml::Value) -> &'static str {
+fn yaml_value_kind(value: &yaml_serde::Value) -> &'static str {
     match value {
-        serde_yaml::Value::Null => "null",
-        serde_yaml::Value::Bool(_) => "boolean",
-        serde_yaml::Value::Number(_) => "number",
-        serde_yaml::Value::String(_) => "string",
-        serde_yaml::Value::Sequence(_) => "sequence",
-        serde_yaml::Value::Mapping(_) => "mapping",
-        serde_yaml::Value::Tagged(_) => "tagged",
+        yaml_serde::Value::Null => "null",
+        yaml_serde::Value::Bool(_) => "boolean",
+        yaml_serde::Value::Number(_) => "number",
+        yaml_serde::Value::String(_) => "string",
+        yaml_serde::Value::Sequence(_) => "sequence",
+        yaml_serde::Value::Mapping(_) => "mapping",
+        yaml_serde::Value::Tagged(_) => "tagged",
     }
 }
 
@@ -2890,7 +2890,7 @@ pub struct ZenChecks {
 /// list. `Extend` (default) keeps the built-in patterns and adds the
 /// user's; `Override` replaces them entirely. The wire format is a map
 /// with a single `extend:` or `override:` key — we hand-roll it via
-/// [`ZenDangerPathsRepr`] because serde_yaml's externally-tagged
+/// [`ZenDangerPathsRepr`] because yaml_serde's externally-tagged
 /// default uses YAML tags (`!extend`), which are awkward to write in a
 /// hand-edited project file. A bare sequence (`danger_paths: [..]`) is
 /// also accepted as shorthand for `extend:` — see [`ZenDangerPathsWire`].
@@ -3337,7 +3337,7 @@ mod pr_tests {
 
     #[test]
     fn the_record_stores_only_what_is_set() {
-        let yaml = serde_yaml::to_string(&IssuePr::new(7, Some("https://h/pull/7".into()))).unwrap();
+        let yaml = yaml_serde::to_string(&IssuePr::new(7, Some("https://h/pull/7".into()))).unwrap();
         assert!(!yaml.contains("state") && !yaml.contains("ci"), "{yaml}");
     }
 }
@@ -3369,7 +3369,7 @@ mod tests {
             updated_at: now,
             params: BTreeMap::new(),
         };
-        let value = serde_yaml::to_value(&issue).unwrap();
+        let value = yaml_serde::to_value(&issue).unwrap();
         let mut keys: Vec<&str> = value
             .as_mapping()
             .unwrap()
@@ -3461,30 +3461,30 @@ mod tests {
     #[test]
     fn column_serde_roundtrip() {
         for c in Column::core() {
-            let y = serde_yaml::to_string(&c).unwrap();
-            let back: Column = serde_yaml::from_str(&y).unwrap();
+            let y = yaml_serde::to_string(&c).unwrap();
+            let back: Column = yaml_serde::from_str(&y).unwrap();
             assert_eq!(c, back);
         }
         // Wire format keeps the legacy snake_case form for the core ids so
         // an older binary still parses the `column:` field.
         assert_eq!(
-            serde_yaml::to_string(&Column::in_progress())
+            yaml_serde::to_string(&Column::in_progress())
                 .unwrap()
                 .trim(),
             "in_progress"
         );
         // A custom / archived status round-trips through its verbatim id.
         let canceled: Column =
-            serde_yaml::from_str(&serde_yaml::to_string(&Column::canceled()).unwrap()).unwrap();
+            yaml_serde::from_str(&yaml_serde::to_string(&Column::canceled()).unwrap()).unwrap();
         assert_eq!(canceled, Column::canceled());
         assert_eq!(
-            serde_yaml::to_string(&Column::canceled()).unwrap().trim(),
+            yaml_serde::to_string(&Column::canceled()).unwrap().trim(),
             "canceled"
         );
         // The legacy snake_case on-disk spelling still deserializes onto the
         // canonical kebab-case id, so old task files keep loading.
         assert_eq!(
-            serde_yaml::from_str::<Column>("in_progress").unwrap(),
+            yaml_serde::from_str::<Column>("in_progress").unwrap(),
             Column::in_progress()
         );
     }
@@ -3531,9 +3531,9 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         assert!(t.depends_on.is_empty());
-        let back = serde_yaml::to_string(&t).unwrap();
+        let back = yaml_serde::to_string(&t).unwrap();
         assert!(!back.contains("depends_on"));
     }
 
@@ -3555,20 +3555,20 @@ depends_on:
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(t.workflow.as_deref(), Some("feature-task"));
         assert_eq!(t.branch.as_deref(), Some("feature/auth-rewrite"));
         assert_eq!(t.depends_on, vec!["scaffold-auth".to_string()]);
 
-        let back = serde_yaml::to_string(&t).unwrap();
+        let back = yaml_serde::to_string(&t).unwrap();
         assert!(back.contains("workflow: feature-task"));
         assert!(back.contains("branch: feature/auth-rewrite"));
         assert!(back.contains("depends_on"));
         assert!(back.contains("- scaffold-auth"));
 
         // Stable second round-trip — no spurious normalization.
-        let t2: Issue = serde_yaml::from_str(&back).unwrap();
-        assert_eq!(serde_yaml::to_string(&t2).unwrap(), back);
+        let t2: Issue = yaml_serde::from_str(&back).unwrap();
+        assert_eq!(yaml_serde::to_string(&t2).unwrap(), back);
     }
 
     #[test]
@@ -3581,18 +3581,18 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         assert!(t.workflow.is_none());
         // Absent `workflow:` routes to the canonical default name; no
         // caller has to special-case `Option::None`.
         assert_eq!(t.workflow_or_default(), DEFAULT_WORKFLOW_NAME);
-        let back = serde_yaml::to_string(&t).unwrap();
+        let back = yaml_serde::to_string(&t).unwrap();
         assert!(!back.contains("workflow"));
     }
 
     #[test]
     fn task_workflow_or_default_prefers_explicit() {
-        let mut t: Issue = serde_yaml::from_str(
+        let mut t: Issue = yaml_serde::from_str(
             r#"
 id: a
 title: A
@@ -3618,9 +3618,9 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         assert!(t.branch.is_none());
-        let back = serde_yaml::to_string(&t).unwrap();
+        let back = yaml_serde::to_string(&t).unwrap();
         assert!(!back.contains("branch"));
     }
 
@@ -3702,7 +3702,7 @@ agent_runners:
         assert_eq!(minimal.display_name, None);
         minimal.name = "contextstore".to_string();
         assert_eq!(minimal.display_label(), "contextstore");
-        let out = serde_yaml::to_string(&minimal).unwrap();
+        let out = yaml_serde::to_string(&minimal).unwrap();
         assert!(
             !out.lines().any(|l| l.starts_with("name:")) && !out.contains("display_name"),
             "the machine id is never serialized and an unset label carries no top-level `name:`:\n{out}"
@@ -3715,7 +3715,7 @@ agent_runners:
         labeled.name = "contextstore".to_string();
         assert_eq!(labeled.label.as_deref(), Some("My Project"));
         assert_eq!(labeled.display_label(), "My Project");
-        assert!(serde_yaml::to_string(&labeled)
+        assert!(yaml_serde::to_string(&labeled)
             .unwrap()
             .contains("name: My Project"));
 
@@ -3782,12 +3782,12 @@ agent_runners:
             updated_at: now,
             params: BTreeMap::new(),
         };
-        let y = serde_yaml::to_string(&task).unwrap();
+        let y = yaml_serde::to_string(&task).unwrap();
         assert!(y.contains("prefers_machine: devbox"));
-        let back: Issue = serde_yaml::from_str(&y).unwrap();
+        let back: Issue = yaml_serde::from_str(&y).unwrap();
         assert_eq!(back.prefers_machine.as_deref(), Some("devbox"));
         // YAML representation is stable across a second round trip.
-        let y2 = serde_yaml::to_string(&back).unwrap();
+        let y2 = yaml_serde::to_string(&back).unwrap();
         assert_eq!(y, y2);
     }
 
@@ -3801,9 +3801,9 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         assert!(t.prefers_machine.is_none());
-        let back = serde_yaml::to_string(&t).unwrap();
+        let back = yaml_serde::to_string(&t).unwrap();
         assert!(!back.contains("prefers_machine"));
     }
 
@@ -3849,14 +3849,14 @@ region: us-east
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(t.param_str("feature"), Some("auth-rewrite"));
         assert_eq!(t.param_str("region"), Some("us-east"));
         // Structured fields aren't double-counted in params.
         assert!(!t.params.contains_key("id"));
         assert!(!t.params.contains_key("workflow"));
 
-        let back = serde_yaml::to_string(&t).unwrap();
+        let back = yaml_serde::to_string(&t).unwrap();
         assert!(back.contains("feature: auth-rewrite"), "out: {back}");
         assert!(back.contains("region: us-east"), "out: {back}");
     }
@@ -3881,12 +3881,12 @@ zen_optional: true
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         // The unknown non-string fields land in params as raw YAML values.
-        assert_eq!(t.params.get("retries"), Some(&serde_yaml::Value::from(2)));
+        assert_eq!(t.params.get("retries"), Some(&yaml_serde::Value::from(2)));
         assert_eq!(
             t.params.get("zen_optional"),
-            Some(&serde_yaml::Value::from(true))
+            Some(&yaml_serde::Value::from(true))
         );
         // Substitution stays string-only: `param_str` / `string_params`
         // expose the string field but not the number or bool.
@@ -3898,15 +3898,15 @@ updated_at: 2026-06-19T00:00:00Z
         assert!(!sp.contains_key("zen_optional"));
         // The old binary rewrites the file: the newer fields survive with
         // their original YAML types, not stringified.
-        let back = serde_yaml::to_string(&t).unwrap();
-        let reparsed: Issue = serde_yaml::from_str(&back).unwrap();
+        let back = yaml_serde::to_string(&t).unwrap();
+        let reparsed: Issue = yaml_serde::from_str(&back).unwrap();
         assert_eq!(
             reparsed.params.get("retries"),
-            Some(&serde_yaml::Value::from(2))
+            Some(&yaml_serde::Value::from(2))
         );
         assert_eq!(
             reparsed.params.get("zen_optional"),
-            Some(&serde_yaml::Value::from(true))
+            Some(&yaml_serde::Value::from(true))
         );
     }
 
@@ -3915,7 +3915,7 @@ updated_at: 2026-06-19T00:00:00Z
             "id: t\ntitle: T\ncolumn: todo\npriority: 0\n\
              created_at: 2026-06-19T00:00:00Z\nupdated_at: 2026-06-19T00:00:00Z\n{extra_yaml}"
         );
-        serde_yaml::from_str(&yaml).unwrap()
+        yaml_serde::from_str(&yaml).unwrap()
     }
 
     #[test]
@@ -3969,7 +3969,7 @@ updated_at: 2026-06-19T00:00:00Z
         // parses (forward-compat), but the lint surfaces it as an error that
         // names the key rather than letting it vanish silently.
         let t = task_with_params("retries: 2\n");
-        assert_eq!(t.params.get("retries"), Some(&serde_yaml::Value::from(2)));
+        assert_eq!(t.params.get("retries"), Some(&yaml_serde::Value::from(2)));
         let diags = t.validate_params();
         assert_eq!(
             diags,
@@ -4024,7 +4024,7 @@ updated_at: 2026-06-19T00:00:00Z
         // and round-trip untouched.
         let t = task_with_params("feature: auth-rewrite\nregion: us-east\n");
         assert!(t.validate_params().is_empty());
-        let reparsed: Issue = serde_yaml::from_str(&serde_yaml::to_string(&t).unwrap()).unwrap();
+        let reparsed: Issue = yaml_serde::from_str(&yaml_serde::to_string(&t).unwrap()).unwrap();
         assert_eq!(reparsed.param_str("feature"), Some("auth-rewrite"));
         assert_eq!(reparsed.param_str("region"), Some("us-east"));
         assert!(reparsed.validate_params().is_empty());
@@ -4053,13 +4053,13 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         assert!(t.params.is_empty());
-        let back = serde_yaml::to_string(&t).unwrap();
+        let back = yaml_serde::to_string(&t).unwrap();
         // There's no good single token to grep for "params:" since it
         // would only appear if we'd nested under that key — instead
         // assert that the round-trip is stable.
-        let t2: Issue = serde_yaml::from_str(&back).unwrap();
+        let t2: Issue = yaml_serde::from_str(&back).unwrap();
         assert!(t2.params.is_empty());
     }
 
@@ -4089,7 +4089,7 @@ agents:
   review:
     runner: claude
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         // Kind → concrete runner is a direct lookup; codex carries a house model.
         let codex = p.runners.get(&RunnerKind::Codex).unwrap();
         assert_eq!(codex.spec.command, "codex");
@@ -4112,7 +4112,7 @@ orchestrator: { runner: claude }
 agent_runners:
   claude: { command: claude, flags: [] }
 "#;
-        let p2: Project = serde_yaml::from_str(bare).unwrap();
+        let p2: Project = yaml_serde::from_str(bare).unwrap();
         assert!(p2.runners.is_empty());
         assert!(p2.agents.is_empty());
     }
@@ -4128,7 +4128,7 @@ orchestrator: { runner: claude }
 agent_runners:
   claude: { command: claude, flags: [] }
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.workspace_poll_interval_secs, 5);
         // A project YAML that predates the reconcile pass defaults to 15 min.
         assert_eq!(p.github_reconcile_interval_secs, 900);
@@ -4154,7 +4154,7 @@ agent_runners:
   claude: { command: claude, flags: [] }
 github_reconcile_interval_secs: 0
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.github_reconcile_interval_secs, 0);
         assert_eq!(
             p.github_reconcile_interval(),
@@ -4187,11 +4187,11 @@ agent_runners:
     path: ~/Documents/Legacy/shelbi
 "#
         );
-        let p: Project = serde_yaml::from_str(&yaml).unwrap();
+        let p: Project = yaml_serde::from_str(&yaml).unwrap();
         // The YAML `name:` deserializes into the display label; the id is
         // filename-derived and not present in a bare serde parse.
         assert_eq!(p.label.as_deref(), Some("p"));
-        let back = serde_yaml::to_string(&p).unwrap();
+        let back = yaml_serde::to_string(&p).unwrap();
         assert!(!back.contains(legacy_key));
     }
 
@@ -4209,7 +4209,7 @@ workspace_poll_interval_secs: 12
 workspace_permissions_mode: acceptEdits
 workspace_settings_template: /etc/shelbi/p.json
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.workspace_poll_interval_secs, 12);
         assert_eq!(p.workspace_permissions_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(
@@ -4314,7 +4314,7 @@ agent_runners:
 workspaces:
   - { name: alice, machine: hub, runner: codex }
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         p.validate_workspaces()
             .expect("codex orchestrator and workspace runner are declared");
     }
@@ -4395,23 +4395,23 @@ workspaces:
     fn workspace_tags_parse_scalar_seq_and_alias() {
         // No `tags:`/`tag:` key → empty.
         let plain: WorkspaceSpec =
-            serde_yaml::from_str("{ name: alpha, machine: hub, runner: claude }").unwrap();
+            yaml_serde::from_str("{ name: alpha, machine: hub, runner: claude }").unwrap();
         assert!(plain.tags.is_empty());
 
         // Bare-string `tags: review` → one-element list (string-or-seq).
         let scalar: WorkspaceSpec =
-            serde_yaml::from_str("{ name: r, machine: hub, runner: claude, tags: review }")
+            yaml_serde::from_str("{ name: r, machine: hub, runner: claude, tags: review }")
                 .unwrap();
         assert_eq!(scalar.tags, vec!["review".to_string()]);
 
         // Scalar `tag:` alias for `tags:`.
         let alias: WorkspaceSpec =
-            serde_yaml::from_str("{ name: r, machine: hub, runner: claude, tag: review }").unwrap();
+            yaml_serde::from_str("{ name: r, machine: hub, runner: claude, tag: review }").unwrap();
         assert_eq!(alias.tags, vec!["review".to_string()]);
 
         // Sequence form.
         let seq: WorkspaceSpec =
-            serde_yaml::from_str("{ name: r, machine: hub, runner: claude, tags: [review, gpu] }")
+            yaml_serde::from_str("{ name: r, machine: hub, runner: claude, tags: [review, gpu] }")
                 .unwrap();
         assert_eq!(seq.tags, vec!["review".to_string(), "gpu".to_string()]);
     }
@@ -4419,23 +4419,23 @@ workspaces:
     #[test]
     fn machine_forward_override_parses_and_defaults_to_none() {
         // No `forward:` key → auto (None), and it round-trips out elided.
-        let auto: Machine = serde_yaml::from_str(
+        let auto: Machine = yaml_serde::from_str(
             "{ name: devbox, kind: ssh, work_dir: /home/u, host: devbox }",
         )
         .unwrap();
         assert_eq!(auto.forward, None);
-        let back = serde_yaml::to_string(&auto).unwrap();
+        let back = yaml_serde::to_string(&auto).unwrap();
         assert!(!back.contains("forward"), "None must not serialize: {back}");
 
         // `forward: tcp` pins the TCP loopback fallback explicitly.
-        let tcp: Machine = serde_yaml::from_str(
+        let tcp: Machine = yaml_serde::from_str(
             "{ name: devbox, kind: ssh, work_dir: /home/u, host: devbox, forward: tcp }",
         )
         .unwrap();
         assert_eq!(tcp.forward, Some(ForwardMode::Tcp));
 
         // `forward: unix` pins the Unix forward (disables auto-fallback).
-        let unix: Machine = serde_yaml::from_str(
+        let unix: Machine = yaml_serde::from_str(
             "{ name: box, kind: ssh, work_dir: /home/u, host: box, forward: unix }",
         )
         .unwrap();
@@ -4446,25 +4446,25 @@ workspaces:
     fn legacy_role_folds_into_tags() {
         // `role: Review` (any case) is read-only legacy → the `review` tag.
         let rev: WorkspaceSpec =
-            serde_yaml::from_str("{ name: review-1, machine: hub, runner: claude, role: Review }")
+            yaml_serde::from_str("{ name: review-1, machine: hub, runner: claude, role: Review }")
                 .unwrap();
         assert_eq!(rev.tags, vec!["review".to_string()]);
 
         // `role: review` lowercase → same.
         let rev2: WorkspaceSpec =
-            serde_yaml::from_str("{ name: review-1, machine: hub, runner: claude, role: review }")
+            yaml_serde::from_str("{ name: review-1, machine: hub, runner: claude, role: review }")
                 .unwrap();
         assert_eq!(rev2.tags, vec!["review".to_string()]);
 
         // `role: Dev` → no tags.
         let dev: WorkspaceSpec =
-            serde_yaml::from_str("{ name: alpha, machine: hub, runner: claude, role: Dev }")
+            yaml_serde::from_str("{ name: alpha, machine: hub, runner: claude, role: Dev }")
                 .unwrap();
         assert!(dev.tags.is_empty());
 
         // `role` is never written back out — a loaded legacy config is
         // rewritten in the tag shape.
-        let y = serde_yaml::to_string(&rev).unwrap();
+        let y = yaml_serde::to_string(&rev).unwrap();
         assert!(!y.contains("role"), "unexpected role key on the wire: {y}");
         assert!(y.contains("review"), "review tag should serialize: {y}");
     }
@@ -4476,10 +4476,10 @@ workspaces:
         // key is dropped — never re-serialized — so the next save rewrites the
         // workspace in the runner-less shape with no manual edit.
         let w: WorkspaceSpec =
-            serde_yaml::from_str("{ name: dev, machine: hub, runner: codex }").unwrap();
+            yaml_serde::from_str("{ name: dev, machine: hub, runner: codex }").unwrap();
         assert_eq!(w.name, "dev");
         assert_eq!(w.machine, "hub");
-        let y = serde_yaml::to_string(&w).unwrap();
+        let y = yaml_serde::to_string(&w).unwrap();
         assert!(!y.contains("runner"), "runner key must not round-trip: {y}");
     }
 
@@ -4516,13 +4516,13 @@ workspaces:
         // A workspace with no tags must not grow a `tags:` key, so existing
         // YAMLs round-trip byte-identically.
         let dev = ws("alpha", "hub", false);
-        let y = serde_yaml::to_string(&dev).unwrap();
+        let y = yaml_serde::to_string(&dev).unwrap();
         assert!(!y.contains("tags"), "unexpected tags key on the wire: {y}");
         assert!(!y.contains("slot"), "unexpected slot key on the wire: {y}");
 
         // A tagged workspace serializes its tags as a sequence.
         let rev = ws("review-1", "hub", true);
-        let y = serde_yaml::to_string(&rev).unwrap();
+        let y = yaml_serde::to_string(&rev).unwrap();
         assert!(y.contains("review"), "missing review tag: {y}");
     }
 
@@ -4625,7 +4625,7 @@ workspaces:
         // The legacy `role:` key is folded into `tags` on read and never
         // serialized back out.
         let project = project_with_workspaces(vec![ws("alpha", "hub", false)]);
-        let y = serde_yaml::to_string(&project).unwrap();
+        let y = yaml_serde::to_string(&project).unwrap();
         assert!(!y.contains("role:"), "unexpected role key: {y}");
     }
 
@@ -4722,7 +4722,7 @@ orchestrator: { runner: claude }
 agent_runners:
   claude: { command: claude, flags: [] }
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.zen, ZenConfig::default());
     }
 
@@ -4756,7 +4756,7 @@ orchestrator: { runner: claude }
 agent_runners:
   claude: { command: claude, flags: [] }
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert!(p.disk.is_default());
         assert_eq!(p.disk.target_cap_bytes(), 20 * GIB);
         assert_eq!(p.disk.low_free_bytes(), 20 * GIB);
@@ -4776,7 +4776,7 @@ disk:
   target_cap_gib: 40
   low_free_gib: 10
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.disk.target_cap_gib, Some(40));
         assert_eq!(p.disk.low_free_gib, Some(10));
         assert_eq!(p.disk.target_cap_bytes(), 40 * GIB);
@@ -4785,12 +4785,12 @@ disk:
 
     #[test]
     fn default_disk_config_is_elided_from_wire_form() {
-        let p: Project = serde_yaml::from_str(
+        let p: Project = yaml_serde::from_str(
             "name: p\nrepo: r\nmachines:\n  - { name: hub, kind: local, work_dir: /tmp }\n\
              orchestrator: { runner: claude }\nagent_runners:\n  claude: { command: claude, flags: [] }\n",
         )
         .unwrap();
-        let round = serde_yaml::to_string(&p).unwrap();
+        let round = yaml_serde::to_string(&p).unwrap();
         assert!(
             !round.contains("disk:"),
             "a default disk block must not grow the wire form: {round}"
@@ -4817,7 +4817,7 @@ zen:
     extend:
       - migrations/**
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.zen.checks.local, vec!["cargo test", "cargo clippy"]);
         assert_eq!(p.zen.ci_timeout, Duration::from_secs(600));
         assert_eq!(
@@ -4841,7 +4841,7 @@ zen:
     override:
       - "**/*"
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(
             p.zen.danger_paths,
             ZenDangerPaths::Override(vec!["**/*".into()])
@@ -4857,8 +4857,8 @@ zen:
             ci_timeout: Duration::from_secs(900),
             danger_paths: ZenDangerPaths::Extend(vec!["docs/**".into()]),
         };
-        let y = serde_yaml::to_string(&cfg).unwrap();
-        let back: ZenConfig = serde_yaml::from_str(&y).unwrap();
+        let y = yaml_serde::to_string(&cfg).unwrap();
+        let back: ZenConfig = yaml_serde::from_str(&y).unwrap();
         assert_eq!(cfg, back);
         // ci_timeout serializes as a plain integer (no struct form).
         assert!(y.contains("ci_timeout: 900"));
@@ -4878,7 +4878,7 @@ zen:
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         let z = t.zen.expect("zen block present");
         assert_eq!(z.enabled, Some(false));
         assert_eq!(z.checks_only, vec!["cargo test --doc"]);
@@ -4895,9 +4895,9 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         assert!(t.zen.is_none());
-        let back = serde_yaml::to_string(&t).unwrap();
+        let back = yaml_serde::to_string(&t).unwrap();
         assert!(!back.contains("zen"));
     }
 
@@ -4916,7 +4916,7 @@ launch:
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         let over = t.launch.clone().expect("launch block parsed");
         assert_eq!(over.runner, Some(crate::RunnerKind::Codex));
         assert_eq!(over.model.as_deref(), Some("gpt-5"));
@@ -4928,7 +4928,7 @@ updated_at: 2026-06-19T00:00:00Z
         // The override is a typed field, not a flattened param.
         assert!(!t.params.contains_key("launch"));
         // Round-trips through YAML unchanged.
-        let back: Issue = serde_yaml::from_str(&serde_yaml::to_string(&t).unwrap()).unwrap();
+        let back: Issue = yaml_serde::from_str(&yaml_serde::to_string(&t).unwrap()).unwrap();
         assert_eq!(back.launch, t.launch);
     }
 
@@ -4942,9 +4942,9 @@ priority: 0
 created_at: 2026-06-19T00:00:00Z
 updated_at: 2026-06-19T00:00:00Z
 "#;
-        let t: Issue = serde_yaml::from_str(yaml).unwrap();
+        let t: Issue = yaml_serde::from_str(yaml).unwrap();
         assert!(t.launch.is_none());
-        assert!(!serde_yaml::to_string(&t).unwrap().contains("launch"));
+        assert!(!yaml_serde::to_string(&t).unwrap().contains("launch"));
     }
 
     #[test]
@@ -4954,8 +4954,8 @@ updated_at: 2026-06-19T00:00:00Z
             checks_additional: vec!["npm test".into()],
             checks_only: vec![],
         };
-        let y = serde_yaml::to_string(&cfg).unwrap();
-        let back: IssueZenConfig = serde_yaml::from_str(&y).unwrap();
+        let y = yaml_serde::to_string(&cfg).unwrap();
+        let back: IssueZenConfig = yaml_serde::from_str(&y).unwrap();
         assert_eq!(cfg, back);
         // Empty lists omitted on the wire.
         assert!(!y.contains("checks_only"));
@@ -5279,24 +5279,24 @@ updated_at: 2026-06-19T00:00:00Z
     fn heartbeat_config_serializes_as_compact_string() {
         // Default cap → collapses to the bare-scalar form (back-compat).
         let cfg = HeartbeatConfig::every(Duration::from_secs(180));
-        let y = serde_yaml::to_string(&cfg).unwrap();
+        let y = yaml_serde::to_string(&cfg).unwrap();
         assert!(y.contains("3m"), "got {y:?}");
         assert!(
             !y.contains("interval"),
             "default cap must stay a scalar: {y:?}"
         );
-        let back: HeartbeatConfig = serde_yaml::from_str(&y).unwrap();
+        let back: HeartbeatConfig = yaml_serde::from_str(&y).unwrap();
         assert_eq!(back, cfg);
 
         let cfg = HeartbeatConfig::Off;
-        let y = serde_yaml::to_string(&cfg).unwrap();
+        let y = yaml_serde::to_string(&cfg).unwrap();
         assert!(y.contains("off"), "got {y:?}");
-        let back: HeartbeatConfig = serde_yaml::from_str(&y).unwrap();
+        let back: HeartbeatConfig = yaml_serde::from_str(&y).unwrap();
         assert_eq!(back, cfg);
 
         // Non-round-number seconds stay in seconds.
         let cfg = HeartbeatConfig::every(Duration::from_secs(45));
-        let y = serde_yaml::to_string(&cfg).unwrap();
+        let y = yaml_serde::to_string(&cfg).unwrap();
         assert!(y.contains("45s"), "got {y:?}");
     }
 
@@ -5308,21 +5308,21 @@ updated_at: 2026-06-19T00:00:00Z
             interval: Duration::from_secs(120),
             max: Duration::from_secs(1_800),
         };
-        let y = serde_yaml::to_string(&cfg).unwrap();
+        let y = yaml_serde::to_string(&cfg).unwrap();
         assert!(
             y.contains("interval"),
             "non-default cap must emit a map: {y:?}"
         );
         assert!(y.contains("2m"), "got {y:?}");
         assert!(y.contains("30m"), "got {y:?}");
-        let back: HeartbeatConfig = serde_yaml::from_str(&y).unwrap();
+        let back: HeartbeatConfig = yaml_serde::from_str(&y).unwrap();
         assert_eq!(back, cfg);
     }
 
     #[test]
     fn heartbeat_config_map_form_fills_missing_fields_from_defaults() {
         // interval-only map → default cap.
-        let cfg: HeartbeatConfig = serde_yaml::from_str("interval: 2m\n").unwrap();
+        let cfg: HeartbeatConfig = yaml_serde::from_str("interval: 2m\n").unwrap();
         assert_eq!(
             cfg,
             HeartbeatConfig::On {
@@ -5331,7 +5331,7 @@ updated_at: 2026-06-19T00:00:00Z
             }
         );
         // max-only map → default interval.
-        let cfg: HeartbeatConfig = serde_yaml::from_str("max: 30m\n").unwrap();
+        let cfg: HeartbeatConfig = yaml_serde::from_str("max: 30m\n").unwrap();
         assert_eq!(
             cfg,
             HeartbeatConfig::On {
@@ -5340,7 +5340,7 @@ updated_at: 2026-06-19T00:00:00Z
             }
         );
         // Both set.
-        let cfg: HeartbeatConfig = serde_yaml::from_str("interval: 1m\nmax: 10m\n").unwrap();
+        let cfg: HeartbeatConfig = yaml_serde::from_str("interval: 1m\nmax: 10m\n").unwrap();
         assert_eq!(
             cfg,
             HeartbeatConfig::On {
@@ -5349,7 +5349,7 @@ updated_at: 2026-06-19T00:00:00Z
             }
         );
         // `interval: off` inside the map disables regardless of `max`.
-        let cfg: HeartbeatConfig = serde_yaml::from_str("interval: \"off\"\nmax: 30m\n").unwrap();
+        let cfg: HeartbeatConfig = yaml_serde::from_str("interval: \"off\"\nmax: 30m\n").unwrap();
         assert_eq!(cfg, HeartbeatConfig::Off);
     }
 
@@ -5438,15 +5438,15 @@ updated_at: 2026-06-19T00:00:00Z
             dialog_signatures: vec![DialogSignature::new("usage-limit", "Stop and wait")],
             integration: None,
         };
-        let y = serde_yaml::to_string(&spec).unwrap();
+        let y = yaml_serde::to_string(&spec).unwrap();
         assert!(y.contains("dialog_signatures"), "got {y:?}");
-        let back: AgentRunnerSpec = serde_yaml::from_str(&y).unwrap();
+        let back: AgentRunnerSpec = yaml_serde::from_str(&y).unwrap();
         assert_eq!(back.dialog_signatures, spec.dialog_signatures);
 
         // Absent in YAML → empty (and elided on the way back out).
-        let spec2: AgentRunnerSpec = serde_yaml::from_str("command: claude\nflags: []\n").unwrap();
+        let spec2: AgentRunnerSpec = yaml_serde::from_str("command: claude\nflags: []\n").unwrap();
         assert!(spec2.dialog_signatures.is_empty());
-        let y2 = serde_yaml::to_string(&spec2).unwrap();
+        let y2 = yaml_serde::to_string(&spec2).unwrap();
         assert!(
             !y2.contains("dialog_signatures"),
             "should be elided: {y2:?}"
@@ -5457,29 +5457,29 @@ updated_at: 2026-06-19T00:00:00Z
     fn integration_field_is_backward_compatible_and_overrides_detection() {
         // Absent field: basename auto-detection, and the key is elided on the
         // way back out so existing runner specs round-trip byte-for-byte.
-        let auto: AgentRunnerSpec = serde_yaml::from_str("command: codex\n").unwrap();
+        let auto: AgentRunnerSpec = yaml_serde::from_str("command: codex\n").unwrap();
         assert_eq!(auto.integration, None);
         assert_eq!(RunnerKind::detect(&auto), RunnerKind::Codex);
-        let y = serde_yaml::to_string(&auto).unwrap();
+        let y = yaml_serde::to_string(&auto).unwrap();
         assert!(!y.contains("integration"), "should be elided: {y:?}");
 
         // Explicit field overrides basename detection: a wrapper executable
         // whose basename Shelbi wouldn't recognize still selects the Claude
         // adapter.
         let pinned: AgentRunnerSpec =
-            serde_yaml::from_str("command: my-claude-wrapper\nintegration: claude\n").unwrap();
+            yaml_serde::from_str("command: my-claude-wrapper\nintegration: claude\n").unwrap();
         assert_eq!(pinned.integration, Some(RunnerKind::Claude));
         assert_eq!(RunnerKind::detect(&pinned), RunnerKind::Claude);
         // ...and it round-trips through YAML as the lowercase token.
-        let y = serde_yaml::to_string(&pinned).unwrap();
+        let y = yaml_serde::to_string(&pinned).unwrap();
         assert!(y.contains("integration: claude"), "got {y:?}");
-        let back: AgentRunnerSpec = serde_yaml::from_str(&y).unwrap();
+        let back: AgentRunnerSpec = yaml_serde::from_str(&y).unwrap();
         assert_eq!(back.integration, Some(RunnerKind::Claude));
 
         // The field can also force the generic contract onto a recognized
         // basename.
         let generic: AgentRunnerSpec =
-            serde_yaml::from_str("command: claude\nintegration: generic\n").unwrap();
+            yaml_serde::from_str("command: claude\nintegration: generic\n").unwrap();
         assert_eq!(RunnerKind::detect(&generic), RunnerKind::Generic);
     }
 
@@ -5500,30 +5500,30 @@ updated_at: 2026-06-19T00:00:00Z
 
     #[test]
     fn prompt_injection_defaults_and_round_trips_through_yaml() {
-        let claude: AgentRunnerSpec = serde_yaml::from_str("command: claude\n").unwrap();
+        let claude: AgentRunnerSpec = yaml_serde::from_str("command: claude\n").unwrap();
         assert_eq!(
             claude.effective_prompt_injection(),
             PromptInjectionSpec::positional_arg()
         );
-        let aider: AgentRunnerSpec = serde_yaml::from_str("command: aider\n").unwrap();
+        let aider: AgentRunnerSpec = yaml_serde::from_str("command: aider\n").unwrap();
         assert_eq!(
             aider.effective_prompt_injection(),
             PromptInjectionSpec::flag_file("--message-file")
         );
-        let unknown: AgentRunnerSpec = serde_yaml::from_str("command: custom-agent\n").unwrap();
+        let unknown: AgentRunnerSpec = yaml_serde::from_str("command: custom-agent\n").unwrap();
         assert_eq!(
             unknown.effective_prompt_injection(),
             PromptInjectionSpec::stdin()
         );
 
         let spec: AgentRunnerSpec =
-            serde_yaml::from_str("command: repl-only\nprompt_injection: { kind: paste }\n")
+            yaml_serde::from_str("command: repl-only\nprompt_injection: { kind: paste }\n")
                 .unwrap();
         assert_eq!(
             spec.effective_prompt_injection(),
             PromptInjectionSpec::paste()
         );
-        let y = serde_yaml::to_string(&spec).unwrap();
+        let y = yaml_serde::to_string(&spec).unwrap();
         assert!(y.contains("prompt_injection"), "got {y:?}");
     }
 
@@ -5541,7 +5541,7 @@ orchestrator: { runner: claude }
 agent_runners:
   claude: { command: claude, flags: [] }
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.heartbeat, HeartbeatConfig::default());
     }
 
@@ -5561,7 +5561,7 @@ heartbeat: off
         // explicitly when handing user-written configs — but the
         // wizard / serializer always writes the quoted form below.
         let yaml_quoted = yaml.replace("heartbeat: off", "heartbeat: \"off\"");
-        let p: Project = serde_yaml::from_str(&yaml_quoted).unwrap();
+        let p: Project = yaml_serde::from_str(&yaml_quoted).unwrap();
         assert_eq!(p.heartbeat, HeartbeatConfig::Off);
 
         let yaml = r#"
@@ -5574,7 +5574,7 @@ agent_runners:
   claude: { command: claude, flags: [] }
 heartbeat: 90s
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.heartbeat, HeartbeatConfig::every(Duration::from_secs(90)));
 
         // Map form: both bounds set explicitly.
@@ -5588,7 +5588,7 @@ agent_runners:
   claude: { command: claude, flags: [] }
 heartbeat: { interval: 5m, max: 30m }
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(
             p.heartbeat,
             HeartbeatConfig::On {
@@ -5613,10 +5613,10 @@ heartbeat: 180
         // YAML parses `180` as an integer, not a string — so deserialization
         // fails at the type level (`expected String`). Quote it and we
         // get the explicit "missing unit" error.
-        assert!(serde_yaml::from_str::<Project>(yaml).is_err());
+        assert!(yaml_serde::from_str::<Project>(yaml).is_err());
 
         let yaml_quoted = yaml.replace("heartbeat: 180", "heartbeat: \"180\"");
-        let err = serde_yaml::from_str::<Project>(&yaml_quoted)
+        let err = yaml_serde::from_str::<Project>(&yaml_quoted)
             .expect_err("must reject unitless heartbeat");
         let msg = err.to_string();
         assert!(
@@ -5638,17 +5638,17 @@ heartbeat: 180
     #[test]
     fn merge_strategy_yaml_wire_form_is_snake_case() {
         assert_eq!(
-            serde_yaml::to_string(&MergeStrategy::Squash)
+            yaml_serde::to_string(&MergeStrategy::Squash)
                 .unwrap()
                 .trim(),
             "squash"
         );
         assert_eq!(
-            serde_yaml::to_string(&MergeStrategy::Merge).unwrap().trim(),
+            yaml_serde::to_string(&MergeStrategy::Merge).unwrap().trim(),
             "merge"
         );
         assert_eq!(
-            serde_yaml::to_string(&MergeStrategy::Rebase)
+            yaml_serde::to_string(&MergeStrategy::Rebase)
                 .unwrap()
                 .trim(),
             "rebase"
@@ -5658,8 +5658,8 @@ heartbeat: 180
             MergeStrategy::Merge,
             MergeStrategy::Rebase,
         ] {
-            let y = serde_yaml::to_string(&s).unwrap();
-            let back: MergeStrategy = serde_yaml::from_str(&y).unwrap();
+            let y = yaml_serde::to_string(&s).unwrap();
+            let back: MergeStrategy = yaml_serde::from_str(&y).unwrap();
             assert_eq!(s, back);
         }
     }
@@ -5685,7 +5685,7 @@ orchestrator: { runner: claude }
 agent_runners:
   claude: { command: claude, flags: [] }
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.git, GitConfig::default());
         assert_eq!(p.base_branch(), "develop");
         assert_eq!(p.merge_strategy(), MergeStrategy::Squash);
@@ -5707,7 +5707,7 @@ git:
   branch_prefix: team
   merge_strategy: rebase
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.git.base_branch.as_deref(), Some("trunk"));
         assert_eq!(p.git.branch_prefix.as_deref(), Some("team"));
         assert_eq!(p.git.merge_strategy, MergeStrategy::Rebase);
@@ -5733,7 +5733,7 @@ agent_runners:
 git:
   merge_strategy: merge
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert!(p.git.base_branch.is_none());
         assert_eq!(p.git.merge_strategy, MergeStrategy::Merge);
         assert_eq!(p.base_branch(), "main");
@@ -5747,11 +5747,11 @@ git:
             merge_strategy: MergeStrategy::Merge,
             ..Default::default()
         };
-        let y = serde_yaml::to_string(&cfg).unwrap();
+        let y = yaml_serde::to_string(&cfg).unwrap();
         // base_branch is None → must not surface on the wire.
         assert!(!y.contains("base_branch"), "got: {y}");
         assert!(y.contains("merge_strategy: merge"), "got: {y}");
-        let back: GitConfig = serde_yaml::from_str(&y).unwrap();
+        let back: GitConfig = yaml_serde::from_str(&y).unwrap();
         assert_eq!(cfg, back);
 
         let cfg = GitConfig {
@@ -5759,9 +5759,9 @@ git:
             merge_strategy: MergeStrategy::Squash,
             ..Default::default()
         };
-        let y = serde_yaml::to_string(&cfg).unwrap();
+        let y = yaml_serde::to_string(&cfg).unwrap();
         assert!(y.contains("base_branch: trunk"), "got: {y}");
-        let back: GitConfig = serde_yaml::from_str(&y).unwrap();
+        let back: GitConfig = yaml_serde::from_str(&y).unwrap();
         assert_eq!(cfg, back);
     }
 
@@ -5779,7 +5779,7 @@ agent_runners:
 git:
   branch: '{{github_user}}/{{id}}'
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.git.branch.as_deref(), Some("{{github_user}}/{{id}}"));
         assert_eq!(p.git.branch_prefix, None);
         // A templated branch validates (the `{{var}}` guard defers charset
@@ -5802,7 +5802,7 @@ git:
   branch: '{{github_user}}/{{id}}'
   branch_prefix: task
 "#;
-        let mut p: Project = serde_yaml::from_str(yaml).unwrap();
+        let mut p: Project = yaml_serde::from_str(yaml).unwrap();
         // The id is stamped from the filename by the loader; simulate that.
         p.name = "p".to_string();
         let err = p
@@ -5846,7 +5846,7 @@ git:
 "#;
         // `ff_only` isn't a known variant — serde must reject so a typo
         // doesn't silently fall back to `Squash`.
-        assert!(serde_yaml::from_str::<Project>(yaml).is_err());
+        assert!(yaml_serde::from_str::<Project>(yaml).is_err());
     }
 
     // ---- Per-workflow zen resolution helpers ------------------------------
@@ -6140,9 +6140,9 @@ orchestrator: { runner: claude }
 agent_runners:
   claude: { command: claude, flags: [] }
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert!(p.config_mode.is_none());
-        let back = serde_yaml::to_string(&p).unwrap();
+        let back = yaml_serde::to_string(&p).unwrap();
         assert!(!back.contains("config_mode"), "got: {back}");
     }
 
@@ -6158,16 +6158,16 @@ orchestrator: { runner: claude }
 agent_runners:
   claude: { command: claude, flags: [] }
 "#;
-        let p: Project = serde_yaml::from_str(yaml).unwrap();
+        let p: Project = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(p.config_mode, Some(ConfigMode::InRepo));
         // Round-trip re-serializes back to the kebab-case form.
-        let back = serde_yaml::to_string(&p).unwrap();
+        let back = yaml_serde::to_string(&p).unwrap();
         assert!(back.contains("config_mode: in-repo"), "got: {back}");
 
         // `global` is the other explicit variant; the parser accepts it
         // even though it matches the default.
         let yaml_global = yaml.replace("in-repo", "global");
-        let p: Project = serde_yaml::from_str(&yaml_global).unwrap();
+        let p: Project = yaml_serde::from_str(&yaml_global).unwrap();
         assert_eq!(p.config_mode, Some(ConfigMode::Global));
     }
 
@@ -6180,7 +6180,7 @@ agent_runners:
         // shared, user-local, or the legacy `workers` alias (which is a
         // deserialization alias only — no serialize path emits it).
         let p = fully_populated_project();
-        let value = serde_yaml::to_value(&p).unwrap();
+        let value = yaml_serde::to_value(&p).unwrap();
         let map = value.as_mapping().expect("Project serializes as a map");
         for (k, _) in map {
             let key = k.as_str().expect("all Project keys are strings");
@@ -6201,7 +6201,7 @@ agent_runners:
     fn from_yaml_str_matches_direct_serde_deserialize() {
         // `Project::from_yaml_str` is the global-mode entry point and must
         // stay behavior-identical to the historical
-        // `serde_yaml::from_str::<Project>` path.
+        // `yaml_serde::from_str::<Project>` path.
         let yaml = r#"
 name: p
 repo: r
@@ -6212,11 +6212,11 @@ agent_runners:
   claude: { command: claude, flags: [] }
 "#;
         let via_helper = Project::from_yaml_str(yaml).unwrap();
-        let via_serde: Project = serde_yaml::from_str(yaml).unwrap();
+        let via_serde: Project = yaml_serde::from_str(yaml).unwrap();
         // No PartialEq on Project — compare via a stable re-serialization.
         assert_eq!(
-            serde_yaml::to_string(&via_helper).unwrap(),
-            serde_yaml::to_string(&via_serde).unwrap()
+            yaml_serde::to_string(&via_helper).unwrap(),
+            yaml_serde::to_string(&via_serde).unwrap()
         );
     }
 
@@ -6236,7 +6236,7 @@ agent_runners:
         let plain = Project::from_yaml_str(base).unwrap();
         assert_eq!(plain.review_diff_command(), None);
         assert!(
-            !serde_yaml::to_string(&plain).unwrap().contains("review:"),
+            !yaml_serde::to_string(&plain).unwrap().contains("review:"),
             "an unconfigured review block is elided from the wire form"
         );
 
@@ -6245,7 +6245,7 @@ agent_runners:
         let p = Project::from_yaml_str(&with_cmd).unwrap();
         assert_eq!(p.review_diff_command(), Some("skim {base} {head}"));
         assert!(
-            serde_yaml::to_string(&p).unwrap().contains("diff_command:"),
+            yaml_serde::to_string(&p).unwrap().contains("diff_command:"),
             "a configured diff_command round-trips onto the wire"
         );
     }
@@ -6271,7 +6271,7 @@ agent_runners:
     fn split_yaml_shared_half_contains_only_shared_keys() {
         let p = fully_populated_project();
         let shared_yaml = p.to_shared_yaml_string().unwrap();
-        let value: serde_yaml::Value = serde_yaml::from_str(&shared_yaml).unwrap();
+        let value: yaml_serde::Value = yaml_serde::from_str(&shared_yaml).unwrap();
         let map = value.as_mapping().unwrap();
         for (k, _) in map {
             let name = k.as_str().unwrap();
@@ -6293,7 +6293,7 @@ agent_runners:
             "config_mode",
         ] {
             assert!(
-                map.contains_key(serde_yaml::Value::String(expected.into())),
+                map.contains_key(yaml_serde::Value::String(expected.into())),
                 "shared YAML missing `{expected}`"
             );
         }
@@ -6303,7 +6303,7 @@ agent_runners:
     fn split_yaml_local_half_contains_only_user_local_keys() {
         let p = fully_populated_project();
         let local_yaml = p.to_local_yaml_string().unwrap();
-        let value: serde_yaml::Value = serde_yaml::from_str(&local_yaml).unwrap();
+        let value: yaml_serde::Value = yaml_serde::from_str(&local_yaml).unwrap();
         let map = value.as_mapping().unwrap();
         for (k, _) in map {
             let name = k.as_str().unwrap();
@@ -6314,7 +6314,7 @@ agent_runners:
         }
         for expected in ["repo", "machines", "workspaces"] {
             assert!(
-                map.contains_key(serde_yaml::Value::String(expected.into())),
+                map.contains_key(yaml_serde::Value::String(expected.into())),
                 "user-local YAML missing `{expected}`"
             );
         }
@@ -6325,7 +6325,7 @@ agent_runners:
         // Merging the two split halves must produce the same in-memory
         // Project as the equivalent single YAML would in global mode.
         let p = fully_populated_project();
-        let global_yaml = serde_yaml::to_string(&p).unwrap();
+        let global_yaml = yaml_serde::to_string(&p).unwrap();
         let shared_yaml = p.to_shared_yaml_string().unwrap();
         let local_yaml = p.to_local_yaml_string().unwrap();
 
@@ -6334,8 +6334,8 @@ agent_runners:
 
         // Compare via a stable re-serialization to sidestep PartialEq.
         assert_eq!(
-            serde_yaml::to_string(&from_global).unwrap(),
-            serde_yaml::to_string(&from_split).unwrap()
+            yaml_serde::to_string(&from_global).unwrap(),
+            yaml_serde::to_string(&from_split).unwrap()
         );
     }
 
@@ -6355,7 +6355,7 @@ agent_runners:
   claude: { command: claude, flags: [] }
 "#;
         let parsed = Project::from_yaml_str(global).unwrap();
-        assert!(!serde_yaml::to_string(&parsed)
+        assert!(!yaml_serde::to_string(&parsed)
             .unwrap()
             .contains("assistant_name"));
 
@@ -6522,7 +6522,7 @@ agent_runners:
         assert!(p.issue_tracker.is_default());
         p.issue_tracker.validate().unwrap();
 
-        let back = serde_yaml::to_string(&p).unwrap();
+        let back = yaml_serde::to_string(&p).unwrap();
         assert!(!back.contains("issue_tracker"), "got: {back}");
     }
 
@@ -6534,7 +6534,7 @@ agent_runners:
         let p = project_with_issue_tracker_yaml("");
         assert!(!p.session.raw_output_log);
         assert!(p.session.is_default());
-        let back = serde_yaml::to_string(&p).unwrap();
+        let back = yaml_serde::to_string(&p).unwrap();
         assert!(!back.contains("session"), "got: {back}");
     }
 
@@ -6548,7 +6548,7 @@ agent_runners:
         );
         assert!(!p.session.is_default());
         // Round-trips: re-serializing keeps the opt-in.
-        let back = serde_yaml::to_string(&p).unwrap();
+        let back = yaml_serde::to_string(&p).unwrap();
         let reparsed = Project::from_yaml_str(&back).unwrap();
         assert!(reparsed.session.raw_output_log);
     }
@@ -6682,8 +6682,8 @@ agent_runners:
                 ..Default::default()
             },
         };
-        let yaml = serde_yaml::to_string(&src).unwrap();
-        let back: IssueTrackerConfig = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = yaml_serde::to_string(&src).unwrap();
+        let back: IssueTrackerConfig = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(src, back);
     }
 
@@ -6707,7 +6707,7 @@ agent_runners:
         // is_default() when it is the file_system default, and a parsed config
         // that omits refresh_secs never materializes a non-None value that would
         // flip is_default().
-        let parsed: IssueTrackerConfig = serde_yaml::from_str("backend: file_system").unwrap();
+        let parsed: IssueTrackerConfig = yaml_serde::from_str("backend: file_system").unwrap();
         assert!(
             parsed.is_default(),
             "an explicit file_system backend with no refresh_secs is still the default"

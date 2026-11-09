@@ -1,0 +1,100 @@
+# Scalars that look like other types, as users write them.
+looks_like:
+  bool_words: [yes, no, on, off, y, n, true, false, True, FALSE]
+  quoted_bool_words: ['yes', "no", 'on', 'true']
+  nulls: [null, ~, Null, '', 'null', '~']
+  ints: [0, -1, 42, 0755, 0o755, 0x1F, 1_000, 9223372036854775807, 18446744073709551615, -9223372036854775808]
+  floats: [0.5, 1.0, -0.0, 1e10, 6.02e+23, .inf, -.inf, .nan, 1.]
+  strings_like_numbers: ['1', '1.0', '0x1F', '1e3', '010', '+1', '1_000']
+  dates: [2026-11-09, 2026-11-09T13:42:11Z, '2026-11-09']
+  versions: [1.2.3, v1.2, '0.9']
+punctuation:
+  colon_space: 'a: b'
+  colon_no_space: a:b
+  hash_comment_like: 'a #b'
+  hash_no_space: a#b
+  leading_dash: '- item'
+  leading_star: '*glob'
+  leading_amp: '&anchor'
+  leading_bang: '!tag'
+  leading_pipe: '|'
+  leading_gt: '>'
+  leading_percent: '%x'
+  leading_at: '@scope/pkg'
+  leading_backtick: '`code`'
+  braces: '{a}'
+  brackets: '[a]'
+  comma: a, b
+  question: '?'
+  single_quote: it's
+  double_quote: say "hi"
+  backslash: C:\path\to
+  template: '{{github_user}}/{{id}}'
+  url: https://example.com/a?b=c#d
+  shell: '[ -d target ] && rm -rf target; true'
+whitespace:
+  leading_space: '  indented'
+  trailing_space: 'trailing  '
+  tab: "a\tb"
+  empty: ''
+  only_space: ' '
+  newline_inside: "line one\nline two"
+  trailing_newline: "ends with newline\n"
+  leading_newline: "\nstarts with newline"
+  crlf: "a\r\nb"
+block_scalars:
+  literal: |
+    first line
+      indented line
+
+    after blank
+  literal_strip: |-
+    no trailing newline
+  literal_keep: |+
+    keeps trailing
+
+  folded: >
+    folded text
+    joins lines
+
+    keeps paragraph
+  folded_strip: >-
+    folded strip
+unicode:
+  accents: café résumé
+  cjk: 日本語のテキスト
+  emoji: ship it 🚀
+  em_dash: build — test — ship
+  nbsp: "a\u00a0b"
+  bom_like: "\ufeffx"
+  control: "bell\u0007"
+anchors:
+  base: &base
+    runner: claude
+    flags: [--fast]
+  derived:
+    <<: *base
+    flags: [--slow]
+  alias_list: [*base, *base]
+tags:
+  explicit_str: !!str 123
+  explicit_int: !!int "7"
+  custom: !Variant value
+  custom_map: !Thing {a: 1}
+keys:
+  1: int key
+  true: bool key
+  null: null key
+  1.5: float key
+  'quoted key': value
+  "key: with colon": value
+  [a, b]: seq key
+long_line: this is a deliberately long line of plain text that runs well past eighty columns so a serializer that folds long scalars would show it here
+empty_collections:
+  map: {}
+  seq: []
+  nested: [[], {}, [[]]]
+order_preserved:
+  zeta: 1
+  alpha: 2
+  mid: 3

@@ -74,7 +74,7 @@ pub fn project_roots() -> Result<Vec<ProjectRoot>> {
                 continue;
             }
         };
-        let project: Project = match serde_yaml::from_str(&text) {
+        let project: Project = match yaml_serde::from_str(&text) {
             Ok(p) => p,
             Err(e) => {
                 warn_skipped_project_yaml_once(&path, &e.to_string());
@@ -242,7 +242,7 @@ fn registered_local_work_dirs(name: &str) -> Result<Vec<PathBuf>> {
     // Global single-YAML layout.
     let global = projects.join(format!("{name}.yaml"));
     if let Ok(text) = fs::read_to_string(&global) {
-        if let Ok(project) = serde_yaml::from_str::<Project>(&text) {
+        if let Ok(project) = yaml_serde::from_str::<Project>(&text) {
             push_local(&project.machines);
         }
     }
@@ -250,7 +250,7 @@ fn registered_local_work_dirs(name: &str) -> Result<Vec<PathBuf>> {
     // In-repo split layout — per-user local half.
     let local = projects.join(name).join("local.yaml");
     if let Ok(text) = fs::read_to_string(&local) {
-        if let Ok(half) = serde_yaml::from_str::<LocalHalf>(&text) {
+        if let Ok(half) = yaml_serde::from_str::<LocalHalf>(&text) {
             push_local(&half.machines);
         }
     }
@@ -303,7 +303,7 @@ fn walk_up_for_in_repo(cwd: &Path) -> Result<Option<InRepoHit>> {
         let candidate = dir.join(".shelbi").join("project.yaml");
         if candidate.is_file() {
             let text = fs::read_to_string(&candidate)?;
-            match serde_yaml::from_str::<InRepoProjectHeader>(&text) {
+            match yaml_serde::from_str::<InRepoProjectHeader>(&text) {
                 Ok(header) => {
                     return Ok(Some(InRepoHit {
                         name: header.name,

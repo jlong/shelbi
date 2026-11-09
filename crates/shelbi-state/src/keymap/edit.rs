@@ -14,7 +14,7 @@
 //! odd indentation) falls back to re-serializing the tree, which is correct
 //! but drops comments. A file that doesn't parse is never rewritten.
 
-use serde_yaml::{Mapping, Value};
+use yaml_serde::{Mapping, Value};
 
 use super::actions::Action;
 use super::chord::KeyChord;
@@ -138,7 +138,7 @@ pub fn set_override(
     if expected.as_mapping().is_some_and(Mapping::is_empty) {
         return Ok(String::new());
     }
-    serde_yaml::to_string(&expected).map_err(|e| EditError::Serialize(e.to_string()))
+    yaml_serde::to_string(&expected).map_err(|e| EditError::Serialize(e.to_string()))
 }
 
 /// Read `$SHELBI_HOME/keys.yaml`; a missing file is empty.
@@ -224,7 +224,7 @@ pub fn yaml_scalar(s: &str) -> String {
 
 /// The file's YAML tree; an empty or comment-only file is an empty mapping.
 fn parse(text: &str) -> Result<Value, EditError> {
-    match serde_yaml::from_str::<Value>(text) {
+    match yaml_serde::from_str::<Value>(text) {
         Ok(Value::Null) => Ok(Value::Mapping(Mapping::new())),
         Ok(v) => Ok(v),
         Err(e) => Err(EditError::Parse(e.to_string())),
@@ -723,7 +723,7 @@ projects:
             text = set_chords(&text, Some("p"), action, &chords(&["f12"])).unwrap();
         }
         // f12 everywhere collides within each mode; check the file instead.
-        let root: Value = serde_yaml::from_str(&text).unwrap();
+        let root: Value = yaml_serde::from_str(&text).unwrap();
         for action in Action::all() {
             let v = lookup(&root, &["defaults", action.mode()])
                 .and_then(|m| m.get(Value::String(action.key_name().into())));

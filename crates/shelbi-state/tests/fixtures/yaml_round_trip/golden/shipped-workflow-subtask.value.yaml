@@ -1,0 +1,32 @@
+name: subtask
+description: A piece of a parent task, squash-merged into the parent's branch with no PR or review.
+statuses:
+- id: backlog
+  owner: user
+  agent: orchestrator
+- id: todo
+  owner: agent
+  agent: orchestrator
+- id: in-progress
+  owner: agent
+  agent: developer
+- id: done
+  owner: user
+- id: canceled
+  owner: user
+transitions:
+- from: in-progress
+  to: done
+  actions:
+  - push_branch
+  - merge
+- from: in-progress
+  to: canceled
+  actions:
+  - delete_branch
+required_params:
+- task
+git:
+  base_branch: task/{{task}}
+  branch: subtask/{{id}}
+  merge_strategy: squash

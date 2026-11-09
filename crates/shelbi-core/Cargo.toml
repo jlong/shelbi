@@ -10,7 +10,7 @@ description = "Domain types for shelbi"
 
 [dependencies]
 serde = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 # `setsid(2)` in the login-shell capture's `pre_exec` (detaches the capture

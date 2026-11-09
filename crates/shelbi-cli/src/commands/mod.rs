@@ -219,7 +219,7 @@ issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n"
     }
 
     fn ifile(id: &str, column: &str) -> shelbi_state::IssueFile {
-        let task: shelbi_core::Issue = serde_yaml::from_str(&format!(
+        let task: shelbi_core::Issue = yaml_serde::from_str(&format!(
             "id: {id}\ntitle: {id}\ncolumn: {column}\npriority: 0\n\
              created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n"
         ))

@@ -132,7 +132,7 @@ pub fn load_project_statuses(project: &str) -> Result<ProjectStatuses> {
 /// dir on demand.
 pub fn save_project_statuses(project: &str, statuses: &ProjectStatuses) -> Result<()> {
     let path = statuses_path(project)?;
-    atomic_write(&path, serde_yaml::to_string(statuses)?.as_bytes())
+    atomic_write(&path, yaml_serde::to_string(statuses)?.as_bytes())
 }
 
 /// Write the self-documenting default `statuses.yaml` for a fresh project —

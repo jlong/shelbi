@@ -174,7 +174,7 @@ mod tests {
              agent_runners:\n  claude: {{ command: claude, flags: [] }}\n",
             wd = work_dir.display()
         );
-        serde_yaml::from_str(&yaml).expect("minimal project YAML parses")
+        yaml_serde::from_str(&yaml).expect("minimal project YAML parses")
     }
 
     #[test]

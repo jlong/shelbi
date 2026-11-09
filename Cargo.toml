@@ -40,7 +40,9 @@ authors = ["John W. Long <john@johnwlong.com>"]
 anyhow = "1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+# The YAML organization's maintained fork of serde_yaml (unmaintained since 0.9.34).
+# `crates/shelbi-state/tests/yaml_round_trip.rs` pins what it reads and writes.
+yaml_serde = "0.10"
 serde_json = "1"
 serde_ignored = "0.1"
 clap = { version = "4", features = ["derive", "env"] }

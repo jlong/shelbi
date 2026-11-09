@@ -20,7 +20,7 @@ use super::mutate_client;
 use super::temp_dir::TempDir;
 
 /// Changed frontmatter keys: `Some` sets the key, `None` removes it.
-type Changes = BTreeMap<String, Option<serde_yaml::Value>>;
+type Changes = BTreeMap<String, Option<yaml_serde::Value>>;
 
 /// The fields an editor save can't change, and what to do instead. Each one
 /// either has a command that runs its side effects or isn't Shelbi's to set.
@@ -177,9 +177,9 @@ fn frontmatter_changes(from: &Issue, to: &Issue) -> Result<Changes> {
     Ok(changes)
 }
 
-fn frontmatter_keys(issue: &Issue) -> Result<BTreeMap<String, serde_yaml::Value>> {
-    let value = serde_yaml::to_value(issue).context("rendering the issue's frontmatter")?;
-    serde_yaml::from_value(value).context("rendering the issue's frontmatter")
+fn frontmatter_keys(issue: &Issue) -> Result<BTreeMap<String, yaml_serde::Value>> {
+    let value = yaml_serde::to_value(issue).context("rendering the issue's frontmatter")?;
+    yaml_serde::from_value(value).context("rendering the issue's frontmatter")
 }
 
 /// The edit that saves `ours` and the body, or `None` when neither changed.
@@ -268,7 +268,7 @@ mod tests {
                 launch: None,
                 created_at: now,
                 updated_at: now,
-                params: BTreeMap::from([("keep".to_string(), serde_yaml::Value::from(3))]),
+                params: BTreeMap::from([("keep".to_string(), yaml_serde::Value::from(3))]),
             },
             body: body.into(),
             tracker_assignees: Vec::new(),
@@ -300,7 +300,7 @@ mod tests {
         edited
             .task
             .params
-            .insert("task".into(), serde_yaml::Value::from("parent"));
+            .insert("task".into(), yaml_serde::Value::from("parent"));
         edited.body = "new body\n".into();
 
         let spec = plan(&base, &edited).unwrap().unwrap();

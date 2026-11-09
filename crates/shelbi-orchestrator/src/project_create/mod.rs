@@ -391,7 +391,7 @@ fn preflight_persistence(project: &str) -> Result<()> {
     if default_session.exists() {
         let text = std::fs::read_to_string(&default_session)
             .with_context(|| format!("reading {}", default_session.display()))?;
-        serde_yaml::from_str::<shelbi_core::Session>(&text).with_context(|| {
+        yaml_serde::from_str::<shelbi_core::Session>(&text).with_context(|| {
             format!(
                 "{} is not a valid Shelbi session; repair or remove it, then try again",
                 default_session.display()
@@ -539,7 +539,7 @@ fn registration_is_for(slug: &str, root: &Path, mode: ConfigMode) -> bool {
     let Ok(text) = std::fs::read_to_string(&file) else {
         return false;
     };
-    let Ok(doc) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+    let Ok(doc) = yaml_serde::from_str::<yaml_serde::Value>(&text) else {
         return false;
     };
     let same = |dir: &str| {
@@ -564,7 +564,7 @@ fn registration_is_for(slug: &str, root: &Path, mode: ConfigMode) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The small, stable starter surface `shelbi init` emits. Built with
-/// `serde_yaml` (never `format!`) so a `work_dir` containing ` #` or a name
+/// `yaml_serde` (never `format!`) so a `work_dir` containing ` #` or a name
 /// containing `: ` is quoted/escaped rather than silently corrupting the file.
 #[derive(serde::Serialize)]
 struct ProjectYaml<'a> {
@@ -679,7 +679,7 @@ pub fn render_project_yaml(starter: &Starter, config_mode: Option<&str>) -> Resu
         agent_runners,
         issue_tracker: starter.issue_tracker,
     };
-    let active = serde_yaml::to_string(&doc).context("serializing project YAML")?;
+    let active = yaml_serde::to_string(&doc).context("serializing project YAML")?;
     Ok(shelbi_core::scaffold::decorate_project_yaml(&active))
 }
 
@@ -1250,7 +1250,7 @@ mod tests {
         let tracker = IssueTrackerConfig::default();
         let defaults = AgentDefaults::default();
         let yaml = render_project_yaml(&starter("my-app", Path::new("/tmp/my-app"), &tracker, &defaults), None).unwrap();
-        let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
+        let project: shelbi_core::Project = yaml_serde::from_str(&yaml).unwrap();
         // A file_system board is the default → no `issue_tracker:` block.
         assert!(!yaml.contains("issue_tracker"));
         assert_eq!(project.label, None);
@@ -1279,7 +1279,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let project: shelbi_core::Project = serde_yaml::from_str(&yaml).unwrap();
+        let project: shelbi_core::Project = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(project.default_branch, "trunk");
         assert_eq!(project.github_url.as_deref(), Some("git@github.com:acme/app.git"));
         assert_eq!(project.orchestrator.runner, "codex");

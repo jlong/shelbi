@@ -1143,7 +1143,7 @@ mod tests {
     use shelbi_core::Issue;
 
     fn issue(id: &str, column: &str, priority: u32) -> IssueFile {
-        let task: Issue = serde_yaml::from_str(&format!(
+        let task: Issue = yaml_serde::from_str(&format!(
             "id: {id}\ntitle: {id}\ncolumn: {column}\npriority: {priority}\n\
              created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n"
         ))

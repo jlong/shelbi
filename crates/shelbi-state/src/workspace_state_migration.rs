@@ -131,7 +131,7 @@ fn declares_slot(project: &str, slot: &str) -> bool {
 /// unreadable, or names no task.
 fn status_task(dir: &Path) -> Option<String> {
     let text = fs::read_to_string(dir.join("status.yaml")).ok()?;
-    serde_yaml::from_str::<WorkspaceStatus>(&text)
+    yaml_serde::from_str::<WorkspaceStatus>(&text)
         .ok()?
         .current_task
 }
@@ -204,7 +204,7 @@ mod tests {
     }
 
     fn add_task(project: &str, id: &str) {
-        let issue: shelbi_core::Issue = serde_yaml::from_str(&format!(
+        let issue: shelbi_core::Issue = yaml_serde::from_str(&format!(
             "id: {id}\ntitle: {id}\ncolumn: in_progress\npriority: 1\n\
              created_at: 2026-11-05T00:00:00Z\nupdated_at: 2026-11-05T00:00:00Z\n"
         ))

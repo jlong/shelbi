@@ -1,0 +1,7 @@
+keymap:
+  zen_toggle: alt-z
+theme: dark
+desktop:
+  contrast: 50
+  window_opacity: 85
+  window_blur: 30

@@ -154,7 +154,7 @@ pub struct NewIssue {
     pub launch: Option<IssueLaunchConfig>,
     /// A pull-request record to carry over (a backend migration).
     pub pr: Option<IssuePr>,
-    pub params: BTreeMap<String, serde_yaml::Value>,
+    pub params: BTreeMap<String, yaml_serde::Value>,
     /// Explicit position within the destination column. `None` appends to the
     /// end (priority = current column length), matching `shelbi task add`.
     pub priority: Option<u32>,
@@ -220,7 +220,7 @@ pub struct IssueFields {
     pub launch: Option<Option<IssueLaunchConfig>>,
     /// Workflow params to change, by name: `Some` sets the param, `None` removes
     /// it. Params not named here are left alone.
-    pub params: BTreeMap<String, Option<serde_yaml::Value>>,
+    pub params: BTreeMap<String, Option<yaml_serde::Value>>,
 }
 
 impl IssueFields {
@@ -244,8 +244,8 @@ impl IssueFields {
 /// Apply a [`IssueFields::params`] change to a stored param map, returning
 /// whether anything actually changed.
 pub(crate) fn apply_param_edits(
-    params: &mut BTreeMap<String, serde_yaml::Value>,
-    edits: BTreeMap<String, Option<serde_yaml::Value>>,
+    params: &mut BTreeMap<String, yaml_serde::Value>,
+    edits: BTreeMap<String, Option<yaml_serde::Value>>,
 ) -> bool {
     let mut changed = false;
     for (key, value) in edits {
@@ -1062,7 +1062,7 @@ impl IssueStore for FileSystemStore {
             let text = crate::read_to_string_at(&path)?;
             let (front, body) = crate::split_frontmatter(&text)
                 .ok_or_else(|| Error::Other(format!("comment {} missing frontmatter", path.display())))?;
-            let meta: CommentMeta = serde_yaml::from_str(front)?;
+            let meta: CommentMeta = yaml_serde::from_str(front)?;
             out.push(IssueComment {
                 id: stem,
                 author: meta.author,
@@ -1376,17 +1376,17 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
         let store = FileSystemStore::new("p");
         let mut new = spec("a", Column::todo());
-        new.params.insert("keep".into(), serde_yaml::Value::from(3));
+        new.params.insert("keep".into(), yaml_serde::Value::from(3));
         store.add(new).unwrap();
 
         let param = |key: &str, value: Option<&str>| IssueFields {
-            params: BTreeMap::from([(key.to_string(), value.map(serde_yaml::Value::from))]),
+            params: BTreeMap::from([(key.to_string(), value.map(yaml_serde::Value::from))]),
             ..Default::default()
         };
         store.set_fields("a", param("task", Some("parent"))).unwrap();
         let after = store.get("a").unwrap().unwrap().task;
         assert_eq!(after.param_str("task"), Some("parent"));
-        assert_eq!(after.params.get("keep"), Some(&serde_yaml::Value::from(3)));
+        assert_eq!(after.params.get("keep"), Some(&yaml_serde::Value::from(3)));
 
         // Re-setting the same value and clearing an unset key change nothing.
         let stamp = after.updated_at;

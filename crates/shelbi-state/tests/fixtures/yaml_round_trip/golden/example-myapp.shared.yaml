@@ -1,0 +1,22 @@
+name: myapp
+default_branch: main
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+  codex:
+    command: codex
+    flags: []
+workspace_poll_interval_secs: 5
+github_reconcile_interval_secs: 900
+zen:
+  checks:
+    local: []
+  ci_timeout: 900
+  danger_paths:
+    extend: []
+heartbeat: 1m
+git:
+  merge_strategy: squash

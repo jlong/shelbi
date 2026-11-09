@@ -826,18 +826,18 @@ mod tests {
         struct Doc {
             editor: ToolChoice,
         }
-        let cli: Doc = serde_yaml::from_str("editor: code --wait\n").unwrap();
+        let cli: Doc = yaml_serde::from_str("editor: code --wait\n").unwrap();
         assert_eq!(cli.editor, ToolChoice::Command("code --wait".into()));
-        assert_eq!(serde_yaml::to_string(&cli).unwrap(), "editor: code --wait\n");
+        assert_eq!(yaml_serde::to_string(&cli).unwrap(), "editor: code --wait\n");
 
-        let app: Doc = serde_yaml::from_str("editor: { app: /Applications/Zed.app }\n").unwrap();
+        let app: Doc = yaml_serde::from_str("editor: { app: /Applications/Zed.app }\n").unwrap();
         assert_eq!(app.editor, ToolChoice::app("/Applications/Zed.app"));
-        let text = serde_yaml::to_string(&app).unwrap();
-        assert_eq!(serde_yaml::from_str::<Doc>(&text).unwrap(), app, "{text}");
+        let text = yaml_serde::to_string(&app).unwrap();
+        assert_eq!(yaml_serde::from_str::<Doc>(&text).unwrap(), app, "{text}");
 
-        let block: Doc = serde_yaml::from_str("editor:\n  app: /Applications/Zed.app\n  future: 1\n").unwrap();
+        let block: Doc = yaml_serde::from_str("editor:\n  app: /Applications/Zed.app\n  future: 1\n").unwrap();
         assert_eq!(block.editor, ToolChoice::app("/Applications/Zed.app"), "unknown keys are ignored");
-        assert!(serde_yaml::from_str::<Doc>("editor: [1]\n").is_err());
+        assert!(yaml_serde::from_str::<Doc>("editor: [1]\n").is_err());
     }
 
     #[test]

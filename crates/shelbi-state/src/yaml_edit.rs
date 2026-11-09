@@ -24,7 +24,7 @@
 //! tree, so keys the typed model doesn't know (or spells differently)
 //! survive.
 
-use serde_yaml::{Mapping, Value};
+use yaml_serde::{Mapping, Value};
 
 /// Why a file couldn't be patched.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -48,7 +48,7 @@ pub struct Patched {
 
 /// The file's YAML tree; an empty or comment-only file is an empty mapping.
 pub fn parse(text: &str) -> Result<Value, PatchError> {
-    match serde_yaml::from_str::<Value>(text) {
+    match yaml_serde::from_str::<Value>(text) {
         Ok(Value::Null) => Ok(Value::Mapping(Mapping::new())),
         Ok(v) => Ok(v),
         Err(e) => Err(PatchError::Parse(e.to_string())),
@@ -77,7 +77,7 @@ pub fn patch(text: &str, new: &Value) -> Result<Patched, PatchError> {
     let out = if new.as_mapping().is_some_and(Mapping::is_empty) {
         String::new()
     } else {
-        serde_yaml::to_string(new).map_err(|e| PatchError::Serialize(e.to_string()))?
+        yaml_serde::to_string(new).map_err(|e| PatchError::Serialize(e.to_string()))?
     };
     Ok(finish(text, out))
 }
@@ -482,7 +482,7 @@ fn emit_item(
 }
 
 fn emit(ind: usize, v: &Value, comment: Option<&str>) -> Option<Vec<String>> {
-    let text = serde_yaml::to_string(v).ok()?;
+    let text = yaml_serde::to_string(v).ok()?;
     let mut lines: Vec<String> = text
         .lines()
         .map(|l| {
@@ -575,7 +575,7 @@ fn flow_scalar(s: &str) -> Option<String> {
         && s.trim() == s
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || " -_./$+=@()".contains(c))
-        && serde_yaml::from_str::<Value>(s).is_ok_and(|v| v == Value::String(s.to_string()));
+        && yaml_serde::from_str::<Value>(s).is_ok_and(|v| v == Value::String(s.to_string()));
     Some(if plain {
         s.to_string()
     } else {

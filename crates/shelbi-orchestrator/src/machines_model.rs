@@ -170,7 +170,7 @@ mod tests {
     use super::*;
 
     fn spec(yaml: &str) -> shelbi_core::AgentRunnerSpec {
-        serde_yaml::from_str(yaml).unwrap()
+        yaml_serde::from_str(yaml).unwrap()
     }
 
     #[test]

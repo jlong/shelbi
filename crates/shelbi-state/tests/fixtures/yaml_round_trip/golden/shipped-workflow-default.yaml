@@ -1,0 +1,47 @@
+## Shelbi workflow — full reference: https://shelbi.dev/docs/configuration/workflow
+## Statuses are reference-only (id + owner + optional agent); each status's
+## display name & category live in workflows/statuses.yaml. Commented blocks
+## below are optional: uncomment to enable.
+
+name: default
+description: The standard one-track flow shipped with every project.
+statuses:
+- id: backlog
+  owner: user
+  agent: orchestrator
+- id: todo
+  owner: agent
+  agent: orchestrator
+- id: in-progress
+  owner: agent
+  agent: developer
+- id: review
+  owner: user
+  agent: orchestrator
+- id: done
+  owner: user
+- id: canceled
+  owner: user
+
+## Stable id a new task lands in. Defaults to the first status when unset.
+#initial_status: backlog
+
+## Hub-side side-effects fired when a task crosses an edge. Moves are
+## any-to-any; unlisted edges are pure status changes. Actions: push_branch,
+## open_pr, merge, close_pr, delete_branch, restack.
+#transitions:
+#  - { from: in-progress, to: review, actions: [push_branch, open_pr] }
+#  - { from: review, to: done, actions: [push_branch, merge] }
+
+## Per-workflow git override (inherits the project git: block when unset).
+#git:
+#  base_branch: main
+#  merge_strategy: squash
+
+## Per-workflow Zen override — each subfield independently optional. The
+## canonical use is a research workflow opting out of the project's checks.
+#zen:
+#  checks:
+#    local: []                # replace the project's checks for this workflow
+#  ci_timeout: 900
+

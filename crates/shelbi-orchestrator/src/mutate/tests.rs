@@ -970,7 +970,7 @@ fn apply_edit_changes_frontmatter_by_key() {
     t.branch = Some("feat/x".into());
     t.workflow = Some("old".into());
     t.prefers_machine = Some("m".into());
-    t.params.insert("keep".into(), serde_yaml::Value::from(3));
+    t.params.insert("keep".into(), yaml_serde::Value::from(3));
     shelbi_state::save_task("p", &t, "body\n").unwrap();
     shelbi_state::save_task("p", &task(Column::todo(), "dep"), "").unwrap();
 
@@ -1010,7 +1010,7 @@ fn apply_edit_changes_frontmatter_by_key() {
     .unwrap();
     let after = shelbi_state::load_task("p", "t").unwrap().task;
     assert_eq!(after.param_str("task"), Some("parent"));
-    assert_eq!(after.params.get("keep"), Some(&serde_yaml::Value::from(3)));
+    assert_eq!(after.params.get("keep"), Some(&yaml_serde::Value::from(3)));
     assert_eq!(after.branch, None);
     assert_eq!(after.workflow, None);
     assert_eq!(after.prefers_machine, None);

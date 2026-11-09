@@ -154,9 +154,9 @@ mod tests {
 
     #[test]
     fn preset_serde_uses_snake_case() {
-        let y = serde_yaml::to_string(&WorkspaceNamePreset::ToyStory).unwrap();
+        let y = yaml_serde::to_string(&WorkspaceNamePreset::ToyStory).unwrap();
         assert_eq!(y.trim(), "toy_story");
-        let back: WorkspaceNamePreset = serde_yaml::from_str(&y).unwrap();
+        let back: WorkspaceNamePreset = yaml_serde::from_str(&y).unwrap();
         assert_eq!(back, WorkspaceNamePreset::ToyStory);
     }
 }

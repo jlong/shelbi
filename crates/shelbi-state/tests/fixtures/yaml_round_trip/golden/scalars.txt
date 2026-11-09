@@ -1,0 +1,480 @@
+#### "plain"
+plain
+#
+k: plain
+#
+- plain
+#### "yes"
+yes
+#
+k: yes
+#
+- yes
+#### "no"
+no
+#
+k: no
+#
+- no
+#### "on"
+on
+#
+k: on
+#
+- on
+#### "off"
+off
+#
+k: off
+#
+- off
+#### "y"
+y
+#
+k: y
+#
+- y
+#### "n"
+n
+#
+k: n
+#
+- n
+#### "true"
+'true'
+#
+k: 'true'
+#
+- 'true'
+#### "False"
+'False'
+#
+k: 'False'
+#
+- 'False'
+#### "null"
+'null'
+#
+k: 'null'
+#
+- 'null'
+#### "Null"
+'Null'
+#
+k: 'Null'
+#
+- 'Null'
+#### "~"
+'~'
+#
+k: '~'
+#
+- '~'
+#### ""
+''
+#
+k: ''
+#
+- ''
+#### " "
+' '
+#
+k: ' '
+#
+- ' '
+#### "1"
+'1'
+#
+k: '1'
+#
+- '1'
+#### "-1"
+'-1'
+#
+k: '-1'
+#
+- '-1'
+#### "1.0"
+'1.0'
+#
+k: '1.0'
+#
+- '1.0'
+#### "1e3"
+'1e3'
+#
+k: '1e3'
+#
+- '1e3'
+#### "0x1F"
+'0x1F'
+#
+k: '0x1F'
+#
+- '0x1F'
+#### "0o17"
+'0o17'
+#
+k: '0o17'
+#
+- '0o17'
+#### "010"
+'010'
+#
+k: '010'
+#
+- '010'
+#### "+1"
+'+1'
+#
+k: '+1'
+#
+- '+1'
+#### "1_000"
+1_000
+#
+k: 1_000
+#
+- 1_000
+#### ".inf"
+'.inf'
+#
+k: '.inf'
+#
+- '.inf'
+#### ".nan"
+'.nan'
+#
+k: '.nan'
+#
+- '.nan'
+#### "2026-11-09"
+2026-11-09
+#
+k: 2026-11-09
+#
+- 2026-11-09
+#### "2026-11-09T13:42:11Z"
+2026-11-09T13:42:11Z
+#
+k: 2026-11-09T13:42:11Z
+#
+- 2026-11-09T13:42:11Z
+#### "1.2.3"
+1.2.3
+#
+k: 1.2.3
+#
+- 1.2.3
+#### "a: b"
+'a: b'
+#
+k: 'a: b'
+#
+- 'a: b'
+#### "a:b"
+a:b
+#
+k: a:b
+#
+- a:b
+#### "a #b"
+'a #b'
+#
+k: 'a #b'
+#
+- 'a #b'
+#### "a#b"
+a#b
+#
+k: a#b
+#
+- a#b
+#### "- x"
+'- x'
+#
+k: '- x'
+#
+- '- x'
+#### "-"
+'-'
+#
+k: '-'
+#
+- '-'
+#### "--"
+--
+#
+k: --
+#
+- --
+#### "---"
+'---'
+#
+k: '---'
+#
+- '---'
+#### "..."
+'...'
+#
+k: '...'
+#
+- '...'
+#### "*glob"
+'*glob'
+#
+k: '*glob'
+#
+- '*glob'
+#### "&anchor"
+'&anchor'
+#
+k: '&anchor'
+#
+- '&anchor'
+#### "!tag"
+'!tag'
+#
+k: '!tag'
+#
+- '!tag'
+#### "|"
+'|'
+#
+k: '|'
+#
+- '|'
+#### ">"
+'>'
+#
+k: '>'
+#
+- '>'
+#### "%x"
+'%x'
+#
+k: '%x'
+#
+- '%x'
+#### "@scope"
+'@scope'
+#
+k: '@scope'
+#
+- '@scope'
+#### "`tick`"
+'`tick`'
+#
+k: '`tick`'
+#
+- '`tick`'
+#### "{a}"
+'{a}'
+#
+k: '{a}'
+#
+- '{a}'
+#### "[a]"
+'[a]'
+#
+k: '[a]'
+#
+- '[a]'
+#### "a, b"
+a, b
+#
+k: a, b
+#
+- a, b
+#### ","
+','
+#
+k: ','
+#
+- ','
+#### "?"
+'?'
+#
+k: '?'
+#
+- '?'
+#### "? x"
+'? x'
+#
+k: '? x'
+#
+- '? x'
+#### "it's"
+it's
+#
+k: it's
+#
+- it's
+#### "say \"hi\""
+say "hi"
+#
+k: say "hi"
+#
+- say "hi"
+#### "C:\\path"
+C:\path
+#
+k: C:\path
+#
+- C:\path
+#### "{{github_user}}/{{id}}"
+'{{github_user}}/{{id}}'
+#
+k: '{{github_user}}/{{id}}'
+#
+- '{{github_user}}/{{id}}'
+#### "https://example.com/a?b=c#d"
+https://example.com/a?b=c#d
+#
+k: https://example.com/a?b=c#d
+#
+- https://example.com/a?b=c#d
+#### "[ -d t ] && rm -rf t; true"
+'[ -d t ] && rm -rf t; true'
+#
+k: '[ -d t ] && rm -rf t; true'
+#
+- '[ -d t ] && rm -rf t; true'
+#### "  lead"
+'  lead'
+#
+k: '  lead'
+#
+- '  lead'
+#### "trail  "
+'trail  '
+#
+k: 'trail  '
+#
+- 'trail  '
+#### "a\tb"
+"a\tb"
+#
+k: "a\tb"
+#
+- "a\tb"
+#### "one\ntwo"
+|-
+  one
+  two
+#
+k: |-
+  one
+  two
+#
+- |-
+  one
+  two
+#### "ends\n"
+|
+  ends
+#
+k: |
+  ends
+#
+- |
+  ends
+#### "\nstarts"
+|2-
+
+  starts
+#
+k: |2-
+
+  starts
+#
+- |2-
+
+  starts
+#### "a\r\nb"
+"a\r\nb"
+#
+k: "a\r\nb"
+#
+- "a\r\nb"
+#### "two\n\nparas\n"
+|
+  two
+
+  paras
+#
+k: |
+  two
+
+  paras
+#
+- |
+  two
+
+  paras
+#### "keep\n\n"
+|+
+  keep
+
+#
+k: |+
+  keep
+
+#
+- |+
+  keep
+
+#### "café"
+café
+#
+k: café
+#
+- café
+#### "日本語"
+日本語
+#
+k: 日本語
+#
+- 日本語
+#### "🚀 ship"
+🚀 ship
+#
+k: 🚀 ship
+#
+- 🚀 ship
+#### "em — dash"
+em — dash
+#
+k: em — dash
+#
+- em — dash
+#### "a\u{a0}b"
+a b
+#
+k: a b
+#
+- a b
+#### "\u{feff}x"
+"\uFEFFx"
+#
+k: "\uFEFFx"
+#
+- "\uFEFFx"
+#### "bell\u{7}"
+"bell\a"
+#
+k: "bell\a"
+#
+- "bell\a"
+#### "nul\0"
+"nul\0"
+#
+k: "nul\0"
+#
+- "nul\0"
+#### "this is a deliberately long line of plain text that runs well past eighty columns so a folding emitter would wrap it"
+this is a deliberately long line of plain text that runs well past eighty columns so a folding emitter would wrap it
+#
+k: this is a deliberately long line of plain text that runs well past eighty columns so a folding emitter would wrap it
+#
+- this is a deliberately long line of plain text that runs well past eighty columns so a folding emitter would wrap it
