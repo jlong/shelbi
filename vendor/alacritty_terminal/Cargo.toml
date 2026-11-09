@@ -33,6 +33,22 @@ resolver = "2"
 
 [features]
 default = ["serde"]
+# SHELBI FORK: upstream compiles the PTY host (`tty`), its reader thread
+# (`event_loop`) and `sync::FairMutex` unconditionally. Shelbi owns PTYs through
+# portable-pty and drives `Term` headless, so those modules and the crates only
+# they use sit behind this off-by-default feature. See VENDORING.md.
+tty = [
+    "dep:home",
+    "dep:libc",
+    "dep:parking_lot",
+    "dep:polling",
+    "dep:rustix",
+    "dep:rustix-openpty",
+    "dep:signal-hook",
+    "dep:miow",
+    "dep:piper",
+    "dep:windows-sys",
+]
 serde = [
     "dep:serde",
     "bitflags/serde",
@@ -56,18 +72,22 @@ version = "2.4.1"
 
 [dependencies.home]
 version = "0.5.5"
+optional = true
 
 [dependencies.libc]
 version = "0.2"
+optional = true
 
 [dependencies.log]
 version = "0.4"
 
 [dependencies.parking_lot]
 version = "0.12.0"
+optional = true
 
 [dependencies.polling]
 version = "3.8.0"
+optional = true
 
 [dependencies.regex-automata]
 version = "0.4.3"
@@ -98,18 +118,23 @@ version = "1.0.0"
 version = "1.0.0"
 features = ["std"]
 default-features = false
+optional = true
 
 [target."cfg(unix)".dependencies.rustix-openpty]
 version = "0.2.0"
+optional = true
 
 [target."cfg(unix)".dependencies.signal-hook]
 version = "0.4.3"
+optional = true
 
 [target."cfg(windows)".dependencies.miow]
 version = "0.6.0"
+optional = true
 
 [target."cfg(windows)".dependencies.piper]
 version = "0.2.1"
+optional = true
 
 [target."cfg(windows)".dependencies.windows-sys]
 version = "0.59.0"
@@ -121,3 +146,4 @@ features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ]
+optional = true

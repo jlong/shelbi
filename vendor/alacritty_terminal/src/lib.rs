@@ -5,13 +5,19 @@
 #![cfg_attr(clippy, deny(warnings))]
 
 pub mod event;
+// SHELBI FORK: gated behind the off-by-default `tty` feature. See VENDORING.md.
+#[cfg(feature = "tty")]
 pub mod event_loop;
 pub mod grid;
 pub mod index;
 pub mod selection;
+// SHELBI FORK: gated behind the off-by-default `tty` feature. See VENDORING.md.
+#[cfg(feature = "tty")]
 pub mod sync;
 pub mod term;
 pub mod thread;
+// SHELBI FORK: gated behind the off-by-default `tty` feature. See VENDORING.md.
+#[cfg(feature = "tty")]
 pub mod tty;
 pub mod vi_mode;
 
