@@ -192,24 +192,14 @@ fn resolve_live_home(compile_time: &str) -> Option<PathBuf> {
     if !compile_time.is_empty() {
         return Some(expand_tilde_str(compile_time));
     }
-    dirs::home_dir().map(|home| home.join(".shelbi"))
+    shelbi_core::home_dir().map(|home| home.join(".shelbi"))
 }
 
 /// `~/.shelbi` by the password database, which a test can't move. Several swap
 /// `$HOME` for a fixture's (so a spawned shell finds a stub `gh`), and the
 /// developer's live hub is still there while they do.
 fn account_home() -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    // SAFETY: `getpwuid` returns null or a record valid until the next call on
-    // this thread; the path is copied out before anything else runs.
-    unsafe {
-        let record = libc::getpwuid(libc::getuid());
-        if record.is_null() || (*record).pw_dir.is_null() {
-            return None;
-        }
-        let dir = std::ffi::CStr::from_ptr((*record).pw_dir);
-        Some(Path::new(std::ffi::OsStr::from_bytes(dir.to_bytes())).join(".shelbi"))
-    }
+    shelbi_core::account_home_dir().map(|home| home.join(".shelbi"))
 }
 
 fn is_live_home(path: &Path) -> bool {
@@ -263,7 +253,7 @@ pub(crate) fn resolve_with(
     if !compile_time.is_empty() {
         return Ok((expand_tilde_str(compile_time), RootSource::CompileTime));
     }
-    let home = dirs::home_dir().ok_or_else(|| Error::Other("no home directory".into()))?;
+    let home = shelbi_core::home_dir().ok_or_else(|| Error::Other("no home directory".into()))?;
     Ok((home.join(".shelbi"), RootSource::HomeFallback))
 }
 
@@ -279,12 +269,12 @@ pub fn root() -> Result<PathBuf> {
 /// parity with shell tilde expansion.
 pub fn expand_tilde_str(s: &str) -> PathBuf {
     if s == "~" {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = shelbi_core::home_dir() {
             return home;
         }
     }
     if let Some(rest) = s.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = shelbi_core::home_dir() {
             return home.join(rest);
         }
     }
@@ -374,7 +364,7 @@ mod tests {
         let _g = LOCK.lock().unwrap();
         clear_env();
         let (path, source) = resolve_with(Some(PathBuf::from("~/from-flag-tilde")), "").unwrap();
-        let expected = dirs::home_dir().unwrap().join("from-flag-tilde");
+        let expected = shelbi_core::home_dir().unwrap().join("from-flag-tilde");
         assert_eq!(path, expected);
         assert_eq!(source, RootSource::CliFlag);
         clear_env();
@@ -406,7 +396,7 @@ mod tests {
         let _g = LOCK.lock().unwrap();
         clear_env();
         let (path, source) = resolve_with(None, "~/baked-tilde").unwrap();
-        let expected = dirs::home_dir().unwrap().join("baked-tilde");
+        let expected = shelbi_core::home_dir().unwrap().join("baked-tilde");
         assert_eq!(path, expected);
         assert_eq!(source, RootSource::CompileTime);
         clear_env();
@@ -459,7 +449,7 @@ mod tests {
         // fallback branch is only reachable via `resolve_with`.
         let (path, source) = resolve_with(None, "").unwrap();
         assert_eq!(source, RootSource::HomeFallback);
-        let expected = dirs::home_dir().unwrap().join(".shelbi");
+        let expected = shelbi_core::home_dir().unwrap().join(".shelbi");
         assert_eq!(path, expected);
         clear_env();
     }
@@ -470,7 +460,7 @@ mod tests {
         clear_env();
         std::env::set_var("SHELBI_ROOT", "~/scratch-shelbi");
         let (path, _) = resolve().unwrap();
-        let expected = dirs::home_dir().unwrap().join("scratch-shelbi");
+        let expected = shelbi_core::home_dir().unwrap().join("scratch-shelbi");
         assert_eq!(path, expected);
         clear_env();
     }
@@ -481,7 +471,7 @@ mod tests {
         clear_env();
         std::env::set_var("SHELBI_HOME", "~/legacy-shelbi");
         let (path, _) = resolve().unwrap();
-        let expected = dirs::home_dir().unwrap().join("legacy-shelbi");
+        let expected = shelbi_core::home_dir().unwrap().join("legacy-shelbi");
         assert_eq!(path, expected);
         clear_env();
     }
@@ -616,7 +606,7 @@ mod tests {
     #[test]
     fn the_compile_time_default_is_the_live_home_when_baked_in() {
         assert_eq!(resolve_live_home("/opt/shelbi"), Some(PathBuf::from("/opt/shelbi")));
-        assert_eq!(resolve_live_home(""), dirs::home_dir().map(|h| h.join(".shelbi")));
+        assert_eq!(resolve_live_home(""), shelbi_core::home_dir().map(|h| h.join(".shelbi")));
     }
 
     #[test]

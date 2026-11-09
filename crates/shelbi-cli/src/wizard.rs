@@ -1629,7 +1629,7 @@ fn render_card_line(writer: &mut impl Write, width: usize, content: &str) -> Res
 }
 
 fn display_path(path: &Path) -> String {
-    let rendered = if let Some(home) = dirs::home_dir() {
+    let rendered = if let Some(home) = shelbi_core::home_dir() {
         if path == home {
             "~".to_string()
         } else if let Ok(relative) = path.strip_prefix(&home) {

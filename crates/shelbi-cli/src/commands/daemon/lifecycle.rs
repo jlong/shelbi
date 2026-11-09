@@ -47,7 +47,7 @@ const RESTART_START_DEADLINE: Duration = Duration::from_secs(10);
 /// Env var that forces [`retire_supervisor_units`] to skip, regardless of the
 /// resolved root. A belt-and-braces the test harnesses set so a daemon spawned
 /// with a temp `SHELBI_HOME` but the developer's real `$HOME` (where
-/// `dirs::home_dir()` still resolves the live plist) can never touch it — on top
+/// `shelbi_core::home_dir()` still resolves the live plist) can never touch it — on top
 /// of the default-root gate in [`should_retire_units`].
 const NO_RETIRE_ENV: &str = "SHELBI_NO_RETIRE_UNITS";
 
@@ -72,7 +72,7 @@ pub(super) fn retire_supervisor_units() -> Vec<PathBuf> {
         retire_units_with(
             &RealLaunchd {
                 uid: current_uid(),
-                home: dirs::home_dir(),
+                home: shelbi_core::home_dir(),
             },
             &[SERVICE_LABEL, LEGACY_SERVICE_LABEL],
         )
@@ -81,7 +81,7 @@ pub(super) fn retire_supervisor_units() -> Vec<PathBuf> {
     {
         retire_units_with(
             &RealSystemd {
-                home: dirs::home_dir(),
+                home: shelbi_core::home_dir(),
             },
             &[SYSTEMD_SERVICE_NAME, LEGACY_SYSTEMD_SERVICE_NAME],
         )

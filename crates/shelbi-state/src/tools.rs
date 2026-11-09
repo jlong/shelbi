@@ -570,7 +570,7 @@ pub fn login_path_dirs() -> Vec<PathBuf> {
 /// The folders apps are found in: `/Applications` and `~/Applications`.
 pub fn app_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![PathBuf::from("/Applications")];
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = shelbi_core::home_dir() {
         dirs.push(home.join("Applications"));
     }
     dirs

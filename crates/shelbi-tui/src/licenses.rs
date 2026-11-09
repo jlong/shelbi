@@ -9,8 +9,8 @@
 //! in the user's own font. The long tail is every other crate the binary
 //! links, walked from the `shelbi` package by the build script (`build.rs`,
 //! running `crates/shelbi-app/build_support/licenses.rs`); the crates with
-//! a notice obligation beyond MIT / Apache's (nucleo-matcher's and
-//! option-ext's MPL 2.0) are entries of their own. Every text is embedded
+//! a notice obligation beyond MIT / Apache's (nucleo-matcher's MPL 2.0)
+//! are entries of their own. Every text is embedded
 //! at build time; nothing is fetched at runtime.
 
 use std::sync::LazyLock;
@@ -102,7 +102,6 @@ mod tests {
                 "Alacritty Terminal",
                 "Crossterm",
                 "nucleo-matcher",
-                "option-ext",
                 "portable-pty",
                 "Ratatui",
                 "termwiz",
@@ -121,7 +120,6 @@ mod tests {
         assert!(text("Ratatui").contains("Permission is hereby granted"));
         assert!(text("Crossterm").contains("Timon"));
         assert!(text("nucleo-matcher").starts_with("Mozilla Public License Version 2.0"));
-        assert!(text("option-ext").starts_with("Mozilla Public License Version 2.0"));
         assert!(text("portable-pty").contains("Wez Furlong"));
         assert!(text("termwiz").contains("Wez Furlong"));
         let attribution = |name: &str| entries().iter().find(|e| e.name == name).unwrap().attribution.clone();
@@ -178,7 +176,7 @@ mod tests {
         assert_eq!(b.selected_entry().map(|e| e.name), Some("Alacritty Terminal"));
         b.set_query("mpl");
         let names: Vec<&str> = b.visible().into_iter().map(|i| entries()[i].name).collect();
-        assert_eq!(names, ["nucleo-matcher", "option-ext"]);
+        assert_eq!(names, ["nucleo-matcher"]);
         b.set_query("inquire");
         assert_eq!(b.selected_entry().map(|e| e.name), Some("Rust crates"));
     }

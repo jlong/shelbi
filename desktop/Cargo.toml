@@ -100,7 +100,7 @@ unicode-width = "0.2"
 sha2 = "0.10"
 
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "fmt", "ansi", "env-filter"] }
 
 # Image and file-promise drops onto a terminal (`src/drops/`): AppKit's
 # pasteboard, file promises and image reps, gpui's window via its raw handle.

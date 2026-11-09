@@ -241,9 +241,9 @@ pub fn project_name_collides(name: &str) -> Result<bool> {
 pub fn absolutize(cwd: &Path, path: &Path) -> PathBuf {
     let raw = path.to_string_lossy();
     let expanded: PathBuf = if raw == "~" {
-        dirs::home_dir().unwrap_or_else(|| path.to_path_buf())
+        shelbi_core::home_dir().unwrap_or_else(|| path.to_path_buf())
     } else if let Some(rest) = raw.strip_prefix("~/") {
-        match dirs::home_dir() {
+        match shelbi_core::home_dir() {
             Some(h) => h.join(rest),
             None => path.to_path_buf(),
         }

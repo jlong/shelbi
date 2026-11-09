@@ -154,31 +154,31 @@ fn the_search_filters_as_you_type_and_esc_backs_out_a_step_at_a_time() {
     draw(&mut v, 100, 30);
     assert_eq!(v.handle_key(key(KeyCode::Char('/'))), Step::Stay);
     assert_eq!(v.focus(), Focus::Search);
-    for c in "mpl".chars() {
+    for c in "mit".chars() {
         v.handle_key(key(KeyCode::Char(c)));
     }
-    assert_eq!(names_shown(&v), ["nucleo-matcher", "option-ext"]);
-    assert_eq!(v.browser().selected(), Some(ix("nucleo-matcher")), "the first match is selected");
+    assert_eq!(names_shown(&v), ["Crossterm", "portable-pty", "Ratatui", "termwiz", "Rust crates"]);
+    assert_eq!(v.browser().selected(), Some(ix("Crossterm")), "the first match is selected");
     let (buf, cursor) = draw(&mut v, 100, 30);
     let screen = text(&buf);
-    assert!(screen.contains("🔍 mpl"), "{screen}");
-    assert!(!screen.contains("Crossterm"), "hidden by the search");
-    assert!(screen.contains("Mozilla Public License 2.0"));
-    let (qx, qy) = find(&buf, "mpl").unwrap();
+    assert!(screen.contains("🔍 mit"), "{screen}");
+    assert!(!screen.contains("Alacritty Terminal"), "hidden by the search");
+    assert!(screen.contains("MIT License"));
+    let (qx, qy) = find(&buf, "mit").unwrap();
     assert_eq!(cursor, Some((qx + 3, qy)), "the caret after the query");
     assert_eq!(buf[(qx, qy)].bg, palette().input_focus, "the focused fill");
     assert!(screen.contains('×'), "a query shows the clear button");
     // Typing j / k types them, it doesn't move the list.
     v.handle_key(key(KeyCode::Backspace));
-    assert_eq!(v.browser().query(), "mp");
+    assert_eq!(v.browser().query(), "mi");
     // ↓ from the search moves the list and leaves the keys there.
     v.handle_key(key(KeyCode::Down));
-    assert_eq!(v.browser().selected(), Some(ix("option-ext")));
+    assert_eq!(v.browser().selected(), Some(ix("portable-pty")));
     assert_eq!(v.focus(), Focus::Search);
     // Esc clears; again hands the keys to the list; again leaves.
     assert_eq!(v.handle_key(key(KeyCode::Esc)), Step::Stay);
     assert_eq!(v.browser().query(), "");
-    assert_eq!(v.browser().selected(), Some(ix("option-ext")), "the selection stays");
+    assert_eq!(v.browser().selected(), Some(ix("portable-pty")), "the selection stays");
     assert_eq!(v.handle_key(key(KeyCode::Esc)), Step::Stay);
     assert_eq!(v.focus(), Focus::List);
     assert_eq!(v.handle_key(key(KeyCode::Esc)), Step::Leave);
@@ -219,8 +219,10 @@ fn nothing_matching_empties_the_detail_and_tab_skips_view_source() {
 
 #[test]
 fn the_arrows_move_the_selection_and_the_list_follows_it() {
+    // Short enough that the list (three rows an entry) scrolls.
+    const H: u16 = 26;
     let mut v = view();
-    draw(&mut v, 100, 30);
+    draw(&mut v, 100, H);
     v.handle_key(key(KeyCode::Down));
     v.handle_key(key(KeyCode::Char('j')));
     assert_eq!(v.browser().selected(), Some(2));
@@ -229,14 +231,14 @@ fn the_arrows_move_the_selection_and_the_list_follows_it() {
     v.handle_key(key(KeyCode::End));
     let last = crate::licenses::entries().len() - 1;
     assert_eq!(v.browser().selected(), Some(last));
-    let (buf, _) = draw(&mut v, 100, 30);
+    let (buf, _) = draw(&mut v, 100, H);
     let (x, y) = find_row(&buf, "Rust crates").expect("the list scrolled to the last row");
     assert_eq!(buf[(x, y)].bg, palette().selection);
     assert!(!text(&buf).contains("Alacritty Terminal"), "scrolled off the top");
     assert!(text(&buf).contains("Licenses and notices"));
     v.handle_key(key(KeyCode::Home));
     assert_eq!(v.browser().selected(), Some(0));
-    let (buf, _) = draw(&mut v, 100, 30);
+    let (buf, _) = draw(&mut v, 100, H);
     assert!(text(&buf).contains("Alacritty Terminal"), "and back");
 }
 
@@ -325,14 +327,16 @@ fn view_source_and_done_answer_the_keyboard() {
 
 #[test]
 fn the_license_scrolls_with_the_keys_and_the_wheel_and_stops_at_its_end() {
-    let area = Rect::new(0, 0, 100, 30);
+    // Short enough that the list (three rows an entry) scrolls.
+    const H: u16 = 26;
+    let area = Rect::new(0, 0, 100, H);
     let mut v = view();
-    let (buf, _) = draw(&mut v, 100, 30);
+    let (buf, _) = draw(&mut v, 100, H);
     let (_, title_y) = find(&buf, "Apache License 2.0").unwrap();
     v.handle_key(key(KeyCode::PageDown));
     let page = v.scroll();
     assert!(page > 5, "a page: {page}");
-    let (buf, _) = draw(&mut v, 100, 30);
+    let (buf, _) = draw(&mut v, 100, H);
     assert!(!text(&buf).contains("Apache License 2.0"), "the license's name scrolled off");
     assert!(text(&buf).contains("Alacritty Terminal"), "the header stays");
     v.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
@@ -346,7 +350,7 @@ fn the_license_scrolls_with_the_keys_and_the_wheel_and_stops_at_its_end() {
     assert_eq!(v.scroll(), 3);
     v.handle_mouse(mouse(MouseEventKind::ScrollDown, 5, 20), area);
     assert_eq!(v.scroll(), 3, "the list's wheel leaves the license");
-    let (buf, _) = draw(&mut v, 100, 30);
+    let (buf, _) = draw(&mut v, 100, H);
     assert!(find_row(&buf, "Alacritty Terminal").is_none(), "the list scrolled a row");
     assert!(text(&buf).contains("Rust crates"));
     // To the end, and no further: the last line at the bottom.
@@ -356,7 +360,7 @@ fn the_license_scrolls_with_the_keys_and_the_wheel_and_stops_at_its_end() {
     let end = v.scroll();
     v.handle_key(key(KeyCode::PageDown));
     assert_eq!(v.scroll(), end);
-    let (buf, _) = draw(&mut v, 100, 30);
+    let (buf, _) = draw(&mut v, 100, H);
     let screen = text(&buf);
     let last = screen.lines().last().unwrap();
     assert!(last.contains("limitations under the License."), "{screen}");

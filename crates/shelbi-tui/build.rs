@@ -15,7 +15,6 @@ const LICENSES: licenses::Config = licenses::Config {
     long_tail_skip: &[
         "alacritty_terminal",
         "nucleo-matcher",
-        "option-ext",
         "portable-pty",
         "termwiz",
         "ratatui",
@@ -24,7 +23,6 @@ const LICENSES: licenses::Config = licenses::Config {
     featured_files: &[
         ("alacritty_terminal", "LICENSE-APACHE"),
         ("nucleo-matcher", "LICENSE"),
-        ("option-ext", "LICENSE.txt"),
         ("portable-pty", "LICENSE.md"),
         ("termwiz", "LICENSE.md"),
         ("ratatui", "LICENSE"),
