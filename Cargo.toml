@@ -45,7 +45,6 @@ serde_json = "1"
 serde_ignored = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 chrono = { version = "0.4", features = ["serde"] }
-chrono-tz = "0.10"
 tracing = "0.1"
 # No `tracing-log` bridge (nothing logs through `log` that we read) and no
 # `smallvec`: only the formatter, its colors and `EnvFilter` (`SHELBI_LOG`).

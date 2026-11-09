@@ -62,6 +62,7 @@ pub mod workspace;
 pub mod workspace_session;
 pub mod zen;
 mod zen_flow;
+mod zoneinfo;
 
 #[cfg(test)]
 mod golden;
