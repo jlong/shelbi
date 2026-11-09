@@ -400,6 +400,51 @@ const NOTICE_SECS: u64 = 6;
 /// The status line shown while the off-thread startup (daemon + dashboard
 /// bootstrap) runs, cleared when it succeeds (`rt-tui-headless-startup-block`).
 const STARTUP_STATUS: &str = "starting orchestrator…";
+const PHASE_DAEMON: &str = "starting daemon";
+const PHASE_ORCHESTRATOR: &str = "starting orchestrator";
+
+/// The startup job's current phase, shared with its thread, and the spinner
+/// frame last drawn for it.
+#[derive(Clone)]
+struct StartupPhase {
+    name: Arc<std::sync::Mutex<&'static str>>,
+    since: Instant,
+    drawn_frame: u64,
+}
+
+impl StartupPhase {
+    const FRAME: Duration = Duration::from_millis(100);
+    const GLYPHS: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+    fn new(name: &'static str) -> Self {
+        Self {
+            name: Arc::new(std::sync::Mutex::new(name)),
+            since: Instant::now(),
+            drawn_frame: 0,
+        }
+    }
+
+    fn set(&self, name: &'static str) {
+        *self.name.lock().unwrap_or_else(|e| e.into_inner()) = name;
+    }
+
+    fn frame(&self) -> u64 {
+        (self.since.elapsed().as_millis() / Self::FRAME.as_millis()) as u64
+    }
+
+    fn text(&self) -> String {
+        let name = *self.name.lock().unwrap_or_else(|e| e.into_inner());
+        let glyph = Self::GLYPHS[(self.frame() % Self::GLYPHS.len() as u64) as usize];
+        format!("{glyph} {name}…")
+    }
+
+    fn tick(&mut self) -> bool {
+        let frame = self.frame();
+        let advanced = frame != self.drawn_frame;
+        self.drawn_frame = frame;
+        advanced
+    }
+}
 
 /// Run the single-process shell for `project` until the user quits.
 pub fn run(project: &str) -> Result<()> {
@@ -492,6 +537,7 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     // of a multi-second blank (`rt-tui-headless-startup-block`).
     draw(&mut term, &mut state)?;
     let mut last_draw = Instant::now();
+    crate::startup::log_phase("first frame", crate::startup::since_launch());
 
     // Read every project's config-only sidebar skeleton in the background, so a
     // later cold Switch Project paints the target's workspace rows on its very
@@ -697,6 +743,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             state.dirty = true;
         }
         if state.poll_startup() {
+            state.dirty = true;
+        }
+        if state.tick_startup_spinner() {
             state.dirty = true;
         }
         if state.poll_onboarding() {
@@ -1270,6 +1319,10 @@ struct ShellState {
     /// project's receiver), so a late result for a project the user already left
     /// never lands in the new project's view or status.
     startup_rx: Option<(String, Receiver<Result<Started, String>>)>,
+    /// The phase the in-flight startup job is in (`starting daemon`, then
+    /// `starting orchestrator`), shown with a spinner in the status band while
+    /// the status is [`STARTUP_STATUS`] (`cli-startup-speed`).
+    startup_phase: Option<StartupPhase>,
     /// The Orchestrator view's onboarding for the current project, while its
     /// orchestrator isn't set up (`orch-onboarding`): shown in place of the
     /// orchestrator's terminal. Dropped when its Launch Orchestrator lands
@@ -1702,6 +1755,7 @@ impl ShellState {
             lifecycle,
             bootstrap,
             startup_rx: None,
+            startup_phase: None,
             onboarding: None,
             review: None,
             review_rx: None,
@@ -1835,11 +1889,24 @@ impl ShellState {
     }
 
     /// The status band's text: a showing retry notice, else the status line.
+    /// While the startup job runs, its note names the current phase behind a
+    /// spinner, so a slow daemon or orchestrator never looks like a hang.
     fn status_text(&self) -> Option<String> {
-        self.retry_notice
-            .as_ref()
-            .map(|(line, _)| line.clone())
-            .or_else(|| self.status.clone())
+        if let Some((line, _)) = &self.retry_notice {
+            return Some(line.clone());
+        }
+        match (&self.status, &self.startup_phase) {
+            (Some(s), Some(phase)) if s == STARTUP_STATUS => Some(phase.text()),
+            _ => self.status.clone(),
+        }
+    }
+
+    /// Whether the startup spinner advanced a frame since the last draw.
+    fn tick_startup_spinner(&mut self) -> bool {
+        match &mut self.startup_phase {
+            Some(phase) if self.status.as_deref() == Some(STARTUP_STATUS) => phase.tick(),
+            _ => false,
+        }
     }
 
     /// Whether `k` is the redraw key: the `FocusMain` chord (Ctrl+L by
@@ -3943,20 +4010,31 @@ impl ShellState {
         let (tx, rx) = std::sync::mpsc::channel();
         let bootstrap = self.bootstrap.clone();
         let job_project = project.clone();
+        let phase = StartupPhase::new(PHASE_DAEMON);
+        let job_phase = phase.clone();
         if std::thread::Builder::new()
             .name("shelbi-shell-startup".into())
             .spawn(move || {
+                // The daemon first, on its own, so the status band (and
+                // `tui.log`) can tell a slow daemon from a slow orchestrator.
+                let t = Instant::now();
+                bootstrap.start_daemon();
+                crate::startup::log_phase("daemon", t.elapsed());
                 let started = if bootstrap.needs_onboarding(&job_project) {
-                    bootstrap.start_daemon();
                     Ok(Started::Onboarding)
                 } else {
-                    bootstrap.bootstrap(&job_project).map(|()| Started::Orchestrator)
+                    job_phase.set(PHASE_ORCHESTRATOR);
+                    let t = Instant::now();
+                    let r = bootstrap.bootstrap(&job_project).map(|()| Started::Orchestrator);
+                    crate::startup::log_phase("orchestrator", t.elapsed());
+                    r
                 };
                 let _ = tx.send(started);
             })
             .is_ok()
         {
             self.startup_rx = Some((project, rx));
+            self.startup_phase = Some(phase);
         }
     }
 
@@ -3971,6 +4049,7 @@ impl ShellState {
             // already replaces the job; this guards any other path.)
             Some((project, _)) if self.client.project() != Some(project.as_str()) => {
                 self.startup_rx = None;
+                self.startup_phase = None;
                 return false;
             }
             Some((_, rx)) => match rx.try_recv() {
@@ -3983,6 +4062,8 @@ impl ShellState {
             None => return false,
         };
         self.startup_rx = None;
+        self.startup_phase = None;
+        crate::startup::log_phase("ready", crate::startup::since_launch());
         match result {
             Ok(Started::Onboarding) => {
                 // Nothing launched: the Orchestrator view shows the onboarding

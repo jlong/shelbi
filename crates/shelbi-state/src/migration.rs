@@ -99,6 +99,29 @@ pub fn all_workspace_migration_states(project: &str) -> Result<BTreeMap<String, 
     Ok(read_state(project)?.workspace_migration)
 }
 
+/// The remote machines whose last migration probe didn't answer, which the
+/// open probes in the background instead of waiting on (`cli-startup-speed`).
+pub fn migration_unreachable_machines(project: &str) -> Result<std::collections::BTreeSet<String>> {
+    Ok(read_state(project)?.migration_unreachable_machines)
+}
+
+/// Record whether `machine` answered its latest migration probe. Routed through
+/// [`update_state`], and a no-op write when nothing changes.
+pub fn set_migration_machine_unreachable(project: &str, machine: &str, unreachable: bool) -> Result<()> {
+    let known = migration_unreachable_machines(project)?.contains(machine);
+    if known == unreachable {
+        return Ok(());
+    }
+    update_state(project, |s| {
+        if unreachable {
+            s.migration_unreachable_machines.insert(machine.to_string());
+        } else {
+            s.migration_unreachable_machines.remove(machine);
+        }
+        Ok(())
+    })
+}
+
 /// Whether the new session backend is allowed to start an agent in `workspace`.
 ///
 /// True only when the workspace is explicitly [`MigrationState::Migrated`]. An

@@ -277,6 +277,18 @@ fn serve_foreground(lock_wait: Duration) -> Result<()> {
         Err(e) => eprintln!("shelbi daemon: could not raise open-file limit: {e}"),
     }
 
+    // Capture the login-shell environment (`$SHELL -ilc env`, often the
+    // slowest step before the socket binds) on its own thread while the
+    // housekeeping below runs. It only warms the process-wide cache; the env
+    // is still applied at the same point as before (`cli-startup-speed`).
+    let started = std::time::Instant::now();
+    let login_env = std::thread::Builder::new()
+        .name("shelbi-login-env".into())
+        .spawn(|| {
+            let _ = shelbi_core::login_shell_env();
+        })
+        .ok();
+
     let sock = shelbi_state::hub_socket_path().map_err(|e| anyhow!(e))?;
     ensure_socket_dir(&sock)?;
     // Exclusive advisory lock held for the daemon's whole lifetime. Two
@@ -285,13 +297,15 @@ fn serve_foreground(lock_wait: Duration) -> Result<()> {
     // errors out here without touching the winner's live socket.
     let _bind_lock = acquire_bind_lock(&sock, lock_wait)?;
     prepare_socket(&sock)?;
-    prune_stale_control_masters();
-    reconcile_forward_modes();
+    timed("control masters", prune_stale_control_masters);
+    timed("forward modes", reconcile_forward_modes);
     // Version-agnostic config validate-and-upgrade pass, run once before the
     // daemon starts serving — the natural "reconcile before serving" window,
     // alongside the housekeeping sweeps above. Best-effort: it emits findings
     // to events.log / the orchestrator handoff file and never blocks serving.
-    let _ = crate::commands::config_upgrade::run_startup_pass();
+    timed("config upgrade", || {
+        let _ = crate::commands::config_upgrade::run_startup_pass();
+    });
 
     // Run with the user's interactive login-shell environment, not the minimal
     // one a detached on-demand spawn inherits. `.zshrc` is where nvm/fnm/Homebrew
@@ -299,12 +313,21 @@ fn serve_foreground(lock_wait: Duration) -> Result<()> {
     // find their tools — replacing the baked minimal PATH that used to need
     // healing to locate `gh`. Overlaid (not replaced) so anything the launcher
     // set intentionally (e.g. SHELBI_ROOT in a test) survives.
-    apply_login_shell_env();
+    timed("login env", || {
+        if let Some(h) = login_env {
+            let _ = h.join();
+        }
+        apply_login_shell_env();
+    });
 
     // Retire any leftover launchd/systemd supervisor unit so its KeepAlive /
     // Restart=always loop can't fight the on-demand daemon. Idempotent; disclose
     // whatever it removed on events.log.
-    retire_leftover_supervisor_units();
+    timed("supervisor units", retire_leftover_supervisor_units);
+    eprintln!(
+        "shelbi daemon: startup before bind took {}ms",
+        started.elapsed().as_millis()
+    );
 
     // Tighten the umask around bind() so the socket inode is created
     // 0600 from the very start. Without this there is a window between
@@ -434,6 +457,14 @@ fn apply_login_shell_env() {
             }
         }
     }
+}
+
+/// Run one pre-bind startup step, noting how long it took in the daemon log
+/// (`cli-startup-speed`): every client waits on these before the socket binds.
+fn timed(step: &str, f: impl FnOnce()) {
+    let t = std::time::Instant::now();
+    f();
+    eprintln!("shelbi daemon: startup {step} {}ms", t.elapsed().as_millis());
 }
 
 /// Stop and remove any leftover launchd/systemd supervisor unit (the retired
