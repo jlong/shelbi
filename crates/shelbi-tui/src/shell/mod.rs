@@ -793,10 +793,13 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
     // Restore the terminal once if either path needs the normal screen. (The RAII
     // guard restores on drop anyway, but `exec` replaces the process so Drop never
     // runs, and a detach message must print after the restore.)
-    if reexec_view.is_some() || detach_reason.is_some() {
+    if reexec_view.is_some() || detach_reason.is_some() || state.pending_quit.is_some() {
         drop(term);
         drop(_guard);
     }
+    // A Quit Project / Quit Shelbi runs now, on the normal screen, where its
+    // progress can show.
+    state.run_pending_quit();
 
     if let Some(view) = reexec_view {
         reexec_into_current_binary(&view);
@@ -1028,20 +1031,29 @@ trait ShellLifecycle: Send + Sync {
 }
 
 /// The production [`ShellLifecycle`]: connect to the daemon's control socket and
-/// send the lifecycle command. Best-effort — a daemon that is already gone means
-/// the sessions are already down, which is the desired end state anyway.
+/// send the lifecycle command, showing its progress on the restored terminal.
+/// Best-effort — a daemon that is already gone means the sessions are already
+/// down, which is the desired end state anyway.
 struct DaemonLifecycle;
+
+impl DaemonLifecycle {
+    fn quit(target: crate::quit_progress::QuitTarget) {
+        let Some(mut client) = connect_control() else {
+            println!("shelbi: the hub daemon isn't running; nothing to quit.");
+            return;
+        };
+        if let Err(e) = crate::quit_progress::quit_with_progress(&mut client, target) {
+            eprintln!("shelbi: quit failed: {e}");
+        }
+    }
+}
 
 impl ShellLifecycle for DaemonLifecycle {
     fn quit_project(&self, project: &str) {
-        if let Some(mut client) = connect_control() {
-            let _ = client.quit_project(project);
-        }
+        Self::quit(crate::quit_progress::QuitTarget::Project(project));
     }
     fn quit_shelbi(&self) {
-        if let Some(mut client) = connect_control() {
-            let _ = client.quit_shelbi();
-        }
+        Self::quit(crate::quit_progress::QuitTarget::Shelbi);
     }
 }
 
@@ -1612,6 +1624,9 @@ struct ShellState {
     remote: Option<Arc<dyn shelbi_app::launch::RemoteConnector>>,
     launch_daemon: Arc<dyn shelbi_app::launch::DaemonStarter>,
     should_quit: bool,
+    /// A Quit Project / Quit Shelbi to run once the loop has ended and the
+    /// terminal is restored ([`ShellState::run_pending_quit`]).
+    pending_quit: Option<QuitAction>,
     dirty: bool,
 }
 
@@ -1866,6 +1881,7 @@ impl ShellState {
             remote: crate::launch::remote_connector(),
             launch_daemon: Arc::new(shelbi_app::launch::SharedDaemon),
             should_quit: false,
+            pending_quit: None,
             dirty: true,
         }
     }
@@ -2500,26 +2516,35 @@ impl ShellState {
         }
     }
 
-    /// Leave the TUI via `action`. `CloseUi` touches no sessions (they outlive
-    /// the client); `QuitProject`/`QuitShelbi` go through the daemon's control
-    /// socket. All three stop the event loop.
+    /// Leave the TUI via `action`. All three stop the event loop. `CloseUi`
+    /// touches no sessions (they outlive the client). `QuitProject`/`QuitShelbi`
+    /// go through the daemon's control socket once the loop has ended and the
+    /// terminal is restored ([`run_pending_quit`](Self::run_pending_quit)), so
+    /// the quit's progress shows on the normal screen instead of the UI sitting
+    /// frozen while the daemon works.
     fn quit(&mut self, action: QuitAction) {
         match action {
-            QuitAction::CloseUi => {
-                // Nothing to do to the sessions: dropping the shell detaches
-                // (never kills) its connections, so agents keep running and a
-                // reopen reattaches.
-            }
-            QuitAction::QuitProject => {
+            // Nothing to do to the sessions: dropping the shell detaches (never
+            // kills) its connections, so agents keep running and a reopen
+            // reattaches.
+            QuitAction::CloseUi => {}
+            QuitAction::QuitProject | QuitAction::QuitShelbi => self.pending_quit = Some(action),
+        }
+        self.should_quit = true;
+    }
+
+    /// Run the quit [`quit`](Self::quit) deferred, if any. Called after the
+    /// terminal is restored.
+    fn run_pending_quit(&mut self) {
+        match self.pending_quit.take() {
+            Some(QuitAction::QuitProject) => {
                 if let Some(project) = self.client.project() {
                     self.lifecycle.quit_project(project);
                 }
             }
-            QuitAction::QuitShelbi => {
-                self.lifecycle.quit_shelbi();
-            }
+            Some(QuitAction::QuitShelbi) => self.lifecycle.quit_shelbi(),
+            Some(QuitAction::CloseUi) | None => {}
         }
-        self.should_quit = true;
     }
 
     /// Detach every *other* client attached to this session, leaving this window
@@ -10120,8 +10145,14 @@ mod tests {
         let mut st = test_state_with(life.clone());
         st.quit(QuitAction::QuitProject);
         assert!(st.should_quit);
+        assert!(
+            life.calls.lock().unwrap().is_empty(),
+            "the quit waits for the terminal to be restored"
+        );
+        st.run_pending_quit();
         st.should_quit = false;
         st.quit(QuitAction::QuitShelbi);
+        st.run_pending_quit();
         assert_eq!(
             *life.calls.lock().unwrap(),
             vec!["quit_project:proj".to_string(), "quit_shelbi".to_string()],
@@ -10148,6 +10179,7 @@ mod tests {
             hidden_until_query: false,
         });
         assert!(st.should_quit, "a palette quit-project ends the loop");
+        st.run_pending_quit();
         assert_eq!(
             *life.calls.lock().unwrap(),
             vec!["quit_project:proj".to_string()],

@@ -267,6 +267,85 @@ impl QuitPhase {
         }
         .wait()
     }
+
+    /// Wait for the project's cancelled jobs to stop, the way a quit needs:
+    /// launches for up to [`quit_barrier_bound`], poll threads for only
+    /// `poll_grace` of it.
+    ///
+    /// The two differ in what a straggler can do. A launch that passed its last
+    /// check before the quit is still spawning, and the quit must wait for it, or
+    /// its session would start after the sweep that was meant to end it. A poll
+    /// thread can't start anything: every spawn it makes (a supervisor restart, a
+    /// stranded-slot resume) registers a launch of its own, and a cancelled
+    /// thread stops at its next check. A healthy one stops within its sleep step;
+    /// one still waiting on an unreachable machine would otherwise hold every
+    /// quit for the whole bound.
+    pub fn drain(&self, poll_grace: Duration) -> Drain {
+        drain_for(&self.project, quit_barrier_bound(), poll_grace)
+    }
+}
+
+/// What [`QuitPhase::drain`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Drain {
+    /// Every job stopped.
+    pub drained: bool,
+    /// The jobs still running when the wait ended, for people ("poll delta").
+    pub stuck: Vec<String>,
+}
+
+fn drain_for(project: &str, bound: Duration, poll_grace: Duration) -> Drain {
+    let start = Instant::now();
+    loop {
+        let (launches, polls) = live_kinds(project);
+        let elapsed = start.elapsed();
+        if launches == 0 && polls == 0 {
+            return Drain {
+                drained: true,
+                stuck: Vec::new(),
+            };
+        }
+        if elapsed >= bound || (launches == 0 && elapsed >= poll_grace) {
+            return Drain {
+                drained: false,
+                stuck: live_job_labels(project),
+            };
+        }
+        std::thread::sleep(BARRIER_POLL);
+    }
+}
+
+/// How many launch and poll jobs `project` has live.
+fn live_kinds(project: &str) -> (usize, usize) {
+    let reg = lock();
+    let Some(ps) = reg.projects.get(project) else {
+        return (0, 0);
+    };
+    let launches = ps.live.values().filter(|j| j.kind == JobKind::Launch).count();
+    (launches, ps.live.len() - launches)
+}
+
+/// The project's live jobs, described for people and sorted: `launch <ws>`,
+/// `poll <ws>`, or `supervisor` for project-wide poll work.
+pub fn live_job_labels(project: &str) -> Vec<String> {
+    let reg = lock();
+    let mut labels: Vec<String> = reg
+        .projects
+        .get(project)
+        .map(|ps| {
+            ps.live
+                .values()
+                .map(|job| match (job.kind, job.workspace.as_deref()) {
+                    (JobKind::Launch, Some(ws)) => format!("launch {ws}"),
+                    (JobKind::Launch, None) => "orchestrator launch".to_string(),
+                    (JobKind::Poll, Some(ws)) => format!("poll {ws}"),
+                    (JobKind::Poll, None) => "supervisor".to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    labels.sort();
+    labels
 }
 
 impl Drop for QuitPhase {
@@ -716,5 +795,53 @@ mod tests {
             Some(v) => std::env::set_var(QUIT_BARRIER_ENV, v),
             None => std::env::remove_var(QUIT_BARRIER_ENV),
         }
+    }
+
+    #[test]
+    fn a_drain_gives_up_on_a_stuck_poll_thread_after_its_grace_and_names_it() {
+        // A poll thread that never answers its cancel (blocked on a dead machine)
+        // must not hold a quit for the whole barrier bound.
+        let poll = register("drain-poll", Some("delta"), JobKind::Poll);
+        let _phase = begin_quit("drain-poll");
+        let start = Instant::now();
+        let drain = drain_for("drain-poll", Duration::from_secs(10), Duration::from_millis(80));
+        assert!(start.elapsed() < Duration::from_secs(2), "took {:?}", start.elapsed());
+        assert_eq!(
+            drain,
+            Drain {
+                drained: false,
+                stuck: vec!["poll delta".to_string()],
+            }
+        );
+        drop(poll);
+    }
+
+    #[test]
+    fn a_drain_waits_past_the_poll_grace_for_a_launch() {
+        // A launch still spawning has to finish before the quit lists what to
+        // end, so the poll grace doesn't apply to it.
+        let launch = register("drain-launch", Some("dev"), JobKind::Launch);
+        let _phase = begin_quit("drain-launch");
+        let worker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(launch);
+        });
+        let drain = drain_for("drain-launch", Duration::from_secs(10), Duration::from_millis(20));
+        worker.join().unwrap();
+        assert!(drain.drained, "the launch finished inside the bound: {drain:?}");
+        assert!(drain.stuck.is_empty());
+    }
+
+    #[test]
+    fn job_labels_say_what_each_job_is() {
+        let a = register("labels", None, JobKind::Poll);
+        let b = register("labels", Some("echo"), JobKind::Launch);
+        let c = register("labels", None, JobKind::Launch);
+        assert_eq!(
+            live_job_labels("labels"),
+            vec!["launch echo", "orchestrator launch", "supervisor"],
+        );
+        drop((a, b, c));
+        assert!(live_job_labels("labels").is_empty());
     }
 }

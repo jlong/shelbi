@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use serde::de::DeserializeOwned;
 use shelbi_proto::control::{
     self, AppRequest, AttachedClient, ChangeNote, ClientInfo, ClientMsg, DetachSelector, ExpectedState,
-    MutationRequest, ReviewSessionRequest, SaveConfigRequest, ServerMsg, StateWriteRequest, Stream as OutStream,
+    MutationRequest, ReviewSessionRequest, SaveConfigRequest, ServerMsg, StateWriteRequest, Step, Stream as OutStream,
     WorkspaceSessionRequest, CONTROL_PROTOCOL_VERSION,
 };
 
@@ -158,30 +158,57 @@ impl ControlClient {
     /// in-flight jobs through the quit barrier, and marks it closed. Blocks
     /// until the daemon reports done.
     pub fn quit_project(&mut self, project: &str) -> Result<(), ClientError> {
-        self.lifecycle(ClientMsg::QuitProject {
-            request_id: 1,
-            project: project.to_string(),
-        })
+        self.quit_project_with_progress(project, &mut |_| {})
+    }
+
+    /// [`quit_project`](Self::quit_project), handing each step the daemon
+    /// reports ([`ServerMsg::Progress`]) to `on_step` as it arrives. A daemon of
+    /// another version reports none.
+    pub fn quit_project_with_progress(
+        &mut self,
+        project: &str,
+        on_step: &mut dyn FnMut(&Step),
+    ) -> Result<(), ClientError> {
+        self.lifecycle(
+            ClientMsg::QuitProject {
+                request_id: 1,
+                project: project.to_string(),
+            },
+            on_step,
+        )
     }
 
     /// Quit Shelbi (Phase 4f): the daemon closes every project, ends all
     /// sessions, acknowledges, and then stops. Blocks until the acknowledgement;
     /// the daemon may close the connection as it stops, which counts as done.
     pub fn quit_shelbi(&mut self) -> Result<(), ClientError> {
-        self.lifecycle(ClientMsg::QuitShelbi { request_id: 1 })
+        self.quit_shelbi_with_progress(&mut |_| {})
+    }
+
+    /// [`quit_shelbi`](Self::quit_shelbi), handing each step the daemon reports
+    /// to `on_step` as it arrives.
+    pub fn quit_shelbi_with_progress(
+        &mut self,
+        on_step: &mut dyn FnMut(&Step),
+    ) -> Result<(), ClientError> {
+        self.lifecycle(ClientMsg::QuitShelbi { request_id: 1 }, on_step)
     }
 
     /// Ask the daemon to tell every subscribed client to re-exec (the reload
     /// signal). Blocks until the daemon acknowledges.
     pub fn reload_clients(&mut self) -> Result<(), ClientError> {
-        self.lifecycle(ClientMsg::ReloadClients { request_id: 1 })
+        self.lifecycle(ClientMsg::ReloadClients { request_id: 1 }, &mut |_| {})
     }
 
     /// Send a lifecycle request (quit/reload) and wait for its `Done`/`Failed`.
     /// A clean EOF before either — the daemon stopping as part of the action —
     /// is treated as success, so `quit_shelbi` doesn't error on the race between
     /// the ack and the shutdown.
-    fn lifecycle(&mut self, msg: ClientMsg) -> Result<(), ClientError> {
+    fn lifecycle(
+        &mut self,
+        msg: ClientMsg,
+        on_step: &mut dyn FnMut(&Step),
+    ) -> Result<(), ClientError> {
         let request_id = match &msg {
             ClientMsg::QuitProject { request_id, .. }
             | ClientMsg::QuitShelbi { request_id }
@@ -197,6 +224,9 @@ impl ControlClient {
                 }
                 Ok(Some(ServerMsg::Failed { request_id: id, error })) if id == request_id => {
                     return Err(ClientError::Mutation(error))
+                }
+                Ok(Some(ServerMsg::Progress { request_id: id, step })) if id == request_id => {
+                    on_step(&step)
                 }
                 // A frame for something else (a stray broadcast) — keep reading.
                 Ok(Some(_)) => {}

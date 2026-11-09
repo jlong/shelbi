@@ -16,7 +16,10 @@
 //!   ends all sessions, acks, then stops. The projects are closed before the
 //!   sessions end, so no session watchdog resurrects the daemon.
 //!
-//! Both block on the daemon's ack via [`shelbi_client::ControlClient`]. The
+//! Both block on the daemon's ack via [`shelbi_client::ControlClient`],
+//! showing each step of the quit as the daemon reports it, and `--all` then
+//! waits for the daemon process to exit
+//! ([`shelbi_tui::quit_progress`]). The
 //! orchestrator handoff and the close-before-end ordering live in
 //! [`shelbi_orchestrator::quit`], invoked by the daemon's control handler — this
 //! command does not reimplement them.
@@ -33,6 +36,8 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
+
+use shelbi_tui::quit_progress::{quit_with_progress, QuitTarget};
 
 use super::require_project;
 
@@ -75,15 +80,14 @@ pub fn run(project_opt: Option<String>, all: bool) -> Result<()> {
         }
         QuitReport::Project(project) => {
             println!(
-                "shelbi: quit \"{project}\" — its sessions were ended (after the orchestrator \
-                 handoff) and it is now closed; other projects keep running. Worktrees and \
-                 branches are left intact."
+                "\"{project}\" is closed; other projects keep running. Worktrees and branches \
+                 are left intact."
             );
         }
         QuitReport::All => {
             println!(
-                "shelbi: quit Shelbi — every project was closed, all sessions ended, and the hub \
-                 daemon stopped. Worktrees and branches are left intact."
+                "Every project is closed and the hub daemon is stopped. Worktrees and branches \
+                 are left intact."
             );
         }
     }
@@ -124,16 +128,13 @@ impl QuitOps for LiveQuit {
 
     fn quit_project(&self, project: &str) -> Result<()> {
         let mut client = connect()?;
-        client
-            .quit_project(project)
+        quit_with_progress(&mut client, QuitTarget::Project(project))
             .map_err(|e| anyhow!("quitting project `{project}`: {e}"))
     }
 
     fn quit_all(&self) -> Result<()> {
         let mut client = connect()?;
-        client
-            .quit_shelbi()
-            .map_err(|e| anyhow!("quitting Shelbi: {e}"))
+        quit_with_progress(&mut client, QuitTarget::Shelbi).map_err(|e| anyhow!("quitting Shelbi: {e}"))
     }
 }
 
@@ -146,6 +147,11 @@ fn connect() -> Result<shelbi_client::ControlClient> {
     loop {
         match shelbi_client::ControlClient::connect(&sock, shelbi_state::CLIENT_VERSION) {
             Ok(c) => return Ok(c),
+            // A daemon of another protocol answers the same way however long we
+            // wait.
+            Err(e @ shelbi_client::ClientError::ControlProtocolMismatch { .. }) => {
+                return Err(anyhow!("the hub daemon can't be asked to quit: {e}"))
+            }
             Err(e) => {
                 if Instant::now() >= deadline {
                     return Err(anyhow!(

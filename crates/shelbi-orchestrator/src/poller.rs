@@ -306,7 +306,7 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
             // every tick means the user can edit the project file and
             // new workspaces get threads spawned without a restart.
             Err(_) => {
-                sleep_interruptible(Duration::from_secs(5), &shutdown);
+                sleep_interruptible(Duration::from_secs(5), &shutdown, &job);
                 continue;
             }
         };
@@ -459,7 +459,7 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
         // `workspace_poll_interval_secs`, which governs each per-workspace
         // loop. Cheap (one YAML reload + map lookup per tick) and fast
         // enough that a YAML edit gets new threads within ~5s.
-        sleep_interruptible(Duration::from_secs(5), &shutdown);
+        sleep_interruptible(Duration::from_secs(5), &shutdown, &job);
     }
 
     // Drain finished threads on shutdown. Threads stuck on a hung SSH
@@ -574,7 +574,7 @@ fn run_workspace_poll_loop(
         let project = match shelbi_state::load_project(&project_name) {
             Ok(p) => p,
             Err(_) => {
-                sleep_interruptible(Duration::from_secs(5), &shutdown);
+                sleep_interruptible(Duration::from_secs(5), &shutdown, &job);
                 continue;
             }
         };
@@ -625,6 +625,7 @@ fn run_workspace_poll_loop(
         sleep_interruptible(
             limit_resume_sleep_interval(&limit_resume, interval, Utc::now()),
             &shutdown,
+            &job,
         );
     }
 }
@@ -13759,7 +13760,7 @@ transitions:
         let fx = RemoteReapFixture::new("exec sleep 600");
         shelbi_state::set_project_open(&fx.project.name, true).unwrap();
 
-        let out = crate::quit::quit_project_with(&fx.project.name, &crate::quit::BackendSessions);
+        let out = crate::quit::quit_project_with(&fx.project.name, std::sync::Arc::new(crate::quit::BackendSessions));
 
         assert_remote_session_ends(&fx, "Quit Project");
         assert_eq!(out.ended, vec!["w-delta/ws/agent"]);
@@ -13772,7 +13773,7 @@ transitions:
         let fx = RemoteReapFixture::new("exec sleep 600");
         shelbi_state::set_project_open(&fx.project.name, true).unwrap();
 
-        let out = crate::quit::quit_shelbi_with(&crate::quit::BackendSessions);
+        let out = crate::quit::quit_shelbi_with(std::sync::Arc::new(crate::quit::BackendSessions));
 
         assert_remote_session_ends(&fx, "Quit Shelbi");
         assert!(out.ended.contains(&"w-delta/ws/agent".to_string()), "{:?}", out.ended);
@@ -13802,7 +13803,7 @@ transitions:
         )
         .unwrap();
 
-        crate::quit::quit_project_with(&fx.project.name, &crate::quit::BackendSessions);
+        crate::quit::quit_project_with(&fx.project.name, std::sync::Arc::new(crate::quit::BackendSessions));
 
         let deadline = Instant::now() + Duration::from_secs(10);
         while crate::remote_session::live_session_names(&fx.host).unwrap().contains(&name) {
@@ -14651,13 +14652,33 @@ transitions:
     }
 }
 
-/// Sleep for `dur`, but wake every 200ms to honor a shutdown request so
-/// the sidebar process exits promptly.
-fn sleep_interruptible(dur: Duration, shutdown: &Arc<AtomicBool>) {
-    let step = Duration::from_millis(200);
+#[cfg(test)]
+mod sleep_interruptible_tests {
+    use super::*;
+
+    #[test]
+    fn a_cancelled_job_wakes_from_its_tick_sleep() {
+        // A quit cancels the poll thread's job and waits for it to stop; the
+        // thread must not sleep out the rest of its 5s tick first.
+        let job = crate::cancel::register("sleep-wakes", Some("dev"), crate::cancel::JobKind::Poll);
+        let _quit = crate::cancel::begin_quit("sleep-wakes");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        sleep_interruptible(Duration::from_secs(5), &shutdown, &job);
+        assert!(start.elapsed() < Duration::from_secs(1), "slept {:?}", start.elapsed());
+    }
+}
+
+/// Sleep for `dur`, but wake every 100ms to honor a shutdown request or the
+/// job's cancellation, so a stop or a quit doesn't wait out the tick.
+fn sleep_interruptible(dur: Duration, shutdown: &Arc<AtomicBool>, job: &crate::cancel::JobGuard) {
+    // The job's flag too, not just the shutdown: a quit cancels the job and then
+    // waits for it to stop, so a thread asleep for its 5s tick would otherwise
+    // hold every quit up for the rest of that tick.
+    let step = Duration::from_millis(100);
     let mut elapsed = Duration::ZERO;
     while elapsed < dur {
-        if shutdown.load(Ordering::SeqCst) {
+        if shutdown.load(Ordering::SeqCst) || job.is_cancelled() {
             return;
         }
         let chunk = step.min(dur - elapsed);

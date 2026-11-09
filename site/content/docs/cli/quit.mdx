@@ -26,6 +26,32 @@ and **Quit Shelbi**.
 With no daemon running nothing is open, so `shelbi quit` reports that and exits
 `0`.
 
+## Progress
+
+A quit that takes more than a moment shows each step as it runs, with how long
+it took:
+
+```text
+$ shelbi quit --all
+Shutting down Shelbi…
+  ✓ stopped 5 sessions                 0.2s
+  ✗ stopped sessions on devbox         6.0s  gave up waiting on devbox
+  ✓ stopped the daemon                 0.1s
+Done in 6.3s.
+```
+
+Progress follows the same rules as opening a project: it goes to stderr, only
+on a terminal (not when stderr is redirected, not under `TERM=dumb`, not with
+`SHELBI_NO_PROGRESS` set), and only once a step has run longer than 150ms, so a
+quick quit prints nothing extra. A step that gives up is always reported.
+
+Every wait has a limit. A remote machine that doesn't answer is given up on
+about six seconds after the quit starts, and the line names it; its sessions
+are left for that machine to clean up. The orchestrator's handoff is always
+written (or given up on after 30 seconds) before its session ends. Quit Project
+and Quit Shelbi from the dashboard's palette show the same steps once the
+dashboard closes.
+
 ## Flags
 
 | Flag | Type | Default | Description |
