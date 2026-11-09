@@ -306,3 +306,20 @@ After T7 to T9 land, record before and after numbers in the PR body:
 - the crate count from `cargo tree -e normal --prefix none | sort -u | wc -l`
 
 Those replace this plan's estimates with real figures.
+
+## Decisions (2026-11-09, owner)
+
+| Question | Decision |
+|---|---|
+| Q1 termwiz | **Replace** with our own key encoder, gated by a termwiz golden table (T7 `deps-termwiz-encoder`) |
+| Q2 tungstenite | **Keep.** It is a production wire protocol with an outside peer, and reliability wins (T8 dropped) |
+| Q3 chrono-tz | **Option A**: read the system tzdb (TZif + POSIX footer). Any zone keeps working (T9 `deps-chrono-tz`) |
+| Q4 TUI stack | **Upgrade** to ratatui 0.30, crossterm 0.29, unicode-width 0.2 and inquire 0.9 with trimmed features (T6 `deps-tui-stack-align`). Don't replace inquire |
+| Q5 alacritty | **Gate off** the unused `tty`/`event_loop`/`sync` modules and document the divergence in VENDORING.md (T10 `deps-alacritty-tty-gate`) |
+| Q6 SHELBI_LOG | **Keep the full EnvFilter syntax.** Phase 1 trims only the default features |
+| Q7 clap color | **Keep** colored help and errors |
+| Q8 serde_yaml | **File a separate migration task** to a maintained fork, held in backlog until this work lands (`serde-yaml-fork-migration`) |
+| Q9 similar / own subscriber | **Skip both** (T11 and T12 dropped) |
+
+In flight: `deps-phase1` (T1 to T3 combined), `deps-globset-inline` (T4) and `deps-tempfile-prod` (T5).
+
