@@ -755,6 +755,40 @@ pub enum ServerMsg {
         request_id: u64,
         body: serde_json::Value,
     },
+    /// One step of a long request (a quit) starting, finishing, or being given
+    /// up on, so the client can show live progress. No protocol bump: the
+    /// daemon sends it only to a client that announced its own exact version
+    /// in the hello, which is the only client sure to read it. Every other
+    /// client sees the request's `Done` and nothing else, as before.
+    Progress { request_id: u64, step: Step },
+}
+
+/// One step of a request the daemon reports progress on ([`ServerMsg::Progress`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Step {
+    /// Stable within one request, so a client can pair a step's finish with its
+    /// start. Steps can overlap: independent ones run at the same time.
+    pub id: String,
+    /// What the step does, for people: "asked orchestrator for handoff".
+    pub label: String,
+    pub state: StepState,
+}
+
+/// Where a [`Step`] is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StepState {
+    /// The step has begun.
+    Started,
+    /// The step finished in `elapsed_ms`. `note` says how it went, when that
+    /// is worth showing ("no handoff: orchestrator not running").
+    Done {
+        elapsed_ms: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    /// The step stopped waiting after `elapsed_ms` without its condition being
+    /// met. `waiting_on` names what never answered ("devbox", "handoff.md").
+    GaveUp { elapsed_ms: u64, waiting_on: String },
 }
 
 /// Encode a message to its full wire bytes (`[len: u32 BE][json]`).

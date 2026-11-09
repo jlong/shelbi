@@ -29,12 +29,22 @@
 //!    (`shelbi_session::daemon_watchdog`). Clearing the open flag before any
 //!    session ends is what makes "quit Shelbi … and nothing restarts it" hold:
 //!    a session shutting down sees `open == false` and stays out of the way.
-//! 4. **Drain the quit barrier.** Wait for the cancelled jobs to acknowledge, so
-//!    "quit" means "no job for this project is still running." This precedes the
-//!    kills so a launch that passed its last check just before step 2 has
-//!    finished spawning by the time step 5 lists what's live.
+//! 4. **Hand off and drain.** Quit Project asks the orchestrator for its handoff
+//!    and waits for the file, and meanwhile waits for the cancelled jobs to
+//!    acknowledge ([`crate::cancel::QuitPhase::drain`]), so a launch that passed
+//!    its last check just before step 2 has finished spawning by the time step 5
+//!    lists what's live. Both finish before any session ends.
 //! 5. **End the sessions.** Best-effort kill of the matching session processes
-//!    on the local hub and the snapshotted remote machines.
+//!    on the local hub and the snapshotted remote machines, all at once.
+//!
+//! Every wait is bounded and every step is timed: each one is reported as it
+//! starts and finishes ([`Report`], which the daemon streams to the client that
+//! asked), and the whole quit's timing is logged to `events.log` as one
+//! `daemon quit-timing` line. The remote
+//! machines start connecting at step 1, and a machine still not done
+//! [`REMOTE_SWEEP_DEADLINE`] after the quit began is given up on and named,
+//! rather than holding the quit for as long as its relay takes to notice it is
+//! gone (once measured at 49s, after a 10s drain stuck on the same machine).
 //!
 //! While a composition runs it holds a [`QuitInFlight`] guard, taken *before*
 //! step 1. The daemon's idle-exit monitor treats a quit in flight as activity
@@ -49,8 +59,11 @@
 //! production implementation over [`crate::session_backend::backend`].
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 use shelbi_core::{Host, Project};
+use shelbi_proto::control::{Step, StepState};
 
 use crate::session_backend::{backend, KillReason};
 use crate::session_process_backend::{session_name, SessionProcessBackend};
@@ -65,6 +78,10 @@ pub trait Sessions {
     /// Best-effort end the session named `name` on `host` (kill its child's
     /// process group). An already-gone session is fine.
     fn kill(&self, host: &Host, name: &str);
+    /// Get ready to reach `host` (connect to it), so its sweep later doesn't
+    /// start cold. Called when the quit begins, on a thread of its own that the
+    /// quit never waits for. The default does nothing.
+    fn warm(&self, _host: &Host) {}
 }
 
 /// Quit compositions currently running in this process.
@@ -178,30 +195,282 @@ fn add_project_sweeps(sweeps: &mut Vec<HostSweep>, project: &Project) {
     }
 }
 
-/// End the sessions a quit owns: the local ones `owned_locally` picks, then each
-/// remote machine's own. Returns the names asked to end, sorted and deduplicated
-/// (one name can live on two machines).
+/// Where a quit reports its steps as they start and finish: the daemon forwards
+/// them to the client that asked for the quit, which shows them live. Steps can
+/// overlap (the handoff and the job drain run side by side, and so do the
+/// machines' sweeps), so a report is called from more than one thread.
+pub type Report<'a> = &'a (dyn Fn(Step) + Sync);
+
+/// A [`Report`] that shows nothing (the quit's timing still goes to `events.log`).
+pub fn silent(_: Step) {}
+
+/// Run a quit composition with its steps passed on to `report` and also timed
+/// into one `events.log` line once it ends, so a slow quit can be read back
+/// afterwards:
+/// `daemon quit-timing reason=quit-project:alpha,total=1450ms,handoff=1323ms,jobs=2004ms:gave-up,…`
+fn logging_timing<T>(what: &str, report: Report, quit: impl FnOnce(Report) -> T) -> T {
+    let start = Instant::now();
+    let finished = std::sync::Mutex::new(Vec::new());
+    let timed = |step: Step| {
+        let token = match &step.state {
+            StepState::Started => None,
+            StepState::Done { elapsed_ms, .. } => Some(format!("{}={elapsed_ms}ms", step.id)),
+            StepState::GaveUp { elapsed_ms, .. } => {
+                Some(format!("{}={elapsed_ms}ms:gave-up", step.id))
+            }
+        };
+        if let Some(token) = token {
+            finished.lock().unwrap_or_else(|p| p.into_inner()).push(token);
+        }
+        report(step);
+    };
+    let out = quit(&timed);
+    let mut tokens = vec![
+        what.to_string(),
+        format!("total={}ms", start.elapsed().as_millis()),
+    ];
+    tokens.extend(finished.into_inner().unwrap_or_else(|p| p.into_inner()));
+    let _ = shelbi_state::append_daemon_event("quit-timing", &tokens.join(","));
+    out
+}
+
+/// How long a quit waits on its slow parts, all of them bounded.
+#[derive(Debug, Clone, Copy)]
+pub struct Bounds {
+    /// How long the drain waits for poll threads to stop (launches get the
+    /// whole quit barrier; see [`crate::cancel::QuitPhase::drain`]).
+    pub poll_grace: Duration,
+    /// How long the quit waits on each remote machine before giving up on it,
+    /// counted from the start of the quit (its connection warms up while the
+    /// handoff and drain run). The machines are swept at once, so a dead one
+    /// costs this much once, not once per machine or per session.
+    pub remote: Duration,
+}
+
+impl Default for Bounds {
+    fn default() -> Self {
+        Self {
+            poll_grace: POLL_DRAIN_GRACE,
+            remote: REMOTE_SWEEP_DEADLINE,
+        }
+    }
+}
+
+/// How long the drain waits for cancelled poll threads. A healthy one stops
+/// within its sleep step; one still blocked on a machine that stopped answering
+/// is left to finish on its own (it can't start anything: see
+/// [`crate::cancel::QuitPhase::drain`]).
+pub const POLL_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a quit waits on one remote machine. A reachable machine's relay is
+/// normally already up (the poller keeps it), and opening a fresh one is a
+/// single SSH connect, which `ConnectTimeout=5` bounds. A machine that hasn't
+/// answered by then isn't going to: before this cap, a relay that went silent
+/// held the quit until its 30s keepalive gave up, and then once more for the
+/// retry.
+pub const REMOTE_SWEEP_DEADLINE: Duration = Duration::from_secs(6);
+
+/// However late the drain ends, a machine's sweep gets at least this long to
+/// list and end its sessions over a connection that is already up.
+const REMOTE_SWEEP_FLOOR: Duration = Duration::from_secs(1);
+
+/// Start connecting to each remote machine now, on threads the quit never
+/// waits for, so the sweep after the drain finds the connection up. Returns
+/// when the remote deadline runs out, counted from now.
+fn warm_remote(sessions: &SharedSessions, remote: &[HostSweep], bound: Duration) -> Instant {
+    for machine in remote {
+        let (sessions, host) = (sessions.clone(), machine.host.clone());
+        let _ = std::thread::Builder::new()
+            .name(format!("quit-warm-{}", host_label(&host)))
+            .spawn(move || sessions.warm(&host));
+    }
+    Instant::now() + bound
+}
+
+/// One running step of a quit: reports its start now and its end when finished,
+/// with the elapsed time.
+struct Timed<'a> {
+    id: String,
+    report: Report<'a>,
+    start: Instant,
+}
+
+impl<'a> Timed<'a> {
+    fn start(report: Report<'a>, id: impl Into<String>, label: impl Into<String>) -> Self {
+        let id = id.into();
+        report(Step {
+            id: id.clone(),
+            label: label.into(),
+            state: StepState::Started,
+        });
+        Self {
+            id,
+            report,
+            start: Instant::now(),
+        }
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        self.start.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+    }
+
+    /// The step finished; `label` is its finished wording ("stopped 5 sessions").
+    fn done(self, label: impl Into<String>, note: Option<String>) {
+        let elapsed_ms = self.elapsed_ms();
+        tracing::info!(step = %self.id, elapsed_ms, note = ?note, "quit step done");
+        (self.report)(Step {
+            id: self.id,
+            label: label.into(),
+            state: StepState::Done { elapsed_ms, note },
+        });
+    }
+
+    /// The step stopped waiting on `waiting_on` without it answering.
+    fn gave_up(self, label: impl Into<String>, waiting_on: impl Into<String>) {
+        let elapsed_ms = self.elapsed_ms();
+        let waiting_on = waiting_on.into();
+        tracing::warn!(step = %self.id, elapsed_ms, %waiting_on, "quit step gave up");
+        (self.report)(Step {
+            id: self.id,
+            label: label.into(),
+            state: StepState::GaveUp {
+                elapsed_ms,
+                waiting_on,
+            },
+        });
+    }
+}
+
+/// A machine's name for people: the SSH host, or "this machine".
+fn host_label(host: &Host) -> String {
+    match host {
+        Host::Ssh { host } => host.clone(),
+        _ => "this machine".to_string(),
+    }
+}
+
+fn sessions_word(n: usize) -> &'static str {
+    if n == 1 {
+        "session"
+    } else {
+        "sessions"
+    }
+}
+
+/// The [`Sessions`] a quit drives, shared so a remote machine's sweep can run on
+/// a thread of its own that the quit can stop waiting for.
+pub type SharedSessions = Arc<dyn Sessions + Send + Sync>;
+
+/// End the owned sessions on one machine; returns the names asked to end.
+fn sweep_host(sessions: &dyn Sessions, host: &Host, owned: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let mut ended = Vec::new();
+    for name in sessions.live_names(host) {
+        if owned(&name) {
+            sessions.kill(host, &name);
+            ended.push(name);
+        }
+    }
+    ended
+}
+
+/// End the sessions a quit owns: the local ones `owned_locally` picks, and each
+/// remote machine's own, all at once. A remote machine that hasn't finished by
+/// `remote_until` (or [`REMOTE_SWEEP_FLOOR`] from now, if later) is given up
+/// on: its sweep keeps going in the background, best-effort. Returns the names
+/// asked to end, sorted and deduplicated (one name can live on two machines).
 fn end_sessions(
-    sessions: &dyn Sessions,
+    sessions: &SharedSessions,
     owned_locally: impl Fn(&str) -> bool,
     remote: &[HostSweep],
+    report: Report,
+    remote_until: Instant,
 ) -> Vec<String> {
-    let mut ended = Vec::new();
-    let mut sweep = |host: &Host, owned: &dyn Fn(&str) -> bool| {
-        for name in sessions.live_names(host) {
-            if owned(&name) {
-                sessions.kill(host, &name);
-                ended.push(name);
-            }
-        }
-    };
-    sweep(&Host::Local, &owned_locally);
+    let until = remote_until.max(Instant::now() + REMOTE_SWEEP_FLOOR);
+    let (tx, rx) = mpsc::channel::<(Host, Vec<String>)>();
+    let mut pending = Vec::new();
     for machine in remote {
-        sweep(&machine.host, &|name| machine.owns(name));
+        let label = host_label(&machine.host);
+        let step = Timed::start(
+            report,
+            format!("remote:{label}"),
+            format!("stopping sessions on {label}"),
+        );
+        let host = machine.host.clone();
+        let (sessions, machine, tx) = (sessions.clone(), machine.clone(), tx.clone());
+        let spawned = std::thread::Builder::new()
+            .name(format!("quit-sweep-{label}"))
+            .spawn(move || {
+                let ended = sweep_host(&*sessions, &machine.host, &|name| machine.owns(name));
+                let _ = tx.send((machine.host, ended));
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(host = %label, error = %e, "quit couldn't start this machine's sweep");
+            step.gave_up(format!("stopped sessions on {label}"), label);
+            continue;
+        }
+        pending.push((host, label, step));
     }
+    drop(tx);
+
+    let local = Timed::start(report, "local", "stopping sessions");
+    let mut ended = sweep_host(&**sessions, &Host::Local, &owned_locally);
+    let n = ended.len();
+    local.done(format!("stopped {n} {}", sessions_word(n)), None);
+
+    while !pending.is_empty() {
+        let Ok((host, names)) = rx.recv_timeout(until.saturating_duration_since(Instant::now())) else {
+            break;
+        };
+        if let Some(at) = pending.iter().position(|(h, ..)| *h == host) {
+            let (_, label, step) = pending.remove(at);
+            let n = names.len();
+            step.done(format!("stopped {n} {} on {label}", sessions_word(n)), None);
+        }
+        ended.extend(names);
+    }
+    for (_, label, step) in pending {
+        step.gave_up(format!("stopped sessions on {label}"), label);
+    }
+
     ended.sort();
     ended.dedup();
     ended
+}
+
+/// Wait for the quitting projects' cancelled jobs, as one step.
+fn drain_step(phases: &[crate::cancel::QuitPhase], report: Report, poll_grace: Duration) -> bool {
+    let step = Timed::start(report, "jobs", "stopping background jobs");
+    let mut stuck = Vec::new();
+    for phase in phases {
+        stuck.extend(phase.drain(poll_grace).stuck);
+    }
+    if stuck.is_empty() {
+        step.done("stopped background jobs", None);
+        true
+    } else {
+        step.gave_up("stopped background jobs", stuck.join(", "));
+        false
+    }
+}
+
+/// Ask `project`'s orchestrator for its handoff and wait for the file, as one step.
+fn handoff_step(project: &str, report: Report) {
+    use crate::handoff::HandoffOutcome as O;
+    let step = Timed::start(report, "handoff", "asking orchestrator for handoff");
+    let label = "asked orchestrator for handoff";
+    // Best-effort: a missing/timed-out handoff is degraded (next open is cold),
+    // never fatal to the quit.
+    match crate::handoff::request_orchestrator_handoff(project) {
+        Ok(O::Written { .. }) => step.done(label, None),
+        Ok(O::NativeThread) => step.done(label, Some("kept in its native thread".into())),
+        Ok(O::PaneNotAlive) => step.done(label, Some("orchestrator not running".into())),
+        Ok(O::Timeout) => step.gave_up(label, "handoff.md"),
+        Ok(O::SendFailed { reason }) => step.done(label, Some(format!("couldn't send: {reason}"))),
+        Ok(O::SubmitUnconfirmed { .. }) => {
+            step.gave_up(label, "the orchestrator to take the request")
+        }
+        Err(e) => step.done(label, Some(format!("skipped: {e}"))),
+    }
 }
 
 /// Outcome of a [`quit_project`] / [`quit_project_with`].
@@ -228,34 +497,40 @@ pub struct QuitShelbiOutcome {
 /// Quit one project (production). Marks it closed, asks the orchestrator to
 /// write its handoff file (so the next open resumes with context, exactly as
 /// the tmux quit does), then drains the quit barrier and ends its sessions.
-pub fn quit_project(project: &str) -> QuitProjectOutcome {
-    quit_project_inner(project, &BackendSessions, || {
-        // Best-effort: a missing/timed-out handoff is degraded (next open is
-        // cold), never fatal to the quit.
-        let _ = crate::handoff::request_orchestrator_handoff(project);
+/// Each step is reported to `report` as it starts and finishes.
+pub fn quit_project(project: &str, report: Report) -> QuitProjectOutcome {
+    let sessions: SharedSessions = Arc::new(BackendSessions);
+    logging_timing(&format!("quit-project:{project}"), report, |report| {
+        quit_project_inner(project, &sessions, report, Bounds::default(), |report| {
+            handoff_step(project, report)
+        })
     })
 }
 
 /// Quit one project against an injected [`Sessions`], with no handoff — the
 /// unit-test entry point. Exercises the same ordering as production.
-pub fn quit_project_with(project: &str, sessions: &dyn Sessions) -> QuitProjectOutcome {
-    quit_project_inner(project, sessions, || {})
+pub fn quit_project_with(project: &str, sessions: SharedSessions) -> QuitProjectOutcome {
+    quit_project_inner(project, &sessions, &silent, Bounds::default(), |_| {})
 }
 
-/// The shared composition. `before_end_sessions` runs after the project is
-/// marked closed but before its sessions end — the window in which the live
-/// orchestrator can still be asked for a handoff.
+/// The shared composition. `handoff` runs after the project is marked closed but
+/// before its sessions end — the window in which the live orchestrator can
+/// still be asked for a handoff. It runs alongside the job drain: both have to
+/// finish before any session ends, and neither waits on the other.
 fn quit_project_inner(
     project: &str,
-    sessions: &dyn Sessions,
-    before_end_sessions: impl FnOnce(),
+    sessions: &SharedSessions,
+    report: Report,
+    bounds: Bounds,
+    handoff: impl FnOnce(Report) + Send,
 ) -> QuitProjectOutcome {
     // Held across every step: closing the last open project must not let the
     // daemon idle-exit before the handoff and session teardown below finish.
     let _in_flight = QuitInFlight::enter();
 
-    // 1. The machines to sweep.
+    // 1. The machines to sweep, which start connecting now.
     let remote = remote_sweeps(&[project.to_string()]);
+    let remote_until = warm_remote(sessions, &remote, bounds.remote);
 
     // 2. Nothing new starts for this project from here on.
     let quitting = crate::cancel::begin_quit(project);
@@ -264,14 +539,21 @@ fn quit_project_inner(
     let _ = shelbi_state::set_project_open(project, false);
     let _ = shelbi_state::append_project_event(project, "closed", "user:quit-project");
 
-    // Handoff (production only) while the orchestrator session is still live.
-    before_end_sessions();
-
-    // 4. Drain the barrier for this project's in-flight daemon jobs.
-    let drained = quitting.wait();
+    // 4. The handoff (production only) while the orchestrator session is still
+    //    live, and the drain of this project's in-flight daemon jobs.
+    let drained = std::thread::scope(|scope| {
+        scope.spawn(|| handoff(report));
+        drain_step(std::slice::from_ref(&quitting), report, bounds.poll_grace)
+    });
 
     // 5. End only this project's sessions.
-    let ended = end_sessions(sessions, |name| belongs_to_project(name, project), &remote);
+    let ended = end_sessions(
+        sessions,
+        |name| belongs_to_project(name, project),
+        &remote,
+        report,
+        remote_until,
+    );
 
     QuitProjectOutcome { ended, drained }
 }
@@ -279,8 +561,11 @@ fn quit_project_inner(
 /// Quit Shelbi (production). See [`quit_shelbi_with`]. Does **not** stop the
 /// daemon itself — the caller (the daemon's control handler) stops after the
 /// client is acknowledged, so the shutdown doesn't race the reply.
-pub fn quit_shelbi() -> QuitShelbiOutcome {
-    quit_shelbi_with(&BackendSessions)
+pub fn quit_shelbi(report: Report) -> QuitShelbiOutcome {
+    let sessions: SharedSessions = Arc::new(BackendSessions);
+    logging_timing("quit-shelbi", report, |report| {
+        quit_shelbi_inner(&sessions, report, Bounds::default())
+    })
 }
 
 /// Quit Shelbi against an injected [`Sessions`]: mark every open project closed
@@ -288,12 +573,17 @@ pub fn quit_shelbi() -> QuitShelbiOutcome {
 /// and end every local session plus the open projects' sessions on their remote
 /// machines. Other sessions on those machines aren't ours to end: a machine can
 /// run a hub of its own.
-pub fn quit_shelbi_with(sessions: &dyn Sessions) -> QuitShelbiOutcome {
+pub fn quit_shelbi_with(sessions: SharedSessions) -> QuitShelbiOutcome {
+    quit_shelbi_inner(&sessions, &silent, Bounds::default())
+}
+
+fn quit_shelbi_inner(sessions: &SharedSessions, report: Report, bounds: Bounds) -> QuitShelbiOutcome {
     let _in_flight = QuitInFlight::enter();
 
     // 1. The machines to sweep, while the open set still names them.
     let open = shelbi_state::list_open_projects().unwrap_or_default();
     let remote = remote_sweeps(&open);
+    let remote_until = warm_remote(sessions, &remote, bounds.remote);
 
     // 2. Nothing new starts for any of these projects from here on.
     let quitting: Vec<_> = open.iter().map(|p| crate::cancel::begin_quit(p)).collect();
@@ -305,13 +595,10 @@ pub fn quit_shelbi_with(sessions: &dyn Sessions) -> QuitShelbiOutcome {
     }
 
     // 4. Drain every closed project's barrier.
-    let mut drained = true;
-    for phase in &quitting {
-        drained &= phase.wait();
-    }
+    let drained = drain_step(&quitting, report, bounds.poll_grace);
 
     // 5. End the sessions.
-    let ended = end_sessions(sessions, |_| true, &remote);
+    let ended = end_sessions(sessions, |_| true, &remote, report, remote_until);
 
     QuitShelbiOutcome {
         closed: open,
@@ -330,6 +617,12 @@ impl Sessions for BackendSessions {
             tracing::warn!(?host, error = %e, "quit can't list this host's sessions; they keep running");
             Vec::new()
         })
+    }
+
+    fn warm(&self, host: &Host) {
+        // Listing opens (or confirms) the machine's relay; the answer itself is
+        // not used: what to end is decided after the drain.
+        let _ = backend().live_pane_ids(host);
     }
 
     fn kill(&self, host: &Host, name: &str) {
@@ -387,15 +680,25 @@ mod tests {
             self.live.extend(live.iter().map(|s| (ssh(host), s.to_string())));
             self
         }
+        /// The hosts asked, in a fixed order: machines are swept at once, so
+        /// the order they were asked in isn't.
         fn swept(&self) -> Vec<Host> {
-            self.swept.lock().unwrap().clone()
+            let mut swept = self.swept.lock().unwrap().clone();
+            swept.sort_by_key(|h| format!("{h:?}"));
+            swept
         }
         fn killed(&self) -> Vec<String> {
-            self.killed.lock().unwrap().iter().map(|(_, n)| n.clone()).collect()
+            let mut killed: Vec<String> =
+                self.killed.lock().unwrap().iter().map(|(_, n)| n.clone()).collect();
+            killed.sort();
+            killed
         }
         fn killed_on(&self, host: &Host) -> Vec<String> {
             let killed = self.killed.lock().unwrap();
-            killed.iter().filter(|(h, _)| h == host).map(|(_, n)| n.clone()).collect()
+            let mut on: Vec<String> =
+                killed.iter().filter(|(h, _)| h == host).map(|(_, n)| n.clone()).collect();
+            on.sort();
+            on
         }
     }
     impl Sessions for FakeSessions {
@@ -480,14 +783,14 @@ mod tests {
         shelbi_state::set_project_open("alpha", true).unwrap();
         shelbi_state::set_project_open("beta", true).unwrap();
 
-        let sessions = FakeSessions::new(&[
+        let sessions = Arc::new(FakeSessions::new(&[
             "alpha/orch",
             "alpha/ws/dev",
             "beta/orch",
             "alpha-2/orch", // a prefix-sharing OTHER project
-        ]);
+        ]));
 
-        let out = quit_project_with("alpha", &sessions);
+        let out = quit_project_with("alpha", sessions.clone());
 
         // Only alpha's sessions were ended.
         assert_eq!(sessions.killed(), vec!["alpha/orch", "alpha/ws/dev"]);
@@ -523,7 +826,7 @@ mod tests {
             })
         };
 
-        let out = quit_project_with("gamma", &FakeSessions::new(&[]));
+        let out = quit_project_with("gamma", Arc::new(FakeSessions::new(&[])));
         assert!(out.drained, "the barrier drained after the job acknowledged");
         worker.join().unwrap();
         assert!(done.load(Ordering::SeqCst), "the cancelled job ran to completion");
@@ -554,13 +857,14 @@ mod tests {
         // can only fire after the session is gone.
         let home = Home::new("qp-inflight", &["solo"]);
         shelbi_state::set_project_open("solo", true).unwrap();
-        let sessions = InFlightAtKill {
+        let sessions = Arc::new(InFlightAtKill {
             live: vec!["solo/orch".into()],
             in_flight_at_kill: Mutex::new(Vec::new()),
-        };
+        });
 
         let seen_during_handoff = Mutex::new(None);
-        let out = quit_project_inner("solo", &sessions, || {
+        let shared: SharedSessions = sessions.clone();
+        let out = quit_project_inner("solo", &shared, &silent, Bounds::default(), |_| {
             // A timed-out handoff: the wait elapses with nothing written.
             std::thread::sleep(Duration::from_millis(20));
             *seen_during_handoff.lock().unwrap() = Some((
@@ -590,8 +894,8 @@ mod tests {
         shelbi_state::set_project_open("one", true).unwrap();
         shelbi_state::set_project_open("two", true).unwrap();
 
-        let sessions = FakeSessions::new(&["one/orch", "two/orch", "two/ws/dev"]);
-        let out = quit_shelbi_with(&sessions);
+        let sessions = Arc::new(FakeSessions::new(&["one/orch", "two/orch", "two/ws/dev"]));
+        let out = quit_shelbi_with(sessions.clone());
 
         assert_eq!(out.closed, vec!["one", "two"]);
         assert_eq!(out.ended.len(), 3);
@@ -615,14 +919,14 @@ mod tests {
         shelbi_state::set_project_open("alpha", true).unwrap();
         shelbi_state::set_project_open("beta", true).unwrap();
 
-        let sessions = FakeSessions::new(&["alpha/orch", "beta/orch"])
+        let sessions = Arc::new(FakeSessions::new(&["alpha/orch", "beta/orch"])
             .on(
                 "devbox",
                 &["alpha/ws/delta/shell", "w-delta/ws/agent", "gamma/orch", "w-zulu/ws/agent"],
             )
-            .on("buildbox", &["w-echo/ws/agent"]);
+            .on("buildbox", &["w-echo/ws/agent"]));
 
-        let out = quit_project_with("alpha", &sessions);
+        let out = quit_project_with("alpha", sessions.clone());
 
         assert_eq!(
             sessions.swept(),
@@ -649,12 +953,12 @@ mod tests {
         give_ssh_machine("alpha", "buildbox", &[]);
         shelbi_state::set_project_open("alpha", true).unwrap();
 
-        let sessions = FakeSessions::new(&[])
+        let sessions = Arc::new(FakeSessions::new(&[])
             .on("devbox", &["w-delta/ws/agent"])
-            .on("buildbox", &["w-delta/ws/agent"]);
-        quit_project_with("alpha", &sessions);
+            .on("buildbox", &["w-delta/ws/agent"]));
+        quit_project_with("alpha", sessions.clone());
 
-        assert_eq!(sessions.swept(), vec![Host::Local, ssh("devbox"), ssh("buildbox")]);
+        assert_eq!(sessions.swept(), vec![Host::Local, ssh("buildbox"), ssh("devbox")]);
         assert_eq!(sessions.killed_on(&ssh("devbox")), vec!["w-delta/ws/agent"]);
         assert!(sessions.killed_on(&ssh("buildbox")).is_empty());
         drop(home);
@@ -671,19 +975,19 @@ mod tests {
         shelbi_state::set_project_open("one", true).unwrap();
         shelbi_state::set_project_open("two", true).unwrap();
 
-        let sessions = FakeSessions::new(&["one/orch", "unrelated/orch"])
+        let sessions = Arc::new(FakeSessions::new(&["one/orch", "unrelated/orch"])
             .on(
                 "devbox",
                 &["one/ws/delta/shell", "w-delta/ws/agent", "w-echo/ws/agent", "theirs/orch"],
             )
             .on("buildbox", &["w-foxtrot/ws/agent"])
-            .on("oldbox", &["w-golf/ws/agent"]);
+            .on("oldbox", &["w-golf/ws/agent"]));
 
-        let out = quit_shelbi_with(&sessions);
+        let out = quit_shelbi_with(sessions.clone());
 
         assert_eq!(
             sessions.swept(),
-            vec![Host::Local, ssh("devbox"), ssh("buildbox")],
+            vec![Host::Local, ssh("buildbox"), ssh("devbox")],
             "every open project's machines are swept, each once",
         );
         assert_eq!(
@@ -732,12 +1036,13 @@ mod tests {
     fn a_relaunch_during_a_quit_is_cancelled_immediately_and_a_reopen_is_not() {
         let home = Home::new("qp-relaunch", &["raced"]);
         shelbi_state::set_project_open("raced", true).unwrap();
-        let sessions = RelaunchRacer {
+        let sessions = Arc::new(RelaunchRacer {
             project: "raced".into(),
             registered_cancelled: Mutex::new(Vec::new()),
-        };
+        });
 
-        let out = quit_project_inner("raced", &sessions, || sessions.race());
+        let shared: SharedSessions = sessions.clone();
+        let out = quit_project_inner("raced", &shared, &silent, Bounds::default(), |_| sessions.race());
 
         assert_eq!(
             *sessions.registered_cancelled.lock().unwrap(),
@@ -786,15 +1091,163 @@ mod tests {
             drop(guard);
         });
 
-        let sessions = LiveJobsAtKill {
+        let sessions = Arc::new(LiveJobsAtKill {
             project: "ordered".into(),
             at_kill: Mutex::new(Vec::new()),
-        };
-        let out = quit_project_with("ordered", &sessions);
+        });
+        let out = quit_project_with("ordered", sessions.clone());
         worker.join().unwrap();
 
         assert!(out.drained);
         assert_eq!(*sessions.at_kill.lock().unwrap(), vec![0]);
+        drop(home);
+    }
+
+    /// A [`Sessions`] fake where one machine never answers until released (a
+    /// relay gone silent), recording every kill.
+    struct SilentMachine {
+        silent: Host,
+        release: Arc<AtomicBool>,
+        live: Vec<(Host, String)>,
+        killed: Mutex<Vec<(Host, String)>>,
+    }
+    impl Sessions for SilentMachine {
+        fn live_names(&self, host: &Host) -> Vec<String> {
+            if *host == self.silent {
+                let until = std::time::Instant::now() + Duration::from_secs(30);
+                while !self.release.load(Ordering::SeqCst) && std::time::Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+            self.live.iter().filter(|(h, _)| h == host).map(|(_, n)| n.clone()).collect()
+        }
+        fn kill(&self, host: &Host, name: &str) {
+            self.killed.lock().unwrap().push((host.clone(), name.to_string()));
+        }
+    }
+
+    /// Collects every step a quit reports.
+    fn recorder() -> (Arc<Mutex<Vec<Step>>>, impl Fn(Step) + Sync) {
+        let steps = Arc::new(Mutex::new(Vec::new()));
+        let sink = steps.clone();
+        (steps, move |step| sink.lock().unwrap().push(step))
+    }
+
+    #[test]
+    fn a_machine_that_never_answers_is_given_up_on_and_named() {
+        let home = Home::new("qp-silent", &["alpha"]);
+        give_ssh_machine("alpha", "deadbox", &["delta"]);
+        give_ssh_machine("alpha", "devbox", &["echo"]);
+        shelbi_state::set_project_open("alpha", true).unwrap();
+        let release = Arc::new(AtomicBool::new(false));
+        let sessions = Arc::new(SilentMachine {
+            silent: ssh("deadbox"),
+            release: release.clone(),
+            live: vec![
+                (Host::Local, "alpha/orch".into()),
+                (ssh("devbox"), "w-echo/ws/agent".into()),
+                (ssh("deadbox"), "w-delta/ws/agent".into()),
+            ],
+            killed: Mutex::new(Vec::new()),
+        });
+        let shared: SharedSessions = sessions.clone();
+        let (steps, report) = recorder();
+        let bounds = Bounds {
+            poll_grace: Duration::from_millis(50),
+            remote: Duration::from_millis(300),
+        };
+
+        let start = std::time::Instant::now();
+        let out = quit_project_inner("alpha", &shared, &report, bounds, |_| {});
+        let took = start.elapsed();
+        release.store(true, Ordering::SeqCst);
+
+        assert!(took < Duration::from_secs(3), "the silent machine held the quit for {took:?}");
+        assert_eq!(out.ended, vec!["alpha/orch", "w-echo/ws/agent"]);
+        let finished: Vec<(String, StepState)> = steps
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.state != StepState::Started)
+            .map(|s| (s.id.clone(), s.state.clone()))
+            .collect();
+        let state = |id: &str| finished.iter().find(|(i, _)| i == id).map(|(_, s)| s.clone());
+        match state("remote:deadbox") {
+            Some(StepState::GaveUp { waiting_on, .. }) => assert_eq!(waiting_on, "deadbox"),
+            other => panic!("the silent machine is given up on by name, got {other:?}"),
+        }
+        assert!(matches!(state("remote:devbox"), Some(StepState::Done { .. })), "{finished:?}");
+        assert!(matches!(state("local"), Some(StepState::Done { .. })), "{finished:?}");
+        assert!(matches!(state("jobs"), Some(StepState::Done { .. })), "{finished:?}");
+        let started = steps.lock().unwrap().iter().filter(|s| s.state == StepState::Started).count();
+        assert_eq!(started, finished.len(), "every step that starts finishes once: {finished:?}");
+        drop(home);
+    }
+
+    /// Records, for each kill, whether the handoff had finished by then.
+    struct HandoffAtKill {
+        handed_off: Arc<AtomicBool>,
+        at_kill: Mutex<Vec<bool>>,
+    }
+    impl Sessions for HandoffAtKill {
+        fn live_names(&self, host: &Host) -> Vec<String> {
+            if host.is_local() { vec!["late/orch".into(), "late/ws/dev".into()] } else { Vec::new() }
+        }
+        fn kill(&self, _host: &Host, _name: &str) {
+            self.at_kill.lock().unwrap().push(self.handed_off.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn the_handoff_finishes_before_any_session_ends() {
+        // The handoff runs beside the drain now; the orchestrator's pane must
+        // still outlive it, however long it takes and however fast the drain is.
+        let home = Home::new("qp-handoff-order", &["late"]);
+        shelbi_state::set_project_open("late", true).unwrap();
+        let handed_off = Arc::new(AtomicBool::new(false));
+        let sessions = Arc::new(HandoffAtKill {
+            handed_off: handed_off.clone(),
+            at_kill: Mutex::new(Vec::new()),
+        });
+        let shared: SharedSessions = sessions.clone();
+        let (steps, report) = recorder();
+
+        quit_project_inner("late", &shared, &report, Bounds::default(), |report| {
+            let step = Timed::start(report, "handoff", "asking orchestrator for handoff");
+            std::thread::sleep(Duration::from_millis(200));
+            handed_off.store(true, Ordering::SeqCst);
+            step.done("asked orchestrator for handoff", None);
+        });
+
+        assert_eq!(*sessions.at_kill.lock().unwrap(), vec![true, true]);
+        let ids: Vec<String> = steps
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.state != StepState::Started)
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["jobs", "handoff", "local"], "the drain doesn't wait for the handoff");
+        drop(home);
+    }
+
+    #[test]
+    fn a_quit_logs_its_timing_as_one_line() {
+        let home = Home::new("qp-timing", &["timed"]);
+        let (steps, report) = recorder();
+        logging_timing("quit-project:timed", &report, |report| {
+            Timed::start(report, "handoff", "asking").done("asked", None);
+            Timed::start(report, "remote:devbox", "stopping").gave_up("stopped", "devbox");
+        });
+        assert_eq!(steps.lock().unwrap().len(), 4, "the steps still reach the caller's report");
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = log.lines().filter(|l| l.contains("quit-timing")).collect();
+        assert_eq!(lines.len(), 1, "{log}");
+        let line = lines[0];
+        assert!(line.contains(" daemon quit-timing reason=quit-project:timed,total="), "{line}");
+        assert!(line.contains(",handoff="), "{line}");
+        assert!(line.contains("remote:devbox=") && line.ends_with("ms:gave-up"), "{line}");
         drop(home);
     }
 }

@@ -185,11 +185,13 @@ type ApplyFn = dyn Fn(
 /// [`shelbi_orchestrator::quit`] and the daemon's shutdown.
 pub(super) trait LifecycleOps: Send + Sync {
     /// Quit one project: end its sessions, drain the quit barrier, mark closed.
-    fn quit_project(&self, project: &str);
+    ///
+    /// Each step is reported to `report` as it starts and finishes.
+    fn quit_project(&self, project: &str, report: QuitReport);
     /// Quit Shelbi: close every project and end all sessions (but do NOT stop
     /// the daemon yet — the handler acks the client first, then calls
     /// [`stop_daemon`](Self::stop_daemon)).
-    fn quit_shelbi(&self);
+    fn quit_shelbi(&self, report: QuitReport);
     /// Stop the daemon: flip the shared stop flag and wake the hub accept loop
     /// so the process drains and exits. Nothing restarts it (the projects are
     /// already closed).
@@ -197,6 +199,30 @@ pub(super) trait LifecycleOps: Send + Sync {
     /// This daemon's version, for the out-of-date check against a subscriber's
     /// announced client version.
     fn daemon_version(&self) -> String;
+}
+
+/// Where a quit reports its steps ([`shelbi_orchestrator::quit::Report`]).
+pub(super) type QuitReport<'a> = shelbi_orchestrator::quit::Report<'a>;
+
+/// A quit's step reporter for the client on `tx`: each step goes to it as a
+/// [`ServerMsg::Progress`], but only when the client announced this daemon's
+/// own version. That's the one client sure to read the message; any other sees
+/// the quit's `Done` alone, as before, so this needs no protocol bump.
+fn progress_to(
+    tx: &Outbox,
+    request_id: u64,
+    client_version: &Option<String>,
+    state: &ControlState,
+) -> impl Fn(shelbi_proto::control::Step) + Sync {
+    let tx = std::sync::Mutex::new(
+        (client_version.as_deref() == Some(state.inner.lifecycle.daemon_version().as_str()))
+            .then(|| tx.0.clone()),
+    );
+    move |step| {
+        if let Some(tx) = tx.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            let _ = tx.send(Outgoing::Msg(ServerMsg::Progress { request_id, step }));
+        }
+    }
 }
 
 /// The production [`LifecycleOps`]: real quit composition + daemon shutdown.
@@ -211,12 +237,12 @@ pub(super) struct DaemonLifecycle {
 }
 
 impl LifecycleOps for DaemonLifecycle {
-    fn quit_project(&self, project: &str) {
-        let _ = shelbi_orchestrator::quit::quit_project(project);
+    fn quit_project(&self, project: &str, report: QuitReport) {
+        let _ = shelbi_orchestrator::quit::quit_project(project, report);
     }
 
-    fn quit_shelbi(&self) {
-        let _ = shelbi_orchestrator::quit::quit_shelbi();
+    fn quit_shelbi(&self, report: QuitReport) {
+        let _ = shelbi_orchestrator::quit::quit_shelbi(report);
     }
 
     fn stop_daemon(&self) {
@@ -240,8 +266,8 @@ struct InertLifecycle;
 
 #[cfg(test)]
 impl LifecycleOps for InertLifecycle {
-    fn quit_project(&self, _project: &str) {}
-    fn quit_shelbi(&self) {}
+    fn quit_project(&self, _project: &str, _report: QuitReport) {}
+    fn quit_shelbi(&self, _report: QuitReport) {}
     fn stop_daemon(&self) {}
     fn daemon_version(&self) -> String {
         CLIENT_VERSION.to_string()
@@ -600,7 +626,8 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 // shutdown too (a quit is how a user gets out, and its client
                 // doesn't retry), counted so the daemon doesn't exit mid-quit.
                 let job = state.inner.jobs.track(format!("quit:{project}"));
-                state.inner.lifecycle.quit_project(&project);
+                let report = progress_to(&tx, request_id, &client_version, &state);
+                state.inner.lifecycle.quit_project(&project, &report);
                 let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
                 tx.release_after_flush(job);
             }
@@ -609,7 +636,8 @@ fn handle_client(stream: UnixStream, state: ControlState) {
                 // stop the daemon — acking before the stop so the reply isn't
                 // lost to the shutdown race. Counted like a project quit.
                 let job = state.inner.jobs.track("quit-shelbi".to_string());
-                state.inner.lifecycle.quit_shelbi();
+                let report = progress_to(&tx, request_id, &client_version, &state);
+                state.inner.lifecycle.quit_shelbi(&report);
                 let _ = tx.send(ServerMsg::Done { request_id, state: None, id: None });
                 tx.release_after_flush(job);
                 state.inner.lifecycle.stop_daemon();
@@ -1635,11 +1663,13 @@ mod tests {
     }
 
     impl LifecycleOps for RecordingLifecycle {
-        fn quit_project(&self, project: &str) {
+        fn quit_project(&self, project: &str, report: QuitReport) {
             self.calls.lock().unwrap().push(format!("quit_project:{project}"));
+            report_test_step(report);
         }
-        fn quit_shelbi(&self) {
+        fn quit_shelbi(&self, report: QuitReport) {
             self.calls.lock().unwrap().push("quit_shelbi".into());
+            report_test_step(report);
         }
         fn stop_daemon(&self) {
             self.calls.lock().unwrap().push("stop_daemon".into());
@@ -1688,6 +1718,64 @@ mod tests {
             "quit_shelbi then stop_daemon, in that order: {:?}",
             life.calls()
         );
+    }
+
+    /// What the recording lifecycle reports for every quit: one step, started
+    /// and finished.
+    fn report_test_step(report: QuitReport) {
+        use shelbi_proto::control::{Step, StepState};
+        let step = |state| Step {
+            id: "handoff".into(),
+            label: "asked orchestrator for handoff".into(),
+            state,
+        };
+        report(step(StepState::Started));
+        report(step(StepState::Done {
+            elapsed_ms: 1100,
+            note: None,
+        }));
+    }
+
+    #[test]
+    fn a_quit_streams_its_steps_to_a_client_of_the_same_version() {
+        let life = RecordingLifecycle::new("v1");
+        let served = serve_lifecycle(life, "qp-progress");
+        let mut client = ControlClient::connect(&served.sock, "v1").unwrap();
+        let mut seen = Vec::new();
+        client
+            .quit_project_with_progress("alpha", &mut |step| seen.push(step.state.clone()))
+            .unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                shelbi_proto::control::StepState::Started,
+                shelbi_proto::control::StepState::Done {
+                    elapsed_ms: 1100,
+                    note: None
+                },
+            ],
+            "both of the step's reports arrive before the ack",
+        );
+
+        let mut client = ControlClient::connect(&served.sock, "v1").unwrap();
+        let mut steps = 0;
+        client.quit_shelbi_with_progress(&mut |_| steps += 1).unwrap();
+        assert_eq!(steps, 2, "Quit Shelbi reports its steps too");
+    }
+
+    #[test]
+    fn a_quit_sends_no_steps_to_a_client_of_another_version() {
+        // A client of another build may not know the Progress message at all;
+        // it gets the ack alone, exactly as before steps existed.
+        let life = RecordingLifecycle::new("daemon-NEW");
+        let served = serve_lifecycle(life.clone(), "qp-progress-old");
+        let mut client = ControlClient::connect(&served.sock, "client-OLD").unwrap();
+        let mut steps = 0;
+        client
+            .quit_project_with_progress("alpha", &mut |_| steps += 1)
+            .unwrap();
+        assert_eq!(steps, 0);
+        assert_eq!(life.calls(), vec!["quit_project:alpha".to_string()]);
     }
 
     #[test]

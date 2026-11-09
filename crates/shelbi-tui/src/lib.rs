@@ -22,6 +22,8 @@ mod modal_form;
 pub mod overlay;
 mod panel;
 mod picker;
+pub mod progress;
+pub mod quit_progress;
 mod review_panel;
 mod shell;
 mod sidebar;
@@ -180,7 +182,7 @@ pub fn run_main(project_name: &str) -> Result<()> {
     // What runs here, before the shell takes the screen, is timed per step to
     // `tui.log` and, on a terminal, drawn as live progress lines once a step
     // outlasts a blink (`cli-startup-speed`). A quick open prints nothing.
-    let progress = startup::Progress::stderr();
+    let progress = startup::progress();
 
     // Cutover gate (`rt-cutover-migration`): refuse to open a project whose
     // legacy `shelbi-<p>` / `_shelbi-<p>` tmux session is still running from the
@@ -234,7 +236,7 @@ pub fn run_main(project_name: &str) -> Result<()> {
 /// hasn't answered by then finishes in the background and records its own
 /// outcome, so an unreachable machine no longer holds the open for 10 s per
 /// workspace (`cli-startup-speed`).
-fn run_open_migration_pass(project_name: &str, progress: &startup::Progress) {
+fn run_open_migration_pass(project_name: &str, progress: &crate::progress::Progress) {
     use shelbi_orchestrator::migration::{MigrationPass, RealMigrationProbe, FOREGROUND_BUDGET};
     use std::io::{IsTerminal, Write};
 
@@ -255,7 +257,7 @@ fn run_open_migration_pass(project_name: &str, progress: &startup::Progress) {
     // Only the machines the pass will actually wait on get a step: one that
     // was down last time is probed in the background from the start.
     let machines: Vec<String> = pass.waits_for().to_vec();
-    let finish = |step: &startup::StepHandle<'_>| {
+    let finish = |step: &crate::progress::StepHandle<'_>| {
         // Consent prompt for a surviving remote session. A non-interactive stdin
         // declines (leaves the workspace pending) rather than killing silently.
         let mut consent = |kill: &shelbi_orchestrator::migration::MigrationKill<'_>| -> bool {
@@ -294,7 +296,7 @@ fn run_open_migration_pass(project_name: &str, progress: &startup::Progress) {
         report
     };
     let report = if machines.is_empty() {
-        startup::Progress::disabled().step("machines", finish)
+        startup::silent().step("machines", finish)
     } else {
         progress.step(&format!("machines ({})", machines.join(", ")), finish)
     };
