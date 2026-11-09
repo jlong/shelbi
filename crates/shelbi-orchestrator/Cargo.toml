@@ -36,7 +36,6 @@ tracing = { workspace = true }
 signal-hook = "0.3"
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
-globset = "0.4"
 tungstenite = { workspace = true }
 libc = { workspace = true }
 
