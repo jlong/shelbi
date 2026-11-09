@@ -1449,8 +1449,19 @@ impl IssueStore for GitHubStore {
         // contiguous 0..N — the same client-side ordering the read path sorts
         // by and the filesystem backend maintains on disk.
         let mut column = self.list_in_status(&target.task.column)?;
-        let Some(idx) = column.iter().position(|tf| tf.task.id == id) else {
-            return Err(Error::Other(format!("issue `{id}` not in its own status?")));
+        // The REST list is eventually consistent, but `get` reads the issue by
+        // number. Right after a create (`issue add --top`, the New task dialog's
+        // "Top of queue") the list can still lack the new issue, so splice the
+        // fresh copy in at its priority slot rather than refusing the reorder.
+        let idx = match column.iter().position(|tf| tf.task.id == id) {
+            Some(idx) => idx,
+            None => {
+                let key = |tf: &IssueFile| (tf.task.priority, tf.task.id.clone());
+                let target_key = key(&target);
+                let at = column.partition_point(|tf| key(tf) < target_key);
+                column.insert(at, target);
+                at
+            }
         };
         let last = column.len().saturating_sub(1);
         let dest = match pos {
@@ -8764,6 +8775,73 @@ mod tests {
         let calls = calls.lock().unwrap();
         // c (issue 3) → priority 0, a (issue 1) → 1, b (issue 2) → 2.
         assert!(call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/3", "priority: 0"]).is_some());
+        assert!(call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/1", "priority: 1"]).is_some());
+        assert!(call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/2", "priority: 2"]).is_some());
+    }
+
+    /// `issue add --top` reorders right after the create, while GitHub's REST
+    /// list can still lack the new issue (it is eventually consistent; the
+    /// by-number `get` is not). The reorder must splice the fresh copy in and
+    /// land it at slot 0, not fail with "not in its own status?".
+    #[test]
+    fn set_priority_top_reaches_an_issue_the_list_does_not_show_yet() {
+        let _home = HomeGuard::new("set-priority-lagging-list");
+        // `a`(0) `b`(1) are listed; `d`(2) was just created and resolves by
+        // number, but the list doesn't carry it yet.
+        let table = [("a", 1, 0), ("b", 2, 1), ("d", 4, 2)];
+        let rest_line = |id: &str, num: i64, prio: i64| {
+            format!(
+                r#"{{"number":{num},"title":"{id}","body":"<!-- shelbi:begin -->\n```yaml\npriority: {prio}\n```\n<!-- shelbi:end -->","state":"open","labels":[{{"name":"shelbi:id/{id}"}},{{"name":"shelbi:status/todo"}}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}}"#
+            )
+        };
+        let list = format!("{}\n{}", rest_line("a", 1, 0), rest_line("b", 2, 1));
+        let calls: Calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let rec = calls.clone();
+        let store = GitHubStore::with_runner("owner/repo", move |args| {
+            rec.lock().unwrap().push(args.join(" "));
+            if args.contains(&"graphql") {
+                let joined = args.join(" ");
+                let rest = table
+                    .iter()
+                    .find(|(id, num, _)| {
+                        joined.contains(&format!("shelbi:id/{id}"))
+                            || joined.contains(&format!("number={num}"))
+                    })
+                    .map(|(id, num, prio)| rest_line(id, *num, *prio))
+                    .unwrap_or_default();
+                return Ok(rest_to_graphql(args, &rest));
+            }
+            let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+            if path.ends_with("/labels") {
+                return Ok(String::new());
+            }
+            // A single-issue read or a PATCH of `.../issues/<n>` answers that issue.
+            if let Some(num) = path
+                .strip_prefix("repos/owner/repo/issues/")
+                .and_then(|s| s.split('/').next())
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                return Ok(table
+                    .iter()
+                    .find(|(_, n, _)| *n == num)
+                    .map(|(id, n, prio)| rest_line(id, *n, *prio))
+                    .unwrap_or_default());
+            }
+            for (id, num, prio) in table {
+                if args.iter().any(|a| *a == format!("labels=shelbi:id/{id}")) {
+                    return Ok(rest_line(id, num, prio));
+                }
+            }
+            Ok(list.clone())
+        });
+
+        store
+            .set_priority("d", PrioMove::Top)
+            .expect("a lagging list must not fail the reorder");
+
+        let calls = calls.lock().unwrap();
+        // d (issue 4) → priority 0, a (issue 1) → 1, b (issue 2) → 2.
+        assert!(call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/4", "priority: 0"]).is_some());
         assert!(call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/1", "priority: 1"]).is_some());
         assert!(call_containing(&calls, &["-X PATCH", "repos/owner/repo/issues/2", "priority: 2"]).is_some());
     }

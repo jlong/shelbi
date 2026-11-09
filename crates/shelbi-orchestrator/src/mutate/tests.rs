@@ -419,6 +419,57 @@ fn apply_add_into_a_ready_status_wakes_the_orchestrator_but_backlog_stays_quiet(
 }
 
 #[test]
+fn apply_add_top_into_a_non_default_status_lands_at_slot_zero() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+
+    // Two cards already queued in `todo` (a ready status, not the default
+    // `backlog` an add lands in).
+    let mut a = task(Column::todo(), "a");
+    a.priority = 0;
+    let mut b = task(Column::todo(), "b");
+    b.priority = 1;
+    shelbi_state::save_task("p", &a, "body").unwrap();
+    shelbi_state::save_task("p", &b, "body").unwrap();
+
+    let mut sink = RecordingSink::default();
+    apply(
+        "p",
+        "",
+        &MutationKind::Add(Box::new(AddSpec {
+            title: "Show a toast".into(),
+            id: Some("editor-launch-toast".into()),
+            status: "todo".into(),
+            body: Some("body".into()),
+            depends_on: vec![],
+            prefers_machine: None,
+            workflow: None,
+            branch: None,
+            top: true,
+        })),
+        &mut sink,
+        &mut no_recheck(),
+    )
+    .expect("add --status todo --top succeeds");
+
+    let order: Vec<String> = shelbi_state::list_column("p", Column::todo())
+        .unwrap()
+        .into_iter()
+        .map(|tf| tf.task.id)
+        .collect();
+    assert_eq!(order, ["editor-launch-toast", "a", "b"], "--top lands at slot 0");
+    assert!(
+        sink.lines.iter().any(|(_, l)| l.contains("top of the queue")),
+        "reports the top placement: {:?}",
+        sink.lines
+    );
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
 fn null_and_recording_sinks_route_streams() {
     let mut rec = RecordingSink::default();
     rec.out("hello");
