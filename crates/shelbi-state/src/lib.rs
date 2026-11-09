@@ -148,7 +148,8 @@ pub use agent_workspaces::{
     agent_divergence, agent_instructions_path, agent_manifest_path, agent_settings_path,
     agent_shared_preamble_path, scaffold_shared_preamble, SharedPreambleOutcome,
     DEFAULT_SHARED_PREAMBLE, HUB_SAFETY_MARKERS,
-    agent_skills_dir, agent_workspace_dir, classify_agent_divergence, compose_agent_prompt,
+    agent_skills_dir, agent_workspace_dir, bundled_agent_manifest_yaml, classify_agent_divergence,
+    compose_agent_prompt,
     content_hash, count_agent_skills, default_agent_body, default_agent_settings, is_default_agent,
     legacy_claude_md_path, list_agents, load_agent_manifest, load_agent_settings,
     load_shared_preamble,
@@ -1413,7 +1414,7 @@ fn warn_project_name_is_now_a_label(stem: &str, yaml: &str) {
         name: Option<String>,
         display_name: Option<String>,
     }
-    let Ok(head) = serde_yaml::from_str::<Head>(yaml) else {
+    let Ok(head) = yaml_serde::from_str::<Head>(yaml) else {
         return;
     };
     let has_display_name = head
@@ -1535,19 +1536,19 @@ fn warn_legacy_workers_key(project: &str, yaml: &str) {
 pub fn save_project(p: &Project) -> Result<()> {
     ensure_dir(&projects_dir()?)?;
     let path = projects_dir()?.join(format!("{}.yaml", p.name));
-    atomic_write(&path, serde_yaml::to_string(p)?.as_bytes())
+    atomic_write(&path, yaml_serde::to_string(p)?.as_bytes())
 }
 
 pub fn load_session(name: &str) -> Result<Session> {
     let p = sessions_dir()?.join(format!("{name}.yaml"));
     let text = read_to_string_at(&p)?;
-    Ok(serde_yaml::from_str(&text)?)
+    Ok(yaml_serde::from_str(&text)?)
 }
 
 pub fn save_session(s: &Session) -> Result<()> {
     ensure_dir(&sessions_dir()?)?;
     let path = sessions_dir()?.join(format!("{}.yaml", s.name));
-    atomic_write(&path, serde_yaml::to_string(s)?.as_bytes())
+    atomic_write(&path, yaml_serde::to_string(s)?.as_bytes())
 }
 
 // ---------------------------------------------------------------------------
@@ -2899,7 +2900,7 @@ pub fn save_agent(project: &str, agent: &Agent, body_md: &str) -> Result<()> {
 /// persists. Factored out so display paths can produce the on-disk
 /// representation without touching the filesystem (see [`render_task_file`]).
 fn render_frontmatter<T: serde::Serialize>(front: &T, body: &str) -> Result<String> {
-    let yaml = serde_yaml::to_string(front)?;
+    let yaml = yaml_serde::to_string(front)?;
     let mut buf = String::with_capacity(yaml.len() + body.len() + 32);
     buf.push_str("---\n");
     buf.push_str(&yaml);
@@ -2944,7 +2945,7 @@ pub fn load_agent(project: &str, id: &str) -> Result<AgentFile> {
 pub fn parse_agent_file(text: &str) -> Result<AgentFile> {
     let (front, body) = split_frontmatter(text)
         .ok_or_else(|| shelbi_core::Error::Other("missing frontmatter".into()))?;
-    let agent: Agent = serde_yaml::from_str(front)?;
+    let agent: Agent = yaml_serde::from_str(front)?;
     Ok(AgentFile {
         agent,
         body: body.to_string(),
@@ -3159,7 +3160,7 @@ pub fn load_task(project: &str, id: &str) -> Result<IssueFile> {
 pub fn parse_task_file(text: &str) -> Result<IssueFile> {
     let (front, body) = split_frontmatter(text)
         .ok_or_else(|| shelbi_core::Error::Other("missing frontmatter".into()))?;
-    let task: Issue = serde_yaml::from_str(front)?;
+    let task: Issue = yaml_serde::from_str(front)?;
     Ok(IssueFile {
         task,
         body: body.to_string(),
@@ -3269,7 +3270,7 @@ pub fn list_tasks(project: &str) -> Result<Vec<IssueFile>> {
                 // hold a misspelled optional field or a non-string extra that
                 // silently did nothing. Surface those by name — never drop the
                 // card (that would undo the forward-compat tolerance the raw
-                // `serde_yaml::Value` params were built for). Deduped through
+                // `yaml_serde::Value` params were built for). Deduped through
                 // the same per-file cache so a refresh loop doesn't re-flood.
                 let diags = tf.task.validate_params();
                 if diags.is_empty() {
@@ -7375,7 +7376,7 @@ mod tests {
         // the loader's own guard.
         std::fs::create_dir_all(home.join("projects")).unwrap();
         let p = fixture_project("shaft", None);
-        let yaml = serde_yaml::to_string(&p).unwrap();
+        let yaml = yaml_serde::to_string(&p).unwrap();
         std::fs::write(home.join("projects/Shaft.yaml"), yaml).unwrap();
 
         let err = load_project("Shaft").unwrap_err();

@@ -718,10 +718,10 @@ fn entry(
 }
 
 fn yaml_repo(text: &str) -> Option<String> {
-    let value: serde_yaml::Value = serde_yaml::from_str(text).ok()?;
+    let value: yaml_serde::Value = yaml_serde::from_str(text).ok()?;
     value
         .as_mapping()?
-        .get(serde_yaml::Value::String("repo".into()))?
+        .get(yaml_serde::Value::String("repo".into()))?
         .as_str()
         .map(str::to_string)
 }
@@ -1165,7 +1165,7 @@ fn lint_typed_yaml<T: DeserializeOwned>(
     out: &mut Vec<Diagnostic>,
 ) {
     lint_unknown_yaml::<T>(entry, text, out);
-    if let Err(e) = serde_yaml::from_str::<T>(text) {
+    if let Err(e) = yaml_serde::from_str::<T>(text) {
         push_yaml_error(entry, "CONFIG_YAML_SYNTAX", &e, out);
     }
 }
@@ -1175,7 +1175,7 @@ fn lint_unknown_yaml<T: DeserializeOwned>(
     text: &str,
     out: &mut Vec<Diagnostic>,
 ) {
-    let deserializer = serde_yaml::Deserializer::from_str(text);
+    let deserializer = yaml_serde::Deserializer::from_str(text);
     let mut unknown = Vec::new();
     let result: std::result::Result<T, _> =
         serde_ignored::deserialize(deserializer, |path| unknown.push(path.to_string()));
@@ -1204,7 +1204,7 @@ fn lint_split_unknown(
     allowed: &[&str],
     out: &mut Vec<Diagnostic>,
 ) {
-    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<yaml_serde::Value>(text) else {
         return;
     };
     let Some(mapping) = value.as_mapping() else {
@@ -1232,8 +1232,8 @@ fn lint_split_nested_unknown(
     out: &mut Vec<Diagnostic>,
 ) {
     let (Ok(shared_value), Ok(local_value)) = (
-        serde_yaml::from_str::<serde_yaml::Value>(shared),
-        serde_yaml::from_str::<serde_yaml::Value>(local),
+        yaml_serde::from_str::<yaml_serde::Value>(shared),
+        yaml_serde::from_str::<yaml_serde::Value>(local),
     ) else {
         return;
     };
@@ -1247,10 +1247,10 @@ fn lint_split_nested_unknown(
             merged.insert(key.clone(), value.clone());
         }
     }
-    let Ok(text) = serde_yaml::to_string(&serde_yaml::Value::Mapping(merged)) else {
+    let Ok(text) = yaml_serde::to_string(&yaml_serde::Value::Mapping(merged)) else {
         return;
     };
-    let deserializer = serde_yaml::Deserializer::from_str(&text);
+    let deserializer = yaml_serde::Deserializer::from_str(&text);
     let mut unknown = Vec::new();
     let result: std::result::Result<Project, _> =
         serde_ignored::deserialize(deserializer, |path| unknown.push(path.to_string()));
@@ -1294,7 +1294,7 @@ fn lint_keybindings(
     projects: &[&str],
     out: &mut Vec<Diagnostic>,
 ) {
-    let value: serde_yaml::Value = match serde_yaml::from_str(text) {
+    let value: yaml_serde::Value = match yaml_serde::from_str(text) {
         Ok(value) => value,
         Err(e) => {
             push_yaml_error(entry, "KEYBINDINGS_YAML_SYNTAX", &e, out);
@@ -1487,7 +1487,7 @@ pub(crate) fn locate_key(text: &str, key: &str) -> Location {
 fn push_yaml_error(
     entry: &InventoryEntry,
     code: &str,
-    error: &serde_yaml::Error,
+    error: &yaml_serde::Error,
     out: &mut Vec<Diagnostic>,
 ) {
     let location = error

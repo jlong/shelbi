@@ -1,0 +1,3 @@
+name: adversarial
+description: Adversarial code review before a human sees the branch
+preferred_runner: claude

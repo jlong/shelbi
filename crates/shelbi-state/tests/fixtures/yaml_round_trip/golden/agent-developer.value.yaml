@@ -1,0 +1,9 @@
+name: developer
+description: Implements a dispatched task on its own branch
+preferred_runner: claude
+runners:
+  claude:
+    model: claude-opus-5-5
+    reasoning_effort: high
+  codex:
+    model: gpt-5

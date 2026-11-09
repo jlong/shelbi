@@ -194,7 +194,7 @@ pub fn read_in_repo_name(path: &Path) -> Option<String> {
         name: Option<String>,
     }
     let text = std::fs::read_to_string(path).ok()?;
-    let head: Head = serde_yaml::from_str(&text).ok()?;
+    let head: Head = yaml_serde::from_str(&text).ok()?;
     head.name.map(|n| n.trim().to_string()).filter(|n| !n.is_empty())
 }
 

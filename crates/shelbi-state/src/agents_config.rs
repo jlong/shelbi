@@ -109,7 +109,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde_yaml::Value;
+use yaml_serde::Value;
 use shelbi_core::{
     AgentManifest, ProjectStatuses, ReasoningEffort, RunnerKind, RunnerManifestConfig,
     StatusCategory,
@@ -668,7 +668,7 @@ impl AgentsConfig {
 
         let project_yaml = project_text
             .as_deref()
-            .and_then(|text| serde_yaml::from_str::<Value>(text).ok());
+            .and_then(|text| yaml_serde::from_str::<Value>(text).ok());
         Ok(AgentsConfig {
             project,
             agents,
@@ -1018,11 +1018,11 @@ impl AgentsConfig {
                     .to_string(),
             ));
         }
-        let mut front = serde_yaml::Mapping::new();
+        let mut front = yaml_serde::Mapping::new();
         front.insert("name".into(), name.into());
         front.insert("description".into(), description.into());
         let front =
-            serde_yaml::to_string(&front).map_err(|e| AgentError::Invalid(e.to_string()))?;
+            yaml_serde::to_string(&front).map_err(|e| AgentError::Invalid(e.to_string()))?;
         let mut text = format!("---\n{front}---\n");
         if !body.trim().is_empty() {
             text.push('\n');
@@ -1378,7 +1378,7 @@ impl AgentsConfig {
             // No file: write one only once there's more than the name the
             // loader would synthesize.
             _ if agent.manifest == synthesized_manifest(&agent.name) && loaded.is_some() => None,
-            _ => Some(serde_yaml::to_string(&agent.manifest).map_err(|e| file_err(&path, e))?),
+            _ => Some(yaml_serde::to_string(&agent.manifest).map_err(|e| file_err(&path, e))?),
         };
         if let Some(text) = manifest_text {
             files.insert(MANIFEST_FILE.to_string(), text.into_bytes());
@@ -1569,7 +1569,7 @@ fn patch_manifest(
     new: &AgentManifest,
     path: &Path,
 ) -> Result<yaml_edit::Patched> {
-    let to_value = |m: &AgentManifest| serde_yaml::to_value(m).map_err(|e| file_err(path, e));
+    let to_value = |m: &AgentManifest| yaml_serde::to_value(m).map_err(|e| file_err(path, e));
     let raw = yaml_edit::parse(text).map_err(|e| file_err(path, e))?;
     let target = yaml_edit::merge(&raw, &to_value(base)?, &to_value(new)?, &[]);
     yaml_edit::patch(text, &target).map_err(|e| file_err(path, e))
@@ -1586,7 +1586,7 @@ fn assignments_from(
         .unwrap_or_else(shelbi_core::default_project_statuses);
     let mut out: BTreeMap<String, Vec<Assignment>> = BTreeMap::new();
     for WorkflowFile { stem, text, .. } in workflows {
-        let Ok(value) = serde_yaml::from_str::<Value>(text) else {
+        let Ok(value) = yaml_serde::from_str::<Value>(text) else {
             continue;
         };
         let Some(items) = value.get("statuses").and_then(Value::as_sequence) else {
@@ -1633,7 +1633,7 @@ fn overrides_from(value: Option<&Value>) -> ProjectOverrides {
         return out;
     };
     fn parse<T: serde::de::DeserializeOwned>(v: Option<&Value>) -> Option<T> {
-        v.and_then(|v| serde_yaml::from_value(v.clone()).ok())
+        v.and_then(|v| yaml_serde::from_value(v.clone()).ok())
     }
     if let Some(agents) = value.get("agents").and_then(Value::as_mapping) {
         for (name, config) in agents {
@@ -1708,7 +1708,7 @@ fn skill_description(text: &str) -> Option<String> {
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"))?;
     let close = rest.find("\n---")?;
-    let value: Value = serde_yaml::from_str(&rest[..close]).ok()?;
+    let value: Value = yaml_serde::from_str(&rest[..close]).ok()?;
     Some(value.get("description")?.as_str()?.trim().to_string())
 }
 
@@ -1724,7 +1724,7 @@ fn check_skill_manifest(text: &str) -> std::result::Result<(), String> {
     let Some(close) = rest.find("\n---") else {
         return Err("has no closing `---` after its frontmatter".into());
     };
-    let value: Value = serde_yaml::from_str(&rest[..close])
+    let value: Value = yaml_serde::from_str(&rest[..close])
         .map_err(|e| format!("has frontmatter that isn't valid YAML: {e}"))?;
     match value.get("description").and_then(Value::as_str) {
         Some(d) if !d.trim().is_empty() => Ok(()),

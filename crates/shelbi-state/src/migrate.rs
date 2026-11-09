@@ -488,7 +488,7 @@ struct LocalHeader {
 }
 
 pub(crate) fn extract_repo_from_local_yaml(text: &str, path: &Path) -> Result<String> {
-    let hdr: LocalHeader = serde_yaml::from_str(text).map_err(|e| {
+    let hdr: LocalHeader = yaml_serde::from_str(text).map_err(|e| {
         Error::Other(format!(
             "failed to read `repo:` from local.yaml at {}: {e}",
             path.display()

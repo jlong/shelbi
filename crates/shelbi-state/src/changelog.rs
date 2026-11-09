@@ -470,7 +470,7 @@ pub fn matches_query(title: &str, body: &str, links: &[Link], query: &str) -> bo
 pub fn parse_entry(id: &str, path: &Path, text: &str) -> Result<ChangelogEntry> {
     let (front, body) =
         crate::split_frontmatter(text).ok_or_else(|| Error::Other("missing frontmatter".into()))?;
-    let front: Front = serde_yaml::from_str(front)?;
+    let front: Front = yaml_serde::from_str(front)?;
     let date = parse_date(&front.date, BareDate::StartOfDay)
         .ok_or_else(|| Error::Other(format!("unreadable date `{}`", front.date)))?;
     Ok(ChangelogEntry {

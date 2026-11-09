@@ -398,7 +398,7 @@ zen:
 /// the serialized [`default_workflow`] plus a header and commented optional
 /// blocks (initial_status, transitions, per-workflow git/zen).
 pub fn default_workflow_yaml() -> Result<String> {
-    let active = serde_yaml::to_string(&default_workflow())?;
+    let active = yaml_serde::to_string(&default_workflow())?;
     Ok(format!(
         "{WORKFLOW_HEADER}{active}\n{}",
         render_sections(WORKFLOW_SECTIONS)
@@ -409,7 +409,7 @@ pub fn default_workflow_yaml() -> Result<String> {
 /// serialized [`task_workflow`] (active `transitions:` + `git:` included) plus
 /// a header and the additive commented blocks that don't collide with them.
 pub fn task_workflow_yaml() -> Result<String> {
-    let active = serde_yaml::to_string(&task_workflow())?;
+    let active = yaml_serde::to_string(&task_workflow())?;
     Ok(format!(
         "{WORKFLOW_HEADER}{active}\n{}",
         render_sections(SHIPPED_WORKFLOW_SECTIONS)
@@ -421,7 +421,7 @@ pub fn task_workflow_yaml() -> Result<String> {
 /// commented blocks. Its `git.base_branch` is the templated `task/{{task}}`,
 /// resolved from the subtask's `task:` frontmatter at dispatch.
 pub fn subtask_workflow_yaml() -> Result<String> {
-    let active = serde_yaml::to_string(&subtask_workflow())?;
+    let active = yaml_serde::to_string(&subtask_workflow())?;
     Ok(format!(
         "{WORKFLOW_HEADER}{active}\n{}",
         render_sections(SHIPPED_WORKFLOW_SECTIONS)
@@ -432,7 +432,7 @@ pub fn subtask_workflow_yaml() -> Result<String> {
 /// New workflow): the docs header over the serialized workflow. No commented
 /// sections, since which of them would collide depends on what `wf` sets.
 pub fn new_workflow_yaml(wf: &crate::Workflow) -> Result<String> {
-    let active = serde_yaml::to_string(wf)?;
+    let active = yaml_serde::to_string(wf)?;
     Ok(format!("{WORKFLOW_HEADER}{active}"))
 }
 
@@ -466,7 +466,7 @@ const STATUSES_SECTIONS: &[Section] = &[Section {
 /// the serialized [`default_project_statuses`] plus a header and a commented
 /// example of adding custom statuses.
 pub fn default_statuses_yaml() -> Result<String> {
-    let active = serde_yaml::to_string(&default_project_statuses())?;
+    let active = yaml_serde::to_string(&default_project_statuses())?;
     Ok(format!(
         "{STATUSES_HEADER}{active}\n{}",
         render_sections(STATUSES_SECTIONS)
@@ -743,7 +743,7 @@ agent_runners:
         // docs pointer. shelbi-state's own test round-trips it through
         // UserConfig.
         assert!(CONFIG_YAML.contains("https://shelbi.dev/docs/configuration/global"));
-        let v: serde_yaml::Value = serde_yaml::from_str(CONFIG_YAML).expect("config.yaml parses");
+        let v: yaml_serde::Value = yaml_serde::from_str(CONFIG_YAML).expect("config.yaml parses");
         let zen = v
             .get("keymap")
             .and_then(|k| k.get("zen_toggle"))

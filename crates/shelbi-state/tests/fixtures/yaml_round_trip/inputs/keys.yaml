@@ -1,0 +1,11 @@
+defaults:
+  global:
+    zen_toggle: ctrl-z
+  palette:
+    close: [esc, ctrl-p]
+projects:
+  widget:
+    board:
+      new_task: 'n'
+      move_left: [h, '<']
+      search: '/'

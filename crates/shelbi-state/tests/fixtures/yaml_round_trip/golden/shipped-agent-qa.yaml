@@ -1,0 +1,28 @@
+## Shelbi agent manifest — full reference: https://shelbi.dev/docs/configuration/agents
+## Runner-agnostic identity + recommended runner/model for this agent (role).
+## The consuming project overrides these via its top-level `runners:` fleet
+## and per-agent `agents.<name>.runner` pins; see the reference above.
+name: qa
+description: Verifies a change against its acceptance criteria
+## Which runner KIND this agent recommends by default (claude | codex | generic).
+## A recommendation only — the project's `agents.<name>.runner` wins.
+preferred_runner: claude
+## Per-runner-kind model + reasoning effort this agent recommends. Uncomment
+## and edit to pin a model; a field the project's `runners.<kind>` block sets
+## overrides it, a field it omits falls through to here. effort: low|medium|high|max.
+# runners:
+#   claude:
+#     model: claude-opus-4-8
+#     reasoning_effort: high
+## Optional launch permission posture this agent REQUESTS. Clamped DOWN to an
+## explicit project ceiling (workspace_permissions_mode), never escalated; omit it
+## to defer to the user's own ~/.claude permissions.defaultMode. Values:
+## plan | default | acceptEdits | bypassPermissions. This is a launch MODE, not a
+## no-edit switch: to forbid edits, add a permissions.deny block on Edit/Write/
+## NotebookEdit in this agent's settings.json (which Claude enforces) instead.
+# permissions_mode: acceptEdits
+## Compatibility hints (advisory this milestone; enforced at install in a future
+## marketplace flow). runner_kinds lists the kinds this agent can run on.
+# requires:
+#   runner_kinds: [claude]
+#   shelbi: ">=0.8"

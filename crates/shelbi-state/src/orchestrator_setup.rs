@@ -35,7 +35,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
-use serde_yaml::{Mapping, Value};
+use yaml_serde::{Mapping, Value};
 use shelbi_core::{Project, RunnerKind};
 
 use crate::yaml_edit;

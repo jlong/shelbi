@@ -5221,9 +5221,9 @@ fn meta_from_new(spec: &NewIssue, priority: u32) -> ShelbiMeta {
 /// all-empty `meta` emits no block at all rather than an empty fence.
 fn build_body(prose: &str, meta: &ShelbiMeta) -> String {
     let prose = prose.trim();
-    let yaml = serde_yaml::to_string(meta).unwrap_or_default();
+    let yaml = yaml_serde::to_string(meta).unwrap_or_default();
     let yaml = yaml.trim();
-    // serde_yaml renders a struct with every field skipped as `{}`.
+    // yaml_serde renders a struct with every field skipped as `{}`.
     if yaml.is_empty() || yaml == "{}" {
         return if prose.is_empty() {
             String::new()
@@ -5285,7 +5285,7 @@ struct ShelbiMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     launch: Option<IssueLaunchConfig>,
     #[serde(flatten, default)]
-    params: BTreeMap<String, serde_yaml::Value>,
+    params: BTreeMap<String, yaml_serde::Value>,
 }
 
 /// Split an issue body into `(prose, metadata)`: the fenced shelbi block is
@@ -5492,7 +5492,7 @@ fn split_shelbi_meta_for_write(id: &str, body: &str) -> Result<(String, ShelbiMe
 /// Parse the inner YAML of a shelbi block into [`ShelbiMeta`]. [`scan_meta_block`]
 /// hands over the text already stripped of its ```` ```yaml ```` / ```` ``` ````
 /// fences, but [`strip_code_fence`] is applied defensively so a stray fence line
-/// never leaks into the YAML. Returns `Err(<serde_yaml message>)` on a parse
+/// never leaks into the YAML. Returns `Err(<yaml_serde message>)` on a parse
 /// failure so the caller can surface the reason — a write refuses, a read warns
 /// and falls back to defaults. An empty block is a clean default, not a failure.
 fn parse_meta_yaml(inner: &str) -> std::result::Result<ShelbiMeta, String> {
@@ -5500,7 +5500,7 @@ fn parse_meta_yaml(inner: &str) -> std::result::Result<ShelbiMeta, String> {
     if yaml.trim().is_empty() {
         return Ok(ShelbiMeta::default());
     }
-    serde_yaml::from_str(&yaml).map_err(|e| e.to_string())
+    yaml_serde::from_str(&yaml).map_err(|e| e.to_string())
 }
 
 /// Strip a leading ```` ```yaml ```` / ```` ``` ```` fence and its closing
@@ -7445,7 +7445,7 @@ mod tests {
                 "t",
                 IssueFields {
                     params: BTreeMap::from([
-                        ("task".to_string(), Some(serde_yaml::Value::from("parent"))),
+                        ("task".to_string(), Some(yaml_serde::Value::from("parent"))),
                         ("old".to_string(), None),
                     ]),
                     zen: Some(Some(IssueZenConfig {
@@ -7477,7 +7477,7 @@ mod tests {
                 "t",
                 IssueFields {
                     params: BTreeMap::from([
-                        ("keep".to_string(), Some(serde_yaml::Value::from("me"))),
+                        ("keep".to_string(), Some(yaml_serde::Value::from("me"))),
                         ("unset".to_string(), None),
                     ]),
                     ..Default::default()
@@ -9303,7 +9303,7 @@ mod tests {
 
     /// A minimal open `IssueFile` for a previous-board fixture.
     fn prev_issue(id: &str, column: &str, priority: u32) -> IssueFile {
-        let task: shelbi_core::Issue = serde_yaml::from_str(&format!(
+        let task: shelbi_core::Issue = yaml_serde::from_str(&format!(
             "id: {id}\ntitle: {id}\ncolumn: {column}\npriority: {priority}\n\
              created_at: 2026-01-01T00:00:00Z\nupdated_at: 2026-01-01T00:00:00Z\n"
         ))
@@ -10175,7 +10175,7 @@ mod tests {
     }
 
     fn idx_issue(id: &str, column: &str, updated: &str) -> IssueFile {
-        let task: shelbi_core::Issue = serde_yaml::from_str(&format!(
+        let task: shelbi_core::Issue = yaml_serde::from_str(&format!(
             "id: {id}\ntitle: {id}\ncolumn: {column}\npriority: 0\n\
              created_at: 2026-01-01T00:00:00Z\nupdated_at: {updated}\n"
         ))

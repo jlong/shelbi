@@ -270,7 +270,7 @@ workspaces:
     /// The project as `load_project` returns it: `name` comes from the config's
     /// file name, not its YAML, and a workflow can't load without it.
     fn project() -> Project {
-        let mut project: Project = serde_yaml::from_str(PROJECT).unwrap();
+        let mut project: Project = yaml_serde::from_str(PROJECT).unwrap();
         project.name = "occ".into();
         project
     }

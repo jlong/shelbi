@@ -1,0 +1,52 @@
+name: app
+description: Rust app track — build, test, clippy gate; squash-merge to main.
+statuses:
+- id: backlog
+  owner: user
+  agent: orchestrator
+- id: todo
+  owner: agent
+  agent: orchestrator
+- id: in-progress
+  owner: agent
+  agent: developer
+- id: review
+  owner: user
+  agent: review
+  tags:
+  - review
+- id: done
+  owner: user
+- id: canceled
+  owner: user
+initial_status: backlog
+git:
+  base_branch: main
+  branch: '{{github_user}}/{{id}}'
+  merge_strategy: squash
+transitions:
+- from: in-progress
+  to: review
+  actions:
+  - push_branch
+  - open_pr
+  run:
+  - '[ -d target ] && [ "$(du -sk target | cut -f1)" -gt 20971520 ] && rm -rf target; true'
+- from: review
+  to: done
+  actions:
+  - merge
+  - delete_branch
+- from: in-progress
+  to: canceled
+  actions:
+  - close_pr
+  - delete_branch
+- from: review
+  to: canceled
+  actions:
+  - close_pr
+  - delete_branch
+zen:
+  checks:
+    local: []

@@ -1,0 +1,26 @@
+repo: git@github.com:someone/widget.git
+machines:
+- name: hub
+  kind: local
+  work_dir: /Users/someone/Workspaces/widget
+- name: devbox
+  kind: ssh
+  work_dir: /home/someone/Workspaces/widget
+  host: devbox
+  tags:
+  - linux
+editor: null
+workspaces:
+- name: alpha
+  machine: hub
+- name: bravo
+  machine: hub
+- name: delta
+  machine: devbox
+  tags:
+  - linux
+- name: review
+  machine: hub
+  tags:
+  - review
+  slot: 4310

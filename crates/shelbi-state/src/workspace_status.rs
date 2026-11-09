@@ -315,7 +315,7 @@ pub fn save_workspace_status(project: &str, status: &WorkspaceStatus) -> Result<
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
-    let yaml = serde_yaml::to_string(status)?;
+    let yaml = yaml_serde::to_string(status)?;
     atomic_write(&path, yaml.as_bytes())
 }
 
@@ -325,7 +325,7 @@ pub fn load_workspace_status(project: &str, workspace: &str) -> Result<Option<Wo
         return Ok(None);
     }
     let text = crate::read_to_string_at(&path)?;
-    Ok(Some(serde_yaml::from_str(&text)?))
+    Ok(Some(yaml_serde::from_str(&text)?))
 }
 
 /// Remove a workspace's `status.yaml`, if any. Called when a slot's agent pane
@@ -509,7 +509,7 @@ mod tests {
 
     #[test]
     fn workspace_state_serializes_snake_case() {
-        let s = serde_yaml::to_string(&WorkspaceState::AwaitingInput).unwrap();
+        let s = yaml_serde::to_string(&WorkspaceState::AwaitingInput).unwrap();
         assert!(s.trim().ends_with("awaiting_input"), "got {s:?}");
     }
 

@@ -46,7 +46,7 @@ pub struct ProjectStatus {
 impl ProjectStatuses {
     /// Parse YAML and validate in one step.
     pub fn from_yaml_str(s: &str) -> crate::Result<Self> {
-        let ps: ProjectStatuses = serde_yaml::from_str(s)?;
+        let ps: ProjectStatuses = yaml_serde::from_str(s)?;
         ps.validate()?;
         Ok(ps)
     }
@@ -259,7 +259,7 @@ statuses:
     #[test]
     fn round_trips_through_yaml() {
         let ps = default_project_statuses();
-        let y = serde_yaml::to_string(&ps).unwrap();
+        let y = yaml_serde::to_string(&ps).unwrap();
         let back = ProjectStatuses::from_yaml_str(&y).unwrap();
         assert_eq!(ps, back);
     }

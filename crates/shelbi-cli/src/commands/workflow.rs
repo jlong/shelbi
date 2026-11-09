@@ -153,7 +153,7 @@ fn write_starter(path: &Path, name: &str) -> Result<()> {
         wf.description = None;
     }
     let yaml =
-        serde_yaml::to_string(&wf).map_err(|e| anyhow!("serializing starter workflow: {e}"))?;
+        yaml_serde::to_string(&wf).map_err(|e| anyhow!("serializing starter workflow: {e}"))?;
     fs::write(path, yaml).map_err(|e| anyhow!("writing {}: {e}", path.display()))?;
     Ok(())
 }

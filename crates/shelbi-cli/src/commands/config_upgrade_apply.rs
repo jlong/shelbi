@@ -15,7 +15,7 @@
 //!   rewritten here (slice 3 routes them to the orchestrator).
 //! * **Non-lossy.** A healer only touches the specific deprecated construct.
 //!   For the project-registration YAML the rewrite is a structural
-//!   `serde_yaml::Value` mutation that preserves every *other* key (including
+//!   `yaml_serde::Value` mutation that preserves every *other* key (including
 //!   unknown / needs-judgment keys); Shelbi already round-trips those files
 //!   through `save_project`, so the normalization is consistent with existing
 //!   behavior. For the comment-bearing scaffolded surfaces (`statuses.yaml`,
@@ -42,7 +42,7 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 
-use serde_yaml::{Mapping, Value};
+use yaml_serde::{Mapping, Value};
 use shelbi_core::StatusCategory;
 
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
@@ -365,7 +365,7 @@ fn heal_registration(entry: &InventoryEntry, codes: &BTreeSet<&str>, applied: &m
 /// Heal a `ZEN_CARGO_TEST_NO_FAIL_FAST` finding: add `--no-fail-fast` to every
 /// fail-fast `cargo test` command in the surface's `zen.checks.local` list.
 ///
-/// A surgical, line-oriented rewrite (not a `serde_yaml` round-trip) so authored
+/// A surgical, line-oriented rewrite (not a `yaml_serde` round-trip) so authored
 /// comments survive — and so it heals the project-registration YAML and a
 /// per-workflow YAML with one code path. We re-parse to confirm which commands
 /// genuinely live under `zen.checks.local`, then rewrite only the raw lines
@@ -377,7 +377,7 @@ fn heal_zen_cargo_test_fail_fast(entry: &InventoryEntry, applied: &mut Vec<Appli
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
-    let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+    let Ok(value) = yaml_serde::from_str::<Value>(&text) else {
         return;
     };
     // The exact command strings that need rewriting, taken from the surface's
@@ -473,7 +473,7 @@ fn rewrite_cargo_test_line(line: &str, targets: &[String]) -> Option<String> {
 /// returning the re-serialized text and the per-code change details. Returns
 /// `None` if the file doesn't parse or nothing changed.
 fn rewrite_registration(text: &str, codes: &BTreeSet<&str>) -> Option<(String, Vec<(&'static str, String)>)> {
-    let mut value: Value = serde_yaml::from_str(text).ok()?;
+    let mut value: Value = yaml_serde::from_str(text).ok()?;
     let map = value.as_mapping_mut()?;
     let mut changes: Vec<(&'static str, String)> = Vec::new();
 
@@ -588,7 +588,7 @@ fn rewrite_registration(text: &str, codes: &BTreeSet<&str>) -> Option<(String, V
     if changes.is_empty() {
         return None;
     }
-    let out = serde_yaml::to_string(&value).ok()?;
+    let out = yaml_serde::to_string(&value).ok()?;
     Some((out, changes))
 }
 
@@ -658,7 +658,7 @@ fn heal_statuses(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
     let Ok(text) = fs::read_to_string(path) else {
         return;
     };
-    let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+    let Ok(value) = yaml_serde::from_str::<Value>(&text) else {
         return;
     };
     let Some(seq) = get(&value, "statuses").and_then(Value::as_sequence) else {
@@ -868,7 +868,7 @@ fn insert_bare_owner_agents(
 /// `shelbi_core::workflow`'s `resolve_owner_agent`). A category with no default
 /// is skipped (left reported) rather than guessed.
 fn bare_owner_targets(text: &str, categories: &HashMap<String, StatusCategory>) -> Vec<(String, &'static str)> {
-    let Ok(value) = serde_yaml::from_str::<Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<Value>(text) else {
         return Vec::new();
     };
     let Some(seq) = get(&value, "statuses").and_then(Value::as_sequence) else {
@@ -1369,7 +1369,7 @@ zen:
             "ZEN_DANGER_PATHS_BARE_SEQ",
         ]);
         let (out, changes) = rewrite_registration(legacy, &codes).expect("rewrite");
-        let value: Value = serde_yaml::from_str(&out).unwrap();
+        let value: Value = yaml_serde::from_str(&out).unwrap();
         let map = value.as_mapping().unwrap();
 
         // display_name -> name (the label wins).
@@ -1517,7 +1517,7 @@ workspaces:
         assert!(applied.iter().any(|c| c.code == "WORKSPACE_RUNNER_REMOVED"));
 
         // Disk is healed: workspace runner gone, orchestrator runner kept.
-        let healed: Value = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let healed: Value = yaml_serde::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let hm = healed.as_mapping().unwrap();
         assert!(!hm.contains_key(vs("display_name")));
         assert_eq!(
@@ -1591,7 +1591,7 @@ zen:
             "build check / comment not preserved: {healed}"
         );
         // ...and the rest of the file still parses with ci_timeout intact.
-        let v: Value = serde_yaml::from_str(&healed).unwrap();
+        let v: Value = yaml_serde::from_str(&healed).unwrap();
         assert_eq!(
             get(&v, "zen")
                 .and_then(|z| get(z, "ci_timeout"))
@@ -2303,7 +2303,7 @@ zen:
 
         // danger_paths is now a single `extend:` = union of both lists; the
         // `override:` is gone. The unknown key is untouched.
-        let healed: Value = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let healed: Value = yaml_serde::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let dp = get(get(&healed, "zen").unwrap(), "danger_paths").unwrap();
         let dpm = dp.as_mapping().unwrap();
         assert!(!dpm.contains_key(vs("override")), "override not dropped");

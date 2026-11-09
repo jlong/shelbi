@@ -258,7 +258,7 @@ pub enum TerminalScrollbar {
 /// macOS's own names `automatic` and `when-scrolling`); anything else is
 /// ignored rather than failing the whole file.
 fn lenient_scrollbar<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<TerminalScrollbar>, D::Error> {
-    let value = serde_yaml::Value::deserialize(d)?;
+    let value = yaml_serde::Value::deserialize(d)?;
     let Some(text) = value.as_str() else {
         return Ok(None);
     };
@@ -313,7 +313,7 @@ impl AppIcon {
 /// case, `_` for `-`);
 /// anything else is ignored rather than failing the whole file.
 fn lenient_app_icon<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<AppIcon>, D::Error> {
-    let value = serde_yaml::Value::deserialize(d)?;
+    let value = yaml_serde::Value::deserialize(d)?;
     let Some(text) = value.as_str() else {
         return Ok(None);
     };
@@ -330,7 +330,7 @@ fn lenient_app_icon<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Resu
 /// to 1 read as one (`0.85` is 85). Out of range saturates; anything that isn't a number is
 /// ignored rather than failing the whole file.
 fn lenient_percent<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u8>, D::Error> {
-    let value = serde_yaml::Value::deserialize(d)?;
+    let value = yaml_serde::Value::deserialize(d)?;
     Ok(value.as_f64().map(|v| {
         let v = if v > 0.0 && v <= 1.0 && value.is_f64() { v * 100.0 } else { v };
         v.round().clamp(0.0, u8::MAX as f64) as u8
@@ -340,7 +340,7 @@ fn lenient_percent<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Resul
 /// `window_blur`: a number of points; out of range saturates, and anything
 /// that isn't a number is ignored.
 fn lenient_amount<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u8>, D::Error> {
-    let value = serde_yaml::Value::deserialize(d)?;
+    let value = yaml_serde::Value::deserialize(d)?;
     Ok(value.as_f64().map(|v| v.round().clamp(0.0, u8::MAX as f64) as u8))
 }
 
@@ -614,7 +614,7 @@ impl UserConfig {
     /// [`UserConfig::default`] stays what an existing file's missing keys
     /// mean.
     pub fn new_install() -> UserConfig {
-        serde_yaml::from_str(shelbi_core::scaffold::CONFIG_YAML).expect("the config.yaml scaffold reads")
+        yaml_serde::from_str(shelbi_core::scaffold::CONFIG_YAML).expect("the config.yaml scaffold reads")
     }
 }
 
@@ -627,7 +627,7 @@ pub fn load_user_config() -> Result<UserConfig> {
         return Ok(UserConfig::new_install());
     }
     let text = fs::read_to_string(&path)?;
-    Ok(serde_yaml::from_str(&text)?)
+    Ok(yaml_serde::from_str(&text)?)
 }
 
 /// Fallback editor when neither the config nor `$EDITOR` names one.
@@ -729,7 +729,7 @@ pub fn editor_display_name(command: &str) -> String {
 pub fn save_user_config(cfg: &UserConfig) -> Result<()> {
     ensure_dir(&shelbi_home()?)?;
     let path = user_config_path()?;
-    atomic_write(&path, serde_yaml::to_string(cfg)?.as_bytes())
+    atomic_write(&path, yaml_serde::to_string(cfg)?.as_bytes())
 }
 
 /// Load the user config, apply `edit`, and write back only what the edit
@@ -762,7 +762,7 @@ pub fn update_user_config(edit: impl FnOnce(&mut UserConfig)) -> Result<UserConf
     if !raw.is_mapping() {
         return Err(unreadable(&"isn't a mapping of settings"));
     }
-    let before: UserConfig = serde_yaml::from_value(raw.clone())?;
+    let before: UserConfig = yaml_serde::from_value(raw.clone())?;
     let mut after = before.clone();
     edit(&mut after);
     if after == before {
@@ -770,8 +770,8 @@ pub fn update_user_config(edit: impl FnOnce(&mut UserConfig)) -> Result<UserConf
     }
     let target = yaml_edit::merge(
         &raw,
-        &serde_yaml::to_value(&before)?,
-        &serde_yaml::to_value(&after)?,
+        &yaml_serde::to_value(&before)?,
+        &yaml_serde::to_value(&after)?,
         &[],
     );
     let patched = yaml_edit::patch(&text, &target).map_err(|e| unreadable(&e))?;
@@ -815,7 +815,7 @@ mod tests {
 
     #[test]
     fn desktop_settings_and_theme_round_trip() {
-        let cfg: UserConfig = serde_yaml::from_str(
+        let cfg: UserConfig = yaml_serde::from_str(
             "theme: light\ndesktop:\n  cli_path: /opt/shelbi/bin/shelbi\n  \
              terminal_font_family: Geist Mono\n  terminal_font_size: 14\n  \
              option_as_meta: left\n",
@@ -829,17 +829,17 @@ mod tests {
         assert_eq!(cfg.desktop.terminal_font_family.as_deref(), Some("Geist Mono"));
         assert_eq!(cfg.desktop.terminal_font_size, Some(14));
         assert_eq!(cfg.desktop.option_as_meta, Some(OptionAsMeta::Left));
-        let back: UserConfig = serde_yaml::from_str(&serde_yaml::to_string(&cfg).unwrap()).unwrap();
+        let back: UserConfig = yaml_serde::from_str(&yaml_serde::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back, cfg);
         // Defaults write neither key, so the CLI's own saves don't add them.
-        let text = serde_yaml::to_string(&UserConfig::default()).unwrap();
+        let text = yaml_serde::to_string(&UserConfig::default()).unwrap();
         assert!(!text.contains("desktop") && !text.contains("theme"), "{text}");
     }
 
     #[test]
     fn desktop_notification_switches_default_on_and_write_only_when_off() {
         let cfg: UserConfig =
-            serde_yaml::from_str("desktop:\n  notifications:\n    review_ready: false\n").unwrap();
+            yaml_serde::from_str("desktop:\n  notifications:\n    review_ready: false\n").unwrap();
         let n = &cfg.desktop.notifications;
         assert!(n.workspace_blocked() && n.orchestrator_waiting());
         assert!(!n.review_ready());
@@ -855,10 +855,10 @@ mod tests {
             },
             ..Default::default()
         };
-        let text = serde_yaml::to_string(&cfg).unwrap();
+        let text = yaml_serde::to_string(&cfg).unwrap();
         assert!(text.contains("workspace_blocked: false"), "{text}");
         assert!(!text.contains("review_ready"), "{text}");
-        let back: UserConfig = serde_yaml::from_str(&text).unwrap();
+        let back: UserConfig = yaml_serde::from_str(&text).unwrap();
         assert_eq!(back, cfg);
     }
 
@@ -1147,7 +1147,7 @@ mod tests {
         // config.yaml looks like — kebab-case, not Rust-style PascalCase.
         let mut cfg = UserConfig::default();
         cfg.keymap.zen_toggle = ZenToggleChord::CtrlShiftZ;
-        let yaml = serde_yaml::to_string(&cfg).unwrap();
+        let yaml = yaml_serde::to_string(&cfg).unwrap();
         assert!(yaml.contains("ctrl-shift-z"), "got: {yaml}");
     }
 
@@ -1204,21 +1204,21 @@ mod tests {
     #[test]
     fn old_and_new_tool_settings_load_and_round_trip() {
         // The old string form loads unchanged; the app form is a mapping.
-        let cfg: UserConfig = serde_yaml::from_str(
+        let cfg: UserConfig = yaml_serde::from_str(
             "editor: code --wait\ndiff_tool:\n  app: /Applications/Kaleidoscope.app\n",
         )
         .unwrap();
         assert_eq!(cfg.editor, Some(ToolChoice::from("code --wait")));
         assert_eq!(cfg.diff_tool, Some(ToolChoice::app("/Applications/Kaleidoscope.app")));
-        let back: UserConfig = serde_yaml::from_str(&serde_yaml::to_string(&cfg).unwrap()).unwrap();
+        let back: UserConfig = yaml_serde::from_str(&yaml_serde::to_string(&cfg).unwrap()).unwrap();
         assert_eq!(back, cfg);
 
-        let cfg: UserConfig = serde_yaml::from_str("editor: { app: /Applications/Zed.app }\ndiff_tool: difft\n").unwrap();
+        let cfg: UserConfig = yaml_serde::from_str("editor: { app: /Applications/Zed.app }\ndiff_tool: difft\n").unwrap();
         assert_eq!(cfg.editor, Some(ToolChoice::app("/Applications/Zed.app")));
         assert_eq!(cfg.diff_tool, Some(ToolChoice::from("difft")));
 
         // Unset is omitted on save.
-        let yaml = serde_yaml::to_string(&UserConfig::default()).unwrap();
+        let yaml = yaml_serde::to_string(&UserConfig::default()).unwrap();
         assert!(!yaml.contains("diff_tool") && !yaml.contains("editor"), "{yaml}");
     }
 
@@ -1283,18 +1283,18 @@ mod tests {
             save_user_config(&cfg).unwrap();
             assert_eq!(load_user_config().unwrap(), cfg);
         }
-        let yaml = serde_yaml::to_string(&UserConfig {
+        let yaml = yaml_serde::to_string(&UserConfig {
             theme: ThemePreference::Light,
             ..UserConfig::default()
         })
         .unwrap();
         assert!(yaml.contains("theme: light"), "got: {yaml}");
-        let yaml = serde_yaml::to_string(&UserConfig::default()).unwrap();
+        let yaml = yaml_serde::to_string(&UserConfig::default()).unwrap();
         assert!(!yaml.contains("theme"), "auto omitted: {yaml}");
 
         // An unknown value is a parse error, not a silent fallback, so
         // `shelbi config lint` reports it.
-        assert!(serde_yaml::from_str::<UserConfig>("theme: purple\n").is_err());
+        assert!(yaml_serde::from_str::<UserConfig>("theme: purple\n").is_err());
         std::env::remove_var("SHELBI_HOME");
     }
 
@@ -1312,7 +1312,7 @@ mod tests {
         assert_eq!(back.editor.as_ref().and_then(crate::ToolChoice::command), Some("hx"));
 
         // A default config omits the key entirely (lean on-disk form).
-        let yaml = serde_yaml::to_string(&UserConfig::default()).unwrap();
+        let yaml = yaml_serde::to_string(&UserConfig::default()).unwrap();
         assert!(!yaml.contains("editor"), "unset editor omitted: {yaml}");
         std::env::remove_var("SHELBI_HOME");
     }
@@ -1333,10 +1333,10 @@ mod tests {
             },
             ..UserConfig::default()
         };
-        let text = serde_yaml::to_string(&cfg).unwrap();
+        let text = yaml_serde::to_string(&cfg).unwrap();
         assert!(text.contains("red:\n      regular: '#e04f52'"), "{text}");
         assert!(!text.contains("black") && !text.contains("bold: null"), "{text}");
-        let back: UserConfig = serde_yaml::from_str(&text).unwrap();
+        let back: UserConfig = yaml_serde::from_str(&text).unwrap();
         assert_eq!(back.desktop.terminal_colors, colors);
 
         colors.set(1, None);
@@ -1355,14 +1355,14 @@ mod tests {
             },
             ..UserConfig::default()
         };
-        let text = serde_yaml::to_string(&cfg).unwrap();
+        let text = yaml_serde::to_string(&cfg).unwrap();
         assert!(text.contains("window_opacity: 85") && text.contains("window_blur: 20"), "{text}");
-        let back: UserConfig = serde_yaml::from_str(&text).unwrap();
+        let back: UserConfig = yaml_serde::from_str(&text).unwrap();
         assert_eq!(back, cfg);
         assert!(!DesktopConfig { window_blur: Some(0), ..DesktopConfig::default() }.is_empty());
 
         let read = |yaml: &str| {
-            let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n{yaml}\n")).unwrap();
+            let cfg: UserConfig = yaml_serde::from_str(&format!("desktop:\n{yaml}\n")).unwrap();
             (cfg.desktop.window_opacity, cfg.desktop.window_blur)
         };
         assert_eq!(read("  window_opacity: 0.85"), (Some(85), None), "Ghostty's fraction");
@@ -1382,14 +1382,14 @@ mod tests {
             },
             ..UserConfig::default()
         };
-        let text = serde_yaml::to_string(&cfg).unwrap();
+        let text = yaml_serde::to_string(&cfg).unwrap();
         assert!(text.contains("contrast: 60"), "{text}");
-        assert_eq!(serde_yaml::from_str::<UserConfig>(&text).unwrap(), cfg);
+        assert_eq!(yaml_serde::from_str::<UserConfig>(&text).unwrap(), cfg);
         assert!(!cfg.desktop.is_empty());
-        assert!(!serde_yaml::to_string(&UserConfig::default()).unwrap().contains("contrast"));
+        assert!(!yaml_serde::to_string(&UserConfig::default()).unwrap().contains("contrast"));
 
         let read = |v: &str| {
-            let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n  contrast: {v}\n")).unwrap();
+            let cfg: UserConfig = yaml_serde::from_str(&format!("desktop:\n  contrast: {v}\n")).unwrap();
             cfg.desktop.contrast
         };
         assert_eq!(read("40"), Some(40));
@@ -1403,19 +1403,19 @@ mod tests {
     #[test]
     fn option_as_meta_reads_bools_and_sides() {
         let read = |v: &str| -> OptionAsMeta {
-            let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n  option_as_meta: {v}\n")).unwrap();
+            let cfg: UserConfig = yaml_serde::from_str(&format!("desktop:\n  option_as_meta: {v}\n")).unwrap();
             cfg.desktop.option_as_meta.unwrap()
         };
         assert_eq!(read("false"), OptionAsMeta::Off);
         assert_eq!(read("true"), OptionAsMeta::Both);
         assert_eq!(read("left"), OptionAsMeta::Left);
         assert_eq!(read("Right"), OptionAsMeta::Right);
-        assert!(serde_yaml::from_str::<UserConfig>("desktop:\n  option_as_meta: sideways\n").is_err());
+        assert!(yaml_serde::from_str::<UserConfig>("desktop:\n  option_as_meta: sideways\n").is_err());
         for v in [OptionAsMeta::Off, OptionAsMeta::Both, OptionAsMeta::Left, OptionAsMeta::Right] {
-            let text = serde_yaml::to_string(&v).unwrap();
-            assert_eq!(serde_yaml::from_str::<OptionAsMeta>(&text).unwrap(), v, "{text}");
+            let text = yaml_serde::to_string(&v).unwrap();
+            assert_eq!(yaml_serde::from_str::<OptionAsMeta>(&text).unwrap(), v, "{text}");
         }
-        assert_eq!(serde_yaml::to_string(&OptionAsMeta::Both).unwrap().trim(), "true");
+        assert_eq!(yaml_serde::to_string(&OptionAsMeta::Both).unwrap().trim(), "true");
     }
 
     #[test]
@@ -1428,11 +1428,11 @@ mod tests {
                 },
                 ..UserConfig::default()
             };
-            let text = serde_yaml::to_string(&cfg).unwrap();
-            let back: UserConfig = serde_yaml::from_str(&text).unwrap();
+            let text = yaml_serde::to_string(&cfg).unwrap();
+            let back: UserConfig = yaml_serde::from_str(&text).unwrap();
             assert_eq!(back, cfg, "{text}");
         }
-        let text = serde_yaml::to_string(&DesktopConfig {
+        let text = yaml_serde::to_string(&DesktopConfig {
             terminal_scrollbar: Some(TerminalScrollbar::Scrolling),
             ..DesktopConfig::default()
         })
@@ -1440,7 +1440,7 @@ mod tests {
         assert!(text.contains("terminal_scrollbar: scrolling"), "{text}");
 
         let read = |v: &str| {
-            let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n  terminal_scrollbar: {v}\n")).unwrap();
+            let cfg: UserConfig = yaml_serde::from_str(&format!("desktop:\n  terminal_scrollbar: {v}\n")).unwrap();
             cfg.desktop.terminal_scrollbar
         };
         assert_eq!(read("auto"), Some(TerminalScrollbar::Auto));
@@ -1464,24 +1464,24 @@ mod tests {
                 },
                 ..UserConfig::default()
             };
-            let text = serde_yaml::to_string(&cfg).unwrap();
-            let back: UserConfig = serde_yaml::from_str(&text).unwrap();
+            let text = yaml_serde::to_string(&cfg).unwrap();
+            let back: UserConfig = yaml_serde::from_str(&text).unwrap();
             assert_eq!(back, cfg, "{text}");
         }
-        let text = serde_yaml::to_string(&DesktopConfig {
+        let text = yaml_serde::to_string(&DesktopConfig {
             app_icon: Some(AppIcon::CommandGrille),
             ..DesktopConfig::default()
         })
         .unwrap();
         assert!(text.contains("app_icon: command-grille"), "{text}");
-        let text = serde_yaml::to_string(&DesktopConfig {
+        let text = yaml_serde::to_string(&DesktopConfig {
             app_icon: Some(AppIcon::RacingS),
             ..DesktopConfig::default()
         })
         .unwrap();
         assert!(text.contains("app_icon: racing-s"), "{text}");
         assert_eq!(AppIcon::RacingS.label(), "Racing S");
-        let text = serde_yaml::to_string(&DesktopConfig {
+        let text = yaml_serde::to_string(&DesktopConfig {
             app_icon: Some(AppIcon::RetroRacingS),
             ..DesktopConfig::default()
         })
@@ -1491,7 +1491,7 @@ mod tests {
         assert_eq!(AppIcon::ALL.last(), Some(&AppIcon::RetroRacingS));
 
         let read = |v: &str| {
-            let cfg: UserConfig = serde_yaml::from_str(&format!("desktop:\n  app_icon: {v}\n")).unwrap();
+            let cfg: UserConfig = yaml_serde::from_str(&format!("desktop:\n  app_icon: {v}\n")).unwrap();
             cfg.desktop.app_icon
         };
         assert_eq!(read("retro"), Some(AppIcon::Retro));

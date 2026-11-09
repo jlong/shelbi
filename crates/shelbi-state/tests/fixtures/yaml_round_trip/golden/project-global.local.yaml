@@ -1,0 +1,13 @@
+repo: /Users/someone/Workspaces/Acme
+machines:
+- name: hub
+  kind: local
+  work_dir: /Users/someone/Workspaces/Acme
+editor: null
+workspaces:
+- name: star
+  machine: hub
+- name: trophy
+  machine: hub
+- name: reward
+  machine: hub

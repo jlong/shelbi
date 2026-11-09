@@ -268,9 +268,9 @@ fn parse_skill_description(text: &str) -> Option<String> {
         .or_else(|| text.strip_prefix("---\r\n"))?;
     let close = rest.find("\n---")?;
     let yaml = &rest[..close];
-    let value: serde_yaml::Value = serde_yaml::from_str(yaml).ok()?;
+    let value: yaml_serde::Value = yaml_serde::from_str(yaml).ok()?;
     let mapping = value.as_mapping()?;
-    let desc = mapping.get(serde_yaml::Value::String("description".into()))?;
+    let desc = mapping.get(yaml_serde::Value::String("description".into()))?;
     Some(desc.as_str()?.trim().to_string())
 }
 

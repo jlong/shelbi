@@ -187,7 +187,7 @@ mod tests {
     use super::*;
 
     fn project() -> Project {
-        let mut p: Project = serde_yaml::from_str(
+        let mut p: Project = yaml_serde::from_str(
             "name: demo\nrepo: /tmp/demo\ndefault_branch: main\n\
              orchestrator:\n  runner: claude\n\
              agent_runners:\n  claude:\n    command: claude\n    flags: []\n\

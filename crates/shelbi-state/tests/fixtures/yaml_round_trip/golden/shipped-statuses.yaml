@@ -1,0 +1,34 @@
+## Shelbi statuses — full reference: https://shelbi.dev/docs/configuration/statuses
+## The project-wide catalog of status identity (id, display name, category).
+## Workflows reference these by id. Add your own below the defaults.
+
+statuses:
+- id: backlog
+  name: Backlog
+  category: backlog
+- id: todo
+  name: Todo
+  category: ready
+- id: in-progress
+  name: In Progress
+  category: active
+- id: review
+  name: Review
+  category: handoff
+- id: done
+  name: Done
+  category: done
+- id: canceled
+  name: Canceled
+  category: archived
+
+## Add custom statuses to the list above. `category` is a fixed vocabulary:
+## backlog | ready | active | handoff | done | archived. Keep at least one
+## terminal (done/archived) status so tasks can complete.
+#- id: qa
+#  name: QA
+#  category: handoff
+#- id: blocked
+#  name: Blocked
+#  category: active
+

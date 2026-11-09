@@ -1166,7 +1166,7 @@ mod tests {
             launch: None,
             params: params
                 .iter()
-                .map(|(k, v)| ((*k).to_string(), serde_yaml::Value::from(*v)))
+                .map(|(k, v)| ((*k).to_string(), yaml_serde::Value::from(*v)))
                 .collect(),
             created_at: now,
             updated_at: now,

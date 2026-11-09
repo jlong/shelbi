@@ -346,7 +346,7 @@ fn decode_frontmatter(
                 )));
             }
             key => {
-                let value: Option<serde_yaml::Value> = decode_field(key, value)?;
+                let value: Option<yaml_serde::Value> = decode_field(key, value)?;
                 if tf.task.params.get(key) != value.as_ref() {
                     edit.updates.params.insert(key.to_string(), value);
                     if !edit.fields.contains(&"params") {

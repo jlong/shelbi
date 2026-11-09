@@ -1,0 +1,77 @@
+name: Widget Works
+default_branch: main
+default_workflow: app
+github_url: git@github.com:someone/widget.git
+workspace_poll_interval_secs: 5
+heartbeat: 3m
+git:
+  merge_strategy: squash
+repo: git@github.com:someone/widget.git
+editor: null
+issue_tracker:
+  backend: github
+  github:
+    repo: someone/widget
+runners:
+  claude:
+    command: claude
+  codex:
+    command: codex
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+  codex:
+    command: codex
+    flags: []
+  opus:
+    command: claude
+    flags:
+    - --model
+    - claude-opus-5-5
+orchestrator:
+  runner: claude
+agents:
+  review:
+    runner: claude
+  developer:
+    runner: claude
+  technical-writer:
+    runner: codex
+zen:
+  checks:
+    local: []
+  ci_timeout: 900
+  danger_paths:
+    override:
+    - .github/workflows/**
+    - scripts/install.sh
+    - '*.yaml'
+    - '*.yml'
+    - LICENSE
+    - package-lock.json
+    - Cargo.lock
+machines:
+- name: hub
+  kind: local
+  work_dir: /Users/someone/Workspaces/widget
+- name: devbox
+  kind: ssh
+  work_dir: /home/someone/Workspaces/widget
+  host: devbox
+  tags:
+  - linux
+workspaces:
+- name: alpha
+  machine: hub
+- name: bravo
+  machine: hub
+- name: delta
+  machine: devbox
+  tags:
+  - linux
+- name: review
+  machine: hub
+  tags:
+  - review
+  slot: 4310

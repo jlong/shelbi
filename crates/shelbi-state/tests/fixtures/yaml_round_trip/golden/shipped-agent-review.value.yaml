@@ -1,0 +1,3 @@
+name: review
+description: Loads a finished branch for human review and runs it
+preferred_runner: claude

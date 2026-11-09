@@ -36,7 +36,7 @@ use super::key::{Key, Mods};
 use crate::user_config::{load_user_config, save_user_config, user_config_path, ZenToggleChord};
 use crate::{atomic_write, shelbi_home};
 use serde::Deserialize;
-use serde_yaml::{Mapping, Value};
+use yaml_serde::{Mapping, Value};
 
 /// Filename under `$SHELBI_HOME` for user-authored key overrides.
 pub const KEYS_FILENAME: &str = "keys.yaml";
@@ -289,7 +289,7 @@ fn value_to_chords(value: &Value) -> Result<Option<Vec<String>>, String> {
     }
 }
 
-/// Human-readable name for a `serde_yaml::Value` variant, used in the
+/// Human-readable name for a `yaml_serde::Value` variant, used in the
 /// mistyped-entry diagnostics from [`value_to_chords`].
 fn value_type_name(v: &Value) -> &'static str {
     match v {
@@ -344,7 +344,7 @@ pub fn project_overlay(project_name: &str) -> Option<String> {
     let mut ignored = Vec::new();
     let file = read_keys_file(&mut ignored)?;
     let section = file.projects?.remove(project_name)?;
-    serde_yaml::to_string(&section).ok()
+    yaml_serde::to_string(&section).ok()
 }
 
 /// Where the project layer of a merge comes from.
@@ -416,7 +416,7 @@ fn load_keymaps_source(
 
     // Layer 2/3: load keys.yaml if present. Missing file is fine.
     let file = match source {
-        Some(text) => match serde_yaml::from_str::<KeysFile>(text) {
+        Some(text) => match yaml_serde::from_str::<KeysFile>(text) {
             Ok(file) => Some(file),
             Err(e) => {
                 diags.push(KeymapDiagnostic::err(
@@ -459,7 +459,7 @@ fn load_keymaps_source(
                 }
             }
             ProjectLayer::Given(None) => {}
-            ProjectLayer::Given(Some(text)) => match serde_yaml::from_str::<ModeMap>(text) {
+            ProjectLayer::Given(Some(text)) => match yaml_serde::from_str::<ModeMap>(text) {
                 Ok(p) => apply_overrides(&scope, &p, &mut staged, &mut diags),
                 Err(e) => diags.push(KeymapDiagnostic::err(
                     ErrorKind::ParseError,
@@ -892,7 +892,7 @@ fn read_keys_file(diags: &mut Vec<KeymapDiagnostic>) -> Option<KeysFile> {
             return None;
         }
     };
-    match serde_yaml::from_str::<KeysFile>(&text) {
+    match yaml_serde::from_str::<KeysFile>(&text) {
         Ok(f) => Some(f),
         Err(e) => {
             diags.push(KeymapDiagnostic::err(
@@ -1085,7 +1085,7 @@ enum ZenToggleValue {
 /// presence test the config-upgrade detector applies, so healer and detector
 /// agree on exactly which files need healing.
 fn config_has_legacy_zen_toggle(text: &str) -> bool {
-    serde_yaml::from_str::<Value>(text)
+    yaml_serde::from_str::<Value>(text)
         .ok()
         .and_then(|v| {
             v.as_mapping()?
@@ -1151,10 +1151,10 @@ fn strip_keymap_block_lines(text: &str) -> Option<String> {
 /// Loses comments, so it's only used when the line strip can't cleanly remove
 /// the field (e.g. a hand-authored flow-style `keymap: {zen_toggle: ...}`).
 fn strip_keymap_via_serde(text: &str) -> Option<String> {
-    let mut value: Value = serde_yaml::from_str(text).ok()?;
+    let mut value: Value = yaml_serde::from_str(text).ok()?;
     let map = value.as_mapping_mut()?;
     map.shift_remove(Value::String("keymap".into()))?;
-    serde_yaml::to_string(&value).ok()
+    yaml_serde::to_string(&value).ok()
 }
 
 /// One-shot migration: copy a non-default `config.yaml::keymap.zen_toggle`
@@ -1279,7 +1279,7 @@ fn splice_zen_toggle_into_keys_yaml(value: Value) -> SpliceOutcome {
 
     // Write keys.yaml. If serialization or IO fails, report failure so the caller
     // leaves the legacy field in place.
-    let Ok(yaml) = serde_yaml::to_string(&root) else {
+    let Ok(yaml) = yaml_serde::to_string(&root) else {
         return SpliceOutcome::Failed;
     };
     if atomic_write(&path, yaml.as_bytes()).is_err() {
@@ -1297,7 +1297,7 @@ enum ReadKeysYml {
     Unreadable,
 }
 
-/// Read keys.yaml as an untyped `serde_yaml::Value` so the migration can
+/// Read keys.yaml as an untyped `yaml_serde::Value` so the migration can
 /// mutate it without losing entries it doesn't know about. Missing or
 /// empty file is treated as an empty mapping; parse errors are caller-
 /// visible as `Unreadable` so the migration can refuse to clobber.
@@ -1312,7 +1312,7 @@ fn read_keys_yml_value(path: &Path) -> ReadKeysYml {
     if text.trim().is_empty() {
         return ReadKeysYml::Empty;
     }
-    match serde_yaml::from_str::<Value>(&text) {
+    match yaml_serde::from_str::<Value>(&text) {
         Ok(v) => ReadKeysYml::Parsed(v),
         Err(_) => ReadKeysYml::Unreadable,
     }
@@ -1322,7 +1322,7 @@ fn read_keys_yml_value(path: &Path) -> ReadKeysYml {
 /// value is present (a YAML `null` counts as "explicitly cleared", which
 /// the loader treats as "fall through to a lower layer" — same semantics
 /// as the typed `ChordSpec::None` deserialize path). Returns the raw
-/// `serde_yaml::Value` so the caller can distinguish "not set" from
+/// `yaml_serde::Value` so the caller can distinguish "not set" from
 /// "set to null".
 fn keys_yml_defaults_zen_toggle(root: &Value) -> Option<&Value> {
     root.as_mapping()?
@@ -1752,7 +1752,7 @@ projects:
 
         // keys.yaml now contains the migrated entry.
         let keys_text = std::fs::read_to_string(home.join("keys.yaml")).unwrap();
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&keys_text).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&keys_text).unwrap();
         let migrated = parsed
             .get("defaults")
             .and_then(|v| v.get("global"))
@@ -1820,7 +1820,7 @@ projects:
 
         // The merged keys.yaml on disk reflects both overrides.
         let keys_text = std::fs::read_to_string(home.join("keys.yaml")).unwrap();
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&keys_text).unwrap();
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&keys_text).unwrap();
         assert_eq!(
             parsed
                 .get("defaults")
@@ -2814,7 +2814,7 @@ editor: hx
         let text = "keymap: {zen_toggle: ctrl-g}\neditor: hx\n";
         let out = strip_legacy_keymap(text).expect("removes flow-style keymap");
         assert!(!config_has_legacy_zen_toggle(&out), "{out}");
-        let parsed: Value = serde_yaml::from_str(&out).unwrap();
+        let parsed: Value = yaml_serde::from_str(&out).unwrap();
         assert_eq!(
             parsed.get("editor").and_then(Value::as_str),
             Some("hx"),

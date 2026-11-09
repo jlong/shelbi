@@ -220,7 +220,7 @@ fn load_project(home: &Path, name: &str) -> Project {
         .into_iter()
         .filter(|(path, _)| path.file_stem().and_then(|s| s.to_str()) == Some(name))
         .find_map(|(_, contents)| {
-            serde_yaml::from_slice::<Project>(&contents).ok().map(|mut project| {
+            yaml_serde::from_slice::<Project>(&contents).ok().map(|mut project| {
                 project.name = name.to_string();
                 project
             })
@@ -289,7 +289,7 @@ fn yes_mode_with_one_runner_initializes_git_while_stdin_is_open() {
 
     // A new install's global config: dark, and a translucent desktop window.
     let text = fs::read_to_string(home.join("config.yaml")).unwrap();
-    let cfg: shelbi_state::UserConfig = serde_yaml::from_str(&text).unwrap();
+    let cfg: shelbi_state::UserConfig = yaml_serde::from_str(&text).unwrap();
     assert_eq!(cfg.theme, shelbi_state::ThemePreference::Dark);
     assert_eq!(cfg.desktop.contrast, Some(50));
     assert_eq!((cfg.desktop.window_opacity, cfg.desktop.window_blur), (Some(85), Some(30)));

@@ -10,7 +10,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error("yaml: {0}")]
-    Yaml(#[from] serde_yaml::Error),
+    Yaml(#[from] yaml_serde::Error),
 
     /// Discovery walked up from cwd, found an in-repo `.shelbi/project.yaml`
     /// naming project `name`, but the per-user companion `local.yaml`

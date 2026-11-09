@@ -1,0 +1,90 @@
+## Shelbi project config — full reference: https://shelbi.dev/docs/configuration/project
+## Required fields are populated below. Every commented block beneath them is an
+## optional feature: uncomment and edit it to turn the feature on.
+## To run the orchestrator with Codex, edit the active `orchestrator.runner`
+## value from `claude` to `codex`; keep the `agent_runners.codex` entry declared.
+## Claude receives Shelbi's `--append-system-prompt` wiring; Codex receives
+## an initial Shelbi startup prompt that embeds the rendered orchestrator
+## instructions. Other runners launch as the configured command plus flags.
+
+name: Acme
+default_branch: main
+default_workflow: task
+## Add more machines to the list above — e.g. a remote box reached over
+## SSH. `host` is the ssh hostname (falls back to `name` when omitted);
+## `work_dir` is where the checkout and worktrees live on that box.
+#- name: devbox
+#  kind: ssh
+#  host: devbox.local
+#  work_dir: ~/work/myapp
+orchestrator:
+  runner: claude
+## Workspaces: the pool of slots agents work in. A new project starts empty
+## and the orchestrator creates the pool on first boot (`shelbi workspace add`
+## adds one by hand). Each owns a worktree at <machine.work_dir>/.shelbi/wt/<name>;
+## a slot tagged `review` is where the Reviewer loads a branch for a human.
+#workspaces:
+#- { name: dev, machine: hub }
+#- { name: review, machine: hub, tags: [review] }
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+  codex:
+    command: codex
+    flags: []
+workspace_poll_interval_secs: 5
+github_reconcile_interval_secs: 900
+zen:
+  checks:
+    local:
+    - cd Packages/AcmeCore && swift test
+    - xcodebuild build -project Acme.xcodeproj -scheme Acme -destination 'generic/platform=iOS Simulator' -derivedDataPath build
+  ci_timeout: 900
+  danger_paths:
+    extend: []
+heartbeat: 1m
+git:
+  merge_strategy: squash
+repo: /Users/someone/Workspaces/Acme
+machines:
+- name: hub
+  kind: local
+  work_dir: /Users/someone/Workspaces/Acme
+editor: null
+workspaces:
+- name: star
+  machine: hub
+- name: trophy
+  machine: hub
+- name: reward
+  machine: hub
+## Per-runner extras (add under a runner above). `flags:` appends args to
+## every launch (e.g. flags: ["--full-auto"]); `dialog_signatures:` teaches
+## the hub poller a new blocking-prompt string so a frozen pane surfaces.
+#    dialog_signatures:
+#      - { kind: trust, pattern: "Do you trust the files" }
+
+## Informational GitHub URL, recorded by the setup wizard.
+#github_url: git@github.com:me/myapp.git
+
+## Optional project-wide permission ceiling for launched agents.
+## Leave it unset (the default) to pass NO `--permission-mode` and
+## let each agent run under your own ~/.claude permissions.defaultMode.
+## Set it only to impose a concrete ceiling that clamps every agent's
+## requested posture downward, never up: plan | default | acceptEdits |
+## bypassPermissions (aliases: read-only, auto, full-access).
+## workspace_permissions_mode: acceptEdits
+
+## Hub disk management. Build output (Rust `target/`) accumulates in the
+## hub checkout and fills the data volume over a week of Zen builds; a full
+## volume looks like a wedged hub. Both knobs default to 20 GiB, so leaving
+## this block out still protects the hub.
+## `target_cap_gib` caps the hub checkout's shared cargo `target/`: a Zen
+## probe clears it before building when it has grown past the cap (never
+## while another probe is building into it). `low_free_gib` is the free-space
+## threshold below which the heartbeat line and `shelbi status` warn.
+#disk:
+#  target_cap_gib: 20         # clear the hub's shared cargo target/ above this. Default 20
+#  low_free_gib: 20           # warn when free space on the work_dir volume drops below this. Default 20
+

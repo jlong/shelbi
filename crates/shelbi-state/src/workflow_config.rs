@@ -84,7 +84,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde_yaml::Value;
+use yaml_serde::Value;
 use shelbi_core::{
     default_project_statuses, default_workflow, validate_workflow_name, GitConfig, Owner,
     ProjectStatus, ProjectStatuses, ReviewServe, StatusCategory, Transition, Workflow,
@@ -1317,7 +1317,7 @@ fn edit_text<T: serde::Serialize>(
     new: &T,
     path: &Path,
 ) -> Result<yaml_edit::Patched> {
-    let to_value = |t: &T| serde_yaml::to_value(t).map_err(|e| file_err(path, e));
+    let to_value = |t: &T| yaml_serde::to_value(t).map_err(|e| file_err(path, e));
     let raw = yaml_edit::parse(text).map_err(|e| file_err(path, e))?;
     let target = yaml_edit::merge(&raw, &to_value(base)?, &to_value(new)?, ALIASES);
     yaml_edit::patch(text, &target).map_err(|e| file_err(path, e))
@@ -1327,7 +1327,7 @@ fn edit_text<T: serde::Serialize>(
 /// live in the catalog, aside).
 fn same(a: &Workflow, b: &Workflow) -> Result<bool> {
     let to_value =
-        |w: &Workflow| serde_yaml::to_value(w).map_err(|e| ConfigError::Invalid(e.to_string()));
+        |w: &Workflow| yaml_serde::to_value(w).map_err(|e| ConfigError::Invalid(e.to_string()));
     Ok(to_value(a)? == to_value(b)?)
 }
 
@@ -1347,7 +1347,7 @@ fn parse_workflow(text: &str, catalog: &ProjectStatuses) -> Result<Workflow, Str
 
 /// The `id`s under a workflow file's `statuses:`, read leniently.
 fn raw_status_ids(text: &str) -> Vec<String> {
-    let Ok(value) = serde_yaml::from_str::<Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<Value>(text) else {
         return Vec::new();
     };
     value

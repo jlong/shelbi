@@ -1,0 +1,10 @@
+desktop:
+  terminal_font_size: 16
+  option_as_meta: true
+  window_blur: 40
+  window_opacity: 84
+  app_icon: command-grille
+  contrast: 50
+theme: dark
+editor:
+  app: /Applications/Visual Studio Code.app

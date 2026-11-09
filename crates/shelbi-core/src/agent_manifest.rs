@@ -130,7 +130,7 @@ impl AgentManifest {
     /// a hard error with a clear message rather than a silent
     /// wrong-runner/model dispatch.
     pub fn from_yaml_str(s: &str) -> crate::Result<Self> {
-        let manifest: Self = serde_yaml::from_str(s)?;
+        let manifest: Self = yaml_serde::from_str(s)?;
         manifest.validate()?;
         Ok(manifest)
     }
@@ -471,7 +471,7 @@ requires:
     #[test]
     fn manifest_roundtrips_through_yaml() {
         let m = AgentManifest::from_yaml_str(manifest_yaml()).unwrap();
-        let s = serde_yaml::to_string(&m).unwrap();
+        let s = yaml_serde::to_string(&m).unwrap();
         let back = AgentManifest::from_yaml_str(&s).unwrap();
         assert_eq!(m, back);
     }

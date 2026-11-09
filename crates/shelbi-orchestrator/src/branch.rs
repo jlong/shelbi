@@ -376,7 +376,7 @@ mod tests {
         // The subtask's `task:` frontmatter names its parent, which the
         // templated `base_branch: task/{{task}}` needs to resolve.
         t.params
-            .insert("task".into(), serde_yaml::Value::String("add-auth".into()));
+            .insert("task".into(), yaml_serde::Value::String("add-auth".into()));
         assert_eq!(
             branch_name_for_task_with_login(&p, Some(&wf), &t, || Some("jlong".into())).unwrap(),
             "subtask/add-csv-export"
@@ -422,7 +422,7 @@ mod tests {
         let wf = workflow_with_branch("{{github_user}}/{{feature}}/{{id}}");
         let mut t = task("fix-login", None, Some("app"));
         t.params
-            .insert("feature".into(), serde_yaml::Value::from("auth"));
+            .insert("feature".into(), yaml_serde::Value::from("auth"));
         assert_eq!(
             branch_name_for_task_with_login(&p, Some(&wf), &t, || Some("jlong".into())).unwrap(),
             "jlong/auth/fix-login"
@@ -469,7 +469,7 @@ mod tests {
         let wf = workflow_with_base("feature/{{feature}}");
         let mut t = task("add-export", None, Some("app"));
         t.params
-            .insert("feature".into(), serde_yaml::Value::from("dashboard"));
+            .insert("feature".into(), yaml_serde::Value::from("dashboard"));
         assert_eq!(
             branch_name_for_task_with_login(&p, Some(&wf), &t, || Some("jlong".into())).unwrap(),
             "shelbi/add-export"

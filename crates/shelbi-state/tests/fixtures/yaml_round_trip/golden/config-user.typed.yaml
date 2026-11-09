@@ -1,0 +1,12 @@
+keymap:
+  zen_toggle: alt-z
+editor:
+  app: /Applications/Visual Studio Code.app
+theme: dark
+desktop:
+  terminal_font_size: 16
+  option_as_meta: true
+  window_opacity: 84
+  window_blur: 40
+  contrast: 50
+  app_icon: command-grille

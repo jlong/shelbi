@@ -147,7 +147,7 @@ pub struct Workflow {
 
 impl Workflow {
     /// Parse YAML and validate in one step. The convenience constructor
-    /// callers should reach for; raw [`serde_yaml::from_str`] skips the
+    /// callers should reach for; raw [`yaml_serde::from_str`] skips the
     /// semantic checks that catch broken cross-references.
     ///
     /// Legacy single-field owner forms migrate silently. Use
@@ -166,7 +166,7 @@ impl Workflow {
     /// one "please update this YAML" message regardless of how many
     /// statuses are legacy.
     pub fn from_yaml_str_with_diagnostics(s: &str) -> crate::Result<(Self, Vec<String>)> {
-        let raw: RawWorkflow = serde_yaml::from_str(s)?;
+        let raw: RawWorkflow = yaml_serde::from_str(s)?;
         let (wf, migrations) = convert_raw_workflow(raw)?;
         wf.validate()?;
         let diagnostics = if migrations.is_empty() {
@@ -738,10 +738,10 @@ impl Workflow {
     /// fields, paired with which field(s) were present. Empty when the
     /// file is in the new (reference-only) form.
     pub fn inline_identity_fields(yaml: &str) -> crate::Result<Vec<InlineIdentityField>> {
-        let value: serde_yaml::Value = serde_yaml::from_str(yaml)?;
+        let value: yaml_serde::Value = yaml_serde::from_str(yaml)?;
         let mut out = Vec::new();
         let Some(statuses) = value
-            .get(serde_yaml::Value::String("statuses".into()))
+            .get(yaml_serde::Value::String("statuses".into()))
             .and_then(|v| v.as_sequence())
         else {
             return Ok(out);
@@ -752,11 +752,11 @@ impl Workflow {
                 continue;
             }
             let id = entry
-                .get(serde_yaml::Value::String("id".into()))
+                .get(yaml_serde::Value::String("id".into()))
                 .and_then(|v| v.as_str())
                 .or_else(|| {
                     entry
-                        .get(serde_yaml::Value::String("name".into()))
+                        .get(yaml_serde::Value::String("name".into()))
                         .and_then(|v| v.as_str())
                 })
                 .unwrap_or("?")
@@ -852,7 +852,7 @@ impl<'de> Deserialize<'de> for Workflow {
     /// Custom deserializer: route through [`RawWorkflow`] so the lenient
     /// status schema (legacy `owner: <name>` rewrites, optional id/name
     /// fallback) applies whenever a Workflow is read from YAML —
-    /// including the `serde_yaml::to_string` → `serde_yaml::from_str`
+    /// including the `yaml_serde::to_string` → `yaml_serde::from_str`
     /// round-trip the round-trip tests rely on. Direct callers that
     /// want the migration warning surfaced must use
     /// [`Workflow::from_yaml_str_with_diagnostics`]; this path runs the
@@ -1267,17 +1267,17 @@ impl Status {
     /// or `category:` after migration" — see
     /// [`Workflow::inline_identity_fields`]. The check needs the
     /// presence bits the regular [`Deserialize`] impl throws away.
-    pub(crate) fn parse_presence(value: &serde_yaml::Value) -> (bool, bool) {
+    pub(crate) fn parse_presence(value: &yaml_serde::Value) -> (bool, bool) {
         let m = match value {
-            serde_yaml::Value::Mapping(m) => m,
+            yaml_serde::Value::Mapping(m) => m,
             _ => return (false, false),
         };
         let has_name = m
-            .get(serde_yaml::Value::String("name".into()))
+            .get(yaml_serde::Value::String("name".into()))
             .map(|v| !v.is_null())
             .unwrap_or(false);
         let has_category = m
-            .get(serde_yaml::Value::String("category".into()))
+            .get(yaml_serde::Value::String("category".into()))
             .map(|v| !v.is_null())
             .unwrap_or(false);
         (has_name, has_category)
@@ -2603,7 +2603,7 @@ statuses:
         // wire form drops `name:`/`category:` from each status entry —
         // identity lives in `workflows/statuses.yaml` after migration.
         let wf = default_workflow();
-        let y = serde_yaml::to_string(&wf).unwrap();
+        let y = yaml_serde::to_string(&wf).unwrap();
         // Identity fields are absent on the wire — that's the contract.
         assert!(!y.contains("category:"), "unexpected category: in {y}");
         // `name:` only appears as the top-level workflow name, never on
@@ -2625,7 +2625,7 @@ statuses:
     #[test]
     fn optional_fields_omitted_when_absent() {
         let wf = default_workflow();
-        let y = serde_yaml::to_string(&wf).unwrap();
+        let y = yaml_serde::to_string(&wf).unwrap();
         // Nothing was set, so neither key should appear on the wire.
         assert!(!y.contains("initial_status"));
         assert!(!y.contains("transitions"));
@@ -2647,7 +2647,7 @@ statuses:
         assert_eq!(ps.statuses[0].category, StatusCategory::Archived);
 
         // Round-trip back out — wire form is the snake_case spelling.
-        let y = serde_yaml::to_string(&ps).unwrap();
+        let y = yaml_serde::to_string(&ps).unwrap();
         assert!(y.contains("category: archived"));
 
         // FromStr (used by the events-log parser to lift
@@ -2889,7 +2889,7 @@ transitions:
         assert_eq!(t.ready_timeout_or_default(), Duration::from_secs(30));
 
         // Round-trip: run/ready survive; ready_timeout is seconds on the wire.
-        let out = serde_yaml::to_string(&wf).unwrap();
+        let out = yaml_serde::to_string(&wf).unwrap();
         assert!(out.contains("npm ci"), "run should serialize: {out}");
         assert!(out.contains("ready_timeout: 30"), "timeout secs: {out}");
 
@@ -2906,7 +2906,7 @@ transitions:
             url: None,
         };
         assert_eq!(bare.ready_timeout_or_default(), Duration::from_secs(90));
-        let out = serde_yaml::to_string(&bare).unwrap();
+        let out = yaml_serde::to_string(&bare).unwrap();
         assert!(!out.contains("run"), "no run key: {out}");
         assert!(!out.contains("ready"), "no ready key: {out}");
     }
@@ -3440,7 +3440,7 @@ git:
         // an empty `git:` key — the field has to be entirely absent so
         // legacy workflow YAMLs keep their existing shape.
         let wf = default_workflow();
-        let y = serde_yaml::to_string(&wf).unwrap();
+        let y = yaml_serde::to_string(&wf).unwrap();
         assert!(!y.contains("git:"), "unexpected git: in {y}");
     }
 
@@ -3697,7 +3697,7 @@ git:
              - { id: done, name: Done, category: done }\n",
         )
         .unwrap();
-        let serialized = serde_yaml::to_string(&wf).unwrap();
+        let serialized = yaml_serde::to_string(&wf).unwrap();
         let back = Workflow::from_yaml_str(&serialized)
             .unwrap()
             .resolve_against(&statuses)
@@ -3793,7 +3793,7 @@ zen: {}
     #[test]
     fn workflow_with_no_zen_block_omits_field_on_the_wire() {
         let wf = default_workflow();
-        let y = serde_yaml::to_string(&wf).unwrap();
+        let y = yaml_serde::to_string(&wf).unwrap();
         assert!(!y.contains("zen:"), "unexpected zen: in {y}");
     }
 
@@ -3819,7 +3819,7 @@ zen:
              - { id: done, name: Done, category: done }\n",
         )
         .unwrap();
-        let serialized = serde_yaml::to_string(&wf).unwrap();
+        let serialized = yaml_serde::to_string(&wf).unwrap();
         let back = Workflow::from_yaml_str(&serialized)
             .unwrap()
             .resolve_against(&statuses)
@@ -3928,7 +3928,7 @@ statuses:
             agent: Some("orchestrator".into()),
             tags: Vec::new(),
         };
-        let y = serde_yaml::to_string(&s).unwrap();
+        let y = yaml_serde::to_string(&s).unwrap();
         assert!(y.contains("id: review"), "got: {y}");
         assert!(y.contains("owner: user"), "got: {y}");
         assert!(y.contains("agent: orchestrator"), "got: {y}");
@@ -3956,9 +3956,9 @@ statuses:
         assert!(wf.statuses[2].tags.is_empty());
 
         // Round-trip: tags serialize as a sequence, tag-less stays absent.
-        let out = serde_yaml::to_string(&wf.statuses[0]).unwrap();
+        let out = yaml_serde::to_string(&wf.statuses[0]).unwrap();
         assert!(out.contains("tags"), "tags should serialize: {out}");
-        let out = serde_yaml::to_string(&wf.statuses[2]).unwrap();
+        let out = yaml_serde::to_string(&wf.statuses[2]).unwrap();
         assert!(
             !out.contains("tags"),
             "tag-less status must stay lean: {out}"
@@ -3975,7 +3975,7 @@ statuses:
             agent: None,
             tags: Vec::new(),
         };
-        let y = serde_yaml::to_string(&s).unwrap();
+        let y = yaml_serde::to_string(&s).unwrap();
         assert!(!y.contains("agent:"), "unexpected agent: in {y}");
     }
 
@@ -4077,7 +4077,7 @@ review:
         assert_eq!(review.url.as_deref(), Some("http://localhost:$SLOT"));
 
         // Round-trips through serde without losing the block.
-        let yaml = serde_yaml::to_string(&wf).unwrap();
+        let yaml = yaml_serde::to_string(&wf).unwrap();
         let back = Workflow::from_yaml_str(&yaml).unwrap();
         assert_eq!(back.review, wf.review);
     }

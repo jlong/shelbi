@@ -1,0 +1,3 @@
+name: orchestrator
+description: Coordinates the board and dispatches tasks to worker agents
+preferred_runner: claude

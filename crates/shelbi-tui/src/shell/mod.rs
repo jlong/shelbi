@@ -12967,7 +12967,7 @@ workspaces:
             ("settings.rs", include_str!("settings.rs")),
             ("settings/workspaces.rs", include_str!("settings/workspaces.rs")),
         ] {
-            for banned in ["save_project", "write_project", "serde_yaml::to_string", "to_yaml_string", "fs::write("] {
+            for banned in ["save_project", "write_project", "yaml_serde::to_string", "to_yaml_string", "fs::write("] {
                 let hits: Vec<&str> = src
                     .lines()
                     .filter(|l| l.contains(banned) && !l.trim_start().starts_with("//"))

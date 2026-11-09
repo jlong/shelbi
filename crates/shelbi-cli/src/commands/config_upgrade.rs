@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
+use yaml_serde::Value;
 use shelbi_core::{
     validate_project_name, Column, ProjectStatuses, StatusCategory, LOCAL_PROJECT_FIELDS,
     SHARED_PROJECT_FIELDS,
@@ -1180,7 +1180,7 @@ fn sniff_project_registration(
     text: &str,
     out: &mut Vec<UpgradeFinding>,
 ) {
-    let Ok(value) = serde_yaml::from_str::<Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<Value>(text) else {
         return; // a YAML syntax error is the lint's job
     };
     let Some(map) = value.as_mapping() else {
@@ -1332,7 +1332,7 @@ fn sniff_workspace_permissions_mode(
 /// posture (→ move to a deny block) or nothing at all (→ drop the key) is their
 /// call, not a mechanical rewrite.
 fn sniff_agent_manifest(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
-    let Ok(value) = serde_yaml::from_str::<Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<Value>(text) else {
         return; // a YAML syntax error is the lint's job
     };
     let mode = get(&value, "permissions_mode").and_then(Value::as_str);
@@ -1357,7 +1357,7 @@ fn sniff_display_name(
     project: &str,
     entry: &InventoryEntry,
     text: &str,
-    map: &serde_yaml::Mapping,
+    map: &yaml_serde::Mapping,
     display_value: &Value,
     out: &mut Vec<UpgradeFinding>,
 ) {
@@ -1745,7 +1745,7 @@ fn sniff_zen_cargo_test_no_fail_fast(
 // statuses.yaml
 
 fn sniff_statuses(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
-    let Ok(value) = serde_yaml::from_str::<Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<Value>(text) else {
         return;
     };
     let Some(seq) = get(&value, "statuses").and_then(Value::as_sequence) else {
@@ -1786,7 +1786,7 @@ pub(crate) fn legacy_status_id(raw: &str) -> Option<String> {
 // workflow YAML
 
 fn sniff_workflow(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
-    let Ok(value) = serde_yaml::from_str::<Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<Value>(text) else {
         return;
     };
 
@@ -2290,7 +2290,7 @@ fn locate_line(text: &str, needle: &str) -> Location {
 // global config.yaml (UserConfig)
 
 fn sniff_user_config(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
-    let Ok(value) = serde_yaml::from_str::<Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<Value>(text) else {
         return;
     };
     // Legacy keybinding home: `config.yaml::keymap.zen_toggle`. The current
@@ -2777,7 +2777,7 @@ fn project_is_rust_track(entries: &[&InventoryEntry]) -> bool {
 /// Whether a config surface's top-level `zen.checks.local` runs a `cargo`
 /// command. Shared by the Rust-track gate so the definition lives in one place.
 fn zen_checks_runs_cargo(text: &str) -> bool {
-    let Ok(value) = serde_yaml::from_str::<Value>(text) else {
+    let Ok(value) = yaml_serde::from_str::<Value>(text) else {
         return false;
     };
     let Some(local) = get(&value, "zen")
@@ -2825,7 +2825,7 @@ fn project_review_done_merges(entries: &[&InventoryEntry]) -> bool {
         let Ok(text) = std::fs::read_to_string(&entry.canonical_path) else {
             continue;
         };
-        let Ok(value) = serde_yaml::from_str::<Value>(&text) else {
+        let Ok(value) = yaml_serde::from_str::<Value>(&text) else {
             continue;
         };
         let Some(transitions) = get(&value, "transitions").and_then(Value::as_sequence) else {
@@ -5493,7 +5493,7 @@ zen:
         );
 
         // On disk: runner gone, but the danger_paths conflict is untouched.
-        let healed: Value = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let healed: Value = yaml_serde::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let ws = &healed.as_mapping().unwrap().get(Value::String("workspaces".into())).unwrap()
             .as_sequence().unwrap()[0];
         assert!(ws.as_mapping().unwrap().get(Value::String("runner".into())).is_none());
