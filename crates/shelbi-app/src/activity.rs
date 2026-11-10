@@ -230,6 +230,14 @@ pub enum SystemKind {
     /// `[project=…] task=… ci pr=… conclusion=success|failure` — a CI
     /// pass/fail verdict for an in-review PR from the hub's scoped CI poll.
     Ci,
+    /// `project=… reminder id=… text="…"` — an awareness reminder came due.
+    Reminder,
+    /// `project=… job id=… kind=… label="…" status=…` — a watched job
+    /// (a detached command, a pid, a commit's CI, a PR) finished.
+    Job,
+    /// `project=… task=… overdue estimate=… elapsed=…` — an active task ran
+    /// past its estimate.
+    Overdue,
     /// `project=… mode=zen <prev> -> <new>` — a Zen Mode toggle.
     Mode,
     /// `project=… supervision=…` — a pane restart / crash-loop give-up.
@@ -1127,6 +1135,7 @@ pub fn event_workspace<'a>(ev: &'a Event, cache: &'a TaskCache) -> Option<&'a st
             }
             SystemKind::Send | SystemKind::PaneDeath => sys.target.as_deref(),
             SystemKind::Supervision => sys.target.as_deref().filter(|t| *t != "orchestrator"),
+            SystemKind::Overdue => sys.status.as_deref(),
             _ => None,
         },
         Event::Heartbeat { .. } | Event::Unknown { .. } => None,
@@ -1196,6 +1205,13 @@ pub fn parse_event_line(line: &str) -> Event {
     // Peel the `project=<name>` scope so both prefixed and legacy-bare
     // task/workspace lines route through the same classifier below.
     let (project, rest) = strip_project_prefix(after_ts);
+
+    // Awareness shapes. Matched first: their quoted free text may contain
+    // anything (` ci `, `task=`), and an overdue line is task-scoped but is no
+    // transition.
+    if let Some(sys) = parse_awareness(ts, project.clone(), rest, &raw) {
+        return Event::System(sys);
+    }
 
     // CI verdict shape (project- and task-scoped):
     // `task=<id> ci pr=<pr> check=<check> conclusion=<success|failure> head_sha=<sha>`.
@@ -1633,6 +1649,69 @@ pub fn parse_event_line(line: &str) -> Event {
 /// reason=<r>`) into a [`SystemEvent`]. Shared by the workspace-scoped form
 /// (`workspace=<name> supervision=…`) and the orchestrator-scoped form
 /// (`supervision=… target=orchestrator …`).
+/// Parse the three awareness lines (the `project=` scope already peeled):
+/// `reminder id=… text="…"`, `job id=… kind=… label="…" status=… [exit=…]
+/// [detail="…"]`, and `task=<id> overdue estimate=… elapsed=… [workspace=…]`.
+fn parse_awareness(
+    ts: DateTime<Utc>,
+    project: Option<String>,
+    rest: &str,
+    raw: &str,
+) -> Option<SystemEvent> {
+    let (verb, tail) = rest.split_once(' ').unwrap_or((rest, ""));
+    let sys = |kind, target, status, detail| SystemEvent {
+        ts,
+        kind,
+        project: project.clone(),
+        target,
+        status,
+        detail,
+        raw: raw.to_string(),
+    };
+    match verb {
+        "reminder" => {
+            let kv = parse_kv(tail);
+            Some(sys(
+                SystemKind::Reminder,
+                kv.get("id").cloned(),
+                None,
+                kv.get("text").cloned(),
+            ))
+        }
+        "job" => {
+            let kv = parse_kv(tail);
+            let label = kv.get("label").cloned().unwrap_or_default();
+            let detail = match (kv.get("exit"), kv.get("detail")) {
+                (Some(exit), Some(d)) => format!("{label} · exit {exit}: {d}"),
+                (Some(exit), None) => format!("{label} · exit {exit}"),
+                (None, Some(d)) => format!("{label}: {d}"),
+                (None, None) => label,
+            };
+            Some(sys(
+                SystemKind::Job,
+                kv.get("id").cloned(),
+                kv.get("status").cloned(),
+                Some(detail),
+            ))
+        }
+        v if v.starts_with("task=") && tail.starts_with("overdue") => {
+            let kv = parse_kv(tail);
+            let detail = match (kv.get("estimate"), kv.get("elapsed")) {
+                (Some(est), Some(el)) => Some(format!("estimate {est} · elapsed {el}")),
+                _ => None,
+            };
+            // `status` carries the workspace, for the row's agent chip.
+            Some(sys(
+                SystemKind::Overdue,
+                Some(v.trim_start_matches("task=").to_string()),
+                kv.get("workspace").cloned(),
+                detail,
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn parse_supervision(
     ts: DateTime<Utc>,
     project: Option<String>,
@@ -2382,6 +2461,37 @@ pub fn system_row(
                     .unwrap_or_else(|| format!("CI {}", status.unwrap_or("reported"))),
             )
         }
+        SystemKind::Reminder => (
+            system_chip("reminder"),
+            "reminder",
+            Tone::Blue,
+            sys.detail.clone().unwrap_or_else(|| "reminder".into()),
+        ),
+        SystemKind::Job => {
+            let (verb, tone) = match status {
+                Some("ok") => ("finished", Tone::Green),
+                Some("merged") => ("merged", Tone::Green),
+                Some("failed") => ("failed", Tone::LightRed),
+                Some("closed") => ("closed", Tone::Gray),
+                Some("exited") => ("exited", Tone::Gray),
+                _ => ("job", Tone::Gray),
+            };
+            (
+                system_chip("job"),
+                verb,
+                tone,
+                sys.detail.clone().unwrap_or_else(|| "job".into()),
+            )
+        }
+        SystemKind::Overdue => {
+            let (name, tone) = agent_display(status);
+            (
+                agent_chip(&name, tone),
+                "overdue",
+                Tone::Yellow,
+                title_of(sys.target.as_deref()),
+            )
+        }
         SystemKind::Other => (
             system_chip(sys.target.as_deref().unwrap_or("")),
             "event",
@@ -2423,7 +2533,8 @@ fn system_target(sys: &SystemEvent) -> Option<RowTarget> {
         | SystemKind::WorktreeDetach
         | SystemKind::Merge
         | SystemKind::Message
-        | SystemKind::Ci => task(&sys.target),
+        | SystemKind::Ci
+        | SystemKind::Overdue => task(&sys.target),
         SystemKind::Send | SystemKind::PaneDeath => sys.target.clone().map(RowTarget::Workspace),
         SystemKind::Supervision => sys
             .target
@@ -2434,6 +2545,8 @@ fn system_target(sys: &SystemEvent) -> Option<RowTarget> {
         | SystemKind::Closed
         | SystemKind::Handoff
         | SystemKind::Mode
+        | SystemKind::Reminder
+        | SystemKind::Job
         | SystemKind::Other => None,
     }
 }
@@ -2443,6 +2556,9 @@ fn system_target(sys: &SystemEvent) -> Option<RowTarget> {
 /// status token under the task title; others fold their detail into the title.
 fn detail_secondary(sys: &SystemEvent) -> Option<String> {
     match sys.kind {
+        // The task title is the row's title; the estimate and elapsed time
+        // go underneath.
+        SystemKind::Overdue => sys.detail.clone(),
         SystemKind::Dispatch | SystemKind::Rebase | SystemKind::WorktreeDetach => {
             sys.status.as_deref().map(humanize_token)
         }
@@ -2475,7 +2591,8 @@ fn event_task_id(ev: &Event) -> Option<&str> {
             | SystemKind::Push
             | SystemKind::WorktreeDetach
             | SystemKind::Merge
-            | SystemKind::Message => sys.target.as_deref(),
+            | SystemKind::Message
+            | SystemKind::Overdue => sys.target.as_deref(),
             _ => None,
         },
         _ => None,
@@ -2901,6 +3018,38 @@ mod tests {
         assert_eq!(row_of("message=m-1 task=t push=ok").verb, "delivered");
     }
 
+    /// Awareness notices read as human rows, never raw `key=value` wire syntax.
+    #[test]
+    fn awareness_rows_read_as_sentences() {
+        let now = Utc.with_ymd_and_hms(2026, 11, 5, 12, 0, 0).unwrap();
+        let row_of = |rest: &str| {
+            let Event::System(sys) = parse_event_line(&format!("2026-11-05T11:00:00Z {rest}"))
+            else {
+                panic!("not a system event: {rest}");
+            };
+            system_row(&sys, &no_cache(), now, 1)
+        };
+        let reminder = row_of(r#"project=p reminder id=r1 text="check the tap PR merged""#);
+        assert_eq!((reminder.verb.as_str(), reminder.title.as_str()), ("reminder", "check the tap PR merged"));
+
+        let failed = row_of(
+            r#"project=p job id=j2 kind=command label="desktop tests" status=failed exit=3 detail="1 failed""#,
+        );
+        assert_eq!(failed.verb, "failed");
+        assert_eq!(failed.verb_tone, Tone::LightRed);
+        assert_eq!(failed.title, "desktop tests · exit 3: 1 failed");
+        let merged = row_of(r#"project=p job id=j3 kind=pr label="PR #42" status=merged"#);
+        assert_eq!((merged.verb.as_str(), merged.title.as_str()), ("merged", "PR #42"));
+
+        let overdue = row_of("project=p task=t-1 overdue estimate=45m elapsed=1h10m workspace=alpha");
+        assert_eq!(overdue.verb, "overdue");
+        assert_eq!(overdue.target, Some(RowTarget::Task("t-1".into())));
+        assert_eq!(
+            overdue.secondary,
+            Some(Secondary::Detail("estimate 45m · elapsed 1h10m".into()))
+        );
+    }
+
     #[test]
     fn parses_legacy_task_event_with_defaults() {
         // Pre-workflow line shape (`Plans/workflows.md` §10). The
@@ -3241,6 +3390,24 @@ mod tests {
                 SystemKind::Ci,
                 Some("t"),
                 Some("failure"),
+            ),
+            (
+                r#"2026-07-22T14:00:00+00:00 project=shelbi reminder id=r1 text="check task=x ci merged""#,
+                SystemKind::Reminder,
+                Some("r1"),
+                None,
+            ),
+            (
+                r#"2026-07-22T14:00:00+00:00 project=shelbi job id=j2 kind=command label="desktop tests" status=failed exit=3 detail="1 failed""#,
+                SystemKind::Job,
+                Some("j2"),
+                Some("failed"),
+            ),
+            (
+                "2026-07-22T14:00:00+00:00 project=shelbi task=t overdue estimate=45m elapsed=1h10m workspace=alpha",
+                SystemKind::Overdue,
+                Some("t"),
+                Some("alpha"),
             ),
         ];
         for (line, kind, target, status) in cases {

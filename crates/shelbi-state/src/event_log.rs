@@ -131,6 +131,14 @@ impl EventEnvelope {
 #[serde(rename_all = "kebab-case")]
 pub enum EventKind {
     Heartbeat,
+    /// `project=P reminder id=<id> text="..."`: an awareness reminder came due.
+    Reminder,
+    /// `project=P job id=<id> kind=<kind> ... status=<status>`: a watched job
+    /// finished.
+    JobDone,
+    /// `project=P task=<id> overdue estimate=<d> elapsed=<d>`: an active task
+    /// ran past its estimate.
+    TaskOverdue,
     Task,
     Workspace,
     WorkspacePane,
@@ -150,8 +158,102 @@ pub enum EventKind {
     External,
 }
 
+/// The awareness kind of an event body (timestamp already stripped), keyed on
+/// the verb after the optional `project=` scope: `reminder`, `job`, or
+/// `task=<id> overdue`.
+fn awareness_kind(body: &str) -> Option<EventKind> {
+    let words = split_event_words(body);
+    let mut words = words.iter().copied().skip_while(|w| w.starts_with("project="));
+    match words.next()? {
+        "reminder" => Some(EventKind::Reminder),
+        "job" => Some(EventKind::JobDone),
+        w if w.starts_with("task=") && words.next() == Some("overdue") => {
+            Some(EventKind::TaskOverdue)
+        }
+        _ => None,
+    }
+}
+
+/// Split an events line into words like `split_whitespace`, except that a
+/// double-quoted value (`text="check the tap PR"`) stays one word, quotes
+/// included. Awareness lines quote their free-text fields this way (see
+/// [`quote_event_text`]); every reader that walks `key=value` words should
+/// split with this so a reminder's text can't forge a field or a verb.
+///
+/// A quote opens only right after a word's first `=` (or at the start of a
+/// word) and closes at the next `"`, so a stray quote inside an older line's
+/// unquoted value doesn't swallow the words after it.
+pub fn split_event_words(line: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut start: Option<usize> = None;
+    // Inside a quoted value.
+    let mut quoted = false;
+    // Byte index just past the current word's first `=`: the only place a
+    // quoted value may open.
+    let mut value_at: Option<usize> = None;
+    for (i, c) in line.char_indices() {
+        match start {
+            None if c.is_whitespace() => {}
+            None => {
+                start = Some(i);
+                quoted = c == '"';
+                value_at = (c == '=').then_some(i + 1);
+            }
+            Some(_) if quoted => quoted = c != '"',
+            Some(s) if c.is_whitespace() => {
+                words.push(&line[s..i]);
+                start = None;
+            }
+            Some(_) if c == '=' && value_at.is_none() => value_at = Some(i + 1),
+            Some(_) if c == '"' && value_at == Some(i) => quoted = true,
+            Some(_) => {}
+        }
+    }
+    if let Some(s) = start {
+        words.push(&line[s..]);
+    }
+    words
+}
+
+/// A word's value with one pair of surrounding double quotes removed
+/// (`"a b"` -> `a b`); unquoted values pass through.
+pub fn unquote_event_value(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
+/// Quote free text for an events line: `"` becomes `'`, every control
+/// character (newlines included) becomes a space, and the text is cut to
+/// `max` chars with an ellipsis. The result is one [`split_event_words`]
+/// word, readable by the activity feed's `parse_kv` as well.
+pub fn quote_event_text(text: &str, max: usize) -> String {
+    let cleaned: String = text
+        .trim()
+        .chars()
+        .map(|c| match c {
+            '"' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    format!("\"{}\"", truncate_with_ellipsis(&cleaned, max))
+}
+
+/// How many chars of a reminder's text, a job's label, or its detail line an
+/// event carries.
+const AWARENESS_TEXT_BUDGET: usize = 200;
+
 impl EventKind {
     fn from_body(body: &str) -> Self {
+        // Awareness lines carry free text (`text="..."`, `label="..."`) that
+        // may contain any of the substrings the broad branches below look
+        // for (` heartbeat`, ` ci `, ` task=`), so classify them first, on
+        // their leading verb.
+        if let Some(kind) = awareness_kind(body) {
+            return kind;
+        }
         // Prefix events may also carry `task=` / `workspace=` metadata. Match
         // their discriminator before those broad field-based branches or a
         // send verdict is mislabeled as an ordinary workspace event.
@@ -1953,6 +2055,109 @@ pub fn append_ci_event(
         Err(e) if is_permission_denied(&e) => emit_event_body(&body),
         Err(e) => Err(e),
     }
+}
+
+/// Write an awareness event body, falling back to the hub socket when the log
+/// isn't writable from this process (the same fallback `ci` lines use).
+fn append_awareness_body(body: String) -> Result<()> {
+    let line = format!("{} {body}", Utc::now().to_rfc3339());
+    match append_event_line(&line) {
+        Ok(()) => Ok(()),
+        Err(e) if is_permission_denied(&e) => emit_event_body(&body),
+        Err(e) => Err(e),
+    }
+}
+
+/// Append an awareness reminder that came due:
+///
+/// ```text
+/// <rfc3339> project=<p> reminder id=<id> text="check the tap PR merged"
+/// ```
+pub fn append_reminder_event(project: &str, id: &str, text: &str) -> Result<()> {
+    append_awareness_body(format!(
+        "project={} reminder id={} text={}",
+        sanitize_field(project),
+        sanitize_field(id),
+        quote_event_text(text, AWARENESS_TEXT_BUDGET),
+    ))
+}
+
+/// What a finished awareness job reports. `exit` is set for a command job;
+/// `log` names its full output file.
+#[derive(Debug, Clone, Default)]
+pub struct JobEvent<'a> {
+    pub id: &'a str,
+    pub kind: &'a str,
+    pub label: &'a str,
+    /// `ok` / `failed` for a command or CI; `exited` for a pid; `merged` /
+    /// `closed` / `ok` / `failed` for a PR; `lost` when a runner vanished.
+    pub status: &'a str,
+    pub exit: Option<i32>,
+    pub detail: Option<&'a str>,
+    pub log: Option<&'a Path>,
+}
+
+/// Append a finished awareness job:
+///
+/// ```text
+/// <rfc3339> project=<p> job id=<id> kind=command label="desktop tests" status=failed exit=3 detail="<last line>" log=<path>
+/// ```
+///
+/// `log=` is omitted when the path holds whitespace (it would tear the word).
+pub fn append_job_event(project: &str, job: &JobEvent<'_>) -> Result<()> {
+    let mut body = format!(
+        "project={} job id={} kind={} label={} status={}",
+        sanitize_field(project),
+        sanitize_field(job.id),
+        sanitize_field(job.kind),
+        quote_event_text(job.label, AWARENESS_TEXT_BUDGET),
+        sanitize_field(job.status),
+    );
+    if let Some(exit) = job.exit {
+        body.push_str(&format!(" exit={exit}"));
+    }
+    if let Some(detail) = job.detail.filter(|d| !d.trim().is_empty()) {
+        body.push_str(&format!(" detail={}", quote_event_text(detail, AWARENESS_TEXT_BUDGET)));
+    }
+    if let Some(log) = job
+        .log
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.chars().any(|c| c.is_whitespace() || c == '"'))
+    {
+        body.push_str(&format!(" log={log}"));
+    }
+    append_awareness_body(body)
+}
+
+/// Append an overdue alert for an active task:
+///
+/// ```text
+/// <rfc3339> project=<p> task=<id> overdue estimate=45m elapsed=1h10m workspace=<ws>
+/// ```
+///
+/// `elapsed` is rounded down to the minute once it is at least a minute.
+pub fn append_task_overdue_event(
+    project: &str,
+    task_id: &str,
+    estimate: std::time::Duration,
+    elapsed: std::time::Duration,
+    workspace: Option<&str>,
+) -> Result<()> {
+    let elapsed = if elapsed.as_secs() >= 60 {
+        std::time::Duration::from_secs(elapsed.as_secs() / 60 * 60)
+    } else {
+        elapsed
+    };
+    let workspace = workspace
+        .map(|w| format!(" workspace={}", sanitize_field(w)))
+        .unwrap_or_default();
+    append_awareness_body(format!(
+        "project={} task={} overdue estimate={} elapsed={}{workspace}",
+        sanitize_field(project),
+        sanitize_field(task_id),
+        shelbi_core::format_duration(estimate),
+        shelbi_core::format_duration(elapsed),
+    ))
 }
 
 /// Append a new-issue-comment notice to `~/.shelbi/events.log`:

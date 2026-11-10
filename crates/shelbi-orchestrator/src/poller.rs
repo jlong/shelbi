@@ -288,6 +288,12 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // are not retroactively reconciled — the accepted watermark tradeoff.
     let mut issue_reconcile = IssueReconcileSchedule::default();
 
+    // Awareness store evaluation (reminders, watched jobs, task estimates).
+    // The timing lives on disk in `awareness.json`, so this in-memory state
+    // only paces the GitHub-backed watches; a restart re-seeds it and samples
+    // them on the first tick.
+    let mut awareness_state = crate::awareness::AwarenessTickState::default();
+
     // The project-wide supervisor job (`rt-daemon-cancellation`): its
     // mutating passes below (orchestrator supervision, CI/GitHub/issue
     // reconciles, stranded-slot resumes) all run on this thread and shell out,
@@ -447,6 +453,18 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 // connectivity + its own watermark so a quiet board pays almost
                 // nothing.
                 maybe_reconcile_issues(&project, &mut issue_reconcile, online_probe);
+
+                // Awareness: fire due reminders, report finished jobs, and
+                // alert on active tasks past their estimate (clearing the
+                // estimate of any task that left the active category). Cheap
+                // when the store is empty: one small file read. GitHub-backed
+                // watches sample on their own cadence and only while online.
+                crate::awareness::tick(
+                    &project,
+                    &mut awareness_state,
+                    chrono::Utc::now(),
+                    &crate::awareness::LiveProbe { is_online: online_probe },
+                );
             }
             Err(e) => tracing::debug!(
                 project = %project.name,

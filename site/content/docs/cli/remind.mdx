@@ -1,0 +1,56 @@
+---
+title: shelbi remind
+order: 33.6
+summary: Set reminders the hub delivers to the orchestrator as events when they come due.
+---
+
+```text
+shelbi remind in <DURATION> <TEXT>... [--every <DURATION>]
+shelbi remind at <TIME> <TEXT>... [--every <DURATION>]
+shelbi remind list [--json]
+shelbi remind cancel <ID>
+```
+
+A reminder is a note to the orchestrator about something it is waiting on that
+no other event will announce, such as "check the release tap PR merged". The
+hub keeps it in `~/.shelbi/projects/<project>/awareness.json` and, once it
+comes due, writes one line to `~/.shelbi/events.log`:
+
+```text
+<ts> project=<p> reminder id=r3 text="check the release tap PR merged"
+```
+
+`shelbi orchestrator events next` reports it with kind `reminder`. The hub
+checks reminders every 5 seconds. They live on disk, so they survive the
+orchestrator restarting and the hub daemon restarting; one that came due while
+the daemon was down fires once when it starts.
+
+Durations take the same forms as the `heartbeat` setting: `30s`, `5m`, `1h`, and
+compounds like `1h30m`.
+
+## in
+
+Due after a duration: `shelbi remind in 1h "check the tap PR merged"`. The text
+words are joined, so quoting is optional.
+
+## at
+
+Due at a time: `15:00` (local time, tomorrow if it has already passed today),
+`2026-11-12 09:30` (local), or an RFC 3339 timestamp.
+
+| Option | Meaning |
+| --- | --- |
+| `--every <DURATION>` | Repeat after the first time, at least every `10m`. A recurring reminder that missed several slots while the daemon was down fires once, then keeps its schedule. Cancel it to stop. |
+
+## list
+
+Lists pending reminders, soonest first. `--json` prints them as JSON.
+
+## cancel
+
+Removes a pending reminder by id.
+
+## See also
+
+- [`shelbi job`](/docs/cli/job): get notified when a command, process, CI run, or PR finishes.
+- [`shelbi issue estimate`](/docs/cli/issue#estimate): get notified when active work runs long.

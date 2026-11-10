@@ -244,6 +244,7 @@ mod tests {
             git,
             zen: None,
             review: None,
+            default_estimate: None,
         }
     }
 

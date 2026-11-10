@@ -83,6 +83,10 @@ enum WakePriority {
     /// quiet heartbeat can never mask or re-order a pending actionable batch.
     HeartbeatKeepAlive,
     Heartbeat,
+    /// An awareness notification the orchestrator asked for: a reminder came
+    /// due, a watched job finished, or an active task ran past its estimate.
+    /// Above heartbeats so it is delivered ahead of a routine board digest.
+    Awareness,
     WorkspaceFree,
     Ready,
     /// A card entered an `active`-category status that this move did not itself
@@ -3064,16 +3068,24 @@ struct ParsedLine {
 
 impl ParsedLine {
     fn parse(line: &str) -> Self {
-        let words = line
-            .split_whitespace()
+        // Quote-aware: an awareness line's `text="..."` / `label="..."` stays one
+        // word, so its free text can't forge a field or a bare verb.
+        let words = shelbi_state::split_event_words(line)
+            .into_iter()
             .map(str::to_string)
             .collect::<Vec<_>>();
         let timestamp = words.first().cloned();
         let mut fields = BTreeMap::new();
         for word in &words {
             if let Some((key, value)) = word.split_once('=') {
-                fields.insert(key.to_string(), value.to_string());
-            } else if matches!(word.as_str(), "heartbeat" | "dispatch" | "send" | "rebase") {
+                fields.insert(
+                    key.to_string(),
+                    shelbi_state::unquote_event_value(value).to_string(),
+                );
+            } else if matches!(
+                word.as_str(),
+                "heartbeat" | "dispatch" | "send" | "rebase" | "reminder" | "job" | "overdue"
+            ) {
                 fields.insert(word.clone(), "true".into());
             }
         }
@@ -3092,6 +3104,14 @@ impl ParsedLine {
 }
 
 fn line_priority(parsed: &ParsedLine, board_in_flight: bool) -> Option<WakePriority> {
+    // Awareness first: an overdue line carries `task=`, and none of these is
+    // a board transition the tiers below would recognize.
+    if ["reminder", "job", "overdue"]
+        .iter()
+        .any(|verb| parsed.fields.contains_key(*verb))
+    {
+        return Some(WakePriority::Awareness);
+    }
     if parsed.fields.get("mode").map(String::as_str) == Some("zen")
         || (parsed.fields.contains_key("zen") && !parsed.fields.contains_key("heartbeat"))
     {
@@ -3153,7 +3173,13 @@ fn line_priority(parsed: &ParsedLine, board_in_flight: bool) -> Option<WakePrior
 }
 
 fn event_kind(parsed: &ParsedLine) -> String {
-    if parsed.fields.contains_key("heartbeat") {
+    if parsed.fields.contains_key("reminder") {
+        "reminder"
+    } else if parsed.fields.contains_key("job") {
+        "job_done"
+    } else if parsed.fields.contains_key("overdue") {
+        "task_overdue"
+    } else if parsed.fields.contains_key("heartbeat") {
         "heartbeat"
     } else if parsed.fields.get("mode").map(String::as_str) == Some("zen")
         || (parsed.fields.contains_key("zen") && !parsed.fields.contains_key("heartbeat"))
@@ -3255,6 +3281,27 @@ mod tests {
             line_priority(&heartbeat, true),
             Some(WakePriority::Heartbeat)
         );
+    }
+
+    #[test]
+    fn awareness_lines_wake_above_heartbeats_with_their_own_kinds() {
+        for (line, kind) in [
+            (r#"t project=demo reminder id=r1 text="heartbeat task=x a -> b""#, "reminder"),
+            (
+                r#"t project=demo job id=j2 kind=command label="tests" status=ok exit=0"#,
+                "job_done",
+            ),
+            (
+                "t project=demo task=t-1 overdue estimate=10m elapsed=20m workspace=alpha",
+                "task_overdue",
+            ),
+        ] {
+            let p = parsed(line);
+            assert_eq!(line_priority(&p, false), Some(WakePriority::Awareness), "{line}");
+            assert_eq!(event_kind(&p), kind, "{line}");
+        }
+        assert!(WakePriority::Heartbeat < WakePriority::Awareness);
+        assert!(!WakePriority::Awareness.is_keep_alive());
     }
 
     #[test]

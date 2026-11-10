@@ -5999,6 +5999,7 @@ transitions:
             git: None,
             zen: None,
             review: None,
+            default_estimate: None,
         }
     }
 
@@ -6070,6 +6071,7 @@ transitions:
             git: None,
             zen: None,
             review: None,
+            default_estimate: None,
         }
     }
 
@@ -7026,6 +7028,7 @@ transitions:
             }),
             zen: None,
             review: None,
+            default_estimate: None,
         }
     }
 

@@ -20,6 +20,7 @@ use shelbi_core::{
 };
 
 mod agent_workspaces;
+pub mod awareness;
 pub mod board_index;
 pub mod change_bus;
 pub mod changelog;
@@ -213,7 +214,8 @@ pub use event_log::{
     append_board_rate_limited_event,
     append_board_unreachable_event,
     append_daemon_event,
-    append_ci_event, append_clarification_event, append_dispatch_event, append_external_event,
+    append_ci_event, append_clarification_event, append_job_event, append_reminder_event,
+    append_task_overdue_event, quote_event_text, split_event_words, unquote_event_value, JobEvent, append_dispatch_event, append_external_event,
     append_handoff_action_failed_event, append_handoff_refused_event,
     append_orphan_reap_failed_event,
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
@@ -1230,7 +1232,7 @@ pub fn try_lock_zen_target_cleanup(key: &str) -> Result<Option<ZenTargetLock>> {
 /// Sibling lock-file path for `path` (`state.json` → `state.json.lock`).
 /// The suffix is appended to the full file name — never `with_extension`,
 /// which would collide `a.json` and `a.yaml` onto the same lock.
-fn sibling_lock_path(path: &Path) -> PathBuf {
+pub(crate) fn sibling_lock_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     path.with_file_name(name)

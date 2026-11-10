@@ -143,6 +143,17 @@ pub struct Workflow {
     /// **not** boot a default-port server.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ReviewServe>,
+
+    /// How long a task on this workflow is expected to stay in its `active`
+    /// category when the orchestrator starts it without an explicit
+    /// `--estimate` (`default_estimate: 90m`). Drives the awareness system's
+    /// overdue alerts. `None` (the default) records no estimate.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::duration::serde_compact::option"
+    )]
+    pub default_estimate: Option<std::time::Duration>,
 }
 
 impl Workflow {
@@ -937,6 +948,7 @@ pub fn default_workflow() -> Workflow {
         git: None,
         zen: None,
         review: None,
+        default_estimate: None,
     }
 }
 
@@ -1054,6 +1066,7 @@ pub fn task_workflow() -> Workflow {
         }),
         zen: None,
         review: None,
+        default_estimate: None,
     }
 }
 
@@ -1151,6 +1164,7 @@ pub fn subtask_workflow() -> Workflow {
         }),
         zen: None,
         review: None,
+        default_estimate: None,
     }
 }
 
@@ -1716,6 +1730,8 @@ struct RawWorkflow {
     zen: Option<WorkflowZenConfig>,
     #[serde(default)]
     review: Option<ReviewServe>,
+    #[serde(default, with = "crate::duration::serde_compact::option")]
+    default_estimate: Option<std::time::Duration>,
 }
 
 #[derive(Deserialize)]
@@ -1818,6 +1834,7 @@ fn convert_raw_workflow(raw: RawWorkflow) -> crate::Result<(Workflow, Vec<Status
             git: raw.git,
             zen: raw.zen,
             review: raw.review,
+            default_estimate: raw.default_estimate,
         },
         migrations,
     ))
@@ -3265,6 +3282,7 @@ statuses:
             git: None,
             zen: None,
             review: None,
+            default_estimate: None,
         };
         let err = wf.validate().unwrap_err();
         match &err {

@@ -18,6 +18,7 @@ use shelbi_core::{
 use shelbi_proto::control::{AddSpec, EditSpec, MutationKind, SubOp};
 
 use super::{mutate_client, require_project};
+use shelbi_state::awareness;
 
 #[derive(Debug, Subcommand)]
 pub enum IssueCmd {
@@ -117,6 +118,21 @@ pub enum IssueCmd {
         /// over from someone else). The orchestrator never passes this itself.
         #[arg(long)]
         take: bool,
+        /// How long the issue should stay active (`45m`, `2h`, `1h30m`). If it
+        /// is still active after that, an `overdue` line goes to the events
+        /// log, then again every half the estimate (at least 10m) until it
+        /// leaves the active category. Without it, the issue's workflow
+        /// `default_estimate:` applies; with neither, no estimate is kept.
+        #[arg(long, value_name = "DURATION")]
+        estimate: Option<String>,
+    },
+    /// Set or revise the estimate of an active issue (see `start --estimate`).
+    /// The estimate is the total time active, counted from when the issue
+    /// started; a revision that is already exceeded alerts on the next tick.
+    Estimate {
+        id: String,
+        /// `45m`, `2h`, `1h30m`.
+        duration: String,
     },
     /// Relaunch the assigned workspace on the issue it is ALREADY working,
     /// WITHOUT discarding progress. For a stalled or killed worker: recreates
@@ -380,17 +396,30 @@ pub fn run(project_opt: Option<String>, cmd: IssueCmd) -> Result<()> {
             reason,
             force,
             take,
-        } => mutate_client::run_mutation(
-            &project,
-            &id,
-            MutationKind::Start {
-                workspace,
-                branch,
-                reason,
-                force,
-                take,
-            },
-        ),
+            estimate,
+        } => {
+            // Parse before starting so a typo can't leave a started issue
+            // without the estimate the caller asked for.
+            let estimate = estimate
+                .as_deref()
+                .map(shelbi_core::parse_duration)
+                .transpose()
+                .map_err(|e| anyhow!(e))?;
+            mutate_client::run_mutation(
+                &project,
+                &id,
+                MutationKind::Start {
+                    workspace,
+                    branch,
+                    reason,
+                    force,
+                    take,
+                },
+            )?;
+            record_start_estimate(&project, &id, estimate);
+            Ok(())
+        }
+        IssueCmd::Estimate { id, duration } => set_estimate(&project, &id, &duration),
         IssueCmd::Resume {
             id,
             workspace,
@@ -401,6 +430,94 @@ pub fn run(project_opt: Option<String>, cmd: IssueCmd) -> Result<()> {
         IssueCmd::Edit(args) => edit(&project, args),
         IssueCmd::Rm { id } => rm(&project, &id),
         IssueCmd::Comment { id, text } => comment(&project, &id, &text),
+    }
+}
+
+/// After a successful `issue start`: record the explicit `--estimate`, else the
+/// workflow's `default_estimate:`, else nothing (dropping any estimate left from
+/// an earlier start). Best-effort: the issue has already started, so a failure
+/// here warns instead of failing the command.
+fn record_start_estimate(project: &str, id: &str, explicit: Option<std::time::Duration>) {
+    let result = (|| -> Result<Option<std::time::Duration>> {
+        let tf = load_issue(project, id)?;
+        let estimate = match explicit {
+            Some(d) => Some(d),
+            None => {
+                let project_yaml = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
+                shelbi_state::load_task_workflow(project, &project_yaml, &tf.task)
+                    .map_err(|e| anyhow!(e))?
+                    .default_estimate
+            }
+        };
+        match estimate {
+            Some(d) => {
+                awareness::set_estimate(
+                    project,
+                    id,
+                    d,
+                    chrono::Utc::now(),
+                    tf.task.assigned_to.as_deref(),
+                )
+                .map_err(|e| anyhow!(e))?;
+            }
+            None => {
+                awareness::clear_estimate(project, id).map_err(|e| anyhow!(e))?;
+            }
+        }
+        Ok(estimate)
+    })();
+    match result {
+        Ok(Some(d)) => println!("  estimate: {}", shelbi_core::format_duration(d)),
+        Ok(None) => {}
+        Err(e) => eprintln!("warning: issue started, but its estimate was not recorded: {e}"),
+    }
+}
+
+/// `shelbi issue estimate <id> <duration>`.
+fn set_estimate(project: &str, id: &str, duration: &str) -> Result<()> {
+    let d = shelbi_core::parse_duration(duration).map_err(|e| anyhow!(e))?;
+    match shelbi_orchestrator::awareness::task_category(project, id).map_err(|e| anyhow!(e))? {
+        None => bail!("issue `{id}` not found"),
+        Some(shelbi_core::StatusCategory::Active) => {}
+        Some(other) => bail!(
+            "issue `{id}` is not active ({other}); estimates apply to active issues. \
+             Start it with `shelbi issue start {id} --estimate {duration}`"
+        ),
+    }
+    let existing = awareness::read_awareness(project)
+        .map_err(|e| anyhow!(e))?
+        .estimate(id)
+        .cloned();
+    let (started_at, workspace) = match &existing {
+        Some(e) => (e.started_at, e.workspace.clone()),
+        None => (chrono::Utc::now(), load_issue(project, id)?.task.assigned_to),
+    };
+    let est = awareness::set_estimate(project, id, d, started_at, workspace.as_deref())
+        .map_err(|e| anyhow!(e))?;
+    let verb = if existing.is_some() { "revised" } else { "set" };
+    println!(
+        "✓ {verb} estimate for {id}: {} ({})",
+        shelbi_core::format_duration(est.estimate),
+        estimate_status(&est, chrono::Utc::now())
+    );
+    Ok(())
+}
+
+/// `elapsed 20m, 25m left` / `elapsed 1h10m, overdue by 25m`.
+fn estimate_status(est: &awareness::Estimate, now: chrono::DateTime<chrono::Utc>) -> String {
+    let elapsed = (now - est.started_at).to_std().unwrap_or_default();
+    let minute = |d: std::time::Duration| {
+        let secs = d.as_secs();
+        shelbi_core::format_duration(std::time::Duration::from_secs(if secs >= 60 {
+            secs / 60 * 60
+        } else {
+            secs
+        }))
+    };
+    if elapsed >= est.estimate {
+        format!("elapsed {}, overdue by {}", minute(elapsed), minute(elapsed - est.estimate))
+    } else {
+        format!("elapsed {}, {} left", minute(elapsed), minute(est.estimate - elapsed))
     }
 }
 
@@ -701,6 +818,21 @@ fn show(project: &str, id: &str) -> Result<()> {
                 owner.label()
             );
         }
+    }
+
+    // Footer: the awareness estimate, while the issue is active.
+    if let Some(est) = awareness::read_awareness(project)
+        .ok()
+        .and_then(|store| store.estimate(id).cloned())
+    {
+        if !text.ends_with('\n') {
+            println!();
+        }
+        println!(
+            "→ estimate: {} ({})",
+            shelbi_core::format_duration(est.estimate),
+            estimate_status(&est, chrono::Utc::now())
+        );
     }
 
     // Footer: resolved depends_on. Done lazily after the frontmatter dump so

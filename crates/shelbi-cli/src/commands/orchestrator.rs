@@ -1111,6 +1111,17 @@ fn line_belongs_to_project(scope: &ProjectScope, parsed: &ParsedLine) -> bool {
 }
 
 fn event_kind(parsed: &ParsedLine) -> String {
+    // Awareness lines first: an overdue line carries `task=` and a job line
+    // carries `kind=`, so the broad branches below would mislabel them.
+    if parsed.fields.contains_key("reminder") {
+        return "reminder".into();
+    }
+    if parsed.fields.contains_key("job") {
+        return "job_done".into();
+    }
+    if parsed.fields.contains_key("overdue") {
+        return "task_overdue".into();
+    }
     // Match the review-ready discriminator before the broad `task=` / `workspace=`
     // branches: a review-ready line carries both as metadata but is its own kind.
     if parsed.fields.contains_key("review-ready") {
@@ -1173,7 +1184,9 @@ struct ParsedLine {
 
 impl ParsedLine {
     fn parse(line: &str) -> Self {
-        let mut parts = line.split_whitespace().collect::<Vec<_>>();
+        // Quote-aware: an awareness line's `text="..."` / `label="..."` stays one
+        // word, so its free text can't forge a field or a bare verb.
+        let mut parts = shelbi_state::split_event_words(line);
         let timestamp = parts.first().map(|s| (*s).to_string());
         if !parts.is_empty() {
             parts.remove(0);
@@ -1182,7 +1195,7 @@ impl ParsedLine {
         let mut fields = BTreeMap::new();
         for part in &parts {
             if let Some((k, v)) = part.split_once('=') {
-                fields.insert(k.to_string(), v.to_string());
+                fields.insert(k.to_string(), shelbi_state::unquote_event_value(v).to_string());
             } else if *part == "heartbeat" {
                 fields.insert("heartbeat".into(), "true".into());
             } else if *part == "dispatch"
@@ -1190,6 +1203,9 @@ impl ParsedLine {
                 || *part == "rebase"
                 || *part == "zen-dryrun"
                 || *part == "review-ready"
+                || *part == "reminder"
+                || *part == "job"
+                || *part == "overdue"
             {
                 fields.insert((*part).to_string(), "true".into());
             }
@@ -1829,6 +1845,52 @@ workspaces: []\n";
         assert_eq!(workspace.workspace.as_deref(), Some("alpha"));
         assert_eq!(workspace.from.as_deref(), Some("working"));
         assert_eq!(workspace.to.as_deref(), Some("awaiting_input"));
+    }
+
+    #[test]
+    fn drain_labels_the_awareness_kinds_and_unquotes_their_text() {
+        let (_guard, _tmp) = setup_home();
+        // Free text that would trip the broad branches if it were split on
+        // whitespace: `heartbeat`, `task=`, `->`.
+        shelbi_state::append_reminder_event("demo", "r1", "heartbeat says task=x a -> b")
+            .unwrap();
+        shelbi_state::append_job_event(
+            "demo",
+            &shelbi_state::JobEvent {
+                id: "j2",
+                kind: "command",
+                label: "desktop tests",
+                status: "failed",
+                exit: Some(3),
+                detail: Some("1 failed"),
+                log: None,
+            },
+        )
+        .unwrap();
+        shelbi_state::append_task_overdue_event(
+            "demo",
+            "t-1",
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(1200),
+            Some("alpha"),
+        )
+        .unwrap();
+
+        let response = drain_once("demo", 0).unwrap();
+        let kinds: Vec<_> = response.events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(kinds, ["reminder", "job_done", "task_overdue"]);
+        let reminder = &response.events[0];
+        assert_eq!(
+            reminder.metadata.get("text").map(String::as_str),
+            Some("heartbeat says task=x a -> b")
+        );
+        assert!(reminder.task.is_none() && reminder.from.is_none());
+        let job = &response.events[1];
+        assert_eq!(job.metadata.get("label").map(String::as_str), Some("desktop tests"));
+        assert_eq!(job.metadata.get("exit").map(String::as_str), Some("3"));
+        let overdue = &response.events[2];
+        assert_eq!(overdue.task.as_deref(), Some("t-1"));
+        assert_eq!(overdue.metadata.get("elapsed").map(String::as_str), Some("20m"));
     }
 
     #[test]

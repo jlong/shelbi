@@ -677,6 +677,7 @@ impl WorkflowConfig {
             git: None,
             zen: None,
             review: None,
+            default_estimate: None,
         };
         let mut next = self.clone();
         next.workflows.push(Entry {
