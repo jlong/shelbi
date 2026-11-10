@@ -111,6 +111,7 @@ pub mod machine_form;
 pub mod machine_form_state;
 pub mod markdown;
 pub mod onboarding;
+pub mod orchestrator;
 pub mod overlay;
 pub mod pane_session;
 pub mod pane_split;

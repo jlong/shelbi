@@ -3747,9 +3747,7 @@ mod tests {
             default_branch: "main".into(),
             default_workflow: None,
             config_mode: None,
-            orchestrator: shelbi_core::OrchestratorSpec {
-                runner: "codex".into(),
-            },
+            orchestrator: shelbi_core::OrchestratorSpec::new("codex"),
             agent_runners: BTreeMap::new(),
             github_url: None,
             workspace_poll_interval_secs: 5,

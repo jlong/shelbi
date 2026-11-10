@@ -1295,7 +1295,7 @@ fn tone_color(tone: Tone, theme: &Theme) -> Hsla {
 
 /// A card's radio: on, a ring with a dot inside in the Primary label's
 /// color; off, a heavier ring in the gray (the frames' ◉ and ○, 14 × 18).
-fn radio(on: bool, theme: &Theme) -> Div {
+pub(crate) fn radio(on: bool, theme: &Theme) -> Div {
     let ring = div()
         .flex()
         .items_center()

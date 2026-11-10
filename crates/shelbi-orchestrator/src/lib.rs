@@ -643,6 +643,49 @@ pub fn relaunch_orchestrator_session(project_name: &str) -> Result<BootstrapStat
     spawn_orchestrator_locked(project_name, &host, hub.work_dir.as_path(), &runner_spec)
 }
 
+/// How long [`replace_orchestrator_session`] waits for the signalled
+/// orchestrator session to exit before bringing up its replacement.
+const ORCH_EXIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const ORCH_EXIT_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// End `project_name`'s orchestrator session and bring a fresh one up (it
+/// ingests any handoff file on disk). Worker sessions are left running. The
+/// second half of `shelbi reload` and of [`restart_orchestrator`].
+///
+/// The kill only signals. Until the session has exited, the bootstrap would
+/// see it as live and attach, launching nothing and leaving the replacement to
+/// the supervisor. If the wait runs out (or a re-exec'd client already
+/// launched the replacement) the bootstrap attaches and the handoff stays on
+/// disk for whichever launch comes next.
+pub fn replace_orchestrator_session(project_name: &str) -> Result<()> {
+    let orch = format!("{project_name}/orch");
+    let backend = backend();
+    let _ = backend.kill_window(&Host::Local, &orch);
+    let target = SessionTarget::session(format!("shelbi-{project_name}"));
+    let deadline = std::time::Instant::now() + ORCH_EXIT_TIMEOUT;
+    while backend.probe(&Host::Local, &target, None).is_alive() && std::time::Instant::now() < deadline {
+        std::thread::sleep(ORCH_EXIT_POLL);
+    }
+    ensure_dashboard(project_name)
+        .map(|_| ())
+        .map_err(|e| Error::Other(format!("respawning the orchestrator session: {e}")))
+}
+
+/// Restart `project_name`'s orchestrator the way `shelbi reload` replaces it,
+/// without restarting the daemon or touching any worker: ask the live
+/// orchestrator for its handoff, then [`replace_orchestrator_session`]. The new
+/// session reads the project config afresh, so a setting that applies at
+/// launch (Settings ▸ Orchestrator's event delivery) takes effect. A refused
+/// handoff preflight stops before anything is killed, leaving the
+/// orchestrator running. Blocking: the handoff waits up to its timeout.
+pub fn restart_orchestrator(project_name: &str) -> Result<handoff::HandoffOutcome> {
+    let outcome = handoff::request_orchestrator_handoff(project_name).map_err(|e| {
+        Error::Other(format!("the orchestrator was left running: {e}"))
+    })?;
+    replace_orchestrator_session(project_name)?;
+    Ok(outcome)
+}
+
 /// `spec` (the runner `orchestrator.runner` names) with the orchestrator's
 /// model ([`shelbi_core::orchestrator_model`]: the project's
 /// `runners.<kind>.model`, else `agents/orchestrator/agent.yaml`'s) as its

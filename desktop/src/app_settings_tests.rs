@@ -1,6 +1,6 @@
 //! Settings in its own sidebar (`dt-settings-sections`): opening it pushes
 //! the settings sidebar into the leading column on the General page (or the
-//! last page used), ⌘1 to ⌘6 and ↑ / ↓ plus Enter switch its pages while it
+//! last page used), ⌘1 to ⌘7 and ↑ / ↓ plus Enter switch its pages while it
 //! is open (and ⌘N keeps its sidebar meaning outside), and Back or Esc
 //! return to the view it was opened over with the app sidebar back and its
 //! selection on that view's row (`dt-back-syncs-sidebar`).
@@ -234,13 +234,16 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
     s.key("down");
     s.key("down");
     s.key("down");
+    s.key("down");
+    s.key("down");
     assert_eq!(
         s.selected_row(),
-        Some(SettingsPage::Agents),
+        Some(SettingsPage::Orchestrator),
         "it stops at the last row"
     );
     s.key("enter");
-    assert_eq!(s.page(), Some(SettingsPage::Agents));
+    assert_eq!(s.page(), Some(SettingsPage::Orchestrator));
+    s.key("up");
     s.key("up");
     s.key("up");
     s.key("up");
@@ -1462,6 +1465,98 @@ fn workflow_actions_create_duplicate_default_and_guard_delete(cx: &mut TestAppCo
     s.click("workflow-delete-hotfix");
     s.saved();
     assert!(!home.workflows().join("hotfix.yaml").exists());
+}
+
+// ---- Settings ▸ Orchestrator (`awareness-setting`) ---------------------------
+
+use crate::views::orchestrator::{mode_selector, OrchestratorPage};
+use shelbi_core::AwarenessMode;
+
+impl Settings {
+    /// Settings on Orchestrator (⌘7), its page loaded from `home`'s files.
+    fn open_orchestrator(cx: &mut TestAppContext) -> Settings {
+        let mut s = Settings::open(cx);
+        s.open_settings();
+        s.key("cmd-7");
+        let page = s.orchestrator();
+        s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
+        s.saved();
+        s
+    }
+
+    fn orchestrator(&self) -> Entity<OrchestratorPage> {
+        self.read(|w, cx| match &w.route {
+            Route::Settings(view) => view.read(cx).orchestrator(),
+            _ => panic!("Settings is open"),
+        })
+    }
+}
+
+#[gpui::test]
+fn the_orchestrator_page_saves_the_event_delivery_to_the_project_yaml(cx: &mut TestAppContext) {
+    let _home = Home::with_project("orch-page", "alpha");
+    let mut s = Settings::open_orchestrator(cx);
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Orchestrator), Some(SettingsPage::Orchestrator)));
+    for selector in [
+        "settings-nav-orchestrator",
+        "settings-page-orchestrator",
+        "orchestrator-event-delivery",
+        "orchestrator-mode-heartbeat",
+        "orchestrator-mode-awareness",
+        "orchestrator-applies",
+        "orchestrator-restart",
+    ] {
+        assert!(s.drawn(selector), "{selector}");
+    }
+    // The two options, one above the other, then the note beside the button.
+    let v1 = s.bounds(mode_selector(AwarenessMode::Heartbeat)).unwrap();
+    let v2 = s.bounds(mode_selector(AwarenessMode::Awareness)).unwrap();
+    let note = s.bounds("orchestrator-applies").unwrap();
+    let restart = s.bounds("orchestrator-restart").unwrap();
+    assert!(v1.bottom() <= v2.top() && v2.bottom() <= note.top(), "in the wireframe's order");
+    assert!(note.right() <= restart.left(), "the note beside the button");
+    let page = s.orchestrator();
+    let mode = |s: &Settings| s.read(|_, cx| page.read(cx).form().mode());
+    assert_eq!(mode(&s), AwarenessMode::Heartbeat, "unset is v1");
+
+    s.click("orchestrator-mode-awareness");
+    s.saved();
+    assert_eq!(mode(&s), AwarenessMode::Awareness);
+    assert!(s.drawn("orchestrator-status"), "Saved to … shows");
+    assert_eq!(
+        shelbi_state::load_project("alpha").unwrap().orchestrator.awareness,
+        AwarenessMode::Awareness,
+        "written as orchestrator.awareness"
+    );
+
+    s.click("orchestrator-mode-heartbeat");
+    s.saved();
+    assert_eq!(shelbi_state::load_project("alpha").unwrap().orchestrator.awareness, AwarenessMode::Heartbeat);
+}
+
+#[gpui::test]
+fn restart_orchestrator_asks_the_projects_daemon_once(cx: &mut TestAppContext) {
+    let _home = Home::with_project("orch-restart", "alpha");
+    let mut s = Settings::open_orchestrator(cx);
+    let page = s.orchestrator();
+    let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let seen = calls.clone();
+    s.update(|_, _, cx| {
+        page.update(cx, |p, _| {
+            p.set_restarter(std::sync::Arc::new(move |handle| {
+                seen.lock().unwrap().push(handle.name().to_string());
+                Ok(())
+            }))
+        })
+    });
+    s.click("orchestrator-restart");
+    s.saved();
+    assert_eq!(*calls.lock().unwrap(), ["alpha"]);
+    assert!(s.drawn("orchestrator-restart-status"), "Orchestrator restarted. shows");
+    assert_eq!(
+        s.read(|_, cx| page.read(cx).form().restart_status().clone()),
+        shelbi_app::settings::orchestrator::RestartStatus::Restarted
+    );
 }
 
 // ---- Edit YAML in the ⋮ menus (`dt-workflow-edit-yaml`) ---------------------

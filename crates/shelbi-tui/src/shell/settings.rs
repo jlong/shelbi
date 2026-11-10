@@ -43,6 +43,10 @@
 //! - Workspaces (`tui-settings-workspaces`, [`workspaces`]): the project's
 //!   workspace pool and the machines that host it, with the New / Edit /
 //!   Remove workspace forms over the shared pool service.
+//! - Orchestrator (`awareness-setting`): how events reach the project's
+//!   orchestrator (the heartbeat or the awareness system), a radio saved to
+//!   the project YAML as it is picked, and Restart orchestrator, over the
+//!   shared [`OrchestratorForm`].
 //!
 //! Keys, all terminal-safe (no Command chords) and never forwarded to a
 //! session while Settings shows:
@@ -82,7 +86,9 @@ use shelbi_app::settings::terminal_preview;
 use shelbi_app::settings::{
     Header, Job, JobState, LeaveGuard, PageSet, SettingsNav, SettingsPage, Ticket,
 };
+use shelbi_app::settings::orchestrator::{self as orch, OrchestratorForm};
 use shelbi_app::settings::workflows::{Committed, Edit, Target};
+use shelbi_core::AwarenessMode;
 use shelbi_app::{EditTarget, Effect};
 use shelbi_state::keymap::{DisplayStyle, Key, Keymaps, SidebarAction};
 use shelbi_state::{AppIcon, ThemePreference, UserConfig};
@@ -143,7 +149,8 @@ pub(crate) const OFFERED: PageSet = PageSet::NONE
     .with(SettingsPage::Terminal)
     .with(SettingsPage::Workspaces)
     .with(SettingsPage::Workflows)
-    .with(SettingsPage::Agents);
+    .with(SettingsPage::Agents)
+    .with(SettingsPage::Orchestrator);
 
 /// A page's background read the shell starts ([`SettingsShell::begin_page_load`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +165,9 @@ pub(crate) enum Load {
     Agents { id: u64, ticket: Ticket, project: String },
     /// The Workspaces page: this project's pool.
     Workspaces(Ticket, String),
+    /// The Orchestrator page: this project's workflow config (it carries
+    /// `orchestrator.awareness:`).
+    Orchestrator(Ticket, String),
 }
 
 /// Where keyboard focus sits inside Settings.
@@ -250,7 +260,31 @@ pub(crate) enum SettingsAction {
     /// Run a machine form's readiness request off the UI thread
     /// ([`SettingsShell::check_finished`] takes its outcome).
     RunCheck(Box<workspaces::CheckJob>),
+    /// Save the Orchestrator page's choice off the UI thread
+    /// ([`SettingsShell::orchestrator_saved`] takes the result).
+    SaveOrchestrator(Box<OrchestratorSave>),
+    /// Restart `project`'s orchestrator off the UI thread
+    /// ([`SettingsShell::orchestrator_restarted`] takes the result).
+    RestartOrchestrator(Ticket, String),
 }
+
+/// The Orchestrator page's save: `project`'s config with the new
+/// `orchestrator.awareness:`. Compared by the project and the mode (the
+/// config itself has no equality).
+#[derive(Debug, Clone)]
+pub(crate) struct OrchestratorSave {
+    pub ticket: Ticket,
+    pub project: String,
+    pub config: WorkflowConfig,
+}
+
+impl PartialEq for OrchestratorSave {
+    fn eq(&self, other: &Self) -> bool {
+        self.ticket == other.ticket && self.project == other.project && self.config.awareness() == other.config.awareness()
+    }
+}
+
+impl Eq for OrchestratorSave {}
 
 /// A save the shell runs off the UI thread for the unsaved-edits prompt.
 pub(crate) enum SaveStart {
@@ -273,6 +307,11 @@ enum Does {
     Tool(ToolSetting),
     /// Open a file in the editor.
     EditFile(PathBuf),
+    /// One of the Orchestrator page's event delivery radio options (Enter
+    /// picks it, ←/→ step the choice).
+    Awareness(AwarenessMode),
+    /// The Orchestrator page's Restart orchestrator.
+    RestartOrchestrator,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -334,6 +373,7 @@ fn page_glyph(page: SettingsPage) -> &'static str {
         SettingsPage::Workspaces => "📁",
         SettingsPage::Workflows => "📑",
         SettingsPage::Agents => "🤖",
+        SettingsPage::Orchestrator => "📡",
     }
 }
 
@@ -381,6 +421,12 @@ pub(crate) struct SettingsShell {
     retired: Vec<(u64, shelbi_app::settings::agents::AgentsState)>,
     /// The Workspaces page, loaded per project.
     workspaces: WorkspacesPage,
+    /// The Orchestrator page, and its read, save and restart (each keyed by
+    /// the project it was for, so one for a project no longer shown drops).
+    orchestrator: OrchestratorForm,
+    orch_load: Job<()>,
+    orch_save: Job<()>,
+    orch_restart: Job<()>,
     /// The page's text start column at the last draw (editor clicks).
     page_x: u16,
     /// The workflow editor, while it shows (over both columns).
@@ -436,6 +482,10 @@ impl Default for SettingsShell {
             next_agents_id: 1,
             retired: Vec::new(),
             workspaces: WorkspacesPage::default(),
+            orchestrator: OrchestratorForm::default(),
+            orch_load: Job::default(),
+            orch_save: Job::default(),
+            orch_restart: Job::default(),
             page_x: 0,
             editor: None,
             agent_editor: None,
@@ -515,6 +565,11 @@ impl SettingsShell {
     }
 
     #[cfg(test)]
+    pub(crate) fn orchestrator(&self) -> &OrchestratorForm {
+        &self.orchestrator
+    }
+
+    #[cfg(test)]
     pub(crate) fn retired(&self) -> usize {
         self.retired.len()
     }
@@ -555,6 +610,7 @@ impl SettingsShell {
         self.save_error = None;
         self.form.cancel_edit();
         self.form.clear_status();
+        self.orchestrator.clear_status();
         self.tools.close();
         self.workflows.close_modal();
         self.keys.blur();
@@ -1067,6 +1123,10 @@ impl SettingsShell {
         self.workflows.project_changed();
         self.workspaces.project_changed();
         self.replace_agents(None);
+        self.orchestrator.reset();
+        self.orch_load.reset();
+        self.orch_save.reset();
+        self.orch_restart.reset();
         self.save.reset();
         self.action = 0;
         self.scroll = 0;
@@ -1092,7 +1152,8 @@ impl SettingsShell {
             | SettingsPage::Terminal
             | SettingsPage::Workspaces
             | SettingsPage::Workflows
-            | SettingsPage::Agents => None,
+            | SettingsPage::Agents
+            | SettingsPage::Orchestrator => None,
         }
     }
 
@@ -1124,8 +1185,66 @@ impl SettingsShell {
                 let ticket = self.workspaces.begin_load(project, force)?;
                 Some(Load::Workspaces(ticket, project?.to_string()))
             }
+            // Read on every visit, as Workflows is, to show a hand edit of
+            // the project YAML.
+            SettingsPage::Orchestrator => {
+                let project = project?;
+                if self.orch_load.project() != Some(project) {
+                    self.orchestrator.reset();
+                }
+                let ticket = self.orch_load.begin(Some(project));
+                Some(Load::Orchestrator(ticket, project.to_string()))
+            }
             SettingsPage::Terminal => None,
         }
+    }
+
+    /// The Orchestrator page's read landed.
+    pub(crate) fn orchestrator_loaded(&mut self, ticket: &Ticket, read: Result<WorkflowConfig, String>) {
+        if self.orch_load.complete(ticket, Ok(())) {
+            self.orchestrator.load(read);
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    /// The Orchestrator page's save landed.
+    pub(crate) fn orchestrator_saved(&mut self, ticket: &Ticket, result: Result<WorkflowConfig, String>) {
+        if self.orch_save.complete(ticket, Ok(())) {
+            self.orchestrator.saved_result(result);
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    /// Restart orchestrator finished.
+    pub(crate) fn orchestrator_restarted(&mut self, ticket: &Ticket, result: Result<(), String>) {
+        if self.orch_restart.complete(ticket, Ok(())) {
+            self.orchestrator.restart_result(result);
+        } else {
+            self.dropped += 1;
+        }
+    }
+
+    /// Save the Orchestrator page's choice, when it made one.
+    fn save_orchestrator(&mut self, next: Option<WorkflowConfig>) -> SettingsAction {
+        let (Some(config), Some(project)) = (next, self.orch_load.project().map(str::to_string)) else {
+            return SettingsAction::Stay;
+        };
+        let ticket = self.orch_save.begin(Some(&project));
+        SettingsAction::SaveOrchestrator(Box::new(OrchestratorSave { ticket, project, config }))
+    }
+
+    /// Restart orchestrator: one at a time.
+    fn restart_orchestrator(&mut self) -> SettingsAction {
+        let Some(project) = self.orch_load.project().map(str::to_string) else {
+            return SettingsAction::Stay;
+        };
+        if !self.orchestrator.begin_restart() {
+            return SettingsAction::Stay;
+        }
+        let ticket = self.orch_restart.begin(Some(&project));
+        SettingsAction::RestartOrchestrator(ticket, project)
     }
 
     /// A Workspaces read landed. Returns whether the pool changed from an
@@ -1379,6 +1498,7 @@ impl SettingsShell {
     fn actions(&self) -> Vec<PageAction> {
         match self.nav.page() {
             SettingsPage::General => self.general_actions(),
+            SettingsPage::Orchestrator => self.orchestrator_actions(),
             // Terminal only explains and shows: nothing on it acts.
             SettingsPage::Terminal
             | SettingsPage::Keybindings
@@ -1413,6 +1533,29 @@ impl SettingsShell {
             label: "About Shelbi".into(),
             note: Some(shelbi_app::about::version_line(crate::overlay::about::VERSION)),
             does: Does::Run(Effect::OpenAbout),
+        });
+        out
+    }
+
+    /// The Orchestrator page's rows: the two event delivery options once the
+    /// project's config reads (Try again when it doesn't), then Restart
+    /// orchestrator. Nothing without a project.
+    fn orchestrator_actions(&self) -> Vec<PageAction> {
+        if self.orch_load.project().is_none() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        if self.orchestrator.has_config() {
+            for mode in orch::MODES {
+                out.push(PageAction { label: orch::mode_label(mode).into(), note: None, does: Does::Awareness(mode) });
+            }
+        } else if self.orchestrator.unreadable().is_some() {
+            out.push(PageAction { label: "Try again".into(), note: None, does: Does::Reload });
+        }
+        out.push(PageAction {
+            label: orch::RESTART_LABEL.into(),
+            note: Some(orch::APPLIES_NOTE.into()),
+            does: Does::RestartOrchestrator,
         });
         out
     }
@@ -1485,6 +1628,11 @@ impl SettingsShell {
                 SettingsAction::Stay
             }
             Does::EditFile(path) => SettingsAction::EditFile(path),
+            Does::Awareness(mode) => {
+                let next = self.orchestrator.choose(mode);
+                self.save_orchestrator(next)
+            }
+            Does::RestartOrchestrator => self.restart_orchestrator(),
         }
     }
 
@@ -1660,6 +1808,15 @@ impl SettingsShell {
                     return write(self.form.step_theme(step));
                 } else if sideways && on == Some(&Does::AppIcon) {
                     return write(self.form.step_app_icon(step));
+                } else if sideways && matches!(on, Some(Does::Awareness(_))) {
+                    let next = self.orchestrator.step(step);
+                    let action = self.save_orchestrator(next);
+                    // The focus follows the choice, as a radio group's does.
+                    let mode = self.orchestrator.mode();
+                    if let Some(i) = actions.iter().position(|a| a.does == Does::Awareness(mode)) {
+                        self.action = i;
+                    }
+                    return action;
                 } else if activate {
                     return self.run_action(self.action);
                 } else {
@@ -2206,6 +2363,11 @@ impl SettingsShell {
                 general_rows(&self.general, &self.form, self.save_error.as_deref(), width, actions, focus)
             }
             SettingsPage::Terminal => terminal_rows(width),
+            SettingsPage::Orchestrator => {
+                let focus = (self.region == Region::Page).then_some(self.action);
+                let has_project = self.orch_load.project().is_some();
+                orchestrator_rows(&self.orchestrator, has_project, width, actions, focus)
+            }
             SettingsPage::Workflows => self.workflows.rows(width, self.region == Region::Page, self.has_project),
             SettingsPage::Agents => {
                 let focused = self.region == Region::Page;
@@ -2590,6 +2752,92 @@ fn action_buttons(rows: &mut Vec<Row>, actions: &[PageAction], range: std::ops::
             }
         }
     }
+}
+
+/// The Orchestrator page (the shared wireframe): the event delivery radio
+/// options, each with its description, then Restart orchestrator with the
+/// note that a change applies on restart. The save's and the restart's lines
+/// show under the title.
+fn orchestrator_rows(
+    form: &OrchestratorForm,
+    has_project: bool,
+    width: usize,
+    actions: &[PageAction],
+    focus: Option<usize>,
+) -> Vec<Row> {
+    let at = |does: &Does| actions.iter().position(|a| a.does == *does);
+    let muted = Style::default().fg(palette().muted);
+    let mut rows = vec![Row::text(Line::from(Span::styled(
+        SettingsPage::Orchestrator.label(),
+        Style::default().fg(palette().white).add_modifier(Modifier::BOLD),
+    )))];
+    wrapped(&mut rows, "How events reach this project's orchestrator, saved to the project's settings as you pick.", width, muted);
+    if let Some(message) = form.status_message() {
+        let color = match form.status() {
+            orch::SaveStatus::Failed(_) => palette().red,
+            orch::SaveStatus::Saved => palette().green,
+            _ => palette().yellow,
+        };
+        wrapped(&mut rows, &message, width, Style::default().fg(color));
+    }
+    if let Some(message) = form.restart_status().message() {
+        let color = match form.restart_status() {
+            orch::RestartStatus::Failed(_) => palette().red,
+            orch::RestartStatus::Restarted => palette().green,
+            _ => palette().yellow,
+        };
+        wrapped(&mut rows, &message, width, Style::default().fg(color));
+    }
+    rows.push(Row::blank());
+    if !has_project {
+        wrapped(&mut rows, "Open a project to choose how its orchestrator hears about events.", width, muted);
+        return rows;
+    }
+    if let Some(e) = form.unreadable() {
+        wrapped(&mut rows, &format!("The project's settings don't read: {e}"), width, Style::default().fg(palette().red));
+        wrapped(&mut rows, "Press r, or choose Try again.", width, muted);
+        if let Some(i) = at(&Does::Reload) {
+            rows.push(Row::blank());
+            action_buttons(&mut rows, actions, i..i + 1, focus, width);
+        }
+    } else if !form.has_config() {
+        rows.push(Row::text(Line::from(Span::styled(
+            "Loading…",
+            Style::default().fg(palette().muted).add_modifier(Modifier::ITALIC),
+        ))));
+    } else {
+        heading(&mut rows, orch::EVENT_DELIVERY_LABEL);
+        for mode in orch::MODES {
+            let Some(i) = at(&Does::Awareness(mode)) else {
+                continue;
+            };
+            let on = form.mode() == mode;
+            let focused = focus == Some(i);
+            let mark = if on { "(•) " } else { "( ) " };
+            let mut style = Style::default().fg(if on { palette().white } else { palette().gray });
+            if focused {
+                style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+            }
+            rows.push(Row {
+                action: Some(i),
+                ..Row::text(Line::from(vec![
+                    Span::styled(mark, Style::default().fg(if on { palette().cyan } else { palette().gray })),
+                    Span::styled(orch::mode_label(mode), style),
+                ]))
+            });
+            for line in shelbi_app::overlay::error_log::wrap(orch::mode_description(mode), width.saturating_sub(4).max(1)) {
+                rows.push(Row {
+                    action: Some(i),
+                    ..Row::text(Line::from(vec![Span::raw("    "), Span::styled(line, muted)]))
+                });
+            }
+        }
+    }
+    if let Some(i) = at(&Does::RestartOrchestrator) {
+        rows.push(Row::blank());
+        action_buttons(&mut rows, actions, i..i + 1, focus, width);
+    }
+    rows
 }
 
 /// The Terminal page: what the host terminal owns, its sixteen colors as
@@ -3223,6 +3471,9 @@ fn hints(region: Region, page: SettingsPage, typing: bool, moves: &str) -> Strin
         Region::Page if page == SettingsPage::General => {
             format!("{moves} choose · ←→ pick · ⏎ run · r reload · Tab sidebar · Esc back")
         }
+        Region::Page if page == SettingsPage::Orchestrator => {
+            format!("{moves} choose · ←→ pick · ⏎ select · r reload · Tab sidebar · Esc back")
+        }
         // Nothing on the page acts: the arrows scroll it.
         Region::Page => format!("{moves} scroll · Tab sidebar · Esc back"),
     }
@@ -3426,7 +3677,8 @@ mod tests {
                 Stop::Switcher,
                 Stop::Page(SettingsPage::Workspaces),
                 Stop::Page(SettingsPage::Workflows),
-                Stop::Page(SettingsPage::Agents)
+                Stop::Page(SettingsPage::Agents),
+                Stop::Page(SettingsPage::Orchestrator)
             ]
         );
         assert_eq!(s.page(), SettingsPage::General);
@@ -3450,7 +3702,10 @@ mod tests {
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Page(SettingsPage::Agents));
         s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.stop, Stop::Page(SettingsPage::Agents), "stops at the bottom");
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Orchestrator));
+        s.handle_key(key(KeyCode::Down), &km);
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Orchestrator), "stops at the bottom");
+        s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);

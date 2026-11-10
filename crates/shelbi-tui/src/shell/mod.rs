@@ -158,6 +158,12 @@ enum SettingsMsg {
     Editor(Ticket, Box<settings::EditorDone>),
     /// The agent editor's read, save, duplicate or delete.
     AgentEditor(Ticket, Box<settings::AgentDone>),
+    /// The Orchestrator page's read of its project's config.
+    OrchestratorLoaded(Ticket, Box<Result<WorkflowConfig, String>>),
+    /// The Orchestrator page's save: the config as now on disk.
+    OrchestratorSaved(Ticket, Box<Result<WorkflowConfig, String>>),
+    /// Restart orchestrator finished.
+    OrchestratorRestarted(Ticket, Result<(), String>),
 }
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
@@ -175,6 +181,11 @@ type NewTaskRunner = Arc<
 /// Reads a project's workflow config for Settings ▸ Workflows (blocking; run
 /// off the UI thread).
 type WorkflowsReader = Arc<dyn Fn(&str) -> Result<WorkflowConfig, String> + Send + Sync>;
+
+/// Restarts a project's orchestrator for Settings ▸ Orchestrator (blocking;
+/// run off the UI thread): this machine's daemon in production, a recorder
+/// under test (no test reaches a daemon).
+type OrchestratorRestarter = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 /// Detects the installed editors and diff tools (blocking; run off the UI
 /// thread). `true` scans again rather than taking the cached scan.
@@ -1525,6 +1536,9 @@ struct ShellState {
     /// `~/.shelbi/config.yaml`.
     #[cfg(test)]
     settings_store: Arc<std::sync::Mutex<settings::FixtureConfig>>,
+    /// Restarts a project's orchestrator (Settings ▸ Orchestrator): the
+    /// daemon in production, a recorder in tests.
+    orchestrator_restarter: OrchestratorRestarter,
     /// Reads Settings ▸ Workflows' config (disk in production; in tests a
     /// refusal unless a test points it at its own `SHELBI_HOME`).
     workflows_reader: WorkflowsReader,
@@ -1719,6 +1733,11 @@ impl ShellState {
         #[cfg(test)]
         let workflows_reader: WorkflowsReader = Arc::new(|_: &str| Err("tests read no ~/.shelbi".to_string()));
         #[cfg(not(test))]
+        let orchestrator_restarter: OrchestratorRestarter =
+            Arc::new(|project| shelbi_app::settings::orchestrator::restart(project, None));
+        #[cfg(test)]
+        let orchestrator_restarter: OrchestratorRestarter = Arc::new(|_: &str| Err("tests reach no daemon".to_string()));
+        #[cfg(not(test))]
         let tools_reader: ToolsReader = Arc::new(|rescan| {
             if rescan {
                 shelbi_state::tools::refresh_detected_tools()
@@ -1842,6 +1861,7 @@ impl ShellState {
             settings_writer,
             #[cfg(test)]
             settings_store,
+            orchestrator_restarter,
             workflows_reader,
             tools_reader,
             panel_tools,
@@ -3282,6 +3302,17 @@ impl ShellState {
                         let _ = tx.send(SettingsMsg::PoolLoaded(sent, reader(&project)));
                     })
             }
+            settings::Load::Orchestrator(sent, project) => {
+                // The setting lives in the project YAML, which the workflow
+                // config carries (its `default_workflow:` is there too).
+                let reader = self.workflows_reader.clone();
+                std::thread::Builder::new()
+                    .name("shelbi-shell-settings-orch".into())
+                    .spawn(move || {
+                        let config = reader(&project);
+                        let _ = tx.send(SettingsMsg::OrchestratorLoaded(sent, Box::new(config)));
+                    })
+            }
         };
         if let Err(e) = spawned {
             let why = format!("couldn't start the read: {e}");
@@ -3302,7 +3333,45 @@ impl ShellState {
                 settings::Load::Workspaces(ticket, _) => {
                     self.settings.pool_loaded(&ticket, Err(why));
                 }
+                settings::Load::Orchestrator(ticket, _) => {
+                    self.settings.orchestrator_loaded(&ticket, Err(why));
+                }
             }
+        }
+    }
+
+    /// Save the Orchestrator page's choice off the UI thread, through this
+    /// machine's daemon (the hash-checked project-YAML write the Workflows
+    /// page's `default_workflow:` takes).
+    fn save_orchestrator(&mut self, save: settings::OrchestratorSave) {
+        let tx = self.settings_tx.clone();
+        let settings::OrchestratorSave { ticket, project, config } = save;
+        let sent = ticket.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-settings-orch-save".into())
+            .spawn(move || {
+                let store = shelbi_app::settings::store::Local { project };
+                let saved = shelbi_app::settings::orchestrator::save(&store, &config);
+                let _ = tx.send(SettingsMsg::OrchestratorSaved(sent, Box::new(saved)));
+            });
+        if let Err(e) = spawned {
+            self.settings.orchestrator_saved(&ticket, Err(format!("Couldn't start the save: {e}")));
+        }
+    }
+
+    /// Restart the project's orchestrator off the UI thread (the handoff can
+    /// take a while); the page says so until it lands.
+    fn restart_orchestrator(&mut self, ticket: Ticket, project: String) {
+        let tx = self.settings_tx.clone();
+        let restarter = self.orchestrator_restarter.clone();
+        let sent = ticket.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-settings-orch-restart".into())
+            .spawn(move || {
+                let _ = tx.send(SettingsMsg::OrchestratorRestarted(sent, restarter(&project)));
+            });
+        if let Err(e) = spawned {
+            self.settings.orchestrator_restarted(&ticket, Err(format!("couldn't start the restart: {e}")));
         }
     }
 
@@ -3668,6 +3737,15 @@ impl ShellState {
                 SettingsMsg::WorkflowsLoaded(ticket, config) => {
                     self.settings.workflows_loaded(&ticket, *config);
                 }
+                SettingsMsg::OrchestratorLoaded(ticket, config) => {
+                    self.settings.orchestrator_loaded(&ticket, *config);
+                }
+                SettingsMsg::OrchestratorSaved(ticket, saved) => {
+                    self.settings.orchestrator_saved(&ticket, *saved);
+                }
+                SettingsMsg::OrchestratorRestarted(ticket, result) => {
+                    self.settings.orchestrator_restarted(&ticket, result);
+                }
                 SettingsMsg::WorkflowsCommitted(ticket, done) => {
                     self.workflows_committed(&ticket, *done);
                 }
@@ -3792,6 +3870,8 @@ impl ShellState {
             SettingsAction::RunPool(ticket, job) => self.run_pool(ticket, job),
             SettingsAction::RunMachine(ticket, job) => self.run_machine(ticket, job),
             SettingsAction::RunCheck(job) => self.run_check(*job),
+            SettingsAction::SaveOrchestrator(save) => self.save_orchestrator(*save),
+            SettingsAction::RestartOrchestrator(ticket, project) => self.restart_orchestrator(ticket, project),
         }
         self.dirty = true;
     }
@@ -11138,7 +11218,12 @@ mod tests {
             for want in wants {
                 assert!(screen.contains(want), "{w}x{h} shows {want:?}:\n{screen}");
             }
-            assert!(!screen.contains("Orchestrator"), "{w}x{h}: the nav sidebar is replaced:\n{screen}");
+            // The nav sidebar's Orchestrator row is gone; only Settings' own
+            // Orchestrator page row (its glyph and number) may show.
+            assert!(
+                screen.lines().filter(|l| l.contains("Orchestrator")).all(|l| l.contains("📡") && l.contains('7')),
+                "{w}x{h}: the nav sidebar is replaced:\n{screen}"
+            );
             // The settings sidebar sits in the sidebar's column, the page in main.
             let (bx, _) = find_on_screen(&term, "Settings").unwrap();
             assert!(contains(st.sidebar_rect, bx, 1), "{w}x{h}");
@@ -12114,6 +12199,70 @@ mod tests {
             shelbi_app::settings::agents::fixture::PREAMBLE,
             "beta's own preamble"
         );
+    }
+
+    // --- Settings ▸ Orchestrator (awareness-setting), through the real event path --
+
+    #[test]
+    fn the_orchestrator_page_saves_the_event_delivery_and_restarts_the_orchestrator() {
+        use shelbi_app::settings::orchestrator::{RestartStatus, SaveStatus};
+        use shelbi_core::AwarenessMode;
+        let _home = agents_home("orchestrator");
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
+        let restarts = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = restarts.clone();
+        st.orchestrator_restarter = Arc::new(move |project: &str| {
+            recorded.lock().unwrap().push(project.to_string());
+            Ok(())
+        });
+        st.dispatch_effect(Effect::OpenSettings);
+        // Its number opens it, from the sidebar.
+        type_key(&mut st, '7');
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Orchestrator);
+        settle_agents(&mut st, "the config loads", |st| st.settings.orchestrator().has_config());
+
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(110, 32)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let text = screen_text(&term);
+        for want in [
+            "Event delivery",
+            "(•) Simple heartbeat system (v1)",
+            "A periodic heartbeat keeps the orchestrator up to date.",
+            "( ) Awareness system (v2)",
+            "Restart orchestrator",
+            "Applies when the orchestrator restarts.",
+        ] {
+            assert!(text.contains(want), "{want:?} on the page:\n{text}");
+        }
+
+        // The keys: into the page, down to v2, Enter picks it and saves.
+        press(&mut st, KeyCode::Tab);
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        assert_eq!(st.settings.orchestrator().mode(), AwarenessMode::Awareness, "shown at once, pending");
+        settle_agents(&mut st, "the save lands", |st| st.settings.orchestrator().status() == &SaveStatus::Saved);
+        let project = shelbi_state::load_project("proj").unwrap();
+        assert_eq!(project.orchestrator.awareness, AwarenessMode::Awareness);
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("(•) Awareness system (v2)"));
+
+        // ←/→ step the radio, saving each choice.
+        press(&mut st, KeyCode::Left);
+        settle_agents(&mut st, "the second save lands", |st| {
+            st.settings.orchestrator().status() == &SaveStatus::Saved
+                && st.settings.orchestrator().mode() == AwarenessMode::Heartbeat
+        });
+        assert_eq!(shelbi_state::load_project("proj").unwrap().orchestrator.awareness, AwarenessMode::Heartbeat);
+
+        // Restart orchestrator, below the radio, runs off the UI thread.
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        settle_agents(&mut st, "the restart lands", |st| {
+            st.settings.orchestrator().restart_status() == &RestartStatus::Restarted
+        });
+        assert_eq!(*restarts.lock().unwrap(), vec!["proj".to_string()]);
     }
 
     // --- the agent editor (tui-agent-editor), through the real event path --

@@ -86,7 +86,7 @@ use std::sync::Arc;
 
 use yaml_serde::Value;
 use shelbi_core::{
-    default_project_statuses, default_workflow, validate_workflow_name, GitConfig, Owner,
+    default_project_statuses, AwarenessMode, default_workflow, validate_workflow_name, GitConfig, Owner,
     ProjectStatus, ProjectStatuses, ReviewServe, StatusCategory, Transition, Workflow,
     WorkflowStatus,
 };
@@ -305,6 +305,9 @@ pub struct WorkflowConfig {
     statuses: Vec<ProjectStatus>,
     workflows: Vec<Entry>,
     default_workflow: String,
+    /// The project YAML's `orchestrator.awareness:` (Settings ▸ Orchestrator),
+    /// saved through the same project-file write as `default_workflow:`.
+    awareness: AwarenessMode,
     /// `None` when the project has no `agents/` directory: like the loader,
     /// agent references aren't checked then.
     agents: Option<Vec<String>>,
@@ -346,6 +349,7 @@ struct Disk {
     project_path: PathBuf,
     project_text: String,
     default_workflow: String,
+    awareness: AwarenessMode,
 }
 
 #[derive(Debug)]
@@ -439,6 +443,7 @@ impl WorkflowConfig {
             }
         }
 
+        let awareness = awareness_in(&project_text);
         let entries = workflows
             .iter()
             .map(|(stem, loaded)| Entry {
@@ -451,6 +456,7 @@ impl WorkflowConfig {
             statuses: catalog.statuses.clone(),
             workflows: entries,
             default_workflow: default_workflow.clone(),
+            awareness,
             agents,
             unreadable,
             disk: Arc::new(Disk {
@@ -462,6 +468,7 @@ impl WorkflowConfig {
                 project_path,
                 project_text,
                 default_workflow,
+                awareness,
             }),
         })
     }
@@ -496,6 +503,18 @@ impl WorkflowConfig {
     /// The project's default workflow.
     pub fn default_workflow(&self) -> &str {
         &self.default_workflow
+    }
+
+    /// How events reach the project's orchestrator
+    /// (`orchestrator.awareness:`, unset is [`AwarenessMode::Heartbeat`]).
+    pub fn awareness(&self) -> AwarenessMode {
+        self.awareness
+    }
+
+    /// The path of the project YAML that holds `orchestrator.awareness:` (and
+    /// `default_workflow:`).
+    pub fn project_path(&self) -> &Path {
+        &self.disk.project_path
     }
 
     /// The agents a status can name, or `None` when the project has no
@@ -802,6 +821,14 @@ impl WorkflowConfig {
             w.description = non_empty(description);
             Ok(())
         })
+    }
+
+    /// Switch the orchestrator's event delivery. Saved as
+    /// `orchestrator.awareness:` in the project YAML.
+    pub fn set_awareness(&self, mode: AwarenessMode) -> Self {
+        let mut next = self.clone();
+        next.awareness = mode;
+        next
     }
 
     /// Make `workflow` the one tasks without a `workflow:` use.
@@ -1144,17 +1171,32 @@ impl WorkflowConfig {
         }
 
         let mut project_op = None;
-        if self.default_workflow != disk.default_workflow {
+        let default_changed = self.default_workflow != disk.default_workflow;
+        let awareness_changed = self.awareness != disk.awareness;
+        if default_changed || awareness_changed {
             let raw = yaml_edit::parse(&disk.project_text)
                 .map_err(|e| file_err(&disk.project_path, e))?;
             let mut target = raw.clone();
             let map = target
                 .as_mapping_mut()
                 .ok_or_else(|| file_err(&disk.project_path, "isn't a mapping"))?;
-            map.insert(
-                "default_workflow".into(),
-                self.default_workflow.clone().into(),
-            );
+            if default_changed {
+                map.insert(
+                    "default_workflow".into(),
+                    self.default_workflow.clone().into(),
+                );
+            }
+            if awareness_changed {
+                // `orchestrator:` is required, so it is there to patch; a
+                // project YAML without it (or with a scalar) gets a block.
+                let orchestrator = map
+                    .entry("orchestrator".into())
+                    .or_insert_with(|| Value::Mapping(Default::default()));
+                let block = orchestrator
+                    .as_mapping_mut()
+                    .ok_or_else(|| file_err(&disk.project_path, "`orchestrator:` isn't a mapping"))?;
+                block.insert("awareness".into(), self.awareness.as_str().into());
+            }
             let patched = yaml_edit::patch(&disk.project_text, &target)
                 .map_err(|e| file_err(&disk.project_path, e))?;
             project_op = Some(FileOp {
@@ -1411,6 +1453,16 @@ pub(crate) fn project_config_file(project: &str) -> Result<PathBuf> {
             .join("project.yaml"));
     }
     Ok(projects.join(format!("{project}.yaml")))
+}
+
+/// The `orchestrator.awareness:` a project YAML's text sets; the default when
+/// it sets none, or one this binary doesn't know (the loader would refuse the
+/// file, so the page shows the default rather than failing).
+fn awareness_in(project_text: &str) -> AwarenessMode {
+    yaml_edit::parse(project_text)
+        .ok()
+        .and_then(|v| AwarenessMode::parse(v.get("orchestrator")?.get("awareness")?.as_str()?))
+        .unwrap_or_default()
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>> {

@@ -38,7 +38,7 @@ pub use model::{
     default_prompt_injection, detect_project_shapes, normalize_project_name, validate_agent_id,
     validate_branch, validate_branch_prefix, validate_project_name, validate_task_id,
     validate_workflow_name, Agent, AgentDefaults,
-    AgentRunnerSpec, BudgetConfig, Column, ConfigMode, DialogSignature, DiskConfig, ForwardMode,
+    AgentRunnerSpec, AwarenessMode, BudgetConfig, Column, ConfigMode, DialogSignature, DiskConfig, ForwardMode,
     GitConfig,
     HeartbeatConfig, GithubConnection, Host, IssueTrackerBackend, IssueTrackerConfig, JiraConnection,
     LinearConnection, Machine, MachineKind, MergeStrategy, OrchestratorSpec, ParamDiagnostic,

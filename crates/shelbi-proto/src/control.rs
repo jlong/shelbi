@@ -70,7 +70,11 @@ use crate::error::ProtoError;
 /// [`ClientMsg::AppRequest`] / [`ServerMsg::Reply`] (the app's own requests:
 /// workspace and machine changes, machine checks, an editor session; their
 /// bodies are `shelbi_app::far`'s).
-pub const CONTROL_PROTOCOL_VERSION: u32 = 8;
+///
+/// v9 adds [`StateWrite::RestartOrchestrator`]: Settings ▸ Orchestrator's
+/// Restart orchestrator asks the project's daemon to hand off and replace the
+/// orchestrator session, as `shelbi reload` does, workers left running.
+pub const CONTROL_PROTOCOL_VERSION: u32 = 9;
 
 /// Upper bound on a single control frame. Generous enough for a large issue body
 /// in an `edit`/`add`, far below the session [`crate::MAX_FRAME_LEN`].
@@ -398,6 +402,11 @@ pub enum StateWrite {
     /// Reset a persistent pane's supervision budget so the daemon relaunches
     /// it now (the reopen marker).
     RequestRelaunch { pane: RelaunchPane },
+    /// Restart the project's orchestrator now (protocol v9): ask it for its
+    /// handoff, end its session and bring a fresh one up, the way
+    /// `shelbi reload` replaces it, without restarting the daemon or touching
+    /// a worker. The reply waits for the replacement to launch.
+    RestartOrchestrator,
 }
 
 impl StateWrite {
@@ -411,6 +420,7 @@ impl StateWrite {
             StateWrite::ClearErrors => "clear-errors",
             StateWrite::MarkErrorsRead => "mark-errors-read",
             StateWrite::RequestRelaunch { .. } => "request-relaunch",
+            StateWrite::RestartOrchestrator => "restart-orchestrator",
         }
     }
 }

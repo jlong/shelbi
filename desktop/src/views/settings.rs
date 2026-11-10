@@ -103,6 +103,7 @@ use super::font_picker::{FontPicker, FontPickerEvent};
 use super::keybindings::{KeybindingsEvent, KeybindingsPage};
 use super::machine_form::{self, MachineFormEvent, MachineFormView};
 use super::machine_form_state;
+use super::orchestrator::OrchestratorPage;
 use super::settings_nav::SettingsPage;
 use super::terminal_preview;
 use super::tool_select::{self, AppIcons, ToolSelect, ToolSelectEvent};
@@ -426,6 +427,8 @@ pub struct SettingsView {
     agent_editor: Option<(Entity<AgentEditor>, Subscription)>,
     /// The project's Workspaces page.
     workspaces: Entity<WorkspacesPage>,
+    /// The project's Orchestrator page.
+    orchestrator: Entity<OrchestratorPage>,
     /// The Add machine / Configure machine dialog while it's open, and what
     /// had the keyboard before it (it gets it back).
     machine_form: Option<OpenForm>,
@@ -466,6 +469,7 @@ impl SettingsView {
         let workflows = cx.new(|cx| WorkflowsPage::new(handle, window, cx));
         let agents = cx.new(|cx| AgentsPage::new(handle, window, cx));
         let workspaces = cx.new(|cx| WorkspacesPage::new(handle, window, cx));
+        let orchestrator = cx.new(|cx| OrchestratorPage::new(handle, window, cx));
         let range = |r: &std::ops::RangeInclusive<u8>| *r.start() as i32..=*r.end() as i32;
         let initial = Translucency::default();
         let opacity_slider = cx.new(|cx| {
@@ -584,6 +588,7 @@ impl SettingsView {
             agents,
             agent_editor: None,
             workspaces,
+            orchestrator,
             machine_form: None,
             scroll: ScrollHandle::new(),
             scroll_to_statuses: false,
@@ -664,6 +669,12 @@ impl SettingsView {
     #[cfg(any(test, feature = "visual-check"))]
     pub(crate) fn agents(&self) -> Entity<AgentsPage> {
         self.agents.clone()
+    }
+
+    /// The Orchestrator page's view.
+    #[cfg(test)]
+    pub(crate) fn orchestrator(&self) -> Entity<OrchestratorPage> {
+        self.orchestrator.clone()
     }
 
     /// The Workspaces page's view.
@@ -899,6 +910,7 @@ impl SettingsView {
                 SettingsPage::Workflows => self.workflows.update(cx, |p, _| p.reload_when_drawn()),
                 SettingsPage::Agents => self.agents.update(cx, |p, _| p.reload_when_drawn()),
                 SettingsPage::Workspaces => self.workspaces.update(cx, |p, _| p.reload_when_drawn()),
+                SettingsPage::Orchestrator => self.orchestrator.update(cx, |p, _| p.reload_when_drawn()),
                 _ => {}
             }
             self.page = page;
@@ -1923,6 +1935,8 @@ impl Render for SettingsView {
             SettingsPage::Agents => page.child(self.agents.clone()),
             // The Workspaces frame (2523:8879): the page scrolls.
             SettingsPage::Workspaces => page.child(self.workspaces.clone()),
+            // Its event delivery radio and Restart orchestrator.
+            SettingsPage::Orchestrator => page.child(self.orchestrator.clone()),
             // The Terminal frame (2252:28494): the controls in a column the
             // picker's width, the Option helper a line per sentence; the
             // preview fills the rest of the page beside them.
@@ -2000,7 +2014,11 @@ impl Render for SettingsView {
         let status = status.filter(|_| {
             !matches!(
                 shown,
-                SettingsPage::Keybindings | SettingsPage::Workflows | SettingsPage::Agents | SettingsPage::Workspaces
+                SettingsPage::Keybindings
+                    | SettingsPage::Workflows
+                    | SettingsPage::Agents
+                    | SettingsPage::Workspaces
+                    | SettingsPage::Orchestrator
             )
         });
         page.children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
@@ -2295,6 +2313,7 @@ pub fn page_selector(page: SettingsPage) -> &'static str {
         SettingsPage::Workflows => "settings-page-workflows",
         SettingsPage::Agents => "settings-page-agents",
         SettingsPage::Workspaces => "settings-page-workspaces",
+        SettingsPage::Orchestrator => "settings-page-orchestrator",
     }
 }
 

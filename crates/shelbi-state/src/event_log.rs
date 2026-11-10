@@ -878,6 +878,24 @@ pub fn latest_task_transition_targets(project: &str) -> Result<HashMap<String, C
     Ok(out)
 }
 
+/// Whether `line` (a whole `events.log` line, timestamp included) is one the
+/// awareness system (v2, `orchestrator.awareness: awareness`) answers with a
+/// board digest for `project`: a task status transition (`<from> -> <to>`), a
+/// reminder that came due, a finished job, or an overdue task. Any other line
+/// (a heartbeat, a workspace state change, a `task edit`, another project's
+/// line) is not.
+pub fn is_awareness_digest_trigger(line: &str, project: &str) -> bool {
+    let env = EventEnvelope::from_log_line(line);
+    if env.project.as_deref() != Some(project) {
+        return false;
+    }
+    match env.kind {
+        EventKind::Reminder | EventKind::JobDone | EventKind::TaskOverdue => true,
+        EventKind::Task => transition_target(line).is_some(),
+        _ => false,
+    }
+}
+
 /// Pull the `to` status id out of a task-transition line's `<from> -> <to>`
 /// segment (the wire shape [`task_event_body`] emits). `None` for a task line
 /// that carries no transition arrow (e.g. a `task edit`). The `to` token is the
