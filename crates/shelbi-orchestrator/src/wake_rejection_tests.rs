@@ -661,3 +661,244 @@ fn nonsteerable_rejection_ignores_stale_completion_then_flushes_fifo_after_curso
     release_tx.send(()).unwrap();
     server.join().unwrap();
 }
+
+/// A batch scanned from real `events.log` lines under `mode`.
+fn scanned_batch(mode: AwarenessMode, from: u64, text: &str) -> QueuedBatch {
+    scan_text_batch_in(mode, PROJECT, from, text, false).expect("whole lines scan")
+}
+
+fn connect_test_rpc(socket_path: &Path) -> CodexRpcClient {
+    CodexRpcClient::connect(
+        socket_path,
+        "wake-rejection-test",
+        env!("CARGO_PKG_VERSION"),
+        RPC_TIMEOUT,
+    )
+    .unwrap()
+}
+
+const REMINDER_LINE: &str = "t project=demo reminder id=r-1 text=\"check the tap PR\"\n";
+
+#[test]
+fn v2_urgent_steer_that_races_the_turn_end_retries_once_as_turn_start() {
+    let _lock = crate::test_lock::acquire();
+    let temp = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::install(temp.path());
+    let socket_path = temp.path().join("app-server.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let reminder = scanned_batch(AwarenessMode::Awareness, 4, REMINDER_LINE);
+    let reminder_id = reminder.message_id.clone();
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let expected_id = reminder_id.clone();
+    let server = thread::spawn(move || {
+        let mut socket = accept_initialized(&listener);
+        let steer = read_json(&mut socket);
+        assert_eq!(steer["method"], "turn/steer");
+        assert_eq!(steer["params"]["expectedTurnId"], "ending-turn");
+        assert_eq!(steer["params"]["clientUserMessageId"], expected_id);
+        send_json(
+            &mut socket,
+            json!({
+                "id": steer["id"],
+                "error": {"code": -32600, "message": "no active turn to steer"}
+            }),
+        );
+        // Same connection, no reconnect: the retry is a plain start with the
+        // same idempotency key.
+        let start = read_json(&mut socket);
+        assert_eq!(start["method"], "turn/start");
+        assert!(start["params"].get("expectedTurnId").is_none());
+        assert_eq!(start["params"]["clientUserMessageId"], expected_id);
+        assert!(start["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("check the tap PR"));
+        send_json(
+            &mut socket,
+            json!({"id": start["id"], "result": {"turn": {"id": "reminder-turn"}}}),
+        );
+        let _ = release_rx.recv();
+    });
+
+    let rpc = connect_test_rpc(&socket_path);
+    let mut bridge = test_bridge(
+        temp.path(),
+        socket_path,
+        rpc,
+        ThreadPhase::Active("ending-turn".into()),
+        DurableQueue {
+            project: PROJECT.into(),
+            batches: VecDeque::from([reminder]),
+        },
+        true,
+    );
+    bridge.project.orchestrator.awareness = AwarenessMode::Awareness;
+
+    bridge.maybe_deliver_event().unwrap();
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
+    assert!(bridge.rpc.is_some(), "no rehydrate round-trip");
+    assert_eq!(
+        bridge.queue.batches[0].status,
+        DeliveryStatus::Delivered {
+            thread_id: THREAD_ID.into()
+        }
+    );
+    assert_eq!(
+        bridge.runtime.phase,
+        ThreadPhase::Active("reminder-turn".into())
+    );
+}
+
+#[test]
+fn v1_urgent_steer_rejection_keeps_the_rehydrate_path() {
+    let _lock = crate::test_lock::acquire();
+    let temp = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::install(temp.path());
+    let socket_path = temp.path().join("app-server.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let reminder = scanned_batch(AwarenessMode::Heartbeat, 4, REMINDER_LINE);
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let mut socket = accept_initialized(&listener);
+        let steer = read_json(&mut socket);
+        assert_eq!(steer["method"], "turn/steer");
+        send_json(
+            &mut socket,
+            json!({
+                "id": steer["id"],
+                "error": {"code": -32600, "message": "no active turn to steer"}
+            }),
+        );
+        let _ = release_rx.recv();
+    });
+
+    let rpc = connect_test_rpc(&socket_path);
+    let mut bridge = test_bridge(
+        temp.path(),
+        socket_path,
+        rpc,
+        ThreadPhase::Active("ending-turn".into()),
+        DurableQueue {
+            project: PROJECT.into(),
+            batches: VecDeque::from([reminder]),
+        },
+        true,
+    );
+
+    bridge.maybe_deliver_event().unwrap();
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
+    assert!(bridge.rpc.is_none(), "v1 rehydrates before retrying");
+    assert_eq!(bridge.queue.batches[0].status, DeliveryStatus::Pending);
+    assert_eq!(bridge.blocked_generation, Some(bridge.runtime.generation));
+}
+
+#[test]
+fn v2_idle_digest_is_injected_once_without_starting_a_turn() {
+    let _lock = crate::test_lock::acquire();
+    let temp = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::install(temp.path());
+    let socket_path = temp.path().join("app-server.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let digest = scanned_batch(
+        AwarenessMode::Awareness,
+        4,
+        "t project=demo heartbeat zen_eligible=0 idle_workspaces=2\n",
+    );
+    let (release_tx, release_rx) = mpsc::channel();
+
+    let server = thread::spawn(move || {
+        let mut socket = accept_initialized(&listener);
+        // The only request the bridge makes: no turn/start, no turn/steer.
+        let inject = read_json(&mut socket);
+        assert_eq!(inject["method"], "thread/inject_items");
+        assert_eq!(inject["params"]["threadId"], THREAD_ID);
+        let item = &inject["params"]["items"][0];
+        assert_eq!(item["role"], "developer");
+        assert!(item["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("[SHELBI_BOARD_DIGEST]"));
+        send_json(&mut socket, json!({"id": inject["id"], "result": {}}));
+        let _ = release_rx.recv();
+    });
+
+    let rpc = connect_test_rpc(&socket_path);
+    let mut bridge = test_bridge(
+        temp.path(),
+        socket_path,
+        rpc,
+        ThreadPhase::Idle,
+        DurableQueue {
+            project: PROJECT.into(),
+            batches: VecDeque::from([digest]),
+        },
+        true,
+    );
+    bridge.project.orchestrator.awareness = AwarenessMode::Awareness;
+
+    // Several loop iterations: the digest goes in once, and nothing wakes.
+    for _ in 0..3 {
+        bridge.maybe_deliver_event().unwrap();
+        bridge.maybe_inject_digest();
+    }
+    release_tx.send(()).unwrap();
+    server.join().unwrap();
+    assert!(bridge.rpc.is_some());
+    assert_eq!(bridge.runtime.phase, ThreadPhase::Idle, "no turn started");
+    assert_eq!(
+        bridge.queue.batches[0].status,
+        DeliveryStatus::Injected {
+            thread_id: THREAD_ID.into()
+        }
+    );
+    // Persisted, so a bridge restart doesn't inject it again.
+    let reloaded = DurableQueue::load(&bridge.queue_path, PROJECT).unwrap();
+    assert_eq!(reloaded.batches, bridge.queue.batches);
+}
+
+#[test]
+fn v2_busy_thread_holds_the_digest_and_v1_never_injects() {
+    // The fixture fails if the bridge sends anything at all.
+    let _lock = crate::test_lock::acquire();
+    let temp = tempfile::tempdir().unwrap();
+    let _home = HomeGuard::install(temp.path());
+    let socket_path = temp.path().join("app-server.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let server = thread::spawn(move || {
+        let mut socket = accept_initialized(&listener);
+        // The client closes without sending anything.
+        assert!(socket.read().is_err());
+    });
+    let digest_line = "t project=demo heartbeat zen_eligible=0 idle_workspaces=2\n";
+
+    let rpc = connect_test_rpc(&socket_path);
+    let mut bridge = test_bridge(
+        temp.path(),
+        socket_path,
+        rpc,
+        ThreadPhase::Active("busy".into()),
+        DurableQueue {
+            project: PROJECT.into(),
+            batches: VecDeque::from([scanned_batch(AwarenessMode::Awareness, 4, digest_line)]),
+        },
+        true,
+    );
+    bridge.project.orchestrator.awareness = AwarenessMode::Awareness;
+    bridge.maybe_deliver_event().unwrap();
+    bridge.maybe_inject_digest();
+    assert_eq!(bridge.queue.batches[0].status, DeliveryStatus::Pending);
+
+    // A v1 bridge never injects, idle or not (its digest is a quiet chunk here
+    // only because the batch was scanned under v2).
+    bridge.project.orchestrator.awareness = AwarenessMode::Heartbeat;
+    bridge.runtime.set_phase(ThreadPhase::Idle);
+    bridge.maybe_inject_digest();
+    assert_eq!(bridge.queue.batches[0].status, DeliveryStatus::Pending);
+
+    drop(bridge);
+    server.join().unwrap();
+}
