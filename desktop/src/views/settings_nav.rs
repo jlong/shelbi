@@ -55,6 +55,7 @@ impl PageLook for SettingsPage {
             SettingsPage::Workspaces => icons::FOLDER,
             SettingsPage::Workflows => icons::VIEW_COLUMNS,
             SettingsPage::Agents => icons::RECTANGLE_STACK,
+            SettingsPage::Orchestrator => icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS,
         }
     }
 
@@ -66,6 +67,7 @@ impl PageLook for SettingsPage {
             SettingsPage::Workspaces => "settings-nav-workspaces",
             SettingsPage::Workflows => "settings-nav-workflows",
             SettingsPage::Agents => "settings-nav-agents",
+            SettingsPage::Orchestrator => "settings-nav-orchestrator",
         }
     }
 }
@@ -292,6 +294,6 @@ mod tests {
         assert_eq!(distinct.len(), all.len());
         // This client offers every page, numbered as the frames number them.
         assert_eq!(SettingsNav::default().available(), shelbi_app::settings::PageSet::ALL);
-        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 5, 4, 6]);
+        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 5, 4, 6, 7]);
     }
 }

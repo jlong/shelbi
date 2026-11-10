@@ -7965,9 +7965,7 @@ mod tests {
                     forward: None,
                 },
             ],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -13539,9 +13537,7 @@ mod sync_worktree_git_tests {
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -14824,9 +14820,7 @@ mod sync_worktree_freshcut_tests {
             default_workflow: None,
             config_mode: None,
             machines: vec![machine_at(repo)],
-            orchestrator: shelbi_core::OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: shelbi_core::OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -15286,9 +15280,7 @@ mod sync_worktree_freshcut_tests {
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: shelbi_core::OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: shelbi_core::OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,

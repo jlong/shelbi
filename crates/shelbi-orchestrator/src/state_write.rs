@@ -36,6 +36,7 @@ pub fn apply(project: &str, write: &StateWrite) -> Result<(), String> {
         StateWrite::ClearErrors => shelbi_state::clear_errors(project),
         StateWrite::MarkErrorsRead => shelbi_state::mark_errors_read(project),
         StateWrite::RequestRelaunch { pane } => request_relaunch(project, pane),
+        StateWrite::RestartOrchestrator => crate::restart_orchestrator(project).map(|_| ()),
     };
     result.map_err(|e| e.to_string())
 }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_lock::LOCK as TEST_LOCK;
-use shelbi_core::{MergeStrategy, TransitionAction};
+use shelbi_core::{AwarenessMode, MergeStrategy, TransitionAction};
 
 const PROJECT: &str = "wfc";
 
@@ -594,6 +594,33 @@ fn description_and_default_edits() {
         load().set_default_workflow("nope").unwrap_err(),
         ConfigError::UnknownWorkflow("nope".into())
     );
+}
+
+#[test]
+fn the_orchestrator_awareness_saves_to_the_project_yaml_alone() {
+    let home = Home::new();
+    let cfg = load();
+    assert_eq!(cfg.awareness(), AwarenessMode::Heartbeat, "unset is the heartbeat");
+    assert!(!cfg.set_awareness(AwarenessMode::Heartbeat).is_dirty(), "no change, no write");
+    let task_before = home.read("task.yaml");
+    let saved = save(&cfg.set_awareness(AwarenessMode::Awareness));
+    assert_eq!(saved.written, vec![home.projects.join(format!("{PROJECT}.yaml"))]);
+    assert_eq!(
+        home.project_yaml(),
+        PROJECT_YAML.replace("  runner: claude\n", "  runner: claude\n  awareness: awareness\n"),
+        "only the key is added; the comments stay"
+    );
+    assert_eq!(home.read("task.yaml"), task_before);
+    assert_eq!(load().awareness(), AwarenessMode::Awareness);
+    let project = crate::load_project(PROJECT).unwrap();
+    assert_eq!(project.orchestrator.awareness, AwarenessMode::Awareness, "the loader reads it");
+
+    save(&load().set_awareness(AwarenessMode::Heartbeat));
+    assert_eq!(
+        home.project_yaml(),
+        PROJECT_YAML.replace("  runner: claude\n", "  runner: claude\n  awareness: heartbeat\n"),
+    );
+    assert_eq!(load().awareness(), AwarenessMode::Heartbeat);
 }
 
 #[test]

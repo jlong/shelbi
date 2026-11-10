@@ -1938,6 +1938,67 @@ pub enum PromptInjectionKind {
 pub struct OrchestratorSpec {
     /// Name of an agent runner declared in `agent_runners`.
     pub runner: String,
+    /// How events reach the orchestrator (`orchestrator.awareness`): the
+    /// periodic heartbeat (the default) or the awareness system. Elided from
+    /// the wire form when it is the default, so an existing project YAML
+    /// round-trips unchanged. See [`AwarenessMode`].
+    #[serde(default, skip_serializing_if = "AwarenessMode::is_default")]
+    pub awareness: AwarenessMode,
+}
+
+impl OrchestratorSpec {
+    /// An orchestrator on `runner`, with every other setting at its default.
+    pub fn new(runner: impl Into<String>) -> Self {
+        OrchestratorSpec {
+            runner: runner.into(),
+            awareness: AwarenessMode::default(),
+        }
+    }
+}
+
+/// How the orchestrator learns that something happened
+/// (`orchestrator.awareness` in the project YAML).
+///
+/// * [`AwarenessMode::Heartbeat`] (v1, the default): the hub poller writes a
+///   periodic `heartbeat` line ([`HeartbeatConfig`]) that wakes the
+///   orchestrator to sweep the board even when nothing changed.
+/// * [`AwarenessMode::Awareness`] (v2): no periodic heartbeat. The board
+///   digest a heartbeat carries is written only right after a board
+///   transition, a reminder, a finished job or an overdue task, so a quiet
+///   board stays quiet.
+///
+/// The orchestrator reads the mode at launch, so a change applies when it
+/// restarts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AwarenessMode {
+    /// The simple heartbeat system (v1).
+    #[default]
+    Heartbeat,
+    /// The awareness system (v2).
+    Awareness,
+}
+
+impl AwarenessMode {
+    /// Both modes, in the order Settings lists them.
+    pub const ALL: [AwarenessMode; 2] = [AwarenessMode::Heartbeat, AwarenessMode::Awareness];
+
+    pub fn is_default(&self) -> bool {
+        *self == AwarenessMode::default()
+    }
+
+    /// The YAML spelling (`heartbeat` / `awareness`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AwarenessMode::Heartbeat => "heartbeat",
+            AwarenessMode::Awareness => "awareness",
+        }
+    }
+
+    /// The mode a YAML value names; `None` for anything else.
+    pub fn parse(value: &str) -> Option<AwarenessMode> {
+        AwarenessMode::ALL.into_iter().find(|m| m.as_str() == value)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4247,9 +4308,7 @@ workspace_settings_template: /etc/shelbi/p.json
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -4353,9 +4412,7 @@ workspaces:
             default_workflow: None,
             config_mode: None,
             machines: vec![machine("hub"), machine("devbox")],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -4659,9 +4716,7 @@ workspaces:
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -6072,9 +6127,7 @@ git:
             default_branch: "main".into(),
             default_workflow: None,
             config_mode: Some(ConfigMode::InRepo),
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             github_url: Some("git@github.com:example/shelbi.git".into()),
             workspace_poll_interval_secs: 7,

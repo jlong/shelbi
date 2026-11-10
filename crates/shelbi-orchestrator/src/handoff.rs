@@ -401,9 +401,7 @@ mod tests {
             default_branch: "main".into(),
             default_workflow: None,
             config_mode: None,
-            orchestrator: shelbi_core::OrchestratorSpec {
-                runner: name.into(),
-            },
+            orchestrator: shelbi_core::OrchestratorSpec::new(name),
             agent_runners: std::collections::BTreeMap::from([(
                 name.into(),
                 shelbi_core::AgentRunnerSpec {

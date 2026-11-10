@@ -31,15 +31,7 @@
 //! untouched" contract — is unit-testable without a daemon, a control socket,
 //! or real sessions.
 
-use std::time::Duration;
-
 use anyhow::Result;
-use shelbi_orchestrator::session_backend::{SessionBackend, SessionTarget};
-
-/// How long reload waits for the signalled orchestrator session to exit before
-/// bringing up its replacement.
-const ORCH_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
-const ORCH_EXIT_POLL: Duration = Duration::from_millis(100);
 
 /// The side effects a session-runtime reload performs, behind a trait so the
 /// orchestration order is testable with a recording stub.
@@ -128,25 +120,7 @@ impl ReloadOps for LiveReload {
 
     fn replace_orchestrator_session(&self) -> Result<()> {
         // End only the orchestrator session; worker sessions are left running.
-        let orch = format!("{}/orch", self.project);
-        let backend = shelbi_orchestrator::session_backend::backend();
-        let _ = backend.kill_window(&shelbi_core::Host::Local, &orch);
-        // The kill only signals. Until the session has exited, the bootstrap
-        // below would see it as live and attach, launching nothing and leaving
-        // the replacement to the supervisor. If this runs out of time (or a
-        // re-exec'd client has already launched the replacement) the bootstrap
-        // attaches and the handoff stays on disk for whichever launch comes next.
-        let target = SessionTarget::session(format!("shelbi-{}", self.project));
-        let deadline = std::time::Instant::now() + ORCH_EXIT_TIMEOUT;
-        while backend.probe(&shelbi_core::Host::Local, &target, None).is_alive()
-            && std::time::Instant::now() < deadline
-        {
-            std::thread::sleep(ORCH_EXIT_POLL);
-        }
-        // Bring a fresh orchestrator session up; it ingests the handoff file.
-        shelbi_orchestrator::ensure_dashboard(&self.project)
-            .map(|_| ())
-            .map_err(|e| anyhow::anyhow!("respawning the orchestrator session: {e}"))
+        shelbi_orchestrator::replace_orchestrator_session(&self.project).map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
 

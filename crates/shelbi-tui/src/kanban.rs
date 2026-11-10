@@ -5419,9 +5419,7 @@ transitions:
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: shelbi_core::OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: shelbi_core::OrchestratorSpec::new("claude"),
             agent_runners: {
                 let mut m = std::collections::BTreeMap::new();
                 m.insert(
@@ -7352,9 +7350,7 @@ transitions:
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: shelbi_core::OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: shelbi_core::OrchestratorSpec::new("claude"),
             agent_runners: {
                 let mut m = std::collections::BTreeMap::new();
                 m.insert(

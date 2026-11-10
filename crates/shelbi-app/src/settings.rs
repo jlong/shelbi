@@ -29,6 +29,8 @@
 //!   status catalog, the edits it saves as they're made, and their guards).
 //! - [`keybindings`]: the Keybindings page's bindings editor.
 //! - [`agents`]: the Agents page's state (its rows, guards, and saves).
+//! - [`orchestrator`]: the Orchestrator page's event delivery radio
+//!   (`orchestrator.awareness:`) and its Restart orchestrator.
 //! - [`workspaces`] and [`workspace_form`]: the Workspaces page (the pool,
 //!   its machines and their reachability) and its New / Edit / Remove
 //!   workspace forms, over the shared pool service.
@@ -49,6 +51,7 @@ pub mod general;
 pub mod keybindings;
 pub mod machine_check;
 pub mod machine_form;
+pub mod orchestrator;
 pub mod store;
 pub mod summary;
 pub mod terminal_preview;
@@ -76,6 +79,8 @@ pub enum SettingsPage {
     Workflows,
     /// The project's agents and their shared instructions.
     Agents,
+    /// The project's orchestrator: how events reach it.
+    Orchestrator,
 }
 
 /// Whose settings a page edits.
@@ -96,6 +101,7 @@ impl SettingsPage {
             SettingsPage::Workspaces => "Workspaces",
             SettingsPage::Workflows => "Workflows",
             SettingsPage::Agents => "Agents",
+            SettingsPage::Orchestrator => "Orchestrator",
         }
     }
 
@@ -113,6 +119,7 @@ impl SettingsPage {
             SettingsPage::Workspaces => 5,
             SettingsPage::Workflows => 4,
             SettingsPage::Agents => 6,
+            SettingsPage::Orchestrator => 7,
         }
     }
 
@@ -127,9 +134,10 @@ impl SettingsPage {
             SettingsPage::General | SettingsPage::Keybindings | SettingsPage::Terminal => {
                 Scope::Global
             }
-            SettingsPage::Workspaces | SettingsPage::Workflows | SettingsPage::Agents => {
-                Scope::Project
-            }
+            SettingsPage::Workspaces
+            | SettingsPage::Workflows
+            | SettingsPage::Agents
+            | SettingsPage::Orchestrator => Scope::Project,
         }
     }
 
@@ -142,6 +150,7 @@ impl SettingsPage {
             SettingsPage::Workspaces => 1 << 3,
             SettingsPage::Workflows => 1 << 4,
             SettingsPage::Agents => 1 << 5,
+            SettingsPage::Orchestrator => 1 << 6,
         }
     }
 }
@@ -175,7 +184,12 @@ pub const SECTIONS: &[Section] = &[
     },
     Section {
         header: Header::Project,
-        pages: &[SettingsPage::Workspaces, SettingsPage::Workflows, SettingsPage::Agents],
+        pages: &[
+            SettingsPage::Workspaces,
+            SettingsPage::Workflows,
+            SettingsPage::Agents,
+            SettingsPage::Orchestrator,
+        ],
     },
 ];
 
@@ -196,7 +210,8 @@ impl PageSet {
             | SettingsPage::Terminal.bit()
             | SettingsPage::Workspaces.bit()
             | SettingsPage::Workflows.bit()
-            | SettingsPage::Agents.bit(),
+            | SettingsPage::Agents.bit()
+            | SettingsPage::Orchestrator.bit(),
     );
 
     /// No page.
@@ -561,22 +576,25 @@ mod tests {
                 SettingsPage::Terminal,
                 SettingsPage::Workspaces,
                 SettingsPage::Workflows,
-                SettingsPage::Agents
+                SettingsPage::Agents,
+                SettingsPage::Orchestrator
             ]
         );
-        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 5, 4, 6]);
+        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 5, 4, 6, 7]);
         assert_eq!(SettingsPage::for_shortcut(3), Some(SettingsPage::Terminal));
         assert_eq!(SettingsPage::for_shortcut(4), Some(SettingsPage::Workflows));
         assert_eq!(SettingsPage::for_shortcut(5), Some(SettingsPage::Workspaces));
         assert_eq!(SettingsPage::for_shortcut(6), Some(SettingsPage::Agents));
-        assert_eq!(SettingsPage::for_shortcut(7), None);
+        assert_eq!(SettingsPage::for_shortcut(7), Some(SettingsPage::Orchestrator));
+        assert_eq!(SettingsPage::for_shortcut(8), None);
         assert_eq!(
             SECTIONS.iter().map(|s| (s.header, s.pages.len())).collect::<Vec<_>>(),
-            [(Header::Title("Global"), 3), (Header::Project, 3)]
+            [(Header::Title("Global"), 3), (Header::Project, 4)]
         );
         assert_eq!(SettingsPage::Terminal.scope(), Scope::Global);
         assert_eq!(SettingsPage::Workspaces.scope(), Scope::Project);
         assert_eq!(SettingsPage::Workflows.scope(), Scope::Project);
+        assert_eq!(SettingsPage::Orchestrator.scope(), Scope::Project);
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a.shortcut(), b.shortcut(), "{a:?} and {b:?} share a number");
@@ -594,7 +612,7 @@ mod tests {
         assert_eq!(tui.pages().collect::<Vec<_>>(), [SettingsPage::General]);
         assert_eq!(tui.for_shortcut(1), Some(SettingsPage::General));
         assert_eq!(tui.for_shortcut(6), None, "Agents isn't offered");
-        assert_eq!(PageSet::ALL.pages().count(), 6);
+        assert_eq!(PageSet::ALL.pages().count(), 7);
         assert_eq!(PageSet::NONE.first(), None);
         // Reversed input still walks in sidebar order.
         let set = PageSet::of(&[SettingsPage::Agents, SettingsPage::General]);
@@ -633,17 +651,20 @@ mod tests {
         assert_eq!((nav.page(), nav.selected()), (SettingsPage::General, SettingsPage::General));
         nav.step(false);
         assert_eq!(nav.selected(), SettingsPage::General, "stops at the top");
-        for _ in 0..6 {
+        for _ in 0..7 {
             nav.step(true);
         }
         assert_eq!(
             nav.selected(),
-            SettingsPage::Agents,
+            SettingsPage::Orchestrator,
             "crosses into the project section and stops at the bottom"
         );
         assert_eq!(nav.page(), SettingsPage::General, "moving doesn't open");
         assert!(nav.activate());
-        assert_eq!((nav.page(), nav.selected()), (SettingsPage::Agents, SettingsPage::Agents));
+        assert_eq!(
+            (nav.page(), nav.selected()),
+            (SettingsPage::Orchestrator, SettingsPage::Orchestrator)
+        );
         assert!(!nav.activate(), "already shown");
     }
 
