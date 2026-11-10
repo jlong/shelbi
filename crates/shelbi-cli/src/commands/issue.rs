@@ -145,10 +145,13 @@ pub enum IssueCmd {
     /// Revise an issue's content. With NO flags, opens the issue's frontmatter
     /// and body in `$EDITOR`, on any issue-tracker backend. Any field flag
     /// switches to non-interactive mode: `--title`, a body source
-    /// (`--body`/`--body-file`/stdin, optionally `--append`), a frontmatter
+    /// (`--body`/`--body-file`, `-` for stdin, optionally `--append`), a frontmatter
     /// field (`--workflow`/`--branch`/`--prefers-machine`/`--no-prefers-machine`),
     /// a workflow param (`--param`/`--no-param`), or in-place body
-    /// substitutions (`--sub`/`--sub-regex`). Fields with a
+    /// substitutions (`--sub`/`--sub-regex`). Piped stdin is read as the body
+    /// only on request (`--body -`/`--body-file -`) or when no field flag was
+    /// given (`shelbi issue edit x <<EOF`); a field-flag edit never touches
+    /// stdin. Fields with a
     /// dedicated command — `move`, `prio`, `assign`, `depends` — are out of
     /// scope; use those instead.
     Edit(EditArgs),
@@ -260,12 +263,14 @@ pub struct EditArgs {
     /// re-slugified from a new title.
     #[arg(long, value_name = "TITLE")]
     pub title: Option<String>,
-    /// Replace the body with this text. Mutually exclusive with
-    /// `--body-file`, piped stdin, and the substitution flags.
+    /// Replace the body with this text, or with stdin when TEXT is `-`.
+    /// Mutually exclusive with `--body-file`, piped stdin, and the
+    /// substitution flags.
     #[arg(long, value_name = "TEXT")]
     pub body: Option<String>,
-    /// Replace the body with the contents of a file. Mutually exclusive with
-    /// `--body`, piped stdin, and the substitution flags.
+    /// Replace the body with the contents of a file, or with stdin when PATH
+    /// is `-`. Mutually exclusive with `--body`, piped stdin, and the
+    /// substitution flags.
     #[arg(long = "body-file", value_name = "PATH")]
     pub body_file: Option<std::path::PathBuf>,
     /// Append the body source (`--body`/`--body-file`/stdin) to the existing
@@ -495,7 +500,8 @@ fn add_should_read_stdin(args: &AddArgs) -> bool {
 /// pipe at all.
 ///
 /// Callers must only invoke this when the body is meant to come from stdin —
-/// i.e. no explicit `--body`/`--body-file` (edit) or `-d` (add) was passed.
+/// i.e. no explicit `--body`/`--body-file` and no field flag (edit), or no
+/// `-d` (add).
 /// A non-TTY stdin that never reaches EOF (backgrounded process, inherited
 /// pipe) blocks `read_to_string` forever, so gate the call on the absence of
 /// an explicit body source (see `edit_should_read_stdin` /
@@ -1218,10 +1224,18 @@ fn resume(
 /// body arrived on stdin), `edit` falls back to opening `$EDITOR` — the
 /// historical zero-flag behavior.
 fn edit_has_field_flags(args: &EditArgs, stdin_body: &Option<String>) -> bool {
-    args.title.is_some()
+    edit_has_non_body_flags(args)
         || args.body.is_some()
         || args.body_file.is_some()
         || args.append
+        || stdin_body.is_some()
+}
+
+/// Whether a flag that edits something OTHER than the body source was given:
+/// the title, a frontmatter field, a workflow param, or a substitution. Such an
+/// edit is complete on its own, so it never takes a body from stdin.
+fn edit_has_non_body_flags(args: &EditArgs) -> bool {
+    args.title.is_some()
         || args.workflow.is_some()
         || args.branch.is_some()
         || args.prefers_machine.is_some()
@@ -1230,16 +1244,29 @@ fn edit_has_field_flags(args: &EditArgs, stdin_body: &Option<String>) -> bool {
         || !args.no_param.is_empty()
         || !args.sub.is_empty()
         || !args.sub_regex.is_empty()
-        || stdin_body.is_some()
 }
 
-/// Whether `edit` should consult stdin for the body. False when an explicit
-/// body source (`--body`/`--body-file`) was given — the caller already supplied
-/// the body, so reading stdin would only risk blocking a non-interactive
-/// invocation whose stdin never closes. Reading stdin is reserved for the
-/// `shelbi issue edit x <<EOF` spelling, where the body comes from stdin.
+/// Whether `edit` should take the body from piped stdin *implicitly*, i.e.
+/// without `--body -`. Only the bare `shelbi issue edit x <<EOF` spelling
+/// (optionally with `--append` / `--reason`) does: an explicit body source
+/// already carries the body, and a field-flag edit (`--param`, `--title`,
+/// `--workflow`, ...) has no body to read. Either way, touching stdin would
+/// block forever on a non-interactive caller whose stdin is an open pipe that
+/// never reaches EOF (an agent's shell, a backgrounded script).
 fn edit_should_read_stdin(args: &EditArgs) -> bool {
-    args.body.is_none() && args.body_file.is_none()
+    args.body.is_none() && args.body_file.is_none() && !edit_has_non_body_flags(args)
+}
+
+/// Drain stdin for an explicit `--body -` / `--body-file -`. Unlike
+/// [`read_piped_stdin`] this reads a terminal too (to EOF, like `cat -`) and
+/// keeps an empty result, so `-` behaves exactly like passing the text inline.
+fn read_stdin_body() -> Result<String> {
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("reading the body from stdin")?;
+    Ok(buf)
 }
 
 /// Reconstruct the command-line order of `--sub` / `--sub-regex` occurrences.
@@ -1315,12 +1342,13 @@ where
 /// application, append composition, field validation, and the write live in
 /// `shelbi_orchestrator::mutate`.
 fn edit(project: &str, args: EditArgs) -> Result<()> {
-    // Only consult stdin when NO explicit body source was passed. `--body` /
-    // `--body-file` already carry the body, so touching `stdin()` would
-    // pointlessly block a non-interactive caller whose stdin never reaches EOF
-    // (backgrounded process, inherited pipe) — the hang this gate exists to
-    // prevent. Reading stdin here is reserved for the `shelbi issue edit x <<EOF`
-    // spelling, where the body is *meant* to come from stdin.
+    // Only consult stdin implicitly when NO body source and NO field flag was
+    // passed. `--body` / `--body-file` already carry the body, and a field-flag
+    // edit (`--param k=v`) has none, so touching `stdin()` would pointlessly
+    // block a non-interactive caller whose stdin never reaches EOF
+    // (backgrounded process, an agent's inherited pipe) — the hang this gate
+    // exists to prevent. Implicit stdin is reserved for the
+    // `shelbi issue edit x <<EOF` spelling; `--body -` asks for it explicitly.
     let stdin_body = if edit_should_read_stdin(&args) {
         read_piped_stdin()?
     } else {
@@ -1357,14 +1385,21 @@ fn edit(project: &str, args: EditArgs) -> Result<()> {
     // Resolve the single body source from the flags/stdin available only to the
     // client (the daemon can't read this process's stdin or cwd files). Pass the
     // RAW text through — the library trims and composes (`--append`).
+    // `-` for either flag reads stdin (explicitly requested, so any stdin).
+    // Both at once is two sources; the check below refuses it.
+    let inline_body = match args.body.as_deref() {
+        Some("-") => Some(read_stdin_body()?),
+        other => other.map(str::to_owned),
+    };
     let file_body = match &args.body_file {
+        Some(path) if path.as_os_str() == "-" => Some(read_stdin_body()?),
         Some(path) => Some(
             std::fs::read_to_string(path)
                 .with_context(|| format!("reading --body-file {}", path.display()))?,
         ),
         None => None,
     };
-    let sources: Vec<String> = [args.body.clone(), file_body, stdin_body]
+    let sources: Vec<String> = [inline_body, file_body, stdin_body]
         .into_iter()
         .flatten()
         .collect();
@@ -2015,6 +2050,41 @@ statuses:
             edit_should_read_stdin(&a),
             "--append with no --body/--body-file still reads stdin as its source"
         );
+        let mut a = edit_args("x");
+        a.reason = Some("why".into());
+        assert!(edit_should_read_stdin(&a), "--reason doesn't change the body source");
+    }
+
+    #[test]
+    fn edit_stdin_gate_skips_stdin_for_field_flag_edits() {
+        // The hang from an agent's shell: `issue edit x --param k=v` with stdin
+        // an open pipe blocked in `read_to_string` forever. A field-flag edit
+        // has no body to read, so it must never touch stdin.
+        type SetFlag = fn(&mut EditArgs);
+        let cases: [(&str, SetFlag); 9] = [
+            ("--title", |a| a.title = Some("T".into())),
+            ("--workflow", |a| a.workflow = Some("w".into())),
+            ("--branch", |a| a.branch = Some("b".into())),
+            ("--prefers-machine", |a| a.prefers_machine = Some("m".into())),
+            ("--no-prefers-machine", |a| a.no_prefers_machine = true),
+            ("--param", |a| a.param = vec!["task=x".into()]),
+            ("--no-param", |a| a.no_param = vec!["task".into()]),
+            ("--sub", |a| a.sub = vec!["a".into(), "b".into()]),
+            ("--sub-regex", |a| a.sub_regex = vec!["a".into(), "b".into()]),
+        ];
+        for (flag, set) in cases {
+            let mut a = edit_args("x");
+            set(&mut a);
+            assert!(!edit_should_read_stdin(&a), "{flag} must skip stdin");
+            // Even with --append, a field flag doesn't turn stdin on: the
+            // caller asks for a stdin body with `--body -`.
+            a.append = true;
+            assert!(!edit_should_read_stdin(&a), "{flag} --append must skip stdin");
+        }
+        // `--body -` is read by its own path, not the implicit gate.
+        let mut a = edit_args("x");
+        a.body = Some("-".into());
+        assert!(!edit_should_read_stdin(&a));
     }
 
     #[test]

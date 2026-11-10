@@ -178,6 +178,50 @@ impl Home {
             .expect("run shelbi issue edit")
     }
 
+    /// Run `shelbi -p p issue edit <args>` with stdin a pipe. `Some(text)` is
+    /// written and the pipe closed; `None` holds the write end open for the
+    /// whole run, the shape of an agent's shell or a backgrounded script, so a
+    /// read of stdin would never return. Gives up (and fails) after 30s.
+    fn edit_with_stdin(&self, args: &[&str], stdin: Option<&str>) -> Output {
+        use std::io::{Read, Write};
+        let mut cmd = Command::new(BIN);
+        self.env(&mut cmd);
+        let mut child = cmd
+            .args(["--project", "p", "issue", "edit"])
+            .args(args)
+            .env("EDITOR", "false")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run shelbi issue edit");
+        let mut pipe = child.stdin.take();
+        if let Some(text) = stdin {
+            pipe.take().unwrap().write_all(text.as_bytes()).unwrap();
+        }
+        let start = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if start.elapsed() > Duration::from_secs(30) {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("`issue edit {}` hung reading stdin", args.join(" "));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        drop(pipe);
+        let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+        child.stdout.take().unwrap().read_to_end(&mut stdout).unwrap();
+        child.stderr.take().unwrap().read_to_end(&mut stderr).unwrap();
+        Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+
     /// Install an editor script. `$1` is the file it's given, `$D` this home.
     fn editor(&self, body: &str) -> String {
         let path = self.path.join("bin/editor");
@@ -394,4 +438,72 @@ fn editor_mode_still_reports_a_missing_issue() {
     let out = home.edit("true", &["nope"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("issue `nope` not found"));
+}
+
+/// The reported hang: a field-flag edit run with stdin an open pipe that never
+/// closes (the orchestrator's Bash tool) blocked reading a body it never asked
+/// for. Each field flag now returns without touching stdin.
+#[test]
+fn field_flag_edits_ignore_an_open_stdin() {
+    let home = Home::new("open", false);
+    home.write_task();
+    let stdout = assert_ok(&home.edit_with_stdin(&["t", "--param", "task=parent"], None));
+    assert!(stdout.contains("t edited (params)"), "{stdout}");
+    assert!(home.task().contains("task: parent"), "{}", home.task());
+
+    let stdout = assert_ok(&home.edit_with_stdin(&["t", "--title", "New"], None));
+    assert!(stdout.contains("t edited"), "{stdout}");
+    let stdout = assert_ok(&home.edit_with_stdin(&["t", "--branch", "feat/x"], None));
+    assert!(stdout.contains("t edited"), "{stdout}");
+    let stdout = assert_ok(&home.edit_with_stdin(&["t", "--sub", "body", "prose"], None));
+    assert!(stdout.contains("t edited"), "{stdout}");
+    let task = home.task();
+    assert!(task.contains("title: New"), "{task}");
+    assert!(task.contains("branch: feat/x"), "{task}");
+    assert!(task.trim_end().ends_with("---\nprose"), "the body came from --sub only: {task}");
+}
+
+/// A field flag never reads stdin, even when something was piped: the body
+/// stays as it was.
+#[test]
+fn field_flag_edits_dont_take_a_piped_body() {
+    let home = Home::new("fpipe", false);
+    home.write_task();
+    let stdout = assert_ok(&home.edit_with_stdin(&["t", "--param", "task=p"], Some("piped\n")));
+    assert!(stdout.contains("t edited (params)"), "{stdout}");
+    let task = home.task();
+    assert!(task.trim_end().ends_with("---\nbody"), "{task}");
+}
+
+/// Stdin is still the body when the caller asks for it: piped with no field
+/// flag, or `--body -` / `--body-file -` alongside other flags.
+#[test]
+fn stdin_is_the_body_when_asked_for() {
+    let home = Home::new("body", false);
+    home.write_task();
+
+    let stdout = assert_ok(&home.edit_with_stdin(&["t"], Some("from the pipe\n")));
+    assert!(stdout.contains("t edited"), "{stdout}");
+    assert!(home.task().trim_end().ends_with("---\nfrom the pipe"), "{}", home.task());
+
+    let stdout = assert_ok(&home.edit_with_stdin(
+        &["t", "--body", "-", "--param", "task=p"],
+        Some("dash body\n"),
+    ));
+    assert!(stdout.contains("t edited"), "{stdout}");
+    let task = home.task();
+    assert!(task.contains("task: p"), "{task}");
+    assert!(task.trim_end().ends_with("---\ndash body"), "{task}");
+
+    let stdout =
+        assert_ok(&home.edit_with_stdin(&["t", "--body-file", "-"], Some("file dash\n")));
+    assert!(stdout.contains("t edited"), "{stdout}");
+    assert!(home.task().trim_end().ends_with("---\nfile dash"), "{}", home.task());
+
+    let stdout =
+        assert_ok(&home.edit_with_stdin(&["t", "--append", "--body", "-"], Some("more\n")));
+    assert!(stdout.contains("t edited"), "{stdout}");
+    let task = home.task();
+    assert!(task.contains("file dash"), "{task}");
+    assert!(task.trim_end().ends_with("more"), "{task}");
 }
