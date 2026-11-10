@@ -85,8 +85,35 @@ fn claude_orchestrator_argv_is_frozen() {
         "myapp",
         Path::new("/tmp/myapp"),
         &crate::orch_bootstrap_prompt_base("myapp"),
+        false,
     );
     assert_golden("claude/orchestrator-argv.txt", &argv);
+}
+
+/// Awareness (v2): the second, session-only `--plugin-dir` and the bootstrap
+/// that leaves event delivery to the plugin. v1 stays frozen above.
+#[test]
+fn claude_awareness_orchestrator_argv_is_frozen() {
+    let argv = crate::orchestrator_launch_command(
+        "/usr/local/bin/shelbi",
+        &claude_runner(),
+        "myapp",
+        Path::new("/tmp/myapp"),
+        None,
+        true,
+    );
+    assert_golden("claude/orchestrator-awareness-argv.txt", &argv);
+
+    // v1 (the plugin not staged) launches exactly as before.
+    let v1 = crate::orchestrator_launch_command(
+        "/usr/local/bin/shelbi",
+        &claude_runner(),
+        "myapp",
+        Path::new("/tmp/myapp"),
+        None,
+        false,
+    );
+    assert_golden("claude/orchestrator-argv.txt", &v1);
 }
 
 #[test]

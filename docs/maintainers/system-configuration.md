@@ -24,6 +24,23 @@ for the command surface.
   skill orchestrates: versioned discovery and read-only validation of every
   owned surface.
 
+## The awareness plugin
+
+A second Shelbi-owned bundle, `plugins/shelbi-awareness` (Claude only), delivers
+awareness (v2) events to the orchestrator. It is staged into
+`.claude/shelbi-system-plugins/shelbi-awareness` and passed with a second
+`--plugin-dir` only when the project sets `orchestrator.awareness: awareness`
+(`deploy_orchestrator_awareness_plugin` in
+`crates/shelbi-orchestrator/src/workspace.rs`); on v1 the directory is removed
+and the launch line is unchanged. Its monitor runs
+`shelbi orchestrator events stream` and its hooks run
+`shelbi orchestrator hook <event>`. Resolution
+(`crates/shelbi-orchestrator/src/awareness_plugin.rs`) follows the same
+installed-then-embedded order as below, except that a missing installed copy is
+not a warning (the desktop app's CLI installer and older packages don't carry
+it). If staging fails, the launch falls back to the v1 bootstrap. The plugin's
+own `README.md` documents its delivery contract and monitor lifetime.
+
 ## Ownership
 
 The name `update-shelbi-configuration` is reserved. It is installed **last**,

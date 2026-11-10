@@ -1,0 +1,38 @@
+{
+  "description": "Shelbi awareness: attach undelivered board events to each prompt, surface urgent ones before stopping, and restate the Zen policy at session start.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "shelbi orchestrator hook user-prompt-submit || true",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "shelbi orchestrator hook stop || true",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "shelbi orchestrator hook session-start || true",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}

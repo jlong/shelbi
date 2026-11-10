@@ -4608,6 +4608,11 @@ pub const ORCHESTRATOR_SYSTEM_PLUGIN_REL: &str =
     ".claude/shelbi-system-plugins/update-shelbi-configuration";
 pub const ORCHESTRATOR_SYSTEM_SKILLS_REL: &str =
     ".claude/shelbi-system-plugins/update-shelbi-configuration/skills";
+/// Session-scoped awareness (v2) delivery plugin, staged beside the
+/// configuration plugin only for a project on `orchestrator.awareness:
+/// awareness` (see [`deploy_orchestrator_awareness_plugin`]).
+pub const ORCHESTRATOR_AWARENESS_PLUGIN_REL: &str =
+    ".claude/shelbi-system-plugins/shelbi-awareness";
 pub const WORKTREE_STARTUP_PROMPT_REL: &str = ".shelbi/startup-prompt.md";
 
 /// Relative path (from the worktree root) where the dispatched agent's
@@ -5101,6 +5106,35 @@ fn deploy_orchestrator_system_skill(
     ignore_rels.push(".claude/shelbi-system-plugins/".to_string());
     let _ = gitignore_worktree_paths(host, worktree, &ignore_rels);
     Ok(())
+}
+
+/// Stage (or, when `enabled` is false, remove) the `shelbi-awareness` plugin
+/// in the orchestrator's workdir. Returns whether a complete bundle is staged,
+/// which is what the launch keys its `--plugin-dir` and bootstrap prompt on: a
+/// failed stage falls back to the v1 self-driven drain rather than pointing
+/// Claude at a missing plugin. The directory sits under the already-ignored
+/// `.claude/shelbi-system-plugins/`.
+pub fn deploy_orchestrator_awareness_plugin(
+    host: &Host,
+    workdir: &Path,
+    enabled: bool,
+) -> Result<bool> {
+    let root = workdir.join(ORCHESTRATOR_AWARENESS_PLUGIN_REL);
+    // Start clean either way, so a file dropped from the bundle (or the whole
+    // plugin, after switching back to v1) never lingers.
+    remove_worktree_entry(host, &root)?;
+    if !enabled {
+        return Ok(false);
+    }
+    let plugin = crate::awareness_plugin::resolve_awareness_plugin();
+    for warning in &plugin.warnings {
+        eprintln!("shelbi: warning: {warning}");
+        tracing::warn!("{warning}");
+    }
+    for (rel, body) in &plugin.files {
+        write_worktree_text(host, &root.join(rel), body, "awareness-plugin")?;
+    }
+    Ok(true)
 }
 
 /// Wrap `handoff` in a `<system-reminder>` block and append it to

@@ -57,6 +57,7 @@ pub mod state_write;
 pub mod submit;
 pub mod supervision;
 pub mod system_plugin;
+pub mod awareness_plugin;
 pub mod transition;
 pub mod wake;
 pub mod workspace;
@@ -599,7 +600,13 @@ pub fn ensure_dashboard(project_name: &str) -> Result<BootstrapStatus> {
         }
     }
 
-    let status = spawn_orchestrator_locked(project_name, &host, hub.work_dir.as_path(), &runner_spec)?;
+    let status = spawn_orchestrator_locked(
+        project_name,
+        &host,
+        hub.work_dir.as_path(),
+        &runner_spec,
+        project.orchestrator.awareness,
+    )?;
     // A successful bring-up answers any supervisor failure the sidebar is still
     // showing (e.g. a TUI open after the supervisor gave up). Best-effort.
     let _ = shelbi_state::clear_orchestrator_supervision_status(project_name);
@@ -640,7 +647,13 @@ pub fn relaunch_orchestrator_session(project_name: &str) -> Result<BootstrapStat
         &project.orchestrator.runner,
         &runner_spec.command,
     )?;
-    spawn_orchestrator_locked(project_name, &host, hub.work_dir.as_path(), &runner_spec)
+    spawn_orchestrator_locked(
+        project_name,
+        &host,
+        hub.work_dir.as_path(),
+        &runner_spec,
+        project.orchestrator.awareness,
+    )
 }
 
 /// How long [`replace_orchestrator_session`] waits for the signalled
@@ -718,6 +731,7 @@ fn spawn_orchestrator_locked(
     host: &Host,
     hub_work_dir: &std::path::Path,
     runner_spec: &shelbi_core::AgentRunnerSpec,
+    awareness: shelbi_core::AwarenessMode,
 ) -> Result<BootstrapStatus> {
     let session = format!("shelbi-{project_name}");
     // The orchestrator's agent context (composed preamble +
@@ -729,6 +743,9 @@ fn spawn_orchestrator_locked(
     // without the bundled orchestrator prompt.
     let workdir = shelbi_state::project_dir(project_name)?;
     shelbi_state::ensure_dir(&workdir)?;
+    // Whether the `shelbi-awareness` plugin is staged for this launch: set by
+    // the deploy step, read by the spawn.
+    let awareness_plugin = std::cell::Cell::new(false);
 
     // The orchestrator runs as a detached session process (owning its own PTY,
     // no tmux pane) through the backend seam — no `$TMUX_PANE`, no duplicated
@@ -740,6 +757,19 @@ fn spawn_orchestrator_locked(
         project_name,
         OrchRelaunchTiming::default(),
         |handoff| {
+            // Staged first and on its own: the launch below keys on whether it
+            // landed, whatever happens to the agent context.
+            let enabled = awareness == shelbi_core::AwarenessMode::Awareness
+                && orchestrator_plugin_runner(runner_spec);
+            match workspace::deploy_orchestrator_awareness_plugin(host, &workdir, enabled) {
+                Ok(staged) => awareness_plugin.set(staged),
+                Err(e) => tracing::warn!(
+                    project = project_name,
+                    error = %e,
+                    "staging the awareness plugin failed; the orchestrator falls back to \
+                     the self-driven event drain",
+                ),
+            }
             workspace::deploy_agent_context(
                 host,
                 &workdir,
@@ -748,7 +778,16 @@ fn spawn_orchestrator_locked(
                 handoff,
             )
         },
-        || ensure_orchestrator_session(project_name, &session, runner_spec, &workdir, hub_work_dir),
+        || {
+            ensure_orchestrator_session(
+                project_name,
+                &session,
+                runner_spec,
+                &workdir,
+                hub_work_dir,
+                awareness_plugin.get(),
+            )
+        },
     )
 }
 
@@ -912,16 +951,49 @@ fn orch_bootstrap_prompt_base(project_name: &str) -> String {
     )
 }
 
+/// The awareness (v2) bootstrap for a Claude orchestrator launched with the
+/// `shelbi-awareness` plugin. Events reach it as plugin-monitor notifications
+/// and as prompt-hook context, both already acked, so unlike
+/// [`orch_bootstrap_prompt_base`] it neither arms a Monitor on `events tail`
+/// nor self-drains before every reply. It says so explicitly: a v1 drain run
+/// by habit (or by an older `instructions.md`) would take events out from
+/// under the plugin.
+fn orch_bootstrap_prompt_awareness() -> String {
+    "Run the \"Bootstrap on session start\" sequence from your instructions now: snapshot \
+     `shelbi task list`, `shelbi workspace list`, and `shelbi zen status`; scan recent \
+     `~/.shelbi/events.log` for a `zen=off reason=crash-recovery` line. This project uses \
+     Shelbi's awareness event delivery, so skip the event-watch steps: do NOT start a \
+     Monitor on `shelbi events tail`, and do NOT run `shelbi orchestrator events next`, \
+     `drain` or `ack` yourself, before replies or otherwise. The shelbi-awareness plugin \
+     owns the delivery queue: its monitor delivers each task and workspace transition, \
+     reminder, finished job, overdue task, pane death, supervision give-up, review-ready \
+     signal, worker question and board digest to you as a `shelbi <kind>: ...` notification \
+     the moment it lands, and anything not yet shown is attached to the user's next \
+     message. Every event you see is already acknowledged and arrives once. React to \
+     each through your normal reaction rules. A quiet board sends nothing, and that is \
+     expected: there is no heartbeat to wait for."
+        .to_string()
+}
+
 /// Compose the recurring orchestrator bootstrap with the optional one-shot
 /// first-project welcome. Repository inspection stays inside the local agent
 /// session: Shelbi supplies strict bounds and the repo path, while the agent
 /// reads and summarizes the evidence itself.
+///
+/// `awareness_plugin` selects the awareness (v2) bootstrap for a Claude
+/// orchestrator launched with the `shelbi-awareness` plugin; every other
+/// launch keeps the v1 prompt byte for byte.
 pub(crate) fn orchestrator_bootstrap_prompt(
     project_name: &str,
     repo_root: &std::path::Path,
     contextual_greeting: bool,
+    awareness_plugin: bool,
 ) -> String {
-    let base = orch_bootstrap_prompt_base(project_name);
+    let base = if awareness_plugin {
+        orch_bootstrap_prompt_awareness()
+    } else {
+        orch_bootstrap_prompt_base(project_name)
+    };
     if !contextual_greeting {
         return base;
     }
@@ -974,17 +1046,27 @@ fn orchestrator_launch_command(
     project_name: &str,
     workdir: &std::path::Path,
     first_launch_repo: Option<&std::path::Path>,
+    awareness_plugin: bool,
 ) -> String {
     if shelbi_agent::RunnerAdapter::for_spec(spec).is_codex() {
         codex_bridge_cmd(shelbi_bin, project_name, first_launch_repo.is_some())
     } else {
+        let awareness_plugin = awareness_plugin && orchestrator_plugin_runner(spec);
         let bootstrap_prompt = orchestrator_bootstrap_prompt(
             project_name,
             first_launch_repo.unwrap_or(workdir),
             first_launch_repo.is_some(),
+            awareness_plugin,
         );
-        launch_with_bootstrap(spec, project_name, workdir, &bootstrap_prompt)
+        launch_with_bootstrap(spec, project_name, workdir, &bootstrap_prompt, awareness_plugin)
     }
+}
+
+/// Whether `spec` is a runner the `shelbi-awareness` plugin can deliver to
+/// (Claude: a plugin monitor plus hooks through `--plugin-dir`). Codex and
+/// custom runners keep the v1 delivery here.
+fn orchestrator_plugin_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
+    shelbi_agent::RunnerAdapter::for_spec(spec).is_claude()
 }
 
 fn codex_bridge_cmd(shelbi_bin: &str, project_name: &str, first_launch: bool) -> String {
@@ -1016,13 +1098,20 @@ fn launch_with_bootstrap(
     project_name: &str,
     workdir: &std::path::Path,
     bootstrap_prompt: &str,
+    awareness_plugin: bool,
 ) -> String {
     let adapter = shelbi_agent::RunnerAdapter::for_spec(spec);
     if adapter.is_claude() {
-        let resolved = adapter.with_orchestrator_plugin_dir(
+        let mut resolved = adapter.with_orchestrator_plugin_dir(
             spec,
             workspace::ORCHESTRATOR_SYSTEM_PLUGIN_REL,
         );
+        if awareness_plugin {
+            resolved = adapter.with_orchestrator_plugin_dir(
+                &resolved,
+                workspace::ORCHESTRATOR_AWARENESS_PLUGIN_REL,
+            );
+        }
         let launch = shelbi_agent::launch_command(&resolved);
         format!(
             "{launch} --append-system-prompt \"$(cat {rel})\" {prompt}",
@@ -1197,6 +1286,7 @@ fn ensure_orchestrator_session(
     runner_spec: &shelbi_core::AgentRunnerSpec,
     workdir: &std::path::Path,
     hub_work_dir: &std::path::Path,
+    awareness_plugin: bool,
 ) -> Result<()> {
     let b = backend();
 
@@ -1213,6 +1303,7 @@ fn ensure_orchestrator_session(
         project_name,
         workdir,
         first_launch_repo,
+        awareness_plugin,
     );
     let spec = orchestrator_session_spec(project_name, session, workdir, &launch);
 

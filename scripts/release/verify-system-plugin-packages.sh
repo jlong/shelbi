@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
 # Verify that every release archive and Debian package carries the complete
-# Shelbi system plugin at the layout its installed binary resolves.
+# Shelbi system plugins at the layout their installed binary resolves.
 
 set -euo pipefail
 
 DIST_DIR="${1:-dist}"
 PLUGIN_REL="plugins/update-shelbi-configuration"
+AWARENESS_REL="plugins/shelbi-awareness"
 ARCHIVE_FILES=(
   "$PLUGIN_REL/.claude-plugin/plugin.json"
   "$PLUGIN_REL/.codex-plugin/plugin.json"
   "$PLUGIN_REL/skills/update-shelbi-configuration/SKILL.md"
+  "$AWARENESS_REL/.claude-plugin/plugin.json"
+  "$AWARENESS_REL/hooks/hooks.json"
+  "$AWARENESS_REL/monitors/monitors.json"
+  "$AWARENESS_REL/README.md"
 )
 DEB_PREFIX="usr/share/shelbi"
 

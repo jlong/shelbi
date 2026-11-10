@@ -20,12 +20,23 @@ use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
 use super::require_project;
 
+#[path = "orchestrator_awareness.rs"]
+mod awareness;
+pub use awareness::HookEvent;
+
 #[derive(Debug, Subcommand)]
 pub enum OrchestratorCmd {
     /// Read project-scoped events since a cursor.
     Events {
         #[command(subcommand)]
         cmd: OrchestratorEventsCmd,
+    },
+    /// Answer a Claude Code hook for the `shelbi-awareness` system plugin
+    /// (awareness v2). Plumbing: the plugin's `hooks/hooks.json` calls it.
+    #[command(hide = true)]
+    Hook {
+        #[arg(value_enum)]
+        event: HookEvent,
     },
 }
 
@@ -86,6 +97,22 @@ pub enum OrchestratorEventsCmd {
         #[arg(long)]
         max_lifetime: Option<String>,
     },
+    /// Deliver project events as they arrive, one compact line per event,
+    /// acking each batch once printed (awareness v2).
+    ///
+    /// This is the `shelbi-awareness` plugin monitor's command: Claude Code
+    /// turns each line into a notification for the orchestrator. It claims the
+    /// project's consuming-follower slot, prints task/workspace transitions,
+    /// reminders, finished jobs, overdue tasks, pane deaths, supervision
+    /// give-ups, review-ready signals, questions and the board digest, and
+    /// nothing at all on a quiet board. It runs until stopped; a follower that
+    /// briefly takes the slot (`events next --follow`) is waited out, not
+    /// fought.
+    Stream {
+        /// Optional wall-clock lifetime, e.g. `4h`. Omit to run indefinitely.
+        #[arg(long)]
+        max_lifetime: Option<String>,
+    },
     /// Advance the durable cursor past an acknowledged batch delivery id.
     ///
     /// The counterpart to `events next --follow`: apply a batch's facts, then
@@ -98,8 +125,13 @@ pub enum OrchestratorEventsCmd {
 }
 
 pub fn run(project_opt: Option<String>, cmd: OrchestratorCmd) -> Result<()> {
+    // A hook must answer even when it can't resolve the project.
+    if let OrchestratorCmd::Hook { event } = cmd {
+        return awareness::run_hook(project_opt, event);
+    }
     let project = require_project(project_opt)?;
     match cmd {
+        OrchestratorCmd::Hook { .. } => unreachable!("handled above"),
         OrchestratorCmd::Events { cmd } => match cmd {
             OrchestratorEventsCmd::Drain { cursor } => {
                 let cursor_override = cursor.as_deref().map(parse_cursor).transpose()?;
@@ -126,6 +158,13 @@ pub fn run(project_opt: Option<String>, cmd: OrchestratorCmd) -> Result<()> {
                     let response = wait_next(&project, parse_cursor(&cursor)?, timeout)?;
                     print_response(&response)
                 }
+            }
+            OrchestratorEventsCmd::Stream { max_lifetime } => {
+                let max_lifetime = max_lifetime
+                    .as_deref()
+                    .map(super::events::parse_duration)
+                    .transpose()?;
+                awareness::run_stream(&project, max_lifetime)
             }
             OrchestratorEventsCmd::Ack { delivery_id } => ack_delivery(&project, &delivery_id),
         },
@@ -1244,7 +1283,7 @@ mod tests {
     };
     use tempfile::TempDir;
 
-    struct TestHome {
+    pub(super) struct TestHome {
         _tmp: TempDir,
     }
 
@@ -1254,7 +1293,7 @@ mod tests {
         }
     }
 
-    fn setup_home() -> (std::sync::MutexGuard<'static, ()>, TestHome) {
+    pub(super) fn setup_home() -> (std::sync::MutexGuard<'static, ()>, TestHome) {
         let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         std::env::remove_var("SHELBI_HOME");
