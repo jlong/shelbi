@@ -9,6 +9,78 @@ on `main`, newest first. This page is hand-curated: it tracks capabilities, not
 every commit, so small copy edits and cosmetic tweaks are folded away. Entries
 are prose with `code` and links where they earn their place.
 
+### November 9, 2026
+
+**v0.14.0. Shelbi's own diff view, one way to add a project, PRs on the task, and a faster start and quit.**
+
+**Shelbi's own diff view.** Workspace and Review now open a diff inside
+Shelbi instead of handing the branch to an external tool. A review shows the
+branch as it would merge; a workspace shows its uncommitted work too,
+including untracked files. Files can be marked viewed and lines commented,
+with syntax highlighting, in both the desktop app and the TUI
+([#2163](https://github.com/jlong/shelbi/pull/2163)).
+
+**One way to add a project.** `shelbi init`, first-run `shelbi`,
+`shelbi project add`, the TUI's Add project dialog and the desktop wizard all
+walk the same four steps (Folder, Agents, Issues, Settings) and write the same
+files. A new project starts with an empty workspace pool that the orchestrator
+sets up on first boot ([#2241](https://github.com/jlong/shelbi/pull/2241)).
+
+**A task's PR, on the task.** When Shelbi opens a PR it records it on the
+task. The task sheet and Review panel show its number, state and CI, and open
+it in the browser. Existing tasks find their PR by branch
+([#2155](https://github.com/jlong/shelbi/pull/2155)).
+
+**Faster start and quit.** Opening a project no longer waits on unreachable
+machines (about 30 seconds with three on a down host, now about 2 on the
+first open). `shelbi quit` finishes in seconds. Both show each step as it
+runs ([#2231](https://github.com/jlong/shelbi/pull/2231),
+[#2234](https://github.com/jlong/shelbi/pull/2234),
+[#2194](https://github.com/jlong/shelbi/pull/2194)).
+
+**Clicks land on the content.** Clicking a workspace or review in the nav
+puts the keyboard on its terminal or diff, not the panel. Enter keeps today's
+panel focus. Edit in an editor shows a "Launching…" toast while it opens
+([#2217](https://github.com/jlong/shelbi/pull/2217),
+[#2239](https://github.com/jlong/shelbi/pull/2239)).
+
+**Hand off with no commits.** A workflow whose deliverable lives outside the
+repo (a plan in a document store, say) hands off without a commit and leaves
+no empty branch on origin
+([#2206](https://github.com/jlong/shelbi/pull/2206)).
+
+**Steadier workers and Zen.** A dispatch can no longer kill a live worker, a
+pane you closed on purpose isn't relaunched, and a short relay drop isn't
+read as a death. Zen merges the exact commit CI tested, refuses an empty
+integration over published work, and leaves a card you demoted alone
+([#2191](https://github.com/jlong/shelbi/pull/2191),
+[#2185](https://github.com/jlong/shelbi/pull/2185),
+[#2202](https://github.com/jlong/shelbi/pull/2202),
+[#2192](https://github.com/jlong/shelbi/pull/2192),
+[#2214](https://github.com/jlong/shelbi/pull/2214),
+[#2189](https://github.com/jlong/shelbi/pull/2189)).
+
+**Review and board fixes.** An accepted review leaves the review at once,
+View Diff waits for its diff, and a review slot's next task starts with fresh
+sessions. Load more on the board keeps its place and never blocks the TUI. On
+a GitHub tracker, `issue add --top` lands at the top and `issue edit` opens in
+`$EDITOR` ([#2150](https://github.com/jlong/shelbi/pull/2150),
+[#2153](https://github.com/jlong/shelbi/pull/2153),
+[#2186](https://github.com/jlong/shelbi/pull/2186),
+[#2213](https://github.com/jlong/shelbi/pull/2213),
+[#2235](https://github.com/jlong/shelbi/pull/2235),
+[#2162](https://github.com/jlong/shelbi/pull/2162)).
+
+**Desktop.** A window keeps its project through notices, quits and dialogs,
+and a project switch or a silent daemon no longer leaves an issue unable to
+save ([#2201](https://github.com/jlong/shelbi/pull/2201),
+[#2203](https://github.com/jlong/shelbi/pull/2203)).
+
+**Fewer dependencies.** termwiz, globset, chrono-tz, tempfile, dirs, which and
+the unmaintained serde_yaml are gone, the TUI uses one crossterm, and the
+vendored terminal no longer builds its own PTY host
+([#2232](https://github.com/jlong/shelbi/pull/2232)–[#2245](https://github.com/jlong/shelbi/pull/2245)).
+
 ### November 3, 2026
 
 **v0.13.3. Remote projects on password-only hosts, desktop windows that reopen where you left them, and no false "needs input".**
