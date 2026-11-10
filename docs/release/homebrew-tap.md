@@ -62,6 +62,7 @@ shelbi
 LICENSE
 README.md
 plugins/update-shelbi-configuration/
+plugins/shelbi-awareness/
 ```
 
 The generated formula installs `shelbi` and its system plugin assets, declares

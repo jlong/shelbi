@@ -128,24 +128,35 @@ pub(crate) fn resolve_system_plugin_at(root: &Path) -> ResolvedSystemPlugin {
 }
 
 fn installed_plugin_candidates() -> Vec<PathBuf> {
+    installed_candidates(SYSTEM_PLUGIN_NAME)
+}
+
+#[cfg(test)]
+fn installed_plugin_candidates_for_exe(exe: &Path) -> Vec<PathBuf> {
+    installed_candidates_for_exe(exe, SYSTEM_PLUGIN_NAME)
+}
+
+/// Where a package installs the Shelbi plugin `name`, most preferred first,
+/// for the running executable. Shared by every Shelbi-owned plugin bundle.
+pub(crate) fn installed_candidates(name: &str) -> Vec<PathBuf> {
     let Ok(exe) = std::env::current_exe() else {
         return Vec::new();
     };
-    installed_plugin_candidates_for_exe(&exe)
+    installed_candidates_for_exe(&exe, name)
 }
 
-fn installed_plugin_candidates_for_exe(exe: &Path) -> Vec<PathBuf> {
+pub(crate) fn installed_candidates_for_exe(exe: &Path, name: &str) -> Vec<PathBuf> {
     let Some(bin_dir) = exe.parent() else {
         return Vec::new();
     };
-    let adjacent = bin_dir.join("plugins").join(SYSTEM_PLUGIN_NAME);
+    let adjacent = bin_dir.join("plugins").join(name);
     let shared = bin_dir
         .parent()
         .unwrap_or(bin_dir)
         .join("share")
         .join("shelbi")
         .join("plugins")
-        .join(SYSTEM_PLUGIN_NAME);
+        .join(name);
 
     // Package managers and the source installer place executables in a `bin`
     // directory and assets under the same prefix's `share`. Prefer that path
@@ -166,7 +177,7 @@ fn installed_plugin_candidates_for_exe(exe: &Path) -> Vec<PathBuf> {
         .is_some_and(|name| name == "debug" || name == "release")
     {
         if let Some(repo) = bin_dir.parent().and_then(Path::parent) {
-            candidates.push(repo.join("plugins").join(SYSTEM_PLUGIN_NAME));
+            candidates.push(repo.join("plugins").join(name));
         }
     }
     candidates

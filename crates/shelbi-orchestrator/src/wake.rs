@@ -396,6 +396,9 @@ fn run_codex_bridge_until_shutdown(
             project_name,
             &repo_root,
             first_launch_pending,
+            // Codex delivery for awareness v2 is a separate path; the bridge
+            // keeps the v1 bootstrap.
+            false,
         );
         let mut bridge = match retry_native_start(
             shutdown,
@@ -459,6 +462,7 @@ fn run_codex_bridge_until_shutdown(
                     project_name,
                     &repo_root,
                     first_launch_pending,
+                    false,
                 );
                 // Every in-run path that sets `protocol_unsupported` (a rejected
                 // resume via the TUI relay, or a method/params rejection on a

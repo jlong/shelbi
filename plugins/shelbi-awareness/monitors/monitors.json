@@ -1,0 +1,7 @@
+[
+  {
+    "name": "shelbi-events",
+    "command": "shelbi orchestrator events stream",
+    "description": "Shelbi board events"
+  }
+]

@@ -1,0 +1,12 @@
+{
+  "name": "shelbi-awareness",
+  "version": "1.0.0",
+  "description": "Delivers Shelbi board events (transitions, reminders, finished jobs, overdue tasks) to the orchestrator as they happen.",
+  "author": {
+    "name": "Shelbi"
+  },
+  "homepage": "https://shelbi.dev",
+  "repository": "https://github.com/jlong/shelbi",
+  "license": "MIT",
+  "keywords": ["shelbi", "orchestration", "events"]
+}

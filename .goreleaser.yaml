@@ -31,6 +31,10 @@ archives:
       - plugins/update-shelbi-configuration/.claude-plugin/plugin.json
       - plugins/update-shelbi-configuration/.codex-plugin/plugin.json
       - plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md
+      - plugins/shelbi-awareness/.claude-plugin/plugin.json
+      - plugins/shelbi-awareness/hooks/hooks.json
+      - plugins/shelbi-awareness/monitors/monitors.json
+      - plugins/shelbi-awareness/README.md
 
 nfpms:
   - id: shelbi-deb
@@ -62,6 +66,14 @@ nfpms:
         dst: /usr/share/shelbi/plugins/update-shelbi-configuration/.codex-plugin/plugin.json
       - src: plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md
         dst: /usr/share/shelbi/plugins/update-shelbi-configuration/skills/update-shelbi-configuration/SKILL.md
+      - src: plugins/shelbi-awareness/.claude-plugin/plugin.json
+        dst: /usr/share/shelbi/plugins/shelbi-awareness/.claude-plugin/plugin.json
+      - src: plugins/shelbi-awareness/hooks/hooks.json
+        dst: /usr/share/shelbi/plugins/shelbi-awareness/hooks/hooks.json
+      - src: plugins/shelbi-awareness/monitors/monitors.json
+        dst: /usr/share/shelbi/plugins/shelbi-awareness/monitors/monitors.json
+      - src: plugins/shelbi-awareness/README.md
+        dst: /usr/share/shelbi/plugins/shelbi-awareness/README.md
     overrides:
       deb:
         file_name_template: "{{ .ProjectName }}_{{ .Version }}_amd64"

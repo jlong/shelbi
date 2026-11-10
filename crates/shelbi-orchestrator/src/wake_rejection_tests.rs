@@ -245,6 +245,7 @@ fn native_first_launch_sends_contextual_prompt_with_stable_message_id() {
         PROJECT,
         Path::new("/tmp/demo"),
         true,
+        false,
     );
     bridge.bootstrap_message_id = bootstrap_message_id(PROJECT, THREAD_ID, 7, true);
 

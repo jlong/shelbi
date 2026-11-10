@@ -1503,6 +1503,13 @@ pub fn event_follower_owner(project: &str) -> Result<Option<u32>> {
     read_follower_pid(&event_follower_path(project)?)
 }
 
+/// [`event_follower_owner`], but only when that process is still alive. A
+/// follower that yielded its claim to another consumer polls this to learn
+/// when the slot is free again (a dead owner's stale PID counts as free).
+pub fn live_event_follower(project: &str) -> Result<Option<u32>> {
+    Ok(event_follower_owner(project)?.filter(|pid| process_is_alive(*pid)))
+}
+
 /// Release ownership iff the registry still names `pid`. A follower that was
 /// superseded (the file now names a newer owner) leaves it untouched so it
 /// never clobbers its successor's claim; a follower that still owns it clears
@@ -1519,6 +1526,30 @@ pub fn release_event_follower(project: &str, pid: u32) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Held while one awareness (v2) consumer delivers a batch: it reads the
+/// cursor, renders the pending events, hands them to the runner, and acks them
+/// before releasing. The plugin monitor's `events stream` and its prompt/stop
+/// hooks all deliver from the same queue, so serializing the
+/// read-deliver-ack sequence is what keeps an event from reaching the
+/// orchestrator twice (once as a notification, once as hook context).
+#[must_use = "the lock is released as soon as the guard is dropped"]
+pub struct EventDeliveryLock {
+    _guard: crate::FileLockGuard,
+}
+
+/// Take the project's delivery lock ([`EventDeliveryLock`]), giving up at
+/// `deadline` or when `cancelled` fires (`Ok(None)`), so a hook that must
+/// answer within its timeout never parks behind a slow stream write.
+pub fn acquire_event_delivery_lock(
+    project: &str,
+    deadline: Option<Instant>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<EventDeliveryLock>> {
+    let path = project_dir(project)?.join("event-delivery.lock");
+    Ok(crate::acquire_file_lock_deadline(&path, deadline, cancelled)?
+        .map(|guard| EventDeliveryLock { _guard: guard }))
 }
 
 /// Stable delivery id for a drained event range: `shelbi-event/<project>/<from>-<through>`.
