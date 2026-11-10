@@ -225,6 +225,7 @@ fn persisted_over_limit_legacy_batch_is_rebuilt_from_the_durable_cursor() {
         input: escaped_input,
         actionable: true,
         keep_alive: false,
+        digest: false,
         attempted: false,
         status: DeliveryStatus::Pending,
     };
