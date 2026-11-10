@@ -33,7 +33,7 @@ A tag push runs these jobs in `release.yml`:
    `x86_64-unknown-linux-gnu`. (macOS runners queue too long to gate releases;
    the shipped darwin binaries are cross-compiled in the publish job and the
    maintainer verifies them on real hardware.)
-3. **`release`** — runs in the **`release`** environment on `macos-14`
+3. **`release`** — runs in the **`release`** environment on `macos-15`
    (darwin targets need a real macOS SDK; Linux cross-compiles from macOS via
    `cargo-zigbuild`). It runs `goreleaser release --clean`, verifies
    `checksums.txt` and the `.deb` exist, runs
@@ -61,7 +61,7 @@ A tag push runs these jobs in `release.yml`:
    GitHub release only when notarized. Without the five signing secrets (see
    [Secrets](#secrets)) it builds an unsigned app with a warning annotation and
    stays green; with them, anything short of notarized fails the job.
-   `macos-15` rather than `macos-14` because the app's floor is macOS 15 and the
+   `macos-15`, like the darwin jobs, because the app's floor is macOS 15 and the
    script runs the bundled binary as a smoke check.
    The app also depends on this release's CLI assets: when a Mac has no
    `shelbi` (the zip without the cask), its first launch downloads
@@ -85,7 +85,7 @@ A tag push runs these jobs in `release.yml`:
 
 The `workflow_dispatch` path (a manual run with a synthetic `ref_name` such as
 `v0.9.0`) is the **dry-run path**: it runs `validate` and `smoke`, then a
-`goreleaser-dry-run` job that builds snapshot artifacts on `macos-14` without
+`goreleaser-dry-run` job that builds snapshot artifacts on `macos-15` without
 publishing a GitHub Release, and `desktop-release`, which bundles the app (signed
 and notarized when the secrets are present) and reports what it would attach
 without touching any release.

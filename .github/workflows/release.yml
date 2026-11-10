@@ -116,10 +116,10 @@ jobs:
       - validate
       - smoke
     if: needs.validate.outputs.dry_run == 'true'
-    # macos-14: darwin targets need a real macOS SDK for framework linking
+    # macos-15: darwin targets need a real macOS SDK for framework linking
     # (zig cross-compilation from Linux fails on -framework CoreFoundation).
     # The Linux target cross-compiles fine from macOS via cargo-zigbuild.
-    runs-on: macos-14
+    runs-on: macos-15
     permissions:
       contents: read
     env:
@@ -162,10 +162,10 @@ jobs:
       - validate
       - smoke
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    # macos-14: darwin targets need a real macOS SDK for framework linking
+    # macos-15: darwin targets need a real macOS SDK for framework linking
     # (zig cross-compilation from Linux fails on -framework CoreFoundation).
     # The Linux target cross-compiles fine from macOS via cargo-zigbuild.
-    runs-on: macos-14
+    runs-on: macos-15
     environment: release
     permissions:
       contents: write
@@ -230,7 +230,7 @@ jobs:
       needs.smoke.result == 'success' &&
       (needs.release.result == 'success' ||
        (needs.validate.outputs.dry_run == 'true' && needs.release.result == 'skipped'))
-    # macos-15, not the darwin jobs' macos-14: the app's floor is macOS 15
+    # macos-15, like the darwin jobs: the app's floor is macOS 15
     # (desktop/.cargo/config.toml, LSMinimumSystemVersion), and bundle.sh runs
     # the bundled binary (`--print-version`) as a smoke check.
     runs-on: macos-15
