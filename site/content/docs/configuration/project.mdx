@@ -126,7 +126,7 @@ workspaces:
 | `github_reconcile_interval_secs` | integer | no | `900` | How often (seconds) the hub poller reconciles review tasks whose PR was merged on GitHub out-of-band, advancing them to done and skipping the local merge. Runs on its own slow clock, never the workspace poll tick. Set to `0` to disable. |
 | `workspace_permissions_mode` | string | no | — | Explicit project-wide permission ceiling rendered into the workspace settings template. Unset (the default) passes no `--permission-mode` and renders no `defaultMode`, so agents run under your own `~/.claude/settings.json` `permissions.defaultMode`. Set it to clamp every agent's requested mode downward. |
 | `workspace_settings_template` | path | no | `<config-root>/workspace-settings.json.template` | Override path for the workspace settings template (`~` is expanded). |
-| `heartbeat` | [Heartbeat](#heartbeat) | no | `60s` / `5m` | Adaptive hub heartbeat written to `events.log`: the orchestrator's fallback wake-up on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. |
+| `heartbeat` | [Heartbeat](#heartbeat) | no | `60s` / `5m` | Adaptive hub heartbeat written to `events.log`: the orchestrator's fallback wake-up on a quiet board. Holds at `interval` while work is in flight, backs off toward `max` when quiescent. Not written on the [awareness system](#event-systems). |
 | `disk` | [Disk](#disk) | no | `20` / `20` | Hub disk management: the size cap on the shared cargo `target/` and the low-disk free-space warning threshold. Both default to 20 GiB and are elided from the wire form when unset. |
 | `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for the review merge and Zen's auto-merge. |
 | `review` | [Review](#review) | no | all defaults | Review-interface behavior. Today just `diff_command`, which makes **View Diff** run a command of your own, such as a tool that reviews a revision range. |
@@ -167,6 +167,7 @@ work. See [the orchestrator concept](/docs/concepts/orchestrator).
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `runner` | string | yes | — | Name of an entry in [`agent_runners`](#agent_runners) used to boot the orchestrator. |
+| `awareness` | `heartbeat` \| `awareness` | no | `heartbeat` | Which event system keeps the orchestrator informed. See [event systems](#event-systems). |
 
 ```yaml
 orchestrator:
@@ -192,6 +193,31 @@ is launched as the configured `command` plus `flags`, then receives an
 initial startup prompt containing the rendered orchestrator instructions
 and bootstrap request. Other runners launch exactly as configured. Put any
 required Codex mode flags in `agent_runners.codex.flags`.
+
+### Event systems
+
+`orchestrator.awareness` picks how the orchestrator learns that something
+happened. Settings ▸ Orchestrator changes it too. The orchestrator picks up a
+change when it next starts.
+
+| Value | System | How it works |
+| --- | --- | --- |
+| `heartbeat` (default) | v1, the heartbeat | The hub writes a periodic [`heartbeat`](#heartbeat) line. The orchestrator runs a Monitor on `shelbi events tail`, drains pending events itself with `shelbi orchestrator events next` before every reply, and on each heartbeat sweeps the board for missed review markers, missed dispatches and unseen CI verdicts. |
+| `awareness` | v2, the awareness system | Events reach the orchestrator on their own: through the `shelbi-awareness` plugin for Claude, through the app-server bridge for Codex. There is no periodic heartbeat; the hub writes one board digest after each issue move instead. The orchestrator passes `--estimate` when it starts an issue (the workflow's [`default_estimate`](/docs/configuration/workflow#top-level-fields) applies otherwise) and hears when the issue runs past it, sets [`shelbi remind`](/docs/cli/remind) reminders for anything that produces no event, and runs long commands and watches CI and PRs with [`shelbi job`](/docs/cli/job) instead of blocking or polling. |
+
+```yaml
+orchestrator:
+  runner: claude
+  awareness: awareness
+```
+
+The orchestrator's instructions teach whichever system is set. The passages
+that differ sit in marked blocks, and each launch keeps only the blocks for the
+current setting (see
+[customizing the prompt](/docs/concepts/orchestrator#customizing-the-prompt-per-project)).
+A runner other than Claude or Codex has no v2 delivery path, so on `awareness`
+it keeps the heartbeat instructions and bootstrap while the periodic heartbeat
+stays off. Leave such projects on `heartbeat`.
 
 Worker hooks are deployed into each worktree under `.shelbi/hooks/`, and the
 worktree's `.claude/settings.local.json` wires
@@ -355,6 +381,11 @@ fired. It is the orchestrator's fallback wake-up and the stream's liveness
 signal. See
 [the events log](/docs/concepts/events-log#heartbeats) for how the
 orchestrator consumes it.
+
+The periodic heartbeat runs only on the heartbeat event system
+(`orchestrator.awareness: heartbeat`, the default). On the
+[awareness system](#event-systems) it stands down, and the same line is written
+once after each issue move as a board digest; these settings don't apply to it.
 
 The cadence is **adaptive**: it holds at `interval` whenever there's
 supervisable work in flight (any active, ready, or in-review task,

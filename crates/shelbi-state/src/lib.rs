@@ -21,6 +21,7 @@ use shelbi_core::{
 
 mod agent_workspaces;
 pub mod awareness;
+mod awareness_variants;
 pub mod board_index;
 pub mod change_bus;
 pub mod changelog;
@@ -163,6 +164,10 @@ pub use agent_workspaces::{
     DEFAULT_REVIEW_LOAD_RUN_SKILL, DEFAULT_SECURITY_INSTRUCTIONS, DEVELOPER_AGENT, HANDOFF_FILE,
     ORCHESTRATOR_AGENT, ORCHESTRATOR_HANDOFF_REL, QA_AGENT, REVIEW_AGENT, SECURITY_AGENT,
     SHARED_AGENT_DIR, SHARED_PREAMBLE_FILE, STALE_HOOK_COMMAND_MARKER,
+};
+pub use awareness_variants::{
+    awareness_close_marker, awareness_marked_spans, awareness_open_marker, awareness_variant_groups,
+    has_awareness_variants, select_awareness_variant, VariantGroup,
 };
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,

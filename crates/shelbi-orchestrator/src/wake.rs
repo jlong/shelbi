@@ -396,9 +396,14 @@ fn run_codex_bridge_until_shutdown(
             project_name,
             &repo_root,
             first_launch_pending,
-            // Codex delivery for awareness v2 is a separate path; the bridge
-            // keeps the v1 bootstrap.
-            false,
+            // On the awareness system (v2) the bridge delivers every event, so
+            // the bootstrap arms no tail and runs no self-drain, matching the
+            // v2 instructions the launch composed.
+            if project.orchestrator.awareness == AwarenessMode::Awareness {
+                crate::EventDelivery::CodexBridge
+            } else {
+                crate::EventDelivery::SelfDrain
+            },
         );
         let mut bridge = match retry_native_start(
             shutdown,
@@ -429,11 +434,19 @@ fn run_codex_bridge_until_shutdown(
                     "shelbi: Codex native event bridge unavailable ({error}); \
                      continuing in standalone turn-boundary polling mode"
                 );
+                // No bridge, so nothing delivers v2 events: standalone polls,
+                // whatever the awareness mode.
+                let fallback_prompt = crate::orchestrator_bootstrap_prompt(
+                    project_name,
+                    &repo_root,
+                    first_launch_pending,
+                    crate::EventDelivery::SelfDrain,
+                );
                 return run_standalone(
                     &runner,
                     project_name,
                     &workdir,
-                    &bootstrap_prompt,
+                    &fallback_prompt,
                     reason,
                 );
             }
@@ -462,7 +475,7 @@ fn run_codex_bridge_until_shutdown(
                     project_name,
                     &repo_root,
                     first_launch_pending,
-                    false,
+                    crate::EventDelivery::SelfDrain,
                 );
                 // Every in-run path that sets `protocol_unsupported` (a rejected
                 // resume via the TUI relay, or a method/params rejection on a

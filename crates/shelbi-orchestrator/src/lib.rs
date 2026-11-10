@@ -775,6 +775,7 @@ fn spawn_orchestrator_locked(
                 &workdir,
                 project_name,
                 shelbi_state::ORCHESTRATOR_AGENT,
+                instructions_awareness(awareness, runner_spec, awareness_plugin.get()),
                 handoff,
             )
         },
@@ -975,24 +976,57 @@ fn orch_bootstrap_prompt_awareness() -> String {
         .to_string()
 }
 
+/// The awareness (v2) bootstrap for a Codex orchestrator behind the native
+/// app-server bridge. The bridge wakes the thread with each event batch and
+/// names the one command that settles it, so like the plugin bootstrap it arms
+/// no tail and runs no self-drain: a self-driven `events next` would consume
+/// batches the bridge is delivering.
+fn orch_bootstrap_prompt_awareness_codex() -> String {
+    "Run the \"Bootstrap on session start\" sequence from your instructions now: snapshot \
+     `shelbi task list`, `shelbi workspace list`, and `shelbi zen status`; scan recent \
+     `~/.shelbi/events.log` for a `zen=off reason=crash-recovery` line. This project uses \
+     Shelbi's awareness event delivery, so skip the event-watch steps: do NOT run \
+     `shelbi events tail --follow`, and do NOT self-drain with `shelbi orchestrator events \
+     next` or `ack`. Shelbi's bridge delivers each task and workspace transition, reminder, \
+     finished job, overdue task, pane death, supervision give-up, review-ready signal, \
+     worker question and board digest into this thread as it lands; run only the command a \
+     delivered `[SHELBI_EVENT_BATCH]` names, then react to each event through your normal \
+     reaction rules. A quiet board sends nothing, and that is expected: there is no \
+     heartbeat to wait for."
+        .to_string()
+}
+
+/// How events reach the orchestrator a bootstrap prompt is written for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EventDelivery {
+    /// The heartbeat system (v1), and any launch v2 can't reach: the
+    /// orchestrator watches the log and self-drains.
+    SelfDrain,
+    /// Awareness (v2) for Claude: the `shelbi-awareness` plugin delivers.
+    AwarenessPlugin,
+    /// Awareness (v2) for Codex: the native app-server bridge delivers.
+    CodexBridge,
+}
+
 /// Compose the recurring orchestrator bootstrap with the optional one-shot
 /// first-project welcome. Repository inspection stays inside the local agent
 /// session: Shelbi supplies strict bounds and the repo path, while the agent
 /// reads and summarizes the evidence itself.
 ///
-/// `awareness_plugin` selects the awareness (v2) bootstrap for a Claude
-/// orchestrator launched with the `shelbi-awareness` plugin; every other
-/// launch keeps the v1 prompt byte for byte.
+/// `delivery` selects the bootstrap: the awareness (v2) one for a Claude
+/// orchestrator launched with the `shelbi-awareness` plugin or a Codex one
+/// behind the bridge on v2; every other launch keeps the v1 prompt byte for
+/// byte.
 pub(crate) fn orchestrator_bootstrap_prompt(
     project_name: &str,
     repo_root: &std::path::Path,
     contextual_greeting: bool,
-    awareness_plugin: bool,
+    delivery: EventDelivery,
 ) -> String {
-    let base = if awareness_plugin {
-        orch_bootstrap_prompt_awareness()
-    } else {
-        orch_bootstrap_prompt_base(project_name)
+    let base = match delivery {
+        EventDelivery::SelfDrain => orch_bootstrap_prompt_base(project_name),
+        EventDelivery::AwarenessPlugin => orch_bootstrap_prompt_awareness(),
+        EventDelivery::CodexBridge => orch_bootstrap_prompt_awareness_codex(),
     };
     if !contextual_greeting {
         return base;
@@ -1056,9 +1090,33 @@ fn orchestrator_launch_command(
             project_name,
             first_launch_repo.unwrap_or(workdir),
             first_launch_repo.is_some(),
-            awareness_plugin,
+            if awareness_plugin {
+                EventDelivery::AwarenessPlugin
+            } else {
+                EventDelivery::SelfDrain
+            },
         );
         launch_with_bootstrap(spec, project_name, workdir, &bootstrap_prompt, awareness_plugin)
+    }
+}
+
+/// Which event system the orchestrator's instructions teach for this launch:
+/// the awareness (v2) variant only when v2 events actually reach it — a Codex
+/// orchestrator through its app-server bridge, a Claude one through the
+/// `shelbi-awareness` plugin this launch staged. A Claude launch whose plugin
+/// failed to stage, and any custom runner, run the v1 self-driven drain (their
+/// bootstrap prompt says so), so they read the heartbeat (v1) variant to match.
+fn instructions_awareness(
+    awareness: shelbi_core::AwarenessMode,
+    spec: &shelbi_core::AgentRunnerSpec,
+    plugin_staged: bool,
+) -> shelbi_core::AwarenessMode {
+    use shelbi_core::AwarenessMode;
+    let delivered = shelbi_agent::RunnerAdapter::for_spec(spec).is_codex() || plugin_staged;
+    if awareness == AwarenessMode::Awareness && delivered {
+        AwarenessMode::Awareness
+    } else {
+        AwarenessMode::Heartbeat
     }
 }
 
@@ -1408,6 +1466,58 @@ mod orchestrator_model_tests {
         assert_eq!(out.flags, ["--verbose", "--model", "opus"], "one model flag, the chosen one");
         let plain = p.runner("claude").unwrap().clone();
         assert_eq!(orchestrator_spec(&project("claude"), Some(&m), &plain).flags, ["--model", "opus"]);
+    }
+}
+
+#[cfg(test)]
+mod instructions_awareness_tests {
+    //! Which event system a launch's composed instructions teach.
+    use super::*;
+    use shelbi_core::AwarenessMode::{Awareness, Heartbeat};
+
+    fn spec(command: &str) -> shelbi_core::AgentRunnerSpec {
+        shelbi_core::AgentRunnerSpec {
+            command: command.into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        }
+    }
+
+    #[test]
+    fn heartbeat_projects_always_read_the_heartbeat_variant() {
+        for (runner, staged) in [("claude", true), ("claude", false), ("codex", false), ("aider", false)] {
+            assert_eq!(instructions_awareness(Heartbeat, &spec(runner), staged), Heartbeat, "{runner}");
+        }
+    }
+
+    #[test]
+    fn awareness_projects_read_v2_only_where_v2_events_arrive() {
+        // Claude gets v2 events through the plugin this launch staged.
+        assert_eq!(instructions_awareness(Awareness, &spec("claude"), true), Awareness);
+        // A plugin that failed to stage falls back to the v1 drain, so v1 rules.
+        assert_eq!(instructions_awareness(Awareness, &spec("claude"), false), Heartbeat);
+        // Codex gets them through its bridge, no plugin involved.
+        assert_eq!(instructions_awareness(Awareness, &spec("codex"), false), Awareness);
+        // A custom runner has no v2 delivery and runs the v1 bootstrap.
+        assert_eq!(instructions_awareness(Awareness, &spec("aider"), false), Heartbeat);
+    }
+
+    #[test]
+    fn codex_bridge_bootstrap_arms_no_watch_and_v1_is_unchanged() {
+        let repo = std::path::Path::new("/tmp/demo");
+        assert_eq!(
+            orchestrator_bootstrap_prompt("demo", repo, false, EventDelivery::SelfDrain),
+            orch_bootstrap_prompt_base("demo"),
+        );
+        let codex = orchestrator_bootstrap_prompt("demo", repo, false, EventDelivery::CodexBridge);
+        assert!(codex.contains("[SHELBI_EVENT_BATCH]"));
+        assert!(!codex.contains("Monitor tool"), "{codex}");
+        assert!(!codex.contains("--max-lifetime"), "{codex}");
+        // The one-shot welcome still rides along.
+        let welcome = orchestrator_bootstrap_prompt("demo", repo, true, EventDelivery::CodexBridge);
+        assert!(welcome.starts_with(&codex) && welcome.contains("[SHELBI_FIRST_PROJECT_GREETING]"));
     }
 }
 
