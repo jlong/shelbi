@@ -302,9 +302,9 @@ command (`move`, `prio`, `assign`, `depends`) are out of scope; use those.
 | Flag | Type | Description |
 | --- | --- | --- |
 | `--title <TITLE>` | string | Change the display title. The issue's `id` stays stable (never re-slugged). |
-| `--body <TEXT>` | string | Replace the body with this text. |
-| `--body-file <PATH>` | path | Replace the body with a file's contents. |
-| (stdin) | pipe | Pipe the body: `shelbi issue edit <id> <<EOF … EOF`. |
+| `--body <TEXT>` | string | Replace the body with this text. `--body -` reads it from stdin. |
+| `--body-file <PATH>` | path | Replace the body with a file's contents. `--body-file -` reads stdin. |
+| (stdin) | pipe | Pipe the body: `shelbi issue edit <id> <<EOF … EOF`. Read only with no field flag (or with `--body -`). |
 | `--append` | flag | Append the body source to the existing body instead of replacing it. |
 | `--workflow <NAME>` | string | Set the workflow. Must name an existing `workflows/<NAME>.yaml`. |
 | `--branch <BRANCH>` | string | Set the `branch:` override. |
@@ -324,6 +324,13 @@ multiple `--sub`/`--sub-regex` apply in command-line order, each operating
 on the previous one's output. Editing an issue whose column is an active
 status (e.g. `in_progress`) prints a warning: the running worker won't see
 the change until the issue is re-dispatched with `shelbi issue start`.
+
+Stdin is read only when you ask for it: with `--body -` (or `--body-file -`),
+or with no field flag at all, as in the heredoc form. A `--title`, `--param`,
+`--workflow`, `--branch`, `--prefers-machine`, or substitution edit never reads
+stdin, so it returns at once from a script or agent shell whose stdin is an
+open pipe. To change a field and the body in one call, pipe the body with
+`--body -`.
 
 ```bash
 # Fix a stale path and swap a value in place, before dispatch.
