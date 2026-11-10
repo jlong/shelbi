@@ -1153,11 +1153,21 @@ fn repair_required_instruction_sections(
         if markdown_contains_heading(&repaired, heading) {
             continue;
         }
-        let section = extract_markdown_section(default_body, heading).ok_or_else(|| {
-            Error::Other(format!(
-                "bundled orchestrator instructions missing required section `{heading}`"
-            ))
-        })?;
+        // A section the bundled body keeps only for one awareness mode (the
+        // drain is heartbeat-only) comes back with its whole marked group, so
+        // the repaired copy still composes per mode instead of handing an
+        // awareness (v2) orchestrator the heartbeat drain.
+        let group = crate::awareness_variant_groups(default_body)
+            .into_iter()
+            .find(|group| markdown_contains_heading(&group.heartbeat, heading));
+        let section = match group {
+            Some(group) => group.text,
+            None => extract_markdown_section(default_body, heading).ok_or_else(|| {
+                Error::Other(format!(
+                    "bundled orchestrator instructions missing required section `{heading}`"
+                ))
+            })?,
+        };
         if !repaired.ends_with('\n') {
             repaired.push('\n');
         }
@@ -1907,6 +1917,15 @@ mod tests {
         assert!(repaired.contains("## Polling-only event drain"));
         assert!(repaired.contains("shelbi orchestrator events drain"));
         assert!(repaired.contains("fall back to\nreading `~/.shelbi/events.log`"));
+        // The drain is heartbeat-only: it comes back inside its marked group,
+        // so an awareness (v2) orchestrator still never reads it.
+        use shelbi_core::AwarenessMode;
+        let v1 = crate::select_awareness_variant(&repaired, AwarenessMode::Heartbeat);
+        let v2 = crate::select_awareness_variant(&repaired, AwarenessMode::Awareness);
+        assert!(v1.contains("## Polling-only event drain"));
+        assert!(!v2.contains("## Polling-only event drain"));
+        assert!(v2.contains("## Waiting on things"));
+        assert!(v2.starts_with(custom));
 
         std::env::remove_var("SHELBI_HOME");
     }

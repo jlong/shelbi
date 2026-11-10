@@ -47,8 +47,9 @@ use shelbi_core::StatusCategory;
 
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
-    append_changelog_section, apply_reporting_subject_rewrite, apply_tmux_instruction_rewrites,
-    apply_tracker_ownership_rewrites, TRACKER_OWNERSHIP_AUTOHEAL_CODE,
+    append_changelog_section, apply_awareness_variant_markers, apply_reporting_subject_rewrite,
+    apply_tmux_instruction_rewrites, apply_tracker_ownership_rewrites,
+    AWARENESS_VARIANTS_AUTOHEAL_CODE, TRACKER_OWNERSHIP_AUTOHEAL_CODE,
     cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
     scope_label, Classification, UpgradeFinding, UpgradeReport, CHANGELOG_TEMPLATE_MISSING,
     CHANGELOG_TEMPLATE_PRIOR_DEFAULT, PR_TEMPLATE_MISSING,
@@ -300,6 +301,14 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
     // (an edited one gets a needs-judgment finding instead, never a write).
     if codes.contains(TRACKER_OWNERSHIP_AUTOHEAL_CODE) {
         heal_tracker_ownership(entry, applied);
+    }
+
+    // Add the marked awareness (v2) counterparts to the orchestrator's
+    // shipped heartbeat passages. In-place Markdown like the tracker rewrite,
+    // and after it (and the tmux rewrite), so it matches the passages those
+    // just refreshed; it re-reads the file.
+    if codes.contains(AWARENESS_VARIANTS_AUTOHEAL_CODE) {
+        heal_awareness_variants(entry, applied);
     }
 
     // Append the orchestrator's `## Changelog` rule to instructions that lack
@@ -1190,6 +1199,33 @@ fn heal_tracker_ownership(entry: &InventoryEntry, applied: &mut Vec<AppliedChang
     );
 }
 
+/// Add the shipped awareness variant markup to an orchestrator
+/// `instructions.md` via the shared [`apply_awareness_variant_markers`] (the
+/// same function the sniffer keys the auto-heal on). Only shipped heartbeat
+/// passages carried verbatim are wrapped, and the heartbeat composition stays
+/// byte for byte what it was; a no-op write is skipped.
+fn heal_awareness_variants(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let out = apply_awareness_variant_markers(&text);
+    if out == text {
+        return;
+    }
+    if let Err(e) = write_atomic(path, &out) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(
+        applied,
+        entry,
+        AWARENESS_VARIANTS_AUTOHEAL_CODE,
+        path,
+        "heartbeat-rules+awareness-variants".into(),
+    );
+}
+
 /// Append the shipped `## Changelog` section to an orchestrator
 /// `instructions.md` that lacks the rule, via the shared
 /// [`append_changelog_section`]. Additive only: everything the user wrote stays
@@ -1835,6 +1871,57 @@ zen:
         assert!(
             !report2.findings.iter().any(|f| f.code == TRACKER_OWNERSHIP_AUTOHEAL_CODE),
             "residual auto-heal: {report2:?}",
+        );
+        assert!(apply_auto_heal(&["demo".to_string()], &report2).is_empty());
+    }
+
+    #[test]
+    fn pre_markup_orchestrator_copy_gains_the_awareness_variants_on_start() {
+        // An existing project whose orchestrator copy predates the heartbeat /
+        // awareness markup (the template's v1 composition, unedited): the boot
+        // pass wraps its heartbeat passages and adds their v2 counterparts,
+        // discloses it, and a second pass is a no-op.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let orch_dir = home.join("projects/demo/agents/orchestrator");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        let legacy = shelbi_state::select_awareness_variant(
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+            shelbi_core::AwarenessMode::Heartbeat,
+        );
+        let path = orch_dir.join("instructions.md");
+        std::fs::write(&path, &legacy).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            report.findings.iter().any(|f| f.code == AWARENESS_VARIANTS_AUTOHEAL_CODE
+                && f.classification == Classification::AutoHeal),
+            "expected an awareness-variants auto-heal: {:?}",
+            report.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
+        );
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(
+            applied.iter().any(|c| c.code == AWARENESS_VARIANTS_AUTOHEAL_CODE),
+            "nothing applied: {applied:?}",
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS
+        );
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default();
+        assert!(log.contains(AWARENESS_VARIANTS_AUTOHEAL_CODE), "{log}");
+
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report2.findings.iter().any(|f| f.code.starts_with("ORCH_AWARENESS_VARIANTS")),
+            "residual finding: {report2:?}",
         );
         assert!(apply_auto_heal(&["demo".to_string()], &report2).is_empty());
     }

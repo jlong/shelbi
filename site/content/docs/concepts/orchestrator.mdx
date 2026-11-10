@@ -166,6 +166,12 @@ the user:
 5. **Read config-upgrade findings.** `shelbi config upgrade --needs-judgment
    --format json` lists config drift that needs the orchestrator's judgment.
 
+Steps 3 and 4 belong to the heartbeat event system, the default. On the
+[awareness system](#two-event-systems) the orchestrator starts no watch and runs
+no drain of its own; instead it lists the reminders and jobs it left pending
+(`shelbi remind list`, `shelbi job list`) so it knows what their events will
+mean.
+
 In practice the shipped prompt folds the first two steps into a single
 `shelbi status --full --handoff` snapshot (plus `shelbi zen status` and a
 crash-recovery scan); the commands above read the same content piecewise.
@@ -197,7 +203,15 @@ statuses:
   stuck workspaces or missed markers. See
   [heartbeats](/docs/concepts/events-log#heartbeats) for the cadence
   config and rationale; tune it via the `heartbeat` key in
-  `project.yaml`.
+  `project.yaml`. On the awareness system the same line is the board
+  digest, written after each issue move: the orchestrator fills idle
+  workspaces and, under Zen, runs `shelbi zen scan` when `zen_eligible > 0`.
+- `task=<id> overdue` → an issue ran past its estimate. The orchestrator
+  checks for a missed review marker (branch ahead of `main`, clean worktree,
+  idle prompt) and recovers it, nudges an idle worker, or revises the estimate
+  with `shelbi issue estimate` when the work is legitimately bigger.
+- `reminder` and `job` → something the orchestrator asked to hear about
+  happened; it acts on it.
 
 When dispatching, the orchestrator picks free eligible workspaces in the
 order they're declared in the project YAML, honoring `prefers_machine`
@@ -209,6 +223,37 @@ The full set of rules is in the default prompt, including when *not*
 to dispatch (failed retries, deduplicated misclicks, mid-conversation
 with the user). It's worth a read; it doubles as the spec for
 what the orchestrator is supposed to do.
+
+## Two event systems
+
+The project setting
+[`orchestrator.awareness`](/docs/configuration/project#event-systems) picks how
+the orchestrator stays informed.
+
+- **Heartbeat** (`heartbeat`, the default, v1). The hub writes a periodic
+  `heartbeat` line. The orchestrator watches the log with a Monitor on
+  `shelbi events tail`, claims and acks pending events itself with
+  `shelbi orchestrator events next` before every reply, and on each heartbeat
+  runs a bounded sweep: recover missed review markers, catch missed dispatches,
+  reconcile in-review CI. A quiet board still costs a wake-up every few minutes.
+- **Awareness** (`awareness`, v2). Events reach the orchestrator on their own:
+  Claude through the `shelbi-awareness` plugin (each event arrives as a
+  notification, already acknowledged), Codex through its app-server bridge.
+  There is no periodic heartbeat. After each issue move the hub writes one board
+  digest, which replaces the sweep. The orchestrator is told about what it
+  waits on instead of polling for it:
+  - it passes `--estimate` on every `shelbi issue start` (the workflow's
+    `default_estimate:` applies otherwise), and an `overdue` event tells it
+    when an issue runs past that;
+  - it sets a [`shelbi remind`](/docs/cli/remind) for anything that produces
+    no event (an external PR, a person, a deploy);
+  - it runs long local commands with `shelbi job run` and watches CI and PRs
+    with `shelbi job watch` (see [`shelbi job`](/docs/cli/job)) instead of
+    blocking on them.
+
+The two systems need different rules, so the shipped instructions carry both
+and every launch keeps one of them (see below). A runner other than Claude or
+Codex has no v2 delivery path and keeps the heartbeat rules.
 
 ## Customizing the prompt per project
 
@@ -240,6 +285,33 @@ directory's `.claude/agent-instructions.md` on every `ensure_dashboard`
 call, so your edits take effect the next time the orchestrator starts
 (or on `shelbi reload`).
 
+### Heartbeat and awareness blocks
+
+The passages that differ between the [two event systems](#two-event-systems)
+sit in marked blocks, each marker on a line of its own:
+
+```markdown
+<!-- shelbi:heartbeat -->
+Rules only a heartbeat (v1) orchestrator reads.
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+Rules only an awareness (v2) orchestrator reads.
+<!-- /shelbi:awareness -->
+```
+
+When composing, Shelbi keeps the blocks for the project's
+`orchestrator.awareness`, drops the others, and removes the marker lines.
+Text outside any block reaches both. Edit inside the blocks freely; to add a
+rule for only one system, put it in a block of its own. A heartbeat project's
+composed instructions are exactly the text of its heartbeat blocks plus
+everything outside them.
+
+Instructions written before the blocks existed are upgraded on the next start
+by the [config upgrade](/docs/concepts/config-upgrade): each heartbeat passage
+still in its shipped wording is wrapped in markers and gains its awareness
+counterpart, without touching anything else. A heartbeat passage you edited is
+left for the orchestrator to wrap with judgment, preserving your changes.
+
 `shelbi reload` runs the agent self-heal before respawning the orchestrator
 session. If your customized `agents/orchestrator/instructions.md` is missing a
 required shipped section, reload appends only that section and reports the
@@ -256,8 +328,11 @@ A few things worth keeping when you fork the default prompt:
 
 - The bootstrap flow. The orchestrator needs the initial board and
   workspace snapshot and the background watch to do its job.
-- The event drain (the `Polling-only event drain` section). Every
-  orchestrator drains pending events before each user-facing reply with
+- The heartbeat and awareness blocks, so the instructions keep matching the
+  project's event system when it changes.
+- The event drain (the `Polling-only event drain` section, heartbeat system
+  only). A heartbeat orchestrator drains pending events before each
+  user-facing reply with
   `shelbi orchestrator events next --follow --max-lifetime 2s` and acks each
   batch with `shelbi orchestrator events ack <delivery-id>` (the durable
   cursor lives in `~/.shelbi/projects/<name>/event-cursor` and resumes

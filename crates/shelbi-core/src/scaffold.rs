@@ -337,6 +337,14 @@ const WORKFLOW_SECTIONS: &[Section] = &[
     },
     Section {
         prose: &[
+            "How long a task on this workflow should stay active when it is started",
+            "without `--estimate` (`45m`, `2h`, `1h30m`). Past it the hub tells the",
+            "orchestrator the task is overdue. Unset: no estimate.",
+        ],
+        yaml: "default_estimate: 2h\n",
+    },
+    Section {
+        prose: &[
             "Hub-side side-effects fired when a task crosses an edge. Moves are",
             "any-to-any; unlisted edges are pure status changes. Actions: push_branch,",
             "open_pr, merge, close_pr, delete_branch, restack.",
@@ -379,6 +387,14 @@ const SHIPPED_WORKFLOW_SECTIONS: &[Section] = &[
     Section {
         prose: &["Stable id a new task lands in. Defaults to the first status when unset."],
         yaml: "initial_status: backlog\n",
+    },
+    Section {
+        prose: &[
+            "How long a task on this workflow should stay active when it is started",
+            "without `--estimate` (`45m`, `2h`, `1h30m`). Past it the hub tells the",
+            "orchestrator the task is overdue. Unset: no estimate.",
+        ],
+        yaml: "default_estimate: 2h\n",
     },
     Section {
         prose: &[
@@ -654,6 +670,7 @@ agent_runners:
         assert!(wf.git.is_some());
         assert!(wf.zen.is_some());
         assert_eq!(wf.initial_status.as_deref(), Some("backlog"));
+        assert_eq!(wf.default_estimate, Some(std::time::Duration::from_secs(2 * 60 * 60)));
     }
 
     #[test]
@@ -684,6 +701,7 @@ agent_runners:
         let wf = Workflow::from_yaml_str(&uncomment(&yaml))
             .expect("uncommented task workflow parses without duplicate keys");
         assert_eq!(wf.initial_status.as_deref(), Some("backlog"));
+        assert_eq!(wf.default_estimate, Some(std::time::Duration::from_secs(2 * 60 * 60)));
         assert!(wf.zen.is_some());
     }
 

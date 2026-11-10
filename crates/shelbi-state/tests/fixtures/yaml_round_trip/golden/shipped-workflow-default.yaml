@@ -26,6 +26,11 @@ statuses:
 ## Stable id a new task lands in. Defaults to the first status when unset.
 #initial_status: backlog
 
+## How long a task on this workflow should stay active when it is started
+## without `--estimate` (`45m`, `2h`, `1h30m`). Past it the hub tells the
+## orchestrator the task is overdue. Unset: no estimate.
+#default_estimate: 2h
+
 ## Hub-side side-effects fired when a task crosses an edge. Moves are
 ## any-to-any; unlisted edges are pure status changes. Actions: push_branch,
 ## open_pr, merge, close_pr, delete_branch, restack.
