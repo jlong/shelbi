@@ -3675,10 +3675,10 @@ mod tests {
                 Stop::Page(SettingsPage::Keybindings),
                 Stop::Page(SettingsPage::Terminal),
                 Stop::Switcher,
+                Stop::Page(SettingsPage::Orchestrator),
                 Stop::Page(SettingsPage::Workspaces),
                 Stop::Page(SettingsPage::Workflows),
-                Stop::Page(SettingsPage::Agents),
-                Stop::Page(SettingsPage::Orchestrator)
+                Stop::Page(SettingsPage::Agents)
             ]
         );
         assert_eq!(s.page(), SettingsPage::General);
@@ -3696,15 +3696,15 @@ mod tests {
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Switcher);
         s.handle_key(key(KeyCode::Down), &km);
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Orchestrator));
+        s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Page(SettingsPage::Workspaces));
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Page(SettingsPage::Workflows));
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Page(SettingsPage::Agents));
         s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.stop, Stop::Page(SettingsPage::Orchestrator));
-        s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.stop, Stop::Page(SettingsPage::Orchestrator), "stops at the bottom");
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Agents), "stops at the bottom");
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
