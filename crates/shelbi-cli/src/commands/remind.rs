@@ -8,7 +8,7 @@ use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc
 use clap::Subcommand;
 use shelbi_state::awareness::{self, Reminder};
 
-use super::require_project;
+use super::require_registered_project;
 
 #[derive(Debug, Subcommand)]
 pub enum RemindCmd {
@@ -44,7 +44,7 @@ pub enum RemindCmd {
 }
 
 pub fn run(project_opt: Option<String>, cmd: RemindCmd) -> Result<()> {
-    let project = require_project(project_opt)?;
+    let project = require_registered_project(project_opt)?;
     match cmd {
         RemindCmd::In { duration, text, every } => {
             let d = shelbi_core::parse_duration(&duration).map_err(|e| anyhow!(e))?;

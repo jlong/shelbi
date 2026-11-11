@@ -12,7 +12,7 @@ use clap::Subcommand;
 use shelbi_orchestrator::awareness as runner;
 use shelbi_state::awareness::{self, Job, JobKind, NewJob};
 
-use super::require_project;
+use super::require_registered_project;
 
 #[derive(Debug, Subcommand)]
 pub enum JobCmd {
@@ -54,7 +54,7 @@ pub enum JobCmd {
 }
 
 pub fn run(project_opt: Option<String>, cmd: JobCmd) -> Result<()> {
-    let project = require_project(project_opt)?;
+    let project = require_registered_project(project_opt)?;
     match cmd {
         JobCmd::Run { label, cmd } => {
             let job = runner::spawn_command_job(&project, &cmd, label).map_err(|e| anyhow!(e))?;
@@ -99,9 +99,12 @@ pub fn run(project_opt: Option<String>, cmd: JobCmd) -> Result<()> {
     }
 }
 
-/// `shelbi __job-exec <id> -- <cmd...>`.
+/// `shelbi __job-exec <id> -- <cmd...>`. Only `job run` starts it, after
+/// checking the project is registered, so it skips that check: a failure here
+/// would leave the job without a result. The store's writers still refuse a
+/// project with no state dir.
 pub fn exec(project_opt: Option<String>, id: String, cmd: Vec<String>) -> Result<()> {
-    let project = require_project(project_opt)?;
+    let project = super::require_project(project_opt)?;
     runner::run_job_exec(&project, &id, &cmd).map_err(|e| anyhow!(e))
 }
 

@@ -353,6 +353,11 @@ pub struct EditArgs {
 
 pub fn run(project_opt: Option<String>, cmd: IssueCmd) -> Result<()> {
     let project = require_project(project_opt)?;
+    // `estimate` writes the awareness store: refuse an unregistered project
+    // before anything else, so a typo can't leave a stray project folder.
+    if matches!(cmd, IssueCmd::Estimate { .. }) {
+        super::ensure_registered(&project)?;
+    }
     // Version gate: board mutations against a stale daemon (old binary
     // kept running across an upgrade) produce undiagnosable io errors —
     // refuse up front. Read-only views still work, with a warning.

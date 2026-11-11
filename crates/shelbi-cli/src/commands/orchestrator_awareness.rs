@@ -295,15 +295,6 @@ pub(super) fn run_stream(project: &str, max_lifetime: Option<Duration>) -> Resul
     }
 }
 
-/// Refuse a project that isn't registered before touching any state: the
-/// cursor and lock live in the project's config dir, which a stray
-/// `SHELBI_PROJECT` would otherwise create.
-fn ensure_registered(project: &str) -> Result<()> {
-    shelbi_state::load_project(project)
-        .map(|_| ())
-        .map_err(|e| anyhow!("project `{project}` is not registered: {e}"))
-}
-
 #[derive(Debug, PartialEq, Eq)]
 enum StreamEnd {
     Terminated(usize),
