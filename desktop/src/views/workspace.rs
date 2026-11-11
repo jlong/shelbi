@@ -116,6 +116,10 @@ pub trait WorkspaceOps: Send + Sync {
     fn open_in_app(&self, _project: &str, _workspace: &str, _role: ReviewRole) -> Result<String, String> {
         Err("apps can't be opened here".into())
     }
+    /// Open `url` (the task's pull request) in the browser.
+    fn open_url(&self, _url: &str) -> Result<(), String> {
+        Err("links can't be opened here".into())
+    }
 }
 
 /// The real thing: the details read through the window's project source,
@@ -129,6 +133,7 @@ impl WorkspaceOps for LiveOps {
     fn details(&self, project: &str, workspace: &str) -> Result<WorkspaceDetailsInfo, String> {
         debug_assert_eq!(project, self.project.name());
         let d = self.project.source.workspace_details(workspace)?;
+        let pr = d.task.as_ref().and_then(|t| shelbi_app::board::task_pr(&t.task));
         Ok(WorkspaceDetailsInfo {
             task: d.task.as_ref().map(|t| (t.task.id.clone(), t.task.title.clone())),
             body: d.task.map(|t| t.body).unwrap_or_default(),
@@ -137,7 +142,12 @@ impl WorkspaceOps for LiveOps {
             remote_address: d.remote_address,
             editor_name: d.editor_name,
             apps: d.apps,
+            pr,
         })
+    }
+
+    fn open_url(&self, url: &str) -> Result<(), String> {
+        super::review::run_open(url)
     }
 
     fn open_in_app(&self, project: &str, workspace: &str, role: ReviewRole) -> Result<String, String> {
@@ -650,7 +660,26 @@ impl WorkspaceView {
     fn panel_shape(&self) -> WsPanelShape {
         let has_body = self.current_details().is_some_and(|d| !d.body.trim().is_empty());
         let apps = self.details.as_ref().map(|d| d.apps).unwrap_or_default();
-        WsPanelShape::for_workspace(self.has_task(), has_body, true).with_apps(apps)
+        let pr = self.task_pr().is_some_and(|pr| pr.url.is_some());
+        WsPanelShape::for_workspace(self.has_task(), has_body, true)
+            .with_branch_and_pr(self.branch().is_some(), pr)
+            .with_apps(apps)
+    }
+
+    /// The branch the panel's branch row shows: the task's, else the
+    /// worktree's. Only with a task (an idle workspace's reduced panel has no
+    /// task rows).
+    fn branch(&self) -> Option<&str> {
+        if !self.has_task() {
+            return None;
+        }
+        self.current_details()
+            .and_then(|d| shelbi_app::task_rows::branch_label(d.branch.as_deref()))
+    }
+
+    /// The task's pull request, for the panel's PR row.
+    fn task_pr(&self) -> Option<&shelbi_core::IssuePr> {
+        self.current_details().and_then(|d| d.pr.as_ref())
     }
 
     fn sync_panel(&mut self) {
@@ -744,6 +773,13 @@ impl WorkspaceView {
                 cx.emit(WorkspaceEvent::Back);
             }
             WsEffect::RevealFolder => self.reveal_folder(cx),
+            WsEffect::CopyBranch => {
+                if let Some(branch) = self.branch().map(str::to_string) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(branch.clone()));
+                    cx.emit(WorkspaceEvent::Toast(Some(shelbi_app::task_rows::copied_branch(&branch))));
+                }
+            }
+            WsEffect::OpenPr => self.open_pr(cx),
             WsEffect::ShowAgent => self.select_view(ContentView::Agent, cx),
             WsEffect::ShowDiff => {
                 // Shelbi's own diff is driven from the keyboard: asking for it
@@ -1121,6 +1157,25 @@ impl WorkspaceView {
         .detach();
     }
 
+    /// Open the task's pull request in the browser, off the UI thread.
+    fn open_pr(&mut self, cx: &mut Context<Self>) {
+        let Some(url) = self.task_pr().and_then(|pr| pr.url.clone()) else {
+            return;
+        };
+        let ops = self.ops.clone();
+        let work = cx.background_executor().spawn(async move { ops.open_url(&url) });
+        cx.spawn(async move |this, cx| {
+            if let Err(e) = work.await {
+                this.update(cx, |this, cx| {
+                    this.status_line = Some(format!("couldn't open the pull request: {e}"));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     fn reveal_folder(&mut self, cx: &mut Context<Self>) {
         // A remote worktree has no folder here to show: copy its
         // `host:path` instead, for an `ssh` / `scp` / editor's remote open.
@@ -1220,7 +1275,7 @@ impl WorkspaceView {
                 }
                 .on_click(listen(WsRow::Folder))
             });
-            let row = task_panel::worktree_row("workspace-worktree", &path, open, selected(WsRow::Folder), 8.0, theme);
+            let row = task_panel::worktree_row("workspace-worktree", &path, open, selected(WsRow::Folder), theme);
             let tip = if header.is_remote {
                 format!("{path} on {}", header.machine)
             } else {
@@ -1231,7 +1286,21 @@ impl WorkspaceView {
                 .flex_none()
                 .tooltip(style::tooltip(tip))
                 .child(row)
+                .into_any_element()
         });
+        // The branch (a click copies it) and the pull request (a click opens
+        // it), under the worktree.
+        let branch = self.branch().map(|branch| {
+            task_panel::branch_row("workspace-branch", branch, selected(WsRow::Branch), theme)
+                .on_click(listen(WsRow::Branch))
+                .into_any_element()
+        });
+        let pr = self.task_pr().map(|pr| {
+            let row = task_panel::pr_row("workspace-pr", pr, selected(WsRow::Pr), theme);
+            if pr.url.is_some() { row.on_click(listen(WsRow::Pr)) } else { row }.into_any_element()
+        });
+        let info: Vec<AnyElement> = folder.into_iter().chain(branch).chain(pr).collect();
+        let info = (!info.is_empty()).then(|| task_panel::info_rows(info));
 
         // The views: the agent, its diff and editor, then the shell, ⌘1…⌘N.
         let active = panel.active();
@@ -1319,7 +1388,7 @@ impl WorkspaceView {
 
         root.child(status)
             .children(summary)
-            .children(folder)
+            .children(info)
             .children(views)
             .when_some(self.status_line.clone(), |d, line| {
                 d.child(task_panel::note("workspace-status", line, theme.warning))
@@ -1634,6 +1703,7 @@ pub(crate) mod tests {
         fail_ops: Mutex<bool>,
         revealed: Mutex<Vec<String>>,
         opened_apps: Mutex<Vec<ReviewRole>>,
+        opened_urls: Mutex<Vec<String>>,
     }
 
     impl WorkspaceOps for FakeOps {
@@ -1650,6 +1720,10 @@ pub(crate) mod tests {
         }
         fn reveal(&self, path: &str) -> Result<(), String> {
             self.revealed.lock().unwrap().push(path.to_string());
+            Ok(())
+        }
+        fn open_url(&self, url: &str) -> Result<(), String> {
+            self.opened_urls.lock().unwrap().push(url.to_string());
             Ok(())
         }
         fn open_in_app(&self, _project: &str, _workspace: &str, role: ReviewRole) -> Result<String, String> {
@@ -1801,6 +1875,7 @@ pub(crate) mod tests {
             worktree: "/w/alpha".into(),
             editor_name: "Vim".into(),
             apps: Default::default(),
+            pr: None,
         }
     }
 
@@ -1875,8 +1950,8 @@ pub(crate) mod tests {
         assert_eq!(header.state.label(), "Working");
 
         h.draw();
-        // State=Workspace: back and the status, the summary, the worktree
-        // with Open, the views.
+        // State=Workspace (2787:33099): back and the status, the summary, the
+        // worktree with Open and the branch under it, the views.
         for selector in [
             "workspace-panel",
             "ws-back",
@@ -1886,6 +1961,7 @@ pub(crate) mod tests {
             "ws-more",
             "workspace-worktree",
             "ws-folder",
+            "workspace-branch",
             "ws-switch-agent",
             "ws-switch-diff",
             "ws-switch-editor",
@@ -1893,14 +1969,14 @@ pub(crate) mod tests {
         ] {
             assert!(h.cx.debug_bounds(selector).is_some(), "{selector} is drawn");
         }
-        // The component draws no workspace name, role, issue id, branch or
-        // machine.
+        // The component draws no workspace name, role, issue id or machine,
+        // and no PR row for a task without one.
         for selector in [
             "workspace-name",
             "workspace-role",
             "workspace-task-id",
-            "workspace-branch",
             "workspace-machine",
+            "workspace-pr",
         ] {
             assert!(h.cx.debug_bounds(selector).is_none(), "{selector} is not drawn");
         }
@@ -1927,6 +2003,16 @@ pub(crate) mod tests {
         let state = h.cx.debug_bounds("task-panel-status").unwrap();
         let title = h.cx.debug_bounds("workspace-title").unwrap();
         assert!(title.origin.y > state.origin.y);
+        // The worktree, then the branch, stacked under the summary and above
+        // the views.
+        let description = h.cx.debug_bounds("workspace-description").unwrap();
+        let worktree = h.cx.debug_bounds("workspace-worktree").unwrap();
+        let branch = h.cx.debug_bounds("workspace-branch").unwrap();
+        let agent = h.cx.debug_bounds("ws-switch-agent").unwrap();
+        assert!(description.bottom() <= worktree.top());
+        assert!(worktree.bottom() <= branch.top());
+        assert!(branch.bottom() <= agent.top());
+        assert_eq!(branch.left(), worktree.left(), "one column of rows");
         let row = h.view.read_with(&h.cx, |v, _| v.panel.rows().to_vec());
         assert_eq!(
             row,
@@ -1934,12 +2020,57 @@ pub(crate) mod tests {
                 WsRow::Back,
                 WsRow::More,
                 WsRow::Folder,
+                WsRow::Branch,
                 WsRow::Switch(ContentView::Agent),
                 WsRow::Switch(ContentView::Diff),
                 WsRow::Switch(ContentView::Editor),
                 WsRow::Shell,
             ]
         );
+    }
+
+    #[gpui::test]
+    fn a_task_with_a_pr_shows_its_row_under_the_branch(cx: &mut TestAppContext) {
+        use shelbi_core::{IssuePr, PrCi};
+        let url = "https://github.com/o/r/pull/1234";
+        let mut h = open(cx);
+        *h.ops.details.lock().unwrap() = Some(WorkspaceDetailsInfo {
+            pr: Some(IssuePr {
+                ci: Some(PrCi::Pending),
+                ..IssuePr::new(1234, Some(url.into()))
+            }),
+            ..details_for_t1()
+        });
+        h.update(|v, cx| v.show("alpha", Some(working()), cx));
+        h.draw();
+        let worktree = h.cx.debug_bounds("workspace-worktree").unwrap();
+        let branch = h.cx.debug_bounds("workspace-branch").unwrap();
+        let pr = h.cx.debug_bounds("workspace-pr").unwrap();
+        let agent = h.cx.debug_bounds("ws-switch-agent").unwrap();
+        assert!(worktree.bottom() <= branch.top() && branch.bottom() <= pr.top() && pr.bottom() <= agent.top());
+        assert!(h.cx.debug_bounds("pr-ci-dot").is_some(), "the CI's dot");
+        let rows = h.view.read_with(&h.cx, |v, _| v.panel.rows().to_vec());
+        assert_eq!(&rows[2..5], [WsRow::Folder, WsRow::Branch, WsRow::Pr]);
+
+        // A click opens the PR; so does Enter on it.
+        h.click("workspace-pr");
+        assert_eq!(h.ops.opened_urls.lock().unwrap().as_slice(), [url.to_string()]);
+        h.focus_panel();
+        h.key("j");
+        h.key("k");
+        assert_eq!(h.view.read_with(&h.cx, |v, _| v.panel.selected_row()), Some(WsRow::Pr), "back up from the agent");
+        h.key("enter");
+        assert_eq!(h.ops.opened_urls.lock().unwrap().len(), 2);
+
+        // The branch row copies the branch, with a toast saying so.
+        h.events.borrow_mut().clear();
+        h.click("workspace-branch");
+        assert_eq!(h.cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("jlong/t-1"));
+        assert_eq!(
+            h.events(),
+            vec![WorkspaceEvent::Toast(Some(shelbi_app::task_rows::copied_branch("jlong/t-1")))]
+        );
+        assert!(h.ops().is_empty(), "neither asks the daemon for anything");
     }
 
     #[gpui::test]
@@ -2517,12 +2648,10 @@ pub(crate) mod tests {
         h.key("m");
         assert_eq!(h.events(), vec![WorkspaceEvent::OpenTask("t-1".into())]);
 
-        // So does Enter on the More row, up past the worktree.
-        h.key("k");
-        h.key("k");
-        h.key("k");
-        h.key("k");
-        h.key("k");
+        // So does Enter on the More row, up past the branch and the worktree.
+        for _ in 0..6 {
+            h.key("k");
+        }
         assert_eq!(h.view.read_with(&h.cx, |v, _| v.panel.selected_row()), Some(WsRow::More));
         h.key("enter");
         assert_eq!(

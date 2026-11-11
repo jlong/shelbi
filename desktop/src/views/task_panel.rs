@@ -6,17 +6,19 @@
 //! Top to bottom: the back button beside the task's status (its glyph and
 //! the status in caps), the issue summary (the title, the description
 //! clamped to five lines, More opening the task detail over the screen),
-//! the worktree with its Open button,
+//! the info rows (the worktree with its Open button, the branch, the pull
+//! request: the Workspace and Review frames 2787:33099 / 2787:33098),
 //! the views (the sidebar's nav item with the sliding chip, numbered ⌘1 to
 //! ⌘N), and, in the Review panel, its Actions. The window draws the
 //! sidebar's titlebar and footer around a panel
 //! ([`super::sidebar::render_panel_column`]).
 
-use gpui::{div, prelude::*, px, AnyElement, Div, SharedString, Stateful};
+use gpui::{div, prelude::*, px, AnyElement, Div, Hsla, SharedString, Stateful};
+use shelbi_app::task_rows;
 use shelbi_core::{IssuePr, PrCi, StatusCategory};
 
 use super::sidebar::nav_item;
-use crate::assets::{heroicon, icons, Icon};
+use crate::assets::{glyph, glyphs, heroicon, icons, Icon};
 use crate::elements::clamped_text::clamped_text;
 use crate::keys::row_hotkey;
 use crate::theme::motion::fill_layer;
@@ -123,8 +125,8 @@ pub fn summary(
         .children(more)
 }
 
-/// A task's pull request as both task surfaces show it (the task pane's PR
-/// property, the Review panel's row): the link and what's known of the PR.
+/// A task's pull request as the task pane's PR property shows it: the link
+/// and what's known of the PR, in words. (The panels' PR row is [`pr_row`].)
 pub fn pr_value(link: Stateful<Div>, pr: &IssuePr, theme: &Theme) -> Div {
     let status = pr.state.map(|s| s.label());
     div()
@@ -143,11 +145,7 @@ pub fn pr_value(link: Stateful<Div>, pr: &IssuePr, theme: &Theme) -> Div {
                 .child(s)
         }))
         .children(pr.ci.map(|ci| {
-            let color = match ci {
-                PrCi::Pending => theme.warning,
-                PrCi::Passing => theme.success,
-                PrCi::Failing => theme.error,
-            };
+            let color = ci_color(ci, theme);
             div()
                 .debug_selector(|| "pr-ci".into())
                 .min_w_0()
@@ -157,9 +155,9 @@ pub fn pr_value(link: Stateful<Div>, pr: &IssuePr, theme: &Theme) -> Div {
         }))
 }
 
-/// A pull request's number as a link (`#2137 ↗`, the URL in its tooltip). The
-/// caller adds the click: the pane opens the page, the Review panel runs its
-/// row. Without a URL it reads as plain text, with nowhere to go.
+/// A pull request's number as a link (`#2137 ↗`, the URL in its tooltip), for
+/// the task pane's PR property; the caller adds the click. Without a URL it
+/// reads as plain text, with nowhere to go.
 pub fn pr_link(id: &'static str, pr: &IssuePr, keyboard: bool, theme: &Theme) -> Stateful<Div> {
     let d = div()
         .id(id)
@@ -224,51 +222,112 @@ pub fn short_path(path: &str) -> String {
     format!("…/{}", parts[parts.len() - KEEP..].join("/"))
 }
 
-/// The worktree row: the folder, the path ([`short_path`], the start
-/// clipped first when even that doesn't fit) and the Open button the caller
-/// makes, if any; 12pt in, `pad_y` above and below (State=Workspace draws
-/// 8pt, State=Review none). `keyboard` marks it the keyboard's row.
-pub fn worktree_row(
-    selector: &'static str,
-    path: &str,
-    open: Option<Stateful<Div>>,
-    keyboard: bool,
-    pad_y: f32,
-    theme: &Theme,
-) -> Div {
+/// The info rows' block under the summary (Figma's "Review worktree"): the
+/// worktree, the branch and the pull request, 12pt in, 8pt above and below,
+/// 4pt apart.
+pub fn info_rows(rows: impl IntoIterator<Item = AnyElement>) -> Div {
     div()
         .flex()
-        .flex_row()
+        .flex_col()
         .flex_none()
+        .gap(px(4.0))
         .px(px(12.0))
-        .py(px(pad_y))
+        .py(px(8.0))
+        .children(rows)
+}
+
+/// One info row's frame: `icon` (20pt, `icon/default`), 8pt, then the
+/// caller's content; 6pt padding, 6pt corners. `keyboard` marks it the
+/// keyboard's row with the selection fill.
+fn info_row(d: Div, icon: Icon, keyboard: bool, theme: &Theme) -> Div {
+    d.relative()
+        .flex()
+        .flex_row()
+        .w_full()
+        .min_w_0()
+        .items_center()
+        .gap(px(8.0))
+        .p(px(6.0))
+        .rounded(px(NAV_RADIUS))
+        .type_style(Type::XSmall)
+        .text_color(theme.foreground)
+        .when(keyboard, |d| d.bg(theme.background))
+        .child(heroicon(icon).text_color(theme.icon))
+}
+
+/// A clickable info row (the branch, the pull request): the row is the
+/// button, deepening to the selection fill on hover.
+fn clickable(id: &'static str, d: Div, theme: &Theme) -> Stateful<Div> {
+    let hover = theme.background;
+    d.id(id)
+        .debug_selector(move || id.into())
+        .cursor_pointer()
+        .hover(move |s| s.bg(hover))
+}
+
+/// The worktree row: the folder, the path ([`short_path`], the start
+/// clipped first when even that doesn't fit) and the Open button the caller
+/// makes, if any. The 24pt button overhangs the row's 20pt line by 2pt each
+/// way, so the row keeps the frame's 32pt like the branch and PR rows.
+/// `keyboard` marks it the keyboard's row.
+pub fn worktree_row(selector: &'static str, path: &str, open: Option<Stateful<Div>>, keyboard: bool, theme: &Theme) -> Div {
+    info_row(div().debug_selector(move || selector.into()), icons::FOLDER, keyboard, theme)
         .child(
             div()
-                .debug_selector(move || selector.into())
-                .relative()
-                .flex()
-                .flex_row()
                 .flex_1()
                 .min_w_0()
-                .items_center()
-                .gap(px(8.0))
-                .p(px(6.0))
-                .rounded(px(NAV_RADIUS))
-                .when(keyboard, |d| d.bg(theme.background))
-                .child(heroicon(icons::FOLDER).text_color(theme.icon))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis_start()
-                        .type_style(Type::XSmall)
-                        .text_color(theme.foreground)
-                        .child(short_path(path)),
-                )
-                .children(open),
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .text_ellipsis_start()
+                .child(short_path(path)),
         )
+        .children(open.map(|button| div().flex().flex_none().my(px(-2.0)).child(button)))
+}
+
+/// The branch row: the git branch and the branch's name, cut at the end when
+/// it doesn't fit. A click (the caller's) copies the name.
+pub fn branch_row(id: &'static str, branch: &str, keyboard: bool, theme: &Theme) -> Stateful<Div> {
+    let row = info_row(div(), icons::GIT_BRANCH, keyboard, theme).child(
+        div()
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .whitespace_nowrap()
+            .text_ellipsis()
+            .child(branch.to_string()),
+    );
+    clickable(id, row, theme).tooltip(style::tooltip(format!("Copy {branch}")))
+}
+
+/// The pull request row: the pull request's icon, `PR #1234`, and one dot in
+/// the CI's color (none while the CI is unknown). The state and CI are in the
+/// tooltip with the URL, not words in the row. With a URL the row is a button
+/// (the caller's click opens it); without one it has nowhere to go.
+pub fn pr_row(id: &'static str, pr: &IssuePr, keyboard: bool, theme: &Theme) -> Stateful<Div> {
+    let row = info_row(div(), icons::PULL_REQUEST, keyboard, theme)
+        .child(div().flex_none().whitespace_nowrap().child(task_rows::pr_label(pr)))
+        .children(pr.ci.map(|ci| {
+            div()
+                .debug_selector(|| "pr-ci-dot".into())
+                .flex()
+                .flex_none()
+                .child(glyph(glyphs::CIRCLE_SOLID).text_color(ci_color(ci, theme)))
+        }));
+    let tip = task_rows::pr_tooltip(pr);
+    if pr.url.is_some() {
+        clickable(id, row, theme).tooltip(style::tooltip(tip))
+    } else {
+        row.id(id).debug_selector(move || id.into()).tooltip(style::tooltip(tip))
+    }
+}
+
+/// A PR's CI as a color: passing green, pending yellow, failing red.
+pub fn ci_color(ci: PrCi, theme: &Theme) -> Hsla {
+    match ci {
+        PrCi::Pending => theme.warning,
+        PrCi::Passing => theme.success,
+        PrCi::Failing => theme.error,
+    }
 }
 
 /// The worktree's Open button: the X-Small Default button.

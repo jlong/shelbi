@@ -75,6 +75,15 @@ const STATUS_INDENT: ratatui::layout::Margin = ratatui::layout::Margin {
 /// math and the rendered line can never drift.
 const FOLDER_PREFIX: &str = "📁 ";
 
+/// The git-branch glyph that prefixes the branch row (the sidebar's review
+/// rows mark a branch the same way). Two spaces after the one-column glyph,
+/// so the name lines up with the path after the two-column folder emoji.
+const BRANCH_PREFIX: &str = "⎇  ";
+
+/// The pull-request glyph that prefixes the PR row, padded like
+/// [`BRANCH_PREFIX`].
+const PR_PREFIX: &str = "⇵  ";
+
 /// Display column width of `s`, honoring wide glyphs.
 pub(crate) fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
@@ -439,6 +448,121 @@ pub(crate) fn render_folder(f: &mut Frame, area: Rect, worktree: &str, selected:
             x: area.x + PAD,
             y: area.y,
             width: width as u16,
+            height: 1,
+        },
+    );
+}
+
+/// One of the info rows a task panel stacks under the task info, for the
+/// panel's click map and keyboard highlight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InfoRow {
+    Folder,
+    Branch,
+    Pr,
+}
+
+/// What the info rows show: the worktree, the branch (no row without one) and
+/// the pull request (no row without one).
+pub(crate) struct InfoRowsView<'a> {
+    pub worktree: &'a str,
+    pub branch: Option<&'a str>,
+    pub pr: Option<&'a shelbi_core::IssuePr>,
+}
+
+/// Draw the info rows from the top of `area`, one line each and no blank
+/// between them (one group, as the desktop's panels stack them): the worktree
+/// folder, `⎇  <branch>`, then `⇵  PR #1234 ●` with the dot in the CI's color
+/// (no dot while the CI is unknown). `selected` is the row with the keyboard.
+/// Returns the lines used and each drawn row's click rect.
+pub(crate) fn render_info_rows(
+    f: &mut Frame,
+    area: Rect,
+    view: &InfoRowsView<'_>,
+    selected: Option<InfoRow>,
+) -> (u16, Vec<(InfoRow, Rect)>) {
+    let mut hits = Vec::new();
+    let bottom = area.y.saturating_add(area.height);
+    let mut y = area.y;
+    let mut rows = vec![InfoRow::Folder];
+    if view.branch.is_some() {
+        rows.push(InfoRow::Branch);
+    }
+    if view.pr.is_some() {
+        rows.push(InfoRow::Pr);
+    }
+    let width = area.width.saturating_sub(PAD + PAD_RIGHT) as usize;
+    for row in rows {
+        if y >= bottom || area.width == 0 {
+            break;
+        }
+        let line = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
+        let on = selected == Some(row);
+        match row {
+            InfoRow::Folder => render_folder(f, line, view.worktree, on),
+            InfoRow::Branch => {
+                let branch = view.branch.unwrap_or_default();
+                let budget = width.saturating_sub(display_width(BRANCH_PREFIX)).max(1);
+                let text = format!("{BRANCH_PREFIX}{}", truncate_right(branch, budget));
+                render_info_line(f, line, vec![Span::styled(text, info_style(on))]);
+            }
+            InfoRow::Pr => {
+                if let Some(pr) = view.pr {
+                    render_info_line(f, line, pr_row_spans(pr, on));
+                }
+            }
+        }
+        hits.push((
+            row,
+            Rect {
+                x: area.x + PAD,
+                y,
+                width: area.width.saturating_sub(PAD),
+                height: 1,
+            },
+        ));
+        y += 1;
+    }
+    (y - area.y, hits)
+}
+
+/// An info row's text: bold white with the keyboard on it, gray otherwise
+/// (the folder row's look).
+fn info_style(selected: bool) -> Style {
+    if selected {
+        Style::default().fg(palette().ansi_white).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(palette().gray)
+    }
+}
+
+/// The PR row: `⇵  PR #1234 ●`, the dot in the CI's color. The state and CI
+/// aren't words here (the desktop keeps them in the row's tooltip; the task's
+/// More popover has them).
+pub(crate) fn pr_row_spans(pr: &shelbi_core::IssuePr, selected: bool) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(
+        format!("{PR_PREFIX}{}", shelbi_app::task_rows::pr_label(pr)),
+        info_style(selected),
+    )];
+    if let Some(ci) = pr.ci {
+        spans.push(Span::styled(" ●", Style::default().fg(crate::kanban::pr_ci_color(ci))));
+    }
+    spans
+}
+
+fn render_info_line(f: &mut Frame, area: Rect, spans: Vec<Span<'static>>) {
+    let width = area.width.saturating_sub(PAD + PAD_RIGHT);
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect {
+            x: area.x + PAD,
+            y: area.y,
+            width,
             height: 1,
         },
     );

@@ -20,4 +20,7 @@ palette frame (2171:752) and drawn on its 20pt grid with the outline set's
   through `style::DROPDOWN_CHEVRON`.
 - `pull-request.svg`: a Changelog entry's PR link chip (component
   `git-pull-request`, 2686:37687), a filled drawing. The other chips (issue,
-  generic link) stay Heroicons.
+  generic link) stay Heroicons. The task panels' PR row draws it too.
+- `git-branch.svg`: the task panels' branch row (component `git-branch`,
+  2686:37688, in the Workspace and Review frames 2787:33099 / 2787:33098), a
+  filled drawing.

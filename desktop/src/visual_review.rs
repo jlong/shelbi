@@ -116,7 +116,7 @@ struct Ops;
 
 impl ReviewOps for Ops {
     fn resolve(&self, _project: &str, _task: &str) -> Result<ReviewTarget, String> {
-        Ok(ReviewTarget::Serving(info()))
+        Ok(ReviewTarget::Serving(Box::new(info())))
     }
     fn session_op(&self, _project: &str, _task: &str, _op: ReviewSessionOp) -> Result<(), String> {
         Ok(())
@@ -153,6 +153,7 @@ fn info() -> ReviewInfo {
             ci: Some(shelbi_core::PrCi::Passing),
             ..shelbi_core::IssuePr::new(2137, Some("https://github.com/acme/demo/pull/2137".into()))
         }),
+        branch: Some("jlong/cold-start".into()),
     }
 }
 

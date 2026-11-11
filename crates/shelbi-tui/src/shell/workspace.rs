@@ -62,6 +62,10 @@ pub enum WorkspaceAction {
     OpenApp(ReviewRole),
     /// Reveal the workspace worktree folder in the OS file manager.
     RevealFolder,
+    /// Copy the task's branch name to the clipboard.
+    CopyBranch,
+    /// Open the task's pull request in the system browser.
+    OpenPr,
     /// Open the full task-description popover over the main area.
     ShowDescription,
     /// Back button / Esc: return to the nav sidebar, leaving the content
@@ -119,7 +123,11 @@ impl WorkspaceInterface {
         let title = task.as_ref().map(|t| t.task.title.clone()).unwrap_or_default();
         let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
         let diff_task = task.as_ref().map(|t| t.task.id.clone());
-        let panel = WorkspacePanel::new(worktree, editor_name, agent_name, title, description, status);
+        let mut panel = WorkspacePanel::new(worktree, editor_name, agent_name, title, description, status);
+        panel.set_branch_and_pr(
+            task.as_ref().and_then(|t| t.task.branch.as_deref()),
+            task.as_ref().and_then(|t| shelbi_app::board::task_pr(&t.task)),
+        );
         let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
             shelbi_app::session::WorkspaceContentRelauncher {
                 project: project.to_string(),
@@ -235,6 +243,27 @@ impl WorkspaceInterface {
     pub fn with_remote_address(mut self, address: Option<String>) -> Self {
         self.remote_address = address;
         self
+    }
+
+    /// The branch the branch row shows when the task names none (the
+    /// worktree's): `workspace_details` resolves the task's, else the
+    /// worktree's.
+    pub fn with_branch(mut self, branch: Option<String>) -> Self {
+        if self.panel.branch.is_none() {
+            let pr = self.panel.pr.clone();
+            self.panel.set_branch_and_pr(branch.as_deref(), pr);
+        }
+        self
+    }
+
+    /// The task's branch, as the panel's branch row shows it.
+    pub fn branch(&self) -> Option<&str> {
+        self.panel.branch.as_deref()
+    }
+
+    /// Where the panel's pull request opens, when it has one.
+    pub fn pr_url(&self) -> Option<&str> {
+        self.panel.pr_url()
     }
 
     /// The editor's display name, as "Edit in <name>" shows it.
@@ -603,6 +632,8 @@ fn map_effect(effect: WsEffect) -> WorkspaceAction {
         WsEffect::None => WorkspaceAction::None,
         WsEffect::Back => WorkspaceAction::Back,
         WsEffect::RevealFolder => WorkspaceAction::RevealFolder,
+        WsEffect::CopyBranch => WorkspaceAction::CopyBranch,
+        WsEffect::OpenPr => WorkspaceAction::OpenPr,
         WsEffect::ShowAgent => WorkspaceAction::ShowContent(None),
         WsEffect::ShowDiff => WorkspaceAction::ShowContent(Some(ReviewRole::Diff)),
         WsEffect::ShowEditor => WorkspaceAction::ShowContent(Some(ReviewRole::Editor)),

@@ -20,6 +20,7 @@ use shelbi_state::keymap::{Key, KeyChord, Mods};
 use shelbi_state::AppTools;
 
 use crate::nav::View;
+pub use crate::task_rows::InfoRows;
 use crate::view::{ReviewRow, ReviewState, WorkspaceRow};
 use crate::ReviewRole;
 
@@ -58,6 +59,8 @@ pub struct ReviewInfo {
     pub remote_machine: Option<String>,
     /// The task's pull request ([`crate::board::task_pr`]).
     pub pr: Option<IssuePr>,
+    /// The task's branch, when it has one.
+    pub branch: Option<String>,
 }
 
 /// Where a review slot's server health check stands.
@@ -164,6 +167,8 @@ pub struct ReviewPanelModel {
     pub remote_machine: Option<String>,
     /// The task's pull request, when it has one.
     pub pr: Option<IssuePr>,
+    /// The task's branch, when it has one (the branch row).
+    pub branch: Option<String>,
     /// The view-switcher nav items, in order.
     pub switch_items: Vec<ReviewSwitch>,
     pub server: ReviewServer,
@@ -205,6 +210,9 @@ impl ReviewPanelModel {
             remote_machine: info.remote_machine.clone(),
             // The row keeps up with the board while the panel stays open.
             pr: row.and_then(|r| r.pr.clone()).or_else(|| info.pr.clone()),
+            branch: crate::task_rows::branch_label(row.map(|r| r.branch.as_str()))
+                .or_else(|| crate::task_rows::branch_label(info.branch.as_deref()))
+                .map(str::to_string),
             switch_items,
             server: ReviewServer {
                 state,
@@ -225,6 +233,17 @@ impl ReviewPanelModel {
 
     pub fn has_body(&self) -> bool {
         !self.body.trim().is_empty()
+    }
+
+    /// The info rows under the description that are keyboard rows: the
+    /// folder (when it can be revealed: a local slot), the branch, the PR
+    /// (when it has a link).
+    pub fn info_rows(&self) -> InfoRows {
+        InfoRows {
+            folder: !self.is_remote(),
+            branch: self.branch.is_some(),
+            pr: self.pr_url().is_some(),
+        }
     }
 
     pub fn is_remote(&self) -> bool {
@@ -355,10 +374,12 @@ pub enum PanelRow {
     Back,
     /// The `More` link: the full task description. Only with a body.
     More,
-    /// The task's pull request: open it in the browser. Only with a link.
-    Pr,
     /// The worktree folder: reveal it in the file manager.
     Folder,
+    /// The task's branch: copy its name. Only with a branch.
+    Branch,
+    /// The task's pull request: open it in the browser. Only with a link.
+    Pr,
     Switch(ReviewSwitch),
     /// The user shell beside the content, on or off (the desktop's; the TUI
     /// asks for no shell row).
@@ -383,6 +404,8 @@ pub enum PanelEffect {
     OpenBrowser,
     /// Open the task's pull request in the browser.
     OpenPr,
+    /// Copy the task's branch name to the clipboard.
+    CopyBranch,
     RevealFolder,
     ShowDescription,
     /// Accept: the gated review → done merge.
@@ -396,31 +419,28 @@ pub enum PanelEffect {
     ToggleShell,
 }
 
-/// The panel's rows: Back, `More` (only with a body), the pull request (only
-/// with a link), the folder (when it can be revealed), the switch entries, then
-/// Approve and Reject.
-pub fn panel_rows(has_body: bool, has_pr: bool, show_folder: bool, switches: &[ReviewSwitch]) -> Vec<PanelRow> {
-    panel_rows_with_shell(has_body, has_pr, show_folder, switches, false)
+/// The panel's rows: Back, `More` (only with a body), the info rows (the
+/// folder when it can be revealed, the branch, the pull request when it has a
+/// link: [`InfoRows`]), the switch entries, then Approve and Reject.
+pub fn panel_rows(has_body: bool, info: InfoRows, switches: &[ReviewSwitch]) -> Vec<PanelRow> {
+    panel_rows_with_shell(has_body, info, switches, false)
 }
 
 /// [`panel_rows`] with the user-shell row after the switch entries when
 /// `shell` (the desktop's).
-pub fn panel_rows_with_shell(
-    has_body: bool,
-    has_pr: bool,
-    show_folder: bool,
-    switches: &[ReviewSwitch],
-    shell: bool,
-) -> Vec<PanelRow> {
+pub fn panel_rows_with_shell(has_body: bool, info: InfoRows, switches: &[ReviewSwitch], shell: bool) -> Vec<PanelRow> {
     let mut rows = vec![PanelRow::Back];
     if has_body {
         rows.push(PanelRow::More);
     }
-    if has_pr {
-        rows.push(PanelRow::Pr);
-    }
-    if show_folder {
+    if info.folder {
         rows.push(PanelRow::Folder);
+    }
+    if info.branch {
+        rows.push(PanelRow::Branch);
+    }
+    if info.pr {
+        rows.push(PanelRow::Pr);
     }
     rows.extend(switches.iter().map(|s| PanelRow::Switch(*s)));
     if shell {
@@ -456,8 +476,9 @@ pub fn activate_row(row: PanelRow, has_body: bool, merging: bool, apps: AppTools
     match row {
         PanelRow::Back => (PanelEffect::Back, None),
         PanelRow::More => (description_effect(has_body), None),
-        PanelRow::Pr => (PanelEffect::OpenPr, None),
         PanelRow::Folder => (PanelEffect::RevealFolder, None),
+        PanelRow::Branch => (PanelEffect::CopyBranch, None),
+        PanelRow::Pr => (PanelEffect::OpenPr, None),
         PanelRow::Switch(ReviewSwitch::Chat) => (PanelEffect::ShowChat, Some(ActiveView::Chat)),
         PanelRow::Switch(ReviewSwitch::Diff) if apps.diff => (PanelEffect::OpenApp(ReviewRole::Diff), None),
         PanelRow::Switch(ReviewSwitch::Editor) if apps.editor => (PanelEffect::OpenApp(ReviewRole::Editor), None),
@@ -680,7 +701,7 @@ impl ReviewPanelState {
     }
 
     fn rows_for(model: &ReviewPanelModel, shell: bool) -> Vec<PanelRow> {
-        panel_rows_with_shell(model.has_body(), model.pr_url().is_some(), !model.is_remote(), &model.switch_items, shell)
+        panel_rows_with_shell(model.has_body(), model.info_rows(), &model.switch_items, shell)
     }
 
     /// Follow a rebuilt model (a refreshed row): the selection stays on the
@@ -821,7 +842,7 @@ impl ReviewPanelState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewTarget {
     /// Loaded on a review slot: open it.
-    Serving(ReviewInfo),
+    Serving(Box<ReviewInfo>),
     /// In the review column but on no slot yet. `free_slots` are the review
     /// slots nothing occupies; `total_slots` tells "every slot is busy" from
     /// "no review workspace is configured".
@@ -899,7 +920,7 @@ impl ReviewLoader {
                 if self.pending.as_deref() == Some(task) {
                     self.pending = None;
                 }
-                LoadStep::Open(Box::new(info))
+                LoadStep::Open(info)
             }
             Ok(ReviewTarget::Queued {
                 title,
@@ -1012,6 +1033,7 @@ mod tests {
             has_health_check: true,
             remote_machine: remote.then(|| "gpu".to_string()),
             pr: None,
+            branch: None,
         }
     }
 
@@ -1250,7 +1272,7 @@ mod tests {
     }
 
     fn serving() -> Result<ReviewTarget, String> {
-        Ok(ReviewTarget::Serving(info(false, false)))
+        Ok(ReviewTarget::Serving(Box::new(info(false, false))))
     }
 
     #[test]
@@ -1412,15 +1434,36 @@ mod tests {
     }
 
     #[test]
-    fn the_pr_row_sits_under_the_summary_and_opens_the_page() {
+    fn the_info_rows_stack_worktree_branch_then_pr_under_the_summary() {
         let mut with_pr = info(false, false);
         with_pr.body = "A body.".into();
         with_pr.pr = Some(IssuePr::new(7, Some("https://h/pull/7".into())));
+        with_pr.branch = Some("jlong/t-1".into());
         let m = ReviewPanelModel::build(&with_pr, None);
         assert_eq!(m.pr_url(), Some("https://h/pull/7"));
+        assert_eq!(m.branch.as_deref(), Some("jlong/t-1"));
         let mut p = ReviewPanelState::new(&m);
-        assert_eq!(&p.rows()[..3], [PanelRow::Back, PanelRow::More, PanelRow::Pr]);
+        assert_eq!(
+            &p.rows()[..6],
+            [
+                PanelRow::Back,
+                PanelRow::More,
+                PanelRow::Folder,
+                PanelRow::Branch,
+                PanelRow::Pr,
+                PanelRow::Switch(ReviewSwitch::Chat),
+            ]
+        );
         assert_eq!(p.click(PanelRow::Pr), PanelEffect::OpenPr);
+        assert_eq!(p.click(PanelRow::Branch), PanelEffect::CopyBranch);
+
+        // No branch, no branch row; the sidebar row's branch stands in for
+        // a task that names none.
+        with_pr.branch = None;
+        let m = ReviewPanelModel::build(&with_pr, None);
+        assert!(!ReviewPanelState::new(&m).rows().contains(&PanelRow::Branch));
+        let m = ReviewPanelModel::build(&with_pr, Some(&row(ReviewState::Serving)));
+        assert_eq!(m.branch.as_deref(), Some("jlong/t-1"));
 
         // A number with nowhere to go isn't a row, and no PR isn't either.
         with_pr.pr = Some(IssuePr::new(7, None));

@@ -8,8 +8,10 @@
 //! - **task info**: the title (bold white), a few wrapped lines of the body
 //!   preview, and a cyan **`More`** link that opens the full task-description
 //!   popover,
-//! - the workspace worktree's **folder** row (left-truncated, revealed on
-//!   click), and
+//! - the info rows, one group: the workspace worktree's **folder** row
+//!   (left-truncated, revealed on click), the task's **branch** (`⎇`, copied on
+//!   click) and, when the task has one, its **pull request** (`⇵ PR #1234 ●`,
+//!   the dot in the CI's color, opened on click), and
 //! - a **view-switcher** nav block — the workspace's **agent** session (default,
 //!   labelled with the agent's display name) / **View Diff** / **Edit in
 //!   <editor>** — the active view highlighted.
@@ -29,9 +31,9 @@ use ratatui::{
 };
 
 use crate::panel::{
-    advance_blank, in_rect, render_back_button, render_folder, render_nav_block,
-    render_status_line, render_task_info, reserve_status_area, NavEntry, BACK_BLOCK_H,
-    BACK_BTN_WIDTH, PAD,
+    advance_blank, in_rect, render_back_button, render_info_rows, render_nav_block,
+    render_status_line, render_task_info, reserve_status_area, InfoRow, InfoRowsView, NavEntry,
+    BACK_BLOCK_H, BACK_BTN_WIDTH, PAD,
 };
 
 // The rows, their activation and the effects are the shared panel
@@ -106,6 +108,10 @@ pub struct WorkspacePanel {
     pub selected: usize,
     /// A message on the panel's status line (effect failures, notes).
     pub status_line: String,
+    /// The task's branch (the branch row; none without one).
+    pub branch: Option<String>,
+    /// The task's pull request (the PR row; none without one).
+    pub pr: Option<shelbi_core::IssuePr>,
     hit_targets: Vec<(Rect, usize)>,
     more_hit: Option<Rect>,
 }
@@ -130,6 +136,8 @@ impl WorkspacePanel {
             active_view: WsView::Agent,
             selected: 0,
             status_line: String::new(),
+            branch: None,
+            pr: None,
             hit_targets: Vec::new(),
             more_hit: None,
         };
@@ -144,12 +152,32 @@ impl WorkspacePanel {
 
     /// The keyboard-navigable rows, top to bottom: Back, `More` (only with a
     /// body, in reading order with the task-info block it belongs to), the
-    /// folder, then the view switch. The same for a remote workspace (its
+    /// folder, the branch and the PR (each only when there is one; the PR only
+    /// with a link), then the view switch. The same for a remote workspace (its
     /// sessions run there); the TUI has no user-shell row.
     fn rows(&self) -> Vec<PanelRow> {
         panel_rows(
-            &WsPanelShape::for_workspace(true, !self.description.trim().is_empty(), false).with_apps(self.apps),
+            &WsPanelShape::for_workspace(true, !self.description.trim().is_empty(), false)
+                .with_branch_and_pr(self.branch.is_some(), self.pr_url().is_some())
+                .with_apps(self.apps),
         )
+    }
+
+    /// Where the pull request opens, when the panel has one to open.
+    pub fn pr_url(&self) -> Option<&str> {
+        self.pr.as_ref().and_then(|pr| pr.url.as_deref())
+    }
+
+    /// Show the task's `branch` (blank is none) and `pr`, keeping the
+    /// selection on the row it was on.
+    pub fn set_branch_and_pr(&mut self, branch: Option<&str>, pr: Option<shelbi_core::IssuePr>) {
+        let current = self.rows().get(self.selected).copied();
+        self.branch = shelbi_app::task_rows::branch_label(branch).map(str::to_string);
+        self.pr = pr;
+        let rows = self.rows();
+        self.selected = current
+            .and_then(|row| rows.iter().position(|r| *r == row))
+            .unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
     }
 
     /// Start index and count of the contiguous `Switch` run in [`rows`].
@@ -302,35 +330,43 @@ pub fn render_full(f: &mut Frame, app: &mut WorkspacePanel, area: Rect) {
     // blank
     y = advance_blank(y, bottom);
 
-    // 3. Worktree folder row.
-    let folder_idx = app
-        .rows()
-        .iter()
-        .position(|r| matches!(r, PanelRow::Folder))
-        .unwrap_or(0);
+    // 3. The info rows: the worktree folder, the branch, the pull request.
     if y < bottom {
-        render_folder(
+        let rows = app.rows();
+        let selected = rows.get(app.selected).and_then(|r| match r {
+            PanelRow::Folder => Some(InfoRow::Folder),
+            PanelRow::Branch => Some(InfoRow::Branch),
+            PanelRow::Pr => Some(InfoRow::Pr),
+            _ => None,
+        });
+        let pr = app.pr.clone();
+        let (used, hits) = render_info_rows(
             f,
             Rect {
                 x: area.x,
                 y,
                 width: area.width,
-                height: 1,
+                height: bottom - y,
             },
-            &app.worktree,
-            app.selected == folder_idx,
-        );
-        push_hit(
-            app,
-            Rect {
-                x: area.x + PAD,
-                y,
-                width: area.width.saturating_sub(PAD),
-                height: 1,
+            &InfoRowsView {
+                worktree: &app.worktree,
+                branch: app.branch.as_deref(),
+                pr: pr.as_ref(),
             },
-            folder_idx,
+            selected,
         );
-        y += 1;
+        for (info, rect) in hits {
+            let row = match info {
+                InfoRow::Folder => PanelRow::Folder,
+                InfoRow::Branch => PanelRow::Branch,
+                InfoRow::Pr => PanelRow::Pr,
+            };
+            // A PR without a link is drawn but isn't a row.
+            if let Some(idx) = rows.iter().position(|r| *r == row) {
+                push_hit(app, rect, idx);
+            }
+        }
+        y += used;
     }
 
     // blank
@@ -447,6 +483,59 @@ mod tests {
         rows.iter()
             .position(|r| r.contains(needle))
             .unwrap_or_else(|| panic!("expected row containing {needle:?} in:\n{}", rows.join("\n")))
+    }
+
+    #[test]
+    fn the_worktree_branch_and_pr_stack_under_the_task_info() {
+        let mut app = panel();
+        let url = "https://github.com/o/r/pull/1234";
+        app.set_branch_and_pr(
+            Some("jlong/cold-start"),
+            Some(shelbi_core::IssuePr {
+                ci: Some(shelbi_core::PrCi::Passing),
+                ..shelbi_core::IssuePr::new(1234, Some(url.into()))
+            }),
+        );
+        let lines = render_lines(&mut app, 40, 30);
+        let folder = row_y(&lines, "📁");
+        let branch = row_y(&lines, "⎇  jlong/cold-start");
+        let pr = row_y(&lines, "⇵  PR #1234 ●");
+        let more = row_y(&lines, "More");
+        let agent = row_y(&lines, "Developer");
+        assert!(more < folder, "under the task info");
+        assert_eq!((branch, pr), (folder + 1, folder + 2), "one group:\n{}", lines.join("\n"));
+        assert!(pr < agent, "above the views");
+
+        // The keyboard walks Back → More → folder → branch → PR → the views.
+        assert_eq!(
+            &app.rows()[..6],
+            [
+                PanelRow::Back,
+                PanelRow::More,
+                PanelRow::Folder,
+                PanelRow::Branch,
+                PanelRow::Pr,
+                PanelRow::Switch(SwitchItem::Agent),
+            ]
+        );
+        app.nav_up();
+        assert_eq!(app.activate(), WsEffect::OpenPr, "Enter on the PR opens it");
+        app.nav_up();
+        assert_eq!(app.activate(), WsEffect::CopyBranch, "Enter on the branch copies it");
+        // Clicks agree.
+        assert_eq!(app.click(PAD + 2, pr as u16), WsEffect::OpenPr);
+        assert_eq!(app.click(PAD + 2, branch as u16), WsEffect::CopyBranch);
+
+        // No branch, no PR: no rows, and the views close up under the folder.
+        app.set_branch_and_pr(Some(" "), None);
+        let lines = render_lines(&mut app, 40, 30);
+        assert!(!lines.iter().any(|l| l.contains('⎇') || l.contains("PR #")), "{}", lines.join("\n"));
+        assert!(!app.rows().contains(&PanelRow::Branch) && !app.rows().contains(&PanelRow::Pr));
+        // A PR with nowhere to go is drawn but isn't a keyboard row.
+        app.set_branch_and_pr(None, Some(shelbi_core::IssuePr::new(7, None)));
+        let lines = render_lines(&mut app, 40, 30);
+        row_y(&lines, "⇵  PR #7");
+        assert!(!app.rows().contains(&PanelRow::Pr));
     }
 
     /// The panel in each status color (in progress, ready for review, done,

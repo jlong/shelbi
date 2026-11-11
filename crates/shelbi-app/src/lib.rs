@@ -110,6 +110,7 @@ pub mod source;
 pub mod state_write;
 pub mod supervision;
 pub mod task_properties;
+pub mod task_rows;
 pub mod task_session;
 pub mod text_area;
 pub mod theme;

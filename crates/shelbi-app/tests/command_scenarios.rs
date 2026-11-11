@@ -400,6 +400,7 @@ fn review_info() -> ReviewInfo {
         has_health_check: false,
         remote_machine: None,
         pr: None,
+        branch: None,
     }
 }
 
@@ -420,7 +421,7 @@ fn a_review_resolves_then_opens_or_asks_for_a_slot() {
     let mut loader = ReviewLoader::default();
     assert_eq!(loader.open("T-9"), LoadStep::Resolve("T-9".into()));
     assert_eq!(
-        loader.resolved("T-9", Ok(ReviewTarget::Serving(review_info()))),
+        loader.resolved("T-9", Ok(ReviewTarget::Serving(Box::new(review_info())))),
         LoadStep::Open(Box::new(review_info()))
     );
 
