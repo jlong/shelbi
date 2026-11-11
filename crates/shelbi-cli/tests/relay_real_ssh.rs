@@ -212,8 +212,7 @@ impl Drop for Lab {
 }
 
 fn write_script(path: &Path, text: &str) {
-    std::fs::write(path, text).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    shelbi_state::test_support::write_executable(path, text);
 }
 
 fn settle(what: &str, mut done: impl FnMut() -> bool) {

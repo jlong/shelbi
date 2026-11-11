@@ -12,7 +12,6 @@
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::Command;
@@ -57,8 +56,7 @@ impl Sandbox {
         std::fs::create_dir_all(root.join("bin")).unwrap();
         let root = root.canonicalize().unwrap();
         let bin = root.join("bin");
-        std::fs::write(bin.join("ssh"), STUB_SSH).unwrap();
-        std::fs::set_permissions(bin.join("ssh"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(bin.join("ssh"), STUB_SSH);
         std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_shelbi"), bin.join("shelbi")).unwrap();
 
         let shelbi_home = root.join("sh");

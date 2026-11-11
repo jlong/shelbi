@@ -12259,16 +12259,10 @@ transitions:
         // real `git` still resolves from the system PATH.
         let bin = home.join("stub-bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(
+        shelbi_state::test_support::write_executable(
             bin.join("gh"),
             "#!/bin/sh\ncase \"$*\" in\n  *\"pr list\"*) echo 'no GitHub remote' >&2; exit 1 ;;\n  *) exit 1 ;;\nesac\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         std::fs::write(
             home.join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),
@@ -12357,16 +12351,10 @@ transitions:
     fn install_gh_stub_no_pr(home: &std::path::Path) -> (Option<std::ffi::OsString>, Option<std::ffi::OsString>) {
         let bin = home.join("stub-bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(
+        shelbi_state::test_support::write_executable(
             bin.join("gh"),
             "#!/bin/sh\ncase \"$*\" in\n  *\"pr list\"*) : ;;\n  *) : ;;\nesac\nexit 0\n",
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         std::fs::write(
             home.join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),

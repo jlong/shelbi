@@ -8,7 +8,6 @@
 
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
@@ -33,8 +32,7 @@ impl Sandbox {
         std::fs::create_dir_all(home.join("repo")).unwrap();
 
         let stub = home.join("stub-runner.sh");
-        std::fs::write(&stub, "#!/bin/sh\nexec sleep 300\n").unwrap();
-        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&stub, "#!/bin/sh\nexec sleep 300\n");
         std::fs::write(
             home.join("projects/p.yaml"),
             format!(

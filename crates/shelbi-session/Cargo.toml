@@ -27,6 +27,8 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+# `test_support::write_executable` for stubs a test executes.
+shelbi-state = { workspace = true, features = ["test-support"] }
 # Replay round-trip tests build terminals directly and drive a real PTY; these
 # are regular deps of the crate but integration tests are separate crates, so
 # they must be named again here.

@@ -11485,10 +11485,8 @@ mod tests {
 
         /// Install an executable `gh` shell script.
         fn write_gh(&self, body: &str) {
-            use std::os::unix::fs::PermissionsExt;
             let script = self.dir.join("gh");
-            std::fs::write(&script, body).unwrap();
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_support::write_executable(&script, body);
         }
 
         fn path(&self, name: &str) -> std::path::PathBuf {

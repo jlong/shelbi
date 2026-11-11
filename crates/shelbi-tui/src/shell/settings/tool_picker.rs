@@ -656,15 +656,13 @@ mod tests {
 
     #[test]
     fn browse_completes_and_saves_a_path_or_says_why_not() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("shelbi-tui-browse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("Fancy.app/Contents")).unwrap();
         std::fs::write(dir.join("Fancy.app/Contents/Info.plist"), "").unwrap();
         std::fs::create_dir_all(dir.join("bin")).unwrap();
         let exe = dir.join("bin/mydiff");
-        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&exe, "#!/bin/sh\n");
 
         let mut f = form();
         let mut layer = ToolLayer { layer: Some(Layer::Browse(Browse::new(ToolSetting::Editor, &f))), ..ToolLayer::default() };

@@ -619,12 +619,10 @@ mod tests {
     /// A launcher running `sh -c <script> daemon` stand-in: `exe` is a script
     /// written to a temp dir.
     fn script_launcher(tag: &str, body: &str) -> (DaemonLauncher, PathBuf) {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("shb-dl-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let exe = dir.join("shelbi");
-        std::fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(&exe, format!("#!/bin/sh\n{body}\n"));
         let log = dir.join("daemon.stderr");
         (
             DaemonLauncher {

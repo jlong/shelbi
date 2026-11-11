@@ -186,7 +186,6 @@ fn local_dispatch_to_handoff_cycle_on_the_session_backend() {
 /// end to end against a genuine `shelbi __session`.
 #[test]
 fn orchestrator_runs_as_a_session_without_tmux_pane_and_delivers_input_once() {
-    use std::os::unix::fs::PermissionsExt;
 
     let _env = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -205,7 +204,7 @@ fn orchestrator_runs_as_a_session_without_tmux_pane_and_delivers_input_once() {
     // appends every stdin line it reads to a file so the test can count how many
     // times a single delivered steer arrives.
     let stub = cwd.path().join("stub-codex.sh");
-    std::fs::write(
+    shelbi_state::test_support::write_executable(
         &stub,
         format!(
             "#!/bin/sh\n\
@@ -216,9 +215,7 @@ fn orchestrator_runs_as_a_session_without_tmux_pane_and_delivers_input_once() {
             pane = tmux_pane_file.display(),
             deliv = delivered_file.display(),
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     // Build the real orchestrator session spec, with the stub as the launch
     // command. `exec {launch}` runs the stub as the PTY's foreground child.

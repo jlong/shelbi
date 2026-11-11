@@ -4841,12 +4841,10 @@ mod tests {
     fn remote_tui_omits_server_only_flags() {
         let temp = tempfile::tempdir().unwrap();
         let command = temp.path().join("fake-codex");
-        fs::write(
+        shelbi_state::test_support::write_executable(
             &command,
             "#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    --add-dir|--add-dir=*|/extra|--approve-for-me|sandbox_mode=*) exit 42 ;;\n  esac\ndone\n",
-        )
-        .unwrap();
-        fs::set_permissions(&command, fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let runner = shelbi_core::AgentRunnerSpec {
             command: command.to_string_lossy().into_owned(),
             flags: vec![

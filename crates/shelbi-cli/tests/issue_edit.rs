@@ -8,7 +8,6 @@
 
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
@@ -273,8 +272,7 @@ impl Drop for Home {
 }
 
 fn write_script(path: &Path, body: &str) {
-    std::fs::write(path, body).unwrap();
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    shelbi_state::test_support::write_executable(path, body);
 }
 
 #[track_caller]

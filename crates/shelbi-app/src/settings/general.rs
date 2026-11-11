@@ -1037,15 +1037,13 @@ mod tests {
 
     #[test]
     fn browse_picks_an_app_or_a_program_and_says_why_not() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("shelbi-general-browse-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let app = dir.join("Fancy.app");
         std::fs::create_dir_all(app.join("Contents")).unwrap();
         std::fs::write(app.join("Contents/Info.plist"), "").unwrap();
         let exe = dir.join("mydiff");
-        std::fs::write(&exe, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&exe, "#!/bin/sh\n");
 
         let mut f = loaded(ThemePreference::Dark, None, None);
         assert_eq!(
