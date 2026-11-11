@@ -129,7 +129,7 @@ struct Ops {
 impl ReviewOps for Ops {
     fn resolve(&self, _project: &str, _task: &str) -> Result<ReviewTarget, String> {
         std::thread::sleep(self.latency);
-        Ok(ReviewTarget::Serving(info()))
+        Ok(ReviewTarget::Serving(Box::new(info())))
     }
     fn session_op(&self, _project: &str, _task: &str, _op: ReviewSessionOp) -> Result<(), String> {
         Ok(())
@@ -157,6 +157,7 @@ impl WorkspaceOps for Ops {
             worktree: "/Users/me/src/demo/.shelbi/wt/alpha".into(),
             editor_name: "Vim".into(),
             apps: Default::default(),
+            pr: None,
         })
     }
     fn session_op(&self, _project: &str, _workspace: &str, _op: WorkspaceSessionOp) -> Result<(), String> {
@@ -184,6 +185,7 @@ fn info() -> ReviewInfo {
         has_health_check: true,
         remote_machine: None,
         pr: None,
+        branch: Some("jlong/cold-start".into()),
     }
 }
 

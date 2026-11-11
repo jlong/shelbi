@@ -148,7 +148,8 @@ impl ReviewOps for LiveOps {
                     .map(|t| (t.task.title.clone(), t.body.clone()))
                     .unwrap_or_default();
                 let pr = info.task.as_ref().and_then(|t| shelbi_app::board::task_pr(&t.task));
-                Ok(ReviewTarget::Serving(ReviewInfo {
+                let branch = info.task.as_ref().and_then(|t| t.task.branch.clone());
+                Ok(ReviewTarget::Serving(Box::new(ReviewInfo {
                     task_id: task.to_string(),
                     slot: info.slot,
                     title,
@@ -160,7 +161,8 @@ impl ReviewOps for LiveOps {
                     has_health_check: info.has_health_check,
                     remote_machine: info.remote_machine,
                     pr,
-                }))
+                    branch,
+                })))
             }
             ReviewOpenTarget::Queued { title } => {
                 // The free slots only: a busy slot is left to its occupant,
@@ -220,7 +222,7 @@ impl ReviewOps for LiveOps {
     }
 }
 
-fn run_open(target: &str) -> Result<(), String> {
+pub(crate) fn run_open(target: &str) -> Result<(), String> {
     std::process::Command::new("open")
         .arg(target)
         .status()
@@ -498,6 +500,7 @@ impl ReviewView {
             has_health_check: false,
             remote_machine: None,
             pr: None,
+            branch: row.as_ref().map(|r| r.branch.clone()),
         };
         let mut shown = self.build(info, row, cx);
         shown.resolved = false;
@@ -1236,6 +1239,12 @@ impl ReviewView {
                     self.run_opener("open the pull request", move |ops| ops.open_url(&url), cx);
                 }
             }
+            PanelEffect::CopyBranch => {
+                if let Some(branch) = self.model().and_then(|m| m.branch.clone()) {
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(branch.clone()));
+                    cx.emit(ReviewEvent::Toast(Some(shelbi_app::task_rows::copied_branch(&branch))));
+                }
+            }
             // Inert until the slot's server is serving (the row says so).
             PanelEffect::OpenBrowser => {
                 if self.model().is_some_and(|m| m.server.state == ReviewState::Serving) {
@@ -1498,39 +1507,27 @@ impl ReviewView {
                 );
         }
 
-        // The pull request, under the summary it belongs to.
-        let pr = model.pr.as_ref().map(|pr| {
-            let mut link = task_panel::pr_link("review-pr", pr, selected(PanelRow::Pr), theme);
-            if pr.url.is_some() {
-                link = link.on_click(listen(PanelRow::Pr));
-            }
-            div()
-                .debug_selector(|| "review-pr-row".into())
-                .flex()
-                .flex_row()
-                .flex_none()
-                .items_center()
-                .gap(px(8.0))
-                .px(px(18.0))
-                .pb(px(8.0))
-                .min_w_0()
-                .child(
-                    div()
-                        .flex_none()
-                        .type_style(Type::Small)
-                        .text_color(theme.muted)
-                        .child("PR"),
-                )
-                .child(task_panel::pr_value(link, pr, theme))
-        });
-
-        // The worktree, with Open when it can be revealed (a local slot).
+        // Under the summary: the worktree, with Open when it can be revealed
+        // (a local slot); the branch, a click copying it; the pull request, a
+        // click opening it.
         let folder = (!model.worktree.is_empty()).then(|| {
             let open = (!model.is_remote()).then(|| {
                 task_panel::open_button("review-folder", theme).on_click(listen(PanelRow::Folder))
             });
-            task_panel::worktree_row("review-worktree", &model.worktree, open, selected(PanelRow::Folder), 0.0, theme)
+            task_panel::worktree_row("review-worktree", &model.worktree, open, selected(PanelRow::Folder), theme)
+                .into_any_element()
         });
+        let branch = model.branch.as_deref().map(|branch| {
+            task_panel::branch_row("review-branch", branch, selected(PanelRow::Branch), theme)
+                .on_click(listen(PanelRow::Branch))
+                .into_any_element()
+        });
+        let pr = model.pr.as_ref().map(|pr| {
+            let row = task_panel::pr_row("review-pr", pr, selected(PanelRow::Pr), theme);
+            if pr.url.is_some() { row.on_click(listen(PanelRow::Pr)) } else { row }.into_any_element()
+        });
+        let info: Vec<gpui::AnyElement> = folder.into_iter().chain(branch).chain(pr).collect();
+        let info = (!info.is_empty()).then(|| task_panel::info_rows(info));
 
         // The views: Reviewer, its diff and editor, the browser, the shell,
         // ⌘1…⌘N.
@@ -1665,8 +1662,7 @@ impl ReviewView {
         self.panel_root(theme, cx)
             .child(status)
             .child(summary)
-            .children(pr)
-            .children(folder)
+            .children(info)
             .child(views)
             .child(task_panel::section_header("Actions", theme))
             .child(actions)
@@ -2029,7 +2025,7 @@ pub(crate) mod tests {
         fn resolve(&self, _project: &str, _task: &str) -> Result<ReviewTarget, String> {
             match &*self.resolve_with.lock().unwrap() {
                 Some(answer) => answer.clone(),
-                None => Ok(ReviewTarget::Serving(info())),
+                None => Ok(ReviewTarget::Serving(Box::new(info()))),
             }
         }
         fn session_op(&self, _project: &str, task: &str, op: ReviewSessionOp) -> Result<(), String> {
@@ -2180,6 +2176,7 @@ pub(crate) mod tests {
             has_health_check: true,
             remote_machine: None,
             pr: None,
+            branch: Some("jlong/t-1".into()),
         }
     }
 
@@ -2265,7 +2262,7 @@ pub(crate) mod tests {
         let mut fresh = info();
         fresh.editor_name = "Zed".into();
         fresh.apps = shelbi_state::AppTools { editor: true, diff: true, ..Default::default() };
-        *h.ops.resolve_with.lock().unwrap() = Some(Ok(ReviewTarget::Serving(fresh)));
+        *h.ops.resolve_with.lock().unwrap() = Some(Ok(ReviewTarget::Serving(Box::new(fresh))));
         h.update(|v, cx| v.tools_changed(cx));
         let model = h.view.read_with(&h.cx, |v, _| v.model().cloned()).unwrap();
         assert_eq!(model.editor_name, "Zed");
@@ -2286,8 +2283,8 @@ pub(crate) mod tests {
         assert_eq!(model.server.health, HealthCheck::Passed);
 
         h.draw();
-        // State=Review: back and the status, the summary, the worktree with
-        // Open, the five views, Actions.
+        // State=Review (2787:33098): back and the status, the summary, the
+        // worktree with Open and the branch, the five views, Actions.
         for selector in [
             "review-panel",
             "review-back",
@@ -2297,6 +2294,7 @@ pub(crate) mod tests {
             "review-more",
             "review-worktree",
             "review-folder",
+            "review-branch",
             "review-switch-chat",
             "review-switch-diff",
             "review-switch-editor",
@@ -2464,7 +2462,7 @@ pub(crate) mod tests {
         h.update(|v, cx| v.show(builtin_info(), None, cx));
         h.click("review-switch-diff");
         assert!(diff_up(&h));
-        *h.ops.resolve_with.lock().unwrap() = Some(Ok(ReviewTarget::Serving(info())));
+        *h.ops.resolve_with.lock().unwrap() = Some(Ok(ReviewTarget::Serving(Box::new(info()))));
         h.update(|v, cx| v.tools_changed(cx));
         h.draw();
         assert!(!diff_up(&h), "the external tool now");
@@ -2735,18 +2733,57 @@ pub(crate) mod tests {
         };
         h.update(|v, cx| v.show(with_pr.clone(), Some(row(ReviewState::Serving)), cx));
         h.draw();
-        assert!(h.cx.debug_bounds("review-pr-row").is_some());
-        assert!(h.cx.debug_bounds("pr-state").is_some());
-        assert!(h.cx.debug_bounds("pr-ci").is_some());
+        // `PR #2137` and one dot: the state and CI are in the tooltip, not
+        // words in the row.
+        assert!(h.cx.debug_bounds("review-pr").is_some());
+        assert!(h.cx.debug_bounds("pr-ci-dot").is_some());
+        assert!(h.cx.debug_bounds("pr-state").is_none());
+        assert!(h.cx.debug_bounds("pr-ci").is_none());
 
-        // It sits under the summary, above the worktree.
-        let summary = h.cx.debug_bounds("review-title").unwrap();
-        let pr_row = h.cx.debug_bounds("review-pr-row").unwrap();
+        // Under the summary: the worktree, the branch, the PR, then the views.
+        let summary = h.cx.debug_bounds("review-description").unwrap();
         let worktree = h.cx.debug_bounds("review-worktree").unwrap();
-        assert!(summary.bottom() <= pr_row.top() && pr_row.bottom() <= worktree.top());
+        let branch = h.cx.debug_bounds("review-branch").unwrap();
+        let pr_row = h.cx.debug_bounds("review-pr").unwrap();
+        let chat = h.cx.debug_bounds("review-switch-chat").unwrap();
+        assert!(summary.bottom() <= worktree.top());
+        assert!(worktree.bottom() <= branch.top());
+        assert!(branch.bottom() <= pr_row.top());
+        assert!(pr_row.bottom() <= chat.top());
+        assert_eq!((worktree.left(), branch.left()), (pr_row.left(), pr_row.left()), "one column of rows");
+        // The frame's rows: 32pt each (the Open button doesn't grow its row),
+        // 4pt apart.
+        for (name, b) in [("worktree", worktree), ("branch", branch), ("pr", pr_row)] {
+            assert_eq!(b.size.height, px(32.0), "the {name} row");
+        }
+        assert_eq!(branch.top() - worktree.bottom(), px(4.0));
+        assert_eq!(pr_row.top() - branch.bottom(), px(4.0));
+        // The keyboard walks them in that order, More before them.
+        let rows = h.view.read_with(&h.cx, |v, _| v.panel().map(|p| p.rows().to_vec())).unwrap();
+        assert_eq!(
+            &rows[..6],
+            [
+                PanelRow::Back,
+                PanelRow::More,
+                PanelRow::Folder,
+                PanelRow::Branch,
+                PanelRow::Pr,
+                PanelRow::Switch(ReviewSwitch::Chat),
+            ]
+        );
 
         h.click("review-pr");
         assert_eq!(h.ops.opened.lock().unwrap().as_slice(), [url.to_string()]);
+        // So does Enter on it.
+        h.focus_panel();
+        for _ in 0..12 {
+            if h.view.read_with(&h.cx, |v, _| v.panel().and_then(|p| p.selected_row())) == Some(PanelRow::Pr) {
+                break;
+            }
+            h.key("k");
+        }
+        h.key("enter");
+        assert_eq!(h.ops.opened.lock().unwrap().len(), 2);
 
         // The row keeps up with the board while the panel stays open.
         let fresh = ReviewRow {
@@ -2760,10 +2797,28 @@ pub(crate) mod tests {
         let pr = h.view.read_with(&h.cx, |v, _| v.model().and_then(|m| m.pr.clone()));
         assert_eq!(pr.and_then(|p| p.state), Some(PrState::Merged));
 
-        // A task with no PR has no row.
+        // A task with no PR has no row, and one with no branch no branch row.
+        let bare = ReviewInfo { branch: None, ..info() };
+        let no_branch = ReviewRow { branch: String::new(), ..row(ReviewState::Serving) };
+        h.update(|v, cx| v.show(bare, Some(no_branch), cx));
+        h.draw();
+        assert!(h.cx.debug_bounds("review-pr").is_none());
+        assert!(h.cx.debug_bounds("review-branch").is_none());
+        assert!(h.cx.debug_bounds("review-worktree").is_some());
+    }
+
+    #[gpui::test]
+    fn the_branch_row_copies_the_branch(cx: &mut TestAppContext) {
+        let mut h = open(cx);
         h.update(|v, cx| v.show(info(), Some(row(ReviewState::Serving)), cx));
         h.draw();
-        assert!(h.cx.debug_bounds("review-pr-row").is_none());
+        h.click("review-branch");
+        assert_eq!(h.cx.read_from_clipboard().and_then(|c| c.text()).as_deref(), Some("jlong/t-1"));
+        assert_eq!(
+            h.events(),
+            vec![ReviewEvent::Toast(Some(shelbi_app::task_rows::copied_branch("jlong/t-1")))]
+        );
+        assert!(h.ops().is_empty(), "copying asks the daemon for nothing");
     }
 
     #[gpui::test]

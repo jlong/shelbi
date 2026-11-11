@@ -435,6 +435,7 @@ heroicons! {
         KEYBOARD_KEY = "keyboard-key";
         CHEVRON_DOWN_SMALL = "chevron-down-small";
         PULL_REQUEST = "pull-request";
+        GIT_BRANCH = "git-branch";
     }
     @small {
         FUNNEL_SMALL = "funnel";
@@ -521,9 +522,12 @@ pub mod glyphs {
     /// chat-bubble-oval-left-ellipsis on a 40pt grid with a 1.25pt stroke,
     /// as the frame draws it.
     pub const CHAT_BUBBLE: Glyph = Glyph { name: "chat-bubble", size: 40 };
+    /// The task panels' PR row's CI dot (`circle-solid`, 2787:32986): a
+    /// solid disc, larger than [`DOT`], in the CI's color.
+    pub const CIRCLE_SOLID: Glyph = Glyph { name: "circle-solid", size: 12 };
 
     #[cfg(test)]
-    pub const ALL: &[Glyph] = &[PLAY, CHECK, DOT, QUESTION, CHEVRON_DOWN, DISCARD, CHAT_BUBBLE];
+    pub const ALL: &[Glyph] = &[PLAY, CHECK, DOT, QUESTION, CHEVRON_DOWN, DISCARD, CHAT_BUBBLE, CIRCLE_SOLID];
 }
 
 /// Every glyph drawing, by asset path.
@@ -535,6 +539,7 @@ const GLYPHS: &[(&str, &[u8])] = &[
     ("icons/glyphs/chevron-down.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/chevron-down.svg"))),
     ("icons/glyphs/discard.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/discard.svg"))),
     ("icons/glyphs/chat-bubble.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/chat-bubble.svg"))),
+    ("icons/glyphs/circle-solid.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/circle-solid.svg"))),
 ];
 
 /// The Heroicons license, for Acknowledgements (`crate::licenses`): the

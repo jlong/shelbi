@@ -134,6 +134,7 @@ impl WorkspaceOps for Ops {
                 worktree: "/Users/me/src/demo/.shelbi/wt/alpha".into(),
                 editor_name: "Vim".into(),
                 apps: shelbi_state::AppTools { builtin_diff: true, ..Default::default() },
+                pr: None,
             }
         })
     }

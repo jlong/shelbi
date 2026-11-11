@@ -300,6 +300,8 @@ pub struct WorkspaceDetailsInfo {
     pub editor_name: String,
     /// Which of Edit and View Diff open an app instead of a pane.
     pub apps: shelbi_state::AppTools,
+    /// The task's pull request, when it has one (the panel's PR row).
+    pub pr: Option<IssuePr>,
 }
 
 /// The header above a workspace's agent: which task it is working (id and

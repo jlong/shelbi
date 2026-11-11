@@ -565,7 +565,7 @@ interface. Don’t stop until every view matches the TUI and the reviews pass.\n
 
 impl ReviewOps for Ops {
     fn resolve(&self, _project: &str, _task: &str) -> Result<ReviewTarget, String> {
-        Ok(ReviewTarget::Serving(review_info()))
+        Ok(ReviewTarget::Serving(Box::new(review_info())))
     }
     fn session_op(&self, _project: &str, _task: &str, _op: ReviewSessionOp) -> Result<(), String> {
         Ok(())
@@ -593,6 +593,7 @@ impl WorkspaceOps for Ops {
                 worktree: worktree(workspace),
                 editor_name: "Vi".into(),
                 apps: Default::default(),
+                pr: None,
             }
         } else {
             WorkspaceDetailsInfo {
@@ -624,7 +625,13 @@ fn review_info() -> ReviewInfo {
         review_url: Some("http://localhost:4101".into()),
         has_health_check: true,
         remote_machine: None,
-        pr: None,
+        // State=Review's PR row: `PR #1234` and a green dot.
+        pr: Some(shelbi_core::IssuePr {
+            state: Some(shelbi_core::PrState::Open),
+            ci: Some(shelbi_core::PrCi::Passing),
+            ..shelbi_core::IssuePr::new(1234, Some("https://github.com/acme/shelbi/pull/1234".into()))
+        }),
+        branch: Some("jlong/desktop-app".into()),
     }
 }
 

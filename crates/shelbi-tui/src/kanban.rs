@@ -3496,14 +3496,18 @@ pub(crate) fn pr_status_spans(pr: &IssuePr) -> Vec<Span<'static>> {
         spans.push(Span::styled(format!("  {}", state.label()), Style::default().fg(color)));
     }
     if let Some(ci) = pr.ci {
-        let color = match ci {
-            PrCi::Pending => palette().ansi_yellow,
-            PrCi::Passing => palette().ansi_green,
-            PrCi::Failing => palette().ansi_red,
-        };
-        spans.push(Span::styled(format!("  ● {}", ci.label()), Style::default().fg(color)));
+        spans.push(Span::styled(format!("  ● {}", ci.label()), Style::default().fg(pr_ci_color(ci))));
     }
     spans
+}
+
+/// A PR's CI as a color: pending yellow, passing green, failing red.
+pub(crate) fn pr_ci_color(ci: PrCi) -> Color {
+    match ci {
+        PrCi::Pending => palette().ansi_yellow,
+        PrCi::Passing => palette().ansi_green,
+        PrCi::Failing => palette().ansi_red,
+    }
 }
 
 fn meta_label(label: &str) -> Span<'static> {

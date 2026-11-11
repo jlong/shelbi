@@ -57,8 +57,8 @@ impl WsSwitch {
 }
 
 /// One selectable panel row, top to bottom. The status, the task's title and
-/// description preview, and the branch and machine are not rows; the `More`
-/// link and the folder are.
+/// description preview, and the machine are not rows; the `More` link and the
+/// info rows under it (the folder, the branch, the PR) are.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsRow {
     /// The back button at the top.
@@ -67,6 +67,10 @@ pub enum WsRow {
     More,
     /// The worktree folder: reveal it in the file manager.
     Folder,
+    /// The task's branch: copy its name. Only with a branch.
+    Branch,
+    /// The task's pull request: open it in the browser. Only with a link.
+    Pr,
     Switch(WsSwitch),
     /// The user shell beside the agent, on or off (desktop).
     Shell,
@@ -82,6 +86,10 @@ pub enum WsEffect {
     /// End the diff and editor sessions, then go back (the TUI's `q`).
     Close,
     RevealFolder,
+    /// Copy the task's branch name to the clipboard.
+    CopyBranch,
+    /// Open the task's pull request in the browser.
+    OpenPr,
     ShowAgent,
     ShowDiff,
     ShowEditor,
@@ -100,6 +108,10 @@ pub struct WsPanelShape {
     pub has_body: bool,
     /// The worktree can be revealed (a local workspace).
     pub folder: bool,
+    /// The task has a branch: the branch row is offered.
+    pub branch: bool,
+    /// The task's PR has a link: the PR row is offered.
+    pub pr: bool,
     /// The view switch's entries, in order (none for an idle workspace).
     pub switches: Vec<WsSwitch>,
     /// The user-shell toggle is offered.
@@ -124,10 +136,20 @@ impl WsPanelShape {
         WsPanelShape {
             has_body: has_task && has_body,
             folder: true,
+            branch: false,
+            pr: false,
             switches,
             shell: has_task && shell,
             apps: AppTools::default(),
         }
+    }
+
+    /// The shape with the branch row (when `branch`) and the PR row (when
+    /// `pr`: a PR with a link) under the folder.
+    pub fn with_branch_and_pr(mut self, branch: bool, pr: bool) -> Self {
+        self.branch = branch;
+        self.pr = pr;
+        self
     }
 
     /// The shape with Edit and View Diff opening `apps`.
@@ -137,7 +159,8 @@ impl WsPanelShape {
     }
 }
 
-/// The panel's rows: Back, `More`, the folder, the view switch, the shell.
+/// The panel's rows: Back, `More`, the folder, the branch, the PR, the view
+/// switch, the shell.
 pub fn panel_rows(shape: &WsPanelShape) -> Vec<WsRow> {
     let mut rows = vec![WsRow::Back];
     if shape.has_body {
@@ -145,6 +168,12 @@ pub fn panel_rows(shape: &WsPanelShape) -> Vec<WsRow> {
     }
     if shape.folder {
         rows.push(WsRow::Folder);
+    }
+    if shape.branch {
+        rows.push(WsRow::Branch);
+    }
+    if shape.pr {
+        rows.push(WsRow::Pr);
     }
     rows.extend(shape.switches.iter().map(|s| WsRow::Switch(*s)));
     if shape.shell {
@@ -161,6 +190,8 @@ pub fn activate_row(row: WsRow, has_body: bool, apps: AppTools) -> (WsEffect, Op
         WsRow::Back => (WsEffect::Back, None),
         WsRow::More => (description_effect(has_body), None),
         WsRow::Folder => (WsEffect::RevealFolder, None),
+        WsRow::Branch => (WsEffect::CopyBranch, None),
+        WsRow::Pr => (WsEffect::OpenPr, None),
         WsRow::Switch(WsSwitch::Agent) => (WsEffect::ShowAgent, Some(WsSwitch::Agent)),
         WsRow::Switch(WsSwitch::Diff) if apps.diff => (WsEffect::OpenApp(ReviewRole::Diff), None),
         WsRow::Switch(WsSwitch::Diff) => (WsEffect::ShowDiff, Some(WsSwitch::Diff)),
@@ -333,6 +364,40 @@ mod tests {
         let panel = WorkspacePanelState::new(&shape);
         assert_eq!(panel.selected_row(), Some(WsRow::Switch(WsSwitch::Agent)), "the agent is selected first");
         assert_eq!(panel.active(), WsSwitch::Agent);
+    }
+
+    #[test]
+    fn the_branch_and_pr_rows_sit_under_the_folder_in_reading_order() {
+        let shape = WsPanelShape::for_workspace(true, true, false).with_branch_and_pr(true, true);
+        assert_eq!(
+            panel_rows(&shape),
+            [
+                WsRow::Back,
+                WsRow::More,
+                WsRow::Folder,
+                WsRow::Branch,
+                WsRow::Pr,
+                WsRow::Switch(WsSwitch::Agent),
+                WsRow::Switch(WsSwitch::Diff),
+                WsRow::Switch(WsSwitch::Editor),
+            ]
+        );
+        let mut panel = WorkspacePanelState::new(&shape);
+        assert_eq!(panel.click(WsRow::Branch), WsEffect::CopyBranch);
+        assert_eq!(panel.click(WsRow::Pr), WsEffect::OpenPr);
+        assert_eq!(panel.active(), WsSwitch::Agent, "neither is a view");
+        // Up from the agent: the PR, the branch, the folder, More.
+        panel.click(WsRow::Switch(WsSwitch::Agent));
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            panel.nav(-1);
+            seen.push(panel.selected_row().unwrap());
+        }
+        assert_eq!(seen, [WsRow::Pr, WsRow::Branch, WsRow::Folder, WsRow::More]);
+        // Without them, the rows close up.
+        let bare = WsPanelShape::for_workspace(true, true, false).with_branch_and_pr(false, false);
+        assert!(!panel_rows(&bare).contains(&WsRow::Branch));
+        assert!(!panel_rows(&bare).contains(&WsRow::Pr));
     }
 
     #[test]

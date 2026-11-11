@@ -12,8 +12,10 @@
 //!   task description (markdown stripped, wrapped, at most three lines, ending
 //!   in `...` when clipped), followed by a cyan **`More`** link / `m` key that
 //!   opens the full task-description popover — see [`PanelEffect::ShowDescription`],
-//! - the review worktree's folder name (left-truncated to fit; click to reveal
-//!   it in the OS file manager),
+//! - the info rows, one group: the review worktree's folder name
+//!   (left-truncated to fit; click to reveal it in the OS file manager), the
+//!   task's branch (`⎇`, click to copy it) and its pull request (`⇵ PR #1234 ●`,
+//!   the dot in the CI's color; click to open it),
 //! - a **view-switcher** action group — *Reviewer* (default) /
 //!   *View Diff* / *Edit in <editor>* / *Open Browser* (the last only when the
 //!   workflow declares a review URL), the active content view highlighted, and
@@ -37,9 +39,9 @@ use ratatui::{
 };
 
 use crate::panel::{
-    advance_blank, display_width, in_rect, render_back_button, render_folder, render_nav_block,
-    render_status_line, render_task_info, reserve_status_area, NavEntry, BACK_BLOCK_H,
-    BACK_BTN_WIDTH, PAD,
+    advance_blank, display_width, in_rect, render_back_button, render_info_rows, render_nav_block,
+    render_status_line, render_task_info, reserve_status_area, InfoRow, InfoRowsView, NavEntry,
+    BACK_BLOCK_H, BACK_BTN_WIDTH, PAD,
 };
 use crate::theme::palette;
 
@@ -85,8 +87,10 @@ pub struct ReviewPanel {
     /// desktop's Review view shows the same (`render_server`).
     pub server: Option<(shelbi_app::view::ReviewState, Option<String>)>,
     /// The task's pull request, live from its sidebar row. The desktop's
-    /// Review view shows the same (`pr_row`).
+    /// Review view shows the same (`task_panel::pr_row`).
     pub pr: Option<shelbi_core::IssuePr>,
+    /// The task's branch (the branch row; none without one).
+    pub branch: Option<String>,
 }
 
 impl ReviewPanel {
@@ -114,6 +118,7 @@ impl ReviewPanel {
             more_hit: None,
             server: None,
             pr: None,
+            branch: None,
         };
         // Focus the Chat switch initially — it's the default middle-pane view.
         panel.selected = panel
@@ -134,7 +139,12 @@ impl ReviewPanel {
         }
         // `More` sits right under the back button, in reading order with the
         // task-info block it belongs to, and only when there's a body to open.
-        shelbi_app::review::panel_rows(!self.description.trim().is_empty(), self.pr_url().is_some(), true, &switches)
+        let info = shelbi_app::review::InfoRows {
+            folder: true,
+            branch: self.branch.is_some(),
+            pr: self.pr_url().is_some(),
+        };
+        shelbi_app::review::panel_rows(!self.description.trim().is_empty(), info, &switches)
     }
 
     /// Where the pull request opens, when the panel has one to open.
@@ -145,8 +155,20 @@ impl ReviewPanel {
     /// Show `pr`. Its row can come or go while the panel is open, so the
     /// selection stays on the row it was on.
     pub fn set_pr(&mut self, pr: Option<shelbi_core::IssuePr>) {
+        self.keeping_selection(|p| p.pr = pr);
+    }
+
+    /// Show `branch` (blank is none). Like the PR row, the branch row can
+    /// come or go while the panel is open.
+    pub fn set_branch(&mut self, branch: Option<&str>) {
+        let branch = shelbi_app::task_rows::branch_label(branch).map(str::to_string);
+        self.keeping_selection(|p| p.branch = branch);
+    }
+
+    /// Apply `change`, keeping the selection on the row it was on.
+    fn keeping_selection(&mut self, change: impl FnOnce(&mut Self)) {
         let current = self.rows().get(self.selected).copied();
-        self.pr = pr;
+        change(self);
         let rows = self.rows();
         self.selected = current
             .and_then(|row| rows.iter().position(|r| *r == row))
@@ -327,68 +349,46 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
         y += used;
     }
 
-    // 2b. The pull request, under the summary it belongs to.
-    if let Some(pr) = app.pr.clone() {
-        let pr_idx = app.rows().iter().position(|r| matches!(r, PanelRow::Pr));
-        if y < bottom {
-            y = advance_blank(y, bottom);
-        }
-        if y < bottom {
-            let line = Rect {
-                x: area.x,
-                y,
-                width: area.width,
-                height: 1,
-            };
-            render_pr_line(f, &pr, pr_idx.is_some_and(|i| app.selected == i), line);
-            if let Some(idx) = pr_idx {
-                push_hit(
-                    app,
-                    Rect {
-                        x: area.x + PAD,
-                        y,
-                        width: area.width.saturating_sub(PAD),
-                        height: 1,
-                    },
-                    idx,
-                );
-            }
-            y += 1;
-        }
-    }
-
     // blank
     y = advance_blank(y, bottom);
 
-    // 3. Worktree folder row.
-    let folder_idx = app
-        .rows()
-        .iter()
-        .position(|r| matches!(r, PanelRow::Folder))
-        .unwrap_or(0);
+    // 3. The info rows: the worktree folder, the branch, the pull request.
     if y < bottom {
-        render_folder(
+        let rows = app.rows();
+        let selected = rows.get(app.selected).and_then(|r| match r {
+            PanelRow::Folder => Some(InfoRow::Folder),
+            PanelRow::Branch => Some(InfoRow::Branch),
+            PanelRow::Pr => Some(InfoRow::Pr),
+            _ => None,
+        });
+        let pr = app.pr.clone();
+        let (used, hits) = render_info_rows(
             f,
             Rect {
                 x: area.x,
                 y,
                 width: area.width,
-                height: 1,
+                height: bottom - y,
             },
-            &app.worktree,
-            app.selected == folder_idx,
-        );
-        push_hit(
-            app,
-            Rect {
-                x: area.x + PAD,
-                y,
-                width: area.width.saturating_sub(PAD),
-                height: 1,
+            &InfoRowsView {
+                worktree: &app.worktree,
+                branch: app.branch.as_deref(),
+                pr: pr.as_ref(),
             },
-            folder_idx,
+            selected,
         );
-        y += 1;
+        for (info, rect) in hits {
+            let row = match info {
+                InfoRow::Folder => PanelRow::Folder,
+                InfoRow::Branch => PanelRow::Branch,
+                InfoRow::Pr => PanelRow::Pr,
+            };
+            // A PR without a link is drawn but isn't a row.
+            if let Some(idx) = rows.iter().position(|r| *r == row) {
+                push_hit(app, rect, idx);
+            }
+        }
+        y += used;
     }
 
     // 3b. The slot's server: its sub-state and location, live.
@@ -459,29 +459,6 @@ pub fn render_full(f: &mut Frame, app: &mut ReviewPanel, area: Rect) {
             },
         );
     }
-}
-
-/// The pull-request line: `PR #2137 ↗  open · ● checks passing`.
-fn render_pr_line(f: &mut Frame, pr: &shelbi_core::IssuePr, selected: bool, area: Rect) {
-    let number = if selected {
-        Style::default().fg(palette().ansi_white).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(palette().cyan)
-    };
-    let mut spans = vec![
-        Span::styled("PR ", Style::default().fg(palette().gray)),
-        Span::styled(crate::kanban::pr_number_text(pr), number),
-    ];
-    spans.extend(crate::kanban::pr_status_spans(pr));
-    f.render_widget(
-        Paragraph::new(Line::from(spans)),
-        Rect {
-            x: area.x + PAD,
-            y: area.y,
-            width: area.width.saturating_sub(PAD),
-            height: 1,
-        },
-    );
 }
 
 /// The server line: the sub-state's glyph and name (`serving`, `loading`,

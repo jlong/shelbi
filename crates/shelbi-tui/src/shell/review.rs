@@ -92,6 +92,8 @@ pub enum ReviewAction {
     RevealFolder,
     /// Open the task's pull request in the system browser.
     OpenPr,
+    /// Copy the task's branch name to the clipboard.
+    CopyBranch,
     /// Open the full task-description popover over the main area (the `More`
     /// link / `m` key). The shell opens the overlay; the content session keeps
     /// running underneath.
@@ -168,6 +170,7 @@ impl ReviewInterface {
         let description = task.as_ref().map(|t| t.body.clone()).unwrap_or_default();
         let mut panel = ReviewPanel::new(worktree, editor_name, has_review_url, title, description);
         panel.pr = task.as_ref().and_then(|t| shelbi_app::board::task_pr(&t.task));
+        panel.set_branch(task.as_ref().and_then(|t| t.task.branch.as_deref()));
         let mut content = SessionManager::new(project, connector).with_relauncher(Arc::new(
             shelbi_app::session::ReviewRelauncher {
                 project: project.to_string(),
@@ -506,10 +509,15 @@ impl ReviewInterface {
         let pr = row
             .and_then(|r| r.pr.clone())
             .or_else(|| self.task.as_ref().and_then(|t| shelbi_app::board::task_pr(&t.task)));
-        if self.panel.server == server && self.panel.pr == pr {
+        // The row's branch, else the task's (as the desktop's model reads it).
+        let branch = shelbi_app::task_rows::branch_label(row.map(|r| r.branch.as_str()))
+            .or_else(|| self.task.as_ref().and_then(|t| shelbi_app::task_rows::branch_label(t.task.branch.as_deref())))
+            .map(str::to_string);
+        if self.panel.server == server && self.panel.pr == pr && self.panel.branch == branch {
             return false;
         }
         self.panel.server = server;
+        self.panel.set_branch(branch.as_deref());
         // The description popover shows the same PR.
         if let Some(task) = self.task.as_mut() {
             task.task.pr = pr.clone();
@@ -521,6 +529,11 @@ impl ReviewInterface {
     /// Where the panel's pull request opens, when it has one.
     pub fn pr_url(&self) -> Option<&str> {
         self.panel.pr_url()
+    }
+
+    /// The task's branch, as the panel's branch row shows it.
+    pub fn branch(&self) -> Option<&str> {
+        self.panel.branch.as_deref()
     }
 
     /// Edit and View Diff open these in their apps (`editor:` /
@@ -999,6 +1012,7 @@ fn map_effect(effect: PanelEffect) -> ReviewAction {
         PanelEffect::OpenApp(role) => ReviewAction::OpenApp(role),
         PanelEffect::OpenBrowser => ReviewAction::OpenBrowser,
         PanelEffect::OpenPr => ReviewAction::OpenPr,
+        PanelEffect::CopyBranch => ReviewAction::CopyBranch,
         PanelEffect::RevealFolder => ReviewAction::RevealFolder,
         PanelEffect::ShowDescription => ReviewAction::ShowDescription,
         PanelEffect::Approve => ReviewAction::Approve,
@@ -1428,8 +1442,18 @@ mod tests {
         let lines: Vec<String> = (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
             .collect();
-        let y = lines.iter().position(|l| l.contains("PR #2137 ↗")).expect("the PR line is drawn");
-        assert!(lines[y].contains("open") && lines[y].contains("● checks failing"), "{}", lines[y]);
+        // `⇵ PR #2137 ●`: one dot in the CI's color, no state or CI words.
+        let y = lines.iter().position(|l| l.contains("⇵  PR #2137 ●")).expect("the PR line is drawn");
+        assert!(!lines[y].contains("open") && !lines[y].contains("checks") && !lines[y].contains('↗'), "{}", lines[y]);
+        let dot = lines[y].find('●').map(|i| lines[y][..i].chars().count() as u16).unwrap();
+        assert_eq!(buf[(dot, y as u16)].fg, crate::kanban::pr_ci_color(PrCi::Failing), "a failing CI is red");
+        // Stacked right under the worktree and the branch, one group.
+        let folder = lines.iter().position(|l| l.contains("📁")).expect("the folder row");
+        let branch = lines.iter().position(|l| l.contains("⎇ ")).expect("the branch row");
+        assert_eq!((branch, y), (folder + 1, folder + 2), "{lines:#?}");
+
+        // The branch row copies the branch.
+        assert_eq!(map_effect(it.panel.click(6, branch as u16)), ReviewAction::CopyBranch);
 
         // A click on it, and Enter once the keys reach it, both open it.
         assert_eq!(map_effect(it.panel.click(6, y as u16)), ReviewAction::OpenPr);

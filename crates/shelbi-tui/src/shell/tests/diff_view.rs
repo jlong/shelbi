@@ -62,6 +62,7 @@ fn with_workspace(apps: AppTools) -> ShellState {
         editor_name: "Vim".into(),
         apps,
         task: None,
+        branch: None,
     });
     st.workspace.as_mut().unwrap().set_diff_opener(fake_opener());
     st

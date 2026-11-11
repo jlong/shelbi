@@ -1004,6 +1004,8 @@ struct WorkspaceOpenParams {
     apps: shelbi_state::AppTools,
     /// The in-progress task on the workspace, when resolvable.
     task: Option<Box<shelbi_state::IssueFile>>,
+    /// The branch: the task's, else the worktree's.
+    branch: Option<String>,
 }
 
 /// A message from a workspace-open background job (all run off the UI thread).
@@ -1613,6 +1615,10 @@ struct ShellState {
     /// order, instead of launching the browser.
     #[cfg(test)]
     opened_urls: Vec<String>,
+    /// Test seam: what the branch rows copied, in order, instead of writing
+    /// the clipboard.
+    #[cfg(test)]
+    copied: Vec<String>,
     /// The remote sessions opened, in a test (never opened for real).
     #[cfg(test)]
     opened_remotes: Vec<shelbi_app::launch::RemoteSession>,
@@ -1890,6 +1896,8 @@ impl ShellState {
             #[cfg(test)]
             opened_urls: Vec::new(),
             #[cfg(test)]
+            copied: Vec::new(),
+            #[cfg(test)]
             opened_remotes: Vec::new(),
             create_job: None,
             feedback_service,
@@ -1950,6 +1958,16 @@ impl ShellState {
             changed = true;
         }
         self.toast.expire(now) || changed
+    }
+
+    /// The branch row: copy the branch and say so with a toast.
+    fn copy_branch(&mut self, branch: &str) {
+        #[cfg(test)]
+        self.copied.push(branch.to_string());
+        #[cfg(not(test))]
+        copy_to_clipboard(branch);
+        self.toast.show(shelbi_app::task_rows::copied_branch(branch), Instant::now());
+        self.dirty = true;
     }
 
     /// Edit in <editor> opens an app: say so with a `Launching <editor>…`
@@ -4832,6 +4850,12 @@ impl ShellState {
                     self.open_url(url);
                 }
             }
+            ReviewAction::CopyBranch => {
+                let branch = self.review.as_ref().and_then(|r| r.branch().map(str::to_string));
+                if let Some(branch) = branch {
+                    self.copy_branch(&branch);
+                }
+            }
             ReviewAction::OpenBrowser | ReviewAction::RevealFolder => {
                 // Openers run inline (spawn+detach); failures land on the status.
                 if let Some(r) = self.review.as_mut() {
@@ -5252,6 +5276,7 @@ impl ShellState {
                     editor_name: info.editor_name,
                     apps: info.apps,
                     task: info.task,
+                    branch: info.branch,
                 })
                 .map_err(|e| e.to_string());
                 let _ = tx.send(WorkspaceJobMsg::Opened(res));
@@ -5336,7 +5361,8 @@ impl ShellState {
         )
         .with_apps(p.apps)
         .with_diff_setup(setup)
-        .with_remote_address(p.remote_address));
+        .with_remote_address(p.remote_address)
+        .with_branch(p.branch));
         if std::mem::take(&mut self.content_on_open) {
             if let Some(w) = self.workspace.as_mut() {
                 w.want_content();
@@ -5406,6 +5432,16 @@ impl ShellState {
                         Err(e) => format!("couldn't open the app: {e}"),
                     }
                 });
+            }
+            WorkspaceAction::CopyBranch => {
+                if let Some(branch) = ws.branch().map(str::to_string) {
+                    self.copy_branch(&branch);
+                }
+            }
+            WorkspaceAction::OpenPr => {
+                if let Some(url) = ws.pr_url().map(str::to_string) {
+                    self.open_url(url);
+                }
             }
             WorkspaceAction::RevealFolder => {
                 // A remote worktree has no local folder: copy its `host:path`.
@@ -8603,6 +8639,7 @@ mod tests {
             editor_name: "Vim".into(),
             apps: Default::default(),
             task: None,
+            branch: None,
         }));
         assert!(st.status.is_none(), "no error status: {:?}", st.status);
         assert!(matches!(&st.main_view, MainView::Workspace(w) if w == "delta"));
@@ -13278,6 +13315,62 @@ workspaces:
         tx.send(Ok(sample_issue("tui-about", "About Shelbi"))).unwrap();
         assert!(st.poll_changelog());
         assert!(st.overlay.is_none());
+    }
+
+    #[test]
+    fn the_panels_branch_rows_copy_and_the_workspace_pr_row_opens() {
+        let mut st = test_state();
+        let url = "https://github.com/o/r/pull/1234";
+        let mut task = sample_issue("t-1", "Cold-start cache");
+        task.task.branch = Some("jlong/t-1".into());
+        task.task.pr = Some(shelbi_core::IssuePr::new(1234, Some(url.into())));
+        st.build_workspace_interface(WorkspaceOpenParams {
+            workspace: "alpha".into(),
+            remote_address: None,
+            worktree: "/wt/alpha".into(),
+            editor_name: "Vim".into(),
+            apps: Default::default(),
+            task: Some(Box::new(task.clone())),
+            branch: Some("detached-worktree".into()),
+        });
+        // The task's branch wins over the worktree's.
+        st.apply_workspace_action(WorkspaceAction::CopyBranch);
+        assert_eq!(st.copied, ["jlong/t-1"]);
+        assert_eq!(
+            st.toast.current(Instant::now()).map(|t| t.text.clone()).as_deref(),
+            Some("Copied jlong/t-1")
+        );
+        st.apply_workspace_action(WorkspaceAction::OpenPr);
+        assert_eq!(st.opened_urls, [url]);
+
+        // A task naming no branch falls back to the worktree's.
+        let mut no_branch = task.clone();
+        no_branch.task.branch = None;
+        st.build_workspace_interface(WorkspaceOpenParams {
+            workspace: "alpha".into(),
+            remote_address: None,
+            worktree: "/wt/alpha".into(),
+            editor_name: "Vim".into(),
+            apps: Default::default(),
+            task: Some(Box::new(no_branch)),
+            branch: Some("worktree-branch".into()),
+        });
+        st.apply_workspace_action(WorkspaceAction::CopyBranch);
+        assert_eq!(st.copied, ["jlong/t-1", "worktree-branch"]);
+
+        // The Review panel's branch row copies the same way.
+        st.review = Some(ReviewInterface::new(
+            "proj",
+            st.connector.clone(),
+            "t-1",
+            "review-1",
+            "/wt",
+            "Vim",
+            true,
+            Some(task),
+        ));
+        st.apply_review_action(ReviewAction::CopyBranch);
+        assert_eq!(st.copied, ["jlong/t-1", "worktree-branch", "jlong/t-1"]);
     }
 
     #[test]
