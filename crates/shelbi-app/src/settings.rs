@@ -73,14 +73,14 @@ pub enum SettingsPage {
     Keybindings,
     /// The terminals' font, size, and Option key.
     Terminal,
+    /// The project's orchestrator: how events reach it.
+    Orchestrator,
     /// The project's workspace pool and the machines that host it.
     Workspaces,
     /// The project's workflows and status catalog.
     Workflows,
     /// The project's agents and their shared instructions.
     Agents,
-    /// The project's orchestrator: how events reach it.
-    Orchestrator,
 }
 
 /// Whose settings a page edits.
@@ -110,7 +110,8 @@ impl SettingsPage {
     /// its number whichever pages a client offers: the frames number
     /// Workflows 4 and Agents 6. They give Workspaces Terminal's 3 too; it
     /// takes the free 5 instead, so each number opens one page (the sidebar
-    /// lists it before Workflows all the same).
+    /// lists it before Workflows all the same). Orchestrator keeps 7 though
+    /// the sidebar lists it first in the project section.
     pub fn shortcut(self) -> u8 {
         match self {
             SettingsPage::General => 1,
@@ -185,10 +186,10 @@ pub const SECTIONS: &[Section] = &[
     Section {
         header: Header::Project,
         pages: &[
+            SettingsPage::Orchestrator,
             SettingsPage::Workspaces,
             SettingsPage::Workflows,
             SettingsPage::Agents,
-            SettingsPage::Orchestrator,
         ],
     },
 ];
@@ -574,13 +575,13 @@ mod tests {
                 SettingsPage::General,
                 SettingsPage::Keybindings,
                 SettingsPage::Terminal,
+                SettingsPage::Orchestrator,
                 SettingsPage::Workspaces,
                 SettingsPage::Workflows,
-                SettingsPage::Agents,
-                SettingsPage::Orchestrator
+                SettingsPage::Agents
             ]
         );
-        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 5, 4, 6, 7]);
+        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 7, 5, 4, 6]);
         assert_eq!(SettingsPage::for_shortcut(3), Some(SettingsPage::Terminal));
         assert_eq!(SettingsPage::for_shortcut(4), Some(SettingsPage::Workflows));
         assert_eq!(SettingsPage::for_shortcut(5), Some(SettingsPage::Workspaces));
@@ -656,16 +657,25 @@ mod tests {
         }
         assert_eq!(
             nav.selected(),
-            SettingsPage::Orchestrator,
+            SettingsPage::Agents,
             "crosses into the project section and stops at the bottom"
         );
         assert_eq!(nav.page(), SettingsPage::General, "moving doesn't open");
         assert!(nav.activate());
         assert_eq!(
             (nav.page(), nav.selected()),
-            (SettingsPage::Orchestrator, SettingsPage::Orchestrator)
+            (SettingsPage::Agents, SettingsPage::Agents)
         );
         assert!(!nav.activate(), "already shown");
+        // Orchestrator leads the project section: one up from Workspaces,
+        // one down from Terminal.
+        nav.select(SettingsPage::Workspaces);
+        nav.step(false);
+        assert_eq!(nav.selected(), SettingsPage::Orchestrator);
+        nav.step(false);
+        assert_eq!(nav.selected(), SettingsPage::Terminal);
+        nav.step(true);
+        assert_eq!(nav.selected(), SettingsPage::Orchestrator);
     }
 
     #[test]

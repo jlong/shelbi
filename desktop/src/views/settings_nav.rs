@@ -292,8 +292,9 @@ mod tests {
         let icons: Vec<String> = all.iter().map(|p| format!("{:?}", p.icon())).collect();
         let distinct: std::collections::HashSet<_> = icons.iter().collect();
         assert_eq!(distinct.len(), all.len());
-        // This client offers every page, numbered as the frames number them.
+        // This client offers every page, numbered as the frames number them
+        // (Orchestrator keeps 7 though it leads the project section).
         assert_eq!(SettingsNav::default().available(), shelbi_app::settings::PageSet::ALL);
-        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 5, 4, 6, 7]);
+        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 7, 5, 4, 6]);
     }
 }

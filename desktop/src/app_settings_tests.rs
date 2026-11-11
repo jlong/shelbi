@@ -228,21 +228,22 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
     s.key("down");
     assert_eq!(
         s.selected_row(),
-        Some(SettingsPage::Workspaces),
-        "it crosses into the project section"
+        Some(SettingsPage::Orchestrator),
+        "it crosses into the project section, Orchestrator first"
     );
     s.key("down");
+    assert_eq!(s.selected_row(), Some(SettingsPage::Workspaces));
     s.key("down");
     s.key("down");
     s.key("down");
     s.key("down");
     assert_eq!(
         s.selected_row(),
-        Some(SettingsPage::Orchestrator),
+        Some(SettingsPage::Agents),
         "it stops at the last row"
     );
     s.key("enter");
-    assert_eq!(s.page(), Some(SettingsPage::Orchestrator));
+    assert_eq!(s.page(), Some(SettingsPage::Agents));
     s.key("up");
     s.key("up");
     s.key("up");
