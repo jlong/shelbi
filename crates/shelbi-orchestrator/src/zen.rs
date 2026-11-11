@@ -3246,7 +3246,6 @@ mod pr_create_tests {
     use super::*;
     use std::collections::BTreeMap;
     use std::ffi::OsString;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -3899,8 +3898,7 @@ esac
             origin_repository_url = q("https://github.com/example/repo"),
         );
         let gh = bin.join("gh");
-        std::fs::write(&gh, script).unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&gh, script);
         std::fs::write(
             stub_home.join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),
@@ -3985,8 +3983,7 @@ esac
             origin_repository_url = q("https://github.com/example/repo"),
         );
         let gh = bin.join("gh");
-        std::fs::write(&gh, script).unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&gh, script);
         std::fs::write(
             stub_home.join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),
@@ -4212,8 +4209,7 @@ esac
             origin_repository_url = q("https://github.com/example/repo"),
         );
         let gh = bin.join("gh");
-        std::fs::write(&gh, script).unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&gh, script);
         std::fs::write(
             stub_home.join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),
@@ -4411,8 +4407,7 @@ esac
             origin_repository_url = q("https://github.com/example/repo"),
         );
         let gh = bin.join("gh");
-        std::fs::write(&gh, script).unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&gh, script);
         std::fs::write(
             stub_home.join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),
@@ -4503,8 +4498,7 @@ esac
             origin_repository_url = q("https://github.com/example/repo"),
         );
         let gh = bin.join("gh");
-        std::fs::write(&gh, script).unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&gh, script);
         std::fs::write(
             stub_home.join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),
@@ -6021,15 +6015,13 @@ esac
         let stub = tempfile::tempdir().unwrap();
         let (_log, pr_base) = install_pr_merge_stub(stub.path(), &expected, false);
         let hook = origin.join("hooks/pre-receive");
-        std::fs::write(
+        shelbi_state::test_support::write_executable(
             &hook,
             format!(
                 "#!/bin/sh\nprintf '%s\\n' release > {}\n",
                 shelbi_agent::shell_escape(&pr_base.to_string_lossy())
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let result = {
             let _env = EnvGuard::install(stub.path());
@@ -6502,8 +6494,7 @@ esac
             origin_repository_url = q("https://github.com/example/repo"),
         );
         let gh = bin.join("gh");
-        std::fs::write(&gh, script).unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&gh, script);
         std::fs::write(
             stub_home.join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),
@@ -6679,8 +6670,7 @@ esac
             origin_repository_url = q("https://github.com/example/repo"),
         );
         let gh = bin.join("gh");
-        std::fs::write(&gh, script).unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&gh, script);
         std::fs::write(
             stub_home.join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),
@@ -7166,8 +7156,7 @@ esac
                 pr = PR,
             );
             let gh = bin.join("gh");
-            std::fs::write(&gh, script).unwrap();
-            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+            shelbi_state::test_support::write_executable(&gh, script);
             std::fs::write(
                 stub_home.join(".profile"),
                 format!("export PATH=\"{}:$PATH\"\n", bin.display()),
@@ -11911,12 +11900,10 @@ mod probe_tests {
         std::fs::create_dir_all(&bindir).unwrap();
         let tool = "shelbi-test-login-shell-tool";
         let tool_path = bindir.join(tool);
-        std::fs::write(&tool_path, "#!/bin/sh\necho login-shell-tool-ran\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tool_path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        shelbi_state::test_support::write_executable(
+            &tool_path,
+            "#!/bin/sh\necho login-shell-tool-ran\n",
+        );
 
         // Login bash-as-sh sources ~/.profile. Override $HOME so we drop
         // the rc file in the fixture's tmp dir without touching the
@@ -12160,14 +12147,12 @@ mod probe_tests {
     #[cfg(unix)]
     impl LoginToolGuard {
         fn install(tool: &str, script: &str) -> Self {
-            use std::os::unix::fs::PermissionsExt;
 
             let home = tempfile::tempdir().unwrap();
             let bin = home.path().join("bin");
             std::fs::create_dir_all(&bin).unwrap();
             let executable = bin.join(tool);
-            std::fs::write(&executable, script).unwrap();
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            shelbi_state::test_support::write_executable(&executable, script);
             std::fs::write(
                 home.path().join(".profile"),
                 format!(
@@ -12477,12 +12462,10 @@ mod probe_tests {
     #[cfg(unix)]
     #[test]
     fn failed_probe_worktree_checkout_is_removed() {
-        use std::os::unix::fs::PermissionsExt;
 
         let (_base, _origin, wt) = setup_origin_and_worktree();
         let hook = wt.join(".git/hooks/post-checkout");
-        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&hook, "#!/bin/sh\nexit 1\n");
 
         let probe_path = unique_probe_worktree_path(&wt, "hook-failure");
         let head = head_sha(&wt);
@@ -13344,7 +13327,6 @@ mod probe_tests {
     #[cfg(unix)]
     #[test]
     fn reused_workspace_probe_installs_reviewed_dependencies_in_isolation() {
-        use std::os::unix::fs::PermissionsExt;
 
         let _lock = crate::test_lock::acquire();
         let _home = ProbeHomeGuard::install();
@@ -13445,12 +13427,10 @@ ln -s ../review-tool/check-reviewed node_modules/.bin/review-tool
         // Its ignored dependency must not be accepted merely because it is
         // already present when bootstrap begins.
         let hook = wt.join(".git/hooks/post-checkout");
-        std::fs::write(
+        shelbi_state::test_support::write_executable(
             &hook,
             "#!/bin/sh\ncase \"$PWD\" in *'.shelbi-probe-'*) mkdir -p site/node_modules/review-tool; printf '%s\\n' hook-injected > site/node_modules/review-tool/source-marker ;; esac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let project = probe_project(base.path(), &["exit 99"]);
         let mut workflow = shelbi_core::default_workflow();
@@ -13953,7 +13933,6 @@ ln -s ../review-tool/check-reviewed node_modules/.bin/review-tool
     #[cfg(unix)]
     #[test]
     fn checkout_hook_node_modules_without_package_manifest_are_cleared() {
-        use std::os::unix::fs::PermissionsExt;
 
         let _lock = crate::test_lock::acquire();
         let _home = ProbeHomeGuard::install();
@@ -13968,12 +13947,10 @@ ln -s ../review-tool/check-reviewed node_modules/.bin/review-tool
         detach_for_handoff(&wt, "shelbi/task1");
 
         let hook = wt.join(".git/hooks/post-checkout");
-        std::fs::write(
+        shelbi_state::test_support::write_executable(
             &hook,
             "#!/bin/sh\ncase \"$PWD\" in *'.shelbi-probe-'*) mkdir -p tools/node_modules/poison; printf '%s\\n' unreviewed > tools/node_modules/poison/index.js ;; esac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let project = probe_project(base.path(), &["test ! -e tools/node_modules"]);
         let report = probe_in_workflow(
@@ -13992,7 +13969,6 @@ ln -s ../review-tool/check-reviewed node_modules/.bin/review-tool
     #[cfg(unix)]
     #[test]
     fn checkout_hook_cannot_inject_ignored_config_or_modify_reviewed_files() {
-        use std::os::unix::fs::PermissionsExt;
 
         let _lock = crate::test_lock::acquire();
         let _home = ProbeHomeGuard::install();
@@ -14006,12 +13982,10 @@ ln -s ../review-tool/check-reviewed node_modules/.bin/review-tool
         detach_for_handoff(&wt, "shelbi/task1");
 
         let hook = wt.join(".git/hooks/post-checkout");
-        std::fs::write(
+        shelbi_state::test_support::write_executable(
             &hook,
             "#!/bin/sh\ncase \"$PWD\" in *'.shelbi-probe-'*) printf '%s\\n' 'registry=https://unreviewed.invalid' > .npmrc; printf '%s\\n' poison > ignored-fixture.txt; printf '%s\\n' modified-by-hook > reviewed.txt ;; esac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let project = probe_project(
             base.path(),
@@ -14039,7 +14013,6 @@ ln -s ../review-tool/check-reviewed node_modules/.bin/review-tool
     #[cfg(unix)]
     #[test]
     fn nested_node_modules_injected_by_checkout_hook_are_cleared() {
-        use std::os::unix::fs::PermissionsExt;
 
         let _lock = crate::test_lock::acquire();
         let _home = ProbeHomeGuard::install();
@@ -14081,12 +14054,10 @@ printf '%s\n' installed-from-reviewed-lock > packages/app/node_modules/reviewed-
         detach_for_handoff(&wt, "shelbi/task1");
 
         let hook = wt.join(".git/hooks/post-checkout");
-        std::fs::write(
+        shelbi_state::test_support::write_executable(
             &hook,
             "#!/bin/sh\ncase \"$PWD\" in *'.shelbi-probe-'*) mkdir -p packages/app/node_modules; printf '%s\\n' hook-poison > packages/app/node_modules/reviewed-marker ;; esac\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
 
         let project = probe_project(
             base.path(),
@@ -14424,7 +14395,6 @@ printf '%s\n' reviewed-classic > node_modules/reviewed-package/marker
     #[cfg(unix)]
     #[test]
     fn yarn_berry_without_package_manager_uses_a_disposable_runtime_cache() {
-        use std::os::unix::fs::PermissionsExt;
 
         let _lock = crate::test_lock::acquire();
         let _home = ProbeHomeGuard::install();
@@ -14473,12 +14443,10 @@ cp "$YARN_GLOBAL_FOLDER/cache/runtime.zip" "$YARN_CACHE_FOLDER/runtime.zip"
             detach_for_handoff(&wt, "shelbi/task1");
 
             let hook = wt.join(".git/hooks/post-checkout");
-            std::fs::write(
+            shelbi_state::test_support::write_executable(
                 &hook,
                 "#!/bin/sh\ncase \"$PWD\" in *'.shelbi-probe-'*) mkdir -p .yarn/cache; printf '%s\\n' hook-poison > .yarn/cache/hook-poison.zip ;; esac\n",
-            )
-            .unwrap();
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+            );
 
             let project = probe_project(
                 base.path(),

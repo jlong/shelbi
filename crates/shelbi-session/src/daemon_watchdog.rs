@@ -267,7 +267,6 @@ mod tests {
         // (here: fakes on a crafted PATH / SHELBI_BIN), never this process's own
         // image. The pure form takes the two env inputs directly so no
         // process-wide env is mutated.
-        use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join(format!("shb-wd-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let bin_dir = dir.join("bin");
@@ -279,8 +278,7 @@ mod tests {
         std::fs::write(noexec_dir.join("shelbi"), b"#!/bin/sh\n").unwrap();
         // ...in favour of the executable one later on PATH.
         let exe = bin_dir.join("shelbi");
-        std::fs::write(&exe, b"#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&exe, b"#!/bin/sh\n");
 
         let path = std::env::join_paths([noexec_dir.as_path(), bin_dir.as_path()]).unwrap();
         assert_eq!(

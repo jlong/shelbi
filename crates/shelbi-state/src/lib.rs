@@ -77,6 +77,8 @@ pub mod session_lost;
 mod ssh_control;
 pub mod supervision_relaunch;
 pub mod supervision_status;
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub mod test_support;
 pub mod tools;
 mod user_config;
 mod workflows;

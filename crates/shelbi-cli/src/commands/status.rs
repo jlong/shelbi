@@ -1306,12 +1306,7 @@ issue_tracker:\n\
         // still resolves from the system PATH.
         let bin = home.join("stub-bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("gh"), "#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        shelbi_state::test_support::write_executable(bin.join("gh"), "#!/bin/sh\nexit 0\n");
         std::fs::write(
             home.join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),

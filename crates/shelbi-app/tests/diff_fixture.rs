@@ -412,8 +412,10 @@ fn fake_ssh() {
         let dir = std::env::temp_dir().join(format!("shelbi-diff-fake-ssh-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let script = dir.join("ssh");
-        fs::write(&script, "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec /bin/sh -c \"$*\"\n").unwrap();
-        fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(
+            &script,
+            "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec /bin/sh -c \"$*\"\n",
+        );
         let path = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{path}", dir.display()));
         dir

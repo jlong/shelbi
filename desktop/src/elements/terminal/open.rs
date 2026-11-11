@@ -83,9 +83,7 @@ mod tests {
         std::fs::write(dir.join("w/src/main.rs"), "fn main() {}\n").unwrap();
         let log = dir.join("argv.log");
         let editor = dir.join("bin/code");
-        std::fs::write(&editor, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n", log.display())).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&editor, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n", log.display()));
 
         let cwd = Some(dir.join("w"));
         let mut child = open_path_with(&editor.to_string_lossy().as_ref().into(), "src/main.rs", Some(42), Some(5), cwd.clone(), None)

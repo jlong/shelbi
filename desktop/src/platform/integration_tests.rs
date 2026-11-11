@@ -79,10 +79,8 @@ impl Sandbox {
         protocol: Option<u32>,
         daemon_body: &str,
     ) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let cli = self.bin.join("shelbi");
-        std::fs::write(&cli, cli_script(version, protocol, daemon_body)).unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&cli, cli_script(version, protocol, daemon_body));
         cli
     }
 
@@ -90,7 +88,6 @@ impl Sandbox {
     /// archive, its plugin, `checksums.txt`) under the sandbox; its download
     /// URL base.
     fn publish_release(&self, version: &str, daemon_body: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let pkg = self.home.join("pkg");
         let plugin = pkg.join("plugins").join(install::PLUGIN);
         for file in install::PLUGIN_FILES {
@@ -100,8 +97,7 @@ impl Sandbox {
         }
         let cli = pkg.join("shelbi");
         let script = cli_script(version, Some(CONTROL_PROTOCOL_VERSION), daemon_body);
-        std::fs::write(&cli, script).unwrap();
-        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&cli, script);
         let release = self.home.join("release");
         std::fs::create_dir_all(&release).unwrap();
         let name = install::archive_name(std::env::consts::ARCH).unwrap();

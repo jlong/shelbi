@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -55,10 +55,7 @@ fn real_program(name: &str) -> PathBuf {
 }
 
 fn executable(path: &Path, body: &str) {
-    fs::write(path, body).unwrap();
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).unwrap();
+    shelbi_state::test_support::write_executable(path, body);
 }
 
 fn fake_path(root: &Path, tools: FakePath) -> PathBuf {

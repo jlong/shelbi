@@ -809,10 +809,8 @@ mod tests {
     }
 
     fn executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, "#!/bin/sh\n").unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_support::write_executable(path, "#!/bin/sh\n");
     }
 
     fn bundle(path: &Path) {

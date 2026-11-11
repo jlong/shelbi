@@ -1663,7 +1663,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn probe_finds_shelbi_only_on_login_shell_path() {
-        use std::os::unix::fs::PermissionsExt;
 
         let hub = v(0, 9, 0);
         let dir = std::env::temp_dir().join(format!(
@@ -1678,10 +1677,7 @@ mod tests {
         std::fs::create_dir_all(&bindir).unwrap();
 
         let write_exec = |path: &std::path::Path, body: &str| {
-            std::fs::write(path, body).unwrap();
-            let mut perm = std::fs::metadata(path).unwrap().permissions();
-            perm.set_mode(0o755);
-            std::fs::set_permissions(path, perm).unwrap();
+            shelbi_state::test_support::write_executable(path, body);
         };
 
         // Stub `shelbi` reachable only via the rc-file PATH.

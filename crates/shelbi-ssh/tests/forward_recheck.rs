@@ -5,7 +5,6 @@
 //! crate's unit tests; here the fake just answers with their exit codes.
 #![cfg(unix)]
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
@@ -66,8 +65,7 @@ fn world(tag: &str) -> World {
         let bin = PathBuf::from(format!("/tmp/shfr-{}-bin", std::process::id()));
         std::fs::create_dir_all(&bin).unwrap();
         let ssh = bin.join("ssh");
-        std::fs::write(&ssh, FAKE_SSH).unwrap();
-        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        shelbi_state::test_support::write_executable(&ssh, FAKE_SSH);
         let path = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{path}", bin.display()));
         std::env::set_var("SHELBI_FORWARD_RETRY_ATTEMPTS", "1");

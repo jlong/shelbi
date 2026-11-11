@@ -180,6 +180,8 @@ gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
 chrono = "0.4"
 # Settings ▸ Workspaces' tests build their pools from the shared fixtures.
 shelbi-app = { path = "../crates/shelbi-app", features = ["test-support"] }
+# `test_support::write_executable` for stubs the tests execute.
+shelbi-state = { path = "../crates/shelbi-state", features = ["test-support"] }
 # The project-source gate (`src/source_gate.rs`) walks the views' syntax
 # trees (with line numbers). Both already in the tree (gpui's macros), so the
 # lockfile only records them.

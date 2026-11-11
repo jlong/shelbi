@@ -4503,7 +4503,7 @@ mod tests {
         let stub = tempfile::tempdir().unwrap();
         let bin = stub.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(
+        shelbi_state::test_support::write_executable(
             bin.join("gh"),
             r#"#!/bin/sh
 case "$*" in
@@ -4517,14 +4517,7 @@ case "$*" in
 esac
 exit 0
 "#,
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
+        );
         std::fs::write(
             stub.path().join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),
@@ -4635,12 +4628,7 @@ exit 0
         let stub = tempfile::tempdir().unwrap();
         let bin = stub.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("gh"), "#!/bin/sh\nexit 0\n").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        shelbi_state::test_support::write_executable(bin.join("gh"), "#!/bin/sh\nexit 0\n");
         std::fs::write(
             stub.path().join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),
@@ -4744,13 +4732,7 @@ transitions:
         let stub = tempfile::tempdir().unwrap();
         let bin = stub.path().join("bin");
         std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(bin.join("gh"), script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(bin.join("gh"), std::fs::Permissions::from_mode(0o755))
-                .unwrap();
-        }
+        shelbi_state::test_support::write_executable(bin.join("gh"), script);
         std::fs::write(
             stub.path().join(".profile"),
             format!("export PATH=\"{}:$PATH\"\n", bin.display()),
