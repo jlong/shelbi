@@ -18,7 +18,7 @@ use clap::Subcommand;
 use serde::Serialize;
 use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
 
-use super::require_project;
+use super::{ensure_registered, require_project};
 
 #[path = "orchestrator_awareness.rs"]
 mod awareness;

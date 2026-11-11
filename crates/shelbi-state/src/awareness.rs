@@ -18,6 +18,11 @@
 //! the command's combined output (`output.log`) and, once it exits, its
 //! `result.json`. The detached runner (`shelbi __job-exec`) writes both; the
 //! poller reads the result and reports it.
+//!
+//! The store never creates the project's state directory: a write for a
+//! project whose `<project_dir>` is missing fails instead, so a mistyped
+//! `--project` (or a stale `SHELBI_PROJECT`) can't leave a stray project
+//! folder holding entries no orchestrator will ever read.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -196,6 +201,21 @@ pub fn awareness_path(project: &str) -> Result<PathBuf> {
     Ok(project_dir(project)?.join(AWARENESS_FILE))
 }
 
+/// The project's state dir, which must already exist: every registered
+/// project has one (it holds the project's config and state), and the store's
+/// writers refuse to create it for a name that isn't one.
+fn existing_project_dir(project: &str) -> Result<PathBuf> {
+    let dir = project_dir(project)?;
+    if dir.is_dir() {
+        return Ok(dir);
+    }
+    Err(Error::Other(format!(
+        "project `{project}` has no state directory ({}); is it registered? The awareness \
+         store does not create one",
+        dir.display()
+    )))
+}
+
 /// Read the store. A missing file is an empty store; any other read or parse
 /// error propagates, so a transiently unreadable file is never replaced with
 /// an empty one by the next write.
@@ -220,7 +240,7 @@ pub fn update_awareness<R>(
     project: &str,
     f: impl FnOnce(&mut AwarenessStore) -> Result<R>,
 ) -> Result<R> {
-    let path = awareness_path(project)?;
+    let path = existing_project_dir(project)?.join(AWARENESS_FILE);
     let _lock = acquire_file_lock(&crate::sibling_lock_path(&path))?;
     let mut store = read_awareness_at(&path)?;
     let before = store.clone();
@@ -406,6 +426,7 @@ impl JobResult {
 
 /// Atomically write job `id`'s result.
 pub fn write_job_result(project: &str, id: &str, result: &JobResult) -> Result<()> {
+    existing_project_dir(project)?;
     let body = serde_json::to_vec_pretty(result)
         .map_err(|e| Error::Other(format!("job result: {e}")))?;
     atomic_write(&job_result_path(project, id)?, &body)
@@ -511,6 +532,30 @@ mod tests {
 
     fn mins(n: u64) -> Duration {
         Duration::from_secs(n * 60)
+    }
+
+    #[test]
+    fn writes_refuse_a_project_without_a_state_dir() {
+        let home = Home::new("nodir");
+        let due = Utc::now();
+        let err = add_reminder("typo", due, "lost", None).unwrap_err().to_string();
+        assert!(err.contains("project `typo` has no state directory"), "{err}");
+        let pid = NewJob { kind: JobKind::Pid, target: "1".into(), label: None };
+        assert!(add_job("typo", pid).is_err());
+        assert!(set_estimate("typo", "t1", mins(30), due, None).is_err());
+        let result = JobResult {
+            exit_code: Some(0),
+            signal: None,
+            finished_at: due,
+            tail: Vec::new(),
+            error: None,
+        };
+        assert!(write_job_result("typo", "j1", &result).is_err());
+        assert!(!home.path.join("projects/typo").exists());
+        // A read of a missing project stays an empty store, and an existing
+        // project still takes writes.
+        assert!(read_awareness("typo").unwrap().reminders.is_empty());
+        add_reminder("demo", due, "kept", None).unwrap();
     }
 
     #[test]

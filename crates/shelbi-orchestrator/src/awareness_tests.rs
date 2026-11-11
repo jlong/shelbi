@@ -7,9 +7,17 @@ use shelbi_core::{Project, Result};
 use shelbi_state::awareness::{self, JobKind, JobResult, NewJob};
 
 use super::*;
-use crate::test_lock::isolated_home;
+use crate::test_lock::{isolated_home, IsolatedHome};
 
 const P: &str = "demo";
+
+/// An isolated home holding `demo`'s state dir: the awareness store writes
+/// only into a project dir that already exists.
+fn home() -> IsolatedHome {
+    let home = isolated_home();
+    std::fs::create_dir_all(shelbi_state::project_dir(P).unwrap()).unwrap();
+    home
+}
 
 fn project() -> Project {
     let mut p = Project::from_yaml_str(
@@ -86,7 +94,7 @@ fn run(state: &mut AwarenessTickState, now: DateTime<Utc>, probe: &FakeProbe) {
 
 #[test]
 fn a_reminder_fires_once_when_due_and_leaves_the_store() {
-    let _home = isolated_home();
+    let _home = home();
     let probe = FakeProbe::default();
     let mut state = AwarenessTickState::default();
     awareness::add_reminder(P, at(2), "check the tap PR merged", None).unwrap();
@@ -104,7 +112,7 @@ fn a_reminder_fires_once_when_due_and_leaves_the_store() {
 
 #[test]
 fn a_reminder_missed_while_the_daemon_was_down_fires_once_and_a_recurring_one_reschedules() {
-    let _home = isolated_home();
+    let _home = home();
     let probe = FakeProbe::default();
     let mut state = AwarenessTickState::default();
     awareness::add_reminder(P, at(0), "one-shot", None).unwrap();
@@ -155,7 +163,7 @@ fn finish(id: &str, exit: i32, tail: &[&str]) {
 
 #[test]
 fn a_finished_command_job_reports_its_exit_and_last_line() {
-    let _home = isolated_home();
+    let _home = home();
     let probe = FakeProbe::default();
     probe.alive.borrow_mut().insert(4242);
     let mut state = AwarenessTickState::default();
@@ -188,7 +196,7 @@ fn a_finished_command_job_reports_its_exit_and_last_line() {
 
 #[test]
 fn a_command_job_whose_runner_died_without_a_result_is_reported_failed() {
-    let _home = isolated_home();
+    let _home = home();
     let probe = FakeProbe::default();
     let mut state = AwarenessTickState::default();
     let id = command_job();
@@ -202,7 +210,7 @@ fn a_command_job_whose_runner_died_without_a_result_is_reported_failed() {
 
 #[test]
 fn a_pid_job_fires_when_the_process_exits() {
-    let _home = isolated_home();
+    let _home = home();
     let probe = FakeProbe::default();
     probe.alive.borrow_mut().insert(77);
     let mut state = AwarenessTickState::default();
@@ -219,7 +227,7 @@ fn a_pid_job_fires_when_the_process_exits() {
 
 #[test]
 fn ci_and_pr_watches_sample_on_their_cadence_and_only_online() {
-    let _home = isolated_home();
+    let _home = home();
     let probe = FakeProbe::default();
     let mut state = AwarenessTickState::default();
     awareness::add_job(P, NewJob { kind: JobKind::Ci, target: "abc123".into(), label: None }).unwrap();
@@ -253,7 +261,7 @@ fn ci_and_pr_watches_sample_on_their_cadence_and_only_online() {
 
 #[test]
 fn an_active_task_alerts_at_its_estimate_then_every_half_estimate_until_it_leaves_active() {
-    let _home = isolated_home();
+    let _home = home();
     let probe = FakeProbe::default();
     let mut state = AwarenessTickState::default();
     *probe.active.borrow_mut() =
@@ -281,7 +289,7 @@ fn an_active_task_alerts_at_its_estimate_then_every_half_estimate_until_it_leave
 
 #[test]
 fn a_short_estimate_repeats_on_the_ten_minute_floor() {
-    let _home = isolated_home();
+    let _home = home();
     let probe = FakeProbe::default();
     let mut state = AwarenessTickState::default();
     *probe.active.borrow_mut() = Some(HashMap::from([("t".to_string(), None)]));
@@ -298,7 +306,7 @@ fn a_short_estimate_repeats_on_the_ten_minute_floor() {
 
 #[test]
 fn estimates_are_left_alone_while_the_board_is_unreadable() {
-    let _home = isolated_home();
+    let _home = home();
     let probe = FakeProbe::default();
     let mut state = AwarenessTickState::default();
     awareness::set_estimate(P, "t", mins(10), t0(), None).unwrap();
@@ -309,7 +317,7 @@ fn estimates_are_left_alone_while_the_board_is_unreadable() {
 
 #[test]
 fn the_job_runner_records_exit_code_and_output_tail() {
-    let _home = isolated_home();
+    let _home = home();
     let argv: Vec<String> = ["sh", "-c", "echo one; echo two >&2; exit 3"]
         .iter()
         .map(|s| s.to_string())

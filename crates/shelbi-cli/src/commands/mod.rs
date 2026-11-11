@@ -73,6 +73,24 @@ pub fn require_project(explicit: Option<String>) -> Result<String> {
     ))
 }
 
+/// Refuse a project that isn't registered before touching any of its state.
+/// Commands that write under the project's state dir (the awareness store, the
+/// event cursor) call this first, so a mistyped `--project` or a stale
+/// `SHELBI_PROJECT` errors out instead of creating a stray project folder whose
+/// entries no orchestrator reads.
+pub(crate) fn ensure_registered(project: &str) -> Result<()> {
+    shelbi_state::load_project(project)
+        .map(|_| ())
+        .map_err(|e| anyhow!("project `{project}` is not registered: {e}"))
+}
+
+/// [`require_project`], then [`ensure_registered`].
+pub(crate) fn require_registered_project(explicit: Option<String>) -> Result<String> {
+    let project = require_project(explicit)?;
+    ensure_registered(&project)?;
+    Ok(project)
+}
+
 /// Read a project's **open** board for a CLI listing through the daemon-owned
 /// `board-index.json` (the consumer half of
 /// `Plans/github-issue-caching-and-rate-limits.md` §5), never the backend.
