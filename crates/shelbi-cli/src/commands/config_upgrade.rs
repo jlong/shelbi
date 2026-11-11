@@ -443,6 +443,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_tracker_ownership_dispatch(entry, &text, out);
         sniff_orchestrator_changelog(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
+        sniff_orchestrator_awareness_variants(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
         sniff_zen_assignee_scope(entry, &text, out);
@@ -2047,7 +2048,130 @@ fn sniff_heartbeat_idle_workspaces_review_exclusion(
     ));
 }
 
-/// Detect the pre-rename `shelbi task <verb>` board command in an agent's prose
+// ---------------------------------------------------------------------------
+// Orchestrator instructions — heartbeat (v1) / awareness (v2) variants
+
+/// Code for an orchestrator copy with shipped heartbeat passages that predate
+/// the variant markup, carried verbatim: each gains its marked awareness (v2)
+/// counterpart in place (an auto-heal).
+pub(crate) const AWARENESS_VARIANTS_AUTOHEAL_CODE: &str = "ORCH_AWARENESS_VARIANTS_MISSING";
+
+/// Code for an orchestrator copy whose awareness (v2) composition would still
+/// carry heartbeat-only rules: an edited passage the auto-heal couldn't match,
+/// routed to the orchestrator for judgment.
+pub(crate) const AWARENESS_VARIANTS_JUDGMENT_CODE: &str = "ORCH_AWARENESS_VARIANTS_EDITED";
+
+/// Phrases only the heartbeat (v1) event rules carry: the Monitor-driven tail,
+/// the bounded self-drain, and the periodic heartbeat sweep. An orchestrator
+/// on the awareness system (v2) must never read them — events reach it on
+/// their own, and a second reader would take them from under the delivery —
+/// so a copy whose v2 composition still contains one needs refreshing. The
+/// shipped template's v2 composition carries none (pinned by the drift guard
+/// in this module's tests).
+pub(crate) const HEARTBEAT_ONLY_RULE_MARKERS: &[&str] = &[
+    "Monitor(command:",
+    "--max-lifetime",
+    "bounded sweep",
+    "heartbeat sweep",
+];
+
+/// Add the shipped awareness variants to an orchestrator `instructions.md`:
+/// every variant group of the shipped template whose heartbeat (v1) text the
+/// copy carries verbatim, outside any marked block, is replaced by the whole
+/// group (the same v1 text inside heartbeat markers, followed by its marked
+/// awareness counterpart). Groups are matched in template order, each after
+/// the previous one, so a passage that recurs (the dispatch command) pairs
+/// with the right group. The heartbeat composition of the result equals the
+/// input, so a v1 orchestrator reads exactly what it read before. An edited
+/// passage doesn't match and is left alone. Shared by the sniffer and the
+/// healer's write-back so the two can never diverge.
+pub(crate) fn apply_awareness_variant_markers(text: &str) -> String {
+    let mut out = text.to_string();
+    let mut cursor = 0;
+    for group in shelbi_state::awareness_variant_groups(shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS) {
+        if group.heartbeat.is_empty() {
+            continue;
+        }
+        let marked = shelbi_state::awareness_marked_spans(&out);
+        let free = |at: usize| marked.iter().all(|span| !span.contains(&at));
+        let found = out[cursor..]
+            .match_indices(group.heartbeat.as_str())
+            .map(|(i, _)| cursor + i)
+            .find(|&at| (at == 0 || out.as_bytes()[at - 1] == b'\n') && free(at));
+        if let Some(at) = found {
+            out.replace_range(at..at + group.heartbeat.len(), group.text);
+            cursor = at + group.text.len();
+        }
+    }
+    out
+}
+
+/// Sniff an orchestrator `instructions.md` that predates the heartbeat (v1) /
+/// awareness (v2) variant markup.
+///
+/// The shipped template now teaches both event systems, the passages that
+/// differ wrapped in `<!-- shelbi:heartbeat -->` / `<!-- shelbi:awareness -->`
+/// blocks the launch composes by `orchestrator.awareness`. A default change
+/// only reaches NEW projects; existing projects carry forked copies with no
+/// markup, so on v2 their orchestrator would read the heartbeat sweep and the
+/// Monitor-driven drain (per the AGENTS.md "Changing shipped defaults"
+/// guardrail, this sniffer hands them the change):
+///
+/// * Each shipped heartbeat passage the copy carries verbatim gains its marked
+///   v2 counterpart in place → [`Classification::AutoHeal`]. Non-lossy: the v1
+///   composition is unchanged byte for byte, and user edits elsewhere stay.
+/// * If the v2 composition of the (healed) copy would still carry a
+///   heartbeat-only rule ([`HEARTBEAT_ONLY_RULE_MARKERS`]) — a passage the user
+///   edited, so no exact match — → [`Classification::NeedsJudgment`], for the
+///   orchestrator to wrap it in markers and write the v2 counterpart itself.
+///
+/// The text is first put through the other orchestrator auto-heals that touch
+/// these passages (tmux commands, tracker ownership), so a copy they fix in
+/// the same pass still counts as untouched here. Idempotent: a healed copy
+/// matches nothing, and its v2 composition carries no heartbeat-only rule.
+fn sniff_orchestrator_awareness_variants(
+    entry: &InventoryEntry,
+    text: &str,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    let normalized = apply_tracker_ownership_rewrites(&apply_tmux_instruction_rewrites(text));
+    let healed = apply_awareness_variant_markers(&normalized);
+    if healed != normalized {
+        out.push(finding(
+            entry,
+            Classification::AutoHeal,
+            AWARENESS_VARIANTS_AUTOHEAL_CODE,
+            "orchestrator instructions predate the awareness system: they carry only the \
+             heartbeat (v1) event rules, so on `orchestrator.awareness: awareness` the \
+             orchestrator would still arm a Monitor, self-drain and sweep on heartbeats",
+            "Wrap each shipped heartbeat passage in `<!-- shelbi:heartbeat -->` markers and add \
+             its `<!-- shelbi:awareness -->` counterpart (events arrive on their own, `--estimate` \
+             on every start, `shelbi remind`, `shelbi job`, the digest rule). Mirror the shipped \
+             default template.",
+            locate_line_containing(text, "heartbeat"),
+        ));
+    }
+    let v2 = shelbi_state::select_awareness_variant(&healed, shelbi_core::AwarenessMode::Awareness);
+    if let Some(rule) = HEARTBEAT_ONLY_RULE_MARKERS.iter().find(|m| v2.contains(*m)) {
+        out.push(finding(
+            entry,
+            Classification::NeedsJudgment,
+            AWARENESS_VARIANTS_JUDGMENT_CODE,
+            "orchestrator instructions carry edited heartbeat (v1) event rules outside a \
+             `<!-- shelbi:heartbeat -->` block, so an orchestrator on the awareness system (v2) \
+             would still read them (arm a Monitor, self-drain, sweep on heartbeats) and race \
+             the event delivery",
+            "Wrap each heartbeat-only passage (the event-feed and Monitor paragraphs, bootstrap \
+             steps 2-3, `## Polling-only event drain`, the `heartbeat` reaction rule, the Zen \
+             heartbeat re-injection) in `<!-- shelbi:heartbeat -->` / `<!-- /shelbi:heartbeat -->` \
+             lines, preserving your edits, and follow each with a `<!-- shelbi:awareness -->` \
+             block that teaches the v2 equivalent. Mirror the shipped default template.",
+            locate_line_containing(text, rule),
+        ));
+    }
+}
+
+/// Detect the pre-rename `shelbi task <verb>` board command in an agent's prose/// Detect the pre-rename `shelbi task <verb>` board command in an agent's prose
 /// (orchestrator `instructions.md` or `zenmode.md`). The board command was
 /// renamed `shelbi task` -> `shelbi issue` (design D5); `shelbi task` still works
 /// as a deprecated alias, so a forked copy on the old wording is not *broken* —
@@ -4630,6 +4754,130 @@ mod tests {
             "shipped default template no longer has a `{FREE_WORKSPACE_SECTION_HEADING}` \
              section — the sniffer's absence check is now dead",
         );
+    }
+
+    // ---- orchestrator heartbeat (v1) / awareness (v2) variants ----
+
+    /// The orchestrator template as shipped before the variant markup: the
+    /// template's heartbeat composition (byte for byte what v1 projects
+    /// composed before the markup existed).
+    fn pre_markup_template() -> String {
+        shelbi_state::select_awareness_variant(
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS,
+            shelbi_core::AwarenessMode::Heartbeat,
+        )
+    }
+
+    fn sniff_variants(text: &str) -> Vec<UpgradeFinding> {
+        let mut out = Vec::new();
+        sniff_orchestrator_awareness_variants(&orch_entry(), text, &mut out);
+        out
+    }
+
+    #[test]
+    fn unedited_pre_markup_copy_is_auto_healed_to_the_shipped_template() {
+        let legacy = pre_markup_template();
+        let out = sniff_variants(&legacy);
+        assert_eq!(codes(&out), vec![AWARENESS_VARIANTS_AUTOHEAL_CODE]);
+        assert_eq!(out[0].classification, Classification::AutoHeal);
+        // Every group matches, so the heal reproduces the shipped template.
+        assert_eq!(
+            apply_awareness_variant_markers(&legacy),
+            shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS
+        );
+    }
+
+    #[test]
+    fn heal_keeps_edits_and_never_changes_the_v1_composition() {
+        // A copy edited outside the variant passages: every group still heals,
+        // the edit survives, and a heartbeat orchestrator reads exactly what it
+        // read before.
+        let legacy = pre_markup_template().replacen(
+            "## Reporting\n",
+            "## Reporting\n\nAlways mention the weather.\n",
+            1,
+        );
+        let healed = apply_awareness_variant_markers(&legacy);
+        assert!(healed.contains("Always mention the weather."));
+        assert_eq!(
+            shelbi_state::select_awareness_variant(&healed, shelbi_core::AwarenessMode::Heartbeat),
+            legacy
+        );
+        assert!(sniff_variants(&healed).is_empty(), "{:?}", codes(&sniff_variants(&healed)));
+    }
+
+    #[test]
+    fn edited_heartbeat_rule_heals_the_rest_and_needs_judgment() {
+        // The user reworded the heartbeat reaction rule: that passage can't be
+        // matched, so the other passages heal and the rule is left for the
+        // orchestrator's judgment (its v2 composition would still sweep).
+        let legacy = pre_markup_template().replacen(
+            "→ bounded sweep. Do exactly these three",
+            "→ bounded sweep (our house rules). Do exactly these three",
+            1,
+        );
+        let out = sniff_variants(&legacy);
+        assert_eq!(
+            codes(&out),
+            vec![AWARENESS_VARIANTS_AUTOHEAL_CODE, AWARENESS_VARIANTS_JUDGMENT_CODE]
+        );
+        assert_eq!(out[1].classification, Classification::NeedsJudgment);
+        let healed = apply_awareness_variant_markers(&legacy);
+        assert!(healed.contains("bounded sweep (our house rules)"));
+        assert!(healed.contains("## Waiting on things"), "the other passages heal");
+        // The orchestrator resolves it by wrapping its edited rule in markers;
+        // after that nothing is flagged.
+        let start = healed.find("- `project=<name> heartbeat` → bounded sweep").unwrap();
+        let end = start
+            + healed[start..]
+                .find("## Free-workspace selection")
+                .unwrap();
+        let mut resolved = healed.clone();
+        resolved.insert_str(end, "<!-- /shelbi:heartbeat -->\n");
+        resolved.insert_str(start, "<!-- shelbi:heartbeat -->\n");
+        assert!(sniff_variants(&resolved).is_empty(), "{:?}", codes(&sniff_variants(&resolved)));
+    }
+
+    #[test]
+    fn copy_without_heartbeat_rules_is_left_alone() {
+        let text = "# Orchestrator\n\nDispatch ready issues. Answer the user.\n";
+        assert!(sniff_variants(text).is_empty());
+        assert_eq!(apply_awareness_variant_markers(text), text);
+    }
+
+    #[test]
+    fn copy_on_the_pre_tmux_wording_still_counts_as_untouched() {
+        // The heartbeat sweep's session sample once named `tmux capture-pane`;
+        // the tmux auto-heal rewrites it in the same pass, so this copy is an
+        // auto-heal here too, not a needs-judgment.
+        let current = pre_markup_template();
+        let legacy = TMUX_INSTRUCTION_REWRITES
+            .iter()
+            .fold(current.clone(), |acc, (legacy, new)| acc.replacen(new, legacy, 1));
+        assert_ne!(legacy, current, "no tmux passage in the heartbeat rules to roll back");
+        assert_eq!(codes(&sniff_variants(&legacy)), vec![AWARENESS_VARIANTS_AUTOHEAL_CODE]);
+    }
+
+    /// Drift guard: the shipped template carries the variant markup (so a fresh
+    /// project never trips this sniffer), its v2 composition carries none of the
+    /// heartbeat-only rules, and its v1 composition carries all of them.
+    #[test]
+    fn shipped_template_variants_are_complete() {
+        let template = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        assert!(sniff_variants(template).is_empty(), "{:?}", codes(&sniff_variants(template)));
+        let v1 = pre_markup_template();
+        let v2 = shelbi_state::select_awareness_variant(template, shelbi_core::AwarenessMode::Awareness);
+        for marker in HEARTBEAT_ONLY_RULE_MARKERS {
+            assert!(v1.contains(marker), "v1 lost `{marker}`; the judgment sniff is dead");
+            assert!(!v2.contains(marker), "v2 still carries `{marker}`");
+        }
+        // Each group's heartbeat text is found in order in the v1 text, so the
+        // heal can always place every group.
+        let mut at = 0;
+        for group in shelbi_state::awareness_variant_groups(template) {
+            assert!(!group.heartbeat.is_empty() && !group.awareness.is_empty());
+            at += v1[at..].find(&group.heartbeat).expect("group heartbeat text in v1");
+        }
     }
 
     // ---- orchestrator Reporting passage (workspace-subject -> issue) ----

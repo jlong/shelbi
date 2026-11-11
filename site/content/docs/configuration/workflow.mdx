@@ -92,6 +92,7 @@ git:
 | `git` | [Git](#git) | no | inherit project | Per-workflow override of the project's `git:` block. |
 | `zen` | [Zen](#zen) | no | inherit project | Per-workflow override of the project's Zen Mode config. |
 | `review` | [Review](#review) | no | — (diff-only review) | Recipe the Review agent runs to serve this workflow's branch. |
+| `default_estimate` | duration (`90m`, `1h30m`) | no | none | How long a task on this workflow should stay active when it is started without `--estimate`. Past it, the hub writes an `overdue` event. See [`shelbi issue estimate`](/docs/cli/issue#estimate). |
 
 ## statuses
 

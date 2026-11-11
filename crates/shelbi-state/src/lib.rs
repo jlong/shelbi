@@ -20,6 +20,8 @@ use shelbi_core::{
 };
 
 mod agent_workspaces;
+pub mod awareness;
+mod awareness_variants;
 pub mod board_index;
 pub mod change_bus;
 pub mod changelog;
@@ -163,6 +165,10 @@ pub use agent_workspaces::{
     ORCHESTRATOR_AGENT, ORCHESTRATOR_HANDOFF_REL, QA_AGENT, REVIEW_AGENT, SECURITY_AGENT,
     SHARED_AGENT_DIR, SHARED_PREAMBLE_FILE, STALE_HOOK_COMMAND_MARKER,
 };
+pub use awareness_variants::{
+    awareness_close_marker, awareness_marked_spans, awareness_open_marker, awareness_variant_groups,
+    has_awareness_variants, select_awareness_variant, VariantGroup,
+};
 pub use hub_config::{
     hub_config_path, list_projects, load_hub_config, save_hub_config, touch_project_launched,
     HubConfig, ProjectMeta, ProjectSummary,
@@ -213,7 +219,8 @@ pub use event_log::{
     append_board_rate_limited_event,
     append_board_unreachable_event,
     append_daemon_event,
-    append_ci_event, append_clarification_event, append_dispatch_event, append_external_event,
+    append_ci_event, append_clarification_event, append_job_event, append_reminder_event,
+    append_task_overdue_event, quote_event_text, split_event_words, unquote_event_value, JobEvent, append_dispatch_event, append_external_event,
     append_handoff_action_failed_event, append_handoff_refused_event,
     append_orphan_reap_failed_event,
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
@@ -229,10 +236,11 @@ pub use event_log::{
     append_workspace_event, append_workspace_pane_event, append_workspace_pause_event,
     append_worktree_detach_event, append_worktree_detach_skipped_event, append_zen_dryrun_event,
     append_zen_mode_event, delivery_id,
-    claim_event_follower, emit_event_body, event_cursor_path, event_follower_owner,
+    acquire_event_delivery_lock, claim_event_follower, emit_event_body, event_cursor_path,
+    event_follower_owner, live_event_follower, EventDeliveryLock,
     event_follower_path, event_log_current_base, event_log_head, event_log_rotation_status,
     events_log_path,
-    format_gib, latest_task_transition_targets,
+    format_gib, is_awareness_digest_trigger, latest_task_transition_targets,
     message_delivery_status, read_event_log_from, read_event_log_from_deadline,
     read_event_log_last_lines, read_event_log_recent, read_event_log_retained,
     read_event_log_since, read_event_log_tail,
@@ -1230,7 +1238,7 @@ pub fn try_lock_zen_target_cleanup(key: &str) -> Result<Option<ZenTargetLock>> {
 /// Sibling lock-file path for `path` (`state.json` → `state.json.lock`).
 /// The suffix is appended to the full file name — never `with_extension`,
 /// which would collide `a.json` and `a.yaml` onto the same lock.
-fn sibling_lock_path(path: &Path) -> PathBuf {
+pub(crate) fn sibling_lock_path(path: &Path) -> PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     path.with_file_name(name)
@@ -4240,9 +4248,7 @@ mod tests {
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,

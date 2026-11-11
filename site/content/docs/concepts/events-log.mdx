@@ -142,6 +142,14 @@ to happen, which can be hours, or never if a marker-emitting code path
 silently regresses. The recurring line is the orchestrator's fallback
 trigger to wake up and check active issues.
 
+On the [awareness system](/docs/configuration/project#event-systems)
+(`orchestrator.awareness: awareness`) the periodic heartbeat stands down. The
+same line, there called the board digest, is written right after an issue moves
+or a reminder, job or overdue line lands: one per burst, never on a quiet board,
+so the orchestrator still sees `zen_eligible` and `idle_workspaces` whenever
+capacity may have changed. The cadence, back-off and offline pause above don't
+apply to it.
+
 The Activity feed (in the TUI and the desktop app) filters heartbeats out by design. They'd
 produce one "nothing happened" row every few minutes. Use
 `shelbi events tail` if you want to see them.
@@ -159,6 +167,21 @@ position). Because every state line now leads with the `project=` scope,
 and more. New line shapes get added over time; consumers that only
 recognize `task=` and `workspace=` should fall through gracefully on the
 rest.
+
+### Reminders, jobs and overdue issues
+
+```
+<ts> project=<p> reminder id=r3 text="check the release tap PR merged"
+<ts> project=<p> job id=j4 kind=command label="desktop tests" status=failed exit=3 detail="<last line>" log=<path>
+<ts> project=<p> task=<id> overdue estimate=45m elapsed=1h10m workspace=<ws>
+```
+
+Written by the hub for what the orchestrator asked to hear about:
+[`shelbi remind`](/docs/cli/remind) reminders coming due,
+[`shelbi job`](/docs/cli/job) jobs finishing, and active issues running past
+their [estimate](/docs/cli/issue#estimate). Free text is double-quoted. Every
+event system records them, but they matter most on the awareness system, where
+nothing else wakes the orchestrator on a schedule.
 
 ### Zen and CI lines
 

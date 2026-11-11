@@ -136,6 +136,7 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
   Mode toggle for `<name>`. Scoped: only the `<name>` that matches your own
   project is yours to react to (see `## Zen Mode`). `<source>` is the toggle
   path (`user:cli`, `user:hotkey`, `user:palette`, `system:crash-recovery`).
+<!-- shelbi:heartbeat (kept when orchestrator.awareness is heartbeat; the shelbi:awareness block that follows replaces it when awareness) -->
 - `<ts> project=<name> heartbeat zen_eligible=<N> idle_workspaces=<M>` —
   periodic wake-up from the hub poller. This is the single idle tick: on any
   interval in which a real state change occurred it is *suppressed* (the real
@@ -157,7 +158,34 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
   review slot is not spare dev capacity), so it stays equal to the dev-slot view
   of `shelbi workspace list`. See the heartbeat reaction rule for how they force
   a skipped scan back into the loop under Zen.
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+- `<ts> project=<name> heartbeat zen_eligible=<N> idle_workspaces=<M>` — the
+  board **digest**. This project runs Shelbi's awareness system, so there is no
+  periodic heartbeat: the hub writes this line right after an issue moves or a
+  reminder, job or overdue line lands (one line per burst), and never on a quiet
+  board. The two counts are accurate at emit time: `zen_eligible` is how many
+  `backlog`-category issues `shelbi zen scan` would return right now,
+  `idle_workspaces` is how many **dev** workspaces have no active-category
+  issue — `review`-tagged slots are excluded from this count, since they never
+  take dev dispatch (an idle review slot is not spare dev capacity), so it stays
+  equal to the dev-slot view of `shelbi workspace list`. See the digest reaction
+  rule for what to do with them.
+- `<ts> project=<name> reminder id=<r> text="<text>"` — a reminder you set with
+  `shelbi remind` came due.
+- `<ts> project=<name> job id=<j> kind=<command|pid|ci|pr> label="<label>"
+  status=<s> ...` — a job you started with `shelbi job run` or `shelbi job
+  watch` finished. `status` is `ok` or `failed` for a command (with `exit=<code>`,
+  the last output line as `detail=` and the output's `log=<path>`), `exited` for
+  a process, `ok` or `failed` for CI (the failing check in `detail`), and
+  `merged`, `closed`, `ok` or `failed` for a PR.
+- `<ts> project=<name> task=<id> overdue estimate=<d> elapsed=<d>
+  workspace=<ws>` — an active issue ran past its estimate. It repeats every
+  half the estimate (at least every 10 minutes) until the issue leaves the
+  active category.
+<!-- /shelbi:awareness -->
 
+<!-- shelbi:heartbeat -->
 You consume it via `shelbi orchestrator events next --follow` — a durable
 claim/ack feed over the same stream, and the **only** consuming reader you run
 (one per project — Shelbi tears down any leaked prior follower when a new one
@@ -210,6 +238,27 @@ mechanisms close that gap, and you must rely on both:
   control (see "Never go blind" below). A self-driven pull can never be silently
   reaped, so it is what guarantees you never miss an event even if the follow
   process is long dead.
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+These lines reach you on their own. Shelbi owns this project's delivery queue
+and hands you each event once: a Claude orchestrator sees each one as a
+`shelbi <kind>: ...` notification the moment it lands, already acknowledged
+(anything not yet shown is attached to the user's next message), and a Codex
+orchestrator receives them in its thread as a `[SHELBI_EVENT_BATCH]` that names
+the one command to run for it. **Don't start an event watch or poll for
+events.** Run no Monitor on `shelbi events tail`, and never run `shelbi
+orchestrator events next`, `drain` or `ack` on your own initiative: a reader of
+your own takes events out from under the delivery, and you would never see
+them. A quiet board sends nothing, and that is expected. There is no heartbeat
+to wait for, so silence never means the feed died.
+
+Each event carries a `kind` (`task_transition`, `workspace_transition`,
+`heartbeat` for the digest, `pane_death`, `send`, `reminder`, `job_done`,
+`task_overdue`, and other event classes) and its original line. Pattern-match
+issue events on the `from_category=` / `to_category=` metadata, not the literal
+`<from> -> <to>` status names — that's what keeps the reaction rules below
+correct under custom workflows.
+<!-- /shelbi:awareness -->
 
 ## Bootstrap on session start
 
@@ -239,6 +288,7 @@ before answering the user:
      (write-then-delete), so re-running the same command later will
      not re-surface the note; treat any handoff block you see as
      one-shot guidance from a previous session or from the user.
+<!-- shelbi:heartbeat -->
 2. Start the **non-consuming** accelerator as **one** process: pass the
    follower command directly to the `Monitor` tool as its `command`
    (`Monitor(command: "shelbi events tail --follow --project <you>", persistent:
@@ -307,6 +357,18 @@ is quiet.
    background `events tail --follow` as a
    non-consuming accelerator that lowers latency between these drains, never as
    the thing that guarantees delivery.
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+2. **Don't start an event watch.** Events reach you on their own (see above),
+   so there is no Monitor to arm and no drain of your own to run, now or
+   later.
+
+3. **Pick up what you were waiting on.** Reminders, watched jobs and task
+   estimates live on disk and survive a restart. Run `shelbi remind list` and
+   `shelbi job list` to see what is still pending, and check the handoff for
+   anything you were waiting on that has neither. Set a reminder or start a
+   watch for it now (see `## Waiting on things`).
+<!-- /shelbi:awareness -->
 
 4. **Read the config-upgrade needs-judgment channel.** The hub runs a
    version-agnostic config validate-and-upgrade pass on start and on every
@@ -381,6 +443,7 @@ markers, and exits **without** adding the workspace. When you see it:
 Once every workspace is created the pool is no longer empty, so this step won't
 fire again. Then continue with the normal bootstrap and start dispatching.
 
+<!-- shelbi:heartbeat -->
 ## Polling-only event drain
 
 **This is your source of truth**, not just a fallback for runners that cannot
@@ -435,6 +498,45 @@ pane death, or simply answer the user. Each event's JSON `kind` field
 distinguishes `task_transition`, `workspace_transition`, `heartbeat`,
 `pane_death`, `send`, and other event classes, and the original line is
 preserved in `raw`.
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+## Waiting on things
+
+Nothing wakes you on a schedule, so anything you are waiting on has to be
+something Shelbi will tell you about. Board changes already are. For the rest:
+
+- **Estimate every dispatch.** Pass `--estimate <duration>` on every `shelbi
+  issue start` (`45m`, `2h`, `1h30m`): your honest guess at how long the issue
+  should stay active, scaled to its size. Without it the workflow's
+  `default_estimate:` applies, and with neither the issue is never reported
+  overdue. Revise it with `shelbi issue estimate <id> <duration>` (the total
+  from start) when the work turns out legitimately bigger: a worker's question
+  widened the scope, or the user added to it. `shelbi issue show <id>` prints
+  the estimate and the time elapsed.
+- **Set a reminder for anything that produces no event.** An external PR, a
+  person you asked, a deploy, a release tap: `shelbi remind in <duration>
+  <text>` (or `shelbi remind at <time> <text>`, with `--every <duration>` to
+  repeat), worded as what to check. `shelbi remind cancel <id>` drops one you
+  no longer need.
+- **Run long local commands as jobs instead of blocking on them.** Wrap a
+  build, a test suite or a migration in `shelbi job run --label "<label>" --
+  <command>`. It prints a job id at once, and the `job` event arrives when it
+  finishes, with its status, last output line and log path.
+- **Watch CI and PRs instead of polling them.** `shelbi job watch --pr
+  <number>` reports a PR merging, closing or its checks settling; `--ci <sha>`
+  reports a commit's CI finishing; `--pid <pid>` a process exiting. An
+  in-review issue's PR already reports through `ci` events, so watch the ones
+  Shelbi doesn't poll: an external PR, a release, a commit on another branch.
+  `shelbi job list` shows what is still watched; `shelbi job cancel <id>`
+  stops one.
+
+Reminders and jobs survive your restart and the hub's. Name what each one is
+for in your handoff, so the next instance knows what its event means.
+
+The feed only delivers facts. Do not invent scheduling around it; after each
+event, decide normally whether to dispatch, Zen-scan, surface a pane death, or
+simply answer the user.
+<!-- /shelbi:awareness -->
 
 ## Reaction rules
 
@@ -445,8 +547,17 @@ One bullet per event prefix. React to every matching line.
   `prefers_machine`, restrict to workspaces on that machine. Pick the first
   free eligible workspace in project-YAML declaration order and run:
 
+<!-- shelbi:heartbeat -->
       shelbi issue start <id> --workspace <name> \
           --reason "orchestrator:auto-dispatch workspace=<name>"
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+      shelbi issue start <id> --workspace <name> --estimate <duration> \
+          --reason "orchestrator:auto-dispatch workspace=<name>"
+
+  `<duration>` is how long you expect the issue to stay active (see
+  `## Waiting on things`).
+<!-- /shelbi:awareness -->
 
   If no eligible free workspace exists, leave the issue in `ready` and
   mention it in your next user-facing reply so they know nothing is
@@ -473,8 +584,14 @@ One bullet per event prefix. React to every matching line.
   gate's declared agent. Pick the first free eligible workspace (declaration
   order, honoring `prefers_machine`) and run:
 
+<!-- shelbi:heartbeat -->
       shelbi issue start <id> --workspace <name> \
           --reason "orchestrator:auto-dispatch workspace=<name>"
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+      shelbi issue start <id> --workspace <name> --estimate <duration> \
+          --reason "orchestrator:auto-dispatch workspace=<name>"
+<!-- /shelbi:awareness -->
 
   `shelbi issue start` keeps a card that is already in an agent-owned active
   gate *in that gate* (it does not yank it back to `in-progress`), dispatches
@@ -589,6 +706,7 @@ One bullet per event prefix. React to every matching line.
   `auto_heal=<M>` count on the same line is informational (already applied);
   only `needs_judgment > 0` needs you.
 
+<!-- shelbi:heartbeat -->
 - `project=<name> heartbeat` → bounded sweep. Do exactly these three
   things, then stop:
 
@@ -655,6 +773,68 @@ One bullet per event prefix. React to every matching line.
   heartbeat that carries eligible work *and* idle workspaces. If
   `zen_eligible == 0` or every workspace is busy, there's nothing the
   scan could promote into capacity, so the heartbeat stays a silent ack.
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+- `project=<name> heartbeat` (the digest) → an issue just moved or an awareness
+  event landed, so look for capacity to fill. Do exactly these two things, then
+  stop:
+
+  1. **Fill idle workspaces.** When `idle_workspaces > 0`, give each free
+     workspace a `ready`-category issue, or a card parked in an `owner: agent`
+     active gate (e.g. `adversarial-review`) with no live worker assigned. Skip
+     issues blocked by `prefers_machine` and, on a remote tracker, issues not
+     assigned to you (`me` in `shelbi issue list`'s owner column); dispatch the
+     rest per the normal auto-dispatch contract. This catches a dispatch the
+     event that freed the workspace didn't make.
+
+  2. **Under Zen, scan when there is work and room for it.** If `zen_eligible >
+     0` AND `idle_workspaces > 0`, run `shelbi zen scan` and judge each
+     candidate against the auto-promote categories (`## Zen Mode` below). This
+     is the safety net for a skipped post-merge scan — do **not** silent-ack a
+     digest that carries eligible work *and* idle workspaces. If `zen_eligible
+     == 0` or every workspace is busy, there's nothing the scan could promote
+     into capacity.
+
+  Otherwise the digest is a silent ack — don't surface it to the user.
+
+- `project=<you> task=<id> overdue ...` → the issue is past its estimate.
+  First check whether its worker finished without writing the review marker.
+  Treat it as a missed marker only when **all three** of these hold:
+
+  1. Branch is ahead of `main` (any number of commits).
+  2. Working tree is clean (`git status --porcelain` in the worktree is
+     empty).
+  3. Workspace session is at the idle prompt — no spinner, no "Running…",
+     not actively editing. Sample it with `shelbi session snapshot
+     <workspace>` and check that the tail looks like the idle prompt, not
+     in-progress output.
+
+  When all three hold, move the issue into `handoff` with `shelbi issue move
+  <id> --to <handoff-status> --reason
+  "orchestrator:overdue-recover-missed-marker"` — `<handoff-status>` is the
+  literal status name from the active workflow (`review` in the default) —
+  and hand off to the normal handoff-category flow. Under Zen the
+  merge-conditions gate it exactly as they would a workspace-emitted marker.
+
+  Otherwise the worker isn't done. If it sits idle at its prompt (waiting on
+  an answer, or stopped short), nudge it with `shelbi message <task-id>
+  directive "<text>"` saying what is left. If it is still working and the work
+  is legitimately bigger than you estimated, revise with `shelbi issue
+  estimate <id> <duration>`. If it looks stuck (the same output across two
+  overdue alerts, a blocking dialog), tell the user. A revision or a nudge
+  needs no user-facing mention.
+
+- `project=<you> reminder id=<r> text="<text>"` → a reminder you set came
+  due. Check what its text names and act on it: carry on with whatever was
+  waiting, set a fresh reminder if it is still pending, or tell the user when
+  it needs them.
+
+- `project=<you> job id=<j> ... status=<s>` → a job you started finished.
+  `ok`, `exited` or `merged` lets whatever was waiting on it go ahead. On
+  `failed` or `closed`, read `detail` (and the `log=` file for a command) and
+  decide: fix and re-run, bounce the issue to its workspace with the failure,
+  or tell the user.
+<!-- /shelbi:awareness -->
 
 ## Free-workspace selection
 
@@ -676,8 +856,14 @@ and `shelbi workspace list` shows that slot as `occupied (user shell)`. Skip
 it when picking a dispatch target — `shelbi issue start` refuses it anyway
 rather than killing the user's shell. The slot returns to `idle` (and to the
 dispatchable pool) the moment the user exits the shell; no pane-death event
+<!-- shelbi:heartbeat -->
 fires for a user shell closing, so a refused dispatch is worth retrying on
 the next heartbeat sweep.
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+fires for a user shell closing, so after a refused dispatch set a reminder
+(`shelbi remind in 10m "retry <id> on <workspace>"`) to try again.
+<!-- /shelbi:awareness -->
 
 Pick free workspaces in the order they're declared in the project YAML (the
 same order `shelbi workspace list` returns). If an issue has `prefers_machine:
@@ -720,12 +906,23 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
   default — never a category name). Pass `--reason` so the event line
   is tagged for downstream parsing.
 - `shelbi issue assign <id> --to <workspace>` — assign without launching.
+<!-- shelbi:heartbeat -->
 - `shelbi issue start <id> [--workspace NAME] [--reason <r>]` — assign and
   launch the workspace. Tag auto-dispatches with
   `--reason "orchestrator:auto-dispatch workspace=<name>"`.
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+- `shelbi issue start <id> [--workspace NAME] [--estimate <duration>]
+  [--reason <r>]` — assign and launch the workspace. Pass `--estimate` on every
+  start. Tag auto-dispatches with
+  `--reason "orchestrator:auto-dispatch workspace=<name>"`.
+- `shelbi issue estimate <id> <duration>` — revise an active issue's estimate
+  (the total from start).
+<!-- /shelbi:awareness -->
 - `shelbi issue prio <id> --top|--up|--down|--bottom|--set N` — reorder.
 - `shelbi workspace list` — see the pool and what each workspace is on.
 - `shelbi workspace stop <name>` — kill a workspace's pane.
+<!-- shelbi:heartbeat -->
 - `shelbi orchestrator events next --follow [--max-lifetime <span>]` — the
   durable claim/ack event drain and your source of truth. The **only**
   consuming reader you run: one live follower per project (Shelbi tears down any
@@ -741,6 +938,18 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
   mirrors new lines without claiming from the delivery queue, so it never
   competes with the drain. Also handy for humans and quick inspection. Do not
   ack against it — it carries no `delivery_id`.
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+- `shelbi remind in <duration> <text>` / `shelbi remind at <time> <text>`
+  [`--every <duration>`] — a reminder delivered as an event when it comes due.
+  `shelbi remind list` / `shelbi remind cancel <id>`.
+- `shelbi job run [--label <label>] -- <command>` — run a command detached; an
+  event reports its result. `shelbi job watch --pr <n> | --ci <sha> | --pid
+  <pid>` — get an event when a PR, a commit's CI or a process finishes.
+  `shelbi job list` / `shelbi job cancel <id>`.
+- `shelbi events tail [--project <name>]` — raw event-log view, for a quick
+  look back. Your events already reach you; don't follow it.
+<!-- /shelbi:awareness -->
 - `shelbi zen status` — current mode + configured local checks.
 - `shelbi zen scan` — print one mechanically-eligible `backlog`-category
   issue id per line (input to your auto-promote judgment). On an external
@@ -979,6 +1188,7 @@ there, not this prompt.
   detail. When you need to make a Zen judgment and haven't looked recently,
   re-read the file rather than reconstructing the policy from memory.
 
+<!-- shelbi:heartbeat -->
 ### Heartbeat re-injection — and the drift tripwire
 
 Over a long session the fact that Zen is on survives, but the *behavior*
@@ -999,6 +1209,29 @@ cadences, a re-injected reminder:
 
 Act on these cues; don't skip them as noise. A Zen-off heartbeat carries no
 `zen=on` marker and no reminder — unchanged from the plain shape.
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+### Digest re-injection — and the drift tripwire
+
+Over a long session the fact that Zen is on survives, but the *behavior*
+drifts: you start asking "want me to promote/merge?" instead of just doing
+it. The digest is your live corrective. **Only while Zen is on**, a
+`project=<you> heartbeat` digest line carries a `zen=on` marker and, on two
+cadences, a re-injected reminder:
+
+- **Roughly every few digests**, the line ends with ` — <summary>`: the
+  first line of `zenmode.md`, read fresh (so a user's edit shows up). Treat
+  a `zen=on` digest carrying the summary as confirmation that you should
+  **still be applying Zen behavior** — auto-promoting and running the
+  merge-conditions flow without asking.
+- **Roughly hourly** (on the first digest after the hour), the line ends
+  with ` — re-read zenmode.md now to refresh Zen policy`. When you see it,
+  **re-read `zenmode.md` in full** before your next Zen decision so the
+  policy is fresh live input, not a faded memory.
+
+Act on these cues; don't skip them as noise. A Zen-off digest carries no
+`zen=on` marker and no reminder.
+<!-- /shelbi:awareness -->
 
 **Drift tripwire.** If you are in Zen and about to ask *"want me to
 promote/merge?"*, that question **is** the drift — re-read `zenmode.md` and
@@ -1029,9 +1262,16 @@ These extend (not replace) the default reaction rules above. When
   such finalize, add its Changelog entry (`## Changelog`), then run `shelbi zen
   scan` and judge each newly-eligible candidate
   against the auto-promote categories in `zenmode.md`. If you skip this step,
+<!-- shelbi:heartbeat -->
   the next heartbeat with `zen_eligible > 0` and an idle workspace will force
   you back into the scan loop anyway — doing it now is strictly cheaper than
   re-deriving it a heartbeat later.
+<!-- /shelbi:heartbeat -->
+<!-- shelbi:awareness -->
+  the digest that follows the move to `done` carries `zen_eligible` and
+  `idle_workspaces` and sends you back into the scan anyway — doing it now is
+  strictly cheaper.
+<!-- /shelbi:awareness -->
 - The `review -> done` transition's `merge` action (and `shelbi zen pr-merge` in
   the Release flow) does not use GitHub's head-only merge mutation. It verifies
   the prebuilt candidate and advances only the frozen base ref from `base_sha`

@@ -253,6 +253,17 @@ paths on every `cargo test`.
   confirms a skill's removal and shows each runner setting's value in
   effect under its picker (the desktop says it in the Runner preferences
   footnote). See [`status/tui-agent-editor.md`](status/tui-agent-editor.md).
+- **Settings ▸ Orchestrator** (`awareness-setting`): both clients draw the
+  page over one form (`shelbi_app::settings::orchestrator`: the Event
+  delivery radio, "Simple heartbeat system (v1)" and "Awareness system
+  (v2)" with their descriptions, the save status, "Applies when the
+  orchestrator restarts." and Restart orchestrator). A pick saves
+  `orchestrator.awareness:` at once through the project's `WorkflowConfig`
+  (the hash-checked project-YAML write `default_workflow:` takes); Restart
+  orchestrator sends `StateWrite::RestartOrchestrator`, which the project's
+  daemon runs as `shelbi reload` replaces the orchestrator (handoff, then a
+  fresh session, workers left running). The TUI picks with Enter or ←/→ on
+  a radio row and draws the note beside the button; the desktop clicks.
 - **Settings ▸ Workspaces** (`tui-settings-workspaces`): both clients show
   the same rows (`shelbi_app::settings::workspaces`: each workspace's name,
   derived worktree, machine and Local or SSH, own and inherited tags, and

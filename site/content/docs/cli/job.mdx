@@ -1,0 +1,70 @@
+---
+title: shelbi job
+order: 33.7
+summary: Run a command detached, or watch a process, a commit's CI, or a PR, and get an event when it finishes.
+---
+
+```text
+shelbi job run [--label <LABEL>] -- <COMMAND>...
+shelbi job watch (--pid <PID> | --ci <SHA> | --pr <NUMBER>) [--label <LABEL>]
+shelbi job list [--json]
+shelbi job cancel <ID>
+```
+
+A job is something the orchestrator is waiting on. The hub keeps it in
+`~/.shelbi/projects/<project>/awareness.json`, checks it every 5 seconds, and
+writes one line to `~/.shelbi/events.log` when it finishes:
+
+```text
+<ts> project=<p> job id=j4 kind=command label="desktop tests" status=failed exit=3 detail="<last line>" log=<path>
+```
+
+`shelbi orchestrator events next` reports it with kind `job_done`.
+
+| `kind` | `status` |
+| --- | --- |
+| `command` | `ok` (exit 0) or `failed`, with `exit=<code>` and the last output line as `detail`. |
+| `pid` | `exited`. |
+| `ci` | `ok` or `failed` (the failing check in `detail`). |
+| `pr` | `merged`, `closed`, or `ok` / `failed` once its checks settle. |
+
+## run
+
+Runs a command detached and prints its job id at once:
+
+```sh
+shelbi job run --label "desktop tests" -- cargo test
+```
+
+The command runs in the current directory, in its own session, so it keeps
+running after the CLI exits and across a hub daemon restart. Its combined
+output goes to `~/.shelbi/projects/<project>/jobs/<id>/output.log` (the event's
+`log=`), and its exit code and last 20 lines to `result.json` beside it. Job
+directories are kept for a week.
+
+## watch
+
+Watches something already running:
+
+| Option | Meaning |
+| --- | --- |
+| `--pid <PID>` | A process on this machine, until it exits. |
+| `--ci <SHA>` | A commit's CI on GitHub, until every reported check has finished. A short sha or ref is resolved in the current repository. |
+| `--pr <NUMBER>` | A pull request, until it merges, closes, or its checks settle. |
+| `--label <LABEL>` | A short name for the event and `job list`. |
+
+CI and PR watches ask GitHub once a minute, and only while the machine is online.
+
+## list
+
+Lists the jobs still being watched. `--json` prints them as JSON.
+
+## cancel
+
+Stops watching a job. A `job run` command that is still running is sent
+SIGTERM (its whole process group).
+
+## See also
+
+- [`shelbi remind`](/docs/cli/remind): reminders delivered as events.
+- [`shelbi orchestrator`](/docs/cli/orchestrator): how the orchestrator drains events.

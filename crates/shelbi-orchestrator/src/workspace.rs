@@ -4608,6 +4608,11 @@ pub const ORCHESTRATOR_SYSTEM_PLUGIN_REL: &str =
     ".claude/shelbi-system-plugins/update-shelbi-configuration";
 pub const ORCHESTRATOR_SYSTEM_SKILLS_REL: &str =
     ".claude/shelbi-system-plugins/update-shelbi-configuration/skills";
+/// Session-scoped awareness (v2) delivery plugin, staged beside the
+/// configuration plugin only for a project on `orchestrator.awareness:
+/// awareness` (see [`deploy_orchestrator_awareness_plugin`]).
+pub const ORCHESTRATOR_AWARENESS_PLUGIN_REL: &str =
+    ".claude/shelbi-system-plugins/shelbi-awareness";
 pub const WORKTREE_STARTUP_PROMPT_REL: &str = ".shelbi/startup-prompt.md";
 
 /// Relative path (from the worktree root) where the dispatched agent's
@@ -4979,14 +4984,21 @@ fn compose_and_mount_agent_context(
 /// where the old one left off. This function never reads `handoff.md` itself:
 /// whether the launch succeeded, and so what becomes of the file, is the
 /// launch's call.
+///
+/// `awareness` picks which event system the body teaches: the instructions'
+/// `<!-- shelbi:heartbeat -->` / `<!-- shelbi:awareness -->` blocks are kept
+/// or dropped by it ([`shelbi_state::select_awareness_variant`]) before the
+/// handoff is spliced on, so the handoff itself is never filtered.
 pub fn deploy_agent_context(
     host: &Host,
     worktree: &Path,
     project_name: &str,
     agent: &str,
+    awareness: shelbi_core::AwarenessMode,
     handoff: Option<&str>,
 ) -> Result<()> {
-    let mut composed = compose_and_mount_agent_context(host, worktree, project_name, agent)?;
+    let composed = compose_and_mount_agent_context(host, worktree, project_name, agent)?;
+    let mut composed = shelbi_state::select_awareness_variant(&composed, awareness);
     if let Some(handoff) = handoff {
         composed = splice_orchestrator_handoff(&composed, handoff);
     }
@@ -5101,6 +5113,35 @@ fn deploy_orchestrator_system_skill(
     ignore_rels.push(".claude/shelbi-system-plugins/".to_string());
     let _ = gitignore_worktree_paths(host, worktree, &ignore_rels);
     Ok(())
+}
+
+/// Stage (or, when `enabled` is false, remove) the `shelbi-awareness` plugin
+/// in the orchestrator's workdir. Returns whether a complete bundle is staged,
+/// which is what the launch keys its `--plugin-dir` and bootstrap prompt on: a
+/// failed stage falls back to the v1 self-driven drain rather than pointing
+/// Claude at a missing plugin. The directory sits under the already-ignored
+/// `.claude/shelbi-system-plugins/`.
+pub fn deploy_orchestrator_awareness_plugin(
+    host: &Host,
+    workdir: &Path,
+    enabled: bool,
+) -> Result<bool> {
+    let root = workdir.join(ORCHESTRATOR_AWARENESS_PLUGIN_REL);
+    // Start clean either way, so a file dropped from the bundle (or the whole
+    // plugin, after switching back to v1) never lingers.
+    remove_worktree_entry(host, &root)?;
+    if !enabled {
+        return Ok(false);
+    }
+    let plugin = crate::awareness_plugin::resolve_awareness_plugin();
+    for warning in &plugin.warnings {
+        eprintln!("shelbi: warning: {warning}");
+        tracing::warn!("{warning}");
+    }
+    for (rel, body) in &plugin.files {
+        write_worktree_text(host, &root.join(rel), body, "awareness-plugin")?;
+    }
+    Ok(true)
 }
 
 /// Wrap `handoff` in a `<system-reminder>` block and append it to
@@ -7965,9 +8006,7 @@ mod tests {
                     forward: None,
                 },
             ],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -11513,7 +11552,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", shelbi_core::AwarenessMode::Heartbeat, None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         assert_eq!(
@@ -11677,7 +11716,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", shelbi_core::AwarenessMode::Heartbeat, None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         let body = std::fs::read_to_string(&instructions).unwrap();
@@ -11734,6 +11773,7 @@ statuses:
             &worktree,
             "p",
             "orchestrator",
+            shelbi_core::AwarenessMode::Heartbeat,
             Some("watching: task xyz\n"),
         )
         .unwrap();
@@ -11781,7 +11821,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", shelbi_core::AwarenessMode::Heartbeat, None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         let body = std::fs::read_to_string(&instructions).unwrap();
@@ -11823,7 +11863,7 @@ statuses:
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
 
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", shelbi_core::AwarenessMode::Heartbeat, None).unwrap();
 
         let instructions = worktree.join(".claude/agent-instructions.md");
         let body = std::fs::read_to_string(&instructions).unwrap();
@@ -11831,6 +11871,51 @@ statuses:
             !body.contains("<system-reminder>"),
             "cold start must NOT inject an empty system-reminder block: {body}"
         );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn deploy_agent_context_composes_the_orchestrator_for_its_awareness_mode() {
+        // The shipped orchestrator instructions carry both event systems in
+        // marked blocks; the deployed body keeps exactly one and no markup.
+        // The heartbeat (v1) body is the template's v1 composition, the
+        // awareness (v2) body teaches reminders, jobs and estimates and none
+        // of the heartbeat sweep or the Monitor-driven drain.
+        let _g = crate::test_lock::acquire();
+        let tmp = agent_test_tmpdir("ctx-awareness");
+        let home = tmp.join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        install_default_agents_under_home(&home, "p");
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let instructions = worktree.join(".claude/agent-instructions.md");
+        let template = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        std::fs::write(
+            shelbi_state::agent_instructions_path("p", "orchestrator").unwrap(),
+            template,
+        )
+        .unwrap();
+
+        use shelbi_core::AwarenessMode::{Awareness, Heartbeat};
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", Heartbeat, None).unwrap();
+        let v1 = std::fs::read_to_string(&instructions).unwrap();
+        assert!(v1.ends_with(&shelbi_state::select_awareness_variant(template, Heartbeat)));
+        assert!(v1.contains("bounded sweep") && v1.contains("Monitor(command:"));
+
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", Awareness, Some("watching: j4\n"))
+            .unwrap();
+        let v2 = std::fs::read_to_string(&instructions).unwrap();
+        assert!(!shelbi_state::has_awareness_variants(&v2), "markup leaked: {v2}");
+        for v1_rule in ["bounded sweep", "Monitor(command:", "--max-lifetime", "Polling-only event drain"] {
+            assert!(!v2.contains(v1_rule), "v2 body still carries `{v1_rule}`");
+        }
+        for v2_rule in ["## Waiting on things", "--estimate <duration>", "shelbi remind in", "shelbi job watch --pr"] {
+            assert!(v2.contains(v2_rule), "v2 body is missing `{v2_rule}`");
+        }
+        assert!(v2.ends_with("<system-reminder>\nwatching: j4\n</system-reminder>\n"));
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&tmp);
@@ -11855,7 +11940,7 @@ statuses:
         std::fs::create_dir_all(&worktree).unwrap();
 
         // Dispatch 1 — developer.
-        deploy_agent_context(&Host::Local, &worktree, "p", "developer", None).unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "developer", shelbi_core::AwarenessMode::Heartbeat, None).unwrap();
         let instructions = worktree.join(".claude/agent-instructions.md");
         let skills_dir = worktree.join(".claude/skills");
         assert!(skills_dir.join("debug.md").exists());
@@ -11866,7 +11951,7 @@ statuses:
         // Dispatch 2 — orchestrator. The developer's `debug.md` must NOT
         // survive the swap; the instructions file is overwritten and the
         // Shelbi-owned system skill is installed for both built-in runners.
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", shelbi_core::AwarenessMode::Heartbeat, None).unwrap();
         assert!(
             !skills_dir.join("debug.md").exists(),
             "developer's skill leaked into orchestrator dispatch",
@@ -11894,7 +11979,7 @@ statuses:
         // A resumed/reloaded orchestrator re-resolves and re-stages the same
         // bundle rather than inheriting mutable session state.
         let first_bytes = std::fs::read(&staged_skill).unwrap();
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", shelbi_core::AwarenessMode::Heartbeat, None).unwrap();
         assert_eq!(std::fs::read(&staged_skill).unwrap(), first_bytes);
         assert!(std::fs::read_to_string(&instructions)
             .unwrap()
@@ -11928,7 +12013,7 @@ statuses:
 
         let worktree = tmp.join("wt");
         std::fs::create_dir_all(&worktree).unwrap();
-        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", None).unwrap();
+        deploy_agent_context(&Host::Local, &worktree, "p", "orchestrator", shelbi_core::AwarenessMode::Heartbeat, None).unwrap();
 
         assert_eq!(
             std::fs::read_to_string(worktree.join(".claude/agent-instructions.md")).unwrap(),
@@ -13539,9 +13624,7 @@ mod sync_worktree_git_tests {
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -14824,9 +14907,7 @@ mod sync_worktree_freshcut_tests {
             default_workflow: None,
             config_mode: None,
             machines: vec![machine_at(repo)],
-            orchestrator: shelbi_core::OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: shelbi_core::OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -15286,9 +15367,7 @@ mod sync_worktree_freshcut_tests {
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: shelbi_core::OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: shelbi_core::OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,

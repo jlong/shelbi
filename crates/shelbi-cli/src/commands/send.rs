@@ -176,9 +176,7 @@ mod tests {
                     forward: None,
                 },
             ],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,

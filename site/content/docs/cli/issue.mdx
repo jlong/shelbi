@@ -124,7 +124,8 @@ shelbi issue show <ID>
 ```
 
 Print an issue's frontmatter and body, plus the resolved status of each
-`depends_on` entry. The same view the orchestrator reads before deciding
+`depends_on` entry and, for an active issue with an [estimate](#estimate), the
+estimate and time elapsed. The same view the orchestrator reads before deciding
 whether an issue is ready to dispatch.
 
 ## depends
@@ -217,6 +218,32 @@ the orchestrator runs when an issue hits `todo`.
 | `--reason <REASON>` | string | `user:cli:start` | Reason tag recorded in `~/.shelbi/events.log` when the column transitions to `in_progress`. |
 | `--force` | flag | off | Launch on a `review`-tagged workspace anyway (refused by default). Recorded in `~/.shelbi/events.log`. |
 | `--take` | flag | off | On a remote issue tracker (e.g. GitHub), assign the issue to you on the tracker before starting. Needed for an unassigned issue or one you're taking over; Shelbi only starts issues assigned to you there. The orchestrator never passes it. |
+| `--estimate <DURATION>` | duration | workflow `default_estimate` | How long the issue should stay active (`45m`, `2h`, `1h30m`). See [estimate](#estimate). |
+
+## estimate
+
+```text
+shelbi issue estimate <ID> <DURATION>
+```
+
+Set or revise how long an active issue should take. The estimate counts the
+total time active, from when the issue started. If the issue is still in an
+`active`-category status once the estimate has passed, the hub writes an
+`overdue` line to `~/.shelbi/events.log`:
+
+```text
+<ts> project=<p> task=<id> overdue estimate=45m elapsed=1h10m workspace=<ws>
+```
+
+It repeats every half the estimate (at least every 10 minutes) until the issue
+leaves the active category, so a 90m issue alerts at 90m, 135m, 180m, and so on.
+Moving the issue to handoff, done, back to ready, or canceled drops the estimate.
+
+`shelbi issue start --estimate <DURATION>` records one when the issue starts.
+Without `--estimate`, the issue's workflow
+[`default_estimate`](/docs/configuration/workflow#top-level-fields) applies; with
+neither, no estimate is kept. A revision that is already exceeded alerts on the
+hub's next tick. `shelbi issue show` prints the estimate and the time elapsed.
 
 ## resume
 

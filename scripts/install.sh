@@ -120,21 +120,27 @@ cp target/release/shelbi "$INSTALL_PATH"
 
 INSTALL_PREFIX="$(dirname "$(dirname "$INSTALL_PATH")")"
 PLUGIN_PARENT="$INSTALL_PREFIX/share/shelbi/plugins"
-ASSET_ROOT="$PLUGIN_PARENT/update-shelbi-configuration"
-echo "==> installing system plugin to $ASSET_ROOT"
 mkdir -p "$PLUGIN_PARENT"
-STAGED_ASSET_ROOT="$(mktemp -d "$PLUGIN_PARENT/.update-shelbi-configuration.XXXXXX")"
+STAGED_ASSET_ROOT=""
 cleanup_staged_asset() {
-  rm -rf "$STAGED_ASSET_ROOT"
+  if [[ -n "$STAGED_ASSET_ROOT" ]]; then
+    rm -rf "$STAGED_ASSET_ROOT"
+  fi
 }
 trap cleanup_staged_asset EXIT
-cp -R plugins/update-shelbi-configuration/. "$STAGED_ASSET_ROOT"
+for plugin in update-shelbi-configuration shelbi-awareness; do
+  ASSET_ROOT="$PLUGIN_PARENT/$plugin"
+  echo "==> installing system plugin to $ASSET_ROOT"
+  STAGED_ASSET_ROOT="$(mktemp -d "$PLUGIN_PARENT/.$plugin.XXXXXX")"
+  cp -R "plugins/$plugin/." "$STAGED_ASSET_ROOT"
 
-# Replace the complete bundle so files removed by an upgrade cannot remain in
-# the active plugin. If this is interrupted between removal and rename, the
-# binary's embedded fallback keeps Shelbi usable until the install is retried.
-rm -rf "$ASSET_ROOT"
-mv "$STAGED_ASSET_ROOT" "$ASSET_ROOT"
+  # Replace the complete bundle so files removed by an upgrade cannot remain in
+  # the active plugin. If this is interrupted between removal and rename, the
+  # binary's embedded fallback keeps Shelbi usable until the install is retried.
+  rm -rf "$ASSET_ROOT"
+  mv "$STAGED_ASSET_ROOT" "$ASSET_ROOT"
+  STAGED_ASSET_ROOT=""
+done
 trap - EXIT
 
 if [[ "$(uname -s)" == "Darwin" ]]; then

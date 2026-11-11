@@ -1,4 +1,5 @@
 pub mod agent_manifest;
+pub mod duration;
 pub mod error;
 pub mod file_limit;
 pub mod github;
@@ -22,6 +23,7 @@ pub use agent_manifest::{
     resolve_agent_launch, AgentManifest, AgentRequires, ReasoningEffort, ResolvedAgentLaunch,
     RunnerManifestConfig, PERMISSION_MODES,
 };
+pub use duration::{format_duration, parse_duration};
 pub use error::{Error, GhTokenProbeFailure, Result};
 pub use file_limit::raise_file_limit;
 pub use home::{account_home_dir, home_dir};
@@ -36,7 +38,7 @@ pub use model::{
     default_prompt_injection, detect_project_shapes, normalize_project_name, validate_agent_id,
     validate_branch, validate_branch_prefix, validate_project_name, validate_task_id,
     validate_workflow_name, Agent, AgentDefaults,
-    AgentRunnerSpec, BudgetConfig, Column, ConfigMode, DialogSignature, DiskConfig, ForwardMode,
+    AgentRunnerSpec, AwarenessMode, BudgetConfig, Column, ConfigMode, DialogSignature, DiskConfig, ForwardMode,
     GitConfig,
     HeartbeatConfig, GithubConnection, Host, IssueTrackerBackend, IssueTrackerConfig, JiraConnection,
     LinearConnection, Machine, MachineKind, MergeStrategy, OrchestratorSpec, ParamDiagnostic,

@@ -211,6 +211,7 @@ docker run --rm -v "$PWD/dist:/dist:ro" debian:bookworm bash -euxo pipefail -c '
   shelbi --version
   command -v shelbi
   test -f /usr/share/shelbi/plugins/update-shelbi-configuration/.claude-plugin/plugin.json
+  test -f /usr/share/shelbi/plugins/shelbi-awareness/.claude-plugin/plugin.json
 '
 ```
 

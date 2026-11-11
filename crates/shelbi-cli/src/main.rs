@@ -126,6 +126,20 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::question::QuestionCmd,
     },
+    /// Reminders for the orchestrator: `remind in 1h "..."`, `remind at 15:00
+    /// "..."`, `list`, `cancel`. The hub writes a `reminder` line to
+    /// `events.log` when one comes due.
+    Remind {
+        #[command(subcommand)]
+        cmd: commands::remind::RemindCmd,
+    },
+    /// Watched jobs: `job run -- <cmd>` (detached), `job watch --pid | --ci |
+    /// --pr`, `list`, `cancel`. The hub writes a `job` line to `events.log`
+    /// when each finishes.
+    Job {
+        #[command(subcommand)]
+        cmd: commands::job::JobCmd,
+    },
     /// Ensure a workspace's session is up so the TUI can show it: a no-op for a
     /// workspace mid-task (dispatch owns its agent session), or a plain
     /// interactive login shell in the worktree for an idle workspace.
@@ -416,6 +430,17 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
     },
+    /// (internal) The detached runner `shelbi job run` starts: runs the
+    /// command with its output in the job's `output.log` and writes
+    /// `result.json` when it exits. Not for direct use.
+    #[command(hide = true)]
+    #[command(name = "__job-exec")]
+    JobExec {
+        id: String,
+        /// The command and its args, everything after `--`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
     /// (internal) The per-session process (remove-tmux backend): own one PTY
     /// and one headless terminal emulator, answer terminal queries with no
     /// client attached, serve clients on a Unix socket, and on child exit write
@@ -507,6 +532,9 @@ fn main() -> Result<()> {
             wait,
         }) => commands::message::run(cli.project, status, id, kind, body, in_response_to, wait),
         Some(Cmd::Question { cmd }) => commands::question::run(cli.project, cmd),
+        Some(Cmd::Remind { cmd }) => commands::remind::run(cli.project, cmd),
+        Some(Cmd::Job { cmd }) => commands::job::run(cli.project, cmd),
+        Some(Cmd::JobExec { id, cmd }) => commands::job::exec(cli.project, id, cmd),
         Some(Cmd::Open { name }) => commands::open::run(cli.project, name),
         Some(Cmd::Issue { cmd }) => commands::issue::run(cli.project, cmd),
         Some(Cmd::Task { cmd }) => {

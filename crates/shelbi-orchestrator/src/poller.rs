@@ -73,7 +73,7 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{DateTime, Utc};
 
 use shelbi_core::{
-    default_workflow, Column, IssueTrackerBackend, Project, StatusCategory, Workflow,
+    default_workflow, AwarenessMode, Column, IssueTrackerBackend, Project, StatusCategory, Workflow,
     DEFAULT_WORKFLOW_NAME,
 };
 use crate::session_backend::{
@@ -288,6 +288,19 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // are not retroactively reconciled — the accepted watermark tradeoff.
     let mut issue_reconcile = IssueReconcileSchedule::default();
 
+    // Awareness store evaluation (reminders, watched jobs, task estimates).
+    // The timing lives on disk in `awareness.json`, so this in-memory state
+    // only paces the GitHub-backed watches; a restart re-seeds it and samples
+    // them on the first tick.
+    let mut awareness_state = crate::awareness::AwarenessTickState::default();
+
+    // The awareness system's (v2) board digest: where in `events.log` the last
+    // scan for a transition / reminder / job / overdue line stopped. Only used
+    // while the project is on `orchestrator.awareness: awareness`; reset on the
+    // heartbeat (v1) so switching back to v2 starts at the log's head rather
+    // than answering history.
+    let mut awareness_digest = AwarenessDigest::default();
+
     // The project-wide supervisor job (`rt-daemon-cancellation`): its
     // mutating passes below (orchestrator supervision, CI/GitHub/issue
     // reconciles, stranded-slot resumes) all run on this thread and shell out,
@@ -353,7 +366,12 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 // `online_probe` is the connectivity gate: while the box is
                 // offline the heartbeat skips silently so the feed doesn't fill
                 // with no-op lines during a network drop.
-                maybe_emit_heartbeat(&project, &mut heartbeat, online_probe);
+                //
+                // On the awareness system (v2) there is no periodic heartbeat:
+                // its timer stands down (keeping the Zen cadence, which counts
+                // digests), and the digest is written after the awareness tick
+                // below, only when a board line called for one.
+                heartbeat_timer_tick(&project, &mut heartbeat, &mut awareness_digest, online_probe);
 
                 // Relaunch the orchestrator pane if it crashed (Zen stays off after
                 // the restart via its own `__zen-orch-start` crash-recovery step).
@@ -447,6 +465,26 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                 // connectivity + its own watermark so a quiet board pays almost
                 // nothing.
                 maybe_reconcile_issues(&project, &mut issue_reconcile, online_probe);
+
+                // Awareness: fire due reminders, report finished jobs, and
+                // alert on active tasks past their estimate (clearing the
+                // estimate of any task that left the active category). Cheap
+                // when the store is empty: one small file read. GitHub-backed
+                // watches sample on their own cadence and only while online.
+                crate::awareness::tick(
+                    &project,
+                    &mut awareness_state,
+                    chrono::Utc::now(),
+                    &crate::awareness::LiveProbe { is_online: online_probe },
+                );
+
+                // Awareness system (v2): the board digest the heartbeat used to
+                // carry on a timer, written once right after this tick's board
+                // transitions and reminder / job / overdue lines (including the
+                // ones the tick above just wrote), coalescing a burst into one.
+                if project.orchestrator.awareness == AwarenessMode::Awareness {
+                    maybe_emit_awareness_digest(&project, &mut heartbeat, &mut awareness_digest);
+                }
             }
             Err(e) => tracing::debug!(
                 project = %project.name,
@@ -689,6 +727,28 @@ struct HeartbeatSchedule {
     /// look idle and pull work onto busy workers. `None` until the first warm
     /// read, where it falls back to the pre-existing quiet-board default of 0.
     last_warm_idle: Option<usize>,
+}
+
+impl HeartbeatSchedule {
+    /// Stop the periodic timer (the awareness system has none) while keeping
+    /// what the board digest shares with the heartbeat: the Zen cadence (counted
+    /// over digests) and the last warm idle count. Switching back to the
+    /// heartbeat re-seeds the timer exactly as `heartbeat: off` → on does.
+    fn stand_down(&mut self) {
+        self.next_attempt = None;
+        self.window_start = None;
+        self.interval = None;
+        self.last_log_mtime = None;
+    }
+}
+
+/// The awareness system's (v2) board-digest state, threaded across supervisor
+/// ticks: the logical `events.log` cursor the last scan stopped at. `None`
+/// until the first tick on v2 seeds it at the log's head, so history written
+/// before the switch (or before a poller restart) is never answered.
+#[derive(Default)]
+struct AwarenessDigest {
+    cursor: Option<u64>,
 }
 
 /// Cadence for the scoped CI poll. Independent of the 5s supervisor tick so a
@@ -1056,6 +1116,21 @@ fn emit_issue_reconcile_event(project: &str, ev: IssueReconcileEvent) {
     }
 }
 
+/// The external-issue reconcile pass's cadence bounds (standard, max). On the
+/// heartbeat (v1) they are the heartbeat's, and `heartbeat: off` disables the
+/// pass (`None`). The awareness system (v2) writes no periodic heartbeat, but
+/// the pass keeps its own timer: the heartbeat config's bounds when set, else
+/// the defaults, so `heartbeat: off` on v2 doesn't stop it.
+fn issue_reconcile_bounds(project: &Project) -> Option<(Duration, Duration)> {
+    let bounds = |hb: &shelbi_core::HeartbeatConfig| Some((hb.interval()?, hb.max()?));
+    match project.orchestrator.awareness {
+        AwarenessMode::Heartbeat => bounds(&project.heartbeat),
+        AwarenessMode::Awareness => {
+            bounds(&project.heartbeat).or_else(|| bounds(&shelbi_core::HeartbeatConfig::default()))
+        }
+    }
+}
+
 /// Run one external-issue reconcile sweep for `project` when its heartbeat-driven
 /// cadence is due and the box is online. Pulls edits made on the tracker itself
 /// via [`IssueStore::poll_changes`] and reconciles each into `events.log`: an
@@ -1088,8 +1163,7 @@ fn maybe_reconcile_issues(
 
     // Heartbeat off ⇒ no cadence source ⇒ pass disabled. Clear so re-enabling
     // the heartbeat re-seeds from the next tick.
-    let (Some(standard), Some(max)) = (project.heartbeat.interval(), project.heartbeat.max())
-    else {
+    let Some((standard, max)) = issue_reconcile_bounds(project) else {
         *schedule = IssueReconcileSchedule::default();
         return;
     };
@@ -1308,6 +1382,49 @@ fn maybe_emit_heartbeat(
         return;
     }
 
+    write_heartbeat_digest(project, schedule, now);
+    // Advance the baseline to our own write's mtime so the next tick can tell
+    // it apart from a real event, and re-anchor the cadence window at "now" so
+    // the reset-on-event deadline is measured from this emission.
+    schedule.last_log_mtime = events_log_mtime();
+    schedule.window_start = Some(now);
+
+    // Choose the next cadence: hold at standard while there's supervisable
+    // work in flight, back off (double, capped at max) while quiescent.
+    let next_interval = if board_is_quiescent(project) {
+        current_interval.saturating_mul(2).min(max).max(standard)
+    } else {
+        standard
+    };
+    schedule.interval = Some(next_interval);
+    schedule.next_attempt = Some(now + next_interval);
+}
+
+/// The supervisor tick's timer half of event delivery: the periodic heartbeat
+/// on `orchestrator.awareness: heartbeat` (v1, [`maybe_emit_heartbeat`],
+/// unchanged), nothing on `awareness` (v2), whose timer stands down. Switching
+/// to v1 forgets the v2 digest cursor.
+fn heartbeat_timer_tick(
+    project: &Project,
+    heartbeat: &mut HeartbeatSchedule,
+    digest: &mut AwarenessDigest,
+    is_online: impl Fn() -> bool,
+) {
+    match project.orchestrator.awareness {
+        AwarenessMode::Heartbeat => {
+            *digest = AwarenessDigest::default();
+            maybe_emit_heartbeat(project, heartbeat, is_online);
+        }
+        AwarenessMode::Awareness => heartbeat.stand_down(),
+    }
+}
+
+/// Write one heartbeat line carrying the board digest: `zen_eligible`,
+/// `idle_workspaces`, the low-disk tokens and the Zen cue. The heartbeat (v1)
+/// writes it on its timer ([`maybe_emit_heartbeat`]); the awareness system
+/// (v2) only right after a board line ([`maybe_emit_awareness_digest`]). Both
+/// share `schedule`'s Zen cadence and last warm idle count.
+fn write_heartbeat_digest(project: &Project, schedule: &mut HeartbeatSchedule, now: Instant) {
     // Both counts are computed fresh so the heartbeat is accurate at emit time.
     // A read failure shouldn't sink the heartbeat — `zen_eligible` falls back to
     // 0, which the orchestrator treats as "nothing to do" (a silent ack), the
@@ -1347,21 +1464,54 @@ fn maybe_emit_heartbeat(
             "append_heartbeat_event failed",
         );
     }
-    // Advance the baseline to our own write's mtime so the next tick can tell
-    // it apart from a real event, and re-anchor the cadence window at "now" so
-    // the reset-on-event deadline is measured from this emission.
-    schedule.last_log_mtime = events_log_mtime();
-    schedule.window_start = Some(now);
+}
 
-    // Choose the next cadence: hold at standard while there's supervisable
-    // work in flight, back off (double, capped at max) while quiescent.
-    let next_interval = if board_is_quiescent(project) {
-        current_interval.saturating_mul(2).min(max).max(standard)
-    } else {
-        standard
+/// Consider writing the awareness system's (v2) board digest for `project`.
+/// Called once per supervisor tick, after the awareness tick, while the
+/// project is on `orchestrator.awareness: awareness`.
+///
+/// Scans the `events.log` lines appended since the last tick and writes one
+/// heartbeat digest ([`write_heartbeat_digest`]) when any of them is a board
+/// transition or a reminder / job / overdue line for this project
+/// ([`shelbi_state::is_awareness_digest_trigger`]); a burst within one tick
+/// gets a single digest, and a quiet board gets none. The digest's own line
+/// is a heartbeat, so it never triggers another. The first tick seeds the cursor at the log's head, and a cursor the log
+/// rotated past re-seeds there too, answering nothing. Best-effort: a read
+/// failure skips the tick.
+fn maybe_emit_awareness_digest(project: &Project, schedule: &mut HeartbeatSchedule, digest: &mut AwarenessDigest) {
+    let Ok(head) = shelbi_state::event_log_head() else {
+        return;
     };
-    schedule.interval = Some(next_interval);
-    schedule.next_attempt = Some(now + next_interval);
+    let Some(cursor) = digest.cursor else {
+        digest.cursor = Some(head);
+        return;
+    };
+    if head <= cursor {
+        // Nothing new (or a head behind the cursor, which a monotonic log
+        // never shows): keep the later of the two.
+        digest.cursor = Some(cursor.max(head));
+        return;
+    }
+    let read = match shelbi_state::read_event_log_from(cursor) {
+        Ok(read) => read,
+        Err(e) => {
+            tracing::debug!(project = %project.name, error = %e, "awareness digest: re-seeding the cursor");
+            digest.cursor = Some(head);
+            return;
+        }
+    };
+    // Only whole lines: an unterminated tail is read again next tick.
+    let whole = read.bytes.iter().rposition(|b| *b == b'\n').map_or(0, |at| at + 1);
+    digest.cursor = Some(read.start + whole as u64);
+    let text = String::from_utf8_lossy(&read.bytes[..whole]);
+    if text
+        .lines()
+        .any(|line| shelbi_state::is_awareness_digest_trigger(line, &project.name))
+    {
+        // The digest's own line lands past the cursor; the next scan reads it
+        // with whatever else arrived meanwhile, and a heartbeat never triggers.
+        write_heartbeat_digest(project, schedule, Instant::now());
+    }
 }
 
 /// Free bytes on the volume holding the hub's `work_dir`, but only when they
@@ -8533,9 +8683,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -12921,6 +13069,145 @@ transitions:
 
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A temp `SHELBI_HOME` with project `demo` on the awareness system (v2)
+    /// and a 1ms heartbeat, so a v1 timer would fire on every tick.
+    fn awareness_home(tag: &str) -> (std::path::PathBuf, Project) {
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-poller-aw-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.heartbeat = shelbi_core::HeartbeatConfig::every(Duration::from_millis(1));
+        project.orchestrator.awareness = AwarenessMode::Awareness;
+        (home, project)
+    }
+
+    /// One supervisor tick's event-delivery passes, in production order.
+    fn delivery_tick(project: &Project, hb: &mut HeartbeatSchedule, digest: &mut AwarenessDigest) {
+        heartbeat_timer_tick(project, hb, digest, || true);
+        if project.orchestrator.awareness == AwarenessMode::Awareness {
+            maybe_emit_awareness_digest(project, hb, digest);
+        }
+    }
+
+    fn heartbeat_lines() -> Vec<String> {
+        let log = shelbi_state::events_log_path().unwrap();
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| shelbi_state::EventEnvelope::from_log_line(l).kind == shelbi_state::EventKind::Heartbeat)
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn awareness_writes_no_heartbeat_on_a_quiet_board() {
+        let _g = crate::test_lock::acquire();
+        let (home, project) = awareness_home("quiet");
+        // History from before the switch is never answered.
+        shelbi_state::append_task_event(&project.name, "old", "task", Column::todo(), Column::in_progress(), "test")
+            .unwrap();
+        let mut hb = HeartbeatSchedule::default();
+        let mut digest = AwarenessDigest::default();
+        // Every tick is long past a 1ms heartbeat interval: v1 would emit.
+        for _ in 0..10 {
+            delivery_tick(&project, &mut hb, &mut digest);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Other lines that aren't board transitions don't call for a digest.
+        shelbi_state::append_workspace_event(&project.name, "alpha", None, shelbi_state::WorkspaceState::Working)
+            .ok();
+        shelbi_state::append_task_event("other", "x", "task", Column::todo(), Column::in_progress(), "test").unwrap();
+        for _ in 0..3 {
+            delivery_tick(&project, &mut hb, &mut digest);
+        }
+        assert_eq!(heartbeat_lines(), Vec::<String>::new());
+        assert!(hb.next_attempt.is_none(), "the v1 timer stands down");
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn awareness_follows_a_transition_or_a_reminder_with_one_digest() {
+        let _g = crate::test_lock::acquire();
+        let (home, project) = awareness_home("digest");
+        let mut hb = HeartbeatSchedule::default();
+        let mut digest = AwarenessDigest::default();
+        delivery_tick(&project, &mut hb, &mut digest); // seeds the cursor
+
+        // A burst of two transitions within one tick: one digest.
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+        shelbi_state::append_task_event(&project.name, "fix-login", "task", Column::todo(), Column::in_progress(), "test")
+            .unwrap();
+        shelbi_state::append_task_event(&project.name, "other", "task", Column::backlog(), Column::todo(), "test")
+            .unwrap();
+        delivery_tick(&project, &mut hb, &mut digest);
+        let lines = heartbeat_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        // `alpha` holds the in-progress task: no idle workspace.
+        assert!(
+            lines[0].contains(" project=demo heartbeat zen_eligible=0 idle_workspaces=0"),
+            "line: {}",
+            lines[0]
+        );
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        assert!(log.trim_end().ends_with(lines[0].as_str()), "the digest follows the transitions");
+
+        // Quiet ticks after it: nothing more, the digest doesn't trigger itself.
+        for _ in 0..3 {
+            delivery_tick(&project, &mut hb, &mut digest);
+        }
+        assert_eq!(heartbeat_lines().len(), 1);
+
+        // A reminder, a finished job, an overdue task: one digest each tick.
+        shelbi_state::append_reminder_event(&project.name, "r-1", "check the heartbeat").unwrap();
+        delivery_tick(&project, &mut hb, &mut digest);
+        assert_eq!(heartbeat_lines().len(), 2);
+        shelbi_state::append_task_overdue_event(
+            &project.name,
+            "fix-login",
+            Duration::from_secs(600),
+            Duration::from_secs(900),
+            Some("alpha"),
+        )
+        .unwrap();
+        delivery_tick(&project, &mut hb, &mut digest);
+        assert_eq!(heartbeat_lines().len(), 3);
+
+        // Back on the heartbeat (v1), the timer re-seeds: first tick quiet.
+        let mut v1 = project.clone();
+        v1.orchestrator.awareness = AwarenessMode::Heartbeat;
+        delivery_tick(&v1, &mut hb, &mut digest);
+        assert!(digest.cursor.is_none(), "v1 forgets the digest cursor");
+        assert_eq!(heartbeat_lines().len(), 3);
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn the_issue_reconcile_cadence_survives_the_awareness_system() {
+        let work_dir = std::env::temp_dir();
+        let mut project = local_project(&work_dir);
+        let defaults = (shelbi_core::HEARTBEAT_DEFAULT, Duration::from_secs(300));
+        assert_eq!(issue_reconcile_bounds(&project), Some(defaults));
+        project.heartbeat = shelbi_core::HeartbeatConfig::Off;
+        assert_eq!(issue_reconcile_bounds(&project), None, "v1: heartbeat off disables the pass");
+        project.orchestrator.awareness = AwarenessMode::Awareness;
+        assert_eq!(issue_reconcile_bounds(&project), Some(defaults), "v2 keeps its own timer");
+        project.heartbeat = shelbi_core::HeartbeatConfig::every(Duration::from_secs(90));
+        assert_eq!(issue_reconcile_bounds(&project), Some((Duration::from_secs(90), Duration::from_secs(300))));
     }
 
     #[test]

@@ -53,6 +53,11 @@ git:
 ## Stable id a new task lands in. Defaults to the first status when unset.
 #initial_status: backlog
 
+## How long a task on this workflow should stay active when it is started
+## without `--estimate` (`45m`, `2h`, `1h30m`). Past it the hub tells the
+## orchestrator the task is overdue. Unset: no estimate.
+#default_estimate: 2h
+
 ## Per-workflow Zen override — each subfield independently optional. The
 ## canonical use is a research workflow opting out of the project's checks.
 #zen:

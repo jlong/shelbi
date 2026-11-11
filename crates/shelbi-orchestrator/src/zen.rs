@@ -76,7 +76,7 @@ const CI_POLL_INTERVAL: Duration = Duration::from_secs(10);
 /// only ever delays a PR with zero Actions runs; a real code PR leaves the grace
 /// window the instant its first Actions run attaches and is then graded on that
 /// run's progress, so it adds no latency to normal CI.
-const CI_SETTLE_GRACE: Duration = Duration::from_secs(60);
+pub(crate) const CI_SETTLE_GRACE: Duration = Duration::from_secs(60);
 
 /// Which set of checks [`ci_watch`] is watching on this poll loop.
 #[cfg(test)]
@@ -1567,18 +1567,18 @@ fn apply_github_merge_reconcile(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CiSnapshot {
-    repository_id: String,
-    base_ref: String,
-    base_oid: String,
-    head_oid: String,
-    head_repository_id: String,
-    merge_state: String,
-    checks: Vec<CiSnapshotCheck>,
+pub(crate) struct CiSnapshot {
+    pub(crate) repository_id: String,
+    pub(crate) base_ref: String,
+    pub(crate) base_oid: String,
+    pub(crate) head_oid: String,
+    pub(crate) head_repository_id: String,
+    pub(crate) merge_state: String,
+    pub(crate) checks: Vec<CiSnapshotCheck>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CiSnapshotCheck {
+pub(crate) struct CiSnapshotCheck {
     name: String,
     link: String,
     state: SnapshotCheckState,
@@ -1604,7 +1604,7 @@ enum SnapshotCheckState {
 /// Atomic PR-head and check provenance query. `isRequired` is deliberately
 /// queried on every context: name/URL alone are not unique across reruns, and
 /// an optional passing check must never stand in for a pending required one.
-const CI_SNAPSHOT_QUERY: &str = r#"
+pub(crate) const CI_SNAPSHOT_QUERY: &str = r#"
 query ShelbiCiSnapshot($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     id
@@ -1795,63 +1795,7 @@ fn ci_snapshot(
             "GitHub PR #{pr} returned a non-atomic CI snapshot: headRefOid {head_oid} differs from latest commit {commit_oid}; refusing to grade checks"
         )));
     }
-    let checks = match commit.get("statusCheckRollup") {
-        Some(serde_json::Value::Null) => Vec::new(),
-        Some(rollup) => {
-            let contexts = rollup.get("contexts").ok_or_else(|| {
-                Error::Other(format!(
-                    "GitHub PR #{pr}: status-check contexts are missing from the CI snapshot"
-                ))
-            })?;
-            let has_next_page = contexts
-                .pointer("/pageInfo/hasNextPage")
-                .and_then(serde_json::Value::as_bool)
-                .ok_or_else(|| {
-                    Error::Other(format!(
-                        "GitHub PR #{pr}: status-check pagination metadata is missing"
-                    ))
-                })?;
-            if has_next_page {
-                return Err(Error::Other(format!(
-                    "PR #{pr} has more than 100 status contexts; refusing a non-atomic paginated CI verdict"
-                )));
-            }
-            let nodes = contexts
-                .get("nodes")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(|| {
-                    Error::Other(format!(
-                        "GitHub PR #{pr}: status-check nodes are missing from the CI snapshot"
-                    ))
-                })?;
-            let total_count = contexts
-                .get("totalCount")
-                .and_then(serde_json::Value::as_u64)
-                .ok_or_else(|| {
-                    Error::Other(format!(
-                        "GitHub PR #{pr}: status-check totalCount is missing"
-                    ))
-                })?;
-            if total_count != nodes.len() as u64 {
-                return Err(Error::Other(format!(
-                    "GitHub PR #{pr}: status-check snapshot contains {} of {total_count} contexts; refusing an incomplete CI verdict",
-                    nodes.len()
-                )));
-            }
-            nodes
-                .iter()
-                .map(|check| parse_snapshot_check(pr, check))
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .flatten()
-                .collect()
-        }
-        None => {
-            return Err(Error::Other(format!(
-                "GitHub PR #{pr}: statusCheckRollup is missing from the CI snapshot"
-            )));
-        }
-    };
+    let checks = parse_rollup_checks(&format!("PR #{pr}"), commit)?;
     Ok(CiSnapshot {
         repository_id: api_repository_id.to_string(),
         base_ref: base_ref.to_string(),
@@ -1863,12 +1807,82 @@ fn ci_snapshot(
     })
 }
 
+/// Parse a commit's `statusCheckRollup` into checks, failing closed on a
+/// paginated or incomplete rollup. `subject` (`PR #12`, `commit abc123`) names
+/// what is being graded in errors.
+pub(crate) fn parse_rollup_checks(subject: &str, commit: &serde_json::Value) -> Result<Vec<CiSnapshotCheck>> {
+    match commit.get("statusCheckRollup") {
+        Some(serde_json::Value::Null) => Ok(Vec::new()),
+        Some(rollup) => {
+            let contexts = rollup.get("contexts").ok_or_else(|| {
+                Error::Other(format!(
+                    "GitHub {subject}: status-check contexts are missing from the CI snapshot"
+                ))
+            })?;
+            let has_next_page = contexts
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "GitHub {subject}: status-check pagination metadata is missing"
+                    ))
+                })?;
+            if has_next_page {
+                return Err(Error::Other(format!(
+                    "{subject} has more than 100 status contexts; refusing a non-atomic paginated CI verdict"
+                )));
+            }
+            let nodes = contexts
+                .get("nodes")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "GitHub {subject}: status-check nodes are missing from the CI snapshot"
+                    ))
+                })?;
+            let total_count = contexts
+                .get("totalCount")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| {
+                    Error::Other(format!(
+                        "GitHub {subject}: status-check totalCount is missing"
+                    ))
+                })?;
+            if total_count != nodes.len() as u64 {
+                return Err(Error::Other(format!(
+                    "GitHub {subject}: status-check snapshot contains {} of {total_count} contexts; refusing an incomplete CI verdict",
+                    nodes.len()
+                )));
+            }
+            Ok(nodes
+                .iter()
+                .map(|check| parse_snapshot_check_for(subject, check))
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .flatten()
+                .collect())
+        }
+        None => Err(Error::Other(format!(
+            "GitHub {subject}: statusCheckRollup is missing from the CI snapshot"
+        ))),
+    }
+}
+
 /// Parse one status-rollup node. Returns `Ok(None)` for an empty/unnamed
 /// rollup placeholder (GitHub occasionally emits `{"name":null,"status":null}`
 /// rows); those are ignored rather than counted as a passing check or treated
 /// as a fatal snapshot error. A node that *does* carry a name but is otherwise
 /// unparseable still fails closed.
+#[cfg(test)]
 fn parse_snapshot_check(pr: u64, check: &serde_json::Value) -> Result<Option<CiSnapshotCheck>> {
+    parse_snapshot_check_for(&format!("PR #{pr}"), check)
+}
+
+/// [`parse_snapshot_check`] naming the graded `subject` in its errors.
+fn parse_snapshot_check_for(
+    subject: &str,
+    check: &serde_json::Value,
+) -> Result<Option<CiSnapshotCheck>> {
     let Some(name) = check
         .get("name")
         .or_else(|| check.get("context"))
@@ -1894,7 +1908,7 @@ fn parse_snapshot_check(pr: u64, check: &serde_json::Value) -> Result<Option<CiS
         .or_else(|| check.get("status").and_then(serde_json::Value::as_str))
         .ok_or_else(|| {
             Error::Other(format!(
-                "PR #{pr} CI snapshot check `{name}` has no state; refusing an unprovable verdict"
+                "{subject} CI snapshot check `{name}` has no state; refusing an unprovable verdict"
             ))
         })?
         .to_string();
@@ -1907,7 +1921,7 @@ fn parse_snapshot_check(pr: u64, check: &serde_json::Value) -> Result<Option<CiS
         | "ACTION_REQUIRED" | "STARTUP_FAILURE" | "STALE" => SnapshotCheckState::Fail,
         unknown => {
             return Err(Error::Other(format!(
-                "PR #{pr} CI snapshot check `{name}` has unknown state `{unknown}`; refusing an unprovable verdict"
+                "{subject} CI snapshot check `{name}` has unknown state `{unknown}`; refusing an unprovable verdict"
             )));
         }
     };
@@ -1916,7 +1930,7 @@ fn parse_snapshot_check(pr: u64, check: &serde_json::Value) -> Result<Option<CiS
         .and_then(serde_json::Value::as_bool)
         .ok_or_else(|| {
             Error::Other(format!(
-                "PR #{pr} CI snapshot check `{name}` has no requiredness; refusing an unprovable verdict"
+                "{subject} CI snapshot check `{name}` has no requiredness; refusing an unprovable verdict"
             ))
         })?;
     // A `checkSuite.app.slug` of `github-actions` marks a CheckRun that a
@@ -1950,7 +1964,7 @@ fn parse_snapshot_check(pr: u64, check: &serde_json::Value) -> Result<Option<CiS
 /// pending — the premature-green guard. It is ignored when GitHub Actions runs
 /// are already attached (they are the authoritative in-band signal) and when the
 /// repo configures required contexts (the required set plus merge state gate).
-fn classify_ci_snapshot(snapshot: &CiSnapshot, settle_satisfied: bool) -> Option<CiVerdict> {
+pub(crate) fn classify_ci_snapshot(snapshot: &CiSnapshot, settle_satisfied: bool) -> Option<CiVerdict> {
     let required: Vec<_> = snapshot
         .checks
         .iter()
@@ -3430,9 +3444,7 @@ esac
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -12380,9 +12392,7 @@ mod probe_tests {
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -16145,6 +16155,7 @@ mod dry_run_tests {
             git: None,
             zen: None,
             review: None,
+            default_estimate: None,
         }
     }
 

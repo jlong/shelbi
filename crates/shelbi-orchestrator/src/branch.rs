@@ -169,9 +169,7 @@ mod tests {
                 tags: Vec::new(),
                 forward: None,
             }],
-            orchestrator: OrchestratorSpec {
-                runner: "claude".into(),
-            },
+            orchestrator: OrchestratorSpec::new("claude"),
             agent_runners: runners,
             editor: None,
             github_url: None,
@@ -244,6 +242,7 @@ mod tests {
             git,
             zen: None,
             review: None,
+            default_estimate: None,
         }
     }
 
