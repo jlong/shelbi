@@ -4,9 +4,9 @@
 //! frame per state, plus a check that each state shows what it should:
 //!
 //! - `review-sidebar.png`: the sidebar before the review opens;
-//! - `sidebar-switcher-mid.png` and `sidebar-switcher.png`: the project
-//!   switcher's menu sliding in over the sidebar, then open with the
-//!   keyboard a row down;
+//! - `sidebar-switcher-mid.png` and `sidebar-switcher.png`: the tab bar's
+//!   project menu (the `+` tab's) sliding in, then open with the keyboard a
+//!   row down;
 //! - `sidebar-slide-mid.png` and `sidebar-slide.png`: the nav selection chip
 //!   part-way to Issues, then landed;
 //! - `review-pending.png`: the panel the moment a review is asked for, before
@@ -448,7 +448,7 @@ impl Run {
         self.expect("the sidebar holds the column", column == (true, false));
         self.save("review-sidebar.png");
 
-        // The project switcher: sliding in, then open a row down.
+        // The tab bar's project menu: sliding in, then open a row down.
         self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_switcher(true, cx)).unwrap();
         self.advance(Duration::from_millis(50));
         self.save("sidebar-switcher-mid.png");

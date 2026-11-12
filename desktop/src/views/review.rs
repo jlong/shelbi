@@ -18,7 +18,7 @@
 //!   title and the description clamped to five lines with `More` opening
 //!   the task detail over the screen (the window draws it,
 //!   `dt-more-opens-detail`), the worktree with Open (reveal it in Finder), the views
-//!   numbered ⌘1 to ⌘N (Reviewer / View Diff / Edit in <editor> / Web
+//!   numbered ⌃1 to ⌃N (Reviewer / View Diff / Edit in <editor> / Web
 //!   Browser when a URL exists / Shell), then Actions: Approve and Reject.
 //!   The review slot's **server** has no block of its own: until it serves,
 //!   the Web Browser row is inert and says "loading…" where its hint sits,
@@ -560,7 +560,7 @@ impl ReviewView {
 
     fn build(&self, info: ReviewInfo, row: Option<ReviewRow>, cx: &mut Context<Self>) -> Shown {
         let model = ReviewPanelModel::build(&info, row.as_ref());
-        // The desktop offers the user shell beside the content (Shell ⌘5).
+        // The desktop offers the user shell beside the content (Shell ⌃5).
         let panel = ReviewPanelState::with_shell(&model, true);
         let deps = (self.sessions)(&info.task_id);
         let clock = deps.clock.clone();
@@ -1295,7 +1295,7 @@ impl ReviewView {
         cx.emit(ReviewEvent::Closed);
     }
 
-    /// ⌘N (the window's chord while the panel holds the column): the
+    /// ⌃N (the window's chord while the panel holds the column): the
     /// panel's N-th view, as its hints number them. Focus stays where it is.
     pub fn view_shortcut(&mut self, n: u8, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(r) = self.review.as_mut() else {
@@ -1530,7 +1530,7 @@ impl ReviewView {
         let info = (!info.is_empty()).then(|| task_panel::info_rows(info));
 
         // The views: Reviewer, its diff and editor, the browser, the shell,
-        // ⌘1…⌘N.
+        // ⌃1…⌃N.
         let serving = model.server.state == ReviewState::Serving;
         let mut shortcut = 0u8;
         let mut views = Vec::new();
@@ -1688,7 +1688,7 @@ impl ReviewView {
     }
 
     /// The Web Browser row while the slot's server isn't serving yet: muted
-    /// and inert, "loading…" where its ⌘N hint sits, the server's sub-state
+    /// and inert, "loading…" where its ⌃N hint sits, the server's sub-state
     /// and health check in its tooltip (the Server block Figma dropped).
     fn render_waiting_browser(
         &self,
@@ -1857,7 +1857,7 @@ impl ReviewView {
     }
 }
 
-/// Whether `row` is one of the views (numbered ⌘1…⌘N): the view switch and
+/// Whether `row` is one of the views (numbered ⌃1…⌃N): the view switch and
 /// the shell.
 fn is_view_row(row: PanelRow) -> bool {
     matches!(row, PanelRow::Switch(_) | PanelRow::Shell)
@@ -2307,7 +2307,7 @@ pub(crate) mod tests {
             assert!(h.cx.debug_bounds(selector).is_some(), "{selector} is drawn");
         }
         // Figma dropped the Server block: serving, the browser row shows its
-        // ⌘4 hint, not a state.
+        // ⌃4 hint, not a state.
         for selector in ["review-server", "review-health", "review-url", "review-server-state"] {
             assert!(h.cx.debug_bounds(selector).is_none(), "{selector} is not drawn");
         }
@@ -2637,7 +2637,7 @@ pub(crate) mod tests {
         let mut h = open(cx);
         h.update(|v, cx| v.show(info(), Some(row(ReviewState::Loading)), cx));
         h.draw();
-        assert!(h.cx.debug_bounds("review-server-state").is_some(), "loading… where ⌘4 sits");
+        assert!(h.cx.debug_bounds("review-server-state").is_some(), "loading… where ⌃4 sits");
         h.click("review-switch-browser");
         assert!(h.ops.opened.lock().unwrap().is_empty(), "inert until serving");
         // The server came up: the row opens the URL.
@@ -2667,7 +2667,7 @@ pub(crate) mod tests {
             ActiveView::Chat,
             "the reviewer stays in the content pane"
         );
-        // ⌘5 is the shell: it closes.
+        // ⌃5 is the shell: it closes.
         h.cx.update(|window, cx| h.view.update(cx, |v, cx| v.view_shortcut(5, window, cx)));
         h.cx.run_until_parked();
         assert!(!h.view.read_with(&h.cx, |v, _| v.shell_open()));
@@ -2694,9 +2694,9 @@ pub(crate) mod tests {
             h.cx.run_until_parked();
         };
         shortcut(&mut h, 2);
-        assert_eq!(h.ops(), vec![ReviewSessionOp::Ensure { role: ReviewRole::Diff }], "⌘2 is View Diff");
+        assert_eq!(h.ops(), vec![ReviewSessionOp::Ensure { role: ReviewRole::Diff }], "⌃2 is View Diff");
         shortcut(&mut h, 4);
-        assert_eq!(*h.ops.opened.lock().unwrap(), vec!["http://localhost:4101"], "⌘4 is Web Browser");
+        assert_eq!(*h.ops.opened.lock().unwrap(), vec!["http://localhost:4101"], "⌃4 is Web Browser");
         shortcut(&mut h, 1);
         assert_eq!(h.view.read_with(&h.cx, |v, _| v.panel().unwrap().active()), ActiveView::Chat);
         shortcut(&mut h, 6);

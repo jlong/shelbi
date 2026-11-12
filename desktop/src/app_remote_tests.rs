@@ -238,7 +238,7 @@ fn a_notice_switching_the_window_under_the_quit_prompt_keeps_it_there(cx: &mut T
     update(cx, handle, |w, window, cx| w.switch_to("other", window, cx));
     draw(cx, handle);
     assert!(read(cx, handle, |w, _| w.chat.is_some()), "the new project's chat");
-    cx.simulate_prompt_answer("Quit Project");
+    cx.simulate_prompt_answer("Close Project");
     settle(cx, "the far daemon to quit the project", |_| !far.asked.lock().unwrap().quits.is_empty());
     linger(cx);
 
@@ -261,7 +261,7 @@ fn quitting_a_remote_windows_project_goes_to_the_chooser(cx: &mut TestAppContext
     shelbi_state::set_project_open("here", true).unwrap();
     let handle = open(cx, &far);
     update(cx, handle, |w, window, cx| w.confirm_quit_project(window, cx));
-    cx.simulate_prompt_answer("Quit Project");
+    cx.simulate_prompt_answer("Close Project");
     settle(cx, "the window to leave the project", |cx| read(cx, handle, |w, _| w.chooser));
     assert_eq!(far.asked.lock().unwrap().quits, [PROJECT]);
     assert_eq!(read(cx, handle, |w, _| w.remote.as_ref().unwrap().session.project.clone()), PROJECT);

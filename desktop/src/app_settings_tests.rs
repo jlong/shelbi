@@ -141,8 +141,8 @@ fn settings_takes_the_column_with_its_own_sidebar(cx: &mut TestAppContext) {
     }
     // The frame's sidebar has no footer: no Zen pill, no settings gear.
     assert!(!s.drawn("sidebar-zen") && !s.drawn("sidebar-settings"));
-    // Its titlebar keeps Search and Toggle sidebar.
-    assert!(s.drawn("sidebar-search") && s.drawn("sidebar-collapse"));
+    // The tab bar over it keeps Search and Toggle sidebar.
+    assert!(s.drawn("tab-bar-search") && s.drawn("tab-bar-sidebar"));
     assert_eq!(s.page(), Some(SettingsPage::General));
     assert_eq!(s.selected_row(), Some(SettingsPage::General));
     assert!(s.drawn("settings-page-general"));
@@ -194,10 +194,18 @@ fn the_numbered_chords_switch_pages_inside_settings_only(cx: &mut TestAppContext
     assert_eq!(s.page(), Some(SettingsPage::Keybindings), "no page is ⌘9");
     assert!(s.h.take_calls().is_empty(), "no sidebar row opened");
 
-    // Outside Settings, ⌘1 is the sidebar's first numbered row again.
+    // ⌃N is no page chord: the settings sidebar has no numbered rows.
+    s.key("ctrl-1");
+    assert_eq!(s.page(), Some(SettingsPage::Keybindings));
+    assert!(s.h.take_calls().is_empty());
+
+    // Outside Settings, ⌘1 is the first tab again (the shown project's:
+    // nothing to switch to) and ⌃1 the sidebar's first numbered row.
     s.key("escape");
     s.h.take_calls();
     s.key("cmd-1");
+    assert!(s.h.take_calls().is_empty(), "already on the first tab");
+    s.key("ctrl-1");
     let mut calls = Vec::new();
     commands::dispatch_command(
         &CommandKind::FocusWorkspace {
@@ -356,7 +364,7 @@ fn toggle_sidebar_collapses_the_settings_sidebar(cx: &mut TestAppContext) {
     s.open_settings();
     let full = s.bounds("settings-sidebar").expect("drawn").size.width;
     // It slides out like the app's sidebar: clipped at its full width.
-    s.h.click_selector("sidebar-collapse");
+    s.h.click_selector("tab-bar-sidebar");
     s.now.set(s.now.get() + Duration::from_millis(30));
     s.h.draw();
     let column = s.bounds("leading-column").expect("still going").size.width;
@@ -367,8 +375,8 @@ fn toggle_sidebar_collapses_the_settings_sidebar(cx: &mut TestAppContext) {
     s.settle();
     assert!(!s.drawn("settings-sidebar") && !s.drawn("leading-column"));
     assert!(s.drawn("settings-page-general"), "the page stays");
-    assert!(s.drawn("expand-sidebar"));
-    s.click("expand-sidebar");
+    assert!(s.drawn("tab-bar-sidebar"), "the tab bar keeps the toggle");
+    s.click("tab-bar-sidebar");
     assert!(s.drawn("settings-sidebar"));
 }
 
@@ -1303,21 +1311,19 @@ fn config() -> WorkflowConfig {
 fn the_settings_sidebar_has_the_project_section(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
-    assert!(s.drawn("settings-project") && s.drawn("sidebar-project-title"));
+    assert!(s.drawn("settings-project") && s.drawn("settings-project-label"));
     let global = s.bounds("settings-nav-terminal").unwrap();
-    let switcher = s.bounds("sidebar-project-title").unwrap();
+    let label = s.bounds("settings-project-label").unwrap();
     let workflows = s.bounds("settings-nav-workflows").unwrap();
-    assert!(global.bottom() < switcher.top() && switcher.bottom() < workflows.top(), "in the frame's order");
+    assert!(global.bottom() < label.top() && label.bottom() < workflows.top(), "in the frame's order");
     s.click("settings-nav-workflows");
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workflows), Some(SettingsPage::Workflows)));
 
-    // The switcher opens the app sidebar's project menu.
+    // The project's name is only a label now: the tab bar switches projects.
     s.h.take_calls();
-    s.click("sidebar-project-title");
-    assert_eq!(s.h.take_calls(), [HostCall::OpenSwitcher]);
-    s.update(|w, _, cx| w.open_switcher(cx));
-    s.settle();
-    assert!(s.drawn("sidebar-switcher"), "its menu shows over the settings sidebar");
+    s.click("settings-project-label");
+    assert!(s.h.take_calls().is_empty());
+    assert!(s.drawn("tab-bar") && s.drawn("tab-plus"));
 }
 
 #[gpui::test]
@@ -3560,10 +3566,10 @@ workspaces:
 fn workspaces_sits_before_workflows_on_its_own_chord(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
-    let switcher = s.bounds("sidebar-project-title").unwrap();
+    let label = s.bounds("settings-project-label").unwrap();
     let workspaces = s.bounds("settings-nav-workspaces").unwrap();
     let workflows = s.bounds("settings-nav-workflows").unwrap();
-    assert!(switcher.bottom() < workspaces.top() && workspaces.bottom() < workflows.top());
+    assert!(label.bottom() < workspaces.top() && workspaces.bottom() < workflows.top());
     s.key("cmd-5");
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workspaces), Some(SettingsPage::Workspaces)));
     assert!(s.drawn("settings-page-workspaces") && s.drawn("workspaces-heading"));

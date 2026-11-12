@@ -43,7 +43,7 @@ paths on every `cargo test`.
 | New Issue | `action:new-issue` | Added after this walk (`new-task-dialog`), covered by both smoke tests: the New task overlay over the view (also the board's `n` and its `+ New issue`), Ctrl+Enter creates | The New task dialog over the window (`views/new_task.rs`; also the board's New issue and `n`, File ▸ New Issue…), ⌘Return creates; the window flashes the outcome |
 | Error log | `action:error-log` | Overlay ("No errors logged.") | Same (View ▸ Error Log) |
 | Settings | `action:settings` | Added after this walk (`tui-settings-shell`), covered by both smoke tests: Settings over the view, its sidebar in the sidebar's column (also `,` in the sidebar and the ⚙ beside the project title) | The existing Settings, on the page last used (Shelbi ▸ Settings…, ⌘,) |
-| Switch Project | `action:switch-project` | Fixed here: was a switch to an empty project name; now the palette's Projects column, focused | The sidebar's project switcher (File ▸ Switch Project…) |
+| Switch Project | `action:switch-project` | Fixed here: was a switch to an empty project name; now the palette's Projects column, focused | The tab bar's `+` menu: the projects that aren't open, then Add project (File ▸ Switch Project…) |
 | Switch to a project | `action:switch-project:<slug>` | The client moves to `pb`, and back | The window switches to `pb` in place, and back to where `pa` was left (File ▸ Open Project ▸ pb; `dt-switch-project-in-window`) |
 | New Window | `action:new-window` | Not offered: the registry lists it only for a multi-window client (`CommandModel::multi_window`); the TUI's arm says to run `shelbi` in another terminal | A second window on the current project, cascaded (File ▸ New Window, ⌘⇧N, and the palette) |
 | Add project | `action:add-project` | Form with detection and the derived id; cancelled before creating (submit would launch a real agent). Since `unify-project-create` the form is the four steps every front end shares (`shelbi_app::new_project::Step`; `overlay/add_project.rs` over `shelbi_app::overlay::add_project`): the folder (Continue runs `project_create::check_folder`, then shows its git-init / pick-up offers before the next Continue takes them), Agent defaults (the detected runner preselected), Issues (GitHub preselected for a GitHub origin, its `gh` preflight on Continue), and where settings live (the recommendation and why), each "Step N of 4" with Back and Continue / Create Project, by keys and mouse; Create Project hands `Form::plan` to `project_create::create_project` | The Add Project wizard's own window (`dt-add-project-wizard`): the same four steps over `shelbi_app::add_project_wizard` (the folder box with its git-init / pick-up checkboxes, Agent defaults, the Issues cards with the repo field and an off-thread preflight, the settings cards with the recommendation line), then Create Project through the same `project_create::create_project`, its checklist, and the created workflows, whose Okay opens the project on its Orchestrator; also File ▸ Add Project…, the switcher and the chooser |
@@ -57,7 +57,7 @@ paths on every `cargo test`.
 | Edit Workflows | `edit:workflows` | The `workflows/` directory | Same path |
 | Detach | `action:detach` | The TUI exits; every session keeps running | The app quits; every session keeps running |
 | Detach Other Clients | `action:detach-others` | Detached the desktop app ("Detached 1 other window.") | Detached the TUI |
-| Quit Project | `action:quit-project` | The TUI exits and the daemon closes the project (see Known gaps for the handoff) | Confirmation sheet, then the orchestrator's handoff, its session ends; the window stays and switches to another open project, or shows the empty-state chooser; `pb` kept running |
+| Quit Project | `action:quit-project` | The TUI exits and the daemon closes the project (see Known gaps for the handoff) | Confirmation sheet, then the orchestrator's handoff, its session ends; the window stays and switches to the neighbor tab (else another open project, else the empty-state chooser), the project's tab going from every window; also a tab's `×` and File ▸ Close Project…; `pb` kept running |
 | Quit Shelbi | `action:quit-shelbi` | Every sandbox session ended and the sandbox daemon stopped | Not pressed in this walk: the TUI's Quit Shelbi had already stopped the sandbox. The smoke test runs it through the palette and the menu; its confirmation sheet is the one Quit Project showed (`confirm_quit_shelbi`) |
 | Open a searched issue | (palette search) `action:open-issue:<id>` | Added after this walk (`changelog-palette-search`): the board's detail popover over the view the palette opened from (read off the UI thread when the issue is past the board's first history page), as a Changelog issue link opens it | The issue's detail on the board, as a Changelog issue chip opens it |
 | Open a searched Changelog entry | (palette search) `action:open-changelog-entry:<id>` | Added after this walk: the Changelog page, its search cleared, the entry unfolded, focused and at the top | The Changelog page, its search cleared, the entry at the top of the list |
@@ -169,15 +169,26 @@ paths on every `cargo test`.
   remembers only the view, in memory. Quitting the shown project keeps the
   window: it moves to another open project or the empty-state chooser. A
   bare "Switch Project" opens each client's switcher (the TUI's palette
-  Projects column, the desktop's sidebar switcher).
+  Projects column, the desktop's tab bar `+` menu).
+- **Project tabs** (`project-tabs`, desktop only): a desktop window draws
+  a tab per open project across its top (`views/tab_bar.rs`, over
+  `crate::project_tabs`), in the order they were opened, saved with the
+  window slot; a click or ⌘1 to ⌘9 switches (the same `SwitchProject` path),
+  a tab's `×` (and File ▸ Close Project…) is Quit Project for that project,
+  the window moving to the neighbor tab, and the `+` menu lists the projects
+  that aren't open, then Add project. The TUI shows one project per screen
+  and switches through the palette's Projects column. No registry command or
+  view model field is added: the tabs are the window's own chrome, like the
+  sidebar width.
 - **The sidebar** (`dt-figma-sidebar`): the desktop draws Figma's
   Navigation component over the same rows (`SidebarModel::rows`, laid out by
   `views/sidebar.rs` `layout` in the shared order: Workspaces, then the review
   sections, as in the TUI), each section collapsible (remembered per project
   in `desktop-view.json`), the Changelog where Activity was (Activity is
   palette-only in both clients), fixed chords (⌘O Orchestrator, ⌘I Issues,
-  ⌘L Changelog, ⌘1 to ⌘9 the working workspaces then the reviews, each
-  hinted on its row and taken even from a focused terminal), a review's
+  ⌘L Changelog, ⌃1 to ⌃9 the working workspaces then the reviews, each
+  hinted on its row and taken even from a focused terminal, unless the
+  user's `keys.yaml` binds that ⌃ digit; ⌘1 to ⌘9 are the project tabs), a review's
   tracker number on its second line, the version line only on a mismatch (it
   is otherwise in the Settings button's tooltip), and a clickable Zen pill
   ("Zen mode on" / "off") in place of the band. Machines is in neither
@@ -394,7 +405,7 @@ paths on every `cargo test`.
     it (`dt-more-opens-detail`); the TUI's More opens a description
     popover.
   - **The worktree row has an Open button** that reveals it in Finder.
-  - **The views carry ⌘1 to ⌘N hints**, and those chords pick them while
+  - **The views carry ⌃1 to ⌃N hints**, and those chords pick them while
     the panel holds the column (the sidebar's rows otherwise).
   - **A Shell row** opens the user shell beside the agent (the TUI has no
     user shell), and the active Diff or Editor row has a × that ends those
@@ -509,7 +520,7 @@ equivalent datum.
 | `machine` | machine group header text when the project spans several machines (via `rows()`, `shell/sidebar.rs` `render_row`) | machine group header (via `rows()`, `views/sidebar.rs` `row_text`); panel machine row (`views/workspace.rs` `render_panel`); remote attach target (`views/workspace.rs` `set_row`) |
 | `is_remote` | not used (remote attach comes from session discovery, `shell/session.rs`) | panel machine row with a globe icon and `(remote)` (`views/workspace.rs` `render_panel`); routes the session through the remote relay and drops the Diff, Editor and folder rows (`views/workspace.rs` `set_row`, `panel_shape`) |
 | `current_task` | not shown as text in the sidebar; counts toward `M active` on a collapsed group (via `rows()`); palette workspace subtitle; gates opening the workspace panel (`shell/mod.rs` `workspace_has_task`) and the panel's IN PROGRESS/IDLE status (`shell/mod.rs` `ws_status_from_model`) | `M active` count (via `rows()`); palette subtitle; panel task id and the full panel vs the reduced idle one (`views/workspace.rs` `render_panel`, `panel_shape` via `has_task`); notification body (`notify.rs`) |
-| `agent` | right-aligned row label, title-cased, or `idle` (`right_label`, `shell/sidebar.rs` `render_row`) | right-aligned row label, X-Small semibold, then the row's ⌘N; "Idle", muted, without one (`views/sidebar.rs` `row_text`); panel `· Agent` role after the name and the agent switch row's label (`views/workspace.rs` `render_panel`) |
+| `agent` | right-aligned row label, title-cased, or `idle` (`right_label`, `shell/sidebar.rs` `render_row`) | right-aligned row label, X-Small semibold, then the row's ⌃N; "Idle", muted, without one (`views/sidebar.rs` `row_text`); panel `· Agent` role after the name and the agent switch row's label (`views/workspace.rs` `render_panel`) |
 | `badge` | colored state glyph in the row (`shell/sidebar.rs` `render_row`) | the Navigation component's state glyph (green play, yellow `?`, quiet dot; the shared glyph for the states it doesn't draw) (`views/sidebar.rs` `workspace_glyph`); panel status glyph plus words beside the back button, e.g. `⏵ Working` (`views/workspace.rs` `render_panel`); drives blocked/needs-permission notifications (`notify.rs` `observe_sidebar`) |
 
 ### `ReviewRow`
@@ -518,7 +529,7 @@ equivalent datum.
 | `task_id` | not shown: routing key for opening the review (`shell/sidebar.rs` `build_rows`, `RowTarget::Review`); palette command id | not shown in the row: routing key (via `SidebarRow::target`) and debug selector (`views/sidebar.rs` `row_selector`); shown in the "reached review" notification body (`notify.rs`) |
 | `title` | row first line, truncated with `…` (`shell/sidebar.rs` `render_row`); palette entry and Approve/Reject titles | row first line (`views/sidebar.rs` `row_text`); palette; Go > Reviews menu; notification title (`notify.rs`) |
 | `branch` | dim `⎇ branch` second line (`shell/sidebar.rs` `render_row`); the open Review panel's branch row, ahead of the task's (`shell/review.rs` `set_server`) | muted second line after the number (`views/sidebar.rs` `row_text`, `render_row`); the open Review panel's branch row, ahead of the task's (`ReviewPanelModel::build`) |
-| `location` | right-aligned `machine:port` on the first line (`shell/sidebar.rs` `render_row`) | not shown: State=Review dropped the server block and the sidebar row's right side is its ⌘N hint (the Navigation component); the review URL stands in (the Web Browser row's tooltip) |
+| `location` | right-aligned `machine:port` on the first line (`shell/sidebar.rs` `render_row`) | not shown: State=Review dropped the server block and the sidebar row's right side is its ⌃N hint (the Navigation component); the review URL stands in (the Web Browser row's tooltip) |
 | `workspace` | not used | not used |
 | `pr` | not in the row: keeps the open Review panel's PR current (`shell/review.rs` `set_server`) | not in the row: keeps the open Review panel's PR current (`ReviewPanelModel::build`, via `views/review.rs` `update_row`) |
 | `number` | not shown | `#401` before the branch on the row's second line (`views/sidebar.rs` `row_text`); filled from the board index for a GitHub-backed project (`shelbi-orchestrator` `sidebar_model`) |
@@ -558,7 +569,7 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | Field | TUI | Desktop |
 |---|---|---|
 | `columns` | equivalent `app.all_columns` + `column_tasks()`, drawn as lanes (`kanban.rs` `render_columns`) | lanes (`views/issues.rs` `render_board`) |
-| `title` | equivalent `display_label()` (display_name else slug) in title row "Issues · name" (`kanban.rs` `render_title`) | not shown: the Figma Issues frame has no board title (the sidebar's project switcher names the project) |
+| `title` | equivalent `display_label()` (display_name else slug) in title row "Issues · name" (`kanban.rs` `render_title`) | not shown: the Figma Issues frame has no board title (the selected project tab names the project) |
 | `loading` | equivalent `board_loading`: centered "Loading board…" overlay while no tasks (`kanban.rs` `render_full` / `render_loading_overlay`) | "Loading board…" row in each empty column (`views/issues.rs` `render_column`) |
 | `banner` | equivalent `board_banner` in title row, muted while warm, yellow when stale or cached with no daemon (`kanban.rs` `render_title`) | muted text in header (`views/issues.rs` `render_header`) |
 | `error` | equivalent: refresh error written to `status_line` (`kanban.rs` `fail_refresh`), shown in footer (`render_footer`) | footer status when no newer status (`views/issues.rs` `render_footer`) |
@@ -712,8 +723,8 @@ The desktop renders `ReviewPanelModel` directly (`views/review.rs` builds it wit
 | `pr` | `⇵ PR #2137 ●` under the branch, the dot in the CI's color (no state or CI words); Enter on it and a click open it (`review_panel.rs` `render_full` via `panel.rs` `render_info_rows`; `PanelEffect::OpenPr` in `shell/mod.rs`) | the PR row under the branch: the pull-request icon, `PR #2137`, one CI-colored dot, the URL, state and CI in its tooltip; Enter and a click open it (`views/review.rs` `render_panel` via `task_panel::pr_row`, `PanelEffect::OpenPr`) |
 | `branch` | `⎇ <branch>` under the folder, hidden without one; Enter or a click copies it with a `Copied <branch>` toast (`review_panel.rs` `render_full` via `panel.rs` `render_info_rows`; `ReviewAction::CopyBranch` in `shell/mod.rs`) | the branch row under the worktree (git-branch icon, the name cut at the end), hidden without one; Enter or a click copies it with a toast (`views/review.rs` `render_panel` via `task_panel::branch_row`, `PanelEffect::CopyBranch`) |
 | `remote_machine` | not shown: the TUI has no remote info for a review | not shown as text: `is_remote` drops Open from the worktree row and Diff/Editor from `switch_items` (`views/review.rs` `render_panel`) |
-| `switch_items` | own fixed list Reviewer / View Diff / Edit in / (Open Browser) (`review_panel.rs` `rows` / `switch_entry`) | nav rows iterated from the model with ⌘N hints, the browser labelled "Web Browser", then Shell (`views/review.rs` `render_panel`) |
-| `server` | state glyph + sub-state name and location under the folder row, live from the sidebar row (`review_panel.rs` `render_server_line`, fed by `shell/mod.rs` `apply_snapshot`); no health check or sub-state detail (the TUI has no `ready:` facts for the slot) | the Web Browser row: inert with a muted "loading…" in place of its ⌘4 hint until serving, the sub-state, detail and health check in its tooltip (`views/review.rs` `render_waiting_browser`); State=Review draws no server block |
+| `switch_items` | own fixed list Reviewer / View Diff / Edit in / (Open Browser) (`review_panel.rs` `rows` / `switch_entry`) | nav rows iterated from the model with ⌃N hints, the browser labelled "Web Browser", then Shell (`views/review.rs` `render_panel`) |
+| `server` | state glyph + sub-state name and location under the folder row, live from the sidebar row (`review_panel.rs` `render_server_line`, fed by `shell/mod.rs` `apply_snapshot`); no health check or sub-state detail (the TUI has no `ready:` facts for the slot) | the Web Browser row: inert with a muted "loading…" in place of its ⌃4 hint until serving, the sub-state, detail and health check in its tooltip (`views/review.rs` `render_waiting_browser`); State=Review draws no server block |
 
 ### `OnboardingModel`
 The Orchestrator view's onboarding (`orch-onboarding`), built by `shelbi_app::onboarding::OnboardingState::model` and shown in place of the orchestrator's terminal while the project's orchestrator isn't set up.

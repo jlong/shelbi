@@ -887,17 +887,16 @@ pub fn focus_shadow_inset(theme: &Theme) -> Vec<BoxShadow> {
 /// An icon button's square.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IconButtonSize {
-    /// 24px, 8px corners.
+    /// 24px, 8px corners. (The 32px Default size went with the collapsed
+    /// sidebar's Show button; the tab bar's toolbar buttons are the
+    /// sidebar's own.)
     Small,
-    /// 32px, 12px corners.
-    Default,
 }
 
 impl IconButtonSize {
     pub fn px(self) -> f32 {
         match self {
             IconButtonSize::Small => 24.0,
-            IconButtonSize::Default => 32.0,
         }
     }
 }
@@ -930,7 +929,6 @@ pub fn tinted_icon_button(
     let hover_icon = theme.text_loud;
     let radius = match size {
         IconButtonSize::Small => px(8.0),
-        _ => px(12.0),
     };
     let rest = if active {
         theme.background

@@ -5,9 +5,10 @@
 //! rows, labels and state badges), arranged the way the component draws
 //! them by [`layout`]: the review sections first (Ready for review, then
 //! Queued for review), then Workspaces, each section collapsible, and every
-//! review and working workspace numbered for its ⌘1 to ⌘9 chord. Top to
-//! bottom: the titlebar row (the native traffic lights, then Search and
-//! Toggle sidebar), the project switcher (the name and an up-down chevron),
+//! review and working workspace numbered for its ⌃1 to ⌃9 chord. It starts
+//! under the window's tab bar (`crate::views::tab_bar`, which holds the
+//! traffic lights, Search, Toggle sidebar and the projects). Top to bottom:
+//! a remote window's host, then
 //! the nav (Orchestrator ⌘O, Issues ⌘I, Changelog ⌘L), the sections, then
 //! the footer: any status (the orchestrator's failure, the polling
 //! indicator, a version mismatch or a stale board), the unread-errors and
@@ -22,40 +23,35 @@
 //! The width is the shared nav model's, in columns ([`COLUMN_PX`] each),
 //! clamped by `shelbi_app::nav::clamp_sidebar_width`.
 
-use std::cell::Cell;
 use std::collections::{BTreeSet, HashMap};
-use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    deferred, div, prelude::*, px, AnyElement, Bounds, Context, Hsla, Pixels,
-    Div, ScrollHandle, SharedString, Stateful, Svg, Window,
+    div, prelude::*, px, AnyElement, Bounds, Context, Hsla, Pixels,
+    Div, ScrollHandle, SharedString, Svg, Window,
 };
 use shelbi_app::nav::{clamp_sidebar_width, View};
-use shelbi_app::overlay::palette::ProjectEntry;
 use shelbi_app::review::{Decision, ReviewDecisions};
 use shelbi_app::view::{ReviewState, SidebarModel, SidebarRow, WorkspaceBadge};
 use shelbi_state::ZenModeState;
 
 use super::settings_nav::SettingsPage;
 use crate::assets::{glyph, glyphs, heroicon, icons, Icon};
-use crate::elements::placed::{placed, MenuScroll};
 use crate::keys::{nav_view_hotkey, row_hotkey};
 use crate::refresh::DaemonLink;
 use crate::theme::fold::{self, Folds};
 use crate::theme::motion::{self, fill_layer, SharedTrack};
 use crate::theme::style::{self, Type, Typography, LIST_ROW_H, NAV_RADIUS};
 use crate::theme::Theme;
-use crate::views::project_menu;
 
 /// Width of one sidebar column in the window, so the shared nav model's
 /// widths (default 28, minimum 24) and its clamp apply unchanged: the default
 /// 28 columns is the component's 280pt.
 pub const COLUMN_PX: f32 = 10.0;
 
-/// The leading column's titlebar row (every Figma frame's): the native
-/// traffic lights centered 26pt down and 26pt in, and, right-aligned and
-/// centered on them, the sidebar's Search and Toggle sidebar buttons.
+/// The tab bar's height (`crate::views::tab_bar`), which the native
+/// traffic lights center on; a no-sidebar titlebar (the workflow editor's,
+/// the relaunch bar) is as tall.
 pub const TITLEBAR_H: f32 = 52.0;
 
 /// The macOS standard window buttons' frames (14pt squares, measured on
@@ -92,17 +88,7 @@ const BLOCK_Y: f32 = 8.0;
 /// A nav item's height (Orchestrator, Issues, Changelog).
 const NAV_ITEM_H: f32 = 34.0;
 
-/// The project trigger's height.
-pub const SWITCHER_H: f32 = 28.0;
-/// The project block's minimum height.
-const PROJECT_BLOCK_H: f32 = 48.0;
-/// The menu's gap below the trigger (the `Project switcher` component's
-/// `4`).
-pub const MENU_GAP: f32 = 4.0;
-/// The menu's inset from the sidebar's left and right edges.
-pub const MENU_INSET: f32 = 12.0;
-
-/// The footer toolbar's and the titlebar's square buttons.
+/// The footer toolbar's and the tab bar's square buttons.
 const TOOLBAR_BUTTON: f32 = 32.0;
 /// The Zen pill's height and corner radius, the same in State=Default,
 /// State=Workspace and State=Review.
@@ -198,7 +184,7 @@ pub struct Entry {
     pub row: SidebarRow,
     /// On a section header row.
     pub head: Option<SectionHead>,
-    /// The row's ⌘1 to ⌘9 chord.
+    /// The row's ⌃1 to ⌃9 chord.
     pub shortcut: Option<u8>,
     /// The section whose body the row is in (not its header, nor the blank
     /// before it).
@@ -385,15 +371,20 @@ pub fn selected_key(entries: &[Entry], ordinal: usize) -> Option<SharedString> {
 pub enum SidebarEvent {
     /// Open the `index`-th selectable row (selecting it first).
     Activate(usize),
-    /// The titlebar's Search button: opens the command palette.
+    /// The tab bar's Search button: opens the command palette.
     OpenSearch,
-    /// Show or hide the project switcher.
+    /// Show or hide the tab bar's project menu (the `+` tab).
     ToggleSwitcher,
-    /// Close the switcher (a click outside it).
+    /// Close the project menu (a click outside it).
     CloseSwitcher,
-    /// Switch to (open or focus the window of) a project.
+    /// Switch to a project: a tab, or a project in the `+` menu (which
+    /// opens it).
     SwitchTo(String),
-    /// The switcher's "Add project…".
+    /// Close a project: its tab's `×`.
+    CloseTab(String),
+    /// The pointer entered (`true`) or left a project's tab.
+    HoverTab(String, bool),
+    /// The project menu's "Add project…".
     AddProject,
     /// Collapse or expand a section (its header).
     ToggleSection(Section),
@@ -404,7 +395,7 @@ pub enum SidebarEvent {
     OpenSettings,
     /// The footer's megaphone: Contact Us.
     SendFeedback,
-    /// The titlebar's Toggle sidebar button.
+    /// The tab bar's Toggle sidebar button: hide or show the sidebar.
     Collapse,
     /// The settings sidebar's back button.
     LeaveSettings,
@@ -433,15 +424,6 @@ pub struct SidebarProps<'a> {
     /// `None` when what the main area shows has no row.
     pub selection: Option<usize>,
     pub link: Option<DaemonLink>,
-    /// The palette-open chord, for the Search button's tooltip (`⌃P`).
-    pub palette_chord: String,
-    /// The project switcher's menu while it shows (opening, open or
-    /// closing).
-    pub switcher: Option<SwitcherProps<'a>>,
-    /// Where the switcher's button lands, for the menu's outside click.
-    pub switcher_button: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// The switcher is open (its button holds its pressed fill).
-    pub switcher_open: bool,
     pub width: f32,
     /// The rows' scroll, owned by the window so it outlives frames the
     /// sidebar isn't drawn in (a review panel standing in for it).
@@ -462,97 +444,6 @@ pub struct RemoteBadge {
     pub address: String,
     pub connected: bool,
 }
-
-/// The switcher menu, as one frame draws it.
-pub struct SwitcherProps<'a> {
-    /// Every project, most recently launched first, with its dot
-    /// ([`crate::projects::Catalog::rows`]; the current one is `Active`).
-    pub projects: &'a [ProjectEntry],
-    /// The keyboard's row: an index into the projects, or `projects.len()`
-    /// for "Add project…".
-    pub highlight: usize,
-    /// How shown the menu is: 0 (hidden) to 1, eased.
-    pub phase: f32,
-    /// Open, not fading out after closing: only an open menu takes the
-    /// window's presses to close.
-    pub open: bool,
-    /// The menu's scroll, keeping the keyboard's row in view.
-    pub scroll: MenuScroll,
-}
-
-/// The project switcher's state, owned by the window: open or closed, when
-/// that last changed (for the slide-and-fade), and the keyboard's row.
-#[derive(Debug, Default)]
-pub struct Switcher {
-    open: bool,
-    changed: Option<Instant>,
-    pub highlight: usize,
-    /// The button's bounds as last painted.
-    pub button: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// The menu's scroll (capped where the window is short).
-    pub scroll: MenuScroll,
-}
-
-impl Switcher {
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    /// Open with the keyboard on `highlight` (the current project).
-    pub fn open(&mut self, highlight: usize, now: Instant) {
-        if !self.open {
-            self.open = true;
-            self.changed = Some(now);
-            // Scrolled to the keyboard's row as it opens.
-            self.scroll.follow(None);
-        }
-        self.highlight = highlight;
-    }
-
-    pub fn close(&mut self, now: Instant) {
-        if self.open {
-            self.open = false;
-            self.changed = Some(now);
-        }
-    }
-
-    /// Move the keyboard's row by `delta` among `count` rows, wrapping.
-    pub fn step(&mut self, delta: isize, count: usize) {
-        if count > 0 {
-            self.highlight = (self.highlight as isize + delta).rem_euclid(count as isize) as usize;
-        }
-    }
-
-    /// How shown the menu is at `now` (0..=1 on Taskpage's curve), `None`
-    /// once it has finished closing. Instant under `reduce_motion`.
-    pub fn phase(&self, now: Instant, reduce_motion: bool) -> Option<f32> {
-        let t = match self.changed {
-            Some(at) if !reduce_motion => {
-                now.saturating_duration_since(at).as_secs_f32() / motion::MENU_IN.as_secs_f32()
-            }
-            _ => 1.0,
-        };
-        let eased = motion::ease_out_expo(t.min(1.0));
-        if self.open {
-            Some(eased)
-        } else if t < 1.0 {
-            Some(1.0 - eased)
-        } else {
-            None
-        }
-    }
-
-    /// Whether the menu is mid-transition at `now` (the window keeps
-    /// drawing frames).
-    pub fn animating(&self, now: Instant, reduce_motion: bool) -> bool {
-        !reduce_motion
-            && self
-                .changed
-                .is_some_and(|at| now.saturating_duration_since(at) < motion::MENU_IN)
-    }
-}
-
-
 
 /// One row's text: the primary label, the right-aligned label, and a
 /// review's second line (`#401` and the branch).
@@ -731,9 +622,9 @@ pub fn row_selector(row: &SidebarRow) -> String {
     }
 }
 
-/// A 32pt square toolbar button (the titlebar's, the footer's): the icon in
+/// A 32pt square toolbar button (the tab bar's, the footer's): the icon in
 /// gray, a fill fading in and the icon going loud on hover.
-fn toolbar_button(id: &'static str, icon: Svg, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn toolbar_button(id: &'static str, icon: Svg, theme: &Theme) -> gpui::Stateful<gpui::Div> {
     let radius = px(8.0);
     let loud = theme.text_loud;
     let d = div()
@@ -810,8 +701,7 @@ pub fn render<H: SidebarHost>(
         .type_style(Type::Base)
         .child(motion::origin_probe(&props.track))
         .children(chip)
-        .child(render_titlebar(&props.palette_chord, theme, cx))
-        .child(render_project(&props, theme, cx))
+        .children(render_remote(props.remote.as_ref(), theme))
         .child(
             div()
                 .flex()
@@ -819,7 +709,8 @@ pub fn render<H: SidebarHost>(
                 .flex_none()
                 .gap_1()
                 .px(px(BLOCK_X))
-                .py(px(BLOCK_Y))
+                .pt(px(if props.remote.is_some() { BLOCK_Y } else { NAV_TOP }))
+                .pb(px(BLOCK_Y))
                 .children(nav),
         )
         .child(
@@ -841,12 +732,11 @@ pub fn render<H: SidebarHost>(
 
 /// The leading column with a task panel in the sidebar's place (the
 /// Navigation component's State=Workspace and State=Review): the sidebar's
-/// titlebar and footer around `panel`.
+/// footer under `panel`.
 pub fn render_panel_column<H: SidebarHost>(
     panel: impl IntoElement,
     model: &SidebarModel,
     link: Option<DaemonLink>,
-    palette_chord: &str,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> AnyElement {
@@ -857,77 +747,30 @@ pub fn render_panel_column<H: SidebarHost>(
         .bg(theme.nested(theme.sidebar))
         .text_color(theme.foreground)
         .type_style(Type::Base)
-        .child(render_titlebar(palette_chord, theme, cx))
         .child(div().flex().flex_col().flex_1().min_h_0().child(panel))
         .child(render_footer(model, link, theme, cx))
         .into_any_element()
 }
 
-/// The titlebar row: room for the traffic lights, then Search (the palette)
-/// and Toggle sidebar, right-aligned.
-pub(crate) fn render_titlebar<H: SidebarHost>(
-    palette_chord: &str,
-    theme: &Theme,
-    cx: &mut Context<H>,
-) -> impl IntoElement {
-    let search_tip = if palette_chord.is_empty() {
-        "Search".to_string()
-    } else {
-        format!("Search ({palette_chord})")
-    };
-    div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .items_center()
-        .justify_end()
-        .gap_1()
-        .h(px(TITLEBAR_H))
-        .pr(px(8.0))
-        .child(
-            toolbar_button("sidebar-search", heroicon(icons::MAGNIFYING_GLASS), theme)
-                .tooltip(style::tooltip(search_tip))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.sidebar_event(SidebarEvent::OpenSearch, window, cx)
-                })),
-        )
-        .child(
-            toolbar_button("sidebar-collapse", heroicon(icons::SIDEBAR), theme)
-                .tooltip(style::tooltip("Hide the sidebar"))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.sidebar_event(SidebarEvent::Collapse, window, cx)
-                })),
-        )
-}
+/// The nav block's top inset: 20pt under the tab bar (`Orchestrator ·
+/// Dark`'s Navigation, 2792:33101).
+const NAV_TOP: f32 = 20.0;
 
-/// The project block: the trigger (the project's name and an up-down
-/// chevron) that opens the switcher's menu below it.
-fn render_project<H: SidebarHost>(
-    props: &SidebarProps<'_>,
-    theme: &Theme,
-    cx: &mut Context<H>,
-) -> impl IntoElement {
-    let button = switcher_trigger(
-        props.model.project_label.clone(),
-        props.switcher_open,
-        &props.switcher_button,
-        theme,
-        cx,
-    );
-    let menu = props
-        .switcher
-        .as_ref()
-        .map(|switcher| switcher_menu(switcher, &props.switcher_button, props.width, theme, cx));
-
-    let remote = props.remote.as_ref().map(|badge| {
-        let dot = if badge.connected { theme.success } else { theme.warning };
+/// A remote window's host row, over the nav: who and where, with its link's
+/// dot.
+fn render_remote(remote: Option<&RemoteBadge>, theme: &Theme) -> Option<Div> {
+    let badge = remote?;
+    let dot = if badge.connected { theme.success } else { theme.warning };
+    Some(
         div()
             .debug_selector(|| "sidebar-remote-host".into())
             .flex()
             .flex_row()
+            .flex_none()
             .items_center()
             .gap(px(6.0))
-            .px_2()
+            .px(px(BLOCK_X + 8.0))
+            .pt(px(NAV_TOP))
             .max_w_full()
             .type_style(Type::Small)
             .text_color(theme.muted)
@@ -939,194 +782,12 @@ fn render_project<H: SidebarHost>(
                     .rounded_full()
                     .bg(dot),
             )
-            .child(div().truncate().child(badge.address.clone()))
-    });
-
-    div()
-        .relative()
-        .flex()
-        .flex_col()
-        .flex_none()
-        .justify_center()
-        .items_start()
-        .min_h(px(PROJECT_BLOCK_H))
-        .px(px(BLOCK_X))
-        .py(px(BLOCK_Y))
-        .children(remote)
-        .child(button)
-        .children(menu)
+            .child(div().truncate().child(badge.address.clone())),
+    )
 }
 
 /// A remote window's link dot.
 const REMOTE_DOT: f32 = 7.0;
-
-/// The project switcher's trigger: the project's `label` and an up-down
-/// chevron, holding its pressed fill while the menu is `open`; it records
-/// where it lands into `cell` (for the menu's outside click). The settings
-/// sidebar's project section draws it too.
-pub fn switcher_trigger<H: SidebarHost>(
-    label: impl Into<SharedString>,
-    open: bool,
-    cell: &Rc<Cell<Option<Bounds<Pixels>>>>,
-    theme: &Theme,
-    cx: &mut Context<H>,
-) -> Stateful<Div> {
-    let button_probe = {
-        let cell = cell.clone();
-        gpui::canvas(move |bounds, _, _| cell.set(Some(bounds)), |_, _, _, _| {})
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-    };
-    let rest = if open {
-        theme.background_active
-    } else {
-        theme.background.opacity(0.0)
-    };
-    let radius = px(NAV_RADIUS);
-    let button = div()
-        .id("sidebar-project-title")
-        .debug_selector(|| "sidebar-project-title".into())
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .h(px(SWITCHER_H))
-        .max_w_full()
-        .rounded(radius)
-        .cursor_pointer();
-    fill_layer(
-        button,
-        "sidebar-project-title",
-        radius,
-        [rest, theme.background_hover, theme.background_active],
-    )
-    .child(button_probe)
-    .child(
-        div()
-            .min_w_0()
-            .truncate()
-            .type_style(Type::BaseMedium)
-            .text_color(theme.foreground)
-            .child(label.into()),
-    )
-    .child(heroicon(icons::CHEVRON_UP_DOWN).text_color(if open { theme.text_loud } else { theme.muted }))
-    .on_click(cx.listener(|this, _, window, cx| {
-        this.sidebar_event(SidebarEvent::ToggleSwitcher, window, cx)
-    }))
-}
-
-/// The switcher's menu floating [`MENU_GAP`] under its `button` (which sits
-/// [`MENU_INSET`] in), as wide as a column `width` wide less that inset on
-/// both sides (228pt in the 252pt column), however long a project's name
-/// (it truncates): drawn after everything (`deferred`), so nothing below it
-/// moves and nothing paints over it, capped and scrolling where the window
-/// is short ([`placed`]). While open, a press outside it (its button
-/// included, so a second click closes it) closes it and goes no further.
-pub fn switcher_menu<H: SidebarHost>(
-    switcher: &SwitcherProps<'_>,
-    button: &Rc<Cell<Option<Bounds<Pixels>>>>,
-    width: f32,
-    theme: &Theme,
-    cx: &mut Context<H>,
-) -> impl IntoElement {
-    let menu = div()
-        .relative()
-        .top(px((1.0 - switcher.phase) * motion::SLIDE_PX))
-        .opacity(switcher.phase)
-        .flex()
-        .flex_col()
-        .min_h_0()
-        .w(px((width - 2.0 * MENU_INSET).max(0.0)))
-        .child(render_switcher(switcher, theme, cx));
-    let menu = placed(button, menu).gap(MENU_GAP);
-    let menu = if switcher.open {
-        menu.on_dismiss(cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
-            this.sidebar_event(SidebarEvent::CloseSwitcher, window, cx)
-        }))
-    } else {
-        menu
-    };
-    deferred(menu).with_priority(1)
-}
-
-/// The switcher's menu, the Figma `Project switcher`'s open state
-/// (2186:1692): the "Projects" heading, a row per project (its dot, its
-/// name, a check on the current one), a rule, then "+ Add project"
-/// ([`project_menu`], the palette's Projects column too). The keyboard's row
-/// wears the selection fill. Its `search` tint is laid over the sidebar's
-/// color, so it reads as the frame draws it over the sidebar while hiding
-/// the rows below it.
-fn render_switcher<H: SidebarHost>(
-    switcher: &SwitcherProps<'_>,
-    theme: &Theme,
-    cx: &mut Context<H>,
-) -> impl IntoElement {
-    let rows = switcher.projects.iter().enumerate().map(|(ix, p)| {
-        let name = p.slug.clone();
-        project_menu::project_row(
-            SharedString::from(format!("sidebar-project-{}", p.slug)),
-            format!("sidebar-project-{}", p.slug),
-            p,
-            switcher.highlight == ix,
-            theme,
-        )
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.sidebar_event(SidebarEvent::SwitchTo(name.clone()), window, cx)
-        }))
-    });
-    let add_ix = switcher.projects.len();
-    // The keyboard's row among the menu's children: after the heading, and
-    // "Add project" after the rule (and the loading note, while it shows).
-    let child = if switcher.highlight < add_ix {
-        1 + switcher.highlight
-    } else {
-        add_ix + 2 + usize::from(switcher.projects.is_empty())
-    };
-    switcher.scroll.follow(Some(child));
-    let add = project_menu::add_row(
-        "sidebar-add-project",
-        "sidebar-add-project",
-        switcher.highlight == add_ix,
-        theme,
-    )
-    .on_click(cx.listener(|this, _, window, cx| {
-        this.sidebar_event(SidebarEvent::AddProject, window, cx)
-    }));
-    div()
-        .id("sidebar-switcher")
-        .debug_selector(|| "sidebar-switcher".into())
-        .flex()
-        .flex_col()
-        .px_1()
-        .py_2()
-        .overflow_y_scroll()
-        .track_scroll(switcher.scroll.handle())
-        .rounded(px(NAV_RADIUS))
-        .bg(theme.raised.blend(theme.search))
-        .text_color(theme.foreground)
-        .occlude()
-        .child(project_menu::heading(theme))
-        .when(switcher.projects.is_empty(), |d| {
-            d.child(
-                div()
-                    .flex_none()
-                    .px_2()
-                    .h(px(project_menu::ROW_H))
-                    .flex()
-                    .items_center()
-                    .type_style(Type::Base)
-                    .text_color(theme.muted)
-                    .child("Loading projects…"),
-            )
-        })
-        .children(rows)
-        .child(project_menu::divider(theme))
-        .child(add)
-}
-
 
 fn render_nav_row<H: SidebarHost>(
     row: &SidebarRow,
@@ -1855,7 +1516,7 @@ mod tests {
         let group = mid.iter().find(|e| row_selector(&e.row) == "sidebar-machine-hub").unwrap();
         assert!(matches!(group.row, SidebarRow::MachineGroup { collapsed: true, .. }));
         // The chords are the collapsed layout's: none on the closing
-        // machine's rows, so the next machine's row takes ⌘1 (not ⌘3).
+        // machine's rows, so the next machine's row takes ⌃1 (not ⌃3).
         let chord = |sel: &str| mid.iter().find(|e| row_selector(&e.row) == sel).and_then(|e| e.shortcut);
         assert_eq!(chord("sidebar-ws-alpha"), None);
         assert_eq!(chord("sidebar-ws-echo"), Some(1));
@@ -2143,10 +1804,6 @@ mod render_tests {
                     now: Instant::now(),
                     selection: Some(self.selection),
                     link: self.link,
-                    palette_chord: "⌃P".into(),
-                    switcher: None,
-                    switcher_button: Default::default(),
-                    switcher_open: false,
                     width: 280.0,
                     scroll: gpui::ScrollHandle::new(),
                     track: motion::SlideTrack::shared(),
@@ -2232,9 +1889,6 @@ mod render_tests {
     fn renders_every_row_of_the_model(cx: &mut TestAppContext) {
         let (_, mut cx) = open(cx, fixture_model(), 0, Some(DaemonLink::Live));
         for selector in [
-            "sidebar-search",
-            "sidebar-collapse",
-            "sidebar-project-title",
             "sidebar-nav-Orchestrator",
             "sidebar-nav-Issues",
             "sidebar-nav-Changelog",
@@ -2262,6 +1916,11 @@ mod render_tests {
             "sidebar-loading",
             "sidebar-nav-Machines",
             "sidebar-version",
+            // The tab bar holds the toolbar and the projects now.
+            "sidebar-search",
+            "sidebar-collapse",
+            "sidebar-project-title",
+            "sidebar-remote-host",
         ] {
             assert!(cx.debug_bounds(absent).is_none(), "{absent} is not drawn");
         }
@@ -2269,7 +1928,6 @@ mod render_tests {
         // Rows stack in the component's order.
         let y = |cx: &mut VisualTestContext, s: &'static str| cx.debug_bounds(s).unwrap().top();
         let order = [
-            "sidebar-project-title",
             "sidebar-nav-Orchestrator",
             "sidebar-nav-Changelog",
             "sidebar-section-Workspaces",
@@ -2292,19 +1950,14 @@ mod render_tests {
     fn the_component_geometry(cx: &mut TestAppContext) {
         let (_, mut cx) = open(cx, fixture_model(), 0, None);
         let b = |cx: &mut VisualTestContext, s: &'static str| cx.debug_bounds(s).unwrap();
-        // The nav: 12pt in, 34pt items, 4pt apart.
+        // The nav: the top row, 20pt down, 12pt in, 34pt items, 4pt apart.
         let orch = b(&mut cx, "sidebar-nav-Orchestrator");
         let issues = b(&mut cx, "sidebar-nav-Issues");
+        assert_eq!(orch.top().as_f32(), 20.0);
         assert_eq!(orch.left().as_f32(), 12.0);
         assert_eq!(orch.size.width.as_f32(), 256.0);
         assert_eq!(orch.size.height.as_f32(), 34.0);
         assert_eq!((issues.top() - orch.bottom()).as_f32(), 4.0);
-        // The titlebar buttons: 32pt squares, 8pt from the right edge.
-        let toggle = b(&mut cx, "sidebar-collapse");
-        assert_eq!(toggle.size.width.as_f32(), 32.0);
-        assert_eq!(toggle.right().as_f32(), 272.0);
-        // The project trigger: 28pt.
-        assert_eq!(b(&mut cx, "sidebar-project-title").size.height.as_f32(), 28.0);
         // A two-line review row: 42pt; a workspace row: 26pt.
         assert_eq!(b(&mut cx, "sidebar-review-T-9").size.height.as_f32(), 42.0);
         assert_eq!(b(&mut cx, "sidebar-ws-bravo").size.height.as_f32(), 26.0);
@@ -2468,8 +2121,6 @@ mod render_tests {
             "sidebar-settings",
             "sidebar-section-Workspaces",
             "sidebar-zen",
-            "sidebar-search",
-            "sidebar-collapse",
         ] {
             let at = cx.debug_bounds(selector).unwrap().center();
             cx.simulate_click(at, Modifiers::none());
@@ -2483,8 +2134,6 @@ mod render_tests {
                 SidebarEvent::OpenSettings,
                 SidebarEvent::ToggleSection(Section::Workspaces),
                 SidebarEvent::ToggleZen,
-                SidebarEvent::OpenSearch,
-                SidebarEvent::Collapse,
             ]
         );
     }

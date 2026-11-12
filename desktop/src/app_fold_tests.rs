@@ -5,7 +5,7 @@
 //! and selection follow what is collapsed, not what is still drawn.
 //!
 //! The window is the smoke test's headless one ([`Harness`]: the working
-//! workspace `alpha-1` is ⌘1, the queued review `T-9` ⌘2) with an injected
+//! workspace `alpha-1` is ⌃1, the queued review `T-9` ⌃2) with an injected
 //! clock and Reduce Motion setting.
 
 use std::cell::Cell;
@@ -216,22 +216,22 @@ fn the_keys_skip_a_closing_sections_rows(cx: &mut TestAppContext) {
     assert!(f.h.take_calls().is_empty(), "a closing row isn't clickable");
 
     // The chords keep their rows mid-fold.
-    f.h.key("cmd-1");
+    f.h.key("ctrl-1");
     assert!(
         f.h.take_calls().contains(&HostCall::ShowView(View::Session("alpha-1".into()))),
-        "⌘1 is still alpha-1"
+        "⌃1 is still alpha-1"
     );
-    f.h.key("cmd-2");
+    f.h.key("ctrl-2");
     assert!(
         f.h.take_calls().contains(&HostCall::LoadReview("T-9".into())),
-        "⌘2 is still the review"
+        "⌃2 is still the review"
     );
 }
 
 #[gpui::test]
 fn the_selection_rides_with_its_row_through_a_fold(cx: &mut TestAppContext) {
     let mut f = Fold::open(cx);
-    f.h.key("cmd-2");
+    f.h.key("ctrl-2");
     f.h.take_calls();
     f.advance(Duration::from_secs(1));
     let before = f.top("sidebar-selection");
@@ -312,10 +312,10 @@ fn a_machine_group_folds_too(cx: &mut TestAppContext) {
     let mid = f.height(body);
     assert!(mid > 0.0 && mid < full, "part-way: {mid} of {full}");
     // A collapsed group's rows take no chord (they aren't in the shared
-    // rows), from the fold's first frame: box-1's ⌘2 passes to the review.
-    f.h.key("cmd-2");
+    // rows), from the fold's first frame: box-1's ⌃2 passes to the review.
+    f.h.key("ctrl-2");
     assert!(f.h.take_calls().contains(&HostCall::LoadReview("T-9".into())));
-    f.h.key("cmd-3");
+    f.h.key("ctrl-3");
     assert!(f.h.take_calls().is_empty());
     f.advance(FOLD);
     assert!(!f.animating());

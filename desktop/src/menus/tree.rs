@@ -502,6 +502,9 @@ fn file_menu<'a, I: Iterator<Item = &'a Command>>(
             MenuEntry::Separator,
             submenu("Edit Configuration", editors, "Nothing to Edit"),
             MenuEntry::Separator,
+            // The shown project's tab closes as its `×` does: the registry's
+            // Quit Project, confirmed (it stops the project's agents).
+            slot("action:quit-project", "Close Project…", None),
             app("Close Window", AppCommand::CloseWindow),
         ],
     }

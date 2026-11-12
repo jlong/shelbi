@@ -3119,8 +3119,10 @@ impl Run {
             self.save(handle, &format!("state-sidebar-fold-{name}-settled"));
         }
 
-        // The project switcher open (the `Project switcher` component's open
-        // state, 2186:1692), the frame's projects open but 32pixels.
+        // The tab bar's project menu open (the `+` tab's, drawn as the
+        // `Project switcher` component's open state, 2186:1692): the frame's
+        // projects open but 32pixels, so the open ones have tabs and
+        // 32pixels is the menu's row.
         if let Some(catalog) = self.cx.update(|cx| cx.try_global::<crate::projects::Catalog>().cloned()) {
             catalog.set_open(&["shelbi", "contextstore"]);
         }

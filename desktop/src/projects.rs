@@ -42,6 +42,9 @@ struct CatalogInner {
     /// The projects recorded open (running in some window or terminal), as
     /// of the last refresh.
     open: std::collections::HashSet<String>,
+    /// The open set has been read (a refresh landed, or a test set it): the
+    /// tabs follow it only then.
+    open_known: bool,
     skeletons: std::collections::HashMap<ProjectKey, SidebarModel>,
     views: std::collections::HashMap<ProjectKey, ProjectViewState>,
     /// Projects whose view state this process has set: a refresh never
@@ -77,6 +80,29 @@ impl Catalog {
             .map(|p| (p.name.clone(), p.label.clone()))
             .collect();
         shelbi_app::command_model::project_rows(current, projects, &inner.open)
+    }
+
+    /// The projects recorded open, sorted by name, or `None` before the
+    /// first refresh lands (the tabs then drop nothing).
+    pub fn open_projects(&self) -> Option<Vec<String>> {
+        let inner = self.lock();
+        inner.open_known.then(|| {
+            let mut open: Vec<String> = inner.open.iter().cloned().collect();
+            open.sort();
+            open
+        })
+    }
+
+    /// Record `project` open (`true`) or closed, ahead of the next refresh:
+    /// this window just brought it up or quit it, and a tab must neither
+    /// come back nor go meanwhile.
+    pub fn note_open(&self, project: &str, open: bool) {
+        let mut inner = self.lock();
+        if open {
+            inner.open.insert(project.to_string());
+        } else {
+            inner.open.remove(project);
+        }
     }
 
     /// The sidebar a window for `project` paints on its first frame, from
@@ -162,6 +188,7 @@ impl Catalog {
         let mut guard = self.lock();
         guard.projects = projects;
         guard.open = open;
+        guard.open_known = true;
         guard.skeletons = skeletons;
         for (name, view) in views {
             if !guard.remembered.contains(&name) {
@@ -174,7 +201,18 @@ impl Catalog {
     /// check's catalog, which never refreshes).
     #[cfg(any(test, feature = "visual-check"))]
     pub fn set_open(&self, open: &[&str]) {
-        self.lock().open = open.iter().map(|p| p.to_string()).collect();
+        let mut inner = self.lock();
+        inner.open = open.iter().map(|p| p.to_string()).collect();
+        inner.open_known = true;
+    }
+
+    /// `project`'s label (its display name), as of the last refresh.
+    pub fn label_of(&self, project: &str) -> Option<String> {
+        self.lock()
+            .projects
+            .iter()
+            .find(|p| p.name == project)
+            .map(|p| p.label.clone())
     }
 
     /// Whether `project` is in the catalog (as of its last refresh).
@@ -355,6 +393,17 @@ mod tests {
         catalog.forget_view(&web);
         assert_eq!(catalog.view_state(&web), ProjectViewState::default());
         assert!(catalog.inner.lock().unwrap().remembered.contains(&web), "a refresh keeps it forgotten");
+    }
+
+    #[test]
+    fn the_open_set_is_unknown_until_read_and_follows_notes() {
+        let catalog = Catalog::default();
+        assert_eq!(catalog.open_projects(), None, "nothing read yet");
+        catalog.set_open(&["web", "api"]);
+        assert_eq!(catalog.open_projects(), Some(vec!["api".to_string(), "web".to_string()]));
+        catalog.note_open("api", false);
+        catalog.note_open("docs", true);
+        assert_eq!(catalog.open_projects(), Some(vec!["docs".to_string(), "web".to_string()]));
     }
 
     #[test]

@@ -121,6 +121,10 @@ pub struct WindowState {
     /// The user's chosen task pane width, in points. Saved as chosen, so a
     /// window too narrow to honor it narrows the pane for display only.
     pub task_pane_width: f32,
+    /// The window's project tabs, in order (`crate::project_tabs`): kept
+    /// across restarts. Empty in a file from before tabs.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tabs: Vec<String>,
 }
 
 impl Default for WindowState {
@@ -131,6 +135,7 @@ impl Default for WindowState {
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
             sidebar_collapsed: false,
             task_pane_width: DEFAULT_W,
+            tabs: Vec::new(),
         }
     }
 }
@@ -407,6 +412,7 @@ mod tests {
             sidebar_width: 33,
             sidebar_collapsed: true,
             task_pane_width: 812.0,
+            tabs: vec!["web".into(), "api".into()],
         };
         state.save_to(&path).unwrap();
         assert_eq!(WindowState::load_from(&path), state);
@@ -501,6 +507,7 @@ mod tests {
             sidebar_width: 30,
             sidebar_collapsed: false,
             task_pane_width: DEFAULT_W,
+            tabs: Vec::new(),
         }
     }
 

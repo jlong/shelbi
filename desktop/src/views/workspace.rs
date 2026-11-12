@@ -16,7 +16,7 @@
 //!   column (IN PROGRESS); the title and the description clamped to five
 //!   lines, More opening the task detail over the screen (the window
 //!   draws it, `dt-more-opens-detail`); the worktree with Open (reveal it in
-//!   Finder); then the views, numbered ⌘1 to ⌘N: the agent, View Diff, Edit
+//!   Finder); then the views, numbered ⌃1 to ⌃N: the agent, View Diff, Edit
 //!   in <editor>, and the Shell toggle. Its rows, selection and keys are the
 //!   shared [`WorkspacePanelState`] (the TUI's panel navigates by the same
 //!   functions).
@@ -821,7 +821,7 @@ impl WorkspaceView {
         cx.notify();
     }
 
-    /// ⌘N (the window's chord while the panel holds the column): the
+    /// ⌃N (the window's chord while the panel holds the column): the
     /// panel's N-th view, as its hints number them. Focus stays where it is.
     pub fn view_shortcut(&mut self, n: u8, window: &mut Window, cx: &mut Context<Self>) {
         let row = (n as usize)
@@ -1302,7 +1302,7 @@ impl WorkspaceView {
         let info: Vec<AnyElement> = folder.into_iter().chain(branch).chain(pr).collect();
         let info = (!info.is_empty()).then(|| task_panel::info_rows(info));
 
-        // The views: the agent, its diff and editor, then the shell, ⌘1…⌘N.
+        // The views: the agent, its diff and editor, then the shell, ⌃1…⌃N.
         let active = panel.active();
         let mut shortcut = 0u8;
         let mut next = || {
@@ -1418,7 +1418,7 @@ impl WorkspaceView {
     }
 }
 
-/// Whether `row` is one of the views (numbered ⌘1…⌘N): the view switch and
+/// Whether `row` is one of the views (numbered ⌃1…⌃N): the view switch and
 /// the shell.
 fn is_view_row(row: WsRow) -> bool {
     matches!(row, WsRow::Switch(_) | WsRow::Shell)
@@ -2120,13 +2120,13 @@ pub(crate) mod tests {
             h.cx.run_until_parked();
         };
         shortcut(&mut h, 2);
-        assert_eq!(h.active(), ContentView::Diff, "⌘2 is View Diff");
+        assert_eq!(h.active(), ContentView::Diff, "⌃2 is View Diff");
         shortcut(&mut h, 3);
-        assert_eq!(h.active(), ContentView::Editor, "⌘3 is Edit in Vim");
+        assert_eq!(h.active(), ContentView::Editor, "⌃3 is Edit in Vim");
         shortcut(&mut h, 4);
-        assert!(h.view.read_with(&h.cx, |v, _| v.shell_open()), "⌘4 toggles the shell");
+        assert!(h.view.read_with(&h.cx, |v, _| v.shell_open()), "⌃4 toggles the shell");
         shortcut(&mut h, 1);
-        assert_eq!(h.active(), ContentView::Agent, "⌘1 is the agent");
+        assert_eq!(h.active(), ContentView::Agent, "⌃1 is the agent");
         shortcut(&mut h, 5);
         assert_eq!(h.active(), ContentView::Agent, "no fifth view");
         // Only the Vim pane's "no toast over me".

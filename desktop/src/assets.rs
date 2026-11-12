@@ -459,6 +459,8 @@ heroicons! {
         CIRCLE_MENU = "circle";
         CHECK_SMALL_HEAVY_MENU = "check-small-heavy";
         PLUS_MENU = "plus";
+        /// A project tab's close button, in its dot's place.
+        X_MARK_MENU = "x-mark";
         /// The terminal's Jump to bottom pill, beside its X-Small label.
         ARROW_DOWN_MENU = "arrow-down";
     }
