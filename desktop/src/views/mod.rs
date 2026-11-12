@@ -120,6 +120,7 @@ pub mod palette;
 pub mod project_menu;
 pub mod remote_session;
 pub mod review;
+pub mod tab_bar;
 pub mod task_detail;
 pub mod task_panel;
 pub mod settings;

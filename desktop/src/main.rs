@@ -28,6 +28,7 @@ mod licenses;
 mod menus;
 mod notify;
 mod platform;
+mod project_tabs;
 mod projects;
 mod refresh;
 #[cfg(test)]

@@ -1,12 +1,12 @@
 //! The Figma sidebar's window behavior (`dt-figma-sidebar`): the sidebar's
-//! chords (⌘O ⌘I ⌘L open the nav views, ⌘1 to ⌘9 the numbered rows, even
+//! chords (⌘O ⌘I ⌘L open the nav views, ⌃1 to ⌃9 the numbered rows, even
 //! from a focused terminal), the sections collapsing and expanding and the
-//! project remembering it, the Zen pill, and the titlebar's Search and
+//! project remembering it, the Zen pill, and the tab bar's Search and
 //! Toggle sidebar buttons.
 //!
 //! The window is the smoke test's headless one ([`Harness`]): one review
-//! (`T-9`, queued) and one working workspace (`alpha-1`), so `alpha-1` is ⌘1
-//! and `T-9` is ⌘2.
+//! (`T-9`, queued) and one working workspace (`alpha-1`), so `alpha-1` is ⌃1
+//! and `T-9` is ⌃2.
 
 use std::rc::Rc;
 
@@ -47,7 +47,7 @@ fn the_nav_chords_open_their_views(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_numbered_chords_open_their_rows(cx: &mut TestAppContext) {
     let mut h = open(cx);
-    h.key("cmd-1");
+    h.key("ctrl-1");
     assert_eq!(
         h.take_calls(),
         calls_of(CommandKind::FocusWorkspace {
@@ -56,7 +56,7 @@ fn the_numbered_chords_open_their_rows(cx: &mut TestAppContext) {
     );
     let selected = h.window.read_with(&h.cx, |w, cx| w.selected(cx));
     assert_eq!(selected, Some(SidebarTarget::Workspace("alpha-1".into())), "its row is selected");
-    h.key("cmd-2");
+    h.key("ctrl-2");
     assert_eq!(
         h.take_calls(),
         calls_of(CommandKind::LoadReview {
@@ -64,7 +64,7 @@ fn the_numbered_chords_open_their_rows(cx: &mut TestAppContext) {
         })
     );
     // Nothing is numbered 3.
-    h.key("cmd-3");
+    h.key("ctrl-3");
     assert!(h.take_calls().is_empty());
 }
 
@@ -74,7 +74,7 @@ fn a_collapsed_sections_chord_still_opens_its_row(cx: &mut TestAppContext) {
     h.click_selector("sidebar-section-Workspaces");
     h.draw();
     assert!(h.cx.debug_bounds("sidebar-ws-alpha-1").is_none());
-    h.key("cmd-1");
+    h.key("ctrl-1");
     assert_eq!(
         h.take_calls(),
         calls_of(CommandKind::FocusWorkspace {
@@ -87,12 +87,14 @@ fn a_collapsed_sections_chord_still_opens_its_row(cx: &mut TestAppContext) {
 fn the_window_takes_the_sidebar_chords_from_a_terminal(cx: &mut TestAppContext) {
     let h = open(cx);
     let keymaps = h.window.read_with(&h.cx, |w, _| w.keymaps.clone());
-    for spec in ["super-o", "super-i", "super-l", "super-1", "super-9"] {
+    for spec in ["super-o", "super-i", "super-l", "super-1", "super-9", "ctrl-1", "ctrl-9"] {
         let chord = shelbi_state::keymap::KeyChord::parse(spec).unwrap();
         assert!(takes_from_terminal(&keymaps, chord), "{spec}");
     }
     let plain = shelbi_state::keymap::KeyChord::parse("super-p").unwrap();
     assert!(!takes_from_terminal(&keymaps, plain));
+    let zero = shelbi_state::keymap::KeyChord::parse("ctrl-0").unwrap();
+    assert!(!takes_from_terminal(&keymaps, zero), "no row 0");
 }
 
 #[gpui::test]
@@ -128,7 +130,7 @@ fn a_section_collapses_expands_and_is_remembered(cx: &mut TestAppContext) {
 #[gpui::test]
 fn collapsing_a_section_keeps_the_selection_on_its_row(cx: &mut TestAppContext) {
     let mut h = open(cx);
-    h.key("cmd-2");
+    h.key("ctrl-2");
     h.take_calls();
     // Collapse the Workspaces section above the selected review.
     h.click_selector("sidebar-section-Workspaces");
@@ -144,9 +146,9 @@ fn the_zen_pill_toggles_zen(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_titlebar_buttons_search_and_toggle_the_sidebar(cx: &mut TestAppContext) {
+fn the_tab_bar_buttons_search_and_toggle_the_sidebar(cx: &mut TestAppContext) {
     let mut h = open(cx);
-    h.click_selector("sidebar-search");
+    h.click_selector("tab-bar-search");
     assert!(h.window.read_with(&h.cx, |w, _| w.overlay.is_some()), "Search opens the palette");
     h.window.update(&mut h.cx, |w, cx| {
         w.overlay = None;
@@ -155,12 +157,14 @@ fn the_titlebar_buttons_search_and_toggle_the_sidebar(cx: &mut TestAppContext) {
 
     // Instant here: the slide itself is `app_column_tests`'s.
     h.window.update(&mut h.cx, |w, _| w.reduce_motion = std::rc::Rc::new(|| true));
-    h.click_selector("sidebar-collapse");
+    let bar = h.cx.debug_bounds("tab-bar").expect("the tab bar");
+    h.click_selector("tab-bar-sidebar");
     h.draw();
     assert!(h.window.read_with(&h.cx, |w, _| w.collapsed));
     assert!(h.cx.debug_bounds("sidebar").is_none(), "the column is hidden");
-    // The toggle stays reachable, in the main area.
-    h.click_selector("expand-sidebar");
+    assert_eq!(h.cx.debug_bounds("tab-bar"), Some(bar), "the tab bar stays put");
+    // The toggle stays where it was.
+    h.click_selector("tab-bar-sidebar");
     h.draw();
     assert!(!h.window.read_with(&h.cx, |w, _| w.collapsed));
     assert!(h.cx.debug_bounds("sidebar").is_some());

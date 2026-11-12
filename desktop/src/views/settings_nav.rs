@@ -2,13 +2,13 @@
 //! State=Settings (2252:27532), which stands in the app sidebar's column
 //! while Settings is open, as the task panels do (`column_swap`).
 //!
-//! Top to bottom: the sidebar's titlebar (the traffic lights, Search and
-//! Toggle sidebar), the back button beside the Settings title, then each
-//! section: its header and its pages' nav rows, each with its ⌘N. The Global
+//! It starts under the window's tab bar, like the app sidebar. Top to
+//! bottom: the back button beside the Settings title, then each section:
+//! its header and its pages' nav rows, each with its ⌘N. The Global
 //! section (General, Keybindings, Terminal), then, after a divider, the
-//! project section (`dt-wf-settings-index`, frame 2301:5824): the project
-//! switcher, the same trigger and menu as the app sidebar's (switching
-//! reopens Settings on the new project), over the project's pages:
+//! project section (`dt-wf-settings-index`, frame 2301:5824): the project's
+//! name (the tab bar switches projects, and a switch reopens Settings on
+//! the new project), over the project's pages:
 //! Workspaces (`dt-workspace-settings-index`, frame 2523:8879), Workflows
 //! and Agents (`dt-agents-settings-page`, frame 2377:41040). The frames'
 //! Integrations joins [`SECTIONS`] with its page. No footer: the frame draws
@@ -17,17 +17,12 @@
 //! [`SettingsNav`] (from `shelbi_app::settings`, shared with the TUI) is the
 //! toolkit-free part: the page shown and the row the keys moved to.
 
-use std::cell::Cell;
-use std::rc::Rc;
-
 use gpui::{div, prelude::*, px, AnyElement, Bounds, Context, FontWeight, Pixels, SharedString};
 
-use super::sidebar::{
-    nav_item, render_titlebar, switcher_menu, switcher_trigger, SidebarEvent, SidebarHost, SwitcherProps,
-};
+use super::sidebar::{nav_item, SidebarEvent, SidebarHost};
 use super::task_panel;
 use crate::assets::{icons, Icon};
-use crate::keys::row_hotkey;
+use crate::keys::tab_hotkey;
 use crate::theme::motion::{self, SharedTrack};
 use crate::theme::style::{self, Type, Typography, NAV_RADIUS};
 use crate::theme::Theme;
@@ -72,21 +67,6 @@ impl PageLook for SettingsPage {
     }
 }
 
-/// The project section's switcher, as one frame draws it.
-pub struct ProjectSwitcher<'a> {
-    /// The shown project's name.
-    pub label: SharedString,
-    /// The menu while it shows (opening, open or closing).
-    pub menu: Option<SwitcherProps<'a>>,
-    /// Where the trigger lands, for the menu's outside click (the app
-    /// sidebar's: one switcher per window).
-    pub button: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// The menu is open (the trigger holds its pressed fill).
-    pub open: bool,
-    /// The column's width, which the menu spans.
-    pub width: f32,
-}
-
 /// The section header: Base/Medium, 20pt in, 8pt above and 4pt below.
 fn section_header(label: &'static str, theme: &Theme) -> impl IntoElement {
     div()
@@ -109,14 +89,10 @@ fn section_header(label: &'static str, theme: &Theme) -> impl IntoElement {
 }
 
 /// The project section's head (frame 2301:5825): the 1pt divider 12pt in
-/// with 8pt above and below, then the switcher's trigger 12pt in, 8pt
-/// above and 4pt below, its menu opening under it.
-fn project_header<H: SidebarHost>(project: &ProjectSwitcher<'_>, theme: &Theme, cx: &mut Context<H>) -> impl IntoElement {
-    let trigger = switcher_trigger(project.label.clone(), project.open, &project.button, theme, cx);
-    let menu = project
-        .menu
-        .as_ref()
-        .map(|menu| switcher_menu(menu, &project.button, project.width, theme, cx));
+/// with 8pt above and below, then the project's name where the frame's
+/// switcher sat (20pt in, 8pt above and 4pt below): the tab bar switches
+/// projects.
+fn project_header(label: SharedString, theme: &Theme) -> impl IntoElement {
     div()
         .flex()
         .flex_col()
@@ -131,30 +107,42 @@ fn project_header<H: SidebarHost>(project: &ProjectSwitcher<'_>, theme: &Theme, 
         .child(
             div()
                 .debug_selector(|| "settings-project".into())
-                .relative()
                 .flex()
                 .flex_row()
                 .flex_none()
                 .items_center()
                 .px(px(12.0))
-                .pt(px(SWITCHER_TOP))
+                .pt(px(8.0))
                 .pb(px(4.0))
-                .child(trigger)
-                .children(menu),
+                .child(
+                    div()
+                        .debug_selector(|| "settings-project-label".into())
+                        .flex()
+                        .items_center()
+                        .h(px(PROJECT_ROW_H))
+                        .px(px(8.0))
+                        .min_w_0()
+                        .truncate()
+                        .type_style(Type::BaseMedium)
+                        .text_color(theme.foreground)
+                        .child(label),
+                ),
         )
 }
 
-/// The switcher trigger's inset from its row's top.
-const SWITCHER_TOP: f32 = 8.0;
+/// The project name's row height (the frame's switcher trigger's).
+const PROJECT_ROW_H: f32 = 28.0;
+
+/// The back row's inset under the tab bar.
+const BACK_TOP: f32 = 16.0;
 
 /// The settings sidebar. `chip` is the sliding selection while it moves
-/// (measured on `track`); `project` is the project section's switcher.
+/// (measured on `track`); `project` is the shown project's name.
 pub fn render<H: SidebarHost>(
     nav: SettingsNav,
     chip: Option<Bounds<Pixels>>,
     track: &SharedTrack,
-    project: ProjectSwitcher<'_>,
-    palette_chord: &str,
+    project: SharedString,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> AnyElement {
@@ -211,7 +199,7 @@ pub fn render<H: SidebarHost>(
                         )
                     });
                     // The frame's hotkeys sit at the row's padding, no inset of their own.
-                    let hotkey = style::hotkey(&row_hotkey(page.shortcut()), theme)
+                    let hotkey = style::hotkey(&tab_hotkey(page.shortcut()), theme)
                         .px_0()
                         .into_any_element();
                     nav_item(painted, page.icon(), page.label(), Some(hotkey), on, theme).on_click(
@@ -223,7 +211,7 @@ pub fn render<H: SidebarHost>(
                 .collect();
             let header = match section.header {
                 Header::Title(title) => section_header(title, theme).into_any_element(),
-                Header::Project => project_header(&project, theme, cx).into_any_element(),
+                Header::Project => project_header(project.clone(), theme).into_any_element(),
             };
             div()
                 .flex()
@@ -263,7 +251,6 @@ pub fn render<H: SidebarHost>(
         .bg(theme.nested(theme.sidebar))
         .text_color(theme.foreground)
         .type_style(Type::Base)
-        .child(render_titlebar(palette_chord, theme, cx))
         .child(
             div()
                 .flex()
@@ -272,7 +259,8 @@ pub fn render<H: SidebarHost>(
                 .items_center()
                 .gap(px(12.0))
                 .px(px(16.0))
-                .py(px(8.0))
+                .pt(px(BACK_TOP))
+                .pb(px(8.0))
                 .child(back)
                 .child(title),
         )

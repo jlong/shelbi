@@ -8,8 +8,8 @@
 //! clamped to five lines, More opening the task detail over the screen),
 //! the info rows (the worktree with its Open button, the branch, the pull
 //! request: the Workspace and Review frames 2787:33099 / 2787:33098),
-//! the views (the sidebar's nav item with the sliding chip, numbered ⌘1 to
-//! ⌘N), and, in the Review panel, its Actions. The window draws the
+//! the views (the sidebar's nav item with the sliding chip, numbered ⌃1 to
+//! ⌃N), and, in the Review panel, its Actions. The window draws the
 //! sidebar's titlebar and footer around a panel
 //! ([`super::sidebar::render_panel_column`]).
 
@@ -354,7 +354,7 @@ pub fn views_block() -> Div {
         .py(px(24.0))
 }
 
-/// One view: the sidebar's nav item with `icon`, `label` and its ⌘N hint
+/// One view: the sidebar's nav item with `icon`, `label` and its ⌃N hint
 /// (or `trailing` in its place). `d` comes painted with its state.
 pub fn view_row(
     d: Stateful<Div>,

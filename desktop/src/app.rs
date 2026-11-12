@@ -1,9 +1,10 @@
 //! The root view of a Shelbi window: the sidebar | main area split.
 //!
 //! A window shows one project at a time and switches projects in place
-//! (`dt-switch-project-in-window`): the sidebar's switcher, the palette, the
-//! File menu and a notification click all retarget the current window rather
-//! than opening another. File ▸ New Window (⌘⇧N) opens a second window, which
+//! (`dt-switch-project-in-window`): the project tabs across its top (and
+//! their `+` menu, `project-tabs`), the palette, the File menu and a
+//! notification click all retarget the current window rather than opening
+//! another. File ▸ New Window (⌘⇧N) opens a second window, which
 //! switches on its own; two windows may show the same project and share its
 //! feed ([`crate::feeds`]). [`Shell`] keeps the open windows and their slots.
 //!
@@ -101,7 +102,9 @@ use crate::platform::version::APP_VERSION;
 use crate::platform::{
     relaunch, Bootstrap, BootstrapEvent, BootstrapState, Failure, Ready, SystemPlatform,
 };
+use crate::project_tabs::ProjectTabs;
 use crate::views::bootstrap::{self as boot_view, ScreenAction};
+use crate::views::tab_bar::{self, TabBarProps};
 use crate::views::chat::{ChatDeps, ChatEvent, ChatView};
 use crate::views::onboarding::{OnboardingEvent, OnboardingView};
 #[cfg(test)]
@@ -275,6 +278,13 @@ fn shelbi_windows(cx: &App) -> Vec<WindowHandle<ShelbiWindow>> {
     cx.try_global::<Shell>()
         .map(|s| s.windows.iter().map(|w| w.handle).collect())
         .unwrap_or_default()
+}
+
+/// Bring every window's tabs in line with the catalog's open set.
+fn sync_every_windows_tabs(cx: &mut App) {
+    for handle in shelbi_windows(cx) {
+        let _ = handle.update(cx, |w, _, cx| w.sync_tabs(cx));
+    }
 }
 
 /// The frontmost Shelbi window: the key one, else the top of the platform's
@@ -1140,8 +1150,14 @@ pub struct ShelbiWindow {
     /// lands at once.
     reveal: SidebarReveal,
     dragging: bool,
-    /// The project switcher's menu.
-    switcher: sidebar::Switcher,
+    /// The tab bar's project menu (its `+` tab's).
+    switcher: tab_bar::ProjectMenu,
+    /// The project tabs, in order (saved in [`Self::window_state`]).
+    tabs: ProjectTabs,
+    /// The tab under the pointer: its dot is an `×`.
+    hovered_tab: Option<String>,
+    /// ⌘ is held: the tabs show their ⌘N.
+    command_held: bool,
     /// When the open overlay opened, for its slide-and-fade in.
     overlay_opened: Option<Instant>,
     /// The sidebar's rows, measured for the selection chip's slide.
@@ -1372,6 +1388,10 @@ impl ShelbiWindow {
             this.active = window.is_window_active();
             if this.active {
                 this.on_activated(cx);
+            } else if this.command_held {
+                // ⌘-Tab away: the release goes to another app.
+                this.command_held = false;
+                cx.notify();
             }
         }));
         // Quitting (⌘Q, Detach) closes no window one by one: save where this
@@ -1629,6 +1649,11 @@ impl ShelbiWindow {
     ) -> Self {
         let mut client = ClientState::new(project);
         client.set_sidebar_width(window_state.sidebar_width);
+        // The saved tab order, and this window's project in it.
+        let mut tabs = ProjectTabs::new(window_state.tabs.iter().cloned());
+        tabs.insert(project);
+        let mut window_state = window_state;
+        window_state.tabs = tabs.order().to_vec();
         // Land on the orchestrator chat, focused, as the TUI does.
         client.set_view(View::Session("orch".into()));
         client.focus_main();
@@ -1672,7 +1697,10 @@ impl ShelbiWindow {
             collapsed: window_state.sidebar_collapsed,
             reveal: SidebarReveal::new(!window_state.sidebar_collapsed),
             dragging: false,
-            switcher: sidebar::Switcher::default(),
+            switcher: tab_bar::ProjectMenu::default(),
+            tabs,
+            hovered_tab: None,
+            command_held: false,
             overlay_opened: None,
             nav_track: SlideTrack::shared(),
             cursor: None,
@@ -1764,6 +1792,8 @@ impl ShelbiWindow {
     /// settings it reads (`keys.yaml` included) may have changed while it was
     /// behind.
     fn on_activated(&mut self, cx: &mut Context<Self>) {
+        // Projects opened or quit elsewhere meanwhile gain or lose tabs.
+        self.refresh_catalog(cx);
         self.sync_menus(cx);
         self.load_keymaps(cx);
         self.load_notify_prefs(cx);
@@ -2202,6 +2232,13 @@ impl ShelbiWindow {
                     Ok(_) => None,
                     Err(message) => Some(message.into()),
                 };
+                // Recorded open now: every window gets its tab.
+                if this.status.is_none() {
+                    if let Some(catalog) = cx.try_global::<Catalog>() {
+                        catalog.note_open(&opening, true);
+                    }
+                    this.refresh_catalog(cx);
+                }
                 // The orchestrator is up now: re-attach a chat that isn't
                 // live, even mid-connect (that attach may have started before
                 // the session existed and give up on it), as the TUI does
@@ -2256,13 +2293,17 @@ impl ShelbiWindow {
         if self.shows(project) {
             return;
         }
-        // Switched from Settings (its project section's switcher): it
-        // reopens on the same page, for the new project.
+        // Switched with Settings open (a tab, the palette): it reopens on the
+        // same page, for the new project.
         let settings = matches!(self.route, Route::Settings(_)).then(|| self.settings_nav.page());
         self.remember_view_state(cx);
         self.teardown_project(window, cx);
         self.chooser = false;
         self.project = project.to_string();
+        // Its tab, at the end when it has none (saved with the slot below).
+        if self.tabs.insert(project) {
+            self.window_state.tabs = self.tabs.order().to_vec();
+        }
         // A remote window switches among its host's projects only.
         self.project_handle = match &mut self.remote {
             Some(remote) => remote.handle_for(project),
@@ -2314,18 +2355,7 @@ impl ShelbiWindow {
         self.palette_inputs = PaletteInputs::default();
         window.set_window_title(CHOOSER_TITLE);
         // The list to choose from, re-read off the UI thread.
-        if let Some(catalog) = cx.try_global::<Catalog>().cloned().filter(|_| !self.offline()) {
-            let (tx, rx) = futures::channel::oneshot::channel();
-            catalog.refresh(move || {
-                let _ = tx.send(());
-            });
-            cx.spawn(async move |this, cx| {
-                if rx.await.is_ok() {
-                    this.update(cx, |_, cx| cx.notify()).ok();
-                }
-            })
-            .detach();
-        }
+        self.refresh_catalog(cx);
         self.record_slot(cx);
         self.sync_menus(cx);
         cx.notify();
@@ -2583,14 +2613,28 @@ impl ShelbiWindow {
         window.remove_window();
     }
 
-    /// `quit` was quit: a window still showing it moves to another open
-    /// project, or to the chooser when none is left. A window the user already
-    /// moved off it stays where they chose (checked by the project, not by a
-    /// count of switches: one that came back to `quit` still has to leave).
-    /// A remote window goes to the chooser: this machine's open projects
-    /// aren't its host's, and its listing doesn't say which of those are open.
-    fn after_quit_project(&mut self, quit: ProjectKey, window: &mut Window, cx: &mut Context<Self>) {
+    /// `quit` was quit: its tab goes, and a window still showing it moves to
+    /// its neighbor tab (the right one, else the left), else another open
+    /// project, else the chooser. A window the user already moved off it
+    /// stays where they chose (checked by the project, not by a count of
+    /// switches: one that came back to `quit` still has to leave). A remote
+    /// window looks no further than its tabs: this machine's open projects
+    /// aren't its host's, and its listing doesn't say which of those are
+    /// open.
+    pub(crate) fn after_quit_project(&mut self, quit: ProjectKey, window: &mut Window, cx: &mut Context<Self>) {
+        // A tab names a project on this window's machine.
+        let mine = quit.origin == self.project_handle.key().origin;
+        let neighbor = mine
+            .then(|| self.tabs.neighbor(&quit.name).map(str::to_string))
+            .flatten();
+        if mine && self.tabs.remove(&quit.name) {
+            self.tabs_changed(cx);
+        }
         if !self.shows_key(&quit) {
+            return;
+        }
+        if neighbor.is_some() {
+            self.leave_quit_project(neighbor, window, cx);
             return;
         }
         let none_to_read = self.offline() || self.remote.is_some();
@@ -2608,6 +2652,12 @@ impl ShelbiWindow {
             let next = next.await;
             this.update_in(cx, |this, window, cx| {
                 if this.shows_key(&quit) {
+                    // Back on it meanwhile: its tab goes again, and a tab
+                    // opened since takes over.
+                    if this.tabs.remove(&quit.name) {
+                        this.tabs_changed(cx);
+                    }
+                    let next = this.tabs.order().first().cloned().or(next);
                     this.leave_quit_project(next, window, cx);
                 }
             })
@@ -2741,10 +2791,22 @@ impl ShelbiWindow {
         cx.notify();
     }
 
-    /// A sidebar chord (⌘O ⌘I ⌘L, ⌘1 to ⌘9): open what it names, selecting
-    /// its row as a click would.
+    /// A window chord (⌘O ⌘I ⌘L, ⌃1 to ⌃9, ⌘1 to ⌘9): open what it names,
+    /// selecting its row (or tab) as a click would.
     fn nav_chord(&mut self, chord: NavChord, window: &mut Window, cx: &mut Context<Self>) {
-        // While a task panel holds the column, ⌘1 to ⌘N are its views (the
+        // ⌘1 to ⌘9 select the tabs, except that open Settings keeps its page
+        // numbers.
+        if let NavChord::Tab(n) = chord {
+            if self.column.target() == Occupant::Settings {
+                if let Some(page) = SettingsPage::for_shortcut(n) {
+                    self.show_settings_page(page, cx);
+                }
+            } else {
+                self.select_tab(usize::from(n), window, cx);
+            }
+            return;
+        }
+        // While a task panel holds the column, ⌃1 to ⌃N are its views (the
         // hints it draws), not the hidden sidebar's rows.
         if let NavChord::Row(n) = chord {
             match self.column.target() {
@@ -2760,13 +2822,9 @@ impl ShelbiWindow {
                     }
                     return;
                 }
-                // Likewise the settings sidebar's pages.
-                Occupant::Settings => {
-                    if let Some(page) = SettingsPage::for_shortcut(n) {
-                        self.show_settings_page(page, cx);
-                    }
-                    return;
-                }
+                // The settings sidebar has no numbered rows (its pages are
+                // ⌘N).
+                Occupant::Settings => return,
                 Occupant::Sidebar => {}
             }
         }
@@ -2776,6 +2834,7 @@ impl ShelbiWindow {
                 .into_iter()
                 .find(|e| e.shortcut == Some(n))
                 .and_then(|e| e.row.target()),
+            NavChord::Tab(_) => None,
         };
         // A collapsed section still answers its chords; the row just isn't
         // there to select.
@@ -4248,21 +4307,122 @@ impl ShelbiWindow {
         }
     }
 
+    /// Open the tab bar's project menu (the `+` tab, Switch Project…) with
+    /// the keyboard on its first row.
     fn open_switcher(&mut self, cx: &mut Context<Self>) {
-        let current = self.switcher_projects(cx).iter().position(|p| p.name == self.project);
-        self.switcher.open(current.unwrap_or(0), (self.clock)());
+        // A project open as of the catalog has its tab, not a menu row.
+        self.sync_tabs(cx);
+        self.switcher.open(0, (self.clock)());
         // Re-read the project list off the UI thread; repaint when it lands.
-        if let Some(catalog) = cx.try_global::<Catalog>().cloned() {
-            let (tx, rx) = futures::channel::oneshot::channel();
-            catalog.refresh(move || {
-                let _ = tx.send(());
-            });
-            cx.spawn(async move |this, cx| {
-                if rx.await.is_ok() {
-                    this.update(cx, |_, cx| cx.notify()).ok();
-                }
+        self.refresh_catalog(cx);
+    }
+
+    // --- project tabs --------------------------------------------------------
+
+    /// The open set the tabs follow: the catalog's, `None` before it has
+    /// been read, and always for a remote window (its host's listing doesn't
+    /// say which projects are open).
+    fn open_set(&self, cx: &App) -> Option<Vec<String>> {
+        if self.remote.is_some() {
+            return None;
+        }
+        cx.try_global::<Catalog>().and_then(|c| c.open_projects())
+    }
+
+    /// Bring the tabs in line with the open set ([`ProjectTabs::reconcile`]).
+    fn sync_tabs(&mut self, cx: &mut Context<Self>) {
+        let open = self.open_set(cx);
+        let current = (!self.chooser).then_some(self.project.as_str());
+        if self.tabs.reconcile(open.as_deref(), current) {
+            self.tabs_changed(cx);
+        }
+    }
+
+    /// The tabs changed: save their order with the window's state.
+    fn tabs_changed(&mut self, cx: &mut Context<Self>) {
+        self.window_state.tabs = self.tabs.order().to_vec();
+        if self.hovered_tab.as_ref().is_some_and(|h| !self.tabs.contains(h)) {
+            self.hovered_tab = None;
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Re-read the catalog off the UI thread, then bring the tabs in line
+    /// and repaint. Nothing in a test window.
+    fn refresh_catalog(&mut self, cx: &mut Context<Self>) {
+        if self.offline() {
+            return;
+        }
+        let Some(catalog) = cx.try_global::<Catalog>().cloned() else {
+            return;
+        };
+        let (tx, rx) = futures::channel::oneshot::channel();
+        catalog.refresh(move || {
+            let _ = tx.send(());
+        });
+        cx.spawn(async move |this, cx| {
+            if rx.await.is_ok() {
+                this.update(cx, |this, cx| {
+                    this.sync_tabs(cx);
+                    cx.notify();
+                    // The catalog is the app's: every other window follows it too.
+                    cx.defer(sync_every_windows_tabs);
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
+    /// `project`'s label: the shown project's from its model, another's from
+    /// the host's listing or the catalog, else its id.
+    fn project_label(&self, project: &str, cx: &App) -> String {
+        if self.shows(project) {
+            return self.model.project_label.clone();
+        }
+        self.remote
+            .as_ref()
+            .and_then(|r| r.label_of(project))
+            .or_else(|| cx.try_global::<Catalog>().and_then(|c| c.label_of(project)))
+            .unwrap_or_else(|| project.to_string())
+    }
+
+    /// The tabs as the bar draws them.
+    fn tab_props(&self, cx: &App) -> Vec<tab_bar::Tab> {
+        self.tabs
+            .order()
+            .iter()
+            .map(|name| tab_bar::Tab {
+                name: name.clone(),
+                label: self.project_label(name, cx).into(),
+                selected: self.shows(name),
             })
-            .detach();
+            .collect()
+    }
+
+    /// The `+` menu's projects: every project without a tab, in the
+    /// switcher's order, each with its dot.
+    fn menu_projects(&self, cx: &App) -> Vec<PaletteProject> {
+        self.switcher_rows(cx)
+            .into_iter()
+            .filter(|p| !self.tabs.contains(&p.slug))
+            .collect()
+    }
+
+    /// Select the `n`th tab (⌘N), as a click on it does.
+    fn select_tab(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(project) = self.tabs.nth(n).filter(|p| !self.shows(p)).map(str::to_string) {
+            self.run(CommandKind::SwitchProject { project }, window, cx);
+        }
+    }
+
+    /// The tab chords' badges show while ⌘ is held.
+    fn modifiers_changed(&mut self, modifiers: gpui::Modifiers, cx: &mut Context<Self>) {
+        let held = modifiers.platform && !modifiers.control && !modifiers.alt && !modifiers.shift;
+        if held != self.command_held {
+            self.command_held = held;
+            cx.notify();
         }
     }
 
@@ -4294,11 +4454,11 @@ impl ShelbiWindow {
         cx.try_global::<Catalog>().map(|c| c.rows(current)).unwrap_or_default()
     }
 
-    /// A key while the switcher is open: ↑↓ (and Tab) move its keyboard row,
+    /// A key while the project menu is open: ↑↓ (and Tab) move its keyboard row,
     /// Enter picks it, Esc closes. `false` for any other key (it goes on as
     /// usual).
     fn switcher_key(&mut self, code: Key, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let projects = self.switcher_projects(cx);
+        let projects = self.menu_projects(cx);
         // The projects, then "Add project…".
         let count = projects.len() + 1;
         match code {
@@ -4307,7 +4467,7 @@ impl ShelbiWindow {
             Key::Esc => self.switcher.close((self.clock)()),
             Key::Enter => {
                 let event = match projects.get(self.switcher.highlight) {
-                    Some(p) => SidebarEvent::SwitchTo(p.name.clone()),
+                    Some(p) => SidebarEvent::SwitchTo(p.slug.clone()),
                     None => SidebarEvent::AddProject,
                 };
                 self.sidebar_event(event, window, cx);
@@ -4418,18 +4578,37 @@ impl ShelbiWindow {
         .detach();
     }
 
+    /// Quit Project (the palette, the menus): close the shown project.
     fn confirm_quit_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let project = self.project.clone();
+        self.confirm_close_project(project, window, cx);
+    }
+
+    /// Close `project` (its tab's `×`, File ▸ Close Project…, Quit
+    /// Project), once the user confirms: its agents stop, its tab goes from
+    /// every window, and a window that showed it moves to its neighbor tab.
+    /// A remote window shows a tab before closing it: its link reaches the
+    /// shown project's far daemon only.
+    fn confirm_close_project(&mut self, project: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.remote.is_some() && !self.shows(&project) {
+            self.switch_to(&project, window, cx);
+        }
+        let shown = self.shows(&project);
+        let label = self.project_label(&project, cx);
         let answer = window.prompt(
             PromptLevel::Warning,
-            &format!("Quit {}?", self.model.project_label),
-            Some("This stops the project's agents. Other projects keep running."),
-            &["Quit Project", "Cancel"],
+            &format!("Close {label}?"),
+            Some("This stops the project's agents and closes its tab. Other projects keep running."),
+            &["Close Project", "Cancel"],
             cx,
         );
-        let project = self.project.clone();
-        let label = self.model.project_label.clone();
-        let quit_key = self.project_handle.key().clone();
-        let link = self.project_handle.link.clone();
+        let quit_key = ProjectKey {
+            origin: self.project_handle.key().origin.clone(),
+            name: project.clone(),
+        };
+        // The shown project's link (a remote window's reaches its far
+        // daemon); another local project quits through this machine's.
+        let link = shown.then(|| self.project_handle.link.clone());
         let control = self.ready().map(|r| r.control.clone());
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
@@ -4449,7 +4628,7 @@ impl ShelbiWindow {
                 .background_executor()
                 .spawn(async move {
                     // A remote window's project quits on the far daemon.
-                    if let Some(quit) = link.quit_far_project() {
+                    if let Some(quit) = link.as_ref().and_then(|l| l.quit_far_project()) {
                         return quit;
                     }
                     control
@@ -4461,11 +4640,16 @@ impl ShelbiWindow {
                 })
                 .await;
             this.update_in(cx, |this, window, cx| match quit {
-                // Every window that showed it moves on (this one included),
-                // staying open.
+                // Every window loses its tab, and one that showed it moves
+                // on (this one included), staying open.
                 Ok(()) => {
+                    if quit_key.is_local() {
+                        if let Some(catalog) = cx.try_global::<Catalog>() {
+                            catalog.note_open(&quit_key.name, false);
+                        }
+                    }
                     let me = window.window_handle().window_id();
-                    for other in windows_showing_key(&quit_key, Some(me), cx) {
+                    for other in shelbi_windows(cx) {
                         if other.window_id() != me {
                             let quit = quit_key.clone();
                             cx.defer(move |cx| {
@@ -4476,13 +4660,14 @@ impl ShelbiWindow {
                         }
                     }
                     this.after_quit_project(quit_key.clone(), window, cx);
+                    this.refresh_catalog(cx);
                 }
                 Err(e) => {
                     if this.shows_key(&quit_key) {
                         this.mark_deliberate_close(false, cx);
                     }
                     // Named: the window may show another project by now.
-                    this.banner = Some(format!("Couldn't quit {label}: {e}").into());
+                    this.banner = Some(format!("Couldn't close {label}: {e}").into());
                     cx.notify();
                 }
             })
@@ -5577,8 +5762,8 @@ impl ShelbiWindow {
             }
             return;
         }
-        // The sidebar's own chords, from anywhere in the window.
-        if let Some(nav) = nav_chord(&chord) {
+        // The window's own chords, from anywhere in it.
+        if let Some(nav) = window_chord(&self.keymaps, &chord) {
             self.nav_chord(nav, window, cx);
             cx.stop_propagation();
             cx.notify();
@@ -5650,10 +5835,8 @@ impl ShelbiWindow {
 
     // --- rendering ---------------------------------------------------------
 
-    /// The main area. `titlebar`: how far its titlebar row is open (the
-    /// sidebar hidden or going, no panel holding the column), with the
-    /// button that shows the sidebar.
-    fn render_main(&self, theme: &Theme, titlebar: MainTitlebar, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The main area, under the tab bar beside the column.
+    fn render_main(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         // The board's detail over the main area, or the one just closed
         // there sliding back out (unless the board itself shows now).
         let board_shown = matches!(self.route, Route::View) && matches!(self.client.view(), View::Issues);
@@ -5720,11 +5903,6 @@ impl ShelbiWindow {
             .overflow_hidden()
             .h_full()
             .bg(theme.canvas)
-            // The collapsed sidebar's titlebar row, room for the traffic
-            // lights (opening as the sidebar slides out).
-            .when(titlebar.open > 0.0, |main| {
-                main.child(div().flex_none().h(px(sidebar::TITLEBAR_H * titlebar.open)))
-            })
             .when_some(self.model.session_lost.clone(), |main, lost| {
                 main.child(notice(lost.into(), Hue::Red))
             })
@@ -5798,23 +5976,6 @@ impl ShelbiWindow {
                     .into_any_element()
             }))
             .child(body)
-            // Show the sidebar: beside the traffic lights and centered on
-            // them, put in the window rather than the row, so it stays put
-            // while the main area's edge slides past it, and fading in.
-            .when(titlebar.open > 0.0, |main| {
-                let size = IconButtonSize::Default.px();
-                main.child(
-                    div()
-                        .absolute()
-                        .top(px((sidebar::TITLEBAR_H - size) / 2.0))
-                        .left(px(sidebar::BESIDE_TRAFFIC_LIGHTS - titlebar.left))
-                        .opacity(titlebar.open)
-                        .child(
-                            style::icon_button("expand-sidebar", icons::SIDEBAR, IconButtonSize::Default, false, theme)
-                                .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-                        ),
-                )
-            })
             // The task detail over the Review or Workspace screen: the board
             // draws it, sized to the main area as it is over the board.
             .when_some(detail_over, |main, issues| main.relative().child(issues))
@@ -5829,15 +5990,6 @@ impl ShelbiWindow {
     fn toast_showing(&self) -> Option<shelbi_app::toast::Toast> {
         self.toast.current(std::time::Instant::now()).cloned()
     }
-}
-
-/// The main area's titlebar row while the sidebar is hidden (or going).
-#[derive(Debug, Clone, Copy)]
-struct MainTitlebar {
-    /// How much of the row is open, 0 to 1.
-    open: f32,
-    /// The main area's left edge in the window.
-    left: f32,
 }
 
 /// Whether `view` is the orchestrator chat.
@@ -5867,9 +6019,9 @@ fn row_key(target: &SidebarTarget) -> String {
 /// Whether the window takes `chord` away from a focused terminal: the focus
 /// moves (Ctrl+H / Ctrl+L by default), the Zen toggle (Option+Z), every
 /// palette chord (the configured one plus the reserved Ctrl+Space and Cmd+K),
-/// New Window (⌘⇧N), the terminal font zoom (⌘+ ⌘− ⌘0), and the sidebar's
-/// chords (⌘O ⌘I ⌘L, ⌘1 to ⌘9).
-/// Everything else is the session's.
+/// New Window (⌘⇧N), the terminal font zoom (⌘+ ⌘− ⌘0), and the window's
+/// chords (⌘O ⌘I ⌘L, ⌘1 to ⌘9 for the tabs, ⌃1 to ⌃9 for the sidebar's
+/// rows). Everything else is the session's.
 fn takes_from_terminal(keymaps: &Keymaps, chord: shelbi_state::keymap::KeyChord) -> bool {
     matches!(
         keymaps.global.dispatch(chord),
@@ -5877,7 +6029,16 @@ fn takes_from_terminal(keymaps: &Keymaps, chord: shelbi_state::keymap::KeyChord)
     ) || shelbi_app::overlay::opens_palette(keymaps, &chord)
         || is_new_window(&chord)
         || font_zoom(&chord).is_some()
-        || nav_chord(&chord).is_some()
+        || window_chord(keymaps, &chord).is_some()
+}
+
+/// [`nav_chord`], except that a row chord (⌃1 to ⌃9) a user's `keys.yaml`
+/// binds in the global or sidebar keys stays theirs.
+fn window_chord(keymaps: &Keymaps, chord: &shelbi_state::keymap::KeyChord) -> Option<NavChord> {
+    nav_chord(chord).filter(|nav| {
+        !matches!(nav, NavChord::Row(_))
+            || (keymaps.global.dispatch(*chord).is_none() && keymaps.sidebar.dispatch(*chord).is_none())
+    })
 }
 
 /// The palette-open chord as the search box shows it (`⌃P`).
@@ -5944,6 +6105,15 @@ impl SidebarHost for ShelbiWindow {
             SidebarEvent::CloseSwitcher => self.switcher.close((self.clock)()),
             SidebarEvent::SwitchTo(project) => {
                 self.run(CommandKind::SwitchProject { project }, window, cx)
+            }
+            SidebarEvent::CloseTab(project) => self.confirm_close_project(project, window, cx),
+            SidebarEvent::HoverTab(project, hovered) => {
+                if hovered {
+                    self.hovered_tab = Some(project);
+                } else if self.hovered_tab.as_deref() == Some(project.as_str()) {
+                    self.hovered_tab = None;
+                }
+                cx.notify();
             }
             SidebarEvent::AddProject => {
                 self.switcher.close((self.clock)());
@@ -6027,7 +6197,7 @@ impl ShelbiWindow {
         if self.switcher.animating(now, reduce_motion) {
             window.request_animation_frame();
         }
-        let catalog_projects = switcher_phase.map(|_| self.switcher_rows(cx));
+        let menu_projects = switcher_phase.map(|_| self.menu_projects(cx));
         // The sidebar's sections and machine groups folding open or closed.
         self.folds.settle(now);
         if self.folds.animating(now) {
@@ -6134,18 +6304,6 @@ impl ShelbiWindow {
                         now,
                         selection,
                         link: self.link,
-                        palette_chord: self.palette_chord.clone(),
-                        switcher: catalog_projects.as_deref().zip(switcher_phase).map(
-                            |(projects, phase)| sidebar::SwitcherProps {
-                                projects,
-                                highlight: self.switcher.highlight,
-                                phase,
-                                open: self.switcher.is_open(),
-                                scroll: self.switcher.scroll.clone(),
-                            },
-                        ),
-                        switcher_button: self.switcher.button.clone(),
-                        switcher_open: self.switcher.is_open(),
                         width,
                         scroll: self.sidebar_scroll.clone(),
                         track: self.nav_track.clone(),
@@ -6163,13 +6321,12 @@ impl ShelbiWindow {
                     cx,
                 ))
             });
-            // A task panel keeps the sidebar's titlebar and footer around it.
+            // A task panel keeps the sidebar's footer under it.
             let review = frame.review.zip(self.review.clone()).map(|(l, review)| {
                 layer("column-review", l).child(sidebar::render_panel_column(
                     review,
                     &self.model,
                     self.link,
-                    &self.palette_chord,
                     &theme,
                     cx,
                 ))
@@ -6179,7 +6336,6 @@ impl ShelbiWindow {
                     ws,
                     &self.model,
                     self.link,
-                    &self.palette_chord,
                     &theme,
                     cx,
                 ))
@@ -6190,22 +6346,7 @@ impl ShelbiWindow {
                     self.settings_nav,
                     settings_chip.flatten(),
                     &self.settings_track,
-                    settings_nav::ProjectSwitcher {
-                        label: self.model.project_label.clone().into(),
-                        menu: catalog_projects.as_deref().zip(switcher_phase).map(|(projects, phase)| {
-                            sidebar::SwitcherProps {
-                                projects,
-                                highlight: self.switcher.highlight,
-                                phase,
-                                open: self.switcher.is_open(),
-                                scroll: self.switcher.scroll.clone(),
-                            }
-                        }),
-                        button: self.switcher.button.clone(),
-                        open: self.switcher.is_open(),
-                        width,
-                    },
-                    &self.palette_chord,
+                    self.model.project_label.clone().into(),
                     &theme,
                     cx,
                 ))
@@ -6241,14 +6382,8 @@ impl ShelbiWindow {
         // starts at x 281); every other frame puts the main area right
         // after the column at x 280, the fill change the only edge.
         let rule = self.column.target() == Occupant::Review;
-        // The collapsed main area's titlebar row opens as the sidebar leaves,
-        // its Show button fixed beside the traffic lights.
         // Where the main area starts: a machine dialog centers over it.
         let main_left = placement.map_or(0.0, |p| p.visible + if rule { 1.0 } else { 0.0 });
-        let titlebar = MainTitlebar {
-            open: placement.map_or(1.0, |p| p.titlebar),
-            left: placement.map_or(0.0, |p| p.visible + if rule { 1.0 } else { 0.0 }),
-        };
         let handle = column_shown.then(|| {
             // The column's right edge: the rule (in the layout, when shown)
             // or nothing, with the grab room laid over the column's edge.
@@ -6289,13 +6424,37 @@ impl ShelbiWindow {
             )
         });
 
-        // The workflow editor takes the whole window: no column, and its own
-        // titlebar row in place of the main area's.
-        let (column, handle, titlebar) = if self.editing_workflow(cx) {
-            (None, None, MainTitlebar { open: 0.0, left: 0.0 })
-        } else {
-            (column, handle, titlebar)
-        };
+        // The workflow editor takes the whole window: no column and no tab
+        // bar, its own titlebar row beside the traffic lights.
+        let editing_workflow = self.editing_workflow(cx);
+        let (column, handle) = if editing_workflow { (None, None) } else { (column, handle) };
+        // The tab bar, over the column and the main area alike, put whether
+        // the sidebar shows or not. The chooser (no project) has none.
+        let tab_bar = (!editing_workflow && !self.chooser).then(|| {
+            let tabs = self.tab_props(cx);
+            tab_bar::render(
+                TabBarProps {
+                    tabs: &tabs,
+                    hovered: self.hovered_tab.as_deref(),
+                    command_held: self.command_held,
+                    menu: menu_projects.as_deref().zip(switcher_phase).map(|(projects, phase)| {
+                        tab_bar::ProjectMenuProps {
+                            projects,
+                            highlight: self.switcher.highlight,
+                            phase,
+                            open: self.switcher.is_open(),
+                            scroll: self.switcher.scroll.clone(),
+                        }
+                    }),
+                    plus: &self.switcher.button,
+                    menu_open: self.switcher.is_open(),
+                    palette_chord: &self.palette_chord,
+                    sidebar_shown: !self.collapsed,
+                },
+                &theme,
+                cx,
+            )
+        });
 
         let shell = div()
             .id("shelbi-window")
@@ -6306,6 +6465,9 @@ impl ShelbiWindow {
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(None, window, cx)))
             .on_action(cx.listener(|this, _: &CloseWindow, window, cx| this.close_window(window, cx)))
+            .on_modifiers_changed(cx.listener(|this, e: &gpui::ModifiersChangedEvent, _, cx| {
+                this.modifiers_changed(e.modifiers, cx)
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                 if this.dragging {
                     let window_width = window.viewport_size().width.as_f32();
@@ -6336,7 +6498,7 @@ impl ShelbiWindow {
             let chooser = self.render_chooser(&theme, cx);
             shell.child(chooser)
         } else {
-            let main = self.render_main(&theme, titlebar, cx);
+            let main = self.render_main(&theme, cx);
             shell.children(column).children(handle).child(main)
         };
 
@@ -6442,7 +6604,15 @@ impl ShelbiWindow {
                     },
                 ))
             })
-            .child(shell.flex_1().min_h_0())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .children(tab_bar)
+                    .child(shell.flex_1().min_h_0()),
+            )
             .children(machine_form)
             .children(pool_dialog)
             .children(feedback)
@@ -6546,20 +6716,20 @@ impl ShelbiWindow {
         self.close_overlay(window, cx);
     }
 
-    /// Open the project switcher over the catalog as installed (no refresh
-    /// from disk), or close it.
+    /// Open the tab bar's project menu (the `+` tab's) over the catalog as
+    /// installed (no refresh from disk), or close it.
     pub(crate) fn offscreen_switcher(&mut self, open: bool, cx: &mut Context<Self>) {
         let now = (self.clock)();
         if open {
-            let current = self.switcher_projects(cx).iter().position(|p| p.name == self.project);
-            self.switcher.open(current.unwrap_or(0), now);
+            self.sync_tabs(cx);
+            self.switcher.open(0, now);
         } else {
             self.switcher.close(now);
         }
         cx.notify();
     }
 
-    /// A key to the open switcher.
+    /// A key to the open project menu.
     pub(crate) fn offscreen_switcher_key(&mut self, code: Key, window: &mut Window, cx: &mut Context<Self>) {
         self.switcher_key(code, window, cx);
         cx.notify();
@@ -6780,6 +6950,10 @@ mod nav_focus_tests;
 #[cfg(test)]
 #[path = "app_toast_tests.rs"]
 mod toast_tests;
+
+#[cfg(test)]
+#[path = "app_tabs_tests.rs"]
+mod tabs_tests;
 
 #[cfg(test)]
 mod tests {

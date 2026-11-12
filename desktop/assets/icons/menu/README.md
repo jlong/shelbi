@@ -13,6 +13,10 @@ them (`icon_green` for the filled dot, `gray` for the rest).
 - `plus.svg`: "Add project" (the Heroicons plus, drawn on the 16pt grid
   with a 1.25pt stroke).
 
+- `x-mark.svg`: a project tab's close button, in its dot's place while
+  the tab is hovered (the Heroicons x-mark on the 16pt grid with a 1.25pt
+  stroke).
+
 The terminal's "Jump to bottom" pill draws its arrow on the same grid, so
 it sits at 16pt beside the pill's X-Small label:
 

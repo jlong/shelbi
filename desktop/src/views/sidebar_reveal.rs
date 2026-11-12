@@ -168,9 +168,6 @@ pub struct Placement {
     /// The content's offset in the column (0 or negative): sliding out to
     /// the left, its right edge stays on the column's.
     pub offset: f32,
-    /// How much of the collapsed main area's titlebar row (room for the
-    /// traffic lights and the show button) is open, 0 to 1.
-    pub titlebar: f32,
 }
 
 /// Place the column for a sidebar at `position` (0 hidden, 1 shown) headed
@@ -191,14 +188,12 @@ pub fn place(shown_px: f32, hidden_px: Option<f32>, position: f32, shown: bool) 
                 visible,
                 content: shown_px,
                 offset: visible - shown_px,
-                titlebar: 1.0 - p,
             })
         }
         Some(hidden_px) => Some(Placement {
             visible: hidden_px + (shown_px - hidden_px) * p,
             content: if shown { shown_px } else { hidden_px },
             offset: 0.0,
-            titlebar: 0.0,
         }),
     }
 }
@@ -352,7 +347,7 @@ mod tests {
     fn the_sidebar_slides_out_at_its_full_width() {
         // Shown: the column at the sidebar's width, the content in place.
         let p = place(280.0, None, 1.0, true).unwrap();
-        assert_eq!(p, Placement { visible: 280.0, content: 280.0, offset: 0.0, titlebar: 0.0 });
+        assert_eq!(p, Placement { visible: 280.0, content: 280.0, offset: 0.0 });
 
         // Part way: the column narrower, the content still 280 wide, slid
         // left so its right edge stays on the column's.
@@ -360,7 +355,6 @@ mod tests {
         assert!(close(p.visible, 70.0));
         assert_eq!(p.content, 280.0, "never laid out narrower");
         assert!(close(p.offset + p.content, p.visible));
-        assert!(close(p.titlebar, 0.75));
 
         // Hidden: no column at all.
         assert_eq!(place(280.0, None, 0.0, false), None);
@@ -371,7 +365,7 @@ mod tests {
         // The sidebar shown at 400, a panel in the column at 280 collapsed.
         let p = place(400.0, Some(280.0), 0.5, false).unwrap();
         assert!(close(p.visible, 340.0));
-        assert_eq!((p.content, p.offset, p.titlebar), (280.0, 0.0, 0.0));
+        assert_eq!((p.content, p.offset), (280.0, 0.0));
         let p = place(400.0, Some(280.0), 0.0, false).unwrap();
         assert_eq!(p.visible, 280.0, "collapsed: the panel's width");
         let p = place(400.0, Some(280.0), 0.5, true).unwrap();

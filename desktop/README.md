@@ -13,8 +13,10 @@ natively, and no not-implemented path is left. On launch the app finds the
 checks versions (with no daemon running it opens the launch window first:
 the projects on this Mac, the recent remote sessions, Add project and
 Connect to remote); a window shows one
-project at a time and switches projects in place (File ▸ New Window, ⌘⇧N,
-opens another), with the sidebar, the Orchestrator chat, the Issues board and task
+project at a time, with a tab across its top for each open project (⌘1 to
+⌘9 pick them, the `+` tab opens another, a tab's `×` closes its project),
+and switches projects in place (File ▸ New Window, ⌘⇧N, opens another),
+with the sidebar (its rows on ⌃1 to ⌃9), the Orchestrator chat, the Issues board and task
 detail, Activity, Machines, the Workspace view (an agent with a user shell
 beside it, local or remote), and the Review view; the command palette and the
 overlays (error log, load for review, reject, Zen intro); the Add Project

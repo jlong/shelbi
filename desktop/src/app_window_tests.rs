@@ -361,7 +361,12 @@ fn quitting_the_shown_project_keeps_the_window(cx: &mut TestAppContext) {
     // Another project is open: the window moves to it.
     update(cx, h, |w, window, cx| w.leave_quit_project(Some("beta".into()), window, cx));
     assert_eq!(windows(cx), [("beta".to_string(), 0)]);
-    // None left (a test window finds none): the chooser, window still open.
+    // alpha quit too, elsewhere: its tab goes, the window stays on beta.
+    update(cx, h, |w, window, cx| w.after_quit_project(ProjectKey::local("alpha"), window, cx));
+    assert_eq!(windows(cx), [("beta".to_string(), 0)]);
+    assert_eq!(read(cx, h, |w, _| w.tabs.order().to_vec()), ["beta"]);
+    // None left (no tab, and a test window finds none open): the chooser,
+    // window still open.
     update(cx, h, |w, window, cx| w.after_quit_project(ProjectKey::local("beta"), window, cx));
     assert!(read(cx, h, |w, _| w.chooser));
     assert_eq!(cx.update(|cx| cx.windows().len()), 1, "the window stays");
@@ -414,13 +419,55 @@ fn a_quit_finishing_after_a_switch_leaves_the_window_on_the_chosen_project(cx: &
     // Another machine's project of the same name isn't this one.
     update(cx, h, |w, window, cx| w.after_quit_project(ProjectKey::remote("devbox", "beta"), window, cx));
     assert!(!read(cx, h, |w, _| w.chooser));
-    // Back on the quit project by the time it finishes: it still has to go.
+    // Back on the quit project by the time it finishes: it still has to go,
+    // to the tab opened meanwhile.
     update(cx, h, |w, window, cx| {
         w.after_quit_project(ProjectKey::local("beta"), window, cx);
         w.switch_to("alpha", window, cx);
         w.switch_to("beta", window, cx);
     });
-    assert!(read(cx, h, |w, _| w.chooser), "beta is gone: the chooser");
+    assert_eq!(windows(cx), [("alpha".to_string(), 0)], "beta is gone: its neighbor");
+    assert_eq!(read(cx, h, |w, _| w.tabs.order().to_vec()), ["alpha"]);
+    // That one quit too, with nothing left: the chooser.
+    update(cx, h, |w, window, cx| w.after_quit_project(ProjectKey::local("alpha"), window, cx));
+    assert!(read(cx, h, |w, _| w.chooser));
+}
+
+#[gpui::test]
+fn closing_the_shown_tab_selects_its_right_neighbor_else_its_left(cx: &mut TestAppContext) {
+    let f = fixture(cx);
+    let h = open(cx, &f, "alpha", 0);
+    update(cx, h, |w, window, cx| {
+        w.switch_to("beta", window, cx);
+        w.switch_to("gamma", window, cx);
+        w.switch_to("beta", window, cx);
+    });
+    let tabs = |cx: &mut TestAppContext| read(cx, h, |w, _| w.tabs.order().to_vec());
+    assert_eq!(tabs(cx), ["alpha", "beta", "gamma"], "in the order they were opened");
+    // The middle tab: its right neighbor.
+    update(cx, h, |w, window, cx| w.after_quit_project(ProjectKey::local("beta"), window, cx));
+    assert_eq!(windows(cx), [("gamma".to_string(), 0)]);
+    assert_eq!(tabs(cx), ["alpha", "gamma"]);
+    // The last tab: its left one.
+    update(cx, h, |w, window, cx| w.after_quit_project(ProjectKey::local("gamma"), window, cx));
+    assert_eq!(windows(cx), [("alpha".to_string(), 0)]);
+    assert_eq!(tabs(cx), ["alpha"]);
+    // A tab the window doesn't show goes without moving it; another
+    // machine's project of that name has none here.
+    update(cx, h, |w, window, cx| {
+        w.switch_to("beta", window, cx);
+        w.after_quit_project(ProjectKey::remote("devbox", "alpha"), window, cx);
+    });
+    assert_eq!(tabs(cx), ["alpha", "beta"]);
+    update(cx, h, |w, window, cx| w.after_quit_project(ProjectKey::local("alpha"), window, cx));
+    assert_eq!(windows(cx), [("beta".to_string(), 0)]);
+    assert_eq!(tabs(cx), ["beta"]);
+    // Saved with the window's state (its slot's, on the debounced save).
+    assert_eq!(read(cx, h, |w, _| w.window_state.tabs.clone()), ["beta"]);
+    cx.executor().advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    let saved = cx.update(|cx| cx.global::<Shell>().session.slots[0].state.tabs.clone());
+    assert_eq!(saved, ["beta"]);
 }
 
 #[gpui::test]

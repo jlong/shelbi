@@ -55,9 +55,12 @@ pub fn font_zoom(chord: &KeyChord) -> Option<FontZoom> {
 pub enum NavChord {
     /// ⌘O, ⌘I, ⌘L: the Orchestrator, Issues and Changelog views.
     View(View),
-    /// ⌘1 to ⌘9: the sidebar row the hint numbers (reviews, then working
-    /// workspaces).
+    /// ⌃1 to ⌃9: the sidebar row the hint numbers (reviews, then working
+    /// workspaces), or a task panel's view while one holds the column.
     Row(u8),
+    /// ⌘1 to ⌘9: the project tab (`project-tabs`), or the Settings page with
+    /// that number while Settings is open.
+    Tab(u8),
 }
 
 /// The nav views' chords, as `keys.yaml` chord strings.
@@ -124,18 +127,33 @@ pub fn nav_view_hotkey(view: &View) -> Option<String> {
     nav_view_chord(view).map(|c| chord_text(&c, DisplayStyle::Mac))
 }
 
-/// A numbered row's hint (`⌘3`).
+/// A numbered sidebar row's hint (`⌃3`), a task panel view's too.
 pub fn row_hotkey(n: u8) -> String {
+    format!("⌃{n}")
+}
+
+/// A project tab's hint (`⌘3`), shown while ⌘ is held; a Settings page's
+/// too (the page numbers take ⌘N while Settings is open).
+pub fn tab_hotkey(n: u8) -> String {
     format!("⌘{n}")
 }
 
-/// Whether `chord` is one of the sidebar's own chords, and what it opens.
+/// Whether `chord` is one of the window's own chords, and what it opens.
+/// ⌃1 to ⌃9 are the sidebar's rows, ⌘1 to ⌘9 the tabs, ⌘O ⌘I ⌘L the nav
+/// views.
 pub fn nav_chord(chord: &KeyChord) -> Option<NavChord> {
+    let digit = match chord.code {
+        Key::Char(c @ '1'..='9') if chord.leader.is_none() => Some(c as u8 - b'0'),
+        _ => None,
+    };
+    if chord.mods == Mods::CONTROL {
+        return digit.map(NavChord::Row);
+    }
     if chord.mods != Mods::SUPER {
         return None;
     }
-    if let Key::Char(c @ '1'..='9') = chord.code {
-        return Some(NavChord::Row(c as u8 - b'0'));
+    if let Some(n) = digit {
+        return Some(NavChord::Tab(n));
     }
     let canonical = chord.canonical();
     NAV_VIEW_CHORDS.iter().find_map(|(view, spec)| {
@@ -364,9 +382,14 @@ mod tests {
         assert_eq!(nav_chord(&chord("cmd-o", "o")), Some(NavChord::View(View::Session("orch".into()))));
         assert_eq!(nav_chord(&chord("cmd-i", "i")), Some(NavChord::View(View::Issues)));
         assert_eq!(nav_chord(&chord("cmd-l", "l")), Some(NavChord::View(View::Changelog)));
-        assert_eq!(nav_chord(&chord("cmd-1", "1")), Some(NavChord::Row(1)));
-        assert_eq!(nav_chord(&chord("cmd-9", "9")), Some(NavChord::Row(9)));
+        assert_eq!(nav_chord(&chord("cmd-1", "1")), Some(NavChord::Tab(1)));
+        assert_eq!(nav_chord(&chord("cmd-9", "9")), Some(NavChord::Tab(9)));
         assert_eq!(nav_chord(&chord("cmd-0", "0")), None);
+        assert_eq!(nav_chord(&chord("ctrl-1", "1")), Some(NavChord::Row(1)));
+        assert_eq!(nav_chord(&chord("ctrl-9", "9")), Some(NavChord::Row(9)));
+        assert_eq!(nav_chord(&chord("ctrl-0", "0")), None);
+        assert_eq!(nav_chord(&chord("ctrl-cmd-1", "1")), None);
+        assert_eq!(nav_chord(&chord("alt-cmd-1", "1")), None, "the doc editor's heading chord");
         assert_eq!(nav_chord(&chord("cmd-shift-o", "O")), None);
         assert_eq!(nav_chord(&chord("ctrl-o", "o")), None);
         assert_eq!(nav_chord(&chord("o", "o")), None);
@@ -375,7 +398,8 @@ mod tests {
         assert_eq!(nav_view_hotkey(&View::Changelog).as_deref(), Some("⌘L"));
         assert_eq!(nav_view_hotkey(&View::Activity), None, "Activity is palette-only");
         assert_eq!(nav_view_hotkey(&View::Machines), None);
-        assert_eq!(row_hotkey(4), "⌘4");
+        assert_eq!(row_hotkey(4), "⌃4");
+        assert_eq!(tab_hotkey(4), "⌘4");
     }
 
     #[test]

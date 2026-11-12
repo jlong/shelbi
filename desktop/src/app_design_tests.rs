@@ -1,18 +1,17 @@
-//! The design pass's window behavior (`dt-design-pass-taskpage`): the
-//! project switcher's menu floats over the sidebar (nothing below it moves),
-//! takes the keyboard and closes on Esc or a click outside; the nav
+//! The design pass's window behavior (`dt-design-pass-taskpage`): the nav
 //! selection's chip slides between rows and lands, instantly under Reduce
-//! Motion.
+//! Motion. (The project switcher it also covered gave way to the tab bar's
+//! `+` menu: `app_tabs_tests`.)
 //!
 //! The window is the smoke test's headless one ([`Harness`]) with an injected
 //! clock and Reduce Motion setting, and a project catalog installed in
-//! memory (the switcher never reads the disk here).
+//! memory.
 
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gpui::{Modifiers, TestAppContext};
+use gpui::TestAppContext;
 
 use super::smoke::Harness;
 use super::*;
@@ -58,124 +57,9 @@ impl Design {
         r
     }
 
-    /// Open the switcher as its button does (without the catalog's disk
-    /// refresh).
-    fn open_switcher(&mut self) {
-        self.update(|w, _, cx| {
-            let now = (w.clock)();
-            w.switcher.open(0, now);
-            cx.notify();
-        });
-        self.advance(Duration::from_millis(400));
-    }
-
-    fn switcher_open(&self) -> bool {
-        self.h.window.read_with(&self.h.cx, |w, _| w.switcher.is_open())
-    }
-
     fn bounds(&mut self, selector: &'static str) -> Option<gpui::Bounds<gpui::Pixels>> {
         self.h.cx.debug_bounds(selector)
     }
-}
-
-#[gpui::test]
-fn the_switcher_menu_floats_over_the_sidebar(cx: &mut TestAppContext) {
-    let mut d = Design::open(cx);
-    let search = d.bounds("sidebar-search").unwrap();
-    let issues = d.bounds("sidebar-nav-Issues").unwrap();
-    let button = d.bounds("sidebar-project-title").unwrap();
-    assert_eq!(button.size.height, px(28.0), "the component's 28pt trigger");
-
-    d.open_switcher();
-    let menu = d.bounds("sidebar-switcher").expect("the menu shows");
-    assert_eq!(d.bounds("sidebar-search").unwrap(), search, "the search button doesn't move");
-    assert_eq!(d.bounds("sidebar-nav-Issues").unwrap(), issues, "the nav doesn't move");
-    assert_eq!(menu.top(), button.bottom() + px(4.0), "the component's 4pt under the button");
-    assert!(menu.size.width >= button.size.width, "at least the trigger's width");
-    let sidebar = d.bounds("sidebar").unwrap();
-    assert_eq!(menu.left(), sidebar.left() + px(12.0), "12pt in from the sidebar's left");
-    assert_eq!(menu.right(), sidebar.right() - px(12.0), "12pt in from the sidebar's right");
-    for name in ["sidebar-project-alpha", "sidebar-project-beta", "sidebar-project-gamma", "sidebar-add-project"] {
-        let row = d.bounds(name).unwrap_or_else(|| panic!("{name} is listed"));
-        assert_eq!(row.size.height, px(26.0), "{name}: the component's 26pt row");
-    }
-}
-
-#[gpui::test]
-fn a_long_project_name_keeps_the_switcher_menu_inset(cx: &mut TestAppContext) {
-    let mut d = Design::open(cx);
-    let long = "a-project-whose-name-runs-far-past-the-sidebar-edge";
-    let entry = |name: &str| ProjectEntry {
-        name: name.into(),
-        label: name.into(),
-    };
-    d.h.cx.update(|_, cx| cx.set_global(Catalog::with(vec![entry("alpha"), entry(long)], Vec::new())));
-    d.open_switcher();
-    let sidebar = d.bounds("sidebar").unwrap();
-    let menu = d.bounds("sidebar-switcher").expect("the menu shows");
-    assert_eq!(menu.left(), sidebar.left() + px(12.0));
-    assert_eq!(menu.right(), sidebar.right() - px(12.0), "the name truncates instead");
-    let row = d.bounds("sidebar-project-a-project-whose-name-runs-far-past-the-sidebar-edge").expect("listed");
-    assert!(row.right() <= menu.right(), "the row stays inside the menu");
-}
-
-#[gpui::test]
-fn the_switcher_slides_in_and_out(cx: &mut TestAppContext) {
-    let mut d = Design::open(cx);
-    d.update(|w, _, cx| {
-        let now = (w.clock)();
-        w.switcher.open(0, now);
-        cx.notify();
-    });
-    let button = d.bounds("sidebar-project-title").unwrap();
-    let opening = d.bounds("sidebar-switcher").expect("drawn from its first frame");
-    assert!(opening.top() > button.bottom() + px(4.0), "starts lower, sliding up");
-    d.advance(Duration::from_millis(400));
-    assert_eq!(d.bounds("sidebar-switcher").unwrap().top(), button.bottom() + px(4.0));
-
-    d.update(|w, _, cx| {
-        let now = (w.clock)();
-        w.switcher.close(now);
-        cx.notify();
-    });
-    assert!(d.bounds("sidebar-switcher").is_some(), "still fading out");
-    d.advance(Duration::from_millis(400));
-    assert!(d.bounds("sidebar-switcher").is_none(), "gone once faded");
-}
-
-#[gpui::test]
-fn the_switcher_takes_the_keyboard(cx: &mut TestAppContext) {
-    let mut d = Design::open(cx);
-    d.h.focus_window();
-    d.open_switcher();
-    d.h.key("down");
-    d.h.key("down");
-    assert_eq!(d.h.window.read_with(&d.h.cx, |w, _| w.switcher.highlight), 2);
-    d.h.key("enter");
-    let calls = d.h.take_calls();
-    assert!(
-        calls.contains(&HostCall::SwitchProject("gamma".into())),
-        "Enter switches to the keyboard's project: {calls:?}"
-    );
-
-    d.open_switcher();
-    // Up from the top wraps to "Add project…".
-    d.h.key("up");
-    assert_eq!(d.h.window.read_with(&d.h.cx, |w, _| w.switcher.highlight), 3);
-    d.h.key("escape");
-    assert!(!d.switcher_open(), "Esc closes");
-}
-
-#[gpui::test]
-fn a_click_outside_closes_the_switcher(cx: &mut TestAppContext) {
-    let mut d = Design::open(cx);
-    d.open_switcher();
-    // The main area, clear of the menu (which floats over the nav).
-    let sidebar = d.bounds("sidebar").unwrap();
-    let elsewhere = gpui::point(sidebar.right() + px(80.0), sidebar.center().y);
-    d.h.cx.simulate_click(elsewhere, Modifiers::none());
-    d.h.cx.run_until_parked();
-    assert!(!d.switcher_open());
 }
 
 #[gpui::test]
