@@ -6952,6 +6952,14 @@ impl ShelbiWindow {
         cx.notify();
     }
 
+    /// Bring the tabs in line with the catalog as installed (no refresh
+    /// from disk): a tab per open project. The `state-tabbar-working`
+    /// visual state uses it.
+    pub(crate) fn offscreen_sync_tabs(&mut self, cx: &mut Context<Self>) {
+        self.sync_tabs(cx);
+        cx.notify();
+    }
+
     /// A key to the open project menu.
     pub(crate) fn offscreen_switcher_key(&mut self, code: Key, window: &mut Window, cx: &mut Context<Self>) {
         self.switcher_key(code, window, cx);

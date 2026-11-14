@@ -36,8 +36,7 @@ pub enum Surface {
     /// The status catalog, the workflow files and the project YAML's
     /// `default_workflow:` (Settings ▸ Workflows and the workflow editor),
     /// its `orchestrator.awareness:` (Settings ▸ Orchestrator) and its own
-    /// settings (Settings ▸ Properties, whose editor an in-repo project keeps
-    /// in `local.yaml`).
+    /// settings (Settings ▸ Properties).
     Workflows,
     /// The agent directories and the shared preamble (Settings ▸ Agents and
     /// the agent editor).
@@ -379,10 +378,7 @@ fn roots(project: &str, surface: Surface) -> Result<(Vec<PathBuf>, Vec<PathBuf>)
         Surface::Workflows => {
             let dir = crate::workflows_dir(project).map_err(|e| e.to_string())?;
             let project_file = crate::workflow_config::project_config_file(project).map_err(|e| e.to_string())?;
-            let mut files = vec![project_file];
-            // An in-repo project's `local.yaml` (Settings ▸ Properties' editor).
-            files.extend(crate::workflow_config::project_local_file(project).map_err(|e| e.to_string())?);
-            Ok((vec![dir], files))
+            Ok((vec![dir], vec![project_file]))
         }
         Surface::Agents => Ok((vec![crate::agents_dir(project).map_err(|e| e.to_string())?], Vec::new())),
     }

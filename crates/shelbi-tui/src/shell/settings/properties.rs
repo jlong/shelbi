@@ -15,16 +15,13 @@
 //!  ▐ main                                ▌
 //!  Default workflow
 //!  ▐ app                               ▾ ▌
-//!  Editor
-//!  ▐ Default ($EDITOR or vim)          ▾ ▌
 //!  Issue tracker  GitHub · jlong/shelbi
 //!  ▸ Advanced
 //! ```
 //!
 //! ↑/↓ move between the rows. Enter on a text field starts typing in it;
-//! Enter saves what was typed and Esc puts the field back. The pickers
-//! change with ←/→ (Enter steps the Default workflow too) and save at once;
-//! Enter on Editor types a command line, a blank one being the default.
+//! Enter saves what was typed and Esc puts the field back. The Default
+//! workflow changes with ←/→ (Enter steps it too) and saves at once.
 //! Enter (or ←/→) on Advanced opens or closes the intervals. A value the
 //! form refuses keeps its text, shows its error in red under the field and
 //! isn't written.
@@ -32,13 +29,12 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use shelbi_app::settings::general::{LineInput, PickerEntry};
+use shelbi_app::settings::general::LineInput;
 use shelbi_app::settings::properties::{
     PropertiesForm, Text, ADVANCED_LABEL, DEFAULT_WORKFLOW_HELP, DEFAULT_WORKFLOW_LABEL, ISSUE_TRACKER_LABEL,
     ISSUE_TRACKER_NOTE, SECONDS, TEXTS, TITLE,
 };
 use shelbi_app::settings::{Job, Ticket};
-use shelbi_state::tools::DetectedTools;
 use shelbi_state::workflow_config::WorkflowConfig;
 
 use super::workflows::Nav;
@@ -51,7 +47,6 @@ use crate::theme::palette;
 pub(crate) enum Item {
     Text(Text),
     Workflow,
-    Editor,
     Advanced,
 }
 
@@ -65,7 +60,6 @@ pub(crate) struct PropertiesPage {
     cursor: usize,
     /// The field being typed, and what's typed.
     editing: Option<(Text, LineInput)>,
-    detected: DetectedTools,
 }
 
 impl PropertiesPage {
@@ -78,11 +72,6 @@ impl PropertiesPage {
         self.cursor
     }
 
-    /// This machine's editors, for the Editor picker's choices.
-    pub(crate) fn set_detected(&mut self, detected: DetectedTools) {
-        self.detected = detected;
-    }
-
     /// The rows the keys stop on, top to bottom.
     pub(crate) fn items(&self) -> Vec<Item> {
         let mut items = vec![
@@ -90,7 +79,6 @@ impl PropertiesPage {
             Item::Text(Text::Repository),
             Item::Text(Text::DefaultBranch),
             Item::Workflow,
-            Item::Editor,
             Item::Advanced,
         ];
         if self.form.advanced_open() {
@@ -171,7 +159,7 @@ impl PropertiesPage {
 
     /// Start typing in `t`.
     fn begin_typing(&mut self, t: Text) {
-        if !self.form.editable() || (t == Text::Editor && !self.form.editor_editable()) {
+        if !self.form.editable() {
             return;
         }
         self.editing = Some((t, LineInput::new(self.form.text(t))));
@@ -266,7 +254,6 @@ impl PropertiesPage {
         };
         let next = match self.items().get(self.cursor).copied() {
             Some(Item::Workflow) => self.form.step_workflow(step),
-            Some(Item::Editor) => self.step_editor(step),
             Some(Item::Advanced) => {
                 self.form.toggle_advanced();
                 None
@@ -282,7 +269,6 @@ impl PropertiesPage {
         self.cursor = i;
         match item {
             Item::Text(t) => self.begin_typing(t),
-            Item::Editor => self.begin_typing(Text::Editor),
             Item::Workflow => {
                 let next = self.form.step_workflow(1);
                 return self.begin_save(next);
@@ -294,32 +280,6 @@ impl PropertiesPage {
             }
         }
         None
-    }
-
-    /// The Editor's choices: the default, this machine's command-line
-    /// editors, and the current command when it's none of those.
-    fn editor_choices(&self) -> Vec<String> {
-        let picker = self.form.editor_picker(&self.detected);
-        picker
-            .entries()
-            .into_iter()
-            .filter_map(|e| match e {
-                PickerEntry::Default => Some(String::new()),
-                PickerEntry::Tool(t) => t.choice.command().map(str::to_string),
-                PickerEntry::Browse | PickerEntry::OtherCommand => None,
-            })
-            .collect()
-    }
-
-    /// The Editor `steps` choices from the current one, wrapping.
-    fn step_editor(&mut self, steps: isize) -> Option<WorkflowConfig> {
-        let choices = self.editor_choices();
-        if choices.len() < 2 {
-            return None;
-        }
-        let at = choices.iter().position(|c| c == self.form.text(Text::Editor)).unwrap_or(0) as isize;
-        let next = choices[(at + steps).rem_euclid(choices.len() as isize) as usize].clone();
-        self.form.choose_editor(&next)
     }
 
     // --- drawing ---------------------------------------------------------------
@@ -366,17 +326,6 @@ impl PropertiesPage {
                 Item::Workflow => {
                     picker_rows(&mut rows, DEFAULT_WORKFLOW_LABEL, self.form.default_workflow(), on, false, Some(i), width);
                     wrapped(&mut rows, DEFAULT_WORKFLOW_HELP, width, muted);
-                }
-                Item::Editor => {
-                    let typing = matches!(&self.editing, Some((Text::Editor, _)));
-                    if typing {
-                        self.text_rows(&mut rows, Text::Editor, on, i, width);
-                    } else {
-                        let current = self.form.editor_picker(&self.detected).current_label();
-                        picker_rows(&mut rows, Text::Editor.label(), &current, on, !self.form.editor_editable(), Some(i), width);
-                        wrapped(&mut rows, &self.form.help(Text::Editor), width, muted);
-                        wrapped(&mut rows, "←/→ picks one; Enter types a command line.", width, muted);
-                    }
                     if let Some(summary) = self.form.issue_tracker() {
                         rows.push(Row::blank());
                         rows.push(Row::text(Line::from(vec![

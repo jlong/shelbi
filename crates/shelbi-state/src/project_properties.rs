@@ -1,6 +1,6 @@
 //! The project YAML's own settings, as Settings ▸ Properties edits them: the
-//! human label (`name:`), the repository (`github_url:`), the default branch,
-//! the editor override (`editor:`) and the two poll intervals.
+//! human label (`name:`), the repository (`github_url:`), the default branch
+//! and the two poll intervals.
 //!
 //! The values travel inside [`WorkflowConfig`](crate::workflow_config::WorkflowConfig),
 //! which already reads and writes the project YAML (`default_workflow:`,
@@ -10,19 +10,21 @@
 //! ([`check`]), and patching only the keys that changed into the trees
 //! ([`apply`]) for [`yaml_edit::patch`](crate::yaml_edit::patch) to write.
 //!
-//! Where a key lives follows the project's layout ([`shelbi_core::ConfigMode`]):
-//! a global project keeps them all in `projects/<id>.yaml`; an in-repo one
-//! keeps the shared keys in `<repo>/.shelbi/project.yaml` and the user-local
-//! `editor:` in `projects/<id>/local.yaml`
-//! ([`shelbi_core::LOCAL_PROJECT_FIELDS`]).
+//! Every one of them is a shared key ([`shelbi_core::SHARED_PROJECT_FIELDS`]),
+//! so it lives in the project YAML: `projects/<id>.yaml` for a global
+//! project, `<repo>/.shelbi/project.yaml` for an in-repo one. The page leaves
+//! the user-local keys ([`shelbi_core::LOCAL_PROJECT_FIELDS`]) alone, the
+//! project's `editor:` among them: nothing in Shelbi reads that key (an
+//! editor opens with Settings ▸ General's), so the page doesn't offer it,
+//! and a save keeps whatever the file has.
 //!
 //! ## Decisions
 //!
 //! - The label is `name:`. A project still on the deprecated `display_name:`
 //!   shows that one (it wins at load); renaming writes `name:` and drops
 //!   `display_name:`, so the file ends on the current spelling.
-//! - An empty label, repository or editor removes the key: the label falls
-//!   back to the id, the editor to the user's default.
+//! - An empty label or repository removes the key: the label falls back to
+//!   the id.
 //! - Only keys whose value changed are written, so a project that leans on a
 //!   default (no `workspace_poll_interval_secs:`) doesn't grow the key when
 //!   something else is saved.
@@ -54,8 +56,6 @@ pub struct Properties {
     /// `github_url:`.
     pub github_url: Option<String>,
     pub default_branch: String,
-    /// `editor:`; `None` is the user's default.
-    pub editor: Option<String>,
     pub workspace_poll_interval_secs: u64,
     pub github_reconcile_interval_secs: u64,
 }
@@ -66,7 +66,6 @@ impl Default for Properties {
             label: None,
             github_url: None,
             default_branch: DEFAULT_BRANCH.into(),
-            editor: None,
             workspace_poll_interval_secs: DEFAULT_POLL_SECS,
             github_reconcile_interval_secs: DEFAULT_RECONCILE_SECS,
         }
@@ -80,7 +79,6 @@ pub enum Field {
     GithubUrl,
     DefaultBranch,
     DefaultWorkflow,
-    Editor,
     PollInterval,
     ReconcileInterval,
 }
@@ -118,18 +116,15 @@ impl IssueTracker {
     }
 }
 
-/// Read the settings out of the project YAML (`shared`) and, for an in-repo
-/// project, its `local.yaml` (`local`, which holds `editor:`). A key that's
+/// Read the settings out of the project YAML (`shared`). A key that's
 /// missing or of the wrong type reads as its default.
-pub fn read(shared: &Value, local: Option<&Value>) -> Properties {
-    let text = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
+pub fn read(shared: &Value) -> Properties {
+    let text = |key: &str| shared.get(key).and_then(Value::as_str).map(str::to_string);
     let secs = |key: &str, default: u64| shared.get(key).and_then(Value::as_u64).unwrap_or(default);
-    let editor_home = local.unwrap_or(shared);
     Properties {
-        label: text(shared, "display_name").or_else(|| text(shared, "name")),
-        github_url: text(shared, "github_url"),
-        default_branch: text(shared, "default_branch").unwrap_or_else(|| DEFAULT_BRANCH.into()),
-        editor: text(editor_home, "editor"),
+        label: text("display_name").or_else(|| text("name")),
+        github_url: text("github_url"),
+        default_branch: text("default_branch").unwrap_or_else(|| DEFAULT_BRANCH.into()),
         workspace_poll_interval_secs: secs("workspace_poll_interval_secs", DEFAULT_POLL_SECS),
         github_reconcile_interval_secs: secs("github_reconcile_interval_secs", DEFAULT_RECONCILE_SECS),
     }
@@ -171,9 +166,6 @@ pub fn check(p: &Properties) -> Vec<Problem> {
     if let Err(e) = check_branch(&p.default_branch) {
         refuse(Field::DefaultBranch, e);
     }
-    if one_line(&p.editor) {
-        refuse(Field::Editor, "The editor command must be one line.".into());
-    }
     let poll = p.workspace_poll_interval_secs;
     if !(MIN_POLL_SECS..=MAX_POLL_SECS).contains(&poll) {
         refuse(
@@ -211,12 +203,10 @@ fn check_branch(name: &str) -> Result<(), String> {
 }
 
 /// Write the fields that differ between `before` (as loaded) and `after`
-/// into the YAML trees: `shared` (the project YAML) and, for an in-repo
-/// project, `local` (its `local.yaml`, where `editor:` lives). Returns
-/// whether each tree changed: `(shared, local)`.
-pub fn apply(shared: &mut Mapping, local: Option<&mut Mapping>, before: &Properties, after: &Properties) -> (bool, bool) {
+/// into `shared`, the project YAML's tree. Every other key, `editor:` among
+/// them, is left as it is. Returns whether the tree changed.
+pub fn apply(shared: &mut Mapping, before: &Properties, after: &Properties) -> bool {
     let mut shared_changed = false;
-    let mut local_changed = false;
     let set = |map: &mut Mapping, key: &str, value: Option<Value>| match value {
         Some(v) => {
             map.insert(key.into(), v);
@@ -254,20 +244,7 @@ pub fn apply(shared: &mut Mapping, local: Option<&mut Mapping>, before: &Propert
         );
         shared_changed = true;
     }
-    if before.editor != after.editor {
-        let editor = after.editor.clone().map(Value::from);
-        match local {
-            Some(local) => {
-                set(local, "editor", editor);
-                local_changed = true;
-            }
-            None => {
-                set(shared, "editor", editor);
-                shared_changed = true;
-            }
-        }
-    }
-    (shared_changed, local_changed)
+    shared_changed
 }
 
 #[cfg(test)]
@@ -280,7 +257,7 @@ mod tests {
 
     #[test]
     fn missing_keys_read_as_their_defaults() {
-        let p = read(&yaml("repo: /tmp/x\n"), None);
+        let p = read(&yaml("repo: /tmp/x\n"));
         assert_eq!(p, Properties::default());
         let p = read(
             &yaml(
@@ -288,16 +265,11 @@ mod tests {
                  default_branch: trunk\neditor: zed\nworkspace_poll_interval_secs: 9\n\
                  github_reconcile_interval_secs: 0\n",
             ),
-            None,
         );
         assert_eq!(p.label.as_deref(), Some("Old"), "the legacy key wins, as at load");
         assert_eq!(p.github_url.as_deref(), Some("git@github.com:a/b.git"));
         assert_eq!(p.default_branch, "trunk");
-        assert_eq!(p.editor.as_deref(), Some("zed"));
         assert_eq!((p.workspace_poll_interval_secs, p.github_reconcile_interval_secs), (9, 0));
-        // An in-repo project's editor is in local.yaml, not the shared file.
-        let p = read(&yaml("editor: shared\n"), Some(&yaml("editor: mine\n")));
-        assert_eq!(p.editor.as_deref(), Some("mine"));
     }
 
     #[test]
@@ -316,7 +288,6 @@ mod tests {
             label: Some("a\nb".into()),
             github_url: Some("git@x .git".into()),
             default_branch: "feature..x".into(),
-            editor: Some("vim\n".into()),
             workspace_poll_interval_secs: 0,
             github_reconcile_interval_secs: 30,
         };
@@ -327,7 +298,6 @@ mod tests {
                 Field::Label,
                 Field::GithubUrl,
                 Field::DefaultBranch,
-                Field::Editor,
                 Field::PollInterval,
                 Field::ReconcileInterval
             ]
@@ -346,27 +316,23 @@ mod tests {
     }
 
     #[test]
-    fn apply_writes_only_what_changed_and_routes_the_editor() {
-        let before = read(&yaml("display_name: Old\neditor: vim\n"), None);
+    fn apply_writes_only_what_changed_and_keeps_the_editor() {
+        let before = read(&yaml("display_name: Old\neditor: vim\n"));
         let mut shared = yaml("display_name: Old\neditor: vim\n").as_mapping().unwrap().clone();
         let after = Properties {
             label: Some("New".into()),
-            editor: None,
             ..before.clone()
         };
-        assert_eq!(apply(&mut shared, None, &before, &after), (true, false));
-        assert_eq!(Value::Mapping(shared), yaml("name: New\n"), "display_name gives way to name");
+        assert!(apply(&mut shared, &before, &after));
+        assert_eq!(
+            Value::Mapping(shared),
+            yaml("editor: vim\nname: New\n"),
+            "display_name gives way to name; editor: is left alone"
+        );
 
-        // In-repo: the editor goes to local.yaml; nothing else is touched.
-        let before = Properties::default();
+        // Nothing changed: nothing is written, defaults included.
         let mut shared = Mapping::new();
-        let mut local = Mapping::new();
-        let after = Properties {
-            editor: Some("zed".into()),
-            ..before.clone()
-        };
-        assert_eq!(apply(&mut shared, Some(&mut local), &before, &after), (false, true));
+        assert!(!apply(&mut shared, &Properties::default(), &Properties::default()));
         assert!(shared.is_empty(), "defaults aren't written");
-        assert_eq!(Value::Mapping(local), yaml("editor: zed\n"));
     }
 }

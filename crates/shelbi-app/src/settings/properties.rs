@@ -9,7 +9,6 @@
 //!  Repository       [ git@github.com:jlong/shelbi.git ]
 //!  Default branch   [ main                            ]
 //!  Default workflow [ app                           ⌄ ]
-//!  Editor           [ Default ($EDITOR or vim)      ⌄ ]
 //!  Issue tracker    GitHub · jlong/shelbi
 //!                   Change it in the project YAML.
 //!  ▸ Advanced
@@ -22,7 +21,11 @@
 //! [`WorkflowConfig`] ([`WorkflowConfig::properties`],
 //! [`WorkflowConfig::set_properties`]): one hash-checked, comment-preserving
 //! plan sent to the daemon that owns the project, here or on the far
-//! machine, which writes an in-repo project's `editor:` to its `local.yaml`.
+//! machine.
+//!
+//! The project YAML's `editor:` isn't on the page: nothing in Shelbi reads
+//! it (every editor launch uses Settings ▸ General's), and a save leaves it
+//! as the file has it.
 //!
 //! Saving works as the General and Workflows pages' do: there is no Save
 //! button. A text field saves when it's committed (Enter, or focus leaving
@@ -41,11 +44,8 @@
 use std::collections::HashMap;
 
 use shelbi_state::project_properties::{self, Field, Properties};
-use shelbi_state::tools::{DetectedTools, ToolOption};
 use shelbi_state::workflow_config::WorkflowConfig;
-use shelbi_state::{ToolChoice, ToolKind};
 
-use crate::settings::general::{PickerEntry, ToolPicker, ToolSetting, DEFAULT_EDITOR_LABEL};
 use crate::settings::orchestrator::SaveStatus;
 use crate::settings::store::{self, ConfigStore};
 use crate::settings::summary::display_path;
@@ -61,24 +61,21 @@ pub const ADVANCED_LABEL: &str = "Advanced";
 /// The unit after an interval field.
 pub const SECONDS: &str = "seconds";
 
-/// A field the page edits as text. The Default workflow is a picker; the
-/// Editor is a picker whose Other command… types into [`Text::Editor`].
+/// A field the page edits as text. The Default workflow is a picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Text {
     Label,
     Repository,
     DefaultBranch,
-    Editor,
     PollInterval,
     ReconcileInterval,
 }
 
 /// The text fields, top to bottom: the main group, then Advanced's.
-pub const TEXTS: [Text; 6] = [
+pub const TEXTS: [Text; 5] = [
     Text::Label,
     Text::Repository,
     Text::DefaultBranch,
-    Text::Editor,
     Text::PollInterval,
     Text::ReconcileInterval,
 ];
@@ -89,7 +86,6 @@ impl Text {
             Text::Label => "Name",
             Text::Repository => "Repository",
             Text::DefaultBranch => "Default branch",
-            Text::Editor => "Editor",
             Text::PollInterval => "Workspace poll interval",
             Text::ReconcileInterval => "GitHub reconcile interval",
         }
@@ -101,9 +97,6 @@ impl Text {
             Text::Label => "Shown on the project’s tab and in the sidebar. Its ID stays the same.",
             Text::Repository => "The project’s remote, as recorded when it was set up.",
             Text::DefaultBranch => "Where workspace branches start, unless a workflow says otherwise.",
-            Text::Editor => {
-                "Saved as the project’s editor:. Edit in … opens Settings ▸ General’s editor; Shelbi doesn’t read this one yet."
-            }
             Text::PollInterval => "How often the orchestrator checks each workspace.",
             Text::ReconcileInterval => {
                 "How often Shelbi checks GitHub for pull requests merged there. 0 turns it off."
@@ -126,7 +119,6 @@ impl Text {
             Text::Label => Field::Label,
             Text::Repository => Field::GithubUrl,
             Text::DefaultBranch => Field::DefaultBranch,
-            Text::Editor => Field::Editor,
             Text::PollInterval => Field::PollInterval,
             Text::ReconcileInterval => Field::ReconcileInterval,
         }
@@ -142,7 +134,6 @@ impl Text {
             Text::Label => p.label.clone().unwrap_or_default(),
             Text::Repository => p.github_url.clone().unwrap_or_default(),
             Text::DefaultBranch => p.default_branch.clone(),
-            Text::Editor => p.editor.clone().unwrap_or_default(),
             Text::PollInterval => p.workspace_poll_interval_secs.to_string(),
             Text::ReconcileInterval => p.github_reconcile_interval_secs.to_string(),
         }
@@ -160,7 +151,6 @@ impl Text {
             Text::Label => p.label = optional(),
             Text::Repository => p.github_url = optional(),
             Text::DefaultBranch => p.default_branch = text.to_string(),
-            Text::Editor => p.editor = optional(),
             Text::PollInterval => p.workspace_poll_interval_secs = secs()?,
             Text::ReconcileInterval => p.github_reconcile_interval_secs = secs()?,
         }
@@ -275,26 +265,19 @@ impl PropertiesForm {
             Text::Label => self.config.as_ref().map(|c| c.project().to_string()).unwrap_or_default(),
             Text::Repository => "git@github.com:owner/repo.git".into(),
             Text::DefaultBranch => project_properties::DEFAULT_BRANCH.into(),
-            Text::Editor => DEFAULT_EDITOR_LABEL.into(),
             Text::PollInterval => project_properties::DEFAULT_POLL_SECS.to_string(),
             Text::ReconcileInterval => project_properties::DEFAULT_RECONCILE_SECS.to_string(),
         }
     }
 
-    /// The help under `t`: its own, and for an in-repo project's editor,
-    /// the file it's kept in.
+    /// The help under `t`.
     pub fn help(&self, t: Text) -> String {
-        match (t, &self.config) {
-            (Text::Editor, Some(c)) if c.layout() == shelbi_core::ConfigMode::InRepo => {
-                format!("{} Kept in {}, not in the repo.", t.help(), display_path(c.editor_path()))
-            }
-            _ => t.help().to_string(),
-        }
+        t.help().to_string()
     }
 
     /// Type into `t`. Its last error goes until it's checked again.
     pub fn set_text(&mut self, t: Text, text: &str) {
-        if !self.editable() || (t == Text::Editor && !self.editor_editable()) {
+        if !self.editable() {
             return;
         }
         self.drafts.insert(t, text.to_string());
@@ -321,12 +304,6 @@ impl PropertiesForm {
     /// `t`'s last error.
     pub fn error(&self, t: Text) -> Option<&str> {
         self.errors.get(&t).map(String::as_str)
-    }
-
-    /// Whether the editor can be saved (an in-repo project's `local.yaml`
-    /// was read).
-    pub fn editor_editable(&self) -> bool {
-        self.config.as_ref().is_some_and(WorkflowConfig::editor_editable)
     }
 
     /// The workflows to pick the default from, in name order.
@@ -378,56 +355,6 @@ impl PropertiesForm {
         let at = all.iter().position(|w| w == self.default_workflow()).unwrap_or(0) as isize;
         let next = all[(at + steps).rem_euclid(all.len() as isize) as usize].clone();
         self.choose_workflow(&next)
-    }
-
-    /// The Editor's picker: the default, this machine's command-line editors
-    /// (the project's `editor:` is a command line), the current command when
-    /// it is none of those, Browse… and Other command….
-    pub fn editor_picker(&self, detected: &DetectedTools) -> ToolPicker {
-        let cli: Vec<ToolOption> = detected.editors.iter().filter(|t| t.kind == ToolKind::Cli).cloned().collect();
-        let current = self
-            .config
-            .as_ref()
-            .and_then(|c| c.properties().editor.clone())
-            .map(ToolChoice::Command);
-        let custom = current.as_ref().filter(|c| !cli.iter().any(|t| &t.choice == *c)).map(ToolOption::custom);
-        ToolPicker {
-            setting: ToolSetting::Editor,
-            default_detail: None,
-            cli,
-            apps: Vec::new(),
-            custom,
-            current,
-        }
-    }
-
-    /// Pick an editor entry: Default and a tool save at once; Browse and
-    /// Other command need more from the user, so they change nothing here.
-    pub fn choose_editor_entry(&mut self, entry: &PickerEntry) -> Option<WorkflowConfig> {
-        let command = match entry {
-            PickerEntry::Default => String::new(),
-            PickerEntry::Tool(t) => t.choice.command()?.to_string(),
-            PickerEntry::Browse | PickerEntry::OtherCommand => return None,
-        };
-        self.choose_editor(&command)
-    }
-
-    /// Set the editor's command (empty: the default) and save it.
-    pub fn choose_editor(&mut self, command: &str) -> Option<WorkflowConfig> {
-        if !self.editor_editable() {
-            return None;
-        }
-        self.set_text(Text::Editor, command);
-        self.commit()
-    }
-
-    /// Browse picked `path` for the editor: a program's path is its command;
-    /// an app is refused (the project's editor is a command line).
-    pub fn browse_editor(&mut self, path: &std::path::Path) -> Result<Option<WorkflowConfig>, String> {
-        match shelbi_state::tools::choice_from_path(path)? {
-            ToolChoice::Command(command) => Ok(self.choose_editor(&command)),
-            ToolChoice::App { .. } => Err("Pick a program: a project’s editor is a command line.".into()),
-        }
     }
 
     /// Check every field and save what changed: the config to write
@@ -678,6 +605,31 @@ mod tests {
     }
 
     #[test]
+    fn the_page_offers_no_editor_and_a_save_keeps_its_key() {
+        let (home, store) = home("props-editor");
+        let path = shelbi_state::projects_dir().unwrap().join("props-editor.yaml");
+        let original = project_yaml("props-editor");
+        let with_editor = format!("{original}editor: hx --vsplit   # mine\n");
+        std::fs::write(&path, &with_editor).unwrap();
+
+        let mut form = PropertiesForm::default();
+        form.load(store.workflows());
+        assert!(form.editable(), "a project YAML with editor: loads");
+        let labels: Vec<&str> = TEXTS.iter().map(|t| t.label()).collect();
+        assert_eq!(labels, ["Name", "Repository", "Default branch", "Workspace poll interval", "GitHub reconcile interval"]);
+
+        form.set_text(Text::DefaultBranch, "trunk");
+        let next = form.commit().unwrap();
+        form.saved_result(save(store.as_ref(), &next));
+        assert_eq!(form.status(), &SaveStatus::Saved);
+        let text = project_yaml("props-editor");
+        assert!(text.contains("editor: hx --vsplit   # mine\n"), "editor: is kept as it was: {text}");
+        let project = shelbi_state::load_project("props-editor").unwrap();
+        assert_eq!((project.editor.as_deref(), project.default_branch.as_str()), (Some("hx --vsplit"), "trunk"));
+        drop(home);
+    }
+
+    #[test]
     fn the_pickers_save_at_once() {
         let (home, store) = home("props-pick");
         let mut form = PropertiesForm::default();
@@ -690,17 +642,6 @@ mod tests {
         form.saved_result(save(store.as_ref(), &next));
         assert_eq!(form.default_workflow(), other);
         assert_eq!(store.workflows().unwrap().default_workflow(), other);
-
-        let picker = form.editor_picker(&DetectedTools::default());
-        assert_eq!(picker.current_label(), DEFAULT_EDITOR_LABEL);
-        let next = form.choose_editor("hx --vsplit").unwrap();
-        form.saved_result(save(store.as_ref(), &next));
-        assert_eq!(shelbi_state::load_project("props-pick").unwrap().editor.as_deref(), Some("hx --vsplit"));
-        let picker = form.editor_picker(&DetectedTools::default());
-        assert_eq!(picker.custom.as_ref().map(|c| c.choice.clone()), Some(ToolChoice::Command("hx --vsplit".into())));
-        let next = form.choose_editor_entry(&PickerEntry::Default).unwrap();
-        form.saved_result(save(store.as_ref(), &next));
-        assert_eq!(shelbi_state::load_project("props-pick").unwrap().editor, None);
         assert_eq!(form.issue_tracker().as_deref(), Some("Files on disk"));
 
         // A failed write keeps what was typed and says why.

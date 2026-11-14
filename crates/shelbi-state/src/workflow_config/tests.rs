@@ -1231,7 +1231,6 @@ fn the_properties_save_to_the_project_yaml_keeping_its_comments() {
     let home = Home::new();
     let cfg = load();
     assert_eq!(cfg.layout(), ConfigMode::Global);
-    assert!(cfg.editor_editable());
     let before = cfg.properties().clone();
     assert_eq!(before.label, None);
     assert_eq!(before.default_branch, "main");
@@ -1244,7 +1243,6 @@ fn the_properties_save_to_the_project_yaml_keeping_its_comments() {
             label: Some("Workflow Config".into()),
             github_url: Some("git@github.com:a/wfc.git".into()),
             default_branch: "trunk".into(),
-            editor: Some("zed --wait".into()),
             workspace_poll_interval_secs: 10,
             github_reconcile_interval_secs: 0,
         })
@@ -1259,22 +1257,52 @@ fn the_properties_save_to_the_project_yaml_keeping_its_comments() {
     assert_eq!(project.display_label(), "Workflow Config", "the loader reads the label");
     assert_eq!(project.github_url.as_deref(), Some("git@github.com:a/wfc.git"));
     assert_eq!(project.default_branch, "trunk");
-    assert_eq!(project.editor.as_deref(), Some("zed --wait"));
     assert_eq!(project.workspace_poll_interval_secs, 10);
     assert_eq!(project.github_reconcile_interval_secs, 0);
     assert_eq!(load().properties(), edited.properties(), "it reads back as saved");
 
-    // Clearing the label and editor removes the keys.
+    // Clearing the label removes the key.
     let cleared = load()
         .set_properties(Properties {
             label: None,
-            editor: None,
             ..edited.properties().clone()
         })
         .unwrap();
     save(&cleared);
     let text = home.project_yaml();
-    assert!(!text.contains("\nname:") && !text.contains("editor:"), "{text}");
+    assert!(!text.contains("\nname:"), "{text}");
+}
+
+#[test]
+fn a_properties_save_keeps_the_projects_editor_key() {
+    // The page doesn't edit `editor:` (nothing reads it), but a project YAML
+    // that has one still loads, and saving the other properties neither
+    // drops nor rewrites it.
+    let home = Home::new();
+    let path = home.projects.join(format!("{PROJECT}.yaml"));
+    let with_editor = PROJECT_YAML.replace(
+        "default_branch: main\n",
+        "default_branch: main\neditor: zed --wait   # mine\n",
+    );
+    fs::write(&path, &with_editor).unwrap();
+    assert_eq!(crate::load_project(PROJECT).unwrap().editor.as_deref(), Some("zed --wait"));
+
+    let cfg = load();
+    let edited = cfg
+        .set_properties(Properties {
+            label: Some("Renamed".into()),
+            default_branch: "trunk".into(),
+            workspace_poll_interval_secs: 9,
+            ..cfg.properties().clone()
+        })
+        .unwrap();
+    save(&edited);
+    let text = home.project_yaml();
+    assert!(text.contains("editor: zed --wait   # mine\n"), "the key and its comment stay: {text}");
+    assert_eq!(text.matches("editor:").count(), 1, "{text}");
+    let project = crate::load_project(PROJECT).unwrap();
+    assert_eq!(project.editor.as_deref(), Some("zed --wait"));
+    assert_eq!((project.display_label(), project.default_branch.as_str()), ("Renamed", "trunk"));
 }
 
 #[test]
@@ -1309,7 +1337,7 @@ fn bad_properties_are_refused_and_nothing_is_written() {
 }
 
 #[test]
-fn an_in_repo_projects_editor_saves_to_its_local_yaml() {
+fn an_in_repo_projects_properties_save_to_the_shared_file_only() {
     let home = Home::new();
     let repo = home.root.join("repo");
     fs::create_dir_all(repo.join(".shelbi/workflows")).unwrap();
@@ -1338,7 +1366,7 @@ agent_runners:
     flags: []
 ";
     let local = format!(
-        "# Mine.\nrepo: {}\nmachines:\n  - name: local\n    kind: local\n    work_dir: /tmp/wfc\n",
+        "# Mine.\nrepo: {}\neditor: nvim\nmachines:\n  - name: local\n    kind: local\n    work_dir: /tmp/wfc\n",
         repo.display()
     );
     fs::write(repo.join(".shelbi/project.yaml"), shared).unwrap();
@@ -1347,31 +1375,27 @@ agent_runners:
 
     let cfg = load();
     assert_eq!(cfg.layout(), ConfigMode::InRepo);
-    assert!(cfg.editor_editable());
-    assert_eq!(cfg.editor_path(), local_path.as_path());
     let edited = cfg
         .set_properties(Properties {
             label: Some("Shared Name".into()),
-            editor: Some("nvim".into()),
             ..cfg.properties().clone()
         })
         .unwrap();
     // (An in-repo project's workflows live in the repo, so not `save`.)
     let saved = edited.save().unwrap();
-    assert_eq!(saved.written, vec![repo.join(".shelbi/project.yaml"), local_path.clone()]);
+    assert_eq!(saved.written, vec![repo.join(".shelbi/project.yaml")], "local.yaml isn't written");
     let shared_now = fs::read_to_string(repo.join(".shelbi/project.yaml")).unwrap();
-    let local_now = fs::read_to_string(&local_path).unwrap();
     assert!(shared_now.starts_with("# Shared settings.\n") && shared_now.contains("name: Shared Name"));
-    assert!(!shared_now.contains("editor"), "the editor is user-local: {shared_now}");
-    assert!(local_now.starts_with("# Mine.\n") && local_now.contains("editor: nvim"), "{local_now}");
+    assert!(!shared_now.contains("editor"), "{shared_now}");
+    assert_eq!(fs::read_to_string(&local_path).unwrap(), local, "the user-local editor: stays as it was");
     let project = crate::load_project(PROJECT).unwrap();
     assert_eq!(project.editor.as_deref(), Some("nvim"));
     assert_eq!(project.display_label(), "Shared Name");
 
-    // A far machine's validation takes the local.yaml write too.
+    // A far machine's validation takes the plan.
     let plan = load()
         .set_properties(Properties {
-            editor: None,
+            label: None,
             ..load().properties().clone()
         })
         .unwrap()
