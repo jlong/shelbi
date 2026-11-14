@@ -2,10 +2,13 @@
 //! the window (`Orchestrator · Dark`, node 2792:33339), 52pt tall, the
 //! native traffic lights on its left.
 //!
-//! Left to right: the toolbar (Search, which opens the command palette, and
-//! Toggle sidebar), then one tab per open project ([`crate::project_tabs`]),
-//! each a green dot and the project's name between 1pt rules, then the `+`
-//! tab. The selected tab fills with the main area's color, so it reads as
+//! Left to right: one tab per open project ([`crate::project_tabs`]),
+//! starting just past the traffic lights, each a green dot and the project's
+//! name between 1pt rules, then the `+` tab; at the right end, the search
+//! box (node 2829:26790), which opens the command palette. While the sidebar
+//! is hidden a Toggle sidebar button slides in before the first tab, with
+//! the sidebar's own reveal, to bring it back (the sidebar's header row has
+//! the toggle otherwise). The selected tab fills with the main area's color, so it reads as
 //! joined to the content below; the rest are unfilled. Hovering a tab swaps
 //! its dot for an `×` that closes the project. While ⌘ is held each of the
 //! first nine tabs shows its ⌘N.
@@ -14,7 +17,8 @@
 //! (the shared [`project_menu`] list, gray rings), a rule, then
 //! "Add project". With every project open, only "Add project".
 //!
-//! The bar stays where it is while the sidebar hides and shows.
+//! The bar stays where it is while the sidebar hides and shows; only the
+//! tabs step right to make room for the toggle.
 
 use std::time::Instant;
 
@@ -24,11 +28,12 @@ use gpui::{
 use shelbi_app::overlay::palette::ProjectEntry;
 
 use super::project_menu;
-use super::sidebar::{toolbar_button, SidebarEvent, SidebarHost, TRAFFIC_LIGHTS_RIGHT};
+use super::sidebar::{self, SidebarEvent, SidebarHost, TOOLBAR_BUTTON, TRAFFIC_LIGHTS_RIGHT};
 use crate::assets::{heroicon, icons, ICON_SIZE_MENU};
 use crate::elements::placed::{placed, MenuScroll};
+use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::keys::tab_hotkey;
-use crate::theme::motion;
+use crate::theme::motion::{self, fill_layer};
 use crate::theme::style::{self, Anchor, Type, Typography, NAV_RADIUS};
 use crate::theme::Theme;
 
@@ -36,13 +41,29 @@ use crate::theme::Theme;
 /// center on it (`sidebar::traffic_light_position`).
 pub const TAB_BAR_H: f32 = 52.0;
 
-/// The gap from the traffic lights' right edge to the toolbar's first
-/// button. Figma draws its lights ending at 69 and the toolbar at 86; the
-/// real lights end at [`TRAFFIC_LIGHTS_RIGHT`], so the toolbar keeps the
-/// frame's 17pt past them.
-const TOOLBAR_GAP: f32 = 17.0;
-/// Where the toolbar starts.
-pub const TOOLBAR_X: f32 = TRAFFIC_LIGHTS_RIGHT + TOOLBAR_GAP;
+/// The gap from the traffic lights' right edge to the bar's first item.
+/// Figma draws its lights ending at 69 and the first tab's rule at 86; the
+/// real lights end at [`TRAFFIC_LIGHTS_RIGHT`], so the bar keeps the frame's
+/// 17pt past them.
+const LIGHTS_GAP: f32 = 17.0;
+/// Where the bar's first item starts: the first tab's rule, or, while the
+/// sidebar is hidden, the Toggle sidebar button.
+pub const LEAD_X: f32 = TRAFFIC_LIGHTS_RIGHT + LIGHTS_GAP;
+/// The room the Toggle sidebar button takes while the sidebar is hidden:
+/// the button and the 16pt before the first tab's rule.
+pub const TOGGLE_ROOM: f32 = TOOLBAR_BUTTON + 16.0;
+
+/// The search box (2829:26790): 170 × 32, 10pt in from the window's right
+/// edge, centered in the bar.
+pub const SEARCH_W: f32 = 170.0;
+pub const SEARCH_H: f32 = 32.0;
+pub const SEARCH_RIGHT: f32 = 10.0;
+/// Its corners and padding: 6pt corners, 6pt before the magnifier, 8pt
+/// after the key cap, 6pt between.
+const SEARCH_RADIUS: f32 = 6.0;
+const SEARCH_PAD_LEFT: f32 = 6.0;
+const SEARCH_PAD_RIGHT: f32 = 8.0;
+const SEARCH_GAP: f32 = 6.0;
 
 /// A tab's padding: 16pt before its dot, 20pt after its name, 8pt between.
 const TAB_PAD_LEFT: f32 = 16.0;
@@ -79,10 +100,15 @@ pub struct TabBarProps<'a> {
     pub plus: &'a Anchor,
     /// The menu is open (the `+` holds its pressed fill).
     pub menu_open: bool,
-    /// The palette-open chord, for the Search button's tooltip (`⌃P`).
+    /// The palette-open chord the search box shows (`⌘K`).
     pub palette_chord: &'a str,
-    /// The sidebar shows (the Toggle sidebar tooltip says what a click does).
+    /// The sidebar shows, or is on its way (the Toggle sidebar tooltip says
+    /// what a click does).
     pub sidebar_shown: bool,
+    /// Where the sidebar stands, 0 hidden to 1 shown, eased
+    /// ([`super::sidebar_reveal`]): the Toggle sidebar button shows as far as
+    /// the sidebar is hidden.
+    pub reveal: f32,
 }
 
 /// The project menu, as one frame draws it.
@@ -187,33 +213,25 @@ fn rule(theme: &Theme) -> Div {
 
 /// Render the bar.
 pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Context<H>) -> AnyElement {
-    let search_tip = if props.palette_chord.is_empty() {
-        "Search".to_string()
-    } else {
-        format!("Search ({})", props.palette_chord)
-    };
-    let toggle_tip = if props.sidebar_shown { "Hide the sidebar" } else { "Show the sidebar" };
-    let toolbar = div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .items_center()
-        .gap_1()
-        .pr(px(8.0))
-        .child(
-            toolbar_button("tab-bar-search", heroicon(icons::MAGNIFYING_GLASS), theme)
-                .tooltip(style::tooltip(search_tip))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.sidebar_event(SidebarEvent::OpenSearch, window, cx)
-                })),
-        )
-        .child(
-            toolbar_button("tab-bar-sidebar", heroicon(icons::SIDEBAR), theme)
-                .tooltip(style::tooltip(toggle_tip))
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.sidebar_event(SidebarEvent::Collapse, window, cx)
-                })),
-        );
+    // Toggle sidebar, while the sidebar is hidden or on its way: its room
+    // opens as the sidebar leaves (the tabs step right) and closes as it
+    // comes back, the button fading with it.
+    let hidden = 1.0 - props.reveal.clamp(0.0, 1.0);
+    let toggle = (hidden > 0.0).then(|| {
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .w(px(TOGGLE_ROOM * hidden))
+            .h(px(TAB_BAR_H))
+            .overflow_hidden()
+            .opacity(hidden)
+            .child(
+                sidebar::toggle_button("tab-bar-sidebar", Some(props.sidebar_shown), theme).on_click(cx.listener(
+                    |this, _, window, cx| this.sidebar_event(SidebarEvent::Collapse, window, cx),
+                )),
+            )
+    });
 
     let mut strip: Vec<AnyElement> = vec![rule(theme).into_any_element()];
     for (ix, tab) in props.tabs.iter().enumerate() {
@@ -240,28 +258,107 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
         .items_start()
         .w_full()
         .h(px(TAB_BAR_H))
-        .pl(px(TOOLBAR_X))
+        .pl(px(LEAD_X))
         .bg(bar_fill(theme))
         .border_b_1()
         .border_color(theme.divider)
         .text_color(theme.foreground)
+        .children(toggle)
         .child(
-            // The toolbar centers on the lights (26pt down); the tabs run the
-            // bar's full height, over its rule, so the selected one covers
-            // it and joins the main area.
-            div().flex().flex_none().items_center().h(px(TAB_BAR_H)).child(toolbar),
+            // The tabs run the bar's full height, over its rule, so the
+            // selected one covers it and joins the main area.
+            div()
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_w_0()
+                .h(px(TAB_BAR_H))
+                .children(strip),
         )
         .child(
             div()
                 .flex()
-                .flex_row()
-                .min_w_0()
-                .ml(px(8.0))
+                .flex_none()
+                .items_center()
                 .h(px(TAB_BAR_H))
-                .children(strip),
+                .pl(px(SEARCH_RIGHT))
+                .pr(px(SEARCH_RIGHT))
+                .child(search_box(props.palette_chord, theme, cx)),
         )
         .children(menu)
         .into_any_element()
+}
+
+/// The search box (2829:26790): Heroicons `magnifying-glass`, "Search"
+/// (Base on a 22pt line, muted), and at its right end the palette's chord in
+/// a key cap (Source Code Pro 12 / 16, muted, 8pt either side, 3pt
+/// corners), on `surface/depth-20` with 6pt corners. Not a text field: a
+/// click opens the command palette. The fill deepens on hover and press and
+/// the magnifier goes loud, as the toolbar buttons do.
+fn search_box<H: SidebarHost>(chord: &str, theme: &Theme, cx: &mut Context<H>) -> Stateful<Div> {
+    const ID: &str = "tab-bar-search";
+    let radius = px(SEARCH_RADIUS);
+    let loud = theme.text_loud;
+    let d = div()
+        .id(ID)
+        .debug_selector(|| ID.into())
+        .group(ID)
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(SEARCH_GAP))
+        .w(px(SEARCH_W))
+        .h(px(SEARCH_H))
+        .pl(px(SEARCH_PAD_LEFT))
+        .pr(px(SEARCH_PAD_RIGHT))
+        .rounded(radius)
+        .cursor_pointer();
+    let cap = (!chord.is_empty()).then(|| {
+        div()
+            .debug_selector(|| "tab-bar-search-chord".into())
+            .flex_none()
+            .px(px(8.0))
+            .rounded(px(3.0))
+            .font_family(PRIMARY_FAMILY)
+            .text_size(px(12.0))
+            .line_height(px(16.0))
+            .text_color(theme.muted)
+            .child(chord.to_string())
+    });
+    fill_layer(
+        d,
+        ID,
+        radius,
+        [theme.divider_strong, theme.background_hover, theme.background_active],
+    )
+    .tooltip(style::tooltip(sidebar::search_tip(chord)))
+    .child(
+        div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_w_0()
+            .items_center()
+            .gap(px(SEARCH_GAP))
+            .child(
+                heroicon(icons::MAGNIFYING_GLASS)
+                    .flex_none()
+                    .text_color(theme.icon)
+                    .group_hover(ID, move |s| s.text_color(loud)),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "tab-bar-search-label".into())
+                    .truncate()
+                    .type_style(Type::Base)
+                    .line_height(px(22.0))
+                    .text_color(theme.muted)
+                    .child("Search"),
+            ),
+    )
+    .children(cap)
+    .on_click(cx.listener(|this, _, window, cx| this.sidebar_event(SidebarEvent::OpenSearch, window, cx)))
 }
 
 /// One project's tab: its dot (an `×` while hovered), its name, and its ⌘N
@@ -474,8 +571,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_toolbar_keeps_figmas_gap_past_the_lights() {
-        assert_eq!(TOOLBAR_X, 96.0, "the real lights end at 79, Figma's 17pt past them");
+    fn the_tabs_keep_figmas_gap_past_the_lights() {
+        assert_eq!(LEAD_X, 96.0, "the real lights end at 79, Figma's 17pt past them");
+    }
+
+    #[test]
+    fn the_search_box_fill_is_surface_depth_20() {
+        // `surface/depth-20` in the frame is Slate/400 at 20% (#acb4cf33),
+        // the app's `stroke/medium`, in both themes.
+        for (pref, appearance) in [
+            (shelbi_state::ThemePreference::Dark, gpui::WindowAppearance::Dark),
+            (shelbi_state::ThemePreference::Light, gpui::WindowAppearance::Light),
+        ] {
+            let theme = Theme::resolve(pref, appearance);
+            let fill = theme.divider_strong.to_rgb();
+            assert!((fill.a - 0.2).abs() < 0.01, "{fill:?}");
+            let (r, g, b) = (fill.r * 255.0, fill.g * 255.0, fill.b * 255.0);
+            assert!((r - 172.0).abs() < 1.5 && (g - 180.0).abs() < 1.5 && (b - 207.0).abs() < 1.5, "{r} {g} {b}");
+        }
     }
 
     #[test]

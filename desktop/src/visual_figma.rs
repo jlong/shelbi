@@ -2950,16 +2950,17 @@ impl Run {
     /// The task panels' states the frames don't draw
     /// (`state-{review,workspace}-<name>-<theme>.png`; no reference, checked
     /// by eye): the task detail More opens over the screen, each view picked
-    /// with its ⌘N, and Approve and Reject hovered and pressed.
+    /// with its ⌃N, and Approve and Reject hovered and pressed.
     fn panel_states(&mut self, orch: &View) {
         use gpui::{point, Modifiers, MouseButton};
 
-        // Points inside the frames' controls (State=Review / Workspace):
-        // More at (18, 230), Approve 91x28 at (12, 560), Reject 80x28 at
-        // (115, 560).
-        let more = point(px(30.0), px(236.0));
-        let approve = point(px(57.0), px(574.0));
-        let reject = point(px(155.0), px(574.0));
+        // Points inside the panels' controls, in the window (the column
+        // starts under the 52pt tab bar, the panel under its 58pt header
+        // row): More at (18, 244), Approve 91x28 at (12, 574), Reject 80x28
+        // at (115, 574).
+        let more = point(px(30.0), px(250.0));
+        let approve = point(px(57.0), px(588.0));
+        let reject = point(px(155.0), px(588.0));
         let click = |run: &mut Self, handle: WindowHandle<ShelbiWindow>, at| {
             run.cx.simulate_click(handle.into(), at, Modifiers::none());
             run.settle(handle);
@@ -2986,7 +2987,7 @@ impl Run {
 
         self.review(orch, "state-review-more", more_detail("state-review-more"));
         for n in 2..=5 {
-            let chord: &'static str = ["", "", "cmd-2", "cmd-3", "cmd-4", "cmd-5"][n];
+            let chord: &'static str = ["", "", "ctrl-2", "ctrl-3", "ctrl-4", "ctrl-5"][n];
             self.review(orch, &format!("state-review-view-{n}"), keys(chord));
         }
         for (name, at) in [("approve", approve), ("reject", reject)] {
@@ -3004,7 +3005,7 @@ impl Run {
         // The workspace panel's worktree row is 8pt taller, so More is too.
         self.workspace(orch, "state-workspace-more", more_detail("state-workspace-more"));
         for n in 2..=4 {
-            let chord: &'static str = ["", "", "cmd-2", "cmd-3", "cmd-4"][n];
+            let chord: &'static str = ["", "", "ctrl-2", "ctrl-3", "ctrl-4"][n];
             self.workspace(orch, &format!("state-workspace-view-{n}"), keys(chord));
         }
     }

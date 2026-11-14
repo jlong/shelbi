@@ -116,7 +116,7 @@ use crate::views::feedback::{FeedbackDialog, FeedbackEvent};
 use crate::views::new_task::{NewTaskDialog, NewTaskEvent};
 use shelbi_app::settings::workspaces::Intent;
 use shelbi_state::keymap::{
-    DisplayStyle, GlobalAction, Key, Keymaps, SidebarAction,
+    GlobalAction, Key, Keymaps, SidebarAction,
 };
 
 use crate::assets::{heroicon, icons};
@@ -1664,6 +1664,11 @@ impl ShelbiWindow {
             .unwrap_or_else(|| SidebarModel::skeleton(project));
         // The built-in keymaps until the user's `keys.yaml` is read (below).
         let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
+        // The task panels' Search names the chord (an open window's own
+        // keymaps, once read, win over the built-in ones).
+        if !cx.has_global::<sidebar::PaletteChord>() {
+            cx.set_global(sidebar::PaletteChord(palette_chord(&keymaps).into()));
+        }
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         // The window's translucency, before its first frame.
@@ -2090,6 +2095,7 @@ impl ShelbiWindow {
     /// Take `keymaps` for the window's keys, its hints and the menu bar.
     fn adopt_keymaps(&mut self, keymaps: Keymaps, cx: &mut Context<Self>) {
         self.palette_chord = palette_chord(&keymaps);
+        cx.set_global(sidebar::PaletteChord(self.palette_chord.clone().into()));
         cx.set_global(DiffKeys(Rc::new(keymaps.diff.clone())));
         self.keymaps = keymaps;
         if let Some(ws) = self.workspace.clone() {
@@ -3551,10 +3557,21 @@ impl ShelbiWindow {
             WorkspaceEvent::Back => this.leave_workspace(window, cx),
             WorkspaceEvent::OpenTask(id) => this.open_task_over(id, window, cx),
             WorkspaceEvent::Toast(toast) => this.show_toast(toast.clone(), cx),
+            WorkspaceEvent::Header(action) => this.header_action(*action, window, cx),
         });
         self._view_subscriptions.push(sub);
         self.workspace = Some(ws.clone());
         ws
+    }
+
+    /// A task panel's header button: Search opens the palette, Toggle
+    /// sidebar hides the column, as the sidebar's own header buttons do.
+    fn header_action(&mut self, action: sidebar::HeaderAction, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            sidebar::HeaderAction::Search => self.open_palette(window, cx),
+            sidebar::HeaderAction::ToggleSidebar => self.toggle_sidebar(cx),
+        }
+        cx.notify();
     }
 
     /// Put `toast` up over the main area, replacing the one showing, and
@@ -3617,6 +3634,7 @@ impl ShelbiWindow {
             ReviewEvent::Back | ReviewEvent::Closed => this.leave_review(window, cx),
             ReviewEvent::OpenTask(id) => this.open_task_over(id, window, cx),
             ReviewEvent::Toast(toast) => this.show_toast(toast.clone(), cx),
+            ReviewEvent::Header(action) => this.header_action(*action, window, cx),
         });
         self._view_subscriptions.push(sub);
         self.review = Some(review.clone());
@@ -6041,13 +6059,10 @@ fn window_chord(keymaps: &Keymaps, chord: &shelbi_state::keymap::KeyChord) -> Op
     })
 }
 
-/// The palette-open chord as the search box shows it (`⌃P`).
+/// The palette-open chord as the search box shows it (`⌘K` by default):
+/// the [`crate::views::palette::hint_chord`].
 fn palette_chord(keymaps: &Keymaps) -> String {
-    keymaps
-        .global
-        .first_chord_for(GlobalAction::OpenPalette)
-        .map(|c| crate::keys::chord_text(c, DisplayStyle::Mac))
-        .unwrap_or_default()
+    crate::views::palette::hint_chord(keymaps)
 }
 
 impl OverlayHost for ShelbiWindow {
@@ -6316,6 +6331,7 @@ impl ShelbiWindow {
                             ),
                             connected: self.link == Some(DaemonLink::Live),
                         }),
+                        palette_chord: &self.palette_chord,
                     },
                     &theme,
                     cx,
@@ -6347,6 +6363,7 @@ impl ShelbiWindow {
                     settings_chip.flatten(),
                     &self.settings_track,
                     self.model.project_label.clone().into(),
+                    &self.palette_chord,
                     &theme,
                     cx,
                 ))
@@ -6450,6 +6467,7 @@ impl ShelbiWindow {
                     menu_open: self.switcher.is_open(),
                     palette_chord: &self.palette_chord,
                     sidebar_shown: !self.collapsed,
+                    reveal: reveal.position,
                 },
                 &theme,
                 cx,

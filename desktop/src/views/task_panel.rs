@@ -3,8 +3,9 @@
 //! Navigation component's State=Workspace (2220:18764) and State=Review
 //! (2220:17158).
 //!
-//! Top to bottom: the back button beside the task's status (its glyph and
-//! the status in caps), the issue summary (the title, the description
+//! Top to bottom: the header row, the back button beside the task's status
+//! (its glyph and the status in caps) with Search and Toggle sidebar on the
+//! right, the issue summary (the title, the description
 //! clamped to five lines, More opening the task detail over the screen),
 //! the info rows (the worktree with its Open button, the branch, the pull
 //! request: the Workspace and Review frames 2787:33099 / 2787:33098),
@@ -17,7 +18,7 @@ use gpui::{div, prelude::*, px, AnyElement, Div, Hsla, SharedString, Stateful};
 use shelbi_app::task_rows;
 use shelbi_core::{IssuePr, PrCi, StatusCategory};
 
-use super::sidebar::nav_item;
+use super::sidebar::{self, nav_item};
 use crate::assets::{glyph, glyphs, heroicon, icons, Icon};
 use crate::elements::clamped_text::clamped_text;
 use crate::keys::row_hotkey;
@@ -56,17 +57,25 @@ pub fn back_button(id: &'static str, keyboard: bool, theme: &Theme) -> Stateful<
         .when(keyboard, |d| d.children(style::focus_bands(NAV_RADIUS, theme)))
 }
 
-/// The panel's first row (Figma's "Project and search"): the back button,
-/// then the status heading, 16pt in, 8pt down, 12pt apart.
-pub fn status_row(back: Stateful<Div>, status: Option<(StatusCategory, &str)>, theme: &Theme) -> Div {
-    div()
+/// The panel's header row (the Navigation component's Toolbar in
+/// State=Workspace 2220:18765 and State=Review): the back button, then the
+/// status heading 12pt past it, 16pt in; then `search` and `toggle`
+/// ([`super::sidebar::search_button`], [`super::sidebar::toggle_button`])
+/// on the right, as the sidebar's header row draws them.
+pub fn status_row(
+    back: Stateful<Div>,
+    status: Option<(StatusCategory, &str)>,
+    search: Stateful<Div>,
+    toggle: Stateful<Div>,
+    theme: &Theme,
+) -> Div {
+    let lead = div()
         .flex()
         .flex_row()
-        .flex_none()
+        .flex_1()
+        .min_w_0()
         .items_center()
         .gap(px(12.0))
-        .px(px(16.0))
-        .py(px(8.0))
         .child(back)
         .children(status.map(|(category, label)| {
             div()
@@ -82,8 +91,12 @@ pub fn status_row(back: Stateful<Div>, status: Option<(StatusCategory, &str)>, t
                     label.to_string(),
                     theme.foreground,
                 ))
-        }))
+        }));
+    sidebar::header_row(lead, PANEL_HEADER_PAD_LEFT, search, toggle)
 }
+
+/// The task panels' header row starts 16pt in (the frames' back button).
+const PANEL_HEADER_PAD_LEFT: f32 = 16.0;
 
 /// The issue summary: the title (Base/Medium, loud), the description
 /// (X-Small on an 18pt line, clamped to [`DESCRIPTION_LINES`] with an

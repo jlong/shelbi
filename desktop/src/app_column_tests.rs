@@ -189,7 +189,8 @@ fn without_a_review_the_column_is_the_sidebar(cx: &mut TestAppContext) {
     assert!(!c.drawn("column-review") && !c.drawn("review-panel"));
     assert_eq!(c.width("leading-column"), sidebar_px(DEFAULT_SIDEBAR_WIDTH));
     assert!(c.drawn("sidebar-resize"));
-    assert!(c.drawn("tab-bar-sidebar"), "the tab bar keeps the toggle");
+    assert!(c.drawn("sidebar-toggle"), "the sidebar's header has the toggle");
+    assert!(!c.drawn("tab-bar-sidebar"), "the tab bar has none while the sidebar shows");
 }
 
 #[gpui::test]
@@ -386,7 +387,7 @@ fn a_collapsed_sidebar_lends_its_column_and_stays_collapsed(cx: &mut TestAppCont
 
     c.open_review();
     assert!(c.drawn("column-review") && !c.drawn("column-sidebar"), "never the hidden sidebar");
-    assert!(c.drawn("tab-bar-sidebar"), "the tab bar keeps the toggle");
+    assert!(c.drawn("tab-bar-sidebar"), "the tab bar keeps the toggle while the sidebar is hidden");
     c.advance(SLIDE);
     assert_eq!(c.width("review-panel"), sidebar_px(DEFAULT_SIDEBAR_WIDTH), "the default width");
 
@@ -777,9 +778,10 @@ fn a_panel_keeps_the_sidebars_chrome_and_takes_the_numbered_chords(cx: &mut Test
     c.open_review();
     c.advance(SLIDE);
     assert!(c.drawn("review-panel") && !c.drawn("column-sidebar"));
-    // The tab bar's toolbar stays over it, and the Navigation component's
-    // footer under it, the Zen pill at the 24pt every state draws.
-    for selector in ["tab-bar-search", "tab-bar-sidebar", "sidebar-settings", "sidebar-zen"] {
+    // The tab bar's search box stays over it, the panel's header row has
+    // Search and Toggle sidebar, and the Navigation component's footer is
+    // under it, the Zen pill at the 24pt every state draws.
+    for selector in ["tab-bar-search", "review-search", "review-toggle", "sidebar-settings", "sidebar-zen"] {
         assert!(c.drawn(selector), "{selector} is drawn around the panel");
     }
     assert_eq!(c.bounds("sidebar-zen").unwrap().size.height, gpui::px(24.0));
@@ -1130,10 +1132,11 @@ fn close_px(a: f32, b: f32) -> bool {
     (a - b).abs() < 0.5
 }
 
-/// Where the tab bar's Toggle sidebar button sits, the sidebar shown or
-/// not: the toolbar's second 32pt button, centered on the traffic lights.
+/// Where the tab bar's Toggle sidebar button sits while the sidebar is
+/// hidden (or on its way): the bar's first item, 17pt past the traffic
+/// lights, centered on them.
 fn toggle_origin() -> (f32, f32) {
-    (crate::views::tab_bar::TOOLBAR_X + 32.0 + 4.0, (crate::views::tab_bar::TAB_BAR_H - 32.0) / 2.0)
+    (crate::views::tab_bar::LEAD_X, (crate::views::tab_bar::TAB_BAR_H - 32.0) / 2.0)
 }
 
 #[gpui::test]
@@ -1143,11 +1146,10 @@ fn the_toggle_slides_the_sidebar_out_at_its_full_width_and_back(cx: &mut TestApp
     let full = c.width("leading-column");
     let content = c.width("sidebar");
     assert!(!held(&mut c));
-    let at = c.bounds("tab-bar-sidebar").expect("the tab bar's toggle").origin;
-    assert_eq!((at.x.as_f32(), at.y.as_f32()), toggle_origin());
+    assert!(!c.drawn("tab-bar-sidebar"), "no toggle in the tab bar while the sidebar shows");
 
-    // Hide: the first frame is already a step out.
-    c.h.click_selector("tab-bar-sidebar");
+    // Hide, from the sidebar's header: the first frame is already a step out.
+    c.h.click_selector("sidebar-toggle");
     c.advance(Duration::ZERO);
     let first = c.width("leading-column");
     assert!(first < full && first > 0.0, "a step in: {first}");
@@ -1162,18 +1164,27 @@ fn the_toggle_slides_the_sidebar_out_at_its_full_width_and_back(cx: &mut TestApp
     assert_eq!(c.width("sidebar"), content, "clipped, never laid out narrower");
     assert!(close_px(c.left("sidebar") + content, col), "its right edge on the column's");
     assert!(held(&mut c), "the terminals hold their resizes");
-    // The toggle stays put in the tab bar.
+    // The tab bar's toggle comes in with it, where it rests, its room
+    // opening as the sidebar leaves.
     let at = c.bounds("tab-bar-sidebar").expect("drawn while the sidebar leaves").origin;
     assert_eq!((at.x.as_f32(), at.y.as_f32()), toggle_origin());
+    let tab = c.left("tab-alpha");
+    assert!(tab > crate::views::tab_bar::LEAD_X, "the tabs step right: {tab}");
 
-    // Settled: no column, the button where it rests, the hold released.
+    // Settled: no column, the button where it rests, the tabs past its room,
+    // the hold released.
     c.advance(REVEAL);
     assert!(!c.drawn("leading-column") && !c.drawn("sidebar"));
     let at = c.bounds("tab-bar-sidebar").expect("the toggle stays reachable").origin;
     assert_eq!((at.x.as_f32(), at.y.as_f32()), toggle_origin());
+    assert_eq!(
+        c.left("tab-alpha"),
+        crate::views::tab_bar::LEAD_X + crate::views::tab_bar::TOGGLE_ROOM + 1.0,
+        "the toggle's room, then the first tab's rule"
+    );
     assert!(!held(&mut c));
 
-    // Show: it slides back in from the left.
+    // Show, from the tab bar: it slides back in from the left.
     c.h.click_selector("tab-bar-sidebar");
     c.advance(Duration::from_millis(30));
     let col = c.width("leading-column");
@@ -1186,6 +1197,8 @@ fn the_toggle_slides_the_sidebar_out_at_its_full_width_and_back(cx: &mut TestApp
     assert_eq!(c.width("leading-column"), full);
     assert_eq!(c.left("sidebar"), 0.0);
     assert!(!held(&mut c));
+    assert!(!c.drawn("tab-bar-sidebar"), "the tab bar's toggle leaves with the sidebar's return");
+    assert_eq!(c.left("tab-alpha"), crate::views::tab_bar::LEAD_X + 1.0);
 }
 
 #[gpui::test]
@@ -1215,7 +1228,7 @@ fn a_second_toggle_mid_way_turns_the_sidebar_around(cx: &mut TestAppContext) {
 fn reduce_motion_toggles_the_sidebar_at_once(cx: &mut TestAppContext) {
     let mut c = Column::open(cx);
     c.reduce_motion.set(true);
-    c.h.click_selector("tab-bar-sidebar");
+    c.h.click_selector("sidebar-toggle");
     c.advance(Duration::ZERO);
     assert!(!c.drawn("leading-column") && c.drawn("tab-bar-sidebar"));
     assert!(!held(&mut c), "nothing moves, nothing is held");
@@ -1223,7 +1236,7 @@ fn reduce_motion_toggles_the_sidebar_at_once(cx: &mut TestAppContext) {
     c.advance(Duration::ZERO);
     assert_eq!(c.width("sidebar"), c.width("leading-column"));
     assert_eq!(c.left("sidebar"), 0.0);
-    assert!(c.drawn("tab-bar-sidebar"), "the tab bar keeps the toggle");
+    assert!(!c.drawn("tab-bar-sidebar") && c.drawn("sidebar-toggle"), "the toggle is back in the header");
 }
 
 #[gpui::test]
@@ -1255,8 +1268,9 @@ fn showing_the_sidebar_over_a_collapsed_panel_column_widens_it(cx: &mut TestAppC
     let mid = c.width("leading-column");
     assert!(mid > sidebar_px(DEFAULT_SIDEBAR_WIDTH) && mid < sidebar_px(40), "{mid}");
     assert!(c.drawn("column-review") && !c.drawn("column-sidebar"));
-    assert!(c.drawn("tab-bar-sidebar"), "the tab bar keeps the toggle");
+    assert!(c.drawn("review-toggle"), "the panel's header has the toggle");
     c.advance(REVEAL);
+    assert!(!c.drawn("tab-bar-sidebar"), "shown: the tab bar's toggle is gone");
     assert_eq!(c.width("leading-column"), sidebar_px(40));
     assert_eq!(c.width("review-panel"), sidebar_px(40));
 

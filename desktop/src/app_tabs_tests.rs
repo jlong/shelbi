@@ -69,34 +69,44 @@ fn the_tab_bar_spans_the_window_over_the_sidebar(cx: &mut TestAppContext) {
     assert_eq!(bar.origin, point(px(0.0), px(0.0)));
     assert_eq!(bar.size, size(viewport.width, px(52.0)), "full width, 52pt");
 
-    // The toolbar beside the traffic lights, centered on them: two 32pt
-    // buttons 4pt apart.
-    let search = bounds(&mut h, "tab-bar-search");
-    let toggle = bounds(&mut h, "tab-bar-sidebar");
-    assert_eq!(search.origin, point(px(tab_bar::TOOLBAR_X), px(10.0)));
-    assert_eq!(search.size, size(px(32.0), px(32.0)));
-    assert_eq!(toggle.size, search.size);
-    assert_eq!(toggle.left(), search.right() + px(4.0));
-    assert_eq!(toggle.top(), search.top());
-
-    // The tabs start 8pt past the toolbar's own 8pt end, after a 1pt rule,
-    // run the bar's height, and sit a rule apart; then the 52pt `+`.
+    // No toolbar: the tabs start 17pt past the traffic lights, at the first
+    // tab's 1pt rule, and run the bar's height.
+    assert!(!drawn(&mut h, "tab-bar-sidebar"), "no toggle while the sidebar shows");
     let alpha = bounds(&mut h, "tab-alpha");
+    assert_eq!(alpha.left(), px(tab_bar::LEAD_X + 1.0));
+    assert_eq!((alpha.top(), alpha.size.height), (px(0.0), px(52.0)));
+
+    // The search box (2829:26790): 170 × 32, 10pt from the right edge,
+    // centered in the bar; the magnifier 6pt in, "Search" 6pt past it, the
+    // palette's chord at the right end, 8pt in.
+    let search = bounds(&mut h, "tab-bar-search");
+    assert_eq!(search.size, size(px(170.0), px(32.0)));
+    assert_eq!(search.right(), viewport.width - px(10.0));
+    assert_eq!(search.top(), px(10.0));
+    let label = bounds(&mut h, "tab-bar-search-label");
+    assert_eq!(label.left(), search.left() + px(6.0 + 20.0 + 6.0));
+    let chord = bounds(&mut h, "tab-bar-search-chord");
+    assert_eq!(chord.right(), search.right() - px(8.0));
+    assert_eq!(chord.size.height, px(16.0));
+    let shown = h.window.read_with(&h.cx, |w, _| w.palette_chord.clone());
+    assert_eq!(shown, "⌘K", "the Mac palette chord, not the TUI's ⌃P");
+
     let beta = bounds(&mut h, "tab-beta");
     let plus = bounds(&mut h, "tab-plus");
-    assert_eq!(alpha.left(), toggle.right() + px(8.0 + 8.0 + 1.0));
-    assert_eq!((alpha.top(), alpha.size.height), (px(0.0), px(52.0)));
     assert_eq!(beta.left(), alpha.right() + px(1.0));
     assert_eq!(plus.left(), beta.right() + px(1.0));
     assert_eq!(plus.size, size(px(52.0), px(52.0)));
 
-    // The sidebar starts under the bar, the nav its first row: no titlebar
-    // row, no project switcher.
+    // The sidebar starts under the bar with its 58pt header row ("Project",
+    // Search, Toggle sidebar), then the nav 8pt down: no project switcher.
     let sidebar = bounds(&mut h, "sidebar");
     assert_eq!(sidebar.top(), px(52.0));
+    let header = bounds(&mut h, "sidebar-header");
+    assert_eq!((header.top(), header.size.height), (sidebar.top(), px(58.0)));
+    assert!(drawn(&mut h, "sidebar-search") && drawn(&mut h, "sidebar-toggle"));
     let orchestrator = bounds(&mut h, "sidebar-nav-Orchestrator");
-    assert_eq!(orchestrator.top(), sidebar.top() + px(20.0), "the frame's 20pt over the nav");
-    for gone in ["sidebar-project-title", "sidebar-search", "sidebar-collapse"] {
+    assert_eq!(orchestrator.top(), sidebar.top() + px(58.0 + 8.0), "the frame's nav at y 58, 8pt in");
+    for gone in ["sidebar-project-title", "sidebar-collapse"] {
         assert!(h.cx.debug_bounds(gone).is_none(), "{gone} is gone");
     }
 }
@@ -106,14 +116,21 @@ fn hiding_the_sidebar_keeps_the_tab_bar_in_place(cx: &mut TestAppContext) {
     let mut h = open(cx, &["alpha", "beta"], &[]);
     let bar = bounds(&mut h, "tab-bar");
     let alpha = bounds(&mut h, "tab-alpha");
-    h.click_selector("tab-bar-sidebar");
+    let search = bounds(&mut h, "tab-bar-search");
+    h.click_selector("sidebar-toggle");
     assert!(h.window.read_with(&h.cx, |w, _| w.collapsed));
     assert!(!drawn(&mut h, "sidebar"));
     assert_eq!(bounds(&mut h, "tab-bar"), bar);
-    assert_eq!(bounds(&mut h, "tab-alpha"), alpha, "the tabs don't move");
+    assert_eq!(bounds(&mut h, "tab-bar-search"), search, "the search box stays put");
+    // The tabs step right to make room for the tab bar's toggle.
+    let toggle = bounds(&mut h, "tab-bar-sidebar");
+    assert_eq!(toggle.origin, point(px(tab_bar::LEAD_X), px(10.0)));
+    assert_eq!(toggle.size, size(px(32.0), px(32.0)));
+    assert_eq!(bounds(&mut h, "tab-alpha").left(), toggle.right() + px(16.0 + 1.0));
     h.click_selector("tab-bar-sidebar");
     assert!(drawn(&mut h, "sidebar"));
     assert_eq!(bounds(&mut h, "tab-bar"), bar);
+    assert_eq!(bounds(&mut h, "tab-alpha"), alpha, "the tabs are back");
 }
 
 #[gpui::test]
