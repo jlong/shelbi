@@ -38,6 +38,9 @@ pub trait CommandHost {
     fn detach_other_clients(&mut self);
     /// Confirm, then quit this window's project (its agents stop).
     fn quit_project(&mut self);
+    /// Confirm once, then quit every other project this window has a tab
+    /// for, keeping its own.
+    fn close_other_projects(&mut self);
     /// Confirm, then quit Shelbi (every agent stops, the daemon exits).
     fn quit_shelbi(&mut self);
     /// Toggle Zen Mode (through the first-run intro on a first off-to-on).
@@ -133,6 +136,9 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         CommandKind::Detach => host.detach(),
         CommandKind::DetachOtherClients => host.detach_other_clients(),
         CommandKind::QuitProject => host.quit_project(),
+        // File ▸ Close All Other Projects…, the palette's, a tab's context
+        // menu (with that tab's project kept).
+        CommandKind::CloseOtherProjects => host.close_other_projects(),
         // Not the app's Cmd+Q: that only closes this client. This is the
         // registry's "stop every agent and shut Shelbi down".
         CommandKind::QuitShelbi => host.quit_shelbi(),
@@ -208,6 +214,7 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::AddProject => true,
         CommandKind::DetachOtherClients => true,
         CommandKind::QuitProject => true,
+        CommandKind::CloseOtherProjects => true,
         CommandKind::QuitShelbi => true,
         CommandKind::MoveIssue { .. } => true,
         CommandKind::StartIssue { .. } => true,
@@ -284,6 +291,9 @@ mod tests {
         }
         fn quit_project(&mut self) {
             self.0.push("quit-project".into());
+        }
+        fn close_other_projects(&mut self) {
+            self.0.push("close-other-projects".into());
         }
         fn quit_shelbi(&mut self) {
             self.0.push("quit-shelbi".into());
@@ -398,6 +408,7 @@ mod tests {
             (CommandKind::Detach, "detach"),
             (CommandKind::DetachOtherClients, "detach-others"),
             (CommandKind::QuitProject, "quit-project"),
+            (CommandKind::CloseOtherProjects, "close-other-projects"),
             (CommandKind::QuitShelbi, "quit-shelbi"),
             (
                 CommandKind::OpenEditor {

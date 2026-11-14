@@ -753,6 +753,9 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
         if state.poll_feedback_job() {
             state.dirty = true;
         }
+        if state.poll_close_others_job() {
+            state.dirty = true;
+        }
         if state.poll_new_task_job() {
             state.dirty = true;
         }
@@ -1021,6 +1024,9 @@ enum WorkspaceJobMsg {
     ContentReady(shelbi_app::ReviewRole, Result<(), String>),
 }
 
+/// One project Close All Other Projects quit, and how that went.
+type ProjectClosed = (String, Result<(), String>);
+
 /// The three ways to leave the TUI (plan, "Quit semantics"):
 ///
 /// - [`QuitAction::CloseUi`] — the default for `q`. Agents keep running; the
@@ -1045,6 +1051,10 @@ enum QuitAction {
 trait ShellLifecycle: Send + Sync {
     fn quit_project(&self, project: &str);
     fn quit_shelbi(&self);
+    /// Quit `project` while this client keeps running (Close All Other
+    /// Projects): the daemon's Quit Project, quietly. Blocking; the shell
+    /// calls it off the UI thread.
+    fn close_project(&self, project: &str) -> Result<(), String>;
 }
 
 /// The production [`ShellLifecycle`]: connect to the daemon's control socket and
@@ -1071,6 +1081,12 @@ impl ShellLifecycle for DaemonLifecycle {
     }
     fn quit_shelbi(&self) {
         Self::quit(crate::quit_progress::QuitTarget::Shelbi);
+    }
+    fn close_project(&self, project: &str) -> Result<(), String> {
+        connect_control()
+            .ok_or_else(|| "the hub daemon isn't running".to_string())?
+            .quit_project(project)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -1152,6 +1168,9 @@ impl Bootstrap for DaemonBootstrap {
 trait PaletteInputs: Send + Sync {
     /// The registered projects other than `project`, as switch targets.
     fn other_projects(&self, project: &str) -> Vec<shelbi_app::command::ProjectItem>;
+    /// The open projects other than `project`: what Close All Other
+    /// Projects closes.
+    fn open_others(&self, project: &str) -> Vec<shelbi_app::command::ProjectItem>;
     /// The `edit:*` targets that exist on disk for `project`.
     fn edit_targets(&self, project: &str) -> Vec<shelbi_app::command::EditItem>;
     /// The palette's Projects column, `current` leading.
@@ -1170,6 +1189,21 @@ impl PaletteInputs for DiskPaletteInputs {
             .map(|p| shelbi_app::command::ProjectItem {
                 label: p.display_label().to_string(),
                 slug: p.name,
+            })
+            .collect()
+    }
+    fn open_others(&self, project: &str) -> Vec<shelbi_app::command::ProjectItem> {
+        let open = shelbi_state::list_open_projects().unwrap_or_default();
+        let labels: HashMap<String, String> = shelbi_state::list_projects()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| (p.name.clone(), p.display_label().to_string()))
+            .collect();
+        open.into_iter()
+            .filter(|p| p != project)
+            .map(|slug| shelbi_app::command::ProjectItem {
+                label: labels.get(&slug).cloned().unwrap_or_else(|| slug.clone()),
+                slug,
             })
             .collect()
     }
@@ -1638,6 +1672,9 @@ struct ShellState {
     feedback_service: shelbi_app::feedback::FeedbackService,
     /// The Contact Us send that's out, off the UI thread.
     feedback_job: Option<Receiver<Result<(), shelbi_app::feedback::FeedbackError>>>,
+    /// Close All Other Projects' quits, run off the UI thread: each project
+    /// and how its quit went.
+    close_others_job: Option<Receiver<Vec<ProjectClosed>>>,
     /// New task's create that's out, off the UI thread.
     new_task_job: Option<Receiver<Result<shelbi_app::new_task::Created, String>>>,
     /// Runs New task's create (the daemon's add, then the orchestrator
@@ -1909,6 +1946,7 @@ impl ShellState {
             create_job: None,
             feedback_service,
             feedback_job: None,
+            close_others_job: None,
             new_task_job: None,
             new_task_runner: Arc::new(|project: &str, request: &shelbi_app::new_task::CreateRequest| {
                 shelbi_app::new_task::create_live(project, request)
@@ -2099,13 +2137,14 @@ impl ShellState {
             return Vec::new();
         };
         let other_clients_attached = self.other_clients.load(Ordering::SeqCst) > 0;
-        let model = shelbi_app::command_model::command_model_from(
+        let mut model = shelbi_app::command_model::command_model_from(
             project,
             sidebar,
             other_clients_attached,
             self.palette_inputs.other_projects(project),
             self.palette_inputs.edit_targets(project),
         );
+        model.open_others = self.palette_inputs.open_others(project);
         CommandRegistry::new().entries(&with_launch(model, self.remote.is_some()))
     }
 
@@ -4018,7 +4057,93 @@ impl ShellState {
             }
             OverlayEvent::Launch(step) => self.apply_launch_step(step),
             OverlayEvent::RemoteConnected(session) => self.remote_connected(&session),
+            OverlayEvent::CloseOthersConfirmed(closing) => {
+                self.overlay = None;
+                self.client.focus_main();
+                self.close_projects(closing);
+            }
         }
+    }
+
+    /// Close All Other Projects: ask once for every open project but `keep`
+    /// (read now, so the dialog names what will close). With none open,
+    /// the status line says so.
+    fn ask_close_others(&mut self, keep: &str) {
+        let closing: Vec<(String, String)> = self
+            .palette_inputs
+            .open_others(keep)
+            .into_iter()
+            .map(|p| (p.slug, p.label))
+            .collect();
+        if closing.is_empty() {
+            self.status = Some("No other project is open.".to_string());
+            return;
+        }
+        let label = self
+            .sidebar_model
+            .as_ref()
+            .map(|m| m.project_label.clone())
+            .filter(|l| !l.is_empty())
+            .unwrap_or_else(|| keep.to_string());
+        self.overlay = Some(ActiveOverlay::close_others(&label, closing));
+    }
+
+    /// Quit each of `projects` through the daemon, off the UI thread, one
+    /// after another; [`Self::poll_close_others_job`] reports the outcome on
+    /// the status line. This client and its project keep running.
+    fn close_projects(&mut self, projects: Vec<String>) {
+        let n = projects.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let lifecycle = self.lifecycle.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-close-others".into())
+            .spawn(move || {
+                let results = projects
+                    .into_iter()
+                    .map(|p| {
+                        let result = lifecycle.close_project(&p);
+                        (p, result)
+                    })
+                    .collect();
+                let _ = tx.send(results);
+            });
+        match spawned {
+            Ok(_) => {
+                self.close_others_job = Some(rx);
+                self.status = Some(format!(
+                    "Closing {n} other project{}…",
+                    if n == 1 { "" } else { "s" }
+                ));
+            }
+            Err(e) => self.status = Some(format!("Couldn't close the other projects: {e}")),
+        }
+        self.dirty = true;
+    }
+
+    /// The other projects' quits came back: say how it went. Returns `true`
+    /// when they did (so the caller redraws).
+    fn poll_close_others_job(&mut self) -> bool {
+        let results = match &self.close_others_job {
+            Some(rx) => match rx.try_recv() {
+                Ok(results) => results,
+                Err(TryRecvError::Empty) => return false,
+                Err(TryRecvError::Disconnected) => Vec::new(),
+            },
+            None => return false,
+        };
+        self.close_others_job = None;
+        let failed: Vec<String> = results
+            .iter()
+            .filter_map(|(p, r)| r.as_ref().err().map(|e| format!("{p}: {e}")))
+            .collect();
+        let closed = results.len() - failed.len();
+        self.status = Some(if failed.is_empty() {
+            format!("Closed {closed} other project{}.", if closed == 1 { "" } else { "s" })
+        } else {
+            format!("Couldn't close {}", failed.join("; "))
+        });
+        self.dirty = true;
+        true
     }
 
     /// Open `url` in the system browser with the platform opener (`open`,
@@ -4449,6 +4574,7 @@ impl ShellState {
             Effect::Detach => self.quit(QuitAction::CloseUi),
             Effect::DetachOtherClients => self.detach_other_clients(),
             Effect::QuitProject { .. } => self.quit(QuitAction::QuitProject),
+            Effect::CloseOtherProjects { keep } => self.ask_close_others(&keep),
             Effect::QuitShelbi => self.quit(QuitAction::QuitShelbi),
             Effect::Mutate(Mutation::ToggleZen { project }) => self.toggle_zen(project),
             // The palette's review decisions, the panel's own path. Reject asks
@@ -9648,6 +9774,10 @@ mod tests {
         fn quit_shelbi(&self) {
             self.calls.lock().unwrap().push("quit_shelbi".into());
         }
+        fn close_project(&self, project: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("close_project:{project}"));
+            Ok(())
+        }
     }
 
     fn test_state_with(lifecycle: Arc<RecordingLifecycle>) -> ShellState {
@@ -10442,12 +10572,98 @@ mod tests {
         );
     }
 
+    #[test]
+    fn close_other_projects_asks_once_then_closes_every_other_open_project() {
+        struct TwoOpen;
+        impl PaletteInputs for TwoOpen {
+            fn other_projects(&self, _: &str) -> Vec<shelbi_app::command::ProjectItem> {
+                Vec::new()
+            }
+            fn open_others(&self, _: &str) -> Vec<shelbi_app::command::ProjectItem> {
+                ["beta", "gamma"]
+                    .map(|p| shelbi_app::command::ProjectItem {
+                        slug: p.into(),
+                        label: p.to_uppercase(),
+                    })
+                    .into()
+            }
+            fn edit_targets(&self, _: &str) -> Vec<shelbi_app::command::EditItem> {
+                Vec::new()
+            }
+            fn projects_column(&self, _: &str) -> Vec<shelbi_app::overlay::palette::ProjectEntry> {
+                Vec::new()
+            }
+        }
+        let life = Arc::new(RecordingLifecycle::default());
+        let mut st = test_state_with(life.clone());
+        st.palette_inputs = Arc::new(TwoOpen);
+        st.dispatch_effect(Effect::CloseOtherProjects { keep: "proj".into() });
+        let Some(ActiveOverlay::CloseOthers { closing, dialog }) = &st.overlay else {
+            panic!("one confirmation opens");
+        };
+        assert_eq!(closing, &["beta", "gamma"]);
+        assert_eq!(dialog.copy().title, "Close 2 other projects?");
+        assert!(dialog.copy().detail.contains("BETA and GAMMA"), "{}", dialog.copy().detail);
+        // Esc cancels: nothing closes.
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(st.overlay.is_none());
+        assert!(life.calls.lock().unwrap().is_empty());
+        // Confirmed: both close, the client keeps running on its project.
+        st.dispatch_effect(Effect::CloseOtherProjects { keep: "proj".into() });
+        st.handle_event(Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(st.overlay.is_none());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !st.poll_close_others_job() {
+            assert!(Instant::now() < deadline, "the quits come back");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            *life.calls.lock().unwrap(),
+            ["close_project:beta", "close_project:gamma"],
+        );
+        assert!(!st.should_quit, "this client stays");
+        assert_eq!(st.client.project(), Some("proj"));
+        assert_eq!(st.status.as_deref(), Some("Closed 2 other projects."));
+    }
+
+    #[test]
+    fn close_other_projects_with_none_open_only_says_so() {
+        let life = Arc::new(RecordingLifecycle::default());
+        let mut st = test_state_with(life.clone());
+        struct NoneOpen;
+        impl PaletteInputs for NoneOpen {
+            fn other_projects(&self, _: &str) -> Vec<shelbi_app::command::ProjectItem> {
+                Vec::new()
+            }
+            fn open_others(&self, _: &str) -> Vec<shelbi_app::command::ProjectItem> {
+                Vec::new()
+            }
+            fn edit_targets(&self, _: &str) -> Vec<shelbi_app::command::EditItem> {
+                Vec::new()
+            }
+            fn projects_column(&self, _: &str) -> Vec<shelbi_app::overlay::palette::ProjectEntry> {
+                Vec::new()
+            }
+        }
+        st.palette_inputs = Arc::new(NoneOpen);
+        st.dispatch_effect(Effect::CloseOtherProjects { keep: "proj".into() });
+        assert!(st.overlay.is_none());
+        assert_eq!(st.status.as_deref(), Some("No other project is open."));
+        assert!(life.calls.lock().unwrap().is_empty());
+    }
+
     /// Fixed palette inputs for the smoke test: one other project and every
     /// edit target, read from nowhere.
     struct FixturePaletteInputs;
 
     impl PaletteInputs for FixturePaletteInputs {
         fn other_projects(&self, _project: &str) -> Vec<shelbi_app::command::ProjectItem> {
+            vec![shelbi_app::command::ProjectItem {
+                slug: "beta".into(),
+                label: "Beta".into(),
+            }]
+        }
+        fn open_others(&self, _project: &str) -> Vec<shelbi_app::command::ProjectItem> {
             vec![shelbi_app::command::ProjectItem {
                 slug: "beta".into(),
                 label: "Beta".into(),
@@ -10630,16 +10846,15 @@ mod tests {
     #[test]
     fn every_registry_command_runs_from_the_palette() {
         let mut st = smoke_state();
-        let model = with_launch(
-            shelbi_app::command_model::command_model_from(
-                "proj",
-                st.sidebar_model.as_ref().unwrap(),
-                true,
-                FixturePaletteInputs.other_projects("proj"),
-                FixturePaletteInputs.edit_targets("proj"),
-            ),
+        let mut model = shelbi_app::command_model::command_model_from(
+            "proj",
+            st.sidebar_model.as_ref().unwrap(),
             true,
+            FixturePaletteInputs.other_projects("proj"),
+            FixturePaletteInputs.edit_targets("proj"),
         );
+        model.open_others = FixturePaletteInputs.open_others("proj");
+        let model = with_launch(model, true);
         let commands = CommandRegistry::new().commands(&model);
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(160, 48)).unwrap();
         let mut ran = Vec::new();
@@ -10719,6 +10934,7 @@ mod tests {
             "action:detach",
             "action:detach-others",
             "action:quit-project",
+            "action:close-other-projects",
             "action:quit-shelbi",
         ] {
             assert!(ran.iter().any(|r| r == id), "{id} was walked");

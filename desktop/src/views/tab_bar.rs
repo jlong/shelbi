@@ -19,12 +19,21 @@
 //! (the shared [`project_menu`] list, gray rings), a rule, then
 //! "Add project". With every project open, only "Add project".
 //!
+//! Right-clicking a project's tab (never the `+`) opens its context menu at
+//! the pointer ([`TabMenu`]): "Close Project", closing that tab's project as
+//! its `×` does, and "Close All Other Projects", closing every other tab's
+//! after one confirmation (dimmed while it's the only tab). It closes on a
+//! press outside it or Esc.
+//!
 //! The bar stays where it is while the sidebar hides and shows; only the
 //! tabs step right to make room for the toggle.
 
 use std::time::Instant;
 
-use gpui::{deferred, div, prelude::*, px, AnyElement, Context, Div, Hsla, SharedString, Stateful};
+use gpui::{
+    deferred, div, prelude::*, px, AnyElement, Bounds, Context, Div, Hsla, MouseButton, MouseDownEvent,
+    SharedString, Size, Stateful,
+};
 use shelbi_app::overlay::palette::ProjectEntry;
 
 use super::project_menu;
@@ -62,6 +71,8 @@ const TAB_MAX_W: f32 = 240.0;
 /// The project menu's width and its gap under the `+` tab.
 const MENU_W: f32 = 240.0;
 const MENU_GAP: f32 = 4.0;
+/// A tab's context menu's gap under the pointer.
+const CONTEXT_GAP: f32 = 2.0;
 
 /// One tab, as a frame draws it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +108,142 @@ pub struct TabBarProps<'a> {
     /// ([`super::sidebar_reveal`]): the Toggle sidebar button shows as far as
     /// the sidebar is hidden.
     pub reveal: f32,
+    /// A tab's context menu while it shows (opening, open or closing).
+    pub tab_menu: Option<TabMenuProps<'a>>,
+    /// Where the pointer was when a tab was last right-clicked: the context
+    /// menu's anchor, which the right-click sets.
+    pub tab_menu_anchor: &'a Anchor,
+}
+
+/// A tab's context menu, as one frame draws it.
+pub struct TabMenuProps<'a> {
+    /// The project whose tab was right-clicked.
+    pub project: &'a str,
+    /// Another tab is open: "Close All Other Projects" can run.
+    pub can_close_others: bool,
+    /// The keyboard's row ([`TabMenuRow`]), if the keys have moved onto one.
+    pub highlight: Option<TabMenuRow>,
+    /// How shown the menu is: 0 (hidden) to 1, eased.
+    pub phase: f32,
+    /// Open, not fading out: only an open menu takes the window's presses.
+    pub open: bool,
+}
+
+/// A row of a tab's context menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabMenuRow {
+    CloseProject,
+    CloseOthers,
+}
+
+impl TabMenuRow {
+    pub const ALL: [TabMenuRow; 2] = [TabMenuRow::CloseProject, TabMenuRow::CloseOthers];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TabMenuRow::CloseProject => "Close Project",
+            TabMenuRow::CloseOthers => "Close All Other Projects",
+        }
+    }
+
+    fn selector(self) -> &'static str {
+        match self {
+            TabMenuRow::CloseProject => "tab-context-close",
+            TabMenuRow::CloseOthers => "tab-context-close-others",
+        }
+    }
+}
+
+/// A tab's context menu's state, owned by the window: which tab it was
+/// opened on (kept while it fades out), open or closed and when that last
+/// changed, and the keyboard's row.
+#[derive(Debug, Default)]
+pub struct TabMenu {
+    project: Option<String>,
+    open: bool,
+    changed: Option<Instant>,
+    highlight: Option<TabMenuRow>,
+    /// The pointer where the tab was right-clicked (the menu's anchor).
+    pub anchor: Anchor,
+}
+
+impl TabMenu {
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// The tab it was opened on, while it shows or fades.
+    pub fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+
+    pub fn highlight(&self) -> Option<TabMenuRow> {
+        self.highlight
+    }
+
+    /// Open on `project`'s tab, no row lit (as a right-click opens it).
+    pub fn open(&mut self, project: &str, now: Instant) {
+        if !self.open || self.project.as_deref() != Some(project) {
+            self.changed = Some(now);
+        }
+        self.project = Some(project.to_string());
+        self.open = true;
+        self.highlight = None;
+    }
+
+    pub fn close(&mut self, now: Instant) {
+        if self.open {
+            self.open = false;
+            self.changed = Some(now);
+        }
+    }
+
+    /// Move the keyboard's row by `delta` over the rows `enabled` allows,
+    /// wrapping; from none, ↓ lands on the first and ↑ on the last.
+    pub fn step(&mut self, delta: isize, enabled: impl Fn(TabMenuRow) -> bool) {
+        let rows: Vec<TabMenuRow> = TabMenuRow::ALL.into_iter().filter(|r| enabled(*r)).collect();
+        if rows.is_empty() {
+            return;
+        }
+        let n = rows.len() as isize;
+        let at = match self.highlight.and_then(|h| rows.iter().position(|r| *r == h)) {
+            Some(ix) => (ix as isize + delta).rem_euclid(n),
+            None if delta < 0 => n - 1,
+            None => 0,
+        };
+        self.highlight = Some(rows[at as usize]);
+    }
+
+    /// How shown the menu is at `now`, `None` once it has finished closing.
+    pub fn phase(&self, now: Instant, reduce_motion: bool) -> Option<f32> {
+        menu_phase(self.open, self.changed, now, reduce_motion)
+    }
+
+    pub fn animating(&self, now: Instant, reduce_motion: bool) -> bool {
+        menu_animating(self.changed, now, reduce_motion)
+    }
+}
+
+/// A menu's slide-and-fade at `now` (0..=1 on Taskpage's curve), `None`
+/// once a closed one has finished fading. Instant under `reduce_motion`.
+fn menu_phase(open: bool, changed: Option<Instant>, now: Instant, reduce_motion: bool) -> Option<f32> {
+    let t = match changed {
+        Some(at) if !reduce_motion => now.saturating_duration_since(at).as_secs_f32() / motion::MENU_IN.as_secs_f32(),
+        _ => 1.0,
+    };
+    let eased = motion::ease_out_expo(t.min(1.0));
+    if open {
+        Some(eased)
+    } else if t < 1.0 {
+        Some(1.0 - eased)
+    } else {
+        None
+    }
+}
+
+/// Whether a menu that last changed at `changed` is mid-transition at `now`.
+fn menu_animating(changed: Option<Instant>, now: Instant, reduce_motion: bool) -> bool {
+    !reduce_motion && changed.is_some_and(|at| now.saturating_duration_since(at) < motion::MENU_IN)
 }
 
 /// The project menu, as one frame draws it.
@@ -161,29 +308,13 @@ impl ProjectMenu {
     /// How shown the menu is at `now` (0..=1 on Taskpage's curve), `None`
     /// once it has finished closing. Instant under `reduce_motion`.
     pub fn phase(&self, now: Instant, reduce_motion: bool) -> Option<f32> {
-        let t = match self.changed {
-            Some(at) if !reduce_motion => {
-                now.saturating_duration_since(at).as_secs_f32() / motion::MENU_IN.as_secs_f32()
-            }
-            _ => 1.0,
-        };
-        let eased = motion::ease_out_expo(t.min(1.0));
-        if self.open {
-            Some(eased)
-        } else if t < 1.0 {
-            Some(1.0 - eased)
-        } else {
-            None
-        }
+        menu_phase(self.open, self.changed, now, reduce_motion)
     }
 
     /// Whether the menu is mid-transition at `now` (the window keeps
     /// drawing frames).
     pub fn animating(&self, now: Instant, reduce_motion: bool) -> bool {
-        !reduce_motion
-            && self
-                .changed
-                .is_some_and(|at| now.saturating_duration_since(at) < motion::MENU_IN)
+        menu_animating(self.changed, now, reduce_motion)
     }
 }
 
@@ -225,7 +356,7 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
     for (ix, tab) in props.tabs.iter().enumerate() {
         let hovered = props.hovered == Some(tab.name.as_str());
         let hotkey = (props.command_held && ix < 9).then(|| tab_hotkey(ix as u8 + 1));
-        strip.push(render_tab(tab, hovered, hotkey, theme, cx).into_any_element());
+        strip.push(render_tab(tab, hovered, hotkey, props.tab_menu_anchor, theme, cx).into_any_element());
         strip.push(rule(theme).into_any_element());
     }
     strip.push(plus_tab(props.plus, props.menu_open, theme, cx).into_any_element());
@@ -235,6 +366,10 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
         .menu
         .as_ref()
         .map(|menu| render_menu_layer(menu, props.plus, theme, cx));
+    let tab_menu = props
+        .tab_menu
+        .as_ref()
+        .map(|menu| render_tab_menu_layer(menu, props.tab_menu_anchor, theme, cx));
 
     div()
         .id("tab-bar")
@@ -264,6 +399,7 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
                 .children(strip),
         )
         .children(menu)
+        .children(tab_menu)
         .into_any_element()
 }
 
@@ -273,12 +409,15 @@ fn render_tab<H: SidebarHost>(
     tab: &Tab,
     hovered: bool,
     hotkey: Option<String>,
+    menu_anchor: &Anchor,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> Stateful<Div> {
     let selector = format!("tab-{}", tab.name);
     let name = tab.name.clone();
     let hover_name = tab.name.clone();
+    let menu_name = tab.name.clone();
+    let menu_anchor = menu_anchor.clone();
     let lead = if hovered {
         let close_selector = format!("tab-close-{}", tab.name);
         let close = tab.name.clone();
@@ -346,6 +485,77 @@ fn render_tab<H: SidebarHost>(
         .on_click(cx.listener(move |this, _, window, cx| {
             this.sidebar_event(SidebarEvent::SwitchTo(name.clone()), window, cx)
         }))
+        // Its context menu, at the pointer.
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                menu_anchor.set(Some(Bounds::new(ev.position, Size::default())));
+                this.sidebar_event(SidebarEvent::OpenTabMenu(menu_name.clone()), window, cx)
+            }),
+        )
+}
+
+/// A tab's context menu at the pointer, drawn over everything as the
+/// project menu is; while open, a press outside it closes it and goes no
+/// further.
+fn render_tab_menu_layer<H: SidebarHost>(
+    menu: &TabMenuProps<'_>,
+    anchor: &Anchor,
+    theme: &Theme,
+    cx: &mut Context<H>,
+) -> impl IntoElement {
+    let body = div()
+        .relative()
+        .top(px((1.0 - menu.phase) * motion::SLIDE_PX))
+        .opacity(menu.phase)
+        .flex()
+        .flex_col()
+        .min_h_0()
+        .w(px(MENU_W))
+        .child(render_tab_menu(menu, theme, cx));
+    let placed = placed(anchor, body).gap(CONTEXT_GAP);
+    let placed = if menu.open {
+        placed.on_dismiss(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+            this.sidebar_event(SidebarEvent::CloseTabMenu, window, cx)
+        }))
+    } else {
+        placed
+    };
+    deferred(placed).with_priority(1)
+}
+
+/// The context menu's rows: Close Project, then Close All Other Projects
+/// (dimmed while there is no other tab), on the project menu's fill.
+fn render_tab_menu<H: SidebarHost>(menu: &TabMenuProps<'_>, theme: &Theme, cx: &mut Context<H>) -> impl IntoElement {
+    let rows = TabMenuRow::ALL.into_iter().map(|row| {
+        let id = SharedString::from(row.selector());
+        if row == TabMenuRow::CloseOthers && !menu.can_close_others {
+            return project_menu::disabled_text_row(id.clone(), id, row.label(), theme).into_any_element();
+        }
+        let project = menu.project.to_string();
+        project_menu::text_row(id.clone(), id, row.label(), menu.highlight == Some(row), theme)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                let event = match row {
+                    TabMenuRow::CloseProject => SidebarEvent::CloseTab(project.clone()),
+                    TabMenuRow::CloseOthers => SidebarEvent::CloseOtherTabs(project.clone()),
+                };
+                this.sidebar_event(event, window, cx)
+            }))
+            .into_any_element()
+    });
+    div()
+        .id("tab-context-menu")
+        .debug_selector(|| "tab-context-menu".into())
+        .flex()
+        .flex_col()
+        .px_1()
+        .py_1()
+        .rounded(px(NAV_RADIUS))
+        .bg(theme.raised.blend(theme.search))
+        .text_color(theme.foreground)
+        .occlude()
+        .children(rows)
 }
 
 /// The `+` tab: 52pt square, Heroicons `plus`, opening the project menu;
@@ -489,6 +699,30 @@ mod tests {
         assert!((r - 55.0).abs() < 3.0 && (g - 62.0).abs() < 3.0 && (b - 83.0).abs() < 8.0, "{r} {g} {b}");
         let light = Theme::resolve(shelbi_state::ThemePreference::Light, gpui::WindowAppearance::Light);
         assert_ne!(bar_fill(&light), light.canvas, "light gets a gray bar under a white selected tab");
+    }
+
+    #[test]
+    fn the_tab_menu_steps_over_the_rows_it_can_run() {
+        let mut m = TabMenu::default();
+        let now = Instant::now();
+        m.open("alpha", now);
+        assert!(m.is_open());
+        assert_eq!(m.project(), Some("alpha"));
+        assert_eq!(m.highlight(), None, "a right-click lights no row");
+        m.step(1, |_| true);
+        assert_eq!(m.highlight(), Some(TabMenuRow::CloseProject));
+        m.step(1, |_| true);
+        assert_eq!(m.highlight(), Some(TabMenuRow::CloseOthers));
+        m.step(1, |_| true);
+        assert_eq!(m.highlight(), Some(TabMenuRow::CloseProject), "wraps");
+        // The only tab: Close All Other Projects is skipped.
+        let only = |r: TabMenuRow| r != TabMenuRow::CloseOthers;
+        m.step(1, only);
+        assert_eq!(m.highlight(), Some(TabMenuRow::CloseProject));
+        m.close(now);
+        assert!(!m.is_open());
+        assert_eq!(m.project(), Some("alpha"), "kept while it fades");
+        assert_eq!(m.phase(now, true), None, "closed at once under Reduce Motion");
     }
 
     #[test]

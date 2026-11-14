@@ -176,6 +176,15 @@ impl Harness {
         self.cx.run_until_parked();
     }
 
+    /// Give the window a second tab (`beta`), so Close All Other Projects
+    /// is offered.
+    pub(super) fn second_tab(&mut self) {
+        self.window.update(&mut self.cx, |w, _| {
+            w.tabs = crate::project_tabs::ProjectTabs::new(vec!["alpha".into(), "beta".into()]);
+        });
+        self.draw();
+    }
+
     pub(super) fn take_calls(&self) -> Vec<HostCall> {
         std::mem::take(&mut *self.tap.borrow_mut())
     }
@@ -260,8 +269,9 @@ fn keystrokes_for(text: &str) -> String {
 #[gpui::test]
 fn every_registry_command_runs_from_the_palette(cx: &mut TestAppContext) {
     let mut h = Harness::open(cx);
+    h.second_tab();
     let commands = h.commands();
-    assert_eq!(commands.len(), 32, "the fixture offers every kind of command");
+    assert_eq!(commands.len(), 33, "the fixture offers every kind of command");
     for command in &commands {
         h.focus_window();
         h.key("ctrl-space");
@@ -291,6 +301,7 @@ fn every_registry_command_runs_from_the_palette(cx: &mut TestAppContext) {
 #[gpui::test]
 fn every_registry_command_runs_from_its_menu_item(cx: &mut TestAppContext) {
     let mut h = Harness::open(cx);
+    h.second_tab();
     let commands = h.commands();
     let tree = h.window.read_with(&h.cx, |w, _| {
         menus::tree::build(&w.command_model(), &w.keymaps, WindowFacts::default())

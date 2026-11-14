@@ -749,6 +749,7 @@ pub enum HostCall {
     Detach,
     DetachOthers,
     QuitProject,
+    CloseOtherProjects,
     QuitShelbi,
     ToggleZen,
     OpenErrorLog,
@@ -768,6 +769,31 @@ pub enum HostCall {
     OpenEditor(EditTarget),
     OpenIssue(String),
     OpenChangelogEntry(String),
+}
+
+/// How a confirmed Close Project reaches the daemon that quits it: a
+/// remote window's link (its far machine's daemon, over a control stream
+/// opened for that project), else this machine's control socket.
+#[derive(Clone)]
+struct QuitRoute {
+    link: shelbi_app::source::ProjectLink,
+    control: Option<crate::platform::control::ControlHandle>,
+}
+
+impl QuitRoute {
+    /// Quit `project`. Blocking.
+    fn quit(&self, project: &str) -> Result<(), String> {
+        if let Some(quit) = self.link.quit_far_sibling(project) {
+            return quit;
+        }
+        self.control
+            .as_ref()
+            .ok_or_else(|| "Couldn't reach the daemon.".to_string())?
+            .connect()
+            .map_err(|e| e.to_string())?
+            .quit_project(project)
+            .map_err(|e| e.to_string())
+    }
 }
 
 impl CommandHost for Vec<HostCall> {
@@ -794,6 +820,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn quit_project(&mut self) {
         self.push(HostCall::QuitProject);
+    }
+    fn close_other_projects(&mut self) {
+        self.push(HostCall::CloseOtherProjects);
     }
     fn quit_shelbi(&mut self) {
         self.push(HostCall::QuitShelbi);
@@ -1162,6 +1191,8 @@ pub struct ShelbiWindow {
     dragging: bool,
     /// The tab bar's project menu (its `+` tab's).
     switcher: tab_bar::ProjectMenu,
+    /// A tab's context menu (a right-click on it).
+    tab_menu: tab_bar::TabMenu,
     /// The project tabs, in order (saved in [`Self::window_state`]).
     tabs: ProjectTabs,
     /// The tab under the pointer: its dot is an `×`.
@@ -1716,6 +1747,7 @@ impl ShelbiWindow {
             reveal: SidebarReveal::new(!window_state.sidebar_collapsed),
             dragging: false,
             switcher: tab_bar::ProjectMenu::default(),
+            tab_menu: tab_bar::TabMenu::default(),
             tabs,
             hovered_tab: None,
             command_held: false,
@@ -1853,6 +1885,18 @@ impl ShelbiWindow {
         model.remote_connect = true;
         // A remote window lists what it can't run yet, disabled with why.
         model.remote_host = self.remote.as_ref().map(|r| r.session.host.clone());
+        // The other tabs: what Close All Other Projects closes.
+        model.open_others = shelbi_app::close_others::others(self.tabs.order(), &self.project)
+            .into_iter()
+            .map(|slug| ProjectItem {
+                label: inputs
+                    .other_projects
+                    .iter()
+                    .find(|p| p.slug == slug)
+                    .map_or_else(|| slug.to_string(), |p| p.label.clone()),
+                slug: slug.to_string(),
+            })
+            .collect();
         if self.chooser {
             // No project: only what needs none (switch, add, detach, quit
             // Shelbi).
@@ -1861,6 +1905,7 @@ impl ShelbiWindow {
             model.workspaces.clear();
             model.reviews.clear();
             model.edit_targets.clear();
+            model.open_others.clear();
             model.multi_window = false;
         }
         model
@@ -2310,6 +2355,7 @@ impl ShelbiWindow {
     /// matter: two windows may show one project.
     pub fn switch_to(&mut self, project: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.switcher.close((self.clock)());
+        self.tab_menu.close((self.clock)());
         if self.shows(project) {
             return;
         }
@@ -3067,6 +3113,10 @@ impl ShelbiWindow {
             HostCall::Detach => cx.quit(),
             HostCall::DetachOthers => self.detach_others(cx),
             HostCall::QuitProject => self.confirm_quit_project(window, cx),
+            HostCall::CloseOtherProjects => {
+                let keep = self.project.clone();
+                self.confirm_close_other_projects(keep, window, cx);
+            }
             HostCall::QuitShelbi => self.confirm_quit_shelbi(window, cx),
             HostCall::ToggleZen => self.toggle_zen(window, cx),
             HostCall::OpenErrorLog => self.open_error_log(window, cx),
@@ -4523,6 +4573,32 @@ impl ShelbiWindow {
         true
     }
 
+    /// A key while a tab's context menu is open: ↑↓ (and Tab) move its
+    /// keyboard row over the rows it can run, Enter runs it, Esc closes.
+    /// `false` for any other key.
+    fn tab_menu_key(&mut self, code: Key, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let others = self.tabs.order().len() > 1;
+        let enabled = |row: tab_bar::TabMenuRow| others || row != tab_bar::TabMenuRow::CloseOthers;
+        match code {
+            Key::Up | Key::BackTab => self.tab_menu.step(-1, enabled),
+            Key::Down | Key::Tab => self.tab_menu.step(1, enabled),
+            Key::Esc => self.tab_menu.close((self.clock)()),
+            Key::Enter => {
+                let (Some(project), Some(row)) = (self.tab_menu.project().map(str::to_string), self.tab_menu.highlight())
+                else {
+                    return true;
+                };
+                let event = match row {
+                    tab_bar::TabMenuRow::CloseProject => SidebarEvent::CloseTab(project),
+                    tab_bar::TabMenuRow::CloseOthers => SidebarEvent::CloseOtherTabs(project),
+                };
+                self.sidebar_event(event, window, cx);
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// A key on the chooser: ↑↓ (and Tab) move its row, Enter opens it (the
     /// last row is Add Project). `false` for any other key.
     fn chooser_key(&mut self, code: Key, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -4634,16 +4710,15 @@ impl ShelbiWindow {
         self.confirm_close_project(project, window, cx);
     }
 
-    /// Close `project` (its tab's `×`, File ▸ Close Project…, Quit
-    /// Project), once the user confirms: its agents stop, its tab goes from
-    /// every window, and a window that showed it moves to its neighbor tab.
-    /// A remote window shows a tab before closing it: its link reaches the
-    /// shown project's far daemon only.
+    /// Close `project` (its tab's `×`, its context menu, File ▸ Close
+    /// Project…, Quit Project), once the user confirms: its agents stop, its
+    /// tab goes from every window, and a window that showed it moves to its
+    /// neighbor tab. A remote window shows a tab before closing it, as it
+    /// always has.
     fn confirm_close_project(&mut self, project: String, window: &mut Window, cx: &mut Context<Self>) {
         if self.remote.is_some() && !self.shows(&project) {
             self.switch_to(&project, window, cx);
         }
-        let shown = self.shows(&project);
         let label = self.project_label(&project, cx);
         let answer = window.prompt(
             PromptLevel::Warning,
@@ -4652,14 +4727,8 @@ impl ShelbiWindow {
             &["Close Project", "Cancel"],
             cx,
         );
-        let quit_key = ProjectKey {
-            origin: self.project_handle.key().origin.clone(),
-            name: project.clone(),
-        };
-        // The shown project's link (a remote window's reaches its far
-        // daemon); another local project quits through this machine's.
-        let link = shown.then(|| self.project_handle.link.clone());
-        let control = self.ready().map(|r| r.control.clone());
+        let quit_key = self.tab_key(&project);
+        let route = self.quit_route();
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
                 return;
@@ -4674,56 +4743,123 @@ impl ShelbiWindow {
                 }
             })
             .ok();
-            let quit = cx
-                .background_executor()
-                .spawn(async move {
-                    // A remote window's project quits on the far daemon.
-                    if let Some(quit) = link.as_ref().and_then(|l| l.quit_far_project()) {
-                        return quit;
-                    }
-                    control
-                        .ok_or_else(|| "Couldn't reach the daemon.".to_string())?
-                        .connect()
-                        .map_err(|e| e.to_string())?
-                        .quit_project(&project)
-                        .map_err(|e| e.to_string())
-                })
-                .await;
-            this.update_in(cx, |this, window, cx| match quit {
-                // Every window loses its tab, and one that showed it moves
-                // on (this one included), staying open.
-                Ok(()) => {
-                    if quit_key.is_local() {
-                        if let Some(catalog) = cx.try_global::<Catalog>() {
-                            catalog.note_open(&quit_key.name, false);
-                        }
-                    }
-                    let me = window.window_handle().window_id();
-                    for other in shelbi_windows(cx) {
-                        if other.window_id() != me {
-                            let quit = quit_key.clone();
-                            cx.defer(move |cx| {
-                                let _ = other.update(cx, |w, window, cx| {
-                                    w.after_quit_project(quit, window, cx)
-                                });
-                            });
-                        }
-                    }
-                    this.after_quit_project(quit_key.clone(), window, cx);
-                    this.refresh_catalog(cx);
-                }
-                Err(e) => {
-                    if this.shows_key(&quit_key) {
-                        this.mark_deliberate_close(false, cx);
-                    }
-                    // Named: the window may show another project by now.
-                    this.banner = Some(format!("Couldn't close {label}: {e}").into());
-                    cx.notify();
-                }
-            })
-            .ok();
+            let quit = cx.background_executor().spawn(async move { route.quit(&project) }).await;
+            this.update_in(cx, |this, window, cx| this.project_quit_landed(quit_key, label, quit, window, cx))
+                .ok();
         })
         .detach();
+    }
+
+    /// Close every project this window has a tab for but `keep` (a tab's
+    /// context menu, File ▸ Close All Other Projects…, the palette's), after
+    /// one confirmation naming them all: `keep`'s tab is selected, then each
+    /// of the others quits through Close Project's path, one after another,
+    /// its tab going from every window. Nothing to close (one tab) does
+    /// nothing.
+    fn confirm_close_other_projects(&mut self, keep: String, window: &mut Window, cx: &mut Context<Self>) {
+        let closing: Vec<String> = shelbi_app::close_others::others(self.tabs.order(), &keep)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if closing.is_empty() {
+            return;
+        }
+        let labels: Vec<String> = closing.iter().map(|p| self.project_label(p, cx)).collect();
+        let copy = shelbi_app::close_others::confirmation(&self.project_label(&keep, cx), &labels);
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &copy.title,
+            Some(&copy.detail),
+            &[copy.confirm.as_str(), "Cancel"],
+            cx,
+        );
+        cx.spawn_in(window, async move |this, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            // The kept tab first, so none of the closing projects is on
+            // screen while it quits.
+            let Ok(route) = this.update_in(cx, |this, window, cx| {
+                if !this.shows(&keep) && this.tabs.contains(&keep) {
+                    this.switch_to(&keep, window, cx);
+                }
+                this.quit_route()
+            }) else {
+                return;
+            };
+            for (project, label) in closing.into_iter().zip(labels) {
+                let route = route.clone();
+                let Ok(key) = this.update(cx, |this, _| this.tab_key(&project)) else {
+                    return;
+                };
+                let quit = cx.background_executor().spawn(async move { route.quit(&project) }).await;
+                if this
+                    .update_in(cx, |this, window, cx| this.project_quit_landed(key, label, quit, window, cx))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The key a tab's `project` names: a project on this window's machine.
+    fn tab_key(&self, project: &str) -> ProjectKey {
+        ProjectKey {
+            origin: self.project_handle.key().origin.clone(),
+            name: project.to_string(),
+        }
+    }
+
+    /// How a confirmed close reaches the daemon that quits a project, read
+    /// now (it's used off the UI thread).
+    fn quit_route(&self) -> QuitRoute {
+        QuitRoute {
+            link: self.project_handle.link.clone(),
+            control: self.ready().map(|r| r.control.clone()),
+        }
+    }
+
+    /// A confirmed close came back. Quit: every window loses its tab, and
+    /// one that showed it moves on (this one included), staying open.
+    /// Refused: the banner says so, naming the project (the window may show
+    /// another one by now).
+    fn project_quit_landed(
+        &mut self,
+        quit_key: ProjectKey,
+        label: String,
+        quit: Result<(), String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match quit {
+            Ok(()) => {
+                if quit_key.is_local() {
+                    if let Some(catalog) = cx.try_global::<Catalog>() {
+                        catalog.note_open(&quit_key.name, false);
+                    }
+                }
+                let me = window.window_handle().window_id();
+                for other in shelbi_windows(cx) {
+                    if other.window_id() != me {
+                        let quit = quit_key.clone();
+                        cx.defer(move |cx| {
+                            let _ = other.update(cx, |w, window, cx| w.after_quit_project(quit, window, cx));
+                        });
+                    }
+                }
+                self.after_quit_project(quit_key, window, cx);
+                self.refresh_catalog(cx);
+            }
+            Err(e) => {
+                if self.shows_key(&quit_key) {
+                    self.mark_deliberate_close(false, cx);
+                }
+                self.banner = Some(format!("Couldn't close {label}: {e}").into());
+                cx.notify();
+            }
+        }
     }
 
     /// The shown project's sessions are about to end on purpose (`on`), or
@@ -4983,6 +5119,7 @@ impl ShelbiWindow {
         }
         self.overlay = Some(overlay);
         self.switcher.close((self.clock)());
+        self.tab_menu.close((self.clock)());
         self.focus_handle.focus(window, cx);
         cx.notify();
     }
@@ -5829,6 +5966,11 @@ impl ShelbiWindow {
             cx.notify();
             return;
         }
+        if self.tab_menu.is_open() && self.tab_menu_key(chord.code, window, cx) {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         match self.keymaps.global.dispatch(chord) {
             Some(GlobalAction::FocusSidebar) => {
                 self.focus_sidebar(window, cx);
@@ -6138,6 +6280,7 @@ impl SidebarHost for ShelbiWindow {
             }
             SidebarEvent::OpenSearch => self.open_palette(window, cx),
             SidebarEvent::ToggleSwitcher => {
+                self.tab_menu.close((self.clock)());
                 if self.switcher.is_open() {
                     self.switcher.close((self.clock)());
                 } else {
@@ -6154,7 +6297,23 @@ impl SidebarHost for ShelbiWindow {
             SidebarEvent::SwitchTo(project) => {
                 self.run(CommandKind::SwitchProject { project }, window, cx)
             }
-            SidebarEvent::CloseTab(project) => self.confirm_close_project(project, window, cx),
+            SidebarEvent::CloseTab(project) => {
+                self.tab_menu.close((self.clock)());
+                self.confirm_close_project(project, window, cx)
+            }
+            SidebarEvent::OpenTabMenu(project) => {
+                self.switcher.close((self.clock)());
+                self.tab_menu.open(&project, (self.clock)());
+                // Esc reaches the window's keys.
+                self.focus_handle.focus(window, cx);
+            }
+            SidebarEvent::CloseTabMenu => self.tab_menu.close((self.clock)()),
+            SidebarEvent::CloseOtherTabs(project) => {
+                self.tab_menu.close((self.clock)());
+                if self.tabs.order().len() > 1 {
+                    self.confirm_close_other_projects(project, window, cx)
+                }
+            }
             SidebarEvent::HoverTab(project, hovered) => {
                 if hovered {
                     self.hovered_tab = Some(project);
@@ -6246,6 +6405,10 @@ impl ShelbiWindow {
             window.request_animation_frame();
         }
         let menu_projects = switcher_phase.map(|_| self.menu_projects(cx));
+        let tab_menu_phase = self.tab_menu.phase(now, reduce_motion);
+        if self.tab_menu.animating(now, reduce_motion) {
+            window.request_animation_frame();
+        }
         // The sidebar's sections and machine groups folding open or closed.
         self.folds.settle(now);
         if self.folds.animating(now) {
@@ -6500,6 +6663,16 @@ impl ShelbiWindow {
                     menu_open: self.switcher.is_open(),
                     sidebar_shown: !self.collapsed,
                     reveal: reveal.position,
+                    tab_menu: self.tab_menu.project().zip(tab_menu_phase).map(|(project, phase)| {
+                        tab_bar::TabMenuProps {
+                            project,
+                            can_close_others: self.tabs.order().len() > 1,
+                            highlight: self.tab_menu.highlight(),
+                            phase,
+                            open: self.tab_menu.is_open(),
+                        }
+                    }),
+                    tab_menu_anchor: &self.tab_menu.anchor,
                 },
                 &theme,
                 cx,

@@ -59,6 +59,7 @@ paths on every `cargo test`.
 | Detach | `action:detach` | The TUI exits; every session keeps running | The app quits; every session keeps running |
 | Detach Other Clients | `action:detach-others` | Detached the desktop app ("Detached 1 other window.") | Detached the TUI |
 | Quit Project | `action:quit-project` | The TUI exits and the daemon closes the project (see Known gaps for the handoff) | Confirmation sheet, then the orchestrator's handoff, its session ends; the window stays and switches to the neighbor tab (else another open project, else the empty-state chooser), the project's tab going from every window; also a tab's `×` and File ▸ Close Project…; `pb` kept running |
+| Close All Other Projects | `action:close-other-projects` | Added after this walk (`tab-context-menu`), covered by both smoke tests and `close_other_projects_*` in `shell/mod.rs`: listed while another project is open (`CommandModel::open_others`); one confirmation dialog (`overlay/close_others.rs`) names them, then each quits through the daemon off the UI thread and the status line says how it went; the TUI stays on its project | Added after this walk (`tab-context-menu`): listed while the window has another tab; one confirmation sheet names them, then each quits through Close Project's path and its tab goes from every window, the window staying on its project; also File ▸ Close All Other Projects… and a tab's context menu (keeping that tab's project) |
 | Quit Shelbi | `action:quit-shelbi` | Every sandbox session ended and the sandbox daemon stopped | Not pressed in this walk: the TUI's Quit Shelbi had already stopped the sandbox. The smoke test runs it through the palette and the menu; its confirmation sheet is the one Quit Project showed (`confirm_quit_shelbi`) |
 | Open a searched issue | (palette search) `action:open-issue:<id>` | Added after this walk (`changelog-palette-search`): the board's detail popover over the view the palette opened from (read off the UI thread when the issue is past the board's first history page), as a Changelog issue link opens it | The issue's detail on the board, as a Changelog issue chip opens it |
 | Open a searched Changelog entry | (palette search) `action:open-changelog-entry:<id>` | Added after this walk: the Changelog page, its search cleared, the entry unfolded, focused and at the top | The Changelog page, its search cleared, the entry at the top of the list |
@@ -177,7 +178,9 @@ paths on every `cargo test`.
   window slot; a click or ⌘1 to ⌘9 switches (the same `SwitchProject` path),
   a tab's `×` (and File ▸ Close Project…) is Quit Project for that project,
   the window moving to the neighbor tab, and the `+` menu lists the projects
-  that aren't open, then Add project. The TUI shows one project per screen
+  that aren't open, then Add project. Right-clicking a tab opens its context
+  menu: Close Project (that tab's) and Close All Other Projects (the
+  registry's `action:close-other-projects`, kept for that tab). The TUI shows one project per screen
   and switches through the palette's Projects column. No registry command or
   view model field is added: the tabs are the window's own chrome, like the
   sidebar width.

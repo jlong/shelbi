@@ -363,6 +363,7 @@ pub fn place(kind: &CommandKind) -> Placement {
         CommandKind::Detach => Placement::App,
         CommandKind::DetachOtherClients => Placement::App,
         CommandKind::QuitProject => Placement::App,
+        CommandKind::CloseOtherProjects => Placement::File,
         CommandKind::QuitShelbi => Placement::App,
         CommandKind::MoveIssue { .. }
         | CommandKind::StartIssue { .. }
@@ -505,6 +506,8 @@ fn file_menu<'a, I: Iterator<Item = &'a Command>>(
             // The shown project's tab closes as its `×` does: the registry's
             // Quit Project, confirmed (it stops the project's agents).
             slot("action:quit-project", "Close Project…", None),
+            // Every other tab's project, after one confirmation.
+            slot("action:close-other-projects", "Close All Other Projects…", None),
             app("Close Window", AppCommand::CloseWindow),
         ],
     }
@@ -800,6 +803,11 @@ mod tests {
             launch_screen: true,
             remote_connect: true,
             remote_host: None,
+            // Another tab is open: File ▸ Close All Other Projects… is live.
+            open_others: vec![ProjectItem {
+                slug: "api".into(),
+                label: "API".into(),
+            }],
         }
     }
 

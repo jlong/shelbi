@@ -106,6 +106,11 @@ fn fixture() -> CommandModel {
         launch_screen: true,
         remote_connect: true,
         remote_host: None,
+        // Another project is open: Close All Other Projects is listed.
+        open_others: vec![ProjectItem {
+            slug: "beta".into(),
+            label: "Beta".into(),
+        }],
     }
 }
 
@@ -245,6 +250,7 @@ impl Executor for Scenario {
             | Effect::Detach
             | Effect::DetachOtherClients
             | Effect::QuitProject { .. }
+            | Effect::CloseOtherProjects { .. }
             | Effect::QuitShelbi
             | Effect::NewWindow { .. }
             // The terminal window over `ssh -t`, beside this one.
@@ -289,6 +295,7 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::Detach => "detach_and_quit_reach_the_host",
         CommandKind::DetachOtherClients => "detach_and_quit_reach_the_host",
         CommandKind::QuitProject => "detach_and_quit_reach_the_host",
+        CommandKind::CloseOtherProjects => "close_other_projects_keeps_the_current_one_and_needs_another_open",
         CommandKind::QuitShelbi => "detach_and_quit_reach_the_host",
         CommandKind::OpenEditor { .. } => "edit_targets_open_their_file_in_the_editor",
         CommandKind::OpenIssue { .. } => "a_searched_issue_opens_its_detail_over_the_view",
@@ -350,6 +357,7 @@ fn every_command_kind_has_a_scenario() {
             "action:detach",
             "action:detach-others",
             "action:quit-project",
+            "action:close-other-projects",
             "action:quit-shelbi",
         ]
     );
@@ -762,6 +770,32 @@ fn detach_and_quit_reach_the_host() {
     let mut m = fixture();
     m.other_clients_attached = false;
     assert!(CommandRegistry::new().resolve("action:detach-others", &m).is_none());
+}
+
+#[test]
+fn close_other_projects_keeps_the_current_one_and_needs_another_open() {
+    // The host gets the project to keep (the current one) and confirms once
+    // before closing the rest; the client's own state is untouched.
+    let mut s = Scenario::new();
+    let effect = Effect::CloseOtherProjects { keep: PROJECT.into() };
+    assert_eq!(s.invoke("action:close-other-projects"), effect);
+    assert_eq!(s.last(), &Performed::Host(effect));
+    assert_eq!(s.client.project(), Some(PROJECT));
+    assert_eq!(s.client.overlay(), None);
+    // Searching "close other" (or "close all") finds it.
+    let entries = CommandRegistry::new().entries(&fixture());
+    for query in ["close other", "close all"] {
+        let first = shelbi_palette::search(&entries, query).into_iter().next().map(|(e, _)| e.id);
+        assert_eq!(first.as_deref(), Some("action:close-other-projects"), "{query}");
+    }
+    // With no other project open it isn't offered.
+    let mut m = fixture();
+    m.open_others.clear();
+    assert!(CommandRegistry::new().resolve("action:close-other-projects", &m).is_none());
+    // Nor without a project.
+    let mut m = fixture();
+    m.project = None;
+    assert!(CommandRegistry::new().resolve("action:close-other-projects", &m).is_none());
 }
 
 #[test]

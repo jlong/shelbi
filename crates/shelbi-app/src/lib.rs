@@ -82,6 +82,7 @@ pub mod board;
 pub mod board_search;
 pub mod changelog;
 pub mod changes;
+pub mod close_others;
 pub mod command;
 pub mod command_model;
 pub mod diff;
