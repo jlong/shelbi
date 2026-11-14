@@ -409,3 +409,35 @@ fn more_tabs_collapse_the_search_box_and_closing_them_brings_it_back(cx: &mut Te
     assert_eq!(order(&h).len(), 2);
     assert!(drawn(&mut h, "tab-bar-search") && !drawn(&mut h, "tab-bar-search-button"));
 }
+
+/// Rests the pointer on `selector` past gpui's tooltip delay (500ms), then
+/// says whether a tooltip is drawn.
+fn tooltip_on_hover(h: &mut Harness, selector: &'static str) -> bool {
+    let at = bounds(h, selector).center();
+    h.cx.simulate_mouse_move(at, None, Modifiers::none());
+    h.cx.executor().advance_clock(std::time::Duration::from_millis(600));
+    h.cx.run_until_parked();
+    drawn(h, "tooltip")
+}
+
+#[gpui::test]
+fn only_the_collapsed_search_button_has_a_tooltip(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta"], &[]);
+    // The full box already shows "Search" and its chord: no tooltip.
+    assert!(drawn(&mut h, "tab-bar-search"));
+    assert!(!tooltip_on_hover(&mut h, "tab-bar-search"), "the box shows no tooltip");
+    // Its hover still fills it and its click still opens the palette.
+    h.click_selector("tab-bar-search");
+    assert!(h.window.read_with(&h.cx, |w, _| w.overlay.is_some()), "the box opens the palette");
+    h.window.update(&mut h.cx, |w, cx| {
+        w.overlay = None;
+        cx.notify();
+    });
+
+    // Off it, then collapsed to the magnifier: that one names the chord.
+    h.cx.simulate_mouse_move(point(px(700.0), px(400.0)), None, Modifiers::none());
+    let room = box_room(&mut h);
+    resize(&mut h, room - px(1.0));
+    assert_search_button(&mut h);
+    assert!(tooltip_on_hover(&mut h, "tab-bar-search-button"), "the button shows its tooltip");
+}

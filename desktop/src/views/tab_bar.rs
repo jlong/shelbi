@@ -354,7 +354,8 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
 /// corners), on `surface/depth-20` (the overlay fill, `background`) with
 /// 6pt corners. Not a text field: a
 /// click opens the command palette. The fill deepens on hover and press and
-/// the magnifier goes loud, as the toolbar buttons do.
+/// the magnifier goes loud, as the toolbar buttons do. No tooltip: the box
+/// already shows its label and chord (only the collapsed button has one).
 fn search_box<H: SidebarHost>(chord: &str, theme: &Theme, cx: &mut Context<H>) -> Stateful<Div> {
     const ID: &str = "tab-bar-search";
     let radius = px(SEARCH_RADIUS);
@@ -392,7 +393,6 @@ fn search_box<H: SidebarHost>(chord: &str, theme: &Theme, cx: &mut Context<H>) -
         radius,
         [theme.background, theme.background_hover, theme.background_active],
     )
-    .tooltip(style::tooltip(sidebar::search_tip(chord)))
     .child(
         div()
             .flex()

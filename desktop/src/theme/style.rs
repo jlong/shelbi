@@ -1390,6 +1390,7 @@ impl gpui::Render for Tooltip {
     fn render(&mut self, _: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         popover(div(), &theme)
+            .debug_selector(|| "tooltip".into())
             .px_2()
             .py_1()
             .type_style(Type::XSmall)
