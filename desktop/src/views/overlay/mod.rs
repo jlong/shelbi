@@ -518,6 +518,7 @@ mod tests {
             slug: "web".into(),
             label: "Web".into(),
             indicator: shelbi_app::overlay::palette::ProjectIndicator::Unloaded,
+            current: false,
         };
         let mut o = ActiveOverlay::palette(vec![entry("view:tasks", "Issues")], vec![project], Default::default());
         assert_eq!(o.handle_key(chord("tab"), &keymaps()), OverlayEvent::Stay);
@@ -733,11 +734,12 @@ mod render_tests {
             decoration: None,
         });
         let projects = vec![
-            PaletteProject("alpha", "Alpha", ProjectIndicator::Active),
+            PaletteProject("alpha", "Alpha", ProjectIndicator::Working),
             PaletteProject("beta", "Beta", ProjectIndicator::Unloaded),
         ]
         .into_iter()
         .map(|PaletteProject(slug, label, indicator)| ProjectEntry {
+            current: slug == "alpha",
             slug: slug.into(),
             label: label.into(),
             indicator,

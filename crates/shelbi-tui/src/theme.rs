@@ -16,7 +16,6 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::LazyLock;
-use std::time::Duration;
 
 use ratatui::style::Color;
 use shelbi_app::theme::{Ansi, Appearance, Swatch, TermColor, Theme, ThemePreference};
@@ -392,16 +391,13 @@ fn dump_html(
 /// `divider` at rest and `divider_active` (bold) while hovered or dragged.
 pub const DIVIDER_GLYPH: &str = "▏";
 
-/// Full breathing period of the active-project pulse: the fill eases from a
-/// dim trough (near-transparent against the palette panel) up to full green
-/// and back down once per cycle. Kept close to a calm breath rather than a
-/// blink.
-pub const PROJECT_PULSE_PERIOD: Duration = Duration::from_millis(1143);
+/// The project pulse's period, shared with the desktop app.
+pub use shelbi_app::theme::PROJECT_PULSE_PERIOD;
 
-/// Fill color for the active-project pulse at animation `phase` (wrapped into
+/// Fill color for the working-project pulse at animation `phase` (wrapped into
 /// `[0.0, 1.0)`), breathing between the theme's `pulse_trough` and
-/// `pulse_peak` (see [`Theme::project_pulse`]). The glyph is a filled disc, so
-/// the ring stays green throughout: "green ring + cycling fill".
+/// `pulse_peak` (see [`Theme::project_pulse`]). The glyph is the same filled
+/// disc a loaded, idle project shows in solid green; only its color breathes.
 pub fn project_pulse_color(phase: f32) -> Color {
     let rgb = tokens().project_pulse(phase);
     Color::Rgb(rgb.r, rgb.g, rgb.b)

@@ -5,12 +5,14 @@
 //! "+ Add project". No avatars.
 //!
 //! A row's dot comes from its [`ProjectIndicator`], which
-//! `shelbi_app::command_model::project_rows` decides for both lists: a
-//! filled green dot while the project is open (this window's, or open in
-//! another), a hollow gray ring when it isn't. The current project (the
-//! indicator's `Active`) wears the check.
+//! `shelbi_app::command_model::project_rows` decides for both lists (and the
+//! tabs use too): a green disc breathing while the project has work in
+//! progress (one of its workspaces' agents is working), a solid green disc
+//! while it is loaded with nothing in progress, a hollow gray ring when it
+//! isn't loaded. The dot never marks the current project: that one wears
+//! the check ([`ProjectEntry::current`]).
 
-use gpui::{div, prelude::*, px, Div, ElementId, Hsla, SharedString, Stateful, Svg};
+use gpui::{div, prelude::*, px, Animation, AnimationExt, AnyElement, Div, ElementId, Hsla, SharedString, Stateful};
 use shelbi_app::overlay::palette::{ProjectEntry, ProjectIndicator};
 
 use crate::assets::{heroicon, icons, Icon, ICON_SIZE_MENU};
@@ -35,17 +37,38 @@ pub fn heading(theme: &Theme) -> Div {
         .child("Projects")
 }
 
-/// A project's dot: filled `icon_green` while it is open, a `gray` ring when
-/// it isn't.
-pub fn dot(indicator: ProjectIndicator, theme: &Theme) -> Svg {
+/// A project's dot (16pt, `flex_none`): the `circle-solid` disc in
+/// `icon_green` while it is loaded, a `gray` `circle` ring when it isn't.
+/// While the project has work in progress the disc's color breathes
+/// ([`pulse_color`]); `id` keys that animation. Under Reduce Motion (and in
+/// the visual checks, which render with it) gpui holds a repeating
+/// animation at its start, so the disc holds at the pulse's peak.
+pub fn dot(id: impl Into<ElementId>, indicator: ProjectIndicator, theme: &Theme) -> AnyElement {
     let (icon, color) = dot_drawing(indicator, theme);
-    heroicon(icon).text_color(color)
+    let disc = heroicon(icon).flex_none().text_color(color);
+    if !indicator.pulses() {
+        return disc.into_any_element();
+    }
+    let theme = *theme;
+    disc.with_animation(
+        id,
+        Animation::new(shelbi_app::theme::PROJECT_PULSE_PERIOD).repeat(),
+        move |d, t| d.text_color(pulse_color(&theme, t)),
+    )
+    .into_any_element()
 }
 
-/// [`dot`]'s drawing and its tint.
+/// The working dot's color `t` (0..1) of the way through its animation.
+/// The breath starts at its peak, so the frame gpui holds under Reduce
+/// Motion (`t` 0) is the brightest, never the trough.
+fn pulse_color(theme: &Theme, t: f32) -> Hsla {
+    theme.project_pulse(t + 0.5)
+}
+
+/// [`dot`]'s drawing and its resting tint.
 fn dot_drawing(indicator: ProjectIndicator, theme: &Theme) -> (Icon, Hsla) {
     match indicator {
-        ProjectIndicator::Active | ProjectIndicator::LoadedIdle => (icons::CIRCLE_SOLID_MENU, theme.icon_green),
+        ProjectIndicator::Working | ProjectIndicator::LoadedIdle => (icons::CIRCLE_SOLID_MENU, theme.icon_green),
         ProjectIndicator::Unloaded => (icons::CIRCLE_MENU, theme.gray),
     }
 }
@@ -87,9 +110,10 @@ pub fn project_row(
     selected: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
-    let current = project.indicator == ProjectIndicator::Active;
-    row(id.into(), key.into(), selected, theme)
-        .child(dot(project.indicator, theme))
+    let key: SharedString = key.into();
+    let current = project.current;
+    row(id.into(), key.clone(), selected, theme)
+        .child(dot(SharedString::from(format!("{key}-dot")), project.indicator, theme))
         .child(div().flex_1().min_w_0().truncate().child(project.label.clone()))
         .child(div().flex_none().size(ICON_SIZE_MENU).when(current, |d| {
             d.child(heroicon(icons::CHECK_SMALL_HEAVY_MENU).text_color(theme.gray))
@@ -129,13 +153,33 @@ mod tests {
     }
 
     #[test]
-    fn an_open_project_is_a_green_dot_and_a_closed_one_a_gray_ring() {
+    fn a_loaded_project_is_a_green_disc_and_one_not_loaded_a_gray_ring() {
         let theme = theme();
         let filled = (icons::CIRCLE_SOLID_MENU, theme.icon_green);
-        assert_eq!(dot_drawing(ProjectIndicator::Active, &theme), filled, "this window's");
-        assert_eq!(dot_drawing(ProjectIndicator::LoadedIdle, &theme), filled, "open elsewhere");
+        assert_eq!(dot_drawing(ProjectIndicator::Working, &theme), filled, "at work: the disc, pulsing");
+        assert_eq!(dot_drawing(ProjectIndicator::LoadedIdle, &theme), filled, "idle: the disc, solid");
         assert_eq!(dot_drawing(ProjectIndicator::Unloaded, &theme), (icons::CIRCLE_MENU, theme.gray));
-        let mut d = dot(ProjectIndicator::Unloaded, &theme);
+        let mut d = heroicon(dot_drawing(ProjectIndicator::Unloaded, &theme).0);
         assert_eq!(d.style().size.width, Some(ICON_SIZE_MENU.into()), "the Figma's 16pt");
+    }
+
+    /// The working dot breathes between the shared pulse tokens, and the
+    /// frame Reduce Motion holds (the animation's start) is its peak.
+    #[test]
+    fn the_working_dot_breathes_from_its_peak() {
+        for theme in [
+            theme(),
+            Theme::resolve(shelbi_state::ThemePreference::Light, gpui::WindowAppearance::Light),
+        ] {
+            let tokens = if theme.is_dark() {
+                shelbi_app::theme::Theme::dark()
+            } else {
+                shelbi_app::theme::Theme::light()
+            };
+            let hsla = |c: shelbi_app::theme::Rgb| -> Hsla { gpui::rgb(u32::from_be_bytes([0, c.r, c.g, c.b])).into() };
+            assert_eq!(pulse_color(&theme, 0.0), hsla(tokens.pulse_peak.rgb), "held at the peak");
+            assert_eq!(pulse_color(&theme, 0.5), hsla(tokens.pulse_trough.rgb), "the trough mid-breath");
+            assert_eq!(pulse_color(&theme, 1.0), pulse_color(&theme, 0.0), "one breath per period");
+        }
     }
 }

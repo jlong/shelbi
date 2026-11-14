@@ -8,6 +8,7 @@
 //! The reads are small local files; hosts still call these off their UI
 //! thread where they can.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use shelbi_palette::{Decoration, DecorationColor};
@@ -137,19 +138,52 @@ pub fn command_model_from(
     }
 }
 
+/// Which projects are loaded and which of those have work in progress: what
+/// a project's dot shows ([`project_rows`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectLiveness {
+    /// The projects recorded open (running in some window or terminal).
+    pub open: HashSet<String>,
+    /// The loaded projects with an agent at work
+    /// ([`shelbi_state::project_is_working`]).
+    pub working: HashSet<String>,
+}
+
+impl ProjectLiveness {
+    /// Read it (blocking: the open records, then the board and the busy
+    /// slots' status of each loaded project). `current`, the caller's own
+    /// project, counts as loaded even before its open record lands.
+    pub fn read(current: Option<&str>) -> Self {
+        let open: HashSet<String> = shelbi_state::list_open_projects()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let working = open
+            .iter()
+            .map(String::as_str)
+            .chain(current)
+            .filter(|p| shelbi_state::project_is_working(p))
+            .map(str::to_string)
+            .collect();
+        ProjectLiveness { open, working }
+    }
+
+    /// `project` is loaded and has work in progress.
+    pub fn is_working(&self, project: &str) -> bool {
+        self.working.contains(project)
+    }
+}
+
 /// The palette's Projects column: every registered project, the current one
-/// first (the filled disc), open ones with the green ring, closed ones gray.
+/// first, each with its dot ([`project_rows`]).
 pub fn build_projects_column(current: &str) -> Vec<ProjectEntry> {
-    let open: std::collections::HashSet<String> = shelbi_state::list_open_projects()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    let liveness = ProjectLiveness::read(Some(current));
     let projects = shelbi_state::list_projects()
         .unwrap_or_default()
         .into_iter()
         .map(|p| (p.name.clone(), p.display_label().to_string()))
         .collect();
-    projects_column_from(current, projects, &open)
+    projects_column_from(current, projects, &liveness)
 }
 
 /// The pure half of [`build_projects_column`]: `projects` as `(slug, label)`
@@ -157,9 +191,9 @@ pub fn build_projects_column(current: &str) -> Vec<ProjectEntry> {
 pub fn projects_column_from(
     current: &str,
     projects: Vec<(String, String)>,
-    open: &std::collections::HashSet<String>,
+    liveness: &ProjectLiveness,
 ) -> Vec<ProjectEntry> {
-    let mut rows = project_rows(current, projects, open);
+    let mut rows = project_rows(current, projects, liveness);
     // The current project leads; the rest keep list order (a stable sort).
     rows.sort_by_key(|p| p.slug != current);
     rows
@@ -167,21 +201,24 @@ pub fn projects_column_from(
 
 /// Every project's row in list order, with its indicator: the one rule that
 /// decides a project's dot wherever a client lists projects (the palette's
-/// Projects column, the desktop's switcher menu). The current project counts
-/// as open (this window has it), the others are open when `open` (the
-/// recorded open projects) has them.
+/// Projects column, the desktop's tabs and `+` menu). A project is loaded
+/// when `liveness` records it open, or it is `current` (this window has it),
+/// and its dot pulses while `liveness` has work in progress there. Being
+/// current only sets the row's [`ProjectEntry::current`] (the menu's check),
+/// never its dot.
 pub fn project_rows(
     current: &str,
     projects: Vec<(String, String)>,
-    open: &std::collections::HashSet<String>,
+    liveness: &ProjectLiveness,
 ) -> Vec<ProjectEntry> {
     projects
         .into_iter()
         .map(|(slug, label)| {
             let is_current = slug == current;
-            let loaded = is_current || open.contains(&slug);
+            let loaded = is_current || liveness.open.contains(&slug);
             ProjectEntry {
-                indicator: project_indicator(loaded, is_current),
+                indicator: project_indicator(loaded, liveness.is_working(&slug)),
+                current: is_current,
                 label,
                 slug,
             }
@@ -379,52 +416,74 @@ mod tests {
         assert_eq!(typed, ["action:switch-project:beta"]);
     }
 
+    fn liveness(open: &[&str], working: &[&str]) -> ProjectLiveness {
+        ProjectLiveness {
+            open: open.iter().map(|p| p.to_string()).collect(),
+            working: working.iter().map(|p| p.to_string()).collect(),
+        }
+    }
+
+    fn rows_of(rows: &[ProjectEntry]) -> Vec<(&str, ProjectIndicator, bool)> {
+        rows.iter().map(|r| (r.slug.as_str(), r.indicator, r.current)).collect()
+    }
+
+    fn three() -> Vec<(String, String)> {
+        vec![
+            ("web".into(), "Web".into()),
+            ("api".into(), "API".into()),
+            ("alpha".into(), "Alpha".into()),
+        ]
+    }
+
     #[test]
     fn the_projects_column_leads_with_the_current_project() {
-        let open: std::collections::HashSet<String> = ["web".to_string()].into();
-        let rows = projects_column_from(
-            "alpha",
-            vec![
-                ("web".into(), "Web".into()),
-                ("api".into(), "API".into()),
-                ("alpha".into(), "Alpha".into()),
-            ],
-            &open,
-        );
-        let got: Vec<(&str, ProjectIndicator)> =
-            rows.iter().map(|r| (r.slug.as_str(), r.indicator)).collect();
+        let rows = projects_column_from("alpha", three(), &liveness(&["web"], &[]));
         assert_eq!(
-            got,
+            rows_of(&rows),
             [
-                ("alpha", ProjectIndicator::Active),
-                ("web", ProjectIndicator::LoadedIdle),
-                ("api", ProjectIndicator::Unloaded),
+                ("alpha", ProjectIndicator::LoadedIdle, true),
+                ("web", ProjectIndicator::LoadedIdle, false),
+                ("api", ProjectIndicator::Unloaded, false),
             ]
         );
     }
 
     #[test]
     fn project_rows_keep_list_order() {
-        let open: std::collections::HashSet<String> = ["web".to_string()].into();
-        let rows = project_rows(
-            "alpha",
-            vec![
-                ("web".into(), "Web".into()),
-                ("api".into(), "API".into()),
-                ("alpha".into(), "Alpha".into()),
-            ],
-            &open,
-        );
-        let got: Vec<(&str, ProjectIndicator)> =
-            rows.iter().map(|r| (r.slug.as_str(), r.indicator)).collect();
+        let rows = project_rows("alpha", three(), &liveness(&["web"], &["web"]));
         assert_eq!(
-            got,
+            rows_of(&rows),
             [
-                ("web", ProjectIndicator::LoadedIdle),
-                ("api", ProjectIndicator::Unloaded),
-                ("alpha", ProjectIndicator::Active),
+                ("web", ProjectIndicator::Working, false),
+                ("api", ProjectIndicator::Unloaded, false),
+                ("alpha", ProjectIndicator::LoadedIdle, true),
             ]
         );
+    }
+
+    /// The dot follows loaded and working only: the current project is the
+    /// check, never the dot, and a working flag on a project that isn't
+    /// loaded is stale.
+    #[test]
+    fn the_dot_follows_loaded_and_working_not_the_current_project() {
+        let cases = [
+            // (open, working, current, expected for "web")
+            (false, false, false, ProjectIndicator::Unloaded),
+            (false, true, false, ProjectIndicator::Unloaded),
+            (true, false, false, ProjectIndicator::LoadedIdle),
+            (true, true, false, ProjectIndicator::Working),
+            // Current: loaded by this window, its dot by its work alone.
+            (false, false, true, ProjectIndicator::LoadedIdle),
+            (true, false, true, ProjectIndicator::LoadedIdle),
+            (true, true, true, ProjectIndicator::Working),
+            (false, true, true, ProjectIndicator::Working),
+        ];
+        for (open, working, current, expected) in cases {
+            let live = liveness(if open { &["web"] } else { &[] }, if working { &["web"] } else { &[] });
+            let rows = project_rows(if current { "web" } else { "other" }, vec![("web".into(), "Web".into())], &live);
+            assert_eq!(rows[0].indicator, expected, "open={open} working={working} current={current}");
+            assert_eq!(rows[0].current, current);
+        }
     }
 
     #[test]

@@ -193,6 +193,66 @@ impl BoardOccupancy {
     }
 }
 
+/// Whether `project` has an agent at work: one of its dev workspaces (not a
+/// `review`-tagged slot) holds an active card and reads as working by
+/// [`slot_reads_working`]. It is the rule behind the sidebar's running
+/// workspace rows (the green ⏵), asked of a whole project, which the project
+/// dot pulses for in both clients.
+///
+/// Reads only what the daemon keeps for every open project: the board as
+/// [`BoardOccupancy::read`] reads it (the daemon-owned index for a remote
+/// backend, never a backend sweep) and each busy slot's `status.yaml`. A
+/// project that won't load, or a board that can't be read, is not working.
+pub fn project_is_working(project: &str) -> bool {
+    let Ok(p) = crate::load_project(project) else {
+        return false;
+    };
+    let Ok(occupancy) = BoardOccupancy::read(&p) else {
+        return false;
+    };
+    occupancy.agent_working(&p, |workspace| {
+        crate::load_workspace_status(project, workspace).ok().flatten()
+    })
+}
+
+/// Whether a dev slot holding the active card `task_id` reads as working,
+/// given its observed `status`: the sidebar's badge rule
+/// (`sidebar_model::derive_workspace_badge`), reduced to "is it the green
+/// Working badge". A blocked pane isn't. A status that describes this card is
+/// trusted (working, or serving); one still naming a prior card, or none at
+/// all, is a fresh dispatch the poller hasn't observed yet, so it reads as
+/// working until the next poll firms it up.
+pub fn slot_reads_working(status: Option<&crate::WorkspaceStatus>, task_id: &str) -> bool {
+    use crate::WorkspaceState;
+    match status {
+        Some(s) if s.state == WorkspaceState::Blocked => false,
+        Some(s) if s.current_task.as_deref() == Some(task_id) => {
+            matches!(s.state, WorkspaceState::Working | WorkspaceState::Serving)
+        }
+        _ => true,
+    }
+}
+
+impl BoardOccupancy {
+    /// [`project_is_working`] over this board, with `status_of` reading a
+    /// slot's observed status.
+    pub fn agent_working(
+        &self,
+        project: &Project,
+        status_of: impl Fn(&str) -> Option<crate::WorkspaceStatus>,
+    ) -> bool {
+        self.working().any(|tf| {
+            let Some(workspace) = tf.task.assigned_to.as_deref() else {
+                return false;
+            };
+            let dev_slot = project
+                .workspace(workspace)
+                .is_some_and(|w| !project.effective_tags(w).contains("review"));
+            dev_slot && slot_reads_working(status_of(workspace).as_ref(), &tf.task.id)
+        })
+    }
+}
+
 /// How `task` holds the slot it names, or `None` when it holds none.
 fn hold_of(
     project: &Project,
@@ -482,6 +542,76 @@ statuses:
             let occ = BoardOccupancy::from_board(&project(), vec![gate, ready]);
             assert!(occ.of("alpha").is_busy(), "could be a running gate");
             assert!(!occ.of("beta").is_busy(), "a stock status is still known");
+        });
+    }
+
+    fn status(task: Option<&str>, state: crate::WorkspaceState) -> crate::WorkspaceStatus {
+        let now = chrono::Utc::now();
+        crate::WorkspaceStatus {
+            workspace: "alpha".into(),
+            current_task: task.map(str::to_string),
+            state,
+            last_transition: now,
+            last_seen: now,
+        }
+    }
+
+    #[test]
+    fn a_slot_reads_working_by_the_sidebars_badge_rule() {
+        use crate::WorkspaceState::*;
+        let s = |task, state| Some(status(task, state));
+        assert!(slot_reads_working(s(Some("t"), Working).as_ref(), "t"));
+        assert!(slot_reads_working(s(Some("t"), Serving).as_ref(), "t"));
+        assert!(!slot_reads_working(s(Some("t"), AwaitingInput).as_ref(), "t"), "awaiting input");
+        assert!(!slot_reads_working(s(Some("t"), Paused).as_ref(), "t"), "paused on a limit");
+        assert!(!slot_reads_working(s(Some("other"), Blocked).as_ref(), "t"), "blocked, any card");
+        // Not yet observed for this card: a fresh dispatch reads as working.
+        assert!(slot_reads_working(None, "t"));
+        assert!(slot_reads_working(s(Some("prior"), AwaitingInput).as_ref(), "t"));
+    }
+
+    #[test]
+    fn a_project_works_while_a_dev_slot_holds_a_working_active_card() {
+        use crate::WorkspaceState::*;
+        with_home(|| {
+            let project = project();
+            let board = |cards| BoardOccupancy::from_board(&project, cards);
+            let working = |_: &str| Some(status(Some("t"), Working));
+            let idle = |_: &str| Some(status(Some("t"), AwaitingInput));
+
+            let active = board(vec![card("t", "in-progress", Some("alpha"))]);
+            assert!(active.agent_working(&project, working));
+            assert!(!active.agent_working(&project, idle), "its agent is at a prompt");
+
+            // Nothing active: a queued review, a pre-assigned card, a stale
+            // `working` status on an idle slot.
+            let quiet = board(vec![
+                card("t", "review", Some("alpha")),
+                card("n", "todo", Some("beta")),
+            ]);
+            assert!(!quiet.agent_working(&project, working));
+            assert!(!board(Vec::new()).agent_working(&project, working));
+
+            // A review slot's agent isn't a dev workspace's work.
+            let review = board(vec![card("t", "in-progress", Some("review-1"))]);
+            assert!(!review.agent_working(&project, working));
+        });
+    }
+
+    #[test]
+    fn project_is_working_reads_the_board_and_the_slot_status() {
+        with_home(|| {
+            assert!(!project_is_working("missing"), "no project, no work");
+            let projects = crate::projects_dir().unwrap();
+            std::fs::create_dir_all(&projects).unwrap();
+            std::fs::write(projects.join("occ.yaml"), PROJECT).unwrap();
+            assert!(!project_is_working("occ"), "an empty board");
+            crate::save_task("occ", &card("t", "in-progress", Some("alpha")).task, "").unwrap();
+            crate::save_workspace_status("occ", &status(Some("t"), crate::WorkspaceState::Working)).unwrap();
+            assert!(project_is_working("occ"));
+            crate::save_workspace_status("occ", &status(Some("t"), crate::WorkspaceState::AwaitingInput))
+                .unwrap();
+            assert!(!project_is_working("occ"), "the agent went idle");
         });
     }
 }

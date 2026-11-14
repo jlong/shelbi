@@ -313,6 +313,19 @@ fn main() {
             // the background so a switch paints the target's chrome at once.
             let catalog = Catalog::default();
             catalog.refresh(|| {});
+            // Every project's dot follows the daemon's change stream: a
+            // project starting or stopping work repaints its tab at once.
+            let (liveness_tx, mut liveness_rx) = futures::channel::mpsc::unbounded::<()>();
+            catalog.watch_changes(move || {
+                let _ = liveness_tx.unbounded_send(());
+            });
+            cx.spawn(async move |cx| {
+                use futures::StreamExt;
+                while liveness_rx.next().await.is_some() {
+                    cx.update(app::liveness_changed);
+                }
+            })
+            .detach();
             cx.set_global(catalog);
 
             // Change notes from the daemon's control socket, routed to each

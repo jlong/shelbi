@@ -280,6 +280,18 @@ fn shelbi_windows(cx: &App) -> Vec<WindowHandle<ShelbiWindow>> {
         .unwrap_or_default()
 }
 
+/// The catalog's liveness moved (a project opened, closed, or started or
+/// stopped working: [`Catalog::watch_changes`]): bring every window's tabs in
+/// line and repaint them, so each dot shows it.
+pub fn liveness_changed(cx: &mut App) {
+    for handle in shelbi_windows(cx) {
+        let _ = handle.update(cx, |w, _, cx| {
+            w.sync_tabs(cx);
+            cx.notify();
+        });
+    }
+}
+
 /// Bring every window's tabs in line with the catalog's open set.
 fn sync_every_windows_tabs(cx: &mut App) {
     for handle in shelbi_windows(cx) {
@@ -870,7 +882,7 @@ impl PaletteInputs {
             projects: shelbi_app::command_model::projects_column_from(
                 project,
                 projects,
-                &std::collections::HashSet::new(),
+                &shelbi_app::command_model::ProjectLiveness::default(),
             ),
             others_attached: false,
         }
@@ -885,10 +897,7 @@ impl PaletteInputs {
         client_id: &str,
     ) -> Self {
         let summaries = shelbi_state::list_projects().unwrap_or_default();
-        let open: std::collections::HashSet<String> = shelbi_state::list_open_projects()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let liveness = shelbi_app::command_model::ProjectLiveness::read(Some(project));
         let others_attached = control
             .and_then(|c| c.connect().ok())
             .and_then(|mut c| c.list_clients().ok())
@@ -909,7 +918,7 @@ impl PaletteInputs {
                     .iter()
                     .map(|p| (p.name.clone(), p.display_label().to_string()))
                     .collect(),
-                &open,
+                &liveness,
             ),
             others_attached,
         }
@@ -4406,6 +4415,8 @@ impl ShelbiWindow {
                 name: name.clone(),
                 label: self.project_label(name, cx).into(),
                 selected: self.shows(name),
+                working: self.remote.is_none()
+                    && cx.try_global::<Catalog>().is_some_and(|c| c.is_working(name)),
             })
             .collect()
     }
@@ -4457,7 +4468,7 @@ impl ShelbiWindow {
             return shelbi_app::command_model::project_rows(
                 current,
                 remote.projects(),
-                &std::collections::HashSet::new(),
+                &shelbi_app::command_model::ProjectLiveness::default(),
             );
         }
         cx.try_global::<Catalog>().map(|c| c.rows(current)).unwrap_or_default()
@@ -4516,7 +4527,11 @@ impl ShelbiWindow {
         let rows = projects.iter().enumerate().map(|(ix, p)| {
             let name = p.slug.clone();
             style::menu_row(format!("chooser-{}", p.slug), ix == self.chooser_highlight, theme)
-                .child(crate::views::project_menu::dot(p.indicator, theme))
+                .child(crate::views::project_menu::dot(
+                    SharedString::from(format!("chooser-dot-{}", p.slug)),
+                    p.indicator,
+                    theme,
+                ))
                 .child(p.label.clone())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     let project = name.clone();

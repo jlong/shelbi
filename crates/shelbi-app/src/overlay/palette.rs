@@ -28,47 +28,60 @@ use super::palette_search::{
 };
 use super::{is_bare, typed_char};
 
-/// A project row's liveness indicator in the Projects column.
+/// A project's status dot, wherever a client lists projects (the desktop's
+/// tabs and `+` menu, both palettes' Projects column). It says whether the
+/// project is loaded and whether an agent is at work in it, never which
+/// project is the current one: the selected tab and the menu's check
+/// ([`ProjectEntry::current`]) say that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectIndicator {
-    /// The current project: a filled disc, pulsing.
-    Active,
-    /// Open but not the current project: a green ring.
+    /// Loaded, with work in progress (a workspace's agent is working): a
+    /// green disc, breathing.
+    Working,
+    /// Loaded, nothing in progress: a solid green disc.
     LoadedIdle,
-    /// Not open: a gray ring.
+    /// Not loaded: a gray ring.
     Unloaded,
 }
 
 impl ProjectIndicator {
-    /// The row's glyph: a filled disc for the current project, a ring for the
-    /// rest (green or gray by color, not glyph).
+    /// The row's glyph: a filled disc while the project is loaded (pulsing or
+    /// solid by color, not glyph), a ring when it isn't.
     pub fn glyph(self) -> &'static str {
         match self {
-            ProjectIndicator::Active => "●",
-            ProjectIndicator::LoadedIdle | ProjectIndicator::Unloaded => "○",
+            ProjectIndicator::Working | ProjectIndicator::LoadedIdle => "●",
+            ProjectIndicator::Unloaded => "○",
         }
+    }
+
+    /// Whether the dot breathes ([`crate::theme::Theme::project_pulse`]).
+    pub fn pulses(self) -> bool {
+        self == ProjectIndicator::Working
     }
 }
 
-/// Resolve a project's indicator. Not-loaded dominates: a project with no live
-/// session shows the gray ring even if it is the "active" one on disk.
-pub fn project_indicator(loaded: bool, active: bool) -> ProjectIndicator {
+/// Resolve a project's indicator from whether it is `loaded` and whether an
+/// agent is `working` in it. Not-loaded dominates: a project with no live
+/// session shows the gray ring even if a stale status says it is working.
+pub fn project_indicator(loaded: bool, working: bool) -> ProjectIndicator {
     if !loaded {
         ProjectIndicator::Unloaded
-    } else if active {
-        ProjectIndicator::Active
+    } else if working {
+        ProjectIndicator::Working
     } else {
         ProjectIndicator::LoadedIdle
     }
 }
 
 /// A Projects-column row: its slug (for the switch entry id), display label,
-/// and indicator.
+/// indicator, and whether it is the window's current project (the check).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectEntry {
     pub slug: String,
     pub label: String,
     pub indicator: ProjectIndicator,
+    /// The window's own project: a menu checks it. The dot doesn't show it.
+    pub current: bool,
 }
 
 /// Which column holds focus inside the open palette.
@@ -576,6 +589,7 @@ mod tests {
             slug: slug.into(),
             label: slug.to_uppercase(),
             indicator: ProjectIndicator::LoadedIdle,
+            current: false,
         }
     }
 
@@ -884,11 +898,16 @@ mod tests {
     }
 
     #[test]
-    fn indicators_resolve_with_not_loaded_dominant() {
-        assert_eq!(project_indicator(false, true), ProjectIndicator::Unloaded);
-        assert_eq!(project_indicator(true, true), ProjectIndicator::Active);
+    fn indicators_resolve_from_loaded_and_working_with_not_loaded_dominant() {
+        assert_eq!(project_indicator(false, false), ProjectIndicator::Unloaded);
+        assert_eq!(project_indicator(false, true), ProjectIndicator::Unloaded, "a stale working flag");
+        assert_eq!(project_indicator(true, true), ProjectIndicator::Working);
         assert_eq!(project_indicator(true, false), ProjectIndicator::LoadedIdle);
-        assert_eq!(ProjectIndicator::Active.glyph(), "●");
+        assert_eq!(ProjectIndicator::Working.glyph(), "●");
+        assert_eq!(ProjectIndicator::LoadedIdle.glyph(), "●");
         assert_eq!(ProjectIndicator::Unloaded.glyph(), "○");
+        assert!(ProjectIndicator::Working.pulses());
+        assert!(!ProjectIndicator::LoadedIdle.pulses());
+        assert!(!ProjectIndicator::Unloaded.pulses());
     }
 }
