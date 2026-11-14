@@ -392,8 +392,16 @@ pub enum SidebarEvent {
     /// Switch to a project: a tab, or a project in the `+` menu (which
     /// opens it).
     SwitchTo(String),
-    /// Close a project: its tab's `×`.
+    /// Close a project: its tab's `×`, or its context menu's Close Project.
     CloseTab(String),
+    /// Open a tab's context menu (a right-click on it; the menu's anchor is
+    /// already set to the pointer).
+    OpenTabMenu(String),
+    /// Close the tab's context menu (a press outside it).
+    CloseTabMenu,
+    /// A tab's context menu's Close All Other Projects: close every other
+    /// tab's project, keeping this one.
+    CloseOtherTabs(String),
     /// The pointer entered (`true`) or left a project's tab.
     HoverTab(String, bool),
     /// The project menu's "Add project…".

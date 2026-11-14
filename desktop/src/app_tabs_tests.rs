@@ -431,3 +431,152 @@ fn the_sidebar_search_opens_the_palette_and_names_its_chord(cx: &mut TestAppCont
     h.click_selector("sidebar-search");
     assert!(h.window.read_with(&h.cx, |w, _| w.overlay.is_some()), "Search opens the palette");
 }
+
+/// Right-click the middle of `selector`'s element, returning where.
+fn right_click(h: &mut Harness, selector: &'static str) -> gpui::Point<Pixels> {
+    let at = bounds(h, selector).center();
+    h.cx.simulate_mouse_down(at, gpui::MouseButton::Right, Modifiers::none());
+    h.cx.simulate_mouse_up(at, gpui::MouseButton::Right, Modifiers::none());
+    h.cx.run_until_parked();
+    at
+}
+
+fn tab_menu_open(h: &Harness) -> bool {
+    h.window.read_with(&h.cx, |w, _| w.tab_menu.is_open())
+}
+
+fn shown(h: &Harness) -> String {
+    h.window.read_with(&h.cx, |w, _| w.project.clone())
+}
+
+#[gpui::test]
+fn right_clicking_a_tab_opens_its_context_menu_at_the_pointer(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta", "gamma"], &[]);
+    h.take_calls();
+    let at = right_click(&mut h, "tab-beta");
+    assert!(tab_menu_open(&h));
+    assert!(h.take_calls().is_empty(), "a right-click doesn't switch to the tab");
+    let menu = bounds(&mut h, "tab-context-menu");
+    assert_eq!(menu.left(), at.x.round(), "at the pointer");
+    assert_eq!(menu.top(), (at.y + px(2.0)).round(), "just under it");
+    for row in ["tab-context-close", "tab-context-close-others"] {
+        assert_eq!(bounds(&mut h, row).size.height, px(26.0), "{row}: the menus' row");
+    }
+    // Esc closes it.
+    h.focus_window();
+    h.key("escape");
+    assert!(!tab_menu_open(&h));
+    assert!(!drawn(&mut h, "tab-context-menu"), "gone at once under Reduce Motion");
+
+    // A press outside closes it, and goes no further.
+    right_click(&mut h, "tab-gamma");
+    assert!(tab_menu_open(&h));
+    h.cx.simulate_click(point(px(700.0), px(400.0)), Modifiers::none());
+    h.cx.run_until_parked();
+    assert!(!tab_menu_open(&h));
+    assert!(h.take_calls().is_empty());
+
+    // The `+` tab has none.
+    right_click(&mut h, "tab-plus");
+    assert!(!tab_menu_open(&h));
+    assert!(!drawn(&mut h, "tab-context-menu"));
+    assert!(h.take_calls().is_empty(), "nor does a right-click open the + menu");
+}
+
+#[gpui::test]
+fn close_project_closes_the_right_clicked_tab_even_when_it_isnt_shown(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta"], &[]);
+    assert_eq!(shown(&h), "alpha");
+    right_click(&mut h, "tab-beta");
+    h.click_selector("tab-context-close");
+    assert!(!tab_menu_open(&h), "picking a row closes the menu");
+    assert_eq!(
+        h.cx.pending_prompt().map(|(title, _)| title),
+        Some("Close beta app?".to_string()),
+        "the tab's project, through the × path's confirmation"
+    );
+    assert_eq!(shown(&h), "alpha", "the window stays where it is");
+    h.cx.simulate_prompt_answer("Cancel");
+    h.cx.run_until_parked();
+    assert_eq!(order(&h), ["alpha", "beta"], "cancelled: the tab stays");
+
+    // The keyboard reaches it too.
+    right_click(&mut h, "tab-beta");
+    h.focus_window();
+    h.key("down");
+    h.key("enter");
+    assert_eq!(h.cx.pending_prompt().map(|(t, _)| t), Some("Close beta app?".to_string()));
+    h.cx.simulate_prompt_answer("Cancel");
+}
+
+#[gpui::test]
+fn close_all_other_projects_asks_once_naming_them_then_keeps_the_tab(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta", "gamma"], &[]);
+    // Selecting the kept tab switches for real: its feed is a canned one.
+    let (hub, _feeds) = crate::feeds::tests::canned_hub();
+    h.cx.update(|_, cx| cx.set_global(hub));
+    right_click(&mut h, "tab-beta");
+    h.click_selector("tab-context-close-others");
+    let (title, detail) = h.cx.pending_prompt().expect("it asks");
+    assert_eq!(title, "Close 2 other projects?");
+    // The shown project's label is its sidebar's (the fixture's "alpha").
+    assert_eq!(detail, "alpha and gamma app close and their agents stop. beta app keeps running.");
+    h.cx.simulate_prompt_answer("Close Projects");
+    h.cx.run_until_parked();
+    h.draw();
+    assert!(!h.cx.has_pending_prompt(), "one sheet for both, not one each");
+    assert_eq!(shown(&h), "beta", "the right-clicked tab is selected");
+
+    // Cancelled, nothing changes.
+    let mut h2 = open(cx, &["alpha", "beta"], &[]);
+    right_click(&mut h2, "tab-beta");
+    h2.click_selector("tab-context-close-others");
+    h2.cx.simulate_prompt_answer("Cancel");
+    h2.cx.run_until_parked();
+    assert_eq!(shown(&h2), "alpha");
+    assert_eq!(order(&h2), ["alpha", "beta"]);
+}
+
+#[gpui::test]
+fn with_one_tab_close_all_other_projects_is_disabled(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha"], &[]);
+    assert_eq!(order(&h), ["alpha"]);
+    right_click(&mut h, "tab-alpha");
+    assert!(drawn(&mut h, "tab-context-close-others"), "listed, dimmed");
+    h.click_selector("tab-context-close-others");
+    assert!(!h.cx.has_pending_prompt(), "a dimmed row does nothing");
+    // The keys skip it.
+    h.window.update(&mut h.cx, |w, _| {
+        w.tab_menu.close(Instant::now());
+        w.tab_menu.open("alpha", Instant::now());
+    });
+    h.focus_window();
+    h.key("down");
+    h.key("down");
+    let lit = h.window.read_with(&h.cx, |w, _| w.tab_menu.highlight());
+    assert_eq!(lit, Some(tab_bar::TabMenuRow::CloseProject));
+    h.key("escape");
+
+    // Nor does the palette offer it: no other project is open.
+    let listed = |h: &Harness| {
+        let model = h.window.read_with(&h.cx, |w, _| w.command_model());
+        CommandRegistry::new().resolve("action:close-other-projects", &model).is_some()
+    };
+    assert!(!listed(&h));
+    let h2 = open(cx, &["alpha", "beta"], &[]);
+    assert!(listed(&h2), "with another tab it is");
+}
+
+#[gpui::test]
+fn the_palettes_close_all_other_projects_keeps_the_shown_one_after_one_sheet(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta", "gamma"], &[]);
+    h.take_calls();
+    h.perform(vec![HostCall::CloseOtherProjects]);
+    let (title, detail) = h.cx.pending_prompt().expect("it asks");
+    assert_eq!(title, "Close 2 other projects?");
+    assert!(detail.starts_with("beta app and gamma app close"), "{detail}");
+    h.cx.simulate_prompt_answer("Close Projects");
+    h.cx.run_until_parked();
+    assert!(!h.cx.has_pending_prompt());
+    assert_eq!(shown(&h), "alpha");
+}

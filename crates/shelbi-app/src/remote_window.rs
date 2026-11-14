@@ -233,6 +233,7 @@ pub fn command_unavailable(kind: &CommandKind, host: &str) -> Option<String> {
         | CommandKind::OpenTerminalView
         | CommandKind::Detach
         | CommandKind::QuitProject
+        | CommandKind::CloseOtherProjects
         | CommandKind::OpenIssue { .. }
         | CommandKind::OpenChangelogEntry { .. }
         | CommandKind::MoveIssue { .. }
@@ -376,6 +377,8 @@ mod tests {
                 to_status: "todo".into(),
             },
             CommandKind::QuitProject,
+            // Each other far project quits over its own control stream.
+            CommandKind::CloseOtherProjects,
             // A far state write, through the far daemon (P7).
             CommandKind::ToggleZen,
             CommandKind::ShowView(crate::nav::View::Issues),

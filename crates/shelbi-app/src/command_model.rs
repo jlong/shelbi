@@ -141,6 +141,8 @@ pub fn command_model_from(
         launch_screen: false,
         remote_connect: false,
         remote_host: None,
+        // Each client fills these from what it has open.
+        open_others: Vec::new(),
     }
 }
 

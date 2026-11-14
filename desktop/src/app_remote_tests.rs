@@ -268,6 +268,34 @@ fn quitting_a_remote_windows_project_goes_to_the_chooser(cx: &mut TestAppContext
 }
 
 #[gpui::test]
+fn close_all_other_projects_quits_each_far_sibling_and_stays_on_the_kept_one(cx: &mut TestAppContext) {
+    setup(cx);
+    let far = FarHost::new("closeothers");
+    let handle = open(cx, &far);
+    // A second far tab, then back on the first: it is the one kept.
+    update(cx, handle, |w, window, cx| {
+        w.switch_to("other", window, cx);
+        w.switch_to(PROJECT, window, cx);
+    });
+    assert_eq!(read(cx, handle, |w, _| w.tabs.order().to_vec()), [PROJECT, "other"]);
+    update(cx, handle, |w, window, cx| w.confirm_close_other_projects(PROJECT.into(), window, cx));
+    let (title, detail) = cx.pending_prompt().expect("it asks");
+    assert_eq!(title, "Close 1 other project?");
+    assert!(detail.contains("its agents stop"), "{detail}");
+    cx.simulate_prompt_answer("Close Project");
+    settle(cx, "the far daemon to quit the other project", |_| !far.asked.lock().unwrap().quits.is_empty());
+    linger(cx);
+    // Over a control stream for `other` itself: the relay lets it quit its
+    // own project, and the kept one never gets a quit.
+    assert_eq!(far.asked.lock().unwrap().quits, ["other"]);
+    assert!(!cx.has_pending_prompt(), "one confirmation");
+    assert_eq!(read(cx, handle, |w, _| w.tabs.order().to_vec()), [PROJECT]);
+    let (project, chooser) = read(cx, handle, |w, _| (w.project.clone(), w.chooser));
+    assert_eq!(project, PROJECT);
+    assert!(!chooser);
+}
+
+#[gpui::test]
 fn a_switch_during_the_zen_check_drops_the_toggle(cx: &mut TestAppContext) {
     use shelbi_proto::control::StateWrite;
     setup(cx);

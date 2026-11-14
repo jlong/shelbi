@@ -73,6 +73,8 @@ pub enum OverlayEvent {
     Launch(crate::launch::LaunchStep),
     /// Connect to Remote Session connected to this session.
     RemoteConnected(shelbi_app::launch::RemoteSession),
+    /// Close All Other Projects was confirmed: close these projects.
+    CloseOthersConfirmed(Vec<String>),
 }
 
 /// The overlay currently drawn over the main area, with its runtime state.
@@ -93,6 +95,12 @@ pub enum ActiveOverlay {
     ZenIntro {
         project: String,
         state: overlay::zen_intro::IntroState,
+    },
+    /// Close All Other Projects' one confirmation, for `closing` (the
+    /// projects' ids, in order).
+    CloseOthers {
+        closing: Vec<String>,
+        dialog: overlay::close_others::Dialog,
     },
     AddProject {
         form: Box<overlay::add_project::Form>,
@@ -208,6 +216,16 @@ impl ActiveOverlay {
     }
 
     /// Open the Add-project form, prefilling the repo path from `cwd`.
+    /// Close All Other Projects' confirmation: `closing` as `(id, label)`,
+    /// `keep` the label of the project that stays.
+    pub fn close_others(keep: &str, closing: Vec<(String, String)>) -> Self {
+        let labels: Vec<String> = closing.iter().map(|(_, label)| label.clone()).collect();
+        ActiveOverlay::CloseOthers {
+            closing: closing.into_iter().map(|(id, _)| id).collect(),
+            dialog: overlay::close_others::Dialog::new(shelbi_app::close_others::confirmation(keep, &labels)),
+        }
+    }
+
     pub fn add_project(cwd: &Path) -> Self {
         ActiveOverlay::AddProject {
             form: Box::new(overlay::add_project::Form::new(cwd)),
@@ -328,6 +346,7 @@ impl ActiveOverlay {
                     },
                 }
             }
+            ActiveOverlay::CloseOthers { closing, dialog } => close_others_event(closing, dialog.handle_key(ev)),
             ActiveOverlay::AddProject { form } => {
                 let step = form.handle_key(ev);
                 add_project_event(form, step)
@@ -418,6 +437,13 @@ impl ActiveOverlay {
                     OverlayEvent::Stay
                 }
             }
+            ActiveOverlay::CloseOthers { closing, dialog } => {
+                if m.kind == MouseEventKind::Down(MouseButton::Left) {
+                    close_others_event(closing, dialog.handle_click(rect, m.column, m.row))
+                } else {
+                    OverlayEvent::Stay
+                }
+            }
             ActiveOverlay::ErrorLog { viewer, .. } => {
                 match m.kind {
                     MouseEventKind::ScrollUp => viewer.scroll_up(1),
@@ -483,6 +509,7 @@ impl ActiveOverlay {
                 centered_rect(area, 60, h)
             }
             ActiveOverlay::ZenIntro { .. } => centered_rect(area, 64, 16),
+            ActiveOverlay::CloseOthers { .. } => centered_rect(area, 64, 9),
             // The form fills a generous share of the main area so long repo
             // paths and validation messages never truncate (the tmux dialog
             // filled the whole palette window for the same reason).
@@ -536,6 +563,7 @@ impl ActiveOverlay {
             ActiveOverlay::ZenIntro { state, .. } => {
                 overlay::zen_intro::render_intro(f, rect, state)
             }
+            ActiveOverlay::CloseOthers { dialog, .. } => dialog.render(f, rect),
             ActiveOverlay::AddProject { form } => form.render(f, rect),
             ActiveOverlay::About(about) => about.render(f.buffer_mut(), area),
             ActiveOverlay::Feedback(dialog) => dialog.render(f, rect),
@@ -582,6 +610,14 @@ fn dialog_rows(dialog: &overlay::review_confirm::Dialog) -> usize {
 }
 
 /// What a key or click on the add-project form means to the shell.
+fn close_others_event(closing: &[String], step: overlay::close_others::Step) -> OverlayEvent {
+    match step {
+        overlay::close_others::Step::Continue => OverlayEvent::Stay,
+        overlay::close_others::Step::Confirm => OverlayEvent::CloseOthersConfirmed(closing.to_vec()),
+        overlay::close_others::Step::Cancel => OverlayEvent::Close,
+    }
+}
+
 fn add_project_event(form: &overlay::add_project::Form, step: overlay::add_project::Step) -> OverlayEvent {
     use overlay::add_project::Step;
     match step {
@@ -704,6 +740,7 @@ mod tests {
                 project: "alpha".into(),
                 state: overlay::zen_intro::IntroState::default(),
             },
+            ActiveOverlay::close_others("Alpha", vec![("beta".into(), "Beta".into())]),
             ActiveOverlay::add_project(Path::new("/tmp/alpha")),
             ActiveOverlay::about(true),
             ActiveOverlay::feedback(shelbi_app::feedback::Remembered::default(), true),
@@ -873,6 +910,7 @@ mod tests {
             ActiveOverlay::RejectReason { .. } => "reject-reason",
             ActiveOverlay::ErrorLog { .. } => "error-log",
             ActiveOverlay::ZenIntro { .. } => "zen-intro",
+            ActiveOverlay::CloseOthers { .. } => "close-others",
             ActiveOverlay::AddProject { .. } => "add-project",
             ActiveOverlay::About(_) => "about",
             ActiveOverlay::Feedback(_) => "feedback",
@@ -889,7 +927,7 @@ mod tests {
     fn every_overlay_draws_the_shared_dialog_border() {
         let names: std::collections::BTreeSet<_> = every_overlay().iter().map(overlay_name).collect();
         // Every variant but the launch screen ([`launch_overlay`]).
-        assert_eq!(names.len(), 11, "every variant is in every_overlay(): {names:?}");
+        assert_eq!(names.len(), 12, "every variant is in every_overlay(): {names:?}");
         for (w, h) in [(100, 30), (60, 20), (120, 40)] {
             for mut ov in every_overlay() {
                 let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();

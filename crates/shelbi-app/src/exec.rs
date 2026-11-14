@@ -80,6 +80,10 @@ pub enum Effect {
     /// Quit a project: end its sessions and mark it closed. The host
     /// confirms first.
     QuitProject { project: String },
+    /// Close every open project but `keep` (the client's current one): end
+    /// their sessions and mark them closed. The host confirms once for all
+    /// of them first, then quits each through its Quit Project path.
+    CloseOtherProjects { keep: String },
     /// Quit Shelbi entirely: end all sessions and stop the daemon. The host
     /// confirms first.
     QuitShelbi,

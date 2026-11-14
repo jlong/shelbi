@@ -80,6 +80,11 @@ pub enum CommandKind {
     DetachOtherClients,
     /// Quit the current project.
     QuitProject,
+    /// Close every other open project, keeping the current one (the
+    /// palette's "Close All Other Projects", a tab's context menu). Listed
+    /// only while another project is open
+    /// ([`CommandModel::open_others`]).
+    CloseOtherProjects,
     /// Quit Shelbi entirely.
     QuitShelbi,
     /// Open an editable config/instructions target.
@@ -224,6 +229,7 @@ impl CommandKind {
             CommandKind::Detach => Effect::Detach,
             CommandKind::DetachOtherClients => Effect::DetachOtherClients,
             CommandKind::QuitProject => Effect::QuitProject { project: p() },
+            CommandKind::CloseOtherProjects => Effect::CloseOtherProjects { keep: p() },
             CommandKind::QuitShelbi => Effect::QuitShelbi,
             CommandKind::OpenEditor { target } => Effect::OpenEditor {
                 target: target.clone(),
@@ -407,6 +413,10 @@ pub struct CommandModel {
     /// with the reason as its subtitle ([`CommandModel::unavailable`]): a
     /// menu draws them disabled and the client refuses them with that line.
     pub remote_host: Option<String>,
+    /// The open projects other than the current one (a desktop window's
+    /// other tabs; the TUI's other open projects): what Close All Other
+    /// Projects closes. Empty hides the command.
+    pub open_others: Vec<ProjectItem>,
 }
 
 impl CommandModel {
@@ -817,6 +827,22 @@ impl CommandRegistry {
                 shortcut: None,
                 hidden_until_query: false,
             });
+            // Close the rest: only while another project is open.
+            if !model.open_others.is_empty() {
+                out.push(Command {
+                    id: "action:close-other-projects".to_string(),
+                    title: "Close All Other Projects".to_string(),
+                    kind: CommandKind::CloseOtherProjects,
+                    entry_kind: EntryKind::Action,
+                    decoration: Some(Decoration {
+                        glyph: "🏁".into(),
+                        color: DecorationColor::Default,
+                    }),
+                    subtitle: Some("Stop the other open projects' agents and close them".to_string()),
+                    shortcut: None,
+                    hidden_until_query: false,
+                });
+            }
         }
         out.push(Command {
             id: "action:quit-shelbi".to_string(),
@@ -931,6 +957,7 @@ impl CommandKind {
             "action:detach" => Some(CommandKind::Detach),
             "action:detach-others" => Some(CommandKind::DetachOtherClients),
             "action:quit-project" => Some(CommandKind::QuitProject),
+            "action:close-other-projects" => Some(CommandKind::CloseOtherProjects),
             "action:quit-shelbi" => Some(CommandKind::QuitShelbi),
             "edit:project" => Some(CommandKind::OpenEditor {
                 target: EditTarget::Project,
@@ -1023,6 +1050,10 @@ mod tests {
             launch_screen: true,
             remote_connect: true,
             remote_host: None,
+            open_others: vec![ProjectItem {
+                slug: "beta".into(),
+                label: "Beta".into(),
+            }],
         }
     }
 
@@ -1056,6 +1087,7 @@ mod tests {
             "action:detach",
             "action:detach-others",
             "action:quit-project",
+            "action:close-other-projects",
             "action:quit-shelbi",
         ] {
             assert!(ids.contains(&want.to_string()), "missing command id {want}");
@@ -1082,6 +1114,7 @@ mod tests {
             ("action:send-feedback", "📣"),
             ("action:detach", "🛸"),
             ("action:quit-project", "🏁"),
+            ("action:close-other-projects", "🏁"),
             ("action:quit-shelbi", "🏎️"),
         ] {
             let dec = glyph(id);

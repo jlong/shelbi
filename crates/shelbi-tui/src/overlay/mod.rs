@@ -23,6 +23,7 @@
 pub mod about;
 mod about_icon;
 pub mod add_project;
+pub mod close_others;
 pub mod error_log;
 pub mod feedback;
 pub mod new_task;

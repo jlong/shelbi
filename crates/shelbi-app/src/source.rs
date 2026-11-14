@@ -492,13 +492,21 @@ impl ProjectLink {
     /// for the window's own project. `None` for a local link, whose client
     /// quits through its own control connection.
     pub fn quit_far_project(&self) -> Option<Result<(), String>> {
+        self.quit_far_sibling(&self.key.name)
+    }
+
+    /// Quit `project`, another project on this link's far machine (Close All
+    /// Other Projects in a remote window): over a control stream opened for
+    /// `project` itself, which the relay lets quit its own project. `None`
+    /// for a local link.
+    pub fn quit_far_sibling(&self, project: &str) -> Option<Result<(), String>> {
         let relay = self.relay.as_ref()?;
         Some(
-            Self::far_control(&**relay, &self.key.name)
+            Self::far_control(&**relay, project)
                 .map_err(|e| e.to_string())
                 .and_then(|mut client| {
                     client
-                        .quit_project(&self.key.name)
+                        .quit_project(project)
                         .map_err(|e| format!("{}: {e}", relay.host()))
                 }),
         )

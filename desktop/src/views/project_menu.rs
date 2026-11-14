@@ -129,6 +129,44 @@ pub fn divider(theme: &Theme) -> Div {
         .child(div().h(px(1.0)).bg(theme.divider))
 }
 
+/// A plain row of `label` (a tab's context menu): the same 26pt row, its
+/// keyboard row lit, the rest fading in on hover.
+pub fn text_row(
+    id: impl Into<ElementId>,
+    key: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    row(id.into(), key.into(), selected, theme).child(div().flex_1().min_w_0().truncate().child(label.into()))
+}
+
+/// [`text_row`] that can't be chosen: at the disabled opacity, with no
+/// hover, press or pointer.
+pub fn disabled_text_row(
+    id: impl Into<ElementId>,
+    key: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let key: SharedString = key.into();
+    div()
+        .id(id.into())
+        .debug_selector(move || key.to_string())
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap_1()
+        .h(px(ROW_H))
+        .px_2()
+        .rounded(px(RADIUS))
+        .opacity(0.4)
+        .type_style(Type::Base)
+        .text_color(theme.foreground)
+        .child(div().flex_1().min_w_0().truncate().child(label.into()))
+}
+
 /// The trailing "+ Add project" row.
 pub fn add_row(
     id: impl Into<ElementId>,

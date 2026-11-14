@@ -141,7 +141,7 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (Icon, Hsla) {
         // The sidebar footer's megaphone and cog.
         "action:send-feedback" => icons::MEGAPHONE,
         "action:settings" => icons::COG_6_TOOTH,
-        "action:quit-project" => icons::X_MARK,
+        "action:quit-project" | "action:close-other-projects" => icons::X_MARK,
         "action:quit-shelbi" => icons::FLAG_FINISH,
         "action:detach-others" => icons::SIGNAL_SLASH,
         "action:add-project" | "action:new-window" => icons::PLUS,
