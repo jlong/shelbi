@@ -85,7 +85,8 @@
 //! launch's CLI setup screens before them; `SHELBI_VISUAL_ONLY=cli-setup`.
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
-//! components; `=issues` just the board, its states and the task pane.
+//! components; `=issues` just the board, its states and the task pane;
+//! `=sidebar` just the sidebar's and the tab bar's states.
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -2732,6 +2733,12 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "sidebar") {
+            // Just the sidebar's and the tab bar's states.
+            self.sidebar_states(&orch);
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "settings") {
             self.settings();
             return;
@@ -3148,6 +3155,39 @@ impl Run {
             .update(&mut self.cx, |w, _, cx| w.offscreen_toggle_sidebar(cx))
             .unwrap();
         self.save(handle, "state-sidebar-hidden");
+
+        // Too many tabs for the search box: it collapses to the magnifier
+        // button at the bar's right end (no frame draws it; checked by eye
+        // against the box's spot). A catalog of its own, so the other
+        // states keep the frame's projects.
+        let catalog = self.cx.update(|cx| cx.try_global::<crate::projects::Catalog>().cloned());
+        let entry = |name: &str, label: &str| crate::projects::ProjectEntry {
+            name: name.into(),
+            label: label.into(),
+        };
+        let crowded = [
+            (PROJECT, "My project"),
+            ("shelbi", "Shelbi"),
+            ("chartme", "ChartMe"),
+            ("contextstore", "ContextStore"),
+            ("website", "Website"),
+            ("docs", "Docs"),
+            ("changelog", "Changelog"),
+            ("wordlock", "Wordlock"),
+            ("hexicon", "Hexicon"),
+            ("tilde", "Tilde"),
+        ];
+        let many = crate::projects::Catalog::with(crowded.iter().map(|(n, l)| entry(n, l)).collect(), Vec::new());
+        many.set_open(&crowded.iter().map(|(n, _)| *n).collect::<Vec<_>>());
+        self.cx.update(|cx| cx.set_global(many));
+        let handle = self.open();
+        self.click(handle, orch.clone());
+        handle.update(&mut self.cx, |w, _, cx| w.offscreen_sync_tabs(cx)).unwrap();
+        self.settle(handle);
+        self.save(handle, "state-tabbar-search-collapsed");
+        if let Some(catalog) = catalog {
+            self.cx.update(|cx| cx.set_global(catalog));
+        }
     }
 
     fn views(&mut self, handle: WindowHandle<ShelbiWindow>) -> NativeViews {

@@ -97,13 +97,22 @@ fn the_tab_bar_spans_the_window_over_the_sidebar(cx: &mut TestAppContext) {
     assert_eq!(plus.left(), beta.right() + px(1.0));
     assert_eq!(plus.size, size(px(52.0), px(52.0)));
 
-    // The sidebar starts under the bar with its 58pt header row ("Project",
-    // Search, Toggle sidebar), then the nav 8pt down: no project switcher.
+    // The sidebar starts under the bar with its 58pt header row (the
+    // project's name and Toggle sidebar, no Search), then the nav 8pt down:
+    // no project switcher.
     let sidebar = bounds(&mut h, "sidebar");
     assert_eq!(sidebar.top(), px(52.0));
     let header = bounds(&mut h, "sidebar-header");
     assert_eq!((header.top(), header.size.height), (sidebar.top(), px(58.0)));
-    assert!(drawn(&mut h, "sidebar-search") && drawn(&mut h, "sidebar-toggle"));
+    assert!(drawn(&mut h, "sidebar-header-name") && drawn(&mut h, "sidebar-toggle"));
+    assert!(!drawn(&mut h, "sidebar-search"), "the tab bar's search box is the one Search");
+    // It names the shown project as its tab does.
+    let (title, tab) = h.window.read_with(&h.cx, |w, cx| {
+        let tabs = w.tab_props(cx);
+        let selected = tabs.iter().find(|t| t.selected).map(|t| t.label.to_string());
+        (sidebar::header_title(&w.model).to_string(), selected)
+    });
+    assert_eq!(Some(title), tab, "the header says what the selected tab says");
     let orchestrator = bounds(&mut h, "sidebar-nav-Orchestrator");
     assert_eq!(orchestrator.top(), sidebar.top() + px(58.0 + 8.0), "the frame's nav at y 58, 8pt in");
     for gone in ["sidebar-project-title", "sidebar-collapse"] {
@@ -323,4 +332,80 @@ fn a_project_opened_elsewhere_gets_a_tab_not_a_menu_row(cx: &mut TestAppContext)
     assert!(drawn(&mut h, "tab-gamma"));
     assert!(!drawn(&mut h, "tab-menu-project-gamma"));
     assert!(drawn(&mut h, "tab-menu-project-beta") && drawn(&mut h, "tab-menu-project-delta"));
+}
+
+/// Resize the window to `width` wide, its height kept, and draw.
+fn resize(h: &mut Harness, width: Pixels) {
+    let height = h.cx.update(|window, _| window.viewport_size().height);
+    h.cx.simulate_resize(size(width, height));
+    h.draw();
+}
+
+/// The narrowest bar the search box fits in beside the tabs as drawn: past
+/// the `+` tab's rule, the gap, the box and its 10pt. Each tab's measured
+/// name rounds up, so the box shows by `slack` more.
+fn box_room(h: &mut Harness) -> Pixels {
+    let plus = bounds(h, "tab-plus");
+    plus.right() + px(1.0 + tab_bar::SEARCH_MIN_GAP + tab_bar::SEARCH_W + tab_bar::SEARCH_RIGHT)
+}
+
+/// The collapsed search: a 32pt button 10pt from the right edge, centered
+/// in the bar where the box was.
+fn assert_search_button(h: &mut Harness) {
+    let width = h.cx.update(|window, _| window.viewport_size().width);
+    assert!(!drawn(h, "tab-bar-search"), "the box gives way");
+    let button = bounds(h, "tab-bar-search-button");
+    assert_eq!(button.size, size(px(32.0), px(32.0)));
+    assert_eq!(button.right(), width - px(10.0));
+    assert_eq!(button.top(), px(10.0), "centered in the bar, as the box is");
+}
+
+#[gpui::test]
+fn the_search_box_collapses_where_the_window_narrows_and_comes_back(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta"], &[]);
+    assert!(drawn(&mut h, "tab-bar-search") && !drawn(&mut h, "tab-bar-search-button"));
+    let room = box_room(&mut h);
+
+    // Just room enough (the two tabs' rounding): the full box.
+    resize(&mut h, room + px(2.0));
+    assert!(drawn(&mut h, "tab-bar-search") && !drawn(&mut h, "tab-bar-search-button"));
+    assert_eq!(bounds(&mut h, "tab-bar-search").size, size(px(170.0), px(32.0)));
+
+    // A point less: the magnifier button in its spot.
+    resize(&mut h, room - px(1.0));
+    assert_search_button(&mut h);
+    // It opens the palette, as the box does; its tooltip names the chord.
+    h.click_selector("tab-bar-search-button");
+    assert!(h.window.read_with(&h.cx, |w, _| w.overlay.is_some()), "the button opens the palette");
+    let chord = h.window.read_with(&h.cx, |w, _| w.palette_chord.clone());
+    assert_eq!(sidebar::search_tip(&chord), "Search (⌘K)");
+    h.window.update(&mut h.cx, |w, cx| {
+        w.overlay = None;
+        cx.notify();
+    });
+
+    // Widened again: the box is back.
+    resize(&mut h, room + px(2.0));
+    assert!(drawn(&mut h, "tab-bar-search") && !drawn(&mut h, "tab-bar-search-button"));
+}
+
+#[gpui::test]
+fn more_tabs_collapse_the_search_box_and_closing_them_brings_it_back(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta"], &[]);
+    // A window the two tabs and the box just fill.
+    let room = box_room(&mut h);
+    resize(&mut h, room + px(2.0));
+    assert!(drawn(&mut h, "tab-bar-search"));
+
+    // Two more tabs: no room for the box.
+    h.cx.update(|_, cx| cx.global::<Catalog>().set_open(&PROJECTS));
+    h.window.update(&mut h.cx, |w, cx| w.sync_tabs(cx));
+    assert_eq!(order(&h).len(), 4);
+    assert_search_button(&mut h);
+
+    // Closed elsewhere: back to two tabs, and the box.
+    h.cx.update(|_, cx| cx.global::<Catalog>().set_open(&["alpha", "beta"]));
+    h.window.update(&mut h.cx, |w, cx| w.sync_tabs(cx));
+    assert_eq!(order(&h).len(), 2);
+    assert!(drawn(&mut h, "tab-bar-search") && !drawn(&mut h, "tab-bar-search-button"));
 }

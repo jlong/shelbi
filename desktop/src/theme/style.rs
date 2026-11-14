@@ -63,6 +63,9 @@ pub enum Type {
     /// `Desktop/Large/Medium`: 16 / 24, 500. A Large button's label (the
     /// Orchestrator onboarding's actions).
     LargeMedium,
+    /// `Desktop/Large/Semibold`: 16 / 24, 600. The sidebar's project name
+    /// and the Settings header's title.
+    LargeSemibold,
     /// `Desktop/Base/Regular`: 14 / 18. Body text, nav labels, card titles'
     /// descriptions in a dialog.
     Base,
@@ -89,7 +92,7 @@ impl Type {
         match self {
             Type::Title => 24.0,
             Type::Heading => 20.0,
-            Type::LargeMedium => 16.0,
+            Type::LargeMedium | Type::LargeSemibold => 16.0,
             Type::Base | Type::BaseMedium | Type::BaseSemibold => 14.0,
             Type::Small | Type::SmallMedium => 13.0,
             Type::XSmall | Type::XSmallMedium | Type::XSmallSemibold => 12.0,
@@ -101,7 +104,7 @@ impl Type {
         match self {
             Type::Title => 32.0,
             Type::Heading => 28.0,
-            Type::LargeMedium => 24.0,
+            Type::LargeMedium | Type::LargeSemibold => 24.0,
             Type::Base | Type::BaseMedium | Type::BaseSemibold | Type::Small | Type::SmallMedium => 18.0,
             Type::XSmall | Type::XSmallMedium | Type::XSmallSemibold => 16.0,
         }
@@ -111,7 +114,7 @@ impl Type {
         match self {
             Type::Base | Type::Small | Type::XSmall => FontWeight::NORMAL,
             Type::LargeMedium | Type::BaseMedium | Type::SmallMedium | Type::XSmallMedium => FontWeight::MEDIUM,
-            Type::Title | Type::BaseSemibold | Type::XSmallSemibold => FontWeight::SEMIBOLD,
+            Type::Title | Type::LargeSemibold | Type::BaseSemibold | Type::XSmallSemibold => FontWeight::SEMIBOLD,
             Type::Heading => FontWeight::BOLD,
         }
     }
@@ -1398,6 +1401,12 @@ impl gpui::Render for Tooltip {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_semibold_is_geist_16_on_24_at_600() {
+        let ty = Type::LargeSemibold;
+        assert_eq!((ty.size(), ty.line_height(), ty.weight()), (16.0, 24.0, FontWeight::SEMIBOLD));
+    }
 
     #[test]
     fn a_filter_chip_is_select_while_set_or_open() {

@@ -3,12 +3,12 @@
 //! while Settings is open, as the task panels do (`column_swap`).
 //!
 //! It starts under the window's tab bar, like the app sidebar. Top to
-//! bottom: the header row (the back button beside the Settings title, then
-//! Search and Toggle sidebar, as the app sidebar's), then each section:
+//! bottom: the header row (the back button beside the Settings title, in
+//! Large/Semibold, then Toggle sidebar, as the app sidebar's), then each section:
 //! its header and its pages' nav rows, each with its ⌘N. The Global
 //! section (General, Keybindings, Terminal), then, after a divider, the
 //! project section (`dt-wf-settings-index`, frame 2301:5824): the project's
-//! name (the tab bar switches projects, and a switch reopens Settings on
+//! name in Large/Semibold, as the app sidebar's header shows it (the tab bar switches projects, and a switch reopens Settings on
 //! the new project), over the project's pages:
 //! Workspaces (`dt-workspace-settings-index`, frame 2523:8879), Workflows
 //! and Agents (`dt-agents-settings-page`, frame 2377:41040). The frames'
@@ -18,7 +18,7 @@
 //! [`SettingsNav`] (from `shelbi_app::settings`, shared with the TUI) is the
 //! toolkit-free part: the page shown and the row the keys moved to.
 
-use gpui::{div, prelude::*, px, AnyElement, Bounds, Context, FontWeight, Pixels, SharedString};
+use gpui::{div, prelude::*, px, AnyElement, Bounds, Context, Pixels, SharedString};
 
 use super::sidebar::{self, nav_item, SidebarEvent, SidebarHost};
 use super::task_panel;
@@ -27,9 +27,6 @@ use crate::keys::tab_hotkey;
 use crate::theme::motion::{self, SharedTrack};
 use crate::theme::style::{self, Type, Typography, NAV_RADIUS};
 use crate::theme::Theme;
-
-/// The Settings title's size.
-const TITLE_SIZE: f32 = 18.0;
 
 // The pages, their sections and numbers, and the sidebar's navigation are
 // shared with the TUI (`shelbi_app::settings`); this client offers every page
@@ -124,7 +121,7 @@ fn project_header(label: SharedString, theme: &Theme) -> impl IntoElement {
                         .px(px(8.0))
                         .min_w_0()
                         .truncate()
-                        .type_style(Type::BaseMedium)
+                        .type_style(Type::LargeSemibold)
                         .text_color(theme.foreground)
                         .child(label),
                 ),
@@ -135,14 +132,12 @@ fn project_header(label: SharedString, theme: &Theme) -> impl IntoElement {
 const PROJECT_ROW_H: f32 = 28.0;
 
 /// The settings sidebar. `chip` is the sliding selection while it moves
-/// (measured on `track`); `project` is the shown project's name;
-/// `palette_chord` the header's Search names.
+/// (measured on `track`); `project` is the shown project's name.
 pub fn render<H: SidebarHost>(
     nav: SettingsNav,
     chip: Option<Bounds<Pixels>>,
     track: &SharedTrack,
     project: SharedString,
-    palette_chord: &str,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> AnyElement {
@@ -158,21 +153,18 @@ pub fn render<H: SidebarHost>(
         .min_w_0()
         .items_center()
         .h(px(24.0))
-        // The frame's Desktop/Heading reads 18 / 28 semibold here; the
-        // app's `Type::Heading` (20 / 28 bold) is left to its other titles.
-        .type_style(Type::Heading)
-        .text_size(px(TITLE_SIZE))
-        .font_weight(FontWeight::SEMIBOLD)
+        // Large/Semibold, the project name's style below and the app
+        // sidebar's header's.
+        .debug_selector(|| "settings-title".into())
+        .truncate()
+        .type_style(Type::LargeSemibold)
         .text_color(theme.foreground)
         .child("Settings");
     // The header row (2252:27533): the back button and the title 12pt
-    // apart, 12pt in, then Search and Toggle sidebar.
+    // apart, 12pt in, then Toggle sidebar (no Search: the tab bar has it).
     let header = sidebar::header_row(
         div().flex().flex_row().flex_1().min_w_0().items_center().gap(px(12.0)).child(back).child(title),
         sidebar::HEADER_PAD_LEFT,
-        sidebar::search_button("settings-search", palette_chord, theme).on_click(cx.listener(
-            |this, _, window, cx| this.sidebar_event(SidebarEvent::OpenSearch, window, cx),
-        )),
         sidebar::toggle_button("settings-toggle", Some(true), theme).on_click(cx.listener(
             |this, _, window, cx| this.sidebar_event(SidebarEvent::Collapse, window, cx),
         )),
