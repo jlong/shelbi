@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 /// What the main area is showing.
 ///
-/// `Issues`, `Changelog`, `Activity`, and `Machines` are native (in-process)
-/// views.
+/// `Issues`, `Changelog`, `Activity`, `Machines`, and `Jobs` are native
+/// (in-process) views.
 /// [`View::Session`] is a terminal view bound to a session by name — the
 /// orchestrator chat, a workspace agent, or a review editor/diff session.
 ///
@@ -30,6 +30,9 @@ pub enum View {
     Changelog,
     Activity,
     Machines,
+    /// The project's active awareness jobs ([`crate::jobs`]). Palette-only,
+    /// like Activity and Machines.
+    Jobs,
     /// A session rendered in a terminal view, identified by session name.
     Session(String),
 }
@@ -51,6 +54,7 @@ impl View {
             "changelog" => View::Changelog,
             "activity" => View::Activity,
             "machines" => View::Machines,
+            "jobs" => View::Jobs,
             other => View::Session(other.to_string()),
         }
     }
@@ -64,6 +68,7 @@ impl View {
             View::Changelog => "changelog".to_string(),
             View::Activity => "activity".to_string(),
             View::Machines => "machines".to_string(),
+            View::Jobs => "jobs".to_string(),
             View::Session(name) => name.clone(),
         }
     }
@@ -446,6 +451,7 @@ mod tests {
             View::Changelog,
             View::Activity,
             View::Machines,
+            View::Jobs,
             View::Session("orch".into()),
             View::Session("alpha-1".into()),
         ] {
@@ -455,6 +461,7 @@ mod tests {
         assert_eq!(View::from_view_id("tasks"), View::Issues);
         assert_eq!(View::from_view_id("activity"), View::Activity);
         assert_eq!(View::from_view_id("changelog"), View::Changelog);
+        assert_eq!(View::from_view_id("jobs"), View::Jobs);
         assert_eq!(View::from_view_id("orch"), View::Session("orch".into()));
     }
 

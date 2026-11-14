@@ -35,6 +35,7 @@ paths on every `cargo test`.
 | Changelog | `view:changelog` | Added after this walk: the sidebar's Changelog row (its page is `changelog-tui`'s) | The Changelog page (`changelog-desktop`: Go ▸ Changelog, ⌘L, the sidebar's Changelog; issue chips open the issue's detail, PR and URL chips the browser) |
 | Activity | `view:activity` | Feed, palette-only since the Changelog took its row | Feed, palette-only since the Changelog took its row |
 | Machines | `view:machines` | Machines view, palette-only | Machines view (Go ▸ Machines) |
+| Jobs | `view:jobs` | Added after this walk (`jobs-screen`): the project's active awareness jobs, palette-only, in a three-column table (`jobs.rs`); the selected row's whole command under it | Same table (`views/jobs.rs`); the whole command in the Command cell's tooltip. A remote window says jobs aren't available yet |
 | Workspace | `workspace:<name>` | Idle placeholder for an idle workspace; the agent when one runs | Same (Go ▸ Workspaces ▸ dev) |
 | Open review | `review:<id>` | Serving task: the review interface (panel, live server line, reviewer session) | Queued task: the "Load for review" slot dialog (Go ▸ Reviews ▸ … ▸ Open Review); a serving one opens the Review view |
 | Approve | `action:approve-review:<id>` | Reached the daemon; the sandbox's gated merge refused (no `origin` to push to) and the status line said so | Reached the daemon; refused (the slot never loaded the task) and the banner said so |

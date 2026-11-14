@@ -145,6 +145,7 @@ use crate::views::sidebar_reveal::{self, SidebarReveal};
 use crate::views::issues::{IssuesEvent, IssuesView};
 use crate::views::pane_session::MainShows;
 use crate::views::session_view::SessionDeps;
+use crate::views::jobs::JobsView;
 use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::changelog::{ChangelogEvent, ChangelogView};
 use crate::views::diff_view::DiffKeys;
@@ -1220,6 +1221,8 @@ pub struct ShelbiWindow {
     activity_reader: Option<ActivityReader>,
     prefetch_activity: bool,
     machines: Option<Entity<MachinesView>>,
+    /// The Jobs screen (palette-only), created the first time it is shown.
+    jobs: Option<Entity<JobsView>>,
     /// The Changelog page, created the first time it is shown.
     changelog: Option<Entity<ChangelogView>>,
     /// The open overlay (palette or dialog), mirrored in `client.overlay()`.
@@ -1514,6 +1517,7 @@ impl ShelbiWindow {
             || self.issues.is_some()
             || self.activity.is_some()
             || self.machines.is_some()
+            || self.jobs.is_some()
             || self.changelog.is_some();
         if open {
             self.teardown_project(window, cx);
@@ -1739,6 +1743,7 @@ impl ShelbiWindow {
             activity_reader: None,
             prefetch_activity: false,
             machines: None,
+            jobs: None,
             changelog: None,
             overlay: None,
             palette_inputs: PaletteInputs::default(),
@@ -1988,7 +1993,7 @@ impl ShelbiWindow {
             view if is_chat(view) => notify::Showing::Orchestrator,
             View::Session(name) => notify::Showing::Workspace(name.clone()),
             View::Issues => notify::Showing::Board,
-            View::Changelog | View::Activity | View::Machines => notify::Showing::Other,
+            View::Changelog | View::Activity | View::Machines | View::Jobs => notify::Showing::Other,
         }
     }
 
@@ -2422,6 +2427,9 @@ impl ShelbiWindow {
         self.activity_reader = None;
         if let Some(machines) = self.machines.take() {
             machines.update(cx, |v, _| v.stop_workers());
+        }
+        if let Some(jobs) = self.jobs.take() {
+            jobs.update(cx, |v, _| v.stop_workers());
         }
         if let Some(changelog) = self.changelog.take() {
             changelog.update(cx, |v, _| v.stop_workers());
@@ -3008,6 +3016,9 @@ impl ShelbiWindow {
                     }
                     View::Machines => {
                         self.ensure_machines(window, cx);
+                    }
+                    View::Jobs => {
+                        self.ensure_jobs(cx);
                     }
                     View::Session(_) => {}
                 }
@@ -4168,6 +4179,18 @@ impl ShelbiWindow {
         machines
     }
 
+    /// The Jobs screen for the window's project, created on first use. It
+    /// only reads: nothing it does reaches the window.
+    fn ensure_jobs(&mut self, cx: &mut Context<Self>) -> Entity<JobsView> {
+        if let Some(jobs) = &self.jobs {
+            return jobs.clone();
+        }
+        let project = self.project_handle.clone();
+        let jobs = cx.new(|cx| JobsView::new(&project, cx));
+        self.jobs = Some(jobs.clone());
+        jobs
+    }
+
     /// The Changelog page for the window's project, created on first use.
     /// An issue chip opens the issue's detail on the board.
     fn ensure_changelog(
@@ -4297,6 +4320,11 @@ impl ShelbiWindow {
             View::Machines if self.machines.is_some() => {
                 if let Some(machines) = &self.machines {
                     machines.update(cx, |v, _| v.request_focus());
+                }
+            }
+            View::Jobs if self.jobs.is_some() => {
+                if let Some(jobs) = &self.jobs {
+                    jobs.update(cx, |v, _| v.request_focus());
                 }
             }
             View::Changelog if self.changelog.is_some() => {
@@ -5886,6 +5914,7 @@ impl ShelbiWindow {
                     View::Changelog => self.changelog.clone().map(|v| v.into_any_element()),
                     View::Activity => self.activity.clone().map(|v| v.into_any_element()),
                     View::Machines => self.machines.clone().map(|v| v.into_any_element()),
+                    View::Jobs => self.jobs.clone().map(|v| v.into_any_element()),
                     View::Session(_) if is_chat(view) => match &self.onboarding {
                         Some(onboarding) => Some(onboarding.clone().into_any_element()),
                         None => self.chat.clone().map(|v| v.into_any_element()),
@@ -6896,6 +6925,11 @@ impl ShelbiWindow {
     /// The Changelog page, once shown.
     pub(crate) fn offscreen_changelog(&self) -> Option<Entity<ChangelogView>> {
         self.changelog.clone()
+    }
+
+    /// The Jobs screen, once shown.
+    pub(crate) fn offscreen_jobs(&self) -> Option<Entity<JobsView>> {
+        self.jobs.clone()
     }
 
     /// The native views shown so far.

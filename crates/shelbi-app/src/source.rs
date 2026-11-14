@@ -266,6 +266,8 @@ pub trait ProjectSource: Send + Sync {
     fn review_slots(&self) -> Result<Vec<ReviewSlot>, String>;
     /// The Machines page.
     fn machines(&self) -> Result<MachinesModel, String>;
+    /// The project's active awareness jobs (the Jobs screen).
+    fn jobs(&self) -> crate::jobs::JobsRead;
     /// Whether `host` answers over SSH, probed from the project's machine
     /// (the machine that would run agents there).
     fn machine_reachability(&self, host: &str) -> Reachability;
@@ -752,6 +754,9 @@ pub mod null {
         }
         fn machines(&self) -> Result<MachinesModel, String> {
             Err(NOTHING.into())
+        }
+        fn jobs(&self) -> crate::jobs::JobsRead {
+            crate::jobs::JobsRead::Unavailable
         }
         fn machine_reachability(&self, _host: &str) -> Reachability {
             Reachability::Unknown

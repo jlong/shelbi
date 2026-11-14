@@ -261,7 +261,7 @@ fn keystrokes_for(text: &str) -> String {
 fn every_registry_command_runs_from_the_palette(cx: &mut TestAppContext) {
     let mut h = Harness::open(cx);
     let commands = h.commands();
-    assert_eq!(commands.len(), 31, "the fixture offers every kind of command");
+    assert_eq!(commands.len(), 32, "the fixture offers every kind of command");
     for command in &commands {
         h.focus_window();
         h.key("ctrl-space");
@@ -565,6 +565,24 @@ impl Harness {
         let command = self.commands().into_iter().find(|c| c.id() == id).unwrap_or_else(|| panic!("{id}"));
         expected_calls(command.kind())
     }
+}
+
+#[gpui::test]
+fn typing_jobs_in_the_palette_opens_the_jobs_screen(cx: &mut TestAppContext) {
+    let mut h = Harness::open(cx);
+    h.open_palette();
+    h.key(&keystrokes_for("Jobs"));
+    h.draw();
+    assert_eq!(h.selected_id().as_deref(), Some("view:jobs"), "typing Jobs offers the Jobs screen first");
+    assert_eq!(h.palette_label("view:jobs"), "Jobs");
+    h.key("enter");
+    assert!(!h.overlay_open(), "running it closes the palette");
+    let calls = h.take_calls();
+    assert_eq!(calls, vec![HostCall::ShowView(View::Jobs)]);
+    h.perform(calls);
+    assert_eq!(h.window.read_with(&h.cx, |w, _| w.client.view().clone()), View::Jobs);
+    assert!(h.window.read_with(&h.cx, |w, _| w.jobs.is_some()), "the Jobs view is built");
+    assert!(h.cx.debug_bounds("jobs-title").is_some(), "the Jobs screen draws in the main area");
 }
 
 #[gpui::test]

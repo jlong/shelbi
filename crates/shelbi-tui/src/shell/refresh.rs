@@ -27,6 +27,8 @@ pub struct ShellSnapshot {
     pub board: Option<BoardData>,
     pub activity: Option<ActivityData>,
     pub machines: Option<MachinesModel>,
+    /// The project's active awareness jobs (the Jobs screen).
+    pub jobs: Option<shelbi_app::jobs::JobsRead>,
 }
 
 /// A refresh worker, generic over the payload `T` it publishes. Dropping it
@@ -57,6 +59,7 @@ mod tests {
             board: None,
             activity: None,
             machines: None,
+            jobs: None,
         }
     }
 

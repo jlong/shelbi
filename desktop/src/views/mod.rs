@@ -103,6 +103,7 @@ pub mod harness_picker;
 pub mod new_task;
 pub mod font_picker;
 pub mod issues;
+pub mod jobs;
 pub mod keybindings;
 pub mod launch;
 pub mod machines;

@@ -398,6 +398,7 @@ mod tests {
         assert_eq!(nav_view_hotkey(&View::Changelog).as_deref(), Some("⌘L"));
         assert_eq!(nav_view_hotkey(&View::Activity), None, "Activity is palette-only");
         assert_eq!(nav_view_hotkey(&View::Machines), None);
+        assert_eq!(nav_view_hotkey(&View::Jobs), None, "Jobs is palette-only: no chord");
         assert_eq!(row_hotkey(4), "⌃4");
         assert_eq!(tab_hotkey(4), "⌘4");
     }

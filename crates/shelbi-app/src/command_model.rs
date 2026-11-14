@@ -28,6 +28,7 @@ pub fn nav_glyph(label: &str) -> &'static str {
         "Changelog" => "🚀",
         "Activity" => "⚡",
         "Machines" => "🖥",
+        "Jobs" => "⏳",
         _ => "•",
     }
 }
@@ -86,8 +87,13 @@ pub fn command_model_from(
             decoration: nav_decoration(&n.label),
         })
         .collect();
-    // Activity and Machines are palette-only (no sidebar row); add each once.
-    for (view, title) in [(View::Activity, "Activity"), (View::Machines, "Machines")] {
+    // Activity, Machines and Jobs are palette-only (no sidebar row); add
+    // each once.
+    for (view, title) in [
+        (View::Activity, "Activity"),
+        (View::Machines, "Machines"),
+        (View::Jobs, crate::jobs::TITLE),
+    ] {
         if !views.iter().any(|v| v.view == view) {
             views.push(ViewItem {
                 id: format!("view:{}", view.as_view_id()),
@@ -343,11 +349,14 @@ mod tests {
         let m = command_model_from("alpha", &sidebar(), false, Vec::new(), Vec::new());
         assert!(m.zen_on);
         let ids: Vec<&str> = m.views.iter().map(|v| v.id.as_str()).collect();
-        // Activity and Machines follow the sidebar's nav as palette-only views.
+        // Activity, Machines and Jobs follow the sidebar's nav as
+        // palette-only views.
         assert_eq!(
             ids,
-            ["view:orch", "view:tasks", "view:changelog", "view:activity", "view:machines"]
+            ["view:orch", "view:tasks", "view:changelog", "view:activity", "view:machines", "view:jobs"]
         );
+        assert_eq!(m.views[5].title, "Jobs");
+        assert_eq!(m.views[5].view, View::Jobs);
         assert_eq!(m.views[2].decoration.as_ref().unwrap().glyph, "🚀");
         assert_eq!(m.views[3].title, "Activity");
         assert_eq!(m.views[3].decoration.as_ref().unwrap().glyph, "⚡");
@@ -370,6 +379,7 @@ mod tests {
         let m = command_model_from("alpha", &s, false, Vec::new(), Vec::new());
         assert_eq!(m.views.iter().filter(|v| v.view == View::Machines).count(), 1);
         assert_eq!(m.views.iter().filter(|v| v.view == View::Activity).count(), 1);
+        assert_eq!(m.views.iter().filter(|v| v.view == View::Jobs).count(), 1);
     }
 
     /// The palette's whole default list for a fixture state, in order: the
@@ -398,6 +408,7 @@ mod tests {
                 "view:changelog",
                 "view:activity",
                 "view:machines",
+                "view:jobs",
                 "action:toggle-zen",
                 "review:T-9",
                 "action:new-issue",
@@ -414,6 +425,9 @@ mod tests {
             .map(|(e, _)| e.id)
             .collect();
         assert_eq!(typed, ["action:switch-project:beta"]);
+        // Typing "Jobs" offers the Jobs screen first.
+        let jobs = shelbi_palette::search(&CommandRegistry::new().entries(&m), "Jobs");
+        assert_eq!(jobs.first().map(|(e, _)| e.id.as_str()), Some("view:jobs"));
     }
 
     fn liveness(open: &[&str], working: &[&str]) -> ProjectLiveness {

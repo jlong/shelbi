@@ -86,7 +86,9 @@
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
 //! components; `=issues` just the board, its states and the task pane;
-//! `=sidebar` just the sidebar's and the tab bar's states.
+//! `=sidebar` just the sidebar's and the tab bar's states. `jobs` and
+//! `jobs-empty` are the Jobs screen with four jobs and with none (no
+//! frame; checked by eye); `=jobs` renders just those.
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -1126,6 +1128,10 @@ impl Run {
             if let Some(v) = changelog {
                 v.update(&mut self.cx, |v, cx| v.poll(cx));
             }
+            let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap();
+            if let Some(v) = jobs {
+                v.update(&mut self.cx, |v, cx| v.poll(cx));
+            }
             self.now.set(self.now.get() + Duration::from_secs(1));
             self.cx
                 .update_window(window, |_, window, cx| window.draw(cx).clear(cx))
@@ -1243,6 +1249,68 @@ impl Run {
         });
         self.save(handle, screen);
         crate::views::machines::stub_reachability(shelbi_core::Reachability::Reachable);
+    }
+
+    /// The Jobs screen (no Figma frame; checked by eye): `jobs` with a
+    /// command job (its long command cut), a CI watch and a PR watch, newest
+    /// first, then `jobs-empty` once every job has finished. The store is
+    /// written straight into the fixture project, as `shelbi job` would.
+    /// `SHELBI_VISUAL_ONLY=jobs` renders just these.
+    fn jobs(&mut self) {
+        use shelbi_state::awareness::{update_awareness, Job, JobKind};
+        let now = pinned_now();
+        let job = |id: &str, kind, target: &str, label: Option<&str>, mins: i64| Job {
+            id: id.into(),
+            kind,
+            target: target.into(),
+            label: label.map(str::to_string),
+            started_at: now - chrono::Duration::minutes(mins),
+            runner_pid: None,
+        };
+        let jobs = vec![
+            job(
+                "j7",
+                JobKind::Command,
+                "zsh -c /Users/jlong/Workspaces/shelbi/scripts/release/bundle.sh && open target/release/bundle/osx/Shelbi.app",
+                Some("bundle desktop app"),
+                4,
+            ),
+            job(
+                "j6",
+                JobKind::Command,
+                "zsh -c 'cd /Users/jlong/Workspaces/shelbi/desktop && cargo clippy --all-targets -- -D warnings && cargo test'",
+                Some("desktop checks project-tabs"),
+                39,
+            ),
+            job("j5", JobKind::Ci, "d482e3fe5a1b2c3d4e5f60718293a4b5c6d7e8f9", None, 51),
+            job("j4", JobKind::Pr, "2265", None, 62),
+        ];
+        let set = |jobs: Vec<Job>| {
+            update_awareness(PROJECT, |store| {
+                store.jobs = jobs;
+                Ok(())
+            })
+            .expect("write the fixture awareness store")
+        };
+        set(jobs);
+        let handle = self.open();
+        self.click(handle, View::Jobs);
+        let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap().expect("the Jobs view");
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| jobs.read_with(cx, |v, _| v.model().rows().len() == 4));
+        self.expect("jobs: the four fixture jobs load", loaded);
+        let ids: Vec<String> = jobs.read_with(&self.cx, |v, _| v.model().rows().iter().map(|r| r.id.clone()).collect());
+        self.expect("jobs: newest first", ids == ["j7", "j6", "j5", "j4"]);
+        self.save(handle, "jobs");
+
+        set(Vec::new());
+        let handle = self.open();
+        self.click(handle, View::Jobs);
+        let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap().expect("the Jobs view");
+        let empty = self.wait(handle, Duration::from_secs(10), |cx| {
+            jobs.read_with(cx, |v, _| *v.model() == shelbi_app::jobs::JobsModel::Empty)
+        });
+        self.expect("jobs-empty: no jobs says so", empty);
+        self.save(handle, "jobs-empty");
     }
 
     /// Save the window as `<screen>-<theme>.png` and close it.
@@ -2735,6 +2803,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "jobs") {
+            self.jobs();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "sidebar") {
             // Just the sidebar's and the tab bar's states.
             self.sidebar_states(&orch);
@@ -2896,6 +2969,8 @@ impl Run {
         for (id, title) in &titles {
             retitle(id, title);
         }
+
+        self.jobs();
 
         self.settings();
 
