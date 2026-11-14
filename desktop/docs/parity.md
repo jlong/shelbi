@@ -281,16 +281,15 @@ paths on every `cargo test`.
   a radio row and draws the note beside the button; the desktop clicks.
 - **Settings ▸ Properties** (`settings-properties-page`): both clients draw
   the page over one form (`shelbi_app::settings::properties`: Name,
-  Repository, Default branch, Default workflow, Editor, the read-only Issue
+  Repository, Default branch, Default workflow, the read-only Issue
   tracker summary, and Advanced's two intervals, with each field's help,
   placeholder and error). A field saves when it's committed and a picker
   when it changes, through the project's `WorkflowConfig` (the hash-checked
-  project-YAML write, checked as `shelbi config lint` would; an in-repo
-  project's editor goes to `local.yaml`). The desktop commits on Return or
-  focus leaving a field and picks the editor with General's picker (CLI
-  tools, Browse, Other command); the TUI types a field after Enter (Esc
-  puts it back), steps the pickers with ←/→ and types the editor's command
-  after Enter. Leaving the TUI page mid-typing asks to save or discard, as
+  project-YAML write, checked as `shelbi config lint` would). Neither shows
+  the project's `editor:` (nothing reads it; `properties-drop-editor`), and
+  a save keeps it as the file has it. The desktop commits on Return or
+  focus leaving a field; the TUI types a field after Enter (Esc puts it
+  back) and steps the Default workflow with ←/→. Leaving the TUI page mid-typing asks to save or discard, as
   General's command field does.
 - **Settings ▸ Workspaces** (`tui-settings-workspaces`): both clients show
   the same rows (`shelbi_app::settings::workspaces`: each workspace's name,

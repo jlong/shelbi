@@ -1626,7 +1626,9 @@ impl Settings {
 fn the_properties_page_saves_the_project_yaml_and_refuses_bad_values(cx: &mut TestAppContext) {
     let home = Home::with_project("props-page", "alpha");
     let yaml = home.root.join("projects").join("alpha.yaml");
-    let commented = format!("# Alpha's own notes.\n{}", std::fs::read_to_string(&yaml).unwrap());
+    // The project's `editor:` (which nothing reads) isn't on the page, and
+    // saves keep it as it is.
+    let commented = format!("# Alpha's own notes.\n{}editor: hx   # mine\n", std::fs::read_to_string(&yaml).unwrap());
     std::fs::write(&yaml, &commented).unwrap();
     let mut s = Settings::open_properties(cx);
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Properties), Some(SettingsPage::Properties)));
@@ -1638,21 +1640,20 @@ fn the_properties_page_saves_the_project_yaml_and_refuses_bad_values(cx: &mut Te
         "properties-repository",
         "properties-default-branch",
         "properties-default-workflow-button",
-        "properties-editor-button",
         "properties-issue-tracker-summary",
         "properties-advanced",
     ] {
         assert!(s.drawn(selector), "{selector}");
     }
     assert!(!s.drawn("properties-poll-interval"), "Advanced starts closed");
+    assert!(!s.drawn("properties-editor-row") && !s.drawn("properties-editor-button"), "no Editor field");
     // Top to bottom as the wireframe: Name, Repository, Default branch,
-    // Default workflow, Editor, Issue tracker, Advanced.
+    // Default workflow, Issue tracker, Advanced.
     let order = [
         "properties-name",
         "properties-repository",
         "properties-default-branch",
         "properties-default-workflow-button",
-        "properties-editor-button",
         "properties-issue-tracker-summary",
         "properties-advanced",
     ];
@@ -1667,6 +1668,7 @@ fn the_properties_page_saves_the_project_yaml_and_refuses_bad_values(cx: &mut Te
     s.saved();
     let text = std::fs::read_to_string(&yaml).unwrap();
     assert!(text.starts_with("# Alpha's own notes.\n") && text.contains("name: Alpha Project"), "{text}");
+    assert!(text.contains("editor: hx   # mine\n"), "editor: is kept: {text}");
     assert_eq!(shelbi_state::load_project("alpha").unwrap().display_label(), "Alpha Project");
     assert!(s.drawn("properties-status"), "Saved to … shows");
     assert_eq!(s.read(|_, cx| page.read(cx).form().text(Text::Label).to_string()), "Alpha Project");
@@ -1684,6 +1686,7 @@ fn the_properties_page_saves_the_project_yaml_and_refuses_bad_values(cx: &mut Te
     s.saved();
     assert!(!s.drawn("properties-poll-interval-error"));
     assert_eq!(shelbi_state::load_project("alpha").unwrap().workspace_poll_interval_secs, 12);
+    assert_eq!(shelbi_state::load_project("alpha").unwrap().editor.as_deref(), Some("hx"));
     let _ = text_selector(Text::Label);
 }
 

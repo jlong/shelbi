@@ -12,7 +12,7 @@ variant (file `pu3hxHgWoCDPCzJ4u6zTQK`, node 2252:27532; the project nav is
 │ My project                │   Properties
 │ ☰ Properties           ⌃4 │   Settings for this project, stored in <file>.
 │ 💬 Orchestrator        ⌃5 │   Name / Repository / Default branch
-│ 🤖 Agents              ⌃6 │   Default workflow ⌄ / Editor ⌄
+│ 🤖 Agents              ⌃6 │   Default workflow ⌄
 │ 📁 Workspaces          ⌃7 │   Issue tracker (read-only summary)
 │ ▥ Workflows            ⌃8 │   › Advanced: the two poll intervals
 ```
@@ -20,27 +20,25 @@ variant (file `pu3hxHgWoCDPCzJ4u6zTQK`, node 2252:27532; the project nav is
 - **Model** (`shelbi_state::project_properties`, carried by
   `WorkflowConfig::properties` / `set_properties`): reads Name (`name:`, or
   the legacy `display_name:`), Repository (`github_url:`), Default branch,
-  Editor (`editor:`), `workspace_poll_interval_secs` and
-  `github_reconcile_interval_secs` out of the YAML, checks them, and patches
-  only the keys that changed into the same plan that writes
-  `default_workflow:` and `orchestrator.awareness:`. An in-repo project's
-  editor goes to its user-local `local.yaml` (`WorkflowFiles::local`, and
-  `config_write`'s Workflows surface may write it). Before planning a
+  `workspace_poll_interval_secs` and `github_reconcile_interval_secs` out of
+  the YAML, checks them, and patches only the keys that changed into the
+  same plan that writes `default_workflow:` and `orchestrator.awareness:`.
+  An in-repo project's user-local `local.yaml` is read
+  (`WorkflowFiles::local`) but never written. Before planning a
   properties write the candidate files are parsed as `shelbi config lint`
   would (`Project::from_yaml_str` / `from_split_yaml_str`, then
   `validate_workspaces`): nothing invalid is written.
 - **Form** (`shelbi_app::settings::properties::PropertiesForm`): the drafts,
-  per-field errors, placeholders and help, the Default workflow and Editor
-  pickers, Advanced (it opens itself on an error inside it), and one save at
+  per-field errors, placeholders and help, the Default workflow picker,
+  Advanced (it opens itself on an error inside it), and one save at
   a time (a commit made mid-save is handed back by `saved_result`).
 - **Desktop** (`views/properties.rs`): text fields commit on Return or blur;
-  the Default workflow is a menu like the workspace dialog's Machine picker;
-  the Editor reuses General's `ToolSelect` (with its own selector prefix)
-  over CLI tools, Browse and Other command. A save that changed the label
+  the Default workflow is a menu like the workspace dialog's Machine picker.
+  A save that changed the label
   refreshes the `Catalog` so every tab shows it.
 - **TUI** (`shell/settings/properties.rs`): label-over-box rows; Enter types
-  a field (Enter saves, Esc puts it back), ←/→ step the pickers, Enter on
-  Editor types a command. Leaving mid-typing goes through the leave prompt.
+  a field (Enter saves, Esc puts it back), ←/→ step the Default workflow.
+  Leaving mid-typing goes through the leave prompt.
 - **Numbers**: `SettingsPage::shortcut()` counts `SECTIONS` order (General 1
   to Workflows 8). The desktop opens pages with ⌃N; ⌘N is always the tabs'
   now. The TUI's digit keys follow the same numbers.
@@ -49,8 +47,12 @@ variant (file `pu3hxHgWoCDPCzJ4u6zTQK`, node 2252:27532; the project nav is
 
 ## Decisions
 
-- The project `editor:` key isn't read at runtime (Edit uses Settings ▸
-  General's editor), so its help says so rather than implying an effect.
+- No Editor field (`properties-drop-editor`). The page first shipped one
+  for the project's `editor:` key, but nothing in Shelbi reads that key:
+  every editor launch (Edit in…, an issue body's Open in editor, Cmd+click
+  on `path:line`) uses Settings ▸ General's editor. The field was removed
+  from both clients; `Project::editor` and its YAML key still load, and a
+  Properties save neither writes nor drops it.
 - Repository edits `github_url:`; `repo:` is the checkout path and stays
   out of the page.
 - No Properties page frame exists in Figma: the page uses the General
@@ -62,10 +64,11 @@ variant (file `pu3hxHgWoCDPCzJ4u6zTQK`, node 2252:27532; the project nav is
 
 - `shelbi-state`: the properties module and `WorkflowConfig` round trips
   (global keeps comments, a bad value or a file the loader refuses writes
-  nothing, an in-repo editor lands in `local.yaml` and a far daemon's
-  `validate` takes the plan).
+  nothing, a project's `editor:` survives a save untouched, an in-repo save
+  writes only the shared file, and a far daemon's `validate` takes the
+  plan).
 - `shelbi-app`: the form (load, edit, validate, save round trip keeping
-  comments, queued saves, pickers, a failed write) and the nav order and
+  comments, queued saves, the workflow picker, a failed write, an `editor:` kept) and the nav order and
   numbers.
 - Desktop: the page through the window (⌃4, the rows in order, a rename
   keeping comments, a refused interval), ⌃N / ⌘N, the ↑/↓ walk, the nav

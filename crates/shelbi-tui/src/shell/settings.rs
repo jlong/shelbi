@@ -45,9 +45,9 @@
 //!   Remove workspace forms over the shared pool service.
 //! - Properties (`settings-properties-page`, [`properties`]): the project
 //!   YAML's own settings (its name, repository, default branch and
-//!   workflow, editor, and the poll intervals), over the shared
+//!   workflow, and the poll intervals), over the shared
 //!   `shelbi_app::settings::properties` form. A field saves when Enter
-//!   commits it; the pickers save as they change.
+//!   commits it; the Default workflow picker saves as it changes.
 //! - Orchestrator (`awareness-setting`): how events reach the project's
 //!   orchestrator (the heartbeat or the awareness system), a radio saved to
 //!   the project YAML as it is picked, and Restart orchestrator, over the
@@ -1080,7 +1080,6 @@ impl SettingsShell {
     /// The installed editors and diff tools were detected (off the UI
     /// thread): the pickers list them.
     pub(crate) fn tools_detected(&mut self, detected: shelbi_state::tools::DetectedTools) {
-        self.properties.set_detected(detected.clone());
         self.form.set_detected(detected);
         self.tools.detected(&self.form);
     }

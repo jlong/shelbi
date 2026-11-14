@@ -12703,13 +12703,12 @@ mod tests {
             "Default branch",
             "Default workflow",
             "task",
-            "Editor",
-            "Default ($EDITOR or vim)",
             "Issue tracker  Files on disk",
             "▸ Advanced",
         ] {
             assert!(text.contains(want), "{want:?} on the page:\n{text}");
         }
+        assert!(!text.contains("Default ($EDITOR or vim)") && !text.contains("editor:"), "no Editor field:\n{text}");
 
         // Into the page; Enter types in Name, Enter saves it.
         press(&mut st, KeyCode::Tab);
@@ -12738,8 +12737,8 @@ mod tests {
         });
         assert_eq!(shelbi_state::load_project("proj").unwrap().default_workflow.as_deref(), Some("subtask"));
 
-        // Advanced opens; a bad interval is refused in red and not written.
-        press(&mut st, KeyCode::Down);
+        // Advanced is the next stop after Default workflow; it opens, and a
+        // bad interval is refused in red and not written.
         press(&mut st, KeyCode::Down);
         press(&mut st, KeyCode::Enter);
         assert!(st.settings.properties().form().advanced_open());
