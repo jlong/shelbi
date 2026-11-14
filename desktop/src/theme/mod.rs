@@ -201,6 +201,20 @@ impl Theme {
         self.appearance == Appearance::Dark
     }
 
+    /// A working project's dot at animation `phase` (0..1, one breath per
+    /// `shelbi_app::theme::PROJECT_PULSE_PERIOD`): the shared tokens' raised
+    /// cosine from `pulse_trough` up to `pulse_peak` and back
+    /// ([`shelbi_app::theme::Theme::project_pulse`]), for this appearance.
+    pub fn project_pulse(&self, phase: f32) -> Hsla {
+        let tokens = if self.is_dark() {
+            shelbi_app::theme::Theme::dark()
+        } else {
+            shelbi_app::theme::Theme::light()
+        };
+        let c = tokens.project_pulse(phase);
+        gpui::rgb(u32::from_be_bytes([0, c.r, c.g, c.b])).into()
+    }
+
     /// The color a shared view model names by [`Tone`] (an activity row's
     /// tag, a machines badge): the Figma log color for the TUI hue's
     /// meaning (Activity's `text/ansi_*`).

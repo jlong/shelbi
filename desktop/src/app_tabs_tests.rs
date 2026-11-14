@@ -329,6 +329,56 @@ fn a_project_opened_elsewhere_gets_a_tab_not_a_menu_row(cx: &mut TestAppContext)
     assert!(drawn(&mut h, "tab-menu-project-beta") && drawn(&mut h, "tab-menu-project-delta"));
 }
 
+/// The tabs' `(name, working)` as the bar draws them.
+fn working_tabs(h: &mut Harness) -> Vec<(String, bool)> {
+    h.cx.update(|_, cx| {
+        h.window
+            .read(cx)
+            .tab_props(cx)
+            .into_iter()
+            .map(|t| (t.name, t.working))
+            .collect()
+    })
+}
+
+/// A tab's dot pulses while its project has work in progress, whichever
+/// project the window shows: work starting in another open project (a task
+/// dispatched there) makes its tab pulse without a switch, and it stops when
+/// the work does. The current project's dot is solid while it is idle.
+#[gpui::test]
+fn a_tab_pulses_while_its_project_has_work_in_progress(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta"], &[]);
+    assert_eq!(working_tabs(&mut h), [("alpha".into(), false), ("beta".into(), false)]);
+
+    // The daemon reports beta's workspace working (the catalog's watcher
+    // re-read it): every window repaints.
+    h.cx.update(|_, cx| {
+        cx.global::<Catalog>().set_working(&["beta"]);
+        liveness_changed(cx);
+    });
+    h.draw();
+    assert_eq!(working_tabs(&mut h), [("alpha".into(), false), ("beta".into(), true)]);
+    // The `+` menu's rows (the projects without a tab) aren't loaded.
+    let menu: Vec<_> = h.cx.update(|_, cx| {
+        h.window.read(cx).menu_projects(cx).into_iter().map(|p| (p.slug, p.indicator)).collect()
+    });
+    assert_eq!(
+        menu,
+        [
+            ("gamma".to_string(), shelbi_app::overlay::palette::ProjectIndicator::Unloaded),
+            ("delta".to_string(), shelbi_app::overlay::palette::ProjectIndicator::Unloaded),
+        ]
+    );
+
+    // The current project working too, then beta's agent going idle.
+    h.cx.update(|_, cx| {
+        cx.global::<Catalog>().set_working(&["alpha"]);
+        liveness_changed(cx);
+    });
+    h.draw();
+    assert_eq!(working_tabs(&mut h), [("alpha".into(), true), ("beta".into(), false)]);
+}
+
 /// Resize the window to `width` wide, its height kept, and draw.
 fn resize(h: &mut Harness, width: Pixels) {
     let height = h.cx.update(|window, _| window.viewport_size().height);

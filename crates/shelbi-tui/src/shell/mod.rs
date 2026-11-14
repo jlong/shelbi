@@ -3051,7 +3051,7 @@ impl ShellState {
     fn open_palette(&mut self) {
         let entries = self.palette_entries_from_model();
         // The Projects column lists every registered project, the current one
-        // leading with the filled disc; Enter on a row switches to it.
+        // leading, each with its status dot; Enter on a row switches to it.
         let projects = self
             .client
             .project()

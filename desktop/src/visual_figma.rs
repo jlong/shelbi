@@ -1196,17 +1196,19 @@ impl Run {
         handle
             .update(&mut self.cx, |w, window, cx| {
                 // The frame's Projects column: two open (Shelbi the current
-                // one, with the check), one not.
+                // one, with the check), one not. Nothing is at work, so both
+                // open dots are solid.
                 use shelbi_app::overlay::palette::{ProjectEntry, ProjectIndicator};
-                let project = |slug: &str, label: &str, indicator| ProjectEntry {
+                let project = |slug: &str, label: &str, indicator, current| ProjectEntry {
                     slug: slug.into(),
                     label: label.into(),
                     indicator,
+                    current,
                 };
                 w.offscreen_palette_projects(vec![
-                    project("shelbi", "Shelbi", ProjectIndicator::Active),
-                    project("contextstore", "ContextStore", ProjectIndicator::LoadedIdle),
-                    project("32pixels", "32pixels", ProjectIndicator::Unloaded),
+                    project("shelbi", "Shelbi", ProjectIndicator::LoadedIdle, true),
+                    project("contextstore", "ContextStore", ProjectIndicator::LoadedIdle, false),
+                    project("32pixels", "32pixels", ProjectIndicator::Unloaded, false),
                 ]);
                 w.offscreen_open_overlay(None, window, cx)
             })
@@ -3142,6 +3144,24 @@ impl Run {
         // Past its slide in.
         self.now.set(self.now.get() + Duration::from_millis(400));
         self.save(handle, "state-sidebar-switcher");
+
+        // A tab in each loaded state (no frame draws it; checked by eye):
+        // Shelbi has work in progress, its dot at the pulse's peak (Reduce
+        // Motion holds the breath there, so the frame is stable), beside the
+        // solid dots of the idle ContextStore and of the current project.
+        let catalog = self.cx.update(|cx| cx.try_global::<crate::projects::Catalog>().cloned());
+        if let Some(catalog) = &catalog {
+            catalog.set_working(&["shelbi"]);
+        }
+        self.cx.update(|cx| cx.set_reduce_motion(true));
+        let handle = self.open();
+        self.click(handle, orch.clone());
+        handle.update(&mut self.cx, |w, _, cx| w.offscreen_sync_tabs(cx)).unwrap();
+        self.save(handle, "state-tabbar-working");
+        self.cx.update(crate::theme::motion::sync_reduce_motion);
+        if let Some(catalog) = &catalog {
+            catalog.set_working(&[]);
+        }
 
         self.sidebar.zen_mode = shelbi_state::ZenModeState::Off;
         let handle = self.open();

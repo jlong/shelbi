@@ -107,7 +107,7 @@ pub use issue_migrate::{
     apply_issue_migration, plan_issue_migration, IssueMigrationPlan, MigrationControls,
     PartialMigration,
 };
-pub use occupancy::{BoardOccupancy, SlotOccupancy};
+pub use occupancy::{project_is_working, slot_reads_working, BoardOccupancy, SlotOccupancy};
 pub use board_index::{
     board_index_path, board_refresh_error_path, clear_board_refresh_error, expected_board_repo,
     fold_assignment_overlay, github_board_repo, indexed_issue, mark_board_index_stale,

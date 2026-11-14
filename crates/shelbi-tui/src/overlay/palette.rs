@@ -102,11 +102,12 @@ const FILTER_ROWS: u16 = 2;
 // ---------------------------------------------------------------------------
 
 /// Leading status glyph + color for a project row, given its indicator and the
-/// current pulse `phase`. The Figma uses a filled `●` for the active project, a
-/// `○` ring for every other (green when loaded, gray when not).
+/// current pulse `phase`: a `●` breathing green while the project has work in
+/// progress, a solid green `●` while it is loaded and idle, a gray `○` ring
+/// when it isn't loaded.
 pub fn project_status_style(indicator: ProjectIndicator, phase: f32) -> (&'static str, Color) {
     let color = match indicator {
-        ProjectIndicator::Active => theme::project_pulse_color(phase),
+        ProjectIndicator::Working => theme::project_pulse_color(phase),
         ProjectIndicator::LoadedIdle => palette().green,
         ProjectIndicator::Unloaded => palette().ansi_dark_gray,
     };
@@ -114,7 +115,7 @@ pub fn project_status_style(indicator: ProjectIndicator, phase: f32) -> (&'stati
 }
 
 /// Current pulse phase in `[0.0, 1.0)`, derived from how long the picker has
-/// been open. Feeds [`project_status_style`] so the active indicator breathes as
+/// been open. Feeds [`project_status_style`] so a working project's dot breathes as
 /// the render loop repaints.
 pub fn pulse_phase(start: Instant) -> f32 {
     let period = theme::PROJECT_PULSE_PERIOD.as_secs_f32();
@@ -650,7 +651,7 @@ fn render_projects_column(f: &mut Frame, area: Rect, col: &ProjectsColumn) {
     ));
 
     // Selection patches background + weight only (never a foreground color) so a
-    // loaded project's green ring keeps its status color under the bar.
+    // loaded project's green disc keeps its status color under the bar.
     let highlight = Style::default()
         .bg(palette().selection)
         .add_modifier(Modifier::BOLD);
@@ -716,7 +717,7 @@ fn truncate_with_ellipsis(s: &str, max: usize) -> String {
 // ---------------------------------------------------------------------------
 
 /// The in-process command palette overlay: the shared state machine
-/// ([`shared::Palette`]) plus when it opened (the active project's pulse phase).
+/// ([`shared::Palette`]) plus when it opened (a working project's pulse phase).
 /// The host (the shell) supplies the entries from
 /// [`shelbi_app::CommandRegistry::entries`] and the projects, and turns an
 /// activated [`Entry`] into a command effect.
@@ -1075,6 +1076,7 @@ mod tests {
             slug: slug.into(),
             label: label.into(),
             indicator,
+            current: false,
         }
     }
 
@@ -1157,21 +1159,22 @@ mod tests {
     #[test]
     fn project_indicator_resolves_the_three_states_in_precedence_order() {
         assert_eq!(project_indicator(false, false), ProjectIndicator::Unloaded);
-        // Not-loaded dominates a stale active flag.
+        // Not-loaded dominates a stale working flag.
         assert_eq!(project_indicator(false, true), ProjectIndicator::Unloaded);
-        assert_eq!(project_indicator(true, true), ProjectIndicator::Active);
+        assert_eq!(project_indicator(true, true), ProjectIndicator::Working);
         assert_eq!(project_indicator(true, false), ProjectIndicator::LoadedIdle);
     }
 
     #[test]
     fn project_status_style_paints_each_state() {
-        let (active_glyph, _) = project_status_style(ProjectIndicator::Active, 0.5);
-        assert_eq!(active_glyph, "●");
+        let (working_glyph, _) = project_status_style(ProjectIndicator::Working, 0.5);
+        assert_eq!(working_glyph, "●");
+        // Loaded and idle: the same disc, solid green.
         let (idle_glyph, idle_color) = project_status_style(ProjectIndicator::LoadedIdle, 0.0);
-        assert_eq!(idle_glyph, "○");
+        assert_eq!(idle_glyph, "●");
         assert_eq!(idle_color, palette().green);
-        // The unloaded project is a gray ring (design `#666`), distinguished
-        // from the loaded ring by color, not glyph.
+        assert_eq!(project_status_style(ProjectIndicator::LoadedIdle, 0.5).1, idle_color, "it holds still");
+        // The unloaded project is a gray ring (design `#666`).
         let (unloaded_glyph, unloaded_color) =
             project_status_style(ProjectIndicator::Unloaded, 0.0);
         assert_eq!(unloaded_glyph, "○");
@@ -1179,9 +1182,9 @@ mod tests {
     }
 
     #[test]
-    fn active_pulse_fill_breathes_across_the_cycle() {
-        let (_, trough) = project_status_style(ProjectIndicator::Active, 0.0);
-        let (_, peak) = project_status_style(ProjectIndicator::Active, 0.5);
+    fn a_working_projects_fill_breathes_across_the_cycle() {
+        let (_, trough) = project_status_style(ProjectIndicator::Working, 0.0);
+        let (_, peak) = project_status_style(ProjectIndicator::Working, 0.5);
         assert_ne!(trough, peak, "the fill must cycle between phases");
     }
 
@@ -1238,7 +1241,7 @@ mod tests {
             rows: vec![
                 ProjectRow {
                     label: "Website".into(),
-                    indicator: ProjectIndicator::Active,
+                    indicator: ProjectIndicator::Working,
                 },
                 ProjectRow {
                     label: "Shelbi".into(),
@@ -1292,7 +1295,7 @@ mod tests {
                 ),
                 entry_full("view:tasks", "Issues", "Queue up and manage work for Shelbi", None),
             ],
-            vec![project("website", "Website", ProjectIndicator::Active)],
+            vec![project("website", "Website", ProjectIndicator::Working)],
         );
         let mut term = Terminal::new(TestBackend::new(100, 14)).unwrap();
         term.draw(|f| p.render(f, f.area())).unwrap();
@@ -1380,7 +1383,7 @@ mod tests {
     fn right_focuses_projects_then_left_returns_to_commands() {
         let mut p = Palette::new(
             vec![entry("view:tasks", "Issues")],
-            vec![project("website", "Website", ProjectIndicator::Active)],
+            vec![project("website", "Website", ProjectIndicator::Working)],
         );
         assert_eq!(p.inner.focus(), Focus::Commands);
         assert_eq!(p.handle_key(key(KeyCode::Right), None), PaletteStep::Continue);
@@ -1401,7 +1404,7 @@ mod tests {
         let mut p = Palette::new(
             vec![entry("view:tasks", "Issues")],
             vec![
-                project("website", "Website", ProjectIndicator::Active),
+                project("website", "Website", ProjectIndicator::Working),
                 project("docs", "Docs", ProjectIndicator::LoadedIdle),
             ],
         );
@@ -1417,7 +1420,7 @@ mod tests {
     fn enter_on_the_add_row_activates_add_project() {
         let mut p = Palette::new(
             vec![entry("view:tasks", "Issues")],
-            vec![project("website", "Website", ProjectIndicator::Active)],
+            vec![project("website", "Website", ProjectIndicator::Working)],
         );
         p.handle_key(key(KeyCode::Right), None);
         // One project, so index 1 is the trailing "Add project" row.
@@ -1432,7 +1435,7 @@ mod tests {
     fn typing_while_in_projects_returns_focus_to_commands() {
         let mut p = Palette::new(
             vec![entry("view:tasks", "Issues")],
-            vec![project("website", "Website", ProjectIndicator::Active)],
+            vec![project("website", "Website", ProjectIndicator::Working)],
         );
         p.handle_key(key(KeyCode::Right), None);
         assert_eq!(p.inner.focus(), Focus::Projects);
@@ -1445,7 +1448,7 @@ mod tests {
     fn project_nav_down_clamps_to_the_add_row() {
         let mut p = Palette::new(
             vec![entry("view:tasks", "Issues")],
-            vec![project("website", "Website", ProjectIndicator::Active)],
+            vec![project("website", "Website", ProjectIndicator::Working)],
         );
         p.handle_key(key(KeyCode::Right), None);
         // Two selectable rows (Website=0, Add=1): extra NavDowns clamp at 1.
@@ -1533,7 +1536,7 @@ mod tests {
     }
 
     #[test]
-    fn projects_column_keeps_the_loaded_glyph_green_when_its_row_is_selected() {
+    fn projects_column_keeps_the_loaded_disc_green_when_its_row_is_selected() {
         let buf = draw_projects(ProjectsColumn {
             rows: vec![ProjectRow {
                 label: "Website".into(),
@@ -1546,25 +1549,25 @@ mod tests {
         for y in 0..buf.area.height {
             for x in 0..buf.area.width {
                 let cell = &buf[(x, y)];
-                if cell.symbol() == "○" {
+                if cell.symbol() == "●" {
                     assert_eq!(
                         cell.fg,
                         palette().green,
-                        "the selected loaded-idle ring must stay green"
+                        "the selected loaded-idle disc must stay solid green"
                     );
                     found = true;
                 }
             }
         }
-        assert!(found, "the loaded project's green ring should render");
+        assert!(found, "the loaded project's green disc should render");
     }
 
     #[test]
-    fn projects_column_pulses_a_filled_green_disc_for_active_work() {
+    fn projects_column_pulses_a_filled_green_disc_for_work_in_progress() {
         let buf = draw_projects(ProjectsColumn {
             rows: vec![ProjectRow {
                 label: "Website".into(),
-                indicator: ProjectIndicator::Active,
+                indicator: ProjectIndicator::Working,
             }],
             selected: None,
             phase: 0.0,
@@ -1576,13 +1579,13 @@ mod tests {
                 if cell.symbol() == "●" {
                     assert!(
                         matches!(cell.fg, Color::Rgb(0, _, 0)),
-                        "the active disc must render a green pulse fill"
+                        "the working disc must render a green pulse fill"
                     );
                     found = true;
                 }
             }
         }
-        assert!(found, "an active project should render the filled disc");
+        assert!(found, "a working project should render the filled disc");
     }
 
     #[test]
@@ -1593,7 +1596,7 @@ mod tests {
             rows: vec![
                 ProjectRow {
                     label: "Website".into(),
-                    indicator: ProjectIndicator::Active,
+                    indicator: ProjectIndicator::Working,
                 },
                 ProjectRow {
                     label: "Docs".into(),
@@ -1608,8 +1611,8 @@ mod tests {
             phase: 0.0,
         });
         let dumped = dump(&buf);
-        assert!(dumped.contains('●'), "active disc: {dumped}");
-        assert!(dumped.contains('○'), "idle/unloaded ring: {dumped}");
+        assert!(dumped.contains('●'), "loaded disc: {dumped}");
+        assert!(dumped.contains('○'), "unloaded ring: {dumped}");
         assert!(!dumped.contains('·'), "no leading bullet: {dumped}");
         assert!(dumped.contains("Website"), "project row: {dumped}");
         assert!(dumped.contains("Add project"), "Add project row: {dumped}");
@@ -1746,7 +1749,7 @@ mod tests {
                 entry_full("view:orch", "Chat", "Talk with the Orchestrator", None),
                 entry_full("view:tasks", "Issues", "Queue up and manage work", None),
             ],
-            vec![project("website", "Website", ProjectIndicator::Active)],
+            vec![project("website", "Website", ProjectIndicator::Working)],
         );
         // Selection defaults to index 0 (Chat) with the commands column focused.
         let mut term = Terminal::new(TestBackend::new(100, 14)).unwrap();
@@ -1888,7 +1891,7 @@ mod tests {
                 entry_full("action:log-in", "Log in to GitHub", "Account", None),
                 entry_full("view:tasks", "Issues", "Queue up and manage work", None),
             ],
-            vec![project("website", "Website", ProjectIndicator::Active)],
+            vec![project("website", "Website", ProjectIndicator::Working)],
         )
         .with_search(PaletteSearch::inline(corpus))
     }
@@ -2184,7 +2187,7 @@ mod tests {
         let mut p = Palette::new(
             vec![entry("view:tasks", "Issues"), entry("view:activity", "Activity")],
             vec![
-                project("website", "Website", ProjectIndicator::Active),
+                project("website", "Website", ProjectIndicator::Working),
                 project("docs", "Docs", ProjectIndicator::LoadedIdle),
             ],
         );

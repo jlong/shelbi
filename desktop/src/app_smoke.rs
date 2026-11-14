@@ -463,7 +463,8 @@ fn typing_in_the_palette_searches_issues_and_changelog_entries(cx: &mut TestAppC
         w.palette_inputs.projects = vec![PaletteProject {
             slug: "alpha".into(),
             label: "Alpha".into(),
-            indicator: shelbi_app::overlay::palette::ProjectIndicator::Active,
+            indicator: shelbi_app::overlay::palette::ProjectIndicator::Working,
+            current: true,
         }];
     });
     h.open_search_palette();
@@ -574,6 +575,7 @@ fn hovering_a_palette_result_selects_it_and_the_keyboard_continues(cx: &mut Test
             slug: "beta".into(),
             label: "Beta".into(),
             indicator: shelbi_app::overlay::palette::ProjectIndicator::LoadedIdle,
+            current: false,
         }];
     });
     h.open_palette();

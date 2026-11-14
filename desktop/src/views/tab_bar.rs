@@ -72,6 +72,9 @@ pub struct Tab {
     pub label: SharedString,
     /// The window shows this project.
     pub selected: bool,
+    /// One of its workspaces' agents is working: the dot breathes. A tab's
+    /// project is always loaded, so it is the pulsing disc or the solid one.
+    pub working: bool,
 }
 
 /// Everything one bar frame draws.
@@ -306,9 +309,8 @@ fn render_tab<H: SidebarHost>(
             }))
             .into_any_element()
     } else {
-        project_menu::dot(shelbi_app::overlay::palette::ProjectIndicator::LoadedIdle, theme)
-            .flex_none()
-            .into_any_element()
+        let indicator = shelbi_app::overlay::palette::project_indicator(true, tab.working);
+        project_menu::dot(SharedString::from(format!("tab-dot-{}", tab.name)), indicator, theme)
     };
     div()
         .id(SharedString::from(selector.clone()))

@@ -316,10 +316,10 @@ pub struct Theme<C = Swatch> {
     pub code_bg: C,
     /// Inline code text in rendered markdown.
     pub code_fg: C,
-    /// The active-project pulse at its dimmest (near-invisible on the palette
+    /// The working-project pulse at its dimmest (near-invisible on the palette
     /// panel).
     pub pulse_trough: C,
-    /// The active-project pulse at its brightest.
+    /// The working-project pulse at its brightest.
     pub pulse_peak: C,
 
     // ---- Terminal hues ----------------------------------------------------
@@ -500,8 +500,8 @@ impl Theme {
         }
     }
 
-    /// The active-project pulse at animation `phase` (wrapped into
-    /// `[0.0, 1.0)`): a raised cosine breathes from [`Theme::pulse_trough`]
+    /// The working-project pulse at animation `phase` (wrapped into
+    /// `[0.0, 1.0)`; one cycle is [`PROJECT_PULSE_PERIOD`]): a raised cosine breathes from [`Theme::pulse_trough`]
     /// up to [`Theme::pulse_peak`] and back once per cycle, easing at both
     /// extremes so it reads as breathing rather than a blink.
     pub fn project_pulse(&self, phase: f32) -> Rgb {
@@ -513,6 +513,12 @@ impl Theme {
         self.pulse_trough.rgb.lerp(self.pulse_peak.rgb, alpha)
     }
 }
+
+/// One breath of the project pulse (a project with work in progress, see
+/// [`Theme::project_pulse`]): its dot eases from the dim trough up to full
+/// green and back once per period. Kept close to a calm breath rather than a
+/// blink. Both clients animate at it.
+pub const PROJECT_PULSE_PERIOD: std::time::Duration = std::time::Duration::from_millis(1143);
 
 /// The appearance a `theme:` setting resolves to. `system_is_dark` as in
 /// [`Theme::for_preference`].

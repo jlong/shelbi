@@ -109,14 +109,57 @@ pub fn spawn_observed(
     )
 }
 
+/// Spawn one subscriber for every project's board and workspace changes on
+/// this machine (the hub's `subscribe` with no project), returning the RAII
+/// handle and the receiver the client drains. Each change yields the project
+/// it names with its wake. The desktop's project catalog follows it to keep
+/// every open project's dot current (`desktop/src/projects.rs`), so a
+/// project starting or stopping work repaints its tab without a timer.
+pub fn spawn_all() -> (ChangeSubscription, Receiver<(String, ChangeWake)>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_thread = stop.clone();
+    let handle = thread::Builder::new()
+        .name("shelbi-changes-all".to_string())
+        .spawn(move || {
+            let connected = AtomicBool::new(false);
+            let frame = "{\"verb\":\"subscribe\"}\n";
+            while !stop_thread.load(Ordering::SeqCst) {
+                let end = stream_lines(frame, &stop_thread, &connected, |line| {
+                    match any_wake_for(line) {
+                        Some(change) => tx.send(change).map_err(|_| ()),
+                        None => Ok(()),
+                    }
+                });
+                match end {
+                    StreamEnd::ReceiverGone => return,
+                    StreamEnd::Disconnected => sleep_slice(&stop_thread),
+                }
+            }
+        })
+        .expect("spawn change subscriber thread");
+    (
+        ChangeSubscription {
+            stop,
+            handles: vec![handle],
+            streams: Vec::new(),
+        },
+        rx,
+    )
+}
+
 fn subscriber_loop(
     project: &str,
     tx: &Sender<ChangeWake>,
     stop: &AtomicBool,
     connected: &AtomicBool,
 ) {
+    let frame = shelbi_client::relay::services::subscribe_line(project);
     while !stop.load(Ordering::SeqCst) {
-        let end = connect_and_stream(project, tx, stop, connected);
+        let end = stream_lines(&frame, stop, connected, |line| match wake_for(line, project) {
+            Some(wake) => tx.send(wake).map_err(|_| ()),
+            None => Ok(()),
+        });
         connected.store(false, Ordering::SeqCst);
         match end {
             StreamEnd::ReceiverGone => return,
@@ -130,11 +173,14 @@ enum StreamEnd {
     ReceiverGone,
 }
 
-fn connect_and_stream(
-    project: &str,
-    tx: &Sender<ChangeWake>,
+/// Open the hub socket, send the subscribe `frame`, and hand each complete
+/// line to `on_line` until the stream ends, `stop` is raised, or `on_line`
+/// reports its receiver gone (`Err`).
+fn stream_lines(
+    frame: &str,
     stop: &AtomicBool,
     connected: &AtomicBool,
+    mut on_line: impl FnMut(&[u8]) -> std::result::Result<(), ()>,
 ) -> StreamEnd {
     let Ok(path) = shelbi_state::hub_socket_path() else {
         return StreamEnd::Disconnected;
@@ -143,8 +189,6 @@ fn connect_and_stream(
         return StreamEnd::Disconnected;
     };
     let _ = stream.set_read_timeout(Some(POLL_SLICE));
-
-    let frame = shelbi_client::relay::services::subscribe_line(project);
     if stream.write_all(frame.as_bytes()).is_err() {
         return StreamEnd::Disconnected;
     }
@@ -160,8 +204,11 @@ fn connect_and_stream(
             Ok(0) => return StreamEnd::Disconnected,
             Ok(n) => {
                 buf.extend_from_slice(&chunk[..n]);
-                if drain_lines(&mut buf, project, tx).is_err() {
-                    return StreamEnd::ReceiverGone;
+                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=nl).collect();
+                    if on_line(&line[..line.len() - 1]).is_err() {
+                        return StreamEnd::ReceiverGone;
+                    }
                 }
             }
             Err(e) if is_timeout(&e) => continue,
@@ -204,6 +251,16 @@ fn wake_for(line: &[u8], project: &str) -> Option<ChangeWake> {
     }
 }
 
+/// [`wake_for`] for any project: the project `line` names with its wake.
+fn any_wake_for(line: &[u8]) -> Option<(String, ChangeWake)> {
+    let change = std::str::from_utf8(line)
+        .ok()
+        .and_then(ChangeNotification::from_line)?;
+    let project = change.project().to_string();
+    let wake = wake_for(line, &project)?;
+    Some((project, wake))
+}
+
 fn sleep_slice(stop: &AtomicBool) {
     for _ in 0..5 {
         if stop.load(Ordering::SeqCst) {
@@ -235,6 +292,18 @@ mod tests {
             wake_for(ws, "demo"),
             Some(ChangeWake::Workspace("alpha".into()))
         );
+    }
+
+    #[test]
+    fn the_all_projects_stream_names_each_changes_project() {
+        let ws = br#"{"change":"workspace","project":"web","workspace":"alpha"}"#;
+        assert_eq!(any_wake_for(ws), Some(("web".into(), ChangeWake::Workspace("alpha".into()))));
+        let board = br#"{"change":"board","project":"api"}"#;
+        assert_eq!(any_wake_for(board), Some(("api".into(), ChangeWake::Board)));
+        let layout =
+            br#"{"change":"layout","project":"demo","event":{"layout":"orchestrator-restarted"}}"#;
+        assert_eq!(any_wake_for(layout), None);
+        assert_eq!(any_wake_for(b"not json"), None);
     }
 
     #[test]

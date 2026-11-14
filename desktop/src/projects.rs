@@ -12,6 +12,13 @@
 //! same way, so switching back to a project restores its view without a disk
 //! read on the switch.
 //!
+//! With them, which projects are open and which of those have work in
+//! progress ([`ProjectLiveness`]): every project's dot. A full refresh reads
+//! it with the rest; [`Catalog::watch_changes`] re-reads just it whenever the
+//! daemon reports a board or workspace change in any project, so a project
+//! that starts or stops working repaints its tab and menu row without a
+//! timer.
+//!
 //! Opening a project brings up its orchestrator and records it open (the
 //! record the daemon's per-project poller watches), the way the TUI's startup
 //! does, through the CLI bootstrap found. See [`open_project`].
@@ -21,11 +28,16 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use gpui::Global;
+use shelbi_app::command_model::ProjectLiveness;
 use shelbi_app::source::{ProjectKey, ProjectSource};
 use shelbi_app::view::SidebarModel;
 
 use crate::platform::env::Env;
 use crate::window_state::ProjectViewState;
+
+/// How long [`Catalog::watch_changes`] lets a burst of changes settle before
+/// it re-reads.
+const LIVENESS_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
 
 /// One project the switcher lists.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,9 +51,9 @@ pub struct ProjectEntry {
 #[derive(Default)]
 struct CatalogInner {
     projects: Vec<ProjectEntry>,
-    /// The projects recorded open (running in some window or terminal), as
-    /// of the last refresh.
-    open: std::collections::HashSet<String>,
+    /// The projects recorded open (running in some window or terminal), and
+    /// those with work in progress, as of the last refresh.
+    liveness: ProjectLiveness,
     /// The open set has been read (a refresh landed, or a test set it): the
     /// tabs follow it only then.
     open_known: bool,
@@ -79,7 +91,13 @@ impl Catalog {
             .iter()
             .map(|p| (p.name.clone(), p.label.clone()))
             .collect();
-        shelbi_app::command_model::project_rows(current, projects, &inner.open)
+        shelbi_app::command_model::project_rows(current, projects, &inner.liveness)
+    }
+
+    /// Whether `project` has work in progress (a workspace's agent is
+    /// working), as of the last read: its tab's dot pulses.
+    pub fn is_working(&self, project: &str) -> bool {
+        self.lock().liveness.is_working(project)
     }
 
     /// The projects recorded open, sorted by name, or `None` before the
@@ -87,7 +105,7 @@ impl Catalog {
     pub fn open_projects(&self) -> Option<Vec<String>> {
         let inner = self.lock();
         inner.open_known.then(|| {
-            let mut open: Vec<String> = inner.open.iter().cloned().collect();
+            let mut open: Vec<String> = inner.liveness.open.iter().cloned().collect();
             open.sort();
             open
         })
@@ -99,9 +117,10 @@ impl Catalog {
     pub fn note_open(&self, project: &str, open: bool) {
         let mut inner = self.lock();
         if open {
-            inner.open.insert(project.to_string());
+            inner.liveness.open.insert(project.to_string());
         } else {
-            inner.open.remove(project);
+            inner.liveness.open.remove(project);
+            inner.liveness.working.remove(project);
         }
     }
 
@@ -159,10 +178,7 @@ impl Catalog {
     /// thread).
     pub fn reload(&self) {
         let summaries = shelbi_state::list_projects().unwrap_or_default();
-        let open = shelbi_state::list_open_projects()
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let liveness = ProjectLiveness::read(None);
         let projects: Vec<ProjectEntry> = summaries
             .iter()
             .map(|p| ProjectEntry {
@@ -187,7 +203,7 @@ impl Catalog {
             .collect();
         let mut guard = self.lock();
         guard.projects = projects;
-        guard.open = open;
+        guard.liveness = liveness;
         guard.open_known = true;
         guard.skeletons = skeletons;
         for (name, view) in views {
@@ -197,13 +213,56 @@ impl Catalog {
         }
     }
 
+    /// Re-read which projects are open and working (blocking: run it off
+    /// the UI thread). Whether that changed what the catalog had.
+    pub fn reload_liveness(&self) -> bool {
+        let liveness = ProjectLiveness::read(None);
+        let mut inner = self.lock();
+        let changed = !inner.open_known || inner.liveness != liveness;
+        inner.liveness = liveness;
+        inner.open_known = true;
+        changed
+    }
+
+    /// Follow every project's board and workspace changes (the daemon's
+    /// change stream, all projects): after each burst, re-read the liveness
+    /// on the watcher's thread and call `changed` there when it moved. Runs
+    /// for the app's lifetime; reconnects on its own while the daemon is
+    /// down.
+    pub fn watch_changes(&self, changed: impl Fn() + Send + 'static) {
+        let catalog = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-desktop-liveness".into())
+            .spawn(move || {
+                let (_subscription, wakes) = shelbi_app::changes::spawn_all();
+                while wakes.recv().is_ok() {
+                    // One read per burst: a dispatch moves a card and starts a
+                    // pane at once.
+                    while wakes.recv_timeout(LIVENESS_SETTLE).is_ok() {}
+                    if catalog.reload_liveness() {
+                        changed();
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(error = %e, "could not watch the projects' work");
+        }
+    }
+
     /// Record `open` as the projects open elsewhere (a test's or a visual
     /// check's catalog, which never refreshes).
     #[cfg(any(test, feature = "visual-check"))]
     pub fn set_open(&self, open: &[&str]) {
         let mut inner = self.lock();
-        inner.open = open.iter().map(|p| p.to_string()).collect();
+        inner.liveness.open = open.iter().map(|p| p.to_string()).collect();
         inner.open_known = true;
+    }
+
+    /// Record `working` as the projects with work in progress (a test's or a
+    /// visual check's catalog).
+    #[cfg(any(test, feature = "visual-check"))]
+    pub fn set_working(&self, working: &[&str]) {
+        self.lock().liveness.working = working.iter().map(|p| p.to_string()).collect();
     }
 
     /// `project`'s label (its display name), as of the last refresh.
@@ -357,18 +416,20 @@ mod tests {
             label: name.to_uppercase(),
         };
         let catalog = Catalog::with(vec![entry("web"), entry("api"), entry("shelbi")], Vec::new());
-        catalog.set_open(&["web"]);
-        let rows: Vec<(String, ProjectIndicator)> = catalog
+        catalog.set_open(&["web", "shelbi"]);
+        catalog.set_working(&["web"]);
+        let rows: Vec<(String, ProjectIndicator, bool)> = catalog
             .rows("shelbi")
             .into_iter()
-            .map(|r| (r.label, r.indicator))
+            .map(|r| (r.label, r.indicator, r.current))
             .collect();
         assert_eq!(
             rows,
             [
-                ("WEB".to_string(), ProjectIndicator::LoadedIdle),
-                ("API".to_string(), ProjectIndicator::Unloaded),
-                ("SHELBI".to_string(), ProjectIndicator::Active),
+                ("WEB".to_string(), ProjectIndicator::Working, false),
+                ("API".to_string(), ProjectIndicator::Unloaded, false),
+                // The current project wears the check, its dot by its work.
+                ("SHELBI".to_string(), ProjectIndicator::LoadedIdle, true),
             ]
         );
     }
@@ -404,6 +465,104 @@ mod tests {
         catalog.note_open("api", false);
         catalog.note_open("docs", true);
         assert_eq!(catalog.open_projects(), Some(vec!["docs".to_string(), "web".to_string()]));
+    }
+
+    #[test]
+    fn the_working_flag_follows_the_daemons_state_and_closing_clears_it() {
+        let catalog = Catalog::default();
+        catalog.set_open(&["web", "api"]);
+        catalog.set_working(&["web"]);
+        assert!(catalog.is_working("web"));
+        assert!(!catalog.is_working("api"));
+        catalog.note_open("web", false);
+        assert!(!catalog.is_working("web"), "a closed project isn't working");
+    }
+
+    /// The per-project flag is read from disk for every open project, not
+    /// only a window's own: a project another terminal has open, whose dev
+    /// slot holds an active card its agent is working, reads as working, and
+    /// stops when the agent goes idle.
+    #[test]
+    fn reload_liveness_reads_every_open_projects_work() {
+        struct Home {
+            dir: std::path::PathBuf,
+            prev: Option<std::ffi::OsString>,
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+        impl Drop for Home {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var("SHELBI_HOME", v),
+                    None => std::env::remove_var("SHELBI_HOME"),
+                }
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+        let _lock = crate::test_env::lock();
+        let dir = std::env::temp_dir().join(format!("shb-liveness-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _home = Home { dir: dir.clone(), prev: std::env::var_os("SHELBI_HOME"), _lock };
+        std::env::set_var("SHELBI_HOME", &dir);
+        let projects = shelbi_state::projects_dir().unwrap();
+        std::fs::create_dir_all(&projects).unwrap();
+        let yaml = |name: &str| {
+            let repo = dir.join("repos").join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            format!(
+                "name: {name}\nrepo: {r}\ndefault_branch: main\nmachines:\n  - {{ name: hub, kind: local, work_dir: {r} }}\norchestrator: {{ runner: claude }}\nagent_runners:\n  claude: {{ command: claude, flags: [] }}\nworkspaces:\n  - {{ name: alpha, machine: hub }}\n",
+                r = repo.display()
+            )
+        };
+        for name in ["web", "api"] {
+            std::fs::write(projects.join(format!("{name}.yaml")), yaml(name)).unwrap();
+            shelbi_state::set_project_open(name, true).unwrap();
+        }
+        let now = chrono::Utc::now();
+        let mut task = shelbi_core::Issue {
+            id: "t-1".into(),
+            title: "Work".into(),
+            column: shelbi_core::Column::in_progress(),
+            priority: 0,
+            assigned_to: Some("alpha".into()),
+            workflow: None,
+            branch: None,
+            pr: None,
+            depends_on: Vec::new(),
+            prefers_machine: None,
+            zen: None,
+            launch: None,
+            created_at: now,
+            updated_at: now,
+            params: Default::default(),
+        };
+        shelbi_state::save_task("web", &task, "").unwrap();
+        let status = |state| shelbi_state::WorkspaceStatus {
+            workspace: "alpha".into(),
+            current_task: Some("t-1".into()),
+            state,
+            last_transition: now,
+            last_seen: now,
+        };
+        shelbi_state::save_workspace_status("web", &status(shelbi_state::WorkspaceState::Working)).unwrap();
+
+        let catalog = Catalog::default();
+        assert!(catalog.reload_liveness(), "the first read is a change");
+        assert!(catalog.is_working("web"));
+        assert!(!catalog.is_working("api"), "nothing in progress there");
+        assert!(!catalog.reload_liveness(), "nothing moved");
+
+        shelbi_state::save_workspace_status("web", &status(shelbi_state::WorkspaceState::AwaitingInput))
+            .unwrap();
+        assert!(catalog.reload_liveness());
+        assert!(!catalog.is_working("web"), "its agent went idle");
+
+        // Back to work, then the card leaves the active column.
+        shelbi_state::save_workspace_status("web", &status(shelbi_state::WorkspaceState::Working)).unwrap();
+        assert!(catalog.reload_liveness());
+        task.column = shelbi_core::Column::review();
+        shelbi_state::save_task("web", &task, "").unwrap();
+        assert!(catalog.reload_liveness());
+        assert!(!catalog.is_working("web"), "a handed-off card is no work in progress");
     }
 
     #[test]

@@ -641,8 +641,8 @@ fn confirm_event(task_id: &str, outcome: overlay::review_confirm::Outcome) -> Ov
 
 /// Build the palette's Projects column from the registered projects on disk
 /// ([`shelbi_app::command_model::build_projects_column`]): the current project
-/// leads (filled `●`), other open projects get the green ring (`○`), and
-/// closed ones the gray ring.
+/// leads; a loaded project gets a green `●`, breathing while one of its
+/// workspaces is working, and a project that isn't loaded the gray ring.
 pub fn build_projects_column(current: &str) -> Vec<ProjectEntry> {
     shelbi_app::command_model::build_projects_column(current)
 }
