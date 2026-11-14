@@ -575,8 +575,7 @@ impl Editor {
             }
         }
         // Marks whose visible text all goes take their delimiters along.
-        for r in ra..=rb {
-            let row = &self.doc.rows[r];
+        for row in &self.doc.rows[ra..=rb] {
             for m in &row.marks {
                 let c = m.content();
                 let shown: Vec<Range<usize>> = row
