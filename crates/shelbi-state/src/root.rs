@@ -169,18 +169,34 @@ pub fn in_test_binary() -> bool {
     false
 }
 
-/// `<target>/<profile>/deps/<name>-<16 hex digits>`, where cargo builds a test
-/// harness. A plain `cargo build` or `cargo run` binary runs from
-/// `<target>/<profile>/<name>`, so it never matches.
+/// Where cargo builds a test harness: `<name>-<16 hex digits>` in
+/// `<target>/<profile>/deps/` (cargo before 1.100), or in
+/// `<target>/<profile>/build/<package>/<that hash>/out/` (cargo 1.100's
+/// build-dir layout). A plain `cargo build` or `cargo run` binary runs from
+/// `<target>/<profile>/<name>`, and the new layout's own copy of it is an
+/// unhashed `out/<name>`, so neither matches.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 fn is_cargo_test_binary_path(exe: &Path) -> bool {
-    let in_deps = exe.parent().and_then(Path::file_name).is_some_and(|dir| dir == "deps");
-    let hashed = exe
+    let is_hash = |s: &str| s.len() == 16 && s.chars().all(|c| c.is_ascii_hexdigit());
+    let Some(hash) = exe
         .file_stem()
         .and_then(|stem| stem.to_str())
         .and_then(|stem| stem.rsplit_once('-'))
-        .is_some_and(|(_, hash)| hash.len() == 16 && hash.chars().all(|c| c.is_ascii_hexdigit()));
-    in_deps && hashed
+        .map(|(_, hash)| hash)
+        .filter(|hash| is_hash(hash))
+    else {
+        return false;
+    };
+    let mut dirs = exe.ancestors().skip(1).map(Path::file_name);
+    match dirs.next().flatten().and_then(|d| d.to_str()) {
+        Some("deps") => true,
+        Some("out") => {
+            dirs.next().flatten().is_some_and(|unit| unit == hash)
+                && dirs.next().flatten().is_some()
+                && dirs.next().flatten().is_some_and(|d| d == "build")
+        }
+        _ => false,
+    }
 }
 
 /// The home a daemon on this machine uses when nothing overrides it.
@@ -610,12 +626,16 @@ mod tests {
     }
 
     #[test]
-    fn only_a_hashed_binary_under_deps_is_a_test_harness() {
+    fn only_a_hashed_harness_in_a_cargo_build_dir_is_a_test_harness() {
         let is = |p: &str| is_cargo_test_binary_path(Path::new(p));
         // Every crate's unit and integration harness, in any target layout.
         assert!(is("/w/target/debug/deps/shelbi_tui-0123456789abcdef"));
         assert!(is("/w/target/debug/deps/shelbi-0123456789abcdef"));
         assert!(is("/w/target/aarch64-apple-darwin/debug/deps/remote_sessions-fedcba9876543210"));
+        // Cargo 1.100's build-dir layout: one unit dir per harness, named by its hash.
+        assert!(is("/w/target/debug/build/shelbi/ed54814372d6e8b4/out/shelbi-ed54814372d6e8b4"));
+        assert!(is("/w/target/debug/build/shelbi-state/80a7fe34750f8285/out/shelbi_state-80a7fe34750f8285"));
+        assert!(is("/w/target/x86_64-unknown-linux-gnu/release/build/shelbi/0123456789abcdef/out/session_cli-0123456789abcdef"));
         // What a user or `cargo run` runs.
         assert!(!is("/w/target/debug/shelbi"));
         assert!(!is("/opt/homebrew/bin/shelbi"));
@@ -625,6 +645,13 @@ mod tests {
         assert!(!is("/w/deps/shelbi"));
         assert!(!is("/w/deps/shelbi-desktop"));
         assert!(!is("/w/target/debug/shelbi-0123456789abcdef"));
+        // The new layout's copy of a plain binary is unhashed, and a hashed
+        // name in some other `out/` (a unit dir that doesn't match, or no
+        // `build/` above it) isn't a harness.
+        assert!(!is("/w/target/debug/build/shelbi/f72970cbcdea655b/out/shelbi"));
+        assert!(!is("/w/target/debug/build/shelbi/f72970cbcdea655b/out/shelbi-0123456789abcdef"));
+        assert!(!is("/w/out/shelbi-0123456789abcdef"));
+        assert!(!is("/w/stuff/shelbi/0123456789abcdef/out/shelbi-0123456789abcdef"));
     }
 
     #[test]

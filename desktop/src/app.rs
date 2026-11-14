@@ -2684,10 +2684,10 @@ impl ShelbiWindow {
     /// or the daemon.
     fn offline(&self) -> bool {
         #[cfg(any(test, feature = "visual-check"))]
-        if self.tap.is_some() {
-            return true;
-        }
-        false
+        let offline = self.tap.is_some();
+        #[cfg(not(any(test, feature = "visual-check")))]
+        let offline = false;
+        offline
     }
 
     /// The sidebar's rows as it draws them (the order and collapse the

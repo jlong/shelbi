@@ -401,8 +401,7 @@ mod lines {
         /// (those at the body's first indentation, deeper than `parent`).
         fn find(&self, body: (usize, usize), parent: Option<usize>, key: &str) -> Option<usize> {
             let mut level = None;
-            for at in body.0..body.1 {
-                let line = &self.lines[at];
+            for (at, line) in self.lines.iter().enumerate().take(body.1).skip(body.0) {
                 if !is_content(line) {
                     continue;
                 }
