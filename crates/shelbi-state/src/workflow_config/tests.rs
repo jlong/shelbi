@@ -1225,3 +1225,157 @@ fn a_save_plan_applies_where_the_project_lives_and_refuses_what_it_shouldnt() {
     ));
     assert_eq!(home.read("statuses.yaml"), after, "nothing written");
 }
+
+#[test]
+fn the_properties_save_to_the_project_yaml_keeping_its_comments() {
+    let home = Home::new();
+    let cfg = load();
+    assert_eq!(cfg.layout(), ConfigMode::Global);
+    assert!(cfg.editor_editable());
+    let before = cfg.properties().clone();
+    assert_eq!(before.label, None);
+    assert_eq!(before.default_branch, "main");
+    assert_eq!((before.workspace_poll_interval_secs, before.github_reconcile_interval_secs), (5, 900));
+    assert_eq!(cfg.issue_tracker().summary(), "Files on disk");
+    assert!(!cfg.set_properties(before.clone()).unwrap().is_dirty(), "no change, no write");
+
+    let edited = cfg
+        .set_properties(Properties {
+            label: Some("Workflow Config".into()),
+            github_url: Some("git@github.com:a/wfc.git".into()),
+            default_branch: "trunk".into(),
+            editor: Some("zed --wait".into()),
+            workspace_poll_interval_secs: 10,
+            github_reconcile_interval_secs: 0,
+        })
+        .unwrap();
+    let saved = save(&edited);
+    assert_eq!(saved.written, vec![home.projects.join(format!("{PROJECT}.yaml"))]);
+    let text = home.project_yaml();
+    assert!(text.starts_with("## Project header.\n"), "the header stays: {text}");
+    assert!(text.contains("default_workflow: task   # tasks without a workflow\n"));
+    assert!(text.contains("default_branch: trunk\n"));
+    let project = crate::load_project(PROJECT).unwrap();
+    assert_eq!(project.display_label(), "Workflow Config", "the loader reads the label");
+    assert_eq!(project.github_url.as_deref(), Some("git@github.com:a/wfc.git"));
+    assert_eq!(project.default_branch, "trunk");
+    assert_eq!(project.editor.as_deref(), Some("zed --wait"));
+    assert_eq!(project.workspace_poll_interval_secs, 10);
+    assert_eq!(project.github_reconcile_interval_secs, 0);
+    assert_eq!(load().properties(), edited.properties(), "it reads back as saved");
+
+    // Clearing the label and editor removes the keys.
+    let cleared = load()
+        .set_properties(Properties {
+            label: None,
+            editor: None,
+            ..edited.properties().clone()
+        })
+        .unwrap();
+    save(&cleared);
+    let text = home.project_yaml();
+    assert!(!text.contains("\nname:") && !text.contains("editor:"), "{text}");
+}
+
+#[test]
+fn bad_properties_are_refused_and_nothing_is_written() {
+    let home = Home::new();
+    let cfg = load();
+    let bad = Properties {
+        workspace_poll_interval_secs: 0,
+        ..cfg.properties().clone()
+    };
+    assert!(matches!(cfg.set_properties(bad), Err(ConfigError::Invalid(_))));
+    let bad_branch = Properties {
+        default_branch: "no spaces".into(),
+        ..cfg.properties().clone()
+    };
+    assert!(cfg.set_properties(bad_branch).is_err());
+
+    // A project YAML the loader would refuse (a workspace on a machine it
+    // doesn't declare) isn't written over, whatever the page changed.
+    let broken = PROJECT_YAML.replace("machine: local, runner", "machine: nowhere, runner");
+    fs::write(home.projects.join(format!("{PROJECT}.yaml")), &broken).unwrap();
+    let cfg = load();
+    let renamed = cfg
+        .set_properties(Properties {
+            label: Some("Renamed".into()),
+            ..cfg.properties().clone()
+        })
+        .unwrap();
+    let err = renamed.save().unwrap_err();
+    assert!(err.to_string().contains("nowhere"), "{err}");
+    assert_eq!(home.project_yaml(), broken, "nothing was written");
+}
+
+#[test]
+fn an_in_repo_projects_editor_saves_to_its_local_yaml() {
+    let home = Home::new();
+    let repo = home.root.join("repo");
+    fs::create_dir_all(repo.join(".shelbi/workflows")).unwrap();
+    fs::write(
+        repo.join(".shelbi/workflows/task.yaml"),
+        shelbi_core::scaffold::task_workflow_yaml().unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        repo.join(".shelbi/workflows/statuses.yaml"),
+        shelbi_core::scaffold::default_statuses_yaml().unwrap(),
+    )
+    .unwrap();
+    let global = home.projects.join(format!("{PROJECT}.yaml"));
+    fs::remove_file(&global).unwrap();
+    let shared = "\
+# Shared settings.
+config_mode: in-repo
+default_branch: main
+default_workflow: task
+orchestrator:
+  runner: claude
+agent_runners:
+  claude:
+    command: claude
+    flags: []
+";
+    let local = format!(
+        "# Mine.\nrepo: {}\nmachines:\n  - name: local\n    kind: local\n    work_dir: /tmp/wfc\n",
+        repo.display()
+    );
+    fs::write(repo.join(".shelbi/project.yaml"), shared).unwrap();
+    let local_path = home.projects.join(PROJECT).join("local.yaml");
+    fs::write(&local_path, &local).unwrap();
+
+    let cfg = load();
+    assert_eq!(cfg.layout(), ConfigMode::InRepo);
+    assert!(cfg.editor_editable());
+    assert_eq!(cfg.editor_path(), local_path.as_path());
+    let edited = cfg
+        .set_properties(Properties {
+            label: Some("Shared Name".into()),
+            editor: Some("nvim".into()),
+            ..cfg.properties().clone()
+        })
+        .unwrap();
+    // (An in-repo project's workflows live in the repo, so not `save`.)
+    let saved = edited.save().unwrap();
+    assert_eq!(saved.written, vec![repo.join(".shelbi/project.yaml"), local_path.clone()]);
+    let shared_now = fs::read_to_string(repo.join(".shelbi/project.yaml")).unwrap();
+    let local_now = fs::read_to_string(&local_path).unwrap();
+    assert!(shared_now.starts_with("# Shared settings.\n") && shared_now.contains("name: Shared Name"));
+    assert!(!shared_now.contains("editor"), "the editor is user-local: {shared_now}");
+    assert!(local_now.starts_with("# Mine.\n") && local_now.contains("editor: nvim"), "{local_now}");
+    let project = crate::load_project(PROJECT).unwrap();
+    assert_eq!(project.editor.as_deref(), Some("nvim"));
+    assert_eq!(project.display_label(), "Shared Name");
+
+    // A far machine's validation takes the local.yaml write too.
+    let plan = load()
+        .set_properties(Properties {
+            editor: None,
+            ..load().properties().clone()
+        })
+        .unwrap()
+        .save_plan()
+        .unwrap();
+    crate::config_write::validate(PROJECT, &plan.plan).unwrap();
+}

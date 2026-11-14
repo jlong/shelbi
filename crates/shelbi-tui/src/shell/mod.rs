@@ -164,6 +164,10 @@ enum SettingsMsg {
     OrchestratorSaved(Ticket, Box<Result<WorkflowConfig, String>>),
     /// Restart orchestrator finished.
     OrchestratorRestarted(Ticket, Result<(), String>),
+    /// The Properties page's read of its project's config.
+    PropertiesLoaded(Ticket, Box<Result<WorkflowConfig, String>>),
+    /// The Properties page's save: the config as now on disk.
+    PropertiesSaved(Ticket, Box<Result<WorkflowConfig, String>>),
 }
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
@@ -3342,6 +3346,19 @@ impl ShellState {
                         let _ = tx.send(SettingsMsg::OrchestratorLoaded(sent, Box::new(config)));
                     })
             }
+            settings::Load::Properties(sent, project) => {
+                // The project YAML, as the workflow config carries it; then
+                // this machine's editors for the Editor's choices.
+                let reader = self.workflows_reader.clone();
+                let tools = self.tools_reader.clone();
+                std::thread::Builder::new()
+                    .name("shelbi-shell-settings-props".into())
+                    .spawn(move || {
+                        let config = reader(&project);
+                        let _ = tx.send(SettingsMsg::PropertiesLoaded(sent, Box::new(config)));
+                        let _ = tx.send(SettingsMsg::ToolsDetected(tools(force)));
+                    })
+            }
         };
         if let Err(e) = spawned {
             let why = format!("couldn't start the read: {e}");
@@ -3365,6 +3382,9 @@ impl ShellState {
                 settings::Load::Orchestrator(ticket, _) => {
                     self.settings.orchestrator_loaded(&ticket, Err(why));
                 }
+                settings::Load::Properties(ticket, _) => {
+                    self.settings.properties_loaded(&ticket, Err(why));
+                }
             }
         }
     }
@@ -3385,6 +3405,25 @@ impl ShellState {
             });
         if let Err(e) = spawned {
             self.settings.orchestrator_saved(&ticket, Err(format!("Couldn't start the save: {e}")));
+        }
+    }
+
+    /// Save the Properties page's changes off the UI thread, through this
+    /// machine's daemon (the same hash-checked project-YAML write).
+    fn save_properties(&mut self, save: settings::PropertiesSave) {
+        let tx = self.settings_tx.clone();
+        let settings::PropertiesSave { ticket, project, config } = save;
+        let sent = ticket.clone();
+        let spawned = std::thread::Builder::new()
+            .name("shelbi-shell-settings-props-save".into())
+            .spawn(move || {
+                let store = shelbi_app::settings::store::Local { project };
+                let saved = shelbi_app::settings::properties::save(&store, &config);
+                let _ = tx.send(SettingsMsg::PropertiesSaved(sent, Box::new(saved)));
+            });
+        if let Err(e) = spawned {
+            let action = self.settings.properties_saved(&ticket, Err(format!("Couldn't start the save: {e}")));
+            self.apply_settings_action(action);
         }
     }
 
@@ -3775,6 +3814,20 @@ impl ShellState {
                 SettingsMsg::OrchestratorRestarted(ticket, result) => {
                     self.settings.orchestrator_restarted(&ticket, result);
                 }
+                SettingsMsg::PropertiesLoaded(ticket, config) => {
+                    self.settings.properties_loaded(&ticket, *config);
+                }
+                SettingsMsg::PropertiesSaved(ticket, saved) => {
+                    let landed = saved.is_ok();
+                    let action = self.settings.properties_saved(&ticket, *saved);
+                    self.apply_settings_action(action);
+                    if landed {
+                        // A new name shows in the sidebar header once the
+                        // snapshot reads the project again (the palette reads
+                        // it each time it opens).
+                        self.request_refresh();
+                    }
+                }
                 SettingsMsg::WorkflowsCommitted(ticket, done) => {
                     self.workflows_committed(&ticket, *done);
                 }
@@ -3901,6 +3954,7 @@ impl ShellState {
             SettingsAction::RunCheck(job) => self.run_check(*job),
             SettingsAction::SaveOrchestrator(save) => self.save_orchestrator(*save),
             SettingsAction::RestartOrchestrator(ticket, project) => self.restart_orchestrator(ticket, project),
+            SettingsAction::SaveProperties(save) => self.save_properties(*save),
         }
         self.dirty = true;
     }
@@ -11359,7 +11413,7 @@ mod tests {
             // The nav sidebar's Orchestrator row is gone; only Settings' own
             // Orchestrator page row (its glyph and number) may show.
             assert!(
-                screen.lines().filter(|l| l.contains("Orchestrator")).all(|l| l.contains("📡") && l.contains('7')),
+                screen.lines().filter(|l| l.contains("Orchestrator")).all(|l| l.contains("📡") && l.contains('5')),
                 "{w}x{h}: the nav sidebar is replaced:\n{screen}"
             );
             // The settings sidebar sits in the sidebar's column, the page in main.
@@ -11743,7 +11797,7 @@ mod tests {
         let mut st = settings_state();
         st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
         st.dispatch_effect(Effect::OpenSettings);
-        type_key(&mut st, '4');
+        type_key(&mut st, '8');
         settle_workflows(&mut st);
         st
     }
@@ -12356,7 +12410,7 @@ mod tests {
         });
         st.dispatch_effect(Effect::OpenSettings);
         // Its number opens it, from the sidebar.
-        type_key(&mut st, '7');
+        type_key(&mut st, '5');
         assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Orchestrator);
         settle_agents(&mut st, "the config loads", |st| st.settings.orchestrator().has_config());
 
@@ -12401,6 +12455,89 @@ mod tests {
             st.settings.orchestrator().restart_status() == &RestartStatus::Restarted
         });
         assert_eq!(*restarts.lock().unwrap(), vec!["proj".to_string()]);
+    }
+
+    // --- Settings ▸ Properties (settings-properties-page), through the real event path --
+
+    #[test]
+    fn the_properties_page_edits_the_project_yaml_and_refuses_bad_values() {
+        use shelbi_app::settings::orchestrator::SaveStatus;
+        use shelbi_app::settings::properties::Text;
+        let home = agents_home("properties");
+        let yaml = shelbi_state::projects_dir().unwrap().join("proj.yaml");
+        let commented = format!("# Proj's own notes.\n{}", std::fs::read_to_string(&yaml).unwrap());
+        std::fs::write(&yaml, &commented).unwrap();
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
+        st.dispatch_effect(Effect::OpenSettings);
+        // Its number opens it, from the sidebar: 4, the project section's first.
+        type_key(&mut st, '4');
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Properties);
+        settle_agents(&mut st, "the config loads", |st| st.settings.properties().form().editable());
+
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(110, 60)).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        let text = screen_text(&term);
+        for want in [
+            "Properties",
+            "Settings for this project, stored in",
+            "Name",
+            "My project",
+            "Repository",
+            "Default branch",
+            "Default workflow",
+            "task",
+            "Editor",
+            "Default ($EDITOR or vim)",
+            "Issue tracker  Files on disk",
+            "▸ Advanced",
+        ] {
+            assert!(text.contains(want), "{want:?} on the page:\n{text}");
+        }
+
+        // Into the page; Enter types in Name, Enter saves it.
+        press(&mut st, KeyCode::Tab);
+        press(&mut st, KeyCode::Enter);
+        for _ in 0.."My project".len() {
+            press(&mut st, KeyCode::Backspace);
+        }
+        for c in "Proj 4".chars() {
+            type_key(&mut st, c);
+        }
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Properties, "4 is typed, not a page");
+        press(&mut st, KeyCode::Enter);
+        settle_agents(&mut st, "the save lands", |st| st.settings.properties().form().status() == &SaveStatus::Saved);
+        let text = std::fs::read_to_string(&yaml).unwrap();
+        assert!(text.starts_with("# Proj's own notes.\n") && text.contains("name: Proj 4"), "{text}");
+        assert_eq!(shelbi_state::load_project("proj").unwrap().display_label(), "Proj 4");
+
+        // ←/→ on Default workflow picks the next one and saves it.
+        for _ in 0..3 {
+            press(&mut st, KeyCode::Down);
+        }
+        press(&mut st, KeyCode::Right);
+        settle_agents(&mut st, "the workflow saves", |st| {
+            st.settings.properties().form().status() == &SaveStatus::Saved
+                && st.settings.properties().form().default_workflow() == "subtask"
+        });
+        assert_eq!(shelbi_state::load_project("proj").unwrap().default_workflow.as_deref(), Some("subtask"));
+
+        // Advanced opens; a bad interval is refused in red and not written.
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        assert!(st.settings.properties().form().advanced_open());
+        press(&mut st, KeyCode::Down);
+        press(&mut st, KeyCode::Enter);
+        press(&mut st, KeyCode::Backspace);
+        type_key(&mut st, '0');
+        press(&mut st, KeyCode::Enter);
+        assert_eq!(st.settings.properties().form().error(Text::PollInterval), Some("Use 1 to 3600 seconds."));
+        let before = std::fs::read_to_string(&yaml).unwrap();
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("Use 1 to 3600 seconds."));
+        assert_eq!(std::fs::read_to_string(&yaml).unwrap(), before, "nothing was written");
+        drop(home);
     }
 
     // --- the agent editor (tui-agent-editor), through the real event path --
@@ -12655,8 +12792,8 @@ workspaces:
         st.pool_service = shelbi_orchestrator::pool_admin::workspace_service_with(ops);
         st.dispatch_effect(Effect::OpenSettings);
         settle_settings(&mut st);
-        type_key(&mut st, '5');
-        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Workspaces, "5 opens Workspaces");
+        type_key(&mut st, '7');
+        assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::Workspaces, "7 opens Workspaces");
         assert!(
             wait_until(Duration::from_secs(5), || {
                 st.poll_settings();

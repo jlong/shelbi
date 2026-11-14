@@ -24,3 +24,6 @@ palette frame (2171:752) and drawn on its 20pt grid with the outline set's
 - `git-branch.svg`: the task panels' branch row (component `git-branch`,
   2686:37688, in the Workspace and Review frames 2787:33099 / 2787:33098), a
   filled drawing.
+- `robot.svg`: the Settings sidebar's Agents row (component `robot`,
+  2833:34630, in the Navigation component's State=Settings 2252:27532), a
+  stroked drawing in the outline set's 1.25pt stroke.

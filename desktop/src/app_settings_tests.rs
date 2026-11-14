@@ -1,7 +1,7 @@
 //! Settings in its own sidebar (`dt-settings-sections`): opening it pushes
 //! the settings sidebar into the leading column on the General page (or the
-//! last page used), ⌘1 to ⌘7 and ↑ / ↓ plus Enter switch its pages while it
-//! is open (and ⌘N keeps its sidebar meaning outside), and Back or Esc
+//! last page used), ⌃1 to ⌃8 and ↑ / ↓ plus Enter switch its pages while it
+//! is open (⌘N stays the tabs', and ⌃N keeps its sidebar meaning outside), and Back or Esc
 //! return to the view it was opened over with the app sidebar back and its
 //! selection on that view's row (`dt-back-syncs-sidebar`).
 //!
@@ -163,11 +163,11 @@ fn each_page_shows_its_controls(cx: &mut TestAppContext) {
     );
     assert!(!s.drawn("settings-font-size") && !s.drawn("settings-open-keys"));
 
-    s.key("cmd-2");
+    s.key("ctrl-2");
     assert!(s.drawn("settings-page-keybindings") && s.drawn("settings-open-keys"));
     assert!(!s.drawn("settings-cli-path") && !s.drawn("settings-font-size"));
 
-    s.key("cmd-3");
+    s.key("ctrl-3");
     assert!(s.drawn("settings-page-terminal"));
     assert!(
         s.drawn("settings-font-size")
@@ -176,7 +176,7 @@ fn each_page_shows_its_controls(cx: &mut TestAppContext) {
     );
     assert!(!s.drawn("settings-open-keys") && !s.drawn("settings-theme-Auto"));
 
-    s.key("cmd-4");
+    s.key("ctrl-8");
     assert!(s.drawn("settings-page-workflows") && s.drawn("settings-workflows"));
     assert!(s.drawn("workflows-new") && s.drawn("statuses-new") && s.drawn("statuses-edit-yaml"));
     assert!(s.drawn("status-categories"));
@@ -187,24 +187,36 @@ fn each_page_shows_its_controls(cx: &mut TestAppContext) {
 fn the_numbered_chords_switch_pages_inside_settings_only(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.key("cmd-3");
+    s.key("ctrl-3");
     assert_eq!(
         (s.page(), s.selected_row()),
         (Some(SettingsPage::Terminal), Some(SettingsPage::Terminal))
     );
-    s.key("cmd-2");
+    s.key("ctrl-2");
     assert_eq!(s.page(), Some(SettingsPage::Keybindings));
-    s.key("cmd-9");
-    assert_eq!(s.page(), Some(SettingsPage::Keybindings), "no page is ⌘9");
+    // ⌃4 to ⌃8 are the project's pages in the frame's order.
+    for (key, page) in [
+        ("ctrl-4", SettingsPage::Properties),
+        ("ctrl-5", SettingsPage::Orchestrator),
+        ("ctrl-6", SettingsPage::Agents),
+        ("ctrl-7", SettingsPage::Workspaces),
+        ("ctrl-8", SettingsPage::Workflows),
+    ] {
+        s.key(key);
+        assert_eq!(s.page(), Some(page), "{key}");
+    }
+    s.key("ctrl-2");
+    s.key("ctrl-9");
+    assert_eq!(s.page(), Some(SettingsPage::Keybindings), "no page is ⌃9");
     assert!(s.h.take_calls().is_empty(), "no sidebar row opened");
 
-    // ⌃N is no page chord: the settings sidebar has no numbered rows.
-    s.key("ctrl-1");
+    // ⌘N stays the tabs': it opens no page.
+    s.key("cmd-1");
     assert_eq!(s.page(), Some(SettingsPage::Keybindings));
     assert!(s.h.take_calls().is_empty());
 
-    // Outside Settings, ⌘1 is the first tab again (the shown project's:
-    // nothing to switch to) and ⌃1 the sidebar's first numbered row.
+    // Outside Settings, ⌘1 is the first tab (the shown project's: nothing
+    // to switch to) and ⌃1 the sidebar's first numbered row.
     s.key("escape");
     s.h.take_calls();
     s.key("cmd-1");
@@ -240,26 +252,29 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
     s.key("down");
     assert_eq!(
         s.selected_row(),
-        Some(SettingsPage::Orchestrator),
-        "it crosses into the project section, Orchestrator first"
+        Some(SettingsPage::Properties),
+        "it crosses into the project section, Properties first"
     );
-    s.key("down");
-    assert_eq!(s.selected_row(), Some(SettingsPage::Workspaces));
-    s.key("down");
-    s.key("down");
-    s.key("down");
+    for page in [
+        SettingsPage::Orchestrator,
+        SettingsPage::Agents,
+        SettingsPage::Workspaces,
+        SettingsPage::Workflows,
+    ] {
+        s.key("down");
+        assert_eq!(s.selected_row(), Some(page));
+    }
     s.key("down");
     assert_eq!(
         s.selected_row(),
-        Some(SettingsPage::Agents),
+        Some(SettingsPage::Workflows),
         "it stops at the last row"
     );
     s.key("enter");
-    assert_eq!(s.page(), Some(SettingsPage::Agents));
-    s.key("up");
-    s.key("up");
-    s.key("up");
-    s.key("up");
+    assert_eq!(s.page(), Some(SettingsPage::Workflows));
+    for _ in 0..5 {
+        s.key("up");
+    }
     s.key("enter");
     assert_eq!(
         (s.page(), s.selected_row()),
@@ -335,7 +350,7 @@ fn back_and_esc_return_to_the_view_with_its_sidebar_row_selected(cx: &mut TestAp
 fn settings_reopens_on_the_page_last_used(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.key("cmd-3");
+    s.key("ctrl-3");
     s.key("escape");
     s.open_settings();
     assert_eq!(
@@ -397,7 +412,7 @@ fn toggle_sidebar_collapses_the_settings_sidebar(cx: &mut TestAppContext) {
 fn a_typed_letter_in_a_field_stays_the_fields(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.key("cmd-3");
+    s.key("ctrl-3");
     s.click("settings-font-size");
     assert!(!s.window_focused(), "the field has focus");
     s.key("j");
@@ -640,7 +655,7 @@ fn browse_saves_an_app_and_refuses_what_isnt_a_tool(cx: &mut TestAppContext) {
 
 /// The Terminal page's view, with `config.yaml` "read" as `cfg`.
 fn terminal_page(s: &mut Settings, cfg: shelbi_state::UserConfig) -> Entity<SettingsView> {
-    s.key("cmd-3");
+    s.key("ctrl-3");
     let view = s.read(|w, _| match &w.route {
         Route::Settings(view) => view.clone(),
         _ => panic!("settings is open"),
@@ -795,7 +810,7 @@ impl Settings {
     fn open_keybindings(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("cmd-2");
+        s.key("ctrl-2");
         s
     }
 
@@ -872,24 +887,27 @@ fn a_capture_takes_the_windows_own_chords_and_esc_only_cancels(cx: &mut TestAppC
     assert_eq!(s.page(), Some(SettingsPage::Keybindings));
     assert!(s.page_read(|p| p.state().capture().is_none()));
 
-    // ⌘1, the General page's chord, is the capture's while it is open.
+    // ⌃1, the General page's chord, is the capture's while it is open.
     s.click("keybinding-sidebar-nav_up-key-0");
-    s.key("cmd-1");
+    s.key("ctrl-1");
     assert_eq!(s.page(), Some(SettingsPage::Keybindings));
     let nav_up = shelbi_state::keymap::Action::Sidebar(SidebarAction::NavUp);
     let chords: Vec<String> = s.page_read(|p| p.state().chords(nav_up).iter().map(|c| c.canonical()).collect());
-    assert_eq!(chords, ["super-1", "up"]);
-    // Closed again, ⌘1 is the page chord once more.
-    s.key("cmd-1");
-    assert_eq!(s.page(), Some(SettingsPage::General));
+    assert_eq!(chords, ["ctrl-1", "up"]);
+    // Closed again, ⌃1 is the user's now (a bound row chord stays theirs);
+    // an unbound one is a page chord once more.
+    s.key("ctrl-1");
+    assert_eq!(s.page(), Some(SettingsPage::Keybindings), "⌃1 is Move up's now");
+    s.key("ctrl-3");
+    assert_eq!(s.page(), Some(SettingsPage::Terminal));
 
     // A capture left open by a click on another page's row ends with it.
-    s.key("cmd-2");
+    s.key("ctrl-2");
     s.click("keybinding-sidebar-nav_up-key-0");
     s.click("settings-nav-terminal");
     assert!(s.page_read(|p| p.state().capture().is_none()));
-    s.key("cmd-2");
-    assert_eq!(s.page(), Some(SettingsPage::Keybindings), "⌘2 reaches the window");
+    s.key("ctrl-2");
+    assert_eq!(s.page(), Some(SettingsPage::Keybindings), "⌃2 reaches the window");
 }
 
 #[gpui::test]
@@ -970,7 +988,7 @@ fn the_search_clear_button_shows_with_a_query_and_clears_it(cx: &mut TestAppCont
 
 /// The General page's view, with `config.yaml` "read" as `cfg`.
 fn general_page(s: &mut Settings, cfg: shelbi_state::UserConfig) -> Entity<SettingsView> {
-    s.key("cmd-1");
+    s.key("ctrl-1");
     let view = s.read(|w, _| match &w.route {
         Route::Settings(view) => view.clone(),
         _ => panic!("settings is open"),
@@ -1276,11 +1294,11 @@ use crate::views::workflows_state::tests::Home;
 use shelbi_state::workflow_config::WorkflowConfig;
 
 impl Settings {
-    /// Settings on Workflows (⌘4), its page loaded from `home`'s files.
+    /// Settings on Workflows (⌃8), its page loaded from `home`'s files.
     fn open_workflows(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("cmd-4");
+        s.key("ctrl-8");
         let page = s.workflows();
         s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
         s.settle();
@@ -1493,11 +1511,11 @@ use crate::views::orchestrator::{mode_selector, OrchestratorPage};
 use shelbi_core::AwarenessMode;
 
 impl Settings {
-    /// Settings on Orchestrator (⌘7), its page loaded from `home`'s files.
+    /// Settings on Orchestrator (⌃5), its page loaded from `home`'s files.
     fn open_orchestrator(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("cmd-7");
+        s.key("ctrl-5");
         let page = s.orchestrator();
         s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
         s.saved();
@@ -1577,6 +1595,96 @@ fn restart_orchestrator_asks_the_projects_daemon_once(cx: &mut TestAppContext) {
         s.read(|_, cx| page.read(cx).form().restart_status().clone()),
         shelbi_app::settings::orchestrator::RestartStatus::Restarted
     );
+}
+
+// ---- Settings ▸ Properties (`settings-properties-page`) ---------------------
+
+use crate::views::properties::{text_selector, PropertiesPage};
+use shelbi_app::settings::properties::Text;
+
+impl Settings {
+    /// Settings on Properties (⌃4), its page loaded from `home`'s files.
+    fn open_properties(cx: &mut TestAppContext) -> Settings {
+        let mut s = Settings::open(cx);
+        s.open_settings();
+        s.key("ctrl-4");
+        let page = s.properties();
+        s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
+        s.saved();
+        s
+    }
+
+    fn properties(&self) -> Entity<PropertiesPage> {
+        self.read(|w, cx| match &w.route {
+            Route::Settings(view) => view.read(cx).properties(),
+            _ => panic!("Settings is open"),
+        })
+    }
+}
+
+#[gpui::test]
+fn the_properties_page_saves_the_project_yaml_and_refuses_bad_values(cx: &mut TestAppContext) {
+    let home = Home::with_project("props-page", "alpha");
+    let yaml = home.root.join("projects").join("alpha.yaml");
+    let commented = format!("# Alpha's own notes.\n{}", std::fs::read_to_string(&yaml).unwrap());
+    std::fs::write(&yaml, &commented).unwrap();
+    let mut s = Settings::open_properties(cx);
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Properties), Some(SettingsPage::Properties)));
+    for selector in [
+        "settings-nav-properties",
+        "settings-page-properties",
+        "properties-subtitle",
+        "properties-name",
+        "properties-repository",
+        "properties-default-branch",
+        "properties-default-workflow-button",
+        "properties-editor-button",
+        "properties-issue-tracker-summary",
+        "properties-advanced",
+    ] {
+        assert!(s.drawn(selector), "{selector}");
+    }
+    assert!(!s.drawn("properties-poll-interval"), "Advanced starts closed");
+    // Top to bottom as the wireframe: Name, Repository, Default branch,
+    // Default workflow, Editor, Issue tracker, Advanced.
+    let order = [
+        "properties-name",
+        "properties-repository",
+        "properties-default-branch",
+        "properties-default-workflow-button",
+        "properties-editor-button",
+        "properties-issue-tracker-summary",
+        "properties-advanced",
+    ];
+    for pair in order.windows(2) {
+        assert!(s.above(pair[0], pair[1]), "{} above {}", pair[0], pair[1]);
+    }
+
+    // A new name saves on Return, keeping the file's comments.
+    let page = s.properties();
+    let name = s.read(|_, cx| page.read(cx).input(Text::Label));
+    s.enter_text(name, "Alpha Project");
+    s.saved();
+    let text = std::fs::read_to_string(&yaml).unwrap();
+    assert!(text.starts_with("# Alpha's own notes.\n") && text.contains("name: Alpha Project"), "{text}");
+    assert_eq!(shelbi_state::load_project("alpha").unwrap().display_label(), "Alpha Project");
+    assert!(s.drawn("properties-status"), "Saved to … shows");
+    assert_eq!(s.read(|_, cx| page.read(cx).form().text(Text::Label).to_string()), "Alpha Project");
+
+    // A bad interval shows its error under the field and isn't written.
+    s.click("properties-advanced");
+    assert!(s.drawn("properties-poll-interval"));
+    let poll = s.read(|_, cx| page.read(cx).input(Text::PollInterval));
+    s.enter_text(poll, "0");
+    s.saved();
+    assert!(s.drawn("properties-poll-interval-error"));
+    assert_eq!(std::fs::read_to_string(&yaml).unwrap(), text, "nothing was written");
+    let poll = s.read(|_, cx| page.read(cx).input(Text::PollInterval));
+    s.enter_text(poll, "12");
+    s.saved();
+    assert!(!s.drawn("properties-poll-interval-error"));
+    assert_eq!(shelbi_state::load_project("alpha").unwrap().workspace_poll_interval_secs, 12);
+    let _ = text_selector(Text::Label);
 }
 
 // ---- Edit YAML in the ⋮ menus (`dt-workflow-edit-yaml`) ---------------------
@@ -1756,7 +1864,7 @@ fn the_editor_takes_the_window_without_the_sidebar(cx: &mut TestAppContext) {
 
     // ⌘N doesn't switch pages under it; Back returns to the page, the
     // sidebar with it.
-    s.key("cmd-1");
+    s.key("ctrl-1");
     assert!(s.drawn("workflow-editor"));
     s.click("workflow-editor-back");
     assert!(!s.drawn("workflow-editor") && s.drawn("settings-workflows") && s.drawn("column-settings"));
@@ -2922,11 +3030,11 @@ use crate::views::agents::AgentsPage;
 use shelbi_state::agents_config::AgentsConfig;
 
 impl Settings {
-    /// Settings on Agents (⌘6), its page loaded from the test's home.
+    /// Settings on Agents (⌃6), its page loaded from the test's home.
     fn open_agents(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("cmd-6");
+        s.key("ctrl-6");
         let page = s.agents();
         s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
         s.settle();
@@ -2960,8 +3068,10 @@ fn the_agents_page_lists_the_projects_agents(cx: &mut TestAppContext) {
     let _home = crate::views::agents_state::tests::home_for("page-rows", "alpha");
     let mut s = Settings::open_agents(cx);
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Agents), Some(SettingsPage::Agents)));
-    let workflows = s.bounds("settings-nav-workflows").unwrap();
-    assert!(workflows.bottom() <= s.bounds("settings-nav-agents").unwrap().top(), "after Workflows");
+    let orchestrator = s.bounds("settings-nav-orchestrator").unwrap();
+    let agents = s.bounds("settings-nav-agents").unwrap();
+    assert!(orchestrator.bottom() <= agents.top(), "after Orchestrator");
+    assert!(agents.bottom() <= s.bounds("settings-nav-workspaces").unwrap().top(), "before Workspaces");
 
     assert_eq!(s.agent_names(), ["orchestrator", "developer", "review", "qa", "security", "adversarial"]);
     for selector in [
@@ -3231,7 +3341,7 @@ fn the_agent_editor_takes_the_window_without_the_sidebar(cx: &mut TestAppContext
 
     // ⌘N doesn't switch pages under it; Back returns to the page, the
     // sidebar with it.
-    s.key("cmd-1");
+    s.key("ctrl-1");
     assert!(s.drawn("agent-editor"));
     s.click("agent-editor-back");
     assert!(!s.drawn("agent-editor") && s.drawn("settings-agents") && s.drawn("column-settings"));
@@ -3414,14 +3524,14 @@ fn assignment_rows_open_their_workflow_and_the_link_shows_workflows(cx: &mut Tes
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workflows), Some(SettingsPage::Workflows)));
 
     // Manage assignments in Workflows.
-    s.key("cmd-6");
+    s.key("ctrl-6");
     s.click("agent-edit-developer");
     s.click("agent-workflows-link");
     assert!(!s.drawn("agent-editor") && s.drawn("settings-workflows"));
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workflows), Some(SettingsPage::Workflows)));
 
     // With unsaved edits, a row asks first.
-    s.key("cmd-6");
+    s.key("ctrl-6");
     s.click("agent-edit-developer");
     s.edit_agent(|e, window, cx| e.make(AgentChange::Permissions(Some("plan".into())), window, cx));
     s.click("agent-assignment-task-in-progress");
@@ -3516,11 +3626,11 @@ use shelbi_app::settings::workspaces::fixtures::{write_pool, POOL};
 use shelbi_app::settings::workspaces::{probe_key, Intent, Load};
 
 impl Settings {
-    /// Settings on Workspaces (⌘5), its page loaded from the test's home.
+    /// Settings on Workspaces (⌃7), its page loaded from the test's home.
     fn open_workspaces(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("cmd-5");
+        s.key("ctrl-7");
         s.load_workspaces();
         s
     }
@@ -3583,11 +3693,11 @@ fn workspaces_sits_before_workflows_on_its_own_chord(cx: &mut TestAppContext) {
     let workspaces = s.bounds("settings-nav-workspaces").unwrap();
     let workflows = s.bounds("settings-nav-workflows").unwrap();
     assert!(label.bottom() < workspaces.top() && workspaces.bottom() < workflows.top());
-    s.key("cmd-5");
+    s.key("ctrl-7");
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workspaces), Some(SettingsPage::Workspaces)));
     assert!(s.drawn("settings-page-workspaces") && s.drawn("workspaces-heading"));
-    s.key("cmd-3");
-    assert_eq!(s.page(), Some(SettingsPage::Terminal), "⌘3 stays Terminal's");
+    s.key("ctrl-3");
+    assert_eq!(s.page(), Some(SettingsPage::Terminal), "⌃3 stays Terminal's");
     s.click("settings-nav-workspaces");
     assert_eq!(s.page(), Some(SettingsPage::Workspaces));
 
@@ -3602,7 +3712,7 @@ fn the_workspaces_page_lists_the_pool_then_its_machines(cx: &mut TestAppContext)
     write_pool("alpha", POOL);
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.key("cmd-5");
+    s.key("ctrl-7");
     assert!(s.drawn("workspaces-loading"), "loading until the read lands");
     s.load_workspaces();
     assert!(!s.drawn("workspaces-loading"));
@@ -3655,7 +3765,7 @@ fn a_remote_that_cant_be_reached_keeps_its_configuration(cx: &mut TestAppContext
     assert!(s.drawn("machine-dir-Build server") && s.drawn("machine-configure-Build server"));
     assert!(s.drawn("workspace-row-charlie"), "its workspaces stay listed");
     assert_eq!(status(&s), "Unreachable");
-    s.key("cmd-4");
+    s.key("ctrl-8");
     assert_eq!(s.page(), Some(SettingsPage::Workflows), "the rest of Settings carries on");
 }
 
@@ -4064,7 +4174,7 @@ fn the_keyboard_moves_through_the_form(cx: &mut TestAppContext) {
     s.key("shift-tab");
     s.key("shift-tab");
     assert!(s.form_focused(MachineField::Name));
-    s.key("cmd-4");
+    s.key("ctrl-8");
     assert_eq!(s.page(), Some(SettingsPage::Workspaces), "the sidebar's chords wait for the form");
     assert!(s.machine_form().is_some());
 }
@@ -4610,7 +4720,7 @@ fn the_dialog_holds_the_keyboard_until_it_closes(cx: &mut TestAppContext) {
     s.key("shift-tab");
     assert_eq!(s.dialog_focus(), Ctl::Submit);
     // The settings sidebar's chords wait.
-    s.key("cmd-4");
+    s.key("ctrl-8");
     assert_eq!(s.page(), Some(SettingsPage::Workspaces));
     assert!(s.dialog().is_some());
     // The machine picker from the keyboard.

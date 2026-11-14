@@ -65,6 +65,7 @@ pub mod issue_store;
 pub mod keymap;
 pub mod pool_config;
 pub mod pr_status;
+pub mod project_properties;
 pub mod zen_flow;
 pub mod workflow_config;
 pub mod yaml_edit;

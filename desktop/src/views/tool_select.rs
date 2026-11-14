@@ -53,6 +53,9 @@ pub enum ToolSelectEvent {
 /// One tool setting's picker.
 pub struct ToolSelect {
     setting: ToolSetting,
+    /// Its element ids' prefix ([`selector`], unless another page's picker
+    /// for the same setting names its own: Settings ▸ Properties' Editor).
+    prefix: &'static str,
     picker: ToolPicker,
     icons: AppIcons,
     /// Whether it takes a pick (the config is read, no save in flight).
@@ -87,6 +90,7 @@ impl ToolSelect {
     pub fn new(setting: ToolSetting, picker: ToolPicker, cx: &mut Context<Self>) -> Self {
         ToolSelect {
             setting,
+            prefix: selector(setting),
             picker,
             icons: AppIcons::new(),
             enabled: false,
@@ -96,6 +100,12 @@ impl ToolSelect {
             scroll: MenuScroll::default(),
             button: Anchor::default(),
         }
+    }
+
+    /// Name its elements with `prefix` instead of [`selector`]'s.
+    pub fn with_prefix(mut self, prefix: &'static str) -> Self {
+        self.prefix = prefix;
+        self
     }
 
     /// Show `picker` (the form changed: read, detected, saving, saved).
@@ -230,7 +240,7 @@ impl ToolSelect {
     /// The menu's rows: the entries in order, with the group headings and
     /// the rule before Browse….
     fn render_rows(&self, theme: &Theme, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let prefix = selector(self.setting);
+        let prefix = self.prefix;
         let selected = self.picker.selected();
         let mut rows = Vec::new();
         for (ix, entry) in self.picker.entries().into_iter().enumerate() {
@@ -312,7 +322,7 @@ fn app_icon(icon: Option<Arc<Image>>, theme: &Theme) -> Div {
 impl Render for ToolSelect {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
-        let prefix = selector(self.setting);
+        let prefix = self.prefix;
         let focused = self.focus.is_focused(window);
         let label = self.picker.current_label();
         let chevron = style::button_colors(ButtonKind::Secondary, &theme).icon;

@@ -26,6 +26,8 @@
 //! -new,-added} against `workflows/2-builder.png`, `3-…`, `5-…`, `6-…` and
 //! `7-…`, and settings-workflow-form against
 //! `workflows/4-workflow-form.png` in the frame's 1440x1283 window,
+//! settings-properties (its sidebar against the Navigation component's
+//! State=Settings, 2252:27532) with state-properties-advanced,
 //! settings-agents against `agents/1-agents-index.png`,
 //! settings-agent-details against `agents/2-agent-details.png`,
 //! settings-workspaces against the Workspaces frame 2523:8879,
@@ -1371,11 +1373,45 @@ impl Run {
         }
         // The Shelbi CLI field is read-only (`dt-cli-path-readonly`): there
         // is no focused state to draw.
+        self.settings_properties();
         self.settings_workflows();
         self.settings_agents();
         self.settings_workspaces();
         self.keybindings_states();
         self.components();
+    }
+
+    /// Settings ▸ Properties (`settings-properties-page`): the settings
+    /// sidebar as the Navigation component's State=Settings draws it
+    /// (2252:27532: Properties first under the project, Agents' robot, ⌃1 to
+    /// ⌃8), over the page (no frame of its own: the General page's
+    /// controls), then the page with Advanced open.
+    fn settings_properties(&mut self) {
+        use crate::views::settings_nav::SettingsPage;
+        let open = |run: &mut Self| {
+            let handle = run.open();
+            handle
+                .update(&mut run.cx, |w, window, cx| w.offscreen_open_settings(SettingsPage::Properties, window, cx))
+                .unwrap();
+            run.settle(handle);
+            handle
+        };
+        let page = |run: &mut Self, handle: WindowHandle<ShelbiWindow>| {
+            handle
+                .update(&mut run.cx, |w, _, cx| w.offscreen_settings().map(|v| v.read(cx).properties()))
+                .unwrap()
+                .expect("Settings is open")
+        };
+        let handle = open(self);
+        let loaded = page(self, handle).read_with(&self.cx, |p, _| p.form().editable());
+        self.expect("settings-properties: the project's YAML reads", loaded);
+        self.save(handle, "settings-properties");
+
+        let handle = open(self);
+        let properties = page(self, handle);
+        properties.update(&mut self.cx, |p, cx| p.offscreen_open_advanced(cx));
+        self.settle(handle);
+        self.save(handle, "state-properties-advanced");
     }
 
     /// Settings ▸ Workflows (the Index frame, 2301:5824, reference

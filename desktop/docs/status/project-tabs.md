@@ -57,7 +57,9 @@ of the window, one per open project: the Figma `Orchestrator · Dark` frame
   `⌘N` badge (the frame's hidden `Hotkey`). The sidebar's numbered rows and
   the task panels' views move from ⌘1 to ⌘9 to ⌃1 to ⌃9, and their badges
   read `⌃N`. Settings keeps ⌘N for its pages while it is open; ⌃N does
-  nothing there. A ⌃ digit the user's `keys.yaml` binds in its global or
+  nothing there. (Since `settings-properties-page`, Settings' pages take
+  ⌃1 to ⌃8 in sidebar order, as the frame numbers them, and ⌘N stays the
+  tabs'.) A ⌃ digit the user's `keys.yaml` binds in its global or
   sidebar keys stays theirs.
 - **The sidebar** starts under the bar: its titlebar row and the project
   switcher are gone, and the nav (Orchestrator, Issues, Changelog) is its
