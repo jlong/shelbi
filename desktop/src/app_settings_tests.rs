@@ -141,8 +141,10 @@ fn settings_takes_the_column_with_its_own_sidebar(cx: &mut TestAppContext) {
     }
     // The frame's sidebar has no footer: no Zen pill, no settings gear.
     assert!(!s.drawn("sidebar-zen") && !s.drawn("sidebar-settings"));
-    // The tab bar over it keeps Search and Toggle sidebar.
-    assert!(s.drawn("tab-bar-search") && s.drawn("tab-bar-sidebar"));
+    // Its header row has Search and Toggle sidebar; the tab bar over it
+    // keeps its search box.
+    assert!(s.drawn("settings-search") && s.drawn("settings-toggle"));
+    assert!(s.drawn("tab-bar-search") && !s.drawn("tab-bar-sidebar"));
     assert_eq!(s.page(), Some(SettingsPage::General));
     assert_eq!(s.selected_row(), Some(SettingsPage::General));
     assert!(s.drawn("settings-page-general"));
@@ -363,8 +365,9 @@ fn toggle_sidebar_collapses_the_settings_sidebar(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
     let full = s.bounds("settings-sidebar").expect("drawn").size.width;
-    // It slides out like the app's sidebar: clipped at its full width.
-    s.h.click_selector("tab-bar-sidebar");
+    // Its header's toggle slides it out like the app's sidebar: clipped at
+    // its full width.
+    s.h.click_selector("settings-toggle");
     s.now.set(s.now.get() + Duration::from_millis(30));
     s.h.draw();
     let column = s.bounds("leading-column").expect("still going").size.width;

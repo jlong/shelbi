@@ -3,7 +3,8 @@
 //! while Settings is open, as the task panels do (`column_swap`).
 //!
 //! It starts under the window's tab bar, like the app sidebar. Top to
-//! bottom: the back button beside the Settings title, then each section:
+//! bottom: the header row (the back button beside the Settings title, then
+//! Search and Toggle sidebar, as the app sidebar's), then each section:
 //! its header and its pages' nav rows, each with its ⌘N. The Global
 //! section (General, Keybindings, Terminal), then, after a divider, the
 //! project section (`dt-wf-settings-index`, frame 2301:5824): the project's
@@ -19,7 +20,7 @@
 
 use gpui::{div, prelude::*, px, AnyElement, Bounds, Context, FontWeight, Pixels, SharedString};
 
-use super::sidebar::{nav_item, SidebarEvent, SidebarHost};
+use super::sidebar::{self, nav_item, SidebarEvent, SidebarHost};
 use super::task_panel;
 use crate::assets::{icons, Icon};
 use crate::keys::tab_hotkey;
@@ -133,16 +134,15 @@ fn project_header(label: SharedString, theme: &Theme) -> impl IntoElement {
 /// The project name's row height (the frame's switcher trigger's).
 const PROJECT_ROW_H: f32 = 28.0;
 
-/// The back row's inset under the tab bar.
-const BACK_TOP: f32 = 16.0;
-
 /// The settings sidebar. `chip` is the sliding selection while it moves
-/// (measured on `track`); `project` is the shown project's name.
+/// (measured on `track`); `project` is the shown project's name;
+/// `palette_chord` the header's Search names.
 pub fn render<H: SidebarHost>(
     nav: SettingsNav,
     chip: Option<Bounds<Pixels>>,
     track: &SharedTrack,
     project: SharedString,
+    palette_chord: &str,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> AnyElement {
@@ -158,7 +158,6 @@ pub fn render<H: SidebarHost>(
         .min_w_0()
         .items_center()
         .h(px(24.0))
-        .px(px(4.0))
         // The frame's Desktop/Heading reads 18 / 28 semibold here; the
         // app's `Type::Heading` (20 / 28 bold) is left to its other titles.
         .type_style(Type::Heading)
@@ -166,6 +165,19 @@ pub fn render<H: SidebarHost>(
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme.foreground)
         .child("Settings");
+    // The header row (2252:27533): the back button and the title 12pt
+    // apart, 12pt in, then Search and Toggle sidebar.
+    let header = sidebar::header_row(
+        div().flex().flex_row().flex_1().min_w_0().items_center().gap(px(12.0)).child(back).child(title),
+        sidebar::HEADER_PAD_LEFT,
+        sidebar::search_button("settings-search", palette_chord, theme).on_click(cx.listener(
+            |this, _, window, cx| this.sidebar_event(SidebarEvent::OpenSearch, window, cx),
+        )),
+        sidebar::toggle_button("settings-toggle", Some(true), theme).on_click(cx.listener(
+            |this, _, window, cx| this.sidebar_event(SidebarEvent::Collapse, window, cx),
+        )),
+    )
+    .debug_selector(|| "settings-header".into());
     let selected = nav.selected();
     let inline = chip.is_none();
     let sections = SECTIONS
@@ -251,19 +263,7 @@ pub fn render<H: SidebarHost>(
         .bg(theme.nested(theme.sidebar))
         .text_color(theme.foreground)
         .type_style(Type::Base)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .flex_none()
-                .items_center()
-                .gap(px(12.0))
-                .px(px(16.0))
-                .pt(px(BACK_TOP))
-                .pb(px(8.0))
-                .child(back)
-                .child(title),
-        )
+        .child(header)
         .child(sections)
         .into_any_element()
 }

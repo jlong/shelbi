@@ -227,7 +227,7 @@ pub fn run(out: PathBuf) -> ! {
             };
             let view = cx.new(|cx| {
                 let mut v = WorkspaceView::new("demo", handle, deps, None, cx);
-                v.set_palette_chord("⌃P", cx);
+                v.set_palette_chord("⌘K", cx);
                 v
             });
             cx.new(|_| Host { view })

@@ -146,28 +146,41 @@ fn the_zen_pill_toggles_zen(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn the_tab_bar_buttons_search_and_toggle_the_sidebar(cx: &mut TestAppContext) {
+fn search_opens_the_palette_and_the_header_toggles_the_sidebar(cx: &mut TestAppContext) {
     let mut h = open(cx);
-    h.click_selector("tab-bar-search");
-    assert!(h.window.read_with(&h.cx, |w, _| w.overlay.is_some()), "Search opens the palette");
-    h.window.update(&mut h.cx, |w, cx| {
-        w.overlay = None;
-        cx.notify();
-    });
+    // The tab bar's search box and the sidebar header's Search both open
+    // the palette.
+    for search in ["tab-bar-search", "sidebar-search"] {
+        h.click_selector(search);
+        assert!(h.window.read_with(&h.cx, |w, _| w.overlay.is_some()), "{search} opens the palette");
+        h.window.update(&mut h.cx, |w, cx| {
+            w.overlay = None;
+            cx.notify();
+        });
+    }
 
     // Instant here: the slide itself is `app_column_tests`'s.
     h.window.update(&mut h.cx, |w, _| w.reduce_motion = std::rc::Rc::new(|| true));
     let bar = h.cx.debug_bounds("tab-bar").expect("the tab bar");
-    h.click_selector("tab-bar-sidebar");
+    h.click_selector("sidebar-toggle");
     h.draw();
     assert!(h.window.read_with(&h.cx, |w, _| w.collapsed));
     assert!(h.cx.debug_bounds("sidebar").is_none(), "the column is hidden");
+    assert!(h.cx.debug_bounds("sidebar-toggle").is_none(), "the header and its toggle with it");
     assert_eq!(h.cx.debug_bounds("tab-bar"), Some(bar), "the tab bar stays put");
-    // The toggle stays where it was.
+    // The tab bar's toggle brings it back, and leaves with it.
     h.click_selector("tab-bar-sidebar");
     h.draw();
     assert!(!h.window.read_with(&h.cx, |w, _| w.collapsed));
     assert!(h.cx.debug_bounds("sidebar").is_some());
+    assert!(h.cx.debug_bounds("tab-bar-sidebar").is_none());
+    // The shortcut's action (View ▸ Toggle Sidebar, ⌃⌘S) still toggles it.
+    h.cx.dispatch_action(crate::app::ToggleSidebar);
+    h.draw();
+    assert!(h.window.read_with(&h.cx, |w, _| w.collapsed), "the shortcut hides it");
+    h.cx.dispatch_action(crate::app::ToggleSidebar);
+    h.draw();
+    assert!(!h.window.read_with(&h.cx, |w, _| w.collapsed), "and shows it");
 }
 
 #[gpui::test]

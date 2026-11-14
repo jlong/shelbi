@@ -162,13 +162,33 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (Icon, Hsla) {
     (icon, color)
 }
 
-/// The footer's close chord: the first palette-open chord, as macOS spells
-/// it (`⌃P`).
+/// The palette-open chord the Mac app shows as its hint, as macOS spells it:
+/// the footer's close chord, the tab bar's search box and the header Search
+/// tooltips all read it.
+///
+/// A ⌘ chord the user binds to `open_palette` wins, as the Mac convention.
+/// While `open_palette` keeps its built-in chords (`ctrl-p`, the TUI's) the
+/// hint is the platform chord, ⌘K, which always opens the palette here. Any
+/// other binding a `keys.yaml` makes shows its own first chord. The settings
+/// editor never saves an override equal to the built-ins, so "the built-in
+/// chords" and "no override" are one case.
+pub fn hint_chord(keymaps: &Keymaps) -> String {
+    use shelbi_app::overlay::PLATFORM_PALETTE_CHORD;
+    use shelbi_state::keymap::{edit::builtin_chords, Action, GlobalAction, Mods};
+    let bound: Vec<_> = keymaps.global.chords_for(GlobalAction::OpenPalette).into_iter().copied().collect();
+    let chord = bound
+        .iter()
+        .find(|c| c.mods.contains(Mods::SUPER) && c.leader.is_none())
+        .copied()
+        .or_else(|| (bound.is_empty() || bound == builtin_chords(Action::Global(GlobalAction::OpenPalette))).then_some(PLATFORM_PALETTE_CHORD))
+        .or_else(|| bound.first().copied())
+        .unwrap_or(PLATFORM_PALETTE_CHORD);
+    crate::keys::chord_text(&chord, DisplayStyle::Mac)
+}
+
+/// The footer's close chord: the [`hint_chord`] (`⌘K` by default).
 pub fn close_chord(keymaps: &Keymaps) -> String {
-    shelbi_app::overlay::palette_open_chords(keymaps)
-        .first()
-        .map(|c| crate::keys::chord_text(c, DisplayStyle::Mac))
-        .unwrap_or_default()
+    hint_chord(keymaps)
 }
 
 /// The palette's drop: the frame's `0 10 15 -3` effect, its blur through
@@ -753,6 +773,23 @@ mod tests {
     #[test]
     fn the_footer_names_the_users_palette_chord() {
         let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
-        assert_eq!(close_chord(&keymaps), "⌃P");
+        assert_eq!(close_chord(&keymaps), "⌘K");
+        let own = shelbi_state::keymap::validate_keymaps_yaml("defaults:\n  global:\n    open_palette: ctrl-o\n", None).0;
+        assert_eq!(close_chord(&own), "⌃O");
+    }
+
+    /// The Mac hint: ⌘K while `open_palette` keeps its built-in `ctrl-p`, a
+    /// ⌘ chord the user binds before any other, and otherwise the user's own
+    /// first chord.
+    #[test]
+    fn the_hint_prefers_a_command_chord_and_keeps_a_users_own() {
+        let km = |yaml: &str| shelbi_state::keymap::validate_keymaps_yaml(yaml, None).0;
+        assert_eq!(hint_chord(&km("")), "⌘K", "the defaults");
+        let only_ctrl = km("defaults:\n  global:\n    open_palette: ctrl-o\n");
+        assert_eq!(hint_chord(&only_ctrl), "⌃O", "a user's only chord");
+        let both = km("defaults:\n  global:\n    open_palette: [ctrl-p, super-j]\n");
+        assert_eq!(hint_chord(&both), "⌘J", "a user's ⌘ chord wins");
+        let project = km("projects:\n  demo:\n    global:\n      open_palette: alt-p\n");
+        assert_eq!(hint_chord(&project), "⌘K", "another project's override doesn't apply");
     }
 }
