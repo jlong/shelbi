@@ -779,11 +779,12 @@ fn a_panel_keeps_the_sidebars_chrome_and_takes_the_numbered_chords(cx: &mut Test
     c.advance(SLIDE);
     assert!(c.drawn("review-panel") && !c.drawn("column-sidebar"));
     // The tab bar's search box stays over it, the panel's header row has
-    // Search and Toggle sidebar, and the Navigation component's footer is
-    // under it, the Zen pill at the 24pt every state draws.
-    for selector in ["tab-bar-search", "review-search", "review-toggle", "sidebar-settings", "sidebar-zen"] {
+    // only Toggle sidebar, and the Navigation component's footer is under
+    // it, the Zen pill at the 24pt every state draws.
+    for selector in ["tab-bar-search", "review-toggle", "sidebar-settings", "sidebar-zen"] {
         assert!(c.drawn(selector), "{selector} is drawn around the panel");
     }
+    assert!(!c.drawn("review-search"), "no Search in the panel's header");
     assert_eq!(c.bounds("sidebar-zen").unwrap().size.height, gpui::px(24.0));
     c.h.take_calls();
 

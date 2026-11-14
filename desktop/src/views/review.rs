@@ -90,7 +90,7 @@ use super::diff_view::{DiffDeps, DiffView, DiffViewEvent, FilePlace};
 use super::session_view::{
     OnDeath, SessionDeps, SessionPhase, SessionView, SessionViewEvent, REVIEW_TERMINAL_INSET_X,
 };
-use super::sidebar::{self, HeaderAction, PaletteChord};
+use super::sidebar;
 use super::task_panel;
 use super::workspace_layout::{render_split, ShellSplit};
 use crate::assets::{icons, Icon};
@@ -288,8 +288,8 @@ pub enum ReviewEvent {
     /// Put this toast up over the main area (`Launching Zed…`), or take the
     /// one showing down (`None`: a terminal editor takes the main area).
     Toast(Option<Toast>),
-    /// The header row's Search or Toggle sidebar.
-    Header(HeaderAction),
+    /// The header row's Toggle sidebar.
+    ToggleSidebar,
 }
 
 /// Where keyboard focus sits inside the review.
@@ -1473,16 +1473,11 @@ impl ReviewView {
         let back = task_panel::back_button("review-back", selected(PanelRow::Back), theme)
             .on_click(listen(PanelRow::Back));
         let status_label = Column::review().default_status_name().to_string();
-        let chord = PaletteChord::of(cx);
         let status = task_panel::status_row(
             back,
             Some((StatusCategory::Handoff, status_label.as_str())),
-            sidebar::search_button("review-search", &chord, theme).on_click(cx.listener(|_, _, _, cx| {
-                cx.emit(ReviewEvent::Header(HeaderAction::Search))
-            })),
-            sidebar::toggle_button("review-toggle", None, theme).on_click(cx.listener(|_, _, _, cx| {
-                cx.emit(ReviewEvent::Header(HeaderAction::ToggleSidebar))
-            })),
+            sidebar::toggle_button("review-toggle", None, theme)
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(ReviewEvent::ToggleSidebar))),
             theme,
         );
 

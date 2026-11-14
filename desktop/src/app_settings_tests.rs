@@ -141,9 +141,9 @@ fn settings_takes_the_column_with_its_own_sidebar(cx: &mut TestAppContext) {
     }
     // The frame's sidebar has no footer: no Zen pill, no settings gear.
     assert!(!s.drawn("sidebar-zen") && !s.drawn("sidebar-settings"));
-    // Its header row has Search and Toggle sidebar; the tab bar over it
-    // keeps its search box.
-    assert!(s.drawn("settings-search") && s.drawn("settings-toggle"));
+    // Its header row has only Toggle sidebar; the tab bar over it keeps
+    // its search box.
+    assert!(!s.drawn("settings-search") && s.drawn("settings-toggle"));
     assert!(s.drawn("tab-bar-search") && !s.drawn("tab-bar-sidebar"));
     assert_eq!(s.page(), Some(SettingsPage::General));
     assert_eq!(s.selected_row(), Some(SettingsPage::General));

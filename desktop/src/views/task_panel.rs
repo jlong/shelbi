@@ -59,13 +59,12 @@ pub fn back_button(id: &'static str, keyboard: bool, theme: &Theme) -> Stateful<
 
 /// The panel's header row (the Navigation component's Toolbar in
 /// State=Workspace 2220:18765 and State=Review): the back button, then the
-/// status heading 12pt past it, 16pt in; then `search` and `toggle`
-/// ([`super::sidebar::search_button`], [`super::sidebar::toggle_button`])
-/// on the right, as the sidebar's header row draws them.
+/// status heading 12pt past it, 16pt in; then `toggle`
+/// ([`super::sidebar::toggle_button`]) on the right, as the sidebar's
+/// header row draws it.
 pub fn status_row(
     back: Stateful<Div>,
     status: Option<(StatusCategory, &str)>,
-    search: Stateful<Div>,
     toggle: Stateful<Div>,
     theme: &Theme,
 ) -> Div {
@@ -92,7 +91,7 @@ pub fn status_row(
                     theme.foreground,
                 ))
         }));
-    sidebar::header_row(lead, PANEL_HEADER_PAD_LEFT, search, toggle)
+    sidebar::header_row(lead, PANEL_HEADER_PAD_LEFT, toggle)
 }
 
 /// The task panels' header row starts 16pt in (the frames' back button).
