@@ -43,6 +43,11 @@
 //! - Workspaces (`tui-settings-workspaces`, [`workspaces`]): the project's
 //!   workspace pool and the machines that host it, with the New / Edit /
 //!   Remove workspace forms over the shared pool service.
+//! - Properties (`settings-properties-page`, [`properties`]): the project
+//!   YAML's own settings (its name, repository, default branch and
+//!   workflow, editor, and the poll intervals), over the shared
+//!   `shelbi_app::settings::properties` form. A field saves when Enter
+//!   commits it; the pickers save as they change.
 //! - Orchestrator (`awareness-setting`): how events reach the project's
 //!   orchestrator (the heartbeat or the awareness system), a radio saved to
 //!   the project YAML as it is picked, and Restart orchestrator, over the
@@ -55,7 +60,8 @@
 //!   default) and the arrows move through the focused list and open its row;
 //! - Tab / Shift-Tab (and the global Ctrl+H / Ctrl+L) move focus between
 //!   the sidebar and the page;
-//! - a page's number (`1`) opens it from either;
+//! - a page's number (`1` to `8`, in the sidebar's order) opens it from
+//!   either;
 //! - Esc closes the innermost thing first: the editor command being typed,
 //!   the unsaved-edits prompt, then Settings itself (back to the view,
 //!   selection and focus it was opened over; no session stops).
@@ -106,6 +112,7 @@ use crate::theme::palette;
 mod agent_editor;
 mod agents;
 mod machine_form;
+mod properties;
 mod tool_picker;
 mod workflow_editor;
 mod workflows;
@@ -115,6 +122,7 @@ pub(crate) use agent_editor::{run_work as run_agent_work, AgentDone, AgentWork};
 use agent_editor::{AgentEditorPage, Back as AgentBack, EditorAction as AgentAction, Landed as AgentLanded};
 pub(crate) use agents::CommitJob;
 use agents::{AgentsHit, AgentsPage, Outcome};
+use properties::PropertiesPage;
 use tool_picker::ToolLayer;
 pub(crate) use workflow_editor::{run_work, EditorDone, EditorWork};
 use workflow_editor::{EditorAction, Landed, WorkflowEditorPage};
@@ -150,7 +158,8 @@ pub(crate) const OFFERED: PageSet = PageSet::NONE
     .with(SettingsPage::Workspaces)
     .with(SettingsPage::Workflows)
     .with(SettingsPage::Agents)
-    .with(SettingsPage::Orchestrator);
+    .with(SettingsPage::Orchestrator)
+    .with(SettingsPage::Properties);
 
 /// A page's background read the shell starts ([`SettingsShell::begin_page_load`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,6 +177,9 @@ pub(crate) enum Load {
     /// The Orchestrator page: this project's workflow config (it carries
     /// `orchestrator.awareness:`).
     Orchestrator(Ticket, String),
+    /// The Properties page: this project's workflow config (it carries the
+    /// project YAML).
+    Properties(Ticket, String),
 }
 
 /// Where keyboard focus sits inside Settings.
@@ -266,6 +278,35 @@ pub(crate) enum SettingsAction {
     /// Restart `project`'s orchestrator off the UI thread
     /// ([`SettingsShell::orchestrator_restarted`] takes the result).
     RestartOrchestrator(Ticket, String),
+    /// Save the Properties page's changes off the UI thread
+    /// ([`SettingsShell::properties_saved`] takes the result).
+    SaveProperties(Box<PropertiesSave>),
+}
+
+/// The Properties page's save: `project`'s config with the edited
+/// properties. Compared by its ticket and project (the config itself has no
+/// equality).
+#[derive(Debug, Clone)]
+pub(crate) struct PropertiesSave {
+    pub ticket: Ticket,
+    pub project: String,
+    pub config: WorkflowConfig,
+}
+
+impl PartialEq for PropertiesSave {
+    fn eq(&self, other: &Self) -> bool {
+        self.ticket == other.ticket && self.project == other.project
+    }
+}
+
+impl Eq for PropertiesSave {}
+
+/// The Properties page's save to start, as an action.
+fn save_properties(save: Option<(Ticket, String, WorkflowConfig)>) -> SettingsAction {
+    match save {
+        Some((ticket, project, config)) => SettingsAction::SaveProperties(Box::new(PropertiesSave { ticket, project, config })),
+        None => SettingsAction::Stay,
+    }
 }
 
 /// The Orchestrator page's save: `project`'s config with the new
@@ -374,6 +415,7 @@ fn page_glyph(page: SettingsPage) -> &'static str {
         SettingsPage::Workflows => "📑",
         SettingsPage::Agents => "🤖",
         SettingsPage::Orchestrator => "📡",
+        SettingsPage::Properties => "📋",
     }
 }
 
@@ -427,6 +469,10 @@ pub(crate) struct SettingsShell {
     orch_load: Job<()>,
     orch_save: Job<()>,
     orch_restart: Job<()>,
+    /// The Properties page, loaded per project.
+    properties: PropertiesPage,
+    /// The leave prompt's Save is the Properties page's typed field.
+    prompt_properties: bool,
     /// The page's text start column at the last draw (editor clicks).
     page_x: u16,
     /// The workflow editor, while it shows (over both columns).
@@ -486,6 +532,8 @@ impl Default for SettingsShell {
             orch_load: Job::default(),
             orch_save: Job::default(),
             orch_restart: Job::default(),
+            properties: PropertiesPage::default(),
+            prompt_properties: false,
             page_x: 0,
             editor: None,
             agent_editor: None,
@@ -570,6 +618,11 @@ impl SettingsShell {
     }
 
     #[cfg(test)]
+    pub(crate) fn properties(&self) -> &PropertiesPage {
+        &self.properties
+    }
+
+    #[cfg(test)]
     pub(crate) fn retired(&self) -> usize {
         self.retired.len()
     }
@@ -641,6 +694,7 @@ impl SettingsShell {
             return true;
         }
         self.form.dirty()
+            || self.properties.dirty()
             || self.agents.dirty()
             || self.editor.as_ref().is_some_and(WorkflowEditorPage::is_dirty)
             || self.agent_editor.as_ref().is_some_and(AgentEditorPage::is_dirty)
@@ -935,6 +989,21 @@ impl SettingsShell {
                 return Some(SaveStart::Work(ticket, Box::new(move || writer(&change).map(Some))));
             }
         }
+        // Properties: a field typed but not committed.
+        if self.properties.dirty() {
+            if let (Some(config), Some(project)) = (self.properties.commit_for_prompt(), project) {
+                let ticket = self.save.begin(Some(project));
+                let project = project.to_string();
+                self.prompt_properties = true;
+                return Some(SaveStart::Work(
+                    ticket,
+                    Box::new(move || {
+                        let store = shelbi_app::settings::store::Local { project };
+                        shelbi_app::settings::properties::save(&store, &config).map(|_| None)
+                    }),
+                ));
+            }
+        }
         if self.agents.dirty() {
             // A save queued behind one in flight starts when that lands.
             return self.agents.save_shared().map(|job| SaveStart::Commit(Box::new(job)));
@@ -957,6 +1026,9 @@ impl SettingsShell {
         if !self.save.complete(ticket, result.clone().map(|_| ())) {
             self.dropped += 1;
             return SettingsAction::Stay;
+        }
+        if std::mem::take(&mut self.prompt_properties) {
+            self.properties.prompt_saved(result.clone().map(|_| ()));
         }
         match result {
             Ok(written) => {
@@ -986,6 +1058,7 @@ impl SettingsShell {
             self.test_edits = None;
         }
         self.form.cancel_edit();
+        self.properties.cancel_typing();
         self.agents.close_editor();
         if let Some(editor) = self.editor.as_mut() {
             editor.discard_for_settings();
@@ -1007,6 +1080,7 @@ impl SettingsShell {
     /// The installed editors and diff tools were detected (off the UI
     /// thread): the pickers list them.
     pub(crate) fn tools_detected(&mut self, detected: shelbi_state::tools::DetectedTools) {
+        self.properties.set_detected(detected.clone());
         self.form.set_detected(detected);
         self.tools.detected(&self.form);
     }
@@ -1044,6 +1118,9 @@ impl SettingsShell {
         }
         if self.nav.page() == SettingsPage::Workspaces {
             return self.workspaces.paste(text);
+        }
+        if self.nav.page() == SettingsPage::Properties {
+            return self.region == Region::Page && self.properties.paste(text);
         }
         if self.tools.paste(text) {
             return true;
@@ -1127,6 +1204,7 @@ impl SettingsShell {
         self.orch_load.reset();
         self.orch_save.reset();
         self.orch_restart.reset();
+        self.properties.project_changed();
         self.save.reset();
         self.action = 0;
         self.scroll = 0;
@@ -1153,7 +1231,8 @@ impl SettingsShell {
             | SettingsPage::Workspaces
             | SettingsPage::Workflows
             | SettingsPage::Agents
-            | SettingsPage::Orchestrator => None,
+            | SettingsPage::Orchestrator
+            | SettingsPage::Properties => None,
         }
     }
 
@@ -1195,7 +1274,31 @@ impl SettingsShell {
                 let ticket = self.orch_load.begin(Some(project));
                 Some(Load::Orchestrator(ticket, project.to_string()))
             }
+            // Read on every visit, to show a hand edit of the project YAML.
+            SettingsPage::Properties => {
+                let ticket = self.properties.begin_load(project)?;
+                Some(Load::Properties(ticket, project?.to_string()))
+            }
             SettingsPage::Terminal => None,
+        }
+    }
+
+    /// The Properties page's read landed.
+    pub(crate) fn properties_loaded(&mut self, ticket: &Ticket, read: Result<WorkflowConfig, String>) {
+        if !self.properties.loaded(ticket, read) {
+            self.dropped += 1;
+        }
+    }
+
+    /// The Properties page's save landed: the next one queued behind it, if
+    /// any, starts.
+    pub(crate) fn properties_saved(&mut self, ticket: &Ticket, result: Result<WorkflowConfig, String>) -> SettingsAction {
+        match self.properties.saved(ticket, result) {
+            Some(next) => save_properties(next),
+            None => {
+                self.dropped += 1;
+                SettingsAction::Stay
+            }
         }
     }
 
@@ -1504,7 +1607,8 @@ impl SettingsShell {
             | SettingsPage::Keybindings
             | SettingsPage::Workspaces
             | SettingsPage::Workflows
-            | SettingsPage::Agents => Vec::new(),
+            | SettingsPage::Agents
+            | SettingsPage::Properties => Vec::new(),
         }
     }
 
@@ -1710,6 +1814,15 @@ impl SettingsShell {
         if self.typing() {
             return self.field_key(k);
         }
+        if self.region == Region::Page && self.nav.page() == SettingsPage::Properties && self.properties.typing() {
+            // The field being typed holds every key (Esc puts it back, Enter
+            // saves it; digits and Tab type).
+            let nav = Nav { up: false, down: false, activate: false };
+            return match self.properties.key(k, nav) {
+                Some(save) => save_properties(save),
+                None => SettingsAction::Stay,
+            };
+        }
         let chord = crate::keymap::chord_from_event(k);
         let sidebar = chord.and_then(|c| keymaps.sidebar.dispatch(c));
         let up = k.code == KeyCode::Up || sidebar == Some(SidebarAction::NavUp);
@@ -1756,6 +1869,20 @@ impl SettingsShell {
             }
             Region::Page if on_workflows => self.workflows.handle_key(k, nav),
             Region::Page if self.nav.page() == SettingsPage::Keybindings => self.keys_key(k, keymaps),
+            Region::Page if self.nav.page() == SettingsPage::Properties => match self.properties.key(k, nav) {
+                Some(save) => save_properties(save),
+                None => {
+                    match k.code {
+                        KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(8),
+                        KeyCode::PageDown => self.scroll = self.scroll.saturating_add(8),
+                        KeyCode::Home => self.scroll = 0,
+                        KeyCode::End => self.scroll = u16::MAX,
+                        KeyCode::Char('r') if k.modifiers.is_empty() => return SettingsAction::Reload,
+                        _ => {}
+                    }
+                    SettingsAction::Stay
+                }
+            },
             Region::Page if self.nav.page() == SettingsPage::Workspaces => {
                 if up || down {
                     self.workspaces.step(down);
@@ -2010,6 +2137,17 @@ impl SettingsShell {
                     Some(Hit::Action(i)) if self.nav.page() == SettingsPage::Workspaces => {
                         let ask = self.workspaces.activate(i);
                         self.ask(ask)
+                    }
+                    Some(Hit::Action(i)) if self.nav.page() == SettingsPage::Properties => {
+                        if self.properties.typing() {
+                            // A click in the field being typed leaves it
+                            // typing; one elsewhere saves it first.
+                            if i == self.properties.cursor() {
+                                return SettingsAction::Stay;
+                            }
+                            return save_properties(self.properties.commit_typing());
+                        }
+                        save_properties(self.properties.activate(i))
                     }
                     Some(Hit::Action(i)) => self.run_action(i),
                     Some(Hit::Agents(h)) => {
@@ -2276,6 +2414,7 @@ impl SettingsShell {
         let focus = match self.nav.page() {
             SettingsPage::Workflows => self.workflows.cursor(),
             SettingsPage::Workspaces => self.workspaces.cursor(),
+            SettingsPage::Properties => self.properties.cursor(),
             _ => self.action,
         };
         // Keep the focused rows in view: the last marked, then the first (an
@@ -2369,6 +2508,7 @@ impl SettingsShell {
                 orchestrator_rows(&self.orchestrator, has_project, width, actions, focus)
             }
             SettingsPage::Workflows => self.workflows.rows(width, self.region == Region::Page, self.has_project),
+            SettingsPage::Properties => self.properties.rows(width, self.region == Region::Page, self.has_project),
             SettingsPage::Agents => {
                 let focused = self.region == Region::Page;
                 self.agents.rows(width, height, focused)
@@ -3675,10 +3815,11 @@ mod tests {
                 Stop::Page(SettingsPage::Keybindings),
                 Stop::Page(SettingsPage::Terminal),
                 Stop::Switcher,
+                Stop::Page(SettingsPage::Properties),
                 Stop::Page(SettingsPage::Orchestrator),
+                Stop::Page(SettingsPage::Agents),
                 Stop::Page(SettingsPage::Workspaces),
-                Stop::Page(SettingsPage::Workflows),
-                Stop::Page(SettingsPage::Agents)
+                Stop::Page(SettingsPage::Workflows)
             ]
         );
         assert_eq!(s.page(), SettingsPage::General);
@@ -3695,16 +3836,19 @@ mod tests {
         assert_eq!(s.stop, Stop::Page(SettingsPage::Terminal));
         s.handle_key(key(KeyCode::Down), &km);
         assert_eq!(s.stop, Stop::Switcher);
+        for page in [
+            SettingsPage::Properties,
+            SettingsPage::Orchestrator,
+            SettingsPage::Agents,
+            SettingsPage::Workspaces,
+            SettingsPage::Workflows,
+        ] {
+            s.handle_key(key(KeyCode::Down), &km);
+            assert_eq!(s.stop, Stop::Page(page));
+        }
         s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.stop, Stop::Page(SettingsPage::Orchestrator));
-        s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.stop, Stop::Page(SettingsPage::Workspaces));
-        s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.stop, Stop::Page(SettingsPage::Workflows));
-        s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.stop, Stop::Page(SettingsPage::Agents));
-        s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.stop, Stop::Page(SettingsPage::Agents), "stops at the bottom");
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Workflows), "stops at the bottom");
+        s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);

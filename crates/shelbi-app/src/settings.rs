@@ -7,9 +7,9 @@
 //! over the shown project's pages), with the open page in the main area.
 //! This module is the toolkit-free half they share:
 //!
-//! - [`SettingsPage`] and [`SECTIONS`]: every page, its label, its fixed
-//!   number (⌘N in the desktop app, the digit key in the TUI), and the
-//!   section it sits in.
+//! - [`SettingsPage`] and [`SECTIONS`]: every page, its label, its number
+//!   (⌃N in the desktop app, the digit key in the TUI; counted in the order
+//!   the sidebar lists the pages), and the section it sits in.
 //! - [`PageSet`]: the pages a client offers. A client registers a page once
 //!   it can show it, so neither lists a page it can't open: the desktop app
 //!   offers all of them, the TUI starts with General and adds the rest as
@@ -29,6 +29,9 @@
 //!   status catalog, the edits it saves as they're made, and their guards).
 //! - [`keybindings`]: the Keybindings page's bindings editor.
 //! - [`agents`]: the Agents page's state (its rows, guards, and saves).
+//! - [`properties`]: the Properties page's form over the project YAML's own
+//!   settings (its label, repository, default branch and workflow, editor,
+//!   and the poll intervals), with its validation and save.
 //! - [`orchestrator`]: the Orchestrator page's event delivery radio
 //!   (`orchestrator.awareness:`) and its Restart orchestrator.
 //! - [`workspaces`] and [`workspace_form`]: the Workspaces page (the pool,
@@ -52,6 +55,7 @@ pub mod keybindings;
 pub mod machine_check;
 pub mod machine_form;
 pub mod orchestrator;
+pub mod properties;
 pub mod store;
 pub mod summary;
 pub mod terminal_preview;
@@ -73,6 +77,9 @@ pub enum SettingsPage {
     Keybindings,
     /// The terminals' font, size, and Option key.
     Terminal,
+    /// The project YAML's own settings: its label, repository, default
+    /// branch and workflow, editor, and poll intervals.
+    Properties,
     /// The project's orchestrator: how events reach it.
     Orchestrator,
     /// The project's workspace pool and the machines that host it.
@@ -102,26 +109,18 @@ impl SettingsPage {
             SettingsPage::Workflows => "Workflows",
             SettingsPage::Agents => "Agents",
             SettingsPage::Orchestrator => "Orchestrator",
+            SettingsPage::Properties => "Properties",
         }
     }
 
-    /// Its number while Settings is open: ⌘N in the desktop app, the digit
-    /// key in the TUI. Fixed per page rather than counted, so a page keeps
-    /// its number whichever pages a client offers: the frames number
-    /// Workflows 4 and Agents 6. They give Workspaces Terminal's 3 too; it
-    /// takes the free 5 instead, so each number opens one page (the sidebar
-    /// lists it before Workflows all the same). Orchestrator keeps 7 though
-    /// the sidebar lists it first in the project section.
+    /// Its number while Settings is open: ⌃N in the desktop app (⌘N are
+    /// the project tabs), the digit key in the TUI. Counted in the order the
+    /// sidebar lists every page, as the Figma frame (2252:27532) numbers
+    /// them: General 1 through Workflows 8. Both clients offer every page,
+    /// so the count is the same whichever client draws it.
     pub fn shortcut(self) -> u8 {
-        match self {
-            SettingsPage::General => 1,
-            SettingsPage::Keybindings => 2,
-            SettingsPage::Terminal => 3,
-            SettingsPage::Workspaces => 5,
-            SettingsPage::Workflows => 4,
-            SettingsPage::Agents => 6,
-            SettingsPage::Orchestrator => 7,
-        }
+        let at = pages().position(|p| p == self).expect("every page is in a section");
+        at as u8 + 1
     }
 
     /// The page numbered `n`, offered or not ([`PageSet::for_shortcut`]
@@ -135,7 +134,8 @@ impl SettingsPage {
             SettingsPage::General | SettingsPage::Keybindings | SettingsPage::Terminal => {
                 Scope::Global
             }
-            SettingsPage::Workspaces
+            SettingsPage::Properties
+            | SettingsPage::Workspaces
             | SettingsPage::Workflows
             | SettingsPage::Agents
             | SettingsPage::Orchestrator => Scope::Project,
@@ -143,7 +143,7 @@ impl SettingsPage {
     }
 
     /// The page's bit in a [`PageSet`].
-    const fn bit(self) -> u8 {
+    const fn bit(self) -> u16 {
         match self {
             SettingsPage::General => 1,
             SettingsPage::Keybindings => 1 << 1,
@@ -152,6 +152,7 @@ impl SettingsPage {
             SettingsPage::Workflows => 1 << 4,
             SettingsPage::Agents => 1 << 5,
             SettingsPage::Orchestrator => 1 << 6,
+            SettingsPage::Properties => 1 << 7,
         }
     }
 }
@@ -186,10 +187,11 @@ pub const SECTIONS: &[Section] = &[
     Section {
         header: Header::Project,
         pages: &[
+            SettingsPage::Properties,
             SettingsPage::Orchestrator,
+            SettingsPage::Agents,
             SettingsPage::Workspaces,
             SettingsPage::Workflows,
-            SettingsPage::Agents,
         ],
     },
 ];
@@ -201,7 +203,7 @@ pub fn pages() -> impl Iterator<Item = SettingsPage> {
 
 /// The pages a client offers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PageSet(u8);
+pub struct PageSet(u16);
 
 impl PageSet {
     /// Every page (the desktop app).
@@ -212,7 +214,8 @@ impl PageSet {
             | SettingsPage::Workspaces.bit()
             | SettingsPage::Workflows.bit()
             | SettingsPage::Agents.bit()
-            | SettingsPage::Orchestrator.bit(),
+            | SettingsPage::Orchestrator.bit()
+            | SettingsPage::Properties.bit(),
     );
 
     /// No page.
@@ -569,30 +572,36 @@ mod tests {
     #[test]
     fn the_pages_are_numbered_in_order() {
         let all: Vec<_> = pages().collect();
+        // The Figma frame's order (2252:27532): Properties leads the project
+        // section, then Orchestrator, Agents, Workspaces, Workflows.
         assert_eq!(
             all,
             [
                 SettingsPage::General,
                 SettingsPage::Keybindings,
                 SettingsPage::Terminal,
+                SettingsPage::Properties,
                 SettingsPage::Orchestrator,
+                SettingsPage::Agents,
                 SettingsPage::Workspaces,
                 SettingsPage::Workflows,
-                SettingsPage::Agents
             ]
         );
-        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 7, 5, 4, 6]);
-        assert_eq!(SettingsPage::for_shortcut(3), Some(SettingsPage::Terminal));
-        assert_eq!(SettingsPage::for_shortcut(4), Some(SettingsPage::Workflows));
-        assert_eq!(SettingsPage::for_shortcut(5), Some(SettingsPage::Workspaces));
+        // Numbered ⌃1 to ⌃8 in that order, as the frame's badges.
+        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(SettingsPage::for_shortcut(4), Some(SettingsPage::Properties));
+        assert_eq!(SettingsPage::for_shortcut(5), Some(SettingsPage::Orchestrator));
         assert_eq!(SettingsPage::for_shortcut(6), Some(SettingsPage::Agents));
-        assert_eq!(SettingsPage::for_shortcut(7), Some(SettingsPage::Orchestrator));
-        assert_eq!(SettingsPage::for_shortcut(8), None);
+        assert_eq!(SettingsPage::for_shortcut(7), Some(SettingsPage::Workspaces));
+        assert_eq!(SettingsPage::for_shortcut(8), Some(SettingsPage::Workflows));
+        assert_eq!(SettingsPage::for_shortcut(9), None);
+        assert_eq!(SettingsPage::for_shortcut(0), None);
         assert_eq!(
             SECTIONS.iter().map(|s| (s.header, s.pages.len())).collect::<Vec<_>>(),
-            [(Header::Title("Global"), 3), (Header::Project, 4)]
+            [(Header::Title("Global"), 3), (Header::Project, 5)]
         );
         assert_eq!(SettingsPage::Terminal.scope(), Scope::Global);
+        assert_eq!(SettingsPage::Properties.scope(), Scope::Project);
         assert_eq!(SettingsPage::Workspaces.scope(), Scope::Project);
         assert_eq!(SettingsPage::Workflows.scope(), Scope::Project);
         assert_eq!(SettingsPage::Orchestrator.scope(), Scope::Project);
@@ -600,8 +609,10 @@ mod tests {
             for b in &all[i + 1..] {
                 assert_ne!(a.shortcut(), b.shortcut(), "{a:?} and {b:?} share a number");
                 assert_ne!(a.label(), b.label());
+                assert_ne!(a.bit(), b.bit());
             }
             assert_eq!(SettingsPage::for_shortcut(a.shortcut()), Some(*a), "its number opens it");
+            assert!(PageSet::ALL.contains(*a));
         }
     }
 
@@ -613,7 +624,7 @@ mod tests {
         assert_eq!(tui.pages().collect::<Vec<_>>(), [SettingsPage::General]);
         assert_eq!(tui.for_shortcut(1), Some(SettingsPage::General));
         assert_eq!(tui.for_shortcut(6), None, "Agents isn't offered");
-        assert_eq!(PageSet::ALL.pages().count(), 7);
+        assert_eq!(PageSet::ALL.pages().count(), 8);
         assert_eq!(PageSet::NONE.first(), None);
         // Reversed input still walks in sidebar order.
         let set = PageSet::of(&[SettingsPage::Agents, SettingsPage::General]);
@@ -652,30 +663,30 @@ mod tests {
         assert_eq!((nav.page(), nav.selected()), (SettingsPage::General, SettingsPage::General));
         nav.step(false);
         assert_eq!(nav.selected(), SettingsPage::General, "stops at the top");
-        for _ in 0..7 {
+        for _ in 0..8 {
             nav.step(true);
         }
         assert_eq!(
             nav.selected(),
-            SettingsPage::Agents,
+            SettingsPage::Workflows,
             "crosses into the project section and stops at the bottom"
         );
         assert_eq!(nav.page(), SettingsPage::General, "moving doesn't open");
         assert!(nav.activate());
         assert_eq!(
             (nav.page(), nav.selected()),
-            (SettingsPage::Agents, SettingsPage::Agents)
+            (SettingsPage::Workflows, SettingsPage::Workflows)
         );
         assert!(!nav.activate(), "already shown");
-        // Orchestrator leads the project section: one up from Workspaces,
+        // Properties leads the project section: one up from Orchestrator,
         // one down from Terminal.
-        nav.select(SettingsPage::Workspaces);
+        nav.select(SettingsPage::Orchestrator);
         nav.step(false);
-        assert_eq!(nav.selected(), SettingsPage::Orchestrator);
+        assert_eq!(nav.selected(), SettingsPage::Properties);
         nav.step(false);
         assert_eq!(nav.selected(), SettingsPage::Terminal);
         nav.step(true);
-        assert_eq!(nav.selected(), SettingsPage::Orchestrator);
+        assert_eq!(nav.selected(), SettingsPage::Properties);
     }
 
     #[test]

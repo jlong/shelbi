@@ -410,6 +410,9 @@ heroicons! {
     RECTANGLE_STACK = "rectangle-stack";
     WRENCH_SCREWDRIVER = "wrench-screwdriver";
     VIEW_COLUMNS = "view-columns";
+    /// Settings ▸ Properties (the Navigation component's State=Settings,
+    /// 2833:34628).
+    LIST_BULLET = "list-bullet";
     BARS_2 = "bars-2";
     /// The Changelog's sidebar row (the Navigation component's drawing), its
     /// palette command (the Figma palette's "Change log") and its search
@@ -436,6 +439,7 @@ heroicons! {
         CHEVRON_DOWN_SMALL = "chevron-down-small";
         PULL_REQUEST = "pull-request";
         GIT_BRANCH = "git-branch";
+        ROBOT = "robot";
     }
     @small {
         FUNNEL_SMALL = "funnel";

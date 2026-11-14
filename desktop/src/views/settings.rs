@@ -104,6 +104,7 @@ use super::keybindings::{KeybindingsEvent, KeybindingsPage};
 use super::machine_form::{self, MachineFormEvent, MachineFormView};
 use super::machine_form_state;
 use super::orchestrator::OrchestratorPage;
+use super::properties::PropertiesPage;
 use super::settings_nav::SettingsPage;
 use super::terminal_preview;
 use super::tool_select::{self, AppIcons, ToolSelect, ToolSelectEvent};
@@ -429,6 +430,8 @@ pub struct SettingsView {
     workspaces: Entity<WorkspacesPage>,
     /// The project's Orchestrator page.
     orchestrator: Entity<OrchestratorPage>,
+    /// The project's Properties page.
+    properties: Entity<PropertiesPage>,
     /// The Add machine / Configure machine dialog while it's open, and what
     /// had the keyboard before it (it gets it back).
     machine_form: Option<OpenForm>,
@@ -470,6 +473,7 @@ impl SettingsView {
         let agents = cx.new(|cx| AgentsPage::new(handle, window, cx));
         let workspaces = cx.new(|cx| WorkspacesPage::new(handle, window, cx));
         let orchestrator = cx.new(|cx| OrchestratorPage::new(handle, window, cx));
+        let properties = cx.new(|cx| PropertiesPage::new(handle, window, cx));
         let range = |r: &std::ops::RangeInclusive<u8>| *r.start() as i32..=*r.end() as i32;
         let initial = Translucency::default();
         let opacity_slider = cx.new(|cx| {
@@ -589,6 +593,7 @@ impl SettingsView {
             agent_editor: None,
             workspaces,
             orchestrator,
+            properties,
             machine_form: None,
             scroll: ScrollHandle::new(),
             scroll_to_statuses: false,
@@ -675,6 +680,12 @@ impl SettingsView {
     #[cfg(test)]
     pub(crate) fn orchestrator(&self) -> Entity<OrchestratorPage> {
         self.orchestrator.clone()
+    }
+
+    /// The Properties page's view.
+    #[cfg(any(test, feature = "visual-check"))]
+    pub(crate) fn properties(&self) -> Entity<PropertiesPage> {
+        self.properties.clone()
     }
 
     /// The Workspaces page's view.
@@ -911,6 +922,7 @@ impl SettingsView {
                 SettingsPage::Agents => self.agents.update(cx, |p, _| p.reload_when_drawn()),
                 SettingsPage::Workspaces => self.workspaces.update(cx, |p, _| p.reload_when_drawn()),
                 SettingsPage::Orchestrator => self.orchestrator.update(cx, |p, _| p.reload_when_drawn()),
+                SettingsPage::Properties => self.properties.update(cx, |p, _| p.reload_when_drawn()),
                 _ => {}
             }
             self.page = page;
@@ -1937,6 +1949,9 @@ impl Render for SettingsView {
             SettingsPage::Workspaces => page.child(self.workspaces.clone()),
             // Its event delivery radio and Restart orchestrator.
             SettingsPage::Orchestrator => page.child(self.orchestrator.clone()),
+            // The project YAML's own settings (no frame of its own: the
+            // General page's controls).
+            SettingsPage::Properties => page.child(self.properties.clone()),
             // The Terminal frame (2252:28494): the controls in a column the
             // picker's width, the Option helper a line per sentence; the
             // preview fills the rest of the page beside them.
@@ -2019,6 +2034,7 @@ impl Render for SettingsView {
                     | SettingsPage::Agents
                     | SettingsPage::Workspaces
                     | SettingsPage::Orchestrator
+                    | SettingsPage::Properties
             )
         });
         page.children(status.map(|(text, color)| div().type_style(Type::XSmall).text_color(color).child(text)))
@@ -2314,6 +2330,7 @@ pub fn page_selector(page: SettingsPage) -> &'static str {
         SettingsPage::Agents => "settings-page-agents",
         SettingsPage::Workspaces => "settings-page-workspaces",
         SettingsPage::Orchestrator => "settings-page-orchestrator",
+        SettingsPage::Properties => "settings-page-properties",
     }
 }
 

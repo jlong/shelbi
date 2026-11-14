@@ -2817,16 +2817,9 @@ impl ShelbiWindow {
     /// A window chord (⌘O ⌘I ⌘L, ⌃1 to ⌃9, ⌘1 to ⌘9): open what it names,
     /// selecting its row (or tab) as a click would.
     fn nav_chord(&mut self, chord: NavChord, window: &mut Window, cx: &mut Context<Self>) {
-        // ⌘1 to ⌘9 select the tabs, except that open Settings keeps its page
-        // numbers.
+        // ⌘1 to ⌘9 select the tabs, Settings open or not.
         if let NavChord::Tab(n) = chord {
-            if self.column.target() == Occupant::Settings {
-                if let Some(page) = SettingsPage::for_shortcut(n) {
-                    self.show_settings_page(page, cx);
-                }
-            } else {
-                self.select_tab(usize::from(n), window, cx);
-            }
+            self.select_tab(usize::from(n), window, cx);
             return;
         }
         // While a task panel holds the column, ⌃1 to ⌃N are its views (the
@@ -2845,9 +2838,14 @@ impl ShelbiWindow {
                     }
                     return;
                 }
-                // The settings sidebar has no numbered rows (its pages are
-                // ⌘N).
-                Occupant::Settings => return,
+                // The settings sidebar's rows are its pages, numbered ⌃1
+                // to ⌃8 in order (the frame's badges).
+                Occupant::Settings => {
+                    if let Some(page) = SettingsPage::for_shortcut(n) {
+                        self.show_settings_page(page, cx);
+                    }
+                    return;
+                }
                 Occupant::Sidebar => {}
             }
         }

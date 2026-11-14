@@ -6,14 +6,15 @@
 //! bottom: the header row (the back button beside the Settings title, in
 //! Large/Semibold, then Search and Toggle sidebar, as the app sidebar's),
 //! then each section:
-//! its header and its pages' nav rows, each with its ⌘N. The Global
+//! its header and its pages' nav rows, each with its ⌃N. The Global
 //! section (General, Keybindings, Terminal), then, after a divider, the
 //! project section (`dt-wf-settings-index`, frame 2301:5824): the project's
 //! name in Large/Semibold, as the app sidebar's header shows it (the tab bar switches projects, and a switch reopens Settings on
-//! the new project), over the project's pages:
-//! Workspaces (`dt-workspace-settings-index`, frame 2523:8879), Workflows
-//! and Agents (`dt-agents-settings-page`, frame 2377:41040). The frames'
-//! Integrations joins [`SECTIONS`] with its page. No footer: the frame draws
+//! the new project), over the project's pages: Properties
+//! (`settings-properties-page`), Orchestrator, Agents
+//! (`dt-agents-settings-page`, frame 2377:41040), Workspaces
+//! (`dt-workspace-settings-index`, frame 2523:8879) and Workflows. The
+//! frames' Integrations joins [`SECTIONS`] with its page. No footer: the frame draws
 //! no Zen pill and no settings gear.
 //!
 //! [`SettingsNav`] (from `shelbi_app::settings`, shared with the TUI) is the
@@ -24,7 +25,7 @@ use gpui::{div, prelude::*, px, AnyElement, Bounds, Context, Pixels, SharedStrin
 use super::sidebar::{self, nav_item, SidebarEvent, SidebarHost};
 use super::task_panel;
 use crate::assets::{icons, Icon};
-use crate::keys::tab_hotkey;
+use crate::keys::row_hotkey;
 use crate::theme::motion::{self, SharedTrack};
 use crate::theme::style::{self, Type, Typography, NAV_RADIUS};
 use crate::theme::Theme;
@@ -48,8 +49,9 @@ impl PageLook for SettingsPage {
             SettingsPage::Terminal => icons::COMMAND_LINE,
             SettingsPage::Workspaces => icons::FOLDER,
             SettingsPage::Workflows => icons::VIEW_COLUMNS,
-            SettingsPage::Agents => icons::RECTANGLE_STACK,
+            SettingsPage::Agents => icons::ROBOT,
             SettingsPage::Orchestrator => icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS,
+            SettingsPage::Properties => icons::LIST_BULLET,
         }
     }
 
@@ -62,6 +64,7 @@ impl PageLook for SettingsPage {
             SettingsPage::Workflows => "settings-nav-workflows",
             SettingsPage::Agents => "settings-nav-agents",
             SettingsPage::Orchestrator => "settings-nav-orchestrator",
+            SettingsPage::Properties => "settings-nav-properties",
         }
     }
 }
@@ -209,7 +212,7 @@ pub fn render<H: SidebarHost>(
                         )
                     });
                     // The frame's hotkeys sit at the row's padding, no inset of their own.
-                    let hotkey = style::hotkey(&tab_hotkey(page.shortcut()), theme)
+                    let hotkey = style::hotkey(&row_hotkey(page.shortcut()), theme)
                         .px_0()
                         .into_any_element();
                     nav_item(painted, page.icon(), page.label(), Some(hotkey), on, theme).on_click(
@@ -278,9 +281,15 @@ mod tests {
         let icons: Vec<String> = all.iter().map(|p| format!("{:?}", p.icon())).collect();
         let distinct: std::collections::HashSet<_> = icons.iter().collect();
         assert_eq!(distinct.len(), all.len());
-        // This client offers every page, numbered as the frames number them
-        // (Orchestrator keeps 7 though it leads the project section).
+        // This client offers every page, numbered ⌃1 to ⌃8 in sidebar order
+        // as the frame (2252:27532) numbers them.
         assert_eq!(SettingsNav::default().available(), shelbi_app::settings::PageSet::ALL);
-        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 7, 5, 4, 6]);
+        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        // The frame's icons: Properties' list, Agents' robot (John's drawing).
+        assert_eq!(SettingsPage::Properties.icon(), icons::LIST_BULLET);
+        assert_eq!(SettingsPage::Agents.icon(), icons::ROBOT);
+        assert_eq!(SettingsPage::Orchestrator.icon(), icons::CHAT_BUBBLE_OVAL_LEFT_ELLIPSIS);
+        assert_eq!(SettingsPage::Workspaces.icon(), icons::FOLDER);
+        assert_eq!(SettingsPage::Workflows.icon(), icons::VIEW_COLUMNS);
     }
 }

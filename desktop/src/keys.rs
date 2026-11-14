@@ -127,13 +127,13 @@ pub fn nav_view_hotkey(view: &View) -> Option<String> {
     nav_view_chord(view).map(|c| chord_text(&c, DisplayStyle::Mac))
 }
 
-/// A numbered sidebar row's hint (`⌃3`), a task panel view's too.
+/// A numbered sidebar row's hint (`⌃3`), a task panel view's and a
+/// Settings page's too.
 pub fn row_hotkey(n: u8) -> String {
     format!("⌃{n}")
 }
 
-/// A project tab's hint (`⌘3`), shown while ⌘ is held; a Settings page's
-/// too (the page numbers take ⌘N while Settings is open).
+/// A project tab's hint (`⌘3`), shown while ⌘ is held.
 pub fn tab_hotkey(n: u8) -> String {
     format!("⌘{n}")
 }

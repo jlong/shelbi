@@ -86,12 +86,13 @@ use std::sync::Arc;
 
 use yaml_serde::Value;
 use shelbi_core::{
-    default_project_statuses, AwarenessMode, default_workflow, validate_workflow_name, GitConfig, Owner,
+    default_project_statuses, AwarenessMode, ConfigMode, default_workflow, validate_workflow_name, GitConfig, Owner,
     ProjectStatus, ProjectStatuses, ReviewServe, StatusCategory, Transition, Workflow,
     WorkflowStatus,
 };
 
 use crate::config_write;
+use crate::project_properties::{self, IssueTracker, Properties};
 use crate::yaml_edit;
 
 /// How many blocking issue ids a [`ConfigError::WorkflowInUse`] names.
@@ -253,6 +254,18 @@ pub struct WorkflowFiles {
     pub default_workflow: String,
     /// The project's agents, or `None` when it has no `agents/` directory.
     pub agents: Option<Vec<String>>,
+    /// An in-repo project's user-local `projects/<id>/local.yaml` (it holds
+    /// `editor:`); `None` for a global project. A far machine whose binary
+    /// predates it sends none, and the page can't edit the editor then.
+    pub local: Option<LocalFile>,
+}
+
+/// An in-repo project's `local.yaml`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LocalFile {
+    pub path: PathBuf,
+    pub text: String,
 }
 
 /// One workflow file's text.
@@ -308,6 +321,9 @@ pub struct WorkflowConfig {
     /// The project YAML's `orchestrator.awareness:` (Settings ▸ Orchestrator),
     /// saved through the same project-file write as `default_workflow:`.
     awareness: AwarenessMode,
+    /// The project YAML's own settings (Settings ▸ Properties), saved
+    /// through the same project-file write.
+    properties: Properties,
     /// `None` when the project has no `agents/` directory: like the loader,
     /// agent references aren't checked then.
     agents: Option<Vec<String>>,
@@ -350,6 +366,11 @@ struct Disk {
     project_text: String,
     default_workflow: String,
     awareness: AwarenessMode,
+    properties: Properties,
+    issue_tracker: IssueTracker,
+    layout: ConfigMode,
+    /// An in-repo project's `local.yaml`.
+    local: Option<LocalFile>,
 }
 
 #[derive(Debug)]
@@ -391,6 +412,13 @@ impl WorkflowConfig {
         } else {
             None
         };
+        let local = match project_local_file(project)? {
+            Some(path) => {
+                let text = fs::read_to_string(&path).map_err(|e| file_err(&path, e))?;
+                Some(LocalFile { path, text })
+            }
+            None => None,
+        };
         Ok(WorkflowFiles {
             project: project.to_string(),
             dir,
@@ -401,6 +429,7 @@ impl WorkflowConfig {
             project_text,
             default_workflow,
             agents,
+            local,
         })
     }
 
@@ -417,6 +446,7 @@ impl WorkflowConfig {
             project_text,
             default_workflow,
             agents,
+            local,
         } = files;
         let catalog = match &statuses_text {
             Some(text) => {
@@ -444,6 +474,15 @@ impl WorkflowConfig {
         }
 
         let awareness = awareness_in(&project_text);
+        let shared_tree = yaml_edit::parse(&project_text).unwrap_or(Value::Null);
+        let local_tree = local.as_ref().and_then(|l| yaml_edit::parse(&l.text).ok());
+        let properties = project_properties::read(&shared_tree, local_tree.as_ref());
+        let issue_tracker = project_properties::issue_tracker(&shared_tree);
+        let layout = if local.is_some() || project_path.ends_with(Path::new(".shelbi").join("project.yaml")) {
+            ConfigMode::InRepo
+        } else {
+            ConfigMode::Global
+        };
         let entries = workflows
             .iter()
             .map(|(stem, loaded)| Entry {
@@ -457,6 +496,7 @@ impl WorkflowConfig {
             workflows: entries,
             default_workflow: default_workflow.clone(),
             awareness,
+            properties: properties.clone(),
             agents,
             unreadable,
             disk: Arc::new(Disk {
@@ -469,6 +509,10 @@ impl WorkflowConfig {
                 project_text,
                 default_workflow,
                 awareness,
+                properties,
+                issue_tracker,
+                layout,
+                local,
             }),
         })
     }
@@ -509,6 +553,39 @@ impl WorkflowConfig {
     /// (`orchestrator.awareness:`, unset is [`AwarenessMode::Heartbeat`]).
     pub fn awareness(&self) -> AwarenessMode {
         self.awareness
+    }
+
+    /// The project YAML's own settings (Settings ▸ Properties), as edited.
+    pub fn properties(&self) -> &Properties {
+        &self.properties
+    }
+
+    /// The project's issue tracker, as the project YAML sets it (read-only
+    /// here).
+    pub fn issue_tracker(&self) -> &IssueTracker {
+        &self.disk.issue_tracker
+    }
+
+    /// The project's layout: one YAML, or a shared `project.yaml` in the
+    /// repo beside a user-local `local.yaml`.
+    pub fn layout(&self) -> ConfigMode {
+        self.disk.layout
+    }
+
+    /// Whether the editor override can be saved: always for a global
+    /// project; for an in-repo one, once its `local.yaml` was read (a far
+    /// machine with an older binary doesn't send it).
+    pub fn editor_editable(&self) -> bool {
+        self.disk.layout == ConfigMode::Global || self.disk.local.is_some()
+    }
+
+    /// The file that holds `editor:`: an in-repo project's `local.yaml`,
+    /// else the project YAML.
+    pub fn editor_path(&self) -> &Path {
+        match &self.disk.local {
+            Some(local) => &local.path,
+            None => &self.disk.project_path,
+        }
     }
 
     /// The path of the project YAML that holds `orchestrator.awareness:` (and
@@ -832,6 +909,24 @@ impl WorkflowConfig {
     }
 
     /// Make `workflow` the one tasks without a `workflow:` use.
+    /// Replace the project YAML's own settings (Settings ▸ Properties).
+    /// Refuses values [`project_properties::check`] refuses (the first
+    /// problem's message), and an editor change it can't save
+    /// ([`editor_editable`](Self::editor_editable)).
+    pub fn set_properties(&self, properties: Properties) -> Result<Self> {
+        if let Some(problem) = project_properties::check(&properties).into_iter().next() {
+            return Err(ConfigError::Invalid(problem.message));
+        }
+        if properties.editor != self.properties.editor && !self.editor_editable() {
+            return Err(ConfigError::Invalid(
+                "the editor lives in this project's local.yaml, which wasn't read".into(),
+            ));
+        }
+        let mut next = self.clone();
+        next.properties = properties;
+        Ok(next)
+    }
+
     pub fn set_default_workflow(&self, workflow: &str) -> Result<Self> {
         self.workflow_index(workflow)?;
         let mut next = self.clone();
@@ -1171,15 +1266,34 @@ impl WorkflowConfig {
         }
 
         let mut project_op = None;
+        let mut local_op = None;
         let default_changed = self.default_workflow != disk.default_workflow;
         let awareness_changed = self.awareness != disk.awareness;
-        if default_changed || awareness_changed {
+        let properties_changed = self.properties != disk.properties;
+        if default_changed || awareness_changed || properties_changed {
             let raw = yaml_edit::parse(&disk.project_text)
                 .map_err(|e| file_err(&disk.project_path, e))?;
             let mut target = raw.clone();
             let map = target
                 .as_mapping_mut()
                 .ok_or_else(|| file_err(&disk.project_path, "isn't a mapping"))?;
+            let mut local_target = match &disk.local {
+                Some(local) => Some(
+                    yaml_edit::parse(&local.text).map_err(|e| file_err(&local.path, e))?,
+                ),
+                None => None,
+            };
+            let mut local_changed = false;
+            if properties_changed {
+                let local_map = match local_target.as_mut() {
+                    Some(v) => Some(v.as_mapping_mut().ok_or_else(|| {
+                        file_err(&disk.local.as_ref().expect("read").path, "isn't a mapping")
+                    })?),
+                    None => None,
+                };
+                (_, local_changed) =
+                    project_properties::apply(map, local_map, &disk.properties, &self.properties);
+            }
             if default_changed {
                 map.insert(
                     "default_workflow".into(),
@@ -1199,12 +1313,39 @@ impl WorkflowConfig {
             }
             let patched = yaml_edit::patch(&disk.project_text, &target)
                 .map_err(|e| file_err(&disk.project_path, e))?;
-            project_op = Some(FileOp {
-                path: disk.project_path.clone(),
-                expected: Some(disk.project_text.clone()),
-                text: Some(patched.text),
-                dropped_comments: patched.dropped_comments,
-            });
+            let local_patched = match (&disk.local, &local_target) {
+                (Some(local), Some(t)) if local_changed => {
+                    Some(yaml_edit::patch(&local.text, t).map_err(|e| file_err(&local.path, e))?)
+                }
+                _ => None,
+            };
+            if properties_changed {
+                // What `shelbi config lint` would say of the files as
+                // written: they must still load as this project.
+                let local_text = local_patched
+                    .as_ref()
+                    .map(|p| p.text.as_str())
+                    .or(disk.local.as_ref().map(|l| l.text.as_str()));
+                self.lint_project(&patched.text, local_text)?;
+            }
+            if patched.text != disk.project_text {
+                project_op = Some(FileOp {
+                    path: disk.project_path.clone(),
+                    expected: Some(disk.project_text.clone()),
+                    text: Some(patched.text),
+                    dropped_comments: patched.dropped_comments,
+                });
+            }
+            if let (Some(local), Some(patched)) = (&disk.local, local_patched) {
+                if patched.text != local.text {
+                    local_op = Some(FileOp {
+                        path: local.path.clone(),
+                        expected: Some(local.text.clone()),
+                        text: Some(patched.text),
+                        dropped_comments: patched.dropped_comments,
+                    });
+                }
+            }
         }
 
         // A catalog that only grows goes first, so no workflow ever names a
@@ -1219,9 +1360,29 @@ impl WorkflowConfig {
             workflow_ops.into_values().partition(|op| op.text.is_some());
         plan.extend(writes);
         plan.extend(project_op);
+        plan.extend(local_op);
         plan.extend(removes);
         plan.extend(statuses_op);
         Ok(plan)
+    }
+
+    /// Refuse a project YAML (and an in-repo project's `local.yaml`) the
+    /// loader wouldn't take, as `shelbi config lint` checks it: it parses as
+    /// the project's layout, and its references resolve.
+    fn lint_project(&self, shared: &str, local: Option<&str>) -> Result<()> {
+        let path = &self.disk.project_path;
+        let refuse = |e: shelbi_core::Error| file_err(path, e);
+        let mut project = match (self.disk.layout, local) {
+            (ConfigMode::InRepo, Some(local)) => {
+                shelbi_core::Project::from_split_yaml_str(shared, local).map_err(refuse)?
+            }
+            // An in-repo project whose local half wasn't sent: the shared
+            // half alone can't be loaded, so check it parses as YAML.
+            (ConfigMode::InRepo, None) => return Ok(()),
+            (ConfigMode::Global, _) => shelbi_core::Project::from_yaml_str(shared).map_err(refuse)?,
+        };
+        project.name = self.project.clone();
+        project.validate_workspaces().map_err(refuse)
     }
 
     // -----------------------------------------------------------------------
@@ -1453,6 +1614,13 @@ pub(crate) fn project_config_file(project: &str) -> Result<PathBuf> {
             .join("project.yaml"));
     }
     Ok(projects.join(format!("{project}.yaml")))
+}
+
+/// An in-repo project's user-local `projects/<id>/local.yaml` (it holds
+/// `editor:`), or `None` for a global project.
+pub(crate) fn project_local_file(project: &str) -> Result<Option<PathBuf>> {
+    let local = crate::projects_dir().map_err(other)?.join(project).join("local.yaml");
+    Ok(local.is_file().then_some(local))
 }
 
 /// The `orchestrator.awareness:` a project YAML's text sets; the default when
