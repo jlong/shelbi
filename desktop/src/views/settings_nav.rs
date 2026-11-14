@@ -4,7 +4,8 @@
 //!
 //! It starts under the window's tab bar, like the app sidebar. Top to
 //! bottom: the header row (the back button beside the Settings title, in
-//! Large/Semibold, then Toggle sidebar, as the app sidebar's), then each section:
+//! Large/Semibold, then Search and Toggle sidebar, as the app sidebar's),
+//! then each section:
 //! its header and its pages' nav rows, each with its ⌘N. The Global
 //! section (General, Keybindings, Terminal), then, after a divider, the
 //! project section (`dt-wf-settings-index`, frame 2301:5824): the project's
@@ -132,12 +133,14 @@ fn project_header(label: SharedString, theme: &Theme) -> impl IntoElement {
 const PROJECT_ROW_H: f32 = 28.0;
 
 /// The settings sidebar. `chip` is the sliding selection while it moves
-/// (measured on `track`); `project` is the shown project's name.
+/// (measured on `track`); `project` is the shown project's name;
+/// `palette_chord` the header's Search names.
 pub fn render<H: SidebarHost>(
     nav: SettingsNav,
     chip: Option<Bounds<Pixels>>,
     track: &SharedTrack,
     project: SharedString,
+    palette_chord: &str,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> AnyElement {
@@ -161,10 +164,13 @@ pub fn render<H: SidebarHost>(
         .text_color(theme.foreground)
         .child("Settings");
     // The header row (2252:27533): the back button and the title 12pt
-    // apart, 12pt in, then Toggle sidebar (no Search: the tab bar has it).
+    // apart, 12pt in, then Search and Toggle sidebar.
     let header = sidebar::header_row(
         div().flex().flex_row().flex_1().min_w_0().items_center().gap(px(12.0)).child(back).child(title),
         sidebar::HEADER_PAD_LEFT,
+        Some(sidebar::search_button("settings-search", palette_chord, theme).on_click(cx.listener(
+            |this, _, window, cx| this.sidebar_event(SidebarEvent::OpenSearch, window, cx),
+        ))),
         sidebar::toggle_button("settings-toggle", Some(true), theme).on_click(cx.listener(
             |this, _, window, cx| this.sidebar_event(SidebarEvent::Collapse, window, cx),
         )),

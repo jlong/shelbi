@@ -290,6 +290,8 @@ pub enum ReviewEvent {
     Toast(Option<Toast>),
     /// The header row's Toggle sidebar.
     ToggleSidebar,
+    /// The header row's Search: open the command palette.
+    OpenSearch,
 }
 
 /// Where keyboard focus sits inside the review.
@@ -1476,6 +1478,10 @@ impl ReviewView {
         let status = task_panel::status_row(
             back,
             Some((StatusCategory::Handoff, status_label.as_str())),
+            Some(
+                sidebar::search_button("review-search", &sidebar::PaletteChord::of(cx), theme)
+                    .on_click(cx.listener(|_, _, _, cx| cx.emit(ReviewEvent::OpenSearch))),
+            ),
             sidebar::toggle_button("review-toggle", None, theme)
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(ReviewEvent::ToggleSidebar))),
             theme,

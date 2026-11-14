@@ -1,5 +1,8 @@
 # tabbar-search-sidebar-header: the search box and the sidebar's header row
 
+> The search box later went: see [`search-back-to-sidebar`](search-back-to-sidebar.md),
+> which puts Search back in the header rows and leaves the tab bar's right end empty.
+
 ## What landed
 
 A follow-up to [`project-tabs`](project-tabs.md), from the Figma

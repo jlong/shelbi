@@ -778,14 +778,26 @@ fn a_panel_keeps_the_sidebars_chrome_and_takes_the_numbered_chords(cx: &mut Test
     c.open_review();
     c.advance(SLIDE);
     assert!(c.drawn("review-panel") && !c.drawn("column-sidebar"));
-    // The tab bar's search box stays over it, the panel's header row has
-    // only Toggle sidebar, and the Navigation component's footer is under
-    // it, the Zen pill at the 24pt every state draws.
-    for selector in ["tab-bar-search", "review-toggle", "sidebar-settings", "sidebar-zen"] {
+    // The panel's header row has Search and Toggle sidebar (State=Review,
+    // 2220:17159), 4pt apart, and the Navigation component's footer is
+    // under it, the Zen pill at the 24pt every state draws.
+    for selector in ["review-search", "review-toggle", "sidebar-settings", "sidebar-zen"] {
         assert!(c.drawn(selector), "{selector} is drawn around the panel");
     }
-    assert!(!c.drawn("review-search"), "no Search in the panel's header");
+    assert!(!c.drawn("tab-bar-search"), "the tab bar has no search");
+    let (search, toggle) = (c.bounds("review-search").unwrap(), c.bounds("review-toggle").unwrap());
+    assert_eq!(search.right() + gpui::px(4.0), toggle.left());
+    assert_eq!(search.size, toggle.size);
     assert_eq!(c.bounds("sidebar-zen").unwrap().size.height, gpui::px(24.0));
+    // Its Search opens the palette, as the sidebar's does.
+    let at = search.center();
+    c.h.cx.simulate_click(at, gpui::Modifiers::none());
+    c.h.draw();
+    assert!(c.read(|w, _| w.overlay.is_some()), "the panel's Search opens the palette");
+    c.update(|w, _, cx| {
+        w.overlay = None;
+        cx.notify();
+    });
     c.h.take_calls();
 
     // ⌃2 is the panel's View Diff, not the hidden sidebar's second row.
@@ -800,6 +812,8 @@ fn a_panel_keeps_the_sidebars_chrome_and_takes_the_numbered_chords(cx: &mut Test
     c.open_workspace();
     c.advance(SLIDE);
     assert!(c.drawn("workspace-panel") && c.drawn("sidebar-zen"));
+    // The Workspace frame (2220:18764) hides Search: the toggle alone.
+    assert!(c.drawn("ws-toggle") && !c.drawn("ws-search"));
     c.h.take_calls();
     c.h.key("ctrl-3");
     let active = c.workspace().read_with(&c.h.cx, |w, _| w.panel().active());

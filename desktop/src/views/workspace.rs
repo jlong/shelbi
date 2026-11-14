@@ -1243,6 +1243,8 @@ impl WorkspaceView {
         let status = task_panel::status_row(
             back,
             header.task_id.is_some().then_some((StatusCategory::Active, status_label.as_str())),
+            // The Workspace frame (2220:18764) hides Search: the toggle alone.
+            None,
             sidebar::toggle_button("ws-toggle", None, theme)
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(WorkspaceEvent::ToggleSidebar))),
             theme,

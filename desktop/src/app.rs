@@ -1664,6 +1664,11 @@ impl ShelbiWindow {
             .unwrap_or_else(|| SidebarModel::skeleton(project));
         // The built-in keymaps until the user's `keys.yaml` is read (below).
         let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
+        // The review panel's Search names the chord (an open window's own
+        // keymaps, once read, win over the built-in ones).
+        if !cx.has_global::<sidebar::PaletteChord>() {
+            cx.set_global(sidebar::PaletteChord(palette_chord(&keymaps).into()));
+        }
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window, cx);
         // The window's translucency, before its first frame.
@@ -2090,6 +2095,7 @@ impl ShelbiWindow {
     /// Take `keymaps` for the window's keys, its hints and the menu bar.
     fn adopt_keymaps(&mut self, keymaps: Keymaps, cx: &mut Context<Self>) {
         self.palette_chord = palette_chord(&keymaps);
+        cx.set_global(sidebar::PaletteChord(self.palette_chord.clone().into()));
         cx.set_global(DiffKeys(Rc::new(keymaps.diff.clone())));
         self.keymaps = keymaps;
         if let Some(ws) = self.workspace.clone() {
@@ -3619,6 +3625,7 @@ impl ShelbiWindow {
             ReviewEvent::OpenTask(id) => this.open_task_over(id, window, cx),
             ReviewEvent::Toast(toast) => this.show_toast(toast.clone(), cx),
             ReviewEvent::ToggleSidebar => this.toggle_sidebar(cx),
+            ReviewEvent::OpenSearch => this.open_palette(window, cx),
         });
         self._view_subscriptions.push(sub);
         self.review = Some(review.clone());
@@ -6043,7 +6050,7 @@ fn window_chord(keymaps: &Keymaps, chord: &shelbi_state::keymap::KeyChord) -> Op
     })
 }
 
-/// The palette-open chord as the search box shows it (`⌘K` by default):
+/// The palette-open chord as the header rows' Search names it (`⌘K` by default):
 /// the [`crate::views::palette::hint_chord`].
 fn palette_chord(keymaps: &Keymaps) -> String {
     crate::views::palette::hint_chord(keymaps)
@@ -6315,6 +6322,7 @@ impl ShelbiWindow {
                             ),
                             connected: self.link == Some(DaemonLink::Live),
                         }),
+                        palette_chord: &self.palette_chord,
                     },
                     &theme,
                     cx,
@@ -6346,6 +6354,7 @@ impl ShelbiWindow {
                     settings_chip.flatten(),
                     &self.settings_track,
                     self.model.project_label.clone().into(),
+                    &self.palette_chord,
                     &theme,
                     cx,
                 ))
@@ -6431,12 +6440,6 @@ impl ShelbiWindow {
         // the sidebar shows or not. The chooser (no project) has none.
         let tab_bar = (!editing_workflow && !self.chooser).then(|| {
             let tabs = self.tab_props(cx);
-            // The bar spans the window: the box fits by the tabs' widths.
-            let search_fits = tab_bar::search_fits(
-                f32::from(window.viewport_size().width),
-                &tab_bar::label_widths(&tabs, window),
-                reveal.position,
-            );
             tab_bar::render(
                 TabBarProps {
                     tabs: &tabs,
@@ -6453,10 +6456,8 @@ impl ShelbiWindow {
                     }),
                     plus: &self.switcher.button,
                     menu_open: self.switcher.is_open(),
-                    palette_chord: &self.palette_chord,
                     sidebar_shown: !self.collapsed,
                     reveal: reveal.position,
-                    search_fits,
                 },
                 &theme,
                 cx,
@@ -6733,13 +6734,6 @@ impl ShelbiWindow {
         } else {
             self.switcher.close(now);
         }
-        cx.notify();
-    }
-
-    /// Bring the tabs in line with the catalog as installed (no refresh
-    /// from disk): a tab per open project.
-    pub(crate) fn offscreen_sync_tabs(&mut self, cx: &mut Context<Self>) {
-        self.sync_tabs(cx);
         cx.notify();
     }
 
