@@ -620,6 +620,7 @@ pub fn nav_icon(view: &View) -> Icon {
         // frame draws, beside the Changelog's rocket there.
         View::Activity => icons::BOLT,
         View::Machines => icons::SERVER_STACK,
+        View::Jobs => icons::COMMAND_LINE,
     }
 }
 
@@ -1783,6 +1784,7 @@ mod tests {
         let shared = shelbi_app::view::default_nav_items();
         assert!(shared.iter().any(|n| n.view == View::Changelog && n.label == "Changelog"));
         assert!(!shared.iter().any(|n| n.view == View::Activity), "Activity is palette-only");
+        assert!(!shared.iter().any(|n| n.view == View::Jobs), "Jobs is palette-only");
     }
 
     #[test]
@@ -1884,6 +1886,7 @@ mod tests {
         assert_eq!(nav_icon(&View::Issues), icons::RECTANGLE_STACK);
         assert_eq!(nav_icon(&View::Changelog), icons::ROCKET_LAUNCH);
         assert_eq!(nav_icon(&View::Activity), icons::BOLT);
+        assert_eq!(nav_icon(&View::Jobs), icons::COMMAND_LINE);
     }
 }
 

@@ -1445,6 +1445,8 @@ struct ShellState {
     kanban: KanbanApp,
     activity: ActivityApp,
     machines: MachinesApp,
+    /// The Jobs screen (palette-only), fed by the core snapshot.
+    jobs: crate::jobs::JobsPage,
     /// The Changelog page (the sidebar's Changelog row), fed by the
     /// changelog refresher.
     changelog: changelog::ChangelogPage,
@@ -1835,6 +1837,7 @@ impl ShellState {
             kanban,
             activity,
             machines,
+            jobs: crate::jobs::JobsPage::default(),
             changelog: changelog::ChangelogPage::new(),
             changelog_issue_rx: None,
             issue_read_from: None,
@@ -2074,6 +2077,13 @@ impl ShellState {
         if let Some(machines) = snap.machines {
             self.machines.apply_data(machines);
             self.dirty = true;
+        }
+        if let Some(jobs) = snap.jobs {
+            self.jobs.apply(jobs);
+            // Repaint while it shows, so its "Started" ages tick over.
+            if matches!(self.main_view, MainView::Native(View::Jobs)) {
+                self.dirty = true;
+            }
         }
     }
 
@@ -2476,6 +2486,7 @@ impl ShellState {
             std::mem::replace(&mut self.activity, activity),
             std::mem::replace(&mut self.machines, machines),
         );
+        self.jobs = crate::jobs::JobsPage::default();
         self.changelog = changelog::ChangelogPage::new();
         self.changelog_issue_rx = None;
         self.issue_read_from = None;
@@ -4453,7 +4464,7 @@ impl ShellState {
     /// "chat" and workspace session views bind a terminal view.
     fn show_view_effect(&mut self, v: View) {
         match v {
-            View::Issues | View::Changelog | View::Activity | View::Machines => {
+            View::Issues | View::Changelog | View::Activity | View::Machines | View::Jobs => {
                 self.show(RowTarget::Native(v))
             }
             View::Session(name) if name == "orch" => {
@@ -5589,6 +5600,11 @@ impl ShellState {
                 self.dirty = true;
                 return;
             }
+            MainView::Native(View::Jobs) => {
+                self.handle_jobs_key(k);
+                self.dirty = true;
+                return;
+            }
             MainView::Native(View::Changelog) => {
                 let step = self.changelog.handle_key(k);
                 self.apply_changelog_step(step);
@@ -5734,6 +5750,21 @@ impl ShellState {
     /// Route a key to the embedded machines view. Unlike the standalone process
     /// (which focuses the workspace in a tmux pane), Enter here opens the
     /// workspace's session in the terminal view.
+    fn handle_jobs_key(&mut self, k: KeyEvent) {
+        // Global quit/palette chords are swallowed (the shell owns them).
+        let chord = crate::keymap::chord_from_event(k);
+        if chord.and_then(|c| self.keymaps.global.dispatch(c)).is_some() {
+            return;
+        }
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => self.jobs.nav_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.jobs.nav_down(),
+            KeyCode::Home | KeyCode::Char('g') => self.jobs.nav_first(),
+            KeyCode::End | KeyCode::Char('G') => self.jobs.nav_last(),
+            _ => {}
+        }
+    }
+
     fn handle_machines_key(&mut self, k: KeyEvent) {
         // Global quit/palette chords are swallowed (the shell owns them).
         let chord = crate::keymap::chord_from_event(k);
@@ -6048,6 +6079,15 @@ impl ShellState {
                 self.dirty = true;
                 return;
             }
+            MainView::Native(View::Jobs) => {
+                match m.kind {
+                    MouseEventKind::ScrollUp => self.jobs.nav_up(),
+                    MouseEventKind::ScrollDown => self.jobs.nav_down(),
+                    _ => {}
+                }
+                self.dirty = true;
+                return;
+            }
             MainView::Native(View::Changelog) => {
                 let step = self.changelog.handle_mouse(m, self.main_rect);
                 self.apply_changelog_step(step);
@@ -6313,6 +6353,7 @@ where
     let kanban = &mut state.kanban;
     let activity = &mut state.activity;
     let machines = &mut state.machines;
+    let jobs = &mut state.jobs;
     let changelog = &mut state.changelog;
     let onboarding = &mut state.onboarding;
     let sessions = &state.sessions;
@@ -6336,6 +6377,9 @@ where
             }
             MainView::Native(View::Machines) => {
                 crate::machines::render_full(frame, machines, main_rect)
+            }
+            MainView::Native(View::Jobs) => {
+                crate::jobs::render_full(frame, jobs, main_rect, chrono::Utc::now())
             }
             _ => {}
         }
@@ -6643,7 +6687,7 @@ fn row_target_to_view(target: &RowTarget) -> Option<View> {
 /// `View::Session` names the session to bind (`orch` is the orchestrator chat).
 fn view_to_row_target(view: &View) -> RowTarget {
     match view {
-        View::Issues | View::Changelog | View::Activity | View::Machines => {
+        View::Issues | View::Changelog | View::Activity | View::Machines | View::Jobs => {
             RowTarget::Native(view.clone())
         }
         View::Session(name) if name == ORCH_VIEW => RowTarget::Session(SessionRef::Orchestrator),
@@ -6904,6 +6948,12 @@ fn read_snapshot(project: &str, _generation: u64) -> ShellSnapshot {
         board: Some(KanbanApp::read_board_data(project)),
         activity: None,
         machines: Some(MachinesApp::read_data(project)),
+        // One small file, read on the same refresh as the sidebar, so a job
+        // appears (and goes) on the shell's refresh without a poll of its own.
+        jobs: Some(match shelbi_state::awareness::read_awareness(project) {
+            Ok(store) => shelbi_app::jobs::JobsRead::Jobs(store.jobs),
+            Err(e) => shelbi_app::jobs::JobsRead::Failed(e.to_string()),
+        }),
     }
 }
 
@@ -7133,6 +7183,7 @@ mod tests {
                 board: None,
                 activity: None,
                 machines: None,
+                jobs: None,
             });
             // The activity refresher tags its read with the project, so a test can
             // read back (via `latest_activity`) which project it followed.
@@ -7180,6 +7231,7 @@ mod tests {
             board: None,
             activity: None,
             machines: None,
+            jobs: None,
         }
     }
 
@@ -7236,6 +7288,7 @@ mod tests {
             board: None,
             activity: None,
             machines: None,
+            jobs: None,
         });
         st
     }
@@ -7628,6 +7681,52 @@ mod tests {
             "running the palette's Machines command shows the Machines view"
         );
         assert_eq!(st.client.view(), &View::Machines);
+    }
+
+    #[test]
+    fn typing_jobs_in_the_palette_opens_the_jobs_screen() {
+        use shelbi_app::jobs::{JobsRead, EMPTY_TEXT};
+        use shelbi_state::awareness::{Job, JobKind};
+        let mut st = test_state();
+        st.open_palette();
+        for c in "Jobs".chars() {
+            type_key(&mut st, c);
+        }
+        let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+            panic!("the palette is open");
+        };
+        assert_eq!(p.results()[p.selected()].0.id, "view:jobs", "typing Jobs offers the Jobs screen first");
+        press(&mut st, KeyCode::Enter);
+        assert!(matches!(st.main_view, MainView::Native(View::Jobs)));
+        assert_eq!(st.client.view(), &View::Jobs);
+
+        // A job lands on the shell's refresh, and goes when it finishes.
+        let snapshot = |jobs: Vec<Job>| ShellSnapshot {
+            sidebar: None,
+            board: None,
+            activity: None,
+            machines: None,
+            jobs: Some(JobsRead::Jobs(jobs)),
+        };
+        let job = Job {
+            id: "j1".into(),
+            kind: JobKind::Command,
+            target: "sleep 60".into(),
+            label: Some("x".into()),
+            started_at: chrono::Utc::now(),
+            runner_pid: Some(4242),
+        };
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        st.apply_snapshot(snapshot(vec![job]));
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("Description") && screen.contains("sleep 60"), "{screen}");
+        assert!(screen.contains("just now"), "{screen}");
+        st.apply_snapshot(snapshot(vec![]));
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains(EMPTY_TEXT), "{screen}");
+        assert!(!screen.contains("sleep 60"), "{screen}");
     }
 
     #[test]
@@ -8680,6 +8779,7 @@ mod tests {
             board: None,
             activity: None,
             machines: None,
+            jobs: None,
         });
         assert_eq!(
             st.workspace.as_ref().unwrap().header_status_text(),
@@ -8696,6 +8796,7 @@ mod tests {
             board: None,
             activity: None,
             machines: None,
+            jobs: None,
         });
         assert_eq!(
             st.workspace.as_ref().unwrap().header_status_text(),
@@ -10139,7 +10240,7 @@ mod tests {
             ProjectWorkers {
                 refresher: refresh::spawn(move |_g| {
                     w1();
-                    ShellSnapshot { sidebar: None, board: None, activity: None, machines: None }
+                    ShellSnapshot { sidebar: None, board: None, activity: None, machines: None, jobs: None }
                 }),
                 activity_refresher: refresh::spawn(move |_g| {
                     w2();
@@ -13480,6 +13581,7 @@ workspaces:
                     board: None,
                     activity: None,
                     machines: None,
+                    jobs: None,
                 }),
                 activity_refresher: refresh::spawn(|_g| ActivityData::tagged_for_test("x")),
                 closed_refresher: refresh::spawn(|_g| None),

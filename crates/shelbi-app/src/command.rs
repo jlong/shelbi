@@ -433,6 +433,7 @@ fn view_description(view: &View) -> Option<&'static str> {
         View::Changelog => Some("See what has shipped"),
         View::Activity => Some("See what's happened recently"),
         View::Machines => Some("See the machines running your agents"),
+        View::Jobs => Some("See the jobs Shelbi is watching"),
         View::Session(_) => None,
     }
 }

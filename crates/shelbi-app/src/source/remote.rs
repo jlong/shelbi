@@ -366,6 +366,11 @@ impl ProjectSource for RemoteSource {
         take!(self.ask(Query::Machines { project: self.name() }), Answer::Machines).map_err(|e| self.text(e))
     }
 
+    /// The far store isn't read over the link yet: the screen says so.
+    fn jobs(&self) -> crate::jobs::JobsRead {
+        crate::jobs::JobsRead::Unavailable
+    }
+
     fn machine_reachability(&self, host: &str) -> Reachability {
         let query = Query::MachineReachability {
             project: self.name(),

@@ -158,7 +158,8 @@ impl Job {
     }
 }
 
-fn short_sha(sha: &str) -> &str {
+/// A commit sha cut to the 12 characters the job listings show.
+pub fn short_sha(sha: &str) -> &str {
     sha.get(..12).unwrap_or(sha)
 }
 

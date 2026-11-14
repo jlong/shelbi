@@ -267,6 +267,13 @@ impl ProjectSource for LocalSource {
         crate::machines_model::read_machines_model(self.name()).map_err(|e| e.to_string())
     }
 
+    fn jobs(&self) -> shelbi_app::jobs::JobsRead {
+        match shelbi_state::awareness::read_awareness(self.name()) {
+            Ok(store) => shelbi_app::jobs::JobsRead::Jobs(store.jobs),
+            Err(e) => shelbi_app::jobs::JobsRead::Failed(e.to_string()),
+        }
+    }
+
     fn machine_reachability(&self, host: &str) -> Reachability {
         crate::machine::probe_host_reachability(host)
     }

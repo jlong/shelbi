@@ -1769,7 +1769,7 @@ mod tests {
         assert_eq!(model.nav.len(), 3);
         assert_eq!(model.nav[1].view, View::Issues);
         assert_eq!(model.nav[2].view, View::Changelog);
-        for palette_only in [View::Machines, View::Activity] {
+        for palette_only in [View::Machines, View::Activity, View::Jobs] {
             assert!(
                 !model.nav.iter().any(|n| n.view == palette_only),
                 "{palette_only:?} is not a sidebar nav entry"
