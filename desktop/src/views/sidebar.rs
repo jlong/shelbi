@@ -7,8 +7,9 @@
 //! Queued for review), then Workspaces, each section collapsible, and every
 //! review and working workspace numbered for its ⌃1 to ⌃9 chord. It starts
 //! under the window's tab bar (`crate::views::tab_bar`, which holds the
-//! traffic lights, the projects and the search box). Top to bottom: the
-//! header row ([`header_row`]: the project's name, then Toggle sidebar),
+//! traffic lights and the projects). Top to bottom: the
+//! header row ([`header_row`]: the project's name, then Search and Toggle
+//! sidebar),
 //! a remote window's host, then
 //! the nav (Orchestrator ⌘O, Issues ⌘I, Changelog ⌘L), the sections, then
 //! the footer: any status (the orchestrator's failure, the polling
@@ -382,8 +383,7 @@ pub fn selected_key(entries: &[Entry], ordinal: usize) -> Option<SharedString> {
 pub enum SidebarEvent {
     /// Open the `index`-th selectable row (selecting it first).
     Activate(usize),
-    /// The search box in the tab bar, or a header row's Search button:
-    /// opens the command palette.
+    /// A header row's Search button: opens the command palette.
     OpenSearch,
     /// Show or hide the tab bar's project menu (the `+` tab).
     ToggleSwitcher,
@@ -448,6 +448,8 @@ pub struct SidebarProps<'a> {
     /// A remote window's host (`jlong@devbox`), drawn over the project with
     /// its link's dot; `None` for a project on this machine.
     pub remote: Option<RemoteBadge>,
+    /// The palette-open chord, for the header's Search tooltip (`⌘K`).
+    pub palette_chord: &'a str,
 }
 
 /// A remote window's host row: who and where, and whether the far link is
@@ -635,6 +637,26 @@ pub fn row_selector(row: &SidebarRow) -> String {
     }
 }
 
+/// The header row's Search button (Heroicons `magnifying-glass`), its
+/// tooltip naming the palette's chord; the caller adds the click.
+pub fn search_button(id: &'static str, palette_chord: &str, theme: &Theme) -> gpui::Stateful<gpui::Div> {
+    toolbar_button(id, heroicon(icons::MAGNIFYING_GLASS), theme).tooltip(style::tooltip(search_tip(palette_chord)))
+}
+
+/// The palette-open chord (`⌘K`) for views that aren't the window (the
+/// review panel's Search tooltip): the window sets it with its keymaps.
+#[derive(Debug, Clone, Default)]
+pub struct PaletteChord(pub SharedString);
+
+impl gpui::Global for PaletteChord {}
+
+impl PaletteChord {
+    /// The chord set, or nothing before the window's keymaps are read.
+    pub fn of(cx: &gpui::App) -> SharedString {
+        cx.try_global::<PaletteChord>().map(|c| c.0.clone()).unwrap_or_default()
+    }
+}
+
 /// What Search says in its tooltip: `Search (⌘K)`.
 pub fn search_tip(palette_chord: &str) -> String {
     if palette_chord.is_empty() {
@@ -659,11 +681,16 @@ pub fn toggle_button(id: &'static str, shown: Option<bool>, theme: &Theme) -> gp
 
 /// The column's header row (the Navigation component's Toolbar, 2196:6837
 /// and its Workspace, Review and Settings variants): [`HEADER_H`] tall,
-/// `lead` from `pad_left` in and growing, then Toggle sidebar
-/// ([`toggle_button`]) [`HEADER_GAP`] past it, 8pt from the right. The
-/// frames still draw a Search button before the toggle; the desktop leaves
-/// it out (the tab bar's search box opens the palette).
-pub fn header_row(lead: impl IntoElement, pad_left: f32, toggle: gpui::Stateful<gpui::Div>) -> Div {
+/// `lead` from `pad_left` in and growing, then Search and Toggle sidebar
+/// ([`search_button`], [`toggle_button`]), 32pt each, [`HEADER_GAP`] apart,
+/// 8pt from the right. `search` is `None` where the frame hides it (the
+/// Workspace task panel, 2220:18764): the toggle alone.
+pub fn header_row(
+    lead: impl IntoElement,
+    pad_left: f32,
+    search: Option<gpui::Stateful<gpui::Div>>,
+    toggle: gpui::Stateful<gpui::Div>,
+) -> Div {
     div()
         .flex()
         .flex_row()
@@ -674,6 +701,7 @@ pub fn header_row(lead: impl IntoElement, pad_left: f32, toggle: gpui::Stateful<
         .pl(px(pad_left))
         .pr(px(HEADER_PAD_RIGHT))
         .child(div().flex().flex_row().flex_1().min_w_0().items_center().child(lead))
+        .children(search)
         .child(toggle)
 }
 
@@ -775,6 +803,9 @@ pub fn render<H: SidebarHost>(
     let header = header_row(
         project_label(header_title(props.model), theme),
         HEADER_PAD_LEFT,
+        Some(search_button("sidebar-search", props.palette_chord, theme).on_click(cx.listener(
+            |this, _, window, cx| this.sidebar_event(SidebarEvent::OpenSearch, window, cx),
+        ))),
         toggle_button("sidebar-toggle", Some(true), theme).on_click(cx.listener(|this, _, window, cx| {
             this.sidebar_event(SidebarEvent::Collapse, window, cx)
         })),
@@ -1899,6 +1930,7 @@ mod render_tests {
                     track: motion::SlideTrack::shared(),
                     chip: None,
                     remote: None,
+                    palette_chord: "⌃P",
                 },
                 &theme,
                 cx,
@@ -1997,6 +2029,7 @@ mod render_tests {
             "sidebar-header",
             "sidebar-header-title",
             "sidebar-header-name",
+            "sidebar-search",
             "sidebar-toggle",
         ] {
             assert!(cx.debug_bounds(selector).is_some(), "{selector} is drawn");
@@ -2015,8 +2048,6 @@ mod render_tests {
             "sidebar-collapse",
             "sidebar-project-title",
             "sidebar-remote-host",
-            // Search is the tab bar's: the header keeps only its toggle.
-            "sidebar-search",
         ] {
             assert!(cx.debug_bounds(absent).is_none(), "{absent} is not drawn");
         }
@@ -2048,14 +2079,17 @@ mod render_tests {
         let (_, mut cx) = open(cx, fixture_model(), 0, None);
         let b = |cx: &mut VisualTestContext, s: &'static str| cx.debug_bounds(s).unwrap();
         // The header row (2196:6837): 58pt, the project's name 12pt + 8pt
-        // in, then Toggle sidebar, 32pt, 8pt off the right edge (the frame's
-        // Search before it is left out).
+        // in, then Search and Toggle sidebar, 32pt with 20pt icons, 4pt
+        // apart, 8pt off the right edge.
         let header = b(&mut cx, "sidebar-header");
         assert_eq!((header.top().as_f32(), header.size.height.as_f32()), (0.0, 58.0));
         let title = b(&mut cx, "sidebar-header-title");
         assert_eq!((title.left().as_f32(), title.top().as_f32(), title.size.height.as_f32()), (12.0, 15.0, 28.0));
         let name = b(&mut cx, "sidebar-header-name");
         assert_eq!((name.left().as_f32(), name.size.height.as_f32()), (20.0, 24.0), "8pt in, Large's 24pt line");
+        let search = b(&mut cx, "sidebar-search");
+        assert_eq!((search.left().as_f32(), search.top().as_f32()), (204.0, 13.0));
+        assert_eq!(search.size, gpui::size(px(32.0), px(32.0)));
         let toggle = b(&mut cx, "sidebar-toggle");
         assert_eq!((toggle.left().as_f32(), toggle.top().as_f32()), (240.0, 13.0));
         assert_eq!(toggle.size, gpui::size(px(32.0), px(32.0)));
@@ -2236,11 +2270,12 @@ mod render_tests {
         let title = cx.debug_bounds("sidebar-header-title").unwrap();
         let toggle = cx.debug_bounds("sidebar-toggle").unwrap();
         assert!(name.size.width > short_w, "a longer name takes more room");
-        // Ellipsized inside the label's 8pt, the header's 4pt short of the
-        // toggle, which stays put.
+        let search = cx.debug_bounds("sidebar-search").unwrap();
+        // Ellipsized inside the label's 8pt, the header's 4pt short of
+        // Search; Search and the toggle stay put.
         assert!(name.right() <= title.right() - px(8.0), "{name:?} in {title:?}");
-        assert!(title.right() <= toggle.left() - px(HEADER_GAP), "{title:?} before {toggle:?}");
-        assert_eq!(toggle.left().as_f32(), 240.0);
+        assert!(title.right() <= search.left() - px(HEADER_GAP), "{title:?} before {search:?}");
+        assert_eq!((search.left().as_f32(), toggle.left().as_f32()), (204.0, 240.0));
     }
 
     #[gpui::test]
@@ -2252,6 +2287,7 @@ mod render_tests {
             "sidebar-settings",
             "sidebar-section-Workspaces",
             "sidebar-zen",
+            "sidebar-search",
             "sidebar-toggle",
             "sidebar-header-title",
         ] {
@@ -2267,6 +2303,7 @@ mod render_tests {
                 SidebarEvent::OpenSettings,
                 SidebarEvent::ToggleSection(Section::Workspaces),
                 SidebarEvent::ToggleZen,
+                SidebarEvent::OpenSearch,
                 SidebarEvent::Collapse,
                 // The project's name is a label: a click on it asks for nothing.
             ]

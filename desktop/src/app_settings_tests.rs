@@ -141,10 +141,12 @@ fn settings_takes_the_column_with_its_own_sidebar(cx: &mut TestAppContext) {
     }
     // The frame's sidebar has no footer: no Zen pill, no settings gear.
     assert!(!s.drawn("sidebar-zen") && !s.drawn("sidebar-settings"));
-    // Its header row has only Toggle sidebar; the tab bar over it keeps
-    // its search box.
-    assert!(!s.drawn("settings-search") && s.drawn("settings-toggle"));
-    assert!(s.drawn("tab-bar-search") && !s.drawn("tab-bar-sidebar"));
+    // Its header row has Search and Toggle sidebar (State=Settings,
+    // 2252:27533), 4pt apart; the tab bar over it has no search.
+    assert!(s.drawn("settings-search") && s.drawn("settings-toggle"));
+    let (search, toggle) = (s.bounds("settings-search").unwrap(), s.bounds("settings-toggle").unwrap());
+    assert_eq!(search.right() + gpui::px(4.0), toggle.left());
+    assert!(!s.drawn("tab-bar-search") && !s.drawn("tab-bar-sidebar"));
     assert_eq!(s.page(), Some(SettingsPage::General));
     assert_eq!(s.selected_row(), Some(SettingsPage::General));
     assert!(s.drawn("settings-page-general"));
@@ -358,6 +360,14 @@ fn settings_over_a_review_returns_to_the_review(cx: &mut TestAppContext) {
     );
     assert!(s.read(|w, _| matches!(w.route, Route::Review)));
     assert_eq!(s.read(|w, cx| w.shown_review(cx)), Some("t-1".into()));
+}
+
+#[gpui::test]
+fn the_settings_search_opens_the_palette(cx: &mut TestAppContext) {
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    s.click("settings-search");
+    assert!(s.read(|w, _| w.overlay.is_some()), "Search opens the palette over Settings");
 }
 
 #[gpui::test]

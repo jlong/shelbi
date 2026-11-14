@@ -1,5 +1,9 @@
 # sidebar-project-name-search-collapse: the project's name in the header, one Search
 
+> Partly reversed by [`search-back-to-sidebar`](search-back-to-sidebar.md):
+> the tab bar's search box and its collapsed button are gone, and Search is
+> back in the header rows.
+
 ## What landed
 
 A follow-up to [`tabbar-search-sidebar-header`](tabbar-search-sidebar-header.md),

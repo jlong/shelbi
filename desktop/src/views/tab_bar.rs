@@ -4,14 +4,13 @@
 //!
 //! Left to right: one tab per open project ([`crate::project_tabs`]),
 //! starting just past the traffic lights, each a green dot and the project's
-//! name between 1pt rules, then the `+` tab; at the right end, the search
-//! box (node 2829:26790), which opens the command palette. Where the tabs
-//! leave no room for the box ([`search_fits`], from the tabs' laid-out
-//! widths) it draws as a 32pt magnifier button in its spot instead, and
-//! comes back as soon as a tab closes or the window widens. While the sidebar
-//! is hidden a Toggle sidebar button slides in before the first tab, with
-//! the sidebar's own reveal, to bring it back (the sidebar's header row has
-//! the toggle otherwise). The selected tab fills with the main area's color, so it reads as
+//! name between 1pt rules, then the `+` tab. The bar's right end is empty:
+//! the command palette opens from the sidebar's header row (its Search
+//! button), so the bar doesn't compete with the screens' own search fields.
+//! While the sidebar is hidden a Toggle sidebar button slides in before the
+//! first tab, with the sidebar's own reveal, to bring it back (the sidebar's
+//! header row has the toggle otherwise). The selected tab fills with the
+//! main area's color, so it reads as
 //! joined to the content below; the rest are unfilled. Hovering a tab swaps
 //! its dot for an `×` that closes the project. While ⌘ is held each of the
 //! first nine tabs shows its ⌘N.
@@ -25,19 +24,15 @@
 
 use std::time::Instant;
 
-use gpui::{
-    deferred, div, font, prelude::*, px, AnyElement, Context, Div, Hsla, SharedString, Stateful, TextRun,
-    Window,
-};
+use gpui::{deferred, div, prelude::*, px, AnyElement, Context, Div, Hsla, SharedString, Stateful};
 use shelbi_app::overlay::palette::ProjectEntry;
 
 use super::project_menu;
 use super::sidebar::{self, SidebarEvent, SidebarHost, TOOLBAR_BUTTON, TRAFFIC_LIGHTS_RIGHT};
 use crate::assets::{heroicon, icons, ICON_SIZE_MENU};
 use crate::elements::placed::{placed, MenuScroll};
-use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::keys::tab_hotkey;
-use crate::theme::motion::{self, fill_layer};
+use crate::theme::motion;
 use crate::theme::style::{self, Anchor, Type, Typography, NAV_RADIUS};
 use crate::theme::Theme;
 
@@ -56,25 +51,6 @@ pub const LEAD_X: f32 = TRAFFIC_LIGHTS_RIGHT + LIGHTS_GAP;
 /// The room the Toggle sidebar button takes while the sidebar is hidden:
 /// the button and the 16pt before the first tab's rule.
 pub const TOGGLE_ROOM: f32 = TOOLBAR_BUTTON + 16.0;
-
-/// The search box (2829:26790): 170 × 32, 10pt in from the window's right
-/// edge, centered in the bar.
-pub const SEARCH_W: f32 = 170.0;
-pub const SEARCH_H: f32 = 32.0;
-pub const SEARCH_RIGHT: f32 = 10.0;
-/// Its corners and padding: 6pt corners, 6pt before the magnifier, 8pt
-/// after the key cap, 6pt between.
-const SEARCH_RADIUS: f32 = 6.0;
-const SEARCH_PAD_LEFT: f32 = 6.0;
-const SEARCH_PAD_RIGHT: f32 = 8.0;
-const SEARCH_GAP: f32 = 6.0;
-/// The least room the search box keeps from the `+` tab's rule before it
-/// gives way to the magnifier button.
-pub const SEARCH_MIN_GAP: f32 = 16.0;
-/// The `+` tab's square (the bar's height).
-const PLUS_W: f32 = TAB_BAR_H;
-/// A tab's dot (or, hovered, its `×`).
-const TAB_DOT: f32 = 16.0;
 
 /// A tab's padding: 16pt before its dot, 20pt after its name, 8pt between.
 const TAB_PAD_LEFT: f32 = 16.0;
@@ -111,8 +87,6 @@ pub struct TabBarProps<'a> {
     pub plus: &'a Anchor,
     /// The menu is open (the `+` holds its pressed fill).
     pub menu_open: bool,
-    /// The palette-open chord the search box shows (`⌘K`).
-    pub palette_chord: &'a str,
     /// The sidebar shows, or is on its way (the Toggle sidebar tooltip says
     /// what a click does).
     pub sidebar_shown: bool,
@@ -120,9 +94,6 @@ pub struct TabBarProps<'a> {
     /// ([`super::sidebar_reveal`]): the Toggle sidebar button shows as far as
     /// the sidebar is hidden.
     pub reveal: f32,
-    /// The search box fits beside the tabs ([`search_fits`]); otherwise the
-    /// magnifier button stands in for it.
-    pub search_fits: bool,
 }
 
 /// The project menu, as one frame draws it.
@@ -220,47 +191,6 @@ pub fn bar_fill(theme: &Theme) -> Hsla {
     theme.canvas.blend(theme.background)
 }
 
-/// How wide a tab lays out with a `label_w`-wide name: its padding, dot and
-/// gap around the name, up to [`TAB_MAX_W`]. (The ⌘N badges, shown only
-/// while ⌘ is held, don't count: holding ⌘ never swaps the search box.)
-pub fn tab_width(label_w: f32) -> f32 {
-    (TAB_PAD_LEFT + TAB_DOT + TAB_GAP + label_w + TAB_PAD_RIGHT).min(TAB_MAX_W)
-}
-
-/// The tabs' names as the bar sets them (Base/Medium), measured in
-/// `window`.
-pub fn label_widths(tabs: &[Tab], window: &Window) -> Vec<f32> {
-    let ty = Type::BaseMedium;
-    let mut face = font(style::UI_FAMILY);
-    face.weight = ty.weight();
-    tabs.iter()
-        .map(|tab| {
-            let run = TextRun {
-                len: tab.label.len(),
-                font: face.clone(),
-                color: gpui::black(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            let line = window.text_system().shape_line(tab.label.clone(), px(ty.size()), &[run], None);
-            f32::from(line.width).ceil()
-        })
-        .collect()
-}
-
-/// Whether the search box fits in a `bar_w`-wide bar beside tabs whose names
-/// are `label_widths` wide, the sidebar `reveal`ed this far: everything from
-/// the bar's lead (and the Toggle sidebar's room while the sidebar is
-/// hidden) through the tabs, their rules and the `+` tab, then
-/// [`SEARCH_MIN_GAP`], the box and its [`SEARCH_RIGHT`].
-pub fn search_fits(bar_w: f32, label_widths: &[f32], reveal: f32) -> bool {
-    let hidden = 1.0 - reveal.clamp(0.0, 1.0);
-    let tabs: f32 = label_widths.iter().map(|&w| tab_width(w) + 1.0).sum();
-    let needed = LEAD_X + TOGGLE_ROOM * hidden + 1.0 + tabs + PLUS_W + 1.0 + SEARCH_MIN_GAP + SEARCH_W + SEARCH_RIGHT;
-    needed <= bar_w
-}
-
 /// A 1pt full-height rule between tabs.
 fn rule(theme: &Theme) -> Div {
     div().flex_none().w(px(1.0)).h(px(TAB_BAR_H)).bg(theme.divider)
@@ -330,104 +260,8 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
                 .h(px(TAB_BAR_H))
                 .children(strip),
         )
-        .child(
-            div()
-                .flex()
-                .flex_none()
-                .items_center()
-                .h(px(TAB_BAR_H))
-                .pl(px(SEARCH_RIGHT))
-                .pr(px(SEARCH_RIGHT))
-                .child(if props.search_fits {
-                    search_box(props.palette_chord, theme, cx)
-                } else {
-                    search_button(props.palette_chord, theme, cx)
-                }),
-        )
         .children(menu)
         .into_any_element()
-}
-
-/// The search box (2829:26790): Heroicons `magnifying-glass`, "Search"
-/// (Base on a 22pt line, muted), and at its right end the palette's chord in
-/// a key cap (Source Code Pro 12 / 16, muted, 8pt either side, 3pt
-/// corners), on `surface/depth-20` (the overlay fill, `background`) with
-/// 6pt corners. Not a text field: a
-/// click opens the command palette. The fill deepens on hover and press and
-/// the magnifier goes loud, as the toolbar buttons do. No tooltip: the box
-/// already shows its label and chord (only the collapsed button has one).
-fn search_box<H: SidebarHost>(chord: &str, theme: &Theme, cx: &mut Context<H>) -> Stateful<Div> {
-    const ID: &str = "tab-bar-search";
-    let radius = px(SEARCH_RADIUS);
-    let loud = theme.text_loud;
-    let d = div()
-        .id(ID)
-        .debug_selector(|| ID.into())
-        .group(ID)
-        .flex()
-        .flex_row()
-        .flex_none()
-        .items_center()
-        .gap(px(SEARCH_GAP))
-        .w(px(SEARCH_W))
-        .h(px(SEARCH_H))
-        .pl(px(SEARCH_PAD_LEFT))
-        .pr(px(SEARCH_PAD_RIGHT))
-        .rounded(radius)
-        .cursor_pointer();
-    let cap = (!chord.is_empty()).then(|| {
-        div()
-            .debug_selector(|| "tab-bar-search-chord".into())
-            .flex_none()
-            .px(px(8.0))
-            .rounded(px(3.0))
-            .font_family(PRIMARY_FAMILY)
-            .text_size(px(12.0))
-            .line_height(px(16.0))
-            .text_color(theme.muted)
-            .child(chord.to_string())
-    });
-    fill_layer(
-        d,
-        ID,
-        radius,
-        [theme.background, theme.background_hover, theme.background_active],
-    )
-    .child(
-        div()
-            .flex()
-            .flex_row()
-            .flex_1()
-            .min_w_0()
-            .items_center()
-            .gap(px(SEARCH_GAP))
-            .child(
-                heroicon(icons::MAGNIFYING_GLASS)
-                    .flex_none()
-                    .text_color(theme.icon)
-                    .group_hover(ID, move |s| s.text_color(loud)),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "tab-bar-search-label".into())
-                    .truncate()
-                    .type_style(Type::Base)
-                    .line_height(px(22.0))
-                    .text_color(theme.muted)
-                    .child("Search"),
-            ),
-    )
-    .children(cap)
-    .on_click(cx.listener(|this, _, window, cx| this.sidebar_event(SidebarEvent::OpenSearch, window, cx)))
-}
-
-/// The search box collapsed (no room beside the tabs): a 32pt toolbar
-/// button with the magnifier, as the header rows' buttons draw it, opening
-/// the palette; its tooltip names the chord.
-fn search_button<H: SidebarHost>(chord: &str, theme: &Theme, cx: &mut Context<H>) -> Stateful<Div> {
-    sidebar::toolbar_button("tab-bar-search-button", heroicon(icons::MAGNIFYING_GLASS), theme)
-        .tooltip(style::tooltip(sidebar::search_tip(chord)))
-        .on_click(cx.listener(|this, _, window, cx| this.sidebar_event(SidebarEvent::OpenSearch, window, cx)))
 }
 
 /// One project's tab: its dot (an `×` while hovered), its name, and its ⌘N
@@ -642,42 +476,6 @@ mod tests {
     #[test]
     fn the_tabs_keep_figmas_gap_past_the_lights() {
         assert_eq!(LEAD_X, 96.0, "the real lights end at 79, Figma's 17pt past them");
-    }
-
-    #[test]
-    fn the_search_box_fill_is_surface_depth_20() {
-        // `surface/depth-20` is the overlay fill (`button/default/background`):
-        // Slate/400 (#acb4cf) at 18% in Dark and 12% in Light, not
-        // `stroke/medium`'s 20%.
-        for (pref, appearance, alpha) in [
-            (shelbi_state::ThemePreference::Dark, gpui::WindowAppearance::Dark, 0.18),
-            (shelbi_state::ThemePreference::Light, gpui::WindowAppearance::Light, 0.12),
-        ] {
-            let theme = Theme::resolve(pref, appearance);
-            let fill = theme.background.to_rgb();
-            assert!((fill.a - alpha).abs() < 0.01, "{pref:?} {fill:?}");
-            let (r, g, b) = (fill.r * 255.0, fill.g * 255.0, fill.b * 255.0);
-            assert!((r - 172.0).abs() < 1.5 && (g - 180.0).abs() < 1.5 && (b - 207.0).abs() < 1.5, "{r} {g} {b}");
-            assert_ne!(theme.background, theme.divider_strong, "{pref:?}: not stroke/medium");
-        }
-    }
-
-    #[test]
-    fn the_search_box_fits_until_the_tabs_reach_it() {
-        // Everything but the tabs: the lead, the first rule, the `+` tab and
-        // its rule, the gap, the box and its 10pt.
-        let fixed = LEAD_X + 1.0 + PLUS_W + 1.0 + SEARCH_MIN_GAP + SEARCH_W + SEARCH_RIGHT;
-        let tab = tab_width(60.0) + 1.0;
-        let bar = fixed + 3.0 * tab;
-        assert!(search_fits(bar, &[60.0; 3], 1.0), "three tabs fill it exactly");
-        assert!(!search_fits(bar, &[60.0; 4], 1.0), "a fourth doesn't fit");
-        assert!(search_fits(bar + tab, &[60.0; 4], 1.0), "a wider window does");
-        assert!(!search_fits(bar, &[61.0, 60.0, 60.0], 1.0), "a longer name");
-        // While the sidebar is hidden the Toggle sidebar's room counts too.
-        assert!(!search_fits(bar, &[60.0; 3], 0.0));
-        assert!(search_fits(bar + TOGGLE_ROOM, &[60.0; 3], 0.0));
-        // A long name counts only up to the widest a tab grows.
-        assert_eq!(tab_width(10_000.0), TAB_MAX_W);
     }
 
     #[test]

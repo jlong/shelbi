@@ -163,8 +163,7 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (Icon, Hsla) {
 }
 
 /// The palette-open chord the Mac app shows as its hint, as macOS spells it:
-/// the footer's close chord, the tab bar's search box and the header Search
-/// tooltips all read it.
+/// the footer's close chord and the header rows' Search tooltips read it.
 ///
 /// A ⌘ chord the user binds to `open_palette` wins, as the Mac convention.
 /// While `open_palette` keeps its built-in chords (`ctrl-p`, the TUI's) the

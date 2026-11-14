@@ -359,8 +359,8 @@ paths on every `cargo test`.
   another way (a done dependency gets a `✓`).
 - **The first-run hint** ("Ctrl+P palette · type E to edit settings") is the
   TUI's onboarding copy in `SidebarModel.status_line`; it is claimed once per
-  machine, so the desktop leaves it to the TUI and shows its palette chord in
-  the sidebar's search box instead.
+  machine, so the desktop leaves it to the TUI and names its palette chord in
+  the tooltip of the Search button in the sidebar's header row instead.
 - **Links**: the desktop's review URLs are clickable; the TUI prints them.
 - **A decision leaves the review at once** in both clients: Approve or Reject
   returns to the view the review was opened over (the Orchestrator if that was

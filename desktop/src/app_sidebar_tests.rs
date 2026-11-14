@@ -148,11 +148,10 @@ fn the_zen_pill_toggles_zen(cx: &mut TestAppContext) {
 #[gpui::test]
 fn search_opens_the_palette_and_the_header_toggles_the_sidebar(cx: &mut TestAppContext) {
     let mut h = open(cx);
-    // The tab bar's search box opens the palette (the sidebar's header has
-    // no Search of its own).
-    assert!(h.cx.debug_bounds("sidebar-search").is_none());
-    h.click_selector("tab-bar-search");
-    assert!(h.window.read_with(&h.cx, |w, _| w.overlay.is_some()), "the search box opens the palette");
+    // The header's Search opens the palette (the tab bar has none).
+    assert!(h.cx.debug_bounds("tab-bar-search").is_none());
+    h.click_selector("sidebar-search");
+    assert!(h.window.read_with(&h.cx, |w, _| w.overlay.is_some()), "Search opens the palette");
     h.window.update(&mut h.cx, |w, cx| {
         w.overlay = None;
         cx.notify();
