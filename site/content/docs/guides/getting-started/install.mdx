@@ -17,9 +17,9 @@ brew install jlong/shelbi/shelbi && shelbi
 Every time it starts, `shelbi` first checks the tools it depends on: `git`,
 `gh`, a coding agent (`claude` or `codex`) and, on macOS, `brew`. When they are
 all installed you never see the check. When one is missing, a screen lists it
-with the command to install it (`c` copies it), lets you point Shelbi at a copy
-installed outside your `PATH` (`l`), and checks again (`r`) once you have
-installed it. You can skip it (`s`), and Shelbi checks again on the next start.
+with the command to install it (`c` copies it; run it in another terminal),
+lets you point Shelbi at a copy installed outside your `PATH` (`b`, **Browse…**),
+and checks again (`r`) once you have installed it. You can skip it (`s`), and Shelbi checks again on the next start.
 
 On a fresh machine, `shelbi` opens the **Welcome to Shelbi** launch screen,
 with **Add project** and **Connect to remote**. **Add project** asks the same
@@ -46,8 +46,9 @@ inside the repository. See
 Each time it starts, the app also checks the command-line tools Shelbi depends
 on: `git`, `gh`, a coding agent (Claude Code or Codex) and `brew`. When one is
 missing, a window lists it with the command to install it and a **Copy**
-button, and **Locate…** points Shelbi at a copy installed outside your `PATH`.
-**Check again** looks once more after you install it; **Skip for now** carries
+button. Open the Terminal app (in Applications ▸ Utilities), paste the command
+and press Return. **Browse…** points Shelbi at a copy installed outside your
+`PATH`. **Check again** looks once more after you install it; **Skip for now** carries
 on, and Shelbi checks again the next time it starts.
 
 </Desktop>

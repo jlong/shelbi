@@ -96,7 +96,9 @@ fn missing_tools_show_rows_commands_and_keys() {
     assert!(s.contains("✕ GitHub CLI"), "{s}");
     assert!(s.contains("brew install gh"), "{s}");
     assert!(s.contains("brew install --cask claude-code") && s.contains("brew install --cask codex"), "{s}");
-    assert!(s.contains("Locate gh…"), "{s}");
+    assert!(s.contains(model::MISSING_BODY_TUI_MAC), "{s}");
+    assert!(s.contains("b Browse…") && !s.contains("Locate"), "{s}");
+    assert!(s.contains("b Browse   r Check again"), "the footer names the same key: {s}");
     assert!(s.contains("Skip for now") && s.contains("Check again"), "{s}");
     assert!(s.contains("c Copy") && s.contains("s Skip"), "{s}");
 }
@@ -182,7 +184,7 @@ fn locate_validates_the_path_and_shows_the_version() {
     let (mut app, _) = app(probe);
     settle(&mut app);
     key(&mut app, KeyCode::Down);
-    key(&mut app, KeyCode::Char('l'));
+    key(&mut app, KeyCode::Char('b'));
     assert_eq!(app.model().locating(), Some(Tool::GithubCli));
     for c in "/nope".chars() {
         key(&mut app, KeyCode::Char(c));

@@ -43,9 +43,21 @@ mod tests;
 pub const CHECKING_TITLE: &str = "Checking your tools";
 pub const CHECKING_BODY: &str = "Shelbi uses a few command-line tools. This only takes a moment.";
 pub const MISSING_TITLE: &str = "A few tools are missing";
-pub const MISSING_BODY: &str = "Install them with the commands below, then check again.";
 pub const MISSING_ONE_TITLE: &str = "A tool is missing";
-pub const MISSING_ONE_BODY: &str = "Install it with the command below, then check again.";
+
+// The Missing screen's line says where the install commands go, once (the
+// rows don't repeat it): the Terminal app beside the Mac desktop app, any
+// terminal beside the Linux one, another terminal beside the TUI (which is
+// using this one). A Linux row may offer a package manager or a guide rather
+// than a command, so Linux reads "as shown below".
+pub const MISSING_BODY_MAC: &str = "Open the Terminal app, run the commands below, then check again.";
+pub const MISSING_ONE_BODY_MAC: &str = "Open the Terminal app, run the command below, then check again.";
+pub const MISSING_BODY_LINUX: &str = "Install them from a terminal as shown below, then check again.";
+pub const MISSING_ONE_BODY_LINUX: &str = "Install it from a terminal as shown below, then check again.";
+pub const MISSING_BODY_TUI_MAC: &str = "Run the commands below in another terminal, then check again.";
+pub const MISSING_ONE_BODY_TUI_MAC: &str = "Run the command below in another terminal, then check again.";
+pub const MISSING_BODY_TUI_LINUX: &str = "Install them from another terminal as shown below, then check again.";
+pub const MISSING_ONE_BODY_TUI_LINUX: &str = "Install it from another terminal as shown below, then check again.";
 pub const READY_TITLE: &str = "Your tools are ready";
 pub const READY_BODY_MAC: &str = "Shelbi found everything it needs on this Mac.";
 pub const READY_BODY_LINUX: &str = "Shelbi found everything it needs on this machine.";
@@ -59,6 +71,8 @@ pub const CHECK_AGAIN: &str = "Check again";
 pub const CONTINUE: &str = "Continue";
 pub const COPY: &str = "Copy";
 pub const COPIED: &str = "Copied";
+/// A missing row's button that opens its Locate panel, and the panel's
+/// file-picker button.
 pub const BROWSE: &str = "Browse…";
 pub const LOCATE_PROMPT: &str = "Already installed somewhere else?";
 
@@ -95,6 +109,32 @@ impl Platform {
         } else {
             Platform::Linux
         }
+    }
+}
+
+/// Which client shows the screen, which decides where the Missing screen says
+/// to run the install commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Client {
+    /// The desktop app: the user opens a terminal for them.
+    Desktop,
+    /// The TUI: the user is in a terminal, but Shelbi is using it.
+    Tui,
+}
+
+/// The Missing screen's line under the heading: where to run the install
+/// commands, for `count` missing tools.
+pub fn missing_body(platform: Platform, client: Client, count: usize) -> &'static str {
+    let one = count == 1;
+    match (client, platform, one) {
+        (Client::Desktop, Platform::Mac, false) => MISSING_BODY_MAC,
+        (Client::Desktop, Platform::Mac, true) => MISSING_ONE_BODY_MAC,
+        (Client::Desktop, Platform::Linux, false) => MISSING_BODY_LINUX,
+        (Client::Desktop, Platform::Linux, true) => MISSING_ONE_BODY_LINUX,
+        (Client::Tui, Platform::Mac, false) => MISSING_BODY_TUI_MAC,
+        (Client::Tui, Platform::Mac, true) => MISSING_ONE_BODY_TUI_MAC,
+        (Client::Tui, Platform::Linux, false) => MISSING_BODY_TUI_LINUX,
+        (Client::Tui, Platform::Linux, true) => MISSING_ONE_BODY_TUI_LINUX,
     }
 }
 
@@ -148,12 +188,10 @@ impl Tool {
         }
     }
 
-    /// The Locate button's label.
-    pub fn locate_label(self) -> String {
-        match self {
-            Tool::Agent => "Locate…".to_string(),
-            tool => format!("Locate {}…", tool.binaries()[0].command()),
-        }
+    /// The label of the button that opens the row's Locate panel: the
+    /// same for every row (the panel names the executable).
+    pub fn locate_label(self) -> &'static str {
+        BROWSE
     }
 
     /// What the Locate panel asks for.
@@ -175,7 +213,8 @@ impl Tool {
         }
     }
 
-    /// Why a missing row is missing and what to do, over its commands.
+    /// Why a missing row is missing and what to do, over its commands. It
+    /// never says where to run them: the screen's line does ([`missing_body`]).
     /// `brew_missing`: Homebrew is missing too, so a brew command can't run
     /// yet.
     pub fn missing_detail(self, platform: Platform, brew_missing: bool) -> &'static str {
@@ -187,7 +226,7 @@ impl Tool {
                 "Not found on your PATH. Install git with your package manager, then check again."
             }
             (Tool::Homebrew, _) => {
-                "Shelbi installs the other tools with Homebrew. Install Git first, then run this in Terminal."
+                "Shelbi installs the other tools with Homebrew. Install Git first, then run:"
             }
             (Tool::GithubCli, Platform::Mac) if brew_missing => "Needs Homebrew. Install Homebrew above, then run:",
             (Tool::GithubCli, Platform::Mac) => "Not found on your PATH. Install it with Homebrew, then check again.",
@@ -345,6 +384,7 @@ pub enum Phase {
 #[derive(Debug, Clone)]
 pub struct Prereqs {
     platform: Platform,
+    client: Client,
     /// One per tool that applies, in [`Tool::CHECK_ORDER`].
     rows: Vec<(Tool, RowState)>,
     run: u64,
@@ -355,7 +395,7 @@ pub struct Prereqs {
 
 impl Prereqs {
     /// Every row Pending.
-    pub fn new(platform: Platform) -> Self {
+    pub fn new(platform: Platform, client: Client) -> Self {
         let rows = Tool::CHECK_ORDER
             .into_iter()
             .filter(|t| t.applies(platform))
@@ -363,6 +403,7 @@ impl Prereqs {
             .collect();
         Prereqs {
             platform,
+            client,
             rows,
             run: 0,
             locate: None,
@@ -463,8 +504,7 @@ impl Prereqs {
             Phase::Checking => CHECKING_BODY,
             Phase::Ready if self.platform == Platform::Mac => READY_BODY_MAC,
             Phase::Ready => READY_BODY_LINUX,
-            Phase::Missing if self.missing().len() == 1 => MISSING_ONE_BODY,
-            Phase::Missing => MISSING_BODY,
+            Phase::Missing => missing_body(self.platform, self.client, self.missing().len()),
         }
     }
 

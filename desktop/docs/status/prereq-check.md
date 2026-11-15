@@ -15,7 +15,7 @@ order, the checks and the skip confirmation's list; the desktop
 ```
  ● ● ●
                   A few tools are missing
-      Install them with the commands below, then check again.
+   Open the Terminal app, run the commands below, then check again.
  ┌──────────────────────────────────────────────────────────┐ ▐
  │ ✓ Git                              2.39.5 · /usr/bin/git │ ▐
  └──────────────────────────────────────────────────────────┘ ▐
@@ -26,7 +26,7 @@ order, the checks and the skip confirmation's list; the desktop
  │   ┌────────────────────────────────────────────┬────────┐│
  │   │ brew install gh                            │ ⧉ Copy ││
  │   └────────────────────────────────────────────┴────────┘│
- │   Already installed somewhere else?  Locate gh…          │
+ │   Already installed somewhere else?  [Browse…]           │
  ░░░░░░░░░░░░░░░░░░ fade to background ░░░░░░░░░░░░░░░░░░░░
                                  [Skip for now] [Check again]
 ```
@@ -72,10 +72,27 @@ needs the Command Line Tools and installs the rest). Linux has no Homebrew
 row, shows "install with your package manager" for Git, GitHub's install
 guide for `gh`, and `npm install -g` for the agents.
 
+## Where to run the commands
+
+The line under the heading says it once, so no row repeats it
+(`prereqs::missing_body`, by client and platform):
+
+| Client | macOS | Linux |
+|---|---|---|
+| Desktop | Open the Terminal app, run the commands below, then check again. | Install them from a terminal as shown below, then check again. |
+| TUI | Run the commands below in another terminal, then check again. | Install them from another terminal as shown below, then check again. |
+
+Only the Mac app names the Terminal app; the TUI's user is in a terminal
+Shelbi is using, and a Linux desktop's terminal has no one name. Linux reads
+"as shown below" because its Git row names a package manager and its GitHub
+CLI row a guide, not a command. One missing tool reads "it" and "the
+command".
+
 ## Locate
 
-Locate… (desktop: the path field with Browse…, a native open panel; TUI:
-`l`, a path field, Return) checks the path: an executable file whose
+Every missing row's **Browse…** (desktop: a Default-style button, the path
+field with its own Browse…, a native open panel; TUI: `b`, a path field,
+Return) checks the path: an executable file whose
 `--version` succeeds. A good one shows "<bin> version X" in green, counts as
 found, and is saved to `config.yaml`:
 

@@ -67,7 +67,7 @@ fn full_mac() -> Fake {
 }
 
 fn checked(platform: Platform, probe: &dyn Probe, located: &ToolPaths) -> Prereqs {
-    let mut p = Prereqs::new(platform);
+    let mut p = Prereqs::new(platform, Client::Desktop);
     let run = p.begin_check();
     run_check(run, located, platform, probe, |e| {
         p.apply(e);
@@ -130,7 +130,7 @@ fn missing_rows_are_listed_in_display_order_with_consequences() {
     let p = checked(Platform::Mac, &probe, &ToolPaths::default());
     assert_eq!(p.phase(), Phase::Missing);
     assert_eq!(p.missing(), [Tool::GithubCli, Tool::Agent]);
-    assert_eq!(p.title(), MISSING_TITLE);
+    assert_eq!((p.title(), p.body()), (MISSING_TITLE, MISSING_BODY_MAC));
     assert_eq!(
         p.consequences(),
         [
@@ -147,7 +147,7 @@ fn missing_rows_are_listed_in_display_order_with_consequences() {
 #[test]
 fn one_missing_tool_reads_singular() {
     let probe = full_mac();
-    let mut p = Prereqs::new(Platform::Mac);
+    let mut p = Prereqs::new(Platform::Mac, Client::Desktop);
     let run = p.begin_check();
     run_check(run, &ToolPaths::default(), Platform::Mac, &probe, |mut e| {
         if e.tool == Tool::GithubCli && e.state != RowState::Checking {
@@ -155,7 +155,7 @@ fn one_missing_tool_reads_singular() {
         }
         p.apply(e);
     });
-    assert_eq!((p.title(), p.body()), (MISSING_ONE_TITLE, MISSING_ONE_BODY));
+    assert_eq!((p.title(), p.body()), (MISSING_ONE_TITLE, MISSING_ONE_BODY_MAC));
     assert_eq!(p.skip_copy(), (SKIP_TITLE_ONE, SKIP_BODY_ONE, SKIP_FOOTER_ONE));
 }
 
@@ -255,7 +255,7 @@ fn checks_report_each_row_starting_then_finishing() {
 
 #[test]
 fn a_new_run_drops_the_old_runs_stragglers() {
-    let mut p = Prereqs::new(Platform::Mac);
+    let mut p = Prereqs::new(Platform::Mac, Client::Desktop);
     let old = p.begin_check();
     assert_eq!(p.phase(), Phase::Checking);
     let new = p.begin_check();
@@ -373,11 +373,59 @@ fn paths_show_home_as_tilde() {
 }
 
 #[test]
+fn the_missing_line_says_where_to_run_the_commands() {
+    // The Mac desktop app names the Terminal app; nothing else claims one.
+    assert_eq!(missing_body(Platform::Mac, Client::Desktop, 2), "Open the Terminal app, run the commands below, then check again.");
+    assert_eq!(missing_body(Platform::Mac, Client::Desktop, 1), "Open the Terminal app, run the command below, then check again.");
+    assert_eq!(missing_body(Platform::Mac, Client::Tui, 2), "Run the commands below in another terminal, then check again.");
+    assert_eq!(missing_body(Platform::Linux, Client::Desktop, 1), "Install it from a terminal as shown below, then check again.");
+    assert_eq!(missing_body(Platform::Linux, Client::Tui, 3), "Install them from another terminal as shown below, then check again.");
+    for platform in [Platform::Mac, Platform::Linux] {
+        for client in [Client::Desktop, Client::Tui] {
+            for count in [1, 2] {
+                let body = missing_body(platform, client, count);
+                let app = platform == Platform::Mac && client == Client::Desktop;
+                assert_eq!(body.contains("Terminal app"), app, "{body}");
+                assert!(body.contains("erminal"), "every line says where: {body}");
+                assert!(!body.contains('—'), "{body}");
+            }
+        }
+    }
+    // The rows never repeat where (the line above them says it once).
+    for platform in [Platform::Mac, Platform::Linux] {
+        for tool in Tool::CHECK_ORDER {
+            for brew_missing in [false, true] {
+                let detail = tool.missing_detail(platform, brew_missing);
+                assert!(!detail.to_lowercase().contains("terminal"), "{detail}");
+            }
+        }
+    }
+    assert_eq!(
+        Tool::Homebrew.missing_detail(Platform::Mac, false),
+        "Shelbi installs the other tools with Homebrew. Install Git first, then run:"
+    );
+}
+
+#[test]
+fn the_tui_line_points_at_another_terminal() {
+    let mut p = Prereqs::new(Platform::Mac, Client::Tui);
+    let run = p.begin_check();
+    run_check(run, &ToolPaths::default(), Platform::Mac, &full_mac(), |mut e| {
+        if e.tool == Tool::GithubCli && e.state != RowState::Checking {
+            e.state = RowState::Missing;
+        }
+        p.apply(e);
+    });
+    assert_eq!(p.body(), MISSING_ONE_BODY_TUI_MAC);
+}
+
+#[test]
 fn locate_copy() {
-    assert_eq!(Tool::GithubCli.locate_label(), "Locate gh…");
-    assert_eq!(Tool::Git.locate_label(), "Locate git…");
-    assert_eq!(Tool::Homebrew.locate_label(), "Locate brew…");
-    assert_eq!(Tool::Agent.locate_label(), "Locate…");
+    // Every row's button reads Browse…, the agent's too: the panel names
+    // the executable.
+    for tool in Tool::CHECK_ORDER {
+        assert_eq!(tool.locate_label(), "Browse…");
+    }
     assert_eq!(Tool::GithubCli.locate_body(), "Choose the gh executable. Shelbi remembers this location.");
 }
 

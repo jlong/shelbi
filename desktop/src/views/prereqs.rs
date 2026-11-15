@@ -6,8 +6,9 @@
 //! The shared [`shelbi_app::prereqs`] model in the wizard's 800 × 580
 //! window: a row per tool Shelbi depends on (Git, GitHub CLI, a coding
 //! agent, Homebrew), found ones compact with their version and path, missing
-//! ones with what to do, the install command(s) to copy and Locate… for a
-//! binary outside the login `PATH`. The list scrolls inside the window,
+//! ones with what to do, the install command(s) to copy and Browse… (the
+//! Locate panel) for a binary outside the login `PATH`. The line under the
+//! heading says where to run the commands (the Terminal app, on a Mac). The list scrolls inside the window,
 //! clipped above the actions with a fade into the window and a scrollbar;
 //! the window never grows and the actions never move.
 //!
@@ -35,7 +36,7 @@ use gpui::{
 };
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use shelbi_app::prereqs::{
-    self as model, CheckEvent, Found, InstallCommand, Phase, Platform, Prereqs, Probe, RowState, SystemProbe, Tool,
+    self as model, CheckEvent, Client, Found, InstallCommand, Phase, Platform, Prereqs, Probe, RowState, SystemProbe, Tool,
     ToolPaths,
 };
 
@@ -180,7 +181,7 @@ impl PrereqsView {
         theme::window::apply_to(window, cx);
         let (path_input, subscription) = Self::path_field("", window, cx);
         let mut this = PrereqsView {
-            model: Prereqs::new(deps.platform),
+            model: Prereqs::new(deps.platform, Client::Desktop),
             deps,
             focus,
             window: window.window_handle(),
@@ -543,7 +544,7 @@ impl PrereqsView {
                 style::button(
                     format!("prereq-locate-{tool:?}"),
                     tool.locate_label(),
-                    ButtonKind::Ghost,
+                    ButtonKind::Secondary,
                     ButtonSize::Small,
                     false,
                     theme,

@@ -151,6 +151,8 @@ fn locate_checks_the_path_and_remembers_it(cx: &mut TestAppContext) {
     let mut probe = FakeProbe::new(&[GIT, BREW, CLAUDE]);
     probe.exes.insert("/Users/me/tools/gh".into(), Ok("gh version 2.62.0".into()));
     let mut r = rig_on(cx, probe);
+    // The Mac app names the Terminal app, once, over the rows.
+    assert_eq!(r.view.read_with(&r.cx, |v, _| v.model().body()), model::MISSING_ONE_BODY_MAC);
     r.click("prereq-locate-GithubCli");
     assert!(r.drawn("prereq-locate-path"));
     let input = r.view.read_with(&r.cx, |v, _| v.path_input.clone());

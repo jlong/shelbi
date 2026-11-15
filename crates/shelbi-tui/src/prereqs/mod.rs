@@ -4,14 +4,14 @@
 //!
 //! ```text
 //!                     A few tools are missing
-//!      Install them with the commands below, then check again.
+//!  Run the commands below in another terminal, then check again.
 //!
 //!   ✓ Git                                  2.39.5 · /usr/bin/git
 //!
 //! › ✕ GitHub CLI
 //!     Not found on your PATH. Install it with Homebrew, then check again.
 //!     brew install gh                                     c Copy
-//!     Already installed somewhere else?  l Locate gh…
+//!     Already installed somewhere else?  b Browse…
 //!                                                                  ┃
 //!   ✕ Coding agent                                                 │
 //!     Shelbi runs your agents with Claude Code or Codex. …         │
@@ -19,16 +19,16 @@
 //!                                   ▄▄▄▄▄▄▄▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄▄▄▄▄▄▄
 //!                                     Skip for now   Check again
 //!                                   ▀▀▀▀▀▀▀▀▀▀▀▀▀▀ ▀▀▀▀▀▀▀▀▀▀▀▀▀
-//!   ↑↓ Move   c Copy   l Locate   r Check again   s Skip   Esc Quit
+//!   ↑↓ Move   c Copy   b Browse   r Check again   s Skip   Esc Quit
 //! ```
 //!
 //! The keyboard moves between the rows (and, in a missing coding-agent row,
 //! between its Claude Code and Codex commands); the list scrolls to keep the
 //! selection in view, with a scrollbar when it doesn't fit. `c` copies the
 //! selected command (OSC 52, and `pbcopy` on macOS, as the shell copies) and
-//! the line reads "Copied" for two seconds. `l` opens the row's path field;
-//! Return checks the path (`<bin> --version`) and remembers a good one in
-//! `config.yaml`. `r` checks again, `s` asks to skip (`y`/Return skips, Esc
+//! the line reads "Copied" for two seconds. `b` (the row's Browse…) opens its
+//! path field; Return checks the path (`<bin> --version`) and remembers a
+//! good one in `config.yaml`. `r` checks again, `s` asks to skip (`y`/Return skips, Esc
 //! goes back), Return continues once everything is found. Esc, `q` or
 //! Ctrl+C leaves `shelbi`.
 
@@ -54,7 +54,7 @@ use ratatui::{
 };
 use shelbi_app::overlay::error_log::wrap;
 use shelbi_app::prereqs::{
-    self as model, CheckEvent, Found, InstallCommand, Phase, Platform, Prereqs, Probe, RowState, SystemProbe, Tool,
+    self as model, CheckEvent, Client, Found, InstallCommand, Phase, Platform, Prereqs, Probe, RowState, SystemProbe, Tool,
     ToolPaths,
 };
 
@@ -158,7 +158,7 @@ impl PrereqApp {
     /// The screen, its first check already running.
     pub fn new(platform: Platform, probe: Arc<dyn Probe>, located: ToolPaths, home: Option<PathBuf>) -> Self {
         let mut app = PrereqApp {
-            model: Prereqs::new(platform),
+            model: Prereqs::new(platform, Client::Tui),
             probe,
             located,
             home,
@@ -366,7 +366,7 @@ impl PrereqApp {
             KeyCode::PageDown => self.scroll += 5,
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(5),
             KeyCode::Char('c') => self.copy(),
-            KeyCode::Char('l') => {
+            KeyCode::Char('b') => {
                 if let Some(stop) = self.focused() {
                     if matches!(self.model.state(stop.tool), RowState::Missing) {
                         self.model.start_locate(stop.tool);
@@ -504,7 +504,7 @@ impl PrereqApp {
             lines.push(Line::from(vec![
                 indent(),
                 Span::styled(format!("{}  ", model::LOCATE_PROMPT), Style::default().fg(p.muted)),
-                Span::styled("l ", Style::default().fg(p.cyan)),
+                Span::styled("b ", Style::default().fg(p.cyan)),
                 Span::styled(tool.locate_label(), Style::default().fg(p.white)),
             ]));
         }
@@ -556,7 +556,7 @@ impl PrereqApp {
         }
         match self.model.phase() {
             Phase::Checking => "Esc Quit",
-            Phase::Missing => "↑↓ Move   c Copy   l Locate   r Check again   s Skip   Esc Quit",
+            Phase::Missing => "↑↓ Move   c Copy   b Browse   r Check again   s Skip   Esc Quit",
             Phase::Ready => "⏎ Continue   r Check again   Esc Quit",
         }
     }
