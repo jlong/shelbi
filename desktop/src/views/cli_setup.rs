@@ -2,10 +2,12 @@
 //! 2478:8507, "CLI Install" 2480:8522, "CLI Ready" 2480:8577): the
 //! unnumbered screens before the Add Project wizard's 01.
 //!
-//! A first launch (no window to restore, `main`) opens this window at the
-//! wizard's 800 × 580. It runs bootstrap ([`crate::platform::Bootstrap`]),
-//! which finds the CLI or, when there is none, installs the release matching
-//! the app (`platform::install`), then starts the daemon and checks the
+//! A first launch (no window to restore, `main`) opens the startup
+//! requirements check ([`super::prereqs`]) in the wizard's 800 × 580 window,
+//! which becomes this view once the tools check out ([`replace_root`]).
+//! It runs bootstrap ([`crate::platform::Bootstrap`]), which finds the CLI
+//! or, when there is none, installs the release matching the app
+//! (`platform::install`), then starts the daemon and checks the
 //! control connection, and shows where it is: "Checking for Shelbi CLI…",
 //! "Installing CLI…" (once an install starts), "Ready" with the bar full
 //! only once bootstrap reached `Ready`. Ready advances by itself: with no
@@ -35,7 +37,7 @@ use crate::platform::version::APP_VERSION;
 use crate::platform::{relaunch, Bootstrap, BootstrapEvent, BootstrapState, SystemPlatform};
 use crate::theme::style::{self, Type, Typography};
 use crate::theme::{self, Theme};
-use crate::views::add_project::{self, SIZE};
+use crate::views::add_project;
 use crate::views::bootstrap::{self as boot_view, ScreenAction};
 use crate::window_state::LaunchWindow;
 
@@ -154,18 +156,12 @@ fn go(next: Next, handle: AnyWindowHandle, cx: &mut App) {
     }
 }
 
-/// Open the setup window (the first launch).
-pub fn show(cx: &mut App) {
-    let opened = cx.open_window(super::about::options("Shelbi", SIZE, false, cx), |window, cx| {
-        cx.new(|cx| CliSetupView::new(Deps::real(), window, cx))
-    });
-    match opened {
-        Ok(handle) => {
-            add_project::opened(handle.into(), cx);
-            cx.activate(true);
-        }
-        Err(e) => tracing::error!(error = %e, "could not open the setup window"),
-    }
+/// Make `window` (the first launch's requirements window, `prereqs`) the
+/// setup window: the same window, its root replaced.
+pub fn replace_root(window: &mut Window, cx: &mut App) {
+    window.set_window_title("Shelbi");
+    window.replace_root(cx, |window, cx| CliSetupView::new(Deps::real(), window, cx));
+    add_project::opened(window.window_handle(), cx);
 }
 
 /// The CLI setup screens.

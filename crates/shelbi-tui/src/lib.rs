@@ -21,6 +21,7 @@ mod machines;
 mod markdown;
 mod modal_form;
 pub mod overlay;
+pub mod prereqs;
 mod panel;
 mod picker;
 pub mod progress;

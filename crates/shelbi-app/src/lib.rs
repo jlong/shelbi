@@ -102,6 +102,7 @@ pub mod nav;
 pub mod new_project;
 pub mod onboarding;
 pub mod overlay;
+pub mod prereqs;
 pub mod reachability;
 pub mod refresh;
 pub mod remote_window;

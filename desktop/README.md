@@ -20,7 +20,9 @@ with the sidebar (its rows on ⌃1 to ⌃9), the Orchestrator chat, the Issues b
 detail, Activity, Machines, the Workspace view (an agent with a user shell
 beside it, local or remote), and the Review view; the command palette and the
 overlays (error log, load for review, reject, Zen intro); the Add Project
-wizard (what a first launch with no project opens, after its CLI check);
+wizard (what a first launch with no project opens, after its tools and CLI
+checks); the startup requirements check (git, gh, a coding agent, brew),
+which shows only when a tool is missing;
 native
 menus and system notifications. `scripts/bundle.sh` packages it as a signed,
 notarized `Shelbi.app`, shipped as the `shelbi-desktop` Homebrew cask. Each
@@ -284,6 +286,7 @@ Which subtask fills what:
 | `views/` workspace | `dt-workspace-view` |
 | `views/` review | `dt-review-view` |
 | native menus, notifications | `dt-menus-notifications` |
+| startup requirements check (`views/prereqs.rs` over `shelbi_app::prereqs`) | `prereq-check` |
 | first-launch CLI install (`platform/install.rs`) and its screens (`views/cli_setup.rs`) | `dt-wizard-cli-setup` |
 | bundle, signing, cask, update notice (`platform/update.rs`, `views/update.rs`) | `dt-packaging` |
 | smoke tests (`app_smoke.rs`), `docs/parity.md`, docs | `dt-parity-audit` |

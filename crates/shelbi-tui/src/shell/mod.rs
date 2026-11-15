@@ -7142,7 +7142,7 @@ fn read_snapshot(project: &str, _generation: u64) -> ShellSnapshot {
 /// Copy `text` to the clipboard. OSC 52 is the portable path (it works over SSH
 /// and through an outer tmux/Screen when configured); locally we also pipe to
 /// the native clipboard as a best-effort fallback.
-fn copy_to_clipboard(text: &str) {
+pub(crate) fn copy_to_clipboard(text: &str) {
     let mut out = io::stdout();
     let _ = out.write_all(&terminal_view::osc52(text));
     let _ = out.flush();
