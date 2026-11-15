@@ -605,26 +605,42 @@ fn quarter(h: &mut Harness, selector: &'static str, right: bool) -> gpui::Point<
     point(x, b.center().y)
 }
 
+/// Each tab's left edge as drawn, in `names`' order.
+fn lefts(h: &mut Harness, names: &[&'static str]) -> Vec<Pixels> {
+    names.iter().map(|n| bounds(h, n).left()).collect()
+}
+
 #[gpui::test]
-fn dragging_a_tab_moves_it_and_the_order_sticks(cx: &mut TestAppContext) {
+fn dragging_a_tab_opens_a_slot_where_it_lands_and_the_order_sticks(cx: &mut TestAppContext) {
     let mut h = open(cx, &["alpha", "beta", "gamma"], &["alpha", "beta", "gamma"]);
     h.take_calls();
-    // gamma over alpha's left half: the gap before alpha.
+    let names = ["tab-alpha", "tab-beta", "tab-gamma"];
+    let rest = lefts(&mut h, &names);
+    // A slot is its tab and the rule after it.
+    let slot = |h: &mut Harness, n: &'static str| bounds(h, n).size.width + px(1.0);
+    let gamma_w = slot(&mut h, "tab-gamma");
+    // gamma over alpha's left half: the gap before alpha. alpha and beta
+    // step right by gamma's slot; gamma's (empty) slot opens where alpha was.
     let to = quarter(&mut h, "tab-alpha", false);
     drag_tab(&mut h, "tab-gamma", to);
     assert!(drawn(&mut h, "tab-drag-ghost"), "a tab-shaped ghost follows the pointer");
     let ghost = bounds(&mut h, "tab-drag-ghost");
     assert_eq!(ghost.size.height, px(52.0), "the tab's height");
     assert!(ghost.contains(&to), "under the pointer");
-    let marker = bounds(&mut h, "tab-drop-marker");
-    assert_eq!(marker.left(), bounds(&mut h, "tab-alpha").left(), "on alpha's left edge");
-    assert_eq!(marker.size.width, px(2.0));
+    assert!(!drawn(&mut h, "tab-drop-marker"), "no insertion marker: the slot shows it");
+    assert_eq!(lefts(&mut h, &names), [rest[0] + gamma_w, rest[1] + gamma_w, rest[0]]);
+    let lifted = h.window.read_with(&h.cx, |w, _| w.tab_reorder.project().map(str::to_string));
+    assert_eq!(lifted.as_deref(), Some("gamma"));
     assert_eq!(order(&h), ["alpha", "beta", "gamma"], "nothing moves until the drop");
 
     release(&mut h, to);
     assert_eq!(order(&h), ["gamma", "alpha", "beta"], "the others keep their order");
     assert!(!drawn(&mut h, "tab-drag-ghost") && !drawn(&mut h, "tab-drop-marker"));
-    assert!(bounds(&mut h, "tab-gamma").left() < bounds(&mut h, "tab-alpha").left());
+    assert_eq!(
+        lefts(&mut h, &["tab-gamma", "tab-alpha", "tab-beta"]),
+        [rest[0], rest[0] + gamma_w, rest[1] + gamma_w],
+        "in the slot, nothing jumps"
+    );
     let saved = h.window.read_with(&h.cx, |w, _| w.window_state.tabs.clone());
     assert_eq!(saved, order(&h), "saved with the window's state");
     assert!(h.take_calls().is_empty(), "a drag doesn't switch to the tab");
@@ -637,8 +653,8 @@ fn dragging_a_tab_moves_it_and_the_order_sticks(cx: &mut TestAppContext) {
     // gamma over beta's right half: the gap after the last tab.
     let to = quarter(&mut h, "tab-beta", true);
     drag_tab(&mut h, "tab-gamma", to);
-    let marker = bounds(&mut h, "tab-drop-marker");
-    assert_eq!(marker.right(), bounds(&mut h, "tab-beta").right(), "on beta's right edge");
+    let beta = bounds(&mut h, "tab-beta");
+    assert_eq!(bounds(&mut h, "tab-gamma").left(), beta.right() + px(1.0), "the slot after beta");
     release(&mut h, to);
     assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
 
@@ -646,41 +662,44 @@ fn dragging_a_tab_moves_it_and_the_order_sticks(cx: &mut TestAppContext) {
     let plus = bounds(&mut h, "tab-plus");
     let past = point(plus.right() + px(60.0), plus.center().y);
     drag_tab(&mut h, "tab-alpha", past);
-    assert!(drawn(&mut h, "tab-drop-marker"));
+    assert_eq!(bounds(&mut h, "tab-beta").left(), rest[0], "beta steps into alpha's place");
     release(&mut h, past);
     assert_eq!(order(&h), ["beta", "gamma", "alpha"]);
 }
 
 #[gpui::test]
-fn a_drag_that_wouldnt_move_the_tab_shows_no_marker_and_changes_nothing(cx: &mut TestAppContext) {
+fn a_drag_that_wouldnt_move_the_tab_leaves_its_slot_in_place_and_changes_nothing(cx: &mut TestAppContext) {
     let mut h = open(cx, &["alpha", "beta", "gamma"], &["alpha", "beta", "gamma"]);
     h.take_calls();
+    let names = ["tab-alpha", "tab-beta", "tab-gamma"];
+    let rest = lefts(&mut h, &names);
     // Beside itself: its own halves, and its neighbors' near halves.
     for (over, right) in [("tab-beta", false), ("tab-beta", true), ("tab-alpha", true), ("tab-gamma", false)] {
         let to = quarter(&mut h, over, right);
         drag_tab(&mut h, "tab-beta", to);
         assert!(drawn(&mut h, "tab-drag-ghost"));
-        assert!(!drawn(&mut h, "tab-drop-marker"), "{over} right={right}: it would stay put");
+        assert_eq!(lefts(&mut h, &names), rest, "{over} right={right}: it would stay put");
         release(&mut h, to);
         assert_eq!(order(&h), ["alpha", "beta", "gamma"], "{over} right={right}");
     }
-    // Over the `+`: no gap, even after passing over one.
+    // Over the `+`: no gap, even after passing over one; the tabs go back.
     let plus = bounds(&mut h, "tab-plus").center();
     let before_alpha = quarter(&mut h, "tab-alpha", false);
     drag_tab(&mut h, "tab-gamma", before_alpha);
-    assert!(drawn(&mut h, "tab-drop-marker"));
+    assert_ne!(lefts(&mut h, &names), rest, "a slot opened before alpha");
     h.cx.simulate_mouse_move(plus, Some(MouseButton::Left), Modifiers::none());
-    assert!(!drawn(&mut h, "tab-drop-marker"), "none over the +");
+    assert_eq!(lefts(&mut h, &names), rest, "none over the +");
     release(&mut h, plus);
     assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
-    // Off the bar: the marker goes, and the drop lands nowhere.
+    // Off the bar: the tabs go back, and the drop lands nowhere.
     let off = point(px(700.0), px(400.0));
     let before_alpha = quarter(&mut h, "tab-alpha", false);
     drag_tab(&mut h, "tab-gamma", before_alpha);
     h.cx.simulate_mouse_move(off, Some(MouseButton::Left), Modifiers::none());
-    assert!(!drawn(&mut h, "tab-drop-marker"), "none off the bar");
+    assert_eq!(lefts(&mut h, &names), rest, "none off the bar");
     release(&mut h, off);
     assert!(!drawn(&mut h, "tab-drag-ghost"));
+    assert_eq!(lefts(&mut h, &names), rest);
     assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
     assert!(h.take_calls().is_empty());
 
@@ -689,6 +708,43 @@ fn a_drag_that_wouldnt_move_the_tab_shows_no_marker_and_changes_nothing(cx: &mut
     h.cx.simulate_mouse_down(beta, MouseButton::Left, Modifiers::none());
     release(&mut h, beta);
     assert_eq!(h.take_calls(), [HostCall::SwitchProject("beta".into())]);
+    assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
+}
+
+#[gpui::test]
+fn the_tabs_slide_aside_and_back_from_where_they_are(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta", "gamma"], &["alpha", "beta", "gamma"]);
+    let now = Rc::new(std::cell::Cell::new(Instant::now()));
+    let n = now.clone();
+    h.window.update(&mut h.cx, |w, _| {
+        w.clock = Rc::new(move || n.get());
+        w.reduce_motion = Rc::new(|| false);
+    });
+    let advance = |h: &mut Harness, ms: u64| {
+        now.set(now.get() + std::time::Duration::from_millis(ms));
+        h.draw();
+    };
+    h.draw();
+    let alpha = bounds(&mut h, "tab-alpha").left();
+    let gamma_w = bounds(&mut h, "tab-gamma").size.width + px(1.0);
+    let to = quarter(&mut h, "tab-alpha", false);
+    // Where gamma rests (it is drawn elsewhere once its slot moves).
+    let home = quarter(&mut h, "tab-gamma", false);
+    drag_tab(&mut h, "tab-gamma", to);
+    assert_eq!(bounds(&mut h, "tab-alpha").left(), alpha, "starts where it rests");
+    advance(&mut h, 50);
+    let mid = bounds(&mut h, "tab-alpha").left();
+    assert!(mid > alpha && mid < alpha + gamma_w, "on its way: {mid:?}");
+    // Back over gamma's own place: alpha turns around from where it is.
+    h.cx.simulate_mouse_move(home, Some(MouseButton::Left), Modifiers::none());
+    h.draw();
+    assert_eq!(bounds(&mut h, "tab-alpha").left(), mid, "no snap");
+    advance(&mut h, 50);
+    let back = bounds(&mut h, "tab-alpha").left();
+    assert!(back < mid && back > alpha, "heading back: {back:?}");
+    advance(&mut h, 200);
+    assert_eq!(bounds(&mut h, "tab-alpha").left(), alpha, "home");
+    release(&mut h, home);
     assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
 }
 
