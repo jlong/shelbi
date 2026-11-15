@@ -317,9 +317,12 @@ pub struct Theme<C = Swatch> {
     /// Inline code text in rendered markdown.
     pub code_fg: C,
     /// The working-project pulse at its dimmest (near-invisible on the palette
-    /// panel).
+    /// panel). The TUI's breath only: it can't draw alpha, so it lerps toward
+    /// this. The desktop fades its green dot's opacity instead
+    /// ([`project_pulse_alpha`]).
     pub pulse_trough: C,
-    /// The working-project pulse at its brightest.
+    /// The working-project pulse at its brightest (the TUI's breath, as
+    /// [`Theme::pulse_trough`]).
     pub pulse_peak: C,
 
     // ---- Terminal hues ----------------------------------------------------
@@ -505,18 +508,29 @@ impl Theme {
     /// up to [`Theme::pulse_peak`] and back once per cycle, easing at both
     /// extremes so it reads as breathing rather than a blink.
     pub fn project_pulse(&self, phase: f32) -> Rgb {
-        // Wrap defensively so a raw elapsed fraction (or one that drifted past
-        // 1.0 through rounding) still maps onto one clean cycle.
-        let phase = phase.rem_euclid(1.0);
-        // 0 → 1 → 0 across the cycle, eased at the extremes by the cosine.
-        let alpha = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
-        self.pulse_trough.rgb.lerp(self.pulse_peak.rgb, alpha)
+        self.pulse_trough.rgb.lerp(self.pulse_peak.rgb, project_pulse_alpha(phase))
     }
 }
 
+/// The working-project pulse's breath at animation `phase` (wrapped into
+/// `[0.0, 1.0)`; one cycle is [`PROJECT_PULSE_PERIOD`]): a raised cosine from
+/// 0.0 at the trough (phase 0) up to 1.0 at the peak (phase 0.5) and back,
+/// easing at both extremes so it reads as breathing rather than a blink.
+/// The desktop draws it as the green dot's opacity, so at the trough the dot
+/// vanishes into whatever is behind it; the TUI, which can't draw alpha,
+/// lerps its color with it ([`Theme::project_pulse`]).
+pub fn project_pulse_alpha(phase: f32) -> f32 {
+    // Wrap defensively so a raw elapsed fraction (or one that drifted past
+    // 1.0 through rounding) still maps onto one clean cycle.
+    let phase = phase.rem_euclid(1.0);
+    // 0 → 1 → 0 across the cycle, eased at the extremes by the cosine.
+    let alpha = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+    alpha.clamp(0.0, 1.0)
+}
+
 /// One breath of the project pulse (a project with work in progress, see
-/// [`Theme::project_pulse`]): its dot eases from the dim trough up to full
-/// green and back once per period. Kept close to a calm breath rather than a
+/// [`project_pulse_alpha`]): its dot eases from the trough (transparent on
+/// the desktop, dim in the TUI) up to full green and back once per period. Kept close to a calm breath rather than a
 /// blink. Both clients animate at it.
 pub const PROJECT_PULSE_PERIOD: std::time::Duration = std::time::Duration::from_millis(1143);
 
@@ -1022,6 +1036,23 @@ mod tests {
         // The dark pulse is the TUI's pure-green breath (g from 45 to 220).
         assert_eq!(t.project_pulse(0.0), Rgb::new(0, 45, 0));
         assert_eq!(t.project_pulse(0.5), Rgb::new(0, 220, 0));
+    }
+
+    #[test]
+    fn pulse_alpha_breathes_from_transparent_to_opaque() {
+        assert_eq!(project_pulse_alpha(0.0), 0.0, "the trough is fully transparent");
+        assert_eq!(project_pulse_alpha(0.5), 1.0, "the peak is fully opaque");
+        assert_eq!(project_pulse_alpha(1.0), project_pulse_alpha(0.0), "wraps at 1.0");
+        assert!((project_pulse_alpha(0.25) - 0.5).abs() < 1e-6, "half way at a quarter");
+        for i in 0..=50 {
+            let d = i as f32 / 100.0;
+            let (a, b) = (project_pulse_alpha(0.5 - d), project_pulse_alpha(0.5 + d));
+            assert!((a - b).abs() < 1e-6, "symmetric about the peak at ±{d}: {a} vs {b}");
+            assert!((0.0..=1.0).contains(&a), "in range at {d}: {a}");
+        }
+        // Rising through the first half, so it never blinks.
+        let rising: Vec<f32> = (0..=10).map(|i| project_pulse_alpha(i as f32 / 20.0)).collect();
+        assert!(rising.windows(2).all(|w| w[0] <= w[1]), "{rising:?}");
     }
 
     #[test]

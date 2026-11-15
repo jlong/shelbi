@@ -202,17 +202,13 @@ impl Theme {
     }
 
     /// A working project's dot at animation `phase` (0..1, one breath per
-    /// `shelbi_app::theme::PROJECT_PULSE_PERIOD`): the shared tokens' raised
-    /// cosine from `pulse_trough` up to `pulse_peak` and back
-    /// ([`shelbi_app::theme::Theme::project_pulse`]), for this appearance.
+    /// `shelbi_app::theme::PROJECT_PULSE_PERIOD`): the resting dot's
+    /// `icon_green` with its opacity on the shared raised cosine
+    /// ([`shelbi_app::theme::project_pulse_alpha`]), fully opaque at the peak
+    /// and fully transparent at the trough, so the dot fades into whatever
+    /// is behind it (a tab, a menu, the palette) rather than into a gray.
     pub fn project_pulse(&self, phase: f32) -> Hsla {
-        let tokens = if self.is_dark() {
-            shelbi_app::theme::Theme::dark()
-        } else {
-            shelbi_app::theme::Theme::light()
-        };
-        let c = tokens.project_pulse(phase);
-        gpui::rgb(u32::from_be_bytes([0, c.r, c.g, c.b])).into()
+        self.icon_green.opacity(shelbi_app::theme::project_pulse_alpha(phase))
     }
 
     /// The color a shared view model names by [`Tone`] (an activity row's

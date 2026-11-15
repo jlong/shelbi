@@ -39,10 +39,11 @@ pub fn heading(theme: &Theme) -> Div {
 
 /// A project's dot (16pt, `flex_none`): the `circle-solid` disc in
 /// `icon_green` while it is loaded, a `gray` `circle` ring when it isn't.
-/// While the project has work in progress the disc's color breathes
-/// ([`pulse_color`]); `id` keys that animation. Under Reduce Motion (and in
-/// the visual checks, which render with it) gpui holds a repeating
-/// animation at its start, so the disc holds at the pulse's peak.
+/// While the project has work in progress the disc breathes, its green
+/// fading to fully transparent and back ([`pulse_color`]); `id` keys that
+/// animation. Under Reduce Motion (and in the visual checks, which render
+/// with it) gpui holds a repeating animation at its start, so the disc
+/// holds at the pulse's peak: the resting, fully opaque green.
 pub fn dot(id: impl Into<ElementId>, indicator: ProjectIndicator, theme: &Theme) -> AnyElement {
     let (icon, color) = dot_drawing(indicator, theme);
     let disc = heroicon(icon).flex_none().text_color(color);
@@ -201,22 +202,24 @@ mod tests {
         assert_eq!(d.style().size.width, Some(ICON_SIZE_MENU.into()), "the Figma's 16pt");
     }
 
-    /// The working dot breathes between the shared pulse tokens, and the
-    /// frame Reduce Motion holds (the animation's start) is its peak.
+    /// The working dot is the resting green with its opacity breathing from
+    /// opaque to fully transparent and back, and the frame Reduce Motion
+    /// holds (the animation's start) is its opaque peak.
     #[test]
     fn the_working_dot_breathes_from_its_peak() {
         for theme in [
             theme(),
             Theme::resolve(shelbi_state::ThemePreference::Light, gpui::WindowAppearance::Light),
         ] {
-            let tokens = if theme.is_dark() {
-                shelbi_app::theme::Theme::dark()
-            } else {
-                shelbi_app::theme::Theme::light()
-            };
-            let hsla = |c: shelbi_app::theme::Rgb| -> Hsla { gpui::rgb(u32::from_be_bytes([0, c.r, c.g, c.b])).into() };
-            assert_eq!(pulse_color(&theme, 0.0), hsla(tokens.pulse_peak.rgb), "held at the peak");
-            assert_eq!(pulse_color(&theme, 0.5), hsla(tokens.pulse_trough.rgb), "the trough mid-breath");
+            let green = theme.icon_green;
+            assert_eq!(green.a, 1.0, "the resting dot is opaque");
+            assert_eq!(pulse_color(&theme, 0.0), green, "held at the peak: the resting green");
+            let trough = pulse_color(&theme, 0.5);
+            assert_eq!(trough.a, 0.0, "fully transparent mid-breath");
+            assert_eq!((trough.h, trough.s, trough.l), (green.h, green.s, green.l), "still green, never gray");
+            let quarter = pulse_color(&theme, 0.25);
+            assert_eq!((quarter.h, quarter.s, quarter.l), (green.h, green.s, green.l), "only alpha moves");
+            assert!(quarter.a > 0.0 && quarter.a < 1.0, "half faded: {}", quarter.a);
             assert_eq!(pulse_color(&theme, 1.0), pulse_color(&theme, 0.0), "one breath per period");
         }
     }
