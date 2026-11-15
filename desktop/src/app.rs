@@ -534,6 +534,10 @@ fn open_window_with(
                 appears_transparent: true,
                 traffic_light_position: Some(sidebar::traffic_light_position()),
             }),
+            // The window moves itself from its titlebar row's empty space
+            // (`elements::window_drag`), so AppKit doesn't take a press on a
+            // tab as a window drag before the tab's own drag starts.
+            app_owns_titlebar_drag: true,
             app_id: Some("co.32pixels.shelbi".into()),
             ..Default::default()
         },
@@ -4647,32 +4651,50 @@ impl ShelbiWindow {
             .child(heroicon(icons::PLUS).text_color(theme.icon))
             .child("Add Project…")
             .on_click(cx.listener(|this, _, window, cx| this.run(CommandKind::AddProject, window, cx)));
+        // No titlebar row here: the window's top strip, beside the traffic
+        // lights and across, moves the window (it owns its titlebar drag).
+        let drag = crate::elements::window_drag::region("chooser-drag")
+            .debug_selector(|| "chooser-drag".into())
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(px(sidebar::TITLEBAR_H));
         div()
             .id("chooser")
             .debug_selector(|| "chooser".into())
-            .flex()
-            .flex_col()
-            .items_center()
-            .justify_center()
+            .relative()
             .size_full()
-            .p_8()
-            .overflow_y_scroll()
             .bg(theme.canvas)
             .child(
                 div()
+                    .id("chooser-scroll")
                     .flex()
                     .flex_col()
-                    .gap_3()
-                    .w(px(360.0))
-                    .max_w_full()
-                    .child(style::heading("No project open", theme))
+                    .items_center()
+                    .justify_center()
+                    .size_full()
+                    .p_8()
+                    // The content stays clear of the drag strip.
+                    .pt(px(sidebar::TITLEBAR_H))
+                    .overflow_y_scroll()
                     .child(
                         div()
-                            .text_color(theme.muted)
-                            .child("Choose a project for this window."),
-                    )
-                    .child(div().flex().flex_col().gap_1().children(rows).child(add)),
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .w(px(360.0))
+                            .max_w_full()
+                            .child(style::heading("No project open", theme))
+                            .child(
+                                div()
+                                    .text_color(theme.muted)
+                                    .child("Choose a project for this window."),
+                            )
+                            .child(div().flex().flex_col().gap_1().children(rows).child(add)),
+                    ),
             )
+            .child(drag)
             .into_any_element()
     }
 

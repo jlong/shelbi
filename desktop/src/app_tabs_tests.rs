@@ -691,3 +691,41 @@ fn a_drag_that_wouldnt_move_the_tab_shows_no_marker_and_changes_nothing(cx: &mut
     assert_eq!(h.take_calls(), [HostCall::SwitchProject("beta".into())]);
     assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
 }
+
+#[gpui::test]
+fn the_bars_empty_space_moves_the_window_and_a_tab_never_does(cx: &mut TestAppContext) {
+    use crate::elements::window_drag::test_log::{self, Call};
+    let mut h = open(cx, &["alpha", "beta", "gamma"], &["alpha", "beta", "gamma"]);
+    h.take_calls();
+    // The traffic lights' room, up to the first tab, is the bar's own.
+    let lead = bounds(&mut h, "tab-bar-drag-lead");
+    assert_eq!((lead.left(), lead.right()), (px(0.0), px(tab_bar::LEAD_X)));
+    assert_eq!(lead.size.height, px(52.0), "the bar's full height");
+    assert_eq!(bounds(&mut h, "tab-alpha").left(), px(tab_bar::LEAD_X + 1.0), "the tabs stay put");
+    // The traffic lights are native buttons over it; press past them.
+    let beside = point(px(sidebar::TRAFFIC_LIGHTS_RIGHT + 4.0), lead.center().y);
+    assert_eq!(test_log::drag_from(&mut h.cx, beside), [Call::Move]);
+    // Past the `+`, to the window's edge.
+    let end = bounds(&mut h, "tab-bar-drag-end");
+    assert_eq!(end.left(), bounds(&mut h, "tab-plus").right() + px(1.0), "past the + and its rule");
+    assert_eq!(test_log::drag_from(&mut h.cx, end.center()), [Call::Move]);
+    assert_eq!(test_log::click_at(&mut h.cx, end.center(), 2), [Call::DoubleClick]);
+    assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
+    assert!(h.take_calls().is_empty(), "nothing switches");
+
+    // A tab dragged (even into the empty space) reorders and never moves
+    // the window; nor does a press on the `+`.
+    test_log::take();
+    let past = point(end.left() + px(60.0), end.center().y);
+    drag_tab(&mut h, "tab-alpha", past);
+    release(&mut h, past);
+    assert_eq!(order(&h), ["beta", "gamma", "alpha"]);
+    let plus = bounds(&mut h, "tab-plus").center();
+    let mut presses = test_log::take();
+    presses.extend(test_log::drag_from(&mut h.cx, plus));
+    assert_eq!(presses, [], "no window move from a tab or the +");
+    // The tab still clicks; a double click on it isn't the titlebar's.
+    let beta = bounds(&mut h, "tab-beta").center();
+    assert_eq!(test_log::click_at(&mut h.cx, beta, 2), []);
+    assert!(h.take_calls().contains(&HostCall::SwitchProject("beta".into())));
+}
