@@ -64,6 +64,77 @@ pub struct UserConfig {
     /// the TUI but for `app_icon`, which its About draws.
     #[serde(default, skip_serializing_if = "DesktopConfig::is_empty")]
     pub desktop: DesktopConfig,
+
+    /// Where the command-line tools Shelbi depends on live when they aren't
+    /// on the login shell's `PATH` (`tools:` block), set by the startup
+    /// requirements check's Locate. Hub-wide: both clients and the daemon
+    /// read it. See [`ToolPaths`].
+    #[serde(default, skip_serializing_if = "ToolPaths::is_empty")]
+    pub tools: ToolPaths,
+}
+
+/// The `tools:` block: a binary the user pointed Shelbi at, per tool, for a
+/// tool installed outside the login shell's `PATH`:
+///
+/// ```yaml
+/// tools:
+///   gh: /Users/me/.local/opt/gh/bin/gh
+/// ```
+///
+/// A set path counts as the tool for the startup requirements check, and its
+/// directory joins the `PATH` Shelbi runs commands and agents under
+/// ([`crate::tool_paths`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPaths {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brew: Option<PathBuf>,
+}
+
+impl ToolPaths {
+    /// Whether no tool is set (so the block isn't written).
+    pub fn is_empty(&self) -> bool {
+        self.git.is_none() && self.gh.is_none() && self.claude.is_none() && self.codex.is_none() && self.brew.is_none()
+    }
+
+    /// The path set for the binary named `name` (`git`, `gh`, `claude`,
+    /// `codex`, `brew`).
+    pub fn get(&self, name: &str) -> Option<&PathBuf> {
+        match name {
+            "git" => self.git.as_ref(),
+            "gh" => self.gh.as_ref(),
+            "claude" => self.claude.as_ref(),
+            "codex" => self.codex.as_ref(),
+            "brew" => self.brew.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Set (or, with `None`, clear) the path for the binary named `name`.
+    /// An unknown name changes nothing.
+    pub fn set(&mut self, name: &str, path: Option<PathBuf>) {
+        let slot = match name {
+            "git" => &mut self.git,
+            "gh" => &mut self.gh,
+            "claude" => &mut self.claude,
+            "codex" => &mut self.codex,
+            "brew" => &mut self.brew,
+            _ => return,
+        };
+        *slot = path;
+    }
+
+    /// Every set path.
+    pub fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+        [&self.git, &self.gh, &self.claude, &self.codex, &self.brew].into_iter().flatten()
+    }
 }
 
 /// The `theme:` setting. `Auto` follows the system appearance where a client

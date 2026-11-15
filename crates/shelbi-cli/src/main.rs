@@ -507,6 +507,10 @@ fn main() -> Result<()> {
             shelbi_state::set_root_override(root);
         }
     }
+    // Tools located outside the login PATH (`config.yaml` `tools:`, set by
+    // the startup requirements check) join the PATH every login environment
+    // this process builds: the daemon's own, its sessions', tool detection.
+    shelbi_state::tool_paths::install_path_extension();
     if cli.yes {
         // Carried through the environment (like `--root` via the override
         // stash) so deep call sites — the daemon-restart offer in the
@@ -686,10 +690,22 @@ where
 ///   (in a terminal) → the launch screen: this machine's projects, the
 ///   recent remote sessions, Add project and Connect to remote. A project
 ///   opened there boots its TUI.
+/// - first (in a terminal), the startup requirements check
+///   ([`shelbi_tui::prereqs::gate`]): nothing shows when every tool is
+///   found; a missing one shows the requirements screen.
 /// - cwd does not resolve to a registered project otherwise → onboarding for
 ///   this cwd, even when other projects already exist. The banner appears
 ///   only when the Shelbi home itself is new.
 fn default_entry(explicit: Option<String>) -> Result<()> {
+    // The startup requirements check (git, gh, a coding agent, brew on
+    // macOS): silent when they're all on this terminal's PATH, else a screen
+    // before anything opens. Skip anyway carries on; Esc leaves.
+    if is_interactive() {
+        let checked = shelbi_tui::prereqs::gate().context("checking your tools")?;
+        if checked == shelbi_tui::prereqs::PrereqExit::Quit {
+            return Ok(());
+        }
+    }
     let resolved = resolve_or_onboard(commands::require_project(explicit))?;
     let missing_project = match classify_default_route(resolved, project_registration_exists) {
         DefaultRoute::Dashboard(name) => {

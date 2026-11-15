@@ -49,9 +49,46 @@ const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 /// would hand the child *no* `PATH` and the agent (`claude`, `codex`, …) would
 /// fail to launch with `command not found`.
 pub fn login_shell_env() -> BTreeMap<String, String> {
-    resolve_login_env(&CACHE, || {
+    let mut env = resolve_login_env(&CACHE, || {
         capture_env_bounded(&login_shell(), CAPTURE_TIMEOUT)
-    })
+    });
+    if let Some(extension) = PATH_EXTENSION.get() {
+        extend_path(&mut env, &extension());
+    }
+    env
+}
+
+/// Directories every [`login_shell_env`] ends its `PATH` with, once
+/// installed ([`set_path_extension`]).
+static PATH_EXTENSION: OnceLock<fn() -> Vec<PathBuf>> = OnceLock::new();
+
+/// Have every [`login_shell_env`] from now on end its `PATH` with the
+/// directories `dirs` returns (called each time, so it can follow a setting
+/// that changes). `shelbi-state` installs one from `main` for the tools the
+/// user located outside their `PATH` (`config.yaml`'s `tools:`); this crate
+/// can't read that setting itself. The first call wins.
+pub fn set_path_extension(dirs: fn() -> Vec<PathBuf>) {
+    let _ = PATH_EXTENSION.set(dirs);
+}
+
+/// Append each of `dirs` to `env`'s `PATH` that isn't on it already.
+pub fn extend_path(env: &mut BTreeMap<String, String>, dirs: &[PathBuf]) {
+    if dirs.is_empty() {
+        return;
+    }
+    let current = env.get("PATH").cloned().unwrap_or_default();
+    let mut all: Vec<PathBuf> = std::env::split_paths(&current).filter(|d| !d.as_os_str().is_empty()).collect();
+    let before = all.len();
+    for dir in dirs {
+        if !all.iter().any(|d| d == dir) {
+            all.push(dir.clone());
+        }
+    }
+    if all.len() != before {
+        if let Ok(joined) = std::env::join_paths(all) {
+            env.insert("PATH".to_string(), joined.to_string_lossy().into_owned());
+        }
+    }
 }
 
 /// The cache-or-fallback policy behind [`login_shell_env`], with the cache and
@@ -379,6 +416,19 @@ fn is_valid_name(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extend_path_appends_missing_dirs_once() {
+        let mut env = BTreeMap::from([("PATH".to_string(), "/usr/bin:/opt/x/bin".to_string())]);
+        extend_path(&mut env, &[PathBuf::from("/opt/x/bin"), PathBuf::from("/opt/y/bin")]);
+        assert_eq!(env["PATH"], "/usr/bin:/opt/x/bin:/opt/y/bin");
+        let mut empty = BTreeMap::new();
+        extend_path(&mut empty, &[PathBuf::from("/opt/y/bin")]);
+        assert_eq!(empty["PATH"], "/opt/y/bin");
+        let mut untouched = BTreeMap::new();
+        extend_path(&mut untouched, &[]);
+        assert!(untouched.is_empty());
+    }
 
     #[test]
     fn parses_simple_assignments() {

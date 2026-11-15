@@ -214,6 +214,10 @@ pub mod figma {
         /// bind a `text/gray` that isn't in `03 Desktop`, so the value is
         /// the frames' own.
         pub const LOG_GRAY: Pair = pair(0x7b85a7ff, 0x7b85a7ff);
+        /// The Command component's `theme.code_bg` and `theme.code_fg`:
+        /// the shared (TUI) theme's code tokens, opaque in both modes.
+        pub const CODE_BG: Pair = pair(0x303030ff, 0xecececff);
+        pub const CODE_FG: Pair = pair(0xd0d0d0ff, 0x1a1a1aff);
         /// A card's workflow badge and its label. The frames bind
         /// `other/workflow_badge_*`, which isn't in `03 Desktop`; the values
         /// are the frames' own.
@@ -406,6 +410,11 @@ palette! {
     /// A Machines workspace row's runner and task (the Machines frame's
     /// `#7b85a7`).
     table_text,
+    /// A copyable shell command's fill (the requirements check's Command
+    /// component, `theme.code_bg`: the shared theme's code token).
+    code_bg,
+    /// A copyable shell command's text, on `code_bg` (`theme.code_fg`).
+    code_fg,
 
     // ---- Icons --------------------------------------------------------------
     /// Icons at rest (`icon/primary`).
@@ -634,6 +643,8 @@ impl Palette {
             text_on_color: Rgba::hex(0xffffff),
             log_text: pick(LOG_GRAY),
             table_text: pick(LOG_GRAY),
+            code_bg: pick(CODE_BG),
+            code_fg: pick(CODE_FG),
 
             icon: pick(GRAY),
             button_icon: pick(BUTTON_ICON),
@@ -873,6 +884,8 @@ pub(super) mod tests {
         // A Machines row's runner and task, on the canvas (the selected
         // row's band is checked below).
         check("table_text on canvas".into(), p.table_text, p.canvas, AA);
+        // A copyable command's text on its own fill.
+        check("code_fg on code_bg".into(), p.code_fg, p.code_bg, AA);
         // The Machines states and reachability: drawn on the canvas only.
         for (name, fg) in [("theme_green", p.theme_green), ("theme_cyan", p.theme_cyan)] {
             check(format!("{name} on canvas"), fg, p.canvas, AA);

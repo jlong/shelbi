@@ -368,6 +368,8 @@ heroicons! {
     #[allow(dead_code)]
     ARROW_UP_RIGHT = "arrow-up-right";
     CLIPBOARD_DOCUMENT = "clipboard-document";
+    /// The requirements check's Copy (the Command component, 2839:12815).
+    DOCUMENT_DUPLICATE = "document-duplicate";
     EXCLAMATION_TRIANGLE = "exclamation-triangle";
     /// The drawing `FUNNEL_SMALL` widens; no view draws the funnel at 20pt.
     #[allow(dead_code)]
@@ -462,6 +464,9 @@ heroicons! {
         CIRCLE_SOLID_MENU = "circle-solid";
         CIRCLE_MENU = "circle";
         CHECK_SMALL_HEAVY_MENU = "check-small-heavy";
+        /// The requirements check's Locate validation (Heroicons' check on
+        /// the 16pt grid).
+        CHECK_MENU = "check";
         PLUS_MENU = "plus";
         /// A project tab's close button, in its dot's place.
         X_MARK_MENU = "x-mark";

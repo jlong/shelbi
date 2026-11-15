@@ -85,6 +85,9 @@
 //! `FakeRemote`. `SHELBI_VISUAL_ONLY=launch` renders just those.
 //! `cli-check`, `cli-install` and `cli-ready-<theme>.png` are the first
 //! launch's CLI setup screens before them; `SHELBI_VISUAL_ONLY=cli-setup`.
+//! `prereq-checking`, `-missing`, `-fresh-mac`, `-locate`, `-ready` and
+//! `-skip` are the startup requirements check's screens before those;
+//! `SHELBI_VISUAL_ONLY=prereqs`.
 //! `SHELBI_VISUAL_ONLY=panels` renders just the Review and Workspace
 //! screens and those states; `=settings` just Settings, its state and the
 //! components; `=issues` just the board, its states and the task pane;
@@ -2631,6 +2634,101 @@ impl Run {
         }
     }
 
+    /// The startup requirements check (`prereq-check`) in the wizard's
+    /// 800 × 580, over a fake machine (nothing runs): `prereq-checking`
+    /// (Figma 2840:13076), `prereq-missing` (2840:13181), `prereq-fresh-mac`
+    /// (2840:13378), `prereq-locate` (2840:13528), `prereq-ready`
+    /// (2840:13657) and `prereq-skip` (2843:13163).
+    /// `SHELBI_VISUAL_ONLY=prereqs` renders just these.
+    fn prereq_windows(&mut self) {
+        use crate::views::add_project::SIZE;
+        use crate::views::prereqs::{Deps, PrereqsView};
+        use shelbi_app::prereqs::{CheckEvent, FakeProbe, Found, Binary, Platform, RowState, Tool, ToolPaths};
+
+        const GIT: (&str, &str) = ("/usr/bin/git", "git version 2.39.5 (Apple Git-154)");
+        const GH: (&str, &str) = ("/opt/homebrew/bin/gh", "gh version 2.62.0 (2024-11-14)");
+        const CLAUDE: (&str, &str) = ("/Users/me/.local/bin/claude", "2.1.4 (Claude Code)");
+        const BREW: (&str, &str) = ("/opt/homebrew/bin/brew", "Homebrew 4.4.6");
+        type Edit = Box<dyn FnOnce(&mut shelbi_app::prereqs::Prereqs)>;
+        let none = || -> Option<Edit> { None };
+        // Name, machine, a state the checks didn't reach, the skip
+        // confirmation open, the Locate field's text.
+        type Screen = (&'static str, FakeProbe, Option<Edit>, bool, Option<&'static str>);
+        let screens: Vec<Screen> = vec![
+            (
+                "prereq-checking",
+                FakeProbe::new(&[GIT, GH, CLAUDE, BREW]),
+                Some(Box::new(|m| {
+                    let run = m.begin_check();
+                    let found = |binary, path: &str, v: &str| RowState::Found(Found {
+                        binary,
+                        path: path.into(),
+                        version: Some(v.into()),
+                        located: false,
+                    });
+                    for (tool, state) in [
+                        (Tool::Git, found(Binary::Git, GIT.0, "2.39.5")),
+                        (Tool::GithubCli, found(Binary::Gh, GH.0, "2.62.0")),
+                        (Tool::Agent, RowState::Checking),
+                    ] {
+                        m.apply(CheckEvent { run, tool, state });
+                    }
+                })),
+                false,
+                None,
+            ),
+            ("prereq-missing", FakeProbe::new(&[GIT, BREW]).dir("/Users/me/.local/bin"), none(), false, None),
+            ("prereq-fresh-mac", FakeProbe::new(&[]).dir("/usr/bin"), none(), false, None),
+            (
+                "prereq-locate",
+                FakeProbe::new(&[GIT, CLAUDE, BREW]),
+                Some(Box::new(|m| {
+                    m.start_locate(Tool::GithubCli);
+                    m.located(
+                        Tool::GithubCli,
+                        Ok(Found {
+                            binary: Binary::Gh,
+                            path: "/Users/me/.local/bin/gh".into(),
+                            version: Some("2.62.0".into()),
+                            located: true,
+                        }),
+                    );
+                })),
+                false,
+                Some("~/.local/bin/gh"),
+            ),
+            ("prereq-ready", FakeProbe::new(&[GIT, ("/Users/me/.local/bin/gh", "gh version 2.62.0"), CLAUDE, BREW]), none(), false, None),
+            ("prereq-skip", FakeProbe::new(&[GIT, BREW]), none(), true, None),
+        ];
+        for (screen, probe, edit, skip, path) in screens {
+            let deps = Deps {
+                probe: Arc::new(probe),
+                located: Arc::new(ToolPaths::default),
+                save: Arc::new(|_| Ok(())),
+                done: Rc::new(|_, _, _, _| {}),
+                home: Some("/Users/me".into()),
+                platform: Platform::Mac,
+            };
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                    cx.new(|cx| PrereqsView::new(deps, window, cx))
+                })
+                .expect("open the offscreen window");
+            let window: AnyWindowHandle = handle.into();
+            self.settle_sheet(window);
+            if edit.is_some() || skip {
+                let edit = edit.unwrap_or_else(|| Box::new(|_| {}));
+                handle
+                    .update(&mut self.cx, |v, window, cx| v.preview(edit, skip, path, window, cx))
+                    .unwrap();
+                self.settle_sheet(window);
+            }
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+    }
+
     /// Run and draw a window that isn't the shell a few times over.
     fn settle_sheet(&mut self, window: AnyWindowHandle) {
         for _ in 0..5 {
@@ -2905,6 +3003,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "prereqs") {
+            self.prereq_windows();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "main") {
             // The main window's screens alone, for the contrast setting's
             // captures (`SHELBI_VISUAL_CONTRAST`).
@@ -3023,6 +3126,7 @@ impl Run {
         self.about_windows();
         self.add_project_windows();
         self.cli_setup_windows();
+        self.prereq_windows();
         self.feedback_states();
         self.new_task_states();
         self.launch_windows();

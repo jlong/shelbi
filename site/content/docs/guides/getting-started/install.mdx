@@ -14,6 +14,13 @@ On macOS, install Shelbi and start it in one command:
 brew install jlong/shelbi/shelbi && shelbi
 ```
 
+Every time it starts, `shelbi` first checks the tools it depends on: `git`,
+`gh`, a coding agent (`claude` or `codex`) and, on macOS, `brew`. When they are
+all installed you never see the check. When one is missing, a screen lists it
+with the command to install it (`c` copies it), lets you point Shelbi at a copy
+installed outside your `PATH` (`l`), and checks again (`r`) once you have
+installed it. You can skip it (`s`), and Shelbi checks again on the next start.
+
 On a fresh machine, `shelbi` opens the **Welcome to Shelbi** launch screen,
 with **Add project** and **Connect to remote**. **Add project** asks the same
 four setup steps as `shelbi project add` run from inside the repository; each
@@ -35,6 +42,13 @@ Then open **Shelbi** from Applications. On a fresh machine it opens the
 Add Project wizard: the same four setup steps as `shelbi project add` run from
 inside the repository. See
 [Set up your first project](/docs/guides/getting-started/first-project).
+
+Each time it starts, the app also checks the command-line tools Shelbi depends
+on: `git`, `gh`, a coding agent (Claude Code or Codex) and `brew`. When one is
+missing, a window lists it with the command to install it and a **Copy**
+button, and **Locate…** points Shelbi at a copy installed outside your `PATH`.
+**Check again** looks once more after you install it; **Skip for now** carries
+on, and Shelbi checks again the next time it starts.
 
 </Desktop>
 

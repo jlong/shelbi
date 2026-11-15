@@ -81,6 +81,7 @@ pub mod supervision_status;
 #[cfg(all(unix, any(test, feature = "test-support")))]
 pub mod test_support;
 pub mod tools;
+pub mod tool_paths;
 mod user_config;
 mod workflows;
 mod workspace_state_migration;
@@ -210,7 +211,7 @@ pub use user_config::{
     editor_display_name, load_user_config, resolve_diff_tool, resolve_editor, resolve_editor_choice,
     resolve_editor_choice_from, resolve_editor_source, resolved_editor_name, save_user_config,
     scaffold_user_config_if_missing, update_user_config, user_config_path, AnsiPair, AppIcon, DesktopConfig,
-    DesktopNotifications, EditorSource, Keymap, OptionAsMeta, TerminalColors, TerminalScrollbar, ThemePreference, UserConfig, ZenToggleChord,
+    DesktopNotifications, EditorSource, Keymap, OptionAsMeta, TerminalColors, TerminalScrollbar, ThemePreference, ToolPaths, UserConfig, ZenToggleChord,
     DEFAULT_EDITOR,
 };
 pub use workflows::{

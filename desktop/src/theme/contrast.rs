@@ -100,9 +100,9 @@ pub fn class(role: &str) -> Option<Class> {
     use Class::*;
     Some(match role {
         "canvas" | "sidebar" | "card" | "raised" | "well" | "textbox" | "keycap" | "nav_selected"
-        | "workflow_badge" => Surface,
+        | "workflow_badge" | "code_bg" => Surface,
         "text_loud" | "foreground" | "gray" | "form_text" | "form_hint" | "muted" | "log_text" | "table_text"
-        | "icon" | "button_icon" | "dark_gray" | "workflow_badge_text" | "link_hover" => Text,
+        | "code_fg" | "icon" | "button_icon" | "dark_gray" | "workflow_badge_text" | "link_hover" => Text,
         "divider" | "divider_strong" | "input_border" | "check_border" | "ring" => Border,
         "link" | "accent" | "icon_cyan" | "icon_green" | "icon_yellow" | "icon_purple" | "progress"
         | "focus_ring" | "success_focus_ring" | "danger_focus_ring" | "select_label" | "primary_label"

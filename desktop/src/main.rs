@@ -183,6 +183,9 @@ fn main() {
         std::process::exit(code);
     }
     init_logging();
+    // Tools located outside the login PATH (`config.yaml` `tools:`) join the
+    // PATH of the login environment the app's children run under.
+    shelbi_state::tool_paths::install_path_extension();
     let mode = parse_args();
     if let Mode::PrintVersion = mode {
         std::process::exit(platform::print_version::run());
@@ -346,20 +349,28 @@ fn main() {
 
             // No daemon running: the launch window (the projects here, the
             // recent remote sessions, Add project, Connect to remote).
+            //
+            // Every launch checks the tools Shelbi depends on (git, gh, a
+            // coding agent, brew): quietly behind the usual windows, the
+            // requirements window only when one is missing.
             if route == LaunchRoute::LaunchScreen {
                 tracing::info!("no daemon running: the launch window");
                 views::launch::show(cx);
+                views::prereqs::check_in_background(cx);
                 return;
             }
-            // No project yet: the first launch checks for the CLI (installing
-            // it when there is none), then becomes the Add Project wizard
-            // (closing it, the last window, quits).
+            // No project yet: the first launch checks the tools (the
+            // requirements window, which goes on by itself when they're all
+            // there), then for the CLI (installing it when there is none),
+            // then becomes the Add Project wizard (closing it, the last
+            // window, quits).
             if plan.is_empty() {
-                views::cli_setup::show(cx);
+                views::prereqs::show_first_launch(cx);
                 return;
             }
             app::open_launch_windows(plan, cx);
             cx.activate(true);
+            views::prereqs::check_in_background(cx);
         });
 }
 

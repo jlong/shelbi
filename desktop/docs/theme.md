@@ -306,8 +306,8 @@ what it is for:
 
 | Class | Roles | Dark at 100 | Light at 100 |
 |---|---|---|---|
-| Surface | `canvas`, `sidebar`, `card`, `raised`, `well`, `textbox`, `keycap`, `nav_selected`, `workflow_badge` | down to a black canvas, each keeping its contrast ratio to the canvas (`canvas` `#1e2330` → `#000000`, `sidebar` `#2c3140` → `#171a24`, `workflow_badge` `#3a4258` → `#292f40`; `card` and `textbox`, darker than the canvas, meet it at black) | 50% toward white (`sidebar` `#f9f9fc` → `#fcfcfe`; white stays white) |
-| Text | `text_loud`, `foreground`, `gray`, `form_text`, `form_hint`, `muted`, `log_text`, `table_text`, `icon`, `button_icon`, `dark_gray`, `workflow_badge_text`, `link_hover` | half toward white, and alpha half toward opaque (`muted` 55% → 78%) | half toward black, alpha half toward opaque (`muted` `#444c65` at 50% → `#222633` at 75%) |
+| Surface | `canvas`, `sidebar`, `card`, `raised`, `well`, `textbox`, `keycap`, `nav_selected`, `workflow_badge`, `code_bg` | down to a black canvas, each keeping its contrast ratio to the canvas (`canvas` `#1e2330` → `#000000`, `sidebar` `#2c3140` → `#171a24`, `workflow_badge` `#3a4258` → `#292f40`; `card` and `textbox`, darker than the canvas, meet it at black) | 50% toward white (`sidebar` `#f9f9fc` → `#fcfcfe`; white stays white) |
+| Text | `text_loud`, `foreground`, `gray`, `form_text`, `form_hint`, `muted`, `log_text`, `table_text`, `code_fg`, `icon`, `button_icon`, `dark_gray`, `workflow_badge_text`, `link_hover` | half toward white, and alpha half toward opaque (`muted` 55% → 78%) | half toward black, alpha half toward opaque (`muted` `#444c65` at 50% → `#222633` at 75%) |
 | Border | `divider`, `divider_strong`, `input_border`, `check_border`, `ring` | half toward white, alpha doubled (`divider` 10% → 20%) | half toward black, alpha doubled |
 | Hue | links, `accent`, the status icons and text, the log hues, focus rings, the colored button labels | a fifth toward white (hue kept) | a fifth toward black (hue kept) |
 | Kept | the translucent fills laid over a surface (rows, chips, button fills and tints, selection, glows, shadows, scrim), `check_fill`, `text_on_color`, `button_keycap_edge` | unchanged: they composite darker over the darker surfaces by themselves, and their rest / hover / pressed steps stay as far apart | unchanged |
@@ -397,6 +397,8 @@ until a new role has its row here, with the values the palette really has.
 | `text_on_color` | `#ffffff` | `#ffffff` | `other/on_color`: the check mark |
 | `log_text` | `#7b85a7` | `#7b85a7` | The Activity frame's `text/gray` (not in `03 Desktop`; opaque, both modes): the log's titles, the `you` actor, the pickers' icon and label |
 | `table_text` | `#7b85a7` | `#7b85a7` | The Machines frame's `text/gray` (the same): a workspace row's runner and task |
+| `code_bg` | `#303030` | `#ececec` | The Command component's `theme.code_bg` (the shared theme's code fill, opaque): the startup requirements check's copyable commands |
+| `code_fg` | `#d0d0d0` | `#1a1a1a` | `theme.code_fg`: a copyable command's text on `code_bg` |
 
 ### Icons
 
