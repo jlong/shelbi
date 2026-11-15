@@ -1000,6 +1000,30 @@ pub(super) mod tests {
             p.nav_selected,
             NON_TEXT,
         );
+        // The notice bands along the foot (`Theme::band`: the tint laid on
+        // the opaque canvas): the message, loud on every band, the update
+        // bar's "Upgrade with", each band's icon and the dismiss buttons'.
+        // Their labelled buttons sit on the canvas (`style::band_button`),
+        // so the button checks over the canvas above cover them.
+        for (name, tint) in [
+            ("notice", p.notice),
+            ("yellow_tint", p.yellow_tint),
+            ("red_tint", p.red_tint),
+            ("blue_tint", p.blue_tint),
+            ("workflow_badge", p.workflow_badge),
+        ] {
+            let band = flatten(tint, p.canvas);
+            check(format!("band: text_loud on {name}"), p.text_loud, band, AA);
+            check(format!("band: dismiss on {name}"), p.foreground, band, NON_TEXT);
+        }
+        check("band: warning on notice".into(), p.warning, flatten(p.notice, p.canvas), NON_TEXT);
+        check("band: blue on blue_tint".into(), p.blue, flatten(p.blue_tint, p.canvas), NON_TEXT);
+        check(
+            "band: foreground on blue_tint".into(),
+            p.foreground,
+            flatten(p.blue_tint, p.canvas),
+            AA,
+        );
         out
     }
 

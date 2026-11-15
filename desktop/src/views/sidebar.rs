@@ -52,8 +52,8 @@ use crate::theme::Theme;
 pub const COLUMN_PX: f32 = 10.0;
 
 /// The tab bar's height (`crate::views::tab_bar`), which the native
-/// traffic lights center on; a no-sidebar titlebar (the workflow editor's,
-/// the relaunch bar) is as tall.
+/// traffic lights center on; a no-sidebar titlebar (the workflow editor's)
+/// is as tall.
 pub const TITLEBAR_H: f32 = 52.0;
 
 /// The macOS standard window buttons' frames (14pt squares, measured on
@@ -70,7 +70,7 @@ pub const TRAFFIC_LIGHTS_RIGHT: f32 =
 /// 12pt past the zoom button.
 const TRAFFIC_LIGHTS_GAP: f32 = 12.0;
 /// Where a titlebar's content starts beside the traffic lights (the workflow
-/// editor's Back, the collapsed sidebar's Show button, the relaunch bar):
+/// editor's Back, the collapsed sidebar's Show button):
 /// every no-sidebar titlebar takes its left edge from here.
 pub const BESIDE_TRAFFIC_LIGHTS: f32 = TRAFFIC_LIGHTS_RIGHT + TRAFFIC_LIGHTS_GAP;
 

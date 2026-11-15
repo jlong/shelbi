@@ -1,4 +1,4 @@
-//! The new-release notice: a bar atop every project window's main area when
+//! The new-release notice: a bar along the foot of every project window's main area when
 //! `platform::update` found a newer Shelbi, naming the Homebrew command that
 //! upgrades the app. Dismissing it hides it in every window until the next
 //! launch (the check itself runs at most once a day).
@@ -51,34 +51,25 @@ pub fn render_update_bar(
     theme: &Theme,
     on_dismiss: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
-    div()
+    // The command box paints its well from the opaque theme: on the glass
+    // the well is clear, and the band under it is opaque.
+    let solid = theme.opaque();
+    style::notice_band(solid.blue_tint, theme)
         .id("update-bar")
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_4()
-        .px_4()
-        .py_2()
-        .bg(theme.blue_tint)
-        .border_b_1()
-        .border_color(theme.divider)
-        .text_color(theme.text_loud)
         .child(
             div()
                 .flex()
                 .flex_row()
+                .min_w_0()
                 .items_center()
                 .gap_2()
-                .child(
-                    heroicon(icons::ARROW_DOWN_CIRCLE).text_color(theme.blue),
-                )
+                .child(heroicon(icons::ARROW_DOWN_CIRCLE).text_color(theme.blue))
                 .child(notice.message())
-                .child(div().text_color(theme.muted).child("Upgrade with"))
-                .child(command_box(0, APP_UPGRADE_COMMAND, theme)),
+                .child(div().text_color(theme.foreground).child("Upgrade with"))
+                .child(command_box(0, APP_UPGRADE_COMMAND, &solid)),
         )
         .child(
-            style::icon_button("dismiss-update", icons::X_MARK, style::IconButtonSize::Small, false, theme)
+            style::band_icon_button("dismiss-update", icons::X_MARK, theme)
                 .tooltip(style::tooltip("Dismiss"))
                 .on_click(move |_, window, cx| on_dismiss(window, cx)),
         )

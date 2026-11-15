@@ -136,7 +136,7 @@ use crate::notify;
 use crate::projects::{self, Catalog, ProjectEntry};
 use crate::refresh::{ControlWatcher, DaemonLink, FeedEvent, SessionNoticeKind};
 use crate::theme::motion::{SharedTrack, SlideTrack};
-use crate::theme::style::{self, IconButtonSize};
+use crate::theme::style;
 use crate::theme::{self, Hue, Theme};
 use crate::views::activity::{ActivityEvent, ActivityView};
 use crate::views::activity_reader::ActivityReader;
@@ -6073,21 +6073,10 @@ impl ShelbiWindow {
                     .into_any_element()
             }
         };
-        // A band across the main area, tinted by what it says.
+        // A band along the foot of the main area, tinted by what it says.
         let notice = |text: SharedString, hue: Hue| {
-            let (fg, bg) = theme.hue(hue);
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .px_4()
-                .py_2()
-                .bg(bg)
-                .border_b_1()
-                .border_color(theme.divider)
-                .text_color(fg)
-                .child(text)
+            style::notice_band(theme.opaque().hue(hue).1, theme)
+                .child(div().min_w_0().child(text))
         };
         div()
             .flex()
@@ -6099,11 +6088,14 @@ impl ShelbiWindow {
             .overflow_hidden()
             .h_full()
             .bg(theme.canvas)
+            .child(body)
+            // The notices along the foot, under the screen: the session lost,
+            // a newer release, the status, the banner and the review
+            // decisions.
             .when_some(self.model.session_lost.clone(), |main, lost| {
                 main.child(notice(lost.into(), Hue::Red))
             })
-            // A newer release (platform::update), in the main column so it
-            // clears the titlebar's traffic lights.
+            // A newer release (platform::update).
             .when_some(
                 cx.try_global::<UpdateState>()
                     .and_then(|u| u.visible().cloned()),
@@ -6119,8 +6111,8 @@ impl ShelbiWindow {
             })
             .when_some(self.banner.clone(), |main, message| {
                 main.child(
-                    notice(message, Hue::Yellow).child(
-                        style::icon_button("dismiss-banner", icons::X_MARK, IconButtonSize::Small, false, theme)
+                    notice(message, Hue::Yellow).debug_selector(|| "banner".into()).child(
+                        style::band_icon_button("dismiss-banner", icons::X_MARK, theme)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.banner = None;
                                 cx.notify();
@@ -6145,13 +6137,7 @@ impl ShelbiWindow {
                         move |this, _, window, cx| this.perform(HostCall::LoadReview(task.clone()), window, cx),
                     ))
                 };
-                let dismiss = style::icon_button(
-                    format!("dismiss-decision-{task}"),
-                    icons::X_MARK,
-                    IconButtonSize::Small,
-                    false,
-                    theme,
-                )
+                let dismiss = style::band_icon_button(format!("dismiss-decision-{task}"), icons::X_MARK, theme)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.decisions.dismiss(&task);
                     cx.notify();
@@ -6166,12 +6152,11 @@ impl ShelbiWindow {
                             .items_center()
                             .gap_2()
                             .ml_4()
-                            .child(reopen)
+                            .child(style::band_button(reopen, theme))
                             .child(dismiss),
                     )
                     .into_any_element()
             }))
-            .child(body)
             // The task detail over the Review or Workspace screen: the board
             // draws it, sized to the main area as it is over the board.
             .when_some(detail_over, |main, issues| main.relative().child(issues))
@@ -6831,6 +6816,17 @@ impl ShelbiWindow {
                     window.dispatch_action(Box::new(kit::SelectAll), cx)
                 }))
             })
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .children(tab_bar)
+                    .child(shell.flex_1().min_h_0()),
+            )
+            // The relaunch and remote bars along the foot of the window,
+            // under the sidebar and the main area: the tabs stay the top row.
             .when_some(relaunch, |col, notice| {
                 col.child(boot_view::render_relaunch_bar(&notice, &theme, move |_, cx| {
                     let _ = weak.update(cx, |this, cx| {
@@ -6849,15 +6845,6 @@ impl ShelbiWindow {
                     },
                 ))
             })
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_h_0()
-                    .children(tab_bar)
-                    .child(shell.flex_1().min_h_0()),
-            )
             .children(machine_form)
             .children(pool_dialog)
             .children(feedback)
@@ -7208,6 +7195,10 @@ mod nav_focus_tests;
 #[cfg(test)]
 #[path = "app_toast_tests.rs"]
 mod toast_tests;
+
+#[cfg(test)]
+#[path = "app_notice_tests.rs"]
+mod notice_tests;
 
 #[cfg(test)]
 #[path = "app_tabs_tests.rs"]
