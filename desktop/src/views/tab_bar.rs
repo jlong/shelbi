@@ -25,13 +25,16 @@
 //! after one confirmation (dimmed while it's the only tab). It closes on a
 //! press outside it or Esc.
 //!
-//! Dragging a tab moves it ([`TabReorder`]): a tab-shaped ghost
-//! ([`TabGhost`]) follows the pointer, the dragged tab dims in place, and a
-//! 2pt marker shows the gap it lands in: the hovered tab's left half is the
-//! gap before it, its right half the gap after, and the bar's empty space
-//! past the `+` is the end. Over the `+` or off the bar there is no gap, and
-//! a drop there leaves the order alone; so does a drop beside the tab
-//! itself (no marker shows). A press without movement stays a click.
+//! Dragging a tab moves it ([`TabReorder`], [`super::tab_drag`]): a
+//! tab-shaped ghost ([`TabGhost`]) follows the pointer, the dragged tab's
+//! slot empties (it is "lifted"), and the other tabs slide aside so that
+//! empty slot opens in the gap it lands in: a tab's left half is the gap
+//! before it, its right half the gap after (judged where the tabs rest, so
+//! a tab sliding out from under the pointer doesn't flip it), the bar
+//! before the first tab is the start, and its empty space past the `+` the
+//! end. Over the `+` or off the bar there is no gap: the tabs slide back,
+//! and a drop there leaves the order alone. Dropped, the tab settles from
+//! under the ghost into its slot. A press without movement stays a click.
 //!
 //! The bar stays where it is while the sidebar hides and shows; only the
 //! tabs step right to make room for the toggle.
@@ -45,18 +48,19 @@
 use std::time::Instant;
 
 use gpui::{
-    deferred, div, prelude::*, px, AnyElement, App, Bounds, Context, Div, DragMoveEvent, Hsla, MouseButton,
-    MouseDownEvent, SharedString, Size, Stateful, Window,
+    canvas, deferred, div, prelude::*, px, AnyElement, App, Bounds, Context, Div, DragMoveEvent, Hsla,
+    MouseButton, MouseDownEvent, SharedString, Size, Stateful, Window,
 };
 use shelbi_app::overlay::palette::ProjectEntry;
 
 use super::project_menu;
 use super::sidebar::{self, SidebarEvent, SidebarHost, TOOLBAR_BUTTON, TRAFFIC_LIGHTS_RIGHT};
+use super::tab_drag::{SharedLayout, TabFrame};
+pub use super::tab_drag::TabReorder;
 use crate::assets::{heroicon, icons, ICON_SIZE_MENU};
 use crate::elements::placed::{placed, MenuScroll};
 use crate::elements::window_drag;
 use crate::keys::tab_hotkey;
-use crate::project_tabs::ProjectTabs;
 use crate::theme::motion;
 use crate::theme::style::{self, Anchor, Type, Typography, NAV_RADIUS};
 use crate::theme::Theme;
@@ -83,6 +87,10 @@ const TAB_PAD_RIGHT: f32 = 20.0;
 const TAB_GAP: f32 = 8.0;
 /// The widest a tab grows; a longer name truncates.
 const TAB_MAX_W: f32 = 240.0;
+/// The 1pt rule between tabs.
+const RULE_W: f32 = 1.0;
+/// The `+` tab and the rule after it: no drop gap over it.
+const PLUS_SLOT_W: f32 = TAB_BAR_H + RULE_W;
 
 /// The project menu's width and its gap under the `+` tab.
 const MENU_W: f32 = 240.0;
@@ -129,11 +137,13 @@ pub struct TabBarProps<'a> {
     /// Where the pointer was when a tab was last right-clicked: the context
     /// menu's anchor, which the right-click sets.
     pub tab_menu_anchor: &'a Anchor,
-    /// The tab being dragged (it dims in place), while a drag lasts.
-    pub dragging: Option<&'a str>,
-    /// The gap the dragged tab would land in ([`TabReorder::marker`]):
-    /// 0 before the first tab, the tab count after the last.
-    pub drop_marker: Option<usize>,
+    /// The tabs' slide this frame ([`TabReorder::frame`]): each tab's x
+    /// offset from where it rests, and the dragged (lifted) tab, whose slot
+    /// draws empty.
+    pub slide: &'a TabFrame,
+    /// Where the tabs rest, measured as they paint (the drop gap is judged
+    /// against it), and a drag's start.
+    pub layout: &'a SharedLayout,
 }
 
 /// The value a tab drag carries.
@@ -181,75 +191,12 @@ impl Render for TabGhost {
     }
 }
 
-/// A tab drag's state, owned by the window: the dragged tab and the drop gap
-/// the pointer is over. A drag that ends off the bar never hears its drop,
-/// so the window reads it only while a drag is active, and the next drag's
-/// start resets it.
-#[derive(Debug, Default)]
-pub struct TabReorder {
-    project: Option<String>,
-    slot: Option<usize>,
-}
-
-impl TabReorder {
-    /// A drag of `project`'s tab began, over no gap yet.
-    pub fn start(&mut self, project: &str) {
-        self.project = Some(project.to_string());
-        self.slot = None;
-    }
-
-    /// The pointer is over drop gap `slot` (`None`: no gap). Whether that
-    /// changed.
-    pub fn over(&mut self, slot: Option<usize>) -> bool {
-        let changed = self.project.is_some() && self.slot != slot;
-        if changed {
-            self.slot = slot;
-        }
-        changed
-    }
-
-    /// The dragged tab's project.
-    pub fn project(&self) -> Option<&str> {
-        self.project.as_deref()
-    }
-
-    /// The gap the insertion marker shows in: the one the pointer is over,
-    /// when dropping there would move the tab.
-    pub fn marker(&self, tabs: &ProjectTabs) -> Option<usize> {
-        let slot = self.slot?;
-        tabs.landing(self.project.as_deref()?, slot).map(|_| slot)
-    }
-
-    /// The drop: move the dragged tab into the gap the marker shows, and end
-    /// the drag. Whether the tabs changed.
-    pub fn drop(&mut self, tabs: &mut ProjectTabs) -> bool {
-        let (project, slot) = (self.project.take(), self.slot.take());
-        match (project, slot) {
-            (Some(project), Some(slot)) => tabs
-                .landing(&project, slot)
-                .is_some_and(|to| tabs.move_to(&project, to)),
-            _ => false,
-        }
-    }
-}
-
-/// Which edge of a tab the insertion marker sits on.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Edge {
-    Left,
-    Right,
-}
-
 /// How one tab draws this frame, beyond the tab itself.
 struct TabLook {
-    /// Its place in the bar, from 0 (its drop gaps are `ix` and `ix + 1`).
-    ix: usize,
     hovered: bool,
     hotkey: Option<String>,
-    /// The insertion marker, on this tab's edge.
-    marker: Option<Edge>,
-    /// It is the tab being dragged.
-    dragged: bool,
+    /// It is the tab being dragged: its slot draws empty.
+    lifted: bool,
 }
 
 /// A tab's context menu, as one frame draws it.
@@ -464,7 +411,16 @@ pub fn bar_fill(theme: &Theme) -> Hsla {
 
 /// A 1pt full-height rule between tabs.
 fn rule(theme: &Theme) -> Div {
-    div().flex_none().w(px(1.0)).h(px(TAB_BAR_H)).bg(theme.divider)
+    div().flex_none().w(px(RULE_W)).h(px(TAB_BAR_H)).bg(theme.divider)
+}
+
+/// A probe filling its parent, handing it the bounds it painted at.
+fn probe(f: impl Fn(Bounds<gpui::Pixels>) + 'static) -> impl IntoElement {
+    canvas(move |bounds, _, _| f(bounds), |_, _, _, _| {})
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
 }
 
 /// Render the bar.
@@ -489,35 +445,33 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
             )
     });
 
-    let count = props.tabs.len();
+    // The strip's first rule, then each tab with the rule after it (its
+    // slot), laid out where it rests and drawn at its slide offset.
     let mut strip: Vec<AnyElement> = vec![rule(theme).into_any_element()];
     for (ix, tab) in props.tabs.iter().enumerate() {
         let look = TabLook {
-            ix,
             hovered: props.hovered == Some(tab.name.as_str()),
             hotkey: (props.command_held && ix < 9).then(|| tab_hotkey(ix as u8 + 1)),
-            // Gap `ix` on this tab's left edge; the last gap on the last
-            // tab's right.
-            marker: match props.drop_marker {
-                Some(gap) if gap == ix => Some(Edge::Left),
-                Some(gap) if gap == count && ix + 1 == count => Some(Edge::Right),
-                _ => None,
-            },
-            dragged: props.dragging == Some(tab.name.as_str()),
+            lifted: props.slide.lifted.as_deref() == Some(tab.name.as_str()),
         };
-        strip.push(render_tab(tab, look, props.tab_menu_anchor, theme, cx).into_any_element());
-        strip.push(rule(theme).into_any_element());
+        let measure = {
+            let (layout, name) = (props.layout.clone(), tab.name.clone());
+            probe(move |b| layout.borrow_mut().set_width(&name, b.size.width.as_f32()))
+        };
+        strip.push(
+            div()
+                .relative()
+                .left(px(props.slide.offset(&tab.name)))
+                .flex()
+                .flex_row()
+                .min_w_0()
+                .child(render_tab(tab, look, props.tab_menu_anchor, props.layout, theme, cx))
+                .child(rule(theme))
+                .child(measure)
+                .into_any_element(),
+        );
     }
-    strip.push(
-        plus_tab(props.plus, props.menu_open, theme, cx)
-            // No gap over the `+`: a drop there does nothing.
-            .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<TabDrag>, window, cx| {
-                if ev.bounds.contains(&ev.event.position) {
-                    this.sidebar_event(SidebarEvent::DragTabOver(None), window, cx)
-                }
-            }))
-            .into_any_element(),
-    );
+    strip.push(plus_tab(props.plus, props.menu_open, theme, cx).into_any_element());
     strip.push(rule(theme).into_any_element());
     // The bar's empty space past the `+`: the gap after the last tab, and,
     // with no drag, a press there moves the window.
@@ -526,13 +480,16 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
             .debug_selector(|| "tab-bar-drag-end".into())
             .flex_1()
             .h(px(TAB_BAR_H))
-            .on_drag_move(cx.listener(move |this, ev: &DragMoveEvent<TabDrag>, window, cx| {
-                if ev.bounds.contains(&ev.event.position) {
-                    this.sidebar_event(SidebarEvent::DragTabOver(Some(count)), window, cx)
-                }
-            }))
             .into_any_element(),
     );
+    let strip_origin = {
+        let layout = props.layout.clone();
+        probe(move |b| layout.borrow_mut().first_x = b.origin.x.as_f32() + RULE_W)
+    };
+    // The gap under the pointer, judged where the tabs rest; off the bar,
+    // none.
+    let names: Vec<String> = props.tabs.iter().map(|t| t.name.clone()).collect();
+    let gap_layout = props.layout.clone();
 
     let menu = props
         .menu
@@ -571,19 +528,24 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
             // The tabs run the bar's full height, over its rule, so the
             // selected one covers it and joins the main area.
             div()
+                .relative()
                 .flex()
                 .flex_row()
                 .flex_1()
                 .min_w_0()
                 .h(px(TAB_BAR_H))
+                .child(strip_origin)
                 .children(strip),
         )
-        // Off the bar, the dragged tab is over no gap; dropped anywhere on
-        // it, it moves to the gap it was last over.
-        .on_drag_move(cx.listener(|this, ev: &DragMoveEvent<TabDrag>, window, cx| {
-            if !ev.bounds.contains(&ev.event.position) {
-                this.sidebar_event(SidebarEvent::DragTabOver(None), window, cx)
-            }
+        // Dropped anywhere on the bar, the tab moves to the gap it was last
+        // over.
+        .on_drag_move(cx.listener(move |this, ev: &DragMoveEvent<TabDrag>, window, cx| {
+            let gap = ev
+                .bounds
+                .contains(&ev.event.position)
+                .then(|| gap_layout.borrow().gap_at(&names, ev.event.position.x.as_f32(), PLUS_SLOT_W))
+                .flatten();
+            this.sidebar_event(SidebarEvent::DragTabOver(gap), window, cx)
         }))
         .on_drop(cx.listener(|this, _: &TabDrag, window, cx| {
             this.sidebar_event(SidebarEvent::DropTab, window, cx)
@@ -599,16 +561,11 @@ fn render_tab<H: SidebarHost>(
     tab: &Tab,
     look: TabLook,
     menu_anchor: &Anchor,
+    layout: &SharedLayout,
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> Stateful<Div> {
-    let TabLook {
-        ix,
-        hovered,
-        hotkey,
-        marker,
-        dragged,
-    } = look;
+    let TabLook { hovered, hotkey, lifted } = look;
     let selector = format!("tab-{}", tab.name);
     let name = tab.name.clone();
     let hover_name = tab.name.clone();
@@ -620,19 +577,7 @@ fn render_tab<H: SidebarHost>(
         working: tab.working,
     };
     let host = cx.entity().downgrade();
-    let marker = marker.map(|edge| {
-        let line = div()
-            .debug_selector(|| "tab-drop-marker".into())
-            .absolute()
-            .top_0()
-            .w(px(2.0))
-            .h(px(TAB_BAR_H))
-            .bg(theme.focus_ring);
-        match edge {
-            Edge::Left => line.left_0(),
-            Edge::Right => line.right_0(),
-        }
-    });
+    let layout = layout.clone();
     let lead = if hovered {
         let close_selector = format!("tab-close-{}", tab.name);
         let close = tab.name.clone();
@@ -682,7 +627,8 @@ fn render_tab<H: SidebarHost>(
         .overflow_hidden()
         .cursor_pointer()
         .when(tab.selected, |d| d.bg(theme.canvas))
-        .when(dragged, |d| d.opacity(0.4))
+        // Lifted: its slot draws empty (the ghost has it).
+        .when(lifted, |d| d.opacity(0.0))
         .child(lead)
         .child(
             div()
@@ -713,22 +659,19 @@ fn render_tab<H: SidebarHost>(
         )
         // A drag (past gpui's threshold, so a click stays a click) carries
         // the tab; the ghost starts where the tab sits under the pointer.
-        .on_drag(drag, move |drag: &TabDrag, _offset, window, cx: &mut App| {
+        .on_drag(drag, move |drag: &TabDrag, offset, window, cx: &mut App| {
+            let (label, working) = (drag.label.clone(), drag.working);
+            let ghost = cx.new(|_| TabGhost { label, working });
+            {
+                let mut layout = layout.borrow_mut();
+                layout.grab_x = offset.x.as_f32();
+                layout.ghost = Some(ghost.downgrade());
+            }
             let project = drag.project.clone();
             host.update(cx, |this, cx| this.sidebar_event(SidebarEvent::DragTab(project), window, cx))
                 .ok();
-            let (label, working) = (drag.label.clone(), drag.working);
-            cx.new(|_| TabGhost { label, working })
+            ghost
         })
-        // Over this tab, its left half is the gap before it, its right half
-        // the gap after.
-        .on_drag_move(cx.listener(move |this, ev: &DragMoveEvent<TabDrag>, window, cx| {
-            if ev.bounds.contains(&ev.event.position) {
-                let after = ev.event.position.x >= ev.bounds.center().x;
-                this.sidebar_event(SidebarEvent::DragTabOver(Some(ix + usize::from(after))), window, cx)
-            }
-        }))
-        .children(marker)
 }
 
 /// A tab's context menu at the pointer, drawn over everything as the
@@ -796,13 +739,9 @@ fn render_tab_menu<H: SidebarHost>(menu: &TabMenuProps<'_>, theme: &Theme, cx: &
 /// The `+` tab: 52pt square, Heroicons `plus`, opening the project menu;
 /// it records where it lands into `anchor` (for the menu's placement).
 fn plus_tab<H: SidebarHost>(anchor: &Anchor, open: bool, theme: &Theme, cx: &mut Context<H>) -> Stateful<Div> {
-    let probe = {
+    let landed = {
         let cell = anchor.clone();
-        gpui::canvas(move |bounds, _, _| cell.set(Some(bounds)), |_, _, _, _| {})
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
+        probe(move |bounds| cell.set(Some(bounds)))
     };
     let loud = theme.text_loud;
     let hover_fill = theme.background_hover;
@@ -821,7 +760,7 @@ fn plus_tab<H: SidebarHost>(anchor: &Anchor, open: bool, theme: &Theme, cx: &mut
         .bg(rest)
         .hover(move |s| s.bg(hover_fill))
         .tooltip(style::tooltip("Open a project"))
-        .child(probe)
+        .child(landed)
         .child(
             heroicon(icons::PLUS)
                 .text_color(if open { loud } else { theme.icon })
@@ -958,35 +897,6 @@ mod tests {
         assert!(!m.is_open());
         assert_eq!(m.project(), Some("alpha"), "kept while it fades");
         assert_eq!(m.phase(now, true), None, "closed at once under Reduce Motion");
-    }
-
-    #[test]
-    fn a_reorder_drops_into_the_marked_gap_and_ends() {
-        let mut tabs = ProjectTabs::new(["web", "api", "docs"].map(String::from));
-        let mut r = TabReorder::default();
-        assert!(!r.over(Some(0)), "no drag yet");
-        r.start("docs");
-        assert_eq!(r.marker(&tabs), None, "over no gap yet");
-        assert!(r.over(Some(2)));
-        assert_eq!(r.marker(&tabs), None, "its own left gap: it would stay put");
-        assert!(r.over(Some(1)));
-        assert!(!r.over(Some(1)), "unchanged");
-        assert_eq!(r.marker(&tabs), Some(1));
-        assert!(r.drop(&mut tabs));
-        assert_eq!(tabs.order(), ["web", "docs", "api"]);
-        assert_eq!(r.project(), None, "the drop ends it");
-        assert!(!r.drop(&mut tabs));
-        // A drag over no gap at the drop moves nothing; the next start
-        // forgets an earlier drag's gap.
-        r.start("web");
-        r.over(Some(3));
-        r.over(None);
-        assert!(!r.drop(&mut tabs));
-        r.start("web");
-        r.over(Some(3));
-        r.start("web");
-        assert!(!r.drop(&mut tabs));
-        assert_eq!(tabs.order(), ["web", "docs", "api"]);
     }
 
     #[test]

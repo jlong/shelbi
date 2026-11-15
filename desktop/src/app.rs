@@ -6342,7 +6342,8 @@ impl SidebarHost for ShelbiWindow {
                 }
             }
             SidebarEvent::DropTab => {
-                if self.tab_reorder.drop(&mut self.tabs) {
+                let pointer_x = window.mouse_position().x.as_f32();
+                if self.tab_reorder.drop(&mut self.tabs, pointer_x) {
                     self.tabs_changed(cx);
                 }
                 cx.notify();
@@ -6668,6 +6669,14 @@ impl ShelbiWindow {
         let (column, handle) = if editing_workflow { (None, None) } else { (column, handle) };
         // The tab bar, over the column and the main area alike, put whether
         // the sidebar shows or not. The chooser (no project) has none.
+        // A tab drag's slide: only while the drag lasts (a drop off the bar
+        // never reaches the bar to end it, and the ghost's life tells a tab
+        // drag from any other), then the settle after it.
+        let tab_drag_active = cx.has_active_drag() && self.tab_reorder.ghost_alive();
+        let tab_slide = self.tab_reorder.frame(&self.tabs, tab_drag_active, now, reduce_motion);
+        if tab_slide.animating {
+            window.request_animation_frame();
+        }
         let tab_bar = (!editing_workflow && !self.chooser).then(|| {
             let tabs = self.tab_props(cx);
             tab_bar::render(
@@ -6698,10 +6707,8 @@ impl ShelbiWindow {
                         }
                     }),
                     tab_menu_anchor: &self.tab_menu.anchor,
-                    // Only while the drag lasts (a drop off the bar never
-                    // reaches the bar to end it).
-                    dragging: self.tab_reorder.project().filter(|_| cx.has_active_drag()),
-                    drop_marker: self.tab_reorder.marker(&self.tabs).filter(|_| cx.has_active_drag()),
+                    slide: &tab_slide,
+                    layout: &self.tab_reorder.layout,
                 },
                 &theme,
                 cx,
