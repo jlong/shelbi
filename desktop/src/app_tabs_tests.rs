@@ -12,7 +12,7 @@
 
 use std::rc::Rc;
 
-use gpui::{point, px, size, Bounds, Modifiers, Pixels, TestAppContext};
+use gpui::{point, px, size, Bounds, Modifiers, MouseButton, Pixels, TestAppContext};
 
 use super::smoke::Harness;
 use super::*;
@@ -579,4 +579,115 @@ fn the_palettes_close_all_other_projects_keeps_the_shown_one_after_one_sheet(cx:
     h.cx.run_until_parked();
     assert!(!h.cx.has_pending_prompt());
     assert_eq!(shown(&h), "alpha");
+}
+
+/// Press on `from`'s tab, then drag to `to` with the button held (past the
+/// drag threshold first, as a hand would).
+fn drag_tab(h: &mut Harness, from: &'static str, to: gpui::Point<Pixels>) {
+    let start = bounds(h, from).center();
+    h.cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    h.cx.simulate_mouse_move(start + point(px(8.0), px(0.0)), Some(MouseButton::Left), Modifiers::none());
+    h.draw();
+    h.cx.simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+    h.draw();
+}
+
+fn release(h: &mut Harness, at: gpui::Point<Pixels>) {
+    h.cx.simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+    h.cx.run_until_parked();
+    h.draw();
+}
+
+/// A point in `selector`'s left (`right == false`) or right quarter.
+fn quarter(h: &mut Harness, selector: &'static str, right: bool) -> gpui::Point<Pixels> {
+    let b = bounds(h, selector);
+    let x = if right { b.right() - b.size.width / 4.0 } else { b.left() + b.size.width / 4.0 };
+    point(x, b.center().y)
+}
+
+#[gpui::test]
+fn dragging_a_tab_moves_it_and_the_order_sticks(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta", "gamma"], &["alpha", "beta", "gamma"]);
+    h.take_calls();
+    // gamma over alpha's left half: the gap before alpha.
+    let to = quarter(&mut h, "tab-alpha", false);
+    drag_tab(&mut h, "tab-gamma", to);
+    assert!(drawn(&mut h, "tab-drag-ghost"), "a tab-shaped ghost follows the pointer");
+    let ghost = bounds(&mut h, "tab-drag-ghost");
+    assert_eq!(ghost.size.height, px(52.0), "the tab's height");
+    assert!(ghost.contains(&to), "under the pointer");
+    let marker = bounds(&mut h, "tab-drop-marker");
+    assert_eq!(marker.left(), bounds(&mut h, "tab-alpha").left(), "on alpha's left edge");
+    assert_eq!(marker.size.width, px(2.0));
+    assert_eq!(order(&h), ["alpha", "beta", "gamma"], "nothing moves until the drop");
+
+    release(&mut h, to);
+    assert_eq!(order(&h), ["gamma", "alpha", "beta"], "the others keep their order");
+    assert!(!drawn(&mut h, "tab-drag-ghost") && !drawn(&mut h, "tab-drop-marker"));
+    assert!(bounds(&mut h, "tab-gamma").left() < bounds(&mut h, "tab-alpha").left());
+    let saved = h.window.read_with(&h.cx, |w, _| w.window_state.tabs.clone());
+    assert_eq!(saved, order(&h), "saved with the window's state");
+    assert!(h.take_calls().is_empty(), "a drag doesn't switch to the tab");
+    // ⌘1 to ⌘3 follow the new order.
+    h.key("cmd-1");
+    assert_eq!(h.take_calls(), [HostCall::SwitchProject("gamma".into())]);
+    h.key("cmd-3");
+    assert_eq!(h.take_calls(), [HostCall::SwitchProject("beta".into())]);
+
+    // gamma over beta's right half: the gap after the last tab.
+    let to = quarter(&mut h, "tab-beta", true);
+    drag_tab(&mut h, "tab-gamma", to);
+    let marker = bounds(&mut h, "tab-drop-marker");
+    assert_eq!(marker.right(), bounds(&mut h, "tab-beta").right(), "on beta's right edge");
+    release(&mut h, to);
+    assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
+
+    // The bar's empty space past the `+` is the end too.
+    let plus = bounds(&mut h, "tab-plus");
+    let past = point(plus.right() + px(60.0), plus.center().y);
+    drag_tab(&mut h, "tab-alpha", past);
+    assert!(drawn(&mut h, "tab-drop-marker"));
+    release(&mut h, past);
+    assert_eq!(order(&h), ["beta", "gamma", "alpha"]);
+}
+
+#[gpui::test]
+fn a_drag_that_wouldnt_move_the_tab_shows_no_marker_and_changes_nothing(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta", "gamma"], &["alpha", "beta", "gamma"]);
+    h.take_calls();
+    // Beside itself: its own halves, and its neighbors' near halves.
+    for (over, right) in [("tab-beta", false), ("tab-beta", true), ("tab-alpha", true), ("tab-gamma", false)] {
+        let to = quarter(&mut h, over, right);
+        drag_tab(&mut h, "tab-beta", to);
+        assert!(drawn(&mut h, "tab-drag-ghost"));
+        assert!(!drawn(&mut h, "tab-drop-marker"), "{over} right={right}: it would stay put");
+        release(&mut h, to);
+        assert_eq!(order(&h), ["alpha", "beta", "gamma"], "{over} right={right}");
+    }
+    // Over the `+`: no gap, even after passing over one.
+    let plus = bounds(&mut h, "tab-plus").center();
+    let before_alpha = quarter(&mut h, "tab-alpha", false);
+    drag_tab(&mut h, "tab-gamma", before_alpha);
+    assert!(drawn(&mut h, "tab-drop-marker"));
+    h.cx.simulate_mouse_move(plus, Some(MouseButton::Left), Modifiers::none());
+    assert!(!drawn(&mut h, "tab-drop-marker"), "none over the +");
+    release(&mut h, plus);
+    assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
+    // Off the bar: the marker goes, and the drop lands nowhere.
+    let off = point(px(700.0), px(400.0));
+    let before_alpha = quarter(&mut h, "tab-alpha", false);
+    drag_tab(&mut h, "tab-gamma", before_alpha);
+    h.cx.simulate_mouse_move(off, Some(MouseButton::Left), Modifiers::none());
+    assert!(!drawn(&mut h, "tab-drop-marker"), "none off the bar");
+    release(&mut h, off);
+    assert!(!drawn(&mut h, "tab-drag-ghost"));
+    assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
+    assert!(h.take_calls().is_empty());
+
+    // A press and release without movement is still a click.
+    let beta = bounds(&mut h, "tab-beta").center();
+    h.cx.simulate_mouse_down(beta, MouseButton::Left, Modifiers::none());
+    release(&mut h, beta);
+    assert_eq!(h.take_calls(), [HostCall::SwitchProject("beta".into())]);
+    assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
 }

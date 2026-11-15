@@ -1193,6 +1193,8 @@ pub struct ShelbiWindow {
     switcher: tab_bar::ProjectMenu,
     /// A tab's context menu (a right-click on it).
     tab_menu: tab_bar::TabMenu,
+    /// A tab being dragged to a new place, and the gap it is over.
+    tab_reorder: tab_bar::TabReorder,
     /// The project tabs, in order (saved in [`Self::window_state`]).
     tabs: ProjectTabs,
     /// The tab under the pointer: its dot is an `×`.
@@ -1748,6 +1750,7 @@ impl ShelbiWindow {
             dragging: false,
             switcher: tab_bar::ProjectMenu::default(),
             tab_menu: tab_bar::TabMenu::default(),
+            tab_reorder: tab_bar::TabReorder::default(),
             tabs,
             hovered_tab: None,
             command_held: false,
@@ -6322,6 +6325,21 @@ impl SidebarHost for ShelbiWindow {
                 }
                 cx.notify();
             }
+            SidebarEvent::DragTab(project) => {
+                self.tab_reorder.start(&project);
+                cx.notify();
+            }
+            SidebarEvent::DragTabOver(slot) => {
+                if self.tab_reorder.over(slot) {
+                    cx.notify();
+                }
+            }
+            SidebarEvent::DropTab => {
+                if self.tab_reorder.drop(&mut self.tabs) {
+                    self.tabs_changed(cx);
+                }
+                cx.notify();
+            }
             SidebarEvent::AddProject => {
                 self.switcher.close((self.clock)());
                 self.run(CommandKind::AddProject, window, cx)
@@ -6673,6 +6691,10 @@ impl ShelbiWindow {
                         }
                     }),
                     tab_menu_anchor: &self.tab_menu.anchor,
+                    // Only while the drag lasts (a drop off the bar never
+                    // reaches the bar to end it).
+                    dragging: self.tab_reorder.project().filter(|_| cx.has_active_drag()),
+                    drop_marker: self.tab_reorder.marker(&self.tabs).filter(|_| cx.has_active_drag()),
                 },
                 &theme,
                 cx,
