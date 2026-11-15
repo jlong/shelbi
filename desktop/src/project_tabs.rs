@@ -11,6 +11,9 @@
 //! order keeps its place, and a project newly found open goes at the end.
 //! The window's own project always has a tab, open on disk yet or not
 //! (bringing it up is still on its way, or it waits on onboarding).
+//!
+//! Dragging a tab moves it ([`ProjectTabs::move_to`]); the moved order is
+//! saved the same way, so ⌘1 to ⌘9 and the next launch follow it.
 
 /// The tabs, in order. Project ids (`projects/<name>.yaml` stems, or a remote
 /// window's far project names).
@@ -58,6 +61,33 @@ impl ProjectTabs {
         let before = self.order.len();
         self.order.retain(|p| p != project);
         self.order.len() != before
+    }
+
+    /// Move `project`'s tab to `index` in the order (past the end means
+    /// last), the other tabs keeping their relative order. Whether the tabs
+    /// changed: not when `project` has no tab or is there already.
+    pub fn move_to(&mut self, project: &str, index: usize) -> bool {
+        let Some(from) = self.order.iter().position(|p| p == project) else {
+            return false;
+        };
+        let to = index.min(self.order.len() - 1);
+        if to == from {
+            return false;
+        }
+        let tab = self.order.remove(from);
+        self.order.insert(to, tab);
+        true
+    }
+
+    /// Where `project`'s tab lands when dropped in gap `slot` (0 before the
+    /// first tab, `order().len()` after the last), as a [`Self::move_to`]
+    /// index. `None` when the drop would leave it where it is (the gaps on
+    /// either side of it), or it has no tab.
+    pub fn landing(&self, project: &str, slot: usize) -> Option<usize> {
+        let from = self.order.iter().position(|p| p == project)?;
+        let slot = slot.min(self.order.len());
+        let to = if slot > from { slot - 1 } else { slot };
+        (to != from).then_some(to)
     }
 
     /// The tab that takes over when `project`'s closes: its right neighbor,
@@ -145,6 +175,41 @@ mod tests {
         assert!(t.remove("web"));
         assert!(!t.remove("web"));
         assert_eq!(t.order(), ["api"]);
+    }
+
+    #[test]
+    fn move_to_places_a_tab_and_keeps_the_others_in_order() {
+        let mut t = tabs(&["web", "api", "docs", "site"]);
+        assert!(t.move_to("docs", 0), "to the start");
+        assert_eq!(t.order(), ["docs", "web", "api", "site"]);
+        assert!(t.move_to("docs", 3), "to the end");
+        assert_eq!(t.order(), ["web", "api", "site", "docs"]);
+        assert!(t.move_to("web", 99), "past the end is last");
+        assert_eq!(t.order(), ["api", "site", "docs", "web"]);
+        assert!(t.move_to("web", 1), "into the middle");
+        assert_eq!(t.order(), ["api", "web", "site", "docs"]);
+        assert!(!t.move_to("web", 1), "its own position");
+        assert!(!t.move_to("docs", 9), "last already");
+        assert!(!t.move_to("gone", 0), "an unknown project");
+        assert_eq!(t.order(), ["api", "web", "site", "docs"]);
+        assert!(!ProjectTabs::default().move_to("web", 0), "no tabs");
+    }
+
+    #[test]
+    fn a_drop_gap_lands_before_the_tab_after_it() {
+        let t = tabs(&["web", "api", "docs"]);
+        // Gaps: 0 |web| 1 |api| 2 |docs| 3.
+        assert_eq!(t.landing("docs", 0), Some(0), "before the first");
+        assert_eq!(t.landing("docs", 1), Some(1), "between web and api");
+        assert_eq!(t.landing("web", 2), Some(1), "past api, which steps left");
+        assert_eq!(t.landing("web", 3), Some(2), "after the last");
+        assert_eq!(t.landing("web", 9), Some(2), "past the end is the end");
+        assert_eq!(t.landing("api", 1), None, "its own left gap");
+        assert_eq!(t.landing("api", 2), None, "its own right gap");
+        assert_eq!(t.landing("gone", 0), None);
+        let mut moved = t.clone();
+        assert!(moved.move_to("web", t.landing("web", 2).unwrap()));
+        assert_eq!(moved.order(), ["api", "web", "docs"]);
     }
 
     #[test]

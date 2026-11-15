@@ -404,6 +404,15 @@ pub enum SidebarEvent {
     CloseOtherTabs(String),
     /// The pointer entered (`true`) or left a project's tab.
     HoverTab(String, bool),
+    /// A drag of a project's tab began (the pointer moved past the drag
+    /// threshold with the button down on it).
+    DragTab(String),
+    /// The dragged tab is over drop gap `Some(n)` (0 before the first tab,
+    /// the tab count after the last), or over no gap (the `+`, off the bar).
+    DragTabOver(Option<usize>),
+    /// The dragged tab was dropped on the bar: it moves to the gap it was
+    /// last over, if any.
+    DropTab,
     /// The project menu's "Add project…".
     AddProject,
     /// Collapse or expand a section (its header).
