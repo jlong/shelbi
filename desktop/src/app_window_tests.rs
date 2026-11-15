@@ -380,6 +380,14 @@ fn quitting_the_shown_project_keeps_the_window(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("chooser").is_some(), "the chooser is drawn");
     assert!(vcx.debug_bounds("chooser-alpha").is_some());
     assert!(vcx.debug_bounds("chooser-add").is_some());
+    // No titlebar row: its top strip moves the window, clear of the rows.
+    let strip = vcx.debug_bounds("chooser-drag").unwrap();
+    assert_eq!((strip.top(), strip.size.height), (gpui::px(0.0), gpui::px(52.0)));
+    assert!(vcx.debug_bounds("chooser-alpha").unwrap().top() >= strip.bottom());
+    assert_eq!(
+        crate::elements::window_drag::test_log::drag_from(&mut vcx, strip.center()),
+        [crate::elements::window_drag::test_log::Call::Move]
+    );
     // Its Add Project… row asks for the wizard.
     taken(cx, h);
     let add = vcx.debug_bounds("chooser-add").unwrap();

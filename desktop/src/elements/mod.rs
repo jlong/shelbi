@@ -30,6 +30,9 @@
 //!
 //! [`placed`] places every dropdown and menu against its control: below or
 //! flipped above, capped to the window and scrolling, shifted inside it.
+//!
+//! [`window_drag`] marks the empty parts of the window's titlebar row that
+//! move the window (the window owns its titlebar drag, so tabs can drag).
 
 pub mod clamped_text;
 pub mod clocked_animation;
@@ -39,3 +42,4 @@ pub mod placed;
 pub mod rotated_text;
 pub mod spinner;
 pub mod terminal;
+pub mod window_drag;

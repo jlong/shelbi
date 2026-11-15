@@ -4821,3 +4821,41 @@ fn a_project_switch_drops_the_draft_unsaved(cx: &mut TestAppContext) {
     assert_eq!(std::fs::read_to_string(&file).unwrap(), before);
     assert!(ops.calls().is_empty());
 }
+
+/// An editor's titlebar row moves the window from its empty space (the
+/// traffic lights' room and past each side's buttons), never from Back.
+fn assert_titlebar_drags(s: &mut Settings, prefix: &str) {
+    use crate::elements::window_drag::test_log::{self, Call};
+    let at = |s: &mut Settings, part: &str| {
+        let selector: &'static str = Box::leak(format!("{prefix}-{part}").into_boxed_str());
+        s.bounds(selector).unwrap_or_else(|| panic!("{selector} is drawn"))
+    };
+    let lead = at(s, "drag-lead");
+    assert_eq!((lead.left(), lead.right()), (px(0.0), px(sidebar::BESIDE_TRAFFIC_LIGHTS)));
+    let back = at(s, "back");
+    assert_eq!(back.left(), px(sidebar::BESIDE_TRAFFIC_LIGHTS), "Back stays put");
+    let beside = gpui::point(px(sidebar::TRAFFIC_LIGHTS_RIGHT + 4.0), lead.center().y);
+    for (part, point) in [
+        ("lead", beside),
+        ("left", at(s, "drag-left").center()),
+        ("right", at(s, "drag-right").center()),
+    ] {
+        assert_eq!(test_log::drag_from(&mut s.h.cx, point), [Call::Move], "{prefix} {part}");
+    }
+    assert!(at(s, "drag-left").size.width > px(0.0) && at(s, "drag-right").size.width > px(0.0));
+    assert_eq!(test_log::drag_from(&mut s.h.cx, back.center()), [], "{prefix}: Back is a button");
+}
+
+#[gpui::test]
+fn the_workflow_editors_titlebar_moves_the_window_from_its_empty_space(cx: &mut TestAppContext) {
+    let _home = Home::with_project("ed-drag", "alpha");
+    let mut s = Settings::open_editor(cx, "task");
+    assert_titlebar_drags(&mut s, "workflow-editor");
+}
+
+#[gpui::test]
+fn the_agent_editors_titlebar_moves_the_window_from_its_empty_space(cx: &mut TestAppContext) {
+    let _home = crate::views::agents_state::tests::home_for("ad-drag", "alpha");
+    let mut s = Settings::open_agent(cx, "developer");
+    assert_titlebar_drags(&mut s, "agent-editor");
+}

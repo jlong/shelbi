@@ -73,6 +73,7 @@ use super::workflows_state::category_label;
 use crate::assets::{glyph, glyphs, heroicon, icons, Icon};
 use crate::elements::controls;
 use crate::elements::placed::placed;
+use crate::elements::window_drag;
 use crate::theme::motion::fill_layer;
 use crate::theme::style::{self, ButtonContent, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
@@ -1530,6 +1531,18 @@ impl WorkflowEditor {
             .pr(px(12.0))
             .h(px(TITLEBAR_H))
             .bg(theme.toolbar)
+            // The row's empty space moves the window (it owns its titlebar
+            // drag): the traffic lights' room, out of the row's flow, and
+            // the rest of each side past its buttons.
+            .child(
+                window_drag::region("workflow-editor-drag-lead")
+                    .debug_selector(|| "workflow-editor-drag-lead".into())
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(sidebar::BESIDE_TRAFFIC_LIGHTS))
+                    .h_full(),
+            )
             .child(
                 div()
                     .flex()
@@ -1547,7 +1560,13 @@ impl WorkflowEditor {
                             .text_color(theme.text_loud)
                             .child(name),
                     )
-                    .children(badge),
+                    .children(badge)
+                    .child(
+                        window_drag::region("workflow-editor-drag-left")
+                            .debug_selector(|| "workflow-editor-drag-left".into())
+                            .flex_1()
+                            .h(px(TITLEBAR_H)),
+                    ),
             )
             .child(
                 controls::segmented_track(theme)
@@ -1563,6 +1582,12 @@ impl WorkflowEditor {
                     .items_center()
                     .justify_end()
                     .gap(px(8.0))
+                    .child(
+                        window_drag::region("workflow-editor-drag-right")
+                            .debug_selector(|| "workflow-editor-drag-right".into())
+                            .flex_1()
+                            .h(px(TITLEBAR_H)),
+                    )
                     .children(discard)
                     .child(save)
                     // The frame's Ellipsis Button: 30pt across, the 32pt

@@ -35,6 +35,12 @@
 //!
 //! The bar stays where it is while the sidebar hides and shows; only the
 //! tabs step right to make room for the toggle.
+//!
+//! The window owns its titlebar drag (`app_owns_titlebar_drag`), so a press
+//! on a tab is the tab's. The bar's empty space moves the window instead
+//! ([`window_drag::region`]): the traffic lights' room before the first
+//! item, and the space past the `+`. A double click there is the system's
+//! titlebar action.
 
 use std::time::Instant;
 
@@ -48,6 +54,7 @@ use super::project_menu;
 use super::sidebar::{self, SidebarEvent, SidebarHost, TOOLBAR_BUTTON, TRAFFIC_LIGHTS_RIGHT};
 use crate::assets::{heroicon, icons, ICON_SIZE_MENU};
 use crate::elements::placed::{placed, MenuScroll};
+use crate::elements::window_drag;
 use crate::keys::tab_hotkey;
 use crate::project_tabs::ProjectTabs;
 use crate::theme::motion;
@@ -512,9 +519,11 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
             .into_any_element(),
     );
     strip.push(rule(theme).into_any_element());
-    // The bar's empty space past the `+`: the gap after the last tab.
+    // The bar's empty space past the `+`: the gap after the last tab, and,
+    // with no drag, a press there moves the window.
     strip.push(
-        div()
+        window_drag::region("tab-bar-drag-end")
+            .debug_selector(|| "tab-bar-drag-end".into())
             .flex_1()
             .h(px(TAB_BAR_H))
             .on_drag_move(cx.listener(move |this, ev: &DragMoveEvent<TabDrag>, window, cx| {
@@ -544,11 +553,19 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
         .items_start()
         .w_full()
         .h(px(TAB_BAR_H))
-        .pl(px(LEAD_X))
         .bg(bar_fill(theme))
         .border_b_1()
         .border_color(theme.divider)
         .text_color(theme.foreground)
+        // The traffic lights' room, up to the first item: it moves the
+        // window (the lights are native buttons over it).
+        .child(
+            window_drag::region("tab-bar-drag-lead")
+                .debug_selector(|| "tab-bar-drag-lead".into())
+                .flex_none()
+                .w(px(LEAD_X))
+                .h(px(TAB_BAR_H)),
+        )
         .children(toggle)
         .child(
             // The tabs run the bar's full height, over its rule, so the

@@ -56,6 +56,7 @@ use super::workflow_editor::{
 };
 use crate::assets::{icons, Icon};
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
+use crate::elements::window_drag;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
@@ -854,6 +855,18 @@ impl AgentEditor {
             .pr(px(12.0))
             .h(px(TITLEBAR_H))
             .bg(theme.toolbar)
+            // The row's empty space moves the window (it owns its titlebar
+            // drag): the traffic lights' room, out of the row's flow, and
+            // the rest of each side past its buttons.
+            .child(
+                window_drag::region("agent-editor-drag-lead")
+                    .debug_selector(|| "agent-editor-drag-lead".into())
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(sidebar::BESIDE_TRAFFIC_LIGHTS))
+                    .h_full(),
+            )
             .child(
                 div()
                     .flex()
@@ -871,7 +884,13 @@ impl AgentEditor {
                             .text_color(theme.text_loud)
                             .child(name),
                     )
-                    .children(badge),
+                    .children(badge)
+                    .child(
+                        window_drag::region("agent-editor-drag-left")
+                            .debug_selector(|| "agent-editor-drag-left".into())
+                            .flex_1()
+                            .h(px(TITLEBAR_H)),
+                    ),
             )
             .child(
                 div()
@@ -882,6 +901,12 @@ impl AgentEditor {
                     .items_center()
                     .justify_end()
                     .gap(px(8.0))
+                    .child(
+                        window_drag::region("agent-editor-drag-right")
+                            .debug_selector(|| "agent-editor-drag-right".into())
+                            .flex_1()
+                            .h(px(TITLEBAR_H)),
+                    )
                     .children(discard)
                     .child(save)
                     // The frame's Ellipsis Button: 30pt across, the 32pt
