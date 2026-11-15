@@ -7128,12 +7128,10 @@ fn read_snapshot(project: &str, _generation: u64) -> ShellSnapshot {
         board: Some(KanbanApp::read_board_data(project)),
         activity: None,
         machines: Some(MachinesApp::read_data(project)),
-        // One small file, read on the same refresh as the sidebar, so a job
-        // appears (and goes) on the shell's refresh without a poll of its own.
-        jobs: Some(match shelbi_state::awareness::read_awareness(project) {
-            Ok(store) => shelbi_app::jobs::JobsRead::Jobs(store.jobs),
-            Err(e) => shelbi_app::jobs::JobsRead::Failed(e.to_string()),
-        }),
+        // Two small files, read on the same refresh as the sidebar, so a job
+        // appears (and moves to Finished) on the shell's refresh without a
+        // poll of its own.
+        jobs: Some(shelbi_app::jobs::read_local(project)),
     }
 }
 
@@ -7886,7 +7884,7 @@ mod tests {
             board: None,
             activity: None,
             machines: None,
-            jobs: Some(JobsRead::Jobs(jobs)),
+            jobs: Some(JobsRead::Jobs { running: jobs, finished: vec![] }),
         };
         let job = Job {
             id: "j1".into(),
@@ -7901,7 +7899,7 @@ mod tests {
         draw_frame(&mut term, &mut st).unwrap();
         let screen = screen_text(&term);
         assert!(screen.contains("Description") && screen.contains("sleep 60"), "{screen}");
-        assert!(screen.contains("just now"), "{screen}");
+        assert!(screen.contains("Running"), "{screen}");
         st.apply_snapshot(snapshot(vec![]));
         draw_frame(&mut term, &mut st).unwrap();
         let screen = screen_text(&term);

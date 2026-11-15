@@ -25,7 +25,8 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Utc};
 use shelbi_core::{Error, Project, Result, StatusCategory};
 use shelbi_state::awareness::{
-    self, overdue_interval, next_slot_after, AwarenessStore, Job, JobKind, JobResult,
+    self, overdue_interval, next_slot_after, AwarenessStore, Job, JobKind, JobRecord, JobResult,
+    JobStatus,
 };
 
 /// How often a `ci` / `pr` job samples GitHub.
@@ -35,12 +36,11 @@ pub const REMOTE_PROBE_CADENCE: Duration = Duration::from_secs(60);
 /// reported lost.
 const RUNNER_START_GRACE: Duration = Duration::from_secs(120);
 
-/// Finished command-job directories are kept this long for a later look at
-/// their output.
-const JOB_DIR_RETENTION: Duration = Duration::from_secs(7 * 24 * 3600);
-
-/// How often the tick sweeps old job directories.
-const JOB_DIR_PRUNE_CADENCE: Duration = Duration::from_secs(3600);
+/// How often the tick sweeps the finished-job history past its retention
+/// window (`awareness::JOB_HISTORY_MAX_JOBS` / `JOB_HISTORY_MAX_AGE`). A
+/// finish prunes too, so this only matters for age running out on a quiet
+/// project.
+const JOB_HISTORY_PRUNE_CADENCE: Duration = Duration::from_secs(3600);
 
 /// Cross-tick memory for [`tick`]: when each remote job was last sampled, and
 /// when job directories were last pruned. In memory only; a restart samples
@@ -85,10 +85,24 @@ pub trait AwarenessProbe {
 /// What a job reports when it fires.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct JobOutcome {
-    status: &'static str,
+    status: JobStatus,
     exit: Option<i32>,
     detail: Option<String>,
     log: Option<PathBuf>,
+    /// When it ended, when the job says (a command's `result.json`); else the
+    /// tick that noticed.
+    finished_at: Option<DateTime<Utc>>,
+}
+
+impl JobOutcome {
+    fn record(&self, job: &Job, now: DateTime<Utc>) -> JobRecord {
+        JobRecord {
+            exit_code: self.exit,
+            detail: self.detail.clone(),
+            log: self.log.clone(),
+            ..JobRecord::finished(job, self.status, self.finished_at.unwrap_or(now))
+        }
+    }
 }
 
 /// Evaluate `project`'s awareness store once. Best-effort: errors are logged.
@@ -111,7 +125,7 @@ fn tick_inner(
 ) -> Result<()> {
     let name = project.name.as_str();
     let store = awareness::read_awareness(name)?;
-    maybe_prune_job_dirs(name, &store, state);
+    maybe_prune_job_history(name, &store, state, now);
     if store == AwarenessStore::default() {
         state.last_remote_probe.clear();
         return Ok(());
@@ -160,14 +174,20 @@ fn tick_inner(
         return Ok(());
     }
 
-    awareness::update_awareness(name, |store| {
+    let finished = awareness::update_awareness(name, |store| {
         fire_reminders(name, store, now);
-        fire_jobs(name, store, &outcomes);
+        let finished = fire_jobs(name, store, &outcomes, now);
         if let Some(active) = &active {
             fire_estimates(name, store, active, now);
         }
-        Ok(())
-    })
+        Ok(finished)
+    })?;
+    // Into the history once the store no longer lists them. A failure here
+    // loses only the record: the event is already out.
+    if let Err(e) = awareness::record_finished_jobs(name, finished, now) {
+        tracing::warn!(project = name, error = %e, "finished jobs not recorded in the job history");
+    }
+    Ok(())
 }
 
 fn fire_reminders(project: &str, store: &mut AwarenessStore, now: DateTime<Utc>) {
@@ -189,7 +209,15 @@ fn fire_reminders(project: &str, store: &mut AwarenessStore, now: DateTime<Utc>)
     });
 }
 
-fn fire_jobs(project: &str, store: &mut AwarenessStore, outcomes: &HashMap<String, JobOutcome>) {
+/// Report every job with an outcome and drop it from the store. Returns the
+/// history record of each one reported.
+fn fire_jobs(
+    project: &str,
+    store: &mut AwarenessStore,
+    outcomes: &HashMap<String, JobOutcome>,
+    now: DateTime<Utc>,
+) -> Vec<JobRecord> {
+    let mut finished = Vec::new();
     store.jobs.retain(|job| {
         let Some(outcome) = outcomes.get(&job.id) else {
             return true;
@@ -199,19 +227,23 @@ fn fire_jobs(project: &str, store: &mut AwarenessStore, outcomes: &HashMap<Strin
             id: &job.id,
             kind: job.kind.as_str(),
             label: &label,
-            status: outcome.status,
+            status: outcome.status.as_str(),
             exit: outcome.exit,
             detail: outcome.detail.as_deref(),
             log: outcome.log.as_deref(),
         };
         match shelbi_state::append_job_event(project, &event) {
-            Ok(()) => false,
+            Ok(()) => {
+                finished.push(outcome.record(job, now));
+                false
+            }
             Err(e) => {
                 tracing::warn!(project, job = %job.id, error = %e, "job event not written; retrying next tick");
                 true
             }
         }
     });
+    finished
 }
 
 fn fire_estimates(
@@ -252,12 +284,7 @@ fn command_outcome(
     probe: &dyn AwarenessProbe,
 ) -> Option<JobOutcome> {
     let log = awareness::job_output_path(project, &job.id).ok();
-    let finished = |result: JobResult| JobOutcome {
-        status: if result.succeeded() { "ok" } else { "failed" },
-        exit: result.exit_code.or(result.signal.map(|s| 128 + s)),
-        detail: result.detail(),
-        log: log.clone(),
-    };
+    let finished = |result: JobResult| result_outcome(&result, log.clone());
     match awareness::read_job_result(project, &job.id) {
         Ok(Some(result)) => return Some(finished(result)),
         Ok(None) => {}
@@ -279,20 +306,33 @@ fn command_outcome(
         return Some(finished(result));
     }
     Some(JobOutcome {
-        status: "failed",
+        status: JobStatus::Failed,
         exit: None,
         detail: Some("the job runner exited without recording a result".into()),
         log,
+        finished_at: None,
     })
+}
+
+/// A command job's outcome from its runner's `result.json`.
+fn result_outcome(result: &JobResult, log: Option<PathBuf>) -> JobOutcome {
+    JobOutcome {
+        status: if result.succeeded() { JobStatus::Ok } else { JobStatus::Failed },
+        exit: result.exit_code.or(result.signal.map(|s| 128 + s)),
+        detail: result.detail(),
+        log,
+        finished_at: Some(result.finished_at),
+    }
 }
 
 fn pid_outcome(job: &Job, probe: &dyn AwarenessProbe) -> Option<JobOutcome> {
     let pid: u32 = job.target.parse().ok()?;
     (!probe.pid_alive(pid)).then_some(JobOutcome {
-        status: "exited",
+        status: JobStatus::Exited,
         exit: None,
         detail: None,
         log: None,
+        finished_at: None,
     })
 }
 
@@ -320,29 +360,35 @@ fn remote_outcome(
         }
     };
     let (status, detail) = match verdict {
-        WatchVerdict::Passed => ("ok", None),
-        WatchVerdict::Failed { check } => ("failed", Some(format!("failing check: {check}"))),
-        WatchVerdict::Merged => ("merged", None),
-        WatchVerdict::Closed => ("closed", None),
+        WatchVerdict::Passed => (JobStatus::Ok, None),
+        WatchVerdict::Failed { check } => (JobStatus::Failed, Some(format!("failing check: {check}"))),
+        WatchVerdict::Merged => (JobStatus::Merged, None),
+        WatchVerdict::Closed => (JobStatus::Closed, None),
     };
     Some(JobOutcome {
         status,
         exit: None,
         detail,
         log: None,
+        finished_at: None,
     })
 }
 
-fn maybe_prune_job_dirs(project: &str, store: &AwarenessStore, state: &mut AwarenessTickState) {
+fn maybe_prune_job_history(
+    project: &str,
+    store: &AwarenessStore,
+    state: &mut AwarenessTickState,
+    now: DateTime<Utc>,
+) {
     if state
         .last_prune
-        .is_some_and(|t| t.elapsed() < JOB_DIR_PRUNE_CADENCE)
+        .is_some_and(|t| t.elapsed() < JOB_HISTORY_PRUNE_CADENCE)
     {
         return;
     }
     state.last_prune = Some(Instant::now());
     let live: Vec<&str> = store.jobs.iter().map(|j| j.id.as_str()).collect();
-    awareness::prune_job_dirs(project, &live, JOB_DIR_RETENTION);
+    awareness::prune_job_history(project, &live, now);
 }
 
 // ---------------------------------------------------------------------------
@@ -749,11 +795,24 @@ pub fn run_job_exec(project: &str, id: &str, argv: &[String]) -> Result<()> {
 
 /// Cancel job `id`: drop it from the store and, for a command job whose runner
 /// is still alive, SIGTERM the runner's process group (the command with it).
-/// Returns the removed job, or `None` when there was none.
+/// The job goes into the history as `canceled` (or, for a command that had
+/// already finished unreported, as it ended). Returns the removed job, or
+/// `None` when there was none.
 pub fn cancel_job(project: &str, id: &str) -> Result<Option<Job>> {
     let Some(job) = awareness::remove_job(project, id)? else {
         return Ok(None);
     };
+    let now = Utc::now();
+    let mut record = JobRecord::finished(&job, JobStatus::Canceled, now);
+    if job.kind == JobKind::Command {
+        record.log = awareness::job_output_path(project, id).ok();
+        if let Ok(Some(result)) = awareness::read_job_result(project, id) {
+            record = result_outcome(&result, record.log.clone()).record(&job, now);
+        }
+    }
+    if let Err(e) = awareness::record_finished_jobs(project, vec![record], now) {
+        tracing::warn!(project, job = %id, error = %e, "canceled job not recorded in the job history");
+    }
     if job.kind == JobKind::Command {
         if let Some(pid) = job.runner_pid.and_then(|p| i32::try_from(p).ok()) {
             // Only a group this job's own runner leads: the result file is

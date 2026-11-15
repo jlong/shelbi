@@ -1,7 +1,9 @@
-//! The Jobs screen (`View::Jobs`, palette-only): the project's active
-//! awareness jobs (what `shelbi job run` and `shelbi job watch` create) in
-//! a three-column table, drawn from the shared [`shelbi_app::jobs`] model
-//! the TUI's Jobs page draws too.
+//! The Jobs screen (`View::Jobs`, palette-only): the project's awareness
+//! jobs (what `shelbi job run` and `shelbi job watch` create) in a
+//! five-column table, the running ones first, then the finished ones from
+//! the job history under a `Finished` row, drawn from the shared
+//! [`shelbi_app::jobs`] model the TUI's Jobs page draws too. A failed job's
+//! Status is red.
 //!
 //! There's no Figma frame for it, so it borrows the app's: the Machines
 //! view's toolbar (the view's name, loud, on a 37pt row over a divider) and
@@ -10,18 +12,21 @@
 //! an ellipsis so the table never scrolls sideways; hovering it shows the
 //! whole command (a long Description likewise).
 //!
-//! The awareness store has no change notification, so the view re-reads it
-//! every [`REFRESH_INTERVAL`] while it is open, off the UI thread through
-//! the window's [`ProjectSource`] (a remote window's source says the far
-//! store isn't readable yet, and the view shows that line). Each read also
-//! repaints, which is what ticks the "Started" ages over.
+//! The awareness store and the history have no change notification, so the
+//! view re-reads them every [`REFRESH_INTERVAL`] while it is open, off the UI
+//! thread through the window's [`ProjectSource`] (a remote window's source
+//! says the far store isn't readable yet, and the view shows that line).
+//! Each read also repaints, which is what ticks the running durations and
+//! the Finished ages over.
 
 use std::time::{Duration, Instant};
 
 use gpui::{
     div, prelude::*, px, AnyElement, Context, FocusHandle, ScrollHandle, SharedString, Task, Window,
 };
-use shelbi_app::jobs::{one_line, JobRow, JobsModel, JobsRead, COLUMNS, REFRESH_INTERVAL, TITLE};
+use shelbi_app::jobs::{
+    one_line, JobRow, JobsModel, JobsRead, COLUMNS, FINISHED_HEADING, REFRESH_INTERVAL, TITLE,
+};
 use shelbi_app::source::{ProjectHandle, ProjectSource};
 
 use crate::theme::style::{self, Type, Typography};
@@ -30,13 +35,18 @@ use crate::theme::Theme;
 /// How often the view drains its refresher.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The Description and Started columns' widths; Command takes the rest.
-const DESCRIPTION_W: f32 = 240.0;
-const STARTED_W: f32 = 180.0;
+/// The fixed columns' widths; Command takes the rest.
+const DESCRIPTION_W: f32 = 200.0;
+const STATUS_W: f32 = 120.0;
+const DURATION_W: f32 = 72.0;
+const FINISHED_W: f32 = 160.0;
+
+/// The gap between columns.
+const COLUMN_GAP: f32 = 20.0;
 
 /// A Description longer than this many characters may not fit its column:
 /// it gets a tooltip with the whole text.
-const DESCRIPTION_TIP_CHARS: usize = 28;
+const DESCRIPTION_TIP_CHARS: usize = 24;
 
 pub struct JobsView {
     model: JobsModel,
@@ -126,15 +136,24 @@ impl JobsView {
         let headings = div()
             .flex()
             .flex_row()
-            .gap(px(24.0))
+            .gap(px(COLUMN_GAP))
             .px(px(12.0))
             .py(px(6.0))
             .child(div().w(px(DESCRIPTION_W)).flex_none().child(COLUMNS[0]))
             .child(div().flex_1().min_w_0().child(COLUMNS[1]))
-            .child(div().w(px(STARTED_W)).flex_none().child(COLUMNS[2]));
+            .child(div().w(px(STATUS_W)).flex_none().child(COLUMNS[2]))
+            .child(div().w(px(DURATION_W)).flex_none().child(COLUMNS[3]))
+            .child(div().w(px(FINISHED_W)).flex_none().child(COLUMNS[4]));
+        let finished_start = self.model.finished_start();
         let mut rows: Vec<AnyElement> = Vec::new();
         for (i, row) in self.model.rows().iter().enumerate() {
-            if i > 0 {
+            if Some(i) == finished_start {
+                if i > 0 {
+                    rows.push(div().h(px(1.0)).bg(theme.divider_strong).into_any_element());
+                }
+                rows.push(finished_heading(theme));
+                rows.push(div().h(px(1.0)).bg(theme.divider).into_any_element());
+            } else if i > 0 {
                 rows.push(div().h(px(1.0)).bg(theme.divider).into_any_element());
             }
             rows.push(job_row(row, now, theme));
@@ -155,8 +174,21 @@ impl JobsView {
     }
 }
 
+/// The section row above the finished jobs, in the headings' type.
+fn finished_heading(theme: &Theme) -> AnyElement {
+    div()
+        .debug_selector(|| "jobs-finished-heading".into())
+        .px(px(12.0))
+        .py(px(6.0))
+        .type_style(Type::SmallMedium)
+        .text_color(theme.form_hint)
+        .child(FINISHED_HEADING)
+        .into_any_element()
+}
+
 /// One job's row: its description, its command cut to the column (whole in
-/// a tooltip), and when it started.
+/// a tooltip), its status (red when it failed), how long it ran, and when it
+/// finished.
 fn job_row(row: &JobRow, now: chrono::DateTime<chrono::Utc>, theme: &Theme) -> AnyElement {
     let id = row.id.clone();
     let description = one_line(&row.description);
@@ -166,7 +198,7 @@ fn job_row(row: &JobRow, now: chrono::DateTime<chrono::Utc>, theme: &Theme) -> A
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(24.0))
+        .gap(px(COLUMN_GAP))
         .px(px(12.0))
         .py(px(10.0))
         .type_style(Type::Base)
@@ -197,11 +229,32 @@ fn job_row(row: &JobRow, now: chrono::DateTime<chrono::Utc>, theme: &Theme) -> A
         )
         .child(
             div()
-                .w(px(STARTED_W))
+                .debug_selector({
+                    let id = row.id.clone();
+                    move || format!("job-status-{id}")
+                })
+                .w(px(STATUS_W))
+                .flex_none()
+                .truncate()
+                .when(row.failed(), |d| d.type_style(Type::BaseMedium))
+                .text_color(theme.tone(row.status_tone()))
+                .child(row.status_label()),
+        )
+        .child(
+            div()
+                .w(px(DURATION_W))
                 .flex_none()
                 .truncate()
                 .text_color(theme.muted)
-                .child(row.started(now)),
+                .child(row.duration(now)),
+        )
+        .child(
+            div()
+                .w(px(FINISHED_W))
+                .flex_none()
+                .truncate()
+                .text_color(theme.muted)
+                .child(row.finished(now)),
         )
         .into_any_element()
 }
@@ -213,7 +266,7 @@ impl Render for JobsView {
             window.focus(&self.focus, cx);
         }
         let theme = *cx.global::<Theme>();
-        let count = self.model.rows().len();
+        let summary = self.model.summary();
         div()
             .id("jobs")
             .debug_selector(|| "jobs".into())
@@ -244,12 +297,13 @@ impl Render for JobsView {
                             .text_color(theme.text_loud)
                             .child(TITLE),
                     )
-                    .when(count > 0, |d| {
+                    .when_some(summary, |d, summary| {
                         d.child(
                             div()
+                                .debug_selector(|| "jobs-summary".into())
                                 .type_style(Type::XSmall)
                                 .text_color(theme.muted)
-                                .child(format!("{count} active")),
+                                .child(summary),
                         )
                     }),
             )
@@ -265,7 +319,7 @@ mod tests {
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use shelbi_app::jobs::{EMPTY_TEXT, REMOTE_TEXT};
     use shelbi_app::source::ProjectKey;
-    use shelbi_state::awareness::{update_awareness, Job, JobKind};
+    use shelbi_state::awareness::{record_finished_jobs, update_awareness, Job, JobKind, JobRecord, JobStatus};
 
     const PROJECT: &str = "jobs";
     const LONG: &str = "zsh -c 'cd /Users/me/Workspaces/shelbi/desktop && cargo clippy --all-targets -- -D warnings && cargo test'";
@@ -365,6 +419,42 @@ mod tests {
         assert!(vcx.debug_bounds("jobs-empty").is_some());
         assert!(vcx.debug_bounds("jobs-table").is_none());
         assert_eq!(view.read_with(&vcx, |v, _| v.model().message()).as_deref(), Some(EMPTY_TEXT));
+        view.update(&mut vcx, |v, _| v.stop_workers());
+    }
+
+    #[gpui::test]
+    fn finished_jobs_sit_under_a_heading_after_the_running_ones(cx: &mut TestAppContext) {
+        let _home = shelbi_app::settings::agents::fixture::Home::new("dt-jobs-history", PROJECT, crate::test_env::lock());
+        let now = Utc::now();
+        let ago = |m: i64| now - chrono::Duration::minutes(m);
+        set_jobs(vec![job("j9", JobKind::Command, "sleep 600", Some("bundle"), ago(3))]);
+        let finished = |id: &str, status, exit, m: i64| JobRecord {
+            exit_code: exit,
+            ..JobRecord::finished(&job(id, JobKind::Command, "cargo test", Some(id), ago(m + 2)), status, ago(m))
+        };
+        record_finished_jobs(
+            PROJECT,
+            vec![finished("j7", JobStatus::Failed, Some(3), 30), finished("j8", JobStatus::Ok, Some(0), 10)],
+            now,
+        )
+        .unwrap();
+        let (view, mut vcx) = open(cx, shelbi_orchestrator::source::local_handle(PROJECT));
+        assert!(read_until(&view, &mut vcx, |m| m.rows().len() == 3), "the first read lands");
+        let ids: Vec<String> = view.read_with(&vcx, |v, _| v.model().rows().iter().map(|r| r.id.clone()).collect());
+        assert_eq!(ids, ["j9", "j8", "j7"], "running, then newest finished first");
+        let mut tops = Vec::new();
+        for sel in ["job-row-j9", "jobs-finished-heading", "job-row-j8", "job-row-j7"] {
+            tops.push(vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} drawn")).top());
+        }
+        assert!(tops.windows(2).all(|w| w[0] < w[1]), "running, the heading, then finished: {tops:?}");
+        assert!(vcx.debug_bounds("jobs-summary").is_some());
+        let model = view.read_with(&vcx, |v, _| v.model().clone());
+        assert_eq!(model.summary().as_deref(), Some("1 running · 2 finished"));
+        let failed = &model.rows()[2];
+        assert_eq!(failed.status_label(), "Failed · exit 3");
+        let theme = vcx.update(|_, cx| *cx.global::<Theme>());
+        assert_eq!(theme.tone(failed.status_tone()), theme.red, "a failure reads red");
+        assert!(vcx.debug_bounds("job-status-j7").is_some());
         view.update(&mut vcx, |v, _| v.stop_workers());
     }
 

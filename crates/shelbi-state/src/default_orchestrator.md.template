@@ -178,7 +178,8 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
   watch` finished. `status` is `ok` or `failed` for a command (with `exit=<code>`,
   the last output line as `detail=` and the output's `log=<path>`), `exited` for
   a process, `ok` or `failed` for CI (the failing check in `detail`), and
-  `merged`, `closed`, `ok` or `failed` for a PR.
+  `merged`, `closed`, `ok` or `failed` for a PR. When a command failed, read its
+  output with `shelbi job log <id> -n 20` rather than opening the log by path.
 - `<ts> project=<name> task=<id> overdue estimate=<d> elapsed=<d>
   workspace=<ws>` — an active issue ran past its estimate. It repeats every
   half the estimate (at least every 10 minutes) until the issue leaves the
@@ -521,13 +522,16 @@ something Shelbi will tell you about. Board changes already are. For the rest:
 - **Run long local commands as jobs instead of blocking on them.** Wrap a
   build, a test suite or a migration in `shelbi job run --label "<label>" --
   <command>`. It prints a job id at once, and the `job` event arrives when it
-  finishes, with its status, last output line and log path.
+  finishes, with its status, last output line and log path. Read the output
+  with `shelbi job log <id> -n 20` (the whole log without `-n`; `-f` follows a
+  running job to its end).
 - **Watch CI and PRs instead of polling them.** `shelbi job watch --pr
   <number>` reports a PR merging, closing or its checks settling; `--ci <sha>`
   reports a commit's CI finishing; `--pid <pid>` a process exiting. An
   in-review issue's PR already reports through `ci` events, so watch the ones
   Shelbi doesn't poll: an external PR, a release, a commit on another branch.
-  `shelbi job list` shows what is still watched; `shelbi job cancel <id>`
+  `shelbi job list` shows what is still watched, `shelbi job list --all` adds
+  the finished ones (status, exit code, duration, log); `shelbi job cancel <id>`
   stops one.
 
 Reminders and jobs survive your restart and the hub's. Name what each one is
@@ -946,7 +950,8 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
 - `shelbi job run [--label <label>] -- <command>` — run a command detached; an
   event reports its result. `shelbi job watch --pr <n> | --ci <sha> | --pid
   <pid>` — get an event when a PR, a commit's CI or a process finishes.
-  `shelbi job list` / `shelbi job cancel <id>`.
+  `shelbi job log <id> [-n <N>] [-f]` — a job's output (its last N lines; `-f`
+  follows a running one). `shelbi job list [--all]` / `shelbi job cancel <id>`.
 - `shelbi events tail [--project <name>]` — raw event-log view, for a quick
   look back. Your events already reach you; don't follow it.
 <!-- /shelbi:awareness -->

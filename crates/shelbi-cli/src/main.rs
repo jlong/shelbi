@@ -134,8 +134,9 @@ enum Cmd {
         cmd: commands::remind::RemindCmd,
     },
     /// Watched jobs: `job run -- <cmd>` (detached), `job watch --pid | --ci |
-    /// --pr`, `list`, `cancel`. The hub writes a `job` line to `events.log`
-    /// when each finishes.
+    /// --pr`, `list [--all]`, `log <id> [-n N] [-f]`, `cancel`. The hub writes
+    /// a `job` line to `events.log` when each finishes, and keeps it in the
+    /// job history (`job list --all`).
     Job {
         #[command(subcommand)]
         cmd: commands::job::JobCmd,

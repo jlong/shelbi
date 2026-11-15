@@ -378,3 +378,73 @@ fn commit_and_pr_verdicts_grade_the_rollup() {
         Some(WatchVerdict::Failed { check: "app-ci".into() })
     );
 }
+
+#[test]
+fn a_finished_job_moves_into_the_history_with_how_it_ended() {
+    let _home = home();
+    let probe = FakeProbe::default();
+    probe.alive.borrow_mut().insert(77);
+    let mut state = AwarenessTickState::default();
+    let failing = command_job();
+    awareness::set_job_runner_pid(P, &failing, 4242).unwrap();
+    awareness::add_job(P, NewJob { kind: JobKind::Pid, target: "77".into(), label: None }).unwrap();
+    probe.alive.borrow_mut().insert(4242);
+    finish(&failing, 3, &["running 4 tests", "test result: FAILED"]);
+    run(&mut state, Utc::now(), &probe);
+
+    // A fresh read, as after a hub restart: the record is on disk.
+    let history = awareness::read_job_history(P).unwrap();
+    assert_eq!(history.len(), 1, "{history:?}");
+    let rec = &history[0];
+    assert_eq!(rec.id, failing);
+    assert_eq!(rec.kind, JobKind::Command);
+    assert_eq!(rec.status, JobStatus::Failed);
+    assert_eq!(rec.exit_code, Some(3));
+    assert_eq!(rec.detail.as_deref(), Some("test result: FAILED"));
+    assert_eq!(rec.log, Some(awareness::job_output_path(P, &failing).unwrap()));
+    assert_eq!(rec.display_label(), "desktop tests");
+    assert!(rec.finished_at >= rec.started_at);
+
+    // The pid watch exits: recorded too, newest first.
+    probe.alive.borrow_mut().remove(&77);
+    run(&mut state, Utc::now() + chrono::Duration::seconds(1), &probe);
+    let history = awareness::read_job_history(P).unwrap();
+    let ids: Vec<(&str, JobStatus)> = history.iter().map(|r| (r.id.as_str(), r.status)).collect();
+    assert_eq!(ids, [("j2", JobStatus::Exited), (failing.as_str(), JobStatus::Failed)]);
+    assert_eq!(history[0].log, None, "a watch has no output");
+    assert!(store().jobs.is_empty());
+}
+
+#[test]
+fn a_watch_verdict_is_recorded_with_its_status() {
+    let _home = home();
+    let probe = FakeProbe::default();
+    let mut state = AwarenessTickState::default();
+    awareness::add_job(P, NewJob { kind: JobKind::Pr, target: "42".into(), label: None }).unwrap();
+    *probe.pr.borrow_mut() = Some(WatchVerdict::Closed);
+    run(&mut state, Utc::now(), &probe);
+    let history = awareness::read_job_history(P).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!((history[0].status, history[0].display_label().as_str()), (JobStatus::Closed, "PR #42"));
+}
+
+#[test]
+fn a_canceled_job_is_recorded_as_canceled() {
+    let _home = home();
+    let pid = awareness::add_job(P, NewJob { kind: JobKind::Pid, target: "1".into(), label: Some("init".into()) })
+        .unwrap()
+        .id;
+    let cmd = command_job();
+    finish(&cmd, 0, &["done"]);
+    cancel_job(P, &pid).unwrap().unwrap();
+    // A command that finished before the poller reported it keeps its result.
+    cancel_job(P, &cmd).unwrap().unwrap();
+    let history = awareness::read_job_history(P).unwrap();
+    let by_id = |id: &str| history.iter().find(|r| r.id == id).unwrap();
+    assert_eq!(by_id(&pid).status, JobStatus::Canceled);
+    assert_eq!(by_id(&cmd).status, JobStatus::Ok);
+    assert_eq!(by_id(&cmd).exit_code, Some(0));
+    assert!(by_id(&cmd).log.is_some());
+    assert!(store().jobs.is_empty());
+    assert!(cancel_job(P, &pid).unwrap().is_none(), "canceled once");
+}
