@@ -268,10 +268,7 @@ impl ProjectSource for LocalSource {
     }
 
     fn jobs(&self) -> shelbi_app::jobs::JobsRead {
-        match shelbi_state::awareness::read_awareness(self.name()) {
-            Ok(store) => shelbi_app::jobs::JobsRead::Jobs(store.jobs),
-            Err(e) => shelbi_app::jobs::JobsRead::Failed(e.to_string()),
-        }
+        shelbi_app::jobs::read_local(self.name())
     }
 
     fn machine_reachability(&self, host: &str) -> Reachability {

@@ -19,6 +19,12 @@
 //! `result.json`. The detached runner (`shelbi __job-exec`) writes both; the
 //! poller reads the result and reports it.
 //!
+//! A job that finishes (or is canceled) leaves the store for the history,
+//! `<project_dir>/jobs/history.json`: one [`JobRecord`] per finished job, with
+//! how it ended and its log path. The history keeps the newest
+//! [`JOB_HISTORY_MAX_JOBS`] jobs finished within [`JOB_HISTORY_MAX_AGE`],
+//! whichever is fewer, and a job's directory goes when its record does.
+//!
 //! The store never creates the project's state directory: a write for a
 //! project whose `<project_dir>` is missing fails instead, so a mistyped
 //! `--project` (or a stale `SHELBI_PROJECT`) can't leave a stray project
@@ -49,6 +55,18 @@ pub const MIN_OVERDUE_INTERVAL: Duration = Duration::from_secs(10 * 60);
 
 /// How many trailing output lines a finished command job keeps in its result.
 pub const JOB_TAIL_LINES: usize = 20;
+
+/// The finished-jobs history file, under [`JOBS_DIR`].
+pub const JOB_HISTORY_FILE: &str = "history.json";
+
+/// The most finished jobs a project's history keeps. Past it the oldest
+/// record goes, and its job directory (its `output.log`) with it.
+pub const JOB_HISTORY_MAX_JOBS: usize = 200;
+
+/// The longest a finished job stays in the history. Whichever of this and
+/// [`JOB_HISTORY_MAX_JOBS`] is smaller wins: a record (and its log) is kept
+/// only while it is both among the newest 200 and under 30 days old.
+pub const JOB_HISTORY_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
 
 /// The whole store. Each list is elided from the file while empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,15 +164,21 @@ impl Job {
     /// The label the event line and listings show: the caller's `--label`, or
     /// a short description of the target.
     pub fn display_label(&self) -> String {
-        if let Some(label) = self.label.as_deref().filter(|l| !l.trim().is_empty()) {
-            return label.to_string();
-        }
-        match self.kind {
-            JobKind::Command => self.target.clone(),
-            JobKind::Pid => format!("pid {}", self.target),
-            JobKind::Ci => format!("ci {}", short_sha(&self.target)),
-            JobKind::Pr => format!("PR #{}", self.target),
-        }
+        job_label(self.kind, &self.target, self.label.as_deref())
+    }
+}
+
+/// A job's label: `label` when it has one, else a short description of what
+/// a `kind` job on `target` watches. Shared by [`Job`] and [`JobRecord`].
+pub fn job_label(kind: JobKind, target: &str, label: Option<&str>) -> String {
+    if let Some(label) = label.filter(|l| !l.trim().is_empty()) {
+        return label.to_string();
+    }
+    match kind {
+        JobKind::Command => target.to_string(),
+        JobKind::Pid => format!("pid {target}"),
+        JobKind::Ci => format!("ci {}", short_sha(target)),
+        JobKind::Pr => format!("PR #{target}"),
     }
 }
 
@@ -473,31 +497,292 @@ pub fn tail_lines(path: &Path, n: usize) -> Vec<String> {
     lines[skip..].iter().map(|l| l.to_string()).collect()
 }
 
-/// Remove job directories older than `max_age` that no live job owns. Best
-/// effort: a directory that can't be read or removed is left alone.
-pub fn prune_job_dirs(project: &str, live_ids: &[&str], max_age: Duration) {
-    let Ok(root) = project_dir(project).map(|d| d.join(JOBS_DIR)) else {
-        return;
-    };
-    let Ok(entries) = std::fs::read_dir(&root) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        if live_ids.contains(&name) {
-            continue;
+/// Where the last `n` lines of the file at `path` start, as a byte offset,
+/// `tail -n` style: a final newline ends the last line rather than starting
+/// an empty one. Reads backwards in chunks, so a long log costs only what it
+/// skips over. `n == 0` is the end of the file.
+pub fn last_lines_offset(path: &Path, n: usize) -> std::io::Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    const CHUNK: u64 = 64 * 1024;
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if n == 0 || len == 0 {
+        return Ok(len);
+    }
+    let mut end = len;
+    let mut newlines = 0usize;
+    let mut skip_final = true;
+    let mut buf = vec![0u8; CHUNK as usize];
+    while end > 0 {
+        let start = end.saturating_sub(CHUNK);
+        let size = (end - start) as usize;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buf[..size])?;
+        for i in (0..size).rev() {
+            if buf[i] != b'\n' {
+                skip_final = false;
+                continue;
+            }
+            if std::mem::take(&mut skip_final) {
+                // The newline that ends the file's last line.
+                continue;
+            }
+            newlines += 1;
+            if newlines == n {
+                return Ok(start + i as u64 + 1);
+            }
         }
-        let old = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > max_age);
-        if old {
-            let _ = std::fs::remove_dir_all(entry.path());
+        end = start;
+    }
+    Ok(0)
+}
+
+// ---------------------------------------------------------------------------
+// Finished-job history
+
+/// How a finished job ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobStatus {
+    /// A command exited 0, or the watched CI / PR checks passed.
+    Ok,
+    /// A command exited non-zero (or never started, or lost its runner), or
+    /// a watched check failed.
+    Failed,
+    /// A watched process exited.
+    Exited,
+    /// A watched PR merged.
+    Merged,
+    /// A watched PR closed without merging.
+    Closed,
+    /// `shelbi job cancel` stopped it.
+    #[serde(alias = "cancelled")]
+    Canceled,
+}
+
+impl JobStatus {
+    /// The word the `job` event's `status=` and the listings use.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            JobStatus::Ok => "ok",
+            JobStatus::Failed => "failed",
+            JobStatus::Exited => "exited",
+            JobStatus::Merged => "merged",
+            JobStatus::Closed => "closed",
+            JobStatus::Canceled => "canceled",
         }
     }
+}
+
+impl std::fmt::Display for JobStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A finished job, as the history keeps it: the [`Job`] it was, plus how and
+/// when it ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRecord {
+    pub id: String,
+    pub kind: JobKind,
+    /// The command line, or the pid / commit sha / PR number watched.
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    pub status: JobStatus,
+    /// A command's exit code (128 + the signal when a signal ended it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// The event's `detail`: a command's last output line (or why it never
+    /// started), a watch's failing check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// A command's `output.log`, while the history keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log: Option<PathBuf>,
+}
+
+impl JobRecord {
+    /// The record for `job`, finished at `finished_at` with `status`.
+    pub fn finished(job: &Job, status: JobStatus, finished_at: DateTime<Utc>) -> Self {
+        JobRecord {
+            id: job.id.clone(),
+            kind: job.kind,
+            target: job.target.clone(),
+            label: job.label.clone(),
+            started_at: job.started_at,
+            finished_at,
+            status,
+            exit_code: None,
+            detail: None,
+            log: None,
+        }
+    }
+
+    /// The label the listings show (see [`Job::display_label`]).
+    pub fn display_label(&self) -> String {
+        job_label(self.kind, &self.target, self.label.as_deref())
+    }
+
+    /// How long it ran. A skewed clock reads zero, never negative.
+    pub fn duration(&self) -> Duration {
+        (self.finished_at - self.started_at).to_std().unwrap_or_default()
+    }
+}
+
+/// The history file's shape: the records, oldest first.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct JobHistoryFile {
+    #[serde(default)]
+    jobs: Vec<JobRecord>,
+}
+
+/// `<project_dir>/jobs/history.json`.
+pub fn job_history_path(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join(JOBS_DIR).join(JOB_HISTORY_FILE))
+}
+
+/// The numeric part of a `j<N>` id, for ordering jobs minted in one second.
+pub fn job_id_number(id: &str) -> u64 {
+    id.trim_start_matches(|c: char| !c.is_ascii_digit()).parse().unwrap_or(0)
+}
+
+fn newest_first(records: &mut [JobRecord]) {
+    records.sort_by(|a, b| {
+        b.finished_at
+            .cmp(&a.finished_at)
+            .then_with(|| job_id_number(&b.id).cmp(&job_id_number(&a.id)))
+    });
+}
+
+/// The project's finished jobs, newest first. A missing file is no history;
+/// any other read or parse error propagates.
+pub fn read_job_history(project: &str) -> Result<Vec<JobRecord>> {
+    read_job_history_at(&job_history_path(project)?)
+}
+
+fn read_job_history_at(path: &Path) -> Result<Vec<JobRecord>> {
+    let text = match read_to_string_at(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Io(e)),
+    };
+    let mut file: JobHistoryFile =
+        serde_json::from_str(&text).map_err(|e| Error::Other(format!("{}: {e}", path.display())))?;
+    newest_first(&mut file.jobs);
+    Ok(file.jobs)
+}
+
+/// The finished job `id`, if the history still has it.
+pub fn find_job_record(project: &str, id: &str) -> Result<Option<JobRecord>> {
+    Ok(read_job_history(project)?.into_iter().find(|r| r.id == id))
+}
+
+/// Split `records` (newest first) into those the retention window keeps at
+/// `now` and those it drops: the newest [`JOB_HISTORY_MAX_JOBS`] that
+/// finished within [`JOB_HISTORY_MAX_AGE`].
+fn retention_split(records: Vec<JobRecord>, now: DateTime<Utc>) -> (Vec<JobRecord>, Vec<JobRecord>) {
+    let oldest = now - chrono::Duration::from_std(JOB_HISTORY_MAX_AGE).unwrap_or(chrono::Duration::MAX);
+    let (mut kept, mut dropped) = (Vec::new(), Vec::new());
+    for record in records {
+        if kept.len() < JOB_HISTORY_MAX_JOBS && record.finished_at >= oldest {
+            kept.push(record);
+        } else {
+            dropped.push(record);
+        }
+    }
+    (kept, dropped)
+}
+
+/// Locked read-modify-write on the history: `f` edits the records (newest
+/// first), then the retention window applies at `now` and the directories of
+/// the records it dropped are removed. Written only when something changed.
+fn update_job_history(
+    project: &str,
+    now: DateTime<Utc>,
+    f: impl FnOnce(&mut Vec<JobRecord>),
+) -> Result<Vec<JobRecord>> {
+    let jobs = existing_project_dir(project)?.join(JOBS_DIR);
+    crate::ensure_dir(&jobs)?;
+    let path = jobs.join(JOB_HISTORY_FILE);
+    let _lock = acquire_file_lock(&crate::sibling_lock_path(&path))?;
+    let before = read_job_history_at(&path)?;
+    let mut records = before.clone();
+    f(&mut records);
+    newest_first(&mut records);
+    let (kept, dropped) = retention_split(records, now);
+    if kept != before {
+        let mut oldest_first = kept.clone();
+        oldest_first.reverse();
+        let body = serde_json::to_vec_pretty(&JobHistoryFile { jobs: oldest_first })
+            .map_err(|e| Error::Other(format!("{JOB_HISTORY_FILE}: {e}")))?;
+        atomic_write(&path, &body)?;
+    }
+    for record in &dropped {
+        if let Ok(dir) = job_dir(project, &record.id) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+    Ok(dropped)
+}
+
+/// Add `records` to the history, replacing any record with the same id (so a
+/// tick that is retried after a failed store write never lists a job twice),
+/// then prune past the retention window.
+pub fn record_finished_jobs(project: &str, records: Vec<JobRecord>, now: DateTime<Utc>) -> Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+    update_job_history(project, now, |history| {
+        history.retain(|old| !records.iter().any(|r| r.id == old.id));
+        history.extend(records);
+    })
+    .map(drop)
+}
+
+/// The tick's sweep: drop history records past the retention window (and
+/// their directories), then remove every job directory that neither a live
+/// job (`live_ids`) nor a kept record owns once it is older than
+/// [`JOB_HISTORY_MAX_AGE`] (one from before the history existed, or from a
+/// runner that failed to start). Best effort: errors are skipped. Returns
+/// the ids of the records it dropped.
+pub fn prune_job_history(project: &str, live_ids: &[&str], now: DateTime<Utc>) -> Vec<String> {
+    let Ok(dir) = project_dir(project) else {
+        return Vec::new();
+    };
+    let root = dir.join(JOBS_DIR);
+    if !root.is_dir() {
+        return Vec::new();
+    }
+    let dropped = update_job_history(project, now, |_| {}).unwrap_or_default();
+    let Ok(kept) = read_job_history(project) else {
+        return dropped.into_iter().map(|r| r.id).collect();
+    };
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+                continue;
+            }
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if live_ids.contains(&name) || kept.iter().any(|r| r.id == name) {
+                continue;
+            }
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > JOB_HISTORY_MAX_AGE);
+            if old {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    dropped.into_iter().map(|r| r.id).collect()
 }
 
 #[cfg(test)]
@@ -718,5 +1003,122 @@ mod tests {
         assert!(!back.succeeded());
         assert_eq!(back.detail().as_deref(), Some("line 30"));
         assert!(job_dir("demo", "../x").is_err());
+    }
+
+    fn record(id: &str, finished_at: DateTime<Utc>) -> JobRecord {
+        let job = Job {
+            id: id.into(),
+            kind: JobKind::Command,
+            target: "cargo test".into(),
+            label: None,
+            started_at: finished_at - chrono::Duration::seconds(90),
+            runner_pid: None,
+        };
+        JobRecord { exit_code: Some(0), ..JobRecord::finished(&job, JobStatus::Ok, finished_at) }
+    }
+
+    fn history_ids() -> Vec<String> {
+        read_job_history("demo").unwrap().into_iter().map(|r| r.id).collect()
+    }
+
+    #[test]
+    fn the_history_is_newest_first_and_a_rerecord_replaces() {
+        let _home = Home::new("history");
+        let now = Utc::now();
+        let t = |m: i64| now - chrono::Duration::minutes(m);
+        record_finished_jobs("demo", vec![record("j1", t(30)), record("j3", t(10))], now).unwrap();
+        record_finished_jobs("demo", vec![record("j2", t(20))], now).unwrap();
+        assert_eq!(history_ids(), ["j3", "j2", "j1"]);
+        // A retried tick records j2 again: still listed once.
+        let mut again = record("j2", t(20));
+        again.status = JobStatus::Failed;
+        record_finished_jobs("demo", vec![again], now).unwrap();
+        assert_eq!(history_ids(), ["j3", "j2", "j1"]);
+        let j2 = find_job_record("demo", "j2").unwrap().unwrap();
+        assert_eq!(j2.status, JobStatus::Failed);
+        assert_eq!(j2.duration(), Duration::from_secs(90));
+        // The file is oldest first, so it reads like a log.
+        let text = std::fs::read_to_string(job_history_path("demo").unwrap()).unwrap();
+        assert!(text.find("\"j1\"").unwrap() < text.find("\"j3\"").unwrap(), "{text}");
+        assert!(text.contains("\"status\": \"failed\""), "{text}");
+    }
+
+    #[test]
+    fn retention_drops_the_oldest_past_the_count_with_their_logs() {
+        let _home = Home::new("retain-count");
+        let now = Utc::now();
+        let records: Vec<JobRecord> = (1..=JOB_HISTORY_MAX_JOBS + 3)
+            .map(|i| record(&format!("j{i}"), now - chrono::Duration::seconds((1000 - i) as i64)))
+            .collect();
+        for r in &records[..4] {
+            let out = job_output_path("demo", &r.id).unwrap();
+            std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+            std::fs::write(out, "x\n").unwrap();
+        }
+        record_finished_jobs("demo", records, now).unwrap();
+        let ids = history_ids();
+        assert_eq!(ids.len(), JOB_HISTORY_MAX_JOBS);
+        assert_eq!(ids.first().map(String::as_str), Some("j203"));
+        assert_eq!(ids.last().map(String::as_str), Some("j4"));
+        // The three oldest went, and their directories with them; j4's stays.
+        for gone in ["j1", "j2", "j3"] {
+            assert!(!job_dir("demo", gone).unwrap().exists(), "{gone}");
+        }
+        assert!(job_output_path("demo", "j4").unwrap().exists());
+    }
+
+    #[test]
+    fn retention_drops_records_past_the_age_limit() {
+        let _home = Home::new("retain-age");
+        let now = Utc::now();
+        let limit = chrono::Duration::from_std(JOB_HISTORY_MAX_AGE).unwrap();
+        record_finished_jobs(
+            "demo",
+            vec![
+                record("j1", now - limit - chrono::Duration::hours(1)),
+                record("j2", now - limit + chrono::Duration::hours(1)),
+            ],
+            now,
+        )
+        .unwrap();
+        assert_eq!(history_ids(), ["j2"]);
+        // A day later the sweep ages j2 out too, and leaves a live job's dir.
+        let live = job_dir("demo", "j9").unwrap();
+        std::fs::create_dir_all(&live).unwrap();
+        let dropped = prune_job_history("demo", &["j9"], now + chrono::Duration::days(1));
+        assert_eq!(dropped, ["j2"]);
+        assert!(history_ids().is_empty());
+        assert!(live.exists());
+    }
+
+    #[test]
+    fn last_lines_offset_is_tail_n() {
+        let _home = Home::new("tail-n");
+        let path = job_output_path("demo", "j1").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let tail = |n: usize| {
+            let at = last_lines_offset(&path, n).unwrap() as usize;
+            std::fs::read_to_string(&path).unwrap()[at..].to_string()
+        };
+        let body: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+        assert_eq!(tail(2), "line 29\nline 30\n");
+        assert_eq!(tail(1), "line 30\n");
+        assert_eq!(tail(0), "");
+        assert_eq!(tail(30), body);
+        assert_eq!(tail(500), body);
+        // No final newline: the last partial line counts as a line.
+        std::fs::write(&path, "a\nb\nc").unwrap();
+        assert_eq!(tail(2), "b\nc");
+        // Blank lines count.
+        std::fs::write(&path, "a\n\n\n").unwrap();
+        assert_eq!(tail(2), "\n\n");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(tail(5), "");
+        // Longer than one read chunk.
+        let big: String = (0..20_000).map(|i| format!("{i:08}\n")).collect();
+        std::fs::write(&path, &big).unwrap();
+        assert_eq!(tail(3), "00019997\n00019998\n00019999\n");
+        assert_eq!(tail(15_000).lines().count(), 15_000);
     }
 }

@@ -92,8 +92,8 @@
 //! screens and those states; `=settings` just Settings, its state and the
 //! components; `=issues` just the board, its states and the task pane;
 //! `=sidebar` just the sidebar's and the tab bar's states. `jobs` and
-//! `jobs-empty` are the Jobs screen with four jobs and with none (no
-//! frame; checked by eye); `=jobs` renders just those.
+//! `jobs-empty` are the Jobs screen with four running and two finished jobs,
+//! and with none (no frame; checked by eye); `=jobs` renders just those.
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -1258,11 +1258,12 @@ impl Run {
 
     /// The Jobs screen (no Figma frame; checked by eye): `jobs` with a
     /// command job (its long command cut), a CI watch and a PR watch, newest
-    /// first, then `jobs-empty` once every job has finished. The store is
+    /// first, then two finished jobs (one failed) under `Finished`, then
+    /// `jobs-empty` once there are none. The store and the history are
     /// written straight into the fixture project, as `shelbi job` would.
     /// `SHELBI_VISUAL_ONLY=jobs` renders just these.
     fn jobs(&mut self) {
-        use shelbi_state::awareness::{update_awareness, Job, JobKind};
+        use shelbi_state::awareness::{record_finished_jobs, update_awareness, Job, JobKind, JobRecord, JobStatus};
         let now = pinned_now();
         let job = |id: &str, kind, target: &str, label: Option<&str>, mins: i64| Job {
             id: id.into(),
@@ -1298,16 +1299,35 @@ impl Run {
             .expect("write the fixture awareness store")
         };
         set(jobs);
+        let record = |id: &str, label: &str, target: &str, status, exit, ran: i64, mins: i64| JobRecord {
+            exit_code: exit,
+            ..JobRecord::finished(
+                &job(id, JobKind::Command, target, Some(label), mins + ran),
+                status,
+                now - chrono::Duration::minutes(mins),
+            )
+        };
+        record_finished_jobs(
+            PROJECT,
+            vec![
+                record("j3", "desktop tests", "cargo test --workspace", JobStatus::Failed, Some(101), 7, 80),
+                record("j2", "site build", "npm run build", JobStatus::Ok, Some(0), 2, 95),
+            ],
+            now,
+        )
+        .expect("write the fixture job history");
         let handle = self.open();
         self.click(handle, View::Jobs);
         let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap().expect("the Jobs view");
-        let loaded = self.wait(handle, Duration::from_secs(10), |cx| jobs.read_with(cx, |v, _| v.model().rows().len() == 4));
-        self.expect("jobs: the four fixture jobs load", loaded);
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| jobs.read_with(cx, |v, _| v.model().rows().len() == 6));
+        self.expect("jobs: the six fixture jobs load", loaded);
         let ids: Vec<String> = jobs.read_with(&self.cx, |v, _| v.model().rows().iter().map(|r| r.id.clone()).collect());
-        self.expect("jobs: newest first", ids == ["j7", "j6", "j5", "j4"]);
+        self.expect("jobs: running newest first, then finished", ids == ["j7", "j6", "j5", "j4", "j3", "j2"]);
         self.save(handle, "jobs");
 
         set(Vec::new());
+        let history = shelbi_state::awareness::job_history_path(PROJECT).expect("the history path");
+        let _ = std::fs::remove_file(history);
         let handle = self.open();
         self.click(handle, View::Jobs);
         let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap().expect("the Jobs view");

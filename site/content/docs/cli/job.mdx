@@ -7,7 +7,8 @@ summary: Run a command detached, or watch a process, a commit's CI, or a PR, and
 ```text
 shelbi job run [--label <LABEL>] -- <COMMAND>...
 shelbi job watch (--pid <PID> | --ci <SHA> | --pr <NUMBER>) [--label <LABEL>]
-shelbi job list [--json]
+shelbi job list [--all] [--json]
+shelbi job log <ID> [-n <N>] [-f]
 shelbi job cancel <ID>
 ```
 
@@ -39,8 +40,8 @@ shelbi job run --label "desktop tests" -- cargo test
 The command runs in the current directory, in its own session, so it keeps
 running after the CLI exits and across a hub daemon restart. Its combined
 output goes to `~/.shelbi/projects/<project>/jobs/<id>/output.log` (the event's
-`log=`), and its exit code and last 20 lines to `result.json` beside it. Job
-directories are kept for a week.
+`log=`), and its exit code and last 20 lines to `result.json` beside it. Read
+the output with [`shelbi job log`](#log).
 
 ## watch
 
@@ -57,12 +58,44 @@ CI and PR watches ask GitHub once a minute, and only while the machine is online
 
 ## list
 
-Lists the jobs still being watched. `--json` prints them as JSON.
+Lists the jobs still being watched, newest first.
+
+| Option | Meaning |
+| --- | --- |
+| `--all` (or `--history`) | Add the finished jobs after the running ones, newest first, with their status, exit code, duration and log path. |
+| `--json` | Print them as JSON. Each job carries a `status`: `running`, or how a finished one ended (`ok`, `failed`, `exited`, `merged`, `closed`, `canceled`), plus `finished_at`, `exit_code`, `detail`, `log` and `duration_secs` when it has them. |
+
+### History
+
+A job that finishes, or that you cancel, moves to the project's job history,
+`~/.shelbi/projects/<project>/jobs/history.json`, and stays there across hub
+restarts. The history keeps the newest 200 finished jobs from the last 30 days,
+whichever is fewer. Past that the oldest job is dropped, and its directory (its
+`output.log`) with it.
+
+## log
+
+Prints a job's output:
+
+```sh
+shelbi job log j4          # the whole log
+shelbi job log j4 -n 20    # the last 20 lines
+shelbi job log j4 -f       # follow a running job until it exits
+```
+
+| Option | Meaning |
+| --- | --- |
+| `-n, --lines <N>` | Print only the last N lines, like `tail -n`. |
+| `-f, --follow` | Keep printing new output until the job exits, then say how it ended. |
+
+It works on a running job and on a finished one while the history keeps its
+log. A `pid`, `ci` or `pr` watch has no command output, so `job log` prints the
+watch's status instead.
 
 ## cancel
 
 Stops watching a job. A `job run` command that is still running is sent
-SIGTERM (its whole process group).
+SIGTERM (its whole process group). The job moves to the history as `canceled`.
 
 ## See also
 

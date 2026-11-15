@@ -444,6 +444,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_orchestrator_changelog(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
         sniff_orchestrator_awareness_variants(entry, &text, out);
+        sniff_orchestrator_job_log(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
         sniff_zen_assignee_scope(entry, &text, out);
@@ -2171,6 +2172,41 @@ fn sniff_orchestrator_awareness_variants(
     }
 }
 
+/// Code for an orchestrator copy that teaches `shelbi job` but not `shelbi job
+/// log`.
+pub(crate) const ORCH_JOB_LOG_CODE: &str = "ORCH_JOB_LOG_MISSING";
+
+/// Flag orchestrator instructions that teach `shelbi job run` but predate
+/// `shelbi job log` and `shelbi job list --all`, so the orchestrator would
+/// keep opening a failed job's `output.log` by path and never look at the job
+/// history.
+///
+/// The fix is a few sentences in user-forkable prose (the `job` event rule,
+/// the run-long-commands guidance, the command reference), so it routes to
+/// [`Classification::NeedsJudgment`]. A copy that mentions `shelbi job log`
+/// anywhere never fires, so the sniff is idempotent; one with no `shelbi job
+/// run` (awareness never adopted) is left to the awareness sniffers.
+fn sniff_orchestrator_job_log(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    if !text.contains("shelbi job run") || text.contains("shelbi job log") {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        ORCH_JOB_LOG_CODE,
+        "orchestrator instructions teach `shelbi job` but not `shelbi job log` or `shelbi job \
+         list --all`, so a failed job's output is read by opening its log path and finished \
+         jobs are never looked up",
+        "Where the `job` event rule describes a failed command, add: read its output with \
+         `shelbi job log <id> -n 20` rather than opening the log by path. In the guidance on \
+         running long commands as jobs, say `shelbi job log <id> -n 20` reads the output (the \
+         whole log without `-n`, `-f` follows a running job). Note that `shelbi job list --all` \
+         adds finished jobs, and list `shelbi job log <id> [-n <N>] [-f]` in the command \
+         reference. Mirror the shipped default template.",
+        locate_line_containing(text, "shelbi job run"),
+    ));
+}
+
 /// Detect the pre-rename `shelbi task <verb>` board command in an agent's prose/// Detect the pre-rename `shelbi task <verb>` board command in an agent's prose
 /// (orchestrator `instructions.md` or `zenmode.md`). The board command was
 /// renamed `shelbi task` -> `shelbi issue` (design D5); `shelbi task` still works
@@ -3234,6 +3270,11 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              exclusion can't be patched in mechanically without risking your edits — \
              refresh the `Free-workspace selection` section by hand to match the \
              shipped default."
+        }
+        ORCH_JOB_LOG_CODE => {
+            "These are prose instructions a project may have forked and customized, so the \
+             `shelbi job log` guidance can't be merged in mechanically without risking local \
+             edits; the orchestrator refreshes its own copy instead."
         }
         "INSTRUCTIONS_TASK_COMMAND_RENAMED" => {
             "These are prose instructions a project may have forked and customized, so the \
@@ -5152,6 +5193,37 @@ mod tests {
             "shipped default template no longer carries the `idle_workspaces` definition anchor \
              — the sniffer's absence check is now dead",
         );
+    }
+
+    // ---- `shelbi job log` guidance ---------------------------------------
+
+    #[test]
+    fn job_guidance_without_job_log_is_needs_judgment() {
+        let text = "# Orchestrator\n\n- Run long commands with `shelbi job run -- <cmd>`.\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_job_log(&orch_entry(), text, &mut out);
+        let f = find(&out, ORCH_JOB_LOG_CODE).expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert_eq!(f.location.line, 3);
+
+        // Current guidance, or none at all, is clean.
+        for clean in [
+            "Run `shelbi job run -- x`, then `shelbi job log <id> -n 20`.\n",
+            "# Orchestrator\n\nNo jobs here.\n",
+        ] {
+            let mut out = Vec::new();
+            sniff_orchestrator_job_log(&orch_entry(), clean, &mut out);
+            assert!(find(&out, ORCH_JOB_LOG_CODE).is_none(), "{clean}: {:?}", codes(&out));
+        }
+    }
+
+    /// Drift guard: the shipped orchestrator template teaches `shelbi job log`.
+    #[test]
+    fn shipped_orchestrator_does_not_trip_the_job_log_sniffer() {
+        let mut out = Vec::new();
+        sniff_orchestrator_job_log(&orch_entry(), shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS, &mut out);
+        assert!(find(&out, ORCH_JOB_LOG_CODE).is_none(), "{:?}", codes(&out));
+        assert!(shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("shelbi job run"));
     }
 
     // ---- deprecated `shelbi task` board command -------------------------
