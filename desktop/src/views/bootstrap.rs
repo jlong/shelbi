@@ -11,7 +11,6 @@ use gpui::{
     div, prelude::*, px, AnyElement, ClipboardItem, IntoElement, SharedString,
 };
 
-use super::sidebar;
 use crate::assets::{heroicon, icons, Icon};
 use crate::platform::discovery::{config_path_label, CliNotFound};
 use crate::platform::install::{InstallError, InstallErrorKind};
@@ -536,49 +535,20 @@ fn render_screen(
     centered(theme).child(column).into_any_element()
 }
 
-/// The relaunch bar shown over the shell.
+/// The relaunch bar along the foot of the window, under the sidebar and
+/// the main area.
 pub fn render_relaunch_bar(
     notice: &RelaunchNotice,
     theme: &Theme,
     on_relaunch: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_4()
-        // The window's top row, under the traffic lights: its content starts
-        // beside them and centers on them.
-        .min_h(px(sidebar::TITLEBAR_H))
-        .pl(px(sidebar::BESIDE_TRAFFIC_LIGHTS))
-        .pr_4()
-        .py_2()
-        .bg(theme.notice)
-        .border_b_1()
-        .border_color(theme.divider)
-        .child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .text_color(theme.text_loud)
-                .child(
-                    heroicon(icons::EXCLAMATION_TRIANGLE)
-                        .text_color(theme.warning),
-                )
-                .child(relaunch_message(notice)),
-        )
-        .child(
-            style::button("relaunch", ScreenAction::Relaunch.label(), ButtonKind::Success, ButtonSize::Base, false, theme)
-                .on_click(move |_, window, cx| on_relaunch(window, cx)),
-        )
-        .into_any_element()
+    let label = ScreenAction::Relaunch.label();
+    render_action_bar("relaunch", relaunch_message(notice), label, theme, on_relaunch)
 }
 
-/// A bar like the relaunch bar: `message` and one button, `label`. A remote
-/// window's "Shelbi isn't running on devbox." with Start Shelbi draws it.
+/// A bar like the relaunch bar: `message` and one button, `label`, along
+/// the foot of the window. A remote window's "Shelbi isn't running on
+/// devbox." with Start Shelbi draws it.
 pub fn render_action_bar(
     id: &'static str,
     message: impl Into<gpui::SharedString>,
@@ -586,34 +556,24 @@ pub fn render_action_bar(
     theme: &Theme,
     on_click: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
-    div()
-        .debug_selector(move || id.into())
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap_4()
-        .min_h(px(sidebar::TITLEBAR_H))
-        .pl(px(sidebar::BESIDE_TRAFFIC_LIGHTS))
-        .pr_4()
-        .py_2()
-        .bg(theme.notice)
-        .border_b_1()
-        .border_color(theme.divider)
+    let selector = format!("{id}-bar");
+    style::notice_band(theme.opaque().notice, theme)
+        .debug_selector(move || selector)
         .child(
             div()
                 .flex()
                 .flex_row()
+                .min_w_0()
                 .items_center()
                 .gap_2()
-                .text_color(theme.text_loud)
                 .child(heroicon(icons::EXCLAMATION_TRIANGLE).text_color(theme.warning))
                 .child(message.into()),
         )
-        .child(
+        .child(style::band_button(
             style::button(id, label, ButtonKind::Success, ButtonSize::Base, false, theme)
                 .on_click(move |_, window, cx| on_click(window, cx)),
-        )
+            theme,
+        ))
         .into_any_element()
 }
 

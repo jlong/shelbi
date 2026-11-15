@@ -35,7 +35,9 @@
 //! (`about-command-grille.png`, `about-retro.png`, `about-racing-s.png`,
 //! `about-retro-racing-s.png`), the bootstrap
 //! screens (`bootstrap-progress.png`, `bootstrap-failure.png`) and the
-//! notice bars (`notice-bars.png`: the update and relaunch bars), and the
+//! notices where the window draws them, along the main area's foot and the
+//! window's (`notice-bars.png` dark, `notice-bars-light.png`,
+//! `notice-bars-glass.png` dark at 84% over a bright desktop), and the
 //! built-in diff over a real worktree through the live deps, as a window opens
 //! it: `diff-review.png` (the branch), `diff-workspace.png` (plus what isn't
 //! committed), `diff-workspace-edited.png` (after an edit it noticed by itself).
@@ -506,32 +508,119 @@ pub fn run(out: PathBuf) -> ! {
     press(&mut cx, "esc");
     drop(pr_view);
 
-    let (_, window) = open(&mut cx, |cx| {
-        cx.new(|_| Screen(Box::new(|theme, _| {
-            use gpui::{div, IntoElement, ParentElement, Styled};
-            let notice = crate::platform::update::UpdateNotice {
-                current: "0.9.0".into(),
-                latest: "0.9.2".into(),
-            };
-            let relaunch = crate::platform::control::RelaunchNotice {
-                app_version: "0.9.0".into(),
-                daemon_version: Some("0.9.2".into()),
-                reason: "The daemon was upgraded.".into(),
-            };
-            div()
-                .flex()
-                .flex_col()
-                .w_full()
-                .child(crate::views::update::render_update_bar(&notice, theme, |_, _| {}))
-                .child(crate::views::bootstrap::render_relaunch_bar(&relaunch, theme, |_, _| {}))
-                .into_any_element()
-        })))
-    });
-    save(&mut cx, window, &out, "notice-bars.png");
+    // The notices where the window draws them, in each theme and on the
+    // glass (dark at 84% over a bright desktop, where a tint alone let the
+    // desktop through): the tabs on top, the main area's notices along its
+    // foot, the relaunch and remote bars along the window's.
+    for (name, preference, opacity) in [
+        ("notice-bars.png", shelbi_app::theme::ThemePreference::Dark, 1.0),
+        ("notice-bars-light.png", shelbi_app::theme::ThemePreference::Light, 1.0),
+        ("notice-bars-glass.png", shelbi_app::theme::ThemePreference::Dark, 0.84),
+    ] {
+        let theme = crate::theme::Theme::resolve_with(preference, 0, gpui::WindowAppearance::Dark).with_opacity(opacity);
+        let (_, window) = open(&mut cx, |cx| cx.new(|_| Screen(Box::new(move |_, _| notice_layout(&theme)))));
+        save(&mut cx, window, &out, name);
+    }
 
     let _ = std::fs::remove_dir_all(&home);
     println!("\n{failures} check(s) failed; frames saved under {}", out.display());
     std::process::exit(if failures == 0 { 0 } else { 1 })
+}
+
+/// A window drawn with every notice up (`notice-bars*.png`): a stand-in
+/// tab row, sidebar and screen, laid out as the window lays them, around
+/// the real bars.
+fn notice_layout(theme: &crate::theme::Theme) -> gpui::AnyElement {
+    use crate::theme::style;
+    use crate::views::sidebar::{BESIDE_TRAFFIC_LIGHTS, TITLEBAR_H};
+    use gpui::{div, IntoElement, ParentElement, Styled};
+    let update = crate::platform::update::UpdateNotice {
+        current: "0.9.0".into(),
+        latest: "0.9.2".into(),
+    };
+    let relaunch = crate::platform::control::RelaunchNotice {
+        app_version: "0.9.0".into(),
+        daemon_version: Some("0.9.2".into()),
+        reason: "The daemon was upgraded.".into(),
+    };
+    let solid = theme.opaque();
+    let notice = |text: &'static str, hue: crate::theme::Hue| {
+        style::notice_band(solid.hue(hue).1, theme).child(div().min_w_0().child(text))
+    };
+    let tabs = div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap_6()
+        .h(px(TITLEBAR_H))
+        .pl(px(BESIDE_TRAFFIC_LIGHTS))
+        .bg(theme.sidebar)
+        .border_b_1()
+        .border_color(theme.divider)
+        .text_color(theme.text_loud)
+        .children(["Shelbi", "ChartMe", "website", "Crown & Keep", "+"].map(|t| div().child(t)));
+    let main = div()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .bg(theme.canvas)
+        .child(div().flex_1().min_h_0().p_4().text_color(theme.foreground).child("The board"))
+        .child(notice("The session for alpha-1 was lost.", crate::theme::Hue::Red))
+        .child(crate::views::update::render_update_bar(&update, theme, |_, _| {}))
+        .child(notice("Loading the board…", crate::theme::Hue::Neutral))
+        .child(
+            notice("Couldn't save the workflow: the file changed on disk.", crate::theme::Hue::Yellow)
+                .child(style::band_icon_button("dismiss-banner", crate::assets::icons::X_MARK, theme)),
+        )
+        .child(
+            notice("Approving T-9 failed: the branch has conflicts.", crate::theme::Hue::Yellow).child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .flex_none()
+                    .items_center()
+                    .gap_2()
+                    .child(style::band_button(style::xsmall_button("reopen-review", "Reopen", theme), theme))
+                    .child(style::band_icon_button("dismiss-decision", crate::assets::icons::X_MARK, theme)),
+            ),
+        );
+    let body = div()
+        .flex()
+        .flex_row()
+        .flex_1()
+        .min_h_0()
+        .child(
+            div()
+                .w(px(220.0))
+                .flex_none()
+                .p_4()
+                .bg(theme.sidebar)
+                .border_r_1()
+                .border_color(theme.divider)
+                .text_color(theme.foreground)
+                .child("Sidebar"),
+        )
+        .child(main);
+    // A bright desktop behind a translucent window.
+    let desktop = if theme.translucent() { gpui::rgb(0xd8c9a3).into() } else { theme.canvas };
+    div()
+        .size_full()
+        .flex()
+        .flex_col()
+        .bg(desktop)
+        .child(tabs)
+        .child(body)
+        .child(crate::views::bootstrap::render_relaunch_bar(&relaunch, theme, |_, _| {}))
+        .child(crate::views::bootstrap::render_action_bar(
+            "remote-stopped",
+            "Shelbi isn't running on devbox.",
+            shelbi_app::launch::remote::START_DAEMON_LABEL,
+            theme,
+            |_, _| {},
+        ))
+        .into_any_element()
 }
 
 fn open<V: gpui::Render + 'static>(

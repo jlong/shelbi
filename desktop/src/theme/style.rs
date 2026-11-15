@@ -1399,6 +1399,43 @@ impl gpui::Render for Tooltip {
     }
 }
 
+/// A notice band along the foot of the window or the main area: a row
+/// with the message on the left and its controls on the right, a divider
+/// on top, in `tint` laid on the opaque canvas ([`Theme::band`]), the text
+/// loud. Its buttons sit on [`band_button`].
+pub fn notice_band(tint: Hsla, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .px_4()
+        .py_2()
+        .bg(theme.band(tint))
+        .border_t_1()
+        .border_color(theme.divider)
+        .text_color(theme.text_loud)
+}
+
+/// A labelled button on a [`notice_band`]: the opaque canvas under it, so
+/// its tinted fill paints as it does on the canvas everywhere else and its
+/// label keeps that contrast, rather than mixing with the band's tint.
+pub fn band_button(button: impl IntoElement, theme: &Theme) -> Div {
+    div()
+        .flex_none()
+        .rounded(px(6.0))
+        .bg(Hsla { a: 1.0, ..theme.opaque().canvas })
+        .child(button)
+}
+
+/// An icon button on a [`notice_band`] (a banner's dismiss): the icon in
+/// `foreground` at rest, since the quiet icon role fades into a tint.
+pub fn band_icon_button(id: impl Into<SharedString>, icon: Icon, theme: &Theme) -> Stateful<Div> {
+    tinted_icon_button(id, icon, IconButtonSize::Small, false, theme.foreground, theme)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

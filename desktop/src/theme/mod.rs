@@ -241,6 +241,15 @@ impl Theme {
         }
     }
 
+    /// A notice band's fill (the relaunch bar, a banner along the main
+    /// area's foot): `tint`, a tint role of [`Theme::opaque`] (`notice`, a
+    /// `*_tint`, the `workflow_badge` [`Hue::Neutral`] takes), laid on the
+    /// opaque canvas. Opaque whatever the window's opacity, so the band's
+    /// text reads as `pairings` checks it rather than over the desktop.
+    pub fn band(&self, tint: Hsla) -> Hsla {
+        glass::over(tint, Hsla { a: 1.0, ..self.opaque().canvas })
+    }
+
     /// The color a shared badge decoration paints in, for the meaning the TUI
     /// sidebar's `badge_color` gives it: the Navigation component's status
     /// icons (busy `icon/green`, ready `icon/cyan`, awaiting input
