@@ -2848,11 +2848,14 @@ impl ShellState {
     }
 
     /// Carry out what the Changelog page asked: an issue link opens the
-    /// issue's detail (the board's task popover), a PR or URL the browser.
+    /// issue's detail (the board's task popover), a PR or URL the browser,
+    /// an attachment the system opener.
     fn apply_changelog_step(&mut self, step: changelog::Step) {
         match step {
             changelog::Step::Stay => {}
             changelog::Step::OpenUrl(url) => self.open_url(url),
+            // The platform opener (`open`, `xdg-open`) takes a path too.
+            changelog::Step::OpenFile(path) => self.open_url(path.display().to_string()),
             changelog::Step::OpenIssue(id) => self.open_issue(id),
         }
     }

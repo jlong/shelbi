@@ -13,13 +13,13 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 use shelbi_core::{Column, MachineKind, ProjectStatus, ProjectStatuses, Reachability, StatusCategory};
-use shelbi_state::changelog::{ChangelogStamp, Link};
+use shelbi_state::changelog::{AttachmentKind, ChangelogStamp, Link};
 use shelbi_state::machine_state::MachineRecord;
 use shelbi_state::{IssueFile, OwnershipGate, WorkspaceState, ZenModeState};
 
 use crate::activity::{ActivityData, Event, SystemEvent, SystemKind, TaskCacheEntry, TaskMeta};
 use crate::board::{BoardOutcome, BoardProject, BoardRead, ClosedPage};
-use crate::changelog::{ChangelogData, ChangelogEntryView, ChangelogLink};
+use crate::changelog::{ChangelogAttachment, ChangelogData, ChangelogEntryView, ChangelogLink};
 use crate::command::EditItem;
 use crate::exec::EditTarget;
 use crate::nav::View;
@@ -580,6 +580,15 @@ fn changelog_entry() -> (ChangelogEntryView, Value) {
         description: "A fourth app icon.".into(),
         links: vec![pr.clone(), issue],
         extra_links: vec![pr],
+        attachments: vec![ChangelogAttachment {
+            name: "bench.csv".into(),
+            kind: AttachmentKind::File,
+            size: 12_288,
+            path: "assets/retro-racing-s/bench.csv".into(),
+            listed: true,
+        }],
+        // The directory on the far machine never travels.
+        dir: None,
     };
     let pr_json = json!({ "kind": "pr", "number": 2076, "url": "https://github.com/32pixels/shelbi/pull/2076" });
     let json = json!({
@@ -589,7 +598,14 @@ fn changelog_entry() -> (ChangelogEntryView, Value) {
         "author": "orchestrator",
         "description": "A fourth app icon.",
         "links": [pr_json, { "kind": "issue", "id": "t-1" }],
-        "extra_links": [pr_json]
+        "extra_links": [pr_json],
+        "attachments": [{
+            "name": "bench.csv",
+            "kind": "file",
+            "size": 12_288,
+            "path": "assets/retro-racing-s/bench.csv",
+            "listed": true
+        }]
     });
     (entry, json)
 }

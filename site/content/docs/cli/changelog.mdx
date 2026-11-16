@@ -7,7 +7,10 @@ summary: Record what has shipped in a project and read it back, as a list, as bl
 ```text
 shelbi changelog add    --title <TITLE> [--date <DATE>] [--author <NAME>]
                         [--issue <ID>]... [--pr <N|URL>]... [--link <URL>]...
-                        [-d <DESC> | stdin] [--format text|markdown|json]
+                        [-d <DESC> | stdin] [--image <FILE>[:<ALT>]]...
+                        [--attach <FILE>]... [--format text|markdown|json]
+shelbi changelog attach <ENTRY-ID> [--image <FILE>[:<ALT>]]... [--attach <FILE>]...
+                        [--format text|markdown|json]
 shelbi changelog list   [--limit <N>] [--since <DATE>] [--format text|markdown|json]
 shelbi changelog search <QUERY> [--limit <N>] [--format text|markdown|json]
 shelbi changelog show   <ENTRY-ID> [--format text|markdown|json]
@@ -56,6 +59,72 @@ body is the description. You can edit an entry by hand; a bare `date:` like
 
 Two writers adding at the same moment never clobber each other: each `add`
 claims a new file name, adding `-2`, `-3` and so on when the name is taken.
+
+## Images and attachments
+
+An entry can carry files: **images**, shown inline in the description, and
+any other file (a log, a benchmark, a PDF, a zip, a video), listed under the
+entry as an **attachment**. Add them with `--image` and `--attach` on
+[`add`](#add), or later with [`attach`](#attach).
+
+Files are copied, never moved, into a directory of their own beside the
+entries:
+
+```text
+~/.shelbi/projects/<project>/changelog/assets/<entry-id>/
+```
+
+and recorded in the entry's frontmatter, each path relative to the changelog
+directory:
+
+```markdown
+---
+title: Board columns scroll smoothly
+date: 2026-11-16T09:00:00-08:00
+author: orchestrator
+issues:
+- job-sheet-pane
+attachments:
+- path: assets/2026-11-16-170000-board-columns-scroll-smoothly/jobs-sheet.png
+  name: jobs-sheet.png
+  size: 48213
+  kind: image
+- path: assets/2026-11-16-170000-board-columns-scroll-smoothly/bench-results.csv
+  name: bench-results.csv
+  size: 12288
+  kind: file
+---
+Opening a job now floats a pane over the table.
+
+![Jobs sheet after the change](assets/2026-11-16-170000-board-columns-scroll-smoothly/jobs-sheet.png)
+```
+
+An image is also referenced from the description with ordinary markdown,
+added at its end, so the entry file stays readable markdown and you can move
+the reference to where the image belongs. The alt text is the image's caption.
+A markdown image you write by hand with a relative `assets/...` path shows the
+same way.
+
+- **Names.** A stored name is the file's own name made safe for a path and a
+  markdown link: letters, digits, `.`, `_` and `-`, anything else becoming `-`
+  (`Jobs sheet.png` is stored as `Jobs-sheet.png`). When the name is already
+  taken in the entry's directory, the file gets the next number: `shot.png`,
+  then `shot-2.png`, `shot-3.png`. A file is never replaced.
+- **Paths are printed.** `add` and `attach` print each file's final stored path,
+  absolute and as the entry uses it, one line per file, so you can reference
+  it. With `--format json` they are in `added`.
+- **Limits.** Each file can be at most 50 MB. An `--image` must be a PNG, JPEG,
+  GIF, WebP or SVG, by its extension or its first bytes. A file that is
+  missing, too big, or not an image when it should be is refused before
+  anything is written.
+
+The Changelog page in the desktop app shows each image at the width of the
+column (never larger than the image), its alt text as the caption, and lists
+the attachments with their sizes; clicking one opens it with the system's
+default app. The TUI shows `[image: <alt>]` where an image sits and an
+**Attachments** list; `Tab` reaches each file and `Enter` opens it. An image
+whose file is missing shows its alt text instead, and so does a project in a
+window on another machine, whose files can't be read from yours.
 
 ## Links
 
@@ -123,15 +192,50 @@ Adds an entry and prints its id and file.
 | `--pr <N\|URL>` | Link a pull request (`1942`, `#1942`, or a URL). Repeatable. |
 | `--link <URL>` | Link any other URL. Repeatable. |
 | `-d`, `--description <DESC>` | The description, in markdown. Without it, the description is read from stdin when stdin is not a terminal. |
+| `--image <FILE>[:<ALT>]` | Copy an image into the entry and show it inline. The alt text after the `:` is its caption; it defaults to the file name. Repeatable. |
+| `--attach <FILE>` | Copy any other file into the entry, listed under it. Repeatable. |
 | `--format <FORMAT>` | How to print the new entry. Default `text`. |
+
+With `--image` or `--attach`, `add` also prints a line per file: its kind, its
+absolute path, and the `assets/...` path the entry records.
+
+```text
+✓ added 2026-11-16-170000-board-columns-scroll-smoothly
+  /Users/you/.shelbi/projects/shelbi/changelog/2026-11-16-170000-board-columns-scroll-smoothly.md
+  image /Users/you/.shelbi/projects/shelbi/changelog/assets/2026-11-16-170000-board-columns-scroll-smoothly/shot.png  (assets/2026-11-16-170000-board-columns-scroll-smoothly/shot.png)
+```
+
+In `--image <FILE>:<ALT>`, the whole value is the file when a file by that
+name exists (a path may hold a `:`). Otherwise the file is the shortest part
+before a `:` that names one, and the rest is the alt text.
 
 Each link is stored once: a `--link` that is the URL of a `--pr` is dropped,
 as is a flag given twice.
 
 `add` refuses an `--issue` that isn't a valid issue id, a `--pr` that isn't a
 number or URL, a `--link` that isn't an `http(s)` URL, an unreadable `--date`,
-and a title or author that is empty or longer than one line. It writes nothing
-when one is refused.
+a title or author that is empty or longer than one line, and a file it can't
+attach (see [Images and attachments](#images-and-attachments)). It writes
+nothing when one is refused.
+
+## attach
+
+Adds images and files to an entry that already exists, and prints where each
+one landed. `<ENTRY-ID>` is the id `list` shows, or any prefix of it that names
+one entry. Each `--image` is referenced at the end of the description; the
+rest of the entry is left as it was.
+
+| Option | Meaning |
+| --- | --- |
+| `--image <FILE>[:<ALT>]` | An image to show inline, with optional alt text. Repeatable. |
+| `--attach <FILE>` | Any other file to list under the entry. Repeatable. |
+| `--format <FORMAT>` | How to print the result. Default `text`. |
+
+```text
+✓ attached 2 files to 2026-11-16-170000-board-columns-scroll-smoothly
+  image /Users/you/.shelbi/projects/shelbi/changelog/assets/2026-11-16-170000-board-columns-scroll-smoothly/shot-2.png  (assets/2026-11-16-170000-board-columns-scroll-smoothly/shot-2.png)
+  file  /Users/you/.shelbi/projects/shelbi/changelog/assets/2026-11-16-170000-board-columns-scroll-smoothly/build.log  (assets/2026-11-16-170000-board-columns-scroll-smoothly/build.log)
+```
 
 ## list
 
@@ -184,11 +288,13 @@ can't be read is skipped with a warning on stderr.
 ```
 
 **markdown** reads like the blog, full entries ready to paste or for an agent
-to read: a heading, a line with the date, author and id, the description, and
-any links the description doesn't already show.
+to read: a heading, a line with the date, author and id, the description (its
+image markdown as written), any links the description doesn't already show,
+and an **Attachments** list of the files it doesn't show, each linked by its
+absolute path with its size.
 
 **json** is for agents and scripts. `list` and `search` print an object with
-the entries; `show` and `add` print one entry:
+the entries; `show`, `add` and `attach` print one entry:
 
 ```json
 {
@@ -207,6 +313,15 @@ the entries; `show` and `add` print one entry:
         { "kind": "pr", "number": 1953, "url": "https://github.com/jlong/shelbi/pull/1953" },
         { "kind": "url", "url": "https://shelbi.dev/docs/cli/changelog" }
       ],
+      "attachments": [
+        {
+          "name": "bench-results.csv",
+          "kind": "file",
+          "size": 12288,
+          "path": "/Users/you/.shelbi/projects/shelbi/changelog/assets/2026-10-28-213005-changelog-lands-in-the-sidebar/bench-results.csv",
+          "relative_path": "assets/2026-10-28-213005-changelog-lands-in-the-sidebar/bench-results.csv"
+        }
+      ],
       "path": "/Users/you/.shelbi/projects/shelbi/changelog/2026-10-28-213005-changelog-lands-in-the-sidebar.md"
     }
   ]
@@ -214,14 +329,19 @@ the entries; `show` and `add` print one entry:
 ```
 
 - `schema_version` changes only when the shape breaks.
-- `query` appears on `search` only. `show` and `add` print `entry` in place of
-  `entries`.
+- `query` appears on `search` only. `show`, `add` and `attach` print `entry`
+  in place of `entries`; `add` and `attach` also print `added`, the files they
+  just stored, in the same shape as `attachments`.
 - `date` is RFC 3339 with the offset the entry was written in.
 - `description` is the markdown body.
 - `links` holds every link, the flags' first and then the description's, without
   duplicates. Each has a `kind`: `issue` with an `id`; `pr` with a `number` and
   a `url`, either of which can be `null` (a `#12` with no known repository has
   no URL, a non-GitHub PR URL has no number); `url` with a `url`.
+- `attachments` holds every file on the entry: its stored `name`, its `kind`
+  (`image` or `file`), its `size` in bytes, its absolute `path`, and its
+  `relative_path` (relative to the changelog directory, as the entry and its
+  image markdown use it). Empty for an entry without files.
 
 ## Examples
 
@@ -236,6 +356,20 @@ Take the description from a file on stdin:
 
 ```bash
 shelbi changelog add --title "Zen pill redesign" --pr 1951 < notes.md
+```
+
+Record a UI change with a screenshot and the benchmark behind it:
+
+```bash
+shelbi changelog add --title "Board columns scroll smoothly" --issue dt-board-perf \
+  --image "board.png:The board after the change" --attach bench-results.csv \
+  -d "Long columns are a virtualized list now."
+```
+
+Add a log to an entry already written:
+
+```bash
+shelbi changelog attach 2026-11-16-1700 --attach ci-build.log
 ```
 
 What landed this week, as an agent would read it:

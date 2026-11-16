@@ -427,6 +427,7 @@ pub(super) fn search_corpus() -> SearchCorpus {
             prs: vec![shelbi_state::changelog::PrRef::Number(1902)],
             urls: vec![],
             body: "The login form, rebuilt.".into(),
+            attachments: vec![],
             path: Default::default(),
         },
         Some("jlong/shelbi"),

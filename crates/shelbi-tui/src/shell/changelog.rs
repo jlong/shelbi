@@ -5,15 +5,18 @@
 //! Entries run one after another, newest first, in a centered reading
 //! column: the title in bold with the date at the right, a rule, the
 //! description through the TUI's markdown renderer
-//! ([`crate::markdown::render_note`]), and the entry's links as a row of
-//! chips (`⧉` an issue, opened in Shelbi; `↗` a PR or URL, opened in the
-//! browser). Over them, the title row: "Changelog", the match count, and
+//! ([`crate::markdown::render_note`], each image as an `[image: alt]`
+//! placeholder), the entry's files under an "Attachments" label (`⎘` a file,
+//! its name and size, opened with the system opener), and the entry's links
+//! as a row of chips (`⧉` an issue, opened in Shelbi; `↗` a PR or URL, opened
+//! in the browser). Over them, the title row: "Changelog", the match count, and
 //! the sidebar's half-block search box.
 //!
 //! Keys: `j` / `k` and the arrows scroll, Page Up / Page Down (Space,
 //! Ctrl+D / Ctrl+U) by the page, `n` / `p` (or `]` / `[`) jump to the
 //! next or previous entry, `g` / `G` (Home / End) to the newest or oldest.
-//! Tab / Shift+Tab step through the links, Enter follows the focused one
+//! Tab / Shift+Tab step through the attachments and links, Enter opens the
+//! focused one
 //! or, with none, folds or unfolds the entry. `/` searches as you type;
 //! Enter keeps the query, Esc clears it. The wheel scrolls, a click on a
 //! title folds its entry, a click on a chip follows it. Older entries load
@@ -26,6 +29,7 @@
 //! or the folds change); drawing and the mouse both read it.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
@@ -35,7 +39,8 @@ use ratatui::{
     text::{Line, Span},
 };
 use shelbi_app::changelog::{
-    ChangelogData, ChangelogEntryView, ChangelogLink, ChangelogModel, LinkKind, LinkTarget,
+    ChangelogAttachment, ChangelogData, ChangelogEntryView, ChangelogLink, ChangelogModel,
+    LinkKind, LinkTarget,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -73,6 +78,37 @@ const WHEEL_LINES: usize = 3;
 /// How near the end (in screens) the next page of entries loads.
 const LOAD_AHEAD_SCREENS: usize = 1;
 
+/// The label over an entry's files.
+const ATTACHMENTS: &str = "Attachments";
+/// An attachment's chip glyph.
+const FILE_GLYPH: &str = "⎘";
+
+/// What a chip stands for. A chip's index runs over the entry's links, then
+/// its attachments: `links.len() + i` is attachment `i`.
+#[derive(Debug, Clone, Copy)]
+enum Item<'a> {
+    Link(&'a ChangelogLink),
+    File(&'a ChangelogAttachment),
+}
+
+/// Chip `ix` of `entry`, when there is one.
+fn item(entry: &ChangelogEntryView, ix: usize) -> Option<Item<'_>> {
+    match entry.links.get(ix) {
+        Some(link) => Some(Item::Link(link)),
+        None => entry.attachments.get(ix - entry.links.len()).map(Item::File),
+    }
+}
+
+/// Whether chip `ix` of `entry` goes anywhere: a link that resolves, a file
+/// this machine can read (not a remote window's).
+fn item_followable(entry: &ChangelogEntryView, ix: usize) -> bool {
+    match item(entry, ix) {
+        Some(Item::Link(link)) => followable(link),
+        Some(Item::File(_)) => entry.dir.is_some(),
+        None => false,
+    }
+}
+
 /// A chip's glyph for its kind.
 fn glyph(kind: LinkKind) -> &'static str {
     match kind {
@@ -95,6 +131,8 @@ pub enum Step {
     OpenIssue(String),
     /// Open this URL in the browser.
     OpenUrl(String),
+    /// Open this file with the system opener (an attachment).
+    OpenFile(PathBuf),
 }
 
 /// Something the pointer can be over.
@@ -127,6 +165,8 @@ struct EntryRows {
     top: usize,
     /// The description, wrapped to the measure; empty when folded.
     body: Vec<Line<'static>>,
+    /// The "Attachments" label's document line, when the entry lists files.
+    attachments: Option<usize>,
     /// Each chip row's document line and its chips.
     chips: Vec<(usize, Vec<Chip>)>,
     /// One past its last row.
@@ -175,10 +215,31 @@ impl Doc {
             let folded = collapsed.contains(&e.id);
             let mut body = Vec::new();
             let mut chips = Vec::new();
+            let mut attachments = None;
             y = top + 3;
             if !folded {
                 body = description_lines(&e.description, width as usize);
                 y += body.len();
+                // The files, one chip a row under their label.
+                let files: Vec<(usize, &ChangelogAttachment)> = e
+                    .attachments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| a.listed)
+                    .map(|(i, a)| (e.links.len() + i, a))
+                    .collect();
+                if !files.is_empty() {
+                    if !body.is_empty() {
+                        y += 1;
+                    }
+                    attachments = Some(y);
+                    y += 1;
+                    for (ix, file) in files {
+                        y += 1;
+                        chips.push((y, vec![file_chip(ix, file, width)]));
+                        y += 1;
+                    }
+                }
                 let links: Vec<(usize, &ChangelogLink)> = e.links.iter().enumerate().collect();
                 if !links.is_empty() {
                     // A blank over each chip row for its pill's top bleed,
@@ -188,13 +249,14 @@ impl Doc {
                         chips.push((y, row));
                         y += 1;
                     }
-                } else if !body.is_empty() {
+                } else if !body.is_empty() && attachments.is_none() {
                     y += 1;
                 }
             }
             rows.push(EntryRows {
                 top,
                 body,
+                attachments,
                 chips,
                 end: y,
             });
@@ -232,7 +294,8 @@ fn description_lines(description: &str, width: usize) -> Vec<Line<'static>> {
     if trimmed.trim().is_empty() {
         return Vec::new();
     }
-    crate::markdown::render_note(trimmed, width)
+    let text = shelbi_app::changelog::image_placeholders(trimmed);
+    crate::markdown::render_note(&text, width)
         .into_iter()
         .map(|mut line| {
             for span in &mut line.spans {
@@ -243,6 +306,21 @@ fn description_lines(description: &str, width: usize) -> Vec<Line<'static>> {
             line
         })
         .collect()
+}
+
+/// An attachment's chip, on a row of its own: its name and size, the name
+/// cut to fit.
+fn file_chip(ix: usize, file: &ChangelogAttachment, width: u16) -> Chip {
+    let room = (width as usize + 2).saturating_sub(4).max(1);
+    let size = format!("  {}", file.size_label());
+    let name = truncate_right(&file.name, room.saturating_sub(size.width()).max(1));
+    let label = truncate_right(&format!("{name}{size}"), room);
+    Chip {
+        link: ix,
+        x: 0,
+        width: (label.width() + 4) as u16,
+        label,
+    }
 }
 
 /// Flow `links` into rows of chips across `width`: each chip's pill is
@@ -625,7 +703,7 @@ impl ChangelogPage {
                 rows.chips
                     .iter()
                     .flat_map(|(_, chips)| chips.iter().map(|c| c.link))
-                    .filter(move |l| followable(&entry.links[*l]))
+                    .filter(move |l| item_followable(entry, *l))
                     .map(move |l| (ix, l))
                     .collect::<Vec<_>>()
             })
@@ -698,8 +776,15 @@ impl ChangelogPage {
     }
 
     fn follow(&self, ix: usize, l: usize) -> Step {
-        let Some(link) = self.model.visible().nth(ix).and_then(|e| e.links.get(l)) else {
+        let Some(entry) = self.model.visible().nth(ix) else {
             return Step::Stay;
+        };
+        let link = match item(entry, l) {
+            Some(Item::Link(link)) => link,
+            Some(Item::File(file)) => {
+                return entry.attachment_file(file).map_or(Step::Stay, Step::OpenFile);
+            }
+            None => return Step::Stay,
         };
         match &link.target {
             LinkTarget::Issue(id) => Step::OpenIssue(id.clone()),
@@ -858,7 +943,7 @@ impl ChangelogPage {
         chips
             .iter()
             .find(|c| col >= left + c.x && col < left + c.x + c.width)
-            .filter(|c| followable(&entry.links[c.link]))
+            .filter(|c| item_followable(entry, c.link))
             .map(|c| Hit::Link(ix, c.link))
     }
 
@@ -1031,6 +1116,10 @@ impl ChangelogPage {
                     buf.set_line(vp.x, y, line, vp.width);
                 }
             }
+            if let Some(y) = rows.attachments.and_then(screen) {
+                let style = Style::default().fg(palette().muted).add_modifier(Modifier::BOLD);
+                buf.set_stringn(vp.x, y, ATTACHMENTS, vp.width as usize, style);
+            }
             for (line, chips) in &rows.chips {
                 for chip in chips {
                     self.render_chip(buf, entry, ix, chip, pill_x, *line, &screen);
@@ -1102,8 +1191,11 @@ impl ChangelogPage {
         line: usize,
         screen: &dyn Fn(usize) -> Option<u16>,
     ) {
-        let link = &entry.links[chip.link];
-        let live = followable(link);
+        let (live, glyph) = match item(entry, chip.link) {
+            Some(Item::Link(link)) => (followable(link), glyph(link.kind)),
+            Some(Item::File(_)) => (item_followable(entry, chip.link), FILE_GLYPH),
+            None => return,
+        };
         let focused = self.selected_ix() == Some(ix) && self.link == Some(chip.link);
         let hovered = self.hover == Some(Hit::Link(ix, chip.link));
         let x = pill_x + chip.x;
@@ -1141,7 +1233,7 @@ impl ChangelogPage {
         }
         let mut spans = vec![
             Span::styled(" ", base),
-            Span::styled(glyph(link.kind), base.fg(fg)),
+            Span::styled(glyph, base.fg(fg)),
         ];
         spans.extend(padded_label(chip.label.clone(), 1, 1, style));
         buf.set_line(x, y, &Line::from(spans), chip.width);

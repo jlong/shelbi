@@ -116,6 +116,7 @@ fn entry_links_merge_frontmatter_and_body() {
         prs: vec![PrRef::Number(12), PrRef::Url("#13".into())],
         urls: vec!["https://example.com".into()],
         body: "Also issue:changelog and #12 and #99.".into(),
+        attachments: vec![],
         path: PathBuf::new(),
     };
     let labels: Vec<String> = entry.links(REPO).iter().map(Link::label).collect();
@@ -367,6 +368,7 @@ fn front(issues: &[&str], prs: &[u64], urls: &[&str]) -> Vec<Link> {
         prs: prs.iter().map(|n| PrRef::Number(*n)).collect(),
         urls: urls.iter().map(|s| s.to_string()).collect(),
         body: String::new(),
+        attachments: vec![],
         path: PathBuf::new(),
     };
     entry.front_links(REPO)
@@ -651,4 +653,190 @@ fn project_paths_scaffold_and_add_under_shelbi_home() {
     assert_eq!(changelog_stamp("p").entries, 1);
 
     std::env::remove_var("SHELBI_HOME");
+}
+
+// ---- attachments ----------------------------------------------------------
+
+/// A one-pixel PNG.
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x06\0\0\0\x1f\x15\xc4\x89";
+
+fn image(source: &Path, alt: Option<&str>) -> NewAttachment {
+    NewAttachment {
+        source: source.to_path_buf(),
+        kind: AttachmentKind::Image,
+        alt: alt.map(str::to_string),
+    }
+}
+
+fn file(source: &Path) -> NewAttachment {
+    NewAttachment {
+        source: source.to_path_buf(),
+        kind: AttachmentKind::File,
+        alt: None,
+    }
+}
+
+#[test]
+fn attaching_copies_files_records_them_and_references_images() {
+    let dir = scratch("attach");
+    let src = scratch("attach-src");
+    fs::write(src.join("Jobs sheet.png"), PNG).unwrap();
+    fs::write(src.join("bench.csv"), "a,b\n1,2\n").unwrap();
+    let mut new = new_entry("Board scrolls", "2026-11-16T17:00:00Z");
+    new.description = "Smooth now.".into();
+    let entry = add_entry_in(&dir, "{{description}}", REPO, new).unwrap();
+    assert!(entry.attachments.is_empty());
+    let stale = entry.clone();
+
+    let prepared = prepare_attachments(&[
+        image(&src.join("Jobs sheet.png"), Some("Jobs [sheet]  after")),
+        file(&src.join("bench.csv")),
+    ])
+    .unwrap();
+    let (entry, stored) = attach_files(&entry, &prepared).unwrap();
+
+    let assets = format!("assets/{}", entry.id);
+    let paths: Vec<&str> = stored.iter().map(|s| s.attachment.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        [
+            format!("{assets}/Jobs-sheet.png"),
+            format!("{assets}/bench.csv")
+        ]
+    );
+    for s in &stored {
+        assert_eq!(s.absolute, dir.join(&s.attachment.path));
+        assert!(s.absolute.is_file(), "{}", s.absolute.display());
+    }
+    // The source is copied, not moved.
+    assert!(src.join("Jobs sheet.png").is_file());
+    assert_eq!(fs::read(&stored[0].absolute).unwrap(), PNG);
+    assert_eq!(stored[1].attachment.size, 8);
+    assert_eq!(stored[0].attachment.kind, AttachmentKind::Image);
+    assert_eq!(stored[1].attachment.kind, AttachmentKind::File);
+
+    // The image is referenced at the end of the description, alt escaped.
+    assert_eq!(
+        entry.body,
+        format!("Smooth now.\n\n![Jobs \\[sheet\\] after]({assets}/Jobs-sheet.png)")
+    );
+    // Only the file is listed: the image shows inline.
+    let listed: Vec<&str> = entry.listed_attachments().iter().map(|a| a.name.as_str()).collect();
+    assert_eq!(listed, ["bench.csv"]);
+
+    // The file stays readable Markdown and round-trips through a read.
+    let text = fs::read_to_string(&entry.path).unwrap();
+    assert!(text.contains("attachments:\n- path: assets/"), "{text}");
+    assert!(text.contains("  kind: image\n"), "{text}");
+    let read = read_entries_in(&dir).unwrap();
+    assert_eq!(read.entries, std::slice::from_ref(&entry));
+
+    // A caller holding the entry from before keeps what was attached since.
+    let more = prepare_attachments(&[file(&src.join("bench.csv"))]).unwrap();
+    let (entry, stored) = attach_files(&stale, &more).unwrap();
+    assert_eq!(stored[0].attachment.name, "bench-2.csv");
+    assert_eq!(entry.attachments.len(), 3);
+    assert!(entry.body.contains("Jobs-sheet.png"), "{}", entry.body);
+}
+
+#[test]
+fn a_taken_name_gets_the_next_number() {
+    let dir = scratch("attach-dup");
+    let src = scratch("attach-dup-src");
+    fs::write(src.join("image.png"), PNG).unwrap();
+    let other = scratch("attach-dup-other");
+    fs::write(other.join("image.png"), PNG).unwrap();
+    let entry = add_entry_in(&dir, "{{description}}", REPO, new_entry("Dup", "2026-11-16T17:00:00Z")).unwrap();
+
+    let (entry, first) = attach_files(&entry, &prepare_attachments(&[image(&src.join("image.png"), None)]).unwrap()).unwrap();
+    let (entry, more) = attach_files(
+        &entry,
+        &prepare_attachments(&[image(&src.join("image.png"), None), image(&other.join("image.png"), None)]).unwrap(),
+    )
+    .unwrap();
+    let names: Vec<&str> = first
+        .iter()
+        .chain(&more)
+        .map(|s| s.attachment.name.as_str())
+        .collect();
+    assert_eq!(names, ["image.png", "image-2.png", "image-3.png"]);
+    assert_eq!(entry.attachments.len(), 3);
+    // Each image referenced once, in order, its alt the file's stem.
+    let refs: Vec<&str> = entry.body.lines().filter(|l| l.starts_with("![")).collect();
+    assert_eq!(
+        refs,
+        [
+            format!("![image](assets/{}/image.png)", entry.id),
+            format!("![image](assets/{}/image-2.png)", entry.id),
+            format!("![image](assets/{}/image-3.png)", entry.id),
+        ]
+    );
+
+    // A name the frontmatter holds counts as taken even with its file gone.
+    fs::remove_file(dir.join(&entry.attachments[0].path)).unwrap();
+    let (_, again) = attach_files(&entry, &prepare_attachments(&[image(&src.join("image.png"), None)]).unwrap()).unwrap();
+    assert_eq!(again[0].attachment.name, "image-4.png");
+}
+
+#[test]
+fn attaching_keeps_unknown_frontmatter_and_old_entries_load() {
+    let dir = scratch("attach-keep");
+    let path = dir.join("2026-10-28-213005-old.md");
+    fs::write(
+        &path,
+        "---\ntitle: Old entry\ndate: 2026-10-28T14:30:05-07:00\nauthor: user\nmood: sunny\n---\nNo files here.\n",
+    )
+    .unwrap();
+    let read = read_entries_in(&dir).unwrap();
+    let entry = &read.entries[0];
+    assert!(entry.attachments.is_empty(), "an entry without the field loads");
+
+    let src = scratch("attach-keep-src");
+    fs::write(src.join("log.txt"), "ok").unwrap();
+    let (entry, stored) =
+        attachments::attach_to_entry_in(&dir, "2026-10-28", &prepare_attachments(&[file(&src.join("log.txt"))]).unwrap())
+            .unwrap();
+    assert_eq!(stored[0].attachment.path, "assets/2026-10-28-213005-old/log.txt");
+    // A file attachment leaves the description alone.
+    assert_eq!(entry.body, "No files here.");
+    let text = fs::read_to_string(&path).unwrap();
+    assert!(text.contains("mood: sunny"), "{text}");
+    assert!(text.starts_with("---\ntitle: Old entry\n"), "{text}");
+    // The asset directory isn't read as an entry.
+    assert_eq!(read_entries_in(&dir).unwrap().entries.len(), 1);
+}
+
+#[test]
+fn bad_files_are_refused_before_anything_is_copied() {
+    let src = scratch("attach-bad");
+    fs::write(src.join("notes.txt"), "plain").unwrap();
+    fs::write(src.join("shot"), PNG).unwrap();
+    let missing = prepare_attachments(&[file(&src.join("nope.bin"))]).unwrap_err();
+    assert!(missing.to_string().contains("nope.bin"), "{missing}");
+    let dir = prepare_attachments(&[file(&src)]).unwrap_err();
+    assert!(dir.to_string().contains("not a file"), "{dir}");
+    let not_image = prepare_attachments(&[image(&src.join("notes.txt"), None)]).unwrap_err();
+    assert!(not_image.to_string().contains("isn't an image"), "{not_image}");
+    // An image without an extension is recognized by its bytes.
+    assert!(prepare_attachments(&[image(&src.join("shot"), None)]).is_ok());
+
+    let big = src.join("big.bin");
+    let f = fs::File::create(&big).unwrap();
+    f.set_len(attachments::MAX_ATTACHMENT_BYTES + 1).unwrap();
+    let too_big = prepare_attachments(&[file(&big)]).unwrap_err();
+    assert!(too_big.to_string().contains("at most 50.0 MB"), "{too_big}");
+}
+
+#[test]
+fn stored_names_are_safe_in_a_path_and_a_link() {
+    use attachments::safe_name;
+    assert_eq!(safe_name("Jobs sheet (after).png"), "Jobs-sheet-after.png");
+    assert_eq!(safe_name("ci-build.log"), "ci-build.log");
+    assert_eq!(safe_name(".env"), "env");
+    assert_eq!(safe_name("éé.png"), "file.png");
+    assert_eq!(safe_name("..."), "file");
+    assert_eq!(safe_name("???"), "file");
+    assert_eq!(format_size(512), "512 B");
+    assert_eq!(format_size(12 * 1024), "12 KB");
+    assert_eq!(format_size(4_300_000), "4.1 MB");
 }

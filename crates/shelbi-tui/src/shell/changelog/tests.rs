@@ -25,6 +25,7 @@ pub(crate) fn entry(
             prs: prs.iter().map(|n| PrRef::Number(*n)).collect(),
             urls: vec![],
             body: body.into(),
+            attachments: vec![],
             path: PathBuf::new(),
         },
         Some(REPO),
@@ -443,6 +444,7 @@ fn an_unresolved_pr_is_muted_and_skipped() {
             prs: vec![PrRef::Number(13)],
             urls: vec![],
             body: String::new(),
+            attachments: vec![],
             path: PathBuf::new(),
         },
         None,
@@ -453,6 +455,88 @@ fn an_unresolved_pr_is_muted_and_skipped() {
     assert_eq!(buf[(x, y)].fg, palette().muted);
     press(&mut page, KeyCode::Tab);
     assert_eq!(page.link, None, "nothing to focus");
+}
+
+/// An entry with an inline image and a file, stored under `/h/changelog`.
+fn with_files() -> ChangelogEntryView {
+    use shelbi_state::changelog::{Attachment, AttachmentKind};
+    let id = "2026-11-16-170000-board-scrolls";
+    ChangelogEntryView::new(
+        ChangelogEntry {
+            id: id.into(),
+            title: "Board columns scroll smoothly".into(),
+            date: DateTime::parse_from_rfc3339("2026-11-16T09:00:00-08:00").unwrap(),
+            author: "orchestrator".into(),
+            issues: vec!["job-sheet-pane".into()],
+            prs: vec![],
+            urls: vec![],
+            body: format!("Opening a job floats a pane.\n\n![Jobs sheet after the change](assets/{id}/jobs.png)"),
+            attachments: vec![
+                Attachment {
+                    path: format!("assets/{id}/jobs.png"),
+                    name: "jobs.png".into(),
+                    size: 48_000,
+                    kind: AttachmentKind::Image,
+                },
+                Attachment {
+                    path: format!("assets/{id}/bench-results.csv"),
+                    name: "bench-results.csv".into(),
+                    size: 12 * 1024,
+                    kind: AttachmentKind::File,
+                },
+            ],
+            path: PathBuf::from(format!("/h/changelog/{id}.md")),
+        },
+        Some(REPO),
+    )
+}
+
+#[test]
+fn images_are_placeholders_and_files_are_listed_and_open() {
+    let mut page = page_with(vec![with_files()]);
+    let buf = render(&mut page, 100, 30);
+    let text = rows(&buf).join("\n");
+    assert!(text.contains("[image: Jobs sheet after the change]"), "{text}");
+    assert!(!text.contains("![") && !text.contains("jobs.png"), "the image isn't listed\n{text}");
+    assert!(text.contains("Attachments"), "{text}");
+    assert!(text.contains("⎘ bench-results.csv  12 KB"), "{text}");
+    // The label sits under the description, the file under the label, the
+    // link chips after the files.
+    let (_, label) = find(&buf, "Attachments").unwrap();
+    let (_, file) = find(&buf, "bench-results.csv").unwrap();
+    let (_, chip) = find(&buf, "job-sheet-pane").unwrap();
+    assert!(label < file && file < chip, "{text}");
+
+    // Tab reaches the file first, and Enter opens it with the system opener.
+    press(&mut page, KeyCode::Tab);
+    assert_eq!(
+        press(&mut page, KeyCode::Enter),
+        Step::OpenFile(PathBuf::from("/h/changelog/assets/2026-11-16-170000-board-scrolls/bench-results.csv"))
+    );
+    press(&mut page, KeyCode::Tab);
+    assert_eq!(press(&mut page, KeyCode::Enter), Step::OpenIssue("job-sheet-pane".into()));
+    // A click opens it too.
+    let area = Rect::new(0, 0, 100, 30);
+    let buf = render(&mut page, 100, 30);
+    let (x, y) = find(&buf, "bench-results.csv").unwrap();
+    let step = page.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), x, y), area);
+    assert!(matches!(step, Step::OpenFile(_)), "{step:?}");
+}
+
+#[test]
+fn a_remote_windows_files_are_listed_but_not_openable() {
+    let mut e = with_files();
+    // What a remote window has: the entry, without this machine's directory.
+    e.dir = None;
+    let mut page = page_with(vec![e]);
+    let buf = render(&mut page, 100, 30);
+    let text = rows(&buf).join("\n");
+    assert!(text.contains("[image: Jobs sheet after the change]"), "{text}");
+    let (x, y) = find(&buf, "bench-results.csv").unwrap();
+    assert_eq!(buf[(x, y)].fg, palette().muted);
+    // Tab skips it for the issue link.
+    press(&mut page, KeyCode::Tab);
+    assert_eq!(press(&mut page, KeyCode::Enter), Step::OpenIssue("job-sheet-pane".into()));
 }
 
 #[test]

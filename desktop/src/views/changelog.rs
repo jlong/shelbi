@@ -49,7 +49,8 @@ use gpui::{
 use gpui_kit::base::text::{RangeHighlight, RenderedText, TextViewState};
 use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
 use shelbi_app::changelog::{
-    self, ChangelogData, ChangelogEntryView, ChangelogLink, ChangelogModel, LinkKind, LinkTarget,
+    self, ChangelogAttachment, ChangelogData, ChangelogEntryView, ChangelogLink, ChangelogModel, LinkKind,
+    LinkTarget,
 };
 
 use super::activity_list::FeedList;
@@ -724,8 +725,13 @@ impl ChangelogView {
             .collect();
         let body = (!entry.prose().is_empty()).then(|| {
             let state = self.body_state(entry, cx);
-            markdown::body_with_state(&state, theme)
+            markdown::body_with_state(&state, theme, entry.dir.as_deref())
         });
+        let files: Vec<AnyElement> = entry
+            .listed_attachments()
+            .enumerate()
+            .map(|(fi, file)| self.render_attachment(ix, fi, entry, file, theme, cx))
+            .collect();
         let chips: Vec<AnyElement> = entry
             .links
             .iter()
@@ -754,6 +760,18 @@ impl ChangelogView {
                     .child(entry.date_label()),
             )
             .when_some(body, |d, body| d.child(div().mt(px(16.0)).type_style(Type::Base).child(body)))
+            .when(!files.is_empty(), |d| {
+                d.child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap(px(6.0))
+                        .child(div().type_style(Type::Small).text_color(theme.muted).child("Attachments"))
+                        .children(files),
+                )
+            })
             .when(!chips.is_empty(), |d| {
                 d.child(div().mt(px(16.0)).flex().flex_row().flex_wrap().gap(px(6.0)).children(chips))
             })
@@ -792,6 +810,40 @@ impl ChangelogView {
         style::content_button(id, content, kind, ButtonSize::Small, false, theme)
             .tooltip(style::tooltip(tip))
             .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_link(&target, cx)))
+            .into_any_element()
+    }
+
+    /// An attachment's row: the Button at Small with the document icon and
+    /// the file's name, its size beside it in the muted role. A click opens
+    /// the file with the system opener; in a remote window, where the far
+    /// file can't be read, the button draws disabled.
+    fn render_attachment(
+        &self,
+        ix: usize,
+        fi: usize,
+        entry: &ChangelogEntryView,
+        file: &ChangelogAttachment,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = format!("changelog-file-{ix}-{fi}");
+        let content = ButtonContent::label(file.name.clone()).left(icons::DOCUMENT_TEXT);
+        let button = match entry.attachment_file(file) {
+            Some(path) => style::content_button(id, content, ButtonKind::Secondary, ButtonSize::Small, false, theme)
+                .tooltip(style::tooltip(path.display().to_string()))
+                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| open_file(&path, cx)))
+                .into_any_element(),
+            None => style::disabled_content_button(id, content, ButtonKind::Secondary, ButtonSize::Small, theme)
+                .tooltip(style::tooltip("Open the project on its own machine to open this file"))
+                .into_any_element(),
+        };
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(button)
+            .child(div().type_style(Type::Small).text_color(theme.muted).child(file.size_label()))
             .into_any_element()
     }
 
@@ -842,11 +894,26 @@ pub fn link_icon(kind: LinkKind) -> Icon {
     }
 }
 
+/// Open an attachment with the system opener. A test records it instead.
+fn open_file(path: &std::path::Path, cx: &mut App) {
+    #[cfg(test)]
+    {
+        let _ = cx;
+        tests::OPENED_FILES.with(|o| o.borrow_mut().push(path.to_path_buf()));
+    }
+    #[cfg(not(test))]
+    cx.open_with_system(path);
+}
+
 /// An entry's list key: its id, and what it reads (an edited entry is
 /// re-measured in place).
 fn entry_key(entry: &ChangelogEntryView) -> ItemKey {
     let ident = ItemKey::of("changelog-entry", &entry.id).ident;
-    let content = ItemKey::of("changelog-entry", (&entry.title, &entry.description, entry.links.len())).content;
+    let content = ItemKey::of(
+        "changelog-entry",
+        (&entry.title, &entry.description, entry.links.len(), entry.attachments.len()),
+    )
+    .content;
     ItemKey { ident, content }
 }
 
@@ -884,6 +951,12 @@ mod tests {
     use super::*;
     use gpui::{TestAppContext, VisualTestContext};
     use shelbi_state::changelog::{add_entry, NewEntry, PrRef};
+
+    thread_local! {
+        /// The files [`open_file`] was asked to open.
+        pub(super) static OPENED_FILES: std::cell::RefCell<Vec<std::path::PathBuf>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
 
     fn nav(spec: &str) -> Option<Nav> {
         nav_for(&Keystroke::parse(spec).unwrap())
@@ -1000,6 +1073,77 @@ mod tests {
         assert_eq!(query, "", "the search is cleared");
         assert_eq!(at, Some(7), "the oldest entry, newest first");
         assert!(top > 0, "scrolled down to it (the list stops at its end): {top}");
+
+        unsafe { std::env::remove_var("SHELBI_HOME") };
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[gpui::test]
+    fn an_entrys_image_shows_inline_and_its_files_open(cx: &mut TestAppContext) {
+        let _env = crate::test_env::lock();
+        let home = std::env::temp_dir().join(format!("shbcl-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        // SAFETY: the env lock is held.
+        unsafe { std::env::set_var("SHELBI_HOME", &home) };
+        let project = "cla";
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // A real 1x1 PNG, so the image decodes.
+        std::fs::write(
+            src.join("shot.png"),
+            [
+                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+                0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+                0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+                0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+            ],
+        )
+        .unwrap();
+        std::fs::write(src.join("bench.csv"), "a,b\n").unwrap();
+        let added = add_entry(project, entry("Board scrolls", &["dt-board"], "Smooth.")).unwrap();
+        let files = shelbi_state::changelog::prepare_attachments(&[
+            shelbi_state::changelog::NewAttachment {
+                source: src.join("shot.png"),
+                kind: shelbi_state::changelog::AttachmentKind::Image,
+                alt: Some("The board after".into()),
+            },
+            shelbi_state::changelog::NewAttachment {
+                source: src.join("bench.csv"),
+                kind: shelbi_state::changelog::AttachmentKind::File,
+                alt: None,
+            },
+        ])
+        .unwrap();
+        let (stored_entry, stored) = shelbi_state::changelog::attach_files(&added, &files).unwrap();
+
+        cx.update(|cx| {
+            cx.set_global(Theme::resolve(shelbi_state::ThemePreference::Dark, gpui::WindowAppearance::Dark));
+            gpui_kit::init(cx);
+        });
+        let handle = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(|cx| ChangelogView::new(&shelbi_orchestrator::source::local_handle(project), cx)))
+                .unwrap()
+        });
+        let mut vcx = VisualTestContext::from_window(handle.into(), cx);
+        let view = handle.root(&mut vcx).unwrap();
+        settle(&view, &mut vcx);
+        settle(&view, &mut vcx);
+        assert_eq!(model(&view, &vcx, |m| m.total()), 1);
+
+        // The image paragraph is a figure.
+        let start = stored_entry.body.find("![").unwrap();
+        let figure: &'static str = Box::leak(format!("changelog-figure-{start}-0").into_boxed_str());
+        assert!(vcx.debug_bounds(figure).is_some(), "the image draws as a figure");
+        // Only the file is listed, and a click opens it.
+        assert!(vcx.debug_bounds("changelog-file-0-1").is_none(), "the inline image isn't listed");
+        let file = vcx.debug_bounds("changelog-file-0-0").expect("the file's row");
+        OPENED_FILES.with(|o| o.borrow_mut().clear());
+        vcx.simulate_click(file.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        let opened = OPENED_FILES.with(|o| o.borrow().clone());
+        assert_eq!(opened, [stored[1].absolute.clone()]);
 
         unsafe { std::env::remove_var("SHELBI_HOME") };
         let _ = std::fs::remove_dir_all(&home);

@@ -698,6 +698,7 @@ mod tests {
                 prs,
                 urls: vec![],
                 body: body.into(),
+                attachments: vec![],
                 path: Default::default(),
             },
             Some("a/b"),
