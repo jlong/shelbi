@@ -36,6 +36,7 @@ tracing = { workspace = true }
 signal-hook = "0.3"
 chrono = { workspace = true }
 tungstenite = { workspace = true }
+portable-pty = { workspace = true }
 libc = { workspace = true }
 
 [features]

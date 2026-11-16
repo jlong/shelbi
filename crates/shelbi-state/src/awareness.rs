@@ -153,9 +153,9 @@ pub struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     pub started_at: DateTime<Utc>,
-    /// `command` only: the pid of the detached runner, which is also the
-    /// process group of the command it runs. `None` for the instant between
-    /// minting the entry and spawning the runner.
+    /// `command` only: the pid of the runner (`shelbi __job-exec`), which
+    /// leads its process group in the job's session. The runner records it
+    /// itself once it is up; `None` until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_pid: Option<u32>,
 }
@@ -395,6 +395,35 @@ pub fn clear_estimate(project: &str, task_id: &str) -> Result<Option<Estimate>> 
 
 // ---------------------------------------------------------------------------
 // Command job files
+
+/// The session a command job runs in: `<project>/job/<id>`. Workspace
+/// sessions are `<project>/ws/<workspace>[/<role>]` and the orchestrator's
+/// is `<project>/orch`, so a job's never collides with either.
+pub fn job_session_name(project: &str, id: &str) -> String {
+    format!("{project}/{JOB_SESSION_SEGMENT}/{id}")
+}
+
+/// The segment after the project in a job session's name.
+pub const JOB_SESSION_SEGMENT: &str = "job";
+
+/// The job id a session named [`job_session_name`] for `project` runs.
+pub fn job_of_session<'a>(project: &str, name: &'a str) -> Option<&'a str> {
+    name.strip_prefix(project)?
+        .strip_prefix('/')?
+        .strip_prefix(JOB_SESSION_SEGMENT)?
+        .strip_prefix('/')
+        .filter(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// Whether the session `name` is some project's job session.
+pub fn is_job_session(name: &str) -> bool {
+    let mut parts = name.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(p), Some(JOB_SESSION_SEGMENT), Some(id), None) if !p.is_empty() && !id.is_empty()
+    )
+}
+
 
 /// `<project_dir>/jobs/<id>/`. The id must be a single plain path component.
 pub fn job_dir(project: &str, id: &str) -> Result<PathBuf> {
@@ -1120,5 +1149,19 @@ mod tests {
         std::fs::write(&path, &big).unwrap();
         assert_eq!(tail(3), "00019997\n00019998\n00019999\n");
         assert_eq!(tail(15_000).lines().count(), 15_000);
+    }
+
+    #[test]
+    fn job_session_names_sit_apart_from_workspace_sessions() {
+        let name = job_session_name("demo", "j12");
+        assert_eq!(name, "demo/job/j12");
+        assert_eq!(job_of_session("demo", &name), Some("j12"));
+        assert!(is_job_session(&name));
+        assert_eq!(job_of_session("dem", &name), None);
+        assert_eq!(job_of_session("demo", "demo/ws/job"), None);
+        assert!(!is_job_session("demo/ws/j12"));
+        assert!(!is_job_session("demo/ws/job"));
+        assert!(!is_job_session("demo/orch"));
+        assert!(!is_job_session("demo/ws/job/shell"));
     }
 }

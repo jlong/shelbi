@@ -168,6 +168,8 @@ pub struct JobRow {
     pub started_at: DateTime<Utc>,
     /// Running, or how it ended.
     pub state: JobState,
+    /// What it is: only a command job has a terminal and output.
+    pub kind: JobKind,
 }
 
 impl JobRow {
@@ -179,6 +181,7 @@ impl JobRow {
             command: command_text_for(job.kind, &job.target),
             started_at: job.started_at,
             state: JobState::Running,
+            kind: job.kind,
         }
     }
 
@@ -194,6 +197,7 @@ impl JobRow {
                 exit_code: record.exit_code,
                 finished_at: record.finished_at,
             },
+            kind: record.kind,
         }
     }
 
@@ -263,6 +267,173 @@ impl JobRow {
     pub fn started(&self, now: DateTime<Utc>) -> String {
         started_label(self.started_at, now, &Local)
     }
+
+    /// The side sheet's status line: a glyph, the status, and how long it
+    /// ran or has been running (`● Running · 42s`, `✕ Failed · exit 3 ·
+    /// 1m 30s`). Colored with [`status_tone`](Self::status_tone).
+    pub fn sheet_status(&self, now: DateTime<Utc>) -> String {
+        let glyph = match self.state {
+            JobState::Running => "●",
+            JobState::Finished { status, .. } => match status {
+                JobStatus::Ok | JobStatus::Merged => "✓",
+                JobStatus::Failed => "✕",
+                JobStatus::Canceled => "■",
+                JobStatus::Exited | JobStatus::Closed => "○",
+            },
+        };
+        format!("{glyph} {} · {}", self.status_label(), self.duration(now))
+    }
+
+    /// Whether the sheet offers [`CANCEL_LABEL`]: the job is still running.
+    pub fn can_cancel(&self) -> bool {
+        self.is_running()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The side sheet
+
+/// The side sheet's Cancel button.
+pub const CANCEL_LABEL: &str = "Cancel job";
+
+/// What the sheet says for a `job watch` job, which has no output.
+pub const WATCH_TEXT: &str = "A watch has no output: it follows something that runs elsewhere.";
+
+/// The most of a finished job's `output.log` the sheet shows: its end.
+pub const SAVED_OUTPUT_MAX: u64 = 256 * 1024;
+
+/// What a job's side sheet shows under its title and status: the live
+/// terminal of a running command, the saved output of a finished one, or a
+/// line saying why there is neither. Both clients open a sheet from a row
+/// with [`sheet_output`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SheetOutput {
+    /// Attach (read-only) to the session of this name: the job's terminal.
+    Live { session: String },
+    /// The saved output, ready to feed a terminal emulator ([`saved_output`]).
+    Saved(Vec<u8>),
+    /// Nothing to show, and why.
+    Message(String),
+}
+
+/// What the sheet for `row` (a job of the local project `project`) shows. A
+/// running command whose session is up is [`SheetOutput::Live`]; one whose
+/// session is gone (a job started by an older Shelbi, or one just ending)
+/// shows its output so far. Reads the sessions directory and the log, so a
+/// client calls it off its UI thread.
+pub fn sheet_output(project: &str, row: &JobRow) -> SheetOutput {
+    if row.kind != JobKind::Command {
+        return SheetOutput::Message(WATCH_TEXT.to_string());
+    }
+    if row.is_running() {
+        let session = shelbi_state::awareness::job_session_name(project, &row.id);
+        let live = shelbi_state::sessions_dir()
+            .ok()
+            .and_then(|root| shelbi_client::list(&root).ok())
+            .is_some_and(|all| shelbi_client::choose_session(&all, &session).is_some());
+        if live {
+            return SheetOutput::Live { session };
+        }
+    }
+    match shelbi_state::awareness::job_output_path(project, &row.id).map(|p| saved_output(&p)) {
+        Ok(Ok(bytes)) if !bytes.is_empty() => SheetOutput::Saved(bytes),
+        Ok(Ok(_)) => SheetOutput::Message("No output.".to_string()),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            SheetOutput::Message("Its output is no longer kept.".to_string())
+        }
+        Ok(Err(e)) => SheetOutput::Message(format!("Couldn't read its output: {e}")),
+        Err(e) => SheetOutput::Message(format!("Couldn't read its output: {e}")),
+    }
+}
+
+/// How long [`attach_live`] keeps trying a job session whose socket isn't
+/// answering yet (one that has only just started).
+const ATTACH_TRIES: u32 = 30;
+const ATTACH_RETRY: Duration = Duration::from_millis(100);
+
+/// Attach to the live job session `session` ([`SheetOutput::Live`]) with a
+/// full replay, by its exact name. The sheet only watches: a client never
+/// sends it input, so nothing typed reaches the job. Blocking: off the UI
+/// thread.
+pub fn attach_live(session: &str) -> Result<crate::session::Connected, String> {
+    let root = shelbi_state::sessions_dir().map_err(|e| e.to_string())?;
+    let mut last = String::new();
+    for _ in 0..ATTACH_TRIES {
+        let sessions = shelbi_client::list(&root).map_err(|e| e.to_string())?;
+        let Some(found) = shelbi_client::choose_session(&sessions, session) else {
+            return Err(format!("the job's terminal `{session}` has closed"));
+        };
+        match shelbi_client::Connection::open(&found.sock, None, shelbi_proto::capability::ALL) {
+            Ok((conn, events)) => {
+                let size = conn
+                    .info()
+                    .map(|i| crate::session::GridSize::new(i.cols.max(1), i.rows.max(1)))
+                    .unwrap_or(crate::session::GridSize::new(80, 24));
+                conn.attach(None).map_err(|e| e.to_string())?;
+                return Ok(crate::session::Connected { conn, events, size });
+            }
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(ATTACH_RETRY);
+    }
+    Err(format!("couldn't attach to the job's terminal: {last}"))
+}
+
+/// A job's sheet, loaded ([`open_sheet`]).
+pub enum SheetLoad {
+    /// Attached to the running job's terminal.
+    Live(crate::session::Connected),
+    /// The saved output ([`saved_output`]).
+    Saved(Vec<u8>),
+    /// Nothing to show, and why.
+    Message(String),
+}
+
+/// Load the sheet for `row`: attach to its live terminal, or read its saved
+/// output, as [`sheet_output`] says. A terminal that closes before the
+/// attach lands (the job just ended) falls back to the output. Blocking:
+/// off the UI thread.
+pub fn open_sheet(project: &str, row: &JobRow) -> SheetLoad {
+    let saved = |why: String| match shelbi_state::awareness::job_output_path(project, &row.id)
+        .map_err(|e| e.to_string())
+        .and_then(|p| saved_output(&p).map_err(|e| e.to_string()))
+    {
+        Ok(bytes) if !bytes.is_empty() => SheetLoad::Saved(bytes),
+        _ => SheetLoad::Message(why),
+    };
+    match sheet_output(project, row) {
+        SheetOutput::Live { session } => match attach_live(&session) {
+            Ok(connected) => SheetLoad::Live(connected),
+            Err(e) => saved(e),
+        },
+        SheetOutput::Saved(bytes) => SheetLoad::Saved(bytes),
+        SheetOutput::Message(m) => SheetLoad::Message(m),
+    }
+}
+
+/// The end of a plain-text log at `path` as terminal input: at most
+/// [`SAVED_OUTPUT_MAX`] bytes, starting on a line, each `\n` a `\r\n` so an
+/// emulator starts every line at the left edge.
+pub fn saved_output(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(SAVED_OUTPUT_MAX);
+    file.seek(SeekFrom::Start(start))?;
+    let mut text = Vec::new();
+    file.read_to_end(&mut text)?;
+    if start > 0 {
+        let first = text.iter().position(|b| *b == b'\n').map_or(text.len(), |i| i + 1);
+        text.drain(..first);
+    }
+    let mut out = Vec::with_capacity(text.len() + text.len() / 16);
+    for b in text {
+        if b == b'\n' {
+            out.push(b'\r');
+        }
+        out.push(b);
+    }
+    Ok(out)
 }
 
 /// A duration in whole seconds, its two largest units: `45s`, `2m 13s`,
@@ -569,4 +740,40 @@ mod tests {
         assert_eq!(truncate("abc", 0), "");
         assert_eq!(one_line("a\nb\tc\r\nd"), "a b c  d");
     }
+
+    #[test]
+    fn the_sheet_status_says_how_the_job_is_doing_and_for_how_long() {
+        let now = at(14, 10);
+        let running = JobRow::from_job(&job("j4", JobKind::Command, "make", None, at(14, 9)));
+        assert_eq!(running.sheet_status(now), "● Running · 1m");
+        assert!(running.can_cancel());
+        let failed = JobRow::from_record(&record("j5", JobStatus::Failed, Some(3), at(14, 0), at(14, 1)));
+        assert_eq!(failed.sheet_status(now), "✕ Failed · exit 3 · 1m");
+        assert!(!failed.can_cancel());
+        let ok = JobRow::from_record(&record("j6", JobStatus::Ok, Some(0), at(14, 0), at(14, 2)));
+        assert_eq!(ok.sheet_status(now), "✓ OK · 2m");
+    }
+
+    #[test]
+    fn a_watch_has_no_output_to_show() {
+        let row = JobRow::from_job(&job("j7", JobKind::Pid, "4242", None, at(14, 0)));
+        assert_eq!(sheet_output("demo", &row), SheetOutput::Message(WATCH_TEXT.to_string()));
+    }
+
+    #[test]
+    fn saved_output_is_the_logs_end_as_terminal_lines() {
+        let path = std::env::temp_dir().join(format!("shelbi-jobs-saved-{}.log", std::process::id()));
+        std::fs::write(&path, "one\ntwo\n").unwrap();
+        assert_eq!(saved_output(&path).unwrap(), b"one\r\ntwo\r\n");
+        // A long log starts on a whole line within the window.
+        let line = "x".repeat(99) + "\n";
+        let big = line.repeat((SAVED_OUTPUT_MAX as usize / line.len()) + 10);
+        std::fs::write(&path, format!("{big}last\n")).unwrap();
+        let out = saved_output(&path).unwrap();
+        assert!(out.len() as u64 <= SAVED_OUTPUT_MAX + SAVED_OUTPUT_MAX / 50);
+        assert!(out.starts_with(b"xxx"));
+        assert!(out.ends_with(b"last\r\n"));
+        let _ = std::fs::remove_file(&path);
+    }
+
 }

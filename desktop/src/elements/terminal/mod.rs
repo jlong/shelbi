@@ -473,6 +473,31 @@ impl TerminalPane {
         pane
     }
 
+    /// A pane that only watches the session `connected` is attached to (wired
+    /// with [`session::wire`]): what it shows is live, but nothing typed,
+    /// clicked or pasted reaches the program ([`session::WatchOnly`]).
+    pub fn watching(connected: session::Connected, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let connected = session::Connected {
+            link: Box::new(session::WatchOnly(connected.link)),
+            ..connected
+        };
+        Self::attached_to(connected, window, cx)
+    }
+
+    /// A read-only pane with no session behind it, showing `bytes` (terminal
+    /// output, `\r\n` line ends), wrapped again to each size it is laid out
+    /// at ([`session::Replay`]).
+    pub fn replay(name: String, bytes: Vec<u8>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (events, rx) = futures::channel::mpsc::unbounded();
+        let mut pane = Self::new(name.clone(), window, cx);
+        let io = session::Replay { events, bytes: bytes.into() };
+        pane.attached(name, Size::new(80, 24), Box::new(io), cx);
+        pane._pump = Some(cx.spawn_in(window, async move |this, cx| {
+            Self::pump(this, rx, cx).await;
+        }));
+        pane
+    }
+
     /// The visible screen as text, one line per row (tests).
     #[cfg(test)]
     pub fn terminal_text(&self) -> String {

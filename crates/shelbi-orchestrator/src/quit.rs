@@ -413,6 +413,9 @@ fn end_sessions(
     drop(tx);
 
     let local = Timed::start(report, "local", "stopping sessions");
+    // A `shelbi job run` command keeps running through a quit, as it always
+    // has: its session is only its terminal, and the next tick reports it.
+    let owned_locally = |name: &str| !shelbi_state::awareness::is_job_session(name) && owned_locally(name);
     let mut ended = sweep_host(&**sessions, &Host::Local, &owned_locally);
     let n = ended.len();
     local.done(format!("stopped {n} {}", sessions_word(n)), None);
@@ -786,13 +789,14 @@ mod tests {
         let sessions = Arc::new(FakeSessions::new(&[
             "alpha/orch",
             "alpha/ws/dev",
+            "alpha/job/j3", // a `job run` command: it outlives the quit
             "beta/orch",
             "alpha-2/orch", // a prefix-sharing OTHER project
         ]));
 
         let out = quit_project_with("alpha", sessions.clone());
 
-        // Only alpha's sessions were ended.
+        // Only alpha's sessions were ended, and not its job's.
         assert_eq!(sessions.killed(), vec!["alpha/orch", "alpha/ws/dev"]);
         assert_eq!(out.ended, vec!["alpha/orch", "alpha/ws/dev"]);
         assert!(out.drained, "no jobs registered → barrier drains at once");

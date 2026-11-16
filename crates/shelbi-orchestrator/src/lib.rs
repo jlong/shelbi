@@ -21,6 +21,7 @@ use crate::session_backend::{backend, SessionBackend, SessionTarget};
 pub mod actions;
 pub mod agent_send;
 pub mod awareness;
+pub mod job_exec;
 pub mod branch;
 pub mod cancel;
 pub(crate) mod codex_rpc;

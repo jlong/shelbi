@@ -17,6 +17,19 @@
 //!   ↑/↓ select
 //! ```
 //!
+//! Enter opens the selected job's sheet on the right: a running command's
+//! live terminal (attached read-only: keys never reach the job), a finished
+//! one's saved output, with its label, status and elapsed time. `c` cancels a
+//! running job; Esc closes the sheet.
+//!
+//! ```text
+//!  Jobs                                  ┃ demo: count to 120
+//!   Description          Command         ┃ ● Running · 42s
+//!  ▐ demo: count to 120  zsh -c 'for i…' ┃ step 41 of 120
+//!                                        ┃ step 42 of 120
+//!                                        ┃ c cancel job · esc close
+//! ```
+//!
 //! The rows come in on the shell's core snapshot (read with the sidebar, so a
 //! job appears, or moves under Finished, on the shell's refresh); the
 //! durations and ages tick over because the shell redraws on that refresh
@@ -29,21 +42,58 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use shelbi_app::jobs::{one_line, JobRow, JobsModel, JobsRead, COLUMNS, FINISHED_HEADING, TITLE};
+use std::sync::mpsc;
 
+use shelbi_app::jobs::{
+    one_line, JobRow, JobsModel, JobsRead, SheetLoad, CANCEL_LABEL, COLUMNS, FINISHED_HEADING, TITLE,
+};
+use shelbi_term::Size;
+
+use crate::shell::terminal_view::TerminalPane;
 use crate::table::{self, Cell, Column, Table};
 use crate::theme::palette;
 
 /// How many lines the selected row's whole command may take under the table.
 const DETAIL_LINES: u16 = 3;
 
-/// The page: the model, and which row is selected.
-#[derive(Debug, Default)]
+/// The page: the model, which row is selected, and the open sheet.
+#[derive(Default)]
 pub(crate) struct JobsPage {
     model: JobsModel,
     selected: usize,
     scroll: usize,
+    sheet: Option<JobSheet>,
 }
+
+/// The side sheet for one job: its terminal (live, or the saved output), or
+/// a line saying why there is none.
+pub(crate) struct JobSheet {
+    id: String,
+    /// The row it opened on, for when the job leaves the model (pruned).
+    opened: JobRow,
+    /// The load, until it lands.
+    loading: Option<mpsc::Receiver<SheetLoad>>,
+    body: SheetBody,
+    /// A cancel was asked for and the row still says running.
+    canceling: bool,
+}
+
+enum SheetBody {
+    Loading,
+    Live {
+        pane: TerminalPane,
+        conn: shelbi_client::Connection,
+        events: shelbi_client::SessionEvents,
+        /// The size last reported to the session.
+        sent: Option<(u16, u16)>,
+    },
+    /// Saved output, laid out at the size it was last drawn at.
+    Saved { bytes: Vec<u8>, pane: Option<(Size, TerminalPane)> },
+    Message(String),
+}
+
+/// The width the sheet takes of the page, in percent.
+const SHEET_PERCENT: u16 = 55;
 
 impl JobsPage {
     /// Fold in a read. The selection follows its job when it moves.
@@ -62,6 +112,91 @@ impl JobsPage {
 
     pub(crate) fn selected_row(&self) -> Option<&JobRow> {
         self.model.rows().get(self.selected)
+    }
+
+    /// Open the selected job's sheet (replacing an open one), loading it off
+    /// this thread with [`shelbi_app::jobs::open_sheet`].
+    pub(crate) fn open_sheet(&mut self, project: &str) {
+        let Some(row) = self.selected_row().cloned() else {
+            return;
+        };
+        let (tx, rx) = mpsc::channel();
+        let (project, load_row) = (project.to_string(), row.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(shelbi_app::jobs::open_sheet(&project, &load_row));
+        });
+        self.sheet = Some(JobSheet {
+            id: row.id.clone(),
+            opened: row,
+            loading: Some(rx),
+            body: SheetBody::Loading,
+            canceling: false,
+        });
+    }
+
+    pub(crate) fn close_sheet(&mut self) {
+        self.sheet = None;
+    }
+
+    pub(crate) fn sheet_open(&self) -> bool {
+        self.sheet.is_some()
+    }
+
+    /// The open sheet's job, while it is running: what `c` cancels. Marks the
+    /// sheet as canceling.
+    pub(crate) fn take_cancel(&mut self) -> Option<String> {
+        let running = self.sheet_row().is_some_and(JobRow::can_cancel);
+        let sheet = self.sheet.as_mut()?;
+        if !running || sheet.canceling {
+            return None;
+        }
+        sheet.canceling = true;
+        Some(sheet.id.clone())
+    }
+
+    /// The open sheet's row, current from the model.
+    fn sheet_row(&self) -> Option<&JobRow> {
+        let sheet = self.sheet.as_ref()?;
+        Some(self.model.rows().iter().find(|r| r.id == sheet.id).unwrap_or(&sheet.opened))
+    }
+
+    /// Take in the sheet's load and its terminal's output. Returns whether
+    /// anything changed on screen.
+    pub(crate) fn pump(&mut self) -> bool {
+        let Some(sheet) = self.sheet.as_mut() else {
+            return false;
+        };
+        let mut changed = false;
+        if let Some(rx) = &sheet.loading {
+            match rx.try_recv() {
+                Ok(load) => {
+                    sheet.body = match load {
+                        SheetLoad::Live(c) => SheetBody::Live {
+                            pane: TerminalPane::new(Size::new(c.size.cols, c.size.rows)),
+                            conn: c.conn,
+                            events: c.events,
+                            sent: None,
+                        },
+                        SheetLoad::Saved(bytes) => SheetBody::Saved { bytes, pane: None },
+                        SheetLoad::Message(m) => SheetBody::Message(m),
+                    };
+                    sheet.loading = None;
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    sheet.body = SheetBody::Message("Couldn't open the job.".into());
+                    sheet.loading = None;
+                    changed = true;
+                }
+            }
+        }
+        if let SheetBody::Live { pane, events, .. } = &mut sheet.body {
+            while let Some(ev) = events.try_recv() {
+                changed |= pane.apply_event(ev);
+            }
+        }
+        changed
     }
 
     pub(crate) fn nav_up(&mut self) {
@@ -119,8 +254,101 @@ impl JobsPage {
     }
 }
 
-/// Draw the page into `area` at `now`.
-pub(crate) fn render_full(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Utc>) {
+/// Draw the page into `area` at `now`: the table, and the open sheet beside
+/// it.
+pub(crate) fn render_full(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Utc>, truecolor: bool) {
+    if page.sheet.is_some() && area.width >= 40 {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(100 - SHEET_PERCENT), Constraint::Percentage(SHEET_PERCENT)])
+            .split(area);
+        render_page(f, page, split[0], now);
+        render_sheet(f, page, split[1], now, truecolor);
+    } else if page.sheet.is_some() {
+        render_sheet(f, page, area, now, truecolor);
+    } else {
+        render_page(f, page, area, now);
+    }
+}
+
+/// The sheet: a rule on its left, the job's label and status, its terminal,
+/// and the keys.
+fn render_sheet(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Utc>, truecolor: bool) {
+    if area.width < 4 || area.height < 4 {
+        return;
+    }
+    let Some(row) = page.sheet_row().cloned() else {
+        return;
+    };
+    let rule = Style::default().fg(palette().ansi_dark_gray);
+    for y in area.top()..area.bottom() {
+        f.render_widget(Paragraph::new(Span::styled("┃", rule)), Rect { x: area.x, y, width: 1, height: 1 });
+    }
+    let inner = Rect { x: area.x + 2, width: area.width - 3, ..area };
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // label
+            Constraint::Length(1), // status
+            Constraint::Length(1), // spacer
+            Constraint::Min(1),    // terminal
+            Constraint::Length(1), // keys
+        ])
+        .split(inner);
+    let sheet = page.sheet.as_mut().expect("checked above");
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            one_line(&row.description),
+            Style::default().fg(palette().foreground).add_modifier(Modifier::BOLD),
+        )),
+        parts[0],
+    );
+    let status = if sheet.canceling && row.is_running() {
+        "● Canceling…".to_string()
+    } else {
+        row.sheet_status(now)
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(status, Style::default().fg(row.status_tone().pick(palette())))),
+        parts[1],
+    );
+    let term = parts[3];
+    let muted = Style::default().fg(palette().muted);
+    let message = |f: &mut Frame, text: &str| {
+        f.render_widget(Paragraph::new(Span::styled(text.to_string(), muted)).wrap(Wrap { trim: false }), term);
+    };
+    match &mut sheet.body {
+        SheetBody::Loading => message(f, "Loading…"),
+        SheetBody::Message(m) => message(f, m),
+        SheetBody::Live { pane, conn, sent, .. } => {
+            let size = (term.width, term.height);
+            if *sent != Some(size) && size.0 > 0 && size.1 > 0 {
+                // Only a size: the sheet watches, so it never claims the
+                // terminal or types into it.
+                let _ = conn.resize(size.0, size.1);
+                *sent = Some(size);
+            }
+            pane.render(f.buffer_mut(), term, truecolor);
+        }
+        SheetBody::Saved { bytes, pane } => {
+            let size = Size::new(term.width.max(1), term.height.max(1));
+            if pane.as_ref().is_none_or(|(s, _)| *s != size) {
+                *pane = Some((size, TerminalPane::canned(size, bytes)));
+            }
+            if let Some((_, pane)) = pane {
+                pane.render(f.buffer_mut(), term, truecolor);
+            }
+        }
+    }
+    let keys = if row.can_cancel() && !sheet.canceling {
+        format!("c {} · esc close", CANCEL_LABEL.to_lowercase())
+    } else {
+        "esc close".to_string()
+    };
+    f.render_widget(Paragraph::new(Span::styled(keys, Style::default().fg(palette().ansi_dark_gray))), parts[4]);
+}
+
+fn render_page(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Utc>) {
     let outer = Layout::default()
         .direction(Direction::Vertical)
         .horizontal_margin(2)
@@ -162,7 +390,7 @@ pub(crate) fn render_full(f: &mut Frame, page: &mut JobsPage, area: Rect, now: D
         f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), outer[3]);
     }
     f.render_widget(
-        Paragraph::new(Span::styled("↑/↓ select", Style::default().fg(palette().ansi_dark_gray))),
+        Paragraph::new(Span::styled("↑/↓ select · enter open", Style::default().fg(palette().ansi_dark_gray))),
         outer[4],
     );
 }
@@ -225,7 +453,7 @@ mod tests {
 
     fn draw(page: &mut JobsPage, width: u16) -> Vec<String> {
         let mut term = Terminal::new(TestBackend::new(width, 16)).unwrap();
-        term.draw(|f| render_full(f, page, f.area(), at(14, 10))).unwrap();
+        term.draw(|f| render_full(f, page, f.area(), at(14, 10), true)).unwrap();
         let buf = term.backend().buffer();
         (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
@@ -335,7 +563,7 @@ mod tests {
             ],
         });
         let mut term = Terminal::new(TestBackend::new(120, 16)).unwrap();
-        term.draw(|f| render_full(f, &mut page, f.area(), at(14, 10))).unwrap();
+        term.draw(|f| render_full(f, &mut page, f.area(), at(14, 10), true)).unwrap();
         let buf = term.backend().buffer().clone();
         let lines: Vec<String> = (0..buf.area.height)
             .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
@@ -360,4 +588,96 @@ mod tests {
         page.nav_down();
         assert_eq!(page.selected_row().unwrap().id, "j8");
     }
+
+    /// Pump `page` until its sheet has loaded.
+    fn loaded(page: &mut JobsPage) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while page.sheet.as_ref().is_some_and(|s| s.loading.is_some()) {
+            assert!(std::time::Instant::now() < deadline, "the sheet never loaded");
+            page.pump();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn write_log(project: &str, id: &str, text: &str) {
+        let path = shelbi_state::awareness::job_output_path(project, id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn enter_opens_a_finished_jobs_saved_output_beside_the_table_and_esc_closes_it() {
+        // The live test below swaps `SHELBI_HOME`.
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = "tui-job-sheet-finished";
+        write_log(project, "j4", "compiling\nbuilt ok\n");
+        let mut page = JobsPage::default();
+        page.apply(JobsRead::Jobs {
+            running: vec![],
+            finished: vec![record("j4", "desktop tests", JobStatus::Ok, Some(0), at(14, 9))],
+        });
+        page.open_sheet(project);
+        loaded(&mut page);
+        let screen = draw(&mut page, 120).join("\n");
+        assert!(screen.contains("┃ desktop tests"), "{screen}");
+        assert!(screen.contains("✓ OK · 2m 13s"), "{screen}");
+        assert!(screen.contains("compiling") && screen.contains("built ok"), "{screen}");
+        assert!(screen.contains("esc close") && !screen.contains("cancel job"), "{screen}");
+        assert_eq!(page.take_cancel(), None, "a finished job can't be canceled");
+        page.close_sheet();
+        assert!(!draw(&mut page, 120).join("\n").contains("built ok"));
+    }
+
+    #[test]
+    fn a_running_job_without_a_terminal_shows_its_output_so_far_and_offers_cancel() {
+        // The live test below swaps `SHELBI_HOME`.
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = "tui-job-sheet-running";
+        write_log(project, "j8", "step 1 of 3\n");
+        let mut page = JobsPage::default();
+        page.apply(running(vec![job("j8", JobKind::Command, "make", Some("build"), at(14, 9))]));
+        page.open_sheet(project);
+        loaded(&mut page);
+        let screen = draw(&mut page, 120).join("\n");
+        assert!(screen.contains("● Running · 1m"), "{screen}");
+        assert!(screen.contains("step 1 of 3"), "{screen}");
+        assert!(screen.contains("c cancel job · esc close"), "{screen}");
+        assert_eq!(page.take_cancel().as_deref(), Some("j8"));
+        assert_eq!(page.take_cancel(), None, "one cancel per sheet");
+        assert!(draw(&mut page, 120).join("\n").contains("Canceling…"));
+    }
+
+
+    #[test]
+    fn enter_on_a_running_job_attaches_to_its_live_terminal() {
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let project = "tui-job-live";
+        let name = shelbi_state::awareness::job_session_name(project, "j1");
+        let (sock, _cleanup) = crate::shell::session::tests::spawn_cat_session(home.path(), &name);
+        let mut page = JobsPage::default();
+        page.apply(running(vec![job("j1", JobKind::Command, "cat", Some("live job"), at(14, 9))]));
+        page.open_sheet(project);
+        loaded(&mut page);
+        assert!(
+            matches!(page.sheet.as_ref().unwrap().body, SheetBody::Live { .. }),
+            "a running job with a session attaches to it"
+        );
+        // Something the job prints shows up in the sheet.
+        let (writer, _events) =
+            shelbi_client::Connection::open(&sock, None, shelbi_proto::capability::ALL).unwrap();
+        writer.input(b"live-line\n").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            page.pump();
+            let screen = draw(&mut page, 120).join("\n");
+            if screen.contains("live-line") {
+                assert!(screen.contains("c cancel job"), "{screen}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "the live output never showed: {screen}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
 }
