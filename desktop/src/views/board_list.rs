@@ -175,6 +175,7 @@ mod tests {
             status_id: "done".into(),
             stored_status: "done".into(),
             updated_at: String::new(),
+            estimate: None,
         }
     }
 

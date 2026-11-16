@@ -34,6 +34,7 @@ use shelbi_app::board::{
     BoardInput, BoardRules, MoreRequest, LOADING_MORE_STATUS,
 };
 use shelbi_app::board_search::{BoardSearch, SearchWorker};
+use shelbi_app::estimate::IssueEstimate;
 #[cfg(test)]
 use shelbi_app::board::resolve_task_status;
 use shelbi_core::{
@@ -2581,6 +2582,11 @@ fn render_column(
             show_card_workflow_label,
             max_text,
         ));
+        // An issue with an estimate ends on a bar of elapsed / estimate, its
+        // last row; a card without one keeps its shape.
+        if let Some(est) = app.input.estimate(&tf.task.id) {
+            lines.push(estimate_bar_line(&est.progress(chrono::Utc::now()), max_text));
+        }
 
         card_heights.push(lines.len() as u16);
 
@@ -3050,6 +3056,30 @@ fn wrap_title_two_lines(title: &str, max: usize) -> (String, Option<String>) {
     (line1, Some(truncate(&remainder, max)))
 }
 
+/// The fill of a card's estimate bar ([`estimate_bar_line`]).
+const ESTIMATE_FILL: &str = "▬";
+/// The bar's track, past the fill.
+const ESTIMATE_TRACK: &str = "─";
+
+/// A card's last row when its issue has an estimate: `width` cells of
+/// elapsed / estimate, the fill over a dim track, all of it in the warning
+/// color once the issue is overdue ([`shelbi_app::estimate`]).
+fn estimate_bar_line(progress: &shelbi_app::estimate::EstimateProgress, width: usize) -> Line<'static> {
+    let filled = progress.filled_cells(width).min(width);
+    let fill = if progress.overdue() {
+        palette().ansi_yellow
+    } else {
+        palette().ansi_cyan
+    };
+    Line::from(vec![
+        Span::styled(ESTIMATE_FILL.repeat(filled), Style::default().fg(fill)),
+        Span::styled(
+            ESTIMATE_TRACK.repeat(width - filled),
+            Style::default().fg(palette().ansi_dark_gray),
+        ),
+    ])
+}
+
 /// Build the card's meta line: the task's workflow name rendered as a
 /// small background-filled badge, followed on the same line by the branch
 /// prefixed with `⎇ ` (dim, truncated to the remaining width).
@@ -3234,6 +3264,7 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
     let columns = app.task_columns();
     let style = app.display_style();
     let owner = tf.as_ref().and_then(|tf| app.input.ownership.owner(&tf.tracker_assignees));
+    let estimate = tf.as_ref().and_then(|tf| app.input.estimate(&tf.task.id));
     let Some(pop) = app.popover.as_mut() else {
         return;
     };
@@ -3242,6 +3273,7 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         popover_area,
         tf.as_ref(),
         owner.as_ref(),
+        estimate.as_ref(),
         &columns,
         &mut pop.scroll,
         &app.keymaps,
@@ -3256,7 +3288,8 @@ fn render_popover(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
 /// show the same bordered box (the dialogs' shared frame), metadata header, markdown body, and footer.
 /// `tf` is the task to show (`None` renders the "issue no longer exists" stub);
 /// `owner` is its tracker ownership (`None` off a remote tracker, or where the
-/// caller has no gate); `columns` resolves dependency labels; `scroll` is clamped against the wrapped
+/// caller has no gate); `estimate` its estimate while it has one (`None` where
+/// the caller has no board); `columns` resolves dependency labels; `scroll` is clamped against the wrapped
 /// body height in place. Returns where the pull-request row landed, when there
 /// is one to open, for the caller's click map.
 #[allow(clippy::too_many_arguments)]
@@ -3265,6 +3298,7 @@ pub(crate) fn render_task_popover_into(
     popover_area: Rect,
     tf: Option<&IssueFile>,
     owner: Option<&TrackerOwner>,
+    estimate: Option<&IssueEstimate>,
     columns: &HashMap<String, Column>,
     scroll: &mut u16,
     keymaps: &Keymaps,
@@ -3272,7 +3306,7 @@ pub(crate) fn render_task_popover_into(
 ) -> Option<Rect> {
     let (header_lines, body_text, title) = match tf {
         Some(tf) => (
-            popover_header(tf, owner, columns),
+            popover_header(tf, owner, estimate, columns),
             tf.body.clone(),
             tf.task.title.clone(),
         ),
@@ -3381,6 +3415,7 @@ pub(crate) fn render_task_popover_into(
 pub(crate) fn popover_header(
     tf: &IssueFile,
     owner: Option<&TrackerOwner>,
+    estimate: Option<&IssueEstimate>,
     columns: &HashMap<String, Column>,
 ) -> Vec<Line<'static>> {
     let task = &tf.task;
@@ -3421,6 +3456,18 @@ pub(crate) fn popover_header(
 
     if let Some(branch) = &task.branch {
         lines.push(meta_row("branch", branch));
+    }
+
+    // The estimate, while the issue has one: `2h · 1h 12m elapsed (60%)`,
+    // in the warning color once overdue.
+    if let Some(est) = estimate {
+        let progress = est.progress(chrono::Utc::now());
+        let style = if progress.overdue() {
+            Style::default().fg(palette().ansi_yellow)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![meta_label("estimate"), Span::styled(progress.label(), style)]));
     }
 
     if let Some(pr) = shelbi_app::board::task_pr(task) {
@@ -3689,6 +3736,7 @@ mod tests {
                 banner: None,
                 base_tasks,
             },
+            estimates: None,
         }
     }
 
@@ -4149,6 +4197,85 @@ mod tests {
         assert_eq!(app.card_at(5, 3), None);
     }
 
+    fn estimate_from(task_id: &str, mins: u64, ago_mins: i64) -> shelbi_state::awareness::Estimate {
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(ago_mins);
+        shelbi_state::awareness::Estimate {
+            task_id: task_id.into(),
+            estimate: std::time::Duration::from_secs(mins * 60),
+            started_at,
+            next_alert_at: started_at + chrono::Duration::minutes(mins as i64),
+            workspace: None,
+        }
+    }
+
+    #[test]
+    fn the_estimate_bar_fills_by_elapsed_share_over_a_dim_track() {
+        let on_time = shelbi_app::estimate::EstimateProgress {
+            estimate: std::time::Duration::from_secs(7200),
+            elapsed: std::time::Duration::from_secs(72 * 60),
+        };
+        let line = estimate_bar_line(&on_time, 10);
+        assert_eq!(line_text(&line), "▬▬▬▬▬▬────");
+        assert_eq!(line.spans[0].style.fg, Some(palette().ansi_cyan));
+        assert_eq!(line.spans[1].style.fg, Some(palette().ansi_dark_gray));
+
+        let overdue = shelbi_app::estimate::EstimateProgress {
+            estimate: std::time::Duration::from_secs(7200),
+            elapsed: std::time::Duration::from_secs(150 * 60),
+        };
+        let line = estimate_bar_line(&overdue, 10);
+        assert_eq!(line_text(&line), "▬".repeat(10));
+        assert_eq!(line.spans[0].style.fg, Some(palette().ansi_yellow));
+    }
+
+    #[test]
+    fn a_card_with_an_estimate_ends_on_its_bar_and_one_without_keeps_its_shape() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = KanbanApp::new("demo");
+        let mut a = task_file("t-1", Column::from_status_id("in-progress"), 0, "2026-06-20T10:00:00Z");
+        a.task.title = "Timed".into();
+        let mut b = task_file("t-2", Column::from_status_id("in-progress"), 1, "2026-06-20T10:00:00Z");
+        b.task.title = "Untimed".into();
+        let mut data = warm_board(vec![a, b]);
+        data.estimates = Some(vec![estimate_from("t-1", 120, 72)]);
+        app.apply_board_data(data);
+
+        let mut term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| render_full(f, &mut app, f.area())).unwrap();
+        let buf = term.backend().buffer().clone();
+        let joined: String = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(joined.contains("▬▬▬"), "no bar in:\n{joined}");
+        let hits: Vec<(usize, u16)> = app.card_hits.iter().map(|h| (h.row_idx, h.area.height)).collect();
+        // Title + meta + bar; title + meta.
+        assert_eq!(hits, [(0, 3), (1, 2)], "card footprints in:\n{joined}");
+        // The bar is the timed card's last row.
+        let bar_row = app.card_hits[0].area.y + 2;
+        let row: String = (0..buf.area.width).map(|x| buf[(x, bar_row)].symbol().to_string()).collect();
+        assert!(row.contains("▬") && row.contains("─"), "bar row: {row}");
+    }
+
+    #[test]
+    fn the_task_sheet_shows_the_estimate_while_the_issue_has_one() {
+        let tf = task_file("a", Column::from_status_id("in-progress"), 0, "2026-06-20T10:00:00Z");
+        let est = shelbi_app::estimate::IssueEstimate::from(&estimate_from("a", 120, 72));
+        let header = popover_header(&tf, None, Some(&est), &HashMap::new());
+        let row = header.iter().map(line_text).find(|l| l.starts_with("estimate: ")).expect("estimate row");
+        assert!(row.starts_with("estimate: 2h · 1h 1"), "{row}");
+        assert!(row.ends_with("%)"), "{row}");
+
+        let late = shelbi_app::estimate::IssueEstimate::from(&estimate_from("a", 120, 150));
+        let header = popover_header(&tf, None, Some(&late), &HashMap::new());
+        let line = header.iter().find(|l| line_text(l).starts_with("estimate: ")).unwrap();
+        assert!(line_text(line).ends_with("elapsed (overdue)"), "{}", line_text(line));
+        assert_eq!(line.spans[1].style.fg, Some(palette().ansi_yellow));
+
+        let header = popover_header(&tf, None, None, &HashMap::new());
+        assert!(!header.iter().any(|l| line_text(l).starts_with("estimate: ")));
+    }
+
     fn sheet_text(tf: &IssueFile) -> (String, Option<Rect>) {
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
         let mut row = None;
@@ -4160,6 +4287,7 @@ mod tests {
                     f,
                     f.area(),
                     Some(tf),
+                    None,
                     None,
                     &HashMap::new(),
                     &mut scroll,

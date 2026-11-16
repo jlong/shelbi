@@ -457,6 +457,12 @@ impl BoardState {
         self.notices.get(id).map(String::as_str)
     }
 
+    /// Whether any issue on the board has an estimate: its card's bar and
+    /// its Estimate row advance with the clock.
+    pub fn has_estimates(&self) -> bool {
+        !self.input.estimates.is_empty()
+    }
+
     pub fn has_pending(&self) -> bool {
         !self.pending.is_empty()
     }
@@ -2296,6 +2302,7 @@ pub(crate) mod tests {
                 banner: None,
                 base_tasks: tasks,
             },
+            estimates: None,
         }
     }
 

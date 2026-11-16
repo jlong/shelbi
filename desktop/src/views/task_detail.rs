@@ -730,8 +730,9 @@ fn session_header(session: &TaskSession, theme: &Theme, cx: &mut Context<IssuesV
         .child(open)
 }
 
-/// The property table: Status, Workflow, Priority and Branch, then the
-/// task's tracker owner, dependencies and pull request where it has them.
+/// The property table: Status, Workflow, Priority, the estimate while the
+/// issue has one, and Branch, then the task's tracker owner, dependencies and
+/// pull request where it has them.
 fn properties(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Context<IssuesView>) -> Div {
     let mut rows = div()
         .debug_selector(|| "pane-properties".into())
@@ -759,6 +760,21 @@ fn properties(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Co
     for (property, label, icon, value) in values {
         let pending = shown.pending == Some(property);
         rows = rows.child(property_row(theme, label, value_picker(view, property, icon, value, pending, theme, cx)));
+    }
+    // The estimate, while the issue has one: `2h · 1h 12m elapsed (60%)`,
+    // in the warning color once overdue. Read against the clock at this
+    // paint, so it advances as the board repaints.
+    if let Some(est) = d.estimate {
+        let progress = est.progress(chrono::Utc::now());
+        let color = if progress.overdue() { theme.warning } else { theme.foreground };
+        rows = rows.child(property_row(
+            theme,
+            "Estimate",
+            value_text(theme)
+                .debug_selector(|| "pane-estimate".into())
+                .text_color(color)
+                .child(progress.label()),
+        ));
     }
     rows = rows.child(property_row(
         theme,

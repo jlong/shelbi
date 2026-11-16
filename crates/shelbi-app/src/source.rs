@@ -728,6 +728,7 @@ pub mod null {
                 workflows: Err(NOTHING.into()),
                 project_statuses: Err(NOTHING.into()),
                 board: BoardOutcome::Cold { banner: None },
+                estimates: None,
             }
         }
         fn closed_page(&self) -> Option<ClosedPage> {
