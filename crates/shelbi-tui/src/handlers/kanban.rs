@@ -901,6 +901,7 @@ mod tests {
                 banner: None,
                 base_tasks: vec![a, b],
             },
+            estimates: None,
         });
         let km = Keymaps::default();
         let press = |app: &mut KanbanApp, code: KeyCode| {

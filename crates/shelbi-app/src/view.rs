@@ -822,6 +822,9 @@ pub struct IssueCard {
     /// refuses it if another client changed the issue first.
     pub stored_status: String,
     pub updated_at: String,
+    /// The issue's estimate while it is active, or `None` (no estimate, or not
+    /// active): the card's progress bar ([`crate::estimate`]).
+    pub estimate: Option<crate::estimate::IssueEstimate>,
 }
 
 /// One `depends_on` entry and where that dependency stands.
@@ -918,7 +921,7 @@ impl IssuesModel {
                 board::sort_column_cards(def.category, &mut members);
                 let cards: Vec<IssueCard> = members
                     .into_iter()
-                    .map(|tf| card_for(tf, &by_id, &rules, &def.status_id, &input.ownership))
+                    .map(|tf| card_for(tf, &by_id, &rules, &def.status_id, input))
                     .filter(|c| search.shows(&c.title, &c.id, c.branch.as_deref()))
                     .collect();
                 let collapsed = input
@@ -1005,6 +1008,9 @@ pub struct TaskDetailModel {
     /// The task's pull request ([`crate::board::task_pr`]): number and link,
     /// and its state and CI when known.
     pub pr: Option<IssuePr>,
+    /// The issue's estimate while it is active ([`IssueCard::estimate`]): the
+    /// Estimate property row.
+    pub estimate: Option<crate::estimate::IssueEstimate>,
     /// `YYYY-MM-DD HH:MM UTC`.
     pub created: String,
     pub updated: String,
@@ -1046,7 +1052,7 @@ impl TaskDetailModel {
             .collect();
         let rules = input.rules();
         let status_id = rules.resolved_status_id(&tf.task);
-        let card = card_for(tf, &by_id, &rules, &status_id, &input.ownership);
+        let card = card_for(tf, &by_id, &rules, &status_id, input);
         let status = input
             .project_statuses
             .statuses
@@ -1071,6 +1077,7 @@ impl TaskDetailModel {
             depends_on: card.depends_on,
             blocked: card.blocked,
             pr: board::task_pr(task),
+            estimate: card.estimate,
             created: task.created_at.format("%Y-%m-%d %H:%M UTC").to_string(),
             updated: task.updated_at.format("%Y-%m-%d %H:%M UTC").to_string(),
             body: tf.body.clone(),
@@ -1083,7 +1090,7 @@ fn card_for(
     by_id: &HashMap<String, Column>,
     rules: &BoardRules<'_>,
     status_id: &str,
-    ownership: &shelbi_state::OwnershipGate,
+    input: &BoardInput,
 ) -> IssueCard {
     let task = &tf.task;
     let workflow_name = rules.workflow_name(task).to_string();
@@ -1096,7 +1103,7 @@ fn card_for(
         workflow: task.workflow.clone(),
         workflow_name,
         assignee: task.assigned_to.clone(),
-        tracker_owner: ownership.owner(&tf.tracker_assignees),
+        tracker_owner: input.ownership.owner(&tf.tracker_assignees),
         priority: task.priority,
         depends_on: task
             .depends_on
@@ -1113,6 +1120,7 @@ fn card_for(
         status_id: status_id.to_string(),
         stored_status: task.column.as_str().to_string(),
         updated_at: task.updated_at.to_rfc3339(),
+        estimate: input.estimate(&task.id),
     }
 }
 
@@ -2120,6 +2128,57 @@ mod tests {
         assert_eq!(d.depends_on[0].status.as_deref(), Some("todo"));
         assert!(d.body.contains("- [ ] ship it"));
         assert!(TaskDetailModel::build(&input, "gone").is_none());
+    }
+
+    fn awareness_estimate(task_id: &str, mins: u64) -> shelbi_state::awareness::Estimate {
+        let started_at: chrono::DateTime<chrono::Utc> = "2026-11-15T10:00:00Z".parse().unwrap();
+        shelbi_state::awareness::Estimate {
+            task_id: task_id.into(),
+            estimate: std::time::Duration::from_secs(mins * 60),
+            started_at,
+            next_alert_at: started_at + chrono::Duration::minutes(mins as i64),
+            workspace: None,
+        }
+    }
+
+    #[test]
+    fn an_issue_with_an_estimate_carries_it_on_its_card_and_detail() {
+        let mut input = board_input(vec![issue("T-1", "in-progress"), issue("T-2", "in-progress")]);
+        let mut read = board::BoardRead {
+            project: None,
+            state_snapshot: None,
+            workflows: Ok(input.workflows.clone()),
+            project_statuses: Ok(input.project_statuses.clone()),
+            board: board::BoardOutcome::Warm {
+                banner: None,
+                base_tasks: input.open.clone(),
+            },
+            estimates: Some(vec![awareness_estimate("T-1", 120)]),
+        };
+        input.apply_open(read.clone());
+        let est = TaskDetailModel::build(&input, "T-1").unwrap().estimate.unwrap();
+        assert_eq!(est.estimate, std::time::Duration::from_secs(7200));
+        let now = est.started_at + chrono::Duration::minutes(72);
+        assert_eq!(est.progress(now).label(), "2h · 1h 12m elapsed (60%)");
+        assert_eq!(TaskDetailModel::build(&input, "T-2").unwrap().estimate, None);
+
+        let model = IssuesModel::build(&input, &BoardFilters::default());
+        let cards: Vec<(&str, bool)> = model
+            .columns
+            .iter()
+            .flat_map(|c| &c.cards)
+            .map(|c| (c.id.as_str(), c.estimate.is_some()))
+            .collect();
+        assert_eq!(cards, [("T-1", true), ("T-2", false)]);
+
+        // An unreadable store keeps the last-known estimates; a read without
+        // the issue's drops it (the issue left the active category).
+        read.estimates = None;
+        input.apply_open(read.clone());
+        assert!(input.estimate("T-1").is_some());
+        read.estimates = Some(Vec::new());
+        input.apply_open(read);
+        assert_eq!(input.estimate("T-1"), None);
     }
 
     fn machine(name: &str, kind: MachineKind, host: Option<&str>) -> Machine {

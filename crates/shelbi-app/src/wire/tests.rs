@@ -188,6 +188,13 @@ fn board_read_round_trips() {
             banner: Some("board 4m stale".into()),
             base_tasks: vec![issue],
         },
+        estimates: Some(vec![shelbi_state::awareness::Estimate {
+            task_id: "t-1".into(),
+            estimate: std::time::Duration::from_secs(2 * 3600),
+            started_at: "2026-11-15T10:00:00Z".parse().unwrap(),
+            next_alert_at: "2026-11-15T12:00:00Z".parse().unwrap(),
+            workspace: Some("alpha".into()),
+        }]),
     };
     // The workflow's own form is its on-disk YAML shape, pinned by
     // shelbi-core's workflow round-trip tests; this pins the envelope
@@ -213,7 +220,14 @@ fn board_read_round_trips() {
             "project_statuses": { "Err": "statuses.yaml load failed: bad" },
             "board": {
                 "warm": { "banner": "board 4m stale", "base_tasks": [issue_json] }
-            }
+            },
+            "estimates": [{
+                "task_id": "t-1",
+                "estimate": "2h",
+                "started_at": "2026-11-15T10:00:00Z",
+                "next_alert_at": "2026-11-15T12:00:00Z",
+                "workspace": "alpha"
+            }]
         }),
     );
     // The identities are what carry the names: the workflow's own form
@@ -228,6 +242,8 @@ fn board_read_round_trips() {
     assert_eq!(empty.workflows, Ok(vec![]));
     assert_eq!(empty.project_statuses, Ok(ProjectStatuses::default()));
     assert_eq!(empty.board, BoardOutcome::Cold { banner: None });
+    // A far machine that sends no estimates leaves the last-known ones.
+    assert_eq!(empty.estimates, None);
     let project: BoardProject = serde_json::from_str("{}").unwrap();
     assert_eq!(project.ownership, OwnershipGate::FailClosed);
 
@@ -243,6 +259,7 @@ fn board_read_round_trips() {
             }],
         }),
         board: BoardOutcome::Failed("refresh failed: x".into()),
+        estimates: None,
     };
     assert_round_trip(
         &cold,

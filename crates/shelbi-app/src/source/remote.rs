@@ -259,6 +259,7 @@ impl ProjectSource for RemoteSource {
                     workflows: Err(message.clone()),
                     project_statuses: Err(message.clone()),
                     board: BoardOutcome::Failed(message),
+                    estimates: None,
                 }
             }
         }

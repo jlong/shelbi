@@ -86,6 +86,7 @@ pub mod close_others;
 pub mod command;
 pub mod command_model;
 pub mod diff;
+pub mod estimate;
 pub mod exec;
 pub mod exec_daemon;
 pub mod far;

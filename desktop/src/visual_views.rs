@@ -17,7 +17,9 @@
 //! (a card selected), `board-dropdown.png` and `board-workspace-dropdown.png`
 //! (each filter open), `board-empty.png` (columns a filter emptied),
 //! `board-drag.png` (a card dragged over another column, the drop target
-//! lit), `board-detail.png` (a card's detail, its body formatted),
+//! lit), `board-detail.png` (a card's detail, its body formatted, and its
+//! Estimate row; the board's in-progress cards carry estimate bars, one
+//! overdue),
 //! `board-detail-editing.png` (the Edit command's caret in the body),
 //! `board-detail-format.png` (the format toolbar over a selection),
 //! `board-detail-unsaved.png` (a save that failed);
@@ -804,6 +806,18 @@ workspaces:
     task("b2", "Sync the board's column widths with the TUI", Column::backlog(), None);
     task("c1", "Restyle the command palette", Column::todo(), None);
     task("t2", LONG_TITLE, Column::in_progress(), None);
+    // Estimates: t1 is 60% through two hours (its card's bar and its
+    // Estimate row), t2 past its half hour (overdue, in the warning color).
+    shelbi_state::awareness::set_estimate(
+        PROJECT,
+        "t1",
+        Duration::from_secs(2 * 3600),
+        now - chrono::Duration::minutes(72),
+        Some("alpha"),
+    )
+    .expect("save a fixture estimate");
+    shelbi_state::awareness::set_estimate(PROJECT, "t2", Duration::from_secs(30 * 60), now - chrono::Duration::minutes(35), None)
+        .expect("save a fixture estimate");
     shelbi_state::save_workspace_status("demo", &shelbi_state::WorkspaceStatus {
         workspace: "alpha".into(),
         current_task: Some("t1".into()),

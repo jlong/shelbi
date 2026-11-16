@@ -630,6 +630,7 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | `status_id` | n/a (bucketing via `resolved_status_id`) | not shown: written on optimistic move only (`views/board_state.rs` `apply_open`) |
 | `stored_status` | n/a: TUI moves send no expected state (`kanban.rs` `ExecutorMovePersister`) | not shown: mutation expected state (`IssueCard::expected`, `views/board_state.rs`) |
 | `updated_at` | n/a (raw `task.updated_at` used for done ordering only) | not shown: mutation expected state + revised check (`views/board_state.rs`) |
+| `estimate` | equivalent `BoardInput::estimate(id)`: the card's last row is a bar of elapsed / estimate, yellow once overdue, only on a card with an estimate (`kanban.rs` `estimate_bar_line`) | a 3pt bar flush along the card's bottom edge, clipped to its corners, accent fill over a track, warning color once overdue, only on a card with an estimate (`views/issues.rs` `render_card`, `estimate_bar`) |
 
 ### `DepBadge`
 | Field | TUI | Desktop |
@@ -662,6 +663,7 @@ The TUI does not use `WorkspaceHeader` at all; its workspace panel header is the
 | `depends_on` | deps row with "[status]" (`kanban.rs` `popover_header`) | Depends on property with "[status]", when any (`views/task_detail.rs` `properties`) |
 | `blocked` | "blocked by" vs "depends on" label (`kanban.rs` `popover_header`) | "Blocked by" vs "Depends on" label (`views/task_detail.rs` `properties`) |
 | `pr` | equivalent `board::task_pr(task)`: "pr:" row, `#2137 ↗` then the state and the colored CI result; `p` or a click on the row opens the page, the footer offers it (`kanban.rs` `popover_header`, `render_task_popover_into`, `handlers/kanban.rs`) | PR property: the `#2137 ↗` link, then the state and the colored CI result; `p` and More's Open pull request open it too (`views/task_detail.rs` `properties`, `views/task_panel.rs` `pr_value`, `views/board_state.rs` `open_pr`) |
+| `estimate` | equivalent `BoardInput::estimate(id)`: "estimate:" row, `2h · 1h 12m elapsed (60%)`, yellow `(overdue)` past it, only while the issue has one (`kanban.rs` `popover_header`, via `shelbi_app::estimate`) | Estimate property, the same text, in the warning color once overdue, only while the issue has one (`views/task_detail.rs` `properties`, via `shelbi_app::estimate`) |
 | `created` | "created:" row (`kanban.rs` `popover_header`) | "Created Oct 26" under the body (`views/task_detail.rs` `short_date`) |
 | `updated` | "updated:" on created row (`kanban.rs` `popover_header`) | "Updated Oct 28" beside it (`views/task_detail.rs` `short_date`) |
 | `body` | markdown body, scrollable (`kanban.rs` `render_task_popover_into` via `markdown::render_note`) | the formatted body in the pane's scroll, edited in place WYSIWYG (`shelbi_app::markdown_edit` over the source; checkboxes click; "Write a description…" placeholder when empty); More / `e` put the keys in it (`views/task_detail.rs` `details`, `views/doc_editor`) |

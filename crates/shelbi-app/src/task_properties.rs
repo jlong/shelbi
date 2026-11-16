@@ -338,6 +338,7 @@ mod tests {
                 banner: None,
                 base_tasks: tasks,
             },
+            estimates: None,
         });
         input
     }

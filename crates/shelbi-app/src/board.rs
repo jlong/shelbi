@@ -697,6 +697,12 @@ pub struct BoardRead {
     pub project_statuses: Result<ProjectStatuses, String>,
     #[serde(default = "crate::wire::cold_board")]
     pub board: BoardOutcome,
+    /// The awareness store's estimates (`issue start --estimate`), one per
+    /// active issue that has one; `None` when the store couldn't be read (the
+    /// last-known estimates stay), or from a far machine that doesn't send
+    /// them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub estimates: Option<Vec<shelbi_state::awareness::Estimate>>,
 }
 
 /// Read the open board for `project`: the project YAML, its state, workflows,
@@ -742,12 +748,16 @@ pub fn read_open_board(project: &str) -> BoardRead {
             }
         },
     };
+    let estimates = shelbi_state::awareness::read_awareness(project)
+        .ok()
+        .map(|store| store.estimates);
     BoardRead {
         project: project_cfg,
         state_snapshot,
         workflows,
         project_statuses,
         board,
+        estimates,
     }
 }
 
@@ -988,6 +998,8 @@ pub struct BoardInput {
     /// ([`crate::board_search::BoardSearch::hits`], set by
     /// [`BoardInput::set_search_hits`]); merged last, so a loaded card wins.
     pub search_hits: Vec<IssueFile>,
+    /// The active issues' estimates, as last read ([`BoardRead::estimates`]).
+    pub estimates: Vec<shelbi_state::awareness::Estimate>,
 }
 
 impl Default for BoardInput {
@@ -1008,6 +1020,7 @@ impl Default for BoardInput {
             ownership: OwnershipGate::Unrestricted,
             remote_search: false,
             search_hits: Vec::new(),
+            estimates: Vec::new(),
         }
     }
 }
@@ -1072,7 +1085,15 @@ impl BoardInput {
                 self.open = base_tasks;
             }
         }
+        if let Some(estimates) = read.estimates {
+            self.estimates = estimates;
+        }
         self.error = (!errors.is_empty()).then(|| errors.join("; "));
+    }
+
+    /// Issue `id`'s estimate, when it has one ([`crate::estimate`]).
+    pub fn estimate(&self, id: &str) -> Option<crate::estimate::IssueEstimate> {
+        self.estimates.iter().find(|e| e.task_id == id).map(Into::into)
     }
 
     /// Fold a closed-page read. `None` (a transient failure) keeps the

@@ -92,6 +92,7 @@ pub mod column_swap;
 pub mod diff_view;
 pub mod connect_remote;
 pub mod doc_editor;
+pub mod estimate_bar;
 pub mod session_view;
 pub mod toast;
 pub mod workspace;

@@ -69,6 +69,7 @@ use super::column_swap::SLIDE;
 use super::pane_session::{MainShows, PaneSession};
 use super::pane_width::PaneWidth;
 use super::session_view::{SessionDeps, SessionView};
+use super::estimate_bar;
 use super::task_detail;
 use crate::assets::{heroicon, icons};
 use crate::elements::placed::MenuScroll;
@@ -244,6 +245,11 @@ pub struct IssuesView {
     /// The open detail's model, by issue id and the board generation it was
     /// built at (building it merges every task on the board).
     detail_cache: Option<(String, u64, Option<TaskDetailModel>)>,
+    /// The minute the estimates were last painted at
+    /// ([`shelbi_app::estimate::minute_of`]): a new one repaints the board
+    /// while an issue has an estimate, so its bar and elapsed time advance
+    /// with nothing else changing.
+    estimate_minute: i64,
     done_tx: Sender<Done>,
     done_rx: Receiver<Done>,
     editor_tx: Sender<EditorEvent>,
@@ -334,6 +340,7 @@ impl IssuesView {
             open_print: None,
             closed_print: None,
             detail_cache: None,
+            estimate_minute: shelbi_app::estimate::minute_of(chrono::Utc::now()),
             done_tx,
             done_rx,
             editor_tx,
@@ -834,6 +841,11 @@ impl IssuesView {
         if self.pane_editors.as_ref().is_some_and(|e| self.state.detail_id() != Some(e.id.as_str())) {
             self.close_editors();
             changed = true;
+        }
+        let minute = shelbi_app::estimate::minute_of(chrono::Utc::now());
+        if minute != self.estimate_minute {
+            self.estimate_minute = minute;
+            changed |= self.state.has_estimates();
         }
         let interval = if self.project.key().is_local() {
             REFRESH_INTERVAL
@@ -1922,9 +1934,14 @@ impl IssuesView {
         } else {
             theme.text_loud
         };
+        // Elapsed against the estimate, at this paint: the bar advances as
+        // the view repaints (the tick repaints on each new minute while a
+        // card has one, `estimate_minute`).
+        let estimate = card.estimate.map(|e| e.progress(chrono::Utc::now()));
         div()
             .id(SharedString::from(format!("card-{}", card.id)))
             .debug_selector(move || selector.clone())
+            .relative()
             .flex()
             .flex_col()
             .flex_none()
@@ -2058,6 +2075,21 @@ impl IssuesView {
                                     cx.notify();
                                 })),
                         ),
+                )
+            })
+            // Last, so it paints over the card's bottom padding: flush along
+            // the bottom edge, clipped to the corners.
+            .when_some(estimate, |d, progress| {
+                let selector = format!("card-estimate-{}", card.id);
+                d.child(
+                    div()
+                        .debug_selector(move || selector.clone())
+                        .absolute()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .h(px(CARD_RADIUS))
+                        .child(estimate_bar::estimate_bar(progress, CARD_RADIUS, theme)),
                 )
             })
     }
@@ -3274,6 +3306,51 @@ mod tests {
             Some(&CommandKind::PrioritizeIssue { id: "A".into(), position: 1 })
         );
         assert_eq!(view.read_with(&cx, |v, _| v.state.pane_focus()), Some(crate::views::board_state::Property::Priority));
+    }
+
+    #[gpui::test]
+    fn an_issue_with_an_estimate_shows_its_bar_and_its_estimate_row(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::{issue, read};
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let tasks = vec![issue("A", "in-progress"), issue("B", "in-progress")];
+        let (view, mut cx) = open_board_sized(cx, tasks.clone(), Some(gpui::size(px(1160.0), px(1024.0))));
+        let started_at = chrono::Utc::now() - chrono::Duration::minutes(72);
+        let mut with_estimate = read(tasks);
+        with_estimate.estimates = Some(vec![shelbi_state::awareness::Estimate {
+            task_id: "A".into(),
+            estimate: Duration::from_secs(2 * 3600),
+            started_at,
+            next_alert_at: started_at + chrono::Duration::hours(2),
+            workspace: None,
+        }]);
+        view.update(&mut cx, |v, cx| {
+            v.state.apply_reads(Some(with_estimate), None);
+            cx.notify();
+        });
+
+        // A's bar runs flush along its card's bottom edge, the full width;
+        // B's card has none.
+        let card = bounds(&mut cx, "card-A");
+        let bar = bounds(&mut cx, "card-estimate-A");
+        assert_eq!(bar.bottom(), card.bottom());
+        assert_eq!((bar.left(), bar.right()), (card.left(), card.right()));
+        assert_eq!(bar.size.height, px(CARD_RADIUS));
+        assert!(!drawn(&mut cx, "card-estimate-B"));
+
+        // The Estimate row shows in A's properties and not in B's.
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        assert!(drawn(&mut cx, "pane-estimate"));
+        view.update(&mut cx, |v, cx| v.open_task("B", cx));
+        assert!(drawn(&mut cx, "pane-properties"));
+        assert!(!drawn(&mut cx, "pane-estimate"));
+
+        // A new minute repaints the board while an issue has an estimate.
+        view.update(&mut cx, |v, cx| {
+            assert!(v.state.has_estimates());
+            v.estimate_minute = 0;
+            v.tick(cx);
+            assert_eq!(v.estimate_minute, shelbi_app::estimate::minute_of(chrono::Utc::now()));
+        });
     }
 
     #[gpui::test]
