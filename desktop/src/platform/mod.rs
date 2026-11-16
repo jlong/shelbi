@@ -35,6 +35,7 @@ pub mod motion;
 pub mod open_panel;
 pub mod print_version;
 pub mod relaunch;
+pub mod screen;
 pub mod scrollers;
 pub mod update;
 pub mod version;

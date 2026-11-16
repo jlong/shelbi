@@ -146,6 +146,12 @@ impl Catalog {
             .unwrap_or_default()
     }
 
+    /// Where `project` was left, when the catalog knows (remembered, or read
+    /// from disk by a refresh): a tab moved to a new window takes it along.
+    pub fn known_view_state(&self, project: &ProjectKey) -> Option<ProjectViewState> {
+        self.inner.try_lock().ok().and_then(|inner| inner.views.get(project).cloned())
+    }
+
     /// Remember where `project` was left (the caller saves it to disk).
     pub fn remember_view(&self, project: &ProjectKey, state: ProjectViewState) {
         let mut inner = self.lock();

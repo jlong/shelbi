@@ -4434,7 +4434,22 @@ impl ShelbiWindow {
     fn sync_tabs(&mut self, cx: &mut Context<Self>) {
         let open = self.open_set(cx);
         let current = (!self.chooser).then_some(self.project.as_str());
-        if self.tabs.reconcile(open.as_deref(), current) {
+        // The other local windows' tabs: a project one of them has a tab for
+        // (one torn off into its own window, or a project opened there)
+        // gets none here.
+        let me = self.handle.map(|h| h.window_id());
+        let elsewhere: Vec<String> = if self.remote.is_some() {
+            Vec::new()
+        } else {
+            shelbi_windows(cx)
+                .into_iter()
+                .filter(|h| Some(h.window_id()) != me)
+                .filter_map(|h| h.read(cx).ok())
+                .filter(|w| w.remote.is_none())
+                .flat_map(|w| w.tabs.order().to_vec())
+                .collect()
+        };
+        if self.tabs.reconcile(open.as_deref(), current, &elsewhere) {
             self.tabs_changed(cx);
         }
     }
@@ -5777,6 +5792,11 @@ impl ShelbiWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Esc ends a tab drag where it began, wherever the keyboard is.
+        if event.keystroke.key == "escape" && self.cancel_tab_drag(window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if !self.chat_focused(window, cx) {
             return;
         }
@@ -6332,22 +6352,9 @@ impl SidebarHost for ShelbiWindow {
                 }
                 cx.notify();
             }
-            SidebarEvent::DragTab(project) => {
-                self.tab_reorder.start(&project);
-                cx.notify();
-            }
-            SidebarEvent::DragTabOver(slot) => {
-                if self.tab_reorder.over(slot) {
-                    cx.notify();
-                }
-            }
-            SidebarEvent::DropTab => {
-                let pointer_x = window.mouse_position().x.as_f32();
-                if self.tab_reorder.drop(&mut self.tabs, pointer_x) {
-                    self.tabs_changed(cx);
-                }
-                cx.notify();
-            }
+            SidebarEvent::DragTab(project) => self.tab_drag_started(project, window, cx),
+            SidebarEvent::DragTabMoved => self.tab_drag_moved(window, cx),
+            SidebarEvent::DropTab => self.tab_drag_dropped(window, cx),
             SidebarEvent::AddProject => {
                 self.switcher.close((self.clock)());
                 self.run(CommandKind::AddProject, window, cx)
@@ -6672,11 +6679,17 @@ impl ShelbiWindow {
         // A tab drag's slide: only while the drag lasts (a drop off the bar
         // never reaches the bar to end it, and the ghost's life tells a tab
         // drag from any other), then the settle after it.
-        let tab_drag_active = cx.has_active_drag() && self.tab_reorder.ghost_alive();
+        // Another window's tab over this bar opens its gap too
+        // (`tab-tearoff`).
+        let tab_drag_active =
+            (cx.has_active_drag() && self.tab_reorder.ghost_alive()) || self.tab_reorder.hosting();
         let tab_slide = self.tab_reorder.frame(&self.tabs, tab_drag_active, now, reduce_motion);
         if tab_slide.animating {
             window.request_animation_frame();
         }
+        // Where the bar is, for a tab dragged from another window: its paint
+        // says, and a frame without it says none.
+        self.tab_reorder.layout.borrow_mut().bar = None;
         let tab_bar = (!editing_workflow && !self.chooser).then(|| {
             let tabs = self.tab_props(cx);
             tab_bar::render(
@@ -7168,6 +7181,9 @@ impl ShelbiWindow {
         }
     }
 }
+
+#[path = "app_tab_tearoff.rs"]
+mod tab_tearoff_host;
 
 #[cfg(test)]
 #[path = "app_smoke.rs"]
