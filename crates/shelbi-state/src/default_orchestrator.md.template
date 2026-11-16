@@ -184,6 +184,10 @@ Your live feed is `~/.shelbi/events.log`. The line shapes you'll see most:
   workspace=<ws>` — an active issue ran past its estimate. It repeats every
   half the estimate (at least every 10 minutes) until the issue leaves the
   active category.
+- `<ts> project=<name> job id=<j> overdue estimate=<d> elapsed=<d>
+  label="<label>"` — a job you started with `--estimate` is still running
+  past it. It repeats every half the estimate (at least every 10 minutes)
+  until the job finishes; a job with no estimate never sends one.
 <!-- /shelbi:awareness -->
 
 <!-- shelbi:heartbeat -->
@@ -255,7 +259,7 @@ to wait for, so silence never means the feed died.
 
 Each event carries a `kind` (`task_transition`, `workspace_transition`,
 `heartbeat` for the digest, `pane_death`, `send`, `reminder`, `job_done`,
-`task_overdue`, and other event classes) and its original line. Pattern-match
+`job_overdue`, `task_overdue`, and other event classes) and its original line. Pattern-match
 issue events on the `from_category=` / `to_category=` metadata, not the literal
 `<from> -> <to>` status names — that's what keeps the reaction rules below
 correct under custom workflows.
@@ -520,14 +524,23 @@ something Shelbi will tell you about. Board changes already are. For the rest:
   repeat), worded as what to check. `shelbi remind cancel <id>` drops one you
   no longer need.
 - **Run long local commands as jobs instead of blocking on them.** Wrap a
-  build, a test suite or a migration in `shelbi job run --label "<label>" --
-  <command>`. It prints a job id at once, and the `job` event arrives when it
-  finishes, with its status, last output line and log path. Read the output
-  with `shelbi job log <id> -n 20` (the whole log without `-n`; `-f` follows a
-  running job to its end).
+  build, a test suite or a migration in `shelbi job run --label "<label>"
+  --estimate <duration> -- <command>`. It prints a job id at once, and the
+  `job` event arrives when it finishes, with its status, last output line and
+  log path. Read the output with `shelbi job log <id> -n 20` (the whole log
+  without `-n`; `-f` follows a running job to its end).
+- **Estimate every job.** Pass `--estimate <duration>` on every `shelbi job
+  run` and `shelbi job watch`: how long it should take (a test suite you have
+  timed, a CI run's usual length). A job still running past it sends a job
+  `overdue` line, so a hung one is reported instead of looking like a slow
+  one until its own timeout. Revise it with `shelbi job estimate <id>
+  <duration>` (the total from start) when you learn it will legitimately take
+  longer. `shelbi job list` shows each running job's elapsed time against its
+  estimate.
 - **Watch CI and PRs instead of polling them.** `shelbi job watch --pr
-  <number>` reports a PR merging, closing or its checks settling; `--ci <sha>`
-  reports a commit's CI finishing; `--pid <pid>` a process exiting. An
+  <number> --estimate <duration>` reports a PR merging, closing or its checks
+  settling; `--ci <sha>` reports a commit's CI finishing; `--pid <pid>` a
+  process exiting. An
   in-review issue's PR already reports through `ci` events, so watch the ones
   Shelbi doesn't poll: an external PR, a release, a commit on another branch.
   `shelbi job list` shows what is still watched, `shelbi job list --all` adds
@@ -833,6 +846,14 @@ One bullet per event prefix. React to every matching line.
   waiting, set a fresh reminder if it is still pending, or tell the user when
   it needs them.
 
+- `project=<you> job id=<j> overdue ...` → a job is still running past its
+  estimate. Read where it is with `shelbi job log <id> -n 20` (`shelbi job
+  list` shows how long it has run). If it is making progress and legitimately
+  needs longer, revise with `shelbi job estimate <id> <duration>`. If it is
+  stuck (no new output since the last alert, a prompt waiting on input, a hung
+  network call), cancel it with `shelbi job cancel <id>` and re-run or fix it,
+  or tell the user when it needs them. A revision needs no user-facing mention.
+
 - `project=<you> job id=<j> ... status=<s>` → a job you started finished.
   `ok`, `exited` or `merged` lets whatever was waiting on it go ahead. On
   `failed` or `closed`, read `detail` (and the `log=` file for a command) and
@@ -947,11 +968,13 @@ The `shelbi` CLI is on your PATH. Commands you'll use most:
 - `shelbi remind in <duration> <text>` / `shelbi remind at <time> <text>`
   [`--every <duration>`] — a reminder delivered as an event when it comes due.
   `shelbi remind list` / `shelbi remind cancel <id>`.
-- `shelbi job run [--label <label>] -- <command>` — run a command detached; an
-  event reports its result. `shelbi job watch --pr <n> | --ci <sha> | --pid
-  <pid>` — get an event when a PR, a commit's CI or a process finishes.
-  `shelbi job log <id> [-n <N>] [-f]` — a job's output (its last N lines; `-f`
-  follows a running one). `shelbi job list [--all]` / `shelbi job cancel <id>`.
+- `shelbi job run [--label <label>] [--estimate <duration>] -- <command>` —
+  run a command detached; an event reports its result. `shelbi job watch --pr
+  <n> | --ci <sha> | --pid <pid> [--estimate <duration>]` — get an event when a
+  PR, a commit's CI or a process finishes. `shelbi job estimate <id>
+  <duration>` — revise a running job's estimate. `shelbi job log <id> [-n <N>]
+  [-f]` — a job's output (its last N lines; `-f` follows a running one).
+  `shelbi job list [--all]` / `shelbi job cancel <id>`.
 - `shelbi events tail [--project <name>]` — raw event-log view, for a quick
   look back. Your events already reach you; don't follow it.
 <!-- /shelbi:awareness -->

@@ -17,6 +17,18 @@
 //!   ↑/↓ select
 //! ```
 //!
+//! A running job started with `--estimate` draws a one-row block bar in its
+//! Duration cell, elapsed against the estimate, in front of the same text;
+//! the bar stays full in the overdue tone once the estimate is used up, and
+//! the Status reads `Overdue`. A finished job shows its actual duration
+//! against the estimate as text only.
+//!
+//! ```text
+//!    Description        │ Command     │ Status  │ Duration
+//!  ▐ desktop tests      │ cargo test  │ Running │ ███▍░░░░ 4m 12s / 10m ▌
+//!    bundle desktop app │ ./bundle.sh │ Overdue │ ████████ 45m / 30m
+//! ```
+//!
 //! Enter opens the selected job's sheet on the right: a running command's
 //! live terminal (attached read-only: keys never reach the job), a finished
 //! one's saved output, with its label, status and elapsed time. `c` cancels a
@@ -51,6 +63,9 @@ use shelbi_term::Size;
 
 use crate::shell::terminal_view::TerminalPane;
 use crate::table::{self, Cell, Column, Table};
+
+/// The cells the Duration column's progress bar takes.
+const BAR_CELLS: usize = 8;
 use crate::theme::palette;
 
 /// How many lines the selected row's whole command may take under the table.
@@ -228,20 +243,29 @@ impl JobsPage {
             Column::new(COLUMNS[0]).min(10).max(32),
             Column::new(COLUMNS[1]).min(12).max(400).fill(),
             Column::new(COLUMNS[2]).min(7).max(20),
-            Column::new(COLUMNS[3]).min(6).max(10).drop(2),
+            Column::new(COLUMNS[3]).min(6).max(26).drop(2),
             Column::new(COLUMNS[4]).min(8).max(30).drop(1),
         ])
         .selected(Some(self.selected), true);
         for row in self.model.rows() {
-            let mut status = Style::default().fg(row.status_tone().pick(palette()));
-            if row.failed() {
+            let mut status = Style::default().fg(row.status_tone_at(now).pick(palette()));
+            if row.failed() || row.overdue(now) {
                 status = status.add_modifier(Modifier::BOLD);
             }
+            let duration_style = row.duration_tone(now).map_or(muted, |t| Style::default().fg(t.pick(palette())));
+            let duration = match row.bar(now) {
+                Some(bar) => {
+                    let mut spans = crate::kanban::estimate_bar_spans(&bar, BAR_CELLS);
+                    spans.push(Span::styled(format!(" {}", row.duration(now)), duration_style));
+                    Cell::spans(spans)
+                }
+                None => Cell::text(row.duration(now), duration_style),
+            };
             t.push(vec![
                 Cell::text(one_line(&row.description), text),
                 Cell::text(one_line(&row.command), text),
-                Cell::text(row.status_label(), status),
-                Cell::text(row.duration(now), muted),
+                Cell::text(row.status_label_at(now), status),
+                duration,
                 Cell::text(row.finished(now), muted),
             ]);
         }
@@ -309,7 +333,7 @@ fn render_sheet(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Ut
         row.sheet_status(now)
     };
     f.render_widget(
-        Paragraph::new(Span::styled(status, Style::default().fg(row.status_tone().pick(palette())))),
+        Paragraph::new(Span::styled(status, Style::default().fg(row.status_tone_at(now).pick(palette())))),
         parts[1],
     );
     let term = parts[3];
@@ -448,7 +472,7 @@ mod tests {
     }
 
     fn job(id: &str, kind: JobKind, target: &str, label: Option<&str>, started_at: DateTime<Utc>) -> Job {
-        Job { id: id.into(), kind, target: target.into(), label: label.map(str::to_string), started_at, runner_pid: None }
+        Job { id: id.into(), kind, target: target.into(), label: label.map(str::to_string), started_at, runner_pid: None, estimate: None, next_alert_at: None }
     }
 
     fn draw(page: &mut JobsPage, width: u16) -> Vec<String> {
@@ -587,6 +611,49 @@ mod tests {
         // Selecting down walks past the heading onto the finished rows.
         page.nav_down();
         assert_eq!(page.selected_row().unwrap().id, "j8");
+    }
+
+    #[test]
+    fn a_running_job_with_an_estimate_draws_a_bar_that_turns_overdue() {
+        let estimated = |id: &str, label: &str, started, mins: u64| {
+            let mut j = job(id, JobKind::Command, "cargo test", Some(label), started);
+            j.set_estimate(std::time::Duration::from_secs(mins * 60));
+            j
+        };
+        let mut done = record("j1", "site build", JobStatus::Ok, Some(0), at(14, 0));
+        done.estimate = Some(std::time::Duration::from_secs(60));
+        let mut page = JobsPage::default();
+        page.apply(JobsRead::Jobs {
+            // At 14:10: 5m into 10m, and 40m into 30m.
+            running: vec![estimated("j3", "half way", at(14, 5), 10), estimated("j2", "running late", at(13, 30), 30)],
+            finished: vec![done],
+        });
+        let mut term = Terminal::new(TestBackend::new(130, 16)).unwrap();
+        term.draw(|f| render_full(f, &mut page, f.area(), at(14, 10), true)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let lines: Vec<String> = (0..buf.area.height)
+            .map(|y| (0..buf.area.width).map(|x| buf[(x, y)].symbol().to_string()).collect())
+            .collect();
+        let text = lines.join("\n");
+        let row = |needle: &str| lines.iter().position(|l| l.contains(needle)).unwrap_or_else(|| panic!("{needle} in\n{text}"));
+        let half = &lines[row("half way")];
+        assert!(half.contains("▬▬▬▬──── 5m / 10m") && half.contains("Running"), "{text}");
+        let late = &lines[row("running late")];
+        assert!(late.contains("▬▬▬▬▬▬▬▬ 40m / 30m") && late.contains("Overdue"), "{text}");
+        // The board cards' bar: full and in the warning color once overdue,
+        // the fill cyan over a dark gray track before that.
+        let x_of = |line: &str, needle: &str| line.find(needle).map(|b| line[..b].chars().count()).unwrap() as u16;
+        let y = row("running late") as u16;
+        assert_eq!(buf[(x_of(late, "▬"), y)].fg, palette().ansi_yellow);
+        assert_eq!(buf[(x_of(late, "Overdue"), y)].fg, shelbi_app::estimate::OVERDUE_TONE.pick(palette()));
+        let y = row("half way") as u16;
+        assert_eq!(buf[(x_of(half, "▬"), y)].fg, palette().ansi_cyan);
+        // The dark gray track, lifted to gray on this (selected) row like
+        // the table's other quiet text.
+        assert_eq!(buf[(x_of(half, "▬▬▬▬─") + 4, y)].fg, palette().gray, "the track past the fill");
+        // Finished: actual against the estimate as text, no bar.
+        let site = &lines[row("site build")];
+        assert!(site.contains("2m 13s / 1m") && !site.contains('▬'), "{text}");
     }
 
     /// Pump `page` until its sheet has loaded.

@@ -1272,6 +1272,8 @@ impl Run {
             label: label.map(str::to_string),
             started_at: now - chrono::Duration::minutes(mins),
             runner_pid: None,
+            estimate: None,
+            next_alert_at: None,
         };
         let jobs = vec![
             job(
@@ -1291,6 +1293,11 @@ impl Run {
             job("j5", JobKind::Ci, "d482e3fe5a1b2c3d4e5f60718293a4b5c6d7e8f9", None, 51),
             job("j4", JobKind::Pr, "2265", None, 62),
         ];
+        // Estimates: the bundle a third of the way in, the checks past theirs
+        // (an overdue bar), the rest with none.
+        let mut jobs = jobs;
+        jobs[0].set_estimate(std::time::Duration::from_secs(12 * 60));
+        jobs[1].set_estimate(std::time::Duration::from_secs(30 * 60));
         let set = |jobs: Vec<Job>| {
             update_awareness(PROJECT, |store| {
                 store.jobs = jobs;

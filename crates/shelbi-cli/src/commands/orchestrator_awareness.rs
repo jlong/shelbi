@@ -89,6 +89,7 @@ fn label(event: &NormalizedEvent) -> Option<&'static str> {
         "workspace_transition" => "workspace",
         "reminder" => "reminder",
         "job_done" => "job done",
+        "job_overdue" => "job overdue",
         "task_overdue" => "task overdue",
         "pane_death" => "pane death",
         "review_ready" => "review ready",
@@ -113,7 +114,7 @@ fn label(event: &NormalizedEvent) -> Option<&'static str> {
 fn is_urgent(event: &NormalizedEvent) -> bool {
     matches!(
         event.kind.as_str(),
-        "reminder" | "job_done" | "task_overdue" | "review_ready"
+        "reminder" | "job_done" | "job_overdue" | "task_overdue" | "review_ready"
     )
 }
 

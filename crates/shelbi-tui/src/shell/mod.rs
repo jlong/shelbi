@@ -7916,6 +7916,8 @@ mod tests {
             label: Some("x".into()),
             started_at: chrono::Utc::now(),
             runner_pid: Some(4242),
+            estimate: None,
+            next_alert_at: None,
         };
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
         st.apply_snapshot(snapshot(vec![job]));

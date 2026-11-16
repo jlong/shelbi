@@ -1651,7 +1651,8 @@ pub fn parse_event_line(line: &str) -> Event {
 /// (`supervision=… target=orchestrator …`).
 /// Parse the three awareness lines (the `project=` scope already peeled):
 /// `reminder id=… text="…"`, `job id=… kind=… label="…" status=… [exit=…]
-/// [detail="…"]`, and `task=<id> overdue estimate=… elapsed=… [workspace=…]`.
+/// [detail="…"]`, `job id=… overdue estimate=… elapsed=… label="…"`, and
+/// `task=<id> overdue estimate=… elapsed=… [workspace=…]`.
 fn parse_awareness(
     ts: DateTime<Utc>,
     project: Option<String>,
@@ -1677,6 +1678,18 @@ fn parse_awareness(
                 None,
                 kv.get("text").cloned(),
             ))
+        }
+        // `job id=… overdue estimate=… elapsed=… label="…"`: still running
+        // past its estimate. The label is quoted, so a bare `overdue` word is
+        // the verb.
+        "job" if shelbi_state::split_event_words(tail).contains(&"overdue") => {
+            let kv = parse_kv(tail);
+            let label = kv.get("label").cloned().unwrap_or_default();
+            let detail = match (kv.get("estimate"), kv.get("elapsed")) {
+                (Some(est), Some(el)) => format!("{label} · estimate {est} · elapsed {el}"),
+                _ => label,
+            };
+            Some(sys(SystemKind::Job, kv.get("id").cloned(), Some("overdue".into()), Some(detail)))
         }
         "job" => {
             let kv = parse_kv(tail);
@@ -2474,6 +2487,7 @@ pub fn system_row(
                 Some("failed") => ("failed", Tone::LightRed),
                 Some("closed") => ("closed", Tone::Gray),
                 Some("exited") => ("exited", Tone::Gray),
+                Some("overdue") => ("overdue", crate::estimate::OVERDUE_TONE),
                 _ => ("job", Tone::Gray),
             };
             (
@@ -3040,6 +3054,13 @@ mod tests {
         assert_eq!(failed.title, "desktop tests · exit 3: 1 failed");
         let merged = row_of(r#"project=p job id=j3 kind=pr label="PR #42" status=merged"#);
         assert_eq!((merged.verb.as_str(), merged.title.as_str()), ("merged", "PR #42"));
+
+        let job_late = row_of(r#"project=p job id=j4 overdue estimate=30m elapsed=45m label="desktop tests""#);
+        assert_eq!((job_late.verb.as_str(), job_late.verb_tone), ("overdue", Tone::Yellow));
+        assert_eq!(job_late.title, "desktop tests · estimate 30m · elapsed 45m");
+        // A finished job whose label says "overdue" is still a finished job.
+        let quoted = row_of(r#"project=p job id=j5 kind=command label="overdue fix" status=ok exit=0"#);
+        assert_eq!(quoted.verb, "finished");
 
         let overdue = row_of("project=p task=t-1 overdue estimate=45m elapsed=1h10m workspace=alpha");
         assert_eq!(overdue.verb, "overdue");

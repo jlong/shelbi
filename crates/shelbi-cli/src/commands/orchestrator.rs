@@ -1155,6 +1155,9 @@ fn event_kind(parsed: &ParsedLine) -> String {
     if parsed.fields.contains_key("reminder") {
         return "reminder".into();
     }
+    if parsed.fields.contains_key("job") && parsed.fields.contains_key("overdue") {
+        return "job_overdue".into();
+    }
     if parsed.fields.contains_key("job") {
         return "job_done".into();
     }
@@ -1914,10 +1917,21 @@ workspaces: []\n";
             Some("alpha"),
         )
         .unwrap();
+        shelbi_state::append_job_overdue_event(
+            "demo",
+            "j3",
+            std::time::Duration::from_secs(600),
+            std::time::Duration::from_secs(900),
+            "overdue builds",
+        )
+        .unwrap();
 
         let response = drain_once("demo", 0).unwrap();
         let kinds: Vec<_> = response.events.iter().map(|e| e.kind.as_str()).collect();
-        assert_eq!(kinds, ["reminder", "job_done", "task_overdue"]);
+        assert_eq!(kinds, ["reminder", "job_done", "task_overdue", "job_overdue"]);
+        let late = &response.events[3];
+        assert_eq!(late.metadata.get("label").map(String::as_str), Some("overdue builds"));
+        assert_eq!(late.metadata.get("estimate").map(String::as_str), Some("10m"));
         let reminder = &response.events[0];
         assert_eq!(
             reminder.metadata.get("text").map(String::as_str),

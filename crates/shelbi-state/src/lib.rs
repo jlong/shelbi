@@ -224,7 +224,7 @@ pub use event_log::{
     append_board_unreachable_event,
     append_daemon_event,
     append_ci_event, append_clarification_event, append_job_event, append_reminder_event,
-    append_task_overdue_event, quote_event_text, split_event_words, unquote_event_value, JobEvent, append_dispatch_event, append_external_event,
+    append_job_overdue_event, append_task_overdue_event, quote_event_text, split_event_words, unquote_event_value, JobEvent, append_dispatch_event, append_external_event,
     append_handoff_action_failed_event, append_handoff_refused_event,
     append_orphan_reap_failed_event,
     append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,

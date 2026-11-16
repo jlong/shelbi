@@ -138,6 +138,7 @@ fn command_job() -> String {
             kind: JobKind::Command,
             target: "cargo test".into(),
             label: Some("desktop tests".into()),
+            estimate: None,
         },
     )
     .unwrap()
@@ -214,7 +215,7 @@ fn a_pid_job_fires_when_the_process_exits() {
     let probe = FakeProbe::default();
     probe.alive.borrow_mut().insert(77);
     let mut state = AwarenessTickState::default();
-    awareness::add_job(P, NewJob { kind: JobKind::Pid, target: "77".into(), label: None }).unwrap();
+    awareness::add_job(P, NewJob { kind: JobKind::Pid, target: "77".into(), label: None, estimate: None }).unwrap();
     run(&mut state, Utc::now(), &probe);
     assert!(events().is_empty());
     probe.alive.borrow_mut().clear();
@@ -230,8 +231,8 @@ fn ci_and_pr_watches_sample_on_their_cadence_and_only_online() {
     let _home = home();
     let probe = FakeProbe::default();
     let mut state = AwarenessTickState::default();
-    awareness::add_job(P, NewJob { kind: JobKind::Ci, target: "abc123".into(), label: None }).unwrap();
-    awareness::add_job(P, NewJob { kind: JobKind::Pr, target: "42".into(), label: None }).unwrap();
+    awareness::add_job(P, NewJob { kind: JobKind::Ci, target: "abc123".into(), label: None, estimate: None }).unwrap();
+    awareness::add_job(P, NewJob { kind: JobKind::Pr, target: "42".into(), label: None, estimate: None }).unwrap();
 
     probe.offline.set(true);
     run(&mut state, Utc::now(), &probe);
@@ -356,7 +357,7 @@ fn a_job_session_is_removed_once_the_job_has_left_the_store() {
     let _home = home();
     let probe = FakeProbe::default();
     let mut state = AwarenessTickState::default();
-    let job = awareness::add_job(P, NewJob { kind: JobKind::Command, target: "true".into(), label: None }).unwrap();
+    let job = awareness::add_job(P, NewJob { kind: JobKind::Command, target: "true".into(), label: None, estimate: None }).unwrap();
     // A dead session directory for the job, and one for a workspace.
     let sessions = shelbi_state::sessions_dir().unwrap();
     let dead_session = |dir: &str, name: &str| {
@@ -438,7 +439,7 @@ fn a_finished_job_moves_into_the_history_with_how_it_ended() {
     let mut state = AwarenessTickState::default();
     let failing = command_job();
     awareness::set_job_runner_pid(P, &failing, 4242).unwrap();
-    awareness::add_job(P, NewJob { kind: JobKind::Pid, target: "77".into(), label: None }).unwrap();
+    awareness::add_job(P, NewJob { kind: JobKind::Pid, target: "77".into(), label: None, estimate: None }).unwrap();
     probe.alive.borrow_mut().insert(4242);
     finish(&failing, 3, &["running 4 tests", "test result: FAILED"]);
     run(&mut state, Utc::now(), &probe);
@@ -471,7 +472,7 @@ fn a_watch_verdict_is_recorded_with_its_status() {
     let _home = home();
     let probe = FakeProbe::default();
     let mut state = AwarenessTickState::default();
-    awareness::add_job(P, NewJob { kind: JobKind::Pr, target: "42".into(), label: None }).unwrap();
+    awareness::add_job(P, NewJob { kind: JobKind::Pr, target: "42".into(), label: None, estimate: None }).unwrap();
     *probe.pr.borrow_mut() = Some(WatchVerdict::Closed);
     run(&mut state, Utc::now(), &probe);
     let history = awareness::read_job_history(P).unwrap();
@@ -482,7 +483,7 @@ fn a_watch_verdict_is_recorded_with_its_status() {
 #[test]
 fn a_canceled_job_is_recorded_as_canceled() {
     let _home = home();
-    let pid = awareness::add_job(P, NewJob { kind: JobKind::Pid, target: "1".into(), label: Some("init".into()) })
+    let pid = awareness::add_job(P, NewJob { kind: JobKind::Pid, target: "1".into(), label: Some("init".into()), estimate: None })
         .unwrap()
         .id;
     let cmd = command_job();
@@ -498,4 +499,95 @@ fn a_canceled_job_is_recorded_as_canceled() {
     assert!(by_id(&cmd).log.is_some());
     assert!(store().jobs.is_empty());
     assert!(cancel_job(P, &pid).unwrap().is_none(), "canceled once");
+}
+
+/// A pid watch on `pid` that started at [`t0`], with `estimate`.
+fn watch_since_t0(pid: u32, label: Option<&str>, estimate: Option<Duration>) -> String {
+    let id = awareness::add_job(
+        P,
+        NewJob { kind: JobKind::Pid, target: pid.to_string(), label: label.map(str::to_string), estimate },
+    )
+    .unwrap()
+    .id;
+    awareness::update_awareness(P, |s| {
+        let job = s.jobs.iter_mut().find(|j| j.id == id).unwrap();
+        job.started_at = t0();
+        if let Some(estimate) = estimate {
+            job.set_estimate(estimate);
+        }
+        Ok(())
+    })
+    .unwrap();
+    id
+}
+
+#[test]
+fn a_job_past_its_estimate_alerts_then_every_half_estimate_until_it_finishes() {
+    let _home = home();
+    let probe = FakeProbe::default();
+    probe.alive.borrow_mut().extend([77, 78]);
+    let mut state = AwarenessTickState::default();
+    watch_since_t0(77, Some("desktop tests"), Some(mins(30)));
+    // No estimate: never overdue, however long it runs.
+    watch_since_t0(78, None, None);
+
+    for m in [0, 29, 30, 31, 44, 45, 50, 600] {
+        run(&mut state, at(m), &probe);
+    }
+    let overdue: Vec<String> = events().into_iter().filter(|e| e.contains(" overdue ")).collect();
+    assert_eq!(
+        overdue[..2],
+        [
+            r#"project=demo job id=j1 overdue estimate=30m elapsed=30m label="desktop tests""#,
+            r#"project=demo job id=j1 overdue estimate=30m elapsed=45m label="desktop tests""#,
+        ]
+    );
+    // A late tick (the daemon was down) fires once, on the original grid.
+    assert_eq!(overdue[2], r#"project=demo job id=j1 overdue estimate=30m elapsed=10h label="desktop tests""#);
+    assert_eq!(overdue.len(), 3);
+    assert!(!events().iter().any(|e| e.contains("id=j2")), "{:?}", events());
+    assert_eq!(store().jobs[0].next_alert_at, Some(at(615)));
+    let kinds: Vec<_> = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+        .unwrap()
+        .lines()
+        .map(|l| shelbi_state::EventEnvelope::from_log_line(l).kind)
+        .collect();
+    assert!(kinds.iter().all(|k| *k == shelbi_state::EventKind::JobOverdue), "{kinds:?}");
+
+    // It finishes on a tick that is also an alert slot: its end is reported,
+    // not that it ran long, and the history keeps the estimate.
+    probe.alive.borrow_mut().remove(&77);
+    run(&mut state, at(615), &probe);
+    let after: Vec<String> = events().into_iter().skip(3).collect();
+    assert_eq!(after.len(), 1, "{after:?}");
+    assert!(after[0].starts_with("project=demo job id=j1 kind=pid"), "{after:?}");
+    let record = awareness::find_job_record(P, "j1").unwrap().unwrap();
+    assert_eq!(record.estimate, Some(mins(30)));
+    run(&mut state, at(700), &probe);
+    assert_eq!(events().len(), 4);
+}
+
+#[test]
+fn a_revised_estimate_counts_from_the_start_and_alerts_next_tick_when_exceeded() {
+    let _home = home();
+    let probe = FakeProbe::default();
+    probe.alive.borrow_mut().insert(77);
+    let mut state = AwarenessTickState::default();
+    let id = watch_since_t0(77, None, Some(mins(60)));
+    run(&mut state, at(40), &probe);
+    assert!(events().is_empty());
+    // Revised down to 30m at 40m in: already past it.
+    let revised = awareness::set_job_estimate(P, &id, mins(30)).unwrap().unwrap();
+    assert_eq!(revised.next_alert_at, Some(at(30)));
+    run(&mut state, at(41), &probe);
+    assert_eq!(events(), [r#"project=demo job id=j1 overdue estimate=30m elapsed=41m label="pid 77""#]);
+    assert_eq!(store().jobs[0].next_alert_at, Some(at(45)));
+    // Revised up past now: quiet until the new estimate runs out.
+    awareness::set_job_estimate(P, &id, mins(120)).unwrap();
+    run(&mut state, at(119), &probe);
+    assert_eq!(events().len(), 1);
+    run(&mut state, at(120), &probe);
+    assert_eq!(events().len(), 2);
+    assert!(awareness::set_job_estimate(P, "j99", mins(5)).unwrap().is_none());
+    assert!(awareness::set_job_estimate(P, &id, Duration::ZERO).is_err());
 }
