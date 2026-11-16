@@ -7,14 +7,20 @@
 //! versioned by `schema_version` and documented on the CLI docs page
 //! (`site/content/docs/cli/changelog.mdx`). `strip-links` cleans up older
 //! entries whose description ends with a list that only repeats their
-//! frontmatter links.
+//! frontmatter links. `add --image/--attach` and `attach` copy files into the
+//! entry's `assets/<entry-id>/` directory and print where each one landed.
 
 use std::io::{IsTerminal, Read};
 
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
-use shelbi_state::changelog::{self, BareDate, ChangelogEntry, Link, NewEntry, PrRef};
+use std::path::{Path, PathBuf};
+
+use shelbi_state::changelog::{
+    self, Attachment, AttachmentKind, BareDate, ChangelogEntry, Link, NewAttachment, NewEntry,
+    PrRef, StoredAttachment,
+};
 
 use super::require_project;
 
@@ -33,12 +39,37 @@ Links:
   number resolves to a URL against the project's GitHub issue tracker, or its
   repository's origin remote when that is on github.com.";
 
+/// The attachment flags, shared by `add`'s and `attach`'s long help.
+pub const ATTACH_HELP: &str = "\
+Attachments:
+  --image <file>[:<alt>]  copy an image (png, jpg, gif, webp, svg) into the
+                          entry and show it inline: `![alt](assets/...)` is
+                          added at the end of the description. The alt text
+                          (its caption) defaults to the file name.
+  --attach <file>         copy any other file (a log, a PDF, a zip, a video);
+                          it is listed under the entry.
+
+  Files are copied, never moved, into the changelog's assets/<entry-id>/
+  directory, at most 50 MB each. A name already taken there gets a number
+  (shot.png, then shot-2.png, shot-3.png); each file's final path is printed.";
+
 #[derive(Debug, Subcommand)]
 pub enum ChangelogCmd {
     /// Add an entry, its description laid out by the project's
     /// changelog-template.md.
-    #[command(after_long_help = LINK_HELP)]
+    #[command(after_long_help = format!("{LINK_HELP}\n\n{ATTACH_HELP}"))]
     Add(AddArgs),
+    /// Add images and files to an existing entry. ENTRY_ID is the id `list`
+    /// shows, or a unique prefix of one.
+    #[command(after_long_help = ATTACH_HELP)]
+    Attach {
+        entry_id: String,
+        #[command(flatten)]
+        files: FileArgs,
+        /// How to print what was attached.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
     /// List entries, newest first.
     List {
         /// Show at most N entries.
@@ -103,9 +134,68 @@ pub struct AddArgs {
     /// not a terminal.
     #[arg(short = 'd', long = "description", value_name = "DESC")]
     description: Option<String>,
+    #[command(flatten)]
+    files: FileArgs,
     /// How to print the new entry.
     #[arg(long, value_enum, default_value_t = Format::Text)]
     format: Format,
+}
+
+/// The files `add` and `attach` copy into an entry.
+#[derive(Debug, Args, Default)]
+pub struct FileArgs {
+    /// An image to show inline, with optional alt text: `shot.png` or
+    /// `shot.png:Jobs sheet after the change`. Repeatable.
+    #[arg(long = "image", value_name = "FILE[:ALT]")]
+    images: Vec<String>,
+    /// Any other file to list under the entry. Repeatable.
+    #[arg(long = "attach", value_name = "FILE")]
+    attach: Vec<String>,
+}
+
+impl FileArgs {
+    fn is_empty(&self) -> bool {
+        self.images.is_empty() && self.attach.is_empty()
+    }
+
+    /// The files asked for, images first, each in the order given.
+    fn new_attachments(&self) -> Result<Vec<NewAttachment>> {
+        let mut out = Vec::new();
+        for value in &self.images {
+            let (source, alt) = split_image_arg(value, |p| p.is_file())?;
+            out.push(NewAttachment {
+                source,
+                kind: AttachmentKind::Image,
+                alt,
+            });
+        }
+        for value in &self.attach {
+            out.push(NewAttachment {
+                source: PathBuf::from(value),
+                kind: AttachmentKind::File,
+                alt: None,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Split `--image <file>[:<alt>]`: the whole value when it names a file (a
+/// path may hold a colon), else the shortest prefix before a `:` that does,
+/// the rest being the alt text.
+fn split_image_arg(value: &str, exists: impl Fn(&Path) -> bool) -> Result<(PathBuf, Option<String>)> {
+    if exists(Path::new(value)) {
+        return Ok((PathBuf::from(value), None));
+    }
+    for (i, _) in value.match_indices(':') {
+        let (path, alt) = (&value[..i], &value[i + 1..]);
+        if !path.is_empty() && exists(Path::new(path)) {
+            let alt = alt.trim();
+            return Ok((PathBuf::from(path), (!alt.is_empty()).then(|| alt.to_string())));
+        }
+    }
+    let path = value.split(':').next().unwrap_or(value);
+    bail!("--image {value}: no such file `{path}`")
 }
 
 /// How entries print.
@@ -129,12 +219,59 @@ pub fn run(project_opt: Option<String>, cmd: ChangelogCmd) -> Result<()> {
     match cmd {
         ChangelogCmd::Add(args) => {
             let format = args.format;
+            // Every file is checked before the entry is written, so a bad one
+            // fails the command without leaving an entry behind.
+            let files = changelog::prepare_attachments(&args.files.new_attachments()?)
+                .map_err(|e| anyhow!(e))?;
             let new = new_entry(args, read_stdin_description)?;
             let entry = changelog::add_entry(&project, new).map_err(|e| anyhow!(e))?;
+            let (entry, stored) = if files.is_empty() {
+                (entry, Vec::new())
+            } else {
+                changelog::attach_files(&entry, &files).map_err(|e| {
+                    anyhow!(
+                        "added {} but attaching failed: {e}\n  retry with: shelbi changelog attach {} …",
+                        entry.id,
+                        entry.id
+                    )
+                })?
+            };
             let out = match format {
-                Format::Text => format!("✓ added {}\n  {}\n", entry.id, entry.path.display()),
+                Format::Text => {
+                    let mut out = format!("✓ added {}\n  {}\n", entry.id, entry.path.display());
+                    out.push_str(&render_stored(&stored));
+                    out
+                }
                 Format::Markdown => render_markdown(&entry, repo),
-                Format::Json => render_json_one(&project, &entry, repo)?,
+                Format::Json => render_json_one(&project, &entry, repo, Some(&stored))?,
+            };
+            print!("{out}");
+        }
+        ChangelogCmd::Attach {
+            entry_id,
+            files,
+            format,
+        } => {
+            if files.is_empty() {
+                bail!("nothing to attach: give --image <file> or --attach <file>");
+            }
+            let prepared =
+                changelog::prepare_attachments(&files.new_attachments()?).map_err(|e| anyhow!(e))?;
+            let (entry, stored) = changelog::attach_to_entry(&project, &entry_id, &prepared)
+                .map_err(|e| anyhow!(e))?;
+            let out = match format {
+                Format::Text => {
+                    let n = stored.len();
+                    let mut out = format!(
+                        "✓ attached {n} file{} to {}\n",
+                        if n == 1 { "" } else { "s" },
+                        entry.id
+                    );
+                    out.push_str(&render_stored(&stored));
+                    out
+                }
+                Format::Markdown => render_markdown(&entry, repo),
+                Format::Json => render_json_one(&project, &entry, repo, Some(&stored))?,
             };
             print!("{out}");
         }
@@ -174,7 +311,7 @@ pub fn run(project_opt: Option<String>, cmd: ChangelogCmd) -> Result<()> {
             let out = match format {
                 Format::Text => render_text(&entry, repo),
                 Format::Markdown => render_markdown(&entry, repo),
-                Format::Json => render_json_one(&project, &entry, repo)?,
+                Format::Json => render_json_one(&project, &entry, repo, None)?,
             };
             print!("{out}");
         }
@@ -262,6 +399,25 @@ fn new_entry(args: AddArgs, stdin: impl FnOnce() -> Result<Option<String>>) -> R
 // ---------------------------------------------------------------------------
 // Rendering
 
+/// One line per stored file: its absolute path, then the path the entry
+/// uses, so a caller can reference either.
+fn render_stored(stored: &[StoredAttachment]) -> String {
+    stored
+        .iter()
+        .map(|s| {
+            format!(
+                "  {} {}  ({})\n",
+                match s.attachment.kind {
+                    AttachmentKind::Image => "image",
+                    AttachmentKind::File => "file ",
+                },
+                s.absolute.display(),
+                s.attachment.path
+            )
+        })
+        .collect()
+}
+
 fn render_many(
     project: &str,
     entries: &[ChangelogEntry],
@@ -324,6 +480,18 @@ fn render_markdown(entry: &ChangelogEntry, repo: Option<&str>) -> String {
         let links: Vec<String> = extra.iter().map(markdown_link).collect();
         out.push_str(&format!("\nLinks: {}\n", links.join(" · ")));
     }
+    let listed = entry.listed_attachments();
+    if !listed.is_empty() {
+        out.push_str("\nAttachments:\n\n");
+        for a in listed {
+            out.push_str(&format!(
+                "- [{}](<{}>) ({})\n",
+                a.name,
+                a.absolute(entry.dir()).display(),
+                changelog::format_size(a.size)
+            ));
+        }
+    }
     out
 }
 
@@ -336,11 +504,22 @@ fn markdown_link(link: &Link) -> String {
     }
 }
 
-fn render_json_one(project: &str, entry: &ChangelogEntry, repo: Option<&str>) -> Result<String> {
+fn render_json_one(
+    project: &str,
+    entry: &ChangelogEntry,
+    repo: Option<&str>,
+    added: Option<&[StoredAttachment]>,
+) -> Result<String> {
     let doc = JsonOne {
         schema_version: JSON_SCHEMA_VERSION,
         project,
         entry: JsonEntry::new(entry, repo),
+        added: added.map(|stored| {
+            stored
+                .iter()
+                .map(|s| JsonAttachment::new(&s.attachment, entry.dir()))
+                .collect()
+        }),
     };
     Ok(format!("{}\n", serde_json::to_string_pretty(&doc)?))
 }
@@ -355,12 +534,39 @@ struct JsonList<'a> {
     entries: Vec<JsonEntry<'a>>,
 }
 
-/// `show` / `add`: `{schema_version, project, entry: {...}}`.
+/// `show` / `add` / `attach`: `{schema_version, project, entry: {...}}`;
+/// `add` and `attach` add `added: [...]`, the files they just stored.
 #[derive(Serialize)]
 struct JsonOne<'a> {
     schema_version: u32,
     project: &'a str,
     entry: JsonEntry<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    added: Option<Vec<JsonAttachment<'a>>>,
+}
+
+/// One attachment: `path` absolute on this machine, `relative_path` as the
+/// entry records it (relative to the changelog directory, the path an
+/// inline image's Markdown uses).
+#[derive(Serialize)]
+struct JsonAttachment<'a> {
+    name: &'a str,
+    kind: AttachmentKind,
+    size: u64,
+    path: String,
+    relative_path: &'a str,
+}
+
+impl<'a> JsonAttachment<'a> {
+    fn new(a: &'a Attachment, dir: &Path) -> Self {
+        JsonAttachment {
+            name: &a.name,
+            kind: a.kind,
+            size: a.size,
+            path: a.absolute(dir).display().to_string(),
+            relative_path: &a.path,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -373,6 +579,7 @@ struct JsonEntry<'a> {
     /// Markdown.
     description: &'a str,
     links: Vec<Link>,
+    attachments: Vec<JsonAttachment<'a>>,
     path: String,
 }
 
@@ -385,6 +592,11 @@ impl<'a> JsonEntry<'a> {
             author: &entry.author,
             description: &entry.body,
             links: entry.links(repo),
+            attachments: entry
+                .attachments
+                .iter()
+                .map(|a| JsonAttachment::new(a, entry.dir()))
+                .collect(),
             path: entry.path.display().to_string(),
         }
     }
@@ -425,6 +637,7 @@ mod tests {
             prs: vec![PrRef::Number(1953)],
             urls: vec![],
             body: "Activity becomes Changelog, see #1953.".into(),
+            attachments: vec![],
             path: PathBuf::from("/h/projects/p/changelog/2026-10-28-213005-changelog.md"),
         }
     }
@@ -579,16 +792,110 @@ mod tests {
                         {"kind": "issue", "id": "changelog"},
                         {"kind": "pr", "number": 1953, "url": "https://github.com/jlong/shelbi/pull/1953"},
                     ],
+                    "attachments": [],
                     "path": "/h/projects/p/changelog/2026-10-28-213005-changelog.md",
                 }],
             })
         );
         let one: serde_json::Value =
-            serde_json::from_str(&render_json_one("p", &entry(), None).unwrap()).unwrap();
+            serde_json::from_str(&render_json_one("p", &entry(), None, None).unwrap()).unwrap();
         assert_eq!(one["schema_version"], 1);
+        assert!(one.get("added").is_none(), "only add and attach report added files");
         assert_eq!(
             one["entry"]["links"][1],
             serde_json::json!({"kind": "pr", "number": 1953, "url": null})
+        );
+    }
+
+    fn with_files() -> ChangelogEntry {
+        let mut e = entry();
+        e.body.push_str("\n\n![Board](assets/2026-10-28-213005-changelog/board.png)");
+        e.attachments = vec![
+            Attachment {
+                path: "assets/2026-10-28-213005-changelog/board.png".into(),
+                name: "board.png".into(),
+                size: 2048,
+                kind: AttachmentKind::Image,
+            },
+            Attachment {
+                path: "assets/2026-10-28-213005-changelog/bench.csv".into(),
+                name: "bench.csv".into(),
+                size: 12 * 1024,
+                kind: AttachmentKind::File,
+            },
+        ];
+        e
+    }
+
+    #[test]
+    fn image_args_split_off_alt_text_only_after_a_real_file() {
+        let exists = |p: &Path| ["shot.png", "a:b.png", "/tmp/x.png"].contains(&p.to_str().unwrap());
+        let split = |v: &str| split_image_arg(v, exists).map_err(|e| e.to_string());
+        assert_eq!(split("shot.png").unwrap(), (PathBuf::from("shot.png"), None));
+        assert_eq!(
+            split("shot.png:The board: after").unwrap(),
+            (PathBuf::from("shot.png"), Some("The board: after".into()))
+        );
+        // A name holding a colon is the file when it exists.
+        assert_eq!(split("a:b.png").unwrap(), (PathBuf::from("a:b.png"), None));
+        assert_eq!(
+            split("a:b.png:caption").unwrap(),
+            (PathBuf::from("a:b.png"), Some("caption".into()))
+        );
+        assert_eq!(split("/tmp/x.png:  ").unwrap(), (PathBuf::from("/tmp/x.png"), None));
+        assert!(split("missing.png:alt").unwrap_err().contains("no such file `missing.png`"));
+    }
+
+    #[test]
+    fn add_and_attach_take_images_and_files() {
+        let args = add_args(&["--title", "T", "--image", "a.png", "--image", "b.png:B", "--attach", "log.txt"]);
+        assert_eq!(args.files.images, ["a.png", "b.png:B"]);
+        assert_eq!(args.files.attach, ["log.txt"]);
+        match parse(&["attach", "2026-10", "--attach", "x.zip", "--format", "json"]) {
+            ChangelogCmd::Attach { entry_id, files, format } => {
+                assert_eq!(entry_id, "2026-10");
+                assert_eq!(files.attach, ["x.zip"]);
+                assert!(files.images.is_empty());
+                assert_eq!(format, Format::Json);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(FileArgs::default().is_empty());
+    }
+
+    #[test]
+    fn json_and_markdown_carry_attachments_with_absolute_paths() {
+        let e = with_files();
+        let stored = vec![StoredAttachment {
+            absolute: PathBuf::from("/h/projects/p/changelog/assets/2026-10-28-213005-changelog/bench.csv"),
+            attachment: e.attachments[1].clone(),
+        }];
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json_one("p", &e, REPO, Some(&stored)).unwrap()).unwrap();
+        assert_eq!(
+            v["entry"]["attachments"][1],
+            serde_json::json!({
+                "name": "bench.csv",
+                "kind": "file",
+                "size": 12288,
+                "path": "/h/projects/p/changelog/assets/2026-10-28-213005-changelog/bench.csv",
+                "relative_path": "assets/2026-10-28-213005-changelog/bench.csv",
+            })
+        );
+        assert_eq!(v["added"], serde_json::json!([v["entry"]["attachments"][1]]));
+
+        let md = render_markdown(&e, REPO);
+        assert!(md.contains("![Board](assets/2026-10-28-213005-changelog/board.png)\n"), "{md}");
+        assert!(
+            md.ends_with(
+                "\nAttachments:\n\n- [bench.csv](</h/projects/p/changelog/assets/2026-10-28-213005-changelog/bench.csv>) (12 KB)\n"
+            ),
+            "{md}"
+        );
+        assert_eq!(
+            render_stored(&stored),
+            "  file  /h/projects/p/changelog/assets/2026-10-28-213005-changelog/bench.csv  \
+             (assets/2026-10-28-213005-changelog/bench.csv)\n"
         );
     }
 }

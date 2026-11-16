@@ -1164,6 +1164,11 @@ to those lines and no merge is missed.
   a PR: the `pr=` token on the `done` line, or `pr:<n>` in the `detail=` of the
   `merge task=<id> ... status=ok` line. `--link <url>` for any other page that
   matters (docs, a design, a release). Leave out a flag you have no value for.
+- **Attachments**: when a merge visibly changes the UI, attach a screenshot
+  with `--image <file>[:<alt>]` (shown inline, the alt text its caption); add
+  other artifacts a reader would want (a benchmark, a log, a short video) with
+  `--attach <file>`. Both repeat, and `shelbi changelog attach <entry-id>` adds
+  them to an entry already written.
 
 **One entry per feature.** A subtask squash-merges into its parent task's
 branch, not the primary branch, so it ships nothing by itself: write no entry

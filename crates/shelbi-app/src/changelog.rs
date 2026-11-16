@@ -8,12 +8,20 @@
 //! changelog directory's [`ChangelogStamp`], so an entry added by the
 //! orchestrator or `shelbi changelog add` shows up on the client's next tick.
 //!
+//! An entry's files ([`ChangelogAttachment`]) resolve against the changelog
+//! directory on this machine ([`ChangelogEntryView::dir`]), which never
+//! crosses the wire: a remote window's entries have none, so its images show
+//! their alt text and its files can't be opened ([`ImageSource::Unavailable`]),
+//! rather than failing.
+//!
 //! Storage, the link syntax and search live in [`shelbi_state::changelog`];
 //! this module is the view over them.
 
+use std::path::{Path, PathBuf};
+
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
-use shelbi_state::changelog::{self, ChangelogStamp, Link};
+use shelbi_state::changelog::{self, AttachmentKind, ChangelogStamp, Link};
 
 /// How many entries a page shows, and how many more each
 /// [`ChangelogModel::load_more`] adds.
@@ -108,6 +116,43 @@ fn display_url(url: &str) -> String {
     rest.trim_end_matches('/').to_string()
 }
 
+/// One file on an entry, as a client lists or draws it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangelogAttachment {
+    /// The stored file name.
+    pub name: String,
+    pub kind: AttachmentKind,
+    /// Bytes.
+    pub size: u64,
+    /// Relative to the changelog directory: `assets/<entry-id>/<name>`.
+    pub path: String,
+    /// Whether it belongs in the entry's Attachments list: every file, and an
+    /// image the description doesn't show.
+    pub listed: bool,
+}
+
+impl ChangelogAttachment {
+    /// `12 KB`, `4.1 MB`.
+    pub fn size_label(&self) -> String {
+        changelog::format_size(self.size)
+    }
+}
+
+/// Where an image in a description comes from, for a client to draw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageSource {
+    /// A file on this machine.
+    File(PathBuf),
+    /// A web image.
+    Web(String),
+    /// A local path whose file isn't there: draw the alt text, "image
+    /// missing".
+    Missing(PathBuf),
+    /// The changelog can't be read from here (a remote window): draw the alt
+    /// text.
+    Unavailable,
+}
+
 /// One entry as a client draws it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -125,6 +170,15 @@ pub struct ChangelogEntryView {
     /// The links the description doesn't already show, for a client that
     /// renders the description and lists the rest beneath it.
     pub extra_links: Vec<ChangelogLink>,
+    /// The entry's files, from its frontmatter.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ChangelogAttachment>,
+    /// The changelog directory on this machine, that attachment paths and the
+    /// description's relative image paths resolve against. Never sent over
+    /// the wire, so `None` in a remote window, where the far directory can't
+    /// be read.
+    #[serde(skip)]
+    pub dir: Option<PathBuf>,
 }
 
 impl ChangelogEntryView {
@@ -132,7 +186,26 @@ impl ChangelogEntryView {
     /// (`owner/name`). [`read_changelog`] builds every entry with this; a
     /// client's tests build fixtures with it.
     pub fn new(entry: changelog::ChangelogEntry, repo: Option<&str>) -> Self {
+        let listed: Vec<String> = entry
+            .listed_attachments()
+            .iter()
+            .map(|a| a.path.clone())
+            .collect();
+        let attachments = entry
+            .attachments
+            .iter()
+            .map(|a| ChangelogAttachment {
+                name: a.name.clone(),
+                kind: a.kind,
+                size: a.size,
+                path: a.path.clone(),
+                listed: listed.contains(&a.path),
+            })
+            .collect();
+        let dir = Some(entry.dir().to_path_buf());
         ChangelogEntryView {
+            attachments,
+            dir,
             links: entry
                 .links(repo)
                 .into_iter()
@@ -196,6 +269,26 @@ impl ChangelogEntryView {
         } else {
             text
         }
+    }
+
+    /// The attachments for the entry's Attachments list
+    /// ([`ChangelogAttachment::listed`]), in the order they were attached.
+    pub fn listed_attachments(&self) -> impl Iterator<Item = &ChangelogAttachment> {
+        self.attachments.iter().filter(|a| a.listed)
+    }
+
+    /// The file behind `attachment` on this machine, or `None` where the
+    /// changelog can't be read from here (a remote window).
+    pub fn attachment_file(&self, attachment: &ChangelogAttachment) -> Option<PathBuf> {
+        Some(self.dir.as_ref()?.join(&attachment.path))
+    }
+
+    /// Where the description's image `url` (a Markdown image's destination)
+    /// comes from: a web URL as itself; a path relative to the changelog
+    /// directory (`assets/<entry-id>/shot.png`, what `--image` writes), an
+    /// absolute path or a `file://` URL as a file here when it exists.
+    pub fn image_source(&self, url: &str) -> ImageSource {
+        resolve_image(self.dir.as_deref(), url)
     }
 
     /// Whether the entry's title, description, or link targets hold every
@@ -361,6 +454,133 @@ impl ChangelogModel {
     }
 }
 
+/// [`ChangelogEntryView::image_source`] over a changelog directory (`None`
+/// where it can't be read from here), for a renderer that keeps only the
+/// directory.
+pub fn resolve_image(dir: Option<&Path>, url: &str) -> ImageSource {
+    let url = url.trim();
+    if url.starts_with("https://") || url.starts_with("http://") {
+        return ImageSource::Web(url.to_string());
+    }
+    let Some(dir) = dir else {
+        return ImageSource::Unavailable;
+    };
+    let raw = url.strip_prefix("file://").unwrap_or(url);
+    let decoded = percent_decode(raw);
+    let path = Path::new(&decoded);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        dir.join(path)
+    };
+    if path.is_file() {
+        ImageSource::File(path)
+    } else {
+        ImageSource::Missing(path)
+    }
+}
+
+/// `%20`-style escapes decoded (a Markdown image path with a space in it).
+/// Anything that doesn't decode to UTF-8 is kept as written.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// `markdown` with every image (`![alt](url)`, outside code) as a text
+/// placeholder, `[image: alt]` (the file name when the alt text is empty):
+/// how a client that can't draw images (the TUI) shows where one sits.
+pub fn image_placeholders(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len());
+    let mut in_fence = false;
+    for line in markdown.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence || !line.contains("![") {
+            out.push_str(line);
+            continue;
+        }
+        // Outside code spans: the even pieces between backticks.
+        for (i, piece) in line.split('`').enumerate() {
+            if i > 0 {
+                out.push('`');
+            }
+            if i % 2 == 1 {
+                out.push_str(piece);
+            } else {
+                replace_images(piece, &mut out);
+            }
+        }
+    }
+    out
+}
+
+fn replace_images(text: &str, out: &mut String) {
+    let mut rest = text;
+    while let Some(start) = rest.find("![") {
+        let Some((alt, url, len)) = parse_image(&rest[start..]) else {
+            out.push_str(&rest[..start + 2]);
+            rest = &rest[start + 2..];
+            continue;
+        };
+        out.push_str(&rest[..start]);
+        let label = if alt.trim().is_empty() {
+            url.rsplit('/').next().unwrap_or(url).to_string()
+        } else {
+            alt.replace("\\[", "[").replace("\\]", "]")
+        };
+        out.push_str(&format!("[image: {}]", label.trim()));
+        rest = &rest[start + len..];
+    }
+    out.push_str(rest);
+}
+
+/// `![alt](url "title")` at the start of `s`: the alt, the url, and the
+/// bytes it takes.
+fn parse_image(s: &str) -> Option<(&str, &str, usize)> {
+    let body = s.strip_prefix("![")?;
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    let mut depth = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 1,
+            b'[' => depth += 1,
+            b']' if depth == 0 => break,
+            b']' => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    let alt = body.get(..i)?;
+    let after = body.get(i + 1..)?.strip_prefix('(')?;
+    let close = after.find(')')?;
+    let dest = after[..close].trim();
+    let url = match dest.strip_prefix('<') {
+        Some(d) => d.split('>').next().unwrap_or(d),
+        None => dest.split_whitespace().next().unwrap_or(""),
+    };
+    Some((alt, url, 2 + i + 1 + 1 + close + 1))
+}
+
 /// Whether `item` is one link and nothing else: `issue:<id>`, `#<n>`, or an
 /// http(s) URL.
 fn is_bare_link(item: &str) -> bool {
@@ -473,6 +693,8 @@ mod tests {
             description: body.into(),
             links: links.into_iter().map(ChangelogLink::new).collect(),
             extra_links: vec![],
+            attachments: vec![],
+            dir: None,
         }
     }
 
@@ -637,6 +859,53 @@ mod tests {
     }
 
     #[test]
+    fn images_become_placeholders_outside_code() {
+        assert_eq!(
+            image_placeholders("Before.\n\n![Jobs sheet after](assets/e/jobs.png)\n"),
+            "Before.\n\n[image: Jobs sheet after]\n"
+        );
+        // No alt: the file name. Escaped brackets read plainly; a title is
+        // dropped with the destination.
+        assert_eq!(
+            image_placeholders("![](assets/e/a.png) and ![x \\[1\\]](<b c.png> \"t\")"),
+            "[image: a.png] and [image: x [1]]"
+        );
+        // Code is left as written, and so is a `![` that isn't an image.
+        let code = "`![a](b.png)`\n```\n![a](b.png)\n```\n![not an image\n";
+        assert_eq!(image_placeholders(code), code);
+    }
+
+    #[test]
+    fn image_sources_resolve_against_the_changelog_dir() {
+        let dir = std::env::temp_dir().join(format!("shelbi-app-cl-img-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets/e")).unwrap();
+        std::fs::write(dir.join("assets/e/a b.png"), b"x").unwrap();
+        let mut entry = view("e", "t", "", vec![]);
+        entry.dir = Some(dir.clone());
+        assert_eq!(
+            entry.image_source("assets/e/a%20b.png"),
+            ImageSource::File(dir.join("assets/e/a b.png"))
+        );
+        let abs = dir.join("assets/e/a b.png");
+        assert_eq!(
+            entry.image_source(&format!("file://{}", abs.display())),
+            ImageSource::File(abs.clone())
+        );
+        assert_eq!(
+            entry.image_source("assets/e/gone.png"),
+            ImageSource::Missing(dir.join("assets/e/gone.png"))
+        );
+        assert_eq!(
+            entry.image_source("https://x.dev/a.png"),
+            ImageSource::Web("https://x.dev/a.png".into())
+        );
+        // No directory here (a remote window): the alt text, no error.
+        entry.dir = None;
+        assert_eq!(entry.image_source("assets/e/a%20b.png"), ImageSource::Unavailable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_read_and_the_watch_follow_an_added_entry() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home: PathBuf = std::env::temp_dir().join(format!(
@@ -656,7 +925,7 @@ mod tests {
         let empty = read_changelog("p");
         assert!(empty.entries.is_empty() && empty.error.is_none());
 
-        changelog::add_entry(
+        let added = changelog::add_entry(
             "p",
             NewEntry {
                 title: "Changelog lands".into(),
@@ -670,10 +939,50 @@ mod tests {
         )
         .unwrap();
         assert!(watch.changed(), "an added entry is a change");
+        // Attach an image and a file: the image shows inline, the file is
+        // listed, and both resolve on this machine.
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("shot.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        std::fs::write(src.join("bench.csv"), "a,b\n").unwrap();
+        let files = changelog::prepare_attachments(&[
+            changelog::NewAttachment {
+                source: src.join("shot.png"),
+                kind: changelog::AttachmentKind::Image,
+                alt: Some("Sidebar".into()),
+            },
+            changelog::NewAttachment {
+                source: src.join("bench.csv"),
+                kind: changelog::AttachmentKind::File,
+                alt: None,
+            },
+        ])
+        .unwrap();
+        changelog::attach_files(&added, &files).unwrap();
         let read = read_changelog("p");
         assert_eq!(read.entries.len(), 1);
         let e = &read.entries[0];
         assert_eq!(e.title, "Changelog lands");
+        let listed: Vec<&str> = e.listed_attachments().map(|a| a.name.as_str()).collect();
+        assert_eq!(listed, ["bench.csv"]);
+        assert_eq!(e.attachments[1].size_label(), "4 B");
+        let dir = changelog::changelog_dir("p").unwrap();
+        assert_eq!(
+            e.attachment_file(&e.attachments[1]),
+            Some(dir.join(format!("assets/{}/bench.csv", e.id)))
+        );
+        assert_eq!(
+            e.image_source(&e.attachments[0].path),
+            ImageSource::File(dir.join(format!("assets/{}/shot.png", e.id)))
+        );
+        // Over the wire the directory stays behind: a remote window's entry
+        // keeps its attachments but resolves none of them.
+        let far: ChangelogEntryView =
+            serde_json::from_str(&serde_json::to_string(e).unwrap()).unwrap();
+        assert_eq!(far.attachments, e.attachments);
+        assert_eq!(far.dir, None);
+        assert_eq!(far.attachment_file(&far.attachments[1]), None);
+        assert_eq!(far.image_source(&far.attachments[0].path), ImageSource::Unavailable);
         // No GitHub repository for this project: the PR stays unresolved.
         let kinds: Vec<(LinkKind, &LinkTarget)> =
             e.links.iter().map(|l| (l.kind, &l.target)).collect();

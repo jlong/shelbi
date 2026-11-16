@@ -197,6 +197,7 @@ fn palette_search_corpus() -> shelbi_app::overlay::palette_search::SearchCorpus 
                 prs: vec![shelbi_state::changelog::PrRef::Number(pr)],
                 urls: vec![],
                 body: String::new(),
+                attachments: vec![],
                 path: Default::default(),
             },
             Some("jlong/shelbi"),

@@ -6,8 +6,8 @@ summary: Every project keeps a blog-style record of what has shipped. The orches
 
 A project's **Changelog** is the record of what has shipped: one entry per
 merged piece of work, newest first, each with a reader-facing title, the date,
-a short description, and links to the issue, the pull request, and any other
-page that matters. It answers "what landed this week?" for you on the
+a short description, links to the issue, the pull request, and any other
+page that matters, and any screenshots or files worth keeping with it. It answers "what landed this week?" for you on the
 Changelog page of the TUI and the desktop app, and for agents through
 [`shelbi changelog`](/docs/cli/changelog).
 
@@ -15,14 +15,17 @@ Changelog page of the TUI and the desktop app, and for agents through
 
 Open it with **Changelog** in the sidebar (or the palette). `n` / `p` step to
 the next and previous entry, `/` searches, and `Tab` steps through an entry's
-links; `Enter` follows one.
+attachments and links; `Enter` opens one. An image shows as `[image: <alt>]`
+where it sits.
 
 </Tui>
 <Desktop>
 
 Open it with **Changelog** in the sidebar (`⌘L`). `j` / `k` step to the next and
 previous entry, `⌘F` or `/` searches, and each entry's link chips open the
-issue on the board or the pull request in your browser.
+issue on the board or the pull request in your browser. Images show inline at
+the column's width with their caption, and an entry's attachments open in
+their default app.
 
 </Desktop>
 
@@ -70,6 +73,9 @@ The orchestrator writes each entry for people and agents reading it later:
   few bullets. Not a diff or a list of commits.
 - **Links**: the issue (`--issue`), the pull request (`--pr`) when there is
   one, and any other relevant page (`--link`).
+- **Attachments**: a screenshot (`--image`) when the merge visibly changes the
+  UI, and other artifacts a reader would want, such as a benchmark or a log
+  (`--attach`). See [images and attachments](/docs/cli/changelog#images-and-attachments).
 
 ## Features and subtasks
 
@@ -100,7 +106,9 @@ section on their next start: the [config upgrade](/docs/concepts/config-upgrade)
 pass appends it to orchestrator instructions that have no `## Changelog`
 heading and never mention `shelbi changelog add`, without changing anything
 else in the file. Instructions that already carry the rule, edited or not, are
-left alone.
+left alone. When the rule predates attachments, the orchestrator is asked to
+add the screenshot guidance to its own copy on its next start, keeping your
+edits.
 
 To change how each entry's description is laid out, edit the project's
 [changelog template](/docs/cli/changelog#the-template).

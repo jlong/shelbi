@@ -1869,6 +1869,7 @@ mod tests {
                 prs: vec![shelbi_state::changelog::PrRef::Number(pr)],
                 urls: vec![],
                 body: "The login form, rebuilt.".into(),
+                attachments: vec![],
                 path: Default::default(),
             },
             Some("jlong/shelbi"),

@@ -51,6 +51,20 @@
 //! the clients draw as chips. `{{links}}` still fills for a template that
 //! wants the list, and [`strip_link_list`] removes one that only repeats the
 //! frontmatter from an older entry.
+//!
+//! ## Attachments
+//!
+//! An entry can carry files: images, shown inline where the description
+//! references them, and any other file, listed under it. They live in
+//! `changelog/assets/<entry-id>/` and are recorded in the frontmatter's
+//! `attachments:`; see [`attachments`] for the layout and naming.
+
+pub mod attachments;
+
+pub use attachments::{
+    attach_files, attach_to_entry, format_size, prepare_attachments, Attachment, AttachmentKind, NewAttachment,
+    PreparedAttachment, StoredAttachment,
+};
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -377,6 +391,8 @@ struct Front {
     prs: Vec<PrRef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     links: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    attachments: Vec<Attachment>,
 }
 
 fn default_author() -> String {
@@ -399,6 +415,8 @@ pub struct ChangelogEntry {
     pub urls: Vec<String>,
     /// The description, in markdown.
     pub body: String,
+    /// Files from the frontmatter, paths relative to the changelog directory.
+    pub attachments: Vec<Attachment>,
     pub path: PathBuf,
 }
 
@@ -448,6 +466,17 @@ impl ChangelogEntry {
     pub fn matches(&self, query: &str, repo: Option<&str>) -> bool {
         matches_query(&self.title, &self.body, &self.links(repo), query)
     }
+
+    /// The changelog directory the entry's attachment paths are relative to.
+    pub fn dir(&self) -> &Path {
+        self.path.parent().unwrap_or(Path::new("."))
+    }
+
+    /// The attachments a reader of the rendered description would miss: every
+    /// file, and any image the description doesn't reference.
+    pub fn listed_attachments(&self) -> Vec<&Attachment> {
+        attachments::listed_attachments(&self.attachments, &self.body)
+    }
 }
 
 /// The search behind [`ChangelogEntry::matches`], over already-resolved
@@ -482,6 +511,7 @@ pub fn parse_entry(id: &str, path: &Path, text: &str) -> Result<ChangelogEntry> 
         prs: front.prs,
         urls: front.links,
         body: body.trim_end().to_string(),
+        attachments: front.attachments,
         path: path.to_path_buf(),
     })
 }
@@ -651,6 +681,7 @@ pub fn add_entry_in(
         issues,
         prs,
         links: urls,
+        attachments: Vec::new(),
     };
     let text = crate::render_frontmatter(&front, &body)?;
     let path = write_new_file(dir, &file_stem(date, &front.title), &text)?;

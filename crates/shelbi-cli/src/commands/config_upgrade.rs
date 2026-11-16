@@ -442,6 +442,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_reporting_subject(entry, &text, out);
         sniff_tracker_ownership_dispatch(entry, &text, out);
         sniff_orchestrator_changelog(entry, &text, out);
+        sniff_orchestrator_changelog_attachments(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
         sniff_orchestrator_awareness_variants(entry, &text, out);
         sniff_orchestrator_job_log(entry, &text, out);
@@ -1044,6 +1045,47 @@ fn sniff_orchestrator_changelog(entry: &InventoryEntry, text: &str, out: &mut Ve
             line: text.lines().count().max(1),
             column: 1,
         },
+    ));
+}
+
+/// The stable code for "the orchestrator's Changelog rule predates entry
+/// attachments".
+pub(crate) const ORCH_CHANGELOG_ATTACHMENTS_CODE: &str = "ORCH_CHANGELOG_ATTACHMENTS_MISSING";
+
+/// Flag orchestrator instructions whose Changelog rule (`shelbi changelog add`)
+/// predates attachments, so a merge that visibly changes the UI never gets a
+/// screenshot and relevant artifacts are never attached.
+///
+/// The `## Changelog` section is user-owned prose (its policy is meant to be
+/// edited), so the line can't be merged in mechanically: routed to
+/// [`Classification::NeedsJudgment`]. A copy without the rule is left to
+/// [`sniff_orchestrator_changelog`], whose append already carries the line. A
+/// copy that names `--image` or `changelog attach` anywhere never fires, so the
+/// sniff is idempotent.
+fn sniff_orchestrator_changelog_attachments(
+    entry: &InventoryEntry,
+    text: &str,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    if !text.contains(ORCH_CHANGELOG_COMMAND_MARKER)
+        || text.contains("--image")
+        || text.contains("changelog attach")
+    {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        ORCH_CHANGELOG_ATTACHMENTS_CODE,
+        "the orchestrator's Changelog rule predates entry attachments, so a merge that visibly \
+         changes the UI never gets a screenshot and useful artifacts are never attached",
+        "In the `## Changelog` section, after the Links bullet, add: when a merge visibly \
+         changes the UI, attach a screenshot with `--image <file>[:<alt>]` (shown inline, the \
+         alt text its caption); add other artifacts a reader would want (a benchmark, a log, a \
+         short video) with `--attach <file>`; both repeat, and `shelbi changelog attach \
+         <entry-id>` adds them to an entry already written. Mirror the shipped default \
+         template.",
+        locate_line_containing(text, ORCH_CHANGELOG_COMMAND_MARKER),
     ));
 }
 
@@ -3439,6 +3481,11 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              note that workers' jobs report to them can't be merged in mechanically without \
              risking local edits; the orchestrator refreshes its own copy instead."
         }
+        ORCH_CHANGELOG_ATTACHMENTS_CODE => {
+            "The `## Changelog` section is prose a project is meant to edit (its policy is \
+             user-owned), so the attachment guidance can't be merged in mechanically without \
+             risking local edits; the orchestrator refreshes its own copy instead."
+        }
         ORCH_JOB_ESTIMATE_CODE => {
             "These are prose instructions a project may have forked and customized, so the job \
              estimate guidance and the job `overdue` reaction rule can't be merged in \
@@ -5393,6 +5440,44 @@ mod tests {
         sniff_orchestrator_job_log(&orch_entry(), shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS, &mut out);
         assert!(find(&out, ORCH_JOB_LOG_CODE).is_none(), "{:?}", codes(&out));
         assert!(shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("shelbi job run"));
+    }
+
+    // ---- changelog attachments ---------------------------------------------
+
+    #[test]
+    fn a_changelog_rule_without_attachments_is_needs_judgment() {
+        let text = "# Orchestrator\n\n## Changelog\n\n    shelbi changelog add --title x\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_changelog_attachments(&orch_entry(), text, &mut out);
+        let f = find(&out, ORCH_CHANGELOG_ATTACHMENTS_CODE).expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert_eq!(f.location.line, 5);
+        assert!(!f.rationale.is_empty());
+        for clean in [
+            "## Changelog\n\n    shelbi changelog add --image shot.png\n",
+            "## Changelog\n\nRun shelbi changelog add, then shelbi changelog attach <id>.\n",
+            // No rule at all: the append sniffer owns it.
+            "# Orchestrator\n\nNo changelog here.\n",
+        ] {
+            let mut out = Vec::new();
+            sniff_orchestrator_changelog_attachments(&orch_entry(), clean, &mut out);
+            assert!(find(&out, ORCH_CHANGELOG_ATTACHMENTS_CODE).is_none(), "{clean}: {:?}", codes(&out));
+        }
+    }
+
+    /// Drift guard: the shipped template (and so the section the append heal
+    /// writes) carries the attachment guidance.
+    #[test]
+    fn shipped_orchestrator_does_not_trip_the_changelog_attachments_sniffer() {
+        let shipped = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        let mut out = Vec::new();
+        sniff_orchestrator_changelog_attachments(&orch_entry(), shipped, &mut out);
+        assert!(find(&out, ORCH_CHANGELOG_ATTACHMENTS_CODE).is_none(), "{:?}", codes(&out));
+        assert!(shipped_changelog_section().contains("--image <file>[:<alt>]"));
+        let healed = append_changelog_section("# Orchestrator\n\nDispatch.\n");
+        let mut out = Vec::new();
+        sniff_orchestrator_changelog_attachments(&orch_entry(), &healed, &mut out);
+        assert!(out.is_empty(), "{:?}", codes(&out));
     }
 
     // ---- job estimates ----------------------------------------------------
