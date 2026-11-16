@@ -19,12 +19,35 @@
 //! `Overdue`. Its Duration reads `4m 12s / 10m`; a finished job keeps its
 //! actual duration against the estimate as that text, with no bar.
 //!
-//! Clicking a row opens the job's sheet on the right, beside the table (the
-//! Workspace view's split, with its draggable divider): the job's label, its
-//! status and elapsed time, a running command's live terminal (watched, never
-//! typed into) or a finished one's saved output, and a Cancel button while it
-//! runs. Escape or ✕ closes it. The loads are
-//! [`shelbi_app::jobs::open_sheet`]'s, the TUI's too.
+//! Clicking a row opens the job's sheet, drawn exactly like the issue pane
+//! (the shared [`super::floating_pane`]): floating over the table's right,
+//! [`EDGE`](super::floating_pane::EDGE) in from the top, right and bottom,
+//! at the window's task pane width (its left edge resizes it, and the board's
+//! pane follows), sliding in and back out. The table keeps its full width,
+//! scroll and selection under it; clicking another row shows that job in the
+//! pane.
+//!
+//! ```text
+//! ┌ Jobs ──────────────────────────────────────────────────────┐
+//! │ j7 bundle …  running  4m 12s / 12m  ┌──────────────────────┐ │
+//! │ j6 checks …  overdue  …             │ j7 · bundle desktop ✕│ │
+//! │ (the table, full width under the    │ Status    ● Running  │ │
+//! │  pane, visible in its margins)      │ Duration  4m / 12m ▬ │ │
+//! │                                     │ Command   zsh -c …   │ │
+//! │                                     │ ┌ terminal ────────┐ │ │
+//! │                                     │ │ …                │ │ │
+//! │                                     │ └──────────────────┘ │ │
+//! │                                     │         [Cancel job] │ │
+//! │                                     └──────────────────────┘ │
+//! └────────────────────────────────────────────────────────────┘
+//! ```
+//!
+//! The Header reads `id · label`, then ✕. Under it, the job's Status (its
+//! glyph and tone) and Duration (with the estimate bar while it runs against
+//! one) and its Command as property rows, then a running command's live
+//! terminal (watched, never typed into) or a finished one's saved output in
+//! a framed well, and Cancel while it runs. Escape or ✕ closes it. The loads
+//! are [`shelbi_app::jobs::open_sheet`]'s, the TUI's too.
 //!
 //! The awareness store and the history have no change notification, so the
 //! view re-reads them every [`REFRESH_INTERVAL`] while it is open, off the UI
@@ -36,7 +59,7 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, AnyElement, ClickEvent, Context, Entity, FocusHandle, KeyDownEvent,
+    div, prelude::*, px, relative, AnyElement, ClickEvent, Context, Entity, EventEmitter, FocusHandle, KeyDownEvent,
     ScrollHandle, SharedString, Task, Window,
 };
 use shelbi_app::jobs::{
@@ -46,10 +69,13 @@ use shelbi_app::jobs::{
 use shelbi_app::source::{ProjectHandle, ProjectSource};
 
 use super::estimate_bar;
-use super::workspace_layout::{render_split, ShellSplit};
+use super::floating_pane::{
+    self, header_button, property_row, value_text, PaneFrame, PaneHost, PaneIds, PaneMotion, SlideOut, INSET,
+};
 use crate::assets::icons;
+use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::elements::terminal::{session as term_session, TerminalPane};
-use crate::theme::style::{self, ButtonKind, ButtonSize, IconButtonSize, Type, Typography};
+use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
 /// How often the view drains its refresher.
@@ -78,8 +104,11 @@ pub struct JobsView {
     model: JobsModel,
     /// The open job's sheet.
     sheet: Option<JobSheet>,
-    /// The table | sheet split.
-    split: ShellSplit,
+    /// A closed sheet sliding back out.
+    closing: SlideOut<JobSheet>,
+    /// The sheet's width (the window's task pane width) and a drag of its
+    /// edge.
+    pane_frame: PaneFrame,
     focus: FocusHandle,
     needs_focus: bool,
     refresher: shelbi_app::Refresher<JobsRead>,
@@ -87,6 +116,45 @@ pub struct JobsView {
     scroll: ScrollHandle,
     _poll: Task<()>,
 }
+
+/// Something the window acts on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum JobsEvent {
+    /// A drag of the sheet's left edge ended on this width: the window saves
+    /// it as its task pane width (`WindowState::task_pane_width`), which the
+    /// board's pane follows too.
+    PaneWidth(f32),
+}
+
+impl EventEmitter<JobsEvent> for JobsView {}
+
+impl PaneHost for JobsView {
+    fn pane_frame(&mut self) -> &mut PaneFrame {
+        &mut self.pane_frame
+    }
+
+    fn pane_resized(&mut self, width: f32, cx: &mut Context<Self>) {
+        cx.emit(JobsEvent::PaneWidth(width));
+    }
+}
+
+/// The sheet's ids: tests and the visual check find it by them.
+const IDS: PaneIds = PaneIds {
+    pane: "job-sheet",
+    closing: "job-sheet-closing",
+    resize: "job-sheet-resize",
+    inert: "job-sheet-inert",
+    slide_in: "job-sheet-in",
+    slide_out: "job-sheet-out",
+};
+
+/// The terminal well's corners.
+const WELL_RADIUS: f32 = 8.0;
+/// The terminal well's room around the grid.
+const WELL_PAD: f32 = 8.0;
+/// The Duration row's estimate bar.
+const BAR_W: f32 = 96.0;
+const BAR_THICK: f32 = 4.0;
 
 /// One job's side sheet.
 struct JobSheet {
@@ -128,7 +196,8 @@ impl JobsView {
             source,
             model: JobsModel::Loading,
             sheet: None,
-            split: ShellSplit::default(),
+            closing: SlideOut::default(),
+            pane_frame: PaneFrame::default(),
             focus: cx.focus_handle(),
             needs_focus: true,
             refresher,
@@ -146,6 +215,31 @@ impl JobsView {
 
     pub fn request_focus(&mut self) {
         self.needs_focus = true;
+    }
+
+    /// The window's saved task pane width, which the sheet shares.
+    pub fn set_pane_width(&mut self, width: f32, cx: &mut Context<Self>) {
+        if self.pane_frame.set_saved(width) {
+            cx.notify();
+        }
+    }
+
+    /// The sheet's chosen width.
+    #[cfg(test)]
+    pub fn pane_width(&self) -> f32 {
+        self.pane_frame.wanted()
+    }
+
+    /// Whether a closed sheet is still sliding out.
+    #[cfg(test)]
+    pub fn sheet_closing(&self) -> bool {
+        self.closing.get().is_some()
+    }
+
+    /// Open job `id`'s sheet, as a click on its row does.
+    #[cfg(any(test, feature = "visual-check"))]
+    pub fn open_job(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_sheet(id, window, cx);
     }
 
     /// What the view shows.
@@ -173,6 +267,12 @@ impl JobsView {
         self.tick(cx);
     }
 
+    /// Whether the open sheet has its terminal (loaded, not a message).
+    #[cfg(feature = "visual-check")]
+    pub fn sheet_has_terminal(&self) -> bool {
+        self.sheet.as_ref().is_some_and(|s| matches!(s.body, SheetBody::Terminal(_)))
+    }
+
     /// The open sheet's job and what its terminal shows (`None` while it
     /// loads or shows a message), for tests.
     #[cfg(test)]
@@ -185,6 +285,13 @@ impl JobsView {
         Some((sheet.id.clone(), text))
     }
 
+    /// The open sheet's Header title.
+    #[cfg(test)]
+    pub fn sheet_title(&self) -> Option<String> {
+        let row = self.sheet_row()?;
+        Some(format!("{} · {}", row.id, one_line(&row.description)))
+    }
+
     /// Ask for a read now.
     #[cfg(test)]
     pub fn refresh(&mut self) {
@@ -195,9 +302,15 @@ impl JobsView {
     /// Open job `id`'s sheet (replacing an open one) and load what it shows
     /// off the UI thread.
     fn open_sheet(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        // Its own row again: the sheet stays as it is.
+        if self.sheet.as_ref().is_some_and(|s| s.id == id) {
+            return;
+        }
         let Some(row) = self.model.rows().iter().find(|r| r.id == id).cloned() else {
             return;
         };
+        // A sheet opened while another slides out shows at once.
+        self.closing.clear();
         let (project, load_row) = (self.project.clone(), row.clone());
         let id = row.id.clone();
         let background = cx.background_executor().clone();
@@ -238,16 +351,25 @@ impl JobsView {
         cx.notify();
     }
 
+    /// Close the sheet (✕, Escape): it slides back out, inert.
     fn close_sheet(&mut self, cx: &mut Context<Self>) {
-        if self.sheet.take().is_some() {
-            self.needs_focus = true;
-            cx.notify();
-        }
+        let Some(sheet) = self.sheet.take() else {
+            return;
+        };
+        // A drag of its edge goes with it.
+        self.pane_frame.cancel_resize();
+        self.closing.start(sheet, |this: &mut Self| &mut this.closing, |_, _| {}, cx);
+        self.needs_focus = true;
+        cx.notify();
     }
 
     /// The open sheet's row, current from the model.
     fn sheet_row(&self) -> Option<&JobRow> {
-        let sheet = self.sheet.as_ref()?;
+        self.row_of(self.sheet.as_ref()?)
+    }
+
+    /// `sheet`'s row, current from the model.
+    fn row_of<'a>(&'a self, sheet: &'a JobSheet) -> Option<&'a JobRow> {
         Some(self.model.rows().iter().find(|r| r.id == sheet.id).unwrap_or(&sheet.opened))
     }
 
@@ -279,21 +401,26 @@ impl JobsView {
         cx.notify();
     }
 
-    /// The sheet: its header (the job's label and ✕), its status, the
-    /// terminal, and Cancel while the job runs.
+    /// The sheet, while one is open or sliding out: the floating pane with
+    /// its Header (`id · label`, ✕), the job's properties, the terminal,
+    /// and Cancel while the job runs.
     fn render_sheet(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let sheet = self.sheet.as_ref()?;
-        let row = self.sheet_row()?.clone();
-        let now = super::activity::now();
-        let status = if sheet.canceling && row.is_running() {
-            "● Canceling…".to_string()
-        } else {
-            row.sheet_status(now)
+        let (sheet, motion) = match (&self.sheet, self.closing.get()) {
+            (Some(sheet), _) => (sheet, PaneMotion::In),
+            (None, Some(sheet)) => (sheet, PaneMotion::Out),
+            (None, None) => return None,
         };
-        let close = style::icon_button("job-sheet-close", icons::X_MARK, IconButtonSize::Small, false, theme)
+        let row = self.row_of(sheet)?.clone();
+        // The pane floats over the table, so it paints from the opaque
+        // theme, as the issue pane does.
+        let theme = &theme.opaque();
+        let now = super::activity::now();
+        let close = header_button("job-sheet-close", icons::X_MARK, false, theme)
             .tooltip(style::tooltip("Close (Esc)"))
             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_sheet(cx)));
-        let body = match &sheet.body {
+        let title = format!("{} · {}", row.id, one_line(&row.description));
+        let header = floating_pane::header("job-sheet-title", title, vec![close.into_any_element()], theme);
+        let terminal = match &sheet.body {
             SheetBody::Loading => message_body("Loading…", theme),
             SheetBody::Message(m) => message_body(m, theme),
             SheetBody::Terminal(pane) => div()
@@ -305,6 +432,22 @@ impl JobsView {
                 .child(pane.clone())
                 .into_any_element(),
         };
+        // The terminal in its well: the terminal's own surface, framed.
+        let well = div()
+            .debug_selector(|| "job-sheet-well".into())
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .mx(px(INSET))
+            .overflow_hidden()
+            .rounded(px(WELL_RADIUS))
+            .border_1()
+            .border_color(theme.divider)
+            .bg(theme.terminal_canvas())
+            // The grid clear of the frame.
+            .p(px(WELL_PAD))
+            .child(terminal);
         let footer = row.can_cancel().then(|| {
             let button = if sheet.canceling {
                 style::disabled_button("job-sheet-cancel", CANCEL_LABEL, ButtonKind::Danger, ButtonSize::Small, theme)
@@ -317,60 +460,29 @@ impl JobsView {
                 .flex_row()
                 .flex_none()
                 .items_center()
+                .justify_end()
                 .gap_3()
-                .px_4()
-                .py_3()
-                .border_t_1()
-                .border_color(theme.divider)
-                .child(button)
+                .px(px(INSET))
+                .pt(px(16.0))
                 .when_some(sheet.cancel_error.clone(), |d, e| {
-                    d.child(div().min_w_0().truncate().type_style(Type::Small).text_color(theme.red).child(e))
+                    d.child(
+                        div().flex_1().min_w_0().truncate().type_style(Type::Small).text_color(theme.red).child(e),
+                    )
                 })
+                .child(button)
         });
-        Some(
-            div()
-                .debug_selector(|| "job-sheet".into())
-                .flex()
-                .flex_col()
-                .size_full()
-                .min_w_0()
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .flex_none()
-                        .items_center()
-                        .gap_2()
-                        .h(px(37.0))
-                        .pl_4()
-                        .pr_2()
-                        .child(
-                            div()
-                                .debug_selector(|| "job-sheet-title".into())
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .type_style(Type::BaseMedium)
-                                .text_color(theme.text_loud)
-                                .child(one_line(&row.description)),
-                        )
-                        .child(close),
-                )
-                .child(
-                    div()
-                        .debug_selector(|| "job-sheet-status".into())
-                        .flex_none()
-                        .px_4()
-                        .pb_2()
-                        .type_style(Type::Small)
-                        .text_color(theme.tone(row.status_tone_at(now)))
-                        .child(status),
-                )
-                .child(div().h(px(1.0)).flex_none().bg(theme.divider))
-                .child(body)
-                .children(footer)
-                .into_any_element(),
-        )
+        let body = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .pb(px(INSET))
+            .child(sheet_properties(&row, sheet.canceling, now, theme))
+            .child(well)
+            .children(footer)
+            .into_any_element();
+        Some(floating_pane::render(&self.pane_frame, IDS, motion, header, body, |pane, _| pane, theme, cx))
     }
 
     fn render_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
@@ -559,9 +671,6 @@ impl Render for JobsView {
         let summary = self.model.summary();
         let table = self.render_body(&theme, cx);
         let sheet = self.render_sheet(&theme, cx);
-        let body = render_split("jobs", &self.split, |this| &mut this.split, table, sheet, &theme, cx)
-            .flex_1()
-            .min_h_0();
         div()
             .id("jobs")
             .debug_selector(|| "jobs".into())
@@ -575,6 +684,7 @@ impl Render for JobsView {
                     cx.stop_propagation();
                 }
             }))
+            .relative()
             .flex()
             .flex_col()
             .size_full()
@@ -611,8 +721,83 @@ impl Render for JobsView {
                     }),
             )
             .child(div().h(px(1.0)).flex_none().bg(theme.divider))
-            .child(body)
+            // The table at its full width, whether or not the sheet is open:
+            // the sheet floats over it.
+            .child(div().flex().flex_col().flex_1().min_h_0().min_w_0().child(table))
+            .children(sheet)
     }
+}
+
+/// The sheet's properties, at the content's inset: Status (its glyph, in
+/// its tone), Duration (against the estimate, with its bar while the job
+/// runs against one) and Command (cut to one line, whole in a tooltip).
+fn sheet_properties(row: &JobRow, canceling: bool, now: chrono::DateTime<chrono::Utc>, theme: &Theme) -> AnyElement {
+    let status = if canceling && row.is_running() {
+        "● Canceling…".to_string()
+    } else {
+        row.status_glyph_label(now)
+    };
+    let duration_color = row.duration_tone(now).map_or(theme.foreground, |t| theme.tone(t));
+    let bar = row.bar(now).map(|bar| {
+        let fill = estimate_bar::fill_color(&bar, theme);
+        div()
+            .debug_selector(|| "job-sheet-bar".into())
+            .flex_none()
+            .w(px(BAR_W))
+            .h(px(BAR_THICK))
+            .rounded_full()
+            .bg(theme.search)
+            .child(div().h_full().w(relative(bar.fraction())).rounded_full().bg(fill))
+    });
+    let command = row.command.clone();
+    div()
+        .debug_selector(|| "job-sheet-properties".into())
+        .flex()
+        .flex_col()
+        .flex_none()
+        .gap(px(6.0))
+        .w_full()
+        .min_w_0()
+        .p(px(INSET))
+        .child(property_row(
+            theme,
+            "Status",
+            value_text(theme)
+                .debug_selector(|| "job-sheet-status".into())
+                .when(row.failed() || row.overdue(now), |d| d.type_style(Type::SmallMedium))
+                .text_color(theme.tone(row.status_tone_at(now)))
+                .child(status),
+        ))
+        .child(property_row(
+            theme,
+            "Duration",
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .min_w_0()
+                .child(
+                    value_text(theme)
+                        .debug_selector(|| "job-sheet-duration".into())
+                        .text_color(duration_color)
+                        .child(row.duration(now)),
+                )
+                .children(bar),
+        ))
+        .child(property_row(
+            theme,
+            "Command",
+            value_text(theme)
+                .id("job-sheet-command")
+                .debug_selector(|| "job-sheet-command".into())
+                .font_family(PRIMARY_FAMILY)
+                .text_size(px(12.0))
+                .line_height(px(18.0))
+                .tooltip(style::tooltip(command))
+                .child(one_line(&row.command)),
+        ))
+        .into_any_element()
 }
 
 /// A line in place of the sheet's terminal.
@@ -620,7 +805,7 @@ fn message_body(text: &str, theme: &Theme) -> AnyElement {
     div()
         .debug_selector(|| "job-sheet-message".into())
         .flex_1()
-        .p_4()
+        .p(px(4.0))
         .type_style(Type::Small)
         .text_color(theme.muted)
         .child(text.to_string())
@@ -630,6 +815,9 @@ fn message_body(text: &str, theme: &Theme) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::views::column_swap::SLIDE;
+    use crate::views::floating_pane::EDGE;
+    use crate::views::pane_width::DEFAULT_W;
     use chrono::{DateTime, Utc};
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use shelbi_app::jobs::{EMPTY_TEXT, REMOTE_TEXT};
@@ -844,6 +1032,13 @@ mod tests {
         vcx.run_until_parked();
     }
 
+    /// Let the sheet's slide in finish (it runs on the executor's clock).
+    fn slid_in(vcx: &mut VisualTestContext) {
+        vcx.executor().advance_clock(SLIDE);
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+
     /// Draw until the sheet's terminal shows `want`.
     fn sheet_shows(view: &Entity<JobsView>, cx: &mut VisualTestContext, want: &str) -> bool {
         for _ in 0..300 {
@@ -878,20 +1073,165 @@ mod tests {
 
         click(&mut vcx, "job-row-j4");
         assert!(sheet_shows(&view, &mut vcx, "test result: FAILED"), "the saved output shows");
-        let sheet = vcx.debug_bounds("job-sheet").expect("the sheet is drawn");
-        let row = vcx.debug_bounds("job-row-j4").unwrap();
-        assert!(sheet.left() >= row.right(), "the sheet sits beside the table");
+        assert!(vcx.debug_bounds("job-sheet").is_some(), "the sheet is drawn");
         assert!(vcx.debug_bounds("job-sheet-title").is_some() && vcx.debug_bounds("job-sheet-status").is_some());
         assert!(vcx.debug_bounds("job-sheet-cancel").is_none(), "a finished job has no Cancel");
 
         vcx.simulate_keystrokes("escape");
         vcx.run_until_parked();
         assert!(view.read_with(&vcx, |v, cx| v.sheet_text(cx)).is_none(), "Escape closes the sheet");
+        // It slides out, then goes.
+        assert!(view.read_with(&vcx, |v, _| v.sheet_closing()));
+        vcx.executor().advance_clock(SLIDE);
+        vcx.run_until_parked();
+        assert!(!view.read_with(&vcx, |v, _| v.sheet_closing()));
+        assert!(vcx.debug_bounds("job-sheet-closing").is_none());
 
         click(&mut vcx, "job-row-j4");
         assert!(sheet_shows(&view, &mut vcx, "running 3 tests"));
+        slid_in(&mut vcx);
         click(&mut vcx, "job-sheet-close");
         assert!(view.read_with(&vcx, |v, cx| v.sheet_text(cx)).is_none(), "✕ closes the sheet");
+        view.update(&mut vcx, |v, _| v.stop_workers());
+    }
+
+    fn two_finished_jobs() {
+        let now = Utc::now();
+        let record = |id: &str, label: &str, mins: i64| JobRecord {
+            exit_code: Some(0),
+            ..JobRecord::finished(
+                &job(id, JobKind::Command, "cargo test", Some(label), now - chrono::Duration::minutes(mins + 2)),
+                JobStatus::Ok,
+                now - chrono::Duration::minutes(mins),
+            )
+        };
+        record_finished_jobs(PROJECT, vec![record("j1", "site build", 9), record("j2", "desktop tests", 3)], now).unwrap();
+        write_log("j1", "built the site\n");
+        write_log("j2", "running 12 tests\n");
+    }
+
+    /// Click `selector`'s left end: what the floating sheet leaves uncovered.
+    fn click_left(vcx: &mut VisualTestContext, selector: &'static str) {
+        let b = vcx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector} drawn"));
+        vcx.simulate_click(gpui::point(b.left() + px(24.0), b.center().y), gpui::Modifiers::none());
+        vcx.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn the_sheet_floats_over_the_full_width_table_like_the_issue_pane(cx: &mut TestAppContext) {
+        let _home = shelbi_app::settings::agents::fixture::Home::new("dt-jobs-float", PROJECT, crate::test_env::lock());
+        two_finished_jobs();
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut vcx) = open(cx, shelbi_orchestrator::source::local_handle(PROJECT));
+        assert!(read_until(&view, &mut vcx, |m| m.rows().len() == 2));
+        let row_before = vcx.debug_bounds("job-row-j2").unwrap();
+
+        click(&mut vcx, "job-row-j2");
+        assert!(sheet_shows(&view, &mut vcx, "running 12 tests"));
+        let sheet = vcx.debug_bounds("job-sheet").expect("the sheet is drawn");
+        let root = vcx.debug_bounds("jobs").unwrap();
+        let edge = px(EDGE);
+        // The issue pane's place: EDGE in from the top, right and bottom, at
+        // the task pane's 640pt.
+        assert_eq!(sheet.top(), root.top() + edge, "{sheet:?}");
+        assert_eq!(sheet.right(), root.right() - edge, "{sheet:?}");
+        assert_eq!(sheet.bottom(), root.bottom() - edge, "{sheet:?}");
+        assert_eq!(sheet.size.width, px(DEFAULT_W));
+        // The table keeps its full width under it.
+        let row = vcx.debug_bounds("job-row-j2").unwrap();
+        assert_eq!(row, row_before, "the table doesn't narrow");
+        assert!(sheet.left() < row.right(), "the sheet covers the table's right");
+        let heading = vcx.debug_bounds("job-sheet-title").unwrap();
+        assert_eq!(heading.top() - sheet.top() + heading.size.height / 2.0, px(floating_pane::HEADER_H / 2.0));
+        let title = view.read_with(&vcx, |v, _| v.sheet_title());
+        assert_eq!(title.as_deref(), Some("j2 · desktop tests"), "the Header reads id · label");
+        assert!(vcx.debug_bounds("job-sheet-well").is_some_and(|w| w.left() > sheet.left() && w.right() < sheet.right()));
+
+        // Another row, where the sheet leaves it uncovered, shows that job.
+        click_left(&mut vcx, "job-row-j1");
+        assert!(sheet_shows(&view, &mut vcx, "built the site"), "the sheet follows the click");
+        assert_eq!(view.read_with(&vcx, |v, _| v.sheet_title()).as_deref(), Some("j1 · site build"));
+        assert_eq!(vcx.debug_bounds("job-sheet").unwrap(), sheet, "in the same place");
+        // Its own row again keeps it as it is.
+        click_left(&mut vcx, "job-row-j1");
+        assert_eq!(view.read_with(&vcx, |v, cx| v.sheet_text(cx)).map(|(id, _)| id).as_deref(), Some("j1"));
+
+        // Reduce Motion: closing leaves nothing sliding.
+        click(&mut vcx, "job-sheet-close");
+        assert!(!view.read_with(&vcx, |v, _| v.sheet_closing()));
+        assert!(vcx.debug_bounds("job-sheet").is_none() && vcx.debug_bounds("job-sheet-closing").is_none());
+        view.update(&mut vcx, |v, _| v.stop_workers());
+    }
+
+    #[gpui::test]
+    fn the_sheet_slides_in_and_back_out(cx: &mut TestAppContext) {
+        let _home = shelbi_app::settings::agents::fixture::Home::new("dt-jobs-slide", PROJECT, crate::test_env::lock());
+        two_finished_jobs();
+        let (view, mut vcx) = open(cx, shelbi_orchestrator::source::local_handle(PROJECT));
+        assert!(read_until(&view, &mut vcx, |m| m.rows().len() == 2));
+        let right = vcx.debug_bounds("jobs").unwrap().right() - px(EDGE);
+        let draw = |vcx: &mut VisualTestContext| {
+            vcx.update(|window, cx| window.draw(cx).clear(cx));
+        };
+
+        vcx.update(|window, cx| view.update(cx, |v, cx| v.open_job("j2", window, cx)));
+        draw(&mut vcx);
+        let start = vcx.debug_bounds("job-sheet").unwrap();
+        assert!(start.left() >= right, "it starts past the right edge: {start:?}");
+        vcx.executor().advance_clock(SLIDE / 2);
+        draw(&mut vcx);
+        let mid = vcx.debug_bounds("job-sheet").unwrap();
+        assert!(mid.left() < start.left() && mid.right() > right, "on its way in: {mid:?}");
+        vcx.executor().advance_clock(SLIDE);
+        draw(&mut vcx);
+        assert_eq!(vcx.debug_bounds("job-sheet").unwrap().right(), right, "in place");
+
+        vcx.simulate_keystrokes("escape");
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("job-sheet").is_none());
+        let leaving = vcx.debug_bounds("job-sheet-closing").expect("the closed sheet slides out");
+        assert_eq!(leaving.right(), right, "from where it was");
+        vcx.executor().advance_clock(SLIDE / 2);
+        draw(&mut vcx);
+        let out = vcx.debug_bounds("job-sheet-closing").unwrap();
+        assert!(out.left() > leaving.left(), "on its way out: {out:?}");
+        vcx.executor().advance_clock(SLIDE);
+        vcx.run_until_parked();
+        draw(&mut vcx);
+        assert!(vcx.debug_bounds("job-sheet-closing").is_none(), "then gone");
+        view.update(&mut vcx, |v, _| v.stop_workers());
+    }
+
+    #[gpui::test]
+    fn dragging_the_sheets_left_edge_resizes_it_and_reports_the_width(cx: &mut TestAppContext) {
+        let _home = shelbi_app::settings::agents::fixture::Home::new("dt-jobs-resize", PROJECT, crate::test_env::lock());
+        two_finished_jobs();
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut vcx) = open(cx, shelbi_orchestrator::source::local_handle(PROJECT));
+        let saved = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = saved.clone();
+        vcx.update(|_, cx| {
+            cx.subscribe(&view, move |_, ev: &JobsEvent, _| {
+                let JobsEvent::PaneWidth(w) = ev;
+                sink.borrow_mut().push(*w);
+            })
+            .detach()
+        });
+        // The window's saved width.
+        view.update(&mut vcx, |v, cx| v.set_pane_width(600.0, cx));
+        assert!(read_until(&view, &mut vcx, |m| m.rows().len() == 2));
+        click(&mut vcx, "job-row-j2");
+        assert_eq!(vcx.debug_bounds("job-sheet").unwrap().size.width, px(600.0), "the saved width");
+
+        let edge = vcx.debug_bounds("job-sheet-resize").unwrap().center();
+        let to = gpui::point(edge.x - px(100.0), edge.y);
+        vcx.simulate_mouse_down(edge, gpui::MouseButton::Left, gpui::Modifiers::none());
+        vcx.simulate_mouse_move(to, Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        vcx.simulate_mouse_up(to, gpui::MouseButton::Left, gpui::Modifiers::none());
+        vcx.run_until_parked();
+        assert_eq!(view.read_with(&vcx, |v, _| v.pane_width()), 700.0);
+        assert_eq!(vcx.debug_bounds("job-sheet").unwrap().size.width, px(700.0));
+        assert_eq!(*saved.borrow(), [700.0], "the window gets the new width");
         view.update(&mut vcx, |v, _| v.stop_workers());
     }
 
@@ -905,6 +1245,7 @@ mod tests {
         assert!(read_until(&view, &mut vcx, |m| m.rows().len() == 1));
         click(&mut vcx, "job-row-j6");
         assert!(sheet_shows(&view, &mut vcx, "step 1 of 3"));
+        slid_in(&mut vcx);
 
         click(&mut vcx, "job-sheet-cancel");
         assert!(

@@ -93,7 +93,9 @@
 //! components; `=issues` just the board, its states and the task pane;
 //! `=sidebar` just the sidebar's and the tab bar's states. `jobs` and
 //! `jobs-empty` are the Jobs screen with four running and two finished jobs,
-//! and with none (no frame; checked by eye); `=jobs` renders just those.
+//! and with none, and `jobs-sheet` the running bundle job's sheet floating
+//! over the table (no frame; checked by eye against the task pane);
+//! `=jobs` renders just those.
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -1332,6 +1334,32 @@ impl Run {
         let ids: Vec<String> = jobs.read_with(&self.cx, |v, _| v.model().rows().iter().map(|r| r.id.clone()).collect());
         self.expect("jobs: running newest first, then finished", ids == ["j7", "j6", "j5", "j4", "j3", "j2"]);
         self.save(handle, "jobs");
+
+        // The bundle job's sheet, floating over the table: its properties
+        // (an estimate bar a third full), its output so far, and Cancel.
+        let log = shelbi_state::awareness::job_output_path(PROJECT, "j7").expect("the output path");
+        std::fs::create_dir_all(log.parent().expect("the job dir")).expect("make the job dir");
+        std::fs::write(
+            &log,
+            "=== bundle desktop app\r\n   Compiling shelbi-desktop v0.42.0\r\n    Finished `release` profile [optimized] target(s) in 3m 41s\r\n    Bundling Shelbi.app\r\n",
+        )
+        .expect("write the fixture job output");
+        let handle = self.open();
+        self.click(handle, View::Jobs);
+        let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap().expect("the Jobs view");
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| jobs.read_with(cx, |v, _| v.model().rows().len() == 6));
+        self.expect("jobs-sheet: the jobs load", loaded);
+        handle
+            .update(&mut self.cx, |_, window, cx| jobs.update(cx, |v, cx| v.open_job("j7", window, cx)))
+            .unwrap();
+        let shown = self.wait(handle, Duration::from_secs(10), |cx| {
+            jobs.read_with(cx, |v, _| v.sheet_has_terminal())
+        });
+        self.expect("jobs-sheet: the sheet shows the job's output", shown);
+        // The slide runs on the executor's clock, not the one `settle` moves.
+        self.cx.advance_clock(crate::views::column_swap::SLIDE);
+        self.settle(handle);
+        self.save(handle, "jobs-sheet");
 
         set(Vec::new());
         let history = shelbi_state::awareness::job_history_path(PROJECT).expect("the history path");

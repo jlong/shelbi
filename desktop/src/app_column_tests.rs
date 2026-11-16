@@ -1112,6 +1112,28 @@ fn the_task_pane_resizes_over_the_review_and_the_workspace_and_the_window_keeps_
 }
 
 #[gpui::test]
+fn the_job_sheet_and_the_task_pane_share_the_windows_width(cx: &mut TestAppContext) {
+    use crate::views::floating_pane::PaneHost;
+    let mut c = Column::open_with(cx, |w| w.window_state.task_pane_width = 700.0);
+    let (issues, jobs) = c.update(|w, window, cx| (w.ensure_issues(window, cx), w.ensure_jobs(cx)));
+    assert_eq!(jobs.read_with(&c.h.cx, |v, _| v.pane_width()), 700.0, "the sheet opens at the window's width");
+
+    // A drag of the sheet's edge: the window keeps it, and the task pane
+    // takes it too.
+    jobs.update(&mut c.h.cx, |v, cx| v.pane_resized(820.0, cx));
+    c.h.cx.run_until_parked();
+    assert_eq!(c.read(|w, _| w.window_state.task_pane_width), 820.0);
+    assert_eq!(issues.read_with(&c.h.cx, |v, _| v.pane_width()), 820.0);
+
+    // And the other way round.
+    issues.update(&mut c.h.cx, |v, cx| v.pane_resized(660.0, cx));
+    c.h.cx.run_until_parked();
+    assert_eq!(c.read(|w, _| w.window_state.task_pane_width), 660.0);
+    assert_eq!(jobs.read_with(&c.h.cx, |v, _| v.pane_width()), 660.0);
+    jobs.update(&mut c.h.cx, |v, _| v.stop_workers());
+}
+
+#[gpui::test]
 fn the_detail_over_a_screen_goes_when_the_main_area_moves_on(cx: &mut TestAppContext) {
     let mut c = Column::open(cx);
     c.open_workspace();

@@ -145,7 +145,7 @@ use crate::views::sidebar_reveal::{self, SidebarReveal};
 use crate::views::issues::{IssuesEvent, IssuesView};
 use crate::views::pane_session::MainShows;
 use crate::views::session_view::SessionDeps;
-use crate::views::jobs::JobsView;
+use crate::views::jobs::{JobsEvent, JobsView};
 use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::changelog::{ChangelogEvent, ChangelogView};
 use crate::views::diff_view::DiffKeys;
@@ -3511,10 +3511,7 @@ impl ShelbiWindow {
             }
             // A drag of the task pane's edge ended: the window keeps the
             // width, like the sidebar's.
-            IssuesEvent::PaneWidth(width) => {
-                this.window_state.task_pane_width = *width;
-                this.schedule_save(cx);
-            }
+            IssuesEvent::PaneWidth(width) => this.pane_width_chosen(*width, cx),
         });
         self._view_subscriptions.push(sub);
         let sub = cx.observe_in(&issues, window, |this, _, window, cx| this.sync_detail_over(window, cx));
@@ -4235,15 +4232,35 @@ impl ShelbiWindow {
     }
 
     /// The Jobs screen for the window's project, created on first use. It
-    /// only reads: nothing it does reaches the window.
+    /// only reads; its sheet shares the task pane's width.
     fn ensure_jobs(&mut self, cx: &mut Context<Self>) -> Entity<JobsView> {
         if let Some(jobs) = &self.jobs {
             return jobs.clone();
         }
         let project = self.project_handle.clone();
         let jobs = cx.new(|cx| JobsView::new(&project, cx));
+        let pane_width = self.window_state.task_pane_width;
+        jobs.update(cx, |v, cx| v.set_pane_width(pane_width, cx));
+        let sub = cx.subscribe(&jobs, |this, _, ev: &JobsEvent, cx| match ev {
+            JobsEvent::PaneWidth(width) => this.pane_width_chosen(*width, cx),
+        });
+        self._view_subscriptions.push(sub);
         self.jobs = Some(jobs.clone());
         jobs
+    }
+
+    /// A drag of a floating pane's edge (the task pane, the job sheet) ended
+    /// on `width`: the window keeps it, like the sidebar's, and every pane
+    /// it shows takes it.
+    fn pane_width_chosen(&mut self, width: f32, cx: &mut Context<Self>) {
+        self.window_state.task_pane_width = width;
+        if let Some(issues) = &self.issues {
+            issues.update(cx, |v, cx| v.set_pane_width(width, cx));
+        }
+        if let Some(jobs) = &self.jobs {
+            jobs.update(cx, |v, cx| v.set_pane_width(width, cx));
+        }
+        self.schedule_save(cx);
     }
 
     /// The Changelog page for the window's project, created on first use.

@@ -2,18 +2,17 @@
 //! the right of the main area, after the Figma Task pane frames (In progress
 //! 2172:722, Ready to start 2573:10737).
 //!
-//! The pane isn't modal. It sits [`EDGE`] in from the main area's top, right
-//! and bottom (the user's chosen width at most, 640pt until they drag its
-//! left edge, narrower in a window that can't fit it; see
-//! [`super::pane_width`]), on an overlay layer over the board. The board
-//! runs at its full width under the pane (it shows in the pane's margins
-//! too), keeps its scroll and selection, and stays usable where the pane
-//! doesn't cover it: a click on another card shows that card here. The pane
-//! is opaque in every window, with Figma's `shadow/hard` drop over the board. It slides in from the right
-//! as it opens ([`SLIDE`], on the executor's clock, so tests can stop it and Reduce Motion
-//! shows it in place). Closing it, by any path, plays that in reverse ([`PaneMotion::Out`]):
-//! the view keeps the closed pane drawn, inert, for one [`SLIDE`] as it slides
-//! back out, then drops it. The same pane shows over Review and Workspace (their More), drawn
+//! The pane's chrome is the shared floating pane ([`super::floating_pane`],
+//! the job sheet's too): it isn't modal, sits [`EDGE`](super::floating_pane::EDGE) in from the main
+//! area's top, right and bottom at the user's width (640pt until they drag
+//! its left edge; see [`super::pane_width`]), on an overlay layer over the
+//! board. The board runs at its full width under the pane (it shows in the
+//! pane's margins too), keeps its scroll and selection, and stays usable
+//! where the pane doesn't cover it: a click on another card shows that card
+//! here. The pane is opaque in every window, with Figma's `shadow/hard` drop
+//! over the board, and slides in from the right as it opens and back out
+//! when it closes by any path ([`PaneMotion`]; Reduce Motion shows it in
+//! place). The same pane shows over Review and Workspace (their More), drawn
 //! by a floating board ([`IssuesView::open_task_over`]).
 //!
 //! Inside, a 12pt-cornered canvas with a divider edge and the frame's drop
@@ -63,9 +62,8 @@
 //! show in the same shell.
 
 use gpui::{
-    canvas, div, prelude::*, px, AnyElement, BoxShadow, ClickEvent, Context, CursorStyle,
-    DispatchPhase, Div, ElementId, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollHandle, SharedString,
-    Stateful, Window,
+    canvas, div, prelude::*, px, AnyElement, ClickEvent, Context, CursorStyle, Div, ElementId, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollHandle, SharedString, Stateful, Window,
 };
 use gpui_kit::base::TextView;
 use shelbi_app::issue_edit::{Field, Resolution, SaveStatus};
@@ -75,34 +73,21 @@ use shelbi_core::StatusCategory;
 use shelbi_state::keymap::PopoverAction;
 
 use super::board_state::{Mode, PaneAction, PaneProperties, Property, PropertyRow};
-use super::column_swap::SLIDE;
+use super::floating_pane::{self, header_button, property_row, value_text, PaneIds, INSET, RADIUS};
 use super::issues::IssuesView;
 use super::pane_session::PaneSession;
 use super::pane_split::{GRIP_H, GRIP_RADIUS, GRIP_W, HANDLE_H, SESSION_H, SESSION_HEADER_H};
 use super::sidebar::{render_glyph, review_glyph, workspace_glyph};
 use super::task_panel;
 use super::workflow_editor::{dropdown, MENU_W};
-use crate::app::RESIZE_GRAB;
-use crate::assets::{heroicon, icons, Icon};
-use crate::elements::clocked_animation::clocked_animation;
+use crate::assets::{heroicon, icons};
 use crate::elements::placed::MenuScroll;
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
-use crate::theme::motion::{ease_out_expo, ease_out_expo_reversed, fill_layer};
 use crate::theme::style::{self, ButtonContent, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
-/// The pane's room from the main area's top, right and bottom edges.
-pub const EDGE: f32 = 8.0;
-/// The pane's corners.
-const RADIUS: f32 = 12.0;
-/// The Header's height.
-const HEADER_H: f32 = 52.0;
-/// The content's inset and the gap between its sections.
-const INSET: f32 = 20.0;
-/// A property's label column.
-const LABEL_W: f32 = 108.0;
-/// A Header button (More, Close): 28pt, a 20pt icon.
-const HEADER_BUTTON: f32 = 28.0;
+pub use super::floating_pane::PaneMotion;
+
 
 /// What the pane shows.
 pub enum PaneContent<'a> {
@@ -134,17 +119,6 @@ impl PaneSnapshot {
     }
 }
 
-/// Which way the pane is moving.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PaneMotion {
-    /// The open pane: it slides in from the right as it first draws.
-    In,
-    /// A closed pane, the open slide played backwards (same [`SLIDE`], the
-    /// curve reversed): drawn inert, taking the pointer from nothing under
-    /// it and never the keys, until the view drops it.
-    Out,
-}
-
 /// The pane for task `id`, on its overlay layer over the main area.
 pub fn render(
     view: &IssuesView,
@@ -154,7 +128,6 @@ pub fn render(
     theme: &Theme,
     cx: &mut Context<IssuesView>,
 ) -> AnyElement {
-    let closing = motion == PaneMotion::Out;
     // The pane floats over what it covers (the board, or a live session
     // over Review and Workspace), so it paints from the opaque theme: on a
     // translucent window the board would otherwise show through it.
@@ -180,141 +153,19 @@ pub fn render(
             state_note(theme, "The board couldn't be read.", Some(e)).into_any_element()
         }
     };
-    // The chosen width; the row it sits in shrinks it in a main area too
-    // narrow for it.
-    let width = view.pane_width.wanted();
-    let selector = if closing { "task-pane-closing" } else { "task-pane" };
-    let pane = div()
-        .id(selector)
-        .debug_selector(move || selector.into())
-        .relative()
-        .flex()
-        .flex_col()
-        .h_full()
-        .w(px(width))
-        .min_w_0()
-        .overflow_hidden()
-        .bg(theme.canvas)
-        .rounded(px(RADIUS))
-        .shadow(pane_shadow(theme))
-        .type_style(Type::Base)
-        .text_color(theme.foreground)
-        // The board under the pane gets none of its pointer.
-        .occlude()
-        .child(header(view, title, theme, cx))
-        .child(body)
-        // The edge, drawn over the content inside the pane's bounds (Figma
-        // strokes inside), so it takes no room from the layout.
-        .child(
-            div()
-                .absolute()
-                .top_0()
-                .left_0()
-                .size_full()
-                .rounded(px(RADIUS))
-                .border_1()
-                .border_color(theme.divider),
-        )
-        .child(resize_handle(view, theme, cx))
-        // Sliding out, the pane's controls are past use: a cover over them
-        // takes the pointer, and the pane never takes the keys.
-        .when(closing, |pane| pane.child(div().id("task-pane-inert").absolute().top_0().left_0().size_full().occlude()));
-    let pane = if closing { pane } else { view.pane_focus(pane, cx) };
-    let travel = width + EDGE;
-    let pane = match motion {
-        // In from past the window's right edge.
-        PaneMotion::In => clocked_animation("task-pane-in", pane, SLIDE, ease_out_expo, move |pane, t| {
-            pane.left(px((1.0 - t) * travel))
-        })
-        .into_any_element(),
-        // Back out the way it came, along the same curve backwards.
-        PaneMotion::Out => clocked_animation("task-pane-out", pane, SLIDE, ease_out_expo_reversed, move |pane, t| {
-            pane.left(px(t * travel))
-        })
-        .into_any_element(),
-    };
-    div()
-        .absolute()
-        .top(px(EDGE))
-        .right(px(EDGE))
-        .bottom(px(EDGE))
-        .left(px(EDGE))
-        .flex()
-        .flex_row()
-        .justify_end()
-        .child(pane)
-        .when(!closing, |layer| layer.child(resize_probe(view, cx)))
-        .into_any_element()
+    let header = header(view, title, theme, cx);
+    floating_pane::render(&view.pane_frame, IDS, motion, header, body, |pane, cx| view.pane_focus(pane, cx), theme, cx)
 }
 
-/// The pane's left edge: the sidebar edge's grab room and cursor, laid over
-/// the pane's first points. A press starts a drag ([`resize_probe`] follows
-/// it); while it's on, a rule lights the edge between the corners, as the
-/// sidebar's edge lights.
-fn resize_handle(view: &IssuesView, theme: &Theme, cx: &mut Context<IssuesView>) -> Stateful<Div> {
-    div()
-        .id("task-pane-resize")
-        .debug_selector(|| "task-pane-resize".into())
-        .absolute()
-        .top_0()
-        .bottom_0()
-        .left_0()
-        .w(px(RESIZE_GRAB))
-        .cursor(CursorStyle::ResizeLeftRight)
-        .when(view.pane_resize.is_some(), |d| {
-            d.child(div().absolute().top(px(RADIUS)).bottom(px(RADIUS)).left_0().w(px(1.0)).bg(theme.icon))
-        })
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, ev: &MouseDownEvent, window, cx| {
-                this.start_pane_resize(ev.position.x.as_f32(), cx);
-                // The keys stay where they were (an editor keeps its caret).
-                window.prevent_default();
-                cx.stop_propagation();
-            }),
-        )
-}
-
-/// Measures the pane's layer for the drag, and while a drag of the pane's
-/// edge is on follows the pointer anywhere in the window until the button
-/// comes up (the pointer leaves the pane, and the layer, as it goes).
-fn resize_probe(view: &IssuesView, cx: &mut Context<IssuesView>) -> impl IntoElement {
-    let measured = cx.entity().downgrade();
-    let weak = cx.entity().downgrade();
-    let resizing = view.pane_resize.is_some();
-    canvas(
-        move |bounds, _, cx| {
-            let _ = measured.update(cx, |this, _| this.pane_layer = Some(bounds));
-        },
-        move |_, _, window, _| {
-            if !resizing {
-                return;
-            }
-            let moved = weak.clone();
-            window.on_mouse_event(move |e: &MouseMoveEvent, phase, _, cx| {
-                if phase == DispatchPhase::Bubble {
-                    let _ = moved.update(cx, |this, cx| this.drag_pane_edge(e.position.x.as_f32(), cx));
-                }
-            });
-            let up = weak.clone();
-            window.on_mouse_event(move |_: &MouseUpEvent, phase, _, cx| {
-                if phase == DispatchPhase::Bubble {
-                    let _ = up.update(cx, |this, cx| this.end_pane_resize(cx));
-                }
-            });
-        },
-    )
-    .absolute()
-    .top_0()
-    .left_0()
-    .size_full()
-}
-
-/// The frame's elevation over the board: Figma's `0 8 32` drop in
-/// `shadow/hard` (the `pane_shadow` role).
-fn pane_shadow(theme: &Theme) -> Vec<BoxShadow> {
-    vec![BoxShadow::new(px(0.0), px(8.0), theme.pane_shadow).blur_radius(style::figma_blur(32.0))]
-}
+/// The task pane's ids: tests and the visual check find it by them.
+const IDS: PaneIds = PaneIds {
+    pane: "task-pane",
+    closing: "task-pane-closing",
+    resize: "task-pane-resize",
+    inert: "task-pane-inert",
+    slide_in: "task-pane-in",
+    slide_out: "task-pane-out",
+};
 
 /// A workflow's name as the pane spells it (`task` → `Task`).
 fn workflow_label(name: &str) -> String {
@@ -365,53 +216,7 @@ fn header(view: &IssuesView, title: String, theme: &Theme, cx: &mut Context<Issu
     let close = header_button("pane-close", icons::X_MARK, false, theme)
         .tooltip(style::tooltip(format!("Close ({close_hint})")))
         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_pane(cx)));
-    div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .items_center()
-        .gap(px(8.0))
-        .h(px(HEADER_H))
-        .px(px(12.0))
-        // The pane's top corners: its overflow clip is square, so the band
-        // rounds its own fill (and its edge) to the pane's.
-        .rounded_t(px(RADIUS))
-        .bg(theme.toolbar)
-        // The Header's 1px canvas edge on its left.
-        .border_l_1()
-        .border_color(theme.canvas)
-        .child(
-            div()
-                .debug_selector(|| "pane-heading".into())
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .type_style(Type::BaseSemibold)
-                .text_color(theme.text_loud)
-                .child(title),
-        )
-        .child(div().flex().flex_row().flex_none().items_center().gap(px(4.0)).child(more).child(close))
-}
-
-/// A Header button: 28pt with 8pt corners, the 20pt icon in the icon role,
-/// a fill fading in (and a loud icon) on hover, held while `active`.
-fn header_button(id: &'static str, icon: Icon, active: bool, theme: &Theme) -> Stateful<Div> {
-    let radius = px(8.0);
-    let loud = theme.text_loud;
-    let rest = if active { theme.background_hover } else { theme.background.opacity(0.0) };
-    let d = div()
-        .id(id)
-        .debug_selector(move || id.into())
-        .group(id)
-        .flex()
-        .flex_none()
-        .items_center()
-        .justify_center()
-        .size(px(HEADER_BUTTON))
-        .rounded(radius)
-        .cursor_pointer();
-    fill_layer(d, id, radius, [rest, theme.background_hover, theme.background_active])
-        .child(heroicon(icon).text_color(theme.icon).group_hover(id, move |s| s.text_color(loud)))
+    floating_pane::header("pane-heading", title, vec![more.into_any_element(), close.into_any_element()], theme)
 }
 
 /// The More menu's rows in one scroll: each action and the key that does
@@ -819,38 +624,6 @@ fn properties(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Co
         ));
     }
     rows
-}
-
-/// A property row: 28pt, the label in its muted column, 12pt before the
-/// value.
-fn property_row(theme: &Theme, label: &'static str, value: impl IntoElement) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(12.0))
-        .min_h(px(28.0))
-        .w_full()
-        .min_w_0()
-        .child(
-            div()
-                .w(px(LABEL_W))
-                .flex_none()
-                .type_style(Type::Small)
-                .text_color(theme.muted)
-                .child(label),
-        )
-        .child(div().flex().flex_row().items_center().flex_1().min_w_0().child(value))
-}
-
-/// A text value, 8pt in so it lines up with the buttons' labels' edge.
-fn value_text(theme: &Theme) -> Div {
-    div()
-        .min_w_0()
-        .px(px(8.0))
-        .truncate()
-        .type_style(Type::Small)
-        .text_color(theme.foreground)
 }
 
 /// A property's value as the frames draw it (`2565:13093`): the Button at

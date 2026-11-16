@@ -65,9 +65,8 @@ use shelbi_app::issue_edit::{self, Field, SaveJob, SharedEdits};
 use super::doc_editor::layout::Field as DocField;
 use super::doc_editor::{DocEditor, DocEvent};
 use super::external_edit::{self, EditorEvent};
-use super::column_swap::SLIDE;
 use super::pane_session::{MainShows, PaneSession};
-use super::pane_width::PaneWidth;
+use super::floating_pane::{PaneFrame, PaneHost, SlideOut};
 use super::session_view::{SessionDeps, SessionView};
 use super::estimate_bar;
 use super::task_detail;
@@ -125,16 +124,6 @@ pub enum IssuesEvent {
     /// A drag of the task pane's left edge ended on this width: the window
     /// saves it (`WindowState::task_pane_width`).
     PaneWidth(f32),
-}
-
-/// A drag of the task pane's left edge: the width the pane showed and
-/// where the pointer pressed, and the width chosen before it (what decides
-/// whether there's a new one to save).
-#[derive(Debug, Clone, Copy)]
-pub(super) struct PaneResize {
-    from: f32,
-    press_x: f32,
-    before: f32,
 }
 
 /// The value a card drag carries.
@@ -285,17 +274,11 @@ pub struct IssuesView {
     /// The pane's live session, once the window hosts one
     /// ([`Self::host_sessions`]; offscreen boards have none).
     pub(super) pane_session: Option<PaneSession>,
-    /// The task pane's chosen width (`dt-task-pane-resize`).
-    pub(super) pane_width: PaneWidth,
-    /// A drag of the pane's left edge is on.
-    pub(super) pane_resize: Option<PaneResize>,
-    /// The pane's layer (the main area inside its insets), measured for the
-    /// drag.
-    pub(super) pane_layer: Option<gpui::Bounds<gpui::Pixels>>,
-    /// A closed pane sliding back out, drawn until its [`SLIDE`] is up.
-    pane_closing: Option<ClosingPane>,
-    /// Counts closes, so a slide's end drops only its own pane.
-    pane_closes: u64,
+    /// The task pane's chosen width and a drag of its edge
+    /// (`dt-task-pane-resize`).
+    pub(super) pane_frame: PaneFrame,
+    /// A closed pane sliding back out, drawn until its [`SLIDE`](super::column_swap::SLIDE) is up.
+    pane_closing: SlideOut<ClosingPane>,
     _subscriptions: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -366,11 +349,8 @@ impl IssuesView {
             display_style: DisplayStyle::detect(),
             floating: false,
             pane_session: None,
-            pane_width: PaneWidth::default(),
-            pane_resize: None,
-            pane_layer: None,
-            pane_closing: None,
-            pane_closes: 0,
+            pane_frame: PaneFrame::default(),
+            pane_closing: SlideOut::default(),
             _subscriptions: Vec::new(),
             _poll: poll,
         }
@@ -433,7 +413,7 @@ impl IssuesView {
         // Only a task the board has: a deleted or missing one shows none.
         let task = self.detail_model().map(|d| d.id).or_else(|| {
             self.pane_closing
-                .as_ref()
+                .get()
                 .filter(|c| matches!(c.snapshot, task_detail::PaneSnapshot::Task(_)))
                 .map(|c| c.id.clone())
         });
@@ -613,9 +593,7 @@ impl IssuesView {
 
     /// The window's saved task pane width.
     pub fn set_pane_width(&mut self, width: f32, cx: &mut Context<Self>) {
-        let width = PaneWidth::new(width);
-        if width != self.pane_width {
-            self.pane_width = width;
+        if self.pane_frame.set_saved(width) {
             cx.notify();
         }
     }
@@ -623,38 +601,7 @@ impl IssuesView {
     /// The task pane's chosen width.
     #[cfg(test)]
     pub fn pane_width(&self) -> f32 {
-        self.pane_width.wanted()
-    }
-
-    /// A press on the pane's left edge at `x`, in window coordinates, starts
-    /// a drag from the width the pane shows.
-    pub(super) fn start_pane_resize(&mut self, x: f32, cx: &mut Context<Self>) {
-        let wanted = self.pane_width.wanted();
-        let shown = self.pane_layer.map_or(wanted, |l| self.pane_width.shown(l.size.width.as_f32()));
-        self.pane_resize = Some(PaneResize { from: shown, press_x: x, before: wanted });
-        cx.notify();
-    }
-
-    /// Follow a drag of the pane's left edge to `x`, in window coordinates.
-    pub(super) fn drag_pane_edge(&mut self, x: f32, cx: &mut Context<Self>) {
-        let (Some(drag), Some(layer)) = (self.pane_resize, self.pane_layer) else {
-            return;
-        };
-        if self.pane_width.drag(drag.from, x - drag.press_x, layer.size.width.as_f32()) {
-            cx.notify();
-        }
-    }
-
-    /// The drag of the pane's edge ended: a new width goes to the window to
-    /// save.
-    pub(super) fn end_pane_resize(&mut self, cx: &mut Context<Self>) {
-        let Some(drag) = self.pane_resize.take() else {
-            return;
-        };
-        if self.pane_width.wanted() != drag.before {
-            cx.emit(IssuesEvent::PaneWidth(self.pane_width.wanted()));
-        }
-        cx.notify();
+        self.pane_frame.wanted()
     }
 
     /// Whether the view draws over another screen.
@@ -679,7 +626,7 @@ impl IssuesView {
             self.state.close_pane();
             // The screen it was over went away: so does the pane, at once.
             self.state.take_closed();
-            self.pane_closing = None;
+            self.pane_closing.clear();
         }
         cx.notify();
     }
@@ -687,17 +634,17 @@ impl IssuesView {
     /// Whether a pane closed over another screen is still sliding out (the
     /// window keeps this view laid over the main area until it is gone).
     pub fn closing_over(&self) -> bool {
-        self.pane_closing.as_ref().is_some_and(|c| c.over)
+        self.pane_closing.get().is_some_and(|c| c.over)
     }
 
     /// Whether a closed pane is still sliding out.
     #[cfg(test)]
     pub fn pane_closing(&self) -> bool {
-        self.pane_closing.is_some()
+        self.pane_closing.get().is_some()
     }
 
     /// A pane closed (by any path: [`BoardState::take_closed`]): keep it
-    /// drawn as it slides back out for one [`SLIDE`], then drop it. With
+    /// drawn as it slides back out for one [`SLIDE`](super::column_swap::SLIDE), then drop it. With
     /// Reduce Motion it goes at once, as it opens in place.
     fn note_pane_close(&mut self, cx: &mut Context<Self>) {
         let Some(id) = self.state.take_closed() else {
@@ -714,20 +661,8 @@ impl IssuesView {
                 None => task_detail::PaneSnapshot::Missing,
             },
         };
-        self.pane_closes += 1;
-        let close = self.pane_closes;
-        self.pane_closing = Some(ClosingPane { id, over: self.floating, snapshot, close });
-        cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(SLIDE).await;
-            let _ = this.update(cx, |this, cx| {
-                if this.pane_closing.as_ref().is_some_and(|c| c.close == close) {
-                    this.pane_closing = None;
-                    this.sync_session(false, cx);
-                    cx.notify();
-                }
-            });
-        })
-        .detach();
+        let closing = ClosingPane { id, over: self.floating, snapshot };
+        self.pane_closing.start(closing, |this: &mut Self| &mut this.pane_closing, |this, cx| this.sync_session(false, cx), cx);
     }
 
     /// Close the task pane (its Close, or Esc on it). An in-place edit with
@@ -2336,13 +2271,13 @@ impl IssuesView {
     fn render_detail(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         let Some(id) = self.state.detail_id().map(str::to_string) else {
             // A pane closed mid-drag (Esc) leaves no drag behind for the next.
-            self.pane_resize = None;
+            self.pane_frame.cancel_resize();
             // A closed pane sliding out.
-            let c = self.pane_closing.as_ref()?;
+            let c = self.pane_closing.get()?;
             return Some(task_detail::render(self, &c.id, c.snapshot.content(), task_detail::PaneMotion::Out, theme, cx));
         };
         // A pane opened while another slides out shows at once.
-        self.pane_closing = None;
+        self.pane_closing.clear();
         let model = self.detail_model();
         let content = match &model {
             Some(d) => task_detail::PaneContent::Task(d),
@@ -2356,6 +2291,17 @@ impl IssuesView {
     }
 }
 
+impl PaneHost for IssuesView {
+    fn pane_frame(&mut self) -> &mut PaneFrame {
+        &mut self.pane_frame
+    }
+
+    /// The window keeps the width, like the sidebar's.
+    fn pane_resized(&mut self, width: f32, cx: &mut Context<Self>) {
+        cx.emit(IssuesEvent::PaneWidth(width));
+    }
+}
+
 // ---- small pieces ------------------------------------------------------------
 
 /// A closed task pane sliding back out ([`task_detail::PaneMotion::Out`]).
@@ -2365,8 +2311,6 @@ struct ClosingPane {
     over: bool,
     /// What it showed, read once as it closed.
     snapshot: task_detail::PaneSnapshot,
-    /// Which close this is ([`IssuesView::pane_closes`]).
-    close: u64,
 }
 
 /// A fingerprint of a background read (its debug rendering hashed, off the
@@ -2579,6 +2523,7 @@ pub(super) fn centered(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::views::column_swap::SLIDE;
     use shelbi_app::issue_edit::SaveStatus;
 
     #[test]
@@ -2882,7 +2827,7 @@ mod tests {
         assert_eq!(bounds(&mut cx, "board-content"), board, "the board keeps its full width under the pane");
         // The pane lies on the board, 8pt in from its top, right and bottom,
         // so the board shows all around it but on the left.
-        let edge = px(task_detail::EDGE);
+        let edge = px(crate::views::floating_pane::EDGE);
         assert_eq!(pane.top() - board.top(), edge);
         assert_eq!(board.right() - pane.right(), edge);
         assert_eq!(board.bottom() - pane.bottom(), edge);
@@ -3117,7 +3062,7 @@ mod tests {
         // Left, far over the board (out of the pane and its layer), as far
         // as leaves some of the board.
         drag_edge(&mut cx, &[-300.0, -2000.0]);
-        let room = 1160.0 - 2.0 * task_detail::EDGE;
+        let room = 1160.0 - 2.0 * crate::views::floating_pane::EDGE;
         assert_eq!(bounds(&mut cx, "task-pane").size.width, px(room - BOARD_KEEP));
         assert_eq!(*saved.borrow(), vec![800.0, MIN_W, room - BOARD_KEEP]);
 
@@ -3134,7 +3079,7 @@ mod tests {
         let width = bounds(&mut cx, "task-pane").size.width;
         cx.simulate_mouse_move(gpui::point(px(100.0), edge.y), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
         assert_eq!(bounds(&mut cx, "task-pane").size.width, width, "the pointer moves nothing");
-        assert!(view.read_with(&cx, |v, _| v.pane_resize.is_none()));
+        assert!(view.read_with(&cx, |v, _| !v.pane_frame.resizing()));
     }
 
     #[gpui::test]

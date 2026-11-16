@@ -100,6 +100,7 @@ pub mod workspace_layout;
 pub mod external_edit;
 pub mod far_editor;
 pub mod feedback;
+pub mod floating_pane;
 pub mod harness_picker;
 pub mod new_task;
 pub mod font_picker;
