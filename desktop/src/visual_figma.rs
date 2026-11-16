@@ -96,6 +96,10 @@
 //! and with none, and `jobs-sheet` the running bundle job's sheet floating
 //! over the table (no frame; checked by eye against the task pane);
 //! `=jobs` renders just those.
+//! `reminders`, `reminders-sheet` and `reminders-empty` are the Reminders
+//! screen with three pending and two fired reminders, with a pending one's
+//! sheet open, and with none (checked by eye); `=reminders` renders just
+//! those.
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -1139,6 +1143,10 @@ impl Run {
             if let Some(v) = jobs {
                 v.update(&mut self.cx, |v, cx| v.poll(cx));
             }
+            let reminders = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap();
+            if let Some(v) = reminders {
+                v.update(&mut self.cx, |v, cx| v.poll(cx));
+            }
             self.now.set(self.now.get() + Duration::from_secs(1));
             self.cx
                 .update_window(window, |_, window, cx| window.draw(cx).clear(cx))
@@ -1372,6 +1380,83 @@ impl Run {
         });
         self.expect("jobs-empty: no jobs says so", empty);
         self.save(handle, "jobs-empty");
+    }
+
+    /// The Reminders screen (no Figma frame; checked by eye): `reminders`
+    /// with three pending reminders (one recurring), soonest first, then two
+    /// fired ones under `Fired`; `reminders-sheet` with the recurring one's
+    /// sheet open; `reminders-empty` once there are none. The store and the
+    /// history are written straight into the fixture project, as `shelbi
+    /// remind` and the hub would. `SHELBI_VISUAL_ONLY=reminders` renders
+    /// just these.
+    fn reminders(&mut self) {
+        use shelbi_state::awareness::{record_fired_reminders, update_awareness, FiredReminder, Reminder};
+        let now = pinned_now();
+        let reminder = |id: &str, text: &str, due_mins: i64, every_mins: Option<u64>| Reminder {
+            id: id.into(),
+            due_at: now + chrono::Duration::minutes(due_mins),
+            text: text.into(),
+            created_at: now - chrono::Duration::minutes(90),
+            every: every_mins.map(|m| std::time::Duration::from_secs(m * 60)),
+        };
+        let set = |reminders: Vec<Reminder>| {
+            update_awareness(PROJECT, |store| {
+                store.reminders = reminders;
+                Ok(())
+            })
+            .expect("write the fixture awareness store")
+        };
+        set(vec![
+            reminder("r12", "check PR #2311 CI", 14, None),
+            reminder("r9", "ask about the devbox relay before the release goes out to the tap", 120, Some(24 * 60)),
+            reminder("r14", "release tap", 20 * 60, None),
+        ]);
+        let fired = |r: Reminder| {
+            let at = r.due_at;
+            FiredReminder::fired(&r, at)
+        };
+        record_fired_reminders(
+            PROJECT,
+            vec![
+                fired(reminder("r8", "check deploy", -20, None)),
+                fired(reminder("r5", "nudge alpha", -180, Some(60))),
+            ],
+            now,
+        )
+        .expect("write the fixture reminder history");
+        let handle = self.open();
+        self.click(handle, View::Reminders);
+        let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 5));
+        self.expect("reminders: the five fixture reminders load", loaded);
+        let ids: Vec<String> = view.read_with(&self.cx, |v, _| v.model().rows().iter().map(|r| r.id.clone()).collect());
+        self.expect("reminders: pending soonest first, then fired", ids == ["r12", "r9", "r14", "r8", "r5"]);
+        self.save(handle, "reminders");
+
+        let handle = self.open();
+        self.click(handle, View::Reminders);
+        let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 5));
+        self.expect("reminders-sheet: the reminders load", loaded);
+        view.update(&mut self.cx, |v, cx| v.open_sheet_for_check("r9", cx));
+        self.settle(handle);
+        // The pane's slide runs on the executor's clock, not the one `settle`
+        // moves.
+        self.cx.advance_clock(crate::views::column_swap::SLIDE);
+        self.settle(handle);
+        self.save(handle, "reminders-sheet");
+
+        set(Vec::new());
+        let history = shelbi_state::awareness::reminder_history_path(PROJECT).expect("the history path");
+        let _ = std::fs::remove_file(history);
+        let handle = self.open();
+        self.click(handle, View::Reminders);
+        let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
+        let empty = self.wait(handle, Duration::from_secs(10), |cx| {
+            view.read_with(cx, |v, _| *v.model() == shelbi_app::reminders::RemindersModel::Empty)
+        });
+        self.expect("reminders-empty: no reminders says so", empty);
+        self.save(handle, "reminders-empty");
     }
 
     /// Save the window as `<screen>-<theme>.png` and close it.
@@ -2998,6 +3083,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "reminders") {
+            self.reminders();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "sidebar") {
             // Just the sidebar's and the tab bar's states.
             self.sidebar_states(&orch);
@@ -3166,6 +3256,8 @@ impl Run {
         }
 
         self.jobs();
+
+        self.reminders();
 
         self.settings();
 

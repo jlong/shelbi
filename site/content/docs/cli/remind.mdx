@@ -7,7 +7,7 @@ summary: Set reminders the hub delivers to the orchestrator as events when they 
 ```text
 shelbi remind in <DURATION> <TEXT>... [--every <DURATION>]
 shelbi remind at <TIME> <TEXT>... [--every <DURATION>]
-shelbi remind list [--json]
+shelbi remind list [--all] [--json]
 shelbi remind cancel <ID>
 ```
 
@@ -45,6 +45,16 @@ Due at a time: `15:00` (local time, tomorrow if it has already passed today),
 ## list
 
 Lists pending reminders, soonest first. `--json` prints them as JSON.
+
+`--all` (or `--history`) adds the reminders that have fired, newest first, from
+`~/.shelbi/projects/<project>/reminders/history.json`. Each firing is kept: a
+recurring reminder stays pending and also gets a fired entry every time it
+fires. The history keeps the newest 200 firings from the last 30 days. With
+`--json`, each entry carries a `status` of `pending` or `fired`.
+
+The desktop app and the TUI show the same list on the Reminders screen: open
+the command palette and type "reminders". Select a reminder to see its details
+and, while it is pending, cancel it.
 
 ## cancel
 

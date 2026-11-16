@@ -394,6 +394,8 @@ heroicons! {
     SIGNAL_SLASH = "signal-slash";
     ARROW_DOWN_CIRCLE = "arrow-down-circle";
     COMMAND_LINE = "command-line";
+    /// The Reminders screen's palette entry.
+    CLOCK = "clock";
     FOLDER = "folder";
     GLOBE_ALT = "globe-alt";
     /// The drawing `ARROW_DOWN_MENU` redraws on the 16pt grid; no view

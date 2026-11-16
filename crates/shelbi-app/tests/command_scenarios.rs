@@ -61,6 +61,7 @@ fn fixture() -> CommandModel {
             view("view:activity", "Activity", View::Activity),
             view("view:machines", "Machines", View::Machines),
             view("view:jobs", "Jobs", View::Jobs),
+            view("view:reminders", "Reminders", View::Reminders),
         ],
         workspaces: vec![WorkspaceItem {
             name: "alpha-1".into(),
@@ -332,6 +333,7 @@ fn every_command_kind_has_a_scenario() {
             "view:activity",
             "view:machines",
             "view:jobs",
+            "view:reminders",
             "action:toggle-zen",
             "workspace:alpha-1",
             "review:T-9",
@@ -371,6 +373,7 @@ fn nav_views_show_and_focus_the_main_area() {
         ("view:activity", View::Activity),
         ("view:machines", View::Machines),
         ("view:jobs", View::Jobs),
+        ("view:reminders", View::Reminders),
         ("view:orch", View::Session("orch".into())),
     ] {
         let mut s = Scenario::new();

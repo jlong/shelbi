@@ -2,11 +2,15 @@
 //! (`shelbi_state::awareness`). The hub poller writes a `reminder` line to
 //! `events.log` when one comes due, so the orchestrator is told instead of
 //! having to poll.
+//!
+//! Each firing is kept in the reminder history (`reminders/history.json`, the
+//! newest 200 within 30 days): `remind list --all` lists them after the
+//! pending reminders, mirroring `job list --all`.
 
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
 use clap::Subcommand;
-use shelbi_state::awareness::{self, Reminder};
+use shelbi_state::awareness::{self, FiredReminder, Reminder};
 
 use super::require_registered_project;
 
@@ -33,8 +37,12 @@ pub enum RemindCmd {
         #[arg(long, value_name = "DURATION")]
         every: Option<String>,
     },
-    /// List pending reminders, soonest first.
+    /// List pending reminders, soonest first. `--all` adds the ones that
+    /// fired (the newest 200 from the last 30 days), newest first.
     List {
+        /// Include fired reminders after the pending ones.
+        #[arg(long, visible_alias = "history")]
+        all: bool,
         /// Print them as JSON.
         #[arg(long)]
         json: bool,
@@ -55,13 +63,22 @@ pub fn run(project_opt: Option<String>, cmd: RemindCmd) -> Result<()> {
             let due = parse_at(&time, Local::now())?;
             add(&project, due, &text, every.as_deref())
         }
-        RemindCmd::List { json } => {
+        RemindCmd::List { all, json } => {
             let mut reminders = awareness::read_awareness(&project)
                 .map_err(|e| anyhow!(e))?
                 .reminders;
             reminders.sort_by_key(|r| r.due_at);
-            if json {
+            let fired = if all {
+                awareness::read_reminder_history(&project).map_err(|e| anyhow!(e))?
+            } else {
+                Vec::new()
+            };
+            if json && all {
+                println!("{}", serde_json::to_string_pretty(&list_json(&reminders, &fired)?)?);
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&reminders)?);
+            } else if all {
+                print!("{}", render_all(&reminders, &fired, Utc::now()));
             } else {
                 print!("{}", render_list(&reminders, Utc::now()));
             }
@@ -155,6 +172,58 @@ pub(crate) fn relative(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
     }
 }
 
+/// The `--all --json` list: each pending reminder with `"status":
+/// "pending"`, then each fired one with `"status": "fired"`.
+fn list_json(reminders: &[Reminder], fired: &[FiredReminder]) -> Result<serde_json::Value> {
+    let mut out = Vec::new();
+    for r in reminders {
+        let mut v = serde_json::to_value(r)?;
+        v["status"] = "pending".into();
+        out.push(v);
+    }
+    for r in fired {
+        let mut v = serde_json::to_value(r)?;
+        v["status"] = "fired".into();
+        out.push(v);
+    }
+    Ok(serde_json::Value::Array(out))
+}
+
+/// `remind list --all`: pending reminders soonest first, then fired ones
+/// newest first.
+fn render_all(reminders: &[Reminder], fired: &[FiredReminder], now: DateTime<Utc>) -> String {
+    if reminders.is_empty() && fired.is_empty() {
+        return "no reminders\n".into();
+    }
+    let every = |e: Option<std::time::Duration>| {
+        e.map(|e| format!("  (every {})", shelbi_core::format_duration(e))).unwrap_or_default()
+    };
+    let mut out = String::new();
+    for r in reminders {
+        out.push_str(&format!(
+            "{:<5} {:<7} {:<16} {:<14} {}{}\n",
+            r.id,
+            "pending",
+            local_stamp(r.due_at),
+            relative(r.due_at, now),
+            r.text,
+            every(r.every)
+        ));
+    }
+    for r in fired {
+        out.push_str(&format!(
+            "{:<5} {:<7} {:<16} {:<14} {}{}\n",
+            r.id,
+            "fired",
+            local_stamp(r.fired_at),
+            relative(r.fired_at, now),
+            r.text,
+            every(r.every)
+        ));
+    }
+    out
+}
+
 fn render_list(reminders: &[Reminder], now: DateTime<Utc>) -> String {
     if reminders.is_empty() {
         return "no pending reminders\n".into();
@@ -205,6 +274,40 @@ mod tests {
             local("2026-11-12T09:30:00Z").with_timezone(&Utc)
         );
         assert!(parse_at("soon", now).is_err());
+    }
+
+    #[test]
+    fn list_all_shows_pending_then_fired() {
+        let now = Utc::now();
+        let pending = Reminder {
+            id: "r9".into(),
+            due_at: now + chrono::Duration::minutes(14),
+            text: "check PR CI".into(),
+            created_at: now,
+            every: Some(std::time::Duration::from_secs(86_400)),
+        };
+        let one_shot = Reminder {
+            id: "r8".into(),
+            due_at: now - chrono::Duration::minutes(20),
+            text: "check deploy".into(),
+            created_at: now - chrono::Duration::hours(1),
+            every: None,
+        };
+        let fired = FiredReminder::fired(&one_shot, now - chrono::Duration::minutes(20));
+        let text = render_all(std::slice::from_ref(&pending), std::slice::from_ref(&fired), now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].starts_with("r9    pending") && lines[0].contains("in 14m"), "{text}");
+        assert!(lines[0].ends_with("check PR CI  (every 24h)"), "{text}");
+        assert!(lines[1].starts_with("r8    fired") && lines[1].contains("20m ago"), "{text}");
+        assert!(lines[1].ends_with("check deploy"), "{text}");
+        assert_eq!(render_all(&[], &[], now), "no reminders\n");
+
+        let json = list_json(&[pending], &[fired]).unwrap();
+        assert_eq!(json[0]["status"], "pending");
+        assert_eq!(json[1]["status"], "fired");
+        assert_eq!(json[1]["id"], "r8");
+        assert!(json[1]["fired_at"].is_string());
     }
 
     #[test]

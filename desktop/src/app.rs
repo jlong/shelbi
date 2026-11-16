@@ -146,6 +146,7 @@ use crate::views::issues::{IssuesEvent, IssuesView};
 use crate::views::pane_session::MainShows;
 use crate::views::session_view::SessionDeps;
 use crate::views::jobs::{JobsEvent, JobsView};
+use crate::views::reminders::{RemindersEvent, RemindersView};
 use crate::views::machines::{MachinesEvent, MachinesView};
 use crate::views::changelog::{ChangelogEvent, ChangelogView};
 use crate::views::diff_view::DiffKeys;
@@ -1260,6 +1261,9 @@ pub struct ShelbiWindow {
     machines: Option<Entity<MachinesView>>,
     /// The Jobs screen (palette-only), created the first time it is shown.
     jobs: Option<Entity<JobsView>>,
+    /// The Reminders screen (palette-only, found by typing), created the
+    /// first time it is shown.
+    reminders: Option<Entity<RemindersView>>,
     /// The Changelog page, created the first time it is shown.
     changelog: Option<Entity<ChangelogView>>,
     /// The open overlay (palette or dialog), mirrored in `client.overlay()`.
@@ -1555,6 +1559,7 @@ impl ShelbiWindow {
             || self.activity.is_some()
             || self.machines.is_some()
             || self.jobs.is_some()
+            || self.reminders.is_some()
             || self.changelog.is_some();
         if open {
             self.teardown_project(window, cx);
@@ -1783,6 +1788,7 @@ impl ShelbiWindow {
             prefetch_activity: false,
             machines: None,
             jobs: None,
+            reminders: None,
             changelog: None,
             overlay: None,
             palette_inputs: PaletteInputs::default(),
@@ -2045,7 +2051,9 @@ impl ShelbiWindow {
             view if is_chat(view) => notify::Showing::Orchestrator,
             View::Session(name) => notify::Showing::Workspace(name.clone()),
             View::Issues => notify::Showing::Board,
-            View::Changelog | View::Activity | View::Machines | View::Jobs => notify::Showing::Other,
+            View::Changelog | View::Activity | View::Machines | View::Jobs | View::Reminders => {
+                notify::Showing::Other
+            }
         }
     }
 
@@ -2483,6 +2491,9 @@ impl ShelbiWindow {
         }
         if let Some(jobs) = self.jobs.take() {
             jobs.update(cx, |v, _| v.stop_workers());
+        }
+        if let Some(reminders) = self.reminders.take() {
+            reminders.update(cx, |v, _| v.stop_workers());
         }
         if let Some(changelog) = self.changelog.take() {
             changelog.update(cx, |v, _| v.stop_workers());
@@ -3070,6 +3081,9 @@ impl ShelbiWindow {
                     }
                     View::Jobs => {
                         self.ensure_jobs(cx);
+                    }
+                    View::Reminders => {
+                        self.ensure_reminders(cx);
                     }
                     View::Session(_) => {}
                 }
@@ -4249,9 +4263,9 @@ impl ShelbiWindow {
         jobs
     }
 
-    /// A drag of a floating pane's edge (the task pane, the job sheet) ended
-    /// on `width`: the window keeps it, like the sidebar's, and every pane
-    /// it shows takes it.
+    /// A drag of a floating pane's edge (the task pane, the job and reminder
+    /// sheets) ended on `width`: the window keeps it, like the sidebar's,
+    /// and every pane it shows takes it.
     fn pane_width_chosen(&mut self, width: f32, cx: &mut Context<Self>) {
         self.window_state.task_pane_width = width;
         if let Some(issues) = &self.issues {
@@ -4260,7 +4274,28 @@ impl ShelbiWindow {
         if let Some(jobs) = &self.jobs {
             jobs.update(cx, |v, cx| v.set_pane_width(width, cx));
         }
+        if let Some(reminders) = &self.reminders {
+            reminders.update(cx, |v, cx| v.set_pane_width(width, cx));
+        }
         self.schedule_save(cx);
+    }
+
+    /// The Reminders screen for the window's project, created on first use.
+    /// It reads, and cancels through the window's source.
+    fn ensure_reminders(&mut self, cx: &mut Context<Self>) -> Entity<RemindersView> {
+        if let Some(reminders) = &self.reminders {
+            return reminders.clone();
+        }
+        let project = self.project_handle.clone();
+        let reminders = cx.new(|cx| RemindersView::new(&project, cx));
+        let pane_width = self.window_state.task_pane_width;
+        reminders.update(cx, |v, cx| v.set_pane_width(pane_width, cx));
+        let sub = cx.subscribe(&reminders, |this, _, ev: &RemindersEvent, cx| match ev {
+            RemindersEvent::PaneWidth(width) => this.pane_width_chosen(*width, cx),
+        });
+        self._view_subscriptions.push(sub);
+        self.reminders = Some(reminders.clone());
+        reminders
     }
 
     /// The Changelog page for the window's project, created on first use.
@@ -4397,6 +4432,11 @@ impl ShelbiWindow {
             View::Jobs if self.jobs.is_some() => {
                 if let Some(jobs) = &self.jobs {
                     jobs.update(cx, |v, _| v.request_focus());
+                }
+            }
+            View::Reminders if self.reminders.is_some() => {
+                if let Some(reminders) = &self.reminders {
+                    reminders.update(cx, |v, _| v.request_focus());
                 }
             }
             View::Changelog if self.changelog.is_some() => {
@@ -6117,6 +6157,7 @@ impl ShelbiWindow {
                     View::Activity => self.activity.clone().map(|v| v.into_any_element()),
                     View::Machines => self.machines.clone().map(|v| v.into_any_element()),
                     View::Jobs => self.jobs.clone().map(|v| v.into_any_element()),
+                    View::Reminders => self.reminders.clone().map(|v| v.into_any_element()),
                     View::Session(_) if is_chat(view) => match &self.onboarding {
                         Some(onboarding) => Some(onboarding.clone().into_any_element()),
                         None => self.chat.clone().map(|v| v.into_any_element()),
@@ -7177,6 +7218,11 @@ impl ShelbiWindow {
     /// The Jobs screen, once shown.
     pub(crate) fn offscreen_jobs(&self) -> Option<Entity<JobsView>> {
         self.jobs.clone()
+    }
+
+    /// The Reminders screen, once shown.
+    pub(crate) fn offscreen_reminders(&self) -> Option<Entity<RemindersView>> {
+        self.reminders.clone()
     }
 
     /// The native views shown so far.

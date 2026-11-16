@@ -36,7 +36,7 @@ pub use crate::job_exec::{job_of_session, job_session_name, run_job_exec};
 pub use crate::job_route::JobNotice;
 use crate::session_process_backend::SessionProcessBackend;
 use shelbi_state::awareness::{
-    self, overdue_interval, next_slot_after, AwarenessStore, Job, JobKind, JobRecord, JobResult,
+    self, overdue_interval, next_slot_after, AwarenessStore, FiredReminder, Job, JobKind, JobRecord, JobResult,
     JobStarter, JobStatus,
 };
 
@@ -216,9 +216,9 @@ fn tick_inner(
         .collect();
 
     let mut to_workers = Vec::new();
-    let finished = awareness::update_awareness(name, |store| {
+    let (finished, fired) = awareness::update_awareness(name, |store| {
         let mut reports = Reports { project: name, live_starters: &live_starters, to_workers: &mut to_workers };
-        fire_reminders(name, store, now);
+        let fired = fire_reminders(name, store, now);
         let finished = fire_jobs(&mut reports, store, &outcomes, now);
         // After the finished ones leave: a job that ends this tick reports
         // its end, not that it ran long.
@@ -226,7 +226,7 @@ fn tick_inner(
         if let Some(active) = &active {
             fire_estimates(name, store, active, now);
         }
-        Ok(finished)
+        Ok((finished, fired))
     })?;
     // Only once the store no longer lists them as due, so a report is handed
     // over once.
@@ -238,10 +238,17 @@ fn tick_inner(
     if let Err(e) = awareness::record_finished_jobs(name, finished, now) {
         tracing::warn!(project = name, error = %e, "finished jobs not recorded in the job history");
     }
+    if let Err(e) = awareness::record_fired_reminders(name, fired, now) {
+        tracing::warn!(project = name, error = %e, "fired reminders not recorded in the reminder history");
+    }
     Ok(())
 }
 
-fn fire_reminders(project: &str, store: &mut AwarenessStore, now: DateTime<Utc>) {
+/// Fire every due reminder: one `reminder` line each, then drop a one-shot
+/// one and move a recurring one to its next slot. Returns a history record
+/// per firing.
+fn fire_reminders(project: &str, store: &mut AwarenessStore, now: DateTime<Utc>) -> Vec<FiredReminder> {
+    let mut fired = Vec::new();
     store.reminders.retain_mut(|r| {
         if r.due_at > now {
             return true;
@@ -250,6 +257,7 @@ fn fire_reminders(project: &str, store: &mut AwarenessStore, now: DateTime<Utc>)
             tracing::warn!(project, reminder = %r.id, error = %e, "reminder event not written; retrying next tick");
             return true;
         }
+        fired.push(FiredReminder::fired(r, now));
         match r.every {
             Some(every) => {
                 r.due_at = next_slot_after(r.due_at, every, now);
@@ -258,6 +266,7 @@ fn fire_reminders(project: &str, store: &mut AwarenessStore, now: DateTime<Utc>)
             None => false,
         }
     });
+    fired
 }
 
 /// Where this tick's job reports go: the worker that started a job, while it
@@ -488,6 +497,7 @@ fn maybe_prune_job_history(
     state.last_prune = Some(Instant::now());
     let live: Vec<&str> = store.jobs.iter().map(|j| j.id.as_str()).collect();
     awareness::prune_job_history(project, &live, now);
+    awareness::prune_reminder_history(project, now);
     remove_job_sessions(project, |id| !live.contains(&id));
 }
 

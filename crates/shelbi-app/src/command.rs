@@ -444,7 +444,24 @@ fn view_description(view: &View) -> Option<&'static str> {
         View::Activity => Some("See what's happened recently"),
         View::Machines => Some("See the machines running your agents"),
         View::Jobs => Some("See the jobs Shelbi is watching"),
+        View::Reminders => Some("See the reminders Shelbi will deliver"),
         View::Session(_) => None,
+    }
+}
+
+/// Whether a nav view's palette entry waits for a query: left out of the
+/// palette's default (empty-query) list, found by typing. Only Reminders
+/// does: it is a rarely visited screen, so it doesn't crowd the default
+/// list, but `rem…` finds it. Every other view is listed up front.
+fn view_hidden_until_query(view: &View) -> bool {
+    match view {
+        View::Reminders => true,
+        View::Issues
+        | View::Changelog
+        | View::Activity
+        | View::Machines
+        | View::Jobs
+        | View::Session(_) => false,
     }
 }
 
@@ -485,7 +502,7 @@ impl CommandRegistry {
                 decoration: v.decoration.clone(),
                 subtitle: view_description(&v.view).map(str::to_string),
                 shortcut: None,
-                hidden_until_query: false,
+                hidden_until_query: view_hidden_until_query(&v.view),
             });
         }
 

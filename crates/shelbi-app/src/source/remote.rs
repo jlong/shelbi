@@ -376,6 +376,15 @@ impl ProjectSource for RemoteSource {
         Err(crate::jobs::REMOTE_TEXT.to_string())
     }
 
+    /// Like the jobs, the far reminders aren't read over the link yet.
+    fn reminders(&self) -> crate::reminders::RemindersRead {
+        crate::reminders::RemindersRead::Unavailable
+    }
+
+    fn cancel_reminder(&self, _id: &str) -> Result<(), String> {
+        Err(crate::reminders::REMOTE_TEXT.to_string())
+    }
+
     fn machine_reachability(&self, host: &str) -> Reachability {
         let query = Query::MachineReachability {
             project: self.name(),
