@@ -254,6 +254,7 @@ pub fn dispatch_view(view: &View, host: &mut impl CommandHost) {
         View::Activity => host.show_view(view),
         View::Machines => host.show_view(view),
         View::Jobs => host.show_view(view),
+        View::Reminders => host.show_view(view),
         View::Session(_) => host.show_view(view),
     }
 }
@@ -378,6 +379,7 @@ mod tests {
             (CommandKind::ShowView(View::Activity), "show:activity"),
             (CommandKind::ShowView(View::Machines), "show:machines"),
             (CommandKind::ShowView(View::Jobs), "show:jobs"),
+            (CommandKind::ShowView(View::Reminders), "show:reminders"),
             (CommandKind::ShowView(View::Session(s("orch"))), "show:orch"),
             (
                 CommandKind::FocusWorkspace {
@@ -515,6 +517,7 @@ mod tests {
                 "show:activity",
                 "show:machines",
                 "show:jobs",
+                "show:reminders",
                 "show:orch",
                 "error-log",
                 "settings",
@@ -583,6 +586,7 @@ mod tests {
             View::Activity,
             View::Machines,
             View::Jobs,
+            View::Reminders,
             View::Session("orch".into()),
             View::Session("alpha".into()),
         ] {

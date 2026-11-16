@@ -1489,6 +1489,9 @@ struct ShellState {
     machines: MachinesApp,
     /// The Jobs screen (palette-only), fed by the core snapshot.
     jobs: crate::jobs::JobsPage,
+    /// The Reminders screen (palette-only, found by typing), fed by the core
+    /// snapshot.
+    reminders: crate::reminders::RemindersPage,
     /// The Changelog page (the sidebar's Changelog row), fed by the
     /// changelog refresher.
     changelog: changelog::ChangelogPage,
@@ -1883,6 +1886,7 @@ impl ShellState {
             activity,
             machines,
             jobs: crate::jobs::JobsPage::default(),
+            reminders: crate::reminders::RemindersPage::default(),
             changelog: changelog::ChangelogPage::new(),
             changelog_issue_rx: None,
             issue_read_from: None,
@@ -2128,6 +2132,13 @@ impl ShellState {
             self.jobs.apply(jobs);
             // Repaint while it shows, so its "Started" ages tick over.
             if matches!(self.main_view, MainView::Native(View::Jobs)) {
+                self.dirty = true;
+            }
+        }
+        if let Some(reminders) = snap.reminders {
+            self.reminders.apply(reminders);
+            // Repaint while it shows, so its relative times tick over.
+            if matches!(self.main_view, MainView::Native(View::Reminders)) {
                 self.dirty = true;
             }
         }
@@ -2534,6 +2545,7 @@ impl ShellState {
             std::mem::replace(&mut self.machines, machines),
         );
         self.jobs = crate::jobs::JobsPage::default();
+        self.reminders = crate::reminders::RemindersPage::default();
         self.changelog = changelog::ChangelogPage::new();
         self.changelog_issue_rx = None;
         self.issue_read_from = None;
@@ -4648,9 +4660,12 @@ impl ShellState {
     /// "chat" and workspace session views bind a terminal view.
     fn show_view_effect(&mut self, v: View) {
         match v {
-            View::Issues | View::Changelog | View::Activity | View::Machines | View::Jobs => {
-                self.show(RowTarget::Native(v))
-            }
+            View::Issues
+            | View::Changelog
+            | View::Activity
+            | View::Machines
+            | View::Jobs
+            | View::Reminders => self.show(RowTarget::Native(v)),
             View::Session(name) if name == "orch" => {
                 self.show(RowTarget::Session(SessionRef::Orchestrator))
             }
@@ -5789,6 +5804,11 @@ impl ShellState {
                 self.dirty = true;
                 return;
             }
+            MainView::Native(View::Reminders) => {
+                self.handle_reminders_key(k);
+                self.dirty = true;
+                return;
+            }
             MainView::Native(View::Changelog) => {
                 let step = self.changelog.handle_key(k);
                 self.apply_changelog_step(step);
@@ -5979,6 +5999,53 @@ impl ShellState {
                     std::thread::spawn(move || {
                         if let Err(e) = shelbi_orchestrator::awareness::cancel_job(&project, &id) {
                             tracing::warn!(project, job = %id, error = %e, "canceling the job failed");
+                        }
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The Reminders screen's keys: select (the open sheet follows), Enter
+    /// opens the sheet, Esc closes it, `c` cancels the sheet's pending
+    /// reminder.
+    fn handle_reminders_key(&mut self, k: KeyEvent) {
+        // Global quit/palette chords are swallowed (the shell owns them).
+        let chord = crate::keymap::chord_from_event(k);
+        if chord.and_then(|c| self.keymaps.global.dispatch(c)).is_some() {
+            return;
+        }
+        match k.code {
+            // With the sheet open, it follows the selection to the next
+            // reminder.
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.reminders.nav_up();
+                self.reminders.follow_selection();
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.reminders.nav_down();
+                self.reminders.follow_selection();
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.reminders.nav_first();
+                self.reminders.follow_selection();
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.reminders.nav_last();
+                self.reminders.follow_selection();
+            }
+            KeyCode::Enter => self.reminders.open_sheet(),
+            KeyCode::Esc if self.reminders.sheet_open() => self.reminders.close_sheet(),
+            KeyCode::Char('c') => {
+                if let (Some(project), Some(id)) =
+                    (self.client.project().map(str::to_string), self.reminders.take_cancel())
+                {
+                    // `shelbi remind cancel`, off the UI thread: the row
+                    // goes on the next refresh, and its sheet with it.
+                    std::thread::spawn(move || {
+                        if let Err(e) = shelbi_app::reminders::cancel_local(&project, &id) {
+                            tracing::warn!(project, reminder = %id, error = %e, "canceling the reminder failed");
                         }
                     });
                 }
@@ -6310,6 +6377,15 @@ impl ShellState {
                 self.dirty = true;
                 return;
             }
+            MainView::Native(View::Reminders) => {
+                match m.kind {
+                    MouseEventKind::ScrollUp => self.reminders.nav_up(),
+                    MouseEventKind::ScrollDown => self.reminders.nav_down(),
+                    _ => {}
+                }
+                self.dirty = true;
+                return;
+            }
             MainView::Native(View::Changelog) => {
                 let step = self.changelog.handle_mouse(m, self.main_rect);
                 self.apply_changelog_step(step);
@@ -6576,6 +6652,7 @@ where
     let activity = &mut state.activity;
     let machines = &mut state.machines;
     let jobs = &mut state.jobs;
+    let reminders = &mut state.reminders;
     let changelog = &mut state.changelog;
     let onboarding = &mut state.onboarding;
     let sessions = &state.sessions;
@@ -6602,6 +6679,9 @@ where
             }
             MainView::Native(View::Jobs) => {
                 crate::jobs::render_full(frame, jobs, main_rect, chrono::Utc::now(), truecolor)
+            }
+            MainView::Native(View::Reminders) => {
+                crate::reminders::render_full(frame, reminders, main_rect, chrono::Utc::now())
             }
             _ => {}
         }
@@ -6909,9 +6989,12 @@ fn row_target_to_view(target: &RowTarget) -> Option<View> {
 /// `View::Session` names the session to bind (`orch` is the orchestrator chat).
 fn view_to_row_target(view: &View) -> RowTarget {
     match view {
-        View::Issues | View::Changelog | View::Activity | View::Machines | View::Jobs => {
-            RowTarget::Native(view.clone())
-        }
+        View::Issues
+        | View::Changelog
+        | View::Activity
+        | View::Machines
+        | View::Jobs
+        | View::Reminders => RowTarget::Native(view.clone()),
         View::Session(name) if name == ORCH_VIEW => RowTarget::Session(SessionRef::Orchestrator),
         View::Session(name) => RowTarget::Session(SessionRef::Workspace(name.clone())),
     }
@@ -7174,6 +7257,8 @@ fn read_snapshot(project: &str, _generation: u64) -> ShellSnapshot {
         // appears (and moves to Finished) on the shell's refresh without a
         // poll of its own.
         jobs: Some(shelbi_app::jobs::read_local(project)),
+        // The Reminders screen's two small files, the same way.
+        reminders: Some(shelbi_app::reminders::read_local(project)),
     }
 }
 
@@ -7404,6 +7489,7 @@ mod tests {
                 activity: None,
                 machines: None,
                 jobs: None,
+                reminders: None,
             });
             // The activity refresher tags its read with the project, so a test can
             // read back (via `latest_activity`) which project it followed.
@@ -7452,6 +7538,7 @@ mod tests {
             activity: None,
             machines: None,
             jobs: None,
+            reminders: None,
         }
     }
 
@@ -7509,6 +7596,7 @@ mod tests {
             activity: None,
             machines: None,
             jobs: None,
+            reminders: None,
         });
         st
     }
@@ -7927,6 +8015,7 @@ mod tests {
             activity: None,
             machines: None,
             jobs: Some(JobsRead::Jobs { running: jobs, finished: vec![] }),
+            reminders: None,
         };
         let job = Job {
             id: "j1".into(),
@@ -7950,6 +8039,72 @@ mod tests {
         let screen = screen_text(&term);
         assert!(screen.contains(EMPTY_TEXT), "{screen}");
         assert!(!screen.contains("sleep 60"), "{screen}");
+    }
+
+    #[test]
+    fn reminders_waits_for_a_query_in_the_palette_then_opens_its_screen() {
+        use shelbi_app::reminders::{RemindersRead, EMPTY_TEXT};
+        use shelbi_state::awareness::{FiredReminder, Reminder};
+        let mut st = test_state();
+        st.open_palette();
+        {
+            let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+                panic!("the palette is open");
+            };
+            let blank: Vec<String> = p.results().into_iter().map(|(e, _)| e.id).collect();
+            assert!(!blank.contains(&"view:reminders".to_string()), "not in the default list: {blank:?}");
+            assert!(blank.contains(&"view:jobs".to_string()), "the other views are: {blank:?}");
+        }
+        for c in "rem".chars() {
+            type_key(&mut st, c);
+        }
+        let Some(ActiveOverlay::Palette(p)) = &st.overlay else {
+            panic!("the palette is open");
+        };
+        assert_eq!(p.results()[p.selected()].0.id, "view:reminders", "typing rem offers Reminders first");
+        press(&mut st, KeyCode::Enter);
+        assert!(matches!(st.main_view, MainView::Native(View::Reminders)));
+        assert_eq!(st.client.view(), &View::Reminders);
+
+        // A reminder lands on the shell's refresh, fires, and goes.
+        let snapshot = |read: RemindersRead| ShellSnapshot {
+            sidebar: None,
+            board: None,
+            activity: None,
+            machines: None,
+            jobs: None,
+            reminders: Some(read),
+        };
+        let now = chrono::Utc::now();
+        let reminder = Reminder {
+            id: "r1".into(),
+            due_at: now + chrono::Duration::minutes(30),
+            text: "check the tap PR".into(),
+            created_at: now,
+            every: None,
+        };
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        st.apply_snapshot(snapshot(RemindersRead::Reminders { pending: vec![reminder.clone()], fired: vec![] }));
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("check the tap PR") && screen.contains("Pending"), "{screen}");
+        assert!(screen.contains("in 29m") || screen.contains("in 30m"), "{screen}");
+        // Enter opens its sheet; c asks for the cancel.
+        press(&mut st, KeyCode::Enter);
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains("c cancel reminder"), "{}", screen_text(&term));
+        press(&mut st, KeyCode::Esc);
+        assert!(!st.reminders.sheet_open());
+        st.apply_snapshot(snapshot(RemindersRead::Reminders {
+            pending: vec![],
+            fired: vec![FiredReminder::fired(&reminder, now)],
+        }));
+        draw_frame(&mut term, &mut st).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("Fired") && screen.contains("fired just now"), "{screen}");
+        st.apply_snapshot(snapshot(RemindersRead::Reminders { pending: vec![], fired: vec![] }));
+        draw_frame(&mut term, &mut st).unwrap();
+        assert!(screen_text(&term).contains(EMPTY_TEXT), "{}", screen_text(&term));
     }
 
     #[test]
@@ -9003,6 +9158,7 @@ mod tests {
             activity: None,
             machines: None,
             jobs: None,
+            reminders: None,
         });
         assert_eq!(
             st.workspace.as_ref().unwrap().header_status_text(),
@@ -9020,6 +9176,7 @@ mod tests {
             activity: None,
             machines: None,
             jobs: None,
+            reminders: None,
         });
         assert_eq!(
             st.workspace.as_ref().unwrap().header_status_text(),
@@ -10467,7 +10624,7 @@ mod tests {
             ProjectWorkers {
                 refresher: refresh::spawn(move |_g| {
                     w1();
-                    ShellSnapshot { sidebar: None, board: None, activity: None, machines: None, jobs: None }
+                    ShellSnapshot { sidebar: None, board: None, activity: None, machines: None, jobs: None, reminders: None }
                 }),
                 activity_refresher: refresh::spawn(move |_g| {
                     w2();
@@ -13977,6 +14134,7 @@ workspaces:
                     activity: None,
                     machines: None,
                     jobs: None,
+                    reminders: None,
                 }),
                 activity_refresher: refresh::spawn(|_g| ActivityData::tagged_for_test("x")),
                 closed_refresher: refresh::spawn(|_g| None),

@@ -118,6 +118,11 @@ fn a_reminder_fires_once_when_due_and_leaves_the_store() {
         [r#"project=demo reminder id=r1 text="check the tap PR merged""#]
     );
     assert!(store().reminders.is_empty());
+    // The firing is remembered in the history.
+    let history = awareness::read_reminder_history(P).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!((history[0].id.as_str(), history[0].text.as_str()), ("r1", "check the tap PR merged"));
+    assert_eq!((history[0].due_at, history[0].fired_at), (at(2), at(2)));
 }
 
 #[test]
@@ -139,6 +144,15 @@ fn a_reminder_missed_while_the_daemon_was_down_fires_once_and_a_recurring_one_re
     assert_eq!(events().len(), 2);
     run(&mut state, at(40), &probe);
     assert_eq!(events().len(), 3);
+    // Each firing has a record, the recurring one's two slots apart, newest
+    // first; the recurring reminder is still pending as well.
+    let history: Vec<(String, DateTime<Utc>)> = awareness::read_reminder_history(P)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.id, r.due_at))
+        .collect();
+    assert_eq!(history, [("r2".to_string(), at(40)), ("r2".to_string(), at(0)), ("r1".to_string(), at(0))]);
+    assert_eq!(store().reminders.len(), 1);
 }
 
 fn command_job() -> String {

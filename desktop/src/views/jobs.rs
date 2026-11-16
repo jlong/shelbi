@@ -72,10 +72,11 @@ use super::estimate_bar;
 use super::floating_pane::{
     self, header_button, property_row, value_text, PaneFrame, PaneHost, PaneIds, PaneMotion, SlideOut, INSET,
 };
+use super::list_screen::{self, ROW_RADIUS};
 use crate::assets::icons;
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::elements::terminal::{session as term_session, TerminalPane};
-use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
+use crate::theme::style::{self, Type, Typography};
 use crate::theme::Theme;
 
 /// How often the view drains its refresher.
@@ -87,12 +88,7 @@ const STATUS_W: f32 = 120.0;
 /// Wide enough for elapsed against an estimate (`1h 4m / 1h 30m`).
 const DURATION_W: f32 = 116.0;
 
-/// A row's corner radius; a running row's estimate bar follows it.
-const ROW_RADIUS: f32 = 6.0;
 const FINISHED_W: f32 = 160.0;
-
-/// The gap between columns.
-const COLUMN_GAP: f32 = 20.0;
 
 /// A Description longer than this many characters may not fit its column:
 /// it gets a tooltip with the whole text.
@@ -449,27 +445,14 @@ impl JobsView {
             .p(px(WELL_PAD))
             .child(terminal);
         let footer = row.can_cancel().then(|| {
-            let button = if sheet.canceling {
-                style::disabled_button("job-sheet-cancel", CANCEL_LABEL, ButtonKind::Danger, ButtonSize::Small, theme)
-            } else {
-                style::button("job-sheet-cancel", CANCEL_LABEL, ButtonKind::Danger, ButtonSize::Small, false, theme)
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)))
-            };
-            div()
-                .flex()
-                .flex_row()
-                .flex_none()
-                .items_center()
-                .justify_end()
-                .gap_3()
-                .px(px(INSET))
-                .pt(px(16.0))
-                .when_some(sheet.cancel_error.clone(), |d, e| {
-                    d.child(
-                        div().flex_1().min_w_0().truncate().type_style(Type::Small).text_color(theme.red).child(e),
-                    )
-                })
-                .child(button)
+            list_screen::action(
+                "job",
+                CANCEL_LABEL,
+                sheet.canceling,
+                sheet.cancel_error.clone(),
+                cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)),
+                theme,
+            )
         });
         let body = div()
             .flex()
@@ -487,67 +470,29 @@ impl JobsView {
 
     fn render_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         if let Some(message) = self.model.message() {
-            return div()
-                .flex()
-                .flex_1()
-                .min_w_0()
-                .child(style::empty_state("jobs-empty", message, None, theme).max_w_full())
-                .into_any_element();
+            return list_screen::message("jobs-empty", message, theme);
         }
         let now = super::activity::now();
-        let headings = div()
-            .flex()
-            .flex_row()
-            .gap(px(COLUMN_GAP))
-            .px(px(12.0))
-            .py(px(6.0))
+        let headings = list_screen::headings_row()
             .child(div().w(px(DESCRIPTION_W)).flex_none().child(COLUMNS[0]))
             .child(div().flex_1().min_w_0().child(COLUMNS[1]))
             .child(div().w(px(STATUS_W)).flex_none().child(COLUMNS[2]))
             .child(div().w(px(DURATION_W)).flex_none().child(COLUMNS[3]))
             .child(div().w(px(FINISHED_W)).flex_none().child(COLUMNS[4]));
-        let finished_start = self.model.finished_start();
-        let mut rows: Vec<AnyElement> = Vec::new();
-        for (i, row) in self.model.rows().iter().enumerate() {
-            if Some(i) == finished_start {
-                if i > 0 {
-                    rows.push(div().h(px(1.0)).bg(theme.divider_strong).into_any_element());
-                }
-                rows.push(finished_heading(theme));
-                rows.push(div().h(px(1.0)).bg(theme.divider).into_any_element());
-            } else if i > 0 {
-                rows.push(div().h(px(1.0)).bg(theme.divider).into_any_element());
-            }
-            let open = self.sheet.as_ref().is_some_and(|s| s.id == row.id);
-            rows.push(job_row(row, now, open, theme, cx));
-        }
-        div()
-            .id("jobs-list")
-            .debug_selector(|| "jobs-list".into())
-            .track_scroll(&self.scroll)
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .overflow_y_scroll()
-            .px_4()
-            .py_4()
-            .child(super::workflows::table(headings, rows, theme).debug_selector(|| "jobs-table".into()))
-            .into_any_element()
+        let rows = self
+            .model
+            .rows()
+            .iter()
+            .map(|row| {
+                let open = self.sheet.as_ref().is_some_and(|s| s.id == row.id);
+                job_row(row, now, open, theme, cx)
+            })
+            .collect();
+        let finished: Vec<(usize, &'static str)> =
+            self.model.finished_start().map(|at| (at, FINISHED_HEADING)).into_iter().collect();
+        let rows = list_screen::sectioned("jobs", rows, &finished, theme);
+        list_screen::list("jobs", &self.scroll, headings, rows, theme)
     }
-}
-
-/// The section row above the finished jobs, in the headings' type.
-fn finished_heading(theme: &Theme) -> AnyElement {
-    div()
-        .debug_selector(|| "jobs-finished-heading".into())
-        .px(px(12.0))
-        .py(px(6.0))
-        .type_style(Type::SmallMedium)
-        .text_color(theme.form_hint)
-        .child(FINISHED_HEADING)
-        .into_any_element()
 }
 
 /// One job's row: its description, its command cut to the column (whole in
@@ -561,28 +506,13 @@ fn job_row(
     theme: &Theme,
     cx: &mut Context<JobsView>,
 ) -> AnyElement {
-    let id = row.id.clone();
     let description = one_line(&row.description);
     let long_description = description.chars().count() > DESCRIPTION_TIP_CHARS;
     let click_id = row.id.clone();
     let overdue = row.overdue(now);
     let duration_color = row.duration_tone(now).map_or(theme.muted, |t| theme.tone(t));
-    div()
-        .id(SharedString::from(format!("job-row-{}", row.id)))
-        .debug_selector(move || format!("job-row-{id}"))
-        .relative()
-        .cursor_pointer()
-        .rounded(px(ROW_RADIUS))
-        .when(open, |d| d.bg(theme.background_hover))
-        .hover(|d| d.bg(theme.background_hover))
+    list_screen::row("job", &row.id, open, theme)
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.open_sheet(&click_id, window, cx)))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(COLUMN_GAP))
-        .px(px(12.0))
-        .py(px(10.0))
-        .type_style(Type::Base)
         .child(
             div()
                 .id(SharedString::from(format!("job-description-{}", row.id)))
@@ -694,32 +624,7 @@ impl Render for JobsView {
             .type_style(Type::Base)
             .text_color(theme.foreground)
             // The title row: the view's name, loud, then the count, muted.
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_none()
-                    .items_center()
-                    .gap_2()
-                    .h(px(37.0))
-                    .px_4()
-                    .child(
-                        div()
-                            .debug_selector(|| "jobs-title".into())
-                            .type_style(Type::BaseMedium)
-                            .text_color(theme.text_loud)
-                            .child(TITLE),
-                    )
-                    .when_some(summary, |d, summary| {
-                        d.child(
-                            div()
-                                .debug_selector(|| "jobs-summary".into())
-                                .type_style(Type::XSmall)
-                                .text_color(theme.muted)
-                                .child(summary),
-                        )
-                    }),
-            )
+            .child(list_screen::title_row("jobs", TITLE, summary, &theme))
             .child(div().h(px(1.0)).flex_none().bg(theme.divider))
             // The table at its full width, whether or not the sheet is open:
             // the sheet floats over it.

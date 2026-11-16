@@ -14,8 +14,8 @@ use std::collections::HashMap;
 
 /// What the main area is showing.
 ///
-/// `Issues`, `Changelog`, `Activity`, `Machines`, and `Jobs` are native
-/// (in-process) views.
+/// `Issues`, `Changelog`, `Activity`, `Machines`, `Jobs`, and `Reminders`
+/// are native (in-process) views.
 /// [`View::Session`] is a terminal view bound to a session by name — the
 /// orchestrator chat, a workspace agent, or a review editor/diff session.
 ///
@@ -33,6 +33,10 @@ pub enum View {
     /// The project's active awareness jobs ([`crate::jobs`]). Palette-only,
     /// like Activity and Machines.
     Jobs,
+    /// The project's `shelbi remind` reminders, pending and recently fired
+    /// ([`crate::reminders`]). Palette-only, and further hidden from the
+    /// palette's default list until the user types a query.
+    Reminders,
     /// A session rendered in a terminal view, identified by session name.
     Session(String),
 }
@@ -55,6 +59,7 @@ impl View {
             "activity" => View::Activity,
             "machines" => View::Machines,
             "jobs" => View::Jobs,
+            "reminders" => View::Reminders,
             other => View::Session(other.to_string()),
         }
     }
@@ -69,6 +74,7 @@ impl View {
             View::Activity => "activity".to_string(),
             View::Machines => "machines".to_string(),
             View::Jobs => "jobs".to_string(),
+            View::Reminders => "reminders".to_string(),
             View::Session(name) => name.clone(),
         }
     }
@@ -452,6 +458,7 @@ mod tests {
             View::Activity,
             View::Machines,
             View::Jobs,
+            View::Reminders,
             View::Session("orch".into()),
             View::Session("alpha-1".into()),
         ] {
@@ -462,6 +469,7 @@ mod tests {
         assert_eq!(View::from_view_id("activity"), View::Activity);
         assert_eq!(View::from_view_id("changelog"), View::Changelog);
         assert_eq!(View::from_view_id("jobs"), View::Jobs);
+        assert_eq!(View::from_view_id("reminders"), View::Reminders);
         assert_eq!(View::from_view_id("orch"), View::Session("orch".into()));
     }
 

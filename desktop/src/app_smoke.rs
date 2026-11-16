@@ -271,7 +271,7 @@ fn every_registry_command_runs_from_the_palette(cx: &mut TestAppContext) {
     let mut h = Harness::open(cx);
     h.second_tab();
     let commands = h.commands();
-    assert_eq!(commands.len(), 33, "the fixture offers every kind of command");
+    assert_eq!(commands.len(), 34, "the fixture offers every kind of command");
     for command in &commands {
         h.focus_window();
         h.key("ctrl-space");
@@ -594,6 +594,30 @@ fn typing_jobs_in_the_palette_opens_the_jobs_screen(cx: &mut TestAppContext) {
     assert_eq!(h.window.read_with(&h.cx, |w, _| w.client.view().clone()), View::Jobs);
     assert!(h.window.read_with(&h.cx, |w, _| w.jobs.is_some()), "the Jobs view is built");
     assert!(h.cx.debug_bounds("jobs-title").is_some(), "the Jobs screen draws in the main area");
+}
+
+#[gpui::test]
+fn reminders_waits_for_a_query_in_the_palette_then_opens_its_screen(cx: &mut TestAppContext) {
+    let mut h = Harness::open(cx);
+    h.open_palette();
+    h.draw();
+    let listed = |h: &Harness, id: &str| {
+        h.palette(|p| p.rows().iter().filter_map(|r| r.item()).any(|i| i.entry().is_some_and(|e| e.id == id)))
+    };
+    assert!(!listed(&h, "view:reminders"), "the default list leaves Reminders out");
+    assert!(listed(&h, "view:machines"), "the default list's views stay listed");
+    h.key(&keystrokes_for("rem"));
+    h.draw();
+    assert_eq!(h.selected_id().as_deref(), Some("view:reminders"), "typing rem offers Reminders first");
+    assert_eq!(h.palette_label("view:reminders"), "Reminders");
+    h.key("enter");
+    assert!(!h.overlay_open(), "running it closes the palette");
+    let calls = h.take_calls();
+    assert_eq!(calls, vec![HostCall::ShowView(View::Reminders)]);
+    h.perform(calls);
+    assert_eq!(h.window.read_with(&h.cx, |w, _| w.client.view().clone()), View::Reminders);
+    assert!(h.window.read_with(&h.cx, |w, _| w.reminders.is_some()), "the Reminders view is built");
+    assert!(h.cx.debug_bounds("reminders-title").is_some(), "the Reminders screen draws in the main area");
 }
 
 #[gpui::test]

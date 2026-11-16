@@ -639,6 +639,7 @@ pub fn nav_icon(view: &View) -> Icon {
         View::Activity => icons::BOLT,
         View::Machines => icons::SERVER_STACK,
         View::Jobs => icons::COMMAND_LINE,
+        View::Reminders => icons::CLOCK,
     }
 }
 
@@ -1803,6 +1804,7 @@ mod tests {
         assert!(shared.iter().any(|n| n.view == View::Changelog && n.label == "Changelog"));
         assert!(!shared.iter().any(|n| n.view == View::Activity), "Activity is palette-only");
         assert!(!shared.iter().any(|n| n.view == View::Jobs), "Jobs is palette-only");
+        assert!(!shared.iter().any(|n| n.view == View::Reminders), "Reminders is palette-only");
     }
 
     #[test]
@@ -1905,6 +1907,7 @@ mod tests {
         assert_eq!(nav_icon(&View::Changelog), icons::ROCKET_LAUNCH);
         assert_eq!(nav_icon(&View::Activity), icons::BOLT);
         assert_eq!(nav_icon(&View::Jobs), icons::COMMAND_LINE);
+        assert_eq!(nav_icon(&View::Reminders), icons::CLOCK);
     }
 }
 

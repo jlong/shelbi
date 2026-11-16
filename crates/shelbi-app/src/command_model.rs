@@ -29,6 +29,7 @@ pub fn nav_glyph(label: &str) -> &'static str {
         "Activity" => "⚡",
         "Machines" => "🖥",
         "Jobs" => "⏳",
+        "Reminders" => "⏰",
         _ => "•",
     }
 }
@@ -87,12 +88,13 @@ pub fn command_model_from(
             decoration: nav_decoration(&n.label),
         })
         .collect();
-    // Activity, Machines and Jobs are palette-only (no sidebar row); add
-    // each once.
+    // Activity, Machines, Jobs and Reminders are palette-only (no sidebar
+    // row); add each once.
     for (view, title) in [
         (View::Activity, "Activity"),
         (View::Machines, "Machines"),
         (View::Jobs, crate::jobs::TITLE),
+        (View::Reminders, crate::reminders::TITLE),
     ] {
         if !views.iter().any(|v| v.view == view) {
             views.push(ViewItem {
@@ -303,7 +305,7 @@ fn project_settings_path(project: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::CommandRegistry;
+    use crate::command::{CommandKind, CommandRegistry};
     use crate::overlay::palette::ProjectIndicator;
     use crate::view::{NavItem, ReviewRow, ReviewState, WorkspaceBadge, WorkspaceRow};
 
@@ -351,14 +353,25 @@ mod tests {
         let m = command_model_from("alpha", &sidebar(), false, Vec::new(), Vec::new());
         assert!(m.zen_on);
         let ids: Vec<&str> = m.views.iter().map(|v| v.id.as_str()).collect();
-        // Activity, Machines and Jobs follow the sidebar's nav as
+        // Activity, Machines, Jobs and Reminders follow the sidebar's nav as
         // palette-only views.
         assert_eq!(
             ids,
-            ["view:orch", "view:tasks", "view:changelog", "view:activity", "view:machines", "view:jobs"]
+            [
+                "view:orch",
+                "view:tasks",
+                "view:changelog",
+                "view:activity",
+                "view:machines",
+                "view:jobs",
+                "view:reminders"
+            ]
         );
         assert_eq!(m.views[5].title, "Jobs");
         assert_eq!(m.views[5].view, View::Jobs);
+        assert_eq!(m.views[6].title, "Reminders");
+        assert_eq!(m.views[6].view, View::Reminders);
+        assert_eq!(m.views[6].decoration.as_ref().unwrap().glyph, "⏰");
         assert_eq!(m.views[2].decoration.as_ref().unwrap().glyph, "🚀");
         assert_eq!(m.views[3].title, "Activity");
         assert_eq!(m.views[3].decoration.as_ref().unwrap().glyph, "⚡");
@@ -382,6 +395,7 @@ mod tests {
         assert_eq!(m.views.iter().filter(|v| v.view == View::Machines).count(), 1);
         assert_eq!(m.views.iter().filter(|v| v.view == View::Activity).count(), 1);
         assert_eq!(m.views.iter().filter(|v| v.view == View::Jobs).count(), 1);
+        assert_eq!(m.views.iter().filter(|v| v.view == View::Reminders).count(), 1);
     }
 
     /// The palette's whole default list for a fixture state, in order: the
@@ -430,6 +444,28 @@ mod tests {
         // Typing "Jobs" offers the Jobs screen first.
         let jobs = shelbi_palette::search(&CommandRegistry::new().entries(&m), "Jobs");
         assert_eq!(jobs.first().map(|(e, _)| e.id.as_str()), Some("view:jobs"));
+    }
+
+    /// Reminders is the one nav view that waits for a query: absent from the
+    /// blank list above, offered first once "rem" is typed. Every other view
+    /// is listed up front.
+    #[test]
+    fn reminders_is_hidden_until_a_query_and_found_by_typing() {
+        let m = command_model_from("alpha", &sidebar(), false, Vec::new(), Vec::new());
+        let reg = CommandRegistry::new();
+        for cmd in reg.commands(&m).iter().filter(|c| c.id().starts_with("view:")) {
+            assert_eq!(cmd.hidden_until_query(), cmd.id() == "view:reminders", "{}", cmd.id());
+        }
+        let entries = reg.entries(&m);
+        let blank = shelbi_palette::search(&entries, "");
+        assert!(!blank.iter().any(|(e, _)| e.id == "view:reminders"), "not in the default list");
+        for query in ["rem", "remind", "Reminders"] {
+            let hits = shelbi_palette::search(&entries, query);
+            assert_eq!(hits.first().map(|(e, _)| e.id.as_str()), Some("view:reminders"), "{query}");
+        }
+        let cmd = reg.resolve("view:reminders", &m).expect("offered");
+        assert_eq!(cmd.kind(), &CommandKind::ShowView(View::Reminders));
+        assert_eq!(cmd.title(), "Reminders");
     }
 
     fn liveness(open: &[&str], working: &[&str]) -> ProjectLiveness {

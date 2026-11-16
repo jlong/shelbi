@@ -25,6 +25,10 @@
 //! [`JOB_HISTORY_MAX_JOBS`] jobs finished within [`JOB_HISTORY_MAX_AGE`],
 //! whichever is fewer, and a job's directory goes when its record does.
 //!
+//! A reminder that fires is recorded in `<project_dir>/reminders/history.json`
+//! (a [`FiredReminder`] per firing: a recurring reminder gets one each time),
+//! kept to the same count and age window as the job history.
+//!
 //! The store never creates the project's state directory: a write for a
 //! project whose `<project_dir>` is missing fails instead, so a mistyped
 //! `--project` (or a stale `SHELBI_PROJECT`) can't leave a stray project
@@ -67,6 +71,20 @@ pub const JOB_HISTORY_MAX_JOBS: usize = 200;
 /// [`JOB_HISTORY_MAX_JOBS`] is smaller wins: a record (and its log) is kept
 /// only while it is both among the newest 200 and under 30 days old.
 pub const JOB_HISTORY_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// Directory under the project state dir holding the fired-reminder history.
+pub const REMINDERS_DIR: &str = "reminders";
+
+/// The fired-reminder history file, under [`REMINDERS_DIR`].
+pub const REMINDER_HISTORY_FILE: &str = "history.json";
+
+/// The most fired reminders a project's history keeps (the job history's
+/// cap). Past it the oldest firing goes.
+pub const REMINDER_HISTORY_MAX: usize = JOB_HISTORY_MAX_JOBS;
+
+/// The longest a fired reminder stays in the history (the job history's).
+/// Whichever of this and [`REMINDER_HISTORY_MAX`] is smaller wins.
+pub const REMINDER_HISTORY_MAX_AGE: Duration = JOB_HISTORY_MAX_AGE;
 
 /// The whole store. Each list is elided from the file while empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -920,6 +938,150 @@ pub fn prune_job_history(project: &str, live_ids: &[&str], now: DateTime<Utc>) -
     dropped.into_iter().map(|r| r.id).collect()
 }
 
+// ---------------------------------------------------------------------------
+// Fired-reminder history
+
+/// One reminder firing, as the history keeps it: the [`Reminder`] it was and
+/// when it fired. A one-shot reminder leaves the store when it fires, so this
+/// is all that remembers it; a recurring one stays in the store (on its next
+/// slot) and gets a record each time it fires.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FiredReminder {
+    pub id: String,
+    pub text: String,
+    /// The slot it fired for (a late tick fires after it).
+    pub due_at: DateTime<Utc>,
+    /// The tick that fired it.
+    pub fired_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
+    /// The repeat of a recurring reminder (see [`Reminder::every`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_compact::option"
+    )]
+    pub every: Option<Duration>,
+}
+
+impl FiredReminder {
+    /// The record for `reminder` firing its current slot at `fired_at`.
+    pub fn fired(reminder: &Reminder, fired_at: DateTime<Utc>) -> Self {
+        FiredReminder {
+            id: reminder.id.clone(),
+            text: reminder.text.clone(),
+            due_at: reminder.due_at,
+            fired_at,
+            created_at: reminder.created_at,
+            every: reminder.every,
+        }
+    }
+
+    /// The same firing as `other`: one reminder's one slot. A tick retried
+    /// after a failed store write records it again; this keeps it once.
+    fn same_firing(&self, other: &FiredReminder) -> bool {
+        self.id == other.id && self.due_at == other.due_at
+    }
+}
+
+/// The history file's shape: the records, oldest first.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ReminderHistoryFile {
+    #[serde(default)]
+    reminders: Vec<FiredReminder>,
+}
+
+/// `<project_dir>/reminders/history.json`.
+pub fn reminder_history_path(project: &str) -> Result<PathBuf> {
+    Ok(project_dir(project)?.join(REMINDERS_DIR).join(REMINDER_HISTORY_FILE))
+}
+
+fn fired_newest_first(records: &mut [FiredReminder]) {
+    records.sort_by(|a, b| {
+        b.fired_at
+            .cmp(&a.fired_at)
+            .then_with(|| b.due_at.cmp(&a.due_at))
+            .then_with(|| job_id_number(&b.id).cmp(&job_id_number(&a.id)))
+    });
+}
+
+/// The project's fired reminders, newest first. A missing file (a project
+/// from before the history existed) is no history; any other read or parse
+/// error propagates.
+pub fn read_reminder_history(project: &str) -> Result<Vec<FiredReminder>> {
+    read_reminder_history_at(&reminder_history_path(project)?)
+}
+
+fn read_reminder_history_at(path: &Path) -> Result<Vec<FiredReminder>> {
+    let text = match read_to_string_at(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::Io(e)),
+    };
+    let mut file: ReminderHistoryFile =
+        serde_json::from_str(&text).map_err(|e| Error::Other(format!("{}: {e}", path.display())))?;
+    fired_newest_first(&mut file.reminders);
+    Ok(file.reminders)
+}
+
+/// Locked read-modify-write on the reminder history: `f` edits the records
+/// (newest first), then the retention window applies at `now`: the newest
+/// [`REMINDER_HISTORY_MAX`] fired within [`REMINDER_HISTORY_MAX_AGE`]. Written
+/// only when something changed. Returns how many records it dropped.
+fn update_reminder_history(
+    project: &str,
+    now: DateTime<Utc>,
+    f: impl FnOnce(&mut Vec<FiredReminder>),
+) -> Result<usize> {
+    let dir = existing_project_dir(project)?.join(REMINDERS_DIR);
+    crate::ensure_dir(&dir)?;
+    let path = dir.join(REMINDER_HISTORY_FILE);
+    let _lock = acquire_file_lock(&crate::sibling_lock_path(&path))?;
+    let before = read_reminder_history_at(&path)?;
+    let mut records = before.clone();
+    f(&mut records);
+    fired_newest_first(&mut records);
+    let oldest = now - chrono_duration(REMINDER_HISTORY_MAX_AGE);
+    let total = records.len();
+    let kept: Vec<FiredReminder> = records
+        .into_iter()
+        .filter(|r| r.fired_at >= oldest)
+        .take(REMINDER_HISTORY_MAX)
+        .collect();
+    let dropped = total - kept.len();
+    if kept != before {
+        let mut oldest_first = kept;
+        oldest_first.reverse();
+        let body = serde_json::to_vec_pretty(&ReminderHistoryFile { reminders: oldest_first })
+            .map_err(|e| Error::Other(format!("{REMINDER_HISTORY_FILE}: {e}")))?;
+        atomic_write(&path, &body)?;
+    }
+    Ok(dropped)
+}
+
+/// Add `fired` to the history (a firing already there is replaced, so a
+/// retried tick never lists one twice), then prune past the retention window.
+pub fn record_fired_reminders(project: &str, fired: Vec<FiredReminder>, now: DateTime<Utc>) -> Result<()> {
+    if fired.is_empty() {
+        return Ok(());
+    }
+    update_reminder_history(project, now, |history| {
+        history.retain(|old| !fired.iter().any(|r| r.same_firing(old)));
+        history.extend(fired);
+    })
+    .map(drop)
+}
+
+/// The tick's sweep: drop fired reminders past the retention window, for a
+/// quiet project where nothing fires to prune it. Best effort; returns how
+/// many it dropped.
+pub fn prune_reminder_history(project: &str, now: DateTime<Utc>) -> usize {
+    let has_history = reminder_history_path(project).is_ok_and(|p| p.is_file());
+    if !has_history {
+        return 0;
+    }
+    update_reminder_history(project, now, |_| {}).unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1264,6 +1426,71 @@ mod tests {
         assert_eq!(dropped, ["j2"]);
         assert!(history_ids().is_empty());
         assert!(live.exists());
+    }
+
+    fn fired(id: &str, due_at: DateTime<Utc>, fired_at: DateTime<Utc>) -> FiredReminder {
+        let reminder = Reminder {
+            id: id.into(),
+            due_at,
+            text: format!("text of {id}"),
+            created_at: due_at - chrono::Duration::hours(1),
+            every: None,
+        };
+        FiredReminder::fired(&reminder, fired_at)
+    }
+
+    fn fired_ids() -> Vec<String> {
+        read_reminder_history("demo").unwrap().into_iter().map(|r| r.id).collect()
+    }
+
+    #[test]
+    fn the_reminder_history_is_newest_first_and_keeps_each_firing_once() {
+        let _home = Home::new("reminder-history");
+        // A project from before the history: no file reads as none.
+        assert!(read_reminder_history("demo").unwrap().is_empty());
+        assert_eq!(prune_reminder_history("demo", Utc::now()), 0);
+        assert!(!reminder_history_path("demo").unwrap().exists(), "a sweep creates nothing");
+
+        let now = Utc::now();
+        let t = |m: i64| now - chrono::Duration::minutes(m);
+        record_fired_reminders("demo", vec![fired("r1", t(30), t(30)), fired("r3", t(10), t(10))], now).unwrap();
+        record_fired_reminders("demo", vec![fired("r2", t(20), t(20))], now).unwrap();
+        assert_eq!(fired_ids(), ["r3", "r2", "r1"]);
+        // A retried tick records r2's firing again: still listed once.
+        record_fired_reminders("demo", vec![fired("r2", t(20), t(19))], now).unwrap();
+        assert_eq!(fired_ids(), ["r3", "r2", "r1"]);
+        // A recurring reminder's next slot is a firing of its own.
+        record_fired_reminders("demo", vec![fired("r2", t(5), t(5))], now).unwrap();
+        assert_eq!(fired_ids(), ["r2", "r3", "r2", "r1"]);
+        // The file is oldest first, so it reads like a log.
+        let text = std::fs::read_to_string(reminder_history_path("demo").unwrap()).unwrap();
+        assert!(text.find("\"r1\"").unwrap() < text.find("\"r3\"").unwrap(), "{text}");
+    }
+
+    #[test]
+    fn the_reminder_history_is_capped_by_count_and_age() {
+        let _home = Home::new("reminder-retain");
+        let now = Utc::now();
+        let records: Vec<FiredReminder> = (1..=REMINDER_HISTORY_MAX + 3)
+            .map(|i| {
+                let at = now - chrono::Duration::seconds((1000 - i) as i64);
+                fired(&format!("r{i}"), at, at)
+            })
+            .collect();
+        record_fired_reminders("demo", records, now).unwrap();
+        let ids = fired_ids();
+        assert_eq!(ids.len(), REMINDER_HISTORY_MAX);
+        assert_eq!(ids.first().map(String::as_str), Some("r203"));
+        assert_eq!(ids.last().map(String::as_str), Some("r4"));
+
+        // Past the age limit: dropped on the next write, or by the sweep.
+        let limit = chrono::Duration::from_std(REMINDER_HISTORY_MAX_AGE).unwrap();
+        let later = now + limit + chrono::Duration::seconds(1);
+        let fresh = fired("r500", later, later);
+        record_fired_reminders("demo", vec![fresh], later).unwrap();
+        assert_eq!(fired_ids(), ["r500"]);
+        assert_eq!(prune_reminder_history("demo", later + limit + chrono::Duration::seconds(1)), 1);
+        assert!(fired_ids().is_empty());
     }
 
     #[test]

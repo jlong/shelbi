@@ -55,10 +55,10 @@
 //! too.
 
 use chrono::{DateTime, Utc};
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Clear, Paragraph, Wrap};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use std::sync::mpsc;
@@ -68,8 +68,9 @@ use shelbi_app::jobs::{
 };
 use shelbi_term::Size;
 
+use crate::list_screen;
 use crate::shell::terminal_view::TerminalPane;
-use crate::table::{self, Cell, Column, Table};
+use crate::table::{Cell, Column, Table};
 
 /// The cells the Duration column's progress bar takes.
 const BAR_CELLS: usize = 8;
@@ -288,9 +289,10 @@ impl JobsPage {
         t
     }
 
-    /// The body line row `row` draws on: one more past the Finished heading.
-    fn line_of(&self, row: usize) -> usize {
-        row + usize::from(self.model.finished_start().is_some_and(|f| row >= f))
+    /// The section headings: [`FINISHED_HEADING`] above the first finished
+    /// job.
+    fn headings(&self) -> Vec<(usize, &'static str)> {
+        self.model.finished_start().map(|at| (at, FINISHED_HEADING)).into_iter().collect()
     }
 }
 
@@ -299,53 +301,34 @@ impl JobsPage {
 pub(crate) fn render_full(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Utc>, truecolor: bool) {
     render_page(f, page, area, now);
     if page.sheet.is_some() {
-        let rect = crate::kanban::popover_rect(area);
-        // Cleared under it, so the table doesn't bleed through.
-        f.render_widget(Clear, rect);
-        render_sheet(f, page, rect, now, truecolor);
+        render_sheet(f, page, area, now, truecolor);
     }
 }
 
-/// The sheet in `rect`: the dialogs' frame with the job's `id · label` in
-/// its border, the status, a rule, the terminal, and the keys (the issue
-/// detail's header, separator, body and hint).
-fn render_sheet(f: &mut Frame, page: &mut JobsPage, rect: Rect, now: DateTime<Utc>, truecolor: bool) {
-    if rect.width < 6 || rect.height < 6 {
-        return;
-    }
+/// The sheet over `area`: the shared frame ([`list_screen::render_sheet_frame`]:
+/// the job's `id · label` in its border, the status, the keys) around its
+/// terminal.
+fn render_sheet(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Utc>, truecolor: bool) {
     let Some(row) = page.sheet_row().cloned() else {
         return;
     };
-    let title = format!("{} · {}", row.id, one_line(&row.description));
-    let title = crate::kanban::truncate(&title, rect.width.saturating_sub(4) as usize);
-    let inner = crate::overlay::dialog_frame(f.buffer_mut(), rect, None, Some(&title));
-    let parts = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // status
-            Constraint::Length(1), // separator
-            Constraint::Min(1),    // terminal
-            Constraint::Length(1), // keys
-        ])
-        .split(inner);
-    let sheet = page.sheet.as_mut().expect("checked above");
+    let sheet = page.sheet.as_mut().expect("a sheet row means a sheet");
     let status = if sheet.canceling && row.is_running() {
         "● Canceling…".to_string()
     } else {
         row.sheet_status(now)
     };
-    f.render_widget(
-        Paragraph::new(Span::styled(status, Style::default().fg(row.status_tone_at(now).pick(palette())))),
-        parts[0],
-    );
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            "─".repeat(parts[1].width as usize),
-            Style::default().fg(palette().ansi_dark_gray),
-        )),
-        parts[1],
-    );
-    let term = parts[2];
+    let keys = list_screen::sheet_keys("job", (row.can_cancel() && !sheet.canceling).then_some(CANCEL_LABEL));
+    let Some(term) = list_screen::render_sheet_frame(
+        f,
+        area,
+        &format!("{} · {}", row.id, one_line(&row.description)),
+        status,
+        Style::default().fg(row.status_tone_at(now).pick(palette())),
+        &keys,
+    ) else {
+        return;
+    };
     let muted = Style::default().fg(palette().muted);
     let message = |f: &mut Frame, text: &str| {
         f.render_widget(Paragraph::new(Span::styled(text.to_string(), muted)).wrap(Wrap { trim: false }), term);
@@ -373,99 +356,25 @@ fn render_sheet(f: &mut Frame, page: &mut JobsPage, rect: Rect, now: DateTime<Ut
             }
         }
     }
-    let keys = if row.can_cancel() && !sheet.canceling {
-        format!("↑/↓ job · c {} · esc close", CANCEL_LABEL.to_lowercase())
-    } else {
-        "↑/↓ job · esc close".to_string()
-    };
-    f.render_widget(Paragraph::new(Span::styled(keys, Style::default().fg(palette().ansi_dark_gray))), parts[3]);
 }
 
 fn render_page(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Utc>) {
-    let outer = Layout::default()
-        .direction(Direction::Vertical)
-        .horizontal_margin(2)
-        .constraints([
-            Constraint::Length(1),            // title
-            Constraint::Length(1),            // spacer
-            Constraint::Min(1),               // table
-            Constraint::Length(DETAIL_LINES), // the selected row's command
-            Constraint::Length(1),            // footer
-        ])
-        .split(area);
-
-    let mut title = vec![Span::styled(
-        TITLE,
-        Style::default().fg(palette().ansi_cyan).add_modifier(Modifier::BOLD),
-    )];
-    if let Some(summary) = page.model.summary() {
-        title.push(Span::styled(format!("   {summary}"), Style::default().fg(palette().ansi_dark_gray)));
-    }
-    f.render_widget(Paragraph::new(Line::from(title)), outer[0]);
-
+    let areas = list_screen::page_areas(area, DETAIL_LINES);
+    list_screen::render_title(f, areas.title, TITLE, page.model.summary());
     if let Some(message) = page.model.message() {
-        let body = outer[2];
-        let at = Rect { y: body.y + body.height.saturating_sub(1) / 3, height: 1.min(body.height), ..body };
-        f.render_widget(
-            Paragraph::new(Span::styled(message, Style::default().fg(palette().muted)))
-                .alignment(Alignment::Center),
-            at,
-        );
+        list_screen::render_message(f, areas.body, message);
         return;
     }
-
-    render_table(f, page, outer[2], now);
+    let headings = page.headings();
+    list_screen::render_sectioned_table(f, areas.body, page.table(now), &headings, page.selected, &mut page.scroll);
     if let Some(row) = page.selected_row() {
         let detail = Line::from(vec![
             Span::styled("Command  ", Style::default().fg(palette().muted)),
             Span::styled(row.command.clone(), Style::default().fg(palette().foreground)),
         ]);
-        f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), outer[3]);
+        f.render_widget(Paragraph::new(detail).wrap(Wrap { trim: false }), areas.detail);
     }
-    f.render_widget(
-        Paragraph::new(Span::styled("↑/↓ select · enter open", Style::default().fg(palette().ansi_dark_gray))),
-        outer[4],
-    );
-}
-
-fn render_table(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Utc>) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
-    let lines = page.table(now).lines(area.width as usize);
-    // The header and its rule stay; the rows scroll under them to keep the
-    // selection in view. The Finished heading is a body line of its own.
-    let (head, rows) = lines.split_at(lines.len().min(2));
-    let mut body: Vec<Line<'static>> = rows.iter().map(|l| l.line.clone()).collect();
-    if let Some(at) = page.model.finished_start().filter(|&at| at <= body.len()) {
-        let heading = Line::from(Span::styled(
-            format!("{}{FINISHED_HEADING}", " ".repeat(table::BLEED)),
-            Style::default().fg(palette().muted).add_modifier(Modifier::BOLD),
-        ));
-        body.insert(at, heading);
-    }
-    let rows_h = (area.height as usize).saturating_sub(head.len());
-    let selected = page.line_of(page.selected);
-    // Keep the heading in view above the first finished row.
-    let top = if page.model.finished_start() == Some(page.selected) { selected - 1 } else { selected };
-    if top < page.scroll {
-        page.scroll = top;
-    } else if rows_h > 0 && selected >= page.scroll + rows_h {
-        page.scroll = selected + 1 - rows_h;
-    }
-    page.scroll = page.scroll.min(body.len().saturating_sub(rows_h));
-    // A table line reaches into the page's gutter.
-    let bleed = table::BLEED as u16;
-    let wide = |y: u16| Rect {
-        x: area.x.saturating_sub(bleed),
-        y,
-        width: area.width + 2 * bleed,
-        height: 1,
-    };
-    let drawn = head.iter().map(|l| l.line.clone()).chain(body.into_iter().skip(page.scroll).take(rows_h));
-    for (i, line) in drawn.enumerate() {
-        f.render_widget(Paragraph::new(line), wide(area.y + i as u16));
-    }
+    list_screen::render_footer(f, areas.footer, "↑/↓ select · enter open");
 }
 
 #[cfg(test)]

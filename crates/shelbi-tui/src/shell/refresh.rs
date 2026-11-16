@@ -29,6 +29,8 @@ pub struct ShellSnapshot {
     pub machines: Option<MachinesModel>,
     /// The project's active awareness jobs (the Jobs screen).
     pub jobs: Option<shelbi_app::jobs::JobsRead>,
+    /// The project's pending and fired reminders (the Reminders screen).
+    pub reminders: Option<shelbi_app::reminders::RemindersRead>,
 }
 
 /// A refresh worker, generic over the payload `T` it publishes. Dropping it
@@ -60,6 +62,7 @@ mod tests {
             activity: None,
             machines: None,
             jobs: None,
+            reminders: None,
         }
     }
 

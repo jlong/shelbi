@@ -277,6 +277,14 @@ impl ProjectSource for LocalSource {
             .map_err(|e| e.to_string())
     }
 
+    fn reminders(&self) -> shelbi_app::reminders::RemindersRead {
+        shelbi_app::reminders::read_local(self.name())
+    }
+
+    fn cancel_reminder(&self, id: &str) -> Result<(), String> {
+        shelbi_app::reminders::cancel_local(self.name(), id)
+    }
+
     fn machine_reachability(&self, host: &str) -> Reachability {
         crate::machine::probe_host_reachability(host)
     }

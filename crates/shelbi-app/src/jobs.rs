@@ -566,16 +566,25 @@ pub fn started_label<Tz: TimeZone>(started: DateTime<Utc>, now: DateTime<Utc>, t
 where
     Tz::Offset: std::fmt::Display,
 {
-    let local = started.with_timezone(tz);
+    format!("{} · {}", clock_label(started, now, tz), age_label(started, now))
+}
+
+/// `t` in `tz` as the screens show a time: the time alone on `now`'s day
+/// (`2:06 PM`), the date too on another day of the year (`Nov 12, 2:06
+/// PM`), and the year too in another year. Past or future alike.
+pub fn clock_label<Tz: TimeZone>(t: DateTime<Utc>, now: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let local = t.with_timezone(tz);
     let today = now.with_timezone(tz);
-    let when = if local.date_naive() == today.date_naive() {
+    if local.date_naive() == today.date_naive() {
         local.format("%-I:%M %p").to_string()
     } else if local.year() == today.year() {
         local.format("%b %-d, %-I:%M %p").to_string()
     } else {
         local.format("%b %-d %Y, %-I:%M %p").to_string()
-    };
-    format!("{when} · {}", age_label(started, now))
+    }
 }
 
 /// How long ago `started` was: `just now` under a minute (or in the
