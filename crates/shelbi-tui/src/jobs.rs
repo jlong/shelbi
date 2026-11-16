@@ -29,17 +29,24 @@
 //!    bundle desktop app │ ./bundle.sh │ Overdue │ ████████ 45m / 30m
 //! ```
 //!
-//! Enter opens the selected job's sheet on the right: a running command's
-//! live terminal (attached read-only: keys never reach the job), a finished
-//! one's saved output, with its label, status and elapsed time. `c` cancels a
-//! running job; Esc closes the sheet.
+//! Enter opens the selected job's sheet over the table, drawn the way the
+//! board's issue detail is (the same centered box, cleared under it, in the
+//! dialogs' frame, [`crate::kanban::popover_rect`]): its `id · label` in the
+//! border, its status and elapsed time, then a running command's live
+//! terminal (attached read-only: keys never reach the job) or a finished
+//! one's saved output. ↑/↓ move to the next job and the sheet follows, as a
+//! click on another row does on the desktop; `c` cancels a running job; Esc
+//! closes the sheet.
 //!
 //! ```text
-//!  Jobs                                  ┃ demo: count to 120
-//!   Description          Command         ┃ ● Running · 42s
-//!  ▐ demo: count to 120  zsh -c 'for i…' ┃ step 41 of 120
-//!                                        ┃ step 42 of 120
-//!                                        ┃ c cancel job · esc close
+//!  Jobs   1 running
+//!   Desc┌ j4 · demo: count to 120 ─────────────────┐
+//!  ▐ dem│ ● Running · 42s                           │
+//!       │───────────────────────────────────────────│
+//!       │ step 41 of 120                            │
+//!       │ step 42 of 120                            │
+//!       │ ↑/↓ job · c cancel job · esc close        │
+//!       └───────────────────────────────────────────┘
 //! ```
 //!
 //! The rows come in on the shell's core snapshot (read with the sidebar, so a
@@ -51,7 +58,7 @@ use chrono::{DateTime, Utc};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::{Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
 use std::sync::mpsc;
@@ -107,9 +114,6 @@ enum SheetBody {
     Message(String),
 }
 
-/// The width the sheet takes of the page, in percent.
-const SHEET_PERCENT: u16 = 55;
-
 impl JobsPage {
     /// Fold in a read. The selection follows its job when it moves.
     pub(crate) fn apply(&mut self, read: JobsRead) {
@@ -135,6 +139,10 @@ impl JobsPage {
         let Some(row) = self.selected_row().cloned() else {
             return;
         };
+        // Its own job again: the sheet stays as it is.
+        if self.sheet.as_ref().is_some_and(|s| s.id == row.id) {
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         let (project, load_row) = (project.to_string(), row.clone());
         std::thread::spawn(move || {
@@ -155,6 +163,14 @@ impl JobsPage {
 
     pub(crate) fn sheet_open(&self) -> bool {
         self.sheet.is_some()
+    }
+
+    /// With the sheet open, show the selected job in it (the selection
+    /// moved under it).
+    pub(crate) fn follow_selection(&mut self, project: &str) {
+        if self.sheet.is_some() {
+            self.open_sheet(project);
+        }
     }
 
     /// The open sheet's job, while it is running: what `c` cancels. Marks the
@@ -278,55 +294,41 @@ impl JobsPage {
     }
 }
 
-/// Draw the page into `area` at `now`: the table, and the open sheet beside
-/// it.
+/// Draw the page into `area` at `now`: the table at its full size, and the
+/// open sheet over it in the issue detail's box.
 pub(crate) fn render_full(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Utc>, truecolor: bool) {
-    if page.sheet.is_some() && area.width >= 40 {
-        let split = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(100 - SHEET_PERCENT), Constraint::Percentage(SHEET_PERCENT)])
-            .split(area);
-        render_page(f, page, split[0], now);
-        render_sheet(f, page, split[1], now, truecolor);
-    } else if page.sheet.is_some() {
-        render_sheet(f, page, area, now, truecolor);
-    } else {
-        render_page(f, page, area, now);
+    render_page(f, page, area, now);
+    if page.sheet.is_some() {
+        let rect = crate::kanban::popover_rect(area);
+        // Cleared under it, so the table doesn't bleed through.
+        f.render_widget(Clear, rect);
+        render_sheet(f, page, rect, now, truecolor);
     }
 }
 
-/// The sheet: a rule on its left, the job's label and status, its terminal,
-/// and the keys.
-fn render_sheet(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Utc>, truecolor: bool) {
-    if area.width < 4 || area.height < 4 {
+/// The sheet in `rect`: the dialogs' frame with the job's `id · label` in
+/// its border, the status, a rule, the terminal, and the keys (the issue
+/// detail's header, separator, body and hint).
+fn render_sheet(f: &mut Frame, page: &mut JobsPage, rect: Rect, now: DateTime<Utc>, truecolor: bool) {
+    if rect.width < 6 || rect.height < 6 {
         return;
     }
     let Some(row) = page.sheet_row().cloned() else {
         return;
     };
-    let rule = Style::default().fg(palette().ansi_dark_gray);
-    for y in area.top()..area.bottom() {
-        f.render_widget(Paragraph::new(Span::styled("┃", rule)), Rect { x: area.x, y, width: 1, height: 1 });
-    }
-    let inner = Rect { x: area.x + 2, width: area.width - 3, ..area };
+    let title = format!("{} · {}", row.id, one_line(&row.description));
+    let title = crate::kanban::truncate(&title, rect.width.saturating_sub(4) as usize);
+    let inner = crate::overlay::dialog_frame(f.buffer_mut(), rect, None, Some(&title));
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // label
             Constraint::Length(1), // status
-            Constraint::Length(1), // spacer
+            Constraint::Length(1), // separator
             Constraint::Min(1),    // terminal
             Constraint::Length(1), // keys
         ])
         .split(inner);
     let sheet = page.sheet.as_mut().expect("checked above");
-    f.render_widget(
-        Paragraph::new(Span::styled(
-            one_line(&row.description),
-            Style::default().fg(palette().foreground).add_modifier(Modifier::BOLD),
-        )),
-        parts[0],
-    );
     let status = if sheet.canceling && row.is_running() {
         "● Canceling…".to_string()
     } else {
@@ -334,9 +336,16 @@ fn render_sheet(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Ut
     };
     f.render_widget(
         Paragraph::new(Span::styled(status, Style::default().fg(row.status_tone_at(now).pick(palette())))),
+        parts[0],
+    );
+    f.render_widget(
+        Paragraph::new(Span::styled(
+            "─".repeat(parts[1].width as usize),
+            Style::default().fg(palette().ansi_dark_gray),
+        )),
         parts[1],
     );
-    let term = parts[3];
+    let term = parts[2];
     let muted = Style::default().fg(palette().muted);
     let message = |f: &mut Frame, text: &str| {
         f.render_widget(Paragraph::new(Span::styled(text.to_string(), muted)).wrap(Wrap { trim: false }), term);
@@ -365,11 +374,11 @@ fn render_sheet(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Ut
         }
     }
     let keys = if row.can_cancel() && !sheet.canceling {
-        format!("c {} · esc close", CANCEL_LABEL.to_lowercase())
+        format!("↑/↓ job · c {} · esc close", CANCEL_LABEL.to_lowercase())
     } else {
-        "esc close".to_string()
+        "↑/↓ job · esc close".to_string()
     };
-    f.render_widget(Paragraph::new(Span::styled(keys, Style::default().fg(palette().ansi_dark_gray))), parts[4]);
+    f.render_widget(Paragraph::new(Span::styled(keys, Style::default().fg(palette().ansi_dark_gray))), parts[3]);
 }
 
 fn render_page(f: &mut Frame, page: &mut JobsPage, area: Rect, now: DateTime<Utc>) {
@@ -673,7 +682,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_opens_a_finished_jobs_saved_output_beside_the_table_and_esc_closes_it() {
+    fn enter_opens_a_finished_jobs_saved_output_over_the_table_and_esc_closes_it() {
         // The live test below swaps `SHELBI_HOME`.
         let _lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let project = "tui-job-sheet-finished";
@@ -685,14 +694,57 @@ mod tests {
         });
         page.open_sheet(project);
         loaded(&mut page);
-        let screen = draw(&mut page, 120).join("\n");
-        assert!(screen.contains("┃ desktop tests"), "{screen}");
+        let lines = draw(&mut page, 120);
+        let screen = lines.join("\n");
+        // The issue detail's box: 80% of the page, centered, its title in
+        // the top border.
+        let rect = crate::kanban::popover_rect(Rect::new(0, 0, 120, 16));
+        let top = &lines[rect.y as usize];
+        assert!(top.contains("j4 · desktop tests"), "{screen}");
+        let chars: Vec<char> = top.chars().collect();
+        assert_eq!(chars[rect.x as usize], '┌', "{screen}");
+        assert_eq!(chars[(rect.x + rect.width - 1) as usize], '┐', "{screen}");
+        let bottom: Vec<char> = lines[(rect.y + rect.height - 1) as usize].chars().collect();
+        assert_eq!(bottom[rect.x as usize], '└', "{screen}");
+        // The table still draws around it.
+        assert!(lines[0].contains("Jobs"), "{screen}");
         assert!(screen.contains("✓ OK · 2m 13s"), "{screen}");
         assert!(screen.contains("compiling") && screen.contains("built ok"), "{screen}");
         assert!(screen.contains("esc close") && !screen.contains("cancel job"), "{screen}");
         assert_eq!(page.take_cancel(), None, "a finished job can't be canceled");
         page.close_sheet();
         assert!(!draw(&mut page, 120).join("\n").contains("built ok"));
+    }
+
+    #[test]
+    fn the_open_sheet_follows_the_selection_to_another_job() {
+        // The live test below swaps `SHELBI_HOME`.
+        let _lock = crate::test_support::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = "tui-job-sheet-follow";
+        write_log(project, "j4", "first job output\n");
+        write_log(project, "j3", "second job output\n");
+        let mut page = JobsPage::default();
+        page.apply(JobsRead::Jobs {
+            running: vec![],
+            finished: vec![
+                record("j4", "desktop tests", JobStatus::Ok, Some(0), at(14, 9)),
+                record("j3", "site build", JobStatus::Ok, Some(0), at(14, 1)),
+            ],
+        });
+        // Closed, moving selects and opens nothing.
+        page.follow_selection(project);
+        assert!(!page.sheet_open());
+        page.open_sheet(project);
+        loaded(&mut page);
+        assert!(draw(&mut page, 120).join("\n").contains("first job output"));
+        page.nav_down();
+        page.follow_selection(project);
+        loaded(&mut page);
+        let screen = draw(&mut page, 120).join("\n");
+        assert!(screen.contains("j3 · site build") && screen.contains("second job output"), "{screen}");
+        // Its own job again keeps the sheet as it is (no reload).
+        page.open_sheet(project);
+        assert!(page.sheet.as_ref().is_some_and(|s| s.loading.is_none()));
     }
 
     #[test]
@@ -708,7 +760,7 @@ mod tests {
         let screen = draw(&mut page, 120).join("\n");
         assert!(screen.contains("● Running · 1m"), "{screen}");
         assert!(screen.contains("step 1 of 3"), "{screen}");
-        assert!(screen.contains("c cancel job · esc close"), "{screen}");
+        assert!(screen.contains("↑/↓ job · c cancel job · esc close"), "{screen}");
         assert_eq!(page.take_cancel().as_deref(), Some("j8"));
         assert_eq!(page.take_cancel(), None, "one cancel per sheet");
         assert!(draw(&mut page, 120).join("\n").contains("Canceling…"));

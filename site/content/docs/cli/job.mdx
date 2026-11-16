@@ -75,8 +75,8 @@ login shell, in a Shelbi session of its own (`<project>/job/<id>`, never one of
 a workspace's). It keeps running after the CLI exits, across a hub daemon
 restart and across a quit. It runs in a terminal, so it prints what it would
 print in yours, and the Jobs screen shows it live: click a job in the desktop
-app, or press Enter on it in the TUI, to open its terminal beside the list
-(read-only, with a Cancel button while it runs). Its combined output also goes
+app, or press Enter on it in the TUI, to open its terminal in a pane over the
+list (read-only, with a Cancel button while it runs). Its combined output also goes
 to `~/.shelbi/projects/<project>/jobs/<id>/output.log` as plain text (the
 event's `log=`), and its exit code and last 20 lines to `result.json` beside
 it. Read the output with [`shelbi job log`](#log). The session is removed once

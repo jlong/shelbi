@@ -335,6 +335,13 @@ impl JobRow {
     /// 1m 30s`, `● Overdue · 45m / 30m`). Colored with
     /// [`status_tone_at`](Self::status_tone_at).
     pub fn sheet_status(&self, now: DateTime<Utc>) -> String {
+        format!("{} · {}", self.status_glyph_label(now), self.duration(now))
+    }
+
+    /// The status with its glyph, and no duration (`● Running`, `✕ Failed ·
+    /// exit 3`): the desktop sheet's Status property, which shows the
+    /// duration on a row of its own.
+    pub fn status_glyph_label(&self, now: DateTime<Utc>) -> String {
         let glyph = match self.state {
             JobState::Running => "●",
             JobState::Finished { status, .. } => match status {
@@ -344,7 +351,7 @@ impl JobRow {
                 JobStatus::Exited | JobStatus::Closed => "○",
             },
         };
-        format!("{glyph} {} · {}", self.status_label_at(now), self.duration(now))
+        format!("{glyph} {}", self.status_label_at(now))
     }
 
     /// Whether the sheet offers [`CANCEL_LABEL`]: the job is still running.
@@ -815,6 +822,7 @@ mod tests {
         assert!(running.can_cancel());
         let failed = JobRow::from_record(&record("j5", JobStatus::Failed, Some(3), at(14, 0), at(14, 1)));
         assert_eq!(failed.sheet_status(now), "✕ Failed · exit 3 · 1m");
+        assert_eq!(failed.status_glyph_label(now), "✕ Failed · exit 3", "the status alone");
         assert!(!failed.can_cancel());
         let ok = JobRow::from_record(&record("j6", JobStatus::Ok, Some(0), at(14, 0), at(14, 2)));
         assert_eq!(ok.sheet_status(now), "✓ OK · 2m");

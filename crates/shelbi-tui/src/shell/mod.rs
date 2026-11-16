@@ -5940,11 +5940,30 @@ impl ShellState {
         if chord.and_then(|c| self.keymaps.global.dispatch(c)).is_some() {
             return;
         }
+        let project = self.client.project().map(str::to_string);
+        // With the sheet open, it follows the selection to the next job.
+        let follow = |jobs: &mut crate::jobs::JobsPage| {
+            if let Some(project) = &project {
+                jobs.follow_selection(project);
+            }
+        };
         match k.code {
-            KeyCode::Up | KeyCode::Char('k') => self.jobs.nav_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.jobs.nav_down(),
-            KeyCode::Home | KeyCode::Char('g') => self.jobs.nav_first(),
-            KeyCode::End | KeyCode::Char('G') => self.jobs.nav_last(),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.jobs.nav_up();
+                follow(&mut self.jobs);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.jobs.nav_down();
+                follow(&mut self.jobs);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                self.jobs.nav_first();
+                follow(&mut self.jobs);
+            }
+            KeyCode::End | KeyCode::Char('G') => {
+                self.jobs.nav_last();
+                follow(&mut self.jobs);
+            }
             KeyCode::Enter => {
                 if let Some(project) = self.client.project().map(str::to_string) {
                     self.jobs.open_sheet(&project);

@@ -3016,7 +3016,7 @@ fn column_color(c: &Column) -> Color {
     category_color(c.category())
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(crate) fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
     }
