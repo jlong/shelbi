@@ -28,7 +28,8 @@ use chrono::{DateTime, Utc};
 use clap::Subcommand;
 use shelbi_app::estimate::EstimateProgress;
 use shelbi_orchestrator::awareness as runner;
-use shelbi_state::awareness::{self, Job, JobKind, JobRecord, NewJob};
+use shelbi_orchestrator::job_route;
+use shelbi_state::awareness::{self, Job, JobKind, JobRecord, JobStarter, NewJob};
 
 /// How often `job log --follow` looks for new output and for the job ending.
 const FOLLOW_POLL: Duration = Duration::from_millis(250);
@@ -114,11 +115,14 @@ pub fn run(project_opt: Option<String>, cmd: JobCmd) -> Result<()> {
     match cmd {
         JobCmd::Run { label, estimate, cmd } => {
             let estimate = parse_estimate(estimate.as_deref())?;
-            let job = runner::spawn_command_job(&project, &cmd, label, estimate).map_err(|e| anyhow!(e))?;
+            let started_by = job_route::starter_from_env(&project);
+            let job = runner::spawn_command_job(&project, &cmd, label, estimate, started_by)
+                .map_err(|e| anyhow!(e))?;
             let log = awareness::job_output_path(&project, &job.id).map_err(|e| anyhow!(e))?;
             println!("✓ job {} started: {}", job.id, job.display_label());
             println!("  output: {}", log.display());
             print_estimate(&job);
+            print_reports_to(&job);
             Ok(())
         }
         JobCmd::Watch { pid, ci, pr, label, estimate } => {
@@ -134,10 +138,11 @@ pub fn run(project_opt: Option<String>, cmd: JobCmd) -> Result<()> {
                 (_, _, Some(pr)) => (JobKind::Pr, pr.to_string()),
                 _ => bail!("pass one of --pid, --ci or --pr"),
             };
-            let job = awareness::add_job(&project, NewJob { kind, target, label, estimate })
+            let job = awareness::add_job(&project, NewJob { kind, target, label, estimate, started_by: job_route::starter_from_env(&project) })
                 .map_err(|e| anyhow!(e))?;
             println!("✓ job {} watching {}", job.id, job.display_label());
             print_estimate(&job);
+            print_reports_to(&job);
             Ok(())
         }
         JobCmd::Estimate { id, duration } => {
@@ -202,6 +207,14 @@ fn parse_estimate(value: Option<&str>) -> Result<Option<Duration>> {
 fn print_estimate(job: &Job) {
     if let Some(d) = job.estimate {
         println!("  estimate: {}", shelbi_core::format_duration(d));
+    }
+}
+
+/// `  reports to: alpha (this session)` when a worker started `job`, so it
+/// knows the result comes back to it as a prompt.
+fn print_reports_to(job: &Job) {
+    if let Some(starter) = &job.started_by {
+        println!("  reports to: {} (this session gets the result as a prompt)", starter.workspace);
     }
 }
 
@@ -305,17 +318,36 @@ fn render_all(jobs: &[Job], history: &[JobRecord], now: DateTime<Utc>) -> String
         };
         let when = format!("started {}", super::remind::relative(job.started_at, now));
         out.push_str(&row(&job.id, job.kind, status, "", &took, &when, &job.display_label()));
+        push_started_by(&mut out, job.started_by.as_ref());
     }
     for r in history {
         let exit = r.exit_code.map(|c| format!("exit {c}")).unwrap_or_default();
         let when = format!("finished {}", super::remind::relative(r.finished_at, now));
         let took = record_progress(r).map(|p| against(&p)).unwrap_or_else(|| duration_text(r.duration()));
         out.push_str(&row(&r.id, r.kind, r.status.as_str(), &exit, &took, &when, &r.display_label()));
+        push_started_by(&mut out, r.started_by.as_ref());
         if let Some(log) = &r.log {
             out.push_str(&format!("      log: {}\n", log.display()));
         }
     }
     out
+}
+
+/// The `      by: alpha (developer, t1)` line under a job a worker started.
+fn push_started_by(out: &mut String, starter: Option<&JobStarter>) {
+    if let Some(starter) = starter {
+        out.push_str(&format!("      by: {}\n", starter.describe()));
+    }
+}
+
+/// `job j3 started by alpha (developer, t1)`, for `job log`'s header.
+fn started_by_line(found: &Found) -> Option<String> {
+    let (id, starter) = match found {
+        Found::Running(j) => (&j.id, j.started_by.as_ref()?),
+        Found::Finished(r) => (&r.id, r.started_by.as_ref()?),
+        Found::DirOnly => return None,
+    };
+    Some(format!("job {id} started by {}", starter.describe()))
 }
 
 /// What `job log` found for an id.
@@ -360,6 +392,10 @@ fn print_log(project: &str, id: &str, lines: Option<usize>, follow: bool) -> Res
         Found::Finished(r) => r.kind,
         Found::DirOnly => JobKind::Command,
     };
+    // On stderr, so the output itself pipes clean.
+    if let Some(by) = started_by_line(&found) {
+        eprintln!("{by}");
+    }
     if kind != JobKind::Command {
         let text = match &found {
             Found::Running(job) => watch_status_running(job, now),
@@ -524,7 +560,8 @@ fn watch_status_finished(record: &JobRecord, now: DateTime<Utc>) -> String {
 }
 
 /// `job list`: each running job, newest first. A job with an estimate shows
-/// its elapsed time against it, and `overdue` once it is used up.
+/// its elapsed time against it, and `overdue` once it is used up; one a worker
+/// started ends `by <workspace>` (it reports to that worker).
 fn render_list(jobs: &[Job], now: DateTime<Utc>) -> String {
     if jobs.is_empty() {
         return "no jobs\n".into();
@@ -538,8 +575,9 @@ fn render_list(jobs: &[Job], now: DateTime<Utc>) -> String {
             None if estimates => format!("{:<23} ", ""),
             None => String::new(),
         };
+        let by = job.started_by.as_ref().map(|s| format!("  by {}", s.workspace)).unwrap_or_default();
         out.push_str(&format!(
-            "{:<5} {:<8} started {:<9} {progress}{}\n",
+            "{:<5} {:<8} started {:<9} {progress}{}{by}\n",
             job.id,
             job.kind.as_str(),
             super::remind::relative(job.started_at, now),
@@ -557,7 +595,7 @@ mod tests {
     use std::sync::Arc;
 
     fn job(id: &str, kind: JobKind, target: &str, started_at: DateTime<Utc>) -> Job {
-        Job { id: id.into(), kind, target: target.into(), label: None, started_at, runner_pid: None, estimate: None, next_alert_at: None }
+        Job { id: id.into(), kind, target: target.into(), label: None, started_at, runner_pid: None, estimate: None, next_alert_at: None, started_by: None }
     }
 
     #[test]
@@ -580,6 +618,34 @@ mod tests {
         assert_eq!(lines[2], "      log: /h/jobs/j7/output.log");
         assert!(lines[3].starts_with("j6    pr       merged") && lines[3].ends_with("PR #2265"), "{text}");
         assert_eq!(render_all(&[], &[], now), "no jobs\n");
+    }
+
+    #[test]
+    fn listings_and_the_log_header_say_which_worker_started_a_job() {
+        let now = Utc::now();
+        let ago = |s: i64| now - chrono::Duration::seconds(s);
+        let starter = JobStarter { workspace: "alpha".into(), agent: Some("developer".into()), task: Some("t1".into()) };
+        let running = Job { started_by: Some(starter.clone()), ..job("j9", JobKind::Command, "cargo test", ago(60)) };
+        let finished = JobRecord {
+            log: Some("/h/jobs/j7/output.log".into()),
+            ..JobRecord::finished(
+                &Job { started_by: Some(JobStarter { agent: None, task: None, ..starter }), ..job("j7", JobKind::Command, "make", ago(300)) },
+                JobStatus::Ok,
+                ago(200),
+            )
+        };
+        let text = render_all(std::slice::from_ref(&running), &[finished.clone(), JobRecord::finished(&job("j6", JobKind::Pid, "1", ago(900)), JobStatus::Exited, ago(800))], now);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "      by: alpha (developer, t1)", "{text}");
+        assert_eq!(lines[3], "      by: alpha", "{text}");
+        assert_eq!(lines[4], "      log: /h/jobs/j7/output.log", "{text}");
+        assert_eq!(lines.len(), 6, "a job nobody started has no by line:\n{text}");
+        assert_eq!(started_by_line(&Found::Running(running.clone())).unwrap(), "job j9 started by alpha (developer, t1)");
+        assert_eq!(started_by_line(&Found::Finished(finished)).unwrap(), "job j7 started by alpha");
+        assert!(started_by_line(&Found::DirOnly).is_none());
+        let list = render_list(&[running, job("j8", JobKind::Pid, "1", ago(5))], now);
+        assert!(list.lines().next().unwrap().ends_with("cargo test  by alpha"), "{list}");
+        assert!(list.lines().nth(1).unwrap().ends_with("pid 1"), "{list}");
     }
 
     fn with_estimate(mut job: Job, mins: u64) -> Job {

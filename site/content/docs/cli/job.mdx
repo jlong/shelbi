@@ -13,7 +13,7 @@ shelbi job log <ID> [-n <N>] [-f]
 shelbi job cancel <ID>
 ```
 
-A job is something the orchestrator is waiting on. The hub keeps it in
+A job is something the orchestrator (or a worker, see [Jobs a worker starts](#jobs-a-worker-starts)) is waiting on. The hub keeps it in
 `~/.shelbi/projects/<project>/awareness.json`, checks it every 5 seconds, and
 writes one line to `~/.shelbi/events.log` when it finishes:
 
@@ -38,6 +38,29 @@ gets one. See [Estimates](#estimates).
 | `pid` | `exited`. |
 | `ci` | `ok` or `failed` (the failing check in `detail`). |
 | `pr` | `merged`, `closed`, or `ok` / `failed` once its checks settle. |
+
+## Jobs a worker starts
+
+Any agent can start a job, not just the orchestrator. A `job run` or `job
+watch` run inside a workspace's agent session records that workspace (with its
+agent and issue), and the job reports back to it instead of to the events log:
+when the job finishes, or runs past its estimate, the worker's session gets a
+one-line prompt with the label, status, exit code, last output line and the
+`shelbi job log` command to read more.
+
+```text
+Shelbi job j4 "desktop tests" finished: failed, exit 3. Last line: "test result: FAILED". Read the output: shelbi job log j4 -n 50
+```
+
+The prompt goes to the worker only while its session is still up and working
+on the same issue. If the session has ended, or the workspace has moved on to
+another issue, the job writes its `job` line to the events log as above, and
+the orchestrator handles it. `job list` marks a worker's job `by <workspace>`,
+`job list --all` adds a `by:` line, and `job log` names who started it.
+
+A worker on a remote machine runs that machine's `shelbi`, whose jobs the hub
+doesn't watch, so its result is never routed back. The shipped agent preamble
+tells agents to run the command directly where `shelbi` isn't on the PATH.
 
 ## run
 

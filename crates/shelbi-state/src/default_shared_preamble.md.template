@@ -18,3 +18,22 @@ process-level mistake here takes down everyone, not just you.
   pid file, never from `~/.shelbi/shelbi.pid`.
 - Tests must not touch the real `~/.shelbi`, the real hub socket, or the real
   daemon lock. Every test that spawns or stops a daemon sets its own root.
+
+## Jobs
+
+Run a long command (a build, a test suite, a migration) as a Shelbi job
+instead of blocking on it; run quick ones directly:
+
+- `shelbi job run --label "<label>" --estimate <duration> -- <command>`
+  prints a job id and returns at once. Keep working on something that doesn't
+  need the result, or end your turn.
+- When the job finishes, its result (status, exit code, last output line)
+  arrives in this session as a prompt. So does a note if it runs past its
+  estimate.
+- `shelbi job log <id> -n 50` prints the end of its output (no `-n` for all
+  of it, `-f` to follow a running job to its end).
+- `shelbi job list` shows running jobs; `--all` adds finished ones.
+  `shelbi job estimate <id> <duration>` revises an estimate, `shelbi job
+  cancel <id>` stops a job.
+- If `shelbi` isn't on your PATH (a remote machine without it), run the
+  command directly.

@@ -174,6 +174,39 @@ pub struct Job {
     /// when `estimate` is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_alert_at: Option<DateTime<Utc>>,
+    /// The worker that started the job (`job run` / `job watch` from inside a
+    /// workspace's agent session). Its result, and any overdue alert, go back
+    /// to that session as a prompt while it still serves the task; otherwise
+    /// (and for a job with no starter: the orchestrator's, the user's shell)
+    /// they go to the orchestrator's feed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<JobStarter>,
+}
+
+/// Who started a job: the workspace whose agent session ran `shelbi job run`
+/// / `job watch`, with the agent and task it was serving then.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobStarter {
+    pub workspace: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+}
+
+impl JobStarter {
+    /// `alpha (developer, task-7)`, as the listings show it.
+    pub fn describe(&self) -> String {
+        let extra: Vec<&str> = [self.agent.as_deref(), self.task.as_deref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if extra.is_empty() {
+            self.workspace.clone()
+        } else {
+            format!("{} ({})", self.workspace, extra.join(", "))
+        }
+    }
 }
 
 impl Job {
@@ -355,6 +388,8 @@ pub struct NewJob {
     pub label: Option<String>,
     /// `--estimate`: how long it should take (see [`Job::estimate`]).
     pub estimate: Option<Duration>,
+    /// The worker starting it (see [`Job::started_by`]).
+    pub started_by: Option<JobStarter>,
 }
 
 /// Register a job and return it with its minted id.
@@ -370,6 +405,7 @@ pub fn add_job(project: &str, job: NewJob) -> Result<Job> {
             runner_pid: None,
             estimate: None,
             next_alert_at: None,
+            started_by: job.started_by,
         };
         if let Some(estimate) = job.estimate {
             new.set_estimate(estimate);
@@ -697,6 +733,9 @@ pub struct JobRecord {
         with = "serde_compact::option"
     )]
     pub estimate: Option<Duration>,
+    /// The worker that started it (see [`Job::started_by`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_by: Option<JobStarter>,
 }
 
 impl JobRecord {
@@ -714,6 +753,7 @@ impl JobRecord {
             detail: None,
             log: None,
             estimate: job.estimate,
+            started_by: job.started_by.clone(),
         }
     }
 
@@ -921,7 +961,7 @@ mod tests {
         let due = Utc::now();
         let err = add_reminder("typo", due, "lost", None).unwrap_err().to_string();
         assert!(err.contains("project `typo` has no state directory"), "{err}");
-        let pid = NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: None };
+        let pid = NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: None, started_by: None };
         assert!(add_job("typo", pid).is_err());
         assert!(set_estimate("typo", "t1", mins(30), due, None).is_err());
         let result = JobResult {
@@ -946,7 +986,7 @@ mod tests {
         let a = add_reminder("demo", due, "a", None).unwrap();
         let j = add_job(
             "demo",
-            NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: None },
+            NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: None, started_by: None },
         )
         .unwrap();
         assert_eq!((a.id.as_str(), j.id.as_str()), ("r1", "j2"));
@@ -994,7 +1034,7 @@ mod tests {
         let _home = Home::new("job-estimate");
         let job = add_job(
             "demo",
-            NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: Some(mins(30)) },
+            NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: Some(mins(30)), started_by: None },
         )
         .unwrap();
         assert_eq!(job.next_alert_at, Some(job.started_at + chrono::Duration::minutes(30)));
@@ -1003,7 +1043,7 @@ mod tests {
         let revised = set_job_estimate("demo", &job.id, mins(90)).unwrap().unwrap();
         assert_eq!(revised.next_alert_at, Some(job.started_at + chrono::Duration::minutes(90)));
         assert!(set_job_estimate("demo", "j99", mins(5)).unwrap().is_none());
-        let zero = NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: Some(Duration::ZERO) };
+        let zero = NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: Some(Duration::ZERO), started_by: None };
         assert!(add_job("demo", zero).is_err());
         // A job from before estimates reads as having none.
         let old: Job = serde_json::from_str(
@@ -1147,6 +1187,7 @@ mod tests {
             runner_pid: None,
             estimate: None,
             next_alert_at: None,
+            started_by: None,
         };
         JobRecord { exit_code: Some(0), ..JobRecord::finished(&job, JobStatus::Ok, finished_at) }
     }

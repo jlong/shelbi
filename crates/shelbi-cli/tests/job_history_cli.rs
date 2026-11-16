@@ -53,7 +53,12 @@ impl Root {
             .env_remove("SHELBI_HUB_SOCK")
             .env_remove("SHELBI_HUB_ADDR")
             .env_remove("SHELBI_CONTROL_SOCK")
-            .env_remove("SHELBI_MANAGED_CONTEXT");
+            .env_remove("SHELBI_MANAGED_CONTEXT")
+            // A worker pane's identity: a job started here would record it.
+            .env_remove("SHELBI_WORKSPACE")
+            .env_remove("SHELBI_AGENT")
+            .env_remove("TASK_ID")
+            .env_remove("PROJECT");
         cmd
     }
 
@@ -325,4 +330,49 @@ fn job_estimates_are_set_revised_and_listed() {
     assert!(watched.contains("estimate: 1h30m"), "{watched}");
     let bad = root.run(&["job", "watch", "--pid", &me, "--estimate", "0m"]);
     assert!(!bad.status.success(), "{bad:?}");
+}
+
+#[test]
+fn a_job_started_from_a_worker_session_records_the_worker() {
+    let root = Root::new("starter");
+    let pid = std::process::id().to_string();
+    let worker = |args: &[&str]| {
+        root.command(args)
+            .env("SHELBI_WORKSPACE", "dev")
+            .env("SHELBI_AGENT", "developer")
+            .env("TASK_ID", "t1")
+            .env("PROJECT", "demo")
+            .env("SHELBI_MANAGED_CONTEXT", "1")
+            .output()
+            .unwrap()
+    };
+    let started = ok(&worker(&["job", "watch", "--pid", &pid, "--label", "mine"]));
+    assert!(started.contains("reports to: dev"), "{started}");
+    // The user's own shell: no starter, reports to the orchestrator as before.
+    let plain = ok(&root.run(&["job", "watch", "--pid", &pid, "--label", "theirs"]));
+    assert!(!plain.contains("reports to"), "{plain}");
+
+    let list = ok(&root.run(&["job", "list"]));
+    let line = |label: &str| list.lines().find(|l| l.contains(label)).unwrap_or_else(|| panic!("{label} in\n{list}")).to_string();
+    assert!(line("mine").ends_with("mine  by dev"), "{list}");
+    assert!(line("theirs").ends_with("theirs"), "{list}");
+
+    let json: serde_json::Value = serde_json::from_str(&ok(&root.run(&["job", "list", "--json"]))).unwrap();
+    let mine = json.as_array().unwrap().iter().find(|j| j["label"] == "mine").unwrap();
+    assert_eq!(mine["started_by"], serde_json::json!({"workspace": "dev", "agent": "developer", "task": "t1"}));
+
+    let all = ok(&root.run(&["job", "list", "--all"]));
+    assert!(all.contains("      by: dev (developer, t1)"), "{all}");
+    let id = mine["id"].as_str().unwrap();
+    let log = root.run(&["job", "log", id]);
+    assert!(String::from_utf8_lossy(&log.stderr).contains(&format!("job {id} started by dev (developer, t1)")), "{log:?}");
+
+    // A session of another project has no worker in this one.
+    let other = root
+        .command(&["job", "watch", "--pid", &pid])
+        .env("SHELBI_WORKSPACE", "dev")
+        .env("PROJECT", "elsewhere")
+        .output()
+        .unwrap();
+    assert!(!ok(&other).contains("reports to"));
 }

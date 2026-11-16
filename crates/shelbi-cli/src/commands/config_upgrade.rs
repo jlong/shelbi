@@ -446,12 +446,14 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_orchestrator_awareness_variants(entry, &text, out);
         sniff_orchestrator_job_log(entry, &text, out);
         sniff_orchestrator_job_estimate(entry, &text, out);
+        sniff_orchestrator_worker_jobs(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
         sniff_zen_assignee_scope(entry, &text, out);
         sniff_tmux_commands(entry, &text, out);
     } else if id.ends_with(SHARED_PREAMBLE_SURFACE_SUFFIX) {
         sniff_shared_preamble(entry, &text, out);
+        sniff_shared_preamble_jobs(entry, &text, out);
     } else if id.ends_with(".changelog-template") {
         sniff_changelog_template(entry, &text, out);
     } else if id.ends_with(".zenmode") {
@@ -2247,6 +2249,40 @@ fn sniff_orchestrator_job_estimate(entry: &InventoryEntry, text: &str, out: &mut
     ));
 }
 
+/// The stable code for "the orchestrator instructions predate worker jobs
+/// reporting to their worker".
+pub(crate) const ORCH_WORKER_JOBS_CODE: &str = "ORCH_WORKER_JOBS_MISSING";
+
+/// Flag orchestrator instructions that teach `shelbi job run` but not that a
+/// job a worker started reports to that worker, so the orchestrator waits on
+/// (or cancels) a job in `shelbi job list` whose `job` line will never come to
+/// it. Prose the project may have forked, so
+/// [`Classification::NeedsJudgment`]. A copy that says jobs report to the
+/// worker, or names the `by <workspace>` marker, never fires.
+fn sniff_orchestrator_worker_jobs(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let lower = text.to_ascii_lowercase();
+    if !text.contains("shelbi job run")
+        || lower.contains("report to that worker")
+        || text.contains("by <workspace>")
+    {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        ORCH_WORKER_JOBS_CODE,
+        "orchestrator instructions teach `shelbi job` but not that a job a worker started \
+         reports to that worker, so the orchestrator may wait on (or cancel) a worker's job \
+         whose `job` line never comes to it",
+        "After the guidance on watching jobs, add that jobs a worker started report to that \
+         worker: `shelbi job list` marks them `by <workspace>`, their result and overdue alerts \
+         go to the worker's session as a prompt, and their `job` line reaches the orchestrator \
+         only when that session has ended or moved on to another issue. Mirror the shipped \
+         default template.",
+        locate_line_containing(text, "shelbi job run"),
+    ));
+}
+
 /// Detect the pre-rename `shelbi task <verb>` board command in an agent's prose/// Detect the pre-rename `shelbi task <verb>` board command in an agent's prose
 /// (orchestrator `instructions.md` or `zenmode.md`). The board command was
 /// renamed `shelbi task` -> `shelbi issue` (design D5); `shelbi task` still works
@@ -2807,6 +2843,88 @@ fn sniff_shared_preamble(entry: &InventoryEntry, text: &str, out: &mut Vec<Upgra
     ));
 }
 
+/// Heading of the shared preamble's Jobs section (run long commands as
+/// `shelbi job`s; the result comes back as a prompt). The sniffer keys on it
+/// and the healer appends the shipped section under it, so the two can never
+/// disagree.
+pub(crate) const PREAMBLE_JOBS_SECTION_HEADING: &str = "## Jobs";
+
+/// The stable code for "the project's shared preamble predates the Jobs
+/// section". An auto-heal: the shipped section is appended, never interleaved.
+pub(crate) const SHARED_PREAMBLE_JOBS_MISSING: &str = "SHARED_PREAMBLE_JOBS_MISSING";
+
+/// The command the Jobs section necessarily names. A preamble that mentions it
+/// anywhere already teaches jobs in some form (moved, reworded), so it's left
+/// alone even without the heading.
+const PREAMBLE_JOBS_COMMAND_MARKER: &str = "shelbi job run";
+
+/// The shipped `## Jobs` section (heading and body), read out of the default
+/// shared preamble so the appended copy is always the current shipped wording.
+pub(crate) fn shipped_preamble_jobs_section() -> String {
+    let body = markdown_section(shelbi_state::DEFAULT_SHARED_PREAMBLE, PREAMBLE_JOBS_SECTION_HEADING)
+        .expect("the shipped shared preamble carries a `## Jobs` section");
+    format!("{PREAMBLE_JOBS_SECTION_HEADING}\n{}", body.trim_end())
+}
+
+/// Whether a shared preamble already teaches jobs: the heading line, or the
+/// command anywhere in the file. A user who rewrote or emptied the section
+/// keeps the heading, so their edit is never touched.
+fn has_preamble_jobs(text: &str) -> bool {
+    text.lines().any(|l| l.trim_end() == PREAMBLE_JOBS_SECTION_HEADING)
+        || text.contains(PREAMBLE_JOBS_COMMAND_MARKER)
+}
+
+/// Append the shipped Jobs section to a shared preamble that lacks it,
+/// returning the text unchanged otherwise (and for an empty file). Purely
+/// additive: the original text is a byte prefix of the result. The healer's
+/// write-back; it shares [`has_preamble_jobs`] with the sniffer.
+pub(crate) fn append_preamble_jobs_section(text: &str) -> String {
+    if text.trim().is_empty() || has_preamble_jobs(text) {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out.push_str(&shipped_preamble_jobs_section());
+    out.push('\n');
+    out
+}
+
+/// Sniff an existing `agents/_shared/preamble.md` for the Jobs section: run a
+/// long build or test suite as `shelbi job run` instead of blocking on it, and
+/// the result arrives as a prompt.
+///
+/// The section ships in the default preamble, which only reaches NEW projects
+/// (and ones with no preamble, [`SHARED_PREAMBLE_MISSING`]). An **absence**
+/// sniff routed to [`Classification::AutoHeal`], like the orchestrator's
+/// Changelog rule: the fix appends a self-contained section at the end and
+/// rewrites nothing the project wrote. A preamble with the heading or the
+/// command anywhere never fires. Idempotent: after the heal the file carries
+/// the heading.
+fn sniff_shared_preamble_jobs(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    if text.trim().is_empty() || has_preamble_jobs(text) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::AutoHeal,
+        SHARED_PREAMBLE_JOBS_MISSING,
+        "the shared agent preamble has no `## Jobs` section, so workers block on long builds and \
+         test suites instead of running them as `shelbi job`s",
+        "Append the shipped `## Jobs` section: run long commands with `shelbi job run --label \
+         <l> --estimate <d> -- <cmd>`, the result arrives as a prompt, read output with `shelbi \
+         job log <id>`, and run the command directly where `shelbi` isn't on the PATH.",
+        Location {
+            line: text.lines().count().max(1),
+            column: 1,
+        },
+    ));
+}
+
 fn sibling_finding(
     entry: &InventoryEntry,
     file: &Path,
@@ -3315,6 +3433,11 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
             "These are prose instructions a project may have forked and customized, so the \
              `shelbi job log` guidance can't be merged in mechanically without risking local \
              edits; the orchestrator refreshes its own copy instead."
+        }
+        ORCH_WORKER_JOBS_CODE => {
+            "These are prose instructions a project may have forked and customized, so the \
+             note that workers' jobs report to them can't be merged in mechanically without \
+             risking local edits; the orchestrator refreshes its own copy instead."
         }
         ORCH_JOB_ESTIMATE_CODE => {
             "These are prose instructions a project may have forked and customized, so the job \
@@ -5292,6 +5415,30 @@ mod tests {
         }
     }
 
+    // ---- worker jobs --------------------------------------------------------
+
+    #[test]
+    fn job_guidance_without_worker_jobs_is_needs_judgment() {
+        let text = "# Orchestrator\n\n- Run `shelbi job run --estimate 5m -- <cmd>`.\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_worker_jobs(&orch_entry(), text, &mut out);
+        let f = find(&out, ORCH_WORKER_JOBS_CODE).expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty());
+        for clean in [
+            "Run `shelbi job run -- x`. Jobs a worker started report to that worker.\n",
+            "Run `shelbi job run -- x`; ones marked `by <workspace>` aren't yours.\n",
+            "# Orchestrator\n\nNo jobs here.\n",
+        ] {
+            let mut out = Vec::new();
+            sniff_orchestrator_worker_jobs(&orch_entry(), clean, &mut out);
+            assert!(find(&out, ORCH_WORKER_JOBS_CODE).is_none(), "{clean}: {:?}", codes(&out));
+        }
+        let mut out = Vec::new();
+        sniff_orchestrator_worker_jobs(&orch_entry(), shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS, &mut out);
+        assert!(find(&out, ORCH_WORKER_JOBS_CODE).is_none(), "shipped default trips it: {:?}", codes(&out));
+    }
+
     /// Drift guard: the shipped orchestrator template teaches job estimates
     /// and reacts to the job `overdue` line.
     #[test]
@@ -6466,9 +6613,14 @@ Finalize by moving the card: `shelbi task move <task> --to done`.
         assert_eq!(f.classification, Classification::NeedsJudgment);
         assert!(!f.rationale.is_empty());
 
-        // The on-start pass never rewrites the project's own prose.
+        // The on-start pass never rewrites the project's own prose, and never
+        // writes the hub-safety rules in itself. It only appends the shipped
+        // `## Jobs` section (SHARED_PREAMBLE_JOBS_MISSING, additive).
         run_for_project("demo");
-        assert_eq!(std::fs::read_to_string(dir.join("preamble.md")).unwrap(), custom);
+        let after = std::fs::read_to_string(dir.join("preamble.md")).unwrap();
+        assert!(after.starts_with(custom), "{after}");
+        assert_eq!(after, append_preamble_jobs_section(custom));
+        assert!(!after.to_ascii_lowercase().contains("hub safety"), "{after}");
     }
 
     #[test]

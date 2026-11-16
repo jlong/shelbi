@@ -472,7 +472,7 @@ mod tests {
     }
 
     fn job(id: &str, kind: JobKind, target: &str, label: Option<&str>, started_at: DateTime<Utc>) -> Job {
-        Job { id: id.into(), kind, target: target.into(), label: label.map(str::to_string), started_at, runner_pid: None, estimate: None, next_alert_at: None }
+        Job { id: id.into(), kind, target: target.into(), label: label.map(str::to_string), started_at, runner_pid: None, estimate: None, next_alert_at: None, started_by: None }
     }
 
     fn draw(page: &mut JobsPage, width: u16) -> Vec<String> {
