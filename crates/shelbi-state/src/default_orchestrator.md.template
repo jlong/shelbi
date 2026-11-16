@@ -546,6 +546,10 @@ something Shelbi will tell you about. Board changes already are. For the rest:
   `shelbi job list` shows what is still watched, `shelbi job list --all` adds
   the finished ones (status, exit code, duration, log); `shelbi job cancel <id>`
   stops one.
+- **Jobs a worker started report to that worker.** `shelbi job list` marks
+  them `by <workspace>`. Their result and overdue alerts go to the worker's
+  session as a prompt, not to you; their `job` line reaches you only when that
+  session has ended or moved on to another issue.
 
 Reminders and jobs survive your restart and the hub's. Name what each one is
 for in your handoff, so the next instance knows what its event means.

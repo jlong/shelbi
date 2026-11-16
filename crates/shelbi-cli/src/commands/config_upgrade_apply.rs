@@ -47,13 +47,13 @@ use shelbi_core::StatusCategory;
 
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
-    append_changelog_section, apply_awareness_variant_markers, apply_reporting_subject_rewrite,
+    append_changelog_section, append_preamble_jobs_section, apply_awareness_variant_markers, apply_reporting_subject_rewrite,
     apply_tmux_instruction_rewrites, apply_tracker_ownership_rewrites,
     AWARENESS_VARIANTS_AUTOHEAL_CODE, TRACKER_OWNERSHIP_AUTOHEAL_CODE,
     cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
     scope_label, Classification, UpgradeFinding, UpgradeReport, CHANGELOG_TEMPLATE_MISSING,
     CHANGELOG_TEMPLATE_PRIOR_DEFAULT, PR_TEMPLATE_MISSING,
-    ORCH_CHANGELOG_RULE_MISSING, REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
+    ORCH_CHANGELOG_RULE_MISSING, REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_JOBS_MISSING, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
 };
 
 /// One auto-heal write-back that landed on disk this run. Returned to the
@@ -316,6 +316,13 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
     // it runs after the in-place tracker rewrite and re-reads the file.
     if codes.contains(ORCH_CHANGELOG_RULE_MISSING) {
         heal_orchestrator_changelog(entry, applied);
+    }
+
+    // Append the shared preamble's `## Jobs` section. Additive like the
+    // Changelog rule; it runs after a missing preamble was materialized above
+    // (which already carries it) and re-reads the file.
+    if codes.contains(SHARED_PREAMBLE_JOBS_MISSING) {
+        heal_shared_preamble_jobs(entry, applied);
     }
 
     // Add `--no-fail-fast` to fail-fast `cargo test` local checks. A surgical,
@@ -1253,6 +1260,25 @@ fn heal_orchestrator_changelog(entry: &InventoryEntry, applied: &mut Vec<Applied
     );
 }
 
+/// Append the shipped `## Jobs` section to a shared preamble that lacks it,
+/// via the shared [`append_preamble_jobs_section`]. Additive only, and a no-op
+/// for a preamble that gained the section between detection and apply.
+fn heal_shared_preamble_jobs(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let out = append_preamble_jobs_section(&text);
+    if out == text {
+        return;
+    }
+    if let Err(e) = write_atomic(path, &out) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(applied, entry, SHARED_PREAMBLE_JOBS_MISSING, path, "append-jobs-section".into());
+}
+
 // ---------------------------------------------------------------------------
 // Shared helpers
 
@@ -1978,6 +2004,70 @@ zen:
 
     fn has_code(report: &UpgradeReport, code: &str) -> bool {
         report.findings.iter().any(|f| f.code == code)
+    }
+
+    fn home_with_shared_preamble(guard: &EnvGuard, text: &str) -> (PathBuf, PathBuf) {
+        let home = fresh_home();
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let dir = home.join("projects/demo/agents/_shared");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("preamble.md");
+        std::fs::write(&path, text).unwrap();
+        (home, path)
+    }
+
+    #[test]
+    fn a_preamble_without_the_jobs_section_gets_it_appended_keeping_its_own_text() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        // The hub-safety rules as an older default shipped them, plus the
+        // project's own notes: only the Jobs section is missing.
+        let original = format!(
+            "{}\n## Our notes\n\nThe API lives in services/api.",
+            shelbi_state::DEFAULT_SHARED_PREAMBLE.split("\n## Jobs").next().unwrap().trim_end()
+        );
+        let (_home, path) = home_with_shared_preamble(&guard, &original);
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            report.findings.iter().any(|f| f.code == SHARED_PREAMBLE_JOBS_MISSING
+                && f.classification == Classification::AutoHeal),
+            "expected a SHARED_PREAMBLE_JOBS_MISSING auto-heal: {:?}",
+            report.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
+        );
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(applied.iter().any(|c| c.code == SHARED_PREAMBLE_JOBS_MISSING), "{applied:?}");
+
+        let healed = std::fs::read_to_string(&path).unwrap();
+        assert!(healed.starts_with(&original), "the project's text was rewritten: {healed}");
+        let section = crate::commands::config_upgrade::shipped_preamble_jobs_section();
+        assert!(healed.ends_with(&format!("\n\n{section}\n")), "{healed}");
+        assert!(section.contains("shelbi job run") && section.contains("shelbi job log"), "{section}");
+
+        // Idempotent.
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(!has_code(&report2, SHARED_PREAMBLE_JOBS_MISSING), "{report2:?}");
+        assert!(apply_auto_heal(&["demo".to_string()], &report2).is_empty());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), healed);
+    }
+
+    #[test]
+    fn the_shipped_preamble_or_an_edited_jobs_section_is_left_alone() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        for text in [
+            shelbi_state::DEFAULT_SHARED_PREAMBLE,
+            "# Notes\n\n## Jobs\n\nDon't use Shelbi jobs in this project.\n",
+            "# Notes\n\nWrap `cargo test` in `shelbi job run` when it takes long.\n",
+        ] {
+            let (_home, path) = home_with_shared_preamble(&guard, text);
+            let report = detect(&["demo".to_string()]).unwrap();
+            assert!(!has_code(&report, SHARED_PREAMBLE_JOBS_MISSING), "{text}: {report:?}");
+            apply_auto_heal(&["demo".to_string()], &report);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "file was modified");
+        }
     }
 
     #[test]

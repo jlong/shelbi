@@ -624,6 +624,7 @@ mod tests {
             runner_pid: None,
             estimate: None,
             next_alert_at: None,
+            started_by: None,
         }
     }
 

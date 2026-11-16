@@ -14,6 +14,10 @@
 //!   next alert, on the same grid as a task's (the estimate, then every half
 //!   of it, at least [`awareness::MIN_OVERDUE_INTERVAL`]), until it finishes.
 //!
+//! A job a worker started ([`Job::started_by`]) reports to that worker's
+//! session as a prompt instead of the feed, finished or overdue, while the
+//! session still serves the task that started it ([`crate::job_route`]).
+//!
 //! The probing (process table, files, GitHub, the board) happens outside the
 //! store lock; then one locked read-modify-write appends each event and
 //! removes or advances its entry, re-checking that the entry still exists so
@@ -29,10 +33,11 @@ use chrono::{DateTime, Utc};
 use shelbi_core::{Error, Project, Result, StatusCategory};
 
 pub use crate::job_exec::{job_of_session, job_session_name, run_job_exec};
+pub use crate::job_route::JobNotice;
 use crate::session_process_backend::SessionProcessBackend;
 use shelbi_state::awareness::{
     self, overdue_interval, next_slot_after, AwarenessStore, Job, JobKind, JobRecord, JobResult,
-    JobStatus,
+    JobStarter, JobStatus,
 };
 
 /// How often a `ci` / `pr` job samples GitHub.
@@ -97,6 +102,13 @@ pub trait AwarenessProbe {
     fn active_tasks(&self, project: &Project) -> Option<HashMap<String, Option<String>>>;
     /// Whether the box can reach GitHub.
     fn online(&self) -> bool;
+    /// Whether the worker that started a job is still there to hear about it:
+    /// its session is up and serves the same task.
+    fn starter_live(&self, project: &Project, starter: &JobStarter) -> bool;
+    /// Hand `notice` to `starter`'s session. Must not block the tick: the
+    /// live probe sends on a thread of its own, falling back to the feed if
+    /// the send doesn't land.
+    fn deliver_to_starter(&self, project: &Project, starter: &JobStarter, notice: JobNotice);
 }
 
 /// What a job reports when it fires.
@@ -193,17 +205,34 @@ fn tick_inner(
         return Ok(());
     }
 
+    // Which reporting jobs' starters are still there to hear it, asked
+    // outside the lock. A job missing here reports to the feed.
+    let live_starters: HashSet<String> = store
+        .jobs
+        .iter()
+        .filter(|j| outcomes.contains_key(&j.id) || job_alert_due(j, now))
+        .filter(|j| j.started_by.as_ref().is_some_and(|s| probe.starter_live(project, s)))
+        .map(|j| j.id.clone())
+        .collect();
+
+    let mut to_workers = Vec::new();
     let finished = awareness::update_awareness(name, |store| {
+        let mut reports = Reports { project: name, live_starters: &live_starters, to_workers: &mut to_workers };
         fire_reminders(name, store, now);
-        let finished = fire_jobs(name, store, &outcomes, now);
+        let finished = fire_jobs(&mut reports, store, &outcomes, now);
         // After the finished ones leave: a job that ends this tick reports
         // its end, not that it ran long.
-        fire_job_overdue(name, store, now);
+        fire_job_overdue(&mut reports, store, now);
         if let Some(active) = &active {
             fire_estimates(name, store, active, now);
         }
         Ok(finished)
     })?;
+    // Only once the store no longer lists them as due, so a report is handed
+    // over once.
+    for (starter, notice) in to_workers {
+        probe.deliver_to_starter(project, &starter, notice);
+    }
     // Into the history once the store no longer lists them. A failure here
     // loses only the record: the event is already out.
     if let Err(e) = awareness::record_finished_jobs(name, finished, now) {
@@ -231,10 +260,34 @@ fn fire_reminders(project: &str, store: &mut AwarenessStore, now: DateTime<Utc>)
     });
 }
 
+/// Where this tick's job reports go: the worker that started a job, while it
+/// is live, else the orchestrator's feed.
+struct Reports<'a> {
+    project: &'a str,
+    /// Jobs whose starter is live (see [`AwarenessProbe::starter_live`]).
+    live_starters: &'a HashSet<String>,
+    /// The reports for workers, handed over once the store is written.
+    to_workers: &'a mut Vec<(JobStarter, JobNotice)>,
+}
+
+impl Reports<'_> {
+    /// Route `notice` for `job`. `Err` only when the feed line failed to
+    /// append (the caller retries next tick).
+    fn send(&mut self, job: &Job, notice: JobNotice) -> Result<()> {
+        match &job.started_by {
+            Some(starter) if self.live_starters.contains(&job.id) => {
+                self.to_workers.push((starter.clone(), notice));
+                Ok(())
+            }
+            _ => notice.append_to_feed(self.project),
+        }
+    }
+}
+
 /// Report every job with an outcome and drop it from the store. Returns the
 /// history record of each one reported.
 fn fire_jobs(
-    project: &str,
+    reports: &mut Reports<'_>,
     store: &mut AwarenessStore,
     outcomes: &HashMap<String, JobOutcome>,
     now: DateTime<Utc>,
@@ -244,23 +297,22 @@ fn fire_jobs(
         let Some(outcome) = outcomes.get(&job.id) else {
             return true;
         };
-        let label = job.display_label();
-        let event = shelbi_state::JobEvent {
-            id: &job.id,
-            kind: job.kind.as_str(),
-            label: &label,
-            status: outcome.status.as_str(),
+        let notice = JobNotice::Finished {
+            id: job.id.clone(),
+            kind: job.kind,
+            label: job.display_label(),
+            status: outcome.status,
             exit: outcome.exit,
-            detail: outcome.detail.as_deref(),
-            log: outcome.log.as_deref(),
+            detail: outcome.detail.clone(),
+            log: outcome.log.clone(),
         };
-        match shelbi_state::append_job_event(project, &event) {
+        match reports.send(job, notice) {
             Ok(()) => {
                 finished.push(outcome.record(job, now));
                 false
             }
             Err(e) => {
-                tracing::warn!(project, job = %job.id, error = %e, "job event not written; retrying next tick");
+                tracing::warn!(project = reports.project, job = %job.id, error = %e, "job event not written; retrying next tick");
                 true
             }
         }
@@ -276,16 +328,17 @@ fn job_alert_due(job: &Job, now: DateTime<Utc>) -> bool {
 /// Write an `overdue` line for every running job past its next alert and move
 /// that alert along the overdue grid ([`overdue_interval`]), exactly as a
 /// task's estimate does. One whose line fails to append is retried next tick.
-fn fire_job_overdue(project: &str, store: &mut AwarenessStore, now: DateTime<Utc>) {
+fn fire_job_overdue(reports: &mut Reports<'_>, store: &mut AwarenessStore, now: DateTime<Utc>) {
     for job in store.jobs.iter_mut().filter(|j| job_alert_due(j, now)) {
         let (Some(estimate), Some(next)) = (job.estimate, job.next_alert_at) else {
             continue;
         };
         let elapsed = (now - job.started_at).to_std().unwrap_or_default();
-        if let Err(e) =
-            shelbi_state::append_job_overdue_event(project, &job.id, estimate, elapsed, &job.display_label())
-        {
-            tracing::warn!(project, job = %job.id, error = %e, "job overdue event not written; retrying next tick");
+        let Some(notice) = JobNotice::overdue(job, elapsed) else {
+            continue;
+        };
+        if let Err(e) = reports.send(job, notice) {
+            tracing::warn!(project = reports.project, job = %job.id, error = %e, "job overdue event not written; retrying next tick");
             continue;
         }
         job.next_alert_at = Some(next_slot_after(next, overdue_interval(estimate), now));
@@ -494,6 +547,25 @@ impl<F: Fn() -> bool> AwarenessProbe for LiveProbe<F> {
 
     fn online(&self) -> bool {
         (self.is_online)()
+    }
+
+    fn starter_live(&self, project: &Project, starter: &JobStarter) -> bool {
+        crate::job_route::starter_live(project, starter)
+    }
+
+    fn deliver_to_starter(&self, project: &Project, starter: &JobStarter, notice: JobNotice) {
+        let job = notice.id().to_string();
+        let send = {
+            let (project, starter, notice) = (project.name.clone(), starter.clone(), notice.clone());
+            move || crate::job_route::deliver_or_fall_back(&project, &starter, &notice)
+        };
+        // A verified send blocks for seconds; the tick must not.
+        if let Err(e) = std::thread::Builder::new().name(format!("job-report-{job}")).spawn(send) {
+            tracing::warn!(project = %project.name, job, error = %e, "no thread to deliver the job report; reporting to the orchestrator");
+            if let Err(e) = notice.append_to_feed(&project.name) {
+                tracing::warn!(project = %project.name, job, error = %e, "job report lost");
+            }
+        }
     }
 }
 
@@ -749,12 +821,14 @@ fn verdict_of(snapshot: &crate::zen::CiSnapshot, settled: bool) -> Option<WatchV
 /// child of a Shelbi session of its own, [`job_session_name`], so it outlives
 /// this CLI and any daemon restart, has a terminal a client can watch, and
 /// leads the process group `job cancel` signals. The runner records its own
-/// pid once it is up. Returns the job at once.
+/// pid once it is up. `started_by` is the worker to report back to (see
+/// [`crate::job_route::starter_from_env`]). Returns the job at once.
 pub fn spawn_command_job(
     project: &str,
     argv: &[String],
     label: Option<String>,
     estimate: Option<Duration>,
+    started_by: Option<JobStarter>,
 ) -> Result<Job> {
     if argv.is_empty() {
         return Err(Error::Other("no command given after `--`".into()));
@@ -771,6 +845,7 @@ pub fn spawn_command_job(
             target,
             label,
             estimate,
+            started_by,
         },
     )?;
     let started = (|| -> Result<()> {

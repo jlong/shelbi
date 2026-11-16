@@ -3236,6 +3236,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
                 .map_err(|e| Error::Other(format!("resolving hub socket path: {e}")))?;
             let spec = LocalDispatchArgs {
                 target: a.addr,
+                workspace: &a.workspace.name,
                 task_id: a.task_id,
                 agent: a.agent,
                 project: &a.project.name,
@@ -5623,6 +5624,10 @@ fn copy_dir_contents_to_remote(ssh_host: &str, src: &Path, dest: &Path) -> Resul
 pub struct LocalDispatchArgs<'a> {
     /// The workspace's session target; names the session the agent runs under.
     target: &'a SessionTarget,
+    /// The workspace's name, injected as `SHELBI_WORKSPACE`
+    /// ([`shelbi_state::WORKSPACE_ENV`]) so a `shelbi job` the agent starts
+    /// records which worker to report back to.
+    workspace: &'a str,
     /// The worktree the agent starts in (the session's cwd).
     worktree: &'a Path,
     /// The agent launch command line (runner invocation with its startup-prompt
@@ -5647,7 +5652,8 @@ pub struct LocalDispatchArgs<'a> {
 
 impl LocalDispatchArgs<'_> {
     /// Map this local-dispatch spec to a session-process [`SpawnSpec`]. The
-    /// per-dispatch variables (`TASK_ID` / `PROJECT` / `SHELBI_HUB_SOCK`, and
+    /// per-dispatch variables (`TASK_ID` / `PROJECT` / `SHELBI_HUB_SOCK` /
+    /// `SHELBI_WORKSPACE`, and
     /// `SHELBI_AGENT` / `PORT` / the review pgid file when set) plus
     /// `SHELBI_MANAGED_CONTEXT=1` (so the commit guard governs the agent) are
     /// placed as an env prefix before an `exec` of the runner launch line under
@@ -5663,6 +5669,11 @@ impl LocalDispatchArgs<'_> {
             shelbi_agent::shell_escape(self.project),
             shelbi_agent::shell_escape(self.hub_sock),
         );
+        env_prefix.push_str(&format!(
+            " {}={}",
+            shelbi_state::WORKSPACE_ENV,
+            shelbi_agent::shell_escape(self.workspace),
+        ));
         if let Some(agent) = self.agent {
             env_prefix.push_str(&format!(" SHELBI_AGENT={}", shelbi_agent::shell_escape(agent)));
         }

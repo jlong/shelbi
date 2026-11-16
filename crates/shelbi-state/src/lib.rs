@@ -263,7 +263,7 @@ pub use workspace_status::{
     load_workspace_status, parse_orchestrator_title_state, parse_pane_title_marker,
     parse_pane_title_state, read_review_serve_pgid, rehome_review_serve_pgid_path,
     review_serve_pgid_path, save_workspace_status, workspace_status_path, workspaces_dir,
-    PaneMarker, WorkspaceState, WorkspaceStatus, REVIEW_SERVE_PGID_FILE_ENV,
+    PaneMarker, WorkspaceState, WorkspaceStatus, REVIEW_SERVE_PGID_FILE_ENV, WORKSPACE_ENV,
 };
 pub use changelog::{
     changelog_template_path, scaffold_changelog_template, ChangelogTemplateOutcome,

@@ -86,6 +86,42 @@ fn classify_delivery(
 /// settle window can't merge with a dispatch's prompt. Blocking, for up to two
 /// polling windows.
 pub fn send_to_workspace(project_name: &str, workspace_name: &str, message: &str) -> Result<AgentDelivery> {
+    let target = resolve_workspace(project_name, workspace_name)?;
+    let _lock = shelbi_state::lock_workspace(project_name, workspace_name)?;
+    if !workspace::workspace_pane_alive(&target.host, &target.addr)? {
+        return Err(Error::Other(format!("no agent is running on `{workspace_name}`")));
+    }
+    send_verified(project_name, workspace_name, &target.runner, &target.host, &target.addr, message)
+}
+
+/// [`send_to_workspace`] for a message meant only for the session as it is
+/// now: `still_wanted` is asked under the workspace's lock, after any dispatch
+/// holding it has finished, and `Ok(None)` means it said no and nothing was
+/// sent. A job's result uses it so it never lands in a session that has moved
+/// on to another task.
+pub fn send_to_workspace_if(
+    project_name: &str,
+    workspace_name: &str,
+    message: &str,
+    still_wanted: impl FnOnce(&shelbi_core::Project) -> bool,
+) -> Result<Option<AgentDelivery>> {
+    let target = resolve_workspace(project_name, workspace_name)?;
+    let _lock = shelbi_state::lock_workspace(project_name, workspace_name)?;
+    if !still_wanted(&target.project) {
+        return Ok(None);
+    }
+    send_verified(project_name, workspace_name, &target.runner, &target.host, &target.addr, message).map(Some)
+}
+
+/// Where a workspace's agent is, and the runner profile a send verifies with.
+struct WorkspaceTarget {
+    project: shelbi_core::Project,
+    host: Host,
+    addr: SessionTarget,
+    runner: AgentRunnerSpec,
+}
+
+fn resolve_workspace(project_name: &str, workspace_name: &str) -> Result<WorkspaceTarget> {
     let project = shelbi_state::load_project(project_name)?;
     let spec = project
         .workspace(workspace_name)
@@ -101,11 +137,7 @@ pub fn send_to_workspace(project_name: &str, workspace_name: &str, message: &str
         .ok_or_else(|| Error::Other(format!("project `{project_name}` declares no runner")))?
         .clone();
     let host = machine.host();
-    let _lock = shelbi_state::lock_workspace(project_name, workspace_name)?;
-    if !workspace::workspace_pane_alive(&host, &addr)? {
-        return Err(Error::Other(format!("no agent is running on `{workspace_name}`")));
-    }
-    send_verified(project_name, workspace_name, &runner, &host, &addr, message)
+    Ok(WorkspaceTarget { project, host, addr, runner })
 }
 
 /// How a diff view on this machine reaches a target's agent.

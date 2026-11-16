@@ -203,6 +203,12 @@ pub fn workspace_status_path(project: &str, workspace: &str) -> Result<PathBuf> 
 /// wrapper) can't drift on the spelling.
 pub const REVIEW_SERVE_PGID_FILE_ENV: &str = "SHELBI_REVIEW_PGID_FILE";
 
+/// Env var naming the workspace a local agent session serves. Set at dispatch
+/// beside `TASK_ID` / `PROJECT` / `SHELBI_AGENT`; `shelbi job run` / `job
+/// watch` read it to record which worker started a job, so its result goes
+/// back to that worker.
+pub const WORKSPACE_ENV: &str = "SHELBI_WORKSPACE";
+
 /// `<project>/workspaces/<name>/review-serve.pgid` — records the process-group
 /// id of the review dev server the Review agent launched through the
 /// `shelbi __review-serve` wrapper. Kept hub-side (not in the tmux session env,
