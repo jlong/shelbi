@@ -55,15 +55,28 @@ pub struct TabLayout {
     /// How far into the dragged tab the pointer pressed: the ghost is drawn
     /// that far left of the pointer.
     pub grab_x: f32,
+    /// How far down the dragged tab the pointer pressed.
+    pub grab_y: f32,
+    /// Where the dragged tab sat in the window as its drag began.
+    pub tab_origin: (f32, f32),
     /// The dragged tab's ghost: a drag lasts while it lives (gpui keeps it
     /// for the drag only), so another kind of drag isn't taken for a tab's.
     pub ghost: Option<WeakEntity<TabGhost>>,
+    /// The bar's bounds in the window as last painted (`None` while the
+    /// window draws no tab bar): where another window's dragged tab looks
+    /// for it (`tab-tearoff`).
+    pub bar: Option<gpui::Bounds<f32>>,
 }
 
 /// The layout as the bar and its probes share it.
 pub type SharedLayout = Rc<RefCell<TabLayout>>;
 
 impl TabLayout {
+    /// The dragged tab's ghost is still up.
+    pub fn ghost_alive(&self) -> bool {
+        self.ghost.as_ref().is_some_and(|g| g.upgrade().is_some())
+    }
+
     /// `project`'s slot measured `width` wide as it painted.
     pub fn set_width(&mut self, project: &str, width: f32) {
         match self.widths.get_mut(project) {
@@ -74,7 +87,8 @@ impl TabLayout {
         }
     }
 
-    fn width(&self, project: &str) -> f32 {
+    /// `project`'s slot width as last painted (0 before it has painted).
+    pub fn width(&self, project: &str) -> f32 {
         self.widths.get(project).copied().unwrap_or(0.0)
     }
 
@@ -164,6 +178,12 @@ pub struct TabReorder {
     slides: HashMap<String, Slide>,
     /// What the bar measured as it painted (shared with its probes).
     pub layout: SharedLayout,
+    /// Another window's tab drag is over this bar (`tab-tearoff`): the bar
+    /// opens its gap though the drag isn't this window's.
+    hosting: bool,
+    /// That tab, when this bar has none for its project: the project and its
+    /// slot's width (the gap's).
+    incoming: Option<(String, f32)>,
 }
 
 impl TabReorder {
@@ -172,12 +192,67 @@ impl TabReorder {
         self.project = Some(project.to_string());
         self.slot = None;
         self.settle = None;
+        self.hosting = false;
+        self.incoming = None;
+    }
+
+    /// Another window's drag of `project`'s tab (its slot `slot_w` wide,
+    /// pressed `grab_x` into it) came over this bar, over no gap yet. When
+    /// this bar has a tab for the project too, that tab is the one lifted.
+    pub fn host(&mut self, tabs: &ProjectTabs, project: &str, slot_w: f32, grab_x: f32) {
+        self.start(project);
+        self.hosting = true;
+        if !tabs.contains(project) {
+            self.project = None;
+            self.incoming = Some((project.to_string(), slot_w));
+        }
+        self.layout.borrow_mut().grab_x = grab_x;
+    }
+
+    /// The other window's drag left this bar (or ended): its gap closes.
+    pub fn unhost(&mut self) {
+        if self.hosting {
+            self.cancel();
+        }
+    }
+
+    /// Another window's drag is over this bar.
+    pub fn hosting(&self) -> bool {
+        self.hosting
+    }
+
+    /// The drag ends with no drop here (the tab went to another window, or
+    /// the drag was cancelled): the tabs slide back.
+    pub fn cancel(&mut self) {
+        self.project = None;
+        self.slot = None;
+        self.hosting = false;
+        self.incoming = None;
+    }
+
+    /// Another window's tab dropped here, with the pointer at window x
+    /// `pointer_x`: it takes the gap it is over (the end when it is over
+    /// none), settling from where its ghost was. Whether the tabs changed
+    /// (a lifted tab of this bar's own lands as [`Self::drop`] does).
+    pub fn accept(&mut self, tabs: &mut ProjectTabs, pointer_x: f32) -> bool {
+        self.hosting = false;
+        let Some((project, width)) = self.incoming.take() else {
+            return self.drop(tabs, pointer_x);
+        };
+        let slot = self.slot.take().unwrap_or(tabs.order().len());
+        {
+            let mut layout = self.layout.borrow_mut();
+            // Its slot is the gap's width until it paints.
+            layout.set_width(&project, width);
+            self.settle = Some((project.clone(), pointer_x - layout.grab_x - layout.first_x));
+        }
+        tabs.insert_at(&project, slot)
     }
 
     /// The pointer is over drop gap `slot` (`None`: no gap). Whether that
     /// changed.
     pub fn over(&mut self, slot: Option<usize>) -> bool {
-        let changed = self.project.is_some() && self.slot != slot;
+        let changed = (self.project.is_some() || self.incoming.is_some()) && self.slot != slot;
         if changed {
             self.slot = slot;
         }
@@ -192,11 +267,7 @@ impl TabReorder {
 
     /// The dragged tab's ghost is still up: the drag gpui has is this one.
     pub fn ghost_alive(&self) -> bool {
-        self.layout
-            .borrow()
-            .ghost
-            .as_ref()
-            .is_some_and(|g| g.upgrade().is_some())
+        self.layout.borrow().ghost_alive()
     }
 
     /// Where the dragged tab lands if dropped now (a [`ProjectTabs::move_to`]
@@ -232,7 +303,8 @@ impl TabReorder {
             .clone()
             .filter(|p| active && tabs.contains(p));
         let settle = self.settle.take();
-        if dragged.is_none() && settle.is_none() && self.slides.is_empty() {
+        let incoming = self.incoming.as_ref().filter(|_| active).map(|(_, w)| *w);
+        if dragged.is_none() && incoming.is_none() && settle.is_none() && self.slides.is_empty() {
             return TabFrame::default();
         }
         let order: Vec<&str> = tabs.order().iter().map(String::as_str).collect();
@@ -247,7 +319,26 @@ impl TabReorder {
             }
             _ => order.clone(),
         };
-        let targets: HashMap<&str, f32> = layout.lefts(target_order).into_iter().collect();
+        let targets: HashMap<&str, f32> = match (incoming, self.slot) {
+            // Another window's tab: a gap its width opens before the tab at
+            // `slot`.
+            (Some(width), Some(slot)) => {
+                let mut x = 0.0;
+                order
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, p)| {
+                        if ix == slot {
+                            x += width;
+                        }
+                        let left = x;
+                        x += layout.width(p);
+                        (*p, left)
+                    })
+                    .collect()
+            }
+            _ => layout.lefts(target_order).into_iter().collect(),
+        };
         drop(layout);
 
         self.slides.retain(|p, _| rest.contains_key(p.as_str()));
@@ -269,7 +360,7 @@ impl TabReorder {
             let x = if slide.done(now) { slide.to } else { slide.at(now) };
             frame.offsets.insert(project.to_string(), x - rest[project]);
         }
-        if frame.lifted.is_none() && !frame.animating {
+        if frame.lifted.is_none() && incoming.is_none() && !frame.animating {
             self.slides.clear();
         }
         frame

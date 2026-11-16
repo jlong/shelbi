@@ -32,9 +32,16 @@
 //! before it, its right half the gap after (judged where the tabs rest, so
 //! a tab sliding out from under the pointer doesn't flip it), the bar
 //! before the first tab is the start, and its empty space past the `+` the
-//! end. Over the `+` or off the bar there is no gap: the tabs slide back,
-//! and a drop there leaves the order alone. Dropped, the tab settles from
-//! under the ghost into its slot. A press without movement stays a click.
+//! end. Over the `+` there is no gap: the tabs slide back, and a drop there
+//! leaves the order alone. The gap follows the pointer while it is within
+//! [`tab_tearoff::TEAR_OFF_PX`] of the bar, on it or off it. Dropped, the tab
+//! settles from under the ghost into its slot. A press without movement
+//! stays a click.
+//!
+//! Dragged further from every bar, the ghost turns into a card and the tab
+//! tears off into a window of its own; over another window's bar it drops
+//! into that one ([`tab_tearoff`]). The bar follows its own drags past the
+//! window's edges for that, and records where it is for other windows'.
 //!
 //! The bar stays where it is while the sidebar hides and shows; only the
 //! tabs step right to make room for the toggle.
@@ -48,14 +55,15 @@
 use std::time::Instant;
 
 use gpui::{
-    canvas, deferred, div, prelude::*, px, AnyElement, App, Bounds, Context, Div, DragMoveEvent, Hsla,
-    MouseButton, MouseDownEvent, SharedString, Size, Stateful, Window,
+    canvas, deferred, div, point, prelude::*, px, AnyElement, App, Bounds, Context, DispatchPhase, Div, Hsla,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, SharedString, Size, Stateful, Window,
 };
 use shelbi_app::overlay::palette::ProjectEntry;
 
 use super::project_menu;
 use super::sidebar::{self, SidebarEvent, SidebarHost, TOOLBAR_BUTTON, TRAFFIC_LIGHTS_RIGHT};
 use super::tab_drag::{SharedLayout, TabFrame};
+use super::tab_tearoff;
 pub use super::tab_drag::TabReorder;
 use crate::assets::{heroicon, icons, ICON_SIZE_MENU};
 use crate::elements::placed::{placed, MenuScroll};
@@ -90,7 +98,7 @@ const TAB_MAX_W: f32 = 240.0;
 /// The 1pt rule between tabs.
 const RULE_W: f32 = 1.0;
 /// The `+` tab and the rule after it: no drop gap over it.
-const PLUS_SLOT_W: f32 = TAB_BAR_H + RULE_W;
+pub const PLUS_SLOT_W: f32 = TAB_BAR_H + RULE_W;
 
 /// The project menu's width and its gap under the `+` tab.
 const MENU_W: f32 = 240.0;
@@ -155,40 +163,51 @@ pub struct TabDrag {
 }
 
 /// The tab that follows the pointer during a drag: the tab as the selected
-/// one draws it, lifted off the bar with a shadow.
+/// one draws it, lifted off the bar with a shadow; torn off, the card
+/// ([`tab_tearoff::ghost`]). While the tab isn't over this window's bar the
+/// floating ghost window draws it instead ([`tab_tearoff::FloatingGhost`]),
+/// and this one draws nothing.
 pub struct TabGhost {
     label: SharedString,
     working: bool,
+    /// The dragged tab's width.
+    tab_w: f32,
 }
 
 impl Render for TabGhost {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.global::<Theme>().opaque();
-        let indicator = shelbi_app::overlay::palette::project_indicator(true, self.working);
+        let now = Instant::now();
+        let Some(drag) = tab_tearoff::session(cx) else {
+            return tab_tearoff::ghost(self.label.clone(), self.working, 0.0, self.tab_w, &theme).into_any_element();
+        };
+        if drag.floats() {
+            return div().into_any_element();
+        }
+        if drag.morph.animating(now) {
+            window.request_animation_frame();
+        }
+        // gpui draws the ghost at the tab's grab point; the card is held
+        // elsewhere ([`tab_tearoff::DragState::hold`]).
+        let shift = drag.grab - drag.hold(now);
         div()
-            .debug_selector(|| "tab-drag-ghost".into())
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(TAB_GAP))
-            .h(px(TAB_BAR_H))
-            .max_w(px(TAB_MAX_W))
-            .pl(px(TAB_PAD_LEFT))
-            .pr(px(TAB_PAD_RIGHT))
-            .overflow_hidden()
-            .bg(theme.canvas)
-            .shadow(style::popover_shadow(&theme))
-            .opacity(0.95)
-            .child(project_menu::dot("tab-drag-ghost-dot", indicator, &theme))
-            .child(
-                div()
-                    .min_w_0()
-                    .truncate()
-                    .type_style(Type::BaseMedium)
-                    .text_color(theme.foreground)
-                    .child(self.label.clone()),
-            )
+            .relative()
+            .left(px(shift.x))
+            .top(px(shift.y))
+            .child(tab_tearoff::ghost(
+                self.label.clone(),
+                self.working,
+                drag.morph.at(now),
+                self.tab_w,
+                &theme,
+            ))
+            .into_any_element()
     }
+}
+
+/// The tab drag in this window is live: its ghost is up.
+fn drag_live(layout: &SharedLayout, cx: &App) -> bool {
+    cx.has_active_drag() && layout.borrow().ghost_alive()
 }
 
 /// How one tab draws this frame, beyond the tab itself.
@@ -486,10 +505,47 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
         let layout = props.layout.clone();
         probe(move |b| layout.borrow_mut().first_x = b.origin.x.as_f32() + RULE_W)
     };
-    // The gap under the pointer, judged where the tabs rest; off the bar,
-    // none.
-    let names: Vec<String> = props.tabs.iter().map(|t| t.name.clone()).collect();
-    let gap_layout = props.layout.clone();
+    // The bar's bounds, for a tab dragged over it from another window.
+    let bar_probe = {
+        let layout = props.layout.clone();
+        probe(move |b| {
+            layout.borrow_mut().bar = Some(Bounds::new(
+                point(b.origin.x.as_f32(), b.origin.y.as_f32()),
+                gpui::size(b.size.width.as_f32(), b.size.height.as_f32()),
+            ))
+        })
+    };
+    // A tab drag of this window's, followed wherever the pointer goes (past
+    // the window's edges too: AppKit keeps sending this window the press's
+    // moves and its release), so the window can tell which bar the tab is
+    // over, in any window, or that it is torn off (`tab-tearoff`).
+    let follow = {
+        let host = cx.entity().downgrade();
+        let layout = props.layout.clone();
+        canvas(
+            |_, _, _| {},
+            move |_, _, window, _| {
+                let (moved_host, moved_layout) = (host.clone(), layout.clone());
+                window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture && drag_live(&moved_layout, cx) {
+                        moved_host
+                            .update(cx, |this, cx| this.sidebar_event(SidebarEvent::DragTabMoved, window, cx))
+                            .ok();
+                    }
+                });
+                let (up_host, up_layout) = (host.clone(), layout.clone());
+                window.on_mouse_event(move |ev: &MouseUpEvent, phase, window, cx| {
+                    if phase == DispatchPhase::Capture && ev.button == MouseButton::Left && drag_live(&up_layout, cx) {
+                        up_host
+                            .update(cx, |this, cx| this.sidebar_event(SidebarEvent::DropTab, window, cx))
+                            .ok();
+                    }
+                });
+            },
+        )
+        .absolute()
+        .size_full()
+    };
 
     let menu = props
         .menu
@@ -537,19 +593,8 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
                 .child(strip_origin)
                 .children(strip),
         )
-        // Dropped anywhere on the bar, the tab moves to the gap it was last
-        // over.
-        .on_drag_move(cx.listener(move |this, ev: &DragMoveEvent<TabDrag>, window, cx| {
-            let gap = ev
-                .bounds
-                .contains(&ev.event.position)
-                .then(|| gap_layout.borrow().gap_at(&names, ev.event.position.x.as_f32(), PLUS_SLOT_W))
-                .flatten();
-            this.sidebar_event(SidebarEvent::DragTabOver(gap), window, cx)
-        }))
-        .on_drop(cx.listener(|this, _: &TabDrag, window, cx| {
-            this.sidebar_event(SidebarEvent::DropTab, window, cx)
-        }))
+        .child(bar_probe)
+        .child(follow)
         .children(menu)
         .children(tab_menu)
         .into_any_element()
@@ -661,10 +706,14 @@ fn render_tab<H: SidebarHost>(
         // the tab; the ghost starts where the tab sits under the pointer.
         .on_drag(drag, move |drag: &TabDrag, offset, window, cx: &mut App| {
             let (label, working) = (drag.label.clone(), drag.working);
-            let ghost = cx.new(|_| TabGhost { label, working });
+            let tab_w = (layout.borrow().width(&drag.project) - RULE_W).max(0.0);
+            let ghost = cx.new(|_| TabGhost { label, working, tab_w });
             {
                 let mut layout = layout.borrow_mut();
                 layout.grab_x = offset.x.as_f32();
+                layout.grab_y = offset.y.as_f32();
+                let at = window.mouse_position() - offset;
+                layout.tab_origin = (at.x.as_f32(), at.y.as_f32());
                 layout.ghost = Some(ghost.downgrade());
             }
             let project = drag.project.clone();

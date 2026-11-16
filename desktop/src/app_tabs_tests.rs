@@ -691,14 +691,28 @@ fn a_drag_that_wouldnt_move_the_tab_leaves_its_slot_in_place_and_changes_nothing
     assert_eq!(lefts(&mut h, &names), rest, "none over the +");
     release(&mut h, plus);
     assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
-    // Off the bar: the tabs go back, and the drop lands nowhere.
-    let off = point(px(700.0), px(400.0));
+    // Off the bar but within 200pt of it (`tab-tearoff`): still the tab
+    // ghost, and the gap follows the pointer there.
     let before_alpha = quarter(&mut h, "tab-alpha", false);
+    let under_alpha = before_alpha + point(px(0.0), px(150.0));
     drag_tab(&mut h, "tab-gamma", before_alpha);
+    h.cx.simulate_mouse_move(under_alpha, Some(MouseButton::Left), Modifiers::none());
+    assert!(drawn(&mut h, "tab-drag-ghost"));
+    assert_ne!(lefts(&mut h, &names), rest, "the slot stays open before alpha");
+    // Further off, the ghost tears off (its own window draws the card), and
+    // the tabs go back.
+    let off = point(px(700.0), px(400.0));
     h.cx.simulate_mouse_move(off, Some(MouseButton::Left), Modifiers::none());
-    assert_eq!(lefts(&mut h, &names), rest, "none off the bar");
-    release(&mut h, off);
+    assert!(!drawn(&mut h, "tab-drag-ghost"), "the window's ghost steps aside for the card");
+    assert_eq!(lefts(&mut h, &names), rest, "no gap past 200");
+    // Esc: the drag ends where it began, and the release lands nowhere.
+    h.cx.simulate_mouse_move(under_alpha, Some(MouseButton::Left), Modifiers::none());
+    h.draw();
+    h.key("escape");
+    h.draw();
     assert!(!drawn(&mut h, "tab-drag-ghost"));
+    assert_eq!(lefts(&mut h, &names), rest);
+    release(&mut h, under_alpha);
     assert_eq!(lefts(&mut h, &names), rest);
     assert_eq!(order(&h), ["alpha", "beta", "gamma"]);
     assert!(h.take_calls().is_empty());

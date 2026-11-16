@@ -14,13 +14,14 @@
 
 use std::sync::Arc;
 
-use gpui::{TestAppContext, VisualTestContext, WindowAppearance};
+use gpui::{point, Modifiers, MouseButton, Pixels, Point, TestAppContext, VisualTestContext, WindowAppearance};
 use shelbi_app::theme::ThemePreference;
 
 use super::smoke::fixture_model;
 use super::*;
 use crate::feeds::tests::{canned_hub, Started};
 use crate::projects::ProjectEntry;
+use crate::views::tab_tearoff::{self, FloatingGhost, CARD_H, CARD_W};
 use crate::views::workspace::tests::{fake_deps as fake_workspace_deps, FakeSessions};
 
 struct Fixture {
@@ -818,4 +819,309 @@ fn a_window_saves_the_display_its_frame_is_on(cx: &mut TestAppContext) {
     let state = read(cx, h, |w, _| w.window_state.clone());
     assert_eq!(state.frame.map(|f| (f.width, f.height)), Some((1000.0, 700.0)));
     assert_eq!(state.display, Some(primary));
+}
+
+// --- tab-tearoff: a tab torn off into its own window, or dragged between
+// windows ---------------------------------------------------------------
+
+/// Open a window on `project` in `slot` at `frame`, with `tabs` (Reduce
+/// Motion on, so the tabs and the ghost land at once), and draw it so its
+/// bar has measured itself.
+fn open_at(
+    cx: &mut TestAppContext,
+    f: &Fixture,
+    project: &str,
+    slot: usize,
+    frame: Frame,
+    tabs: &[&str],
+) -> WindowHandle<ShelbiWindow> {
+    let deps = f.deps.clone();
+    let state = WindowState {
+        frame: Some(frame),
+        tabs: tabs.iter().map(|t| t.to_string()).collect(),
+        ..WindowState::default()
+    };
+    let handle = cx.update(|cx| {
+        open_window(project, slot, state, None, cx);
+        let handle = cx.global::<Shell>().windows.last().unwrap().handle;
+        handle
+            .update(cx, |w, window, cx| {
+                w.chat_deps = Some(deps.sessions.clone());
+                w.workspace_deps = Some(deps);
+                w.reduce_motion = Rc::new(|| true);
+                w.start_feed(window, cx);
+            })
+            .unwrap();
+        handle
+    });
+    draw(cx, handle);
+    draw(cx, handle);
+    handle
+}
+
+fn frame(x: f32, y: f32) -> Frame {
+    Frame { x, y, width: 900.0, height: 700.0 }
+}
+
+/// A catalog with `open` recorded open, and windows closing as the app's do.
+fn tearoff_fixture(cx: &mut TestAppContext, open: &[&str]) -> Fixture {
+    let f = fixture(cx);
+    cx.update(|cx| {
+        cx.global::<Catalog>().set_open(open);
+        cx.on_window_closed(|cx, id| window_closed(id, cx)).detach();
+    });
+    f
+}
+
+fn tabs_of(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) -> Vec<String> {
+    read(cx, handle, |w, _| w.tabs.order().to_vec())
+}
+
+fn shown(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) -> String {
+    read(cx, handle, |w, _| w.project.clone())
+}
+
+fn vcx(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) -> VisualTestContext {
+    VisualTestContext::from_window(*handle, cx)
+}
+
+fn bounds_in(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, selector: &'static str) -> Option<gpui::Bounds<Pixels>> {
+    draw(cx, handle);
+    vcx(cx, handle).debug_bounds(selector)
+}
+
+/// Press on `selector` in `handle` and drag past gpui's threshold: the drag
+/// begins. Where it began (the point its ghost is held by).
+fn press_and_start(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, selector: &'static str) -> Point<Pixels> {
+    let start = bounds_in(cx, handle, selector).unwrap_or_else(|| panic!("{selector} is drawn")).center();
+    let began = start + point(px(8.0), px(0.0));
+    let mut v = vcx(cx, handle);
+    v.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+    v.simulate_mouse_move(began, Some(MouseButton::Left), Modifiers::none());
+    draw(cx, handle);
+    began
+}
+
+/// Move the held pointer to window point `to` of `handle` (the drag's own
+/// window: it follows the drag past its edges).
+fn move_to(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, to: Point<Pixels>) {
+    vcx(cx, handle).simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
+    cx.run_until_parked();
+    draw(cx, handle);
+}
+
+fn release_at(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, at: Point<Pixels>) {
+    vcx(cx, handle).simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
+    cx.run_until_parked();
+}
+
+/// The open floating ghost windows.
+fn floats(cx: &mut TestAppContext) -> Vec<WindowHandle<FloatingGhost>> {
+    cx.update(|cx| {
+        cx.windows()
+            .into_iter()
+            .filter_map(|w| w.downcast::<FloatingGhost>())
+            .collect()
+    })
+}
+
+fn over(cx: &mut TestAppContext) -> Option<Option<WindowId>> {
+    cx.update(|cx| tab_tearoff::session(cx).map(|s| s.over))
+}
+
+#[gpui::test]
+fn a_tab_dragged_200_from_the_bar_becomes_a_card_and_tears_off_into_its_own_window(cx: &mut TestAppContext) {
+    let f = tearoff_fixture(cx, &["alpha", "beta"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(0.0, 0.0), &["alpha", "beta"]);
+    assert_eq!(tabs_of(cx, a), ["alpha", "beta"]);
+    let beta = bounds_in(cx, a, "tab-beta").unwrap();
+    let grab = press_and_start(cx, a, "tab-beta") - beta.origin;
+
+    // Along the bar, and within 200 under it: the tab ghost, in the window.
+    move_to(cx, a, point(px(450.0), px(52.0 + 199.0)));
+    assert_eq!(over(cx), Some(Some(a.window_id())));
+    let ghost = bounds_in(cx, a, "tab-drag-ghost").expect("the tab ghost");
+    assert_eq!(ghost.size.height, px(52.0));
+    assert!(floats(cx).is_empty(), "no floating ghost over its own bar");
+
+    // Past 200: the card, 200 × 300, drawn by the floating ghost window.
+    let away = point(px(450.0), px(52.0 + 260.0));
+    move_to(cx, a, away);
+    assert_eq!(over(cx), Some(None), "torn off");
+    assert!(bounds_in(cx, a, "tab-drag-ghost").is_none(), "the window's own ghost steps aside");
+    let float = *floats(cx).first().expect("a floating ghost window opened");
+    let mut fv = VisualTestContext::from_window(*float, cx);
+    fv.update(|window, cx| window.draw(cx).clear(cx));
+    let card = fv.debug_bounds("tab-drag-card").expect("the card");
+    assert_eq!(card.size, gpui::size(px(CARD_W), px(CARD_H)));
+
+    // Back within 200: the tab ghost again.
+    move_to(cx, a, point(px(450.0), px(120.0)));
+    assert_eq!(over(cx), Some(Some(a.window_id())));
+    assert!(bounds_in(cx, a, "tab-drag-ghost").is_some());
+
+    // Dropped torn off: a new window holding just beta; alpha keeps its
+    // window.
+    move_to(cx, a, away);
+    release_at(cx, a, away);
+    let list = windows(cx);
+    assert_eq!(list.len(), 2, "{list:?}");
+    assert!(floats(cx).is_empty(), "the floating ghost closed");
+    assert!(over(cx).is_none(), "the drag is over");
+    let b = cx.update(|cx| cx.global::<Shell>().windows[1].handle);
+    assert_eq!(tabs_of(cx, a), ["alpha"]);
+    assert_eq!(shown(cx, a), "alpha");
+    assert_eq!(tabs_of(cx, b), ["beta"]);
+    assert_eq!(shown(cx, b), "beta");
+    // Its tab under the pointer, where the pointer held it.
+    let (fa, fb) = (frame_of(cx, a), frame_of(cx, b));
+    let first = read(cx, a, |w, _| w.tab_reorder.layout.borrow().first_x);
+    assert_eq!(
+        (fb.x, fb.y),
+        (fa.x + away.x.as_f32() - first - grab.x.as_f32(), fa.y + away.y.as_f32() - grab.y.as_f32())
+    );
+    assert_eq!((fb.width, fb.height), (900.0, 700.0), "the size of the window it came from");
+
+    // A refresh doesn't bring beta's tab back to the first window.
+    update(cx, a, |w, _, cx| w.sync_tabs(cx));
+    assert_eq!(tabs_of(cx, a), ["alpha"]);
+    update(cx, b, |w, _, cx| w.sync_tabs(cx));
+    assert_eq!(tabs_of(cx, b), ["beta"]);
+}
+
+#[gpui::test]
+fn a_relaunch_restores_the_torn_off_arrangement(cx: &mut TestAppContext) {
+    let f = tearoff_fixture(cx, &["alpha", "beta", "gamma"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(0.0, 0.0), &["alpha", "beta", "gamma"]);
+    press_and_start(cx, a, "tab-gamma");
+    let away = point(px(400.0), px(600.0));
+    move_to(cx, a, away);
+    release_at(cx, a, away);
+    // The tabs' save waits a beat.
+    cx.executor().advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    let session = cx.update(|cx| cx.global::<Shell>().session.clone());
+    let open: Vec<(Option<ProjectKey>, Vec<String>)> = session
+        .slots
+        .iter()
+        .filter(|s| s.open)
+        .map(|s| (s.project.clone(), s.state.tabs.clone()))
+        .collect();
+    assert_eq!(
+        open,
+        [
+            (Some(ProjectKey::local("alpha")), vec!["alpha".to_string(), "beta".to_string()]),
+            (Some(ProjectKey::local("gamma")), vec!["gamma".to_string()]),
+        ]
+    );
+    // Quit (the windows close with the app) and relaunch from the saved
+    // slots: the same two windows, the same tabs.
+    let plan = window_state::launch_plan(Some(&session), None, None, &|_| true, &|_| WindowState::default());
+    let reopened: Vec<(String, Vec<String>)> = plan.iter().map(|w| (w.project.name.clone(), w.state.tabs.clone())).collect();
+    assert_eq!(
+        reopened,
+        [
+            ("alpha".to_string(), vec!["alpha".to_string(), "beta".to_string()]),
+            ("gamma".to_string(), vec!["gamma".to_string()]),
+        ]
+    );
+}
+
+#[gpui::test]
+fn a_tab_dragged_onto_another_windows_bar_drops_into_its_gap_with_its_view_and_sessions(cx: &mut TestAppContext) {
+    let f = tearoff_fixture(cx, &["alpha", "beta", "gamma"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(0.0, 0.0), &["alpha", "beta"]);
+    let b = open_at(cx, &f, "gamma", 1, frame(1000.0, 0.0), &["gamma"]);
+    leave_alpha_on_its_workspace(cx, a);
+    assert!(live_attaches(&f, "alpha") > 0, "alpha's workspace session is attached");
+
+    // Over the other window's bar (its gamma tab's left half, in this
+    // window's coordinates): the tab ghost, and that bar opens its gap.
+    let gamma = bounds_in(cx, b, "tab-gamma").unwrap();
+    let rest = gamma.left();
+    press_and_start(cx, a, "tab-alpha");
+    let to = point(px(1000.0) + gamma.left() + px(10.0), gamma.center().y);
+    move_to(cx, a, to);
+    assert_eq!(over(cx), Some(Some(b.window_id())));
+    assert!(read(cx, b, |w, _| w.tab_reorder.hosting()));
+    let slid = bounds_in(cx, b, "tab-gamma").unwrap().left();
+    assert!(slid > rest, "gamma steps aside for the gap: {slid:?} > {rest:?}");
+    assert!(!floats(cx).is_empty(), "the tab ghost floats over the other window");
+
+    release_at(cx, a, to);
+    draw(cx, b);
+    draw(cx, b);
+    assert_eq!(tabs_of(cx, b), ["alpha", "gamma"], "in the gap, before gamma");
+    assert_eq!(shown(cx, b), "alpha");
+    assert!(!read(cx, b, |w, _| w.tab_reorder.hosting()));
+    assert_eq!(tabs_of(cx, a), ["beta"], "it left the first window");
+    assert_eq!(shown(cx, a), "beta", "which moved to its neighbor");
+    // The project kept where it was left, and its session: the workspace,
+    // attached in its new window.
+    assert_eq!(read(cx, b, |w, _| w.client.view().clone()), View::from_view_id("alpha-1"));
+    assert!(live_attaches(&f, "alpha") > 0, "alpha's session is attached again");
+    assert_eq!(windows(cx).len(), 2);
+}
+
+#[gpui::test]
+fn moving_a_windows_last_tab_away_closes_the_empty_window(cx: &mut TestAppContext) {
+    let f = tearoff_fixture(cx, &["alpha", "beta"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(0.0, 0.0), &["alpha"]);
+    let b = open_at(cx, &f, "beta", 1, frame(1000.0, 0.0), &["beta"]);
+    let beta = bounds_in(cx, b, "tab-beta").unwrap();
+    press_and_start(cx, a, "tab-alpha");
+    // Past beta's tab: the gap after it.
+    let to = point(px(1000.0) + beta.right() - px(5.0), beta.center().y);
+    move_to(cx, a, to);
+    release_at(cx, a, to);
+    assert_eq!(windows(cx), [("alpha".to_string(), 1)], "one window, the one it went to");
+    assert_eq!(tabs_of(cx, b), ["beta", "alpha"]);
+    let slots = cx.update(|cx| cx.global::<Shell>().session.slots.clone());
+    assert!(!slots[0].open, "the emptied window doesn't come back next launch");
+}
+
+#[gpui::test]
+fn tearing_off_a_windows_only_tab_moves_the_window(cx: &mut TestAppContext) {
+    let f = tearoff_fixture(cx, &["alpha"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(100.0, 50.0), &["alpha"]);
+    let tab = bounds_in(cx, a, "tab-alpha").unwrap();
+    let grab = press_and_start(cx, a, "tab-alpha") - tab.origin;
+    crate::platform::screen::test_log::take();
+    let away = point(px(500.0), px(600.0));
+    move_to(cx, a, away);
+    assert_eq!(over(cx), Some(None), "the card");
+    release_at(cx, a, away);
+    assert_eq!(windows(cx), [("alpha".to_string(), 0)], "no new window");
+    assert_eq!(tabs_of(cx, a), ["alpha"]);
+    // The window goes where the tab was dropped (screen space: its origin
+    // plus the pointer), its tab under the pointer.
+    let to = crate::platform::screen::test_log::take();
+    let fa = frame_of(cx, a);
+    let want = point(
+        fa.x + away.x.as_f32() - tab.origin.x.as_f32() - grab.x.as_f32(),
+        fa.y + away.y.as_f32() - tab.origin.y.as_f32() - grab.y.as_f32(),
+    );
+    assert_eq!(to, [want]);
+}
+
+#[gpui::test]
+fn esc_ends_a_tab_drag_where_it_began(cx: &mut TestAppContext) {
+    let f = tearoff_fixture(cx, &["alpha", "beta", "gamma"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(0.0, 0.0), &["alpha", "beta"]);
+    let b = open_at(cx, &f, "gamma", 1, frame(1000.0, 0.0), &["gamma"]);
+    let gamma = bounds_in(cx, b, "tab-gamma").unwrap();
+    press_and_start(cx, a, "tab-beta");
+    let to = point(px(1000.0) + gamma.left() + px(10.0), gamma.center().y);
+    move_to(cx, a, to);
+    assert!(read(cx, b, |w, _| w.tab_reorder.hosting()));
+    vcx(cx, a).simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(over(cx).is_none(), "no drag");
+    assert!(!cx.update(|cx| cx.has_active_drag()));
+    assert!(!read(cx, b, |w, _| w.tab_reorder.hosting()), "the other bar's gap closes");
+    release_at(cx, a, to);
+    assert_eq!(tabs_of(cx, a), ["alpha", "beta"]);
+    assert_eq!(tabs_of(cx, b), ["gamma"]);
+    assert_eq!(windows(cx).len(), 2);
+    assert!(floats(cx).is_empty());
 }

@@ -8,12 +8,15 @@
 //!
 //! The open set is `shelbi_state::list_open_projects` (as of the catalog's
 //! last refresh), which knows nothing of order: a tab already in the saved
-//! order keeps its place, and a project newly found open goes at the end.
+//! order keeps its place, and a project newly found open goes at the end,
+//! unless another window already has a tab for it (each window keeps its own
+//! tabs: one torn off into a new window, or dragged to another, stays there).
 //! The window's own project always has a tab, open on disk yet or not
 //! (bringing it up is still on its way, or it waits on onboarding).
 //!
-//! Dragging a tab moves it ([`ProjectTabs::move_to`]); the moved order is
-//! saved the same way, so ⌘1 to ⌘9 and the next launch follow it.
+//! Dragging a tab moves it ([`ProjectTabs::move_to`]), or into another
+//! window ([`ProjectTabs::insert_at`] there); the order is saved the same
+//! way, so ⌘1 to ⌘9 and the next launch follow it.
 
 /// The tabs, in order. Project ids (`projects/<name>.yaml` stems, or a remote
 /// window's far project names).
@@ -53,6 +56,17 @@ impl ProjectTabs {
             return false;
         }
         self.order.push(project.to_string());
+        true
+    }
+
+    /// Give `project` a tab at `index` (past the end means last), unless it
+    /// has one: a tab dropped in from another window. Whether the tabs
+    /// changed.
+    pub fn insert_at(&mut self, project: &str, index: usize) -> bool {
+        if project.is_empty() || self.contains(project) {
+            return false;
+        }
+        self.order.insert(index.min(self.order.len()), project.to_string());
         true
     }
 
@@ -102,18 +116,20 @@ impl ProjectTabs {
     }
 
     /// Follow the open set: a tab whose project is no longer `open` goes,
-    /// a project newly open gets a tab at the end (in `open`'s order), and
+    /// a project newly open gets a tab at the end (in `open`'s order) unless
+    /// another window has one for it (`elsewhere`: a tab torn off into its
+    /// own window, or moved to another, stays where it went), and
     /// `current` (the window's own project, `None` on the chooser) keeps or
     /// gets one either way. With `open` unknown (`None`: a remote window,
     /// whose host's listing doesn't say what is open, or a catalog not yet
     /// read) nothing goes, and only `current` is added. Whether the tabs
     /// changed.
-    pub fn reconcile(&mut self, open: Option<&[String]>, current: Option<&str>) -> bool {
+    pub fn reconcile(&mut self, open: Option<&[String]>, current: Option<&str>, elsewhere: &[String]) -> bool {
         let before = self.order.clone();
         if let Some(open) = open {
             self.order
                 .retain(|p| current == Some(p.as_str()) || open.iter().any(|o| o == p));
-            for project in open {
+            for project in open.iter().filter(|p| !elsewhere.contains(p)) {
                 self.insert(project);
             }
         }
@@ -216,9 +232,9 @@ mod tests {
     fn reconcile_keeps_the_saved_order_and_appends_new_ones() {
         // `list_open_projects` is sorted by name; the tabs keep their own order.
         let mut t = tabs(&["web", "api"]);
-        assert!(t.reconcile(Some(&open(&["api", "docs", "web"])), Some("web")));
+        assert!(t.reconcile(Some(&open(&["api", "docs", "web"])), Some("web"), &[]));
         assert_eq!(t.order(), ["web", "api", "docs"]);
-        assert!(!t.reconcile(Some(&open(&["api", "docs", "web"])), Some("web")), "settled");
+        assert!(!t.reconcile(Some(&open(&["api", "docs", "web"])), Some("web"), &[]), "settled");
     }
 
     #[test]
@@ -226,18 +242,44 @@ mod tests {
         let mut t = tabs(&["web", "api", "docs"]);
         // `docs` was quit elsewhere; `web` (this window's) isn't recorded open
         // yet (its orchestrator is still coming up).
-        assert!(t.reconcile(Some(&open(&["api"])), Some("web")));
+        assert!(t.reconcile(Some(&open(&["api"])), Some("web"), &[]));
         assert_eq!(t.order(), ["web", "api"]);
         // The chooser has no current project.
-        assert!(t.reconcile(Some(&open(&[])), None));
+        assert!(t.reconcile(Some(&open(&[])), None, &[]));
         assert!(t.order().is_empty());
+    }
+
+    #[test]
+    fn a_project_with_a_tab_in_another_window_gets_none_here() {
+        // `docs` was torn off into its own window: a refresh doesn't bring
+        // its tab back here, and a project newly open goes to one window.
+        let mut t = tabs(&["web", "api"]);
+        let elsewhere = open(&["docs", "site"]);
+        assert!(!t.reconcile(Some(&open(&["api", "docs", "web"])), Some("web"), &elsewhere));
+        assert_eq!(t.order(), ["web", "api"]);
+        assert!(t.reconcile(Some(&open(&["api", "docs", "new", "web"])), Some("web"), &elsewhere));
+        assert_eq!(t.order(), ["web", "api", "new"]);
+        // A tab it already has stays, though another window has one too.
+        let mut t = tabs(&["web", "docs"]);
+        assert!(!t.reconcile(Some(&open(&["docs", "web"])), Some("web"), &elsewhere));
+        assert_eq!(t.order(), ["web", "docs"]);
+    }
+
+    #[test]
+    fn insert_at_places_a_dropped_in_tab() {
+        let mut t = tabs(&["web", "api"]);
+        assert!(t.insert_at("docs", 1));
+        assert_eq!(t.order(), ["web", "docs", "api"]);
+        assert!(t.insert_at("site", 9), "past the end is last");
+        assert!(!t.insert_at("web", 0), "it has one");
+        assert_eq!(t.order(), ["web", "docs", "api", "site"]);
     }
 
     #[test]
     fn an_unknown_open_set_only_adds_the_current_project() {
         let mut t = tabs(&["web", "api"]);
-        assert!(t.reconcile(None, Some("docs")));
+        assert!(t.reconcile(None, Some("docs"), &[]));
         assert_eq!(t.order(), ["web", "api", "docs"]);
-        assert!(!t.reconcile(None, None));
+        assert!(!t.reconcile(None, None, &[]));
     }
 }

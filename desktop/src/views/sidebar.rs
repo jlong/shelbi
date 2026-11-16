@@ -407,11 +407,12 @@ pub enum SidebarEvent {
     /// A drag of a project's tab began (the pointer moved past the drag
     /// threshold with the button down on it).
     DragTab(String),
-    /// The dragged tab is over drop gap `Some(n)` (0 before the first tab,
-    /// the tab count after the last), or over no gap (the `+`, off the bar).
-    DragTabOver(Option<usize>),
-    /// The dragged tab was dropped on the bar: it moves to the gap it was
-    /// last over, if any.
+    /// The dragged tab moved (anywhere: the window follows a tab drag
+    /// past its edges, `tab-tearoff`), the pointer at the window's mouse
+    /// position.
+    DragTabMoved,
+    /// The dragged tab was released: it lands in the bar it is over (in the
+    /// gap there, if any), or, torn off, in a window of its own.
     DropTab,
     /// The project menu's "Add project…".
     AddProject,
