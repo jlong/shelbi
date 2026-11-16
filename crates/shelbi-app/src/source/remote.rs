@@ -371,6 +371,10 @@ impl ProjectSource for RemoteSource {
         crate::jobs::JobsRead::Unavailable
     }
 
+    fn cancel_job(&self, _id: &str) -> Result<(), String> {
+        Err(crate::jobs::REMOTE_TEXT.to_string())
+    }
+
     fn machine_reachability(&self, host: &str) -> Reachability {
         let query = Query::MachineReachability {
             project: self.name(),

@@ -9,7 +9,10 @@
 //! list --all` lists it, and `job log <id>` prints a command job's output,
 //! running or finished, while its log is kept.
 //!
-//! `__job-exec` is the hidden runner `job run` starts in its own session.
+//! `__job-exec` is the hidden runner `job run` starts as the child of a
+//! Shelbi session of its own (`<project>/job/<id>`), so the Jobs screen can
+//! show the job's live terminal; it runs the command under the caller's login
+//! shell in a PTY and keeps the output in `output.log` too.
 
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;

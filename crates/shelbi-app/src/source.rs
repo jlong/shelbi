@@ -268,6 +268,9 @@ pub trait ProjectSource: Send + Sync {
     fn machines(&self) -> Result<MachinesModel, String>;
     /// The project's active awareness jobs (the Jobs screen).
     fn jobs(&self) -> crate::jobs::JobsRead;
+    /// Cancel job `id` (`shelbi job cancel`): a running command is sent
+    /// SIGTERM. Off the UI thread.
+    fn cancel_job(&self, id: &str) -> Result<(), String>;
     /// Whether `host` answers over SSH, probed from the project's machine
     /// (the machine that would run agents there).
     fn machine_reachability(&self, host: &str) -> Reachability;
@@ -765,6 +768,9 @@ pub mod null {
         }
         fn jobs(&self) -> crate::jobs::JobsRead {
             crate::jobs::JobsRead::Unavailable
+        }
+        fn cancel_job(&self, _id: &str) -> Result<(), String> {
+            Err(NOTHING.into())
         }
         fn machine_reachability(&self, _host: &str) -> Reachability {
             Reachability::Unknown

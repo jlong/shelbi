@@ -318,20 +318,71 @@ fn estimates_are_left_alone_while_the_board_is_unreadable() {
 #[test]
 fn the_job_runner_records_exit_code_and_output_tail() {
     let _home = home();
-    let argv: Vec<String> = ["sh", "-c", "echo one; echo two >&2; exit 3"]
+    let argv: Vec<String> = ["sh", "-c", "echo one; printf '\\033[31mtwo\\033[0m\\n' >&2; [ -t 1 ] && echo tty; exit 3"]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    run_job_exec(P, "j9", &argv).unwrap();
+    crate::job_exec::run_job_command(P, "j9", &argv, None).unwrap();
     let result = awareness::read_job_result(P, "j9").unwrap().unwrap();
     assert_eq!(result.exit_code, Some(3));
-    assert_eq!(result.tail, ["one", "two"]);
+    // Both streams, through a terminal, written as plain text.
+    assert_eq!(result.tail, ["one", "two", "tty"]);
+    let log = std::fs::read_to_string(awareness::job_output_path(P, "j9").unwrap()).unwrap();
+    assert_eq!(log, "one\ntwo\ntty\n");
 
     let missing = vec!["/nonexistent/shelbi-test-binary".to_string()];
-    run_job_exec(P, "j10", &missing).unwrap();
+    crate::job_exec::run_job_command(P, "j10", &missing, None).unwrap();
     let result = awareness::read_job_result(P, "j10").unwrap().unwrap();
     assert_eq!(result.exit_code, Some(127));
     assert!(result.detail().unwrap().contains("could not start"));
+}
+
+#[test]
+fn the_job_runner_runs_with_the_environment_it_is_given() {
+    let _home = home();
+    let argv: Vec<String> = ["sh", "-c", "echo \"$JOB_SHELL_TEST\""].iter().map(|s| s.to_string()).collect();
+    let env: std::collections::BTreeMap<String, String> = [
+        ("JOB_SHELL_TEST".to_string(), "from-the-caller".to_string()),
+        ("PATH".to_string(), std::env::var("PATH").unwrap_or_default()),
+    ]
+    .into();
+    crate::job_exec::run_job_command(P, "j11", &argv, Some(&env)).unwrap();
+    let result = awareness::read_job_result(P, "j11").unwrap().unwrap();
+    assert_eq!(result.tail, ["from-the-caller"]);
+}
+
+#[test]
+fn a_job_session_is_removed_once_the_job_has_left_the_store() {
+    let _home = home();
+    let probe = FakeProbe::default();
+    let mut state = AwarenessTickState::default();
+    let job = awareness::add_job(P, NewJob { kind: JobKind::Command, target: "true".into(), label: None }).unwrap();
+    // A dead session directory for the job, and one for a workspace.
+    let sessions = shelbi_state::sessions_dir().unwrap();
+    let dead_session = |dir: &str, name: &str| {
+        let path = sessions.join(dir);
+        std::fs::create_dir_all(&path).unwrap();
+        let meta = serde_json::json!({
+            "id": dir, "name": name, "pid": 0, "launched_at": "2026-11-10T10:00:00Z",
+            "cwd": "/", "argv": ["true"], "protocol_version": shelbi_proto::PROTOCOL_VERSION,
+        });
+        std::fs::write(path.join("meta.json"), meta.to_string()).unwrap();
+        path
+    };
+    let job_dir = dead_session("jobsess", &job_session_name(P, &job.id));
+    let ws_dir = dead_session("wssess", "demo/ws/job");
+    assert!(
+        shelbi_client::list(&sessions).unwrap().iter().any(|s| s.dir == job_dir),
+        "fixture session is discoverable"
+    );
+
+    run(&mut state, at(0), &probe);
+    assert!(job_dir.exists(), "a running job keeps its session");
+
+    awareness::remove_job(P, &job.id).unwrap();
+    run(&mut state, at(1), &probe);
+    assert!(!job_dir.exists(), "an ended job's session is removed");
+    assert!(ws_dir.exists(), "a workspace's session is never touched");
 }
 
 #[test]

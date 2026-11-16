@@ -29,12 +29,12 @@ use shelbi_app::session::relaunch;
 mod review;
 mod keybindings;
 mod onboarding;
-mod session;
+pub(crate) mod session;
 mod settings;
 mod sidebar;
 mod stray_output;
 mod workspace;
-mod terminal_view;
+pub(crate) mod terminal_view;
 
 #[cfg(all(test, unix))]
 mod pty_input_tests;
@@ -745,6 +745,10 @@ fn run_with(project: &str, connector: Arc<dyn session::Connector>) -> Result<()>
             state.dirty = true;
         }
         if state.poll_job() {
+            state.dirty = true;
+        }
+        // An open job sheet's load and live terminal.
+        if state.jobs.pump() {
             state.dirty = true;
         }
         if state.poll_create_job() {
@@ -5941,6 +5945,25 @@ impl ShellState {
             KeyCode::Down | KeyCode::Char('j') => self.jobs.nav_down(),
             KeyCode::Home | KeyCode::Char('g') => self.jobs.nav_first(),
             KeyCode::End | KeyCode::Char('G') => self.jobs.nav_last(),
+            KeyCode::Enter => {
+                if let Some(project) = self.client.project().map(str::to_string) {
+                    self.jobs.open_sheet(&project);
+                }
+            }
+            KeyCode::Esc if self.jobs.sheet_open() => self.jobs.close_sheet(),
+            KeyCode::Char('c') => {
+                if let (Some(project), Some(id)) =
+                    (self.client.project().map(str::to_string), self.jobs.take_cancel())
+                {
+                    // `shelbi job cancel`, off the UI thread: the row moves
+                    // under Finished on the next refresh.
+                    std::thread::spawn(move || {
+                        if let Err(e) = shelbi_orchestrator::awareness::cancel_job(&project, &id) {
+                            tracing::warn!(project, job = %id, error = %e, "canceling the job failed");
+                        }
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -6559,7 +6582,7 @@ where
                 crate::machines::render_full(frame, machines, main_rect)
             }
             MainView::Native(View::Jobs) => {
-                crate::jobs::render_full(frame, jobs, main_rect, chrono::Utc::now())
+                crate::jobs::render_full(frame, jobs, main_rect, chrono::Utc::now(), truecolor)
             }
             _ => {}
         }

@@ -24,6 +24,9 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use shelbi_core::{Error, Project, Result, StatusCategory};
+
+pub use crate::job_exec::{job_of_session, job_session_name, run_job_exec};
+use crate::session_process_backend::SessionProcessBackend;
 use shelbi_state::awareness::{
     self, overdue_interval, next_slot_after, AwarenessStore, Job, JobKind, JobRecord, JobResult,
     JobStatus,
@@ -49,7 +52,18 @@ const JOB_HISTORY_PRUNE_CADENCE: Duration = Duration::from_secs(3600);
 pub struct AwarenessTickState {
     last_remote_probe: HashMap<String, Instant>,
     last_prune: Option<Instant>,
+    /// The command jobs the store listed on the last tick.
+    command_jobs: HashSet<String>,
+    /// Command jobs that have left the store (finished or canceled) whose
+    /// session directory is still to be removed, with how many ticks have
+    /// tried. See [`remove_job_sessions`].
+    ended_sessions: HashMap<String, u32>,
 }
+
+/// How many ticks keep trying to remove an ended job's session while it is
+/// still up (its runner still writing its result). The hourly sweep in
+/// [`maybe_prune_job_history`] removes any left after that.
+const ENDED_SESSION_TRIES: u32 = 120;
 
 /// A watched GitHub target's settled state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +140,7 @@ fn tick_inner(
     let name = project.name.as_str();
     let store = awareness::read_awareness(name)?;
     maybe_prune_job_history(name, &store, state, now);
+    clean_ended_job_sessions(name, &store, state);
     if store == AwarenessStore::default() {
         state.last_remote_probe.clear();
         return Ok(());
@@ -389,6 +404,30 @@ fn maybe_prune_job_history(
     state.last_prune = Some(Instant::now());
     let live: Vec<&str> = store.jobs.iter().map(|j| j.id.as_str()).collect();
     awareness::prune_job_history(project, &live, now);
+    remove_job_sessions(project, |id| !live.contains(&id));
+}
+
+/// Remove the session of every command job that left the store since the
+/// last tick (it finished, or was canceled), once that session has exited.
+fn clean_ended_job_sessions(project: &str, store: &AwarenessStore, state: &mut AwarenessTickState) {
+    let current: HashSet<String> = store
+        .jobs
+        .iter()
+        .filter(|j| j.kind == JobKind::Command)
+        .map(|j| j.id.clone())
+        .collect();
+    for gone in state.command_jobs.difference(&current) {
+        state.ended_sessions.entry(gone.clone()).or_insert(0);
+    }
+    state.command_jobs = current;
+    if state.ended_sessions.is_empty() {
+        return;
+    }
+    let up = remove_job_sessions(project, |id| state.ended_sessions.contains_key(id));
+    state.ended_sessions.retain(|id, tries| {
+        *tries += 1;
+        up.contains(id) && *tries < ENDED_SESSION_TRIES
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -674,10 +713,12 @@ fn verdict_of(snapshot: &crate::zen::CiSnapshot, settled: bool) -> Option<WatchV
 // ---------------------------------------------------------------------------
 // Command jobs
 
-/// Start `argv` as a detached command job for `project`: register the job,
-/// spawn `shelbi __job-exec` in its own session (so it outlives this CLI and
-/// any daemon restart, and its process group is the command's), and record
-/// the runner's pid. Returns the job at once.
+/// Start `argv` as a detached command job for `project`: register the job and
+/// start its runner (`shelbi __job-exec`, see [`crate::job_exec`]) as the
+/// child of a Shelbi session of its own, [`job_session_name`], so it outlives
+/// this CLI and any daemon restart, has a terminal a client can watch, and
+/// leads the process group `job cancel` signals. The runner records its own
+/// pid once it is up. Returns the job at once.
 pub fn spawn_command_job(project: &str, argv: &[String], label: Option<String>) -> Result<Job> {
     if argv.is_empty() {
         return Err(Error::Other("no command given after `--`".into()));
@@ -695,106 +736,78 @@ pub fn spawn_command_job(project: &str, argv: &[String], label: Option<String>) 
             label,
         },
     )?;
-    let started = (|| -> Result<u32> {
+    let started = (|| -> Result<()> {
         let dir = awareness::job_dir(project, &job.id)?;
         shelbi_state::ensure_dir(&dir)?;
+        crate::job_exec::write_job_env(project, &job.id)?;
         let exe = shelbi_core::current_shelbi_exe()
             .ok_or_else(|| Error::Other("cannot locate the shelbi binary".into()))?;
-        let mut cmd = std::process::Command::new(exe);
-        cmd.arg("--project")
-            .arg(project)
-            .arg("__job-exec")
-            .arg(&job.id)
-            .arg("--")
-            .args(argv)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            // SAFETY: async-signal-safe `setsid` in the forked child before exec.
-            unsafe {
-                cmd.pre_exec(|| {
-                    if libc::setsid() == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
-        let child = cmd.spawn().map_err(Error::Io)?;
-        // Not waited on: the runner is its own session and outlives us.
-        Ok(child.id())
+        let mut child_argv = vec![
+            exe.to_string_lossy().into_owned(),
+            "--project".to_string(),
+            project.to_string(),
+            "__job-exec".to_string(),
+            job.id.clone(),
+            "--".to_string(),
+        ];
+        child_argv.extend(argv.iter().cloned());
+        let cwd = std::env::current_dir()
+            .ok()
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let (cols, rows) = SessionProcessBackend::default_size();
+        SessionProcessBackend.spawn_session(shelbi_session::SpawnSpec {
+            name: job_session_name(project, &job.id),
+            cwd,
+            cols,
+            rows,
+            task: None,
+            raw_output_log: false,
+            child_argv,
+        })?;
+        Ok(())
     })();
     match started {
-        Ok(pid) => {
-            awareness::set_job_runner_pid(project, &job.id, pid)?;
-            Ok(Job {
-                runner_pid: Some(pid),
-                ..job
-            })
-        }
+        Ok(()) => Ok(job),
         Err(e) => {
             let _ = awareness::remove_job(project, &job.id);
+            if let Ok(dir) = awareness::job_dir(project, &job.id) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
             Err(e)
         }
     }
 }
 
-/// The body of `shelbi __job-exec <id> -- <cmd...>`: run the command with its
-/// combined output in the job's `output.log`, then write `result.json`. The
-/// runner was started as a session leader, so the command shares its process
-/// group and `job cancel` reaches both with one signal.
-pub fn run_job_exec(project: &str, id: &str, argv: &[String]) -> Result<()> {
-    let output_path = awareness::job_output_path(project, id)?;
-    if let Some(parent) = output_path.parent() {
-        shelbi_state::ensure_dir(parent)?;
-    }
-    let result = (|| -> std::result::Result<std::process::ExitStatus, String> {
-        let program = argv.first().ok_or("no command given")?;
-        let out = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&output_path)
-            .map_err(|e| format!("cannot open {}: {e}", output_path.display()))?;
-        let err = out.try_clone().map_err(|e| e.to_string())?;
-        std::process::Command::new(program)
-            .args(&argv[1..])
-            .stdin(std::process::Stdio::null())
-            .stdout(out)
-            .stderr(err)
-            .status()
-            .map_err(|e| format!("could not start `{program}`: {e}"))
-    })();
-    let tail = awareness::tail_lines(&output_path, awareness::JOB_TAIL_LINES);
-    let result = match result {
-        Ok(status) => {
-            #[cfg(unix)]
-            let signal = std::os::unix::process::ExitStatusExt::signal(&status);
-            #[cfg(not(unix))]
-            let signal = None;
-            JobResult {
-                exit_code: status.code(),
-                signal,
-                finished_at: Utc::now(),
-                tail,
-                error: None,
-            }
-        }
-        Err(error) => JobResult {
-            exit_code: Some(127),
-            signal: None,
-            finished_at: Utc::now(),
-            tail,
-            error: Some(error),
-        },
+/// Remove the directory of each of `project`'s job sessions
+/// ([`job_session_name`]) that has exited, for the jobs `remove` picks. A
+/// finished job's output stays in its `output.log`: the session was only its
+/// live terminal. Matched on the exact name, so no other session is ever
+/// touched. Returns the picked jobs whose session is still up.
+pub fn remove_job_sessions(project: &str, remove: impl Fn(&str) -> bool) -> HashSet<String> {
+    let mut up = HashSet::new();
+    let Ok(root) = shelbi_state::sessions_dir() else {
+        return up;
     };
-    awareness::write_job_result(project, id, &result)
+    for session in shelbi_client::list(&root).unwrap_or_default() {
+        let Some(id) = job_of_session(project, &session.meta.name) else {
+            continue;
+        };
+        if !remove(id) {
+            continue;
+        }
+        if session.alive {
+            up.insert(id.to_string());
+        } else {
+            let _ = std::fs::remove_dir_all(&session.dir);
+        }
+    }
+    up
 }
 
 /// Cancel job `id`: drop it from the store and, for a command job whose runner
-/// is still alive, SIGTERM the runner's process group (the command with it).
+/// is still alive, SIGTERM the runner's process group (the runner passes it on
+/// to the command's).
 /// The job goes into the history as `canceled` (or, for a command that had
 /// already finished unreported, as it ended). Returns the removed job, or
 /// `None` when there was none.
@@ -823,6 +836,15 @@ pub fn cancel_job(project: &str, id: &str) -> Result<Option<Job>> {
                 unsafe {
                     libc::kill(-pid, libc::SIGTERM);
                 }
+            }
+        }
+        // A runner that hasn't recorded its pid yet is reached through its
+        // session, by the job's exact session name: the session sends its
+        // child's group SIGTERM, which the runner passes on to the command.
+        if job.runner_pid.is_none() && matches!(awareness::read_job_result(project, id), Ok(None)) {
+            let name = job_session_name(project, id);
+            if let Err(e) = SessionProcessBackend.signal_by_name(&shelbi_core::Host::Local, &name, None) {
+                tracing::warn!(project, job = %id, error = %e, "job session not signalled");
             }
         }
     }

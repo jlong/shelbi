@@ -12,6 +12,13 @@
 //! an ellipsis so the table never scrolls sideways; hovering it shows the
 //! whole command (a long Description likewise).
 //!
+//! Clicking a row opens the job's sheet on the right, beside the table (the
+//! Workspace view's split, with its draggable divider): the job's label, its
+//! status and elapsed time, a running command's live terminal (watched, never
+//! typed into) or a finished one's saved output, and a Cancel button while it
+//! runs. Escape or ✕ closes it. The loads are
+//! [`shelbi_app::jobs::open_sheet`]'s, the TUI's too.
+//!
 //! The awareness store and the history have no change notification, so the
 //! view re-reads them every [`REFRESH_INTERVAL`] while it is open, off the UI
 //! thread through the window's [`ProjectSource`] (a remote window's source
@@ -22,14 +29,19 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, AnyElement, Context, FocusHandle, ScrollHandle, SharedString, Task, Window,
+    div, prelude::*, px, AnyElement, ClickEvent, Context, Entity, FocusHandle, KeyDownEvent, ScrollHandle,
+    SharedString, Task, Window,
 };
 use shelbi_app::jobs::{
-    one_line, JobRow, JobsModel, JobsRead, COLUMNS, FINISHED_HEADING, REFRESH_INTERVAL, TITLE,
+    one_line, JobRow, JobsModel, JobsRead, SheetLoad, CANCEL_LABEL, COLUMNS, FINISHED_HEADING, REFRESH_INTERVAL,
+    TITLE,
 };
 use shelbi_app::source::{ProjectHandle, ProjectSource};
 
-use crate::theme::style::{self, Type, Typography};
+use super::workspace_layout::{render_split, ShellSplit};
+use crate::assets::icons;
+use crate::elements::terminal::{session as term_session, TerminalPane};
+use crate::theme::style::{self, ButtonKind, ButtonSize, IconButtonSize, Type, Typography};
 use crate::theme::Theme;
 
 /// How often the view drains its refresher.
@@ -49,7 +61,13 @@ const COLUMN_GAP: f32 = 20.0;
 const DESCRIPTION_TIP_CHARS: usize = 24;
 
 pub struct JobsView {
+    project: String,
+    source: std::sync::Arc<dyn ProjectSource>,
     model: JobsModel,
+    /// The open job's sheet.
+    sheet: Option<JobSheet>,
+    /// The table | sheet split.
+    split: ShellSplit,
     focus: FocusHandle,
     needs_focus: bool,
     refresher: shelbi_app::Refresher<JobsRead>,
@@ -58,14 +76,34 @@ pub struct JobsView {
     _poll: Task<()>,
 }
 
+/// One job's side sheet.
+struct JobSheet {
+    id: String,
+    /// The row it opened on, for when the job leaves the model (pruned).
+    opened: JobRow,
+    body: SheetBody,
+    /// A cancel was asked for and the row still says running.
+    canceling: bool,
+    /// Why the cancel failed, when it did.
+    cancel_error: Option<String>,
+    _load: Option<Task<()>>,
+}
+
+enum SheetBody {
+    Loading,
+    /// The live terminal, or the saved output replayed.
+    Terminal(Entity<TerminalPane>),
+    Message(String),
+}
+
 impl JobsView {
     pub fn new(handle: &ProjectHandle, cx: &mut Context<Self>) -> Self {
-        let source = handle.source.clone();
-        Self::over(source, cx)
+        Self::over(handle.name().to_string(), handle.source.clone(), cx)
     }
 
-    fn over(source: std::sync::Arc<dyn ProjectSource>, cx: &mut Context<Self>) -> Self {
-        let refresher = shelbi_app::spawn_worker(move |_| source.jobs());
+    fn over(project: String, source: std::sync::Arc<dyn ProjectSource>, cx: &mut Context<Self>) -> Self {
+        let reader = source.clone();
+        let refresher = shelbi_app::spawn_worker(move |_| reader.jobs());
         refresher.request();
         let poll = cx.spawn(async move |this, cx| loop {
             cx.background_executor().timer(POLL_INTERVAL).await;
@@ -74,7 +112,11 @@ impl JobsView {
             }
         });
         JobsView {
+            project,
+            source,
             model: JobsModel::Loading,
+            sheet: None,
+            split: ShellSplit::default(),
             focus: cx.focus_handle(),
             needs_focus: true,
             refresher,
@@ -119,6 +161,18 @@ impl JobsView {
         self.tick(cx);
     }
 
+    /// The open sheet's job and what its terminal shows (`None` while it
+    /// loads or shows a message), for tests.
+    #[cfg(test)]
+    pub fn sheet_text(&self, cx: &gpui::App) -> Option<(String, Option<String>)> {
+        let sheet = self.sheet.as_ref()?;
+        let text = match &sheet.body {
+            SheetBody::Terminal(pane) => Some(pane.read(cx).terminal_text()),
+            _ => None,
+        };
+        Some((sheet.id.clone(), text))
+    }
+
     /// Ask for a read now.
     #[cfg(test)]
     pub fn refresh(&mut self) {
@@ -126,10 +180,194 @@ impl JobsView {
         self.last_refresh = Instant::now();
     }
 
-    fn render_body(&self, theme: &Theme) -> AnyElement {
+    /// Open job `id`'s sheet (replacing an open one) and load what it shows
+    /// off the UI thread.
+    fn open_sheet(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.model.rows().iter().find(|r| r.id == id).cloned() else {
+            return;
+        };
+        let (project, load_row) = (self.project.clone(), row.clone());
+        let id = row.id.clone();
+        let background = cx.background_executor().clone();
+        let load = cx.spawn_in(window, async move |this, cx| {
+            let load = background
+                .spawn(async move { shelbi_app::jobs::open_sheet(&project, &load_row) })
+                .await;
+            let _ = this.update_in(cx, |view, window, cx| view.sheet_loaded(&id, load, window, cx));
+        });
+        self.sheet = Some(JobSheet {
+            id: row.id.clone(),
+            opened: row,
+            body: SheetBody::Loading,
+            canceling: false,
+            cancel_error: None,
+            _load: Some(load),
+        });
+        cx.notify();
+    }
+
+    fn sheet_loaded(&mut self, id: &str, load: SheetLoad, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(sheet) = self.sheet.as_mut().filter(|s| s.id == id) else {
+            return;
+        };
+        let name = shelbi_state::awareness::job_session_name(&self.project, id);
+        sheet.body = match load {
+            SheetLoad::Live(c) => {
+                let size = shelbi_term::Size::new(c.size.cols, c.size.rows);
+                match term_session::wire(c.conn, c.events, size, name) {
+                    Ok(connected) => SheetBody::Terminal(cx.new(|cx| TerminalPane::watching(connected, window, cx))),
+                    Err(e) => SheetBody::Message(e),
+                }
+            }
+            SheetLoad::Saved(bytes) => SheetBody::Terminal(cx.new(|cx| TerminalPane::replay(name, bytes, window, cx))),
+            SheetLoad::Message(m) => SheetBody::Message(m),
+        };
+        sheet._load = None;
+        cx.notify();
+    }
+
+    fn close_sheet(&mut self, cx: &mut Context<Self>) {
+        if self.sheet.take().is_some() {
+            self.needs_focus = true;
+            cx.notify();
+        }
+    }
+
+    /// The open sheet's row, current from the model.
+    fn sheet_row(&self) -> Option<&JobRow> {
+        let sheet = self.sheet.as_ref()?;
+        Some(self.model.rows().iter().find(|r| r.id == sheet.id).unwrap_or(&sheet.opened))
+    }
+
+    /// `shelbi job cancel` for the open sheet's job, off the UI thread: its
+    /// row moves under Finished on the next read.
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        let running = self.sheet_row().is_some_and(JobRow::can_cancel);
+        let Some(sheet) = self.sheet.as_mut().filter(|s| running && !s.canceling) else {
+            return;
+        };
+        sheet.canceling = true;
+        sheet.cancel_error = None;
+        let (source, id) = (self.source.clone(), sheet.id.clone());
+        let background = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            let done = background.spawn(async move { source.cancel_job(&id).map(|()| id) }).await;
+            let _ = this.update(cx, |view, cx| {
+                if let (Err(e), Some(sheet)) = (done, view.sheet.as_mut()) {
+                    sheet.canceling = false;
+                    sheet.cancel_error = Some(e);
+                }
+                // Read now, so the row moves without waiting out the cadence.
+                view.refresher.request();
+                view.last_refresh = Instant::now();
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// The sheet: its header (the job's label and ✕), its status, the
+    /// terminal, and Cancel while the job runs.
+    fn render_sheet(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let sheet = self.sheet.as_ref()?;
+        let row = self.sheet_row()?.clone();
+        let now = super::activity::now();
+        let status = if sheet.canceling && row.is_running() {
+            "● Canceling…".to_string()
+        } else {
+            row.sheet_status(now)
+        };
+        let close = style::icon_button("job-sheet-close", icons::X_MARK, IconButtonSize::Small, false, theme)
+            .tooltip(style::tooltip("Close (Esc)"))
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.close_sheet(cx)));
+        let body = match &sheet.body {
+            SheetBody::Loading => message_body("Loading…", theme),
+            SheetBody::Message(m) => message_body(m, theme),
+            SheetBody::Terminal(pane) => div()
+                .debug_selector(|| "job-sheet-terminal".into())
+                .flex()
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
+                .child(pane.clone())
+                .into_any_element(),
+        };
+        let footer = row.can_cancel().then(|| {
+            let button = if sheet.canceling {
+                style::disabled_button("job-sheet-cancel", CANCEL_LABEL, ButtonKind::Danger, ButtonSize::Small, theme)
+            } else {
+                style::button("job-sheet-cancel", CANCEL_LABEL, ButtonKind::Danger, ButtonSize::Small, false, theme)
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.cancel(cx)))
+            };
+            div()
+                .flex()
+                .flex_row()
+                .flex_none()
+                .items_center()
+                .gap_3()
+                .px_4()
+                .py_3()
+                .border_t_1()
+                .border_color(theme.divider)
+                .child(button)
+                .when_some(sheet.cancel_error.clone(), |d, e| {
+                    d.child(div().min_w_0().truncate().type_style(Type::Small).text_color(theme.red).child(e))
+                })
+        });
+        Some(
+            div()
+                .debug_selector(|| "job-sheet".into())
+                .flex()
+                .flex_col()
+                .size_full()
+                .min_w_0()
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .flex_none()
+                        .items_center()
+                        .gap_2()
+                        .h(px(37.0))
+                        .pl_4()
+                        .pr_2()
+                        .child(
+                            div()
+                                .debug_selector(|| "job-sheet-title".into())
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .type_style(Type::BaseMedium)
+                                .text_color(theme.text_loud)
+                                .child(one_line(&row.description)),
+                        )
+                        .child(close),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "job-sheet-status".into())
+                        .flex_none()
+                        .px_4()
+                        .pb_2()
+                        .type_style(Type::Small)
+                        .text_color(theme.tone(row.status_tone()))
+                        .child(status),
+                )
+                .child(div().h(px(1.0)).flex_none().bg(theme.divider))
+                .child(body)
+                .children(footer)
+                .into_any_element(),
+        )
+    }
+
+    fn render_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         if let Some(message) = self.model.message() {
-            return style::empty_state("jobs-empty", message, None, theme)
-                .max_w_full()
+            return div()
+                .flex()
+                .flex_1()
+                .min_w_0()
+                .child(style::empty_state("jobs-empty", message, None, theme).max_w_full())
                 .into_any_element();
         }
         let now = super::activity::now();
@@ -156,7 +394,8 @@ impl JobsView {
             } else if i > 0 {
                 rows.push(div().h(px(1.0)).bg(theme.divider).into_any_element());
             }
-            rows.push(job_row(row, now, theme));
+            let open = self.sheet.as_ref().is_some_and(|s| s.id == row.id);
+            rows.push(job_row(row, now, open, theme, cx));
         }
         div()
             .id("jobs-list")
@@ -166,6 +405,7 @@ impl JobsView {
             .flex_col()
             .flex_1()
             .min_h_0()
+            .min_w_0()
             .overflow_y_scroll()
             .px_4()
             .py_4()
@@ -189,12 +429,25 @@ fn finished_heading(theme: &Theme) -> AnyElement {
 /// One job's row: its description, its command cut to the column (whole in
 /// a tooltip), its status (red when it failed), how long it ran, and when it
 /// finished.
-fn job_row(row: &JobRow, now: chrono::DateTime<chrono::Utc>, theme: &Theme) -> AnyElement {
+fn job_row(
+    row: &JobRow,
+    now: chrono::DateTime<chrono::Utc>,
+    open: bool,
+    theme: &Theme,
+    cx: &mut Context<JobsView>,
+) -> AnyElement {
     let id = row.id.clone();
     let description = one_line(&row.description);
     let long_description = description.chars().count() > DESCRIPTION_TIP_CHARS;
+    let click_id = row.id.clone();
     div()
+        .id(SharedString::from(format!("job-row-{}", row.id)))
         .debug_selector(move || format!("job-row-{id}"))
+        .cursor_pointer()
+        .rounded(px(6.0))
+        .when(open, |d| d.bg(theme.background_hover))
+        .hover(|d| d.bg(theme.background_hover))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.open_sheet(&click_id, window, cx)))
         .flex()
         .flex_row()
         .items_center()
@@ -267,11 +520,24 @@ impl Render for JobsView {
         }
         let theme = *cx.global::<Theme>();
         let summary = self.model.summary();
+        let table = self.render_body(&theme, cx);
+        let sheet = self.render_sheet(&theme, cx);
+        let body = render_split("jobs", &self.split, |this| &mut this.split, table, sheet, &theme, cx)
+            .flex_1()
+            .min_h_0();
         div()
             .id("jobs")
             .debug_selector(|| "jobs".into())
             .track_focus(&self.focus)
             .key_context("Jobs")
+            // Escape closes the sheet, wherever focus is in the view: ahead
+            // of the terminal, which would otherwise take the key.
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                if ev.keystroke.key == "escape" && this.sheet.is_some() {
+                    this.close_sheet(cx);
+                    cx.stop_propagation();
+                }
+            }))
             .flex()
             .flex_col()
             .size_full()
@@ -308,8 +574,20 @@ impl Render for JobsView {
                     }),
             )
             .child(div().h(px(1.0)).flex_none().bg(theme.divider))
-            .child(self.render_body(&theme))
+            .child(body)
     }
+}
+
+/// A line in place of the sheet's terminal.
+fn message_body(text: &str, theme: &Theme) -> AnyElement {
+    div()
+        .debug_selector(|| "job-sheet-message".into())
+        .flex_1()
+        .p_4()
+        .type_style(Type::Small)
+        .text_color(theme.muted)
+        .child(text.to_string())
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -467,4 +745,91 @@ mod tests {
         assert_eq!(view.read_with(&vcx, |v, _| v.model().message()).as_deref(), Some(REMOTE_TEXT));
         view.update(&mut vcx, |v, _| v.stop_workers());
     }
+
+    fn write_log(id: &str, text: &str) {
+        let path = shelbi_state::awareness::job_output_path(PROJECT, id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    fn click(vcx: &mut VisualTestContext, selector: &'static str) {
+        let at = vcx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector} drawn")).center();
+        vcx.simulate_click(at, gpui::Modifiers::none());
+        vcx.run_until_parked();
+    }
+
+    /// Draw until the sheet's terminal shows `want`.
+    fn sheet_shows(view: &Entity<JobsView>, cx: &mut VisualTestContext, want: &str) -> bool {
+        for _ in 0..300 {
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+            cx.run_until_parked();
+            let text = cx.update(|_, cx| view.read(cx).sheet_text(cx));
+            if text.and_then(|(_, t)| t).is_some_and(|t| t.contains(want)) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    #[gpui::test]
+    fn clicking_a_finished_job_opens_its_saved_output_and_escape_or_x_closes_it(cx: &mut TestAppContext) {
+        let _home = shelbi_app::settings::agents::fixture::Home::new("dt-jobs-sheet", PROJECT, crate::test_env::lock());
+        let now = Utc::now();
+        let record = JobRecord {
+            exit_code: Some(3),
+            ..JobRecord::finished(
+                &job("j4", JobKind::Command, "cargo test", Some("desktop tests"), now - chrono::Duration::minutes(3)),
+                JobStatus::Failed,
+                now - chrono::Duration::minutes(1),
+            )
+        };
+        record_finished_jobs(PROJECT, vec![record], now).unwrap();
+        write_log("j4", "running 3 tests\ntest result: FAILED\n");
+        let (view, mut vcx) = open(cx, shelbi_orchestrator::source::local_handle(PROJECT));
+        assert!(read_until(&view, &mut vcx, |m| m.rows().len() == 1));
+        assert!(vcx.debug_bounds("job-sheet").is_none());
+
+        click(&mut vcx, "job-row-j4");
+        assert!(sheet_shows(&view, &mut vcx, "test result: FAILED"), "the saved output shows");
+        let sheet = vcx.debug_bounds("job-sheet").expect("the sheet is drawn");
+        let row = vcx.debug_bounds("job-row-j4").unwrap();
+        assert!(sheet.left() >= row.right(), "the sheet sits beside the table");
+        assert!(vcx.debug_bounds("job-sheet-title").is_some() && vcx.debug_bounds("job-sheet-status").is_some());
+        assert!(vcx.debug_bounds("job-sheet-cancel").is_none(), "a finished job has no Cancel");
+
+        vcx.simulate_keystrokes("escape");
+        vcx.run_until_parked();
+        assert!(view.read_with(&vcx, |v, cx| v.sheet_text(cx)).is_none(), "Escape closes the sheet");
+
+        click(&mut vcx, "job-row-j4");
+        assert!(sheet_shows(&view, &mut vcx, "running 3 tests"));
+        click(&mut vcx, "job-sheet-close");
+        assert!(view.read_with(&vcx, |v, cx| v.sheet_text(cx)).is_none(), "✕ closes the sheet");
+        view.update(&mut vcx, |v, _| v.stop_workers());
+    }
+
+    #[gpui::test]
+    fn cancel_in_a_running_jobs_sheet_stops_the_job(cx: &mut TestAppContext) {
+        let _home = shelbi_app::settings::agents::fixture::Home::new("dt-jobs-cancel", PROJECT, crate::test_env::lock());
+        // A running job whose terminal is gone shows its output so far.
+        set_jobs(vec![job("j6", JobKind::Command, "make", Some("build"), Utc::now())]);
+        write_log("j6", "step 1 of 3\n");
+        let (view, mut vcx) = open(cx, shelbi_orchestrator::source::local_handle(PROJECT));
+        assert!(read_until(&view, &mut vcx, |m| m.rows().len() == 1));
+        click(&mut vcx, "job-row-j6");
+        assert!(sheet_shows(&view, &mut vcx, "step 1 of 3"));
+
+        click(&mut vcx, "job-sheet-cancel");
+        assert!(
+            read_until(&view, &mut vcx, |m| m.rows().first().is_some_and(|r| !r.is_running())),
+            "the job is canceled and moves under Finished"
+        );
+        let model = view.read_with(&vcx, |v, _| v.model().clone());
+        assert_eq!(model.rows()[0].status_label(), "Canceled");
+        assert!(vcx.debug_bounds("job-sheet-cancel").is_none(), "no Cancel once it has stopped");
+        assert!(view.read_with(&vcx, |v, cx| v.sheet_text(cx)).is_some(), "the sheet stays open on it");
+        view.update(&mut vcx, |v, _| v.stop_workers());
+    }
+
 }

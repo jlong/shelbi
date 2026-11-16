@@ -1831,6 +1831,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "libc",
+ "portable-pty",
  "regex",
  "serde",
  "serde_json",

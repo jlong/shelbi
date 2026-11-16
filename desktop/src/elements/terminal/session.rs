@@ -102,6 +102,47 @@ impl SessionIo for Canned {
     }
 }
 
+/// A [`SessionIo`] that only watches the session behind `0`: keys, mouse
+/// reports and pastes go nowhere, and the pane never claims the session's
+/// size (a `shelbi job run` command's sheet). It still reports its viewport,
+/// which the session follows while no client is typing into it.
+pub struct WatchOnly(pub Box<dyn SessionIo + Send>);
+
+impl SessionIo for WatchOnly {
+    fn input(&self, _: Vec<u8>) {}
+
+    fn paste(&self, _: String, _: bool) {}
+
+    fn resize(&self, size: Size) {
+        self.0.resize(size);
+    }
+}
+
+/// A [`SessionIo`] with no session behind it, replaying `bytes` (a finished
+/// job's saved output) from a reset screen each time the pane's size
+/// changes, so its lines wrap to the pane. Input goes nowhere.
+pub struct Replay {
+    pub events: UnboundedSender<SessionEvent>,
+    pub bytes: std::sync::Arc<[u8]>,
+}
+
+impl SessionIo for Replay {
+    fn input(&self, _: Vec<u8>) {}
+
+    fn paste(&self, _: String, _: bool) {}
+
+    fn resize(&self, size: Size) {
+        let mut data = b"\x1bc".to_vec();
+        data.extend_from_slice(&self.bytes);
+        let _ = self.events.unbounded_send(SessionEvent::Resized {
+            seq: 0,
+            cols: size.cols,
+            rows: size.rows,
+        });
+        let _ = self.events.unbounded_send(SessionEvent::Output { seq: 0, data });
+    }
+}
+
 /// A connected session, attached and streaming.
 pub struct Connected {
     /// The input side ([`SessionLink`] for a real session).

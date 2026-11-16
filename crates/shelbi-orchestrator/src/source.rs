@@ -271,6 +271,12 @@ impl ProjectSource for LocalSource {
         shelbi_app::jobs::read_local(self.name())
     }
 
+    fn cancel_job(&self, id: &str) -> Result<(), String> {
+        crate::awareness::cancel_job(self.name(), id)
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+
     fn machine_reachability(&self, host: &str) -> Reachability {
         crate::machine::probe_host_reachability(host)
     }
