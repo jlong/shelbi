@@ -2788,13 +2788,14 @@ impl QueuedBatch {
         }
     }
 
-    /// Whether this batch carries a reminder, a finished job or an overdue task:
+    /// Whether this batch carries a reminder, a finished or overdue job, or an
+    /// overdue task:
     /// the awareness lines the orchestrator asked to be woken for.
     fn is_urgent(&self) -> bool {
         self.events.iter().any(|event| {
             matches!(
                 event.kind.as_str(),
-                "reminder" | "job_done" | "task_overdue"
+                "reminder" | "job_done" | "job_overdue" | "task_overdue"
             )
         })
     }
@@ -3505,6 +3506,8 @@ fn line_priority(parsed: &ParsedLine, board_in_flight: bool) -> Option<WakePrior
 fn event_kind(parsed: &ParsedLine) -> String {
     if parsed.fields.contains_key("reminder") {
         "reminder"
+    } else if parsed.fields.contains_key("job") && parsed.fields.contains_key("overdue") {
+        "job_overdue"
     } else if parsed.fields.contains_key("job") {
         "job_done"
     } else if parsed.fields.contains_key("overdue") {
@@ -3628,6 +3631,10 @@ mod tests {
             (
                 "t project=demo task=t-1 overdue estimate=10m elapsed=20m workspace=alpha",
                 "task_overdue",
+            ),
+            (
+                r#"t project=demo job id=j3 overdue estimate=10m elapsed=20m label="tests""#,
+                "job_overdue",
             ),
         ] {
             let p = parsed(line);

@@ -113,10 +113,11 @@ pub struct Reminder {
 }
 
 /// What a [`Job`] watches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JobKind {
     /// A command Shelbi runs detached (`shelbi job run`).
+    #[default]
     Command,
     /// An existing process, until it exits.
     Pid,
@@ -158,6 +159,21 @@ pub struct Job {
     /// itself once it is up; `None` until then.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner_pid: Option<u32>,
+    /// How long the job is expected to run, counted from `started_at`
+    /// (`job run --estimate`, `job watch --estimate`, revised by `job
+    /// estimate`). Past it the tick writes a job `overdue` line, then again
+    /// every [`overdue_interval`] until the job finishes. `None`: no alerts.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_compact::option"
+    )]
+    pub estimate: Option<Duration>,
+    /// When the next overdue line is due: `started_at + estimate`, then
+    /// advanced on the overdue grid each time one is written. Set exactly
+    /// when `estimate` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_alert_at: Option<DateTime<Utc>>,
 }
 
 impl Job {
@@ -166,6 +182,19 @@ impl Job {
     pub fn display_label(&self) -> String {
         job_label(self.kind, &self.target, self.label.as_deref())
     }
+
+    /// Set (or replace) the estimate, counted from `started_at`. The first
+    /// overdue line is due once it is used up, so a revision that is already
+    /// exceeded alerts on the next tick.
+    pub fn set_estimate(&mut self, estimate: Duration) {
+        self.estimate = Some(estimate);
+        self.next_alert_at = Some(self.started_at + chrono_duration(estimate));
+    }
+}
+
+/// `d` as a chrono duration, saturating instead of failing.
+fn chrono_duration(d: Duration) -> chrono::Duration {
+    chrono::Duration::from_std(d).unwrap_or(chrono::Duration::MAX)
 }
 
 /// A job's label: `label` when it has one, else a short description of what
@@ -319,26 +348,54 @@ pub fn cancel_reminder(project: &str, id: &str) -> Result<Option<Reminder>> {
 }
 
 /// A job as the CLI registers it, before it has an id.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct NewJob {
     pub kind: JobKind,
     pub target: String,
     pub label: Option<String>,
+    /// `--estimate`: how long it should take (see [`Job::estimate`]).
+    pub estimate: Option<Duration>,
 }
 
 /// Register a job and return it with its minted id.
 pub fn add_job(project: &str, job: NewJob) -> Result<Job> {
+    validate_job_estimate(job.estimate)?;
     update_awareness(project, |store| {
-        let job = Job {
+        let mut new = Job {
             id: store.mint_id('j'),
             kind: job.kind,
             target: job.target,
             label: job.label.filter(|l| !l.trim().is_empty()),
             started_at: Utc::now(),
             runner_pid: None,
+            estimate: None,
+            next_alert_at: None,
         };
-        store.jobs.push(job.clone());
-        Ok(job)
+        if let Some(estimate) = job.estimate {
+            new.set_estimate(estimate);
+        }
+        store.jobs.push(new.clone());
+        Ok(new)
+    })
+}
+
+/// A zero estimate would alert on the first tick and mean nothing.
+fn validate_job_estimate(estimate: Option<Duration>) -> Result<()> {
+    match estimate {
+        Some(d) if d.is_zero() => Err(Error::Other("an estimate must be longer than zero".into())),
+        _ => Ok(()),
+    }
+}
+
+/// Set or revise running job `id`'s estimate, counted from when it started.
+/// Returns the job as revised, or `None` when no running job has that id.
+pub fn set_job_estimate(project: &str, id: &str, estimate: Duration) -> Result<Option<Job>> {
+    validate_job_estimate(Some(estimate))?;
+    update_awareness(project, |store| {
+        Ok(store.jobs.iter_mut().find(|j| j.id == id).map(|job| {
+            job.set_estimate(estimate);
+            job.clone()
+        }))
     })
 }
 
@@ -370,7 +427,7 @@ pub fn set_estimate(
     started_at: DateTime<Utc>,
     workspace: Option<&str>,
 ) -> Result<Estimate> {
-    let first = started_at + chrono::Duration::from_std(estimate).unwrap_or(chrono::Duration::MAX);
+    let first = started_at + chrono_duration(estimate);
     let entry = Estimate {
         task_id: task_id.to_string(),
         estimate,
@@ -632,6 +689,14 @@ pub struct JobRecord {
     /// A command's `output.log`, while the history keeps it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log: Option<PathBuf>,
+    /// The estimate the job had when it finished, so the history shows
+    /// estimate against actual ([`Self::duration`]).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "serde_compact::option"
+    )]
+    pub estimate: Option<Duration>,
 }
 
 impl JobRecord {
@@ -648,6 +713,7 @@ impl JobRecord {
             exit_code: None,
             detail: None,
             log: None,
+            estimate: job.estimate,
         }
     }
 
@@ -855,7 +921,7 @@ mod tests {
         let due = Utc::now();
         let err = add_reminder("typo", due, "lost", None).unwrap_err().to_string();
         assert!(err.contains("project `typo` has no state directory"), "{err}");
-        let pid = NewJob { kind: JobKind::Pid, target: "1".into(), label: None };
+        let pid = NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: None };
         assert!(add_job("typo", pid).is_err());
         assert!(set_estimate("typo", "t1", mins(30), due, None).is_err());
         let result = JobResult {
@@ -880,7 +946,7 @@ mod tests {
         let a = add_reminder("demo", due, "a", None).unwrap();
         let j = add_job(
             "demo",
-            NewJob { kind: JobKind::Pid, target: "1".into(), label: None },
+            NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: None },
         )
         .unwrap();
         assert_eq!((a.id.as_str(), j.id.as_str()), ("r1", "j2"));
@@ -921,6 +987,35 @@ mod tests {
         assert_eq!(read_awareness("demo").unwrap().estimates.len(), 1);
         assert!(clear_estimate("demo", "t").unwrap().is_some());
         assert!(clear_estimate("demo", "t").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_job_estimate_is_kept_on_the_job_and_its_record() {
+        let _home = Home::new("job-estimate");
+        let job = add_job(
+            "demo",
+            NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: Some(mins(30)) },
+        )
+        .unwrap();
+        assert_eq!(job.next_alert_at, Some(job.started_at + chrono::Duration::minutes(30)));
+        let text = std::fs::read_to_string(awareness_path("demo").unwrap()).unwrap();
+        assert!(text.contains("\"estimate\": \"30m\""), "{text}");
+        let revised = set_job_estimate("demo", &job.id, mins(90)).unwrap().unwrap();
+        assert_eq!(revised.next_alert_at, Some(job.started_at + chrono::Duration::minutes(90)));
+        assert!(set_job_estimate("demo", "j99", mins(5)).unwrap().is_none());
+        let zero = NewJob { kind: JobKind::Pid, target: "1".into(), label: None, estimate: Some(Duration::ZERO) };
+        assert!(add_job("demo", zero).is_err());
+        // A job from before estimates reads as having none.
+        let old: Job = serde_json::from_str(
+            r#"{"id":"j1","kind":"pid","target":"1","started_at":"2026-11-10T10:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!((old.estimate, old.next_alert_at), (None, None));
+        let record = JobRecord::finished(&revised, JobStatus::Exited, Utc::now());
+        assert_eq!(record.estimate, Some(mins(90)));
+        record_finished_jobs("demo", vec![record], Utc::now()).unwrap();
+        let text = std::fs::read_to_string(job_history_path("demo").unwrap()).unwrap();
+        assert!(text.contains("\"estimate\": \"1h30m\""), "{text}");
     }
 
     #[test]
@@ -972,6 +1067,8 @@ mod tests {
         .unwrap();
         crate::append_task_overdue_event("demo", "t-1", mins(45), Duration::from_secs(70 * 60 + 12), Some("alpha"))
             .unwrap();
+        crate::append_job_overdue_event("demo", "j3", mins(30), Duration::from_secs(45 * 60 + 40), "bundle \"app\"")
+            .unwrap();
         let lines = log_lines();
         assert_eq!(
             lines,
@@ -979,6 +1076,7 @@ mod tests {
                 "project=demo reminder id=r1 text=\"check the 'tap' PR heartbeat ci task=x\"",
                 "project=demo job id=j2 kind=command label=\"desktop tests\" status=failed exit=3 detail=\"error: 1 test failed\" log=/tmp/jobs/j2/output.log",
                 "project=demo task=t-1 overdue estimate=45m elapsed=1h10m workspace=alpha",
+                "project=demo job id=j3 overdue estimate=30m elapsed=45m label=\"bundle 'app'\"",
             ]
         );
         let path = crate::events_log_path().unwrap();
@@ -989,7 +1087,12 @@ mod tests {
             .collect();
         assert_eq!(
             kinds,
-            [crate::EventKind::Reminder, crate::EventKind::JobDone, crate::EventKind::TaskOverdue]
+            [
+                crate::EventKind::Reminder,
+                crate::EventKind::JobDone,
+                crate::EventKind::TaskOverdue,
+                crate::EventKind::JobOverdue
+            ]
         );
     }
 
@@ -1042,6 +1145,8 @@ mod tests {
             label: None,
             started_at: finished_at - chrono::Duration::seconds(90),
             runner_pid: None,
+            estimate: None,
+            next_alert_at: None,
         };
         JobRecord { exit_code: Some(0), ..JobRecord::finished(&job, JobStatus::Ok, finished_at) }
     }

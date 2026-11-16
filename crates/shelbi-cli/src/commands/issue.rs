@@ -510,20 +510,7 @@ fn set_estimate(project: &str, id: &str, duration: &str) -> Result<()> {
 
 /// `elapsed 20m, 25m left` / `elapsed 1h10m, overdue by 25m`.
 fn estimate_status(est: &awareness::Estimate, now: chrono::DateTime<chrono::Utc>) -> String {
-    let elapsed = (now - est.started_at).to_std().unwrap_or_default();
-    let minute = |d: std::time::Duration| {
-        let secs = d.as_secs();
-        shelbi_core::format_duration(std::time::Duration::from_secs(if secs >= 60 {
-            secs / 60 * 60
-        } else {
-            secs
-        }))
-    };
-    if elapsed >= est.estimate {
-        format!("elapsed {}, overdue by {}", minute(elapsed), minute(elapsed - est.estimate))
-    } else {
-        format!("elapsed {}, {} left", minute(elapsed), minute(est.estimate - elapsed))
-    }
+    shelbi_app::estimate::EstimateProgress::between(est.started_at, now, est.estimate).status_text()
 }
 
 /// Post a comment onto an issue via the project's configured issue-tracker

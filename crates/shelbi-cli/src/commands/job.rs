@@ -4,6 +4,11 @@
 //! writes one `job` line to `events.log` when each finishes, so the
 //! orchestrator is told instead of having to poll.
 //!
+//! `--estimate` on `job run` / `job watch` (revised by `job estimate`) says how
+//! long a job should take: past it the poller writes a job `overdue` line,
+//! then again every half the estimate (at least 10m) until the job finishes,
+//! and the listings mark it overdue.
+//!
 //! A finished job leaves the watch list for the job history
 //! (`jobs/history.json`, kept for the newest 200 jobs within 30 days): `job
 //! list --all` lists it, and `job log <id>` prints a command job's output,
@@ -21,6 +26,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Result};
 use chrono::{DateTime, Utc};
 use clap::Subcommand;
+use shelbi_app::estimate::EstimateProgress;
 use shelbi_orchestrator::awareness as runner;
 use shelbi_state::awareness::{self, Job, JobKind, JobRecord, NewJob};
 
@@ -38,6 +44,11 @@ pub enum JobCmd {
         /// A short name for the event line and `job list`.
         #[arg(long)]
         label: Option<String>,
+        /// How long it should take (`45m`, `2h`, `1h30m`). If it is still
+        /// running after that, a job `overdue` line goes to the events log,
+        /// then again every half the estimate (at least 10m) until it exits.
+        #[arg(long, value_name = "DURATION")]
+        estimate: Option<String>,
         /// The command and its arguments, after `--`.
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
@@ -56,6 +67,18 @@ pub enum JobCmd {
         /// A short name for the event line and `job list`.
         #[arg(long)]
         label: Option<String>,
+        /// How long it should take (`45m`, `2h`, `1h30m`); see `job run
+        /// --estimate`.
+        #[arg(long, value_name = "DURATION")]
+        estimate: Option<String>,
+    },
+    /// Set or revise a running job's estimate. The estimate is the total
+    /// time from when the job started; a revision that is already exceeded
+    /// alerts on the next tick.
+    Estimate {
+        id: String,
+        /// `45m`, `2h`, `1h30m`.
+        duration: String,
     },
     /// List the jobs still being watched. `--all` adds the finished ones
     /// (the newest 200 from the last 30 days), newest first, with their
@@ -89,14 +112,17 @@ pub enum JobCmd {
 pub fn run(project_opt: Option<String>, cmd: JobCmd) -> Result<()> {
     let project = require_registered_project(project_opt)?;
     match cmd {
-        JobCmd::Run { label, cmd } => {
-            let job = runner::spawn_command_job(&project, &cmd, label).map_err(|e| anyhow!(e))?;
+        JobCmd::Run { label, estimate, cmd } => {
+            let estimate = parse_estimate(estimate.as_deref())?;
+            let job = runner::spawn_command_job(&project, &cmd, label, estimate).map_err(|e| anyhow!(e))?;
             let log = awareness::job_output_path(&project, &job.id).map_err(|e| anyhow!(e))?;
             println!("✓ job {} started: {}", job.id, job.display_label());
             println!("  output: {}", log.display());
+            print_estimate(&job);
             Ok(())
         }
-        JobCmd::Watch { pid, ci, pr, label } => {
+        JobCmd::Watch { pid, ci, pr, label, estimate } => {
+            let estimate = parse_estimate(estimate.as_deref())?;
             let (kind, target) = match (pid, ci, pr) {
                 (Some(pid), _, _) => {
                     if !runner::pid_alive(pid) {
@@ -108,9 +134,33 @@ pub fn run(project_opt: Option<String>, cmd: JobCmd) -> Result<()> {
                 (_, _, Some(pr)) => (JobKind::Pr, pr.to_string()),
                 _ => bail!("pass one of --pid, --ci or --pr"),
             };
-            let job = awareness::add_job(&project, NewJob { kind, target, label })
+            let job = awareness::add_job(&project, NewJob { kind, target, label, estimate })
                 .map_err(|e| anyhow!(e))?;
             println!("✓ job {} watching {}", job.id, job.display_label());
+            print_estimate(&job);
+            Ok(())
+        }
+        JobCmd::Estimate { id, duration } => {
+            let d = shelbi_core::parse_duration(&duration).map_err(|e| anyhow!(e))?;
+            let had = awareness::read_awareness(&project)
+                .map_err(|e| anyhow!(e))?
+                .jobs
+                .iter()
+                .find(|j| j.id == id)
+                .map(|j| j.estimate.is_some());
+            let Some(job) = awareness::set_job_estimate(&project, &id, d).map_err(|e| anyhow!(e))? else {
+                if awareness::find_job_record(&project, &id).map_err(|e| anyhow!(e))?.is_some() {
+                    bail!("job `{id}` has finished; estimates apply to running jobs");
+                }
+                bail!("no running job `{id}` (see `shelbi job list`)");
+            };
+            let verb = if had == Some(true) { "revised" } else { "set" };
+            println!(
+                "✓ {verb} estimate for job {}: {} ({})",
+                job.id,
+                shelbi_core::format_duration(d),
+                progress_of(&job, Utc::now()).map(|p| p.status_text()).unwrap_or_default()
+            );
             Ok(())
         }
         JobCmd::List { all, json } => {
@@ -126,7 +176,7 @@ pub fn run(project_opt: Option<String>, cmd: JobCmd) -> Result<()> {
             } else if all {
                 print!("{}", render_all(&jobs, &history, Utc::now()));
             } else {
-                print!("{}", render_list(&jobs));
+                print!("{}", render_list(&jobs, Utc::now()));
             }
             Ok(())
         }
@@ -139,6 +189,35 @@ pub fn run(project_opt: Option<String>, cmd: JobCmd) -> Result<()> {
             None => bail!("no job `{id}` (see `shelbi job list`)"),
         },
     }
+}
+
+/// `--estimate`'s value, parsed: `45m`, `2h`, `1h30m`.
+fn parse_estimate(value: Option<&str>) -> Result<Option<Duration>> {
+    value
+        .map(|v| shelbi_core::parse_duration(v).map_err(|e| anyhow!("--estimate: {e}")))
+        .transpose()
+}
+
+/// The `  estimate: 30m` line after a job starts with one.
+fn print_estimate(job: &Job) {
+    if let Some(d) = job.estimate {
+        println!("  estimate: {}", shelbi_core::format_duration(d));
+    }
+}
+
+/// How far running `job` is into its estimate at `now`.
+fn progress_of(job: &Job, now: DateTime<Utc>) -> Option<EstimateProgress> {
+    job.estimate.map(|e| EstimateProgress::between(job.started_at, now, e))
+}
+
+/// How a finished `record` went against its estimate.
+fn record_progress(record: &JobRecord) -> Option<EstimateProgress> {
+    record.estimate.map(|e| EstimateProgress::new(record.duration(), e))
+}
+
+/// `12m/30m`: elapsed (or how long it ran) against the estimate, compact.
+fn against(progress: &EstimateProgress) -> String {
+    format!("{}/{}", duration_text(progress.elapsed), shelbi_core::format_duration(progress.estimate))
 }
 
 /// `shelbi __job-exec <id> -- <cmd...>`. Only `job run` starts it, after
@@ -183,9 +262,14 @@ fn newest_started_first(jobs: &mut [Job]) {
 /// (with `--all`) each finished record with its `duration_secs`.
 fn list_json(jobs: &[Job], history: &[JobRecord]) -> Result<serde_json::Value> {
     let mut out = Vec::new();
+    let now = Utc::now();
     for job in jobs {
         let mut v = serde_json::to_value(job)?;
         v["status"] = "running".into();
+        v["elapsed_secs"] = (now - job.started_at).to_std().unwrap_or_default().as_secs().into();
+        if let Some(p) = progress_of(job, now) {
+            v["overdue"] = p.overdue().into();
+        }
         out.push(v);
     }
     for record in history {
@@ -206,19 +290,26 @@ fn render_all(jobs: &[Job], history: &[JobRecord], now: DateTime<Utc>) -> String
     if jobs.is_empty() && history.is_empty() {
         return "no jobs\n".into();
     }
+    // The duration column is wider only when some job has an estimate to
+    // show against it (`45m/30m`).
+    let estimates = jobs.iter().any(|j| j.estimate.is_some()) || history.iter().any(|r| r.estimate.is_some());
+    let took_w = if estimates { 15 } else { 9 };
     let row = |id: &str, kind: JobKind, status: &str, exit: &str, took: &str, when: &str, label: &str| {
-        format!("{id:<5} {kind:<8} {status:<9} {exit:<8} {took:<9} {when:<22} {label}\n", kind = kind.as_str())
+        format!("{id:<5} {kind:<8} {status:<9} {exit:<8} {took:<took_w$} {when:<22} {label}\n", kind = kind.as_str())
     };
     let mut out = String::new();
     for job in jobs {
-        let took = duration_text((now - job.started_at).to_std().unwrap_or_default());
+        let (status, took) = match progress_of(job, now) {
+            Some(p) => (if p.overdue() { "overdue" } else { "running" }, against(&p)),
+            None => ("running", duration_text((now - job.started_at).to_std().unwrap_or_default())),
+        };
         let when = format!("started {}", super::remind::relative(job.started_at, now));
-        out.push_str(&row(&job.id, job.kind, "running", "", &took, &when, &job.display_label()));
+        out.push_str(&row(&job.id, job.kind, status, "", &took, &when, &job.display_label()));
     }
     for r in history {
         let exit = r.exit_code.map(|c| format!("exit {c}")).unwrap_or_default();
         let when = format!("finished {}", super::remind::relative(r.finished_at, now));
-        let took = duration_text(r.duration());
+        let took = record_progress(r).map(|p| against(&p)).unwrap_or_else(|| duration_text(r.duration()));
         out.push_str(&row(&r.id, r.kind, r.status.as_str(), &exit, &took, &when, &r.display_label()));
         if let Some(log) = &r.log {
             out.push_str(&format!("      log: {}\n", log.display()));
@@ -280,6 +371,10 @@ fn print_log(project: &str, id: &str, lines: Option<usize>, follow: bool) -> Res
     }
     if !path.exists() && !matches!(found, Found::Running(_)) {
         bail!("job {id}'s output is no longer kept ({} is gone)", path.display());
+    }
+    // On stderr, so the output itself pipes clean.
+    if let Some(header) = log_header(&found, now) {
+        eprintln!("{header}");
     }
     let start = match (lines, path.exists()) {
         (Some(n), true) => awareness::last_lines_offset(&path, n)?,
@@ -357,10 +452,50 @@ fn follow_log(
     }
 }
 
+/// The header `job log` writes (to stderr) above a command job's output
+/// when it has an estimate: `job j3 running 45m of a 30m estimate, overdue
+/// by 15m` / `job j3 ok after 12m of a 30m estimate`.
+fn log_header(found: &Found, now: DateTime<Utc>) -> Option<String> {
+    match found {
+        Found::Running(job) => {
+            let p = progress_of(job, now)?;
+            Some(format!("job {} running: {}", job.id, estimate_text(&p)))
+        }
+        Found::Finished(record) => {
+            let p = record_progress(record)?;
+            Some(format!("job {} {}: {}", record.id, record.status, ran_text(&p)))
+        }
+        Found::DirOnly => None,
+    }
+}
+
+/// `30m estimate, elapsed 12m, 18m left` / `..., overdue by 15m`.
+fn estimate_text(p: &EstimateProgress) -> String {
+    format!("{} estimate, {}", shelbi_core::format_duration(p.estimate), p.status_text())
+}
+
+/// How a finished job went against its estimate: `ran 12m of a 30m
+/// estimate` / `ran 45m, 15m over its 30m estimate`.
+fn ran_text(p: &EstimateProgress) -> String {
+    let estimate = shelbi_core::format_duration(p.estimate);
+    if p.elapsed > p.estimate {
+        format!(
+            "ran {}, {} over its {estimate} estimate",
+            duration_text(p.elapsed),
+            duration_text(p.elapsed - p.estimate)
+        )
+    } else {
+        format!("ran {} of a {estimate} estimate", duration_text(p.elapsed))
+    }
+}
+
 /// What a running watch prints in place of output.
 fn watch_status_running(job: &Job, now: DateTime<Utc>) -> String {
+    let estimate = progress_of(job, now)
+        .map(|p| format!(" ({})", estimate_text(&p)))
+        .unwrap_or_default();
     format!(
-        "job {} is a {} watch on {}, started {} and still waiting. A watch has no command output.\n",
+        "job {} is a {} watch on {}, started {} and still waiting{estimate}. A watch has no command output.\n",
         job.id,
         job.kind,
         job.display_label(),
@@ -370,14 +505,17 @@ fn watch_status_running(job: &Job, now: DateTime<Utc>) -> String {
 
 /// What a finished watch prints in place of output.
 fn watch_status_finished(record: &JobRecord, now: DateTime<Utc>) -> String {
+    let took = match record_progress(record) {
+        Some(p) => ran_text(&p),
+        None => format!("after {}", duration_text(record.duration())),
+    };
     let mut out = format!(
-        "job {} was a {} watch on {}: {} {} (after {}). A watch has no command output.\n",
+        "job {} was a {} watch on {}: {} {} ({took}). A watch has no command output.\n",
         record.id,
         record.kind,
         record.display_label(),
         record.status,
         super::remind::relative(record.finished_at, now),
-        duration_text(record.duration()),
     );
     if let Some(detail) = &record.detail {
         out.push_str(&format!("{detail}\n"));
@@ -385,15 +523,23 @@ fn watch_status_finished(record: &JobRecord, now: DateTime<Utc>) -> String {
     out
 }
 
-fn render_list(jobs: &[Job]) -> String {
+/// `job list`: each running job, newest first. A job with an estimate shows
+/// its elapsed time against it, and `overdue` once it is used up.
+fn render_list(jobs: &[Job], now: DateTime<Utc>) -> String {
     if jobs.is_empty() {
         return "no jobs\n".into();
     }
-    let now = Utc::now();
+    let estimates = jobs.iter().any(|j| j.estimate.is_some());
     let mut out = String::new();
     for job in jobs {
+        let progress = match progress_of(job, now) {
+            Some(p) if p.overdue() => format!("{:<23} ", format!("{} overdue", against(&p))),
+            Some(p) => format!("{:<23} ", against(&p)),
+            None if estimates => format!("{:<23} ", ""),
+            None => String::new(),
+        };
         out.push_str(&format!(
-            "{:<5} {:<8} started {:<9} {}\n",
+            "{:<5} {:<8} started {:<9} {progress}{}\n",
             job.id,
             job.kind.as_str(),
             super::remind::relative(job.started_at, now),
@@ -411,7 +557,7 @@ mod tests {
     use std::sync::Arc;
 
     fn job(id: &str, kind: JobKind, target: &str, started_at: DateTime<Utc>) -> Job {
-        Job { id: id.into(), kind, target: target.into(), label: None, started_at, runner_pid: None }
+        Job { id: id.into(), kind, target: target.into(), label: None, started_at, runner_pid: None, estimate: None, next_alert_at: None }
     }
 
     #[test]
@@ -434,6 +580,61 @@ mod tests {
         assert_eq!(lines[2], "      log: /h/jobs/j7/output.log");
         assert!(lines[3].starts_with("j6    pr       merged") && lines[3].ends_with("PR #2265"), "{text}");
         assert_eq!(render_all(&[], &[], now), "no jobs\n");
+    }
+
+    fn with_estimate(mut job: Job, mins: u64) -> Job {
+        job.set_estimate(Duration::from_secs(mins * 60));
+        job
+    }
+
+    #[test]
+    fn listings_show_elapsed_against_the_estimate_and_flag_overdue() {
+        let now = Utc::now();
+        let ago = |m: i64| now - chrono::Duration::minutes(m);
+        let jobs = vec![
+            with_estimate(job("j3", JobKind::Command, "cargo test", ago(45)), 30),
+            with_estimate(job("j2", JobKind::Pr, "42", ago(12)), 30),
+            job("j1", JobKind::Pid, "77", ago(5)),
+        ];
+        let list = render_list(&jobs, now);
+        println!("{list}");
+        let lines: Vec<&str> = list.lines().collect();
+        assert!(lines[0].contains("45m/30m overdue") && lines[0].ends_with("cargo test"), "{list}");
+        assert!(lines[1].contains("12m/30m ") && !lines[1].contains("overdue"), "{list}");
+        // The label column stays aligned for a job with no estimate.
+        let col = |l: &str, label: &str| l.find(label).unwrap();
+        assert_eq!(col(lines[0], "cargo test"), col(lines[2], "pid 77"), "{list}");
+        // Without any estimate the list looks as it always did.
+        assert!(!render_list(&jobs[2..], now).contains("  /"));
+
+        let done = JobRecord {
+            exit_code: Some(0),
+            ..JobRecord::finished(&with_estimate(job("j0", JobKind::Command, "make", ago(70)), 10), JobStatus::Ok, ago(58))
+        };
+        let all = render_all(&jobs, &[done], now);
+        println!("{all}");
+        let lines: Vec<&str> = all.lines().collect();
+        assert!(lines[0].starts_with("j3    command  overdue") && lines[0].contains("45m/30m"), "{all}");
+        assert!(lines[1].starts_with("j2    pr       running") && lines[1].contains("12m/30m"), "{all}");
+        assert!(lines[3].starts_with("j0    command  ok") && lines[3].contains("12m/10m"), "{all}");
+    }
+
+    #[test]
+    fn the_log_header_says_how_the_job_stands_against_its_estimate() {
+        let now = Utc::now();
+        let ago = |m: i64| now - chrono::Duration::minutes(m);
+        let late = Found::Running(with_estimate(job("j3", JobKind::Command, "x", ago(45)), 30));
+        assert_eq!(
+            log_header(&late, now).unwrap(),
+            "job j3 running: 30m estimate, elapsed 45m, overdue by 15m"
+        );
+        let fine = Found::Running(with_estimate(job("j4", JobKind::Command, "x", ago(10)), 30));
+        assert_eq!(log_header(&fine, now).unwrap(), "job j4 running: 30m estimate, elapsed 10m, 20m left");
+        assert!(log_header(&Found::Running(job("j5", JobKind::Command, "x", ago(1))), now).is_none());
+        let rec = JobRecord::finished(&with_estimate(job("j6", JobKind::Command, "x", ago(50)), 30), JobStatus::Failed, ago(5));
+        assert_eq!(log_header(&Found::Finished(rec.clone()), now).unwrap(), "job j6 failed: ran 45m, 15m over its 30m estimate");
+        let watch = JobRecord { kind: JobKind::Pr, ..rec };
+        assert!(watch_status_finished(&watch, now).contains("(ran 45m, 15m over its 30m estimate)"));
     }
 
     #[test]

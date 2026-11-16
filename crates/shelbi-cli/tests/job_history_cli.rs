@@ -156,7 +156,10 @@ fn list_shows_running_jobs_and_all_adds_finished_ones_newest_first() {
     assert!(j1.contains("failed") && j1.contains("exit 3") && j1.contains("4m"), "{j1}");
     assert!(all.contains(&format!("log: {}", root.job_dir("j1").join("output.log").display())), "{all}");
     assert!(all.lines().find(|l| l.starts_with("j2 ")).unwrap().contains("merged"), "{all}");
-    assert_eq!(all, ok(&root.run(&["job", "list", "--history"])), "--history is --all");
+    // The running rows' elapsed seconds may tick between the two runs: drop
+    // the digits before comparing.
+    let no_digits = |s: &str| s.chars().filter(|c| !c.is_ascii_digit()).collect::<String>();
+    assert_eq!(no_digits(&all), no_digits(&ok(&root.run(&["job", "list", "--history"]))), "--history is --all");
 
     let json: serde_json::Value = serde_json::from_str(&ok(&root.run(&["job", "list", "--all", "--json"]))).unwrap();
     let rows: Vec<(String, String)> = json
@@ -255,4 +258,71 @@ fn wait_with_timeout(mut child: std::process::Child, limit: Duration) -> Output 
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// `--estimate` on `job watch`, `job estimate` revising it, and `job list` /
+/// `job log` showing elapsed against it.
+#[test]
+fn job_estimates_are_set_revised_and_listed() {
+    let root = Root::new("estimate");
+    root.write(
+        "awareness.json",
+        &format!(
+            r#"{{"next_id": 1, "jobs": [
+                {{"id": "j1", "kind": "command", "target": "cargo test", "label": "desktop tests",
+                  "started_at": "{}", "estimate": "30m", "next_alert_at": "{}"}}
+            ]}}"#,
+            rfc(45),
+            rfc(15)
+        ),
+    );
+    root.write("jobs/j1/output.log", "step 1\nstep 2\n");
+    root.write(
+        "jobs/history.json",
+        &format!(
+            r#"{{"jobs": [{{"id": "j0", "kind": "pr", "target": "7", "started_at": "{}", "finished_at": "{}",
+                 "status": "merged", "estimate": "10m"}}]}}"#,
+            rfc(90),
+            rfc(70)
+        ),
+    );
+    let list = ok(&root.run(&["job", "list"]));
+    assert!(list.contains(" 45m") && list.contains("/30m overdue") && list.contains("desktop tests"), "{list}");
+    let all = ok(&root.run(&["job", "list", "--all"]));
+    assert!(all.lines().next().unwrap().starts_with("j1    command  overdue"), "{all}");
+    assert!(all.contains("20m/10m"), "the history keeps estimate against actual: {all}");
+
+    // The log's header (stderr) says where it stands; the output stays clean.
+    let out = root.run(&["job", "log", "j1"]);
+    assert_eq!(ok(&out), "step 1\nstep 2\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("job j1 running: 30m estimate, elapsed 45m, overdue by 15m"), "{stderr}");
+
+    // Revised up: no longer overdue, counted from the start.
+    let revised = ok(&root.run(&["job", "estimate", "j1", "1h"]));
+    assert!(revised.starts_with("✓ revised estimate for job j1: 1h (elapsed 45m, 1"), "{revised}");
+    assert!(revised.trim_end().ends_with("m left)"), "{revised}");
+    let list = ok(&root.run(&["job", "list"]));
+    assert!(list.contains("/1h ") && !list.contains("overdue"), "{list}");
+    let json: serde_json::Value = serde_json::from_str(&ok(&root.run(&["job", "list", "--json"]))).unwrap();
+    assert_eq!(json[0]["estimate"], "1h");
+    assert_eq!(json[0]["overdue"], false);
+
+    // Finished or unknown jobs, and bad durations, are refused.
+    for (args, want) in [
+        (vec!["job", "estimate", "j0", "1h"], "has finished"),
+        (vec!["job", "estimate", "j9", "1h"], "no running job `j9`"),
+        (vec!["job", "estimate", "j1", "soon"], ""),
+    ] {
+        let out = root.run(&args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains(want), "{args:?}: {out:?}");
+    }
+
+    // A watch takes one too.
+    let me = std::process::id().to_string();
+    let watched = ok(&root.run(&["job", "watch", "--pid", &me, "--estimate", "1h30m"]));
+    assert!(watched.contains("estimate: 1h30m"), "{watched}");
+    let bad = root.run(&["job", "watch", "--pid", &me, "--estimate", "0m"]);
+    assert!(!bad.status.success(), "{bad:?}");
 }

@@ -12,6 +12,13 @@
 //! an ellipsis so the table never scrolls sideways; hovering it shows the
 //! whole command (a long Description likewise).
 //!
+//! A running job started with `--estimate` draws a thin progress bar along
+//! the bottom of its row (elapsed against the estimate, the shared
+//! [`shelbi_app::estimate`] fraction the TUI's block bar draws too), full and
+//! in the overdue tone once the estimate is used up, when its Status reads
+//! `Overdue`. Its Duration reads `4m 12s / 10m`; a finished job keeps its
+//! actual duration against the estimate as that text, with no bar.
+//!
 //! Clicking a row opens the job's sheet on the right, beside the table (the
 //! Workspace view's split, with its draggable divider): the job's label, its
 //! status and elapsed time, a running command's live terminal (watched, never
@@ -29,8 +36,8 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, AnyElement, ClickEvent, Context, Entity, FocusHandle, KeyDownEvent, ScrollHandle,
-    SharedString, Task, Window,
+    div, prelude::*, px, AnyElement, ClickEvent, Context, Entity, FocusHandle, KeyDownEvent,
+    ScrollHandle, SharedString, Task, Window,
 };
 use shelbi_app::jobs::{
     one_line, JobRow, JobsModel, JobsRead, SheetLoad, CANCEL_LABEL, COLUMNS, FINISHED_HEADING, REFRESH_INTERVAL,
@@ -38,6 +45,7 @@ use shelbi_app::jobs::{
 };
 use shelbi_app::source::{ProjectHandle, ProjectSource};
 
+use super::estimate_bar;
 use super::workspace_layout::{render_split, ShellSplit};
 use crate::assets::icons;
 use crate::elements::terminal::{session as term_session, TerminalPane};
@@ -50,7 +58,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// The fixed columns' widths; Command takes the rest.
 const DESCRIPTION_W: f32 = 200.0;
 const STATUS_W: f32 = 120.0;
-const DURATION_W: f32 = 72.0;
+/// Wide enough for elapsed against an estimate (`1h 4m / 1h 30m`).
+const DURATION_W: f32 = 116.0;
+
+/// A row's corner radius; a running row's estimate bar follows it.
+const ROW_RADIUS: f32 = 6.0;
 const FINISHED_W: f32 = 160.0;
 
 /// The gap between columns.
@@ -351,7 +363,7 @@ impl JobsView {
                         .px_4()
                         .pb_2()
                         .type_style(Type::Small)
-                        .text_color(theme.tone(row.status_tone()))
+                        .text_color(theme.tone(row.status_tone_at(now)))
                         .child(status),
                 )
                 .child(div().h(px(1.0)).flex_none().bg(theme.divider))
@@ -427,8 +439,9 @@ fn finished_heading(theme: &Theme) -> AnyElement {
 }
 
 /// One job's row: its description, its command cut to the column (whole in
-/// a tooltip), its status (red when it failed), how long it ran, and when it
-/// finished.
+/// a tooltip), its status (red when it failed), how long it ran (against its
+/// estimate when it has one), and when it finished. A running job with an
+/// estimate has a bar along the bottom ([`row_estimate_bar`]).
 fn job_row(
     row: &JobRow,
     now: chrono::DateTime<chrono::Utc>,
@@ -440,11 +453,14 @@ fn job_row(
     let description = one_line(&row.description);
     let long_description = description.chars().count() > DESCRIPTION_TIP_CHARS;
     let click_id = row.id.clone();
+    let overdue = row.overdue(now);
+    let duration_color = row.duration_tone(now).map_or(theme.muted, |t| theme.tone(t));
     div()
         .id(SharedString::from(format!("job-row-{}", row.id)))
         .debug_selector(move || format!("job-row-{id}"))
+        .relative()
         .cursor_pointer()
-        .rounded(px(6.0))
+        .rounded(px(ROW_RADIUS))
         .when(open, |d| d.bg(theme.background_hover))
         .hover(|d| d.bg(theme.background_hover))
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.open_sheet(&click_id, window, cx)))
@@ -489,16 +505,20 @@ fn job_row(
                 .w(px(STATUS_W))
                 .flex_none()
                 .truncate()
-                .when(row.failed(), |d| d.type_style(Type::BaseMedium))
-                .text_color(theme.tone(row.status_tone()))
-                .child(row.status_label()),
+                .when(row.failed() || overdue, |d| d.type_style(Type::BaseMedium))
+                .text_color(theme.tone(row.status_tone_at(now)))
+                .child(row.status_label_at(now)),
         )
         .child(
             div()
+                .debug_selector({
+                    let id = row.id.clone();
+                    move || format!("job-duration-{id}")
+                })
                 .w(px(DURATION_W))
                 .flex_none()
                 .truncate()
-                .text_color(theme.muted)
+                .text_color(duration_color)
                 .child(row.duration(now)),
         )
         .child(
@@ -509,6 +529,23 @@ fn job_row(
                 .text_color(theme.muted)
                 .child(row.finished(now)),
         )
+        .when_some(row.bar(now), |d, bar| d.child(row_estimate_bar(&row.id, bar, theme)))
+        .into_any_element()
+}
+
+/// The bar along the bottom of a running job's row: the issue cards' bar
+/// ([`estimate_bar`]), flush with the row's bottom edge and clipped to its
+/// corners, full and in the warning color once the estimate is used up.
+fn row_estimate_bar(id: &str, bar: shelbi_app::estimate::EstimateProgress, theme: &Theme) -> AnyElement {
+    let selector = format!("job-bar-{id}");
+    div()
+        .debug_selector(move || selector.clone())
+        .absolute()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .h(px(ROW_RADIUS))
+        .child(estimate_bar::estimate_bar(bar, ROW_RADIUS, theme))
         .into_any_element()
 }
 
@@ -603,7 +640,7 @@ mod tests {
     const LONG: &str = "zsh -c 'cd /Users/me/Workspaces/shelbi/desktop && cargo clippy --all-targets -- -D warnings && cargo test'";
 
     fn job(id: &str, kind: JobKind, target: &str, label: Option<&str>, started_at: DateTime<Utc>) -> Job {
-        Job { id: id.into(), kind, target: target.into(), label: label.map(str::to_string), started_at, runner_pid: None }
+        Job { id: id.into(), kind, target: target.into(), label: label.map(str::to_string), started_at, runner_pid: None, estimate: None, next_alert_at: None }
     }
 
     fn set_jobs(jobs: Vec<Job>) {
@@ -733,6 +770,55 @@ mod tests {
         let theme = vcx.update(|_, cx| *cx.global::<Theme>());
         assert_eq!(theme.tone(failed.status_tone()), theme.red, "a failure reads red");
         assert!(vcx.debug_bounds("job-status-j7").is_some());
+        view.update(&mut vcx, |v, _| v.stop_workers());
+    }
+
+    #[gpui::test]
+    fn a_running_job_with_an_estimate_draws_a_bar_that_turns_overdue(cx: &mut TestAppContext) {
+        let _home = shelbi_app::settings::agents::fixture::Home::new("dt-jobs-estimate", PROJECT, crate::test_env::lock());
+        let now = Utc::now();
+        let ago = |m: i64| now - chrono::Duration::minutes(m);
+        let estimated = |id: &str, started, mins: u64| {
+            let mut j = job(id, JobKind::Command, "cargo test", Some(id), started);
+            j.set_estimate(Duration::from_secs(mins * 60));
+            j
+        };
+        // A quarter of the way in, past it, and no estimate at all.
+        set_jobs(vec![estimated("j1", ago(10), 40), estimated("j2", ago(45), 30), job("j3", JobKind::Pid, "1", None, ago(1))]);
+        let done = JobRecord {
+            exit_code: Some(0),
+            ..JobRecord::finished(&estimated("j0", ago(80), 10), JobStatus::Ok, ago(60))
+        };
+        record_finished_jobs(PROJECT, vec![done], now).unwrap();
+        let (view, mut vcx) = open(cx, shelbi_orchestrator::source::local_handle(PROJECT));
+        assert!(read_until(&view, &mut vcx, |m| m.rows().len() == 4), "the first read lands");
+
+        let row = vcx.debug_bounds("job-row-j1").unwrap();
+        let bar = vcx.debug_bounds("job-bar-j1").expect("an estimated running job draws a bar");
+        // Flush along the row's bottom edge, its full width, like a card's.
+        assert_eq!((bar.bottom(), bar.left(), bar.size.width), (row.bottom(), row.left(), row.size.width), "{bar:?} in {row:?}");
+        assert!(bar.top() > row.center().y, "along the row's bottom: {bar:?} in {row:?}");
+        let model = view.read_with(&vcx, |v, _| v.model().clone());
+        let quarter = model.rows().iter().find(|r| r.id == "j1").unwrap().bar(Utc::now()).unwrap();
+        assert!((quarter.fraction() - 0.25).abs() < 0.02, "a quarter full: {}", quarter.fraction());
+
+        // Past its estimate: full (warning-colored, see estimate_bar), and
+        // the Status says so.
+        assert!(vcx.debug_bounds("job-bar-j2").is_some());
+        let late = model.rows().iter().find(|r| r.id == "j2").unwrap().clone();
+        assert_eq!(late.status_label_at(Utc::now()), "Overdue");
+        let over = late.bar(Utc::now()).unwrap();
+        assert!(over.overdue() && over.fraction() == 1.0);
+        assert!(late.duration(Utc::now()).ends_with("/ 30m"));
+
+        // No estimate, or finished: no bar; the finished one keeps its text.
+        assert!(vcx.debug_bounds("job-bar-j3").is_none());
+        assert!(vcx.debug_bounds("job-bar-j0").is_none());
+        let finished = model.rows().iter().find(|r| r.id == "j0").unwrap();
+        assert_eq!(finished.duration(Utc::now()), "20m / 10m");
+        assert!(vcx.debug_bounds("job-duration-j0").is_some());
+        let row = vcx.debug_bounds("job-row-j2").unwrap();
+        assert!(row.right() <= px(1000.0), "no sideways scroll");
         view.update(&mut vcx, |v, _| v.stop_workers());
     }
 

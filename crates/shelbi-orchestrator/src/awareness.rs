@@ -9,7 +9,10 @@
 //!   that exited, a commit's CI or a PR that settled (those two sample GitHub
 //!   on their own [`REMOTE_PROBE_CADENCE`], only while online);
 //! - writes an `overdue` line for every active task past its next alert, and
-//!   drops the estimate of every task that left the `active` category.
+//!   drops the estimate of every task that left the `active` category;
+//! - writes a job `overdue` line for every running job past its estimate's
+//!   next alert, on the same grid as a task's (the estimate, then every half
+//!   of it, at least [`awareness::MIN_OVERDUE_INTERVAL`]), until it finishes.
 //!
 //! The probing (process table, files, GitHub, the board) happens outside the
 //! store lock; then one locked read-modify-write appends each event and
@@ -179,19 +182,23 @@ fn tick_inner(
     };
 
     let due_reminders = store.reminders.iter().any(|r| r.due_at <= now);
+    let overdue_jobs = store.jobs.iter().any(|j| job_alert_due(j, now));
     let estimate_work = active.as_ref().is_some_and(|active| {
         store
             .estimates
             .iter()
             .any(|e| !active.contains_key(&e.task_id) || e.next_alert_at <= now)
     });
-    if !due_reminders && outcomes.is_empty() && !estimate_work {
+    if !due_reminders && outcomes.is_empty() && !estimate_work && !overdue_jobs {
         return Ok(());
     }
 
     let finished = awareness::update_awareness(name, |store| {
         fire_reminders(name, store, now);
         let finished = fire_jobs(name, store, &outcomes, now);
+        // After the finished ones leave: a job that ends this tick reports
+        // its end, not that it ran long.
+        fire_job_overdue(name, store, now);
         if let Some(active) = &active {
             fire_estimates(name, store, active, now);
         }
@@ -259,6 +266,30 @@ fn fire_jobs(
         }
     });
     finished
+}
+
+/// Whether running job `job` has an overdue line due at `now`.
+fn job_alert_due(job: &Job, now: DateTime<Utc>) -> bool {
+    job.estimate.is_some() && job.next_alert_at.is_some_and(|at| at <= now)
+}
+
+/// Write an `overdue` line for every running job past its next alert and move
+/// that alert along the overdue grid ([`overdue_interval`]), exactly as a
+/// task's estimate does. One whose line fails to append is retried next tick.
+fn fire_job_overdue(project: &str, store: &mut AwarenessStore, now: DateTime<Utc>) {
+    for job in store.jobs.iter_mut().filter(|j| job_alert_due(j, now)) {
+        let (Some(estimate), Some(next)) = (job.estimate, job.next_alert_at) else {
+            continue;
+        };
+        let elapsed = (now - job.started_at).to_std().unwrap_or_default();
+        if let Err(e) =
+            shelbi_state::append_job_overdue_event(project, &job.id, estimate, elapsed, &job.display_label())
+        {
+            tracing::warn!(project, job = %job.id, error = %e, "job overdue event not written; retrying next tick");
+            continue;
+        }
+        job.next_alert_at = Some(next_slot_after(next, overdue_interval(estimate), now));
+    }
 }
 
 fn fire_estimates(
@@ -719,7 +750,12 @@ fn verdict_of(snapshot: &crate::zen::CiSnapshot, settled: bool) -> Option<WatchV
 /// this CLI and any daemon restart, has a terminal a client can watch, and
 /// leads the process group `job cancel` signals. The runner records its own
 /// pid once it is up. Returns the job at once.
-pub fn spawn_command_job(project: &str, argv: &[String], label: Option<String>) -> Result<Job> {
+pub fn spawn_command_job(
+    project: &str,
+    argv: &[String],
+    label: Option<String>,
+    estimate: Option<Duration>,
+) -> Result<Job> {
     if argv.is_empty() {
         return Err(Error::Other("no command given after `--`".into()));
     }
@@ -734,6 +770,7 @@ pub fn spawn_command_job(project: &str, argv: &[String], label: Option<String>) 
             kind: JobKind::Command,
             target,
             label,
+            estimate,
         },
     )?;
     let started = (|| -> Result<()> {

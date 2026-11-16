@@ -445,6 +445,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
         sniff_orchestrator_awareness_variants(entry, &text, out);
         sniff_orchestrator_job_log(entry, &text, out);
+        sniff_orchestrator_job_estimate(entry, &text, out);
         sniff_deprecated_task_command(entry, &text, out);
         sniff_zen_merge_reason_format(entry, &text, out);
         sniff_zen_assignee_scope(entry, &text, out);
@@ -2207,6 +2208,45 @@ fn sniff_orchestrator_job_log(entry: &InventoryEntry, text: &str, out: &mut Vec<
     ));
 }
 
+/// Code for an orchestrator copy that teaches `shelbi job` but not job
+/// estimates (`--estimate`, `shelbi job estimate`, the job `overdue` line).
+pub(crate) const ORCH_JOB_ESTIMATE_CODE: &str = "ORCH_JOB_ESTIMATE_MISSING";
+
+/// Flag orchestrator instructions that teach `shelbi job run` but predate job
+/// estimates, so the orchestrator never passes `--estimate` (a hung job looks
+/// like a slow one until its own timeout) and has no rule for the job
+/// `overdue` line when one arrives.
+///
+/// The fix touches user-forkable prose (the waiting-on-things guidance, the
+/// event list, a new reaction rule, the command reference), so it routes to
+/// [`Classification::NeedsJudgment`]. A copy that mentions `shelbi job
+/// estimate` anywhere never fires, so the sniff is idempotent; one with no
+/// `shelbi job run` (awareness never adopted) is left to the awareness
+/// sniffers.
+fn sniff_orchestrator_job_estimate(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    if !text.contains("shelbi job run") || text.contains("shelbi job estimate") {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        ORCH_JOB_ESTIMATE_CODE,
+        "orchestrator instructions teach `shelbi job` but not job estimates, so jobs start \
+         without `--estimate` (a hung job looks like a slow one until its own timeout) and the \
+         job `overdue` line has no reaction rule",
+        "In the waiting-on-things guidance, pass `--estimate <duration>` on every `shelbi job \
+         run` and `shelbi job watch`, and say `shelbi job estimate <id> <duration>` revises a \
+         running job's (the total from start). Add the `project=<name> job id=<j> overdue \
+         estimate=<d> elapsed=<d> label=\"<label>\"` line to the event list (it repeats every \
+         half the estimate, at least every 10 minutes, until the job finishes) and `job_overdue` \
+         to the event kinds. Add a reaction rule for it: read `shelbi job log <id> -n 20`; revise \
+         the estimate if the job is progressing, cancel it with `shelbi job cancel <id>` or tell \
+         the user if it is stuck. List `--estimate` and `shelbi job estimate` in the command \
+         reference. Mirror the shipped default template.",
+        locate_line_containing(text, "shelbi job run"),
+    ));
+}
+
 /// Detect the pre-rename `shelbi task <verb>` board command in an agent's prose/// Detect the pre-rename `shelbi task <verb>` board command in an agent's prose
 /// (orchestrator `instructions.md` or `zenmode.md`). The board command was
 /// renamed `shelbi task` -> `shelbi issue` (design D5); `shelbi task` still works
@@ -3275,6 +3315,12 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
             "These are prose instructions a project may have forked and customized, so the \
              `shelbi job log` guidance can't be merged in mechanically without risking local \
              edits; the orchestrator refreshes its own copy instead."
+        }
+        ORCH_JOB_ESTIMATE_CODE => {
+            "These are prose instructions a project may have forked and customized, so the job \
+             estimate guidance and the job `overdue` reaction rule can't be merged in \
+             mechanically without risking local edits; the orchestrator refreshes its own copy \
+             instead."
         }
         "INSTRUCTIONS_TASK_COMMAND_RENAMED" => {
             "These are prose instructions a project may have forked and customized, so the \
@@ -5224,6 +5270,41 @@ mod tests {
         sniff_orchestrator_job_log(&orch_entry(), shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS, &mut out);
         assert!(find(&out, ORCH_JOB_LOG_CODE).is_none(), "{:?}", codes(&out));
         assert!(shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS.contains("shelbi job run"));
+    }
+
+    // ---- job estimates ----------------------------------------------------
+
+    #[test]
+    fn job_guidance_without_job_estimates_is_needs_judgment() {
+        let text = "# Orchestrator\n\n- Run `shelbi job run -- <cmd>`; read `shelbi job log <id>`.\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_job_estimate(&orch_entry(), text, &mut out);
+        let f = find(&out, ORCH_JOB_ESTIMATE_CODE).expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert_eq!(f.location.line, 3);
+        for clean in [
+            "Run `shelbi job run --estimate 10m -- x`; revise with `shelbi job estimate <id> 20m`.\n",
+            "# Orchestrator\n\nNo jobs here.\n",
+        ] {
+            let mut out = Vec::new();
+            sniff_orchestrator_job_estimate(&orch_entry(), clean, &mut out);
+            assert!(find(&out, ORCH_JOB_ESTIMATE_CODE).is_none(), "{clean}: {:?}", codes(&out));
+        }
+    }
+
+    /// Drift guard: the shipped orchestrator template teaches job estimates
+    /// and reacts to the job `overdue` line.
+    #[test]
+    fn shipped_orchestrator_does_not_trip_the_job_estimate_sniffer() {
+        let shipped = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        let mut out = Vec::new();
+        sniff_orchestrator_job_estimate(&orch_entry(), shipped, &mut out);
+        assert!(find(&out, ORCH_JOB_ESTIMATE_CODE).is_none(), "{:?}", codes(&out));
+        assert!(shipped.contains("--estimate <duration> -- <command>"));
+        assert!(shipped.contains("`project=<you> job id=<j> overdue ...`"));
+        // Both live in the awareness (v2) composition, where jobs exist.
+        let v2 = shelbi_state::select_awareness_variant(shipped, shelbi_core::AwarenessMode::Awareness);
+        assert!(v2.contains("shelbi job estimate <id> <duration>") && v2.contains("job_overdue"));
     }
 
     // ---- deprecated `shelbi task` board command -------------------------

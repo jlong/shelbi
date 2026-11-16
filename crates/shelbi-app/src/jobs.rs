@@ -16,12 +16,19 @@
 //! the columns, [`job_rows`] for the order, [`JobRow::status_tone`] for how
 //! loud a status is (a failure is red), [`started_label`] for a time,
 //! [`truncate`] for a cell that would overflow.
+//!
+//! A job started with `--estimate` carries it: its Duration reads elapsed
+//! against the estimate (`4m 12s / 10m`), a running one draws a progress bar
+//! ([`JobRow::bar`], [`crate::estimate`]) and reads `Overdue` once the
+//! estimate is used up, and a finished one keeps its actual duration against
+//! the estimate as text.
 
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use shelbi_state::awareness::{job_id_number, short_sha, Job, JobKind, JobRecord, JobStatus};
 
+use crate::estimate::{EstimateProgress, OVERDUE_TONE};
 use crate::theme::Tone;
 
 /// The screen's title.
@@ -170,6 +177,8 @@ pub struct JobRow {
     pub state: JobState,
     /// What it is: only a command job has a terminal and output.
     pub kind: JobKind,
+    /// How long it was expected to take (`--estimate`), if it had a say.
+    pub estimate: Option<Duration>,
 }
 
 impl JobRow {
@@ -182,6 +191,7 @@ impl JobRow {
             started_at: job.started_at,
             state: JobState::Running,
             kind: job.kind,
+            estimate: job.estimate,
         }
     }
 
@@ -198,6 +208,7 @@ impl JobRow {
                 finished_at: record.finished_at,
             },
             kind: record.kind,
+            estimate: record.estimate,
         }
     }
 
@@ -245,13 +256,64 @@ impl JobRow {
         }
     }
 
-    /// The Duration cell: how long it ran, or has been running as of `now`.
-    pub fn duration(&self, now: DateTime<Utc>) -> String {
-        let end = match self.state {
+    /// When it stopped running, or `now` while it runs.
+    fn end(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        match self.state {
             JobState::Running => now,
             JobState::Finished { finished_at, .. } => finished_at,
-        };
-        duration_label((end - self.started_at).to_std().unwrap_or_default())
+        }
+    }
+
+    /// The Duration cell: how long it ran, or has been running as of `now`;
+    /// against its estimate when it has one (`4m 12s / 10m`).
+    pub fn duration(&self, now: DateTime<Utc>) -> String {
+        match self.progress(now) {
+            Some(p) => format!("{} / {}", duration_label(p.elapsed), duration_label(p.estimate)),
+            None => duration_label((self.end(now) - self.started_at).to_std().unwrap_or_default()),
+        }
+    }
+
+    /// How far into its estimate it ran (a finished job) or is (a running
+    /// one) at `now`; `None` without an estimate.
+    pub fn progress(&self, now: DateTime<Utc>) -> Option<EstimateProgress> {
+        let estimate = self.estimate?;
+        Some(EstimateProgress::between(self.started_at, self.end(now), estimate))
+    }
+
+    /// The progress bar a running job with an estimate draws (the issue
+    /// cards' bar, from the same [`EstimateProgress`]); `None` for a finished
+    /// job (its Duration says how it went) or one with no estimate.
+    pub fn bar(&self, now: DateTime<Utc>) -> Option<EstimateProgress> {
+        self.progress(now).filter(|_| self.is_running())
+    }
+
+    /// Whether it is still running past its estimate.
+    pub fn overdue(&self, now: DateTime<Utc>) -> bool {
+        self.bar(now).is_some_and(|p| p.overdue())
+    }
+
+    /// The Duration cell's color: [`OVERDUE_TONE`] once it ran (or is
+    /// running) past its estimate; `None` is the cell's muted default.
+    pub fn duration_tone(&self, now: DateTime<Utc>) -> Option<Tone> {
+        self.progress(now).filter(EstimateProgress::overdue).map(|_| OVERDUE_TONE)
+    }
+
+    /// The Status cell at `now`: [`status_label`](Self::status_label), but
+    /// `Overdue` for a job still running past its estimate.
+    pub fn status_label_at(&self, now: DateTime<Utc>) -> String {
+        if self.overdue(now) {
+            return "Overdue".to_string();
+        }
+        self.status_label()
+    }
+
+    /// The Status cell's color at `now`: [`OVERDUE_TONE`] for a job running
+    /// past its estimate, else [`status_tone`](Self::status_tone).
+    pub fn status_tone_at(&self, now: DateTime<Utc>) -> Tone {
+        if self.overdue(now) {
+            return OVERDUE_TONE;
+        }
+        self.status_tone()
     }
 
     /// The Finished cell in the local time zone, as of `now`; empty while
@@ -270,7 +332,8 @@ impl JobRow {
 
     /// The side sheet's status line: a glyph, the status, and how long it
     /// ran or has been running (`● Running · 42s`, `✕ Failed · exit 3 ·
-    /// 1m 30s`). Colored with [`status_tone`](Self::status_tone).
+    /// 1m 30s`, `● Overdue · 45m / 30m`). Colored with
+    /// [`status_tone_at`](Self::status_tone_at).
     pub fn sheet_status(&self, now: DateTime<Utc>) -> String {
         let glyph = match self.state {
             JobState::Running => "●",
@@ -281,7 +344,7 @@ impl JobRow {
                 JobStatus::Exited | JobStatus::Closed => "○",
             },
         };
-        format!("{glyph} {} · {}", self.status_label(), self.duration(now))
+        format!("{glyph} {} · {}", self.status_label_at(now), self.duration(now))
     }
 
     /// Whether the sheet offers [`CANCEL_LABEL`]: the job is still running.
@@ -559,6 +622,8 @@ mod tests {
             label: label.map(str::to_string),
             started_at,
             runner_pid: None,
+            estimate: None,
+            next_alert_at: None,
         }
     }
 
@@ -752,6 +817,48 @@ mod tests {
         assert!(!failed.can_cancel());
         let ok = JobRow::from_record(&record("j6", JobStatus::Ok, Some(0), at(14, 0), at(14, 2)));
         assert_eq!(ok.sheet_status(now), "✓ OK · 2m");
+    }
+
+    #[test]
+    fn an_estimate_shows_elapsed_against_it_and_a_bar_while_running() {
+        let mut j = job("j1", JobKind::Command, "cargo test", None, at(14, 0));
+        j.estimate = Some(Duration::from_secs(600));
+        let row = JobRow::from_job(&j);
+        let now = at(14, 4) + chrono::Duration::seconds(12);
+        assert_eq!(row.duration(now), "4m 12s / 10m");
+        let bar = row.bar(now).unwrap();
+        assert!((bar.fraction() - 0.42).abs() < 1e-6);
+        assert!(!row.overdue(now));
+        assert_eq!((row.status_label_at(now).as_str(), row.status_tone_at(now)), ("Running", Tone::Blue));
+        assert_eq!(row.duration_tone(now), None);
+
+        // Past it: overdue, the bar full in the overdue tone.
+        let late = at(14, 15);
+        assert!(row.overdue(late));
+        assert_eq!(row.bar(late).unwrap().fraction(), 1.0);
+        assert!(row.bar(late).unwrap().overdue());
+        assert_eq!((row.status_label_at(late).as_str(), row.status_tone_at(late)), ("Overdue", OVERDUE_TONE));
+        assert_eq!(row.duration_tone(late), Some(OVERDUE_TONE));
+        assert_eq!(row.sheet_status(late), "● Overdue · 15m / 10m");
+
+        // No estimate: no bar, never overdue.
+        let plain = JobRow::from_job(&job("j2", JobKind::Command, "x", None, at(14, 0)));
+        assert_eq!((plain.bar(late), plain.overdue(late), plain.duration(late).as_str()), (None, false, "15m"));
+    }
+
+    #[test]
+    fn a_finished_job_keeps_its_duration_against_the_estimate_as_text() {
+        let mut r = record("j3", JobStatus::Ok, Some(0), at(14, 0), at(14, 12));
+        r.estimate = Some(Duration::from_secs(600));
+        let row = JobRow::from_record(&r);
+        let now = at(19, 0);
+        assert_eq!(row.duration(now), "12m / 10m");
+        assert_eq!(row.bar(now), None, "a finished job draws no bar");
+        assert!(!row.overdue(now));
+        assert_eq!(row.status_label_at(now), "OK");
+        assert_eq!(row.duration_tone(now), Some(OVERDUE_TONE), "it ran over");
+        r.finished_at = at(14, 8);
+        assert_eq!(JobRow::from_record(&r).duration_tone(now), None);
     }
 
     #[test]

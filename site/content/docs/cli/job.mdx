@@ -5,8 +5,9 @@ summary: Run a command detached, or watch a process, a commit's CI, or a PR, and
 ---
 
 ```text
-shelbi job run [--label <LABEL>] -- <COMMAND>...
-shelbi job watch (--pid <PID> | --ci <SHA> | --pr <NUMBER>) [--label <LABEL>]
+shelbi job run [--label <LABEL>] [--estimate <DURATION>] -- <COMMAND>...
+shelbi job watch (--pid <PID> | --ci <SHA> | --pr <NUMBER>) [--label <LABEL>] [--estimate <DURATION>]
+shelbi job estimate <ID> <DURATION>
 shelbi job list [--all] [--json]
 shelbi job log <ID> [-n <N>] [-f]
 shelbi job cancel <ID>
@@ -21,6 +22,15 @@ writes one line to `~/.shelbi/events.log` when it finishes:
 ```
 
 `shelbi orchestrator events next` reports it with kind `job_done`.
+
+A job started with `--estimate` that is still running past it gets an
+`overdue` line too (kind `job_overdue`), then another every half the estimate
+(at least every 10 minutes) until it finishes. A job with no estimate never
+gets one. See [Estimates](#estimates).
+
+```text
+<ts> project=<p> job id=j4 overdue estimate=30m elapsed=45m label="desktop tests"
+```
 
 | `kind` | `status` |
 | --- | --- |
@@ -59,8 +69,31 @@ Watches something already running:
 | `--ci <SHA>` | A commit's CI on GitHub, until every reported check has finished. A short sha or ref is resolved in the current repository. |
 | `--pr <NUMBER>` | A pull request, until it merges, closes, or its checks settle. |
 | `--label <LABEL>` | A short name for the event and `job list`. |
+| `--estimate <DURATION>` | How long it should take. See [Estimates](#estimates). |
 
 CI and PR watches ask GitHub once a minute, and only while the machine is online.
+
+## Estimates
+
+`--estimate` on `job run` or `job watch` takes a duration (`45m`, `2h`,
+`1h30m`, as `shelbi issue start --estimate` does): how long the job should
+take. Once it has run that long, the hub writes the job's `overdue` line, and
+repeats it every half the estimate (at least every 10 minutes) until the job
+finishes. A job that hangs is reported, instead of looking the same as a slow
+one until its own timeout.
+
+```sh
+shelbi job run --label "desktop tests" --estimate 20m -- cargo test
+shelbi job estimate j4 45m    # revise it: the total from when the job started
+```
+
+`job estimate` revises a running job's estimate. A revision that is already
+used up alerts on the hub's next check. `job list` shows a running job's
+elapsed time against its estimate (`12m/30m`) and marks one past it
+`overdue`; `job log` prints the same on stderr above the output. The history
+keeps each job's estimate, so `job list --all` shows how long a finished job
+ran against it. The Jobs screen draws a progress bar for each running job with
+an estimate, full and in the overdue color once it is past it.
 
 ## list
 
@@ -69,7 +102,7 @@ Lists the jobs still being watched, newest first.
 | Option | Meaning |
 | --- | --- |
 | `--all` (or `--history`) | Add the finished jobs after the running ones, newest first, with their status, exit code, duration and log path. |
-| `--json` | Print them as JSON. Each job carries a `status`: `running`, or how a finished one ended (`ok`, `failed`, `exited`, `merged`, `closed`, `canceled`), plus `finished_at`, `exit_code`, `detail`, `log` and `duration_secs` when it has them. |
+| `--json` | Print them as JSON. Each job carries a `status`: `running`, or how a finished one ended (`ok`, `failed`, `exited`, `merged`, `closed`, `canceled`), plus `finished_at`, `exit_code`, `detail`, `log`, `estimate` and `duration_secs` when it has them. A running job carries `elapsed_secs`, and `overdue` when it has an estimate. |
 
 ### History
 

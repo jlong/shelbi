@@ -1,6 +1,8 @@
-//! An active issue's estimate, as both clients show it: the Estimate row in
-//! the issue's properties (`2h · 1h 12m elapsed (60%)`) and the progress bar
-//! along its board card.
+//! Elapsed time against an estimate, as both clients and the CLI show it: an
+//! active issue's Estimate row (`2h · 1h 12m elapsed (60%)`) and the bar
+//! along its board card, and a running job's bar on the Jobs screen (`shelbi
+//! job run --estimate`). Both bars take their fraction, fill and overdue edge
+//! from [`EstimateProgress`], so they read the same.
 //!
 //! The estimate lives in the awareness store, not the issue
 //! ([`shelbi_state::awareness::Estimate`]): `issue start --estimate` (or a
@@ -13,6 +15,13 @@
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+
+use crate::theme::Tone;
+
+/// The color of overdue text (a job's Status and Duration, the activity
+/// feed's `overdue` verb). The bars take the clients' warning color, the same
+/// yellow.
+pub const OVERDUE_TONE: Tone = Tone::Yellow;
 
 /// The part of an awareness estimate a client shows: how long the issue was
 /// expected to take, and when it started.
@@ -50,6 +59,16 @@ pub struct EstimateProgress {
 }
 
 impl EstimateProgress {
+    pub fn new(elapsed: Duration, estimate: Duration) -> Self {
+        EstimateProgress { estimate, elapsed }
+    }
+
+    /// From `started` to `end` (now, for something still running). A skewed
+    /// clock reads nothing elapsed, never negative.
+    pub fn between(started: DateTime<Utc>, end: DateTime<Utc>, estimate: Duration) -> Self {
+        Self::new((end - started).to_std().unwrap_or_default(), estimate)
+    }
+
     /// At or past the estimate (the same edge `issue show` and the overdue
     /// alert use).
     pub fn overdue(&self) -> bool {
@@ -89,6 +108,25 @@ impl EstimateProgress {
             format!("{}%", shown.percent())
         };
         format!("{} · {} elapsed ({tail})", spaced(self.estimate), spaced(shown.elapsed))
+    }
+
+    /// The CLI's sentence (`issue estimate`, `job list`, `job log`): `elapsed
+    /// 20m, 25m left` / `elapsed 1h10m, overdue by 25m`, compact durations
+    /// cut to the minute once past one.
+    pub fn status_text(&self) -> String {
+        let minute = |d: Duration| {
+            let secs = d.as_secs();
+            shelbi_core::format_duration(Duration::from_secs(if secs >= 60 { secs / 60 * 60 } else { secs }))
+        };
+        if self.overdue() {
+            format!(
+                "elapsed {}, overdue by {}",
+                minute(self.elapsed),
+                minute(self.elapsed - self.estimate)
+            )
+        } else {
+            format!("elapsed {}, {} left", minute(self.elapsed), minute(self.estimate - self.elapsed))
+        }
     }
 
     /// How many of a `width`-cell bar are filled: rounded down, so the last
@@ -212,6 +250,16 @@ mod tests {
         assert_eq!(est.progress(now).elapsed, Duration::from_secs(72 * 60));
         let before = started_at - chrono::Duration::minutes(5);
         assert_eq!(est.progress(before).elapsed, Duration::ZERO);
+    }
+
+    #[test]
+    fn the_cli_sentence_says_time_left_or_how_far_over() {
+        assert_eq!(at(10, 252).status_text(), "elapsed 4m, 5m left");
+        assert_eq!(at(10, 42).status_text(), "elapsed 42s, 9m left");
+        assert_eq!(at(45, 70 * 60).status_text(), "elapsed 1h10m, overdue by 25m");
+        let start: DateTime<Utc> = "2026-11-15T10:00:00Z".parse().unwrap();
+        let skewed = EstimateProgress::between(start, start - chrono::Duration::minutes(3), Duration::from_secs(300));
+        assert_eq!(skewed.elapsed, Duration::ZERO);
     }
 
     #[test]

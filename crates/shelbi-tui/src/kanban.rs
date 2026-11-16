@@ -3062,22 +3062,28 @@ const ESTIMATE_FILL: &str = "▬";
 const ESTIMATE_TRACK: &str = "─";
 
 /// A card's last row when its issue has an estimate: `width` cells of
-/// elapsed / estimate, the fill over a dim track, all of it in the warning
-/// color once the issue is overdue ([`shelbi_app::estimate`]).
+/// elapsed / estimate ([`estimate_bar_spans`]).
 fn estimate_bar_line(progress: &shelbi_app::estimate::EstimateProgress, width: usize) -> Line<'static> {
+    Line::from(estimate_bar_spans(progress, width))
+}
+
+/// An estimate bar `width` cells wide: the fill over a dim track, all of it
+/// in the warning color once overdue ([`shelbi_app::estimate`]). The board
+/// cards end on it and the Jobs table draws it for a running job.
+pub(crate) fn estimate_bar_spans(progress: &shelbi_app::estimate::EstimateProgress, width: usize) -> Vec<Span<'static>> {
     let filled = progress.filled_cells(width).min(width);
     let fill = if progress.overdue() {
         palette().ansi_yellow
     } else {
         palette().ansi_cyan
     };
-    Line::from(vec![
+    vec![
         Span::styled(ESTIMATE_FILL.repeat(filled), Style::default().fg(fill)),
         Span::styled(
             ESTIMATE_TRACK.repeat(width - filled),
             Style::default().fg(palette().ansi_dark_gray),
         ),
-    ])
+    ]
 }
 
 /// Build the card's meta line: the task's workflow name rendered as a

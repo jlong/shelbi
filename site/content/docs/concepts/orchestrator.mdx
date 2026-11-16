@@ -210,6 +210,10 @@ statuses:
   checks for a missed review marker (branch ahead of `main`, clean worktree,
   idle prompt) and recovers it, nudges an idle worker, or revises the estimate
   with `shelbi issue estimate` when the work is legitimately bigger.
+- `job id=<j> overdue` → a job ran past its `--estimate`. The orchestrator
+  reads its last output with `shelbi job log`, revises the estimate with
+  `shelbi job estimate` when the job is still making progress, and cancels it
+  or tells you when it is stuck.
 - `reminder` and `job` → something the orchestrator asked to hear about
   happened; it acts on it.
 
@@ -249,7 +253,8 @@ the orchestrator stays informed.
     no event (an external PR, a person, a deploy);
   - it runs long local commands with `shelbi job run` and watches CI and PRs
     with `shelbi job watch` (see [`shelbi job`](/docs/cli/job)) instead of
-    blocking on them.
+    blocking on them, each with an `--estimate`, so a hung job is reported
+    instead of looking like a slow one.
 
 The two systems need different rules, so the shipped instructions carry both
 and every launch keeps one of them (see below). A runner other than Claude or

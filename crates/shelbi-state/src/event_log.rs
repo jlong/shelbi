@@ -136,6 +136,9 @@ pub enum EventKind {
     /// `project=P job id=<id> kind=<kind> ... status=<status>`: a watched job
     /// finished.
     JobDone,
+    /// `project=P job id=<id> overdue estimate=<d> elapsed=<d> label="..."`: a
+    /// running job ran past its estimate.
+    JobOverdue,
     /// `project=P task=<id> overdue estimate=<d> elapsed=<d>`: an active task
     /// ran past its estimate.
     TaskOverdue,
@@ -159,13 +162,15 @@ pub enum EventKind {
 }
 
 /// The awareness kind of an event body (timestamp already stripped), keyed on
-/// the verb after the optional `project=` scope: `reminder`, `job`, or
-/// `task=<id> overdue`.
+/// the verb after the optional `project=` scope: `reminder`, `job` (or `job
+/// id=<id> overdue`), or `task=<id> overdue`.
 fn awareness_kind(body: &str) -> Option<EventKind> {
     let words = split_event_words(body);
     let mut words = words.iter().copied().skip_while(|w| w.starts_with("project="));
     match words.next()? {
         "reminder" => Some(EventKind::Reminder),
+        // A job's free text is quoted, so a bare `overdue` is the verb.
+        "job" if words.any(|w| w == "overdue") => Some(EventKind::JobOverdue),
         "job" => Some(EventKind::JobDone),
         w if w.starts_with("task=") && words.next() == Some("overdue") => {
             Some(EventKind::TaskOverdue)
@@ -881,7 +886,7 @@ pub fn latest_task_transition_targets(project: &str) -> Result<HashMap<String, C
 /// Whether `line` (a whole `events.log` line, timestamp included) is one the
 /// awareness system (v2, `orchestrator.awareness: awareness`) answers with a
 /// board digest for `project`: a task status transition (`<from> -> <to>`), a
-/// reminder that came due, a finished job, or an overdue task. Any other line
+/// reminder that came due, a finished or overdue job, or an overdue task. Any other line
 /// (a heartbeat, a workspace state change, a `task edit`, another project's
 /// line) is not.
 pub fn is_awareness_digest_trigger(line: &str, project: &str) -> bool {
@@ -890,7 +895,9 @@ pub fn is_awareness_digest_trigger(line: &str, project: &str) -> bool {
         return false;
     }
     match env.kind {
-        EventKind::Reminder | EventKind::JobDone | EventKind::TaskOverdue => true,
+        EventKind::Reminder | EventKind::JobDone | EventKind::JobOverdue | EventKind::TaskOverdue => {
+            true
+        }
         EventKind::Task => transition_target(line).is_some(),
         _ => false,
     }
@@ -2192,11 +2199,7 @@ pub fn append_task_overdue_event(
     elapsed: std::time::Duration,
     workspace: Option<&str>,
 ) -> Result<()> {
-    let elapsed = if elapsed.as_secs() >= 60 {
-        std::time::Duration::from_secs(elapsed.as_secs() / 60 * 60)
-    } else {
-        elapsed
-    };
+    let elapsed = overdue_elapsed(elapsed);
     let workspace = workspace
         .map(|w| format!(" workspace={}", sanitize_field(w)))
         .unwrap_or_default();
@@ -2207,6 +2210,40 @@ pub fn append_task_overdue_event(
         shelbi_core::format_duration(estimate),
         shelbi_core::format_duration(elapsed),
     ))
+}
+
+/// Append an overdue alert for a running job:
+///
+/// ```text
+/// <rfc3339> project=<p> job id=<id> overdue estimate=30m elapsed=45m label="desktop tests"
+/// ```
+///
+/// `elapsed` is rounded down to the minute once it is at least a minute, as
+/// the task overdue line's is.
+pub fn append_job_overdue_event(
+    project: &str,
+    id: &str,
+    estimate: std::time::Duration,
+    elapsed: std::time::Duration,
+    label: &str,
+) -> Result<()> {
+    append_awareness_body(format!(
+        "project={} job id={} overdue estimate={} elapsed={} label={}",
+        sanitize_field(project),
+        sanitize_field(id),
+        shelbi_core::format_duration(estimate),
+        shelbi_core::format_duration(overdue_elapsed(elapsed)),
+        quote_event_text(label, AWARENESS_TEXT_BUDGET),
+    ))
+}
+
+/// An overdue line's `elapsed=`: whole minutes once there is one.
+fn overdue_elapsed(elapsed: std::time::Duration) -> std::time::Duration {
+    if elapsed.as_secs() >= 60 {
+        std::time::Duration::from_secs(elapsed.as_secs() / 60 * 60)
+    } else {
+        elapsed
+    }
 }
 
 /// Append a new-issue-comment notice to `~/.shelbi/events.log`:
