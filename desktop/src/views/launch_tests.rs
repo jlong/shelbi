@@ -16,7 +16,7 @@ use shelbi_app::launch::{FakeDaemon, FakeRemote, LocalProject, RemoteError};
 use super::*;
 use crate::views::connect_remote::test_services;
 
-fn project(slug: &str) -> LocalProject {
+pub(crate) fn project(slug: &str) -> LocalProject {
     LocalProject {
         slug: slug.into(),
         label: slug.into(),
@@ -25,7 +25,7 @@ fn project(slug: &str) -> LocalProject {
     }
 }
 
-fn session(project: &str) -> RemoteSession {
+pub(crate) fn session(project: &str) -> RemoteSession {
     RemoteSession {
         host: "devbox".into(),
         user: "jlong".into(),
@@ -37,14 +37,14 @@ fn session(project: &str) -> RemoteSession {
 
 /// A throwaway Shelbi home with `projects` registered, set as `SHELBI_HOME`
 /// while the guard lives (the shared registration check reads it).
-struct Home {
+pub(crate) struct Home {
     dir: PathBuf,
     prev: Option<std::ffi::OsString>,
     _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Home {
-    fn new(tag: &str, projects: &[&str]) -> Home {
+    pub(crate) fn new(tag: &str, projects: &[&str]) -> Home {
         let lock = crate::test_env::lock();
         let dir = std::env::temp_dir().join(format!("shb-launch-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -112,6 +112,7 @@ fn rig(cx: &mut TestAppContext, projects: Vec<LocalProject>, remote: FakeRemote,
             let added = added.clone();
             move |_| *added.borrow_mut() += 1
         }),
+        remote: Rc::new(crate::views::remote_session::open_remote_session),
     };
     cx.update(|cx| {
         cx.set_global(test_services(remote, recents));

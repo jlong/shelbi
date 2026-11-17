@@ -2465,6 +2465,7 @@ impl Run {
                 daemon: Rc::new(|_| Arc::new(shelbi_app::launch::SharedDaemon)),
                 open: Rc::new(|_, _| {}),
                 add: Rc::new(|_| {}),
+                remote: Rc::new(|_, _| {}),
             };
             let handle = self
                 .cx
@@ -3493,21 +3494,20 @@ impl Run {
             self.save(handle, &format!("state-sidebar-fold-{name}-settled"));
         }
 
-        // The tab bar's project menu open (the `+` tab's, drawn as the
-        // `Project switcher` component's open state, 2186:1692): the frame's
-        // projects open but 32pixels, so the open ones have tabs and
-        // 32pixels is the menu's row.
+        // The `+` tab's New tab (`new-tab-launch`): the launch screen
+        // (Figma "Startup · Projects and remote sessions", 2539:10949)
+        // under the tab bar, the frame's projects open but 32pixels, so the
+        // open ones have tabs beside it.
         if let Some(catalog) = self.cx.update(|cx| cx.try_global::<crate::projects::Catalog>().cloned()) {
             catalog.set_open(&["shelbi", "contextstore"]);
         }
         let handle = self.open();
         self.click(handle, orch.clone());
         handle
-            .update(&mut self.cx, |w, _, cx| w.offscreen_switcher(true, cx))
+            .update(&mut self.cx, |w, window, cx| w.offscreen_new_tab(window, cx))
             .unwrap();
-        // Past its slide in.
-        self.now.set(self.now.get() + Duration::from_millis(400));
-        self.save(handle, "state-sidebar-switcher");
+        self.cx.run_until_parked();
+        self.save(handle, "state-new-tab");
 
         // A tab in each loaded state (no frame draws it; checked by eye):
         // Shelbi has work in progress, its dot at the pulse's peak (Reduce

@@ -615,7 +615,6 @@ Every `--visual-*` mode renders both themes: with `SHELBI_VISUAL_THEME`
 unset it runs itself once per theme into `<dir>/dark/` and `<dir>/light/`;
 set it to `dark` or `light` for one. `--visual-views` includes the issues
 board (`board.png`, `board-dropdown.png`, `board-detail.png`), Settings, the
-bootstrap screens and the notice bars; `--visual-review` the project
-switcher (`sidebar-switcher-mid.png`, `sidebar-switcher.png`), the nav chip
+bootstrap screens and the notice bars; `--visual-review` the nav chip
 mid-slide (`sidebar-slide-mid.png`) and the palette sliding in
 (`palette-entering.png`).

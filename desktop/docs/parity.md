@@ -172,14 +172,14 @@ paths on every `cargo test`.
   remembers only the view, in memory. Quitting the shown project keeps the
   window: it moves to another open project or the empty-state chooser. A
   bare "Switch Project" opens each client's switcher (the TUI's palette
-  Projects column, the desktop's tab bar `+` menu).
+  Projects column, the desktop's New tab and its launch screen).
 - **Project tabs** (`project-tabs`, desktop only): a desktop window draws
   a tab per open project across its top (`views/tab_bar.rs`, over
   `crate::project_tabs`), in the order they were opened, saved with the
   window slot; a click or ⌘1 to ⌘9 switches (the same `SwitchProject` path),
   a tab's `×` (and File ▸ Close Project…) is Quit Project for that project,
-  the window moving to the neighbor tab, and the `+` menu lists the projects
-  that aren't open, then Add project. Right-clicking a tab opens its context
+  the window moving to the neighbor tab, and the `+` opens a New tab
+  showing the launch screen (`new-tab-launch`), where a pick becomes that tab. Right-clicking a tab opens its context
   menu: Close Project (that tab's) and Close All Other Projects (the
   registry's `action:close-other-projects`, kept for that tab). The TUI shows one project per screen
   and switches through the palette's Projects column. No registry command or

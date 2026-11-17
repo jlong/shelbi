@@ -114,7 +114,7 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         // window.
         CommandKind::OpenAcknowledgements => host.open_acknowledgements(),
         // The window switches in place (dt-switch-project-in-window). A bare
-        // switch (no target) opens the switcher.
+        // switch (no target) opens the switcher (the desktop's New tab).
         CommandKind::SwitchProject { project } => {
             if project.is_empty() {
                 host.open_project_switcher()

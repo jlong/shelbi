@@ -4,9 +4,6 @@
 //! frame per state, plus a check that each state shows what it should:
 //!
 //! - `review-sidebar.png`: the sidebar before the review opens;
-//! - `sidebar-switcher-mid.png` and `sidebar-switcher.png`: the tab bar's
-//!   project menu (the `+` tab's) sliding in, then open with the keyboard a
-//!   row down;
 //! - `sidebar-slide-mid.png` and `sidebar-slide.png`: the nav selection chip
 //!   part-way to Issues, then landed;
 //! - `review-pending.png`: the panel the moment a review is asked for, before
@@ -447,21 +444,6 @@ impl Run {
         let column = self.column();
         self.expect("the sidebar holds the column", column == (true, false));
         self.save("review-sidebar.png");
-
-        // The tab bar's project menu: sliding in, then open a row down.
-        self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_switcher(true, cx)).unwrap();
-        self.advance(Duration::from_millis(50));
-        self.save("sidebar-switcher-mid.png");
-        self.advance(Duration::from_millis(400));
-        self.handle
-            .update(&mut self.cx, |w, window, cx| {
-                w.offscreen_switcher_key(shelbi_state::keymap::Key::Down, window, cx)
-            })
-            .unwrap();
-        self.settle();
-        self.save("sidebar-switcher.png");
-        self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_switcher(false, cx)).unwrap();
-        self.advance(Duration::from_millis(400));
 
         // The nav chip sliding from Orchestrator to Issues, and back.
         self.handle.update(&mut self.cx, |w, _, cx| w.offscreen_select(1, cx)).unwrap();

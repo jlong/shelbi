@@ -16,7 +16,9 @@
 //!
 //! The project travels as a switch does: the giving window remembers where
 //! it was left, the taking window adopts that and attaches the same daemon
-//! sessions, and a window left with no tab closes.
+//! sessions, and a window left with no tab closes. A New tab travels the
+//! same way: torn off, its window shows the launch screen; dropped on a bar
+//! whose window has a New tab already, that one is selected.
 
 use gpui::{point, px, App, Bounds, Context, Point, Window, WindowHandle, WindowId};
 
@@ -351,7 +353,7 @@ fn tear_off(t: TearOff, cx: &mut App) {
             sidebar_width: w.window_state.sidebar_width,
             sidebar_collapsed: w.window_state.sidebar_collapsed,
             task_pane_width: w.window_state.task_pane_width,
-            tabs: vec![t.project.clone()],
+            tabs: if t.project == NEW_TAB { Vec::new() } else { vec![t.project.clone()] },
             ..WindowState::default()
         };
         (state, window.window_bounds().get_bounds().size, window_display(window, cx))
@@ -375,6 +377,13 @@ fn tear_off(t: TearOff, cx: &mut App) {
         .map(|s| s.windows.iter().map(|w| w.slot).collect())
         .unwrap_or_default();
     let slot = WindowSession::free_slot(&taken);
+    if t.project == NEW_TAB {
+        if let Some(handle) = open_new_tab_window(slot, state, bounds, cx) {
+            let _ = handle.update(cx, |_, window, _| window.activate_window());
+            let _ = source.update(cx, |w, window, cx| w.give_up_tab(&t.project, window, cx));
+        }
+        return;
+    }
     let Some(handle) = open_window(&t.project, slot, state, Some(bounds), cx) else {
         return;
     };

@@ -2,7 +2,10 @@
 //! remote sessions" 2539:10949 and "Startup · No projects yet" 2544:10318):
 //! what the app opens when it starts with no daemon running
 //! ([`shelbi_app::launch::route`]), and what File ▸ Show Launch Screen
-//! brings up.
+//! brings up. The same view is a New tab's content (`new-tab-launch`): the
+//! tab bar's `+` opens one in a project window ([`LaunchView::in_tab`]), and
+//! what is picked there lands in that tab rather than in a window of its own
+//! ([`Deps`] says where each choice goes).
 //!
 //! A 900 × 620 window, traffic lights over its left panel: "Welcome to
 //! Shelbi", the line under it, Add project and Connect to remote. The right
@@ -96,6 +99,8 @@ pub type DaemonFn = dyn Fn(&mut App) -> Arc<dyn LaunchDaemon>;
 pub type OpenFn = dyn Fn(&str, &mut App);
 /// Runs Add project.
 pub type AddFn = dyn Fn(&mut App);
+/// Opens a remote session connected to (and remembered).
+pub type RemoteFn = dyn Fn(RemoteSession, &mut App);
 
 /// What the view runs; a test swaps in its own (a canned model, a fake
 /// daemon, recorders for where it went).
@@ -105,6 +110,7 @@ pub struct Deps {
     pub daemon: Rc<DaemonFn>,
     pub open: Rc<OpenFn>,
     pub add: Rc<AddFn>,
+    pub remote: Rc<RemoteFn>,
 }
 
 impl Deps {
@@ -127,8 +133,19 @@ impl Deps {
             }),
             open: Rc::new(crate::app::open_project_window),
             add: Rc::new(|cx| super::add_project::show(Origin::Workspace, None, cx)),
+            remote: Rc::new(crate::views::remote_session::open_remote_session),
         }
     }
+}
+
+/// What draws a launch view: the launch window, or a project window's New
+/// tab, under the tab bar. The window's own chrome (its menu bar, its
+/// translucency, ⌘W closing it, the title bar over the lists) is the launch
+/// window's alone; a tab leaves those to the window it is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Host {
+    Window,
+    Tab,
 }
 
 /// The open launch window, so asking again brings it up.
@@ -144,7 +161,8 @@ pub struct TestDeps(pub Deps);
 #[cfg(test)]
 impl Global for TestDeps {}
 
-fn deps(cx: &App) -> Deps {
+/// The [`Deps`] a launch view runs on: a test's, else the real machine's.
+pub fn deps(cx: &App) -> Deps {
     #[cfg(test)]
     if let Some(d) = cx.try_global::<TestDeps>() {
         return d.0.clone();
@@ -266,8 +284,10 @@ pub fn card(
         .children(trailing)
 }
 
-/// The launch window.
+/// The launch screen: the launch window's root view, or a New tab's content
+/// ([`Host`]).
 pub struct LaunchView {
+    host: Host,
     model: LaunchModel,
     /// The keyboard's row ([`LaunchModel::action_at`]).
     selected: usize,
@@ -284,22 +304,34 @@ pub struct LaunchView {
 }
 
 impl LaunchView {
+    /// The launch window's view.
     pub fn new(deps: Deps, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::hosted(Host::Window, deps, window, cx)
+    }
+
+    /// A New tab's: the window it is in keeps its own theme and menus.
+    pub fn in_tab(deps: Deps, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::hosted(Host::Tab, deps, window, cx)
+    }
+
+    fn hosted(host: Host, deps: Deps, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        theme::window::apply_to(window, cx);
-        let subscriptions = vec![
-            theme::follow_system(window, cx),
+        let mut subscriptions = Vec::new();
+        if host == Host::Window {
+            theme::window::apply_to(window, cx);
+            subscriptions.push(theme::follow_system(window, cx));
             // Frontmost, the menu bar is this window's: no project, the
             // Connect dialog's item live.
-            cx.observe_window_activation(window, |_, window, cx| {
+            subscriptions.push(cx.observe_window_activation(window, |_, window, cx| {
                 if window.is_window_active() {
                     install_menus(cx);
                 }
-            }),
-        ];
-        install_menus(cx);
+            }));
+            install_menus(cx);
+        }
         let mut this = LaunchView {
+            host,
             model: LaunchModel::default(),
             selected: 0,
             busy: None,
@@ -313,6 +345,16 @@ impl LaunchView {
         };
         this.reload(cx);
         this
+    }
+
+    /// Take the keyboard (the New tab coming up).
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        self.focus.focus(window, cx);
+    }
+
+    #[cfg(test)]
+    pub fn host(&self) -> Host {
+        self.host
     }
 
     #[cfg(test)]
@@ -455,11 +497,11 @@ impl LaunchView {
     }
 
     /// Connected to `session` (remembered): its window opens
-    /// ([`crate::views::remote_session`]), and the list re-reads, so it is
-    /// on top.
+    /// ([`crate::views::remote_session`], or the New tab's [`Deps::remote`]),
+    /// and the list re-reads, so it is on top.
     fn connected(&mut self, session: RemoteSession, cx: &mut Context<Self>) {
         tracing::info!(host = %session.host, project = %session.project, "connected to a remote session");
-        crate::views::remote_session::open_remote_session(session, cx);
+        (self.deps.remote.clone())(session, cx);
         self.selected = self.model.projects.len();
         self.reload(cx);
     }
@@ -654,13 +696,19 @@ impl LaunchView {
                 }))
             })
             .collect();
+        // Under the launch window's title bar it starts lower; under the tab
+        // bar, at the panel's inset.
+        let top = match self.host {
+            Host::Window => RIGHT_TOP,
+            Host::Tab => INSET,
+        };
         let inner = div()
             .flex()
             .flex_col()
             .justify_center()
             .gap(px(24.0))
             .min_h_full()
-            .pt(px(RIGHT_TOP))
+            .pt(px(top))
             .pb(px(INSET))
             .px(px(INSET))
             .when(!projects.is_empty(), |d| d.child(section("launch-projects", PROJECTS_HEADING, projects)))
@@ -767,15 +815,19 @@ impl Render for LaunchView {
             LaunchState::Projects => self.render_lists(&theme, cx).bg(theme.canvas).into_any_element(),
             LaunchState::NoProjects => self.render_empty(&theme).bg(theme.canvas).into_any_element(),
         };
+        // ⌘W cancels the dialog first, then closes the launch window; in a
+        // tab, with no dialog, it is the window's (it closes the tab).
+        let close_here = self.host == Host::Window || self.dialog.is_some();
         div()
             .id("launch")
             .debug_selector(|| "launch".into())
             .track_focus(&self.focus)
-            .on_action(cx.listener(|this, _: &CloseWindow, window, cx| match this.dialog() {
-                // ⌘W cancels the dialog first.
-                Some(dialog) => dialog.update(cx, |d, cx| d.dismiss(cx)),
-                None => window.remove_window(),
-            }))
+            .when(close_here, |d| {
+                d.on_action(cx.listener(|this, _: &CloseWindow, window, cx| match this.dialog() {
+                    Some(dialog) => dialog.update(cx, |d, cx| d.dismiss(cx)),
+                    None => window.remove_window(),
+                }))
+            })
             .on_key_down(cx.listener(Self::key_down))
             .relative()
             .flex()
@@ -791,4 +843,4 @@ impl Render for LaunchView {
 
 #[cfg(test)]
 #[path = "launch_tests.rs"]
-mod tests;
+pub(crate) mod tests;
