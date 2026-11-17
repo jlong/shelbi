@@ -15,11 +15,14 @@
 //! its dot for an `×` that closes the project. While ⌘ is held each of the
 //! first nine tabs shows its ⌘N.
 //!
-//! The `+` tab opens the project menu under it: the projects that aren't open
-//! (the shared [`project_menu`] list, gray rings), a rule, then
-//! "Add project". With every project open, only "Add project".
+//! The `+` tab opens a New tab (`new-tab-launch`) after the last tab and
+//! selects it, or selects the window's New tab when it has one: "New tab"
+//! beside a gray ring (no project, so no status), its content the launch
+//! screen ([`super::launch`]). It closes with its `×` as a project's tab
+//! does, without asking (nothing stops), and drags, reorders and tears off
+//! the same way.
 //!
-//! Right-clicking a project's tab (never the `+`) opens its context menu at
+//! Right-clicking a project's tab (never the `+` or the New tab) opens its context menu at
 //! the pointer ([`TabMenu`]): "Close Project", closing that tab's project as
 //! its `×` does, and "Close All Other Projects", closing every other tab's
 //! after one confirmation (dimmed while it's the only tab). It closes on a
@@ -58,7 +61,7 @@ use gpui::{
     canvas, deferred, div, point, prelude::*, px, AnyElement, App, Bounds, Context, DispatchPhase, Div, Hsla,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, SharedString, Size, Stateful, Window,
 };
-use shelbi_app::overlay::palette::ProjectEntry;
+use shelbi_app::overlay::palette::{project_indicator, ProjectIndicator};
 
 use super::project_menu;
 use super::sidebar::{self, SidebarEvent, SidebarHost, TOOLBAR_BUTTON, TRAFFIC_LIGHTS_RIGHT};
@@ -66,7 +69,8 @@ use super::tab_drag::{SharedLayout, TabFrame};
 use super::tab_tearoff;
 pub use super::tab_drag::TabReorder;
 use crate::assets::{heroicon, icons, ICON_SIZE_MENU};
-use crate::elements::placed::{placed, MenuScroll};
+use crate::elements::placed::placed;
+use crate::project_tabs::NEW_TAB;
 use crate::elements::window_drag;
 use crate::keys::tab_hotkey;
 use crate::theme::motion;
@@ -100,11 +104,32 @@ const RULE_W: f32 = 1.0;
 /// The `+` tab and the rule after it: no drop gap over it.
 pub const PLUS_SLOT_W: f32 = TAB_BAR_H + RULE_W;
 
-/// The project menu's width and its gap under the `+` tab.
+/// A tab's context menu's width.
 const MENU_W: f32 = 240.0;
-const MENU_GAP: f32 = 4.0;
 /// A tab's context menu's gap under the pointer.
 const CONTEXT_GAP: f32 = 2.0;
+
+/// What the New tab says.
+pub const NEW_TAB_LABEL: &str = "New tab";
+
+/// A tab's dot: an open project's (green, breathing while it works), or the
+/// New tab's gray ring (no project, so no status).
+pub fn indicator(name: &str, working: bool) -> ProjectIndicator {
+    if name == NEW_TAB {
+        ProjectIndicator::Unloaded
+    } else {
+        project_indicator(true, working)
+    }
+}
+
+/// The name a tab's debug selectors use: the project's, or `new-tab`.
+fn selector_name(name: &str) -> &str {
+    if name == NEW_TAB {
+        "new-tab"
+    } else {
+        name
+    }
+}
 
 /// One tab, as a frame draws it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,12 +152,6 @@ pub struct TabBarProps<'a> {
     pub hovered: Option<&'a str>,
     /// ⌘ is held: the first nine tabs show their ⌘N.
     pub command_held: bool,
-    /// The project menu while it shows (opening, open or closing).
-    pub menu: Option<ProjectMenuProps<'a>>,
-    /// Where the `+` tab lands, for the menu's placement.
-    pub plus: &'a Anchor,
-    /// The menu is open (the `+` holds its pressed fill).
-    pub menu_open: bool,
     /// The sidebar shows, or is on its way (the Toggle sidebar tooltip says
     /// what a click does).
     pub sidebar_shown: bool,
@@ -169,7 +188,7 @@ pub struct TabDrag {
 /// and this one draws nothing.
 pub struct TabGhost {
     label: SharedString,
-    working: bool,
+    indicator: ProjectIndicator,
     /// The dragged tab's width.
     tab_w: f32,
 }
@@ -179,7 +198,7 @@ impl Render for TabGhost {
         let theme = cx.global::<Theme>().opaque();
         let now = Instant::now();
         let Some(drag) = tab_tearoff::session(cx) else {
-            return tab_tearoff::ghost(self.label.clone(), self.working, 0.0, self.tab_w, &theme).into_any_element();
+            return tab_tearoff::ghost(self.label.clone(), self.indicator, 0.0, self.tab_w, &theme).into_any_element();
         };
         if drag.floats() {
             return div().into_any_element();
@@ -196,7 +215,7 @@ impl Render for TabGhost {
             .top(px(shift.y))
             .child(tab_tearoff::ghost(
                 self.label.clone(),
-                self.working,
+                self.indicator,
                 drag.morph.at(now),
                 self.tab_w,
                 &theme,
@@ -349,78 +368,6 @@ fn menu_animating(changed: Option<Instant>, now: Instant, reduce_motion: bool) -
     !reduce_motion && changed.is_some_and(|at| now.saturating_duration_since(at) < motion::MENU_IN)
 }
 
-/// The project menu, as one frame draws it.
-pub struct ProjectMenuProps<'a> {
-    /// The projects without a tab, each with its (gray) dot.
-    pub projects: &'a [ProjectEntry],
-    /// The keyboard's row: an index into the projects, or `projects.len()`
-    /// for "Add project".
-    pub highlight: usize,
-    /// How shown the menu is: 0 (hidden) to 1, eased.
-    pub phase: f32,
-    /// Open, not fading out after closing: only an open menu takes the
-    /// window's presses to close.
-    pub open: bool,
-    /// The menu's scroll, keeping the keyboard's row in view.
-    pub scroll: MenuScroll,
-}
-
-/// The project menu's state, owned by the window: open or closed, when that
-/// last changed (for the slide-and-fade), and the keyboard's row.
-#[derive(Debug, Default)]
-pub struct ProjectMenu {
-    open: bool,
-    changed: Option<Instant>,
-    pub highlight: usize,
-    /// The `+` tab's bounds as last painted.
-    pub button: Anchor,
-    /// The menu's scroll (capped where the window is short).
-    pub scroll: MenuScroll,
-}
-
-impl ProjectMenu {
-    pub fn is_open(&self) -> bool {
-        self.open
-    }
-
-    /// Open with the keyboard on `highlight`.
-    pub fn open(&mut self, highlight: usize, now: Instant) {
-        if !self.open {
-            self.open = true;
-            self.changed = Some(now);
-            // Scrolled to the keyboard's row as it opens.
-            self.scroll.follow(None);
-        }
-        self.highlight = highlight;
-    }
-
-    pub fn close(&mut self, now: Instant) {
-        if self.open {
-            self.open = false;
-            self.changed = Some(now);
-        }
-    }
-
-    /// Move the keyboard's row by `delta` among `count` rows, wrapping.
-    pub fn step(&mut self, delta: isize, count: usize) {
-        if count > 0 {
-            self.highlight = (self.highlight as isize + delta).rem_euclid(count as isize) as usize;
-        }
-    }
-
-    /// How shown the menu is at `now` (0..=1 on Taskpage's curve), `None`
-    /// once it has finished closing. Instant under `reduce_motion`.
-    pub fn phase(&self, now: Instant, reduce_motion: bool) -> Option<f32> {
-        menu_phase(self.open, self.changed, now, reduce_motion)
-    }
-
-    /// Whether the menu is mid-transition at `now` (the window keeps
-    /// drawing frames).
-    pub fn animating(&self, now: Instant, reduce_motion: bool) -> bool {
-        menu_animating(self.changed, now, reduce_motion)
-    }
-}
-
 /// The bar's fill: `slate/700` in the Dark frame, which is the overlay fill
 /// (`button/default/background`) laid over the main area's color, so Light
 /// gets its own light gray the same way.
@@ -490,7 +437,7 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
                 .into_any_element(),
         );
     }
-    strip.push(plus_tab(props.plus, props.menu_open, theme, cx).into_any_element());
+    strip.push(plus_tab(theme, cx).into_any_element());
     strip.push(rule(theme).into_any_element());
     // The bar's empty space past the `+`: the gap after the last tab, and,
     // with no drag, a press there moves the window.
@@ -547,10 +494,6 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
         .size_full()
     };
 
-    let menu = props
-        .menu
-        .as_ref()
-        .map(|menu| render_menu_layer(menu, props.plus, theme, cx));
     let tab_menu = props
         .tab_menu
         .as_ref()
@@ -595,7 +538,6 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
         )
         .child(bar_probe)
         .child(follow)
-        .children(menu)
         .children(tab_menu)
         .into_any_element()
 }
@@ -611,7 +553,9 @@ fn render_tab<H: SidebarHost>(
     cx: &mut Context<H>,
 ) -> Stateful<Div> {
     let TabLook { hovered, hotkey, lifted } = look;
-    let selector = format!("tab-{}", tab.name);
+    let new_tab = tab.name == NEW_TAB;
+    let key = selector_name(&tab.name).to_string();
+    let selector = format!("tab-{key}");
     let name = tab.name.clone();
     let hover_name = tab.name.clone();
     let menu_name = tab.name.clone();
@@ -624,7 +568,7 @@ fn render_tab<H: SidebarHost>(
     let host = cx.entity().downgrade();
     let layout = layout.clone();
     let lead = if hovered {
-        let close_selector = format!("tab-close-{}", tab.name);
+        let close_selector = format!("tab-close-{key}");
         let close = tab.name.clone();
         let group = SharedString::from(close_selector.clone());
         let loud = theme.text_loud;
@@ -641,7 +585,7 @@ fn render_tab<H: SidebarHost>(
             .rounded(px(4.0))
             .cursor_pointer()
             .hover(move |s| s.bg(hover_fill))
-            .tooltip(style::tooltip("Close Project"))
+            .tooltip(style::tooltip(if new_tab { "Close Tab" } else { "Close Project" }))
             .child(
                 heroicon(icons::X_MARK_MENU)
                     .text_color(theme.gray)
@@ -653,8 +597,7 @@ fn render_tab<H: SidebarHost>(
             }))
             .into_any_element()
     } else {
-        let indicator = shelbi_app::overlay::palette::project_indicator(true, tab.working);
-        project_menu::dot(SharedString::from(format!("tab-dot-{}", tab.name)), indicator, theme)
+        project_menu::dot(SharedString::from(format!("tab-dot-{key}")), indicator(&tab.name, tab.working), theme)
     };
     div()
         .id(SharedString::from(selector.clone()))
@@ -684,7 +627,7 @@ fn render_tab<H: SidebarHost>(
                 .child(tab.label.clone()),
         )
         .children(hotkey.map(|h| {
-            let badge = format!("tab-hotkey-{}", tab.name);
+            let badge = format!("tab-hotkey-{key}");
             style::hotkey(&h, theme).px_0().debug_selector(move || badge)
         }))
         .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
@@ -693,21 +636,24 @@ fn render_tab<H: SidebarHost>(
         .on_click(cx.listener(move |this, _, window, cx| {
             this.sidebar_event(SidebarEvent::SwitchTo(name.clone()), window, cx)
         }))
-        // Its context menu, at the pointer.
-        .on_mouse_down(
-            MouseButton::Right,
-            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                cx.stop_propagation();
-                menu_anchor.set(Some(Bounds::new(ev.position, Size::default())));
-                this.sidebar_event(SidebarEvent::OpenTabMenu(menu_name.clone()), window, cx)
-            }),
-        )
+        // Its context menu, at the pointer (a project's: the New tab has
+        // no project to close).
+        .when(!new_tab, |d| {
+            d.on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    menu_anchor.set(Some(Bounds::new(ev.position, Size::default())));
+                    this.sidebar_event(SidebarEvent::OpenTabMenu(menu_name.clone()), window, cx)
+                }),
+            )
+        })
         // A drag (past gpui's threshold, so a click stays a click) carries
         // the tab; the ghost starts where the tab sits under the pointer.
         .on_drag(drag, move |drag: &TabDrag, offset, window, cx: &mut App| {
-            let (label, working) = (drag.label.clone(), drag.working);
+            let (label, indicator) = (drag.label.clone(), indicator(&drag.project, drag.working));
             let tab_w = (layout.borrow().width(&drag.project) - RULE_W).max(0.0);
-            let ghost = cx.new(|_| TabGhost { label, working, tab_w });
+            let ghost = cx.new(|_| TabGhost { label, indicator, tab_w });
             {
                 let mut layout = layout.borrow_mut();
                 layout.grab_x = offset.x.as_f32();
@@ -723,8 +669,8 @@ fn render_tab<H: SidebarHost>(
         })
 }
 
-/// A tab's context menu at the pointer, drawn over everything as the
-/// project menu is; while open, a press outside it closes it and goes no
+/// A tab's context menu at the pointer, drawn over everything
+/// (`deferred`); while open, a press outside it closes it and goes no
 /// further.
 fn render_tab_menu_layer<H: SidebarHost>(
     menu: &TabMenuProps<'_>,
@@ -753,7 +699,7 @@ fn render_tab_menu_layer<H: SidebarHost>(
 }
 
 /// The context menu's rows: Close Project, then Close All Other Projects
-/// (dimmed while there is no other tab), on the project menu's fill.
+/// (dimmed while there is no other tab), on the menus' raised fill.
 fn render_tab_menu<H: SidebarHost>(menu: &TabMenuProps<'_>, theme: &Theme, cx: &mut Context<H>) -> impl IntoElement {
     let rows = TabMenuRow::ALL.into_iter().map(|row| {
         let id = SharedString::from(row.selector());
@@ -785,16 +731,11 @@ fn render_tab_menu<H: SidebarHost>(menu: &TabMenuProps<'_>, theme: &Theme, cx: &
         .children(rows)
 }
 
-/// The `+` tab: 52pt square, Heroicons `plus`, opening the project menu;
-/// it records where it lands into `anchor` (for the menu's placement).
-fn plus_tab<H: SidebarHost>(anchor: &Anchor, open: bool, theme: &Theme, cx: &mut Context<H>) -> Stateful<Div> {
-    let landed = {
-        let cell = anchor.clone();
-        probe(move |bounds| cell.set(Some(bounds)))
-    };
+/// The `+` tab: 52pt square, Heroicons `plus`, opening a New tab (or
+/// selecting the window's).
+fn plus_tab<H: SidebarHost>(theme: &Theme, cx: &mut Context<H>) -> Stateful<Div> {
     let loud = theme.text_loud;
     let hover_fill = theme.background_hover;
-    let rest = if open { theme.background_active } else { theme.background.opacity(0.0) };
     div()
         .id("tab-plus")
         .debug_selector(|| "tab-plus".into())
@@ -806,102 +747,14 @@ fn plus_tab<H: SidebarHost>(anchor: &Anchor, open: bool, theme: &Theme, cx: &mut
         .justify_center()
         .size(px(TAB_BAR_H))
         .cursor_pointer()
-        .bg(rest)
         .hover(move |s| s.bg(hover_fill))
-        .tooltip(style::tooltip("Open a project"))
-        .child(landed)
+        .tooltip(style::tooltip("New tab"))
         .child(
             heroicon(icons::PLUS)
-                .text_color(if open { loud } else { theme.icon })
+                .text_color(theme.icon)
                 .group_hover("tab-plus", move |s| s.text_color(loud)),
         )
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.sidebar_event(SidebarEvent::ToggleSwitcher, window, cx)
-        }))
-}
-
-/// The menu floating [`MENU_GAP`] under the `+` tab, its left edge on the
-/// tab's: drawn after everything (`deferred`), so nothing below it moves,
-/// capped and scrolling where the window is short. While open, a press
-/// outside it (the `+` included, so a second click closes it) closes it and
-/// goes no further.
-fn render_menu_layer<H: SidebarHost>(
-    menu: &ProjectMenuProps<'_>,
-    anchor: &Anchor,
-    theme: &Theme,
-    cx: &mut Context<H>,
-) -> impl IntoElement {
-    let body = div()
-        .relative()
-        .top(px((1.0 - menu.phase) * motion::SLIDE_PX))
-        .opacity(menu.phase)
-        .flex()
-        .flex_col()
-        .min_h_0()
-        .w(px(MENU_W))
-        .child(render_menu(menu, theme, cx));
-    let placed = placed(anchor, body).gap(MENU_GAP);
-    let placed = if menu.open {
-        placed.on_dismiss(cx.listener(|this, _: &gpui::MouseDownEvent, window, cx| {
-            this.sidebar_event(SidebarEvent::CloseSwitcher, window, cx)
-        }))
-    } else {
-        placed
-    };
-    deferred(placed).with_priority(1)
-}
-
-/// The menu (the Figma `Project switcher`'s open state, 2186:1692): the
-/// "Projects" heading over a row per project that isn't open, a rule, then
-/// "+ Add project". Only "Add project" when every project is open. The
-/// keyboard's row wears the selection fill.
-fn render_menu<H: SidebarHost>(menu: &ProjectMenuProps<'_>, theme: &Theme, cx: &mut Context<H>) -> impl IntoElement {
-    let rows = menu.projects.iter().enumerate().map(|(ix, p)| {
-        let name = p.slug.clone();
-        project_menu::project_row(
-            SharedString::from(format!("tab-menu-project-{}", p.slug)),
-            format!("tab-menu-project-{}", p.slug),
-            p,
-            menu.highlight == ix,
-            theme,
-        )
-        .on_click(cx.listener(move |this, _, window, cx| {
-            this.sidebar_event(SidebarEvent::SwitchTo(name.clone()), window, cx)
-        }))
-    });
-    let add_ix = menu.projects.len();
-    let listed = !menu.projects.is_empty();
-    // The keyboard's row among the menu's children: after the heading, and
-    // "Add project" after the rule.
-    let child = if menu.highlight < add_ix {
-        1 + menu.highlight
-    } else if listed {
-        add_ix + 2
-    } else {
-        0
-    };
-    menu.scroll.follow(Some(child));
-    let add = project_menu::add_row("tab-menu-add", "tab-menu-add", menu.highlight == add_ix, theme)
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.sidebar_event(SidebarEvent::AddProject, window, cx)
-        }));
-    div()
-        .id("tab-menu")
-        .debug_selector(|| "tab-menu".into())
-        .flex()
-        .flex_col()
-        .px_1()
-        .py_2()
-        .overflow_y_scroll()
-        .track_scroll(menu.scroll.handle())
-        .rounded(px(NAV_RADIUS))
-        .bg(theme.raised.blend(theme.search))
-        .text_color(theme.foreground)
-        .occlude()
-        .when(listed, |d| d.child(project_menu::heading(theme)))
-        .children(rows)
-        .when(listed, |d| d.child(project_menu::divider(theme)))
-        .child(add)
+        .on_click(cx.listener(|this, _, window, cx| this.sidebar_event(SidebarEvent::NewTab, window, cx)))
 }
 
 #[cfg(test)]
@@ -949,17 +802,10 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_steps_and_wraps() {
-        let mut m = ProjectMenu::default();
-        let now = Instant::now();
-        m.open(0, now);
-        assert!(m.is_open());
-        m.step(-1, 3);
-        assert_eq!(m.highlight, 2);
-        m.step(1, 3);
-        assert_eq!(m.highlight, 0);
-        m.close(now);
-        assert!(!m.is_open());
-        assert_eq!(m.phase(now, true), None, "closed at once under Reduce Motion");
+    fn the_new_tab_wears_a_gray_ring() {
+        assert_eq!(indicator(NEW_TAB, true), ProjectIndicator::Unloaded, "no project, no status");
+        assert_eq!(indicator("web", false), ProjectIndicator::LoadedIdle);
+        assert_eq!(indicator("web", true), ProjectIndicator::Working);
+        assert_eq!(selector_name(NEW_TAB), "new-tab");
     }
 }

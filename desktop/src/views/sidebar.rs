@@ -385,14 +385,12 @@ pub enum SidebarEvent {
     Activate(usize),
     /// A header row's Search button: opens the command palette.
     OpenSearch,
-    /// Show or hide the tab bar's project menu (the `+` tab).
-    ToggleSwitcher,
-    /// Close the project menu (a click outside it).
-    CloseSwitcher,
-    /// Switch to a project: a tab, or a project in the `+` menu (which
-    /// opens it).
+    /// The tab bar's `+`: open a New tab, or select the window's.
+    NewTab,
+    /// Switch to a tab: a project's, or the New tab.
     SwitchTo(String),
-    /// Close a project: its tab's `×`, or its context menu's Close Project.
+    /// Close a tab: a project's `×` (or its context menu's Close Project),
+    /// which asks first and stops it; or the New tab's.
     CloseTab(String),
     /// Open a tab's context menu (a right-click on it; the menu's anchor is
     /// already set to the pointer).
@@ -414,8 +412,6 @@ pub enum SidebarEvent {
     /// The dragged tab was released: it lands in the bar it is over (in the
     /// gap there, if any), or, torn off, in a window of its own.
     DropTab,
-    /// The project menu's "Add project…".
-    AddProject,
     /// Collapse or expand a section (its header).
     ToggleSection(Section),
     /// The Zen pill.

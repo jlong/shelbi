@@ -38,6 +38,8 @@ use gpui::{
     WindowBackgroundAppearance, WindowBounds, WindowHandle, WindowId, WindowKind, WindowOptions,
 };
 
+use shelbi_app::overlay::palette::ProjectIndicator;
+
 use super::project_menu;
 use crate::platform::screen::NativeWindow;
 use crate::theme::motion;
@@ -195,6 +197,12 @@ pub struct DragState {
 }
 
 impl DragState {
+    /// The dragged tab's dot: a project's (open, working or not), or the
+    /// New tab's ring.
+    pub fn indicator(&self) -> ProjectIndicator {
+        super::tab_bar::indicator(&self.project, self.working)
+    }
+
     pub fn new(source: WindowId, project: String, label: SharedString, working: bool) -> DragState {
         DragState {
             source,
@@ -378,9 +386,8 @@ pub fn sync_float(display: Option<gpui::DisplayId>, cx: &mut App) {
 /// dialog's shadow, growing from the tab's `tab_w` × 52 into the
 /// [`CARD_W`] × [`CARD_H`] card with a dialog's corners, its name moving to
 /// the middle as the dot fades.
-pub fn ghost(label: SharedString, working: bool, morph: f32, tab_w: f32, theme: &Theme) -> Div {
+pub fn ghost(label: SharedString, indicator: ProjectIndicator, morph: f32, tab_w: f32, theme: &Theme) -> Div {
     let m = morph.clamp(0.0, 1.0);
-    let indicator = shelbi_app::overlay::palette::project_indicator(true, working);
     let tab_w = if tab_w > 0.0 { tab_w } else { TAB_MAX_W };
     let card = m > 0.0;
     let dot_room = lerp(1.0, 0.0, m);
@@ -443,7 +450,7 @@ impl Render for FloatingGhost {
                 .absolute()
                 .left(px(at.x))
                 .top(px(at.y))
-                .child(ghost(s.label.clone(), s.working, s.morph.at(now), s.tab_w, &theme))
+                .child(ghost(s.label.clone(), s.indicator(), s.morph.at(now), s.tab_w, &theme))
         });
         div()
             .debug_selector(|| "tab-drag-float".into())

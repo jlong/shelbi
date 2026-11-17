@@ -1,9 +1,8 @@
 //! The project tabs (`project-tabs`): the tab bar across the top of the
 //! window (Figma `Tabs`, 2792:33339) over the sidebar, which no longer has a
 //! titlebar row or a project switcher; one tab per open project in its saved
-//! order; a click switches, the hovered tab's `×` closes; the `+` tab's menu
-//! lists the projects that aren't open, then Add project; ⌘1 to ⌘9 pick the
-//! tabs and holding ⌘ shows their badges.
+//! order; a click switches, the hovered tab's `×` closes; the `+` tab opens a
+//! New tab; ⌘1 to ⌘9 pick the tabs and holding ⌘ shows their badges.
 //!
 //! The window is the smoke test's headless one ([`Harness`], on `alpha`),
 //! with a project catalog in memory (nothing reads the disk) and Reduce
@@ -221,58 +220,28 @@ fn a_hovered_tab_shows_a_close_button_that_asks_first(cx: &mut TestAppContext) {
     assert!(!drawn(&mut h, "tab-close-beta"));
 }
 
+/// The `+` opens a New tab (`new-tab-launch`, its own tests in
+/// `app_new_tab_tests`), never a menu: no command runs, no project is asked
+/// for.
 #[gpui::test]
-fn the_plus_menu_lists_the_projects_that_arent_open(cx: &mut TestAppContext) {
+fn the_plus_opens_a_new_tab_not_a_menu(cx: &mut TestAppContext) {
     let mut h = open(cx, &["alpha", "beta"], &[]);
+    h.cx.update(|_, cx| {
+        let deps = crate::views::launch::Deps {
+            load: std::sync::Arc::new(|_| shelbi_app::launch::LaunchModel::default()),
+            ..crate::views::launch::deps(cx)
+        };
+        cx.set_global(crate::views::launch::TestDeps(deps));
+    });
     h.take_calls();
     h.click_selector("tab-plus");
-    assert_eq!(h.take_calls(), [HostCall::OpenSwitcher], "the + is Switch Project's menu");
-    h.window.update(&mut h.cx, |w, cx| w.open_switcher(cx));
-    let plus = bounds(&mut h, "tab-plus");
-    let menu = bounds(&mut h, "tab-menu");
-    assert_eq!((menu.left(), menu.top()), (plus.left(), plus.bottom() + px(4.0)), "under the +");
-    for listed in ["tab-menu-project-gamma", "tab-menu-project-delta", "tab-menu-add"] {
-        assert_eq!(bounds(&mut h, listed).size.height, px(26.0), "{listed}");
+    assert!(h.take_calls().is_empty(), "the window's own");
+    assert_eq!(order(&h), ["alpha", "beta", crate::project_tabs::NEW_TAB]);
+    assert!(h.window.read_with(&h.cx, |w, _| w.on_new_tab()));
+    assert!(drawn(&mut h, "tab-new-tab") && drawn(&mut h, "launch"));
+    for gone in ["tab-menu", "tab-menu-add"] {
+        assert!(!drawn(&mut h, gone), "{gone} is gone");
     }
-    for tabbed in ["tab-menu-project-alpha", "tab-menu-project-beta"] {
-        assert!(!drawn(&mut h, tabbed), "{tabbed} has a tab");
-    }
-    // Picking one opens it in its tab (the switch adds it).
-    h.click_selector("tab-menu-project-delta");
-    assert_eq!(h.take_calls(), [HostCall::SwitchProject("delta".into())]);
-
-    // The keyboard: Down then Enter is the second row; up from the top
-    // wraps to Add project.
-    h.window.update(&mut h.cx, |w, cx| {
-        w.switcher.close(Instant::now());
-        w.open_switcher(cx);
-    });
-    h.focus_window();
-    h.key("down");
-    h.key("enter");
-    assert_eq!(h.take_calls(), [HostCall::SwitchProject("delta".into())]);
-    h.window.update(&mut h.cx, |w, cx| {
-        w.switcher.close(Instant::now());
-        w.open_switcher(cx);
-    });
-    h.key("up");
-    assert_eq!(h.window.read_with(&h.cx, |w, _| w.switcher.highlight), 2, "Add project");
-    h.key("escape");
-    assert!(!h.window.read_with(&h.cx, |w, _| w.switcher.is_open()));
-}
-
-#[gpui::test]
-fn with_every_project_open_the_plus_menu_is_add_project(cx: &mut TestAppContext) {
-    let mut h = open(cx, &PROJECTS, &[]);
-    assert_eq!(order(&h), ["alpha", "beta", "delta", "gamma"]);
-    h.window.update(&mut h.cx, |w, cx| w.open_switcher(cx));
-    assert!(drawn(&mut h, "tab-menu-add"));
-    for name in ["tab-menu-project-alpha", "tab-menu-project-gamma"] {
-        assert!(!drawn(&mut h, name));
-    }
-    h.take_calls();
-    h.click_selector("tab-menu-add");
-    assert_eq!(h.take_calls(), [HostCall::OpenAddProject]);
 }
 
 #[gpui::test]
@@ -318,15 +287,13 @@ fn a_users_own_control_digit_binding_stays_theirs(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_project_opened_elsewhere_gets_a_tab_not_a_menu_row(cx: &mut TestAppContext) {
+fn a_project_opened_elsewhere_gets_a_tab(cx: &mut TestAppContext) {
     let mut h = open(cx, &["alpha"], &[]);
     // Opened from another window or a terminal since the tabs last synced.
     h.cx.update(|_, cx| cx.global::<Catalog>().set_open(&["alpha", "gamma"]));
-    h.window.update(&mut h.cx, |w, cx| w.open_switcher(cx));
+    h.window.update(&mut h.cx, |w, cx| w.sync_tabs(cx));
     assert_eq!(order(&h), ["alpha", "gamma"]);
     assert!(drawn(&mut h, "tab-gamma"));
-    assert!(!drawn(&mut h, "tab-menu-project-gamma"));
-    assert!(drawn(&mut h, "tab-menu-project-beta") && drawn(&mut h, "tab-menu-project-delta"));
 }
 
 /// The tabs' `(name, working)` as the bar draws them.
@@ -358,17 +325,6 @@ fn a_tab_pulses_while_its_project_has_work_in_progress(cx: &mut TestAppContext) 
     });
     h.draw();
     assert_eq!(working_tabs(&mut h), [("alpha".into(), false), ("beta".into(), true)]);
-    // The `+` menu's rows (the projects without a tab) aren't loaded.
-    let menu: Vec<_> = h.cx.update(|_, cx| {
-        h.window.read(cx).menu_projects(cx).into_iter().map(|p| (p.slug, p.indicator)).collect()
-    });
-    assert_eq!(
-        menu,
-        [
-            ("gamma".to_string(), shelbi_app::overlay::palette::ProjectIndicator::Unloaded),
-            ("delta".to_string(), shelbi_app::overlay::palette::ProjectIndicator::Unloaded),
-        ]
-    );
 
     // The current project working too, then beta's agent going idle.
     h.cx.update(|_, cx| {
@@ -480,7 +436,8 @@ fn right_clicking_a_tab_opens_its_context_menu_at_the_pointer(cx: &mut TestAppCo
     right_click(&mut h, "tab-plus");
     assert!(!tab_menu_open(&h));
     assert!(!drawn(&mut h, "tab-context-menu"));
-    assert!(h.take_calls().is_empty(), "nor does a right-click open the + menu");
+    assert!(h.take_calls().is_empty(), "nor does a right-click open a New tab");
+    assert_eq!(order(&h).len(), 3, "no New tab");
 }
 
 #[gpui::test]

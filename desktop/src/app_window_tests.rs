@@ -24,7 +24,7 @@ use crate::projects::ProjectEntry;
 use crate::views::tab_tearoff::{self, FloatingGhost, CARD_H, CARD_W};
 use crate::views::workspace::tests::{fake_deps as fake_workspace_deps, FakeSessions};
 
-struct Fixture {
+pub(super) struct Fixture {
     hub: FeedHub,
     /// The feeds started, and which still run.
     feeds: Started,
@@ -41,7 +41,7 @@ fn entry(name: &str, label: &str) -> ProjectEntry {
 
 /// Two projects in the catalog: alpha (the smoke fixture's sidebar, with its
 /// workspace `alpha-1`) and beta (a bare skeleton).
-fn fixture(cx: &mut TestAppContext) -> Fixture {
+pub(super) fn fixture(cx: &mut TestAppContext) -> Fixture {
     let (hub, feeds) = canned_hub();
     let (deps, sessions, _ops) = fake_workspace_deps();
     let mut alpha = fixture_model();
@@ -71,7 +71,7 @@ fn fixture(cx: &mut TestAppContext) -> Fixture {
 
 /// Open a window on `project` in `slot`, with fake sessions and a running
 /// feed.
-fn open(cx: &mut TestAppContext, f: &Fixture, project: &str, slot: usize) -> WindowHandle<ShelbiWindow> {
+pub(super) fn open(cx: &mut TestAppContext, f: &Fixture, project: &str, slot: usize) -> WindowHandle<ShelbiWindow> {
     let deps = f.deps.clone();
     cx.update(|cx| {
         open_window(project, slot, WindowState::default(), None, cx);
@@ -87,7 +87,7 @@ fn open(cx: &mut TestAppContext, f: &Fixture, project: &str, slot: usize) -> Win
     })
 }
 
-fn update<R>(
+pub(super) fn update<R>(
     cx: &mut TestAppContext,
     handle: WindowHandle<ShelbiWindow>,
     f: impl FnOnce(&mut ShelbiWindow, &mut Window, &mut Context<ShelbiWindow>) -> R,
@@ -97,13 +97,13 @@ fn update<R>(
     r
 }
 
-fn read<R>(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, f: impl FnOnce(&ShelbiWindow, &App) -> R) -> R {
+pub(super) fn read<R>(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, f: impl FnOnce(&ShelbiWindow, &App) -> R) -> R {
     cx.update(|cx| handle.read_with(cx, f).unwrap())
 }
 
 /// Draw one frame of `handle`, then let foreground work run (the frames it
 /// asks for included).
-fn draw(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) {
+pub(super) fn draw(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) {
     draw_only(cx, handle);
     cx.run_until_parked();
 }
@@ -116,7 +116,7 @@ fn draw_only(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) {
     });
 }
 
-fn windows(cx: &mut TestAppContext) -> Vec<(String, usize)> {
+pub(super) fn windows(cx: &mut TestAppContext) -> Vec<(String, usize)> {
     cx.update(|cx| {
         cx.global::<Shell>()
             .windows
@@ -827,7 +827,7 @@ fn a_window_saves_the_display_its_frame_is_on(cx: &mut TestAppContext) {
 /// Open a window on `project` in `slot` at `frame`, with `tabs` (Reduce
 /// Motion on, so the tabs and the ghost land at once), and draw it so its
 /// bar has measured itself.
-fn open_at(
+pub(super) fn open_at(
     cx: &mut TestAppContext,
     f: &Fixture,
     project: &str,
@@ -859,12 +859,12 @@ fn open_at(
     handle
 }
 
-fn frame(x: f32, y: f32) -> Frame {
+pub(super) fn frame(x: f32, y: f32) -> Frame {
     Frame { x, y, width: 900.0, height: 700.0 }
 }
 
 /// A catalog with `open` recorded open, and windows closing as the app's do.
-fn tearoff_fixture(cx: &mut TestAppContext, open: &[&str]) -> Fixture {
+pub(super) fn tearoff_fixture(cx: &mut TestAppContext, open: &[&str]) -> Fixture {
     let f = fixture(cx);
     cx.update(|cx| {
         cx.global::<Catalog>().set_open(open);
@@ -873,26 +873,26 @@ fn tearoff_fixture(cx: &mut TestAppContext, open: &[&str]) -> Fixture {
     f
 }
 
-fn tabs_of(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) -> Vec<String> {
+pub(super) fn tabs_of(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) -> Vec<String> {
     read(cx, handle, |w, _| w.tabs.order().to_vec())
 }
 
-fn shown(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) -> String {
+pub(super) fn shown(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) -> String {
     read(cx, handle, |w, _| w.project.clone())
 }
 
-fn vcx(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) -> VisualTestContext {
+pub(super) fn vcx(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) -> VisualTestContext {
     VisualTestContext::from_window(*handle, cx)
 }
 
-fn bounds_in(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, selector: &'static str) -> Option<gpui::Bounds<Pixels>> {
+pub(super) fn bounds_in(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, selector: &'static str) -> Option<gpui::Bounds<Pixels>> {
     draw(cx, handle);
     vcx(cx, handle).debug_bounds(selector)
 }
 
 /// Press on `selector` in `handle` and drag past gpui's threshold: the drag
 /// begins. Where it began (the point its ghost is held by).
-fn press_and_start(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, selector: &'static str) -> Point<Pixels> {
+pub(super) fn press_and_start(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, selector: &'static str) -> Point<Pixels> {
     let start = bounds_in(cx, handle, selector).unwrap_or_else(|| panic!("{selector} is drawn")).center();
     let began = start + point(px(8.0), px(0.0));
     let mut v = vcx(cx, handle);
@@ -904,13 +904,13 @@ fn press_and_start(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, 
 
 /// Move the held pointer to window point `to` of `handle` (the drag's own
 /// window: it follows the drag past its edges).
-fn move_to(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, to: Point<Pixels>) {
+pub(super) fn move_to(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, to: Point<Pixels>) {
     vcx(cx, handle).simulate_mouse_move(to, Some(MouseButton::Left), Modifiers::none());
     cx.run_until_parked();
     draw(cx, handle);
 }
 
-fn release_at(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, at: Point<Pixels>) {
+pub(super) fn release_at(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, at: Point<Pixels>) {
     vcx(cx, handle).simulate_mouse_up(at, MouseButton::Left, Modifiers::none());
     cx.run_until_parked();
 }

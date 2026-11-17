@@ -17,6 +17,16 @@
 //! Dragging a tab moves it ([`ProjectTabs::move_to`]), or into another
 //! window ([`ProjectTabs::insert_at`] there); the order is saved the same
 //! way, so ⌘1 to ⌘9 and the next launch follow it.
+//!
+//! A window may also hold one New tab ([`NEW_TAB`], `new-tab-launch`): the
+//! `+` adds it, and it shows the launch screen until a project takes its
+//! place ([`ProjectTabs::replace`]). It is no project: the open set never
+//! drops it, it is left out of what is saved ([`ProjectTabs::projects`]), and
+//! nothing that closes projects counts it.
+
+/// The New tab's id among the projects': a `/` never appears in a project
+/// id (a file stem), so no project can be named this.
+pub const NEW_TAB: &str = "/new-tab";
 
 /// The tabs, in order. Project ids (`projects/<name>.yaml` stems, or a remote
 /// window's far project names).
@@ -43,6 +53,12 @@ impl ProjectTabs {
     /// The `n`th tab's project, counting from 1 (the ⌘N it answers to).
     pub fn nth(&self, n: usize) -> Option<&str> {
         n.checked_sub(1).and_then(|i| self.order.get(i)).map(String::as_str)
+    }
+
+    /// The tabs' projects, in order, without the New tab: what the window
+    /// saves, and what closing other projects counts.
+    pub fn projects(&self) -> Vec<String> {
+        self.order.iter().filter(|p| *p != NEW_TAB).cloned().collect()
     }
 
     pub fn contains(&self, project: &str) -> bool {
@@ -75,6 +91,21 @@ impl ProjectTabs {
         let before = self.order.len();
         self.order.retain(|p| p != project);
         self.order.len() != before
+    }
+
+    /// `old`'s tab becomes `new`'s, in its place: the New tab a project was
+    /// opened from. When `new` has a tab already, `old`'s just goes. Whether
+    /// the tabs changed.
+    pub fn replace(&mut self, old: &str, new: &str) -> bool {
+        let Some(at) = self.order.iter().position(|p| p == old) else {
+            return self.insert(new);
+        };
+        if new.is_empty() || self.contains(new) {
+            self.order.remove(at);
+        } else {
+            self.order[at] = new.to_string();
+        }
+        true
     }
 
     /// Move `project`'s tab to `index` in the order (past the end means
@@ -120,7 +151,7 @@ impl ProjectTabs {
     /// another window has one for it (`elsewhere`: a tab torn off into its
     /// own window, or moved to another, stays where it went), and
     /// `current` (the window's own project, `None` on the chooser) keeps or
-    /// gets one either way. With `open` unknown (`None`: a remote window,
+    /// gets one either way. The New tab is no project: it stays. With `open` unknown (`None`: a remote window,
     /// whose host's listing doesn't say what is open, or a catalog not yet
     /// read) nothing goes, and only `current` is added. Whether the tabs
     /// changed.
@@ -128,7 +159,7 @@ impl ProjectTabs {
         let before = self.order.clone();
         if let Some(open) = open {
             self.order
-                .retain(|p| current == Some(p.as_str()) || open.iter().any(|o| o == p));
+                .retain(|p| p == NEW_TAB || current == Some(p.as_str()) || open.iter().any(|o| o == p));
             for project in open.iter().filter(|p| !elsewhere.contains(p)) {
                 self.insert(project);
             }
@@ -273,6 +304,32 @@ mod tests {
         assert!(t.insert_at("site", 9), "past the end is last");
         assert!(!t.insert_at("web", 0), "it has one");
         assert_eq!(t.order(), ["web", "docs", "api", "site"]);
+    }
+
+    #[test]
+    fn the_new_tab_is_no_project() {
+        let mut t = tabs(&["web", NEW_TAB, "api"]);
+        assert_eq!(t.projects(), ["web", "api"], "left out of what is saved");
+        // The open set never names it, and it stays all the same.
+        assert!(!t.reconcile(Some(&open(&["api", "web"])), Some("web"), &[]));
+        assert_eq!(t.order(), ["web", NEW_TAB, "api"]);
+        assert!(t.reconcile(Some(&open(&[])), None, &[]));
+        assert_eq!(t.order(), [NEW_TAB]);
+    }
+
+    #[test]
+    fn a_project_takes_the_new_tabs_place() {
+        let mut t = tabs(&["web", NEW_TAB, "api"]);
+        assert!(t.replace(NEW_TAB, "docs"));
+        assert_eq!(t.order(), ["web", "docs", "api"], "in its place");
+        // A project with a tab already: the New tab just goes.
+        let mut t = tabs(&["web", NEW_TAB, "api"]);
+        assert!(t.replace(NEW_TAB, "api"));
+        assert_eq!(t.order(), ["web", "api"]);
+        // No New tab: the project goes at the end.
+        let mut t = tabs(&["web"]);
+        assert!(t.replace(NEW_TAB, "api"));
+        assert_eq!(t.order(), ["web", "api"]);
     }
 
     #[test]
