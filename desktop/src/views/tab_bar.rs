@@ -424,6 +424,9 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
             let (layout, name) = (props.layout.clone(), tab.name.clone());
             probe(move |b| layout.borrow_mut().set_width(&name, b.size.width.as_f32()))
         };
+        // The dragged tab gone from this bar: its slot isn't drawn, rule and
+        // all (the tabs after it close up over it).
+        let gone = look.lifted && props.slide.away;
         strip.push(
             div()
                 .relative()
@@ -431,14 +434,26 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
                 .flex()
                 .flex_row()
                 .min_w_0()
+                .when(gone, |d| d.opacity(0.0))
                 .child(render_tab(tab, look, props.tab_menu_anchor, props.layout, theme, cx))
                 .child(rule(theme))
                 .child(measure)
                 .into_any_element(),
         );
     }
-    strip.push(plus_tab(theme, cx).into_any_element());
-    strip.push(rule(theme).into_any_element());
+    // The `+` and its rule follow the tabs' end: in when a tab leaves, out
+    // when another window's tab opens a gap.
+    strip.push(
+        div()
+            .relative()
+            .left(px(props.slide.tail_offset()))
+            .flex()
+            .flex_row()
+            .flex_none()
+            .child(plus_tab(theme, cx))
+            .child(rule(theme))
+            .into_any_element(),
+    );
     // The bar's empty space past the `+`: the gap after the last tab, and,
     // with no drag, a press there moves the window.
     strip.push(

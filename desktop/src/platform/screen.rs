@@ -60,12 +60,23 @@ impl NativeWindow {
             .detach();
     }
 
-    /// Let the pointer through to whatever is under the window (the floating
-    /// ghost never takes a click), and draw no window shadow (the ghost
-    /// draws its own).
+    /// Make the window a bare overlay: borderless (gpui opens a window with
+    /// no titlebar as a titled one, whose chrome draws a line across its top
+    /// and which AppKit keeps below the menu bar), letting the pointer
+    /// through to whatever is under it (the floating ghost never takes a
+    /// click), and with no window shadow (the ghost draws its own).
     pub fn make_overlay(&self) {
         imp::make_overlay(&self.0);
     }
+}
+
+/// Screen point `at` (y down from the primary display's top) as AppKit's
+/// global point (y up from the primary display's bottom), the primary display
+/// `primary_h` tall. No display's edge clamps it: a point above the primary
+/// display (the menu bar's row, or a display arranged above it) is simply
+/// past its top.
+pub fn appkit_point(at: Point<f32>, primary_h: f64) -> (f64, f64) {
+    (f64::from(at.x), primary_h - f64::from(at.y))
 }
 
 /// Where tests' window moves went, as [`move_window`] recorded them.
@@ -97,6 +108,24 @@ pub fn move_window(window: &Window, at: Point<f32>, cx: &App) {
     } else {
         #[cfg(test)]
         test_log::push(at);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::point;
+
+    use super::appkit_point;
+
+    #[test]
+    fn screen_points_flip_into_appkit_space_unclamped() {
+        // A 1117pt primary display (its menu bar the top 33).
+        let h = 1117.0;
+        assert_eq!(appkit_point(point(100.0, 0.0), h), (100.0, 1117.0), "its top edge");
+        assert_eq!(appkit_point(point(100.0, 10.0), h), (100.0, 1107.0), "on the menu bar");
+        assert_eq!(appkit_point(point(100.0, -60.0), h), (100.0, 1177.0), "above it");
+        assert_eq!(appkit_point(point(-1500.0, 900.0), h), (-1500.0, 217.0), "a display to its left");
+        assert_eq!(appkit_point(point(2000.0, 1500.0), h), (2000.0, -383.0), "a display below it");
     }
 }
 
@@ -203,16 +232,24 @@ mod imp {
         let Some(primary_h) = primary_height() else {
             return;
         };
-        let top_left = NSPoint::new(at.x as f64, primary_h - at.y as f64);
+        let (x, y) = super::appkit_point(at, primary_h);
+        let top_left = NSPoint::new(x, y);
         // SAFETY: `setFrameTopLeftPoint:` on a retained NSWindow.
         unsafe {
             let _: () = msg_send![&**window, setFrameTopLeftPoint: top_left];
         }
     }
 
+    /// `NSWindowStyleMaskNonactivatingPanel`: the pop-up is a panel that
+    /// never takes focus, and keeps that. No other bit: borderless.
+    const NONACTIVATING_PANEL: usize = 1 << 7;
+
     pub fn make_overlay(window: &Handle) {
-        // SAFETY: plain NSWindow setters.
+        // SAFETY: plain NSWindow setters. Dropping the titled bit keeps the
+        // frame (the content already filled it: gpui opens it full-size
+        // content), so gpui's view gets no resize.
         unsafe {
+            let _: () = msg_send![&**window, setStyleMask: NONACTIVATING_PANEL];
             let _: () = msg_send![&**window, setIgnoresMouseEvents: Bool::YES];
             let _: () = msg_send![&**window, setHasShadow: Bool::NO];
         }

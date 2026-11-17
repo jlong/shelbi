@@ -1125,3 +1125,124 @@ fn esc_ends_a_tab_drag_where_it_began(cx: &mut TestAppContext) {
     assert_eq!(windows(cx).len(), 2);
     assert!(floats(cx).is_empty());
 }
+
+fn gap_open(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>) -> bool {
+    read(cx, handle, |w, _| w.tab_reorder.gap_open())
+}
+
+#[gpui::test]
+fn the_gap_follows_the_tab_between_windows_back_and_forth(cx: &mut TestAppContext) {
+    let f = tearoff_fixture(cx, &["alpha", "beta", "gamma"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(0.0, 0.0), &["alpha", "beta"]);
+    let b = open_at(cx, &f, "gamma", 1, frame(1000.0, 0.0), &["gamma"]);
+    let alpha = bounds_in(cx, a, "tab-alpha").unwrap();
+    let beta = bounds_in(cx, a, "tab-beta").unwrap();
+    let gamma = bounds_in(cx, b, "tab-gamma").unwrap();
+    let plus_b = bounds_in(cx, b, "tab-plus").unwrap();
+    press_and_start(cx, a, "tab-alpha");
+    // Window points of `a` (at the screen's origin): its own bar, b's bar
+    // before gamma, and torn off below both.
+    let home = point(beta.right() - px(5.0), beta.center().y);
+    let on_b = point(px(1000.0) + gamma.left() + px(10.0), gamma.center().y);
+    let away = point(px(450.0), px(600.0));
+    let only_a = |cx: &mut TestAppContext| (gap_open(cx, a), gap_open(cx, b)) == (true, false);
+    let only_b = |cx: &mut TestAppContext| (gap_open(cx, a), gap_open(cx, b)) == (false, true);
+
+    move_to(cx, a, home);
+    assert!(only_a(cx), "its own bar");
+    for round in 0..3 {
+        move_to(cx, a, on_b);
+        assert!(only_b(cx), "round {round}: a's closes as b's opens");
+        draw(cx, b);
+        assert!(bounds_in(cx, b, "tab-gamma").unwrap().left() > gamma.left(), "gamma steps aside");
+        assert!(bounds_in(cx, b, "tab-plus").unwrap().left() > plus_b.left(), "and so does the +");
+        // The tab gone from a's bar: beta closes up over its slot.
+        assert_eq!(bounds_in(cx, a, "tab-beta").unwrap().left(), alpha.left(), "round {round}");
+        move_to(cx, a, home);
+        assert!(only_a(cx), "round {round}: back home");
+        assert_eq!(bounds_in(cx, b, "tab-gamma").unwrap().left(), gamma.left(), "b's gap closed");
+        move_to(cx, a, away);
+        assert_eq!((gap_open(cx, a), gap_open(cx, b)), (false, false), "round {round}: torn off, none");
+        move_to(cx, a, on_b);
+        assert!(only_b(cx));
+        move_to(cx, a, away);
+        assert_eq!((gap_open(cx, a), gap_open(cx, b)), (false, false));
+    }
+    // Straight from b's bar to a's in one move, and back.
+    move_to(cx, a, on_b);
+    move_to(cx, a, home);
+    assert!(only_a(cx));
+    move_to(cx, a, on_b);
+    assert!(only_b(cx));
+    // Dropped: it lands in the gap that showed, before gamma.
+    let gap = cx.update(|cx| tab_tearoff::session(cx).and_then(|s| s.gap));
+    assert_eq!(gap, Some(0));
+    release_at(cx, a, on_b);
+    draw(cx, b);
+    assert_eq!(tabs_of(cx, b), ["alpha", "gamma"]);
+    assert_eq!(tabs_of(cx, a), ["beta"]);
+    assert!(!gap_open(cx, a) && !gap_open(cx, b), "the drag is over");
+}
+
+#[gpui::test]
+fn a_tab_dropped_past_another_bars_last_tab_lands_in_the_gap_at_the_end(cx: &mut TestAppContext) {
+    let f = tearoff_fixture(cx, &["alpha", "beta", "gamma"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(0.0, 0.0), &["alpha", "beta"]);
+    let b = open_at(cx, &f, "gamma", 1, frame(1000.0, 0.0), &["gamma"]);
+    let plus = bounds_in(cx, b, "tab-plus").unwrap();
+    press_and_start(cx, a, "tab-alpha");
+    // Over b's `+`: the gap at the end shows (the + steps aside), and the
+    // drop lands there.
+    let to = point(px(1000.0) + plus.center().x, plus.center().y);
+    move_to(cx, a, to);
+    assert!(gap_open(cx, b));
+    assert_eq!(cx.update(|cx| tab_tearoff::session(cx).and_then(|s| s.gap)), Some(1));
+    assert!(bounds_in(cx, b, "tab-plus").unwrap().left() > plus.left());
+    release_at(cx, a, to);
+    assert_eq!(tabs_of(cx, b), ["gamma", "alpha"]);
+}
+
+#[gpui::test]
+fn over_overlapping_windows_the_front_ones_bar_takes_the_gap(cx: &mut TestAppContext) {
+    let f = tearoff_fixture(cx, &["alpha", "beta", "gamma"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(0.0, 0.0), &["alpha", "beta"]);
+    // b over a's lower part, in front.
+    let b = open_at(cx, &f, "gamma", 1, frame(300.0, 200.0), &["gamma"]);
+    update(cx, b, |_, window, _| window.activate_window());
+    let gamma = bounds_in(cx, b, "tab-gamma").unwrap();
+    press_and_start(cx, a, "tab-alpha");
+    // On b's bar, inside a too and within 200 of a's bar: b's, in front.
+    let on_b = point(px(300.0) + gamma.left() + px(10.0), px(200.0) + gamma.center().y);
+    let on_a = point(px(150.0), px(26.0));
+    for _ in 0..2 {
+        move_to(cx, a, on_b);
+        assert_eq!(over(cx), Some(Some(b.window_id())));
+        assert_eq!((gap_open(cx, a), gap_open(cx, b)), (false, true));
+        move_to(cx, a, on_a);
+        assert_eq!(over(cx), Some(Some(a.window_id())));
+        assert_eq!((gap_open(cx, a), gap_open(cx, b)), (true, false));
+    }
+    release_at(cx, a, on_a);
+}
+
+#[gpui::test]
+fn a_bar_left_hosting_by_a_missed_move_closes_its_gap_on_its_next_frame(cx: &mut TestAppContext) {
+    let f = tearoff_fixture(cx, &["alpha", "beta", "gamma"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(0.0, 0.0), &["alpha", "beta"]);
+    let b = open_at(cx, &f, "gamma", 1, frame(1000.0, 0.0), &["gamma"]);
+    let gamma = bounds_in(cx, b, "tab-gamma").unwrap();
+    press_and_start(cx, a, "tab-alpha");
+    move_to(cx, a, point(px(1000.0) + gamma.left() + px(10.0), gamma.center().y));
+    assert!(gap_open(cx, b));
+    // The session moves on without telling b (as a move that never reached
+    // it would): b's next frame follows the session anyway.
+    cx.update(|cx| {
+        if let Some(s) = tab_tearoff::session_mut(cx) {
+            s.over = None;
+            s.gap = None;
+        }
+    });
+    draw(cx, b);
+    assert!(!gap_open(cx, b));
+    release_at(cx, a, point(px(450.0), px(600.0)));
+}

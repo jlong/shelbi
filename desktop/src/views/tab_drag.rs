@@ -23,6 +23,12 @@
 //!   dropped tab settles from under the ghost into its slot; after a cancel
 //!   they slide back. Under Reduce Motion every tab is placed at its target
 //!   at once: the slot still opens, the tabs just reflow.
+//! - Across windows (`tab-tearoff`) a bar doesn't keep its own idea of the
+//!   drag: it follows the app's drag session ([`BarRole`],
+//!   [`TabReorder::follow`]). The bar the tab is over shows the gap; the
+//!   bar the tab came from closes its slot while the tab is elsewhere
+//!   (`away`); every other bar shows none. The `+` after the tabs slides
+//!   with them ([`TabFrame::tail_offset`]), so a gap at the end opens too.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -33,6 +39,28 @@ use gpui::WeakEntity;
 
 use super::tab_bar::TabGhost;
 use crate::project_tabs::ProjectTabs;
+
+/// The `+` and the rule after it, sliding with the tabs: its key among the
+/// slides (no project is named with a NUL).
+const TAIL: &str = "\0tail";
+
+/// What a tab drag asks of one window's bar (`tab-tearoff`). The app's drag
+/// session decides for every bar at once, so no bar can be left showing a
+/// gap the tab has moved on from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BarRole {
+    /// No drag over this bar: a gap another window's drag opened here
+    /// closes. (This bar's own drag, if any, is left alone: it ends with its
+    /// drop or cancel.)
+    Idle,
+    /// The drag is of this bar's own tab. `home`: the tab is over this bar,
+    /// over gap `gap`; away from it (over another bar, or torn off) its slot
+    /// closes, the tabs after it sliding in.
+    Own { home: bool, gap: Option<usize> },
+    /// Another window's tab is over this bar, over gap `gap`: the bar opens
+    /// a slot `slot_w` wide there (the tab pressed `grab_x` into it).
+    Host { project: String, slot_w: f32, grab_x: f32, gap: Option<usize> },
+}
 
 /// How long a tab takes to slide to a new place.
 pub const TAB_SLIDE: Duration = Duration::from_millis(150);
@@ -153,6 +181,9 @@ pub struct TabFrame {
     offsets: HashMap<String, f32>,
     /// The tab being dragged: its slot is drawn empty.
     pub lifted: Option<String>,
+    /// The dragged tab is away from this bar (over another, or torn off):
+    /// its slot isn't drawn at all, rule and all.
+    pub away: bool,
     /// A tab is still sliding: draw another frame.
     pub animating: bool,
 }
@@ -161,6 +192,13 @@ impl TabFrame {
     /// How far right of its resting place `project`'s tab draws.
     pub fn offset(&self, project: &str) -> f32 {
         self.offsets.get(project).copied().unwrap_or(0.0)
+    }
+
+    /// How far right of its resting place the `+` (and the rule after it)
+    /// draws: left by the slot of a tab gone from the bar, right by the gap
+    /// another window's tab opens.
+    pub fn tail_offset(&self) -> f32 {
+        self.offset(TAIL)
     }
 }
 
@@ -184,6 +222,9 @@ pub struct TabReorder {
     /// That tab, when this bar has none for its project: the project and its
     /// slot's width (the gap's).
     incoming: Option<(String, f32)>,
+    /// This bar's dragged tab is over another bar, or torn off: its slot
+    /// closes.
+    away: bool,
 }
 
 impl TabReorder {
@@ -194,6 +235,7 @@ impl TabReorder {
         self.settle = None;
         self.hosting = false;
         self.incoming = None;
+        self.away = false;
     }
 
     /// Another window's drag of `project`'s tab (its slot `slot_w` wide,
@@ -228,6 +270,53 @@ impl TabReorder {
         self.slot = None;
         self.hosting = false;
         self.incoming = None;
+        self.away = false;
+    }
+
+    /// The project another window's drag is over this bar with.
+    fn hosted(&self) -> Option<&str> {
+        if !self.hosting {
+            return None;
+        }
+        self.incoming.as_ref().map(|(p, _)| p.as_str()).or(self.project.as_deref())
+    }
+
+    /// What this bar shows, to tell whether following the session changed it.
+    fn shown(&self) -> (Option<String>, Option<usize>, Option<String>, bool) {
+        (self.project.clone(), self.slot, self.hosted().map(str::to_string), self.away)
+    }
+
+    /// Show what the drag session asks of this bar (`role`). Whether that
+    /// changed what it shows.
+    pub fn follow(&mut self, tabs: &ProjectTabs, role: BarRole) -> bool {
+        let before = self.shown();
+        match role {
+            BarRole::Idle => self.unhost(),
+            BarRole::Own { home, gap } => {
+                if self.hosting {
+                    // Never both: hosting is another window's drag.
+                    self.cancel();
+                }
+                if self.project.is_some() {
+                    self.away = !home;
+                    self.over(if home { gap } else { None });
+                }
+            }
+            BarRole::Host { project, slot_w, grab_x, gap } => {
+                if self.hosted() != Some(project.as_str()) {
+                    self.host(tabs, &project, slot_w, grab_x);
+                }
+                self.over(gap);
+            }
+        }
+        self.shown() != before
+    }
+
+    /// The bar shows a drop gap: another window's tab is over it, or its own
+    /// dragged tab is (its slot open, wherever it is).
+    #[cfg(test)]
+    pub fn gap_open(&self) -> bool {
+        self.hosting || (self.project.is_some() && !self.away)
     }
 
     /// Another window's tab dropped here, with the pointer at window x
@@ -311,7 +400,15 @@ impl TabReorder {
         let layout = self.layout.borrow();
         let rest: HashMap<&str, f32> = layout.lefts(order.iter().copied()).into_iter().collect();
         let lifted = order.iter().copied().find(|p| dragged.as_deref() == Some(*p));
+        let away = lifted.is_some() && self.away;
         let target_order: Vec<&str> = match (lifted, self.landing(tabs).filter(|_| lifted.is_some())) {
+            // Gone from the bar: the others close up, its slot (undrawn)
+            // past them.
+            (Some(project), _) if away => {
+                let mut moved: Vec<&str> = order.iter().copied().filter(|p| *p != project).collect();
+                moved.push(project);
+                moved
+            }
             (Some(project), Some(to)) => {
                 let mut moved: Vec<&str> = order.iter().copied().filter(|p| *p != project).collect();
                 moved.insert(to.min(moved.len()), project);
@@ -339,13 +436,25 @@ impl TabReorder {
             }
             _ => layout.lefts(target_order).into_iter().collect(),
         };
+        // The `+` rests past every slot; it follows the tabs' end.
+        let total: f32 = order.iter().map(|p| layout.width(p)).sum();
+        let tail = match (lifted, incoming, self.slot) {
+            (Some(project), _, _) if away => total - layout.width(project),
+            (_, Some(width), Some(_)) => total + width,
+            _ => total,
+        };
         drop(layout);
 
-        self.slides.retain(|p, _| rest.contains_key(p.as_str()));
+        self.slides.retain(|p, _| p == TAIL || rest.contains_key(p.as_str()));
         let mut frame = TabFrame {
             lifted: dragged,
+            away,
             ..TabFrame::default()
         };
+        let slide = retarget(&mut self.slides, TAIL, total, tail, now, reduce_motion);
+        frame.animating |= !slide.done(now);
+        let x = if slide.done(now) { slide.to } else { slide.at(now) };
+        frame.offsets.insert(TAIL.to_string(), x - total);
         for project in &order {
             let target = targets[project];
             let slide = match settle.as_ref().filter(|(p, _)| p == project) {
@@ -354,7 +463,7 @@ impl TabReorder {
                     self.slides.insert(project.to_string(), slide);
                     slide
                 }
-                _ => retarget(&mut self.slides, project, target, now, reduce_motion),
+                _ => retarget(&mut self.slides, project, rest[project], target, now, reduce_motion),
             };
             frame.animating |= !slide.done(now);
             let x = if slide.done(now) { slide.to } else { slide.at(now) };
@@ -368,17 +477,25 @@ impl TabReorder {
 }
 
 /// Point `project`'s slide at `target`: unchanged if it is headed there,
-/// otherwise from where it is drawn now (placed there at once under
-/// `reduce_motion`, or when it had no slide yet).
-fn retarget(slides: &mut HashMap<String, Slide>, project: &str, target: f32, now: Instant, reduce_motion: bool) -> Slide {
+/// otherwise from where it is drawn now, or from where it rests (`rest`)
+/// when it had no slide yet (placed there at once under `reduce_motion`).
+fn retarget(
+    slides: &mut HashMap<String, Slide>,
+    project: &str,
+    rest: f32,
+    target: f32,
+    now: Instant,
+    reduce_motion: bool,
+) -> Slide {
     let slide = match slides.get(project) {
         Some(s) if (s.to - target).abs() < 0.01 => *s,
-        Some(s) if !reduce_motion => Slide {
+        _ if reduce_motion => Slide { from: target, to: target, start: now },
+        Some(s) => Slide {
             from: if s.done(now) { s.to } else { s.at(now) },
             to: target,
             start: now,
         },
-        _ => Slide { from: target, to: target, start: now },
+        None => Slide { from: rest, to: target, start: now },
     };
     slides.insert(project.to_string(), slide);
     slide
@@ -564,6 +681,97 @@ mod tests {
         assert_eq!(r.landing(&t), None);
         assert!(!r.drop(&mut t, 0.0));
         assert_eq!(t.order(), ["web", "api", "docs"]);
+    }
+
+    fn host(project: &str, gap: Option<usize>) -> BarRole {
+        BarRole::Host { project: project.into(), slot_w: 80.0, grab_x: 10.0, gap }
+    }
+
+    #[test]
+    fn away_from_its_bar_the_dragged_tabs_slot_closes_and_the_plus_follows() {
+        let (mut r, t) = reorder();
+        let t0 = Instant::now();
+        r.start("web");
+        assert!(r.follow(&t, BarRole::Own { home: true, gap: Some(3) }));
+        let f = r.frame(&t, true, t0, true);
+        assert!(r.gap_open());
+        assert!(!f.away);
+        assert_eq!(offsets(&f), [200.0, -100.0, -100.0], "its slot at the end");
+        assert_eq!(f.tail_offset(), 0.0);
+        // Over another bar: api and docs close up over web's slot, the `+`
+        // with them; web's slot (undrawn) goes past them.
+        assert!(r.follow(&t, BarRole::Own { home: false, gap: None }));
+        assert!(!r.gap_open());
+        let f = r.frame(&t, true, t0, true);
+        assert!(f.away);
+        assert_eq!(f.lifted.as_deref(), Some("web"));
+        assert_eq!(offsets(&f), [200.0, -100.0, -100.0]);
+        assert_eq!(f.tail_offset(), -100.0, "the + closes web's slot");
+        assert!(!r.follow(&t, BarRole::Own { home: false, gap: None }), "no change");
+        // Home again, over the start: the gap opens there.
+        assert!(r.follow(&t, BarRole::Own { home: true, gap: Some(0) }));
+        assert!(r.gap_open());
+        let f = r.frame(&t, true, t0, true);
+        assert!(!f.away);
+        assert_eq!(offsets(&f), [0.0; 3]);
+        assert_eq!(f.tail_offset(), 0.0);
+    }
+
+    #[test]
+    fn a_hosted_gap_opens_closes_and_opens_at_the_end_too() {
+        let (mut r, t) = reorder();
+        let t0 = Instant::now();
+        assert!(!r.follow(&t, BarRole::Idle), "nothing to close");
+        assert!(r.follow(&t, host("ops", Some(1))));
+        assert!(r.gap_open());
+        let f = r.frame(&t, true, t0, true);
+        assert_eq!(offsets(&f), [0.0, 80.0, 80.0], "api and docs step right");
+        assert_eq!(f.tail_offset(), 80.0, "so does the +");
+        // Past the last tab: the gap at the end, the + stepping aside.
+        assert!(r.follow(&t, host("ops", Some(3))));
+        let f = r.frame(&t, true, t0, true);
+        assert_eq!(offsets(&f), [0.0; 3]);
+        assert_eq!(f.tail_offset(), 80.0, "the gap at the end shows");
+        // The tab moved on: the gap closes and everything slides home.
+        assert!(r.follow(&t, BarRole::Idle));
+        assert!(!r.gap_open());
+        let f = r.frame(&t, false, t0, true);
+        assert_eq!(offsets(&f), [0.0; 3]);
+        assert_eq!(f.tail_offset(), 0.0);
+        // And back, as often as it goes back and forth.
+        for _ in 0..3 {
+            assert!(r.follow(&t, host("ops", Some(0))));
+            assert_eq!(offsets(&r.frame(&t, true, t0, true)), [80.0; 3]);
+            assert!(r.follow(&t, BarRole::Idle));
+            assert_eq!(offsets(&r.frame(&t, false, t0, true)), [0.0; 3]);
+        }
+    }
+
+    #[test]
+    fn a_hosted_drop_lands_in_the_gap_it_showed() {
+        let (mut r, mut t) = reorder();
+        r.follow(&t, host("ops", Some(2)));
+        assert!(r.accept(&mut t, 0.0));
+        assert_eq!(t.order(), ["web", "api", "ops", "docs"]);
+        assert!(!r.hosting());
+        // Over the `+` the session asks for the end: it lands there.
+        let (mut r, mut t) = reorder();
+        r.follow(&t, host("ops", Some(3)));
+        assert!(r.accept(&mut t, 0.0));
+        assert_eq!(t.order(), ["web", "api", "docs", "ops"]);
+    }
+
+    #[test]
+    fn a_hosted_gap_slides_open_from_where_the_tabs_rest() {
+        let (mut r, t) = reorder();
+        let t0 = Instant::now();
+        r.follow(&t, host("ops", Some(0)));
+        let f = r.frame(&t, true, t0, false);
+        assert_eq!(offsets(&f), [0.0; 3], "no jump on entry");
+        assert!(f.animating);
+        let f = r.frame(&t, true, t0 + TAB_SLIDE, false);
+        assert_eq!(offsets(&f), [80.0; 3]);
+        assert_eq!(f.tail_offset(), 80.0);
     }
 
     #[test]

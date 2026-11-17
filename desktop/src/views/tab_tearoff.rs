@@ -26,7 +26,16 @@
 //!
 //! A window's ghost can't leave the window, so while the tab isn't over its
 //! own bar the ghost is drawn in a small transparent pop-up window that
-//! follows the pointer ([`FloatingGhost`]), above every window.
+//! follows the pointer ([`FloatingGhost`]), above every window. That window
+//! is borderless ([`crate::platform::screen::NativeWindow::make_overlay`]):
+//! no window chrome draws around the ghost, and no display edge or menu bar
+//! holds it back from the pointer ([`float_origin`]).
+//!
+//! The session is the one place the drop gap lives: which bar the tab is
+//! over and the gap there ([`DragState::over`], [`DragState::gap`]). Each
+//! window's bar follows it ([`BarRole`]), on every move and every frame, so
+//! exactly one bar shows a gap (none while torn off), however the tab goes
+//! back and forth.
 //!
 //! The drag's state is the app's, not a window's ([`TabDragSession`]): both
 //! ghosts read it, and the bar under the tab is another window's.
@@ -41,6 +50,7 @@ use gpui::{
 use shelbi_app::overlay::palette::ProjectIndicator;
 
 use super::project_menu;
+use super::tab_drag::BarRole;
 use crate::platform::screen::NativeWindow;
 use crate::theme::motion;
 use crate::theme::style::{self, Type, Typography};
@@ -184,6 +194,9 @@ pub struct DragState {
     /// pointer's x in that window.
     pub over: Option<WindowId>,
     pub over_x: f32,
+    /// The drop gap in that bar (`None`: over none). The one gap any bar
+    /// shows ([`Self::role`]), and the one a drop lands in.
+    pub gap: Option<usize>,
     /// The tab ↔ card turn.
     pub morph: Morph,
     pub reduce_motion: bool,
@@ -217,6 +230,7 @@ impl DragState {
             tearable: true,
             over: Some(source),
             over_x: 0.0,
+            gap: None,
             morph: Morph::default(),
             reduce_motion: false,
             pointer: Point::default(),
@@ -230,6 +244,20 @@ impl DragState {
     /// whenever the tab isn't over its own bar.
     pub fn floats(&self) -> bool {
         self.over != Some(self.source)
+    }
+
+    /// What the drag asks of `window`'s bar: the source's tab is home over
+    /// its own bar or away from it, the bar the tab is over opens the gap,
+    /// every other bar shows none.
+    pub fn role(&self, window: WindowId) -> BarRole {
+        let over = self.over == Some(window);
+        if window == self.source {
+            BarRole::Own { home: over, gap: self.gap.filter(|_| over) }
+        } else if over {
+            BarRole::Host { project: self.project.clone(), slot_w: self.slot_w, grab_x: self.grab.x, gap: self.gap }
+        } else {
+            BarRole::Idle
+        }
     }
 
     /// Where the pointer holds the ghost at `now`: from its top-left, the
@@ -249,6 +277,14 @@ impl Global for TabDragSession {}
 /// The drag in flight, if any.
 pub fn session(cx: &App) -> Option<&DragState> {
     cx.try_global::<TabDragSession>().and_then(|s| s.0.as_ref())
+}
+
+/// What the drag in flight asks of `window`'s bar ([`DragState::role`]);
+/// with none (or gpui's drag over without a drop this window heard), none.
+pub fn role(window: WindowId, cx: &App) -> BarRole {
+    session(cx)
+        .filter(|_| cx.has_active_drag())
+        .map_or(BarRole::Idle, |s| s.role(window))
 }
 
 /// The drag in flight, to change.
@@ -293,6 +329,14 @@ fn float_anchor() -> Point<f32> {
     point(TAB_MAX_W + FLOAT_PAD, TAB_H + FLOAT_PAD)
 }
 
+/// Where the floating ghost window's top-left goes, in screen space, for the
+/// pointer at `pointer`: always the pointer less [`float_anchor`], with no
+/// display edge or menu bar clamping it, so the ghost stays under the
+/// pointer anywhere on any display.
+pub fn float_origin(pointer: Point<f32>) -> Point<f32> {
+    pointer - float_anchor()
+}
+
 /// The floating ghost window's size: the ghost held at [`float_anchor`]
 /// fits, whichever way it is held, with room for its shadow.
 fn float_size() -> gpui::Size<Pixels> {
@@ -310,7 +354,7 @@ pub fn sync_float(display: Option<gpui::DisplayId>, cx: &mut App) {
     if !state.floats() && state.float.is_none() {
         return;
     }
-    let at = state.pointer - float_anchor();
+    let at = float_origin(state.pointer);
     let (float, native, opening, source, pointer) =
         (state.float, state.float_native.clone(), state.float_opening, state.source, state.pointer);
     if let Some(native) = native {
@@ -367,16 +411,23 @@ pub fn sync_float(display: Option<gpui::DisplayId>, cx: &mut App) {
         if let Some(native) = &native {
             native.make_overlay();
         }
-        match session_mut(cx).filter(|s| s.source == source) {
+        let pointer = match session_mut(cx).filter(|s| s.source == source) {
             Some(state) => {
                 state.float = Some(handle);
-                state.float_native = native;
+                state.float_native = native.clone();
                 state.float_opening = false;
+                state.pointer
             }
             // The drag ended while it opened.
             None => {
                 let _ = handle.update(cx, |_, window, _| window.remove_window());
+                return;
             }
+        };
+        // Where the pointer is now: opened titled, AppKit may have kept it
+        // below the menu bar.
+        if let Some(native) = native {
+            native.place_later(float_origin(pointer), cx);
         }
     });
 }
@@ -540,6 +591,107 @@ mod tests {
         m.head(1.0, t0, true);
         assert_eq!(m.at(t0), 1.0);
         assert!(!m.animating(t0));
+    }
+
+    /// Which bars show a gap for the drag in `s`, of windows 1..=3.
+    fn gaps(s: &DragState) -> Vec<u64> {
+        (1..=3u64)
+            .filter(|w| match s.role(WindowId::from(*w)) {
+                BarRole::Own { home, .. } => home,
+                BarRole::Host { .. } => true,
+                BarRole::Idle => false,
+            })
+            .collect()
+    }
+
+    /// Move the drag in `s` to `pointer` over `bars`, as the source does.
+    fn move_drag(s: &mut DragState, pointer: Point<f32>, bars: &[BarSpot<WindowId>]) {
+        s.over = target(pointer, bars);
+        s.gap = s.over.map(|_| 0);
+    }
+
+    fn ids(bars: Vec<BarSpot<u8>>) -> Vec<BarSpot<WindowId>> {
+        bars.into_iter()
+            .map(|b| BarSpot { window: WindowId::from(u64::from(b.window)), frame: b.frame, bar: b.bar })
+            .collect()
+    }
+
+    #[test]
+    fn exactly_one_bar_shows_the_gap_as_the_tab_goes_back_and_forth() {
+        let bars = ids(two());
+        let mut s = DragState::new(WindowId::from(1u64), "web".into(), "web".into(), false);
+        let (on_a, on_b, off) = (point(500.0, 20.0), point(1500.0, 20.0), point(500.0, 600.0));
+        move_drag(&mut s, on_a, &bars);
+        assert_eq!(gaps(&s), [1], "its own bar");
+        for _ in 0..3 {
+            move_drag(&mut s, on_b, &bars);
+            assert_eq!(gaps(&s), [2], "A's closes as B's opens");
+            assert_eq!(s.role(WindowId::from(1u64)), BarRole::Own { home: false, gap: None });
+            move_drag(&mut s, on_a, &bars);
+            assert_eq!(gaps(&s), [1], "and back");
+            move_drag(&mut s, off, &bars);
+            assert!(gaps(&s).is_empty(), "torn off: none");
+            move_drag(&mut s, on_b, &bars);
+            assert_eq!(gaps(&s), [2]);
+            move_drag(&mut s, off, &bars);
+            assert!(gaps(&s).is_empty());
+        }
+        // In one move from B's bar straight to A's.
+        move_drag(&mut s, on_b, &bars);
+        move_drag(&mut s, on_a, &bars);
+        assert_eq!(gaps(&s), [1]);
+    }
+
+    #[test]
+    fn over_overlapping_windows_the_front_bar_shows_the_gap() {
+        // Window 3 in front of window 1's lower part.
+        let mut raw = two();
+        raw.insert(0, BarSpot { window: 3, frame: b(100.0, 100.0, 600.0, 600.0), bar: b(100.0, 100.0, 600.0, 52.0) });
+        let bars = ids(raw);
+        let mut s = DragState::new(WindowId::from(1u64), "web".into(), "web".into(), false);
+        move_drag(&mut s, point(400.0, 120.0), &bars);
+        assert_eq!(gaps(&s), [3]);
+        // Up onto window 1's bar, above window 3.
+        move_drag(&mut s, point(400.0, 30.0), &bars);
+        assert_eq!(gaps(&s), [1]);
+        move_drag(&mut s, point(400.0, 120.0), &bars);
+        assert_eq!(gaps(&s), [3]);
+        move_drag(&mut s, point(1500.0, 20.0), &bars);
+        assert_eq!(gaps(&s), [2]);
+    }
+
+    #[test]
+    fn a_hosting_bar_gets_the_tab_and_the_sessions_gap() {
+        let mut s = DragState::new(WindowId::from(1u64), "web".into(), "web".into(), false);
+        s.slot_w = 120.0;
+        s.grab = point(30.0, 20.0);
+        s.over = Some(WindowId::from(2u64));
+        s.gap = Some(2);
+        assert_eq!(
+            s.role(WindowId::from(2u64)),
+            BarRole::Host { project: "web".into(), slot_w: 120.0, grab_x: 30.0, gap: Some(2) }
+        );
+        assert_eq!(s.role(WindowId::from(3u64)), BarRole::Idle);
+    }
+
+    #[test]
+    fn the_floating_ghost_follows_the_pointer_unclamped() {
+        let anchor = float_anchor();
+        for p in [
+            point(500.0, 400.0),
+            // On the menu bar, at the very top, and above the primary
+            // display (a display arranged over it).
+            point(500.0, 10.0),
+            point(0.0, 0.0),
+            point(300.0, -400.0),
+            // A display left of the primary, and far right.
+            point(-1200.0, 300.0),
+            point(5000.0, 1400.0),
+        ] {
+            let at = float_origin(p);
+            assert_eq!(at + anchor, p, "the pointer is always at the anchor: {p:?}");
+        }
+        assert!(float_origin(point(500.0, 10.0)).y < 0.0, "past the screen's top, not held below the menu bar");
     }
 
     #[test]
