@@ -6948,6 +6948,11 @@ impl ShelbiWindow {
         // drag from any other), then the settle after it.
         // Another window's tab over this bar opens its gap too
         // (`tab-tearoff`).
+        // Every frame the bar follows the app's drag session (a move that
+        // missed this window, or a drag gpui ended unheard, can't leave a gap
+        // open here).
+        let me = window.window_handle().window_id();
+        self.tab_reorder.follow(&self.tabs, crate::views::tab_tearoff::role(me, cx));
         let tab_drag_active =
             (cx.has_active_drag() && self.tab_reorder.ghost_alive()) || self.tab_reorder.hosting();
         let tab_slide = self.tab_reorder.frame(&self.tabs, tab_drag_active, now, reduce_motion);

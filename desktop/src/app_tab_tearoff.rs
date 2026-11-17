@@ -24,6 +24,7 @@ use gpui::{point, px, App, Bounds, Context, Point, Window, WindowHandle, WindowI
 
 use super::*;
 use crate::platform::screen;
+use crate::views::tab_drag::BarRole;
 use crate::views::tab_tearoff::{self, BarSpot, DragState};
 
 /// The Shelbi windows front to back: the platform's stack where it keeps
@@ -50,17 +51,6 @@ fn windows_front_to_back(cx: &App) -> Vec<WindowHandle<ShelbiWindow>> {
 
 fn find_window(id: WindowId, cx: &App) -> Option<WindowHandle<ShelbiWindow>> {
     shelbi_windows(cx).into_iter().find(|h| h.window_id() == id)
-}
-
-/// Run `f` on the Shelbi window `id`, if it is still open.
-fn with_window(
-    id: WindowId,
-    cx: &mut App,
-    f: impl FnOnce(&mut ShelbiWindow, &mut Window, &mut Context<ShelbiWindow>),
-) {
-    if let Some(handle) = find_window(id, cx) {
-        let _ = handle.update(cx, f);
-    }
 }
 
 /// `b` (window-local) moved into screen space by its window's `frame`.
@@ -139,16 +129,17 @@ impl ShelbiWindow {
         bars
     }
 
-    /// This window's tab drag moved: find the bar it is over, open that
-    /// bar's gap (closing the last one's), turn the ghost into the card or
-    /// back, and keep the floating ghost under the pointer.
+    /// This window's tab drag moved: find the bar it is over and the gap
+    /// there, put them in the drag session, have every bar follow it (the
+    /// one the tab is over opens its gap, every other closes its own), turn
+    /// the ghost into the card or back, and keep the floating ghost under
+    /// the pointer.
     pub(super) fn tab_drag_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let me = window.window_handle().window_id();
         let Some(state) = tab_tearoff::session(cx).filter(|s| s.source == me) else {
             return;
         };
-        let (project, slot_w, grab_x, tearable, was_over) =
-            (state.project.clone(), state.slot_w, state.grab.x, state.tearable, state.over);
+        let tearable = state.tearable;
         let now = (self.clock)();
         let frame = screen::content_frame(window);
         let local = window.mouse_position();
@@ -161,48 +152,42 @@ impl ShelbiWindow {
         let over_x = bars
             .iter()
             .find(|b| Some(b.window) == over)
-            .map_or(0.0, |b| pointer.x - b.frame.origin.x);
+            .map_or(local.x.as_f32(), |b| pointer.x - b.frame.origin.x);
+        let gap = match over {
+            Some(w) if w == me => (target == Some(me))
+                .then(|| {
+                    self.tab_reorder
+                        .layout
+                        .borrow()
+                        .gap_at(self.tabs.order(), local.x.as_f32(), tab_bar::PLUS_SLOT_W)
+                })
+                .flatten(),
+            // Another window's bar: over its `+`, the gap at the end (where
+            // a drop there lands).
+            Some(other) => find_window(other, cx).and_then(|h| {
+                h.read_with(cx, |w, _| {
+                    let order = w.tabs.order();
+                    w.tab_reorder
+                        .layout
+                        .borrow()
+                        .gap_at(order, over_x, tab_bar::PLUS_SLOT_W)
+                        .unwrap_or(order.len())
+                })
+                .ok()
+            }),
+            None => None,
+        };
         if let Some(state) = tab_tearoff::session_mut(cx) {
             state.pointer = pointer;
             state.over = over;
             state.over_x = over_x;
+            state.gap = gap;
             let card = if over.is_none() { 1.0 } else { 0.0 };
             let reduce_motion = state.reduce_motion;
             state.morph.head(card, now, reduce_motion);
         }
-
-        if was_over != over {
-            if let Some(left) = was_over.filter(|w| *w != me) {
-                with_window(left, cx, |w, _, cx| {
-                    w.tab_reorder.unhost();
-                    cx.notify();
-                });
-            }
-        }
-        if let Some(other) = over.filter(|w| *w != me) {
-            let entered = was_over != over;
-            with_window(other, cx, |w, _, cx| {
-                if entered {
-                    w.tab_reorder.host(&w.tabs, &project, slot_w, grab_x);
-                }
-                let gap = w
-                    .tab_reorder
-                    .layout
-                    .borrow()
-                    .gap_at(w.tabs.order(), over_x, tab_bar::PLUS_SLOT_W);
-                w.tab_reorder.over(gap);
-                cx.notify();
-            });
-        }
-        let gap = (target == Some(me))
-            .then(|| {
-                self.tab_reorder
-                    .layout
-                    .borrow()
-                    .gap_at(self.tabs.order(), local.x.as_f32(), tab_bar::PLUS_SLOT_W)
-            })
-            .flatten();
-        self.tab_reorder.over(gap);
+        self.tab_reorder.follow(&self.tabs, tab_tearoff::role(me, cx));
+        follow_tab_drag(Some(me), cx);
         let display = window.display(cx).map(|d| d.id());
         tab_tearoff::sync_float(display, cx);
         cx.notify();
@@ -225,8 +210,13 @@ impl ShelbiWindow {
             }
             (Some(to), Some(state)) => {
                 self.tab_reorder.cancel();
-                let (project, x) = (state.project.clone(), state.over_x);
-                cx.defer(move |cx| move_tab(project, me, to, x, cx));
+                // It lands in the gap the session showed there.
+                let landing = Landing {
+                    project: state.project.clone(),
+                    role: state.role(to),
+                    x: state.over_x,
+                };
+                cx.defer(move |cx| move_tab(landing, me, to, cx));
             }
             (None, Some(state)) if self.tabs.order().len() > 1 => {
                 self.tab_reorder.cancel();
@@ -250,6 +240,9 @@ impl ShelbiWindow {
         if let Some(state) = state {
             tab_tearoff::close_float(state, cx);
         }
+        // The drag is over: no other bar shows a gap (the one taking the tab
+        // opens it again as it lands).
+        follow_tab_drag(Some(me), cx);
         cx.notify();
     }
 
@@ -262,14 +255,9 @@ impl ShelbiWindow {
             return false;
         }
         if let Some(state) = tab_tearoff::end(cx) {
-            if let Some(other) = state.over.filter(|w| *w != me) {
-                with_window(other, cx, |w, _, cx| {
-                    w.tab_reorder.unhost();
-                    cx.notify();
-                });
-            }
             tab_tearoff::close_float(state, cx);
         }
+        follow_tab_drag(Some(me), cx);
         self.tab_reorder.cancel();
         cx.stop_active_drag(window);
         cx.notify();
@@ -294,21 +282,49 @@ impl ShelbiWindow {
         }
     }
 
-    /// A tab dropped here from another window, with the pointer at window x
-    /// `x`: it takes the gap it was over, and the window comes forward on it.
-    fn take_tab(&mut self, project: &str, x: f32, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tab_reorder.accept(&mut self.tabs, x) {
+    /// A tab dropped here from another window: it takes the gap the drag
+    /// showed here (`landing.role`'s), and the window comes forward on it.
+    fn take_tab(&mut self, landing: &Landing, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab_reorder.follow(&self.tabs, landing.role.clone());
+        if self.tab_reorder.accept(&mut self.tabs, landing.x) {
             self.tabs_changed(cx);
         }
         window.activate_window();
-        self.switch_to(project, window, cx);
+        self.switch_to(&landing.project, window, cx);
         cx.notify();
     }
 }
 
-/// Move `project`'s tab from window `from` to window `to` (dropped at window
-/// x `x` there). Where the project was left travels with it.
-fn move_tab(project: String, from: WindowId, to: WindowId, x: f32, cx: &mut App) {
+/// Every Shelbi window's bar but `skip`'s follows the drag session: the one
+/// the tab is over opens its gap, the rest show none (a window whose bar
+/// changed draws again).
+fn follow_tab_drag(skip: Option<WindowId>, cx: &mut App) {
+    for handle in shelbi_windows(cx) {
+        let id = handle.window_id();
+        if Some(id) == skip {
+            continue;
+        }
+        let role = tab_tearoff::role(id, cx);
+        let _ = handle.update(cx, |w, _, cx| {
+            if w.tab_reorder.follow(&w.tabs, role) {
+                cx.notify();
+            }
+        });
+    }
+}
+
+/// A tab dropped on another window's bar: its project, the gap it showed
+/// there, and the pointer's x in that window.
+struct Landing {
+    project: String,
+    role: BarRole,
+    x: f32,
+}
+
+/// Move `landing`'s tab from window `from` to window `to`, into the gap it
+/// showed there. Where the project was left travels with it.
+fn move_tab(landing: Landing, from: WindowId, to: WindowId, cx: &mut App) {
+    let project = landing.project.clone();
     let (Some(source), Some(target)) = (find_window(from, cx), find_window(to, cx)) else {
         return;
     };
@@ -318,7 +334,7 @@ fn move_tab(project: String, from: WindowId, to: WindowId, x: f32, cx: &mut App)
         }
     });
     if target
-        .update(cx, |w, window, cx| w.take_tab(&project, x, window, cx))
+        .update(cx, |w, window, cx| w.take_tab(&landing, window, cx))
         .is_ok()
     {
         let _ = source.update(cx, |w, window, cx| w.give_up_tab(&project, window, cx));
