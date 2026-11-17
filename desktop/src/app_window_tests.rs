@@ -944,7 +944,7 @@ fn a_tab_dragged_200_from_the_bar_becomes_a_card_and_tears_off_into_its_own_wind
     assert_eq!(ghost.size.height, px(52.0));
     assert!(floats(cx).is_empty(), "no floating ghost over its own bar");
 
-    // Past 200: the card, 200 × 300, drawn by the floating ghost window.
+    // Past 200: the card, 300 × 200, drawn by the floating ghost window.
     let away = point(px(450.0), px(52.0 + 260.0));
     move_to(cx, a, away);
     assert_eq!(over(cx), Some(None), "torn off");
