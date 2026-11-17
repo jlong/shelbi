@@ -58,9 +58,10 @@ use crate::theme::Theme;
 
 /// How far from every tab bar a dragged tab tears off.
 pub const TEAR_OFF_PX: f32 = 200.0;
-/// The torn-off card.
-pub const CARD_W: f32 = 200.0;
-pub const CARD_H: f32 = 300.0;
+/// The torn-off card: landscape, wider than tall.
+pub const CARD_W: f32 = 300.0;
+pub const CARD_H: f32 = 200.0;
+const _: () = assert!(CARD_W > CARD_H, "the card is landscape");
 /// The card's corners (a dialog's: `rounded_lg`).
 pub const CARD_RADIUS: f32 = 8.0;
 /// How long the ghost takes to turn into the card, or back: a menu's pace,
@@ -702,5 +703,17 @@ mod tests {
         assert_eq!(s.hold(t0), point(30.0, 20.0), "the tab where it was pressed");
         s.morph.head(1.0, t0, true);
         assert_eq!(s.hold(t0), point(CARD_W / 2.0, CARD_GRAB_Y));
+    }
+
+    #[test]
+    fn the_landscape_card_fits_the_floating_ghost_window_with_room_for_its_shadow() {
+        let window = float_size();
+        let (w, h) = (window.width.as_f32(), window.height.as_f32());
+        let mut s = DragState::new(gpui::WindowId::from(1u64), "web".into(), "web".into(), false);
+        s.morph.head(1.0, Instant::now(), true);
+        let at = float_anchor() - s.hold(Instant::now());
+        assert!(at.x >= FLOAT_PAD && at.y >= FLOAT_PAD, "the card's top-left {at:?}");
+        assert!(at.x + CARD_W + FLOAT_PAD <= w, "its right edge in {w}");
+        assert!(at.y + CARD_H + FLOAT_PAD <= h, "its bottom edge in {h}");
     }
 }
