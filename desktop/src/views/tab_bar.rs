@@ -134,10 +134,14 @@ fn selector_name(name: &str) -> &str {
 /// One tab, as a frame draws it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tab {
-    /// The project id.
+    /// The tab id (`crate::project_tabs::tab_id`): a project's name here,
+    /// `host:name` for one on another machine.
     pub name: String,
     /// What the tab says: the project's display name.
     pub label: SharedString,
+    /// The machine a remote project is on (`mixed-host-tabs`), named in the
+    /// tab before its label; `None` for a project here.
+    pub host: Option<SharedString>,
     /// The window shows this project.
     pub selected: bool,
     /// One of its workspaces' agents is working: the dot breathes. A tab's
@@ -557,8 +561,18 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
         .into_any_element()
 }
 
-/// One project's tab: its dot (an `×` while hovered), its name, and its ⌘N
-/// while ⌘ is held; dragged, it moves to another place in the bar.
+/// What a tab reads as in one line: its label, after its host for a project
+/// on another machine (`devbox · api`): the drag ghost's text.
+pub fn tab_title(tab: &Tab) -> SharedString {
+    match &tab.host {
+        Some(host) => format!("{host} · {}", tab.label).into(),
+        None => tab.label.clone(),
+    }
+}
+
+/// One project's tab: its dot (an `×` while hovered), its host when it is
+/// on another machine, its name, and its ⌘N while ⌘ is held; dragged, it
+/// moves to another place in the bar.
 fn render_tab<H: SidebarHost>(
     tab: &Tab,
     look: TabLook,
@@ -577,7 +591,7 @@ fn render_tab<H: SidebarHost>(
     let menu_anchor = menu_anchor.clone();
     let drag = TabDrag {
         project: tab.name.clone(),
-        label: tab.label.clone(),
+        label: tab_title(tab),
         working: tab.working,
     };
     let host = cx.entity().downgrade();
@@ -633,6 +647,16 @@ fn render_tab<H: SidebarHost>(
         // Lifted: its slot draws empty (the ghost has it).
         .when(lifted, |d| d.opacity(0.0))
         .child(lead)
+        // A remote project's host first, quieter than its name.
+        .children(tab.host.clone().map(|host| {
+            let selector = format!("tab-host-{key}");
+            div()
+                .flex_none()
+                .debug_selector(move || selector)
+                .type_style(Type::BaseMedium)
+                .text_color(theme.muted)
+                .child(format!("{host} ·"))
+        }))
         .child(
             div()
                 .min_w_0()

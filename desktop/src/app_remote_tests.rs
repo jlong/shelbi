@@ -75,6 +75,19 @@ fn open(cx: &mut TestAppContext, far: &FarHost) -> WindowHandle<ShelbiWindow> {
     handle
 }
 
+/// The app reaches `far` (and only it) as it reaches a real host: its
+/// connector decides, over its in-process link.
+pub(super) fn reach(cx: &mut TestAppContext, far: &FarHost) {
+    let (remote, link) = (far.remote.clone(), far.link.clone());
+    cx.update(|cx| {
+        cx.set_global(crate::platform::launch::LaunchServices {
+            remote,
+            recents: shelbi_app::launch::RecentRemotes::none(),
+        });
+        cx.set_global(crate::views::remote_session::HostLinks(Arc::new(move |_| link.clone())));
+    });
+}
+
 fn update<R>(
     cx: &mut TestAppContext,
     handle: WindowHandle<ShelbiWindow>,
@@ -165,7 +178,8 @@ fn the_remote_window_names_its_host_and_switches_among_its_projects(cx: &mut Tes
 
     // The switcher and the palette list the far host's projects only.
     let (switcher, model) = read(cx, handle, |w, cx| (w.switcher_projects(cx), w.command_model()));
-    assert_eq!(switcher.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(), [PROJECT]);
+    // By tab id, so a pick switches to the far project, not a local one.
+    assert_eq!(switcher.iter().map(|p| p.name.clone()).collect::<Vec<_>>(), [format!("{HOST}:{PROJECT}")]);
     assert_eq!(model.remote_host.as_deref(), Some(HOST));
 }
 
@@ -190,7 +204,7 @@ fn a_clicked_notice_opens_in_its_remote_window_and_keeps_the_project(cx: &mut Te
             (
                 w.project.clone(),
                 w.project_handle.key().clone(),
-                w.remote.as_ref().unwrap().session.project.clone(),
+                w.remote().unwrap().session.project.clone(),
             )
         })
     };
@@ -208,22 +222,21 @@ fn a_clicked_notice_opens_in_its_remote_window_and_keeps_the_project(cx: &mut Te
 }
 
 #[gpui::test]
-fn a_local_notice_never_lands_in_a_remote_window(cx: &mut TestAppContext) {
+fn a_local_notice_opens_as_a_tab_beside_the_remote_one(cx: &mut TestAppContext) {
+    // A window mixes machines (`mixed-host-tabs`): the frontmost one takes a
+    // local project's notice, as a tab of its own, keeping the far tab.
     setup(cx);
     let far = FarHost::new("localnotice");
     let handle = open(cx, &far);
-    let key = read(cx, handle, |w, _| w.project_handle.key().clone());
     update(cx, handle, |_, window, _| window.activate_window());
 
     cx.update(|cx| open_notice_tag("shelbi/gamma/orch", cx));
     cx.run_until_parked();
 
-    assert_eq!(read(cx, handle, |w, _| w.project_handle.key().clone()), key);
-    assert_eq!(
-        cx.update(|cx| windows_showing("gamma", None, cx)).len(),
-        1,
-        "a local window opens on it instead"
-    );
+    assert_eq!(read(cx, handle, |w, _| w.project_handle.key().clone()), ProjectKey::local("gamma"));
+    assert_eq!(read(cx, handle, |w, _| w.tabs.order().to_vec()), [format!("{HOST}:{PROJECT}"), "gamma".to_string()]);
+    assert_eq!(cx.update(|cx| shelbi_windows(cx)).len(), 1, "no other window");
+    assert!(read(cx, handle, |w, _| w.hosts.contains_key(HOST)), "the far tab's host stays open");
 }
 
 #[gpui::test]
@@ -235,7 +248,7 @@ fn a_notice_switching_the_window_under_the_quit_prompt_keeps_it_there(cx: &mut T
     assert!(cx.has_pending_prompt());
 
     // Moved on (a shown chat, the view a close would mark), then the answer.
-    update(cx, handle, |w, window, cx| w.switch_to("other", window, cx));
+    update(cx, handle, |w, window, cx| w.switch_to(&format!("{HOST}:other"), window, cx));
     draw(cx, handle);
     assert!(read(cx, handle, |w, _| w.chat.is_some()), "the new project's chat");
     cx.simulate_prompt_answer("Close Project");
@@ -264,7 +277,9 @@ fn quitting_a_remote_windows_project_goes_to_the_chooser(cx: &mut TestAppContext
     cx.simulate_prompt_answer("Close Project");
     settle(cx, "the window to leave the project", |cx| read(cx, handle, |w, _| w.chooser));
     assert_eq!(far.asked.lock().unwrap().quits, [PROJECT]);
-    assert_eq!(read(cx, handle, |w, _| w.remote.as_ref().unwrap().session.project.clone()), PROJECT);
+    // Its host's last tab went, and the host with it (its link closes once
+    // nothing else holds it).
+    assert!(read(cx, handle, |w, _| w.hosts.is_empty()));
 }
 
 #[gpui::test]
@@ -273,12 +288,13 @@ fn close_all_other_projects_quits_each_far_sibling_and_stays_on_the_kept_one(cx:
     let far = FarHost::new("closeothers");
     let handle = open(cx, &far);
     // A second far tab, then back on the first: it is the one kept.
+    let (far_id, other) = (format!("{HOST}:{PROJECT}"), format!("{HOST}:other"));
     update(cx, handle, |w, window, cx| {
-        w.switch_to("other", window, cx);
-        w.switch_to(PROJECT, window, cx);
+        w.switch_to(&other, window, cx);
+        w.switch_to(&far_id, window, cx);
     });
-    assert_eq!(read(cx, handle, |w, _| w.tabs.order().to_vec()), [PROJECT, "other"]);
-    update(cx, handle, |w, window, cx| w.confirm_close_other_projects(PROJECT.into(), window, cx));
+    assert_eq!(read(cx, handle, |w, _| w.tabs.order().to_vec()), [far_id.clone(), other]);
+    update(cx, handle, |w, window, cx| w.confirm_close_other_projects(far_id.clone(), window, cx));
     let (title, detail) = cx.pending_prompt().expect("it asks");
     assert_eq!(title, "Close 1 other project?");
     assert!(detail.contains("its agents stop"), "{detail}");
@@ -289,7 +305,7 @@ fn close_all_other_projects_quits_each_far_sibling_and_stays_on_the_kept_one(cx:
     // own project, and the kept one never gets a quit.
     assert_eq!(far.asked.lock().unwrap().quits, ["other"]);
     assert!(!cx.has_pending_prompt(), "one confirmation");
-    assert_eq!(read(cx, handle, |w, _| w.tabs.order().to_vec()), [PROJECT]);
+    assert_eq!(read(cx, handle, |w, _| w.tabs.order().to_vec()), [far_id]);
     let (project, chooser) = read(cx, handle, |w, _| (w.project.clone(), w.chooser));
     assert_eq!(project, PROJECT);
     assert!(!chooser);
@@ -304,7 +320,7 @@ fn a_switch_during_the_zen_check_drops_the_toggle(cx: &mut TestAppContext) {
     let handle = open(cx, &far);
     update(cx, handle, |w, window, cx| {
         w.toggle_zen(window, cx);
-        w.switch_to("other", window, cx);
+        w.switch_to(&format!("{HOST}:other"), window, cx);
     });
     linger(cx);
     assert!(
@@ -472,17 +488,17 @@ fn open_in_terminal_view_opens_the_far_tui_beside_the_native_window(cx: &mut Tes
     let opened = TERMINAL_OPENED.with(|o| o.borrow().clone());
     assert_eq!(opened, vec![far.session()], "the far TUI opens for this window's project");
     // The native window stays, as it was.
-    assert!(read(cx, handle, |w, _| w.remote_changed.is_none() && w.is_remote()));
+    assert!(read(cx, handle, |w, _| w.remote_changed().is_none() && w.is_remote()));
     assert_eq!(cx.update(|cx| shelbi_windows(cx)).len(), 1);
 }
 
 #[gpui::test]
 fn a_host_that_changed_closes_the_panes_and_reopen_decides_again(cx: &mut TestAppContext) {
-    use crate::views::remote_session::tests::OPENED;
-    OPENED.with(|o| o.borrow_mut().clear());
     setup(cx);
     let far = FarHost::new("changed");
+    let current = far.listing().version;
     let handle = open(cx, &far);
+    reach(cx, &far);
     run(cx, handle, CommandKind::ShowView(View::Issues));
     draw(cx, handle);
     assert!(read(cx, handle, |w, _| w.issues.is_some()));
@@ -497,23 +513,37 @@ fn a_host_that_changed_closes_the_panes_and_reopen_decides_again(cx: &mut TestAp
     };
     assert!(message.contains("is now 0.0.2"), "{message}");
 
-    // The window shows that with Reopen in place of its shell, and its panes
-    // and views close.
-    update(cx, handle, |w, _, cx| w.host_changed(message.clone(), cx));
+    // The tab shows that with Reopen in place of the shell (the tab bar
+    // stays), and its panes and views close.
+    update(cx, handle, |w, _, cx| w.host_changed(HOST, message.clone(), cx));
     draw(cx, handle);
     let (changed, open) = read(cx, handle, |w, _| {
         (
-            w.remote_changed.clone(),
+            w.remote_changed(),
             w.chat.is_some() || w.issues.is_some() || w.workspace.is_some() || w.review.is_some(),
         )
     });
     assert_eq!(changed.as_deref(), Some(message.as_str()));
     assert!(!open, "the panes are closed");
+    let mut vcx = VisualTestContext::from_window(handle.into(), cx);
+    assert!(vcx.debug_bounds("remote-reopen").is_some());
+    // `tab-devbox:far`: the tab's selector is its id.
+    assert!(vcx.debug_bounds("tab-devbox:far").is_some(), "the tabs stay");
 
-    // Reopen closes the window and opens the project again, deciding afresh.
+    // Reopen decides afresh, in the tab: still another version, it says so
+    // there, with Try Again.
     update(cx, handle, |w, window, cx| w.reopen_remote(window, cx));
-    let opened = OPENED.with(|o| o.borrow().clone());
-    assert_eq!(opened, vec![far.session()]);
+    draw(cx, handle);
+    assert!(read(cx, handle, |w, _| w.on_pending_tab() && w.shows(&format!("{HOST}:{PROJECT}"))));
+    let mut vcx = VisualTestContext::from_window(handle.into(), cx);
+    assert!(vcx.debug_bounds("remote-retry").is_some(), "Try Again");
+    assert_eq!(cx.update(|cx| shelbi_windows(cx)).len(), 1, "no window opened");
+
+    // The same Shelbi again: Try Again shows the project natively.
+    far.remote.set_far_version(HOST, &current, Some(shelbi_app::launch::NativeCapability::current()));
+    update(cx, handle, |w, window, cx| w.retry_pending(window, cx));
+    let key = ProjectKey::remote(HOST, PROJECT);
+    assert!(read(cx, handle, |w, _| w.shows_key(&key) && w.is_remote() && w.remote_changed().is_none()));
 }
 
 #[gpui::test]
@@ -548,11 +578,11 @@ fn a_refused_sign_in_stops_asking_and_the_bar_signs_in_again(cx: &mut TestAppCon
 
     // The window shows it with Sign In, in plain words.
     update(cx, handle, |w, _, cx| {
-        w.remote_bar = Some(RemoteBar::of(&refused));
+        w.set_remote_bar(Some(RemoteBar::of(&refused)));
         cx.notify();
     });
     draw(cx, handle);
-    let bar = read(cx, handle, |w, _| w.remote_bar.clone()).expect("the bar");
+    let bar = read(cx, handle, |w, _| w.remote_bar()).expect("the bar");
     assert_eq!(bar.label(), shelbi_app::launch::remote::SIGN_IN_LABEL);
     assert!(bar.line().contains(&format!("ssh-copy-id {HOST}")), "{}", bar.line());
     let mut vcx = VisualTestContext::from_window(handle.into(), cx);
@@ -561,7 +591,7 @@ fn a_refused_sign_in_stops_asking_and_the_bar_signs_in_again(cx: &mut TestAppCon
 
     // Sign In: the link comes up, and the bar goes.
     update(cx, handle, |w, _, cx| w.remote_bar_action(cx));
-    settle(cx, "the bar to clear", |cx| read(cx, handle, |w, _| w.remote_bar.is_none()));
+    settle(cx, "the bar to clear", |cx| read(cx, handle, |w, _| w.remote_bar().is_none()));
 }
 
 #[test]

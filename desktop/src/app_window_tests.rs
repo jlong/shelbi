@@ -29,7 +29,7 @@ pub(super) struct Fixture {
     /// The feeds started, and which still run.
     feeds: Started,
     sessions: Arc<FakeSessions>,
-    deps: WorkspaceDeps,
+    pub(super) deps: WorkspaceDeps,
 }
 
 fn entry(name: &str, label: &str) -> ProjectEntry {
@@ -472,11 +472,11 @@ fn closing_the_shown_tab_selects_its_right_neighbor_else_its_left(cx: &mut TestA
     assert_eq!(windows(cx), [("beta".to_string(), 0)]);
     assert_eq!(tabs(cx), ["beta"]);
     // Saved with the window's state (its slot's, on the debounced save).
-    assert_eq!(read(cx, h, |w, _| w.window_state.tabs.clone()), ["beta"]);
+    assert_eq!(read(cx, h, |w, _| w.window_state.tabs.clone()), [ProjectKey::local("beta")]);
     cx.executor().advance_clock(std::time::Duration::from_secs(1));
     cx.run_until_parked();
     let saved = cx.update(|cx| cx.global::<Shell>().session.slots[0].state.tabs.clone());
-    assert_eq!(saved, ["beta"]);
+    assert_eq!(saved, [ProjectKey::local("beta")]);
 }
 
 #[gpui::test]
@@ -838,7 +838,7 @@ pub(super) fn open_at(
     let deps = f.deps.clone();
     let state = WindowState {
         frame: Some(frame),
-        tabs: tabs.iter().map(|t| t.to_string()).collect(),
+        tabs: tabs.iter().map(|t| crate::project_tabs::tab_key(t)).collect(),
         ..WindowState::default()
     };
     let handle = cx.update(|cx| {
@@ -1005,7 +1005,7 @@ fn a_relaunch_restores_the_torn_off_arrangement(cx: &mut TestAppContext) {
         .slots
         .iter()
         .filter(|s| s.open)
-        .map(|s| (s.project.clone(), s.state.tabs.clone()))
+        .map(|s| (s.project.clone(), s.state.tabs.iter().map(ToString::to_string).collect()))
         .collect();
     assert_eq!(
         open,
@@ -1017,7 +1017,10 @@ fn a_relaunch_restores_the_torn_off_arrangement(cx: &mut TestAppContext) {
     // Quit (the windows close with the app) and relaunch from the saved
     // slots: the same two windows, the same tabs.
     let plan = window_state::launch_plan(Some(&session), None, None, &|_| true, &|_| WindowState::default());
-    let reopened: Vec<(String, Vec<String>)> = plan.iter().map(|w| (w.project.name.clone(), w.state.tabs.clone())).collect();
+    let reopened: Vec<(String, Vec<String>)> = plan
+        .iter()
+        .map(|w| (w.project.name.clone(), w.state.tabs.iter().map(ToString::to_string).collect()))
+        .collect();
     assert_eq!(
         reopened,
         [

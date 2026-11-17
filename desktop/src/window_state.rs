@@ -122,9 +122,12 @@ pub struct WindowState {
     /// window too narrow to honor it narrows the pane for display only.
     pub task_pane_width: f32,
     /// The window's project tabs, in order (`crate::project_tabs`): kept
-    /// across restarts. Empty in a file from before tabs.
+    /// across restarts. A project here is saved as its bare name (all a
+    /// file from before remote tabs holds), one on another machine as
+    /// `{"host": .., "name": ..}`, so a restart reopens it on its host
+    /// (`mixed-host-tabs`). Empty in a file from before tabs.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub tabs: Vec<String>,
+    pub tabs: Vec<ProjectKey>,
 }
 
 impl Default for WindowState {
@@ -412,10 +415,13 @@ mod tests {
             sidebar_width: 33,
             sidebar_collapsed: true,
             task_pane_width: 812.0,
-            tabs: vec!["web".into(), "api".into()],
+            tabs: vec![ProjectKey::local("web"), ProjectKey::remote("devbox", "api"), ProjectKey::local("api")],
         };
         state.save_to(&path).unwrap();
         assert_eq!(WindowState::load_from(&path), state);
+        // A local tab is its bare name, a remote one names its host.
+        let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["tabs"], serde_json::json!(["web", {"host": "devbox", "name": "api"}, "api"]));
         // No temp file is left behind.
         let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
@@ -423,6 +429,16 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty());
+    }
+
+    #[test]
+    fn tabs_saved_before_remote_tabs_load_as_this_machines() {
+        let path = temp_dir("oldtabs").join(LEGACY_FILE_NAME);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, br#"{"sidebar_width": 30, "tabs": ["web", "api"]}"#).unwrap();
+        let state = WindowState::load_from(&path);
+        assert_eq!(state.tabs, [ProjectKey::local("web"), ProjectKey::local("api")]);
+        assert_eq!(state.sidebar_width, 30);
     }
 
     #[test]
@@ -653,8 +669,7 @@ mod tests {
         let back: WindowSession = serde_json::from_str(&serde_json::to_string(&remote).unwrap()).unwrap();
         assert_eq!(back, remote);
         assert_ne!(back.slots[0].project, session.slots[0].project);
-        // A slot whose project isn't there to open (a remote one, until
-        // remote windows open natively) isn't restored.
+        // A slot whose project `exists` turns down isn't restored.
         let local_only = |p: &ProjectKey| p.is_local();
         let never = |_: &str| -> WindowState { panic!("a session never reads the legacy file") };
         assert!(launch_plan(Some(&remote), None, None, &local_only, &never).is_empty());

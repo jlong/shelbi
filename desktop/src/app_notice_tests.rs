@@ -21,7 +21,7 @@ fn the_notices_sit_along_the_foot_and_the_tabs_stay_on_top(cx: &mut TestAppConte
             daemon_version: Some("0.9.2".into()),
             reason: "The daemon was upgraded.".into(),
         }));
-        w.remote_bar = Some(RemoteBar::Stopped("Shelbi isn't running on devbox.".into()));
+        w.set_remote_bar(Some(RemoteBar::Stopped("Shelbi isn't running on devbox.".into())));
         w.banner = Some("Couldn't save the workflow.".into());
         cx.notify();
     });

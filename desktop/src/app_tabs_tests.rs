@@ -146,7 +146,7 @@ fn one_tab_per_open_project_in_the_saved_order(cx: &mut TestAppContext) {
     assert!(left(&mut h, "tab-alpha") < left(&mut h, "tab-beta"));
     assert!(!drawn(&mut h, "tab-delta"), "delta isn't open");
     // Saved with the window's state.
-    let saved = h.window.read_with(&h.cx, |w, _| w.window_state.tabs.clone());
+    let saved: Vec<String> = h.window.read_with(&h.cx, |w, _| w.window_state.tabs.iter().map(ToString::to_string).collect());
     assert_eq!(saved, order(&h));
     // Each tab says its project's display name; this window's is selected.
     let tabs = h.window.read_with(&h.cx, |w, cx| w.tab_props(cx));
@@ -163,7 +163,7 @@ fn one_tab_per_open_project_in_the_saved_order(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_tab_order_survives_a_restart(cx: &mut TestAppContext) {
     let saved = WindowState {
-        tabs: vec!["gamma".into(), "beta".into()],
+        tabs: vec![ProjectKey::local("gamma"), ProjectKey::local("beta")],
         ..Default::default()
     };
     // A window built from the saved state keeps the order, its own
@@ -185,7 +185,7 @@ fn the_tab_order_survives_a_restart(cx: &mut TestAppContext) {
         .update(|cx| handle.read_with(cx, |w, _| (w.tabs.order().to_vec(), w.window_state.tabs.clone())))
         .unwrap();
     assert_eq!(tabs, ["gamma", "beta", "alpha"]);
-    assert_eq!(state, tabs, "and saves it back");
+    assert_eq!(state.iter().map(ToString::to_string).collect::<Vec<_>>(), tabs, "and saves it back");
 }
 
 #[gpui::test]
@@ -598,7 +598,7 @@ fn dragging_a_tab_opens_a_slot_where_it_lands_and_the_order_sticks(cx: &mut Test
         [rest[0], rest[0] + gamma_w, rest[1] + gamma_w],
         "in the slot, nothing jumps"
     );
-    let saved = h.window.read_with(&h.cx, |w, _| w.window_state.tabs.clone());
+    let saved: Vec<String> = h.window.read_with(&h.cx, |w, _| w.window_state.tabs.iter().map(ToString::to_string).collect());
     assert_eq!(saved, order(&h), "saved with the window's state");
     assert!(h.take_calls().is_empty(), "a drag doesn't switch to the tab");
     // ⌘1 to ⌘3 follow the new order.

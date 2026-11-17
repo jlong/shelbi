@@ -53,6 +53,11 @@ fn setup(cx: &mut TestAppContext) -> Fixture {
     f
 }
 
+/// Tab ids as the keys a window saves.
+fn keys(ids: &[&str]) -> Vec<ProjectKey> {
+    ids.iter().map(|id| crate::project_tabs::tab_key(id)).collect()
+}
+
 fn on_new_tab(cx: &mut TestAppContext, h: WindowHandle<ShelbiWindow>) -> bool {
     read(cx, h, |w, _| w.on_new_tab())
 }
@@ -171,7 +176,7 @@ fn a_project_picked_on_the_launch_screen_opens_in_the_tabs_place(cx: &mut TestAp
     assert_eq!(tabs_of(cx, h), ["alpha", "gamma", "beta"], "in the New tab's place");
     assert!(!on_new_tab(cx, h));
     assert_eq!(windows(cx).len(), 1, "in this window");
-    assert_eq!(read(cx, h, |w, _| w.window_state.tabs.clone()), ["alpha", "gamma", "beta"]);
+    assert_eq!(read(cx, h, |w, _| w.window_state.tabs.clone()), keys(&["alpha", "gamma", "beta"]));
 }
 
 #[gpui::test]
@@ -229,7 +234,10 @@ fn the_wizards_new_project_opens_in_the_new_tab(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_remote_session_connected_from_the_new_tab_opens_its_own_window(cx: &mut TestAppContext) {
+fn a_remote_session_that_opens_elsewhere_closes_the_new_tab(cx: &mut TestAppContext) {
+    // No host link (the session is only recorded, as the terminal window
+    // would open it): the New tab it was picked on goes. One that opens
+    // natively takes the New tab's place (`app_mixed_tabs_tests`).
     let f = setup(cx);
     let h = with_new_tab(cx, &f);
     crate::views::remote_session::tests::OPENED.with(|o| o.borrow_mut().clear());
@@ -274,7 +282,7 @@ fn the_new_tab_closes_with_its_x_or_command_w(cx: &mut TestAppContext) {
 fn the_new_tab_is_never_saved(cx: &mut TestAppContext) {
     let f = setup(cx);
     let h = with_new_tab(cx, &f);
-    assert_eq!(read(cx, h, |w, _| w.window_state.tabs.clone()), ["alpha", "beta"]);
+    assert_eq!(read(cx, h, |w, _| w.window_state.tabs.clone()), keys(&["alpha", "beta"]));
     // Nor does a refresh drop it (the open set never names it).
     update(cx, h, |w, _, cx| {
         cx.global::<Catalog>().set_open(&["alpha", "beta"]);

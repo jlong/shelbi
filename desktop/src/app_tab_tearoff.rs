@@ -16,7 +16,9 @@
 //!
 //! The project travels as a switch does: the giving window remembers where
 //! it was left, the taking window adopts that and attaches the same daemon
-//! sessions, and a window left with no tab closes. A New tab travels the
+//! sessions, and a window left with no tab closes. A project on another
+//! machine takes its host with it (`mixed-host-tabs`): the taking window
+//! shares the giver's open host (its one link), so it stays connected. A New tab travels the
 //! same way: torn off, its window shows the launch screen; dropped on a bar
 //! whose window has a New tab already, that one is selected.
 
@@ -80,7 +82,8 @@ impl ShelbiWindow {
             state.first_x = layout.first_x;
         }
         state.reduce_motion = (self.reduce_motion)();
-        state.tearable = self.remote.is_none();
+        // Any tab can leave: a remote one takes its host along.
+        state.tearable = true;
         let frame = screen::content_frame(window);
         let at = window.mouse_position();
         state.pointer = frame.origin + point(at.x.as_f32(), at.y.as_f32());
@@ -88,9 +91,8 @@ impl ShelbiWindow {
         cx.notify();
     }
 
-    /// Every local window's tab bar in screen space, front to back, this
-    /// window's (`frame`) among them. A remote window's tab stays in its
-    /// window, so it sees only its own bar.
+    /// Every window's tab bar in screen space, front to back, this window's
+    /// (`frame`) among them.
     fn bars_for_drag(&self, me: WindowId, frame: Bounds<f32>, cx: &mut App) -> Vec<BarSpot<WindowId>> {
         let own = self
             .tab_reorder
@@ -107,12 +109,9 @@ impl ShelbiWindow {
                 own_listed = true;
                 continue;
             }
-            if self.remote.is_some() {
-                continue;
-            }
             let spot = handle
                 .update(cx, |w, window, _| {
-                    let bar = w.tab_reorder.layout.borrow().bar.filter(|_| w.remote.is_none())?;
+                    let bar = w.tab_reorder.layout.borrow().bar?;
                     let frame = screen::content_frame(window);
                     Some(BarSpot { window: id, frame, bar: on_screen(bar, &frame) })
                 })
@@ -264,6 +263,12 @@ impl ShelbiWindow {
         true
     }
 
+    /// Tab `id`'s host, open here, for a remote tab moving to another window
+    /// (`None` for a project here, or a host not open yet).
+    fn host_of_tab(&self, id: &str) -> Option<RemoteWindow> {
+        self.host_remote(tab_key(id).host()?).cloned()
+    }
+
     /// `project`'s tab went to another window: it goes here, and a window
     /// showing it moves to its neighbor tab, or closes with none left.
     fn give_up_tab(&mut self, project: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -328,13 +333,23 @@ fn move_tab(landing: Landing, from: WindowId, to: WindowId, cx: &mut App) {
     let (Some(source), Some(target)) = (find_window(from, cx), find_window(to, cx)) else {
         return;
     };
-    let _ = source.update(cx, |w, _, cx| {
-        if w.shows(&project) {
-            w.remember_view_state(cx);
-        }
-    });
+    let host = source
+        .update(cx, |w, _, cx| {
+            if w.shows(&project) {
+                w.remember_view_state(cx);
+            }
+            w.host_of_tab(&project)
+        })
+        .ok()
+        .flatten();
     if target
-        .update(cx, |w, window, cx| w.take_tab(&landing, window, cx))
+        .update(cx, |w, window, cx| {
+            // A remote tab's host comes along, open: the tab stays connected.
+            if let Some(host) = host {
+                w.adopt_host(host, cx);
+            }
+            w.take_tab(&landing, window, cx)
+        })
         .is_ok()
     {
         let _ = source.update(cx, |w, window, cx| w.give_up_tab(&project, window, cx));
@@ -361,7 +376,7 @@ fn tear_off(t: TearOff, cx: &mut App) {
     let Some(source) = find_window(t.from, cx) else {
         return;
     };
-    let Ok((mut state, size, source_display)) = source.update(cx, |w, window, cx| {
+    let Ok((mut state, size, source_display, host)) = source.update(cx, |w, window, cx| {
         if w.shows(&t.project) {
             w.remember_view_state(cx);
         }
@@ -369,10 +384,11 @@ fn tear_off(t: TearOff, cx: &mut App) {
             sidebar_width: w.window_state.sidebar_width,
             sidebar_collapsed: w.window_state.sidebar_collapsed,
             task_pane_width: w.window_state.task_pane_width,
-            tabs: if t.project == NEW_TAB { Vec::new() } else { vec![t.project.clone()] },
+            tabs: if t.project == NEW_TAB { Vec::new() } else { vec![tab_key(&t.project)] },
             ..WindowState::default()
         };
-        (state, window.window_bounds().get_bounds().size, window_display(window, cx))
+        let host = w.host_of_tab(&t.project);
+        (state, window.window_bounds().get_bounds().size, window_display(window, cx), host)
     }) else {
         return;
     };
@@ -400,10 +416,12 @@ fn tear_off(t: TearOff, cx: &mut App) {
         }
         return;
     }
-    let Some(handle) = open_window(&t.project, slot, state, Some(bounds), cx) else {
+    // A remote tab opens over its host, as the source had it open (or, not
+    // yet open there, opening in the new window's tab).
+    let key = tab_key(&t.project);
+    let Some(handle) = open_window_on(&key, host, slot, state, Some(bounds), cx) else {
         return;
     };
-    let key = ProjectKey::local(&t.project);
     let _ = handle.update(cx, |w, window, cx| {
         if let Some(saved) = cx.try_global::<Catalog>().and_then(|c| c.known_view_state(&key)) {
             w.adopt_view_state(saved);
