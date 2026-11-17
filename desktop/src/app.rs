@@ -77,7 +77,7 @@
 //! ([`IssuesView`], `dt-issues-board`), built for the window's project the
 //! first time it is shown, and rebuilt for the new project after a switch.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -108,7 +108,7 @@ use crate::platform::version::APP_VERSION;
 use crate::platform::{
     relaunch, Bootstrap, BootstrapEvent, BootstrapState, Failure, Ready, SystemPlatform,
 };
-use crate::project_tabs::{ProjectTabs, NEW_TAB};
+use crate::project_tabs::{tab_id, tab_key, ProjectTabs, NEW_TAB};
 use crate::views::launch::LaunchView;
 use crate::views::bootstrap::{self as boot_view, ScreenAction};
 use crate::views::tab_bar::{self, TabBarProps};
@@ -277,8 +277,9 @@ pub fn shared_ready(cx: &App) -> Option<Ready> {
 /// Open the windows a launch restores (`window_state::launch_plan`).
 pub fn open_launch_windows(plan: Vec<LaunchWindow>, cx: &mut App) {
     for w in plan {
-        // The plan holds this machine's projects only (`read_launch_plan`).
-        open_window(&w.project.name, w.slot, w.state, None, cx);
+        // A window left on another machine's project opens at once, its
+        // host opening in that tab (`mixed-host-tabs`).
+        open_window_on(&w.project, None, w.slot, w.state, None, cx);
     }
 }
 
@@ -314,16 +315,6 @@ fn frontmost(cx: &App) -> Option<WindowHandle<ShelbiWindow>> {
     frontmost_of(shelbi_windows(cx), cx)
 }
 
-/// The frontmost window on this machine's projects: a remote window switches
-/// among its host's only, so a local project never lands in one.
-fn frontmost_local(cx: &App) -> Option<WindowHandle<ShelbiWindow>> {
-    let local = shelbi_windows(cx)
-        .into_iter()
-        .filter(|h| h.read(cx).is_ok_and(|w| w.remote.is_none()))
-        .collect();
-    frontmost_of(local, cx)
-}
-
 fn frontmost_of(ours: Vec<WindowHandle<ShelbiWindow>>, cx: &App) -> Option<WindowHandle<ShelbiWindow>> {
     let find = |any: AnyWindowHandle| {
         ours.iter()
@@ -352,10 +343,28 @@ fn windows_showing_key(key: &ProjectKey, me: Option<WindowId>, cx: &App) -> Vec<
         .collect()
 }
 
+/// The window holding a tab for `key`'s project, if any (the first opened).
+fn window_with_tab(key: &ProjectKey, cx: &App) -> Option<WindowHandle<ShelbiWindow>> {
+    let id = tab_id(key);
+    shelbi_windows(cx)
+        .into_iter()
+        .find(|h| h.read(cx).is_ok_and(|w| w.tabs.contains(&id)))
+}
+
 /// File ▸ New Window: another window on `project`, cascaded off the
 /// frontmost one (on its display, taking its sidebar width and collapse), in
 /// the lowest free slot. `None` when the window couldn't open (logged).
 pub fn open_new_window(project: &str, cx: &mut App) -> Option<WindowHandle<ShelbiWindow>> {
+    open_new_window_on(&ProjectKey::local(project), None, cx)
+}
+
+/// [`open_new_window`] on `key`'s project, here or (with its `host`, when
+/// open) on another machine.
+fn open_new_window_on(
+    key: &ProjectKey,
+    host: Option<RemoteWindow>,
+    cx: &mut App,
+) -> Option<WindowHandle<ShelbiWindow>> {
     let mut state = WindowState::default();
     let mut cascade = None;
     if let Some(from) = frontmost(cx) {
@@ -377,7 +386,7 @@ pub fn open_new_window(project: &str, cx: &mut App) -> Option<WindowHandle<Shelb
         b.origin.y += px(CASCADE);
         b
     });
-    open_window(project, slot, state, bounds, cx)
+    open_window_on(key, host, slot, state, bounds, cx)
 }
 
 /// A project picked on the launch window: the window already showing it
@@ -437,19 +446,49 @@ pub fn open_notice_tag(tag: &str, cx: &mut App) {
         });
         return;
     }
-    // A remote window's notices name its project as `host:project`, an id and
-    // never a project to switch to: only that window opens them.
-    if id.contains(':') {
-        return;
-    }
-    let Some(handle) = frontmost_local(cx).or_else(|| open_new_window(&id, cx)) else {
-        return;
+    // A remote project's notices name it as `host:project`, a tab id: a
+    // window with its tab switches to it. No window has it: nothing opens
+    // (its host isn't open here).
+    let key = tab_key(&id);
+    let handle = match window_with_tab(&key, cx) {
+        Some(handle) => handle,
+        None if !key.is_local() => return,
+        None => match frontmost(cx).or_else(|| open_new_window(&id, cx)) {
+            Some(handle) => handle,
+            None => return,
+        },
     };
     let _ = handle.update(cx, |this, window, cx| {
         window.activate_window();
-        this.switch_to(&id, window, cx);
+        this.switch_to_key(&key, window, cx);
         this.open_notice(target, window, cx);
     });
+}
+
+/// Open a window on `key`'s project in `slot` ([`open_window`]'s placement).
+/// One on another machine opens over its `host` when the caller has it open;
+/// else the window opens at once, its host opening in the project's tab.
+fn open_window_on(
+    key: &ProjectKey,
+    host: Option<RemoteWindow>,
+    slot: usize,
+    state: WindowState,
+    bounds: Option<Bounds<gpui::Pixels>>,
+    cx: &mut App,
+) -> Option<WindowHandle<ShelbiWindow>> {
+    match (key.host(), host) {
+        (None, _) => open_window(&key.name, slot, state, bounds, cx),
+        (Some(_), Some(mut remote)) => {
+            let handle = remote.handle_for(&key.name);
+            open_window_with(handle, Some(remote), slot, state, bounds, cx)
+        }
+        (Some(_), None) => {
+            let handle = open_window_as(Opening::Blank, slot, state, bounds, cx)?;
+            let key = key.clone();
+            let _ = handle.update(cx, |w, window, cx| w.switch_to_key(&key, window, cx));
+            Some(handle)
+        }
+    }
 }
 
 /// Open a window on `project` in `slot`: at `bounds` when given (a cascade),
@@ -496,46 +535,38 @@ enum NewTabChoice {
 ///
 /// - a project with a tab in this window: that tab is selected and the New
 ///   tab goes;
-/// - one with a tab in another local window: that window comes up on it,
-///   and the New tab goes (the window too, when it was its only tab);
+/// - one with a tab in another window: that window comes up on it, and the
+///   New tab goes (the window too, when it was its only tab);
 /// - any other: it opens in the New tab's place ([`ShelbiWindow::switch_to`]).
 ///
-/// A remote session opens as it does from the launch window, in a window of
-/// its own (a window's tabs are one machine's projects), and the New tab
-/// goes the same way; so does a local project picked in a remote window's
-/// New tab, in a local window.
+/// A window's tabs mix machines (`mixed-host-tabs`): a remote session opens
+/// the same way, once its host's listing decides it opens natively
+/// ([`crate::views::remote_session::open_remote_session_in`]); one that
+/// can't opens its terminal window, and the New tab goes. "Has a tab" is per
+/// project key: a local `api` and `devbox:api` are two projects.
 fn new_tab_chose(choice: NewTabChoice, me: AnyWindowHandle, weak: gpui::WeakEntity<ShelbiWindow>, cx: &mut App) {
-    let leave = |cx: &mut App| {
-        let _ = me.update(cx, |_, window, cx| {
-            weak.update(cx, |w, cx| w.close_new_tab(true, window, cx)).ok();
-        });
-    };
     let project = match choice {
         NewTabChoice::Remote(session) => {
-            crate::views::remote_session::open_remote_session(session, cx);
-            leave(cx);
+            crate::views::remote_session::open_remote_session_in(session, Some(me), cx);
             return;
         }
         NewTabChoice::Project(slug) => slug,
     };
-    let Ok((here, remote)) = weak.read_with(cx, |w, _| (w.tabs.contains(&project), w.remote.is_some())) else {
+    let key = ProjectKey::local(&project);
+    let id = tab_id(&key);
+    let Ok(here) = weak.read_with(cx, |w, _| w.tabs.contains(&id)) else {
         return;
     };
     let elsewhere = shelbi_windows(cx)
         .into_iter()
         .filter(|h| h.window_id() != me.window_id())
-        .find(|h| h.read(cx).is_ok_and(|w| w.remote.is_none() && w.tabs.contains(&project)));
-    if let (false, Some(other)) = (here && !remote, elsewhere) {
+        .find(|h| h.read(cx).is_ok_and(|w| w.tabs.contains(&id)));
+    if let (false, Some(other)) = (here, elsewhere) {
         let _ = other.update(cx, |w, window, cx| {
             window.activate_window();
-            w.switch_to(&project, window, cx);
+            w.switch_to_key(&key, window, cx);
         });
-        leave(cx);
-        return;
-    }
-    if remote {
-        open_project_window(&project, cx);
-        leave(cx);
+        leave_new_tab(me, cx);
         return;
     }
     let _ = me.update(cx, |_, window, cx| {
@@ -543,16 +574,72 @@ fn new_tab_chose(choice: NewTabChoice, me: AnyWindowHandle, weak: gpui::WeakEnti
             if here && w.tabs.remove(NEW_TAB) {
                 w.tabs_changed(cx);
             }
-            w.switch_to(&project, window, cx);
+            w.switch_to_key(&key, window, cx);
         })
         .ok();
     });
 }
 
-/// Open the native window for `remote`'s project on another machine
-/// (remote-window; a host on this exact version): the main window over
-/// the host's relay link. A window already showing that project comes up
-/// instead. `None` when the window couldn't open (logged).
+/// What was picked on window `me`'s New tab came up elsewhere (another
+/// window, the terminal window): the New tab goes, and the window with it
+/// when it was its only tab. Nothing when it isn't on its New tab.
+pub(crate) fn leave_new_tab(me: AnyWindowHandle, cx: &mut App) {
+    let Some(handle) = me.downcast::<ShelbiWindow>() else {
+        return;
+    };
+    let _ = handle.update(cx, |w, window, cx| {
+        if w.on_new_tab() {
+            w.close_new_tab(true, window, cx);
+        }
+    });
+}
+
+/// Open a remote project (`remote`'s session) natively, as a tab
+/// (`mixed-host-tabs`): a window with its tab already comes up on it;
+/// else it opens in window `into` (where it was picked: in place of its New
+/// tab when that is selected), else in the frontmost window; with no window
+/// at all, in a window of its own. A New tab in `into` it was picked on goes
+/// when another window takes it. `None` when no window could open (logged).
+pub(crate) fn open_remote_in(
+    remote: RemoteWindow,
+    into: Option<AnyWindowHandle>,
+    cx: &mut App,
+) -> Option<WindowHandle<ShelbiWindow>> {
+    let key = remote.key();
+    if let Some(handle) = window_with_tab(&key, cx) {
+        let picked_here = into.is_some_and(|i| i.window_id() == handle.window_id());
+        let _ = handle.update(cx, |w, window, cx| {
+            window.activate_window();
+            if picked_here && w.on_new_tab() && w.tabs.remove(NEW_TAB) {
+                w.tabs_changed(cx);
+            }
+            w.adopt_host(remote, cx);
+            w.switch_to_key(&key, window, cx);
+        });
+        if let Some(into) = into.filter(|_| !picked_here) {
+            leave_new_tab(into, cx);
+        }
+        crate::views::launch::project_window_opened(cx);
+        return Some(handle);
+    }
+    let target = into
+        .and_then(|i| shelbi_windows(cx).into_iter().find(|h| h.window_id() == i.window_id()))
+        .or_else(|| frontmost(cx));
+    if let Some(handle) = target {
+        let opened = handle.update(cx, |w, window, cx| {
+            window.activate_window();
+            w.open_remote_tab(remote, window, cx);
+        });
+        if opened.is_ok() {
+            cx.activate(true);
+            crate::views::launch::project_window_opened(cx);
+            return Some(handle);
+        }
+        return None;
+    }
+    open_remote_window_alone(remote, cx)
+}
+
 /// What an `edit:*` target opens, named for a far editor window's title.
 fn edit_target_label(target: &EditTarget) -> String {
     match target {
@@ -564,13 +651,18 @@ fn edit_target_label(target: &EditTarget) -> String {
     }
 }
 
-pub fn open_remote_window(mut remote: RemoteWindow, cx: &mut App) -> Option<WindowHandle<ShelbiWindow>> {
-    let key = ProjectKey::remote(remote.session.host.clone(), remote.session.project.clone());
-    if let Some(handle) = windows_showing_key(&key, None, cx).first().copied() {
-        let _ = handle.update(cx, |_, window, _| window.activate_window());
-        crate::views::launch::project_window_opened(cx);
-        return Some(handle);
-    }
+/// Open `remote`'s project on another machine natively (remote-window; a
+/// host on this exact version), over the host's relay link: a tab in the
+/// frontmost window, or a window of its own when there is none
+/// ([`open_remote_in`]). A window with its tab already comes up on it.
+/// `None` when no window could open (logged).
+#[cfg(test)]
+pub fn open_remote_window(remote: RemoteWindow, cx: &mut App) -> Option<WindowHandle<ShelbiWindow>> {
+    open_remote_in(remote, None, cx)
+}
+
+/// A window of its own for `remote`'s project (no Shelbi window is open).
+fn open_remote_window_alone(mut remote: RemoteWindow, cx: &mut App) -> Option<WindowHandle<ShelbiWindow>> {
     let taken: Vec<usize> = cx
         .try_global::<Shell>()
         .map(|s| s.windows.iter().map(|w| w.slot).collect())
@@ -614,10 +706,11 @@ fn open_window_as(
     bounds: Option<Bounds<gpui::Pixels>>,
     cx: &mut App,
 ) -> Option<WindowHandle<ShelbiWindow>> {
-    let project = match &opening {
-        Opening::Project(p) => p.0.name().to_string(),
-        Opening::Blank => String::new(),
+    let key = match &opening {
+        Opening::Project(p) => p.0.key().clone(),
+        Opening::Blank => ProjectKey::local(""),
     };
+    let project = key.name.clone();
     let blank = matches!(opening, Opening::Blank);
     let project = project.as_str();
     let (bounds, display_id) = placement(&state, bounds, cx);
@@ -627,7 +720,7 @@ fn open_window_as(
     #[cfg(test)]
     let inert = cx.global::<Shell>().inert_windows;
     #[cfg(test)]
-    let project_name = project.to_string();
+    let inert_key = key.clone();
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -652,7 +745,7 @@ fn open_window_as(
             cx.new(|cx| {
                 #[cfg(test)]
                 if inert {
-                    let mut w = ShelbiWindow::inert(&project_name, slot, state, window, cx);
+                    let mut w = ShelbiWindow::inert_on(&inert_key, slot, state, window, cx);
                     match opening {
                         Opening::Project(p) => {
                             if let (handle, Some(remote)) = *p {
@@ -895,20 +988,38 @@ pub enum HostCall {
     OpenChangelogEntry(String),
 }
 
-/// How a confirmed Close Project reaches the daemon that quits it: a
-/// remote window's link (its far machine's daemon, over a control stream
+/// How a confirmed Close Project reaches the daemon that quits it: a remote
+/// project's host link (its far machine's daemon, over a control stream
 /// opened for that project), else this machine's control socket.
 #[derive(Clone)]
 struct QuitRoute {
-    link: shelbi_app::source::ProjectLink,
+    far: QuitFar,
     control: Option<crate::platform::control::ControlHandle>,
+}
+
+/// Where a project to close lives, for [`QuitRoute`].
+#[derive(Clone)]
+enum QuitFar {
+    /// This machine.
+    Here,
+    /// Another machine, over its host's link.
+    Link(shelbi_app::source::ProjectLink),
+    /// Another machine whose host isn't open here: nothing stops from here,
+    /// the tab just closes.
+    Unopened,
 }
 
 impl QuitRoute {
     /// Quit `project`. Blocking.
     fn quit(&self, project: &str) -> Result<(), String> {
-        if let Some(quit) = self.link.quit_far_sibling(project) {
-            return quit;
+        match &self.far {
+            QuitFar::Here => {}
+            QuitFar::Link(link) => {
+                if let Some(quit) = link.quit_far_sibling(project) {
+                    return quit;
+                }
+            }
+            QuitFar::Unopened => return Ok(()),
         }
         self.control
             .as_ref()
@@ -1020,8 +1131,9 @@ pub struct PaletteInputs {
 }
 
 impl PaletteInputs {
-    /// A remote window's: the host's `projects` (name, label) from its
-    /// listing, and the edit targets through the source. Blocking.
+    /// A remote project's: its host's `projects` (tab id, label) from its
+    /// listing, `project` the shown one's tab id, and the edit targets
+    /// through the source. Blocking.
     fn read_remote(project: &str, source: &dyn ProjectSource, projects: Vec<(String, String)>) -> Self {
         PaletteInputs {
             other_projects: projects
@@ -1168,6 +1280,48 @@ impl RemoteWindow {
         self.handle_for(project)
     }
 
+    /// The key of the project the session names (the one it opened, or the
+    /// one last shown).
+    pub fn key(&self) -> ProjectKey {
+        ProjectKey::remote(self.session.host.clone(), self.session.project.clone())
+    }
+
+    /// The host this is.
+    pub fn host(&self) -> &str {
+        &self.session.host
+    }
+
+    /// A link for `project` on the host, without making it the shown one
+    /// (closing a tab that isn't selected quits through it).
+    fn link_for(&self, project: &str) -> shelbi_app::source::ProjectLink {
+        shelbi_app::remote_window::remote_handle(&self.session, project, self.link.clone(), self.remote.clone())
+            .0
+            .link
+    }
+
+    /// The host's projects as tabs name them (`host:name`), with their
+    /// labels: what the palette and the switcher list on its tab.
+    fn project_ids(&self) -> Vec<(String, String)> {
+        self.projects()
+            .into_iter()
+            .map(|(name, label)| (tab_id(&ProjectKey::remote(self.session.host.clone(), name)), label))
+            .collect()
+    }
+
+    /// The session for a project of the host's opened without one (a
+    /// restored or dragged-in tab): `stub` (host and project) filled in from
+    /// the host's `listing` (who Shelbi runs as there, the project's display
+    /// name and folder).
+    fn session_from(stub: RemoteSession, listing: &RemoteListing) -> RemoteSession {
+        let project = listing.projects.iter().find(|p| p.name == stub.project);
+        RemoteSession {
+            user: listing.user.clone(),
+            label: project.and_then(|p| p.label.clone()),
+            path: project.map(|p| p.path.clone()).unwrap_or_default(),
+            ..stub
+        }
+    }
+
     /// The host's projects (name, label), as its listing names them.
     fn projects(&self) -> Vec<(String, String)> {
         self.listing
@@ -1268,6 +1422,40 @@ impl RemoteBar {
 /// How often a remote window checks its host's link.
 const REMOTE_WATCH: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Where a host the window has tabs on is with being opened.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+enum HostOpening {
+    /// Open, or not asked for yet.
+    #[default]
+    Idle,
+    /// Its listing and link are on their way (a tab picked before its host
+    /// was open here: one restored at launch, or dragged in).
+    Opening,
+    /// It couldn't be opened: the line its tabs show, with Try Again.
+    Failed(SharedString),
+}
+
+/// One other machine this window has tabs on (`mixed-host-tabs`): its
+/// connection once open, and what its tabs show about it. Every tab on the
+/// host shares it (and its one link), whichever is selected; it goes when
+/// the host's last tab does, so the link closes with it.
+#[derive(Default)]
+struct HostTabs {
+    /// The host's session, listing and link, once open.
+    remote: Option<RemoteWindow>,
+    /// Its far daemon was found stopped, or a sign-in refused: the bar its
+    /// tabs show, which offers the way on (the daemon is never started
+    /// implicitly).
+    bar: Option<RemoteBar>,
+    /// It no longer opens natively (another version, or other protocols,
+    /// since it opened): the line its tabs show instead of the shell, with
+    /// Reopen. Their panes are closed and nothing more is sent to it.
+    changed: Option<SharedString>,
+    opening: HostOpening,
+    /// Its link watch ([`ShelbiWindow::watch_host`]).
+    _watch: Option<Task<()>>,
+}
+
 /// A Shelbi window's root view.
 pub struct ShelbiWindow {
     /// The project the window shows (meaningless while [`Self::chooser`]).
@@ -1276,19 +1464,19 @@ pub struct ShelbiWindow {
     /// view reads it through, and the link for everything else
     /// (`shelbi_app::source`). Replaced with [`Self::project`] on a switch.
     project_handle: ProjectHandle,
-    /// The host a native remote window's project lives on (remote-window
-    /// P6), `None` for a project on this machine.
-    remote: Option<RemoteWindow>,
-    /// A remote window's far daemon was found stopped: the bar offers to
-    /// start it (never started implicitly).
-    remote_bar: Option<RemoteBar>,
-    /// A native remote window's host no longer opens natively (another
-    /// version, or other protocols, since the window opened): the line the
-    /// window shows instead of its shell, with Reopen. Its panes are closed
-    /// and nothing more is sent to the far daemon.
-    remote_changed: Option<SharedString>,
-    /// A remote window's link watch ([`Self::watch_remote`]).
-    _remote_watch: Option<Task<()>>,
+    /// The other machines the window's tabs are on, by host
+    /// (`mixed-host-tabs`): a tab shows a project here or on one of these.
+    hosts: BTreeMap<String, HostTabs>,
+    /// The selected tab is another machine's project whose host isn't open
+    /// here yet (restored at launch, dragged in): the window shows no
+    /// project ([`Self::chooser`] is set), only that tab's opening or why it
+    /// couldn't open.
+    pending: Option<ProjectKey>,
+    /// A live window watches each host's link; a test's doesn't.
+    watches_hosts: bool,
+    /// A test's remote bar, drawn whatever the window shows.
+    #[cfg(test)]
+    test_bar: Option<RemoteBar>,
     /// The window slot its frame is saved in.
     slot: usize,
     /// No project is shown: the empty-state chooser (the last open project
@@ -1522,10 +1710,12 @@ impl ShelbiWindow {
         cx: &mut Context<Self>,
     ) -> Self {
         let shared_ready = cx.try_global::<Shell>().and_then(|s| s.ready.clone());
-        let mut this = Self::build(handle.name(), window_state, window, cx);
+        let mut this = Self::build_on(&handle.key().clone(), window_state, window, cx);
+        this.watches_hosts = true;
         if let Some(remote) = remote {
+            let host = remote.host().to_string();
             this.become_remote(handle, remote, window);
-            this.watch_remote(cx);
+            this.watch_host(host, cx);
         }
         this.slot = slot;
         // Where the project was left (a small local read: a new window may
@@ -1557,6 +1747,7 @@ impl ShelbiWindow {
     fn new_blank(slot: usize, window_state: WindowState, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let shared_ready = cx.try_global::<Shell>().and_then(|s| s.ready.clone());
         let mut this = Self::build("", window_state, window, cx);
+        this.watches_hosts = true;
         this.slot = slot;
         // No project: nothing opens on ready.
         this.chooser = true;
@@ -1607,7 +1798,7 @@ impl ShelbiWindow {
         }));
     }
 
-    /// Make this freshly built window `remote`'s: its project on the host,
+    /// Make this freshly built window's project `remote`'s, on the host:
     /// read and attached over the host's link. Before anything reads or
     /// attaches. The first frame paints the listing's name for the project.
     fn become_remote(&mut self, handle: ProjectHandle, remote: RemoteWindow, window: &mut Window) {
@@ -1617,85 +1808,186 @@ impl ShelbiWindow {
         }
         self.notifier = notify::Tracker::new(&handle.key().to_string());
         self.project_handle = handle;
-        self.remote = Some(remote);
+        let host = remote.host().to_string();
+        self.hosts.entry(host).or_default().remote = Some(remote);
         window.set_window_title(&self.window_title());
     }
 
-    /// The window's title: the project's name, and for a remote window who
-    /// and where first (`jlong@devbox · Shelbi`).
+    /// The host the selected tab's project is on, `None` for one here (or
+    /// no project).
+    fn shown_host(&self) -> Option<&str> {
+        if self.chooser {
+            return None;
+        }
+        self.project_handle.key().host()
+    }
+
+    /// The selected tab's host, as the window keeps it.
+    fn shown_host_tabs(&self) -> Option<&HostTabs> {
+        self.hosts.get(self.shown_host()?)
+    }
+
+    /// The selected tab's host connection, when its project is on another
+    /// machine whose host is open.
+    fn remote(&self) -> Option<&RemoteWindow> {
+        self.shown_host_tabs()?.remote.as_ref()
+    }
+
+    /// `host`'s connection, when it is open here.
+    fn host_remote(&self, host: &str) -> Option<&RemoteWindow> {
+        self.hosts.get(host)?.remote.as_ref()
+    }
+
+    /// Take `remote`'s host in (`mixed-host-tabs`): a host this window
+    /// hadn't opened gets it, and its link watch; one already open keeps its
+    /// link and watch (the same shared link), and takes the newer listing.
+    /// A host that changed, or couldn't open, starts over with it.
+    pub(crate) fn adopt_host(&mut self, remote: RemoteWindow, cx: &mut Context<Self>) {
+        let host = remote.host().to_string();
+        let entry = self.hosts.entry(host.clone()).or_default();
+        match &mut entry.remote {
+            Some(open) if entry.changed.is_none() => {
+                open.listing = remote.listing;
+                open.session.user = remote.session.user;
+            }
+            _ => {
+                entry.remote = Some(remote);
+                entry.changed = None;
+                entry.bar = None;
+            }
+        }
+        entry.opening = HostOpening::Idle;
+        let watched = entry._watch.is_some();
+        if self.watches_hosts && !watched {
+            self.watch_host(host, cx);
+        }
+        cx.notify();
+    }
+
+    /// A remote project opened here (picked on the New tab, Connect, the
+    /// launch window, a host opened again): its host joins the window's
+    /// and its tab is selected, in the New tab's place when that is selected.
+    pub(crate) fn open_remote_tab(&mut self, remote: RemoteWindow, window: &mut Window, cx: &mut Context<Self>) {
+        let key = remote.key();
+        self.adopt_host(remote, cx);
+        self.switch_to_key(&key, window, cx);
+    }
+
+    /// Hosts no tab is on any more (and the selected project isn't on) go,
+    /// and their link watch with them: a host's link closes when its last
+    /// tab does (once nothing else holds it).
+    fn forget_idle_hosts(&mut self) {
+        let shown = self.shown_host().map(str::to_string);
+        let pending = self.pending.as_ref().and_then(|k| k.host()).map(str::to_string);
+        let tabs = &self.tabs;
+        self.hosts
+            .retain(|host, _| tabs.has_host(host) || shown.as_deref() == Some(host) || pending.as_deref() == Some(host));
+    }
+
+    /// The window's title: the project's name, and for one on another
+    /// machine who and where first (`jlong@devbox · Shelbi`).
     fn window_title(&self) -> String {
-        match &self.remote {
+        if let Some(key) = self.pending.as_ref().filter(|_| self.chooser) {
+            let host = shelbi_app::remote_window::bare_host(key.host().unwrap_or_default());
+            return format!("{host} · {}", key.name);
+        }
+        match self.remote() {
             Some(r) => shelbi_app::remote_window::window_title(&r.session.user, &r.session.host, &self.model.project_label),
             None => self.model.project_label.clone(),
         }
     }
 
-    /// Whether this window's project is on another machine.
+    /// Whether the selected tab's project is on another machine.
     #[cfg(test)]
     pub fn is_remote(&self) -> bool {
-        self.remote.is_some()
+        self.remote().is_some()
     }
 
-    /// Keep a remote window's link up: every [`REMOTE_WATCH`], a link found
-    /// down is reopened off the UI thread after the host checks out (never
-    /// starting its daemon). A stopped far daemon or a refused sign-in, found
-    /// here or by a pane's reconnect, shows the bar that offers the way on.
-    fn watch_remote(&mut self, cx: &mut Context<Self>) {
-        self._remote_watch = Some(cx.spawn(async move |this, cx| loop {
-            // A host that changed is done with: Reopen decides again.
-            let Ok(Some(remote)) =
-                this.update(cx, |this, _| this.remote.clone().filter(|_| this.remote_changed.is_none()))
-            else {
-                return;
-            };
-            let (link, connector, session) = (remote.link.clone(), remote.remote.clone(), remote.session.clone());
-            let kept = cx
-                .background_executor()
-                .spawn(async move { RemoteWindow::keep_up(&link, connector.as_ref(), &session) })
-                .await;
-            let alive = this.update(cx, |this, cx| {
-                let refused = match &kept {
-                    Err(Some(error)) => Some(error.clone()),
-                    Ok(true) => None,
-                    _ => this.remote.as_ref().and_then(RemoteWindow::refused),
+    /// Keep `host`'s link up while the window has tabs there: every
+    /// [`REMOTE_WATCH`], a link found down is reopened off the UI thread
+    /// after the host checks out (never starting its daemon). A stopped far
+    /// daemon or a refused sign-in, found here or by a pane's reconnect,
+    /// shows the bar that offers the way on, under that host's tabs only.
+    fn watch_host(&mut self, host: String, cx: &mut Context<Self>) {
+        let task = cx.spawn({
+            let host = host.clone();
+            async move |this, cx| loop {
+                // A host that changed is done with (Reopen decides again), and
+                // one whose tabs all went is gone.
+                let Ok(Some(remote)) = this.update(cx, |this, _| {
+                    this.hosts
+                        .get(&host)
+                        .filter(|h| h.changed.is_none())
+                        .and_then(|h| h.remote.clone())
+                }) else {
+                    return;
                 };
-                if let Some(RemoteError::NoLongerNative { message, .. }) = &refused {
-                    this.host_changed(message.clone(), cx);
+                let (link, connector, session) = (remote.link.clone(), remote.remote.clone(), remote.session.clone());
+                let kept = cx
+                    .background_executor()
+                    .spawn(async move { RemoteWindow::keep_up(&link, connector.as_ref(), &session) })
+                    .await;
+                let alive = this.update(cx, |this, cx| this.host_kept(&host, kept, cx));
+                if alive.is_err() {
                     return;
                 }
-                let bar = refused.as_ref().map(RemoteBar::of);
-                if kept == Ok(true) {
-                    this.request_refresh();
-                }
-                if bar != this.remote_bar {
-                    this.remote_bar = bar;
-                    cx.notify();
-                }
-            });
-            if alive.is_err() {
-                return;
+                cx.background_executor().timer(REMOTE_WATCH).await;
             }
-            cx.background_executor().timer(REMOTE_WATCH).await;
-        }));
+        });
+        if let Some(entry) = self.hosts.get_mut(&host) {
+            entry._watch = Some(task);
+        }
     }
 
-    /// The remote window's host no longer opens natively (it was upgraded,
-    /// or this Mac was, while the window was away): show `line` with Reopen
-    /// in place of the shell. The panes close on the next frame
-    /// ([`Self::close_remote_panes`]) and nothing more is sent to the far
-    /// daemon: every reconnect is refused by the same check.
-    fn host_changed(&mut self, line: String, cx: &mut Context<Self>) {
-        if self.remote_changed.is_some() {
+    /// A watch of `host`'s link came back with `kept`
+    /// ([`RemoteWindow::keep_up`]): its bar follows, a host that changed
+    /// shows Reopen, and a link back up refreshes the selected tab when it
+    /// is there.
+    fn host_kept(&mut self, host: &str, kept: Result<bool, Option<RemoteError>>, cx: &mut Context<Self>) {
+        let refused = match &kept {
+            Err(Some(error)) => Some(error.clone()),
+            Ok(true) => None,
+            _ => self.host_remote(host).and_then(RemoteWindow::refused),
+        };
+        if let Some(RemoteError::NoLongerNative { message, .. }) = &refused {
+            self.host_changed(host, message.clone(), cx);
             return;
         }
-        tracing::info!(line, "the remote window's host changed; offering Reopen");
-        self.remote_changed = Some(line.into());
-        self.remote_bar = None;
+        let shown = self.shown_host() == Some(host);
+        if kept == Ok(true) && shown {
+            self.request_refresh();
+        }
+        let bar = refused.as_ref().map(RemoteBar::of);
+        if let Some(entry) = self.hosts.get_mut(host) {
+            if entry.bar != bar {
+                entry.bar = bar;
+                cx.notify();
+            }
+        }
+    }
+
+    /// `host` no longer opens natively (it was upgraded, or this Mac was,
+    /// while the window was away): its tabs show `line` with Reopen in place
+    /// of the shell. The selected one's panes close on the next frame
+    /// ([`Self::close_remote_panes`]) and nothing more is sent to the far
+    /// daemon: every reconnect is refused by the same check. The window's
+    /// other tabs go on.
+    fn host_changed(&mut self, host: &str, line: String, cx: &mut Context<Self>) {
+        let Some(entry) = self.hosts.get_mut(host) else {
+            return;
+        };
+        if entry.changed.is_some() {
+            return;
+        }
+        tracing::info!(host, line, "a remote tab's host changed; offering Reopen");
+        entry.changed = Some(line.into());
+        entry.bar = None;
         cx.notify();
     }
 
-    /// Close a changed remote window's panes (their sessions detach; the far
-    /// agents keep running) and its views. Idempotent.
+    /// Close the selected tab's panes (their sessions detach; the far
+    /// agents keep running) and its views, its host having changed.
+    /// Idempotent.
     fn close_remote_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let open = self.chat.is_some()
             || self.workspace.is_some()
@@ -1711,27 +2003,29 @@ impl ShelbiWindow {
         }
     }
 
-    /// Reopen (a changed remote window's): this window closes and the
-    /// project opens again, in whichever window the host gets now (the
-    /// native one when it matches again, else the terminal view with its
-    /// notice).
+    /// Reopen (the selected tab's, its host having changed): the host is
+    /// let go and opened again, deciding afresh ([`Self::open_host`]): the
+    /// same Shelbi again shows the tab natively; any other says why in the
+    /// tab, and the terminal window stays a Try Again away.
     fn reopen_remote(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(remote) = self.remote.as_ref() else {
+        let Some(host) = self.shown_host().map(str::to_string) else {
             return;
         };
-        let session = remote.session.clone();
+        let key = self.project_handle.key().clone();
         self.close_remote_panes(window, cx);
-        window.remove_window();
-        cx.defer(move |cx| crate::views::remote_session::open_remote_session(session, cx));
+        if let Some(entry) = self.hosts.get_mut(&host) {
+            *entry = HostTabs::default();
+        }
+        self.show_pending(key, window, cx);
     }
 
-    /// View ▸ Open in Terminal View: this remote window's project in the far
+    /// View ▸ Open in Terminal View: the selected remote project in the far
     /// machine's TUI, in a terminal window of its own beside this one (both
-    /// attach to the same far sessions). A window on this machine has it
-    /// gray (the registry lists it only for a remote window); its project's
-    /// terminal view is `shelbi` in a terminal.
+    /// attach to the same far sessions). A project here has it gray (the
+    /// registry lists it only for a remote one); its terminal view is
+    /// `shelbi` in a terminal.
     fn open_terminal_view(&mut self, cx: &mut Context<Self>) {
-        let Some(remote) = self.remote.as_ref() else {
+        let Some(remote) = self.remote() else {
             let line = format!("{} is on this Mac: run shelbi in a terminal for its terminal view.", self.model.project_label);
             self.flash(line, cx);
             return;
@@ -1741,10 +2035,10 @@ impl ShelbiWindow {
         cx.defer(move |cx| crate::views::remote_session::open_terminal_view(session, connector, cx));
     }
 
-    /// The bar's Start: start Shelbi on the remote window's host (only ever
+    /// The bar's Start: start Shelbi on the selected tab's host (only ever
     /// on the user's say-so), then bring the link back up.
     fn start_far_daemon(&mut self, cx: &mut Context<Self>) {
-        let Some(remote) = self.remote.clone() else {
+        let Some(remote) = self.remote().cloned() else {
             return;
         };
         let host = remote.session.host.clone();
@@ -1756,13 +2050,13 @@ impl ShelbiWindow {
                 .connect(&|| shelbi_app::remote_window::reconnect_check(remote.remote.as_ref(), &remote.session))
                 .map(|_| ())
         });
-        self.after_far_action(work, format!("Started Shelbi on {host}."), cx);
+        self.after_far_action(host.clone(), work, format!("Started Shelbi on {host}."), cx);
     }
 
-    /// The bar's Sign In: the user wants the host again after refusing a
-    /// sign-in, so the link may ask once more.
+    /// The bar's Sign In: the user wants the selected tab's host again after
+    /// refusing a sign-in, so the link may ask once more.
     fn sign_in_to_far_host(&mut self, cx: &mut Context<Self>) {
-        let Some(remote) = self.remote.clone() else {
+        let Some(remote) = self.remote().cloned() else {
             return;
         };
         let host = remote.session.host.clone();
@@ -1774,13 +2068,14 @@ impl ShelbiWindow {
                 .connect(&|| shelbi_app::remote_window::reconnect_check(remote.remote.as_ref(), &remote.session))
                 .map(|_| ())
         });
-        self.after_far_action(work, format!("Signed in to {host}."), cx);
+        self.after_far_action(host.clone(), work, format!("Signed in to {host}."), cx);
     }
 
-    /// A far action that brings the link back up has finished: say `done`, or
-    /// what stands in its way.
+    /// A far action on `host` that brings its link back up has finished:
+    /// say `done`, or what stands in its way.
     fn after_far_action(
         &mut self,
+        host: String,
         work: gpui::Task<Result<(), RemoteError>>,
         done: String,
         cx: &mut Context<Self>,
@@ -1789,13 +2084,19 @@ impl ShelbiWindow {
             let result = work.await;
             this.update(cx, |this, cx| match result {
                 Ok(()) => {
-                    this.remote_bar = None;
+                    if let Some(entry) = this.hosts.get_mut(&host) {
+                        entry.bar = None;
+                    }
                     this.flash(done, cx);
-                    this.request_refresh();
+                    if this.shown_host() == Some(host.as_str()) {
+                        this.request_refresh();
+                    }
                 }
-                Err(RemoteError::NoLongerNative { message, .. }) => this.host_changed(message, cx),
+                Err(RemoteError::NoLongerNative { message, .. }) => this.host_changed(&host, message, cx),
                 Err(error) if sign_in_refused(&error) => {
-                    this.remote_bar = Some(RemoteBar::of(&error));
+                    if let Some(entry) = this.hosts.get_mut(&host) {
+                        entry.bar = Some(RemoteBar::of(&error));
+                    }
                     cx.notify();
                 }
                 Err(error) => {
@@ -1808,27 +2109,175 @@ impl ShelbiWindow {
         .detach();
     }
 
-    /// The remote bar's button.
+    /// The remote bar's button (the selected tab's host's bar).
     fn remote_bar_action(&mut self, cx: &mut Context<Self>) {
-        match self.remote_bar {
+        match self.shown_host_tabs().and_then(|h| h.bar.clone()) {
             Some(RemoteBar::Stopped(_)) => self.start_far_daemon(cx),
             Some(RemoteBar::SignIn(_)) => self.sign_in_to_far_host(cx),
             None => {}
         }
     }
 
+    /// The bar the selected tab shows for its host, if any.
+    fn remote_bar(&self) -> Option<RemoteBar> {
+        #[cfg(test)]
+        if let Some(bar) = &self.test_bar {
+            return Some(bar.clone());
+        }
+        self.shown_host_tabs()?.bar.clone()
+    }
+
+    /// Set the selected tab's host's bar (a test's): on the host's entry
+    /// for a remote tab, else drawn under whatever the window shows.
+    #[cfg(test)]
+    fn set_remote_bar(&mut self, bar: Option<RemoteBar>) {
+        match self.shown_host().map(str::to_string).and_then(|h| self.hosts.get_mut(&h)) {
+            Some(entry) => entry.bar = bar,
+            None => self.test_bar = bar,
+        }
+    }
+
+    /// The line the selected tab shows for its changed host, if any.
+    fn remote_changed(&self) -> Option<SharedString> {
+        self.shown_host_tabs()?.changed.clone()
+    }
+
+    /// Show `key`'s tab, its host not open here yet (a tab restored at
+    /// launch, dragged in, or reopened): the window shows no project, only
+    /// the tab's opening (and then why it couldn't, with Try Again), while
+    /// the host opens off the UI thread ([`Self::open_host`]). It never holds
+    /// up the window or its other tabs: a click on one switches as ever.
+    fn show_pending(&mut self, key: ProjectKey, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab_menu.close((self.clock)());
+        let id = tab_id(&key);
+        if self.on_new_tab() && !self.tabs.contains(&id) && self.tabs.replace(NEW_TAB, &id) {
+            self.tabs_changed(cx);
+        }
+        self.new_tab = None;
+        if !self.chooser {
+            self.remember_view_state(cx);
+            self.teardown_project(window, cx);
+        }
+        self.chooser = true;
+        if !matches!(self.route, Route::View) {
+            self.set_route(Route::View);
+        }
+        if self.tabs.insert(&id) {
+            self.tabs_changed(cx);
+        }
+        self.pending = Some(key.clone());
+        self.forget_idle_hosts();
+        self.model = SidebarModel::skeleton("");
+        self.palette_inputs = PaletteInputs::default();
+        window.set_window_title(&self.window_title());
+        self.open_host(&key, window, cx);
+        self.record_slot(cx);
+        self.sync_menus(cx);
+        cx.notify();
+    }
+
+    /// The selected tab is `pending`'s (a project whose host isn't open).
+    pub fn on_pending_tab(&self) -> bool {
+        self.chooser && self.pending.is_some()
+    }
+
+    /// Open `key`'s host off the UI thread, unless it is open or on its way:
+    /// its listing decides ([`crate::views::remote_session::decide_with`]),
+    /// over the app's link to it; it is never started here. The same
+    /// Shelbi joins the window's hosts, and a tab still waiting on it is
+    /// shown; any other leaves the line saying why on the host's tabs.
+    fn open_host(&mut self, key: &ProjectKey, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(host) = key.host().map(str::to_string) else {
+            return;
+        };
+        let entry = self.hosts.entry(host.clone()).or_default();
+        if entry.remote.is_some() || entry.opening == HostOpening::Opening {
+            return;
+        }
+        entry.opening = HostOpening::Opening;
+        let stub = RemoteSession {
+            host: host.clone(),
+            user: String::new(),
+            project: key.name.clone(),
+            label: None,
+            path: String::new(),
+        };
+        let connector = crate::platform::launch::services(cx).remote;
+        let links = crate::views::remote_session::host_links(cx);
+        let decide = cx.background_executor().spawn({
+            let (session, connector) = (stub.clone(), connector.clone());
+            async move { crate::views::remote_session::decide_with(&session, connector, &*links.0) }
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let decided = decide.await;
+            this.update_in(cx, |this, window, cx| this.host_decided(stub, connector, decided, window, cx))
+                .ok();
+        })
+        .detach();
+    }
+
+    /// [`Self::open_host`] came back with `decided` for `stub`'s host.
+    fn host_decided(
+        &mut self,
+        stub: RemoteSession,
+        connector: Arc<dyn RemoteConnector>,
+        decided: crate::views::remote_session::Decided,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::views::remote_session::Decided;
+        let host = stub.host.clone();
+        // Its tabs all went meanwhile: nothing to show it in.
+        let Some(entry) = self.hosts.get_mut(&host) else {
+            return;
+        };
+        match decided {
+            Decided::Native { listing, link } => {
+                let session = RemoteWindow::session_from(stub, &listing);
+                self.adopt_host(RemoteWindow::new(session, listing, link, connector), cx);
+                if let Some(key) = self.pending.clone().filter(|k| k.host() == Some(host.as_str()) && self.chooser) {
+                    self.switch_to_key(&key, window, cx);
+                }
+            }
+            Decided::Terminal { notice } => {
+                let line = notice.unwrap_or_else(|| {
+                    format!(
+                        "Shelbi couldn’t reach {}. Check that it is on and answers over SSH, then try again.",
+                        shelbi_app::remote_window::bare_host(&host)
+                    )
+                });
+                tracing::info!(host, line, "a remote tab's host didn't open");
+                entry.opening = HostOpening::Failed(line.into());
+                cx.notify();
+            }
+        }
+    }
+
+    /// Try Again, on a tab whose host couldn't open.
+    fn retry_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key) = self.pending.clone().filter(|_| self.chooser) else {
+            return;
+        };
+        if let Some(entry) = key.host().and_then(|h| self.hosts.get_mut(h)) {
+            entry.opening = HostOpening::Idle;
+        }
+        self.open_host(&key, window, cx);
+        cx.notify();
+    }
+
     /// A window that reaches nothing (a test's): the shell over the
     /// catalog's skeleton, commands and the palette's inputs recorded by a
-    /// tap, no feed, bootstrap or disk.
+    /// tap, no feed, bootstrap or disk. `key`'s project is here, or on another machine for
+    /// [`Self::become_remote`].
     #[cfg(test)]
-    pub(crate) fn inert(
-        project: &str,
+    pub(crate) fn inert_on(
+        key: &ProjectKey,
         slot: usize,
         window_state: WindowState,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut w = Self::build(project, window_state, window, cx);
+        let mut w = Self::build_on(key, window_state, window, cx);
         w.slot = slot;
         w.boot = Boot::Ready(Box::new(inert_ready()));
         w.tap = Some(Default::default());
@@ -1847,20 +2296,34 @@ impl ShelbiWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::build_on(&ProjectKey::local(project), window_state, window, cx)
+    }
+
+    /// [`Self::build`] on `key`'s project (its tab is `key`'s; a remote
+    /// one's host is the caller's to give it, [`Self::become_remote`]).
+    fn build_on(
+        key: &ProjectKey,
+        window_state: WindowState,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let project = key.name.as_str();
         let mut client = ClientState::new(project);
         client.set_sidebar_width(window_state.sidebar_width);
         // The saved tab order, and this window's project in it.
-        let mut tabs = ProjectTabs::new(window_state.tabs.iter().cloned());
-        tabs.insert(project);
+        let mut tabs = ProjectTabs::from_keys(&window_state.tabs);
+        if !project.is_empty() {
+            tabs.insert(&tab_id(key));
+        }
         let mut window_state = window_state;
-        window_state.tabs = tabs.projects();
+        window_state.tabs = tabs.keys();
         // Land on the orchestrator chat, focused, as the TUI does.
         client.set_view(View::Session("orch".into()));
         client.focus_main();
 
         let model = cx
             .try_global::<Catalog>()
-            .map(|c| c.first_frame_sidebar(&ProjectKey::local(project)))
+            .map(|c| c.first_frame_sidebar(key))
             .unwrap_or_else(|| SidebarModel::skeleton(project));
         // The built-in keymaps until the user's `keys.yaml` is read (below).
         let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
@@ -1877,10 +2340,11 @@ impl ShelbiWindow {
         ShelbiWindow {
             project: project.to_string(),
             project_handle: shelbi_orchestrator::source::local_handle(project),
-            remote: None,
-            remote_bar: None,
-            remote_changed: None,
-            _remote_watch: None,
+            hosts: BTreeMap::new(),
+            pending: None,
+            watches_hosts: false,
+            #[cfg(test)]
+            test_bar: None,
             slot: 0,
             chooser: false,
             chooser_highlight: 0,
@@ -2041,18 +2505,20 @@ impl ShelbiWindow {
         // It has the launch screen and the Connect to Remote Session dialog.
         model.launch_screen = true;
         model.remote_connect = true;
-        // A remote window lists what it can't run yet, disabled with why.
-        model.remote_host = self.remote.as_ref().map(|r| r.session.host.clone());
+        // A remote project lists what it can't run yet, disabled with why.
+        model.remote_host = self.remote().map(|r| r.session.host.clone());
         // The other tabs: what Close All Other Projects closes.
         let projects = self.tabs.projects();
-        model.open_others = shelbi_app::close_others::others(&projects, &self.project)
+        let shown = self.shown_id();
+        model.open_others = shelbi_app::close_others::others(&projects, &shown)
             .into_iter()
             .map(|slug| ProjectItem {
                 label: inputs
                     .other_projects
                     .iter()
                     .find(|p| p.slug == slug)
-                    .map_or_else(|| slug.to_string(), |p| p.label.clone()),
+                    .map(|p| p.label.clone())
+                    .unwrap_or_else(|| self.host_label(slug).unwrap_or_else(|| slug.to_string())),
                 slug: slug.to_string(),
             })
             .collect();
@@ -2102,19 +2568,21 @@ impl ShelbiWindow {
         if self.tap.is_some() {
             return;
         }
-        let project = self.project.clone();
+        // The shown tab's id: a project here is its name.
+        let project = self.shown_id();
         let source = self.project_handle.source.clone();
         let control = self.ready().map(|r| r.control.clone());
         let client_id = cx
             .try_global::<Shell>()
             .map(|s| s.client_id.clone())
             .unwrap_or_default();
-        let reading = project.clone();
-        let remote = self.remote.as_ref().map(RemoteWindow::projects);
+        let reading = self.project_handle.key().clone();
+        let remote = self.remote().map(RemoteWindow::project_ids);
         let read = cx.background_executor().spawn(async move {
             match remote {
-                // Only the far host's projects, from its listing; no local
-                // daemon is asked who else is attached.
+                // Only the far host's projects, from its listing (by tab id,
+                // so a pick switches to the far one); no local daemon is
+                // asked who else is attached.
                 Some(projects) => PaletteInputs::read_remote(&project, source.as_ref(), projects),
                 None => PaletteInputs::read(&project, source.as_ref(), control, &client_id),
             }
@@ -2122,7 +2590,7 @@ impl ShelbiWindow {
         cx.spawn(async move |this, cx| {
             let inputs = read.await;
             this.update(cx, |this, cx| {
-                if !this.shows(&reading) {
+                if !this.shows_key(&reading) {
                     return;
                 }
                 this.palette_inputs = inputs;
@@ -2298,12 +2766,12 @@ impl ShelbiWindow {
     /// Read the user's merged keymaps (`keys.yaml`) off the UI thread.
     fn load_keymaps(&mut self, cx: &mut Context<Self>) {
         let source = self.project_handle.source.clone();
-        let reading = self.project.clone();
+        let reading = self.project_handle.key().clone();
         let read = cx.background_executor().spawn(async move { source.project_keymap().0 });
         cx.spawn(async move |this, cx| {
             let keymaps = read.await;
             this.update(cx, |this, cx| {
-                if this.shows(&reading) {
+                if this.shows_key(&reading) {
                     this.adopt_keymaps(keymaps, cx);
                 }
             })
@@ -2420,7 +2888,7 @@ impl ShelbiWindow {
     fn open_project(&mut self, cx: &mut Context<Self>) {
         // A remote project is the far Shelbi's to run: its orchestrator is
         // never brought up from here (and the far daemon never started).
-        if self.remote.is_some() || self.chooser {
+        if !self.project_handle.key().is_local() || self.chooser {
             return;
         }
         let Some(ready) = self.ready() else {
@@ -2489,14 +2957,24 @@ impl ShelbiWindow {
             .unwrap_or_else(|| Arc::new(crate::views::review::LiveOps::new(self.project_handle.clone())))
     }
 
-    /// Whether the window shows `project` (not the chooser). Within one
-    /// window a name is enough: a window switches only among one machine's
-    /// projects. Across windows, ask [`Self::shows_key`].
-    pub fn shows(&self, project: &str) -> bool {
-        if project == NEW_TAB {
+    /// Whether the selected tab is tab `id`'s: its project (not the
+    /// chooser), a remote one still opening ([`Self::on_pending_tab`]), or for
+    /// [`NEW_TAB`] the New tab. A tab id names the machine too ([`tab_id`]):
+    /// `api` and `devbox:api` are two projects. Whether the window shows a
+    /// project's content is [`Self::shows_key`]'s.
+    pub fn shows(&self, id: &str) -> bool {
+        if id == NEW_TAB {
             return self.on_new_tab();
         }
-        !self.chooser && self.project == project
+        if self.on_pending_tab() {
+            return self.pending.as_ref().is_some_and(|k| tab_id(k) == id);
+        }
+        !self.chooser && self.shown_id() == id
+    }
+
+    /// The selected project's tab id (meaningless while [`Self::chooser`]).
+    fn shown_id(&self) -> String {
+        tab_id(self.project_handle.key())
     }
 
     /// The New tab is selected: the launch screen shows, no project.
@@ -2515,31 +2993,54 @@ impl ShelbiWindow {
         !self.chooser && self.project_handle.key().to_string() == id
     }
 
-    /// Switch this window to `project` in place. The outgoing project's
+    /// Switch this window to tab `id`'s project ([`Self::switch_to_key`]):
+    /// a bare name is a project here, `host:name` one on another machine,
+    /// and [`NEW_TAB`] the New tab ([`Self::open_new_tab`]).
+    pub fn switch_to(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if id == NEW_TAB {
+            self.open_new_tab(window, cx);
+            return;
+        }
+        self.switch_to_key(&tab_key(id), window, cx);
+    }
+
+    /// Switch this window to `key`'s project in place. The outgoing project's
     /// view state is saved and its views torn down (their sessions detach;
     /// the daemon's stay); the target's prefetched sidebar paints on the next
     /// frame with its own saved selection, and its main view is built (and
     /// attached) once that frame is drawn. The window keeps its frame, size
-    /// and sidebar width. Another window already showing `project` doesn't
-    /// matter: two windows may show one project.
+    /// and sidebar width. Another window already showing it doesn't matter:
+    /// two windows may show one project.
+    ///
+    /// A window's tabs mix machines (`mixed-host-tabs`): a project on another
+    /// machine is read and attached over its host's link, which every tab on
+    /// that host shares. One whose host isn't open here yet shows its tab
+    /// while the host opens ([`Self::show_pending`]).
     ///
     /// From the New tab, a project without a tab here takes the New tab's
     /// place (a pick on its launch screen, the wizard's new project, the
     /// palette); one with a tab leaves the New tab where it is (a click on
-    /// that tab). `project` the New tab selects it ([`Self::open_new_tab`]).
-    pub fn switch_to(&mut self, project: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if project == NEW_TAB {
+    /// that tab).
+    pub fn switch_to_key(&mut self, key: &ProjectKey, window: &mut Window, cx: &mut Context<Self>) {
+        if key.is_local() && key.name == NEW_TAB {
             self.open_new_tab(window, cx);
             return;
         }
         self.tab_menu.close((self.clock)());
-        if self.shows(project) {
+        if self.shows_key(key) {
             return;
         }
-        if self.on_new_tab() && !self.tabs.contains(project) && self.tabs.replace(NEW_TAB, project) {
+        if key.host().is_some_and(|host| self.host_remote(host).is_none()) {
+            self.show_pending(key.clone(), window, cx);
+            return;
+        }
+        let id = tab_id(key);
+        let project = key.name.as_str();
+        if self.on_new_tab() && !self.tabs.contains(&id) && self.tabs.replace(NEW_TAB, &id) {
             self.tabs_changed(cx);
         }
         self.new_tab = None;
+        self.pending = None;
         // Switched with Settings open (a tab, the palette): it reopens on the
         // same page, for the new project.
         let settings = matches!(self.route, Route::Settings(_)).then(|| self.settings_nav.page());
@@ -2548,21 +3049,23 @@ impl ShelbiWindow {
         self.chooser = false;
         self.project = project.to_string();
         // Its tab, at the end when it has none (saved with the slot below).
-        if self.tabs.insert(project) {
-            self.window_state.tabs = self.tabs.projects();
+        if self.tabs.insert(&id) {
+            self.window_state.tabs = self.tabs.keys();
         }
-        // A remote window switches among its host's projects only.
-        self.project_handle = match &mut self.remote {
+        // Here, or over its host's link.
+        self.project_handle = match key.host().and_then(|h| self.hosts.get_mut(h)?.remote.as_mut()) {
             Some(remote) => remote.handle_for(project),
             None => shelbi_orchestrator::source::local_handle(project),
         };
-        self.remote_bar = None;
+        // A host left with no tab (its last one moved or closed while shown)
+        // goes now that nothing shows it.
+        self.forget_idle_hosts();
         self.client.switch_project(project);
         self.model = cx
             .try_global::<Catalog>()
             .map(|c| c.first_frame_sidebar(self.project_handle.key()))
             .unwrap_or_else(|| SidebarModel::skeleton(project));
-        if let Some(label) = self.remote.as_ref().and_then(|r| r.label_of(project)) {
+        if let Some(label) = self.remote().and_then(|r| r.label_of(project)) {
             self.model.project_label = label;
         }
         self.notifier = notify::Tracker::new(&self.project_handle.key().to_string());
@@ -2591,7 +3094,7 @@ impl ShelbiWindow {
     /// Show no project: the empty-state chooser (the project the window
     /// showed was quit and no other is open). The window stays open.
     fn show_chooser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.chooser && self.new_tab.is_none() {
+        if self.chooser && self.new_tab.is_none() && self.pending.is_none() {
             return;
         }
         if !self.chooser {
@@ -2599,7 +3102,9 @@ impl ShelbiWindow {
             self.teardown_project(window, cx);
         }
         self.new_tab = None;
+        self.pending = None;
         self.chooser = true;
+        self.forget_idle_hosts();
         self.chooser_highlight = 0;
         self.model = SidebarModel::skeleton("");
         self.palette_inputs = PaletteInputs::default();
@@ -2628,6 +3133,8 @@ impl ShelbiWindow {
             self.teardown_project(window, cx);
         }
         self.chooser = true;
+        self.pending = None;
+        self.forget_idle_hosts();
         // Settings or a review open over the project don't come back with
         // the next one.
         if !matches!(self.route, Route::View) {
@@ -2914,8 +3421,14 @@ impl ShelbiWindow {
 
     /// Record this window's slot (its project and frame) and save the slots.
     fn record_slot(&mut self, cx: &mut Context<Self>) {
+        // A remote tab still opening is the project the window is on.
+        let project = if self.on_pending_tab() {
+            self.pending.clone()
+        } else {
+            (!self.chooser).then(|| self.project_handle.key().clone())
+        };
         let entry = window_state::Slot {
-            project: (!self.chooser).then(|| self.project_handle.key().clone()),
+            project,
             open: true,
             state: self.window_state.clone(),
         };
@@ -2957,22 +3470,23 @@ impl ShelbiWindow {
     /// aren't its host's, and its listing doesn't say which of those are
     /// open.
     pub(crate) fn after_quit_project(&mut self, quit: ProjectKey, window: &mut Window, cx: &mut Context<Self>) {
-        // A tab names a project on this window's machine.
-        let mine = quit.origin == self.project_handle.key().origin;
-        let neighbor = mine
-            .then(|| self.tabs.neighbor(&quit.name).map(str::to_string))
-            .flatten();
-        if mine && self.tabs.remove(&quit.name) {
+        // A tab names its project's machine too (`devbox:api` isn't `api`).
+        let id = tab_id(&quit);
+        let neighbor = self.tabs.neighbor(&id).map(str::to_string);
+        let pending = self.on_pending_tab() && self.pending.as_ref() == Some(&quit);
+        if self.tabs.remove(&id) {
             self.tabs_changed(cx);
         }
-        if !self.shows_key(&quit) {
+        if !self.shows_key(&quit) && !pending {
             return;
         }
         if neighbor.is_some() {
             self.leave_quit_project(neighbor, window, cx);
             return;
         }
-        let none_to_read = self.offline() || self.remote.is_some();
+        // Only this machine's open set is read; nothing opens a project on
+        // another machine for the window by itself.
+        let none_to_read = self.offline() || !quit.is_local();
         let name = quit.name.clone();
         let next = cx.background_executor().spawn(async move {
             if none_to_read {
@@ -2986,10 +3500,10 @@ impl ShelbiWindow {
         cx.spawn_in(window, async move |this, cx| {
             let next = next.await;
             this.update_in(cx, |this, window, cx| {
-                if this.shows_key(&quit) {
+                if this.shows_key(&quit) || (this.on_pending_tab() && this.pending.as_ref() == Some(&quit)) {
                     // Back on it meanwhile: its tab goes again, and a tab
                     // opened since takes over.
-                    if this.tabs.remove(&quit.name) {
+                    if this.tabs.remove(&tab_id(&quit)) {
                         this.tabs_changed(cx);
                     }
                     let next = this.tabs.order().first().cloned().or(next);
@@ -3295,7 +3809,7 @@ impl ShelbiWindow {
     /// Why `kind` can't run in this window (a remote window's reasons,
     /// `shelbi_app::remote_window::command_unavailable`), or `None`.
     pub(crate) fn unavailable(&self, kind: &CommandKind) -> Option<String> {
-        let host = self.remote.as_ref()?.session.host.as_str();
+        let host = self.remote()?.session.host.as_str();
         shelbi_app::remote_window::command_unavailable(kind, host)
     }
 
@@ -3369,18 +3883,21 @@ impl ShelbiWindow {
             HostCall::SwitchProject(project) => self.switch_to(&project, window, cx),
             HostCall::NewWindow => {
                 if !self.chooser {
-                    let project = self.project.clone();
+                    // On the same machine's project (over its host's link
+                    // for one on another).
+                    let key = self.project_handle.key().clone();
+                    let host = self.remote().cloned();
                     // After this update, so the new window's first frame
                     // isn't nested in ours.
                     cx.defer(move |cx| {
-                        open_new_window(&project, cx);
+                        open_new_window_on(&key, host, cx);
                     });
                 }
             }
             // Switch Project… with no project named: the New tab's launch
             // screen lists them (the chooser already does).
             HostCall::OpenNewTab => {
-                if !self.chooser || self.new_tab.is_some() {
+                if !self.chooser || self.new_tab.is_some() || self.pending.is_some() {
                     self.open_new_tab(window, cx);
                 }
             }
@@ -3389,7 +3906,7 @@ impl ShelbiWindow {
             HostCall::DetachOthers => self.detach_others(cx),
             HostCall::QuitProject => self.confirm_quit_project(window, cx),
             HostCall::CloseOtherProjects => {
-                let keep = self.project.clone();
+                let keep = self.shown_id();
                 self.confirm_close_other_projects(keep, window, cx);
             }
             HostCall::QuitShelbi => self.confirm_quit_shelbi(window, cx),
@@ -3651,7 +4168,10 @@ impl ShelbiWindow {
                 }
                 if let Some(s) = session {
                     this.flash(format!("Connected to {} on {}.", s.display_label(), s.host), cx);
-                    crate::views::remote_session::open_remote_session(s.clone(), cx);
+                    // A tab in this window (`mixed-host-tabs`), after this
+                    // update.
+                    let (s, me) = (s.clone(), window.window_handle());
+                    cx.defer(move |cx| crate::views::remote_session::open_remote_session_in(s, Some(me), cx));
                 }
                 cx.notify();
             }
@@ -4721,43 +5241,42 @@ impl ShelbiWindow {
 
     // --- project tabs --------------------------------------------------------
 
-    /// The open set the tabs follow: the catalog's, `None` before it has
-    /// been read, and always for a remote window (its host's listing doesn't
-    /// say which projects are open).
+    /// The open set the tabs follow: this machine's, from the catalog,
+    /// `None` before it has been read. Another machine's tabs aren't in it
+    /// and never go by it (its host's listing doesn't say which projects are
+    /// open there).
     fn open_set(&self, cx: &App) -> Option<Vec<String>> {
-        if self.remote.is_some() {
-            return None;
-        }
         cx.try_global::<Catalog>().and_then(|c| c.open_projects())
     }
 
     /// Bring the tabs in line with the open set ([`ProjectTabs::reconcile`]).
     fn sync_tabs(&mut self, cx: &mut Context<Self>) {
         let open = self.open_set(cx);
-        let current = (!self.chooser).then_some(self.project.as_str());
-        // The other local windows' tabs: a project one of them has a tab for
-        // (one torn off into its own window, or a project opened there)
-        // gets none here.
-        let me = self.handle.map(|h| h.window_id());
-        let elsewhere: Vec<String> = if self.remote.is_some() {
-            Vec::new()
+        let current = if self.on_pending_tab() {
+            self.pending.as_ref().map(tab_id)
         } else {
-            shelbi_windows(cx)
-                .into_iter()
-                .filter(|h| Some(h.window_id()) != me)
-                .filter_map(|h| h.read(cx).ok())
-                .filter(|w| w.remote.is_none())
-                .flat_map(|w| w.tabs.order().to_vec())
-                .collect()
+            (!self.chooser).then(|| self.shown_id())
         };
-        if self.tabs.reconcile(open.as_deref(), current, &elsewhere) {
+        // The other windows' tabs: a project one of them has a tab for (one
+        // torn off into its own window, or a project opened there) gets none
+        // here.
+        let me = self.handle.map(|h| h.window_id());
+        let elsewhere: Vec<String> = shelbi_windows(cx)
+            .into_iter()
+            .filter(|h| Some(h.window_id()) != me)
+            .filter_map(|h| h.read(cx).ok())
+            .flat_map(|w| w.tabs.order().to_vec())
+            .collect();
+        if self.tabs.reconcile(open.as_deref(), current.as_deref(), &elsewhere) {
             self.tabs_changed(cx);
         }
     }
 
-    /// The tabs changed: save their order with the window's state.
+    /// The tabs changed: save their order with the window's state, and let
+    /// a host go once none of them is on it.
     fn tabs_changed(&mut self, cx: &mut Context<Self>) {
-        self.window_state.tabs = self.tabs.projects();
+        self.window_state.tabs = self.tabs.keys();
+        self.forget_idle_hosts();
         if self.hovered_tab.as_ref().is_some_and(|h| !self.tabs.contains(h)) {
             self.hovered_tab = None;
         }
@@ -4792,37 +5311,49 @@ impl ShelbiWindow {
         .detach();
     }
 
-    /// `project`'s label: the shown project's from its model, another's from
-    /// the host's listing or the catalog, else its id.
-    fn project_label(&self, project: &str, cx: &App) -> String {
-        if self.shows(project) {
+    /// Tab `id`'s label: the shown project's from its model, another's from
+    /// its host's listing or the catalog, else its project id.
+    fn project_label(&self, id: &str, cx: &App) -> String {
+        if !self.chooser && self.shown_id() == id {
             return self.model.project_label.clone();
         }
-        self.remote
-            .as_ref()
-            .and_then(|r| r.label_of(project))
-            .or_else(|| cx.try_global::<Catalog>().and_then(|c| c.label_of(project)))
-            .unwrap_or_else(|| project.to_string())
+        let key = tab_key(id);
+        match key.host() {
+            Some(_) => self.host_label(id).unwrap_or(key.name),
+            None => cx.try_global::<Catalog>().and_then(|c| c.label_of(id)).unwrap_or(key.name),
+        }
     }
 
-    /// The tabs as the bar draws them.
+    /// A remote tab `id`'s label from its host's listing, once the host is
+    /// open here.
+    fn host_label(&self, id: &str) -> Option<String> {
+        let key = tab_key(id);
+        self.host_remote(key.host()?)?.label_of(&key.name)
+    }
+
+    /// The tabs as the bar draws them: a project on another machine names
+    /// its host before its label.
     fn tab_props(&self, cx: &App) -> Vec<tab_bar::Tab> {
         self.tabs
             .order()
             .iter()
-            .map(|name| {
-                let label = if name == NEW_TAB {
+            .map(|id| {
+                let key = tab_key(id);
+                let label = if id == NEW_TAB {
                     tab_bar::NEW_TAB_LABEL.to_string()
                 } else {
-                    self.project_label(name, cx)
+                    self.project_label(id, cx)
                 };
                 tab_bar::Tab {
-                    name: name.clone(),
+                    name: id.clone(),
                     label: label.into(),
-                    selected: self.shows(name),
-                    working: self.remote.is_none()
-                        && name != NEW_TAB
-                        && cx.try_global::<Catalog>().is_some_and(|c| c.is_working(name)),
+                    host: key
+                        .host()
+                        .map(|h| shelbi_app::remote_window::bare_host(h).to_string().into()),
+                    selected: self.shows(id),
+                    working: key.is_local()
+                        && id != NEW_TAB
+                        && cx.try_global::<Catalog>().is_some_and(|c| c.is_working(id)),
                 }
             })
             .collect()
@@ -4854,12 +5385,12 @@ impl ShelbiWindow {
         }
     }
 
-    /// The projects the switcher lists (the catalog's, empty until it has
-    /// loaded).
+    /// The projects the switcher lists: the selected tab's machine's, by
+    /// tab id (the catalog's, empty until it has loaded, for one here).
     fn switcher_projects(&self, cx: &App) -> Vec<ProjectEntry> {
-        if let Some(remote) = &self.remote {
+        if let Some(remote) = self.remote() {
             return remote
-                .projects()
+                .project_ids()
                 .into_iter()
                 .map(|(name, label)| ProjectEntry { name, label })
                 .collect();
@@ -4871,11 +5402,12 @@ impl ShelbiWindow {
     /// them: in the same order, each with its dot (the chooser has no
     /// current project).
     fn switcher_rows(&self, cx: &App) -> Vec<shelbi_app::overlay::palette::ProjectEntry> {
-        let current = if self.chooser { "" } else { self.project.as_str() };
-        if let Some(remote) = &self.remote {
+        let shown = self.shown_id();
+        let current = if self.chooser { "" } else { shown.as_str() };
+        if let Some(remote) = self.remote() {
             return shelbi_app::command_model::project_rows(
                 current,
-                remote.projects(),
+                remote.project_ids(),
                 &shelbi_app::command_model::ProjectLiveness::default(),
             );
         }
@@ -5033,18 +5565,33 @@ impl ShelbiWindow {
 
     /// Quit Project (the palette, the menus): close the shown project.
     fn confirm_quit_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let project = self.project.clone();
+        let project = if self.on_pending_tab() {
+            self.pending.as_ref().map(tab_id).unwrap_or_default()
+        } else {
+            self.shown_id()
+        };
         self.confirm_close_project(project, window, cx);
     }
 
     /// Close `project` (its tab's `×`, its context menu, File ▸ Close
     /// Project…, Quit Project), once the user confirms: its agents stop, its
     /// tab goes from every window, and a window that showed it moves to its
-    /// neighbor tab. A remote window shows a tab before closing it, as it
-    /// always has.
+    /// neighbor tab. A remote project's tab is shown before it closes, as a
+    /// remote window always has; one whose host isn't open here has nothing
+    /// to stop from here, and its tab just closes.
+    ///
+    /// `project` is a tab id ([`tab_id`]): the quit goes to its machine's
+    /// daemon (this one's, or the far host's over its link).
     fn confirm_close_project(&mut self, project: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.remote.is_some() && !self.shows(&project) {
-            self.switch_to(&project, window, cx);
+        let quit_key = self.tab_key(&project);
+        if let Some(host) = quit_key.host() {
+            if self.host_remote(host).is_none() {
+                self.after_quit_project(quit_key, window, cx);
+                return;
+            }
+            if !self.shows(&project) {
+                self.switch_to(&project, window, cx);
+            }
         }
         let label = self.project_label(&project, cx);
         let answer = window.prompt(
@@ -5054,8 +5601,8 @@ impl ShelbiWindow {
             &["Close Project", "Cancel"],
             cx,
         );
-        let quit_key = self.tab_key(&project);
-        let route = self.quit_route();
+        let route = self.quit_route(&quit_key);
+        let name = quit_key.name.clone();
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
                 return;
@@ -5070,7 +5617,7 @@ impl ShelbiWindow {
                 }
             })
             .ok();
-            let quit = cx.background_executor().spawn(async move { route.quit(&project) }).await;
+            let quit = cx.background_executor().spawn(async move { route.quit(&name) }).await;
             this.update_in(cx, |this, window, cx| this.project_quit_landed(quit_key, label, quit, window, cx))
                 .ok();
         })
@@ -5107,20 +5654,28 @@ impl ShelbiWindow {
             }
             // The kept tab first, so none of the closing projects is on
             // screen while it quits.
-            let Ok(route) = this.update_in(cx, |this, window, cx| {
-                if !this.shows(&keep) && this.tabs.contains(&keep) {
-                    this.switch_to(&keep, window, cx);
-                }
-                this.quit_route()
-            }) else {
+            if this
+                .update_in(cx, |this, window, cx| {
+                    if !this.shows(&keep) && this.tabs.contains(&keep) {
+                        this.switch_to(&keep, window, cx);
+                    }
+                })
+                .is_err()
+            {
                 return;
-            };
+            }
             for (project, label) in closing.into_iter().zip(labels) {
-                let route = route.clone();
-                let Ok(key) = this.update(cx, |this, _| this.tab_key(&project)) else {
+                // Each through its own machine's daemon (a tab on a host
+                // that isn't open just closes).
+                let Ok((key, route)) = this.update(cx, |this, _| {
+                    let key = this.tab_key(&project);
+                    let route = this.quit_route(&key);
+                    (key, route)
+                }) else {
                     return;
                 };
-                let quit = cx.background_executor().spawn(async move { route.quit(&project) }).await;
+                let name = key.name.clone();
+                let quit = cx.background_executor().spawn(async move { route.quit(&name) }).await;
                 if this
                     .update_in(cx, |this, window, cx| this.project_quit_landed(key, label, quit, window, cx))
                     .is_err()
@@ -5132,19 +5687,29 @@ impl ShelbiWindow {
         .detach();
     }
 
-    /// The key a tab's `project` names: a project on this window's machine.
-    fn tab_key(&self, project: &str) -> ProjectKey {
-        ProjectKey {
-            origin: self.project_handle.key().origin.clone(),
-            name: project.to_string(),
-        }
+    /// The key tab `id` names ([`tab_key`]).
+    fn tab_key(&self, id: &str) -> ProjectKey {
+        tab_key(id)
     }
 
-    /// How a confirmed close reaches the daemon that quits a project, read
-    /// now (it's used off the UI thread).
-    fn quit_route(&self) -> QuitRoute {
+    /// How a confirmed close reaches the daemon that quits `key`'s project,
+    /// read now (it's used off the UI thread): its host's link for one on
+    /// another machine (none when the host isn't open here: nothing to stop
+    /// from here), this machine's control socket for one here.
+    fn quit_route(&self, key: &ProjectKey) -> QuitRoute {
+        let far = match key.host() {
+            None => QuitFar::Here,
+            Some(host) if self.shows_key(key) => match self.host_remote(host) {
+                Some(_) => QuitFar::Link(self.project_handle.link.clone()),
+                None => QuitFar::Unopened,
+            },
+            Some(host) => match self.host_remote(host) {
+                Some(remote) => QuitFar::Link(remote.link_for(&key.name)),
+                None => QuitFar::Unopened,
+            },
+        };
         QuitRoute {
-            link: self.project_handle.link.clone(),
+            far,
             control: self.ready().map(|r| r.control.clone()),
         }
     }
@@ -5534,7 +6099,7 @@ impl ShelbiWindow {
             return;
         }
         let source = self.project_handle.source.clone();
-        let reading = self.project.clone();
+        let reading = self.project_handle.key().clone();
         let read = cx.background_executor().spawn(async move {
             let changelog = source.changelog(None).map(|c| c.entries).unwrap_or_default();
             shelbi_app::overlay::palette_search::corpus_from_reads(source.open_board(), changelog)
@@ -5542,7 +6107,7 @@ impl ShelbiWindow {
         cx.spawn(async move |this, cx| {
             let read = read.await;
             this.update(cx, |this, cx| {
-                if !this.shows(&reading) {
+                if !this.shows_key(&reading) {
                     return;
                 }
                 let (issues, changelog) = this.palette_corpus_held(cx);
@@ -6022,6 +6587,7 @@ impl ShelbiWindow {
         }
         let ProjectHandle { source, link } = self.project_handle.clone();
         let (ops, project) = (self.review_ops(), self.project.clone());
+        let deciding = self.project_handle.key().clone();
         let id_for_state = id.clone();
         #[cfg(test)]
         let seam = self.review_mutation.clone();
@@ -6042,7 +6608,7 @@ impl ShelbiWindow {
                 match result {
                     // The window switched projects meanwhile: only the sessions
                     // are left to see to.
-                    Ok(()) if this.project != project => {
+                    Ok(()) if *this.project_handle.key() != deciding => {
                         // Its reason is another project's: the link has moved on,
                         // so the threads just stay unsent.
                         this.reject_reasons.remove(&id);
@@ -6275,8 +6841,9 @@ impl ShelbiWindow {
             return;
         }
         // The New tab's launch screen took its own keys (↑↓, Return) before
-        // they got here; the window's chords still work over it.
-        if self.chooser && self.new_tab.is_none() {
+        // they got here; the window's chords still work over it, and over a
+        // remote tab still opening.
+        if self.chooser && self.new_tab.is_none() && self.pending.is_none() {
             if self.chooser_key(chord.code, window, cx) {
                 cx.stop_propagation();
                 cx.notify();
@@ -6648,20 +7215,6 @@ impl Render for ShelbiWindow {
         let theme = *cx.global::<Theme>();
         let weak = cx.entity().downgrade();
         match &self.boot {
-            // A native remote window whose host changed: no shell, no panes,
-            // only Reopen.
-            Boot::Ready(_) if self.remote_changed.is_some() => {
-                cx.defer_in(window, |this, window, cx| this.close_remote_panes(window, cx));
-                let line = self.remote_changed.clone().unwrap_or_default();
-                let host = self
-                    .remote
-                    .as_ref()
-                    .map(|r| shelbi_app::remote_window::bare_host(&r.session.host).to_string())
-                    .unwrap_or_default();
-                boot_view::render_remote_changed(&host, &line, &theme, move |window, cx| {
-                    let _ = weak.update(cx, |this, cx| this.reopen_remote(window, cx));
-                })
-            }
             Boot::Ready(_) => self.render_shell(&theme, window, cx),
             Boot::InFlight(state) => boot_view::render_progress(state, &theme),
             Boot::Failed(failure) => boot_view::render_failure(
@@ -6685,14 +7238,19 @@ impl ShelbiWindow {
         #[cfg(feature = "visual-check")]
         let render_start = Instant::now();
         let theme = *theme;
+        // The selected tab's host changed: its views stay closed (only
+        // Reopen shows), so nothing below builds or attaches one.
+        let host_changed = !self.chooser && self.remote_changed().is_some();
         // The chat attaches the first time the shell paints with it routed
         // (bootstrap has no window to hand it); later changes go through
         // `perform`. Idempotent.
-        self.sync_chat(window, cx);
+        if !host_changed {
+            self.sync_chat(window, cx);
+        }
         self.settle_detail_over(cx);
         // A switch (or a new window): this frame paints the project's
         // sidebar; the next builds its main view and attaches its sessions.
-        if let Some(hold) = self.switch_hold.as_mut() {
+        if let Some(hold) = self.switch_hold.as_mut().filter(|_| !host_changed) {
             if hold.rendered {
                 let hold = self.switch_hold.take().expect("held");
                 cx.defer_in(window, move |this, window, cx| this.finish_switch(hold, window, cx));
@@ -6818,7 +7376,7 @@ impl ShelbiWindow {
                         scroll: self.sidebar_scroll.clone(),
                         track: self.nav_track.clone(),
                         chip,
-                        remote: self.remote.as_ref().map(|r| sidebar::RemoteBadge {
+                        remote: self.remote().map(|r| sidebar::RemoteBadge {
                             address: format!(
                                 "{}@{}",
                                 r.session.user,
@@ -6962,7 +7520,7 @@ impl ShelbiWindow {
         // Where the bar is, for a tab dragged from another window: its paint
         // says, and a frame without it says none.
         self.tab_reorder.layout.borrow_mut().bar = None;
-        let tab_bar = (!editing_workflow && (!self.chooser || self.new_tab.is_some())).then(|| {
+        let tab_bar = (!editing_workflow && (!self.chooser || self.new_tab.is_some() || self.pending.is_some())).then(|| {
             let tabs = self.tab_props(cx);
             tab_bar::render(
                 TabBarProps {
@@ -7039,9 +7597,34 @@ impl ShelbiWindow {
                     .h_full()
                     .child(launch),
             )
+        } else if let Some(key) = self.pending.clone().filter(|_| self.chooser) {
+            // A remote tab whose host is opening, or couldn't: only that
+            // tab's, under the bar (the other tabs stay a click away).
+            let host = shelbi_app::remote_window::bare_host(key.host().unwrap_or_default()).to_string();
+            let opening = key.host().and_then(|h| self.hosts.get(h)).map(|h| h.opening.clone());
+            let screen = match opening {
+                Some(HostOpening::Failed(line)) => {
+                    let weak = cx.entity().downgrade();
+                    boot_view::render_remote_unopened(&host, &key.name, &line, &theme, move |window, cx| {
+                        let _ = weak.update(cx, |this, cx| this.retry_pending(window, cx));
+                    })
+                }
+                _ => boot_view::render_remote_opening(&host, &key.name, &theme),
+            };
+            shell.child(div().debug_selector(|| "remote-tab".into()).flex().flex_1().min_w_0().h_full().child(screen))
         } else if self.chooser {
             let chooser = self.render_chooser(&theme, cx);
             shell.child(chooser)
+        } else if let Some(line) = self.remote_changed() {
+            // The selected tab's host changed: no panes, only Reopen, in
+            // the tab (the window's other tabs go on).
+            cx.defer_in(window, |this, window, cx| this.close_remote_panes(window, cx));
+            let host = shelbi_app::remote_window::bare_host(self.shown_host().unwrap_or_default()).to_string();
+            let weak = cx.entity().downgrade();
+            let screen = boot_view::render_remote_changed(&host, &line, &theme, move |window, cx| {
+                let _ = weak.update(cx, |this, cx| this.reopen_remote(window, cx));
+            });
+            shell.child(div().debug_selector(|| "remote-tab".into()).flex().flex_1().min_w_0().h_full().child(screen))
         } else {
             let main = self.render_main(&theme, cx);
             shell.children(column).children(handle).child(main)
@@ -7073,7 +7656,7 @@ impl ShelbiWindow {
         let relaunch = self.ready().and_then(|r| r.control.relaunch_required());
         let weak = cx.entity().downgrade();
         let bar_weak = weak.clone();
-        let remote_bar = self.remote_bar.clone();
+        let remote_bar = self.remote_bar();
         let layer = self.overlay.as_ref().map(|o| {
             let entering = if reduce_motion {
                 None
@@ -7519,6 +8102,10 @@ mod tabs_tests;
 #[cfg(test)]
 #[path = "app_new_tab_tests.rs"]
 mod new_tab_tests;
+
+#[cfg(test)]
+#[path = "app_mixed_tabs_tests.rs"]
+mod mixed_tabs_tests;
 
 #[cfg(test)]
 mod tests {

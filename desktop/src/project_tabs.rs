@@ -18,18 +18,49 @@
 //! window ([`ProjectTabs::insert_at`] there); the order is saved the same
 //! way, so ⌘1 to ⌘9 and the next launch follow it.
 //!
+//! A window mixes projects from this machine and from other machines it has
+//! a remote session with (`mixed-host-tabs`). A tab is named by its project's
+//! [`ProjectKey`] as a string ([`tab_id`]): the bare name for a project here
+//! (`web`), `host:name` for one on another machine (`devbox:web`), so a local
+//! `api` and `devbox:api` are two tabs. A project id is lowercase
+//! `[a-z0-9_-]`, never a `:`, so [`tab_key`] reads either back exactly. The
+//! open set is this machine's: it never drops another machine's tab.
+//!
 //! A window may also hold one New tab ([`NEW_TAB`], `new-tab-launch`): the
 //! `+` adds it, and it shows the launch screen until a project takes its
 //! place ([`ProjectTabs::replace`]). It is no project: the open set never
 //! drops it, it is left out of what is saved ([`ProjectTabs::projects`]), and
 //! nothing that closes projects counts it.
 
+use shelbi_app::source::ProjectKey;
+
 /// The New tab's id among the projects': a `/` never appears in a project
 /// id (a file stem), so no project can be named this.
 pub const NEW_TAB: &str = "/new-tab";
 
-/// The tabs, in order. Project ids (`projects/<name>.yaml` stems, or a remote
-/// window's far project names).
+/// The tab id of `key`'s project: its name here, `host:name` on another
+/// machine (the key's own string form, which notices use too).
+pub fn tab_id(key: &ProjectKey) -> String {
+    key.to_string()
+}
+
+/// The project a tab id names ([`tab_id`] read back): `host:name` is `name`
+/// on `host` (a project id has no `:`; a host may), anything else is a
+/// project here.
+pub fn tab_key(id: &str) -> ProjectKey {
+    match id.rsplit_once(':') {
+        Some((host, name)) if !host.is_empty() && !name.is_empty() => ProjectKey::remote(host, name),
+        _ => ProjectKey::local(id),
+    }
+}
+
+/// Whether tab `id` is a project on another machine.
+pub fn is_remote_id(id: &str) -> bool {
+    !tab_key(id).is_local()
+}
+
+/// The tabs, in order, by tab id ([`tab_id`]: a project here, or on another
+/// machine).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ProjectTabs {
     order: Vec<String>,
@@ -55,10 +86,25 @@ impl ProjectTabs {
         n.checked_sub(1).and_then(|i| self.order.get(i)).map(String::as_str)
     }
 
-    /// The tabs' projects, in order, without the New tab: what the window
-    /// saves, and what closing other projects counts.
+    /// The tabs' projects, in order, without the New tab: what closing other
+    /// projects counts.
     pub fn projects(&self) -> Vec<String> {
         self.order.iter().filter(|p| *p != NEW_TAB).cloned().collect()
+    }
+
+    /// [`Self::projects`] as keys: what the window saves.
+    pub fn keys(&self) -> Vec<ProjectKey> {
+        self.order.iter().filter(|p| *p != NEW_TAB).map(|p| tab_key(p)).collect()
+    }
+
+    /// Tabs for saved `keys`, in order.
+    pub fn from_keys<'a>(keys: impl IntoIterator<Item = &'a ProjectKey>) -> ProjectTabs {
+        ProjectTabs::new(keys.into_iter().map(tab_id))
+    }
+
+    /// Whether any tab is a project on `host`.
+    pub fn has_host(&self, host: &str) -> bool {
+        self.order.iter().any(|p| tab_key(p).host() == Some(host))
     }
 
     pub fn contains(&self, project: &str) -> bool {
@@ -151,15 +197,17 @@ impl ProjectTabs {
     /// another window has one for it (`elsewhere`: a tab torn off into its
     /// own window, or moved to another, stays where it went), and
     /// `current` (the window's own project, `None` on the chooser) keeps or
-    /// gets one either way. The New tab is no project: it stays. With `open` unknown (`None`: a remote window,
-    /// whose host's listing doesn't say what is open, or a catalog not yet
-    /// read) nothing goes, and only `current` is added. Whether the tabs
-    /// changed.
+    /// gets one either way. The New tab is no project: it stays. `open` is
+    /// this machine's open set, so another machine's tab stays too (its
+    /// host's listing doesn't say what is open there). With `open` unknown
+    /// (`None`: a catalog not yet read) nothing goes, and only `current` is
+    /// added. Whether the tabs changed.
     pub fn reconcile(&mut self, open: Option<&[String]>, current: Option<&str>, elsewhere: &[String]) -> bool {
         let before = self.order.clone();
         if let Some(open) = open {
-            self.order
-                .retain(|p| p == NEW_TAB || current == Some(p.as_str()) || open.iter().any(|o| o == p));
+            self.order.retain(|p| {
+                p == NEW_TAB || current == Some(p.as_str()) || is_remote_id(p) || open.iter().any(|o| o == p)
+            });
             for project in open.iter().filter(|p| !elsewhere.contains(p)) {
                 self.insert(project);
             }
@@ -330,6 +378,42 @@ mod tests {
         let mut t = tabs(&["web"]);
         assert!(t.replace(NEW_TAB, "api"));
         assert_eq!(t.order(), ["web", "api"]);
+    }
+
+    #[test]
+    fn a_tab_id_is_the_projects_key() {
+        assert_eq!(tab_id(&ProjectKey::local("api")), "api");
+        assert_eq!(tab_id(&ProjectKey::remote("devbox", "api")), "devbox:api");
+        assert_eq!(tab_key("api"), ProjectKey::local("api"));
+        assert_eq!(tab_key("devbox:api"), ProjectKey::remote("devbox", "api"));
+        // A host may carry a user, or a `:` of its own; a project id never does.
+        assert_eq!(tab_key("me@devbox:api"), ProjectKey::remote("me@devbox", "api"));
+        assert_eq!(tab_key("[::1]:api"), ProjectKey::remote("[::1]", "api"));
+        assert_eq!(tab_key(NEW_TAB), ProjectKey::local(NEW_TAB));
+        assert!(is_remote_id("devbox:api"));
+        assert!(!is_remote_id("api"));
+    }
+
+    #[test]
+    fn a_local_and_a_remote_project_of_one_name_are_two_tabs() {
+        let mut t = tabs(&["api"]);
+        assert!(t.insert("devbox:api"));
+        assert_eq!(t.order(), ["api", "devbox:api"]);
+        assert_eq!(t.keys(), [ProjectKey::local("api"), ProjectKey::remote("devbox", "api")]);
+        assert!(t.has_host("devbox"));
+        assert!(!t.has_host("studio"));
+        assert_eq!(ProjectTabs::from_keys(&t.keys()), t);
+    }
+
+    #[test]
+    fn the_open_set_never_drops_another_machines_tab() {
+        // The open set is this machine's: `devbox:api` isn't in it, and stays.
+        let mut t = tabs(&["web", "devbox:api", "docs"]);
+        assert!(t.reconcile(Some(&open(&["web"])), Some("web"), &[]));
+        assert_eq!(t.order(), ["web", "devbox:api"]);
+        // Selected, a remote tab is `current`; the local ones still follow.
+        assert!(t.reconcile(Some(&open(&["web", "api"])), Some("devbox:api"), &[]));
+        assert_eq!(t.order(), ["web", "devbox:api", "api"]);
     }
 
     #[test]

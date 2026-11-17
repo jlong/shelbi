@@ -458,6 +458,45 @@ pub fn render_remote_changed(
     render_screen(&screen, ("remote-reopen", icons::ARROW_PATH, REOPEN_LABEL), theme, on_reopen)
 }
 
+/// What a remote project's tab shows while its host is being opened (a tab
+/// restored at launch, or dragged in from a window that hadn't opened it):
+/// that tab's alone, so the window and its other tabs go on meanwhile
+/// (`mixed-host-tabs`).
+pub fn render_remote_opening(host: &str, project: &str, theme: &Theme) -> AnyElement {
+    centered(theme)
+        .debug_selector(|| "remote-opening".into())
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_2()
+                .child(div().type_style(Type::Heading).text_color(theme.accent).child("Shelbi"))
+                .child(div().text_color(theme.foreground).child(format!("Opening {project} on {host}…"))),
+        )
+        .into_any_element()
+}
+
+/// A remote project's tab whose host couldn't be opened: `line` says why,
+/// and Try Again opens it again. Only that tab shows it.
+pub fn render_remote_unopened(
+    host: &str,
+    project: &str,
+    line: &str,
+    theme: &Theme,
+    on_retry: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let screen = Screen {
+        title: format!("Couldn’t open {project} on {host}"),
+        body: vec![line.to_string()],
+        fix: Vec::new(),
+        details: None,
+        action: ScreenAction::Retry,
+    };
+    let action = ScreenAction::Retry;
+    render_screen(&screen, ("remote-retry", action.icon(), action.label()), theme, on_retry)
+}
+
 /// A full-window screen: `screen`'s title, body, fix and details, and one
 /// button (`id`, icon, label) that runs `on_click`.
 fn render_screen(

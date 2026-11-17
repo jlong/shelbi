@@ -384,8 +384,10 @@ pub(crate) fn read_launch_plan() -> (Option<WindowSession>, Vec<window_state::La
         session.as_ref(),
         named.as_deref(),
         projects::launch_project().as_deref(),
-        // Only this machine's projects reopen in a window of their own.
-        &|p: &shelbi_app::source::ProjectKey| p.is_local() && known.contains(&p.name),
+        // A project here reopens while it is still registered; one on another
+        // machine always does (its host opens in its tab, and says there
+        // when it can't: `mixed-host-tabs`).
+        &|p: &shelbi_app::source::ProjectKey| !p.is_local() || known.contains(&p.name),
         &WindowState::load_legacy,
     );
     (session, plan)

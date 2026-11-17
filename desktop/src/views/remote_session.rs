@@ -18,7 +18,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    div, prelude::*, px, App, Context, Entity, FocusHandle, Subscription, Window, WindowHandle,
+    div, prelude::*, px, AnyWindowHandle, App, Context, Entity, FocusHandle, Global, Subscription, Window,
+    WindowHandle,
 };
 use shelbi_app::launch::link::HostLink;
 use shelbi_app::launch::remote::{RemoteConnector, RemoteSession};
@@ -46,43 +47,72 @@ pub const TITLEBAR_H: f32 = 52.0;
 /// The connection dot's diameter.
 const DOT: f32 = 8.0;
 
-/// Open `session`, a remote project the Connect dialog or a recent remote
-/// session just connected to, in a window of its own.
-///
-/// The host's listing decides ([`remote_window::choose`]): the same Shelbi
-/// opens the full main window over the host's relay link
-/// ([`crate::app::open_remote_window`]); any other version (or one from
-/// before the native window) opens the terminal window with a line saying
-/// why. Every check runs off the UI thread. A test records the session
-/// instead ([`tests::OPENED`]).
-pub fn open_remote_session(session: RemoteSession, cx: &mut App) {
+/// How the app reaches a host's relay: the process's one shared link per
+/// host ([`HostLink::shared`]), or a test's in-process relay. A test with
+/// none set reaches no host at all (never a real `ssh`).
+#[derive(Clone)]
+pub struct HostLinks(pub Arc<LinkFor>);
+
+/// Gives a host's link by its name.
+pub type LinkFor = dyn Fn(&str) -> Arc<HostLink> + Send + Sync;
+
+impl Global for HostLinks {}
+
+/// The app's [`HostLinks`].
+pub fn host_links(cx: &App) -> HostLinks {
+    if let Some(links) = cx.try_global::<HostLinks>() {
+        return links.clone();
+    }
     #[cfg(test)]
-    {
-        let _ = cx;
-        tests::OPENED.with(|o| o.borrow_mut().push(session));
-    }
+    return HostLinks(Arc::new(|host: &str| {
+        Arc::new(HostLink::new(host, |host| {
+            Err(shelbi_app::launch::remote::RemoteError::Unreachable {
+                host: host.to_string(),
+                reason: "a test reaches no host".into(),
+            })
+        }))
+    }));
     #[cfg(not(test))]
-    {
-        let remote = crate::platform::launch::services(cx).remote;
-        let decide = cx.background_executor().spawn({
-            let (session, remote) = (session.clone(), remote.clone());
-            async move { decide(&session, remote) }
-        });
-        cx.spawn(async move |cx| {
-            let decided = decide.await;
-            cx.update(|cx| open_decided(session, remote, decided, cx));
-        })
-        .detach();
-    }
+    HostLinks(Arc::new(HostLink::shared))
 }
 
-/// Where `session` opens, and for a native window its host's link, already
-/// up. Blocking (`ssh`): the listing, then the link (whose check is the
-/// connector's: the host has the project and its daemon runs; it is never
-/// started here).
-#[cfg_attr(test, allow(dead_code))]
-pub fn decide(session: &RemoteSession, remote: Arc<dyn RemoteConnector>) -> Decided {
-    decide_with(session, remote, &HostLink::shared)
+/// Open `session`, a remote project the Connect dialog or a recent remote
+/// session just connected to: as a tab in the frontmost window, or in a
+/// window of its own when there is none ([`open_remote_session_in`]).
+pub fn open_remote_session(session: RemoteSession, cx: &mut App) {
+    open_remote_session_in(session, None, cx);
+}
+
+/// Open `session` in window `into` (the window it was picked in: its New
+/// tab, its Connect dialog), else as [`open_remote_session`] does.
+///
+/// The host's listing decides ([`remote_window::choose`]): the same Shelbi
+/// opens natively, a tab over the host's relay link
+/// ([`crate::app::open_remote_in`]); any other version (or one from before
+/// the native window) opens the terminal window with a line saying why, and
+/// a New tab it was picked on goes. Every check runs off the UI thread. A
+/// test with no [`HostLinks`] records the session instead
+/// ([`tests::OPENED`]).
+pub fn open_remote_session_in(session: RemoteSession, into: Option<AnyWindowHandle>, cx: &mut App) {
+    #[cfg(test)]
+    if !cx.has_global::<HostLinks>() {
+        tests::OPENED.with(|o| o.borrow_mut().push(session));
+        if let Some(into) = into {
+            crate::app::leave_new_tab(into, cx);
+        }
+        return;
+    }
+    let remote = crate::platform::launch::services(cx).remote;
+    let links = host_links(cx);
+    let decide = cx.background_executor().spawn({
+        let (session, remote) = (session.clone(), remote.clone());
+        async move { decide_with(&session, remote, &*links.0) }
+    });
+    cx.spawn(async move |cx| {
+        let decided = decide.await;
+        cx.update(|cx| open_decided(session, remote, decided, into, cx));
+    })
+    .detach();
 }
 
 /// [`decide`] with the host's link from `link_for` (a test's in-process
@@ -120,20 +150,30 @@ pub enum Decided {
     Terminal { notice: Option<String> },
 }
 
-/// Open `session` as `decided`: the native main window, or the terminal
-/// window (whose local `ssh` session runs through the CLI bootstrap found;
-/// from the launch window, before any bootstrap, the CLI is found the same
-/// way, off the UI thread, never starting this machine's daemon).
-#[cfg_attr(test, allow(dead_code))]
-pub fn open_decided(session: RemoteSession, remote: Arc<dyn RemoteConnector>, decided: Decided, cx: &mut App) {
+/// Open `session` as `decided`: natively, a tab in `into` (else the
+/// frontmost window, else a window of its own), or the terminal window
+/// (whose local `ssh` session runs through the CLI bootstrap found; from the
+/// launch window, before any bootstrap, the CLI is found the same way, off
+/// the UI thread, never starting this machine's daemon), when a New tab in
+/// `into` it was picked on goes.
+pub fn open_decided(
+    session: RemoteSession,
+    remote: Arc<dyn RemoteConnector>,
+    decided: Decided,
+    into: Option<AnyWindowHandle>,
+    cx: &mut App,
+) {
     let notice = match decided {
         Decided::Native { listing, link } => {
             let window = crate::app::RemoteWindow::new(session, listing, link, remote);
-            crate::app::open_remote_window(window, cx);
+            crate::app::open_remote_in(window, into, cx);
             return;
         }
         Decided::Terminal { notice } => notice,
     };
+    if let Some(into) = into {
+        crate::app::leave_new_tab(into, cx);
+    }
     if let Some((cli, _)) = crate::app::running_cli(cx) {
         open(session, remote, cli, notice, cx);
         return;
@@ -163,7 +203,7 @@ pub fn open_terminal_view(session: RemoteSession, remote: Arc<dyn RemoteConnecto
         tests::TERMINAL_OPENED.with(|o| o.borrow_mut().push(session));
     }
     #[cfg(not(test))]
-    open_decided(session, remote, Decided::Terminal { notice: None }, cx);
+    open_decided(session, remote, Decided::Terminal { notice: None }, None, cx);
 }
 
 /// Open `session` in a window of its own. The connect runs in the window
