@@ -1,10 +1,12 @@
 //! Backend-to-backend issue migration: copy a project's whole board from one
-//! [`IssueStore`] to another (today `file_system` ⇄ `github`), matched on the
-//! stable shelbi id so a re-run never duplicates an already-migrated card.
+//! [`IssueStore`] to another (`file_system`, `github` and `linear`, in any
+//! direction), matched on the stable shelbi id so a re-run never duplicates an
+//! already-migrated card.
 //!
-//! Both live backends key every issue by the same durable id — the on-disk
-//! task filename for `file_system`, the `shelbi:id/<slug>` label for `github` —
-//! so "has this card already been migrated?" is just "does the target already
+//! Every backend keys each issue by the same durable id — the on-disk task
+//! filename for `file_system`, the `shelbi:id/<slug>` label for `github`, the
+//! Shelbi attachment for `linear` — so "has this card already been migrated?"
+//! is just "does the target already
 //! hold an issue with this id?". [`plan_issue_migration`] answers that for the
 //! whole board with a single `list()` on each side, partitioning the source
 //! into the cards to create and the ids to skip. [`apply_issue_migration`]
@@ -24,17 +26,25 @@
 //!
 //! Scope: this carries the durable issue definition (title, body, status,
 //! priority, workflow, branch, deps, machine hint, zen/launch overrides, and
-//! free-form params) — everything [`NewIssue`] can express. Comments are *not*
-//! migrated: they carry no per-comment anchor, so a re-run could not tell an
-//! already-copied comment from a new one without a second bookkeeping channel,
-//! which would break the "re-run is a clean no-op" guarantee. Ephemeral local
-//! routing (`assigned_to`) is intentionally dropped, exactly as it is on any
-//! other cross-backend write.
+//! free-form params) — everything [`NewIssue`] can express — and, when
+//! [`MigrationControls::comments_from`] is set, each card's comments, copied
+//! right after the card is created (oldest first, each headed with its
+//! original author and time). Comments carry no per-comment anchor, so they
+//! are copied only with a card this run creates: a re-run never copies a
+//! comment twice (a card already on the target is skipped whole). The one gap
+//! is a run that stops between a card's create and its last comment.
+//! Ephemeral local routing (`assigned_to`) is intentionally dropped, exactly
+//! as it is on any other cross-backend write.
+//!
+//! **Statuses.** A target whose statuses differ from the source's (a Linear
+//! team's workflow states) gets each card in the target status of the same
+//! id when there is one, else the first target status of the same category
+//! ([`plan_issue_migration_mapped`]); the plan lists every such remap.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use shelbi_core::{Error, Issue, Result};
+use shelbi_core::{Column, Error, Issue, Result, StatusCategory};
 
 use crate::{IssueFile, IssueStore, NewIssue};
 
@@ -49,6 +59,17 @@ pub struct IssueMigrationPlan {
     /// anchor), left untouched. A non-empty list on a fresh migration means the
     /// target was partially populated; on a re-run it is the whole board.
     pub already_present: Vec<String>,
+    /// Cards whose status the target doesn't have, and the status they are
+    /// written in instead (already applied to `to_migrate`).
+    pub remapped: Vec<StatusRemap>,
+}
+
+/// One card written in a different status than its source's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusRemap {
+    pub id: String,
+    pub from: Column,
+    pub to: Column,
 }
 
 impl IssueMigrationPlan {
@@ -70,6 +91,21 @@ pub fn plan_issue_migration(
     from: &dyn IssueStore,
     to: &dyn IssueStore,
 ) -> Result<IssueMigrationPlan> {
+    plan_issue_migration_mapped(from, to, None, &|c: &Column| c.category())
+}
+
+/// [`plan_issue_migration`] onto a target with its own statuses: `targets`
+/// lists the target's statuses (in order) with their categories, and
+/// `source_category` names a source status's category. A card whose status the
+/// target lacks moves to the first target status of the same category (else
+/// the target's first backlog status, else its first status) and is recorded
+/// in [`IssueMigrationPlan::remapped`]. `None` keeps every status as is.
+pub fn plan_issue_migration_mapped(
+    from: &dyn IssueStore,
+    to: &dyn IssueStore,
+    targets: Option<&[(Column, StatusCategory)]>,
+    source_category: &dyn Fn(&Column) -> StatusCategory,
+) -> Result<IssueMigrationPlan> {
     let source = from.list()?;
     let present: HashSet<String> = to.list()?.into_iter().map(|tf| tf.task.id).collect();
 
@@ -83,9 +119,33 @@ pub fn plan_issue_migration(
         }
     }
     order_by_dependencies(&mut to_migrate);
+    let mut remapped = Vec::new();
+    if let Some(targets) = targets.filter(|t| !t.is_empty()) {
+        for tf in &mut to_migrate {
+            let col = &tf.task.column;
+            if targets.iter().any(|(c, _)| c == col) {
+                continue;
+            }
+            let category = source_category(col);
+            let to = targets
+                .iter()
+                .find(|(_, cat)| *cat == category)
+                .or_else(|| targets.iter().find(|(_, cat)| *cat == StatusCategory::Backlog))
+                .unwrap_or(&targets[0])
+                .0
+                .clone();
+            remapped.push(StatusRemap {
+                id: tf.task.id.clone(),
+                from: col.clone(),
+                to: to.clone(),
+            });
+            tf.task.column = to;
+        }
+    }
     Ok(IssueMigrationPlan {
         to_migrate,
         already_present,
+        remapped,
     })
 }
 
@@ -111,9 +171,10 @@ pub struct PartialMigration {
 ///
 /// Progress is reported *from inside the loop* (not from the returned vec after
 /// the fact), so a multi-minute bulk run streams a line per creation instead of
-/// going silent. Pacing throttles the writes to stay under GitHub's secondary
-/// content-creation limit (no more than 80/min and 500/hr) rather than
-/// sprinting into it and relying on backoff to recover.
+/// going silent. Pacing throttles the writes to stay under the target's write
+/// limits (GitHub's secondary content-creation limit of 80/min and 500/hr,
+/// Linear's hourly request budget) rather than sprinting into them and relying
+/// on backoff to recover.
 pub struct MigrationControls<'a> {
     /// Invoked as each issue lands, with `(index, total, issue)` where `index`
     /// is 1-based — the hook the CLI turns into a `[137/588] ✓ migrated <id>`
@@ -127,6 +188,12 @@ pub struct MigrationControls<'a> {
     /// Sleep primitive, injected so tests pace without waiting in real time.
     /// Production passes [`std::thread::sleep`].
     pub sleep: &'a dyn Fn(Duration),
+    /// The store to copy each new card's comments from (the source), or
+    /// `None` to leave comments behind.
+    pub comments_from: Option<&'a dyn IssueStore>,
+    /// How many comments the run copied (written by
+    /// [`apply_issue_migration`]).
+    pub comments_copied: usize,
 }
 
 impl<'a> MigrationControls<'a> {
@@ -137,6 +204,8 @@ impl<'a> MigrationControls<'a> {
             on_created,
             pace: Duration::ZERO,
             sleep: &|_| {},
+            comments_from: None,
+            comments_copied: 0,
         }
     }
 }
@@ -158,21 +227,67 @@ pub fn apply_issue_migration(
 ) -> std::result::Result<Vec<Issue>, PartialMigration> {
     let total = plan.to_migrate.len();
     let mut created = Vec::with_capacity(total);
-    for (i, tf) in plan.to_migrate.iter().enumerate() {
-        // Pace before every create after the first, so a bulk run stays under
-        // the secondary content-creation limit instead of provoking it.
-        if i > 0 && !controls.pace.is_zero() {
+    let mut writes = 0usize;
+    // Pace before every write after the first (creates and comments alike), so
+    // a bulk run stays under the target's write limits instead of provoking them.
+    let mut pace = |controls: &MigrationControls<'_>| {
+        if writes > 0 && !controls.pace.is_zero() {
             (controls.sleep)(controls.pace);
         }
-        match to.add(new_issue_from(tf)) {
-            Ok(issue) => {
-                (controls.on_created)(i + 1, total, &issue);
-                created.push(issue);
-            }
+        writes += 1;
+    };
+    for (i, tf) in plan.to_migrate.iter().enumerate() {
+        pace(controls);
+        let issue = match to.add(new_issue_from(tf)) {
+            Ok(issue) => issue,
             Err(error) => return Err(PartialMigration { created, error }),
+        };
+        let comments = match controls.comments_from {
+            Some(from) => match from.list_comments(&tf.task.id) {
+                Ok(c) => c,
+                Err(e) => {
+                    created.push(issue);
+                    return Err(PartialMigration {
+                        created,
+                        error: Error::Other(format!(
+                            "reading the comments of `{}` to copy them: {e}",
+                            tf.task.id
+                        )),
+                    });
+                }
+            },
+            None => Vec::new(),
+        };
+        for c in &comments {
+            pace(controls);
+            if let Err(e) = to.add_comment(&issue.id, &migrated_comment_body(c)) {
+                let id = issue.id.clone();
+                created.push(issue);
+                return Err(PartialMigration {
+                    created,
+                    error: Error::Other(format!(
+                        "copying a comment onto `{id}` (the card was created; its remaining \
+                         comments were not copied, and a re-run skips the card): {e}"
+                    )),
+                });
+            }
+            controls.comments_copied += 1;
         }
+        (controls.on_created)(i + 1, total, &issue);
+        created.push(issue);
     }
     Ok(created)
+}
+
+/// A copied comment's body: a quoted header naming the original author and
+/// time (the target records whoever ran the migration as the author), then the
+/// original text.
+fn migrated_comment_body(c: &crate::IssueComment) -> String {
+    let at = c.created_at.format("%Y-%m-%d %H:%M UTC");
+    match c.author.as_deref().filter(|a| !a.trim().is_empty()) {
+        Some(author) => format!("> Migrated comment by @{author}, {at}\n\n{}", c.body),
+        None => format!("> Migrated comment, {at}\n\n{}", c.body),
+    }
 }
 
 /// Build the creation spec for a source card, carrying every durable field the
@@ -334,6 +449,79 @@ mod tests {
     }
 
     #[test]
+    fn statuses_the_target_lacks_map_by_category() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let from = FileSystemStore::new("src");
+        let to = FileSystemStore::new("dst");
+        from.add(spec("a", Column::todo())).unwrap();
+        from.add(spec("b", Column::review())).unwrap();
+        from.add(spec("c", Column::in_progress())).unwrap();
+        // A Linear-like team: its own names, one per category but Active.
+        let targets = [
+            (Column::from_status_id("triage"), StatusCategory::Backlog),
+            (Column::todo(), StatusCategory::Ready),
+            (Column::from_status_id("in-review"), StatusCategory::Handoff),
+            (Column::done(), StatusCategory::Done),
+        ];
+        let plan =
+            plan_issue_migration_mapped(&from, &to, Some(&targets), &|c: &Column| c.category()).unwrap();
+        let col = |id: &str| {
+            plan.to_migrate.iter().find(|tf| tf.task.id == id).unwrap().task.column.as_str().to_string()
+        };
+        assert_eq!(col("a"), "todo", "same id: kept");
+        assert_eq!(col("b"), "in-review", "same category");
+        assert_eq!(col("c"), "triage", "no active status: the first backlog one");
+        let mut remapped = plan.remapped.clone();
+        remapped.sort_by(|x, y| x.id.cmp(&y.id));
+        assert_eq!(
+            remapped,
+            vec![
+                StatusRemap { id: "b".into(), from: Column::review(), to: Column::from_status_id("in-review") },
+                StatusRemap { id: "c".into(), from: Column::in_progress(), to: Column::from_status_id("triage") },
+            ]
+        );
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn comments_are_copied_with_each_new_card_and_never_twice() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let from = FileSystemStore::new("src");
+        let to = FileSystemStore::new("dst");
+        from.add(spec("a", Column::todo())).unwrap();
+        from.add(spec("b", Column::todo())).unwrap();
+        from.add_comment("a", "first").unwrap();
+        from.add_comment("a", "second").unwrap();
+
+        let plan = plan_issue_migration(&from, &to).unwrap();
+        let mut noop = |_: usize, _: usize, _: &Issue| {};
+        let mut controls = MigrationControls::silent(&mut noop);
+        controls.comments_from = Some(&from);
+        apply_issue_migration(&to, &plan, &mut controls).unwrap();
+        assert_eq!(controls.comments_copied, 2);
+        let copied = to.list_comments("a").unwrap();
+        let bodies: Vec<&str> = copied.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].starts_with("> Migrated comment") && bodies[0].ends_with("\n\nfirst"), "{bodies:?}");
+        assert!(bodies[1].ends_with("\n\nsecond"), "{bodies:?}");
+        assert!(to.list_comments("b").unwrap().is_empty());
+
+        // A re-run skips both cards, so no comment is copied twice.
+        let replan = plan_issue_migration(&from, &to).unwrap();
+        let mut noop = |_: usize, _: usize, _: &Issue| {};
+        let mut controls = MigrationControls::silent(&mut noop);
+        controls.comments_from = Some(&from);
+        apply_issue_migration(&to, &replan, &mut controls).unwrap();
+        assert_eq!(controls.comments_copied, 0);
+        assert_eq!(to.list_comments("a").unwrap().len(), 2);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
     fn partially_migrated_target_migrates_only_the_gap() {
         let _g = TEST_LOCK.lock().unwrap();
         let home = fresh_home();
@@ -465,6 +653,8 @@ mod tests {
             let mut noop = |_: usize, _: usize, _: &Issue| {};
             let sleep = |d: Duration| sleeps.borrow_mut().push(d);
             let mut controls = MigrationControls {
+                comments_from: None,
+                comments_copied: 0,
                 on_created: &mut noop,
                 pace: Duration::from_secs(7),
                 sleep: &sleep,

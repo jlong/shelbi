@@ -1,0 +1,13 @@
+{
+  "data": {
+    "team": {
+      "projects": {
+        "nodes": [
+          { "id": "proj-shelbi", "name": "Shelbi", "status": { "name": "In Progress", "type": "started" } },
+          { "id": "proj-mobile", "name": "Mobile", "status": { "name": "Planned", "type": "planned" } }
+        ],
+        "pageInfo": { "hasNextPage": false, "endCursor": "projects-end" }
+      }
+    }
+  }
+}

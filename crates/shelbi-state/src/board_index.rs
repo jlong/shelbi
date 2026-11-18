@@ -78,19 +78,37 @@ pub fn github_board_repo(repo: &str) -> String {
     format!("github.com/{repo}")
 }
 
+/// The board-index identity stamped for a Linear project:
+/// `linear:<team>[/project:<p>][/label:<l>][/assignee:<a>]`, from the filters
+/// as written (trimmed, lowercased). The filters define the board, so changing
+/// any of them changes the identity and the old index stops serving.
+pub fn linear_board_repo(conn: &shelbi_core::LinearConnection) -> String {
+    let norm = |s: &str| s.trim().to_lowercase();
+    let mut out = format!("linear:{}", norm(&conn.team));
+    for (key, value) in [
+        ("project", conn.project_ref()),
+        ("label", conn.label_ref()),
+        ("assignee", conn.assignee_ref()),
+    ] {
+        if let Some(v) = value {
+            out.push_str(&format!("/{key}:{}", norm(v)));
+        }
+    }
+    out
+}
+
 /// The board-index repository identity a project's tracker config implies, or
 /// `None` for a backend that publishes no index (`file_system`, and the
-/// not-yet-resolvable `jira`/`linear` stubs). GitHub is the only backend that
-/// stamps identity today. Used by every config-holding read path to decide
+/// not-yet-resolvable `jira` stub). GitHub stamps its `owner/repo`, Linear
+/// its team and filters ([`linear_board_repo`]). Used by every config-holding read path to decide
 /// whether a published index describes the repository this project is now
 /// pointed at; a mismatch means the file is another repository's board and is
 /// treated as absent.
 pub fn expected_board_repo(cfg: &IssueTrackerConfig) -> Option<String> {
     match cfg.backend {
         IssueTrackerBackend::Github => cfg.github.as_ref().map(|g| github_board_repo(&g.repo)),
-        IssueTrackerBackend::FileSystem
-        | IssueTrackerBackend::Jira
-        | IssueTrackerBackend::Linear => None,
+        IssueTrackerBackend::Linear => cfg.linear.as_ref().map(linear_board_repo),
+        IssueTrackerBackend::FileSystem | IssueTrackerBackend::Jira => None,
     }
 }
 

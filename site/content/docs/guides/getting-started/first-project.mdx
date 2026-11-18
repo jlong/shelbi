@@ -123,9 +123,11 @@ Next, Shelbi asks where this project's board should live:
 Step 3 of 4 · Issues
 Where should this project's issues live?
   GitHub Issues  cards are GitHub issues your team can see and file (requires `gh` logged in)
+  Linear         cards are Linear issues in one of your teams, optionally narrowed by project, label or assignee (requires a Linear API key)
   File system    private markdown files on this machine (no GitHub needed)
 ? Issue tracker:
 > GitHub Issues
+  Linear
   File system
 ```
 
@@ -137,6 +139,12 @@ Where should this project's issues live?
   retry or fall back to File system, so a GitHub config that would not load is
   never written. On success it creates `shelbi:id/*` and `shelbi:status/*` labels
   on first use and stores a small metadata block in each issue's body.
+- **Linear** stores each card as a Linear issue in one team. Shelbi asks for a
+  Linear personal API key if this machine has none, then lets you pick the team
+  (required) and, optionally, a project, a label and an assignee to narrow the
+  board. It checks them all with Linear before writing anything. See
+  [Linear](/docs/concepts/linear) for the full setup, including mapping your
+  workflows onto the team's statuses.
 - **File system** keeps the board as private markdown under
   `~/.shelbi/projects/<name>/tasks/`. No GitHub needed. It's preselected when
   the origin isn't on GitHub.
@@ -145,7 +153,8 @@ You can move a board between backends later with
 [`shelbi issue-store migrate`](/docs/cli/issue#issue-store-migrate). For the full
 picture of what the GitHub backend writes onto your repo (the label scheme, the
 metadata block, and how assignees gate Zen Mode), see the
-[GitHub Issues backend](/docs/concepts/github-issues).
+[GitHub Issues backend](/docs/concepts/github-issues), and for Linear, see
+[Linear](/docs/concepts/linear).
 
 ## 4. Settings
 

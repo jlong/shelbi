@@ -23,7 +23,7 @@ where you start.
 2. **Agents.** The runner and model the project's agents use by default. The
    installed runner is preselected (Claude Code when both Claude Code and Codex
    are installed), on the runner's own default model.
-3. **Issues.** Where the board lives: GitHub Issues or the file system. See
+3. **Issues.** Where the board lives: GitHub Issues, Linear or the file system. See
    [Where your issues live](#where-your-issues-live).
 4. **Settings.** Where the project's settings live: outside the repository
    (global, under `~/.shelbi/projects/`) or inside it (in-repo, committed at
@@ -61,6 +61,19 @@ remove it with [`shelbi guard`](/docs/cli/guard).
   retry or fall back to File system, so a GitHub config that would not load is
   never written. On success, Shelbi creates `shelbi:id/*` and `shelbi:status/*`
   labels on first use and stores a small metadata block in each issue's body.
+- **Linear** stores each card as a Linear issue in one team. The team is
+  required; a project, a label and an assignee (`me`, or a teammate) are
+  optional filters that narrow the board, and every issue Shelbi creates gets
+  them too. Shelbi needs a Linear personal API key: when this machine has none,
+  the setup asks for one, checks it and stores it in the keychain (as
+  [`shelbi tracker linear login`](/docs/cli/tracker) does). The team and filters
+  are picked from lists read from Linear, then preflighted: every one must
+  resolve, and the key's owner must be able to create issues in the team. On a
+  failure the setup shows the fix and lets you choose again or fall back to File
+  system. To connect an existing project, use
+  [`shelbi tracker linear connect`](/docs/cli/tracker). See
+  [Linear](/docs/concepts/linear) for the whole setup, including mapping your
+  workflows onto the team's statuses.
 - **File system** keeps the board as private markdown files on this machine
   under `~/.shelbi/projects/<name>/tasks/`. No GitHub needed. It's
   preselected when the origin isn't on GitHub.
@@ -89,6 +102,7 @@ Each flag pre-answers its step, with or without `-y`:
 ```bash
 shelbi init -y --root /workspace/myapp --runner codex --mode global
 shelbi init -y --issue-tracker github --github-repo acme/myapp
+shelbi init -y --issue-tracker linear --linear-team ENG --linear-assignee me
 ```
 
 Running `init -y` again in a directory that already belongs to a project prints
@@ -104,8 +118,10 @@ Running `init -y` again in a directory that already belongs to a project prints
 | `--pick-up` | Folder | offered when found | Take the committed `<repo>/.shelbi/project.yaml` (searching parent folders when `--root` isn't given). A committed name that's taken locally gets a suffixed alias (`-2`, `-3`, and so on). |
 | `--runner <RUNNER>` | Agents | the installed runner, Claude Code first | `claude` or `codex`. With `-y` it must be installed on `PATH`. |
 | `--model <MODEL>` | Agents | the runner's default | The agents' default model. |
-| `--issue-tracker <BACKEND>` | Issues | GitHub for a GitHub origin that passes the preflight, else `file_system` | `github` or `file_system`. `github` is preflighted before anything is written; a failure is a hard error naming the fix. |
+| `--issue-tracker <BACKEND>` | Issues | GitHub for a GitHub origin that passes the preflight, else `file_system` | `github`, `linear` or `file_system`. `github` and `linear` are preflighted before anything is written; a failure is a hard error naming the fix. |
 | `--github-repo <OWNER/REPO>` | Issues | detected origin repo | The repo for `--issue-tracker github`. Required when the origin remote is not a GitHub repo. |
+| `--linear-team <TEAM>` | Issues | none | The Linear team for `--issue-tracker linear` (key, name or id). Required with it. |
+| `--linear-project`, `--linear-label`, `--linear-assignee` | Issues | none | Optional Linear filters: only the issues in this project, with this label, or assigned to this person (`me`, an email or a user id). See [`shelbi tracker`](/docs/cli/tracker). |
 | `--mode <MODE>` | Settings | the recommendation | `global` or `in-repo`. |
 | `--default-branch <BRANCH>` | | detected branch, then `main` | Override the detected default branch (also the branch a `git init` creates). `--branch` is an alias. |
 | `--github-url <URL>` | | detected origin | Override the detected origin URL; credentials are removed before it's written. `--remote` is an alias; pass an empty value to omit it. |

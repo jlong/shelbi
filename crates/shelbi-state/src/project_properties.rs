@@ -98,6 +98,9 @@ pub struct IssueTracker {
     /// What the backend's connection names (`owner/repo`, a Jira project
     /// key, a Linear team), when it names one.
     pub target: Option<String>,
+    /// The whole `issue_tracker:` block (Settings' tracker section seeds its
+    /// choice from it: a Linear connection's filters too).
+    pub config: IssueTrackerConfig,
 }
 
 impl IssueTracker {
@@ -138,14 +141,15 @@ pub fn issue_tracker(shared: &Value) -> IssueTracker {
         .unwrap_or_default();
     let target = match config.backend {
         IssueTrackerBackend::FileSystem => None,
-        IssueTrackerBackend::Github => config.github.map(|g| g.repo),
-        IssueTrackerBackend::Jira => config.jira.map(|j| j.project),
-        IssueTrackerBackend::Linear => config.linear.map(|l| l.team),
+        IssueTrackerBackend::Github => config.github.as_ref().map(|g| g.repo.clone()),
+        IssueTrackerBackend::Jira => config.jira.as_ref().map(|j| j.project.clone()),
+        IssueTrackerBackend::Linear => config.linear.as_ref().map(|l| l.team.clone()),
     }
     .filter(|t| !t.trim().is_empty());
     IssueTracker {
         backend: config.backend,
         target,
+        config,
     }
 }
 

@@ -1,7 +1,8 @@
 //! Tracker ownership: which issues on a shared remote tracker belong to the
 //! authenticated user, and so may be started by this user's orchestrator.
 //!
-//! Several people can share one GitHub Issues tracker, each running their own
+//! Several people can share one GitHub repository's issues or one Linear team,
+//! each running their own
 //! Shelbi hub. Without a gate, one person's orchestrator would dispatch any card
 //! that reached a `ready` status, including a teammate's. So on a remote tracker
 //! an issue is this user's only when its native tracker assignees
@@ -24,7 +25,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use shelbi_core::{IssueTrackerConfig, Result};
+use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig, Result};
 
 use crate::{IssueFile, IssueStore};
 
@@ -146,6 +147,7 @@ impl OwnershipGate {
             owner: self
                 .owner(tracker_assignees)
                 .unwrap_or(TrackerOwner::Unassigned),
+            login_check: login_check(None),
         })
     }
 }
@@ -157,6 +159,27 @@ pub struct NotOwned {
     /// The authenticated login, when it resolved.
     pub login: Option<String>,
     pub owner: TrackerOwner,
+    /// What to check when the login didn't resolve ([`login_check`]).
+    pub login_check: &'static str,
+}
+
+impl NotOwned {
+    /// Name `backend`'s own login check in the refusal.
+    pub fn for_backend(mut self, backend: IssueTrackerBackend) -> Self {
+        self.login_check = login_check(Some(backend));
+        self
+    }
+}
+
+/// What a user runs to see whether their tracker login works: `gh auth
+/// status` on GitHub, `shelbi tracker linear status` on Linear, else a
+/// generic phrase.
+pub fn login_check(backend: Option<IssueTrackerBackend>) -> &'static str {
+    match backend {
+        Some(IssueTrackerBackend::Github) => "`gh auth status`",
+        Some(IssueTrackerBackend::Linear) => "`shelbi tracker linear status`",
+        _ => "your issue-tracker login",
+    }
 }
 
 impl fmt::Display for NotOwned {
@@ -192,7 +215,8 @@ impl fmt::Display for NotOwned {
                     f,
                     "refusing to start issue `{id}`{assigned}: your issue-tracker login could \
                      not be resolved, so Shelbi can't tell whether it is assigned to you. Check \
-                     `gh auth status`, then retry"
+                     {}, then retry",
+                    self.login_check
                 )
             }
         }
@@ -265,12 +289,14 @@ pub fn ensure_owned_for_dispatch(
         return Err(gate
             .check(id, &tf.tracker_assignees)
             .expect_err("a refused issue fails the check")
+            .for_backend(cfg.backend)
             .to_string());
     }
     let Some(login) = gate.login().map(str::to_string) else {
         return Err(format!(
             "can't take issue `{id}`: your issue-tracker login could not be resolved (check \
-             `gh auth status`), so Shelbi can't assign it to you"
+             {}), so Shelbi can't assign it to you",
+            login_check(Some(cfg.backend))
         ));
     };
     let after = store
@@ -279,7 +305,7 @@ pub fn ensure_owned_for_dispatch(
     if !gate.allows(&after) {
         return Err(format!(
             "the issue tracker did not assign `{id}` to @{login} (assignees now: {}); you may \
-             lack permission to assign issues in this repository. Nothing was started",
+             lack permission to assign issues on this tracker. Nothing was started",
             if after.is_empty() { "none".to_string() } else { at_logins(&after) }
         ));
     }
@@ -303,13 +329,14 @@ pub fn creation_warning(
     Some(match gate.login() {
         Some(login) => format!(
             "warning: created `{id}`, but the issue tracker did not assign it to @{login} (you \
-             may lack permission to assign issues in this repository). Shelbi will not start it \
+             may lack permission to assign issues on this tracker). Shelbi will not start it \
              until it is assigned to you; assign it on the tracker, or run `shelbi issue start \
              {id} --take`"
         ),
         None => format!(
             "warning: created `{id}` unassigned: your issue-tracker login could not be resolved \
-             (check `gh auth status`). Shelbi will not start it until it is assigned to you"
+             (check {}). Shelbi will not start it until it is assigned to you",
+            login_check(Some(cfg.backend))
         ),
     })
 }
@@ -400,6 +427,19 @@ mod tests {
             .to_string();
         assert!(unknown.contains("login could not be resolved"), "{unknown}");
         assert!(unknown.contains("assigned to @octocat"), "{unknown}");
+        assert!(unknown.contains("Check your issue-tracker login, then retry"), "{unknown}");
+        // Each tracker names its own login check; Linear never mentions `gh`.
+        let refused = |backend| {
+            OwnershipGate::FailClosed
+                .check("t", &logins(&["grace"]))
+                .unwrap_err()
+                .for_backend(backend)
+                .to_string()
+        };
+        assert!(refused(IssueTrackerBackend::Github).contains("Check `gh auth status`"));
+        let linear = refused(IssueTrackerBackend::Linear);
+        assert!(linear.contains("Check `shelbi tracker linear status`"), "{linear}");
+        assert!(!linear.contains("gh "), "{linear}");
 
         assert!(gate.check("t", &logins(&["octocat"])).is_ok());
     }

@@ -31,6 +31,12 @@ saved to this file as you make it, comments and unknown keys included, and
 Edit YAML opens the file itself. If the file changed on disk since the page
 read it, nothing is written: the page reloads and says so.
 
+In a project connected to Linear, the statuses come from the Linear team and
+are read-only here: only each status's category can be changed. A banner says
+so, and **Sync now** reads the team's statuses again without waiting for the
+next automatic check. See [Linear: Statuses](/docs/concepts/linear#statuses)
+and [Statuses from Linear](/docs/cli/tracker#statuses-from-linear).
+
 ## Example
 
 ```yaml
@@ -49,6 +55,7 @@ statuses:
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `statuses` | list of [Status](#status) | yes | — | Ordered catalog of every status in the project. Order is significant: it's the column order on the board's all-workflows view. |
+| `managed_by` | `linear` | no | unset | Set by `shelbi tracker linear sync`: the catalog mirrors a Linear team's states, and only categories are editable. |
 
 ## status
 
@@ -57,6 +64,7 @@ statuses:
 | `id` | string | yes | — | Stable identifier referenced from every workflow's `statuses:` list. Must be unique and non-empty. Conventionally lowercase kebab-case. |
 | `name` | string | yes | — | User-facing display label (e.g. `Backlog`, `In Progress`). Must be non-empty. |
 | `category` | [category](#categories) | yes | — | Closed semantic category. Generic code keys off this, so a renamed status keeps its behavior. |
+| `external_id` | string | no | unset | The tracker's id for this status (a Linear workflow state's id), written by sync. A re-sync matches on it. |
 
 ## categories
 

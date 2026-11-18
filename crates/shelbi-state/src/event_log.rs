@@ -4720,36 +4720,43 @@ mod tests {
         // carrying `category: active`, declared between `in-progress` and
         // `review`.
         let statuses = ProjectStatuses {
+            managed_by: None,
             statuses: vec![
                 ProjectStatus {
                     id: "backlog".into(),
                     name: "Backlog".into(),
                     category: StatusCategory::Backlog,
+                    external_id: None,
                 },
                 ProjectStatus {
                     id: "todo".into(),
                     name: "Todo".into(),
                     category: StatusCategory::Ready,
+                    external_id: None,
                 },
                 ProjectStatus {
                     id: "in-progress".into(),
                     name: "In Progress".into(),
                     category: StatusCategory::Active,
+                    external_id: None,
                 },
                 ProjectStatus {
                     id: "review-app".into(),
                     name: "Review App".into(),
                     category: StatusCategory::Active,
+                    external_id: None,
                 },
                 ProjectStatus {
                     id: "review".into(),
                     name: "Review".into(),
                     category: StatusCategory::Handoff,
+                    external_id: None,
                 },
                 ProjectStatus {
                     id: "done".into(),
                     name: "Done".into(),
                     category: StatusCategory::Done,
+                    external_id: None,
                 },
             ],
         };

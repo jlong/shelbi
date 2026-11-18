@@ -677,11 +677,12 @@ pub struct IssueSearchPage {
 /// filtering the board it has.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IssueSearchError {
-    /// The project's tracker isn't GitHub: search the local board.
-    NotGithub,
+    /// The project's tracker has no remote search (the local board): filter
+    /// the board it has.
+    Unsupported,
     /// The search quota (or a secondary limit) is spent, or parked until reset.
     RateLimited,
-    /// The GitHub API can't be reached (or the unreachable breaker is parked).
+    /// The tracker's API can't be reached (or the unreachable breaker is parked).
     Unreachable,
     /// Anything else (auth, a malformed query, an unparseable response).
     Failed(String),
@@ -690,17 +691,22 @@ pub enum IssueSearchError {
 impl std::fmt::Display for IssueSearchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            IssueSearchError::NotGithub => f.write_str("the issue tracker isn't GitHub"),
-            IssueSearchError::RateLimited => f.write_str("GitHub search is rate-limited"),
-            IssueSearchError::Unreachable => f.write_str("GitHub is unreachable"),
+            IssueSearchError::Unsupported => {
+                f.write_str("the issue tracker has no remote search")
+            }
+            IssueSearchError::RateLimited => f.write_str("issue search is rate-limited"),
+            IssueSearchError::Unreachable => f.write_str("the issue tracker is unreachable"),
             IssueSearchError::Failed(e) => f.write_str(e),
         }
     }
 }
 
-/// Search `project`'s GitHub issues for `query`, page `page` (1-based): the
-/// board search's live read ([`GitHubStore::search_issues`]). Never touches the
-/// process board cache; [`IssueSearchError::NotGithub`] for any other tracker.
+/// Search `project`'s issues for `query`, page `page` (1-based): the board
+/// search's live read. GitHub runs its REST issue search
+/// ([`GitHubStore::search_issues`]) on the search budget; Linear runs
+/// `searchIssues` scoped by the project's filters
+/// ([`crate::LinearStore::search_issues`]). Never touches the process board
+/// cache; [`IssueSearchError::Unsupported`] for a tracker with no remote search.
 pub fn search_issues(
     project: &str,
     query: &str,
@@ -709,16 +715,22 @@ pub fn search_issues(
     let cfg = crate::load_project(project)
         .map_err(|e| IssueSearchError::Failed(e.to_string()))?
         .issue_tracker;
-    if !matches!(cfg.backend, shelbi_core::IssueTrackerBackend::Github) {
-        return Err(IssueSearchError::NotGithub);
+    match cfg.backend {
+        shelbi_core::IssueTrackerBackend::Github => {
+            let repo = cfg
+                .github
+                .map(|g| g.repo)
+                .ok_or(IssueSearchError::Unsupported)?;
+            GitHubStore::new(project, repo)
+                .search_issues(query, page)
+                .map_err(|e| classify_search_error(&e))
+        }
+        shelbi_core::IssueTrackerBackend::Linear => {
+            let conn = cfg.linear.ok_or(IssueSearchError::Unsupported)?;
+            crate::LinearStore::new(project, conn).search_issues(query, page)
+        }
+        _ => Err(IssueSearchError::Unsupported),
     }
-    let repo = cfg
-        .github
-        .map(|g| g.repo)
-        .ok_or(IssueSearchError::NotGithub)?;
-    GitHubStore::new(project, repo)
-        .search_issues(query, page)
-        .map_err(|e| classify_search_error(&e))
 }
 
 /// Sort a search failure into what the board does about it.
@@ -5040,7 +5052,7 @@ impl GhComment {
 /// A fresh hidden marker line for a comment shelbi is about to post
 /// (`<!-- shelbi:comment/<16 lowercase hex> -->`). Lets a lost-response create
 /// retry recognize its own already-posted comment so it never duplicates it.
-fn comment_marker() -> String {
+pub(crate) fn comment_marker() -> String {
     format!("{COMMENT_MARKER_PREFIX}{:016x} -->", comment_marker_token())
 }
 
@@ -5051,7 +5063,7 @@ fn comment_marker() -> String {
 /// dependency, and no security requirement (a collision only ever risks a
 /// missed reconcile, never a wrong match, because the caller also holds the exact
 /// marker string it generated).
-fn comment_marker_token() -> u64 {
+pub(crate) fn comment_marker_token() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -5074,7 +5086,7 @@ fn comment_marker_token() -> u64 {
 /// (byte-identical), so a human's comment is never reshaped; only a shelbi-posted
 /// body — whose marker line, and the blank line separating it, are dropped — is
 /// trimmed back to the text shelbi was asked to post.
-fn strip_comment_marker(body: &str) -> String {
+pub(crate) fn strip_comment_marker(body: &str) -> String {
     if !body.contains(COMMENT_MARKER_PREFIX) {
         return body.to_string();
     }
@@ -5643,7 +5655,12 @@ mod tests {
             stderr: "\ngh: Pull request review thread line must be part of the diff\n".to_string(),
         };
         assert_eq!(gh_failure_reason(&refused), "Pull request review thread line must be part of the diff");
-        let no_login = Error::MissingIssueTrackerAuth { backend: "github", token_file: "t".to_string() };
+        let no_login = Error::MissingIssueTrackerAuth {
+            backend: "github",
+            checked: String::new(),
+            token_file: "t".to_string(),
+            fix: String::new(),
+        };
         assert_eq!(gh_failure_reason(&no_login), "No GitHub login here: run gh auth login");
     }
 
@@ -5913,6 +5930,62 @@ mod tests {
         assert_eq!(got.body, "prose");
 
         assert!(store.get("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_github_board_migrates_onto_linear_with_its_comments() {
+        use crate::linear_store::tests::Sim;
+        use crate::{apply_issue_migration, plan_issue_migration_mapped, LinearStore, MigrationControls};
+        let _home = HomeGuard::new("gh-to-linear");
+        std::fs::create_dir_all(crate::project_dir("p").unwrap()).unwrap();
+        crate::linear_store::clear_linear_caches_for_test();
+        let issues = r#"{"number":7,"title":"Login fails","body":"Steps to reproduce.","state":"open","labels":[{"name":"shelbi:id/login-fails"},{"name":"shelbi:status/review"}],"created_at":"2026-08-01T00:00:00Z","updated_at":"2026-08-02T00:00:00Z"}
+{"number":8,"title":"Old idea","body":"Never mind.","state":"closed","state_reason":"completed","labels":[{"name":"shelbi:id/old-idea"}],"created_at":"2026-07-01T00:00:00Z","updated_at":"2026-07-02T00:00:00Z"}"#;
+        let comments = r#"{"id":100,"body":"Repro'd on main.","created_at":"2026-08-01T01:00:00Z","user":{"login":"alice"}}"#;
+        // A label search (`labels=shelbi:id/<id>`) answers only its issue.
+        let from = GitHubStore::with_runner("owner/repo", move |args| {
+            let label = args.iter().find_map(|a| a.strip_prefix("labels=")).map(|l| format!("\"{l}\""));
+            let matching: String = issues
+                .lines()
+                .filter(|l| label.as_ref().is_none_or(|lb| l.contains(lb.as_str())))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if args.contains(&"graphql") {
+                return Ok(rest_to_graphql(args, &matching));
+            }
+            let path = args.iter().find(|a| a.contains("repos/")).copied().unwrap_or("");
+            Ok(if path.contains("/comments") { comments.to_string() } else { matching })
+        });
+        let sim = Sim::new();
+        let to = LinearStore::with_client("p", shelbi_core::LinearConnection::for_team("ENG"), sim.client());
+
+        let targets = to.status_columns().unwrap();
+        let plan = plan_issue_migration_mapped(&from, &to, Some(&targets), &|c: &Column| c.category()).unwrap();
+        let mut ids: Vec<&str> = plan.to_migrate.iter().map(|tf| tf.task.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, ["login-fails", "old-idea"]);
+        assert!(sim.w().issues.is_empty(), "the plan is a dry run");
+
+        let mut noop = |_: usize, _: usize, _: &Issue| {};
+        let mut controls = MigrationControls::silent(&mut noop);
+        controls.comments_from = Some(&from);
+        apply_issue_migration(&to, &plan, &mut controls).unwrap();
+
+        let board = to.list().unwrap();
+        let login = board.iter().find(|tf| tf.task.id == "login-fails").expect("migrated");
+        assert_eq!(login.task.title, "Login fails");
+        assert!(login.body.contains("Steps to reproduce."), "{:?}", login.body);
+        assert_eq!(login.task.column.as_str(), "in-review", "review → the team's review state");
+        let old = board.iter().find(|tf| tf.task.id == "old-idea").expect("migrated");
+        assert_eq!(old.task.column, Column::done(), "closed history lands closed");
+        let copied = to.list_comments("login-fails").unwrap();
+        assert_eq!(copied.len(), 1);
+        assert!(copied[0].body.starts_with("> Migrated comment by @alice"), "{:?}", copied[0].body);
+        assert!(copied[0].body.ends_with("Repro'd on main."), "{:?}", copied[0].body);
+
+        // Re-running finds both by their Shelbi ids.
+        let replan = plan_issue_migration_mapped(&from, &to, Some(&targets), &|c: &Column| c.category()).unwrap();
+        assert!(replan.is_empty(), "{:?}", replan.to_migrate);
     }
 
     #[test]

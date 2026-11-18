@@ -159,7 +159,7 @@ fn print_summary(project: &str) -> Result<()> {
     if let Some(line) = session_lost_line() {
         println!("{line}");
     }
-    if let Some(line) = github_summary_line(project) {
+    if let Some(line) = tracker_summary_line(project) {
         println!("github: {line}");
     }
     if let Some(line) = disk_warning_line(project) {
@@ -322,7 +322,14 @@ fn print_full(project: &str) -> Result<()> {
         println!("{line}");
     }
 
-    if let Some(section) = github_section(project) {
+    // The remote tracker's budget block: Linear's own section for a Linear
+    // board, the GitHub section otherwise.
+    if let Some(section) = linear_section(project) {
+        println!();
+        println!("## Linear");
+        println!();
+        print!("{section}");
+    } else if let Some(section) = github_section(project) {
         println!();
         println!("## GitHub");
         println!();
@@ -334,13 +341,23 @@ fn print_full(project: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 // GitHub section (--full) + summary line (Phase 3 §6)
 
+/// The `## Linear` section for a Linear project (account, filters, the key's
+/// two buckets, the last refresh and the request rate); `None` for any other
+/// backend. See [`super::linear_health`].
+fn linear_section(project: &str) -> Option<String> {
+    let now = Utc::now();
+    let health = super::linear_health::LinearHealth::read(project, now)?;
+    let freshness = shelbi_state::read_board_report(project).ok().map(|r| r.freshness);
+    Some(super::linear_health::status_section(&health, freshness.as_ref(), now))
+}
+
 /// The rate-limit / freshness snapshot for a remote (github) project's board:
 /// remaining + reset per budget, requests observed in the last hour, the index
 /// age, and which read path is active. `None` for a `file_system` project, which
 /// has no API budget or read path. All reads are best-effort and side-effect free.
 fn github_section(project: &str) -> Option<String> {
     let cfg = shelbi_state::load_project(project).ok()?.issue_tracker;
-    if !cfg.backend.is_remote() {
+    if !cfg.backend.is_remote() || cfg.backend == shelbi_core::IssueTrackerBackend::Linear {
         return None;
     }
     let now = Utc::now();
@@ -468,9 +485,10 @@ fn github_section(project: &str) -> Option<String> {
     Some(out)
 }
 
-/// The concise one-liner for bare `shelbi status`: board age + graphql remaining.
-/// `None` for a non-remote backend.
-fn github_summary_line(project: &str) -> Option<String> {
+/// The concise one-liner for bare `shelbi status`: board age plus the tracker's
+/// remaining budget (GitHub's GraphQL points, or the Linear key's tighter
+/// bucket). `None` for a non-remote backend.
+fn tracker_summary_line(project: &str) -> Option<String> {
     let cfg = shelbi_state::load_project(project).ok()?.issue_tracker;
     if !cfg.backend.is_remote() {
         return None;
@@ -479,6 +497,14 @@ fn github_summary_line(project: &str) -> Option<String> {
         .ok()
         .map(|r| r.freshness)?;
     let board = freshness.banner().unwrap_or_else(|| "board (no index)".to_string());
+    if cfg.backend == shelbi_core::IssueTrackerBackend::Linear {
+        let suffix = super::linear_health::LinearHealth::read(project, Utc::now())
+            .and_then(|h| super::linear_health::summary_suffix(&h));
+        return Some(match suffix {
+            Some(s) => format!("{board} · {s}"),
+            None => board,
+        });
+    }
     let budget = github_budget_snapshot(project);
     let remaining = budget
         .as_ref()
@@ -1145,6 +1171,78 @@ issue_tracker:\n\
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// Register a `linear`-backed project `name` (team ENG, project Shelbi).
+    fn register_linear_project(home: &std::path::Path, name: &str) {
+        let projects = home.join("projects");
+        std::fs::create_dir_all(projects.join(name)).unwrap();
+        std::fs::write(
+            projects.join(format!("{name}.yaml")),
+            format!(
+                "name: {name}\nrepo: /tmp/{name}\ndefault_branch: main\n\
+orchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/{name}\nworkspaces: []\n\
+issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n    project: Shelbi\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_linear_project_gets_a_linear_section_instead_of_the_github_one() {
+        use shelbi_state::linear_client::{fixture, FakeLinear, FakeReply, LinearClient, LinearResponse};
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        register_linear_project(&home, "lin");
+        let fake = FakeLinear::new();
+        fake.on_reply(
+            "Viewer",
+            FakeReply::Response(
+                LinearResponse::ok(fixture("Viewer").unwrap())
+                    .with_header("X-RateLimit-Requests-Limit", "1500")
+                    .with_header("X-RateLimit-Requests-Remaining", "1450")
+                    .with_header("X-RateLimit-Complexity-Limit", "250000")
+                    .with_header("X-RateLimit-Complexity-Remaining", "200000"),
+            ),
+        );
+        let _fake = fake.install();
+        // One real (fake) request: it records the budget and logs a line.
+        LinearClient::for_project(Some("lin")).unwrap().caller("daemon").viewer().unwrap();
+        let conn = shelbi_core::LinearConnection {
+            project: Some("Shelbi".into()),
+            ..shelbi_core::LinearConnection::for_team("ENG")
+        };
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![ifile("eng-1", "todo")]);
+        idx.repo = Some(shelbi_state::board_index::linear_board_repo(&conn));
+        idx.viewer_login = Some("ada".into());
+        shelbi_state::write_board_index("lin", &idx).unwrap();
+
+        assert!(github_section("lin").is_none(), "no GitHub block for a Linear board");
+        let section = linear_section("lin").expect("a Linear project has a Linear section");
+        for want in [
+            "account: ada\n",
+            "api key: from the macOS keychain\n",
+            "filters: team ENG · project Shelbi\n",
+            "board index: 0s old (warm)\n",
+            "last refresh: ",
+            "requests budget: 1450 of 1500 remaining\n",
+            "complexity budget: 200000 of 250000 remaining\n",
+            "request rate: 1 request in the last hour",
+        ] {
+            assert!(section.contains(want), "missing {want:?} in:\n{section}");
+        }
+        assert!(!section.contains("graphql"), "{section}");
+        let line = tracker_summary_line("lin").unwrap();
+        // The tighter bucket (complexity at 80% vs requests at 96%), named.
+        assert!(line.ends_with(" · linear 200000 complexity left"), "{line}");
+        // A GitHub project still has no Linear section.
+        register_github_project(&home, "g");
+        assert!(linear_section("g").is_none());
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn orchestrator_integration_line_defaults_to_conventional_without_a_codex_thread() {
         // No persisted Codex thread => the orchestrator isn't the native
@@ -1222,16 +1320,19 @@ issue_tracker:\n\
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let custom = ProjectStatuses {
+            managed_by: None,
             statuses: vec![
                 shelbi_core::ProjectStatus {
                     id: "z-last".into(),
                     name: "Z Last".into(),
                     category: shelbi_core::StatusCategory::Archived,
+                    external_id: None,
                 },
                 shelbi_core::ProjectStatus {
                     id: "a-first".into(),
                     name: "A First".into(),
                     category: shelbi_core::StatusCategory::Ready,
+                    external_id: None,
                 },
             ],
         };

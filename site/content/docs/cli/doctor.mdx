@@ -1,7 +1,7 @@
 ---
 title: shelbi doctor
 order: 31.5
-summary: Runtime health checks for a project, mainly its GitHub API budget, with a warning when a budget would run out within 30 minutes.
+summary: Runtime health checks for a project, mainly its issue tracker's API budget (GitHub or Linear), with a warning when a budget would run out within 30 minutes.
 ---
 
 ```text
@@ -31,6 +31,14 @@ It checks:
   requests. Requests that GitHub answered with `304 Not Modified` spend no
   budget and are counted on their own line, and failed attempts are reported
   separately so a dead network never reads as a high spend rate.
+
+- **Linear API budget.** For a project whose board is on
+  [Linear](/docs/cli/tracker#the-board-on-the-hub-daemon), where the API key
+  comes from, the account and filters, the requests bucket's observed rate over
+  the last hour with its remaining count and projected time until it runs out,
+  the complexity bucket's remaining count and reset, failed attempts by class,
+  and a live `RATELIMITED` pause. The request log is hub-wide, so the rate
+  covers every Linear project on the hub.
 
 When a budget would run out within 30 minutes at the observed rate, `doctor`
 prints a `WARNING` line under it naming the top callers, so you know which
@@ -77,5 +85,7 @@ GitHub API budget health for `shelbi`:
 
 - [GitHub Issues backend](/docs/concepts/github-issues): how Shelbi reads and
   writes a GitHub board, and why it watches the API budget.
+- [Linear](/docs/concepts/linear#rate-limits): how a Linear board stays inside
+  the API key's rate limits.
 - [`shelbi config lint`](/docs/cli/config#lint): static checks of the
   configuration files, as opposed to these runtime checks.

@@ -21,6 +21,11 @@
 //! guards refuse up front (the default or only workflow, a status a workflow
 //! uses) says why at the row instead.
 //!
+//! A catalog Linear manages (`WorkflowsState::read_only`) takes only
+//! category changes: its banner says so, the heading's one button is Sync
+//! now (`S`, or Enter on it), and a status row's Enter and menu only change
+//! its category.
+//!
 //! Every edit goes to the shared state's queue; the shell runs each save off
 //! the input and render loop ([`WorkflowsPage::begin_commit`]) and hands the
 //! result back ([`WorkflowsPage::committed`]) under a ticket, so a result for
@@ -36,7 +41,7 @@ use ratatui::{
 };
 use shelbi_app::settings::workflows::{
     category_help, category_label, Committed, Draft, Edit, Target, WorkflowsState, CATEGORIES,
-    RENAME_NOTE, STATUSES_HELP, WORKFLOWS_HELP,
+    RENAME_NOTE, STATUSES_HELP, SYNCING, SYNC_NOW, WORKFLOWS_HELP,
 };
 use shelbi_app::settings::{Job, Ticket};
 use shelbi_core::StatusCategory;
@@ -62,6 +67,9 @@ pub(crate) enum Item {
     NewStatus,
     /// Open `statuses.yaml` in the user's editor.
     EditStatuses,
+    /// Sync now (a catalog a tracker manages), in place of Edit YAML and
+    /// New status.
+    SyncStatuses,
 }
 
 impl Item {
@@ -87,6 +95,7 @@ enum Act {
     DeleteStatus(String),
     NewStatus,
     StatusesYaml,
+    SyncStatuses,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,6 +180,18 @@ pub(crate) struct WorkflowsPage {
 }
 
 impl WorkflowsPage {
+    /// Workflows' Sync now landed.
+    pub(crate) fn synced(&mut self, sync: shelbi_app::tracker_connect::StatusSync) {
+        if let Some(state) = self.state.as_mut() {
+            state.synced(sync);
+        }
+    }
+
+    /// The catalog is a tracker's: only categories change here.
+    fn managed(&self) -> bool {
+        self.state.as_ref().is_some_and(|s| s.read_only().is_some())
+    }
+
     pub(crate) fn state(&self) -> Option<&WorkflowsState> {
         self.state.as_ref()
     }
@@ -363,8 +384,12 @@ impl WorkflowsPage {
         let mut out = vec![Item::NewWorkflow];
         out.extend(state.workflows().into_iter().map(|w| Item::Workflow(w.name)));
         out.extend(state.unreadable().iter().map(|u| Item::Unreadable(u.name.clone())));
-        out.push(Item::EditStatuses);
-        out.push(Item::NewStatus);
+        if state.read_only().is_some() {
+            out.push(Item::SyncStatuses);
+        } else {
+            out.push(Item::EditStatuses);
+            out.push(Item::NewStatus);
+        }
         out.extend(state.statuses().into_iter().map(|s| Item::Status(s.id)));
         out
     }
@@ -404,6 +429,10 @@ impl WorkflowsPage {
             }
             Item::Unreadable(name) => vec![entry("Edit YAML", "⏎ y", Act::WorkflowYaml(name.clone()), false)],
             Item::NewWorkflow => vec![entry("New workflow", "⏎ n", Act::NewWorkflow, false)],
+            Item::Status(id) if state.read_only().is_some() => {
+                vec![entry("Change category", "⏎ c", Act::Category(id.clone()), false)]
+            }
+            Item::SyncStatuses => vec![entry(SYNC_NOW, "⏎ S", Act::SyncStatuses, state.syncing())],
             Item::Status(id) => {
                 let statuses = state.statuses();
                 let at = statuses.iter().position(|s| &s.id == id).unwrap_or(0);
@@ -429,8 +458,10 @@ impl WorkflowsPage {
     }
 
     /// The row's main thing (Enter).
-    fn primary(item: &Item) -> Act {
+    fn primary(&self, item: &Item) -> Act {
         match item {
+            Item::Status(id) if self.managed() => Act::Category(id.clone()),
+            Item::SyncStatuses => Act::SyncStatuses,
             Item::Workflow(name) => Act::EditWorkflow(name.clone()),
             Item::Unreadable(name) => Act::WorkflowYaml(name.clone()),
             Item::NewWorkflow => Act::NewWorkflow,
@@ -442,6 +473,12 @@ impl WorkflowsPage {
 
     fn run(&mut self, act: Act) -> SettingsAction {
         self.modal = None;
+        // A tracker's catalog changes only its categories here.
+        if self.managed()
+            && matches!(act, Act::Rename(_) | Act::MoveStatus(..) | Act::DeleteStatus(_) | Act::NewStatus | Act::StatusesYaml)
+        {
+            return SettingsAction::Stay;
+        }
         let Some(state) = self.state.as_ref() else {
             return SettingsAction::Stay;
         };
@@ -460,6 +497,14 @@ impl WorkflowsPage {
                 target: Target::Page,
                 statuses_of: Some(state.project().to_string()),
             }),
+            Act::SyncStatuses => {
+                let project = state.project().to_string();
+                if self.state.as_mut().is_some_and(WorkflowsState::begin_sync) {
+                    SettingsAction::SyncStatuses(project)
+                } else {
+                    SettingsAction::Stay
+                }
+            }
             Act::NewWorkflow => {
                 self.open_draft(Draft::Workflow { from: None }, String::new());
                 SettingsAction::Stay
@@ -589,10 +634,11 @@ impl WorkflowsPage {
             return SettingsAction::Stay;
         };
         if nav.activate {
-            return self.run(Self::primary(&item));
+            return self.run(self.primary(&item));
         }
         let plain = k.modifiers.difference(KeyModifiers::SHIFT).is_empty();
         let act = match (k.code, &item) {
+            (KeyCode::Char('S'), _) if self.managed() => Act::SyncStatuses,
             (KeyCode::Char('m') | KeyCode::Char('.'), _) if plain => {
                 self.open_menu(&item);
                 return SettingsAction::Stay;
@@ -633,7 +679,7 @@ impl WorkflowsPage {
                 .map(|s| s.name.clone())
                 .unwrap_or_else(|| id.clone()),
             Item::NewWorkflow => "Workflows".into(),
-            Item::NewStatus | Item::EditStatuses => "Statuses".into(),
+            Item::NewStatus | Item::EditStatuses | Item::SyncStatuses => "Statuses".into(),
         };
         self.modal = Some(Modal::Menu { title, entries, selected: 0 });
     }
@@ -827,7 +873,7 @@ impl WorkflowsPage {
         self.cursor = index;
         match item {
             Item::NewWorkflow | Item::NewStatus | Item::EditStatuses | Item::Unreadable(_) => {
-                self.run(Self::primary(&item))
+                self.run(self.primary(&item))
             }
             _ if again => {
                 self.open_menu(&item);
@@ -872,9 +918,11 @@ impl WorkflowsPage {
                 let rest = match self.current() {
                     Some(Item::Workflow(_)) => "⏎ edit · m actions · n new · c duplicate · s default · x delete · y YAML",
                     Some(Item::Unreadable(_)) => "⏎ edit YAML · m actions",
+                    Some(Item::Status(_)) if self.managed() => "⏎ category · S sync now",
                     Some(Item::Status(_)) => {
                         "⏎ rename · m actions · c category · ⇧↑↓ move · x delete · n new · y YAML"
                     }
+                    Some(Item::SyncStatuses) => "⏎ sync the statuses from the tracker now",
                     Some(Item::NewWorkflow) => "⏎ new workflow",
                     Some(Item::NewStatus) => "⏎ new status",
                     Some(Item::EditStatuses) => "⏎ open statuses.yaml",
@@ -979,19 +1027,42 @@ impl WorkflowsPage {
             _ => error_rows(&mut rows, state.error_at(&Target::NewWorkflow), width),
         }
 
-        // Statuses: Edit YAML and New status in the heading, then the table.
+        // Statuses: Edit YAML and New status in the heading (Sync now, for a
+        // tracker's catalog, under its banner), then the table.
         rows.extend(super::section_rule(width).map(Row::text));
+        let managed = state.read_only().is_some();
         let (edit_yaml, new_status) = (index, index + 1);
-        index += 2;
-        let buttons = [
-            Button::secondary("Edit YAML").focused(selected(edit_yaml) == Some(true)),
-            Button::secondary("New status").focused(selected(new_status) == Some(true)),
-        ];
-        rows.extend(
-            section_heading("Statuses", Some(STATUSES_HELP), &buttons, width)
-                .into_iter()
-                .map(|h| Row::heading(h, &[Some(edit_yaml), Some(new_status)])),
-        );
+        if managed {
+            let sync = index;
+            index += 1;
+            let label = if state.syncing() { SYNCING } else { SYNC_NOW };
+            let buttons = [Button::secondary(label).focused(selected(sync) == Some(true))];
+            rows.extend(
+                section_heading("Statuses", Some(STATUSES_HELP), &buttons, width)
+                    .into_iter()
+                    .map(|h| Row::heading(h, &[Some(sync)])),
+            );
+            rows.push(Row::blank());
+            if let Some(banner) = state.banner() {
+                wrapped(&mut rows, &format!("ⓘ {banner}"), width, Style::default().fg(palette().cyan));
+            }
+            match state.sync_note() {
+                Some(Ok(line)) => wrapped(&mut rows, line, width, Style::default().fg(palette().green)),
+                Some(Err(why)) => wrapped(&mut rows, why, width, red),
+                None => {}
+            }
+        } else {
+            index += 2;
+            let buttons = [
+                Button::secondary("Edit YAML").focused(selected(edit_yaml) == Some(true)),
+                Button::secondary("New status").focused(selected(new_status) == Some(true)),
+            ];
+            rows.extend(
+                section_heading("Statuses", Some(STATUSES_HELP), &buttons, width)
+                    .into_iter()
+                    .map(|h| Row::heading(h, &[Some(edit_yaml), Some(new_status)])),
+            );
+        }
         rows.push(Row::blank());
         let statuses = state.statuses();
         // A status renamed in a field under its row shows selected.
@@ -1029,8 +1100,10 @@ impl WorkflowsPage {
             }
             _ => error_rows(&mut rows, state.error_at(&Target::NewStatus), width),
         }
-        rows.push(Row::blank());
-        wrapped(&mut rows, RENAME_NOTE, width, muted);
+        if !managed {
+            rows.push(Row::blank());
+            wrapped(&mut rows, RENAME_NOTE, width, muted);
+        }
 
         // The legend.
         rows.push(Row::blank());

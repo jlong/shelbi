@@ -1640,22 +1640,22 @@ fn the_properties_page_saves_the_project_yaml_and_refuses_bad_values(cx: &mut Te
         "properties-repository",
         "properties-default-branch",
         "properties-default-workflow-button",
-        "properties-issue-tracker-summary",
         "properties-advanced",
+        "tracker-section",
     ] {
         assert!(s.drawn(selector), "{selector}");
     }
     assert!(!s.drawn("properties-poll-interval"), "Advanced starts closed");
     assert!(!s.drawn("properties-editor-row") && !s.drawn("properties-editor-button"), "no Editor field");
-    // Top to bottom as the wireframe: Name, Repository, Default branch,
-    // Default workflow, Issue tracker, Advanced.
+    // Top to bottom: Name, Repository, Default branch, Default workflow,
+    // Advanced, then the Issue tracker section.
     let order = [
         "properties-name",
         "properties-repository",
         "properties-default-branch",
         "properties-default-workflow-button",
-        "properties-issue-tracker-summary",
         "properties-advanced",
+        "tracker-section",
     ];
     for pair in order.windows(2) {
         assert!(s.above(pair[0], pair[1]), "{} above {}", pair[0], pair[1]);
@@ -1688,6 +1688,121 @@ fn the_properties_page_saves_the_project_yaml_and_refuses_bad_values(cx: &mut Te
     assert_eq!(shelbi_state::load_project("alpha").unwrap().workspace_poll_interval_secs, 12);
     assert_eq!(shelbi_state::load_project("alpha").unwrap().editor.as_deref(), Some("hx"));
     let _ = text_selector(Text::Label);
+}
+
+// ---- Settings ▸ Properties ▸ Issue tracker (`linear-settings-ui`) -----------
+
+use shelbi_app::settings::tracker::TrackerService;
+use shelbi_app::tracker_connect::{ConnectError, ConnectTracker, Connected, StatusSync, TrackerChoice};
+
+/// A tracker service over canned Linear answers that records each
+/// connection asked for and refuses the first (the board has issues).
+fn recording_service(asked: Arc<Mutex<Vec<ConnectTracker>>>) -> TrackerService {
+    TrackerService {
+        connect: Arc::new(move |req| {
+            let mut asked = asked.lock().unwrap();
+            asked.push(req.clone());
+            if asked.len() == 1 {
+                return Err(ConnectError::NotEmpty {
+                    from: shelbi_core::IssueTrackerBackend::FileSystem,
+                    to: shelbi_core::IssueTrackerBackend::Linear,
+                    issues: 2,
+                    message: "project `alpha` has 2 issues on the local file system; run `shelbi issue-store migrate --to linear`".into(),
+                });
+            }
+            Ok(Connected {
+                backend: shelbi_core::IssueTrackerBackend::Linear,
+                previous: shelbi_core::IssueTrackerBackend::FileSystem,
+                file: "alpha.yaml".into(),
+                summary: "Linear: ENG (Engineering)".into(),
+                statuses: StatusSync::Synced("6 statuses from the Linear team".into()),
+            })
+        }),
+        linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+        sync_statuses: Arc::new(|| StatusSync::NotNeeded),
+    }
+}
+
+#[gpui::test]
+fn the_issue_tracker_section_connects_linear_and_can_force_a_refused_switch(cx: &mut TestAppContext) {
+    let _home = Home::with_project("props-tracker", "alpha");
+    let mut s = Settings::open_properties(cx);
+    let page = s.properties();
+    let section = s.read(|_, cx| page.read(cx).tracker());
+    let asked = Arc::new(Mutex::new(Vec::new()));
+    s.update(|_, _, cx| section.update(cx, |t, _| t.set_service(recording_service(asked.clone()))));
+    assert!(s.drawn("tracker-choice-local") && s.drawn("tracker-choice-github") && s.drawn("tracker-choice-linear"));
+    assert_eq!(s.read(|_, cx| section.read(cx).form().tracker()), shelbi_app::new_project::Tracker::FileSystem);
+    assert!(!s.drawn("tracker-linear"), "the local board has no Linear fields");
+
+    s.click("tracker-choice-linear");
+    s.saved();
+    assert!(s.drawn("tracker-linear-account") && s.drawn("tracker-linear-team"));
+    assert!(!s.drawn("tracker-linear-project"), "the filters wait for a team");
+    assert!(!s.drawn("tracker-linear-key"), "a working key shows the account, not the field");
+
+    // The team from its menu, then the filters show.
+    s.click("tracker-linear-team");
+    assert!(s.drawn("tracker-linear-team-menu"));
+    s.click("tracker-linear-team-0");
+    s.saved();
+    assert_eq!(s.read(|_, cx| section.read(cx).form().linear().team().to_string()), "ENG");
+    assert!(s.drawn("tracker-linear-project") && s.drawn("tracker-linear-assignee"));
+    s.click("tracker-linear-assignee");
+    s.click("tracker-linear-assignee-1");
+    s.saved();
+    assert!(s.drawn("tracker-linear-scope"));
+
+    // Connect is refused (the board has issues): the hint, and Switch anyway.
+    s.click("tracker-connect");
+    s.saved();
+    assert!(s.drawn("tracker-error") && s.drawn("tracker-force"));
+    // Under the refusal the button can sit below the test window's edge:
+    // press it as its click does.
+    s.update(|_, window, cx| section.update(cx, |t, cx| t.connect(true, window, cx)));
+    s.saved();
+    let asked = asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 2);
+    assert!(!asked[0].force && asked[1].force);
+    let TrackerChoice::Linear(conn) = &asked[1].choice else { panic!("{asked:?}") };
+    assert_eq!((conn.team.as_str(), conn.assignee.as_deref()), ("ENG", Some("me")));
+    assert!(s.drawn("tracker-status") && !s.drawn("tracker-error"));
+}
+
+#[gpui::test]
+fn a_linear_managed_catalog_is_read_only_but_its_categories_and_sync_now(cx: &mut TestAppContext) {
+    let home = Home::with_project("page-managed", "alpha");
+    crate::views::workflows_state::fixture::write_linear_project(&home.root.join("projects"), "alpha");
+    let mut s = Settings::open_workflows(cx);
+    assert!(s.drawn("statuses-managed") && s.drawn("statuses-sync"));
+    assert!(!s.drawn("statuses-new") && !s.drawn("statuses-edit-yaml"));
+    assert!(s.drawn("status-row-todo") && s.drawn("status-name-todo"));
+    assert!(!s.drawn("status-handle-todo") && !s.drawn("status-delete-todo"), "no reorder, no delete");
+    let page = s.workflows();
+    assert!(s.read(|_, cx| page.read(cx).name_field("todo").is_none()), "no rename field");
+
+    // The category still saves.
+    s.click("status-category-review");
+    s.click("status-category-review-active");
+    s.saved();
+    assert_eq!(config().status("review").unwrap().category, shelbi_core::StatusCategory::Active);
+    assert!(home.read("statuses.yaml").contains("managed_by: linear"));
+
+    // Sync now runs the tracker's sync and says what it did.
+    let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = runs.clone();
+    s.update(|_, _, cx| {
+        page.update(cx, |p, _| {
+            p.set_sync(Arc::new(move || {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                StatusSync::Synced("6 statuses from the Linear team".into())
+            }))
+        })
+    });
+    s.click("statuses-sync");
+    s.saved();
+    assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(s.drawn("statuses-sync-note"));
 }
 
 // ---- Edit YAML in the ⋮ menus (`dt-workflow-edit-yaml`) ---------------------

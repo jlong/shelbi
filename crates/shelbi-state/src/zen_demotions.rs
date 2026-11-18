@@ -187,6 +187,7 @@ mod tests {
                 id: id.into(),
                 name: id.into(),
                 category,
+                external_id: None,
             });
         }
         crate::save_project_statuses("demo", &catalog).unwrap();

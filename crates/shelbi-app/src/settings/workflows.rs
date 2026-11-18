@@ -17,7 +17,7 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
-use shelbi_core::StatusCategory;
+use shelbi_core::{StatusCategory, TrackerName};
 
 use super::store::ConfigStore;
 use shelbi_state::workflow_config::{
@@ -35,6 +35,33 @@ pub const STATUSES_HELP: &str = "Work transitions through statuses in workflows.
 /// The note under the status table.
 pub const RENAME_NOTE: &str =
     "Renaming a status keeps its ID, so existing workflow references stay intact.";
+
+/// "Sync now": read the tracker's statuses into the catalog again.
+pub const SYNC_NOW: &str = "Sync now";
+/// While it runs.
+pub const SYNCING: &str = "Syncing…";
+
+/// The banner over a catalog a tracker manages (`managed_by:` in
+/// `statuses.yaml`): the statuses come from there, and only each one's
+/// category is edited here.
+pub fn managed_banner(tracker: TrackerName, team: Option<&str>) -> String {
+    let name = tracker_label(tracker);
+    let whose = match team {
+        Some(team) => format!("{name} (team {team})"),
+        None => name.to_string(),
+    };
+    format!(
+        "Statuses are managed by {whose}. Rename, reorder, add or remove them in {name}; Shelbi syncs \
+         automatically. Each status's category is still yours to set."
+    )
+}
+
+/// A tracker's name in prose.
+pub fn tracker_label(tracker: TrackerName) -> &'static str {
+    match tracker {
+        TrackerName::Linear => "Linear",
+    }
+}
 
 /// The six categories, in the order the picker and the legend list them.
 pub const CATEGORIES: [StatusCategory; 6] = [
@@ -134,6 +161,19 @@ impl Edit {
                 Target::Workflow(name.clone())
             }
         }
+    }
+
+    /// Whether a catalog a tracker manages takes the edit: only a status's
+    /// category (and the workflow edits, which aren't the catalog's).
+    pub fn allowed_when_managed(&self) -> bool {
+        !matches!(
+            self,
+            Edit::AddStatus { .. }
+                | Edit::RenameStatus { .. }
+                | Edit::MoveStatus { .. }
+                | Edit::StepStatus { .. }
+                | Edit::DeleteStatus { .. }
+        )
     }
 
     /// Whether the edit removes something (a client confirms it first).
@@ -257,6 +297,11 @@ pub struct WorkflowsState {
     queue: VecDeque<Edit>,
     /// The new row being typed into, if any.
     pub draft: Option<Draft>,
+    /// A "Sync now" is running.
+    syncing: bool,
+    /// What the last one said: `Ok` a line saying what changed, `Err` why
+    /// it failed.
+    synced: Option<Result<String, String>>,
 }
 
 impl WorkflowsState {
@@ -269,7 +314,57 @@ impl WorkflowsState {
             saving: false,
             queue: VecDeque::new(),
             draft: None,
+            syncing: false,
+            synced: None,
         }
+    }
+
+    /// The tracker that manages the status catalog, if one does: the page
+    /// hides adding, renaming, reordering and deleting statuses, and shows
+    /// [`managed_banner`] and [`SYNC_NOW`].
+    pub fn read_only(&self) -> Option<TrackerName> {
+        self.config.as_ref().and_then(WorkflowConfig::statuses_read_only)
+    }
+
+    /// The banner over a managed catalog (`None` when it isn't managed).
+    pub fn banner(&self) -> Option<String> {
+        let tracker = self.read_only()?;
+        let team = self.config.as_ref().and_then(|c| c.issue_tracker().target.clone());
+        Some(managed_banner(tracker, team.as_deref()))
+    }
+
+    /// Start "Sync now" (the host runs the tracker service's
+    /// `sync_statuses` off the UI thread and answers [`Self::synced`]).
+    /// False while one runs, or when the catalog isn't managed.
+    pub fn begin_sync(&mut self) -> bool {
+        if self.syncing || self.read_only().is_none() {
+            return false;
+        }
+        self.syncing = true;
+        self.synced = None;
+        true
+    }
+
+    /// The sync finished: the host reads the files again next.
+    pub fn synced(&mut self, result: crate::tracker_connect::StatusSync) {
+        use crate::tracker_connect::StatusSync;
+        if !std::mem::take(&mut self.syncing) {
+            return;
+        }
+        self.synced = Some(match result {
+            StatusSync::Synced(line) => Ok(format!("Synced: {line}.")),
+            StatusSync::NotNeeded => Ok("Nothing to sync: the project isn't on Linear.".into()),
+            StatusSync::Failed(why) => Err(format!("Couldn't sync the statuses: {why}")),
+        });
+    }
+
+    pub fn syncing(&self) -> bool {
+        self.syncing
+    }
+
+    /// The last sync's line, until the next.
+    pub fn sync_note(&self) -> Option<&Result<String, String>> {
+        self.synced.as_ref()
     }
 
     pub fn project(&self) -> &str {
@@ -339,6 +434,11 @@ impl WorkflowsState {
     /// one lands) or before the model has loaded. The edit's row (and the
     /// header) stop showing their errors; other rows keep theirs.
     pub fn request(&mut self, edit: Edit) -> Option<(WorkflowConfig, Edit)> {
+        if let Some(tracker) = self.read_only().filter(|_| !edit.allowed_when_managed()) {
+            // The page hides these; a key that slips through says why.
+            self.set_error(edit.target(), sentence(&shelbi_state::workflow_config::ConfigError::ReadOnlyStatus(tracker).to_string()));
+            return None;
+        }
         self.clear_error(&edit.target());
         self.clear_error(&Target::Page);
         self.notice = None;
@@ -435,6 +535,9 @@ impl WorkflowsState {
 
     /// Why status `id` can't be deleted: the workflows that use it.
     pub fn delete_status_blocked(&self, id: &str) -> Option<String> {
+        if let Some(tracker) = self.read_only() {
+            return Some(format!("Delete it in {}.", tracker_label(tracker)));
+        }
         let used = self.config.as_ref()?.used_in(id);
         (!used.is_empty()).then(|| format!("Used in {}. Remove it from them first.", used.join(", ")))
     }
@@ -548,6 +651,46 @@ pub mod fixture {
         std::fs::write(projects.join(format!("{project}.yaml")), PROJECT_YAML).unwrap();
         write(&projects.join(project));
     }
+
+    /// Project `project` under `projects` as a Linear project (team ENG)
+    /// whose catalog Linear manages ([`MANAGED_STATUSES`]): the Statuses
+    /// section's read-only state.
+    pub fn write_linear_project(projects: &Path, project: &str) {
+        write_project(projects, project);
+        let yaml = format!("{PROJECT_YAML}issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n");
+        std::fs::write(projects.join(format!("{project}.yaml")), yaml).unwrap();
+        std::fs::write(projects.join(project).join("workflows").join("statuses.yaml"), MANAGED_STATUSES).unwrap();
+    }
+
+    /// [`STATUSES`] as Linear's team ENG manages them.
+    pub const MANAGED_STATUSES: &str = "\
+managed_by: linear
+statuses:
+- id: backlog
+  name: Backlog
+  category: backlog
+  external_id: state-backlog
+- id: todo
+  name: To Do
+  category: ready
+  external_id: state-todo
+- id: in-progress
+  name: In Progress
+  category: active
+  external_id: state-started
+- id: review
+  name: Review
+  category: handoff
+  external_id: state-review
+- id: done
+  name: Done
+  category: done
+  external_id: state-done
+- id: canceled
+  name: Canceled
+  category: archived
+  external_id: state-canceled
+";
 
     pub const STATUSES: &str = "\
 ## The project's statuses.

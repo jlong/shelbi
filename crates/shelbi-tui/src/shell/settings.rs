@@ -112,7 +112,7 @@ use crate::theme::palette;
 mod agent_editor;
 mod agents;
 mod machine_form;
-mod properties;
+pub(crate) mod properties;
 mod tool_picker;
 mod workflow_editor;
 mod workflows;
@@ -127,6 +127,8 @@ use tool_picker::ToolLayer;
 pub(crate) use workflow_editor::{run_work, EditorDone, EditorWork};
 use workflow_editor::{EditorAction, Landed, WorkflowEditorPage};
 pub(crate) use workflows::EditFile;
+#[cfg(test)]
+pub(crate) use workflows::Item as WorkflowsItem;
 use workflows::{Nav, WorkflowsPage};
 use shelbi_app::settings::workspace_form::{self, Outcome as PoolOutcome};
 use shelbi_app::settings::workspaces::PoolIndex;
@@ -238,6 +240,13 @@ pub(crate) enum SettingsAction {
     /// The Workflows page queued a save: start it off the UI thread
     /// ([`SettingsShell::begin_commit`]).
     Commit,
+    /// The Properties page's Issue tracker section has work (a Linear read,
+    /// a connection) to run off the UI thread
+    /// ([`SettingsShell::take_tracker_work`]).
+    TrackerWork,
+    /// Workflows' Sync now: sync `project`'s status catalog from its
+    /// tracker off the UI thread, then [`SettingsShell::statuses_synced`].
+    SyncStatuses(String),
     /// Open workflow `name`'s editor, on status `status`'s row when given
     /// (an agent's workflow-status assignment): [`SettingsShell::open_editor`].
     EditWorkflow { name: String, status: Option<String> },
@@ -302,6 +311,16 @@ impl PartialEq for PropertiesSave {
 impl Eq for PropertiesSave {}
 
 /// The Properties page's save to start, as an action.
+/// What a Properties key or click asks for: its save, else the Issue
+/// tracker section's work.
+fn properties_action(page: &properties::PropertiesPage, save: Option<(Ticket, String, WorkflowConfig)>) -> SettingsAction {
+    match save {
+        Some(save) => save_properties(Some(save)),
+        None if page.tracker_work_due() => SettingsAction::TrackerWork,
+        None => SettingsAction::Stay,
+    }
+}
+
 fn save_properties(save: Option<(Ticket, String, WorkflowConfig)>) -> SettingsAction {
     match save {
         Some((ticket, project, config)) => SettingsAction::SaveProperties(Box::new(PropertiesSave { ticket, project, config })),
@@ -1283,9 +1302,41 @@ impl SettingsShell {
     }
 
     /// The Properties page's read landed.
-    pub(crate) fn properties_loaded(&mut self, ticket: &Ticket, read: Result<WorkflowConfig, String>) {
+    pub(crate) fn properties_loaded(&mut self, ticket: &Ticket, read: Result<WorkflowConfig, String>) -> SettingsAction {
         if !self.properties.loaded(ticket, read) {
             self.dropped += 1;
+            return SettingsAction::Stay;
+        }
+        properties_action(&self.properties, None)
+    }
+
+    /// The Issue tracker section's work to run now, for its project.
+    pub(crate) fn take_tracker_work(&mut self) -> Option<(String, Vec<properties::TrackerWork>)> {
+        self.properties.take_tracker_work()
+    }
+
+    /// A piece of the section's work landed for `project`. A connection
+    /// written reads the page again; more Linear reads go on.
+    pub(crate) fn tracker_done(&mut self, project: &str, done: properties::TrackerDone) -> (SettingsAction, bool) {
+        let wrote = self.properties.tracker_done(project, done);
+        if wrote && self.nav.page() == SettingsPage::Properties {
+            return (SettingsAction::Reload, true);
+        }
+        (properties_action(&self.properties, None), wrote)
+    }
+
+    /// Workflows' Sync now landed for `project`: the page reads its files
+    /// again.
+    pub(crate) fn statuses_synced(&mut self, project: &str, sync: shelbi_app::tracker_connect::StatusSync) -> SettingsAction {
+        if self.workflows.state().map(|s| s.project()) != Some(project) {
+            self.dropped += 1;
+            return SettingsAction::Stay;
+        }
+        self.workflows.synced(sync);
+        if self.nav.page() == SettingsPage::Workflows {
+            SettingsAction::Reload
+        } else {
+            SettingsAction::Stay
         }
     }
 
@@ -1818,7 +1869,7 @@ impl SettingsShell {
             // saves it; digits and Tab type).
             let nav = Nav { up: false, down: false, activate: false };
             return match self.properties.key(k, nav) {
-                Some(save) => save_properties(save),
+                Some(save) => properties_action(&self.properties, save),
                 None => SettingsAction::Stay,
             };
         }
@@ -1869,7 +1920,7 @@ impl SettingsShell {
             Region::Page if on_workflows => self.workflows.handle_key(k, nav),
             Region::Page if self.nav.page() == SettingsPage::Keybindings => self.keys_key(k, keymaps),
             Region::Page if self.nav.page() == SettingsPage::Properties => match self.properties.key(k, nav) {
-                Some(save) => save_properties(save),
+                Some(save) => properties_action(&self.properties, save),
                 None => {
                     match k.code {
                         KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(8),
@@ -2146,7 +2197,8 @@ impl SettingsShell {
                             }
                             return save_properties(self.properties.commit_typing());
                         }
-                        save_properties(self.properties.activate(i))
+                        let save = self.properties.activate(i);
+                        properties_action(&self.properties, save)
                     }
                     Some(Hit::Action(i)) => self.run_action(i),
                     Some(Hit::Agents(h)) => {

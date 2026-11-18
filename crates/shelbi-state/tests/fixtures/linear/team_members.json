@@ -1,0 +1,16 @@
+{
+  "data": {
+    "team": {
+      "members": {
+        "nodes": [
+          { "id": "user-ada", "name": "Ada Lovelace", "displayName": "ada", "email": "ada@example.com", "active": true },
+          { "id": "user-grace", "name": "Grace Hopper", "displayName": "grace", "email": "grace@example.com", "active": true },
+          { "id": "user-sam-1", "name": "Sam Lee", "displayName": "sam", "email": "sam.lee@example.com", "active": true },
+          { "id": "user-sam-2", "name": "Sam Park", "displayName": "sam", "email": "sam.park@example.com", "active": true },
+          { "id": "user-old", "name": "Former Member", "displayName": "former", "email": "former@example.com", "active": false }
+        ],
+        "pageInfo": { "hasNextPage": false, "endCursor": "members-end" }
+      }
+    }
+  }
+}
