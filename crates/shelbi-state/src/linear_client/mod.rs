@@ -6,7 +6,9 @@
 //! ```text
 //!  LinearClient ── query / mutate / paginate ──► LinearRunner ──► curl ──► api.linear.app
 //!     │   typed helpers: viewer, teams, team_states,      (swappable: FakeLinear in tests)
-//!     │   team_projects, labels, team_members
+//!     │   team_projects, labels, team_members; issues,
+//!     │   create/update_issue, upsert_attachment,
+//!     │   issue_comments, create_comment
 //!     ├── auth:    LINEAR_API_KEY → macOS keychain → tokens.yml   (SecretToken)
 //!     ├── budget:  X-RateLimit-* headers → ~/.shelbi/linear-budget/<key>.json, park on RATELIMITED
 //!     ├── log:     one line per request → ~/.shelbi/linear-requests.log (never the key)
@@ -68,6 +70,7 @@ mod budget;
 mod client;
 mod error;
 mod filters;
+mod issues;
 mod queries;
 mod transport;
 
@@ -89,6 +92,10 @@ pub use filters::{
     resolve_team, ResolvedLinearFilters, FILTER_CACHE_FILE,
 };
 pub(crate) use filters::{read_cache_doc, write_cache_doc};
+pub use issues::{
+    merge_attachment, IssueOrder, IssueQuery, LinearAttachment, LinearComment, LinearIssue,
+    LinearRef, SHELBI_ATTACHMENT_PREFIX,
+};
 pub use queries::{
     Connection, LinearLabel, LinearProject, LinearProjectStatus, LinearState, LinearStateType,
     LinearTeam, LinearUser, PageInfo, PAGE_SIZE,
@@ -97,8 +104,8 @@ pub use transport::{curl_runner, LinearRequest, LinearResponse, LinearRunner, LI
 
 #[cfg(any(test, feature = "test-support"))]
 pub use fake::{
-    clear_test_linear_runner, fixture, set_test_linear_runner, test_keychain_value, FakeLinear,
-    FakeLinearGuard, FakeReply, FAKE_API_KEY,
+    clear_test_linear_runner, fixture, set_test_linear_runner, test_keychain_value,
+    test_runner_installed, FakeLinear, FakeLinearGuard, FakeReply, FAKE_API_KEY,
 };
 
 #[cfg(test)]

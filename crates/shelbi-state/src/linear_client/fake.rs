@@ -50,12 +50,30 @@ pub fn fixture(operation: &str) -> Option<&'static str> {
         "TeamProjects" => include_str!("../../tests/fixtures/linear/team_projects.json"),
         "Labels" => include_str!("../../tests/fixtures/linear/labels.json"),
         "TeamMembers" => include_str!("../../tests/fixtures/linear/team_members.json"),
+        "Issues" => include_str!("../../tests/fixtures/linear/issues.json"),
+        "IssueCreate" => include_str!("../../tests/fixtures/linear/issue_create.json"),
+        "IssueUpdate" => include_str!("../../tests/fixtures/linear/issue_update.json"),
+        "AttachmentCreate" => include_str!("../../tests/fixtures/linear/attachment_create.json"),
+        "IssueComments" => include_str!("../../tests/fixtures/linear/issue_comments.json"),
+        "CommentCreate" => include_str!("../../tests/fixtures/linear/comment_create.json"),
         _ => return None,
     })
 }
 
-const FIXTURE_OPERATIONS: &[&str] =
-    &["Viewer", "Teams", "TeamStates", "TeamProjects", "Labels", "TeamMembers"];
+const FIXTURE_OPERATIONS: &[&str] = &[
+    "Viewer",
+    "Teams",
+    "TeamStates",
+    "TeamProjects",
+    "Labels",
+    "TeamMembers",
+    "Issues",
+    "IssueCreate",
+    "IssueUpdate",
+    "AttachmentCreate",
+    "IssueComments",
+    "CommentCreate",
+];
 
 /// One canned reply.
 #[derive(Debug, Clone)]
@@ -243,6 +261,11 @@ where
 /// Remove a runner installed by [`set_test_linear_runner`].
 pub fn clear_test_linear_runner() {
     *RUNNER_OVERRIDE.write().unwrap_or_else(PoisonError::into_inner) = None;
+}
+
+/// Whether a fake runner is installed process-wide.
+pub fn test_runner_installed() -> bool {
+    test_runner_override().is_some()
 }
 
 pub(crate) fn test_runner_override() -> Option<LinearRunner> {

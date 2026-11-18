@@ -5040,7 +5040,7 @@ impl GhComment {
 /// A fresh hidden marker line for a comment shelbi is about to post
 /// (`<!-- shelbi:comment/<16 lowercase hex> -->`). Lets a lost-response create
 /// retry recognize its own already-posted comment so it never duplicates it.
-fn comment_marker() -> String {
+pub(crate) fn comment_marker() -> String {
     format!("{COMMENT_MARKER_PREFIX}{:016x} -->", comment_marker_token())
 }
 
@@ -5051,7 +5051,7 @@ fn comment_marker() -> String {
 /// dependency, and no security requirement (a collision only ever risks a
 /// missed reconcile, never a wrong match, because the caller also holds the exact
 /// marker string it generated).
-fn comment_marker_token() -> u64 {
+pub(crate) fn comment_marker_token() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
@@ -5074,7 +5074,7 @@ fn comment_marker_token() -> u64 {
 /// (byte-identical), so a human's comment is never reshaped; only a shelbi-posted
 /// body — whose marker line, and the blank line separating it, are dropped — is
 /// trimmed back to the text shelbi was asked to post.
-fn strip_comment_marker(body: &str) -> String {
+pub(crate) fn strip_comment_marker(body: &str) -> String {
     if !body.contains(COMMENT_MARKER_PREFIX) {
         return body.to_string();
     }

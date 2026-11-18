@@ -41,6 +41,7 @@ pub use gh_retry::{
 #[cfg(any(test, feature = "test-support"))]
 pub use gh_retry::notify_retry_for_test;
 pub mod github_store;
+pub mod linear_store;
 mod hub_config;
 mod hub_version;
 mod issue_cache;
@@ -101,6 +102,7 @@ pub use issue_auth::{
     resolve_github_token_by_name, token_file_path, SecretToken, TokenSource,
 };
 pub use github_store::GitHubStore;
+pub use linear_store::LinearStore;
 pub use github_store::{
     gh_failure_reason, graphql_read, graphql_write, search_issues, IssueSearchError, IssueSearchPage, ISSUE_SEARCH_MAX_RESULTS,
     ISSUE_SEARCH_PAGE_SIZE,
@@ -114,6 +116,7 @@ pub use issue_migrate::{
 pub use occupancy::{project_is_working, slot_reads_working, BoardOccupancy, SlotOccupancy};
 pub use board_index::{
     board_index_path, board_refresh_error_path, clear_board_refresh_error, expected_board_repo,
+    linear_board_repo,
     fold_assignment_overlay, github_board_repo, indexed_issue, mark_board_index_stale,
     patch_board_index_issue, read_board, read_board_index, read_board_index_numbers,
     read_board_index_viewer_login,

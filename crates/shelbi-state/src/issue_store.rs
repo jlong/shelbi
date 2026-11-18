@@ -42,12 +42,11 @@ use crate::IssueFile;
 ///
 /// The config is validated first, so a `github` backend with a missing or
 /// malformed `repo` surfaces a field-named [`Error::InvalidIssueTracker`]
-/// before we ever try to build a store. `file_system` (the markdown board) and
-/// `github` (issues in `owner/repo`) both have live backends; `jira` / `linear`
-/// validate but resolve to a typed [`Error::IssueTrackerUnimplemented`] (the
-/// Linear API client exists in [`crate::linear_client`]; its store does not
-/// yet) so a
-/// caller can tell "not built yet" apart from "you configured it wrong". See
+/// before we ever try to build a store. `file_system` (the markdown board),
+/// `github` (issues in `owner/repo`) and `linear` (a team's issues, narrowed
+/// by the project's filters) have live backends; `jira` validates but resolves
+/// to a typed [`Error::IssueTrackerUnimplemented`] so a caller can tell "not
+/// built yet" apart from "you configured it wrong". See
 /// `Plans/pluggable-task-stores.md` §2 + D1.
 pub fn resolve_issue_store(
     project: &str,
@@ -90,10 +89,12 @@ pub(crate) fn build_store(
                 })?;
             Ok(Box::new(crate::GitHubStore::new(project, repo)))
         }
-        // The API client (`crate::linear_client`) exists; the store built on
-        // it does not yet. A clear typed error, never a panic, until it lands.
         IssueTrackerBackend::Linear => {
-            Err(Error::IssueTrackerUnimplemented(IssueTrackerBackend::Linear.to_string()))
+            // `validate()` above guarantees a `linear` block with a team.
+            let conn = cfg.linear.clone().ok_or_else(|| {
+                Error::InvalidIssueTracker("issue_tracker.linear.team is required".into())
+            })?;
+            Ok(Box::new(crate::LinearStore::new(project, conn)))
         }
         IssueTrackerBackend::Jira => {
             Err(Error::IssueTrackerUnimplemented(IssueTrackerBackend::Jira.to_string()))
@@ -492,8 +493,9 @@ impl BoardState {
 }
 
 /// The board seam. Every consumer that reads or mutates a project's issues
-/// does so through this trait; [`FileSystemStore`] is the only implementor
-/// today, with GitHub / Jira / Linear backends to follow behind the same shape.
+/// does so through this trait: [`FileSystemStore`] (the markdown board),
+/// [`crate::GitHubStore`] and [`crate::LinearStore`], with Jira to follow
+/// behind the same shape.
 pub trait IssueStore {
     /// The whole board, in the canonical column-then-priority order.
     ///
@@ -1732,7 +1734,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_linear_is_a_clear_not_built_yet_error() {
+    fn resolve_linear_returns_a_cached_live_store() {
         use shelbi_core::{IssueTrackerConfig, LinearConnection};
 
         let cfg = IssueTrackerConfig {
@@ -1740,15 +1742,10 @@ mod tests {
             linear: Some(LinearConnection::for_team("ENG")),
             ..Default::default()
         };
-        match resolve_issue_store("p", &cfg) {
-            Err(e @ Error::IssueTrackerUnimplemented(_)) => {
-                let msg = e.to_string();
-                assert!(msg.contains("`linear`") && msg.contains("not built yet"), "{msg}");
-            }
-            Err(other) => panic!("expected IssueTrackerUnimplemented, got {other:?}"),
-            Ok(_) => panic!("expected an error, got a live store"),
-        }
-        // A config error still wins over "not built yet".
+        // Building the store reads nothing: the key and filters resolve per call.
+        assert!(build_store("p", &cfg).is_ok());
+        assert!(resolve_issue_store("p", &cfg).is_ok());
+        // A config error (no team) is still a typed config error.
         let cfg = IssueTrackerConfig { backend: IssueTrackerBackend::Linear, ..Default::default() };
         assert!(matches!(resolve_issue_store("p", &cfg), Err(Error::InvalidIssueTracker(_))));
     }

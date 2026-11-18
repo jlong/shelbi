@@ -1,0 +1,13 @@
+{
+  "data": {
+    "commentCreate": {
+      "success": true,
+      "comment": {
+        "id": "comment-2",
+        "body": "Posted by Shelbi.",
+        "createdAt": "2026-11-06T11:00:00.000Z",
+        "user": { "id": "user-ada", "name": "Ada Lovelace", "displayName": "ada", "email": "ada@example.com" }
+      }
+    }
+  }
+}
