@@ -1,0 +1,13 @@
+{
+  "data": {
+    "issueLabels": {
+      "nodes": [
+        { "id": "label-bug", "name": "Bug", "color": "#eb5757", "isGroup": false },
+        { "id": "label-shelbi", "name": "shelbi", "color": "#4ea7fc", "isGroup": false },
+        { "id": "label-feature", "name": "Feature", "color": "#bb87fc", "isGroup": true },
+        { "id": "label-improvement", "name": "Improvement", "color": "#4cb782", "isGroup": false }
+      ],
+      "pageInfo": { "hasNextPage": false, "endCursor": "labels-end" }
+    }
+  }
+}

@@ -527,17 +527,22 @@ for the concept and the full behavior.
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
-| `backend` | `file_system` \| `github` \| `jira` \| `linear` | no | `file_system` | The live backend. `file_system` (local markdown) and `github` resolve to a working board today; `jira` and `linear` parse and validate but return a "not yet implemented" error. |
+| `backend` | `file_system` \| `github` \| `jira` \| `linear` | no | `file_system` | The live backend. `file_system` (local markdown) and `github` resolve to a working board today; `jira` and `linear` parse and validate but return a "store is not built yet" error. |
 | `github` | [GithubConnection](#github-connection) | when `backend: github` | — | GitHub connection facts. |
 | `jira` | object | when `backend: jira` | — | `{ project: KEY }`. Stub backend. |
-| `linear` | object | when `backend: linear` | — | `{ team: KEY }`. Stub backend. |
+| `linear` | [LinearConnection](#linear-connection) | when `backend: linear` | — | Linear team plus optional filters. |
 | `refresh_secs` | integer | no | `30` | How often (seconds) the hub daemon re-reads a **remote** board and rewrites `board-index.json`. `0` or absent folds to the default. Ignored for `file_system`, whose local read is free. |
 | `budget` | [Budget](#issue_tracker-budget) | no | all defaults | Rate-limit governor thresholds for a remote backend. |
 
-Only the **selected** backend's connection block is validated, so you can stage a
-`github:` block alongside `backend: file_system` without it failing the load. The
-auth token is never a field here: it is resolved out of band from `gh` (see
-[prerequisites](/docs/concepts/github-issues#prerequisites)).
+A project connects to **one** external tracker. At most one of the `github:`,
+`jira:` and `linear:` blocks may be present, and with an external backend
+selected the block present must be that backend's; anything else is a validation
+error naming the block to remove. With `backend: file_system` you may stage a
+single block (for example a `github:` block ahead of
+`shelbi issue-store migrate --to github`), and only the **selected** backend's
+block is validated. Auth tokens are never fields here: GitHub's comes from `gh`
+(see [prerequisites](/docs/concepts/github-issues#prerequisites)) and Linear's
+from [`shelbi tracker linear login`](/docs/cli/tracker).
 
 ```yaml
 issue_tracker:
@@ -553,6 +558,35 @@ issue_tracker:
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
 | `repo` | string | yes (when `backend: github`) | — | `owner/repo` slug naming the repository the issues live in. Validated as a well-formed slug. |
+
+### linear connection
+
+The filters that pick which Linear issues the project's board (and its agents)
+see. Every value is matched case-insensitively against the Linear object's key,
+name or id. Issues Shelbi creates are created with these filters applied. Use
+[`shelbi tracker linear`](/docs/cli/tracker) to list the values and to check what
+they resolve to.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `team` | string | yes (when `backend: linear`) | — | Team key, name or id (e.g. `ENG`). Statuses come from this team. |
+| `project` | string | no | any | Linear project name or id. |
+| `label` | string | no | any | Issue label name or id (a team or workspace label). |
+| `assignee` | string | no | anyone | `me` (the API key's owner), an email, or a user id. |
+
+```yaml
+issue_tracker:
+  backend: linear
+  linear:
+    team: ENG
+    project: Shelbi
+    label: shelbi
+    assignee: me
+```
+
+The Linear backend's store is still being built: today this block parses and
+validates, and `shelbi tracker linear status` resolves it, but selecting
+`backend: linear` reports that the store is not built yet.
 
 ### issue_tracker budget
 

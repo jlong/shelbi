@@ -1,0 +1,77 @@
+---
+title: shelbi tracker
+order: 21.5
+summary: Connect to an external issue tracker (Linear today), check the connection, and list the teams, projects, labels and users to use as filters.
+---
+
+```text
+shelbi tracker linear login [--key-stdin]
+shelbi tracker linear status [--refresh] [--json]
+shelbi tracker linear teams [--json]
+shelbi tracker linear projects [--team <TEAM>] [--json]
+shelbi tracker linear labels [--team <TEAM>] [--json]
+shelbi tracker linear users [--team <TEAM>] [--json]
+```
+
+`shelbi tracker` manages the connection to an external issue tracker, separate
+from the issues on the board (`shelbi issue`). Today it covers Linear.
+
+## Getting started with Linear
+
+1. In Linear, create a personal API key: **Settings > Account > Security &
+   access > Personal API keys**.
+2. Run `shelbi tracker linear login` and paste the key. Shelbi asks Linear who
+   the key belongs to, and only stores a key Linear accepts.
+3. Run `shelbi tracker linear teams` to find your team's key.
+4. Point the project at Linear (see the
+   [`linear` connection](/docs/configuration/project#linear-connection)):
+
+   ```yaml
+   issue_tracker:
+     backend: linear
+     linear:
+       team: ENG          # required
+       project: Shelbi    # optional
+       label: shelbi      # optional
+       assignee: me       # optional
+   ```
+
+5. Run `shelbi tracker linear status` to check what the filters resolve to.
+
+## Where the API key lives
+
+Shelbi looks for the key in this order and uses the first it finds:
+
+1. The `LINEAR_API_KEY` environment variable.
+2. The macOS keychain: the generic password with service `shelbi-linear` and
+   account `default`, which `login` writes.
+3. The project's `~/.shelbi/projects/<name>/tokens.yml`, under
+   `linear: { token: ... }`. The file must be `chmod 600`.
+
+The key is never written to the project config, never passed on a command line,
+and never logged. Requests go to Linear through `curl`, which reads the key and
+the request body from stdin.
+
+## Subcommands
+
+| Subcommand | What it does |
+| --- | --- |
+| `login` | Prompts for an API key (input hidden), checks it against Linear and stores it in the keychain. `--key-stdin` reads the key from stdin instead, for example `pbpaste \| shelbi tracker linear login --key-stdin`. |
+| `status` | Shows where the key comes from, who it belongs to, the project's filters and the ids they resolve to, and the rate-limit budget left. Resolved ids are cached in `~/.shelbi/projects/<name>/linear.json`; `--refresh` resolves them again. |
+| `teams` | Lists the teams the key can see. |
+| `projects` | Lists a team's projects. |
+| `labels` | Lists the labels usable on a team's issues: the team's own and the workspace's. Group labels are marked: they can't be put on an issue. |
+| `users` | Lists a team's members, with inactive users marked. |
+
+`projects`, `labels` and `users` take the team from `--team` (key, name or id),
+or else from the current project's `issue_tracker.linear.team`. Every listing
+takes `--json`.
+
+## Rate limits
+
+Every Linear response's rate-limit headers are recorded per API key under
+`~/.shelbi/linear-budget/`, and each request is logged (operation, outcome and
+duration, never the key) to `~/.shelbi/linear-requests.log`. When Linear
+reports the limit reached, Shelbi pauses requests with that key until the reset
+time Linear gives (one minute when it gives none), and `status` shows the pause.
+Timeouts and server errors are retried with backoff.

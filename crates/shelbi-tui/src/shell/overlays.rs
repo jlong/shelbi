@@ -54,8 +54,10 @@ pub enum OverlayEvent {
         dont_show_again: bool,
     },
     /// The Add-project form submitted these answers; the shell creates the
-    /// project off-thread through the one creation engine.
-    AddProjectSubmit(shelbi_app::new_project::NewProject),
+    /// project off-thread through the one creation engine. Boxed: the plan
+    /// (which carries the whole `issue_tracker` block) dwarfs every other
+    /// variant.
+    AddProjectSubmit(Box<shelbi_app::new_project::NewProject>),
     /// The Add-project form was cancelled.
     AddProjectCancel,
     /// About Shelbi asked to open this page in the browser; it stays open.
@@ -626,7 +628,7 @@ fn add_project_event(form: &overlay::add_project::Form, step: overlay::add_proje
         Step::Continue | Step::Validate | Step::Preflight(_) | Step::Menu(_) => OverlayEvent::Stay,
         Step::Cancel => OverlayEvent::AddProjectCancel,
         Step::Submit => match form.plan() {
-            Some(plan) => OverlayEvent::AddProjectSubmit(plan),
+            Some(plan) => OverlayEvent::AddProjectSubmit(Box::new(plan)),
             None => OverlayEvent::Stay,
         },
     }

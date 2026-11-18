@@ -5643,7 +5643,12 @@ mod tests {
             stderr: "\ngh: Pull request review thread line must be part of the diff\n".to_string(),
         };
         assert_eq!(gh_failure_reason(&refused), "Pull request review thread line must be part of the diff");
-        let no_login = Error::MissingIssueTrackerAuth { backend: "github", token_file: "t".to_string() };
+        let no_login = Error::MissingIssueTrackerAuth {
+            backend: "github",
+            checked: String::new(),
+            token_file: "t".to_string(),
+            fix: String::new(),
+        };
         assert_eq!(gh_failure_reason(&no_login), "No GitHub login here: run gh auth login");
     }
 

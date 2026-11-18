@@ -63,6 +63,7 @@ pub mod issue_auth;
 pub mod issue_migrate;
 pub mod issue_store;
 pub mod keymap;
+pub mod linear_client;
 pub mod pool_config;
 pub mod pr_status;
 pub mod project_properties;

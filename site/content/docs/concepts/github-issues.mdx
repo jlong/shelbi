@@ -73,12 +73,13 @@ and validate (a `jira:` or `linear:` block requires its selector), but they have
 no live store yet: selecting one resolves to a typed error, reported exactly as:
 
 ```text
-issue_tracker backend `jira` is not yet implemented (only `file_system` is available today)
+the `jira` issue-tracker store is not built yet in this version of shelbi; use `file_system` or `github` for now
 ```
 
-Only `file_system` and `github` resolve to a working board today. (That error
-string predates the GitHub backend and still names only `file_system`; `github`
-is nonetheless live.)
+Only `file_system` and `github` resolve to a working board today. The Linear
+API client and `shelbi tracker linear` already exist (see
+[`shelbi tracker`](/docs/cli/tracker)); the Linear store built on them is in
+progress.
 
 ## How issues map to cards
 

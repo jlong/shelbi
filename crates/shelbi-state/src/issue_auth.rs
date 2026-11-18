@@ -87,6 +87,9 @@ pub enum TokenSource {
     GhCli,
     /// The out-of-repo `~/.shelbi/projects/<name>/tokens.yml` file.
     File,
+    /// The macOS login keychain (Linear: the `shelbi-linear` generic password
+    /// that `shelbi tracker linear login` stores).
+    Keychain,
 }
 
 impl fmt::Display for TokenSource {
@@ -95,6 +98,7 @@ impl fmt::Display for TokenSource {
             TokenSource::Env(var) => write!(f, "${var}"),
             TokenSource::GhCli => f.write_str("`gh auth token`"),
             TokenSource::File => f.write_str("tokens.yml"),
+            TokenSource::Keychain => f.write_str("the macOS keychain"),
         }
     }
 }
@@ -119,7 +123,7 @@ pub struct SecretToken {
 }
 
 impl SecretToken {
-    fn new(value: String, source: TokenSource) -> Self {
+    pub(crate) fn new(value: String, source: TokenSource) -> Self {
         SecretToken { value, source }
     }
 
@@ -160,6 +164,15 @@ impl fmt::Display for SecretToken {
 struct TokensFile {
     #[serde(default)]
     github: Option<BackendToken>,
+    #[serde(default)]
+    linear: Option<BackendToken>,
+}
+
+/// Which backend's block of `tokens.yml` to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenBlock {
+    Github,
+    Linear,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -317,7 +330,7 @@ fn resolve_github_token_with(
     }
 
     // 3. Out-of-repo tokens.yml (chmod 600).
-    if let Some(tok) = read_token_file(token_file)? {
+    if let Some(tok) = read_token_file(token_file, TokenBlock::Github)? {
         return Ok(SecretToken::new(tok, TokenSource::File));
     }
 
@@ -336,7 +349,9 @@ fn resolve_github_token_with(
     }
     Err(Error::MissingIssueTrackerAuth {
         backend: "github",
+        checked: "$GH_TOKEN, $GITHUB_TOKEN, `gh auth token`".to_string(),
         token_file: token_file.display().to_string(),
+        fix: "run `gh auth login` or set GH_TOKEN".to_string(),
     })
 }
 
@@ -375,13 +390,13 @@ fn non_empty(value: String) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Read the GitHub token from an out-of-repo `tokens.yml`.
+/// Read one backend's token from an out-of-repo `tokens.yml`.
 ///
 /// Returns `Ok(None)` when the file is absent or present but carries no
-/// `github.token`, so the caller falls through to the missing-auth error.
+/// `<block>.token`, so the caller falls through to the missing-auth error.
 /// Refuses (with [`Error::InsecureTokenFile`]) a unix file whose mode is looser
 /// than `0600`.
-fn read_token_file(path: &Path) -> Result<Option<String>> {
+pub(crate) fn read_token_file(path: &Path, block: TokenBlock) -> Result<Option<String>> {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -391,10 +406,11 @@ fn read_token_file(path: &Path) -> Result<Option<String>> {
     ensure_private_permissions(path)?;
 
     let parsed: TokensFile = yaml_serde::from_str(&contents)?;
-    Ok(parsed
-        .github
-        .and_then(|g| g.token)
-        .and_then(non_empty))
+    let entry = match block {
+        TokenBlock::Github => parsed.github,
+        TokenBlock::Linear => parsed.linear,
+    };
+    Ok(entry.and_then(|g| g.token).and_then(non_empty))
 }
 
 /// Reject a token file readable by group or other. Unix only — on other
@@ -614,7 +630,7 @@ mod tests {
         let _ = std::fs::remove_file(&missing);
         let err = resolve_github_token_with(no_env, no_gh, &missing).unwrap_err();
         match &err {
-            Error::MissingIssueTrackerAuth { backend, token_file } => {
+            Error::MissingIssueTrackerAuth { backend, token_file, .. } => {
                 assert_eq!(*backend, "github");
                 assert_eq!(token_file, &missing.display().to_string());
             }

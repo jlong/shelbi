@@ -160,32 +160,37 @@ pub enum Error {
     #[error("{0}")]
     InvalidIssueTracker(String),
 
-    /// A project's `issue_tracker` block selects a valid remote backend
-    /// (`github` / `jira` / `linear`) that parses and validates but has no live
-    /// store implementation yet. Distinct from [`Error::InvalidIssueTracker`]
-    /// (a config error the user must fix) so a caller can tell "not built yet"
-    /// apart from "you configured it wrong". Only `file_system` resolves today.
+    /// A project's `issue_tracker` block selects a valid remote backend whose
+    /// live store is not built yet (`jira` today, `linear` until its store
+    /// lands). Distinct from [`Error::InvalidIssueTracker`] (a config error the
+    /// user must fix) so a caller can tell "not built yet" apart from "you
+    /// configured it wrong". The payload is the backend's wire token.
     #[error(
-        "issue_tracker backend `{0}` is not yet implemented \
-         (only `file_system` is available today)"
+        "the `{0}` issue-tracker store is not built yet in this version of shelbi; \
+         use `file_system` or `github` for now"
     )]
     IssueTrackerUnimplemented(String),
 
-    /// No auth token could be resolved for a remote issue-tracker backend.
-    /// The resolver walked its whole chain — `GH_TOKEN`/`GITHUB_TOKEN` env,
-    /// the `gh` CLI keychain, then the out-of-repo `tokens.yml` — and found
-    /// nothing, so the message names every place it looked *and* the one-line
-    /// fix. Shelbi never holds a long-lived secret on disk, so the default
-    /// remedy is to reuse `gh`'s own auth. See `Plans/pluggable-task-stores.md`
+    /// No auth credential could be resolved for a remote issue-tracker backend.
+    /// The resolver walked its whole chain and found nothing, so the message
+    /// names every place it looked (`checked`, then the out-of-repo
+    /// `token_file`) *and* the one-line fix. Each backend fills in its own
+    /// chain and fix: GitHub checks `GH_TOKEN`/`GITHUB_TOKEN`, `gh auth token`
+    /// and `tokens.yml` (fix: `gh auth login`); Linear checks
+    /// `LINEAR_API_KEY`, the macOS keychain and `tokens.yml` (fix:
+    /// `shelbi tracker linear login`). See `Plans/pluggable-task-stores.md`
     /// §4 + D2.
     #[error(
         "no auth token found for the `{backend}` issue-tracker backend: \
-         checked $GH_TOKEN, $GITHUB_TOKEN, `gh auth token`, and {token_file}; \
-         run `gh auth login` or set GH_TOKEN"
+         checked {checked}, and {token_file}; {fix}"
     )]
     MissingIssueTrackerAuth {
         backend: &'static str,
+        /// The sources tried before the token file, e.g. `$GH_TOKEN, …`.
+        checked: String,
         token_file: String,
+        /// The actionable remedy, e.g. ``run `gh auth login` or set GH_TOKEN``.
+        fix: String,
     },
 
     /// The `gh auth token` keychain probe kept failing across its retries, so a

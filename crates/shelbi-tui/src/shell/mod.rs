@@ -4066,7 +4066,7 @@ impl ShellState {
                 self.overlay = None;
                 self.client.focus_main();
             }
-            OverlayEvent::AddProjectSubmit(plan) => self.submit_add_project(plan),
+            OverlayEvent::AddProjectSubmit(plan) => self.submit_add_project(*plan),
             OverlayEvent::OpenUrl(url) => self.open_url(url),
             OverlayEvent::FeedbackSend(submission) => self.send_feedback(submission),
             OverlayEvent::NewTaskCreate(request) => self.create_new_task(request),

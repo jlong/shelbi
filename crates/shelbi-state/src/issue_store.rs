@@ -44,7 +44,9 @@ use crate::IssueFile;
 /// malformed `repo` surfaces a field-named [`Error::InvalidIssueTracker`]
 /// before we ever try to build a store. `file_system` (the markdown board) and
 /// `github` (issues in `owner/repo`) both have live backends; `jira` / `linear`
-/// validate but resolve to a typed [`Error::IssueTrackerUnimplemented`] so a
+/// validate but resolve to a typed [`Error::IssueTrackerUnimplemented`] (the
+/// Linear API client exists in [`crate::linear_client`]; its store does not
+/// yet) so a
 /// caller can tell "not built yet" apart from "you configured it wrong". See
 /// `Plans/pluggable-task-stores.md` §2 + D1.
 pub fn resolve_issue_store(
@@ -88,7 +90,14 @@ pub(crate) fn build_store(
                 })?;
             Ok(Box::new(crate::GitHubStore::new(project, repo)))
         }
-        other => Err(Error::IssueTrackerUnimplemented(other.to_string())),
+        // The API client (`crate::linear_client`) exists; the store built on
+        // it does not yet. A clear typed error, never a panic, until it lands.
+        IssueTrackerBackend::Linear => {
+            Err(Error::IssueTrackerUnimplemented(IssueTrackerBackend::Linear.to_string()))
+        }
+        IssueTrackerBackend::Jira => {
+            Err(Error::IssueTrackerUnimplemented(IssueTrackerBackend::Jira.to_string()))
+        }
     }
 }
 
@@ -1720,6 +1729,28 @@ mod tests {
             Err(other) => panic!("expected IssueTrackerUnimplemented, got {other:?}"),
             Ok(_) => panic!("expected an error, got a live store"),
         }
+    }
+
+    #[test]
+    fn resolve_linear_is_a_clear_not_built_yet_error() {
+        use shelbi_core::{IssueTrackerConfig, LinearConnection};
+
+        let cfg = IssueTrackerConfig {
+            backend: IssueTrackerBackend::Linear,
+            linear: Some(LinearConnection::for_team("ENG")),
+            ..Default::default()
+        };
+        match resolve_issue_store("p", &cfg) {
+            Err(e @ Error::IssueTrackerUnimplemented(_)) => {
+                let msg = e.to_string();
+                assert!(msg.contains("`linear`") && msg.contains("not built yet"), "{msg}");
+            }
+            Err(other) => panic!("expected IssueTrackerUnimplemented, got {other:?}"),
+            Ok(_) => panic!("expected an error, got a live store"),
+        }
+        // A config error still wins over "not built yet".
+        let cfg = IssueTrackerConfig { backend: IssueTrackerBackend::Linear, ..Default::default() };
+        assert!(matches!(resolve_issue_store("p", &cfg), Err(Error::InvalidIssueTracker(_))));
     }
 
     #[test]

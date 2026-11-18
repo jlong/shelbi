@@ -174,6 +174,12 @@ enum Cmd {
         #[command(subcommand)]
         cmd: commands::issue_store::IssueStoreCmd,
     },
+    /// Connect to an external issue tracker and inspect the connection:
+    /// `shelbi tracker linear login|status|teams|projects|labels|users`.
+    Tracker {
+        #[command(subcommand)]
+        cmd: commands::tracker::TrackerCmd,
+    },
     /// Inspect and control the project's declared workspace pool.
     Workspace {
         #[command(subcommand)]
@@ -551,6 +557,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Changelog { cmd }) => commands::changelog::run(cli.project, cmd),
         Some(Cmd::IssueStore { cmd }) => commands::issue_store::run(cli.project, cmd),
+        Some(Cmd::Tracker { cmd }) => commands::tracker::run(cli.project, cmd),
         Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => {
             eprintln!("shelbi: 'worker' is deprecated; use 'workspace' instead.");
@@ -1188,6 +1195,31 @@ mod cli_tests {
 
         // Both the id and the text are required positionals.
         assert!(Cli::try_parse_from(["shelbi", "issue", "comment", "fix-login"]).is_err());
+    }
+
+    /// `shelbi tracker linear ...` parses its subcommands and flags.
+    #[test]
+    fn tracker_linear_subcommands_parse() {
+        use commands::tracker::{LinearCmd, TrackerCmd};
+
+        let cli = Cli::parse_from(["shelbi", "tracker", "linear", "login", "--key-stdin"]);
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Tracker { cmd: TrackerCmd::Linear { cmd: LinearCmd::Login { key_stdin: true } } })
+        ));
+        let cli = Cli::parse_from(["shelbi", "tracker", "linear", "status", "--refresh", "--json"]);
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Tracker {
+                cmd: TrackerCmd::Linear { cmd: LinearCmd::Status { refresh: true, json: true } }
+            })
+        ));
+        for sub in ["teams", "projects", "labels", "users"] {
+            Cli::try_parse_from(["shelbi", "tracker", "linear", sub, "--json"])
+                .unwrap_or_else(|e| panic!("{sub}: {e}"));
+        }
+        Cli::try_parse_from(["shelbi", "tracker", "linear", "labels", "--team", "ENG"]).unwrap();
+        assert!(Cli::try_parse_from(["shelbi", "tracker", "linear", "teams", "--team", "ENG"]).is_err());
     }
 
     /// `shelbi issue-store migrate --to github` parses into the target backend,
