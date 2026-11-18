@@ -1742,12 +1742,19 @@ mod tests {
             linear: Some(LinearConnection::for_team("ENG")),
             ..Default::default()
         };
-        // Building the store reads nothing: the key and filters resolve per call.
+        // The cache layer touches per-project state paths: a throwaway home.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Building the store reads nothing remote: the key and filters
+        // resolve per call.
         assert!(build_store("p", &cfg).is_ok());
         assert!(resolve_issue_store("p", &cfg).is_ok());
         // A config error (no team) is still a typed config error.
         let cfg = IssueTrackerConfig { backend: IssueTrackerBackend::Linear, ..Default::default() };
         assert!(matches!(resolve_issue_store("p", &cfg), Err(Error::InvalidIssueTracker(_))));
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
