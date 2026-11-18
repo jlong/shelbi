@@ -24,6 +24,11 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
+# The Linear client's HTTP transport (`linear_client::transport`): blocking,
+# no async runtime, rustls with ring and the bundled Mozilla roots (no
+# OpenSSL / native-tls). `gzip` is off, so ureq doesn't ask for compressed
+# bodies; serde_json already covers the JSON.
+ureq = { version = "3.5", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
 # Test-only: a scoped subscriber capturing the one-line warning the event-log
