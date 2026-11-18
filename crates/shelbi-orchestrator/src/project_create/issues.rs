@@ -232,15 +232,54 @@ pub fn ensure_board_not_stranded(project: &str, tracker: &IssueTrackerConfig) ->
         return Ok(());
     }
     if file_system_board_has_issues(project) {
+        let to = migrate_target_args(tracker);
         bail!(
             "project `{project}` already has issues on its local file_system board; switching to \
              {backend} here would strand them. Migrate them first:\n  \
-             shelbi issue-store migrate --to {backend} --dry-run   # preview\n  \
-             shelbi issue-store migrate --to {backend}             # then migrate",
+             shelbi issue-store migrate --to {to}           # preview\n  \
+             shelbi issue-store migrate --to {to} --apply   # then migrate",
             backend = tracker.backend,
         );
     }
     Ok(())
+}
+
+/// The `--to <backend> [connection flags]` part of an `issue-store migrate`
+/// command onto `tracker`. The target's connection is named in flags because
+/// the project's config doesn't carry it yet (the switch is what's pending).
+pub fn migrate_target_args(tracker: &IssueTrackerConfig) -> String {
+    let mut to = tracker.backend.to_string();
+    if tracker.backend == IssueTrackerBackend::Github {
+        if let Some(repo) = tracker.github.as_ref().map(|g| g.repo.trim()).filter(|r| !r.is_empty()) {
+            to.push_str(&format!(" --github-repo {}", shell_word(repo)));
+        }
+    }
+    if tracker.backend == IssueTrackerBackend::Linear {
+        if let Some(l) = tracker.linear.as_ref() {
+            for (flag, value) in [
+                ("--linear-team", l.team_ref()),
+                ("--linear-project", l.project_ref()),
+                ("--linear-label", l.label_ref()),
+                ("--linear-assignee", l.assignee_ref()),
+            ] {
+                if let Some(v) = value {
+                    to.push_str(&format!(" {flag} {}", shell_word(v)));
+                }
+            }
+        }
+    }
+    to
+}
+
+/// `value` as one shell word: bare when it is plain, single-quoted otherwise.
+fn shell_word(value: &str) -> String {
+    if !value.is_empty()
+        && value.chars().all(|c| c.is_ascii_alphanumeric() || "-_./@:".contains(c))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 /// True when the project already has a non-empty local (file_system) board, so

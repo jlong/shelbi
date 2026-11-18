@@ -1086,6 +1086,14 @@ impl BudgetConfig {
 /// live value up as the token budget tightens.
 pub const DEFAULT_ISSUE_REFRESH_SECS: u64 = 30;
 
+/// Default board-index refresh cadence (seconds) for a **Linear** project.
+/// Linear's per-key budget is counted in requests and in query complexity,
+/// and one board read (a 100-issue page with its state, assignee, labels and
+/// Shelbi attachment) costs a few thousand complexity points, so a minute
+/// keeps the daemon's steady-state reads well inside the hourly allowance
+/// while Shelbi's own writes still show at once (they write through).
+pub const DEFAULT_LINEAR_REFRESH_SECS: u64 = 60;
+
 impl IssueTrackerConfig {
     /// True when this is the untouched default (`file_system`, no connection
     /// blocks). Drives `skip_serializing_if` on [`Project::issue_tracker`] so an
@@ -1095,13 +1103,17 @@ impl IssueTrackerConfig {
     }
 
     /// The board-index refresh cadence in seconds: the configured
-    /// `refresh_secs` when set to a positive value, else
-    /// [`DEFAULT_ISSUE_REFRESH_SECS`]. A `0` (or absent) folds to the default
-    /// so a misconfiguration can never turn the daemon's tick into a busy loop.
+    /// `refresh_secs` when set to a positive value, else the backend's
+    /// default ([`DEFAULT_LINEAR_REFRESH_SECS`] for Linear,
+    /// [`DEFAULT_ISSUE_REFRESH_SECS`] otherwise). A `0` (or absent) folds to
+    /// the default so a misconfiguration can never turn the daemon's tick into
+    /// a busy loop.
     pub fn refresh_interval_secs(&self) -> u64 {
-        self.refresh_secs
-            .filter(|&s| s > 0)
-            .unwrap_or(DEFAULT_ISSUE_REFRESH_SECS)
+        let default = match self.backend {
+            IssueTrackerBackend::Linear => DEFAULT_LINEAR_REFRESH_SECS,
+            _ => DEFAULT_ISSUE_REFRESH_SECS,
+        };
+        self.refresh_secs.filter(|&s| s > 0).unwrap_or(default)
     }
 
     /// The external-tracker connection blocks present in this config, by
@@ -1126,7 +1138,7 @@ impl IssueTrackerConfig {
     /// (`github:`, `jira:`, `linear:`) may be present, and when the backend is
     /// an external tracker the block present must be that backend's: a stray
     /// block is an error naming it. `file_system` may keep a single staged
-    /// block (what `shelbi issue-store migrate --to github` reads), and that
+    /// block (what `shelbi issue-store migrate --to <that backend>` reads), and that
     /// staged block is not validated.
     ///
     /// Then the **selected** backend's facts: GitHub requires a well-formed
@@ -6948,6 +6960,11 @@ agent_runners:
         assert_eq!(cfg.refresh_interval_secs(), 90);
         cfg.refresh_secs = Some(0);
         assert_eq!(cfg.refresh_interval_secs(), DEFAULT_ISSUE_REFRESH_SECS);
+        // Linear has its own (slower) default; an explicit value still wins.
+        cfg.backend = IssueTrackerBackend::Linear;
+        assert_eq!(cfg.refresh_interval_secs(), DEFAULT_LINEAR_REFRESH_SECS);
+        cfg.refresh_secs = Some(45);
+        assert_eq!(cfg.refresh_interval_secs(), 45);
     }
 
     #[test]

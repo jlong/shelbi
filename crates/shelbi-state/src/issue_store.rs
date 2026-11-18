@@ -1,11 +1,12 @@
 //! The `IssueStore` seam: the backend-agnostic contract every consumer
 //! (CLI, TUI, orchestrator) uses to reach a project's issue board.
 //!
-//! Today the only backend is [`FileSystemStore`] — a thin facade over the
-//! markdown-on-disk board that already lives in this crate. It exists so the
-//! GitHub / Jira / Linear backends the pluggable-issue-trackers plan calls for
-//! can slot in behind the same trait without any consumer learning which
-//! backend is live. Every method speaks the shared domain types ([`Issue`],
+//! Three backends implement it: [`FileSystemStore`] (a thin facade over the
+//! markdown-on-disk board that already lives in this crate),
+//! [`crate::GitHubStore`] (issues in one repository) and [`crate::LinearStore`]
+//! (one team's issues, narrowed by the project's filters); Jira is still a
+//! stub. No consumer learns which backend is live. Every method speaks the
+//! shared domain types ([`Issue`],
 //! status [`Column`] ids, issue ids) so the workflow / category layer stays
 //! backend-agnostic.
 //!
@@ -17,8 +18,8 @@
 //! (`load_task` / `save_task` / `renumber_column`, the per-project task lock,
 //! parked-review markers, welcome-card scaffolding) remain module functions:
 //! they are the *mechanism* the [`FileSystemStore`] happens to use, not part of
-//! the cross-backend contract, and a remote backend will satisfy the same trait
-//! with an entirely different mechanism. `FileSystemStore` therefore delegates
+//! the cross-backend contract, and the remote backends satisfy the same trait
+//! with entirely different mechanisms. `FileSystemStore` therefore delegates
 //! to those functions, which keeps this a behavior-preserving refactor.
 //!
 //! Comments and `poll_changes` are the two capabilities the plan adds that the

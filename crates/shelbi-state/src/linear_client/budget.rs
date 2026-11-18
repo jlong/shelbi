@@ -19,6 +19,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::error::from_epoch;
+use crate::gh_budget::{BudgetTier, TickPlan};
 use super::transport::LinearResponse;
 
 /// Directory (under the shelbi root) holding one budget file per API key.
@@ -134,6 +135,104 @@ impl LinearBudget {
         self.parked_until
             .filter(|&t| t > now.timestamp())
             .and_then(from_epoch)
+    }
+}
+
+/// Below this share (percent) of a bucket's limit the daemon's board refresh
+/// slows to `issue_tracker.budget.slow_refresh_secs`. The GitHub governor's
+/// defaults (2,000 / 500 of 5,000 points) are the same shares.
+pub const LINEAR_SLOW_BELOW_PCT: u64 = 40;
+/// Below this share (percent) of a bucket's limit the board refresh pauses
+/// until that bucket resets.
+pub const LINEAR_PAUSE_BELOW_PCT: u64 = 10;
+
+/// Which of a key's two rate-limit buckets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearBucket {
+    Requests,
+    Complexity,
+}
+
+impl LinearBucket {
+    /// The lowercase name used in status lines and events.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LinearBucket::Requests => "requests",
+            LinearBucket::Complexity => "complexity",
+        }
+    }
+}
+
+impl BucketSnapshot {
+    /// Remaining as a percentage of the limit, when both are known.
+    pub fn percent_left(&self) -> Option<u64> {
+        match (self.remaining, self.limit) {
+            (Some(r), Some(l)) if l > 0 => Some(r.saturating_mul(100) / l),
+            _ => None,
+        }
+    }
+}
+
+impl LinearBudget {
+    /// The bucket closest to running out: the lower share of its limit left,
+    /// else (no limits known) the lower remaining. `None` when neither bucket
+    /// has reported anything.
+    pub fn tightest(&self) -> Option<(LinearBucket, BucketSnapshot)> {
+        let buckets = [
+            (LinearBucket::Requests, self.requests),
+            (LinearBucket::Complexity, self.complexity),
+        ];
+        let known = buckets.into_iter().filter(|(_, b)| b.remaining.is_some());
+        known.min_by_key(|(_, b)| (b.percent_left().unwrap_or(u64::MAX), b.remaining))
+    }
+
+    /// The budget as the GitHub governor's [`BudgetTier`] shape: the tightest
+    /// bucket's remaining and reset, plus the park. What the daemon stamps on
+    /// a stale board index, so the `quota resets HH:MM` banner works the same
+    /// for both trackers.
+    pub fn tier(&self) -> BudgetTier {
+        let tight = self.tightest().map(|(_, b)| b).unwrap_or_default();
+        BudgetTier {
+            remaining: tight.remaining.map(|r| r as i64),
+            reset_at: tight.reset_at,
+            parked_until: self.parked_until,
+            backoff_secs: None,
+        }
+    }
+}
+
+/// The daemon's board-refresh decision from a Linear key's budget: the Linear
+/// twin of [`crate::gh_budget::tick_plan`], banded by share of each bucket's
+/// limit rather than GitHub's point counts.
+///
+/// | state | plan |
+/// | --- | --- |
+/// | parked (a `RATELIMITED` reply) | pause until the park expires |
+/// | unknown (no response read yet) | refresh every `base_secs` |
+/// | tightest bucket above [`LINEAR_SLOW_BELOW_PCT`] | refresh every `base_secs` |
+/// | above [`LINEAR_PAUSE_BELOW_PCT`] | refresh every `slow_secs` |
+/// | below, reset still ahead | pause until that bucket resets |
+/// | below, reset passed or unknown | refresh every `base_secs` (the window rolled) |
+pub fn linear_tick_plan(budget: &LinearBudget, base_secs: u64, slow_secs: u64, now: i64) -> TickPlan {
+    if let Some(until) = budget.parked_until.filter(|&t| t > now) {
+        return TickPlan::Pause { until };
+    }
+    let base = TickPlan::Refresh(std::time::Duration::from_secs(base_secs));
+    let Some((_, bucket)) = budget.tightest() else {
+        return base;
+    };
+    let low = match bucket.percent_left() {
+        Some(pct) if pct >= LINEAR_SLOW_BELOW_PCT => return base,
+        Some(pct) if pct >= LINEAR_PAUSE_BELOW_PCT => {
+            return TickPlan::Refresh(std::time::Duration::from_secs(slow_secs.max(base_secs)))
+        }
+        Some(_) => true,
+        // No limit header: only an empty bucket is known to be low.
+        None => bucket.remaining == Some(0),
+    };
+    match bucket.reset_at {
+        Some(reset) if low && reset > now => TickPlan::Pause { until: reset },
+        _ => base,
     }
 }
 
@@ -355,6 +454,51 @@ mod tests {
         clear_park(key);
         let b = read_budget(key);
         assert_eq!((b.parked_until, b.requests.remaining), (None, Some(1499)));
+    }
+
+    fn budget(req: (u64, u64), cx: (u64, u64), reset: i64) -> LinearBudget {
+        LinearBudget {
+            requests: BucketSnapshot { limit: Some(req.1), remaining: Some(req.0), reset_at: Some(reset) },
+            complexity: BucketSnapshot { limit: Some(cx.1), remaining: Some(cx.0), reset_at: Some(reset + 60) },
+            parked_until: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn tightest_bucket_is_the_lower_share_of_its_limit() {
+        // 1000/1500 requests (66%) vs 50k/250k complexity (20%): complexity binds.
+        let b = budget((1000, 1500), (50_000, 250_000), 1_800_000_600);
+        let (which, bucket) = b.tightest().unwrap();
+        assert_eq!((which, bucket.remaining), (LinearBucket::Complexity, Some(50_000)));
+        let tier = b.tier();
+        assert_eq!((tier.remaining, tier.reset_at), (Some(50_000), Some(1_800_000_660)));
+        assert_eq!(LinearBudget::default().tightest(), None);
+    }
+
+    #[test]
+    fn tick_plan_bands_by_share_and_parks() {
+        let now = 1_800_000_000;
+        let reset = now + 600;
+        let secs = |p: TickPlan| match p {
+            TickPlan::Refresh(d) => Some(d.as_secs()),
+            TickPlan::Pause { .. } => None,
+        };
+        // Unknown budget and a healthy one run at the base cadence.
+        assert_eq!(secs(linear_tick_plan(&LinearBudget::default(), 60, 120, now)), Some(60));
+        assert_eq!(secs(linear_tick_plan(&budget((1400, 1500), (240_000, 250_000), reset), 60, 120, now)), Some(60));
+        // The middle band slows.
+        assert_eq!(secs(linear_tick_plan(&budget((450, 1500), (240_000, 250_000), reset), 60, 120, now)), Some(120));
+        // The low band pauses until the binding bucket resets.
+        let low = budget((1400, 1500), (10_000, 250_000), reset);
+        assert_eq!(linear_tick_plan(&low, 60, 120, now), TickPlan::Pause { until: reset + 60 });
+        // ...but a passed reset means the window rolled: refresh.
+        assert_eq!(secs(linear_tick_plan(&low, 60, 120, reset + 61)), Some(60));
+        // A park wins over everything, until it expires.
+        let mut parked = budget((1400, 1500), (240_000, 250_000), reset);
+        parked.parked_until = Some(now + 30);
+        assert_eq!(linear_tick_plan(&parked, 60, 120, now), TickPlan::Pause { until: now + 30 });
+        assert_eq!(secs(linear_tick_plan(&parked, 60, 120, now + 31)), Some(60));
     }
 
     #[test]

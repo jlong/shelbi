@@ -161,13 +161,13 @@ pub enum Error {
     InvalidIssueTracker(String),
 
     /// A project's `issue_tracker` block selects a valid remote backend whose
-    /// live store is not built yet (`jira` today, `linear` until its store
-    /// lands). Distinct from [`Error::InvalidIssueTracker`] (a config error the
+    /// live store is not built yet (`jira`). Distinct from
+    /// [`Error::InvalidIssueTracker`] (a config error the
     /// user must fix) so a caller can tell "not built yet" apart from "you
     /// configured it wrong". The payload is the backend's wire token.
     #[error(
         "the `{0}` issue-tracker store is not built yet in this version of shelbi; \
-         use `file_system` or `github` for now"
+         use `file_system`, `github` or `linear` for now"
     )]
     IssueTrackerUnimplemented(String),
 

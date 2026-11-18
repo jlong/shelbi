@@ -194,9 +194,10 @@ pub fn apply_tracker_connection_with(
 
     if switches_board(&current, &new) && !req.force {
         let to = new.backend;
+        let args = crate::project_create::issues::migrate_target_args(&new);
         let migrate = format!(
-            "Move them first:\n  shelbi issue-store migrate --to {to} --dry-run   # preview\n  \
-             shelbi issue-store migrate --to {to}             # then migrate\n\
+            "Move them first:\n  shelbi issue-store migrate --to {args}           # preview\n  \
+             shelbi issue-store migrate --to {args} --apply   # then migrate\n\
              or switch anyway with --force (the issues stay on {}, unseen by this project).",
             board_name(&current)
         );

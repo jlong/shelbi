@@ -105,7 +105,8 @@ valid values. On success the resolved ids are cached in
 Switching boards (from GitHub, from a local board, or to another Linear team)
 is refused while the current board has issues, because they would stay behind,
 unseen by the project. Move them with `shelbi issue-store migrate --to <backend>`
-first, or pass `--force` to switch anyway. A filter change on the same team is
+first (it previews; add `--apply` to move them), or pass `--force` to switch
+anyway. A filter change on the same team is
 not a switch.
 
 `shelbi tracker disconnect` puts the project back on the local file-system
@@ -136,6 +137,38 @@ duration, never the key) to `~/.shelbi/linear-requests.log`. When Linear
 reports the limit reached, Shelbi pauses requests with that key until the reset
 time Linear gives (one minute when it gives none), and `status` shows the pause.
 Timeouts and server errors are retried with backoff.
+
+## The board on the hub daemon
+
+A Linear project's board is refreshed by the hub daemon like a GitHub one: it
+reads the team's issues on the project's `issue_tracker.refresh_secs` cadence
+(**60s** by default for Linear) and publishes them to `board-index.json`, so
+every client and agent reads the board without spending budget.
+
+- **The budget governs the cadence.** Each tick looks at the key's two buckets
+  (requests and complexity) and goes by the tighter one: above 40% of its limit
+  the refresh runs at the configured cadence, between 10% and 40% it slows to
+  `issue_tracker.budget.slow_refresh_secs` (120s by default), and below 10% it
+  pauses until that bucket resets. A `RATELIMITED` reply pauses it until the
+  reset Linear names. While paused, the board keeps showing the last good read,
+  marked stale with the reset time. The GraphQL point thresholds in
+  `issue_tracker.budget` are GitHub's and don't apply.
+- **Moves made in Linear** show up as normal transition lines in `events.log`
+  (`task=<id> ... todo -> in-progress ... owner=me`), just like a status a
+  person changes on github.com.
+- **`board refreshed` lines** carry `linear_remaining=<n>`, the tighter
+  bucket's remaining count.
+- [`shelbi status --full`](/docs/cli/status) prints a `## Linear` section (the
+  account, the filters, the board index age and last refresh, both buckets with
+  their reset times, and the request rate), and
+  [`shelbi doctor`](/docs/cli/doctor) projects the request rate against the
+  requests bucket.
+- **Board search** uses Linear's full-text search, scoped by the project's team
+  and filters, so it finds open and closed issues the board hasn't loaded.
+
+To move an existing board onto Linear (from the local board or from GitHub),
+use [`shelbi issue-store migrate --to linear`](/docs/cli/issue#issue-store-migrate),
+then `shelbi tracker linear connect` to point the project at it.
 
 ## Statuses from Linear
 

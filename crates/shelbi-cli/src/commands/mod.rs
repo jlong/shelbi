@@ -17,6 +17,7 @@ pub mod issue;
 mod issue_editor;
 pub mod issue_store;
 pub mod job;
+mod linear_health;
 pub mod machine;
 pub mod message;
 pub mod msrv_check;

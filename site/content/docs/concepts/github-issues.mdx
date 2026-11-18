@@ -68,18 +68,16 @@ is free, so none of the caching or budget machinery on this page applies to it.
 
 ### Backends that are declared but not implemented
 
-The `issue_tracker.backend` enum also accepts `jira` and `linear`. These parse
-and validate (a `jira:` or `linear:` block requires its selector), but they have
-no live store yet: selecting one resolves to a typed error, reported exactly as:
+The `issue_tracker.backend` enum also accepts `jira`. It parses and validates (a
+`jira:` block requires its `project`), but it has no live store yet: selecting it
+resolves to a typed error, reported exactly as:
 
 ```text
-the `jira` issue-tracker store is not built yet in this version of shelbi; use `file_system` or `github` for now
+the `jira` issue-tracker store is not built yet in this version of shelbi; use `file_system`, `github` or `linear` for now
 ```
 
-Only `file_system` and `github` resolve to a working board today. The Linear
-API client and `shelbi tracker linear` already exist (see
-[`shelbi tracker`](/docs/cli/tracker)); the Linear store built on them is in
-progress.
+`file_system`, `github` and `linear` resolve to a working board. Linear is set up
+with [`shelbi tracker linear`](/docs/cli/tracker).
 
 ## How issues map to cards
 
@@ -275,7 +273,7 @@ map, and a freshness envelope (when it was fetched, the last-seen rate-limit
 remaining and reset, the active read path, and the authenticated login).
 
 The refresh cadence is the `issue_tracker.refresh_secs` value, defaulting to
-**30s**. Readers treat the index as stale after roughly three refresh intervals
+**30s** (60s on a [Linear](/docs/cli/tracker#the-board-on-the-hub-daemon) board). Readers treat the index as stale after roughly three refresh intervals
 (with a 90s floor). A full cold read is forced at least every 10 minutes;
 between cold reads the loop fetches only incremental deltas.
 
@@ -394,18 +392,20 @@ Move an existing board from one backend to the other with
 
 ```bash
 # Push a local markdown board up to GitHub issues.
-shelbi issue-store migrate --to github --dry-run   # preview first
-shelbi issue-store migrate --to github
+shelbi issue-store migrate --to github           # preview first
+shelbi issue-store migrate --to github --apply
 
 # Or pull GitHub issues down into a local markdown board.
-shelbi issue-store migrate --to file_system
+shelbi issue-store migrate --to file_system --apply
 ```
 
-The migration matches on the stable Shelbi id, so a re-run never duplicates an
-already-migrated card. A `--to github` run paces its creates (default 7.5s
-between issues) to stay under GitHub's secondary content-creation limit; switch
-the project's `issue_tracker.backend` once the migration completes. Comments are
-not migrated, and workspace assignments are dropped.
+The command previews unless `--apply` is given. The migration matches on the
+stable Shelbi id, so a re-run never duplicates an already-migrated card. A
+`--to github` run paces its writes (default 7.5s apart) to stay under GitHub's
+secondary content-creation limit; switch the project's `issue_tracker.backend`
+once the migration completes. Comments are copied with each new card, and
+workspace assignments are dropped. The same command moves a board onto Linear
+(`--to linear`); see [`shelbi issue-store migrate`](/docs/cli/issue#issue-store-migrate).
 
 ## See also
 

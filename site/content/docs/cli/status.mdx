@@ -16,7 +16,11 @@ sections, `## Board`, `## Workspaces`, `## Zen`, `## Handoff`, and
 `## Daemon`, plus a `## Disk` section when the hub machine's `work_dir` volume
 is low on free space and a `## GitHub` section when the project's board is on
 the [GitHub backend](/docs/concepts/github-issues#the-budget-and-what-shelbi-status-shows)
-(read path, board-index age, and per-budget rate-limit numbers). Both the plain
+(read path, board-index age, and per-budget rate-limit numbers), or a
+`## Linear` section in its place when the board is on
+[Linear](/docs/cli/tracker#the-board-on-the-hub-daemon) (account, filters,
+board-index age and last refresh, the API key's requests and complexity budgets
+with their reset times, and the request rate). Both the plain
 summary and `--full` are idempotent and safe to re-run.
 
 `--handoff` prints the contents of `HANDOFF.md` from the project's local

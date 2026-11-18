@@ -112,6 +112,18 @@ pub struct LinearComment {
     pub user: Option<LinearUser>,
 }
 
+/// One page of [`LinearClient::search_issues`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchPage {
+    /// How many issues match in all.
+    #[serde(default)]
+    pub total_count: u64,
+    pub nodes: Vec<LinearIssue>,
+    #[serde(default)]
+    pub page_info: PageInfo,
+}
+
 /// How an `Issues` read is ordered (Linear's `PaginationOrderBy`; newest
 /// first either way).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +260,41 @@ impl LinearClient {
                 has_next_page: false,
                 end_cursor: None,
             };
+        }
+        Ok(page)
+    }
+
+    /// One page of Linear's full-text issue search (`searchIssues`): issues
+    /// whose title, description (or identifier) match `term`, narrowed by
+    /// `filter`, in Linear's relevance order, with the total match count.
+    pub fn search_issues(
+        &self,
+        term: &str,
+        filter: Value,
+        first: u32,
+        after: Option<&str>,
+    ) -> LinearResult<SearchPage> {
+        let query = format!(
+            "query SearchIssues($term: String!, $filter: IssueFilter, $first: Int, $after: \
+             String) {{ searchIssues(term: $term, filter: $filter, first: $first, after: $after) \
+             {{ totalCount nodes {{ {ISSUE_FIELDS} }} pageInfo {{ hasNextPage endCursor }} }} }}"
+        );
+        let vars = json!({
+            "term": term,
+            "filter": filter,
+            "first": first.clamp(1, 250),
+            "after": after,
+        });
+        let req = LinearRequest::new("SearchIssues", query, vars);
+        let mut data = self.query_value(&req)?;
+        let node = data.get_mut("searchIssues").map(Value::take).ok_or_else(|| LinearError::Decode {
+            detail: "SearchIssues: no `searchIssues` in the response".into(),
+        })?;
+        let mut page: SearchPage = serde_json::from_value(node).map_err(|e| LinearError::Decode {
+            detail: format!("SearchIssues: {e}"),
+        })?;
+        if !page.page_info.has_next_page {
+            page.page_info.end_cursor = None;
         }
         Ok(page)
     }

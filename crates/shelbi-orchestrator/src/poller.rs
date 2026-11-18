@@ -13441,6 +13441,65 @@ transitions:
     }
 
     #[test]
+    fn a_state_change_made_in_linear_reconciles_into_a_transition_with_owner() {
+        use shelbi_state::linear_client::{fixture, FakeLinear};
+        let _home = crate::test_lock::isolated_home();
+        shelbi_state::linear_store::clear_linear_caches_for_test();
+        let home = shelbi_state::shelbi_home().unwrap();
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.name = "lin".into();
+        let conn = shelbi_core::LinearConnection::for_team("ENG");
+        project.issue_tracker = shelbi_core::IssueTrackerConfig {
+            backend: IssueTrackerBackend::Linear,
+            linear: Some(conn.clone()),
+            ..Default::default()
+        };
+        shelbi_state::save_project(&project).unwrap();
+        std::fs::create_dir_all(shelbi_state::project_dir("lin").unwrap()).unwrap();
+
+        // The board as the daemon last published it: ENG-1 (ada's, Todo) with
+        // the key owner's login, which is where `owner=` comes from.
+        let fake = FakeLinear::new();
+        let _guard = fake.install();
+        // The daemon's read: the raw (uncached) store.
+        let store = shelbi_state::raw_issue_store_for("lin").unwrap();
+        let read = store.refresh_board(None, &[]).unwrap();
+        let mut idx = shelbi_state::BoardIndex::fresh(read.board);
+        idx.repo = Some(shelbi_state::board_index::linear_board_repo(&conn));
+        idx.viewer_login = read.viewer_login;
+        shelbi_state::write_board_index("lin", &idx).unwrap();
+
+        // First sweep: the baseline (ENG-1 in todo), nothing emitted.
+        let mut schedule = IssueReconcileSchedule::default();
+        maybe_reconcile_issues(&project, &mut schedule, || true);
+        assert!(schedule.seeded);
+
+        // Someone moves ENG-1 to In Progress in Linear.
+        let mut moved: serde_json::Value = serde_json::from_str(fixture("Issues").unwrap()).unwrap();
+        let eng1 = &mut moved["data"]["issues"]["nodes"][0];
+        eng1["state"] = serde_json::json!({ "id": "state-progress", "name": "In Progress", "type": "started" });
+        eng1["updatedAt"] = serde_json::json!("2026-11-05T10:00:00.000Z");
+        fake.on("Issues", moved.to_string());
+        fake.on("IssueComments", r#"{"data":{"issue":{"comments":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}"#);
+        schedule.next_attempt = None;
+        maybe_reconcile_issues(&project, &mut schedule, || true);
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        let line = log
+            .lines()
+            .find(|l| l.contains("task=eng-1"))
+            .unwrap_or_else(|| panic!("no transition for eng-1 in:\n{log}"));
+        assert!(line.contains("todo -> in_progress"), "{line}");
+        assert!(line.contains("project=lin"), "{line}");
+        assert!(line.ends_with(" owner=me"), "ada's own issue: {line}");
+        // The poll asked Linear only for issues updated past the watermark.
+        let poll = fake.calls_for("Issues").pop().unwrap();
+        assert_eq!(poll.var("filter")["updatedAt"]["gt"], "2026-11-04T10:00:00+00:00");
+    }
+
+    #[test]
     fn plan_issue_reconcile_maps_external_moves_reopens_and_relabels() {
         // Baseline: `a` in-progress, `b` in todo. Both then move on the tracker
         // itself — `a` is closed (→ done), `b` is relabeled to review.

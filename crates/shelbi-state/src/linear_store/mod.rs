@@ -63,7 +63,7 @@
 mod mapping;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -536,6 +536,95 @@ impl LinearStore {
     }
 }
 
+impl LinearStore {
+    /// The statuses this team's board offers, in Linear's order (by state
+    /// position): each workflow state's Shelbi status id and its category (the
+    /// synced catalog's when there is one, else the default for the state's
+    /// type). What `issue-store migrate --to linear` maps a source status onto
+    /// when the team has no state of the same name. A status two states share
+    /// is listed once.
+    pub fn status_columns(&self) -> Result<Vec<(Column, shelbi_core::StatusCategory)>> {
+        let ctx = self.ctx()?;
+        let mut states = self.states(&ctx, true)?;
+        states.sort_by(|a, b| a.position.total_cmp(&b.position));
+        let mut out: Vec<(Column, shelbi_core::StatusCategory)> = Vec::new();
+        for state in &states {
+            let col = column_for_state(state, ctx.catalog.as_ref());
+            if out.iter().any(|(c, _)| *c == col) {
+                continue;
+            }
+            let category = ctx
+                .catalog
+                .as_ref()
+                .and_then(|c| c.get(col.as_str()))
+                .map(|st| st.category)
+                .unwrap_or_else(|| crate::linear_statuses::default_category(state.kind, &state.name));
+            out.push((col, category));
+        }
+        Ok(out)
+    }
+
+    /// One page (1-based) of the board's issue search: Linear's full-text
+    /// `searchIssues` for `query`, narrowed by the project's filters (team,
+    /// and project / label / assignee when set), open and closed alike, in
+    /// Linear's relevance order, mapped exactly as a board read maps them with
+    /// the local assignment overlay folded in.
+    ///
+    /// Linear pages by cursor, so the cursor ending each page is remembered
+    /// per query; a page whose cursor isn't known yet (a cold process asked
+    /// for page 3) walks forward from the last one known.
+    pub fn search_issues(
+        &self,
+        query: &str,
+        page: u32,
+    ) -> std::result::Result<crate::IssueSearchPage, crate::IssueSearchError> {
+        use crate::IssueSearchError as E;
+        let failed = |e: Error| E::Failed(e.to_string());
+        let term = query.trim();
+        let ctx = self.ctx().map_err(failed)?;
+        let filter = Value::Object(visible_filter(&ctx.filters));
+        let page = page.max(1) as usize;
+        let key = (self.identity(), term.to_string());
+        let mut known: Vec<Option<String>> =
+            lock(search_cursor_cache()).get(&key).cloned().unwrap_or_default();
+        // `known[k]` is the cursor after page k+1; page p starts after known[p-2].
+        let mut current = known.len().min(page - 1);
+        loop {
+            let after = current.checked_sub(1).and_then(|i| known[i].clone());
+            if current > 0 && after.is_none() {
+                // The search ran out before the page asked for.
+                return Ok(crate::IssueSearchPage { issues: Vec::new(), total_count: 0, incomplete: false });
+            }
+            let result = ctx
+                .client
+                .search_issues(term, filter.clone(), crate::ISSUE_SEARCH_PAGE_SIZE, after.as_deref())
+                .map_err(|e| match e {
+                    LinearError::RateLimited { .. } => E::RateLimited,
+                    LinearError::Transport(_) => E::Unreachable,
+                    other => E::Failed(other.to_string()),
+                })?;
+            known.truncate(current);
+            known.push(result.page_info.end_cursor.clone());
+            current += 1;
+            if current == page {
+                remember_search_cursors(key, known);
+                let assignments = crate::task_assignments(&self.project).map_err(failed)?;
+                let issues = result
+                    .nodes
+                    .into_iter()
+                    .filter(|i| i.archived_at.is_none())
+                    .map(|i| fold(self.row(&ctx, i, 0).tf, &assignments))
+                    .collect();
+                return Ok(crate::IssueSearchPage {
+                    issues,
+                    total_count: result.total_count,
+                    incomplete: false,
+                });
+            }
+        }
+    }
+}
+
 impl IssueStore for LinearStore {
     fn list(&self) -> Result<Vec<IssueFile>> {
         let ctx = self.ctx()?;
@@ -580,9 +669,12 @@ impl IssueStore for LinearStore {
     ) -> Result<BoardRead> {
         let ctx = self.ctx()?;
         let viewer_login = self.viewer(&ctx).ok().map(|v| user_token(&v));
+        // The tighter of the key's two buckets (requests, complexity): the
+        // one that would stop the board first, and whose reset the stale
+        // banner should name.
         let budget = |client: &LinearClient| {
-            let b = client.budget();
-            (b.requests.remaining, b.requests.reset_at)
+            let tight = client.budget().tightest().map(|(_, b)| b).unwrap_or_default();
+            (tight.remaining, tight.reset_at)
         };
         let assignments = crate::task_assignments(&self.project)?;
         let cold = |ctx: &Ctx| -> Result<BoardRead> {
@@ -1294,6 +1386,24 @@ fn sort_cache() -> &'static IdCache<f64> {
     C.get_or_init(Default::default)
 }
 
+/// Search cursors per (board identity, query): the cursor after each page.
+type SearchCursors = Mutex<HashMap<(String, String), Vec<Option<String>>>>;
+
+fn search_cursor_cache() -> &'static SearchCursors {
+    static C: OnceLock<SearchCursors> = OnceLock::new();
+    C.get_or_init(Default::default)
+}
+
+/// Keep a query's cursors, bounding the cache (a long-lived TUI types many
+/// queries; an evicted one just walks again).
+fn remember_search_cursors(key: (String, String), cursors: Vec<Option<String>>) {
+    let mut cache = lock(search_cursor_cache());
+    if cache.len() >= 64 && !cache.contains_key(&key) {
+        cache.clear();
+    }
+    cache.insert(key, cursors);
+}
+
 /// Empty the process caches (a test builds a fresh store per scenario, and
 /// the caches outlive it).
 #[cfg(any(test, feature = "test-support"))]
@@ -1302,4 +1412,5 @@ pub fn clear_linear_caches_for_test() {
     lock(viewer_cache()).clear();
     lock(number_cache()).clear();
     lock(sort_cache()).clear();
+    lock(search_cursor_cache()).clear();
 }

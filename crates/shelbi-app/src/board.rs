@@ -647,8 +647,8 @@ pub struct BoardProject {
     /// fallback [`read_open_board`] uses when the gate can't be read.
     #[serde(default = "crate::wire::fail_closed")]
     pub ownership: OwnershipGate,
-    /// The tracker can search its issues remotely (a GitHub board), so the
-    /// board's text search asks it ([`crate::board_search`]).
+    /// The tracker can search its issues remotely (a GitHub or Linear board),
+    /// so the board's text search asks it ([`crate::board_search`]).
     #[serde(default)]
     pub remote_search: bool,
 }
@@ -708,8 +708,8 @@ pub struct BoardRead {
 /// Read the open board for `project`: the project YAML, its state, workflows,
 /// `statuses.yaml`, and the open issues from the daemon-owned board index
 /// (`read_board_report`, which serves this process's snapshot cache when no
-/// index or daemon exists). Never a live backend sweep, so it costs no GitHub
-/// budget; on a cold project it returns [`BoardOutcome::Cold`] without
+/// index or daemon exists). Never a live backend sweep, so it costs no
+/// tracker API budget; on a cold project it returns [`BoardOutcome::Cold`] without
 /// blocking.
 pub fn read_open_board(project: &str) -> BoardRead {
     let project_cfg = shelbi_state::load_project(project)
@@ -722,7 +722,7 @@ pub fn read_open_board(project: &str) -> BoardRead {
                 .unwrap_or(OwnershipGate::FailClosed),
             remote_search: matches!(
                 p.issue_tracker.backend,
-                shelbi_core::IssueTrackerBackend::Github
+                shelbi_core::IssueTrackerBackend::Github | shelbi_core::IssueTrackerBackend::Linear
             ),
             workspaces: p.workspaces.into_iter().map(|w| w.name).collect(),
         });

@@ -33,17 +33,19 @@ enum Fault {
 }
 
 #[derive(Default)]
-struct World {
-    issues: Vec<Value>,
-    comments: BTreeMap<String, Vec<Value>>,
+pub(crate) struct World {
+    pub(crate) issues: Vec<Value>,
+    pub(crate) comments: BTreeMap<String, Vec<Value>>,
     calls: Vec<LinearRequest>,
     faults: BTreeMap<String, VecDeque<Fault>>,
     next_number: i64,
     clock: i64,
 }
 
+/// The stateful Linear simulator, shared with other modules' tests (a
+/// migration onto Linear from another backend).
 #[derive(Clone)]
-struct Sim(Arc<Mutex<World>>);
+pub(crate) struct Sim(Arc<Mutex<World>>);
 
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 11, 10, 0, 0, 0).unwrap()
@@ -72,7 +74,7 @@ fn user(id: &str) -> Value {
 }
 
 impl Sim {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let world = World {
             next_number: 1,
             ..Default::default()
@@ -80,11 +82,11 @@ impl Sim {
         Sim(Arc::new(Mutex::new(world)))
     }
 
-    fn w(&self) -> std::sync::MutexGuard<'_, World> {
+    pub(crate) fn w(&self) -> std::sync::MutexGuard<'_, World> {
         self.0.lock().unwrap()
     }
 
-    fn client(&self) -> LinearClient {
+    pub(crate) fn client(&self) -> LinearClient {
         let sim = self.clone();
         let runner: LinearRunner = Arc::new(move |req, _| sim.answer(req));
         LinearClient::with_runner(
@@ -179,6 +181,7 @@ impl Sim {
         let v = &req.variables;
         let data = match req.operation.as_str() {
             "Issues" => self.issues(v),
+            "SearchIssues" => self.search(v),
             "IssueCreate" => self.create(v),
             "IssueUpdate" => {
                 let issue = self.update(v["id"].as_str().unwrap(), &v["input"]);
@@ -213,6 +216,31 @@ impl Sim {
         let page: Vec<Value> = hits.iter().skip(start).take(first).map(|i| (*i).clone()).collect();
         let end = start + page.len();
         json!({ "issues": { "nodes": page, "pageInfo": {
+            "hasNextPage": end < hits.len(), "endCursor": end.to_string() } } })
+    }
+
+    /// `searchIssues`: a case-insensitive substring match on title or
+    /// description within the filter, newest first, with `totalCount`.
+    fn search(&self, v: &Value) -> Value {
+        let term = v["term"].as_str().unwrap().to_lowercase();
+        let w = self.w();
+        let mut hits: Vec<&Value> = w
+            .issues
+            .iter()
+            .filter(|i| i["archivedAt"].is_null())
+            .filter(|i| v["filter"].is_null() || eval(i, &v["filter"]))
+            .filter(|i| {
+                ["title", "description"]
+                    .iter()
+                    .any(|f| i[*f].as_str().unwrap_or("").to_lowercase().contains(&term))
+            })
+            .collect();
+        hits.sort_by(|a, b| b["number"].as_i64().cmp(&a["number"].as_i64()));
+        let start: usize = v["after"].as_str().map(|c| c.parse().unwrap()).unwrap_or(0);
+        let first = v["first"].as_u64().unwrap_or(50) as usize;
+        let page: Vec<Value> = hits.iter().skip(start).take(first).map(|i| (*i).clone()).collect();
+        let end = start + page.len();
+        json!({ "searchIssues": { "totalCount": hits.len(), "nodes": page, "pageInfo": {
             "hasNextPage": end < hits.len(), "endCursor": end.to_string() } } })
     }
 
@@ -424,6 +452,61 @@ fn the_board_is_exactly_the_issues_matching_the_filters() {
     // Outside the filters is absent, even by id.
     assert!(store.get("eng-2").unwrap().is_none());
     assert!(store.get("eng-1").unwrap().is_some());
+}
+
+#[test]
+fn search_is_linears_full_text_search_scoped_by_the_filters_and_pages_by_cursor() {
+    let env = env();
+    clear_linear_caches_for_test();
+    let sim = &env.sim;
+    let shelbi = json!({ "project": { "id": "proj-shelbi" } });
+    for n in 0..33 {
+        sim.seed(&format!("Login bug {n}"), "state-todo", n as f64, shelbi.clone());
+    }
+    sim.seed("Login, shipped", "state-done", 99.0, shelbi.clone());
+    sim.seed("Login on mobile", "state-todo", 1.0, json!({ "project": { "id": "proj-mobile" } }));
+    sim.seed("Login elsewhere", "state-todo", 1.0, json!({ "team": { "id": "team-des" } }));
+    sim.seed("Unrelated", "state-todo", 1.0, shelbi);
+    let store = env.store(LinearConnection {
+        project: Some("Shelbi".into()),
+        ..LinearConnection::for_team("ENG")
+    });
+
+    let first = store.search_issues("  login ", 1).unwrap();
+    assert_eq!(first.total_count, 34, "33 open + 1 done, inside the team and project filters");
+    assert_eq!(first.issues.len(), crate::ISSUE_SEARCH_PAGE_SIZE as usize);
+    assert_eq!(first.issues[0].task.title, "Login, shipped");
+    assert_eq!(first.issues[0].task.column, Column::done(), "closed issues are found too");
+    let call = sim.calls("SearchIssues").remove(0);
+    assert_eq!(call.var("term"), "login");
+    assert_eq!(call.var("filter")["team"]["id"]["eq"], "team-eng");
+    assert_eq!(call.var("filter")["project"]["id"]["eq"], "proj-shelbi");
+    assert!(call.var("after").is_null());
+
+    // Page 2 resumes from page 1's cursor: one more request, no re-read.
+    let second = store.search_issues("login", 2).unwrap();
+    assert_eq!(second.issues.len(), 4);
+    let calls = sim.calls("SearchIssues");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].var("after"), "30");
+
+    // A cold process asked for page 2 walks from page 1.
+    clear_linear_caches_for_test();
+    assert_eq!(store.search_issues("login", 2).unwrap().issues.len(), 4);
+    assert_eq!(sim.calls("SearchIssues").len(), 4);
+    // Past the end: nothing, without a request.
+    assert!(store.search_issues("login", 3).unwrap().issues.is_empty());
+    assert_eq!(sim.calls("SearchIssues").len(), 4);
+
+    // A rate limit is a typed search failure, so the board falls back.
+    sim.fault(
+        "SearchIssues",
+        Fault::Reply(
+            LinearResponse::ok(r#"{"errors":[{"message":"slow down","extensions":{"code":"RATELIMITED"}}]}"#)
+                .with_status(400),
+        ),
+    );
+    assert_eq!(store.search_issues("other", 1).unwrap_err(), crate::IssueSearchError::RateLimited);
 }
 
 #[test]
@@ -1015,4 +1098,61 @@ fn a_cached_store_from_config_reaches_the_installed_fake() {
     let board = store.list().unwrap();
     assert_eq!(ids(&board), ["eng-1", "linear-store"]);
     assert_eq!(board[1].task.depends_on, ["eng-1"]);
+}
+
+// --- migration onto Linear --------------------------------------------------------
+
+#[test]
+fn a_file_system_board_migrates_onto_linear_and_a_rerun_is_a_no_op() {
+    use crate::{apply_issue_migration, plan_issue_migration_mapped, FileSystemStore, MigrationControls};
+    let env = env();
+    clear_linear_caches_for_test();
+    let from = FileSystemStore::new("src");
+    let mut a = spec("set-up", Column::todo());
+    a.workflow = Some("default".into());
+    a.branch = Some("jlong/set-up".into());
+    a.params.insert("area".into(), "board".into());
+    from.add(a).unwrap();
+    let mut b = spec("ship-it", Column::review());
+    b.depends_on = vec!["set-up".into()];
+    from.add(b).unwrap();
+    from.add(spec("explore", Column::backlog())).unwrap();
+    from.add_comment("ship-it", "Ready for a look.").unwrap();
+    let to = env.eng();
+
+    // Dry run first: the plan, mapped onto the team's states, writes nothing.
+    let targets = to.status_columns().unwrap();
+    let plan = plan_issue_migration_mapped(&from, &to, Some(&targets), &|c: &Column| c.category()).unwrap();
+    assert_eq!(plan.to_migrate.len(), 3);
+    assert_eq!(env.sim.calls("IssueCreate").len(), 0, "planning never writes");
+    // ENG has `In Review` (a started state named like review) for `review`.
+    let remap = plan.remapped.iter().find(|r| r.id == "ship-it").expect("review remapped");
+    assert_eq!(remap.to.as_str(), "in-review");
+
+    let mut noop = |_: usize, _: usize, _: &Issue| {};
+    let mut controls = MigrationControls::silent(&mut noop);
+    controls.comments_from = Some(&from);
+    apply_issue_migration(&to, &plan, &mut controls).unwrap();
+    assert_eq!(controls.comments_copied, 1);
+
+    // Titles, bodies, statuses, Shelbi fields and the comment, read back from Linear.
+    let board = to.list().unwrap();
+    let get = |id: &str| board.iter().find(|tf| tf.task.id == id).unwrap_or_else(|| panic!("{id} on {board:?}"));
+    let set_up = get("set-up");
+    assert_eq!(set_up.task.title, "Title set-up");
+    assert_eq!(set_up.body, from.get("set-up").unwrap().unwrap().body, "the body verbatim");
+    assert_eq!(set_up.task.column, Column::todo());
+    assert_eq!(set_up.task.branch.as_deref(), Some("jlong/set-up"));
+    assert_eq!(set_up.task.params.get("area").and_then(|v| v.as_str()), Some("board"));
+    assert_eq!(get("ship-it").task.column.as_str(), "in-review");
+    assert_eq!(get("ship-it").task.depends_on, ["set-up"]);
+    assert_eq!(get("explore").task.column, Column::backlog());
+    let comments = to.list_comments("ship-it").unwrap();
+    assert_eq!(comments.len(), 1);
+    assert!(comments[0].body.ends_with("Ready for a look."), "{:?}", comments[0].body);
+
+    // A re-run matches every card by its Shelbi id: nothing to create.
+    let replan = plan_issue_migration_mapped(&from, &to, Some(&targets), &|c: &Column| c.category()).unwrap();
+    assert!(replan.is_empty());
+    assert_eq!(replan.already_present.len(), 3);
 }

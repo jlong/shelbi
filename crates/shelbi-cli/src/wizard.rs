@@ -539,7 +539,10 @@ impl Ask for Defaults<'_> {
             Ok(()) => issue_tracker_setup::github_config(repo),
             Err(failure) => {
                 println!("  GitHub Issues for {repo} isn't usable: {}", failure.guidance());
-                println!("  → Using File system. Run `shelbi issue-store migrate --to github` later.");
+                println!(
+                    "  → Using File system. Later, `shelbi issue-store migrate --to github \
+                     --github-repo {repo}` previews the move (add --apply to make it)."
+                );
                 Ok(issue_tracker_setup::file_system_config())
             }
         }

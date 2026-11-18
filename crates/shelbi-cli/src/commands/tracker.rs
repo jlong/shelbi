@@ -40,7 +40,8 @@ pub enum TrackerCmd {
     /// Disconnect the project's external tracker (GitHub or Linear): the
     /// project goes back to the local file-system board. Refused while the
     /// tracker's board has issues, unless --force (they stay in the
-    /// tracker; `shelbi issue-store migrate --to file_system` moves them).
+    /// tracker; `shelbi issue-store migrate --to file_system --apply` moves
+    /// them).
     Disconnect {
         /// Disconnect even though the tracker's board has issues.
         #[arg(long)]
@@ -976,7 +977,8 @@ project: Shelbi\n    label: bug\n    assignee: me\n";
 
         let err = run(Some("local"), LinearCmd::Connect(connect_args("ENG")), "").unwrap_err().to_string();
         assert!(err.contains("has 1 issue on the local file system"), "{err}");
-        assert!(err.contains("shelbi issue-store migrate --to linear --dry-run"), "{err}");
+        assert!(err.contains("shelbi issue-store migrate --to linear --linear-team ENG "), "{err}");
+        assert!(err.contains("--linear-team ENG --apply"), "{err}");
         assert!(fake.calls().is_empty(), "refused before asking Linear anything");
 
         let out = run(Some("local"), LinearCmd::Connect(ConnectArgs { force: true, ..connect_args("ENG") }), "").unwrap();
