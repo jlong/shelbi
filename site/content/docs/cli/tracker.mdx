@@ -66,8 +66,8 @@ Shelbi looks for the key in this order and uses the first it finds:
    `linear: { token: ... }`. The file must be `chmod 600`.
 
 The key is never written to the project config, never passed on a command line,
-and never logged. Requests go to Linear through `curl`, which reads the key and
-the request body from stdin.
+and never logged. Shelbi calls Linear's API directly over HTTPS, and the key is
+sent only in the request's `Authorization` header.
 
 ## Subcommands
 

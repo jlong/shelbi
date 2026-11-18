@@ -8,16 +8,16 @@ use super::transport::LinearResponse;
 /// The result of a Linear client call.
 pub type LinearResult<T> = std::result::Result<T, LinearError>;
 
-/// A transport-level failure: `curl` could not complete the exchange, so no
-/// HTTP response was read. Returned by a [`super::LinearRunner`].
+/// A transport-level failure: the HTTP exchange could not complete, so no
+/// response was read. Returned by a [`super::LinearRunner`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportFailure {
-    /// The request timed out (`curl` exit 28). It may have reached Linear.
+    /// The request timed out (connect, send, or read). It may have reached Linear.
     Timeout(String),
     /// The connection could not be made (DNS, refused, TLS handshake): the
     /// request never reached Linear, so even a mutation is safe to retry.
     Connect(String),
-    /// Anything else (curl missing, a broken pipe, an unreadable reply).
+    /// Anything else (a reset connection, an unreadable or oversized reply).
     Other(String),
 }
 
@@ -86,7 +86,7 @@ pub enum LinearError {
     #[error("Linear server error (HTTP {status}): {detail}")]
     Server { status: u16, detail: String },
 
-    /// `curl` could not complete the exchange.
+    /// The HTTP exchange could not complete.
     #[error("could not reach Linear: {0}")]
     Transport(TransportFailure),
 

@@ -8,7 +8,7 @@ use serde_json::Value;
 
 use super::budget::{self, LinearBudget, LinearRateHeaders};
 use super::error::{classify, LinearError, LinearResult, TransportFailure};
-use super::transport::{curl_runner, LinearRequest, LinearRunner};
+use super::transport::{http_runner, LinearRequest, LinearRunner};
 use crate::issue_auth::{SecretToken, TokenSource};
 
 /// How a call retries transient failures: up to `attempts` tries in all,
@@ -78,7 +78,7 @@ impl std::fmt::Debug for LinearClient {
 }
 
 impl LinearClient {
-    /// A client for `key` over the production `curl` runner (or the installed
+    /// A client for `key` over the production HTTPS runner (or the installed
     /// test runner).
     pub fn new(key: SecretToken) -> Self {
         #[cfg(any(test, feature = "test-support"))]
@@ -88,7 +88,7 @@ impl LinearClient {
                 base_delay: Duration::ZERO,
             });
         }
-        Self::with_runner(key, curl_runner())
+        Self::with_runner(key, http_runner())
     }
 
     /// A client whose key is resolved for `project` (env → keychain →

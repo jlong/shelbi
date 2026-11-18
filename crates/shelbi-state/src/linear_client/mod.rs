@@ -4,7 +4,7 @@
 //! ## Shape
 //!
 //! ```text
-//!  LinearClient ── query / mutate / paginate ──► LinearRunner ──► curl ──► api.linear.app
+//!  LinearClient ── query / mutate / paginate ──► LinearRunner ──► ureq ──► api.linear.app
 //!     │   typed helpers: viewer, teams, team_states,      (swappable: FakeLinear in tests)
 //!     │   team_projects, labels, team_members; issues,
 //!     │   create/update_issue, upsert_attachment,
@@ -16,11 +16,12 @@
 //!                  ~/.shelbi/projects/<name>/linear.json
 //! ```
 //!
-//! * **No HTTP crate.** Requests go through `curl` (present on every supported
-//!   host), via a [`LinearRunner`] closure so tests swap in a fake. The
-//!   production runner ([`curl_runner`]) passes the `Authorization` header and
-//!   the JSON body to `curl --config -` **on stdin**: the key never appears in
-//!   argv (visible in `ps`), in a log line, or in an error.
+//! * **Native HTTPS.** Requests go through a [`LinearRunner`] closure so tests
+//!   swap in a fake. The production runner ([`http_runner`]) POSTs straight to
+//!   Linear with a blocking `ureq` agent (rustls, one shared agent so
+//!   connections are reused, 30 s per request); no external binary is needed.
+//!   The key travels only in the `Authorization` header: it never appears in
+//!   argv, in a log line, or in an error.
 //! * **Errors** are a typed [`LinearError`]: auth, forbidden, rate limited
 //!   (with a park-until time), invalid input, other GraphQL errors, 5xx,
 //!   transport (timeout / connect), decode, and filter-resolution misses. It
@@ -101,7 +102,7 @@ pub use queries::{
     Connection, LinearLabel, LinearProject, LinearProjectStatus, LinearState, LinearStateType,
     LinearTeam, LinearUser, LinearViewerAccess, PageInfo, PAGE_SIZE, VIEWER_TEAMS_PAGE,
 };
-pub use transport::{curl_runner, LinearRequest, LinearResponse, LinearRunner, LINEAR_API_URL};
+pub use transport::{http_runner, LinearRequest, LinearResponse, LinearRunner, LINEAR_API_URL};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use fake::{

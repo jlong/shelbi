@@ -82,7 +82,7 @@ fn non_empty(value: String) -> Option<String> {
 /// Check a pasted key's shape and return it trimmed. Linear personal API keys
 /// are `lin_api_` followed by letters and digits; anything outside
 /// `[A-Za-z0-9_-]` is refused, which also keeps the key safe to hand to
-/// `security -i` and a curl config unquoted-free.
+/// `security -i` unquoted and to send as an HTTP header.
 pub fn validate_key_shape(raw: &str) -> Result<String> {
     let key = raw.trim();
     if key.is_empty() {
