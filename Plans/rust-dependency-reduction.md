@@ -323,3 +323,24 @@ Those replace this plan's estimates with real figures.
 
 In flight: `deps-phase1` (T1 to T3 combined), `deps-globset-inline` (T4) and `deps-tempfile-prod` (T5).
 
+
+## Status (2026-11-09, evening)
+
+Merged: `deps-phase1` (#2232), `deps-globset-inline` (#2233), `deps-tempfile-prod` (#2237), `deps-chrono-tz` (#2238, system tzdb), `deps-termwiz-encoder` (#2242, byte-identical golden table; termwiz kept in Acknowledgements as a ported crate with its MIT text), `deps-alacritty-tty-gate` (#2243).
+
+In flight: `deps-tui-stack-align` (#2244). It needs a lockfile rebase after termwiz. Note: the lockfile grows from 296 to 304 packages because ratatui 0.30 split into sub-crates, but the crossterm, mio and unicode-width duplicates are gone.
+
+Held: `serde-yaml-fork-migration` (backlog) until #2244 merges.
+
+Follow-ups: the owner's manual keyboard check of the termwiz encoder (Shift+Enter, Tab, Shift+Tab, DECCKM arrows) on the next desktop build, and the before/after build-time and binary-size measurements.
+
+
+## Status (2026-11-09, final)
+
+All approved work has merged: #2232, #2233, #2237, #2238, #2242, #2243 and #2244, plus `serde-yaml-fork-migration` (#2245, now on `yaml_serde` 0.10.7, with a 78-file golden round-trip suite that is byte-identical).
+
+Remaining follow-ups:
+- The owner's manual keyboard check of the encoder on the relaunched desktop build.
+- Before/after build-time and binary-size measurements.
+- bitflags 1 stays, through portable-pty, which we're keeping.
+
