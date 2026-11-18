@@ -1006,7 +1006,7 @@ impl KanbanApp {
     /// blocks; a local board never starts the worker.
     pub fn poll_search(&mut self) -> bool {
         if self.search.is_due() && self.search_worker.is_none() {
-            self.search_worker = Some(SearchWorker::github(self.project_name.clone()));
+            self.search_worker = Some(SearchWorker::tracker(self.project_name.clone()));
         }
         let Some(worker) = &self.search_worker else {
             return false;
@@ -1030,7 +1030,7 @@ impl KanbanApp {
             if let Some(req) = self.search.load_more() {
                 let project = self.project_name.clone();
                 self.search_worker
-                    .get_or_insert_with(|| SearchWorker::github(project))
+                    .get_or_insert_with(|| SearchWorker::tracker(project))
                     .send(req);
             }
             return;
@@ -6962,11 +6962,13 @@ transitions:
     #[test]
     fn compute_column_widths_drops_overflow_and_scrolls() {
         let ps = shelbi_core::ProjectStatuses {
+            managed_by: None,
             statuses: (0..10)
                 .map(|i| shelbi_core::ProjectStatus {
                     id: format!("s{i}"),
                     name: format!("Status{i}"),
                     category: StatusCategory::Active,
+                    external_id: None,
                 })
                 .collect(),
         };
@@ -7066,11 +7068,13 @@ transitions:
     #[test]
     fn ensure_selected_visible_keeps_selection_in_view() {
         let ps = shelbi_core::ProjectStatuses {
+            managed_by: None,
             statuses: (0..10)
                 .map(|i| shelbi_core::ProjectStatus {
                     id: format!("s{i}"),
                     name: format!("Status{i}"),
                     category: StatusCategory::Active,
+                    external_id: None,
                 })
                 .collect(),
         };

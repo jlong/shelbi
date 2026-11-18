@@ -252,10 +252,12 @@ fn board_read_round_trips() {
         state_snapshot: None,
         workflows: Err("workflow load failed: x".into()),
         project_statuses: Ok(ProjectStatuses {
+            managed_by: None,
             statuses: vec![ProjectStatus {
                 id: "todo".into(),
                 name: "Todo".into(),
                 category: StatusCategory::Ready,
+                external_id: None,
             }],
         }),
         board: BoardOutcome::Failed("refresh failed: x".into()),

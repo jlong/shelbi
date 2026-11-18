@@ -1,0 +1,13 @@
+{
+  "data": {
+    "viewer": {
+      "id": "user-ada",
+      "guest": false,
+      "admin": false,
+      "teams": {
+        "nodes": [{ "id": "team-eng" }],
+        "pageInfo": { "hasNextPage": false, "endCursor": "viewer-teams-end" }
+      }
+    }
+  }
+}

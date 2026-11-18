@@ -13,8 +13,8 @@ variant (file `pu3hxHgWoCDPCzJ4u6zTQK`, node 2252:27532; the project nav is
 │ ☰ Properties           ⌃4 │   Settings for this project, stored in <file>.
 │ 💬 Orchestrator        ⌃5 │   Name / Repository / Default branch
 │ 🤖 Agents              ⌃6 │   Default workflow ⌄
-│ 📁 Workspaces          ⌃7 │   Issue tracker (read-only summary)
-│ ▥ Workflows            ⌃8 │   › Advanced: the two poll intervals
+│ 📁 Workspaces          ⌃7 │   › Advanced: the two poll intervals
+│ ▥ Workflows            ⌃8 │   Issue tracker section (linear-settings-ui)
 ```
 
 - **Model** (`shelbi_state::project_properties`, carried by

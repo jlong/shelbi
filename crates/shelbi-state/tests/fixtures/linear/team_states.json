@@ -1,0 +1,18 @@
+{
+  "data": {
+    "team": {
+      "states": {
+        "nodes": [
+          { "id": "state-done", "name": "Done", "type": "completed", "color": "#5e6ad2", "position": 5 },
+          { "id": "state-backlog", "name": "Backlog", "type": "backlog", "color": "#bec2c8", "position": 1 },
+          { "id": "state-todo", "name": "Todo", "type": "unstarted", "color": "#e2e2e2", "position": 2 },
+          { "id": "state-progress", "name": "In Progress", "type": "started", "color": "#f2c94c", "position": 3 },
+          { "id": "state-review", "name": "In Review", "type": "started", "color": "#0f783c", "position": 4 },
+          { "id": "state-canceled", "name": "Canceled", "type": "canceled", "color": "#95a2b3", "position": 6 },
+          { "id": "state-triage", "name": "Triage", "type": "triage", "color": "#fc7840", "position": 0 }
+        ],
+        "pageInfo": { "hasNextPage": false, "endCursor": "states-end" }
+      }
+    }
+  }
+}

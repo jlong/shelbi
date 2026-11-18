@@ -1,0 +1,540 @@
+---
+title: Linear
+order: 19.5
+summary: Keep a project's board as Linear issues in one team, from getting an API key to a working board, covering filters, statuses synced from Linear, ownership and Zen, rate limits, migration and troubleshooting.
+---
+
+A Shelbi project keeps its board in one place. By default that is private
+markdown on your own machine. Connect the project to Linear and the board
+becomes **the issues of one Linear team**, optionally narrowed to a Linear
+project, a label or an assignee. Every card is a real Linear issue your team
+can see, triage and comment on in Linear, while Shelbi's orchestrator and
+agents keep driving it from the desktop app, the TUI and the CLI.
+
+This page walks you through setting it up from scratch, then explains how the
+integration behaves. The command reference is
+[`shelbi tracker`](/docs/cli/tracker), and the config reference is the
+[`issue_tracker`](/docs/configuration/project#issue_tracker) block.
+
+## What you get
+
+- **The board is your Linear issues.** Shelbi reads the team's issues that
+  match your filters, and every issue it creates lands in that team with the
+  same filters applied.
+- **Statuses come from Linear.** The board's columns are the team's workflow
+  states, in Linear's order. You rename, add and reorder them in Linear;
+  Shelbi follows.
+- **Moves go both ways.** A card an agent moves changes the issue's state in
+  Linear, and an issue someone moves in Linear moves on the board.
+- **Shelbi's own fields stay out of the description.** The workflow, branch,
+  pull request and the rest live in a small attachment named **Shelbi** on
+  each issue, so the description stays human prose.
+- **Ownership gates autonomy.** Shelbi only starts issues assigned to you, so
+  several people can share one team without their orchestrators picking up
+  each other's work.
+
+## Set it up
+
+You need a Linear account that is a member of the team the board will use, and
+permission to create issues in that team.
+
+<Steps>
+<Step title="Create a personal API key in Linear">
+
+In Linear, open **Settings > Account > Security & access > Personal API keys**
+and create a key. Linear shows it once, so copy it now. It starts with
+`lin_api_`.
+
+Shelbi uses the key for everything it does in Linear: reading the board,
+creating and moving issues, posting comments. Issues it creates and comments
+it posts are made as the key's owner.
+
+</Step>
+<Step title="Log in">
+
+```bash
+shelbi tracker linear login
+```
+
+Paste the key at the prompt (input is hidden). Shelbi asks Linear who the key
+belongs to and stores it only if Linear accepts it:
+
+```text
+Logged in to Linear as Ada Lovelace <ada@example.com>.
+The key is stored in the macOS keychain (service `shelbi-linear`, account `default`).
+```
+
+To pipe the key in instead of typing it, use `--key-stdin`:
+
+```bash
+pbpaste | shelbi tracker linear login --key-stdin
+```
+
+The key goes into the macOS keychain, not into any config file. You can also
+provide it through the `LINEAR_API_KEY` environment variable or a project's
+`tokens.yml`; see [where the API key lives](/docs/cli/tracker#where-the-api-key-lives).
+You can skip this step if you connect from the desktop app or the TUI: both
+ask for the key when this machine has none.
+
+</Step>
+<Step title="Connect the project">
+
+Pick whichever way suits you. All three run the same checks before anything
+is written, and all three end with the same config.
+
+**A new project.** [`shelbi init`](/docs/cli/init#where-your-issues-live)
+(and adding a project in the desktop app or the TUI) asks where the project's
+issues live. Choose **Linear**, then pick the team and, optionally, the
+filters from lists read from Linear. Without a terminal, pass them as flags:
+
+```bash
+shelbi init -y --issue-tracker linear --linear-team ENG --linear-assignee me
+```
+
+**An existing project, from the CLI.** Find your team's key, then connect:
+
+```bash
+shelbi tracker linear teams
+shelbi tracker linear connect --team ENG --label shelbi --assignee me
+```
+
+At a terminal you can leave out `--team` and pick the team and filters from
+lists. The Linear project filter is `--linear-project`, because `--project`
+already selects the Shelbi project.
+
+**An existing project, from Settings.** In the desktop app or the TUI, open
+**Settings > Properties** and find the **Issue tracker** section. Choose
+**Linear**. The section shows whose API key this machine uses (with
+**Change key…**), or a field to paste one and **Verify**. Pick the **Team**
+(required) and, if you want, a **Project**, a **Label** and an **Assignee**. A
+line under the pickers says what you'll get, for example:
+
+```text
+Shelbi shows and creates issues in ENG, project Shelbi, assigned to you.
+```
+
+Nothing is written until you press **Connect**.
+
+Before writing, every path checks that the key works, that the team and each
+filter you set match exactly one thing in Linear, and that the key's owner can
+create issues in the team. Each failure names the fix. On success the project
+config gets this block:
+
+```yaml
+issue_tracker:
+  backend: linear
+  linear:
+    team: ENG
+    label: shelbi
+    assignee: me
+```
+
+Connecting an existing project also syncs its statuses from the team right
+away. A new project syncs them on the hub daemon's first board refresh.
+
+</Step>
+<Step title="Map your workflows onto Linear's statuses">
+
+Your [workflows](/docs/guides/getting-started/workflows) name statuses by id,
+and the statuses now come from Linear. Where a workflow names a status the
+team doesn't have, it has to point at one the team does. The shipped `task`
+workflow, for example, has a `review` status, and a team with the usual
+Linear states has `In Review` (`in-review`) instead. Let Shelbi do the
+mapping:
+
+```bash
+shelbi tracker linear sync --rewrite-workflows
+```
+
+This writes nothing yet. It prints what would change in the status catalog
+and a diff for each workflow it would rewrite (abridged here):
+
+```text
+Would sync statuses from Linear:
+  ~ statuses are now managed by Linear
+  + in-review (In Review, handoff)
+  + duplicate (Duplicate, archived)
+  - review (Review)
+
+Workflow `task` (~/.shelbi/projects/myapp/workflows/task.yaml):
+  review -> in-review
+  ...
+
+Dry run: nothing was written. Re-run with --rewrite-workflows --yes to write the statuses and the workflows.
+```
+
+Each missing status is replaced by the first Linear status of the same
+[category](#statuses), keeping its owner, agent and tags, and the workflow's
+`initial_status` and transitions move with it. When the plan looks right,
+write it:
+
+```bash
+shelbi tracker linear sync --rewrite-workflows --yes
+```
+
+When `connect` (or Settings) finds workflows to map, its result line ends with
+this same command, so you don't have to remember it.
+
+</Step>
+<Step title="Check the connection">
+
+```bash
+shelbi tracker linear status
+```
+
+```text
+Linear
+  project:   myapp (backend: linear)
+  api key:   from the macOS keychain
+  viewer:    Ada Lovelace <ada@example.com> [<user id>]
+  team:      ENG (Engineering) [<team id>]
+  project:   any
+  label:     shelbi [<label id>]
+  assignee:  Ada Lovelace [<user id>]
+  budget:    <requests and complexity left, with reset times>
+```
+
+It shows where the key comes from, who it belongs to, what each filter
+resolved to (with Linear's ids) and how much of the rate limit is left.
+
+Open the project and the board shows the team's matching issues, in Linear's
+columns. From here the orchestrator works it like any other board:
+`shelbi issue add` creates a Linear issue, and dispatching a card moves it in
+Linear.
+
+</Step>
+</Steps>
+
+## Filters
+
+A project sees one team's issues, narrowed by up to three optional filters.
+
+| Filter | Config key | What it matches |
+| --- | --- | --- |
+| Team | `team` | **Required.** A team key, name or id (for example `ENG`). The statuses come from this team. |
+| Project | `project` | A Linear project's name or id. |
+| Label | `label` | A label's name or id: the team's own labels or the workspace's. The pickers leave out group labels, which can't be put on an issue. |
+| Assignee | `assignee` | `me` (the API key's owner), an email, or a user id. |
+
+Each value is matched case-insensitively against the key, name or id of the
+thing in Linear. A value that matches nothing, or more than one thing, is
+refused with the list of valid values. The listing commands show them:
+
+```bash
+shelbi tracker linear teams
+shelbi tracker linear projects --team ENG
+shelbi tracker linear labels --team ENG
+shelbi tracker linear users --team ENG
+```
+
+The filters work both ways:
+
+- **The board shows only matching issues.** So does everything that reads the
+  board: the orchestrator, the agents, `shelbi issue list`, board search.
+  An issue that stops matching (someone removes the label, say) leaves the
+  board on the next refresh.
+- **New issues get the filters.** An issue Shelbi creates is created in the
+  team, inside the project, with the label, and assigned to the assignee
+  filter. With no assignee filter, it is assigned to the API key's owner, so
+  it is yours for the [ownership gate](#ownership-and-zen).
+
+A label filter is a handy way to share a team with people who don't use
+Shelbi: only the issues carrying, say, a `shelbi` label show up on the board.
+
+To change the filters later, run `connect` again with new values, or edit them
+under **Settings > Properties > Issue tracker** and press **Save**. A filter
+change on the same team isn't a switch, so it is never refused.
+
+## Statuses
+
+A Linear project's status catalog (`workflows/statuses.yaml`) is a copy of the
+team's workflow states, one status per state, in Linear's order. It is marked
+`managed_by: linear`, and each status keeps its Linear state's id as
+`external_id`. See [Statuses](/docs/configuration/statuses) for the file's
+fields.
+
+### Linear owns the names and the order
+
+Add, rename, reorder and remove statuses in Linear. **Settings > Workflows**
+shows the statuses read-only, under this banner:
+
+```text
+Statuses are managed by Linear (team ENG). Rename, reorder, add or remove them in Linear; Shelbi syncs automatically. Each status's category is still yours to set.
+```
+
+A status's id is assigned once and never changes. A new state's id is its name
+in kebab case (`In Review` becomes `in-review`; a clash gets `-2`, `-3`). When
+a state is renamed in Linear only the status's name changes, so the issues and
+workflows that use its id keep working.
+
+### Categories stay yours
+
+Shelbi's generic logic (the orchestrator, [Zen Mode](/docs/concepts/zen-mode),
+the board's lanes) works off each status's
+[category](/docs/configuration/statuses#categories), not its name. Each Linear
+state gets a default category from its type:
+
+| Linear state type | Default category |
+| --- | --- |
+| Triage, Backlog | `backlog` |
+| Unstarted | `ready` |
+| Started | `active`, or `handoff` when the name contains "review", "QA", "verif" or "test" |
+| Completed | `done` |
+| Canceled | `archived` |
+
+To change one, pick another category for the status in **Settings >
+Workflows**. A category you changed is kept across syncs, including when the
+state is renamed in Linear. A category you never changed follows the name, so
+renaming `Doing` to `In Review` in Linear moves it to `handoff`.
+
+Whatever its category, an issue in a completed or canceled Linear state is
+history, not open work: a `Shipped` or `Duplicate` state leaves the open board.
+
+### When syncs happen
+
+- **On connect.** Connecting an existing project syncs right away.
+- **Automatically.** The hub daemon checks the team's states at most every
+  five minutes, as part of its board refresh, and syncs when they changed.
+- **On demand.** `shelbi tracker linear sync` (add `--dry-run` to only see the
+  changes), or **Sync now** in **Settings > Workflows**.
+
+A state removed in Linear leaves the catalog. Shelbi remembers its id and
+category, so `sync --rewrite-workflows` can still map a workflow that names
+it.
+
+### Workflows reference the synced ids
+
+Nothing changes in how [workflows](/docs/configuration/workflow) are written:
+they list statuses by id, and the ids are the synced ones (`todo`,
+`in-progress`, `in-review`, `done`...). A workflow that names a status the
+team doesn't have fails to load, with an error that lists the ones it has and
+the fix:
+
+```text
+workflow `task`: status `review` is not one of the Linear team's statuses (statuses are managed by Linear; available: `backlog`, `todo`, `in-progress`, `in-review`, `done`, `canceled`, `duplicate`). Point the workflow at one of those, or run `shelbi tracker linear sync --rewrite-workflows` to map it by category
+```
+
+Fix the workflow by hand, or let `sync --rewrite-workflows` map each missing
+status to the first Linear status of the same category. If no Linear status
+has that category, the rewrite says so: give a status that category in
+Settings, or edit the workflow.
+
+## How issues map to cards
+
+One Shelbi card is one Linear issue.
+
+- **Ids.** A card's id is the issue's identifier, lowercased: `ENG-123` is
+  `eng-123`. An issue Shelbi created, or migrated from another board, keeps
+  its Shelbi id (for example `fix-login-timeout`) in its Shelbi attachment.
+- **Status** is the issue's workflow state. Moving a card sets the state, and
+  moving the issue in Linear moves the card.
+- **Order** within a column is Linear's own manual order, so reordering in
+  either place shows up in the other.
+- **Comments** are native Linear comments, both ways. Shelbi marks the
+  comments it posts so a retried post never duplicates.
+- **Issues filed in Linear** need nothing from Shelbi: any issue in the team
+  that matches the filters is on the board, under the project's default
+  workflow, in the column for its state.
+- **Workspace assignment** (which Shelbi workspace is working a card) stays
+  on your machine. It is never written to Linear.
+
+### The Shelbi attachment
+
+The fields Shelbi needs that Linear has no place for are stored in an
+attachment named **Shelbi** on the issue, at a URL of the form
+`https://shelbi.dev/i/<team-key>/<shelbi-id>`. It holds the card's Shelbi id,
+workflow, branch, pull request, dependencies, machine hint, per-issue Zen and
+launch overrides, and any custom params, in the attachment's metadata. In
+Linear it appears on the issue as an attachment titled **Shelbi**, with the
+card's workflow as its subtitle.
+
+Shelbi never writes Shelbi fields into the issue's description, so the
+description is entirely yours. Leave the attachment in place: without it, a
+card created under a Shelbi id falls back to its Linear identifier and loses
+its workflow, branch and pull request. To change a field, use
+[`shelbi issue edit`](/docs/cli/issue) rather than editing the attachment.
+
+Pull requests are still opened on your Git host as before. Linear holds the
+issue; the attachment records which pull request belongs to it.
+
+## Ownership and Zen
+
+Several people can share one Linear team, each running their own Shelbi. So on
+a Linear board, Shelbi only acts on issues **assigned to you**, meaning the
+owner of the API key.
+
+- **Starting work.** `shelbi issue start` and `shelbi issue resume` refuse an
+  issue that isn't assigned to you, and so does every automatic start: the
+  orchestrator's dispatch, the daemon's dispatch, and the review auto-load.
+  The refusal says how to claim it.
+- **Claiming an issue.** Assign it to yourself in Linear, or run
+  `shelbi issue start <id> --take`, which assigns it to you in Linear and then
+  starts it. A Linear issue has one assignee, so `--take` replaces the current
+  one. The orchestrator never passes `--take` on its own.
+- **Zen.** [Zen Mode](/docs/concepts/zen-mode) only auto-promotes backlog
+  issues assigned to you. Issues assigned to a teammate, or to no one, are
+  never picked up on their own.
+- **Fails closed.** If Shelbi can't tell who you are (the key is missing or
+  rejected), nothing counts as yours and nothing starts.
+
+`shelbi issue list` shows each card's owner (`me`, another person, or
+unassigned), and task lines in the [events log](/docs/concepts/events-log)
+carry the same thing as an `owner=` token: `owner=me`,
+`owner=other:<name>`, `owner=unassigned`. A person's name here is their Linear
+display name.
+
+Since new issues are assigned to you unless an assignee filter says
+otherwise, the work Shelbi files for you stays yours. An `assignee: me` filter
+narrows the board itself to your issues.
+
+## Rate limits
+
+Linear limits each API key by requests and by query complexity, per hour.
+Shelbi keeps well inside both:
+
+- **One reader.** The hub daemon reads the board on a cadence (every **60
+  seconds** by default, `issue_tracker.refresh_secs`) and publishes it to a
+  local index. The desktop app, the TUI, the orchestrator and the agents all
+  read that index, so opening more windows costs nothing.
+- **It slows down before it runs out.** Above 40% of either budget the board
+  refreshes at its normal cadence; between 10% and 40% it slows to
+  `issue_tracker.budget.slow_refresh_secs` (120 seconds by default); below 10%
+  it pauses until that budget resets. The board keeps showing the last good
+  read, marked stale with the reset time.
+- **It waits out a limit.** When Linear reports the limit reached, Shelbi
+  stops sending requests with that key until the reset time Linear gives.
+  Timeouts and server errors are retried with backoff.
+
+To see where you stand:
+
+- `shelbi tracker linear status` shows the budget left.
+- [`shelbi status --full`](/docs/cli/status) prints a `## Linear` section:
+  the account, the filters, the board's age and last refresh, both budgets
+  with their reset times, and the request rate.
+- [`shelbi doctor`](/docs/cli/doctor) projects the request rate forward and
+  warns when the budget would run out within 30 minutes, naming the top
+  callers.
+
+Every request is logged (its operation, outcome and duration, never the key)
+to `~/.shelbi/linear-requests.log`. One key used by several projects on the
+same hub shares one budget. See
+[the board on the hub daemon](/docs/cli/tracker#the-board-on-the-hub-daemon)
+for the details.
+
+## One external tracker per project
+
+A project uses **one** external tracker at most: GitHub Issues or Linear, or
+neither (the local board). Connecting Linear replaces the whole
+`issue_tracker` block, so a `github:` block is removed, and a config with both
+fails validation.
+
+Switching a project's board (from GitHub, from a local board with issues, or
+to another Linear team) is refused while the current board has issues, since
+they would stay behind, unseen by the project. Move them first (see the next
+section), or force the switch with `--force` on the CLI or **Switch anyway**
+in Settings.
+
+`shelbi tracker disconnect` (or **Use local board** in Settings) puts the
+project back on the local file-system board, under the same rule. Your issues
+stay in Linear.
+
+## Migrating an existing board
+
+[`shelbi issue-store migrate`](/docs/cli/issue#issue-store-migrate) copies a
+board between the local board, GitHub and Linear, in any direction. It
+previews by default:
+
+```bash
+# A local board onto Linear: preview, then apply.
+shelbi issue-store migrate --to linear --linear-team ENG
+shelbi issue-store migrate --to linear --linear-team ENG --apply
+
+# A GitHub project moving to Linear.
+shelbi issue-store migrate --from github --to linear --linear-team ENG --apply
+```
+
+Each card keeps its title, body, status, order, Shelbi fields and comments
+(each copied comment starts with a line naming its original author and time).
+A card whose status the team doesn't have goes into the team's first status
+of the same category, and the preview lists each such change. Cards are
+matched on their Shelbi id, so a re-run never duplicates one. Writes are
+spaced 3 seconds apart by default (`--pace-secs`) to stay inside the rate
+limit.
+
+Once the migration is done, connect the project to the team with
+`shelbi tracker linear connect --team ENG`.
+
+## Troubleshooting
+
+**"no auth token found for the `linear` issue-tracker backend"**
+
+No key on this machine. Run `shelbi tracker linear login`, or set
+`LINEAR_API_KEY`. A key in the keychain is per machine, so a remote machine
+needs its own.
+
+**"Linear rejected the API key"**
+
+The key was revoked or mistyped. Create a new personal API key and run
+`shelbi tracker linear login` again.
+
+**"no Linear team `ENG`" or "... is ambiguous"**
+
+A filter matched nothing, or more than one thing. Run the listing command
+the error names (`shelbi tracker linear teams`, `projects`, `labels` or
+`users`) and use a key, an exact name or an id.
+
+**Connect passes, but the first write fails**
+
+The key's owner may not be able to create issues in the team. A guest must
+be a member of the team. Linear can't report a key's own permissions, so a
+read-only key passes the check and fails on its first write.
+
+**A workflow fails to load: "status ... is not one of the Linear team's statuses"**
+
+The workflow names a status the team doesn't have. Run
+`shelbi tracker linear sync --rewrite-workflows`, check the diff, then add
+`--yes`. See [Workflows reference the synced ids](#workflows-reference-the-synced-ids).
+
+**"Statuses are managed by Linear" when editing statuses**
+
+Names, order and the set of statuses are edited in Linear. Only categories
+are edited in Shelbi.
+
+**A status I added in Linear isn't on the board yet**
+
+The daemon checks for state changes at most every five minutes. Run
+`shelbi tracker linear sync`, or press **Sync now** in Settings > Workflows.
+
+**An issue is missing from the board**
+
+It doesn't match the filters (another project, no label, a different
+assignee), or it is in a completed or canceled state and so in the history.
+`shelbi tracker linear status` shows the filters in effect.
+
+**Shelbi won't start an issue: "Shelbi only starts issues assigned to you"**
+
+Assign it to yourself in Linear, or run `shelbi issue start <id> --take`.
+
+**"Linear rate limit reached; requests are paused until ..."**
+
+Shelbi waits for the reset time Linear gave. The board keeps its last good
+read meanwhile. `shelbi doctor` shows which callers spent the budget.
+
+**Switching to Linear is refused because the board has issues**
+
+Move the issues with `shelbi issue-store migrate --to linear` first, or
+switch anyway with `--force` (they stay where they are).
+
+## See also
+
+- [`shelbi tracker`](/docs/cli/tracker): every Linear command and flag.
+- [Project config](/docs/configuration/project#linear-connection): the
+  `issue_tracker.linear` block.
+- [Statuses](/docs/configuration/statuses): the status catalog, including
+  `managed_by` and `external_id`.
+- [`shelbi issue-store migrate`](/docs/cli/issue#issue-store-migrate): moving
+  a board between backends.
+- [GitHub Issues backend](/docs/concepts/github-issues): the other external
+  tracker, which works the same way in most respects.
+- [Zen Mode](/docs/concepts/zen-mode): the autonomy the ownership gate
+  protects.

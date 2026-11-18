@@ -1231,11 +1231,13 @@ statuses:
         save_project_statuses(
             "p",
             &ProjectStatuses {
+                managed_by: None,
                 statuses: vec![
                     ProjectStatus {
                         id: "doing".into(),
                         name: "Doing".into(),
                         category: StatusCategory::Active,
+                        external_id: None,
                     },
                     // A terminal is required for the set to validate; the
                     // workflow under test only references `doing`.
@@ -1243,6 +1245,7 @@ statuses:
                         id: "done".into(),
                         name: "Done".into(),
                         category: StatusCategory::Done,
+                        external_id: None,
                     },
                 ],
             },
@@ -1377,11 +1380,13 @@ statuses:
         save_project_statuses(
             "p",
             &ProjectStatuses {
+                managed_by: None,
                 statuses: vec![
                     ProjectStatus {
                         id: "todo".into(),
                         name: "Todo".into(),
                         category: StatusCategory::Ready,
+                        external_id: None,
                     },
                     // Terminal so the set validates; the workflow below
                     // references `done`, which is deliberately *not* here.
@@ -1389,6 +1394,7 @@ statuses:
                         id: "canceled".into(),
                         name: "Canceled".into(),
                         category: StatusCategory::Archived,
+                        external_id: None,
                     },
                 ],
             },

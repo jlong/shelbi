@@ -1,11 +1,12 @@
 //! The `IssueStore` seam: the backend-agnostic contract every consumer
 //! (CLI, TUI, orchestrator) uses to reach a project's issue board.
 //!
-//! Today the only backend is [`FileSystemStore`] — a thin facade over the
-//! markdown-on-disk board that already lives in this crate. It exists so the
-//! GitHub / Jira / Linear backends the pluggable-issue-trackers plan calls for
-//! can slot in behind the same trait without any consumer learning which
-//! backend is live. Every method speaks the shared domain types ([`Issue`],
+//! Three backends implement it: [`FileSystemStore`] (a thin facade over the
+//! markdown-on-disk board that already lives in this crate),
+//! [`crate::GitHubStore`] (issues in one repository) and [`crate::LinearStore`]
+//! (one team's issues, narrowed by the project's filters); Jira is still a
+//! stub. No consumer learns which backend is live. Every method speaks the
+//! shared domain types ([`Issue`],
 //! status [`Column`] ids, issue ids) so the workflow / category layer stays
 //! backend-agnostic.
 //!
@@ -17,8 +18,8 @@
 //! (`load_task` / `save_task` / `renumber_column`, the per-project task lock,
 //! parked-review markers, welcome-card scaffolding) remain module functions:
 //! they are the *mechanism* the [`FileSystemStore`] happens to use, not part of
-//! the cross-backend contract, and a remote backend will satisfy the same trait
-//! with an entirely different mechanism. `FileSystemStore` therefore delegates
+//! the cross-backend contract, and the remote backends satisfy the same trait
+//! with entirely different mechanisms. `FileSystemStore` therefore delegates
 //! to those functions, which keeps this a behavior-preserving refactor.
 //!
 //! Comments and `poll_changes` are the two capabilities the plan adds that the
@@ -42,10 +43,11 @@ use crate::IssueFile;
 ///
 /// The config is validated first, so a `github` backend with a missing or
 /// malformed `repo` surfaces a field-named [`Error::InvalidIssueTracker`]
-/// before we ever try to build a store. `file_system` (the markdown board) and
-/// `github` (issues in `owner/repo`) both have live backends; `jira` / `linear`
-/// validate but resolve to a typed [`Error::IssueTrackerUnimplemented`] so a
-/// caller can tell "not built yet" apart from "you configured it wrong". See
+/// before we ever try to build a store. `file_system` (the markdown board),
+/// `github` (issues in `owner/repo`) and `linear` (a team's issues, narrowed
+/// by the project's filters) have live backends; `jira` validates but resolves
+/// to a typed [`Error::IssueTrackerUnimplemented`] so a caller can tell "not
+/// built yet" apart from "you configured it wrong". See
 /// `Plans/pluggable-task-stores.md` §2 + D1.
 pub fn resolve_issue_store(
     project: &str,
@@ -88,7 +90,16 @@ pub(crate) fn build_store(
                 })?;
             Ok(Box::new(crate::GitHubStore::new(project, repo)))
         }
-        other => Err(Error::IssueTrackerUnimplemented(other.to_string())),
+        IssueTrackerBackend::Linear => {
+            // `validate()` above guarantees a `linear` block with a team.
+            let conn = cfg.linear.clone().ok_or_else(|| {
+                Error::InvalidIssueTracker("issue_tracker.linear.team is required".into())
+            })?;
+            Ok(Box::new(crate::LinearStore::new(project, conn)))
+        }
+        IssueTrackerBackend::Jira => {
+            Err(Error::IssueTrackerUnimplemented(IssueTrackerBackend::Jira.to_string()))
+        }
     }
 }
 
@@ -483,8 +494,9 @@ impl BoardState {
 }
 
 /// The board seam. Every consumer that reads or mutates a project's issues
-/// does so through this trait; [`FileSystemStore`] is the only implementor
-/// today, with GitHub / Jira / Linear backends to follow behind the same shape.
+/// does so through this trait: [`FileSystemStore`] (the markdown board),
+/// [`crate::GitHubStore`] and [`crate::LinearStore`], with Jira to follow
+/// behind the same shape.
 pub trait IssueStore {
     /// The whole board, in the canonical column-then-priority order.
     ///
@@ -1720,6 +1732,30 @@ mod tests {
             Err(other) => panic!("expected IssueTrackerUnimplemented, got {other:?}"),
             Ok(_) => panic!("expected an error, got a live store"),
         }
+    }
+
+    #[test]
+    fn resolve_linear_returns_a_cached_live_store() {
+        use shelbi_core::{IssueTrackerConfig, LinearConnection};
+
+        let cfg = IssueTrackerConfig {
+            backend: IssueTrackerBackend::Linear,
+            linear: Some(LinearConnection::for_team("ENG")),
+            ..Default::default()
+        };
+        // The cache layer touches per-project state paths: a throwaway home.
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        // Building the store reads nothing remote: the key and filters
+        // resolve per call.
+        assert!(build_store("p", &cfg).is_ok());
+        assert!(resolve_issue_store("p", &cfg).is_ok());
+        // A config error (no team) is still a typed config error.
+        let cfg = IssueTrackerConfig { backend: IssueTrackerBackend::Linear, ..Default::default() };
+        assert!(matches!(resolve_issue_store("p", &cfg), Err(Error::InvalidIssueTracker(_))));
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

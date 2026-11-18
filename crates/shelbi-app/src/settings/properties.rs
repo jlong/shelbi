@@ -9,8 +9,8 @@
 //!  Repository       [ git@github.com:jlong/shelbi.git ]
 //!  Default branch   [ main                            ]
 //!  Default workflow [ app                           ⌄ ]
-//!  Issue tracker    GitHub · jlong/shelbi
-//!                   Change it in the project YAML.
+//!  Issue tracker
+//!    (•) Local board   ( ) GitHub Issues   ( ) Linear     [Cancel] [Save]
 //!  ▸ Advanced
 //!    Workspace poll interval    [ 5   ] seconds
 //!    GitHub reconcile interval  [ 900 ] seconds
@@ -38,6 +38,11 @@
 //! time; a commit made while one is in flight is saved when it lands
 //! ([`PropertiesForm::saved_result`] hands it back).
 //!
+//! The Issue tracker section is its own form ([`crate::settings::tracker`]):
+//! a connection isn't a YAML edit, so it saves on Connect, not as each
+//! field is committed. The page hands it the project's connection
+//! ([`PropertiesForm::issue_tracker_config`]) whenever the config is read.
+//!
 //! Toolkit-free: the desktop app's and the TUI's Properties pages draw
 //! [`PropertiesForm`] with the labels here.
 
@@ -54,8 +59,6 @@ use crate::settings::summary::display_path;
 pub const TITLE: &str = "Properties";
 /// The Issue tracker row's label.
 pub const ISSUE_TRACKER_LABEL: &str = "Issue tracker";
-/// The note under the issue tracker's summary.
-pub const ISSUE_TRACKER_NOTE: &str = "Change it in the project YAML.";
 /// The Advanced group's disclosure.
 pub const ADVANCED_LABEL: &str = "Advanced";
 /// The unit after an interval field.
@@ -322,9 +325,15 @@ impl PropertiesForm {
             .unwrap_or("")
     }
 
-    /// The issue tracker's summary (read-only on this page).
+    /// The issue tracker's one-line summary (`GitHub · jlong/shelbi`).
     pub fn issue_tracker(&self) -> Option<String> {
         self.config.as_ref().map(|c| c.issue_tracker().summary())
+    }
+
+    /// The project's whole `issue_tracker:` block, for the Issue tracker
+    /// section ([`crate::settings::tracker::TrackerForm::load`]).
+    pub fn issue_tracker_config(&self) -> Option<&shelbi_core::IssueTrackerConfig> {
+        self.config.as_ref().map(|c| &c.issue_tracker().config)
     }
 
     /// Whether Advanced is open (it opens itself for an error inside it).

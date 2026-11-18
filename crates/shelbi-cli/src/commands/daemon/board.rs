@@ -10,6 +10,12 @@
 //! `fetched_at` (and mtime) advance on the interval and stay a live freshness
 //! signal even when nothing moved.
 //!
+//! GitHub and Linear boards refresh the same way; only the budget that governs
+//! the cadence differs ([`govern`]): the GitHub token's GraphQL points, or the
+//! Linear key's requests and complexity buckets. A Linear project's refresh
+//! also re-syncs its status catalog when the team's workflow states change
+//! ([`sync_linear_statuses`]).
+//!
 //! A [`refresh-board <project>`](BoardRefresher::refresh_now) hub message forces
 //! an immediate refresh and replies with the new `fetched_at`; callers wait at
 //! most two seconds for it.
@@ -104,6 +110,7 @@ impl BoardRefresher {
     fn refresh(&self, project: &str, interval_secs: Option<u64>) -> Result<RefreshOutcome> {
         let lock = self.lock_for(project);
         let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        sync_linear_statuses(project, interval_secs.is_none());
         let store = shelbi_state::raw_issue_store_for(project).map_err(|e| anyhow!(e))?;
         refresh_with_store(project, store.as_ref(), interval_secs)
     }
@@ -129,6 +136,34 @@ impl BoardRefresher {
     /// in so the tick doesn't re-shell to the keychain.
     fn tick(&self, project: &str, tier: &BudgetTier, interval_secs: u64) {
         handle_tick_result(project, self.refresh(project, Some(interval_secs)), tier);
+    }
+}
+
+/// A Linear project's status catalog follows the team's workflow states: a
+/// tick checks them (at most every
+/// [`STATES_CHECK_INTERVAL`](shelbi_state::linear_statuses::STATES_CHECK_INTERVAL);
+/// a manual `refresh-board` always checks) and re-syncs `statuses.yaml` when
+/// they changed. Best-effort: a failure is logged and the board refresh goes
+/// on, so a Linear blip never stalls the board. A no-op for other backends.
+fn sync_linear_statuses(project: &str, force: bool) {
+    use shelbi_state::linear_statuses;
+    let interval = if force { Duration::ZERO } else { linear_statuses::STATES_CHECK_INTERVAL };
+    match linear_statuses::refresh_if_changed(project, interval) {
+        Ok(Some(sync)) => {
+            let changes: Vec<String> = sync.changes.iter().map(ToString::to_string).collect();
+            tracing::info!(project, changes = %changes.join("; "), "shelbi daemon: re-synced statuses from Linear");
+            if !sync.broken.is_empty() {
+                let refs: Vec<String> =
+                    sync.broken.iter().map(|b| format!("{}:{}", b.workflow, b.status)).collect();
+                tracing::warn!(
+                    project,
+                    refs = %refs.join(", "),
+                    "shelbi daemon: workflows name statuses Linear no longer has; run `shelbi tracker linear sync --rewrite-workflows`",
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(project, error = %e, "shelbi daemon: Linear status sync failed"),
     }
 }
 
@@ -219,9 +254,12 @@ fn refresh_with_store(
     // production the store was just built from this config, so the load succeeds;
     // a unit test driving `refresh_with_store` with a fake store and no registered
     // project gets `None`, which is stamped and matches its own later ticks.
-    let expected_repo = shelbi_state::load_project(project)
-        .ok()
-        .and_then(|p| board_index::expected_board_repo(&p.issue_tracker));
+    let tracker = shelbi_state::load_project(project).ok().map(|p| p.issue_tracker);
+    let expected_repo = tracker.as_ref().and_then(board_index::expected_board_repo);
+    // Which budget the read's `remaining` is, for the events line.
+    let linear = tracker
+        .as_ref()
+        .is_some_and(|t| t.backend == shelbi_core::IssueTrackerBackend::Linear);
 
     // Only a previous index that still describes THIS repository (and the current
     // schema) counts. A mismatched or pre-identity file (a retargeted project, an
@@ -284,7 +322,13 @@ fn refresh_with_store(
     // Which budget `remaining_return` belongs to: the GraphQL path reports the
     // GraphQL points budget, the REST fallback the REST request budget. The event
     // labels it so a reader never mistakes a REST number for GraphQL headroom.
-    let rest_fallback = read.rest_fallback;
+    let budget_label = if linear {
+        BudgetLabel::Linear
+    } else if read.rest_fallback {
+        BudgetLabel::Rest
+    } else {
+        BudgetLabel::Graphql
+    };
 
     // The reopened issues to announce on this tick: those the read observed open
     // on GitHub while still carrying a terminal `shelbi:status/*` label, minus
@@ -354,7 +398,7 @@ fn refresh_with_store(
     .map_err(|e| anyhow!(e))?;
 
     if changed > 0 {
-        emit_board_refreshed(project, &fetched_at_return, changed, remaining_return, rest_fallback);
+        emit_board_refreshed(project, &fetched_at_return, changed, remaining_return, budget_label);
         // Push a change notification to any subscribed client so a UI can
         // refresh its board without polling (Phase 3 pushed notifications). A
         // no-op when nobody is subscribed, so a quiet sidebar pays nothing.
@@ -490,10 +534,34 @@ fn merge_index_numbers(
     numbers.into_iter().collect()
 }
 
+/// Which API budget a board read's `remaining` counts, so the events line
+/// labels it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BudgetLabel {
+    /// GitHub's GraphQL points (the GitHub board path).
+    Graphql,
+    /// GitHub's REST requests (the REST fallback).
+    Rest,
+    /// The Linear key's tighter bucket (requests or complexity).
+    Linear,
+}
+
+impl BudgetLabel {
+    fn field(self) -> &'static str {
+        match self {
+            BudgetLabel::Graphql => "graphql_remaining",
+            BudgetLabel::Rest => "rest_remaining",
+            BudgetLabel::Linear => "linear_remaining",
+        }
+    }
+}
+
 /// Append the `board refreshed=<ts> changed=<n> [<budget>_remaining=<n>]` line
 /// for `project`. The remaining budget is appended when the read surfaced it,
-/// **labeled by which budget it is**: `graphql_remaining=` for the GraphQL board
-/// path (points), `rest_remaining=` for the REST fallback (requests). Before this
+/// **labeled by which budget it is**: `graphql_remaining=` for the GitHub
+/// GraphQL board path (points), `rest_remaining=` for the REST fallback
+/// (requests), `linear_remaining=` for a Linear board (the key's tighter
+/// bucket, requests or complexity). Before this
 /// the field was a bare `remaining=`, so a REST-fallback tick's REST number read
 /// as GraphQL headroom to the orchestrator and `doctor`; labeling it keeps the
 /// two budgets distinct. Best-effort: a failed events append is logged, never
@@ -504,12 +572,11 @@ fn emit_board_refreshed(
     fetched_at: &str,
     changed: usize,
     remaining: Option<u64>,
-    rest_fallback: bool,
+    label: BudgetLabel,
 ) {
     let mut body = format!("project={project} board refreshed={fetched_at} changed={changed}");
     if let Some(remaining) = remaining {
-        let label = if rest_fallback { "rest_remaining" } else { "graphql_remaining" };
-        body.push_str(&format!(" {label}={remaining}"));
+        body.push_str(&format!(" {}={remaining}", label.field()));
     }
     if let Err(e) = shelbi_state::append_external_event(&body) {
         tracing::debug!(project, error = %e, "shelbi daemon: failed to append board-refreshed event");
@@ -550,7 +617,7 @@ fn refresh_manager_loop(refresher: &BoardRefresher, stop: &AtomicBool) {
     // Per-project token key, resolved once and cached — the budget file is keyed
     // by a hash of the token, and resolving it can shell out to the keychain, so
     // we must not do it every MANAGER_TICK.
-    let mut token_keys: HashMap<String, Option<String>> = HashMap::new();
+    let mut token_keys = KeyCache::default();
     // Projects currently paused by the governor, so a pause logs once per episode
     // (on entry) rather than every 2s tick.
     let mut paused: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -561,12 +628,13 @@ fn refresh_manager_loop(refresher: &BoardRefresher, stop: &AtomicBool) {
                 break;
             }
             let now = chrono::Utc::now().timestamp();
-            // Resolve the token's GraphQL budget once, then derive both the tick
-            // plan and (on a failed tick / pause) the stale index's budget envelope
-            // from it — so the reset time the banner shows comes straight from the
-            // budget that governed the decision.
-            let tier = graphql_tier_for(project, &mut token_keys);
-            match governor_plan_from_tier(project, &tier, now) {
+            // Resolve the key's budget once (the GitHub token's GraphQL tier, or
+            // the Linear key's tighter bucket), then derive both the tick plan
+            // and (on a failed tick / pause) the stale index's budget envelope
+            // from it — so the reset time the banner shows comes straight from
+            // the budget that governed the decision.
+            let (tier, plan) = govern(project, &mut token_keys, now);
+            match plan {
                 TickPlan::Refresh(interval) => {
                     if paused.remove(project) {
                         tracing::info!(project, "shelbi daemon: board refresh resumed (budget recovered)");
@@ -590,7 +658,7 @@ fn refresh_manager_loop(refresher: &BoardRefresher, stop: &AtomicBool) {
                         tracing::warn!(
                             project,
                             until,
-                            "shelbi daemon: board refresh paused (low/parked GraphQL budget); serving cache until reset",
+                            "shelbi daemon: board refresh paused (low/parked API budget); serving cache until reset",
                         );
                     }
                 }
@@ -600,19 +668,84 @@ fn refresh_manager_loop(refresher: &BoardRefresher, stop: &AtomicBool) {
         // immediately rather than waiting out its stale last-tick time.
         let open_set: std::collections::HashSet<&String> = open.iter().collect();
         last.retain(|p, _| open_set.contains(p));
-        token_keys.retain(|p, _| open_set.contains(p));
+        token_keys.github.retain(|p, _| open_set.contains(p));
+        token_keys.linear.retain(|p, _| open_set.contains(p));
         paused.retain(|p| open_set.contains(p));
         sleep_until_stop(MANAGER_TICK, stop);
     }
 }
 
+/// Per-project budget-file keys, resolved once each (resolving can read the
+/// keychain) and kept apart per tracker so a project switched between GitHub
+/// and Linear while open never reads the other tracker's budget.
+#[derive(Default)]
+struct KeyCache {
+    github: HashMap<String, Option<String>>,
+    linear: HashMap<String, Option<String>>,
+}
+
+/// This tick's budget and the governor's decision for `project`, by backend:
+///
+/// * **GitHub** (and any other remote): the token's GraphQL tier, banded by the
+///   project's `issue_tracker.budget` point thresholds
+///   ([`governor_plan_from_tier`]).
+/// * **Linear**: the API key's own budget file (requests and complexity, each
+///   with its reset), banded by share of each bucket's limit and parked on a
+///   `RATELIMITED` reply until the reset
+///   ([`shelbi_state::linear_client::linear_tick_plan`]). The cadence is the
+///   project's `refresh_secs` (Linear's own default when unset) and
+///   `budget.slow_refresh_secs`; the GraphQL point thresholds are GitHub's and
+///   don't apply.
+///
+/// The returned tier is what a failed tick or a pause stamps on the stale
+/// index, so the `quota resets HH:MM` banner reads the same for both trackers.
+fn govern(project: &str, keys: &mut KeyCache, now: i64) -> (BudgetTier, TickPlan) {
+    let cfg = shelbi_state::load_project(project)
+        .map(|p| p.issue_tracker)
+        .unwrap_or_default();
+    if cfg.backend == shelbi_core::IssueTrackerBackend::Linear {
+        return match linear_key_for(project, &mut keys.linear) {
+            Some(key) => {
+                let budget = shelbi_state::linear_client::read_budget(&key);
+                let plan = shelbi_state::linear_client::linear_tick_plan(
+                    &budget,
+                    cfg.refresh_interval_secs(),
+                    cfg.budget.slow_refresh_secs(),
+                    now,
+                );
+                (budget.tier(), plan)
+            }
+            // No key in the daemon: the refresh itself will fail and record
+            // why; govern from the index's last-seen numbers meanwhile.
+            None => {
+                let tier = index_tier(project);
+                let plan = governor_plan_with(&cfg, &tier, now);
+                (tier, plan)
+            }
+        };
+    }
+    let tier = graphql_tier_for(project, &mut keys.github);
+    let plan = governor_plan_with(&cfg, &tier, now);
+    (tier, plan)
+}
+
 /// The governor's decision for this project's tick (plan Phase 3 §6): scale the
 /// configured cadence, or pause the refresh, from the token's GraphQL budget and
 /// the project's `issue_tracker.budget` thresholds.
+#[cfg(test)]
 fn governor_plan_from_tier(project: &str, tier: &BudgetTier, now: i64) -> TickPlan {
     let cfg = shelbi_state::load_project(project)
         .map(|p| p.issue_tracker)
         .unwrap_or_default();
+    governor_plan_with(&cfg, tier, now)
+}
+
+/// [`governor_plan_from_tier`] over a config already in hand.
+fn governor_plan_with(
+    cfg: &shelbi_core::IssueTrackerConfig,
+    tier: &BudgetTier,
+    now: i64,
+) -> TickPlan {
     let budget = &cfg.budget;
     let thresholds = BudgetThresholds {
         graphql_high: budget.graphql_high(),
@@ -632,6 +765,11 @@ fn graphql_tier_for(project: &str, token_keys: &mut HashMap<String, Option<Strin
     if let Some(key) = token_key_for(project, token_keys) {
         return gh_budget::read_state(&key).graphql;
     }
+    index_tier(project)
+}
+
+/// The budget tier the published board index last recorded (no key needed).
+fn index_tier(project: &str) -> BudgetTier {
     board_index::read_board_index(project)
         .map(|idx| BudgetTier {
             remaining: idx.remaining.map(|r| r as i64),
@@ -652,6 +790,21 @@ fn token_key_for(project: &str, token_keys: &mut HashMap<String, Option<String>>
         .ok()
         .map(|t| gh_budget::token_key(t.expose()));
     token_keys.insert(project.to_string(), key.clone());
+    key
+}
+
+/// The Linear budget-file key for `project` (a hash of its API key, the same
+/// name [`shelbi_state::linear_client::LinearClient::budget_key`] uses),
+/// resolved once and memoized like [`token_key_for`]: resolving it can read the
+/// keychain.
+fn linear_key_for(project: &str, keys: &mut HashMap<String, Option<String>>) -> Option<String> {
+    if let Some(cached) = keys.get(project) {
+        return cached.clone();
+    }
+    let key = shelbi_state::linear_client::resolve_linear_key(Some(project))
+        .ok()
+        .map(|k| gh_budget::token_key(k.expose()));
+    keys.insert(project.to_string(), key.clone());
     key
 }
 
@@ -697,6 +850,7 @@ fn open_project_names() -> Vec<String> {
 mod tests {
     use super::*;
     use shelbi_core::{Column, Issue, Result as CoreResult};
+    use shelbi_state::linear_client::{FakeLinear, FakeReply, LinearResponse};
 
     use shelbi_state::issue_store::{
         Cursor, IssueChange, IssueComment, IssueFields, NewIssue, PrioMove, StatusMove,
@@ -1500,6 +1654,115 @@ issue_tracker:\n\
             ),
         )
         .unwrap();
+    }
+
+    /// Register a `linear`-backed project (team `ENG` of the bundled fixtures)
+    /// under the isolated home, with its project dir (the store's overlay and
+    /// `linear.json` live there).
+    fn register_linear_project(name: &str) {
+        let projects = shelbi_state::shelbi_home().unwrap().join("projects");
+        std::fs::create_dir_all(projects.join(name)).unwrap();
+        std::fs::write(
+            projects.join(format!("{name}.yaml")),
+            format!(
+                "name: {name}\nrepo: /tmp/{name}\ndefault_branch: main\n\
+orchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\n    flags: []\n\
+machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/{name}\nworkspaces: []\n\
+issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    /// The bundled `Issues` page with Linear's rate-limit headers on it.
+    fn issues_with_budget(requests_left: u64, complexity_left: u64, reset_ms: i64) -> FakeReply {
+        let fixture = shelbi_state::linear_client::fixture("Issues").unwrap();
+        FakeReply::Response(
+            LinearResponse::ok(fixture)
+                .with_header("X-RateLimit-Requests-Limit", "1500")
+                .with_header("X-RateLimit-Requests-Remaining", requests_left.to_string())
+                .with_header("X-RateLimit-Requests-Reset", reset_ms.to_string())
+                .with_header("X-RateLimit-Complexity-Limit", "250000")
+                .with_header("X-RateLimit-Complexity-Remaining", complexity_left.to_string())
+                .with_header("X-RateLimit-Complexity-Reset", reset_ms.to_string()),
+        )
+    }
+
+    #[test]
+    fn a_linear_board_refreshes_on_its_own_budget_and_parks_on_a_rate_limit() {
+        let _iso = IsolatedHome::new("linear");
+        register_linear_project("lin");
+        shelbi_state::linear_store::clear_linear_caches_for_test();
+        let reset = Utc::now().timestamp() + 900;
+        let fake = FakeLinear::new();
+        fake.on_reply("Issues", issues_with_budget(1400, 240_000, reset * 1000));
+        let _guard = fake.install();
+        let mut keys = KeyCache::default();
+
+        // A cold hub: no budget read yet → the Linear default cadence (not
+        // GitHub's 30s).
+        let (_, plan) = govern("lin", &mut keys, Utc::now().timestamp());
+        assert_eq!(
+            plan,
+            TickPlan::Refresh(Duration::from_secs(shelbi_core::DEFAULT_LINEAR_REFRESH_SECS))
+        );
+
+        // A tick reads the board through the Linear store and publishes it.
+        let refresher = BoardRefresher::default();
+        let (tier, _) = govern("lin", &mut keys, Utc::now().timestamp());
+        refresher.tick("lin", &tier, 60);
+        let idx = board_index::read_board_index("lin").expect("index published");
+        assert!(!idx.board.is_empty(), "the fixture's open issues are on the board");
+        assert_eq!(idx.viewer_login.as_deref(), Some("ada"), "the key owner, for ownership");
+        assert_eq!(idx.remaining, Some(1400), "the tighter bucket (93% vs 96%)");
+        let refreshed: Vec<_> =
+            events_lines().into_iter().filter(|l| l.contains("board refreshed=")).collect();
+        assert_eq!(refreshed.len(), 1, "{refreshed:?}");
+        assert!(refreshed[0].contains("linear_remaining=1400"), "{}", refreshed[0]);
+        assert!(!refreshed[0].contains("graphql_remaining"), "{}", refreshed[0]);
+
+        // The budget file now governs: healthy → base cadence; the complexity
+        // bucket draining into the middle band slows the refresh.
+        let (_, plan) = govern("lin", &mut keys, Utc::now().timestamp());
+        assert_eq!(plan, TickPlan::Refresh(Duration::from_secs(60)));
+        fake.on_reply("Issues", issues_with_budget(1400, 50_000, reset * 1000));
+        refresher.refresh_now("lin").unwrap();
+        let (_, plan) = govern("lin", &mut keys, Utc::now().timestamp());
+        assert_eq!(plan, TickPlan::Refresh(Duration::from_secs(120)), "20% left: slow band");
+
+        // Linear says RATELIMITED: the tick fails, the key parks until the
+        // reset, and the published board goes stale naming that reset.
+        fake.on_reply(
+            "Issues",
+            FakeReply::Response(
+                LinearResponse::ok(
+                    r#"{"errors":[{"message":"Rate limit exceeded","extensions":{"code":"RATELIMITED"}}]}"#,
+                )
+                .with_status(400)
+                .with_header("X-RateLimit-Requests-Limit", "1500")
+                .with_header("X-RateLimit-Requests-Remaining", "0")
+                .with_header("X-RateLimit-Requests-Reset", (reset * 1000).to_string()),
+            ),
+        );
+        let (tier, _) = govern("lin", &mut keys, Utc::now().timestamp());
+        refresher.tick("lin", &tier, 120);
+        let (tier, plan) = govern("lin", &mut keys, Utc::now().timestamp());
+        assert_eq!(plan, TickPlan::Pause { until: reset }, "parked until the reset");
+        assert_eq!(tier.reset_at, Some(reset));
+        mark_index_stale_from_tier("lin", &tier);
+        let report = shelbi_state::read_board_report("lin").unwrap();
+        let banner = report.freshness.banner().unwrap();
+        assert!(banner.contains("stale") && banner.contains("quota resets"), "{banner}");
+        assert!(
+            shelbi_state::read_board_refresh_error("lin")
+                .is_some_and(|e| e.error.contains("Linear rate limit")),
+            "the failure is recorded for status/doctor"
+        );
+
+        // While parked a refresh fails fast: no request leaves the host.
+        let issues_before = fake.calls_for("Issues").len();
+        assert!(refresher.refresh_now("lin").is_err());
+        assert_eq!(fake.calls_for("Issues").len(), issues_before, "parked: no Issues call");
     }
 
     fn tier(remaining: Option<i64>, reset_at: Option<i64>, parked_until: Option<i64>) -> BudgetTier {

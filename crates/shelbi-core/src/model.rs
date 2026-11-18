@@ -814,7 +814,9 @@ pub enum IssueTrackerBackend {
     Github,
     /// Jira issues in a project. Stub: parses and validates, not yet resolvable.
     Jira,
-    /// Linear issues for a team. Stub: parses and validates, not yet resolvable.
+    /// Linear issues for a team, narrowed by optional filters. Selector:
+    /// [`LinearConnection`]. The API client lives in
+    /// `shelbi_state::linear_client`; the store is being built on top of it.
     Linear,
 }
 
@@ -876,12 +878,77 @@ pub struct JiraConnection {
     pub project: String,
 }
 
-/// Linear backend connection facts (stub). No secret ever.
+/// Linear backend connection facts: the **filters** that pick which Linear
+/// issues a project sees. No secret ever (the API key is resolved out-of-band,
+/// see `shelbi_state::linear_client`).
+///
+/// ```yaml
+/// issue_tracker:
+///   backend: linear
+///   linear:
+///     team: ENG          # required: team key, name, or id
+///     project: Shelbi    # optional: project name or id
+///     label: shelbi      # optional: label name or id
+///     assignee: me       # optional: `me` | email | user id
+/// ```
+///
+/// `team` scopes everything (Linear statuses are per team). The optional
+/// filters narrow the board further and are applied to every issue Shelbi
+/// creates, so a new card lands inside the same view. Each value is a
+/// human-friendly reference matched case-insensitively against the Linear
+/// object's key / name / id; `shelbi_state::linear_client::resolve_filters`
+/// turns them into ids. A `team`-only block (the original stub shape) still
+/// parses: the three filters default to unset.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LinearConnection {
-    /// Linear team key (e.g. `ENG`) — which team's issues to sync.
+    /// Linear team key, name, or id (e.g. `ENG`). Required whenever the Linear
+    /// backend is selected; validated by [`IssueTrackerConfig::validate`].
     #[serde(default)]
     pub team: String,
+    /// Optional Linear project (name or id) the board is narrowed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    /// Optional issue label (name or id) the board is narrowed to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Optional assignee the board is narrowed to: `me` (the API key's owner),
+    /// an email address, or a Linear user id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+}
+
+impl LinearConnection {
+    /// A connection scoped to `team` with no optional filters.
+    pub fn for_team(team: impl Into<String>) -> Self {
+        LinearConnection {
+            team: team.into(),
+            ..Default::default()
+        }
+    }
+
+    /// The trimmed team reference, `None` when blank.
+    pub fn team_ref(&self) -> Option<&str> {
+        non_blank(Some(&self.team))
+    }
+
+    /// The trimmed project filter, `None` when unset or blank.
+    pub fn project_ref(&self) -> Option<&str> {
+        non_blank(self.project.as_ref())
+    }
+
+    /// The trimmed label filter, `None` when unset or blank.
+    pub fn label_ref(&self) -> Option<&str> {
+        non_blank(self.label.as_ref())
+    }
+
+    /// The trimmed assignee filter, `None` when unset or blank.
+    pub fn assignee_ref(&self) -> Option<&str> {
+        non_blank(self.assignee.as_ref())
+    }
+}
+
+fn non_blank(value: Option<&String>) -> Option<&str> {
+    value.map(|v| v.trim()).filter(|v| !v.is_empty())
 }
 
 /// A project's `issue_tracker` block: which board backend is live plus its
@@ -1019,6 +1086,14 @@ impl BudgetConfig {
 /// live value up as the token budget tightens.
 pub const DEFAULT_ISSUE_REFRESH_SECS: u64 = 30;
 
+/// Default board-index refresh cadence (seconds) for a **Linear** project.
+/// Linear's per-key budget is counted in requests and in query complexity,
+/// and one board read (a 100-issue page with its state, assignee, labels and
+/// Shelbi attachment) costs a few thousand complexity points, so a minute
+/// keeps the daemon's steady-state reads well inside the hourly allowance
+/// while Shelbi's own writes still show at once (they write through).
+pub const DEFAULT_LINEAR_REFRESH_SECS: u64 = 60;
+
 impl IssueTrackerConfig {
     /// True when this is the untouched default (`file_system`, no connection
     /// blocks). Drives `skip_serializing_if` on [`Project::issue_tracker`] so an
@@ -1028,21 +1103,76 @@ impl IssueTrackerConfig {
     }
 
     /// The board-index refresh cadence in seconds: the configured
-    /// `refresh_secs` when set to a positive value, else
-    /// [`DEFAULT_ISSUE_REFRESH_SECS`]. A `0` (or absent) folds to the default
-    /// so a misconfiguration can never turn the daemon's tick into a busy loop.
+    /// `refresh_secs` when set to a positive value, else the backend's
+    /// default ([`DEFAULT_LINEAR_REFRESH_SECS`] for Linear,
+    /// [`DEFAULT_ISSUE_REFRESH_SECS`] otherwise). A `0` (or absent) folds to
+    /// the default so a misconfiguration can never turn the daemon's tick into
+    /// a busy loop.
     pub fn refresh_interval_secs(&self) -> u64 {
-        self.refresh_secs
-            .filter(|&s| s > 0)
-            .unwrap_or(DEFAULT_ISSUE_REFRESH_SECS)
+        let default = match self.backend {
+            IssueTrackerBackend::Linear => DEFAULT_LINEAR_REFRESH_SECS,
+            _ => DEFAULT_ISSUE_REFRESH_SECS,
+        };
+        self.refresh_secs.filter(|&s| s > 0).unwrap_or(default)
     }
 
-    /// Validate the **selected** backend's connection facts, naming the bad
-    /// field in the error. A no-op for `file_system`. GitHub requires a
-    /// well-formed `owner/repo`; Jira/Linear (stubs) require their selector be
-    /// present. Staged connection blocks for a *non-selected* backend are not
-    /// validated, so a `github:` block can sit alongside `backend: file_system`.
+    /// The external-tracker connection blocks present in this config, by
+    /// their YAML key, in a fixed order (`github`, `jira`, `linear`).
+    pub fn connection_blocks(&self) -> Vec<&'static str> {
+        let mut blocks = Vec::new();
+        if self.github.is_some() {
+            blocks.push("github");
+        }
+        if self.jira.is_some() {
+            blocks.push("jira");
+        }
+        if self.linear.is_some() {
+            blocks.push("linear");
+        }
+        blocks
+    }
+
+    /// Validate the config, naming the bad field in the error.
+    ///
+    /// **One external integration per project.** At most one connection block
+    /// (`github:`, `jira:`, `linear:`) may be present, and when the backend is
+    /// an external tracker the block present must be that backend's: a stray
+    /// block is an error naming it. `file_system` may keep a single staged
+    /// block (what `shelbi issue-store migrate --to <that backend>` reads), and that
+    /// staged block is not validated.
+    ///
+    /// Then the **selected** backend's facts: GitHub requires a well-formed
+    /// `owner/repo`, Linear a non-empty `team`, Jira a non-empty `project`.
     pub fn validate(&self) -> crate::Result<()> {
+        let blocks = self.connection_blocks();
+        if blocks.len() > 1 {
+            let keep = match self.backend {
+                IssueTrackerBackend::FileSystem => None,
+                external => Some(external.as_str()),
+            };
+            let stray: Vec<String> = blocks
+                .iter()
+                .filter(|b| Some(**b) != keep)
+                .map(|b| format!("`{b}:`"))
+                .collect();
+            let present: Vec<String> = blocks.iter().map(|b| format!("`{b}:`")).collect();
+            return Err(crate::Error::InvalidIssueTracker(format!(
+                "issue_tracker has {} blocks, but a project connects to only one \
+                 external tracker; remove {}",
+                present.join(" and "),
+                stray.join(" and "),
+            )));
+        }
+        if let Some(&block) = blocks.first() {
+            let backend = self.backend;
+            if backend != IssueTrackerBackend::FileSystem && block != backend.as_str() {
+                return Err(crate::Error::InvalidIssueTracker(format!(
+                    "issue_tracker.{block} is set but the backend is `{backend}`; \
+                     remove the `{block}:` block (a project connects to only one \
+                     external tracker)"
+                )));
+            }
+        }
         match self.backend {
             IssueTrackerBackend::FileSystem => Ok(()),
             IssueTrackerBackend::Github => {
@@ -1073,16 +1203,19 @@ impl IssueTrackerConfig {
                     "jira",
                 )
             }
-            IssueTrackerBackend::Linear => require_selector(
-                self.linear.as_ref().map(|l| l.team.as_str()),
-                "issue_tracker.linear.team",
-                "linear",
-            ),
+            IssueTrackerBackend::Linear => match self.linear.as_ref().and_then(|l| l.team_ref()) {
+                Some(_) => Ok(()),
+                None => Err(crate::Error::InvalidIssueTracker(
+                    "issue_tracker.linear.team is required for the `linear` backend \
+                     (a team key, name, or id; `shelbi tracker linear teams` lists them)"
+                        .to_string(),
+                )),
+            },
         }
     }
 }
 
-/// Shared helper for the stub backends: require a non-empty selector, naming
+/// Shared helper for the selector-only backends: require a non-empty selector, naming
 /// the field and backend in the error.
 fn require_selector(
     value: Option<&str>,
@@ -6713,6 +6846,79 @@ agent_runners:
     }
 
     #[test]
+    fn linear_parses_every_filter() {
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n    \
+             project: \"Shelbi\"\n    label: shelbi\n    assignee: me\n",
+        );
+        p.issue_tracker.validate().unwrap();
+        let l = p.issue_tracker.linear.as_ref().unwrap();
+        assert_eq!(l.team_ref(), Some("ENG"));
+        assert_eq!(l.project_ref(), Some("Shelbi"));
+        assert_eq!(l.label_ref(), Some("shelbi"));
+        assert_eq!(l.assignee_ref(), Some("me"));
+    }
+
+    #[test]
+    fn linear_team_only_block_still_parses_and_round_trips_without_filters() {
+        // The original stub shape: `team` alone, no optional filters.
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n",
+        );
+        p.issue_tracker.validate().unwrap();
+        let l = p.issue_tracker.linear.clone().unwrap();
+        assert_eq!(l, LinearConnection::for_team("ENG"));
+        assert_eq!((l.project_ref(), l.label_ref(), l.assignee_ref()), (None, None, None));
+        // Unset filters stay off the wire.
+        let yaml = yaml_serde::to_string(&p.issue_tracker).unwrap();
+        assert!(!yaml.contains("project") && !yaml.contains("assignee"), "{yaml}");
+    }
+
+    #[test]
+    fn linear_blank_team_or_filters_count_as_unset() {
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: linear\n  linear:\n    team: \"  \"\n    label: \"\"\n",
+        );
+        let err = p.issue_tracker.validate().expect_err("blank team").to_string();
+        assert!(err.contains("issue_tracker.linear.team"), "{err}");
+        assert_eq!(p.issue_tracker.linear.as_ref().unwrap().label_ref(), None);
+    }
+
+    #[test]
+    fn github_and_linear_blocks_together_are_an_error_naming_the_stray_block() {
+        let both = "  github:\n    repo: owner/repo\n  linear:\n    team: ENG\n";
+        for (backend, stray) in [("github", "`linear:`"), ("linear", "`github:`")] {
+            let p = project_with_issue_tracker_yaml(&format!(
+                "issue_tracker:\n  backend: {backend}\n{both}"
+            ));
+            let err = p.issue_tracker.validate().expect_err("two trackers").to_string();
+            assert!(err.contains(&format!("remove {stray}")), "{backend}: {err}");
+            assert!(err.contains("only one"), "{err}");
+        }
+        // file_system may stage one block, never two.
+        let p = project_with_issue_tracker_yaml(&format!(
+            "issue_tracker:\n  backend: file_system\n{both}"
+        ));
+        let err = p.issue_tracker.validate().expect_err("two staged").to_string();
+        assert!(err.contains("remove `github:` and `linear:`"), "{err}");
+    }
+
+    #[test]
+    fn a_lone_block_for_another_tracker_is_stray() {
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: linear\n  github:\n    repo: owner/repo\n",
+        );
+        let err = p.issue_tracker.validate().expect_err("stray github").to_string();
+        assert!(err.contains("issue_tracker.github is set but the backend is `linear`"), "{err}");
+
+        // file_system keeps a staged linear block, like a staged github block.
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: file_system\n  linear:\n    team: ENG\n",
+        );
+        p.issue_tracker.validate().unwrap();
+    }
+
+    #[test]
     fn issue_tracker_round_trips_without_dropping_fields() {
         // parse → serialize → parse must preserve backend + every connection
         // block, including one staged for a non-selected backend.
@@ -6726,6 +6932,9 @@ agent_runners:
             }),
             linear: Some(LinearConnection {
                 team: "ENG".into(),
+                project: Some("Shelbi".into()),
+                label: Some("shelbi".into()),
+                assignee: Some("me".into()),
             }),
             refresh_secs: Some(45),
             budget: BudgetConfig {
@@ -6751,6 +6960,11 @@ agent_runners:
         assert_eq!(cfg.refresh_interval_secs(), 90);
         cfg.refresh_secs = Some(0);
         assert_eq!(cfg.refresh_interval_secs(), DEFAULT_ISSUE_REFRESH_SECS);
+        // Linear has its own (slower) default; an explicit value still wins.
+        cfg.backend = IssueTrackerBackend::Linear;
+        assert_eq!(cfg.refresh_interval_secs(), DEFAULT_LINEAR_REFRESH_SECS);
+        cfg.refresh_secs = Some(45);
+        assert_eq!(cfg.refresh_interval_secs(), 45);
     }
 
     #[test]

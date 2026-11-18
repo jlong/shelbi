@@ -32,6 +32,7 @@ use shelbi_state::AgentMaterializeOutcome;
 
 pub mod detect;
 pub mod issues;
+pub mod linear;
 mod pick_up;
 
 pub use detect::{check_folder, installed_runners, remote_url_for_storage, InstalledRunner};
@@ -358,7 +359,39 @@ pub fn create_project(
     preflight_persistence(&resolved.name).map_err(|e| AddProjectError::Failed(format!("Add project failed: {e:#}")))?;
     scaffold_project(&resolved, plan, out)
         .map_err(|e| AddProjectError::Failed(format!("Add project failed: {e}")))?;
+    if plan.issue_tracker.backend == shelbi_core::IssueTrackerBackend::Linear {
+        if let Some(conn) = &plan.issue_tracker.linear {
+            finish_linear(&resolved.name, conn, out);
+        }
+    }
     Ok(resolved.name)
+}
+
+/// A new Linear-backed project: cache its resolved filter ids and sync the
+/// team's workflow states into its status catalog, as connecting an
+/// existing project does. The preflight already passed, so a failure here
+/// (Linear unreachable a moment later) is a warning, never a failed
+/// creation: the board resolves the filters on its first read.
+fn finish_linear(project: &str, conn: &shelbi_core::LinearConnection, out: &mut dyn ScaffoldReporter) {
+    use shelbi_app::tracker_connect::StatusSync;
+    use shelbi_state::linear_client::{self, LinearClient};
+    let resolved = LinearClient::for_project(Some(project))
+        .and_then(|client| linear_client::resolve_filters_cached(&client.caller("setup"), project, conn));
+    let resolved = match resolved {
+        Ok(resolved) => resolved,
+        Err(e) => {
+            out.warn(&format!(
+                "warning: Linear filters for {project} couldn't be resolved yet ({e});                  `shelbi tracker linear status --refresh` retries"
+            ));
+            return;
+        }
+    };
+    out.note(&format!("✓ Linear: {}", linear::summary(&resolved)));
+    match crate::tracker_connect::sync_linear_statuses(project, &resolved) {
+        StatusSync::Synced(what) => out.note(&format!("✓ Linear statuses: {what}")),
+        StatusSync::Failed(why) => out.warn(&format!("warning: Linear statuses weren't synced: {why}")),
+        StatusSync::NotNeeded => {}
+    }
 }
 
 /// `git` runs on this machine.

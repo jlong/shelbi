@@ -1,0 +1,24 @@
+{
+  "data": {
+    "issueUpdate": {
+      "success": true,
+      "issue": {
+        "id": "issue-1",
+        "identifier": "ENG-1",
+        "number": 1,
+        "title": "Set up the board",
+        "description": "Linear-authored issue with no Shelbi attachment.",
+        "sortOrder": 100,
+        "url": "https://linear.app/acme/issue/ENG-1",
+        "createdAt": "2026-11-01T10:00:00.000Z",
+        "updatedAt": "2026-11-06T10:00:00.000Z",
+        "archivedAt": null,
+        "state": { "id": "state-progress", "name": "In Progress", "type": "started" },
+        "assignee": { "id": "user-ada", "name": "Ada Lovelace", "displayName": "ada", "email": "ada@example.com" },
+        "labels": { "nodes": [{ "id": "label-shelbi" }] },
+        "project": { "id": "proj-shelbi" },
+        "attachments": { "nodes": [] }
+      }
+    }
+  }
+}

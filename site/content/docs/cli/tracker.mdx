@@ -1,0 +1,198 @@
+---
+title: shelbi tracker
+order: 21.5
+summary: Connect a project to an external issue tracker (Linear today) or disconnect it, check the connection, and list the teams, projects, labels and users to use as filters.
+---
+
+```text
+shelbi tracker linear login [--key-stdin]
+shelbi tracker linear connect [--team <TEAM>] [--linear-project <PROJECT>] [--label <LABEL>] [--assignee <ASSIGNEE>] [--force]
+shelbi tracker disconnect [--force]
+shelbi tracker linear status [--refresh] [--json]
+shelbi tracker linear sync [--dry-run] [--rewrite-workflows [--yes]]
+shelbi tracker linear teams [--json]
+shelbi tracker linear projects [--team <TEAM>] [--json]
+shelbi tracker linear labels [--team <TEAM>] [--json]
+shelbi tracker linear users [--team <TEAM>] [--json]
+```
+
+`shelbi tracker` manages the connection to an external issue tracker, separate
+from the issues on the board (`shelbi issue`). Today it covers Linear. For a
+walkthrough of the whole integration (filters, statuses, ownership, migration
+and troubleshooting), see [Linear](/docs/concepts/linear).
+
+## Getting started with Linear
+
+1. In Linear, create a personal API key: **Settings > Account > Security &
+   access > Personal API keys**.
+2. Run `shelbi tracker linear login` and paste the key. Shelbi asks Linear who
+   the key belongs to, and only stores a key Linear accepts.
+3. Run `shelbi tracker linear teams` to find your team's key.
+4. Connect the project:
+
+   ```sh
+   shelbi tracker linear connect --team ENG --label shelbi --assignee me
+   ```
+
+   At a terminal you can leave out `--team` and pick the team and filters from
+   lists. `shelbi init` offers the same choices for a new project. Either way
+   the project config ends up with this block (see the
+   [`linear` connection](/docs/configuration/project#linear-connection)), which
+   you can also write by hand:
+
+   ```yaml
+   issue_tracker:
+     backend: linear
+     linear:
+       team: ENG          # required
+       project: Shelbi    # optional
+       label: shelbi      # optional
+       assignee: me       # optional
+   ```
+
+5. Run `shelbi tracker linear status` to check what the filters resolve to.
+6. Run `shelbi tracker linear sync --rewrite-workflows` to take the team's
+   statuses and see how your workflows map onto them, then add `--yes` to
+   write both (see [Statuses from Linear](#statuses-from-linear)).
+
+## Where the API key lives
+
+Shelbi looks for the key in this order and uses the first it finds:
+
+1. The `LINEAR_API_KEY` environment variable.
+2. The macOS keychain: the generic password with service `shelbi-linear` and
+   account `default`, which `login` writes.
+3. The project's `~/.shelbi/projects/<name>/tokens.yml`, under
+   `linear: { token: ... }`. The file must be `chmod 600`.
+
+The key is never written to the project config, never passed on a command line,
+and never logged. Requests go to Linear through `curl`, which reads the key and
+the request body from stdin.
+
+## Subcommands
+
+| Subcommand | What it does |
+| --- | --- |
+| `login` | Prompts for an API key (input hidden), checks it against Linear and stores it in the keychain. `--key-stdin` reads the key from stdin instead, for example `pbpaste \| shelbi tracker linear login --key-stdin`. |
+| `connect` | Checks a connection, then writes it as the project's tracker: see [Connecting and switching](#connecting-and-switching). `--team` is required with `-y` or without a terminal; `--linear-project` is the Linear project filter (`--project` picks the Shelbi project). |
+| `status` | Shows where the key comes from, who it belongs to, the project's filters and the ids they resolve to, and the rate-limit budget left. Resolved ids are cached in `~/.shelbi/projects/<name>/linear.json`; `--refresh` resolves them again. |
+| `sync` | Syncs the project's statuses from the team's workflow states and prints what changed (added, renamed, removed, reordered, category). `--dry-run` writes nothing. `--rewrite-workflows` also shows how each workflow maps onto the new statuses, as a diff; it writes nothing (statuses included) unless `--yes` is given. |
+| `teams` | Lists the teams the key can see. |
+| `projects` | Lists a team's projects. |
+| `labels` | Lists the labels usable on a team's issues: the team's own and the workspace's. Group labels are marked: they can't be put on an issue. |
+| `users` | Lists a team's members, with inactive users marked. |
+
+`projects`, `labels` and `users` take the team from `--team` (key, name or id),
+or else from the current project's `issue_tracker.linear.team`. Every listing
+takes `--json`.
+
+## Connecting and switching
+
+A project connects to one external tracker at most: GitHub or Linear, or
+neither (the local file-system board). `connect` and `disconnect` replace the
+whole `issue_tracker` block, so the other tracker's block is removed.
+
+Before anything is written, `connect` checks that:
+
+- an API key is configured and Linear accepts it;
+- the team, and each filter you set, matches exactly one Linear object;
+- the key's owner can create issues in the team. A guest must be a member of
+  the team. Linear can't report a key's own permissions, so a read-only key
+  passes this check and fails on its first write.
+
+Each failure names the fix, for example the listing command that shows the
+valid values. On success the resolved ids are cached in
+`~/.shelbi/projects/<name>/linear.json`.
+
+Switching boards (from GitHub, from a local board, or to another Linear team)
+is refused while the current board has issues, because they would stay behind,
+unseen by the project. Move them with `shelbi issue-store migrate --to <backend>`
+first (it previews; add `--apply` to move them), or pass `--force` to switch
+anyway. A filter change on the same team is
+not a switch.
+
+`shelbi tracker disconnect` puts the project back on the local file-system
+board. It asks first at a terminal (`-y` skips the question) and follows the
+same rule for a board with issues.
+
+### From Settings or a new project
+
+The desktop app and the TUI offer the same choice. When you add a project, the
+Issues step lists GitHub Issues, Linear and File system. In an existing
+project, **Settings > Properties > Issue tracker** connects, switches or
+disconnects it, and edits the Linear filters. Choosing Linear shows whose API
+key this machine uses (with Change key), or a field to paste one: Verify checks
+it with Linear and stores it in the keychain, as `shelbi tracker linear login`
+does. Then pick the team (required) and, optionally, a project, a label and an
+assignee from lists read from Linear. A line under the pickers says which
+issues the board will show and create. Nothing is written until you press
+Connect (or Save, for new filters on the same team), which runs the same checks
+as `connect`. When a switch is refused because the board has issues, the
+section shows how to migrate them and offers Switch anyway, the `--force`
+above.
+
+## Rate limits
+
+Every Linear response's rate-limit headers are recorded per API key under
+`~/.shelbi/linear-budget/`, and each request is logged (operation, outcome and
+duration, never the key) to `~/.shelbi/linear-requests.log`. When Linear
+reports the limit reached, Shelbi pauses requests with that key until the reset
+time Linear gives (one minute when it gives none), and `status` shows the pause.
+Timeouts and server errors are retried with backoff.
+
+## The board on the hub daemon
+
+A Linear project's board is refreshed by the hub daemon like a GitHub one: it
+reads the team's issues on the project's `issue_tracker.refresh_secs` cadence
+(**60s** by default for Linear) and publishes them to `board-index.json`, so
+every client and agent reads the board without spending budget.
+
+- **The budget governs the cadence.** Each tick looks at the key's two buckets
+  (requests and complexity) and goes by the tighter one: above 40% of its limit
+  the refresh runs at the configured cadence, between 10% and 40% it slows to
+  `issue_tracker.budget.slow_refresh_secs` (120s by default), and below 10% it
+  pauses until that bucket resets. A `RATELIMITED` reply pauses it until the
+  reset Linear names. While paused, the board keeps showing the last good read,
+  marked stale with the reset time. The GraphQL point thresholds in
+  `issue_tracker.budget` are GitHub's and don't apply.
+- **Moves made in Linear** show up as normal transition lines in `events.log`
+  (`task=<id> ... todo -> in-progress ... owner=me`), just like a status a
+  person changes on github.com.
+- **`board refreshed` lines** carry `linear_remaining=<n>`, the tighter
+  bucket's remaining count.
+- [`shelbi status --full`](/docs/cli/status) prints a `## Linear` section (the
+  account, the filters, the board index age and last refresh, both buckets with
+  their reset times, and the request rate), and
+  [`shelbi doctor`](/docs/cli/doctor) projects the request rate against the
+  requests bucket.
+- **Board search** uses Linear's full-text search, scoped by the project's team
+  and filters, so it finds open and closed issues the board hasn't loaded.
+
+To move an existing board onto Linear (from the local board or from GitHub),
+use [`shelbi issue-store migrate --to linear`](/docs/cli/issue#issue-store-migrate),
+then `shelbi tracker linear connect` to point the project at it.
+
+## Statuses from Linear
+
+A project connected to Linear takes its statuses from the team's workflow
+states. `sync` writes `workflows/statuses.yaml` with one status per state, in
+Linear's order, marked `managed_by: linear`. Each status keeps the state's id
+as `external_id`. The board refresh re-syncs on its own when the states change
+in Linear (it checks at most every five minutes).
+
+- **Read-only in Settings.** Adding, renaming, reordering and deleting statuses
+  happens in Linear. Settings refuses those edits with "Statuses are managed by
+  Linear".
+- **Categories stay yours.** Each state gets a default category from its type:
+  triage and backlog are `backlog`, unstarted is `ready`, started is `active`
+  (or `handoff` when the name mentions review, QA, verification or testing),
+  completed is `done`, canceled is `archived`. Change a category in Settings and
+  later syncs keep your choice.
+- **Ids never change.** A new state's id is its name in kebab case (`In Review`
+  becomes `in-review`). When a state is renamed in Linear, only the name
+  changes, so issues and workflows that use the id keep working.
+- **Workflows reference statuses by id, as before.** A workflow that names a
+  status the team doesn't have fails to load, and the error lists the
+  available ones. `sync --rewrite-workflows` maps each missing status to the
+  first Linear status of the same category, keeping its owner, agent and tags,
+  and moves `initial_status` and transitions with it.

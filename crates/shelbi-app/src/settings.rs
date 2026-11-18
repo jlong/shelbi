@@ -59,6 +59,7 @@ pub mod properties;
 pub mod store;
 pub mod summary;
 pub mod terminal_preview;
+pub mod tracker;
 pub mod workflow_builder;
 pub mod workflow_editor;
 pub mod workflow_graph;

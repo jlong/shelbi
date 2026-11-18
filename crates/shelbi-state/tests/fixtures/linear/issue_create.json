@@ -1,0 +1,28 @@
+{
+  "data": {
+    "issueCreate": {
+      "success": true,
+      "issue": {
+        "id": "issue-3",
+        "identifier": "ENG-3",
+        "number": 3,
+        "title": "New issue",
+        "description": "",
+        "sortOrder": 300,
+        "url": "https://linear.app/acme/issue/ENG-3",
+        "createdAt": "2026-11-05T10:00:00.000Z",
+        "updatedAt": "2026-11-05T10:00:00.000Z",
+        "archivedAt": null,
+        "state": { "id": "state-backlog", "name": "Backlog", "type": "backlog" },
+        "assignee": { "id": "user-ada", "name": "Ada Lovelace", "displayName": "ada", "email": "ada@example.com" },
+        "labels": { "nodes": [] },
+        "project": null,
+        "attachments": { "nodes": [] }
+      }
+    },
+    "attachmentCreate": {
+      "success": true,
+      "attachment": { "id": "att-3", "url": "https://shelbi.dev/i/ENG/new-issue", "metadata": { "shelbi": { "id": "new-issue" } } }
+    }
+  }
+}

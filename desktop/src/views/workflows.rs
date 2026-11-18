@@ -27,6 +27,12 @@
 //! Both Edit YAML items open their file in the user's editor; when the
 //! window comes back to the front after one, the files are read again to
 //! show the hand edit.
+//!
+//! A catalog Linear manages (`managed_by: linear`,
+//! `WorkflowsState::read_only`) is read-only here except for each status's
+//! category: a banner says where to change it, the header offers Sync now
+//! (the tracker service's status sync, then a reload) in place of Edit YAML
+//! and New status, and the rows have no drag handle, name field or delete.
 
 use std::sync::Arc;
 use shelbi_app::source::{ProjectHandle, ProjectSource};
@@ -43,7 +49,7 @@ use shelbi_state::workflow_config::{StatusSummary, WorkflowConfig, WorkflowSumma
 
 use super::workflows_state::{
     category_help, category_label, commit, prepare_statuses_yaml, prepare_workflow_yaml, Committed, Draft, Edit,
-    Target, WorkflowsState, CATEGORIES, RENAME_NOTE, STATUSES_HELP, WORKFLOWS_HELP,
+    Target, WorkflowsState, CATEGORIES, RENAME_NOTE, STATUSES_HELP, SYNCING, SYNC_NOW, WORKFLOWS_HELP,
 };
 use crate::assets::{heroicon, icons, Icon};
 use crate::elements::controls;
@@ -143,6 +149,8 @@ pub struct WorkflowsPage {
     /// Where the Statuses section last painted (the editor's Manage project
     /// statuses scrolls it into view).
     statuses_anchor: style::Anchor,
+    /// Sync now's status sync (this machine's, or the far daemon's).
+    sync: Arc<dyn Fn() -> shelbi_app::tracker_connect::StatusSync + Send + Sync>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -176,6 +184,7 @@ impl WorkflowsPage {
             reload: false,
             reload_on_return: false,
             statuses_anchor: Default::default(),
+            sync: super::properties::tracker_service(handle).sync_statuses,
             _subscriptions: subscriptions,
         };
         // A test's page never reads the real `~/.shelbi`.
@@ -217,6 +226,35 @@ impl WorkflowsPage {
         &self.state
     }
 
+    /// Swap Sync now's sync (a test's, or the visual check's).
+    #[cfg(any(test, feature = "visual-check"))]
+    pub fn set_sync(&mut self, sync: Arc<dyn Fn() -> shelbi_app::tracker_connect::StatusSync + Send + Sync>) {
+        self.sync = sync;
+    }
+
+    /// Sync now: read the tracker's statuses into the catalog, then the
+    /// files again.
+    pub fn sync_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.begin_sync() {
+            return;
+        }
+        let sync = self.sync.clone();
+        let task = cx.background_executor().spawn(async move { sync() });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                this.state.synced(result);
+                if !cfg!(test) {
+                    this.load(window, cx);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
     /// Where the Statuses section painted, since
     /// [`forget_statuses_bounds`](Self::forget_statuses_bounds).
     pub fn statuses_bounds(&self) -> Option<gpui::Bounds<gpui::Pixels>> {
@@ -250,6 +288,11 @@ impl WorkflowsPage {
     /// statuses, the name put back in any that isn't being typed in (or in
     /// `reset`'s, whose edit was refused).
     fn sync_names(&mut self, reset: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.read_only().is_some() {
+            // A tracker's statuses are renamed there: no name fields.
+            self.names.clear();
+            return;
+        }
         let statuses = self.state.statuses();
         self.names.retain(|id, _| statuses.iter().any(|s| &s.id == id));
         for status in statuses {
@@ -932,6 +975,7 @@ impl WorkflowsPage {
     }
 
     fn render_statuses(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let managed = self.state.read_only().is_some();
         let edit_yaml = header_button("statuses-edit-yaml", icons::DOCUMENT_TEXT, "Edit YAML", theme)
         .on_click(cx.listener(|this, _, window, cx| this.edit_yaml(window, cx)));
         let new_status = header_button("statuses-new", icons::PLUS, "New status", theme)
@@ -945,6 +989,58 @@ impl WorkflowsPage {
                 cx,
             )
         }));
+        let header_buttons = if managed {
+            let sync = if self.state.syncing() {
+                style::disabled_content_button(
+                    "statuses-sync",
+                    style::ButtonContent::label(SYNCING).left(icons::ARROW_PATH),
+                    ButtonKind::Secondary,
+                    ButtonSize::Small,
+                    theme,
+                )
+            } else {
+                header_button("statuses-sync", icons::ARROW_PATH, SYNC_NOW, theme)
+                    .on_click(cx.listener(|this, _, window, cx| this.sync_now(window, cx)))
+            };
+            vec![sync.into_any_element()]
+        } else {
+            vec![edit_yaml.into_any_element(), new_status.into_any_element()]
+        };
+        let banner = self.state.banner().map(|text| {
+            let note = self.state.sync_note().map(|r| match r {
+                Ok(line) => (line.clone(), theme.form_hint),
+                Err(why) => (why.clone(), theme.error),
+            });
+            div()
+                .debug_selector(|| "statuses-managed".into())
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(10.0))
+                .w_full()
+                .p(px(12.0))
+                .rounded(px(6.0))
+                .border_1()
+                .border_color(theme.input_border)
+                .bg(theme.toolbar)
+                .child(heroicon(icons::LOCK_CLOSED).text_color(theme.icon))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .flex_1()
+                        .min_w_0()
+                        .child(div().type_style(Type::Small).text_color(theme.form_text).child(text))
+                        .children(note.map(|(line, color)| {
+                            div()
+                                .debug_selector(|| "statuses-sync-note".into())
+                                .type_style(Type::Small)
+                                .text_color(color)
+                                .child(line)
+                        })),
+                )
+        });
         let headings = div()
             .flex()
             .flex_row()
@@ -982,24 +1078,20 @@ impl WorkflowsPage {
             .w_full()
             .gap(px(24.0))
             .child(style::anchor_probe(&self.statuses_anchor))
-            .child(section_header(
-                "Statuses",
-                STATUSES_HELP,
-                vec![edit_yaml.into_any_element(), new_status.into_any_element()],
-                theme,
-            ))
+            .child(section_header("Statuses", STATUSES_HELP, header_buttons, theme))
+            .children(banner)
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(px(12.0))
                     .child(table(headings, rows, theme).debug_selector(|| "statuses-table".into()))
-                    .child(
+                    .children((!managed).then(|| {
                         div()
                             .type_style(Type::Small)
                             .text_color(theme.form_hint)
-                            .child(RENAME_NOTE),
-                    ),
+                            .child(RENAME_NOTE)
+                    })),
             )
             .child(
                 div()
@@ -1025,6 +1117,9 @@ impl WorkflowsPage {
     }
 
     fn render_status_row(&self, s: StatusSummary, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.state.read_only().is_some() {
+            return self.render_managed_row(s, theme, cx);
+        }
         let id = s.id.clone();
         let handle = {
             let drag = StatusDrag {
@@ -1131,6 +1226,73 @@ impl WorkflowsPage {
                     .child(s.used_in.join(", ")),
             )
             .child(delete);
+        let error = self
+            .state
+            .error_at(&Target::Status(id.clone()))
+            .map(|e| row_error(format!("status-error-{id}"), e, theme));
+        div().flex().flex_col().child(row).children(error).into_any_element()
+    }
+
+    /// A row of a catalog a tracker manages: no handle, the name as text,
+    /// no delete; only the category can be changed.
+    fn render_managed_row(&self, s: StatusSummary, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let id = s.id.clone();
+        let identity = div()
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .gap(px(8.0))
+            .w(px(IDENTITY_W))
+            .child(status_icon_box(s.category, theme))
+            .child(
+                div()
+                    .debug_selector({
+                        let id = id.clone();
+                        move || format!("status-name-{id}")
+                    })
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .type_style(Type::Base)
+                    .text_color(theme.form_text)
+                    .child(s.name.clone()),
+            );
+        let row = div()
+            .id(SharedString::from(format!("status-row-{id}")))
+            .debug_selector({
+                let id = id.clone();
+                move || format!("status-row-{id}")
+            })
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(12.0))
+            .p(px(12.0))
+            .child(div().w(px(20.0)).flex_none())
+            .child(identity)
+            .child(
+                div()
+                    .w(px(ID_W))
+                    .flex_none()
+                    .truncate()
+                    .font_family(PRIMARY_FAMILY)
+                    .text_size(px(14.0))
+                    .line_height(px(18.0))
+                    .text_color(theme.form_hint)
+                    .child(s.id.clone()),
+            )
+            .child(self.category_picker(Some(id.clone()), s.category, theme, cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .type_style(Type::Small)
+                    .text_color(theme.form_text)
+                    .child(s.used_in.join(", ")),
+            )
+            .child(div().w(px(ROW_BUTTON)).flex_none());
         let error = self
             .state
             .error_at(&Target::Status(id.clone()))

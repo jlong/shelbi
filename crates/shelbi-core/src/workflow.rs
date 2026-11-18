@@ -726,12 +726,25 @@ impl Workflow {
                     .map(|s| format!("`{s}`"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                workflow_err(format!(
-                    "workflow `{wf}`: status id `{id}` is not declared in \
-                     `workflows/statuses.yaml` (available: {available})",
-                    wf = self.name,
-                    id = st.id,
-                ))
+                match statuses.managed_by {
+                    // The catalog is a tracker's states: the fix is the
+                    // workflow, not statuses.yaml (which a re-sync rewrites).
+                    Some(tracker) => workflow_err(format!(
+                        "workflow `{wf}`: status `{id}` is not one of the {tracker} team's \
+                         statuses (statuses are managed by {tracker}; available: {available}). \
+                         Point the workflow at one of those, or run `shelbi tracker {token} \
+                         sync --rewrite-workflows` to map it by category",
+                        wf = self.name,
+                        id = st.id,
+                        token = tracker.as_str(),
+                    )),
+                    None => workflow_err(format!(
+                        "workflow `{wf}`: status id `{id}` is not declared in \
+                         `workflows/statuses.yaml` (available: {available})",
+                        wf = self.name,
+                        id = st.id,
+                    )),
+                }
             })?;
             st.name = known.name.clone();
             st.category = known.category;
@@ -3901,6 +3914,30 @@ statuses:
         assert!(msg.contains("`review`"), "msg: {msg}");
         assert!(msg.contains("`done`"), "msg: {msg}");
         assert!(msg.contains("`canceled`"), "msg: {msg}");
+    }
+
+    #[test]
+    fn resolve_against_a_linear_catalog_names_linear_and_the_rewrite() {
+        // A Linear-managed catalog: the fix is the workflow (or the
+        // rewrite command), never a hand edit of statuses.yaml.
+        let mut catalog = crate::ProjectStatuses::new(vec![
+            crate::ProjectStatus::new("todo", "Todo", StatusCategory::Ready),
+            crate::ProjectStatus::new("in-review", "In Review", StatusCategory::Handoff),
+            crate::ProjectStatus::new("done", "Done", StatusCategory::Done),
+        ]);
+        catalog.managed_by = Some(crate::TrackerName::Linear);
+        let wf = Workflow::from_yaml_str(
+            "name: task\nstatuses:\n  - { id: todo, owner: user }\n  - { id: review, owner: user }\n",
+        )
+        .unwrap();
+        let msg = wf.resolve_against(&catalog).unwrap_err().to_string();
+        assert!(msg.contains("workflow `task`: status `review`"), "msg: {msg}");
+        assert!(msg.contains("managed by Linear"), "msg: {msg}");
+        assert!(msg.contains("available: `todo`, `in-review`, `done`"), "msg: {msg}");
+        assert!(
+            msg.contains("shelbi tracker linear sync --rewrite-workflows"),
+            "msg: {msg}"
+        );
     }
 
     #[test]
