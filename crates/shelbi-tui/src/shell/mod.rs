@@ -168,7 +168,16 @@ enum SettingsMsg {
     PropertiesLoaded(Ticket, Box<Result<WorkflowConfig, String>>),
     /// The Properties page's save: the config as now on disk.
     PropertiesSaved(Ticket, Box<Result<WorkflowConfig, String>>),
+    /// A piece of the Issue tracker section's work, for a project.
+    Tracker(String, Box<settings::properties::TrackerDone>),
+    /// Workflows' Sync now, for a project.
+    StatusesSynced(String, shelbi_app::tracker_connect::StatusSync),
 }
+
+/// The tracker service for a project (Settings ▸ Properties' Issue tracker,
+/// Workflows' Sync now): this machine's in production, a test's fake.
+pub(crate) type TrackerServiceFor =
+    Arc<dyn Fn(&str) -> shelbi_app::settings::tracker::TrackerService + Send + Sync>;
 
 /// Reads the General summary for a project (blocking; run off the UI thread).
 type SettingsReader = Arc<dyn Fn(Option<&str>) -> GeneralSummary + Send + Sync>;
@@ -1591,6 +1600,8 @@ struct ShellState {
     /// Reads Settings ▸ Workflows' config (disk in production; in tests a
     /// refusal unless a test points it at its own `SHELBI_HOME`).
     workflows_reader: WorkflowsReader,
+    /// The Issue tracker section's and Sync now's service.
+    tracker_service: TrackerServiceFor,
     /// Detects General's installed tools (disk in production; a fixture in
     /// tests).
     tools_reader: ToolsReader,
@@ -1789,6 +1800,14 @@ impl ShellState {
         #[cfg(test)]
         let workflows_reader: WorkflowsReader = Arc::new(|_: &str| Err("tests read no ~/.shelbi".to_string()));
         #[cfg(not(test))]
+        let tracker_service: TrackerServiceFor = Arc::new(shelbi_orchestrator::tracker_connect::local_service);
+        #[cfg(test)]
+        let tracker_service: TrackerServiceFor = Arc::new(|_: &str| shelbi_app::settings::tracker::TrackerService {
+            connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("tests connect nothing".into()))),
+            linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+            sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
+        });
+        #[cfg(not(test))]
         let orchestrator_restarter: OrchestratorRestarter =
             Arc::new(|project| shelbi_app::settings::orchestrator::restart(project, None));
         #[cfg(test)]
@@ -1921,6 +1940,7 @@ impl ShellState {
             settings_store,
             orchestrator_restarter,
             workflows_reader,
+            tracker_service,
             tools_reader,
             panel_tools,
             keys_store,
@@ -3441,7 +3461,8 @@ impl ShellState {
                     self.settings.orchestrator_loaded(&ticket, Err(why));
                 }
                 settings::Load::Properties(ticket, _) => {
-                    self.settings.properties_loaded(&ticket, Err(why));
+                    let action = self.settings.properties_loaded(&ticket, Err(why));
+                    self.apply_settings_action(action);
                 }
             }
         }
@@ -3715,6 +3736,37 @@ impl ShellState {
         }
     }
 
+    /// Start the Issue tracker section's waiting work (Linear reads, a
+    /// connection) off the UI thread, one thread each. Each result comes
+    /// back under its project, so one for a project no longer shown is
+    /// dropped.
+    fn start_tracker_work(&mut self) {
+        let Some((project, work)) = self.settings.take_tracker_work() else {
+            return;
+        };
+        let service = (self.tracker_service)(&project);
+        for item in work {
+            let (tx, service, project) = (self.settings_tx.clone(), service.clone(), project.clone());
+            let _ = std::thread::Builder::new().name("shelbi-shell-tracker".into()).spawn(move || {
+                let done = item.run(&service);
+                let _ = tx.send(SettingsMsg::Tracker(project, Box::new(done)));
+            });
+        }
+    }
+
+    /// Workflows' Sync now off the UI thread.
+    fn sync_statuses(&mut self, project: String) {
+        let service = (self.tracker_service)(&project);
+        let tx = self.settings_tx.clone();
+        let spawned = std::thread::Builder::new().name("shelbi-shell-status-sync".into()).spawn(move || {
+            let sync = (service.sync_statuses)();
+            let _ = tx.send(SettingsMsg::StatusesSynced(project.clone(), sync));
+        });
+        if let Err(e) = spawned {
+            self.status = Some(format!("Couldn't start the sync: {e}"));
+        }
+    }
+
     /// Start the agent editor's waiting work (its read, save, duplicate or
     /// delete) off the UI thread, through the Agents page's reader. The
     /// result comes back under the work's ticket, so one for an editor (or
@@ -3873,7 +3925,21 @@ impl ShellState {
                     self.settings.orchestrator_restarted(&ticket, result);
                 }
                 SettingsMsg::PropertiesLoaded(ticket, config) => {
-                    self.settings.properties_loaded(&ticket, *config);
+                    let action = self.settings.properties_loaded(&ticket, *config);
+                    self.apply_settings_action(action);
+                }
+                SettingsMsg::Tracker(project, done) => {
+                    let (action, wrote) = self.settings.tracker_done(&project, *done);
+                    if wrote {
+                        // The board follows the new tracker.
+                        self.request_refresh();
+                    }
+                    self.apply_settings_action(action);
+                }
+                SettingsMsg::StatusesSynced(project, sync) => {
+                    let action = self.settings.statuses_synced(&project, sync);
+                    self.request_refresh();
+                    self.apply_settings_action(action);
                 }
                 SettingsMsg::PropertiesSaved(ticket, saved) => {
                     let landed = saved.is_ok();
@@ -4000,6 +4066,8 @@ impl ShellState {
             SettingsAction::Commit => self.start_workflows_commit(),
             SettingsAction::EditWorkflow { name, status } => self.edit_workflow(&name, status),
             SettingsAction::EditorWork => self.start_editor_work(),
+            SettingsAction::TrackerWork => self.start_tracker_work(),
+            SettingsAction::SyncStatuses(project) => self.sync_statuses(project),
             SettingsAction::AgentWork => self.start_agent_work(),
             SettingsAction::EditYaml(file) => self.edit_settings_file(file),
             SettingsAction::SaveKeys(change) => self.save_keys(change),
@@ -12906,8 +12974,9 @@ mod tests {
             "Default branch",
             "Default workflow",
             "task",
-            "Issue tracker  Files on disk",
             "▸ Advanced",
+            "Issue tracker",
+            "(•) Local board",
         ] {
             assert!(text.contains(want), "{want:?} on the page:\n{text}");
         }
@@ -12955,6 +13024,227 @@ mod tests {
         draw_frame(&mut term, &mut st).unwrap();
         assert!(screen_text(&term).contains("Use 1 to 3600 seconds."));
         assert_eq!(std::fs::read_to_string(&yaml).unwrap(), before, "nothing was written");
+        drop(home);
+    }
+
+    // --- Settings ▸ Properties ▸ Issue tracker (linear-settings-ui) ----------
+
+    /// A tracker service over canned Linear answers that records each
+    /// connection and refuses the first (the board has issues).
+    fn recording_tracker(
+        asked: Arc<std::sync::Mutex<Vec<shelbi_app::tracker_connect::ConnectTracker>>>,
+    ) -> TrackerServiceFor {
+        use shelbi_app::tracker_connect::{ConnectError, Connected, StatusSync};
+        Arc::new(move |_: &str| {
+            let asked = asked.clone();
+            shelbi_app::settings::tracker::TrackerService {
+                connect: Arc::new(move |req| {
+                    let mut asked = asked.lock().unwrap();
+                    asked.push(req);
+                    if asked.len() == 1 {
+                        return Err(ConnectError::NotEmpty {
+                            from: shelbi_core::IssueTrackerBackend::FileSystem,
+                            to: shelbi_core::IssueTrackerBackend::Linear,
+                            issues: 2,
+                            message: "project `proj` has 2 issues on the local file system; switching to Linear \
+                                      (ENG) would leave them behind. Move them first with `shelbi issue-store \
+                                      migrate --to linear`, or switch anyway."
+                                .into(),
+                        });
+                    }
+                    Ok(Connected {
+                        backend: shelbi_core::IssueTrackerBackend::Linear,
+                        previous: shelbi_core::IssueTrackerBackend::FileSystem,
+                        file: "proj.yaml".into(),
+                        summary: "Linear: ENG (Engineering)".into(),
+                        statuses: StatusSync::Synced("6 statuses from the Linear team".into()),
+                    })
+                }),
+                linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+                sync_statuses: Arc::new(|| StatusSync::Synced("6 statuses from the Linear team".into())),
+            }
+        })
+    }
+
+    /// Move the Properties page's cursor onto `item`.
+    fn cursor_to(st: &mut ShellState, item: settings::properties::Item) {
+        for _ in 0..40 {
+            let p = st.settings.properties();
+            let at = p.items().iter().position(|i| *i == item).unwrap_or_else(|| panic!("{item:?} isn't a stop"));
+            match at.cmp(&p.cursor()) {
+                std::cmp::Ordering::Equal => return,
+                std::cmp::Ordering::Greater => press(st, KeyCode::Down),
+                std::cmp::Ordering::Less => press(st, KeyCode::Up),
+            }
+        }
+        panic!("the cursor never reached {item:?}");
+    }
+
+    fn capture_screen(st: &mut ShellState, name: &str) -> String {
+        // Tall enough for the whole page: the captures show it unscrolled.
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(110, 150)).unwrap();
+        draw_frame(&mut term, st).unwrap();
+        let text = screen_text(&term);
+        if let Some(dir) = std::env::var_os("SHELBI_TUI_CAPTURE") {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{name}.txt")), &text);
+        }
+        text
+    }
+
+    #[test]
+    fn the_issue_tracker_section_connects_linear_from_the_keys_and_forces_a_refused_switch() {
+        use settings::properties::{Item, TrackerItem};
+        use shelbi_app::linear_setup::Filter;
+        use shelbi_app::new_project::Tracker;
+        let home = agents_home("tracker");
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        st.tracker_service = recording_tracker(asked.clone());
+        st.dispatch_effect(Effect::OpenSettings);
+        type_key(&mut st, '4');
+        settle_agents(&mut st, "the config loads", |st| st.settings.properties().tracker().loaded());
+        press(&mut st, KeyCode::Tab);
+
+        // →→ on the boards: GitHub, then Linear (the cursor follows).
+        cursor_to(&mut st, Item::Tracker(TrackerItem::Choice(Tracker::FileSystem)));
+        press(&mut st, KeyCode::Right);
+        press(&mut st, KeyCode::Right);
+        assert_eq!(st.settings.properties().tracker().tracker(), Tracker::Linear);
+        settle_agents(&mut st, "the teams and the account load", |st| {
+            st.settings.properties().tracker().linear().account().is_some()
+        });
+
+        // The team with →, then Assignee → Me.
+        cursor_to(&mut st, Item::Tracker(TrackerItem::Team));
+        press(&mut st, KeyCode::Right);
+        assert_eq!(st.settings.properties().tracker().linear().team(), "ENG");
+        settle_agents(&mut st, "the team's lists load", |st| {
+            st.settings.properties().items().contains(&Item::Tracker(TrackerItem::Filter(Filter::Assignee)))
+                && st.settings.properties().tracker().linear().filter_options(Filter::Assignee).loaded().is_some()
+        });
+        cursor_to(&mut st, Item::Tracker(TrackerItem::Filter(Filter::Assignee)));
+        press(&mut st, KeyCode::Right);
+        assert_eq!(st.settings.properties().tracker().linear().filter(Filter::Assignee), Some("me"));
+        let text = capture_screen(&mut st, "settings-tracker-linear");
+        for want in [
+            "Issue tracker",
+            "(•) Linear",
+            "Linear account  Ada Lovelace <ada@example.com>",
+            "Change key…",
+            "ENG  Engineering",
+            "Shelbi shows and creates issues in ENG, assigned to you.",
+            "[ Connect ]",
+        ] {
+            assert!(text.contains(want), "{want:?} on the page:\n{text}");
+        }
+
+        // Connect: refused, with the migrate hint and Switch anyway.
+        cursor_to(&mut st, Item::Tracker(TrackerItem::Primary));
+        press(&mut st, KeyCode::Enter);
+        settle_agents(&mut st, "the connection is refused", |st| st.settings.properties().tracker().offers_force());
+        let text = capture_screen(&mut st, "settings-tracker-refused");
+        assert!(text.contains("migrate --to linear") && text.contains("[ Switch anyway ]"), "{text}");
+        cursor_to(&mut st, Item::Tracker(TrackerItem::Force));
+        press(&mut st, KeyCode::Enter);
+        settle_agents(&mut st, "the forced connection lands", |st| {
+            st.settings.properties().tracker().last_connected().is_some()
+        });
+        let asked = asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), 2);
+        assert!(!asked[0].force && asked[1].force);
+        let shelbi_app::tracker_connect::TrackerChoice::Linear(conn) = &asked[1].choice else { panic!("{asked:?}") };
+        assert_eq!((conn.team.as_str(), conn.assignee.as_deref()), ("ENG", Some("me")));
+        drop(home);
+    }
+
+    #[test]
+    fn the_tracker_sections_key_field_masks_a_pasted_key_and_verifies_it() {
+        use settings::properties::{Item, TrackerItem};
+        use shelbi_app::new_project::Tracker;
+        let home = agents_home("tracker-key");
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
+        st.tracker_service = Arc::new(|_: &str| shelbi_app::settings::tracker::TrackerService {
+            connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("unused".into()))),
+            linear: Arc::new(shelbi_app::linear_setup::fixture::no_key),
+            sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
+        });
+        st.dispatch_effect(Effect::OpenSettings);
+        type_key(&mut st, '4');
+        settle_agents(&mut st, "the config loads", |st| st.settings.properties().tracker().loaded());
+        press(&mut st, KeyCode::Tab);
+        cursor_to(&mut st, Item::Tracker(TrackerItem::Choice(Tracker::Linear)));
+        press(&mut st, KeyCode::Enter);
+        settle_agents(&mut st, "no key", |st| st.settings.properties().tracker().linear().needs_key());
+        let text = capture_screen(&mut st, "settings-tracker-no-key");
+        for want in ["Not connected. Paste a personal API key.", "Linear API key", "Verify an API key first"] {
+            assert!(text.contains(want), "{want:?} on the page:\n{text}");
+        }
+        cursor_to(&mut st, Item::Tracker(TrackerItem::Key));
+        press(&mut st, KeyCode::Enter);
+        assert!(st.settings.paste("lin_api_secret"));
+        let text = capture_screen(&mut st, "settings-tracker-key-typed");
+        assert!(text.contains("••••••••••••••") && !text.contains("lin_api_secret"), "masked:\n{text}");
+        // Once the key is stored, Linear answers with it.
+        st.tracker_service = Arc::new(|_: &str| shelbi_app::settings::tracker::TrackerService {
+            connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("unused".into()))),
+            linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+            sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
+        });
+        press(&mut st, KeyCode::Enter);
+        settle_agents(&mut st, "the key is stored and the teams load", |st| {
+            !st.settings.properties().tracker().linear().needs_key()
+                && st.settings.properties().tracker().linear().teams().loaded().is_some()
+        });
+        drop(home);
+    }
+
+    #[test]
+    fn a_linear_managed_catalog_is_read_only_but_its_categories_and_sync_now() {
+        let home = agents_home("managed");
+        shelbi_app::settings::workflows::fixture::write_linear_project(&shelbi_state::projects_dir().unwrap(), "proj");
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
+        st.tracker_service = recording_tracker(Arc::new(std::sync::Mutex::new(Vec::new())));
+        st.dispatch_effect(Effect::OpenSettings);
+        type_key(&mut st, '8');
+        settle_agents(&mut st, "the workflows load", |st| {
+            st.settings.workflows().state().is_some_and(|s| s.config().is_some())
+        });
+        let text = capture_screen(&mut st, "settings-statuses-managed");
+        assert!(text.contains("Statuses are managed by Linear (team ENG)."), "{text}");
+        assert!(text.contains("Sync now") && !text.contains("New status") && !text.contains("Renaming a status"), "{text}");
+
+        // Into the page, onto the review row: Enter changes its category,
+        // not its name.
+        press(&mut st, KeyCode::Tab);
+        for _ in 0..30 {
+            if st.settings.workflows().cursor_item() == Some(settings::WorkflowsItem::Status("review".into())) {
+                break;
+            }
+            press(&mut st, KeyCode::Down);
+        }
+        press(&mut st, KeyCode::Char('e'));
+        press(&mut st, KeyCode::Char('x'));
+        assert!(!st.settings.workflows().modal_open(), "no rename, no delete");
+        press(&mut st, KeyCode::Enter);
+        assert!(st.settings.workflows().modal_open(), "the category picker");
+        press(&mut st, KeyCode::Up);
+        press(&mut st, KeyCode::Enter);
+        settle_agents(&mut st, "the category saves", |st| {
+            st.settings.workflows().state().and_then(|s| s.config()).and_then(|c| c.status("review")).map(|s| s.category)
+                == Some(shelbi_core::StatusCategory::Active)
+        });
+
+        // S syncs now.
+        press(&mut st, KeyCode::Char('S'));
+        settle_agents(&mut st, "the sync lands", |st| {
+            st.settings.workflows().state().is_some_and(|s| s.sync_note().is_some())
+        });
+        let text = capture_screen(&mut st, "settings-statuses-synced");
+        assert!(text.contains("Synced: 6 statuses from the Linear team."), "{text}");
         drop(home);
     }
 

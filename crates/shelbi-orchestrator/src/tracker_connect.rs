@@ -82,6 +82,34 @@ pub fn sync_linear_statuses(project: &str, _filters: &ResolvedLinearFilters) -> 
     }
 }
 
+/// Settings' tracker service for `project` on this machine: the connection,
+/// the Linear pickers' reads (with the project's key) and the status sync,
+/// each run in this process. A far project's goes through its daemon
+/// ([`shelbi_app::settings::tracker::TrackerService::far`]).
+pub fn local_service(project: &str) -> shelbi_app::settings::tracker::TrackerService {
+    let (a, b, c) = (project.to_string(), project.to_string(), project.to_string());
+    shelbi_app::settings::tracker::TrackerService {
+        connect: std::sync::Arc::new(move |req| apply_tracker_connection(&a, &req)),
+        linear: std::sync::Arc::new(move |req| linear::answer(Some(&b), req)),
+        sync_statuses: std::sync::Arc::new(move || sync_statuses_now(&c)),
+    }
+}
+
+/// Sync `project`'s status catalog from its Linear team now (Settings'
+/// "Sync now"): the same sync a connection runs, reported the same way. A
+/// project not on Linear has nothing to sync.
+pub fn sync_statuses_now(project: &str) -> StatusSync {
+    match shelbi_state::load_project(project) {
+        Ok(p) if p.issue_tracker.backend == IssueTrackerBackend::Linear => {}
+        Ok(_) => return StatusSync::NotNeeded,
+        Err(e) => return StatusSync::Failed(e.to_string()),
+    }
+    match shelbi_state::linear_statuses::connect(project) {
+        Ok(done) => StatusSync::Synced(status_sync_line(&done)),
+        Err(e) => StatusSync::Failed(e.to_string()),
+    }
+}
+
 /// `7 statuses from the team (3 changed); 1 workflow can be mapped onto
 /// them: shelbi tracker linear sync --rewrite-workflows`.
 fn status_sync_line(done: &shelbi_state::linear_statuses::Connected) -> String {

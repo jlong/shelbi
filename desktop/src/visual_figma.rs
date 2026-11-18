@@ -2719,6 +2719,227 @@ impl Run {
         self.cx.update(crate::theme::motion::sync_reduce_motion);
     }
 
+    /// Linear as a tracker (`linear-settings-ui`), over canned Linear answers
+    /// (`shelbi_app::linear_setup::fixture`; nothing reads Linear): the Add
+    /// Project wizard's Issues screen with Linear chosen and no key yet
+    /// (`add-project-linear-no-key`) and with a team and filters picked
+    /// (`add-project-linear`); Settings ▸ Properties' Issue tracker section on
+    /// Linear (`settings-tracker-linear`), with no key
+    /// (`settings-tracker-no-key`) and a switch refused because the board has
+    /// issues (`settings-tracker-refused`); and Settings ▸ Workflows over a
+    /// catalog Linear manages after a Sync now (`settings-statuses-managed`).
+    /// `SHELBI_VISUAL_ONLY=linear` renders just these.
+    fn linear_windows(&mut self) {
+        use crate::views::add_project::{AddProjectView, Engine, SIZE};
+        use crate::views::linear_fields::Msg;
+        use crate::views::settings_nav::SettingsPage;
+        use shelbi_app::add_project_wizard::{FolderCheck, Focus, Origin, Repo, Tracker};
+        use shelbi_app::linear_setup::{fixture, Filter, LinearAnswer, LinearRequest};
+        use shelbi_app::settings::tracker::TrackerService;
+        use shelbi_app::tracker_connect::{ConnectError, StatusSync};
+        use shelbi_core::IssueTrackerBackend;
+
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/Users/me"));
+        let folder = home.join("Projects/my-project");
+        let picks = [
+            Msg::Team("ENG".into()),
+            Msg::Filter(Filter::Project, "Shelbi".into()),
+            Msg::Filter(Filter::Label, "shelbi".into()),
+            Msg::Filter(Filter::Assignee, "me".into()),
+        ];
+        type Answer = fn(LinearRequest) -> LinearAnswer;
+        let wizard_states: [(&str, Answer, bool); 2] =
+            [("add-project-linear-no-key", fixture::no_key, false), ("add-project-linear", fixture::answer, true)];
+        for (screen, linear, pick) in wizard_states {
+            let engine = Engine {
+                check: Arc::new({
+                    let home = home.clone();
+                    move |_, root, _| {
+                        let path = shelbi_orchestrator::project_create::absolutize(&home, Path::new(root.trim()));
+                        FolderCheck {
+                            in_repo_dir: path.join(".shelbi"),
+                            global_dir: Some(home.join(".shelbi/projects/my-project")),
+                            path,
+                            name: Some("My project".into()),
+                            slug: Some("my-project".into()),
+                            repo: Some(Repo::Git),
+                            problem: None,
+                            facts: Default::default(),
+                        }
+                    }
+                }),
+                create: Arc::new(|_, _, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
+                refresh: Arc::new(|| {}),
+                preflight: Arc::new(|_| Ok(())),
+                linear: Arc::new(linear),
+            };
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                    cx.new(|cx| {
+                        AddProjectView::new(Origin::Workspace, None, home.clone(), engine, Rc::new(|_, _, _| Ok(())), window, cx)
+                    })
+                })
+                .expect("open the offscreen window");
+            let view = handle.entity(&self.cx).expect("the view");
+            let window: AnyWindowHandle = handle.into();
+            self.cx
+                .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.folder_picked(Some(&folder), window, cx)))
+                .unwrap();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |v, cx| {
+                        v.click(Focus::Primary, window, cx);
+                        v.click(Focus::Primary, window, cx);
+                        v.click(Focus::Tracker(Tracker::Linear), window, cx);
+                    })
+                })
+                .unwrap();
+            self.settle_sheet(window);
+            if pick {
+                for msg in picks.clone() {
+                    self.cx
+                        .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.linear_msg(msg, window, cx)))
+                        .unwrap();
+                    self.settle_sheet(window);
+                }
+            }
+            let shown = view.read_with(&self.cx, |v, _| {
+                let linear = v.wizard().issues().linear();
+                if pick { linear.scope_line().is_some() } else { linear.needs_key() }
+            });
+            self.expect(&format!("{screen}: the Linear card's state"), shown);
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+
+        // Settings ▸ Properties' Issue tracker section.
+        let service = |linear: Answer, refuse: bool| TrackerService {
+            connect: Arc::new(move |_| {
+                if refuse {
+                    Err(ConnectError::NotEmpty {
+                        from: IssueTrackerBackend::FileSystem,
+                        to: IssueTrackerBackend::Linear,
+                        issues: 12,
+                        message: "project `my-project` has 12 issues on the local file system; switching to Linear \
+                                  (ENG) would leave them behind. Move them first with `shelbi issue-store migrate \
+                                  --to linear`, or switch anyway."
+                            .into(),
+                    })
+                } else {
+                    Err(ConnectError::Failed("offscreen".into()))
+                }
+            }),
+            linear: Arc::new(linear),
+            sync_statuses: Arc::new(|| StatusSync::NotNeeded),
+        };
+        let tracker_states: [(&str, Answer, bool, bool); 3] = [
+            ("settings-tracker-linear", fixture::answer, true, false),
+            ("settings-tracker-no-key", fixture::no_key, false, false),
+            ("settings-tracker-refused", fixture::answer, true, true),
+        ];
+        for (screen, linear, pick, refuse) in tracker_states {
+            let handle = self.open();
+            handle
+                .update(&mut self.cx, |w, window, cx| w.offscreen_open_settings(SettingsPage::Properties, window, cx))
+                .unwrap();
+            self.settle(handle);
+            let page = handle
+                .update(&mut self.cx, |w, _, cx| w.offscreen_settings().map(|v| v.read(cx).properties()))
+                .unwrap()
+                .expect("Settings is open");
+            let section = page.read_with(&self.cx, |p, _| p.tracker());
+            let svc = service(linear, refuse);
+            handle
+                .update(&mut self.cx, |_, window, cx| {
+                    section.update(cx, |s, cx| {
+                        s.set_service(svc);
+                        s.select(Tracker::Linear, window, cx);
+                    })
+                })
+                .unwrap();
+            self.settle(handle);
+            if pick {
+                for msg in picks.clone() {
+                    handle
+                        .update(&mut self.cx, |_, window, cx| section.update(cx, |s, cx| s.msg(msg, window, cx)))
+                        .unwrap();
+                    self.settle(handle);
+                }
+            }
+            if refuse {
+                handle
+                    .update(&mut self.cx, |_, window, cx| section.update(cx, |s, cx| s.connect(false, window, cx)))
+                    .unwrap();
+                self.settle(handle);
+            }
+            let ok = section.read_with(&self.cx, |s, _| {
+                let f = s.form();
+                match screen {
+                    "settings-tracker-no-key" => f.linear().needs_key(),
+                    "settings-tracker-refused" => f.offers_force(),
+                    _ => f.scope_line().is_some() && f.primary_enabled(),
+                }
+            });
+            self.expect(&format!("{screen}: the section's state"), ok);
+            // The section sits under the page's other fields.
+            handle
+                .update(&mut self.cx, |w, _, cx| {
+                    if let Some(v) = w.offscreen_settings() {
+                        v.update(cx, |v, cx| v.offscreen_scroll_to_end(cx));
+                    }
+                })
+                .unwrap();
+            self.settle(handle);
+            self.settle(handle);
+            self.save(handle, screen);
+        }
+
+        // Settings ▸ Workflows over a catalog Linear manages.
+        let workflows = shelbi_state::workflows_dir(PROJECT).expect("the workflows directory");
+        let project_dir = workflows.parent().expect("the project directory").to_path_buf();
+        let agents = project_dir.join("agents");
+        let had_agents = agents.exists();
+        let yaml = shelbi_state::projects_dir().expect("the projects directory").join(format!("{PROJECT}.yaml"));
+        let before = std::fs::read_to_string(&yaml).ok();
+        crate::views::workflows_state::fixture::write(&project_dir);
+        std::fs::write(workflows.join("statuses.yaml"), crate::views::workflows_state::fixture::MANAGED_STATUSES)
+            .expect("write the managed catalog");
+        if let Some(text) = &before {
+            std::fs::write(&yaml, format!("{text}issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n"))
+                .expect("put the project on Linear");
+        }
+        let handle = self.open();
+        handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_open_settings(SettingsPage::Workflows, window, cx))
+            .unwrap();
+        self.settle(handle);
+        let page = handle
+            .update(&mut self.cx, |w, _, cx| w.offscreen_settings().map(|v| v.read(cx).workflows()))
+            .unwrap()
+            .expect("Settings is open");
+        handle
+            .update(&mut self.cx, |_, window, cx| {
+                page.update(cx, |p, cx| {
+                    p.set_sync(Arc::new(|| StatusSync::Synced("6 statuses from the Linear team".into())));
+                    p.sync_now(window, cx);
+                })
+            })
+            .unwrap();
+        self.settle(handle);
+        let managed = page.read_with(&self.cx, |p, _| p.state().read_only().is_some() && p.state().sync_note().is_some());
+        self.expect("settings-statuses-managed: the banner and the sync's line", managed);
+        self.save(handle, "settings-statuses-managed");
+        let _ = std::fs::remove_dir_all(&workflows);
+        if !had_agents {
+            let _ = std::fs::remove_dir_all(&agents);
+        }
+        if let Some(text) = before {
+            let _ = std::fs::write(&yaml, text);
+        }
+    }
+
     /// The first launch's CLI setup (`dt-wizard-cli-setup`) in the wizard's
     /// 800 × 580, over scripted bootstrap states (nothing runs): `cli-
     /// check` (looking for the CLI, Figma 2478:8507), `cli-install` (an
@@ -3123,6 +3344,11 @@ impl Run {
 
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "add-project") {
             self.add_project_windows();
+            return;
+        }
+
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "linear") {
+            self.linear_windows();
             return;
         }
 

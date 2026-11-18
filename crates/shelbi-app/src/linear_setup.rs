@@ -28,6 +28,9 @@
 //!    [`TEAM_REQUIRED`]): the key works, every filter resolves, and the key
 //!    can create issues in the team. Continue moves on once the connection
 //!    as chosen now has passed ([`LinearChoice::ready`]).
+//! 4. [`LinearRequest::Viewer`] once nothing else is due and the key works
+//!    but whose it is isn't known yet: the account row's name (Settings
+//!    shows it beside "Change key…").
 
 use serde::{Deserialize, Serialize};
 use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig, LinearConnection};
@@ -57,6 +60,19 @@ pub const ANY: &str = "Any";
 pub const ME: &str = "me";
 /// Continue was pressed with no team.
 pub const TEAM_REQUIRED: &str = "Choose the Linear team this project's issues live in.";
+/// The account row's label, its button while a key works, and what it says
+/// with no working key.
+pub const ACCOUNT_LABEL: &str = "Linear account";
+pub const CHANGE_KEY: &str = "Change key…";
+pub const NOT_CONNECTED: &str = "Not connected. Paste a personal API key.";
+/// The key field's button: check the pasted key with Linear and store it.
+pub const VERIFY: &str = "Verify";
+/// The key field's placeholder.
+pub const KEY_PLACEHOLDER: &str = "lin_api_…";
+/// A picker whose rows are being read.
+pub const LOADING: &str = "Loading…";
+/// The team picker before one is picked.
+pub const CHOOSE_TEAM: &str = "Choose a team";
 
 /// One of the optional filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -222,6 +238,9 @@ pub enum LinearRequest {
     /// The full check before a connection is written
     /// (`project_create::linear::linear_preflight`).
     Preflight(LinearConnection),
+    /// Whose the working key is (the account row), once the teams proved
+    /// it works.
+    Viewer,
 }
 
 /// Why a read failed, as far as the key is concerned.
@@ -260,6 +279,8 @@ pub enum LinearAnswer {
     /// `connection` passed (with a one-line summary of what it resolved to)
     /// or failed with the fix to show.
     Preflight { connection: LinearConnection, result: Result<String, String> },
+    /// The key's owner, as a label (`Ada Lovelace <ada@example.com>`).
+    Viewer(Result<String, LinearFailure>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,6 +320,10 @@ pub struct LinearChoice {
     verified: Option<(LinearConnection, String)>,
     /// Why Continue was refused, or the last preflight failed.
     error: Option<String>,
+    /// The key's owner was asked for ([`LinearRequest::Viewer`]).
+    viewer_asked: bool,
+    /// "Change key…" opened the key field over a working key.
+    changing_key: bool,
 }
 
 impl LinearChoice {
@@ -311,9 +336,79 @@ impl LinearChoice {
         &self.key
     }
 
-    /// The key field shows: there's no working key yet.
+    /// The key field shows: there's no working key yet, or "Change key…"
+    /// opened it.
     pub fn needs_key(&self) -> bool {
-        matches!(self.key, KeyState::Missing | KeyState::Rejected(_))
+        self.changing_key || matches!(self.key, KeyState::Missing | KeyState::Rejected(_))
+    }
+
+    /// The key field shows over a working key ("Change key…"), so it can be
+    /// closed again ([`Self::cancel_change_key`]).
+    pub fn changing_key(&self) -> bool {
+        self.changing_key
+    }
+
+    /// "Change key…": show the key field to paste another key. The working
+    /// key stays in use until a new one is stored.
+    pub fn change_key(&mut self) {
+        if matches!(self.key, KeyState::Valid { .. }) {
+            self.changing_key = true;
+            self.error = None;
+        }
+    }
+
+    /// Close the key field "Change key…" opened, keeping the working key.
+    pub fn cancel_change_key(&mut self) {
+        if self.changing_key && self.login.is_none() {
+            self.changing_key = false;
+            self.key_input.clear();
+            self.error = None;
+        }
+    }
+
+    /// The account row: whose the working key is, `None` while there's no
+    /// working key ([`NOT_CONNECTED`] shows) or it hasn't been read yet.
+    pub fn account(&self) -> Option<&str> {
+        match &self.key {
+            KeyState::Valid { viewer } => viewer.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// Why the key was refused, while the key field shows for it.
+    pub fn key_error(&self) -> Option<&str> {
+        match &self.key {
+            KeyState::Rejected(why) => Some(why),
+            _ => None,
+        }
+    }
+
+    /// One sentence saying what the connection as picked shows and creates:
+    /// `Shelbi shows and creates issues in ENG, project Shelbi, labeled
+    /// shelbi, assigned to you.` `None` until a team is picked.
+    pub fn scope_line(&self) -> Option<String> {
+        let team = self.connection.team_ref()?;
+        let team = self.team_option().map(|t| t.label.clone()).unwrap_or_else(|| team.to_string());
+        let shown = |filter: Filter| -> Option<String> {
+            let wanted = self.filter(filter)?;
+            Some(match self.filter_option(filter) {
+                Some(row) if !row.value.is_empty() => row.label,
+                _ => wanted.to_string(),
+            })
+        };
+        let mut parts = vec![team];
+        if let Some(project) = shown(Filter::Project) {
+            parts.push(format!("project {project}"));
+        }
+        if let Some(label) = shown(Filter::Label) {
+            parts.push(format!("labeled {label}"));
+        }
+        match self.filter(Filter::Assignee) {
+            Some(a) if a.eq_ignore_ascii_case(ME) => parts.push("assigned to you".into()),
+            Some(_) => parts.push(format!("assigned to {}", shown(Filter::Assignee).unwrap_or_default())),
+            None => {}
+        }
+        Some(format!("Shelbi shows and creates issues in {}.", parts.join(", ")))
     }
 
     /// The key field's text.
@@ -469,6 +564,29 @@ impl LinearChoice {
         }
     }
 
+    /// The next (or previous) loaded team: an arrow key on the team
+    /// picker. From no team, forward picks the first.
+    pub fn step_team(&mut self, forward: bool) {
+        let Some(rows) = self.teams.loaded() else { return };
+        let at = self.team_option().and_then(|t| rows.iter().position(|r| r == t));
+        if let Some(next) = step_index(rows.len(), at, forward) {
+            let team = rows[next].value.clone();
+            self.select_team(&team);
+        }
+    }
+
+    /// The next (or previous) row of a filter's picker (Any first):
+    /// an arrow key on it.
+    pub fn step_filter(&mut self, filter: Filter, forward: bool) {
+        let rows = self.filter_options(filter);
+        let Some(rows) = rows.loaded() else { return };
+        let at = self.filter_option(filter).and_then(|o| rows.iter().position(|r| *r == o));
+        if let Some(next) = step_index(rows.len(), at, forward) {
+            let value = rows[next].value.clone();
+            self.select_filter(filter, Some(&value));
+        }
+    }
+
     /// The key field's text changed.
     pub fn set_key_input(&mut self, text: impl Into<String>) {
         self.key_input = text.into();
@@ -541,10 +659,11 @@ impl LinearChoice {
             }
             None => {}
         }
-        if self.teams == Loadable::Idle && !self.needs_key() {
+        if self.teams == Loadable::Idle && !matches!(self.key, KeyState::Missing | KeyState::Rejected(_)) {
             self.teams = Loadable::Loading;
             return Some(LinearRequest::Teams);
         }
+
         if let Some(team_id) = self.team_id() {
             if self.lists.as_ref().is_none_or(|l| l.team_id != team_id) {
                 self.lists = Some(Lists {
@@ -560,6 +679,11 @@ impl LinearChoice {
             let connection = self.connection();
             self.preflight = Some(Preflight::Running(connection.clone()));
             return Some(LinearRequest::Preflight(connection));
+        }
+        // Last: whose the key is, for the account row (nothing waits on it).
+        if matches!(self.key, KeyState::Valid { viewer: None }) && !self.viewer_asked {
+            self.viewer_asked = true;
+            return Some(LinearRequest::Viewer);
         }
         None
     }
@@ -596,15 +720,29 @@ impl LinearChoice {
                 match result {
                     Ok(viewer) => {
                         self.key = KeyState::Valid { viewer: Some(viewer) };
+                        self.changing_key = false;
                         self.key_input.clear();
                         self.teams = Loadable::Idle;
                         self.error = None;
+                    }
+                    Err(failure) if self.changing_key => {
+                        // The working key stays; the field says why the new
+                        // one wasn't taken.
+                        self.error = Some(failure.message().to_string());
                     }
                     Err(failure) => {
                         self.key = KeyState::Rejected(failure.message().to_string());
                     }
                 }
             }
+            LinearAnswer::Viewer(result) => match result {
+                Ok(viewer) => {
+                    if let KeyState::Valid { viewer: shown @ None } = &mut self.key {
+                        *shown = Some(viewer);
+                    }
+                }
+                Err(failure) => self.note_key_failure(&failure),
+            },
             LinearAnswer::TeamLists { team_id, projects, labels, users } => {
                 if let Some(lists) = self.lists.as_mut().filter(|l| l.team_id == team_id) {
                     lists.projects = Loadable::from_result(projects);
@@ -642,6 +780,71 @@ impl LinearChoice {
             LinearFailure::Other(_) => {}
         }
     }
+}
+
+/// Canned Linear answers for the clients' tests and the desktop's visual
+/// check: teams ENG (Engineering) and DES (Design), ENG's projects, labels
+/// and members, and Ada Lovelace's key. Nothing here reads Linear.
+#[doc(hidden)]
+pub mod fixture {
+    use super::*;
+
+    fn row(id: &str, value: &str, label: &str, detail: Option<&str>) -> PickOption {
+        PickOption { id: id.into(), value: value.into(), label: label.into(), detail: detail.map(str::to_string) }
+    }
+
+    /// Whose the key is.
+    pub const VIEWER: &str = "Ada Lovelace <ada@example.com>";
+
+    /// The answer to `request` with a working key.
+    pub fn answer(request: LinearRequest) -> LinearAnswer {
+        match request {
+            LinearRequest::Teams => LinearAnswer::Teams(Ok(vec![
+                row("team-eng", "ENG", "ENG", Some("Engineering")),
+                row("team-des", "DES", "DES", Some("Design")),
+            ])),
+            LinearRequest::Viewer => LinearAnswer::Viewer(Ok(VIEWER.into())),
+            LinearRequest::Login(_) => LinearAnswer::Login(Ok(VIEWER.into())),
+            LinearRequest::TeamLists { team_id } => LinearAnswer::TeamLists {
+                team_id,
+                projects: Ok(vec![
+                    row("proj-shelbi", "Shelbi", "Shelbi", Some("In Progress")),
+                    row("proj-site", "Website", "Website", Some("Planned")),
+                ]),
+                labels: Ok(vec![row("label-shelbi", "shelbi", "shelbi", None), row("label-bug", "Bug", "Bug", None)]),
+                users: Ok(vec![
+                    row("user-ada", "ada@example.com", "Ada Lovelace", Some("ada@example.com")),
+                    row("user-alan", "alan@example.com", "Alan Turing", Some("alan@example.com")),
+                ]),
+            },
+            LinearRequest::Preflight(connection) => {
+                let team = connection.team.clone();
+                LinearAnswer::Preflight { connection, result: Ok(format!("{team} (Engineering)")) }
+            }
+        }
+    }
+
+    /// The answer to `request` on a machine with no key yet (a pasted key
+    /// logs in, after which [`answer`] applies).
+    pub fn no_key(request: LinearRequest) -> LinearAnswer {
+        match request {
+            LinearRequest::Teams => LinearAnswer::Teams(Err(LinearFailure::MissingKey(KEY_MISSING.into()))),
+            other => answer(other),
+        }
+    }
+}
+
+/// The row an arrow moves to among `len`, from `at` (none: the first),
+/// wrapping. `None` for an empty list.
+fn step_index(len: usize, at: Option<usize>, forward: bool) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match at {
+        None => 0,
+        Some(i) if forward => (i + 1) % len,
+        Some(i) => (i + len - 1) % len,
+    })
 }
 
 #[cfg(test)]
@@ -684,7 +887,10 @@ mod tests {
         c.answer(LinearAnswer::Teams(Ok(teams())));
         assert_eq!(c.key_state(), &KeyState::Valid { viewer: None });
         assert_eq!(c.teams().loaded().unwrap().len(), 2);
+        assert_eq!(c.due(), Some(LinearRequest::Viewer), "whose the key is, for the account row");
         assert_eq!(c.due(), None, "nothing more until a team is picked");
+        c.answer(LinearAnswer::Viewer(Ok("Ada <ada@example.com>".into())));
+        assert_eq!(c.account(), Some("Ada <ada@example.com>"));
 
         c.select_team("eng");
         assert_eq!(c.team_option().unwrap().id, "team-eng");
@@ -805,6 +1011,64 @@ mod tests {
             result: Ok("ENG".into()),
         });
         assert!(!c.preflighting() && !c.ready());
+    }
+
+    #[test]
+    fn change_key_keeps_the_working_key_until_a_new_one_is_stored() {
+        let mut c = LinearChoice::default();
+        c.due();
+        c.answer(LinearAnswer::Teams(Ok(teams())));
+        assert!(!c.needs_key());
+        c.change_key();
+        assert!(c.needs_key() && c.changing_key());
+        c.set_key_input("lin_api_bad");
+        assert!(c.submit_key());
+        assert!(matches!(c.due(), Some(LinearRequest::Login(_))));
+        c.answer(LinearAnswer::Login(Err(LinearFailure::Rejected("bad key".into()))));
+        assert_eq!(c.key_state(), &KeyState::Valid { viewer: None }, "the old key still works");
+        assert_eq!(c.error(), Some("bad key"));
+        c.cancel_change_key();
+        assert!(!c.needs_key() && c.key_input().is_empty() && c.error().is_none());
+    }
+
+    #[test]
+    fn arrows_step_through_a_pickers_rows() {
+        let mut c = LinearChoice::default();
+        c.due();
+        c.answer(LinearAnswer::Teams(Ok(teams())));
+        c.step_team(true);
+        assert_eq!(c.team(), "DES", "from no team, the first");
+        c.step_team(false);
+        assert_eq!(c.team(), "ENG", "wrapping");
+        c.due();
+        c.answer(lists("team-eng"));
+        c.step_filter(Filter::Project, true);
+        assert_eq!(c.filter(Filter::Project), Some("Shelbi"));
+        c.step_filter(Filter::Project, true);
+        assert_eq!(c.filter(Filter::Project), None, "back to Any");
+    }
+
+    #[test]
+    fn the_scope_line_names_the_picks() {
+        let mut c = LinearChoice::default();
+        assert_eq!(c.scope_line(), None, "no team, no scope");
+        c.due();
+        c.answer(LinearAnswer::Teams(Ok(teams())));
+        c.select_team("ENG");
+        assert_eq!(c.scope_line().as_deref(), Some("Shelbi shows and creates issues in ENG."));
+        c.due();
+        c.answer(LinearAnswer::TeamLists {
+            team_id: "team-eng".into(),
+            projects: Ok(vec![]),
+            labels: Ok(vec![opt("label-bug", "Bug", "Bug", None)]),
+            users: Ok(vec![opt("u1", "ada@example.com", "Ada", Some("ada@example.com"))]),
+        });
+        c.select_filter(Filter::Label, Some("Bug"));
+        c.select_filter(Filter::Assignee, Some("ada@example.com"));
+        assert_eq!(
+            c.scope_line().as_deref(),
+            Some("Shelbi shows and creates issues in ENG, labeled Bug, assigned to Ada.")
+        );
     }
 
     #[test]

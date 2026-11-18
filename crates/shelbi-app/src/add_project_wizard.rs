@@ -761,6 +761,22 @@ impl Wizard {
         }
     }
 
+    /// The Linear key field's Verify: check the pasted key and store it
+    /// (the host runs the login from `linear_due`). False when nothing was
+    /// sent (an empty field says so).
+    pub fn verify_linear_key(&mut self) -> bool {
+        self.screen == Screen::Issues && self.issues.linear_mut().submit_key()
+    }
+
+    /// "Change key…" on the Linear account row, and its Cancel.
+    pub fn change_linear_key(&mut self) {
+        self.issues.linear_mut().change_key();
+    }
+
+    pub fn cancel_linear_key(&mut self) {
+        self.issues.linear_mut().cancel_change_key();
+    }
+
     /// Ask Linear again for the lists whose read failed.
     pub fn retry_linear(&mut self) {
         self.issues.linear_mut().retry();
@@ -1231,6 +1247,18 @@ impl Wizard {
             {
                 let forward = matches!(chord.code, Key::Down | Key::Right);
                 self.step_choice(self.focus, forward);
+                Action::Stay
+            }
+            Key::Up | Key::Down | Key::Left | Key::Right
+                if bare && !in_text && matches!(self.focus, Focus::LinearTeam | Focus::LinearFilter(_)) =>
+            {
+                let forward = matches!(chord.code, Key::Down | Key::Right);
+                self.chose_issues = true;
+                match self.focus {
+                    Focus::LinearTeam => self.issues.linear_mut().step_team(forward),
+                    Focus::LinearFilter(filter) => self.issues.linear_mut().step_filter(filter, forward),
+                    _ => {}
+                }
                 Action::Stay
             }
             Key::Up | Key::Down | Key::Left | Key::Right if bare && !in_text && matches!(self.focus, Focus::Tracker(_)) => {

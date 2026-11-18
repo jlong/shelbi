@@ -82,6 +82,7 @@ pub fn answer_with(services: &FarServices, project: &str, request: Request) -> R
         }
         // The project's key: the pickers read what the connection will use.
         Request::Linear(req) => Reply::Linear(crate::project_create::linear::answer(Some(project), req)),
+        Request::SyncStatuses => Reply::StatusesSynced(crate::tracker_connect::sync_statuses_now(project)),
     }
 }
 

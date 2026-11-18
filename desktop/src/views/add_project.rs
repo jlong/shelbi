@@ -73,13 +73,14 @@ use shelbi_app::add_project_wizard::{
     Tone, Tracker, Wizard, WorkflowOverview,
 };
 use shelbi_app::exec::Mutation;
-use shelbi_app::linear_setup::{LinearAnswer, LinearRequest};
+use shelbi_app::linear_setup::{Filter, LinearAnswer, LinearRequest};
 use shelbi_app::new_project as np;
 use shelbi_core::ConfigMode;
 use shelbi_orchestrator::project_create::{self as engine, AddProjectError, ScaffoldReporter, ScaffoldStage};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
 use super::harness_picker::{self as pickers, Fields, Handlers, Host, Menu};
+use super::linear_fields::{self, LinearUi, Pick};
 use super::workflow_editor::error_line;
 use crate::app::{CloseWindow, ShelbiWindow};
 use crate::commands;
@@ -292,6 +293,8 @@ pub struct AddProjectView {
     workflows: Vec<WorkflowOverview>,
     /// The Agent defaults picker whose menu is open.
     menu: Option<Menu>,
+    /// The Issues screen's Linear card: its key field and open picker.
+    linear: LinearUi,
     menu_anchor: style::Anchor,
     _subscriptions: Vec<Subscription>,
 }
@@ -313,6 +316,7 @@ impl AddProjectView {
         let path_input = cx.new(|cx| InputState::new(window, cx).placeholder("~/Projects/my-project"));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Project name"));
         let repo_input = cx.new(|cx| InputState::new(window, cx).placeholder("owner/repo"));
+        let linear = LinearUi::new(window, cx);
         let this_window = window.window_handle();
         let me = cx.weak_entity();
         let subscriptions = vec![
@@ -359,6 +363,21 @@ impl AddProjectView {
                     _ => {}
                 }
             }),
+            cx.subscribe_in(&linear.key_input, window, |this, input, event: &InputEvent, window, cx| {
+                match event {
+                    InputEvent::Change => {
+                        let text = input.read(cx).value().to_string();
+                        this.wizard.set_linear_key(text);
+                        cx.notify();
+                    }
+                    InputEvent::Focus => {
+                        this.wizard.set_focus(Focus::LinearKey);
+                        let _ = window;
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            }),
             // Ahead of the text fields' own bindings (Tab indents, Return
             // and Esc are theirs otherwise): the wizard's keys are its own
             // everywhere in the window.
@@ -392,12 +411,13 @@ impl AddProjectView {
             workflows: wiz::created_workflows(),
             menu: None,
             menu_anchor: Default::default(),
+            linear,
             _subscriptions: subscriptions,
         }
     }
 
-    /// The wizard's state (tests).
-    #[cfg(test)]
+    /// The wizard's state (tests and the visual check).
+    #[cfg(any(test, feature = "visual-check"))]
     pub fn wizard(&self) -> &Wizard {
         &self.wizard
     }
@@ -405,7 +425,7 @@ impl AddProjectView {
     /// A key the wizard takes: Tab and ⇧Tab, Return and Esc anywhere;
     /// Space and the arrows off the text fields. `false` lets it through.
     fn key(&mut self, chord: KeyChord, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let in_text = matches!(self.wizard.focus(), Focus::Path | Focus::Name | Focus::Repo);
+        let in_text = matches!(self.wizard.focus(), Focus::Path | Focus::Name | Focus::Repo | Focus::LinearKey);
         let bare = chord.mods == Mods::NONE;
         let taken = match chord.code {
             Key::Tab | Key::BackTab => bare || chord.mods == Mods::SHIFT,
@@ -417,7 +437,7 @@ impl AddProjectView {
             return false;
         }
         // An open picker's menu takes Esc; any other key closes it ([`Self::act`]).
-        if chord.code == Key::Esc && self.menu.take().is_some() {
+        if chord.code == Key::Esc && (self.menu.take().is_some() || self.linear.menu.take().is_some()) {
             cx.notify();
             return true;
         }
@@ -443,6 +463,12 @@ impl AddProjectView {
         };
         // A picker's button toggles its menu; anything else closes it.
         self.menu = menu.filter(|m| self.menu != Some(*m));
+        let pick = match action {
+            Action::Menu(Focus::LinearTeam) => Some(Pick::Team),
+            Action::Menu(Focus::LinearFilter(f)) => Some(Pick::Filter(f)),
+            _ => None,
+        };
+        self.linear.menu = pick.filter(|p| self.linear.menu != Some(*p));
         match action {
             Action::Stay | Action::Menu(_) => {}
             Action::Browse => self.browse(window, cx),
@@ -462,6 +488,8 @@ impl AddProjectView {
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.wizard.settle_focus();
         self.sync_repo(window, cx);
+        let key = self.wizard.issues().linear().key_input().to_string();
+        self.linear.sync_key(&key, window, cx);
         self.sync_focus(window, cx);
         self.run_checks(window, cx);
         self.run_linear(window, cx);
@@ -494,6 +522,7 @@ impl AddProjectView {
             Focus::Path => self.path_input.read(cx).focus_handle(cx),
             Focus::Name => self.name_input.read(cx).focus_handle(cx),
             Focus::Repo => self.repo_input.read(cx).focus_handle(cx),
+            Focus::LinearKey => self.linear.key_input.read(cx).focus_handle(cx),
             _ => self.focus.clone(),
         };
         if !handle.is_focused(window) {
@@ -744,6 +773,42 @@ impl AddProjectView {
             Menu::Model => Focus::Model,
         });
         self.menu = if self.menu == Some(menu) { None } else { Some(menu) };
+        cx.notify();
+    }
+
+    /// A click in the Linear card's fields.
+    pub(crate) fn linear_msg(&mut self, msg: linear_fields::Msg, window: &mut Window, cx: &mut Context<Self>) {
+        use linear_fields::Msg;
+        match msg {
+            Msg::Verify => {
+                self.wizard.set_focus(Focus::LinearKey);
+                self.wizard.verify_linear_key();
+            }
+            Msg::ChangeKey => {
+                self.wizard.change_linear_key();
+                self.wizard.set_focus(Focus::LinearKey);
+            }
+            Msg::CancelChangeKey => self.wizard.cancel_linear_key(),
+            Msg::Retry => self.wizard.retry_linear(),
+            Msg::Team(team) => self.wizard.select_linear_team(&team),
+            Msg::Filter(filter, value) => self.wizard.select_linear_filter(filter, Some(&value)),
+        }
+        self.after_change(window, cx);
+    }
+
+    /// A Linear picker's button (`Some`) or a press outside its menu.
+    fn linear_menu(&mut self, pick: Option<Pick>, cx: &mut Context<Self>) {
+        match pick {
+            Some(p) => {
+                self.wizard.set_focus(match p {
+                    Pick::Team => Focus::LinearTeam,
+                    Pick::Filter(f) => Focus::LinearFilter(f),
+                });
+                self.menu = None;
+                self.linear.toggle(p);
+            }
+            None => self.linear.menu = None,
+        }
         cx.notify();
     }
 
@@ -1020,8 +1085,15 @@ impl AddProjectView {
             Tracker::FileSystem => ("add-project-card-file-system", np::FILE_SYSTEM_TITLE, np::FILE_SYSTEM_BODY),
         };
         let selected = self.wizard.issues().tracker() == tracker;
-        choice_card(id, title, body, None, selected, self.ring(Focus::Tracker(tracker), window), theme)
-            .on_click(cx.listener(move |this, _, window, cx| this.click(Focus::Tracker(tracker), window, cx)))
+        let ring = self.ring(Focus::Tracker(tracker), window);
+        // With Linear chosen its fields need the room: the cards draw as
+        // one line each (the radio and the title).
+        let card = if self.wizard.issues().tracker() == Tracker::Linear {
+            compact_card(id, title, selected, ring, theme)
+        } else {
+            choice_card(id, title, body, None, selected, ring, theme)
+        };
+        card.on_click(cx.listener(move |this, _, window, cx| this.click(Focus::Tracker(tracker), window, cx)))
     }
 
     /// The Issues screen: the two cards, then (on GitHub) the repo field,
@@ -1064,13 +1136,54 @@ impl AddProjectView {
                         .child(text)
                 }))
         });
+        let linear = (issues.tracker() == Tracker::Linear).then(|| {
+            let ring = linear_fields::Ring {
+                team: self.ring(Focus::LinearTeam, window),
+                filter: Filter::ALL.into_iter().find(|f| self.ring(Focus::LinearFilter(*f), window)),
+            };
+            let choice = issues.linear();
+            let error = choice
+                .error()
+                .map(|e| error_line("add-project-linear-error".into(), e, theme));
+            let passed = choice.summary().map(|s| {
+                div()
+                    .debug_selector(|| "add-project-linear-passed".into())
+                    .type_style(Type::Small)
+                    .text_color(theme.muted)
+                    .child(format!("Verified: {s}"))
+            });
+            linear_fields::fields(
+                linear_fields::Host::AddProject,
+                choice,
+                &self.linear,
+                ring,
+                !choice.preflighting(),
+                linear_fields::Handlers {
+                    msg: |this: &mut Self, msg, window, cx| this.linear_msg(msg, window, cx),
+                    menu: |this: &mut Self, pick, cx| this.linear_menu(pick, cx),
+                },
+                theme,
+                window,
+                cx,
+            )
+            .pt(px(4.0))
+            .children(error)
+            .children(passed)
+        });
+        let cards = Tracker::ALL.map(|t| self.tracker_card(t, window, theme, cx));
+        let cards = if issues.tracker() == Tracker::Linear {
+            div().flex().flex_row().gap(px(12.0)).w_full().children(cards)
+        } else {
+            div().flex().flex_col().gap(px(16.0)).w_full().children(cards)
+        };
         div()
             .flex()
             .flex_col()
             .gap(px(16.0))
             .w_full()
-            .children(Tracker::ALL.map(|t| self.tracker_card(t, window, theme, cx)))
+            .child(cards)
             .children(repo)
+            .children(linear)
     }
 
     /// One of screen 02's cards.
@@ -1136,6 +1249,35 @@ fn choice_card(
                         .child(path)
                 })),
         )
+}
+
+/// A board's card on one line (the Issues screen while Linear is chosen):
+/// its radio and title.
+fn compact_card(id: &'static str, title: &'static str, selected: bool, ring: bool, theme: &Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .relative()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .flex_1()
+        .min_w_0()
+        .px(px(16.0))
+        .py(px(12.0))
+        .rounded(px(10.0))
+        .border_1()
+        .cursor_pointer()
+        .when(selected, |d| d.bg(theme.primary_fill).border_color(theme.focus_ring))
+        .when(!selected, |d| {
+            d.bg(theme.toolbar)
+                .border_color(theme.divider)
+                .hover(|s| s.bg(theme.background_hover))
+        })
+        .when(ring, |d| d.children(style::focus_bands_past(10.0, 1.0, theme)))
+        .child(radio(selected, theme))
+        .child(div().type_style(Type::BaseSemibold).text_color(theme.text_loud).truncate().child(title))
 }
 
 /// One of screen 04's cards: the workflow's name (and Default badge), what
@@ -1371,6 +1513,17 @@ impl Render for AddProjectView {
         let details = match screen {
             Screen::Folder => details.child(self.folder_box(window, &theme, cx)),
             Screen::Defaults => details.child(self.defaults(window, &theme, cx)),
+            // Linear's fields run past the window's height: the screen
+            // scrolls, from the top.
+            Screen::Issues if self.wizard.issues().tracker() == Tracker::Linear => details.justify_start().child(
+                div()
+                    .id("add-project-issues-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(self.issues(window, &theme, cx).pb(px(8.0))),
+            ),
             Screen::Issues => details.child(self.issues(window, &theme, cx)),
             Screen::Settings => details
                 .child(self.card(ConfigMode::InRepo, window, &theme, cx))
@@ -2147,6 +2300,60 @@ mod tests {
         r.keys("enter");
         let created = r.created.lock().unwrap().clone();
         assert_eq!(created[0].plan.issue_tracker.github.as_ref().map(|g| g.repo.as_str()), Some("acme/ok"));
+    }
+
+    #[gpui::test]
+    fn linear_pastes_a_key_picks_a_team_and_filters_and_creates_with_them(cx: &mut TestAppContext) {
+        use shelbi_app::linear_setup::fixture;
+        let mut r = rig(cx, Origin::Workspace, Ok("repo".into()));
+        let view = r.view.clone();
+        view.update(&mut r.cx, |v, _| v.engine.linear = Arc::new(fixture::no_key));
+        r.pick(Some("/repo"));
+        r.keys("enter enter");
+        r.click("add-project-card-linear");
+        assert_eq!(r.wizard(|w| w.issues().tracker()), Tracker::Linear);
+        // No key on this machine: the paste-and-verify field.
+        assert!(r.drawn("add-project-linear-key") && r.drawn("add-project-linear-verify"));
+        assert!(!r.drawn("add-project-linear-project"), "no filters before a team");
+        r.click("add-project-linear-verify");
+        assert_eq!(r.wizard(|w| w.issues().error().map(str::to_string)).as_deref(), Some(shelbi_app::linear_setup::KEY_EMPTY));
+
+        // A pasted key logs in; the teams load with it.
+        let input = view.read_with(&r.cx, |v, _| v.linear.key_input.clone());
+        // A programmatic set sends no Change: hand the text over as the
+        // field's subscription does.
+        r.cx.update(|window, cx| {
+            input.update(cx, |s, cx| s.set_value("lin_api_test".to_string(), window, cx));
+            view.update(cx, |v, cx| {
+                v.wizard.set_linear_key("lin_api_test");
+                v.after_change(window, cx);
+            })
+        });
+        r.cx.run_until_parked();
+        assert_eq!(r.wizard(|w| w.issues().linear().key_input().to_string()), "lin_api_test");
+        // Once the key is stored, Linear answers with it.
+        view.update(&mut r.cx, |v, _| v.engine.linear = Arc::new(fixture::answer));
+        r.click("add-project-linear-verify");
+        assert!(r.drawn("add-project-linear-account") && !r.drawn("add-project-linear-key"));
+        assert_eq!(view.read_with(&r.cx, |v, cx| v.linear.key_input.read(cx).value().to_string()), "", "the key isn't kept");
+
+        // Continue without a team says so; the team's menu, then a filter.
+        r.click("add-project-primary");
+        assert!(r.drawn("add-project-linear-error"));
+        r.click("add-project-linear-team");
+        assert!(r.drawn("add-project-linear-team-menu"));
+        r.click("add-project-linear-team-0");
+        assert_eq!(r.wizard(|w| w.issues().linear().team().to_string()), "ENG");
+        r.click("add-project-linear-label");
+        r.click("add-project-linear-label-1");
+        assert!(r.drawn("add-project-linear-scope"));
+        r.click("add-project-primary");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings, "the preflight passed");
+        r.keys("enter");
+        let created = r.created.lock().unwrap().clone();
+        let linear = created[0].plan.issue_tracker.linear.clone().unwrap();
+        assert_eq!((linear.team.as_str(), linear.label.as_deref()), ("ENG", Some("shelbi")));
+        assert!(created[0].plan.issue_tracker.github.is_none(), "one external tracker");
     }
 
     #[gpui::test]

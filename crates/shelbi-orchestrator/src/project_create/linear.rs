@@ -236,6 +236,9 @@ pub fn answer(project: Option<&str>, request: LinearRequest) -> LinearAnswer {
             let result = preflight_linear(project, &connection).map(|r| summary(&r));
             LinearAnswer::Preflight { connection, result }
         }
+        LinearRequest::Viewer => {
+            LinearAnswer::Viewer(client().and_then(|c| c.viewer()).map(|v| v.label()).map_err(failure))
+        }
     }
 }
 

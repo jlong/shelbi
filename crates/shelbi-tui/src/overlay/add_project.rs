@@ -9,7 +9,9 @@
 //!   1  Add a project · Name · Repo path · Detected: · Folder / id:
 //!        [x] Use the committed settings · [x] Initialize a Git repository here
 //!   2  Agent defaults · Default Harness ▾ · Default model ▾
-//!   3  Where should issues live? · (•) GitHub Issues · ( ) File system · repo
+//!   3  Where should issues live? · (•) GitHub Issues · ( ) Linear · ( ) File system
+//!        GitHub: the repo · Linear: the key (pasted, masked), Team ▾, Project ▾,
+//!        Label ▾, Assignee ▾ (`crate::linear_rows`)
 //!   4  Where should settings live? · (•) In the project · ( ) Outside the project
 //!      Step N of 4                                 [ Back ] [ Continue ]
 //! ```
@@ -51,6 +53,7 @@ use shelbi_app::new_project::{self as np, NewProject, Tracker};
 use shelbi_core::ConfigMode;
 use shelbi_orchestrator::project_create;
 use crate::button::{self, Align, Button};
+use crate::linear_rows::{self, Part};
 use crate::panel;
 use crate::picker::{self, select_lines};
 use crate::textbox::{self, Textbox};
@@ -87,6 +90,15 @@ pub struct Form {
     custom: Option<String>,
     /// What each drawn control's rect is, from the last render.
     hits: Vec<(Rect, Hit)>,
+    /// Answers the Linear card's reads: Linear itself, or a test's canned
+    /// answers.
+    linear: fn(shelbi_app::linear_setup::LinearRequest) -> shelbi_app::linear_setup::LinearAnswer,
+}
+
+/// The real Linear reads, with this machine's key (the project doesn't
+/// exist yet).
+fn live_linear(request: shelbi_app::linear_setup::LinearRequest) -> shelbi_app::linear_setup::LinearAnswer {
+    project_create::linear::answer(None, request)
 }
 
 impl Form {
@@ -105,10 +117,13 @@ impl Form {
             menu: None,
             custom: None,
             hits: Vec::new(),
+            // A test reads no Linear (and no keychain).
+            linear: if cfg!(test) { shelbi_app::linear_setup::fixture::no_key } else { live_linear },
         };
         form.detect();
         form
     }
+
 
     /// The entered (raw, human-readable) project name.
     pub fn name(&self) -> &str {
@@ -184,6 +199,16 @@ impl Form {
             }
             return Step::Continue;
         }
+        if key.code == KeyCode::Char('r')
+            && key.modifiers.is_empty()
+            && matches!(self.inner.focus(), Field::LinearTeam | Field::LinearFilter(_))
+            && self.menu.is_none()
+        {
+            // Retry the Linear lists that failed to load.
+            self.inner.retry_linear();
+            self.run_linear();
+            return Step::Continue;
+        }
         if let Some(menu) = self.menu {
             let n = self.choices(menu.item).0.len().max(1);
             match key.code {
@@ -210,7 +235,7 @@ impl Form {
     /// for here, as the GitHub preflight is.
     fn run_linear(&mut self) {
         while let Some(request) = self.inner.linear_due() {
-            let answer = project_create::linear::answer(None, request);
+            let answer = (self.linear)(request);
             self.inner.linear_answer(answer);
         }
     }
@@ -314,7 +339,10 @@ impl Form {
         match field {
             Field::Harness => picker::harness_labels(&p.harnesses()),
             Field::Model => picker::model_labels(&p.models()),
-            _ => (Vec::new(), None),
+            field => match part_of(field) {
+                Some(part) => linear_rows::menu(self.inner.issues().linear(), part),
+                None => (Vec::new(), None),
+            },
         }
     }
 
@@ -343,9 +371,19 @@ impl Form {
                 Some(o) => self.inner.select_model(o.model.as_deref()),
                 None => self.custom = Some(p.model().unwrap_or_default().to_string()),
             },
+            Field::LinearTeam => {
+                if let Some(team) = linear_rows::menu_value(self.inner.issues().linear(), Part::Team, index) {
+                    self.inner.select_linear_team(&team);
+                }
+            }
+            Field::LinearFilter(filter) => {
+                let value = linear_rows::menu_value(self.inner.issues().linear(), Part::Filter(filter), index);
+                self.inner.select_linear_filter(filter, value.as_deref());
+            }
             _ => {}
         }
         self.inner.set_focus(field);
+        self.run_linear();
     }
 
     /// Paint the dialog into `area`.
@@ -407,11 +445,16 @@ fn render(f: &mut Frame, area: Rect, form: &mut Form) {
         }
         rows.push((Line::raw(""), None));
     }
-    let mut menu_at = None;
+    // Where each picker's box starts (row index), for its menu.
+    let mut boxes: Vec<(Field, usize)> = Vec::new();
     match page {
         Page::Folder => folder_rows(&mut rows, form),
-        Page::Defaults => menu_at = defaults_rows(&mut rows, form, w),
-        Page::Issues => issues_rows(&mut rows, form, w),
+        Page::Defaults => {
+            if let Some((harness, model)) = defaults_rows(&mut rows, form, w) {
+                boxes = vec![(Field::Harness, harness), (Field::Model, model)];
+            }
+        }
+        Page::Issues => boxes = issues_rows(&mut rows, form, w),
         Page::Settings => settings_rows(&mut rows, form, w),
     }
     // The error row is reserved so the footer doesn't jump when one shows.
@@ -447,8 +490,9 @@ fn render(f: &mut Frame, area: Rect, form: &mut Form) {
     footer(f, form, Rect { y: footer_y, height: 3.min(inner.height), ..inner });
 
     // An open picker drops below its box, over what follows.
-    if let (Some(menu), Some((harness_y, model_y))) = (form.menu, menu_at) {
-        let below = if menu.item == Field::Harness { harness_y } else { model_y } + 3;
+    let open = form.menu.and_then(|m| boxes.iter().find(|(f, _)| *f == m.item).map(|(_, at)| (m, *at)));
+    if let Some((menu, at)) = open {
+        let below = at + 3;
         let (labels, chosen) = form.choices(menu.item);
         let at = Rect { y: inner.y + below as u16, height: 1, ..inner };
         for (rect, i) in picker::render_menu(f, area, at, &labels, chosen, menu.selected) {
@@ -493,15 +537,51 @@ fn check_line(label: &str, on: bool, focused: bool) -> Line<'static> {
     ])
 }
 
+/// The Linear part a form field is, if it's one.
+fn part_of(field: Field) -> Option<Part> {
+    match field {
+        Field::LinearKey => Some(Part::Key),
+        Field::LinearTeam => Some(Part::Team),
+        Field::LinearFilter(f) => Some(Part::Filter(f)),
+        _ => None,
+    }
+}
+
+fn field_of(part: Part) -> Option<Field> {
+    match part {
+        Part::Key => Some(Field::LinearKey),
+        Part::ChangeKey => None,
+        Part::Team => Some(Field::LinearTeam),
+        Part::Filter(f) => Some(Field::LinearFilter(f)),
+    }
+}
+
 /// Page 3: the boards, each a radio with its description, then the
 /// GitHub repo field when GitHub is chosen (and what a GitHub board writes,
-/// once the repo passed).
-fn issues_rows(rows: &mut Rows, form: &Form, w: usize) {
+/// once the repo passed), or Linear's rows ([`linear_rows`]: with Linear
+/// chosen the boards drop their descriptions, for the room). Returns where
+/// each Linear picker's box starts.
+fn issues_rows(rows: &mut Rows, form: &Form, w: usize) -> Vec<(Field, usize)> {
     let focus = form.inner.focus();
     let issues = form.inner.issues();
+    let linear = issues.tracker() == Tracker::Linear;
     for tracker in Tracker::ALL {
         let on = issues.tracker() == tracker;
-        radio_rows(rows, on, focus == Field::Tracker, tracker.title(), tracker.body(), Hit::Tracker(tracker), w);
+        let body = if linear { "" } else { tracker.body() };
+        radio_rows(rows, on, focus == Field::Tracker, tracker.title(), body, Hit::Tracker(tracker), w);
+    }
+    if linear {
+        rows.push((Line::raw(""), None));
+        let choice = issues.linear();
+        let drawn = linear_rows::rows(choice, part_of(focus), !choice.preflighting(), false, w);
+        let start = rows.len();
+        for (line, part) in drawn.lines {
+            rows.push((line, part.and_then(field_of).map(Hit::Field)));
+        }
+        if let Some(summary) = choice.summary() {
+            rows.push((Line::from(Span::styled(format!("✓ Verified: {summary}"), Style::default().fg(palette().ansi_green))), None));
+        }
+        return drawn.boxes.into_iter().filter_map(|(p, at)| field_of(p).map(|f| (f, start + at))).collect();
     }
     if issues.tracker() == Tracker::Github {
         rows.push((field_line(np::GITHUB_REPO_LABEL, issues.repo(), focus == Field::Repo), Some(Hit::Field(Field::Repo))));
@@ -511,6 +591,7 @@ fn issues_rows(rows: &mut Rows, form: &Form, w: usize) {
             }
         }
     }
+    Vec::new()
 }
 
 /// A radio row (its mark and title) and its wrapped description.
@@ -533,7 +614,9 @@ fn radio_rows(rows: &mut Rows, on: bool, focused: bool, title: &str, body: &str,
             Some(hit),
         ));
     }
-    rows.push((Line::raw(""), None));
+    if !body.is_empty() {
+        rows.push((Line::raw(""), None));
+    }
 }
 
 /// Page 2: Default Harness and Default model, each a picker box with the
@@ -895,6 +978,68 @@ mod tests {
             let buf = draw(&mut f);
             assert_eq!(click(&mut f, &buf, "Create Project"), Step::Submit);
             assert_eq!(f.defaults(), AgentDefaults { runner: RunnerKind::Codex, model: Some("gpt-5-codex".into()) });
+        });
+    }
+
+    /// Write `buf`'s text as `<name>.txt` under `$SHELBI_TUI_CAPTURE` (the
+    /// handoff's captures), when it's set.
+    pub(crate) fn capture(name: &str, screen: &str) {
+        if let Some(dir) = std::env::var_os("SHELBI_TUI_CAPTURE") {
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(std::path::Path::new(&dir).join(format!("{name}.txt")), screen);
+        }
+    }
+
+    #[test]
+    fn linear_pastes_a_key_picks_a_team_and_a_filter_and_creates_with_them() {
+        with_home(|repo| {
+            let mut f = Form::new(repo);
+            typed(&mut f, "acme");
+            f.handle_key(key(KeyCode::Enter));
+            f.handle_key(key(KeyCode::Enter));
+            assert_eq!(f.page(), Page::Issues);
+            let buf = draw(&mut f);
+            click(&mut f, &buf, "Linear");
+            assert_eq!(f.inner.issues().tracker(), Tracker::Linear);
+            let out = text(&draw(&mut f));
+            capture("add-project-linear-no-key", &out);
+            for needle in ["Linear account", "Not connected. Paste a personal API key.", "Linear API key", "Verify an API key first"] {
+                assert!(out.contains(needle), "missing {needle:?} in:\n{out}");
+            }
+            assert!(!out.contains(np::GITHUB_BODY), "the boards drop their descriptions:\n{out}");
+
+            // The key: typed as dots, Enter verifies (the canned login).
+            f.inner.set_focus(Field::LinearKey);
+            typed(&mut f, "lin_api_x");
+            let out = text(&draw(&mut f));
+            assert!(out.contains("•••••••••") && !out.contains("lin_api_x"), "masked:\n{out}");
+            f.linear = shelbi_app::linear_setup::fixture::answer;
+            f.handle_key(key(KeyCode::Enter));
+            assert!(!f.inner.issues().linear().needs_key());
+            let out = text(&draw(&mut f));
+            assert!(out.contains("Linear account  Ada Lovelace <ada@example.com>"), "{out}");
+
+            // The team from its menu, then a label with ←/→.
+            let buf = draw(&mut f);
+            click(&mut f, &buf, "Choose a team");
+            let buf = draw(&mut f);
+            click(&mut f, &buf, "ENG  Engineering");
+            assert_eq!(f.inner.issues().linear().team(), "ENG");
+            f.inner.set_focus(Field::LinearFilter(shelbi_app::linear_setup::Filter::Label));
+            f.handle_key(key(KeyCode::Right));
+            assert_eq!(f.inner.issues().linear().filter(shelbi_app::linear_setup::Filter::Label), Some("shelbi"));
+            let mut term = Terminal::new(TestBackend::new(W, 44)).unwrap();
+            term.draw(|frame| f.render(frame, frame.area())).unwrap();
+            let out = text(term.backend().buffer());
+            capture("add-project-linear", &out);
+            assert!(out.contains("Shelbi shows and creates issues in ENG, labeled shelbi."), "{out}");
+
+            // Continue runs the preflight, then on to the settings.
+            f.handle_key(key(KeyCode::Enter));
+            assert_eq!(f.page(), Page::Settings);
+            let cfg = f.plan().unwrap().issue_tracker;
+            assert_eq!(cfg.connection_blocks(), vec!["linear"]);
+            assert_eq!(cfg.linear.unwrap().label.as_deref(), Some("shelbi"));
         });
     }
 
