@@ -1,0 +1,8 @@
+{
+  "data": {
+    "attachmentCreate": {
+      "success": true,
+      "attachment": { "id": "att-1", "url": "https://shelbi.dev/i/ENG/eng-1", "metadata": { "shelbi": { "id": "eng-1" } } }
+    }
+  }
+}

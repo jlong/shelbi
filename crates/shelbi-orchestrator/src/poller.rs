@@ -1139,7 +1139,7 @@ fn issue_reconcile_bounds(project: &Project) -> Option<(Duration, Duration)> {
 ///
 /// Only remote backends need this — the `file_system` board is read directly and
 /// every mutation already writes its own event at the mutation site, so this is a
-/// clean no-op there. `github` is the only remote backend today.
+/// clean no-op there. Remote backends are `github` and `linear`.
 ///
 /// Cadence is derived from the project heartbeat (base interval, backing off to
 /// the heartbeat max while the board is quiescent, exactly like

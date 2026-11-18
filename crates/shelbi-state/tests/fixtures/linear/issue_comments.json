@@ -1,0 +1,17 @@
+{
+  "data": {
+    "issue": {
+      "comments": {
+        "nodes": [
+          {
+            "id": "comment-1",
+            "body": "Looks good.",
+            "createdAt": "2026-11-02T11:00:00.000Z",
+            "user": { "id": "user-grace", "name": "Grace Hopper", "displayName": "grace", "email": "grace@example.com" }
+          }
+        ],
+        "pageInfo": { "hasNextPage": false, "endCursor": "comments-end" }
+      }
+    }
+  }
+}
