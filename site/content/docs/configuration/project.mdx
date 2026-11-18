@@ -130,12 +130,14 @@ workspaces:
 | `disk` | [Disk](#disk) | no | `20` / `20` | Hub disk management: the size cap on the shared cargo `target/` and the low-disk free-space warning threshold. Both default to 20 GiB and are elided from the wire form when unset. |
 | `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for the review merge and Zen's auto-merge. |
 | `review` | [Review](#review) | no | all defaults | Review-interface behavior. Today just `diff_command`, which makes **View Diff** run a command of your own, such as a tool that reviews a revision range. |
-| `issue_tracker` | [IssueTracker](#issue_tracker) | no | `file_system` | Which backend the board lives in: `file_system` (local markdown, the default) or `github` (issues in a repo). See [GitHub Issues backend](/docs/concepts/github-issues). |
+| `issue_tracker` | [IssueTracker](#issue_tracker) | no | `file_system` | Which backend the board lives in: `file_system` (local markdown, the default), `github` (issues in a repo) or `linear` (issues in a Linear team). See [GitHub Issues backend](/docs/concepts/github-issues) and [Linear](/docs/concepts/linear). |
 | `session` | `{ raw_output_log }` | no | off | `raw_output_log: true` keeps a full raw output log of every session at `~/.shelbi/sessions/<id>/raw.log`. Opt-in, for debugging: the log is mostly repaint noise for full-screen agents and captures anything pasted into a session. |
 
 Settings ▸ Properties edits `name`, `github_url`, `default_branch`,
-`default_workflow` and the two intervals in the desktop app and the TUI, and
-shows the `issue_tracker` backend read-only. It checks each value first and
+`default_workflow` and the two intervals in the desktop app and the TUI. Its
+Issue tracker section connects, switches or disconnects the `issue_tracker`
+backend and edits the Linear filters, saving only when you press Connect or
+Save (see [`shelbi tracker`](/docs/cli/tracker#from-settings-or-a-new-project)). It checks each value first and
 refuses a file the loader wouldn't take, writes only the keys that changed,
 and keeps the file's comments. It leaves every other key as it is, `editor`
 included.
@@ -523,7 +525,7 @@ keep it rather than acting on that finding.
 Which backend the project's board lives in, plus the non-secret connection facts
 for a remote backend. An absent block is the default (`file_system`), so existing
 projects keep working. See [GitHub Issues backend](/docs/concepts/github-issues)
-for the concept and the full behavior.
+and [Linear](/docs/concepts/linear) for the concepts and the full behavior.
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -585,6 +587,7 @@ issue_tracker:
 ```
 
 With `backend: linear` the board is the team's issues matching these filters.
+[Linear](/docs/concepts/linear) walks through setting it up.
 See [`shelbi tracker`](/docs/cli/tracker#the-board-on-the-hub-daemon) for how the
 hub daemon refreshes it against the key's rate limits.
 

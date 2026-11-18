@@ -4,10 +4,11 @@ order: 19
 summary: Keep a project's Kanban board as GitHub issues in one repo, covering the label scheme, the metadata block, assignee-gated Zen, and the daemon's cached, rate-limit-aware reads.
 ---
 
-A Shelbi project keeps its board in one of two places. By default the board
-is private markdown on your own machine (the **file system** backend). Set
+A Shelbi project keeps its board in one place. By default the board is
+private markdown on your own machine (the **file system** backend). Set
 `issue_tracker.backend: github` and the board becomes **GitHub issues in a
-single repo** instead: every card is a real issue your team can see, file, and
+single repo** instead (or Linear issues in one team: see
+[Linear](/docs/concepts/linear)): every card is a real issue your team can see, file, and
 comment on from github.com, while Shelbi keeps driving it from the TUI and the
 CLI exactly as before.
 
@@ -52,7 +53,7 @@ No secret is ever written into the project YAML or any other file on disk. The
 
 <Callout type="note" title="Setup preflights this for you">
 
-When you pick **GitHub Issues** during [first-project setup](/docs/guides/getting-started/first-project#2-choose-where-your-issues-live),
+When you pick **GitHub Issues** during [first-project setup](/docs/guides/getting-started/first-project#3-issues),
 Shelbi preflights `gh` auth and repo access before writing anything, explains
 the fix if the check fails, and lets you retry or fall back to the file system.
 
@@ -76,8 +77,8 @@ resolves to a typed error, reported exactly as:
 the `jira` issue-tracker store is not built yet in this version of shelbi; use `file_system`, `github` or `linear` for now
 ```
 
-`file_system`, `github` and `linear` resolve to a working board. Linear is set up
-with [`shelbi tracker linear`](/docs/cli/tracker).
+`file_system`, `github` and `linear` resolve to a working board. Linear has its
+own page: [Linear](/docs/concepts/linear).
 
 ## How issues map to cards
 
@@ -416,8 +417,10 @@ workspace assignments are dropped. The same command moves a board onto Linear
   `comment` and the `issue-store migrate` backend mover.
 - [`shelbi status`](/docs/cli/status): the bootstrap snapshot whose `## GitHub`
   section reports the read path and budget.
+- [Linear](/docs/concepts/linear): the other external tracker, set up the
+  same way with `shelbi tracker linear`.
 - [Zen Mode](/docs/concepts/zen-mode): the autonomy the assignee gate protects.
 - [The events log](/docs/concepts/events-log): where the
   `poller:github-merge-reconcile` and board-refresh lines land.
-- [Set up your first project](/docs/guides/getting-started/first-project#2-choose-where-your-issues-live):
-  choosing GitHub Issues or the file system during onboarding.
+- [Set up your first project](/docs/guides/getting-started/first-project#3-issues):
+  choosing GitHub Issues, Linear or the file system during onboarding.

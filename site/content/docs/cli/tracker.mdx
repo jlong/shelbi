@@ -17,7 +17,9 @@ shelbi tracker linear users [--team <TEAM>] [--json]
 ```
 
 `shelbi tracker` manages the connection to an external issue tracker, separate
-from the issues on the board (`shelbi issue`). Today it covers Linear.
+from the issues on the board (`shelbi issue`). Today it covers Linear. For a
+walkthrough of the whole integration (filters, statuses, ownership, migration
+and troubleshooting), see [Linear](/docs/concepts/linear).
 
 ## Getting started with Linear
 
@@ -116,7 +118,7 @@ same rule for a board with issues.
 ### From Settings or a new project
 
 The desktop app and the TUI offer the same choice. When you add a project, the
-Issues step lists Local board, GitHub Issues and Linear. In an existing
+Issues step lists GitHub Issues, Linear and File system. In an existing
 project, **Settings > Properties > Issue tracker** connects, switches or
 disconnects it, and edits the Linear filters. Choosing Linear shows whose API
 key this machine uses (with Change key), or a field to paste one: Verify checks
