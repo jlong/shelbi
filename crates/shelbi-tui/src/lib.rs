@@ -15,6 +15,7 @@ mod handlers;
 mod jobs;
 mod kanban;
 mod licenses;
+mod linear_rows;
 mod list_screen;
 mod keymap;
 pub mod launch;

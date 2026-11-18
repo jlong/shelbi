@@ -664,8 +664,16 @@ impl SettingsView {
         self.keybindings.clone()
     }
 
+    /// Scroll the page to its end (the visual check's lower half).
+    #[cfg(feature = "visual-check")]
+    pub(crate) fn offscreen_scroll_to_end(&mut self, cx: &mut Context<Self>) {
+        let max = self.scroll.max_offset();
+        self.scroll.set_offset(gpui::point(px(0.0), -max.y));
+        cx.notify();
+    }
+
     /// The Workflows page's view.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "visual-check"))]
     pub(crate) fn workflows(&self) -> Entity<WorkflowsPage> {
         self.workflows.clone()
     }

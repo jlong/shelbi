@@ -445,6 +445,22 @@ impl Form {
         }
     }
 
+    /// The Linear key field's Verify: check the pasted key and store it
+    /// (the host runs the login from `linear_due`). False when nothing was
+    /// sent (an empty field says so).
+    pub fn verify_linear_key(&mut self) -> bool {
+        self.page == Page::Issues && self.issues.linear_mut().submit_key()
+    }
+
+    /// "Change key…" on the Linear account row, and its Cancel.
+    pub fn change_linear_key(&mut self) {
+        self.issues.linear_mut().change_key();
+    }
+
+    pub fn cancel_linear_key(&mut self) {
+        self.issues.linear_mut().cancel_change_key();
+    }
+
     /// Ask Linear again for the lists whose read failed.
     pub fn retry_linear(&mut self) {
         self.issues.linear_mut().retry();
@@ -716,6 +732,16 @@ impl Form {
                 }
                 Field::LinearTeam | Field::LinearFilter(_) => match chord.code {
                     Key::Char(' ') if bare => self.click(self.focus),
+                    Key::Up | Key::Down | Key::Left | Key::Right if bare => {
+                        let forward = matches!(chord.code, Key::Down | Key::Right);
+                        self.chose_issues = true;
+                        match self.focus {
+                            Field::LinearTeam => self.issues.linear_mut().step_team(forward),
+                            Field::LinearFilter(filter) => self.issues.linear_mut().step_filter(filter, forward),
+                            _ => {}
+                        }
+                        Step::Continue
+                    }
                     _ => Step::Continue,
                 },
                 Field::Repo => {

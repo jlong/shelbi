@@ -100,6 +100,9 @@ pub enum Request {
     /// A Linear read (or a key's login) for Settings' Linear pickers, with
     /// the project's machine's key.
     Linear(crate::linear_setup::LinearRequest),
+    /// Sync the project's status catalog from its tracker now (Settings ▸
+    /// Workflows' "Sync now" on a Linear-managed catalog).
+    SyncStatuses,
 }
 
 /// The far daemon's answer to a [`Request`].
@@ -116,6 +119,7 @@ pub enum Reply {
     Diff(crate::diff::DiffReply),
     TrackerConnected(Result<crate::tracker_connect::Connected, crate::tracker_connect::ConnectError>),
     Linear(crate::linear_setup::LinearAnswer),
+    StatusesSynced(crate::tracker_connect::StatusSync),
 }
 
 /// The far paths a path Cmd+clicked in a far terminal may name: as
@@ -225,11 +229,24 @@ pub fn linear(link: &ProjectLink, req: crate::linear_setup::LinearRequest) -> cr
         LinearRequest::Preflight(connection) => {
             LinearAnswer::Preflight { connection: connection.clone(), result: Err(why) }
         }
+        LinearRequest::Viewer => LinearAnswer::Viewer(Err(LinearFailure::Other(why))),
     };
     match link.far_request(&Request::Linear(req.clone())) {
         Ok(Reply::Linear(answer)) => answer,
         Ok(other) => failed(&req, unexpected(&other)),
         Err(e) => failed(&req, e),
+    }
+}
+
+/// Sync `link`'s project's status catalog from its tracker through its
+/// daemon (blocking). A failure to reach the daemon answers as a failed
+/// sync.
+pub fn sync_statuses(link: &ProjectLink) -> crate::tracker_connect::StatusSync {
+    use crate::tracker_connect::StatusSync;
+    match link.far_request(&Request::SyncStatuses) {
+        Ok(Reply::StatusesSynced(sync)) => sync,
+        Ok(other) => StatusSync::Failed(unexpected(&other)),
+        Err(e) => StatusSync::Failed(e),
     }
 }
 

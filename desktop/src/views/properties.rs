@@ -11,10 +11,11 @@
 //!  Repository         [ git@github.com:jlong/shelbi.git ]
 //!  Default branch     [ main                            ]
 //!  Default workflow   [ app                           ⌄ ]
-//!  Issue tracker      GitHub · jlong/shelbi
 //!  ▸ Advanced
 //!     Workspace poll interval    [ 5   ] seconds
 //!     GitHub reconcile interval  [ 900 ] seconds
+//!  ──────────────────────────────────────────────────────
+//!  Issue tracker   (the section in `tracker_section.rs`)
 //! ```
 //!
 //! The project's config is read off the UI thread through the window's
@@ -35,11 +36,12 @@ use gpui_kit::component::input::{InputEvent, InputState};
 use shelbi_app::settings::orchestrator::SaveStatus;
 use shelbi_app::settings::properties::{
     self as props, PropertiesForm, Text, ADVANCED_LABEL, DEFAULT_WORKFLOW_HELP, DEFAULT_WORKFLOW_LABEL,
-    ISSUE_TRACKER_LABEL, ISSUE_TRACKER_NOTE, SECONDS, TITLE,
+    SECONDS, TITLE,
 };
 use shelbi_app::source::ProjectHandle;
 use shelbi_state::workflow_config::WorkflowConfig;
 
+use super::tracker_section::{TrackerEvent, TrackerSection};
 use super::workflow_editor::text_field;
 use crate::assets::{glyph, glyphs, heroicon, icons};
 use crate::elements::controls;
@@ -74,7 +76,19 @@ pub struct PropertiesPage {
     workflow_scroll: MenuScroll,
     /// Re-read the config on the next draw (the page was shown again).
     reload: bool,
+    /// The Issue tracker section.
+    tracker: Entity<TrackerSection>,
     _subscriptions: Vec<Subscription>,
+}
+
+/// The tracker service for `handle`'s project: this machine's, or its far
+/// daemon's.
+pub fn tracker_service(handle: &ProjectHandle) -> shelbi_app::settings::tracker::TrackerService {
+    if handle.link.is_remote() {
+        shelbi_app::settings::tracker::TrackerService::far(&handle.link)
+    } else {
+        shelbi_orchestrator::tracker_connect::local_service(handle.name())
+    }
 }
 
 impl PropertiesPage {
@@ -93,6 +107,15 @@ impl PropertiesPage {
             }));
             inputs.insert(t, input);
         }
+        let tracker = cx.new(|cx| TrackerSection::new(tracker_service(handle), window, cx));
+        subscriptions.push(cx.subscribe_in(&tracker, window, |this, _, event: &TrackerEvent, window, cx| match event {
+            // The project changed under the page: show it as written.
+            TrackerEvent::Connected => {
+                if !cfg!(test) {
+                    this.load(window, cx);
+                }
+            }
+        }));
         let mut page = PropertiesPage {
             form,
             handle: handle.clone(),
@@ -101,6 +124,7 @@ impl PropertiesPage {
             workflow_anchor: Anchor::default(),
             workflow_scroll: MenuScroll::default(),
             reload: false,
+            tracker,
             _subscriptions: subscriptions,
         };
         // A test's page never reads the real `~/.shelbi`.
@@ -124,6 +148,9 @@ impl PropertiesPage {
     /// The config was read (a test hands it in).
     pub fn loaded(&mut self, config: Result<WorkflowConfig, String>, window: &mut Window, cx: &mut Context<Self>) {
         self.form.load(config);
+        if let Some(cfg) = self.form.issue_tracker_config().cloned() {
+            self.tracker.update(cx, |t, cx| t.load(&cfg, window, cx));
+        }
         self.fill(window, cx);
         cx.notify();
     }
@@ -148,6 +175,12 @@ impl PropertiesPage {
     #[cfg(any(test, feature = "visual-check"))]
     pub fn form(&self) -> &PropertiesForm {
         &self.form
+    }
+
+    /// The Issue tracker section.
+    #[cfg(any(test, feature = "visual-check"))]
+    pub fn tracker(&self) -> Entity<TrackerSection> {
+        self.tracker.clone()
     }
 
     /// `t`'s field.
@@ -406,19 +439,8 @@ impl Render for PropertiesPage {
             line("properties-status", text, color)
         });
         let main = [Text::Label, Text::Repository, Text::DefaultBranch].map(|t| self.text_row(t, &theme, window, cx));
-        let tracker = self.form.issue_tracker().map(|summary| {
-            row(
-                "properties-issue-tracker",
-                ISSUE_TRACKER_LABEL,
-                div()
-                    .debug_selector(|| "properties-issue-tracker-summary".into())
-                    .type_style(Type::Base)
-                    .text_color(theme.form_text)
-                    .child(summary),
-                ISSUE_TRACKER_NOTE.into(),
-                None,
-                &theme,
-            )
+        let tracker = self.form.editable().then(|| {
+            div().pt(px(24.0)).border_t_1().border_color(theme.divider).child(self.tracker.clone())
         });
         let advanced = self.form.advanced_open().then(|| {
             div()
@@ -460,9 +482,9 @@ impl Render for PropertiesPage {
             .children(unreadable)
             .children(main)
             .child(self.workflow_row(&theme, cx))
-            .children(tracker)
             .child(self.advanced_toggle(&theme, cx))
             .children(advanced)
             .children(status)
+            .children(tracker)
     }
 }

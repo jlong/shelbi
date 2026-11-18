@@ -422,3 +422,55 @@ fn edit_yaml_writes_the_shipped_catalog_when_there_is_none() {
         Err("Couldn't find gone.yaml.".to_string())
     );
 }
+
+#[test]
+fn a_linear_managed_catalog_takes_category_edits_only_and_says_so() {
+    let home = Home::new("managed");
+    fixture::write_linear_project(&shelbi_state::projects_dir().unwrap(), PROJECT);
+    let mut state = loaded();
+    assert_eq!(state.read_only(), Some(shelbi_core::TrackerName::Linear));
+    let banner = state.banner().unwrap();
+    assert!(banner.starts_with("Statuses are managed by Linear (team ENG)."), "{banner}");
+    assert!(state.delete_status_blocked("canceled").unwrap().contains("Linear"));
+
+    // The catalog's own edits are refused at the row, before any save.
+    for edit in [
+        Edit::RenameStatus { id: "todo".into(), name: "Ready".into() },
+        Edit::StepStatus { id: "todo".into(), down: true },
+        Edit::DeleteStatus { id: "canceled".into() },
+        Edit::AddStatus { name: "QA".into(), category: StatusCategory::Handoff },
+    ] {
+        let target = edit.target();
+        assert!(state.request(edit).is_none());
+        assert!(state.error_at(&target).unwrap().contains("managed by Linear"), "{:?}", state.errors());
+        assert!(!state.saving());
+    }
+    let before = home.read("statuses.yaml");
+    assert!(before.contains("name: To Do"));
+
+    // A category is Shelbi's, and saves.
+    make(&mut state, Edit::SetCategory { id: "review".into(), category: StatusCategory::Active });
+    assert_eq!(state.error_at(&Target::Status("review".into())), None);
+    let after = home.read("statuses.yaml");
+    assert!(after.contains("managed_by: linear"), "{after}");
+    assert!(after.contains("id: review\n  name: Review\n  category: active"), "{after}");
+
+    // Sync now: one at a time, its outcome shown.
+    assert!(state.begin_sync());
+    assert!(!state.begin_sync(), "one sync at a time");
+    state.synced(shelbi_app::tracker_connect::StatusSync::Failed("Linear's rate limit is spent".into()));
+    assert_eq!(
+        state.sync_note(),
+        Some(&Err("Couldn't sync the statuses: Linear's rate limit is spent".into()))
+    );
+    drop(home);
+}
+
+#[test]
+fn an_unmanaged_catalog_has_no_banner_and_no_sync() {
+    let home = Home::new("unmanaged");
+    let mut state = loaded();
+    assert_eq!((state.read_only(), state.banner()), (None, None));
+    assert!(!state.begin_sync());
+    drop(home);
+}

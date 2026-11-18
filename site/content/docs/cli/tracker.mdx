@@ -112,6 +112,22 @@ not a switch.
 board. It asks first at a terminal (`-y` skips the question) and follows the
 same rule for a board with issues.
 
+### From Settings or a new project
+
+The desktop app and the TUI offer the same choice. When you add a project, the
+Issues step lists Local board, GitHub Issues and Linear. In an existing
+project, **Settings > Properties > Issue tracker** connects, switches or
+disconnects it, and edits the Linear filters. Choosing Linear shows whose API
+key this machine uses (with Change key), or a field to paste one: Verify checks
+it with Linear and stores it in the keychain, as `shelbi tracker linear login`
+does. Then pick the team (required) and, optionally, a project, a label and an
+assignee from lists read from Linear. A line under the pickers says which
+issues the board will show and create. Nothing is written until you press
+Connect (or Save, for new filters on the same team), which runs the same checks
+as `connect`. When a switch is refused because the board has issues, the
+section shows how to migrate them and offers Switch anyway, the `--force`
+above.
+
 ## Rate limits
 
 Every Linear response's rate-limit headers are recorded per API key under
