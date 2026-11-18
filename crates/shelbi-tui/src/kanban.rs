@@ -6962,11 +6962,13 @@ transitions:
     #[test]
     fn compute_column_widths_drops_overflow_and_scrolls() {
         let ps = shelbi_core::ProjectStatuses {
+            managed_by: None,
             statuses: (0..10)
                 .map(|i| shelbi_core::ProjectStatus {
                     id: format!("s{i}"),
                     name: format!("Status{i}"),
                     category: StatusCategory::Active,
+                    external_id: None,
                 })
                 .collect(),
         };
@@ -7066,11 +7068,13 @@ transitions:
     #[test]
     fn ensure_selected_visible_keeps_selection_in_view() {
         let ps = shelbi_core::ProjectStatuses {
+            managed_by: None,
             statuses: (0..10)
                 .map(|i| shelbi_core::ProjectStatus {
                     id: format!("s{i}"),
                     name: format!("Status{i}"),
                     category: StatusCategory::Active,
+                    external_id: None,
                 })
                 .collect(),
         };

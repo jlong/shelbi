@@ -175,7 +175,7 @@ enum Cmd {
         cmd: commands::issue_store::IssueStoreCmd,
     },
     /// Connect to an external issue tracker and inspect the connection:
-    /// `shelbi tracker linear login|status|teams|projects|labels|users`.
+    /// `shelbi tracker linear login|status|sync|teams|projects|labels|users`.
     Tracker {
         #[command(subcommand)]
         cmd: commands::tracker::TrackerCmd,
@@ -1220,6 +1220,23 @@ mod cli_tests {
         }
         Cli::try_parse_from(["shelbi", "tracker", "linear", "labels", "--team", "ENG"]).unwrap();
         assert!(Cli::try_parse_from(["shelbi", "tracker", "linear", "teams", "--team", "ENG"]).is_err());
+
+        let cli = Cli::parse_from(["shelbi", "tracker", "linear", "sync", "--rewrite-workflows", "--yes"]);
+        assert!(matches!(
+            cli.cmd,
+            Some(Cmd::Tracker {
+                cmd: TrackerCmd::Linear {
+                    cmd: LinearCmd::Sync { dry_run: false, rewrite_workflows: true, yes: true }
+                }
+            })
+        ));
+        Cli::try_parse_from(["shelbi", "tracker", "linear", "sync", "--dry-run"]).unwrap();
+        // --yes only means something with --rewrite-workflows, and never with --dry-run.
+        assert!(Cli::try_parse_from(["shelbi", "tracker", "linear", "sync", "--yes"]).is_err());
+        assert!(Cli::try_parse_from([
+            "shelbi", "tracker", "linear", "sync", "--rewrite-workflows", "--yes", "--dry-run"
+        ])
+        .is_err());
     }
 
     /// `shelbi issue-store migrate --to github` parses into the target backend,

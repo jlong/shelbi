@@ -9682,21 +9682,25 @@ Auto mode works better when it knows your environment. Takes about a minute.
         shelbi_state::save_project_statuses(
             &project.name,
             &shelbi_core::ProjectStatuses {
+                managed_by: None,
                 statuses: vec![
                     shelbi_core::ProjectStatus {
                         id: "backlog".into(),
                         name: "Backlog".into(),
                         category: StatusCategory::Backlog,
+                        external_id: None,
                     },
                     shelbi_core::ProjectStatus {
                         id: "coding".into(),
                         name: "Coding".into(),
                         category: StatusCategory::Active,
+                        external_id: None,
                     },
                     shelbi_core::ProjectStatus {
                         id: "done".into(),
                         name: "Done".into(),
                         category: StatusCategory::Done,
+                        external_id: None,
                     },
                 ],
             },

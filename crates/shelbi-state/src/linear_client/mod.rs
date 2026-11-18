@@ -88,6 +88,7 @@ pub use filters::{
     filter_cache_path, invalidate_filter_cache, resolve_filters, resolve_filters_cached,
     resolve_team, ResolvedLinearFilters, FILTER_CACHE_FILE,
 };
+pub(crate) use filters::{read_cache_doc, write_cache_doc};
 pub use queries::{
     Connection, LinearLabel, LinearProject, LinearProjectStatus, LinearState, LinearStateType,
     LinearTeam, LinearUser, PageInfo, PAGE_SIZE,

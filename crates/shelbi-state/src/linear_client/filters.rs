@@ -196,23 +196,60 @@ pub fn resolve_filters_cached(
         resolved: resolved.clone(),
         resolved_at: Utc::now(),
     };
-    if let Ok(bytes) = serde_json::to_vec_pretty(&cache) {
-        if let Some(parent) = path.parent() {
-            let _ = crate::ensure_dir(parent);
-        }
-        let _ = crate::atomic_write(&path, &bytes);
+    if let Ok(serde_json::Value::Object(fresh)) = serde_json::to_value(&cache) {
+        // Other keys in the file (the status catalog's sync stamp) are kept.
+        let mut doc = read_cache_doc(&path);
+        doc.extend(fresh);
+        let _ = write_cache_doc(&path, &doc);
     }
     Ok(resolved)
+}
+
+/// The keys the filter cache owns in `linear.json`; anything else in the
+/// file belongs to another reader (`crate::linear_statuses`).
+const FILTER_CACHE_KEYS: &[&str] = &["filters", "resolved", "resolved_at"];
+
+/// `linear.json` as a JSON object; empty when it's missing or unreadable.
+pub(crate) fn read_cache_doc(path: &std::path::Path) -> serde_json::Map<String, serde_json::Value> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| match v {
+            serde_json::Value::Object(map) => Some(map),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Write `doc` as `linear.json` (atomically), or remove the file when `doc`
+/// is empty.
+pub(crate) fn write_cache_doc(
+    path: &std::path::Path,
+    doc: &serde_json::Map<String, serde_json::Value>,
+) -> shelbi_core::Result<()> {
+    if doc.is_empty() {
+        return match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    let bytes = serde_json::to_vec_pretty(doc)
+        .map_err(|e| shelbi_core::Error::Other(format!("encoding linear.json: {e}")))?;
+    if let Some(parent) = path.parent() {
+        crate::ensure_dir(parent)?;
+    }
+    crate::atomic_write(path, &bytes)
 }
 
 /// Drop a project's filter cache so the next resolve asks Linear again (e.g.
 /// after a project or label was deleted and recreated).
 pub fn invalidate_filter_cache(project: &str) -> shelbi_core::Result<()> {
-    match std::fs::remove_file(filter_cache_path(project)?) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(e.into()),
+    let path = filter_cache_path(project)?;
+    let mut doc = read_cache_doc(&path);
+    for key in FILTER_CACHE_KEYS {
+        doc.remove(*key);
     }
+    write_cache_doc(&path, &doc)
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ summary: Connect to an external issue tracker (Linear today), check the connecti
 ```text
 shelbi tracker linear login [--key-stdin]
 shelbi tracker linear status [--refresh] [--json]
+shelbi tracker linear sync [--dry-run] [--rewrite-workflows [--yes]]
 shelbi tracker linear teams [--json]
 shelbi tracker linear projects [--team <TEAM>] [--json]
 shelbi tracker linear labels [--team <TEAM>] [--json]
@@ -37,6 +38,9 @@ from the issues on the board (`shelbi issue`). Today it covers Linear.
    ```
 
 5. Run `shelbi tracker linear status` to check what the filters resolve to.
+6. Run `shelbi tracker linear sync --rewrite-workflows` to take the team's
+   statuses and see how your workflows map onto them, then add `--yes` to
+   write both (see [Statuses from Linear](#statuses-from-linear)).
 
 ## Where the API key lives
 
@@ -58,6 +62,7 @@ the request body from stdin.
 | --- | --- |
 | `login` | Prompts for an API key (input hidden), checks it against Linear and stores it in the keychain. `--key-stdin` reads the key from stdin instead, for example `pbpaste \| shelbi tracker linear login --key-stdin`. |
 | `status` | Shows where the key comes from, who it belongs to, the project's filters and the ids they resolve to, and the rate-limit budget left. Resolved ids are cached in `~/.shelbi/projects/<name>/linear.json`; `--refresh` resolves them again. |
+| `sync` | Syncs the project's statuses from the team's workflow states and prints what changed (added, renamed, removed, reordered, category). `--dry-run` writes nothing. `--rewrite-workflows` also shows how each workflow maps onto the new statuses, as a diff; it writes nothing (statuses included) unless `--yes` is given. |
 | `teams` | Lists the teams the key can see. |
 | `projects` | Lists a team's projects. |
 | `labels` | Lists the labels usable on a team's issues: the team's own and the workspace's. Group labels are marked: they can't be put on an issue. |
@@ -75,3 +80,28 @@ duration, never the key) to `~/.shelbi/linear-requests.log`. When Linear
 reports the limit reached, Shelbi pauses requests with that key until the reset
 time Linear gives (one minute when it gives none), and `status` shows the pause.
 Timeouts and server errors are retried with backoff.
+
+## Statuses from Linear
+
+A project connected to Linear takes its statuses from the team's workflow
+states. `sync` writes `workflows/statuses.yaml` with one status per state, in
+Linear's order, marked `managed_by: linear`. Each status keeps the state's id
+as `external_id`. The board refresh re-syncs on its own when the states change
+in Linear (it checks at most every five minutes).
+
+- **Read-only in Settings.** Adding, renaming, reordering and deleting statuses
+  happens in Linear. Settings refuses those edits with "Statuses are managed by
+  Linear".
+- **Categories stay yours.** Each state gets a default category from its type:
+  triage and backlog are `backlog`, unstarted is `ready`, started is `active`
+  (or `handoff` when the name mentions review, QA, verification or testing),
+  completed is `done`, canceled is `archived`. Change a category in Settings and
+  later syncs keep your choice.
+- **Ids never change.** A new state's id is its name in kebab case (`In Review`
+  becomes `in-review`). When a state is renamed in Linear, only the name
+  changes, so issues and workflows that use the id keep working.
+- **Workflows reference statuses by id, as before.** A workflow that names a
+  status the team doesn't have fails to load, and the error lists the
+  available ones. `sync --rewrite-workflows` maps each missing status to the
+  first Linear status of the same category, keeping its owner, agent and tags,
+  and moves `initial_status` and transitions with it.

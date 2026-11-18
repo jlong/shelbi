@@ -59,7 +59,7 @@ pub use session_health::{
     SessionProbe, SessionReading, TickVerdict, DEFAULT_LOST_THRESHOLD,
 };
 pub use shell::shell_escape;
-pub use statuses::{default_project_statuses, ProjectStatus, ProjectStatuses};
+pub use statuses::{default_project_statuses, ProjectStatus, ProjectStatuses, TrackerName};
 pub use system_memory::{format_bytes_short, recommended_workspace_count, total_memory_bytes};
 pub use workflow::{
     default_workflow, substitute_review_url, subtask_workflow, task_workflow, InlineIdentityField,

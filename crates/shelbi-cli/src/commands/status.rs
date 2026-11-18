@@ -1222,16 +1222,19 @@ issue_tracker:\n\
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let custom = ProjectStatuses {
+            managed_by: None,
             statuses: vec![
                 shelbi_core::ProjectStatus {
                     id: "z-last".into(),
                     name: "Z Last".into(),
                     category: shelbi_core::StatusCategory::Archived,
+                    external_id: None,
                 },
                 shelbi_core::ProjectStatus {
                     id: "a-first".into(),
                     name: "A First".into(),
                     category: shelbi_core::StatusCategory::Ready,
+                    external_id: None,
                 },
             ],
         };

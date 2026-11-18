@@ -1,7 +1,7 @@
 //! `shelbi tracker <tracker> <subcommand>`: connect to and inspect an external
 //! issue tracker, independent of the board itself (`shelbi issue`).
 //!
-//! Today: `shelbi tracker linear login|status|teams|projects|labels|users`.
+//! Today: `shelbi tracker linear login|status|sync|teams|projects|labels|users`.
 //! The listing commands are how a user finds the values for a project's
 //! `issue_tracker.linear` filters (team, project, label, assignee); `status`
 //! shows what a project's filters resolve to and how much rate-limit budget is
@@ -51,6 +51,10 @@ Getting started:
            assignee: me       # optional: me | email | user id
 
   5. shelbi tracker linear status           (check what the filters resolve to)
+  6. shelbi tracker linear sync --rewrite-workflows
+                                            (take the team's statuses, and see how
+                                             the workflows map onto them; add --yes
+                                             to write both)
 
 The API key is looked up in $LINEAR_API_KEY, then the macOS keychain (service
 `shelbi-linear`), then the project's ~/.shelbi/projects/<name>/tokens.yml
@@ -80,6 +84,26 @@ pub enum LinearCmd {
         /// Print JSON instead of text.
         #[arg(long)]
         json: bool,
+    },
+    /// Sync the project's statuses from its Linear team's workflow states.
+    ///
+    /// Writes `workflows/statuses.yaml` with one status per state, in Linear's
+    /// order, and prints what changed. Ids are assigned once and survive a
+    /// rename in Linear; categories you changed are kept. The board refresh
+    /// also re-syncs when the team's states change.
+    Sync {
+        /// Show the changes without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also map the project's workflows onto the synced statuses: a status
+        /// Linear doesn't have becomes the first Linear status of the same
+        /// category, keeping its owner, agent and tags. Shows a diff and
+        /// writes nothing unless --yes is given.
+        #[arg(long)]
+        rewrite_workflows: bool,
+        /// With --rewrite-workflows: write the statuses and the workflows.
+        #[arg(long, requires = "rewrite_workflows", conflicts_with = "dry_run")]
+        yes: bool,
     },
     /// List the teams this API key can see (use one's key as `team:`).
     Teams {
@@ -129,6 +153,10 @@ fn run_linear(
     match cmd {
         LinearCmd::Login { key_stdin } => login(key_stdin, input, out),
         LinearCmd::Status { refresh, json } => status(project_opt, refresh, json, out),
+        LinearCmd::Sync { dry_run, rewrite_workflows, yes } => {
+            let project = require_project(project_opt)?;
+            sync(&project, dry_run, rewrite_workflows, yes, out)
+        }
         LinearCmd::Teams { json } => {
             let project = optional_project(project_opt)?;
             let teams = client(project.as_ref().map(|p| p.name.as_str()))?.teams()?;
@@ -353,6 +381,96 @@ fn status(project_opt: Option<String>, refresh: bool, as_json: bool, out: &mut d
     }
     if let Some(b) = &budget {
         writeln!(out, "  budget:    {}", budget_line(b))?;
+    }
+    Ok(())
+}
+
+/// `shelbi tracker linear sync`: the catalog diff, applied unless dry; with
+/// `--rewrite-workflows`, the workflow diffs too, written only with `--yes`.
+fn sync(project: &str, dry_run: bool, rewrite: bool, yes: bool, out: &mut dyn Write) -> Result<()> {
+    use shelbi_state::linear_statuses;
+    // A rewrite without --yes is a full dry run: writing the catalog alone
+    // would leave the workflows it's about to show broken.
+    let write_catalog = !dry_run && (!rewrite || yes);
+    let synced = linear_statuses::sync(project, !write_catalog).map_err(|e| anyhow!("{e}"))?;
+
+    if synced.changes.is_empty() {
+        writeln!(out, "Statuses are up to date with Linear ({} statuses).", synced.after.statuses.len())?;
+    } else {
+        let verb = if synced.written { "Synced" } else { "Would sync" };
+        writeln!(out, "{verb} statuses from Linear:")?;
+        for change in &synced.changes {
+            writeln!(out, "  {change}")?;
+        }
+    }
+
+    if rewrite {
+        let rewrites = linear_statuses::plan_workflow_rewrites(project, &synced.after, &synced.before)
+            .map_err(|e| anyhow!("{e}"))?;
+        if rewrites.is_empty() {
+            writeln!(out, "\nWorkflows already use only these statuses.")?;
+        }
+        for r in &rewrites {
+            print_rewrite(out, r)?;
+        }
+        if yes {
+            let n = linear_statuses::apply_workflow_rewrites(&rewrites).map_err(|e| anyhow!("{e}"))?;
+            writeln!(out, "\nWrote {n} workflow file{}.", if n == 1 { "" } else { "s" })?;
+        } else {
+            writeln!(
+                out,
+                "\nDry run: nothing was written. Re-run with --rewrite-workflows --yes to write the \
+                 statuses and the workflows."
+            )?;
+        }
+        return Ok(());
+    }
+
+    if !synced.broken.is_empty() {
+        writeln!(out, "\nThese workflows name statuses the Linear team doesn't have:")?;
+        for b in &synced.broken {
+            writeln!(out, "  {}: {}", b.workflow, b.status)?;
+        }
+        writeln!(
+            out,
+            "Run `shelbi tracker linear sync --rewrite-workflows` to map them by category."
+        )?;
+    }
+    if dry_run && !synced.changes.is_empty() {
+        writeln!(out, "\nDry run: nothing was written.")?;
+    }
+    Ok(())
+}
+
+fn print_rewrite(out: &mut dyn Write, r: &shelbi_state::linear_statuses::WorkflowRewrite) -> Result<()> {
+    use shelbi_state::linear_statuses::{line_diff, DiffLine};
+    writeln!(out, "\nWorkflow `{}` ({}):", r.workflow, r.path.display())?;
+    for (from, to) in &r.remapped {
+        writeln!(out, "  {from} -> {to}")?;
+    }
+    for id in &r.merged {
+        writeln!(out, "  {id}: folded into a status the workflow already lists")?;
+    }
+    for id in &r.unmapped {
+        writeln!(
+            out,
+            "  {id}: no Linear status has its category; give one that category (Settings > \
+             Workflows) or edit the workflow"
+        )?;
+    }
+    if r.changes() {
+        writeln!(out, "  --- {}", r.path.display())?;
+        writeln!(out, "  +++ {} (rewritten)", r.path.display())?;
+        for line in line_diff(&r.before, &r.after) {
+            match line {
+                DiffLine::Same(l) => writeln!(out, "    {l}")?,
+                DiffLine::Removed(l) => writeln!(out, "  - {l}")?,
+                DiffLine::Added(l) => writeln!(out, "  + {l}")?,
+            }
+        }
+    }
+    if let Some(e) = &r.error {
+        writeln!(out, "  still invalid after the rewrite: {e}")?;
     }
     Ok(())
 }
@@ -587,5 +705,73 @@ project: Shelbi\n    label: bug\n    assignee: me\n";
 
         let err = run(None, LinearCmd::Teams { json: false }, "").unwrap_err();
         assert!(err.to_string().contains("shelbi tracker linear login"), "{err}");
+    }
+
+    fn sync_cmd(dry_run: bool, rewrite_workflows: bool, yes: bool) -> LinearCmd {
+        LinearCmd::Sync { dry_run, rewrite_workflows, yes }
+    }
+
+    #[test]
+    fn sync_prints_the_catalog_diff_and_flags_broken_workflows() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        register(&home, "lin", "issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n");
+        shelbi_state::scaffold_project_statuses("lin").unwrap();
+        shelbi_state::scaffold_project_workflow("lin").unwrap();
+        let fake = FakeLinear::new();
+        let _guard = fake.install();
+        let statuses = shelbi_state::statuses_path("lin").unwrap();
+        let original = std::fs::read_to_string(&statuses).unwrap();
+
+        let out = run(Some("lin"), sync_cmd(true, false, false), "").unwrap();
+        assert!(out.contains("Would sync statuses from Linear:"), "{out}");
+        assert!(out.contains("~ statuses are now managed by Linear"), "{out}");
+        assert!(out.contains("+ triage (Triage, backlog)"), "{out}");
+        assert!(out.contains("+ in-review (In Review, handoff)"), "{out}");
+        assert!(out.contains("- review (Review)"), "{out}");
+        assert!(out.contains("task: review"), "{out}");
+        assert!(out.contains("Dry run: nothing was written."), "{out}");
+        assert_eq!(std::fs::read_to_string(&statuses).unwrap(), original);
+
+        let out = run(Some("lin"), sync_cmd(false, false, false), "").unwrap();
+        assert!(out.starts_with("Synced statuses from Linear:"), "{out}");
+        assert!(out.contains("--rewrite-workflows"), "{out}");
+        assert!(std::fs::read_to_string(&statuses).unwrap().contains("managed_by: linear"));
+
+        let out = run(Some("lin"), sync_cmd(false, false, false), "").unwrap();
+        assert!(out.starts_with("Statuses are up to date with Linear (7 statuses)."), "{out}");
+    }
+
+    #[test]
+    fn sync_rewrite_workflows_is_a_dry_run_until_yes() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        register(&home, "lin", "issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n");
+        shelbi_state::scaffold_project_statuses("lin").unwrap();
+        shelbi_state::scaffold_project_workflow("lin").unwrap();
+        let fake = FakeLinear::new();
+        let _guard = fake.install();
+        let statuses = shelbi_state::statuses_path("lin").unwrap();
+        let task = shelbi_state::workflow_path("lin", "task").unwrap();
+        let (statuses_before, task_before) =
+            (std::fs::read_to_string(&statuses).unwrap(), std::fs::read_to_string(&task).unwrap());
+
+        let out = run(Some("lin"), sync_cmd(false, true, false), "").unwrap();
+        assert!(out.contains("Would sync statuses from Linear:"), "{out}");
+        assert!(out.contains("Workflow `task`"), "{out}");
+        assert!(out.contains("  review -> in-review"), "{out}");
+        assert!(out.contains("  - - id: review"), "{out}");
+        assert!(out.contains("  + - id: in-review"), "{out}");
+        assert!(!out.contains("still invalid"), "{out}");
+        assert!(out.contains("Re-run with --rewrite-workflows --yes"), "{out}");
+        assert_eq!(std::fs::read_to_string(&statuses).unwrap(), statuses_before);
+        assert_eq!(std::fs::read_to_string(&task).unwrap(), task_before);
+
+        let out = run(Some("lin"), sync_cmd(false, true, true), "").unwrap();
+        assert!(out.contains("Synced statuses from Linear:"), "{out}");
+        assert!(out.contains("Wrote 1 workflow file."), "{out}");
+        shelbi_state::load_workflow("lin", "task").unwrap();
+        let out = run(Some("lin"), sync_cmd(false, true, true), "").unwrap();
+        assert!(out.contains("Workflows already use only these statuses."), "{out}");
     }
 }
