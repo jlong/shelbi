@@ -241,6 +241,30 @@ pub(crate) fn write_cache_doc(
     crate::atomic_write(path, &bytes)
 }
 
+/// Record `resolved` as what `conn` resolves to for `project`, so the next
+/// [`resolve_filters_cached`] needs no API call (connecting a project
+/// resolves its filters once, in its preflight, then stores them here).
+/// `linear.json` is shared with other Linear state, so only the filter
+/// cache's own keys are replaced; every other key in the file is kept.
+pub fn store_filter_cache(
+    project: &str,
+    conn: &LinearConnection,
+    resolved: &ResolvedLinearFilters,
+) -> shelbi_core::Result<()> {
+    let path = filter_cache_path(project)?;
+    let mut doc = read_cache_doc(&path);
+    let cache = serde_json::to_value(FilterCache {
+        filters: conn.clone(),
+        resolved: resolved.clone(),
+        resolved_at: Utc::now(),
+    })
+    .map_err(|e| shelbi_core::Error::Other(format!("encoding linear.json: {e}")))?;
+    if let serde_json::Value::Object(cache) = cache {
+        doc.extend(cache);
+    }
+    write_cache_doc(&path, &doc)
+}
+
 /// Drop a project's filter cache so the next resolve asks Linear again (e.g.
 /// after a project or label was deleted and recreated).
 pub fn invalidate_filter_cache(project: &str) -> shelbi_core::Result<()> {
@@ -350,5 +374,22 @@ mod tests {
         invalidate_filter_cache("p").unwrap();
         invalidate_filter_cache("p").unwrap();
         assert!(!filter_cache_path("p").unwrap().exists());
+    }
+
+    #[test]
+    fn storing_the_cache_keeps_other_keys_and_serves_the_next_resolve() {
+        let _home = test_home::fresh();
+        let path = filter_cache_path("lin").unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"states_hash":"abc"}"#).unwrap();
+        let fake = FakeLinear::new();
+        let resolved = resolve_filters(&fake.client(), &conn("ENG")).unwrap();
+        store_filter_cache("lin", &conn("ENG"), &resolved).unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(doc["states_hash"], "abc", "another feature's key survives");
+        assert_eq!(doc["resolved"]["team_id"], "team-eng");
+        let calls = fake.calls().len();
+        assert_eq!(resolve_filters_cached(&fake.client(), "lin", &conn("ENG")).unwrap(), resolved);
+        assert_eq!(fake.calls().len(), calls, "a cache hit asks Linear nothing");
     }
 }

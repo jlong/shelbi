@@ -1,11 +1,13 @@
 ---
 title: shelbi tracker
 order: 21.5
-summary: Connect to an external issue tracker (Linear today), check the connection, and list the teams, projects, labels and users to use as filters.
+summary: Connect a project to an external issue tracker (Linear today) or disconnect it, check the connection, and list the teams, projects, labels and users to use as filters.
 ---
 
 ```text
 shelbi tracker linear login [--key-stdin]
+shelbi tracker linear connect [--team <TEAM>] [--linear-project <PROJECT>] [--label <LABEL>] [--assignee <ASSIGNEE>] [--force]
+shelbi tracker disconnect [--force]
 shelbi tracker linear status [--refresh] [--json]
 shelbi tracker linear sync [--dry-run] [--rewrite-workflows [--yes]]
 shelbi tracker linear teams [--json]
@@ -24,8 +26,17 @@ from the issues on the board (`shelbi issue`). Today it covers Linear.
 2. Run `shelbi tracker linear login` and paste the key. Shelbi asks Linear who
    the key belongs to, and only stores a key Linear accepts.
 3. Run `shelbi tracker linear teams` to find your team's key.
-4. Point the project at Linear (see the
-   [`linear` connection](/docs/configuration/project#linear-connection)):
+4. Connect the project:
+
+   ```sh
+   shelbi tracker linear connect --team ENG --label shelbi --assignee me
+   ```
+
+   At a terminal you can leave out `--team` and pick the team and filters from
+   lists. `shelbi init` offers the same choices for a new project. Either way
+   the project config ends up with this block (see the
+   [`linear` connection](/docs/configuration/project#linear-connection)), which
+   you can also write by hand:
 
    ```yaml
    issue_tracker:
@@ -61,6 +72,7 @@ the request body from stdin.
 | Subcommand | What it does |
 | --- | --- |
 | `login` | Prompts for an API key (input hidden), checks it against Linear and stores it in the keychain. `--key-stdin` reads the key from stdin instead, for example `pbpaste \| shelbi tracker linear login --key-stdin`. |
+| `connect` | Checks a connection, then writes it as the project's tracker: see [Connecting and switching](#connecting-and-switching). `--team` is required with `-y` or without a terminal; `--linear-project` is the Linear project filter (`--project` picks the Shelbi project). |
 | `status` | Shows where the key comes from, who it belongs to, the project's filters and the ids they resolve to, and the rate-limit budget left. Resolved ids are cached in `~/.shelbi/projects/<name>/linear.json`; `--refresh` resolves them again. |
 | `sync` | Syncs the project's statuses from the team's workflow states and prints what changed (added, renamed, removed, reordered, category). `--dry-run` writes nothing. `--rewrite-workflows` also shows how each workflow maps onto the new statuses, as a diff; it writes nothing (statuses included) unless `--yes` is given. |
 | `teams` | Lists the teams the key can see. |
@@ -71,6 +83,34 @@ the request body from stdin.
 `projects`, `labels` and `users` take the team from `--team` (key, name or id),
 or else from the current project's `issue_tracker.linear.team`. Every listing
 takes `--json`.
+
+## Connecting and switching
+
+A project connects to one external tracker at most: GitHub or Linear, or
+neither (the local file-system board). `connect` and `disconnect` replace the
+whole `issue_tracker` block, so the other tracker's block is removed.
+
+Before anything is written, `connect` checks that:
+
+- an API key is configured and Linear accepts it;
+- the team, and each filter you set, matches exactly one Linear object;
+- the key's owner can create issues in the team. A guest must be a member of
+  the team. Linear can't report a key's own permissions, so a read-only key
+  passes this check and fails on its first write.
+
+Each failure names the fix, for example the listing command that shows the
+valid values. On success the resolved ids are cached in
+`~/.shelbi/projects/<name>/linear.json`.
+
+Switching boards (from GitHub, from a local board, or to another Linear team)
+is refused while the current board has issues, because they would stay behind,
+unseen by the project. Move them with `shelbi issue-store migrate --to <backend>`
+first, or pass `--force` to switch anyway. A filter change on the same team is
+not a switch.
+
+`shelbi tracker disconnect` puts the project back on the local file-system
+board. It asks first at a terminal (`-y` skips the question) and follows the
+same rule for a board with issues.
 
 ## Rate limits
 

@@ -8,7 +8,9 @@
 //! picks the runner and model the project's agents use by default (the
 //! shared [`HarnessPicker`], the detected install preselected); the Issues
 //! screen ([`Screen::Issues`]) picks where the board lives, a GitHub repo
-//! verified by the `gh` preflight ([`Action::Preflight`]); and screen 02
+//! verified by the `gh` preflight ([`Action::Preflight`]) or a Linear team
+//! and filters ([`crate::linear_setup`], whose reads the host runs from
+//! [`Wizard::linear_due`]); and screen 02
 //! picks where its settings live ([`ConfigMode`], the folder's
 //! recommendation preselected and explained). Create Project then hands the
 //! host one [`CreateRequest`] for
@@ -44,6 +46,7 @@ use shelbi_state::orchestrator_setup::RunnerSetupError;
 
 pub use crate::harness_picker::HarnessPicker;
 pub use crate::new_project::{folder_name, Facts, FolderCheck, PickUp, Problem, Repo, Tone, Tracker};
+use crate::linear_setup::{Filter, LinearAnswer, LinearRequest};
 use crate::new_project::{IssuesChoice, NewProject};
 
 /// The footer's step count ("Step 1 of 4"): the folder, the agent defaults,
@@ -311,6 +314,13 @@ pub enum Focus {
     /// The Issues screen's cards, and its GitHub repo field.
     Tracker(Tracker),
     Repo,
+    /// The Linear card's key field (while there's no working key), team
+    /// picker and filter pickers. A picker's [`Action::Menu`] opens its
+    /// rows ([`IssuesChoice::linear`]); the choice goes to
+    /// [`Wizard::select_linear_team`] / [`Wizard::select_linear_filter`].
+    LinearKey,
+    LinearTeam,
+    LinearFilter(Filter),
     /// Screen 02's cards.
     Card(ConfigMode),
     Back,
@@ -705,6 +715,57 @@ impl Wizard {
         self.issues.set_repo(text);
     }
 
+    /// The Linear read due now (Linear is chosen on the Issues screen),
+    /// marked running: the host runs it off the UI thread and answers with
+    /// [`Self::linear_answer`]. Call until it answers `None`.
+    pub fn linear_due(&mut self) -> Option<LinearRequest> {
+        if self.screen != Screen::Issues {
+            return None;
+        }
+        self.issues.linear_due()
+    }
+
+    /// The host's answer to a [`Self::linear_due`] request. A preflight that
+    /// passed moves on to the settings, as GitHub's does.
+    pub fn linear_answer(&mut self, answer: LinearAnswer) {
+        let preflight = matches!(answer, LinearAnswer::Preflight { .. });
+        self.issues.linear_answer(answer);
+        if preflight && self.screen == Screen::Issues && self.issues.ready() {
+            self.screen = Screen::Settings;
+            self.focus = Focus::Card(self.mode);
+        }
+        self.settle_focus();
+    }
+
+    /// The Linear key field's text changed.
+    pub fn set_linear_key(&mut self, text: impl Into<String>) {
+        self.issues.linear_mut().set_key_input(text);
+    }
+
+    /// Pick the Linear team (a team menu row's value).
+    pub fn select_linear_team(&mut self, team: &str) {
+        if self.screen == Screen::Issues {
+            self.chose_issues = true;
+            self.issues.linear_mut().select_team(team);
+            self.focus = Focus::LinearTeam;
+        }
+    }
+
+    /// Pick a Linear filter (a filter menu row's value; `None` or blank is
+    /// no filter).
+    pub fn select_linear_filter(&mut self, filter: Filter, value: Option<&str>) {
+        if self.screen == Screen::Issues {
+            self.chose_issues = true;
+            self.issues.linear_mut().select_filter(filter, value);
+            self.focus = Focus::LinearFilter(filter);
+        }
+    }
+
+    /// Ask Linear again for the lists whose read failed.
+    pub fn retry_linear(&mut self) {
+        self.issues.linear_mut().retry();
+    }
+
     /// Choose the board (a card, or an arrow on one).
     pub fn select_tracker(&mut self, tracker: Tracker) {
         if self.screen == Screen::Issues {
@@ -757,7 +818,9 @@ impl Wizard {
             Screen::Folder | Screen::Defaults | Screen::Settings => {
                 self.check().is_some_and(FolderCheck::usable)
             }
-            Screen::Issues => self.check().is_some_and(FolderCheck::usable) && self.preflighting.is_none(),
+            Screen::Issues => {
+                self.check().is_some_and(FolderCheck::usable) && self.preflighting.is_none() && !self.issues.busy()
+            }
             // Try Again, once a creation has failed.
             Screen::Creating => !self.progress.running && self.progress.failed.is_some(),
             Screen::Created => self.created.is_some() && !self.opening,
@@ -823,10 +886,20 @@ impl Wizard {
                 }
             }
             Screen::Issues => {
-                order.push(Focus::Tracker(Tracker::Github));
-                order.push(Focus::Tracker(Tracker::FileSystem));
-                if self.issues.tracker() == Tracker::Github {
-                    order.push(Focus::Repo);
+                order.extend(Tracker::ALL.map(Focus::Tracker));
+                match self.issues.tracker() {
+                    Tracker::Github => order.push(Focus::Repo),
+                    Tracker::Linear => {
+                        let linear = self.issues.linear();
+                        if linear.needs_key() {
+                            order.push(Focus::LinearKey);
+                        }
+                        order.push(Focus::LinearTeam);
+                        if linear.team_option().is_some() {
+                            order.extend(Filter::ALL.map(Focus::LinearFilter));
+                        }
+                    }
+                    Tracker::FileSystem => {}
                 }
             }
             Screen::Defaults => {
@@ -956,6 +1029,12 @@ impl Wizard {
                 if self.issues.ready() {
                     self.screen = Screen::Settings;
                     self.focus = Focus::Card(self.mode);
+                    return Action::Stay;
+                }
+                if self.issues.tracker() == Tracker::Linear {
+                    // The host picks the login or the preflight up from
+                    // `linear_due`.
+                    self.issues.press_linear();
                     return Action::Stay;
                 }
                 match self.issues.preflight_due() {
@@ -1103,6 +1182,14 @@ impl Wizard {
                 self.select_tracker(tracker);
                 Action::Stay
             }
+            Focus::LinearTeam if self.screen == Screen::Issues && self.issues.linear().teams().loaded().is_some() => {
+                Action::Menu(Focus::LinearTeam)
+            }
+            Focus::LinearFilter(filter)
+                if self.screen == Screen::Issues && self.issues.linear().filter_options(filter).loaded().is_some() =>
+            {
+                Action::Menu(Focus::LinearFilter(filter))
+            }
             Focus::Back => self.back(),
             Focus::Primary => self.primary(),
             _ => Action::Stay,
@@ -1147,11 +1234,8 @@ impl Wizard {
                 Action::Stay
             }
             Key::Up | Key::Down | Key::Left | Key::Right if bare && !in_text && matches!(self.focus, Focus::Tracker(_)) => {
-                let other = match self.issues.tracker() {
-                    Tracker::Github => Tracker::FileSystem,
-                    Tracker::FileSystem => Tracker::Github,
-                };
-                self.select_tracker(other);
+                let forward = matches!(chord.code, Key::Down | Key::Right);
+                self.select_tracker(self.issues.tracker().step(forward));
                 Action::Stay
             }
             Key::Up | Key::Down | Key::Left | Key::Right if bare && !in_text => {
@@ -1820,7 +1904,14 @@ mod tests {
         assert_eq!(w.issues().tracker(), Tracker::Github, "a GitHub origin");
         assert_eq!(
             w.tab_order(),
-            [Focus::Tracker(Tracker::Github), Focus::Tracker(Tracker::FileSystem), Focus::Repo, Focus::Back, Focus::Primary]
+            [
+                Focus::Tracker(Tracker::Github),
+                Focus::Tracker(Tracker::Linear),
+                Focus::Tracker(Tracker::FileSystem),
+                Focus::Repo,
+                Focus::Back,
+                Focus::Primary
+            ]
         );
         assert_eq!(w.primary(), Action::Preflight("acme/acme".into()));
         assert!(w.preflighting() && !w.primary_enabled(), "one preflight at a time");
@@ -1861,5 +1952,61 @@ mod tests {
         let Action::Create(request) = w.primary() else { panic!("a pick-up creates from screen 01") };
         assert!(request.plan.pick_up);
         assert_eq!(w.screen(), Screen::Creating);
+    }
+
+    #[test]
+    fn linear_loads_its_pickers_needs_a_team_and_moves_on_once_its_preflight_passes() {
+        use crate::linear_setup::{LinearFailure, PickOption, TEAM_REQUIRED};
+        let mut w = wizard(Origin::Workspace);
+        w.folder_picked(Some(Path::new("/Users/me/Projects/acme")));
+        answer(&mut w, found("/Users/me/Projects/acme", "acme", Repo::Git));
+        w.primary();
+        w.primary();
+        assert_eq!(w.screen(), Screen::Issues);
+        assert_eq!(w.linear_due(), None, "the file system reads nothing");
+        w.set_focus(Focus::Tracker(Tracker::FileSystem));
+        w.handle_key(key(Key::Left), false);
+        assert_eq!(w.issues().tracker(), Tracker::Linear, "an arrow reaches Linear");
+
+        // No key: the key field joins the tab order.
+        assert_eq!(w.linear_due(), Some(LinearRequest::Teams));
+        w.linear_answer(LinearAnswer::Teams(Err(LinearFailure::MissingKey("no key".into()))));
+        assert!(w.tab_order().contains(&Focus::LinearKey));
+        w.set_linear_key("lin_api_x");
+        assert_eq!(w.handle_key(key(Key::Enter), false), Action::Stay);
+        assert!(matches!(w.linear_due(), Some(LinearRequest::Login(_))));
+        assert!(!w.primary_enabled(), "Continue waits on the login");
+        w.linear_answer(LinearAnswer::Login(Ok("ada".into())));
+        assert!(!w.tab_order().contains(&Focus::LinearKey));
+        assert_eq!(w.linear_due(), Some(LinearRequest::Teams));
+        let eng = PickOption { id: "team-eng".into(), value: "ENG".into(), label: "ENG".into(), detail: None };
+        w.linear_answer(LinearAnswer::Teams(Ok(vec![eng])));
+
+        // Continue with no team says so.
+        w.primary();
+        assert_eq!(w.issues().error(), Some(TEAM_REQUIRED));
+        assert_eq!(w.activate(Focus::LinearTeam), Action::Menu(Focus::LinearTeam));
+        assert_eq!(w.activate(Focus::LinearFilter(Filter::Label)), Action::Stay, "no lists before a team");
+        w.select_linear_team("ENG");
+        assert!(w.tab_order().contains(&Focus::LinearFilter(Filter::Assignee)));
+        assert_eq!(w.linear_due(), Some(LinearRequest::TeamLists { team_id: "team-eng".into() }));
+        w.linear_answer(LinearAnswer::TeamLists {
+            team_id: "team-eng".into(),
+            projects: Ok(Vec::new()),
+            labels: Ok(Vec::new()),
+            users: Ok(Vec::new()),
+        });
+        assert_eq!(w.activate(Focus::LinearFilter(Filter::Assignee)), Action::Menu(Focus::LinearFilter(Filter::Assignee)));
+        w.select_linear_filter(Filter::Assignee, Some("me"));
+
+        w.primary();
+        let Some(LinearRequest::Preflight(conn)) = w.linear_due() else { panic!("preflight due") };
+        assert_eq!(conn.assignee.as_deref(), Some("me"));
+        w.linear_answer(LinearAnswer::Preflight { connection: conn, result: Ok("ENG".into()) });
+        assert_eq!(w.screen(), Screen::Settings);
+        let Action::Create(request) = w.primary() else { panic!("Create Project") };
+        let cfg = request.plan.issue_tracker;
+        assert_eq!(cfg.connection_blocks(), vec!["linear"]);
+        assert_eq!(cfg.linear.unwrap().team, "ENG");
     }
 }

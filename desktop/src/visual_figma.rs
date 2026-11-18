@@ -2578,6 +2578,11 @@ impl Run {
             create: Arc::new(|_, _, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
             refresh: Arc::new(|| {}),
             preflight: Arc::new(|_| Ok(())),
+            linear: Arc::new(|_| {
+                shelbi_app::linear_setup::LinearAnswer::Teams(Err(shelbi_app::linear_setup::LinearFailure::Other(
+                    "offscreen".into(),
+                )))
+            }),
         };
         // Each state: its name, Continues pressed, the card chosen, whether a
         // folder is picked.

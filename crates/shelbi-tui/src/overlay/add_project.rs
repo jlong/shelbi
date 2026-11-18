@@ -204,9 +204,26 @@ impl Form {
         self.follow(step)
     }
 
+    /// Run the Linear reads the shared form has due (Linear chosen on page
+    /// 3): the teams, a team's filter lists, a pasted key's login, the
+    /// preflight. Each is one small Linear round trip, brief enough to wait
+    /// for here, as the GitHub preflight is.
+    fn run_linear(&mut self) {
+        while let Some(request) = self.inner.linear_due() {
+            let answer = project_create::linear::answer(None, request);
+            self.inner.linear_answer(answer);
+        }
+    }
+
     /// Act on what the shared form asked for: validate page 1, open a menu.
     /// What's left (Continue, Submit, Cancel) is the caller's.
     fn follow(&mut self, step: Step) -> Step {
+        let step = self.follow_step(step);
+        self.run_linear();
+        step
+    }
+
+    fn follow_step(&mut self, step: Step) -> Step {
         match step {
             Step::Validate => {
                 self.close_menus();
@@ -279,6 +296,7 @@ impl Form {
             Some(Hit::Tracker(tracker)) => {
                 self.close_menus();
                 self.inner.select_tracker(tracker);
+                self.run_linear();
                 Step::Continue
             }
             None => {
@@ -475,17 +493,15 @@ fn check_line(label: &str, on: bool, focused: bool) -> Line<'static> {
     ])
 }
 
-/// Page 3: the two boards, each a radio with its description, then the
+/// Page 3: the boards, each a radio with its description, then the
 /// GitHub repo field when GitHub is chosen (and what a GitHub board writes,
 /// once the repo passed).
 fn issues_rows(rows: &mut Rows, form: &Form, w: usize) {
     let focus = form.inner.focus();
     let issues = form.inner.issues();
-    for (tracker, title, body) in [
-        (Tracker::Github, np::GITHUB_TITLE, np::GITHUB_BODY),
-        (Tracker::FileSystem, np::FILE_SYSTEM_TITLE, np::FILE_SYSTEM_BODY),
-    ] {
-        radio_rows(rows, issues.tracker() == tracker, focus == Field::Tracker, title, body, Hit::Tracker(tracker), w);
+    for tracker in Tracker::ALL {
+        let on = issues.tracker() == tracker;
+        radio_rows(rows, on, focus == Field::Tracker, tracker.title(), tracker.body(), Hit::Tracker(tracker), w);
     }
     if issues.tracker() == Tracker::Github {
         rows.push((field_line(np::GITHUB_REPO_LABEL, issues.repo(), focus == Field::Repo), Some(Hit::Field(Field::Repo))));

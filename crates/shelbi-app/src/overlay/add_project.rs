@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 
 use shelbi_core::{AgentDefaults, ConfigMode, RunnerKind};
 
+use crate::linear_setup::{Filter, LinearAnswer, LinearRequest};
 use crate::new_project::{FolderCheck, IssuesChoice, NewProject, Problem, Tracker};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 use shelbi_state::orchestrator_setup::RunnerSetupError;
@@ -116,6 +117,13 @@ pub enum Field {
     /// Page 3's board choice, and its GitHub repo field.
     Tracker,
     Repo,
+    /// Page 3's Linear fields: the key (while there's no working key), the
+    /// team picker and the optional filter pickers. A picker's
+    /// [`Step::Menu`] lists [`IssuesChoice::linear`]'s rows; the choice goes
+    /// to [`Form::select_linear_team`] / [`Form::select_linear_filter`].
+    LinearKey,
+    LinearTeam,
+    LinearFilter(Filter),
     /// Page 2's pickers.
     Harness,
     Model,
@@ -398,6 +406,60 @@ impl Form {
         self.issues.preflight_failed(repo, message);
     }
 
+    /// The Linear read due now (Linear is chosen on page 3), marked running;
+    /// the host answers with [`Self::linear_answer`]. Call until `None`.
+    pub fn linear_due(&mut self) -> Option<LinearRequest> {
+        if self.page != Page::Issues {
+            return None;
+        }
+        self.issues.linear_due()
+    }
+
+    /// The host's answer to a [`Self::linear_due`] request. A preflight that
+    /// passed moves on to the settings, as GitHub's does.
+    pub fn linear_answer(&mut self, answer: LinearAnswer) {
+        let preflight = matches!(answer, LinearAnswer::Preflight { .. });
+        self.issues.linear_answer(answer);
+        if preflight && self.page == Page::Issues && self.issues.ready() {
+            self.page = Page::Settings;
+            self.focus = Field::Config;
+        }
+        self.settle();
+    }
+
+    /// Pick the Linear team (a team menu row's value).
+    pub fn select_linear_team(&mut self, team: &str) {
+        if self.page == Page::Issues {
+            self.issues.linear_mut().select_team(team);
+            self.chose_issues = true;
+            self.focus = Field::LinearTeam;
+        }
+    }
+
+    /// Pick a Linear filter (a menu row's value; `None` or blank: none).
+    pub fn select_linear_filter(&mut self, filter: Filter, value: Option<&str>) {
+        if self.page == Page::Issues {
+            self.issues.linear_mut().select_filter(filter, value);
+            self.chose_issues = true;
+            self.focus = Field::LinearFilter(filter);
+        }
+    }
+
+    /// Ask Linear again for the lists whose read failed.
+    pub fn retry_linear(&mut self) {
+        self.issues.linear_mut().retry();
+    }
+
+    /// A Linear picker has rows to show.
+    fn linear_menu(&self, field: Field) -> bool {
+        let linear = self.issues.linear();
+        match field {
+            Field::LinearTeam => linear.teams().loaded().is_some(),
+            Field::LinearFilter(filter) => linear.filter_options(filter).loaded().is_some(),
+            _ => false,
+        }
+    }
+
     /// The answers [`Step::Submit`] creates: the checked folder with every
     /// step's choice, `None` before page 1's check.
     pub fn plan(&self) -> Option<NewProject> {
@@ -451,8 +513,24 @@ impl Form {
                 }
                 f
             }
-            Page::Issues if self.issues.tracker() == Tracker::Github => vec![Field::Tracker, Field::Repo],
-            Page::Issues => vec![Field::Tracker],
+            Page::Issues => {
+                let mut f = vec![Field::Tracker];
+                match self.issues.tracker() {
+                    Tracker::Github => f.push(Field::Repo),
+                    Tracker::Linear => {
+                        let linear = self.issues.linear();
+                        if linear.needs_key() {
+                            f.push(Field::LinearKey);
+                        }
+                        f.push(Field::LinearTeam);
+                        if linear.team_option().is_some() {
+                            f.extend(Filter::ALL.map(Field::LinearFilter));
+                        }
+                    }
+                    Tracker::FileSystem => {}
+                }
+                f
+            }
             Page::Defaults if self.picker.takes_model() => vec![Field::Harness, Field::Model],
             Page::Defaults => vec![Field::Harness],
             Page::Settings => vec![Field::Config],
@@ -561,6 +639,11 @@ impl Form {
                     self.focus = Field::Config;
                     return Step::Continue;
                 }
+                if self.issues.tracker() == Tracker::Linear {
+                    // The host runs the login or preflight from `linear_due`.
+                    self.issues.press_linear();
+                    return Step::Continue;
+                }
                 match self.issues.preflight_due() {
                     Some(repo) => Step::Preflight(repo),
                     None => Step::Continue,
@@ -605,11 +688,34 @@ impl Form {
                     }
                     Step::Continue
                 }
-                Field::GitInit | Field::PickUp | Field::Tracker => match chord.code {
+                Field::Tracker => match chord.code {
+                    Key::Char(' ') | Key::Right | Key::Down if bare => {
+                        self.toggle(Field::Tracker);
+                        Step::Continue
+                    }
+                    Key::Left | Key::Up if bare => {
+                        self.issues.step(false);
+                        self.chose_issues = true;
+                        self.error = None;
+                        Step::Continue
+                    }
+                    _ => Step::Continue,
+                },
+                Field::GitInit | Field::PickUp => match chord.code {
                     Key::Char(' ') | Key::Left | Key::Right | Key::Up | Key::Down if bare => {
                         self.toggle(self.focus);
                         Step::Continue
                     }
+                    _ => Step::Continue,
+                },
+                Field::LinearKey => {
+                    let mut key = self.issues.linear().key_input().to_string();
+                    edit_text(&mut key, &mut self.error, chord);
+                    self.issues.linear_mut().set_key_input(key);
+                    Step::Continue
+                }
+                Field::LinearTeam | Field::LinearFilter(_) => match chord.code {
+                    Key::Char(' ') if bare => self.click(self.focus),
                     _ => Step::Continue,
                 },
                 Field::Repo => {
@@ -664,6 +770,8 @@ impl Form {
             Field::Back => self.back(),
             Field::Primary => self.primary(),
             Field::Harness | Field::Model => Step::Menu(field),
+            Field::LinearTeam | Field::LinearFilter(_) if self.linear_menu(field) => Step::Menu(field),
+            Field::LinearTeam | Field::LinearFilter(_) => Step::Continue,
             Field::Config => {
                 if refocus {
                     self.mode = flip(self.mode);
@@ -682,7 +790,7 @@ impl Form {
                 }
                 Step::Continue
             }
-            Field::Name | Field::Root | Field::Repo => {
+            Field::Name | Field::Root | Field::Repo | Field::LinearKey => {
                 self.error = None;
                 Step::Continue
             }
@@ -698,7 +806,7 @@ impl Form {
                 self.settle();
             }
             Field::Tracker => {
-                self.issues.toggle();
+                self.issues.step(true);
                 self.chose_issues = true;
             }
             _ => return,
@@ -854,6 +962,43 @@ mod tests {
         assert_eq!(f.page().step_label(), "Step 4 of 4");
         assert_eq!(f.page().primary(), "Create Project");
         assert_eq!(f.handle_key(key(Key::Enter)), Step::Submit);
+    }
+
+    #[test]
+    fn linear_on_page_three_needs_a_team_and_its_preflight() {
+        use crate::linear_setup::{LinearAnswer, LinearFailure, PickOption, TEAM_REQUIRED};
+        let mut f = on_defaults();
+        f.primary();
+        assert_eq!(f.page(), Page::Issues);
+        // From the file system, ← reaches Linear (the cards wrap).
+        f.handle_key(key(Key::Left));
+        assert_eq!(f.issues().tracker(), Tracker::Linear);
+        assert_eq!(f.linear_due(), Some(LinearRequest::Teams));
+        f.linear_answer(LinearAnswer::Teams(Err(LinearFailure::MissingKey("no key".into()))));
+        assert_eq!(f.fields(), [Field::Tracker, Field::LinearKey, Field::LinearTeam, Field::Back, Field::Primary]);
+        f.set_focus(Field::LinearKey);
+        for c in "lin_api_x".chars() {
+            f.handle_key(ch(c));
+        }
+        assert_eq!(f.issues().linear().key_input(), "lin_api_x");
+        assert_eq!(f.handle_key(key(Key::Enter)), Step::Continue);
+        assert!(matches!(f.linear_due(), Some(LinearRequest::Login(_))));
+        f.linear_answer(LinearAnswer::Login(Ok("ada".into())));
+        assert_eq!(f.linear_due(), Some(LinearRequest::Teams));
+        let eng = PickOption { id: "team-eng".into(), value: "ENG".into(), label: "ENG".into(), detail: None };
+        f.linear_answer(LinearAnswer::Teams(Ok(vec![eng])));
+
+        assert_eq!(f.handle_key(key(Key::Enter)), Step::Continue);
+        assert_eq!((f.page(), f.error()), (Page::Issues, Some(TEAM_REQUIRED)));
+        assert_eq!(f.click(Field::LinearTeam), Step::Menu(Field::LinearTeam));
+        f.select_linear_team("ENG");
+        assert_eq!(f.linear_due(), Some(LinearRequest::TeamLists { team_id: "team-eng".into() }));
+        assert!(f.fields().contains(&Field::LinearFilter(Filter::Label)));
+        f.handle_key(key(Key::Enter));
+        let Some(LinearRequest::Preflight(conn)) = f.linear_due() else { panic!("preflight due") };
+        f.linear_answer(LinearAnswer::Preflight { connection: conn, result: Ok("ENG".into()) });
+        assert_eq!(f.page(), Page::Settings);
+        assert_eq!(f.plan().unwrap().issue_tracker.connection_blocks(), vec!["linear"]);
     }
 
     #[test]

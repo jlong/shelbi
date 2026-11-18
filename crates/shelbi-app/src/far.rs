@@ -10,6 +10,9 @@
 //! - **Machine checks** (`shelbi_orchestrator::machine_readiness`) run SSH
 //!   from the far hub to the machine, and record what they verified in the
 //!   far hub's state.
+//! - **Tracker connections** (`shelbi_orchestrator::tracker_connect`) and
+//!   the Linear reads behind their pickers ([`crate::linear_setup`]) use the
+//!   far machine's API keys and write the far project's config.
 //! - **Edit** opens a far file: in a terminal session on the far machine
 //!   running the far `$EDITOR` ([`FarFile`]), which the window shows in a
 //!   window of its own. Far paths are never opened as local files.
@@ -91,6 +94,12 @@ pub enum Request {
     /// A read or write for the diff view (`crate::diff`): its changeset,
     /// blame, comments and viewed marks live on the project's machine.
     Diff(crate::diff::DiffRequest),
+    /// Connect the project to a tracker, switch it, or disconnect it
+    /// ([`crate::tracker_connect`]).
+    ConnectTracker(crate::tracker_connect::ConnectTracker),
+    /// A Linear read (or a key's login) for Settings' Linear pickers, with
+    /// the project's machine's key.
+    Linear(crate::linear_setup::LinearRequest),
 }
 
 /// The far daemon's answer to a [`Request`].
@@ -105,6 +114,8 @@ pub enum Reply {
     /// The editor session's name, or why it couldn't start.
     Editor(Result<String, String>),
     Diff(crate::diff::DiffReply),
+    TrackerConnected(Result<crate::tracker_connect::Connected, crate::tracker_connect::ConnectError>),
+    Linear(crate::linear_setup::LinearAnswer),
 }
 
 /// The far paths a path Cmd+clicked in a far terminal may name: as
@@ -183,6 +194,43 @@ pub fn fresh_editor_key() -> String {
 /// Why a reply isn't the one the request asks for.
 fn unexpected(reply: &Reply) -> String {
     format!("the far daemon answered something else ({reply:?})")
+}
+
+/// Connect `link`'s project to a tracker through its daemon (blocking).
+pub fn connect_tracker(
+    link: &ProjectLink,
+    req: crate::tracker_connect::ConnectTracker,
+) -> Result<crate::tracker_connect::Connected, crate::tracker_connect::ConnectError> {
+    use crate::tracker_connect::ConnectError;
+    match link.far_request(&Request::ConnectTracker(req)) {
+        Ok(Reply::TrackerConnected(result)) => result,
+        Ok(other) => Err(ConnectError::Failed(unexpected(&other))),
+        Err(e) => Err(ConnectError::Failed(e)),
+    }
+}
+
+/// Run a Linear picker read for `link`'s project through its daemon
+/// (blocking). A failure to reach the daemon answers as a failed read.
+pub fn linear(link: &ProjectLink, req: crate::linear_setup::LinearRequest) -> crate::linear_setup::LinearAnswer {
+    use crate::linear_setup::{LinearAnswer, LinearFailure, LinearRequest};
+    let failed = |req: &LinearRequest, why: String| match req {
+        LinearRequest::Teams => LinearAnswer::Teams(Err(LinearFailure::Other(why))),
+        LinearRequest::Login(_) => LinearAnswer::Login(Err(LinearFailure::Other(why))),
+        LinearRequest::TeamLists { team_id } => LinearAnswer::TeamLists {
+            team_id: team_id.clone(),
+            projects: Err(why.clone()),
+            labels: Err(why.clone()),
+            users: Err(why),
+        },
+        LinearRequest::Preflight(connection) => {
+            LinearAnswer::Preflight { connection: connection.clone(), result: Err(why) }
+        }
+    };
+    match link.far_request(&Request::Linear(req.clone())) {
+        Ok(Reply::Linear(answer)) => answer,
+        Ok(other) => failed(&req, unexpected(&other)),
+        Err(e) => failed(&req, e),
+    }
 }
 
 /// The workspace form's operations, run by the far daemon over `link`.

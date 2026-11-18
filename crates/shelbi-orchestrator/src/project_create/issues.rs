@@ -248,18 +248,27 @@ pub fn ensure_board_not_stranded(project: &str, tracker: &IssueTrackerConfig) ->
 /// first. Counts any task markdown under the project's tasks dir; a project
 /// that was never set up (no tasks dir) is empty.
 pub fn file_system_board_has_issues(project: &str) -> bool {
+    file_system_board_issue_count(project) > 0
+}
+
+/// How many task markdown files the project's local (file_system) board
+/// holds; 0 for a project that was never set up.
+pub fn file_system_board_issue_count(project: &str) -> usize {
     let Ok(tasks_dir) = shelbi_state::tasks_dir(project) else {
-        return false;
+        return 0;
     };
     let Ok(entries) = std::fs::read_dir(&tasks_dir) else {
-        return false;
+        return 0;
     };
-    entries.flatten().any(|entry| {
-        entry
-            .path()
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-    })
+    entries
+        .flatten()
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        })
+        .count()
 }
 
 #[cfg(test)]

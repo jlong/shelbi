@@ -17,8 +17,9 @@
 //!    ([`crate::harness_picker::HarnessPicker`]), the detected install
 //!    preselected.
 //! 3. [`Step::Issues`]: where the board lives ([`IssuesChoice`]), GitHub
-//!    preselected when the origin is a GitHub repo, and verified with the
-//!    `gh` preflight before the flow moves on.
+//!    preselected when the origin is a GitHub repo. GitHub is verified with
+//!    the `gh` preflight before the flow moves on, Linear with its own
+//!    ([`crate::linear_setup`]: a team is required, the filters optional).
 //! 4. [`Step::Settings`]: where the settings live ([`ConfigMode`]), the
 //!    folder's [`Facts::recommended_mode`] preselected.
 //!
@@ -28,7 +29,11 @@
 
 use std::path::{Path, PathBuf};
 
-use shelbi_core::{AgentDefaults, ConfigMode, GithubConnection, IssueTrackerBackend, IssueTrackerConfig, RunnerKind};
+use shelbi_core::{
+    AgentDefaults, ConfigMode, GithubConnection, IssueTrackerBackend, IssueTrackerConfig, LinearConnection, RunnerKind,
+};
+
+use crate::linear_setup::{LinearAnswer, LinearChoice, LinearRequest};
 
 /// The flow's steps, in the order every front end shows them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -332,20 +337,66 @@ impl FolderCheck {
     }
 }
 
-/// The two boards a new project can use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The boards a project can use: one external tracker (GitHub or Linear)
+/// or the local file system. The Linear connection's team and filters live
+/// in [`IssuesChoice::linear`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tracker {
     Github,
+    Linear,
     FileSystem,
 }
 
-/// The Issues step's choice: the board, the GitHub repo, and whether that
-/// repo passed the `gh` preflight. Checking takes `gh`, so the choice only
-/// says when a check is due ([`Self::preflight_due`]); the host runs it and
-/// answers with [`Self::preflight_passed`] or [`Self::preflight_failed`].
+impl Tracker {
+    /// The choices in the order every front end lists them.
+    pub const ALL: [Tracker; 3] = [Tracker::Github, Tracker::Linear, Tracker::FileSystem];
+
+    /// The next choice (an arrow on the cards), wrapping.
+    pub fn step(self, forward: bool) -> Tracker {
+        let n = Tracker::ALL.len();
+        let i = Tracker::ALL.iter().position(|t| *t == self).unwrap_or(0);
+        Tracker::ALL[if forward { (i + 1) % n } else { (i + n - 1) % n }]
+    }
+
+    /// The card's title and description.
+    pub fn title(self) -> &'static str {
+        match self {
+            Tracker::Github => GITHUB_TITLE,
+            Tracker::Linear => crate::linear_setup::LINEAR_TITLE,
+            Tracker::FileSystem => FILE_SYSTEM_TITLE,
+        }
+    }
+
+    pub fn body(self) -> &'static str {
+        match self {
+            Tracker::Github => GITHUB_BODY,
+            Tracker::Linear => crate::linear_setup::LINEAR_BODY,
+            Tracker::FileSystem => FILE_SYSTEM_BODY,
+        }
+    }
+
+    /// The backend a config with this choice selects.
+    pub fn backend(self) -> IssueTrackerBackend {
+        match self {
+            Tracker::Github => IssueTrackerBackend::Github,
+            Tracker::Linear => IssueTrackerBackend::Linear,
+            Tracker::FileSystem => IssueTrackerBackend::FileSystem,
+        }
+    }
+}
+
+/// The Issues step's choice: the board, the GitHub repo and whether it
+/// passed the `gh` preflight, and the Linear connection
+/// ([`LinearChoice`]). Checking takes `gh` (or Linear's API), so the choice
+/// only says when a check is due ([`Self::preflight_due`] for GitHub,
+/// [`Self::linear_due`] for Linear); the host runs it and answers with
+/// [`Self::preflight_passed`] / [`Self::preflight_failed`] or
+/// [`Self::linear_answer`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IssuesChoice {
     tracker: Tracker,
+    /// The Linear card's connection, pickers and preflight.
+    linear: LinearChoice,
     /// The repo field's text.
     repo: String,
     /// The repo text that last passed the preflight.
@@ -368,6 +419,16 @@ impl IssuesChoice {
             repo: github_repo.unwrap_or_default().to_string(),
             verified: None,
             error: None,
+            linear: LinearChoice::default(),
+        }
+    }
+
+    /// Linear, seeded with `connection` (a flag, or Settings' current one).
+    pub fn linear_with(connection: LinearConnection) -> Self {
+        IssuesChoice {
+            tracker: Tracker::Linear,
+            linear: LinearChoice::with_connection(connection),
+            ..IssuesChoice::recommended(None)
         }
     }
 
@@ -379,8 +440,57 @@ impl IssuesChoice {
         &self.repo
     }
 
+    /// Why Continue was refused: the GitHub repo's, or the Linear
+    /// choice's, for the chosen board.
     pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+        match self.tracker {
+            Tracker::Linear => self.linear.error(),
+            _ => self.error.as_deref(),
+        }
+    }
+
+    /// The Linear card's choice.
+    pub fn linear(&self) -> &LinearChoice {
+        &self.linear
+    }
+
+    pub fn linear_mut(&mut self) -> &mut LinearChoice {
+        &mut self.linear
+    }
+
+    /// The Linear read due now, when Linear is chosen
+    /// ([`LinearChoice::due`]).
+    pub fn linear_due(&mut self) -> Option<LinearRequest> {
+        if self.tracker == Tracker::Linear {
+            self.linear.due()
+        } else {
+            None
+        }
+    }
+
+    /// The host's answer to a [`Self::linear_due`] request.
+    pub fn linear_answer(&mut self, answer: LinearAnswer) {
+        self.linear.answer(answer);
+    }
+
+    /// A check is under way, so Continue waits: a Linear login or preflight
+    /// (GitHub's runs in the host, which tracks it).
+    pub fn busy(&self) -> bool {
+        self.tracker == Tracker::Linear && self.linear.busy()
+    }
+
+    /// Continue on a board that isn't ready yet: for Linear, store a pasted
+    /// key when the key field shows, else start the preflight (refusing a
+    /// missing team). GitHub's check is [`Self::preflight_due`].
+    pub fn press_linear(&mut self) {
+        if self.tracker != Tracker::Linear || self.linear.ready() {
+            return;
+        }
+        if self.linear.needs_key() && !self.linear.key_input().trim().is_empty() {
+            self.linear.submit_key();
+        } else {
+            self.linear.want_preflight();
+        }
     }
 
     /// The GitHub repo passed the preflight (as typed now).
@@ -395,12 +505,9 @@ impl IssuesChoice {
         }
     }
 
-    /// The other choice (an arrow key on the pickers).
-    pub fn toggle(&mut self) {
-        self.select(match self.tracker {
-            Tracker::Github => Tracker::FileSystem,
-            Tracker::FileSystem => Tracker::Github,
-        });
+    /// The next (or previous) choice: an arrow key on the cards.
+    pub fn step(&mut self, forward: bool) {
+        self.select(self.tracker.step(forward));
     }
 
     pub fn set_repo(&mut self, text: impl Into<String>) {
@@ -411,11 +518,13 @@ impl IssuesChoice {
         }
     }
 
-    /// Continue can move on: the file system, or a GitHub repo that passed.
+    /// Continue can move on: the file system, a GitHub repo that passed,
+    /// or a Linear connection that passed.
     pub fn ready(&self) -> bool {
         match self.tracker {
             Tracker::FileSystem => true,
             Tracker::Github => self.verified(),
+            Tracker::Linear => self.linear.ready(),
         }
     }
 
@@ -452,12 +561,20 @@ impl IssuesChoice {
     }
 
     /// The board config this choice writes. A GitHub repo that doesn't
-    /// spell `owner/repo` falls back to the file system (the step never
-    /// moves on with one).
+    /// spell `owner/repo`, or a Linear connection with no team, falls back
+    /// to the file system (the step never moves on with one).
     pub fn config(&self) -> IssueTrackerConfig {
         match self.tracker {
             Tracker::FileSystem => IssueTrackerConfig::default(),
             Tracker::Github => github_config(&self.repo).unwrap_or_default(),
+            Tracker::Linear => {
+                let cfg = self.linear.config();
+                if cfg.validate().is_ok() {
+                    cfg
+                } else {
+                    IssueTrackerConfig::default()
+                }
+            }
         }
     }
 }
@@ -571,9 +688,44 @@ mod tests {
         gh.set_repo("not a repo");
         assert_eq!(gh.preflight_due(), None);
         assert!(gh.error().is_some(), "a misspelled repo fails without a check");
-        gh.toggle();
-        assert_eq!(gh.tracker(), Tracker::FileSystem);
+        gh.step(false);
+        assert_eq!(gh.tracker(), Tracker::FileSystem, "back from GitHub wraps to the file system");
         assert!(gh.ready());
+        gh.step(true);
+        assert_eq!(gh.tracker(), Tracker::Github);
+        gh.step(true);
+        assert_eq!(gh.tracker(), Tracker::Linear);
+    }
+
+    #[test]
+    fn linear_needs_a_team_and_a_passed_preflight_and_writes_one_block() {
+        use crate::linear_setup::TEAM_REQUIRED;
+        let mut c = IssuesChoice::recommended(Some("acme/app"));
+        assert_eq!(c.linear_due(), None, "nothing to read while GitHub is chosen");
+        c.select(Tracker::Linear);
+        assert!(!c.ready());
+        assert_eq!(c.preflight_due(), None, "the gh check is GitHub's");
+        assert_eq!(c.linear_due(), Some(LinearRequest::Teams));
+        c.linear_answer(LinearAnswer::Teams(Ok(Vec::new())));
+
+        c.press_linear();
+        assert_eq!(c.error(), Some(TEAM_REQUIRED));
+        assert_eq!(c.config(), IssueTrackerConfig::default(), "no team, no Linear block");
+
+        c.linear_mut().select_team("ENG");
+        c.press_linear();
+        assert!(c.busy());
+        let Some(LinearRequest::Preflight(conn)) = c.linear_due() else { panic!("preflight due") };
+        c.linear_answer(LinearAnswer::Preflight { connection: conn, result: Ok("ENG".into()) });
+        assert!(c.ready() && !c.busy());
+        let cfg = c.config();
+        assert_eq!(cfg.backend, IssueTrackerBackend::Linear);
+        assert_eq!(cfg.connection_blocks(), vec!["linear"], "the GitHub repo isn't written");
+        assert_eq!(cfg.linear.unwrap().team, "ENG");
+
+        let seeded = IssuesChoice::linear_with(LinearConnection::for_team("DES"));
+        assert_eq!(seeded.tracker(), Tracker::Linear);
+        assert_eq!(seeded.linear().team(), "DES");
     }
 
     #[test]
