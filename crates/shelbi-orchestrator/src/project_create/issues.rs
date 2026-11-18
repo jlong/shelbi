@@ -232,12 +232,29 @@ pub fn ensure_board_not_stranded(project: &str, tracker: &IssueTrackerConfig) ->
         return Ok(());
     }
     if file_system_board_has_issues(project) {
-        // Name the target's connection in flags: the project's config doesn't
-        // carry it yet (that is the switch being refused).
-        let mut to = tracker.backend.to_string();
+        let to = migrate_target_args(tracker);
+        bail!(
+            "project `{project}` already has issues on its local file_system board; switching to \
+             {backend} here would strand them. Migrate them first:\n  \
+             shelbi issue-store migrate --to {to}           # preview\n  \
+             shelbi issue-store migrate --to {to} --apply   # then migrate",
+            backend = tracker.backend,
+        );
+    }
+    Ok(())
+}
+
+/// The `--to <backend> [connection flags]` part of an `issue-store migrate`
+/// command onto `tracker`. The target's connection is named in flags because
+/// the project's config doesn't carry it yet (the switch is what's pending).
+pub fn migrate_target_args(tracker: &IssueTrackerConfig) -> String {
+    let mut to = tracker.backend.to_string();
+    if tracker.backend == IssueTrackerBackend::Github {
         if let Some(repo) = tracker.github.as_ref().map(|g| g.repo.trim()).filter(|r| !r.is_empty()) {
-            to.push_str(&format!(" --github-repo {repo}"));
+            to.push_str(&format!(" --github-repo {}", shell_word(repo)));
         }
+    }
+    if tracker.backend == IssueTrackerBackend::Linear {
         if let Some(l) = tracker.linear.as_ref() {
             for (flag, value) in [
                 ("--linear-team", l.team_ref()),
@@ -250,15 +267,8 @@ pub fn ensure_board_not_stranded(project: &str, tracker: &IssueTrackerConfig) ->
                 }
             }
         }
-        bail!(
-            "project `{project}` already has issues on its local file_system board; switching to \
-             {backend} here would strand them. Migrate them first:\n  \
-             shelbi issue-store migrate --to {to}           # preview\n  \
-             shelbi issue-store migrate --to {to} --apply   # then migrate",
-            backend = tracker.backend,
-        );
     }
-    Ok(())
+    to
 }
 
 /// `value` as one shell word: bare when it is plain, single-quoted otherwise.

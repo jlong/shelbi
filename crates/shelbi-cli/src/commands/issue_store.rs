@@ -313,8 +313,8 @@ fn migrate(project: &str, args: &MigrateArgs) -> Result<()> {
 fn switch_hint(target: IssueTrackerBackend) -> String {
     let how = match target {
         IssueTrackerBackend::Linear => {
-            "set `issue_tracker.backend: linear` with its `linear:` block (`shelbi tracker linear \
-             status` checks it), or connect it in Settings"
+            "run `shelbi tracker linear connect --team <TEAM> --force` (the old board still has \
+             its issues, so the switch needs --force)"
         }
         IssueTrackerBackend::Github => {
             "set `issue_tracker.backend: github` with its `github:` block, or connect it in Settings"

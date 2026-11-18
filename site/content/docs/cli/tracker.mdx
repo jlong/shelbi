@@ -105,7 +105,8 @@ valid values. On success the resolved ids are cached in
 Switching boards (from GitHub, from a local board, or to another Linear team)
 is refused while the current board has issues, because they would stay behind,
 unseen by the project. Move them with `shelbi issue-store migrate --to <backend>`
-first, or pass `--force` to switch anyway. A filter change on the same team is
+first (it previews; add `--apply` to move them), or pass `--force` to switch
+anyway. A filter change on the same team is
 not a switch.
 
 `shelbi tracker disconnect` puts the project back on the local file-system
@@ -166,7 +167,8 @@ every client and agent reads the board without spending budget.
   and filters, so it finds open and closed issues the board hasn't loaded.
 
 To move an existing board onto Linear (from the local board or from GitHub),
-use [`shelbi issue-store migrate --to linear`](/docs/cli/issue#issue-store-migrate).
+use [`shelbi issue-store migrate --to linear`](/docs/cli/issue#issue-store-migrate),
+then `shelbi tracker linear connect` to point the project at it.
 
 ## Statuses from Linear
 
