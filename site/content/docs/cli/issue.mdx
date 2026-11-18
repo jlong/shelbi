@@ -403,24 +403,61 @@ markdown file; on a `github` board it is a native GitHub issue comment. See the
 ## issue-store migrate
 
 ```text
-shelbi issue-store migrate --to <BACKEND> [--dry-run] [--pace-secs <SECS>]
+shelbi issue-store migrate --to <BACKEND> [--from <BACKEND>] [--apply] [--pace-secs <SECS>]
+                           [--github-repo <OWNER/REPO>]
+                           [--linear-team <TEAM> [--linear-project <P>] [--linear-label <L>] [--linear-assignee <WHO>]]
 ```
 
 `issue-store` is a sibling top-level command that operates on the backend itself.
 Its one subcommand, `migrate`, moves the project's issues between the
-`file_system` and `github` backends, matched on the stable Shelbi id so a re-run
-never duplicates an already-migrated card. The source is the *other* live backend:
-`--to github` reads the on-disk board and creates issues; `--to file_system` reads
-GitHub issues and writes markdown files.
+`file_system`, `github` and `linear` backends, in any direction, matched on the
+stable Shelbi id so a re-run never duplicates an already-migrated card.
+
+**It previews by default.** Without `--apply` it prints the plan (every card it
+would create, every card already there, and every status it would change) and
+writes nothing. Run it once to check, then again with `--apply`.
+
+The source is `--from` when given. Otherwise it is the project's configured
+backend when that isn't the target, else the backend of a staged connection
+block, else `file_system`. A project keeps at most one external connection block
+in its config, so the side the config doesn't describe comes from flags:
+`--github-repo` for GitHub, `--linear-team` (plus the optional Linear filters)
+for Linear.
+
+What moves: each card's title, body, status, priority, and its Shelbi fields
+(workflow, branch, dependencies, PR, machine hint, Zen and launch overrides,
+params), plus its comments. Each copied comment starts with a quoted line naming
+its original author and time. Comments are copied only with a card the run
+creates, so a re-run never copies one twice. Workspace assignments are dropped.
+
+**Statuses on Linear.** A Linear team has its own workflow states. A card whose
+status the team has (same id) keeps it. Otherwise it goes into the team's first
+status of the same category (a `review` card lands in `In Review`), and the plan
+lists each such change.
 
 | Flag | Type | Default | Description |
 | --- | --- | --- | --- |
-| `--to <BACKEND>` | `github` \| `file_system` | — | Backend to migrate **into** (required). |
-| `--dry-run` | flag | off | Preview the plan without writing anything to the target. |
-| `--pace-secs <SECS>` | float | `7.5` | Seconds between successive creates on a `--to github` run, to stay under GitHub's secondary content-creation limit (80/min, 500/hr). `0` disables pacing. Ignored for `--to file_system`. |
+| `--to <BACKEND>` | `file_system` \| `github` \| `linear` | none | Backend to migrate **into** (required). |
+| `--from <BACKEND>` | `file_system` \| `github` \| `linear` | see above | Backend to migrate **from**. |
+| `--apply` | flag | off | Write to the target. Without it, only the plan is printed. |
+| `--dry-run` | flag | on | The default. Kept so existing scripts keep working; can't be combined with `--apply`. |
+| `--pace-secs <SECS>` | float | `7.5` for `github`, `3` for `linear`, `0` for `file_system` | Seconds between successive writes (creates and comments), to stay under the target's limits: GitHub's secondary content-creation limit (80/min, 500/hr), Linear's hourly request budget. `0` disables pacing. |
+| `--github-repo <OWNER/REPO>` | string | `issue_tracker.github.repo` | The repository for the GitHub side. |
+| `--linear-team <TEAM>` | string | `issue_tracker.linear.team` | The team (key, name or id) for the Linear side. |
+| `--linear-project`, `--linear-label`, `--linear-assignee` | string | unset | The Linear side's optional filters (need `--linear-team`). New issues are created inside them. |
 
 After the migration completes, switch the project's `issue_tracker.backend` to the
-new backend. See [GitHub Issues backend](/docs/concepts/github-issues#migrating-between-backends).
+new backend. See [GitHub Issues backend](/docs/concepts/github-issues#migrating-between-backends)
+and [`shelbi tracker`](/docs/cli/tracker) for Linear.
+
+```bash
+# Preview, then move a local board onto a Linear team.
+shelbi issue-store migrate --to linear --linear-team ENG
+shelbi issue-store migrate --to linear --linear-team ENG --apply
+
+# A GitHub project moving to Linear.
+shelbi issue-store migrate --from github --to linear --linear-team ENG --apply
+```
 
 ## Examples
 

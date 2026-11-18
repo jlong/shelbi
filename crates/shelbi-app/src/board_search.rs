@@ -1,11 +1,13 @@
 //! The Issues board's text search, shared by every client.
 //!
-//! On a GitHub board a query is a GitHub issue search (open and closed, scoped
-//! to the project's repo), so a match shows whether or not the board has it
-//! loaded: the done column is paginated, and a filter over the loaded cards
-//! looked arbitrarily cut off. A local (`file_system`) board, a one-character
-//! query, and a search GitHub won't serve (rate-limited, unreachable, failed)
-//! all filter the board the client already has instead
+//! On a remote board a query is the tracker's own issue search (open and
+//! closed): GitHub's issue search scoped to the project's repo, or Linear's
+//! `searchIssues` scoped by the project's team and filters. So a match shows
+//! whether or not the board has it loaded: the done column is paginated, and a
+//! filter over the loaded cards looked arbitrarily cut off. A local
+//! (`file_system`) board, a one-character query, and a search the tracker won't
+//! serve (rate-limited, unreachable, failed) all filter the board the client
+//! already has instead
 //! ([`crate::board::card_matches_search`]); the last of those says so.
 //!
 //! [`BoardSearch`] is the pure half: what was typed, when a request is due
@@ -14,7 +16,7 @@
 //! slow older response never replaces a newer one), the per-query cache
 //! ([`CACHE_TTL`]), and "load more" paging. It takes the clock as an argument
 //! and performs no IO. [`SearchWorker`] runs the requests off the UI thread
-//! through a [`SearchClient`] ([`GithubSearch`] in the apps, a fake in tests).
+//! through a [`SearchClient`] ([`TrackerSearch`] in the apps, a fake in tests).
 //! A client holds one of each and calls [`BoardSearch::pump`] on its tick.
 
 use std::collections::{HashMap, HashSet};
@@ -29,7 +31,7 @@ use crate::board::card_matches_search;
 /// How long typing must pause before a search goes out.
 pub const DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// The shortest query (in characters, trimmed) worth a GitHub search; shorter
+/// The shortest query (in characters, trimmed) worth a tracker search; shorter
 /// ones filter the board locally.
 pub const MIN_QUERY_CHARS: usize = 2;
 
@@ -68,11 +70,13 @@ pub trait SearchClient: Send + Sync {
     fn search(&self, project: &str, query: &str, page: u32) -> Result<SearchPage, SearchFailure>;
 }
 
-/// The real client: GitHub's issue search through `gh`
-/// ([`shelbi_state::search_issues`]), on the token's search budget.
-pub struct GithubSearch;
+/// The real client: the project's tracker search
+/// ([`shelbi_state::search_issues`]): GitHub's issue search through `gh` on the
+/// token's search budget, or Linear's `searchIssues` scoped by the project's
+/// filters.
+pub struct TrackerSearch;
 
-impl SearchClient for GithubSearch {
+impl SearchClient for TrackerSearch {
     fn search(&self, project: &str, query: &str, page: u32) -> Result<SearchPage, SearchFailure> {
         use shelbi_state::IssueSearchError as E;
         shelbi_state::search_issues(project, query, page)
@@ -85,7 +89,7 @@ impl SearchClient for GithubSearch {
                 }
             })
             .map_err(|e| match e {
-                E::NotGithub => SearchFailure::Unsupported,
+                E::Unsupported => SearchFailure::Unsupported,
                 E::RateLimited => SearchFailure::RateLimited,
                 E::Unreachable => SearchFailure::Unreachable,
                 E::Failed(msg) => SearchFailure::Failed(msg),
@@ -505,9 +509,9 @@ impl SearchWorker {
         }
     }
 
-    /// The worker over GitHub's search for `project`.
-    pub fn github(project: impl Into<String>) -> SearchWorker {
-        SearchWorker::spawn(project, Arc::new(GithubSearch))
+    /// The worker over `project`'s tracker search (GitHub or Linear).
+    pub fn tracker(project: impl Into<String>) -> SearchWorker {
+        SearchWorker::spawn(project, Arc::new(TrackerSearch))
     }
 
     pub fn send(&self, request: SearchRequest) {

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use shelbi_app::activity::{read_activity_window_staged, ActivityMetaCache, ProjectInfo};
 use shelbi_app::board::{self, BoardRead, ClosedPage};
-use shelbi_app::board_search::{GithubSearch, SearchClient, SearchFailure, SearchPage};
+use shelbi_app::board_search::{TrackerSearch, SearchClient, SearchFailure, SearchPage};
 use shelbi_app::changelog::{self, ChangelogData};
 use shelbi_app::command::EditItem;
 use shelbi_app::session::{ConnectFailure, Connected, Connector, SessionRef};
@@ -210,7 +210,7 @@ impl ProjectSource for LocalSource {
     }
 
     fn search(&self, query: &str, page: u32) -> Result<SearchPage, SearchFailure> {
-        GithubSearch.search(self.name(), query, page)
+        TrackerSearch.search(self.name(), query, page)
     }
 
     fn issue_state(&self, id: &str) -> Option<ExpectedState> {

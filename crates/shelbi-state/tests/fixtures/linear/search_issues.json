@@ -1,0 +1,99 @@
+{
+  "data": {
+    "searchIssues": {
+      "totalCount": 2,
+      "nodes": [
+        {
+          "id": "issue-1",
+          "identifier": "ENG-1",
+          "number": 1,
+          "title": "Set up the board",
+          "description": "Linear-authored issue with no Shelbi attachment.",
+          "sortOrder": 100,
+          "url": "https://linear.app/acme/issue/ENG-1",
+          "createdAt": "2026-11-01T10:00:00.000Z",
+          "updatedAt": "2026-11-02T10:00:00.000Z",
+          "archivedAt": null,
+          "state": {
+            "id": "state-todo",
+            "name": "Todo",
+            "type": "unstarted"
+          },
+          "assignee": {
+            "id": "user-ada",
+            "name": "Ada Lovelace",
+            "displayName": "ada",
+            "email": "ada@example.com"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "label-shelbi"
+              }
+            ]
+          },
+          "project": {
+            "id": "proj-shelbi"
+          },
+          "attachments": {
+            "nodes": []
+          }
+        },
+        {
+          "id": "issue-2",
+          "identifier": "ENG-2",
+          "number": 2,
+          "title": "Ship the Linear store",
+          "description": "Created by Shelbi.",
+          "sortOrder": 200,
+          "url": "https://linear.app/acme/issue/ENG-2",
+          "createdAt": "2026-11-03T10:00:00.000Z",
+          "updatedAt": "2026-11-04T10:00:00.000Z",
+          "archivedAt": null,
+          "state": {
+            "id": "state-progress",
+            "name": "In Progress",
+            "type": "started"
+          },
+          "assignee": {
+            "id": "user-grace",
+            "name": "Grace Hopper",
+            "displayName": "grace",
+            "email": "grace@example.com"
+          },
+          "labels": {
+            "nodes": [
+              {
+                "id": "label-shelbi"
+              }
+            ]
+          },
+          "project": {
+            "id": "proj-shelbi"
+          },
+          "attachments": {
+            "nodes": [
+              {
+                "id": "att-2",
+                "url": "https://shelbi.dev/i/ENG/linear-store",
+                "metadata": {
+                  "shelbi": {
+                    "id": "linear-store",
+                    "workflow": "default",
+                    "depends_on": [
+                      "eng-1"
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+      ],
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "search-end"
+      }
+    }
+  }
+}

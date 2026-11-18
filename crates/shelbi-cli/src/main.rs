@@ -169,7 +169,7 @@ enum Cmd {
         cmd: commands::changelog::ChangelogCmd,
     },
     /// Operate on the issue-tracker backend itself (e.g. `migrate` between
-    /// `file_system` and `github`).
+    /// `file_system`, `github` and `linear`).
     IssueStore {
         #[command(subcommand)]
         cmd: commands::issue_store::IssueStoreCmd,
@@ -1247,52 +1247,56 @@ mod cli_tests {
         .is_err());
     }
 
-    /// `shelbi issue-store migrate --to github` parses into the target backend,
-    /// the (default-off) dry-run flag, and the default pacing.
+    /// `shelbi issue-store migrate` parses its target, an optional source, the
+    /// write switch (previews by default), pacing and the connection flags.
     #[test]
-    fn issue_store_migrate_parses_target_and_dry_run() {
-        use commands::issue_store::{IssueStoreCmd, MigrateTarget};
+    fn issue_store_migrate_parses_target_and_apply() {
+        use commands::issue_store::{IssueStoreCmd, MigrateArgs, MigrateTarget};
 
-        let cli = Cli::parse_from(["shelbi", "issue-store", "migrate", "--to", "github"]);
-        match cli.cmd {
-            Some(Cmd::IssueStore {
-                cmd: IssueStoreCmd::Migrate { to, dry_run, pace_secs },
-            }) => {
-                assert_eq!(to, MigrateTarget::Github);
-                assert!(!dry_run, "dry_run defaults off");
-                assert!(pace_secs > 0.0, "pacing defaults on for a bulk run");
+        let parse = |argv: &[&str]| -> MigrateArgs {
+            let mut full = vec!["shelbi", "issue-store", "migrate"];
+            full.extend_from_slice(argv);
+            match Cli::parse_from(full).cmd {
+                Some(Cmd::IssueStore { cmd: IssueStoreCmd::Migrate(args) }) => args,
+                other => panic!("expected IssueStore::Migrate, got {other:?}"),
             }
-            other => panic!("expected IssueStore::Migrate, got {other:?}"),
-        }
+        };
 
-        // `file_system` is the reverse target; `--dry-run` flips the flag, and
-        // `--pace-secs 0` disables pacing.
-        let cli = Cli::parse_from([
-            "shelbi",
-            "issue-store",
-            "migrate",
-            "--to",
-            "file_system",
-            "--dry-run",
-            "--pace-secs",
-            "0",
+        let a = parse(&["--to", "github"]);
+        assert_eq!(a.to, MigrateTarget::Github);
+        assert_eq!(a.from, None);
+        assert!(!a.apply, "a migration previews unless --apply is given");
+        assert_eq!(a.pace_secs, None, "pacing defaults per target");
+
+        // `--dry-run` is still accepted (the default anyway), as is `--pace-secs 0`.
+        let a = parse(&["--to", "file_system", "--dry-run", "--pace-secs", "0"]);
+        assert_eq!(a.to, MigrateTarget::FileSystem);
+        assert!(a.dry_run && !a.apply);
+        assert_eq!(a.pace_secs, Some(0.0));
+
+        // github → linear, with the Linear side's filters from flags.
+        let a = parse(&[
+            "--from", "github", "--to", "linear", "--apply", "--linear-team", "ENG",
+            "--linear-project", "Shelbi",
         ]);
-        match cli.cmd {
-            Some(Cmd::IssueStore {
-                cmd: IssueStoreCmd::Migrate { to, dry_run, pace_secs },
-            }) => {
-                assert_eq!(to, MigrateTarget::FileSystem);
-                assert!(dry_run);
-                assert_eq!(pace_secs, 0.0);
-            }
-            other => panic!("expected IssueStore::Migrate, got {other:?}"),
-        }
+        assert_eq!((a.from, a.to, a.apply), (Some(MigrateTarget::Github), MigrateTarget::Linear, true));
+        assert_eq!(a.linear_team.as_deref(), Some("ENG"));
+        assert_eq!(a.linear_project.as_deref(), Some("Shelbi"));
 
-        // `--to` is required, and only the live backends are accepted.
+        // `--to` is required; jira isn't a backend it migrates; --apply and
+        // --dry-run contradict; a Linear filter needs its team.
         assert!(Cli::try_parse_from(["shelbi", "issue-store", "migrate"]).is_err());
         assert!(
             Cli::try_parse_from(["shelbi", "issue-store", "migrate", "--to", "jira"]).is_err()
         );
+        assert!(Cli::try_parse_from([
+            "shelbi", "issue-store", "migrate", "--to", "linear", "--apply", "--dry-run"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "shelbi", "issue-store", "migrate", "--to", "linear", "--linear-label", "bug"
+        ])
+        .is_err());
     }
 
     /// `shelbi workspace list` is the canonical form and parses into

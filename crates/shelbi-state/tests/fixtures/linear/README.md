@@ -13,7 +13,7 @@ across all six types; projects `Shelbi` and `Mobile`; labels `Bug`, `shelbi`,
 (non-guest) member of ENG only. Every list is a single page; tests that
 need pagination queue their own pages.
 
-Issue operations (`Issues`, `IssueCreate`, `IssueUpdate`, `AttachmentCreate`,
+Issue operations (`Issues`, `SearchIssues`, `IssueCreate`, `IssueUpdate`, `AttachmentCreate`,
 `IssueComments`, `CommentCreate`) answer with static payloads: `ENG-1`
 (Linear-authored, no Shelbi attachment, Todo, ada) and `ENG-2` (Shelbi id
 `linear-store` in its attachment, In Progress, grace). They make a consumer

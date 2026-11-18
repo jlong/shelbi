@@ -82,8 +82,9 @@ pub use auth::{
     KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE, LINEAR_API_KEY_ENV,
 };
 pub use budget::{
-    read_budget, recent_requests, BucketSnapshot, LinearBudget, LinearRateHeaders,
-    RequestLogEntry, BUDGET_DIR, REQUESTS_LOG_FILE,
+    linear_tick_plan, read_budget, recent_requests, BucketSnapshot, LinearBucket, LinearBudget,
+    LinearRateHeaders, RequestLogEntry, BUDGET_DIR, LINEAR_PAUSE_BELOW_PCT, LINEAR_SLOW_BELOW_PCT,
+    REQUESTS_LOG_FILE,
 };
 pub use client::{LinearClient, RetryPolicy};
 pub use error::{LinearError, LinearResult, TransportFailure};
@@ -94,7 +95,7 @@ pub use filters::{
 pub(crate) use filters::{read_cache_doc, write_cache_doc};
 pub use issues::{
     merge_attachment, IssueOrder, IssueQuery, LinearAttachment, LinearComment, LinearIssue,
-    LinearRef, SHELBI_ATTACHMENT_PREFIX,
+    LinearRef, SearchPage, SHELBI_ATTACHMENT_PREFIX,
 };
 pub use queries::{
     Connection, LinearLabel, LinearProject, LinearProjectStatus, LinearState, LinearStateType,

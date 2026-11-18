@@ -1,4 +1,6 @@
-//! `shelbi doctor` — runtime health checks for a project's GitHub API budget.
+//! `shelbi doctor` — runtime health checks for a project's issue-tracker API
+//! budget (GitHub's, or for a Linear project the Linear key's; see
+//! [`report_linear`]).
 //!
 //! Phase 3 §6 of `Plans/github-issue-caching-and-rate-limits.md` asks for a
 //! `shelbi doctor` that "warns when the observed request rate would exhaust a
@@ -30,6 +32,7 @@ use chrono::{DateTime, Utc};
 use shelbi_state::gh_budget::Budget;
 use shelbi_state::gh_requests::{self, RequestEntry};
 
+use super::linear_health::{bucket_line, failure_classes, LinearHealth};
 use super::require_project;
 
 /// Time-to-exhaustion under which a budget's rate earns a warning: 30 minutes,
@@ -65,6 +68,10 @@ pub fn run(project: Option<String>) -> Result<()> {
     }
 
     let now = Utc::now();
+    if let Some(health) = LinearHealth::read(&project, now) {
+        report_linear(&project, &health, now);
+        return Ok(());
+    }
     let entries = gh_requests::recent_entries(OBSERVATION_WINDOW, now);
     let budget = github_budget_snapshot(&project);
 
@@ -95,6 +102,103 @@ pub fn run(project: Option<String>) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The Linear project's budget health: the key and account, each bucket's
+/// remaining and reset, the observed request rate projected against the
+/// requests bucket (warning, with the top callers, when it would run out
+/// within [`EXHAUSTION_WARN`]), failed attempts, a live rate-limit park, and
+/// the daemon's last refresh failure. Linear's log carries no per-request
+/// complexity, so only the requests bucket is projected.
+fn report_linear(project: &str, h: &LinearHealth, now: DateTime<Utc>) {
+    print!("{}", linear_report(project, h, now));
+}
+
+fn linear_report(project: &str, h: &LinearHealth, now: DateTime<Utc>) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let _ = writeln!(out, "Linear API budget health for `{project}`:");
+    match &h.key_source {
+        Some(_) => {
+            let _ = writeln!(out, "  api key: {}", h.key_line());
+        }
+        None => {
+            let _ = writeln!(out, "  api key: MISSING; {}", h.key_line().trim_start_matches("missing; "));
+        }
+    }
+    let _ = writeln!(
+        out,
+        "  account: {} · {}",
+        h.account.as_deref().unwrap_or("unknown (no board read yet)"),
+        h.filters_line()
+    );
+    let budget = h.budget.clone().unwrap_or_default();
+
+    // The requests bucket: rate and projection over the sent requests.
+    let sent: Vec<&shelbi_state::linear_client::RequestLogEntry> = h.sent().collect();
+    let requests = bucket_line(&budget.requests);
+    match sent.iter().map(|e| e.at).min() {
+        None => {
+            let _ = writeln!(out, "  requests: 0 in the last hour · {requests} · idle");
+        }
+        Some(oldest) => {
+            let span = (now - oldest).num_seconds().max(1) as f64;
+            let rate = sent.len() as f64 / span;
+            let per_hour = (rate * 3_600.0).round() as u64;
+            let _ = write!(out, "  requests: ~{per_hour}/hr ({} in the last hour) · {requests}", sent.len());
+            match budget.requests.remaining {
+                Some(left) => {
+                    let secs = left as f64 / rate;
+                    let _ = writeln!(out, " · exhausts in ~{}", format_duration(secs));
+                    if secs < EXHAUSTION_WARN.as_secs_f64() {
+                        let _ = writeln!(
+                            out,
+                            "    WARNING: at the observed rate the requests budget runs out in ~{} (under {} min).",
+                            format_duration(secs),
+                            EXHAUSTION_WARN.as_secs() / 60,
+                        );
+                        let mut by: std::collections::HashMap<&str, u64> = Default::default();
+                        for e in &sent {
+                            *by.entry(e.caller.as_str()).or_insert(0) += 1;
+                        }
+                        let mut ranked: Vec<(&str, u64)> = by.into_iter().collect();
+                        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+                        ranked.truncate(3);
+                        let named = ranked
+                            .iter()
+                            .map(|(c, n)| format!("{c} ({n} req)"))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let _ = writeln!(out, "    Top callers: {named}");
+                    }
+                }
+                None => {
+                    let _ = writeln!(out);
+                }
+            }
+        }
+    }
+    let failed: Vec<_> = h.failed().collect();
+    if !failed.is_empty() {
+        let _ = writeln!(
+            out,
+            "    {} failed attempt(s): {}",
+            failed.len(),
+            failure_classes(failed.into_iter())
+        );
+    }
+    let _ = writeln!(out, "  complexity: {}", bucket_line(&budget.complexity));
+    if let Some(until) = h.parked_until(now) {
+        let _ = writeln!(
+            out,
+            "  rate limited: RATELIMITED, requests paused until {}",
+            until.with_timezone(&chrono::Local).format("%H:%M:%S")
+        );
+    }
+    if let Some(err) = &h.refresh_error {
+        let _ = writeln!(out, "  board refresh: FAILING — last error: {} (at {})", err.error, err.at);
+    }
+    out
 }
 
 /// Report the daemon's macOS login-session health: a loud, actionable warning
@@ -369,6 +473,59 @@ fn format_duration(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linear_report_projects_the_requests_bucket_and_names_callers() {
+        use shelbi_state::linear_client::{BucketSnapshot, LinearBudget, RequestLogEntry};
+        let now = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let entry = |secs_ago: i64, caller: &str, outcome: &str| RequestLogEntry {
+            at: now - chrono::Duration::seconds(secs_ago),
+            op: "Issues".into(),
+            outcome: outcome.into(),
+            millis: 40,
+            caller: caller.into(),
+        };
+        // 60 requests in the last minute: 3,600/hr against 100 left.
+        let mut requests: Vec<_> = (0..40).map(|i| entry(60 - i, "daemon", "ok")).collect();
+        requests.extend((0..19).map(|i| entry(30 - i, "cli", "ok")));
+        requests.push(entry(5, "cli", "err:timeout"));
+        requests.push(entry(1, "daemon", "err:parked"));
+        let health = LinearHealth {
+            conn: shelbi_core::LinearConnection::for_team("ENG"),
+            key_source: Some("the macOS keychain".into()),
+            budget: Some(LinearBudget {
+                requests: BucketSnapshot { limit: Some(1500), remaining: Some(100), reset_at: None },
+                complexity: BucketSnapshot { limit: Some(250_000), remaining: Some(90_000), reset_at: None },
+                parked_until: Some(now.timestamp() + 120),
+                updated_at: None,
+            }),
+            account: Some("ada".into()),
+            last_refresh: None,
+            refresh_error: None,
+            requests,
+        };
+        let out = linear_report("lin", &health, now);
+        for want in [
+            "Linear API budget health for `lin`:\n",
+            "  api key: from the macOS keychain\n",
+            "  account: ada · team ENG\n",
+            "  requests: ~3600/hr (60 in the last hour) · 100 of 1500 remaining · exhausts in ~1m\n",
+            "WARNING: at the observed rate the requests budget runs out",
+            "Top callers: daemon (40 req), cli (20 req)\n",
+            "1 failed attempt(s): timeout (1)\n",
+            "  complexity: 90000 of 250000 remaining\n",
+            "  rate limited: RATELIMITED, requests paused until ",
+        ] {
+            assert!(out.contains(want), "missing {want:?} in:\n{out}");
+        }
+        assert!(!out.contains("graphql") && !out.contains("GitHub"), "{out}");
+
+        // No key: the fix is named.
+        let none = LinearHealth { key_source: None, budget: None, requests: Vec::new(), ..health };
+        let out = linear_report("lin", &none, now);
+        assert!(out.contains("api key: MISSING; run `shelbi tracker linear login`"), "{out}");
+        assert!(out.contains("requests: 0 in the last hour · remaining unknown · idle"), "{out}");
+    }
 
     fn entry(caller: &str, budget: Budget, at: DateTime<Utc>) -> RequestEntry {
         RequestEntry {

@@ -111,8 +111,8 @@ pub use github_store::{
 #[cfg(any(test, feature = "test-support"))]
 pub use github_store::{clear_test_gh_runner, set_test_gh_runner, set_test_park_side_effects};
 pub use issue_migrate::{
-    apply_issue_migration, plan_issue_migration, IssueMigrationPlan, MigrationControls,
-    PartialMigration,
+    apply_issue_migration, plan_issue_migration, plan_issue_migration_mapped, IssueMigrationPlan,
+    MigrationControls, PartialMigration, StatusRemap,
 };
 pub use occupancy::{project_is_working, slot_reads_working, BoardOccupancy, SlotOccupancy};
 pub use board_index::{
