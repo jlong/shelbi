@@ -58,6 +58,14 @@
 //!
 //! ## Decisions
 //!
+//! - A catalog synced from a tracker (`managed_by: linear` in
+//!   `statuses.yaml`) is read-only here: `add_status` / `rename_status` /
+//!   `move_status` / `delete_status` return [`ConfigError::ReadOnlyStatus`]
+//!   (the tracker owns the set, names and order; a re-sync would undo the
+//!   edit). `set_status_category` stays allowed, since category is Shelbi
+//!   semantics the tracker doesn't have. Views ask
+//!   [`statuses_read_only`](WorkflowConfig::statuses_read_only) to disable
+//!   those controls up front.
 //! - A status's id never changes; renaming edits `name:` only. A new
 //!   status's id is the kebab-case of its name, suffixed `-2`, `-3`, … to be
 //!   unique.
@@ -87,7 +95,7 @@ use std::sync::Arc;
 use yaml_serde::Value;
 use shelbi_core::{
     default_project_statuses, AwarenessMode, ConfigMode, default_workflow, validate_workflow_name, GitConfig, Owner,
-    ProjectStatus, ProjectStatuses, ReviewServe, StatusCategory, Transition, Workflow,
+    ProjectStatus, ProjectStatuses, ReviewServe, StatusCategory, TrackerName, Transition, Workflow,
     WorkflowStatus,
 };
 
@@ -109,6 +117,10 @@ pub enum ConfigError {
     Invalid(String),
     #[error("no status `{0}` in the project")]
     UnknownStatus(String),
+    /// The catalog is synced from a tracker, which owns its set, names and
+    /// order: only a status's category can be edited.
+    #[error("Statuses are managed by {0}")]
+    ReadOnlyStatus(TrackerName),
     #[error("no workflow `{0}`")]
     UnknownWorkflow(String),
     #[error("workflow `{workflow}` has no status `{status}`")]
@@ -317,6 +329,8 @@ impl SavePlan {
 pub struct WorkflowConfig {
     project: String,
     statuses: Vec<ProjectStatus>,
+    /// The catalog's `managed_by:` (fixed: no edit here changes it).
+    managed_by: Option<TrackerName>,
     workflows: Vec<Entry>,
     default_workflow: String,
     /// The project YAML's `orchestrator.awareness:` (Settings ▸ Orchestrator),
@@ -493,6 +507,7 @@ impl WorkflowConfig {
         Ok(WorkflowConfig {
             project,
             statuses: catalog.statuses.clone(),
+            managed_by: catalog.managed_by,
             workflows: entries,
             default_workflow: default_workflow.clone(),
             awareness,
@@ -531,6 +546,14 @@ impl WorkflowConfig {
 
     pub fn status(&self, id: &str) -> Option<&ProjectStatus> {
         self.statuses.iter().find(|s| s.id == id)
+    }
+
+    /// The tracker that owns the status catalog, when one does (a project
+    /// connected to Linear): Settings shows the statuses read-only then,
+    /// with only each status's category editable. `None` for a catalog
+    /// Shelbi owns, where every status edit is open.
+    pub fn statuses_read_only(&self) -> Option<TrackerName> {
+        self.managed_by
     }
 
     /// The editable workflows, in index order: loaded ones by name, then
@@ -669,24 +692,25 @@ impl WorkflowConfig {
     /// Append a status named `name` to the catalog, with the id
     /// [`status_id_for`](Self::status_id_for) gives it.
     pub fn add_status(&self, name: &str, category: StatusCategory) -> Result<Self> {
+        self.check_catalog_editable()?;
         let name = name.trim();
         let id = self.status_id_for(name);
         let mut next = self.clone();
-        next.statuses.push(ProjectStatus {
-            id,
-            name: name.to_string(),
-            category,
-        });
+        next.statuses.push(ProjectStatus::new(id, name, category));
         next.checked_catalog()
     }
 
     /// Rename a status. Its id stays, so workflows keep referencing it.
     pub fn rename_status(&self, id: &str, name: &str) -> Result<Self> {
+        self.check_catalog_editable()?;
         let mut next = self.clone();
         next.catalog_status_mut(id)?.name = name.trim().to_string();
         next.checked_catalog()
     }
 
+    /// Change a status's category. Allowed on a tracker-managed catalog too:
+    /// the tracker has no notion of Shelbi's categories, and a re-sync keeps
+    /// the choice.
     pub fn set_status_category(&self, id: &str, category: StatusCategory) -> Result<Self> {
         let mut next = self.clone();
         next.catalog_status_mut(id)?.category = category;
@@ -695,6 +719,7 @@ impl WorkflowConfig {
 
     /// Move a status to `index` in the catalog's column order.
     pub fn move_status(&self, id: &str, index: usize) -> Result<Self> {
+        self.check_catalog_editable()?;
         let mut next = self.clone();
         let from = next.catalog_index(id)?;
         move_item(&mut next.statuses, from, index)?;
@@ -703,6 +728,7 @@ impl WorkflowConfig {
 
     /// Delete a status no workflow uses.
     pub fn delete_status(&self, id: &str) -> Result<Self> {
+        self.check_catalog_editable()?;
         let at = self.catalog_index(id)?;
         let workflows = self.used_in(id);
         if !workflows.is_empty() {
@@ -1229,9 +1255,11 @@ impl WorkflowConfig {
                     .map_err(|e| file_err(&disk.statuses_path, e))?,
             };
             let base = ProjectStatuses {
+                managed_by: self.managed_by,
                 statuses: disk.statuses.clone(),
             };
             let new = ProjectStatuses {
+                managed_by: self.managed_by,
                 statuses: self.statuses.clone(),
             };
             let patched = edit_text(&base_text, &base, &new, &disk.statuses_path)?;
@@ -1330,6 +1358,14 @@ impl WorkflowConfig {
     // -----------------------------------------------------------------------
     // Helpers
 
+    /// Refuse a structural catalog edit when a tracker owns the catalog.
+    fn check_catalog_editable(&self) -> Result<()> {
+        match self.managed_by {
+            Some(tracker) => Err(ConfigError::ReadOnlyStatus(tracker)),
+            None => Ok(()),
+        }
+    }
+
     fn catalog_index(&self, id: &str) -> Result<usize> {
         self.statuses
             .iter()
@@ -1388,6 +1424,7 @@ impl WorkflowConfig {
     /// workflows.
     fn checked_catalog(mut self) -> Result<Self> {
         let catalog = ProjectStatuses {
+            managed_by: self.managed_by,
             statuses: self.statuses.clone(),
         };
         catalog.validate().map_err(invalid)?;
@@ -1407,6 +1444,7 @@ impl WorkflowConfig {
     fn checked_workflow(mut self, name: &str) -> Result<Self> {
         let at = self.workflow_index(name)?;
         let catalog = ProjectStatuses {
+            managed_by: self.managed_by,
             statuses: self.statuses.clone(),
         };
         let wf = &mut self.workflows[at].workflow;
@@ -1492,7 +1530,7 @@ fn parse_workflow(text: &str, catalog: &ProjectStatuses) -> Result<Workflow, Str
 }
 
 /// The `id`s under a workflow file's `statuses:`, read leniently.
-fn raw_status_ids(text: &str) -> Vec<String> {
+pub(crate) fn raw_status_ids(text: &str) -> Vec<String> {
     let Ok(value) = yaml_serde::from_str::<Value>(text) else {
         return Vec::new();
     };
@@ -1620,7 +1658,7 @@ fn non_empty(s: Option<&str>) -> Option<String> {
 }
 
 /// `In Progress` → `in-progress`.
-fn kebab(name: &str) -> String {
+pub(crate) fn kebab(name: &str) -> String {
     let mut out = String::new();
     for c in name.chars().flat_map(char::to_lowercase) {
         if c.is_ascii_alphanumeric() {

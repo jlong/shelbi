@@ -1208,12 +1208,14 @@ mod tests {
 
     fn statuses(ids: &[(&str, StatusCategory)]) -> ProjectStatuses {
         ProjectStatuses {
+            managed_by: None,
             statuses: ids
                 .iter()
                 .map(|(id, cat)| ProjectStatus {
                     id: id.to_string(),
                     name: id.to_string(),
                     category: *cat,
+                    external_id: None,
                 })
                 .collect(),
         }

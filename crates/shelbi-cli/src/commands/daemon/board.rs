@@ -104,6 +104,7 @@ impl BoardRefresher {
     fn refresh(&self, project: &str, interval_secs: Option<u64>) -> Result<RefreshOutcome> {
         let lock = self.lock_for(project);
         let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        sync_linear_statuses(project, interval_secs.is_none());
         let store = shelbi_state::raw_issue_store_for(project).map_err(|e| anyhow!(e))?;
         refresh_with_store(project, store.as_ref(), interval_secs)
     }
@@ -129,6 +130,34 @@ impl BoardRefresher {
     /// in so the tick doesn't re-shell to the keychain.
     fn tick(&self, project: &str, tier: &BudgetTier, interval_secs: u64) {
         handle_tick_result(project, self.refresh(project, Some(interval_secs)), tier);
+    }
+}
+
+/// A Linear project's status catalog follows the team's workflow states: a
+/// tick checks them (at most every
+/// [`STATES_CHECK_INTERVAL`](shelbi_state::linear_statuses::STATES_CHECK_INTERVAL);
+/// a manual `refresh-board` always checks) and re-syncs `statuses.yaml` when
+/// they changed. Best-effort: a failure is logged and the board refresh goes
+/// on, so a Linear blip never stalls the board. A no-op for other backends.
+fn sync_linear_statuses(project: &str, force: bool) {
+    use shelbi_state::linear_statuses;
+    let interval = if force { Duration::ZERO } else { linear_statuses::STATES_CHECK_INTERVAL };
+    match linear_statuses::refresh_if_changed(project, interval) {
+        Ok(Some(sync)) => {
+            let changes: Vec<String> = sync.changes.iter().map(ToString::to_string).collect();
+            tracing::info!(project, changes = %changes.join("; "), "shelbi daemon: re-synced statuses from Linear");
+            if !sync.broken.is_empty() {
+                let refs: Vec<String> =
+                    sync.broken.iter().map(|b| format!("{}:{}", b.workflow, b.status)).collect();
+                tracing::warn!(
+                    project,
+                    refs = %refs.join(", "),
+                    "shelbi daemon: workflows name statuses Linear no longer has; run `shelbi tracker linear sync --rewrite-workflows`",
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(project, error = %e, "shelbi daemon: Linear status sync failed"),
     }
 }
 

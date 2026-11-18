@@ -21,11 +21,46 @@ use crate::Error;
 /// [`ProjectStatuses::from_yaml_str`]) before trusting the contents.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct ProjectStatuses {
+    /// The tracker this catalog is synced from, when it isn't Shelbi's own
+    /// (`managed_by: linear`). A managed catalog's set, names and order come
+    /// from the tracker and are read-only in Settings; only each status's
+    /// [`category`](ProjectStatus::category) stays editable, because that is
+    /// Shelbi semantics the tracker doesn't know. Absent (the default) for a
+    /// hand-edited catalog. Written first so it heads the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_by: Option<TrackerName>,
+
     /// Canonical, ordered list of statuses. Ordering is significant — it's
     /// the left-to-right column order in the project-wide TUI all-view.
     /// Workflows reference these by [`ProjectStatus::id`] and inherit
     /// the ordering they see here.
     pub statuses: Vec<ProjectStatus>,
+}
+
+/// An external issue tracker that can own a project's status catalog.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackerName {
+    /// The catalog is a Linear team's workflow states.
+    Linear,
+}
+
+impl TrackerName {
+    /// The YAML token (`linear`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TrackerName::Linear => "linear",
+        }
+    }
+}
+
+impl std::fmt::Display for TrackerName {
+    /// The product name (`Linear`), for user-facing text.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            TrackerName::Linear => "Linear",
+        })
+    }
 }
 
 /// One entry in `statuses.yaml` — the project-wide identity of a status.
@@ -41,6 +76,25 @@ pub struct ProjectStatus {
     /// Closed semantic category — generic code keys off this so a project
     /// that renames a status keeps its semantics intact.
     pub category: StatusCategory,
+
+    /// The tracker's own id for this status (a Linear workflow state's
+    /// uuid) when the catalog is [managed](ProjectStatuses::managed_by).
+    /// A re-sync matches on it, so a status renamed in the tracker keeps its
+    /// Shelbi `id` (and every issue and workflow that names it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_id: Option<String>,
+}
+
+impl ProjectStatus {
+    /// A status Shelbi owns (no external id).
+    pub fn new(id: impl Into<String>, name: impl Into<String>, category: StatusCategory) -> Self {
+        ProjectStatus {
+            id: id.into(),
+            name: name.into(),
+            category,
+            external_id: None,
+        }
+    }
 }
 
 impl ProjectStatuses {
@@ -64,6 +118,19 @@ impl ProjectStatuses {
     /// single-instance category) surface as non-fatal warnings via
     /// [`ProjectStatuses::category_warnings`] rather than blocking load.
     pub fn validate(&self) -> crate::Result<()> {
+        // A tracker's states are unique by its own id too: two entries for one
+        // state would make a re-sync ambiguous.
+        let mut external: HashSet<&str> = HashSet::new();
+        for st in &self.statuses {
+            if let Some(ext) = st.external_id.as_deref() {
+                if !external.insert(ext) {
+                    return Err(invalid(format!(
+                        "statuses.yaml: status `{}`: external_id `{ext}` is used twice",
+                        st.id
+                    )));
+                }
+            }
+        }
         if self.statuses.is_empty() {
             return Err(invalid("statuses.yaml must declare at least one status"));
         }
@@ -177,6 +244,27 @@ impl ProjectStatuses {
     pub fn ids(&self) -> Vec<&str> {
         self.statuses.iter().map(|s| s.id.as_str()).collect()
     }
+
+    /// A Shelbi-owned catalog of `statuses`.
+    pub fn new(statuses: Vec<ProjectStatus>) -> Self {
+        ProjectStatuses {
+            managed_by: None,
+            statuses,
+        }
+    }
+
+    /// The status whose tracker id is `external_id` (a Linear state uuid):
+    /// how an issue's tracker state maps to its Shelbi status.
+    pub fn by_external_id(&self, external_id: &str) -> Option<&ProjectStatus> {
+        self.statuses
+            .iter()
+            .find(|s| s.external_id.as_deref() == Some(external_id))
+    }
+
+    /// The first status of `category`, in column order.
+    pub fn first_of(&self, category: StatusCategory) -> Option<&ProjectStatus> {
+        self.statuses.iter().find(|s| s.category == category)
+    }
 }
 
 /// The canonical six-status default written into `workflows/statuses.yaml`
@@ -185,37 +273,14 @@ impl ProjectStatuses {
 /// from). Matches the wireframe in `Plans/shared-statuses.md` §Wireframes.
 pub fn default_project_statuses() -> ProjectStatuses {
     ProjectStatuses {
+        managed_by: None,
         statuses: vec![
-            ProjectStatus {
-                id: "backlog".into(),
-                name: "Backlog".into(),
-                category: StatusCategory::Backlog,
-            },
-            ProjectStatus {
-                id: "todo".into(),
-                name: "Todo".into(),
-                category: StatusCategory::Ready,
-            },
-            ProjectStatus {
-                id: "in-progress".into(),
-                name: "In Progress".into(),
-                category: StatusCategory::Active,
-            },
-            ProjectStatus {
-                id: "review".into(),
-                name: "Review".into(),
-                category: StatusCategory::Handoff,
-            },
-            ProjectStatus {
-                id: "done".into(),
-                name: "Done".into(),
-                category: StatusCategory::Done,
-            },
-            ProjectStatus {
-                id: "canceled".into(),
-                name: "Canceled".into(),
-                category: StatusCategory::Archived,
-            },
+            ProjectStatus::new("backlog", "Backlog", StatusCategory::Backlog),
+            ProjectStatus::new("todo", "Todo", StatusCategory::Ready),
+            ProjectStatus::new("in-progress", "In Progress", StatusCategory::Active),
+            ProjectStatus::new("review", "Review", StatusCategory::Handoff),
+            ProjectStatus::new("done", "Done", StatusCategory::Done),
+            ProjectStatus::new("canceled", "Canceled", StatusCategory::Archived),
         ],
     }
 }
@@ -262,6 +327,40 @@ statuses:
         let y = yaml_serde::to_string(&ps).unwrap();
         let back = ProjectStatuses::from_yaml_str(&y).unwrap();
         assert_eq!(ps, back);
+    }
+
+    #[test]
+    fn a_hand_written_catalog_writes_no_tracker_fields() {
+        let y = yaml_serde::to_string(&default_project_statuses()).unwrap();
+        assert!(!y.contains("managed_by") && !y.contains("external_id"), "{y}");
+    }
+
+    #[test]
+    fn a_managed_catalog_round_trips_with_its_external_ids() {
+        let yaml = r#"
+managed_by: linear
+statuses:
+  - { id: todo, name: Todo, category: ready, external_id: state-todo }
+  - { id: done, name: Done, category: done, external_id: state-done }
+"#;
+        let ps = ProjectStatuses::from_yaml_str(yaml).unwrap();
+        assert_eq!(ps.managed_by, Some(TrackerName::Linear));
+        assert_eq!(ps.by_external_id("state-done").map(|s| s.id.as_str()), Some("done"));
+        assert_eq!(ps.first_of(StatusCategory::Ready).map(|s| s.id.as_str()), Some("todo"));
+        let back = ProjectStatuses::from_yaml_str(&yaml_serde::to_string(&ps).unwrap()).unwrap();
+        assert_eq!(back, ps);
+    }
+
+    #[test]
+    fn rejects_an_external_id_used_twice() {
+        let yaml = r#"
+managed_by: linear
+statuses:
+  - { id: todo,  name: Todo,  category: ready, external_id: s1 }
+  - { id: todo2, name: Todo2, category: done,  external_id: s1 }
+"#;
+        let err = ProjectStatuses::from_yaml_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("external_id `s1` is used twice"), "got: {err}");
     }
 
     #[test]
