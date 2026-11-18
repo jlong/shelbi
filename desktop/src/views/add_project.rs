@@ -73,6 +73,7 @@ use shelbi_app::add_project_wizard::{
     Tone, Tracker, Wizard, WorkflowOverview,
 };
 use shelbi_app::exec::Mutation;
+use shelbi_app::linear_setup::{LinearAnswer, LinearRequest};
 use shelbi_app::new_project as np;
 use shelbi_core::ConfigMode;
 use shelbi_orchestrator::project_create::{self as engine, AddProjectError, ScaffoldReporter, ScaffoldStage};
@@ -111,6 +112,10 @@ pub type RefreshFn = dyn Fn() + Send + Sync;
 /// failure.
 pub type PreflightFn = dyn Fn(&str) -> Result<(), String> + Send + Sync;
 
+/// [`Engine::linear`]'s signature: one Linear read for the Issues screen's
+/// Linear card, answered.
+pub type LinearFn = dyn Fn(LinearRequest) -> LinearAnswer + Send + Sync;
+
 /// The blocking work the wizard runs off the UI thread. A test swaps in its
 /// own, so nothing reads or writes a real Shelbi home.
 #[derive(Clone)]
@@ -124,6 +129,9 @@ pub struct Engine {
     pub refresh: Arc<RefreshFn>,
     /// The Issues screen's `gh` check of a GitHub repo.
     pub preflight: Arc<PreflightFn>,
+    /// The Issues screen's Linear reads (teams, a team's filter lists, a
+    /// pasted key's login, the preflight).
+    pub linear: Arc<LinearFn>,
 }
 
 impl Engine {
@@ -146,6 +154,7 @@ impl Engine {
                 commands::run_add_project(&mutation, attempt, out)
             }),
             preflight: Arc::new(engine::issues::preflight_github),
+            linear: Arc::new(|request| engine::linear::answer(None, request)),
         }
     }
 }
@@ -455,7 +464,26 @@ impl AddProjectView {
         self.sync_repo(window, cx);
         self.sync_focus(window, cx);
         self.run_checks(window, cx);
+        self.run_linear(window, cx);
         cx.notify();
+    }
+
+    /// Run every Linear read the wizard has due off the UI thread, each
+    /// answer back to the wizard (which drops one for a pick since changed).
+    fn run_linear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(request) = self.wizard.linear_due() {
+            let linear = self.engine.linear.clone();
+            let task = cx.background_executor().spawn(async move { linear(request) });
+            cx.spawn_in(window, async move |this, cx| {
+                let answer = task.await;
+                this.update_in(cx, |this, window, cx| {
+                    this.wizard.linear_answer(answer);
+                    this.after_change(window, cx);
+                })
+                .ok();
+            })
+            .detach();
+        }
     }
 
     /// Give the keyboard to the wizard's focused control: a text field's own
@@ -988,6 +1016,7 @@ impl AddProjectView {
     fn tracker_card(&self, tracker: Tracker, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
         let (id, title, body) = match tracker {
             Tracker::Github => ("add-project-card-github", np::GITHUB_TITLE, np::GITHUB_BODY),
+            Tracker::Linear => ("add-project-card-linear", tracker.title(), tracker.body()),
             Tracker::FileSystem => ("add-project-card-file-system", np::FILE_SYSTEM_TITLE, np::FILE_SYSTEM_BODY),
         };
         let selected = self.wizard.issues().tracker() == tracker;
@@ -1040,8 +1069,7 @@ impl AddProjectView {
             .flex_col()
             .gap(px(16.0))
             .w_full()
-            .child(self.tracker_card(Tracker::Github, window, theme, cx))
-            .child(self.tracker_card(Tracker::FileSystem, window, theme, cx))
+            .children(Tracker::ALL.map(|t| self.tracker_card(t, window, theme, cx)))
             .children(repo)
     }
 
@@ -1526,6 +1554,11 @@ mod tests {
                 }
             }),
             preflight: Arc::new(|repo| if repo == "acme/ok" { Ok(()) } else { Err("gh is not signed in".into()) }),
+            linear: Arc::new(|_| {
+                shelbi_app::linear_setup::LinearAnswer::Teams(Err(shelbi_app::linear_setup::LinearFailure::Other(
+                    "offline".into(),
+                )))
+            }),
         };
         let on_created: OnCreated = Rc::new({
             let (opened, open_fails) = (opened.clone(), open_fails.clone());
@@ -2043,9 +2076,13 @@ mod tests {
         assert_eq!(r.wizard(|w| w.screen()), Screen::Issues, "Return continues");
         assert_eq!(r.wizard(|w| w.focus()), Focus::Tracker(Tracker::FileSystem));
         r.keys("up");
-        assert_eq!(r.wizard(|w| w.issues().tracker()), Tracker::Github, "an arrow moves the board");
+        assert_eq!(r.wizard(|w| w.issues().tracker()), Tracker::Linear, "an arrow moves the board");
+        r.keys("up");
+        assert_eq!(r.wizard(|w| w.issues().tracker()), Tracker::Github);
         assert_eq!(r.wizard(|w| w.focus()), Focus::Tracker(Tracker::Github));
         r.keys("down");
+        r.keys("down");
+        assert_eq!(r.wizard(|w| w.issues().tracker()), Tracker::FileSystem);
         r.keys("enter");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
         assert_eq!(r.wizard(|w| w.focus()), Focus::Card(ConfigMode::Global));

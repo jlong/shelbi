@@ -77,6 +77,11 @@ pub fn answer_with(services: &FarServices, project: &str, request: Request) -> R
             req.target.project = project.to_string();
             Reply::Diff(shelbi_app::diff::answer(&req, services.agent_send.clone()))
         }
+        Request::ConnectTracker(req) => {
+            Reply::TrackerConnected(crate::tracker_connect::apply_tracker_connection(project, &req))
+        }
+        // The project's key: the pickers read what the connection will use.
+        Request::Linear(req) => Reply::Linear(crate::project_create::linear::answer(Some(project), req)),
     }
 }
 

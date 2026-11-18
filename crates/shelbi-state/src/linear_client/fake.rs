@@ -56,6 +56,7 @@ pub fn fixture(operation: &str) -> Option<&'static str> {
         "AttachmentCreate" => include_str!("../../tests/fixtures/linear/attachment_create.json"),
         "IssueComments" => include_str!("../../tests/fixtures/linear/issue_comments.json"),
         "CommentCreate" => include_str!("../../tests/fixtures/linear/comment_create.json"),
+        "ViewerAccess" => include_str!("../../tests/fixtures/linear/viewer_access.json"),
         _ => return None,
     })
 }
@@ -73,6 +74,7 @@ const FIXTURE_OPERATIONS: &[&str] = &[
     "AttachmentCreate",
     "IssueComments",
     "CommentCreate",
+    "ViewerAccess",
 ];
 
 /// One canned reply.

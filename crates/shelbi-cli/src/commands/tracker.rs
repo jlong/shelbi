@@ -1,11 +1,14 @@
 //! `shelbi tracker <tracker> <subcommand>`: connect to and inspect an external
 //! issue tracker, independent of the board itself (`shelbi issue`).
 //!
-//! Today: `shelbi tracker linear login|status|sync|teams|projects|labels|users`.
-//! The listing commands are how a user finds the values for a project's
-//! `issue_tracker.linear` filters (team, project, label, assignee); `status`
-//! shows what a project's filters resolve to and how much rate-limit budget is
-//! left.
+//! Today: `shelbi tracker linear login|connect|status|sync|teams|projects|labels|users`
+//! and `shelbi tracker disconnect`. The listing commands are how a user finds
+//! the values for a project's `issue_tracker.linear` filters (team, project,
+//! label, assignee); `connect` checks a connection and writes it (switching
+//! from another tracker only when the old board is empty, or with `--force`);
+//! `disconnect` puts the project back on the local file-system board;
+//! `status` shows what a project's filters resolve to and how much rate-limit
+//! budget is left.
 
 use std::io::{BufRead, Write};
 
@@ -16,6 +19,9 @@ use shelbi_core::{IssueTrackerBackend, LinearConnection};
 use shelbi_state::linear_client::{
     self, LinearBudget, LinearClient, LinearError, LinearTeam, LINEAR_API_KEY_ENV,
 };
+
+use shelbi_app::tracker_connect::{ConnectTracker, Connected, StatusSync, TrackerChoice};
+use shelbi_orchestrator::tracker_connect::apply_tracker_connection;
 
 use super::require_project;
 
@@ -31,6 +37,15 @@ pub enum TrackerCmd {
         #[command(subcommand)]
         cmd: LinearCmd,
     },
+    /// Disconnect the project's external tracker (GitHub or Linear): the
+    /// project goes back to the local file-system board. Refused while the
+    /// tracker's board has issues, unless --force (they stay in the
+    /// tracker; `shelbi issue-store migrate --to file_system` moves them).
+    Disconnect {
+        /// Disconnect even though the tracker's board has issues.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 const LINEAR_HELP: &str = "\
@@ -40,7 +55,10 @@ Getting started:
   2. shelbi tracker linear login            (paste the key; it is checked, then
                                              stored in the macOS keychain)
   3. shelbi tracker linear teams            (find your team's key, e.g. ENG)
-  4. Point the project at Linear in its config:
+  4. shelbi tracker linear connect --team ENG [--linear-project Shelbi]
+         [--label shelbi] [--assignee me]
+     (checks the connection, then writes it; at a terminal, leave out --team
+     to pick from lists). Or edit the project config by hand:
 
        issue_tracker:
          backend: linear
@@ -105,6 +123,16 @@ pub enum LinearCmd {
         #[arg(long, requires = "rewrite_workflows", conflicts_with = "dry_run")]
         yes: bool,
     },
+    /// Connect the current project to Linear: a team (required) and optional
+    /// project, label and assignee filters.
+    ///
+    /// The connection is checked first (the key works, every filter
+    /// resolves, the key can create issues in the team), then written as the
+    /// project's only tracker. Switching from GitHub, or from a local board
+    /// with issues, is refused unless the old board is empty or --force is
+    /// given. At a terminal, leaving out --team picks the team and filters
+    /// from lists; with --yes (or no terminal) --team is required.
+    Connect(ConnectArgs),
     /// List the teams this API key can see (use one's key as `team:`).
     Teams {
         /// Print JSON instead of a table.
@@ -121,6 +149,28 @@ pub enum LinearCmd {
 }
 
 #[derive(Debug, Args)]
+pub struct ConnectArgs {
+    /// The team (key, name, or id; `shelbi tracker linear teams`).
+    #[arg(long)]
+    team: Option<String>,
+    /// Optional: only this Linear project's issues (name or id). Named
+    /// `--linear-project` because `--project` picks the Shelbi project.
+    #[arg(long, value_name = "PROJECT")]
+    linear_project: Option<String>,
+    /// Optional: only issues with this label (name or id).
+    #[arg(long)]
+    label: Option<String>,
+    /// Optional: only issues assigned to this person (`me`, an email, or a
+    /// user id).
+    #[arg(long)]
+    assignee: Option<String>,
+    /// Switch even though the current board has issues (they stay where
+    /// they are, unseen by the project).
+    #[arg(long)]
+    force: bool,
+}
+
+#[derive(Debug, Args)]
 pub struct TeamListArgs {
     /// The team (key, name, or id). Defaults to the current project's
     /// `issue_tracker.linear.team`.
@@ -131,27 +181,33 @@ pub struct TeamListArgs {
     json: bool,
 }
 
-pub fn run(project_opt: Option<String>, cmd: TrackerCmd) -> Result<()> {
+pub fn run(project_opt: Option<String>, cmd: TrackerCmd, assume_yes: bool) -> Result<()> {
+    use std::io::IsTerminal;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
+    let interactive = !assume_yes && std::io::stdin().is_terminal();
     match cmd {
         TrackerCmd::Linear { cmd } => {
             let stdin = std::io::stdin();
             let mut input = stdin.lock();
-            run_linear(project_opt, cmd, &mut input, &mut out)
+            run_linear(project_opt, cmd, interactive, &mut input, &mut out)
         }
+        TrackerCmd::Disconnect { force } => disconnect(project_opt, force, interactive, &mut out),
     }
 }
 
-/// The testable body of `shelbi tracker linear ...`.
+/// The testable body of `shelbi tracker linear ...`. `interactive`: a person
+/// at a terminal can be asked (never with `--yes`).
 fn run_linear(
     project_opt: Option<String>,
     cmd: LinearCmd,
+    interactive: bool,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<()> {
     match cmd {
         LinearCmd::Login { key_stdin } => login(key_stdin, input, out),
+        LinearCmd::Connect(args) => connect(project_opt, args, interactive, out),
         LinearCmd::Status { refresh, json } => status(project_opt, refresh, json, out),
         LinearCmd::Sync { dry_run, rewrite_workflows, yes } => {
             let project = require_project(project_opt)?;
@@ -218,6 +274,78 @@ fn run_linear(
             )
         }
     }
+}
+
+/// `shelbi tracker linear connect`.
+fn connect(project_opt: Option<String>, args: ConnectArgs, interactive: bool, out: &mut dyn Write) -> Result<()> {
+    let name = require_project(project_opt)?;
+    let conn = match args.team.filter(|t| !t.trim().is_empty()) {
+        Some(team) => LinearConnection {
+            team,
+            project: args.linear_project,
+            label: args.label,
+            assignee: args.assignee,
+        },
+        None if interactive => {
+            let seed = LinearConnection {
+                project: args.linear_project,
+                label: args.label,
+                assignee: args.assignee,
+                ..LinearConnection::default()
+            };
+            match crate::issue_tracker_setup::choose_linear_interactive(Some(&name), seed)? {
+                Some(conn) => conn,
+                None => bail!("project `{name}` was not connected to Linear"),
+            }
+        }
+        None => bail!(
+            "which team? pass --team <KEY> (`shelbi tracker linear teams` lists them); \
+             --yes and a non-terminal stdin never prompt"
+        ),
+    };
+    let req = ConnectTracker { choice: TrackerChoice::Linear(conn), force: args.force };
+    let done = apply_tracker_connection(&name, &req).map_err(|e| anyhow!(e.to_string()))?;
+    report_connected(out, &name, &done)
+}
+
+/// `shelbi tracker disconnect`.
+fn disconnect(project_opt: Option<String>, force: bool, interactive: bool, out: &mut dyn Write) -> Result<()> {
+    let name = require_project(project_opt)?;
+    let project = shelbi_state::load_project(&name).map_err(|e| anyhow!("project `{name}` could not be loaded: {e}"))?;
+    let current = project.issue_tracker.backend;
+    if current == IssueTrackerBackend::FileSystem {
+        writeln!(out, "Project {name} has no external tracker: it already uses the local file-system board.")?;
+        return Ok(());
+    }
+    if interactive {
+        let go = inquire::Confirm::new(&format!(
+            "Disconnect {name} from {current}? It goes back to the local file-system board; the {current} issues stay there."
+        ))
+        .with_default(false)
+        .prompt()
+        .context("disconnect confirmation")?;
+        if !go {
+            bail!("project `{name}` was not disconnected");
+        }
+    }
+    let req = ConnectTracker { choice: TrackerChoice::FileSystem, force };
+    let done = apply_tracker_connection(&name, &req).map_err(|e| anyhow!(e.to_string()))?;
+    report_connected(out, &name, &done)
+}
+
+fn report_connected(out: &mut dyn Write, name: &str, done: &Connected) -> Result<()> {
+    if done.previous == done.backend {
+        writeln!(out, "Updated {name}: {}.", done.summary)?;
+    } else {
+        writeln!(out, "Connected {name} to {} (was {}).", done.summary, done.previous)?;
+    }
+    writeln!(out, "  config:   {}", done.file)?;
+    match &done.statuses {
+        StatusSync::NotNeeded => {}
+        StatusSync::Synced(what) => writeln!(out, "  statuses: {what}")?,
+        StatusSync::Failed(why) => writeln!(out, "  statuses: not synced: {why}")?,
+    }
+    Ok(())
 }
 
 fn login(key_stdin: bool, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<()> {
@@ -585,7 +713,7 @@ project: Shelbi\n    label: bug\n    assignee: me\n";
     fn run(project: Option<&str>, cmd: LinearCmd, stdin: &str) -> Result<String> {
         let mut input = std::io::Cursor::new(stdin.as_bytes().to_vec());
         let mut out = Vec::new();
-        run_linear(project.map(str::to_string), cmd, &mut input, &mut out)?;
+        run_linear(project.map(str::to_string), cmd, false, &mut input, &mut out)?;
         Ok(String::from_utf8(out).unwrap())
     }
 
@@ -773,5 +901,91 @@ project: Shelbi\n    label: bug\n    assignee: me\n";
         shelbi_state::load_workflow("lin", "task").unwrap();
         let out = run(Some("lin"), sync_cmd(false, true, true), "").unwrap();
         assert!(out.contains("Workflows already use only these statuses."), "{out}");
+    }
+
+    fn connect_args(team: &str) -> ConnectArgs {
+        ConnectArgs {
+            team: Some(team.into()),
+            linear_project: None,
+            label: None,
+            assignee: None,
+            force: false,
+        }
+    }
+
+    fn tracker_yaml(home: &Home, name: &str) -> String {
+        std::fs::read_to_string(home.path.join("projects").join(format!("{name}.yaml"))).unwrap()
+    }
+
+    #[test]
+    fn connect_checks_then_writes_one_linear_block_and_disconnect_reverts() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        register(&home, "app", "issue_tracker:\n  backend: github\n  github:\n    repo: o/r\n");
+        let fake = FakeLinear::new();
+        let _guard = fake.install();
+
+        // --force switches without counting GitHub's issues (no `gh` call).
+        let args = ConnectArgs { label: Some("bug".into()), assignee: Some("me".into()), force: true, ..connect_args("eng") };
+        let out = run(Some("app"), LinearCmd::Connect(args), "").unwrap();
+        assert!(
+            out.starts_with("Connected app to Linear ENG (Engineering) · label Bug · assignee ada <ada@example.com> (was github)."),
+            "{out}"
+        );
+        assert!(out.contains("statuses: 7 statuses from the Linear team"), "{out}");
+        let p = shelbi_state::load_project("app").unwrap();
+        assert_eq!(p.issue_tracker.connection_blocks(), vec!["linear"]);
+        let l = p.issue_tracker.linear.unwrap();
+        assert_eq!((l.team.as_str(), l.label.as_deref(), l.assignee.as_deref()), ("eng", Some("bug"), Some("me")));
+        assert!(home.path.join("projects/app/linear.json").exists(), "filters cached");
+
+        // An unknown filter is refused with the fix, nothing written.
+        let args = ConnectArgs { label: Some("nope".into()), ..connect_args("eng") };
+        let err = run(Some("app"), LinearCmd::Connect(args), "").unwrap_err().to_string();
+        assert!(err.contains("No Linear label `nope`; available:") && err.contains("shelbi tracker linear labels"), "{err}");
+        assert_eq!(shelbi_state::load_project("app").unwrap().issue_tracker.linear.unwrap().label.as_deref(), Some("bug"));
+
+        // With --yes (not interactive) a team is required.
+        let args = ConnectArgs { team: None, ..connect_args("") };
+        let err = run(Some("app"), LinearCmd::Connect(args), "").unwrap_err().to_string();
+        assert!(err.contains("pass --team"), "{err}");
+
+        // Disconnect: the Linear board has issues, so it needs --force too.
+        let mut out = Vec::new();
+        let err = disconnect(Some("app".into()), false, false, &mut out).unwrap_err().to_string();
+        assert!(err.contains("issues on Linear (eng)"), "{err}");
+        assert!(err.contains("shelbi issue-store migrate --to file_system"), "{err}");
+        disconnect(Some("app".into()), true, false, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("Connected app to the local file system (was linear)."), "{out}");
+        assert!(!tracker_yaml(&home, "app").contains("issue_tracker"));
+        let doc = std::fs::read_to_string(home.path.join("projects/app/linear.json")).unwrap_or_default();
+        assert!(!doc.contains("\"resolved\""), "the filter cache went with it:\n{doc}");
+    }
+
+    #[test]
+    fn connecting_a_local_board_with_issues_is_refused_with_migrate_guidance() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        register(&home, "local", "");
+        let tasks = home.path.join("projects/local/tasks");
+        std::fs::create_dir_all(&tasks).unwrap();
+        std::fs::write(tasks.join("t-1.md"), "---\nid: t-1\n---\n").unwrap();
+        let fake = FakeLinear::new();
+        let _guard = fake.install();
+
+        let err = run(Some("local"), LinearCmd::Connect(connect_args("ENG")), "").unwrap_err().to_string();
+        assert!(err.contains("has 1 issue on the local file system"), "{err}");
+        assert!(err.contains("shelbi issue-store migrate --to linear --dry-run"), "{err}");
+        assert!(fake.calls().is_empty(), "refused before asking Linear anything");
+
+        let out = run(Some("local"), LinearCmd::Connect(ConnectArgs { force: true, ..connect_args("ENG") }), "").unwrap();
+        assert!(out.contains("Connected local to Linear ENG (Engineering) (was file_system)."), "{out}");
+
+        let mut out = Vec::new();
+        disconnect(Some("local".into()), true, false, &mut out).unwrap();
+        disconnect(Some("local".into()), false, false, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("already uses the local file-system board"), "{out}");
     }
 }

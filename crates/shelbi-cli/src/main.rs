@@ -175,7 +175,8 @@ enum Cmd {
         cmd: commands::issue_store::IssueStoreCmd,
     },
     /// Connect to an external issue tracker and inspect the connection:
-    /// `shelbi tracker linear login|status|sync|teams|projects|labels|users`.
+    /// `shelbi tracker linear login|connect|status|sync|teams|projects|labels|users`,
+    /// `shelbi tracker disconnect`.
     Tracker {
         #[command(subcommand)]
         cmd: commands::tracker::TrackerCmd,
@@ -557,7 +558,7 @@ fn main() -> Result<()> {
         }
         Some(Cmd::Changelog { cmd }) => commands::changelog::run(cli.project, cmd),
         Some(Cmd::IssueStore { cmd }) => commands::issue_store::run(cli.project, cmd),
-        Some(Cmd::Tracker { cmd }) => commands::tracker::run(cli.project, cmd),
+        Some(Cmd::Tracker { cmd }) => commands::tracker::run(cli.project, cmd, cli.yes),
         Some(Cmd::Workspace { cmd }) => commands::workspace::run(cli.project, cmd),
         Some(Cmd::Worker { cmd }) => {
             eprintln!("shelbi: 'worker' is deprecated; use 'workspace' instead.");
@@ -1219,6 +1220,13 @@ mod cli_tests {
                 .unwrap_or_else(|e| panic!("{sub}: {e}"));
         }
         Cli::try_parse_from(["shelbi", "tracker", "linear", "labels", "--team", "ENG"]).unwrap();
+        Cli::try_parse_from([
+            "shelbi", "-p", "app", "tracker", "linear", "connect", "--team", "ENG", "--linear-project", "Shelbi",
+            "--label", "bug", "--assignee", "me", "--force", "-y",
+        ])
+        .unwrap();
+        let cli = Cli::parse_from(["shelbi", "tracker", "disconnect", "--force"]);
+        assert!(matches!(cli.cmd, Some(Cmd::Tracker { cmd: TrackerCmd::Disconnect { force: true } })));
         assert!(Cli::try_parse_from(["shelbi", "tracker", "linear", "teams", "--team", "ENG"]).is_err());
 
         let cli = Cli::parse_from(["shelbi", "tracker", "linear", "sync", "--rewrite-workflows", "--yes"]);

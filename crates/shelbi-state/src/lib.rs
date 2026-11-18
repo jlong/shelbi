@@ -85,6 +85,7 @@ pub mod supervision_status;
 pub mod test_support;
 pub mod tools;
 pub mod tool_paths;
+pub mod tracker_config;
 mod user_config;
 mod workflows;
 mod workspace_state_migration;

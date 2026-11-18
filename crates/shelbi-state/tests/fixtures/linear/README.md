@@ -9,7 +9,8 @@ The workspace they describe: viewer `ada` (`user-ada`); teams `ENG`
 (`team-eng`, Engineering) and `DES` (`team-des`, Design); seven ENG states
 across all six types; projects `Shelbi` and `Mobile`; labels `Bug`, `shelbi`,
 `Improvement` and the group label `Feature`; members ada, grace, two `sam`s
-(for ambiguity) and one inactive user. Every list is a single page; tests that
+(for ambiguity) and one inactive user. `ViewerAccess` says ada is a full
+(non-guest) member of ENG only. Every list is a single page; tests that
 need pagination queue their own pages.
 
 Issue operations (`Issues`, `IssueCreate`, `IssueUpdate`, `AttachmentCreate`,

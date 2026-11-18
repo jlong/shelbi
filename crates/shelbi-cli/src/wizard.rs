@@ -86,6 +86,9 @@ pub(crate) enum SetupOutcome {
 pub(crate) enum IssuesPreset {
     /// GitHub, on this repo or else the one the origin names.
     Github { repo: Option<String> },
+    /// Linear, on this team and filters (preflighted with the key from the
+    /// environment or the keychain).
+    Linear(shelbi_core::LinearConnection),
     FileSystem,
 }
 
@@ -256,6 +259,13 @@ pub(crate) fn answer_steps(
             }
             cfg
         }
+        Some(IssuesPreset::Linear(conn)) => {
+            let cfg = issue_tracker_setup::linear_config(conn.clone());
+            cfg.validate().map_err(|e| anyhow!("{e}"))?;
+            // Never write a Linear connection that can't work.
+            project_create::linear::preflight_linear(None, conn).map_err(|why| anyhow!(why))?;
+            cfg
+        }
         None => ask.issues(&GithubSuggestion { repo: check.facts.github_repo.clone() })?,
     };
     if !ask.interactive() {
@@ -373,6 +383,16 @@ fn print_issue_tracker_plan(tracker: &IssueTrackerConfig) {
             let repo = tracker.github.as_ref().map(|g| g.repo.as_str()).unwrap_or("");
             println!("✓ issue tracker: GitHub ({repo})");
             println!("  {}", issue_tracker_setup::GITHUB_DISCLOSURE);
+        }
+        IssueTrackerBackend::Linear => {
+            let conn = tracker.linear.clone().unwrap_or_default();
+            let mut line = format!("✓ issue tracker: Linear (team {}", conn.team);
+            for (what, value) in [("project", conn.project_ref()), ("label", conn.label_ref()), ("assignee", conn.assignee_ref())] {
+                if let Some(value) = value {
+                    line.push_str(&format!(", {what} {value}"));
+                }
+            }
+            println!("{line})");
         }
         _ => println!("✓ issue tracker: file system (local markdown)"),
     }
@@ -630,6 +650,49 @@ mod tests {
         assert_eq!(plan.mode, ConfigMode::InRepo);
         assert_eq!(plan.default_branch, "develop");
         assert_eq!(plan.remote.as_deref(), Some("https://github.com/acme/s.git"));
+    }
+
+    #[test]
+    fn a_linear_preset_is_preflighted_then_created_with_one_linear_block() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let temp = TempDir::new().unwrap();
+        let env = EnvGuard::new(&["SHELBI_HOME"]);
+        env.set("SHELBI_HOME", temp.path().join("home"));
+        let fake = shelbi_state::linear_client::FakeLinear::new();
+        let _fake = fake.install();
+        let repo = temp.path().join("App");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]);
+        git(&repo, &["remote", "add", "origin", "https://github.com/acme/app.git"]);
+
+        let conn = |label: &str| shelbi_core::LinearConnection {
+            team: "eng".into(),
+            label: Some(label.into()),
+            assignee: Some("me".into()),
+            ..Default::default()
+        };
+        let preset = |label: &str| Preset {
+            root: Some(repo.clone()),
+            mode: Some(ConfigMode::Global),
+            issues: Some(IssuesPreset::Linear(conn(label))),
+            ..Preset::default()
+        };
+        let (mut gh, mut probe) = (FakeGh(false), FakeGh(false));
+        let err = answer_steps(temp.path(), &preset("nope"), &mut Defaults { gh: &mut gh }, &mut probe).unwrap_err();
+        assert!(err.to_string().contains("No Linear label `nope`"), "{err}");
+
+        let plan = answer_steps(temp.path(), &preset("Bug"), &mut Defaults { gh: &mut gh }, &mut probe)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.issue_tracker.connection_blocks(), vec!["linear"], "the GitHub origin isn't written too");
+        assert_eq!(plan.issue_tracker.linear, Some(conn("Bug")));
+
+        let slug = project_create::create_project(&plan, Attempt::New, &mut project_create::NullReporter).unwrap();
+        let yaml = std::fs::read_to_string(temp.path().join("home/projects").join(format!("{slug}.yaml"))).unwrap();
+        assert!(yaml.contains("backend: linear") && yaml.contains("team: eng"), "{yaml}");
+        assert!(!yaml.contains("github:"), "{yaml}");
+        let cache = temp.path().join("home/projects").join(&slug).join("linear.json");
+        assert!(std::fs::read_to_string(cache).unwrap().contains("label-bug"), "filters cached at creation");
     }
 
     #[test]

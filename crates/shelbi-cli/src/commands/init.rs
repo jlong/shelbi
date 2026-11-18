@@ -36,13 +36,16 @@ impl InitMode {
     }
 }
 
-/// The `--issue-tracker` backend choice. Only the two live backends are
-/// selectable; jira/linear parse but have no store.
+/// The `--issue-tracker` backend choice (jira parses but has no store).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum IssueTrackerArg {
     /// Store issues as GitHub issues in `--github-repo` (or the detected repo).
     #[value(name = "github")]
     Github,
+    /// Store issues as Linear issues in `--linear-team` (narrowed by the
+    /// optional `--linear-project`, `--linear-label`, `--linear-assignee`).
+    #[value(name = "linear")]
+    Linear,
     /// Keep issues as local markdown under `~/.shelbi/projects/<name>/tasks/`.
     #[value(name = "file_system", alias = "file-system")]
     FileSystem,
@@ -102,6 +105,24 @@ pub struct Args {
     #[arg(long, value_name = "OWNER/REPO")]
     pub(crate) github_repo: Option<String>,
 
+    /// The Linear team for `--issue-tracker linear` (key, name, or id;
+    /// `shelbi tracker linear teams` lists them). Required with it.
+    #[arg(long, value_name = "TEAM")]
+    pub(crate) linear_team: Option<String>,
+
+    /// Optional: narrow the Linear board to this project (name or id).
+    #[arg(long, value_name = "PROJECT")]
+    pub(crate) linear_project: Option<String>,
+
+    /// Optional: narrow the Linear board to issues with this label.
+    #[arg(long, value_name = "LABEL")]
+    pub(crate) linear_label: Option<String>,
+
+    /// Optional: narrow the Linear board to this assignee (`me`, an email,
+    /// or a user id).
+    #[arg(long, value_name = "ASSIGNEE")]
+    pub(crate) linear_assignee: Option<String>,
+
     /// Where the project's settings live (the Settings step): `in-repo`
     /// writes a committed `<repo>/.shelbi/project.yaml` shared with the
     /// team; `global` keeps everything under `~/.shelbi/projects/`. Defaults
@@ -145,13 +166,33 @@ fn preset(args: Args) -> Result<Preset> {
         ),
         (runner, orchestrator) => runner.or(orchestrator),
     };
+    let linear_flags = [&args.linear_team, &args.linear_project, &args.linear_label, &args.linear_assignee]
+        .iter()
+        .any(|f| f.is_some());
+    if linear_flags && args.issue_tracker != Some(IssueTrackerArg::Linear) {
+        bail!("--linear-team, --linear-project, --linear-label and --linear-assignee require `--issue-tracker linear`");
+    }
     let issues = match (args.issue_tracker, args.github_repo) {
-        (None | Some(IssueTrackerArg::FileSystem), Some(_)) => {
+        (None | Some(IssueTrackerArg::FileSystem | IssueTrackerArg::Linear), Some(_)) => {
             bail!("--github-repo requires `--issue-tracker github`")
         }
         (None, None) => None,
         (Some(IssueTrackerArg::FileSystem), None) => Some(IssuesPreset::FileSystem),
         (Some(IssueTrackerArg::Github), repo) => Some(IssuesPreset::Github { repo }),
+        (Some(IssueTrackerArg::Linear), None) => {
+            let team = args.linear_team.filter(|t| !t.trim().is_empty()).ok_or_else(|| {
+                anyhow!(
+                    "`--issue-tracker linear` needs a team: pass --linear-team <TEAM> \
+                     (`shelbi tracker linear teams` lists them)"
+                )
+            })?;
+            Some(IssuesPreset::Linear(shelbi_core::LinearConnection {
+                team,
+                project: args.linear_project,
+                label: args.linear_label,
+                assignee: args.linear_assignee,
+            }))
+        }
     };
     let cwd = std::env::current_dir().context("reading current directory")?;
     let root = match args.root {
@@ -218,6 +259,10 @@ mod tests {
             orchestrator_runner: None,
             issue_tracker: None,
             github_repo: None,
+            linear_team: None,
+            linear_project: None,
+            linear_label: None,
+            linear_assignee: None,
             mode: None,
             pick_up: false,
         }
@@ -252,6 +297,38 @@ mod tests {
             preset(Args { issue_tracker: Some(IssueTrackerArg::FileSystem), ..args() }).unwrap().issues,
             Some(IssuesPreset::FileSystem)
         );
+    }
+
+    #[test]
+    fn linear_takes_a_required_team_and_optional_filters() {
+        let p = preset(Args {
+            issue_tracker: Some(IssueTrackerArg::Linear),
+            linear_team: Some("ENG".into()),
+            linear_label: Some("shelbi".into()),
+            linear_assignee: Some("me".into()),
+            ..args()
+        })
+        .unwrap();
+        assert_eq!(
+            p.issues,
+            Some(IssuesPreset::Linear(shelbi_core::LinearConnection {
+                team: "ENG".into(),
+                project: None,
+                label: Some("shelbi".into()),
+                assignee: Some("me".into()),
+            }))
+        );
+        let err = preset(Args { issue_tracker: Some(IssueTrackerArg::Linear), ..args() }).unwrap_err();
+        assert!(err.to_string().contains("--linear-team"), "{err}");
+        let err = preset(Args { linear_team: Some("ENG".into()), ..args() }).unwrap_err();
+        assert!(err.to_string().contains("require `--issue-tracker linear`"), "{err}");
+        assert!(preset(Args {
+            issue_tracker: Some(IssueTrackerArg::Linear),
+            linear_team: Some("ENG".into()),
+            github_repo: Some("a/b".into()),
+            ..args()
+        })
+        .is_err());
     }
 
     #[test]

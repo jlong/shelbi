@@ -136,6 +136,35 @@ pub struct LinearLabel {
     pub is_group: bool,
 }
 
+/// What the API key's owner may do, for the "can this key create issues in
+/// the team" check: whether they are a guest (guests only work in the teams
+/// they belong to) or an admin, and the ids of the teams they belong to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinearViewerAccess {
+    pub id: String,
+    #[serde(default)]
+    pub guest: bool,
+    #[serde(default)]
+    pub admin: bool,
+    /// The teams the viewer is a member of (the first page: a guest in more
+    /// than [`VIEWER_TEAMS_PAGE`] teams is not a case worth a sweep).
+    pub team_ids: Vec<String>,
+}
+
+impl LinearViewerAccess {
+    /// The viewer may create issues in `team_id`: a member of the
+    /// workspace can file in any team they can see, a guest only in a team
+    /// they belong to. (Linear has no query for an API key's own scopes, so
+    /// a key made read-only passes this and fails its first write with
+    /// `FORBIDDEN`.)
+    pub fn can_create_in(&self, team_id: &str) -> bool {
+        !self.guest || self.admin || self.team_ids.iter().any(|t| t == team_id)
+    }
+}
+
+/// How many of the viewer's teams [`LinearClient::viewer_access`] reads.
+pub const VIEWER_TEAMS_PAGE: u32 = 250;
+
 /// GraphQL connection paging info.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -221,6 +250,44 @@ impl LinearClient {
             json!({}),
         );
         Ok(self.query::<Data>(&req)?.viewer)
+    }
+
+    /// The key owner's access: guest / admin, and their teams.
+    pub fn viewer_access(&self) -> LinearResult<LinearViewerAccess> {
+        #[derive(Deserialize)]
+        struct TeamId {
+            id: String,
+        }
+        #[derive(Deserialize)]
+        struct Teams {
+            nodes: Vec<TeamId>,
+        }
+        #[derive(Deserialize)]
+        struct Viewer {
+            id: String,
+            #[serde(default)]
+            guest: bool,
+            #[serde(default)]
+            admin: bool,
+            teams: Teams,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            viewer: Viewer,
+        }
+        let req = LinearRequest::new(
+            "ViewerAccess",
+            "query ViewerAccess($first: Int) { viewer { id guest admin teams(first: $first) \
+             { nodes { id } pageInfo { hasNextPage endCursor } } } }",
+            json!({ "first": VIEWER_TEAMS_PAGE }),
+        );
+        let v = self.query::<Data>(&req)?.viewer;
+        Ok(LinearViewerAccess {
+            id: v.id,
+            guest: v.guest,
+            admin: v.admin,
+            team_ids: v.teams.nodes.into_iter().map(|t| t.id).collect(),
+        })
     }
 
     /// Every team the key can see, sorted by key.

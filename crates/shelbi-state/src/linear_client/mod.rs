@@ -89,7 +89,7 @@ pub use client::{LinearClient, RetryPolicy};
 pub use error::{LinearError, LinearResult, TransportFailure};
 pub use filters::{
     filter_cache_path, invalidate_filter_cache, resolve_filters, resolve_filters_cached,
-    resolve_team, ResolvedLinearFilters, FILTER_CACHE_FILE,
+    resolve_team, store_filter_cache, ResolvedLinearFilters, FILTER_CACHE_FILE,
 };
 pub(crate) use filters::{read_cache_doc, write_cache_doc};
 pub use issues::{
@@ -98,7 +98,7 @@ pub use issues::{
 };
 pub use queries::{
     Connection, LinearLabel, LinearProject, LinearProjectStatus, LinearState, LinearStateType,
-    LinearTeam, LinearUser, PageInfo, PAGE_SIZE,
+    LinearTeam, LinearUser, LinearViewerAccess, PageInfo, PAGE_SIZE, VIEWER_TEAMS_PAGE,
 };
 pub use transport::{curl_runner, LinearRequest, LinearResponse, LinearRunner, LINEAR_API_URL};
 
