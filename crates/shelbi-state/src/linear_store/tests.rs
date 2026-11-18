@@ -467,6 +467,39 @@ fn states_map_to_statuses_and_issues_carry_their_assignee() {
 }
 
 #[test]
+fn a_synced_catalog_maps_by_external_id_and_closed_follows_the_state_type() {
+    let env = env();
+    let path = crate::workflows::statuses_path("p").unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        "managed_by: linear\nstatuses:\n\
+         - { id: todo, name: Todo, category: ready, external_id: state-todo }\n\
+         - { id: review, name: In Review, category: handoff, external_id: state-review }\n\
+         - { id: shipped, name: Done, category: done, external_id: state-done }\n",
+    )
+    .unwrap();
+    let a = env.sim.seed("a", "state-review", 1.0, json!({}));
+    env.sim.seed("b", "state-done", 1.0, json!({}));
+    let store = env.eng();
+    let open = store.list_open().unwrap();
+    assert_eq!(ids(&open), ["eng-1"]);
+    assert_eq!(open[0].task.column, Column::review(), "by external_id, not `in-review`");
+    let closed = store.list_in_status(&Column::from_status_id("shipped")).unwrap();
+    assert_eq!(ids(&closed), ["eng-2"], "a synced completed status reads from history");
+
+    store.move_status("eng-1", &Column::todo(), "").unwrap();
+    store.move_status("eng-1", &Column::review(), "").unwrap();
+    assert_eq!(env.sim.issue(&a)["state"]["id"], "state-review");
+    let cold = store.refresh_board(None, &[]).unwrap();
+    let since = t0() + ChronoDuration::seconds(env.sim.w().clock);
+    store.move_status("eng-1", &Column::from_status_id("shipped"), "").unwrap();
+    assert_eq!(env.sim.issue(&a)["state"]["id"], "state-done");
+    let warm = store.refresh_board(Some(since), &cold.board).unwrap();
+    assert!(warm.board.is_empty(), "a closed card leaves the open board");
+}
+
+#[test]
 fn a_rate_limit_surfaces_from_reads_and_writes() {
     let env = env();
     env.sim.seed("a", "state-todo", 1.0, json!({}));

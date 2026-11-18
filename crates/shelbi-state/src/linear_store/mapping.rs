@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
-use shelbi_core::{Column, IssueLaunchConfig, IssuePr, IssueZenConfig};
+use shelbi_core::{Column, IssueLaunchConfig, IssuePr, IssueZenConfig, ProjectStatuses};
 
 use crate::linear_client::{
     LinearIssue, LinearState, LinearStateType, LinearUser, ResolvedLinearFilters,
@@ -44,15 +44,18 @@ pub(crate) fn slug(name: &str) -> String {
 /// The Shelbi status a Linear workflow state maps to. **The one place** the
 /// state → status rule lives.
 ///
-/// Linear's two terminal categories always land in Shelbi's two terminal
-/// statuses (`completed` → `done`, `canceled` → `canceled`, whatever the
-/// state is called), so a closed Linear issue is never an active card. Every
-/// other state maps by its slugged name (`In Review` → `in-review`).
-///
-/// When the status catalog carries each status's Linear state uuid
-/// (`external_id`, the `linear-statuses` subtask), this becomes a lookup of
-/// `state.id` in that catalog, with the rule below as the fallback.
-pub(crate) fn column_for_state(state: &LinearState) -> Column {
+/// A project whose status catalog is synced from Linear (`managed_by:
+/// linear`, [`crate::linear_statuses`]) maps each state to the status
+/// carrying its uuid as `external_id`: ids are assigned once per state and
+/// survive renames. Otherwise (no synced catalog yet, or a state added since
+/// the last sync) the rule is by name: Linear's two terminal categories land
+/// in Shelbi's two terminal statuses (`completed` → `done`, `canceled` →
+/// `canceled`, whatever the state is called), and every other state maps by
+/// its slugged name (`In Review` → `in-review`).
+pub(crate) fn column_for_state(state: &LinearState, catalog: Option<&ProjectStatuses>) -> Column {
+    if let Some(st) = catalog.and_then(|c| c.by_external_id(&state.id)) {
+        return Column::from_status_id(&st.id);
+    }
     match state.kind {
         LinearStateType::Completed => Column::done(),
         LinearStateType::Canceled => Column::canceled(),
@@ -60,12 +63,23 @@ pub(crate) fn column_for_state(state: &LinearState) -> Column {
     }
 }
 
+/// Whether a state is closed in Linear (completed or canceled). The store
+/// decides open vs. history by this, never by the status id, so a synced
+/// status like `shipped` or `duplicate` still leaves the open board.
+pub(crate) fn is_closed_state(state: &LinearState) -> bool {
+    matches!(state.kind, LinearStateType::Completed | LinearStateType::Canceled)
+}
+
 /// The team state a move to `col` writes: among the states that map to
 /// `col` (in board order), the one whose own slug is `col` if any, else the
 /// first. So `done` prefers a completed state named "Done" over "Shipped".
-pub(crate) fn state_for_column<'a>(states: &'a [LinearState], col: &Column) -> Option<&'a LinearState> {
+pub(crate) fn state_for_column<'a>(
+    states: &'a [LinearState],
+    col: &Column,
+    catalog: Option<&ProjectStatuses>,
+) -> Option<&'a LinearState> {
     let matches: Vec<&LinearState> =
-        states.iter().filter(|s| column_for_state(s) == *col).collect();
+        states.iter().filter(|s| column_for_state(s, catalog) == *col).collect();
     matches
         .iter()
         .find(|s| slug(&s.name) == col.as_str())
@@ -74,10 +88,14 @@ pub(crate) fn state_for_column<'a>(states: &'a [LinearState], col: &Column) -> O
 }
 
 /// The ids of every team state that maps to `col`.
-pub(crate) fn state_ids_for_column(states: &[LinearState], col: &Column) -> Vec<String> {
+pub(crate) fn state_ids_for_column(
+    states: &[LinearState],
+    col: &Column,
+    catalog: Option<&ProjectStatuses>,
+) -> Vec<String> {
     states
         .iter()
-        .filter(|s| column_for_state(s) == *col)
+        .filter(|s| column_for_state(s, catalog) == *col)
         .map(|s| s.id.clone())
         .collect()
 }
@@ -350,7 +368,7 @@ mod tests {
             (state("f", "Duplicate", Canceled, 4.0), "canceled"),
         ];
         for (s, want) in cases {
-            assert_eq!(column_for_state(&s).as_str(), want, "{}", s.name);
+            assert_eq!(column_for_state(&s, None).as_str(), want, "{}", s.name);
         }
     }
 
@@ -363,14 +381,38 @@ mod tests {
             state("dup", "Duplicate", Canceled, 7.0),
             state("review", "In Review", Started, 4.0),
         ];
-        assert_eq!(state_for_column(&states, &Column::done()).unwrap().id, "done");
-        assert_eq!(state_for_column(&states, &Column::canceled()).unwrap().id, "dup");
+        assert_eq!(state_for_column(&states, &Column::done(), None).unwrap().id, "done");
+        assert_eq!(state_for_column(&states, &Column::canceled(), None).unwrap().id, "dup");
         assert_eq!(
-            state_for_column(&states, &Column::from_status_id("in-review")).unwrap().id,
+            state_for_column(&states, &Column::from_status_id("in-review"), None).unwrap().id,
             "review"
         );
-        assert!(state_for_column(&states, &Column::todo()).is_none());
-        assert_eq!(state_ids_for_column(&states, &Column::done()), ["shipped", "done"]);
+        assert!(state_for_column(&states, &Column::todo(), None).is_none());
+        assert_eq!(state_ids_for_column(&states, &Column::done(), None), ["shipped", "done"]);
+    }
+
+    #[test]
+    fn a_synced_catalog_maps_states_by_external_id() {
+        use LinearStateType::*;
+        let catalog: ProjectStatuses = yaml_serde::from_str(
+            "managed_by: linear\nstatuses:\n\
+             - { id: shipped, name: Shipped, category: done, external_id: shipped-uuid }\n\
+             - { id: doing, name: In Progress, category: active, external_id: progress-uuid }\n",
+        )
+        .unwrap();
+        let states = vec![
+            state("progress-uuid", "In Progress", Started, 1.0),
+            state("shipped-uuid", "Shipped", Completed, 2.0),
+            state("new-uuid", "Brand New", Unstarted, 0.0),
+        ];
+        // A renamed state keeps the id its uuid was assigned.
+        assert_eq!(column_for_state(&states[0], Some(&catalog)).as_str(), "doing");
+        assert_eq!(column_for_state(&states[1], Some(&catalog)).as_str(), "shipped");
+        assert!(is_closed_state(&states[1]));
+        // A state the catalog hasn't synced yet falls back to the name rule.
+        assert_eq!(column_for_state(&states[2], Some(&catalog)).as_str(), "brand-new");
+        let col = Column::from_status_id("shipped");
+        assert_eq!(state_for_column(&states, &col, Some(&catalog)).unwrap().id, "shipped-uuid");
     }
 
     #[test]

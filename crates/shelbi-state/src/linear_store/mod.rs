@@ -16,10 +16,13 @@
 //!   issue is assigned to the API key's owner, so it is the user's for the
 //!   Zen ownership gate (the parity of GitHub's auto-assign).
 //! * **Status.** Each issue's workflow state maps to a Shelbi status in one
-//!   function, [`mapping::column_for_state`]: `completed` → `done`,
-//!   `canceled` → `canceled`, anything else by slugged name (`In Review` →
-//!   `in-review`). A move writes the team state that maps to the target
-//!   ([`mapping::state_for_column`]).
+//!   function, [`mapping::column_for_state`]: through the synced status
+//!   catalog's `external_id` (the state uuid, [`crate::linear_statuses`])
+//!   when there is one; otherwise `completed` → `done`, `canceled` →
+//!   `canceled`, anything else by slugged name (`In Review` → `in-review`).
+//!   A move writes the team state that maps to the target
+//!   ([`mapping::state_for_column`]). Open vs. history follows Linear's state
+//!   type, so a synced `shipped` or `duplicate` status is still history.
 //! * **Board order** is Linear's own `sortOrder` (lower first): a card's
 //!   `priority` is its rank within its status, and `set_priority` writes a
 //!   `sortOrder` between its new neighbours. `renumber` has nothing to do.
@@ -68,7 +71,10 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
-use shelbi_core::{Column, Error, Issue, LinearConnection, Result, DEFAULT_WORKFLOW_NAME};
+use shelbi_core::{
+    Column, Error, Issue, LinearConnection, ProjectStatuses, Result, TrackerName,
+    DEFAULT_WORKFLOW_NAME,
+};
 
 use crate::issue_store::{
     is_terminal_column as is_terminal, BoardRead, ClosedPage, Cursor, IssueChange, IssueComment,
@@ -81,7 +87,8 @@ use crate::linear_client::{
 use crate::IssueFile;
 
 use mapping::{
-    attachment_filter, attachment_input, column_for_state, matches_filters, new_uuid,
+    attachment_filter, attachment_input, column_for_state, is_closed_state, matches_filters,
+    new_uuid,
     number_from_id, read_meta, shelbi_id, sort_between, state_for_column, state_ids_for_column,
     strictly_between, team_filter, terminal_filter, user_token, visible_filter, with, LinearMeta,
 };
@@ -117,11 +124,17 @@ impl std::fmt::Debug for LinearStore {
 struct Ctx {
     client: LinearClient,
     filters: ResolvedLinearFilters,
+    /// The project's status catalog when it is synced from Linear (each
+    /// status carries its state's uuid); `None` maps by state name.
+    catalog: Option<ProjectStatuses>,
 }
 
 /// A mapped issue plus what the store needs beside it.
 struct Row {
     tf: IssueFile,
+    /// Closed in Linear (a completed or canceled state): done history, not
+    /// the open board, whatever the status id.
+    closed: bool,
     uuid: String,
     number: i64,
     sort: f64,
@@ -174,7 +187,10 @@ impl LinearStore {
     fn ctx(&self) -> Result<Ctx> {
         let client = self.client()?;
         let filters = resolve_filters_cached(&client, &self.project, &self.conn)?;
-        Ok(Ctx { client, filters })
+        let catalog = crate::load_project_statuses(&self.project)
+            .ok()
+            .filter(|c| c.managed_by == Some(TrackerName::Linear));
+        Ok(Ctx { client, filters, catalog })
     }
 
     /// The board-index identity this store's index carries.
@@ -204,7 +220,7 @@ impl LinearStore {
     fn target_state(&self, ctx: &Ctx, col: &Column) -> Result<LinearState> {
         for fresh in [false, true] {
             let states = self.states(ctx, fresh)?;
-            if let Some(s) = state_for_column(&states, col) {
+            if let Some(s) = state_for_column(&states, col, ctx.catalog.as_ref()) {
                 return Ok(s.clone());
             }
         }
@@ -253,7 +269,7 @@ impl LinearStore {
     // --- mapping --------------------------------------------------------------
 
     /// Map one issue, with `priority` as its rank (the caller ranks).
-    fn row(&self, issue: LinearIssue, priority: u32) -> Row {
+    fn row(&self, ctx: &Ctx, issue: LinearIssue, priority: u32) -> Row {
         let meta = match read_meta(&issue) {
             Ok(m) => m,
             Err(detail) => {
@@ -271,7 +287,7 @@ impl LinearStore {
         let task = Issue {
             id,
             title: issue.title.clone(),
-            column: column_for_state(&issue.state),
+            column: column_for_state(&issue.state, ctx.catalog.as_ref()),
             priority,
             assigned_to: None,
             workflow: meta.workflow,
@@ -291,6 +307,7 @@ impl LinearStore {
                 body: issue.description.clone().unwrap_or_default(),
                 tracker_assignees: issue.assignee.iter().map(user_token).collect(),
             },
+            closed: is_closed_state(&issue.state),
             uuid: issue.id.clone(),
             number: issue.number_i64(),
             sort: issue.sort_order,
@@ -299,7 +316,7 @@ impl LinearStore {
 
     /// Map a set of issues, ranking each within its status by `sortOrder`.
     fn rows(&self, ctx: &Ctx, issues: Vec<LinearIssue>) -> Vec<Row> {
-        let mut rows: Vec<Row> = issues.into_iter().map(|i| self.row(i, 0)).collect();
+        let mut rows: Vec<Row> = issues.into_iter().map(|i| self.row(ctx, i, 0)).collect();
         rank(&mut rows);
         for row in &rows {
             self.remember(ctx, row);
@@ -310,7 +327,7 @@ impl LinearStore {
     /// One issue mapped outside a full read: its rank comes from where its
     /// `sortOrder` falls among the published index's cards in its status.
     fn single_row(&self, ctx: &Ctx, issue: LinearIssue) -> Row {
-        let mut row = self.row(issue, 0);
+        let mut row = self.row(ctx, issue, 0);
         row.tf.task.priority = self
             .valid_index()
             .map(|idx| {
@@ -416,7 +433,7 @@ impl LinearStore {
     /// The cards in `col`, ordered (ranked) by `sortOrder`, as `(id, uuid,
     /// sort)`.
     fn column_order(&self, ctx: &Ctx, col: &Column) -> Result<Vec<(String, String, f64)>> {
-        let state_ids = state_ids_for_column(&self.states(ctx, false)?, col);
+        let state_ids = state_ids_for_column(&self.states(ctx, false)?, col, ctx.catalog.as_ref());
         if state_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -433,7 +450,7 @@ impl LinearStore {
     /// GitHub backend's write-through), best-effort.
     fn publish(&self, row: &Row) -> Result<IssueFile> {
         let tf = self.with_overlay(row.tf.clone())?;
-        if is_terminal(&tf.task.column) {
+        if row.closed {
             let _ = crate::board_index::remove_board_index_issue(&self.project, &tf.task.id);
             let _ = crate::done_history::patch_done_history_issue(&self.project, &tf);
         } else {
@@ -492,14 +509,14 @@ impl LinearStore {
 
     fn move_inner(&self, ctx: &Ctx, id: &str, to: &Column) -> Result<Option<StatusMove>> {
         let issue = self.require(ctx, id)?;
-        let from = column_for_state(&issue.state);
+        let from = column_for_state(&issue.state, ctx.catalog.as_ref());
         if from == *to {
             return Ok(None);
         }
-        let workflow = self.workflow_name(&self.row(issue.clone(), 0).tf);
+        let workflow = self.workflow_name(&self.row(ctx, issue.clone(), 0).tf);
         let state = self.target_state(ctx, to)?;
         let after = self.update(ctx, &issue.id, json!({ "stateId": state.id }))?;
-        let applied = column_for_state(&after.state);
+        let applied = column_for_state(&after.state, ctx.catalog.as_ref());
         if applied != *to {
             return Err(Error::Other(format!(
                 "issue `{id}` in Linear: move did not apply; its state is `{}` (status `{}`), \
@@ -608,6 +625,7 @@ impl IssueStore for LinearStore {
                 let id = tf.task.id.clone();
                 let row = Row {
                     tf: tf.clone(),
+                    closed: false,
                     uuid: String::new(),
                     number: self.cached_number(&ctx, &id).unwrap_or(0),
                     sort: self.cached_sort(&ctx, &id).unwrap_or(f64::MAX),
@@ -618,8 +636,8 @@ impl IssueStore for LinearStore {
         let mut numbers = Vec::new();
         for issue in touched {
             let gone = issue.archived_at.is_some() || !matches_filters(&issue, &ctx.filters);
-            let row = self.row(issue, 0);
-            if gone || is_terminal(&row.tf.task.column) {
+            let row = self.row(&ctx, issue, 0);
+            if gone || row.closed {
                 by_id.remove(&row.tf.task.id);
             } else {
                 self.remember(&ctx, &row);
@@ -644,8 +662,15 @@ impl IssueStore for LinearStore {
 
     fn list_in_status(&self, status: &Column) -> Result<Vec<IssueFile>> {
         let ctx = self.ctx()?;
+        // Read the side of the board (open or history) the status's states
+        // are on; a status with no state yet falls back to its category.
+        let states = self.states(&ctx, false)?;
+        let closed = match state_for_column(&states, status, ctx.catalog.as_ref()) {
+            Some(st) => is_closed_state(st),
+            None => is_terminal(status),
+        };
         Ok(self
-            .board(&ctx, terminal_filter(is_terminal(status)))?
+            .board(&ctx, terminal_filter(closed))?
             .into_iter()
             .filter(|tf| tf.task.column == *status)
             .collect())
@@ -830,10 +855,10 @@ impl IssueStore for LinearStore {
             Err(e) => return Err(e.into()),
         };
 
-        let mut row = self.row(created, position as u32);
+        let mut row = self.row(&ctx, created, position as u32);
         row.tf.task.column = spec.column.clone();
         self.remember(&ctx, &row);
-        if !is_terminal(&spec.column) {
+        if !row.closed {
             let _ = crate::board_index::record_board_index_number(&self.project, &spec.id, row.number);
         }
         let tf = self.publish(&row)?;
@@ -870,7 +895,7 @@ impl IssueStore for LinearStore {
     fn set_priority(&self, id: &str, pos: PrioMove) -> Result<()> {
         let ctx = self.ctx()?;
         let issue = self.require(&ctx, id)?;
-        let col = column_for_state(&issue.state);
+        let col = column_for_state(&issue.state, ctx.catalog.as_ref());
         let mut order = self.column_order(&ctx, &col)?;
         let idx = match order.iter().position(|o| o.1 == issue.id) {
             Some(i) => i,
@@ -1022,7 +1047,7 @@ impl IssueStore for LinearStore {
         // choice the GitHub backend makes). Idempotent.
         let ctx = self.ctx()?;
         if let Some(issue) = self.get_raw(&ctx, id)? {
-            if !is_terminal(&column_for_state(&issue.state)) {
+            if !is_closed_state(&issue.state) {
                 self.move_inner(&ctx, id, &Column::canceled())?;
             }
         }
