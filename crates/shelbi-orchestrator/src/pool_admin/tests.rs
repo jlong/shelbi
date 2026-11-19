@@ -1099,3 +1099,65 @@ fn live_active_task_reads_in_progress_and_review_assignments() {
     open.sort();
     assert_eq!(open, vec!["feat-x", "feat-z"]);
 }
+
+/// A live add in a fresh repo (one empty commit, like a new project) leaves
+/// the worktree ready for a hand-started `claude`: every runner hook script is
+/// there and executable, every script `settings.local.json` names exists, and
+/// `.shelbi/` stays out of `git status` before the first dispatch.
+#[test]
+fn a_live_add_deploys_the_hook_scripts_and_excludes_shelbi() {
+    let home = Home::new();
+    let repo = home.root.join("work");
+    fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    git(&repo, &["commit", "-q", "--allow-empty", "-m", "initial"]);
+    fs::create_dir_all(shelbi_state::project_dir(PROJECT).unwrap()).unwrap();
+    fs::write(
+        home.global_path(),
+        format!(
+            "repo: {r}\ndefault_branch: main\norchestrator:\n  runner: claude\n\
+             agent_runners:\n  claude: {{ command: claude, flags: [] }}\n\
+             machines:\n  - name: hub\n    kind: local\n    work_dir: {r}\n",
+            r = repo.display()
+        ),
+    )
+    .unwrap();
+
+    let added = add_workspace_with(&LiveOps, PROJECT, &add_req("huey", None, &[], None)).unwrap();
+    assert_eq!(added.hooks, HooksOutcome::Wired);
+    let wt = added.worktree;
+
+    for file in ws::RUNNER_HOOK_FILES {
+        let path = wt.join(file.rel_path);
+        let meta = fs::metadata(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_ne!(meta.permissions().mode() & 0o111, 0, "{} isn't executable", path.display());
+        }
+        let _ = meta;
+    }
+    let settings = fs::read_to_string(wt.join(".claude/settings.local.json")).unwrap();
+    let named: Vec<&str> = settings
+        .split(".shelbi/hooks/")
+        .skip(1)
+        .map(|rest| rest.split(|c: char| !(c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')).next().unwrap())
+        .collect();
+    assert!(!named.is_empty(), "{settings}");
+    for script in named {
+        assert!(wt.join(".shelbi/hooks").join(script).is_file(), "settings names a missing {script}");
+    }
+
+    // Neither the project repo (which holds `.shelbi/wt/`) nor the worktree
+    // lists `.shelbi/`. A user's global excludes file mustn't hide a miss.
+    for dir in [&repo, &wt] {
+        let out = std::process::Command::new("git")
+            .args(["-c", "core.excludesFile=/dev/null", "-C"])
+            .arg(dir)
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .unwrap();
+        let status = String::from_utf8_lossy(&out.stdout);
+        assert!(!status.contains(".shelbi"), "{}: {status}", dir.display());
+    }
+}
