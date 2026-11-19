@@ -4,7 +4,7 @@
 //! so several clients can mutate the board without interleaving stale work; see
 //! the "Removing tmux" plan, "The daemon executes mutations".
 //!
-//! `shelbi issue move|start|assign|unassign|edit|add` call [`run_mutation`].
+//! `shelbi issue move|start|assign|unassign|edit|add|rm` call [`run_mutation`].
 //! Output and exit codes are the same on both paths: the library emits every
 //! user-facing line through an [`OutputSink`](shelbi_orchestrator::mutate::OutputSink),
 //! and the daemon streams those same lines back verbatim.

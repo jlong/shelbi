@@ -3777,6 +3777,7 @@ mod tests {
             workspaces: Vec::new(),
             ownership: OwnershipGate::Unrestricted,
             remote_search: true,
+            tracker: Default::default(),
         });
         app.apply_board_data(data);
         app.apply_closed_page(Some(closed(

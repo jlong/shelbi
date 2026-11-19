@@ -177,6 +177,7 @@ fn board_read_round_trips() {
             workspaces: vec!["alpha".into(), "beta".into()],
             ownership: OwnershipGate::RequireAssignee("jlong".into()),
             remote_search: true,
+            tracker: shelbi_core::IssueTrackerBackend::Github,
         }),
         state_snapshot: Some(shelbi_state::State {
             workspace_filter: Some("alpha".into()),
@@ -213,7 +214,8 @@ fn board_read_round_trips() {
                 "display_name": "Shelbi",
                 "workspaces": ["alpha", "beta"],
                 "ownership": { "require_assignee": "jlong" },
-                "remote_search": true
+                "remote_search": true,
+                "tracker": "github"
             },
             "state_snapshot": { "zen_mode": "off", "workspace_filter": "alpha" },
             "workflows": { "Ok": [{ "workflow": workflow_json, "statuses": identities }] },

@@ -4065,6 +4065,23 @@ impl Run {
         }
         self.save(handle, "state-task-pane-menu");
 
+        // More ▸ Delete issue… chosen: its confirm, over the board and pane.
+        let handle = self.open_pane();
+        if let (Some(board), _, _) = self.views(handle) {
+            board.update(&mut self.cx, |v, cx| {
+                let state = v.state_mut();
+                let delete = state.pane_actions().iter().position(|a| *a == crate::views::board_state::PaneAction::Delete);
+                state.toggle_pane_menu();
+                if let Some(ix) = delete {
+                    state.choose_pane_action(ix);
+                }
+                cx.notify();
+            });
+        }
+        let asked = self.views(handle).0.is_some_and(|b| b.update(&mut self.cx, |v, _| v.state_mut().delete_confirm().is_some()));
+        self.expect("state-task-pane-delete: Delete asks first", asked);
+        self.save(handle, "state-task-pane-delete");
+
         // Each property's picker open under its value, then the keyboard
         // on Workflow (Tab, Tab): the Ghost focus.
         for property in crate::views::board_state::Property::ALL {
@@ -4100,6 +4117,17 @@ impl Run {
         let handle = self.open_pane();
         self.cx.simulate_keystrokes(handle.into(), "pagedown");
         self.save(handle, "state-task-pane-scrolled");
+
+        // In progress: the More menu's Delete dimmed (a workspace works it).
+        save_pane_task(Column::in_progress(), true);
+        let handle = self.open_pane();
+        if let (Some(board), _, _) = self.views(handle) {
+            board.update(&mut self.cx, |v, cx| {
+                v.state_mut().toggle_pane_menu();
+                cx.notify();
+            });
+        }
+        self.save(handle, "state-task-pane-menu-active");
 
         // No body at all.
         save_task_body("");

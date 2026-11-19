@@ -379,7 +379,9 @@ shelbi issue rm <ID>
 
 Delete an issue. On the `file_system` backend this removes its markdown file;
 on a `github` board it closes the GitHub issue as *not planned* (GitHub can't
-delete issues). Either way the column's priorities are renumbered.
+delete issues), and on a `linear` board it moves the issue to the team's
+Canceled status. Either way the column's priorities are renumbered. The
+desktop app's task pane runs the same delete from **More** ▸ **Delete issue…**.
 
 <Callout type="warning" title="Irreversible">
 

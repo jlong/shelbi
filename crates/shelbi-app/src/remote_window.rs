@@ -245,7 +245,8 @@ pub fn command_unavailable(kind: &CommandKind, host: &str) -> Option<String> {
         | CommandKind::AddIssue { .. }
         | CommandKind::NewIssue
         | CommandKind::PrioritizeIssue { .. }
-        | CommandKind::SetIssueWorkflow { .. } => return None,
+        | CommandKind::SetIssueWorkflow { .. }
+        | CommandKind::DeleteIssue { .. } => return None,
     };
     Some(reason)
 }

@@ -47,6 +47,7 @@ use shelbi_app::board::{
     WorkspaceOption, LOADING_MORE_STATUS,
 };
 use shelbi_app::board_search::{BoardSearch, SearchRequest, SearchWorker};
+use shelbi_app::issue_delete::{self, DeleteEffect};
 use shelbi_app::issue_edit::{self, Field, SaveJob, SaveStatus, SharedEdits, Snapshot};
 use shelbi_app::task_properties::{
     self, PriorityChoice, QueuePosition, StatusChoice, WorkflowChoice,
@@ -80,6 +81,9 @@ pub enum Mode {
     WorkflowDropdown { cursor: usize },
     /// Pick the workspace to assign `id` to.
     AssignPicker { id: String, cursor: usize },
+    /// Confirm deleting `id` (More ▸ Delete issue…, ⌘⌫): Enter deletes, Esc
+    /// (or Cancel) goes back to the pane with nothing done.
+    ConfirmDelete { id: String },
 }
 
 /// Something the view must do. The board never performs IO itself.
@@ -132,6 +136,10 @@ pub enum PaneAction {
     OpenWorkspace,
     OpenPr,
     CopyBranch,
+    /// Delete the issue, after a confirm: last, below a divider, in the
+    /// danger color. What it says depends on the tracker
+    /// ([`BoardState::pane_action_label`]).
+    Delete,
 }
 
 impl PaneAction {
@@ -146,6 +154,7 @@ impl PaneAction {
             PaneAction::OpenWorkspace => "Open workspace",
             PaneAction::OpenPr => "Open pull request",
             PaneAction::CopyBranch => "Copy branch name",
+            PaneAction::Delete => "Delete issue…",
         }
     }
 
@@ -161,6 +170,7 @@ impl PaneAction {
             PaneAction::OpenWorkspace => "workspace",
             PaneAction::OpenPr => "pr",
             PaneAction::CopyBranch => "copy-branch",
+            PaneAction::Delete => "delete",
         }
     }
 }
@@ -277,9 +287,24 @@ pub struct Pending {
     /// The daemon acknowledged it; the card stays pending until a read shows
     /// the change (so a read already in flight can't flash the old state).
     pub acked: bool,
+    /// A delete: once acked the card leaves the board, until a read shows it
+    /// gone (or, on a tracker that closes rather than deletes, revised).
+    pub deleting: bool,
     /// The acked change this one follows, put back if this one fails, so the
     /// card keeps the state its landed change produced.
     prev: Option<Box<Pending>>,
+}
+
+/// The delete confirm's content ([`BoardState::delete_confirm`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteConfirm {
+    pub id: String,
+    /// The question, naming the issue (`Delete “…”?`).
+    pub title: String,
+    /// What happens on this tracker.
+    pub body: &'static str,
+    /// The danger button's label.
+    pub confirm: &'static str,
 }
 
 /// A mutation ready to send, from [`BoardState::begin_mutation`].
@@ -305,6 +330,7 @@ impl MutationJob {
             | Mutation::AssignIssue { .. }
             | Mutation::AddIssue { .. }
             | Mutation::PrioritizeIssue { .. }
+            | Mutation::DeleteIssue { .. }
             | Mutation::EditIssue { workflow: Some(_), .. })) => Some(m),
             _ => None,
         }
@@ -555,6 +581,13 @@ impl BoardState {
         // something to overlay.
         let tasks = if self.pending.is_empty() { Vec::new() } else { self.input.tasks() };
         for (id, p) in &self.pending {
+            // An acked delete: the card is gone from the board.
+            if p.deleting && p.acked {
+                if let Some((c, r)) = self.model.position(id) {
+                    self.model.columns[c].cards.remove(r);
+                }
+                continue;
+            }
             // A workflow change shows on the card's badge at once.
             if let Some(workflow) = &p.to_workflow {
                 if let Some((c, r)) = self.model.position(id) {
@@ -797,7 +830,97 @@ impl BoardState {
         if card.branch.is_some() {
             out.push(PaneAction::CopyBranch);
         }
+        out.push(PaneAction::Delete);
         out
+    }
+
+    /// What deleting an issue does on this board's tracker.
+    pub fn delete_effect(&self) -> DeleteEffect {
+        issue_delete::effect(&self.input)
+    }
+
+    /// The More menu's row text for `action`: Delete's says what the
+    /// tracker really does (Close issue… on GitHub).
+    pub fn pane_action_label(&self, action: PaneAction) -> &'static str {
+        match action {
+            PaneAction::Delete => self.delete_effect().menu_label(),
+            other => other.label(),
+        }
+    }
+
+    /// Why the pane's `action` can't run now, when it can't (its row is
+    /// drawn dimmed with this on hover): Delete on an issue a workspace is
+    /// working on, or with a change of this client's still unanswered.
+    pub fn pane_action_refusal(&self, action: PaneAction) -> Option<String> {
+        let id = self.pane.as_deref()?;
+        match action {
+            PaneAction::Delete => issue_delete::delete_refusal(&self.input, id).or_else(|| {
+                self.change_in_progress(id).then(|| "A change to this issue is still in progress.".to_string())
+            }),
+            _ => None,
+        }
+    }
+
+    /// Ask to delete `id` (More ▸ Delete issue…, ⌘⌫ on the pane): the
+    /// confirm opens, or a refused delete says why and nothing opens.
+    fn begin_delete(&mut self, id: &str) -> Vec<Intent> {
+        if self.model.card(id).is_none() {
+            self.status = Some(format!("{id} is no longer on the board"));
+            return Vec::new();
+        }
+        if let Some(why) = self.pane_action_refusal(PaneAction::Delete) {
+            self.status = Some(why);
+            return Vec::new();
+        }
+        self.mode = Mode::ConfirmDelete { id: id.to_string() };
+        Vec::new()
+    }
+
+    /// The delete confirm, while it is up: what it names and says.
+    pub fn delete_confirm(&self) -> Option<DeleteConfirm> {
+        let Mode::ConfirmDelete { id } = &self.mode else {
+            return None;
+        };
+        let effect = self.delete_effect();
+        let title = self.model.card(id).map_or_else(|| id.clone(), |c| c.title.clone());
+        Some(DeleteConfirm {
+            id: id.clone(),
+            title: effect.confirm_title(&title),
+            body: effect.confirm_body(),
+            confirm: effect.confirm_label(),
+        })
+    }
+
+    /// The confirm's Delete (or Enter): back on the pane, the delete sent.
+    /// The pane closes once the daemon has done it ([`Self::finish_mutation`]).
+    pub fn confirm_delete(&mut self) -> Vec<Intent> {
+        let Mode::ConfirmDelete { id } = self.mode.clone() else {
+            return Vec::new();
+        };
+        self.mode = self.rest();
+        // The issue may have gone active while the confirm was up.
+        if let Some(why) = self.pane_action_refusal(PaneAction::Delete) {
+            self.status = Some(why);
+            return Vec::new();
+        }
+        vec![Intent::Command(CommandKind::DeleteIssue { id })]
+    }
+
+    /// The confirm's Cancel (or Esc): back on the pane, nothing done.
+    pub fn cancel_delete(&mut self) {
+        if matches!(self.mode, Mode::ConfirmDelete { .. }) {
+            self.mode = self.rest();
+        }
+    }
+
+    fn confirm_delete_key(&mut self, chord: KeyChord) -> Vec<Intent> {
+        match chord.code {
+            Key::Esc => self.cancel_delete(),
+            Key::Enter if chord.mods.is_empty() => return self.confirm_delete(),
+            // Modal: nothing else reaches the board or the pane.
+            _ => {}
+        }
+        Vec::new()
     }
 
     /// Where issue `id`'s pull request opens, when it has one to open.
@@ -849,6 +972,7 @@ impl BoardState {
                 self.open_workspace(ws)
             }
             PaneAction::OpenPr => self.open_pr(&id),
+            PaneAction::Delete => self.begin_delete(&id),
             PaneAction::CopyBranch => match self.model.card(&id).and_then(|c| c.branch.clone()) {
                 Some(branch) => {
                     self.status = Some(format!("copied {branch}"));
@@ -1293,6 +1417,7 @@ impl BoardState {
             Mode::WorkspaceDropdown { cursor } => Some(self.workspace_dropdown_key(cursor, chord)),
             Mode::WorkflowDropdown { cursor } => Some(self.workflow_dropdown_key(cursor, chord)),
             Mode::AssignPicker { id, cursor } => Some(self.assign_key(&id, cursor, chord)),
+            Mode::ConfirmDelete { .. } => Some(self.confirm_delete_key(chord)),
         }
     }
 
@@ -1394,6 +1519,10 @@ impl BoardState {
                 }
             }
             _ => {}
+        }
+        // ⌘⌫: More ▸ Delete issue…'s key (the desktop's, outside the keymap).
+        if chord.code == Key::Backspace && chord.mods == Mods::SUPER {
+            return self.begin_delete(id);
         }
         if let Some(action) = self.keymaps.popover.dispatch(chord) {
             return match action {
@@ -1830,6 +1959,9 @@ impl BoardState {
             CommandKind::SetIssueWorkflow { id, workflow } => {
                 (id.clone(), format!("Moving to the {workflow} workflow…"), None, None)
             }
+            CommandKind::DeleteIssue { id } => {
+                (id.clone(), self.delete_effect().progress_label().to_string(), None, None)
+            }
             CommandKind::AddIssue { title, .. } => {
                 if self.pending.contains_key(ADD_KEY) {
                     self.status = Some("an issue is already being added".into());
@@ -1853,6 +1985,7 @@ impl BoardState {
                         to_workflow: None,
                         renumbers: Vec::new(),
                         acked: false,
+                        deleting: false,
                         prev: None,
                     },
                 );
@@ -1905,7 +2038,8 @@ impl BoardState {
         let mut renumbers = match kind {
             CommandKind::MoveIssue { .. }
             | CommandKind::StartIssue { .. }
-            | CommandKind::PrioritizeIssue { .. } => vec![sent_from.status.clone()],
+            | CommandKind::PrioritizeIssue { .. }
+            | CommandKind::DeleteIssue { .. } => vec![sent_from.status.clone()],
             _ => Vec::new(),
         };
         // A follow-up on this client's own landed change: until the reads
@@ -1943,6 +2077,7 @@ impl BoardState {
                 to_workflow,
                 renumbers,
                 acked: false,
+                deleting: matches!(kind, CommandKind::DeleteIssue { .. }),
                 prev,
             },
         );
@@ -2006,7 +2141,26 @@ impl BoardState {
         result: Result<Option<ExpectedState>, ExecError>,
     ) -> Vec<Intent> {
         let released = self.release_held(id);
+        let deleting = self.pending.get(id).is_some_and(|p| p.deleting);
         match result {
+            Ok(_) if deleting => {
+                // Done: the card leaves the board (the read catches up
+                // later), and the pane on it closes, the board's selection
+                // on its neighbour.
+                if let Some(p) = self.pending.get_mut(id) {
+                    p.acked = true;
+                    p.prev = None;
+                    p.landed = None;
+                    p.to_status = None;
+                    p.to_slot = None;
+                    p.to_workflow = None;
+                }
+                if self.pane.as_deref() == Some(id) {
+                    self.close_pane();
+                }
+                self.status = Some(self.delete_effect().done_line(id));
+                self.rebuild();
+            }
             Ok(landed) => {
                 if let Some(p) = self.pending.get_mut(id) {
                     p.acked = true;
@@ -2038,6 +2192,9 @@ impl BoardState {
                 };
                 if id == ADD_KEY {
                     self.status = Some(format!("add failed: {message}"));
+                } else if deleting {
+                    self.status = Some(format!("{id}: {}: {message}", self.delete_effect().failed_line()));
+                    self.notices.insert(id.to_string(), message);
                 } else {
                     self.status = Some(format!("{id}: {message}"));
                     self.notices.insert(id.to_string(), message);
@@ -2294,6 +2451,7 @@ pub(crate) mod tests {
                 workspaces: vec!["alpha".into(), "bravo".into()],
                 ownership: shelbi_state::OwnershipGate::Unrestricted,
                 remote_search: false,
+                tracker: Default::default(),
             }),
             state_snapshot: None,
             workflows: Ok(vec![shelbi_core::default_workflow()]),
@@ -2629,16 +2787,17 @@ pub(crate) mod tests {
         use PaneAction::*;
         assert_eq!(
             b.pane_actions(),
-            vec![MoveLeft, MoveRight, Start, Assign, EditDescription, OpenInEditor],
-            "no workspace to open while unassigned"
+            vec![MoveLeft, MoveRight, Start, Assign, EditDescription, OpenInEditor, Delete],
+            "no workspace to open while unassigned; Delete always last"
         );
         b.open_detail("A");
-        assert_eq!(b.pane_actions().last(), Some(&OpenWorkspace));
+        let actions = b.pane_actions();
+        assert_eq!(actions[actions.len() - 2..], [OpenWorkspace, Delete]);
 
         b.toggle_pane_menu();
         assert_eq!(b.mode, Mode::PaneMenu { cursor: 0 });
         press(&mut b, "k");
-        assert_eq!(b.mode, Mode::PaneMenu { cursor: 6 }, "up wraps to the last row");
+        assert_eq!(b.mode, Mode::PaneMenu { cursor: 7 }, "up wraps to the last row");
         press(&mut b, "esc");
         assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "Esc closes the menu, not the pane");
 
@@ -3226,6 +3385,151 @@ pub(crate) mod tests {
             .iter()
             .position(|c| c.status_id == status)
             .unwrap()
+    }
+
+    /// The pane on `id` with its More menu's Delete chosen: the confirm.
+    fn ask_delete(b: &mut BoardState, id: &str) -> Vec<Intent> {
+        b.open_detail(id);
+        b.toggle_pane_menu();
+        let ix = b.pane_actions().iter().position(|a| *a == PaneAction::Delete).unwrap();
+        b.choose_pane_action(ix)
+    }
+
+    #[test]
+    fn delete_asks_first_and_cancel_or_esc_leaves_the_issue() {
+        let mut b = board(vec![issue("A", "todo"), issue("B", "todo")]);
+        b.open_detail("A");
+        assert_eq!(b.pane_action_label(PaneAction::Delete), "Delete issue…");
+        assert_eq!(b.pane_action_refusal(PaneAction::Delete), None);
+        assert!(ask_delete(&mut b, "A").is_empty(), "nothing is sent yet");
+        assert_eq!(b.mode, Mode::ConfirmDelete { id: "A".into() });
+        let confirm = b.delete_confirm().unwrap();
+        assert_eq!(confirm.title, "Delete “Issue A”?", "it names the issue's title");
+        assert!(confirm.body.contains("can’t be undone"));
+        assert_eq!(confirm.confirm, "Delete");
+
+        // Esc: back on the pane, nothing sent.
+        assert!(press(&mut b, "esc").is_empty());
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        // Cancel (the button) and the scrim's click do the same.
+        ask_delete(&mut b, "A");
+        b.cancel_delete();
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        ask_delete(&mut b, "A");
+        b.close_overlay();
+        assert_eq!(b.detail_id(), Some("A"), "the scrim closes the confirm, not the pane");
+        assert_eq!(ids_in(&b, "todo"), ["A", "B"]);
+
+        // ⌘⌫ on the pane asks too; other keys go nowhere while it's up.
+        press(&mut b, "super-backspace");
+        assert_eq!(b.mode, Mode::ConfirmDelete { id: "A".into() });
+        assert!(press(&mut b, "j").is_empty());
+        assert_eq!(b.mode, Mode::ConfirmDelete { id: "A".into() });
+        assert_eq!(press(&mut b, "enter"), vec![Intent::Command(CommandKind::DeleteIssue { id: "A".into() })]);
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+    }
+
+    #[test]
+    fn a_confirmed_delete_closes_the_pane_and_drops_the_card() {
+        let mut b = board(vec![issue("A", "todo"), issue("B", "todo"), issue("C", "todo")]);
+        ask_delete(&mut b, "B");
+        let out = b.confirm_delete();
+        let kind = CommandKind::DeleteIssue { id: "B".into() };
+        assert_eq!(out, vec![Intent::Command(kind.clone())]);
+        let job = b.begin_mutation(&kind).unwrap();
+        assert_eq!(job.mutation("demo"), Some(Mutation::DeleteIssue { project: "demo".into(), id: "B".into() }));
+        assert_eq!(b.pending("B").map(|p| p.label.as_str()), Some("Deleting…"));
+        assert_eq!(ids_in(&b, "todo"), ["A", "B", "C"], "still there until the daemon answers");
+
+        b.answer("B", Ok(None));
+        assert_eq!(b.detail_id(), None, "the pane closes");
+        assert_eq!(b.take_closed().as_deref(), Some("B"));
+        assert_eq!(b.mode, Mode::Board, "the keys are the board's");
+        assert_eq!(ids_in(&b, "todo"), ["A", "C"], "the card is gone at once");
+        assert_eq!(b.selected_card().map(|c| c.id.as_str()), Some("C"), "on its neighbour");
+        assert_eq!(b.status.as_deref(), Some("B deleted"));
+
+        // A read from before the delete doesn't bring it back; one without
+        // it settles.
+        b.apply_open(read(vec![issue("A", "todo"), issue("B", "todo"), issue("C", "todo")]));
+        assert_eq!(ids_in(&b, "todo"), ["A", "C"]);
+        b.apply_open(read(vec![issue("A", "todo"), issue("C", "todo")]));
+        assert!(b.pending("B").is_none());
+        assert_eq!(ids_in(&b, "todo"), ["A", "C"]);
+    }
+
+    #[test]
+    fn a_failed_delete_says_why_and_leaves_the_issue() {
+        let mut b = board(vec![issue("A", "todo"), issue("B", "todo")]);
+        ask_delete(&mut b, "A");
+        let kind = b.confirm_delete().into_iter().find_map(|i| match i {
+            Intent::Command(k) => Some(k),
+            _ => None,
+        });
+        b.begin_mutation(&kind.unwrap()).unwrap();
+        b.answer("A", Err(ExecError::Backend("gh: HTTP 403 Must have admin rights".into())));
+        assert_eq!(b.detail_id(), Some("A"), "the pane stays");
+        assert_eq!(ids_in(&b, "todo"), ["A", "B"]);
+        assert!(b.pending("A").is_none());
+        assert_eq!(b.notice("A"), Some("gh: HTTP 403 Must have admin rights"));
+        assert_eq!(b.status.as_deref(), Some("A: delete failed: gh: HTTP 403 Must have admin rights"));
+    }
+
+    #[test]
+    fn an_active_issue_cant_be_deleted_and_says_why() {
+        let mut busy = issue("W", "in-progress");
+        busy.task.assigned_to = Some("alpha".into());
+        let mut b = board(vec![busy, issue("A", "todo")]);
+        b.open_detail("W");
+        assert!(b.pane_actions().contains(&PaneAction::Delete), "listed, dimmed");
+        let why = b.pane_action_refusal(PaneAction::Delete).expect("refused while a workspace works on it");
+        assert!(why.contains("Stop it or move the issue out of"), "{why}");
+        // Neither the menu nor ⌘⌫ opens the confirm; the reason shows.
+        assert!(ask_delete(&mut b, "W").is_empty());
+        assert_eq!(b.mode, Mode::Detail { id: "W".into(), editing: false });
+        assert_eq!(b.status.as_deref(), Some(why.as_str()));
+        press(&mut b, "super-backspace");
+        assert_eq!(b.delete_confirm(), None);
+
+        // An issue that went active while the confirm was up isn't sent.
+        ask_delete(&mut b, "A");
+        let mut moved = issue("A", "in-progress");
+        moved.task.updated_at = chrono::Utc::now();
+        let mut w = issue("W", "in-progress");
+        w.task.assigned_to = Some("alpha".into());
+        b.apply_open(read(vec![w, moved]));
+        assert!(b.confirm_delete().is_empty());
+        assert!(b.pending("A").is_none());
+    }
+
+    #[test]
+    fn a_github_board_closes_rather_than_deletes_and_says_so() {
+        let mut b = fresh_board();
+        let mut r = read(vec![issue("A", "todo"), issue("B", "todo")]);
+        r.project.as_mut().unwrap().tracker = shelbi_core::IssueTrackerBackend::Github;
+        b.apply_open(r);
+        b.apply_closed(None);
+        b.open_detail("A");
+        assert_eq!(b.pane_action_label(PaneAction::Delete), "Close issue…");
+        ask_delete(&mut b, "A");
+        let confirm = b.delete_confirm().unwrap();
+        assert_eq!(confirm.title, "Close “Issue A”?");
+        assert!(confirm.body.contains("closes the issue as not planned on GitHub"));
+        assert_eq!(confirm.confirm, "Close issue");
+        let kind = CommandKind::DeleteIssue { id: "A".into() };
+        assert_eq!(b.confirm_delete(), vec![Intent::Command(kind.clone())], "the same delete `issue rm` sends");
+        assert_eq!(b.begin_mutation(&kind).map(|_| ()), Ok(()));
+        assert_eq!(b.pending("A").map(|p| p.label.as_str()), Some("Closing…"));
+        b.answer("A", Ok(None));
+        assert_eq!(b.status.as_deref(), Some("A closed as not planned"));
+        assert_eq!(ids_in(&b, "todo"), ["B"]);
+        // The read showing it closed (revised) settles it where GitHub has it.
+        let mut closed = issue("A", "done");
+        closed.task.updated_at = chrono::Utc::now();
+        let mut r = read(vec![issue("B", "todo"), closed]);
+        r.project.as_mut().unwrap().tracker = shelbi_core::IssueTrackerBackend::Github;
+        b.apply_open(r);
+        assert!(b.pending("A").is_none());
     }
 
     fn ids_in(b: &BoardState, status: &str) -> Vec<String> {

@@ -171,7 +171,8 @@ pub enum IssueCmd {
     /// dedicated command — `move`, `prio`, `assign`, `depends` — are out of
     /// scope; use those instead.
     Edit(EditArgs),
-    /// Delete an issue.
+    /// Delete an issue. A tracker that can't delete does the nearest thing:
+    /// a GitHub issue is closed as not planned, a Linear one is canceled.
     Rm { id: String },
     /// Post a comment on an issue. Works against whichever issue-tracker
     /// backend the project is configured for (`file_system` by default,
@@ -1564,17 +1565,10 @@ fn edit(project: &str, args: EditArgs) -> Result<()> {
     mutate_client::run_mutation(project, &args.id, MutationKind::Edit(Box::new(spec)))
 }
 
+/// `shelbi issue rm`: through the daemon, the same delete the desktop issue
+/// pane's Delete issue sends ([`shelbi_orchestrator::mutate`]'s `delete`).
 fn rm(project: &str, id: &str) -> Result<()> {
-    let tf = load_issue(project, id)?;
-    let column = tf.task.column;
-    let store = cached_issue_store(project)?;
-    store.delete(id).map_err(|e| anyhow!(e))?;
-    store.renumber(&column).map_err(|e| anyhow!(e))?;
-    if let Err(e) = shelbi_state::clear_zen_demotion(project, id) {
-        eprintln!("warning: clearing Zen's record of `{id}` failed: {e}");
-    }
-    println!("✓ {id} deleted");
-    Ok(())
+    mutate_client::run_mutation(project, id, MutationKind::Delete)
 }
 
 #[cfg(test)]

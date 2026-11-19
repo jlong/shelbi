@@ -651,6 +651,11 @@ pub struct BoardProject {
     /// so the board's text search asks it ([`crate::board_search`]).
     #[serde(default)]
     pub remote_search: bool,
+    /// The project's issue tracker, which says what deleting an issue does
+    /// there ([`crate::issue_delete::DeleteEffect`]). A read without it
+    /// decodes as the filesystem board.
+    #[serde(default)]
+    pub tracker: shelbi_core::IssueTrackerBackend,
 }
 
 /// How the open-board read went.
@@ -724,6 +729,7 @@ pub fn read_open_board(project: &str) -> BoardRead {
                 p.issue_tracker.backend,
                 shelbi_core::IssueTrackerBackend::Github | shelbi_core::IssueTrackerBackend::Linear
             ),
+            tracker: p.issue_tracker.backend,
             workspaces: p.workspaces.into_iter().map(|w| w.name).collect(),
         });
     let state_snapshot = shelbi_state::read_state(project).ok();
@@ -994,6 +1000,8 @@ pub struct BoardInput {
     pub ownership: OwnershipGate,
     /// See [`BoardProject::remote_search`].
     pub remote_search: bool,
+    /// See [`BoardProject::tracker`].
+    pub tracker: shelbi_core::IssueTrackerBackend,
     /// Issues the active text search found that the board hasn't loaded
     /// ([`crate::board_search::BoardSearch::hits`], set by
     /// [`BoardInput::set_search_hits`]); merged last, so a loaded card wins.
@@ -1019,6 +1027,7 @@ impl Default for BoardInput {
             error: None,
             ownership: OwnershipGate::Unrestricted,
             remote_search: false,
+            tracker: shelbi_core::IssueTrackerBackend::FileSystem,
             search_hits: Vec::new(),
             estimates: Vec::new(),
         }
@@ -1038,6 +1047,7 @@ impl BoardInput {
                 self.workspaces = p.workspaces;
                 self.ownership = p.ownership;
                 self.remote_search = p.remote_search;
+                self.tracker = p.tracker;
             }
             None => {
                 self.default_workflow_name = DEFAULT_WORKFLOW_NAME.to_string();
@@ -1045,6 +1055,7 @@ impl BoardInput {
                 self.workspaces = Vec::new();
                 self.ownership = OwnershipGate::Unrestricted;
                 self.remote_search = false;
+                self.tracker = shelbi_core::IssueTrackerBackend::FileSystem;
             }
         }
         self.workspace_filter = read

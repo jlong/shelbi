@@ -127,6 +127,11 @@ pub enum CommandKind {
     /// only workflows that declare the issue's status
     /// ([`crate::task_properties::workflow_choices`]).
     SetIssueWorkflow { id: String, workflow: String },
+    /// Delete an issue, as `shelbi issue rm` does (the desktop task pane's
+    /// More ▸ Delete issue…, after its confirm). On a tracker that can't
+    /// delete it closes or cancels the issue instead
+    /// ([`crate::issue_delete::DeleteEffect`]). Never listed in the palette.
+    DeleteIssue { id: String },
 }
 
 /// A registry command: metadata + typed arguments. Built by the registry
@@ -178,6 +183,7 @@ impl Command {
                 | CommandKind::AddIssue { .. }
                 | CommandKind::PrioritizeIssue { .. }
                 | CommandKind::SetIssueWorkflow { .. }
+                | CommandKind::DeleteIssue { .. }
         )
     }
 
@@ -304,6 +310,10 @@ impl CommandKind {
                 workflow: Some(workflow.clone()),
                 expect_title: None,
                 expect_body: None,
+            }),
+            CommandKind::DeleteIssue { id } => Effect::Mutate(Mutation::DeleteIssue {
+                project: p(),
+                id: id.clone(),
             }),
         }
     }
@@ -1318,6 +1328,19 @@ mod tests {
             hidden_until_query: false,
         };
         assert!(cmd.is_mutating());
+    }
+
+    #[test]
+    fn delete_issue_is_a_daemon_mutation() {
+        let kind = CommandKind::DeleteIssue { id: "t1".into() };
+        assert_eq!(
+            kind.effect_with_project("alpha"),
+            Effect::Mutate(Mutation::DeleteIssue {
+                project: "alpha".into(),
+                id: "t1".into(),
+            })
+        );
+        assert!(CommandKind::from_id("action:delete-issue:t1").is_none(), "never listed");
     }
 
     #[test]

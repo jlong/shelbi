@@ -79,7 +79,7 @@ use super::pane_session::PaneSession;
 use super::pane_split::{GRIP_H, GRIP_RADIUS, GRIP_W, HANDLE_H, SESSION_H, SESSION_HEADER_H};
 use super::sidebar::{render_glyph, review_glyph, workspace_glyph};
 use super::task_panel;
-use super::workflow_editor::{dropdown, MENU_W};
+use super::workflow_editor::{dropdown, menu_rule, MENU_W};
 use crate::assets::{heroicon, icons};
 use crate::elements::placed::MenuScroll;
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
@@ -187,8 +187,17 @@ fn header(view: &IssuesView, title: String, theme: &Theme, cx: &mut Context<Issu
     let menu_open = cursor.is_some();
     // What the menu lists, read now (its rows are built while this view
     // renders, so they can't read it then).
-    let rows: Vec<(PaneAction, String)> = if menu_open {
-        view.state.pane_actions().into_iter().map(|a| (a, action_hint(view, a))).collect()
+    let rows: Vec<MenuRow> = if menu_open {
+        view.state
+            .pane_actions()
+            .into_iter()
+            .map(|a| MenuRow {
+                action: a,
+                label: view.state.pane_action_label(a),
+                hint: action_hint(view, a),
+                refusal: view.state.pane_action_refusal(a),
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -219,30 +228,49 @@ fn header(view: &IssuesView, title: String, theme: &Theme, cx: &mut Context<Issu
     floating_pane::header("pane-heading", title, vec![more.into_any_element(), close.into_any_element()], theme)
 }
 
+/// One row of the More menu, read while the view renders.
+struct MenuRow {
+    action: PaneAction,
+    label: &'static str,
+    hint: String,
+    /// Why it can't run now: drawn dimmed, with this on hover.
+    refusal: Option<String>,
+}
+
 /// The More menu's rows in one scroll: each action and the key that does
-/// the same, the keyboard's row kept in view (`scroll` follows it).
+/// the same, the keyboard's row kept in view (`scroll` follows it). Delete
+/// comes last, under a rule, in the danger color.
 fn menu_items(
-    rows: Vec<(PaneAction, String)>,
+    rows: Vec<MenuRow>,
     cursor: Option<usize>,
     scroll: MenuScroll,
     cx: &mut Context<IssuesView>,
 ) -> Vec<AnyElement> {
     let theme = cx.global::<Theme>().opaque();
-    let items: Vec<AnyElement> = rows
-        .into_iter()
-        .enumerate()
-        .map(|(ix, (action, hint))| {
-            style::menu_row(format!("pane-menu-{}", action.slug()), cursor == Some(ix), &theme)
-                .child(div().flex_1().min_w_0().truncate().child(action.label()))
-                .child(div().flex_none().type_style(Type::XSmall).text_color(theme.muted).child(hint))
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+    let mut items: Vec<AnyElement> = Vec::new();
+    for (ix, row) in rows.into_iter().enumerate() {
+        let danger = row.action == PaneAction::Delete;
+        if danger && ix > 0 {
+            items.push(menu_rule(&theme).debug_selector(|| "pane-menu-rule".into()).into_any_element());
+        }
+        let id = format!("pane-menu-{}", row.action.slug());
+        let base = match &row.refusal {
+            Some(why) => style::disabled_menu_row(id, &theme).tooltip(style::tooltip(why.clone())),
+            None => style::menu_row(id, cursor == Some(ix), &theme).on_click(cx.listener(
+                move |this, _: &ClickEvent, window, cx| {
                     let intents = this.state.choose_pane_action(ix);
                     this.apply_intents(intents, window, cx);
                     cx.notify();
-                }))
-                .into_any_element()
-        })
-        .collect();
+                },
+            )),
+        };
+        let base = if danger { base.text_color(theme.error) } else { base };
+        items.push(
+            base.child(div().flex_1().min_w_0().truncate().child(row.label))
+                .child(div().flex_none().type_style(Type::XSmall).text_color(theme.muted).child(row.hint))
+                .into_any_element(),
+        );
+    }
     vec![div()
         .id("pane-menu-scroll")
         .flex()
@@ -915,6 +943,7 @@ pub(super) fn action_hint(view: &IssuesView, action: PaneAction) -> String {
         PaneAction::EditDescription => "e".into(),
         PaneAction::OpenInEditor => "⇧E".into(),
         PaneAction::CopyBranch => String::new(),
+        PaneAction::Delete => "⌘⌫".into(),
     }
 }
 

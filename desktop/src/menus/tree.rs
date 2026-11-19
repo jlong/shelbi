@@ -371,7 +371,8 @@ pub fn place(kind: &CommandKind) -> Placement {
         | CommandKind::EditIssue { .. }
         | CommandKind::AddIssue { .. }
         | CommandKind::PrioritizeIssue { .. }
-        | CommandKind::SetIssueWorkflow { .. } => Placement::Board,
+        | CommandKind::SetIssueWorkflow { .. }
+        | CommandKind::DeleteIssue { .. } => Placement::Board,
         CommandKind::OpenIssue { .. } | CommandKind::OpenChangelogEntry { .. } => Placement::Search,
     }
 }

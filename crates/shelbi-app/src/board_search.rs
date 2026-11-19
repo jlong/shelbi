@@ -653,6 +653,7 @@ mod tests {
             open: vec![issue("t-1", "Change the palette", "todo"), issue("t-2", "Other", "todo")],
             loading: false,
             remote_search: true,
+            tracker: Default::default(),
             ..BoardInput::default()
         };
         input.apply_closed(Some(ClosedPage {

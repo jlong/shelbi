@@ -4703,6 +4703,7 @@ impl ShellState {
             Effect::Mutate(m @ Mutation::PrioritizeIssue { .. }) => {
                 self.spawn_mutation(m, "reordered", "reorder failed")
             }
+            Effect::Mutate(m @ Mutation::DeleteIssue { .. }) => self.spawn_mutation(m, "deleted", "delete failed"),
         }
     }
 
