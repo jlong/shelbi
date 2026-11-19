@@ -1,21 +1,25 @@
-//! The New tab (`new-tab-launch`): the tab bar's `+` adds a "New tab" whose
-//! content is the launch screen ([`LaunchView::in_tab`], the launch window's
-//! own view), a second `+` selects it, and what is picked there becomes
-//! that tab: a project opens in its place, one with a tab already (here or
-//! in another window) comes up there and the New tab goes, the wizard's
-//! new project lands in it, and a remote session opens its own window. It
-//! closes (its `×`, ⌘W), is never saved, and drags and tears off like a
-//! project's tab.
+//! The New tab (`new-tab-launch`): the tab bar's `+` turns into a "New tab"
+//! (`new-tab-plus-morph`: its `+` into an `×`, its label sliding out, the
+//! slot widening; at once under Reduce Motion) whose content is the launch
+//! screen ([`LaunchView::in_tab`], the launch window's own view). While it is
+//! open there is no other `+`, so a window has one. What is picked there
+//! becomes that tab: a project opens in its place (the last tab, a plain `+`
+//! back after it), one with a tab already (here or in another window) comes
+//! up there and the New tab goes, the wizard's new project lands in it, and a
+//! remote session opens its own window. It closes (its `×`, ⌘W) turning back
+//! into the `+`, is never saved, and stays pinned in the `+` slot: it never
+//! drags, reorders or tears off, and no tab lands past it.
 //!
 //! Windows are the window tests' inert ones ([`super::window_tests`]); the
 //! launch screen reads a canned model ([`TestDeps`]) and starts a fake
 //! daemon, so nothing runs or reaches the real Shelbi home.
 
+use std::cell::Cell;
 use std::sync::Arc;
+use std::time::Instant;
 
 use gpui::{point, px, Modifiers, TestAppContext};
 use shelbi_app::launch::{FakeDaemon, LaunchModel};
-use shelbi_app::overlay::palette::ProjectIndicator;
 
 use super::window_tests::{
     bounds_in, draw, fixture, open, open_at, press_and_start, read, release_at, shown, tabs_of, tearoff_fixture,
@@ -23,6 +27,7 @@ use super::window_tests::{
 };
 use super::*;
 use crate::views::launch::tests::{project, session, Home};
+use crate::theme::motion;
 use crate::views::launch::{Deps, Host, TestDeps};
 
 /// The launch screen's rows (alpha, beta, gamma) and a daemon that only
@@ -82,6 +87,34 @@ fn with_new_tab(cx: &mut TestAppContext, f: &Fixture) -> WindowHandle<ShelbiWind
     h
 }
 
+/// Run `h`'s clock by hand from now on (its tab bar's turns follow it):
+/// the clock, to set.
+fn hand_clock(cx: &mut TestAppContext, h: WindowHandle<ShelbiWindow>) -> Rc<Cell<Instant>> {
+    let now = Rc::new(Cell::new(Instant::now()));
+    let clock = now.clone();
+    update(cx, h, move |w, _, _| {
+        w.clock = Rc::new(move || clock.get());
+        w.reduce_motion = Rc::new(|| false);
+    });
+    now
+}
+
+fn width(cx: &mut TestAppContext, h: WindowHandle<ShelbiWindow>, selector: &'static str) -> f32 {
+    bounds_in(cx, h, selector).unwrap_or_else(|| panic!("{selector} is drawn")).size.width.as_f32()
+}
+
+/// The New tab's width, fully open, from its label's as it painted.
+fn open_width(cx: &mut TestAppContext, h: WindowHandle<ShelbiWindow>) -> f32 {
+    let label = read(cx, h, |w, _| w.tab_reorder.layout.borrow().plus_label_w).expect("the label painted");
+    tab_bar::plus_slot_w(1.0, label)
+}
+
+/// Widths as laid out, within a fraction of a point.
+#[track_caller]
+fn assert_near(got: f32, want: f32, why: &str) {
+    assert!((got - want).abs() < 0.5, "{got} vs {want}: {why}");
+}
+
 fn chose(cx: &mut TestAppContext, h: WindowHandle<ShelbiWindow>, choice: NewTabChoice) {
     cx.update(|cx| {
         let weak = h.entity(cx).unwrap().downgrade();
@@ -102,8 +135,14 @@ fn plus_opens_a_new_tab_showing_the_launch_screen(cx: &mut TestAppContext) {
     assert!(on_new_tab(cx, h), "and selected");
     let tab = read(cx, h, |w, cx| w.tab_props(cx).into_iter().find(|t| t.name == NEW_TAB).unwrap());
     assert_eq!((tab.label.as_ref(), tab.selected, tab.working), ("New tab", true, false));
-    assert!(drawn(cx, h, "tab-new-tab"));
-    assert_eq!(tab_bar::indicator(&tab.name, tab.working), ProjectIndicator::Unloaded, "a gray ring");
+    // The `+` became it, in its slot past beta: no `+` is left to start
+    // another, and its `×` is where the `+` was.
+    assert!(drawn(cx, h, "tab-new-tab") && drawn(cx, h, "tab-close-new-tab"));
+    assert!(!drawn(cx, h, "tab-plus"), "no separate +");
+    let (beta, new_tab) = (bounds_in(cx, h, "tab-beta").unwrap(), bounds_in(cx, h, "tab-new-tab").unwrap());
+    assert!(new_tab.left() > beta.right(), "at the bar's end");
+    let close = bounds_in(cx, h, "tab-close-new-tab").unwrap();
+    assert_eq!(close.center().x - new_tab.left(), px(26.0), "centered where the + was");
 
     // The launch screen fills the window under the bar: no sidebar.
     for screen in ["new-tab", "launch", "launch-welcome", "launch-projects", "launch-add-project", "launch-connect-remote"] {
@@ -116,10 +155,72 @@ fn plus_opens_a_new_tab_showing_the_launch_screen(cx: &mut TestAppContext) {
     assert_eq!(cx.update(|cx| launch.read(cx).host()), Host::Tab, "the launch window's own view");
     assert!(read(cx, h, |w, _| w.command_model().project.is_none()), "no project");
 
-    // A second `+` selects it: never a second New tab.
-    click(cx, h, "tab-plus");
+    // Switch Project… (or a click on its body) selects it: never a second
+    // New tab.
+    update(cx, h, |w, window, cx| w.open_new_tab(window, cx));
+    click(cx, h, "tab-new-tab-label");
     assert_eq!(tabs_of(cx, h), ["alpha", "beta", NEW_TAB]);
     assert!(on_new_tab(cx, h));
+}
+
+#[gpui::test]
+fn the_plus_turns_into_the_new_tab_and_back(cx: &mut TestAppContext) {
+    let f = setup(cx);
+    let h = open(cx, &f, "alpha", 0);
+    update(cx, h, |w, window, cx| w.switch_to("beta", window, cx));
+    let now = hand_clock(cx, h);
+    assert_near(width(cx, h, "tab-plus"), 52.0, "the 52pt square");
+    let beta = bounds_in(cx, h, "tab-beta").unwrap();
+    let t0 = now.get();
+    click(cx, h, "tab-plus");
+    assert!(on_new_tab(cx, h), "the launch screen shows at once");
+    assert!(drawn(cx, h, "launch"));
+    // Still the square as the click lands, then widening on the curve.
+    assert_near(width(cx, h, "tab-new-tab"), 52.0, "");
+    let full = open_width(cx, h);
+    assert!(full > 52.0 + 40.0, "{full}: room for the label");
+    now.set(t0 + motion::TAB_MORPH / 4);
+    let quarter = width(cx, h, "tab-new-tab");
+    let eased = 52.0 + (full - 52.0) * motion::ease_out_expo(0.25);
+    assert!((quarter - eased).abs() < 0.5, "{quarter} vs {eased}");
+    assert!(read(cx, h, |w, _| w.plus_morph.animating(true, t0 + motion::TAB_MORPH / 4, false)));
+    // The tabs before it never move.
+    assert_eq!(bounds_in(cx, h, "tab-beta").unwrap(), beta);
+    now.set(t0 + motion::TAB_MORPH);
+    assert_near(width(cx, h, "tab-new-tab"), full, "");
+    assert_eq!(bounds_in(cx, h, "tab-beta").unwrap(), beta);
+
+    // Its `×`: back the same way, to a lone `+`.
+    let t1 = now.get();
+    click(cx, h, "tab-close-new-tab");
+    assert_eq!(tabs_of(cx, h), ["alpha", "beta"]);
+    assert!(!drawn(cx, h, "tab-new-tab"));
+    assert_near(width(cx, h, "tab-plus"), full, "turning back from the New tab");
+    now.set(t1 + motion::TAB_MORPH / 2);
+    let half = width(cx, h, "tab-plus");
+    assert!(half > 52.0 && half < full, "{half}");
+    now.set(t1 + motion::TAB_MORPH);
+    assert_near(width(cx, h, "tab-plus"), 52.0, "");
+    assert!(!drawn(cx, h, "tab-new-tab-label"), "the label is gone under the +");
+    assert_eq!(bounds_in(cx, h, "tab-beta").unwrap(), beta);
+}
+
+#[gpui::test]
+fn under_reduce_motion_the_plus_turns_at_once(cx: &mut TestAppContext) {
+    let f = setup(cx);
+    let h = open(cx, &f, "alpha", 0);
+    let _now = hand_clock(cx, h);
+    update(cx, h, |w, _, _| w.reduce_motion = Rc::new(|| true));
+    click(cx, h, "tab-plus");
+    let full = open_width(cx, h);
+    assert_near(width(cx, h, "tab-new-tab"), full, "open as the click lands");
+    click(cx, h, "tab-close-new-tab");
+    assert_near(width(cx, h, "tab-plus"), 52.0, "closed as the click lands");
+    // ⌘W too.
+    click(cx, h, "tab-plus");
+    update(cx, h, |w, window, cx| w.close_window(window, cx));
+    assert_near(width(cx, h, "tab-plus"), 52.0, "");
+    assert_eq!(windows(cx).len(), 1);
 }
 
 #[gpui::test]
@@ -147,8 +248,11 @@ fn another_tab_picked_keeps_the_new_tab_to_come_back_to(cx: &mut TestAppContext)
     assert!(!on_new_tab(cx, h));
     assert_eq!(tabs_of(cx, h), ["alpha", "beta", NEW_TAB], "it stays");
     assert!(drawn(cx, h, "sidebar") && !drawn(cx, h, "launch"));
-    // Its tab (a click, ⌘3) brings the launch screen back.
-    click(cx, h, "tab-new-tab");
+    let tab = read(cx, h, |w, cx| w.tab_props(cx).into_iter().find(|t| t.name == NEW_TAB).unwrap());
+    assert!(!tab.selected, "unselected, like any tab");
+    assert!(drawn(cx, h, "tab-new-tab") && !drawn(cx, h, "tab-plus"), "still in the + slot");
+    // Its tab (a click on its label, ⌘3) brings the launch screen back.
+    click(cx, h, "tab-new-tab-label");
     assert!(on_new_tab(cx, h));
     assert!(drawn(cx, h, "launch"));
     update(cx, h, |w, window, cx| w.switch_to("alpha", window, cx));
@@ -163,20 +267,24 @@ fn a_project_picked_on_the_launch_screen_opens_in_the_tabs_place(cx: &mut TestAp
     let _home = Home::new("new-tab-pick", &["alpha", "beta", "gamma"]);
     let h = open(cx, &f, "alpha", 0);
     update(cx, h, |w, window, cx| w.switch_to("beta", window, cx));
+    let now = hand_clock(cx, h);
     click(cx, h, "tab-plus");
-    // The New tab between alpha and beta.
-    update(cx, h, |w, _, cx| {
-        w.tabs.move_to(NEW_TAB, 1);
-        w.tabs_changed(cx);
-    });
+    now.set(now.get() + motion::TAB_MORPH);
+    let full = open_width(cx, h);
+    assert_near(width(cx, h, "tab-new-tab"), full, "");
     // gamma, the launch screen's third row.
     click(cx, h, "launch-project-2");
     assert_eq!(daemon.starts(), 1, "the daemon is started first, as from the launch window");
     assert_eq!(shown(cx, h), "gamma");
-    assert_eq!(tabs_of(cx, h), ["alpha", "gamma", "beta"], "in the New tab's place");
+    assert_eq!(tabs_of(cx, h), ["alpha", "beta", "gamma"], "in the New tab's place, the last");
     assert!(!on_new_tab(cx, h));
     assert_eq!(windows(cx).len(), 1, "in this window");
-    assert_eq!(read(cx, h, |w, _| w.window_state.tabs.clone()), keys(&["alpha", "gamma", "beta"]));
+    assert_eq!(read(cx, h, |w, _| w.window_state.tabs.clone()), keys(&["alpha", "beta", "gamma"]));
+    // A plain `+` past it, just there: no turning back.
+    assert!(drawn(cx, h, "tab-gamma"));
+    assert_near(width(cx, h, "tab-plus"), 52.0, "");
+    assert!(!drawn(cx, h, "tab-new-tab-label"));
+    assert!(bounds_in(cx, h, "tab-plus").unwrap().left() > bounds_in(cx, h, "tab-gamma").unwrap().right());
 }
 
 #[gpui::test]
@@ -224,13 +332,10 @@ fn a_project_in_another_window_comes_up_there_and_the_new_tab_goes(cx: &mut Test
 fn the_wizards_new_project_opens_in_the_new_tab(cx: &mut TestAppContext) {
     let f = setup(cx);
     let h = with_new_tab(cx, &f);
-    update(cx, h, |w, _, cx| {
-        w.tabs.move_to(NEW_TAB, 0);
-        w.tabs_changed(cx);
-    });
     update(cx, h, |w, window, cx| w.project_added("gamma", window, cx));
     assert_eq!(shown(cx, h), "gamma");
-    assert_eq!(tabs_of(cx, h), ["gamma", "alpha", "beta"], "in the New tab's place");
+    assert_eq!(tabs_of(cx, h), ["alpha", "beta", "gamma"], "in the New tab's place");
+    assert!(drawn(cx, h, "tab-plus"));
 }
 
 #[gpui::test]
@@ -299,45 +404,47 @@ fn the_new_tab_is_never_saved(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_torn_off_new_tab_becomes_a_window_showing_the_launch_screen(cx: &mut TestAppContext) {
+fn the_new_tab_never_drags_or_tears_off(cx: &mut TestAppContext) {
     let f = tearoff_fixture(cx, &["alpha", "beta"]);
     launch_deps(cx);
     let a = open_at(cx, &f, "alpha", 0, super::window_tests::frame(0.0, 0.0), &["alpha", "beta"]);
     update(cx, a, |w, window, cx| w.open_new_tab(window, cx));
     draw(cx, a);
     assert_eq!(tabs_of(cx, a), ["alpha", "beta", NEW_TAB]);
-    press_and_start(cx, a, "tab-new-tab");
+    // Pressed and pulled onto alpha: nothing moves.
+    let alpha = bounds_in(cx, a, "tab-alpha").unwrap();
+    press_and_start(cx, a, "tab-new-tab-label");
+    assert!(read(cx, a, |w, _| !w.tab_reorder.ghost_alive()), "no drag began");
+    let to = point(alpha.left() + px(4.0), alpha.center().y);
+    super::window_tests::move_to(cx, a, to);
+    release_at(cx, a, to);
+    assert_eq!(tabs_of(cx, a), ["alpha", "beta", NEW_TAB]);
+    // Pulled far off the bar: no window of its own.
+    press_and_start(cx, a, "tab-new-tab-label");
     let away = point(px(450.0), px(52.0 + 300.0));
     super::window_tests::move_to(cx, a, away);
     release_at(cx, a, away);
-    let handles: Vec<WindowHandle<ShelbiWindow>> =
-        cx.update(|cx| cx.global::<Shell>().windows.iter().map(|w| w.handle).collect());
-    assert_eq!(handles.len(), 2);
-    let b = handles[1];
-    assert_eq!(tabs_of(cx, a), ["alpha", "beta"], "it left");
-    assert_eq!(shown(cx, a), "beta", "its neighbor shows");
-    assert_eq!(tabs_of(cx, b), [NEW_TAB]);
-    assert!(on_new_tab(cx, b), "the new window shows the picker");
-    assert!(drawn(cx, b, "launch") && drawn(cx, b, "tab-new-tab"));
-
-    // Picked there, a project opens in that window, in that tab.
-    chose(cx, b, NewTabChoice::Project("gamma".into()));
-    assert_eq!(shown(cx, b), "gamma");
-    assert_eq!(tabs_of(cx, b), ["gamma"]);
+    assert_eq!(cx.update(|cx| cx.global::<Shell>().windows.len()), 1);
+    assert_eq!(tabs_of(cx, a), ["alpha", "beta", NEW_TAB]);
 }
 
 #[gpui::test]
-fn a_new_tab_reorders_like_any_tab(cx: &mut TestAppContext) {
+fn a_tab_dragged_to_the_end_lands_before_the_new_tab(cx: &mut TestAppContext) {
     let f = tearoff_fixture(cx, &["alpha", "beta"]);
     launch_deps(cx);
     let a = open_at(cx, &f, "alpha", 0, super::window_tests::frame(0.0, 0.0), &["alpha", "beta"]);
     update(cx, a, |w, window, cx| w.open_new_tab(window, cx));
     draw(cx, a);
-    let alpha = bounds_in(cx, a, "tab-alpha").unwrap();
-    press_and_start(cx, a, "tab-new-tab");
-    let to = point(alpha.left() + px(4.0), alpha.center().y);
-    super::window_tests::move_to(cx, a, to);
-    release_at(cx, a, to);
-    assert_eq!(tabs_of(cx, a), [NEW_TAB, "alpha", "beta"]);
-    assert!(on_new_tab(cx, a));
+    let new_tab = bounds_in(cx, a, "tab-new-tab").unwrap();
+    // Over the New tab is no gap; past it, the end, which is before it.
+    press_and_start(cx, a, "tab-alpha");
+    let over = point(new_tab.center().x, new_tab.center().y);
+    super::window_tests::move_to(cx, a, over);
+    release_at(cx, a, over);
+    assert_eq!(tabs_of(cx, a), ["alpha", "beta", NEW_TAB], "a drop over it moves nothing");
+    let past = point(new_tab.right() + px(40.0), new_tab.center().y);
+    press_and_start(cx, a, "tab-alpha");
+    super::window_tests::move_to(cx, a, past);
+    release_at(cx, a, past);
+    assert_eq!(tabs_of(cx, a), ["beta", "alpha", NEW_TAB]);
 }

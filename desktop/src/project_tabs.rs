@@ -27,10 +27,14 @@
 //! open set is this machine's: it never drops another machine's tab.
 //!
 //! A window may also hold one New tab ([`NEW_TAB`], `new-tab-launch`): the
-//! `+` adds it, and it shows the launch screen until a project takes its
-//! place ([`ProjectTabs::replace`]). It is no project: the open set never
-//! drops it, it is left out of what is saved ([`ProjectTabs::projects`]), and
-//! nothing that closes projects counts it.
+//! `+` becomes it (`new-tab-plus-morph`), and it shows the launch screen
+//! until a project takes its place ([`ProjectTabs::replace`]). It is always
+//! the last tab, in the `+`'s slot: a project added while it is open goes
+//! before it, and nothing moves a tab past it or moves it. The project tabs
+//! before it are the bar's strip ([`ProjectTabs::strip`]), the ones a drag
+//! reorders. It is no project: the open set never drops it, it is left out of
+//! what is saved ([`ProjectTabs::projects`]), and nothing that closes
+//! projects counts it.
 
 use shelbi_app::source::ProjectKey;
 
@@ -81,6 +85,20 @@ impl ProjectTabs {
         &self.order
     }
 
+    /// The tabs before the New tab (all of them when there is none): the
+    /// project tabs the bar draws before its `+` slot, and a drag reorders.
+    pub fn strip(&self) -> &[String] {
+        match self.order.last() {
+            Some(last) if last == NEW_TAB => &self.order[..self.order.len() - 1],
+            _ => &self.order,
+        }
+    }
+
+    /// Where the tabs end for a project tab: before the New tab, if any.
+    fn strip_len(&self) -> usize {
+        self.strip().len()
+    }
+
     /// The `n`th tab's project, counting from 1 (the ⌘N it answers to).
     pub fn nth(&self, n: usize) -> Option<&str> {
         n.checked_sub(1).and_then(|i| self.order.get(i)).map(String::as_str)
@@ -111,24 +129,28 @@ impl ProjectTabs {
         self.order.iter().any(|p| p == project)
     }
 
-    /// Give `project` a tab, at the end, unless it has one. Whether the tabs
-    /// changed.
+    /// Give `project` a tab, at the end (before the New tab, which stays
+    /// last), unless it has one. Whether the tabs changed.
     pub fn insert(&mut self, project: &str) -> bool {
         if project.is_empty() || self.contains(project) {
             return false;
         }
-        self.order.push(project.to_string());
+        if project == NEW_TAB {
+            self.order.push(project.to_string());
+        } else {
+            self.order.insert(self.strip_len(), project.to_string());
+        }
         true
     }
 
-    /// Give `project` a tab at `index` (past the end means last), unless it
-    /// has one: a tab dropped in from another window. Whether the tabs
-    /// changed.
+    /// Give `project` a tab at `index` (past the end means last, before the
+    /// New tab), unless it has one: a tab dropped in from another window.
+    /// Whether the tabs changed.
     pub fn insert_at(&mut self, project: &str, index: usize) -> bool {
-        if project.is_empty() || self.contains(project) {
+        if project.is_empty() || project == NEW_TAB || self.contains(project) {
             return false;
         }
-        self.order.insert(index.min(self.order.len()), project.to_string());
+        self.order.insert(index.min(self.strip_len()), project.to_string());
         true
     }
 
@@ -140,7 +162,8 @@ impl ProjectTabs {
     }
 
     /// `old`'s tab becomes `new`'s, in its place: the New tab a project was
-    /// opened from. When `new` has a tab already, `old`'s just goes. Whether
+    /// opened from (so the project's tab is the last, and the `+` comes back
+    /// after it). When `new` has a tab already, `old`'s just goes. Whether
     /// the tabs changed.
     pub fn replace(&mut self, old: &str, new: &str) -> bool {
         let Some(at) = self.order.iter().position(|p| p == old) else {
@@ -155,13 +178,14 @@ impl ProjectTabs {
     }
 
     /// Move `project`'s tab to `index` in the order (past the end means
-    /// last), the other tabs keeping their relative order. Whether the tabs
-    /// changed: not when `project` has no tab or is there already.
+    /// last, before the New tab), the other tabs keeping their relative
+    /// order. Whether the tabs changed: not when `project` has no tab, is
+    /// there already, or is the New tab (pinned last).
     pub fn move_to(&mut self, project: &str, index: usize) -> bool {
-        let Some(from) = self.order.iter().position(|p| p == project) else {
+        let Some(from) = self.order.iter().position(|p| p == project).filter(|_| project != NEW_TAB) else {
             return false;
         };
-        let to = index.min(self.order.len() - 1);
+        let to = index.min(self.strip_len() - 1);
         if to == from {
             return false;
         }
@@ -171,12 +195,12 @@ impl ProjectTabs {
     }
 
     /// Where `project`'s tab lands when dropped in gap `slot` (0 before the
-    /// first tab, `order().len()` after the last), as a [`Self::move_to`]
+    /// first tab, `strip().len()` after the last), as a [`Self::move_to`]
     /// index. `None` when the drop would leave it where it is (the gaps on
-    /// either side of it), or it has no tab.
+    /// either side of it), or it has no tab in the strip.
     pub fn landing(&self, project: &str, slot: usize) -> Option<usize> {
-        let from = self.order.iter().position(|p| p == project)?;
-        let slot = slot.min(self.order.len());
+        let from = self.strip().iter().position(|p| p == project)?;
+        let slot = slot.min(self.strip_len());
         let to = if slot > from { slot - 1 } else { slot };
         (to != from).then_some(to)
     }
@@ -356,22 +380,46 @@ mod tests {
 
     #[test]
     fn the_new_tab_is_no_project() {
-        let mut t = tabs(&["web", NEW_TAB, "api"]);
+        let mut t = tabs(&["web", "api", NEW_TAB]);
         assert_eq!(t.projects(), ["web", "api"], "left out of what is saved");
         // The open set never names it, and it stays all the same.
         assert!(!t.reconcile(Some(&open(&["api", "web"])), Some("web"), &[]));
-        assert_eq!(t.order(), ["web", NEW_TAB, "api"]);
+        assert_eq!(t.order(), ["web", "api", NEW_TAB]);
         assert!(t.reconcile(Some(&open(&[])), None, &[]));
         assert_eq!(t.order(), [NEW_TAB]);
     }
 
     #[test]
+    fn the_new_tab_stays_last() {
+        // Opened with tabs, it goes at the end; projects opened after it go
+        // before it, however they arrive.
+        let mut t = tabs(&["web", NEW_TAB, "api"]);
+        assert_eq!(t.order(), ["web", "api", NEW_TAB], "a saved order puts it last");
+        assert_eq!(t.strip(), ["web", "api"]);
+        assert!(t.insert("docs"));
+        assert!(t.reconcile(Some(&open(&["api", "docs", "site", "web"])), Some("web"), &[]));
+        assert!(t.insert_at("ops", 99), "dropped in past the end");
+        assert_eq!(t.order(), ["web", "api", "docs", "site", "ops", NEW_TAB]);
+        // Nothing moves it, or moves a tab past it.
+        assert!(!t.move_to(NEW_TAB, 0));
+        assert!(t.move_to("web", 99));
+        assert_eq!(t.order(), ["api", "docs", "site", "ops", "web", NEW_TAB]);
+        assert!(!t.insert_at(NEW_TAB, 0), "never dropped in");
+        // Its gap is no drop gap: past the strip is the strip's end.
+        assert_eq!(t.landing("api", 99), Some(4));
+        assert_eq!(t.landing(NEW_TAB, 0), None);
+        // ⌘N counts it, after the projects.
+        assert_eq!(t.nth(6), Some(NEW_TAB));
+        assert_eq!(tabs(&["web"]).strip(), ["web"], "no New tab: the strip is every tab");
+    }
+
+    #[test]
     fn a_project_takes_the_new_tabs_place() {
-        let mut t = tabs(&["web", NEW_TAB, "api"]);
+        let mut t = tabs(&["web", "api", NEW_TAB]);
         assert!(t.replace(NEW_TAB, "docs"));
-        assert_eq!(t.order(), ["web", "docs", "api"], "in its place");
+        assert_eq!(t.order(), ["web", "api", "docs"], "in its place, the last");
         // A project with a tab already: the New tab just goes.
-        let mut t = tabs(&["web", NEW_TAB, "api"]);
+        let mut t = tabs(&["web", "api", NEW_TAB]);
         assert!(t.replace(NEW_TAB, "api"));
         assert_eq!(t.order(), ["web", "api"]);
         // No New tab: the project goes at the end.

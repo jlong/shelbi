@@ -3,7 +3,8 @@
 ## What landed
 
 The tab bar's `+` no longer opens a project menu. It adds a tab titled
-**New tab** after the last one and selects it; its content is the launch
+**New tab** after the last one and selects it (since `new-tab-plus-morph`
+the `+` itself turns into it); its content is the launch
 screen (Figma "Startup · Projects and remote sessions" 2539:10949 and
 "Startup · No projects yet" 2544:10318), drawn under the tab bar instead of in
 a window of its own:
@@ -56,11 +57,10 @@ a window of its own:
     machine's projects, so a remote project can't sit in a local window's
     tab. A local project picked in a remote window's New tab opens in a local
     window for the same reason.
-- **Drag, reorder, tear off**: as any tab (`tab-tearoff` rules). Torn off,
-  it opens a window holding only a New tab (`open_new_tab_window`,
-  `ShelbiWindow::new_blank`: no project, nothing opened on ready) showing the
-  picker; dropped on a bar whose window has a New tab already, that one is
-  selected.
+- **Drag, reorder, tear off**: superseded by `new-tab-plus-morph`
+  ([`new-tab-plus-morph.md`](new-tab-plus-morph.md)): the New tab is now the
+  `+` slot itself, pinned at the bar's end, and never drags, reorders or
+  tears off (`open_new_tab_window` is gone).
 - **Gone**: the `+` project menu (`tab_bar::ProjectMenu`, its keys, the
   `ToggleSwitcher` / `CloseSwitcher` / `AddProject` sidebar events). A bare
   Switch Project (`HostCall::OpenNewTab`) opens the New tab. File ▸ Show Launch
