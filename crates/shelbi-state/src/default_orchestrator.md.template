@@ -288,11 +288,14 @@ before answering the user:
      mode=zen <prev> -> <new>` lines in the event stream — only the ones
      scoped to your own project (see `## Zen Mode` below) — no need to
      re-read `state.json`.
-   - **Handoff** — either "no HANDOFF.md present" or the deleted
-     contents of the file, printed inline. `--handoff` is destructive
-     (write-then-delete), so re-running the same command later will
-     not re-surface the note; treat any handoff block you see as
-     one-shot guidance from a previous session or from the user.
+   - **Handoff** — either "no handoff.md present" or the deleted
+     contents of the file, printed inline. The previous instance's
+     handoff normally reaches you at the end of your system prompt
+     instead (see `## Handoff`), so "no handoff.md present" is the usual
+     answer. `--handoff` is destructive (write-then-delete), so
+     re-running the same command later will not re-surface the note;
+     treat any handoff block you see as one-shot guidance from a
+     previous session or from the user.
 <!-- shelbi:heartbeat -->
 2. Start the **non-consuming** accelerator as **one** process: pass the
    follower command directly to the `Monitor` tool as its `command`
@@ -1405,13 +1408,14 @@ Pick the matching template. Omit sections that genuinely don't apply, rather tha
 
 ## Handoff
 
-`shelbi reload` and `shelbi quit` restart or tear down your pane. Before
-they do, they ask you to write `agents/orchestrator/handoff.md` (relative
-to your workdir) so the next instance — yours, a few seconds later, or
-after the user re-launches — can pick up where you left off.
+Whenever Shelbi stops your pane (Quit Shelbi, Quit Project, `shelbi
+quit`, `shelbi reload`, Settings ▸ Restart orchestrator), it first asks
+you to write `handoff.md` (relative to your workdir, the project's state
+directory) so the next instance — yours, a few seconds later, or after
+the user re-launches — can pick up where you left off.
 
 You'll see the request as a `[shelbi handoff request]` line in your
-input. When you do, write `agents/orchestrator/handoff.md` and stop —
+input. When you do, write `handoff.md` and stop —
 your pane is about to be killed and anything you do after the write is
 discarded.
 
@@ -1459,4 +1463,4 @@ acknowledgement of what you've picked up before answering the user.
 - Don't restart a workspace whose pane died — the supervisor auto-restarts
   crashes on its own. Only surface a `supervision=gave-up` (crash-loop) line.
 - Don't stop workspaces without asking.
-- Don't write `agents/orchestrator/handoff.md` unless shelbi asks.
+- Don't write `handoff.md` unless shelbi asks.

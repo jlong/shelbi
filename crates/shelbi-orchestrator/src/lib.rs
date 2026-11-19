@@ -157,7 +157,7 @@ pub struct ReloadReport {
     /// on [`ReloadReport::handoff`].
     pub orchestrator: PaneReloadStatus,
     /// What happened when we asked the previous orchestrator to write
-    /// `agents/orchestrator/handoff.md` before the respawn. `None` is
+    /// the project's `handoff.md` before the respawn. `None` is
     /// the legacy/no-attempt state; otherwise carries the outcome of
     /// the request (file written, pane already dead, timeout, etc.).
     pub handoff: Option<handoff::HandoffOutcome>,
@@ -833,6 +833,12 @@ fn launch_orchestrator<B: session_backend::SessionBackend>(
         None
     });
 
+    // What this launch did with the handoff, logged once it is decided.
+    let log = |outcome: &str, detail: &str| {
+        let _ = shelbi_state::append_handoff_launch_event(project_name, outcome, detail);
+    };
+    let mut restored = None;
+
     if let Err(e) = deploy(claim.as_ref().map(|c| c.contents())) {
         tracing::warn!(
             project = project_name,
@@ -841,14 +847,31 @@ fn launch_orchestrator<B: session_backend::SessionBackend>(
         );
         if let Some(claim) = claim.take() {
             claim.restore();
+            restored = Some("deploy-failed");
         }
     }
 
     // Dropping the claim on either early return restores the handoff.
-    spawn()?;
-    if let Some(claim) = claim {
-        wait_for_orchestrator_ready(backend, host, target, timing)?;
-        claim.commit();
+    if let Err(e) = spawn() {
+        match (claim.is_some(), restored) {
+            (true, _) => log("restored", "spawn-failed"),
+            (false, Some(reason)) => log("restored", reason),
+            (false, None) => log("none", "spawn-failed"),
+        }
+        return Err(e);
+    }
+    match (claim, restored) {
+        (Some(claim), _) => {
+            if let Err(e) = wait_for_orchestrator_ready(backend, host, target, timing) {
+                log("restored", "not-ready");
+                return Err(e);
+            }
+            let bytes = claim.contents().len();
+            claim.commit();
+            log("injected", &format!("{bytes}-bytes"));
+        }
+        (None, Some(reason)) => log("restored", reason),
+        (None, None) => log("none", "-"),
     }
     Ok(BootstrapStatus::Started)
 }
@@ -1714,6 +1737,21 @@ mod supervise_restart_orchestrator_tests {
         path
     }
 
+    /// The `handoff outcome=… stage=launch` lines `project` logged, as
+    /// `outcome detail` pairs.
+    fn launch_lines(project: &str) -> Vec<String> {
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
+        log.lines()
+            .filter(|l| l.contains(&format!("project={project} handoff outcome=")) && l.contains("stage=launch"))
+            .map(|l| {
+                let field = |k: &str| {
+                    l.split(' ').find_map(|t| t.strip_prefix(k)).unwrap_or("").to_string()
+                };
+                format!("{} {}", field("outcome="), field("detail="))
+            })
+            .collect()
+    }
+
     fn launch(
         backend: &StubBackend,
         project: &str,
@@ -1750,6 +1788,7 @@ mod supervise_restart_orchestrator_tests {
 
         assert_eq!(status, BootstrapStatus::AlreadyRunning);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "watching: task xyz\n");
+        assert!(launch_lines("alpha").is_empty(), "an attach launches nothing to log");
     }
 
     #[test]
@@ -1780,6 +1819,34 @@ mod supervise_restart_orchestrator_tests {
             shelbi_state::claim_orchestrator_handoff("alpha").unwrap().is_none(),
             "nothing is left to re-ingest"
         );
+        assert_eq!(launch_lines("alpha"), vec!["injected 19-bytes"]);
+    }
+
+    #[test]
+    fn a_launch_injects_a_handoff_left_at_the_pre_upgrade_location() {
+        let _fx = seed("alpha");
+        let legacy = shelbi_state::project_dir("alpha")
+            .unwrap()
+            .join("agents/orchestrator/handoff.md");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "from before the upgrade\n").unwrap();
+        let backend = StubBackend::scripted(&[Liveness::Dead, Liveness::Alive]);
+        let mut deployed = None;
+
+        launch(
+            &backend,
+            "alpha",
+            |handoff| {
+                deployed = handoff.map(str::to_string);
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(deployed.as_deref(), Some("from before the upgrade\n"));
+        assert!(!legacy.exists(), "migrated, then spent");
+        assert!(!shelbi_state::orchestrator_handoff_path("alpha").unwrap().exists());
     }
 
     #[test]
@@ -1798,6 +1865,7 @@ mod supervise_restart_orchestrator_tests {
 
         assert!(err.to_string().contains("no session"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "watching: task xyz\n");
+        assert_eq!(launch_lines("alpha"), vec!["restored spawn-failed"]);
     }
 
     #[test]
@@ -1810,6 +1878,7 @@ mod supervise_restart_orchestrator_tests {
 
         assert!(err.to_string().contains("did not come up"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "watching: task xyz\n");
+        assert_eq!(launch_lines("alpha"), vec!["restored not-ready"]);
     }
 
     #[test]
@@ -1860,6 +1929,7 @@ mod supervise_restart_orchestrator_tests {
 
         assert_eq!(status, BootstrapStatus::Started);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "watching: task xyz\n");
+        assert_eq!(launch_lines("alpha"), vec!["restored deploy-failed"]);
     }
 
     #[test]
@@ -1883,6 +1953,7 @@ mod supervise_restart_orchestrator_tests {
         assert_eq!(status, BootstrapStatus::Started);
         assert_eq!(deployed, None);
         assert_eq!(*backend.probe_count.lock().unwrap(), 1);
+        assert_eq!(launch_lines("alpha"), vec!["none -"], "a cold start says so");
     }
 
     #[test]

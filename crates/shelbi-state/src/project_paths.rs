@@ -37,7 +37,7 @@ use crate::{expand_tilde_path, expand_tilde_str, project_dir, shelbi_home};
 /// | `statuses_yaml_path`                | `~/.shelbi/projects/<name>/workflows/…`     | `<repo>/.shelbi/workflows/…`        |
 /// | `state_json_path`                   | `~/.shelbi/projects/<name>/state.json`      | *same*                              |
 /// | `tasks_dir`                         | `~/.shelbi/projects/<name>/tasks/`          | *same*                              |
-/// | `handoff_md_path`                   | `~/.shelbi/projects/<name>/HANDOFF.md`      | *same*                              |
+/// | `handoff_md_path`                   | `~/.shelbi/projects/<name>/handoff.md`      | *same*                              |
 /// | `events_log_path`                   | `~/.shelbi/events.log`                      | *same*                              |
 /// | `workspaces_dir`                    | `~/.shelbi/projects/<name>/workspaces/`     | *same*                              |
 /// | `claude_dir`                        | `~/.shelbi/projects/<name>/.claude/`        | *same*                              |
@@ -83,7 +83,8 @@ pub trait ProjectPaths {
     /// `<state_root>/tasks/`.
     fn tasks_dir(&self) -> Result<PathBuf>;
 
-    /// `<state_root>/HANDOFF.md`.
+    /// `<state_root>/handoff.md`: the orchestrator's one handoff file, the
+    /// same path as [`crate::orchestrator_handoff_path`].
     fn handoff_md_path(&self) -> Result<PathBuf>;
 
     /// `<shelbi_home>/events.log`. Cross-project, hence outside
@@ -140,7 +141,7 @@ impl ProjectPaths for Project {
     }
 
     fn handoff_md_path(&self) -> Result<PathBuf> {
-        Ok(self.state_root()?.join("HANDOFF.md"))
+        Ok(self.state_root()?.join(crate::HANDOFF_FILE))
     }
 
     fn events_log_path(&self) -> Result<PathBuf> {
@@ -465,7 +466,7 @@ mod tests {
             assert_eq!(p.tasks_dir().unwrap(), home.join("projects/myapp/tasks"));
             assert_eq!(
                 p.handoff_md_path().unwrap(),
-                home.join("projects/myapp/HANDOFF.md")
+                home.join("projects/myapp/handoff.md")
             );
             assert_eq!(
                 p.workspaces_dir().unwrap(),

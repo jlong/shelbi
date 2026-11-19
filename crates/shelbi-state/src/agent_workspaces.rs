@@ -83,19 +83,27 @@ pub const SHARED_AGENT_DIR: &str = "_shared";
 /// agents see their own instructions verbatim.
 pub const SHARED_PREAMBLE_FILE: &str = "preamble.md";
 
-/// File name of the orchestrator's one-shot state-transfer file. Lives
-/// inside `agents/orchestrator/` and is written by the outgoing
-/// orchestrator (on `shelbi reload` / `shelbi quit`) and ingested by the
-/// next instance (on startup / post-reload respawn), then deleted. Not
-/// persistent state — durable orchestrator state lives in `state.json`.
+/// File name of the orchestrator's one-shot state-transfer file, the one
+/// handoff file a project has. It lives in the project's state root
+/// (`~/.shelbi/projects/<name>/handoff.md`), is written by the outgoing
+/// orchestrator whenever Shelbi stops it (Quit Shelbi, Quit Project,
+/// `shelbi quit`, `shelbi reload`, Settings ▸ Restart orchestrator), and is
+/// claimed by the launch that starts the next instance, then deleted. Not
+/// persistent state: durable orchestrator state lives in `state.json`.
 pub const HANDOFF_FILE: &str = "handoff.md";
 
 /// Relative path (from the orchestrator's workdir) where its handoff
 /// file lives. The orchestrator's workdir IS `~/.shelbi/projects/<name>/`
-/// (see `ensure_dashboard`), and its agent dir is `agents/orchestrator/`,
-/// so a CWD-relative `agents/orchestrator/handoff.md` is the path the
+/// (see `ensure_dashboard`), so a CWD-relative `handoff.md` is the path the
 /// running orchestrator sees in its filesystem.
-pub const ORCHESTRATOR_HANDOFF_REL: &str = "agents/orchestrator/handoff.md";
+pub const ORCHESTRATOR_HANDOFF_REL: &str = HANDOFF_FILE;
+
+/// Where the handoff lived before it moved to the state root: the request
+/// poller and the launch claim used `agents/orchestrator/handoff.md` (claimed
+/// as its `.claimed` sibling), and `shelbi status --handoff` read
+/// `HANDOFF.md`. Only [`migrate_legacy_orchestrator_handoff`] reads these.
+const LEGACY_ORCHESTRATOR_HANDOFF_REL: &str = "agents/orchestrator/handoff.md";
+const LEGACY_HANDOFF_MD: &str = "HANDOFF.md";
 
 /// The pre-rename hook-command path prefix a per-agent `settings.json`
 /// written by an older shelbi still references (e.g.
@@ -400,22 +408,96 @@ pub fn agent_shared_preamble_path(project: &str) -> Result<PathBuf> {
         .join(SHARED_PREAMBLE_FILE))
 }
 
-/// `~/.shelbi/projects/<project>/agents/orchestrator/handoff.md` — the
-/// orchestrator's one-shot state-transfer file. Written by the outgoing
-/// orchestrator on `shelbi reload` / `shelbi quit` and claimed by the launch
-/// that starts the next instance ([`claim_orchestrator_handoff`]). Same path the
-/// orchestrator's instructions reference, so the directory layout the
-/// running orchestrator sees agrees with the path callers compute.
+/// `~/.shelbi/projects/<project>/handoff.md`: the orchestrator's one-shot
+/// state-transfer file. Written by the outgoing orchestrator whenever Shelbi
+/// stops it and claimed by the launch that starts the next instance
+/// ([`claim_orchestrator_handoff`]). Same path the orchestrator's instructions
+/// reference, so the directory layout the running orchestrator sees agrees
+/// with the path callers compute.
 pub fn orchestrator_handoff_path(project: &str) -> Result<PathBuf> {
-    // State path, NOT the mode-aware `agent_workspace_dir`: the handoff is
-    // a transient state-transfer artifact the running orchestrator writes
-    // CWD-relative to its workdir — which is the project's *state* root
-    // (`project_dir`, see `ensure_dashboard`), not its config root. Keying
-    // it off `project_dir` (via the same [`ORCHESTRATOR_HANDOFF_REL`] the
-    // orchestrator is told to write) keeps the reader and the writer in
-    // agreement in both config modes; in global mode this is byte-identical
-    // to the old `agents/orchestrator/handoff.md` under the project dir.
+    // State path, NOT the mode-aware config root: the handoff is a transient
+    // state-transfer artifact the running orchestrator writes CWD-relative to
+    // its workdir, which is the project's *state* root (`project_dir`, see
+    // `ensure_dashboard`). Keying it off `project_dir` keeps the reader and the
+    // writer in agreement in both config modes.
     Ok(project_dir(project)?.join(ORCHESTRATOR_HANDOFF_REL))
+}
+
+/// A file named exactly `name` in `dir`, compared byte for byte. On a
+/// case-insensitive filesystem (the macOS default) `dir/HANDOFF.md` also
+/// resolves to `dir/handoff.md`, so `Path::exists` can't tell the legacy name
+/// from the current one; the directory listing can.
+fn exact_entry(dir: &Path, name: &str) -> Option<PathBuf> {
+    fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .find(|entry| entry.file_name() == name)
+        .map(|entry| entry.path())
+}
+
+fn modified(path: &Path) -> Option<std::time::SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
+}
+
+/// Move a handoff left at a pre-upgrade location into `handoff.md`, so nothing
+/// in flight across the upgrade is lost. The candidates are
+/// `agents/orchestrator/handoff.md`, its `.claimed` sibling (a launch that died
+/// holding it), and the state root's `HANDOFF.md`. The newest file wins,
+/// counting a `handoff.md` (or its claim) already in place; every losing legacy
+/// file is deleted, so after one pass there is nothing left at the old
+/// locations and later passes cost a few `stat`s. Returns the legacy file that
+/// was moved into place, if one was.
+///
+/// Runs at the start of every claim and discard, so the first launch (or the
+/// first handoff request) after the upgrade does it. This is the only reader of
+/// the legacy locations.
+pub fn migrate_legacy_orchestrator_handoff(project: &str) -> Result<Option<PathBuf>> {
+    let dir = project_dir(project)?;
+    let current = dir.join(HANDOFF_FILE);
+    let legacy_live = dir.join(LEGACY_ORCHESTRATOR_HANDOFF_REL);
+    let mut legacy: Vec<PathBuf> = [claimed_handoff_path(&legacy_live), legacy_live]
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect();
+    legacy.extend(exact_entry(&dir, LEGACY_HANDOFF_MD));
+    if legacy.is_empty() {
+        return Ok(None);
+    }
+
+    // What's already in place: `handoff.md` under its exact name (on a
+    // case-insensitive filesystem a lone `HANDOFF.md` must not count as it),
+    // or a claim of it.
+    let in_place = [exact_entry(&dir, HANDOFF_FILE), Some(claimed_handoff_path(&current))]
+        .into_iter()
+        .flatten()
+        .filter_map(|p| modified(&p))
+        .max();
+    // The newest legacy file; on a tie the one in place wins.
+    let newest = legacy
+        .iter()
+        .filter_map(|p| modified(p).map(|m| (m, p.clone())))
+        .max_by_key(|(m, _)| *m)
+        .filter(|(m, _)| in_place.is_none_or(|placed| *m > placed))
+        .map(|(_, p)| p);
+
+    // The losers go first: on a case-insensitive filesystem a losing
+    // `HANDOFF.md` is the very file the winner is about to be renamed onto.
+    for stale in legacy.iter().filter(|p| Some(*p) != newest.as_ref()) {
+        let _ = fs::remove_file(stale);
+    }
+    if let Some(from) = &newest {
+        // A same-directory rename for `HANDOFF.md` (a case-only rename on a
+        // case-insensitive filesystem), a cross-directory one otherwise; both
+        // stay on the project's filesystem.
+        fs::rename(from, &current).map_err(Error::Io)?;
+        tracing::info!(
+            project,
+            from = %from.display(),
+            to = %current.display(),
+            "migrated a pre-upgrade orchestrator handoff",
+        );
+    }
+    Ok(newest)
 }
 
 /// Where a launch holds the handoff it has claimed: the live file's sibling, so
@@ -510,6 +592,7 @@ impl Drop for OrchestratorHandoffClaim {
 /// so a crash mid-launch doesn't lose the handoff. A `handoff.md` written since
 /// then is fresher and replaces it.
 pub fn claim_orchestrator_handoff(project: &str) -> Result<Option<OrchestratorHandoffClaim>> {
+    migrate_legacy_handoff_best_effort(project);
     let path = orchestrator_handoff_path(project)?;
     let claimed = claimed_handoff_path(&path);
     match fs::rename(&path, &claimed) {
@@ -542,10 +625,21 @@ pub fn claim_orchestrator_handoff(project: &str) -> Result<Option<OrchestratorHa
 /// be satisfied by (and a later launch can't ingest) a leftover. Best-effort: a
 /// failure degrades to a stale-handoff ingest, the documented fallback.
 pub fn discard_orchestrator_handoff(project: &str) -> Result<()> {
+    // Migrating first means a leftover at a legacy location is discarded too.
+    migrate_legacy_handoff_best_effort(project);
     let path = orchestrator_handoff_path(project)?;
     let _ = fs::remove_file(claimed_handoff_path(&path));
     let _ = fs::remove_file(&path);
     Ok(())
+}
+
+/// [`migrate_legacy_orchestrator_handoff`], with a failure logged rather than
+/// returned: the legacy file stays where it was for the next pass, and the
+/// caller carries on with whatever `handoff.md` holds.
+fn migrate_legacy_handoff_best_effort(project: &str) {
+    if let Err(e) = migrate_legacy_orchestrator_handoff(project) {
+        tracing::warn!(project, error = %e, "migrating a pre-upgrade orchestrator handoff failed");
+    }
 }
 
 /// Read the per-project shared preamble if it exists, otherwise return
@@ -2508,29 +2602,138 @@ After green, run `shelbi zen pr-merge <pr-number> --match-head-commit <head_sha>
     }
 
     #[test]
-    fn orchestrator_handoff_path_lives_inside_orchestrator_workspace() {
-        // The path must land at `agents/orchestrator/handoff.md` so the
-        // orchestrator (running with cwd = project dir) sees the same
-        // path its instructions reference.
+    fn orchestrator_handoff_path_is_the_state_roots_handoff_md() {
+        // The one handoff file: `<project>/handoff.md`, the path the
+        // orchestrator (running with cwd = project dir) sees its instructions
+        // and the request name, and the one `shelbi status --handoff` reads.
         let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
 
         let path = orchestrator_handoff_path("p").unwrap();
-        let expected_tail = "agents/orchestrator/handoff.md";
-        let path_str = path.to_string_lossy();
-        assert!(
-            path_str.ends_with(expected_tail),
-            "expected path ending with {expected_tail}, got {path_str}"
+        assert_eq!(path, project_dir("p").unwrap().join("handoff.md"));
+        assert_eq!(ORCHESTRATOR_HANDOFF_REL, "handoff.md");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    /// Write `contents` at `path` (creating its directory) with an mtime
+    /// `age_secs` in the past, so a test can order files by age.
+    fn write_aged(path: &Path, contents: &str, age_secs: u64) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, contents).unwrap();
+        let at = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        fs::File::options().write(true).open(path).unwrap().set_modified(at).unwrap();
+    }
+
+    /// The names in `dir`, sorted: on a case-insensitive filesystem only the
+    /// listing shows whether a file is `handoff.md` or `HANDOFF.md`.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn a_pre_upgrade_agents_dir_handoff_is_claimed_from_handoff_md() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = project_dir("p").unwrap();
+        let legacy = dir.join("agents/orchestrator/handoff.md");
+        write_aged(&legacy, "from before the upgrade\n", 60);
+
+        let claim = claim_orchestrator_handoff("p").unwrap().expect("migrated");
+        assert_eq!(claim.contents(), "from before the upgrade\n");
+        assert!(!legacy.exists(), "the legacy file moved, it wasn't copied");
+        claim.restore();
+        assert_eq!(
+            fs::read_to_string(dir.join("handoff.md")).unwrap(),
+            "from before the upgrade\n"
         );
 
-        // And the orchestrator-instructions-relative constant exposed
-        // for the request message must match the path's tail so the
-        // request message points the agent at the correct file.
-        assert!(
-            path_str.ends_with(ORCHESTRATOR_HANDOFF_REL),
-            "ORCHESTRATOR_HANDOFF_REL ({ORCHESTRATOR_HANDOFF_REL}) must match the on-disk path tail",
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_pre_upgrade_handoff_md_in_capitals_is_renamed_in_place() {
+        // `HANDOFF.md` and `handoff.md` are the same file on a case-insensitive
+        // filesystem; the migration still leaves it under the one name.
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = project_dir("p").unwrap();
+        write_aged(&dir.join("HANDOFF.md"), "capitals\n", 60);
+
+        let moved = migrate_legacy_orchestrator_handoff("p").unwrap();
+        assert_eq!(moved, Some(dir.join("HANDOFF.md")));
+        assert_eq!(names_in(&dir), vec!["handoff.md"]);
+        assert_eq!(fs::read_to_string(dir.join("handoff.md")).unwrap(), "capitals\n");
+        // Nothing left to migrate.
+        assert_eq!(migrate_legacy_orchestrator_handoff("p").unwrap(), None);
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn the_newest_handoff_wins_the_migration_and_the_rest_are_deleted() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = project_dir("p").unwrap();
+        let legacy = dir.join("agents/orchestrator/handoff.md");
+        let legacy_claimed = dir.join("agents/orchestrator/handoff.md.claimed");
+        write_aged(&legacy, "older\n", 300);
+        write_aged(&legacy_claimed, "newest\n", 10);
+        write_aged(&dir.join("HANDOFF.md"), "oldest\n", 900);
+
+        let claim = claim_orchestrator_handoff("p").unwrap().unwrap();
+        assert_eq!(claim.contents(), "newest\n");
+        assert!(!legacy.exists() && !legacy_claimed.exists());
+        claim.commit();
+        assert_eq!(
+            names_in(&dir),
+            vec!["agents"],
+            "every legacy file is gone once the winner is delivered",
         );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn a_handoff_md_newer_than_a_leftover_keeps_its_place() {
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = project_dir("p").unwrap();
+        let legacy = dir.join("agents/orchestrator/handoff.md");
+        write_aged(&legacy, "stale\n", 600);
+        write_aged(&dir.join("handoff.md"), "fresh\n", 5);
+
+        assert_eq!(migrate_legacy_orchestrator_handoff("p").unwrap(), None);
+        assert!(!legacy.exists(), "the losing leftover is deleted");
+        assert_eq!(fs::read_to_string(dir.join("handoff.md")).unwrap(), "fresh\n");
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn discarding_also_clears_pre_upgrade_leftovers() {
+        // The request path discards before it asks, so a leftover at a legacy
+        // location can neither satisfy its poll nor reach a later launch.
+        let _g = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let dir = project_dir("p").unwrap();
+        write_aged(&dir.join("agents/orchestrator/handoff.md"), "stale\n", 60);
+        write_aged(&dir.join("HANDOFF.md"), "stale\n", 30);
+
+        discard_orchestrator_handoff("p").unwrap();
+        assert_eq!(names_in(&dir), vec!["agents"]);
+        assert!(names_in(&dir.join("agents/orchestrator")).is_empty());
 
         std::env::remove_var("SHELBI_HOME");
     }

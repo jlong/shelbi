@@ -47,13 +47,13 @@ use shelbi_core::StatusCategory;
 
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
-    append_changelog_section, append_preamble_jobs_section, apply_awareness_variant_markers, apply_reporting_subject_rewrite,
+    append_changelog_section, append_preamble_jobs_section, apply_awareness_variant_markers, apply_handoff_path_rewrite, apply_reporting_subject_rewrite,
     apply_tmux_instruction_rewrites, apply_tracker_ownership_rewrites,
     AWARENESS_VARIANTS_AUTOHEAL_CODE, TRACKER_OWNERSHIP_AUTOHEAL_CODE,
     cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
     scope_label, Classification, UpgradeFinding, UpgradeReport, CHANGELOG_TEMPLATE_MISSING,
     CHANGELOG_TEMPLATE_PRIOR_DEFAULT, PR_TEMPLATE_MISSING,
-    ORCH_CHANGELOG_RULE_MISSING, REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_JOBS_MISSING, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
+    ORCH_CHANGELOG_RULE_MISSING, ORCH_HANDOFF_PATH_AUTOHEAL_CODE, REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_JOBS_MISSING, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
 };
 
 /// One auto-heal write-back that landed on disk this run. Returned to the
@@ -295,6 +295,12 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
     // independently of the YAML/JSON content healers below.
     if codes.contains(REPORTING_SUBJECT_AUTOHEAL_CODE) {
         heal_reporting_subject(entry, applied);
+    }
+
+    // Point the orchestrator at the one handoff file, `handoff.md`. A literal
+    // path swap in Markdown, handled independently like the rewrite above.
+    if codes.contains(ORCH_HANDOFF_PATH_AUTOHEAL_CODE) {
+        heal_orchestrator_handoff_path(entry, applied);
     }
 
     // Add the tracker-ownership dispatch rule to an unedited orchestrator copy
@@ -1179,6 +1185,33 @@ fn heal_reporting_subject(entry: &InventoryEntry, applied: &mut Vec<AppliedChang
     );
 }
 
+/// Rename the orchestrator's pre-upgrade handoff file references to
+/// `handoff.md` via the shared [`apply_handoff_path_rewrite`] table (the same
+/// one the sniffer keys the `ORCH_HANDOFF_LEGACY_PATH` auto-heal on). Only the
+/// path literals change, so the user's edits elsewhere in the file survive. A
+/// no-op write is skipped so the file mtime and the disclosure stay honest.
+fn heal_orchestrator_handoff_path(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let out = apply_handoff_path_rewrite(&text);
+    if out == text {
+        return;
+    }
+    if let Err(e) = write_atomic(path, &out) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(
+        applied,
+        entry,
+        ORCH_HANDOFF_PATH_AUTOHEAL_CODE,
+        path,
+        "handoff-legacy-path->handoff.md".into(),
+    );
+}
+
 /// Patch the orchestrator's ready-dispatch and heartbeat missed-dispatch rules
 /// with the tracker-ownership condition via the shared
 /// [`apply_tracker_ownership_rewrites`] table (the same one the sniffer keys the
@@ -1798,6 +1831,61 @@ zen:
         );
         let applied2 = apply_auto_heal(&["demo".to_string()], &report2);
         assert!(applied2.is_empty(), "second pass wrote: {applied2:?}");
+    }
+
+    #[test]
+    fn pre_upgrade_handoff_path_auto_heals_on_start_idempotently_and_discloses() {
+        // An existing project whose orchestrator copy (with a user's own line in
+        // it) still names `agents/orchestrator/handoff.md` and `HANDOFF.md`: the
+        // boot pass renames both to `handoff.md`, keeps the user's line,
+        // discloses the change, and a second pass is a no-op.
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let orch_dir = home.join("projects/demo/agents/orchestrator");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        let path = orch_dir.join("instructions.md");
+        std::fs::write(
+            &path,
+            "# Orchestrator\n\n- **Handoff** — either \"no HANDOFF.md present\" or its contents.\n\n\
+             ## Handoff\n\nWrite `agents/orchestrator/handoff.md` when asked. My own rule: be brief.\n",
+        )
+        .unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            report.findings.iter().any(|f| f.code == ORCH_HANDOFF_PATH_AUTOHEAL_CODE
+                && f.classification == Classification::AutoHeal),
+            "expected an ORCH_HANDOFF_LEGACY_PATH auto-heal: {:?}",
+            report.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
+        );
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(
+            applied.iter().any(|c| c.code == ORCH_HANDOFF_PATH_AUTOHEAL_CODE),
+            "nothing applied: {applied:?}",
+        );
+
+        let healed = std::fs::read_to_string(&path).unwrap();
+        assert!(healed.contains("Write `handoff.md` when asked. My own rule: be brief."), "{healed}");
+        assert!(healed.contains("\"no handoff.md present\""), "{healed}");
+        assert!(!healed.contains("agents/orchestrator/handoff.md") && !healed.contains("HANDOFF.md"));
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default();
+        assert!(log.contains(ORCH_HANDOFF_PATH_AUTOHEAL_CODE), "no disclosure line: {log}");
+
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            !report2.findings.iter().any(|f| f.code == ORCH_HANDOFF_PATH_AUTOHEAL_CODE),
+            "residual handoff-path auto-heal: {report2:?}",
+        );
+        assert!(apply_auto_heal(&["demo".to_string()], &report2)
+            .iter()
+            .all(|c| c.code != ORCH_HANDOFF_PATH_AUTOHEAL_CODE));
     }
 
     #[test]

@@ -8,12 +8,15 @@
 //! - `shelbi status --full` — the full orchestrator bootstrap payload:
 //!   board (all columns), workspaces (idle vs busy), zen (mode +
 //!   crash flag), and a handoff-presence line. Idempotent — safe to
-//!   re-run. Does NOT print `HANDOFF.md` contents and does NOT delete
+//!   re-run. Does NOT print `handoff.md` contents and does NOT delete
 //!   anything.
-//! - `shelbi status --handoff` — print the contents of `HANDOFF.md`
-//!   (from the resolved project's local machine's `work_dir`) and then
-//!   delete the file. Write-then-delete so a crash between the two
-//!   doesn't lose the note. No-op when the file is absent.
+//! - `shelbi status --handoff` — print the contents of the project's
+//!   `handoff.md` (`~/.shelbi/projects/<name>/handoff.md`, the one handoff
+//!   file) and then delete it. Write-then-delete so a crash between the two
+//!   doesn't lose the note. No-op when the file is absent. A launch normally
+//!   claims the file and injects it into the new orchestrator's prompt
+//!   before the orchestrator gets here, so this only finds one written
+//!   since.
 //!
 //! Both flags compose: `shelbi status --full --handoff` prints the full
 //! snapshot followed by the handoff-consume block in a single call.
@@ -29,15 +32,10 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use clap::Subcommand;
-use shelbi_core::{IntegrationMode, MachineKind, Project, StatusCategory};
+use shelbi_core::{IntegrationMode, MachineKind, StatusCategory};
 use shelbi_state::{read_state, ZenModeState};
 
 use super::require_project;
-
-/// The one HANDOFF.md file the `--handoff` flag reads and (on success)
-/// deletes. Case-sensitive by design: mixed-case FS behaviors aside, the
-/// task convention is uppercase.
-const HANDOFF_FILE_NAME: &str = "HANDOFF.md";
 
 /// How many bytes off the tail of `~/.shelbi/events.log` to scan for a
 /// `project=<name> zen=off reason=crash-recovery` line. The log is
@@ -77,7 +75,7 @@ pub fn run(
 ) -> Result<()> {
     let project = require_project(project)?;
     if handoff {
-        // Consuming HANDOFF.md deletes it, so this is the mutating status
+        // Consuming handoff.md deletes it, so this is the mutating status
         // shape and must not run against a stale daemon.
         super::hub_version::ensure_daemon_matches_for_mutation()?;
     } else {
@@ -106,7 +104,7 @@ fn list(project: &str) -> Result<()> {
 
 /// Drive the snapshot path. `full=false, handoff=false` emits the
 /// concise summary; `full=true` emits the full sectioned payload;
-/// `handoff=true` consumes `HANDOFF.md`. Both flags compose — `--full`
+/// `handoff=true` consumes `handoff.md`. Both flags compose — `--full`
 /// runs first (safe/idempotent), then `--handoff` writes and deletes.
 fn snapshot(project: &str, full: bool, handoff: bool) -> Result<()> {
     if full {
@@ -302,9 +300,9 @@ fn print_full(project: &str) -> Result<()> {
     println!();
     let present = handoff_present(project)?;
     if present {
-        println!("HANDOFF.md present — run `shelbi status --handoff` to read and consume it.");
+        println!("handoff.md present — run `shelbi status --handoff` to read and consume it.");
     } else {
-        println!("no HANDOFF.md present");
+        println!("no handoff.md present");
     }
 
     println!();
@@ -598,11 +596,15 @@ fn print_zen_full(zen: &ZenSnapshot) {
 // Handoff consumption (--handoff)
 
 fn consume_handoff(project: &str) -> Result<()> {
+    // A handoff left at a pre-upgrade location is this file's to read.
+    if let Err(e) = shelbi_state::migrate_legacy_orchestrator_handoff(project) {
+        eprintln!("warning: couldn't migrate a pre-upgrade handoff: {e}");
+    }
     let path = handoff_path(project)?;
     let contents = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("(no HANDOFF.md to consume)");
+            println!("(no handoff.md to consume)");
             return Ok(());
         }
         Err(e) => {
@@ -612,19 +614,19 @@ fn consume_handoff(project: &str) -> Result<()> {
     // WRITE first so a crash between print and unlink loses nothing —
     // the note stays on disk and the next `--handoff` invocation
     // re-consumes it.
-    println!("--- HANDOFF.md ({}) ---", path.display());
+    println!("--- handoff.md ({}) ---", path.display());
     print!("{contents}");
     if !contents.ends_with('\n') {
         println!();
     }
-    println!("--- end HANDOFF.md ---");
+    println!("--- end handoff.md ---");
     // Best-effort delete: a read that succeeded followed by an unlink
     // failure (permissions, race) is surfaced but not fatal — the
     // caller already got the content and can re-run on the next
     // bootstrap if the file re-appears.
     if let Err(e) = fs::remove_file(&path) {
         eprintln!(
-            "warning: consumed HANDOFF.md but failed to delete {}: {e}",
+            "warning: consumed handoff.md but failed to delete {}: {e}",
             path.display()
         );
     }
@@ -635,29 +637,10 @@ fn handoff_present(project: &str) -> Result<bool> {
     Ok(handoff_path(project)?.exists())
 }
 
-/// Resolve `HANDOFF.md`'s path against the project's local machine's
-/// `work_dir`. Errors if the project YAML has no local machine — the
-/// snapshot is meaningless without one, and rather than silently
-/// treating "no local work_dir" as "handoff absent" we surface it so
-/// the user can fix their project YAML.
+/// The project's one handoff file, `~/.shelbi/projects/<name>/handoff.md`:
+/// the one the orchestrator writes when asked and the launch claims.
 fn handoff_path(project: &str) -> Result<PathBuf> {
-    let p = shelbi_state::load_project(project).map_err(|e| anyhow!(e))?;
-    let work_dir = local_work_dir(&p)?;
-    Ok(work_dir.join(HANDOFF_FILE_NAME))
-}
-
-fn local_work_dir(p: &Project) -> Result<PathBuf> {
-    p.machines
-        .iter()
-        .find(|m| m.kind == MachineKind::Local)
-        .map(|m| m.work_dir.clone())
-        .ok_or_else(|| {
-            anyhow!(
-                "project `{}` declares no local machine — HANDOFF.md needs \
-                 a local work_dir to resolve against",
-                p.name,
-            )
-        })
+    shelbi_state::orchestrator_handoff_path(project).map_err(|e| anyhow!(e))
 }
 
 // ---------------------------------------------------------------------------
@@ -1443,8 +1426,9 @@ issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n    project: Shelbi
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        let work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
-        let handoff = work_dir.join(HANDOFF_FILE_NAME);
+        let _work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
+        let handoff = shelbi_state::orchestrator_handoff_path("p").unwrap();
+        assert_eq!(handoff, home.join("projects/p/handoff.md"), "the one handoff file");
         std::fs::write(&handoff, "note body\nmore lines\n").unwrap();
 
         // Presence check is true before the read.
@@ -1459,13 +1443,36 @@ issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n    project: Shelbi
     }
 
     #[test]
+    fn consume_handoff_reads_a_pre_upgrade_handoff_md_in_capitals() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        let _work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
+        let legacy = home.join("projects/p/HANDOFF.md");
+        std::fs::write(&legacy, "old name\n").unwrap();
+
+        consume_handoff("p").unwrap();
+        let names: Vec<String> = std::fs::read_dir(home.join("projects/p"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.eq_ignore_ascii_case("handoff.md")),
+            "consumed and deleted: {names:?}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn consume_handoff_is_noop_when_absent() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
         let _work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
         // No file staged — read exits with Ok and prints the "(no
-        // HANDOFF.md to consume)" line.
+        // handoff.md to consume)" line.
         consume_handoff("p").unwrap();
         std::env::remove_var("SHELBI_HOME");
         let _ = std::fs::remove_dir_all(&home);
@@ -1473,24 +1480,24 @@ issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n    project: Shelbi
 
     #[test]
     fn snapshot_full_alone_is_idempotent_even_when_handoff_exists() {
-        // The `--full` flag is meant to be safe to re-run: a HANDOFF.md
+        // The `--full` flag is meant to be safe to re-run: a handoff.md
         // that exists on disk must stay put after `--full` returns.
         // Consumption only happens under `--handoff`.
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let home = fresh_home();
         std::env::set_var("SHELBI_HOME", &home);
-        let work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
-        let handoff = work_dir.join(HANDOFF_FILE_NAME);
+        let _work_dir = crate::commands::test_support::provision_hub_repo_for_project(&home, "p");
+        let handoff = shelbi_state::orchestrator_handoff_path("p").unwrap();
         std::fs::write(&handoff, "stay put\n").unwrap();
 
         snapshot("p", true, false).unwrap();
-        assert!(handoff.exists(), "--full alone must not delete HANDOFF.md");
+        assert!(handoff.exists(), "--full alone must not delete handoff.md");
         // A second `--full` still leaves it in place — this is the
         // acceptance-criterion "safe to re-run" test.
         snapshot("p", true, false).unwrap();
         assert!(
             handoff.exists(),
-            "second --full still must not delete HANDOFF.md"
+            "second --full still must not delete handoff.md"
         );
 
         std::env::remove_var("SHELBI_HOME");
@@ -1499,7 +1506,7 @@ issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n    project: Shelbi
 
     #[test]
     fn snapshot_full_and_handoff_compose_without_side_effects_when_absent() {
-        // `--full --handoff` on a project with no HANDOFF.md should print
+        // `--full --handoff` on a project with no handoff.md should print
         // both sections in one call and NOT error just because the note
         // isn't there — that's the orchestrator's every-bootstrap shape.
         let _g = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());

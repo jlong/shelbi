@@ -37,7 +37,7 @@ runner settings without each of them having to redo the setup wizard.
 | Shared config (name, default_branch, orchestrator, agent_runners, zen, heartbeat, git — `SHARED_PROJECT_FIELDS`) | `~/.shelbi/projects/<name>.yaml` (one flat file) | Committed `<repo>/.shelbi/project.yaml` (with `config_mode: in-repo`) |
 | User-local config (repo path, machines, workspaces, editor — `LOCAL_PROJECT_FIELDS`) | Same flat `~/.shelbi/projects/<name>.yaml` | Per-machine `~/.shelbi/projects/<name>/local.yaml` (no flat `<name>.yaml`) |
 | Shared config files (workflows/, agents/, workspace-settings.json.template, zenmode.md, pr-template.md, changelog-template.md) | `~/.shelbi/projects/<name>/` | `<repo>/.shelbi/` |
-| State (state.json, tasks/, HANDOFF.md, .claude/, workspaces/, events.log) | `~/.shelbi/projects/<name>/` (+ `~/.shelbi/events.log`) | `~/.shelbi/projects/<name>/` (+ `~/.shelbi/events.log`) |
+| State (state.json, tasks/, handoff.md, .claude/, workspaces/, events.log) | `~/.shelbi/projects/<name>/` (+ `~/.shelbi/events.log`) | `~/.shelbi/projects/<name>/` (+ `~/.shelbi/events.log`) |
 | Discovery | Reverse-lookup: cwd matched against every registered project's local `work_dir` | Walk up from cwd for `<dir>/.shelbi/project.yaml`, then require a matching `~/.shelbi/projects/<name>/local.yaml` |
 | Shared with clones? | No: every teammate reruns `shelbi init` | Yes: everything under `<repo>/.shelbi/` (the shared `project.yaml` plus the workflows/agents/settings directories, minus the gitignored state) travels with `git clone`; each teammate adds their own `local.yaml` via `--pick-up` |
 
@@ -132,7 +132,7 @@ against a shared config a teammate already committed.
                               #   editor (no flat <name>.yaml for in-repo)
       state.json              # ← state — never committed
       tasks/
-      HANDOFF.md
+      handoff.md
       .claude/
       workspaces/
   events.log                  # ← state — cross-project
@@ -178,7 +178,7 @@ migrate-to-in-repo` prints (and optionally appends) this snippet at
 ```
 .shelbi/state.json
 .shelbi/tasks/
-.shelbi/HANDOFF.md
+.shelbi/handoff.md
 .shelbi/.claude/
 .shelbi/workspaces/
 .shelbi/events.log
@@ -237,7 +237,7 @@ existing global-mode project into the in-repo layout:
    `<name>.yaml.migrated` (it is not deleted — the copy stays as a rollback
    source), whose contents now live in the two files above.
 
-State (`state.json`, `tasks/`, `HANDOFF.md`, `.claude/`, `workspaces/`,
+State (`state.json`, `tasks/`, `handoff.md`, `.claude/`, `workspaces/`,
 `events.log`) stays put under `~/.shelbi/`.
 
 ### Try it dry first

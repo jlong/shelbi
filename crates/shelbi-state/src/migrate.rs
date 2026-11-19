@@ -60,7 +60,7 @@ pub const IN_REPO_CONFIG_FILES: &[&str] = &["workspace-settings.json.template"];
 pub const IN_REPO_GITIGNORE_SNIPPET: &str = "\
 .shelbi/state.json
 .shelbi/tasks/
-.shelbi/HANDOFF.md
+.shelbi/handoff.md
 .shelbi/.claude/
 .shelbi/workspaces/
 .shelbi/events.log

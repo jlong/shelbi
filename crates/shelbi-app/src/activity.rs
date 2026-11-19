@@ -2665,8 +2665,10 @@ fn push_status_tone(status: Option<&str>) -> Tone {
 
 fn handoff_status_tone(status: Option<&str>) -> Tone {
     match status {
-        Some("written") | Some("native-thread") => Tone::Green,
-        Some("timeout") | Some("send-failed") | Some("unconfirmed") => Tone::Yellow,
+        // `injected` and `restored` are what a launch did with it
+        // (`stage=launch`); the rest are what a stop's request got back.
+        Some("written") | Some("native-thread") | Some("injected") => Tone::Green,
+        Some("timeout") | Some("send-failed") | Some("unconfirmed") | Some("restored") => Tone::Yellow,
         _ => Tone::Gray,
     }
 }
@@ -3399,6 +3401,12 @@ mod tests {
                 SystemKind::Handoff,
                 Some("shelbi"),
                 Some("written"),
+            ),
+            (
+                "2026-07-22T14:00:00+00:00 project=shelbi handoff outcome=injected stage=launch detail=812-bytes",
+                SystemKind::Handoff,
+                Some("shelbi"),
+                Some("injected"),
             ),
             (
                 "2026-07-22T14:00:00+00:00 project=shelbi task=t ci pr=42 check=all conclusion=success head_sha=deadbeef",

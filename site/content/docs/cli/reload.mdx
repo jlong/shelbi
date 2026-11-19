@@ -16,7 +16,7 @@ orchestrator's instructions or the shared preamble land at the same time,
 without tearing down the dashboard.
 
 The orchestrator's context survives the swap. Before its session is replaced,
-it's asked to write `agents/orchestrator/handoff.md` covering its in-flight
+it's asked to write the project's `handoff.md` covering its in-flight
 state; the new instance ingests that file (then deletes it) and resumes
 mid-thought rather than cold. A missing or timed-out handoff degrades to a cold
 start, never fatal.

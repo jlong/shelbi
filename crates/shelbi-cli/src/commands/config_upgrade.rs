@@ -440,6 +440,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_orchestrator_instructions(entry, &text, out);
         sniff_orchestrator_active_dispatch(entry, &text, out);
         sniff_reporting_subject(entry, &text, out);
+        sniff_orchestrator_handoff_path(entry, &text, out);
         sniff_tracker_ownership_dispatch(entry, &text, out);
         sniff_orchestrator_changelog(entry, &text, out);
         sniff_orchestrator_changelog_attachments(entry, &text, out);
@@ -960,6 +961,62 @@ fn sniff_reporting_subject(entry: &InventoryEntry, text: &str, out: &mut Vec<Upg
             locate_line_containing(text, "comma-separated workspace"),
         ));
     }
+}
+
+/// The stable code for "the orchestrator instructions name a pre-upgrade
+/// handoff file". An auto-heal: the rewrite swaps the path and nothing else.
+pub(crate) const ORCH_HANDOFF_PATH_AUTOHEAL_CODE: &str = "ORCH_HANDOFF_LEGACY_PATH";
+
+/// The pre-upgrade handoff file names an orchestrator copy can carry, each
+/// paired with the one file it now is. The handoff used to be split across
+/// `agents/orchestrator/handoff.md` (what the orchestrator wrote on request)
+/// and `HANDOFF.md` (what `shelbi status --handoff` read); both are now the
+/// project's `handoff.md`, CWD-relative from the orchestrator's workdir. The
+/// longer path comes first so its `handoff.md` tail isn't rewritten twice.
+///
+/// Kept in sync with the shipped default by the drift guard in this module's
+/// tests: no shipped template carries a legacy name.
+pub(crate) const ORCH_HANDOFF_PATH_REWRITES: &[(&str, &str)] = &[
+    ("agents/orchestrator/handoff.md", "handoff.md"),
+    ("HANDOFF.md", "handoff.md"),
+];
+
+/// Rewrite every pre-upgrade handoff file name in an orchestrator copy to
+/// `handoff.md`, returning the text unchanged when there is none. Shared by the
+/// sniffer and the healer's write-back so the two can never diverge.
+pub(crate) fn apply_handoff_path_rewrite(text: &str) -> String {
+    ORCH_HANDOFF_PATH_REWRITES
+        .iter()
+        .fold(text.to_string(), |text, (legacy, current)| text.replace(legacy, current))
+}
+
+/// Sniff an orchestrator `instructions.md` that still tells the orchestrator to
+/// write (or look for) a pre-upgrade handoff file. Such a copy writes a file no
+/// launch reads, so the handoff it hands over is lost (only the request's own
+/// wording, which names `handoff.md`, saves it).
+///
+/// An auto-heal, not a needs-judgment finding: the rewrite swaps a literal path
+/// for another and touches nothing else, so a user's edits anywhere in the file
+/// survive it. A default change only reaches NEW projects via the shipped
+/// template; this heals existing ones on next boot. Idempotent: after the heal
+/// no legacy name is left and a second pass finds nothing.
+fn sniff_orchestrator_handoff_path(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    let Some((legacy, _)) = ORCH_HANDOFF_PATH_REWRITES.iter().find(|(legacy, _)| text.contains(legacy))
+    else {
+        return;
+    };
+    out.push(finding(
+        entry,
+        Classification::AutoHeal,
+        ORCH_HANDOFF_PATH_AUTOHEAL_CODE,
+        "orchestrator instructions name a pre-upgrade handoff file (`agents/orchestrator/handoff.md` \
+         or `HANDOFF.md`); the one handoff file is now the project's `handoff.md`, so a handoff \
+         written to the old name never reaches the next instance",
+        "Rename every `agents/orchestrator/handoff.md` and `HANDOFF.md` reference to `handoff.md` \
+         (relative to the orchestrator's workdir, the project's state directory). Mirror the \
+         shipped default template.",
+        locate_line_containing(text, legacy),
+    ));
 }
 
 /// Heading of the orchestrator's Changelog rule (add an entry after every
@@ -5135,6 +5192,66 @@ mod tests {
             assert!(!group.heartbeat.is_empty() && !group.awareness.is_empty());
             at += v1[at..].find(&group.heartbeat).expect("group heartbeat text in v1");
         }
+    }
+
+    // ---- orchestrator handoff file (pre-upgrade names -> handoff.md) ----
+
+    /// The `## Handoff` passage and bootstrap line as the orchestrator template
+    /// shipped them before the handoff moved to `handoff.md`.
+    const PRE_UPGRADE_HANDOFF_PROSE: &str = "\
+# Orchestrator
+
+## Bootstrap on session start
+
+   - **Handoff** — either \"no HANDOFF.md present\" or the deleted
+     contents of the file, printed inline.
+
+## Handoff
+
+`shelbi reload` and `shelbi quit` restart or tear down your pane. Before
+they do, they ask you to write `agents/orchestrator/handoff.md` (relative
+to your workdir). My own note: keep it short.
+
+- Don't write `agents/orchestrator/handoff.md` unless shelbi asks.
+";
+
+    #[test]
+    fn pre_upgrade_handoff_names_are_auto_healed_and_nothing_else_changes() {
+        let mut out = Vec::new();
+        sniff_orchestrator_handoff_path(&orch_entry(), PRE_UPGRADE_HANDOFF_PROSE, &mut out);
+        assert_eq!(codes(&out), vec![ORCH_HANDOFF_PATH_AUTOHEAL_CODE]);
+        assert_eq!(out[0].classification, Classification::AutoHeal);
+
+        let healed = apply_handoff_path_rewrite(PRE_UPGRADE_HANDOFF_PROSE);
+        assert_eq!(
+            healed,
+            PRE_UPGRADE_HANDOFF_PROSE
+                .replace("agents/orchestrator/handoff.md", "handoff.md")
+                .replace("HANDOFF.md", "handoff.md"),
+        );
+        assert!(healed.contains("write `handoff.md` (relative\nto your workdir)"), "{healed}");
+        assert!(healed.contains("\"no handoff.md present\""), "{healed}");
+        assert!(healed.contains("Don't write `handoff.md` unless shelbi asks."), "{healed}");
+        assert!(healed.contains("My own note: keep it short."), "a user edit was lost");
+        // Idempotent: the healed copy trips nothing.
+        let mut again = Vec::new();
+        sniff_orchestrator_handoff_path(&orch_entry(), &healed, &mut again);
+        assert!(again.is_empty(), "{:?}", codes(&again));
+    }
+
+    /// Drift guard: the shipped orchestrator template names only `handoff.md`,
+    /// so a fresh project never trips the handoff-path sniffer.
+    #[test]
+    fn shipped_default_template_names_only_handoff_md() {
+        let shipped = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        for (legacy, _) in ORCH_HANDOFF_PATH_REWRITES {
+            assert!(!shipped.contains(legacy), "the shipped template still names `{legacy}`");
+        }
+        assert!(shipped.contains("write `handoff.md`"), "the shipped template lost the handoff rule");
+        let mut out = Vec::new();
+        sniff_orchestrator_handoff_path(&orch_entry(), shipped, &mut out);
+        assert!(out.is_empty(), "{:?}", codes(&out));
+        assert_eq!(apply_handoff_path_rewrite(shipped), shipped);
     }
 
     // ---- orchestrator Reporting passage (workspace-subject -> issue) ----

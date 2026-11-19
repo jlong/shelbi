@@ -28,7 +28,7 @@ pub enum ProjectCmd {
     /// half at `<repo>/.shelbi/project.yaml` and a per-machine
     /// `~/.shelbi/projects/<name>/local.yaml`; moves `workflows/`,
     /// `agents/`, and the workspace-settings template from the state
-    /// dir to the repo. State (`state.json`, `tasks/`, `HANDOFF.md`,
+    /// dir to the repo. State (`state.json`, `tasks/`, `handoff.md`,
     /// `.claude/`, `workspaces/`, `events.log`) stays under
     /// `~/.shelbi/` in both modes.
     ///
