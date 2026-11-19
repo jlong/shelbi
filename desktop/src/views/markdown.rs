@@ -159,52 +159,73 @@ fn figure_state(source: &ImageSource, window: &mut Window, cx: &mut App) -> Figu
 fn render_figures(node: &MarkdownNode, theme: &Theme, window: &mut Window, cx: &mut App) -> Div {
     let figures = node.data::<Vec<Figure>>().cloned().unwrap_or_default();
     let start = node.source_range().map_or(0, |r| r.start);
-    div()
+    figure_column(figures.into_iter().enumerate().map(|(ix, figure)| {
+        let state = figure_state(&figure.source, window, cx);
+        figure_element(format!("changelog-figure-{start}-{ix}"), &figure, state, theme)
+    }))
+}
+
+/// A [`FIGURE`] block's figures, top to bottom across the column.
+fn figure_column(figures: impl IntoIterator<Item = gpui::Stateful<Div>>) -> Div {
+    div().flex().flex_col().gap(px(BLOCK_GAP / 2.0)).w_full().children(figures)
+}
+
+/// One figure of a [`FIGURE`] block, once its source has been tried: the
+/// image over its caption, the caption alone while it loads, or the
+/// placeholder. Its id is also its debug selector, and its image's is the id
+/// with `-image` after it.
+fn figure_element(id: String, figure: &Figure, state: FigureState, theme: &Theme) -> gpui::Stateful<Div> {
+    let caption = (!figure.alt.trim().is_empty()).then(|| {
+        div()
+            .type_style(Type::Small)
+            .text_color(theme.muted)
+            .child(figure.alt.clone())
+    });
+    let picture = match (&figure.source, state) {
+        (ImageSource::File(path), FigureState::Image { width, height }) if height > 0.0 => {
+            Some(framed(img(path.clone()), width, height, theme))
+        }
+        (ImageSource::Web(url), FigureState::Image { width, height }) if height > 0.0 => {
+            Some(framed(img(SharedUri::from(url.clone())), width, height, theme))
+        }
+        _ => None,
+    };
+    let image_selector = format!("{id}-image");
+    let picture = picture.map(|p| p.debug_selector(move || image_selector.clone()));
+    let selector = id.clone();
+    let out = div()
+        .id(SharedString::from(id))
+        .debug_selector(move || selector.clone())
         .flex()
         .flex_col()
-        .gap(px(BLOCK_GAP / 2.0))
-        .w_full()
-        .children(figures.into_iter().enumerate().map(|(ix, figure)| {
-            let state = figure_state(&figure.source, window, cx);
-            let id = format!("changelog-figure-{start}-{ix}");
-            let caption = (!figure.alt.trim().is_empty()).then(|| {
-                div()
-                    .type_style(Type::Small)
-                    .text_color(theme.muted)
-                    .child(figure.alt.clone())
-            });
-            let picture = match (&figure.source, state) {
-                (ImageSource::File(path), FigureState::Image { width, height }) if height > 0.0 => {
-                    Some(framed(img(path.clone()), width, height, theme))
-                }
-                (ImageSource::Web(url), FigureState::Image { width, height }) if height > 0.0 => {
-                    Some(framed(img(SharedUri::from(url.clone())), width, height, theme))
-                }
-                _ => None,
-            };
-            let mut out = div().id(SharedString::from(id.clone())).debug_selector(move || id.clone());
-            out = out.flex().flex_col().gap(px(FIGURE_GAP)).w_full();
-            match (picture, state) {
-                (Some(picture), _) => out.child(picture).children(caption),
-                (None, FigureState::Placeholder(why)) => out.child(placeholder(&figure.alt, why, theme)),
-                (None, _) => out.children(caption),
-            }
-            .into_any_element()
-        }))
+        .gap(px(FIGURE_GAP))
+        .w_full();
+    match (picture, state) {
+        (Some(picture), _) => out.child(picture).children(caption),
+        (None, FigureState::Placeholder(why)) => out.child(placeholder(&figure.alt, why, theme)),
+        (None, _) => out.children(caption),
+    }
 }
 
 /// An image at the column's width, at most its own, its height following
 /// from its aspect ratio.
+///
+/// The clamp and the ratio sit on two boxes: on one, taffy works the height
+/// out from the column's full width before `max_w` narrows it, so an image
+/// narrower than the column got the height of one as wide as the column (a
+/// gap under its caption). The outer box settles the width; the inner one,
+/// all of it, takes its height from that.
 fn framed(image: gpui::Img, width: f32, height: f32, theme: &Theme) -> Div {
-    div()
-        .w_full()
-        .max_w(px(width))
-        .aspect_ratio(width / height)
-        .rounded_md()
-        .overflow_hidden()
-        .border_1()
-        .border_color(theme.divider)
-        .child(image.size_full())
+    div().w_full().max_w(px(width)).child(
+        div()
+            .w_full()
+            .aspect_ratio(width / height)
+            .rounded_md()
+            .overflow_hidden()
+            .border_1()
+            .border_color(theme.divider)
+            .child(image.size_full()),
+    )
 }
 
 /// What a figure shows when there is no image to draw: its alt text, and why
@@ -560,6 +581,72 @@ The column keeps its cards.
         let node = parse_figures(&paragraph, None).unwrap();
         assert!(node.data::<Vec<Figure>>().unwrap().iter().all(|f| f.source == ImageSource::Unavailable));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A column of figures as the Changelog draws them, across the window's
+    /// width, with a row under it.
+    struct Figures(Vec<(f32, f32)>);
+
+    impl Render for Figures {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            let theme = Theme::resolve(shelbi_state::ThemePreference::Dark, gpui::WindowAppearance::Dark);
+            let figures = self.0.iter().enumerate().map(|(ix, &(width, height))| {
+                let figure = Figure {
+                    alt: format!("Shot {ix}"),
+                    source: ImageSource::File(PathBuf::from(format!("/nonexistent/shot-{ix}.png"))),
+                };
+                figure_element(format!("fig-{ix}"), &figure, FigureState::Image { width, height }, &theme)
+            });
+            div()
+                .flex()
+                .flex_col()
+                .w_full()
+                .child(figure_column(figures))
+                .child(div().debug_selector(|| "after".into()).h(px(10.0)))
+        }
+    }
+
+    /// Each figure is its image (the column's width, never past its own, at
+    /// its aspect ratio) over its caption, with only the figure gap between
+    /// figures, however the column compares with the images and as the
+    /// window resizes.
+    #[gpui::test]
+    fn a_figure_is_as_tall_as_its_image_and_caption_at_any_column_width(cx: &mut gpui::TestAppContext) {
+        // Crown & Keep's phone screenshots, and a wide one.
+        let shots = vec![(460.0, 1000.0), (750.0, 1000.0), (1200.0, 600.0)];
+        let window = cx.add_window(|_, _| Figures(shots.clone()));
+        let host = window.root(cx).unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        // Wider than every image, between them, and narrower than all.
+        for column in [1400.0_f32, 600.0, 300.0, 1000.0] {
+            vcx.simulate_resize(gpui::size(px(column), px(4000.0)));
+            host.update(&mut vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+            let mut prev_bottom = None;
+            for (ix, &(width, height)) in shots.iter().enumerate() {
+                let figure = vcx.debug_bounds(Box::leak(format!("fig-{ix}").into_boxed_str())).unwrap();
+                let image = vcx.debug_bounds(Box::leak(format!("fig-{ix}-image").into_boxed_str())).unwrap();
+                let shown = width.min(column);
+                let at = format!("a {width}x{height} image in a {column}pt column");
+                assert!((image.size.width.as_f32() - shown).abs() < 0.5, "{at}: width {:?}", image.size.width);
+                let tall = shown * height / width;
+                assert!((image.size.height.as_f32() - tall).abs() < 0.5, "{at}: height {:?}, want {tall}", image.size.height);
+                assert_eq!(image.top(), figure.top(), "{at}: the image heads its figure");
+                let caption = Type::Small.line_height();
+                let want = image.size.height.as_f32() + FIGURE_GAP + caption;
+                assert!(
+                    (figure.size.height.as_f32() - want).abs() < 0.5,
+                    "{at}: the figure is {:?} tall, want image + gap + caption = {want}",
+                    figure.size.height
+                );
+                if let Some(bottom) = prev_bottom {
+                    assert_eq!(figure.top(), bottom + px(BLOCK_GAP / 2.0), "{at}: only the figure gap above it");
+                }
+                prev_bottom = Some(figure.bottom());
+            }
+            let after = vcx.debug_bounds("after").unwrap();
+            assert_eq!(Some(after.top()), prev_bottom, "{column}pt: nothing under the last figure");
+        }
     }
 
     #[test]
