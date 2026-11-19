@@ -1,11 +1,13 @@
 //! The first-run Zen intro, drawn: the TUI's `overlay/zen_intro.rs`. The cyan
-//! heading, the gray body copy, the "Don't show this again" checkbox, and
+//! heading, the gray body copy, the "Don't show this again" checkbox (the
+//! app's [`controls::checkbox`], where the TUI draws `[ ]` / `[x]`), and
 //! `[ Cancel ]` left of the green `[ Enable Zen ]`. Like the TUI's, it draws no
 //! accent border of its own.
 
-use gpui::{div, prelude::*, px, AnyElement, Context, FontWeight};
+use gpui::{div, prelude::*, px, AnyElement, Context, Role, Toggled};
 use shelbi_app::overlay::zen_intro::{self as zen, IntroFocus, IntroState};
 
+use crate::elements::controls;
 use crate::theme::style::{self, ButtonKind, ButtonSize};
 use crate::theme::Theme;
 use crate::views::overlay::{panel, with_overlay, zen_event, ActiveOverlay, OverlayEvent, OverlayHost};
@@ -34,21 +36,17 @@ pub fn render<H: OverlayHost>(state: &IntroState, theme: &Theme, cx: &mut Contex
                 .map(|line| div().child(line.trim_end().replace("  ", "\u{00a0}\u{00a0}"))),
         )
     });
-    let checkbox_focused = state.focus == IntroFocus::Checkbox;
-    let checkbox = div()
-        .id("zen-checkbox")
-        .debug_selector(|| "zen-checkbox".into())
-        .cursor_pointer()
-        .when(checkbox_focused, |c| {
-            c.text_color(theme.text_loud).font_weight(FontWeight::MEDIUM).underline()
-        })
-        .when(!checkbox_focused, |c| c.text_color(theme.foreground))
-        .child(format!(
-            "{} {}",
-            if state.dont_show_again { "[x]" } else { "[ ]" },
-            zen::CHECKBOX
-        ))
-        .on_click(cx.listener(on_control(IntroFocus::Checkbox)));
+    let checkbox = controls::checkbox(
+        "zen-checkbox",
+        zen::CHECKBOX,
+        state.dont_show_again,
+        state.focus == IntroFocus::Checkbox,
+        theme,
+    )
+    .role(Role::CheckBox)
+    .aria_label(zen::CHECKBOX)
+    .aria_toggled(if state.dont_show_again { Toggled::True } else { Toggled::False })
+    .on_click(cx.listener(on_control(IntroFocus::Checkbox)));
 
     let button = |id: &'static str, label: &str, focused: bool, kind| {
         style::button(id, label.to_string(), kind, ButtonSize::Base, focused, theme)
