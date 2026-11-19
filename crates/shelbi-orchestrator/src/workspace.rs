@@ -5543,6 +5543,17 @@ fn gitignore_worktree_paths(host: &Host, worktree: &Path, rels: &[String]) -> Re
     write_worktree_text(host, &exclude_path, &body, "git-exclude")
 }
 
+/// Keep a worktree's `.shelbi/` scratch (runner hooks, markers, messages) out
+/// of `git status`, in the worktree and in the repo it belongs to: the exclude
+/// lives in the repo's shared `info/exclude`, and the repo's own `git status`
+/// would otherwise list the `.shelbi/wt/` worktrees themselves. `workspace add`
+/// calls this so a new project is clean before its first dispatch; dispatch
+/// writes the same entry again from the skill-mount step. Best-effort, like
+/// [`gitignore_worktree_paths`].
+pub fn exclude_shelbi_scratch(host: &Host, worktree: &Path) {
+    let _ = gitignore_worktree_paths(host, worktree, &[".shelbi/".to_string()]);
+}
+
 /// Recursively copy the contents of `src` (a directory) into `dest`. The
 /// destination must already exist. Local hosts mount skills via symlink
 /// ([`mount_skill_entry`]), so this copy fallback is only reached on non-unix

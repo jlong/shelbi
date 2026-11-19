@@ -992,12 +992,19 @@ impl PoolOps for LiveOps {
 
     fn materialize(&self, project: &Project, machine: &Machine, workspace: &WorkspaceSpec) -> Result<(), String> {
         ws::materialize_idle_worktree(&project.name, machine, workspace, project.base_branch())
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        ws::exclude_shelbi_scratch(&machine.host(), &ws::workspace_worktree(machine, workspace));
+        Ok(())
     }
 
+    /// Deploy the runner hook scripts, then wire `settings.local.json` to
+    /// them. Scripts first, so the config never names a script that isn't
+    /// there (a `claude` started by hand in an idle worktree runs the hooks).
+    /// Dispatch redeploys both on every launch.
     fn wire_hooks(&self, project: &Project, machine: &Machine, workspace: &WorkspaceSpec) -> Result<HookWiring, String> {
         let block = ws::render_workspace_settings_preferring_agent(project, None).map_err(|e| e.to_string())?;
         let worktree = ws::workspace_worktree(machine, workspace);
+        ws::deploy_runner_hooks(&machine.host(), &worktree).map_err(|e| e.to_string())?;
         match ws::wire_settings_local(&machine.host(), &worktree, &workspace.name, &block)
             .map_err(|e| e.to_string())?
         {
