@@ -12,12 +12,12 @@ pub const HEADING: &str = "Enable Zen Mode?";
 /// The body copy, with its own line breaks.
 pub const BODY: &str = "Zen Mode lets the orchestrator act autonomously:\n\
 \n  \
-• Auto-promotes ready tasks to dispatch\n  \
+• Auto-promotes backlog issues it judges in scope, and dispatches them\n  \
 • Auto-merges completed tasks that pass your project's checks \
 (build/test + diff size + danger paths)\n\
 \n\
 You can pause it (palette → Pause Zen) or turn it off any time. \
-Edit CLAUDE.md to tune what qualifies as in-scope or what gates merges.";
+Edit the orchestrator's instructions to tune what qualifies as in-scope or what gates merges.";
 
 /// The checkbox label.
 pub const CHECKBOX: &str = "Don't show this again";

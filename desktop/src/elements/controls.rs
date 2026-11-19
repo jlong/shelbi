@@ -306,6 +306,14 @@ pub fn form_icon_button(id: impl Into<SharedString>, icon: Icon, inert: bool, th
 /// `check_fill` with the mark in white. `focused` turns the edge to the
 /// ring (`check_fill` when checked) with the glow around it.
 pub fn check(selected: bool, focused: bool, theme: &Theme) -> Div {
+    check_parts(selected, focused, theme, None)
+}
+
+/// [`check`], its mark and glow carrying `{selector}-mark` and
+/// `{selector}-ring` debug selectors when `selector` is given, so a test can
+/// see whether a [`checkbox`] draws checked or focused.
+fn check_parts(selected: bool, focused: bool, theme: &Theme, selector: Option<SharedString>) -> Div {
+    let mark_selector = selector.clone();
     let (fill, edge) = if selected {
         (theme.check_fill, theme.check_fill)
     } else if focused {
@@ -339,10 +347,15 @@ pub fn check(selected: bool, focused: bool, theme: &Theme) -> Div {
                     .absolute()
                     .top(px(1.0))
                     .left(px(1.0))
+                    .when_some(mark_selector, |d, s| d.debug_selector(move || format!("{s}-mark")))
                     .child(check_mark().text_color(theme.text_on_color)),
             )
         })
-        .when(focused, |d| d.child(glow(3.0, glow_color)))
+        .when(focused, |d| {
+            d.child(
+                glow(3.0, glow_color).when_some(selector, |d, s| d.debug_selector(move || format!("{s}-ring"))),
+            )
+        })
 }
 
 /// The Switch (`2739:1615`): a 36 × 22 pill with an 18pt white thumb 2pt
@@ -375,7 +388,9 @@ pub fn switch(on: bool, theme: &Theme) -> Div {
 }
 
 /// A checkbox: the [`check`] and its label (Base; loud when checked,
-/// `form_text` when not), 8px apart, 2px in.
+/// `form_text` when not), 8px apart, 2px in. Debug selectors: `id` on the
+/// whole row, `{id}-mark` on the check mark while selected, `{id}-ring` on
+/// the focus glow while focused.
 pub fn checkbox(
     id: impl Into<SharedString>,
     label: impl Into<SharedString>,
@@ -385,16 +400,17 @@ pub fn checkbox(
 ) -> Stateful<Div> {
     let id: SharedString = id.into();
     let selector = id.clone();
+    let id_selector = id.clone();
     div()
         .id(id)
-        .debug_selector(move || selector.to_string())
+        .debug_selector(move || id_selector.to_string())
         .flex()
         .flex_row()
         .items_center()
         .gap(px(8.0))
         .px(px(2.0))
         .cursor_pointer()
-        .child(check(selected, focused, theme))
+        .child(check_parts(selected, focused, theme, Some(selector.clone())))
         .child(
             div()
                 .type_style(Type::Base)

@@ -28,8 +28,8 @@
 //!   (the sidebar as it was);
 //! - the overlays over the shell: `palette-entering.png` (the palette
 //!   sliding in), `palette.png`, `dialog-review-confirm.png`,
-//!   `dialog-reject.png`, `dialog-zen.png` and
-//!   `dialog-error-log.png`.
+//!   `dialog-reject.png`, `dialog-zen.png`, `dialog-zen-checked.png` (its
+//!   checkbox checked and focused) and `dialog-error-log.png`.
 
 use shelbi_app::review::diff_load::DiffLoad;
 use std::cell::Cell;
@@ -621,6 +621,16 @@ impl Run {
             ),
             ("dialog-reject.png", Some(typed_reason(ActiveOverlay::reject_reason("cold-start", Some(wrap))))),
             ("dialog-zen.png", Some(ActiveOverlay::zen_intro("demo"))),
+            (
+                "dialog-zen-checked.png",
+                Some(ActiveOverlay::ZenIntro {
+                    project: "demo".into(),
+                    state: shelbi_app::overlay::zen_intro::IntroState {
+                        focus: shelbi_app::overlay::zen_intro::IntroFocus::Checkbox,
+                        dont_show_again: true,
+                    },
+                }),
+            ),
             ("dialog-error-log.png", Some(log)),
         ] {
             self.handle

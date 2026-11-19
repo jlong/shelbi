@@ -974,6 +974,60 @@ mod render_tests {
         );
     }
 
+    /// The Zen intro's "Don't show this again" is the app's checkbox: a box
+    /// that draws a mark when checked and the ring when focused, toggled by a
+    /// click on the box or its label and by Space, and Enable Zen carries it.
+    #[gpui::test]
+    fn the_zen_intro_checkbox_draws_and_toggles(cx: &mut TestAppContext) {
+        let (root, mut vcx) = open(cx, ActiveOverlay::zen_intro("alpha"));
+        let drawn = |vcx: &mut VisualTestContext, selector: &'static str| vcx.debug_bounds(selector).is_some();
+        // Unchecked, and Enable has focus: no mark, no ring.
+        assert!(!drawn(&mut vcx, "zen-checkbox-mark"));
+        assert!(!drawn(&mut vcx, "zen-checkbox-ring"));
+        let row = vcx.debug_bounds("zen-checkbox").unwrap();
+        let label = gpui::point(row.right() - px(4.0), row.center().y);
+        let box_ = gpui::point(row.left() + px(9.0), row.center().y);
+
+        // A click on the label checks it and focuses it.
+        vcx.simulate_click(label, Modifiers::none());
+        vcx.run_until_parked();
+        assert!(drawn(&mut vcx, "zen-checkbox-mark"), "checked after a label click");
+        assert!(drawn(&mut vcx, "zen-checkbox-ring"), "the ring follows focus");
+
+        // Space toggles it while it has focus.
+        let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
+        root.update(&mut vcx, |f, cx| {
+            f.overlay.as_mut().unwrap().handle_key(KeyChord::parse("space").unwrap(), &keymaps);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert!(!drawn(&mut vcx, "zen-checkbox-mark"), "Space unchecks it");
+        assert!(drawn(&mut vcx, "zen-checkbox-ring"));
+
+        // A click on the box checks it again; Tab moves focus (and the ring) on.
+        vcx.simulate_click(box_, Modifiers::none());
+        vcx.run_until_parked();
+        assert!(drawn(&mut vcx, "zen-checkbox-mark"), "checked after a box click");
+        root.update(&mut vcx, |f, cx| {
+            f.overlay.as_mut().unwrap().handle_key(KeyChord::parse("tab").unwrap(), &keymaps);
+            cx.notify();
+        });
+        vcx.run_until_parked();
+        assert!(!drawn(&mut vcx, "zen-checkbox-ring"), "Cancel has focus");
+        assert!(drawn(&mut vcx, "zen-checkbox-mark"));
+
+        let enable = vcx.debug_bounds("zen-enable").unwrap();
+        vcx.simulate_click(enable.center(), Modifiers::none());
+        assert_eq!(
+            root.read_with(&vcx, |f, _| f.events.clone()),
+            [OverlayEvent::ZenResult {
+                project: "alpha".into(),
+                confirmed: true,
+                dont_show_again: true
+            }]
+        );
+    }
+
     #[gpui::test]
     fn clicking_the_dialogs_buttons_resolves_them(cx: &mut TestAppContext) {
         let (root, mut vcx) = open(cx, ActiveOverlay::zen_intro("alpha"));
