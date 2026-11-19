@@ -5,7 +5,8 @@
 //! - Menus, popovers and the palette open with Taskpage's slide-and-fade:
 //!   8px of travel and opacity on `cubic-bezier(0.16, 1, 0.3, 1)`
 //!   ([`ease_out_expo`]), 200ms for a menu ([`MENU_IN`]), 400ms for the
-//!   palette ([`DIALOG_IN`]).
+//!   palette ([`DIALOG_IN`]). The tab bar's `+` turns into the New tab on the
+//!   same curve over 240ms ([`TAB_MORPH`]).
 //! - The selected row's chip slides to a newly selected row on a spring with
 //!   a slight overshoot ([`NAV_SPRING`], framer-motion's `bounce: 0.25`),
 //!   tracked by a [`SlideTrack`].
@@ -34,6 +35,10 @@ use gpui::{
 pub const MENU_IN: Duration = Duration::from_millis(200);
 /// The palette's slide-and-fade in (Taskpage's 400ms).
 pub const DIALOG_IN: Duration = Duration::from_millis(400);
+/// The tab bar's `+` turning into the New tab and back (its `+` rotating to
+/// an `×`, its label sliding out): a menu's pace, a touch longer for the
+/// tab's travel.
+pub const TAB_MORPH: Duration = Duration::from_millis(240);
 /// How far a menu or dialog travels as it fades in.
 pub const SLIDE_PX: f32 = 8.0;
 

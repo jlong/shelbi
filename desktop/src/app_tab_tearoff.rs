@@ -18,9 +18,9 @@
 //! it was left, the taking window adopts that and attaches the same daemon
 //! sessions, and a window left with no tab closes. A project on another
 //! machine takes its host with it (`mixed-host-tabs`): the taking window
-//! shares the giver's open host (its one link), so it stays connected. A New tab travels the
-//! same way: torn off, its window shows the launch screen; dropped on a bar
-//! whose window has a New tab already, that one is selected.
+//! shares the giver's open host (its one link), so it stays connected. The
+//! New tab never travels: it is the bar's `+` slot (`new-tab-plus-morph`),
+//! pinned past the project tabs, and a tab dropped on a bar lands before it.
 
 use gpui::{point, px, App, Bounds, Context, Point, Window, WindowHandle, WindowId};
 
@@ -158,18 +158,18 @@ impl ShelbiWindow {
                     self.tab_reorder
                         .layout
                         .borrow()
-                        .gap_at(self.tabs.order(), local.x.as_f32(), tab_bar::PLUS_SLOT_W)
+                        .gap_at(self.tabs.strip(), local.x.as_f32(), layout_tail(&self.tab_reorder))
                 })
                 .flatten(),
             // Another window's bar: over its `+`, the gap at the end (where
             // a drop there lands).
             Some(other) => find_window(other, cx).and_then(|h| {
                 h.read_with(cx, |w, _| {
-                    let order = w.tabs.order();
+                    let order = w.tabs.strip();
                     w.tab_reorder
                         .layout
                         .borrow()
-                        .gap_at(order, over_x, tab_bar::PLUS_SLOT_W)
+                        .gap_at(order, over_x, layout_tail(&w.tab_reorder))
                         .unwrap_or(order.len())
                 })
                 .ok()
@@ -384,7 +384,7 @@ fn tear_off(t: TearOff, cx: &mut App) {
             sidebar_width: w.window_state.sidebar_width,
             sidebar_collapsed: w.window_state.sidebar_collapsed,
             task_pane_width: w.window_state.task_pane_width,
-            tabs: if t.project == NEW_TAB { Vec::new() } else { vec![tab_key(&t.project)] },
+            tabs: vec![tab_key(&t.project)],
             ..WindowState::default()
         };
         let host = w.host_of_tab(&t.project);
@@ -409,13 +409,6 @@ fn tear_off(t: TearOff, cx: &mut App) {
         .map(|s| s.windows.iter().map(|w| w.slot).collect())
         .unwrap_or_default();
     let slot = WindowSession::free_slot(&taken);
-    if t.project == NEW_TAB {
-        if let Some(handle) = open_new_tab_window(slot, state, bounds, cx) {
-            let _ = handle.update(cx, |_, window, _| window.activate_window());
-            let _ = source.update(cx, |w, window, cx| w.give_up_tab(&t.project, window, cx));
-        }
-        return;
-    }
     // A remote tab opens over its host, as the source had it open (or, not
     // yet open there, opening in the new window's tab).
     let key = tab_key(&t.project);
@@ -429,4 +422,10 @@ fn tear_off(t: TearOff, cx: &mut App) {
         window.activate_window();
     });
     let _ = source.update(cx, |w, window, cx| w.give_up_tab(&t.project, window, cx));
+}
+
+/// The `+` slot's width in `reorder`'s bar as it last painted (wider while
+/// it is the New tab): the span past the tabs where no gap opens.
+fn layout_tail(reorder: &crate::views::tab_drag::TabReorder) -> f32 {
+    reorder.layout.borrow().tail_w(tab_bar::PLUS_SLOT_W)
 }

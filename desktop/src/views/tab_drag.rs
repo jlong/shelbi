@@ -29,6 +29,9 @@
 //!   bar the tab came from closes its slot while the tab is elsewhere
 //!   (`away`); every other bar shows none. The `+` after the tabs slides
 //!   with them ([`TabFrame::tail_offset`]), so a gap at the end opens too.
+//! - The tabs a drag moves are the strip ([`ProjectTabs::strip`]): the
+//!   project tabs. The New tab is the `+` slot (`new-tab-plus-morph`), pinned
+//!   past them: it never drags, and no gap opens over or after it.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -94,6 +97,12 @@ pub struct TabLayout {
     /// window draws no tab bar): where another window's dragged tab looks
     /// for it (`tab-tearoff`).
     pub bar: Option<gpui::Bounds<f32>>,
+    /// The `+` slot's width as last painted, its rule included (`None`
+    /// before it has painted): wider while it is the New tab.
+    pub tail_w: Option<f32>,
+    /// The New tab's label (and ⌘N badge) at its natural width, as last
+    /// painted: how far the `+` slot widens for it.
+    pub plus_label_w: Option<f32>,
 }
 
 /// The layout as the bar and its probes share it.
@@ -113,6 +122,11 @@ impl TabLayout {
                 self.widths.insert(project.to_string(), width);
             }
         }
+    }
+
+    /// The `+` slot's width as last painted, else `plus_w` (a lone `+`'s).
+    pub fn tail_w(&self, plus_w: f32) -> f32 {
+        self.tail_w.unwrap_or(plus_w)
     }
 
     /// `project`'s slot width as last painted (0 before it has painted).
@@ -328,7 +342,7 @@ impl TabReorder {
         let Some((project, width)) = self.incoming.take() else {
             return self.drop(tabs, pointer_x);
         };
-        let slot = self.slot.take().unwrap_or(tabs.order().len());
+        let slot = self.slot.take().unwrap_or(tabs.strip().len());
         {
             let mut layout = self.layout.borrow_mut();
             // Its slot is the gap's width until it paints.
@@ -396,7 +410,7 @@ impl TabReorder {
         if dragged.is_none() && incoming.is_none() && settle.is_none() && self.slides.is_empty() {
             return TabFrame::default();
         }
-        let order: Vec<&str> = tabs.order().iter().map(String::as_str).collect();
+        let order: Vec<&str> = tabs.strip().iter().map(String::as_str).collect();
         let layout = self.layout.borrow();
         let rest: HashMap<&str, f32> = layout.lefts(order.iter().copied()).into_iter().collect();
         let lifted = order.iter().copied().find(|p| dragged.as_deref() == Some(*p));

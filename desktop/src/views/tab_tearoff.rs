@@ -211,10 +211,10 @@ pub struct DragState {
 }
 
 impl DragState {
-    /// The dragged tab's dot: a project's (open, working or not), or the
-    /// New tab's ring.
+    /// The dragged tab's dot: a project's (open, working or not; the New
+    /// tab never drags).
     pub fn indicator(&self) -> ProjectIndicator {
-        super::tab_bar::indicator(&self.project, self.working)
+        super::tab_bar::indicator(self.working)
     }
 
     pub fn new(source: WindowId, project: String, label: SharedString, working: bool) -> DragState {

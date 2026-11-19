@@ -3740,6 +3740,33 @@ impl Run {
         self.cx.run_until_parked();
         self.save(handle, "state-new-tab");
 
+        // The `+` turning into the New tab and back (`new-tab-plus-morph`;
+        // no frame draws it, checked by eye): the `+` a quarter turn on its
+        // way to the `×`, "New tab" sliding out, at points along the curve,
+        // then the `×` turning back once the New tab closes.
+        let handle = self.open();
+        self.click(handle, orch.clone());
+        handle.update(&mut self.cx, |w, _, cx| w.offscreen_sync_tabs(cx)).unwrap();
+        self.settle(handle);
+        let start = self.now.get();
+        handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_new_tab(window, cx))
+            .unwrap();
+        self.cx.run_until_parked();
+        for ms in [0, 20, 60, 120, 240] {
+            self.now.set(start + Duration::from_millis(ms));
+            self.capture_frame(handle, &format!("state-plus-morph-open-{ms}"));
+        }
+        let start = self.now.get();
+        handle
+            .update(&mut self.cx, |w, window, cx| w.offscreen_close_new_tab(window, cx))
+            .unwrap();
+        self.cx.run_until_parked();
+        for ms in [0, 20, 60, 240] {
+            self.now.set(start + Duration::from_millis(ms));
+            self.capture_frame(handle, &format!("state-plus-morph-close-{ms}"));
+        }
+
         // A tab in each loaded state (no frame draws it; checked by eye):
         // Shelbi has work in progress, its dot at the pulse's peak (Reduce
         // Motion holds the breath there, so the frame is stable), beside the

@@ -4,7 +4,7 @@
 //!
 //! Left to right: one tab per open project ([`crate::project_tabs`]),
 //! starting just past the traffic lights, each a green dot and the project's
-//! name between 1pt rules, then the `+` tab. The bar's right end is empty:
+//! name between 1pt rules, then the `+` slot. The bar's right end is empty:
 //! the command palette opens from the sidebar's header row (its Search
 //! button), so the bar doesn't compete with the screens' own search fields.
 //! While the sidebar is hidden a Toggle sidebar button slides in before the
@@ -15,14 +15,23 @@
 //! its dot for an `×` that closes the project. While ⌘ is held each of the
 //! first nine tabs shows its ⌘N.
 //!
-//! The `+` tab opens a New tab (`new-tab-launch`) after the last tab and
-//! selects it, or selects the window's New tab when it has one: "New tab"
-//! beside a gray ring (no project, so no status), its content the launch
-//! screen ([`super::launch`]). It closes with its `×` as a project's tab
-//! does, without asking (nothing stops), and drags, reorders and tears off
-//! the same way.
+//! The `+` slot (`new-tab-plus-morph`) is a 52pt square `+` that becomes the
+//! window's New tab (`new-tab-launch`) when clicked: the `+` turns 45°
+//! counterclockwise into an `×` while "New tab" slides out from under it to
+//! its right, clipped at the tab's edge as the tab widens to fit
+//! ([`PlusMorph`], on the motion module's curve over [`motion::TAB_MORPH`];
+//! at once under Reduce Motion). The New tab's content is the launch screen
+//! ([`super::launch`]). One glyph turns, never two cross-fading: a `+` turned
+//! 45° is an `×`. While the New tab is open there is no other `+`, so a
+//! window has one New tab at most. It is selected (the main area's fill)
+//! while its launch screen shows and unselected like any tab otherwise; a
+//! click on its body selects it, and its `×` closes it without asking
+//! (nothing stops), turning back into the lone `+`. A project picked on its
+//! launch screen takes its place as the last project tab, and a fresh `+`
+//! is just there (no turn back). The New tab is pinned to the bar's end: it
+//! never drags, reorders or tears off, and no tab is dropped past it.
 //!
-//! Right-clicking a project's tab (never the `+` or the New tab) opens its context menu at
+//! Right-clicking a project's tab (never the `+` slot) opens its context menu at
 //! the pointer ([`TabMenu`]): "Close Project", closing that tab's project as
 //! its `×` does, and "Close All Other Projects", closing every other tab's
 //! after one confirmation (dimmed while it's the only tab). It closes on a
@@ -34,9 +43,9 @@
 //! empty slot opens in the gap it lands in: a tab's left half is the gap
 //! before it, its right half the gap after (judged where the tabs rest, so
 //! a tab sliding out from under the pointer doesn't flip it), the bar
-//! before the first tab is the start, and its empty space past the `+` the
-//! end. Over the `+` there is no gap: the tabs slide back, and a drop there
-//! leaves the order alone. The gap follows the pointer while it is within
+//! before the first tab is the start, and its empty space past the `+` slot
+//! the end. Over the `+` slot (the `+`, or the New tab) there is no gap: the
+//! tabs slide back, and a drop there leaves the order alone. The gap follows the pointer while it is within
 //! [`tab_tearoff::TEAR_OFF_PX`] of the bar, on it or off it. Dropped, the tab
 //! settles from under the ghost into its slot. A press without movement
 //! stays a click.
@@ -52,14 +61,16 @@
 //! The window owns its titlebar drag (`app_owns_titlebar_drag`), so a press
 //! on a tab is the tab's. The bar's empty space moves the window instead
 //! ([`window_drag::region`]): the traffic lights' room before the first
-//! item, and the space past the `+`. A double click there is the system's
+//! item, and the space past the `+` slot. A double click there is the system's
 //! titlebar action.
 
+use std::f32::consts::FRAC_PI_4;
 use std::time::Instant;
 
 use gpui::{
-    canvas, deferred, div, point, prelude::*, px, AnyElement, App, Bounds, Context, DispatchPhase, Div, Hsla,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, SharedString, Size, Stateful, Window,
+    canvas, deferred, div, point, prelude::*, px, radians, AnyElement, App, Bounds, Context, DispatchPhase, Div,
+    Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, SharedString, Size, Stateful, Transformation,
+    Window,
 };
 use shelbi_app::overlay::palette::{project_indicator, ProjectIndicator};
 
@@ -103,6 +114,15 @@ const TAB_MAX_W: f32 = 240.0;
 const RULE_W: f32 = 1.0;
 /// The `+` tab and the rule after it: no drop gap over it.
 pub const PLUS_SLOT_W: f32 = TAB_BAR_H + RULE_W;
+/// The `+` slot's `×` while it is the New tab: a project tab's `×` box,
+/// centered where the `+` is.
+const PLUS_CLOSE_BOX: f32 = 16.0;
+/// Where the New tab's label starts in the `+` slot: past the `×` and the
+/// tabs' gap.
+const PLUS_LABEL_X: f32 = (TAB_BAR_H + PLUS_CLOSE_BOX) / 2.0 + TAB_GAP;
+/// The New tab's label width before it has painted ("New tab" in Base
+/// Medium, near enough for one frame).
+const PLUS_LABEL_W_GUESS: f32 = 52.0;
 
 /// A tab's context menu's width.
 const MENU_W: f32 = 240.0;
@@ -112,23 +132,10 @@ const CONTEXT_GAP: f32 = 2.0;
 /// What the New tab says.
 pub const NEW_TAB_LABEL: &str = "New tab";
 
-/// A tab's dot: an open project's (green, breathing while it works), or the
-/// New tab's gray ring (no project, so no status).
-pub fn indicator(name: &str, working: bool) -> ProjectIndicator {
-    if name == NEW_TAB {
-        ProjectIndicator::Unloaded
-    } else {
-        project_indicator(true, working)
-    }
-}
-
-/// The name a tab's debug selectors use: the project's, or `new-tab`.
-fn selector_name(name: &str) -> &str {
-    if name == NEW_TAB {
-        "new-tab"
-    } else {
-        name
-    }
+/// A project tab's dot: green, breathing while it works (a tab's project is
+/// always loaded). The New tab has none: its `+` slot shows its `×`.
+pub fn indicator(working: bool) -> ProjectIndicator {
+    project_indicator(true, working)
 }
 
 /// One tab, as a frame draws it.
@@ -175,6 +182,9 @@ pub struct TabBarProps<'a> {
     /// Where the tabs rest, measured as they paint (the drop gap is judged
     /// against it), and a drag's start.
     pub layout: &'a SharedLayout,
+    /// How far the `+` slot has turned into the New tab, 0 (a `+`) to 1
+    /// (the New tab), eased ([`PlusMorph::phase`]).
+    pub plus_phase: f32,
 }
 
 /// The value a tab drag carries.
@@ -350,6 +360,56 @@ impl TabMenu {
     }
 }
 
+/// The `+` slot turning into the New tab and back (`new-tab-plus-morph`),
+/// owned by the window: which way it last turned, and when. Whether the
+/// window has a New tab is the window's tabs' to say; a New tab that came or
+/// went without [`Self::animate`] (a project picked on it takes its place)
+/// is drawn where it ends, without turning.
+#[derive(Debug, Default)]
+pub struct PlusMorph {
+    open: bool,
+    changed: Option<Instant>,
+}
+
+impl PlusMorph {
+    /// The `+` was clicked (`open`) or the New tab's `×` (`!open`): turn
+    /// from where it stands now.
+    pub fn animate(&mut self, open: bool, now: Instant) {
+        self.open = open;
+        self.changed = Some(now);
+    }
+
+    /// How far the slot has turned into the New tab at `now` (0 a `+`, 1
+    /// the New tab), eased on the motion module's curve, for a window that
+    /// `has_new_tab` or not. At its end under `reduce_motion`.
+    pub fn phase(&self, has_new_tab: bool, now: Instant, reduce_motion: bool) -> f32 {
+        let end = if has_new_tab { 1.0 } else { 0.0 };
+        if self.open != has_new_tab || reduce_motion {
+            return end;
+        }
+        let t = match self.changed {
+            Some(at) => now.saturating_duration_since(at).as_secs_f32() / motion::TAB_MORPH.as_secs_f32(),
+            None => 1.0,
+        };
+        if t >= 1.0 {
+            return end;
+        }
+        let eased = motion::ease_out_expo(t);
+        if has_new_tab {
+            eased
+        } else {
+            1.0 - eased
+        }
+    }
+
+    /// Whether the slot is mid-turn at `now`: draw another frame.
+    pub fn animating(&self, has_new_tab: bool, now: Instant, reduce_motion: bool) -> bool {
+        !reduce_motion
+            && self.open == has_new_tab
+            && self.changed.is_some_and(|at| now.saturating_duration_since(at) < motion::TAB_MORPH)
+    }
+}
+
 /// A menu's slide-and-fade at `now` (0..=1 on Taskpage's curve), `None`
 /// once a closed one has finished fading. Instant under `reduce_motion`.
 fn menu_phase(open: bool, changed: Option<Instant>, now: Instant, reduce_motion: bool) -> Option<f32> {
@@ -415,10 +475,12 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
             )
     });
 
-    // The strip's first rule, then each tab with the rule after it (its
-    // slot), laid out where it rests and drawn at its slide offset.
+    // The strip's first rule, then each project's tab with the rule after
+    // it (its slot), laid out where it rests and drawn at its slide offset.
+    // The New tab, always last, is the `+` slot's.
     let mut strip: Vec<AnyElement> = vec![rule(theme).into_any_element()];
-    for (ix, tab) in props.tabs.iter().enumerate() {
+    let new_tab_ix = props.tabs.iter().position(|t| t.name == NEW_TAB);
+    for (ix, tab) in props.tabs.iter().enumerate().filter(|(_, t)| t.name != NEW_TAB) {
         let look = TabLook {
             hovered: props.hovered == Some(tab.name.as_str()),
             hotkey: (props.command_held && ix < 9).then(|| tab_hotkey(ix as u8 + 1)),
@@ -445,8 +507,19 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
                 .into_any_element(),
         );
     }
-    // The `+` and its rule follow the tabs' end: in when a tab leaves, out
-    // when another window's tab opens a gap.
+    // The `+` slot and its rule follow the tabs' end: in when a tab leaves,
+    // out when another window's tab opens a gap.
+    let plus = PlusSlot {
+        new_tab: new_tab_ix.map(|ix| &props.tabs[ix]),
+        hotkey: new_tab_ix
+            .filter(|ix| props.command_held && *ix < 9)
+            .map(|ix| tab_hotkey(ix as u8 + 1)),
+        phase: props.plus_phase.clamp(0.0, 1.0),
+    };
+    let tail_measure = {
+        let layout = props.layout.clone();
+        probe(move |b| layout.borrow_mut().tail_w = Some(b.size.width.as_f32()))
+    };
     strip.push(
         div()
             .relative()
@@ -454,8 +527,9 @@ pub fn render<H: SidebarHost>(props: TabBarProps<'_>, theme: &Theme, cx: &mut Co
             .flex()
             .flex_row()
             .flex_none()
-            .child(plus_tab(theme, cx))
+            .child(plus_tab(plus, props.layout, theme, cx))
             .child(rule(theme))
+            .child(tail_measure)
             .into_any_element(),
     );
     // The bar's empty space past the `+`: the gap after the last tab, and,
@@ -570,7 +644,7 @@ pub fn tab_title(tab: &Tab) -> SharedString {
     }
 }
 
-/// One project's tab: its dot (an `×` while hovered), its host when it is
+/// One project's tab (never the New tab: the `+` slot is that): its dot (an `×` while hovered), its host when it is
 /// on another machine, its name, and its ⌘N while ⌘ is held; dragged, it
 /// moves to another place in the bar.
 fn render_tab<H: SidebarHost>(
@@ -582,8 +656,7 @@ fn render_tab<H: SidebarHost>(
     cx: &mut Context<H>,
 ) -> Stateful<Div> {
     let TabLook { hovered, hotkey, lifted } = look;
-    let new_tab = tab.name == NEW_TAB;
-    let key = selector_name(&tab.name).to_string();
+    let key = tab.name.clone();
     let selector = format!("tab-{key}");
     let name = tab.name.clone();
     let hover_name = tab.name.clone();
@@ -614,7 +687,7 @@ fn render_tab<H: SidebarHost>(
             .rounded(px(4.0))
             .cursor_pointer()
             .hover(move |s| s.bg(hover_fill))
-            .tooltip(style::tooltip(if new_tab { "Close Tab" } else { "Close Project" }))
+            .tooltip(style::tooltip("Close Project"))
             .child(
                 heroicon(icons::X_MARK_MENU)
                     .text_color(theme.gray)
@@ -626,7 +699,7 @@ fn render_tab<H: SidebarHost>(
             }))
             .into_any_element()
     } else {
-        project_menu::dot(SharedString::from(format!("tab-dot-{key}")), indicator(&tab.name, tab.working), theme)
+        project_menu::dot(SharedString::from(format!("tab-dot-{key}")), indicator(tab.working), theme)
     };
     div()
         .id(SharedString::from(selector.clone()))
@@ -675,22 +748,19 @@ fn render_tab<H: SidebarHost>(
         .on_click(cx.listener(move |this, _, window, cx| {
             this.sidebar_event(SidebarEvent::SwitchTo(name.clone()), window, cx)
         }))
-        // Its context menu, at the pointer (a project's: the New tab has
-        // no project to close).
-        .when(!new_tab, |d| {
-            d.on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
-                    menu_anchor.set(Some(Bounds::new(ev.position, Size::default())));
-                    this.sidebar_event(SidebarEvent::OpenTabMenu(menu_name.clone()), window, cx)
-                }),
-            )
-        })
+        // Its context menu, at the pointer.
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                cx.stop_propagation();
+                menu_anchor.set(Some(Bounds::new(ev.position, Size::default())));
+                this.sidebar_event(SidebarEvent::OpenTabMenu(menu_name.clone()), window, cx)
+            }),
+        )
         // A drag (past gpui's threshold, so a click stays a click) carries
         // the tab; the ghost starts where the tab sits under the pointer.
         .on_drag(drag, move |drag: &TabDrag, offset, window, cx: &mut App| {
-            let (label, indicator) = (drag.label.clone(), indicator(&drag.project, drag.working));
+            let (label, indicator) = (drag.label.clone(), indicator(drag.working));
             let tab_w = (layout.borrow().width(&drag.project) - RULE_W).max(0.0);
             let ghost = cx.new(|_| TabGhost { label, indicator, tab_w });
             {
@@ -770,30 +840,151 @@ fn render_tab_menu<H: SidebarHost>(menu: &TabMenuProps<'_>, theme: &Theme, cx: &
         .children(rows)
 }
 
-/// The `+` tab: 52pt square, Heroicons `plus`, opening a New tab (or
-/// selecting the window's).
-fn plus_tab<H: SidebarHost>(theme: &Theme, cx: &mut Context<H>) -> Stateful<Div> {
+/// The `+` slot as one frame draws it.
+struct PlusSlot<'a> {
+    /// The window's New tab, while it has one: the slot is that tab.
+    new_tab: Option<&'a Tab>,
+    /// The New tab's ⌘N while ⌘ is held.
+    hotkey: Option<String>,
+    /// How far it has turned into the New tab (0 a `+`, 1 the New tab).
+    phase: f32,
+}
+
+/// How wide the `+` slot draws `phase` of the way into the New tab whose
+/// label is `label_w` wide: 52pt square at 0, the `×`, the label and a tab's
+/// right padding at 1.
+pub(crate) fn plus_slot_w(phase: f32, label_w: f32) -> f32 {
+    let open = PLUS_LABEL_X + label_w + TAB_PAD_RIGHT;
+    TAB_BAR_H + (open - TAB_BAR_H) * phase
+}
+
+/// The `+` slot: a 52pt square Heroicons `plus` opening the New tab, which
+/// it turns into ([`PlusMorph`]): the `+` turned 45° counterclockwise into
+/// its `×`, "New tab" slid out to the right of it.
+fn plus_tab<H: SidebarHost>(
+    plus: PlusSlot<'_>,
+    layout: &SharedLayout,
+    theme: &Theme,
+    cx: &mut Context<H>,
+) -> Stateful<Div> {
+    let PlusSlot { new_tab, hotkey, phase } = plus;
+    let open = new_tab.is_some();
+    let selected = new_tab.is_some_and(|t| t.selected);
+    let label_w = layout.borrow().plus_label_w.unwrap_or(PLUS_LABEL_W_GUESS);
     let loud = theme.text_loud;
     let hover_fill = theme.background_hover;
-    div()
-        .id("tab-plus")
-        .debug_selector(|| "tab-plus".into())
-        .group("tab-plus")
-        .relative()
+    let (id, selector) = if open { ("tab-new-tab", "tab-new-tab") } else { ("tab-plus", "tab-plus") };
+
+    // The one glyph, turning: a `+` turned 45° is an `×`.
+    let glyph = heroicon(icons::PLUS)
+        .with_transformation(Transformation::rotate(radians(-FRAC_PI_4 * phase)))
+        .text_color(if open { theme.gray } else { theme.icon });
+    let close_group = SharedString::from("tab-close-new-tab");
+    let glyph = if open {
+        glyph.group_hover(close_group.clone(), move |s| s.text_color(loud))
+    } else {
+        glyph.group_hover("tab-plus", move |s| s.text_color(loud))
+    };
+    // Its box, centered in the slot's first 52pt where the `+` is: the
+    // New tab's `×` hovers as a project tab's does.
+    let close_box = div()
+        .id("tab-close-new-tab")
+        .absolute()
+        .left(px((TAB_BAR_H - PLUS_CLOSE_BOX) / 2.0))
+        .top(px((TAB_BAR_H - PLUS_CLOSE_BOX) / 2.0))
         .flex()
-        .flex_none()
         .items_center()
         .justify_center()
-        .size(px(TAB_BAR_H))
+        .size(px(PLUS_CLOSE_BOX))
+        .rounded(px(4.0))
+        .child(glyph)
+        .when(open, |d| {
+            d.debug_selector(|| "tab-close-new-tab".into())
+                .group(close_group)
+                .cursor_pointer()
+                .hover(move |s| s.bg(hover_fill))
+                .tooltip(style::tooltip("Close tab"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.sidebar_event(SidebarEvent::CloseTab(NEW_TAB.into()), window, cx)
+                }))
+        });
+
+    // "New tab" (and its ⌘N), at its natural width, sliding out from under
+    // the `×`: clipped where the `×` ends and at the tab's edge.
+    // Drawn (clipped out of sight) from the click on, so it has its width
+    // before it shows.
+    let label = (open || phase > 0.0).then(|| {
+        let measure = {
+            let layout = layout.clone();
+            canvas(
+                move |b, window, _| {
+                    let w = b.size.width.as_f32();
+                    let mut layout = layout.borrow_mut();
+                    if layout.plus_label_w != Some(w) {
+                        layout.plus_label_w = Some(w);
+                        // The slot was drawn at the last width it knew.
+                        window.request_animation_frame();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .top_0()
+            .left_0()
+            .size_full()
+        };
+        let text = div()
+            .relative()
+            .left(px(-label_w * (1.0 - phase)))
+            .flex()
+            .flex_row()
+            .flex_none()
+            .items_center()
+            .gap(px(TAB_GAP))
+            .h(px(TAB_BAR_H))
+            .opacity(phase)
+            .child(
+                div()
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .type_style(Type::BaseMedium)
+                    .text_color(theme.foreground)
+                    .child(NEW_TAB_LABEL),
+            )
+            .children(hotkey.map(|h| style::hotkey(&h, theme).px_0().debug_selector(|| "tab-hotkey-new-tab".into())))
+            .child(measure);
+        div()
+            .debug_selector(|| "tab-new-tab-label".into())
+            .absolute()
+            .flex()
+            .flex_row()
+            .top_0()
+            .bottom_0()
+            .left(px(PLUS_LABEL_X))
+            .right_0()
+            .overflow_hidden()
+            .child(text)
+    });
+
+    div()
+        .id(id)
+        .debug_selector(move || selector.into())
+        .group("tab-plus")
+        .relative()
+        .flex_none()
+        .w(px(plus_slot_w(phase, label_w)))
+        .h(px(TAB_BAR_H))
+        .overflow_hidden()
         .cursor_pointer()
-        .hover(move |s| s.bg(hover_fill))
-        .tooltip(style::tooltip("New tab"))
-        .child(
-            heroicon(icons::PLUS)
-                .text_color(theme.icon)
-                .group_hover("tab-plus", move |s| s.text_color(loud)),
-        )
-        .on_click(cx.listener(|this, _, window, cx| this.sidebar_event(SidebarEvent::NewTab, window, cx)))
+        .when(selected, |d| d.bg(theme.canvas))
+        .when(!open, |d| d.hover(move |s| s.bg(hover_fill)).tooltip(style::tooltip(NEW_TAB_LABEL)))
+        .children(label)
+        .child(close_box)
+        .on_click(cx.listener(move |this, _, window, cx| {
+            let event = if open { SidebarEvent::SwitchTo(NEW_TAB.into()) } else { SidebarEvent::NewTab };
+            this.sidebar_event(event, window, cx)
+        }))
 }
 
 #[cfg(test)]
@@ -841,10 +1032,52 @@ mod tests {
     }
 
     #[test]
-    fn the_new_tab_wears_a_gray_ring() {
-        assert_eq!(indicator(NEW_TAB, true), ProjectIndicator::Unloaded, "no project, no status");
-        assert_eq!(indicator("web", false), ProjectIndicator::LoadedIdle);
-        assert_eq!(indicator("web", true), ProjectIndicator::Working);
-        assert_eq!(selector_name(NEW_TAB), "new-tab");
+    fn a_project_tabs_dot_is_loaded() {
+        assert_eq!(indicator(false), ProjectIndicator::LoadedIdle);
+        assert_eq!(indicator(true), ProjectIndicator::Working);
+    }
+
+    #[test]
+    fn the_plus_turns_into_the_new_tab_on_the_motion_curve() {
+        let t0 = Instant::now();
+        let mut m = PlusMorph::default();
+        assert_eq!(m.phase(false, t0, false), 0.0, "a lone +");
+        m.animate(true, t0);
+        assert_eq!(m.phase(true, t0, false), 0.0, "starts as the +");
+        assert!(m.animating(true, t0, false));
+        let mid = t0 + motion::TAB_MORPH / 2;
+        let at = m.phase(true, mid, false);
+        assert!((at - motion::ease_out_expo(0.5)).abs() < 1e-4, "{at}");
+        let end = t0 + motion::TAB_MORPH;
+        assert_eq!(m.phase(true, end, false), 1.0);
+        assert!(!m.animating(true, end, false));
+        // Its `×`: back the same way.
+        m.animate(false, end);
+        assert_eq!(m.phase(false, end, false), 1.0, "starts as the New tab");
+        assert!(m.phase(false, end + motion::TAB_MORPH / 2, false) < 0.5);
+        assert_eq!(m.phase(false, end + motion::TAB_MORPH, false), 0.0);
+    }
+
+    #[test]
+    fn a_new_tab_that_comes_or_goes_unturned_is_drawn_where_it_ends() {
+        let t0 = Instant::now();
+        let mut m = PlusMorph::default();
+        m.animate(true, t0);
+        // A project picked on it took its place: the `+` is just back.
+        assert_eq!(m.phase(false, t0, false), 0.0);
+        assert!(!m.animating(false, t0, false));
+        // Reduce Motion: every turn is at its end at once.
+        m.animate(false, t0);
+        assert_eq!(m.phase(false, t0, true), 0.0);
+        m.animate(true, t0);
+        assert_eq!(m.phase(true, t0, true), 1.0);
+        assert!(!m.animating(true, t0, true));
+    }
+
+    #[test]
+    fn the_plus_slot_widens_from_its_square_to_fit_the_label() {
+        assert_eq!(plus_slot_w(0.0, 60.0), TAB_BAR_H, "the 52pt square");
+        assert_eq!(plus_slot_w(1.0, 60.0), PLUS_LABEL_X + 60.0 + TAB_PAD_RIGHT);
+        assert_eq!(plus_slot_w(0.5, 60.0), (TAB_BAR_H + PLUS_LABEL_X + 60.0 + TAB_PAD_RIGHT) / 2.0);
     }
 }

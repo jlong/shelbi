@@ -504,19 +504,6 @@ fn open_window(
     open_window_with(shelbi_orchestrator::source::local_handle(project), None, slot, state, bounds, cx)
 }
 
-/// Open a window in `slot` holding only a New tab (one torn off its window),
-/// at `bounds`: no project, the launch screen showing.
-pub(crate) fn open_new_tab_window(
-    slot: usize,
-    state: WindowState,
-    bounds: Bounds<gpui::Pixels>,
-    cx: &mut App,
-) -> Option<WindowHandle<ShelbiWindow>> {
-    let handle = open_window_as(Opening::Blank, slot, state, Some(bounds), cx)?;
-    let _ = handle.update(cx, |w, window, cx| w.open_new_tab(window, cx));
-    Some(handle)
-}
-
 /// What a window opens on: a project (on this machine, or with a remote,
 /// another's), or nothing yet (a New tab's window).
 enum Opening {
@@ -1506,6 +1493,8 @@ pub struct ShelbiWindow {
     new_tab: Option<Entity<LaunchView>>,
     /// A tab's context menu (a right-click on it).
     tab_menu: tab_bar::TabMenu,
+    /// The `+` turning into the New tab and back (`new-tab-plus-morph`).
+    plus_morph: tab_bar::PlusMorph,
     /// A tab being dragged to a new place, and the gap it is over.
     tab_reorder: tab_bar::TabReorder,
     /// The project tabs, in order (saved in [`Self::window_state`]).
@@ -2368,6 +2357,7 @@ impl ShelbiWindow {
             dragging: false,
             new_tab: None,
             tab_menu: tab_bar::TabMenu::default(),
+            plus_morph: tab_bar::PlusMorph::default(),
             tab_reorder: tab_bar::TabReorder::default(),
             tabs,
             hovered_tab: None,
@@ -3116,12 +3106,13 @@ impl ShelbiWindow {
         cx.notify();
     }
 
-    /// Select the window's New tab, adding it after the last tab when it has
-    /// none (the `+`, Switch Project…): the project shown goes as a switch
-    /// takes it, and the launch screen shows in its place with the keyboard.
+    /// Select the window's New tab, the `+` turning into it when it has none
+    /// (the `+`, Switch Project…): the project shown goes as a switch takes
+    /// it, and the launch screen shows in its place with the keyboard.
     pub(crate) fn open_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.tab_menu.close((self.clock)());
         if self.tabs.insert(NEW_TAB) {
+            self.plus_morph.animate(true, (self.clock)());
             self.tabs_changed(cx);
         }
         if let Some(launch) = self.new_tab.clone().filter(|_| self.chooser) {
@@ -3152,12 +3143,16 @@ impl ShelbiWindow {
     }
 
     /// Close the New tab (its `×`, ⌘W on it): nothing to confirm, nothing
-    /// stops. Selected, the window moves to its neighbor tab, else to the
-    /// chooser; `or_close` closes the window instead then (what was picked
-    /// came up in another window).
+    /// stops, and its `×` turns back into the `+`. Selected, the window moves
+    /// to its neighbor tab, else to the chooser; `or_close` closes the window
+    /// instead then (what was picked came up in another window, so the `+`
+    /// just comes back).
     fn close_new_tab(&mut self, or_close: bool, window: &mut Window, cx: &mut Context<Self>) {
         let neighbor = self.tabs.neighbor(NEW_TAB).map(str::to_string);
         if self.tabs.remove(NEW_TAB) {
+            if !or_close {
+                self.plus_morph.animate(false, (self.clock)());
+            }
             self.tabs_changed(cx);
         }
         if !self.on_new_tab() {
@@ -7266,6 +7261,11 @@ impl ShelbiWindow {
         if self.tab_menu.animating(now, reduce_motion) {
             window.request_animation_frame();
         }
+        let has_new_tab = self.tabs.contains(NEW_TAB);
+        let plus_phase = self.plus_morph.phase(has_new_tab, now, reduce_motion);
+        if self.plus_morph.animating(has_new_tab, now, reduce_motion) {
+            window.request_animation_frame();
+        }
         // The sidebar's sections and machine groups folding open or closed.
         self.folds.settle(now);
         if self.folds.animating(now) {
@@ -7541,6 +7541,7 @@ impl ShelbiWindow {
                     tab_menu_anchor: &self.tab_menu.anchor,
                     slide: &tab_slide,
                     layout: &self.tab_reorder.layout,
+                    plus_phase,
                 },
                 &theme,
                 cx,
@@ -7851,6 +7852,12 @@ impl ShelbiWindow {
     pub(crate) fn offscreen_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.sync_tabs(cx);
         self.open_new_tab(window, cx);
+        cx.notify();
+    }
+
+    /// Close the New tab as its `×` does (`state-plus-morph-close-*`).
+    pub(crate) fn offscreen_close_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_new_tab(false, window, cx);
         cx.notify();
     }
 
