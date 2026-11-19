@@ -2453,7 +2453,8 @@ pub fn append_migration_event(
 
 /// Append `<rfc3339> project=<project> handoff outcome=<outcome> detail=<detail>`
 /// to `~/.shelbi/events.log`. Emitted once per orchestrator handoff attempt on
-/// every teardown/reload path (quit, quit-project, reload), so a failed or
+/// every stop path (Quit Shelbi, Quit Project, `shelbi quit`, `shelbi reload`,
+/// Restart orchestrator), so a failed or
 /// unconfirmed handoff is diagnosable post-hoc — the whole flow was previously
 /// invisible in the log.
 ///
@@ -2471,6 +2472,26 @@ pub fn append_handoff_event(project: &str, outcome: &str, detail: &str) -> Resul
     let detail = sanitize_reason(detail);
     append_event_line(&format!(
         "{ts} project={project} handoff outcome={outcome} detail={detail}"
+    ))
+}
+
+/// Append `<rfc3339> project=<project> handoff outcome=<outcome> stage=launch detail=<detail>`
+/// to `~/.shelbi/events.log`: what an orchestrator *launch* did with the handoff,
+/// the reading half of [`append_handoff_event`]. Emitted once per launch (an
+/// attach to a live orchestrator launches nothing and logs nothing).
+///
+/// `outcome` is `injected` (a handoff was spliced into the new prompt and
+/// deleted once the session came up), `none` (nothing on disk to inject), or
+/// `restored` (a handoff was claimed but the launch failed, so it went back on
+/// disk for the next one; `detail` says where it failed). Same `handoff
+/// outcome=` shape as the request line, so the activity feed reads both.
+pub fn append_handoff_launch_event(project: &str, outcome: &str, detail: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let outcome = sanitize_reason(outcome);
+    let detail = sanitize_reason(detail);
+    append_event_line(&format!(
+        "{ts} project={project} handoff outcome={outcome} stage=launch detail={detail}"
     ))
 }
 
@@ -4572,6 +4593,25 @@ mod tests {
             messages,
             sanitize_reason(reason),
         )
+    }
+
+    #[test]
+    fn handoff_launch_event_line_reads_as_a_handoff_outcome() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_handoff_launch_event("alpha", "injected", "812 bytes").unwrap();
+
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let line = log.trim_end();
+        assert!(
+            line.contains("project=alpha handoff outcome=injected stage=launch detail=812_bytes"),
+            "unexpected launch line: {line}"
+        );
+
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]

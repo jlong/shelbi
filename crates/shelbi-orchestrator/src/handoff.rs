@@ -1,7 +1,11 @@
-//! Orchestrator handoff — ask the live orchestrator pane to write its
-//! in-flight state to `agents/orchestrator/handoff.md` before we kill
-//! and respawn it (on `shelbi reload`) or tear it down (on
-//! `shelbi quit`).
+//! Orchestrator handoff: ask the live orchestrator pane to write its
+//! in-flight state to the project's `handoff.md`
+//! (`~/.shelbi/projects/<name>/handoff.md`) before Shelbi stops it. Every stop
+//! path asks: Quit Shelbi (once per open project, in parallel), Quit Project
+//! and `shelbi quit` ([`crate::quit`]), `shelbi reload`, and Settings ▸
+//! Restart orchestrator ([`crate::restart_orchestrator`]). A supervisor
+//! relaunch after a crash has nobody left to ask, but its launch still claims
+//! whatever `handoff.md` is on disk.
 //!
 //! The launch that starts the next orchestrator instance claims the file and
 //! splices it into the new prompt (see
@@ -108,8 +112,8 @@ impl HandoffOutcome {
     }
 }
 
-/// Ask the live orchestrator pane to write
-/// `agents/orchestrator/handoff.md`, then poll for the file to appear
+/// Ask the live orchestrator pane to write the project's `handoff.md`, then
+/// poll for the file to appear
 /// up to [`HANDOFF_TIMEOUT`].
 ///
 /// A project-matching persisted native Codex thread returns
@@ -178,7 +182,7 @@ fn request_orchestrator_handoff_inner(project_name: &str) -> Result<HandoffOutco
     // fallback anyway.
     let _ = shelbi_state::discard_orchestrator_handoff(project_name);
 
-    let request = handoff_request_message();
+    let request = handoff_request_message(&handoff_path);
     // Deliver AND verify the submission through the shared verified-submit path
     // the worker nudges use: the Enter is sent as a separate key event after a
     // settle, then we confirm the orchestrator actually went busy (retrying
@@ -196,6 +200,9 @@ fn request_orchestrator_handoff_inner(project_name: &str) -> Result<HandoffOutco
 
     let deadline = Instant::now() + HANDOFF_TIMEOUT;
     while Instant::now() < deadline {
+        // An orchestrator still running on pre-upgrade instructions may write
+        // the old location; the migration moves that into place.
+        let _ = shelbi_state::migrate_legacy_orchestrator_handoff(project_name);
         if handoff_path.exists() {
             return Ok(HandoffOutcome::Written { path: handoff_path });
         }
@@ -372,17 +379,23 @@ pub(crate) fn uses_native_thread_continuity(persisted_native_thread: bool) -> bo
 /// the prompt parts that the orchestrator's bundled `instructions.md`
 /// `## Handoff` section also references are mirrored here so a user
 /// who customized that section still gets a sensible request.
-fn handoff_request_message() -> String {
+///
+/// It names the file both ways: `handoff.md` relative to the workdir (what the
+/// instructions say) and its absolute path, so an orchestrator whose prompt
+/// still carries a pre-upgrade path, or that has `cd`'d elsewhere, writes the
+/// one file Shelbi polls.
+fn handoff_request_message(path: &std::path::Path) -> String {
     format!(
         "[shelbi handoff request] The orchestrator pane is about to be \
-         restarted. Per the `## Handoff` section of your instructions, \
-         write `{rel}` (relative to your workdir) covering in-flight \
+         stopped or restarted. Per the `## Handoff` section of your instructions, \
+         write `{rel}` in your workdir (`{abs}`) covering in-flight \
          decisions, what you're watching for, recent context the next \
          instance should know, and anything the user asked but you \
          haven't fully answered. Free-form prose, markdown. Don't do \
          anything else — once the file lands, this pane will be torn \
          down.",
         rel = shelbi_state::ORCHESTRATOR_HANDOFF_REL,
+        abs = path.display(),
     )
 }
 
@@ -435,14 +448,13 @@ mod tests {
 
     #[test]
     fn handoff_request_message_names_the_relative_path() {
-        // Acceptance criterion: the request must point the orchestrator
-        // at `agents/orchestrator/handoff.md` so a user who customized
-        // their instructions still gets a sensible ask.
-        let msg = handoff_request_message();
-        assert!(
-            msg.contains("agents/orchestrator/handoff.md"),
-            "request missing handoff path: {msg}"
-        );
+        // The request must point the orchestrator at `handoff.md` in its
+        // workdir (the project's state root) so a user who customized their
+        // instructions still gets a sensible ask.
+        let msg = handoff_request_message(std::path::Path::new("/home/u/.shelbi/projects/p/handoff.md"));
+        assert!(msg.contains("write `handoff.md`"), "request missing handoff path: {msg}");
+        assert!(msg.contains("`/home/u/.shelbi/projects/p/handoff.md`"), "{msg}");
+        assert!(!msg.contains("agents/orchestrator"), "request names the old path: {msg}");
         // And mentions the section name so the agent knows which prompt
         // policy to follow if there's any ambiguity.
         assert!(msg.contains("Handoff"), "request missing section: {msg}");

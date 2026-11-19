@@ -59,8 +59,8 @@ enum Cmd {
     /// Print the orchestrator's bootstrap snapshot. Bare `shelbi status`
     /// emits a concise human summary; `--full` emits the LLM-consumable
     /// payload (board + workspaces + zen + handoff-presence);
-    /// `--handoff` prints `HANDOFF.md` from the project's work_dir and
-    /// deletes it. Both flags compose. The legacy `list` subcommand
+    /// `--handoff` prints the project's `handoff.md`
+    /// (`~/.shelbi/projects/<name>/handoff.md`) and deletes it. Both flags compose. The legacy `list` subcommand
     /// still prints the project-wide status catalogue.
     Status {
         #[command(subcommand)]
@@ -69,8 +69,9 @@ enum Cmd {
         /// zen, handoff-presence). Idempotent — safe to re-run.
         #[arg(long)]
         full: bool,
-        /// Print the contents of `HANDOFF.md` from the project's local
-        /// `work_dir` and delete the file. No-op when absent.
+        /// Print the contents of the project's `handoff.md`
+        /// (`~/.shelbi/projects/<name>/handoff.md`) and delete the file.
+        /// No-op when absent.
         /// Destructive; separated from `--full` so bootstrap snapshots
         /// stay safe to re-run.
         #[arg(long)]
@@ -299,7 +300,7 @@ enum Cmd {
     /// AND the orchestrator pane in place so a freshly installed binary
     /// takes effect — and edits to the orchestrator's instructions /
     /// preamble land without a manual tear-down. The previous
-    /// orchestrator is asked to write `agents/orchestrator/handoff.md`
+    /// orchestrator is asked to write the project's `handoff.md`
     /// covering its in-flight state; the new instance ingests that
     /// file (then deletes it), so reload carries the orchestrator's
     /// mid-thought context forward. Workspace panes are left alone —

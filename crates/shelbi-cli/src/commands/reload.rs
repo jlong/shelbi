@@ -13,7 +13,7 @@ use super::require_project;
 /// lands without forcing the user to recreate the project.
 ///
 /// Before respawning the orchestrator pane, the previous instance is
-/// asked to write `agents/orchestrator/handoff.md` covering its
+/// asked to write the project's `handoff.md` covering its
 /// in-flight state. The new instance ingests that file as a
 /// `<system-reminder>` block in its system prompt and deletes it, so
 /// `shelbi reload` carries the orchestrator's mid-thought context

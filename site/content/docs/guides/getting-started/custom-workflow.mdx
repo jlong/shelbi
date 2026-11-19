@@ -273,7 +273,7 @@ loads.
 `shelbi reload` reloads the whole project: it restarts the daemon,
 reattaches open clients, and replaces the orchestrator session.
 Workspaces keep running. Before the old orchestrator goes away it
-writes a handoff note (`agents/orchestrator/handoff.md`) that its
+writes a handoff note (`handoff.md` in the project's state directory) that its
 successor ingests and then deletes, so in-flight context carries over.
 The raw conversation transcript does not.
 

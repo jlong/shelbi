@@ -167,7 +167,7 @@ pub use agent_workspaces::{
     load_shared_preamble,
     materialize_default_agents, maybe_emit_claude_md_migration_hint, recommend_runner_for_new_agents, orchestrator_handoff_path,
     reset_claude_md_migration_hint, self_heal_default_agents, self_heal_orchestrator_agent,
-    claim_orchestrator_handoff, discard_orchestrator_handoff, OrchestratorHandoffClaim, AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill,
+    claim_orchestrator_handoff, discard_orchestrator_handoff, migrate_legacy_orchestrator_handoff, OrchestratorHandoffClaim, AgentDivergence, AgentMaterializeOutcome, BundledAgent, BundledSkill,
     ADVERSARIAL_AGENT,
     DEFAULT_ADVERSARIAL_INSTRUCTIONS, DEFAULT_AGENTS, DEFAULT_DEVELOPER_INSTRUCTIONS,
     DEFAULT_ORCHESTRATOR_INSTRUCTIONS, DEFAULT_QA_INSTRUCTIONS, DEFAULT_REVIEW_INSTRUCTIONS,
@@ -233,7 +233,7 @@ pub use event_log::{
     append_job_overdue_event, append_task_overdue_event, quote_event_text, split_event_words, unquote_event_value, JobEvent, append_dispatch_event, append_external_event,
     append_handoff_action_failed_event, append_handoff_refused_event,
     append_orphan_reap_failed_event,
-    append_handoff_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
+    append_handoff_event, append_handoff_launch_event, append_heartbeat_event, append_integration_event, append_issue_comment_event,
     append_limit_resume_event, append_marker_deferred_event, append_marker_skipped_event,
     append_transition_marker_event,
     append_github_merge_reconcile_event, append_merge_event, append_message_ack_event,
@@ -5308,12 +5308,12 @@ mod tests {
         std::env::set_var("SHELBI_HOME", &home);
 
         // A real task (so the tasks dir exists) plus a sentinel one level up
-        // in the project dir — exactly what `../HANDOFF` would resolve onto.
+        // in the project dir — exactly what `../handoff` would resolve onto.
         save_task("p", &make_task("keep", Column::todo(), 0), "").unwrap();
-        let sentinel = project_dir("p").unwrap().join("HANDOFF.md");
+        let sentinel = project_dir("p").unwrap().join("handoff.md");
         std::fs::write(&sentinel, "precious").unwrap();
 
-        for bad in ["../HANDOFF", "../../other/tasks/foo", "a/b", "..", "x/../y"] {
+        for bad in ["../handoff", "../../other/tasks/foo", "a/b", "..", "x/../y"] {
             // The chokepoint itself refuses to build the path.
             assert!(
                 matches!(
@@ -7685,7 +7685,7 @@ mod tests {
             // state root (workdir), never the repo, in both modes.
             assert_eq!(
                 orchestrator_handoff_path("myapp").unwrap(),
-                base.join("agents/orchestrator/handoff.md"),
+                base.join("handoff.md"),
             );
         }
         std::env::remove_var("SHELBI_HOME");

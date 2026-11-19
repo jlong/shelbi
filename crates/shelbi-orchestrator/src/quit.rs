@@ -29,11 +29,14 @@
 //!    (`shelbi_session::daemon_watchdog`). Clearing the open flag before any
 //!    session ends is what makes "quit Shelbi … and nothing restarts it" hold:
 //!    a session shutting down sees `open == false` and stays out of the way.
-//! 4. **Hand off and drain.** Quit Project asks the orchestrator for its handoff
-//!    and waits for the file, and meanwhile waits for the cancelled jobs to
-//!    acknowledge ([`crate::cancel::QuitPhase::drain`]), so a launch that passed
-//!    its last check just before step 2 has finished spawning by the time step 5
-//!    lists what's live. Both finish before any session ends.
+//! 4. **Hand off and drain.** Each quitting project's orchestrator is asked for
+//!    its handoff (`handoff.md`) and the quit waits for the file: Quit Project
+//!    asks its one project, Quit Shelbi asks every open project at once, so a
+//!    quit of several projects waits one handoff timeout, not one per project.
+//!    Meanwhile the quit waits for the cancelled jobs to acknowledge
+//!    ([`crate::cancel::QuitPhase::drain`]), so a launch that passed its last
+//!    check just before step 2 has finished spawning by the time step 5 lists
+//!    what's live. All of it finishes before any session ends.
 //! 5. **End the sessions.** Best-effort kill of the matching session processes
 //!    on the local hub and the snapshotted remote machines, all at once.
 //!
@@ -456,11 +459,25 @@ fn drain_step(phases: &[crate::cancel::QuitPhase], report: Report, poll_grace: D
     }
 }
 
-/// Ask `project`'s orchestrator for its handoff and wait for the file, as one step.
-fn handoff_step(project: &str, report: Report) {
+/// Ask `project`'s orchestrator for its handoff and wait for the file, as one
+/// step. Quit Project reports it as `handoff`; Quit Shelbi, which asks every
+/// open project at once, as `handoff:<project>`, naming the project.
+fn handoff_step(project: &str, report: Report, scope: StepScope) {
     use crate::handoff::HandoffOutcome as O;
-    let step = Timed::start(report, "handoff", "asking orchestrator for handoff");
-    let label = "asked orchestrator for handoff";
+    let (id, asking, label) = match scope {
+        StepScope::Project => (
+            "handoff".to_string(),
+            "asking orchestrator for handoff".to_string(),
+            "asked orchestrator for handoff".to_string(),
+        ),
+        StepScope::Shelbi => (
+            format!("handoff:{project}"),
+            format!("asking {project}'s orchestrator for handoff"),
+            format!("asked {project}'s orchestrator for handoff"),
+        ),
+    };
+    let step = Timed::start(report, id, asking);
+    let label = label.as_str();
     // Best-effort: a missing/timed-out handoff is degraded (next open is cold),
     // never fatal to the quit.
     match crate::handoff::request_orchestrator_handoff(project) {
@@ -474,6 +491,13 @@ fn handoff_step(project: &str, report: Report) {
         }
         Err(e) => step.done(label, Some(format!("skipped: {e}"))),
     }
+}
+
+/// Which quit a [`handoff_step`] belongs to, for how the step is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepScope {
+    Project,
+    Shelbi,
 }
 
 /// Outcome of a [`quit_project`] / [`quit_project_with`].
@@ -505,7 +529,7 @@ pub fn quit_project(project: &str, report: Report) -> QuitProjectOutcome {
     let sessions: SharedSessions = Arc::new(BackendSessions);
     logging_timing(&format!("quit-project:{project}"), report, |report| {
         quit_project_inner(project, &sessions, report, Bounds::default(), |report| {
-            handoff_step(project, report)
+            handoff_step(project, report, StepScope::Project)
         })
     })
 }
@@ -561,26 +585,41 @@ fn quit_project_inner(
     QuitProjectOutcome { ended, drained }
 }
 
-/// Quit Shelbi (production). See [`quit_shelbi_with`]. Does **not** stop the
-/// daemon itself — the caller (the daemon's control handler) stops after the
-/// client is acknowledged, so the shutdown doesn't race the reply.
+/// Quit Shelbi (production). See [`quit_shelbi_with`]. Asks every open
+/// project's orchestrator for its handoff, as Quit Project does for one. Does
+/// **not** stop the daemon itself — the caller (the daemon's control handler)
+/// stops after the client is acknowledged, so the shutdown doesn't race the
+/// reply.
 pub fn quit_shelbi(report: Report) -> QuitShelbiOutcome {
     let sessions: SharedSessions = Arc::new(BackendSessions);
     logging_timing("quit-shelbi", report, |report| {
-        quit_shelbi_inner(&sessions, report, Bounds::default())
+        quit_shelbi_inner(&sessions, report, Bounds::default(), |project, report| {
+            handoff_step(project, report, StepScope::Shelbi)
+        })
     })
 }
 
-/// Quit Shelbi against an injected [`Sessions`]: mark every open project closed
-/// (so no watchdog resurrects the daemon), drain each project's quit barrier,
-/// and end every local session plus the open projects' sessions on their remote
-/// machines. Other sessions on those machines aren't ours to end: a machine can
-/// run a hub of its own.
+/// Quit Shelbi against an injected [`Sessions`], with no handoff — the
+/// unit-test entry point: mark every open project closed (so no watchdog
+/// resurrects the daemon), drain each project's quit barrier, and end every
+/// local session plus the open projects' sessions on their remote machines.
+/// Other sessions on those machines aren't ours to end: a machine can run a hub
+/// of its own.
 pub fn quit_shelbi_with(sessions: SharedSessions) -> QuitShelbiOutcome {
-    quit_shelbi_inner(&sessions, &silent, Bounds::default())
+    quit_shelbi_inner(&sessions, &silent, Bounds::default(), |_, _| {})
 }
 
-fn quit_shelbi_inner(sessions: &SharedSessions, report: Report, bounds: Bounds) -> QuitShelbiOutcome {
+/// The shared Quit Shelbi composition. `handoff` runs once per open project,
+/// each on a thread of its own and beside the job drain, after every project
+/// is marked closed and before any session ends: the same window
+/// [`quit_project_inner`] gives its one handoff. The quit waits for the slowest
+/// of them, never their sum.
+fn quit_shelbi_inner(
+    sessions: &SharedSessions,
+    report: Report,
+    bounds: Bounds,
+    handoff: impl Fn(&str, Report) + Sync,
+) -> QuitShelbiOutcome {
     let _in_flight = QuitInFlight::enter();
 
     // 1. The machines to sweep, while the open set still names them.
@@ -597,8 +636,16 @@ fn quit_shelbi_inner(sessions: &SharedSessions, report: Report, bounds: Bounds) 
         let _ = shelbi_state::append_project_event(project, "closed", "user:quit-shelbi");
     }
 
-    // 4. Drain every closed project's barrier.
-    let drained = drain_step(&quitting, report, bounds.poll_grace);
+    // 4. Every open project's handoff (production only), all at once, while
+    //    the orchestrator sessions are still live, and the drain of every
+    //    closed project's barrier. The scope joins them all before step 5.
+    let drained = std::thread::scope(|scope| {
+        for project in &open {
+            let handoff = &handoff;
+            scope.spawn(move || handoff(project, report));
+        }
+        drain_step(&quitting, report, bounds.poll_grace)
+    });
 
     // 5. End the sessions.
     let ended = end_sessions(sessions, |_| true, &remote, report, remote_until);
@@ -644,7 +691,7 @@ impl Sessions for BackendSessions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -1232,6 +1279,145 @@ mod tests {
             .map(|s| s.id.clone())
             .collect();
         assert_eq!(ids, vec!["jobs", "handoff", "local"], "the drain doesn't wait for the handoff");
+        drop(home);
+    }
+
+    /// Records, for each kill, which projects had finished their handoff.
+    struct HandoffsAtKill {
+        handed_off: Arc<Mutex<Vec<String>>>,
+        live: Vec<String>,
+        at_kill: Mutex<Vec<Vec<String>>>,
+    }
+    impl Sessions for HandoffsAtKill {
+        fn live_names(&self, host: &Host) -> Vec<String> {
+            if host.is_local() { self.live.clone() } else { Vec::new() }
+        }
+        fn kill(&self, _host: &Host, _name: &str) {
+            let mut done = self.handed_off.lock().unwrap().clone();
+            done.sort();
+            self.at_kill.lock().unwrap().push(done);
+        }
+    }
+
+    #[test]
+    fn quit_shelbi_asks_every_open_project_for_its_handoff_before_any_session_ends() {
+        let home = Home::new("qs-handoff", &["one", "two", "shut"]);
+        shelbi_state::set_project_open("one", true).unwrap();
+        shelbi_state::set_project_open("two", true).unwrap();
+        // `shut` isn't open: nobody is asked for its handoff.
+        let handed_off = Arc::new(Mutex::new(Vec::new()));
+        let sessions = Arc::new(HandoffsAtKill {
+            handed_off: handed_off.clone(),
+            live: vec!["one/orch".into(), "two/orch".into(), "two/ws/dev".into()],
+            at_kill: Mutex::new(Vec::new()),
+        });
+        let shared: SharedSessions = sessions.clone();
+        let (steps, report) = recorder();
+        let closed_during_handoff = Mutex::new(Vec::new());
+
+        let out = quit_shelbi_inner(&shared, &report, Bounds::default(), |project, report| {
+            let step = Timed::start(report, format!("handoff:{project}"), "asking");
+            closed_during_handoff
+                .lock()
+                .unwrap()
+                .push(shelbi_state::is_project_open(project).unwrap());
+            std::thread::sleep(Duration::from_millis(100));
+            handed_off.lock().unwrap().push(project.to_string());
+            step.done("asked", None);
+        });
+
+        assert_eq!(out.closed, vec!["one", "two"]);
+        let mut asked = handed_off.lock().unwrap().clone();
+        asked.sort();
+        assert_eq!(asked, vec!["one", "two"], "every open project is asked, once");
+        assert_eq!(
+            *closed_during_handoff.lock().unwrap(),
+            vec![false, false],
+            "each project already reads closed while its handoff runs",
+        );
+        assert_eq!(
+            *sessions.at_kill.lock().unwrap(),
+            vec![vec!["one".to_string(), "two".to_string()]; 3],
+            "no session ends before every handoff has finished",
+        );
+        let finished: Vec<String> = steps
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|s| s.state != StepState::Started)
+            .map(|s| s.id.clone())
+            .collect();
+        assert_eq!(finished.last().map(String::as_str), Some("local"), "{finished:?}");
+        drop(home);
+    }
+
+    #[test]
+    fn quit_shelbi_runs_the_handoffs_at_once() {
+        // Each handoff waits until every other one has started. Run one after
+        // another, none would see the others and each would wait out its
+        // deadline; run at once, they all meet straight away. So the quit waits
+        // one handoff's time, not one per project.
+        let projects = ["p1", "p2", "p3", "p4"];
+        let home = Home::new("qs-parallel", &projects);
+        for p in projects {
+            shelbi_state::set_project_open(p, true).unwrap();
+        }
+        let started = AtomicUsize::new(0);
+        let met = Mutex::new(Vec::new());
+        let shared: SharedSessions = Arc::new(FakeSessions::new(&[]));
+
+        let begun = Instant::now();
+        quit_shelbi_inner(&shared, &silent, Bounds::default(), |_, _| {
+            started.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while started.load(Ordering::SeqCst) < projects.len() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            met.lock().unwrap().push(started.load(Ordering::SeqCst) == projects.len());
+        });
+
+        assert_eq!(*met.lock().unwrap(), vec![true; projects.len()], "the handoffs overlapped");
+        assert!(begun.elapsed() < Duration::from_secs(5), "took {:?}", begun.elapsed());
+        drop(home);
+    }
+
+    #[test]
+    fn quit_shelbi_with_dead_orchestrators_logs_pane_not_alive_and_goes_on() {
+        // The production step against this home's (absent) orchestrator
+        // sessions: each project logs its outcome and the quit doesn't wait.
+        let home = Home::new("qs-dead-orch", &["one", "two"]);
+        shelbi_state::set_project_open("one", true).unwrap();
+        shelbi_state::set_project_open("two", true).unwrap();
+        let shared: SharedSessions = Arc::new(FakeSessions::new(&["one/orch", "two/orch"]));
+        let (steps, report) = recorder();
+
+        let begun = Instant::now();
+        let out = quit_shelbi_inner(&shared, &report, Bounds::default(), |project, report| {
+            handoff_step(project, report, StepScope::Shelbi)
+        });
+
+        assert!(begun.elapsed() < Duration::from_secs(5), "took {:?}", begun.elapsed());
+        assert_eq!(out.ended, vec!["one/orch", "two/orch"]);
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap();
+        for project in ["one", "two"] {
+            assert!(
+                log.contains(&format!("project={project} handoff outcome=pane-not-alive")),
+                "{log}"
+            );
+        }
+        let steps = steps.lock().unwrap();
+        for project in ["one", "two"] {
+            let step = steps
+                .iter()
+                .find(|s| s.id == format!("handoff:{project}") && s.state != StepState::Started)
+                .unwrap_or_else(|| panic!("no finished handoff step for {project}: {steps:?}"));
+            assert_eq!(step.label, format!("asked {project}'s orchestrator for handoff"));
+            assert!(
+                matches!(&step.state, StepState::Done { note: Some(n), .. } if n == "orchestrator not running"),
+                "{step:?}"
+            );
+        }
+        drop(steps);
         drop(home);
     }
 

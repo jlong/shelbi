@@ -14,9 +14,17 @@ the project's sessions, and marks the project closed. Other projects keep
 running. Worktrees and branches are left intact, so the work picks up again the
 next time you open the project.
 
-Pass `--all` to quit Shelbi entirely: the daemon closes every project, ends all
+Pass `--all` to quit Shelbi entirely: the daemon closes every project, asks
+every open project's orchestrator for its handoff (all at once), ends all
 sessions, and then stops itself. Nothing restarts it until you open a project
 again.
+
+The handoff is the project's `handoff.md`
+(`~/.shelbi/projects/<name>/handoff.md`). The next orchestrator launch puts it
+in the new orchestrator's prompt and deletes it once that launch is up. Each
+request logs a `project=<name> handoff outcome=<outcome>` line to
+`~/.shelbi/events.log` (`written`, `pane-not-alive` when the orchestrator isn't
+running, `timeout`, and so on), and each launch logs whether it injected one.
 
 Quitting is not detaching. [`shelbi detach`](/docs/cli/detach) disconnects
 clients but leaves every session running in the background. Inside the
@@ -48,7 +56,9 @@ quick quit prints nothing extra. A step that gives up is always reported.
 Every wait has a limit. A remote machine that doesn't answer is given up on
 about six seconds after the quit starts, and the line names it; its sessions
 are left for that machine to clean up. The orchestrator's handoff is always
-written (or given up on after 30 seconds) before its session ends. Quit Project
+written (or given up on after 30 seconds) before its session ends. Quit Shelbi
+asks every project at once, so several open projects still wait 30 seconds at
+most, and an orchestrator that isn't running costs nothing. Quit Project
 and Quit Shelbi from the dashboard's palette show the same steps once the
 dashboard closes.
 
