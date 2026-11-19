@@ -74,7 +74,11 @@ use crate::error::ProtoError;
 /// v9 adds [`StateWrite::RestartOrchestrator`]: Settings ▸ Orchestrator's
 /// Restart orchestrator asks the project's daemon to hand off and replace the
 /// orchestrator session, as `shelbi reload` does, workers left running.
-pub const CONTROL_PROTOCOL_VERSION: u32 = 9;
+///
+/// v10 adds [`MutationKind::Delete`]: `shelbi issue rm` and the desktop issue
+/// pane's Delete issue go through the daemon's per-issue queue, one code path
+/// for both (a remote tracker closes or cancels where it can't delete).
+pub const CONTROL_PROTOCOL_VERSION: u32 = 10;
 
 /// Upper bound on a single control frame. Generous enough for a large issue body
 /// in an `edit`/`add`, far below the session [`crate::MAX_FRAME_LEN`].
@@ -226,6 +230,10 @@ pub enum MutationKind {
     Prioritize {
         position: u32,
     },
+    /// Delete the issue, as `shelbi issue rm` does: the filesystem board
+    /// removes it, and a remote tracker that can't delete does the nearest
+    /// durable thing (GitHub closes it as not planned, Linear cancels it).
+    Delete,
 }
 
 impl MutationKind {
@@ -241,6 +249,7 @@ impl MutationKind {
             MutationKind::Approve => "approve",
             MutationKind::Reject { .. } => "reject",
             MutationKind::Prioritize { .. } => "prioritize",
+            MutationKind::Delete => "delete",
         }
     }
 }
@@ -876,6 +885,24 @@ mod tests {
         let (back, _): (ClientMsg, usize) = decode(&bytes).unwrap();
         assert_eq!(back, msg);
         assert_eq!(MutationKind::Prioritize { position: 0 }.verb(), "prioritize");
+    }
+
+    #[test]
+    fn round_trips_a_delete_request() {
+        let msg = ClientMsg::Mutate(MutationRequest {
+            request_id: 9,
+            project: "p".into(),
+            id: "t-3".into(),
+            expected: Some(ExpectedState {
+                status: "todo".into(),
+                updated_at: "2026-11-18T00:00:00+00:00".into(),
+            }),
+            kind: MutationKind::Delete,
+        });
+        let bytes = encode(&msg).unwrap();
+        let (back, _): (ClientMsg, usize) = decode(&bytes).unwrap();
+        assert_eq!(back, msg);
+        assert_eq!(MutationKind::Delete.verb(), "delete");
     }
 
     #[test]

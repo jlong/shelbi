@@ -1,6 +1,6 @@
 //! The one library behind every issue **mutation** — `move`, `start`,
 //! `assign`/`unassign`, `edit`, `add`, `prioritize` (reorder within a column),
-//! and review `approve`/`reject`.
+//! `delete`, and review `approve`/`reject`.
 //!
 //! Historically each of these lived in `shelbi-cli` (`commands/issue.rs` and the
 //! review commands), reading the issue, running git/merge side effects, and
@@ -318,6 +318,11 @@ pub fn apply(
             let store = issue_store(project)?;
             Ok(change_note(store.as_ref(), project, id, kind.verb()))
         }
+        MutationKind::Delete => {
+            apply_delete(project, id, sink, recheck)?;
+            let store = issue_store(project)?;
+            Ok(change_note(store.as_ref(), project, id, kind.verb()))
+        }
     }
 }
 
@@ -384,6 +389,35 @@ fn apply_prioritize(
         .set_priority(id, shelbi_state::PrioMove::Set(position))
         .map_err(MutateError::backend)?;
     sink.out(&format!("✓ {id} now at slot {position} in {}", tf.task.column));
+    Ok(())
+}
+
+// --- delete ---------------------------------------------------------------
+
+/// Delete `id` (`shelbi issue rm`, the desktop issue pane's Delete issue):
+/// the store's delete, which on a remote tracker that can't delete is its
+/// nearest durable effect (GitHub closes the issue as not planned, Linear
+/// cancels it), then the column's priorities are made contiguous again and
+/// Zen's record of the issue is dropped. Prints the line the CLI always has.
+fn apply_delete(
+    project: &str,
+    id: &str,
+    sink: &mut dyn OutputSink,
+    recheck: Recheck<'_>,
+) -> Result<(), MutateError> {
+    let store = issue_store(project)?;
+    let tf = load_issue(store.as_ref(), id)?;
+    // Irreversible: a delete queued behind a change the user never saw (a
+    // start that put a worker on it) is refused rather than stranding it.
+    recheck()?;
+    store.delete(id).map_err(MutateError::backend)?;
+    store
+        .renumber(&tf.task.column)
+        .map_err(MutateError::backend)?;
+    if let Err(e) = shelbi_state::clear_zen_demotion(project, id) {
+        sink.warn(&format!("warning: clearing Zen's record of `{id}` failed: {e}"));
+    }
+    sink.out(&format!("✓ {id} deleted"));
     Ok(())
 }
 

@@ -330,6 +330,7 @@ mod tests {
                 workspaces: Vec::new(),
                 ownership: OwnershipGate::Unrestricted,
                 remote_search: false,
+                tracker: Default::default(),
             }),
             state_snapshot: None,
             workflows: Ok(vec![default_workflow(), subtask()]),

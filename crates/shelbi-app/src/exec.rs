@@ -182,6 +182,9 @@ pub enum Mutation {
         id: String,
         position: u32,
     },
+    /// Delete an issue (`shelbi issue rm`): a remote tracker that can't
+    /// delete closes or cancels it ([`crate::issue_delete::DeleteEffect`]).
+    DeleteIssue { project: String, id: String },
     /// Toggle Zen Mode for a project.
     ToggleZen { project: String },
     /// Create and open a new project: the answers the host's new-project

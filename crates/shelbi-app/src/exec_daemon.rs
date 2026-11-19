@@ -298,6 +298,7 @@ fn map_to_kind(m: &Mutation) -> Result<(String, String, MutationKind), ExecError
                 position: *position,
             },
         ),
+        Mutation::DeleteIssue { project, id } => (project.clone(), id.clone(), MutationKind::Delete),
         Mutation::ToggleZen { .. } | Mutation::AddProject { .. } => {
             return Err(ExecError::Backend(
                 "lifecycle mutation not handled by the daemon mutation executor".to_string(),

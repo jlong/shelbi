@@ -90,6 +90,7 @@ pub mod estimate;
 pub mod exec;
 pub mod exec_daemon;
 pub mod far;
+pub mod issue_delete;
 pub mod issue_edit;
 pub mod jobs;
 pub mod reminders;

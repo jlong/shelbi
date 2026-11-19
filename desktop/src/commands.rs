@@ -156,7 +156,9 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         | CommandKind::AssignIssue { .. }
         | CommandKind::PrioritizeIssue { .. }
         // The task pane's Workflow property (dt-task-inline-properties).
-        | CommandKind::SetIssueWorkflow { .. } => host.issue_command(kind),
+        | CommandKind::SetIssueWorkflow { .. }
+        // The task pane's More ▸ Delete issue…, once its confirm is answered.
+        | CommandKind::DeleteIssue { .. } => host.issue_command(kind),
         // Approve has no confirmation, in either client.
         CommandKind::ApproveReview { id } => host.approve_review(id),
         // The palette's reject carries no reason: ask for one first.
@@ -225,6 +227,7 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::AddIssue { .. } => true,
         CommandKind::PrioritizeIssue { .. } => true,
         CommandKind::SetIssueWorkflow { .. } => true,
+        CommandKind::DeleteIssue { .. } => true,
     }
 }
 
@@ -499,6 +502,7 @@ mod tests {
                 },
                 "issue:workflow:t1",
             ),
+            (CommandKind::DeleteIssue { id: s("t1") }, "issue:delete:t1"),
         ]
     }
 
@@ -563,6 +567,7 @@ mod tests {
                 | CommandKind::AddIssue { .. }
                 | CommandKind::PrioritizeIssue { .. }
                 | CommandKind::SetIssueWorkflow { .. }
+                | CommandKind::DeleteIssue { .. }
         )
     }
 

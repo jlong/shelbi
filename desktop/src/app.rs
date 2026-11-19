@@ -8231,6 +8231,7 @@ mod tests {
                 id: "t1".into(),
                 workflow: "subtask".into(),
             },
+            CommandKind::DeleteIssue { id: "t1".into() },
         ] {
             assert_eq!(calls(kind.clone()), [HostCall::IssueCommand(kind)]);
         }

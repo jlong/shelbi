@@ -288,6 +288,72 @@ fn apply_prioritize_aborts_without_reordering_when_the_recheck_reports_stale() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+#[test]
+fn apply_delete_removes_the_issue_and_closes_the_gap_in_its_column() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    for (i, id) in ["a", "b", "c"].iter().enumerate() {
+        let mut t = task(Column::todo(), id);
+        t.priority = i as u32;
+        shelbi_state::save_task("p", &t, "").unwrap();
+    }
+
+    let mut sink = RecordingSink::default();
+    let note = apply("p", "b", &MutationKind::Delete, &mut sink, &mut no_recheck()).unwrap();
+
+    assert_eq!(note.verb, "delete");
+    assert_eq!(note.status, "", "the note re-reads an issue that is gone");
+    assert_eq!(column_ids(Column::todo()), ["a", "c"]);
+    let store = issue_store("p").unwrap();
+    assert!(store.get("b").unwrap().is_none());
+    let prios: Vec<u32> = store
+        .list_in_status(&Column::todo())
+        .unwrap()
+        .into_iter()
+        .map(|tf| tf.task.priority)
+        .collect();
+    assert_eq!(prios, [0, 1], "the column is renumbered, as `issue rm` does");
+    assert!(
+        sink.lines.iter().any(|(s, t)| *s == Stream::Stdout && t == "✓ b deleted"),
+        "stdout lines: {:?}",
+        sink.lines
+    );
+
+    // A missing issue says so, the CLI's message.
+    let err = apply("p", "b", &MutationKind::Delete, &mut sink, &mut no_recheck()).unwrap_err();
+    assert_eq!(err.to_string(), "issue `b` not found");
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn apply_delete_keeps_the_issue_when_the_recheck_reports_stale() {
+    let _g = crate::test_lock::acquire();
+    let home = fresh_home();
+    std::env::set_var("SHELBI_HOME", &home);
+    shelbi_state::save_task("p", &task(Column::todo(), "a"), "").unwrap();
+
+    let stale = ExpectedState {
+        status: "todo".into(),
+        updated_at: "x".into(),
+    };
+    let mut recheck = || {
+        Err(MutateError::Stale {
+            expected: stale.clone(),
+            actual: stale.clone(),
+        })
+    };
+    let mut sink = RecordingSink::default();
+    let err = apply("p", "a", &MutationKind::Delete, &mut sink, &mut recheck).unwrap_err();
+    assert!(matches!(err, MutateError::Stale { .. }));
+    assert_eq!(column_ids(Column::todo()), ["a"]);
+
+    std::env::remove_var("SHELBI_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// Write a second project `g` into the current `SHELBI_HOME` whose board is the
 /// GitHub (remote) backend, so a test can exercise the remote-vs-local branch of
 /// [`is_stale_change`]. The YAML otherwise mirrors `fresh_home`'s project `p`.

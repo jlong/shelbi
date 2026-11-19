@@ -309,7 +309,8 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         | CommandKind::EditIssue { .. }
         | CommandKind::AddIssue { .. }
         | CommandKind::PrioritizeIssue { .. }
-        | CommandKind::SetIssueWorkflow { .. } => "board_mutations_carry_the_project",
+        | CommandKind::SetIssueWorkflow { .. }
+        | CommandKind::DeleteIssue { .. } => "board_mutations_carry_the_project",
     }
 }
 
@@ -1079,6 +1080,15 @@ fn board_mutations_carry_the_project() {
                 workflow: Some(s("subtask")),
                 expect_title: None,
                 expect_body: None,
+            },
+        ),
+        // The task pane's More ▸ Delete issue…, after its confirm: the
+        // daemon's delete, `shelbi issue rm`'s path.
+        (
+            CommandKind::DeleteIssue { id: s("T-1") },
+            Mutation::DeleteIssue {
+                project: s(PROJECT),
+                id: s("T-1"),
             },
         ),
     ] {

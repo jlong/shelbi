@@ -77,7 +77,7 @@ use crate::keys::chord_from_keystroke;
 use crate::refresh::SessionSink;
 use crate::theme::style;
 use crate::theme::Theme;
-use crate::theme::style::{Type, Typography};
+use crate::theme::style::{ButtonKind, ButtonSize, Type, Typography};
 
 /// The fallback refresh cadence (the TUI's).
 const REFRESH_INTERVAL: Duration = Duration::from_millis(750);
@@ -2194,6 +2194,48 @@ impl IssuesView {
     }
 }
 
+impl IssuesView {
+    /// The delete confirm (More ▸ Delete issue…, ⌘⌫): the issue's title,
+    /// what deleting does on this tracker, Cancel and the danger button.
+    /// A click on the scrim, Cancel and Esc all leave the issue as it is.
+    fn render_confirm_delete(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let confirm = self.state.delete_confirm()?;
+        let cancel = style::button("delete-cancel", "Cancel", ButtonKind::Ghost, ButtonSize::Base, false, theme)
+            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.state.cancel_delete();
+                this.needs_focus = true;
+                cx.notify();
+            }));
+        let delete = style::button("delete-confirm", confirm.confirm, ButtonKind::Danger, ButtonSize::Base, false, theme)
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                let intents = this.state.confirm_delete();
+                this.apply_intents(intents, window, cx);
+                this.needs_focus = true;
+                cx.notify();
+            }));
+        let dialog = style::dialog(
+            div()
+                .debug_selector(|| "delete-prompt".into())
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .w(px(super::workflow_editor::PROMPT_W))
+                .p(px(16.0)),
+            theme,
+        )
+        .child(
+            div()
+                .debug_selector(|| "delete-prompt-title".into())
+                .type_style(Type::BaseSemibold)
+                .text_color(theme.text_loud)
+                .child(confirm.title),
+        )
+        .child(super::workflow_editor::footnote(confirm.body, theme))
+        .child(div().flex().flex_row().justify_end().gap(px(8.0)).pt(px(8.0)).child(cancel).child(delete));
+        Some(centered(backdrop(theme, cx), dialog))
+    }
+}
+
 impl Render for IssuesView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_pane_editors(window, cx);
@@ -2225,6 +2267,7 @@ impl Render for IssuesView {
                 .text_color(theme.foreground)
                 .children(detail)
                 .children(self.render_assign(&theme, cx))
+                .children(self.render_confirm_delete(&theme, cx))
                 .into_any_element();
         }
         let board = self.render_board(&theme, cx);
@@ -2261,6 +2304,7 @@ impl Render for IssuesView {
             .children(detail)
             .children(self.render_dropdown(&theme, cx))
             .children(self.render_assign(&theme, cx))
+            .children(self.render_confirm_delete(&theme, cx))
             .into_any_element()
     }
 }
@@ -3195,6 +3239,51 @@ mod tests {
         click(&mut cx, "pane-more");
         cx.simulate_keystrokes("down enter");
         assert!(matches!(events.borrow().last(), Some(CommandKind::MoveIssue { .. })));
+    }
+
+    #[gpui::test]
+    fn more_ends_with_delete_which_asks_before_it_is_sent(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut busy = issue("W", "in-progress");
+        busy.task.assigned_to = Some("alpha".into());
+        let (view, mut cx) =
+            open_board_sized(cx, vec![issue("A", "todo"), busy], Some(gpui::size(px(1160.0), px(1024.0))));
+        let events = record(&view, &mut cx);
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        click(&mut cx, "pane-more");
+        assert!(drawn(&mut cx, "pane-menu-delete"));
+        let rule = bounds(&mut cx, "pane-menu-rule");
+        let delete = bounds(&mut cx, "pane-menu-delete");
+        let editor = bounds(&mut cx, "pane-menu-editor");
+        assert!(editor.bottom() <= rule.top() && rule.bottom() <= delete.top(), "last, under a rule");
+
+        // Its click asks first; Cancel sends nothing and leaves the pane.
+        click(&mut cx, "pane-menu-delete");
+        assert!(drawn(&mut cx, "delete-prompt"));
+        assert!(events.borrow().is_empty(), "nothing sent before the confirm");
+        click(&mut cx, "delete-cancel");
+        assert!(!drawn(&mut cx, "delete-prompt"));
+        assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"));
+        // Esc on the confirm does the same.
+        cx.simulate_keystrokes("cmd-backspace");
+        assert!(drawn(&mut cx, "delete-prompt"), "⌘⌫ asks too");
+        cx.simulate_keystrokes("escape");
+        assert!(!drawn(&mut cx, "delete-prompt"));
+        assert!(events.borrow().is_empty());
+        assert!(drawn(&mut cx, "task-pane"), "Esc closes the confirm, not the pane");
+        // Delete sends the registry's delete.
+        cx.simulate_keystrokes("cmd-backspace");
+        click(&mut cx, "delete-confirm");
+        assert_eq!(*events.borrow(), vec![CommandKind::DeleteIssue { id: "A".into() }]);
+        assert!(!drawn(&mut cx, "delete-prompt"));
+
+        // An active issue's row is dimmed and won't open the confirm.
+        view.update(&mut cx, |v, cx| v.open_task("W", cx));
+        click(&mut cx, "pane-more");
+        click(&mut cx, "pane-menu-delete");
+        assert!(!drawn(&mut cx, "delete-prompt"));
+        assert_eq!(events.borrow().len(), 1);
     }
 
     #[gpui::test]
