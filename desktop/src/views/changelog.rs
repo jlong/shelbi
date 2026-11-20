@@ -87,6 +87,12 @@ pub enum ChangelogEvent {
     /// Show this image in the window's lightbox (a click on a figure the
     /// column scaled down).
     OpenImage(crate::views::overlay::lightbox::LightboxImage),
+    /// Show the image menu for this image at `at` in the window (a
+    /// right-click on a figure that draws its image).
+    ImageMenu {
+        source: shelbi_app::changelog::ImageSource,
+        at: gpui::Point<Pixels>,
+    },
 }
 
 /// A key the page takes.
@@ -729,8 +735,12 @@ impl ChangelogView {
         let body = (!entry.prose().is_empty()).then(|| {
             let state = self.body_state(entry, cx);
             let page = cx.entity().downgrade();
-            let open: markdown::OpenImage = std::sync::Arc::new(move |image, _, cx| {
-                let _ = page.update(cx, |_, cx| cx.emit(ChangelogEvent::OpenImage(image)));
+            let open: markdown::OnImage = std::sync::Arc::new(move |action, _, cx| {
+                let event = match action {
+                    markdown::ImageAction::Open(image) => ChangelogEvent::OpenImage(image),
+                    markdown::ImageAction::Menu { source, at } => ChangelogEvent::ImageMenu { source, at },
+                };
+                let _ = page.update(cx, |_, cx| cx.emit(event));
             });
             markdown::body_with_state(&state, theme, entry.dir.as_deref(), Some(open))
         });
@@ -1201,11 +1211,13 @@ mod tests {
         let view = handle.root(&mut vcx).unwrap();
         let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let seen = opened.clone();
+        let menus = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let asked = menus.clone();
         vcx.update(|_, cx| {
-            cx.subscribe(&view, move |_, ev: &ChangelogEvent, _| {
-                if let ChangelogEvent::OpenImage(image) = ev {
-                    seen.borrow_mut().push(image.clone());
-                }
+            cx.subscribe(&view, move |_, ev: &ChangelogEvent, _| match ev {
+                ChangelogEvent::OpenImage(image) => seen.borrow_mut().push(image.clone()),
+                ChangelogEvent::ImageMenu { source, at } => asked.borrow_mut().push((source.clone(), *at)),
+                ChangelogEvent::OpenIssue(_) => {}
             })
             .detach();
         });
@@ -1247,6 +1259,22 @@ mod tests {
                 caption: "The wide one".into(),
             }]
         );
+        assert_eq!(scroll(&vcx), top, "the page didn't move");
+
+        // A right-click on either asks for the image menu at the pointer,
+        // and neither opens the lightbox nor moves the page.
+        opened.borrow_mut().clear();
+        for (image, file) in [(wide, &stored[0]), (small, &stored[1])] {
+            let at = image.center();
+            vcx.simulate_mouse_down(at, gpui::MouseButton::Right, gpui::Modifiers::none());
+            vcx.simulate_mouse_up(at, gpui::MouseButton::Right, gpui::Modifiers::none());
+            vcx.run_until_parked();
+            assert_eq!(
+                menus.borrow_mut().drain(..).collect::<Vec<_>>(),
+                [(shelbi_app::changelog::ImageSource::File(file.absolute.clone()), at)]
+            );
+        }
+        assert!(opened.borrow().is_empty(), "a right-click never opens the lightbox");
         assert_eq!(scroll(&vcx), top, "the page didn't move");
 
         unsafe { std::env::remove_var("SHELBI_HOME") };

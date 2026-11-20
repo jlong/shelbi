@@ -12,8 +12,10 @@
 //! column's width (never past its own), its alt text as the caption, a
 //! missing file or a remote window's image as the alt text in a placeholder.
 //! A figure scaled down to fit the column is a zoom target: a pointing hand
-//! over it, and a click hands it to the caller's [`OpenImage`] (the
-//! Changelog's lightbox, `views::overlay::lightbox`).
+//! over it, and a click hands it to the caller's [`OnImage`] (the
+//! Changelog's lightbox, `views::overlay::lightbox`). A right-click on any
+//! figure that draws an image hands it over too, with the pointer (the
+//! window's image menu, `views::image_menu`); a placeholder has neither.
 //! (The task pane's body moved to the in-place editor, `doc_editor`.) Its
 //! tests pin that Markdown bodies parse into the blocks the view renders
 //! (headings, lists, checkboxes, code, links) rather than plain text.
@@ -25,7 +27,7 @@ use std::sync::Arc;
 
 use gpui::{
     canvas, div, img, prelude::*, px, rems, App, CursorStyle, Div, ElementId, Entity, HighlightStyle, HitboxBehavior,
-    Hsla, ImgResourceLoader, Resource, SharedString, SharedUri, StyleRefinement, Window,
+    Hsla, ImgResourceLoader, MouseButton, Pixels, Point, Resource, SharedString, SharedUri, StyleRefinement, Window,
 };
 use gpui_kit::base::text::{MarkdownNode, MarkdownParseContext, TextView, TextViewState, TextViewStyle};
 use markdown::mdast::Node;
@@ -59,9 +61,20 @@ const FIGURE: &str = "shelbi-figure";
 /// The room between an image and its caption, and between figures.
 const FIGURE_GAP: f32 = 6.0;
 
-/// What a click on a scaled-down figure does with its image (the
-/// Changelog's: open it in the window's lightbox).
-pub type OpenImage = Arc<dyn Fn(LightboxImage, &mut Window, &mut App) + Send + Sync>;
+/// What the pointer asked of a figure's image.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ImageAction {
+    /// A click on a figure drawn smaller than its own size: show it in the
+    /// lightbox.
+    Open(LightboxImage),
+    /// A right-click on a figure that draws its image, at `at` in the window:
+    /// its context menu there.
+    Menu { source: ImageSource, at: Point<Pixels> },
+}
+
+/// What a figure's [`ImageAction`] does (the Changelog's: hand it to the
+/// window, for its lightbox or its image menu).
+pub type OnImage = Arc<dyn Fn(ImageAction, &mut Window, &mut App) + Send + Sync>;
 
 /// A description as Markdown over a [`TextViewState`] the caller keeps, for
 /// the text it highlights (the Changelog's search matches,
@@ -69,13 +82,13 @@ pub type OpenImage = Arc<dyn Fn(LightboxImage, &mut Window, &mut App) + Send + S
 /// checkbox rows, its image paragraphs as figures. `images` is the changelog
 /// directory relative image paths resolve against: `None` where it can't be
 /// read (a remote window), and every image shows its alt text. `open` is
-/// what a click on a figure drawn smaller than its own size does; `None`
-/// leaves figures inert.
+/// what a click on a figure drawn smaller than its own size, or a right-click
+/// on any drawn figure, does; `None` leaves figures inert.
 pub fn body_with_state(
     state: &Entity<TextViewState>,
     theme: &Theme,
     images: Option<&Path>,
-    open: Option<OpenImage>,
+    open: Option<OnImage>,
 ) -> TextView {
     let style = text_style(theme);
     let theme = *theme;
@@ -176,7 +189,7 @@ fn figure_state(source: &ImageSource, window: &mut Window, cx: &mut App) -> Figu
 fn render_figures(
     node: &MarkdownNode,
     theme: &Theme,
-    open: Option<&OpenImage>,
+    open: Option<&OnImage>,
     window: &mut Window,
     cx: &mut App,
 ) -> Div {
@@ -197,12 +210,13 @@ fn figure_column(figures: impl IntoIterator<Item = gpui::Stateful<Div>>) -> Div 
 /// image over its caption, the caption alone while it loads, or the
 /// placeholder. Its id is also its debug selector, and its image's is the id
 /// with `-image` after it. With `open`, the image is a zoom target while it
-/// is drawn smaller than its own size ([`framed`]).
+/// is drawn smaller than its own size, and a right-click on it asks for its
+/// menu ([`framed`]).
 fn figure_element(
     id: String,
     figure: &Figure,
     state: FigureState,
-    open: Option<OpenImage>,
+    open: Option<OnImage>,
     theme: &Theme,
 ) -> gpui::Stateful<Div> {
     let caption = (!figure.alt.trim().is_empty()).then(|| {
@@ -247,11 +261,11 @@ fn figure_element(
     }
 }
 
-/// A figure's way into the lightbox: its image at its own size, and what a
-/// click hands it to.
+/// A figure's way into the lightbox and its menu: its image at its own size,
+/// and what a click or a right-click hands it to.
 struct Zoom {
     image: LightboxImage,
-    open: OpenImage,
+    open: OnImage,
 }
 
 /// Whether an image `natural` wide, drawn `drawn` wide, was scaled down to
@@ -272,7 +286,9 @@ pub(crate) fn zooms(drawn: f32, natural: f32) -> bool {
 ///
 /// With `zoom`, the outer box measures itself as it lays out (a canvas over
 /// it): drawn narrower than its own width ([`zooms`]), it shows a pointing
-/// hand and a click opens it; at its own size it stays inert.
+/// hand and a click opens it; at its own size a click does nothing. A
+/// right-click asks for its menu at any size, and goes no further (no
+/// selection, no scroll); a click is left-button only, so it never opens it.
 fn framed(
     id: String,
     image: gpui::Img,
@@ -322,11 +338,19 @@ fn framed(
     .top_0()
     .left_0()
     .size_full();
-    frame.child(target).on_click(move |_, window, cx| {
-        if scaled.get() {
-            open(image.clone(), window, cx);
-        }
-    })
+    let menu = open.clone();
+    let source = image.source.clone();
+    frame
+        .child(target)
+        .on_click(move |_, window, cx| {
+            if scaled.get() {
+                open(ImageAction::Open(image.clone()), window, cx);
+            }
+        })
+        .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
+            cx.stop_propagation();
+            menu(ImageAction::Menu { source: source.clone(), at: ev.position }, window, cx);
+        })
 }
 
 /// What a figure shows when there is no image to draw: its alt text, and why
@@ -686,7 +710,7 @@ The column keeps its cards.
 
     /// A column of figures as the Changelog draws them, across the window's
     /// width, with a row under it.
-    struct Figures(Vec<(f32, f32)>, Option<OpenImage>);
+    struct Figures(Vec<(f32, f32)>, Option<OnImage>);
 
     impl Render for Figures {
         fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
@@ -757,7 +781,11 @@ The column keeps its cards.
     fn only_a_scaled_down_figure_opens_on_a_click(cx: &mut gpui::TestAppContext) {
         let opened = Arc::new(std::sync::Mutex::new(Vec::<LightboxImage>::new()));
         let seen = opened.clone();
-        let open: OpenImage = Arc::new(move |image, _, _| seen.lock().unwrap().push(image));
+        let open: OnImage = Arc::new(move |action, _, _| {
+            if let ImageAction::Open(image) = action {
+                seen.lock().unwrap().push(image);
+            }
+        });
         let shots = vec![(1200.0, 600.0), (400.0, 300.0)];
         let window = cx.add_window(|_, _| Figures(shots.clone(), Some(open)));
         let host = window.root(cx).unwrap();
@@ -785,6 +813,62 @@ The column keeps its cards.
         assert!(click(&mut vcx, 600.0, "fig-1-image").is_empty(), "the narrow shot is at its own size");
         assert!(click(&mut vcx, 1400.0, "fig-0-image").is_empty(), "a column wider than the shot");
         assert_eq!(click(&mut vcx, 1199.0, "fig-0-image").len(), 1, "a point narrower is scaled");
+    }
+
+    /// A right-click on any figure that draws its image, scaled down or not,
+    /// asks for its menu at the pointer and never opens the lightbox; a
+    /// placeholder (a missing file, a remote window's) has no menu.
+    #[gpui::test]
+    fn a_right_click_on_a_drawn_figure_asks_for_its_menu_and_a_placeholder_none(cx: &mut gpui::TestAppContext) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<ImageAction>::new()));
+        let log = seen.clone();
+        let open: OnImage = Arc::new(move |action, _, _| log.lock().unwrap().push(action));
+        let window = cx.add_window(|_, _| Figures(vec![(1200.0, 600.0), (400.0, 300.0)], Some(open)));
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_resize(gpui::size(px(600.0), px(4000.0)));
+        vcx.run_until_parked();
+        let right_click = |vcx: &mut gpui::VisualTestContext, at: Point<Pixels>| {
+            vcx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::none());
+            vcx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::none());
+            vcx.run_until_parked();
+            std::mem::take(&mut *seen.lock().unwrap())
+        };
+        for (ix, what) in [(0, "scaled down"), (1, "at its own size")] {
+            let image = vcx.debug_bounds(Box::leak(format!("fig-{ix}-image").into_boxed_str())).unwrap();
+            let at = image.origin + gpui::point(px(10.0), px(12.0));
+            assert_eq!(
+                right_click(&mut vcx, at),
+                [ImageAction::Menu {
+                    source: ImageSource::File(PathBuf::from(format!("/nonexistent/shot-{ix}.png"))),
+                    at,
+                }],
+                "{what}: the menu, at the pointer, and no lightbox"
+            );
+        }
+
+        // Placeholders draw no image, so there is nothing to right-click.
+        struct Placeholders(OnImage);
+        impl Render for Placeholders {
+            fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+                let theme = Theme::resolve(shelbi_state::ThemePreference::Dark, gpui::WindowAppearance::Dark);
+                let missing = Figure { alt: "Gone".into(), source: ImageSource::Missing("/nonexistent/gone.png".into()) };
+                let remote = Figure { alt: "There".into(), source: ImageSource::Unavailable };
+                figure_column([
+                    figure_element("ph-0".into(), &missing, FigureState::Placeholder("Image missing"), Some(self.0.clone()), &theme),
+                    figure_element("ph-1".into(), &remote, FigureState::Placeholder("Image not available here"), Some(self.0.clone()), &theme),
+                ])
+            }
+        }
+        let log = seen.clone();
+        let open: OnImage = Arc::new(move |action, _, _| log.lock().unwrap().push(action));
+        let window = cx.add_window(|_, _| Placeholders(open));
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        for selector in ["ph-0", "ph-1"] {
+            assert!(vcx.debug_bounds(Box::leak(format!("{selector}-image").into_boxed_str())).is_none());
+            let at = vcx.debug_bounds(selector).unwrap().center();
+            assert!(right_click(&mut vcx, at).is_empty(), "{selector}: a placeholder has no menu");
+        }
     }
 
     #[test]

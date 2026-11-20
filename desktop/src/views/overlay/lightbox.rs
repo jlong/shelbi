@@ -8,7 +8,8 @@
 //! [`ActiveOverlay::Lightbox`](super::ActiveOverlay). Esc, or a click
 //! anywhere (the scrim, the image, the close button), closes it, and the
 //! keys go back to the Changelog. It is drawn against the window's size
-//! every frame, so a resize re-fits it.
+//! every frame, so a resize re-fits it. A right-click on the image opens the
+//! image menu over it (`views::image_menu`), and the lightbox stays.
 //!
 //! Desktop only: the TUI's Changelog draws an image as its alt text.
 
@@ -76,7 +77,8 @@ pub fn render<H: OverlayHost>(
         .overflow_hidden()
         .shadow(style::dialog_shadow(theme))
         .children(picture.map(|p| p.size_full()))
-        .on_mouse_down(MouseButton::Left, close_on_press(cx));
+        .on_mouse_down(MouseButton::Left, close_on_press(cx))
+        .on_mouse_down(MouseButton::Right, menu_on_press(image.source.clone(), cx));
     let caption = (!image.caption.is_empty()).then(|| {
         style::dialog(
             div()
@@ -125,6 +127,20 @@ fn close_on_press<H: OverlayHost>(
     move |_, window, cx| {
         cx.stop_propagation();
         let _ = host.update(cx, |this, cx| with_overlay(this, window, cx, |_| OverlayEvent::Close));
+    }
+}
+
+/// A right-click on the image: the image menu at the pointer, the lightbox
+/// left open under it.
+fn menu_on_press<H: OverlayHost>(
+    source: ImageSource,
+    cx: &mut Context<H>,
+) -> impl Fn(&gpui::MouseDownEvent, &mut gpui::Window, &mut gpui::App) + 'static + use<H> {
+    let host = cx.entity().downgrade();
+    move |ev, window, cx| {
+        cx.stop_propagation();
+        let source = source.clone();
+        let _ = host.update(cx, |this, cx| this.open_image_menu(source, ev.position, window, cx));
     }
 }
 

@@ -1493,6 +1493,11 @@ pub struct ShelbiWindow {
     new_tab: Option<Entity<LaunchView>>,
     /// A tab's context menu (a right-click on it).
     tab_menu: tab_bar::TabMenu,
+    /// A Changelog image's context menu (a right-click on it, in the column
+    /// or the lightbox).
+    pub(crate) image_menu: Option<crate::views::image_menu::ImageMenu>,
+    /// The save panel its Download opens (injectable for tests).
+    pub(crate) save_panel: crate::views::image_menu::SavePanel,
     /// The `+` turning into the New tab and back (`new-tab-plus-morph`).
     plus_morph: tab_bar::PlusMorph,
     /// A tab being dragged to a new place, and the gap it is over.
@@ -2357,6 +2362,8 @@ impl ShelbiWindow {
             dragging: false,
             new_tab: None,
             tab_menu: tab_bar::TabMenu::default(),
+            image_menu: None,
+            save_panel: crate::views::image_menu::system_save_panel(),
             plus_morph: tab_bar::PlusMorph::default(),
             tab_reorder: tab_bar::TabReorder::default(),
             tabs,
@@ -5082,6 +5089,7 @@ impl ShelbiWindow {
         let sub = cx.subscribe_in(&changelog, window, |this, _, ev: &ChangelogEvent, window, cx| match ev {
             ChangelogEvent::OpenIssue(id) => this.open_task(id, window, cx),
             ChangelogEvent::OpenImage(image) => this.open_lightbox(image.clone(), window, cx),
+            ChangelogEvent::ImageMenu { source, at } => this.show_image_menu(source.clone(), *at, cx),
         });
         self._view_subscriptions.push(sub);
         self.changelog = Some(changelog.clone());
@@ -6027,6 +6035,65 @@ impl ShelbiWindow {
         self.open_overlay(ActiveOverlay::Lightbox(image), window, cx);
     }
 
+    /// A right-click on a Changelog image at `at`: its menu there (over the
+    /// lightbox, when that is where the image was).
+    pub(crate) fn show_image_menu(
+        &mut self,
+        source: shelbi_app::changelog::ImageSource,
+        at: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.image_menu = Some(crate::views::image_menu::ImageMenu::new(source, at));
+        cx.notify();
+    }
+
+    /// Close the image menu, if it's open; whether it was.
+    fn close_image_menu(&mut self, cx: &mut Context<Self>) -> bool {
+        let open = self.image_menu.take().is_some();
+        if open {
+            cx.notify();
+        }
+        open
+    }
+
+    /// The image menu's Download Image…: close it, ask the save panel where
+    /// (`~/Downloads`, the image's name filled in), and write the image's
+    /// bytes there off the UI thread. Cancel does nothing; a failure is the
+    /// window's toast.
+    fn download_image(&mut self, cx: &mut Context<Self>) {
+        use crate::views::image_menu;
+        let Some(menu) = self.image_menu.take() else {
+            return;
+        };
+        cx.notify();
+        if image_menu::refusal(&menu.source).is_some() {
+            return;
+        }
+        let name = image_menu::file_name(&menu.source);
+        let chosen = (self.save_panel)(&image_menu::downloads_dir(), &name, cx);
+        let http = cx.http_client();
+        let source = menu.source;
+        cx.spawn(async move |this, cx| {
+            let result = match chosen.await {
+                Ok(None) => return,
+                Ok(Some(dest)) => {
+                    let saved = dest.file_name().map_or_else(|| name.clone(), |n| n.to_string_lossy().into_owned());
+                    cx.background_spawn(image_menu::save(source, dest, http))
+                        .await
+                        .map_err(|e| format!("Couldn\u{2019}t save {saved}: {e}"))
+                }
+                Err(e) => Err(format!("Couldn\u{2019}t save {name}: {e}")),
+            };
+            if let Err(message) = result {
+                tracing::warn!(error = %message, "image download failed");
+                let _ = this.update(cx, |this, cx| {
+                    this.show_toast(Some(shelbi_app::toast::Toast::error(message)), cx)
+                });
+            }
+        })
+        .detach();
+    }
+
     /// Close the overlay and hand keys back to where focus was.
     fn close_overlay(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let closed = self.overlay.take();
@@ -6661,6 +6728,12 @@ impl ShelbiWindow {
             cx.stop_propagation();
             return;
         }
+        // Esc closes the image menu, and nothing else (the lightbox under it
+        // stays, the Changelog keeps its search).
+        if event.keystroke.key == "escape" && self.close_image_menu(cx) {
+            cx.stop_propagation();
+            return;
+        }
         if !self.chat_focused(window, cx) {
             return;
         }
@@ -7143,6 +7216,16 @@ impl OverlayHost for ShelbiWindow {
 
     fn overlay_event(&mut self, event: OverlayEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.apply_overlay_event(event, window, cx);
+    }
+
+    fn open_image_menu(
+        &mut self,
+        source: shelbi_app::changelog::ImageSource,
+        at: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_image_menu(source, at, cx);
     }
 }
 
@@ -7674,6 +7757,16 @@ impl ShelbiWindow {
         let weak = cx.entity().downgrade();
         let bar_weak = weak.clone();
         let remote_bar = self.remote_bar();
+        let image_menu = self.image_menu.as_ref().map(|menu| {
+            crate::views::image_menu::render(
+                menu,
+                &theme,
+                cx.listener(|this, _: &gpui::ClickEvent, _, cx| this.download_image(cx)),
+                cx.listener(|this, _: &gpui::MouseDownEvent, _, cx| {
+                    this.close_image_menu(cx);
+                }),
+            )
+        });
         let layer = self.overlay.as_ref().map(|o| {
             let entering = if reduce_motion {
                 None
@@ -7766,6 +7859,7 @@ impl ShelbiWindow {
             .children(new_task)
             .children(connect)
             .children(layer)
+            .children(image_menu)
             .children(probe)
             .into_any_element()
     }
@@ -8133,6 +8227,10 @@ mod mixed_tabs_tests;
 #[cfg(test)]
 #[path = "app_lightbox_tests.rs"]
 mod lightbox_tests;
+
+#[cfg(test)]
+#[path = "app_image_menu_tests.rs"]
+mod image_menu_tests;
 
 #[cfg(test)]
 mod tests {

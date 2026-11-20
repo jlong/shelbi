@@ -482,7 +482,7 @@ pub fn resolve_image(dir: Option<&Path>, url: &str) -> ImageSource {
 
 /// `%20`-style escapes decoded (a Markdown image path with a space in it).
 /// Anything that doesn't decode to UTF-8 is kept as written.
-fn percent_decode(s: &str) -> String {
+pub fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
