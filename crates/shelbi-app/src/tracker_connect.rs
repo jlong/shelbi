@@ -10,6 +10,8 @@
 //! project's whole `issue_tracker:` block, so it ends up with GitHub, Linear,
 //! or neither (the local file system), never two.
 
+pub mod flow;
+
 use serde::{Deserialize, Serialize};
 use shelbi_core::{GithubConnection, IssueTrackerBackend, IssueTrackerConfig, LinearConnection};
 

@@ -90,6 +90,7 @@ use review::{ReviewAction, ReviewInterface};
 use session::{gave_up_notice, LiveConnector, MainState, SessionManager, SessionRef};
 use settings::workspaces::PoolReader;
 use settings::{SettingsAction, SettingsShell};
+use shelbi_app::settings::SettingsPage;
 use shelbi_app::settings::keybindings::Change as KeysChange;
 use shelbi_app::settings::workspace_form::{Outcome as PoolOutcome, PoolService};
 use shelbi_app::settings::workspaces::PoolIndex;
@@ -3316,14 +3317,25 @@ impl ShellState {
     /// stops: the sessions stay attached and keep streaming, a review or
     /// workspace interface stays built, and Back returns to all of it.
     fn open_settings(&mut self) {
+        self.open_settings_at(None);
+    }
+
+    /// Open Settings on `page` (else the page last shown). Already open, it
+    /// moves to `page` the way the sidebar does (through the unsaved-edits
+    /// prompt).
+    fn open_settings_at(&mut self, page: Option<SettingsPage>) {
         if self.settings_open() {
+            if let Some(page) = page {
+                let action = self.settings.request(settings::Leave::Page(page));
+                self.apply_settings_action(action);
+            }
             return;
         }
         self.settings_return = Some(SettingsReturn {
             focus: self.client.focus(),
             selection: self.client.sidebar_selection(),
         });
-        self.settings.open();
+        self.settings.open(page);
         self.settings.project_shown(self.client.project());
         // Read again on every visit: config.yaml may have changed outside.
         self.load_settings(true);
@@ -4700,6 +4712,9 @@ impl ShellState {
             Effect::Mutate(m @ Mutation::AddIssue { .. }) => self.spawn_mutation(m, "added", "add failed"),
             // New task, over whatever is showing, on the board's workflows.
             Effect::NewIssue { project } => self.open_new_task(&project),
+            // The desktop's guided flow is a dialog; here the Issue tracker
+            // section on Settings ▸ Properties connects GitHub or Linear.
+            Effect::ConnectTracker { .. } => self.open_settings_at(Some(SettingsPage::Properties)),
             Effect::Mutate(m @ Mutation::PrioritizeIssue { .. }) => {
                 self.spawn_mutation(m, "reordered", "reorder failed")
             }
@@ -11784,6 +11799,21 @@ mod tests {
         st.dispatch_effect(Effect::OpenSettings);
         assert_eq!(st.settings.page(), shelbi_app::settings::SettingsPage::General);
         assert_eq!(st.settings.region(), settings::Region::Sidebar, "it reopens on its sidebar");
+    }
+
+    #[test]
+    fn connect_tracker_opens_settings_on_the_properties_page() {
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::ConnectTracker { project: "app".into() });
+        assert!(st.settings_open());
+        assert_eq!(st.settings.page(), SettingsPage::Properties, "the Issue tracker section's page");
+        assert_eq!(st.settings.region(), settings::Region::Page, "the keys go to the page");
+        // Already open on another page, it moves there.
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::OpenSettings);
+        assert_eq!(st.settings.page(), SettingsPage::General);
+        st.dispatch_effect(Effect::ConnectTracker { project: "app".into() });
+        assert_eq!(st.settings.page(), SettingsPage::Properties);
     }
 
     #[test]

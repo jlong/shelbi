@@ -673,11 +673,12 @@ impl SettingsShell {
     }
 
     /// Settings opened: on the last page, the selection on its row, the keys
-    /// on the sidebar.
-    pub(crate) fn open(&mut self) {
-        self.nav.open(None);
+    /// on the sidebar. Opened for one `page` (Connect to Issue Tracker's
+    /// Properties), the keys go to that page instead.
+    pub(crate) fn open(&mut self, page: Option<SettingsPage>) {
+        self.nav.open(page);
         self.stop = Stop::Page(self.nav.page());
-        self.region = Region::Sidebar;
+        self.region = if page.is_some_and(|p| p == self.nav.page()) { Region::Page } else { Region::Sidebar };
         self.guard.cancel();
         self.save_error = None;
         self.form.cancel_edit();
@@ -3879,7 +3880,7 @@ mod tests {
     #[test]
     fn arrows_and_jk_walk_the_stops_and_stop_at_the_ends() {
         let mut s = SettingsShell::default();
-        s.open();
+        s.open(None);
         let km = keymaps();
         s.handle_key(key(KeyCode::Char('j')), &km);
         assert_eq!(s.stop, Stop::Page(SettingsPage::Keybindings));
@@ -3917,7 +3918,7 @@ mod tests {
     #[test]
     fn enter_on_the_switcher_opens_it_and_tab_moves_focus() {
         let mut s = SettingsShell::default();
-        s.open();
+        s.open(None);
         let km = keymaps();
         for _ in 0..3 {
             s.handle_key(key(KeyCode::Down), &km);
@@ -3936,7 +3937,7 @@ mod tests {
             None,
         );
         let mut s = SettingsShell::default();
-        s.open();
+        s.open(None);
         s.handle_key(key(KeyCode::Char('w')), &km);
         assert_eq!(
             s.stop,
@@ -3992,7 +3993,7 @@ mod tests {
     #[test]
     fn a_dirty_page_asks_before_leaving_and_esc_cancels_first() {
         let mut s = SettingsShell::default();
-        s.open();
+        s.open(None);
         s.test_edits = Some(Ok(()));
         let km = keymaps();
         assert_eq!(s.handle_key(key(KeyCode::Esc), &km), SettingsAction::Stay);
@@ -4008,7 +4009,7 @@ mod tests {
     #[test]
     fn save_leaves_once_it_lands_and_a_failed_save_stays_with_its_error() {
         let mut s = SettingsShell::default();
-        s.open();
+        s.open(None);
         s.test_edits = Some(Err("disk full".into()));
         let km = keymaps();
         s.request(Leave::Project("beta".into()));
@@ -4082,7 +4083,7 @@ mod tests {
     /// focus on the page's first row (the theme).
     fn on_general(summary: GeneralSummary) -> SettingsShell {
         let mut s = SettingsShell::default();
-        s.open();
+        s.open(None);
         let t = s.begin_load(Some("proj"), false).unwrap();
         assert!(s.loaded(&t, Ok(summary)));
         s.set_region(Region::Page);
@@ -4495,7 +4496,7 @@ mod tests {
     #[test]
     fn terminal_explains_what_the_host_owns_and_offers_no_controls() {
         let mut s = SettingsShell::default();
-        s.open();
+        s.open(None);
         assert_eq!(s.handle_key(key(KeyCode::Char('3')), &keymaps()), SettingsAction::Load);
         assert_eq!(s.page(), SettingsPage::Terminal);
         assert!(s.actions().is_empty(), "nothing on it acts");
@@ -4563,7 +4564,7 @@ mod tests {
             assert_eq!(painted, 16, "{width}: sixteen swatches");
         }
         let mut s = SettingsShell::default();
-        s.open();
+        s.open(None);
         s.handle_key(key(KeyCode::Char('3')), &keymaps());
         for (w, h) in [(40, 12), (30, 8), (12, 4)] {
             screen(&mut s, w.max(29), h);

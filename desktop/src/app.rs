@@ -960,6 +960,7 @@ pub enum HostCall {
     OpenSettings,
     SendFeedback,
     NewIssue,
+    ConnectTracker,
     OpenAbout,
     OpenAcknowledgements,
     OpenAddProject,
@@ -1063,6 +1064,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn new_issue(&mut self) {
         self.push(HostCall::NewIssue);
+    }
+    fn connect_tracker(&mut self) {
+        self.push(HostCall::ConnectTracker);
     }
     fn open_about(&mut self) {
         self.push(HostCall::OpenAbout);
@@ -3910,6 +3914,7 @@ impl ShelbiWindow {
             HostCall::OpenSettings => self.open_settings(None, window, cx),
             HostCall::SendFeedback => self.open_feedback(window, cx),
             HostCall::NewIssue => self.open_new_task(window, cx),
+            HostCall::ConnectTracker => self.open_tracker_connect(window, cx),
             // After this update, so the window's first frame isn't nested in
             // ours (as New Window).
             HostCall::OpenAbout => cx.defer(crate::views::about::show_about),
@@ -4295,6 +4300,7 @@ impl ShelbiWindow {
             // A drag of the task pane's edge ended: the window keeps the
             // width, like the sidebar's.
             IssuesEvent::PaneWidth(width) => this.pane_width_chosen(*width, cx),
+            IssuesEvent::OpenSettings(page) => this.open_settings(Some(*page), window, cx),
         });
         self._view_subscriptions.push(sub);
         let sub = cx.observe_in(&issues, window, |this, _, window, cx| this.sync_detail_over(window, cx));
@@ -6368,6 +6374,38 @@ impl ShelbiWindow {
             .ok();
         })
         .detach();
+    }
+
+    /// `ConnectTracker`: the Connect to Issue Tracker window for this
+    /// window's project (or its open one to the front), on this machine or
+    /// through the far link.
+    fn open_tracker_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from = window.window_handle().downcast::<ShelbiWindow>();
+        let handle = self.project_handle.clone();
+        // After this update, so the flow's first frame isn't nested in ours.
+        cx.defer(move |cx| crate::views::tracker_connect::show(handle, from, cx));
+    }
+
+    /// The tracker flow wrote a connection (`message` says to what): the
+    /// board reads again, so its header and cards follow it. `view_board`
+    /// (the flow's View board) also brings this window up on the board.
+    pub(crate) fn tracker_connected(
+        &mut self,
+        view_board: bool,
+        message: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(issues) = &self.issues {
+            issues.update(cx, |view, cx| view.reload(cx));
+        }
+        if view_board {
+            window.activate_window();
+            self.run(CommandKind::ShowView(View::Issues), window, cx);
+        } else if let Some(message) = message {
+            self.flash(message, cx);
+        }
+        cx.notify();
     }
 
     /// `AddProject`: the Add Project wizard's window (or the open one to

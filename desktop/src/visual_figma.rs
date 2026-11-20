@@ -2550,6 +2550,64 @@ impl Run {
     /// 2481:8810), `add-project-defaults` (the Agent defaults, Claude Code on
     /// its default model, 2720:33054) and `add-project-settings-in-repo` /
     /// `-global` (each card selected, 2483:8653 / 2483:8897).
+    /// Connect to an Issue tracker (`tracker-connect`, Figma 2753:11686):
+    /// the chooser (2753:12002), with GitHub connected (2780:35199), and a
+    /// counted step (the Choose project frame's footer, 2753:12006).
+    /// `SHELBI_VISUAL_ONLY=tracker-connect` renders just these.
+    fn tracker_connect_windows(&mut self) {
+        use crate::views::tracker_connect::{TrackerConnectView, SIZE};
+        use shelbi_app::new_project::Tracker;
+        use shelbi_app::source::{ProjectHandle, ProjectKey};
+        use shelbi_app::tracker_connect::StatusSync;
+        use shelbi_core::{GithubConnection, IssueTrackerBackend, IssueTrackerConfig};
+
+        let service = shelbi_app::settings::tracker::TrackerService {
+            connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("offscreen".into()))),
+            linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+            sync_statuses: Arc::new(|| StatusSync::NotNeeded),
+        };
+        let github = IssueTrackerConfig {
+            backend: IssueTrackerBackend::Github,
+            github: Some(GithubConnection { repo: "jlong/shelbi".into() }),
+            ..IssueTrackerConfig::default()
+        };
+        let states: [(&str, IssueTrackerConfig, Option<Tracker>); 4] = [
+            ("tracker-select", IssueTrackerConfig::default(), None),
+            ("tracker-connected", github, None),
+            ("tracker-github-choose", IssueTrackerConfig::default(), Some(Tracker::Github)),
+            ("tracker-linear-choose", IssueTrackerConfig::default(), Some(Tracker::Linear)),
+        ];
+        for (screen, cfg, connect) in states {
+            let service = service.clone();
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                    cx.new(|cx| {
+                        let project = ProjectHandle::null(ProjectKey::local("my-project"));
+                        TrackerConnectView::new(project, service, None, window, cx)
+                    })
+                })
+                .expect("open the offscreen window");
+            let view = handle.entity(&self.cx).expect("the view");
+            let window: AnyWindowHandle = handle.into();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |v, cx| {
+                        v.loaded(Ok(cfg), window, cx);
+                        if let Some(tracker) = connect {
+                            v.edit_flow(|f| { f.connect(tracker); }, window, cx);
+                        }
+                    })
+                })
+                .unwrap();
+            self.settle_sheet(window);
+            self.settle_sheet(window);
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+    }
+
     /// `SHELBI_VISUAL_ONLY=add-project` renders just these.
     fn add_project_windows(&mut self) {
         use crate::views::add_project::{AddProjectView, Engine, SIZE};
@@ -3344,6 +3402,11 @@ impl Run {
 
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "add-project") {
             self.add_project_windows();
+            return;
+        }
+
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "tracker-connect") {
+            self.tracker_connect_windows();
             return;
         }
 

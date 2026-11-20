@@ -51,6 +51,10 @@ pub enum Effect {
     /// Open the New task dialog over the current view (a client-local
     /// dialog; its create is a [`Mutation::AddIssue`]).
     NewIssue { project: String },
+    /// Connect `project` to an issue tracker (a client-local dialog, or the
+    /// TUI's Settings page; the connection is the dialog's own
+    /// [`crate::far::Request::ConnectTracker`]).
+    ConnectTracker { project: String },
     /// Switch the client to another project.
     SwitchProject { project: String },
     /// Begin the add-project flow (the host collects the form, then calls
