@@ -96,7 +96,7 @@ use super::pane_split::{GRIP_H, GRIP_RADIUS, GRIP_W, HANDLE_H, SESSION_H, SESSIO
 use super::sidebar::{render_glyph, review_glyph, workspace_glyph};
 use super::task_panel;
 use super::tab_bar::CONTEXT_GAP;
-use super::workflow_editor::{dropdown, menu_rule, popup, MENU_W};
+use super::workflow_editor::{dropdown, menu_dropdown, MENU_W};
 use crate::assets::{heroicon, icons};
 use crate::elements::placed::{placed, MenuScroll};
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
@@ -197,11 +197,10 @@ fn workflow_label(name: &str) -> String {
 fn header(view: &IssuesView, title: String, theme: &Theme, cx: &mut Context<IssuesView>) -> Div {
     let km = view.state.keymaps();
     let close_hint = view.hint(km.popover.first_chord_for(PopoverAction::Close));
-    let cursor = match view.state.mode {
-        Mode::PaneMenu { cursor } => Some(cursor),
-        _ => None,
+    let (menu_open, cursor) = match view.state.mode {
+        Mode::PaneMenu { cursor } => (true, cursor),
+        _ => (false, None),
     };
-    let menu_open = cursor.is_some();
     // What the menu lists, read now (its rows are built while this view
     // renders, so they can't read it then).
     let rows = match (menu_open, view.state.detail_id()) {
@@ -210,13 +209,13 @@ fn header(view: &IssuesView, title: String, theme: &Theme, cx: &mut Context<Issu
     };
     view.pane_menu_scroll.follow(cursor);
     let scroll = view.pane_menu_scroll.clone();
-    let more = dropdown(
+    let more = menu_dropdown(
         menu_open,
         &view.pane_menu_anchor,
         "pane-menu",
         header_button("pane-more", icons::ELLIPSIS_VERTICAL, menu_open, theme).tooltip(style::tooltip("More")),
         move |cx| menu_items("pane-menu", rows, cursor, scroll, BoardState::choose_pane_action, cx),
-        MENU_W,
+        style::MENU_WIDTH,
         true,
         |this: &mut IssuesView, cx| {
             this.state.toggle_pane_menu();
@@ -245,10 +244,10 @@ pub(super) fn render_card_menu(view: &IssuesView, cx: &mut Context<IssuesView>) 
         return None;
     };
     let rows = menu_rows(view, id);
-    view.card_menu_scroll.follow(Some(*cursor));
+    view.card_menu_scroll.follow(*cursor);
     let theme = *cx.global::<Theme>();
-    let items = menu_items("card-menu", rows, Some(*cursor), view.card_menu_scroll.clone(), BoardState::choose_card_action, cx);
-    let menu = placed(&view.card_menu_anchor, popup("card-menu", MENU_W, &theme).children(items))
+    let items = menu_items("card-menu", rows, *cursor, view.card_menu_scroll.clone(), BoardState::choose_card_action, cx);
+    let menu = placed(&view.card_menu_anchor, style::menu_panel("card-menu", style::MENU_WIDTH, &theme).children(items))
         .gap(CONTEXT_GAP)
         .on_dismiss(cx.listener(|this, _: &MouseDownEvent, _, cx| {
             if matches!(this.state.mode, Mode::CardMenu { .. }) {
@@ -303,12 +302,12 @@ fn menu_items(
     for (ix, row) in rows.into_iter().enumerate() {
         let danger = row.action == PaneAction::Delete;
         if danger && ix > 0 {
-            items.push(menu_rule(&theme).debug_selector(move || format!("{prefix}-rule")).into_any_element());
+            items.push(style::menu_divider(&theme).debug_selector(move || format!("{prefix}-rule")).into_any_element());
         }
         let id = format!("{prefix}-{}", row.action.slug());
         let base = match &row.refusal {
-            Some(why) => style::disabled_menu_row(id, &theme).tooltip(style::tooltip(why.clone())),
-            None => style::menu_row(id, cursor == Some(ix), &theme).on_click(cx.listener(
+            Some(why) => style::disabled_menu_item(id, &theme).tooltip(style::tooltip(why.clone())),
+            None => style::menu_item(id, cursor == Some(ix), &theme).on_click(cx.listener(
                 move |this, _: &ClickEvent, window, cx| {
                     let intents = choose(&mut this.state, ix);
                     this.apply_intents(intents, window, cx);

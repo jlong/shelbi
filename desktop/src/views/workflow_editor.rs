@@ -1218,6 +1218,43 @@ pub(super) fn dropdown<V: 'static>(
     close: impl Fn(&mut V, &mut Context<V>) + 'static,
     cx: &mut Context<V>,
 ) -> Div {
+    dropdown_in(popup, open, anchor, id, button, items, width, right, toggle, close, cx)
+}
+
+/// [`dropdown`] whose items float in the Menu ([`style::menu_panel`],
+/// Figma 2879:26546): an action menu's (the Issues header's ⋮, the task
+/// pane's More), its rows [`style::menu_item`]s.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn menu_dropdown<V: 'static>(
+    open: bool,
+    anchor: &style::Anchor,
+    id: &'static str,
+    button: Stateful<Div>,
+    items: impl FnOnce(&mut Context<V>) -> Vec<AnyElement>,
+    width: f32,
+    right: bool,
+    toggle: impl Fn(&mut V, &mut Context<V>) + 'static,
+    close: impl Fn(&mut V, &mut Context<V>) + 'static,
+    cx: &mut Context<V>,
+) -> Div {
+    dropdown_in(style::menu_panel, open, anchor, id, button, items, width, right, toggle, close, cx)
+}
+
+/// [`dropdown`] with its items in `panel`'s.
+#[allow(clippy::too_many_arguments)]
+fn dropdown_in<V: 'static>(
+    panel: fn(&'static str, f32, &Theme) -> Stateful<Div>,
+    open: bool,
+    anchor: &style::Anchor,
+    id: &'static str,
+    button: Stateful<Div>,
+    items: impl FnOnce(&mut Context<V>) -> Vec<AnyElement>,
+    width: f32,
+    right: bool,
+    toggle: impl Fn(&mut V, &mut Context<V>) + 'static,
+    close: impl Fn(&mut V, &mut Context<V>) + 'static,
+    cx: &mut Context<V>,
+) -> Div {
     let button = button
         .when(open, |d| d.child(style::anchor_probe(anchor)))
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -1227,7 +1264,7 @@ pub(super) fn dropdown<V: 'static>(
     let theme = *cx.global::<Theme>();
     let panel = open.then(|| {
         let items = items(cx);
-        let menu = popup(id, width, &theme).children(items);
+        let menu = panel(id, width, &theme).children(items);
         let menu = placed(anchor, menu)
             .gap(MENU_GAP)
             .on_dismiss(cx.listener(move |this, _: &MouseDownEvent, _, cx| {

@@ -59,7 +59,8 @@
 //! handle focused, and a 20-status workflow), the board toolbar's (`state-issues-unfiltered`: no
 //! filter set; `state-issues-search`: `/` and a query typed, the cards
 //! narrowed; `state-issues-workspace-open` / `-workflow-open`: a filter
-//! chip's menu open; `state-issues-collapsed`: Backlog collapsed as node
+//! chip's menu open; `state-issues-more-menu`: the header's ⋮ menu open
+//! (2753:11687); `state-issues-collapsed`: Backlog collapsed as node
 //! 2165:94 draws it, `-long` / `-cut` under a long status name, whole and
 //! ellipsized), and the form components' sheets
 //! (`components/<name>-<theme>.png`, against the components page's PNGs;
@@ -4109,6 +4110,22 @@ impl Run {
                     cx.notify();
                 });
             }
+        }
+
+        // The header's ⋮ open (node 2753:11687): the Toolbar Button in its
+        // Select style over the Menu, as a click opens it (no row lit).
+        if let (Some(board), _, _) = self.views(handle) {
+            board.update(&mut self.cx, |v, cx| {
+                v.state_mut().toggle_header_menu();
+                cx.notify();
+            });
+        }
+        self.capture(handle, "state-issues-more-menu");
+        if let (Some(board), _, _) = self.views(handle) {
+            board.update(&mut self.cx, |v, cx| {
+                v.state_mut().mode = crate::views::board_state::Mode::Board;
+                cx.notify();
+            });
         }
 
         // `/`, then a query: the search narrows the cards as it is typed.
