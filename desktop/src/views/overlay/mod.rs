@@ -1,5 +1,6 @@
-//! The overlay layer: the command palette and the four dialogs (error log,
-//! review load, reject reason, Zen intro). Add Project is its own window
+//! The overlay layer: the command palette, the four dialogs (error log,
+//! review load, reject reason, Zen intro) and the Changelog's image lightbox
+//! ([`lightbox`], desktop only). Add Project is its own window
 //! (`views::add_project`).
 //!
 //! One overlay is open at a time, held by the window as an [`ActiveOverlay`]
@@ -15,6 +16,7 @@
 //! the per-overlay views live beside this file and in `views::palette`.
 
 pub mod error_log;
+pub mod lightbox;
 pub mod review_confirm;
 pub mod review_reject;
 pub mod zen_intro;
@@ -81,6 +83,8 @@ pub enum ActiveOverlay {
         text: review_reject::TextBounds,
     },
     ZenIntro { project: String, state: IntroState },
+    /// A Changelog image at its own size (or fit to the window).
+    Lightbox(lightbox::LightboxImage),
 }
 
 impl ActiveOverlay {
@@ -168,6 +172,7 @@ impl ActiveOverlay {
                 task_id: task_id.clone(),
             },
             ActiveOverlay::ZenIntro { .. } => nav::Overlay::ZenIntro,
+            ActiveOverlay::Lightbox(_) => nav::Overlay::Lightbox,
         }
     }
 
@@ -231,16 +236,20 @@ impl ActiveOverlay {
                 let outcome = zen::step_intro(state, chord);
                 zen_event(project, state, outcome)
             }
+            ActiveOverlay::Lightbox(_) => match chord.code {
+                Key::Esc => OverlayEvent::Close,
+                _ => OverlayEvent::Stay,
+            },
         }
     }
 
-    /// Whether a click on the backdrop closes this overlay. The palette and
-    /// the error log close; the dialogs that hold typed input or a pending
-    /// decision ignore a stray click.
+    /// Whether a click on the backdrop closes this overlay. The palette, the
+    /// error log and the lightbox close; the dialogs that hold typed input or
+    /// a pending decision ignore a stray click.
     pub fn closes_on_backdrop(&self) -> bool {
         matches!(
             self,
-            ActiveOverlay::Palette { .. } | ActiveOverlay::ErrorLog { .. }
+            ActiveOverlay::Palette { .. } | ActiveOverlay::ErrorLog { .. } | ActiveOverlay::Lightbox(_)
         )
     }
 }
@@ -356,6 +365,7 @@ pub fn render_layer<H: OverlayHost>(
             (review_reject::render(prompt, text, theme, cx), false)
         }
         ActiveOverlay::ZenIntro { state, .. } => (zen_intro::render(state, theme, cx), false),
+        ActiveOverlay::Lightbox(image) => (lightbox::render(image, size, theme, cx), false),
     };
     let closes = overlay.closes_on_backdrop();
     let phase = entering.unwrap_or(1.0);

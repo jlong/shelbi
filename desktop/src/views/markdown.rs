@@ -11,16 +11,21 @@
 //! --image` writes) as figures (a custom block, [`FIGURE`]): each image at the
 //! column's width (never past its own), its alt text as the caption, a
 //! missing file or a remote window's image as the alt text in a placeholder.
+//! A figure scaled down to fit the column is a zoom target: a pointing hand
+//! over it, and a click hands it to the caller's [`OpenImage`] (the
+//! Changelog's lightbox, `views::overlay::lightbox`).
 //! (The task pane's body moved to the in-place editor, `doc_editor`.) Its
 //! tests pin that Markdown bodies parse into the blocks the view renders
 //! (headings, lists, checkboxes, code, links) rather than plain text.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    div, img, prelude::*, px, rems, App, Div, ElementId, Entity, HighlightStyle, Hsla, ImgResourceLoader, Resource,
-    SharedString, SharedUri, StyleRefinement, Window,
+    canvas, div, img, prelude::*, px, rems, App, CursorStyle, Div, ElementId, Entity, HighlightStyle, HitboxBehavior,
+    Hsla, ImgResourceLoader, Resource, SharedString, SharedUri, StyleRefinement, Window,
 };
 use gpui_kit::base::text::{MarkdownNode, MarkdownParseContext, TextView, TextViewState, TextViewStyle};
 use markdown::mdast::Node;
@@ -28,6 +33,7 @@ use shelbi_app::changelog::{resolve_image, ImageSource};
 use shelbi_app::theme::Appearance;
 
 use crate::elements::controls;
+use crate::views::overlay::lightbox::LightboxImage;
 use crate::theme::style::{Type, Typography};
 use crate::theme::Theme;
 
@@ -53,13 +59,24 @@ const FIGURE: &str = "shelbi-figure";
 /// The room between an image and its caption, and between figures.
 const FIGURE_GAP: f32 = 6.0;
 
+/// What a click on a scaled-down figure does with its image (the
+/// Changelog's: open it in the window's lightbox).
+pub type OpenImage = Arc<dyn Fn(LightboxImage, &mut Window, &mut App) + Send + Sync>;
+
 /// A description as Markdown over a [`TextViewState`] the caller keeps, for
 /// the text it highlights (the Changelog's search matches,
 /// `TextViewState::set_range_highlights`), selectable, its task lists as
 /// checkbox rows, its image paragraphs as figures. `images` is the changelog
 /// directory relative image paths resolve against: `None` where it can't be
-/// read (a remote window), and every image shows its alt text.
-pub fn body_with_state(state: &Entity<TextViewState>, theme: &Theme, images: Option<&Path>) -> TextView {
+/// read (a remote window), and every image shows its alt text. `open` is
+/// what a click on a figure drawn smaller than its own size does; `None`
+/// leaves figures inert.
+pub fn body_with_state(
+    state: &Entity<TextViewState>,
+    theme: &Theme,
+    images: Option<&Path>,
+    open: Option<OpenImage>,
+) -> TextView {
     let style = text_style(theme);
     let theme = *theme;
     let items = style.clone();
@@ -69,7 +86,7 @@ pub fn body_with_state(state: &Entity<TextViewState>, theme: &Theme, images: Opt
         .markdown_block_parser(parse_checklist)
         .markdown_block_parser(move |node, _| parse_figures(node, dir.as_deref().map(PathBuf::as_path)))
         .markdown_block_renderer(CHECKLIST, move |node, _, _| render_checklist(node, &items, &theme))
-        .markdown_block_renderer(FIGURE, move |node, window, cx| render_figures(node, &theme, window, cx))
+        .markdown_block_renderer(FIGURE, move |node, window, cx| render_figures(node, &theme, open.as_ref(), window, cx))
 }
 
 /// One image of a [`FIGURE`] block: its alt text and where it comes from.
@@ -156,12 +173,18 @@ fn figure_state(source: &ImageSource, window: &mut Window, cx: &mut App) -> Figu
 /// A [`FIGURE`] block: each image scaled to the column's width (never past
 /// its own, keeping its aspect ratio) with its alt text as the caption; an
 /// image that can't be drawn as its alt text in a bordered placeholder.
-fn render_figures(node: &MarkdownNode, theme: &Theme, window: &mut Window, cx: &mut App) -> Div {
+fn render_figures(
+    node: &MarkdownNode,
+    theme: &Theme,
+    open: Option<&OpenImage>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Div {
     let figures = node.data::<Vec<Figure>>().cloned().unwrap_or_default();
     let start = node.source_range().map_or(0, |r| r.start);
     figure_column(figures.into_iter().enumerate().map(|(ix, figure)| {
         let state = figure_state(&figure.source, window, cx);
-        figure_element(format!("changelog-figure-{start}-{ix}"), &figure, state, theme)
+        figure_element(format!("changelog-figure-{start}-{ix}"), &figure, state, open.cloned(), theme)
     }))
 }
 
@@ -173,25 +196,42 @@ fn figure_column(figures: impl IntoIterator<Item = gpui::Stateful<Div>>) -> Div 
 /// One figure of a [`FIGURE`] block, once its source has been tried: the
 /// image over its caption, the caption alone while it loads, or the
 /// placeholder. Its id is also its debug selector, and its image's is the id
-/// with `-image` after it.
-fn figure_element(id: String, figure: &Figure, state: FigureState, theme: &Theme) -> gpui::Stateful<Div> {
+/// with `-image` after it. With `open`, the image is a zoom target while it
+/// is drawn smaller than its own size ([`framed`]).
+fn figure_element(
+    id: String,
+    figure: &Figure,
+    state: FigureState,
+    open: Option<OpenImage>,
+    theme: &Theme,
+) -> gpui::Stateful<Div> {
     let caption = (!figure.alt.trim().is_empty()).then(|| {
         div()
             .type_style(Type::Small)
             .text_color(theme.muted)
             .child(figure.alt.clone())
     });
-    let picture = match (&figure.source, state) {
+    let image = match (&figure.source, state) {
         (ImageSource::File(path), FigureState::Image { width, height }) if height > 0.0 => {
-            Some(framed(img(path.clone()), width, height, theme))
+            Some((img(path.clone()), width, height))
         }
         (ImageSource::Web(url), FigureState::Image { width, height }) if height > 0.0 => {
-            Some(framed(img(SharedUri::from(url.clone())), width, height, theme))
+            Some((img(SharedUri::from(url.clone())), width, height))
         }
         _ => None,
     };
-    let image_selector = format!("{id}-image");
-    let picture = picture.map(|p| p.debug_selector(move || image_selector.clone()));
+    let picture = image.map(|(image, width, height)| {
+        let zoom = open.map(|open| Zoom {
+            image: LightboxImage {
+                source: figure.source.clone(),
+                width,
+                height,
+                caption: figure.alt.trim().to_string(),
+            },
+            open,
+        });
+        framed(format!("{id}-image"), image, width, height, zoom, theme)
+    });
     let selector = id.clone();
     let out = div()
         .id(SharedString::from(id))
@@ -207,25 +247,86 @@ fn figure_element(id: String, figure: &Figure, state: FigureState, theme: &Theme
     }
 }
 
+/// A figure's way into the lightbox: its image at its own size, and what a
+/// click hands it to.
+struct Zoom {
+    image: LightboxImage,
+    open: OpenImage,
+}
+
+/// Whether an image `natural` wide, drawn `drawn` wide, was scaled down to
+/// fit (and so opens in the lightbox). Half a point of rounding is still
+/// its own size.
+pub(crate) fn zooms(drawn: f32, natural: f32) -> bool {
+    drawn + 0.5 < natural
+}
+
 /// An image at the column's width, at most its own, its height following
-/// from its aspect ratio.
+/// from its aspect ratio; `id` is its id and debug selector.
 ///
 /// The clamp and the ratio sit on two boxes: on one, taffy works the height
 /// out from the column's full width before `max_w` narrows it, so an image
 /// narrower than the column got the height of one as wide as the column (a
 /// gap under its caption). The outer box settles the width; the inner one,
 /// all of it, takes its height from that.
-fn framed(image: gpui::Img, width: f32, height: f32, theme: &Theme) -> Div {
-    div().w_full().max_w(px(width)).child(
-        div()
-            .w_full()
-            .aspect_ratio(width / height)
-            .rounded_md()
-            .overflow_hidden()
-            .border_1()
-            .border_color(theme.divider)
-            .child(image.size_full()),
+///
+/// With `zoom`, the outer box measures itself as it lays out (a canvas over
+/// it): drawn narrower than its own width ([`zooms`]), it shows a pointing
+/// hand and a click opens it; at its own size it stays inert.
+fn framed(
+    id: String,
+    image: gpui::Img,
+    width: f32,
+    height: f32,
+    zoom: Option<Zoom>,
+    theme: &Theme,
+) -> gpui::Stateful<Div> {
+    let selector = id.clone();
+    let frame = div()
+        .id(SharedString::from(id))
+        .debug_selector(move || selector.clone())
+        .relative()
+        .w_full()
+        .max_w(px(width))
+        .child(
+            div()
+                .w_full()
+                .aspect_ratio(width / height)
+                .rounded_md()
+                .overflow_hidden()
+                .border_1()
+                .border_color(theme.divider)
+                .child(image.size_full()),
+        );
+    let Some(Zoom { image, open }) = zoom else {
+        return frame;
+    };
+    // Set as the frame lays out, read by its click (events follow the
+    // frame that drew them).
+    let scaled = Rc::new(Cell::new(false));
+    let measured = scaled.clone();
+    let natural = image.width;
+    let target = canvas(
+        move |bounds, window, _| {
+            let zoomed = zooms(bounds.size.width.as_f32(), natural);
+            measured.set(zoomed);
+            zoomed.then(|| window.insert_hitbox(bounds, HitboxBehavior::Normal))
+        },
+        |_, hitbox, window, _| {
+            if let Some(hitbox) = hitbox {
+                window.set_cursor_style(CursorStyle::PointingHand, &hitbox);
+            }
+        },
     )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full();
+    frame.child(target).on_click(move |_, window, cx| {
+        if scaled.get() {
+            open(image.clone(), window, cx);
+        }
+    })
 }
 
 /// What a figure shows when there is no image to draw: its alt text, and why
@@ -585,7 +686,7 @@ The column keeps its cards.
 
     /// A column of figures as the Changelog draws them, across the window's
     /// width, with a row under it.
-    struct Figures(Vec<(f32, f32)>);
+    struct Figures(Vec<(f32, f32)>, Option<OpenImage>);
 
     impl Render for Figures {
         fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
@@ -595,7 +696,7 @@ The column keeps its cards.
                     alt: format!("Shot {ix}"),
                     source: ImageSource::File(PathBuf::from(format!("/nonexistent/shot-{ix}.png"))),
                 };
-                figure_element(format!("fig-{ix}"), &figure, FigureState::Image { width, height }, &theme)
+                figure_element(format!("fig-{ix}"), &figure, FigureState::Image { width, height }, self.1.clone(), &theme)
             });
             div()
                 .flex()
@@ -614,7 +715,7 @@ The column keeps its cards.
     fn a_figure_is_as_tall_as_its_image_and_caption_at_any_column_width(cx: &mut gpui::TestAppContext) {
         // Crown & Keep's phone screenshots, and a wide one.
         let shots = vec![(460.0, 1000.0), (750.0, 1000.0), (1200.0, 600.0)];
-        let window = cx.add_window(|_, _| Figures(shots.clone()));
+        let window = cx.add_window(|_, _| Figures(shots.clone(), None));
         let host = window.root(cx).unwrap();
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         // Wider than every image, between them, and narrower than all.
@@ -647,6 +748,51 @@ The column keeps its cards.
             let after = vcx.debug_bounds("after").unwrap();
             assert_eq!(Some(after.top()), prev_bottom, "{column}pt: nothing under the last figure");
         }
+    }
+
+    /// A figure the column scaled down opens on a click, with its image at
+    /// its own size; one drawn at its own size doesn't, and the same figure
+    /// stops opening once the column is wide enough for it.
+    #[gpui::test]
+    fn only_a_scaled_down_figure_opens_on_a_click(cx: &mut gpui::TestAppContext) {
+        let opened = Arc::new(std::sync::Mutex::new(Vec::<LightboxImage>::new()));
+        let seen = opened.clone();
+        let open: OpenImage = Arc::new(move |image, _, _| seen.lock().unwrap().push(image));
+        let shots = vec![(1200.0, 600.0), (400.0, 300.0)];
+        let window = cx.add_window(|_, _| Figures(shots.clone(), Some(open)));
+        let host = window.root(cx).unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let click = |vcx: &mut gpui::VisualTestContext, column: f32, selector: &'static str| {
+            vcx.simulate_resize(gpui::size(px(column), px(4000.0)));
+            host.update(vcx, |_, cx| cx.notify());
+            vcx.run_until_parked();
+            let at = vcx.debug_bounds(selector).unwrap().center();
+            vcx.simulate_click(at, gpui::Modifiers::none());
+            vcx.run_until_parked();
+            std::mem::take(&mut *opened.lock().unwrap())
+        };
+        let got = click(&mut vcx, 600.0, "fig-0-image");
+        assert_eq!(
+            got,
+            [LightboxImage {
+                source: ImageSource::File(PathBuf::from("/nonexistent/shot-0.png")),
+                width: 1200.0,
+                height: 600.0,
+                caption: "Shot 0".into(),
+            }],
+            "the wide shot, scaled to 600pt, opens at its own size"
+        );
+        assert!(click(&mut vcx, 600.0, "fig-1-image").is_empty(), "the narrow shot is at its own size");
+        assert!(click(&mut vcx, 1400.0, "fig-0-image").is_empty(), "a column wider than the shot");
+        assert_eq!(click(&mut vcx, 1199.0, "fig-0-image").len(), 1, "a point narrower is scaled");
+    }
+
+    #[test]
+    fn a_figure_zooms_only_when_drawn_smaller_than_its_own_width() {
+        assert!(zooms(600.0, 1200.0));
+        assert!(!zooms(1200.0, 1200.0));
+        assert!(!zooms(1199.6, 1200.0), "rounding");
+        assert!(!zooms(400.0, 300.0));
     }
 
     #[test]

@@ -94,3 +94,24 @@ The Figma file draws the sidebar row (the Navigation component's
   `state-changelog-search` ("board") and `state-changelog-next` (J twice),
   with checks for each. The captures are in
   `~/.shelbi/projects/shelbi/design-refs/changelog-desktop/`.
+
+## The image lightbox (`changelog-lightbox`)
+
+An image the column scaled down (drawn narrower than its own width) is a
+zoom target: a pointing hand over it, and a click opens it in a lightbox
+over the window (`src/views/overlay/lightbox.rs`). An image already at its
+own size, and a placeholder, stay inert.
+
+- The figure measures itself as it lays out (a canvas over its frame in
+  `views/markdown.rs`), so the cursor and the click follow the column's
+  width as the window resizes. The click goes out as
+  `ChangelogEvent::OpenImage`, and the window opens
+  `ActiveOverlay::Lightbox` (`nav::Overlay::Lightbox`) on the overlay layer.
+- The image is drawn at its own size, or scaled down uniformly to fit the
+  window less 32pt on each side and its footer (`lightbox::fit`), centered
+  on the dimmed scrim. The footer holds the caption (the alt text) and a
+  close button. It is fitted against the window every frame, so a resize
+  re-fits it.
+- Esc, or a click on the scrim, the image or the close button, closes it;
+  the keys go back to the Changelog, which keeps its scroll. Its entrance is
+  the overlay layer's slide-and-fade, drawn in place under Reduce Motion.

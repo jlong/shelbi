@@ -178,6 +178,9 @@ libc = "0.2"
 gpui = { package = "gpui-pre", version = "=0.3.9", features = ["test-support"] }
 # Issue fixtures in the board tests carry timestamps.
 chrono = "0.4"
+# The Changelog's lightbox tests write real PNGs (gpui decodes with it, so
+# it's already in the tree).
+image = { version = "0.25", default-features = false, features = ["png"] }
 # Settings ▸ Workspaces' tests build their pools from the shared fixtures.
 shelbi-app = { path = "../crates/shelbi-app", features = ["test-support"] }
 # `test_support::write_executable` for stubs the tests execute.
