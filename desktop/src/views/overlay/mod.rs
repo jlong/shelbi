@@ -83,8 +83,9 @@ pub enum ActiveOverlay {
         text: review_reject::TextBounds,
     },
     ZenIntro { project: String, state: IntroState },
-    /// A Changelog image at its own size (or fit to the window).
-    Lightbox(lightbox::LightboxImage),
+    /// A Changelog image at its own size (or fit to the window), with the
+    /// page's other images to step to.
+    Lightbox(lightbox::Lightbox),
 }
 
 impl ActiveOverlay {
@@ -236,10 +237,26 @@ impl ActiveOverlay {
                 let outcome = zen::step_intro(state, chord);
                 zen_event(project, state, outcome)
             }
-            ActiveOverlay::Lightbox(_) => match chord.code {
-                Key::Esc => OverlayEvent::Close,
-                _ => OverlayEvent::Stay,
-            },
+            ActiveOverlay::Lightbox(lightbox) => {
+                if chord.code == Key::Esc {
+                    return OverlayEvent::Close;
+                }
+                if let Some(by) = lightbox::step_for(&chord) {
+                    lightbox.step(by);
+                }
+                OverlayEvent::Stay
+            }
+        }
+    }
+
+    /// How long the overlay takes to come in, and the curve it comes in
+    /// on: the dialogs' slide-and-fade, or the lightbox's image growing
+    /// from its place on the page.
+    pub fn entrance(&self) -> (std::time::Duration, fn(f32) -> f32) {
+        use crate::theme::motion;
+        match self {
+            ActiveOverlay::Lightbox(_) => (motion::LIGHTBOX_GROW, motion::ease_out_smooth),
+            _ => (motion::DIALOG_IN, motion::ease_out_expo),
         }
     }
 
@@ -337,9 +354,13 @@ pub fn with_overlay<H: OverlayHost>(
 }
 
 /// The dimmed backdrop's color: the palette's scrim (Taskpage's slate-700
-/// at partial strength; black-700 in dark).
-fn backdrop(theme: &Theme) -> Hsla {
-    theme.scrim
+/// at partial strength; black-700 in dark), or the lightbox's much darker
+/// one under an image.
+fn backdrop(overlay: &ActiveOverlay, theme: &Theme) -> Hsla {
+    match overlay {
+        ActiveOverlay::Lightbox(_) => lightbox::scrim(),
+        _ => theme.scrim,
+    }
 }
 
 /// Draw `overlay` over the whole window: a dimmed backdrop that swallows the
@@ -356,6 +377,7 @@ pub fn render_layer<H: OverlayHost>(
     entering: Option<f32>,
     keymaps: &Keymaps,
     theme: &Theme,
+    window: &mut Window,
     cx: &mut Context<H>,
 ) -> AnyElement {
     // Overlays are opaque over a translucent window, so they stay readable.
@@ -375,15 +397,24 @@ pub fn render_layer<H: OverlayHost>(
             (review_reject::render(prompt, text, theme, cx), false)
         }
         ActiveOverlay::ZenIntro { state, .. } => (zen_intro::render(state, theme, cx), false),
-        ActiveOverlay::Lightbox(image) => (lightbox::render(image, size, theme, cx), false),
+        // It draws its own entrance (the image growing from the page) over
+        // the whole window.
+        ActiveOverlay::Lightbox(lightbox) => {
+            (lightbox::render(lightbox, size, entering, theme, window, cx), false)
+        }
     };
     let closes = overlay.closes_on_backdrop();
     let phase = entering.unwrap_or(1.0);
-    let panel = div()
-        .relative()
-        .top(px((1.0 - phase) * crate::theme::motion::SLIDE_PX))
-        .opacity(phase)
-        .child(panel);
+    let panel = if matches!(overlay, ActiveOverlay::Lightbox(_)) {
+        panel
+    } else {
+        div()
+            .relative()
+            .top(px((1.0 - phase) * crate::theme::motion::SLIDE_PX))
+            .opacity(phase)
+            .child(panel)
+            .into_any_element()
+    };
     div()
         .id("overlay-layer")
         .debug_selector(|| "overlay-layer".into())
@@ -392,7 +423,7 @@ pub fn render_layer<H: OverlayHost>(
         .left_0()
         .size_full()
         .occlude()
-        .bg(backdrop(theme).opacity(phase))
+        .bg(backdrop(overlay, theme).opacity(phase))
         .flex()
         .flex_col()
         .items_center()
@@ -694,7 +725,7 @@ mod render_tests {
             div()
                 .relative()
                 .size_full()
-                .children(self.overlay.as_ref().map(|o| render_layer(o, size, None, &keymaps, &theme, cx)))
+                .children(self.overlay.as_ref().map(|o| render_layer(o, size, None, &keymaps, &theme, window, cx)))
         }
     }
 

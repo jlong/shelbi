@@ -109,7 +109,7 @@ fn a_right_click_on_the_lightbox_image_opens_the_menu_over_it(cx: &mut TestAppCo
     let source = ImageSource::File(PathBuf::from("/nonexistent/wide.png"));
     let image = LightboxImage { source: source.clone(), width: 800.0, height: 400.0, caption: "Wide".into() };
     let window = h.window.clone();
-    h.cx.update(|win, cx| window.update(cx, |w, cx| w.open_lightbox(image, win, cx)));
+    h.cx.update(|win, cx| window.update(cx, |w, cx| w.open_lightbox(crate::views::overlay::lightbox::Lightbox::single(image), win, cx)));
     h.draw();
     assert!(lightbox_open(&h));
     let at = h.cx.debug_bounds("lightbox-image").expect("the lightbox's image").center();
@@ -131,7 +131,7 @@ fn a_right_click_on_the_lightbox_image_opens_the_menu_over_it(cx: &mut TestAppCo
     // A press outside it closes it, and goes no further: the lightbox's
     // own close-on-click doesn't fire.
     let image = LightboxImage { source: ImageSource::File("/nonexistent/wide.png".into()), width: 800.0, height: 400.0, caption: String::new() };
-    h.cx.update(|win, cx| window.update(cx, |w, cx| w.open_lightbox(image, win, cx)));
+    h.cx.update(|win, cx| window.update(cx, |w, cx| w.open_lightbox(crate::views::overlay::lightbox::Lightbox::single(image), win, cx)));
     h.draw();
     let at = h.cx.debug_bounds("lightbox-image").unwrap().center();
     h.cx.simulate_mouse_down(at, gpui::MouseButton::Right, gpui::Modifiers::none());

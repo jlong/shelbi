@@ -8,7 +8,8 @@
 //! "Don't stop until…", `dt-figma-qa-task-panels`). [`clamped_text`] wraps
 //! with the real shaper, finds where the last allowed line starts, and fits
 //! as much of the rest as the line holds beside the ellipsis. It paints in
-//! the inherited text style and, like a plain string, carries no
+//! the inherited text style (its alignment too, so a `.text_center()`
+//! parent centers each line) and, like a plain string, carries no
 //! accessibility role.
 
 use std::cell::RefCell;
@@ -111,9 +112,10 @@ impl Element for ClampedText {
         cx: &mut App,
     ) {
         let (lines, line_height) = &*shaped.borrow();
+        let align: TextAlign = window.text_style().text_align;
         let mut origin = bounds.origin;
         for line in lines {
-            let _ = line.paint(origin, *line_height, TextAlign::Left, Some(bounds), window, cx);
+            let _ = line.paint(origin, *line_height, align, Some(bounds), window, cx);
             origin.y += line.size(*line_height).height;
         }
     }

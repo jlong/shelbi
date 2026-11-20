@@ -6030,7 +6030,7 @@ impl ShelbiWindow {
     /// the page keeps its scroll: the overlay draws over it).
     pub(crate) fn open_lightbox(
         &mut self,
-        image: crate::views::overlay::lightbox::LightboxImage,
+        image: crate::views::overlay::lightbox::Lightbox,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -7821,16 +7821,16 @@ impl ShelbiWindow {
             let entering = if reduce_motion {
                 None
             } else {
+                let (length, ease) = o.entrance();
                 self.overlay_opened.and_then(|at| {
-                    let t = now.saturating_duration_since(at).as_secs_f32()
-                        / theme::motion::DIALOG_IN.as_secs_f32();
-                    (t < 1.0).then(|| theme::motion::ease_out_expo(t))
+                    let t = now.saturating_duration_since(at).as_secs_f32() / length.as_secs_f32();
+                    (t < 1.0).then(|| ease(t))
                 })
             };
             if entering.is_some() {
                 window.request_animation_frame();
             }
-            overlay::render_layer(o, window.viewport_size(), entering, &self.keymaps, &theme, cx)
+            overlay::render_layer(o, window.viewport_size(), entering, &self.keymaps, &theme, window, cx)
         });
         // Edit ▸ Cut / Copy / Paste / Select All: a focused terminal handles
         // them itself; an open overlay takes paste (and the error log's copy)
