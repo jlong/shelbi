@@ -77,6 +77,28 @@ The orchestrator writes each entry for people and agents reading it later:
   UI, and other artifacts a reader would want, such as a benchmark or a log
   (`--attach`). See [images and attachments](/docs/cli/changelog#images-and-attachments).
 
+## Releases on the timeline
+
+A timeline runs down the left of the Changelog page: a tick beside each entry,
+and a marker wherever the project made a release, labeled with the release
+and its date. Each marker sits between the entries merged before and after
+it, so you can see what went out in each release.
+
+What counts as a release follows the project's own convention, so you set it
+in the [project config](/docs/configuration/project#releases): a glob over the
+repository's git tags. Shelbi tags its releases `v0.14.0`; an iOS app that
+ships through TestFlight might tag `testflight/1.2.0-1`:
+
+```yaml
+releases:
+  tags: "testflight/*"
+  label: "TestFlight {version}"
+```
+
+With no `releases:` block the timeline shows the ticks alone. Tags are read
+from the repository on the hub, never fetched, and re-read when the page opens
+or the Changelog changes.
+
 ## Features and subtasks
 
 A feature split into subtasks ships once. Each subtask merges into the

@@ -131,6 +131,7 @@ workspaces:
 | `git` | [Git](#git) | no | all defaults | Base branch, generated task branch prefix, and merge strategy for the review merge and Zen's auto-merge. |
 | `review` | [Review](#review) | no | all defaults | Review-interface behavior. Today just `diff_command`, which makes **View Diff** run a command of your own, such as a tool that reviews a revision range. |
 | `issue_tracker` | [IssueTracker](#issue_tracker) | no | `file_system` | Which backend the board lives in: `file_system` (local markdown, the default), `github` (issues in a repo) or `linear` (issues in a Linear team). See [GitHub Issues backend](/docs/concepts/github-issues) and [Linear](/docs/concepts/linear). |
+| `releases` | [Releases](#releases) | no | none | What counts as a release on the [Changelog](/docs/concepts/changelog#releases-on-the-timeline) timeline: a git tag glob and an optional label. With none, the timeline shows no release markers. |
 | `session` | `{ raw_output_log }` | no | off | `raw_output_log: true` keeps a full raw output log of every session at `~/.shelbi/sessions/<id>/raw.log`. Opt-in, for debugging: the log is mostly repaint noise for full-screen agents and captures anything pasted into a session. |
 
 Settings ▸ Properties edits `name`, `github_url`, `default_branch`,
@@ -519,6 +520,38 @@ than only git warnings.
 The [config-upgrade pass](/docs/concepts/config-upgrade) currently misreports a
 `review:` block as a removed key (`PROJECT_REMOVED_KEY`). The block is live:
 keep it rather than acting on that finding.
+
+## releases
+
+What counts as a release on the [Changelog](/docs/concepts/changelog#releases-on-the-timeline)
+page's timeline. Every git tag in the project's repository that matches
+`tags` is drawn as a marker between the entries merged before and after it,
+dated when the tag was made (the tagger date of an annotated tag, the commit
+date of a lightweight one).
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `tags` | string | yes | none | A git tag glob: `*` matches any run of characters (`/` included), `?` one character, `[a-z]` or `[!a-z]` a character class, and `\` escapes the next character. |
+| `label` | string | no | `{tag}` | How a release reads on its marker. `{tag}` is the whole tag; `{version}` is the tag without the glob's literal prefix (`0.14.0` for `v0.14.0` under `v*.*.*`). |
+
+```yaml
+# Shelbi's own releases: v0.14.0, v0.13.3, ...
+releases:
+  tags: "v*.*.*"
+
+# An app shipped through TestFlight: testflight/1.2.0-1 reads "TestFlight 1.2.0-1"
+releases:
+  tags: "testflight/*"
+  label: "TestFlight {version}"
+```
+
+New projects have no `releases:` block, and Shelbi never guesses a pattern.
+Tags are read from the local repository (nothing is fetched) and cached, so
+the Changelog page never waits on git. A malformed glob, or a placeholder
+other than `{tag}` or `{version}`, never stops the project from loading: the
+Changelog page says what's wrong above its entries, and
+[`shelbi config lint`](/docs/cli/config) reports it as
+`PROJECT_RELEASES_INVALID`.
 
 ## issue_tracker
 

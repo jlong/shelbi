@@ -5609,6 +5609,7 @@ transitions:
             issue_tracker: Default::default(),
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
+            releases: None,
         };
         shelbi_state::save_project(&project).unwrap();
 
@@ -7531,6 +7532,7 @@ transitions:
             issue_tracker: Default::default(),
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
+            releases: None,
         };
         shelbi_state::save_project(&project).unwrap();
         shelbi_state::scaffold_project_statuses("demo").unwrap();

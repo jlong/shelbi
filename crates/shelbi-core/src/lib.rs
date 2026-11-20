@@ -9,6 +9,7 @@ pub mod login_env;
 pub mod model;
 pub mod placeholders;
 pub mod pool;
+pub mod releases;
 pub mod scaffold;
 pub mod session_health;
 pub mod shell;
@@ -53,6 +54,7 @@ pub use model::{
     LOCAL_PROJECT_FIELDS,
     MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS, SUBTASK_WORKFLOW_NAME, TASK_WORKFLOW_NAME,
 };
+pub use releases::{ReleasesConfig, TagGlob};
 pub use placeholders::{extract_placeholders, substitute_placeholders};
 pub use session_health::{
     classify as classify_session, HealthTransition, RealSessionProbe, SessionHealthTracker,

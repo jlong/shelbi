@@ -3,7 +3,11 @@
 //! palette-only now) and draws the shared [`ChangelogModel`].
 //!
 //! Entries run one after another, newest first, in a centered reading
-//! column: the title in bold with the date at the right, a rule, the
+//! column, with a timeline down its left: a rule the length of the list, a
+//! `●` tick on each entry's title row, and a `◆` marker where each of the
+//! project's releases fell (its `releases:` tag glob), labeled with the
+//! release and its date ([`ChangelogModel::timeline`]). Each entry is
+//! the title in bold with the date at the right, a rule, the
 //! description through the TUI's markdown renderer
 //! ([`crate::markdown::render_note`], each image as an `[image: alt]`
 //! placeholder), the entry's files under an "Attachments" label (`⎘` a file,
@@ -39,8 +43,8 @@ use ratatui::{
     text::{Line, Span},
 };
 use shelbi_app::changelog::{
-    ChangelogAttachment, ChangelogData, ChangelogEntryView, ChangelogLink, ChangelogModel,
-    LinkKind, LinkTarget,
+    release_caption, ChangelogAttachment, ChangelogData, ChangelogEntryView, ChangelogLink,
+    ChangelogModel, LinkKind, LinkTarget, TimelineEntry,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -67,6 +71,16 @@ const ENTRY_GAP: usize = 1;
 const MAX_MEASURE: u16 = 100;
 /// The search box's widest.
 const SEARCH_MAX: u16 = 34;
+/// Columns the timeline takes left of the reading column: the release
+/// line's lead-in, the rule, and a blank before the title pills (which
+/// reach one column left of the text).
+const GUTTER: u16 = 4;
+/// Where the timeline's rule sits, in columns left of the reading column.
+const RULE_INSET: u16 = 3;
+/// The timeline's rule, an entry's tick on it, and a release's marker.
+const RULE: &str = "│";
+const TICK: &str = "●";
+const RELEASE: &str = "◆";
 /// Rows the header takes: the search box's two caps around the title row.
 const HEADER_ROWS: u16 = 3;
 /// The key hints along the bottom show from this height up.
@@ -161,6 +175,9 @@ struct Chip {
 /// One entry laid out: where its rows land in the document.
 #[derive(Debug, Clone)]
 struct EntryRows {
+    /// The release markers over the entry, newest first: each one's
+    /// document line and caption (`v0.14.0 · Nov 19`).
+    releases: Vec<(usize, String)>,
     /// The gap row over the title (the pill's top bleed).
     top: usize,
     /// The description, wrapped to the measure; empty when folded.
@@ -193,24 +210,39 @@ struct Doc {
     entries: Vec<EntryRows>,
     /// The "Loading older entries…" row, when more are past the shown pages.
     more: Option<usize>,
+    /// Why the releases couldn't be read, on the document's first line.
+    releases_error: Option<String>,
     height: usize,
 }
 
 impl Doc {
     fn build(
-        entries: &[&ChangelogEntryView],
+        timeline: &[TimelineEntry<'_>],
+        releases_error: Option<&str>,
         collapsed: &HashSet<String>,
         has_more: bool,
         width: u16,
         generation: u64,
     ) -> Doc {
-        let mut y = 0;
-        let mut rows = Vec::with_capacity(entries.len());
-        for e in entries {
+        // The releases' error, and a blank under it.
+        let mut y = if releases_error.is_some() { 2 } else { 0 };
+        let mut rows = Vec::with_capacity(timeline.len());
+        for t in timeline {
+            let e = t.entry;
             // Blank rows between one entry's end and the next's bleed row.
             if !rows.is_empty() {
                 y += ENTRY_GAP;
             }
+            // Each release over the entry: its marker, then a blank.
+            let releases = t
+                .releases
+                .iter()
+                .map(|r| {
+                    let line = y;
+                    y += 2;
+                    (line, release_caption(r))
+                })
+                .collect();
             let top = y;
             let folded = collapsed.contains(&e.id);
             let mut body = Vec::new();
@@ -254,6 +286,7 @@ impl Doc {
                 }
             }
             rows.push(EntryRows {
+                releases,
                 top,
                 body,
                 attachments,
@@ -274,6 +307,7 @@ impl Doc {
             generation,
             entries: rows,
             more,
+            releases_error: releases_error.map(str::to_string),
             height: y,
         }
     }
@@ -368,8 +402,16 @@ struct Plan {
 }
 
 fn plan(area: Rect) -> Plan {
-    let measure = area.width.saturating_sub(4).min(MAX_MEASURE);
-    let x = area.x + (area.width - measure) / 2;
+    let mut measure = area.width.saturating_sub(4).min(MAX_MEASURE);
+    let mut x = area.x + (area.width - measure) / 2;
+    // The timeline hangs in the left margin; a screen too narrow for it
+    // there moves the column over and narrows it.
+    let margin = x - area.x;
+    if margin < GUTTER && measure > GUTTER * 4 {
+        let short = GUTTER - margin;
+        x += short;
+        measure -= short;
+    }
     let column = Rect {
         x,
         y: area.y,
@@ -603,9 +645,15 @@ impl ChangelogPage {
         if self.doc.width == width && self.doc.generation == self.generation {
             return;
         }
-        let collapsed = &self.collapsed;
-        let entries: Vec<&ChangelogEntryView> = self.model.visible().collect();
-        self.doc = Doc::build(&entries, collapsed, self.model.has_more(), width, self.generation);
+        let timeline = self.model.timeline();
+        self.doc = Doc::build(
+            &timeline,
+            self.model.releases_error(),
+            &self.collapsed,
+            self.model.has_more(),
+            width,
+            self.generation,
+        );
     }
 
     fn viewport_height(&self) -> usize {
@@ -1087,6 +1135,12 @@ impl ChangelogPage {
         // The pills reach one column past the reading column on each side.
         let pill_x = vp.x.saturating_sub(1);
         let pill_w = vp.width + 2;
+        if let (Some(err), Some(y)) = (&self.doc.releases_error, screen(0)) {
+            let text = format!("Couldn\u{2019}t read the releases: {err}");
+            let room = vp.width as usize;
+            buf.set_stringn(vp.x, y, truncate_right(&text, room), room, Style::default().fg(palette().yellow));
+        }
+        self.render_timeline(buf, vp, &screen);
         for (ix, rows) in self.doc.entries.iter().enumerate() {
             if rows.end <= top || rows.top >= bottom {
                 continue;
@@ -1129,6 +1183,59 @@ impl ChangelogPage {
         if let Some(y) = self.doc.more.and_then(screen) {
             let style = Style::default().fg(palette().muted);
             buf.set_stringn(vp.x, y, "Loading older entries…", vp.width as usize, style);
+        }
+    }
+
+    /// The timeline down the reading column's left: the rule the length of
+    /// the list, a tick on each entry's title row (brighter on the focused
+    /// entry's), and each release's marker line, `─◆─ v0.14.0 · Nov 19 ───`.
+    /// A screen too narrow for the gutter keeps the release lines alone.
+    fn render_timeline(&self, buf: &mut Buffer, vp: Rect, screen: &dyn Fn(usize) -> Option<u16>) {
+        let gutter = vp.x >= self.last_area.x + GUTTER;
+        let rule_x = vp.x.saturating_sub(RULE_INSET);
+        let quiet = Style::default().fg(palette().divider);
+        let accent = Style::default().fg(palette().cyan);
+        let (Some(first), Some(last)) = (self.doc.entries.first(), self.doc.entries.last()) else {
+            return;
+        };
+        if gutter {
+            let start = first.releases.first().map_or(first.top, |(line, _)| *line);
+            let end = self.doc.more.map_or(last.end, |more| more + 1);
+            for line in start..end {
+                if let Some(y) = screen(line) {
+                    buf.set_string(rule_x, y, RULE, quiet);
+                }
+            }
+        }
+        let selected = self.selected_ix();
+        for (ix, rows) in self.doc.entries.iter().enumerate() {
+            if gutter {
+                if let Some(y) = screen(rows.title()) {
+                    let fg = if Some(ix) == selected { palette().white } else { palette().muted };
+                    buf.set_string(rule_x, y, TICK, Style::default().fg(fg));
+                }
+            }
+            for (line, caption) in &rows.releases {
+                let Some(y) = screen(*line) else {
+                    continue;
+                };
+                let mut x = vp.x;
+                if gutter {
+                    buf.set_string(rule_x - 1, y, "─", quiet);
+                    buf.set_string(rule_x, y, RELEASE, accent);
+                    buf.set_string(rule_x + 1, y, "─", quiet);
+                } else {
+                    buf.set_string(x, y, RELEASE, accent);
+                    x += 2;
+                }
+                let room = vp.right().saturating_sub(x) as usize;
+                let shown = truncate_right(caption, room);
+                let (end, _) = buf.set_stringn(x, y, &shown, room, accent.add_modifier(Modifier::BOLD));
+                if end + 1 < vp.right() {
+                    let fill = (vp.right() - end - 1) as usize;
+                    buf.set_string(end + 1, y, "─".repeat(fill), quiet);
+                }
+            }
         }
     }
 

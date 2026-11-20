@@ -1277,6 +1277,7 @@ mod tests {
             issue_tracker: Default::default(),
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
+            releases: None,
         }
     }
 

@@ -171,8 +171,11 @@ fn entries_read_as_a_blog_newest_first_at_every_size() {
         // A rule under the title (it's the selection's bleed on the
         // focused first entry, so look under the second), when it's on
         // screen.
-        if second.1 + 1 < plan(Rect::new(0, 0, w, h)).viewport.bottom() {
-            let rule = &rows(&buf)[second.1 as usize + 1];
+        let vp = plan(Rect::new(0, 0, w, h)).viewport;
+        if second.1 + 1 < vp.bottom() {
+            // The reading column's part of the row (the timeline's rule is
+            // left of it).
+            let rule: String = rows(&buf)[second.1 as usize + 1].chars().skip(vp.x as usize).collect();
             assert!(rule.trim().chars().all(|c| c == '─') && !rule.trim().is_empty(), "{w}x{h}: {rule:?}");
         }
         // The links as chips: the issue and the PR from the frontmatter.
@@ -195,7 +198,10 @@ fn a_blank_row_more_separates_consecutive_entries() {
     let mut page = page_with(entries);
     let buf = render(&mut page, 100, 45);
     let text = rows(&buf);
-    let blank = |from: u16, to: u16| (from..to).all(|y| text[y as usize].trim().is_empty());
+    // Blank but for the timeline's rule.
+    let blank = |from: u16, to: u16| {
+        (from..to).all(|y| text[y as usize].trim_matches(|c| c == ' ' || c == '│').is_empty())
+    };
     // Chips, then the gap and the next title's top bleed (which is the
     // chips' bottom bleed too): two blanks, one more than before.
     let (_, chips) = find(&buf, "#1942").unwrap();
@@ -252,7 +258,11 @@ fn the_reading_column_is_centered_and_capped() {
     assert_eq!(x, (160 - MAX_MEASURE) / 2, "a blog's measure, centered");
     let buf = render(&mut page, 60, 20);
     let (x, _) = find(&buf, "Changelog").unwrap();
-    assert_eq!(x, 2, "a narrow screen keeps a two-column gutter");
+    assert_eq!(x, 4, "a narrow screen moves over for the timeline");
+    // The timeline's rule, in its margin, beside every row of the list.
+    let buf = render(&mut page, 160, 45);
+    let vp = plan(Rect::new(0, 0, 160, 45)).viewport;
+    assert_eq!(buf[(vp.x - RULE_INSET, vp.y + 4)].symbol(), RULE);
 }
 
 #[test]
@@ -699,4 +709,85 @@ fn tiny_areas_never_panic() {
         press(&mut page, KeyCode::Tab);
         press(&mut page, KeyCode::Char('G'));
     }
+}
+
+fn release(tag: &str, date: &str) -> shelbi_app::changelog::Release {
+    shelbi_app::changelog::Release {
+        tag: tag.into(),
+        label: tag.into(),
+        date: DateTime::parse_from_rfc3339(date).unwrap(),
+    }
+}
+
+fn with_releases() -> ChangelogData {
+    let mut d = data(sample());
+    d.releases = vec![
+        // Between "Settings polish pass" (14:30) and "Contact Us" (10:00).
+        release("v0.14.0", "2026-10-28T12:00:00-07:00"),
+        // Between "About Shelbi" (the 27th) and "Faster board" (the 26th).
+        release("v0.13.3", "2026-10-26T20:00:00Z"),
+        // Older than every entry: off the timeline.
+        release("v0.1.0", "2026-01-01T00:00:00Z"),
+    ];
+    d
+}
+
+#[test]
+fn the_timeline_ticks_each_title_and_marks_releases_between_entries() {
+    let mut page = ChangelogPage::new();
+    page.set_data(with_releases());
+    let buf = render(&mut page, 160, 60);
+    let text = rows(&buf);
+    let vp = plan(Rect::new(0, 0, 160, 60)).viewport;
+    let rule_x = vp.x - RULE_INSET;
+    let at = |title: &str| find(&buf, title).unwrap_or_else(|| panic!("{title}\n{}", text.join("\n"))).1;
+    // A tick on every title row.
+    for title in ["Settings polish pass", "Contact Us feedback dialog", "About Shelbi", "Faster board"] {
+        assert_eq!(buf[(rule_x, at(title))].symbol(), TICK, "{title}");
+    }
+    // Each release between the entries before and after it, labeled with
+    // its date, its marker on the rule.
+    let (cx, v14) = find(&buf, "v0.14.0 · Oct 28").expect("v0.14.0");
+    assert_eq!(cx, vp.x, "the caption lines up with the titles");
+    assert!(at("Settings polish pass") < v14 && v14 < at("Contact Us feedback dialog"));
+    let (_, v13) = find(&buf, "v0.13.3 · Oct 26").expect("v0.13.3");
+    assert!(at("About Shelbi") < v13 && v13 < at("Faster board"));
+    for y in [v14, v13] {
+        assert_eq!(buf[(rule_x, y)].symbol(), RELEASE);
+        assert_eq!(buf[(rule_x, y)].fg, palette().cyan);
+        assert!(text[y as usize].ends_with('─'), "{:?}", text[y as usize]);
+    }
+    assert!(find(&buf, "v0.1.0").is_none(), "older than every entry");
+    // The rule runs unbroken from the first title to the last entry.
+    for y in at("Settings polish pass")..at("Faster board") {
+        let sym = buf[(rule_x, y)].symbol();
+        assert!([RULE, TICK, RELEASE].contains(&sym), "row {y}: {sym:?}");
+    }
+    // A blank under each marker, then the next entry's top bleed row.
+    assert_eq!(at("Contact Us feedback dialog"), v14 + 3);
+
+    // A narrow screen keeps the markers, at the column's edge.
+    let buf = render(&mut page, 20, 60);
+    let (x, _) = find(&buf, "◆ v0.14.0").expect("narrow marker");
+    assert_eq!(x, plan(Rect::new(0, 0, 20, 60)).viewport.x);
+}
+
+#[test]
+fn no_releases_shows_ticks_only_and_a_bad_block_says_so() {
+    let mut page = page_with(sample());
+    let buf = render(&mut page, 160, 45);
+    assert!(!rows(&buf).join("\n").contains(RELEASE));
+    let vp = plan(Rect::new(0, 0, 160, 45)).viewport;
+    let (_, y) = find(&buf, "Settings polish pass").unwrap();
+    assert_eq!(buf[(vp.x - RULE_INSET, y)].symbol(), TICK);
+
+    let mut d = data(sample());
+    d.releases_error = Some("releases.tags `v[0-9`: a `[` is never closed with `]`".into());
+    page.set_data(d);
+    let buf = render(&mut page, 160, 45);
+    let (x, y) = find(&buf, "Couldn’t read the releases: releases.tags `v[0-9`").expect("the error");
+    assert_eq!((x, y), (vp.x, vp.y));
+    assert_eq!(buf[(x, y)].fg, palette().yellow);
+    // The entries still show under it.
+    assert!(find(&buf, "Settings polish pass").unwrap().1 > y);
 }

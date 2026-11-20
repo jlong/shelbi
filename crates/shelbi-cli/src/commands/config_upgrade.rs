@@ -445,6 +445,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_claim_on_start_dispatch(entry, &text, out);
         sniff_orchestrator_changelog(entry, &text, out);
         sniff_orchestrator_changelog_attachments(entry, &text, out);
+        sniff_orchestrator_changelog_releases(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
         sniff_orchestrator_awareness_variants(entry, &text, out);
         sniff_orchestrator_job_log(entry, &text, out);
@@ -1143,6 +1144,46 @@ fn sniff_orchestrator_changelog_attachments(
          short video) with `--attach <file>`; both repeat, and `shelbi changelog attach \
          <entry-id>` adds them to an entry already written. Mirror the shipped default \
          template.",
+        locate_line_containing(text, ORCH_CHANGELOG_COMMAND_MARKER),
+    ));
+}
+
+/// The stable code for "the orchestrator's Changelog rule predates release
+/// markers on the timeline".
+pub(crate) const ORCH_CHANGELOG_RELEASES_CODE: &str = "ORCH_CHANGELOG_RELEASES_MISSING";
+
+/// What the shipped Changelog section says about releases; a copy naming it
+/// is current.
+const ORCH_CHANGELOG_RELEASES_MARKER: &str = "releases.tags";
+
+/// Flag orchestrator instructions whose Changelog rule (`shelbi changelog add`)
+/// predates the timeline's release markers, so the orchestrator never learns
+/// that releases come from the project's `releases:` tag pattern, nor to set
+/// one for a project with a release routine.
+///
+/// The `## Changelog` section is user-owned prose, so the line can't be merged
+/// in mechanically: routed to [`Classification::NeedsJudgment`]. A copy
+/// without the rule is left to [`sniff_orchestrator_changelog`], whose append
+/// already carries the line. A copy naming `releases.tags` never fires, so the
+/// sniff is idempotent.
+fn sniff_orchestrator_changelog_releases(
+    entry: &InventoryEntry,
+    text: &str,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    if !text.contains(ORCH_CHANGELOG_COMMAND_MARKER) || text.contains(ORCH_CHANGELOG_RELEASES_MARKER) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        ORCH_CHANGELOG_RELEASES_CODE,
+        "the orchestrator's Changelog rule predates release markers on the Changelog timeline, \
+         so it doesn't know releases come from the project's `releases:` tag pattern",
+        "In the `## Changelog` section, after the Attachments bullet, add: releases appear on \
+         the Changelog timeline automatically, from the `releases:` tag pattern in the project \
+         YAML; when the project has a release routine, set `releases.tags` to match the tags it \
+         makes (`\"v*.*.*\"`, `\"testflight/*\"`). Mirror the shipped default template.",
         locate_line_containing(text, ORCH_CHANGELOG_COMMAND_MARKER),
     ));
 }
@@ -3615,6 +3656,11 @@ fn needs_judgment_rationale(code: &str) -> &'static str {
              user-owned), so the attachment guidance can't be merged in mechanically without \
              risking local edits; the orchestrator refreshes its own copy instead."
         }
+        ORCH_CHANGELOG_RELEASES_CODE => {
+            "The `## Changelog` section is prose a project is meant to edit (its policy is \
+             user-owned), so the release-marker guidance can't be merged in mechanically without \
+             risking local edits; the orchestrator refreshes its own copy instead."
+        }
         ORCH_JOB_ESTIMATE_CODE => {
             "These are prose instructions a project may have forked and customized, so the job \
              estimate guidance and the job `overdue` reaction rule can't be merged in \
@@ -5712,6 +5758,36 @@ to your workdir). My own note: keep it short.
             sniff_orchestrator_changelog_attachments(&orch_entry(), clean, &mut out);
             assert!(find(&out, ORCH_CHANGELOG_ATTACHMENTS_CODE).is_none(), "{clean}: {:?}", codes(&out));
         }
+    }
+
+    #[test]
+    fn a_changelog_rule_without_releases_is_needs_judgment() {
+        let text = "# Orchestrator\n\n## Changelog\n\n    shelbi changelog add --image x.png\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_changelog_releases(&orch_entry(), text, &mut out);
+        let f = find(&out, ORCH_CHANGELOG_RELEASES_CODE).expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert_eq!(f.location.line, 5);
+        assert!(!f.rationale.is_empty());
+        for clean in [
+            "## Changelog\n\n    shelbi changelog add\n\nSet releases.tags to the release tags.\n",
+            // No rule at all: the append sniffer owns it.
+            "# Orchestrator\n\nNo changelog here.\n",
+        ] {
+            let mut out = Vec::new();
+            sniff_orchestrator_changelog_releases(&orch_entry(), clean, &mut out);
+            assert!(find(&out, ORCH_CHANGELOG_RELEASES_CODE).is_none(), "{clean}: {:?}", codes(&out));
+        }
+        // The shipped template, and the section the append heal writes, are
+        // current.
+        let mut out = Vec::new();
+        sniff_orchestrator_changelog_releases(&orch_entry(), shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS, &mut out);
+        assert!(out.is_empty(), "{:?}", codes(&out));
+        assert!(shipped_changelog_section().contains("releases.tags"));
+        let healed = append_changelog_section("# Orchestrator\n\nDispatch.\n");
+        let mut out = Vec::new();
+        sniff_orchestrator_changelog_releases(&orch_entry(), &healed, &mut out);
+        assert!(out.is_empty(), "{:?}", codes(&out));
     }
 
     /// Drift guard: the shipped template (and so the section the append heal

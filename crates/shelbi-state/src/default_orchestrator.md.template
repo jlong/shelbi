@@ -1179,6 +1179,10 @@ to those lines and no merge is missed.
   other artifacts a reader would want (a benchmark, a log, a short video) with
   `--attach <file>`. Both repeat, and `shelbi changelog attach <entry-id>` adds
   them to an entry already written.
+- **Releases**: they appear on the Changelog timeline automatically, from the
+  `releases:` tag pattern in the project YAML. When the project has a release
+  routine, set `releases.tags` to match the tags it makes (`"v*.*.*"`,
+  `"testflight/*"`).
 
 **One entry per feature.** A subtask squash-merges into its parent task's
 branch, not the primary branch, so it ships nothing by itself: write no entry

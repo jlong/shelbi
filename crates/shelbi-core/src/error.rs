@@ -160,6 +160,13 @@ pub enum Error {
     #[error("{0}")]
     InvalidIssueTracker(String),
 
+    /// A project's `releases:` block is malformed: a bad tag glob or an
+    /// unknown label placeholder. The message names the field
+    /// (`releases.tags`, `releases.label`). Never fails a project load; the
+    /// Changelog page and `shelbi config lint` report it.
+    #[error("{0}")]
+    InvalidReleases(String),
+
     /// A project's `issue_tracker` block selects a valid remote backend whose
     /// live store is not built yet (`jira`). Distinct from
     /// [`Error::InvalidIssueTracker`] (a config error the
