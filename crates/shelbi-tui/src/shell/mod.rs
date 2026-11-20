@@ -1808,6 +1808,7 @@ impl ShellState {
             linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
+            preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
         });
         #[cfg(not(test))]
         let orchestrator_restarter: OrchestratorRestarter =
@@ -13095,6 +13096,7 @@ mod tests {
                 linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
                 github: Arc::new(shelbi_app::github_setup::fixture::answer),
                 sync_statuses: Arc::new(|| StatusSync::Synced("6 statuses from the Linear team".into())),
+                preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
             }
         })
     }
@@ -13245,6 +13247,7 @@ mod tests {
             linear: Arc::new(shelbi_app::linear_setup::fixture::no_key),
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
+            preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
         });
         st.dispatch_effect(Effect::OpenSettings);
         type_key(&mut st, '4');
@@ -13268,6 +13271,7 @@ mod tests {
             linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
+            preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
         });
         press(&mut st, KeyCode::Enter);
         settle_agents(&mut st, "the key is stored and the teams load", |st| {

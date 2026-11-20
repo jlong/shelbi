@@ -6386,24 +6386,36 @@ impl ShelbiWindow {
         cx.defer(move |cx| crate::views::tracker_connect::show(handle, from, cx));
     }
 
-    /// The tracker flow wrote a connection (`message` says to what): the
-    /// board reads again, so its header and cards follow it. `view_board`
-    /// (the flow's View board) also brings this window up on the board.
+    /// The tracker flow wrote a connection: the board reads again, so its
+    /// header, menu and cards follow it, and with `watch` it watches for the
+    /// import (its first read of the new tracker), which the flow's
+    /// Importing step and the board's toast follow. The board is made if
+    /// this window hasn't shown it yet, so the import is read either way.
+    /// `view_board` (the flow's View board) also brings this window up on
+    /// the board.
     pub(crate) fn tracker_connected(
         &mut self,
         view_board: bool,
-        message: Option<String>,
+        watch: Option<Entity<shelbi_app::tracker_connect::ImportWatch>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(issues) = &self.issues {
-            issues.update(cx, |view, cx| view.reload(cx));
+        let issues = match (&self.issues, &watch) {
+            (Some(issues), _) => Some(issues.clone()),
+            (None, Some(_)) => Some(self.ensure_issues(window, cx)),
+            (None, None) => None,
+        };
+        if let Some(issues) = issues {
+            issues.update(cx, |view, cx| {
+                if let Some(watch) = watch {
+                    view.watch_import(watch, cx);
+                }
+                view.reload(cx);
+            });
         }
         if view_board {
             window.activate_window();
             self.run(CommandKind::ShowView(View::Issues), window, cx);
-        } else if let Some(message) = message {
-            self.flash(message, cx);
         }
         cx.notify();
     }
@@ -8135,6 +8147,10 @@ mod nav_focus_tests;
 #[cfg(test)]
 #[path = "app_toast_tests.rs"]
 mod toast_tests;
+
+#[cfg(test)]
+#[path = "app_tracker_connect_tests.rs"]
+mod tracker_connect_tests;
 
 #[cfg(test)]
 #[path = "app_notice_tests.rs"]

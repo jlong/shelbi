@@ -2603,6 +2603,7 @@ pub(crate) mod tests {
                 ownership: shelbi_state::OwnershipGate::Unrestricted,
                 remote_search: false,
                 tracker: Default::default(),
+                connection: None,
             }),
             state_snapshot: None,
             workflows: Ok(vec![shelbi_core::default_workflow()]),

@@ -51,11 +51,35 @@
 //! reads and Continue's preflight run through the project's
 //! [`TrackerService`] (the far daemon's for a project on another machine).
 //!
+//! How should agents handle issues created in <Tracker>? (04-agent-rules):
+//! the two agent rules as setting cards with switches (a click anywhere on a
+//! card flips it).
+//!
+//! Review your first import (06-review-import), from one read of the chosen
+//! connection where the project lives ([`TrackerService::preview`]):
+//!
+//! ```text
+//!   Issues to import
+//!   [ All open issues                                           ]
+//!   ┌──────────────────────────────────────────────────────────┐
+//!   │ 64 open issues will be imported                          │
+//!   │ 48 assigned to you are eligible for agents.              │
+//!   │ 16 others stay visible, but agents will not pick them up.│
+//!   └──────────────────────────────────────────────────────────┘
+//!   #128     Fix keyboard navigation
+//!   #129     Restore the previous view
+//!   12 closed issues are excluded. Imported tasks will follow …
+//!                                          [Back] [Import 64 issues]
+//! ```
+//!
+//! Importing your issues (07-importing): the connection saved, the status
+//! mappings applied (Linear), then the import, its bar sliding until the
+//! project's board has read the new tracker ([`ImportWatch`], handed to the
+//! project window, which shows the board's toast when it lands).
+//!
 //! Keys: Return is the step's primary button (Verify while the Linear key
 //! field shows), Esc closes an open picker, else the window, as ⌘W does (a
-//! connection already running carries on in the background). The Agent
-//! rules and Review import steps draw placeholders until `tc-import` builds
-//! them.
+//! connection already running carries on in the background).
 
 use std::collections::HashMap;
 
@@ -70,9 +94,9 @@ use shelbi_app::new_project::Tracker;
 use shelbi_app::settings::tracker::TrackerService;
 use shelbi_app::source::ProjectHandle;
 use shelbi_app::tracker_connect::flow::{
-    self as copy, Action, Apply, Card, CardState, FlowRequest, Secondary, Step, TrackerFlow,
+    self as copy, Action, Apply, Card, CardState, FlowRequest, Preview, Secondary, Step, TrackerFlow,
 };
-use shelbi_app::tracker_connect::StatusSync;
+use shelbi_app::tracker_connect::{import_copy, rules_copy, ImportWatch, StatusSync};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
 use super::harness_picker::picker_button;
@@ -81,7 +105,8 @@ use super::workflow_editor::dropdown;
 use crate::app::{CloseWindow, ShelbiWindow};
 use crate::assets::{heroicon, icons};
 use crate::elements::terminal::metrics::PRIMARY_FAMILY as MONO_FAMILY;
-use crate::elements::spinner;
+use crate::elements::progress_bar::progress_bar;
+use crate::elements::{controls, spinner};
 use crate::keys::chord_from_keystroke;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
@@ -182,6 +207,8 @@ pub struct TrackerConnectView {
     /// The GitHub step's open picker, and where the open one hangs.
     github_menu: Option<GithubPick>,
     github_anchor: style::Anchor,
+    /// The import's watch, observed until the project's board has it.
+    import: Option<(gpui::Entity<ImportWatch>, Subscription)>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -226,6 +253,7 @@ impl TrackerConnectView {
             linear_ui,
             github_menu: None,
             github_anchor: Default::default(),
+            import: None,
             _subscriptions: subscriptions,
         };
         view.load(window, cx);
@@ -363,6 +391,25 @@ impl TrackerConnectView {
         self.after_change(window, cx);
     }
 
+    /// Flip an agent rule (a click on its card).
+    fn toggle_rule(&mut self, assigned_only: bool, cx: &mut Context<Self>) {
+        let mut rules = self.flow.rules();
+        if assigned_only {
+            rules.assigned_only = !rules.assigned_only;
+        } else {
+            rules.require_review = !rules.require_review;
+        }
+        self.flow.set_rules(rules);
+        cx.notify();
+    }
+
+    /// The review's Retry after a failed read.
+    fn retry_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flow.retry_preview();
+        self.run_due(window, cx);
+        cx.notify();
+    }
+
     /// A card's Connect.
     fn connect(&mut self, tracker: Tracker, window: &mut Window, cx: &mut Context<Self>) {
         if self.flow.connect(tracker) {
@@ -381,7 +428,7 @@ impl TrackerConnectView {
         }
         match self.flow.primary() {
             Action::ViewBoard => {
-                self.land(true, cx);
+                self.land(true, None, cx);
                 self.close(window);
                 return;
             }
@@ -434,6 +481,20 @@ impl TrackerConnectView {
                     })
                     .detach();
                 }
+                FlowRequest::Preview(choice) => {
+                    let preview = self.service.preview.clone();
+                    let asked = choice.clone();
+                    let work = cx.background_executor().spawn(async move { preview(asked) });
+                    cx.spawn_in(window, async move |this, cx| {
+                        let result = work.await;
+                        this.update_in(cx, |this, _, cx| {
+                            this.flow.preview_answer(&choice, result);
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
                 FlowRequest::Connect(req) => {
                     let connect = self.service.connect.clone();
                     let work = cx.background_executor().spawn(async move { connect(req) });
@@ -443,7 +504,7 @@ impl TrackerConnectView {
                             let written = result.is_ok();
                             this.flow.connected(result);
                             if written {
-                                this.land(false, cx);
+                                this.start_import(cx);
                             }
                             cx.notify();
                         })
@@ -455,12 +516,34 @@ impl TrackerConnectView {
         }
     }
 
+    /// The connection was written: watch for its import, and hand the
+    /// watch to the project window, whose board reads the new tracker and
+    /// says when the issues have landed (here, and in its toast).
+    fn start_import(&mut self, cx: &mut Context<Self>) {
+        let Some(done) = self.flow.finished() else { return };
+        let watch = cx.new(|_| ImportWatch::new(done.backend, self.flow.source_name()));
+        let observe = cx.observe(&watch, |this, watch, cx| {
+            if let Some(n) = watch.read(cx).landed() {
+                this.flow.imported(n);
+                cx.notify();
+            }
+        });
+        self.import = Some((watch.clone(), observe));
+        self.land(false, Some(watch), cx);
+    }
+
+    /// The import's watch (tests stand in for the project's board).
+    #[cfg(test)]
+    pub fn import_watch(&self) -> Option<gpui::Entity<ImportWatch>> {
+        self.import.as_ref().map(|(w, _)| w.clone())
+    }
+
     /// Tell the project window: a connection was written (it reads its
-    /// board again), and on View board, show the board.
-    fn land(&self, view_board: bool, cx: &mut App) {
+    /// board again, watching for the import), and on View board, show the
+    /// board.
+    fn land(&self, view_board: bool, watch: Option<gpui::Entity<ImportWatch>>, cx: &mut App) {
         let Some(from) = self.from else { return };
-        let message = self.flow.finished().map(|done| format!("Connected to {}.", done.summary.trim_end_matches('.')));
-        from.update(cx, |w, window, cx| w.tracker_connected(view_board, message, window, cx)).ok();
+        from.update(cx, |w, window, cx| w.tracker_connected(view_board, watch, window, cx)).ok();
     }
 }
 
@@ -509,21 +592,36 @@ fn connected_badge(tracker: Tracker, theme: &Theme) -> Div {
         .child(copy::CONNECTED)
 }
 
-/// A step's placeholder until its subtask draws it.
-fn placeholder(id: &'static str, text: &'static str, theme: &Theme) -> Div {
+/// An agent rule's setting card (04-agent-rules): its title over its help,
+/// and its switch at the right.
+fn rule_card(id: &'static str, title: String, help: &'static str, on: bool, theme: &Theme) -> Stateful<Div> {
     div()
+        .id(id)
         .debug_selector(move || id.into())
+        .role(Role::Switch)
+        .aria_label(title.clone())
+        .aria_toggled(if on { gpui::Toggled::True } else { gpui::Toggled::False })
         .flex()
+        .flex_row()
         .items_center()
-        .justify_center()
+        .gap(px(16.0))
         .w_full()
-        .h(px(160.0))
+        .px(px(16.0))
+        .py(px(16.0))
         .rounded(px(12.0))
-        .border_1()
-        .border_color(theme.divider)
-        .type_style(Type::Small)
-        .text_color(theme.muted)
-        .child(text)
+        .bg(theme.toolbar)
+        .cursor_pointer()
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .gap(px(8.0))
+                .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child(title))
+                .child(div().type_style(Type::Small).text_color(theme.muted).child(help)),
+        )
+        .child(controls::switch(on, theme).debug_selector(move || format!("{id}-{}", if on { "on" } else { "off" })))
 }
 
 /// A line of the Importing step's checklist: a check (green) or a spinner.
@@ -848,6 +946,131 @@ impl TrackerConnectView {
             )
     }
 
+    /// How should agents handle issues created in <Tracker>? The two rules.
+    fn rules_step(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let rules = self.flow.rules();
+        let card = |id, title, help, on, assigned_only, cx: &mut Context<Self>| {
+            rule_card(id, title, help, on, theme)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_rule(assigned_only, cx)))
+        };
+        div()
+            .debug_selector(|| "tracker-rules".into())
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .w_full()
+            // The frame's cards sit 39pt lower than the choose step's fields.
+            .mt(px(39.0))
+            .child(card(
+                "tracker-rule-review",
+                rules_copy::REVIEW_TITLE.to_string(),
+                rules_copy::REVIEW_HELP,
+                rules.require_review,
+                false,
+                cx,
+            ))
+            .child(card(
+                "tracker-rule-assigned",
+                self.flow.assigned_title(),
+                rules_copy::ASSIGNED_HELP,
+                rules.assigned_only,
+                true,
+                cx,
+            ))
+    }
+
+    /// Review your first import: what to import, the counts, the first few
+    /// issues and the closed ones left out (or the read's loading or error).
+    fn review_step(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let field = div()
+            .debug_selector(|| "tracker-import-scope".into())
+            .flex()
+            .items_center()
+            .w_full()
+            .h(px(32.0))
+            .px(px(12.0))
+            .rounded(px(6.0))
+            .bg(theme.toolbar)
+            .type_style(Type::Base)
+            .text_color(theme.foreground)
+            .child(import_copy::ALL_OPEN);
+        let col = div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .w_full()
+            .child(labeled(import_copy::ISSUES_TO_IMPORT, field, theme));
+        match self.flow.preview() {
+            Preview::Loaded(p) => {
+                let rules = self.flow.rules();
+                let summary = div()
+                    .debug_selector(|| "tracker-import-summary".into())
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .w_full()
+                    .px(px(12.0))
+                    .py(px(12.0))
+                    .rounded(px(8.0))
+                    .bg(theme.toolbar)
+                    .child(
+                        div()
+                            .debug_selector(|| "tracker-import-count".into())
+                            .type_style(Type::BaseMedium)
+                            .text_color(theme.text_loud)
+                            .child(import_copy::will_import(p.open)),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "tracker-import-eligible".into())
+                            .flex()
+                            .flex_col()
+                            .gap(px(4.0))
+                            .type_style(Type::Small)
+                            .text_color(theme.muted)
+                            .children(import_copy::eligibility(p, rules)),
+                    );
+                let rows = p.first.iter().enumerate().map(|(i, issue)| {
+                    div()
+                        .debug_selector(move || format!("tracker-import-issue-{i}"))
+                        .flex()
+                        .flex_row()
+                        .gap(px(12.0))
+                        .type_style(Type::Base)
+                        .child(div().flex_none().w(px(64.0)).text_color(theme.muted).child(issue.key.clone()))
+                        .child(div().flex_1().min_w_0().truncate().text_color(theme.foreground).child(issue.title.clone()))
+                });
+                col.child(summary)
+                    .child(div().flex().flex_col().gap(px(10.0)).children(rows))
+                    .child(quiet("tracker-import-closed", import_copy::closed_note(p), theme))
+            }
+            Preview::Failed(why) => col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(error_line("tracker-import-error", format!("Couldn't read the issues to import: {why}"), theme))
+                    .child(
+                        div().flex().child(
+                            style::button("tracker-import-retry", copy::RETRY, ButtonKind::Secondary, ButtonSize::Small, false, theme)
+                                .role(Role::Button)
+                                .aria_label(copy::RETRY)
+                                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.retry_preview(window, cx))),
+                        ),
+                    ),
+            ),
+            Preview::Idle | Preview::Wanted | Preview::Loading => col.child(
+                div()
+                    .debug_selector(|| "tracker-import-loading".into())
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(spinner::spinner_sized("tracker-import-spinner", theme.muted, 14.0))
+                    .child(div().type_style(Type::Small).text_color(theme.muted).child(import_copy::LOADING)),
+            ),
+        }
+    }
+
     fn importing(&self, theme: &Theme) -> Div {
         let mut lines = div().flex().flex_col().gap(px(16.0)).w_full();
         match self.flow.apply() {
@@ -876,6 +1099,24 @@ impl TrackerConnectView {
                         )
                     }
                 }
+                // The import: the board's first read of the new tracker. It
+                // can't count issue by issue, so the bar slides until then.
+                let landed = self.flow.landed().is_some();
+                let color = if landed { theme.green } else { theme.cyan };
+                lines = lines.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(16.0))
+                        .child(progress_line("tracker-progress-import", landed, self.flow.import_line(), theme))
+                        .child(progress_bar(
+                            "tracker-progress-bar",
+                            landed.then_some(1.0),
+                            CONTENT_W,
+                            color,
+                            theme.toolbar,
+                        )),
+                );
             }
             // The refusal shows as the step's error.
             Apply::Refused(_) => {}
@@ -907,8 +1148,8 @@ impl TrackerConnectView {
                     ),
                 )
             }
-            Step::AgentRules => placeholder("tracker-rules-placeholder", "The two agent rules (tc-import).", theme),
-            Step::ReviewImport => placeholder("tracker-review-placeholder", "The first import's preview (tc-import).", theme),
+            Step::AgentRules => self.rules_step(theme, cx),
+            Step::ReviewImport => self.review_step(theme, cx),
             Step::Importing => self.importing(theme),
         }
     }
@@ -916,7 +1157,7 @@ impl TrackerConnectView {
     /// The step counter, then the left button and the primary one (every
     /// step after the chooser).
     fn footer(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
-        let label = self.flow.primary_label()?;
+        let label = gpui::SharedString::from(self.flow.primary_label()?);
         let secondary = self.flow.secondary().map(|s| {
             let (id, text) = match s {
                 Secondary::Back => ("tracker-back", copy::BACK),
@@ -928,10 +1169,10 @@ impl TrackerConnectView {
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.secondary(window, cx)))
         });
         let primary = if self.flow.ready() {
-            style::button("tracker-primary", label, ButtonKind::Primary, ButtonSize::Base, false, theme)
+            style::button("tracker-primary", label.clone(), ButtonKind::Primary, ButtonSize::Base, false, theme)
                 .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.primary(window, cx)))
         } else {
-            style::disabled_button("tracker-primary", label, ButtonKind::Primary, ButtonSize::Base, theme)
+            style::disabled_button("tracker-primary", label.clone(), ButtonKind::Primary, ButtonSize::Base, theme)
         }
         .role(Role::Button)
         .aria_label(label)
@@ -1061,6 +1302,7 @@ mod tests {
             linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| StatusSync::NotNeeded),
+            preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
         }
     }
 
@@ -1165,7 +1407,7 @@ mod tests {
         assert_eq!(r.flow(|f| f.step()), Step::ChooseProject);
         r.keys("enter");
         r.keys("enter");
-        assert_eq!(r.flow(|f| (f.step(), f.primary_label())), (Step::ReviewImport, Some(copy::IMPORT)));
+        assert_eq!(r.flow(|f| (f.step(), f.primary_label())), (Step::ReviewImport, Some("Import 64 issues".to_string())));
         // Import writes the connection, through the service, once.
         r.keys("enter");
         assert_eq!(r.flow(|f| f.step()), Step::Importing);
@@ -1175,7 +1417,7 @@ mod tests {
         );
         assert!(r.flow(|f| f.finished().is_some()));
         assert!(r.drawn("tracker-progress-connection") && r.drawn("tracker-close"));
-        assert_eq!(r.flow(|f| f.primary_label()), Some(copy::VIEW_BOARD));
+        assert_eq!(r.flow(|f| f.primary_label()).as_deref(), Some(copy::VIEW_BOARD));
     }
 
     #[gpui::test]
@@ -1277,6 +1519,35 @@ mod tests {
     }
 
     #[gpui::test]
+    fn a_failed_preview_shows_why_and_retry_reads_it_again(cx: &mut TestAppContext) {
+        let reads = Arc::new(Mutex::new(0));
+        let mut service = recording(Arc::default());
+        let counter = reads.clone();
+        service.preview = Arc::new(move |choice| {
+            let mut n = counter.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                Err("gh: API rate limit exceeded".into())
+            } else {
+                shelbi_app::tracker_connect::fixture::answer(choice)
+            }
+        });
+        let mut r = local(cx, service, IssueTrackerConfig::default());
+        r.click("tracker-connect-github");
+        r.pick_repo();
+        r.keys("enter");
+        r.keys("enter");
+        assert_eq!(r.flow(|f| f.step()), Step::ReviewImport);
+        assert!(r.drawn("tracker-import-error") && r.drawn("tracker-import-retry"));
+        assert!(!r.drawn("tracker-import-summary"));
+        assert_eq!(r.flow(|f| f.primary_label()).as_deref(), Some(copy::IMPORT), "no count to put in the button");
+        r.click("tracker-import-retry");
+        assert_eq!(*reads.lock().unwrap(), 2);
+        assert!(!r.drawn("tracker-import-error") && r.drawn("tracker-import-summary"));
+        assert_eq!(r.flow(|f| f.primary_label()).as_deref(), Some("Import 64 issues"));
+    }
+
+    #[gpui::test]
     fn esc_closes_the_window(cx: &mut TestAppContext) {
         let mut r = local(cx, recording(Arc::default()), IssueTrackerConfig::default());
         let windows = r.cx.cx.update(|cx| cx.windows().len());
@@ -1315,6 +1586,10 @@ mod tests {
             assert!(asked.contains(&shelbi_app::far::Request::Github(want.clone())), "{want:?} went to the far daemon: {asked:?}");
         }
         assert!(
+            asked.contains(&shelbi_app::far::Request::ImportPreview(TrackerChoice::Github { repo: "acme/app".into() })),
+            "the review's read went to the far daemon: {asked:?}"
+        );
+        assert!(
             asked.iter().any(|q| matches!(q, shelbi_app::far::Request::ConnectTracker(c)
                 if c.choice == TrackerChoice::Github { repo: "acme/app".into() })),
             "{asked:?}"
@@ -1324,7 +1599,7 @@ mod tests {
             "{:?}",
             r.flow(|f| f.apply().clone())
         );
-        assert_eq!(r.flow(|f| f.primary_label()), Some(copy::SWITCH_ANYWAY));
+        assert_eq!(r.flow(|f| f.primary_label()).as_deref(), Some(copy::SWITCH_ANYWAY));
         assert!(r.drawn("tracker-error"));
     }
 }

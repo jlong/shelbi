@@ -50,6 +50,7 @@ use shelbi_app::board::DropTarget;
 use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
 use shelbi_app::board::{BoardRead, ClosedPage, MoreRequest};
 use shelbi_app::board_search::SearchWorker;
+use shelbi_app::tracker_connect::{import_copy, ImportWatch};
 use shelbi_app::source::{ProjectHandle, ProjectLink};
 use shelbi_app::state_write::{self, StateWrite};
 use shelbi_app::{
@@ -255,6 +256,11 @@ pub struct IssuesView {
     editor_tx: Sender<EditorEvent>,
     editor_rx: Receiver<EditorEvent>,
     last_refresh: Instant,
+    /// A tracker connection's first import, watched until a read of the new
+    /// tracker lands (`tracker-connect`), then the toast saying so (its
+    /// title, its line, and when it went up).
+    import: Option<Entity<ImportWatch>>,
+    import_toast: Option<(String, String, Instant)>,
     board_scroll: BoardScroll,
     /// Each expanded column's virtualized card list, by status id (a column
     /// keeps its scroll position across a filter change or a collapse).
@@ -344,6 +350,8 @@ impl IssuesView {
             editor_tx,
             editor_rx,
             last_refresh: Instant::now(),
+            import: None,
+            import_toast: None,
             board_scroll: BoardScroll::default(),
             column_lists: HashMap::new(),
             search_lists: HashMap::new(),
@@ -752,6 +760,11 @@ impl IssuesView {
         let open = self.open_refresher.latest();
         let closed = self.closed_refresher.latest();
         let mut changed = self.fold_reads(open, closed);
+        changed |= self.observe_import(cx);
+        if self.import_toast.as_ref().is_some_and(|(_, _, at)| at.elapsed() >= import_copy::TOAST_LIFETIME) {
+            self.import_toast = None;
+            changed = true;
+        }
         while let Ok(done) = self.done_rx.try_recv() {
             changed = true;
             match done {
@@ -859,6 +872,87 @@ impl IssuesView {
     /// board's read).
     pub fn new_task_workflows(&self) -> (Vec<shelbi_core::Workflow>, String) {
         self.state.new_task_workflows()
+    }
+
+    /// Watch for a tracker connection's import: the next read of the new
+    /// tracker's board is it. The watch says so (the connection flow's
+    /// Importing step follows it) and the board shows its toast.
+    pub fn watch_import(&mut self, watch: Entity<ImportWatch>, cx: &mut Context<Self>) {
+        self.import = Some(watch);
+        cx.notify();
+    }
+
+    /// Fold the read into the watched import; true when it landed.
+    fn observe_import(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(watch) = self.import.clone() else { return false };
+        let input = self.state.input();
+        let (tracker, loading, error, open) = (input.tracker, input.loading, input.error.is_some(), input.open.len());
+        let landed = watch.update(cx, |w, cx| {
+            let hit = w.observe(tracker, loading, error, open);
+            if hit {
+                cx.notify();
+            }
+            hit
+        });
+        if !landed {
+            return false;
+        }
+        let source = watch.read(cx).source().to_string();
+        self.import = None;
+        self.import_toast =
+            Some((import_copy::toast_title(open), import_copy::toast_detail(&source), Instant::now()));
+        true
+    }
+
+    /// Fold `read` as a refresh would (tests hand in what the board reads).
+    #[cfg(test)]
+    pub fn fold_read_for_test(&mut self, read: BoardRead, cx: &mut Context<Self>) {
+        self.state.apply_reads(Some(read), None);
+        self.observe_import(cx);
+        cx.notify();
+    }
+
+    /// The import toast, while it's up (its title and line).
+    #[cfg(test)]
+    pub fn import_toast(&self) -> Option<(&str, &str)> {
+        self.import_toast.as_ref().map(|(t, d, _)| (t.as_str(), d.as_str()))
+    }
+
+    /// The import toast at the board's bottom right (08-connected-board):
+    /// "✓ 64 issues imported" in green over "acme/app · Synced just now". A
+    /// click dismisses it; it goes by itself after a few seconds.
+    fn render_import_toast(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (title, detail, _) = self.import_toast.as_ref()?;
+        Some(
+            style::popover(div().id("board-import-toast"), theme)
+                .debug_selector(|| "board-import-toast".into())
+                .role(gpui::Role::Status)
+                .absolute()
+                .right(px(16.0))
+                .bottom(px(FOOTER_H + 12.0))
+                .w(px(360.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .px(px(16.0))
+                .py(px(12.0))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .type_style(Type::BaseMedium)
+                        .text_color(theme.green)
+                        .child(heroicon(icons::CHECK).text_color(theme.green))
+                        .child(title.clone()),
+                )
+                .child(div().type_style(Type::Small).text_color(theme.muted).child(detail.clone()))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.import_toast = None;
+                    cx.notify();
+                })),
+        )
     }
 
     /// Read the board again now (New task created an issue).
@@ -1446,6 +1540,7 @@ impl IssuesView {
         };
         let (workflow_set, workspace_set) = (filters.workflow.is_some(), filters.workspace.is_some());
         let banner = model.banner.clone();
+        let connection = model.connection.clone();
         // The search's note beside its field: the match count, or that the
         // board shows local results because GitHub's search is unavailable.
         let search_note = model.search.as_ref().and_then(|s| s.label());
@@ -1515,6 +1610,16 @@ impl IssuesView {
                         .type_style(Type::XSmall)
                         .text_color(theme.muted)
                         .child(note),
+                )
+            })
+            .when_some(connection, |row, connection| {
+                row.child(
+                    div()
+                        .debug_selector(|| "board-connection".into())
+                        .flex_none()
+                        .type_style(Type::Small)
+                        .text_color(theme.foreground)
+                        .child(connection),
                 )
             })
             .child(search)
@@ -2425,6 +2530,7 @@ impl Render for IssuesView {
             .children(task_detail::render_card_menu(self, cx))
             .children(self.render_assign(&theme, cx))
             .children(self.render_confirm_delete(&theme, cx))
+            .children(self.render_import_toast(&theme, cx))
             .into_any_element()
     }
 }

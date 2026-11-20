@@ -2559,6 +2559,7 @@ impl Run {
         use crate::views::tracker_connect::{TrackerConnectView, SIZE};
         use shelbi_app::new_project::Tracker;
         use shelbi_app::source::{ProjectHandle, ProjectKey};
+        use shelbi_app::tracker_connect::flow::Step;
         use shelbi_app::tracker_connect::StatusSync;
         use shelbi_core::{GithubConnection, IssueTrackerBackend, IssueTrackerConfig};
 
@@ -2567,6 +2568,7 @@ impl Run {
             linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| StatusSync::NotNeeded),
+            preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
         };
         let github = IssueTrackerConfig {
             backend: IssueTrackerBackend::Github,
@@ -2620,6 +2622,75 @@ impl Run {
                 .unwrap();
             self.settle_sheet(window);
             self.settle_sheet(window);
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+
+        // The later steps (04-agent-rules, 06-review-import, 07-importing):
+        // a choice made, then Continue pressed `steps` times, each answered.
+        let mut writes = service.clone();
+        writes.connect = Arc::new(|req| {
+            Ok(shelbi_app::tracker_connect::Connected {
+                backend: req.choice.backend(),
+                previous: IssueTrackerBackend::FileSystem,
+                file: "my-project.yaml".into(),
+                summary: "the tracker".into(),
+                statuses: if req.choice.backend() == IssueTrackerBackend::Linear {
+                    StatusSync::Synced("6 statuses".into())
+                } else {
+                    StatusSync::NotNeeded
+                },
+            })
+        });
+        let later: [(&str, Tracker, Edit, usize); 5] = [
+            ("tracker-rules", Tracker::Linear, team, 1),
+            ("tracker-rules-github", Tracker::Github, repo, 1),
+            ("tracker-review", Tracker::Github, repo, 2),
+            ("tracker-review-linear", Tracker::Linear, team, 2),
+            ("tracker-importing", Tracker::Linear, team, 3),
+        ];
+        for (screen, tracker, edit, steps) in later {
+            let service = writes.clone();
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                    cx.new(|cx| {
+                        let project = ProjectHandle::null(ProjectKey::local("my-project"));
+                        TrackerConnectView::new(project, service, None, window, cx)
+                    })
+                })
+                .expect("open the offscreen window");
+            let view = handle.entity(&self.cx).expect("the view");
+            let window: AnyWindowHandle = handle.into();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |v, cx| {
+                        v.loaded(Ok(IssueTrackerConfig::default()), window, cx);
+                        v.edit_flow(|f| { f.connect(tracker); }, window, cx);
+                    })
+                })
+                .unwrap();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.edit_flow(edit, window, cx)))
+                .unwrap();
+            self.settle_sheet(window);
+            for _ in 0..steps {
+                self.cx
+                    .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.edit_flow(|f| { f.advance(); }, window, cx)))
+                    .unwrap();
+                self.settle_sheet(window);
+                self.settle_sheet(window);
+            }
+            self.settle_sheet(window);
+            let want = match steps {
+                1 => Step::AgentRules,
+                2 => Step::ReviewImport,
+                _ => Step::Importing,
+            };
+            let at = view.read_with(&self.cx, |v, _| v.flow().step());
+            self.expect(&format!("{screen}: on {want:?} (on {at:?})"), at == want);
             self.write_sized(window, screen, SIZE.0 as u32);
             let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
         }
@@ -2909,6 +2980,7 @@ impl Run {
             linear: Arc::new(linear),
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| StatusSync::NotNeeded),
+            preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
         };
         let tracker_states: [(&str, Answer, bool, bool); 3] = [
             ("settings-tracker-linear", fixture::answer, true, false),

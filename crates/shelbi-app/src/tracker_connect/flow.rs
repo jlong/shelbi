@@ -25,19 +25,24 @@
 //!   ([`FlowRequest::Github`] / [`FlowRequest::Linear`]) and moves on when
 //!   that passes, or shows why it didn't.
 //! - **Agent rules** (04-agent-rules): the project's [`AgentRules`]
-//!   (`issue_tracker.agent_rules`), written with the connection; `tc-import`
-//!   draws the toggles.
-//! - **Review import** (06-review-import): a placeholder for `tc-import`'s
-//!   preview. Its primary button starts the connection.
+//!   (`issue_tracker.agent_rules`), two switches (both on for a project
+//!   with no tracker yet), written with the connection.
+//! - **Review import** (06-review-import): what the import would bring in,
+//!   from one read of the chosen connection where the project lives
+//!   ([`FlowRequest::Preview`], answered with [`TrackerFlow::preview_answer`]):
+//!   the open count, who agents may work for under the rules, the first few
+//!   issues and the closed ones left out. A failed read offers Retry. Its
+//!   primary button (Import N issues) starts the connection.
 //! - **Importing** (07-importing): the connection runs
 //!   ([`crate::tracker_connect::ConnectTracker`], answered with
-//!   [`TrackerFlow::connected`]); `tc-import` adds the import's progress.
-//!   A refusal (the local board has issues) offers Switch anyway, as
-//!   Settings does.
+//!   [`TrackerFlow::connected`]); then the project's board reads the new
+//!   tracker, and the step completes when its first read lands
+//!   ([`TrackerFlow::imported`]). A refusal (the local board has issues)
+//!   offers Switch anyway, as Settings does.
 
 use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig};
 
-use super::{ConnectError, ConnectTracker, Connected, TrackerChoice};
+use super::{import_copy, ConnectError, ConnectTracker, Connected, ImportPreview, TrackerChoice};
 use crate::github_setup::{GithubAnswer, GithubChoice, GithubRequest, REPO_REQUIRED};
 use crate::linear_setup::{LinearAnswer, LinearChoice, LinearRequest, TEAM_REQUIRED};
 use crate::new_project::{github_config, Tracker};
@@ -175,6 +180,20 @@ pub enum Apply {
     Refused(ConnectError),
 }
 
+/// The Review import step's read of what the import would bring in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Preview {
+    /// Not asked for (any step before Review import).
+    Idle,
+    /// Asked for: [`TrackerFlow::due`] hands it to the host next.
+    Wanted,
+    /// The host is reading it.
+    Loading,
+    Loaded(ImportPreview),
+    /// The read failed: why (the step offers Retry).
+    Failed(String),
+}
+
 /// Blocking work the host runs off the UI thread, answering with
 /// [`TrackerFlow::linear_answer`] or [`TrackerFlow::connected`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +207,9 @@ pub enum FlowRequest {
     /// Write the connection (`apply_tracker_connection`, where the project
     /// lives).
     Connect(ConnectTracker),
+    /// Read what a first import of this connection would bring in, where the
+    /// project lives (answered with [`TrackerFlow::preview_answer`]).
+    Preview(TrackerChoice),
 }
 
 /// The footer's left button.
@@ -221,7 +243,12 @@ pub struct TrackerFlow {
     /// preflight it started passes.
     advancing: bool,
     rules: AgentRules,
+    /// The Review import step's read, and the connection it was read for.
+    preview: Preview,
+    preview_for: Option<TrackerChoice>,
     apply: Apply,
+    /// How many issues the board's first read of the new tracker brought in.
+    imported: Option<usize>,
     /// Why Continue was refused.
     error: Option<String>,
 }
@@ -236,7 +263,10 @@ impl Default for TrackerFlow {
             linear: LinearChoice::default(),
             advancing: false,
             rules: DEFAULT_RULES,
+            preview: Preview::Idle,
+            preview_for: None,
             apply: Apply::Idle,
+            imported: None,
             error: None,
         }
     }
@@ -453,6 +483,85 @@ impl TrackerFlow {
         crate::tracker_connect::rules_copy::assigned_title(self.account())
     }
 
+    // ---- Review import ----------------------------------------------------
+
+    /// The Review import step's read.
+    pub fn preview(&self) -> &Preview {
+        &self.preview
+    }
+
+    /// The preview, once read.
+    pub fn previewed(&self) -> Option<&ImportPreview> {
+        match &self.preview {
+            Preview::Loaded(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// Ask for the preview of the current choice unless it's read (or being
+    /// read) already: on reaching Review import, and on Retry.
+    fn want_preview(&mut self) {
+        let choice = self.wanted();
+        let fresh = choice.is_some() && self.preview_for == choice;
+        match self.preview {
+            Preview::Loaded(_) | Preview::Loading | Preview::Wanted if fresh => {}
+            _ => {
+                self.preview = Preview::Wanted;
+                self.preview_for = choice;
+            }
+        }
+    }
+
+    /// The failed read's Retry.
+    pub fn retry_preview(&mut self) {
+        if self.step == Step::ReviewImport && matches!(self.preview, Preview::Failed(_)) {
+            self.preview = Preview::Idle;
+            self.want_preview();
+        }
+    }
+
+    /// The answer to a [`FlowRequest::Preview`]. An answer for a choice that
+    /// has since changed is dropped.
+    pub fn preview_answer(&mut self, choice: &TrackerChoice, result: Result<ImportPreview, String>) {
+        if self.preview != Preview::Loading || self.preview_for.as_ref() != Some(choice) {
+            return;
+        }
+        self.preview = match result {
+            Ok(p) => Preview::Loaded(p),
+            Err(why) => Preview::Failed(why),
+        };
+    }
+
+    // ---- Importing --------------------------------------------------------
+
+    /// How many open issues the import is bringing in, as the preview read
+    /// them.
+    pub fn expected(&self) -> Option<usize> {
+        self.previewed().map(|p| p.open)
+    }
+
+    /// The project's board read the new tracker: the import is done, with
+    /// `open` issues.
+    pub fn imported(&mut self, open: usize) {
+        if matches!(self.apply, Apply::Done(_)) && self.imported.is_none() {
+            self.imported = Some(open);
+        }
+    }
+
+    /// How many issues the import brought in, once the board has them.
+    pub fn landed(&self) -> Option<usize> {
+        self.imported
+    }
+
+    /// The Importing step's import line: "Importing 64 issues…" until the
+    /// board has them, then "Imported 64 issues".
+    pub fn import_line(&self) -> String {
+        match self.imported {
+            Some(n) => import_copy::imported(n),
+            None => import_copy::importing(self.expected()),
+        }
+    }
+
 
     // ---- moving -----------------------------------------------------------
 
@@ -468,7 +577,10 @@ impl TrackerFlow {
                 };
                 !blocked && self.wanted().is_some()
             }
-            Step::AgentRules | Step::ReviewImport => true,
+            Step::AgentRules => true,
+            // The count is in the button: it waits for the read (a failed
+            // read can still import, or Retry).
+            Step::ReviewImport => matches!(self.preview, Preview::Loaded(_) | Preview::Failed(_)),
             Step::Importing => match &self.apply {
                 Apply::Running | Apply::Done(_) | Apply::Refused(_) => true,
                 Apply::Idle | Apply::Wanted { .. } => false,
@@ -561,9 +673,13 @@ impl TrackerFlow {
         }
         self.step = match self.step {
             Step::ChooseProject => Step::AgentRules,
-            Step::AgentRules => Step::ReviewImport,
+            Step::AgentRules => {
+                self.want_preview();
+                Step::ReviewImport
+            }
             Step::ReviewImport => {
                 self.apply = Apply::Wanted { force: false };
+                self.imported = None;
                 Step::Importing
             }
             Step::Chooser | Step::Importing => return false,
@@ -613,18 +729,24 @@ impl TrackerFlow {
     }
 
     /// The primary button's label; the chooser has none (its cards connect).
-    pub fn primary_label(&self) -> Option<&'static str> {
-        match self.step {
-            Step::Chooser => None,
-            Step::ChooseProject if self.checking() => Some(CHECKING),
-            Step::ChooseProject | Step::AgentRules => Some(CONTINUE),
-            Step::ReviewImport => Some(IMPORT),
-            Step::Importing => Some(match &self.apply {
+    pub fn primary_label(&self) -> Option<String> {
+        let label = match self.step {
+            Step::Chooser => return None,
+            Step::ChooseProject if self.checking() => CHECKING,
+            Step::ChooseProject | Step::AgentRules => CONTINUE,
+            Step::ReviewImport => {
+                return Some(match self.previewed() {
+                    Some(p) => import_copy::import_button(p.open),
+                    None => IMPORT.to_string(),
+                })
+            }
+            Step::Importing => match &self.apply {
                 Apply::Refused(_) if self.offers_force() => SWITCH_ANYWAY,
                 Apply::Refused(_) => TRY_AGAIN,
                 _ => VIEW_BOARD,
-            }),
-        }
+            },
+        };
+        Some(label.to_string())
     }
 
     /// The primary button: Continue on the steps before Importing; there,
@@ -659,6 +781,15 @@ impl TrackerFlow {
             };
             self.apply = Apply::Running;
             return Some(FlowRequest::Connect(ConnectTracker::new(choice, force).with_rules(self.rules)));
+        }
+        if self.preview == Preview::Wanted {
+            match self.preview_for.clone() {
+                Some(choice) => {
+                    self.preview = Preview::Loading;
+                    return Some(FlowRequest::Preview(choice));
+                }
+                None => self.preview = Preview::Idle,
+            }
         }
         if self.step == Step::ChooseProject {
             match self.tracker {
@@ -755,6 +886,10 @@ mod tests {
             match req {
                 FlowRequest::Linear(req) => flow.linear_answer(fixture::answer(req)),
                 FlowRequest::Github(req) => flow.github_answer(github_fixture::answer(req)),
+                FlowRequest::Preview(choice) => {
+                    let answer = crate::tracker_connect::fixture::answer(choice.clone());
+                    flow.preview_answer(&choice, answer)
+                }
                 FlowRequest::Connect(c) => panic!("no connection yet: {c:?}"),
             }
         }
@@ -764,7 +899,7 @@ mod tests {
     fn continue_(flow: &mut TrackerFlow) -> bool {
         let before = flow.step();
         flow.advance();
-        if before == Step::ChooseProject {
+        if before != Step::ReviewImport {
             answer_reads(flow);
         }
         flow.step() != before
@@ -819,7 +954,7 @@ mod tests {
         let mut flow = TrackerFlow::new();
         flow.load(&local());
         assert_eq!((flow.step(), flow.counter()), (Step::Chooser, None));
-        assert_eq!((flow.primary_label(), flow.secondary()), (None, None), "the cards connect");
+        assert_eq!((flow.primary_label().as_deref(), flow.secondary()), (None, None), "the cards connect");
         assert!(!flow.advance() && !flow.back());
 
         assert!(flow.connect(Tracker::Github));
@@ -892,7 +1027,7 @@ mod tests {
         assert!(flow.ready());
         assert!(!flow.advance(), "Continue runs the preflight first");
         assert!(flow.checking());
-        assert_eq!(flow.primary_label(), Some(CHECKING));
+        assert_eq!(flow.primary_label().as_deref(), Some(CHECKING));
         assert!(!flow.ready(), "one preflight at a time");
         let Some(FlowRequest::Linear(req @ LinearRequest::Preflight(_))) = flow.due() else { panic!("the preflight") };
         flow.linear_answer(fixture::answer(req));
@@ -919,7 +1054,7 @@ mod tests {
         flow.github_answer(GithubAnswer::Preflight { repo: "acme/app".into(), result: Err("Issues disabled".into()) });
         assert_eq!(flow.step(), Step::ChooseProject);
         assert_eq!(flow.error().as_deref(), Some("Issues disabled"));
-        assert_eq!(flow.primary_label(), Some(CONTINUE));
+        assert_eq!(flow.primary_label().as_deref(), Some(CONTINUE));
 
         // Back while a preflight runs: its pass doesn't carry the step on.
         flow.advance();
@@ -990,7 +1125,7 @@ mod tests {
     #[test]
     fn import_starts_the_connection_and_view_board_follows_it() {
         let mut flow = at_review("acme/app");
-        assert_eq!(flow.primary_label(), Some(IMPORT));
+        assert_eq!(flow.primary_label().as_deref(), Some("Import 64 issues"));
         assert_eq!(flow.primary(), Action::None);
         assert_eq!(flow.step(), Step::Importing);
         assert_eq!(
@@ -1001,7 +1136,7 @@ mod tests {
             ))
         );
         assert_eq!(flow.due(), None, "asked once");
-        assert_eq!(flow.primary_label(), Some(VIEW_BOARD));
+        assert_eq!(flow.primary_label().as_deref(), Some(VIEW_BOARD));
         flow.connected(Ok(connected()));
         assert_eq!(flow.finished().map(|c| c.summary.as_str()), Some("GitHub acme/app"));
         assert_eq!(flow.connected_tracker(), Some(Tracker::Github), "the flow holds the new connection");
@@ -1009,6 +1144,87 @@ mod tests {
         // A late or repeated answer changes nothing.
         flow.connected(Err(ConnectError::Failed("late".into())));
         assert!(flow.finished().is_some());
+
+        // The board's first read of the new tracker completes the import.
+        assert_eq!((flow.landed(), flow.import_line()), (None, "Importing 64 issues…".to_string()));
+        flow.imported(61);
+        assert_eq!((flow.landed(), flow.import_line()), (Some(61), "Imported 61 issues".to_string()));
+        flow.imported(70);
+        assert_eq!(flow.landed(), Some(61), "the first read is the import");
+    }
+
+    #[test]
+    fn review_reads_the_preview_once_and_a_failure_retries() {
+        let mut flow = TrackerFlow::new();
+        flow.load(&local());
+        flow.connect(Tracker::Github);
+        flow.set_repo("acme/app");
+        assert!(continue_(&mut flow));
+        assert_eq!(flow.step(), Step::AgentRules);
+        assert_eq!(flow.preview(), &Preview::Idle, "not read before the step");
+        flow.advance();
+        assert_eq!(flow.step(), Step::ReviewImport);
+        let choice = TrackerChoice::Github { repo: "acme/app".into() };
+        assert_eq!(flow.due(), Some(FlowRequest::Preview(choice.clone())));
+        assert_eq!(flow.due(), None, "asked once");
+        assert!(!flow.ready(), "Import waits for the count");
+        assert_eq!(flow.primary_label().as_deref(), Some(IMPORT));
+        // A stale answer (another repo) is dropped.
+        flow.preview_answer(&TrackerChoice::Github { repo: "acme/web".into() }, Err("x".into()));
+        assert_eq!(flow.preview(), &Preview::Loading);
+        flow.preview_answer(&choice, Err("gh: rate limited".into()));
+        assert_eq!(flow.preview(), &Preview::Failed("gh: rate limited".into()));
+        assert!(flow.ready(), "a failed read can still import");
+        flow.retry_preview();
+        assert_eq!(flow.due(), Some(FlowRequest::Preview(choice.clone())));
+        flow.preview_answer(&choice, crate::tracker_connect::fixture::answer(choice.clone()));
+        assert_eq!(flow.expected(), Some(64));
+
+        // Back and on again keeps the read; another repo reads again.
+        flow.back();
+        flow.advance();
+        assert_eq!(flow.due(), None);
+        assert_eq!(flow.expected(), Some(64));
+        flow.back();
+        flow.back();
+        flow.set_repo("acme/web");
+        answer_reads(&mut flow);
+        assert!(continue_(&mut flow) && continue_(&mut flow));
+        assert_eq!(flow.step(), Step::ReviewImport);
+        assert_eq!(flow.expected(), Some(64), "acme/web's read (the fixture's counts)");
+        assert_eq!(flow.subheading(), "Import from acme/web. Your existing Shelbi tasks stay on this board.");
+    }
+
+    #[test]
+    fn the_review_copy_follows_the_assignment_rule() {
+        use crate::tracker_connect::{import_copy as c, ImportPreview};
+        let p = ImportPreview { open: 64, mine: 48, unassigned: 4, closed: 12, ..Default::default() };
+        let on = AgentRules { require_review: true, assigned_only: true };
+        let off = AgentRules { require_review: true, assigned_only: false };
+        assert_eq!(c::will_import(64), "64 open issues will be imported");
+        assert_eq!(
+            c::eligibility(&p, on),
+            vec![
+                "48 assigned to you are eligible for agents.".to_string(),
+                "16 others stay visible, but agents will not pick them up.".to_string(),
+            ]
+        );
+        assert_eq!(
+            c::eligibility(&p, off),
+            vec![
+                "48 assigned to you and 4 unassigned are eligible for agents.".to_string(),
+                "12 assigned to others stay visible, but agents will not pick them up.".to_string(),
+            ]
+        );
+        assert_eq!((p.eligible(on), p.eligible(off)), (48, 52));
+        assert_eq!(c::closed_note(&p), "12 closed issues are excluded. Imported tasks will follow your review and assignment rules.");
+        let capped = ImportPreview { closed: 1000, closed_capped: true, ..p.clone() };
+        assert!(c::closed_note(&capped).starts_with("1000+ closed issues are excluded."));
+        let one = ImportPreview { open: 1, mine: 1, ..Default::default() };
+        assert_eq!(c::will_import(1), "1 open issue will be imported");
+        assert_eq!(c::eligibility(&one, on), vec!["1 assigned to you is eligible for agents.".to_string()]);
+        assert_eq!(c::import_button(1), "Import 1 issue");
+        assert_eq!((c::toast_title(64), c::toast_detail("acme/app")), ("64 issues imported".into(), "acme/app · Synced just now".into()));
     }
 
     #[test]
@@ -1023,13 +1239,13 @@ mod tests {
             message: "project `app` has 3 issues on the local file system".into(),
         }));
         assert!(flow.error().unwrap().starts_with("Project `app` has 3 issues"));
-        assert_eq!(flow.primary_label(), Some(SWITCH_ANYWAY));
+        assert_eq!(flow.primary_label().as_deref(), Some(SWITCH_ANYWAY));
         assert_eq!(flow.secondary(), Some(Secondary::Back));
         assert_eq!(flow.primary(), Action::None);
         let Some(FlowRequest::Connect(req)) = flow.due() else { panic!("a forced retry") };
         assert!(req.force);
         flow.connected(Err(ConnectError::Preflight("gh can't see acme/app".into())));
-        assert_eq!(flow.primary_label(), Some(TRY_AGAIN), "a failed preflight can't be forced");
+        assert_eq!(flow.primary_label().as_deref(), Some(TRY_AGAIN), "a failed preflight can't be forced");
         assert!(flow.back());
         assert_eq!((flow.step(), flow.apply()), (Step::ReviewImport, &Apply::Idle));
         assert_eq!(flow.error(), None);

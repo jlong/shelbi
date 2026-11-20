@@ -36,7 +36,15 @@ pub struct FarServices {
     /// Connect to an Issue tracker's GitHub reads, through this machine's
     /// `gh`.
     pub github: Arc<dyn Fn(shelbi_app::github_setup::GithubRequest) -> shelbi_app::github_setup::GithubAnswer + Send + Sync>,
+    /// Review your first import's read for a project here (its `gh`, or
+    /// its Linear key).
+    pub import_preview: Arc<ImportPreviewFn>,
 }
+
+/// [`FarServices::import_preview`]: the project, and the connection to read.
+pub type ImportPreviewFn = dyn Fn(&str, &shelbi_app::tracker_connect::TrackerChoice) -> Result<shelbi_app::tracker_connect::ImportPreview, String>
+    + Send
+    + Sync;
 
 impl FarServices {
     /// This machine's live services.
@@ -48,6 +56,7 @@ impl FarServices {
             spawn_editor: Arc::new(spawn_editor),
             agent_send: crate::agent_send::service(),
             github: Arc::new(crate::project_create::github::answer),
+            import_preview: Arc::new(crate::tracker_connect::import_preview),
         }
     }
 }
@@ -88,6 +97,7 @@ pub fn answer_with(services: &FarServices, project: &str, request: Request) -> R
         Request::Linear(req) => Reply::Linear(crate::project_create::linear::answer(Some(project), req)),
         Request::Github(req) => Reply::Github((services.github)(req)),
         Request::SyncStatuses => Reply::StatusesSynced(crate::tracker_connect::sync_statuses_now(project)),
+        Request::ImportPreview(choice) => Reply::ImportPreview((services.import_preview)(project, &choice)),
     }
 }
 
@@ -209,6 +219,7 @@ mod tests {
             spawn_editor: Arc::new(|_, _, _| panic!("never spawned")),
             agent_send: crate::agent_send::service(),
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
+            import_preview: Arc::new(|_, choice| shelbi_app::tracker_connect::fixture::answer(choice.clone())),
         };
         let reply = answer_with(
             &services,

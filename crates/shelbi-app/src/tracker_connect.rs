@@ -39,6 +39,258 @@ pub mod rules_copy {
     }
 }
 
+/// What a first import would bring in (06-review-import): one read of the
+/// chosen connection on the project's machine, before anything is written.
+/// GitHub's counts are the repository's issues (pull requests aside); Linear's
+/// are the team's, narrowed by the chosen project.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportPreview {
+    /// Open issues: what the board will show.
+    pub open: usize,
+    /// Open issues assigned to the connected account.
+    pub mine: usize,
+    /// Open issues assigned to no one.
+    pub unassigned: usize,
+    /// Closed issues, which the import leaves out.
+    pub closed: usize,
+    /// `closed` stopped counting at a cap: there are at least that many.
+    #[serde(default)]
+    pub closed_capped: bool,
+    /// The first few open issues (newest first).
+    #[serde(default)]
+    pub first: Vec<PreviewIssue>,
+}
+
+/// One issue in the preview: `#128` or `ENG-12`, and its title.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreviewIssue {
+    pub key: String,
+    pub title: String,
+}
+
+/// How many issues the preview lists.
+pub const PREVIEW_ISSUES: usize = 3;
+
+impl ImportPreview {
+    /// Open issues assigned to someone else.
+    pub fn others(&self) -> usize {
+        self.open.saturating_sub(self.mine + self.unassigned)
+    }
+
+    /// Open issues agents may start under `rules`: the user's own, plus the
+    /// unassigned ones when `assigned_only` is off (they're claimed on start).
+    pub fn eligible(&self, rules: AgentRules) -> usize {
+        if rules.assigned_only {
+            self.mine
+        } else {
+            (self.mine + self.unassigned).min(self.open)
+        }
+    }
+}
+
+/// The review and importing steps' counted copy (06-review-import,
+/// 07-importing), and the board's toast after an import (08-connected-board).
+pub mod import_copy {
+    use super::{AgentRules, ImportPreview};
+
+    pub const ISSUES_TO_IMPORT: &str = "Issues to import";
+    pub const ALL_OPEN: &str = "All open issues";
+    pub const LOADING: &str = "Reading the issues to import…";
+    pub const SYNCED_NOW: &str = "Synced just now";
+    /// How long the board's import toast stays up (a click dismisses it
+    /// sooner).
+    pub const TOAST_LIFETIME: std::time::Duration = std::time::Duration::from_secs(6);
+
+    /// `1 issue`, `64 issues`.
+    pub fn issues(n: usize) -> String {
+        format!("{n} issue{}", if n == 1 { "" } else { "s" })
+    }
+
+    /// "64 open issues will be imported" (the summary card's title).
+    pub fn will_import(n: usize) -> String {
+        match n {
+            0 => "No open issues to import".to_string(),
+            1 => "1 open issue will be imported".to_string(),
+            n => format!("{n} open issues will be imported"),
+        }
+    }
+
+    /// The summary card's lines under its title: who agents may work for.
+    pub fn eligibility(p: &ImportPreview, rules: AgentRules) -> Vec<String> {
+        let them = |n: usize| if n == 1 { "stays" } else { "stay" };
+        let others = p.others();
+        if rules.assigned_only {
+            let mut lines = vec![format!("{} assigned to you {} eligible for agents.", p.mine, are(p.mine))];
+            let rest = p.open.saturating_sub(p.mine);
+            if rest > 0 {
+                lines.push(format!(
+                    "{rest} other{} {} visible, but agents will not pick {} up.",
+                    if rest == 1 { "" } else { "s" },
+                    them(rest),
+                    if rest == 1 { "it" } else { "them" }
+                ));
+            }
+            lines
+        } else {
+            let mut lines = vec![format!(
+                "{} assigned to you and {} unassigned {} eligible for agents.",
+                p.mine,
+                p.unassigned,
+                are(p.mine + p.unassigned)
+            )];
+            if others > 0 {
+                lines.push(format!(
+                    "{others} assigned to others {} visible, but agents will not pick {} up.",
+                    them(others),
+                    if others == 1 { "it" } else { "them" }
+                ));
+            }
+            lines
+        }
+    }
+
+    fn are(n: usize) -> &'static str {
+        if n == 1 {
+            "is"
+        } else {
+            "are"
+        }
+    }
+
+    /// "12 closed issues are excluded. Imported tasks will follow your
+    /// review and assignment rules."
+    pub fn closed_note(p: &ImportPreview) -> String {
+        let n = p.closed;
+        let count = if p.closed_capped { format!("{n}+ closed issues are") } else if n == 1 {
+            "1 closed issue is".to_string()
+        } else {
+            format!("{n} closed issues are")
+        };
+        format!("{count} excluded. Imported tasks will follow your review and assignment rules.")
+    }
+
+    /// "Import 64 issues" (the review step's primary button).
+    pub fn import_button(n: usize) -> String {
+        format!("Import {}", issues(n))
+    }
+
+    /// "Importing 64 issues…" while the board's first read is on its way.
+    pub fn importing(n: Option<usize>) -> String {
+        match n {
+            Some(n) => format!("Importing {}…", issues(n)),
+            None => "Importing your issues…".to_string(),
+        }
+    }
+
+    /// "Imported 64 issues" once the board has them.
+    pub fn imported(n: usize) -> String {
+        format!("Imported {}", issues(n))
+    }
+
+    /// The board's toast: "64 issues imported".
+    pub fn toast_title(n: usize) -> String {
+        format!("{} imported", issues(n))
+    }
+
+    /// The board's toast's second line: "acme/app · Synced just now".
+    pub fn toast_detail(source: &str) -> String {
+        format!("{source} · {SYNCED_NOW}")
+    }
+
+    /// The Issues header's connection: "Connected · acme/app".
+    pub fn connected(source: &str) -> String {
+        format!("Connected · {source}")
+    }
+}
+
+/// What the Issues header names a connection by: the GitHub repository, or
+/// the Linear project (else its team). `None` on the local board.
+pub fn source_name(cfg: &IssueTrackerConfig) -> Option<String> {
+    let name = match cfg.backend {
+        IssueTrackerBackend::Github => cfg.github.as_ref().map(|g| g.repo.trim().to_string()),
+        IssueTrackerBackend::Linear => cfg.linear.as_ref().map(|l| {
+            l.project.clone().filter(|p| !p.trim().is_empty()).unwrap_or_else(|| l.team.clone())
+        }),
+        IssueTrackerBackend::FileSystem | IssueTrackerBackend::Jira => None,
+    }?;
+    (!name.trim().is_empty()).then_some(name)
+}
+
+/// A connection's first import, watched until the board has it: the flow
+/// hands it to the project's board, which reports the first read of the
+/// new tracker's board ([`ImportWatch::observe`]); the Importing step and
+/// the board's toast follow it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportWatch {
+    backend: IssueTrackerBackend,
+    source: String,
+    landed: Option<usize>,
+}
+
+impl ImportWatch {
+    pub fn new(backend: IssueTrackerBackend, source: impl Into<String>) -> Self {
+        ImportWatch { backend, source: source.into(), landed: None }
+    }
+
+    /// A board read landed: on the new tracker, warm and without an error,
+    /// it's the import, `open` issues in all. True the first time.
+    pub fn observe(&mut self, tracker: IssueTrackerBackend, loading: bool, error: bool, open: usize) -> bool {
+        if self.landed.is_some() || tracker != self.backend || loading || error {
+            return false;
+        }
+        self.landed = Some(open);
+        true
+    }
+
+    /// How many issues the import brought in, once the board has them.
+    pub fn landed(&self) -> Option<usize> {
+        self.landed
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
+    }
+
+    pub fn backend(&self) -> IssueTrackerBackend {
+        self.backend
+    }
+}
+
+/// A canned preview for tests and the offscreen renders: the frame's
+/// counts (64 open, 48 yours, 12 closed), keyed for the tracker.
+pub mod fixture {
+    use super::{ImportPreview, PreviewIssue, TrackerChoice};
+
+    pub const TITLES: [&str; 3] = ["Fix keyboard navigation", "Restore the previous view", "Keep the sidebar width"];
+
+    pub fn preview(choice: &TrackerChoice) -> ImportPreview {
+        let key = |n: usize| match choice {
+            TrackerChoice::Linear(conn) => {
+                let team = conn.team_ref().unwrap_or("ENG").to_ascii_uppercase();
+                format!("{team}-{n}")
+            }
+            _ => format!("#{n}"),
+        };
+        ImportPreview {
+            open: 64,
+            mine: 48,
+            unassigned: 4,
+            closed: 12,
+            closed_capped: false,
+            first: TITLES
+                .iter()
+                .enumerate()
+                .map(|(i, t)| PreviewIssue { key: key(128 + i), title: t.to_string() })
+                .collect(),
+        }
+    }
+
+    /// [`preview`] as a service answers it.
+    pub fn answer(choice: TrackerChoice) -> Result<ImportPreview, String> {
+        Ok(preview(&choice))
+    }
+}
+
 /// Who the connected account is on GitHub, for "assigned to me (<account>)"
 /// in Settings: the host runs [`crate::github_setup::GithubRequest::Account`]
 /// once and answers. (The connection flow reads it through its

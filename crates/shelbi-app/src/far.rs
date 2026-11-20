@@ -106,6 +106,10 @@ pub enum Request {
     /// Sync the project's status catalog from its tracker now (Settings ▸
     /// Workflows' "Sync now" on a Linear-managed catalog).
     SyncStatuses,
+    /// What a first import of this connection would bring in (Connect to an
+    /// Issue tracker's Review your first import), read where the project
+    /// lives.
+    ImportPreview(crate::tracker_connect::TrackerChoice),
 }
 
 /// The far daemon's answer to a [`Request`].
@@ -124,6 +128,7 @@ pub enum Reply {
     Linear(crate::linear_setup::LinearAnswer),
     Github(crate::github_setup::GithubAnswer),
     StatusesSynced(crate::tracker_connect::StatusSync),
+    ImportPreview(Result<crate::tracker_connect::ImportPreview, String>),
 }
 
 /// The far paths a path Cmd+clicked in a far terminal may name: as
@@ -268,6 +273,19 @@ pub fn sync_statuses(link: &ProjectLink) -> crate::tracker_connect::StatusSync {
         Ok(Reply::StatusesSynced(sync)) => sync,
         Ok(other) => StatusSync::Failed(unexpected(&other)),
         Err(e) => StatusSync::Failed(e),
+    }
+}
+
+/// Read what a first import of `choice` would bring in for `link`'s project
+/// through its daemon (blocking).
+pub fn import_preview(
+    link: &ProjectLink,
+    choice: crate::tracker_connect::TrackerChoice,
+) -> Result<crate::tracker_connect::ImportPreview, String> {
+    match link.far_request(&Request::ImportPreview(choice)) {
+        Ok(Reply::ImportPreview(result)) => result,
+        Ok(other) => Err(unexpected(&other)),
+        Err(e) => Err(e),
     }
 }
 

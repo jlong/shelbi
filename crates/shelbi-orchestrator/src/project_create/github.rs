@@ -14,6 +14,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use shelbi_app::github_setup::{GithubAccount, GithubAnswer, GithubFailure, GithubRequest};
+use shelbi_app::tracker_connect::{ImportPreview, PreviewIssue, PREVIEW_ISSUES};
 
 use super::issues::{classify_api_failure, github_preflight, GhCommandResult, GhProbe, GithubPreflightError};
 
@@ -155,6 +156,75 @@ fn repos<R: GhRun + ?Sized>(gh: &mut R, owner: &str) -> Result<Vec<String>, Stri
     Ok(lines(&out.stdout))
 }
 
+/// The Review your first import read for `repo`: its open and closed issue
+/// counts (pull requests aside), how many open ones are the signed-in
+/// account's or no one's, and the newest few, in one GraphQL call.
+pub fn import_preview(repo: &str) -> Result<ImportPreview, String> {
+    import_preview_with(&mut RealGh, repo)
+}
+
+const PREVIEW_QUERY: &str = "query($owner:String!,$name:String!,$mine:String!,$none:String!){\
+repository(owner:$owner,name:$name){open:issues(states:OPEN){totalCount} \
+closed:issues(states:CLOSED){totalCount} \
+recent:issues(states:OPEN,first:3,orderBy:{field:CREATED_AT,direction:DESC}){nodes{number title}}} \
+mine:search(type:ISSUE,query:$mine){issueCount} unassigned:search(type:ISSUE,query:$none){issueCount}}";
+
+/// [`import_preview`] over `gh`.
+pub fn import_preview_with<R: GhRun + ?Sized>(gh: &mut R, repo: &str) -> Result<ImportPreview, String> {
+    let repo = repo.trim();
+    let Some((owner, name)) = repo.split_once('/').filter(|(o, n)| !o.is_empty() && !n.is_empty()) else {
+        return Err(format!("`{repo}` isn't an owner/repo"));
+    };
+    let query = format!("query={PREVIEW_QUERY}");
+    let (owner, name) = (format!("owner={owner}"), format!("name={name}"));
+    let mine = format!("mine=repo:{repo} is:issue is:open assignee:@me");
+    let none = format!("none=repo:{repo} is:issue is:open no:assignee");
+    let args = ["api", "graphql", "-f", &query, "-f", &owner, "-f", &name, "-f", &mine, "-f", &none];
+    let Some(out) = gh.gh(&args) else {
+        return Err(GithubPreflightError::GhNotInstalled.guidance());
+    };
+    if !out.success {
+        return Err(match classify_api_failure(repo, &out.stderr) {
+            GithubPreflightError::ProbeFailed { detail } => format!("Couldn't read {repo}'s issues: {detail}"),
+            other => other.guidance(),
+        });
+    }
+    parse_preview(repo, &out.stdout)
+}
+
+fn parse_preview(repo: &str, stdout: &str) -> Result<ImportPreview, String> {
+    let bad = |why: &str| format!("Couldn't read {repo}'s issues: {why}");
+    let v: serde_json::Value = serde_json::from_str(stdout).map_err(|e| bad(&e.to_string()))?;
+    if let Some(msg) = v.pointer("/errors/0/message").and_then(|m| m.as_str()) {
+        return Err(bad(msg));
+    }
+    let count = |path: &str| v.pointer(path).and_then(|n| n.as_u64()).map(|n| n as usize);
+    let open = count("/data/repository/open/totalCount").ok_or_else(|| bad("GitHub returned no repository"))?;
+    let first = v
+        .pointer("/data/repository/recent/nodes")
+        .and_then(|n| n.as_array())
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|n| {
+                    let number = n.get("number")?.as_u64()?;
+                    let title = n.get("title")?.as_str()?.to_string();
+                    Some(PreviewIssue { key: format!("#{number}"), title })
+                })
+                .take(PREVIEW_ISSUES)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(ImportPreview {
+        open,
+        mine: count("/data/mine/issueCount").unwrap_or(0).min(open),
+        unassigned: count("/data/unassigned/issueCount").unwrap_or(0).min(open),
+        closed: count("/data/repository/closed/totalCount").unwrap_or(0),
+        closed_capped: false,
+        first,
+    })
+}
+
 /// One value per non-blank line.
 fn lines(text: &str) -> Vec<String> {
     text.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect()
@@ -215,12 +285,43 @@ mod tests {
                 ["api", "user/orgs", ..] => ok("acme\nwidgets\n"),
                 ["repo", "list", "acme", ..] => ok("acme/app\nacme/site\n\n"),
                 ["repo", "list", "nobody", ..] => failed("GraphQL: Could not resolve to a RepositoryOwner"),
+                ["api", "graphql", ..] => ok(PREVIEW_JSON),
                 ["api", path] if path.starts_with("repos/") => {
                     ok(r#"{"permissions":{"push":true},"has_issues":true}"#)
                 }
                 other => panic!("unexpected gh {other:?}"),
             }
         }
+    }
+
+    const PREVIEW_JSON: &str = r#"{"data":{"repository":{"open":{"totalCount":64},"closed":{"totalCount":12},
+        "recent":{"nodes":[{"number":130,"title":"Keep the sidebar width"},{"number":129,"title":"Restore the previous view"}]}},
+        "mine":{"issueCount":48},"unassigned":{"issueCount":4}}}"#;
+
+    #[test]
+    fn the_import_preview_is_one_graphql_read() {
+        let mut gh = signed_in();
+        let preview = import_preview_with(&mut gh, " acme/app ").unwrap();
+        assert_eq!((preview.open, preview.mine, preview.unassigned, preview.closed), (64, 48, 4, 12));
+        assert_eq!(preview.others(), 12);
+        assert_eq!(
+            preview.first,
+            vec![
+                PreviewIssue { key: "#130".into(), title: "Keep the sidebar width".into() },
+                PreviewIssue { key: "#129".into(), title: "Restore the previous view".into() },
+            ]
+        );
+        let args = &gh.asked[0];
+        assert_eq!(&args[..2], ["api", "graphql"]);
+        assert!(args.contains(&"owner=acme".to_string()) && args.contains(&"name=app".to_string()), "{args:?}");
+        assert!(args.contains(&"mine=repo:acme/app is:issue is:open assignee:@me".to_string()), "{args:?}");
+        assert!(args.iter().any(|a| a.starts_with("query=query(") && !a.contains('\\')), "{args:?}");
+
+        let mut gh = FakeGh { installed: true, ..FakeGh::default() };
+        assert!(import_preview_with(&mut gh, "acme/app").unwrap_err().contains("gh auth login"));
+        assert!(import_preview_with(&mut signed_in(), "acme").is_err(), "not owner/repo");
+        let err = parse_preview("acme/app", r#"{"errors":[{"message":"Could not resolve to a Repository"}]}"#);
+        assert_eq!(err.unwrap_err(), "Couldn't read acme/app's issues: Could not resolve to a Repository");
     }
 
     fn signed_in() -> FakeGh {

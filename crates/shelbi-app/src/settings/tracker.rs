@@ -92,6 +92,9 @@ pub struct TrackerService {
     pub github: Arc<dyn Fn(GithubRequest) -> GithubAnswer + Send + Sync>,
     /// Sync the status catalog from the tracker now (Workflows' Sync now).
     pub sync_statuses: Arc<dyn Fn() -> StatusSync + Send + Sync>,
+    /// What a first import of a connection would bring in (Connect to an
+    /// Issue tracker's Review your first import).
+    pub preview: Arc<dyn Fn(crate::tracker_connect::TrackerChoice) -> Result<crate::tracker_connect::ImportPreview, String> + Send + Sync>,
 }
 
 impl std::fmt::Debug for TrackerService {
@@ -103,12 +106,13 @@ impl std::fmt::Debug for TrackerService {
 impl TrackerService {
     /// The far daemon's, over `link`.
     pub fn far(link: &ProjectLink) -> Self {
-        let (a, b, c, d) = (link.clone(), link.clone(), link.clone(), link.clone());
+        let (a, b, c, d, e) = (link.clone(), link.clone(), link.clone(), link.clone(), link.clone());
         TrackerService {
             connect: Arc::new(move |req| crate::far::connect_tracker(&a, req)),
             linear: Arc::new(move |req| crate::far::linear(&b, req)),
             github: Arc::new(move |req| crate::far::github(&d, req)),
             sync_statuses: Arc::new(move || crate::far::sync_statuses(&c)),
+            preview: Arc::new(move |choice| crate::far::import_preview(&e, choice)),
         }
     }
 }

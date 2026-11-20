@@ -656,6 +656,11 @@ pub struct BoardProject {
     /// decodes as the filesystem board.
     #[serde(default)]
     pub tracker: shelbi_core::IssueTrackerBackend,
+    /// What the external tracker's board is (the GitHub repository, the
+    /// Linear project or team) for the header's "Connected · acme/app";
+    /// `None` on the local board.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
 }
 
 /// How the open-board read went.
@@ -730,6 +735,7 @@ pub fn read_open_board(project: &str) -> BoardRead {
                 shelbi_core::IssueTrackerBackend::Github | shelbi_core::IssueTrackerBackend::Linear
             ),
             tracker: p.issue_tracker.backend,
+            connection: crate::tracker_connect::source_name(&p.issue_tracker),
             workspaces: p.workspaces.into_iter().map(|w| w.name).collect(),
         });
     let state_snapshot = shelbi_state::read_state(project).ok();
@@ -1002,6 +1008,8 @@ pub struct BoardInput {
     pub remote_search: bool,
     /// See [`BoardProject::tracker`].
     pub tracker: shelbi_core::IssueTrackerBackend,
+    /// See [`BoardProject::connection`].
+    pub connection: Option<String>,
     /// Issues the active text search found that the board hasn't loaded
     /// ([`crate::board_search::BoardSearch::hits`], set by
     /// [`BoardInput::set_search_hits`]); merged last, so a loaded card wins.
@@ -1028,6 +1036,7 @@ impl Default for BoardInput {
             ownership: OwnershipGate::Unrestricted,
             remote_search: false,
             tracker: shelbi_core::IssueTrackerBackend::FileSystem,
+            connection: None,
             search_hits: Vec::new(),
             estimates: Vec::new(),
         }
@@ -1048,6 +1057,7 @@ impl BoardInput {
                 self.ownership = p.ownership;
                 self.remote_search = p.remote_search;
                 self.tracker = p.tracker;
+                self.connection = p.connection;
             }
             None => {
                 self.default_workflow_name = DEFAULT_WORKFLOW_NAME.to_string();
@@ -1056,6 +1066,7 @@ impl BoardInput {
                 self.ownership = OwnershipGate::Unrestricted;
                 self.remote_search = false;
                 self.tracker = shelbi_core::IssueTrackerBackend::FileSystem;
+                self.connection = None;
             }
         }
         self.workspace_filter = read
