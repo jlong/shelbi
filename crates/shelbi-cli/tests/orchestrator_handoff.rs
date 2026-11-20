@@ -178,13 +178,9 @@ fn quit_shelbi_asks_the_live_orchestrator_for_its_handoff_and_the_reopen_injects
     let sandbox = Sandbox::new("q", HANDOFF_RUNNER);
     assert!(sandbox.orchestrate().contains("orchestrator started"));
     assert!(!sandbox.handoff().exists());
-    // A launch with no handoff returns without waiting for the session to bind;
-    // a user quits a running orchestrator, so wait until it takes input.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while backend().send_text(&Host::Local, &target(), "").is_err() {
-        assert!(Instant::now() < deadline, "the orchestrator session never took input");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    // A launch with no handoff returns without waiting for the session to bind
+    // its socket; the handoff request waits for that bind itself, so quitting
+    // straight after the launch still reaches the orchestrator.
 
     // Quit Shelbi, the way the desktop app and the TUI quit: the daemon asks the
     // orchestrator for its handoff before it ends the session.
@@ -225,6 +221,8 @@ fn reload_carries_the_handoff_to_the_replacement_orchestrator() {
     // the handoff request, then `replace_orchestrator_session`, whose launch
     // claims the file.
     let sandbox = Sandbox::new("r", HANDOFF_RUNNER);
+    // No readiness wait on purpose: the launch returns before the session binds
+    // its socket, and a reload right then must still deliver the request.
     assert!(sandbox.orchestrate().contains("orchestrator started"));
 
     let out = sandbox.shelbi(&["--project", "p", "reload"]);
