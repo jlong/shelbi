@@ -217,13 +217,17 @@ pub struct IssuesView {
     /// and the menu's scroll, following its cursor.
     pub(super) pane_menu_anchor: style::Anchor,
     pub(super) pane_menu_scroll: MenuScroll,
+    /// Where the pointer was when a card's context menu opened (a
+    /// zero-size box the menu opens under), and the menu's scroll.
+    pub(super) card_menu_anchor: style::Anchor,
+    pub(super) card_menu_scroll: MenuScroll,
     /// The open property picker's value, measured so the picker opens
     /// under it (one picker is open at a time), and the picker's scroll.
     pub(super) property_anchor: style::Anchor,
     pub(super) picker_scroll: ScrollHandle,
     pub(super) state: BoardState,
     pub(super) focus: FocusHandle,
-    needs_focus: bool,
+    pub(super) needs_focus: bool,
     open_refresher: shelbi_app::Refresher<(BoardRead, u64)>,
     closed_refresher: shelbi_app::Refresher<(Option<ClosedPage>, u64)>,
     /// The fingerprints of the last reads folded in: a refresh that reads
@@ -337,6 +341,8 @@ impl IssuesView {
             workspace_anchor: Default::default(),
             pane_menu_anchor: Default::default(),
             pane_menu_scroll: Default::default(),
+            card_menu_anchor: Default::default(),
+            card_menu_scroll: Default::default(),
             property_anchor: Default::default(),
             picker_scroll: ScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
@@ -612,6 +618,18 @@ impl IssuesView {
     /// Whether the detail, or a picker over the board, is up.
     pub fn overlay_open(&self) -> bool {
         self.state.mode != Mode::Board
+    }
+
+    /// A right-click on card `id` at `at`: its context menu opens there,
+    /// with the keys (out of a pane editor that had them), the board's
+    /// cursor on the card. Nothing else happens: no drag, no pane.
+    fn open_card_menu(&mut self, id: &str, at: gpui::Point<gpui::Pixels>, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.open_card_menu(id) {
+            return;
+        }
+        self.card_menu_anchor.set(Some(gpui::Bounds::new(at, gpui::Size::default())));
+        window.focus(&self.focus, cx);
+        cx.notify();
     }
 
     /// Stop drawing over another screen. `close` closes the detail too (the
@@ -1858,6 +1876,7 @@ impl IssuesView {
         let notice = self.state.notice(&card.id).map(str::to_string);
         let dragged = self.state.dragging() == Some(card.id.as_str());
         let id = card.id.clone();
+        let menu_id = card.id.clone();
         let weak = cx.weak_entity();
         let drag = CardDrag {
             id: card.id.clone(),
@@ -1906,6 +1925,15 @@ impl IssuesView {
                 this.state.open_detail(&id);
                 cx.notify();
             }))
+            // Its context menu, at the pointer: the More menu's rows for
+            // this card (`task_detail::render_card_menu`).
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+                    this.open_card_menu(&menu_id, ev.position, window, cx);
+                }),
+            )
             // A card with a change in flight can't be dragged (one mutation
             // per issue at a time).
             .when(pending.is_none(), |d| {
@@ -2303,6 +2331,7 @@ impl Render for IssuesView {
             .child(content)
             .children(detail)
             .children(self.render_dropdown(&theme, cx))
+            .children(task_detail::render_card_menu(self, cx))
             .children(self.render_assign(&theme, cx))
             .children(self.render_confirm_delete(&theme, cx))
             .into_any_element()
@@ -3284,6 +3313,151 @@ mod tests {
         click(&mut cx, "pane-menu-delete");
         assert!(!drawn(&mut cx, "delete-prompt"));
         assert_eq!(events.borrow().len(), 1);
+    }
+
+    /// A right-click (press and release) in the middle of `selector`: where.
+    fn right_click(cx: &mut gpui::VisualTestContext, selector: &'static str) -> gpui::Point<gpui::Pixels> {
+        let at = bounds(cx, selector).center();
+        cx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::none());
+        cx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::none());
+        cx.run_until_parked();
+        at
+    }
+
+    /// The card menu's row selectors for `id`, in order, from the one
+    /// action list the More menu draws.
+    fn card_menu_rows(view: &Entity<IssuesView>, cx: &gpui::VisualTestContext, id: &str) -> Vec<&'static str> {
+        view.read_with(cx, |v, _| v.state.actions(id))
+            .into_iter()
+            .map(|a| &*Box::leak(format!("card-menu-{}", a.slug()).into_boxed_str()))
+            .collect()
+    }
+
+    #[gpui::test]
+    fn right_clicking_a_card_opens_its_context_menu_at_the_pointer(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut assigned = issue("A", "todo");
+        assigned.task.assigned_to = Some("alpha".into());
+        let (view, mut cx) =
+            open_board_sized(cx, vec![assigned, issue("B", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
+        let events = record(&view, &mut cx);
+        assert!(!drawn(&mut cx, "card-menu"));
+
+        let at = right_click(&mut cx, "card-B");
+        assert!(drawn(&mut cx, "card-menu"));
+        let menu = bounds(&mut cx, "card-menu");
+        assert!((menu.left() - at.x).abs() < px(1.0), "at the pointer: {menu:?} {at:?}");
+        assert!((menu.top() - (at.y + px(2.0))).abs() < px(1.0), "just under it: {menu:?} {at:?}");
+        assert_eq!(
+            view.read_with(&cx, |v, _| v.state.mode.clone()),
+            Mode::CardMenu { id: "B".into(), cursor: 0 }
+        );
+        assert_eq!(view.read_with(&cx, |v, _| v.state.selected_card().map(|c| c.id.clone())).as_deref(), Some("B"));
+        assert_eq!(pane_id(&view, &cx), None, "a right-click doesn't open the pane");
+        assert!(view.read_with(&cx, |v, _| v.state.dragging().is_none()), "nor start a drag");
+        assert!(events.borrow().is_empty());
+
+        // Its rows are B's More menu's, in its order, Delete last under a rule.
+        let rows = card_menu_rows(&view, &cx, "B");
+        assert_eq!(rows.first(), Some(&"card-menu-move-left"));
+        assert_eq!(rows.last(), Some(&"card-menu-delete"));
+        assert!(!rows.contains(&"card-menu-workspace"), "B is unassigned (A isn't)");
+        let mut top = px(f32::MIN);
+        for row in &rows {
+            let b = bounds(&mut cx, row);
+            assert!(b.top() > top, "{row} in order");
+            top = b.top();
+        }
+        let rule = bounds(&mut cx, "card-menu-rule");
+        assert!(rule.bottom() <= bounds(&mut cx, "card-menu-delete").top());
+        assert!(!drawn(&mut cx, "pane-menu"), "the pane's own menu stays shut");
+
+        // Esc closes it, nothing else.
+        cx.simulate_keystrokes("escape");
+        assert!(!drawn(&mut cx, "card-menu"));
+        assert_eq!(view.read_with(&cx, |v, _| v.state.mode.clone()), Mode::Board);
+
+        // A press outside closes it and goes no further: the card under it
+        // doesn't open.
+        right_click(&mut cx, "card-B");
+        assert!(drawn(&mut cx, "card-menu"));
+        click(&mut cx, "card-A");
+        assert!(!drawn(&mut cx, "card-menu"));
+        assert_eq!(pane_id(&view, &cx), None, "the press didn't reach card A");
+        assert_eq!(view.read_with(&cx, |v, _| v.state.mode.clone()), Mode::Board);
+        assert!(events.borrow().is_empty());
+
+        // A's menu lists A's rows (its workspace to open).
+        right_click(&mut cx, "card-A");
+        assert!(card_menu_rows(&view, &cx, "A").contains(&"card-menu-workspace"));
+        assert!(drawn(&mut cx, "card-menu-workspace"));
+    }
+
+    #[gpui::test]
+    fn a_card_menus_row_runs_on_its_card_while_the_pane_shows_another(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut busy = issue("W", "in-progress");
+        busy.task.assigned_to = Some("alpha".into());
+        let (view, mut cx) = open_board_sized(
+            cx,
+            vec![issue("A", "todo"), issue("B", "todo"), busy],
+            Some(gpui::size(px(1160.0), px(1024.0))),
+        );
+        let events = record(&view, &mut cx);
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+
+        right_click(&mut cx, "card-B");
+        click(&mut cx, "card-menu-start");
+        assert_eq!(*events.borrow(), vec![CommandKind::StartIssue { id: "B".into() }]);
+        assert!(!drawn(&mut cx, "card-menu"), "a choice closes the menu");
+        assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"), "the pane stays on A");
+
+        // Its keys: down to Move right, Enter, for B.
+        right_click(&mut cx, "card-B");
+        cx.simulate_keystrokes("down enter");
+        assert!(
+            matches!(events.borrow().last(), Some(CommandKind::MoveIssue { id, .. }) if id == "B"),
+            "{:?}",
+            events.borrow()
+        );
+
+        // Delete asks first, for B, over the board.
+        right_click(&mut cx, "card-B");
+        click(&mut cx, "card-menu-delete");
+        assert!(drawn(&mut cx, "delete-prompt"));
+        click(&mut cx, "delete-confirm");
+        assert_eq!(events.borrow().last(), Some(&CommandKind::DeleteIssue { id: "B".into() }));
+        assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"));
+
+        // A refused row is dimmed and can't be chosen.
+        let n = events.borrow().len();
+        right_click(&mut cx, "card-W");
+        click(&mut cx, "card-menu-delete");
+        assert!(!drawn(&mut cx, "delete-prompt"));
+        assert_eq!(events.borrow().len(), n);
+        cx.simulate_keystrokes("escape");
+        assert!(!drawn(&mut cx, "card-menu"));
+        assert_eq!(view.read_with(&cx, |v, _| v.state.mode.clone()), Mode::Detail { id: "A".into(), editing: false });
+    }
+
+    #[gpui::test]
+    fn a_card_menu_takes_the_keys_from_a_pane_editor(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) =
+            open_board_sized(cx, vec![issue("A", "todo"), issue("B", "todo")], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        cx.simulate_keystrokes("e");
+        assert_eq!(view.read_with(&cx, |v, _| v.state.mode.clone()), Mode::Detail { id: "A".into(), editing: true });
+        right_click(&mut cx, "card-B");
+        assert!(board_focused(&view, &mut cx), "the menu has the keys, not the editor");
+        cx.simulate_keystrokes("down");
+        assert_eq!(view.read_with(&cx, |v, _| v.state.mode.clone()), Mode::CardMenu { id: "B".into(), cursor: 1 });
+        cx.simulate_keystrokes("escape");
+        assert!(!drawn(&mut cx, "card-menu"));
+        assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"));
     }
 
     #[gpui::test]
