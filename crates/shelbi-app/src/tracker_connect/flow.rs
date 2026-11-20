@@ -18,9 +18,12 @@
 //!   the others' Connect is disabled: **one external integration per
 //!   project**.
 //! - **Choose project** (03-github-choose / 03a-linear-choose): GitHub's
-//!   repository, or Linear's team (the only required field) through the
-//!   shared [`LinearChoice`]. The pickers are `tc-choose`'s; this model holds
-//!   the values and refuses Continue until the choice can be connected.
+//!   organization and repository through [`GithubChoice`], or Linear's
+//!   workspace (read-only), team (the only required field) and project
+//!   through the shared [`LinearChoice`]. Continue is offered once the
+//!   choice can be connected; it runs the connection's own preflight
+//!   ([`FlowRequest::Github`] / [`FlowRequest::Linear`]) and moves on when
+//!   that passes, or shows why it didn't.
 //! - **Agent rules** (04-agent-rules): a placeholder [`AgentRules`] for
 //!   `tc-agent-rules` / `tc-import` to back with the real settings.
 //! - **Review import** (06-review-import): a placeholder for `tc-import`'s
@@ -34,6 +37,7 @@
 use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig};
 
 use super::{ConnectError, ConnectTracker, Connected, TrackerChoice};
+use crate::github_setup::{GithubAnswer, GithubChoice, GithubRequest, REPO_REQUIRED};
 use crate::linear_setup::{LinearAnswer, LinearChoice, LinearRequest, TEAM_REQUIRED};
 use crate::new_project::{github_config, Tracker};
 
@@ -48,6 +52,19 @@ pub const LINEAR_TITLE: &str = "Linear";
 pub const LINEAR_BODY: &str = "Sync issues from a Linear team.";
 /// The Choose project step's note under its fields.
 pub const ONLY_PROJECT: &str = "This will be the only issue tracker project connected to this Shelbi project.";
+/// The Choose project step's account line (`✓ Account connected · Change
+/// account`).
+pub const ACCOUNT_CONNECTED: &str = "Account connected";
+pub const CHANGE_ACCOUNT: &str = "Change account";
+pub const RETRY: &str = "Retry";
+/// Linear's Workspace field, and its Project picker's first row.
+pub const WORKSPACE_LABEL: &str = "Workspace";
+pub const ANY_PROJECT: &str = "Any project";
+/// Where Linear's personal API keys are made.
+pub const LINEAR_KEYS_URL: &str = "https://linear.app/settings/account/security";
+pub const LINEAR_KEYS_LINK: &str = "Open Linear's API key settings";
+/// The primary button while the choice's preflight runs.
+pub const CHECKING: &str = "Checking…";
 /// The buttons.
 pub const CONNECT: &str = "Connect";
 pub const CONNECTED: &str = "Connected";
@@ -170,8 +187,12 @@ pub enum Apply {
 /// [`TrackerFlow::linear_answer`] or [`TrackerFlow::connected`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FlowRequest {
-    /// A Linear read for the Choose project step's pickers.
+    /// A Linear read for the Choose project step's pickers (or its
+    /// preflight).
     Linear(LinearRequest),
+    /// A GitHub read for the Choose project step's pickers (or its
+    /// preflight).
+    Github(GithubRequest),
     /// Write the connection (`apply_tracker_connection`, where the project
     /// lives).
     Connect(ConnectTracker),
@@ -201,9 +222,12 @@ pub struct TrackerFlow {
     current: Option<IssueTrackerConfig>,
     /// The tracker a card's Connect picked.
     tracker: Option<Tracker>,
-    /// GitHub's `owner/repo`.
-    repo: String,
+    /// GitHub's organization and repository.
+    github: GithubChoice,
     linear: LinearChoice,
+    /// Continue was pressed on Choose project: the step moves on when the
+    /// preflight it started passes.
+    advancing: bool,
     rules: AgentRules,
     apply: Apply,
     /// Why Continue was refused.
@@ -216,8 +240,9 @@ impl Default for TrackerFlow {
             step: Step::Chooser,
             current: None,
             tracker: None,
-            repo: String::new(),
+            github: GithubChoice::default(),
             linear: LinearChoice::default(),
+            advancing: false,
             rules: AgentRules::default(),
             apply: Apply::Idle,
             error: None,
@@ -297,6 +322,10 @@ impl TrackerFlow {
         self.tracker = Some(tracker);
         self.step = Step::ChooseProject;
         self.error = None;
+        if tracker == Tracker::Linear {
+            // The step shows the key's workspace.
+            self.linear.want_workspace();
+        }
         true
     }
 
@@ -338,7 +367,7 @@ impl TrackerFlow {
     /// repository, or the Linear project (else its team).
     pub fn source_name(&self) -> String {
         match self.tracker {
-            Some(Tracker::Github) => self.repo.trim().to_string(),
+            Some(Tracker::Github) => self.github.repo().to_string(),
             Some(Tracker::Linear) => {
                 let conn = self.linear.connection();
                 conn.project.clone().filter(|p| !p.trim().is_empty()).unwrap_or(conn.team)
@@ -351,14 +380,26 @@ impl TrackerFlow {
 
     /// GitHub's repository (`owner/repo`).
     pub fn repo(&self) -> &str {
-        &self.repo
+        self.github.repo()
     }
 
     pub fn set_repo(&mut self, repo: &str) {
-        if self.step == Step::ChooseProject && repo != self.repo {
-            self.repo = repo.to_string();
+        if self.step == Step::ChooseProject && repo.trim() != self.github.repo() {
+            self.github.select_repo(repo);
             self.error = None;
         }
+    }
+
+    /// GitHub's choice (account, organization, repository).
+    pub fn github(&self) -> &GithubChoice {
+        &self.github
+    }
+
+    /// GitHub's choice, to pick an organization or repository, change the
+    /// account or retry. Edits clear a refused Continue's reason.
+    pub fn github_mut(&mut self) -> &mut GithubChoice {
+        self.error = None;
+        &mut self.github
     }
 
     /// Linear's choice (key, team, project).
@@ -377,8 +418,8 @@ impl TrackerFlow {
     /// an empty or malformed repo, a Linear choice with no team or key).
     pub fn wanted(&self) -> Option<TrackerChoice> {
         match self.tracker? {
-            Tracker::Github => github_config(&self.repo).ok().map(|_| TrackerChoice::Github {
-                repo: self.repo.trim().to_string(),
+            Tracker::Github => github_config(self.github.repo()).ok().map(|_| TrackerChoice::Github {
+                repo: self.github.repo().to_string(),
             }),
             Tracker::Linear => {
                 let conn = self.linear.connection();
@@ -407,8 +448,12 @@ impl TrackerFlow {
         match self.step {
             Step::Chooser => false,
             Step::ChooseProject => {
-                let linear_busy = self.tracker == Some(Tracker::Linear) && self.linear.busy();
-                !linear_busy && self.wanted().is_some()
+                let blocked = match self.tracker {
+                    Some(Tracker::Linear) => self.linear.busy(),
+                    Some(Tracker::Github) => self.github.needs_auth() || self.github.preflighting(),
+                    _ => true,
+                };
+                !blocked && self.wanted().is_some()
             }
             Step::AgentRules | Step::ReviewImport => true,
             Step::Importing => match &self.apply {
@@ -428,18 +473,66 @@ impl TrackerFlow {
         }
         match (self.step, self.tracker) {
             (Step::ChooseProject, Some(Tracker::Linear)) => self.linear.error().map(str::to_string),
+            (Step::ChooseProject, Some(Tracker::Github)) => self.github.error().map(str::to_string),
             _ => None,
         }
     }
 
+    /// Continue's preflight is due or running (the primary button says
+    /// [`CHECKING`]).
+    pub fn checking(&self) -> bool {
+        self.step == Step::ChooseProject
+            && match self.tracker {
+                Some(Tracker::Linear) => self.linear.preflighting(),
+                Some(Tracker::Github) => self.github.preflighting(),
+                _ => false,
+            }
+    }
+
+    /// The choice as picked passed its preflight.
+    fn verified(&self) -> bool {
+        match self.tracker {
+            Some(Tracker::Linear) => self.linear.ready(),
+            Some(Tracker::Github) => self.github.ready(),
+            _ => false,
+        }
+    }
+
+    /// Start the choice's preflight (Continue on Choose project).
+    fn want_preflight(&mut self) -> bool {
+        match self.tracker {
+            Some(Tracker::Linear) => self.linear.want_preflight(),
+            Some(Tracker::Github) => self.github.want_preflight(),
+            _ => false,
+        }
+    }
+
+    /// A preflight Continue started finished: move on if it passed (its
+    /// failure shows as the step's error).
+    fn finish_advance(&mut self) {
+        if !self.advancing || self.checking() {
+            return;
+        }
+        self.advancing = false;
+        if self.step == Step::ChooseProject && self.verified() && self.wanted().is_some() {
+            self.error = None;
+            self.step = Step::AgentRules;
+        }
+    }
+
     /// Continue: the next step, once this one is ready. False (with
-    /// [`Self::error`] saying why, where there's a why) when it isn't. From
-    /// Review import it starts the connection.
+    /// [`Self::error`] saying why, where there's a why) when it isn't. On
+    /// Choose project it moves on only once the choice has passed its
+    /// preflight: until then it starts the preflight ([`Self::checking`])
+    /// and the step moves on when that passes. From Review import it starts
+    /// the connection.
     pub fn advance(&mut self) -> bool {
         if !self.ready() {
-            if self.step == Step::ChooseProject {
+            if self.step == Step::ChooseProject && !self.checking() {
                 self.error = match self.tracker {
-                    Some(Tracker::Github) => github_config(&self.repo).err(),
+                    Some(Tracker::Github) if self.github.needs_auth() => None,
+                    Some(Tracker::Github) if self.github.repo().is_empty() => Some(REPO_REQUIRED.into()),
+                    Some(Tracker::Github) => github_config(self.github.repo()).err(),
                     Some(Tracker::Linear) if !self.linear.needs_key() && !self.linear.busy() => {
                         Some(TEAM_REQUIRED.into())
                     }
@@ -449,6 +542,10 @@ impl TrackerFlow {
             return false;
         }
         self.error = None;
+        if self.step == Step::ChooseProject && !self.verified() {
+            self.advancing = self.want_preflight();
+            return false;
+        }
         self.step = match self.step {
             Step::ChooseProject => Step::AgentRules,
             Step::AgentRules => Step::ReviewImport,
@@ -477,6 +574,8 @@ impl TrackerFlow {
             return false;
         }
         self.error = None;
+        // A preflight still running doesn't carry the step on.
+        self.advancing = false;
         self.step = match self.step {
             Step::ChooseProject => Step::Chooser,
             Step::AgentRules => Step::ChooseProject,
@@ -504,6 +603,7 @@ impl TrackerFlow {
     pub fn primary_label(&self) -> Option<&'static str> {
         match self.step {
             Step::Chooser => None,
+            Step::ChooseProject if self.checking() => Some(CHECKING),
             Step::ChooseProject | Step::AgentRules => Some(CONTINUE),
             Step::ReviewImport => Some(IMPORT),
             Step::Importing => Some(match &self.apply {
@@ -547,8 +647,12 @@ impl TrackerFlow {
             self.apply = Apply::Running;
             return Some(FlowRequest::Connect(ConnectTracker { choice, force }));
         }
-        if self.tracker == Some(Tracker::Linear) && self.step == Step::ChooseProject {
-            return self.linear.due().map(FlowRequest::Linear);
+        if self.step == Step::ChooseProject {
+            match self.tracker {
+                Some(Tracker::Linear) => return self.linear.due().map(FlowRequest::Linear),
+                Some(Tracker::Github) => return self.github.due().map(FlowRequest::Github),
+                _ => {}
+            }
         }
         None
     }
@@ -556,6 +660,13 @@ impl TrackerFlow {
     /// The answer to a [`FlowRequest::Linear`].
     pub fn linear_answer(&mut self, answer: LinearAnswer) {
         self.linear.answer(answer);
+        self.finish_advance();
+    }
+
+    /// The answer to a [`FlowRequest::Github`].
+    pub fn github_answer(&mut self, answer: GithubAnswer) {
+        self.github.answer(answer);
+        self.finish_advance();
     }
 
     /// The answer to a [`FlowRequest::Connect`]. Written: the flow holds the
@@ -598,6 +709,7 @@ impl TrackerFlow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github_setup::{fixture as github_fixture, GithubFailure};
     use crate::linear_setup::fixture;
     use crate::tracker_connect::StatusSync;
     use shelbi_core::GithubConnection;
@@ -624,14 +736,25 @@ mod tests {
         }
     }
 
-    /// Run the flow's Linear reads with the fixture's answers.
+    /// Run the flow's reads with the fixtures' answers.
     fn answer_reads(flow: &mut TrackerFlow) {
         while let Some(req) = flow.due() {
             match req {
                 FlowRequest::Linear(req) => flow.linear_answer(fixture::answer(req)),
+                FlowRequest::Github(req) => flow.github_answer(github_fixture::answer(req)),
                 FlowRequest::Connect(c) => panic!("no connection yet: {c:?}"),
             }
         }
+    }
+
+    /// Continue, with the preflight it starts answered.
+    fn continue_(flow: &mut TrackerFlow) -> bool {
+        let before = flow.step();
+        flow.advance();
+        if before == Step::ChooseProject {
+            answer_reads(flow);
+        }
+        flow.step() != before
     }
 
     fn at_review(repo: &str) -> TrackerFlow {
@@ -639,7 +762,7 @@ mod tests {
         flow.load(&local());
         assert!(flow.connect(Tracker::Github));
         flow.set_repo(repo);
-        assert!(flow.advance() && flow.advance());
+        assert!(continue_(&mut flow) && continue_(&mut flow));
         assert_eq!(flow.step(), Step::ReviewImport);
         flow
     }
@@ -659,7 +782,7 @@ mod tests {
         let mut seen = vec![(flow.step(), flow.counter())];
         while flow.step() != Step::Importing {
             assert_eq!(flow.secondary(), Some(Secondary::Back));
-            assert!(flow.advance(), "{:?} continues", flow.step());
+            assert!(continue_(&mut flow), "{:?} continues", flow.step());
             seen.push((flow.step(), flow.counter()));
         }
         let counter = |n: usize| Some(format!("Step {n} of 4"));
@@ -698,12 +821,13 @@ mod tests {
         assert!(!flow.ready());
         assert!(!flow.advance());
         assert_eq!(flow.step(), Step::ChooseProject);
+        assert_eq!(flow.error().as_deref(), Some(REPO_REQUIRED));
         flow.set_repo("not a repo");
         assert!(!flow.advance());
         assert!(flow.error().unwrap().contains("owner/repo"), "{:?}", flow.error());
         flow.set_repo("acme/app");
         assert_eq!(flow.error(), None, "an edit clears it");
-        assert!(flow.advance());
+        assert!(continue_(&mut flow));
 
         // Linear: a working key and a team (the only required field).
         let mut flow = TrackerFlow::new();
@@ -718,9 +842,65 @@ mod tests {
         assert_eq!(flow.error().as_deref(), Some(TEAM_REQUIRED));
         flow.linear_mut().select_team("ENG");
         answer_reads(&mut flow);
-        assert!(flow.ready() && flow.advance());
+        assert!(flow.ready());
+        assert!(!flow.advance(), "Continue runs the preflight first");
+        assert!(flow.checking());
+        assert_eq!(flow.primary_label(), Some(CHECKING));
+        assert!(!flow.ready(), "one preflight at a time");
+        let Some(FlowRequest::Linear(req @ LinearRequest::Preflight(_))) = flow.due() else { panic!("the preflight") };
+        flow.linear_answer(fixture::answer(req));
+        assert_eq!(flow.step(), Step::AgentRules, "it passed: on to the next step");
         assert_eq!(flow.heading(), "How should agents handle issues created in Linear?");
+        assert_eq!(flow.linear().workspace().loaded().map(String::as_str), Some(fixture::WORKSPACE));
         assert_eq!(flow.source_name(), "ENG", "no project picked: the team");
+    }
+
+    #[test]
+    fn github_continue_runs_the_preflight_and_a_failure_stays() {
+        let mut flow = TrackerFlow::new();
+        flow.load(&local());
+        flow.connect(Tracker::Github);
+        answer_reads(&mut flow);
+        assert_eq!(flow.github().owner(), github_fixture::LOGIN, "the login is the first organization");
+        flow.github_mut().select_owner(github_fixture::ORG);
+        answer_reads(&mut flow);
+        assert_eq!(flow.github().repos().loaded().map(Vec::len), Some(2));
+        flow.github_mut().select_repo("acme/app");
+        assert!(flow.ready());
+        assert!(!flow.advance());
+        assert_eq!(flow.due(), Some(FlowRequest::Github(GithubRequest::Preflight { repo: "acme/app".into() })));
+        flow.github_answer(GithubAnswer::Preflight { repo: "acme/app".into(), result: Err("Issues disabled".into()) });
+        assert_eq!(flow.step(), Step::ChooseProject);
+        assert_eq!(flow.error().as_deref(), Some("Issues disabled"));
+        assert_eq!(flow.primary_label(), Some(CONTINUE));
+
+        // Back while a preflight runs: its pass doesn't carry the step on.
+        flow.advance();
+        let _ = flow.due();
+        assert!(flow.back());
+        flow.github_answer(GithubAnswer::Preflight { repo: "acme/app".into(), result: Ok(()) });
+        assert_eq!(flow.step(), Step::Chooser);
+        // ...but the pass is kept: Continue moves straight on.
+        assert!(flow.connect(Tracker::Github));
+        assert!(flow.advance());
+        assert_eq!(flow.step(), Step::AgentRules);
+    }
+
+    #[test]
+    fn github_signed_out_shows_how_to_sign_in_and_waits() {
+        let mut flow = TrackerFlow::new();
+        flow.load(&local());
+        flow.connect(Tracker::Github);
+        let Some(FlowRequest::Github(GithubRequest::Account)) = flow.due() else { panic!("the account first") };
+        flow.github_answer(GithubAnswer::Account(Err(GithubFailure::NotSignedIn)));
+        assert!(flow.github().needs_auth());
+        flow.set_repo("acme/app");
+        assert!(!flow.ready() && !flow.advance());
+        assert_eq!(flow.error(), None, "the instructions say what's missing");
+        flow.github_mut().retry();
+        answer_reads(&mut flow);
+        assert!(!flow.github().needs_auth());
+        assert!(continue_(&mut flow));
     }
 
     #[test]

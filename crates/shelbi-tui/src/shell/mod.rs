@@ -1806,6 +1806,7 @@ impl ShellState {
         let tracker_service: TrackerServiceFor = Arc::new(|_: &str| shelbi_app::settings::tracker::TrackerService {
             connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("tests connect nothing".into()))),
             linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
         });
         #[cfg(not(test))]
@@ -13092,6 +13093,7 @@ mod tests {
                     })
                 }),
                 linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+                github: Arc::new(shelbi_app::github_setup::fixture::answer),
                 sync_statuses: Arc::new(|| StatusSync::Synced("6 statuses from the Linear team".into())),
             }
         })
@@ -13200,6 +13202,7 @@ mod tests {
         st.tracker_service = Arc::new(|_: &str| shelbi_app::settings::tracker::TrackerService {
             connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("unused".into()))),
             linear: Arc::new(shelbi_app::linear_setup::fixture::no_key),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
         });
         st.dispatch_effect(Effect::OpenSettings);
@@ -13222,6 +13225,7 @@ mod tests {
         st.tracker_service = Arc::new(|_: &str| shelbi_app::settings::tracker::TrackerService {
             connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("unused".into()))),
             linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
         });
         press(&mut st, KeyCode::Enter);
