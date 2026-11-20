@@ -24,8 +24,9 @@
 //!   choice can be connected; it runs the connection's own preflight
 //!   ([`FlowRequest::Github`] / [`FlowRequest::Linear`]) and moves on when
 //!   that passes, or shows why it didn't.
-//! - **Agent rules** (04-agent-rules): a placeholder [`AgentRules`] for
-//!   `tc-agent-rules` / `tc-import` to back with the real settings.
+//! - **Agent rules** (04-agent-rules): the project's [`AgentRules`]
+//!   (`issue_tracker.agent_rules`), written with the connection; `tc-import`
+//!   draws the toggles.
 //! - **Review import** (06-review-import): a placeholder for `tc-import`'s
 //!   preview. Its primary button starts the connection.
 //! - **Importing** (07-importing): the connection runs
@@ -150,22 +151,13 @@ pub fn tracker_name(tracker: Tracker) -> &'static str {
     }
 }
 
-/// The agent rules for imported issues (04-agent-rules). A placeholder:
-/// `tc-agent-rules` makes them real settings and `tc-import` draws them;
-/// the defaults are the frame's (both on).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AgentRules {
-    /// "Always require human review before beginning work".
-    pub require_review: bool,
-    /// "Only work on issues assigned to me".
-    pub assigned_only: bool,
-}
+/// The agent rules for the tracker's issues (04-agent-rules): the project's
+/// `issue_tracker.agent_rules`, written with the connection.
+pub use shelbi_core::AgentRules;
 
-impl Default for AgentRules {
-    fn default() -> Self {
-        AgentRules { require_review: true, assigned_only: true }
-    }
-}
+/// The rules the step starts with on a project that has no tracker yet: the
+/// frame's (both on). A project already on a tracker starts with its own.
+pub const DEFAULT_RULES: AgentRules = AgentRules { require_review: true, assigned_only: true };
 
 /// The connection's progress on the Importing step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,7 +235,7 @@ impl Default for TrackerFlow {
             github: GithubChoice::default(),
             linear: LinearChoice::default(),
             advancing: false,
-            rules: AgentRules::default(),
+            rules: DEFAULT_RULES,
             apply: Apply::Idle,
             error: None,
         }
@@ -257,6 +249,11 @@ impl TrackerFlow {
 
     /// The project's connection was read (or read again).
     pub fn load(&mut self, cfg: &IssueTrackerConfig) {
+        // A project already on a tracker starts the rules step from its own
+        // rules; until the user reaches the step, a reread follows them.
+        if cfg.backend.is_remote() && self.step == Step::Chooser {
+            self.rules = cfg.agent_rules;
+        }
         self.current = Some(cfg.clone());
     }
 
@@ -429,7 +426,7 @@ impl TrackerFlow {
         }
     }
 
-    // ---- Agent rules (placeholder) ----------------------------------------
+    // ---- Agent rules ------------------------------------------------------
 
     pub fn rules(&self) -> AgentRules {
         self.rules
@@ -440,6 +437,22 @@ impl TrackerFlow {
             self.rules = rules;
         }
     }
+
+    /// The connected account the assigned-only rule names: the `gh` login
+    /// for GitHub, the key's owner for Linear. `None` until known.
+    pub fn account(&self) -> Option<&str> {
+        match self.tracker? {
+            Tracker::Github => self.github.login(),
+            Tracker::Linear => self.linear.account(),
+            Tracker::FileSystem => None,
+        }
+    }
+
+    /// "Only work on issues assigned to me (<account>)".
+    pub fn assigned_title(&self) -> String {
+        crate::tracker_connect::rules_copy::assigned_title(self.account())
+    }
+
 
     // ---- moving -----------------------------------------------------------
 
@@ -645,7 +658,7 @@ impl TrackerFlow {
                 return None;
             };
             self.apply = Apply::Running;
-            return Some(FlowRequest::Connect(ConnectTracker { choice, force }));
+            return Some(FlowRequest::Connect(ConnectTracker::new(choice, force).with_rules(self.rules)));
         }
         if self.step == Step::ChooseProject {
             match self.tracker {
@@ -678,7 +691,7 @@ impl TrackerFlow {
         match result {
             Ok(done) => {
                 if let (Some(current), Some(wanted)) = (&self.current, self.wanted()) {
-                    self.current = Some(wanted.config(current));
+                    self.current = Some(ConnectTracker::new(wanted, false).with_rules(self.rules).config(current));
                 }
                 self.apply = Apply::Done(done);
             }
@@ -765,6 +778,40 @@ mod tests {
         assert!(continue_(&mut flow) && continue_(&mut flow));
         assert_eq!(flow.step(), Step::ReviewImport);
         flow
+    }
+
+    #[test]
+    fn the_rules_step_starts_from_the_frame_or_the_projects_and_names_the_account() {
+        // No tracker yet: the frame's defaults (both on).
+        let mut flow = TrackerFlow::new();
+        flow.load(&local());
+        assert_eq!(flow.rules(), DEFAULT_RULES);
+        assert!(flow.connect(Tracker::Github));
+        assert_eq!(flow.assigned_title(), "Only work on issues assigned to me");
+        // The account comes from the GitHub picker's own account read.
+        answer_reads(&mut flow);
+        assert_eq!(flow.assigned_title(), "Only work on issues assigned to me (octocat)");
+        // The step's toggles are what Import writes.
+        flow.set_repo("acme/app");
+        assert!(continue_(&mut flow));
+        assert_eq!(flow.step(), Step::AgentRules);
+        let off = AgentRules { require_review: false, assigned_only: false };
+        flow.set_rules(off);
+        assert!(continue_(&mut flow));
+        flow.primary();
+        let Some(FlowRequest::Connect(req)) = flow.due() else { panic!("the connection") };
+        assert_eq!(req.rules, Some(off));
+
+        // A project already on a tracker starts from its own rules.
+        let mut flow = TrackerFlow::new();
+        let mut cfg = IssueTrackerConfig {
+            backend: IssueTrackerBackend::Github,
+            github: Some(shelbi_core::GithubConnection { repo: "acme/app".into() }),
+            ..IssueTrackerConfig::default()
+        };
+        cfg.agent_rules = off;
+        flow.load(&cfg);
+        assert_eq!(flow.rules(), off);
     }
 
     #[test]
@@ -948,10 +995,10 @@ mod tests {
         assert_eq!(flow.step(), Step::Importing);
         assert_eq!(
             flow.due(),
-            Some(FlowRequest::Connect(ConnectTracker {
-                choice: TrackerChoice::Github { repo: "acme/app".into() },
-                force: false,
-            }))
+            Some(FlowRequest::Connect(
+                ConnectTracker::new(TrackerChoice::Github { repo: "acme/app".into() }, false)
+                    .with_rules(DEFAULT_RULES)
+            ))
         );
         assert_eq!(flow.due(), None, "asked once");
         assert_eq!(flow.primary_label(), Some(VIEW_BOARD));

@@ -442,6 +442,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_reporting_subject(entry, &text, out);
         sniff_orchestrator_handoff_path(entry, &text, out);
         sniff_tracker_ownership_dispatch(entry, &text, out);
+        sniff_claim_on_start_dispatch(entry, &text, out);
         sniff_orchestrator_changelog(entry, &text, out);
         sniff_orchestrator_changelog_attachments(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
@@ -1265,6 +1266,77 @@ fn sniff_tracker_ownership_dispatch(
          a filesystem board where every issue is yours. In the heartbeat's missed-dispatch \
          sweep, only dispatch an issue that on a remote tracker is assigned to you (`me` in \
          `shelbi issue list`'s owner column). Mirror the shipped default template.",
+        locate_line_containing(text, "to_category=ready"),
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// Orchestrator dispatch rules — `claim=on_start` (the `assigned_only` agent
+// rule off lets an unassigned tracker issue be started, claiming it)
+
+/// Code for an unedited ready-dispatch rule that lacks the `claim=on_start`
+/// paragraph: patched in place.
+pub(crate) const CLAIM_ON_START_AUTOHEAL_CODE: &str = "ORCH_CLAIM_ON_START_DISPATCH_MISSING";
+
+/// Code for an edited ready-dispatch rule that lacks it: handed to the
+/// orchestrator for judgment.
+pub(crate) const CLAIM_ON_START_JUDGMENT_CODE: &str = "ORCH_CLAIM_ON_START_DISPATCH_EDITED";
+
+/// What the healed rule carries; a copy containing it is current.
+pub(crate) const CLAIM_ON_START_MARKER: &str = "`claim=on_start`";
+
+/// The end of the tracker-ownership paragraph as shipped, and the same with
+/// the `claim=on_start` paragraph after it. With the project's
+/// `issue_tracker.agent_rules.assigned_only` off, an unassigned issue's task
+/// lines carry `owner=unassigned claim=on_start`, and a plain `shelbi issue
+/// start` claims it; without this paragraph the orchestrator would still skip
+/// every `owner=unassigned` line.
+pub(crate) const CLAIM_ON_START_REWRITE: (&str, &str) = (
+    "  line with no `owner=` is from a filesystem board, where every issue is\n  yours.\n",
+    "  line with no `owner=` is from a filesystem board, where every issue is\n  yours.\n\n  \
+     **Unassigned issues, when the project allows them.** With the project's\n  \
+     \"Only work on issues assigned to me\" agent rule off, a line for an\n  \
+     unassigned issue also carries `claim=on_start` (`owner=unassigned\n  \
+     claim=on_start`): dispatch it like `owner=me`, with a plain `shelbi issue\n  \
+     start <id>` (no `--take`), which assigns it to you on the tracker first.\n  \
+     `owner=other:<login>` stays off limits either way.\n",
+);
+
+/// Add the `claim=on_start` paragraph after the shipped tracker-ownership
+/// paragraph, when that paragraph is there verbatim (an unedited copy) and the
+/// marker isn't; otherwise the text is returned unchanged. Shared by the
+/// sniffer and the healer.
+pub(crate) fn apply_claim_on_start_rewrite(text: &str) -> String {
+    let (legacy, new) = CLAIM_ON_START_REWRITE;
+    if text.contains(CLAIM_ON_START_MARKER) || !text.contains(legacy) {
+        return text.to_string();
+    }
+    text.replacen(legacy, new, 1)
+}
+
+/// Sniff an orchestrator `instructions.md` whose ready-dispatch rule doesn't
+/// know `claim=on_start`. Judged against the copy as the tracker-ownership heal
+/// (which runs first) leaves it, so a copy that predates both still auto-heals
+/// in one pass. Only copies that carry the ready-dispatch rule are in scope.
+fn sniff_claim_on_start_dispatch(entry: &InventoryEntry, text: &str, out: &mut Vec<UpgradeFinding>) {
+    if text.contains(CLAIM_ON_START_MARKER) || !text.contains("to_category=ready") {
+        return;
+    }
+    let base = apply_tracker_ownership_rewrites(text);
+    let unedited = apply_claim_on_start_rewrite(&base) != base;
+    out.push(finding(
+        entry,
+        if unedited { Classification::AutoHeal } else { Classification::NeedsJudgment },
+        if unedited { CLAIM_ON_START_AUTOHEAL_CODE } else { CLAIM_ON_START_JUDGMENT_CODE },
+        "orchestrator dispatch rules skip every `owner=unassigned` line, but a project whose \
+         \"Only work on issues assigned to me\" agent rule is off lets its agents start \
+         unassigned tracker issues (those lines carry `claim=on_start`)",
+        "After the \"Only dispatch issues assigned to you on a remote tracker.\" paragraph of the \
+         ready-dispatch reaction rule, add: a line for an unassigned issue that also carries \
+         `claim=on_start` (the project's \"Only work on issues assigned to me\" rule is off) is \
+         dispatched like `owner=me`, with a plain `shelbi issue start <id>` (no `--take`), which \
+         assigns it to you on the tracker first; `owner=other:<login>` stays off limits. Mirror \
+         the shipped default template.",
         locate_line_containing(text, "to_category=ready"),
     ));
 }
@@ -5387,6 +5459,66 @@ to your workdir). My own note: keep it short.
         }
         let mut out = Vec::new();
         sniff_tracker_ownership_dispatch(&orch_entry(), shipped, &mut out);
+        assert!(out.is_empty(), "{:?}", codes(&out));
+    }
+
+    // ---- orchestrator `claim=on_start` dispatch rule ---------------------
+
+    fn legacy_claim_template() -> String {
+        let (legacy, new) = CLAIM_ON_START_REWRITE;
+        shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS.replacen(new, legacy, 1)
+    }
+
+    #[test]
+    fn an_unedited_copy_without_claim_on_start_auto_heals_to_the_shipped_wording() {
+        let legacy = legacy_claim_template();
+        assert!(!legacy.contains(CLAIM_ON_START_MARKER));
+        let mut out = Vec::new();
+        sniff_claim_on_start_dispatch(&orch_entry(), &legacy, &mut out);
+        assert_eq!(codes(&out), vec![CLAIM_ON_START_AUTOHEAL_CODE]);
+        let healed = apply_claim_on_start_rewrite(&legacy);
+        assert_eq!(healed, shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS);
+        let mut again = Vec::new();
+        sniff_claim_on_start_dispatch(&orch_entry(), &healed, &mut again);
+        assert!(again.is_empty(), "{:?}", codes(&again));
+
+        // A copy from before the ownership rule too heals in one pass: the
+        // ownership heal runs first, then this one.
+        let older = TRACKER_OWNERSHIP_REWRITES
+            .iter()
+            .fold(legacy.clone(), |acc, (legacy, new)| acc.replacen(new, legacy, 1));
+        assert!(!older.contains(TRACKER_OWNERSHIP_MARKER));
+        let mut out = Vec::new();
+        sniff_claim_on_start_dispatch(&orch_entry(), &older, &mut out);
+        assert_eq!(codes(&out), vec![CLAIM_ON_START_AUTOHEAL_CODE]);
+        let healed = apply_claim_on_start_rewrite(&apply_tracker_ownership_rewrites(&older));
+        assert_eq!(healed, shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn an_edited_ownership_paragraph_without_claim_on_start_is_needs_judgment() {
+        let edited = legacy_claim_template().replace(
+            "where every issue is\n  yours.",
+            "where every issue is\n  yours (mine too).",
+        );
+        let mut out = Vec::new();
+        sniff_claim_on_start_dispatch(&orch_entry(), &edited, &mut out);
+        assert_eq!(codes(&out), vec![CLAIM_ON_START_JUDGMENT_CODE]);
+        assert_eq!(out[0].classification, Classification::NeedsJudgment);
+        assert_eq!(apply_claim_on_start_rewrite(&edited), edited);
+        // Out of scope without a ready-dispatch rule.
+        let mut out = Vec::new();
+        sniff_claim_on_start_dispatch(&orch_entry(), "# Orchestrator\n", &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn shipped_default_template_carries_the_claim_on_start_rule() {
+        let shipped = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        assert!(shipped.contains(CLAIM_ON_START_REWRITE.1));
+        assert!(shipped.contains(shelbi_state::ownership::CLAIM_ON_START), "the token the daemon writes");
+        let mut out = Vec::new();
+        sniff_claim_on_start_dispatch(&orch_entry(), shipped, &mut out);
         assert!(out.is_empty(), "{:?}", codes(&out));
     }
 

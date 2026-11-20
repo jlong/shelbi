@@ -1171,7 +1171,7 @@ mod tests {
         assert_eq!(r.flow(|f| f.step()), Step::Importing);
         assert_eq!(
             asked.lock().unwrap().as_slice(),
-            [ConnectTracker { choice: TrackerChoice::Github { repo: "acme/app".into() }, force: false }]
+            [ConnectTracker::new(TrackerChoice::Github { repo: "acme/app".into() }, false).with_rules(shelbi_app::tracker_connect::flow::DEFAULT_RULES)]
         );
         assert!(r.flow(|f| f.finished().is_some()));
         assert!(r.drawn("tracker-progress-connection") && r.drawn("tracker-close"));

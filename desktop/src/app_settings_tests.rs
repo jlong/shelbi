@@ -1735,6 +1735,7 @@ fn the_issue_tracker_section_connects_linear_and_can_force_a_refused_switch(cx: 
     assert!(s.drawn("tracker-choice-local") && s.drawn("tracker-choice-github") && s.drawn("tracker-choice-linear"));
     assert_eq!(s.read(|_, cx| section.read(cx).form().tracker()), shelbi_app::new_project::Tracker::FileSystem);
     assert!(!s.drawn("tracker-linear"), "the local board has no Linear fields");
+    assert!(!s.drawn("tracker-rules"), "nor agent rules");
 
     s.click("tracker-choice-linear");
     s.saved();
@@ -1754,10 +1755,24 @@ fn the_issue_tracker_section_connects_linear_and_can_force_a_refused_switch(cx: 
     s.saved();
     assert!(s.drawn("tracker-linear-scope"));
 
+    // The agent rules: the frame's copy, the key's owner named, and a click
+    // toggles one (it saves with the connection).
+    assert!(s.drawn("tracker-rules") && s.drawn("tracker-rule-review") && s.drawn("tracker-rule-assigned"));
+    assert!(s.drawn("tracker-rule-assigned-mark") && !s.drawn("tracker-rule-review-mark"));
+    assert_eq!(
+        s.read(|_, cx| section.read(cx).form().assigned_title()),
+        "Only work on issues assigned to me (Ada Lovelace <ada@example.com>)"
+    );
+    s.click("tracker-rule-review");
+    assert!(s.drawn("tracker-rule-review-mark"));
+
     // Connect is refused (the board has issues): the hint, and Switch anyway.
-    s.click("tracker-connect");
+    // (Below the rules the buttons can sit past the test window's edge:
+    // press them as their clicks do.)
+    s.update(|_, window, cx| section.update(cx, |t, cx| t.connect(false, window, cx)));
     s.saved();
-    assert!(s.drawn("tracker-error") && s.drawn("tracker-force"));
+    assert!(s.read(|_, cx| section.read(cx).form().offers_force()));
+    assert!(s.drawn("tracker-error"));
     // Under the refusal the button can sit below the test window's edge:
     // press it as its click does.
     s.update(|_, window, cx| section.update(cx, |t, cx| t.connect(true, window, cx)));
@@ -1767,6 +1782,7 @@ fn the_issue_tracker_section_connects_linear_and_can_force_a_refused_switch(cx: 
     assert!(!asked[0].force && asked[1].force);
     let TrackerChoice::Linear(conn) = &asked[1].choice else { panic!("{asked:?}") };
     assert_eq!((conn.team.as_str(), conn.assignee.as_deref()), ("ENG", Some("me")));
+    assert_eq!(asked[1].rules, Some(shelbi_core::AgentRules { require_review: true, assigned_only: true }));
     assert!(s.drawn("tracker-status") && !s.drawn("tracker-error"));
 }
 

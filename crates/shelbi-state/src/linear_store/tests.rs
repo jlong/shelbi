@@ -938,6 +938,39 @@ fn ownership_tokens_and_claim_work_on_linear_issues() {
     assert_eq!(gate.owner(&tf.tracker_assignees), Some(TrackerOwner::Me));
 }
 
+#[test]
+fn the_assigned_only_rule_gates_starting_linear_issues() {
+    let env = env();
+    env.sim.seed("mine", "state-todo", 1.0, json!({}));
+    env.sim.seed("grace's", "state-todo", 2.0, json!({ "assignee": user("user-grace") }));
+    env.sim.seed("nobody's", "state-todo", 3.0, json!({ "assignee": null }));
+    let store = env.eng();
+    let cfg = |assigned_only| shelbi_core::IssueTrackerConfig {
+        backend: shelbi_core::IssueTrackerBackend::Linear,
+        linear: Some(LinearConnection::for_team("ENG")),
+        agent_rules: shelbi_core::AgentRules { assigned_only, ..Default::default() },
+        ..Default::default()
+    };
+    let start = |id: &str, assigned_only| {
+        let tf = store.get(id).unwrap().unwrap();
+        crate::ownership::ensure_owned_for_dispatch(&cfg(assigned_only), &store, &tf, false)
+    };
+    // On (the default): an unassigned issue is refused, naming the rule.
+    let err = start("eng-3", true).unwrap_err();
+    assert!(err.contains("\"Only work on issues assigned to me\""), "{err}");
+    assert!(env.sim.calls("IssueUpdate").is_empty(), "nothing claimed");
+    // A teammate's is refused on and off, and never claimed.
+    for assigned_only in [true, false] {
+        let err = start("eng-2", assigned_only).unwrap_err();
+        assert!(err.contains("assigned to @grace"), "{err}");
+    }
+    assert!(env.sim.calls("IssueUpdate").is_empty());
+    // Off: starting the unassigned issue assigns it to the key's owner.
+    assert_eq!(start("eng-3", false), Ok(crate::ownership::Claim::Took { login: "ada".into() }));
+    assert_eq!(env.sim.calls("IssueUpdate")[0].var("input")["assigneeId"], "user-ada");
+    assert_eq!(start("eng-1", false), Ok(crate::ownership::Claim::AlreadyMine));
+}
+
 // --- changes ----------------------------------------------------------------------
 
 #[test]

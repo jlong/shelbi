@@ -20,12 +20,18 @@
 //! A human can claim an issue explicitly with `shelbi issue start <id> --take`
 //! ([`ensure_owned_for_dispatch`] with `take`), which assigns it to them on the
 //! tracker first. The orchestrator never passes that override on its own.
+//!
+//! The project's [`AgentRules`] (`issue_tracker.agent_rules`) adjust the gate:
+//! with `assigned_only` off an **unassigned** issue is startable too, and
+//! starting it claims it as `--take` would ([`OwnershipGate::claims_on_start`]).
+//! A teammate's issue stays off limits either way, and an unresolved login
+//! still fails closed (there is no one to assign it to).
 
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig, Result};
+use shelbi_core::{AgentRules, IssueTrackerBackend, IssueTrackerConfig, Result};
 
 use crate::{IssueFile, IssueStore};
 
@@ -127,6 +133,20 @@ impl OwnershipGate {
         }
     }
 
+    /// Whether an issue with these assignees may be started under `rules`: the
+    /// user's own, or (with `assigned_only` off) an unassigned one this gate can
+    /// claim on start. What the Zen scan and every dispatch path gate on.
+    pub fn startable(&self, rules: &AgentRules, tracker_assignees: &[String]) -> bool {
+        self.allows(tracker_assignees) || self.claims_on_start(rules, tracker_assignees)
+    }
+
+    /// Whether starting an issue with these assignees assigns it to the user
+    /// first: `assigned_only` is off, nobody is assigned, and the user's login
+    /// is known. Shown on task event lines as `claim=on_start`.
+    pub fn claims_on_start(&self, rules: &AgentRules, tracker_assignees: &[String]) -> bool {
+        !rules.assigned_only && tracker_assignees.is_empty() && self.login().is_some()
+    }
+
     /// The authenticated login, when this gate resolved one.
     pub fn login(&self) -> Option<&str> {
         match self {
@@ -148,6 +168,7 @@ impl OwnershipGate {
                 .owner(tracker_assignees)
                 .unwrap_or(TrackerOwner::Unassigned),
             login_check: login_check(None),
+            assigned_only_rule: false,
         })
     }
 }
@@ -161,6 +182,9 @@ pub struct NotOwned {
     pub owner: TrackerOwner,
     /// What to check when the login didn't resolve ([`login_check`]).
     pub login_check: &'static str,
+    /// The project's "Only work on issues assigned to me" rule is why an
+    /// unassigned issue was refused (with it off, the start would claim it).
+    pub assigned_only_rule: bool,
 }
 
 impl NotOwned {
@@ -199,12 +223,23 @@ impl fmt::Display for NotOwned {
                  --take` (assigns it to you on the tracker, then starts it)",
                 at_logins(logins)
             ),
-            TrackerOwner::Unassigned => write!(
-                f,
-                "issue `{id}` is not assigned to anyone on the issue tracker; Shelbi only starts \
-                 issues assigned to you. Assign it to yourself on the tracker, or run `shelbi \
-                 issue start {id} --take` to claim and start it"
-            ),
+            TrackerOwner::Unassigned => {
+                write!(
+                    f,
+                    "issue `{id}` is not assigned to anyone on the issue tracker; Shelbi only \
+                     starts issues assigned to you. Assign it to yourself on the tracker, or run \
+                     `shelbi issue start {id} --take` to claim and start it"
+                )?;
+                if self.assigned_only_rule {
+                    write!(
+                        f,
+                        ". This is the project's agent rule \"Only work on issues assigned to me\" \
+                         (`issue_tracker.agent_rules.assigned_only`); turn it off in Settings ▸ \
+                         Properties ▸ Issue tracker to let Shelbi start unassigned issues"
+                    )?;
+                }
+                Ok(())
+            }
             TrackerOwner::Unknown(logins) => {
                 let assigned = if logins.is_empty() {
                     String::new()
@@ -271,7 +306,10 @@ pub enum Claim {
 /// `Ok` when the issue is the user's (or the board has no ownership); with
 /// `take`, an issue that isn't yet is first assigned to the user on the
 /// tracker. `Err` is the user-facing refusal. Only an explicit human request
-/// passes `take`; automatic dispatch never does.
+/// passes `take`; automatic dispatch never does. With the project's
+/// `assigned_only` rule off, an unassigned issue is claimed the same way
+/// without `take` ([`OwnershipGate::claims_on_start`]); a teammate's still
+/// needs it.
 pub fn ensure_owned_for_dispatch(
     cfg: &IssueTrackerConfig,
     store: &dyn IssueStore,
@@ -285,12 +323,15 @@ pub fn ensure_owned_for_dispatch(
         _ => {}
     }
     let id = &tf.task.id;
-    if !take {
-        return Err(gate
+    let rules = &cfg.agent_rules;
+    if !take && !gate.claims_on_start(rules, &tf.tracker_assignees) {
+        let mut refusal = gate
             .check(id, &tf.tracker_assignees)
             .expect_err("a refused issue fails the check")
-            .for_backend(cfg.backend)
-            .to_string());
+            .for_backend(cfg.backend);
+        refusal.assigned_only_rule =
+            rules.assigned_only && refusal.owner == TrackerOwner::Unassigned && gate.login().is_some();
+        return Err(refusal.to_string());
     }
     let Some(login) = gate.login().map(str::to_string) else {
         return Err(format!(
@@ -345,6 +386,11 @@ pub fn creation_warning(
 /// from the board index (its assignees and the viewer login). `None` on a
 /// filesystem board, or when the open index doesn't carry the issue (a terminal
 /// card, or one created since the last tick), so the token is simply omitted.
+///
+/// An unassigned issue that starting would claim (the project's
+/// `assigned_only` rule is off) gets a second token, `owner=unassigned
+/// claim=on_start`, so the orchestrator knows a plain `shelbi issue start`
+/// takes it. `owner=` itself never changes meaning.
 pub fn event_owner_token(project: &str, task_id: &str) -> Option<String> {
     let cfg = crate::load_project(project).ok()?.issue_tracker;
     if !cfg.backend.is_remote() {
@@ -352,8 +398,17 @@ pub fn event_owner_token(project: &str, task_id: &str) -> Option<String> {
     }
     let tf = crate::indexed_issue(project, &cfg, task_id)?;
     let gate = gate_from_index(project, &cfg).ok()?;
-    gate.owner(&tf.tracker_assignees).map(|o| o.token())
+    let owner = gate.owner(&tf.tracker_assignees)?.token();
+    Some(if gate.claims_on_start(&cfg.agent_rules, &tf.tracker_assignees) {
+        format!("{owner} {CLAIM_ON_START}")
+    } else {
+        owner
+    })
 }
+
+/// The token after `owner=unassigned` on a task event line when starting the
+/// issue would claim it (the `assigned_only` rule is off).
+pub const CLAIM_ON_START: &str = "claim=on_start";
 
 #[cfg(test)]
 mod tests {
@@ -442,5 +497,38 @@ mod tests {
         assert!(!linear.contains("gh "), "{linear}");
 
         assert!(gate.check("t", &logins(&["octocat"])).is_ok());
+    }
+
+    #[test]
+    fn assigned_only_off_makes_unassigned_issues_startable_but_never_a_teammates() {
+        let gate = OwnershipGate::RequireAssignee("octocat".into());
+        let on = AgentRules::default();
+        let off = AgentRules { assigned_only: false, ..AgentRules::default() };
+        // On (the default): only the user's own.
+        assert!(gate.startable(&on, &logins(&["octocat"])));
+        assert!(!gate.startable(&on, &[]));
+        assert!(!gate.claims_on_start(&on, &[]));
+        // Off: an unassigned issue too, claimed on start; a teammate's never.
+        assert!(gate.startable(&off, &[]));
+        assert!(gate.claims_on_start(&off, &[]));
+        assert!(!gate.startable(&off, &logins(&["alice"])));
+        assert!(!gate.claims_on_start(&off, &logins(&["octocat"])), "already mine: nothing to claim");
+        // An unknown login can't claim anything, so it still fails closed.
+        assert!(!OwnershipGate::FailClosed.startable(&off, &[]));
+        // The filesystem board is unrestricted whatever the rules.
+        assert!(OwnershipGate::Unrestricted.startable(&on, &logins(&["alice"])));
+        assert!(!OwnershipGate::Unrestricted.claims_on_start(&off, &[]), "no login, no claim");
+    }
+
+    #[test]
+    fn an_unassigned_refusal_names_the_rule_only_when_it_is_the_reason() {
+        let gate = OwnershipGate::RequireAssignee("octocat".into());
+        let mut refusal = gate.check("t", &[]).unwrap_err();
+        assert!(!refusal.to_string().contains("agent rule"));
+        refusal.assigned_only_rule = true;
+        let text = refusal.to_string();
+        assert!(text.contains("\"Only work on issues assigned to me\""), "{text}");
+        assert!(text.contains("Settings ▸ Properties ▸ Issue tracker"), "{text}");
+        assert!(text.contains("--take"), "the override still shows: {text}");
     }
 }

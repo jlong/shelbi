@@ -13168,10 +13168,22 @@ mod tests {
             "Change key…",
             "ENG  Engineering",
             "Shelbi shows and creates issues in ENG, assigned to you.",
+            "[ ] Always require human review before beginning work",
+            "You must move them out of the backlog status",
+            "[x] Only work on issues assigned to me (Ada Lovelace <ada@example.com>)",
+            "Issues must be assigned to your user before work begins.",
             "[ Connect ]",
         ] {
             assert!(text.contains(want), "{want:?} on the page:\n{text}");
         }
+        // The rules toggle with Enter and ride with the connection.
+        cursor_to(&mut st, Item::Tracker(TrackerItem::RequireReview));
+        press(&mut st, KeyCode::Enter);
+        cursor_to(&mut st, Item::Tracker(TrackerItem::AssignedOnly));
+        press(&mut st, KeyCode::Enter);
+        let text = capture_screen(&mut st, "settings-tracker-rules");
+        assert!(text.contains("[x] Always require human review"), "{text}");
+        assert!(text.contains("[ ] Only work on issues assigned to me"), "{text}");
 
         // Connect: refused, with the migrate hint and Switch anyway.
         cursor_to(&mut st, Item::Tracker(TrackerItem::Primary));
@@ -13189,6 +13201,35 @@ mod tests {
         assert!(!asked[0].force && asked[1].force);
         let shelbi_app::tracker_connect::TrackerChoice::Linear(conn) = &asked[1].choice else { panic!("{asked:?}") };
         assert_eq!((conn.team.as_str(), conn.assignee.as_deref()), ("ENG", Some("me")));
+        assert_eq!(
+            asked[1].rules,
+            Some(shelbi_core::AgentRules { require_review: true, assigned_only: false })
+        );
+        drop(home);
+    }
+
+    #[test]
+    fn the_tracker_sections_rules_name_the_github_account_and_hide_for_the_local_board() {
+        use settings::properties::{Item, TrackerItem};
+        use shelbi_app::new_project::Tracker;
+        let home = agents_home("tracker-rules");
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        st.tracker_service = recording_tracker(asked);
+        st.dispatch_effect(Effect::OpenSettings);
+        type_key(&mut st, '4');
+        settle_agents(&mut st, "the config loads", |st| st.settings.properties().tracker().loaded());
+        press(&mut st, KeyCode::Tab);
+        // The local board has no rules to show.
+        assert!(!st.settings.properties().items().contains(&Item::Tracker(TrackerItem::AssignedOnly)));
+        cursor_to(&mut st, Item::Tracker(TrackerItem::Choice(Tracker::FileSystem)));
+        press(&mut st, KeyCode::Right);
+        assert_eq!(st.settings.properties().tracker().tracker(), Tracker::Github);
+        settle_agents(&mut st, "the gh login loads", |st| st.settings.properties().tracker().account().is_some());
+        let text = capture_screen(&mut st, "settings-tracker-github-rules");
+        assert!(text.contains("[x] Only work on issues assigned to me (octocat)"), "{text}");
+        assert!(text.contains("[ ] Always require human review before beginning work"), "{text}");
         drop(home);
     }
 

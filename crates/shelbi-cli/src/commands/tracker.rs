@@ -304,7 +304,7 @@ fn connect(project_opt: Option<String>, args: ConnectArgs, interactive: bool, ou
              --yes and a non-terminal stdin never prompt"
         ),
     };
-    let req = ConnectTracker { choice: TrackerChoice::Linear(conn), force: args.force };
+    let req = ConnectTracker::new(TrackerChoice::Linear(conn), args.force);
     let done = apply_tracker_connection(&name, &req).map_err(|e| anyhow!(e.to_string()))?;
     report_connected(out, &name, &done)
 }
@@ -329,7 +329,7 @@ fn disconnect(project_opt: Option<String>, force: bool, interactive: bool, out: 
             bail!("project `{name}` was not disconnected");
         }
     }
-    let req = ConnectTracker { choice: TrackerChoice::FileSystem, force };
+    let req = ConnectTracker::new(TrackerChoice::FileSystem, force);
     let done = apply_tracker_connection(&name, &req).map_err(|e| anyhow!(e.to_string()))?;
     report_connected(out, &name, &done)
 }

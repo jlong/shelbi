@@ -190,7 +190,7 @@ pub fn apply_tracker_connection_with(
     let loaded = shelbi_state::load_project(project)
         .map_err(|e| ConnectError::Failed(format!("project `{project}` could not be loaded: {e}")))?;
     let current = loaded.issue_tracker;
-    let new = req.choice.config(&current);
+    let new = req.config(&current);
     new.validate().map_err(|e| ConnectError::Preflight(e.to_string()))?;
 
     if switches_board(&current, &new) && !req.force {
@@ -333,7 +333,7 @@ machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/app\nworkspaces:
     const GITHUB: &str = "issue_tracker:\n  backend: github\n  github:\n    repo: acme/app\n";
 
     fn linear(team: &str) -> ConnectTracker {
-        ConnectTracker { choice: TrackerChoice::Linear(LinearConnection::for_team(team)), force: false }
+        ConnectTracker::new(TrackerChoice::Linear(LinearConnection::for_team(team)), false)
     }
 
     #[test]
@@ -358,16 +358,29 @@ machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/app\nworkspaces:
 
         // A filter change on the same team is no switch: no emptiness check.
         let mut env = FakeEnv { issues: Some(Ok(5)), ..FakeEnv::default() };
-        let req = ConnectTracker {
-            choice: TrackerChoice::Linear(LinearConnection { label: Some("Bug".into()), ..LinearConnection::for_team("ENG") }),
-            force: false,
-        };
+        let req = ConnectTracker::new(
+            TrackerChoice::Linear(LinearConnection { label: Some("Bug".into()), ..LinearConnection::for_team("ENG") }),
+            false,
+        );
         apply_tracker_connection_with(&mut env, "app", &req).unwrap();
         assert!(env.counted.is_empty());
 
+        // The agent rules ride with the connection, and a later request
+        // without them keeps them.
+        let rules = shelbi_core::AgentRules { require_review: true, assigned_only: false };
+        let mut env = FakeEnv::default();
+        apply_tracker_connection_with(&mut env, "app", &req.clone().with_rules(rules)).unwrap();
+        assert_eq!(shelbi_state::load_project("app").unwrap().issue_tracker.agent_rules, rules);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("require_review: true") && text.contains("assigned_only: false"), "{text}");
+        apply_tracker_connection_with(&mut env, "app", &req).unwrap();
+        assert_eq!(shelbi_state::load_project("app").unwrap().issue_tracker.agent_rules, rules);
+        apply_tracker_connection_with(&mut env, "app", &req.clone().with_rules(Default::default())).unwrap();
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("agent_rules"));
+
         // Disconnecting goes back to no block at all, and drops the cache.
         let mut env = FakeEnv::default();
-        let req = ConnectTracker { choice: TrackerChoice::FileSystem, force: false };
+        let req = ConnectTracker::new(TrackerChoice::FileSystem, false);
         let done = apply_tracker_connection_with(&mut env, "app", &req).unwrap();
         assert_eq!(done.statuses, StatusSync::NotNeeded);
         assert!(!std::fs::read_to_string(&file).unwrap().contains("issue_tracker"));
