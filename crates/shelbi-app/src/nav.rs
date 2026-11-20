@@ -108,6 +108,9 @@ pub enum Overlay {
     ZenIntro,
     /// The add-project form.
     AddProject,
+    /// An image shown at its own size over the window (the desktop
+    /// Changelog's lightbox; the TUI draws images as their alt text).
+    Lightbox,
 }
 
 /// One client's view of Shelbi. Each attached UI (and each desktop window)

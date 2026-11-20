@@ -84,6 +84,9 @@ const FOOTER_H: f32 = 27.0;
 pub enum ChangelogEvent {
     /// Show this issue's detail (on the Issues board).
     OpenIssue(String),
+    /// Show this image in the window's lightbox (a click on a figure the
+    /// column scaled down).
+    OpenImage(crate::views::overlay::lightbox::LightboxImage),
 }
 
 /// A key the page takes.
@@ -725,7 +728,11 @@ impl ChangelogView {
             .collect();
         let body = (!entry.prose().is_empty()).then(|| {
             let state = self.body_state(entry, cx);
-            markdown::body_with_state(&state, theme, entry.dir.as_deref())
+            let page = cx.entity().downgrade();
+            let open: markdown::OpenImage = std::sync::Arc::new(move |image, _, cx| {
+                let _ = page.update(cx, |_, cx| cx.emit(ChangelogEvent::OpenImage(image)));
+            });
+            markdown::body_with_state(&state, theme, entry.dir.as_deref(), Some(open))
         });
         let files: Vec<AnyElement> = entry
             .listed_attachments()
@@ -1149,6 +1156,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// A click on an image the column scaled down asks the window for the
+    /// lightbox, with the stored file at its own size and its caption; the
+    /// same click on one drawn at its own size asks for nothing, and the
+    /// page stays where it was scrolled.
+    #[gpui::test]
+    fn a_click_on_a_scaled_down_image_asks_for_the_lightbox(cx: &mut TestAppContext) {
+        let _env = crate::test_env::lock();
+        let home = std::env::temp_dir().join(format!("shbcl-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        // SAFETY: the env lock is held.
+        unsafe { std::env::set_var("SHELBI_HOME", &home) };
+        let project = "clz";
+        let src = home.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        // Far wider than the column, and narrower than it.
+        image::RgbaImage::from_pixel(2400, 300, image::Rgba([40, 80, 120, 255]))
+            .save(src.join("wide.png"))
+            .unwrap();
+        image::RgbaImage::from_pixel(80, 40, image::Rgba([120, 80, 40, 255]))
+            .save(src.join("small.png"))
+            .unwrap();
+        let added = add_entry(project, entry("Lightbox", &[], "Click to zoom.")).unwrap();
+        let image = |name: &str, alt: &str| shelbi_state::changelog::NewAttachment {
+            source: src.join(name),
+            kind: shelbi_state::changelog::AttachmentKind::Image,
+            alt: Some(alt.into()),
+        };
+        let files =
+            shelbi_state::changelog::prepare_attachments(&[image("wide.png", "The wide one"), image("small.png", "A chip")])
+                .unwrap();
+        let (stored_entry, stored) = shelbi_state::changelog::attach_files(&added, &files).unwrap();
+
+        cx.update(|cx| {
+            cx.set_global(Theme::resolve(shelbi_state::ThemePreference::Dark, gpui::WindowAppearance::Dark));
+            gpui_kit::init(cx);
+        });
+        let handle = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(|cx| ChangelogView::new(&shelbi_orchestrator::source::local_handle(project), cx)))
+                .unwrap()
+        });
+        let mut vcx = VisualTestContext::from_window(handle.into(), cx);
+        let view = handle.root(&mut vcx).unwrap();
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = opened.clone();
+        vcx.update(|_, cx| {
+            cx.subscribe(&view, move |_, ev: &ChangelogEvent, _| {
+                if let ChangelogEvent::OpenImage(image) = ev {
+                    seen.borrow_mut().push(image.clone());
+                }
+            })
+            .detach();
+        });
+        // The read, then the images' decode (off the UI thread).
+        for _ in 0..3 {
+            settle(&view, &mut vcx);
+        }
+
+        // Each image is a figure: of one paragraph, or of one each.
+        let starts: Vec<usize> = stored_entry.body.match_indices("![").map(|(at, _)| at).collect();
+        let selector = |start: usize, ix: usize| -> &'static str {
+            Box::leak(format!("changelog-figure-{start}-{ix}-image").into_boxed_str())
+        };
+        let wide = vcx.debug_bounds(selector(starts[0], 0)).expect("the wide image is drawn");
+        assert!(wide.size.width.as_f32() < 2400.0, "scaled to the column: {wide:?}");
+        let small = vcx
+            .debug_bounds(selector(starts[1], 0))
+            .or_else(|| vcx.debug_bounds(selector(starts[0], 1)))
+            .expect("the small image is drawn");
+        assert_eq!(small.size.width.as_f32(), 80.0, "at its own size");
+        let scroll = |vcx: &VisualTestContext| view.read_with(vcx, |v, _| {
+            let top = v.scroll_top();
+            (top.item_ix, top.offset_in_item)
+        });
+        let top = scroll(&vcx);
+
+        vcx.simulate_click(small.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        assert!(opened.borrow().is_empty(), "a full-size image isn't a zoom target");
+
+        vcx.simulate_click(wide.center(), gpui::Modifiers::none());
+        vcx.run_until_parked();
+        assert_eq!(
+            *opened.borrow(),
+            [crate::views::overlay::lightbox::LightboxImage {
+                source: shelbi_app::changelog::ImageSource::File(stored[0].absolute.clone()),
+                width: 2400.0,
+                height: 300.0,
+                caption: "The wide one".into(),
+            }]
+        );
+        assert_eq!(scroll(&vcx), top, "the page didn't move");
+
+        unsafe { std::env::remove_var("SHELBI_HOME") };
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn a_pr_chip_draws_the_figma_pull_request_icon() {
         assert_eq!(link_icon(LinkKind::Pr), icons::PULL_REQUEST);
@@ -1188,8 +1292,9 @@ mod tests {
         let seen = opened.clone();
         vcx.update(|_, cx| {
             cx.subscribe(&view, move |_, ev: &ChangelogEvent, _| {
-                let ChangelogEvent::OpenIssue(id) = ev;
-                seen.borrow_mut().push(id.clone());
+                if let ChangelogEvent::OpenIssue(id) = ev {
+                    seen.borrow_mut().push(id.clone());
+                }
             })
             .detach();
         });

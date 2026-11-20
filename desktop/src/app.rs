@@ -5079,9 +5079,9 @@ impl ShelbiWindow {
         }
         let project = self.project_handle.clone();
         let changelog = cx.new(|cx| ChangelogView::new(&project, cx));
-        let sub = cx.subscribe_in(&changelog, window, |this, _, ev: &ChangelogEvent, window, cx| {
-            let ChangelogEvent::OpenIssue(id) = ev;
-            this.open_task(id, window, cx);
+        let sub = cx.subscribe_in(&changelog, window, |this, _, ev: &ChangelogEvent, window, cx| match ev {
+            ChangelogEvent::OpenIssue(id) => this.open_task(id, window, cx),
+            ChangelogEvent::OpenImage(image) => this.open_lightbox(image.clone(), window, cx),
         });
         self._view_subscriptions.push(sub);
         self.changelog = Some(changelog.clone());
@@ -6009,6 +6009,22 @@ impl ShelbiWindow {
         self.tab_menu.close((self.clock)());
         self.focus_handle.focus(window, cx);
         cx.notify();
+    }
+
+    /// Show a Changelog image in the lightbox. The click came from the
+    /// Changelog, so that is where the keys go back to when it closes (and
+    /// the page keeps its scroll: the overlay draws over it).
+    pub(crate) fn open_lightbox(
+        &mut self,
+        image: crate::views::overlay::lightbox::LightboxImage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overlay.is_some() {
+            return;
+        }
+        self.client.focus_main();
+        self.open_overlay(ActiveOverlay::Lightbox(image), window, cx);
     }
 
     /// Close the overlay and hand keys back to where focus was.
@@ -8113,6 +8129,10 @@ mod new_tab_tests;
 #[cfg(test)]
 #[path = "app_mixed_tabs_tests.rs"]
 mod mixed_tabs_tests;
+
+#[cfg(test)]
+#[path = "app_lightbox_tests.rs"]
+mod lightbox_tests;
 
 #[cfg(test)]
 mod tests {
