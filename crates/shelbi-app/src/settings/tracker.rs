@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig};
 
+use crate::github_setup::{GithubAnswer, GithubRequest};
 use crate::linear_setup::{Filter, LinearAnswer, LinearChoice, LinearRequest, TEAM_REQUIRED};
 use crate::new_project::{github_config, IssuesChoice, Tracker};
 use crate::source::ProjectLink;
@@ -84,6 +85,9 @@ pub struct TrackerService {
     pub connect: Arc<dyn Fn(ConnectTracker) -> Result<Connected, ConnectError> + Send + Sync>,
     /// One Linear read for the pickers (or a pasted key's login).
     pub linear: Arc<dyn Fn(LinearRequest) -> LinearAnswer + Send + Sync>,
+    /// One GitHub read for Connect to an Issue tracker's pickers (the
+    /// account, an owner's repositories, the preflight).
+    pub github: Arc<dyn Fn(GithubRequest) -> GithubAnswer + Send + Sync>,
     /// Sync the status catalog from the tracker now (Workflows' Sync now).
     pub sync_statuses: Arc<dyn Fn() -> StatusSync + Send + Sync>,
 }
@@ -97,10 +101,11 @@ impl std::fmt::Debug for TrackerService {
 impl TrackerService {
     /// The far daemon's, over `link`.
     pub fn far(link: &ProjectLink) -> Self {
-        let (a, b, c) = (link.clone(), link.clone(), link.clone());
+        let (a, b, c, d) = (link.clone(), link.clone(), link.clone(), link.clone());
         TrackerService {
             connect: Arc::new(move |req| crate::far::connect_tracker(&a, req)),
             linear: Arc::new(move |req| crate::far::linear(&b, req)),
+            github: Arc::new(move |req| crate::far::github(&d, req)),
             sync_statuses: Arc::new(move || crate::far::sync_statuses(&c)),
         }
     }
@@ -528,6 +533,7 @@ mod tests {
                 },
                 LinearRequest::Login(_) => LinearAnswer::Login(Ok("Ada <ada@example.com>".into())),
                 LinearRequest::Preflight(connection) => LinearAnswer::Preflight { connection, result: Ok("ENG".into()) },
+                LinearRequest::Workspace => LinearAnswer::Workspace(Ok("Example".into())),
             };
             form.linear_answer(answer);
         }

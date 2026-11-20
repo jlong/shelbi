@@ -33,6 +33,9 @@ pub struct FarServices {
     pub spawn_editor: Arc<SpawnEditor>,
     /// How a diff view's `gY` reaches an agent's session here.
     pub agent_send: shelbi_app::diff::AgentSend,
+    /// Connect to an Issue tracker's GitHub reads, through this machine's
+    /// `gh`.
+    pub github: Arc<dyn Fn(shelbi_app::github_setup::GithubRequest) -> shelbi_app::github_setup::GithubAnswer + Send + Sync>,
 }
 
 impl FarServices {
@@ -44,6 +47,7 @@ impl FarServices {
             readiness: crate::machine_readiness::service(),
             spawn_editor: Arc::new(spawn_editor),
             agent_send: crate::agent_send::service(),
+            github: Arc::new(crate::project_create::github::answer),
         }
     }
 }
@@ -82,6 +86,7 @@ pub fn answer_with(services: &FarServices, project: &str, request: Request) -> R
         }
         // The project's key: the pickers read what the connection will use.
         Request::Linear(req) => Reply::Linear(crate::project_create::linear::answer(Some(project), req)),
+        Request::Github(req) => Reply::Github((services.github)(req)),
         Request::SyncStatuses => Reply::StatusesSynced(crate::tracker_connect::sync_statuses_now(project)),
     }
 }
@@ -203,6 +208,7 @@ mod tests {
             readiness: crate::machine_readiness::service(),
             spawn_editor: Arc::new(|_, _, _| panic!("never spawned")),
             agent_send: crate::agent_send::service(),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
         };
         let reply = answer_with(
             &services,

@@ -2551,8 +2551,9 @@ impl Run {
     /// its default model, 2720:33054) and `add-project-settings-in-repo` /
     /// `-global` (each card selected, 2483:8653 / 2483:8897).
     /// Connect to an Issue tracker (`tracker-connect`, Figma 2753:11686):
-    /// the chooser (2753:12002), with GitHub connected (2780:35199), and a
-    /// counted step (the Choose project frame's footer, 2753:12006).
+    /// the chooser (2753:12002), with GitHub connected (2780:35199), and
+    /// Choose your GitHub / Linear project (2753:12004 / 2753:12006), picked
+    /// and before `gh` is signed in or a Linear key is stored.
     /// `SHELBI_VISUAL_ONLY=tracker-connect` renders just these.
     fn tracker_connect_windows(&mut self) {
         use crate::views::tracker_connect::{TrackerConnectView, SIZE};
@@ -2564,6 +2565,7 @@ impl Run {
         let service = shelbi_app::settings::tracker::TrackerService {
             connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("offscreen".into()))),
             linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| StatusSync::NotNeeded),
         };
         let github = IssueTrackerConfig {
@@ -2571,14 +2573,28 @@ impl Run {
             github: Some(GithubConnection { repo: "jlong/shelbi".into() }),
             ..IssueTrackerConfig::default()
         };
-        let states: [(&str, IssueTrackerConfig, Option<Tracker>); 4] = [
-            ("tracker-select", IssueTrackerConfig::default(), None),
-            ("tracker-connected", github, None),
-            ("tracker-github-choose", IssueTrackerConfig::default(), Some(Tracker::Github)),
-            ("tracker-linear-choose", IssueTrackerConfig::default(), Some(Tracker::Linear)),
+        type Edit = fn(&mut shelbi_app::tracker_connect::flow::TrackerFlow);
+        let none: Edit = |_| {};
+        let repo: Edit = |f| f.set_repo("octocat/shelbi");
+        let team: Edit = |f| f.linear_mut().select_team("ENG");
+        // Screen, the project's connection, the card connected, an edit, and
+        // whether the machine is signed out of gh and Linear.
+        let states: [(&str, IssueTrackerConfig, Option<Tracker>, Edit, bool); 8] = [
+            ("tracker-select", IssueTrackerConfig::default(), None, none, false),
+            ("tracker-connected", github, None, none, false),
+            ("tracker-github-choose", IssueTrackerConfig::default(), Some(Tracker::Github), none, false),
+            ("tracker-github-picked", IssueTrackerConfig::default(), Some(Tracker::Github), repo, false),
+            ("tracker-github-signed-out", IssueTrackerConfig::default(), Some(Tracker::Github), none, true),
+            ("tracker-linear-choose", IssueTrackerConfig::default(), Some(Tracker::Linear), none, false),
+            ("tracker-linear-picked", IssueTrackerConfig::default(), Some(Tracker::Linear), team, false),
+            ("tracker-linear-no-key", IssueTrackerConfig::default(), Some(Tracker::Linear), none, true),
         ];
-        for (screen, cfg, connect) in states {
-            let service = service.clone();
+        for (screen, cfg, connect, edit, signed_out) in states {
+            let mut service = service.clone();
+            if signed_out {
+                service.github = Arc::new(shelbi_app::github_setup::fixture::signed_out);
+                service.linear = Arc::new(shelbi_app::linear_setup::fixture::no_key);
+            }
             let handle = self
                 .cx
                 .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
@@ -2597,6 +2613,7 @@ impl Run {
                         v.loaded(Ok(cfg), window, cx);
                         if let Some(tracker) = connect {
                             v.edit_flow(|f| { f.connect(tracker); }, window, cx);
+                            v.edit_flow(edit, window, cx);
                         }
                     })
                 })
@@ -2890,6 +2907,7 @@ impl Run {
                 }
             }),
             linear: Arc::new(linear),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| StatusSync::NotNeeded),
         };
         let tracker_states: [(&str, Answer, bool, bool); 3] = [

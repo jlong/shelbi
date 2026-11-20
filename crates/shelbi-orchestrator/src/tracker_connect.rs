@@ -91,6 +91,7 @@ pub fn local_service(project: &str) -> shelbi_app::settings::tracker::TrackerSer
     shelbi_app::settings::tracker::TrackerService {
         connect: std::sync::Arc::new(move |req| apply_tracker_connection(&a, &req)),
         linear: std::sync::Arc::new(move |req| linear::answer(Some(&b), req)),
+        github: std::sync::Arc::new(crate::project_create::github::answer),
         sync_statuses: std::sync::Arc::new(move || sync_statuses_now(&c)),
     }
 }

@@ -96,6 +96,7 @@ pub mod jobs;
 pub mod reminders;
 pub mod new_task;
 pub mod feedback;
+pub mod github_setup;
 pub mod harness_picker;
 pub mod launch;
 pub mod layout_sub;

@@ -290,6 +290,20 @@ impl LinearClient {
         })
     }
 
+    /// The name of the workspace (organization) the key belongs to.
+    pub fn organization_name(&self) -> LinearResult<String> {
+        #[derive(Deserialize)]
+        struct Organization {
+            name: String,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            organization: Organization,
+        }
+        let req = LinearRequest::new("Organization", "query Organization { organization { id name urlKey } }", json!({}));
+        Ok(self.query::<Data>(&req)?.organization.name)
+    }
+
     /// Every team the key can see, sorted by key.
     pub fn teams(&self) -> LinearResult<Vec<LinearTeam>> {
         let query = format!(
@@ -377,6 +391,13 @@ mod tests {
         assert_eq!(me.label(), "ada <ada@example.com>");
         let keys: Vec<_> = client.teams().unwrap().into_iter().map(|t| t.key).collect();
         assert_eq!(keys, ["DES", "ENG"]);
+    }
+
+    #[test]
+    fn the_organization_decodes() {
+        let _home = test_home::fresh();
+        let fake = FakeLinear::new();
+        assert_eq!(fake.client().organization_name().unwrap(), "Example workspace");
     }
 
     #[test]

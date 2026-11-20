@@ -30,17 +30,42 @@
 //!   Step N of 4                                  [Back] [Continue]
 //! ```
 //!
-//! Keys: Return is the step's primary button, Esc and ⌘W close (a
-//! connection already running carries on in the background). The Choose
-//! project, Agent rules and Review import steps draw placeholders until
-//! `tc-choose` and `tc-import` build them.
+//! Choose your GitHub project / Choose your Linear project (03-github-choose,
+//! 03a-linear-choose), the pickers 624pt wide in the 704pt column:
+//!
+//! ```text
+//!   ✓ Account connected · Change account
+//!   Organization                      Workspace
+//!   [ octocat                    ⌄ ]  [ Example workspace          ⌄ ]
+//!   Repository                        Team
+//!   [ octocat/shelbi             ⌄ ]  [ Engineering · ENG          ⌄ ]
+//!                                     Project
+//!                                     [ Any project                ⌄ ]
+//!   This will be the only issue tracker project connected to this Shelbi project.
+//! ```
+//!
+//! Without a signed-in `gh` the GitHub step shows how to sign in (the
+//! command, with Copy) and Retry in the account line's place; without a
+//! working Linear key the Linear step shows the key field and a link to
+//! Linear's API key settings. Change account opens the same. The pickers'
+//! reads and Continue's preflight run through the project's
+//! [`TrackerService`] (the far daemon's for a project on another machine).
+//!
+//! Keys: Return is the step's primary button (Verify while the Linear key
+//! field shows), Esc closes an open picker, else the window, as ⌘W does (a
+//! connection already running carries on in the background). The Agent
+//! rules and Review import steps draw placeholders until `tc-import` builds
+//! them.
 
 use std::collections::HashMap;
 
 use gpui::{
-    div, prelude::*, px, AnyWindowHandle, App, ClickEvent, Context, Div, FocusHandle, Focusable, Global, Role,
-    Stateful, Subscription, Window, WindowHandle,
+    div, prelude::*, px, AnyElement, AnyWindowHandle, App, ClickEvent, ClipboardItem, Context, Div, FocusHandle,
+    Focusable, Global, Role, Stateful, Subscription, Window, WindowHandle,
 };
+use gpui_kit::component::input::InputEvent;
+use shelbi_app::github_setup::{self as gh, GithubAuth};
+use shelbi_app::linear_setup::{KeyState, Loadable, LOADING};
 use shelbi_app::new_project::Tracker;
 use shelbi_app::settings::tracker::TrackerService;
 use shelbi_app::source::ProjectHandle;
@@ -50,8 +75,12 @@ use shelbi_app::tracker_connect::flow::{
 use shelbi_app::tracker_connect::StatusSync;
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
+use super::harness_picker::picker_button;
+use super::linear_fields::{self, LinearUi, Pick};
+use super::workflow_editor::dropdown;
 use crate::app::{CloseWindow, ShelbiWindow};
 use crate::assets::{heroicon, icons};
+use crate::elements::terminal::metrics::PRIMARY_FAMILY as MONO_FAMILY;
 use crate::elements::spinner;
 use crate::keys::chord_from_keystroke;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
@@ -66,6 +95,49 @@ const CONTENT_W: f32 = 704.0;
 /// The room between the subheading and a step's content (the frames' 76pt,
 /// less the column's 24pt gap).
 const CONTENT_TOP: f32 = 52.0;
+/// The Choose project step's pickers' width (the frames' 624pt, centered in
+/// the 704pt column).
+const FIELDS_W: f32 = 624.0;
+
+/// A GitHub picker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GithubPick {
+    Owner,
+    Repo,
+}
+
+impl GithubPick {
+    fn id(self) -> &'static str {
+        match self {
+            GithubPick::Owner => "tracker-github-owner",
+            GithubPick::Repo => "tracker-github-repo",
+        }
+    }
+
+    fn menu_id(self) -> &'static str {
+        match self {
+            GithubPick::Owner => "tracker-github-owner-menu",
+            GithubPick::Repo => "tracker-github-repo-menu",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            GithubPick::Owner => gh::OWNER_LABEL,
+            GithubPick::Repo => gh::REPO_LABEL,
+        }
+    }
+}
+
+/// What a click in the GitHub step asks for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GithubMsg {
+    Owner(String),
+    Repo(String),
+    ChangeAccount,
+    CancelChangeAccount,
+    Retry,
+}
 
 /// The open flows, by project: asking again raises the open one.
 #[derive(Default)]
@@ -105,6 +177,11 @@ pub struct TrackerConnectView {
     focus: FocusHandle,
     /// Why the project's connection couldn't be read.
     load_error: Option<String>,
+    /// The Linear step's key field and open picker.
+    linear_ui: LinearUi,
+    /// The GitHub step's open picker, and where the open one hangs.
+    github_menu: Option<GithubPick>,
+    github_anchor: style::Anchor,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -120,7 +197,15 @@ impl TrackerConnectView {
         window.focus(&focus, cx);
         let this_window = window.window_handle();
         let me = cx.weak_entity();
-        let subscriptions = vec![cx.intercept_keystrokes(move |event, window, cx| {
+        let linear_ui = LinearUi::new(window, cx);
+        let key_input = cx.subscribe_in(&linear_ui.key_input, window, |this, input, event: &InputEvent, _, cx| {
+            if let InputEvent::Change = event {
+                let text = input.read(cx).value().to_string();
+                this.flow.linear_mut().set_key_input(text);
+                cx.notify();
+            }
+        });
+        let subscriptions = vec![key_input, cx.intercept_keystrokes(move |event, window, cx| {
             if window.window_handle() != this_window {
                 return;
             }
@@ -138,6 +223,9 @@ impl TrackerConnectView {
             from,
             focus,
             load_error: None,
+            linear_ui,
+            github_menu: None,
+            github_anchor: Default::default(),
             _subscriptions: subscriptions,
         };
         view.load(window, cx);
@@ -196,23 +284,89 @@ impl TrackerConnectView {
         window.remove_window();
     }
 
-    /// A key the flow takes: Return is the primary button, Esc closes.
+    /// A key the flow takes: Return is the primary button (Verify while the
+    /// Linear key field shows), Esc closes an open picker, else the window.
     fn key(&mut self, chord: KeyChord, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if chord.mods != Mods::NONE {
             return false;
         }
         match chord.code {
+            Key::Enter if self.key_field_shows() => self.linear_msg(linear_fields::Msg::Verify, window, cx),
             Key::Enter => self.primary(window, cx),
+            Key::Esc if self.linear_ui.menu.is_some() || self.github_menu.is_some() => {
+                self.linear_ui.menu = None;
+                self.github_menu = None;
+                cx.notify();
+            }
             Key::Esc => self.close(window),
             _ => return false,
         }
         true
     }
 
+    /// The Linear step's key field shows (Return verifies the key).
+    fn key_field_shows(&self) -> bool {
+        self.flow.step() == Step::ChooseProject
+            && self.flow.tracker() == Some(Tracker::Linear)
+            && self.flow.linear().needs_key()
+    }
+
+    /// After the choice changed: the key field shows the choice's text, and
+    /// the reads it asks for run.
+    fn after_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self.flow.linear().key_input().to_string();
+        self.linear_ui.sync_key(&key, window, cx);
+        self.run_due(window, cx);
+        cx.notify();
+    }
+
+    /// A click in the Linear step's fields.
+    fn linear_msg(&mut self, msg: linear_fields::Msg, window: &mut Window, cx: &mut Context<Self>) {
+        use linear_fields::Msg;
+        let linear = self.flow.linear_mut();
+        match msg {
+            Msg::Verify => {
+                linear.submit_key();
+            }
+            Msg::ChangeKey => {
+                linear.change_key();
+                let focus = self.linear_ui.key_input.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            }
+            Msg::CancelChangeKey => linear.cancel_change_key(),
+            Msg::Retry => linear.retry(),
+            Msg::Team(team) => linear.select_team(&team),
+            Msg::Filter(filter, value) => linear.select_filter(filter, Some(&value)),
+        }
+        self.after_change(window, cx);
+    }
+
+    fn linear_menu(&mut self, pick: Option<Pick>, cx: &mut Context<Self>) {
+        match pick {
+            Some(p) => self.linear_ui.toggle(p),
+            None => self.linear_ui.menu = None,
+        }
+        cx.notify();
+    }
+
+    /// A click in the GitHub step.
+    fn github_msg(&mut self, msg: GithubMsg, window: &mut Window, cx: &mut Context<Self>) {
+        self.github_menu = None;
+        let github = self.flow.github_mut();
+        match msg {
+            GithubMsg::Owner(owner) => github.select_owner(&owner),
+            GithubMsg::Repo(repo) => github.select_repo(&repo),
+            GithubMsg::ChangeAccount => github.change_account(),
+            GithubMsg::CancelChangeAccount => github.cancel_change_account(),
+            GithubMsg::Retry => github.retry(),
+        }
+        self.after_change(window, cx);
+    }
+
     /// A card's Connect.
     fn connect(&mut self, tracker: Tracker, window: &mut Window, cx: &mut Context<Self>) {
         if self.flow.connect(tracker) {
-            self.run_due(window, cx);
+            self.after_change(window, cx);
         }
         cx.notify();
     }
@@ -238,6 +392,8 @@ impl TrackerConnectView {
 
     /// The footer's left button.
     fn secondary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.linear_ui.menu = None;
+        self.github_menu = None;
         match self.flow.secondary() {
             Some(Secondary::Back) => {
                 self.flow.back();
@@ -259,8 +415,20 @@ impl TrackerConnectView {
                         let answer = work.await;
                         this.update_in(cx, |this, window, cx| {
                             this.flow.linear_answer(answer);
-                            this.run_due(window, cx);
-                            cx.notify();
+                            this.after_change(window, cx);
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+                FlowRequest::Github(req) => {
+                    let github = self.service.github.clone();
+                    let work = cx.background_executor().spawn(async move { github(req) });
+                    cx.spawn_in(window, async move |this, cx| {
+                        let answer = work.await;
+                        this.update_in(cx, |this, window, cx| {
+                            this.flow.github_answer(answer);
+                            this.after_change(window, cx);
                         })
                         .ok();
                     })
@@ -376,7 +544,242 @@ fn progress_line(id: &'static str, done: bool, text: String, theme: &Theme) -> D
         .child(text)
 }
 
+/// The account line (`✓ Account connected · Change account`, in the accent).
+fn account_line(id: &'static str, theme: &Theme, cx: &mut Context<TrackerConnectView>, on_change: fn(&mut TrackerConnectView, &mut Window, &mut Context<TrackerConnectView>)) -> Div {
+    div()
+        .debug_selector(move || format!("{id}-account"))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .type_style(Type::Small)
+        .text_color(theme.link)
+        .child(format!("✓ {} ·", copy::ACCOUNT_CONNECTED))
+        .child(
+            super::about::link(format!("{id}-change-account"), copy::CHANGE_ACCOUNT, theme.link, theme)
+                .role(Role::Button)
+                .aria_label(copy::CHANGE_ACCOUNT)
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| on_change(this, window, cx))),
+        )
+}
+
+/// A quiet line (an account being checked).
+fn quiet(selector: &'static str, text: impl Into<gpui::SharedString>, theme: &Theme) -> Div {
+    div().debug_selector(move || selector.into()).type_style(Type::Small).text_color(theme.muted).child(text.into())
+}
+
+fn error_line(selector: &'static str, text: impl Into<gpui::SharedString>, theme: &Theme) -> Div {
+    div().debug_selector(move || selector.into()).type_style(Type::Small).text_color(theme.error).child(text.into())
+}
+
+/// A field: its label over its control, 8pt apart.
+fn labeled(label: &'static str, control: impl IntoElement, theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .w_full()
+        .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child(label))
+        .child(control)
+}
+
 impl TrackerConnectView {
+    /// The Choose your GitHub project step: the account line (or how to
+    /// sign `gh` in), then Organization and Repository.
+    fn github_step(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let choice = self.flow.github();
+        let mut col = div().flex().flex_col().gap(px(16.0)).w(px(FIELDS_W));
+        if choice.needs_auth() {
+            return col.child(self.github_auth(theme, cx));
+        }
+        col = col.child(match (choice.auth(), choice.account()) {
+            (GithubAuth::Valid, Loadable::Loaded(_)) => account_line("tracker-github", theme, cx, |this, window, cx| {
+                this.github_msg(GithubMsg::ChangeAccount, window, cx)
+            }),
+            (_, Loadable::Failed(why)) => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(error_line("tracker-github-account-error", format!("Couldn't read the GitHub account: {why}"), theme))
+                .child(self.github_retry(theme, cx)),
+            _ => quiet("tracker-github-checking", "Checking the GitHub account…", theme),
+        });
+
+        let owner_label = match choice.owners() {
+            Some(_) => choice.owner().to_string(),
+            None => LOADING.to_string(),
+        };
+        let owner = self.github_picker(GithubPick::Owner, choice.owners(), choice.owner(), owner_label, theme, cx);
+        let repos = choice.repos();
+        let repo_label = match (&repos, choice.repo()) {
+            (_, repo) if !repo.is_empty() => repo.to_string(),
+            (Loadable::Loaded(rows), _) if rows.is_empty() => gh::NO_REPOS.to_string(),
+            (Loadable::Loaded(_), _) => gh::CHOOSE_REPO.to_string(),
+            (Loadable::Failed(_), _) => "Couldn't load".to_string(),
+            _ => LOADING.to_string(),
+        };
+        let repo = self.github_picker(GithubPick::Repo, repos.loaded().cloned(), choice.repo(), repo_label, theme, cx);
+        col.child(labeled(gh::OWNER_LABEL, owner, theme))
+            .child(labeled(gh::REPO_LABEL, repo, theme).children(repos.error().map(|e| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(error_line("tracker-github-repo-error", e.to_string(), theme))
+                    .child(self.github_retry(theme, cx))
+            })))
+    }
+
+    fn github_retry(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
+        style::button("tracker-github-retry", copy::RETRY, ButtonKind::Secondary, ButtonSize::Small, false, theme)
+            .role(Role::Button)
+            .aria_label(copy::RETRY)
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.github_msg(GithubMsg::Retry, window, cx)))
+    }
+
+    /// How to sign the project's machine's `gh` in (or in to another
+    /// account): why, the command with Copy, and Retry.
+    fn github_auth(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let choice = self.flow.github();
+        let message = choice.auth_message().unwrap_or(gh::NOT_SIGNED_IN);
+        let command = div()
+            .debug_selector(|| "tracker-github-auth-command".into())
+            .flex()
+            .flex_row()
+            .items_center()
+            .h(px(36.0))
+            .gap(px(8.0))
+            .pl(px(12.0))
+            .pr(px(4.0))
+            .rounded(px(6.0))
+            .border_1()
+            .border_color(theme.divider)
+            .bg(theme.code_bg)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .font_family(MONO_FAMILY)
+                    .text_size(px(14.0))
+                    .line_height(px(18.0))
+                    .text_color(theme.code_fg)
+                    .child(gh::AUTH_COMMAND),
+            )
+            .child(
+                style::button("tracker-github-copy", "Copy", ButtonKind::Secondary, ButtonSize::Small, false, theme)
+                    .role(Role::Button)
+                    .aria_label("Copy the command")
+                    .on_click(|_: &ClickEvent, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(gh::AUTH_COMMAND.into()))),
+            );
+        let cancel = choice.changing_account().then(|| {
+            style::button("tracker-github-cancel-change", "Cancel", ButtonKind::Secondary, ButtonSize::Small, false, theme)
+                .role(Role::Button)
+                .aria_label("Cancel")
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                    this.github_msg(GithubMsg::CancelChangeAccount, window, cx)
+                }))
+        });
+        div()
+            .debug_selector(|| "tracker-github-auth".into())
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .w_full()
+            .child(div().type_style(Type::Base).text_color(theme.foreground).child(message))
+            .child(command)
+            .child(div().flex().flex_row().gap(px(8.0)).child(self.github_retry(theme, cx)).children(cancel))
+    }
+
+    /// A GitHub picker: its button, and `rows` in a menu under it while
+    /// open. Greyed while there are no rows to pick.
+    fn github_picker(
+        &self,
+        pick: GithubPick,
+        rows: Option<Vec<String>>,
+        selected: &str,
+        label: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = pick.id();
+        let button = picker_button(id, label, None, false, theme).aria_label(pick.label());
+        let Some(rows) = rows.filter(|r| !r.is_empty()) else {
+            return div().w_full().child(button.opacity(0.4).cursor_default()).into_any_element();
+        };
+        let selected = selected.to_string();
+        dropdown(
+            self.github_menu == Some(pick),
+            &self.github_anchor,
+            pick.menu_id(),
+            button,
+            move |cx| {
+                let theme = *cx.global::<Theme>();
+                rows.into_iter()
+                    .enumerate()
+                    .map(|(i, row)| {
+                        let on_row = row == selected;
+                        let value = row.clone();
+                        style::menu_row(format!("{id}-{i}"), on_row, &theme)
+                            .child(div().flex_1().min_w_0().truncate().child(row))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                let msg = match pick {
+                                    GithubPick::Owner => GithubMsg::Owner(value.clone()),
+                                    GithubPick::Repo => GithubMsg::Repo(value.clone()),
+                                };
+                                this.github_msg(msg, window, cx);
+                            }))
+                            .into_any_element()
+                    })
+                    .collect()
+            },
+            FIELDS_W,
+            false,
+            move |this: &mut Self, cx| {
+                this.github_menu = if this.github_menu == Some(pick) { None } else { Some(pick) };
+                cx.notify();
+            },
+            |this: &mut Self, cx| {
+                this.github_menu = None;
+                cx.notify();
+            },
+            cx,
+        )
+        .w_full()
+        .into_any_element()
+    }
+
+    /// The Choose your Linear project step: the account line (or the key
+    /// field, with a link to Linear's key settings), then Workspace, Team
+    /// and Project.
+    fn linear_step(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Div {
+        let choice = self.flow.linear();
+        let col = div().flex().flex_col().gap(px(16.0)).w(px(FIELDS_W));
+        let on = linear_fields::Handlers {
+            msg: |this: &mut Self, msg, window, cx| this.linear_msg(msg, window, cx),
+            menu: |this: &mut Self, pick, cx| this.linear_menu(pick, cx),
+        };
+        let enabled = !self.flow.checking();
+        if choice.needs_key() {
+            let link = super::about::link("tracker-linear-keys-link", copy::LINEAR_KEYS_LINK, theme.link, theme)
+                .type_style(Type::Small)
+                .role(Role::Link)
+                .aria_label(copy::LINEAR_KEYS_LINK)
+                .on_click(|_: &ClickEvent, _, cx| super::about::open_url(copy::LINEAR_KEYS_URL, cx));
+            return col
+                .child(linear_fields::key_entry(linear_fields::Host::Connect, choice, &self.linear_ui, true, on, theme, window, cx))
+                .child(div().flex().child(link));
+        }
+        let account = match choice.key_state() {
+            KeyState::Valid { .. } => account_line("tracker-linear", theme, cx, |this, window, cx| {
+                this.linear_msg(linear_fields::Msg::ChangeKey, window, cx)
+            }),
+            _ => quiet("tracker-linear-checking", "Checking the Linear API key…", theme),
+        };
+        col.child(account)
+            .child(linear_fields::connect_fields(choice, &self.linear_ui, enabled, on, FIELDS_W, theme, cx))
+    }
+
     fn card(&self, card: Card, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
         let tracker = card.tracker;
         let action = match card.state {
@@ -483,19 +886,27 @@ impl TrackerConnectView {
         })
     }
 
-    fn content(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    fn content(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Div {
         let tracker = self.flow.tracker();
         match self.flow.step() {
             Step::Chooser => self.chooser(theme, cx),
-            Step::ChooseProject => div().flex().flex_col().gap(px(12.0)).w_full().child(placeholder(
-                "tracker-choose-placeholder",
-                match tracker {
-                    Some(Tracker::Linear) => "Workspace, Team and Project pickers (tc-choose).",
-                    _ => "Organization, Repository and GitHub Project pickers (tc-choose).",
-                },
-                theme,
-            ))
-            .child(div().type_style(Type::Small).text_color(theme.muted).child(copy::ONLY_PROJECT)),
+            Step::ChooseProject => {
+                let body = match tracker {
+                    Some(Tracker::Linear) => self.linear_step(theme, window, cx),
+                    _ => self.github_step(theme, cx),
+                };
+                // The frames hang the account line 78pt under the subheading,
+                // 16pt above where the chooser's cards start.
+                div().flex().flex_col().items_center().w_full().mt(px(-16.0)).child(
+                    body.child(
+                        div()
+                            .debug_selector(|| "tracker-only-project".into())
+                            .type_style(Type::Small)
+                            .text_color(theme.muted)
+                            .child(copy::ONLY_PROJECT),
+                    ),
+                )
+            }
             Step::AgentRules => placeholder("tracker-rules-placeholder", "The two agent rules (tc-import).", theme),
             Step::ReviewImport => placeholder("tracker-review-placeholder", "The first import's preview (tc-import).", theme),
             Step::Importing => self.importing(theme),
@@ -548,10 +959,10 @@ impl TrackerConnectView {
 }
 
 impl Render for TrackerConnectView {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let error = self.load_error.clone().or_else(|| self.flow.error());
-        let content = self.content(&theme, cx);
+        let content = self.content(&theme, window, cx);
         let footer = self.footer(&theme, cx);
         // The frames hang each step's content a fixed way under the heading;
         // only Importing's progress sits in the middle.
@@ -648,6 +1059,7 @@ mod tests {
                 })
             }),
             linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| StatusSync::NotNeeded),
         }
     }
@@ -707,6 +1119,16 @@ mod tests {
             self.cx.simulate_keystrokes(keys);
             self.cx.run_until_parked();
         }
+
+        /// Pick the acme organization, then its acme/app, from the menus.
+        fn pick_repo(&mut self) {
+            self.click("tracker-github-owner");
+            self.click("tracker-github-owner-1");
+            assert_eq!(self.flow(|f| f.github().owner().to_string()), "acme");
+            self.click("tracker-github-repo");
+            self.click("tracker-github-repo-0");
+            assert_eq!(self.flow(|f| f.repo().to_string()), "acme/app");
+        }
     }
 
     fn github(repo: &str) -> IssueTrackerConfig {
@@ -730,12 +1152,12 @@ mod tests {
         r.click("tracker-connect-github");
         assert_eq!(r.flow(|f| (f.step(), f.counter())), (Step::ChooseProject, Some("Step 1 of 4".to_string())));
         assert!(r.drawn("tracker-step") && r.drawn("tracker-back") && r.drawn("tracker-primary"));
-        assert!(r.drawn("tracker-choose-placeholder"));
+        assert!(r.drawn("tracker-github-account") && r.drawn("tracker-only-project"));
         // Continue waits for a repository, and says why.
         r.keys("enter");
         assert_eq!(r.flow(|f| f.step()), Step::ChooseProject);
         assert!(r.drawn("tracker-error"));
-        r.update(|v, window, cx| v.edit_flow(|f| f.set_repo("acme/app"), window, cx));
+        r.pick_repo();
         assert!(!r.drawn("tracker-error"));
         r.keys("enter");
         assert_eq!(r.flow(|f| f.step()), Step::AgentRules);
@@ -754,6 +1176,92 @@ mod tests {
         assert!(r.flow(|f| f.finished().is_some()));
         assert!(r.drawn("tracker-progress-connection") && r.drawn("tracker-close"));
         assert_eq!(r.flow(|f| f.primary_label()), Some(copy::VIEW_BOARD));
+    }
+
+    #[gpui::test]
+    fn github_signed_out_shows_how_to_sign_in_and_retry_loads_the_pickers(cx: &mut TestAppContext) {
+        let mut service = recording(Arc::default());
+        service.github = Arc::new(shelbi_app::github_setup::fixture::signed_out);
+        let mut r = local(cx, service, IssueTrackerConfig::default());
+        r.click("tracker-connect-github");
+        assert!(r.drawn("tracker-github-auth") && r.drawn("tracker-github-auth-command"));
+        assert!(!r.drawn("tracker-github-owner"), "no pickers until gh is signed in");
+        assert!(!r.drawn("tracker-error"));
+        r.keys("enter");
+        assert_eq!(r.flow(|f| f.step()), Step::ChooseProject, "Continue waits");
+
+        // Signed in now: Retry reads the account again.
+        r.update(|v, _, _| v.service.github = Arc::new(shelbi_app::github_setup::fixture::answer));
+        r.click("tracker-github-retry");
+        assert!(!r.drawn("tracker-github-auth"));
+        assert!(r.drawn("tracker-github-account") && r.drawn("tracker-github-owner"));
+        assert_eq!(r.flow(|f| f.github().owner().to_string()), "octocat", "the login first");
+
+        // Change account explains the same, and Cancel keeps the account.
+        r.click("tracker-github-change-account");
+        assert!(r.drawn("tracker-github-auth") && r.drawn("tracker-github-cancel-change"));
+        r.click("tracker-github-cancel-change");
+        assert!(r.drawn("tracker-github-owner"));
+    }
+
+    #[gpui::test]
+    fn github_continue_runs_the_preflight_and_shows_a_failure(cx: &mut TestAppContext) {
+        use shelbi_app::github_setup::{GithubAnswer, GithubRequest};
+        let mut service = recording(Arc::default());
+        service.github = Arc::new(|req| match req {
+            GithubRequest::Preflight { repo } => GithubAnswer::Preflight { repo, result: Err("Issues are off".into()) },
+            other => shelbi_app::github_setup::fixture::answer(other),
+        });
+        let mut r = local(cx, service, IssueTrackerConfig::default());
+        r.click("tracker-connect-github");
+        r.pick_repo();
+        r.keys("enter");
+        assert_eq!(r.flow(|f| (f.step(), f.error())), (Step::ChooseProject, Some("Issues are off".to_string())));
+        assert!(r.drawn("tracker-error"));
+    }
+
+    #[gpui::test]
+    fn linear_without_a_key_shows_key_entry_then_workspace_team_and_project(cx: &mut TestAppContext) {
+        super::super::about::tests::OPENED.with(|o| o.borrow_mut().clear());
+        let mut service = recording(Arc::default());
+        service.linear = Arc::new(shelbi_app::linear_setup::fixture::no_key);
+        let mut r = local(cx, service, IssueTrackerConfig::default());
+        r.click("tracker-connect-linear");
+        assert_eq!(r.flow(|f| f.heading()), "Choose your Linear project");
+        assert!(r.drawn("tracker-connect-linear-key") && r.drawn("tracker-connect-linear-verify"));
+        assert!(!r.drawn("tracker-connect-linear-team"), "no pickers without a key");
+        r.click("tracker-linear-keys-link");
+        assert_eq!(super::super::about::tests::OPENED.with(|o| o.borrow().clone()), vec![copy::LINEAR_KEYS_URL.to_string()]);
+
+        // A pasted key verifies, and Linear answers with it from then on.
+        r.update(|v, window, cx| {
+            v.service.linear = Arc::new(shelbi_app::linear_setup::fixture::answer);
+            v.edit_flow(|f| f.linear_mut().set_key_input("lin_api_x"), window, cx);
+        });
+        r.click("tracker-connect-linear-verify");
+        assert!(r.drawn("tracker-linear-account") && r.drawn("tracker-connect-linear-workspace"));
+        assert_eq!(
+            r.flow(|f| f.linear().workspace().loaded().cloned()),
+            Some(shelbi_app::linear_setup::fixture::WORKSPACE.to_string())
+        );
+
+        // Team is required; Project defaults to Any project.
+        r.keys("enter");
+        assert_eq!(r.flow(|f| (f.step(), f.error())), (Step::ChooseProject, Some(shelbi_app::linear_setup::TEAM_REQUIRED.into())));
+        r.click("tracker-connect-linear-team");
+        assert!(r.drawn("tracker-connect-linear-team-menu"));
+        r.click("tracker-connect-linear-team-1");
+        assert_eq!(r.flow(|f| f.linear().team().to_string()), "DES");
+        assert!(r.drawn("tracker-connect-linear-project"));
+        assert_eq!(r.flow(|f| f.linear().filter(shelbi_app::linear_setup::Filter::Project).map(str::to_string)), None);
+        r.keys("enter");
+        assert_eq!(r.flow(|f| f.step()), Step::AgentRules, "the preflight passed");
+
+        // Back keeps the choice; Change account goes back to key entry.
+        r.click("tracker-back");
+        assert_eq!(r.flow(|f| f.linear().team().to_string()), "DES");
+        r.click("tracker-linear-change-account");
+        assert!(r.drawn("tracker-connect-linear-key") && r.drawn("tracker-connect-linear-cancel-key"));
     }
 
     #[gpui::test]
@@ -792,11 +1300,20 @@ mod tests {
         assert!(r.drawn("tracker-connect-github"), "the far project is on its local board");
 
         r.click("tracker-connect-github");
-        r.update(|v, window, cx| v.edit_flow(|f| f.set_repo("acme/app"), window, cx));
+        r.pick_repo();
         r.keys("enter");
+        assert_eq!(r.flow(|f| f.step()), Step::AgentRules, "the far daemon's preflight passed");
         r.keys("enter");
         r.keys("enter");
         let asked: Vec<_> = far.asked.lock().unwrap().requests.clone();
+        use shelbi_app::github_setup::GithubRequest;
+        for want in [
+            GithubRequest::Account,
+            GithubRequest::Repos { owner: "acme".into() },
+            GithubRequest::Preflight { repo: "acme/app".into() },
+        ] {
+            assert!(asked.contains(&shelbi_app::far::Request::Github(want.clone())), "{want:?} went to the far daemon: {asked:?}");
+        }
         assert!(
             asked.iter().any(|q| matches!(q, shelbi_app::far::Request::ConnectTracker(c)
                 if c.choice == TrackerChoice::Github { repo: "acme/app".into() })),

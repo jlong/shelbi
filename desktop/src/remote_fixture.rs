@@ -254,6 +254,7 @@ fn far_services(asked: Arc<Mutex<FarAsked>>) -> shelbi_orchestrator::far::FarSer
         },
         // No agent's session in the fixture: a send says so, as a dead one would.
         agent_send: Arc::new(|target, _| Err(format!("no agent is running on `{}`", target.workspace))),
+        github: Arc::new(shelbi_app::github_setup::fixture::answer),
         spawn_editor: Arc::new(move |name, cwd, argv| {
             asked
                 .lock()
