@@ -416,6 +416,22 @@ mod tests {
     }
 
     #[test]
+    fn a_workspace_waiting_on_its_own_job_is_quiet_until_it_needs_the_user() {
+        let mut t = Tracker::new("web");
+        t.observe_sidebar(&model(vec![ws("alpha", WorkspaceBadge::Working)], vec![]));
+        // Turn ended while its job runs: nobody needs to answer it.
+        let c = t.observe_sidebar(&model(vec![ws("alpha", WorkspaceBadge::Waiting)], vec![]));
+        assert_eq!(c, Changes::default());
+        // The result lands and it works again: still nothing.
+        let c = t.observe_sidebar(&model(vec![ws("alpha", WorkspaceBadge::Working)], vec![]));
+        assert_eq!(c, Changes::default());
+        // The job ends and it sits idle with nothing pending: now it needs you.
+        t.observe_sidebar(&model(vec![ws("alpha", WorkspaceBadge::Waiting)], vec![]));
+        let c = t.observe_sidebar(&model(vec![ws("alpha", WorkspaceBadge::AwaitingInput)], vec![]));
+        assert_eq!(targets(&c), [Target::Workspace("alpha".into())]);
+    }
+
+    #[test]
     fn idle_paused_and_loading_workspaces_are_quiet() {
         let mut t = Tracker::new("web");
         t.observe_sidebar(&model(

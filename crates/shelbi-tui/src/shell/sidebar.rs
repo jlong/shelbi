@@ -1656,6 +1656,42 @@ mod tests {
         assert!(!rows[devbox_y].contains(working_glyph), "collapsed header doesn't borrow the badge: {:?}", rows[devbox_y]);
     }
 
+    /// A Waiting worker draws a one-cell blue `⋯`, a Question one the yellow
+    /// `?`, and the names line up (the glyph doesn't widen the row).
+    #[test]
+    fn waiting_and_question_rows_draw_their_own_glyph_in_one_cell() {
+        let mut model = empty_model();
+        model.workspaces = vec![
+            ws("bravo", "hub", Some("t-1"), Some("developer"), WorkspaceBadge::Waiting),
+            ws("charlie", "hub", Some("t-2"), Some("developer"), WorkspaceBadge::AwaitingInput),
+        ];
+        let view = SidebarView::build(&model);
+        let mut term = Terminal::new(TestBackend::new(30, 20)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            view.render(f.buffer_mut(), area, 0, true, &default_chrome())
+        })
+        .unwrap();
+        let rows = dump(&term);
+        let (b, c) = (row_y(&rows, "bravo"), row_y(&rows, "charlie"));
+        assert!(rows[b].contains("⋯ bravo"), "row: {:?}", rows[b]);
+        assert!(rows[c].contains("? charlie"), "row: {:?}", rows[c]);
+        let col = |row: &str, needle: &str| {
+            unicode_width::UnicodeWidthStr::width(&row[..row.find(needle).unwrap()])
+        };
+        assert_eq!(col(&rows[b], "bravo"), col(&rows[c], "charlie"));
+        let buf = term.backend().buffer();
+        let fg = |y: usize, glyph: &str| {
+            (0..buf.area.width)
+                .map(|x| &buf[(x, y as u16)])
+                .find(|cell| cell.symbol() == glyph)
+                .map(|cell| cell.fg)
+                .unwrap()
+        };
+        assert_eq!(fg(b, "⋯"), crate::theme::palette().ansi_blue);
+        assert_eq!(fg(c, "?"), crate::theme::palette().ansi_yellow);
+    }
+
     /// Single-machine layout: a flat list, no `▾ <machine>` divider, no indent.
     #[test]
     fn single_machine_skips_group_header_and_indent() {

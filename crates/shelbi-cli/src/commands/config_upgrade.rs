@@ -447,6 +447,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_orchestrator_changelog_attachments(entry, &text, out);
         sniff_orchestrator_changelog_releases(entry, &text, out);
         sniff_heartbeat_idle_workspaces_review_exclusion(entry, &text, out);
+        sniff_orchestrator_waiting_not_free(entry, &text, out);
         sniff_orchestrator_awareness_variants(entry, &text, out);
         sniff_orchestrator_job_log(entry, &text, out);
         sniff_orchestrator_job_estimate(entry, &text, out);
@@ -2261,6 +2262,60 @@ fn sniff_heartbeat_idle_workspaces_review_exclusion(
          capacity), keeping it equal to the dev-slot view of `shelbi workspace list`. Mirror the \
          shipped default template.",
         locate_line_containing(text, IDLE_WORKSPACES_DEFINITION_ANCHOR),
+    ));
+}
+
+/// Marker phrase the shipped orchestrator template's reaction rules carry once
+/// they say a `-> waiting` workspace transition is not a workspace-free signal,
+/// matched with whitespace folded so any line wrap of it reads as healed. Kept
+/// in sync with the template by the drift guard in this module's tests.
+const WAITING_NOT_FREE_MARKER_FLAT: &str = "`-> waiting` is not a free signal";
+
+/// Anchor the reaction rules carry in every copy, before and after the fix:
+/// the workspace-free rule's `working -> awaiting_input` transition. In scope
+/// only when the copy reacts to workspace transitions at all.
+const WAITING_NOT_FREE_ANCHOR: &str = "working -> awaiting_input`";
+
+/// Sniff an orchestrator `instructions.md` whose reaction rules predate the
+/// `waiting` workspace state.
+///
+/// A worker that ends its turn while a job it started (or its own background
+/// work) will wake it now logs `working -> waiting`, not `-> awaiting_input`.
+/// The hub never treats it as free, but a copy that doesn't know the state
+/// might read any non-`working` transition as a free slot and dispatch onto a
+/// worker that is about to resume. The shipped template says `-> waiting` is
+/// not a free signal; existing projects carry forked copies, so this hands the
+/// orchestrator a boot finding to add the rule. An absence sniff keyed on the
+/// workspace-free rule's stable anchor, idempotent once the marker appears,
+/// and [`Classification::NeedsJudgment`] because it edits user-customizable
+/// prose.
+fn sniff_orchestrator_waiting_not_free(
+    entry: &InventoryEntry,
+    text: &str,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    if !text.contains(WAITING_NOT_FREE_ANCHOR) {
+        return;
+    }
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.contains(WAITING_NOT_FREE_MARKER_FLAT) {
+        return;
+    }
+    out.push(finding(
+        entry,
+        Classification::NeedsJudgment,
+        "ORCH_WAITING_NOT_FREE_MISSING",
+        "the reaction rules don't know the `waiting` workspace state: a worker that ended its turn \
+         while a job it started (or its own background work) will wake it logs `working -> \
+         waiting`, and a copy that reads that as a free slot could dispatch onto a worker about \
+         to resume",
+        "In the reaction rules, beside the workspace-free rule (`working -> awaiting_input` / \
+         `-> idle`), add a rule that `-> waiting` is not a free signal: the worker is parked \
+         until a `shelbi job run` / `job watch` it started reports back as a prompt, or its own \
+         background work finishes, so treat a `waiting` workspace like a `working` one (no \
+         dispatch, not idle, no nudge). Also note `waiting -> awaiting_input` is a free signal \
+         like `working -> awaiting_input`. Mirror the shipped default template.",
+        locate_line_containing(text, WAITING_NOT_FREE_ANCHOR),
     ));
 }
 
@@ -5637,6 +5692,53 @@ to your workdir). My own note: keep it short.
             "shipped default template no longer has a `{REACTION_RULES_SECTION_HEADING}` \
              section — the sniffer's absence check is now dead",
         );
+    }
+
+    // ---- waiting is not a free signal ------------------------------------
+
+    #[test]
+    fn reaction_rules_without_the_waiting_rule_are_needs_judgment() {
+        let text = "- `project=<you> workspace=<name> working -> awaiting_input` or \
+                    `... -> idle` → this workspace just became free.\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_waiting_not_free(&orch_entry(), text, &mut out);
+        let f = find(&out, "ORCH_WAITING_NOT_FREE_MISSING").expect("finding");
+        assert_eq!(f.classification, Classification::NeedsJudgment);
+        assert!(!f.rationale.is_empty());
+    }
+
+    #[test]
+    fn reaction_rules_with_the_waiting_rule_are_clean_however_wrapped() {
+        for text in [
+            "- `working -> awaiting_input` → free.\n- `working -> waiting` → **`-> waiting` is \
+             not a free signal.**\n",
+            "- `working -> awaiting_input` → free.\n- `-> waiting` is not a\n  free signal.\n",
+        ] {
+            let mut out = Vec::new();
+            sniff_orchestrator_waiting_not_free(&orch_entry(), text, &mut out);
+            assert!(find(&out, "ORCH_WAITING_NOT_FREE_MISSING").is_none(), "{:?}", codes(&out));
+        }
+    }
+
+    #[test]
+    fn a_copy_without_workspace_reaction_rules_is_not_flagged() {
+        let text = "# Custom orchestrator\n\nno reaction rules here\n";
+        let mut out = Vec::new();
+        sniff_orchestrator_waiting_not_free(&orch_entry(), text, &mut out);
+        assert!(find(&out, "ORCH_WAITING_NOT_FREE_MISSING").is_none());
+    }
+
+    /// Drift guard: the shipped template carries the rule (and the anchor), so
+    /// a fresh project never trips the sniffer.
+    #[test]
+    fn shipped_default_template_does_not_trip_the_waiting_sniffer() {
+        let template = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        assert!(template.contains(WAITING_NOT_FREE_ANCHOR), "anchor gone from the template");
+        let flat = template.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains(WAITING_NOT_FREE_MARKER_FLAT), "marker gone from the template");
+        let mut out = Vec::new();
+        sniff_orchestrator_waiting_not_free(&orch_entry(), template, &mut out);
+        assert!(find(&out, "ORCH_WAITING_NOT_FREE_MISSING").is_none());
     }
 
     // ---- heartbeat idle_workspaces review exclusion ---------------------

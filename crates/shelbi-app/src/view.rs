@@ -156,8 +156,12 @@ pub struct ReviewRow {
 pub enum WorkspaceBadge {
     /// ⏵ — the agent is actively running a turn.
     Working,
-    /// ? — finished a turn and sitting at the prompt.
+    /// ? — finished a turn and sitting at the prompt, needing the user.
     AwaitingInput,
+    /// ⋯ — finished a turn, but a job it started or background work it holds
+    /// will wake it without the user ([`WorkspaceState::Waiting`]). Busy for
+    /// every purpose but display: never notifies, never idle capacity.
+    Waiting,
     /// ⚠ — a permission dialog is up.
     AwaitingPermission,
     /// ⏸ — the runner stalled on a usage/session limit.
@@ -177,6 +181,7 @@ impl WorkspaceBadge {
         match self {
             WorkspaceBadge::Working => "⏵",
             WorkspaceBadge::AwaitingInput => "?",
+            WorkspaceBadge::Waiting => "⋯",
             WorkspaceBadge::AwaitingPermission => "⚠",
             WorkspaceBadge::Paused => "⏸",
             WorkspaceBadge::Idle => "·",
@@ -189,6 +194,7 @@ impl WorkspaceBadge {
         match self {
             WorkspaceBadge::Working => DecorationColor::Green,
             WorkspaceBadge::AwaitingInput => DecorationColor::Yellow,
+            WorkspaceBadge::Waiting => DecorationColor::Blue,
             WorkspaceBadge::AwaitingPermission => DecorationColor::Red,
             WorkspaceBadge::Paused => DecorationColor::Yellow,
             WorkspaceBadge::Idle | WorkspaceBadge::Loading => DecorationColor::DarkGray,
@@ -267,6 +273,7 @@ impl WorkspaceBadge {
         match self {
             WorkspaceBadge::Working => "Working",
             WorkspaceBadge::AwaitingInput => "Awaiting input",
+            WorkspaceBadge::Waiting => "Waiting",
             WorkspaceBadge::AwaitingPermission => "Needs permission",
             WorkspaceBadge::Paused => "Paused",
             WorkspaceBadge::Idle => "Idle",
@@ -1492,6 +1499,7 @@ pub fn workspace_state_badge(state: Option<WorkspaceState>) -> (&'static str, To
     match state {
         Some(WorkspaceState::Working) => ("working", Tone::Green),
         Some(WorkspaceState::AwaitingInput) => ("awaiting", Tone::Yellow),
+        Some(WorkspaceState::Waiting) => ("waiting", Tone::Blue),
         Some(WorkspaceState::Blocked) => ("blocked", Tone::Red),
         Some(WorkspaceState::Paused) => ("paused", Tone::Magenta),
         Some(WorkspaceState::Serving) => ("serving", Tone::Cyan),
@@ -2446,6 +2454,17 @@ mod tests {
         assert_eq!(model.entries.len(), 2);
         assert_eq!(model.unread, 1);
         assert_eq!(model.entries[0].source.as_deref(), Some("kanban"));
+    }
+
+    #[test]
+    fn waiting_badge_is_a_blue_ellipsis_apart_from_the_yellow_question() {
+        let waiting = WorkspaceBadge::Waiting.decoration();
+        assert_eq!(waiting.glyph, "⋯");
+        assert_eq!(waiting.color, DecorationColor::Blue);
+        assert_eq!(WorkspaceBadge::Waiting.label(), "Waiting");
+        let question = WorkspaceBadge::AwaitingInput.decoration();
+        assert_eq!(question.glyph, "?");
+        assert_eq!(question.color, DecorationColor::Yellow);
     }
 
     #[test]

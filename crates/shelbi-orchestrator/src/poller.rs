@@ -2117,15 +2117,32 @@ fn poll_one(
         }
     };
 
+    // A turn that ended reads as Waiting, not AwaitingInput, while something
+    // will wake the worker without the user: a job it started is still
+    // running (or its report is on its way), and AwaitingInput again when it
+    // has an open question. Read only on turn-end ticks, so a busy pane costs
+    // no store reads. See [`WorkspaceState::with_turn_end_wake`].
+    let assigned_task = current_task_for(project, &workspace.name);
+    let new_state = if new_state.is_turn_end() {
+        new_state.with_turn_end_wake(shelbi_state::read_turn_end_wake(
+            &project.name,
+            &workspace.name,
+            assigned_task.as_deref(),
+            Utc::now(),
+        ))
+    } else {
+        new_state
+    };
+
     // Bootstrap previous state from disk on first sighting so a hub
     // restart doesn't emit a bogus `none -> X` event for state we've
     // already recorded.
     let prior = load_prior(&project.name, &workspace.name, last_known);
 
-    // Debounce the false-idle `working -> awaiting_input` edge: a lone
-    // mid-repaint capture that misses the live spinner row would otherwise flip a
-    // busy pane to AwaitingInput for one tick and log a spurious workspace-free
-    // signal. Require the idle observation to persist for
+    // Debounce the false-idle `working -> awaiting_input` edge (and
+    // `working -> waiting`, `waiting -> awaiting_input`): a lone mid-repaint
+    // capture that misses the live spinner row would otherwise flip a busy pane
+    // to AwaitingInput for one tick and log a spurious workspace-free signal. Require the idle observation to persist for
     // `IDLE_DEBOUNCE_MIN_STREAK` polls; a real turn-end still commits one
     // interval later at most, and any other edge is unaffected.
     let (new_state, streak) =
@@ -2144,8 +2161,8 @@ fn poll_one(
     // A review card isn't an active one, so `current_task_for` can't name it.
     // Held at `Serving`, the slot goes on naming the task it serves: that's what
     // tells the next task's serving edge apart ([`record_review_serving`]).
-    let current_task = current_task_for(project, &workspace.name)
-        .or(serving_task.filter(|_| new_state == WorkspaceState::Serving));
+    let current_task =
+        assigned_task.or(serving_task.filter(|_| new_state == WorkspaceState::Serving));
     let outcome = decide(
         &workspace.name,
         current_task.clone(),
@@ -2468,12 +2485,12 @@ fn record_limit_recovery_from_screen(
     if !workspace_is_paused(&project.name, &workspace.name, last_known) {
         return false;
     }
-    // Background work in flight reads as working here too (see
+    // Background work in flight reads as waiting here too (see
     // [`live_workspace_state`]).
-    let observed = if crate::ready::is_claude_working(screen)
-        || crate::ready::has_background_tasks(screen)
-    {
+    let observed = if crate::ready::is_claude_working(screen) {
         Some(WorkspaceState::Working)
+    } else if crate::ready::has_background_tasks(screen) {
+        Some(WorkspaceState::Waiting)
     } else if crate::ready::is_input_ready(screen)
         && !crate::submit::input_holds_unsubmitted_prompt(screen, LIMIT_RESUME_PROMPT)
     {
@@ -4813,17 +4830,21 @@ struct PollOutcome {
 /// live spinner row — not the footer alone — is what proves a turn is running.
 ///
 /// A turn that ended with background work still in flight (a backgrounded
-/// shell, a monitor, a subagent: [`ready::has_background_tasks`]) is also
-/// `Working`, even though Claude draws the ready input box. Claude Code resumes
+/// shell, a monitor, a subagent: [`ready::has_background_tasks`]) is
+/// `Waiting`, even though Claude draws the ready input box. Claude Code resumes
 /// the agent when that work finishes, so nobody needs to answer it: reading it
 /// as `AwaitingInput` posted a false "finished a turn and needs input"
 /// notification and logged a `working -> awaiting_input` workspace-free edge
-/// for a worker that was waiting on its own `cargo test`. When the work exits
-/// and the agent resumes, the spinner row keeps it `Working`, so the resume
-/// never flaps; only a turn that ends with nothing in flight goes idle.
+/// for a worker that was waiting on its own `cargo test`. `Waiting` is busy for
+/// all of that (no notification, no free signal) but shows the user the agent
+/// isn't running a turn. When the work exits and the agent resumes, the
+/// spinner row reads `Working`; only a turn that ends with nothing in flight
+/// goes idle.
 fn live_workspace_state(screen: &str) -> Option<WorkspaceState> {
-    if crate::ready::is_claude_working(screen) || crate::ready::has_background_tasks(screen) {
+    if crate::ready::is_claude_working(screen) {
         Some(WorkspaceState::Working)
+    } else if crate::ready::has_background_tasks(screen) {
+        Some(WorkspaceState::Waiting)
     } else if crate::ready::is_input_ready(screen) {
         Some(WorkspaceState::AwaitingInput)
     } else {
@@ -4902,23 +4923,31 @@ const IDLE_DEBOUNCE_MIN_STREAK: u32 = 2;
 /// count advance until either the idle observation persists to
 /// [`IDLE_DEBOUNCE_MIN_STREAK`] (commit `AwaitingInput`) or a busy frame returns
 /// (reset).
+///
+/// The same dwell covers the turn-end edges [`WorkspaceState::Waiting`] adds:
+/// `Working -> Waiting` (the same mis-sampled frame, folded to Waiting because
+/// a job is running) and `Waiting -> AwaitingInput` (one frame where the
+/// background-work footer didn't read).
 fn debounce_idle_edge(
     prior: Option<WorkspaceState>,
     observed: WorkspaceState,
     idle_streak: u32,
 ) -> (WorkspaceState, u32) {
-    match (prior, observed) {
-        (Some(WorkspaceState::Working), WorkspaceState::AwaitingInput) => {
-            let streak = idle_streak + 1;
-            if streak >= IDLE_DEBOUNCE_MIN_STREAK {
-                (WorkspaceState::AwaitingInput, 0)
-            } else {
-                // One mid-turn frame dropped the spinner row: hold `Working` and
-                // wait for the observation to repeat before trusting it.
-                (WorkspaceState::Working, streak)
-            }
-        }
-        _ => (observed, 0),
+    let held = match (prior, observed) {
+        (
+            Some(WorkspaceState::Working),
+            WorkspaceState::AwaitingInput | WorkspaceState::Waiting,
+        ) => WorkspaceState::Working,
+        (Some(WorkspaceState::Waiting), WorkspaceState::AwaitingInput) => WorkspaceState::Waiting,
+        _ => return (observed, 0),
+    };
+    let streak = idle_streak + 1;
+    if streak >= IDLE_DEBOUNCE_MIN_STREAK {
+        (observed, 0)
+    } else {
+        // One frame dropped the spinner row: hold the prior state and wait for
+        // the observation to repeat before trusting it.
+        (held, streak)
     }
 }
 
@@ -4949,7 +4978,7 @@ fn debounce_idle_edge(
 /// genuine awaiting-input on a review slot (a permission prompt, a live turn) is
 /// untouched and still surfaces.
 fn fold_review_serving(observed: WorkspaceState, confirmed_serving_review: bool) -> WorkspaceState {
-    if confirmed_serving_review && observed == WorkspaceState::AwaitingInput {
+    if confirmed_serving_review && observed.is_turn_end() {
         WorkspaceState::Serving
     } else {
         observed
@@ -7126,6 +7155,7 @@ fn workflow_status_is_active(workflow: &Workflow, column: Column) -> bool {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use shelbi_state::TurnEndWake;
 
     fn ts(secs: i64) -> DateTime<Utc> {
         Utc.timestamp_opt(secs, 0).unwrap()
@@ -7845,14 +7875,26 @@ Auto mode works better when it knows your environment. Takes about a minute.
     /// decide path `poll_one` takes, returning every committed transition as
     /// `(from, to)`. The prior starts at `Working` (a worker mid-turn).
     fn transitions_for(frames: &[&str]) -> Vec<(Option<WorkspaceState>, WorkspaceState)> {
+        let frames: Vec<(&str, TurnEndWake)> =
+            frames.iter().map(|f| (*f, TurnEndWake::default())).collect();
+        transitions_with(&frames)
+    }
+
+    /// [`transitions_for`] with what the hub knows beyond the pane on each
+    /// frame (a running job, an open question), folded as `poll_one` does.
+    fn transitions_with(
+        frames: &[(&str, TurnEndWake)],
+    ) -> Vec<(Option<WorkspaceState>, WorkspaceState)> {
         let mut prior = Some(PriorState {
             state: WorkspaceState::Working,
             last_transition: Some(ts(0)),
         });
         let mut streak = 0;
         let mut edges = Vec::new();
-        for (i, frame) in frames.iter().enumerate() {
-            let observed = live_workspace_state(frame).expect("every frame classifies");
+        for (i, (frame, wake)) in frames.iter().enumerate() {
+            let observed = live_workspace_state(frame)
+                .expect("every frame classifies")
+                .with_turn_end_wake(*wake);
             let (state, next_streak) =
                 debounce_idle_edge(prior.map(|p| p.state), observed, streak);
             streak = next_streak;
@@ -7909,12 +7951,12 @@ Auto mode works better when it knows your environment. Takes about a minute.
   ⏵⏵ auto mode on (shift+tab to cycle)";
 
     #[test]
-    fn turn_end_with_a_background_shell_stays_working() {
-        // No `working -> awaiting_input` edge: no notification, no
-        // workspace-free event, however long the job runs.
+    fn turn_end_with_a_background_shell_is_waiting() {
+        // One `working -> waiting` edge and no `awaiting_input`: no
+        // notification, no workspace-free event, however long the job runs.
         assert_eq!(
             live_workspace_state(TURN_END_BACKGROUND_SHELL),
-            Some(WorkspaceState::Working)
+            Some(WorkspaceState::Waiting)
         );
         let edges = transitions_for(&[
             MID_TURN,
@@ -7923,13 +7965,13 @@ Auto mode works better when it knows your environment. Takes about a minute.
             TURN_END_BACKGROUND_SHELL,
             TURN_END_BACKGROUND_SHELL,
         ]);
-        assert!(edges.is_empty(), "unexpected transitions: {edges:?}");
+        assert_eq!(edges, vec![(Some(WorkspaceState::Working), WorkspaceState::Waiting)]);
     }
 
     #[test]
     fn background_job_exit_and_resume_does_not_flap() {
         // The job exits, Claude resumes the agent, and the agent then ends a turn
-        // with nothing pending: exactly one edge, the real one at the end.
+        // with nothing pending: waiting, back to working, then the real idle edge.
         let edges = transitions_for(&[
             MID_TURN,
             TURN_END_BACKGROUND_SHELL,
@@ -7941,8 +7983,90 @@ Auto mode works better when it knows your environment. Takes about a minute.
         ]);
         assert_eq!(
             edges,
-            vec![(Some(WorkspaceState::Working), WorkspaceState::AwaitingInput)]
+            vec![
+                (Some(WorkspaceState::Working), WorkspaceState::Waiting),
+                (Some(WorkspaceState::Waiting), WorkspaceState::Working),
+                (Some(WorkspaceState::Working), WorkspaceState::AwaitingInput),
+            ]
         );
+    }
+
+    const JOB: TurnEndWake = TurnEndWake { job_pending: true, question_open: false };
+    const QUESTION: TurnEndWake = TurnEndWake { job_pending: false, question_open: true };
+    const NOTHING: TurnEndWake = TurnEndWake { job_pending: false, question_open: false };
+
+    #[test]
+    fn turn_end_with_a_shelbi_job_running_is_waiting_then_working_when_it_reports() {
+        // alpha ran `shelbi job run`, ended its turn: the pane shows a bare
+        // prompt, but the job's result will wake it. Waiting, not `?`. The
+        // result prompt lands and it works again; no awaiting_input edge.
+        let edges = transitions_with(&[
+            (MID_TURN, JOB),
+            (TURN_END_NOTHING_PENDING, JOB),
+            (TURN_END_NOTHING_PENDING, JOB),
+            (TURN_END_NOTHING_PENDING, JOB),
+            (RESUMED_AFTER_JOB, NOTHING),
+        ]);
+        assert_eq!(
+            edges,
+            vec![
+                (Some(WorkspaceState::Working), WorkspaceState::Waiting),
+                (Some(WorkspaceState::Waiting), WorkspaceState::Working),
+            ]
+        );
+    }
+
+    #[test]
+    fn job_ends_and_the_worker_sits_idle_becomes_awaiting_input() {
+        let edges = transitions_with(&[
+            (MID_TURN, JOB),
+            (TURN_END_NOTHING_PENDING, JOB),
+            (TURN_END_NOTHING_PENDING, JOB),
+            (TURN_END_NOTHING_PENDING, NOTHING),
+            (TURN_END_NOTHING_PENDING, NOTHING),
+        ]);
+        assert_eq!(
+            edges,
+            vec![
+                (Some(WorkspaceState::Working), WorkspaceState::Waiting),
+                (Some(WorkspaceState::Waiting), WorkspaceState::AwaitingInput),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_open_question_is_awaiting_input_even_with_work_pending() {
+        for frame in [TURN_END_NOTHING_PENDING, TURN_END_BACKGROUND_SHELL] {
+            let edges = transitions_with(&[
+                (MID_TURN, QUESTION),
+                (frame, TurnEndWake { job_pending: true, ..QUESTION }),
+                (frame, TurnEndWake { job_pending: true, ..QUESTION }),
+            ]);
+            assert_eq!(
+                edges,
+                vec![(Some(WorkspaceState::Working), WorkspaceState::AwaitingInput)],
+                "frame {frame:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_waiting_slot_is_debounced_against_one_missed_footer() {
+        // Waiting on background work; one frame misses the footer and reads as
+        // a bare prompt. The next frame shows the work again: no edge.
+        let edges = transitions_with(&[
+            (TURN_END_BACKGROUND_SHELL, NOTHING),
+            (TURN_END_BACKGROUND_SHELL, NOTHING),
+            (TURN_END_NOTHING_PENDING, NOTHING),
+            (TURN_END_BACKGROUND_SHELL, NOTHING),
+        ]);
+        assert_eq!(edges, vec![(Some(WorkspaceState::Working), WorkspaceState::Waiting)]);
+    }
+
+    #[test]
+    fn a_serving_review_slot_holds_serving_while_waiting() {
+        assert_eq!(fold_review_serving(WorkspaceState::Waiting, true), WorkspaceState::Serving);
+        assert_eq!(fold_review_serving(WorkspaceState::Waiting, false), WorkspaceState::Waiting);
     }
 
     #[test]

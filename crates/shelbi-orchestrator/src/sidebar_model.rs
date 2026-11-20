@@ -261,6 +261,7 @@ fn derive_workspace_badge(
         Some(s) if s.current_task.as_deref() == Some(task_id) => match s.state {
             WorkspaceState::Working => WorkspaceBadge::Working,
             WorkspaceState::AwaitingInput => WorkspaceBadge::AwaitingInput,
+            WorkspaceState::Waiting => WorkspaceBadge::Waiting,
             WorkspaceState::Blocked => WorkspaceBadge::AwaitingPermission,
             WorkspaceState::Paused => WorkspaceBadge::Paused,
             WorkspaceState::Serving => WorkspaceBadge::Working,
@@ -470,6 +471,47 @@ mod tests {
         let row = |name: &str| model.workspaces.iter().find(|w| w.name == name).unwrap();
         assert_eq!(row("alpha").current_task.as_deref(), Some("t-gate"));
         assert_eq!(row("beta").current_task, None);
+    }
+
+    /// The status file's state picks the row's badge: a worker parked on its
+    /// own job reads Waiting (`⋯`), one that needs the user the `?`.
+    #[test]
+    fn a_waiting_status_shows_the_waiting_badge() {
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-sidebar-waiting-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join("projects/demo")).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let badge_for = |state| {
+            let now = chrono::Utc::now();
+            shelbi_state::save_workspace_status(
+                "demo",
+                &shelbi_state::WorkspaceStatus {
+                    workspace: "alpha".into(),
+                    current_task: Some("t1".into()),
+                    state,
+                    last_transition: now,
+                    last_seen: now,
+                },
+            )
+            .unwrap();
+            derive_workspace_badge("demo", "alpha", Some("t1"))
+        };
+        let waiting = badge_for(WorkspaceState::Waiting);
+        let question = badge_for(WorkspaceState::AwaitingInput);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(waiting, WorkspaceBadge::Waiting);
+        assert_eq!(waiting.glyph(), "⋯");
+        assert_eq!(question, WorkspaceBadge::AwaitingInput);
+        assert_eq!(question.glyph(), "?");
     }
 
     #[test]
