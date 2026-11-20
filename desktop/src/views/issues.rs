@@ -3348,6 +3348,121 @@ mod tests {
         assert_eq!(view.read_with(&cx, |v, _| v.state.pane_focus()), Some(Property::Priority));
     }
 
+    /// Each shown property's row, label and value (`pane-row-<slug>`,
+    /// `pane-label-<slug>`, `pane-value-<slug>`), top to bottom, from one
+    /// draw.
+    fn property_rows(
+        cx: &mut gpui::VisualTestContext,
+        slugs: &[&str],
+    ) -> Vec<(String, [gpui::Bounds<gpui::Pixels>; 3])> {
+        assert!(drawn(cx, "pane-properties"));
+        slugs
+            .iter()
+            .map(|slug| {
+                let mut at = |part: &str| {
+                    let selector: &'static str = format!("pane-{part}-{slug}").leak();
+                    cx.debug_bounds(selector).unwrap_or_else(|| panic!("{selector} is drawn"))
+                };
+                (slug.to_string(), [at("row"), at("label"), at("value")])
+            })
+            .collect()
+    }
+
+    /// The frame's rows: each label in its 108pt column at the table's left,
+    /// level with its value, which takes the rest of the width; 6pt between
+    /// rows.
+    fn assert_labels_beside(cx: &mut gpui::VisualTestContext, slugs: &[&str]) {
+        use crate::views::floating_pane::LABEL_W;
+        let props = bounds(cx, "pane-properties");
+        let rows = property_rows(cx, slugs);
+        for (slug, [row, label, value]) in &rows {
+            assert!((label.left() - props.left()).abs() < px(0.5), "{slug}: the label at the left {label:?}");
+            assert!((label.size.width - px(LABEL_W)).abs() < px(0.5), "{slug}: in its column {label:?}");
+            assert!((label.center().y - value.center().y).abs() < px(1.0), "{slug}: level {label:?} {value:?}");
+            assert_eq!(value.left(), label.right() + px(12.0), "{slug}: the value beside it");
+            assert!((value.right() - props.right()).abs() < px(0.5), "{slug}: to the table's right {value:?}");
+            assert!(row.size.height >= px(28.0) && row.size.height < px(29.0), "{slug}: one 28pt line {row:?}");
+        }
+        for pair in rows.windows(2) {
+            let (upper, lower) = (&pair[0].1[0], &pair[1].1[0]);
+            assert!((lower.top() - upper.bottom() - px(6.0)).abs() < px(0.5), "6pt apart: {pair:?}");
+        }
+    }
+
+    /// The side column's rows: each label on its own line over its value,
+    /// both the column's full content width, the label closer to its value
+    /// than to the property over it.
+    fn assert_labels_over(cx: &mut gpui::VisualTestContext, slugs: &[&str]) {
+        use crate::views::floating_pane::{INSET, PROPERTY_OVER_GAP};
+        use crate::views::pane_width::SIDE_W;
+        let (props, side) = (bounds(cx, "pane-properties"), bounds(cx, "pane-side"));
+        // The column's width, less its divider and insets.
+        assert!((props.size.width - px(SIDE_W - 1.0 - 2.0 * INSET)).abs() < px(0.5), "{props:?} in {side:?}");
+        let rows = property_rows(cx, slugs);
+        for (slug, [_, label, value]) in &rows {
+            assert!(label.bottom() <= value.top(), "{slug}: the label over its value {label:?} {value:?}");
+            assert!((value.top() - label.bottom() - px(PROPERTY_OVER_GAP)).abs() < px(0.5), "{slug}: just over it");
+            for b in [label, value] {
+                assert!((b.left() - props.left()).abs() < px(0.5), "{slug}: {b:?} from the column's left");
+                assert!((b.size.width - props.size.width).abs() < px(0.5), "{slug}: {b:?} the column's width");
+            }
+            assert!(value.size.height >= px(28.0), "{slug}: {value:?}");
+        }
+        for pair in rows.windows(2) {
+            let (upper, lower) = (&pair[0].1[0], &pair[1].1[0]);
+            let between = lower.top() - upper.bottom();
+            assert!(between > px(PROPERTY_OVER_GAP) * 3.0, "properties further apart than a label and value: {pair:?}");
+        }
+    }
+
+    #[gpui::test]
+    fn the_side_column_puts_each_label_over_a_full_width_value(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        use shelbi_core::{IssuePr, PrCi, PrState};
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut a = issue("A", "todo");
+        a.task.branch = Some("jlong/pane-responsive-props".into());
+        a.task.depends_on = vec!["B".into()];
+        a.task.pr = Some(IssuePr {
+            state: Some(PrState::Merged),
+            ci: Some(PrCi::Passing),
+            ..IssuePr::new(2360, Some("https://github.com/o/r/pull/2360".into()))
+        });
+        let (view, mut cx) =
+            open_board_sized(cx, vec![a, issue("B", "todo")], Some(gpui::size(px(1440.0), px(1024.0))));
+        let slugs = ["status", "workflow", "priority", "branch", "deps", "pr"];
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        // At the default width, the frame's rows, as before.
+        assert!(properties_stacked(&mut cx));
+        assert_labels_beside(&mut cx, &slugs);
+        // What the values need with the room the frame gives them.
+        let natural = |cx: &mut gpui::VisualTestContext| {
+            ["pane-branch", "pr-state", "pr-ci"].map(|s| bounds(cx, s).size.width)
+        };
+        let wanted = natural(&mut cx);
+
+        // Wide: each label over its value, and nothing cut short.
+        view.update(&mut cx, |v, cx| v.set_pane_width(1000.0, cx));
+        assert!(properties_beside(&mut cx));
+        assert_labels_over(&mut cx, &slugs);
+        assert_eq!(natural(&mut cx), wanted, "the branch and the PR's state and CI keep their width");
+        // The PR line wraps its CI under the number in the column's width.
+        let (value, ci) = (bounds(&mut cx, "pane-value-pr"), bounds(&mut cx, "pr-ci"));
+        assert!(value.contains(&ci.origin) && ci.right() <= value.right(), "{ci:?} in {value:?}");
+        assert!(ci.bottom() <= value.bottom(), "{ci:?} in {value:?}");
+        // The pickers' buttons still lead their values, under the labels.
+        for slug in ["status", "workflow", "priority"] {
+            let (rows, button) = (property_rows(&mut cx, &[slug]), bounds(&mut cx, format!("pane-{slug}").leak()));
+            let [_, label, value] = rows[0].1;
+            assert!(value.contains(&button.origin) && button.top() >= label.bottom(), "{slug}: {button:?}");
+        }
+
+        // And back to the frame's rows.
+        view.update(&mut cx, |v, cx| v.set_pane_width(640.0, cx));
+        assert!(properties_stacked(&mut cx));
+        assert_labels_beside(&mut cx, &slugs);
+    }
+
     #[gpui::test]
     fn a_reader_in_the_body_keeps_their_line_as_the_layout_switches(cx: &mut gpui::TestAppContext) {
         use crate::views::board_state::tests::issue;

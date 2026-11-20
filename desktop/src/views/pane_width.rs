@@ -32,9 +32,6 @@ pub const BOARD_KEEP: f32 = 240.0;
 pub const SPLIT_W: f32 = 860.0;
 /// The properties' column in the split layout, its left divider included.
 pub const SIDE_W: f32 = 280.0;
-/// A property's label column in the split layout (the stacked one keeps
-/// the frame's 108pt): room for `Blocked by` with the values beside it.
-pub const SIDE_LABEL_W: f32 = 84.0;
 
 /// Where the pane's details put its properties.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,7 +198,8 @@ mod tests {
         // A chosen width past it, in a window that shows less, stacks.
         assert_eq!(PaneLayout::for_width(PaneWidth::new(900.0).shown(584.0)), PaneLayout::Stacked);
         const { assert!(SPLIT_W - SIDE_W >= 560.0, "the body keeps most of the default's room") };
-        const { assert!(SIDE_W - SIDE_LABEL_W - 2.0 * 20.0 >= 140.0, "the side's values have room") };
+        // Each label over its value there, a value has the column's width.
+        const { assert!(SIDE_W - 2.0 * 20.0 >= 220.0, "the side's values have room") };
     }
 
     #[test]
