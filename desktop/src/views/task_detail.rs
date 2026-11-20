@@ -62,7 +62,7 @@
 //! show in the same shell.
 
 use gpui::{
-    canvas, div, prelude::*, px, AnyElement, ClickEvent, Context, CursorStyle, Div, ElementId, KeyDownEvent,
+    canvas, deferred, div, prelude::*, px, AnyElement, ClickEvent, Context, CursorStyle, Div, ElementId, KeyDownEvent,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ScrollHandle, SharedString, Stateful, Window,
 };
 use gpui_kit::base::TextView;
@@ -72,16 +72,17 @@ use shelbi_app::TaskDetailModel;
 use shelbi_core::StatusCategory;
 use shelbi_state::keymap::PopoverAction;
 
-use super::board_state::{Mode, PaneAction, PaneProperties, Property, PropertyRow};
+use super::board_state::{BoardState, Intent, Mode, PaneAction, PaneProperties, Property, PropertyRow};
 use super::floating_pane::{self, header_button, property_row, value_text, PaneIds, INSET, RADIUS};
 use super::issues::IssuesView;
 use super::pane_session::PaneSession;
 use super::pane_split::{GRIP_H, GRIP_RADIUS, GRIP_W, HANDLE_H, SESSION_H, SESSION_HEADER_H};
 use super::sidebar::{render_glyph, review_glyph, workspace_glyph};
 use super::task_panel;
-use super::workflow_editor::{dropdown, menu_rule, MENU_W};
+use super::tab_bar::CONTEXT_GAP;
+use super::workflow_editor::{dropdown, menu_rule, popup, MENU_W};
 use crate::assets::{heroicon, icons};
-use crate::elements::placed::MenuScroll;
+use crate::elements::placed::{placed, MenuScroll};
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::theme::style::{self, ButtonContent, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
@@ -187,19 +188,9 @@ fn header(view: &IssuesView, title: String, theme: &Theme, cx: &mut Context<Issu
     let menu_open = cursor.is_some();
     // What the menu lists, read now (its rows are built while this view
     // renders, so they can't read it then).
-    let rows: Vec<MenuRow> = if menu_open {
-        view.state
-            .pane_actions()
-            .into_iter()
-            .map(|a| MenuRow {
-                action: a,
-                label: view.state.pane_action_label(a),
-                hint: action_hint(view, a),
-                refusal: view.state.pane_action_refusal(a),
-            })
-            .collect()
-    } else {
-        Vec::new()
+    let rows = match (menu_open, view.state.detail_id()) {
+        (true, Some(id)) => menu_rows(view, id),
+        _ => Vec::new(),
     };
     view.pane_menu_scroll.follow(cursor);
     let scroll = view.pane_menu_scroll.clone();
@@ -208,7 +199,7 @@ fn header(view: &IssuesView, title: String, theme: &Theme, cx: &mut Context<Issu
         &view.pane_menu_anchor,
         "pane-menu",
         header_button("pane-more", icons::ELLIPSIS_VERTICAL, menu_open, theme).tooltip(style::tooltip("More")),
-        move |cx| menu_items(rows, cursor, scroll, cx),
+        move |cx| menu_items("pane-menu", rows, cursor, scroll, BoardState::choose_pane_action, cx),
         MENU_W,
         true,
         |this: &mut IssuesView, cx| {
@@ -228,7 +219,48 @@ fn header(view: &IssuesView, title: String, theme: &Theme, cx: &mut Context<Issu
     floating_pane::header("pane-heading", title, vec![more.into_any_element(), close.into_any_element()], theme)
 }
 
-/// One row of the More menu, read while the view renders.
+/// A card's context menu (a right-click on the card), while it is open: the
+/// More menu's rows for that card, drawn as the More menu draws them, at
+/// the pointer and over everything (`deferred`). A press outside it closes
+/// it and goes no further.
+pub(super) fn render_card_menu(view: &IssuesView, cx: &mut Context<IssuesView>) -> Option<AnyElement> {
+    let Mode::CardMenu { id, cursor } = &view.state.mode else {
+        view.card_menu_scroll.follow(None);
+        return None;
+    };
+    let rows = menu_rows(view, id);
+    view.card_menu_scroll.follow(Some(*cursor));
+    let theme = *cx.global::<Theme>();
+    let items = menu_items("card-menu", rows, Some(*cursor), view.card_menu_scroll.clone(), BoardState::choose_card_action, cx);
+    let menu = placed(&view.card_menu_anchor, popup("card-menu", MENU_W, &theme).children(items))
+        .gap(CONTEXT_GAP)
+        .on_dismiss(cx.listener(|this, _: &MouseDownEvent, _, cx| {
+            if matches!(this.state.mode, Mode::CardMenu { .. }) {
+                this.state.close_overlay();
+                this.needs_focus = true;
+                cx.notify();
+            }
+        }));
+    Some(deferred(menu).with_priority(1).into_any_element())
+}
+
+/// Task `id`'s action rows, as both its menus list them: the one list
+/// ([`BoardState::actions`]), each row's label, key and refusal.
+fn menu_rows(view: &IssuesView, id: &str) -> Vec<MenuRow> {
+    view.state
+        .actions(id)
+        .into_iter()
+        .map(|a| MenuRow {
+            action: a,
+            label: view.state.pane_action_label(a),
+            hint: action_hint(view, a),
+            refusal: view.state.action_refusal(id, a),
+        })
+        .collect()
+}
+
+/// One row of the More menu (or a card's context menu), read while the
+/// view renders.
 struct MenuRow {
     action: PaneAction,
     label: &'static str,
@@ -237,13 +269,17 @@ struct MenuRow {
     refusal: Option<String>,
 }
 
-/// The More menu's rows in one scroll: each action and the key that does
-/// the same, the keyboard's row kept in view (`scroll` follows it). Delete
-/// comes last, under a rule, in the danger color.
+/// An action menu's rows in one scroll (the More menu's, a card menu's):
+/// each action and the key that does the same, the keyboard's row kept in
+/// view (`scroll` follows it). Delete comes last, under a rule, in the
+/// danger color. Rows are `<prefix>-<slug>`; a click runs `choose` on its
+/// row.
 fn menu_items(
+    prefix: &'static str,
     rows: Vec<MenuRow>,
     cursor: Option<usize>,
     scroll: MenuScroll,
+    choose: fn(&mut BoardState, usize) -> Vec<Intent>,
     cx: &mut Context<IssuesView>,
 ) -> Vec<AnyElement> {
     let theme = cx.global::<Theme>().opaque();
@@ -251,14 +287,14 @@ fn menu_items(
     for (ix, row) in rows.into_iter().enumerate() {
         let danger = row.action == PaneAction::Delete;
         if danger && ix > 0 {
-            items.push(menu_rule(&theme).debug_selector(|| "pane-menu-rule".into()).into_any_element());
+            items.push(menu_rule(&theme).debug_selector(move || format!("{prefix}-rule")).into_any_element());
         }
-        let id = format!("pane-menu-{}", row.action.slug());
+        let id = format!("{prefix}-{}", row.action.slug());
         let base = match &row.refusal {
             Some(why) => style::disabled_menu_row(id, &theme).tooltip(style::tooltip(why.clone())),
             None => style::menu_row(id, cursor == Some(ix), &theme).on_click(cx.listener(
                 move |this, _: &ClickEvent, window, cx| {
-                    let intents = this.state.choose_pane_action(ix);
+                    let intents = choose(&mut this.state, ix);
                     this.apply_intents(intents, window, cx);
                     cx.notify();
                 },
@@ -272,7 +308,7 @@ fn menu_items(
         );
     }
     vec![div()
-        .id("pane-menu-scroll")
+        .id(SharedString::from(format!("{prefix}-scroll")))
         .flex()
         .flex_col()
         .overflow_y_scroll()

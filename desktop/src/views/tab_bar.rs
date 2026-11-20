@@ -127,7 +127,7 @@ const PLUS_LABEL_W_GUESS: f32 = 52.0;
 /// A tab's context menu's width.
 const MENU_W: f32 = 240.0;
 /// A tab's context menu's gap under the pointer.
-const CONTEXT_GAP: f32 = 2.0;
+pub(super) const CONTEXT_GAP: f32 = 2.0;
 
 /// What the New tab says.
 pub const NEW_TAB_LABEL: &str = "New tab";

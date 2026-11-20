@@ -74,6 +74,10 @@ pub enum Mode {
     /// The pane's More menu, its keyboard row at `cursor`
     /// ([`BoardState::pane_actions`]).
     PaneMenu { cursor: usize },
+    /// A card's context menu (a right-click on it), its keyboard row at
+    /// `cursor`: the More menu's rows for card `id`
+    /// ([`BoardState::actions`]), whichever task the pane shows.
+    CardMenu { id: String, cursor: usize },
     /// The picker under one of the pane's property values, its keyboard row
     /// at `cursor` ([`BoardState::property_rows`]).
     PropertyPicker { property: Property, cursor: usize },
@@ -124,7 +128,9 @@ pub enum Intent {
 }
 
 /// What the task pane's More menu offers: the task operations the old modal
-/// put on its action row, each with the pane key that does the same.
+/// put on its action row, each with the pane key that does the same. A
+/// card's context menu offers the same list, from the same
+/// [`BoardState::actions`], run by the same dispatcher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneAction {
     MoveLeft,
@@ -563,6 +569,13 @@ impl BoardState {
         self.generation += 1;
         self.model = IssuesModel::build_searched(&self.input, &self.filters, &self.search);
         self.overlay_pending();
+        // A card menu whose card left the board (deleted, filtered out)
+        // has nothing to act on.
+        if let Mode::CardMenu { id, .. } = &self.mode {
+            if self.model.card(id).is_none() {
+                self.mode = self.rest();
+            }
+        }
         if let Some(id) = selected {
             if let Some((c, r)) = self.model.position(&id) {
                 self.selected_column = c;
@@ -798,14 +811,20 @@ impl BoardState {
 
     // ---- the pane's More menu --------------------------------------------
 
-    /// What the pane's More menu lists for its task, in order: the moves,
-    /// Start (not for someone else's issue on a remote tracker), Assign, the
-    /// description's editors, and the workspace once one is assigned.
+    /// What the pane's More menu lists for its task ([`Self::actions`]).
     pub fn pane_actions(&self) -> Vec<PaneAction> {
-        let Some(card) = self.pane.as_deref().and_then(|id| self.model.card(id)) else {
+        self.pane.as_deref().map(|id| self.actions(id)).unwrap_or_default()
+    }
+
+    /// What the More menu (and the card's context menu) lists for task
+    /// `id`, in order: the moves, Start (not for someone else's issue on a
+    /// remote tracker), Assign, the description's editors, the workspace
+    /// once one is assigned, the PR and branch once there are, and Delete.
+    /// Nothing for a task that isn't on the board.
+    pub fn actions(&self, id: &str) -> Vec<PaneAction> {
+        let Some(card) = self.model.card(id) else {
             return Vec::new();
         };
-        let id = card.id.as_str();
         let mut out = Vec::new();
         // A step the workflow has (the pane's move clamps at the ends).
         if self.move_target(id, false, false).is_ok() {
@@ -848,11 +867,16 @@ impl BoardState {
         }
     }
 
-    /// Why the pane's `action` can't run now, when it can't (its row is
+    /// Why the pane's `action` can't run now ([`Self::action_refusal`]).
+    #[cfg(test)]
+    pub fn pane_action_refusal(&self, action: PaneAction) -> Option<String> {
+        self.action_refusal(self.pane.as_deref()?, action)
+    }
+
+    /// Why `action` can't run on task `id` now, when it can't (its row is
     /// drawn dimmed with this on hover): Delete on an issue a workspace is
     /// working on, or with a change of this client's still unanswered.
-    pub fn pane_action_refusal(&self, action: PaneAction) -> Option<String> {
-        let id = self.pane.as_deref()?;
+    pub fn action_refusal(&self, id: &str, action: PaneAction) -> Option<String> {
         match action {
             PaneAction::Delete => issue_delete::delete_refusal(&self.input, id).or_else(|| {
                 self.change_in_progress(id).then(|| "A change to this issue is still in progress.".to_string())
@@ -868,7 +892,7 @@ impl BoardState {
             self.status = Some(format!("{id} is no longer on the board"));
             return Vec::new();
         }
-        if let Some(why) = self.pane_action_refusal(PaneAction::Delete) {
+        if let Some(why) = self.action_refusal(id, PaneAction::Delete) {
             self.status = Some(why);
             return Vec::new();
         }
@@ -899,7 +923,7 @@ impl BoardState {
         };
         self.mode = self.rest();
         // The issue may have gone active while the confirm was up.
-        if let Some(why) = self.pane_action_refusal(PaneAction::Delete) {
+        if let Some(why) = self.action_refusal(&id, PaneAction::Delete) {
             self.status = Some(why);
             return Vec::new();
         }
@@ -955,11 +979,51 @@ impl BoardState {
     /// Run the More menu's action `ix` (a click, or Enter on its row), back
     /// on the pane.
     pub fn choose_pane_action(&mut self, ix: usize) -> Vec<Intent> {
-        let (Some(id), Some(action)) = (self.pane.clone(), self.pane_actions().get(ix).copied()) else {
-            self.mode = self.rest();
+        self.choose_action(self.pane.clone(), ix)
+    }
+
+    /// Open card `id`'s context menu (a right-click on it): the More
+    /// menu's rows for that card, the board's cursor moved onto it. The pane
+    /// stays as it is (on another card, or closed). False, and nothing
+    /// opens, for a card that isn't on the board, during a drag, or while a
+    /// menu, picker or prompt has the keys.
+    pub fn open_card_menu(&mut self, id: &str) -> bool {
+        if self.dragging.is_some() || !matches!(self.mode, Mode::Board | Mode::Detail { .. }) {
+            return false;
+        }
+        let Some((c, r)) = self.model.position(id) else {
+            return false;
+        };
+        self.select(c, r);
+        self.mode = Mode::CardMenu { id: id.to_string(), cursor: 0 };
+        true
+    }
+
+    /// Run the card menu's action `ix` (a click, or Enter on its row) on
+    /// its card, back on the pane (or the board).
+    pub fn choose_card_action(&mut self, ix: usize) -> Vec<Intent> {
+        let id = match &self.mode {
+            Mode::CardMenu { id, .. } => Some(id.clone()),
+            _ => None,
+        };
+        self.choose_action(id, ix)
+    }
+
+    /// Run row `ix` of task `id`'s action list (the More menu's or a card
+    /// menu's: one list, one dispatcher), the menu closed.
+    fn choose_action(&mut self, id: Option<String>, ix: usize) -> Vec<Intent> {
+        self.mode = self.rest();
+        let Some(id) = id else {
             return Vec::new();
         };
-        self.mode = self.rest();
+        let Some(action) = self.actions(&id).get(ix).copied() else {
+            return Vec::new();
+        };
+        self.run_action(id, action)
+    }
+
+    /// What `action` does to task `id`, from either menu.
+    fn run_action(&mut self, id: String, action: PaneAction) -> Vec<Intent> {
         match action {
             PaneAction::MoveLeft => self.move_command(&id, false, false),
             PaneAction::MoveRight => self.move_command(&id, true, false),
@@ -1171,21 +1235,27 @@ impl BoardState {
         Vec::new()
     }
 
-    fn pane_menu_key(&mut self, cursor: usize, chord: KeyChord) -> Vec<Intent> {
-        let n = self.pane_actions().len();
+    /// The keys of an action menu: the pane's More (`card` `None`) or card
+    /// `card`'s context menu, the same keys on the same list.
+    fn action_menu_key(&mut self, card: Option<String>, cursor: usize, chord: KeyChord) -> Vec<Intent> {
+        let n = match &card {
+            Some(id) => self.actions(id).len(),
+            None => self.pane_actions().len(),
+        };
+        let at = |cursor| match &card {
+            Some(id) => Mode::CardMenu { id: id.clone(), cursor },
+            None => Mode::PaneMenu { cursor },
+        };
         match chord.code {
             Key::Esc | Key::Char('q') => self.mode = self.rest(),
-            Key::Up | Key::Char('k') if n > 0 => {
-                self.mode = Mode::PaneMenu {
-                    cursor: if cursor == 0 { n - 1 } else { cursor - 1 },
-                }
+            Key::Up | Key::Char('k') if n > 0 => self.mode = at(if cursor == 0 { n - 1 } else { cursor - 1 }),
+            Key::Down | Key::Char('j') if n > 0 => self.mode = at((cursor + 1) % n),
+            Key::Enter | Key::Char(' ') => {
+                return match card {
+                    Some(id) => self.choose_action(Some(id), cursor),
+                    None => self.choose_pane_action(cursor),
+                };
             }
-            Key::Down | Key::Char('j') if n > 0 => {
-                self.mode = Mode::PaneMenu {
-                    cursor: (cursor + 1) % n,
-                }
-            }
-            Key::Enter | Key::Char(' ') => return self.choose_pane_action(cursor),
             _ => {}
         }
         Vec::new()
@@ -1412,7 +1482,8 @@ impl BoardState {
                 }
                 Some(self.detail_key(&id, chord))
             }
-            Mode::PaneMenu { cursor } => Some(self.pane_menu_key(cursor, chord)),
+            Mode::PaneMenu { cursor } => Some(self.action_menu_key(None, cursor, chord)),
+            Mode::CardMenu { id, cursor } => Some(self.action_menu_key(Some(id), cursor, chord)),
             Mode::PropertyPicker { property, cursor } => Some(self.property_key(property, cursor, chord)),
             Mode::WorkspaceDropdown { cursor } => Some(self.workspace_dropdown_key(cursor, chord)),
             Mode::WorkflowDropdown { cursor } => Some(self.workflow_dropdown_key(cursor, chord)),
@@ -2814,6 +2885,110 @@ pub(crate) mod tests {
         b.toggle_pane_menu();
         assert_eq!(b.choose_pane_action(4), vec![Intent::BeginEdit("A".into())]);
         assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: true });
+    }
+
+    #[test]
+    fn a_card_menu_lists_the_more_menus_rows_for_its_card() {
+        let mut assigned = issue("A", "todo");
+        assigned.task.assigned_to = Some("alpha".into());
+        let mut b = board(vec![assigned, issue("B", "todo")]);
+        // With the pane closed: the right-clicked card's rows, the cursor on it.
+        assert!(b.open_card_menu("B"));
+        assert_eq!(b.mode, Mode::CardMenu { id: "B".into(), cursor: 0 });
+        assert_eq!(b.selected_card().map(|c| c.id.as_str()), Some("B"), "the board's cursor moves onto it");
+        assert_eq!(b.detail_id(), None, "no pane opens");
+        b.open_detail("B");
+        let b_rows = b.pane_actions();
+        assert_eq!(b.actions("B"), b_rows, "the same list as B's More menu");
+        b.open_detail("A");
+        assert_ne!(b.actions("B"), b.pane_actions(), "A has a workspace to open");
+        // With the pane on another card: still B's rows, the pane left as it is.
+        assert!(b.open_card_menu("B"));
+        assert_eq!(b.actions("B"), b_rows);
+        assert_eq!(b.detail_id(), Some("A"));
+        // Its keys are the More menu's.
+        press(&mut b, "k");
+        assert_eq!(b.mode, Mode::CardMenu { id: "B".into(), cursor: b_rows.len() - 1 }, "up wraps");
+        press(&mut b, "j");
+        press(&mut b, "j");
+        assert_eq!(b.mode, Mode::CardMenu { id: "B".into(), cursor: 1 });
+        press(&mut b, "esc");
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "Esc goes back to the pane");
+        // Not over a picker or prompt, and not for a card that isn't there.
+        b.begin_assign("A");
+        assert!(!b.open_card_menu("B"));
+        b.close_overlay();
+        assert!(!b.open_card_menu("Z"));
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        b.close_pane();
+        assert!(b.open_card_menu("B"));
+        b.close_overlay();
+        assert_eq!(b.mode, Mode::Board, "with no pane, closing goes back to the board");
+    }
+
+    #[test]
+    fn a_card_menus_action_runs_on_its_card_not_the_panes() {
+        let mut b = board(vec![issue("A", "todo"), issue("B", "todo")]);
+        b.open_detail("A");
+        let ix = |b: &BoardState, a: PaneAction| b.actions("B").iter().position(|x| *x == a).unwrap();
+
+        b.open_card_menu("B");
+        let start = ix(&b, PaneAction::Start);
+        assert_eq!(b.choose_card_action(start), vec![Intent::Command(CommandKind::StartIssue { id: "B".into() })]);
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "back on A's pane");
+
+        // Enter on a row does the same.
+        b.open_card_menu("B");
+        for _ in 0..ix(&b, PaneAction::MoveRight) {
+            press(&mut b, "j");
+        }
+        assert!(matches!(
+            press(&mut b, "enter").as_slice(),
+            [Intent::Command(CommandKind::MoveIssue { id, .. })] if id == "B"
+        ));
+
+        // The ones that open UI open it for B: the assign picker, the confirm
+        // (over the board, the pane on A under it), the editor (on B's pane).
+        b.open_card_menu("B");
+        b.choose_card_action(ix(&b, PaneAction::Assign));
+        assert!(matches!(&b.mode, Mode::AssignPicker { id, .. } if id == "B"));
+        assert_eq!(press(&mut b, "enter"), vec![Intent::Command(CommandKind::AssignIssue {
+            id: "B".into(),
+            workspace: "alpha".into()
+        })]);
+        b.open_card_menu("B");
+        b.choose_card_action(ix(&b, PaneAction::Delete));
+        assert_eq!(b.mode, Mode::ConfirmDelete { id: "B".into() });
+        assert_eq!(b.detail_id(), Some("A"));
+        assert_eq!(b.confirm_delete(), vec![Intent::Command(CommandKind::DeleteIssue { id: "B".into() })]);
+        assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false });
+        b.open_card_menu("B");
+        assert_eq!(b.choose_card_action(ix(&b, PaneAction::EditDescription)), vec![Intent::BeginEdit("B".into())]);
+        assert_eq!(b.mode, Mode::Detail { id: "B".into(), editing: true }, "B's pane, its editor");
+    }
+
+    #[test]
+    fn a_card_menus_refused_delete_is_its_cards() {
+        let mut busy = issue("W", "in-progress");
+        busy.task.assigned_to = Some("alpha".into());
+        let mut b = board(vec![busy, issue("A", "todo")]);
+        // The pane on A, whose Delete is fine; W's is refused, from its menu.
+        b.open_detail("A");
+        assert_eq!(b.action_refusal("A", PaneAction::Delete), None);
+        let why = b.action_refusal("W", PaneAction::Delete).expect("W is being worked on");
+        b.open_card_menu("W");
+        let ix = b.actions("W").iter().position(|a| *a == PaneAction::Delete).unwrap();
+        assert!(b.choose_card_action(ix).is_empty());
+        assert_eq!(b.delete_confirm(), None, "no confirm");
+        assert_eq!(b.status.as_deref(), Some(why.as_str()));
+    }
+
+    #[test]
+    fn a_card_menu_closes_when_its_card_leaves_the_board() {
+        let mut b = board(vec![issue("A", "todo"), issue("B", "todo")]);
+        b.open_card_menu("B");
+        b.apply_open(read(vec![issue("A", "todo")]));
+        assert_eq!(b.mode, Mode::Board);
     }
 
     #[test]
