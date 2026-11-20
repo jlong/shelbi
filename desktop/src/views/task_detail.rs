@@ -25,6 +25,16 @@
 //! updated dates. The task operations the old modal put on its action row
 //! are in More ([`PaneAction`]) and keep their keys.
 //!
+//! Dragged wide (at [`SPLIT_W`](super::pane_width::SPLIT_W) or past it, by
+//! the width it shows: [`PaneLayout`]), the details split
+//! (`pane-responsive-props`): the title, body and dates scroll on the left,
+//! and the same property table, in the same order with the same pickers,
+//! sits in a [`SIDE_W`] column on the right behind its own divider, the way
+//! Linear's issue view has it. Only the details split: the Header and the
+//! session area stay full width. The switch follows a drag of the edge
+//! live, and a reader in the body keeps their line across it
+//! ([`body_probe`]).
+//!
 //! The PR property is the task's pull request: its number links to the page
 //! (`p` opens it too, and More has it), then its state and CI when known
 //! (`task-pr-metadata`).
@@ -73,7 +83,8 @@ use shelbi_core::StatusCategory;
 use shelbi_state::keymap::PopoverAction;
 
 use super::board_state::{BoardState, Intent, Mode, PaneAction, PaneProperties, Property, PropertyRow};
-use super::floating_pane::{self, header_button, property_row, value_text, PaneIds, INSET, RADIUS};
+use super::floating_pane::{self, header_button, property_row_at, value_text, PaneIds, INSET, LABEL_W, RADIUS};
+use super::pane_width::{keep_body_line, PaneLayout, SIDE_LABEL_W, SIDE_W};
 use super::issues::IssuesView;
 use super::pane_session::PaneSession;
 use super::pane_split::{GRIP_H, GRIP_RADIUS, GRIP_W, HANDLE_H, SESSION_H, SESSION_HEADER_H};
@@ -371,13 +382,16 @@ fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Conte
             })
     });
 
-    let properties = properties(view, d, theme, cx);
+    let layout = view.pane_layout();
+    let properties = properties(view, d, layout, theme, cx);
 
     let body = div()
         .debug_selector(|| "pane-body".into())
+        .relative()
         .w_full()
         .min_w_0()
-        .children(editors.map(|e| e.body.clone()));
+        .children(editors.map(|e| e.body.clone()))
+        .child(body_probe(&d.id, layout, &view.detail_scroll, cx));
 
     let dates = div()
         .debug_selector(|| "pane-dates".into())
@@ -385,37 +399,101 @@ fn details(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Conte
         .text_color(theme.muted)
         .child(format!("Created {}  ·  Updated {}", short_date(&d.created), short_date(&d.updated)));
 
-    div()
+    let heading = div()
+        .flex()
+        .flex_col()
+        .gap(px(16.0))
+        .w_full()
+        .min_w_0()
+        .child(title)
+        .children(status_rows);
+
+    let scroll = div()
         .id("pane-scroll")
         .debug_selector(|| "pane-scroll".into())
         .flex_1()
         .min_h_0()
-        .w_full()
         .overflow_y_scroll()
-        .track_scroll(&view.detail_scroll)
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(INSET))
-                .p(px(INSET))
-                .w_full()
-                .min_w_0()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(16.0))
-                        .w_full()
-                        .min_w_0()
-                        .child(title)
-                        .children(status_rows)
-                        .child(properties),
-                )
+        .track_scroll(&view.detail_scroll);
+    let column = div().flex().flex_col().gap(px(INSET)).p(px(INSET)).w_full().min_w_0();
+    match layout {
+        // The frame's: the properties under the title, a divider, the body.
+        PaneLayout::Stacked => scroll.w_full().child(
+            column
+                .child(heading.child(properties))
                 .child(div().flex_none().h(px(1.0)).w_full().bg(theme.divider))
                 .child(body)
                 .child(dates),
-        )
+        ),
+        // The title and body take the room the properties' column leaves,
+        // and each side scrolls on its own (a long body leaves the
+        // properties in view). The dates stay under the body, as stacked.
+        PaneLayout::Split => div()
+            .id("pane-details")
+            .debug_selector(|| "pane-details".into())
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .child(scroll.min_w_0().h_full().child(column.child(heading).child(body).child(dates)))
+            .child(
+                div()
+                    .id("pane-side")
+                    .debug_selector(|| "pane-side".into())
+                    .flex_none()
+                    .w(px(SIDE_W))
+                    .h_full()
+                    .border_l_1()
+                    .border_color(theme.divider)
+                    .overflow_y_scroll()
+                    .child(div().flex().flex_col().p(px(INSET)).w_full().min_w_0().child(properties)),
+            ),
+    }
+}
+
+/// Measures where task `id`'s body starts in the details' scroll, and when
+/// the layout has changed since it last did on the same task (a drag across the breakpoint, a
+/// window that shrank the pane) keeps a reader in the body on their line
+/// ([`keep_body_line`]): the scroll moves with the body, and the pane
+/// repaints at the kept place.
+fn body_probe(id: &str, layout: PaneLayout, scroll: &ScrollHandle, cx: &mut Context<IssuesView>) -> impl IntoElement {
+    let this = cx.entity().downgrade();
+    let id = id.to_string();
+    let scroll = scroll.clone();
+    canvas(
+        move |bounds, _, cx| {
+            let viewport = scroll.bounds();
+            let mut offset = scroll.offset();
+            let top = (bounds.origin.y - viewport.origin.y - offset.y).as_f32();
+            let _ = this.update(cx, |this, cx| {
+                let now = BodyAnchor { id: id.clone(), layout, top };
+                if let Some(BodyAnchor { id: was_id, layout: was, top: was_top }) = this.body_anchor.replace(now) {
+                    if was_id == id && was != layout {
+                        let kept = keep_body_line(offset.y.as_f32(), scroll.max_offset().y.as_f32(), was_top, top);
+                        if kept != offset.y.as_f32() {
+                            offset.y = px(kept);
+                            scroll.set_offset(offset);
+                            cx.notify();
+                        }
+                    }
+                }
+            });
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+}
+
+/// Where the pane's body started in the details' scroll at the last paint,
+/// and in which layout.
+pub struct BodyAnchor {
+    id: String,
+    layout: PaneLayout,
+    top: f32,
 }
 
 /// The details over the task's live session: the details' scroll, the
@@ -602,7 +680,17 @@ fn session_header(session: &TaskSession, theme: &Theme, cx: &mut Context<IssuesV
 /// The property table: Status, Workflow, Priority, the estimate while the
 /// issue has one, and Branch, then the task's tracker owner, dependencies and
 /// pull request where it has them.
-fn properties(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Context<IssuesView>) -> Div {
+fn properties(
+    view: &IssuesView,
+    d: &TaskDetailModel,
+    layout: PaneLayout,
+    theme: &Theme,
+    cx: &mut Context<IssuesView>,
+) -> Div {
+    let label_w = match layout {
+        PaneLayout::Stacked => LABEL_W,
+        PaneLayout::Split => SIDE_LABEL_W,
+    };
     let mut rows = div()
         .debug_selector(|| "pane-properties".into())
         .flex()
@@ -628,7 +716,9 @@ fn properties(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Co
     ];
     for (property, label, icon, value) in values {
         let pending = shown.pending == Some(property);
-        rows = rows.child(property_row(theme, label, value_picker(view, property, icon, value, pending, theme, cx)));
+        let value = value_picker(view, property, icon, value, pending, theme, cx);
+        let row = SharedString::from(format!("pane-row-{}", property.slug()));
+        rows = rows.child(property_row_at(theme, label, label_w, value).debug_selector(move || row.to_string()));
     }
     // The estimate, while the issue has one: `2h · 1h 12m elapsed (60%)`,
     // in the warning color once overdue. Read against the clock at this
@@ -636,18 +726,20 @@ fn properties(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Co
     if let Some(est) = d.estimate {
         let progress = est.progress(chrono::Utc::now());
         let color = if progress.overdue() { theme.warning } else { theme.foreground };
-        rows = rows.child(property_row(
+        rows = rows.child(property_row_at(
             theme,
             "Estimate",
+            label_w,
             value_text(theme)
                 .debug_selector(|| "pane-estimate".into())
                 .text_color(color)
                 .child(progress.label()),
         ));
     }
-    rows = rows.child(property_row(
+    rows = rows.child(property_row_at(
         theme,
         "Branch",
+        label_w,
         match &d.branch {
             // Selectable and copyable (More copies it too); not an editor:
             // the branch is derived, and made when work starts.
@@ -660,7 +752,7 @@ fn properties(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Co
                 .child(TextView::markdown(ElementId::Name(SharedString::from(format!("branch-{}", d.id))), plain(b)).selectable(true)),
             None => value_text(theme).text_color(theme.muted).child("Created when work starts"),
         },
-    ));
+    ).debug_selector(|| "pane-row-branch".into()));
     // Tracker ownership, on a remote tracker only: whose the issue is, and for
     // one that isn't the user's, how to claim it (Start isn't offered).
     if let Some(owner) = &d.tracker_owner {
@@ -669,21 +761,23 @@ fn properties(view: &IssuesView, d: &TaskDetailModel, theme: &Theme, cx: &mut Co
         } else {
             format!("{}  ·  not yours: `shelbi issue start {} --take` claims it", owner.label(), d.id)
         };
-        rows = rows.child(property_row(theme, "Owner", value_text(theme).child(text)));
+        rows = rows.child(property_row_at(theme, "Owner", label_w, value_text(theme).child(text)));
     }
     if !d.depends_on.is_empty() {
         let deps = d.depends_on.iter().map(dep_text).collect::<Vec<_>>().join(", ");
         let label = if d.blocked { "Blocked by" } else { "Depends on" };
-        rows = rows.child(property_row(theme, label, value_text(theme).debug_selector(|| "pane-deps".into()).child(deps)));
+        let value = value_text(theme).debug_selector(|| "pane-deps".into()).child(deps);
+        rows = rows.child(property_row_at(theme, label, label_w, value));
     }
     if let Some(pr) = &d.pr {
         let mut link = task_panel::pr_link("pr-link", pr, false, theme);
         if let Some(url) = pr.url.clone() {
             link = link.on_click(move |_, _, cx| cx.open_url(&url));
         }
-        rows = rows.child(property_row(
+        rows = rows.child(property_row_at(
             theme,
             "PR",
+            label_w,
             div().flex().flex_row().items_center().min_w_0().px(px(8.0)).child(task_panel::pr_value(link, pr, theme)),
         ));
     }

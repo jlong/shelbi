@@ -4098,6 +4098,19 @@ impl Run {
         self.cx.simulate_keystrokes(handle.into(), "tab tab");
         self.save(handle, "state-task-pane-focus");
 
+        // Dragged wide (as wide as the frame's main area lets it): the
+        // properties in their column beside the title and body.
+        let handle = self.open_pane();
+        if let (Some(board), _, _) = self.views(handle) {
+            board.update(&mut self.cx, |v, cx| v.set_pane_width(904.0, cx));
+        }
+        self.settle(handle);
+        let split = self.views(handle).0.is_some_and(|b| {
+            b.read_with(&self.cx, |v, _| v.pane_layout() == crate::views::pane_width::PaneLayout::Split)
+        });
+        self.expect("state-task-pane-wide: the properties are beside the body", split);
+        self.save(handle, "state-task-pane-wide");
+
         // Another card picked beside it: the one pane shows it, the board
         // as it was.
         let handle = self.open_pane();
