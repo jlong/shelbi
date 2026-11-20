@@ -261,6 +261,38 @@ fn an_in_progress_task_shows_the_agent_working_it_at_the_frames_size(cx: &mut Te
 }
 
 #[gpui::test]
+fn a_wide_pane_splits_only_its_details_over_a_full_width_session(cx: &mut TestAppContext) {
+    use super::super::pane_width::SIDE_W;
+    let mut p = open_sized(cx, GpuiSize { width: px(1440.0), height: px(1024.0) });
+    p.view.update(&mut p.cx, |v, cx| v.set_pane_width(1000.0, cx));
+    p.open_task("A");
+    let pane = p.bounds("task-pane");
+    let details = p.bounds("pane-details");
+    let side = p.bounds("pane-side");
+    let handle = p.bounds("pane-split-handle");
+    let session = p.bounds("pane-session");
+    assert!(p.drawn("pane-properties") && side.size.width == px(SIDE_W));
+    // The properties' column runs the details' height and stops at the
+    // handle; the handle and the session take the pane's whole width.
+    assert_eq!((side.top(), side.bottom()), (details.top(), details.bottom()));
+    assert_eq!(details.bottom(), handle.top());
+    assert_eq!((details.left(), details.right()), (pane.left(), pane.right()));
+    for b in [handle, session, p.bounds("pane-session-header")] {
+        assert_eq!((b.left(), b.right()), (pane.left(), pane.right()), "{b:?} spans {pane:?}");
+    }
+    assert_eq!(session.bottom(), pane.bottom());
+    // The Header too: its title starts at the pane's left, Close sits at
+    // its right, over both columns.
+    assert!(p.bounds("pane-heading").left() < p.bounds("pane-scroll").right() - px(200.0));
+    assert!(p.bounds("pane-close").left() > side.left());
+    // Narrowed under the breakpoint: stacked again, the same session.
+    p.view.update(&mut p.cx, |v, cx| v.set_pane_width(640.0, cx));
+    assert!(!p.drawn("pane-side") && !p.drawn("pane-details"));
+    assert_eq!(p.bounds("pane-scroll").bottom(), p.bounds("pane-split-handle").top());
+    assert_eq!(p.fake.attached(), vec![name("alpha")], "the layout change attached nothing new");
+}
+
+#[gpui::test]
 fn an_assignment_or_status_alone_attaches_nothing_and_an_idle_task_launches_nothing(cx: &mut TestAppContext) {
     let mut p = open(cx);
     // C is In Progress and assigned to alpha, but alpha is working A.

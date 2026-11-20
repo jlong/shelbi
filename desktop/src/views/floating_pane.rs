@@ -115,6 +115,13 @@ impl PaneFrame {
         self.width.wanted()
     }
 
+    /// The width the pane draws at: the chosen one, or the layer's room when
+    /// that's less (the chosen one until the layer is first measured).
+    pub fn shown(&self) -> f32 {
+        let wanted = self.width.wanted();
+        self.layer.map_or(wanted, |l| self.width.shown(l.size.width.as_f32()))
+    }
+
     /// The window's saved width. Whether it changed.
     pub fn set_saved(&mut self, saved: f32) -> bool {
         let width = PaneWidth::new(saved);
@@ -132,8 +139,7 @@ impl PaneFrame {
     /// a drag from the width the pane shows.
     pub fn start_resize(&mut self, x: f32) {
         let wanted = self.width.wanted();
-        let shown = self.layer.map_or(wanted, |l| self.width.shown(l.size.width.as_f32()));
-        self.resize = Some(PaneResize { from: shown, press_x: x, before: wanted });
+        self.resize = Some(PaneResize { from: self.shown(), press_x: x, before: wanted });
     }
 
     /// Follow a drag of the edge to `x`, in window coordinates. Whether the
@@ -335,7 +341,8 @@ fn resize_handle<V: PaneHost>(frame: &PaneFrame, id: &'static str, theme: &Theme
         )
 }
 
-/// Measures the pane's layer for the drag, and while a drag of the pane's
+/// Measures the pane's layer for the drag (and for the width the pane
+/// shows, which picks its host's layout: a change repaints), and while a drag of the pane's
 /// edge is on follows the pointer anywhere in the window until the button
 /// comes up (the pointer leaves the pane, and the layer, as it goes).
 fn resize_probe<V: PaneHost>(frame: &PaneFrame, cx: &mut Context<V>) -> impl IntoElement {
@@ -344,7 +351,13 @@ fn resize_probe<V: PaneHost>(frame: &PaneFrame, cx: &mut Context<V>) -> impl Int
     let resizing = frame.resizing();
     canvas(
         move |bounds, _, cx| {
-            let _ = measured.update(cx, |this, _| this.pane_frame().layer = Some(bounds));
+            let _ = measured.update(cx, |this, cx| {
+                let frame = this.pane_frame();
+                if frame.layer != Some(bounds) {
+                    frame.layer = Some(bounds);
+                    cx.notify();
+                }
+            });
         },
         move |_, _, window, _| {
             if !resizing {
@@ -443,6 +456,12 @@ pub fn header_button(id: &'static str, icon: Icon, active: bool, theme: &Theme) 
 /// A property row: 28pt, the label in its muted column, 12pt before the
 /// value.
 pub fn property_row(theme: &Theme, label: &'static str, value: impl IntoElement) -> Div {
+    property_row_at(theme, label, LABEL_W, value)
+}
+
+/// [`property_row`] with its label column `label_w` wide (the task pane's
+/// side column is narrower than the frame's).
+pub fn property_row_at(theme: &Theme, label: &'static str, label_w: f32, value: impl IntoElement) -> Div {
     div()
         .flex()
         .flex_row()
@@ -453,8 +472,9 @@ pub fn property_row(theme: &Theme, label: &'static str, value: impl IntoElement)
         .min_w_0()
         .child(
             div()
-                .w(px(LABEL_W))
+                .w(px(label_w))
                 .flex_none()
+                .truncate()
                 .type_style(Type::Small)
                 .text_color(theme.muted)
                 .child(label),

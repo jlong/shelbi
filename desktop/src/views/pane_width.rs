@@ -9,6 +9,12 @@
 //! narrower (the layout shrinks it to fit) without forgetting the width, so
 //! it comes back when the window grows. Each window saves its own width
 //! (`WindowState::task_pane_width`).
+//!
+//! The width shown also picks the details' layout ([`PaneLayout`],
+//! `pane-responsive-props`): under [`SPLIT_W`] the properties stack under
+//! the title, as at the default width; at it or past it they move to a
+//! [`SIDE_W`] column beside the title and body, the way Linear's issue view
+//! has them. A drag across it switches the layout live.
 
 /// The pane's width until the user drags it: the Figma frame's 640pt.
 pub const DEFAULT_W: f32 = 640.0;
@@ -18,6 +24,55 @@ pub const MIN_W: f32 = 400.0;
 /// The main area a drag leaves beside the pane, so part of the board (or
 /// the screen under it) stays in view.
 pub const BOARD_KEEP: f32 = 240.0;
+
+/// The narrowest pane that puts its properties in a column beside the title
+/// and body. The title and body keep 580pt there (a little under the 600pt
+/// they have at the default width), so the body never reads narrower for
+/// the split.
+pub const SPLIT_W: f32 = 860.0;
+/// The properties' column in the split layout, its left divider included.
+pub const SIDE_W: f32 = 280.0;
+/// A property's label column in the split layout (the stacked one keeps
+/// the frame's 108pt): room for `Blocked by` with the values beside it.
+pub const SIDE_LABEL_W: f32 = 84.0;
+
+/// Where the pane's details put its properties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneLayout {
+    /// Under the title, over a divider and the body: under [`SPLIT_W`].
+    Stacked,
+    /// In a [`SIDE_W`] column beside the title and body: at [`SPLIT_W`] and
+    /// past it.
+    Split,
+}
+
+impl PaneLayout {
+    /// The layout of a pane `shown` wide (the width it draws at, not the one
+    /// chosen: a narrow window that shrinks the pane stacks it too).
+    pub fn for_width(shown: f32) -> Self {
+        if shown >= SPLIT_W {
+            PaneLayout::Split
+        } else {
+            PaneLayout::Stacked
+        }
+    }
+}
+
+/// The details' scroll offset after the layout changed under it (gpui's,
+/// so negative as it scrolls down, at most `max` down): a reader in the body
+/// (its top scrolled out of sight) keeps the body's line where it was on
+/// screen, though the body moved from `was_top` to `now_top` in the scroll's
+/// content; one who can still see the body's top (or what's over it) keeps
+/// the offset, so the properties don't scroll away from them.
+pub fn keep_body_line(offset: f32, max: f32, was_top: f32, now_top: f32) -> f32 {
+    if !offset.is_finite() || !max.is_finite() || !was_top.is_finite() || !now_top.is_finite() {
+        return offset;
+    }
+    if was_top + offset >= 0.0 {
+        return offset;
+    }
+    (offset + was_top - now_top).clamp(-max.max(0.0), 0.0)
+}
 
 /// The pane's chosen width.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -134,6 +189,41 @@ mod tests {
         assert_eq!(PaneWidth::new(f32::NAN), PaneWidth::default());
         assert_eq!(PaneWidth::new(f32::INFINITY), PaneWidth::default());
         assert_eq!(PaneWidth::new(12.0), PaneWidth::default());
+    }
+
+    #[test]
+    fn the_properties_go_beside_the_body_from_the_breakpoint_on() {
+        assert_eq!(PaneLayout::for_width(DEFAULT_W), PaneLayout::Stacked, "the default stays one column");
+        assert_eq!(PaneLayout::for_width(MIN_W), PaneLayout::Stacked);
+        assert_eq!(PaneLayout::for_width(SPLIT_W - 1.0), PaneLayout::Stacked);
+        assert_eq!(PaneLayout::for_width(SPLIT_W), PaneLayout::Split, "at the breakpoint");
+        assert_eq!(PaneLayout::for_width(1200.0), PaneLayout::Split);
+        // A chosen width past it, in a window that shows less, stacks.
+        assert_eq!(PaneLayout::for_width(PaneWidth::new(900.0).shown(584.0)), PaneLayout::Stacked);
+        const { assert!(SPLIT_W - SIDE_W >= 560.0, "the body keeps most of the default's room") };
+        const { assert!(SIDE_W - SIDE_LABEL_W - 2.0 * 20.0 >= 140.0, "the side's values have room") };
+    }
+
+    #[test]
+    fn a_reader_in_the_body_keeps_their_line_across_a_switch() {
+        // 300pt into a body that starts at 260: the body moves up 200pt as
+        // the properties leave it, so the scroll follows it up.
+        assert_eq!(keep_body_line(-300.0, 2000.0, 260.0, 60.0), -100.0);
+        // And back down as they return.
+        assert_eq!(keep_body_line(-100.0, 2000.0, 60.0, 260.0), -300.0);
+        // Within what the new layout can scroll.
+        assert_eq!(keep_body_line(-100.0, 150.0, 60.0, 400.0), -150.0);
+        assert_eq!(keep_body_line(-300.0, 2000.0, 260.0, 290.0), -330.0);
+    }
+
+    #[test]
+    fn a_reader_over_the_body_keeps_the_offset() {
+        assert_eq!(keep_body_line(0.0, 2000.0, 260.0, 60.0), 0.0, "at the top, the top");
+        assert_eq!(keep_body_line(0.0, 2000.0, 60.0, 260.0), 0.0, "the properties come back in view");
+        assert_eq!(keep_body_line(-40.0, 2000.0, 60.0, 260.0), -40.0, "the body's top still showed");
+        assert_eq!(keep_body_line(-60.0, 2000.0, 60.0, 260.0), -60.0, "right at it");
+        assert!(keep_body_line(f32::NAN, 2000.0, 60.0, 260.0).is_nan());
+        assert_eq!(keep_body_line(-300.0, 2000.0, f32::NAN, 260.0), -300.0);
     }
 
     #[test]

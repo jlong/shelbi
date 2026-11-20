@@ -67,6 +67,7 @@ use super::doc_editor::{DocEditor, DocEvent};
 use super::external_edit::{self, EditorEvent};
 use super::pane_session::{MainShows, PaneSession};
 use super::floating_pane::{PaneFrame, PaneHost, SlideOut};
+use super::pane_width::PaneLayout;
 use super::session_view::{SessionDeps, SessionView};
 use super::estimate_bar;
 use super::task_detail;
@@ -257,6 +258,10 @@ pub struct IssuesView {
     /// Emptied when a new search starts, so its results start at the top.
     search_lists: HashMap<String, ColumnList>,
     pub(super) detail_scroll: ScrollHandle,
+    /// The task pane's layout at its last paint and where its body started
+    /// in [`Self::detail_scroll`] then: a change of layout keeps a reader in
+    /// the body on their line (`task_detail::body_probe`).
+    pub(super) body_anchor: Option<task_detail::BodyAnchor>,
     /// The open task's title and body editors. They edit the issue's draft
     /// (`issue_edit`), which saves itself.
     pub(crate) pane_editors: Option<PaneEditors>,
@@ -346,6 +351,7 @@ impl IssuesView {
             property_anchor: Default::default(),
             picker_scroll: ScrollHandle::new(),
             detail_scroll: ScrollHandle::new(),
+            body_anchor: None,
             pane_editors: None,
             #[cfg(test)]
             sent_saves: Vec::new(),
@@ -608,6 +614,12 @@ impl IssuesView {
     #[cfg(test)]
     pub fn pane_width(&self) -> f32 {
         self.pane_frame.wanted()
+    }
+
+    /// Where the task pane puts its properties, from the width it shows
+    /// (live while its edge is dragged).
+    pub(crate) fn pane_layout(&self) -> PaneLayout {
+        PaneLayout::for_width(self.pane_frame.shown())
     }
 
     /// Whether the view draws over another screen.
@@ -3181,6 +3193,197 @@ mod tests {
         // ...and the width comes back when the window grows.
         cx.simulate_resize(gpui::size(px(1160.0), px(1024.0)));
         assert_eq!(bounds(&mut cx, "task-pane").size.width, px(760.0));
+    }
+
+    /// Whether the pane's properties stack under its title (and over the
+    /// body), as at the default width.
+    fn properties_stacked(cx: &mut gpui::VisualTestContext) -> bool {
+        let (title, props, body) = (bounds(cx, "pane-title"), bounds(cx, "pane-properties"), bounds(cx, "pane-body"));
+        let scroll = bounds(cx, "pane-scroll");
+        !drawn(cx, "pane-side")
+            && !drawn(cx, "pane-details")
+            && props.top() >= title.bottom()
+            && props.bottom() < body.top()
+            && (props.left() - title.left()).abs() < px(0.5)
+            && props.left() > scroll.left()
+            && props.right() < scroll.right()
+    }
+
+    /// Whether the pane's properties are in the column beside its title and
+    /// body: right of both, at the column's top (level with the title while
+    /// the body's side is at its top), the column at its width flush with
+    /// the pane's right edge.
+    fn properties_beside(cx: &mut gpui::VisualTestContext) -> bool {
+        use crate::views::floating_pane::INSET;
+        use crate::views::pane_width::SIDE_W;
+        let (title, props, body) = (bounds(cx, "pane-title"), bounds(cx, "pane-properties"), bounds(cx, "pane-body"));
+        let (side, scroll, pane) = (bounds(cx, "pane-side"), bounds(cx, "pane-scroll"), bounds(cx, "task-pane"));
+        side.size.width == px(SIDE_W)
+            && side.right() == pane.right()
+            && side.contains(&props.origin)
+            && props.left() >= title.right()
+            && props.left() >= body.right()
+            && (props.top() - side.top() - px(INSET)).abs() < px(0.5)
+            && side.top() == scroll.top()
+            && scroll.right() == side.left()
+            && body.top() > title.bottom()
+    }
+
+    #[gpui::test]
+    fn the_default_width_keeps_the_properties_under_the_title(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        use crate::views::pane_width::{PaneLayout, DEFAULT_W};
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1440.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        assert_eq!(bounds(&mut cx, "task-pane").size.width, px(DEFAULT_W));
+        assert_eq!(view.read_with(&cx, |v, _| v.pane_layout()), PaneLayout::Stacked);
+        assert!(properties_stacked(&mut cx));
+        // One scroll for all of it, the pane's full width under the Header.
+        let (pane, scroll) = (bounds(&mut cx, "task-pane"), bounds(&mut cx, "pane-scroll"));
+        assert_eq!((scroll.left(), scroll.right(), scroll.bottom()), (pane.left(), pane.right(), pane.bottom()));
+    }
+
+    #[gpui::test]
+    fn a_wide_pane_puts_the_properties_beside_the_body_live(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        use crate::views::pane_width::SPLIT_W;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) = open_board_sized(cx, vec![issue("A", "todo")], Some(gpui::size(px(1440.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        assert!(properties_stacked(&mut cx));
+        let title_top = bounds(&mut cx, "pane-title").top();
+
+        // Dragged wider to the breakpoint: the switch is live, mid-drag.
+        let edge = bounds(&mut cx, "task-pane-resize").center();
+        let to = |w: f32| gpui::point(edge.x - px(w - 640.0), edge.y);
+        cx.simulate_mouse_down(edge, gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.simulate_mouse_move(to(SPLIT_W - 1.0), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        assert_eq!(bounds(&mut cx, "task-pane").size.width, px(SPLIT_W - 1.0));
+        assert!(properties_stacked(&mut cx), "a point short of it, still stacked");
+        cx.simulate_mouse_move(to(SPLIT_W), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        assert_eq!(bounds(&mut cx, "task-pane").size.width, px(SPLIT_W));
+        assert!(properties_beside(&mut cx), "at the breakpoint, beside");
+        assert_eq!(bounds(&mut cx, "pane-title").top(), title_top, "the title stays where it was");
+        assert!((bounds(&mut cx, "pane-properties").top() - title_top).abs() < px(0.5), "level with the title");
+        cx.simulate_mouse_move(to(1000.0), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        assert!(properties_beside(&mut cx));
+        // Back narrower, still in the same drag: stacked again.
+        cx.simulate_mouse_move(to(800.0), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        assert!(properties_stacked(&mut cx));
+        cx.simulate_mouse_move(to(1000.0), Some(gpui::MouseButton::Left), gpui::Modifiers::none());
+        cx.simulate_mouse_up(to(1000.0), gpui::MouseButton::Left, gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(properties_beside(&mut cx), "and it stays where the drag ended");
+
+        // Every property the stacked layout shows, in the same order.
+        for (upper, lower) in [("pane-status", "pane-workflow"), ("pane-workflow", "pane-priority")] {
+            assert!(bounds(&mut cx, upper).bottom() <= bounds(&mut cx, lower).top(), "{upper} over {lower}");
+        }
+        assert!(bounds(&mut cx, "pane-priority").bottom() <= bounds(&mut cx, "pane-row-branch").top());
+        let side = bounds(&mut cx, "pane-side");
+        for value in ["pane-status", "pane-workflow", "pane-priority", "pane-row-branch"] {
+            let b = bounds(&mut cx, value);
+            assert!(side.contains(&b.origin) && b.right() <= side.right(), "{value} in the column: {b:?} in {side:?}");
+        }
+        // The dates stay under the body, as stacked.
+        assert!(bounds(&mut cx, "pane-dates").top() >= bounds(&mut cx, "pane-body").bottom());
+        assert!(bounds(&mut cx, "pane-scroll").contains(&bounds(&mut cx, "pane-dates").origin));
+
+        // A window too narrow for the chosen width shrinks the pane, and
+        // the shrunk pane stacks; the window grown back, it's beside again.
+        cx.simulate_resize(gpui::size(px(800.0), px(1024.0)));
+        assert!(bounds(&mut cx, "task-pane").size.width < px(SPLIT_W));
+        assert!(properties_stacked(&mut cx));
+        cx.simulate_resize(gpui::size(px(1440.0), px(1024.0)));
+        assert!(properties_beside(&mut cx));
+    }
+
+    #[gpui::test]
+    fn the_split_layout_keeps_the_pickers_and_the_keys(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        use crate::views::board_state::Property;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let (view, mut cx) =
+            open_board_sized(cx, vec![issue("A", "todo"), issue("B", "todo")], Some(gpui::size(px(1440.0), px(1024.0))));
+        let events = record(&view, &mut cx);
+        view.update(&mut cx, |v, cx| {
+            v.set_pane_width(960.0, cx);
+            v.open_task("A", cx);
+        });
+        assert!(properties_beside(&mut cx));
+        // Each picker opens under its value in the column.
+        for (value, picker) in [("pane-status", "picker-status-0"), ("pane-workflow", "picker-workflow-0"), ("pane-priority", "picker-priority-0")] {
+            click(&mut cx, value);
+            assert!(drawn(&mut cx, picker), "{value} opens its picker");
+            // Under it, from its left edge, or as near as the window's edge
+            // lets a menu wider than the room right of it.
+            let (at, menu) = (bounds(&mut cx, value), bounds(&mut cx, "property-picker"));
+            let window = px(1440.0) - px(crate::views::floating_pane::EDGE);
+            let from_left = (menu.left() - at.left()).abs() < px(1.0);
+            let at_edge = menu.left() < at.left() && (menu.right() - window).abs() < px(1.0);
+            assert!(menu.top() >= at.bottom() && (menu.top() - at.bottom()) < px(12.0), "{menu:?} under {value} {at:?}");
+            assert!(from_left || at_edge, "{menu:?} under {value} {at:?}");
+            click(&mut cx, value);
+            assert!(!drawn(&mut cx, "property-picker"));
+        }
+        // A choice there is the same command.
+        click(&mut cx, "pane-status");
+        click(&mut cx, "picker-status-2");
+        assert_eq!(*events.borrow(), vec![CommandKind::MoveIssue { id: "A".into(), to_status: "in-progress".into() }]);
+
+        // Tab walks title → Status → Workflow → Priority → body, as stacked.
+        cx.update(|window, _| window.activate_window());
+        let (title, body) = editors(&view, &mut cx);
+        cx.simulate_keystrokes("tab");
+        assert!(title.read_with(&cx, |t, _| t.is_focused()));
+        for property in [Property::Status, Property::Workflow, Property::Priority] {
+            cx.simulate_keystrokes("tab");
+            assert_eq!(view.read_with(&cx, |v, _| v.state.pane_focus()), Some(property));
+        }
+        cx.simulate_keystrokes("tab");
+        assert!(body.read_with(&cx, |b, _| b.is_focused()));
+        assert_eq!(view.read_with(&cx, |v, _| v.state.pane_focus()), None);
+        cx.simulate_keystrokes("shift-tab");
+        assert_eq!(view.read_with(&cx, |v, _| v.state.pane_focus()), Some(Property::Priority));
+    }
+
+    #[gpui::test]
+    fn a_reader_in_the_body_keeps_their_line_as_the_layout_switches(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut a = issue("A", "todo");
+        a.body = (1..=200).map(|n| format!("Paragraph {n} of a long description.\n\n")).collect();
+        let (view, mut cx) = open_board_sized(cx, vec![a], Some(gpui::size(px(1440.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        let offset = |cx: &mut gpui::VisualTestContext| view.read_with(cx, |v, _| v.detail_scroll.offset().y);
+        // Read 600pt down: the body's top is out of sight.
+        view.update(&mut cx, |v, cx| {
+            v.detail_scroll.set_offset(gpui::point(px(0.0), px(-600.0)));
+            cx.notify();
+        });
+        let line = bounds(&mut cx, "pane-body").top();
+        // Wide: the properties leave the stack over the body, and the scroll
+        // follows the body up, so its line stays put.
+        view.update(&mut cx, |v, cx| v.set_pane_width(1000.0, cx));
+        assert!(properties_beside(&mut cx));
+        assert!((bounds(&mut cx, "pane-body").top() - line).abs() < px(1.0), "the body's line stays put");
+        assert!(offset(&mut cx) > px(-600.0), "by scrolling less far: {:?}", offset(&mut cx));
+        // And back.
+        view.update(&mut cx, |v, cx| v.set_pane_width(640.0, cx));
+        assert!(properties_stacked(&mut cx));
+        assert!((bounds(&mut cx, "pane-body").top() - line).abs() < px(1.0));
+        assert!((offset(&mut cx) - px(-600.0)).abs() < px(1.0));
+
+        // At the top, the switch leaves the scroll at the top.
+        view.update(&mut cx, |v, cx| {
+            v.detail_scroll.set_offset(gpui::point(px(0.0), px(0.0)));
+            v.set_pane_width(1000.0, cx);
+        });
+        assert!(properties_beside(&mut cx));
+        view.update(&mut cx, |v, cx| v.set_pane_width(640.0, cx));
+        assert!(properties_stacked(&mut cx));
+        assert_eq!(offset(&mut cx), px(0.0), "the properties are back in view");
     }
 
     #[gpui::test]
