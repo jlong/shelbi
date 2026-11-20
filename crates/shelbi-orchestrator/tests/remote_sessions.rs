@@ -668,6 +668,8 @@ fn edit_starts_a_far_editor_session_the_window_attaches_to_by_name() {
                 Ok(())
             }),
             agent_send: shelbi_orchestrator::agent_send::service(),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
+            import_preview: Arc::new(|_, choice| shelbi_app::tracker_connect::fixture::answer(choice.clone())),
         };
         let reply = shelbi_orchestrator::far::answer_with(&services, &req.project, request);
         let reply = ServerMsg::Reply {

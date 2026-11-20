@@ -49,8 +49,9 @@ use shelbi_app::new_project::{self as np, Tracker};
 use shelbi_app::settings::properties::{
     PropertiesForm, Text, ADVANCED_LABEL, DEFAULT_WORKFLOW_HELP, DEFAULT_WORKFLOW_LABEL, SECONDS, TEXTS, TITLE,
 };
+use shelbi_app::github_setup::{GithubAnswer, GithubRequest};
 use shelbi_app::settings::tracker::{self as tr, TrackerForm};
-use shelbi_app::tracker_connect::{ConnectError, ConnectTracker, Connected};
+use shelbi_app::tracker_connect::{rules_copy, ConnectError, ConnectTracker, Connected};
 use shelbi_app::settings::{Job, Ticket};
 use shelbi_state::workflow_config::WorkflowConfig;
 
@@ -79,6 +80,9 @@ pub(crate) enum TrackerItem {
     ChangeKey,
     Team,
     Filter(Filter),
+    /// The agent rules' toggles (an external tracker only).
+    RequireReview,
+    AssignedOnly,
     Cancel,
     Force,
     Primary,
@@ -89,6 +93,9 @@ pub(crate) enum TrackerItem {
 pub(crate) enum TrackerWork {
     Linear(LinearRequest),
     Connect(ConnectTracker),
+    /// A GitHub read (whose account `gh` is, for the assigned-only rule's
+    /// title).
+    Github(GithubRequest),
 }
 
 /// Its outcome, handed back by [`PropertiesPage::tracker_done`].
@@ -96,6 +103,7 @@ pub(crate) enum TrackerWork {
 pub(crate) enum TrackerDone {
     Linear(LinearAnswer),
     Connected(Result<Connected, ConnectError>),
+    Github(GithubAnswer),
 }
 
 impl TrackerWork {
@@ -104,6 +112,7 @@ impl TrackerWork {
         match self {
             TrackerWork::Linear(req) => TrackerDone::Linear((service.linear)(req)),
             TrackerWork::Connect(req) => TrackerDone::Connected((service.connect)(req)),
+            TrackerWork::Github(req) => TrackerDone::Github((service.github)(req)),
         }
     }
 }
@@ -180,6 +189,9 @@ impl PropertiesPage {
             }
             Tracker::FileSystem => {}
         }
+        if t.shows_rules() {
+            items.extend([TrackerItem::RequireReview, TrackerItem::AssignedOnly]);
+        }
         items.push(TrackerItem::Cancel);
         if t.offers_force() {
             items.push(TrackerItem::Force);
@@ -190,10 +202,13 @@ impl PropertiesPage {
 
     // --- the tracker's work ------------------------------------------------------
 
-    /// Queue the Linear reads the section has due.
+    /// Queue the reads the section has due: Linear's, and GitHub's login.
     fn queue_linear(&mut self) {
         while let Some(req) = self.tracker.linear_due() {
             self.tracker_work.push(TrackerWork::Linear(req));
+        }
+        if let Some(req) = self.tracker.github_due() {
+            self.tracker_work.push(TrackerWork::Github(req));
         }
     }
 
@@ -226,6 +241,10 @@ impl PropertiesPage {
                 let ok = result.is_ok();
                 self.tracker.connected(result);
                 ok
+            }
+            TrackerDone::Github(answer) => {
+                self.tracker.github_answer(answer);
+                false
             }
         };
         self.queue_linear();
@@ -428,6 +447,8 @@ impl PropertiesPage {
             }
             TrackerItem::Team => t.step_team(true),
             TrackerItem::Filter(f) => t.step_filter(f, true),
+            TrackerItem::RequireReview => t.toggle_require_review(),
+            TrackerItem::AssignedOnly => t.toggle_assigned_only(),
             TrackerItem::Cancel => t.cancel(),
             TrackerItem::Force => {
                 if let Some(req) = t.submit(true) {
@@ -706,6 +727,30 @@ impl PropertiesPage {
                 if matches!(self.tracker_typing, Some((TrackerItem::Key, _))) {
                     wrapped(rows, "Enter verifies and stores the key; Esc puts it back.", width, muted);
                 }
+            }
+        }
+        if t.shows_rules() {
+            // The agent rules: a checkbox each, its help under it.
+            rows.push(Row::blank());
+            let rules = t.rules();
+            let assigned = t.assigned_title();
+            for (item, checked, title, help) in [
+                (TrackerItem::RequireReview, rules.require_review, rules_copy::REVIEW_TITLE, rules_copy::REVIEW_HELP),
+                (TrackerItem::AssignedOnly, rules.assigned_only, assigned.as_str(), rules_copy::ASSIGNED_HELP),
+            ] {
+                let mut style = Style::default().fg(if t.editable() { palette().white } else { palette().muted });
+                if on(item) {
+                    style = style.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
+                rows.push(Row {
+                    action: at(item),
+                    focus: on(item),
+                    ..Row::text(Line::from(vec![
+                        Span::styled(if checked { "[x] " } else { "[ ] " }, Style::default().fg(palette().cyan)),
+                        Span::styled(title.to_string(), style),
+                    ]))
+                });
+                wrapped(rows, &format!("    {help}"), width, muted);
             }
         }
         if let Some(e) = t.error() {

@@ -247,6 +247,9 @@ impl Executor for Scenario {
             Effect::LoadReview { .. }
             | Effect::SendFeedback
             | Effect::NewIssue { .. }
+            // The tracker flow is each client's own (the desktop's dialog;
+            // the TUI's Settings page).
+            | Effect::ConnectTracker { .. }
             | Effect::OpenEditor { .. }
             | Effect::Detach
             | Effect::DetachOtherClients
@@ -284,6 +287,7 @@ fn scenario_for(kind: &CommandKind) -> &'static str {
         CommandKind::OpenSettings => "settings_opens_over_the_view_on_the_last_page",
         CommandKind::SendFeedback => "send_feedback_reaches_the_host_and_leaves_the_view",
         CommandKind::NewIssue => "new_issue_opens_the_new_task_dialog_over_the_view",
+        CommandKind::ConnectTracker => "connect_tracker_reaches_the_host_with_a_project",
         CommandKind::OpenAbout => "about_reaches_the_host_with_or_without_a_project",
         CommandKind::OpenAcknowledgements => "acknowledgements_reach_the_host_with_or_without_a_project",
         CommandKind::SwitchProject { .. } => "switch_project_moves_the_client_or_opens_the_switcher",
@@ -341,6 +345,7 @@ fn every_command_kind_has_a_scenario() {
             "action:approve-review:T-9",
             "action:reject-review:T-9",
             "action:new-issue",
+            "action:connect-tracker",
             "action:error-log",
             "action:settings",
             "action:send-feedback",
@@ -588,6 +593,22 @@ fn new_issue_opens_the_new_task_dialog_over_the_view() {
     let mut m = fixture();
     m.project = None;
     assert!(CommandRegistry::new().resolve("action:new-issue", &m).is_none());
+}
+
+#[test]
+fn connect_tracker_reaches_the_host_with_a_project() {
+    let mut s = Scenario::new();
+    s.client.set_view(View::Activity);
+    let want = Effect::ConnectTracker { project: PROJECT.to_string() };
+    assert_eq!(s.invoke("action:connect-tracker"), want);
+    assert_eq!(s.last(), &Performed::Host(want), "the host opens its flow; nothing reaches the daemon yet");
+    assert_eq!(s.client.view(), &View::Activity, "the view under the flow stays");
+    assert_eq!(s.client.overlay(), None);
+
+    // There's nothing to connect without a project.
+    let mut m = fixture();
+    m.project = None;
+    assert!(CommandRegistry::new().resolve("action:connect-tracker", &m).is_none());
 }
 
 #[test]

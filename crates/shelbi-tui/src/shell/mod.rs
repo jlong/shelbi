@@ -90,6 +90,7 @@ use review::{ReviewAction, ReviewInterface};
 use session::{gave_up_notice, LiveConnector, MainState, SessionManager, SessionRef};
 use settings::workspaces::PoolReader;
 use settings::{SettingsAction, SettingsShell};
+use shelbi_app::settings::SettingsPage;
 use shelbi_app::settings::keybindings::Change as KeysChange;
 use shelbi_app::settings::workspace_form::{Outcome as PoolOutcome, PoolService};
 use shelbi_app::settings::workspaces::PoolIndex;
@@ -1805,7 +1806,9 @@ impl ShellState {
         let tracker_service: TrackerServiceFor = Arc::new(|_: &str| shelbi_app::settings::tracker::TrackerService {
             connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("tests connect nothing".into()))),
             linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
+            preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
         });
         #[cfg(not(test))]
         let orchestrator_restarter: OrchestratorRestarter =
@@ -3316,14 +3319,25 @@ impl ShellState {
     /// stops: the sessions stay attached and keep streaming, a review or
     /// workspace interface stays built, and Back returns to all of it.
     fn open_settings(&mut self) {
+        self.open_settings_at(None);
+    }
+
+    /// Open Settings on `page` (else the page last shown). Already open, it
+    /// moves to `page` the way the sidebar does (through the unsaved-edits
+    /// prompt).
+    fn open_settings_at(&mut self, page: Option<SettingsPage>) {
         if self.settings_open() {
+            if let Some(page) = page {
+                let action = self.settings.request(settings::Leave::Page(page));
+                self.apply_settings_action(action);
+            }
             return;
         }
         self.settings_return = Some(SettingsReturn {
             focus: self.client.focus(),
             selection: self.client.sidebar_selection(),
         });
-        self.settings.open();
+        self.settings.open(page);
         self.settings.project_shown(self.client.project());
         // Read again on every visit: config.yaml may have changed outside.
         self.load_settings(true);
@@ -4700,6 +4714,9 @@ impl ShellState {
             Effect::Mutate(m @ Mutation::AddIssue { .. }) => self.spawn_mutation(m, "added", "add failed"),
             // New task, over whatever is showing, on the board's workflows.
             Effect::NewIssue { project } => self.open_new_task(&project),
+            // The desktop's guided flow is a dialog; here the Issue tracker
+            // section on Settings ▸ Properties connects GitHub or Linear.
+            Effect::ConnectTracker { .. } => self.open_settings_at(Some(SettingsPage::Properties)),
             Effect::Mutate(m @ Mutation::PrioritizeIssue { .. }) => {
                 self.spawn_mutation(m, "reordered", "reorder failed")
             }
@@ -11787,6 +11804,21 @@ mod tests {
     }
 
     #[test]
+    fn connect_tracker_opens_settings_on_the_properties_page() {
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::ConnectTracker { project: "app".into() });
+        assert!(st.settings_open());
+        assert_eq!(st.settings.page(), SettingsPage::Properties, "the Issue tracker section's page");
+        assert_eq!(st.settings.region(), settings::Region::Page, "the keys go to the page");
+        // Already open on another page, it moves there.
+        let mut st = settings_state();
+        st.dispatch_effect(Effect::OpenSettings);
+        assert_eq!(st.settings.page(), SettingsPage::General);
+        st.dispatch_effect(Effect::ConnectTracker { project: "app".into() });
+        assert_eq!(st.settings.page(), SettingsPage::Properties);
+    }
+
+    #[test]
     fn esc_closes_the_innermost_first_and_typing_in_the_switcher_stays_in_it() {
         let mut st = settings_state();
         st.dispatch_effect(Effect::OpenSettings);
@@ -13062,7 +13094,9 @@ mod tests {
                     })
                 }),
                 linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+                github: Arc::new(shelbi_app::github_setup::fixture::answer),
                 sync_statuses: Arc::new(|| StatusSync::Synced("6 statuses from the Linear team".into())),
+                preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
             }
         })
     }
@@ -13136,10 +13170,22 @@ mod tests {
             "Change key…",
             "ENG  Engineering",
             "Shelbi shows and creates issues in ENG, assigned to you.",
+            "[ ] Always require human review before beginning work",
+            "You must move them out of the backlog status",
+            "[x] Only work on issues assigned to me (Ada Lovelace <ada@example.com>)",
+            "Issues must be assigned to your user before work begins.",
             "[ Connect ]",
         ] {
             assert!(text.contains(want), "{want:?} on the page:\n{text}");
         }
+        // The rules toggle with Enter and ride with the connection.
+        cursor_to(&mut st, Item::Tracker(TrackerItem::RequireReview));
+        press(&mut st, KeyCode::Enter);
+        cursor_to(&mut st, Item::Tracker(TrackerItem::AssignedOnly));
+        press(&mut st, KeyCode::Enter);
+        let text = capture_screen(&mut st, "settings-tracker-rules");
+        assert!(text.contains("[x] Always require human review"), "{text}");
+        assert!(text.contains("[ ] Only work on issues assigned to me"), "{text}");
 
         // Connect: refused, with the migrate hint and Switch anyway.
         cursor_to(&mut st, Item::Tracker(TrackerItem::Primary));
@@ -13157,6 +13203,35 @@ mod tests {
         assert!(!asked[0].force && asked[1].force);
         let shelbi_app::tracker_connect::TrackerChoice::Linear(conn) = &asked[1].choice else { panic!("{asked:?}") };
         assert_eq!((conn.team.as_str(), conn.assignee.as_deref()), ("ENG", Some("me")));
+        assert_eq!(
+            asked[1].rules,
+            Some(shelbi_core::AgentRules { require_review: true, assigned_only: false })
+        );
+        drop(home);
+    }
+
+    #[test]
+    fn the_tracker_sections_rules_name_the_github_account_and_hide_for_the_local_board() {
+        use settings::properties::{Item, TrackerItem};
+        use shelbi_app::new_project::Tracker;
+        let home = agents_home("tracker-rules");
+        let mut st = test_state_with(Arc::new(RecordingLifecycle::default()));
+        st.workflows_reader = Arc::new(shelbi_app::settings::workflows::load);
+        let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+        st.tracker_service = recording_tracker(asked);
+        st.dispatch_effect(Effect::OpenSettings);
+        type_key(&mut st, '4');
+        settle_agents(&mut st, "the config loads", |st| st.settings.properties().tracker().loaded());
+        press(&mut st, KeyCode::Tab);
+        // The local board has no rules to show.
+        assert!(!st.settings.properties().items().contains(&Item::Tracker(TrackerItem::AssignedOnly)));
+        cursor_to(&mut st, Item::Tracker(TrackerItem::Choice(Tracker::FileSystem)));
+        press(&mut st, KeyCode::Right);
+        assert_eq!(st.settings.properties().tracker().tracker(), Tracker::Github);
+        settle_agents(&mut st, "the gh login loads", |st| st.settings.properties().tracker().account().is_some());
+        let text = capture_screen(&mut st, "settings-tracker-github-rules");
+        assert!(text.contains("[x] Only work on issues assigned to me (octocat)"), "{text}");
+        assert!(text.contains("[ ] Always require human review before beginning work"), "{text}");
         drop(home);
     }
 
@@ -13170,7 +13245,9 @@ mod tests {
         st.tracker_service = Arc::new(|_: &str| shelbi_app::settings::tracker::TrackerService {
             connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("unused".into()))),
             linear: Arc::new(shelbi_app::linear_setup::fixture::no_key),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
+            preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
         });
         st.dispatch_effect(Effect::OpenSettings);
         type_key(&mut st, '4');
@@ -13192,7 +13269,9 @@ mod tests {
         st.tracker_service = Arc::new(|_: &str| shelbi_app::settings::tracker::TrackerService {
             connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("unused".into()))),
             linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| shelbi_app::tracker_connect::StatusSync::NotNeeded),
+            preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
         });
         press(&mut st, KeyCode::Enter);
         settle_agents(&mut st, "the key is stored and the teams load", |st| {

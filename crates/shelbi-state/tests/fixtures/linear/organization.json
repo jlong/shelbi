@@ -1,0 +1,9 @@
+{
+  "data": {
+    "organization": {
+      "id": "org-example",
+      "name": "Example workspace",
+      "urlKey": "example"
+    }
+  }
+}

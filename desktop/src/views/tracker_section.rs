@@ -9,8 +9,15 @@
 //!  (•) Local board   ( ) GitHub Issues   ( ) Linear
 //!  ...the chosen board's fields...
 //!  Shelbi shows and creates issues in ENG, assigned to you.
+//!  [ ] Always require human review before beginning work
+//!      You must move them out of the backlog status before work begins. ...
+//!  [x] Only work on issues assigned to me (ada)
+//!      Issues must be assigned to your user before work begins.
 //!                                               [Cancel] [Connect]
 //! ```
+//!
+//! The two agent rules (`issue_tracker.agent_rules`) show for an external
+//! tracker only, and save with the connection like its fields.
 //!
 //! Nothing is written until Connect (Save for the same board's new
 //! filters): the connection runs off the UI thread through the section's
@@ -27,6 +34,7 @@ use shelbi_app::new_project::{self as np, Tracker};
 use shelbi_app::settings::tracker::{
     self as tr, choice_title, TrackerForm, TrackerService, CANCEL, CHOICES, SWITCH_ANYWAY,
 };
+use shelbi_app::tracker_connect::rules_copy;
 use shelbi_core::IssueTrackerConfig;
 
 use super::add_project::radio;
@@ -124,6 +132,65 @@ impl TrackerSection {
         while let Some(request) = self.form.linear_due() {
             self.spawn_linear(request, window, cx);
         }
+        if let Some(request) = self.form.github_due() {
+            let github = self.service.github.clone();
+            let task = cx.background_executor().spawn(async move { github(request) });
+            cx.spawn_in(window, async move |this, cx| {
+                let answer = task.await;
+                this.update_in(cx, |this, _, cx| {
+                    this.form.github_answer(answer);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
+    }
+
+    /// Flip an agent rule (a checkbox click).
+    pub fn toggle_rule(&mut self, assigned_only: bool, cx: &mut Context<Self>) {
+        if assigned_only {
+            self.form.toggle_assigned_only();
+        } else {
+            self.form.toggle_require_review();
+        }
+        cx.notify();
+    }
+
+    /// The agent rules: a checkbox each, its help under it.
+    fn rules(&self, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
+        let rules = self.form.rules();
+        let editable = self.form.editable();
+        let assigned = self.form.assigned_title();
+        let rule = |id: &'static str, title: String, help: &'static str, on: bool, assigned_only: bool, cx: &mut Context<Self>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    controls::checkbox(id, title, on, false, theme)
+                        .role(Role::CheckBox)
+                        .aria_selected(on)
+                        .when(!editable, |d| d.opacity(0.6))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_rule(assigned_only, cx))),
+                )
+                .child(div().pl(px(30.0)).type_style(Type::Small).text_color(theme.form_hint).child(help))
+        };
+        div()
+            .debug_selector(|| "tracker-rules".into())
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .max_w(px(640.0))
+            .child(rule(
+                "tracker-rule-review",
+                rules_copy::REVIEW_TITLE.to_string(),
+                rules_copy::REVIEW_HELP,
+                rules.require_review,
+                false,
+                cx,
+            ))
+            .child(rule("tracker-rule-assigned", assigned, rules_copy::ASSIGNED_HELP, rules.assigned_only, true, cx))
     }
 
     fn spawn_linear(&mut self, request: LinearRequest, window: &mut Window, cx: &mut Context<Self>) {
@@ -289,6 +356,8 @@ impl Render for TrackerSection {
             .max_w(px(640.0))
             .into_any_element(),
         };
+        let rules = form.shows_rules().then(|| self.rules(&theme, cx));
+        let form = &self.form;
         let error = form.error().map(|e| {
             div()
                 .debug_selector(|| "tracker-error".into())
@@ -340,6 +409,7 @@ impl Render for TrackerSection {
             )
             .child(radios)
             .child(body)
+            .children(rules)
             .children(error)
             .child(
                 div()

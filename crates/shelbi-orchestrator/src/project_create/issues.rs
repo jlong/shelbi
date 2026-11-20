@@ -159,7 +159,7 @@ pub fn github_preflight<P: GhProbe + ?Sized>(
 /// Classify a failed `gh api repos/...` call from its stderr. Auth failures and
 /// a missing/invisible repo get their own actionable variant; anything else is
 /// surfaced verbatim rather than guessed at.
-fn classify_api_failure(repo: &str, stderr: &str) -> GithubPreflightError {
+pub(crate) fn classify_api_failure(repo: &str, stderr: &str) -> GithubPreflightError {
     let lower = stderr.to_ascii_lowercase();
     if lower.contains("gh auth login")
         || lower.contains("not logged")

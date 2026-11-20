@@ -26,6 +26,12 @@
 //!  Create one in Linear: Settings > Account > Security & access > ...
 //! ```
 //!
+//! Connect to an Issue tracker's "Choose your Linear project" step
+//! (`views/tracker_connect.rs`) lays the same pickers out its own way
+//! ([`connect_fields`]): the key's Workspace (read-only), Team as
+//! `Name · KEY`, and Project from "Any project", stacked at the frame's
+//! width, with no label or assignee filter. Its key entry is [`key_entry`].
+//!
 //! The host keeps the choice, the key field and which picker is open
 //! ([`LinearUi`]), and hands in what a click does ([`Handlers`]); it runs
 //! the reads the choice asks for (`LinearChoice::due`) itself.
@@ -34,8 +40,9 @@ use gpui::{div, prelude::*, px, AnyElement, App, ClickEvent, Context, Div, Entit
 use gpui_kit::component::input::{Input, InputState};
 use shelbi_app::linear_setup::{
     Filter, KeyState, LinearChoice, Loadable, PickOption, ACCOUNT_LABEL, CHANGE_KEY, CHOOSE_TEAM, FILTERS_HELP,
-    KEY_HELP, KEY_PLACEHOLDER, LOADING, NOT_CONNECTED, TEAM_LABEL, VERIFY,
+    KEY_HELP, KEY_MISSING, KEY_PLACEHOLDER, LOADING, NOT_CONNECTED, PROJECT_LABEL, TEAM_LABEL, VERIFY,
 };
+use shelbi_app::tracker_connect::flow::{ANY_PROJECT, WORKSPACE_LABEL};
 
 use super::harness_picker::picker_button;
 use super::workflow_editor::{dropdown, footnote};
@@ -70,6 +77,8 @@ pub enum Msg {
 pub enum Host {
     AddProject,
     Settings,
+    /// Connect to an Issue tracker's Choose your Linear project step.
+    Connect,
 }
 
 impl Host {
@@ -77,6 +86,7 @@ impl Host {
         match self {
             Host::AddProject => "add-project-linear",
             Host::Settings => "tracker-linear",
+            Host::Connect => "tracker-connect-linear",
         }
     }
 
@@ -91,6 +101,10 @@ impl Host {
             (Host::Settings, Pick::Filter(Filter::Project)) => "tracker-linear-project",
             (Host::Settings, Pick::Filter(Filter::Label)) => "tracker-linear-label",
             (Host::Settings, Pick::Filter(Filter::Assignee)) => "tracker-linear-assignee",
+            (Host::Connect, Pick::Team) => "tracker-connect-linear-team",
+            (Host::Connect, Pick::Filter(Filter::Project)) => "tracker-connect-linear-project",
+            (Host::Connect, Pick::Filter(Filter::Label)) => "tracker-connect-linear-label",
+            (Host::Connect, Pick::Filter(Filter::Assignee)) => "tracker-connect-linear-assignee",
         }
     }
 
@@ -104,6 +118,10 @@ impl Host {
             (Host::Settings, Pick::Filter(Filter::Project)) => "tracker-linear-project-menu",
             (Host::Settings, Pick::Filter(Filter::Label)) => "tracker-linear-label-menu",
             (Host::Settings, Pick::Filter(Filter::Assignee)) => "tracker-linear-assignee-menu",
+            (Host::Connect, Pick::Team) => "tracker-connect-linear-team-menu",
+            (Host::Connect, Pick::Filter(Filter::Project)) => "tracker-connect-linear-project-menu",
+            (Host::Connect, Pick::Filter(Filter::Label)) => "tracker-connect-linear-label-menu",
+            (Host::Connect, Pick::Filter(Filter::Assignee)) => "tracker-connect-linear-assignee-menu",
         }
     }
 
@@ -312,6 +330,7 @@ fn account<V: 'static>(
     let (note, color) = match choice.key_error() {
         Some(why) => (why.to_string(), theme.error),
         None if choice.changing_key() => ("Paste the new key. The current one stays until it's verified.".into(), theme.form_hint),
+        None if host == Host::Connect => (KEY_MISSING.to_string(), theme.form_hint),
         None => (NOT_CONNECTED.to_string(), theme.form_hint),
     };
     let control = div()
@@ -338,6 +357,102 @@ fn account<V: 'static>(
                 .children(cancel),
         );
     field(ACCOUNT_LABEL, control, Some(KEY_HELP.into()), theme)
+}
+
+/// The key field (with Verify, and Cancel over a working key) while
+/// `choice` has no working key or Change key… opened it: Connect to an
+/// Issue tracker's Change account.
+#[allow(clippy::too_many_arguments)]
+pub fn key_entry<V: 'static>(
+    host: Host,
+    choice: &LinearChoice,
+    ui: &LinearUi,
+    enabled: bool,
+    on: Handlers<V>,
+    theme: &Theme,
+    window: &Window,
+    cx: &mut Context<V>,
+) -> Div {
+    account(host, choice, ui, enabled, on, theme, window, cx)
+}
+
+/// The Choose your Linear project step's pickers, each `width` wide:
+/// Workspace (the key's, read-only), Team (required, `Name · KEY`) and
+/// Project ("Any project" first).
+#[allow(clippy::too_many_arguments)]
+pub fn connect_fields<V: 'static>(
+    choice: &LinearChoice,
+    ui: &LinearUi,
+    enabled: bool,
+    on: Handlers<V>,
+    width: f32,
+    theme: &Theme,
+    cx: &mut Context<V>,
+) -> Div {
+    let host = Host::Connect;
+    let (workspace, faded) = match choice.workspace() {
+        Loadable::Loaded(name) => (name.clone(), false),
+        Loadable::Failed(_) => ("Couldn't load".to_string(), true),
+        Loadable::Idle | Loadable::Loading => (LOADING.to_string(), true),
+    };
+    let workspace = picker_button("tracker-connect-linear-workspace", workspace, None, false, theme)
+        .aria_label(WORKSPACE_LABEL)
+        .cursor_default()
+        .when(faded, |d| d.opacity(0.6));
+
+    // Team: `Name · KEY`.
+    let team_row = |row: &PickOption| PickOption {
+        label: match row.detail.as_deref().filter(|d| !d.is_empty()) {
+            Some(name) => format!("{name} · {}", row.label),
+            None => row.label.clone(),
+        },
+        detail: None,
+        ..row.clone()
+    };
+    let teams = choice.teams();
+    let picked = choice.team_option().map(team_row);
+    let mut label = shown(teams, picked.as_ref(), CHOOSE_TEAM);
+    if choice.needs_key() && teams.loaded().is_none() {
+        label = (KEY_FIRST.to_string(), None);
+    }
+    let rows = teams.loaded().map(|rows| rows.iter().map(team_row).collect());
+    let team = picker(host, Pick::Team, rows, picked, label, ui.menu == Some(Pick::Team), false, enabled, ui, on, width, theme, cx);
+    let team_error = teams
+        .error()
+        .filter(|_| !choice.needs_key())
+        .map(|e| error_text(host.id("teams-error"), format!("Couldn't load the teams: {e}"), theme));
+
+    // Project: "Any project", then the team's.
+    let project_row = |row: PickOption| {
+        if row.value.is_empty() {
+            PickOption { label: ANY_PROJECT.into(), ..row }
+        } else {
+            PickOption { detail: None, ..row }
+        }
+    };
+    let list = choice.filter_options(Filter::Project);
+    let picked = choice.filter_option(Filter::Project).map(project_row);
+    let mut label = (shown(&list, picked.as_ref(), ANY_PROJECT).0, None);
+    if picked.is_none() && list.loaded().is_some() {
+        label = (choice.filter(Filter::Project).unwrap_or(ANY_PROJECT).to_string(), None);
+    }
+    let rows = list.loaded().map(|rows| rows.iter().cloned().map(project_row).collect());
+    let pick = Pick::Filter(Filter::Project);
+    let project = picker(host, pick, rows, picked, label, ui.menu == Some(pick), false, enabled, ui, on, width, theme, cx);
+    let project_error =
+        list.error().map(|e| error_text(SharedString::from(format!("{}-error", host.pick_id(pick))), e.to_string(), theme));
+    let failed = teams.error().is_some() || list.error().is_some() || choice.workspace().error().is_some();
+
+    div()
+        .debug_selector(move || host.prefix().into())
+        .flex()
+        .flex_col()
+        .gap(px(16.0))
+        .w(px(width))
+        .child(field(WORKSPACE_LABEL, workspace, None, theme).gap(px(8.0)))
+        .child(field(TEAM_LABEL, team, None, theme).gap(px(8.0)).children(team_error))
+        .child(field(PROJECT_LABEL, project, None, theme).gap(px(8.0)).children(project_error))
+        .children((failed && !choice.needs_key()).then(|| retry(host, enabled, on, theme, cx)))
 }
 
 /// The team picker while there's no working key.

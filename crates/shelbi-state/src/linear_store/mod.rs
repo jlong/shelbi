@@ -61,6 +61,7 @@
 //! error naming when calls resume.
 
 mod mapping;
+pub mod preview;
 
 #[cfg(test)]
 pub(crate) mod tests;

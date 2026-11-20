@@ -2550,6 +2550,152 @@ impl Run {
     /// 2481:8810), `add-project-defaults` (the Agent defaults, Claude Code on
     /// its default model, 2720:33054) and `add-project-settings-in-repo` /
     /// `-global` (each card selected, 2483:8653 / 2483:8897).
+    /// Connect to an Issue tracker (`tracker-connect`, Figma 2753:11686):
+    /// the chooser (2753:12002), with GitHub connected (2780:35199), and
+    /// Choose your GitHub / Linear project (2753:12004 / 2753:12006), picked
+    /// and before `gh` is signed in or a Linear key is stored.
+    /// `SHELBI_VISUAL_ONLY=tracker-connect` renders just these.
+    fn tracker_connect_windows(&mut self) {
+        use crate::views::tracker_connect::{TrackerConnectView, SIZE};
+        use shelbi_app::new_project::Tracker;
+        use shelbi_app::source::{ProjectHandle, ProjectKey};
+        use shelbi_app::tracker_connect::flow::Step;
+        use shelbi_app::tracker_connect::StatusSync;
+        use shelbi_core::{GithubConnection, IssueTrackerBackend, IssueTrackerConfig};
+
+        let service = shelbi_app::settings::tracker::TrackerService {
+            connect: Arc::new(|_| Err(shelbi_app::tracker_connect::ConnectError::Failed("offscreen".into()))),
+            linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
+            sync_statuses: Arc::new(|| StatusSync::NotNeeded),
+            preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
+        };
+        let github = IssueTrackerConfig {
+            backend: IssueTrackerBackend::Github,
+            github: Some(GithubConnection { repo: "jlong/shelbi".into() }),
+            ..IssueTrackerConfig::default()
+        };
+        type Edit = fn(&mut shelbi_app::tracker_connect::flow::TrackerFlow);
+        let none: Edit = |_| {};
+        let repo: Edit = |f| f.set_repo("octocat/shelbi");
+        let team: Edit = |f| f.linear_mut().select_team("ENG");
+        // Screen, the project's connection, the card connected, an edit, and
+        // whether the machine is signed out of gh and Linear.
+        let states: [(&str, IssueTrackerConfig, Option<Tracker>, Edit, bool); 8] = [
+            ("tracker-select", IssueTrackerConfig::default(), None, none, false),
+            ("tracker-connected", github, None, none, false),
+            ("tracker-github-choose", IssueTrackerConfig::default(), Some(Tracker::Github), none, false),
+            ("tracker-github-picked", IssueTrackerConfig::default(), Some(Tracker::Github), repo, false),
+            ("tracker-github-signed-out", IssueTrackerConfig::default(), Some(Tracker::Github), none, true),
+            ("tracker-linear-choose", IssueTrackerConfig::default(), Some(Tracker::Linear), none, false),
+            ("tracker-linear-picked", IssueTrackerConfig::default(), Some(Tracker::Linear), team, false),
+            ("tracker-linear-no-key", IssueTrackerConfig::default(), Some(Tracker::Linear), none, true),
+        ];
+        for (screen, cfg, connect, edit, signed_out) in states {
+            let mut service = service.clone();
+            if signed_out {
+                service.github = Arc::new(shelbi_app::github_setup::fixture::signed_out);
+                service.linear = Arc::new(shelbi_app::linear_setup::fixture::no_key);
+            }
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                    cx.new(|cx| {
+                        let project = ProjectHandle::null(ProjectKey::local("my-project"));
+                        TrackerConnectView::new(project, service, None, window, cx)
+                    })
+                })
+                .expect("open the offscreen window");
+            let view = handle.entity(&self.cx).expect("the view");
+            let window: AnyWindowHandle = handle.into();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |v, cx| {
+                        v.loaded(Ok(cfg), window, cx);
+                        if let Some(tracker) = connect {
+                            v.edit_flow(|f| { f.connect(tracker); }, window, cx);
+                            v.edit_flow(edit, window, cx);
+                        }
+                    })
+                })
+                .unwrap();
+            self.settle_sheet(window);
+            self.settle_sheet(window);
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+
+        // The later steps (04-agent-rules, 06-review-import, 07-importing):
+        // a choice made, then Continue pressed `steps` times, each answered.
+        let mut writes = service.clone();
+        writes.connect = Arc::new(|req| {
+            Ok(shelbi_app::tracker_connect::Connected {
+                backend: req.choice.backend(),
+                previous: IssueTrackerBackend::FileSystem,
+                file: "my-project.yaml".into(),
+                summary: "the tracker".into(),
+                statuses: if req.choice.backend() == IssueTrackerBackend::Linear {
+                    StatusSync::Synced("6 statuses".into())
+                } else {
+                    StatusSync::NotNeeded
+                },
+            })
+        });
+        let later: [(&str, Tracker, Edit, usize); 5] = [
+            ("tracker-rules", Tracker::Linear, team, 1),
+            ("tracker-rules-github", Tracker::Github, repo, 1),
+            ("tracker-review", Tracker::Github, repo, 2),
+            ("tracker-review-linear", Tracker::Linear, team, 2),
+            ("tracker-importing", Tracker::Linear, team, 3),
+        ];
+        for (screen, tracker, edit, steps) in later {
+            let service = writes.clone();
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                    cx.new(|cx| {
+                        let project = ProjectHandle::null(ProjectKey::local("my-project"));
+                        TrackerConnectView::new(project, service, None, window, cx)
+                    })
+                })
+                .expect("open the offscreen window");
+            let view = handle.entity(&self.cx).expect("the view");
+            let window: AnyWindowHandle = handle.into();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |v, cx| {
+                        v.loaded(Ok(IssueTrackerConfig::default()), window, cx);
+                        v.edit_flow(|f| { f.connect(tracker); }, window, cx);
+                    })
+                })
+                .unwrap();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.edit_flow(edit, window, cx)))
+                .unwrap();
+            self.settle_sheet(window);
+            for _ in 0..steps {
+                self.cx
+                    .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.edit_flow(|f| { f.advance(); }, window, cx)))
+                    .unwrap();
+                self.settle_sheet(window);
+                self.settle_sheet(window);
+            }
+            self.settle_sheet(window);
+            let want = match steps {
+                1 => Step::AgentRules,
+                2 => Step::ReviewImport,
+                _ => Step::Importing,
+            };
+            let at = view.read_with(&self.cx, |v, _| v.flow().step());
+            self.expect(&format!("{screen}: on {want:?} (on {at:?})"), at == want);
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+    }
+
     /// `SHELBI_VISUAL_ONLY=add-project` renders just these.
     fn add_project_windows(&mut self) {
         use crate::views::add_project::{AddProjectView, Engine, SIZE};
@@ -2832,7 +2978,9 @@ impl Run {
                 }
             }),
             linear: Arc::new(linear),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| StatusSync::NotNeeded),
+            preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
         };
         let tracker_states: [(&str, Answer, bool, bool); 3] = [
             ("settings-tracker-linear", fixture::answer, true, false),
@@ -3344,6 +3492,11 @@ impl Run {
 
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "add-project") {
             self.add_project_windows();
+            return;
+        }
+
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "tracker-connect") {
+            self.tracker_connect_windows();
             return;
         }
 

@@ -960,6 +960,7 @@ pub enum HostCall {
     OpenSettings,
     SendFeedback,
     NewIssue,
+    ConnectTracker,
     OpenAbout,
     OpenAcknowledgements,
     OpenAddProject,
@@ -1063,6 +1064,9 @@ impl CommandHost for Vec<HostCall> {
     }
     fn new_issue(&mut self) {
         self.push(HostCall::NewIssue);
+    }
+    fn connect_tracker(&mut self) {
+        self.push(HostCall::ConnectTracker);
     }
     fn open_about(&mut self) {
         self.push(HostCall::OpenAbout);
@@ -3917,6 +3921,7 @@ impl ShelbiWindow {
             HostCall::OpenSettings => self.open_settings(None, window, cx),
             HostCall::SendFeedback => self.open_feedback(window, cx),
             HostCall::NewIssue => self.open_new_task(window, cx),
+            HostCall::ConnectTracker => self.open_tracker_connect(window, cx),
             // After this update, so the window's first frame isn't nested in
             // ours (as New Window).
             HostCall::OpenAbout => cx.defer(crate::views::about::show_about),
@@ -4302,6 +4307,7 @@ impl ShelbiWindow {
             // A drag of the task pane's edge ended: the window keeps the
             // width, like the sidebar's.
             IssuesEvent::PaneWidth(width) => this.pane_width_chosen(*width, cx),
+            IssuesEvent::OpenSettings(page) => this.open_settings(Some(*page), window, cx),
         });
         self._view_subscriptions.push(sub);
         let sub = cx.observe_in(&issues, window, |this, _, window, cx| this.sync_detail_over(window, cx));
@@ -6453,6 +6459,50 @@ impl ShelbiWindow {
         .detach();
     }
 
+    /// `ConnectTracker`: the Connect to Issue Tracker window for this
+    /// window's project (or its open one to the front), on this machine or
+    /// through the far link.
+    fn open_tracker_connect(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let from = window.window_handle().downcast::<ShelbiWindow>();
+        let handle = self.project_handle.clone();
+        // After this update, so the flow's first frame isn't nested in ours.
+        cx.defer(move |cx| crate::views::tracker_connect::show(handle, from, cx));
+    }
+
+    /// The tracker flow wrote a connection: the board reads again, so its
+    /// header, menu and cards follow it, and with `watch` it watches for the
+    /// import (its first read of the new tracker), which the flow's
+    /// Importing step and the board's toast follow. The board is made if
+    /// this window hasn't shown it yet, so the import is read either way.
+    /// `view_board` (the flow's View board) also brings this window up on
+    /// the board.
+    pub(crate) fn tracker_connected(
+        &mut self,
+        view_board: bool,
+        watch: Option<Entity<shelbi_app::tracker_connect::ImportWatch>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let issues = match (&self.issues, &watch) {
+            (Some(issues), _) => Some(issues.clone()),
+            (None, Some(_)) => Some(self.ensure_issues(window, cx)),
+            (None, None) => None,
+        };
+        if let Some(issues) = issues {
+            issues.update(cx, |view, cx| {
+                if let Some(watch) = watch {
+                    view.watch_import(watch, cx);
+                }
+                view.reload(cx);
+            });
+        }
+        if view_board {
+            window.activate_window();
+            self.run(CommandKind::ShowView(View::Issues), window, cx);
+        }
+        cx.notify();
+    }
+
     /// `AddProject`: the Add Project wizard's window (or the open one to
     /// the front). This window is where a created project opens.
     fn open_add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -8207,6 +8257,10 @@ mod nav_focus_tests;
 #[cfg(test)]
 #[path = "app_toast_tests.rs"]
 mod toast_tests;
+
+#[cfg(test)]
+#[path = "app_tracker_connect_tests.rs"]
+mod tracker_connect_tests;
 
 #[cfg(test)]
 #[path = "app_notice_tests.rs"]

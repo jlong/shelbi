@@ -53,6 +53,8 @@ pub trait CommandHost {
     fn send_feedback(&mut self);
     /// Open New task over the window.
     fn new_issue(&mut self);
+    /// Open Connect to an Issue tracker for the window's project.
+    fn connect_tracker(&mut self);
     /// Show the About Shelbi window (or the open one to the front).
     fn open_about(&mut self);
     /// Show the Acknowledgements window (or the open one to the front).
@@ -108,6 +110,10 @@ pub fn dispatch_command(kind: &CommandKind, host: &mut impl CommandHost) {
         // The board's New issue and `n`, File ▸ New Issue… and the
         // palette's entry: New task, over the window.
         CommandKind::NewIssue => host.new_issue(),
+        // The Issues header's ⋮ ▸ Connect to issue tracker…, File ▸ Connect
+        // to Issue Tracker… and the palette's entry: the guided flow's
+        // window, on this window's project.
+        CommandKind::ConnectTracker => host.connect_tracker(),
         // Shelbi ▸ About Shelbi: its own small window.
         CommandKind::OpenAbout => host.open_about(),
         // About's Acknowledgements link, Help ▸ Acknowledgements: its own
@@ -187,6 +193,9 @@ pub fn sends_to_daemon(kind: &CommandKind) -> bool {
         CommandKind::SendFeedback => false,
         // Opens the dialog; its Create Task is its own add.
         CommandKind::NewIssue => false,
+        // Opens the flow; its connection is its own request (and it reads
+        // the project's config over the window's source).
+        CommandKind::ConnectTracker => false,
         // Only shows this build's version and the project's links.
         CommandKind::OpenAbout => false,
         // Only shows the bundled software's licenses, built in.
@@ -317,6 +326,9 @@ mod tests {
         fn new_issue(&mut self) {
             self.0.push("new-issue".into());
         }
+        fn connect_tracker(&mut self) {
+            self.0.push("connect-tracker".into());
+        }
         fn open_about(&mut self) {
             self.0.push("about".into());
         }
@@ -396,6 +408,7 @@ mod tests {
             (CommandKind::OpenSettings, "settings"),
             (CommandKind::SendFeedback, "send-feedback"),
             (CommandKind::NewIssue, "new-issue"),
+            (CommandKind::ConnectTracker, "connect-tracker"),
             (CommandKind::OpenAbout, "about"),
             (CommandKind::OpenAcknowledgements, "acknowledgements"),
             (
@@ -527,6 +540,7 @@ mod tests {
                 "settings",
                 "send-feedback",
                 "new-issue",
+                "connect-tracker",
                 "about",
                 "acknowledgements",
                 "connect-remote",

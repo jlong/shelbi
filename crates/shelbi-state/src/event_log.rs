@@ -1957,14 +1957,29 @@ pub fn append_task_event(
 /// rules can skip a teammate's work on a shared remote tracker without another
 /// call. Read from the board index with no API call; omitted on a filesystem
 /// board (no ownership) and for an issue the open index doesn't carry.
+///
+/// An unassigned issue that starting would claim (`assigned_only` off) is
+/// followed by [`crate::ownership::CLAIM_ON_START`] (`owner=unassigned
+/// claim=on_start`).
 fn with_owner_token(body: String, project: &str, task_id: &str) -> String {
     match crate::ownership::event_owner_token(project, task_id) {
         // Each login is sanitized on its own so the `,` between co-assignees
         // survives (`sanitize_field` would fold it to `_`).
-        Some(owner) => format!(
-            "{body} owner={}",
-            owner.split(',').map(sanitize_field).collect::<Vec<_>>().join(",")
-        ),
+        Some(token) => {
+            let (owner, claim) = match token.split_once(' ') {
+                Some((owner, claim)) => (owner, Some(claim)),
+                None => (token.as_str(), None),
+            };
+            let mut line = format!(
+                "{body} owner={}",
+                owner.split(',').map(sanitize_field).collect::<Vec<_>>().join(",")
+            );
+            if claim == Some(crate::ownership::CLAIM_ON_START) {
+                line.push(' ');
+                line.push_str(crate::ownership::CLAIM_ON_START);
+            }
+            line
+        }
         None => body,
     }
 }

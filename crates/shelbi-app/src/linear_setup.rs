@@ -28,7 +28,10 @@
 //!    [`TEAM_REQUIRED`]): the key works, every filter resolves, and the key
 //!    can create issues in the team. Continue moves on once the connection
 //!    as chosen now has passed ([`LinearChoice::ready`]).
-//! 4. [`LinearRequest::Viewer`] once nothing else is due and the key works
+//! 4. [`LinearRequest::Workspace`], only for a host that shows it
+//!    ([`LinearChoice::want_workspace`]: Connect to an Issue tracker's
+//!    Workspace field), once the key works: the organization it belongs to.
+//! 5. [`LinearRequest::Viewer`] once nothing else is due and the key works
 //!    but whose it is isn't known yet: the account row's name (Settings
 //!    shows it beside "Change key…").
 
@@ -241,6 +244,8 @@ pub enum LinearRequest {
     /// Whose the working key is (the account row), once the teams proved
     /// it works.
     Viewer,
+    /// The workspace (organization) the working key belongs to.
+    Workspace,
 }
 
 /// Why a read failed, as far as the key is concerned.
@@ -281,6 +286,8 @@ pub enum LinearAnswer {
     Preflight { connection: LinearConnection, result: Result<String, String> },
     /// The key's owner, as a label (`Ada Lovelace <ada@example.com>`).
     Viewer(Result<String, LinearFailure>),
+    /// The key's workspace, by name.
+    Workspace(Result<String, LinearFailure>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +331,9 @@ pub struct LinearChoice {
     viewer_asked: bool,
     /// "Change key…" opened the key field over a working key.
     changing_key: bool,
+    /// The host shows the key's workspace ([`Self::want_workspace`]).
+    wants_workspace: bool,
+    workspace: Loadable<String>,
 }
 
 impl LinearChoice {
@@ -334,6 +344,18 @@ impl LinearChoice {
 
     pub fn key_state(&self) -> &KeyState {
         &self.key
+    }
+
+    /// Read the workspace the key belongs to once it works (a host that
+    /// shows it: Connect to an Issue tracker's Workspace field).
+    pub fn want_workspace(&mut self) {
+        self.wants_workspace = true;
+    }
+
+    /// The key's workspace (organization) name, [`Loadable::Idle`] until
+    /// [`Self::want_workspace`] and a working key.
+    pub fn workspace(&self) -> &Loadable<String> {
+        &self.workspace
     }
 
     /// The key field shows: there's no working key yet, or "Change key…"
@@ -633,6 +655,9 @@ impl LinearChoice {
                 self.lists = None;
             }
         }
+        if self.workspace.error().is_some() {
+            self.workspace = Loadable::Idle;
+        }
     }
 
     /// The loaded team's id, when the pick names one.
@@ -680,6 +705,10 @@ impl LinearChoice {
             self.preflight = Some(Preflight::Running(connection.clone()));
             return Some(LinearRequest::Preflight(connection));
         }
+        if self.wants_workspace && self.workspace == Loadable::Idle && matches!(self.key, KeyState::Valid { .. }) {
+            self.workspace = Loadable::Loading;
+            return Some(LinearRequest::Workspace);
+        }
         // Last: whose the key is, for the account row (nothing waits on it).
         if matches!(self.key, KeyState::Valid { viewer: None }) && !self.viewer_asked {
             self.viewer_asked = true;
@@ -723,6 +752,8 @@ impl LinearChoice {
                         self.changing_key = false;
                         self.key_input.clear();
                         self.teams = Loadable::Idle;
+                        // Another key may be another workspace's.
+                        self.workspace = Loadable::Idle;
                         self.error = None;
                     }
                     Err(failure) if self.changing_key => {
@@ -743,6 +774,18 @@ impl LinearChoice {
                 }
                 Err(failure) => self.note_key_failure(&failure),
             },
+            LinearAnswer::Workspace(result) => {
+                if !self.workspace.is_loading() {
+                    return;
+                }
+                self.workspace = match result {
+                    Ok(name) => Loadable::Loaded(name),
+                    Err(failure) => {
+                        self.note_key_failure(&failure);
+                        Loadable::Failed(failure.message().to_string())
+                    }
+                };
+            }
             LinearAnswer::TeamLists { team_id, projects, labels, users } => {
                 if let Some(lists) = self.lists.as_mut().filter(|l| l.team_id == team_id) {
                     lists.projects = Loadable::from_result(projects);
@@ -795,6 +838,8 @@ pub mod fixture {
 
     /// Whose the key is.
     pub const VIEWER: &str = "Ada Lovelace <ada@example.com>";
+    /// The key's workspace.
+    pub const WORKSPACE: &str = "Example workspace";
 
     /// The answer to `request` with a working key.
     pub fn answer(request: LinearRequest) -> LinearAnswer {
@@ -804,6 +849,7 @@ pub mod fixture {
                 row("team-des", "DES", "DES", Some("Design")),
             ])),
             LinearRequest::Viewer => LinearAnswer::Viewer(Ok(VIEWER.into())),
+            LinearRequest::Workspace => LinearAnswer::Workspace(Ok(WORKSPACE.into())),
             LinearRequest::Login(_) => LinearAnswer::Login(Ok(VIEWER.into())),
             LinearRequest::TeamLists { team_id } => LinearAnswer::TeamLists {
                 team_id,
@@ -1029,6 +1075,39 @@ mod tests {
         assert_eq!(c.error(), Some("bad key"));
         c.cancel_change_key();
         assert!(!c.needs_key() && c.key_input().is_empty() && c.error().is_none());
+    }
+
+    #[test]
+    fn the_workspace_is_read_only_for_a_host_that_wants_it() {
+        let mut c = LinearChoice::default();
+        c.due();
+        c.answer(LinearAnswer::Teams(Ok(teams())));
+        assert_eq!(c.due(), Some(LinearRequest::Viewer), "Settings never asks for it");
+        assert_eq!(c.due(), None);
+
+        let mut c = LinearChoice::default();
+        c.want_workspace();
+        assert_eq!(c.due(), Some(LinearRequest::Teams), "not before the key works");
+        c.answer(LinearAnswer::Teams(Ok(teams())));
+        assert_eq!(c.due(), Some(LinearRequest::Workspace));
+        assert!(c.workspace().is_loading());
+        c.answer(LinearAnswer::Workspace(Ok("Example".into())));
+        assert_eq!(c.workspace().loaded().map(String::as_str), Some("Example"));
+
+        // A new key reads its workspace again.
+        c.change_key();
+        c.set_key_input("lin_api_other");
+        c.submit_key();
+        c.due();
+        c.answer(LinearAnswer::Login(Ok("Alan".into())));
+        assert_eq!(c.workspace(), &Loadable::Idle);
+        assert_eq!(c.due(), Some(LinearRequest::Teams));
+        c.answer(LinearAnswer::Teams(Ok(teams())));
+        assert_eq!(c.due(), Some(LinearRequest::Workspace));
+        c.answer(LinearAnswer::Workspace(Err(LinearFailure::Other("timeout".into()))));
+        assert_eq!(c.workspace().error(), Some("timeout"));
+        c.retry();
+        assert_eq!(c.due(), Some(LinearRequest::Workspace));
     }
 
     #[test]
