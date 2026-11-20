@@ -670,7 +670,14 @@ fn list(
         .as_ref()
         .and_then(|p| shelbi_state::ownership::gate_from_index(project, &p.issue_tracker).ok())
         .unwrap_or(shelbi_state::OwnershipGate::Unrestricted);
+    let rules = project_yaml.as_ref().map(|p| p.issue_tracker.agent_rules).unwrap_or_default();
+    // An unassigned issue that starting would claim (the `assigned_only` agent
+    // rule is off) reads `claim on start`, so the column still says which
+    // issues Shelbi may start.
     let owner_col = |tf: &shelbi_state::IssueFile| -> String {
+        if ownership.claims_on_start(&rules, &tf.tracker_assignees) {
+            return format!("{:<16} ", OWNER_CLAIM_ON_START);
+        }
         ownership
             .owner(&tf.tracker_assignees)
             .map(|o| format!("{:<16} ", o.label()))
@@ -781,6 +788,10 @@ fn render_shown(project: &str, tf: &mut shelbi_state::IssueFile) -> Result<Strin
     shelbi_state::render_task_file(tf).map_err(|e| anyhow!(e))
 }
 
+/// `issue list`'s owner column for an unassigned issue that starting would
+/// claim (`issue_tracker.agent_rules.assigned_only` off).
+const OWNER_CLAIM_ON_START: &str = "claim on start";
+
 fn show(project: &str, id: &str) -> Result<()> {
     // Render the issue fetched through the store, not the local task file: a
     // `github` backend never writes that file, so reading it would fail on a
@@ -804,6 +815,11 @@ fn show(project: &str, id: &str) -> Result<()> {
         }
         if owner.is_mine() {
             println!("→ owner: me");
+        } else if gate.claims_on_start(&project_yaml.issue_tracker.agent_rules, &tf.tracker_assignees) {
+            println!(
+                "→ owner: unassigned (starting it assigns it to you: the project's \"Only work on \
+                 issues assigned to me\" rule is off)"
+            );
         } else {
             println!(
                 "→ owner: {} (not yours: Shelbi won't start it; `shelbi issue start {id} --take` \

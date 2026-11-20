@@ -48,8 +48,8 @@ use shelbi_core::StatusCategory;
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
     append_changelog_section, append_preamble_jobs_section, apply_awareness_variant_markers, apply_handoff_path_rewrite, apply_reporting_subject_rewrite,
-    apply_tmux_instruction_rewrites, apply_tracker_ownership_rewrites,
-    AWARENESS_VARIANTS_AUTOHEAL_CODE, TRACKER_OWNERSHIP_AUTOHEAL_CODE,
+    apply_claim_on_start_rewrite, apply_tmux_instruction_rewrites, apply_tracker_ownership_rewrites,
+    AWARENESS_VARIANTS_AUTOHEAL_CODE, CLAIM_ON_START_AUTOHEAL_CODE, TRACKER_OWNERSHIP_AUTOHEAL_CODE,
     cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
     scope_label, Classification, UpgradeFinding, UpgradeReport, CHANGELOG_TEMPLATE_MISSING,
     CHANGELOG_TEMPLATE_PRIOR_DEFAULT, PR_TEMPLATE_MISSING,
@@ -307,6 +307,12 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
     // (an edited one gets a needs-judgment finding instead, never a write).
     if codes.contains(TRACKER_OWNERSHIP_AUTOHEAL_CODE) {
         heal_tracker_ownership(entry, applied);
+    }
+
+    // Then the `claim=on_start` paragraph after it (re-reads the file, so a
+    // copy the ownership heal just patched gets it in the same pass).
+    if codes.contains(CLAIM_ON_START_AUTOHEAL_CODE) {
+        heal_claim_on_start(entry, applied);
     }
 
     // Add the marked awareness (v2) counterparts to the orchestrator's
@@ -1237,6 +1243,25 @@ fn heal_tracker_ownership(entry: &InventoryEntry, applied: &mut Vec<AppliedChang
         path,
         "dispatch-rules+tracker-ownership".into(),
     );
+}
+
+/// Add the `claim=on_start` dispatch paragraph to an orchestrator
+/// `instructions.md` via the shared [`apply_claim_on_start_rewrite`]; a no-op
+/// write is skipped.
+fn heal_claim_on_start(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let out = apply_claim_on_start_rewrite(&text);
+    if out == text {
+        return;
+    }
+    if let Err(e) = write_atomic(path, &out) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(applied, entry, CLAIM_ON_START_AUTOHEAL_CODE, path, "dispatch-rules+claim-on-start".into());
 }
 
 /// Add the shipped awareness variant markup to an orchestrator
