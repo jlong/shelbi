@@ -59,12 +59,13 @@ use gpui::{
 use gpui_kit::base::text::{RangeHighlight, RenderedText, TextViewState};
 use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
 use shelbi_app::changelog::{
-    self, ChangelogAttachment, ChangelogData, ChangelogEntryView, ChangelogLink, ChangelogModel, LinkKind,
-    LinkTarget, Release,
+    self, ChangelogAttachment, ChangelogData, ChangelogEntryView, ChangelogLink, ChangelogModel, ImageSource,
+    LinkKind, LinkTarget, Release,
 };
 
 use super::activity_list::FeedList;
 use super::activity_state::ItemKey;
+use super::overlay::lightbox::{Lightbox, LightboxImage};
 use super::{board_scroll, markdown};
 use crate::assets::{icons, Icon};
 use crate::theme::style::{self, ButtonContent, ButtonKind, ButtonSize, Type, Typography};
@@ -109,7 +110,8 @@ pub enum ChangelogEvent {
     OpenIssue(String),
     /// Show this image in the window's lightbox (a click on a figure the
     /// column scaled down).
-    OpenImage(crate::views::overlay::lightbox::LightboxImage),
+    /// It carries every image on the page, in order, to step through.
+    OpenImage(crate::views::overlay::lightbox::Lightbox),
     /// Show the image menu for this image at `at` in the window (a
     /// right-click on a figure that draws its image).
     ImageMenu {
@@ -455,6 +457,35 @@ impl ChangelogView {
     }
 
     /// Entry `entry`'s description view, made the first time it is drawn.
+    /// The lightbox for `clicked`: every image the page's entries (the
+    /// ones shown, under a search too) draw as figures, in order, with
+    /// `clicked` up. A neighbor's size is the image cache's when it has
+    /// decoded it (the lightbox asks again when it's shown), and an image
+    /// with nothing to draw (missing, or on another machine) is left out.
+    fn lightbox_from(&self, clicked: LightboxImage, cx: &mut App) -> Lightbox {
+        let mut at = None;
+        let mut images = Vec::new();
+        for entry in self.model.visible() {
+            for (alt, source) in markdown::figure_images(entry.prose(), entry.dir.as_deref()) {
+                if !matches!(source, ImageSource::File(_) | ImageSource::Web(_)) {
+                    continue;
+                }
+                let caption = alt.trim().to_string();
+                if at.is_none() && source == clicked.source && caption == clicked.caption {
+                    at = Some(images.len());
+                    images.push(clicked.clone());
+                    continue;
+                }
+                let (width, height) = markdown::cached_image_size(&source, cx).unwrap_or((0.0, 0.0));
+                images.push(LightboxImage { source, width, height, caption });
+            }
+        }
+        match at {
+            Some(at) => Lightbox::new(images, at, clicked),
+            None => Lightbox::single(clicked),
+        }
+    }
+
     fn body_state(&mut self, entry: &ChangelogEntryView, cx: &mut Context<Self>) -> Entity<TextViewState> {
         if let Some(body) = self.bodies.get_mut(&entry.id) {
             if body.text != entry.prose() {
@@ -821,11 +852,15 @@ impl ChangelogView {
             let state = self.body_state(entry, cx);
             let page = cx.entity().downgrade();
             let open: markdown::OnImage = std::sync::Arc::new(move |action, _, cx| {
-                let event = match action {
-                    markdown::ImageAction::Open(image) => ChangelogEvent::OpenImage(image),
-                    markdown::ImageAction::Menu { source, at } => ChangelogEvent::ImageMenu { source, at },
-                };
-                let _ = page.update(cx, |_, cx| cx.emit(event));
+                let _ = page.update(cx, |page, cx| {
+                    let event = match action {
+                        markdown::ImageAction::Open { image, from } => {
+                            ChangelogEvent::OpenImage(page.lightbox_from(image, cx).growing_from(from))
+                        }
+                        markdown::ImageAction::Menu { source, at } => ChangelogEvent::ImageMenu { source, at },
+                    };
+                    cx.emit(event);
+                });
             });
             markdown::body_with_state(&state, theme, entry.dir.as_deref(), Some(open))
         });
@@ -1440,15 +1475,24 @@ mod tests {
 
         vcx.simulate_click(wide.center(), gpui::Modifiers::none());
         vcx.run_until_parked();
+        let shown = |file: &shelbi_state::changelog::StoredAttachment, (width, height): (f32, f32), caption: &str| {
+            crate::views::overlay::lightbox::LightboxImage {
+                source: shelbi_app::changelog::ImageSource::File(file.absolute.clone()),
+                width,
+                height,
+                caption: caption.into(),
+            }
+        };
+        let lightboxes = opened.borrow().clone();
+        assert_eq!(lightboxes.len(), 1);
+        assert_eq!(*lightboxes[0].current(), shown(&stored[0], (2400.0, 300.0), "The wide one"));
+        // It steps through every image on the page, the small one (decoded,
+        // so its size is known) after the wide one.
         assert_eq!(
-            *opened.borrow(),
-            [crate::views::overlay::lightbox::LightboxImage {
-                source: shelbi_app::changelog::ImageSource::File(stored[0].absolute.clone()),
-                width: 2400.0,
-                height: 300.0,
-                caption: "The wide one".into(),
-            }]
+            lightboxes[0].images(),
+            [shown(&stored[0], (2400.0, 300.0), "The wide one"), shown(&stored[1], (80.0, 40.0), "A chip")]
         );
+        assert_eq!(lightboxes[0].position(), 0);
         assert_eq!(scroll(&vcx), top, "the page didn't move");
 
         // A right-click on either asks for the image menu at the pointer,

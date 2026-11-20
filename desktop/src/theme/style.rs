@@ -511,6 +511,45 @@ pub fn toolbar_icon_button(
 /// The Toolbar Button's square.
 pub const TOOLBAR_ICON_BUTTON: f32 = 32.0;
 
+/// A [`toolbar_icon_button`]-sized circle with an opaque fill, for a button
+/// that floats over content it can't count on (a photo, the scrim): the
+/// raised surface laid over the canvas, the theme's 1px ring and a soft
+/// drop ([`popover_shadow`]), and the hover and pressed fills laid over
+/// that, so it reads over bright and dark alike. `label` is its accessible
+/// name and its tooltip. The lightbox's close button.
+pub fn floating_icon_button(
+    id: impl Into<SharedString>,
+    icon: Svg,
+    label: &'static str,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let canvas = Hsla { a: 1.0, ..theme.canvas };
+    let rest = super::glass::over(theme.raised, canvas);
+    let fills = [
+        rest,
+        super::glass::over(theme.background_hover, rest),
+        super::glass::over(theme.background_active, rest),
+    ];
+    let radius = px(TOOLBAR_ICON_BUTTON / 2.0);
+    let selector = id.clone();
+    let d = div()
+        .id(id.clone())
+        .debug_selector(move || selector.to_string())
+        .role(gpui::Role::Button)
+        .aria_label(label)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(TOOLBAR_ICON_BUTTON))
+        .rounded(radius)
+        .shadow(popover_shadow(theme))
+        .cursor_pointer()
+        .tooltip(tooltip(label));
+    fill_layer(d, id, radius, fills).child(icon.text_color(theme.icon))
+}
+
 /// A section heading: Base medium, loud.
 pub fn heading(text: impl Into<SharedString>, theme: &Theme) -> Div {
     div()

@@ -30,7 +30,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, img, prelude::*, px, rems, App, CursorStyle, Div, ElementId, Entity, HighlightStyle, HitboxBehavior,
+    canvas, div, img, prelude::*, px, rems, App, Bounds, CursorStyle, Div, ElementId, Entity, HighlightStyle, HitboxBehavior,
     Hsla, ImgResourceLoader, MouseButton, Pixels, Point, Resource, SharedString, SharedUri, StyleRefinement, Window,
 };
 use gpui_kit::base::text::{MarkdownNode, MarkdownParseContext, TextView, TextViewState, TextViewStyle};
@@ -74,8 +74,8 @@ const GALLERY_CELL: (f32, f32) = (300.0, 200.0);
 #[derive(Debug, Clone, PartialEq)]
 pub enum ImageAction {
     /// A click on a figure drawn smaller than its own size: show it in the
-    /// lightbox.
-    Open(LightboxImage),
+    /// lightbox, growing from `from`, where the column drew it in the window.
+    Open { image: LightboxImage, from: Bounds<Pixels> },
     /// A right-click on a figure that draws its image, at `at` in the window:
     /// its context menu there.
     Menu { source: ImageSource, at: Point<Pixels> },
@@ -160,6 +160,47 @@ fn parse_figures(node: &Node, dir: Option<&Path>) -> Option<MarkdownNode> {
     Some(MarkdownNode::new(FIGURE, figures).text(text))
 }
 
+/// The images `prose` draws as [`FIGURE`] blocks, in order, as `(alt,
+/// source)` resolved against `dir` as the figures are: what the lightbox
+/// steps through. Image paragraphs nested in a list or a quote count too.
+pub fn figure_images(prose: &str, dir: Option<&Path>) -> Vec<(String, ImageSource)> {
+    fn walk(node: &Node, dir: Option<&Path>, out: &mut Vec<(String, ImageSource)>) {
+        if let Some(images) = image_paragraph(node) {
+            out.extend(images.into_iter().map(|(alt, url)| (alt, resolve_image(dir, &url))));
+            return;
+        }
+        for child in node.children().map(Vec::as_slice).unwrap_or_default() {
+            walk(child, dir, out);
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(root) = markdown::to_mdast(prose, &options()) {
+        walk(&root, dir, &mut out);
+    }
+    out
+}
+
+/// An image's own size in pixels, `(width, height)`, once the shared image
+/// cache has decoded it (asking starts the load); `None` until then, and
+/// for a source with nothing to draw. While drawing (it redraws the view
+/// when the load lands).
+pub(crate) fn image_size(source: &ImageSource, window: &mut Window, cx: &mut App) -> Option<(f32, f32)> {
+    match figure_state(source, window, cx) {
+        FigureState::Image { width, height } if width > 0.0 && height > 0.0 => Some((width, height)),
+        _ => None,
+    }
+}
+
+/// [`image_size`] outside a draw (a click handler): the cache as it stands,
+/// starting the load if it hasn't, with no redraw when it lands.
+pub(crate) fn cached_image_size(source: &ImageSource, cx: &mut App) -> Option<(f32, f32)> {
+    let resource = image_resource(source).ok()?;
+    let image = cx.fetch_asset::<ImgResourceLoader>(&resource)?.ok()?;
+    let size = image.size(0);
+    let (width, height) = (size.width.0 as f32, size.height.0 as f32);
+    (width > 0.0 && height > 0.0).then_some((width, height))
+}
+
 /// `prose` with each run of image paragraphs (the ones [`FIGURE`] claims,
 /// with nothing but blank lines between them) joined into one paragraph, so
 /// the run parses as one block: a gallery. Any other block between two of
@@ -206,12 +247,21 @@ enum FigureState {
     Placeholder(&'static str),
 }
 
+/// The image cache's key for `source`, or the placeholder's reason when
+/// there's nothing to load.
+fn image_resource(source: &ImageSource) -> Result<Resource, &'static str> {
+    match source {
+        ImageSource::File(path) => Ok(Resource::Path(Arc::from(path.as_path()))),
+        ImageSource::Web(url) => Ok(Resource::Uri(SharedUri::from(url.clone()))),
+        ImageSource::Missing(_) => Err("Image missing"),
+        ImageSource::Unavailable => Err("Image not available here"),
+    }
+}
+
 fn figure_state(source: &ImageSource, window: &mut Window, cx: &mut App) -> FigureState {
-    let resource = match source {
-        ImageSource::File(path) => Resource::Path(Arc::from(path.as_path())),
-        ImageSource::Web(url) => Resource::Uri(SharedUri::from(url.clone())),
-        ImageSource::Missing(_) => return FigureState::Placeholder("Image missing"),
-        ImageSource::Unavailable => return FigureState::Placeholder("Image not available here"),
+    let resource = match image_resource(source) {
+        Ok(resource) => resource,
+        Err(why) => return FigureState::Placeholder(why),
     };
     // The same cache the image element reads, so the load happens once.
     match window.use_asset::<ImgResourceLoader>(&resource, cx) {
@@ -427,14 +477,17 @@ fn framed(
         return frame;
     };
     // Set as the frame lays out, read by its click (events follow the
-    // frame that drew them).
+    // frame that drew them): whether it's scaled down, and where it is.
     let scaled = Rc::new(Cell::new(false));
     let measured = scaled.clone();
+    let drawn_at = Rc::new(Cell::new(Bounds::default()));
+    let placed = drawn_at.clone();
     let target = canvas(
         move |bounds, window, _| {
             let drawn = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
             let zoomed = zooms(drawn, natural);
             measured.set(zoomed);
+            placed.set(bounds);
             zoomed.then(|| window.insert_hitbox(bounds, HitboxBehavior::Normal))
         },
         |_, hitbox, window, _| {
@@ -453,7 +506,7 @@ fn framed(
         .child(target)
         .on_click(move |_, window, cx| {
             if scaled.get() {
-                open(ImageAction::Open(image.clone()), window, cx);
+                open(ImageAction::Open { image: image.clone(), from: drawn_at.get() }, window, cx);
             }
         })
         .on_mouse_down(MouseButton::Right, move |ev, window, cx| {
@@ -848,6 +901,28 @@ The column keeps its cards.
     }
 
     #[test]
+    fn figure_images_lists_every_figure_in_order_across_galleries() {
+        let dir = std::env::temp_dir().join(format!("shelbi-desktop-figlist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["a", "b", "c", "d", "e"] {
+            std::fs::write(dir.join(format!("{f}.png")), b"x").unwrap();
+        }
+        let body = "Intro.\n\n![A](a.png)\n\n![B](b.png)\n![C](c.png)\n\nBetween.\n\n\
+                    ![web](https://example.com/w.png)\n\n- ![D](d.png)\n\nText ![inline](x.png) here.\n\n![E](e.png)\n";
+        let got = figure_images(body, Some(&dir));
+        let alts: Vec<&str> = got.iter().map(|(alt, _)| alt.as_str()).collect();
+        // A gallery's images, a lone figure, one in a list; not a web-only
+        // paragraph nor an image inside running text (neither is a figure).
+        assert_eq!(alts, ["A", "B", "C", "D", "E"]);
+        assert_eq!(got[0].1, ImageSource::File(dir.join("a.png")));
+        // The order with_galleries hands the view is the same.
+        let joined: Vec<String> = figure_images(&with_galleries(body), Some(&dir)).into_iter().map(|(a, _)| a).collect();
+        assert_eq!(joined, alts);
+        assert!(figure_images("No images.", Some(&dir)).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn figures_resolve_against_the_changelog_dir() {
         let dir = std::env::temp_dir().join(format!("shelbi-desktop-fig-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("assets/e")).unwrap();
@@ -1006,7 +1081,7 @@ The column keeps its cards.
         let opened = Arc::new(std::sync::Mutex::new(Vec::<LightboxImage>::new()));
         let seen = opened.clone();
         let open: OnImage = Arc::new(move |action, _, _| {
-            if let ImageAction::Open(image) = action {
+            if let ImageAction::Open { image, .. } = action {
                 seen.lock().unwrap().push(image);
             }
         });
@@ -1061,7 +1136,7 @@ The column keeps its cards.
         let at = bounds_of(&mut vcx, "fig-0-image".into()).center();
         vcx.simulate_click(at, gpui::Modifiers::none());
         let got = take(&mut vcx);
-        assert!(matches!(&got[..], [ImageAction::Open(i)] if i.width == 1200.0), "scaled into its cell: {got:?}");
+        assert!(matches!(&got[..], [ImageAction::Open { image: i, .. }] if i.width == 1200.0), "scaled into its cell: {got:?}");
         let at = bounds_of(&mut vcx, "fig-1-image".into()).center();
         vcx.simulate_click(at, gpui::Modifiers::none());
         assert!(take(&mut vcx).is_empty(), "the small shot is at its own size");

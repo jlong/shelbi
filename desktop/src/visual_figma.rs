@@ -3521,6 +3521,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "lightbox") {
+            self.lightbox();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "palette-search") {
             self.palette_search();
             return;
@@ -3603,6 +3608,7 @@ impl Run {
         self.save(handle, "activity");
 
         self.changelog();
+        self.lightbox();
 
         self.review(&orch, "review", |_, _| {});
         self.workspace(&orch, "workspace", |_, _| {});
@@ -3991,6 +3997,52 @@ impl Run {
         if let Some(text) = before {
             std::fs::write(&yaml, text).expect("restore the project");
         }
+    }
+
+    /// The Changelog's image lightbox (no Figma frame; checked by eye): a
+    /// bright synthetic shot, bright at its top-left corner where the close
+    /// button sits, fit to the window on the dark scrim. `state-lightbox`
+    /// with a caption long enough to wrap to two lines and ellipsize,
+    /// `state-lightbox-bare` with none. `SHELBI_VISUAL_ONLY=lightbox`
+    /// renders just these.
+    fn lightbox(&mut self) {
+        use crate::views::overlay::lightbox::LightboxImage;
+        use shelbi_app::changelog::ImageSource;
+
+        let (w, h) = (1600u32, 1000u32);
+        let shot = image::RgbaImage::from_fn(w, h, |x, y| {
+            let (fx, fy) = (x as f32 / w as f32, y as f32 / h as f32);
+            let v = |a: f32| (a.clamp(0.0, 1.0) * 255.0) as u8;
+            image::Rgba([v(1.0 - 0.5 * fx), v(0.95 - 0.6 * fy), v(0.8 + 0.2 * fx * fy), 255])
+        });
+        let path = self.out.join("lightbox-shot.png");
+        shot.save(&path).expect("write the lightbox's image");
+        let captions = [
+            (
+                "state-lightbox",
+                "The Issues board after the toolbar restyle: the ⋮ menu and the filter chips share the Figma \
+                 Toolbar Button, and the board's columns keep their counts beside each status name, with the \
+                 cards' estimates drawn as a bar along their foot. Right-click the image to save it, Esc or a \
+                 click anywhere to close it, and h or l (or the arrow keys) to step to the page's other images, \
+                 across galleries and entries alike",
+            ),
+            ("state-lightbox-bare", ""),
+        ];
+        for (screen, caption) in captions {
+            let handle = self.open();
+            self.click(handle, View::Changelog);
+            let image = LightboxImage {
+                source: ImageSource::File(path.clone()),
+                width: w as f32,
+                height: h as f32,
+                caption: caption.into(),
+            };
+            handle
+                .update(&mut self.cx, |w, window, cx| w.open_lightbox(crate::views::overlay::lightbox::Lightbox::single(image), window, cx))
+                .unwrap();
+            self.save(handle, screen);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     fn changelog_pages(&mut self) {

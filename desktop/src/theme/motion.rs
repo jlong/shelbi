@@ -41,6 +41,9 @@ pub const DIALOG_IN: Duration = Duration::from_millis(400);
 pub const TAB_MORPH: Duration = Duration::from_millis(240);
 /// How far a menu or dialog travels as it fades in.
 pub const SLIDE_PX: f32 = 8.0;
+/// A Changelog image growing from its place in the column into the
+/// lightbox ([`ease_out_smooth`]), the scrim fading in with it.
+pub const LIGHTBOX_GROW: Duration = Duration::from_millis(380);
 
 /// The nav selection's spring: a damping ratio of 0.75 (framer-motion's
 /// `bounce: 0.25`) at 22 rad/s, so the chip reaches its row in about 200ms
@@ -56,6 +59,13 @@ const SETTLE_PX: f32 = 0.5;
 /// landing.
 pub fn ease_out_expo(t: f32) -> f32 {
     cubic_bezier(0.16, 1.0, 0.3, 1.0, t)
+}
+
+/// `cubic-bezier(0.32, 0.72, 0, 1)`: a quick start that glides to a stop
+/// with no snap at either end, for a thing that grows or travels across the
+/// window (the lightbox's image).
+pub fn ease_out_smooth(t: f32) -> f32 {
+    cubic_bezier(0.32, 0.72, 0.0, 1.0, t)
 }
 
 /// [`ease_out_expo`] played backwards in time: an animation on it retraces,
