@@ -504,6 +504,13 @@ impl Backend {
         )
     }
 
+    /// Wait up to `limit` for `target`'s live session to bind its socket, so a
+    /// send right after a launch doesn't find nothing to connect to. See
+    /// [`SessionProcessBackend::wait_bound`](crate::session_process_backend::SessionProcessBackend::wait_bound).
+    pub fn wait_bound(&self, host: &Host, target: &SessionTarget, limit: Duration) -> Liveness {
+        self.0.wait_bound(host, target, limit)
+    }
+
     /// Whether a session for `target`'s slot is **wedged** — its process is
     /// still up but its socket does not answer the protocol — as opposed to
     /// genuinely gone (process exited). Local-only (a remote slot's wedge can't

@@ -620,6 +620,35 @@ impl SessionProcessBackend {
         Ok(())
     }
 
+    /// Wait up to `limit` for the live session `name` to bind its socket. A
+    /// session binds only after spawning its child, and [`probe`](SessionBackend::probe)
+    /// reads a session still binding as alive (so startup isn't mistaken for
+    /// death), so a caller about to connect right after a launch can find no
+    /// socket to connect to yet. [`Liveness::Dead`] when no live session carries
+    /// the name (or it went away while binding); [`Liveness::Alive`] once it is
+    /// bound, and also when `limit` passes first, leaving the connect's own error
+    /// to say what went wrong. Local only: a remote probe already answers over
+    /// the relay.
+    pub(crate) fn wait_bound(&self, host: &Host, target: &SessionTarget, limit: Duration) -> Liveness {
+        if host.is_ssh() {
+            return self.probe(host, target, None);
+        }
+        let name = session_name(target);
+        let gone = std::cell::Cell::new(false);
+        wait_until_found(limit, ATTACH_POLL, || match self.find_live(&name) {
+            Some(s) => s.sock.exists(),
+            None => {
+                gone.set(true);
+                true
+            }
+        });
+        if gone.get() {
+            Liveness::Dead
+        } else {
+            Liveness::Alive
+        }
+    }
+
     /// The logical names of every live session. Stands in for the tmux backend's
     /// `live_pane_ids` (there are no panes): a caller confirming a specific
     /// handle still gets a definitive membership answer.
@@ -1170,6 +1199,67 @@ claude --resume a7b448d4-e35d-4246-9870-953e5ab7a895
             std::os::unix::process::ExitStatusExt::signal(&status),
             Some(libc::SIGTERM),
         );
+
+        match prev {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn wait_bound_waits_out_a_session_still_binding_its_socket() {
+        // `flaky-reload-handoff`: a launch with no handoff returns before the
+        // orchestrator session binds its socket. The probe reads that session as
+        // alive, so a reload right then connected to a socket that wasn't there
+        // and skipped the handoff. `wait_bound` holds the send until the bind.
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!("shelbi-wb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let prev = std::env::var("SHELBI_HOME").ok();
+        std::env::set_var("SHELBI_HOME", &home);
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let b = SessionProcessBackend;
+        let target = SessionTarget::session("shelbi-demo");
+
+        // No session at all: dead at once, not after the limit.
+        let start = std::time::Instant::now();
+        assert!(matches!(b.wait_bound(&Host::Local, &target, Duration::from_secs(5)), Liveness::Dead));
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        // A session holding its lock with no socket yet: the race's precondition.
+        let id = "dddddddddddddddd";
+        let (lock, _none) = write_session_dir(&sessions, id, "demo/orch", "2026-01-01T00:00:00Z", true);
+        let sock = sessions.join(id).join("sock");
+        let _ = std::fs::remove_file(&sock);
+        assert!(b.probe(&Host::Local, &target, None).is_alive(), "a binding session reads alive");
+        assert!(b.send_text(&Host::Local, &target, "x").is_err(), "but can't be sent to yet");
+
+        // It binds a moment later; the wait returns once it has.
+        let binder = {
+            let sock = sock.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(200));
+                std::os::unix::net::UnixListener::bind(&sock).unwrap()
+            })
+        };
+        assert!(b.wait_bound(&Host::Local, &target, Duration::from_secs(10)).is_alive());
+        assert!(sock.exists(), "returned only once the socket was bound");
+        let listener = binder.join().unwrap();
+
+        // A session that dies while binding is dead, not a full-limit wait.
+        drop(listener);
+        let _ = std::fs::remove_file(&sock);
+        let dropper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(lock);
+        });
+        let start = std::time::Instant::now();
+        assert!(matches!(b.wait_bound(&Host::Local, &target, Duration::from_secs(10)), Liveness::Dead));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        dropper.join().unwrap();
 
         match prev {
             Some(h) => std::env::set_var("SHELBI_HOME", h),

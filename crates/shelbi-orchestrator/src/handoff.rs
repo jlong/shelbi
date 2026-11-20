@@ -44,6 +44,11 @@ use crate::submit::{self, SubmitStatus};
 /// so we'd rather time out and proceed than hang.
 const HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long to wait for a just-launched orchestrator session to bind its socket
+/// before sending it the request. A session binds once it has spawned its
+/// child, normally within milliseconds; the margin is for a loaded machine.
+const BIND_WAIT: Duration = Duration::from_secs(10);
+
 /// How often we re-check disk for the handoff file. Cheap enough at
 /// 250ms that the worst-case extra latency over a fast write is well
 /// under a second.
@@ -171,6 +176,13 @@ fn request_orchestrator_handoff_inner(project_name: &str) -> Result<HandoffOutco
     // handoff request into it. A dead/absent session reads `PaneNotAlive`.
     let target = SessionTarget::session(format!("shelbi-{project_name}"));
     if !backend().probe(&Host::Local, &target, None).is_alive() {
+        return Ok(HandoffOutcome::PaneNotAlive);
+    }
+    // The probe counts a session still binding its socket as alive, and a launch
+    // with no handoff to protect returns before that bind, so a reload or quit
+    // right after a launch would otherwise connect to a socket that isn't there
+    // yet and skip the handoff (`flaky-reload-handoff`).
+    if !backend().wait_bound(&Host::Local, &target, BIND_WAIT).is_alive() {
         return Ok(HandoffOutcome::PaneNotAlive);
     }
 
