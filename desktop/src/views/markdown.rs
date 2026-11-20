@@ -8,10 +8,14 @@
 //! they head; the body in `Desktop/Base/Regular`, 20pt between blocks; and a
 //! task list drawn as Figma's checkbox rows (a custom block, [`CHECKLIST`]);
 //! and a paragraph of images (`![alt](assets/…)`, what `shelbi changelog add
-//! --image` writes) as figures (a custom block, [`FIGURE`]): each image at the
-//! column's width (never past its own), its alt text as the caption, a
-//! missing file or a remote window's image as the alt text in a placeholder.
-//! A figure scaled down to fit the column is a zoom target: a pointing hand
+//! --image` writes) as figures (a custom block, [`FIGURE`]), its alt text as
+//! each caption, a missing file or a remote window's image as the alt text in
+//! a placeholder. An image on its own is drawn at the column's width and at
+//! most 400pt tall ([`SINGLE_MAX_HEIGHT`]); two or more one after another
+//! (one paragraph, or image paragraphs with only blank lines between them,
+//! which [`with_galleries`] joins into one) are a gallery: each within 300 by
+//! 200pt ([`GALLERY_CELL`]), in rows that wrap. Neither is ever drawn past its
+//! own size ([`fit`]). A figure scaled down is a zoom target: a pointing hand
 //! over it, and a click hands it to the caller's [`OnImage`] (the
 //! Changelog's lightbox, `views::overlay::lightbox`). A right-click on any
 //! figure that draws an image hands it over too, with the pointer (the
@@ -41,7 +45,6 @@ use crate::theme::Theme;
 
 /// GitHub-flavored Markdown, as gpui-kit's text view parses it (it adds math,
 /// which task bodies don't use).
-#[cfg(test)]
 fn options() -> markdown::ParseOptions {
     markdown::ParseOptions::gfm()
 }
@@ -58,8 +61,14 @@ const ROW_GAP: f32 = 12.0;
 const CHECKLIST: &str = "shelbi-checklist";
 /// The custom block a paragraph of images renders as.
 const FIGURE: &str = "shelbi-figure";
-/// The room between an image and its caption, and between figures.
+/// The room between an image and its caption.
 const FIGURE_GAP: f32 = 6.0;
+/// The room between figures, down a column and across a gallery's rows.
+const FIGURES_GAP: f32 = BLOCK_GAP / 2.0;
+/// The tallest an image on its own is drawn (the column bounds its width).
+const SINGLE_MAX_HEIGHT: f32 = 400.0;
+/// The box, `(width, height)`, each image of a gallery is drawn within.
+const GALLERY_CELL: (f32, f32) = (300.0, 200.0);
 
 /// What the pointer asked of a figure's image.
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +160,41 @@ fn parse_figures(node: &Node, dir: Option<&Path>) -> Option<MarkdownNode> {
     Some(MarkdownNode::new(FIGURE, figures).text(text))
 }
 
+/// `prose` with each run of image paragraphs (the ones [`FIGURE`] claims,
+/// with nothing but blank lines between them) joined into one paragraph, so
+/// the run parses as one block: a gallery. Any other block between two of
+/// them (text, a heading, a paragraph of web images only) ends the run, and
+/// each side is laid out on its own. What the Changelog hands its text view.
+///
+/// Only the room between the paragraphs changes, so the text the view
+/// renders (and its search matches) is the same.
+pub fn with_galleries(prose: &str) -> std::borrow::Cow<'_, str> {
+    let Ok(root) = markdown::to_mdast(prose, &options()) else {
+        return prose.into();
+    };
+    let gaps: Vec<std::ops::Range<usize>> = root
+        .children()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .windows(2)
+        .filter(|pair| pair.iter().all(|n| image_paragraph(n).is_some()))
+        .filter_map(|pair| Some(pair[0].position()?.end.offset..pair[1].position()?.start.offset))
+        .filter(|gap| prose.get(gap.clone()).is_some_and(|g| g.trim().is_empty()))
+        .collect();
+    if gaps.is_empty() {
+        return prose.into();
+    }
+    let mut out = String::with_capacity(prose.len());
+    let mut at = 0;
+    for gap in gaps {
+        out.push_str(&prose[at..gap.start]);
+        out.push('\n');
+        at = gap.end;
+    }
+    out.push_str(&prose[at..]);
+    out.into()
+}
+
 /// What a figure draws once its source has been tried.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum FigureState {
@@ -183,9 +227,51 @@ fn figure_state(source: &ImageSource, window: &mut Window, cx: &mut App) -> Figu
     }
 }
 
-/// A [`FIGURE`] block: each image scaled to the column's width (never past
-/// its own, keeping its aspect ratio) with its alt text as the caption; an
-/// image that can't be drawn as its alt text in a bordered placeholder.
+/// How a [`FIGURE`] block lays its images out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Layout {
+    /// One image: the column's width, at most [`SINGLE_MAX_HEIGHT`] tall,
+    /// its caption under it across the column.
+    Single,
+    /// Two or more: each within [`GALLERY_CELL`], left to right in rows that
+    /// wrap, each caption under its image and as wide.
+    Gallery,
+}
+
+impl Layout {
+    /// The layout of a block of `count` images.
+    fn of(count: usize) -> Self {
+        if count > 1 {
+            Layout::Gallery
+        } else {
+            Layout::Single
+        }
+    }
+
+    /// The box, `(width, height)`, an image is drawn within; the column's
+    /// width bounds it too, as it lays out.
+    fn bound(self) -> (f32, f32) {
+        match self {
+            Layout::Single => (f32::INFINITY, SINGLE_MAX_HEIGHT),
+            Layout::Gallery => GALLERY_CELL,
+        }
+    }
+}
+
+/// An image `natural` in size, `(width, height)`, scaled down to fit within
+/// `bound` at its aspect ratio, and never up past its own size.
+pub(crate) fn fit(natural: (f32, f32), bound: (f32, f32)) -> (f32, f32) {
+    let (width, height) = natural;
+    if width <= 0.0 || height <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let scale = (bound.0 / width).min(bound.1 / height).min(1.0);
+    (width * scale, height * scale)
+}
+
+/// A [`FIGURE`] block: one image on its own, or a gallery of them
+/// ([`Layout`]), each at its aspect ratio with its alt text as the caption;
+/// an image that can't be drawn as its alt text in a bordered placeholder.
 fn render_figures(
     node: &MarkdownNode,
     theme: &Theme,
@@ -195,27 +281,38 @@ fn render_figures(
 ) -> Div {
     let figures = node.data::<Vec<Figure>>().cloned().unwrap_or_default();
     let start = node.source_range().map_or(0, |r| r.start);
-    figure_column(figures.into_iter().enumerate().map(|(ix, figure)| {
-        let state = figure_state(&figure.source, window, cx);
-        figure_element(format!("changelog-figure-{start}-{ix}"), &figure, state, open.cloned(), theme)
-    }))
+    let layout = Layout::of(figures.len());
+    figure_block(
+        layout,
+        figures.into_iter().enumerate().map(|(ix, figure)| {
+            let state = figure_state(&figure.source, window, cx);
+            figure_element(format!("changelog-figure-{start}-{ix}"), &figure, state, layout, open.cloned(), theme)
+        }),
+    )
 }
 
-/// A [`FIGURE`] block's figures, top to bottom across the column.
-fn figure_column(figures: impl IntoIterator<Item = gpui::Stateful<Div>>) -> Div {
-    div().flex().flex_col().gap(px(BLOCK_GAP / 2.0)).w_full().children(figures)
+/// A [`FIGURE`] block's figures: down the column, or a gallery's rows,
+/// [`FIGURES_GAP`] between them either way.
+fn figure_block(layout: Layout, figures: impl IntoIterator<Item = gpui::Stateful<Div>>) -> Div {
+    let block = div().flex().gap(px(FIGURES_GAP)).w_full();
+    match layout {
+        Layout::Single => block.flex_col(),
+        Layout::Gallery => block.flex_row().flex_wrap().items_start(),
+    }
+    .children(figures)
 }
 
 /// One figure of a [`FIGURE`] block, once its source has been tried: the
 /// image over its caption, the caption alone while it loads, or the
-/// placeholder. Its id is also its debug selector, and its image's is the id
-/// with `-image` after it. With `open`, the image is a zoom target while it
-/// is drawn smaller than its own size, and a right-click on it asks for its
-/// menu ([`framed`]).
+/// placeholder, within `layout`'s box. Its id is also its debug selector,
+/// and its image's is the id with `-image` after it. With `open`, the image
+/// is a zoom target while it is drawn smaller than its own size, and a
+/// right-click on it asks for its menu ([`framed`]).
 fn figure_element(
     id: String,
     figure: &Figure,
     state: FigureState,
+    layout: Layout,
     open: Option<OnImage>,
     theme: &Theme,
 ) -> gpui::Stateful<Div> {
@@ -226,14 +323,17 @@ fn figure_element(
             .child(figure.alt.clone())
     });
     let image = match (&figure.source, state) {
-        (ImageSource::File(path), FigureState::Image { width, height }) if height > 0.0 => {
+        (ImageSource::File(path), FigureState::Image { width, height }) if width > 0.0 && height > 0.0 => {
             Some((img(path.clone()), width, height))
         }
-        (ImageSource::Web(url), FigureState::Image { width, height }) if height > 0.0 => {
+        (ImageSource::Web(url), FigureState::Image { width, height }) if width > 0.0 && height > 0.0 => {
             Some((img(SharedUri::from(url.clone())), width, height))
         }
         _ => None,
     };
+    let bound = layout.bound();
+    // The widest the image is drawn: the column narrows it further.
+    let widest = image.as_ref().map(|&(_, width, height)| fit((width, height), bound).0);
     let picture = image.map(|(image, width, height)| {
         let zoom = open.map(|open| Zoom {
             image: LightboxImage {
@@ -244,7 +344,7 @@ fn figure_element(
             },
             open,
         });
-        framed(format!("{id}-image"), image, width, height, zoom, theme)
+        framed(format!("{id}-image"), image, (width, height), widest.unwrap_or(width), zoom, theme)
     });
     let selector = id.clone();
     let out = div()
@@ -254,9 +354,16 @@ fn figure_element(
         .flex_col()
         .gap(px(FIGURE_GAP))
         .w_full();
+    // A gallery's cell is as wide as its image (a caption wraps within it),
+    // or the whole cell for a placeholder or a caption still waiting on its
+    // image.
+    let out = match layout {
+        Layout::Single => out,
+        Layout::Gallery => out.max_w(px(widest.unwrap_or(bound.0))),
+    };
     match (picture, state) {
         (Some(picture), _) => out.child(picture).children(caption),
-        (None, FigureState::Placeholder(why)) => out.child(placeholder(&figure.alt, why, theme)),
+        (None, FigureState::Placeholder(why)) => out.child(placeholder(&figure.alt, why, bound.1, theme)),
         (None, _) => out.children(caption),
     }
 }
@@ -268,15 +375,16 @@ struct Zoom {
     open: OnImage,
 }
 
-/// Whether an image `natural` wide, drawn `drawn` wide, was scaled down to
-/// fit (and so opens in the lightbox). Half a point of rounding is still
-/// its own size.
-pub(crate) fn zooms(drawn: f32, natural: f32) -> bool {
-    drawn + 0.5 < natural
+/// Whether an image `natural` in size, `(width, height)`, drawn `drawn`, was
+/// scaled down to fit, by the column's width or a height limit (and so
+/// opens in the lightbox). Half a point of rounding is still its own size.
+pub(crate) fn zooms(drawn: (f32, f32), natural: (f32, f32)) -> bool {
+    drawn.0 + 0.5 < natural.0 || drawn.1 + 0.5 < natural.1
 }
 
-/// An image at the column's width, at most its own, its height following
-/// from its aspect ratio; `id` is its id and debug selector.
+/// An image `natural` in size at the column's width, at most `widest` (its
+/// own width, or less to keep it within its layout's box), its height
+/// following from its aspect ratio; `id` is its id and debug selector.
 ///
 /// The clamp and the ratio sit on two boxes: on one, taffy works the height
 /// out from the column's full width before `max_w` narrows it, so an image
@@ -285,25 +393,26 @@ pub(crate) fn zooms(drawn: f32, natural: f32) -> bool {
 /// all of it, takes its height from that.
 ///
 /// With `zoom`, the outer box measures itself as it lays out (a canvas over
-/// it): drawn narrower than its own width ([`zooms`]), it shows a pointing
+/// it): drawn smaller than its own size ([`zooms`]), it shows a pointing
 /// hand and a click opens it; at its own size a click does nothing. A
 /// right-click asks for its menu at any size, and goes no further (no
 /// selection, no scroll); a click is left-button only, so it never opens it.
 fn framed(
     id: String,
     image: gpui::Img,
-    width: f32,
-    height: f32,
+    natural: (f32, f32),
+    widest: f32,
     zoom: Option<Zoom>,
     theme: &Theme,
 ) -> gpui::Stateful<Div> {
+    let (width, height) = natural;
     let selector = id.clone();
     let frame = div()
         .id(SharedString::from(id))
         .debug_selector(move || selector.clone())
         .relative()
         .w_full()
-        .max_w(px(width))
+        .max_w(px(widest))
         .child(
             div()
                 .w_full()
@@ -321,10 +430,10 @@ fn framed(
     // frame that drew them).
     let scaled = Rc::new(Cell::new(false));
     let measured = scaled.clone();
-    let natural = image.width;
     let target = canvas(
         move |bounds, window, _| {
-            let zoomed = zooms(bounds.size.width.as_f32(), natural);
+            let drawn = (bounds.size.width.as_f32(), bounds.size.height.as_f32());
+            let zoomed = zooms(drawn, natural);
             measured.set(zoomed);
             zoomed.then(|| window.insert_hitbox(bounds, HitboxBehavior::Normal))
         },
@@ -354,14 +463,16 @@ fn framed(
 }
 
 /// What a figure shows when there is no image to draw: its alt text, and why
-/// in the muted role.
-fn placeholder(alt: &str, why: &str, theme: &Theme) -> Div {
+/// in the muted role, at most `tallest` (its layout's box).
+fn placeholder(alt: &str, why: &str, tallest: f32, theme: &Theme) -> Div {
     let alt = if alt.trim().is_empty() { "Image" } else { alt };
     div()
         .flex()
         .flex_col()
         .gap(px(2.0))
         .w_full()
+        .max_h(px(tallest))
+        .overflow_hidden()
         .px_3()
         .py_2()
         .rounded_md()
@@ -680,7 +791,7 @@ The column keeps its cards.
             figures("Before.\n\n![Jobs sheet](assets/e/jobs.png)\n"),
             [vec![pair("Jobs sheet", "assets/e/jobs.png")]]
         );
-        // Two images on consecutive lines are one figure block.
+        // Two images on consecutive lines are one figure block (a gallery).
         assert_eq!(
             figures("![a](a.png)\n![b](b.png)"),
             [vec![pair("a", "a.png"), pair("b", "b.png")]]
@@ -688,6 +799,52 @@ The column keeps its cards.
         // An image inside prose, or a web image alone, is the text view's.
         assert!(figures("See ![a](a.png) here.").is_empty());
         assert!(figures("![web](https://x.dev/a.png)").is_empty());
+    }
+
+    /// The figure blocks a body renders as, once its image paragraphs are
+    /// joined into galleries: the alt texts of each.
+    fn blocks(body: &str) -> Vec<Vec<String>> {
+        let joined = with_galleries(body);
+        let root = markdown::to_mdast(&joined, &options()).unwrap();
+        root.children()
+            .unwrap()
+            .iter()
+            .filter_map(image_paragraph)
+            .map(|images| images.into_iter().map(|(alt, _)| alt).collect())
+            .collect()
+    }
+
+    #[test]
+    fn images_one_after_another_are_one_gallery_and_text_splits_them() {
+        let alts = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // One paragraph of images: one block, a gallery.
+        assert_eq!(blocks("![a](a.png)\n![b](b.png)\n![c](c.png)\n"), [alts(&["a", "b", "c"])]);
+        assert_eq!(Layout::of(3), Layout::Gallery);
+        assert_eq!(Layout::of(1), Layout::Single);
+        // Image paragraphs with only blank lines between them: one gallery.
+        assert_eq!(
+            blocks("Intro.\n\n![a](a.png)\n\n![b](b.png)\n\n\n![c](c.png)\n\nOutro.\n"),
+            [alts(&["a", "b", "c"])]
+        );
+        assert_eq!(blocks("![a](a.png)\n\n![b](b.png)\n![c](c.png)"), [alts(&["a", "b", "c"])]);
+        assert_eq!(blocks("![a](a.png)\n\n  ![b](b.png)\n"), [alts(&["a", "b"])], "an indented one");
+        // Text between them splits the run: each side on its own.
+        assert_eq!(
+            blocks("![a](a.png)\n\nBetween.\n\n![b](b.png)\n\n![c](c.png)\n"),
+            [alts(&["a"]), alts(&["b", "c"])]
+        );
+        assert_eq!(blocks("![a](a.png)\n\n## Next\n\n![b](b.png)\n"), [alts(&["a"]), alts(&["b"])]);
+        // A paragraph of web images only stays the text view's, and splits too.
+        assert_eq!(
+            blocks("![a](a.png)\n\n![w](https://x.dev/w.png)\n\n![b](b.png)\n"),
+            [alts(&["a"]), alts(&["b"])]
+        );
+        // Nothing to join: the body as written.
+        let body = "Text.\n\n![a](a.png)\n\nMore.\n";
+        assert!(matches!(with_galleries(body), std::borrow::Cow::Borrowed(b) if b == body));
+        // Joining changes only the blank lines between the paragraphs (an
+        // indent is the next paragraph's own, and fine on a continuation line).
+        assert_eq!(with_galleries("![a](a.png)\n\n![b](b.png)\n\nEnd.\n"), "![a](a.png)\n![b](b.png)\n\nEnd.\n");
     }
 
     #[test]
@@ -708,54 +865,70 @@ The column keeps its cards.
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A column of figures as the Changelog draws them, across the window's
-    /// width, with a row under it.
-    struct Figures(Vec<(f32, f32)>, Option<OnImage>);
+    /// Figures as the Changelog draws them, across the window's width, with
+    /// a row under them: each shot a block of its own (`Layout::Single`), or
+    /// all of them one gallery.
+    struct Figures(Vec<(f32, f32)>, Layout, Option<OnImage>);
 
     impl Render for Figures {
         fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
             let theme = Theme::resolve(shelbi_state::ThemePreference::Dark, gpui::WindowAppearance::Dark);
-            let figures = self.0.iter().enumerate().map(|(ix, &(width, height))| {
+            let layout = self.1;
+            let open = self.2.clone();
+            let figures = self.0.iter().enumerate().map(move |(ix, &(width, height))| {
                 let figure = Figure {
                     alt: format!("Shot {ix}"),
                     source: ImageSource::File(PathBuf::from(format!("/nonexistent/shot-{ix}.png"))),
                 };
-                figure_element(format!("fig-{ix}"), &figure, FigureState::Image { width, height }, self.1.clone(), &theme)
+                figure_element(format!("fig-{ix}"), &figure, FigureState::Image { width, height }, layout, open.clone(), &theme)
             });
+            let blocks: Vec<Div> = match layout {
+                Layout::Single => figures.map(|f| figure_block(Layout::Single, [f])).collect(),
+                Layout::Gallery => vec![figure_block(Layout::Gallery, figures)],
+            };
             div()
                 .flex()
                 .flex_col()
                 .w_full()
-                .child(figure_column(figures))
+                .child(div().flex().flex_col().gap(px(FIGURES_GAP)).w_full().children(blocks))
                 .child(div().debug_selector(|| "after".into()).h(px(10.0)))
         }
     }
 
-    /// Each figure is its image (the column's width, never past its own, at
-    /// its aspect ratio) over its caption, with only the figure gap between
-    /// figures, however the column compares with the images and as the
-    /// window resizes.
+    fn bounds_of(vcx: &mut gpui::VisualTestContext, selector: String) -> gpui::Bounds<Pixels> {
+        vcx.debug_bounds(Box::leak(selector.into_boxed_str())).unwrap()
+    }
+
+    fn resize(vcx: &mut gpui::VisualTestContext, host: &Entity<Figures>, column: f32) {
+        vcx.simulate_resize(gpui::size(px(column), px(4000.0)));
+        host.update(vcx, |_, cx| cx.notify());
+        vcx.run_until_parked();
+    }
+
+    /// An image on its own is the column's width, at most 400pt tall, never
+    /// past its own size, at its aspect ratio, over its caption, with only
+    /// the figure gap between figures, however the column compares with the
+    /// images and as the window resizes.
     #[gpui::test]
-    fn a_figure_is_as_tall_as_its_image_and_caption_at_any_column_width(cx: &mut gpui::TestAppContext) {
-        // Crown & Keep's phone screenshots, and a wide one.
-        let shots = vec![(460.0, 1000.0), (750.0, 1000.0), (1200.0, 600.0)];
-        let window = cx.add_window(|_, _| Figures(shots.clone(), None));
+    fn a_single_figure_fits_the_column_and_400pt_and_heads_its_caption(cx: &mut gpui::TestAppContext) {
+        // Crown & Keep's phone screenshots, a wide one, and a small one.
+        let shots = vec![(460.0, 1000.0), (750.0, 1000.0), (1200.0, 600.0), (300.0, 200.0)];
+        let window = cx.add_window(|_, _| Figures(shots.clone(), Layout::Single, None));
         let host = window.root(cx).unwrap();
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         // Wider than every image, between them, and narrower than all.
-        for column in [1400.0_f32, 600.0, 300.0, 1000.0] {
-            vcx.simulate_resize(gpui::size(px(column), px(4000.0)));
-            host.update(&mut vcx, |_, cx| cx.notify());
-            vcx.run_until_parked();
+        for column in [1400.0_f32, 600.0, 250.0, 1000.0] {
+            resize(&mut vcx, &host, column);
             let mut prev_bottom = None;
             for (ix, &(width, height)) in shots.iter().enumerate() {
-                let figure = vcx.debug_bounds(Box::leak(format!("fig-{ix}").into_boxed_str())).unwrap();
-                let image = vcx.debug_bounds(Box::leak(format!("fig-{ix}-image").into_boxed_str())).unwrap();
-                let shown = width.min(column);
+                let figure = bounds_of(&mut vcx, format!("fig-{ix}"));
+                let image = bounds_of(&mut vcx, format!("fig-{ix}-image"));
+                let (shown, tall) = fit((width, height), (column, SINGLE_MAX_HEIGHT));
                 let at = format!("a {width}x{height} image in a {column}pt column");
-                assert!((image.size.width.as_f32() - shown).abs() < 0.5, "{at}: width {:?}", image.size.width);
-                let tall = shown * height / width;
+                assert!((image.size.width.as_f32() - shown).abs() < 0.5, "{at}: width {:?}, want {shown}", image.size.width);
                 assert!((image.size.height.as_f32() - tall).abs() < 0.5, "{at}: height {:?}, want {tall}", image.size.height);
+                assert!(image.size.height.as_f32() <= SINGLE_MAX_HEIGHT + 0.5, "{at}: at most 400pt tall");
+                assert_eq!(image.left(), figure.left(), "{at}: left-aligned");
                 assert_eq!(image.top(), figure.top(), "{at}: the image heads its figure");
                 let caption = Type::Small.line_height();
                 let want = image.size.height.as_f32() + FIGURE_GAP + caption;
@@ -765,7 +938,7 @@ The column keeps its cards.
                     figure.size.height
                 );
                 if let Some(bottom) = prev_bottom {
-                    assert_eq!(figure.top(), bottom + px(BLOCK_GAP / 2.0), "{at}: only the figure gap above it");
+                    assert_eq!(figure.top(), bottom + px(FIGURES_GAP), "{at}: only the figure gap above it");
                 }
                 prev_bottom = Some(figure.bottom());
             }
@@ -774,9 +947,60 @@ The column keeps its cards.
         }
     }
 
-    /// A figure the column scaled down opens on a click, with its image at
-    /// its own size; one drawn at its own size doesn't, and the same figure
-    /// stops opening once the column is wide enough for it.
+    /// A gallery lays its images left to right, each within 300x200 at its
+    /// aspect ratio over its caption, the cell gap between them, and wraps
+    /// onto rows the same gap apart.
+    #[gpui::test]
+    fn a_gallery_wraps_its_figures_in_rows_within_300_by_200(cx: &mut gpui::TestAppContext) {
+        // Tall, wide, small, and wide again.
+        let shots = vec![(460.0, 1000.0), (1200.0, 600.0), (120.0, 90.0), (1600.0, 900.0)];
+        let window = cx.add_window(|_, _| Figures(shots.clone(), Layout::Gallery, None));
+        let host = window.root(cx).unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        let caption = Type::Small.line_height();
+        // Room for every cell on one row, and for only the first three.
+        for column in [1200.0_f32, 600.0] {
+            resize(&mut vcx, &host, column);
+            let mut rows: Vec<Vec<gpui::Bounds<Pixels>>> = Vec::new();
+            for (ix, &(width, height)) in shots.iter().enumerate() {
+                let figure = bounds_of(&mut vcx, format!("fig-{ix}"));
+                let image = bounds_of(&mut vcx, format!("fig-{ix}-image"));
+                let (shown, tall) = fit((width, height), GALLERY_CELL);
+                let at = format!("a {width}x{height} image in a {column}pt gallery");
+                assert!((image.size.width.as_f32() - shown).abs() < 0.5, "{at}: width {:?}, want {shown}", image.size.width);
+                assert!((image.size.height.as_f32() - tall).abs() < 0.5, "{at}: height {:?}, want {tall}", image.size.height);
+                assert_eq!(figure.size.width, image.size.width, "{at}: the cell is as wide as its image");
+                assert_eq!(image.origin, figure.origin, "{at}: the image heads its cell");
+                let want = tall + FIGURE_GAP + caption;
+                assert!((figure.size.height.as_f32() - want).abs() < 0.5, "{at}: caption under the image");
+                match rows.last_mut() {
+                    Some(row) if row[0].top() == figure.top() => {
+                        let prev = row.last().unwrap();
+                        assert_eq!(figure.left(), prev.right() + px(FIGURES_GAP), "{at}: the cell gap before it");
+                        row.push(figure);
+                    }
+                    _ => {
+                        assert_eq!(figure.left(), px(0.0), "{at}: a row starts at the left");
+                        if let Some(row) = rows.last() {
+                            let bottom = row.iter().map(|b| b.bottom()).max().unwrap();
+                            assert_eq!(figure.top(), bottom + px(FIGURES_GAP), "{at}: the row gap above it");
+                        }
+                        rows.push(vec![figure]);
+                    }
+                }
+            }
+            let lens: Vec<usize> = rows.iter().map(Vec::len).collect();
+            // 92+300+120+300 and the gaps fit 1200; 600 holds the first three.
+            let want: &[usize] = if column > 1000.0 { &[4] } else { &[3, 1] };
+            assert_eq!(lens, want, "{column}pt: cells per row");
+            let bottom = rows.last().unwrap().iter().map(|b| b.bottom()).max().unwrap();
+            assert_eq!(vcx.debug_bounds("after").unwrap().top(), bottom, "{column}pt: the gallery ends under its last row");
+        }
+    }
+
+    /// A figure the column or a height limit scaled down opens on a click,
+    /// with its image at its own size; one drawn at its own size doesn't, and
+    /// the same figure stops opening once the column is wide enough for it.
     #[gpui::test]
     fn only_a_scaled_down_figure_opens_on_a_click(cx: &mut gpui::TestAppContext) {
         let opened = Arc::new(std::sync::Mutex::new(Vec::<LightboxImage>::new()));
@@ -786,14 +1010,14 @@ The column keeps its cards.
                 seen.lock().unwrap().push(image);
             }
         });
-        let shots = vec![(1200.0, 600.0), (400.0, 300.0)];
-        let window = cx.add_window(|_, _| Figures(shots.clone(), Some(open)));
+        // Wide (under 400pt tall), small, and tall (400pt at 230 wide, in
+        // any column).
+        let shots = vec![(1200.0, 360.0), (400.0, 300.0), (460.0, 800.0)];
+        let window = cx.add_window(|_, _| Figures(shots.clone(), Layout::Single, Some(open)));
         let host = window.root(cx).unwrap();
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         let click = |vcx: &mut gpui::VisualTestContext, column: f32, selector: &'static str| {
-            vcx.simulate_resize(gpui::size(px(column), px(4000.0)));
-            host.update(vcx, |_, cx| cx.notify());
-            vcx.run_until_parked();
+            resize(vcx, &host, column);
             let at = vcx.debug_bounds(selector).unwrap().center();
             vcx.simulate_click(at, gpui::Modifiers::none());
             vcx.run_until_parked();
@@ -805,25 +1029,64 @@ The column keeps its cards.
             [LightboxImage {
                 source: ImageSource::File(PathBuf::from("/nonexistent/shot-0.png")),
                 width: 1200.0,
-                height: 600.0,
+                height: 360.0,
                 caption: "Shot 0".into(),
             }],
             "the wide shot, scaled to 600pt, opens at its own size"
         );
-        assert!(click(&mut vcx, 600.0, "fig-1-image").is_empty(), "the narrow shot is at its own size");
+        assert!(click(&mut vcx, 600.0, "fig-1-image").is_empty(), "the small shot is at its own size");
         assert!(click(&mut vcx, 1400.0, "fig-0-image").is_empty(), "a column wider than the shot");
         assert_eq!(click(&mut vcx, 1199.0, "fig-0-image").len(), 1, "a point narrower is scaled");
+        let tall = click(&mut vcx, 1400.0, "fig-2-image");
+        assert_eq!(tall.len(), 1, "the tall shot, held to 400pt in a wide column, opens");
+        assert_eq!((tall[0].width, tall[0].height), (460.0, 800.0), "at its own size");
+    }
+
+    /// A gallery's images are zoom targets when scaled into their cell, and
+    /// every drawn one asks for its menu on a right-click.
+    #[gpui::test]
+    fn a_gallery_image_opens_when_scaled_and_has_its_menu(cx: &mut gpui::TestAppContext) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<ImageAction>::new()));
+        let log = seen.clone();
+        let open: OnImage = Arc::new(move |action, _, _| log.lock().unwrap().push(action));
+        let window = cx.add_window(|_, _| Figures(vec![(1200.0, 600.0), (120.0, 90.0)], Layout::Gallery, Some(open)));
+        let host = window.root(cx).unwrap();
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        resize(&mut vcx, &host, 1400.0);
+        let take = |vcx: &mut gpui::VisualTestContext| {
+            vcx.run_until_parked();
+            std::mem::take(&mut *seen.lock().unwrap())
+        };
+        // In a column wide enough for it, the wide shot is still held to its cell.
+        let at = bounds_of(&mut vcx, "fig-0-image".into()).center();
+        vcx.simulate_click(at, gpui::Modifiers::none());
+        let got = take(&mut vcx);
+        assert!(matches!(&got[..], [ImageAction::Open(i)] if i.width == 1200.0), "scaled into its cell: {got:?}");
+        let at = bounds_of(&mut vcx, "fig-1-image".into()).center();
+        vcx.simulate_click(at, gpui::Modifiers::none());
+        assert!(take(&mut vcx).is_empty(), "the small shot is at its own size");
+        for ix in 0..2 {
+            let at = bounds_of(&mut vcx, format!("fig-{ix}-image")).origin + gpui::point(px(10.0), px(12.0));
+            vcx.simulate_mouse_down(at, MouseButton::Right, gpui::Modifiers::none());
+            vcx.simulate_mouse_up(at, MouseButton::Right, gpui::Modifiers::none());
+            assert_eq!(
+                take(&mut vcx),
+                [ImageAction::Menu { source: ImageSource::File(PathBuf::from(format!("/nonexistent/shot-{ix}.png"))), at }],
+                "gallery image {ix}: its menu at the pointer"
+            );
+        }
     }
 
     /// A right-click on any figure that draws its image, scaled down or not,
     /// asks for its menu at the pointer and never opens the lightbox; a
-    /// placeholder (a missing file, a remote window's) has no menu.
+    /// placeholder (a missing file, a remote window's) has no menu, and keeps
+    /// to its layout's box.
     #[gpui::test]
     fn a_right_click_on_a_drawn_figure_asks_for_its_menu_and_a_placeholder_none(cx: &mut gpui::TestAppContext) {
         let seen = Arc::new(std::sync::Mutex::new(Vec::<ImageAction>::new()));
         let log = seen.clone();
         let open: OnImage = Arc::new(move |action, _, _| log.lock().unwrap().push(action));
-        let window = cx.add_window(|_, _| Figures(vec![(1200.0, 600.0), (400.0, 300.0)], Some(open)));
+        let window = cx.add_window(|_, _| Figures(vec![(1200.0, 600.0), (400.0, 300.0)], Layout::Single, Some(open)));
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
         vcx.simulate_resize(gpui::size(px(600.0), px(4000.0)));
         vcx.run_until_parked();
@@ -834,7 +1097,7 @@ The column keeps its cards.
             std::mem::take(&mut *seen.lock().unwrap())
         };
         for (ix, what) in [(0, "scaled down"), (1, "at its own size")] {
-            let image = vcx.debug_bounds(Box::leak(format!("fig-{ix}-image").into_boxed_str())).unwrap();
+            let image = bounds_of(&mut vcx, format!("fig-{ix}-image"));
             let at = image.origin + gpui::point(px(10.0), px(12.0));
             assert_eq!(
                 right_click(&mut vcx, at),
@@ -853,30 +1116,64 @@ The column keeps its cards.
                 let theme = Theme::resolve(shelbi_state::ThemePreference::Dark, gpui::WindowAppearance::Dark);
                 let missing = Figure { alt: "Gone".into(), source: ImageSource::Missing("/nonexistent/gone.png".into()) };
                 let remote = Figure { alt: "There".into(), source: ImageSource::Unavailable };
-                figure_column([
-                    figure_element("ph-0".into(), &missing, FigureState::Placeholder("Image missing"), Some(self.0.clone()), &theme),
-                    figure_element("ph-1".into(), &remote, FigureState::Placeholder("Image not available here"), Some(self.0.clone()), &theme),
-                ])
+                let placeholders = |layout, at: &str| {
+                    figure_block(
+                        layout,
+                        [
+                            figure_element(format!("{at}-0"), &missing, FigureState::Placeholder("Image missing"), layout, Some(self.0.clone()), &theme),
+                            figure_element(format!("{at}-1"), &remote, FigureState::Placeholder("Image not available here"), layout, Some(self.0.clone()), &theme),
+                        ],
+                    )
+                };
+                div().flex().flex_col().w_full().child(placeholders(Layout::Single, "ph")).child(placeholders(Layout::Gallery, "gal"))
             }
         }
         let log = seen.clone();
         let open: OnImage = Arc::new(move |action, _, _| log.lock().unwrap().push(action));
         let window = cx.add_window(|_, _| Placeholders(open));
         let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.simulate_resize(gpui::size(px(1000.0), px(2000.0)));
         vcx.run_until_parked();
-        for selector in ["ph-0", "ph-1"] {
+        for selector in ["ph-0", "ph-1", "gal-0", "gal-1"] {
             assert!(vcx.debug_bounds(Box::leak(format!("{selector}-image").into_boxed_str())).is_none());
-            let at = vcx.debug_bounds(selector).unwrap().center();
-            assert!(right_click(&mut vcx, at).is_empty(), "{selector}: a placeholder has no menu");
+            let bounds = bounds_of(&mut vcx, selector.into());
+            assert!(right_click(&mut vcx, bounds.center()).is_empty(), "{selector}: a placeholder has no menu");
         }
+        assert_eq!(bounds_of(&mut vcx, "ph-0".into()).size.width, px(1000.0), "on its own: the column's width");
+        let (cell0, cell1) = (bounds_of(&mut vcx, "gal-0".into()), bounds_of(&mut vcx, "gal-1".into()));
+        assert_eq!(cell0.size.width, px(GALLERY_CELL.0), "in a gallery: the cell's width");
+        assert_eq!((cell1.top(), cell1.left()), (cell0.top(), cell0.right() + px(FIGURES_GAP)), "side by side");
     }
 
     #[test]
-    fn a_figure_zooms_only_when_drawn_smaller_than_its_own_width() {
-        assert!(zooms(600.0, 1200.0));
-        assert!(!zooms(1200.0, 1200.0));
-        assert!(!zooms(1199.6, 1200.0), "rounding");
-        assert!(!zooms(400.0, 300.0));
+    fn an_image_scales_down_to_its_box_and_never_up() {
+        // Width-bound: wider than the box, in proportion.
+        assert_eq!(fit((1200.0, 600.0), (600.0, 400.0)), (600.0, 300.0));
+        assert_eq!(fit((1200.0, 600.0), GALLERY_CELL), (300.0, 150.0));
+        // Height-bound: taller than the box, narrower in proportion.
+        assert_eq!(fit((460.0, 1000.0), (800.0, SINGLE_MAX_HEIGHT)), (184.0, 400.0));
+        assert_eq!(fit((460.0, 1000.0), GALLERY_CELL), (92.0, 200.0));
+        assert_eq!(fit((600.0, 600.0), (f32::INFINITY, SINGLE_MAX_HEIGHT)), (400.0, 400.0), "no column bound");
+        // Both: the tighter one wins.
+        assert_eq!(fit((900.0, 900.0), GALLERY_CELL), (200.0, 200.0));
+        // Never up past its own size, by either limit.
+        assert_eq!(fit((120.0, 90.0), GALLERY_CELL), (120.0, 90.0));
+        assert_eq!(fit((300.0, 200.0), GALLERY_CELL), (300.0, 200.0));
+        assert_eq!(fit((300.0, 380.0), (f32::INFINITY, SINGLE_MAX_HEIGHT)), (300.0, 380.0));
+        assert_eq!(fit((0.0, 10.0), GALLERY_CELL), (0.0, 0.0), "no size, nothing to draw");
+    }
+
+    #[test]
+    fn a_figure_zooms_only_when_drawn_smaller_than_its_own_size() {
+        assert!(zooms((600.0, 300.0), (1200.0, 600.0)));
+        assert!(!zooms((1200.0, 600.0), (1200.0, 600.0)));
+        assert!(!zooms((1199.6, 599.8), (1200.0, 600.0)), "rounding");
+        assert!(!zooms((400.0, 300.0), (300.0, 200.0)));
+        // Held by its height: smaller both ways at its aspect ratio, and the
+        // height alone is enough to say so.
+        assert!(zooms((184.0, 400.0), (460.0, 1000.0)));
+        assert!(zooms((460.0, 400.0), (460.0, 1000.0)), "height alone");
+        assert!(!zooms((460.0, 999.7), (460.0, 1000.0)), "rounding, by height");
     }
 
     #[test]

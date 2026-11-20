@@ -462,12 +462,12 @@ impl ChangelogView {
                 body.text = entry.prose().to_string();
                 body.searched = None;
                 let text = body.text.clone();
-                body.state.update(cx, |s, cx| s.set_text(&text, cx));
+                body.state.update(cx, |s, cx| s.set_text(&markdown::with_galleries(&text), cx));
             }
             return body.state.clone();
         }
         let text = entry.prose().to_string();
-        let state = cx.new(|cx| TextViewState::markdown(&text, cx));
+        let state = cx.new(|cx| TextViewState::markdown(&markdown::with_galleries(&text), cx));
         let id = entry.id.clone();
         let parsed = cx.observe(&state, move |this, _, cx| this.highlight_body(&id, cx));
         self.bodies.insert(
