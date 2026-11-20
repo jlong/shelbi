@@ -456,12 +456,22 @@ pub fn header_button(id: &'static str, icon: Icon, active: bool, theme: &Theme) 
 /// A property row: 28pt, the label in its muted column, 12pt before the
 /// value.
 pub fn property_row(theme: &Theme, label: &'static str, value: impl IntoElement) -> Div {
-    property_row_at(theme, label, LABEL_W, value)
+    property_beside(property_label(theme, label), property_value(value))
 }
 
-/// [`property_row`] with its label column `label_w` wide (the task pane's
-/// side column is narrower than the frame's).
-pub fn property_row_at(theme: &Theme, label: &'static str, label_w: f32, value: impl IntoElement) -> Div {
+/// A property's label: muted, in the Small style.
+pub fn property_label(theme: &Theme, label: &'static str) -> Div {
+    div().min_w_0().truncate().type_style(Type::Small).text_color(theme.muted).child(label)
+}
+
+/// The slot a property's value sits in, the room its label leaves.
+pub fn property_value(value: impl IntoElement) -> Div {
+    div().flex().flex_row().items_center().min_w_0().child(value)
+}
+
+/// A [`property_label`] in its [`LABEL_W`] column with the
+/// [`property_value`] beside it: [`property_row`]'s shape.
+pub fn property_beside(label: Div, value: Div) -> Div {
     div()
         .flex()
         .flex_row()
@@ -470,26 +480,37 @@ pub fn property_row_at(theme: &Theme, label: &'static str, label_w: f32, value: 
         .min_h(px(28.0))
         .w_full()
         .min_w_0()
-        .child(
-            div()
-                .w(px(label_w))
-                .flex_none()
-                .truncate()
-                .type_style(Type::Small)
-                .text_color(theme.muted)
-                .child(label),
-        )
-        .child(div().flex().flex_row().items_center().flex_1().min_w_0().child(value))
+        .child(label.w(px(LABEL_W)).flex_none())
+        .child(value.flex_1())
 }
+
+/// A [`property_label`] on its own line over its [`property_value`], both
+/// the full width (a column with more height than width to spare, like the
+/// task pane's side). The label sits 8pt in, on the values' text edge, and
+/// [`PROPERTY_OVER_GAP`] over its value: the gap between properties is
+/// wider, so each pair reads as one.
+pub fn property_over(label: Div, value: Div) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(PROPERTY_OVER_GAP))
+        .w_full()
+        .min_w_0()
+        .child(label.w_full().px(px(8.0)))
+        .child(value.w_full().min_h(px(28.0)))
+}
+
+/// The gap between a [`property_over`]'s label and its value.
+pub const PROPERTY_OVER_GAP: f32 = 2.0;
 
 /// A text value, 8pt in so it lines up with the buttons' labels' edge.
 pub fn value_text(theme: &Theme) -> Div {
-    div()
-        .min_w_0()
-        .px(px(8.0))
-        .truncate()
-        .type_style(Type::Small)
-        .text_color(theme.foreground)
+    wrapping_value_text(theme).truncate()
+}
+
+/// [`value_text`] that wraps to its width instead of cutting off.
+pub fn wrapping_value_text(theme: &Theme) -> Div {
+    div().min_w_0().px(px(8.0)).type_style(Type::Small).text_color(theme.foreground)
 }
 
 #[cfg(test)]

@@ -21,8 +21,10 @@ changes.
   `pane-scroll` (still on `detail_scroll`, so the editors keep their caret in
   view and the keys still page it), and the `pane-side` column, its own
   scroll with a 1pt divider on its left, holding the same property table
-  in the same order with the same pickers. The labels are 84pt there
-  (`SIDE_LABEL_W`) instead of 108pt, which leaves the values 144pt. The
+  in the same order with the same pickers. Each label sits over its value
+  there, both the column's width
+  ([`pane-side-props-stacked`](pane-side-props-stacked.md); it first had
+  84pt labels beside 144pt values, which cut them off). The
   divider between the properties and the body goes (nothing is over the
   body to set off), and the dates stay under the body in both layouts. The
   Header and the session area under the resize handle stay full width.

@@ -30,7 +30,9 @@
 //! (`pane-responsive-props`): the title, body and dates scroll on the left,
 //! and the same property table, in the same order with the same pickers,
 //! sits in a [`SIDE_W`] column on the right behind its own divider, the way
-//! Linear's issue view has it. Only the details split: the Header and the
+//! Linear's issue view has it. The column has height to spare but not
+//! width, so each label sits on its own line over its value
+//! (`pane-side-props-stacked`), the value the column's full width. Only the details split: the Header and the
 //! session area stay full width. The switch follows a drag of the edge
 //! live, and a reader in the body keeps their line across it
 //! ([`body_probe`]).
@@ -83,8 +85,11 @@ use shelbi_core::StatusCategory;
 use shelbi_state::keymap::PopoverAction;
 
 use super::board_state::{BoardState, Intent, Mode, PaneAction, PaneProperties, Property, PropertyRow};
-use super::floating_pane::{self, header_button, property_row_at, value_text, PaneIds, INSET, LABEL_W, RADIUS};
-use super::pane_width::{keep_body_line, PaneLayout, SIDE_LABEL_W, SIDE_W};
+use super::floating_pane::{
+    self, header_button, property_beside, property_label, property_over, property_value, value_text, wrapping_value_text,
+    PaneIds, INSET, RADIUS,
+};
+use super::pane_width::{keep_body_line, PaneLayout, SIDE_W};
 use super::issues::IssuesView;
 use super::pane_session::PaneSession;
 use super::pane_split::{GRIP_H, GRIP_RADIUS, GRIP_W, HANDLE_H, SESSION_H, SESSION_HEADER_H};
@@ -687,15 +692,16 @@ fn properties(
     theme: &Theme,
     cx: &mut Context<IssuesView>,
 ) -> Div {
-    let label_w = match layout {
-        PaneLayout::Stacked => LABEL_W,
-        PaneLayout::Split => SIDE_LABEL_W,
-    };
     let mut rows = div()
         .debug_selector(|| "pane-properties".into())
         .flex()
         .flex_col()
-        .gap(px(6.0))
+        .gap(px(match layout {
+            PaneLayout::Stacked => 6.0,
+            // Wider than a label's gap over its value, so each pair reads
+            // as one.
+            PaneLayout::Split => 12.0,
+        }))
         .w_full()
         .min_w_0();
     let shown = view.state.pane_properties(&d.id).unwrap_or_else(|| PaneProperties {
@@ -717,8 +723,7 @@ fn properties(
     for (property, label, icon, value) in values {
         let pending = shown.pending == Some(property);
         let value = value_picker(view, property, icon, value, pending, theme, cx);
-        let row = SharedString::from(format!("pane-row-{}", property.slug()));
-        rows = rows.child(property_row_at(theme, label, label_w, value).debug_selector(move || row.to_string()));
+        rows = rows.child(property_at(layout, theme, property.slug(), label, value));
     }
     // The estimate, while the issue has one: `2h · 1h 12m elapsed (60%)`,
     // in the warning color once overdue. Read against the clock at this
@@ -726,20 +731,22 @@ fn properties(
     if let Some(est) = d.estimate {
         let progress = est.progress(chrono::Utc::now());
         let color = if progress.overdue() { theme.warning } else { theme.foreground };
-        rows = rows.child(property_row_at(
+        rows = rows.child(property_at(
+            layout,
             theme,
+            "estimate",
             "Estimate",
-            label_w,
             value_text(theme)
                 .debug_selector(|| "pane-estimate".into())
                 .text_color(color)
                 .child(progress.label()),
         ));
     }
-    rows = rows.child(property_row_at(
+    rows = rows.child(property_at(
+        layout,
         theme,
+        "branch",
         "Branch",
-        label_w,
         match &d.branch {
             // Selectable and copyable (More copies it too); not an editor:
             // the branch is derived, and made when work starts.
@@ -752,7 +759,7 @@ fn properties(
                 .child(TextView::markdown(ElementId::Name(SharedString::from(format!("branch-{}", d.id))), plain(b)).selectable(true)),
             None => value_text(theme).text_color(theme.muted).child("Created when work starts"),
         },
-    ).debug_selector(|| "pane-row-branch".into()));
+    ));
     // Tracker ownership, on a remote tracker only: whose the issue is, and for
     // one that isn't the user's, how to claim it (Start isn't offered).
     if let Some(owner) = &d.tracker_owner {
@@ -761,27 +768,63 @@ fn properties(
         } else {
             format!("{}  ·  not yours: `shelbi issue start {} --take` claims it", owner.label(), d.id)
         };
-        rows = rows.child(property_row_at(theme, "Owner", label_w, value_text(theme).child(text)));
+        rows = rows.child(property_at(layout, theme, "owner", "Owner", text_value(layout, theme).child(text)));
     }
     if !d.depends_on.is_empty() {
         let deps = d.depends_on.iter().map(dep_text).collect::<Vec<_>>().join(", ");
         let label = if d.blocked { "Blocked by" } else { "Depends on" };
-        let value = value_text(theme).debug_selector(|| "pane-deps".into()).child(deps);
-        rows = rows.child(property_row_at(theme, label, label_w, value));
+        let value = text_value(layout, theme).debug_selector(|| "pane-deps".into()).child(deps);
+        rows = rows.child(property_at(layout, theme, "deps", label, value));
     }
     if let Some(pr) = &d.pr {
         let mut link = task_panel::pr_link("pr-link", pr, false, theme);
         if let Some(url) = pr.url.clone() {
             link = link.on_click(move |_, _, cx| cx.open_url(&url));
         }
-        rows = rows.child(property_row_at(
+        rows = rows.child(property_at(
+            layout,
             theme,
+            "pr",
             "PR",
-            label_w,
-            div().flex().flex_row().items_center().min_w_0().px(px(8.0)).child(task_panel::pr_value(link, pr, theme)),
+            div().flex().flex_row().items_center().min_w_0().px(px(8.0)).child(
+                // In the side column, the CI goes under the number and state
+                // when they don't all fit on one line, rather than cut off.
+                task_panel::pr_value(link, pr, theme)
+                    .when(layout == PaneLayout::Split, |d| d.flex_1().flex_wrap().gap_y(px(2.0))),
+            ),
         ));
     }
     rows
+}
+
+/// A property as the pane's `layout` draws it: its label in the muted
+/// column beside its value under the title (as the frame does), or on its
+/// own line over its value in the side column, which has height to spare
+/// but not width. `slug` names its selectors: `pane-row-<slug>`, and
+/// `pane-label-<slug>` and `pane-value-<slug>` for its pieces.
+fn property_at(
+    layout: PaneLayout,
+    theme: &Theme,
+    slug: &'static str,
+    label: &'static str,
+    value: impl IntoElement,
+) -> Div {
+    let label = property_label(theme, label).debug_selector(move || format!("pane-label-{slug}"));
+    let value = property_value(value).debug_selector(move || format!("pane-value-{slug}"));
+    match layout {
+        PaneLayout::Stacked => property_beside(label, value),
+        PaneLayout::Split => property_over(label, value),
+    }
+    .debug_selector(move || format!("pane-row-{slug}"))
+}
+
+/// A prose value (the owner, the dependencies): cut off beside its label,
+/// wrapped to the side column's width under it.
+fn text_value(layout: PaneLayout, theme: &Theme) -> Div {
+    match layout {
+        PaneLayout::Stacked => value_text(theme),
+        PaneLayout::Split => wrapping_value_text(theme),
+    }
 }
 
 /// A property's value as the frames draw it (`2565:13093`): the Button at
