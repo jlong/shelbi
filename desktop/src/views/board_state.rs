@@ -71,13 +71,14 @@ pub enum Mode {
     /// in-place editors (the title, the body) has them: the editor owns the
     /// keys then (see [`BoardState::handle_key`]).
     Detail { id: String, editing: bool },
-    /// The pane's More menu, its keyboard row at `cursor`
+    /// The pane's More menu, its keyboard row at `cursor` (`None` until an
+    /// arrow key picks one: opening it highlights nothing)
     /// ([`BoardState::pane_actions`]).
-    PaneMenu { cursor: usize },
+    PaneMenu { cursor: Option<usize> },
     /// A card's context menu (a right-click on it), its keyboard row at
     /// `cursor`: the More menu's rows for card `id`
     /// ([`BoardState::actions`]), whichever task the pane shows.
-    CardMenu { id: String, cursor: usize },
+    CardMenu { id: String, cursor: Option<usize> },
     /// The picker under one of the pane's property values, its keyboard row
     /// at `cursor` ([`BoardState::property_rows`]).
     PropertyPicker { property: Property, cursor: usize },
@@ -88,9 +89,21 @@ pub enum Mode {
     /// Confirm deleting `id` (More ▸ Delete issue…, ⌘⌫): Enter deletes, Esc
     /// (or Cancel) goes back to the pane with nothing done.
     ConfirmDelete { id: String },
-    /// The header's ⋮ menu, its keyboard row at `cursor`
-    /// ([`BoardState::header_items`]).
-    HeaderMenu { cursor: usize },
+    /// The header's ⋮ menu, its keyboard row at `cursor` (`None` until an
+    /// arrow key picks one) ([`BoardState::header_items`]).
+    HeaderMenu { cursor: Option<usize> },
+}
+
+/// The keyboard's next row in a menu of `n` (`n > 0`) from `cursor`,
+/// wrapping: with no row yet (a menu just opened, highlighting nothing),
+/// the first going down and the last going up.
+fn menu_step(cursor: Option<usize>, n: usize, down: bool) -> usize {
+    match (cursor, down) {
+        (None, true) => 0,
+        (None, false) => n - 1,
+        (Some(c), true) => (c + 1) % n,
+        (Some(c), false) => (c + n - 1) % n,
+    }
 }
 
 /// A row of the Issues header's ⋮ menu (Figma 2753:11687).
@@ -858,7 +871,7 @@ impl BoardState {
     pub fn toggle_header_menu(&mut self) {
         self.mode = match self.mode {
             Mode::HeaderMenu { .. } => self.rest(),
-            _ => Mode::HeaderMenu { cursor: 0 },
+            _ => Mode::HeaderMenu { cursor: None },
         };
     }
 
@@ -874,15 +887,17 @@ impl BoardState {
         }
     }
 
-    fn header_menu_key(&mut self, cursor: usize, chord: KeyChord) -> Vec<Intent> {
+    fn header_menu_key(&mut self, cursor: Option<usize>, chord: KeyChord) -> Vec<Intent> {
         let n = self.header_items().len();
         match chord.code {
             Key::Esc => self.mode = self.rest(),
-            Key::Up | Key::Char('k') => {
-                self.mode = Mode::HeaderMenu { cursor: if cursor == 0 { n - 1 } else { cursor - 1 } }
+            Key::Up | Key::Char('k') => self.mode = Mode::HeaderMenu { cursor: Some(menu_step(cursor, n, false)) },
+            Key::Down | Key::Char('j') => self.mode = Mode::HeaderMenu { cursor: Some(menu_step(cursor, n, true)) },
+            Key::Enter | Key::Char(' ') => {
+                if let Some(cursor) = cursor {
+                    return self.choose_header_item(cursor);
+                }
             }
-            Key::Down | Key::Char('j') => self.mode = Mode::HeaderMenu { cursor: (cursor + 1) % n },
-            Key::Enter | Key::Char(' ') => return self.choose_header_item(cursor),
             _ => {}
         }
         Vec::new()
@@ -1051,7 +1066,7 @@ impl BoardState {
         }
         self.mode = match self.mode {
             Mode::PaneMenu { .. } => self.rest(),
-            _ => Mode::PaneMenu { cursor: 0 },
+            _ => Mode::PaneMenu { cursor: None },
         };
     }
 
@@ -1074,7 +1089,7 @@ impl BoardState {
             return false;
         };
         self.select(c, r);
-        self.mode = Mode::CardMenu { id: id.to_string(), cursor: 0 };
+        self.mode = Mode::CardMenu { id: id.to_string(), cursor: None };
         true
     }
 
@@ -1316,20 +1331,23 @@ impl BoardState {
 
     /// The keys of an action menu: the pane's More (`card` `None`) or card
     /// `card`'s context menu, the same keys on the same list.
-    fn action_menu_key(&mut self, card: Option<String>, cursor: usize, chord: KeyChord) -> Vec<Intent> {
+    fn action_menu_key(&mut self, card: Option<String>, cursor: Option<usize>, chord: KeyChord) -> Vec<Intent> {
         let n = match &card {
             Some(id) => self.actions(id).len(),
             None => self.pane_actions().len(),
         };
         let at = |cursor| match &card {
-            Some(id) => Mode::CardMenu { id: id.clone(), cursor },
-            None => Mode::PaneMenu { cursor },
+            Some(id) => Mode::CardMenu { id: id.clone(), cursor: Some(cursor) },
+            None => Mode::PaneMenu { cursor: Some(cursor) },
         };
         match chord.code {
             Key::Esc | Key::Char('q') => self.mode = self.rest(),
-            Key::Up | Key::Char('k') if n > 0 => self.mode = at(if cursor == 0 { n - 1 } else { cursor - 1 }),
-            Key::Down | Key::Char('j') if n > 0 => self.mode = at((cursor + 1) % n),
+            Key::Up | Key::Char('k') if n > 0 => self.mode = at(menu_step(cursor, n, false)),
+            Key::Down | Key::Char('j') if n > 0 => self.mode = at(menu_step(cursor, n, true)),
             Key::Enter | Key::Char(' ') => {
+                let Some(cursor) = cursor else {
+                    return Vec::new();
+                };
                 return match card {
                     Some(id) => self.choose_action(Some(id), cursor),
                     None => self.choose_pane_action(cursor),
@@ -2947,13 +2965,18 @@ pub(crate) mod tests {
         assert_eq!(actions[actions.len() - 2..], [OpenWorkspace, Delete]);
 
         b.toggle_pane_menu();
-        assert_eq!(b.mode, Mode::PaneMenu { cursor: 0 });
+        assert_eq!(b.mode, Mode::PaneMenu { cursor: None }, "opening it highlights nothing");
+        assert!(press(&mut b, "enter").is_empty(), "Enter with nothing highlighted runs nothing");
+        assert_eq!(b.mode, Mode::PaneMenu { cursor: None });
         press(&mut b, "k");
-        assert_eq!(b.mode, Mode::PaneMenu { cursor: 7 }, "up wraps to the last row");
+        assert_eq!(b.mode, Mode::PaneMenu { cursor: Some(7) }, "up from nothing is the last row");
+        press(&mut b, "j");
+        assert_eq!(b.mode, Mode::PaneMenu { cursor: Some(0) }, "down wraps to the first");
         press(&mut b, "esc");
         assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "Esc closes the menu, not the pane");
 
         b.toggle_pane_menu();
+        press(&mut b, "j");
         press(&mut b, "j");
         press(&mut b, "j");
         assert_eq!(press(&mut b, "enter"), vec![Intent::Command(CommandKind::StartIssue { id: "A".into() })]);
@@ -2975,7 +2998,7 @@ pub(crate) mod tests {
         let mut b = board(vec![assigned, issue("B", "todo")]);
         // With the pane closed: the right-clicked card's rows, the cursor on it.
         assert!(b.open_card_menu("B"));
-        assert_eq!(b.mode, Mode::CardMenu { id: "B".into(), cursor: 0 });
+        assert_eq!(b.mode, Mode::CardMenu { id: "B".into(), cursor: None }, "a right-click highlights no row");
         assert_eq!(b.selected_card().map(|c| c.id.as_str()), Some("B"), "the board's cursor moves onto it");
         assert_eq!(b.detail_id(), None, "no pane opens");
         b.open_detail("B");
@@ -2989,10 +3012,10 @@ pub(crate) mod tests {
         assert_eq!(b.detail_id(), Some("A"));
         // Its keys are the More menu's.
         press(&mut b, "k");
-        assert_eq!(b.mode, Mode::CardMenu { id: "B".into(), cursor: b_rows.len() - 1 }, "up wraps");
+        assert_eq!(b.mode, Mode::CardMenu { id: "B".into(), cursor: Some(b_rows.len() - 1) }, "up: the last row");
         press(&mut b, "j");
         press(&mut b, "j");
-        assert_eq!(b.mode, Mode::CardMenu { id: "B".into(), cursor: 1 });
+        assert_eq!(b.mode, Mode::CardMenu { id: "B".into(), cursor: Some(1) }, "down wraps");
         press(&mut b, "esc");
         assert_eq!(b.mode, Mode::Detail { id: "A".into(), editing: false }, "Esc goes back to the pane");
         // Not over a picker or prompt, and not for a card that isn't there.
@@ -3763,9 +3786,12 @@ pub(crate) mod tests {
         let mut b = board(vec![issue("A", "todo")]);
         assert_eq!(b.header_items(), [HeaderItem::ConnectTracker, HeaderItem::Settings]);
         b.toggle_header_menu();
-        assert_eq!(b.mode, Mode::HeaderMenu { cursor: 0 });
+        assert_eq!(b.mode, Mode::HeaderMenu { cursor: None }, "opening it highlights nothing");
+        assert!(press(&mut b, "enter").is_empty(), "nor does Enter run anything then");
         assert!(press(&mut b, "down").is_empty());
-        assert_eq!(b.mode, Mode::HeaderMenu { cursor: 1 });
+        assert_eq!(b.mode, Mode::HeaderMenu { cursor: Some(0) }, "down: the first row");
+        assert!(press(&mut b, "down").is_empty());
+        assert_eq!(b.mode, Mode::HeaderMenu { cursor: Some(1) });
         assert_eq!(
             press(&mut b, "enter"),
             vec![Intent::OpenSettings(shelbi_app::settings::SettingsPage::Properties)],
@@ -3784,6 +3810,7 @@ pub(crate) mod tests {
         b.apply_open(r);
         assert_eq!(b.header_items(), [HeaderItem::Settings]);
         b.toggle_header_menu();
+        press(&mut b, "down");
         assert_eq!(
             press(&mut b, "enter"),
             vec![Intent::OpenSettings(shelbi_app::settings::SettingsPage::Properties)]

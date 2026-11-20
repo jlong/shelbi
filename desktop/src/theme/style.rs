@@ -375,6 +375,142 @@ pub fn disabled_menu_row(id: impl Into<SharedString>, theme: &Theme) -> Stateful
         .text_color(theme.foreground)
 }
 
+// ---- the Menu (Figma 2879:26546, its items 2879:26156) --------------------
+
+/// The Menu's width.
+pub const MENU_WIDTH: f32 = 236.0;
+/// The Menu's corners.
+pub const MENU_RADIUS: f32 = 10.0;
+/// The Menu's padding above its first item and below its last.
+pub const MENU_PAD_Y: f32 = 8.0;
+/// A Menu Item's height.
+pub const MENU_ITEM_H: f32 = 36.0;
+/// A Menu Item's content inset from the Menu's edge.
+pub const MENU_ITEM_PAD_X: f32 = 16.0;
+
+/// The Menu's drop: `0 8 24` at 10% and `0 4 8` at 5% of `#0a1e51`, in
+/// both modes (an effect in the file, not a variable).
+pub fn menu_shadow() -> Vec<BoxShadow> {
+    let ink = |alpha: u32| -> Hsla { gpui::rgba(0x0a1e5100 | alpha).into() };
+    vec![
+        BoxShadow::new(px(0.0), px(8.0), ink(0x1a)).blur_radius(figma_blur(24.0)),
+        BoxShadow::new(px(0.0), px(4.0), ink(0x0d)).blur_radius(figma_blur(8.0)),
+    ]
+}
+
+/// Paint `el` as the Menu: the canvas, a 1px `divider` edge, 10pt
+/// corners, 8pt above and below its items, and [`menu_shadow`]. Its
+/// items ([`menu_item`]) and rules ([`menu_divider`]) span its width. It
+/// paints from the opaque theme ([`Theme::opaque`]), so a translucent
+/// window doesn't show through it.
+pub fn menu<E: Styled>(el: E, theme: &Theme) -> E {
+    let theme = theme.opaque();
+    el.bg(theme.canvas)
+        .border_1()
+        .border_color(theme.divider)
+        .rounded(px(MENU_RADIUS))
+        .py(px(MENU_PAD_Y))
+        .shadow(menu_shadow())
+        .text_color(theme.foreground)
+}
+
+/// A Menu `id`, `width` wide, scrolling when [`placed`](crate::elements::placed)
+/// caps it, and taking the presses on it.
+pub fn menu_panel(id: &'static str, width: f32, theme: &Theme) -> Stateful<Div> {
+    menu(
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .flex()
+            .flex_col()
+            .w(px(width))
+            .overflow_y_scroll()
+            .occlude(),
+        theme,
+    )
+}
+
+/// A Menu Item: 36pt, the content 16pt in from the Menu's edge (an icon,
+/// then the label, 8pt apart), Base in `foreground`. Its fill
+/// (`theme.background`, square, the Menu's full inner width) shows only
+/// while the pointer is over it, fading in and out, or while it is the
+/// keyboard's row (`highlighted`: after an arrow key, never on opening).
+/// It never shrinks, so a capped menu scrolls its items whole. Like the
+/// Menu, it paints from the opaque theme.
+pub fn menu_item(id: impl Into<SharedString>, highlighted: bool, theme: &Theme) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let theme = &theme.opaque();
+    let d = menu_item_shell(id.clone(), theme).cursor_pointer();
+    let rest = if highlighted { theme.background } else { theme.background.opacity(0.0) };
+    fill_layer(d, id, px(0.0), [rest, theme.background, theme.background_hover])
+}
+
+/// [`menu_item`] that can't be chosen: at the disabled opacity, with no
+/// fill, press or pointer.
+pub fn disabled_menu_item(id: impl Into<SharedString>, theme: &Theme) -> Stateful<Div> {
+    menu_item_shell(id.into(), &theme.opaque()).opacity(0.4)
+}
+
+fn menu_item_shell(id: SharedString, theme: &Theme) -> Stateful<Div> {
+    let selector = id.clone();
+    div()
+        .id(id)
+        .debug_selector(move || selector.to_string())
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap_2()
+        .h(px(MENU_ITEM_H))
+        .px(px(MENU_ITEM_PAD_X))
+        .type_style(Type::Base)
+        .text_color(theme.foreground)
+}
+
+/// The Menu Divider: a 1px `divider_strong` rule with 8pt all round.
+pub fn menu_divider(theme: &Theme) -> Div {
+    div()
+        .flex_none()
+        .p(px(8.0))
+        .child(div().h(px(1.0)).w_full().bg(theme.opaque().divider_strong))
+}
+
+/// The Toolbar Button (Figma 2196:9319): a 32pt circle around a 20pt
+/// icon. At rest just the icon (`theme.icon`); the `theme.background` fill
+/// fades in on hover and deepens to `background_hover` while pressed. While
+/// `selected` (its menu is open) it takes the Select style: the cyan
+/// `select_fill` and a `select_label` icon.
+pub fn toolbar_icon_button(
+    id: impl Into<SharedString>,
+    icon: Svg,
+    selected: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let fills = if selected {
+        [theme.select_fill, theme.select_fill_hover, theme.select_fill_active]
+    } else {
+        [theme.background.opacity(0.0), theme.background, theme.background_hover]
+    };
+    let color = if selected { theme.select_label } else { theme.icon };
+    let radius = px(TOOLBAR_ICON_BUTTON / 2.0);
+    let selector = id.clone();
+    let d = div()
+        .id(id.clone())
+        .debug_selector(move || selector.to_string())
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(TOOLBAR_ICON_BUTTON))
+        .rounded(radius)
+        .cursor_pointer();
+    fill_layer(d, id, radius, fills).child(icon.text_color(color))
+}
+
+/// The Toolbar Button's square.
+pub const TOOLBAR_ICON_BUTTON: f32 = 32.0;
+
 /// A section heading: Base medium, loud.
 pub fn heading(text: impl Into<SharedString>, theme: &Theme) -> Div {
     div()

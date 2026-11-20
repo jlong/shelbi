@@ -114,8 +114,6 @@ const FOOTER_H: f32 = 29.0;
 /// the selected card's focus glow (4px outside it) isn't cut off while the
 /// cards keep the column's full width.
 const GLOW_ROOM: f32 = 6.0;
-/// The header's ⋮ menu's width (the frame's, 2753:11687).
-const HEADER_MENU_W: f32 = 236.0;
 
 /// What the view asks of the window.
 #[derive(Debug, Clone)]
@@ -1641,41 +1639,35 @@ impl IssuesView {
     fn render_header_menu(&self, cx: &mut Context<Self>) -> gpui::Div {
         use super::board_state::HeaderItem;
         let theme = *cx.global::<Theme>();
-        let cursor = match self.state.mode {
-            Mode::HeaderMenu { cursor } => Some(cursor),
-            _ => None,
+        let (open, cursor) = match self.state.mode {
+            Mode::HeaderMenu { cursor } => (true, cursor),
+            _ => (false, None),
         };
-        let open = cursor.is_some();
         let items = self.state.header_items();
-        let button = style::content_button(
-            "board-more",
-            style::ButtonContent::default().left(icons::ELLIPSIS_VERTICAL),
-            if open { ButtonKind::Primary } else { ButtonKind::Secondary },
-            ButtonSize::Small,
-            false,
-            &theme,
-        )
-        .role(gpui::Role::Button)
-        .aria_label("More")
-        .tooltip(style::tooltip("More"));
-        super::workflow_editor::dropdown(
+        // The Toolbar Button (2196:9319), in its Select style while its menu
+        // is up.
+        let button = style::toolbar_icon_button("board-more", heroicon(icons::ELLIPSIS_VERTICAL), open, &theme)
+            .role(gpui::Role::Button)
+            .aria_label("More")
+            .tooltip(style::tooltip("More"));
+        super::workflow_editor::menu_dropdown(
             open,
             &self.header_menu_anchor,
             "board-menu",
             button,
             move |cx| {
-                let theme = cx.global::<Theme>().opaque();
+                let theme = *cx.global::<Theme>();
                 let mut rows: Vec<AnyElement> = Vec::new();
                 for (ix, item) in items.iter().copied().enumerate() {
                     if ix > 0 {
-                        rows.push(super::workflow_editor::menu_rule(&theme).into_any_element());
+                        rows.push(style::menu_divider(&theme).into_any_element());
                     }
                     let icon = match item {
                         HeaderItem::ConnectTracker => icons::SQUARES_PLUS,
                         HeaderItem::Settings => icons::COG_6_TOOTH,
                     };
                     rows.push(
-                        style::menu_row(format!("board-menu-{}", item.slug()), cursor == Some(ix), &theme)
+                        style::menu_item(format!("board-menu-{}", item.slug()), cursor == Some(ix), &theme)
                             .child(heroicon(icon).text_color(theme.icon))
                             .child(div().flex_1().min_w_0().truncate().child(item.label()))
                             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
@@ -1688,7 +1680,7 @@ impl IssuesView {
                 }
                 rows
             },
-            HEADER_MENU_W,
+            style::MENU_WIDTH,
             true,
             |this: &mut IssuesView, cx| {
                 this.state.toggle_header_menu();
@@ -3043,6 +3035,35 @@ mod tests {
         assert!(!drawn(&mut cx, "board-menu-connect-tracker"));
     }
 
+    /// The ⋮ is the Toolbar Button (2196:9319) and its menu the Menu
+    /// (2879:26546): a click opens it with no row highlighted, and the
+    /// arrows then pick one for Enter.
+    #[gpui::test]
+    fn the_header_menu_is_the_figma_menu_and_opens_unhighlighted(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        let (view, mut cx) = open_board(cx, vec![issue("T1", "todo")]);
+        let events = record(&view, &mut cx);
+        let button = bounds(&mut cx, "board-more");
+        assert_eq!((button.size.width, button.size.height), (px(32.0), px(32.0)));
+
+        click(&mut cx, "board-more");
+        let mode = |cx: &gpui::VisualTestContext| view.read_with(cx, |v, _| v.state.mode.clone());
+        assert_eq!(mode(&cx), Mode::HeaderMenu { cursor: None }, "a click highlights no row");
+        let menu = bounds(&mut cx, "board-menu");
+        assert_eq!(menu.size.width, px(style::MENU_WIDTH));
+        let connect = bounds(&mut cx, "board-menu-connect-tracker");
+        assert_eq!(connect.size.height, px(style::MENU_ITEM_H));
+        assert_eq!(connect.left() - menu.left(), px(1.0), "the full inner width, inside the 1px edge");
+        assert_eq!(connect.size.width, menu.size.width - px(2.0));
+        assert_eq!(connect.top() - menu.top(), px(1.0 + style::MENU_PAD_Y), "8pt under the 1px edge");
+
+        cx.simulate_keystrokes("down");
+        assert_eq!(mode(&cx), Mode::HeaderMenu { cursor: Some(0) });
+        cx.simulate_keystrokes("enter");
+        assert_eq!(events.borrow().as_slice(), [CommandKind::ConnectTracker]);
+        assert!(!drawn(&mut cx, "board-menu"));
+    }
+
     // ---- the task pane (`dt-floating-task-pane`) ---------------------------
 
     /// A card in each of the default workflow's columns, more than a 1160pt
@@ -3896,7 +3917,7 @@ mod tests {
         assert!((menu.top() - (at.y + px(2.0))).abs() < px(1.0), "just under it: {menu:?} {at:?}");
         assert_eq!(
             view.read_with(&cx, |v, _| v.state.mode.clone()),
-            Mode::CardMenu { id: "B".into(), cursor: 0 }
+            Mode::CardMenu { id: "B".into(), cursor: None }
         );
         assert_eq!(view.read_with(&cx, |v, _| v.state.selected_card().map(|c| c.id.clone())).as_deref(), Some("B"));
         assert_eq!(pane_id(&view, &cx), None, "a right-click doesn't open the pane");
@@ -3999,7 +4020,7 @@ mod tests {
         right_click(&mut cx, "card-B");
         assert!(board_focused(&view, &mut cx), "the menu has the keys, not the editor");
         cx.simulate_keystrokes("down");
-        assert_eq!(view.read_with(&cx, |v, _| v.state.mode.clone()), Mode::CardMenu { id: "B".into(), cursor: 1 });
+        assert_eq!(view.read_with(&cx, |v, _| v.state.mode.clone()), Mode::CardMenu { id: "B".into(), cursor: Some(0) });
         cx.simulate_keystrokes("escape");
         assert!(!drawn(&mut cx, "card-menu"));
         assert_eq!(pane_id(&view, &cx).as_deref(), Some("A"));

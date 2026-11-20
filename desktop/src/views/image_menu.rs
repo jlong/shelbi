@@ -20,15 +20,13 @@ use std::path::{Path, PathBuf};
 
 use futures::future::LocalBoxFuture;
 use futures::AsyncReadExt as _;
-use gpui::{deferred, div, prelude::*, px, AnyElement, App, ClickEvent, MouseDownEvent, SharedString, Window};
+use gpui::{deferred, div, prelude::*, AnyElement, App, ClickEvent, MouseDownEvent, SharedString, Window};
 use shelbi_app::changelog::{percent_decode, ImageSource};
 
 use crate::elements::placed::placed;
 use crate::theme::style::{self, Anchor};
 use crate::theme::Theme;
 
-/// The menu's width.
-const MENU_W: f32 = 200.0;
 /// The room between the pointer and the menu (the tab menu's).
 const CONTEXT_GAP: f32 = 2.0;
 /// Its row's label.
@@ -166,23 +164,12 @@ pub fn render(
     download: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let theme = theme.opaque();
     let row = match refusal(&menu.source) {
-        Some(why) => style::disabled_menu_row(DOWNLOAD_ROW, &theme).tooltip(style::tooltip(why)),
-        None => style::menu_row(DOWNLOAD_ROW, false, &theme).on_click(download),
+        Some(why) => style::disabled_menu_item(DOWNLOAD_ROW, theme).tooltip(style::tooltip(why)),
+        None => style::menu_item(DOWNLOAD_ROW, false, theme).on_click(download),
     };
-    let body = style::popover(
-        div()
-            .id(MENU)
-            .debug_selector(|| MENU.into())
-            .flex()
-            .flex_col()
-            .p_1()
-            .w(px(MENU_W))
-            .occlude()
-            .child(row.child(div().flex_1().min_w_0().truncate().child(SharedString::from(DOWNLOAD_LABEL)))),
-        &theme,
-    );
+    let body = style::menu_panel(MENU, style::MENU_WIDTH, theme)
+        .child(row.child(div().flex_1().min_w_0().truncate().child(SharedString::from(DOWNLOAD_LABEL))));
     let placed = placed(&menu.anchor, body).gap(CONTEXT_GAP).on_dismiss(dismiss);
     // Over the overlay layer (the lightbox) and the tab bar's menu.
     deferred(placed).with_priority(2).into_any_element()
