@@ -308,6 +308,16 @@ pub(crate) fn zen_event(project: &str, state: &IntroState, outcome: IntroOutcome
 pub trait OverlayHost: 'static + Sized {
     fn overlay_mut(&mut self) -> Option<&mut ActiveOverlay>;
     fn overlay_event(&mut self, event: OverlayEvent, window: &mut Window, cx: &mut Context<Self>);
+    /// A right-click on the lightbox's image at `at`: the image menu there,
+    /// over the overlay, which stays open. A host with no menu ignores it.
+    fn open_image_menu(
+        &mut self,
+        _source: shelbi_app::changelog::ImageSource,
+        _at: gpui::Point<gpui::Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
 }
 
 /// Run `f` on the open overlay, then hand what it resolved to the host. The

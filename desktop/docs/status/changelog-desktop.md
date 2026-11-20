@@ -115,3 +115,33 @@ own size, and a placeholder, stay inert.
 - Esc, or a click on the scrim, the image or the close button, closes it;
   the keys go back to the Changelog, which keeps its scroll. Its entrance is
   the overlay layer's slide-and-fade, drawn in place under Reduce Motion.
+
+## Downloading an image (`changelog-image-download`)
+
+A right-click on any image the Changelog draws (a figure in the column,
+scaled down or not, a local file or a web image, or the lightbox's image)
+opens the image menu at the pointer (`src/views/image_menu.rs`). A
+placeholder (a missing file, a remote window's local image) has no menu.
+
+- The window owns the menu (`ShelbiWindow::image_menu`), so the column and
+  the lightbox share it: a figure sends `ChangelogEvent::ImageMenu`, the
+  lightbox calls `OverlayHost::open_image_menu`. It follows the tab bar's
+  context menu: anchored at the pointer, drawn `deferred` (over the
+  lightbox), a press outside closes it and goes no further, Esc closes it
+  (and only it: the lightbox under it stays). A right-click never opens the
+  lightbox or moves the page; a left-click is still the lightbox's.
+- Its one row, "Download Image…", opens gpui's save panel
+  (`prompt_for_new_path`) in `~/Downloads` with the image's file name (from
+  its path, or the last part of its URL, unescaped; `image.png` when there
+  is none). Saving writes the bytes unchanged, off the UI thread: a copy of
+  a local file, or the body of a fresh download of a web image through the
+  app's HTTP client (the one gpui loads web images through). Cancel does
+  nothing; a failure is an error toast.
+- An image whose bytes aren't on this machine (`image_menu::refusal`) shows
+  the row dimmed, with why on hover. No figure reaches it today, since those
+  draw as placeholders, which have no menu.
+- Tests: `src/app_image_menu_tests.rs` (the window: at the pointer, over the
+  lightbox, Esc and a press outside, the save flow with the panel stubbed
+  through `ShelbiWindow::save_panel`, a fake HTTP client for web images),
+  `views/markdown.rs` (right-click on a drawn figure, none on a
+  placeholder), `views/changelog.rs` (a real figure's right-click).

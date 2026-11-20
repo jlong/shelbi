@@ -102,6 +102,7 @@ pub mod far_editor;
 pub mod feedback;
 pub mod floating_pane;
 pub mod harness_picker;
+pub mod image_menu;
 pub mod new_task;
 pub mod font_picker;
 pub mod issues;
