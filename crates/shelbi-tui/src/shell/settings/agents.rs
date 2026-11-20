@@ -1359,7 +1359,7 @@ mod tests {
                 status: None,
                 left: None,
             };
-            d.s.open();
+            d.s.open(None);
             let action = d.s.request(Leave::Page(SettingsPage::Agents));
             d.apply(action);
             d.s.set_region(Region::Page);

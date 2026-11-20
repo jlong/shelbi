@@ -6538,6 +6538,48 @@ mod tests {
         assert!(err.contains("can't take"), "{err}");
     }
 
+    fn gate_with_rules(
+        issue: &'static str,
+        rules: shelbi_core::AgentRules,
+    ) -> (std::result::Result<crate::ownership::Claim, String>, Vec<String>) {
+        let (store, calls) = ownership_store(issue, "octocat", CLAIMED);
+        let tf = store.get("t").unwrap().expect("issue t");
+        let cfg = shelbi_core::IssueTrackerConfig { agent_rules: rules, ..ownership_cfg() };
+        let out = crate::ownership::ensure_owned_for_dispatch(&cfg, &store, &tf, false);
+        let calls = calls.lock().unwrap().clone();
+        (out, calls)
+    }
+
+    #[test]
+    fn assigned_only_on_refuses_an_unassigned_issue_naming_the_rule() {
+        let _home = HomeGuard::new("own-rule-on");
+        let (out, calls) = gate_with_rules(NOBODYS, shelbi_core::AgentRules::default());
+        let err = out.unwrap_err();
+        assert!(err.contains("not assigned to anyone"), "{err}");
+        assert!(err.contains("\"Only work on issues assigned to me\""), "{err}");
+        assert!(call_containing(&calls, &["/assignees"]).is_none(), "{calls:?}");
+        // A teammate's refusal isn't about the rule.
+        let err = gate_with_rules(THEIRS, shelbi_core::AgentRules::default()).0.unwrap_err();
+        assert!(!err.contains("agent rule"), "{err}");
+    }
+
+    #[test]
+    fn assigned_only_off_claims_an_unassigned_issue_on_start_but_not_a_teammates() {
+        let _home = HomeGuard::new("own-rule-off");
+        let off = shelbi_core::AgentRules { assigned_only: false, ..Default::default() };
+        let (out, calls) = gate_with_rules(NOBODYS, off);
+        assert_eq!(out, Ok(crate::ownership::Claim::Took { login: "octocat".into() }));
+        let claim = call_containing(&calls, &["-X POST", "repos/owner/repo/issues/7/assignees"])
+            .expect("starting it assigns it");
+        assert!(claim.contains("assignees[]=octocat"), "{claim}");
+        // A teammate's issue is still refused, and never claimed.
+        let (out, calls) = gate_with_rules(THEIRS, off);
+        assert!(out.unwrap_err().contains("assigned to @alice"));
+        assert!(call_containing(&calls, &["/assignees"]).is_none(), "{calls:?}");
+        // The user's own passes untouched.
+        assert_eq!(gate_with_rules(MINE, off).0, Ok(crate::ownership::Claim::AlreadyMine));
+    }
+
     #[test]
     fn take_assigns_the_issue_to_the_user_then_passes() {
         let _home = HomeGuard::new("own-gate-take");
@@ -6649,6 +6691,15 @@ mod tests {
         assert_eq!(token("nobody").as_deref(), Some("unassigned"));
         // An issue the open index doesn't carry gets no token.
         assert_eq!(token("missing"), None);
+
+        // With "Only work on issues assigned to me" off, an unassigned line
+        // says starting it claims it; `owner=` itself is unchanged.
+        let yaml = std::fs::read_to_string(projects.join("gp.yaml")).unwrap();
+        std::fs::write(projects.join("gp.yaml"), format!("{yaml}  agent_rules:\n    assigned_only: false\n"))
+            .unwrap();
+        assert_eq!(token("nobody").as_deref(), Some("unassigned claim=on_start"));
+        assert_eq!(token("mine").as_deref(), Some("me"));
+        assert_eq!(token("theirs").as_deref(), Some("other:alice,bob"));
         assert_eq!(
             crate::ownership::gate_from_index("gp", &ownership_cfg()).unwrap(),
             crate::OwnershipGate::RequireAssignee("octocat".into())

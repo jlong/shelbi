@@ -32,12 +32,15 @@
 
 use std::sync::Arc;
 
-use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig};
+use shelbi_core::{AgentRules, IssueTrackerBackend, IssueTrackerConfig};
 
+use crate::github_setup::{GithubAnswer, GithubRequest};
 use crate::linear_setup::{Filter, LinearAnswer, LinearChoice, LinearRequest, TEAM_REQUIRED};
 use crate::new_project::{github_config, IssuesChoice, Tracker};
 use crate::source::ProjectLink;
-use crate::tracker_connect::{ConnectError, ConnectTracker, Connected, StatusSync, TrackerChoice};
+use crate::tracker_connect::{
+    rules_copy, ConnectError, ConnectTracker, Connected, GithubLogin, StatusSync, TrackerChoice,
+};
 
 /// The section's title and the line under it.
 pub const TITLE: &str = "Issue tracker";
@@ -84,8 +87,14 @@ pub struct TrackerService {
     pub connect: Arc<dyn Fn(ConnectTracker) -> Result<Connected, ConnectError> + Send + Sync>,
     /// One Linear read for the pickers (or a pasted key's login).
     pub linear: Arc<dyn Fn(LinearRequest) -> LinearAnswer + Send + Sync>,
+    /// One GitHub read for Connect to an Issue tracker's pickers (the
+    /// account, an owner's repositories, the preflight).
+    pub github: Arc<dyn Fn(GithubRequest) -> GithubAnswer + Send + Sync>,
     /// Sync the status catalog from the tracker now (Workflows' Sync now).
     pub sync_statuses: Arc<dyn Fn() -> StatusSync + Send + Sync>,
+    /// What a first import of a connection would bring in (Connect to an
+    /// Issue tracker's Review your first import).
+    pub preview: Arc<dyn Fn(crate::tracker_connect::TrackerChoice) -> Result<crate::tracker_connect::ImportPreview, String> + Send + Sync>,
 }
 
 impl std::fmt::Debug for TrackerService {
@@ -97,11 +106,13 @@ impl std::fmt::Debug for TrackerService {
 impl TrackerService {
     /// The far daemon's, over `link`.
     pub fn far(link: &ProjectLink) -> Self {
-        let (a, b, c) = (link.clone(), link.clone(), link.clone());
+        let (a, b, c, d, e) = (link.clone(), link.clone(), link.clone(), link.clone(), link.clone());
         TrackerService {
             connect: Arc::new(move |req| crate::far::connect_tracker(&a, req)),
             linear: Arc::new(move |req| crate::far::linear(&b, req)),
+            github: Arc::new(move |req| crate::far::github(&d, req)),
             sync_statuses: Arc::new(move || crate::far::sync_statuses(&c)),
+            preview: Arc::new(move |choice| crate::far::import_preview(&e, choice)),
         }
     }
 }
@@ -122,6 +133,10 @@ pub struct TrackerForm {
     refused: Option<ConnectError>,
     /// The last connection that was written.
     connected: Option<Connected>,
+    /// The agent rules as picked (the project's until edited).
+    rules: AgentRules,
+    /// Whose GitHub account `gh` is, for the assigned-only rule's title.
+    github_login: GithubLogin,
 }
 
 impl Default for TrackerForm {
@@ -134,6 +149,8 @@ impl Default for TrackerForm {
             error: None,
             refused: None,
             connected: None,
+            rules: AgentRules::default(),
+            github_login: GithubLogin::default(),
         }
     }
 }
@@ -168,6 +185,7 @@ impl TrackerForm {
             TrackerChoice::Github { repo } => IssuesChoice::recommended(Some(&repo)),
             TrackerChoice::Linear(conn) => IssuesChoice::linear_with(conn),
         };
+        self.rules = cfg.agent_rules;
         self.edited = false;
         self.error = None;
     }
@@ -313,6 +331,78 @@ impl TrackerForm {
         self.choice.linear_answer(answer);
     }
 
+    // ---- agent rules ------------------------------------------------------
+
+    /// Whether the agent rules apply to the board picked: an external
+    /// tracker's issues only (the local board has no tracker to obey).
+    pub fn shows_rules(&self) -> bool {
+        self.tracker() != Tracker::FileSystem
+    }
+
+    /// The agent rules as picked.
+    pub fn rules(&self) -> AgentRules {
+        self.rules
+    }
+
+    /// Change the agent rules (a toggle). They save with the connection:
+    /// Save on the same board, Connect on a new one.
+    pub fn set_rules(&mut self, rules: AgentRules) {
+        if self.editable() && self.shows_rules() && rules != self.rules {
+            self.rules = rules;
+            self.edit();
+        }
+    }
+
+    /// Flip "Always require human review before beginning work".
+    pub fn toggle_require_review(&mut self) {
+        let rules = self.rules;
+        self.set_rules(AgentRules { require_review: !rules.require_review, ..rules });
+    }
+
+    /// Flip "Only work on issues assigned to me".
+    pub fn toggle_assigned_only(&mut self) {
+        let rules = self.rules;
+        self.set_rules(AgentRules { assigned_only: !rules.assigned_only, ..rules });
+    }
+
+    /// The GitHub account read due now (GitHub picked, not asked yet),
+    /// marked asked: the host runs it with [`TrackerService::github`] and
+    /// answers [`Self::github_answer`].
+    pub fn github_due(&mut self) -> Option<GithubRequest> {
+        (self.tracker() == Tracker::Github && self.github_login.take_due()).then_some(GithubRequest::Account)
+    }
+
+    /// The answer to [`Self::github_due`]'s read.
+    pub fn github_answer(&mut self, answer: GithubAnswer) {
+        self.github_login.answer_account(answer);
+    }
+
+    /// The connected account the assigned-only rule names: GitHub's `gh`
+    /// login, or the Linear key's owner.
+    pub fn account(&self) -> Option<&str> {
+        match self.tracker() {
+            Tracker::Github => self.github_login.login(),
+            Tracker::Linear => self.linear().account(),
+            Tracker::FileSystem => None,
+        }
+    }
+
+    /// "Only work on issues assigned to me (<account>)".
+    pub fn assigned_title(&self) -> String {
+        rules_copy::assigned_title(self.account())
+    }
+
+    /// The request Connect / Save sends for `choice`: with the rules when
+    /// they apply.
+    fn request(&self, choice: TrackerChoice, force: bool) -> ConnectTracker {
+        let req = ConnectTracker::new(choice, force);
+        if self.shows_rules() {
+            req.with_rules(self.rules)
+        } else {
+            req
+        }
+    }
+
     /// The connection as picked, `None` while it can't be one (a Linear
     /// choice with no team, an empty repo).
     pub fn wanted(&self) -> Option<TrackerChoice> {
@@ -332,7 +422,9 @@ impl TrackerForm {
     /// The choice differs from the project's connection.
     pub fn dirty(&self) -> bool {
         let Some(current) = &self.current else { return false };
-        Some(self.tracker()) != self.current_tracker() || self.wanted() != Some(TrackerChoice::from_config(current))
+        Some(self.tracker()) != self.current_tracker()
+            || self.wanted() != Some(TrackerChoice::from_config(current))
+            || (self.shows_rules() && self.rules != current.agent_rules)
     }
 
     /// The primary button's label: Connect a new board, Save the same
@@ -397,7 +489,7 @@ impl TrackerForm {
         self.refused = None;
         self.connected = None;
         self.connecting = true;
-        Some(ConnectTracker { choice, force })
+        Some(self.request(choice, force))
     }
 
     /// The connection's outcome. Written: the section shows the new
@@ -410,7 +502,7 @@ impl TrackerForm {
         match result {
             Ok(done) => {
                 if let (Some(current), Some(wanted)) = (&self.current, self.wanted()) {
-                    self.current = Some(wanted.config(current));
+                    self.current = Some(self.request(wanted, false).config(current));
                 }
                 self.edited = false;
                 self.connected = Some(done);
@@ -528,6 +620,7 @@ mod tests {
                 },
                 LinearRequest::Login(_) => LinearAnswer::Login(Ok("Ada <ada@example.com>".into())),
                 LinearRequest::Preflight(connection) => LinearAnswer::Preflight { connection, result: Ok("ENG".into()) },
+                LinearRequest::Workspace => LinearAnswer::Workspace(Ok("Example".into())),
             };
             form.linear_answer(answer);
         }
@@ -648,5 +741,44 @@ mod tests {
         assert_eq!(form.primary_label(), SAVE);
         form.select_filter(Filter::Label, Some("shelbi"));
         assert!(!form.dirty(), "back as it was");
+    }
+
+    #[test]
+    fn the_agent_rules_seed_from_the_project_save_with_it_and_name_the_github_account() {
+        let mut form = TrackerForm::default();
+        let mut cfg = github("acme/app");
+        cfg.agent_rules = AgentRules { require_review: true, assigned_only: true };
+        form.load(&cfg);
+        assert!(form.shows_rules());
+        assert_eq!(form.rules(), cfg.agent_rules);
+        assert!(!form.dirty());
+
+        // The account: one read through the GitHub service.
+        assert_eq!(form.assigned_title(), "Only work on issues assigned to me");
+        assert_eq!(form.github_due(), Some(GithubRequest::Account));
+        assert_eq!(form.github_due(), None, "asked once");
+        form.github_answer(crate::github_setup::fixture::answer(GithubRequest::Account));
+        assert_eq!(form.assigned_title(), "Only work on issues assigned to me (octocat)");
+
+        // A toggle is a change on the same board: Save sends it.
+        form.toggle_assigned_only();
+        assert!(form.dirty() && form.primary_enabled());
+        assert_eq!(form.primary_label(), SAVE);
+        let req = form.submit(false).expect("a save");
+        let want = AgentRules { require_review: true, assigned_only: false };
+        assert_eq!(req.rules, Some(want));
+        form.connected(Ok(connected(IssueTrackerBackend::Github)));
+        assert_eq!(form.current().unwrap().agent_rules, want, "the form holds what it wrote");
+        assert!(!form.dirty());
+
+        // Cancel puts an unsaved toggle back; the local board has none.
+        form.toggle_require_review();
+        form.cancel();
+        assert_eq!(form.rules(), want);
+        form.select(Tracker::FileSystem);
+        assert!(!form.shows_rules());
+        let rules = form.rules();
+        form.toggle_require_review();
+        assert_eq!(form.rules(), rules, "no rules on the local board");
     }
 }

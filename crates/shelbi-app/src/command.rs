@@ -117,6 +117,10 @@ pub enum CommandKind {
     /// Open the New task dialog (the palette's New Issue, the board's `n`
     /// and its New issue button).
     NewIssue,
+    /// Connect the project to an issue tracker: the desktop's guided flow
+    /// (the Issues header's ⋮ menu, [`crate::tracker_connect::flow`]); the
+    /// TUI opens Settings ▸ Properties, where its Issue tracker section is.
+    ConnectTracker,
     /// Reorder an issue within its column: land it at absolute slot
     /// `position` (0 is the top) of the column's priority order. The board
     /// computes the slot from the unfiltered column
@@ -295,6 +299,7 @@ impl CommandKind {
                 top: *top,
             }),
             CommandKind::NewIssue => Effect::NewIssue { project: p() },
+            CommandKind::ConnectTracker => Effect::ConnectTracker { project: p() },
             CommandKind::PrioritizeIssue { id, position } => {
                 Effect::Mutate(Mutation::PrioritizeIssue {
                     project: p(),
@@ -614,6 +619,20 @@ impl CommandRegistry {
                 subtitle: Some("Add work for your Orchestrator and agents".to_string()),
                 shortcut: None,
                 hidden_until_query: false,
+            });
+            // Connect to an issue tracker: GitHub Issues or Linear. Offered
+            // with a project whatever it's connected to (the flow shows the
+            // connected tracker); surfaced by typing, like the other setup
+            // commands.
+            out.push(Command {
+                id: "action:connect-tracker".to_string(),
+                title: "Connect to Issue Tracker".to_string(),
+                kind: CommandKind::ConnectTracker,
+                entry_kind: EntryKind::Action,
+                decoration: None,
+                subtitle: Some("Bring issues in from GitHub or Linear".to_string()),
+                shortcut: None,
+                hidden_until_query: true,
             });
         }
 
@@ -971,6 +990,7 @@ impl CommandKind {
             "action:settings" => Some(CommandKind::OpenSettings),
             "action:send-feedback" => Some(CommandKind::SendFeedback),
             "action:new-issue" => Some(CommandKind::NewIssue),
+            "action:connect-tracker" => Some(CommandKind::ConnectTracker),
             "action:about" => Some(CommandKind::OpenAbout),
             "action:acknowledgements" => Some(CommandKind::OpenAcknowledgements),
             "action:switch-project" => Some(CommandKind::SwitchProject {
@@ -1098,6 +1118,7 @@ mod tests {
             "action:approve-review:T-12",
             "action:reject-review:T-12",
             "action:new-issue",
+            "action:connect-tracker",
             "action:error-log",
             "action:settings",
             "action:send-feedback",

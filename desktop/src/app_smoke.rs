@@ -271,7 +271,7 @@ fn every_registry_command_runs_from_the_palette(cx: &mut TestAppContext) {
     let mut h = Harness::open(cx);
     h.second_tab();
     let commands = h.commands();
-    assert_eq!(commands.len(), 34, "the fixture offers every kind of command");
+    assert_eq!(commands.len(), 35, "the fixture offers every kind of command");
     for command in &commands {
         h.focus_window();
         h.key("ctrl-space");

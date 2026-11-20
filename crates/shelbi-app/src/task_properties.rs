@@ -331,6 +331,7 @@ mod tests {
                 ownership: OwnershipGate::Unrestricted,
                 remote_search: false,
                 tracker: Default::default(),
+                connection: None,
             }),
             state_snapshot: None,
             workflows: Ok(vec![default_workflow(), subtask()]),

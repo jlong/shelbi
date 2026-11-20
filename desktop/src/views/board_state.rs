@@ -88,6 +88,35 @@ pub enum Mode {
     /// Confirm deleting `id` (More ▸ Delete issue…, ⌘⌫): Enter deletes, Esc
     /// (or Cancel) goes back to the pane with nothing done.
     ConfirmDelete { id: String },
+    /// The header's ⋮ menu, its keyboard row at `cursor`
+    /// ([`BoardState::header_items`]).
+    HeaderMenu { cursor: usize },
+}
+
+/// A row of the Issues header's ⋮ menu (Figma 2753:11687).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderItem {
+    /// "Connect to issue tracker…": offered while the project is on the
+    /// local board (a connected one shows only Settings, 2753:12123).
+    ConnectTracker,
+    /// Settings, on the Properties page (where the Issue tracker section is).
+    Settings,
+}
+
+impl HeaderItem {
+    pub fn label(self) -> &'static str {
+        match self {
+            HeaderItem::ConnectTracker => shelbi_app::tracker_connect::flow::MENU_TITLE,
+            HeaderItem::Settings => "Settings",
+        }
+    }
+
+    pub fn slug(self) -> &'static str {
+        match self {
+            HeaderItem::ConnectTracker => "connect-tracker",
+            HeaderItem::Settings => "settings",
+        }
+    }
 }
 
 /// Something the view must do. The board never performs IO itself.
@@ -125,6 +154,8 @@ pub enum Intent {
     ClearSearchField,
     /// Put text on the clipboard (More > Copy branch).
     Copy(String),
+    /// Open Settings on this page (the header's ⋮ ▸ Settings).
+    OpenSettings(shelbi_app::settings::SettingsPage),
 }
 
 /// What the task pane's More menu offers: the task operations the old modal
@@ -809,6 +840,54 @@ impl BoardState {
         }
     }
 
+    // ---- the header's ⋮ menu ---------------------------------------------
+
+    /// What the header's ⋮ menu lists: Connect to issue tracker… while the
+    /// project is on the local board, then Settings.
+    pub fn header_items(&self) -> Vec<HeaderItem> {
+        let local = self.input.tracker == shelbi_core::IssueTrackerBackend::FileSystem;
+        let mut items = Vec::new();
+        if local {
+            items.push(HeaderItem::ConnectTracker);
+        }
+        items.push(HeaderItem::Settings);
+        items
+    }
+
+    /// The ⋮ button: open the menu, or close it.
+    pub fn toggle_header_menu(&mut self) {
+        self.mode = match self.mode {
+            Mode::HeaderMenu { .. } => self.rest(),
+            _ => Mode::HeaderMenu { cursor: 0 },
+        };
+    }
+
+    /// Run the ⋮ menu's row `ix` (a click, or Enter on it), closing it.
+    pub fn choose_header_item(&mut self, ix: usize) -> Vec<Intent> {
+        self.mode = self.rest();
+        match self.header_items().get(ix) {
+            Some(HeaderItem::ConnectTracker) => vec![Intent::Command(CommandKind::ConnectTracker)],
+            Some(HeaderItem::Settings) => {
+                vec![Intent::OpenSettings(shelbi_app::settings::SettingsPage::Properties)]
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn header_menu_key(&mut self, cursor: usize, chord: KeyChord) -> Vec<Intent> {
+        let n = self.header_items().len();
+        match chord.code {
+            Key::Esc => self.mode = self.rest(),
+            Key::Up | Key::Char('k') => {
+                self.mode = Mode::HeaderMenu { cursor: if cursor == 0 { n - 1 } else { cursor - 1 } }
+            }
+            Key::Down | Key::Char('j') => self.mode = Mode::HeaderMenu { cursor: (cursor + 1) % n },
+            Key::Enter | Key::Char(' ') => return self.choose_header_item(cursor),
+            _ => {}
+        }
+        Vec::new()
+    }
+
     // ---- the pane's More menu --------------------------------------------
 
     /// What the pane's More menu lists for its task ([`Self::actions`]).
@@ -1489,6 +1568,7 @@ impl BoardState {
             Mode::WorkflowDropdown { cursor } => Some(self.workflow_dropdown_key(cursor, chord)),
             Mode::AssignPicker { id, cursor } => Some(self.assign_key(&id, cursor, chord)),
             Mode::ConfirmDelete { .. } => Some(self.confirm_delete_key(chord)),
+            Mode::HeaderMenu { cursor } => Some(self.header_menu_key(cursor, chord)),
         }
     }
 
@@ -2523,6 +2603,7 @@ pub(crate) mod tests {
                 ownership: shelbi_state::OwnershipGate::Unrestricted,
                 remote_search: false,
                 tracker: Default::default(),
+                connection: None,
             }),
             state_snapshot: None,
             workflows: Ok(vec![shelbi_core::default_workflow()]),
@@ -3675,6 +3756,38 @@ pub(crate) mod tests {
         b.apply_open(read(vec![w, moved]));
         assert!(b.confirm_delete().is_empty());
         assert!(b.pending("A").is_none());
+    }
+
+    #[test]
+    fn the_header_menu_offers_connect_only_on_the_local_board() {
+        let mut b = board(vec![issue("A", "todo")]);
+        assert_eq!(b.header_items(), [HeaderItem::ConnectTracker, HeaderItem::Settings]);
+        b.toggle_header_menu();
+        assert_eq!(b.mode, Mode::HeaderMenu { cursor: 0 });
+        assert!(press(&mut b, "down").is_empty());
+        assert_eq!(b.mode, Mode::HeaderMenu { cursor: 1 });
+        assert_eq!(
+            press(&mut b, "enter"),
+            vec![Intent::OpenSettings(shelbi_app::settings::SettingsPage::Properties)],
+            "Settings opens on Properties, where the Issue tracker section is"
+        );
+        assert_eq!(b.mode, Mode::Board);
+        b.toggle_header_menu();
+        assert_eq!(b.choose_header_item(0), vec![Intent::Command(CommandKind::ConnectTracker)]);
+        b.toggle_header_menu();
+        assert!(press(&mut b, "esc").is_empty());
+        assert_eq!(b.mode, Mode::Board);
+
+        // Connected: only Settings.
+        let mut r = read(vec![issue("A", "todo")]);
+        r.project.as_mut().unwrap().tracker = shelbi_core::IssueTrackerBackend::Linear;
+        b.apply_open(r);
+        assert_eq!(b.header_items(), [HeaderItem::Settings]);
+        b.toggle_header_menu();
+        assert_eq!(
+            press(&mut b, "enter"),
+            vec![Intent::OpenSettings(shelbi_app::settings::SettingsPage::Properties)]
+        );
     }
 
     #[test]

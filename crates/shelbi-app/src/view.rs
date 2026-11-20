@@ -748,6 +748,9 @@ pub struct IssuesModel {
     pub loading: bool,
     /// The board freshness banner, when the index lags or is cached.
     pub banner: Option<String>,
+    /// "Connected · acme/app" while the project's issues come from an
+    /// external tracker (`tracker-connect`); `None` on the local board.
+    pub connection: Option<String>,
     /// The last read's error, for the status line.
     pub error: Option<String>,
     /// True until the first terminal-history page lands: the done column is
@@ -942,6 +945,7 @@ impl IssuesModel {
             title: input.display_name.clone().unwrap_or_default(),
             loading: input.loading,
             banner: input.banner.clone(),
+            connection: input.connection.as_deref().map(crate::tracker_connect::import_copy::connected),
             error: input.error.clone(),
             done_loading: !input.closed.landed() && !search.showing_results(),
             has_more_done: match search.status() {

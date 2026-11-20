@@ -239,6 +239,9 @@ pub fn answer(project: Option<&str>, request: LinearRequest) -> LinearAnswer {
         LinearRequest::Viewer => {
             LinearAnswer::Viewer(client().and_then(|c| c.viewer()).map(|v| v.label()).map_err(failure))
         }
+        LinearRequest::Workspace => {
+            LinearAnswer::Workspace(client().and_then(|c| c.organization_name()).map_err(failure))
+        }
     }
 }
 

@@ -50,6 +50,7 @@ use shelbi_app::board::DropTarget;
 use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
 use shelbi_app::board::{BoardRead, ClosedPage, MoreRequest};
 use shelbi_app::board_search::SearchWorker;
+use shelbi_app::tracker_connect::{import_copy, ImportWatch};
 use shelbi_app::source::{ProjectHandle, ProjectLink};
 use shelbi_app::state_write::{self, StateWrite};
 use shelbi_app::{
@@ -113,6 +114,8 @@ const FOOTER_H: f32 = 29.0;
 /// the selected card's focus glow (4px outside it) isn't cut off while the
 /// cards keep the column's full width.
 const GLOW_ROOM: f32 = 6.0;
+/// The header's ⋮ menu's width (the frame's, 2753:11687).
+const HEADER_MENU_W: f32 = 236.0;
 
 /// What the view asks of the window.
 #[derive(Debug, Clone)]
@@ -125,6 +128,8 @@ pub enum IssuesEvent {
     /// A drag of the task pane's left edge ended on this width: the window
     /// saves it (`WindowState::task_pane_width`).
     PaneWidth(f32),
+    /// Open Settings on this page (the header's ⋮ ▸ Settings).
+    OpenSettings(shelbi_app::settings::SettingsPage),
 }
 
 /// The value a card drag carries.
@@ -217,6 +222,8 @@ pub struct IssuesView {
     /// The task pane's More button, measured so its menu opens under it,
     /// and the menu's scroll, following its cursor.
     pub(super) pane_menu_anchor: style::Anchor,
+    /// The header's ⋮ button, while its menu is open.
+    header_menu_anchor: style::Anchor,
     pub(super) pane_menu_scroll: MenuScroll,
     /// Where the pointer was when a card's context menu opened (a
     /// zero-size box the menu opens under), and the menu's scroll.
@@ -249,6 +256,11 @@ pub struct IssuesView {
     editor_tx: Sender<EditorEvent>,
     editor_rx: Receiver<EditorEvent>,
     last_refresh: Instant,
+    /// A tracker connection's first import, watched until a read of the new
+    /// tracker lands (`tracker-connect`), then the toast saying so (its
+    /// title, its line, and when it went up).
+    import: Option<Entity<ImportWatch>>,
+    import_toast: Option<(String, String, Instant)>,
     board_scroll: BoardScroll,
     /// Each expanded column's virtualized card list, by status id (a column
     /// keeps its scroll position across a filter change or a collapse).
@@ -338,6 +350,8 @@ impl IssuesView {
             editor_tx,
             editor_rx,
             last_refresh: Instant::now(),
+            import: None,
+            import_toast: None,
             board_scroll: BoardScroll::default(),
             column_lists: HashMap::new(),
             search_lists: HashMap::new(),
@@ -345,6 +359,7 @@ impl IssuesView {
             dropdown_scroll: Default::default(),
             workspace_anchor: Default::default(),
             pane_menu_anchor: Default::default(),
+            header_menu_anchor: Default::default(),
             pane_menu_scroll: Default::default(),
             card_menu_anchor: Default::default(),
             card_menu_scroll: Default::default(),
@@ -745,6 +760,11 @@ impl IssuesView {
         let open = self.open_refresher.latest();
         let closed = self.closed_refresher.latest();
         let mut changed = self.fold_reads(open, closed);
+        changed |= self.observe_import(cx);
+        if self.import_toast.as_ref().is_some_and(|(_, _, at)| at.elapsed() >= import_copy::TOAST_LIFETIME) {
+            self.import_toast = None;
+            changed = true;
+        }
         while let Ok(done) = self.done_rx.try_recv() {
             changed = true;
             match done {
@@ -852,6 +872,87 @@ impl IssuesView {
     /// board's read).
     pub fn new_task_workflows(&self) -> (Vec<shelbi_core::Workflow>, String) {
         self.state.new_task_workflows()
+    }
+
+    /// Watch for a tracker connection's import: the next read of the new
+    /// tracker's board is it. The watch says so (the connection flow's
+    /// Importing step follows it) and the board shows its toast.
+    pub fn watch_import(&mut self, watch: Entity<ImportWatch>, cx: &mut Context<Self>) {
+        self.import = Some(watch);
+        cx.notify();
+    }
+
+    /// Fold the read into the watched import; true when it landed.
+    fn observe_import(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(watch) = self.import.clone() else { return false };
+        let input = self.state.input();
+        let (tracker, loading, error, open) = (input.tracker, input.loading, input.error.is_some(), input.open.len());
+        let landed = watch.update(cx, |w, cx| {
+            let hit = w.observe(tracker, loading, error, open);
+            if hit {
+                cx.notify();
+            }
+            hit
+        });
+        if !landed {
+            return false;
+        }
+        let source = watch.read(cx).source().to_string();
+        self.import = None;
+        self.import_toast =
+            Some((import_copy::toast_title(open), import_copy::toast_detail(&source), Instant::now()));
+        true
+    }
+
+    /// Fold `read` as a refresh would (tests hand in what the board reads).
+    #[cfg(test)]
+    pub fn fold_read_for_test(&mut self, read: BoardRead, cx: &mut Context<Self>) {
+        self.state.apply_reads(Some(read), None);
+        self.observe_import(cx);
+        cx.notify();
+    }
+
+    /// The import toast, while it's up (its title and line).
+    #[cfg(test)]
+    pub fn import_toast(&self) -> Option<(&str, &str)> {
+        self.import_toast.as_ref().map(|(t, d, _)| (t.as_str(), d.as_str()))
+    }
+
+    /// The import toast at the board's bottom right (08-connected-board):
+    /// "✓ 64 issues imported" in green over "acme/app · Synced just now". A
+    /// click dismisses it; it goes by itself after a few seconds.
+    fn render_import_toast(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let (title, detail, _) = self.import_toast.as_ref()?;
+        Some(
+            style::popover(div().id("board-import-toast"), theme)
+                .debug_selector(|| "board-import-toast".into())
+                .role(gpui::Role::Status)
+                .absolute()
+                .right(px(16.0))
+                .bottom(px(FOOTER_H + 12.0))
+                .w(px(360.0))
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .px(px(16.0))
+                .py(px(12.0))
+                .cursor_pointer()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .type_style(Type::BaseMedium)
+                        .text_color(theme.green)
+                        .child(heroicon(icons::CHECK).text_color(theme.green))
+                        .child(title.clone()),
+                )
+                .child(div().type_style(Type::Small).text_color(theme.muted).child(detail.clone()))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.import_toast = None;
+                    cx.notify();
+                })),
+        )
     }
 
     /// Read the board again now (New task created an issue).
@@ -984,6 +1085,7 @@ impl IssuesView {
                     input.update(cx, |s, cx| s.focus(window, cx));
                 }
                 Intent::Copy(text) => cx.write_to_clipboard(gpui::ClipboardItem::new_string(text)),
+                Intent::OpenSettings(page) => cx.emit(IssuesEvent::OpenSettings(page)),
                 Intent::ClearSearchField => {
                     if let Some(input) = &self.search_input {
                         input.update(cx, |s, cx| s.set_value("", window, cx));
@@ -1438,6 +1540,7 @@ impl IssuesView {
         };
         let (workflow_set, workspace_set) = (filters.workflow.is_some(), filters.workspace.is_some());
         let banner = model.banner.clone();
+        let connection = model.connection.clone();
         // The search's note beside its field: the match count, or that the
         // board shows local results because GitHub's search is unavailable.
         let search_note = model.search.as_ref().and_then(|s| s.label());
@@ -1509,6 +1612,16 @@ impl IssuesView {
                         .child(note),
                 )
             })
+            .when_some(connection, |row, connection| {
+                row.child(
+                    div()
+                        .debug_selector(|| "board-connection".into())
+                        .flex_none()
+                        .type_style(Type::Small)
+                        .text_color(theme.foreground)
+                        .child(connection),
+                )
+            })
             .child(search)
             .child(
                 style::toolbar_button("new-issue", icons::PLUS, "New issue", theme)
@@ -1518,6 +1631,77 @@ impl IssuesView {
                         cx.notify();
                     })),
             )
+            .child(self.render_header_menu(cx))
+    }
+
+    /// The header's ⋮ button and its menu (Figma 2753:11687): "Connect to
+    /// issue tracker…" over a rule while the project is on the local board,
+    /// then Settings (only Settings once a tracker is connected,
+    /// 2753:12123).
+    fn render_header_menu(&self, cx: &mut Context<Self>) -> gpui::Div {
+        use super::board_state::HeaderItem;
+        let theme = *cx.global::<Theme>();
+        let cursor = match self.state.mode {
+            Mode::HeaderMenu { cursor } => Some(cursor),
+            _ => None,
+        };
+        let open = cursor.is_some();
+        let items = self.state.header_items();
+        let button = style::content_button(
+            "board-more",
+            style::ButtonContent::default().left(icons::ELLIPSIS_VERTICAL),
+            if open { ButtonKind::Primary } else { ButtonKind::Secondary },
+            ButtonSize::Small,
+            false,
+            &theme,
+        )
+        .role(gpui::Role::Button)
+        .aria_label("More")
+        .tooltip(style::tooltip("More"));
+        super::workflow_editor::dropdown(
+            open,
+            &self.header_menu_anchor,
+            "board-menu",
+            button,
+            move |cx| {
+                let theme = cx.global::<Theme>().opaque();
+                let mut rows: Vec<AnyElement> = Vec::new();
+                for (ix, item) in items.iter().copied().enumerate() {
+                    if ix > 0 {
+                        rows.push(super::workflow_editor::menu_rule(&theme).into_any_element());
+                    }
+                    let icon = match item {
+                        HeaderItem::ConnectTracker => icons::SQUARES_PLUS,
+                        HeaderItem::Settings => icons::COG_6_TOOTH,
+                    };
+                    rows.push(
+                        style::menu_row(format!("board-menu-{}", item.slug()), cursor == Some(ix), &theme)
+                            .child(heroicon(icon).text_color(theme.icon))
+                            .child(div().flex_1().min_w_0().truncate().child(item.label()))
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                let intents = this.state.choose_header_item(ix);
+                                this.apply_intents(intents, window, cx);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                rows
+            },
+            HEADER_MENU_W,
+            true,
+            |this: &mut IssuesView, cx| {
+                this.state.toggle_header_menu();
+                cx.notify();
+            },
+            |this: &mut IssuesView, _| {
+                if matches!(this.state.mode, Mode::HeaderMenu { .. }) {
+                    this.state.close_overlay();
+                    this.needs_focus = true;
+                }
+            },
+            cx,
+        )
     }
 
     /// The toolbar's search field (Figma's Searchbox): the input with its
@@ -2346,6 +2530,7 @@ impl Render for IssuesView {
             .children(task_detail::render_card_menu(self, cx))
             .children(self.render_assign(&theme, cx))
             .children(self.render_confirm_delete(&theme, cx))
+            .children(self.render_import_toast(&theme, cx))
             .into_any_element()
     }
 }
@@ -2815,6 +3000,48 @@ mod tests {
         }
     }
 
+
+    // ---- the header's ⋮ menu (`tracker-connect`) ----------------------------
+
+    #[gpui::test]
+    fn the_header_menu_connects_a_tracker_or_opens_settings(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        let (view, mut cx) = open_board(cx, vec![issue("T1", "todo")]);
+        let events = record(&view, &mut cx);
+        let settings = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let sink = settings.clone();
+        cx.update(|_, cx| {
+            cx.subscribe(&view, move |_, ev: &IssuesEvent, _| {
+                if let IssuesEvent::OpenSettings(page) = ev {
+                    sink.borrow_mut().push(*page);
+                }
+            })
+            .detach()
+        });
+        assert!(!drawn(&mut cx, "board-menu-connect-tracker"));
+        click(&mut cx, "board-more");
+        assert!(drawn(&mut cx, "board-menu-connect-tracker") && drawn(&mut cx, "board-menu-settings"));
+        let (connect, settings_row) = (bounds(&mut cx, "board-menu-connect-tracker"), bounds(&mut cx, "board-menu-settings"));
+        assert!(connect.bottom() <= settings_row.top(), "Connect comes first, over Settings");
+        click(&mut cx, "board-menu-connect-tracker");
+        assert_eq!(events.borrow().as_slice(), [CommandKind::ConnectTracker]);
+        assert!(!drawn(&mut cx, "board-menu-settings"), "a choice closes the menu");
+
+        click(&mut cx, "board-more");
+        click(&mut cx, "board-menu-settings");
+        assert_eq!(settings.borrow().as_slice(), [shelbi_app::settings::SettingsPage::Properties]);
+
+        // A connected board's menu has only Settings.
+        view.update(&mut cx, |v, cx| {
+            let mut r = crate::views::board_state::tests::read(vec![issue("T1", "todo")]);
+            r.project.as_mut().unwrap().tracker = shelbi_core::IssueTrackerBackend::Github;
+            v.state.apply_reads(Some(r), None);
+            cx.notify();
+        });
+        click(&mut cx, "board-more");
+        assert!(drawn(&mut cx, "board-menu-settings"));
+        assert!(!drawn(&mut cx, "board-menu-connect-tracker"));
+    }
 
     // ---- the task pane (`dt-floating-task-pane`) ---------------------------
 

@@ -2085,6 +2085,14 @@ fn render_title(f: &mut Frame, app: &mut KanbanApp, area: Rect) {
         let color = if stale { palette().ansi_yellow } else { palette().muted };
         left_spans.push(Span::styled(format!("   {banner}"), Style::default().fg(color)));
     }
+    // The external tracker the board comes from (`Connected · acme/app`),
+    // as the desktop's Issues header shows it before New issue.
+    if let Some(source) = &app.input.connection {
+        left_spans.push(Span::styled(
+            format!("   {}", shelbi_app::tracker_connect::import_copy::connected(source)),
+            Style::default().fg(palette().muted),
+        ));
+    }
     left_spans.extend(search_spans(app));
     f.render_widget(Paragraph::new(Line::from(left_spans)), left_area);
 
@@ -3778,6 +3786,7 @@ mod tests {
             ownership: OwnershipGate::Unrestricted,
             remote_search: true,
             tracker: Default::default(),
+            connection: None,
         });
         app.apply_board_data(data);
         app.apply_closed_page(Some(closed(

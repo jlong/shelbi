@@ -27,3 +27,5 @@ palette frame (2171:752) and drawn on its 20pt grid with the outline set's
 - `robot.svg`: the Settings sidebar's Agents row (component `robot`,
   2833:34630, in the Navigation component's State=Settings 2252:27532), a
   stroked drawing in the outline set's 1.25pt stroke.
+- `github.svg` and `linear.svg`: the service marks on the "Connect to an
+  Issue tracker" chooser's cards (2753:12002), filled drawings.

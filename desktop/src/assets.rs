@@ -433,6 +433,8 @@ heroicons! {
     /// Settings ▸ Agents' Edit instructions (`PENCIL_BUTTON` is its
     /// widened drawing for the 24pt row buttons).
     PENCIL = "pencil";
+    /// The Issues header's ⋮ ▸ Connect to issue tracker… (Figma 2753:11687).
+    SQUARES_PLUS = "squares-plus";
     @figma {
         TOGGLE_OFF = "toggle-off";
         TOGGLE_ON = "toggle-on";
@@ -444,6 +446,9 @@ heroicons! {
         PULL_REQUEST = "pull-request";
         GIT_BRANCH = "git-branch";
         ROBOT = "robot";
+        // The tracker flow's cards (Figma 2753:12002).
+        GITHUB = "github";
+        LINEAR = "linear";
     }
     @small {
         FUNNEL_SMALL = "funnel";

@@ -27,6 +27,8 @@
 //! for a motion a test has to stop at an exact point.
 //!
 //! [`spinner`] is the Figma Spinner: the progress ring a running step shows.
+//! [`progress_bar`] is a thin bar, filled to a fraction or sliding while
+//! the amount isn't known.
 //!
 //! [`placed`] places every dropdown and menu against its control: below or
 //! flipped above, capped to the window and scrolling, shifted inside it.
@@ -39,6 +41,7 @@ pub mod clocked_animation;
 pub mod controls;
 pub mod exact_text;
 pub mod placed;
+pub mod progress_bar;
 pub mod rotated_text;
 pub mod spinner;
 pub mod terminal;

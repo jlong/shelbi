@@ -535,6 +535,7 @@ and [Linear](/docs/concepts/linear) for the concepts and the full behavior.
 | `linear` | [LinearConnection](#linear-connection) | when `backend: linear` | — | Linear team plus optional filters. |
 | `refresh_secs` | integer | no | `30` (`60` for `linear`) | How often (seconds) the hub daemon re-reads a **remote** board and rewrites `board-index.json`. `0` or absent folds to the default. Ignored for `file_system`, whose local read is free. |
 | `budget` | [Budget](#issue_tracker-budget) | no | all defaults | Rate-limit governor thresholds for a remote backend. |
+| `agent_rules` | [AgentRules](#issue_tracker-agent-rules) | no | today's behavior | How agents treat the tracker's issues: whether Zen may promote them, and whether only issues assigned to you can be started. |
 
 A project connects to **one** external tracker. At most one of the `github:`,
 `jira:` and `linear:` blocks may be present, and with an external backend
@@ -590,6 +591,28 @@ With `backend: linear` the board is the team's issues matching these filters.
 [Linear](/docs/concepts/linear) walks through setting it up.
 See [`shelbi tracker`](/docs/cli/tracker#the-board-on-the-hub-daemon) for how the
 hub daemon refreshes it against the key's rate limits.
+
+### issue_tracker agent rules
+
+How agents handle the issues on a remote tracker. Settings ▸ Properties ▸ Issue
+tracker shows both as checkboxes, and connecting a tracker from the Issues
+board's ⋮ menu asks for them. An absent block is the behavior Shelbi had before
+the rules existed. The local board (`file_system`) ignores both.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `require_review` | boolean | `false` | "Always require human review before beginning work." On, Zen never promotes a tracker issue out of backlog (`shelbi zen scan` and the heartbeat's `zen_eligible` count skip them all, whoever they are assigned to). Moving an issue to a ready status yourself still dispatches it as normal. |
+| `assigned_only` | boolean | `true` | "Only work on issues assigned to me." On, only issues assigned to your tracker account can be started. Off, an unassigned issue can be started too: `shelbi issue start` assigns it to you first, Zen counts unassigned backlog issues, and their task event lines carry `owner=unassigned claim=on_start`. A teammate's issue stays off limits either way (`shelbi issue start <id> --take` claims one explicitly). |
+
+```yaml
+issue_tracker:
+  backend: linear
+  linear:
+    team: ENG
+  agent_rules:
+    require_review: true
+    assigned_only: false
+```
 
 ### issue_tracker budget
 

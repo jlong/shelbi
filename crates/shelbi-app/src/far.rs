@@ -100,9 +100,16 @@ pub enum Request {
     /// A Linear read (or a key's login) for Settings' Linear pickers, with
     /// the project's machine's key.
     Linear(crate::linear_setup::LinearRequest),
+    /// A GitHub read for Connect to an Issue tracker's pickers, through the
+    /// project's machine's `gh` ([`crate::github_setup`]).
+    Github(crate::github_setup::GithubRequest),
     /// Sync the project's status catalog from its tracker now (Settings ▸
     /// Workflows' "Sync now" on a Linear-managed catalog).
     SyncStatuses,
+    /// What a first import of this connection would bring in (Connect to an
+    /// Issue tracker's Review your first import), read where the project
+    /// lives.
+    ImportPreview(crate::tracker_connect::TrackerChoice),
 }
 
 /// The far daemon's answer to a [`Request`].
@@ -119,7 +126,9 @@ pub enum Reply {
     Diff(crate::diff::DiffReply),
     TrackerConnected(Result<crate::tracker_connect::Connected, crate::tracker_connect::ConnectError>),
     Linear(crate::linear_setup::LinearAnswer),
+    Github(crate::github_setup::GithubAnswer),
     StatusesSynced(crate::tracker_connect::StatusSync),
+    ImportPreview(Result<crate::tracker_connect::ImportPreview, String>),
 }
 
 /// The far paths a path Cmd+clicked in a far terminal may name: as
@@ -230,9 +239,26 @@ pub fn linear(link: &ProjectLink, req: crate::linear_setup::LinearRequest) -> cr
             LinearAnswer::Preflight { connection: connection.clone(), result: Err(why) }
         }
         LinearRequest::Viewer => LinearAnswer::Viewer(Err(LinearFailure::Other(why))),
+        LinearRequest::Workspace => LinearAnswer::Workspace(Err(LinearFailure::Other(why))),
     };
     match link.far_request(&Request::Linear(req.clone())) {
         Ok(Reply::Linear(answer)) => answer,
+        Ok(other) => failed(&req, unexpected(&other)),
+        Err(e) => failed(&req, e),
+    }
+}
+
+/// Run a GitHub picker read for `link`'s project through its daemon
+/// (blocking). A failure to reach the daemon answers as a failed read.
+pub fn github(link: &ProjectLink, req: crate::github_setup::GithubRequest) -> crate::github_setup::GithubAnswer {
+    use crate::github_setup::{GithubAnswer, GithubFailure, GithubRequest};
+    let failed = |req: &GithubRequest, why: String| match req {
+        GithubRequest::Account => GithubAnswer::Account(Err(GithubFailure::Other(why))),
+        GithubRequest::Repos { owner } => GithubAnswer::Repos { owner: owner.clone(), result: Err(why) },
+        GithubRequest::Preflight { repo } => GithubAnswer::Preflight { repo: repo.clone(), result: Err(why) },
+    };
+    match link.far_request(&Request::Github(req.clone())) {
+        Ok(Reply::Github(answer)) => answer,
         Ok(other) => failed(&req, unexpected(&other)),
         Err(e) => failed(&req, e),
     }
@@ -247,6 +273,19 @@ pub fn sync_statuses(link: &ProjectLink) -> crate::tracker_connect::StatusSync {
         Ok(Reply::StatusesSynced(sync)) => sync,
         Ok(other) => StatusSync::Failed(unexpected(&other)),
         Err(e) => StatusSync::Failed(e),
+    }
+}
+
+/// Read what a first import of `choice` would bring in for `link`'s project
+/// through its daemon (blocking).
+pub fn import_preview(
+    link: &ProjectLink,
+    choice: crate::tracker_connect::TrackerChoice,
+) -> Result<crate::tracker_connect::ImportPreview, String> {
+    match link.far_request(&Request::ImportPreview(choice)) {
+        Ok(Reply::ImportPreview(result)) => result,
+        Ok(other) => Err(unexpected(&other)),
+        Err(e) => Err(e),
     }
 }
 

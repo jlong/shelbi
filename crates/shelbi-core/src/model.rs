@@ -996,6 +996,69 @@ pub struct IssueTrackerConfig {
     /// form and leaves [`is_default`](Self::is_default) untouched.
     #[serde(default, skip_serializing_if = "BudgetConfig::is_default")]
     pub budget: BudgetConfig,
+    /// How agents treat the tracker's issues ([`AgentRules`]): whether Zen may
+    /// promote them out of backlog, and whether only the user's own issues may
+    /// be started. Absent ⇒ today's behavior (Zen may promote, assigned only),
+    /// and an all-default block stays elided from the wire form. Only meaningful
+    /// for a remote backend; the filesystem board ignores it.
+    #[serde(default, skip_serializing_if = "AgentRules::is_default")]
+    pub agent_rules: AgentRules,
+}
+
+/// The `issue_tracker.agent_rules` block: how agents handle the issues on a
+/// remote tracker (the connection flow's "How should agents handle issues
+/// created in <Tracker>?" step, and Settings ▸ Properties ▸ Issue tracker).
+///
+/// ```yaml
+/// issue_tracker:
+///   agent_rules:
+///     require_review: true   # Zen never promotes a tracker issue out of backlog
+///     assigned_only: false   # an unassigned issue can be started (and is assigned to you)
+/// ```
+///
+/// Both are plain booleans whose absent value is the behavior Shelbi had before
+/// they existed, so a project that never set them behaves exactly as before.
+/// The filesystem board has no tracker and is unaffected by either.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentRules {
+    /// "Always require human review before beginning work": Zen never promotes
+    /// a tracker issue out of backlog (`shelbi zen scan` and the digest's
+    /// `zen_eligible` skip them), so a human moves each one to a ready status
+    /// first. A human promotion dispatches as normal. Absent ⇒ `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub require_review: bool,
+    /// "Only work on issues assigned to me": only issues assigned to the
+    /// connected account can be started or dispatched. Off, an **unassigned**
+    /// issue can be started too, and starting it assigns it to the user (as
+    /// `--take` does). A teammate's issue stays off limits either way.
+    /// Absent ⇒ `true`.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub assigned_only: bool,
+}
+
+impl Default for AgentRules {
+    fn default() -> Self {
+        AgentRules { require_review: false, assigned_only: true }
+    }
+}
+
+impl AgentRules {
+    /// True when both rules are at their defaults (the block is elided).
+    pub fn is_default(&self) -> bool {
+        *self == AgentRules::default()
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 /// Default GraphQL points above which the daemon uses its configured refresh
@@ -6943,10 +7006,46 @@ agent_runners:
                 rest_reserve: Some(150),
                 ..Default::default()
             },
+            agent_rules: AgentRules { require_review: true, assigned_only: false },
         };
         let yaml = yaml_serde::to_string(&src).unwrap();
         let back: IssueTrackerConfig = yaml_serde::from_str(&yaml).unwrap();
         assert_eq!(src, back);
+    }
+
+    #[test]
+    fn agent_rules_default_to_todays_behavior_and_round_trip() {
+        // A block without `agent_rules:` is today's behavior: Zen may promote,
+        // and only the user's own issues start. It stays off the wire.
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n",
+        );
+        let rules = p.issue_tracker.agent_rules;
+        assert!(!rules.require_review);
+        assert!(rules.assigned_only);
+        assert!(rules.is_default());
+        let back = yaml_serde::to_string(&p).unwrap();
+        assert!(!back.contains("agent_rules"), "got: {back}");
+
+        // Each rule changed on its own writes only that key, and reads back.
+        for (rules, key) in [
+            (AgentRules { require_review: true, assigned_only: true }, "require_review: true"),
+            (AgentRules { require_review: false, assigned_only: false }, "assigned_only: false"),
+        ] {
+            let cfg = IssueTrackerConfig { agent_rules: rules, ..p.issue_tracker.clone() };
+            let yaml = yaml_serde::to_string(&cfg).unwrap();
+            assert!(yaml.contains(key), "{yaml}");
+            let other = if key.starts_with("require") { "assigned_only" } else { "require_review" };
+            assert!(!yaml.contains(other), "only the changed rule is written: {yaml}");
+            let back: IssueTrackerConfig = yaml_serde::from_str(&yaml).unwrap();
+            assert_eq!(back.agent_rules, rules);
+        }
+
+        // A hand-written partial block keeps the other rule's default.
+        let p = project_with_issue_tracker_yaml(
+            "issue_tracker:\n  backend: github\n  github:\n    repo: owner/repo\n  agent_rules:\n    require_review: true\n",
+        );
+        assert_eq!(p.issue_tracker.agent_rules, AgentRules { require_review: true, assigned_only: true });
     }
 
     #[test]

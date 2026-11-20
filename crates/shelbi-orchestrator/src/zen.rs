@@ -15122,7 +15122,12 @@ pub fn mechanically_eligible(project: &Project) -> Result<Vec<String>> {
     let tasks = board_from_caches(project)?;
     let demoted = shelbi_state::zen_demoted_task_ids(&project.name)?;
     let ownership = resolve_ownership_gate(project)?;
-    Ok(mechanically_eligible_from(&tasks, &demoted, &ownership))
+    Ok(mechanically_eligible_with(
+        &tasks,
+        &demoted,
+        &ownership,
+        &project.issue_tracker.agent_rules,
+    ))
 }
 
 /// Build the ownership gate for `project`'s Zen scan.
@@ -15187,14 +15192,37 @@ fn open_board(project: &Project) -> Result<Vec<shelbi_state::IssueFile>> {
     Ok(shelbi_state::read_board_with_cfg(&project.name, &project.issue_tracker)?.into_issues())
 }
 
-/// Pure-logic core of [`mechanically_eligible`]. Split out so the unit
-/// tests can drive it with in-memory fixtures without touching disk or
-/// `SHELBI_HOME`.
+/// Pure-logic core of [`mechanically_eligible`] under the default agent
+/// rules ([`mechanically_eligible_with`]). Split out so the unit tests can
+/// drive it with in-memory fixtures without touching disk or `SHELBI_HOME`.
 pub fn mechanically_eligible_from(
     tasks: &[shelbi_state::IssueFile],
     demoted: &std::collections::HashSet<String>,
     ownership: &OwnershipGate,
 ) -> Vec<String> {
+    mechanically_eligible_with(tasks, demoted, ownership, &shelbi_core::AgentRules::default())
+}
+
+/// [`mechanically_eligible_from`] under the project's agent rules
+/// (`issue_tracker.agent_rules`). On a remote tracker (any gate but
+/// [`OwnershipGate::Unrestricted`]):
+///
+/// - `require_review` on: nothing is eligible. Every tracker issue waits in
+///   backlog for a human to move it to a ready status (which still
+///   dispatches as normal), whoever it is assigned to.
+/// - `assigned_only` off: an unassigned backlog issue is eligible too (its
+///   start claims it); a teammate's never is.
+///
+/// The filesystem board ignores both.
+pub fn mechanically_eligible_with(
+    tasks: &[shelbi_state::IssueFile],
+    demoted: &std::collections::HashSet<String>,
+    ownership: &OwnershipGate,
+    rules: &shelbi_core::AgentRules,
+) -> Vec<String> {
+    if rules.require_review && *ownership != OwnershipGate::Unrestricted {
+        return Vec::new();
+    }
     let columns: std::collections::HashMap<String, Column> = tasks
         .iter()
         .map(|tf| (tf.task.id.clone(), tf.task.column.clone()))
@@ -15214,9 +15242,10 @@ pub fn mechanically_eligible_from(
         .filter(|tf| !demoted.contains(&tf.task.id))
         .filter(|tf| !file_overlaps_in_flight(&tf.body, &in_flight_bodies))
         // Ownership gate: on an external tracker, only backlog issues assigned
-        // to the authenticated user survive (and nothing survives when that
-        // login is unresolved — `FailClosed`). No-op on the filesystem backend.
-        .filter(|tf| ownership.allows(&tf.tracker_assignees))
+        // to the authenticated user survive (plus unassigned ones with the
+        // `assigned_only` rule off; nothing survives when that login is
+        // unresolved — `FailClosed`). No-op on the filesystem backend.
+        .filter(|tf| ownership.startable(rules, &tf.tracker_assignees))
         .map(|tf| &tf.task)
         .collect();
 
@@ -15518,6 +15547,106 @@ mod scan_tests {
         let got =
             mechanically_eligible_from(&tasks, &HashSet::new(), &OwnershipGate::Unrestricted);
         assert_eq!(got, vec!["mine", "theirs", "nobody"]);
+    }
+
+    // --- agent rules (`issue_tracker.agent_rules`) ------------------------
+
+    fn rules(require_review: bool, assigned_only: bool) -> shelbi_core::AgentRules {
+        shelbi_core::AgentRules { require_review, assigned_only }
+    }
+
+    fn mixed_backlog() -> Vec<IssueFile> {
+        vec![
+            tf_assigned(task("mine", Column::backlog(), 0, &[]), "", &["octocat"]),
+            tf_assigned(task("theirs", Column::backlog(), 1, &[]), "", &["someone-else"]),
+            tf(task("nobody", Column::backlog(), 2, &[]), ""),
+        ]
+    }
+
+    #[test]
+    fn require_review_makes_no_tracker_issue_eligible_assigned_or_not() {
+        let gate = OwnershipGate::RequireAssignee("octocat".into());
+        for assigned_only in [true, false] {
+            let got = mechanically_eligible_with(
+                &mixed_backlog(),
+                &HashSet::new(),
+                &gate,
+                &rules(true, assigned_only),
+            );
+            assert!(got.is_empty(), "a human promotes each one: {got:?}");
+        }
+        // Off, today's behavior.
+        let got = mechanically_eligible_with(&mixed_backlog(), &HashSet::new(), &gate, &rules(false, true));
+        assert_eq!(got, vec!["mine"]);
+    }
+
+    #[test]
+    fn assigned_only_off_adds_unassigned_issues_but_never_a_teammates() {
+        let gate = OwnershipGate::RequireAssignee("octocat".into());
+        let got = mechanically_eligible_with(&mixed_backlog(), &HashSet::new(), &gate, &rules(false, false));
+        assert_eq!(got, vec!["mine", "nobody"]);
+        // An unknown login still fails closed: nobody to claim it for.
+        let got = mechanically_eligible_with(
+            &mixed_backlog(),
+            &HashSet::new(),
+            &OwnershipGate::FailClosed,
+            &rules(false, false),
+        );
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    /// The rules end to end on a Linear board: the project's YAML, the
+    /// daemon-published board index (the viewer is `ada`), and
+    /// [`mechanically_eligible`] reading both, as the scan and the digest's
+    /// `zen_eligible` do.
+    #[test]
+    fn the_agent_rules_gate_zen_eligibility_on_a_linear_board() {
+        use shelbi_state::linear_client::FakeLinear;
+        let _home = crate::test_lock::isolated_home();
+        shelbi_state::linear_store::clear_linear_caches_for_test();
+        let fake = FakeLinear::new();
+        let _guard = fake.install();
+        let conn = shelbi_core::LinearConnection::for_team("ENG");
+        let mut project = crate::transition::fixture_project();
+        project.name = "lin".into();
+        std::fs::create_dir_all(shelbi_state::project_dir("lin").unwrap()).unwrap();
+        let mut idx = shelbi_state::BoardIndex::fresh(vec![
+            tf_assigned(task("eng-1", Column::backlog(), 0, &[]), "", &["ada"]),
+            tf_assigned(task("eng-2", Column::backlog(), 1, &[]), "", &["grace"]),
+            tf(task("eng-3", Column::backlog(), 2, &[]), ""),
+        ]);
+        idx.repo = Some(shelbi_state::board_index::linear_board_repo(&conn));
+        idx.viewer_login = Some("ada".into());
+        shelbi_state::write_board_index("lin", &idx).unwrap();
+
+        let eligible = |rules: shelbi_core::AgentRules| {
+            let mut project = project.clone();
+            project.issue_tracker = shelbi_core::IssueTrackerConfig {
+                backend: shelbi_core::IssueTrackerBackend::Linear,
+                linear: Some(conn.clone()),
+                agent_rules: rules,
+                ..Default::default()
+            };
+            shelbi_state::save_project(&project).unwrap();
+            mechanically_eligible(&project).unwrap()
+        };
+        assert_eq!(eligible(rules(false, true)), vec!["eng-1"], "today's behavior");
+        assert_eq!(eligible(rules(false, false)), vec!["eng-1", "eng-3"]);
+        assert!(eligible(rules(true, true)).is_empty());
+        assert!(eligible(rules(true, false)).is_empty());
+    }
+
+    #[test]
+    fn the_filesystem_board_ignores_the_agent_rules() {
+        for (review, assigned) in [(true, true), (true, false), (false, false)] {
+            let got = mechanically_eligible_with(
+                &mixed_backlog(),
+                &HashSet::new(),
+                &OwnershipGate::Unrestricted,
+                &rules(review, assigned),
+            );
+            assert_eq!(got, vec!["mine", "theirs", "nobody"]);
+        }
     }
 
     // --- helpers --------------------------------------------------------

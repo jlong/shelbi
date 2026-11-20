@@ -178,6 +178,7 @@ fn board_read_round_trips() {
             ownership: OwnershipGate::RequireAssignee("jlong".into()),
             remote_search: true,
             tracker: shelbi_core::IssueTrackerBackend::Github,
+            connection: None,
         }),
         state_snapshot: Some(shelbi_state::State {
             workspace_filter: Some("alpha".into()),

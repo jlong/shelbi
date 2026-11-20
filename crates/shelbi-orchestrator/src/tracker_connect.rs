@@ -23,7 +23,9 @@
 //! Every IO step goes through [`ConnectEnv`], so tests run the whole
 //! operation with canned answers.
 
-use shelbi_app::tracker_connect::{ConnectError, ConnectTracker, Connected, StatusSync, TrackerChoice};
+use shelbi_app::tracker_connect::{
+    ConnectError, ConnectTracker, Connected, ImportPreview, PreviewIssue, StatusSync, TrackerChoice,
+};
 use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig, LinearConnection};
 use shelbi_state::linear_client::{self, ResolvedLinearFilters};
 
@@ -87,12 +89,41 @@ pub fn sync_linear_statuses(project: &str, _filters: &ResolvedLinearFilters) -> 
 /// each run in this process. A far project's goes through its daemon
 /// ([`shelbi_app::settings::tracker::TrackerService::far`]).
 pub fn local_service(project: &str) -> shelbi_app::settings::tracker::TrackerService {
-    let (a, b, c) = (project.to_string(), project.to_string(), project.to_string());
+    let (a, b, c, d) = (project.to_string(), project.to_string(), project.to_string(), project.to_string());
     shelbi_app::settings::tracker::TrackerService {
         connect: std::sync::Arc::new(move |req| apply_tracker_connection(&a, &req)),
         linear: std::sync::Arc::new(move |req| linear::answer(Some(&b), req)),
+        github: std::sync::Arc::new(crate::project_create::github::answer),
         sync_statuses: std::sync::Arc::new(move || sync_statuses_now(&c)),
+        preview: std::sync::Arc::new(move |choice| import_preview(&d, &choice)),
     }
+}
+
+/// What a first import of `choice` would bring in for `project` (Connect to
+/// an Issue tracker's Review your first import), read with this machine's
+/// `gh` or the project's Linear key. Nothing is written.
+pub fn import_preview(project: &str, choice: &TrackerChoice) -> Result<ImportPreview, String> {
+    match choice {
+        TrackerChoice::Github { repo } => crate::project_create::github::import_preview(repo),
+        TrackerChoice::Linear(conn) => linear_import_preview(project, conn),
+        TrackerChoice::FileSystem => Err("The local board has nothing to import.".into()),
+    }
+}
+
+fn linear_import_preview(project: &str, conn: &LinearConnection) -> Result<ImportPreview, String> {
+    let fail = |e: linear_client::LinearError| format!("Couldn't read the Linear issues: {e}");
+    let client = linear_client::LinearClient::for_project(Some(project)).map_err(fail)?.caller("import-preview");
+    let filters = linear_client::resolve_filters(&client, conn).map_err(fail)?;
+    let viewer = client.viewer().map_err(fail)?;
+    let counts = shelbi_state::linear_store::preview::import_counts(&client, &filters, &viewer.id).map_err(fail)?;
+    Ok(ImportPreview {
+        open: counts.open,
+        mine: counts.mine,
+        unassigned: counts.unassigned,
+        closed: counts.closed,
+        closed_capped: counts.closed_capped,
+        first: counts.first.into_iter().map(|(key, title)| PreviewIssue { key, title }).collect(),
+    })
 }
 
 /// Sync `project`'s status catalog from its Linear team now (Settings'
@@ -189,7 +220,7 @@ pub fn apply_tracker_connection_with(
     let loaded = shelbi_state::load_project(project)
         .map_err(|e| ConnectError::Failed(format!("project `{project}` could not be loaded: {e}")))?;
     let current = loaded.issue_tracker;
-    let new = req.choice.config(&current);
+    let new = req.config(&current);
     new.validate().map_err(|e| ConnectError::Preflight(e.to_string()))?;
 
     if switches_board(&current, &new) && !req.force {
@@ -332,7 +363,7 @@ machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/app\nworkspaces:
     const GITHUB: &str = "issue_tracker:\n  backend: github\n  github:\n    repo: acme/app\n";
 
     fn linear(team: &str) -> ConnectTracker {
-        ConnectTracker { choice: TrackerChoice::Linear(LinearConnection::for_team(team)), force: false }
+        ConnectTracker::new(TrackerChoice::Linear(LinearConnection::for_team(team)), false)
     }
 
     #[test]
@@ -357,16 +388,29 @@ machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/app\nworkspaces:
 
         // A filter change on the same team is no switch: no emptiness check.
         let mut env = FakeEnv { issues: Some(Ok(5)), ..FakeEnv::default() };
-        let req = ConnectTracker {
-            choice: TrackerChoice::Linear(LinearConnection { label: Some("Bug".into()), ..LinearConnection::for_team("ENG") }),
-            force: false,
-        };
+        let req = ConnectTracker::new(
+            TrackerChoice::Linear(LinearConnection { label: Some("Bug".into()), ..LinearConnection::for_team("ENG") }),
+            false,
+        );
         apply_tracker_connection_with(&mut env, "app", &req).unwrap();
         assert!(env.counted.is_empty());
 
+        // The agent rules ride with the connection, and a later request
+        // without them keeps them.
+        let rules = shelbi_core::AgentRules { require_review: true, assigned_only: false };
+        let mut env = FakeEnv::default();
+        apply_tracker_connection_with(&mut env, "app", &req.clone().with_rules(rules)).unwrap();
+        assert_eq!(shelbi_state::load_project("app").unwrap().issue_tracker.agent_rules, rules);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("require_review: true") && text.contains("assigned_only: false"), "{text}");
+        apply_tracker_connection_with(&mut env, "app", &req).unwrap();
+        assert_eq!(shelbi_state::load_project("app").unwrap().issue_tracker.agent_rules, rules);
+        apply_tracker_connection_with(&mut env, "app", &req.clone().with_rules(Default::default())).unwrap();
+        assert!(!std::fs::read_to_string(&file).unwrap().contains("agent_rules"));
+
         // Disconnecting goes back to no block at all, and drops the cache.
         let mut env = FakeEnv::default();
-        let req = ConnectTracker { choice: TrackerChoice::FileSystem, force: false };
+        let req = ConnectTracker::new(TrackerChoice::FileSystem, false);
         let done = apply_tracker_connection_with(&mut env, "app", &req).unwrap();
         assert_eq!(done.statuses, StatusSync::NotNeeded);
         assert!(!std::fs::read_to_string(&file).unwrap().contains("issue_tracker"));

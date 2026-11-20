@@ -31,6 +31,7 @@ use shelbi_core::{AgentDefaults, ConfigMode, IssueTrackerConfig, RunnerKind};
 use shelbi_state::AgentMaterializeOutcome;
 
 pub mod detect;
+pub mod github;
 pub mod issues;
 pub mod linear;
 mod pick_up;
