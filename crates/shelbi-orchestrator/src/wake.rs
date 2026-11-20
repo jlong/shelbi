@@ -4108,6 +4108,7 @@ mod tests {
             issue_tracker: Default::default(),
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
+            releases: None,
         };
         let log_path = shelbi_state::events_log_path().unwrap();
         let old_action = b"t project=demo workspace=old working -> idle\n";

@@ -15,6 +15,16 @@
 //! The band's subtitle is the month of the entry at the top of the view, so
 //! the date stays in sight however far down a long entry the reader is.
 //!
+//! A timeline runs down the column's left gutter ([`GUTTER_W`]): a muted
+//! rule the length of the list, a tick on it beside each entry's title, and
+//! an accent diamond for each of the project's releases (its `releases:` tag
+//! glob), with the release and its date beside it on a rule across the
+//! column, between the entries merged before and after it
+//! ([`ChangelogModel::timeline`]). An entry over a release drops its divider:
+//! the release's rule takes its place. A malformed `releases:` block is said
+//! over the entries, which still show. No Figma frame has the timeline, so it
+//! keeps to the page's tokens and type.
+//!
 //! Reads never run on the UI thread: a background worker re-reads, through
 //! the window's project source, when the changelog directory's stamp changes
 //! since the last read (the source's `changelog`), polled on the
@@ -42,15 +52,15 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, ClickEvent, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    HighlightStyle,
-    KeyDownEvent, Keystroke, ListOffset, Pixels, SharedString, StyledText, Subscription, Task, Window,
+    canvas, div, point, prelude::*, px, AnyElement, App, Bounds, ClickEvent, Context, Entity, EventEmitter,
+    FocusHandle, Focusable, HighlightStyle, Hsla, KeyDownEvent, Keystroke, ListOffset, PathBuilder, Pixels,
+    SharedString, StyledText, Subscription, Task, Window,
 };
 use gpui_kit::base::text::{RangeHighlight, RenderedText, TextViewState};
 use gpui_kit::component::input::{Enter, Escape, Input, InputEvent, InputState};
 use shelbi_app::changelog::{
     self, ChangelogAttachment, ChangelogData, ChangelogEntryView, ChangelogLink, ChangelogModel, LinkKind,
-    LinkTarget,
+    LinkTarget, Release,
 };
 
 use super::activity_list::FeedList;
@@ -78,6 +88,19 @@ const LINE_STEP: f32 = 40.0;
 const PAGE_OVERLAP: f32 = 48.0;
 /// The key-hint footer's height, its rule included (Activity's).
 const FOOTER_H: f32 = 27.0;
+/// The timeline's gutter, left of the column of entries, and where its
+/// rule runs in it.
+const GUTTER_W: f32 = 32.0;
+const RULE_X: f32 = 11.0;
+/// An entry's tick: a dot on the rule, centered on the title's first line
+/// (`Desktop/Heading` is 28pt tall).
+const TICK: f32 = 7.0;
+const TITLE_LINE_H: f32 = 28.0;
+/// A release's marker: its row's height, the diamond's size, and the room
+/// between two releases that fell between the same entries.
+const RELEASE_H: f32 = 20.0;
+const DIAMOND: f32 = 11.0;
+const RELEASE_GAP: f32 = 12.0;
 
 /// What the page asks of the window.
 #[derive(Debug, Clone)]
@@ -177,6 +200,9 @@ pub struct ChangelogView {
     list: FeedList,
     /// The keys the list last synced to.
     synced: Vec<ItemKey>,
+    /// The releases drawn over each shown entry, by its position (the
+    /// model's timeline, as of the last sync).
+    releases_above: Vec<Vec<Release>>,
     bodies: HashMap<String, Body>,
     /// The band's search field, made on first draw (an input needs the
     /// window).
@@ -223,6 +249,7 @@ impl ChangelogView {
             refresher,
             list: FeedList::new(),
             synced: Vec::new(),
+            releases_above: Vec::new(),
             bodies: HashMap::new(),
             search_input: None,
             loading_more: false,
@@ -515,7 +542,18 @@ impl ChangelogView {
     /// Tell the list what changed since it last drew: one item per shown
     /// entry (by id and content), then the row under them.
     fn sync_list(&mut self) {
-        let mut keys: Vec<ItemKey> = self.model.visible().map(entry_key).collect();
+        self.releases_above = self.model.timeline().iter().map(|t| t.releases.to_vec()).collect();
+        let error = self.model.releases_error();
+        let mut keys: Vec<ItemKey> = self
+            .model
+            .visible()
+            .zip(&self.releases_above)
+            .enumerate()
+            .map(|(ix, (entry, releases))| {
+                let next = self.releases_above.get(ix + 1).is_some_and(|r| !r.is_empty());
+                entry_key(entry, releases, next, error.filter(|_| ix == 0))
+            })
+            .collect();
         keys.push(ItemKey::of("changelog-end", (self.model.has_more(), self.model.match_count())));
         if keys != self.synced {
             self.list.sync(&keys);
@@ -691,18 +729,45 @@ impl ChangelogView {
     fn render_item(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.global::<Theme>();
         let entry = self.model.visible().nth(ix).cloned();
-        let inner = match entry {
+        let has_more = self.model.has_more();
+        // The rule runs the length of the list: through every entry, and on
+        // through the row under them while more are loading.
+        let (inner, rule) = match entry {
             Some(entry) => {
-                let last = ix + 1 == self.model.visible().count() && !self.model.has_more();
-                self.render_entry(ix, &entry, last, &theme, cx).into_any_element()
+                let last = ix + 1 == self.model.visible().count() && !has_more;
+                let releases = self.releases_above.get(ix).cloned().unwrap_or_default();
+                // The release under this entry draws its own rule across, in
+                // place of the divider.
+                let divided = !last && self.releases_above.get(ix + 1).is_none_or(|r| r.is_empty());
+                let error = (ix == 0).then(|| self.model.releases_error().map(str::to_string)).flatten();
+                let body = self.render_entry(ix, &entry, divided, &theme, cx).into_any_element();
+                let mut column = div().flex().flex_col();
+                if let Some(error) = error {
+                    column = column.child(release_error(&error, &theme));
+                }
+                if !releases.is_empty() {
+                    let first = ix == 0;
+                    column = column.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(RELEASE_GAP))
+                            .when(first, |d| d.pt(px(ENTRY_PAD_Y)))
+                            .children(releases.iter().map(|r| render_release(r, &theme))),
+                    );
+                }
+                (column.child(body).into_any_element(), true)
             }
             None => {
-                if self.model.has_more() && !self.loading_more {
+                if has_more && !self.loading_more {
                     // In view (or nearly): the next page, after this frame.
                     self.loading_more = true;
                     cx.defer_in(window, |this, _, cx| this.load_more(cx));
                 }
-                self.render_end(&theme).into_any_element()
+                (
+                    div().pl(px(GUTTER_W)).child(self.render_end(&theme)).into_any_element(),
+                    has_more,
+                )
             }
         };
         div()
@@ -711,15 +776,35 @@ impl ChangelogView {
             .flex_row()
             .justify_center()
             .px(px(PAGE_PAD_X))
-            .child(div().w_full().max_w(px(MEASURE)).child(inner))
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .max_w(px(MEASURE + GUTTER_W))
+                    .when(rule, |d| {
+                        d.child(
+                            div()
+                                .debug_selector(move || format!("changelog-rule-{ix}"))
+                                .absolute()
+                                .top_0()
+                                .bottom_0()
+                                .left(px(RULE_X))
+                                .w(px(1.0))
+                                .bg(theme.divider_strong),
+                        )
+                    })
+                    .child(inner),
+            )
             .into_any_element()
     }
 
+    /// Entry `ix`: its title (with the timeline's tick beside it), date,
+    /// description, files and links, over a divider when `divided`.
     fn render_entry(
         &mut self,
         ix: usize,
         entry: &ChangelogEntryView,
-        last: bool,
+        divided: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -761,12 +846,24 @@ impl ChangelogView {
             .debug_selector(move || format!("changelog-entry-{id}"))
             .flex()
             .flex_col()
+            .ml(px(GUTTER_W))
             .py(px(ENTRY_PAD_Y))
-            .when(!last, |d| d.border_b_1().border_color(theme.divider))
+            .when(divided, |d| d.border_b_1().border_color(theme.divider))
             .child(
                 div()
+                    .relative()
                     .type_style(Type::Heading)
                     .text_color(theme.text_loud)
+                    .child(
+                        div()
+                            .debug_selector(move || format!("changelog-tick-{ix}"))
+                            .absolute()
+                            .left(px(RULE_X + 0.5 - TICK / 2.0 - GUTTER_W))
+                            .top(px((TITLE_LINE_H - TICK) / 2.0))
+                            .size(px(TICK))
+                            .rounded_full()
+                            .bg(theme.muted),
+                    )
                     .child(StyledText::new(entry.title.clone()).with_highlights(title_marks)),
             )
             .child(
@@ -923,15 +1020,108 @@ fn open_file(path: &std::path::Path, cx: &mut App) {
 }
 
 /// An entry's list key: its id, and what it reads (an edited entry is
-/// re-measured in place).
-fn entry_key(entry: &ChangelogEntryView) -> ItemKey {
+/// re-measured in place), with the releases over it, whether one sits under
+/// it, and the releases' error over the first.
+fn entry_key(entry: &ChangelogEntryView, releases: &[Release], release_under: bool, error: Option<&str>) -> ItemKey {
     let ident = ItemKey::of("changelog-entry", &entry.id).ident;
+    let releases: Vec<(&str, &str)> = releases.iter().map(|r| (r.tag.as_str(), r.label.as_str())).collect();
     let content = ItemKey::of(
         "changelog-entry",
-        (&entry.title, &entry.description, entry.links.len(), entry.attachments.len()),
+        (
+            &entry.title,
+            &entry.description,
+            entry.links.len(),
+            entry.attachments.len(),
+            releases,
+            release_under,
+            error,
+        ),
     )
     .content;
     ItemKey { ident, content }
+}
+
+/// A release on the timeline: an accent diamond on the rule, a short rule
+/// either side of it, and the release and its date over a rule across the
+/// column (`──◆── v0.14.0 · Nov 19 ─────`).
+fn render_release(release: &Release, theme: &Theme) -> AnyElement {
+    let rule = theme.divider_strong;
+    let accent = theme.accent;
+    let tag = release.tag.clone();
+    let mid = RELEASE_H / 2.0;
+    let line = |left: f32, width: f32| {
+        div()
+            .absolute()
+            .left(px(left))
+            .top(px(mid))
+            .w(px(width))
+            .h(px(1.0))
+            .bg(rule)
+    };
+    let center = RULE_X + 0.5;
+    div()
+        .debug_selector(move || format!("changelog-release-{tag}"))
+        .relative()
+        .h(px(RELEASE_H))
+        .flex()
+        .flex_row()
+        .items_center()
+        .child(line(0.0, center - DIAMOND / 2.0 - 2.0))
+        .child(line(center + DIAMOND / 2.0 + 2.0, GUTTER_W - (center + DIAMOND / 2.0 + 2.0) - 6.0))
+        .child(
+            canvas(|_, _, _| (), move |bounds, _, window, _| paint_diamond(bounds, accent, window))
+                .absolute()
+                .left(px(center - DIAMOND / 2.0))
+                .top(px(mid + 0.5 - DIAMOND / 2.0))
+                .size(px(DIAMOND)),
+        )
+        .child(
+            div()
+                .ml(px(GUTTER_W))
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .type_style(Type::SmallMedium)
+                        .text_color(accent)
+                        .child(changelog::release_caption(release)),
+                )
+                .child(div().flex_1().h(px(1.0)).bg(rule)),
+        )
+        .into_any_element()
+}
+
+/// A diamond filling `bounds`.
+fn paint_diamond(bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {
+    let c = bounds.center();
+    let (rx, ry) = (bounds.size.width / 2.0, bounds.size.height / 2.0);
+    let mut path = PathBuilder::fill();
+    path.move_to(point(c.x, c.y - ry));
+    path.line_to(point(c.x + rx, c.y));
+    path.line_to(point(c.x, c.y + ry));
+    path.line_to(point(c.x - rx, c.y));
+    path.close();
+    if let Ok(path) = path.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// Why the releases couldn't be read, over the entries (a malformed
+/// `releases:` block): the page still shows everything else.
+fn release_error(error: &str, theme: &Theme) -> AnyElement {
+    div()
+        .debug_selector(|| "changelog-releases-error".into())
+        .ml(px(GUTTER_W))
+        .pt(px(ENTRY_PAD_Y))
+        .type_style(Type::Small)
+        .text_color(theme.warning)
+        .child(format!("Couldn\u{2019}t read the releases: {error}"))
+        .into_any_element()
 }
 
 impl Render for ChangelogView {
@@ -1367,6 +1557,113 @@ mod tests {
         view.update_in(&mut vcx, |v, window, cx| v.navigate(Nav::ClearSearch, window, cx));
         settle(&view, &mut vcx);
         assert_eq!(model(&view, &vcx, |m| (m.query().to_string(), m.match_count())), (String::new(), 3));
+
+        view.update(&mut vcx, |v, _| v.stop_workers());
+        unsafe { std::env::remove_var("SHELBI_HOME") };
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// `git` in `repo`, its dates `at`.
+    fn git(repo: &std::path::Path, args: &[&str], at: chrono::DateTime<chrono::FixedOffset>) {
+        let date = at.to_rfc3339();
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[gpui::test]
+    fn the_timeline_ticks_each_entry_and_marks_releases_between_them(cx: &mut TestAppContext) {
+        let _env = crate::test_env::lock();
+        let home = std::env::temp_dir().join(format!("shbcl-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(home.join("projects")).unwrap();
+        // SAFETY: the env lock is held.
+        unsafe { std::env::set_var("SHELBI_HOME", &home) };
+        let project = "tl";
+        let now = shelbi_state::changelog::now();
+        // A repository tagged between the two entries.
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"], now);
+        git(&repo, &["commit", "-q", "--allow-empty", "-m", "x"], now - chrono::Duration::hours(1));
+        git(&repo, &["tag", "-a", "-m", "x", "v1.0.0"], now - chrono::Duration::hours(1));
+        let yaml = |releases: &str| {
+            format!(
+                "repo: {}\nmachines: []\norchestrator: {{ runner: claude }}\nagent_runners:\n  claude: {{ command: claude, flags: [] }}\n{releases}",
+                repo.display()
+            )
+        };
+        let config = home.join("projects").join(format!("{project}.yaml"));
+        std::fs::write(&config, yaml("releases:\n  tags: \"v*.*.*\"\n  label: \"Shelbi {version}\"\n")).unwrap();
+        let mut older = entry("Before the release", &[], "Shipped in 1.0.");
+        older.date = now - chrono::Duration::hours(2);
+        add_entry(project, older).unwrap();
+        add_entry(project, entry("After the release", &[], "Ships next.")).unwrap();
+
+        cx.update(|cx| {
+            cx.set_global(Theme::resolve(shelbi_state::ThemePreference::Dark, gpui::WindowAppearance::Dark));
+            gpui_kit::init(cx);
+        });
+        let handle = cx.update(|cx| {
+            cx.open_window(Default::default(), |_, cx| cx.new(|cx| ChangelogView::new(&shelbi_orchestrator::source::local_handle(project), cx)))
+                .unwrap()
+        });
+        let mut vcx = VisualTestContext::from_window(handle.into(), cx);
+        let view = handle.root(&mut vcx).unwrap();
+        settle(&view, &mut vcx);
+        let ids: Vec<String> = view.read_with(&vcx, |v, _| v.model.visible().map(|e| e.id.clone()).collect());
+        assert_eq!(ids.len(), 2);
+
+        // The release sits between the entry after it (above) and the one
+        // before it (below), labeled with its version and day.
+        let after = vcx.debug_bounds(Box::leak(format!("changelog-entry-{}", ids[0]).into_boxed_str())).expect("newest");
+        let before = vcx.debug_bounds(Box::leak(format!("changelog-entry-{}", ids[1]).into_boxed_str())).expect("older");
+        let release = vcx.debug_bounds("changelog-release-v1.0.0").expect("the release marker");
+        assert!(after.bottom() <= release.top() && release.bottom() <= before.top(), "{after:?} {release:?} {before:?}");
+        let caption = view.read_with(&vcx, |v, _| v.model.data().unwrap().releases[0].label.clone());
+        assert_eq!(caption, "Shelbi 1.0.0");
+
+        // A tick beside each title, on the rule, centered on the title's
+        // first line.
+        let rule = vcx.debug_bounds("changelog-rule-0").expect("the rule");
+        for (ix, entry) in [after, before].into_iter().enumerate() {
+            let tick = vcx.debug_bounds(Box::leak(format!("changelog-tick-{ix}").into_boxed_str())).expect("a tick");
+            assert!((tick.center().x - rule.center().x).abs() <= px(1.0), "tick {ix} on the rule");
+            let title_mid = entry.top() + px(ENTRY_PAD_Y + TITLE_LINE_H / 2.0);
+            assert!((tick.center().y - title_mid).abs() <= px(1.0), "tick {ix} beside its title");
+        }
+        // The rule runs the list's length: through both rows.
+        assert!(vcx.debug_bounds("changelog-rule-1").is_some());
+        assert!(vcx.debug_bounds("changelog-releases-error").is_none());
+
+        // A malformed glob: said over the entries, which still show.
+        std::fs::write(&config, yaml("releases:\n  tags: \"v[0\"\n")).unwrap();
+        add_entry(project, entry("A third", &[], "Re-read.")).unwrap();
+        settle(&view, &mut vcx);
+        assert_eq!(model(&view, &vcx, |m| m.total()), 3);
+        assert!(vcx.debug_bounds("changelog-releases-error").is_some());
+        assert!(vcx.debug_bounds("changelog-release-v1.0.0").is_none());
+        let error = model(&view, &vcx, |m| m.releases_error().map(str::to_string)).unwrap();
+        assert!(error.starts_with("releases.tags `v[0`"), "{error}");
+
+        // No block: ticks only.
+        std::fs::write(&config, yaml("")).unwrap();
+        add_entry(project, entry("A fourth", &[], "Re-read.")).unwrap();
+        settle(&view, &mut vcx);
+        assert!(vcx.debug_bounds("changelog-releases-error").is_none());
+        assert!(vcx.debug_bounds("changelog-release-v1.0.0").is_none());
+        assert!(vcx.debug_bounds("changelog-tick-0").is_some());
 
         view.update(&mut vcx, |v, _| v.stop_workers());
         unsafe { std::env::remove_var("SHELBI_HOME") };

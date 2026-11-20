@@ -14,6 +14,11 @@
 //! their alt text and its files can't be opened ([`ImageSource::Unavailable`]),
 //! rather than failing.
 //!
+//! The page draws a timeline down its left edge: a tick per entry, and a
+//! marker per release (the project's `releases:` tag glob, read with the
+//! entries by [`read_changelog`]) placed between the entries that came
+//! before and after it ([`ChangelogModel::timeline`]).
+//!
 //! Storage, the link syntax and search live in [`shelbi_state::changelog`];
 //! this module is the view over them.
 
@@ -21,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
+pub use shelbi_state::changelog::Release;
 use shelbi_state::changelog::{self, AttachmentKind, ChangelogStamp, Link};
 
 /// How many entries a page shows, and how many more each
@@ -314,6 +320,14 @@ pub struct ChangelogData {
     pub error: Option<String>,
     /// The directory's stamp when it was read.
     pub stamp: ChangelogStamp,
+    /// The project's releases (the git tags its `releases:` glob matches),
+    /// newest first. Empty for a project with no `releases:` block.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub releases: Vec<Release>,
+    /// Why the releases couldn't be read: a malformed `releases:` block, or
+    /// a repository git couldn't list. The entries still show.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_error: Option<String>,
 }
 
 /// Read `project`'s changelog with its links resolved. Touches disk (the
@@ -322,7 +336,14 @@ pub struct ChangelogData {
 pub fn read_changelog(project: &str) -> ChangelogData {
     // Stamp first: an entry landing mid-read then shows as a change next tick.
     let stamp = changelog::changelog_stamp(project);
-    let repo = changelog::project_github_repo(project);
+    let config = shelbi_state::load_project(project).ok();
+    let repo = config.as_ref().and_then(changelog::project_github_repo_of);
+    // The tags are cached per repository, so a re-read with no new tag runs
+    // no git.
+    let releases = config
+        .as_ref()
+        .map(changelog::read_releases_of)
+        .unwrap_or_default();
     match changelog::read_entries(project) {
         Ok(read) => ChangelogData {
             project: project.to_string(),
@@ -334,6 +355,8 @@ pub fn read_changelog(project: &str) -> ChangelogData {
                 .collect(),
             error: None,
             stamp,
+            releases: releases.releases,
+            releases_error: releases.error,
         },
         Err(e) => ChangelogData {
             project: project.to_string(),
@@ -342,6 +365,45 @@ pub fn read_changelog(project: &str) -> ChangelogData {
             ..ChangelogData::default()
         },
     }
+}
+
+/// How a release reads on its marker: its label and the day it was tagged,
+/// `v0.14.0 · Nov 19`.
+pub fn release_caption(release: &Release) -> String {
+    format!("{} \u{b7} {}", release.label, release.date.format("%b %-d"))
+}
+
+/// One shown entry on the timeline, with the releases drawn just above it,
+/// newest first: those made no earlier than this entry and before the
+/// entry above it (for the newest entry, every release since it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimelineEntry<'a> {
+    pub entry: &'a ChangelogEntryView,
+    pub releases: &'a [Release],
+}
+
+/// Where each release goes among entries dated `entries` (newest first):
+/// for each entry, the range of `releases` (newest first) drawn above it.
+/// A release sits above the newest entry no newer than it, so every entry
+/// made after a release sits above the release's marker (an entry made at
+/// the release's very moment sits under it). A release older than every
+/// entry has no place and is left out: the timeline doesn't run on past its
+/// last entry.
+pub fn place_releases(
+    entries: &[DateTime<FixedOffset>],
+    releases: &[DateTime<FixedOffset>],
+) -> Vec<std::ops::Range<usize>> {
+    let mut next = 0;
+    entries
+        .iter()
+        .map(|date| {
+            let start = next;
+            while next < releases.len() && releases[next] >= *date {
+                next += 1;
+            }
+            start..next
+        })
+        .collect()
 }
 
 /// The Changelog page's state: the entries last read, the search query, and
@@ -451,6 +513,30 @@ impl ChangelogModel {
     /// The entry with `id`, if it's in the last read.
     pub fn entry(&self, id: &str) -> Option<&ChangelogEntryView> {
         self.data.as_ref()?.entries.iter().find(|e| e.id == id)
+    }
+
+    /// The shown entries, newest first, each with the releases drawn above
+    /// it ([`place_releases`]). Releases older than the last shown entry
+    /// wait for the page that reaches them.
+    pub fn timeline(&self) -> Vec<TimelineEntry<'_>> {
+        let releases = self.data.as_ref().map_or(&[][..], |d| &d.releases[..]);
+        let entries: Vec<&ChangelogEntryView> = self.visible().collect();
+        let dates: Vec<DateTime<FixedOffset>> = entries.iter().map(|e| e.date).collect();
+        let release_dates: Vec<DateTime<FixedOffset>> = releases.iter().map(|r| r.date).collect();
+        place_releases(&dates, &release_dates)
+            .into_iter()
+            .zip(entries)
+            .map(|(range, entry)| TimelineEntry {
+                entry,
+                releases: &releases[range],
+            })
+            .collect()
+    }
+
+    /// Why the releases couldn't be read, if they couldn't (the page says
+    /// so over its entries).
+    pub fn releases_error(&self) -> Option<&str> {
+        self.data.as_ref()?.releases_error.as_deref()
     }
 }
 
@@ -796,6 +882,104 @@ mod tests {
         m.set_query("");
         assert_eq!(m.match_count(), PAGE_SIZE + 6);
         assert_eq!(m.visible().count(), PAGE_SIZE);
+    }
+
+    fn at(s: &str) -> DateTime<FixedOffset> {
+        DateTime::parse_from_rfc3339(s).unwrap()
+    }
+
+    fn dated(id: &str, date: &str) -> ChangelogEntryView {
+        let mut e = view(id, id, "", vec![]);
+        e.date = at(date);
+        e
+    }
+
+    fn release(tag: &str, date: &str) -> Release {
+        Release {
+            tag: tag.into(),
+            label: tag.into(),
+            date: at(date),
+        }
+    }
+
+    #[test]
+    fn releases_sit_between_the_entries_before_and_after_them() {
+        let entries = [
+            at("2026-11-20T10:00:00-08:00"),
+            at("2026-11-19T12:00:00-08:00"),
+            at("2026-11-18T09:00:00-08:00"),
+            at("2026-11-16T09:00:00-08:00"),
+        ];
+        let releases = [
+            // Newer than every entry: over the newest.
+            at("2026-11-20T11:00:00-08:00"),
+            // Between the 20th and 19th entries: over the 19th.
+            at("2026-11-19T15:30:00-08:00"),
+            // At the 18th entry's very moment: over it.
+            at("2026-11-18T09:00:00-08:00"),
+            // Two between the 18th and the 16th, newest first.
+            at("2026-11-17T09:00:00Z"),
+            at("2026-11-16T20:00:00Z"),
+            // Older than every entry: nowhere.
+            at("2026-11-01T00:00:00Z"),
+        ];
+        assert_eq!(place_releases(&entries, &releases), [0..1, 1..2, 2..3, 3..5]);
+        // Offsets compare as instants: 17:00Z is 09:00-08:00.
+        assert_eq!(
+            place_releases(&[at("2026-11-16T09:00:00-08:00")], &[at("2026-11-16T17:00:00Z")]),
+            vec![std::ops::Range { start: 0, end: 1 }]
+        );
+        assert_eq!(place_releases(&entries, &[]), [0..0, 0..0, 0..0, 0..0]);
+        assert!(place_releases(&[], &releases).is_empty());
+    }
+
+    #[test]
+    fn the_timeline_follows_search_and_paging() {
+        let mut m = ChangelogModel::new();
+        let mut entries = vec![
+            dated("tracker", "2026-11-20T10:00:00-08:00"),
+            dated("labels", "2026-11-19T09:00:00-08:00"),
+        ];
+        // A full page of older entries, so the oldest release waits for the
+        // second page.
+        entries.extend((0..PAGE_SIZE).map(|i| dated(&format!("old{i}"), "2026-11-10T00:00:00Z")));
+        entries.push(dated("first", "2026-10-01T00:00:00Z"));
+        let mut d = data(entries);
+        d.releases = vec![
+            release("v0.14.0", "2026-11-19T15:30:00-08:00"),
+            release("v0.13.3", "2026-11-16T12:00:00-08:00"),
+            release("v0.1.0", "2026-10-02T00:00:00Z"),
+        ];
+        m.set_data(d);
+        let rows = |m: &ChangelogModel| -> Vec<(String, Vec<String>)> {
+            m.timeline()
+                .into_iter()
+                .filter(|t| !t.releases.is_empty())
+                .map(|t| {
+                    (
+                        t.entry.id.clone(),
+                        t.releases.iter().map(|r| r.tag.clone()).collect(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(m.timeline().len(), PAGE_SIZE);
+        assert_eq!(
+            rows(&m),
+            [
+                ("labels".to_string(), vec!["v0.14.0".to_string()]),
+                ("old0".to_string(), vec!["v0.13.3".to_string()]),
+            ]
+        );
+        m.load_more();
+        assert_eq!(rows(&m).last().unwrap(), &("first".to_string(), vec!["v0.1.0".to_string()]));
+        // A search keeps each release between the matches around it.
+        m.set_query("tracker labels");
+        assert!(m.timeline().is_empty());
+        m.set_query("labels");
+        assert_eq!(rows(&m), [("labels".to_string(), vec!["v0.14.0".to_string()])]);
+        assert_eq!(m.releases_error(), None);
+        assert_eq!(release_caption(&release("v0.14.0", "2026-11-19T15:30:00-08:00")), "v0.14.0 \u{b7} Nov 19");
     }
 
     #[test]

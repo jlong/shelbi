@@ -876,6 +876,7 @@ fn lint_project(
                                 locate_key(text, "config_mode"),
                             ));
                         }
+                        lint_releases(entry, text, &p, out);
                         match p.validate_workspaces() {
                             Ok(()) => Some(p),
                             Err(e) => {
@@ -922,6 +923,7 @@ fn lint_project(
                                 locate_key(shared, "config_mode"),
                             ));
                         }
+                        lint_releases(shared_entry, shared, &p, out);
                         match p.validate_workspaces() {
                             Ok(()) => Some(p),
                             Err(e) => {
@@ -1514,6 +1516,28 @@ fn push_parse(
     out: &mut Vec<Diagnostic>,
 ) {
     out.push(semantic(entry, code, error, None));
+}
+
+/// A malformed `releases:` block (a bad tag glob, an unknown label
+/// placeholder). It never fails the project's load, so the Changelog page
+/// still renders (and says so over its entries); lint is where it fails.
+fn lint_releases(entry: &InventoryEntry, text: &str, project: &Project, out: &mut Vec<Diagnostic>) {
+    let Some(releases) = &project.releases else {
+        return;
+    };
+    if let Err(e) = releases.validate() {
+        out.push(diag(
+            entry,
+            Severity::Error,
+            "PROJECT_RELEASES_INVALID",
+            e.to_string(),
+            Some(
+                "Set releases.tags to a git tag glob such as \"v*.*.*\", and use only {tag} and {version} in releases.label."
+                    .into(),
+            ),
+            locate_key(text, "releases"),
+        ));
+    }
 }
 
 fn semantic(

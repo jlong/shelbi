@@ -8706,6 +8706,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
             issue_tracker: Default::default(),
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
+            releases: None,
         }
     }
 

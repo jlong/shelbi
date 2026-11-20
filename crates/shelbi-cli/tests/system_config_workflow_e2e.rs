@@ -779,6 +779,34 @@ fn every_flat_family_has_valid_and_invalid_scenario() {
     }
 }
 
+/// The registration's `releases:` block (the Changelog timeline's tag glob):
+/// a good one lints clean, a malformed glob is a config error naming the
+/// field.
+#[test]
+fn a_releases_block_lints_and_a_bad_glob_is_a_config_error() {
+    let base = "name: Demo\ndefault_branch: main\ndefault_workflow: task\norchestrator:\n  runner: claude\nagent_runners:\n  claude:\n    command: claude\n    flags: []\nrepo: /tmp/demo-repo\nmachines:\n  - name: hub\n    kind: local\n    work_dir: /tmp\nworkspaces:\n  - name: alpha\n    machine: hub\n    runner: claude\n    tags: [build]\n";
+    let (_fixture, root) = scaffold_flat("claude");
+    let session = Session::open(&root, "demo");
+    session.edit(
+        "project.demo.registration",
+        &format!("{base}releases:\n  tags: \"testflight/*\"\n  label: \"TestFlight {{version}}\"\n"),
+    );
+    let (clean, report) = session.lint_staged();
+    assert!(clean, "a good releases block lints clean: {report}");
+
+    for bad in ["releases:\n  tags: \"v[0-9\"\n", "releases:\n  tags: \"v*\"\n  label: \"{name}\"\n"] {
+        let (_fixture, root) = scaffold_flat("claude");
+        let session = Session::open(&root, "demo");
+        session.edit("project.demo.registration", &format!("{base}{bad}"));
+        let (clean, report) = session.lint_staged();
+        assert!(!clean, "a malformed releases block fails lint: {report}");
+        assert!(
+            has_code(&report, "PROJECT_RELEASES_INVALID"),
+            "expected PROJECT_RELEASES_INVALID: {report}"
+        );
+    }
+}
+
 /// The split registration family (`project.yaml` + `local.yaml`) only exists in
 /// the in-repo layout, so it gets its own valid/invalid pair.
 #[test]

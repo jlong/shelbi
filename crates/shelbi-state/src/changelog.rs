@@ -58,13 +58,21 @@
 //! references them, and any other file, listed under it. They live in
 //! `changelog/assets/<entry-id>/` and are recorded in the frontmatter's
 //! `attachments:`; see [`attachments`] for the layout and naming.
+//!
+//! ## Releases
+//!
+//! The Changelog page's timeline marks each release between the entries
+//! that came before and after it. What counts as a release is the project's
+//! own convention, its YAML's `releases:` tag glob; see [`releases`].
 
 pub mod attachments;
+pub mod releases;
 
 pub use attachments::{
     attach_files, attach_to_entry, format_size, prepare_attachments, Attachment, AttachmentKind, NewAttachment,
     PreparedAttachment, StoredAttachment,
 };
+pub use releases::{read_releases, read_releases_of, Release, ReleaseRead};
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
@@ -974,7 +982,11 @@ pub fn now() -> DateTime<FixedOffset> {
 /// tracker when it has one, else its repository's `origin` remote when that
 /// points at github.com. `None` when neither does.
 pub fn project_github_repo(project: &str) -> Option<String> {
-    let p = crate::load_project(project).ok()?;
+    project_github_repo_of(&crate::load_project(project).ok()?)
+}
+
+/// [`project_github_repo`] for a loaded project.
+pub fn project_github_repo_of(p: &shelbi_core::Project) -> Option<String> {
     if let Some(gh) = p
         .issue_tracker
         .github
@@ -991,22 +1003,7 @@ pub fn project_github_repo(project: &str) -> Option<String> {
 /// config (following a worktree's `.git` file to the common dir). No `git`
 /// process is run.
 fn origin_url(repo: &Path) -> Option<String> {
-    let dot_git = repo.join(".git");
-    let git_dir = if dot_git.is_file() {
-        let text = fs::read_to_string(&dot_git).ok()?;
-        let dir = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
-        let dir = if dir.is_relative() {
-            repo.join(dir)
-        } else {
-            dir
-        };
-        match fs::read_to_string(dir.join("commondir")) {
-            Ok(common) => dir.join(common.trim()),
-            Err(_) => dir,
-        }
-    } else {
-        dot_git
-    };
+    let git_dir = releases::git_common_dir(repo)?;
     origin_from_config(&fs::read_to_string(git_dir.join("config")).ok()?)
 }
 

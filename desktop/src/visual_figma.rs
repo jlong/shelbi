@@ -3972,11 +3972,28 @@ impl Run {
     /// `changelog-empty` before any entry, then `changelog` once the
     /// fixture's entries land (live, on the view's own refresh),
     /// `state-changelog-search` with a query typed, and
-    /// `state-changelog-next` after J twice (K brings it back).
+    /// `state-changelog-next` after J twice (K brings it back). The project
+    /// has a `releases:` block over a repository tagged between the
+    /// fixture's entries, so the timeline draws its markers.
     /// `SHELBI_VISUAL_ONLY=changelog` renders just these.
     fn changelog(&mut self) {
         let dir = shelbi_state::changelog::changelog_dir(PROJECT).expect("the changelog directory");
         let _ = std::fs::remove_dir_all(&dir);
+        let yaml = shelbi_state::projects_dir().expect("the projects directory").join(format!("{PROJECT}.yaml"));
+        let before = std::fs::read_to_string(&yaml).ok();
+        if let Some(text) = &before {
+            let repo = write_release_repo(&dir.with_file_name("release-repo"), pinned_now());
+            let text = text.replacen("repo: ''\n", &format!("repo: {}\n", repo.display()), 1);
+            std::fs::write(&yaml, format!("{text}releases:\n  tags: \"v*.*.*\"\n"))
+                .expect("give the project releases");
+        }
+        self.changelog_pages();
+        if let Some(text) = before {
+            std::fs::write(&yaml, text).expect("restore the project");
+        }
+    }
+
+    fn changelog_pages(&mut self) {
         let handle = self.open();
         self.click(handle, View::Changelog);
         let page = handle.update(&mut self.cx, |w, _, _| w.offscreen_changelog()).unwrap();
@@ -4537,6 +4554,40 @@ const CHANGELOG_FIXTURES: &[(&str, i64, &str, &[&str], &[u64], &[&str])] = &[
 ];
 
 /// Write [`CHANGELOG_FIXTURES`] into the fixture project's changelog.
+/// A repository tagged `v0.13.0`, `v0.13.3` and `v0.14.0` between the
+/// changelog fixture's entries (10 days, 3 days and 12 hours before `now`).
+fn write_release_repo(repo: &Path, now: DateTime<Utc>) -> PathBuf {
+    let _ = std::fs::remove_dir_all(repo);
+    std::fs::create_dir_all(repo).expect("create the release repository");
+    let git = |args: &[&str], at: DateTime<Utc>| {
+        let date = at.to_rfc3339();
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .env("GIT_AUTHOR_DATE", &date)
+            .env("GIT_COMMITTER_DATE", &date)
+            .env("GIT_AUTHOR_NAME", "Shelbi")
+            .env("GIT_AUTHOR_EMAIL", "visual@example.com")
+            .env("GIT_COMMITTER_NAME", "Shelbi")
+            .env("GIT_COMMITTER_EMAIL", "visual@example.com")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        assert!(ok, "git {args:?}");
+    };
+    git(&["init", "-q", "-b", "main"], now);
+    for (tag, ago) in [
+        ("v0.13.0", chrono::Duration::days(10)),
+        ("v0.13.3", chrono::Duration::days(3)),
+        ("v0.14.0", chrono::Duration::hours(12)),
+    ] {
+        git(&["commit", "-q", "--allow-empty", "-m", tag], now - ago);
+        git(&["tag", "-a", "-m", tag, tag], now - ago);
+    }
+    repo.to_path_buf()
+}
+
 fn write_changelog_fixtures(now: DateTime<Utc>) {
     use shelbi_state::changelog::{add_entry, NewEntry, PrRef};
     for (i, (title, days, body, issues, prs, urls)) in CHANGELOG_FIXTURES.iter().enumerate() {

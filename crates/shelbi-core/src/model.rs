@@ -193,6 +193,13 @@ pub struct Project {
     /// set once at the kind level in [`runners`](Self::runners).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, ProjectAgentConfig>,
+    /// What counts as a release: the git tags matching a glob, drawn as
+    /// markers on the Changelog page's timeline. `None` (the default, and
+    /// every new project's) means no releases; nothing guesses a pattern.
+    /// A malformed block never fails the load: the Changelog page and
+    /// `shelbi config lint` report it. See [`crate::releases`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub releases: Option<crate::releases::ReleasesConfig>,
 
     // --- user-local -------------------------------------------------------
     pub repo: String,
@@ -265,6 +272,7 @@ pub const SHARED_PROJECT_FIELDS: &[&str] = &[
     "issue_tracker",
     "runners",
     "agents",
+    "releases",
 ];
 
 /// YAML keys that belong in the *user-local* half of a split project
@@ -4527,6 +4535,7 @@ workspace_settings_template: /etc/shelbi/p.json
             issue_tracker: Default::default(),
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
+            releases: None,
         };
         assert!(project.validate_workspaces().is_ok());
 
@@ -4626,6 +4635,7 @@ workspaces:
             issue_tracker: Default::default(),
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
+            releases: None,
         }
     }
 
@@ -4930,6 +4940,7 @@ workspaces:
             issue_tracker: Default::default(),
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
+            releases: None,
         }
     }
 
@@ -6371,6 +6382,7 @@ git:
             agents: Default::default(),
             disk: DiskConfig::default(),
             detected_shapes: Vec::new(),
+            releases: None,
         }
     }
 

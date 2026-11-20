@@ -615,6 +615,14 @@ fn changelog_entry() -> (ChangelogEntryView, Value) {
     (entry, json)
 }
 
+fn shelbi_app_release() -> crate::changelog::Release {
+    crate::changelog::Release {
+        tag: "v0.14.0".into(),
+        label: "v0.14.0".into(),
+        date: chrono::DateTime::parse_from_rfc3339("2026-11-19T15:30:00-08:00").unwrap(),
+    }
+}
+
 #[test]
 fn changelog_data_round_trips() {
     let (entry, entry_json) = changelog_entry();
@@ -627,6 +635,8 @@ fn changelog_data_round_trips() {
             entries: 4,
             modified: Some(UNIX_EPOCH + Duration::new(1_793_000_000, 5)),
         },
+        releases: vec![shelbi_app_release()],
+        releases_error: Some("releases.label: unknown placeholder".into()),
     };
     assert_round_trip(
         &data,
@@ -638,9 +648,23 @@ fn changelog_data_round_trips() {
             "stamp": {
                 "entries": 4,
                 "modified": { "secs_since_epoch": 1_793_000_000u64, "nanos_since_epoch": 5 }
-            }
+            },
+            "releases": [{
+                "tag": "v0.14.0",
+                "label": "v0.14.0",
+                "date": "2026-11-19T15:30:00-08:00"
+            }],
+            "releases_error": "releases.label: unknown placeholder"
         }),
     );
+    // A project with no releases sends neither key.
+    let bare = ChangelogData {
+        releases: vec![],
+        releases_error: None,
+        ..data.clone()
+    };
+    let text = serde_json::to_string(&bare).unwrap();
+    assert!(!text.contains("releases"), "{text}");
     // The links' labels and targets are rebuilt on decode, not sent.
     let back: ChangelogData = serde_json::to_string(&data)
         .and_then(|s| serde_json::from_str(&s))

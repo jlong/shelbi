@@ -495,6 +495,7 @@ mod tests {
             issue_tracker: Default::default(),
             disk: shelbi_core::DiskConfig::default(),
             detected_shapes: Vec::new(),
+            releases: None,
             git: GitConfig {
                 base_branch: base_branch.map(String::from),
                 branch_prefix: Some("shelbi".into()),
