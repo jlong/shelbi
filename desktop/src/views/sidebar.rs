@@ -557,15 +557,19 @@ pub enum StateGlyph {
     Drawn(crate::assets::Glyph, Hsla),
     /// The awaiting-input disc: yellow, its `?` cut out over a dark disc.
     Question(Hsla),
+    /// The waiting disc: cyan, three dots cut out over a white disc.
+    Waiting(Hsla),
     Text(String, Hsla),
 }
 
 /// A workspace's state glyph: green play while working, the yellow `?`
-/// while it waits for input, a quiet dot while idle.
+/// while it waits for input, the cyan `⋯` while a job or background work it
+/// started will wake it, a quiet dot while idle.
 pub fn workspace_glyph(badge: WorkspaceBadge, theme: &Theme) -> StateGlyph {
     match badge {
         WorkspaceBadge::Working => StateGlyph::Drawn(glyphs::PLAY, theme.icon_green),
         WorkspaceBadge::AwaitingInput => StateGlyph::Question(theme.icon_yellow),
+        WorkspaceBadge::Waiting => StateGlyph::Waiting(theme.icon_cyan),
         WorkspaceBadge::Idle => StateGlyph::Drawn(glyphs::DOT, quiet_glyph(theme)),
         WorkspaceBadge::Loading => StateGlyph::Text(badge.glyph().to_string(), theme.muted),
         WorkspaceBadge::AwaitingPermission | WorkspaceBadge::Paused => StateGlyph::Text(
@@ -596,21 +600,8 @@ fn quiet_glyph(theme: &Theme) -> Hsla {
 pub fn render_glyph(g: StateGlyph) -> AnyElement {
     match g {
         StateGlyph::Drawn(g, color) => glyph(g).text_color(color).into_any_element(),
-        StateGlyph::Question(color) => div()
-            .relative()
-            .flex_none()
-            .size(glyphs::QUESTION.size())
-            .child(
-                div()
-                    .absolute()
-                    .top(px(1.0))
-                    .left(px(1.0))
-                    .size(px(10.0))
-                    .rounded_full()
-                    .bg(gpui::rgb(0x131418)),
-            )
-            .child(glyph(glyphs::QUESTION).absolute().top_0().left_0().text_color(color))
-            .into_any_element(),
+        StateGlyph::Question(color) => cutout_disc(glyphs::QUESTION, color, gpui::rgb(0x131418).into()),
+        StateGlyph::Waiting(color) => cutout_disc(glyphs::WAITING, color, gpui::white()),
         StateGlyph::Text(text, color) => div()
             .flex()
             .flex_none()
@@ -622,6 +613,26 @@ pub fn render_glyph(g: StateGlyph) -> AnyElement {
             .child(text)
             .into_any_element(),
     }
+}
+
+/// A disc glyph with its mark cut out, over a 10pt disc in `under` so the
+/// mark reads on either theme (the Figma `Status` glyphs' `circle` layer).
+fn cutout_disc(g: crate::assets::Glyph, color: Hsla, under: Hsla) -> AnyElement {
+    div()
+        .relative()
+        .flex_none()
+        .size(g.size())
+        .child(
+            div()
+                .absolute()
+                .top(px(1.0))
+                .left(px(1.0))
+                .size(px(10.0))
+                .rounded_full()
+                .bg(under),
+        )
+        .child(glyph(g).absolute().top_0().left_0().text_color(color))
+        .into_any_element()
 }
 
 /// The Heroicon for a nav view.
@@ -1876,6 +1887,10 @@ mod tests {
         assert_eq!(
             workspace_glyph(WorkspaceBadge::AwaitingInput, &t),
             StateGlyph::Question(t.icon_yellow)
+        );
+        assert_eq!(
+            workspace_glyph(WorkspaceBadge::Waiting, &t),
+            StateGlyph::Waiting(t.icon_cyan)
         );
         assert!(matches!(
             workspace_glyph(WorkspaceBadge::Idle, &t),

@@ -227,7 +227,8 @@ pub fn slot_reads_working(status: Option<&crate::WorkspaceStatus>, task_id: &str
     match status {
         Some(s) if s.state == WorkspaceState::Blocked => false,
         Some(s) if s.current_task.as_deref() == Some(task_id) => {
-            matches!(s.state, WorkspaceState::Working | WorkspaceState::Serving)
+            // Waiting (parked on its own job or background work) is busy too.
+            s.state.is_busy() || s.state == WorkspaceState::Serving
         }
         _ => true,
     }
@@ -563,6 +564,7 @@ statuses:
         assert!(slot_reads_working(s(Some("t"), Working).as_ref(), "t"));
         assert!(slot_reads_working(s(Some("t"), Serving).as_ref(), "t"));
         assert!(!slot_reads_working(s(Some("t"), AwaitingInput).as_ref(), "t"), "awaiting input");
+        assert!(slot_reads_working(s(Some("t"), Waiting).as_ref(), "t"), "waiting on a job");
         assert!(!slot_reads_working(s(Some("t"), Paused).as_ref(), "t"), "paused on a limit");
         assert!(!slot_reads_working(s(Some("other"), Blocked).as_ref(), "t"), "blocked, any card");
         // Not yet observed for this card: a fresh dispatch reads as working.

@@ -42,6 +42,21 @@ use crate::{atomic_write, ensure_dir, project_dir, shelbi_home};
 pub enum WorkspaceState {
     Working,
     AwaitingInput,
+    /// A worker ended its turn, but something it is waiting on will wake it
+    /// without the user: a Shelbi job it started is still running (its result
+    /// arrives as a prompt), or Claude Code background work it started (a
+    /// backgrounded shell, a Monitor, a subagent) is still in flight. Shown as
+    /// the blue `⋯` badge, apart from the yellow `?` of [`AwaitingInput`], so
+    /// the user can tell "parked until the job reports" from "blocked on me".
+    ///
+    /// For every purpose but display this is [`Working`]: never idle capacity,
+    /// never dispatched to, never a notification, never a workspace-free
+    /// signal. Worker panes only: the orchestrator's own session never reads
+    /// as Waiting ([`PaneMarker::orchestrator_state`]).
+    ///
+    /// [`AwaitingInput`]: WorkspaceState::AwaitingInput
+    /// [`Working`]: WorkspaceState::Working
+    Waiting,
     Blocked,
     /// The runner stalled on a usage/session limit (e.g. Claude Code's "usage
     /// limit reached … resets at <time>"). Unlike the other states this one is
@@ -66,11 +81,148 @@ impl WorkspaceState {
         match self {
             WorkspaceState::Working => "working",
             WorkspaceState::AwaitingInput => "awaiting_input",
+            WorkspaceState::Waiting => "waiting",
             WorkspaceState::Blocked => "blocked",
             WorkspaceState::Paused => "paused",
             WorkspaceState::Serving => "serving",
         }
     }
+
+    /// Whether the worker is busy for every purpose but display: running a
+    /// turn ([`Working`](WorkspaceState::Working)), or parked until a job or
+    /// background work wakes it ([`Waiting`](WorkspaceState::Waiting)).
+    pub fn is_busy(self) -> bool {
+        matches!(self, WorkspaceState::Working | WorkspaceState::Waiting)
+    }
+
+    /// Fold what the hub knows beyond the pane into a worker's turn-end
+    /// reading. A worker whose turn ended is [`Waiting`] while something will
+    /// wake it without the user ([`TurnEndWake::job_pending`], or the
+    /// `background` reading that is already `Waiting`), and
+    /// [`AwaitingInput`] when nothing will, or when it has an open question
+    /// for the user ([`TurnEndWake::question_open`] wins: it needs input
+    /// whatever else it waits on). Every other state passes through.
+    ///
+    /// Worker panes only; never applied to the orchestrator's session.
+    ///
+    /// [`Waiting`]: WorkspaceState::Waiting
+    /// [`AwaitingInput`]: WorkspaceState::AwaitingInput
+    pub fn with_turn_end_wake(self, wake: TurnEndWake) -> WorkspaceState {
+        match self {
+            WorkspaceState::AwaitingInput | WorkspaceState::Waiting if wake.question_open => {
+                WorkspaceState::AwaitingInput
+            }
+            WorkspaceState::AwaitingInput if wake.job_pending => WorkspaceState::Waiting,
+            other => other,
+        }
+    }
+
+    /// Whether this state is a turn-end reading [`with_turn_end_wake`] folds
+    /// (so a caller only reads the job and question stores when it matters).
+    ///
+    /// [`with_turn_end_wake`]: WorkspaceState::with_turn_end_wake
+    pub fn is_turn_end(self) -> bool {
+        matches!(self, WorkspaceState::AwaitingInput | WorkspaceState::Waiting)
+    }
+}
+
+/// What, beyond its pane, decides whether a worker whose turn ended is
+/// [`WorkspaceState::Waiting`] or [`WorkspaceState::AwaitingInput`]
+/// ([`WorkspaceState::with_turn_end_wake`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TurnEndWake {
+    /// A `shelbi job run` / `job watch` the worker started is still running
+    /// and its result will come back to it as a prompt.
+    pub job_pending: bool,
+    /// The worker has an unanswered `request-clarification` question for its
+    /// current task (`questions/<task>/q-*.md` with no `answered_at`).
+    pub question_open: bool,
+}
+
+/// How long after a job a worker started finishes it still counts as
+/// pending ([`read_turn_end_wake`]). The awareness tick takes the job out of
+/// the store first and delivers its report to the worker on a thread of its
+/// own after; a verified send takes seconds. Without this grace the worker
+/// would read as idle in between (a false `waiting -> awaiting_input` edge, a
+/// notification, a workspace-free signal) and then flip back to working when
+/// the prompt lands.
+pub const JOB_REPORT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Read [`TurnEndWake`] for `workspace` of `project`, serving `task`, from the
+/// job store and the question store. A job counts when the workspace started
+/// it and, if the job recorded a task, that task is still the one the
+/// workspace serves: a job started for an earlier task reports to the
+/// orchestrator, not to this worker. A job that finished within
+/// [`JOB_REPORT_GRACE`] of `now` still counts, since its report may still be
+/// on its way. Unreadable stores read as nothing pending, which falls back to
+/// the plain `AwaitingInput` reading.
+pub fn read_turn_end_wake(
+    project: &str,
+    workspace: &str,
+    task: Option<&str>,
+    now: DateTime<Utc>,
+) -> TurnEndWake {
+    let running = || {
+        crate::awareness::read_awareness(project)
+            .map(|store| {
+                store
+                    .jobs
+                    .iter()
+                    .any(|job| starter_is(job.started_by.as_ref(), workspace, task))
+            })
+            .unwrap_or(false)
+    };
+    let grace = chrono::Duration::from_std(JOB_REPORT_GRACE).unwrap_or_default();
+    let reporting = || {
+        crate::awareness::read_job_history(project)
+            .map(|history| {
+                history.iter().any(|record| {
+                    record.finished_at <= now
+                        && now - record.finished_at < grace
+                        && starter_is(record.started_by.as_ref(), workspace, task)
+                })
+            })
+            .unwrap_or(false)
+    };
+    let job_pending = running() || reporting();
+    let question_open = task.is_some_and(|task| task_has_open_question(project, task));
+    TurnEndWake { job_pending, question_open }
+}
+
+/// Whether a job started by `starter` reports back to `workspace` serving
+/// `task` as a prompt.
+fn starter_is(
+    starter: Option<&crate::awareness::JobStarter>,
+    workspace: &str,
+    task: Option<&str>,
+) -> bool {
+    let Some(starter) = starter else {
+        return false;
+    };
+    starter.workspace == workspace
+        && match (starter.task.as_deref(), task) {
+            (Some(started_for), Some(now)) => started_for == now,
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+}
+
+/// Whether `task` of `project` has a stored question with no answer yet.
+fn task_has_open_question(project: &str, task: &str) -> bool {
+    let Ok(dir) = crate::questions::questions_root(Some(project)).map(|root| root.join(task)) else {
+        return false;
+    };
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        path.extension().and_then(|e| e.to_str()) == Some("md")
+            && crate::questions::read_question(&path)
+                .ok()
+                .flatten()
+                .is_some_and(|q| !q.is_answered())
+    })
 }
 
 impl std::fmt::Display for WorkspaceState {
@@ -95,8 +247,9 @@ pub enum PaneMarker {
     /// agent by itself when that work finishes, so nobody needs to answer it:
     /// the `Stop` hook writes `shelbi:background` instead of `shelbi:idle`
     /// (from the `background_tasks` array in its payload). On a worker pane it
-    /// reads as [`WorkspaceState::Working`] ([`PaneMarker::workspace_state`]):
-    /// it never notifies and is never a workspace-free signal. The orchestrator
+    /// reads as [`WorkspaceState::Waiting`] ([`PaneMarker::workspace_state`]):
+    /// the agent isn't running a turn, but it never notifies and is never a
+    /// workspace-free signal. The orchestrator
     /// is different ([`PaneMarker::orchestrator_state`]): it holds a persistent
     /// event-feed monitor for its whole session, so every turn it ends carries
     /// background work, and ending a turn still means it is waiting for the
@@ -113,11 +266,12 @@ impl PaneMarker {
     /// happens elsewhere.
     ///
     /// This is the *worker* (workspace pane) reading: `Background` is
-    /// `Working`. Never use it for the orchestrator's session; use
+    /// `Waiting`. Never use it for the orchestrator's session; use
     /// [`PaneMarker::orchestrator_state`].
     pub fn workspace_state(self) -> WorkspaceState {
         match self {
-            PaneMarker::Working | PaneMarker::Background => WorkspaceState::Working,
+            PaneMarker::Working => WorkspaceState::Working,
+            PaneMarker::Background => WorkspaceState::Waiting,
             PaneMarker::Idle | PaneMarker::Review => WorkspaceState::AwaitingInput,
             PaneMarker::Blocked => WorkspaceState::Blocked,
         }
@@ -169,7 +323,7 @@ pub fn parse_pane_title_marker(title: &str) -> Option<PaneMarker> {
 /// distinction. Callers that need to know `review` vs `idle` should use
 /// [`parse_pane_title_marker`] instead.
 ///
-/// Worker (workspace pane) semantics: `shelbi:background` is `Working`. The
+/// Worker (workspace pane) semantics: `shelbi:background` is `Waiting`. The
 /// orchestrator's title goes through [`parse_orchestrator_title_state`].
 pub fn parse_pane_title_state(title: &str) -> Option<WorkspaceState> {
     parse_pane_title_marker(title).map(PaneMarker::workspace_state)
@@ -398,19 +552,114 @@ mod tests {
     }
 
     #[test]
-    fn background_marker_reads_as_working_not_awaiting_input() {
+    fn background_marker_reads_as_waiting_not_awaiting_input() {
         // A turn that ended with a background job still running is not waiting
         // on a human: Claude Code resumes the agent when the job exits. It must
         // never surface as awaiting input (no notification, no
-        // workspace-free signal).
+        // workspace-free signal), and it isn't running a turn either.
         assert_eq!(
             parse_pane_title_state("shelbi:background"),
-            Some(WorkspaceState::Working)
+            Some(WorkspaceState::Waiting)
         );
         assert_eq!(
             parse_pane_title_state("✳ Claude shelbi:background\u{0007}"),
-            Some(WorkspaceState::Working)
+            Some(WorkspaceState::Waiting)
         );
+        assert!(WorkspaceState::Waiting.is_busy());
+        assert!(!WorkspaceState::AwaitingInput.is_busy());
+    }
+
+    #[test]
+    fn turn_end_wake_decides_waiting_vs_question() {
+        use WorkspaceState::*;
+        let none = TurnEndWake::default();
+        let job = TurnEndWake { job_pending: true, question_open: false };
+        let question = TurnEndWake { job_pending: false, question_open: true };
+        let both = TurnEndWake { job_pending: true, question_open: true };
+
+        // Nothing pending: the turn ended and nothing will wake it.
+        assert_eq!(AwaitingInput.with_turn_end_wake(none), AwaitingInput);
+        // A running job it started: its result wakes it.
+        assert_eq!(AwaitingInput.with_turn_end_wake(job), Waiting);
+        // Background work (the `background` reading) stays Waiting.
+        assert_eq!(Waiting.with_turn_end_wake(none), Waiting);
+        assert_eq!(Waiting.with_turn_end_wake(job), Waiting);
+        // An open question needs the user, whatever else it waits on.
+        assert_eq!(AwaitingInput.with_turn_end_wake(question), AwaitingInput);
+        assert_eq!(AwaitingInput.with_turn_end_wake(both), AwaitingInput);
+        assert_eq!(Waiting.with_turn_end_wake(question), AwaitingInput);
+        // A live turn, a dialog, a pause, a serving slot are untouched.
+        for s in [Working, Blocked, Paused, Serving] {
+            assert_eq!(s.with_turn_end_wake(both), s);
+        }
+    }
+
+    #[test]
+    fn turn_end_wake_reads_the_job_and_question_stores() {
+        use crate::awareness::{add_job, JobKind, JobStarter, NewJob};
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::create_dir_all(home.join("projects/demo")).unwrap();
+
+        // Nothing stored.
+        assert_eq!(read_turn_end_wake("demo", "alpha", Some("t1"), Utc::now()), TurnEndWake::default());
+
+        let starter = |ws: &str, task: Option<&str>| JobStarter {
+            workspace: ws.into(),
+            agent: Some("developer".into()),
+            task: task.map(str::to_string),
+        };
+        let job = |by: Option<JobStarter>| NewJob {
+            kind: JobKind::Pid,
+            target: "1".into(),
+            label: None,
+            estimate: None,
+            started_by: by,
+        };
+        // Jobs that don't report to alpha serving t1: the orchestrator's, another
+        // worker's, and one alpha started for an earlier task.
+        add_job("demo", job(None)).unwrap();
+        add_job("demo", job(Some(starter("bravo", Some("t1"))))).unwrap();
+        add_job("demo", job(Some(starter("alpha", Some("t0"))))).unwrap();
+        assert!(!read_turn_end_wake("demo", "alpha", Some("t1"), Utc::now()).job_pending);
+
+        // Alpha's own job for t1.
+        let mine = add_job("demo", job(Some(starter("alpha", Some("t1"))))).unwrap();
+        assert!(read_turn_end_wake("demo", "alpha", Some("t1"), Utc::now()).job_pending);
+        let job = crate::awareness::remove_job("demo", &mine.id).unwrap().unwrap();
+        assert!(!read_turn_end_wake("demo", "alpha", Some("t1"), Utc::now()).job_pending);
+
+        // Finished just now: its report is on its way to alpha, so alpha is
+        // still waiting on it. Past the grace it no longer counts.
+        let finished_at = Utc::now();
+        let record = crate::awareness::JobRecord::finished(
+            &job,
+            crate::awareness::JobStatus::Exited,
+            finished_at,
+        );
+        crate::awareness::record_finished_jobs("demo", vec![record], finished_at).unwrap();
+        assert!(read_turn_end_wake("demo", "alpha", Some("t1"), finished_at).job_pending);
+        assert!(!read_turn_end_wake("demo", "charlie", Some("t1"), finished_at).job_pending);
+        let later = finished_at + chrono::Duration::from_std(JOB_REPORT_GRACE).unwrap();
+        assert!(!read_turn_end_wake("demo", "alpha", Some("t1"), later).job_pending);
+
+        // An open question on t1, then answered.
+        let q = crate::questions::record_question(crate::questions::NewQuestion {
+            project: Some("demo"),
+            task: "t1",
+            id: "q-001",
+            workspace: Some("alpha"),
+            text: "Which way?",
+            context: None,
+        })
+        .unwrap();
+        assert!(read_turn_end_wake("demo", "alpha", Some("t1"), Utc::now()).question_open);
+        assert!(!read_turn_end_wake("demo", "alpha", Some("t2"), Utc::now()).question_open);
+        crate::questions::mark_question_answered(Some("demo"), "t1", &q.meta.id, "m1").unwrap();
+        assert!(!read_turn_end_wake("demo", "alpha", Some("t1"), Utc::now()).question_open);
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]
@@ -430,6 +679,8 @@ mod tests {
         ] {
             assert_eq!(marker.orchestrator_state(), marker.workspace_state());
         }
+        // The orchestrator never reads as Waiting.
+        assert_ne!(PaneMarker::Background.orchestrator_state(), WorkspaceState::Waiting);
         assert!(parse_orchestrator_title_state("vim").is_none());
     }
 
@@ -517,6 +768,9 @@ mod tests {
     fn workspace_state_serializes_snake_case() {
         let s = yaml_serde::to_string(&WorkspaceState::AwaitingInput).unwrap();
         assert!(s.trim().ends_with("awaiting_input"), "got {s:?}");
+        let s = yaml_serde::to_string(&WorkspaceState::Waiting).unwrap();
+        assert!(s.trim().ends_with("waiting"), "got {s:?}");
+        assert_eq!(WorkspaceState::Waiting.as_str(), "waiting");
     }
 
     #[test]

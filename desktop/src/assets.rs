@@ -530,6 +530,10 @@ pub mod glyphs {
     /// A workspace awaiting input: a yellow disc with the `?` cut out, over
     /// a dark disc so the mark reads on either theme.
     pub const QUESTION: Glyph = Glyph { name: "question", size: 12 };
+    /// A workspace waiting on a job or background work it started: a cyan
+    /// disc with three dots cut out, over a white disc (Figma
+    /// `Status=Waiting`, 2881:33728).
+    pub const WAITING: Glyph = Glyph { name: "waiting", size: 12 };
     /// A section header's collapse chevron.
     pub const CHEVRON_DOWN: Glyph = Glyph { name: "chevron-down", size: 12 };
     /// The workflow editor's Discard changes link (the Header's `Discard
@@ -545,7 +549,7 @@ pub mod glyphs {
     pub const CIRCLE_SOLID: Glyph = Glyph { name: "circle-solid", size: 12 };
 
     #[cfg(test)]
-    pub const ALL: &[Glyph] = &[PLAY, CHECK, DOT, QUESTION, CHEVRON_DOWN, DISCARD, CHAT_BUBBLE, CIRCLE_SOLID];
+    pub const ALL: &[Glyph] = &[PLAY, CHECK, DOT, QUESTION, WAITING, CHEVRON_DOWN, DISCARD, CHAT_BUBBLE, CIRCLE_SOLID];
 }
 
 /// Every glyph drawing, by asset path.
@@ -554,6 +558,7 @@ const GLYPHS: &[(&str, &[u8])] = &[
     ("icons/glyphs/check.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/check.svg"))),
     ("icons/glyphs/dot.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/dot.svg"))),
     ("icons/glyphs/question.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/question.svg"))),
+    ("icons/glyphs/waiting.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/waiting.svg"))),
     ("icons/glyphs/chevron-down.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/chevron-down.svg"))),
     ("icons/glyphs/discard.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/discard.svg"))),
     ("icons/glyphs/chat-bubble.svg", include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icons/glyphs/chat-bubble.svg"))),

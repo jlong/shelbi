@@ -80,6 +80,9 @@ pub enum WorkspaceBadge {
     Working,
     /// ? — claude finished a turn and is sitting at the prompt.
     AwaitingInput,
+    /// ⋯ — claude finished a turn, but a job or background work will wake it
+    /// without the user (see [`WorkspaceState::Waiting`]).
+    Waiting,
     /// ⚠ — claude is showing a permission dialog.
     AwaitingPermission,
     /// ⏸ — the runner stalled on a usage/session limit. Distinct from the
@@ -102,6 +105,7 @@ impl WorkspaceBadge {
         match self {
             WorkspaceBadge::Working => "⏵",
             WorkspaceBadge::AwaitingInput => "?",
+            WorkspaceBadge::Waiting => "⋯",
             WorkspaceBadge::AwaitingPermission => "⚠",
             WorkspaceBadge::Paused => "⏸",
             WorkspaceBadge::Idle => "·",
@@ -114,6 +118,7 @@ impl WorkspaceBadge {
         match self {
             WorkspaceBadge::Working => DecorationColor::Green,
             WorkspaceBadge::AwaitingInput => DecorationColor::Yellow,
+            WorkspaceBadge::Waiting => DecorationColor::Blue,
             WorkspaceBadge::AwaitingPermission => DecorationColor::Red,
             WorkspaceBadge::Paused => DecorationColor::Yellow,
             WorkspaceBadge::Idle => DecorationColor::DarkGray,
@@ -1666,6 +1671,7 @@ fn derive_workspace_badge(
         Some(s) if s.current_task.as_deref() == Some(task_id) => match s.state {
             WorkspaceState::Working => WorkspaceBadge::Working,
             WorkspaceState::AwaitingInput => WorkspaceBadge::AwaitingInput,
+            WorkspaceState::Waiting => WorkspaceBadge::Waiting,
             // Handled by the Blocked arm above; kept for match exhaustiveness.
             WorkspaceState::Blocked => WorkspaceBadge::AwaitingPermission,
             WorkspaceState::Paused => WorkspaceBadge::Paused,

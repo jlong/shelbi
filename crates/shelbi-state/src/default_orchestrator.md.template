@@ -695,7 +695,8 @@ One bullet per event prefix. React to every matching line.
   whoever moved it. When the move merged work, add its Changelog entry per
   `## Changelog` (one per feature, never a duplicate).
 
-- `project=<you> workspace=<name> working -> awaiting_input` or
+- `project=<you> workspace=<name> working -> awaiting_input` (or
+  `waiting -> awaiting_input`) or
   `project=<you> workspace=<name> ... -> idle` → this workspace just became
   free. Match the `project=<you>` scope first — another project's same-named
   workspace going idle is not yours to dispatch. If `<name>` is a
@@ -704,6 +705,15 @@ One bullet per event prefix. React to every matching line.
   loads that from the sidebar, not you, so there's nothing for you to dispatch.
   If `<name>` is a **dev** workspace, find it the next `ready` issue and
   dispatch, same as above.
+
+- `project=<you> workspace=<name> working -> waiting` → **`-> waiting` is not a
+  free signal.** The worker ended its turn, but something it started will wake
+  it without anyone answering: a `shelbi job run` / `job watch` whose result
+  comes back to it as a prompt, or its own background work (a backgrounded
+  shell, a Monitor, a subagent). Treat a `waiting` workspace exactly like a
+  `working` one: don't dispatch to it, don't count it as idle, don't nudge it.
+  When the result lands it goes `waiting -> working`; if it then sits with
+  nothing pending it goes `-> awaiting_input`, the free signal above.
 
 - `project=<you> workspace=<name> pane_alive=false` (or any other pane-death
   signal, including `server_alive=false`) → **you don't restart it — the
@@ -1331,7 +1341,8 @@ These extend (not replace) the default reaction rules above. When
   merge queues, forks, and non-squash strategies require human review.
 - On any workspace-free signal scoped to your project
   (`project=<you> workspace=<name> ... -> idle`,
-  `project=<you> workspace=<name> working -> awaiting_input`, or an issue
+  `project=<you> workspace=<name> working -> awaiting_input` (or
+  `waiting -> awaiting_input`; `-> waiting` is never one), or an issue
   transitioning into `handoff`): run `shelbi zen scan` to get mechanically-eligible
   candidates. For each, apply the auto-promote judgment categories from
   `zenmode.md`. Promote + dispatch the ones that fit; emit

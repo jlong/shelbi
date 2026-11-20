@@ -1750,6 +1750,7 @@ fn parse_workspace_state(s: &str) -> Option<WorkspaceState> {
     match s {
         "working" => Some(WorkspaceState::Working),
         "awaiting_input" => Some(WorkspaceState::AwaitingInput),
+        "waiting" => Some(WorkspaceState::Waiting),
         "blocked" => Some(WorkspaceState::Blocked),
         "paused" => Some(WorkspaceState::Paused),
         "serving" => Some(WorkspaceState::Serving),
@@ -2916,6 +2917,7 @@ fn workspace_row(
     let (verb, tone, detail) = match new {
         WorkspaceState::Working => ("working", Tone::DarkGray, None),
         WorkspaceState::AwaitingInput => ("awaiting input", Tone::Blue, None),
+        WorkspaceState::Waiting => ("waiting", Tone::DarkGray, Some("for a job or background work")),
         WorkspaceState::Blocked => ("blocked", Tone::Yellow, Some("needs human approval")),
         WorkspaceState::Paused => (
             "paused",
@@ -3204,6 +3206,30 @@ mod tests {
                 assert_eq!(new, WorkspaceState::AwaitingInput);
             }
             other => panic!("expected workspace event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_waiting_workspace_events() {
+        for (line, prev, new) in [
+            (
+                "2026-11-20T10:00:00Z project=demo workspace=alpha working -> waiting",
+                WorkspaceState::Working,
+                WorkspaceState::Waiting,
+            ),
+            (
+                "2026-11-20T10:05:00Z project=demo workspace=alpha waiting -> awaiting_input",
+                WorkspaceState::Waiting,
+                WorkspaceState::AwaitingInput,
+            ),
+        ] {
+            match parse_event_line(line) {
+                Event::Workspace { prev: p, new: n, .. } => {
+                    assert_eq!(p, Some(prev), "{line}");
+                    assert_eq!(n, new, "{line}");
+                }
+                other => panic!("expected workspace event, got {other:?}"),
+            }
         }
     }
 
