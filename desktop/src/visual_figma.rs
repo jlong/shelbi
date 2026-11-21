@@ -3991,6 +3991,20 @@ impl Run {
         self.click(handle, orch.clone());
         handle.update(&mut self.cx, |w, _, cx| w.offscreen_sync_tabs(cx)).unwrap();
         self.save(handle, "state-tabbar-working");
+
+        // A tab whose project is quitting (`tab-closing-spinner`; no frame
+        // draws it, checked by eye): ContextStore's close confirmed, its
+        // spinner in the `×`'s slot and "Closing…" over its name, the
+        // spinner held still by Reduce Motion so the frame is stable.
+        let handle = self.open();
+        self.click(handle, orch.clone());
+        handle
+            .update(&mut self.cx, |w, _, cx| {
+                w.offscreen_sync_tabs(cx);
+                w.offscreen_mark_closing("contextstore", cx);
+            })
+            .unwrap();
+        self.save(handle, "state-tabbar-closing");
         self.cx.update(crate::theme::motion::sync_reduce_motion);
         if let Some(catalog) = &catalog {
             catalog.set_working(&[]);

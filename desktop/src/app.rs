@@ -77,7 +77,7 @@
 //! ([`IssuesView`], `dt-issues-board`), built for the window's project the
 //! first time it is shown, and rebuilt for the new project after a switch.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Instant;
@@ -985,6 +985,13 @@ struct QuitRoute {
     control: Option<crate::platform::control::ControlHandle>,
 }
 
+/// A quit on its way: [`QuitRoute::quit`] off the UI thread.
+type QuitFuture = futures::future::LocalBoxFuture<'static, Result<(), String>>;
+
+/// [`ShelbiWindow::quit_stub`]'s shape: the quit of the project named.
+#[cfg(test)]
+pub(crate) type QuitStub = Rc<dyn Fn(&str) -> QuitFuture>;
+
 /// Where a project to close lives, for [`QuitRoute`].
 #[derive(Clone)]
 enum QuitFar {
@@ -1510,6 +1517,14 @@ pub struct ShelbiWindow {
     tabs: ProjectTabs,
     /// The tab under the pointer: its dot is an `×`.
     hovered_tab: Option<String>,
+    /// The tabs (by id) whose project is quitting from this window: a close
+    /// confirmed, its quit not back yet. Each shows a spinner for its `×`
+    /// and can't be closed again.
+    closing_tabs: HashSet<String>,
+    /// Test seam: what a confirmed close's quit does in place of asking the
+    /// daemon ([`Self::quit_future`]), by project name.
+    #[cfg(test)]
+    quit_stub: Option<QuitStub>,
     /// ⌘ is held: the tabs show their ⌘N.
     command_held: bool,
     /// When the open overlay opened, for its slide-and-fade in.
@@ -2372,6 +2387,9 @@ impl ShelbiWindow {
             tab_reorder: tab_bar::TabReorder::default(),
             tabs,
             hovered_tab: None,
+            closing_tabs: HashSet::new(),
+            #[cfg(test)]
+            quit_stub: None,
             command_held: false,
             overlay_opened: None,
             nav_track: SlideTrack::shared(),
@@ -5289,6 +5307,8 @@ impl ShelbiWindow {
         if self.hovered_tab.as_ref().is_some_and(|h| !self.tabs.contains(h)) {
             self.hovered_tab = None;
         }
+        let tabs = &self.tabs;
+        self.closing_tabs.retain(|id| tabs.contains(id));
         self.schedule_save(cx);
         cx.notify();
     }
@@ -5360,6 +5380,7 @@ impl ShelbiWindow {
                         .host()
                         .map(|h| shelbi_app::remote_window::bare_host(h).to_string().into()),
                     selected: self.shows(id),
+                    closing: self.closing_tabs.contains(id),
                     working: key.is_local()
                         && id != NEW_TAB
                         && cx.try_global::<Catalog>().is_some_and(|c| c.is_working(id)),
@@ -5592,6 +5613,10 @@ impl ShelbiWindow {
     /// `project` is a tab id ([`tab_id`]): the quit goes to its machine's
     /// daemon (this one's, or the far host's over its link).
     fn confirm_close_project(&mut self, project: String, window: &mut Window, cx: &mut Context<Self>) {
+        // Already quitting: its spinner says so, and one quit is enough.
+        if self.closing_tabs.contains(&project) {
+            return;
+        }
         let quit_key = self.tab_key(&project);
         if let Some(host) = quit_key.host() {
             if self.host_remote(host).is_none() {
@@ -5611,7 +5636,6 @@ impl ShelbiWindow {
             cx,
         );
         let route = self.quit_route(&quit_key);
-        let name = quit_key.name.clone();
         cx.spawn_in(window, async move |this, cx| {
             if answer.await != Ok(0) {
                 return;
@@ -5619,14 +5643,21 @@ impl ShelbiWindow {
             // The orchestrator is about to be stopped on purpose: its exit is
             // not a crash to restart. The prompt named `project`, and that's
             // what quits; a window a notice switched off it meanwhile holds
-            // another project's views, which aren't closing.
-            this.update(cx, |this, cx| {
+            // another project's views, which aren't closing. A close that
+            // started meanwhile (Close Others) has it already.
+            let Ok(Some(quit)) = this.update(cx, |this, cx| {
+                if this.closing_tabs.contains(&project) {
+                    return None;
+                }
                 if this.shows_key(&quit_key) {
                     this.mark_deliberate_close(true, cx);
                 }
-            })
-            .ok();
-            let quit = cx.background_executor().spawn(async move { route.quit(&name) }).await;
+                this.mark_closing(&project, &route, cx);
+                Some(this.quit_future(route, &quit_key.name, cx))
+            }) else {
+                return;
+            };
+            let quit = quit.await;
             this.update_in(cx, |this, window, cx| this.project_quit_landed(quit_key, label, quit, window, cx))
                 .ok();
         })
@@ -5641,8 +5672,10 @@ impl ShelbiWindow {
     /// nothing.
     fn confirm_close_other_projects(&mut self, keep: String, window: &mut Window, cx: &mut Context<Self>) {
         let projects = self.tabs.projects();
+        // A tab already quitting is on its way out without another quit.
         let closing: Vec<String> = shelbi_app::close_others::others(&projects, &keep)
             .into_iter()
+            .filter(|p| !self.closing_tabs.contains(*p))
             .map(str::to_string)
             .collect();
         if closing.is_empty() {
@@ -5662,29 +5695,36 @@ impl ShelbiWindow {
                 return;
             }
             // The kept tab first, so none of the closing projects is on
-            // screen while it quits.
-            if this
-                .update_in(cx, |this, window, cx| {
-                    if !this.shows(&keep) && this.tabs.contains(&keep) {
-                        this.switch_to(&keep, window, cx);
-                    }
-                })
-                .is_err()
-            {
+            // screen while it quits. Every tab to close shows it's closing
+            // from now, as each waits its turn (one a close started
+            // meanwhile is already on its way, and is left to it).
+            let Ok(closing) = this.update_in(cx, |this, window, cx| {
+                if !this.shows(&keep) && this.tabs.contains(&keep) {
+                    this.switch_to(&keep, window, cx);
+                }
+                let closing: Vec<(String, String)> = closing
+                    .into_iter()
+                    .zip(labels)
+                    .filter(|(p, _)| !this.closing_tabs.contains(p))
+                    .collect();
+                this.closing_tabs.extend(closing.iter().map(|(p, _)| p.clone()));
+                cx.notify();
+                closing
+            }) else {
                 return;
-            }
-            for (project, label) in closing.into_iter().zip(labels) {
+            };
+            for (project, label) in closing {
                 // Each through its own machine's daemon (a tab on a host
                 // that isn't open just closes).
-                let Ok((key, route)) = this.update(cx, |this, _| {
+                let Ok((key, quit)) = this.update(cx, |this, cx| {
                     let key = this.tab_key(&project);
                     let route = this.quit_route(&key);
-                    (key, route)
+                    let quit = this.quit_future(route, &key.name, cx);
+                    (key, quit)
                 }) else {
                     return;
                 };
-                let name = key.name.clone();
-                let quit = cx.background_executor().spawn(async move { route.quit(&name) }).await;
+                let quit = quit.await;
                 if this
                     .update_in(cx, |this, window, cx| this.project_quit_landed(key, label, quit, window, cx))
                     .is_err()
@@ -5694,6 +5734,27 @@ impl ShelbiWindow {
             }
         })
         .detach();
+    }
+
+    /// Tab `id`'s project is quitting through `route`: its tab shows it
+    /// until the quit lands ([`Self::project_quit_landed`]). One whose host
+    /// isn't open here has nothing to wait for: it just closes.
+    fn mark_closing(&mut self, id: &str, route: &QuitRoute, cx: &mut Context<Self>) {
+        if !matches!(route.far, QuitFar::Unopened) && self.closing_tabs.insert(id.to_string()) {
+            cx.notify();
+        }
+    }
+
+    /// The quit of `name` through `route`, run off the UI thread (blocking
+    /// on the daemon's handoff and shutdown); a test's stub in its place.
+    fn quit_future(&self, route: QuitRoute, name: &str, cx: &App) -> QuitFuture {
+        use futures::FutureExt;
+        #[cfg(test)]
+        if let Some(stub) = &self.quit_stub {
+            return stub(name);
+        }
+        let name = name.to_string();
+        cx.background_executor().spawn(async move { route.quit(&name) }).boxed_local()
     }
 
     /// The key tab `id` names ([`tab_key`]).
@@ -5735,6 +5796,11 @@ impl ShelbiWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Quit or refused, it isn't closing any more: its tab goes, or is
+        // back as it was.
+        if self.closing_tabs.remove(&tab_id(&quit_key)) {
+            cx.notify();
+        }
         match quit {
             Ok(()) => {
                 if quit_key.is_local() {
@@ -8026,6 +8092,13 @@ impl ShelbiWindow {
     /// visual state uses it.
     pub(crate) fn offscreen_sync_tabs(&mut self, cx: &mut Context<Self>) {
         self.sync_tabs(cx);
+        cx.notify();
+    }
+
+    /// Show tab `id` closing, as a confirmed close does while its project
+    /// quits (`state-tabbar-closing`).
+    pub(crate) fn offscreen_mark_closing(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.closing_tabs.insert(id.to_string());
         cx.notify();
     }
 
