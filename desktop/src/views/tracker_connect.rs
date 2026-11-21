@@ -24,11 +24,34 @@
 //!   │ (ln) Linear                                   [Connect]  │
 //!   │      Sync issues from a Linear team.                     │
 //!   └──────────────────────────────────────────────────────────┘
-//!          Only one issue tracker can be connected at a time.
 //!
-//!   (every later step)
-//!   Step N of 4                                  [Back] [Continue]
+//!   (every later step: no step counter)
+//!                                                [Back] [Continue]
 //! ```
+//!
+//! A card's Connect checks its tracker's authorization (the card says
+//! Checking…): the GitHub CLI's sign-in, or a working Linear API key.
+//! Authorized, the chooser shows the card Connected (a green badge, the
+//! other card's Connect disabled; 02a-github-connected) for a beat
+//! ([`copy::CONNECTED_BEAT_MS`]), then moves on to Choose project; Back from
+//! there returns to it, with Continue in the footer. Not authorized, the
+//! Authorize step asks first. Linear's is Add API key (02b-linear-api-key),
+//! which Choose your Linear project's Change account opens too:
+//!
+//! ```text
+//!                             Add API key
+//!   Shelbi needs access to the Linear API. Add a personal API key below.
+//!
+//!   Linear account
+//!   [ lin_api…                                        ] [Verify]
+//!   Create one in Linear: Settings → Account → Security & access →
+//!   Personal API keys.  Open Linear
+//!                                                [Back] [Continue]
+//! ```
+//!
+//! GitHub's (Sign in to GitHub) shows how to sign the GitHub CLI in (the
+//! command, with Copy) and Retry. Continue waits for a verified key or a
+//! signed-in `gh`.
 //!
 //! Choose your GitHub project / Choose your Linear project (03-github-choose,
 //! 03a-linear-choose), the pickers 624pt wide in the 704pt column:
@@ -44,12 +67,10 @@
 //!   This will be the only issue tracker project connected to this Shelbi project.
 //! ```
 //!
-//! Without a signed-in `gh` the GitHub step shows how to sign in (the
-//! command, with Copy) and Retry in the account line's place; without a
-//! working Linear key the Linear step shows the key field and a link to
-//! Linear's API key settings. Change account opens the same. The pickers'
-//! reads and Continue's preflight run through the project's
-//! [`TrackerService`] (the far daemon's for a project on another machine).
+//! GitHub's Change account shows how to sign `gh` in to another account in
+//! the account line's place; Linear's opens Add API key. The pickers' reads
+//! and Continue's preflight run through the project's [`TrackerService`]
+//! (the far daemon's for a project on another machine).
 //!
 //! How should agents handle issues created in <Tracker>? (04-agent-rules):
 //! the two agent rules as setting cards with switches (a click anywhere on a
@@ -77,11 +98,13 @@
 //! project's board has read the new tracker ([`ImportWatch`], handed to the
 //! project window, which shows the board's toast when it lands).
 //!
-//! Keys: Return is the step's primary button (Verify while the Linear key
-//! field shows), Esc closes an open picker, else the window, as ⌘W does (a
-//! connection already running carries on in the background).
+//! Keys: Return is the step's primary button (on Add API key, Verify until
+//! the key verifies, then Continue), Esc closes an open picker, else the
+//! window, as ⌘W does (a connection already running carries on in the
+//! background).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use gpui::{
     div, prelude::*, px, AnyElement, AnyWindowHandle, App, ClickEvent, ClipboardItem, Context, Div, FocusHandle,
@@ -89,7 +112,7 @@ use gpui::{
 };
 use gpui_kit::component::input::InputEvent;
 use shelbi_app::github_setup::{self as gh, GithubAuth};
-use shelbi_app::linear_setup::{KeyState, Loadable, LOADING};
+use shelbi_app::linear_setup::{KeyState, Loadable, LOADING, VERIFY};
 use shelbi_app::new_project::Tracker;
 use shelbi_app::settings::tracker::TrackerService;
 use shelbi_app::source::ProjectHandle;
@@ -121,8 +144,13 @@ const CONTENT_W: f32 = 704.0;
 /// less the column's 24pt gap).
 const CONTENT_TOP: f32 = 52.0;
 /// The Choose project step's pickers' width (the frames' 624pt, centered in
-/// the 704pt column).
+/// the 704pt column), and the Add API key step's field with its Verify.
 const FIELDS_W: f32 = 624.0;
+/// How much lower the chooser's cards sit than the later steps' content
+/// (01-select-tracker: the first card at 198pt, without the old note).
+const CHOOSER_DROP: f32 = 17.0;
+/// The Add API key step's help line's width (its frame's 420pt).
+const KEY_HELP_W: f32 = 420.0;
 
 /// A GitHub picker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -202,8 +230,11 @@ pub struct TrackerConnectView {
     focus: FocusHandle,
     /// Why the project's connection couldn't be read.
     load_error: Option<String>,
-    /// The Linear step's key field and open picker.
+    /// The Add API key step's key field, and the Linear step's open picker.
     linear_ui: LinearUi,
+    /// The step the view last showed (to focus the key field on reaching
+    /// Add API key).
+    shown: Step,
     /// The GitHub step's open picker, and where the open one hangs.
     github_menu: Option<GithubPick>,
     github_anchor: style::Anchor,
@@ -224,7 +255,7 @@ impl TrackerConnectView {
         window.focus(&focus, cx);
         let this_window = window.window_handle();
         let me = cx.weak_entity();
-        let linear_ui = LinearUi::new(window, cx);
+        let linear_ui = LinearUi::with_placeholder(copy::API_KEY_PLACEHOLDER, window, cx);
         let key_input = cx.subscribe_in(&linear_ui.key_input, window, |this, input, event: &InputEvent, _, cx| {
             if let InputEvent::Change = event {
                 let text = input.read(cx).value().to_string();
@@ -251,6 +282,7 @@ impl TrackerConnectView {
             focus,
             load_error: None,
             linear_ui,
+            shown: Step::Chooser,
             github_menu: None,
             github_anchor: Default::default(),
             import: None,
@@ -312,14 +344,14 @@ impl TrackerConnectView {
         window.remove_window();
     }
 
-    /// A key the flow takes: Return is the primary button (Verify while the
-    /// Linear key field shows), Esc closes an open picker, else the window.
+    /// A key the flow takes: Return is the primary button (on Add API key,
+    /// Verify until the key verifies), Esc closes an open picker, else the
+    /// window.
     fn key(&mut self, chord: KeyChord, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if chord.mods != Mods::NONE {
             return false;
         }
         match chord.code {
-            Key::Enter if self.key_field_shows() => self.linear_msg(linear_fields::Msg::Verify, window, cx),
             Key::Enter => self.primary(window, cx),
             Key::Esc if self.linear_ui.menu.is_some() || self.github_menu.is_some() => {
                 self.linear_ui.menu = None;
@@ -332,39 +364,45 @@ impl TrackerConnectView {
         true
     }
 
-    /// The Linear step's key field shows (Return verifies the key).
-    fn key_field_shows(&self) -> bool {
-        self.flow.step() == Step::ChooseProject
-            && self.flow.tracker() == Some(Tracker::Linear)
-            && self.flow.linear().needs_key()
+    /// The Add API key step shows.
+    fn key_step(&self) -> bool {
+        self.flow.step() == Step::Authorize && self.flow.tracker() == Some(Tracker::Linear)
     }
 
-    /// After the choice changed: the key field shows the choice's text, and
-    /// the reads it asks for run.
+    /// After the choice changed: the key field shows the choice's text (and
+    /// takes the focus on reaching Add API key), and the reads it asks for
+    /// run.
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.flow.linear().key_input().to_string();
         self.linear_ui.sync_key(&key, window, cx);
+        if self.flow.step() != self.shown {
+            self.shown = self.flow.step();
+            self.linear_ui.menu = None;
+            self.github_menu = None;
+            if self.key_step() {
+                let focus = self.linear_ui.key_input.read(cx).focus_handle(cx);
+                window.focus(&focus, cx);
+            } else {
+                window.focus(&self.focus, cx);
+            }
+        }
         self.run_due(window, cx);
         cx.notify();
     }
 
-    /// A click in the Linear step's fields.
+    /// A click in the Linear step's fields, or the Add API key step's.
     fn linear_msg(&mut self, msg: linear_fields::Msg, window: &mut Window, cx: &mut Context<Self>) {
         use linear_fields::Msg;
-        let linear = self.flow.linear_mut();
         match msg {
             Msg::Verify => {
-                linear.submit_key();
+                self.flow.verify();
             }
-            Msg::ChangeKey => {
-                linear.change_key();
-                let focus = self.linear_ui.key_input.read(cx).focus_handle(cx);
-                window.focus(&focus, cx);
-            }
-            Msg::CancelChangeKey => linear.cancel_change_key(),
-            Msg::Retry => linear.retry(),
-            Msg::Team(team) => linear.select_team(&team),
-            Msg::Filter(filter, value) => linear.select_filter(filter, Some(&value)),
+            // Change account: the Add API key step.
+            Msg::ChangeKey => self.flow.change_account(),
+            Msg::CancelChangeKey => self.flow.linear_mut().cancel_change_key(),
+            Msg::Retry => self.flow.linear_mut().retry(),
+            Msg::Team(team) => self.flow.linear_mut().select_team(&team),
+            Msg::Filter(filter, value) => self.flow.linear_mut().select_filter(filter, Some(&value)),
         }
         self.after_change(window, cx);
     }
@@ -418,12 +456,13 @@ impl TrackerConnectView {
         cx.notify();
     }
 
-    /// The footer's primary button.
+    /// The footer's primary button (and Return).
     fn primary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.flow.ready() {
-            // Continue says why it can't go on.
+            // Continue says why it can't go on (on Add API key, it verifies
+            // the key).
             self.flow.advance();
-            cx.notify();
+            self.after_change(window, cx);
             return;
         }
         match self.flow.primary() {
@@ -432,7 +471,7 @@ impl TrackerConnectView {
                 self.close(window);
                 return;
             }
-            Action::None => self.run_due(window, cx),
+            Action::None => self.after_change(window, cx),
         }
         cx.notify();
     }
@@ -444,6 +483,7 @@ impl TrackerConnectView {
         match self.flow.secondary() {
             Some(Secondary::Back) => {
                 self.flow.back();
+                self.after_change(window, cx);
             }
             Some(Secondary::Close) => self.close(window),
             None => {}
@@ -513,6 +553,19 @@ impl TrackerConnectView {
                     .detach();
                 }
             }
+        }
+        // The Connected chooser's beat, then Choose project.
+        if let Some(token) = self.flow.beat_due() {
+            let timer = cx.background_executor().timer(Duration::from_millis(copy::CONNECTED_BEAT_MS));
+            cx.spawn_in(window, async move |this, cx| {
+                timer.await;
+                this.update_in(cx, |this, window, cx| {
+                    this.flow.beat_done(token);
+                    this.after_change(window, cx);
+                })
+                .ok();
+            })
+            .detach();
         }
     }
 
@@ -847,10 +900,10 @@ impl TrackerConnectView {
         .into_any_element()
     }
 
-    /// The Choose your Linear project step: the account line (or the key
-    /// field, with a link to Linear's key settings), then Workspace, Team
-    /// and Project.
-    fn linear_step(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Div {
+    /// The Choose your Linear project step: the account line, then
+    /// Workspace, Team and Project. (No key field: Change account, or a key
+    /// that stops working, opens the Add API key step.)
+    fn linear_step(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let choice = self.flow.linear();
         let col = div().flex().flex_col().gap(px(16.0)).w(px(FIELDS_W));
         let on = linear_fields::Handlers {
@@ -858,16 +911,6 @@ impl TrackerConnectView {
             menu: |this: &mut Self, pick, cx| this.linear_menu(pick, cx),
         };
         let enabled = !self.flow.checking();
-        if choice.needs_key() {
-            let link = super::about::link("tracker-linear-keys-link", copy::LINEAR_KEYS_LINK, theme.link, theme)
-                .type_style(Type::Small)
-                .role(Role::Link)
-                .aria_label(copy::LINEAR_KEYS_LINK)
-                .on_click(|_: &ClickEvent, _, cx| super::about::open_url(copy::LINEAR_KEYS_URL, cx));
-            return col
-                .child(linear_fields::key_entry(linear_fields::Host::Connect, choice, &self.linear_ui, true, on, theme, window, cx))
-                .child(div().flex().child(link));
-        }
         let account = match choice.key_state() {
             KeyState::Valid { .. } => account_line("tracker-linear", theme, cx, |this, window, cx| {
                 this.linear_msg(linear_fields::Msg::ChangeKey, window, cx)
@@ -878,10 +921,121 @@ impl TrackerConnectView {
             .child(linear_fields::connect_fields(choice, &self.linear_ui, enabled, on, FIELDS_W, theme, cx))
     }
 
+    /// The Add API key step (02b-linear-api-key): the key field with Verify,
+    /// 624pt together, why a key was refused under it (or whose it is once
+    /// verified), then where keys are made, with Open Linear.
+    fn api_key_step(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Div {
+        let choice = self.flow.linear();
+        let focused = self.linear_ui.key_input.read(cx).focus_handle(cx).is_focused(window);
+        let error = self.flow.key_error();
+        let field = div().flex_1().min_w_0().child(
+            gpui_kit::component::input::Input::new(&self.linear_ui.key_input)
+                .appearance(false)
+                .h_full()
+                .px_0()
+                .type_style(Type::Base)
+                .text_color(theme.form_text),
+        );
+        let input = if error.is_some() {
+            controls::invalid_textbox(field, focused, theme)
+        } else {
+            controls::textbox(field, focused, theme)
+        }
+        .debug_selector(|| "tracker-key-input".into())
+        .flex_1()
+        .min_w_0();
+        let verify = if choice.logging_in() {
+            style::disabled_button("tracker-key-verify", "Verifying…", ButtonKind::Secondary, ButtonSize::Base, theme)
+        } else {
+            style::button("tracker-key-verify", VERIFY, ButtonKind::Secondary, ButtonSize::Base, false, theme)
+                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.linear_msg(linear_fields::Msg::Verify, window, cx)))
+        }
+        .role(Role::Button)
+        .aria_label(VERIFY);
+        let note = match (error, self.flow.verified_line()) {
+            (Some(why), _) => Some(error_line("tracker-key-error", why, theme)),
+            (None, Some(line)) => Some(
+                div()
+                    .debug_selector(|| "tracker-key-verified".into())
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .type_style(Type::Small)
+                    .text_color(theme.green)
+                    .child(heroicon(icons::CHECK).text_color(theme.green))
+                    .child(line),
+            ),
+            (None, None) => None,
+        };
+        // The help wraps where the frame's 420pt does: the path, then the
+        // last step and Open Linear on the next line.
+        let (path, last) = copy::API_KEY_HELP.rsplit_once(" → ").unwrap_or((copy::API_KEY_HELP, ""));
+        let link = div()
+            .id("tracker-linear-keys-link")
+            .debug_selector(|| "tracker-linear-keys-link".into())
+            .role(Role::Link)
+            .aria_label(copy::LINEAR_KEYS_LINK)
+            .cursor_pointer()
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.foreground)
+            .underline()
+            .hover(|s| s.text_color(theme.text_loud))
+            .child(copy::LINEAR_KEYS_LINK)
+            .on_click(|_: &ClickEvent, _, cx| super::about::open_url(copy::LINEAR_KEYS_URL, cx));
+        let help = div()
+            .debug_selector(|| "tracker-key-help".into())
+            .flex()
+            .flex_col()
+            .w(px(KEY_HELP_W))
+            .type_style(Type::Small)
+            .text_color(theme.muted)
+            .child(format!("{path} →"))
+            .child(div().flex().flex_row().gap(px(6.0)).child(last.to_string()).child(link));
+        div()
+            .debug_selector(|| "tracker-api-key".into())
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .w(px(FIELDS_W))
+            .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child(copy::API_KEY_LABEL))
+            .child(div().flex().flex_row().items_center().gap(px(8.0)).w_full().child(input).child(verify))
+            .children(note)
+            .child(help)
+    }
+
+    /// The Sign in to GitHub step: how to sign the GitHub CLI in, with
+    /// Retry, and who it's signed in as once it is.
+    fn github_auth_step(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let col = div().flex().flex_col().gap(px(16.0)).w(px(FIELDS_W));
+        if let Some(line) = self.flow.verified_line() {
+            return col.child(
+                div()
+                    .debug_selector(|| "tracker-github-signed-in".into())
+                    .flex()
+                    .items_center()
+                    .gap(px(4.0))
+                    .type_style(Type::Base)
+                    .text_color(theme.green)
+                    .child(heroicon(icons::CHECK).text_color(theme.green))
+                    .child(line),
+            );
+        }
+        if self.flow.github().account().is_loading() {
+            return col.child(quiet("tracker-github-checking", "Checking the GitHub account…", theme));
+        }
+        col.child(self.github_auth(theme, cx))
+    }
+
     fn card(&self, card: Card, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
         let tracker = card.tracker;
         let action = match card.state {
             CardState::Connected => connected_badge(tracker, theme).into_any_element(),
+            CardState::Checking => {
+                style::disabled_button(button_id(tracker), copy::CHECKING, ButtonKind::Primary, ButtonSize::Small, theme)
+                    .role(Role::Button)
+                    .aria_label(format!("{} {}", copy::CHECKING, card.title))
+                    .into_any_element()
+            }
             CardState::Disabled => {
                 style::disabled_button(button_id(tracker), copy::CONNECT, ButtonKind::Primary, ButtonSize::Small, theme)
                     .role(Role::Button)
@@ -936,14 +1090,8 @@ impl TrackerConnectView {
             .items_center()
             .gap(px(16.0))
             .w_full()
+            .mt(px(CHOOSER_DROP))
             .children(cards)
-            .child(
-                div()
-                    .debug_selector(|| "tracker-one-at-a-time".into())
-                    .type_style(Type::Small)
-                    .text_color(theme.muted)
-                    .child(copy::ONE_AT_A_TIME),
-            )
     }
 
     /// How should agents handle issues created in <Tracker>? The two rules.
@@ -1131,9 +1279,14 @@ impl TrackerConnectView {
         let tracker = self.flow.tracker();
         match self.flow.step() {
             Step::Chooser => self.chooser(theme, cx),
+            // Centered in the room between the heading and the footer.
+            Step::Authorize => div().flex().flex_col().items_center().w_full().child(match tracker {
+                Some(Tracker::Linear) => self.api_key_step(theme, window, cx),
+                _ => self.github_auth_step(theme, cx),
+            }),
             Step::ChooseProject => {
                 let body = match tracker {
-                    Some(Tracker::Linear) => self.linear_step(theme, window, cx),
+                    Some(Tracker::Linear) => self.linear_step(theme, cx),
                     _ => self.github_step(theme, cx),
                 };
                 // The frames hang the account line 78pt under the subheading,
@@ -1154,8 +1307,8 @@ impl TrackerConnectView {
         }
     }
 
-    /// The step counter, then the left button and the primary one (every
-    /// step after the chooser).
+    /// The left button and the primary one, right-aligned (every step after
+    /// the chooser, and the Connected chooser after Back).
     fn footer(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<Div> {
         let label = gpui::SharedString::from(self.flow.primary_label()?);
         let secondary = self.flow.secondary().map(|s| {
@@ -1185,13 +1338,6 @@ impl TrackerConnectView {
                 .items_center()
                 .gap(px(8.0))
                 .w_full()
-                .child(
-                    div()
-                        .debug_selector(|| "tracker-step".into())
-                        .type_style(Type::SmallMedium)
-                        .text_color(theme.muted)
-                        .children(self.flow.counter()),
-                )
                 .child(div().flex_1())
                 .children(secondary)
                 .child(primary),
@@ -1206,8 +1352,9 @@ impl Render for TrackerConnectView {
         let content = self.content(&theme, window, cx);
         let footer = self.footer(&theme, cx);
         // The frames hang each step's content a fixed way under the heading;
-        // only Importing's progress sits in the middle.
-        let centered = self.flow.step() == Step::Importing;
+        // only Add API key's field and Importing's progress sit in the
+        // middle.
+        let centered = matches!(self.flow.step(), Step::Authorize | Step::Importing);
         div()
             .id("tracker-connect")
             .debug_selector(|| "tracker-connect".into())
@@ -1362,6 +1509,22 @@ mod tests {
             self.cx.run_until_parked();
         }
 
+        /// Run out the Connected chooser's beat.
+        fn beat(&mut self) {
+            self.cx.executor().advance_clock(Duration::from_millis(copy::CONNECTED_BEAT_MS + 100));
+            self.cx.run_until_parked();
+        }
+
+        /// A card's Connect with its tracker authorized: the Connected
+        /// chooser, then Choose project after the beat.
+        fn connect(&mut self, card: &'static str) {
+            self.click(card);
+            assert_eq!(self.flow(|f| f.step()), Step::Chooser, "the Connected chooser first");
+            assert!(self.flow(|f| f.authorized().is_some()));
+            self.beat();
+            assert_eq!(self.flow(|f| f.step()), Step::ChooseProject);
+        }
+
         /// Pick the acme organization, then its acme/app, from the menus.
         fn pick_repo(&mut self) {
             self.click("tracker-github-owner");
@@ -1387,13 +1550,20 @@ mod tests {
         let mut r = local(cx, recording(asked.clone()), IssueTrackerConfig::default());
         assert!(r.drawn("tracker-card-github") && r.drawn("tracker-card-linear"));
         assert!(!r.drawn("tracker-card-jira"), "no Jira");
-        assert!(r.drawn("tracker-one-at-a-time"));
-        assert!(!r.drawn("tracker-step") && !r.drawn("tracker-primary"), "the chooser has no footer");
+        assert!(!r.drawn("tracker-primary") && !r.drawn("tracker-back"), "the chooser has no footer");
         assert_eq!(r.flow(|f| f.heading()), copy::CHOOSER_HEADING);
 
+        // Connect: gh is signed in, so the chooser shows GitHub Connected
+        // and Linear disabled, then moves on by itself.
         r.click("tracker-connect-github");
-        assert_eq!(r.flow(|f| (f.step(), f.counter())), (Step::ChooseProject, Some("Step 1 of 4".to_string())));
-        assert!(r.drawn("tracker-step") && r.drawn("tracker-back") && r.drawn("tracker-primary"));
+        assert_eq!(r.flow(|f| f.step()), Step::Chooser);
+        assert!(r.drawn("tracker-card-github-connected") && r.drawn("tracker-connect-linear"));
+        assert!(!r.drawn("tracker-primary"), "no footer during the beat");
+        r.click("tracker-connect-linear");
+        assert_eq!(r.flow(|f| f.tracker()), Some(Tracker::Github), "Linear's Connect is disabled");
+        r.beat();
+        assert_eq!(r.flow(|f| f.step()), Step::ChooseProject);
+        assert!(r.drawn("tracker-back") && r.drawn("tracker-primary"));
         assert!(r.drawn("tracker-github-account") && r.drawn("tracker-only-project"));
         // Continue waits for a repository, and says why.
         r.keys("enter");
@@ -1405,6 +1575,15 @@ mod tests {
         assert_eq!(r.flow(|f| f.step()), Step::AgentRules);
         r.click("tracker-back");
         assert_eq!(r.flow(|f| f.step()), Step::ChooseProject);
+        // Back again: the chooser, GitHub still Connected, with Continue.
+        r.click("tracker-back");
+        assert_eq!(r.flow(|f| f.step()), Step::Chooser);
+        assert!(r.drawn("tracker-card-github-connected") && r.drawn("tracker-primary") && !r.drawn("tracker-back"));
+        assert_eq!(r.flow(|f| f.cards()[1].state), CardState::Connect, "Linear can switch now");
+        r.beat();
+        assert_eq!(r.flow(|f| f.step()), Step::Chooser, "no beat after Back");
+        r.click("tracker-primary");
+        assert_eq!(r.flow(|f| (f.step(), f.repo().to_string())), (Step::ChooseProject, "acme/app".to_string()));
         r.keys("enter");
         r.keys("enter");
         assert_eq!(r.flow(|f| (f.step(), f.primary_label())), (Step::ReviewImport, Some("Import 64 issues".to_string())));
@@ -1426,16 +1605,21 @@ mod tests {
         service.github = Arc::new(shelbi_app::github_setup::fixture::signed_out);
         let mut r = local(cx, service, IssueTrackerConfig::default());
         r.click("tracker-connect-github");
+        assert_eq!(r.flow(|f| (f.step(), f.heading())), (Step::Authorize, copy::GITHUB_AUTH_HEADING.to_string()));
         assert!(r.drawn("tracker-github-auth") && r.drawn("tracker-github-auth-command"));
         assert!(!r.drawn("tracker-github-owner"), "no pickers until gh is signed in");
         assert!(!r.drawn("tracker-error"));
         r.keys("enter");
-        assert_eq!(r.flow(|f| f.step()), Step::ChooseProject, "Continue waits");
+        assert_eq!(r.flow(|f| f.step()), Step::Authorize, "Continue waits");
 
-        // Signed in now: Retry reads the account again.
+        // Signed in now: Retry reads the account again, then Continue shows
+        // GitHub Connected and moves on.
         r.update(|v, _, _| v.service.github = Arc::new(shelbi_app::github_setup::fixture::answer));
         r.click("tracker-github-retry");
-        assert!(!r.drawn("tracker-github-auth"));
+        assert!(!r.drawn("tracker-github-auth") && r.drawn("tracker-github-signed-in"));
+        r.click("tracker-primary");
+        assert!(r.drawn("tracker-card-github-connected"));
+        r.beat();
         assert!(r.drawn("tracker-github-account") && r.drawn("tracker-github-owner"));
         assert_eq!(r.flow(|f| f.github().owner().to_string()), "octocat", "the login first");
 
@@ -1455,7 +1639,7 @@ mod tests {
             other => shelbi_app::github_setup::fixture::answer(other),
         });
         let mut r = local(cx, service, IssueTrackerConfig::default());
-        r.click("tracker-connect-github");
+        r.connect("tracker-connect-github");
         r.pick_repo();
         r.keys("enter");
         assert_eq!(r.flow(|f| (f.step(), f.error())), (Step::ChooseProject, Some("Issues are off".to_string())));
@@ -1463,25 +1647,50 @@ mod tests {
     }
 
     #[gpui::test]
-    fn linear_without_a_key_shows_key_entry_then_workspace_team_and_project(cx: &mut TestAppContext) {
+    fn linear_without_a_key_asks_for_one_then_shows_workspace_team_and_project(cx: &mut TestAppContext) {
+        use shelbi_app::linear_setup::{LinearAnswer, LinearFailure, LinearRequest};
         super::super::about::tests::OPENED.with(|o| o.borrow_mut().clear());
         let mut service = recording(Arc::default());
         service.linear = Arc::new(shelbi_app::linear_setup::fixture::no_key);
         let mut r = local(cx, service, IssueTrackerConfig::default());
         r.click("tracker-connect-linear");
-        assert_eq!(r.flow(|f| f.heading()), "Choose your Linear project");
-        assert!(r.drawn("tracker-connect-linear-key") && r.drawn("tracker-connect-linear-verify"));
-        assert!(!r.drawn("tracker-connect-linear-team"), "no pickers without a key");
+        assert_eq!(r.flow(|f| (f.step(), f.heading())), (Step::Authorize, copy::API_KEY_HEADING.to_string()));
+        assert_eq!(r.flow(|f| f.subheading()), copy::API_KEY_SUBHEADING);
+        assert!(r.drawn("tracker-key-input") && r.drawn("tracker-key-verify") && r.drawn("tracker-key-help"));
+        assert!(r.drawn("tracker-back") && r.drawn("tracker-primary"));
+        assert!(!r.flow(|f| f.ready()), "Continue waits for a verified key");
         r.click("tracker-linear-keys-link");
         assert_eq!(super::super::about::tests::OPENED.with(|o| o.borrow().clone()), vec![copy::LINEAR_KEYS_URL.to_string()]);
 
-        // A pasted key verifies, and Linear answers with it from then on.
+        // A key Linear refuses: why, under the field.
+        r.update(|v, window, cx| {
+            v.service.linear = Arc::new(|req| match req {
+                LinearRequest::Login(_) => LinearAnswer::Login(Err(LinearFailure::Rejected("Linear refused this key.".into()))),
+                other => shelbi_app::linear_setup::fixture::no_key(other),
+            });
+            v.edit_flow(|f| f.linear_mut().set_key_input("lin_api_bad"), window, cx);
+        });
+        r.keys("enter");
+        assert_eq!(r.flow(|f| f.step()), Step::Authorize);
+        assert!(r.drawn("tracker-key-error"));
+        assert_eq!(r.flow(|f| f.key_error()).as_deref(), Some("Linear refused this key."));
+
+        // A good one verifies (Return), and the next Return is Continue: the
+        // chooser shows Linear Connected, then Choose your Linear project.
         r.update(|v, window, cx| {
             v.service.linear = Arc::new(shelbi_app::linear_setup::fixture::answer);
             v.edit_flow(|f| f.linear_mut().set_key_input("lin_api_x"), window, cx);
         });
-        r.click("tracker-connect-linear-verify");
+        r.click("tracker-key-verify");
+        assert!(!r.drawn("tracker-key-error") && r.drawn("tracker-key-verified"));
+        assert_eq!(r.flow(|f| f.step()), Step::Authorize, "Continue is the user's");
+        r.keys("enter");
+        assert_eq!(r.flow(|f| f.step()), Step::Chooser);
+        assert!(r.drawn("tracker-card-linear-connected"));
+        r.beat();
+        assert_eq!(r.flow(|f| f.heading()), "Choose your Linear project");
         assert!(r.drawn("tracker-linear-account") && r.drawn("tracker-connect-linear-workspace"));
+        assert!(!r.drawn("tracker-key-input"), "no key field on Choose project");
         assert_eq!(
             r.flow(|f| f.linear().workspace().loaded().cloned()),
             Some(shelbi_app::linear_setup::fixture::WORKSPACE.to_string())
@@ -1499,11 +1708,26 @@ mod tests {
         r.keys("enter");
         assert_eq!(r.flow(|f| f.step()), Step::AgentRules, "the preflight passed");
 
-        // Back keeps the choice; Change account goes back to key entry.
+        // Back keeps the choice; Change account opens Add API key, and its
+        // Back returns to Choose project.
         r.click("tracker-back");
         assert_eq!(r.flow(|f| f.linear().team().to_string()), "DES");
         r.click("tracker-linear-change-account");
-        assert!(r.drawn("tracker-connect-linear-key") && r.drawn("tracker-connect-linear-cancel-key"));
+        assert_eq!(r.flow(|f| f.step()), Step::Authorize);
+        assert!(r.drawn("tracker-key-input"));
+        r.click("tracker-back");
+        assert_eq!(r.flow(|f| (f.step(), f.linear().team().to_string())), (Step::ChooseProject, "DES".to_string()));
+    }
+
+    #[gpui::test]
+    fn linear_with_a_working_key_skips_add_api_key(cx: &mut TestAppContext) {
+        let mut r = local(cx, recording(Arc::default()), IssueTrackerConfig::default());
+        r.click("tracker-connect-linear");
+        assert_eq!(r.flow(|f| (f.step(), f.authorized())), (Step::Chooser, Some(Tracker::Linear)));
+        assert!(r.drawn("tracker-card-linear-connected") && r.drawn("tracker-connect-github"));
+        r.beat();
+        assert_eq!(r.flow(|f| f.step()), Step::ChooseProject);
+        assert!(r.drawn("tracker-linear-account"));
     }
 
     #[gpui::test]
@@ -1533,7 +1757,7 @@ mod tests {
             }
         });
         let mut r = local(cx, service, IssueTrackerConfig::default());
-        r.click("tracker-connect-github");
+        r.connect("tracker-connect-github");
         r.pick_repo();
         r.keys("enter");
         r.keys("enter");
@@ -1570,7 +1794,7 @@ mod tests {
         assert!(r.flow(|f| f.loaded()), "the far project's connection was read");
         assert!(r.drawn("tracker-connect-github"), "the far project is on its local board");
 
-        r.click("tracker-connect-github");
+        r.connect("tracker-connect-github");
         r.pick_repo();
         r.keys("enter");
         assert_eq!(r.flow(|f| f.step()), Step::AgentRules, "the far daemon's preflight passed");

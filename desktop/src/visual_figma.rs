@@ -2552,9 +2552,12 @@ impl Run {
     /// its default model, 2720:33054) and `add-project-settings-in-repo` /
     /// `-global` (each card selected, 2483:8653 / 2483:8897).
     /// Connect to an Issue tracker (`tracker-connect`, Figma 2753:11686):
-    /// the chooser (2753:12002), with GitHub connected (2780:35199), and
-    /// Choose your GitHub / Linear project (2753:12004 / 2753:12006), picked
-    /// and before `gh` is signed in or a Linear key is stored.
+    /// the chooser (2753:12002), the project already on GitHub, the
+    /// Connected chooser after a card's Connect (2780:35199 / 2782:35298) and
+    /// after Back from Choose project (Continue, Linear enabled again),
+    /// Choose your GitHub / Linear project (2753:12004 / 2753:12006) and
+    /// picked, Sign in to GitHub before `gh` is signed in, and Add API key
+    /// (2887:14264) before a Linear key is stored.
     /// `SHELBI_VISUAL_ONLY=tracker-connect` renders just these.
     fn tracker_connect_windows(&mut self) {
         use crate::views::tracker_connect::{TrackerConnectView, SIZE};
@@ -2580,17 +2583,40 @@ impl Run {
         let none: Edit = |_| {};
         let repo: Edit = |f| f.set_repo("octocat/shelbi");
         let team: Edit = |f| f.linear_mut().select_team("ENG");
+        // On from the Connected chooser at once (Return), not after its beat.
+        fn on_from_chooser(f: &mut shelbi_app::tracker_connect::flow::TrackerFlow) {
+            if f.step() == shelbi_app::tracker_connect::flow::Step::Chooser {
+                f.advance();
+            }
+        }
+        let on: Edit = on_from_chooser;
+        let picked_repo: Edit = |f| {
+            on_from_chooser(f);
+            f.set_repo("octocat/shelbi");
+        };
+        let back: Edit = |f| {
+            on_from_chooser(f);
+            f.set_repo("octocat/shelbi");
+            f.back();
+        };
+        let picked_team: Edit = |f| {
+            on_from_chooser(f);
+            f.linear_mut().select_team("ENG");
+        };
         // Screen, the project's connection, the card connected, an edit, and
         // whether the machine is signed out of gh and Linear.
-        let states: [(&str, IssueTrackerConfig, Option<Tracker>, Edit, bool); 8] = [
+        let states: [(&str, IssueTrackerConfig, Option<Tracker>, Edit, bool); 11] = [
             ("tracker-select", IssueTrackerConfig::default(), None, none, false),
             ("tracker-connected", github, None, none, false),
-            ("tracker-github-choose", IssueTrackerConfig::default(), Some(Tracker::Github), none, false),
-            ("tracker-github-picked", IssueTrackerConfig::default(), Some(Tracker::Github), repo, false),
+            ("tracker-github-connected", IssueTrackerConfig::default(), Some(Tracker::Github), none, false),
+            ("tracker-linear-connected", IssueTrackerConfig::default(), Some(Tracker::Linear), none, false),
+            ("tracker-github-back", IssueTrackerConfig::default(), Some(Tracker::Github), back, false),
+            ("tracker-github-choose", IssueTrackerConfig::default(), Some(Tracker::Github), on, false),
+            ("tracker-github-picked", IssueTrackerConfig::default(), Some(Tracker::Github), picked_repo, false),
             ("tracker-github-signed-out", IssueTrackerConfig::default(), Some(Tracker::Github), none, true),
-            ("tracker-linear-choose", IssueTrackerConfig::default(), Some(Tracker::Linear), none, false),
-            ("tracker-linear-picked", IssueTrackerConfig::default(), Some(Tracker::Linear), team, false),
-            ("tracker-linear-no-key", IssueTrackerConfig::default(), Some(Tracker::Linear), none, true),
+            ("tracker-linear-choose", IssueTrackerConfig::default(), Some(Tracker::Linear), on, false),
+            ("tracker-linear-picked", IssueTrackerConfig::default(), Some(Tracker::Linear), picked_team, false),
+            ("tracker-linear-api-key", IssueTrackerConfig::default(), Some(Tracker::Linear), none, true),
         ];
         for (screen, cfg, connect, edit, signed_out) in states {
             let mut service = service.clone();
@@ -2616,10 +2642,13 @@ impl Run {
                         v.loaded(Ok(cfg), window, cx);
                         if let Some(tracker) = connect {
                             v.edit_flow(|f| { f.connect(tracker); }, window, cx);
-                            v.edit_flow(edit, window, cx);
                         }
                     })
                 })
+                .unwrap();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.edit_flow(edit, window, cx)))
                 .unwrap();
             self.settle_sheet(window);
             self.settle_sheet(window);
@@ -2671,6 +2700,10 @@ impl Run {
                         v.edit_flow(|f| { f.connect(tracker); }, window, cx);
                     })
                 })
+                .unwrap();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.edit_flow(on, window, cx)))
                 .unwrap();
             self.settle_sheet(window);
             self.cx

@@ -66,6 +66,16 @@ impl Flow {
         self.cx.run_until_parked();
     }
 
+    /// A card's Connect: the Connected chooser, then Choose project once
+    /// its beat runs out.
+    fn connect(&mut self, card: &'static str) {
+        self.click(card);
+        assert_eq!(self.flow(|f| f.step()), Step::Chooser, "the Connected chooser first");
+        self.cx.executor().advance_clock(std::time::Duration::from_millis(copy::CONNECTED_BEAT_MS + 100));
+        self.cx.run_until_parked();
+        assert_eq!(self.flow(|f| f.step()), Step::ChooseProject);
+    }
+
     fn enter(&mut self) {
         self.cx.simulate_keystrokes("enter");
         self.cx.run_until_parked();
@@ -206,7 +216,7 @@ fn rules_review_import_and_board(
 fn github_connects_and_imports_through_to_the_board(cx: &mut TestAppContext) {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let (mut h, issues, mut f) = open(cx, asked.clone());
-    f.click("tracker-connect-github");
+    f.connect("tracker-connect-github");
     f.click("tracker-github-owner");
     f.click("tracker-github-owner-1");
     f.click("tracker-github-repo");
@@ -219,7 +229,7 @@ fn github_connects_and_imports_through_to_the_board(cx: &mut TestAppContext) {
 fn linear_connects_and_imports_through_to_the_board(cx: &mut TestAppContext) {
     let asked = Arc::new(Mutex::new(Vec::new()));
     let (mut h, issues, mut f) = open(cx, asked.clone());
-    f.click("tracker-connect-linear");
+    f.connect("tracker-connect-linear");
     f.click("tracker-connect-linear-team");
     f.click("tracker-connect-linear-team-0");
     let team = f.flow(|f| f.linear().connection());

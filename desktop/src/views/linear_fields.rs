@@ -30,7 +30,8 @@
 //! (`views/tracker_connect.rs`) lays the same pickers out its own way
 //! ([`connect_fields`]): the key's Workspace (read-only), Team as
 //! `Name · KEY`, and Project from "Any project", stacked at the frame's
-//! width, with no label or assignee filter. Its key entry is [`key_entry`].
+//! width, with no label or assignee filter. Its key entry is its own Add API
+//! key step.
 //!
 //! The host keeps the choice, the key field and which picker is open
 //! ([`LinearUi`]), and hands in what a click does ([`Handlers`]); it runs
@@ -40,7 +41,7 @@ use gpui::{div, prelude::*, px, AnyElement, App, ClickEvent, Context, Div, Entit
 use gpui_kit::component::input::{Input, InputState};
 use shelbi_app::linear_setup::{
     Filter, KeyState, LinearChoice, Loadable, PickOption, ACCOUNT_LABEL, CHANGE_KEY, CHOOSE_TEAM, FILTERS_HELP,
-    KEY_HELP, KEY_MISSING, KEY_PLACEHOLDER, LOADING, NOT_CONNECTED, PROJECT_LABEL, TEAM_LABEL, VERIFY,
+    KEY_HELP, KEY_PLACEHOLDER, LOADING, NOT_CONNECTED, PROJECT_LABEL, TEAM_LABEL, VERIFY,
 };
 use shelbi_app::tracker_connect::flow::{ANY_PROJECT, WORKSPACE_LABEL};
 
@@ -140,8 +141,14 @@ pub struct LinearUi {
 
 impl LinearUi {
     pub fn new<V: 'static>(window: &mut Window, cx: &mut Context<V>) -> Self {
+        Self::with_placeholder(KEY_PLACEHOLDER, window, cx)
+    }
+
+    /// The fields with the key field's own placeholder (Connect to an Issue
+    /// tracker's Add API key step: `lin_api…`).
+    pub fn with_placeholder<V: 'static>(placeholder: &'static str, window: &mut Window, cx: &mut Context<V>) -> Self {
         LinearUi {
-            key_input: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(KEY_PLACEHOLDER)),
+            key_input: cx.new(|cx| InputState::new(window, cx).masked(true).placeholder(placeholder)),
             menu: None,
             anchor: Default::default(),
         }
@@ -330,7 +337,6 @@ fn account<V: 'static>(
     let (note, color) = match choice.key_error() {
         Some(why) => (why.to_string(), theme.error),
         None if choice.changing_key() => ("Paste the new key. The current one stays until it's verified.".into(), theme.form_hint),
-        None if host == Host::Connect => (KEY_MISSING.to_string(), theme.form_hint),
         None => (NOT_CONNECTED.to_string(), theme.form_hint),
     };
     let control = div()
@@ -357,23 +363,6 @@ fn account<V: 'static>(
                 .children(cancel),
         );
     field(ACCOUNT_LABEL, control, Some(KEY_HELP.into()), theme)
-}
-
-/// The key field (with Verify, and Cancel over a working key) while
-/// `choice` has no working key or Change key… opened it: Connect to an
-/// Issue tracker's Change account.
-#[allow(clippy::too_many_arguments)]
-pub fn key_entry<V: 'static>(
-    host: Host,
-    choice: &LinearChoice,
-    ui: &LinearUi,
-    enabled: bool,
-    on: Handlers<V>,
-    theme: &Theme,
-    window: &Window,
-    cx: &mut Context<V>,
-) -> Div {
-    account(host, choice, ui, enabled, on, theme, window, cx)
 }
 
 /// The Choose your Linear project step's pickers, each `width` wide:
