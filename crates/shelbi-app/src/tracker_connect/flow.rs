@@ -118,6 +118,8 @@ pub const CONNECTED_BEAT_MS: u64 = 700;
 pub const CHECKING: &str = "Checking…";
 /// The buttons.
 pub const CONNECT: &str = "Connect";
+/// The File system row's button in the new-project wizard's chooser.
+pub const USE: &str = "Use";
 pub const CONNECTED: &str = "Connected";
 pub const CONTINUE: &str = "Continue";
 pub const BACK: &str = "Back";
@@ -138,6 +140,15 @@ pub const MENU_TITLE: &str = "Connect to issue tracker…";
 
 /// The trackers the chooser offers, in its order.
 pub const TRACKERS: [Tracker; 2] = [Tracker::Github, Tracker::Linear];
+
+/// The rows the new-project wizard's chooser offers: the trackers, then the
+/// local file system (a new project has no board to keep yet).
+pub const NEW_PROJECT_TRACKERS: [Tracker; 3] = [Tracker::Github, Tracker::Linear, Tracker::FileSystem];
+
+/// The agent rules the new-project wizard's rules step starts on: the ones a
+/// project created without the step gets (`shelbi init -y`, the TUI), so
+/// accepting every preselection creates the same project everywhere.
+pub const NEW_PROJECT_RULES: AgentRules = AgentRules { require_review: false, assigned_only: true };
 
 /// Where the flow is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +175,9 @@ pub enum CardState {
     /// Its Connect was pressed and its authorization is being checked: the
     /// button says [`CHECKING`], disabled.
     Checking,
+    /// The new-project wizard's File system row: its [`USE`] button, which
+    /// needs no sub-screens.
+    Use,
 }
 
 /// One chooser card.
@@ -353,6 +367,16 @@ pub struct TrackerFlow {
     imported: Option<usize>,
     /// Why Continue was refused.
     error: Option<String>,
+    /// The flow is the new-project wizard's Issues step
+    /// ([`TrackerFlow::for_new_project`]).
+    new_project: bool,
+    /// The new-project chooser's choice: what its Continue goes on with
+    /// (the recommended row until a row's button is pressed).
+    choice: Tracker,
+    /// The new-project flow just finished a choice ([`Self::take_complete`]).
+    complete: bool,
+    /// The `issue_tracker:` block the new-project flow last finished with.
+    answer: Option<IssueTrackerConfig>,
 }
 
 impl Default for TrackerFlow {
@@ -379,6 +403,10 @@ impl Default for TrackerFlow {
             apply: Apply::Idle,
             imported: None,
             error: None,
+            new_project: false,
+            choice: Tracker::FileSystem,
+            complete: false,
+            answer: None,
         }
     }
 }
@@ -386,6 +414,73 @@ impl Default for TrackerFlow {
 impl TrackerFlow {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The new-project wizard's Issues step: the same screens for a project
+    /// that doesn't exist yet. The chooser adds the File system row and
+    /// keeps a Continue (on the recommended row: GitHub on `github_repo`,
+    /// the origin's, else the file system), Choose your GitHub project
+    /// starts on `github_repo`, and the agent rules start on `rules`. The
+    /// rules' Continue (or File system's Use) finishes the step
+    /// ([`Self::take_complete`], [`Self::answer`]): a new project has
+    /// nothing to review, move or import.
+    pub fn for_new_project(github_repo: Option<&str>, rules: AgentRules) -> Self {
+        TrackerFlow {
+            current: Some(IssueTrackerConfig::default()),
+            github: github_repo.map(GithubChoice::with_repo).unwrap_or_default(),
+            rules,
+            new_project: true,
+            choice: if github_repo.is_some() { Tracker::Github } else { Tracker::FileSystem },
+            ..TrackerFlow::default()
+        }
+    }
+
+    /// The flow is the new-project wizard's.
+    pub fn is_new_project(&self) -> bool {
+        self.new_project
+    }
+
+    /// What the new-project chooser's Continue goes on with.
+    pub fn choice(&self) -> Tracker {
+        self.choice
+    }
+
+    /// The new-project flow finished a choice since the last ask (the
+    /// wizard moves on to its next step).
+    pub fn take_complete(&mut self) -> bool {
+        std::mem::take(&mut self.complete)
+    }
+
+    /// The `issue_tracker:` block the new-project flow last finished with:
+    /// the connection as picked with the agent rules (what Connect to an
+    /// issue tracker writes over a fresh project), or the file system's.
+    pub fn answer(&self) -> Option<&IssueTrackerConfig> {
+        self.answer.as_ref()
+    }
+
+    /// Finish the new-project flow with `tracker`'s choice.
+    fn finish(&mut self, tracker: Tracker) -> bool {
+        let cfg = match tracker {
+            Tracker::FileSystem => IssueTrackerConfig::default(),
+            _ => match self.wanted() {
+                Some(choice) => ConnectTracker::new(choice, false).with_rules(self.rules).config(&IssueTrackerConfig::default()),
+                None => return false,
+            },
+        };
+        self.error = None;
+        self.choice = tracker;
+        self.answer = Some(cfg);
+        self.complete = true;
+        true
+    }
+
+    /// The chooser's rows, in order.
+    pub fn trackers(&self) -> &'static [Tracker] {
+        if self.new_project {
+            &NEW_PROJECT_TRACKERS
+        } else {
+            &TRACKERS
+        }
     }
 
     /// The project's connection was read (or read again).
@@ -435,12 +530,20 @@ impl TrackerFlow {
     pub fn cards(&self) -> Vec<Card> {
         let connected = self.connected_tracker();
         let any = self.has_connection();
-        TRACKERS
-            .into_iter()
+        self.trackers()
+            .iter()
+            .copied()
             .map(|tracker| {
                 let (title, body) = card_copy(tracker);
                 let state = match () {
                     _ if connected == Some(tracker) => CardState::Connected,
+                    _ if tracker == Tracker::FileSystem => {
+                        if self.authorizing.is_some() || self.in_beat() {
+                            CardState::Disabled
+                        } else {
+                            CardState::Use
+                        }
+                    }
                     _ if any || !self.loaded() => CardState::Disabled,
                     _ if self.authorizing == Some(tracker) => CardState::Checking,
                     _ if self.authorized == Some(tracker) => CardState::Connected,
@@ -467,10 +570,17 @@ impl TrackerFlow {
     /// connect (another tracker is connected, the connection isn't read yet,
     /// or the flow is past the chooser).
     pub fn connect(&mut self, tracker: Tracker) -> bool {
-        let offered = self.cards().iter().any(|c| c.tracker == tracker && c.state == CardState::Connect);
+        let offered = self
+            .cards()
+            .iter()
+            .any(|c| c.tracker == tracker && matches!(c.state, CardState::Connect | CardState::Use));
         if self.step != Step::Chooser || !offered {
             return false;
         }
+        if tracker == Tracker::FileSystem {
+            return self.finish(Tracker::FileSystem);
+        }
+        self.choice = tracker;
         self.tracker = Some(tracker);
         self.authorizing = Some(tracker);
         self.error = None;
@@ -647,6 +757,7 @@ impl TrackerFlow {
     pub fn heading(&self) -> String {
         let name = tracker_name(self.tracker.unwrap_or(Tracker::Github));
         match self.step {
+            Step::Chooser if self.new_project => crate::new_project::ISSUES_TITLE.into(),
             Step::Chooser => CHOOSER_HEADING.into(),
             Step::Authorize => match self.tracker {
                 Some(Tracker::Linear) => API_KEY_HEADING.into(),
@@ -663,6 +774,7 @@ impl TrackerFlow {
     pub fn subheading(&self) -> String {
         let name = tracker_name(self.tracker.unwrap_or(Tracker::Github));
         match self.step {
+            Step::Chooser if self.new_project => crate::new_project::ISSUES_INTRO.into(),
             Step::Chooser => CHOOSER_SUBHEADING.into(),
             Step::Authorize => match self.tracker {
                 Some(Tracker::Linear) => API_KEY_SUBHEADING.into(),
@@ -1003,6 +1115,9 @@ impl TrackerFlow {
     /// Whether the step's Continue (its primary button) can be pressed.
     pub fn ready(&self) -> bool {
         match self.step {
+            // The new-project chooser always goes on with its choice
+            // (once no check runs).
+            Step::Chooser if self.new_project => self.authorizing.is_none(),
             // The Connected chooser's Continue (after Back from Choose
             // project, or Return during the beat).
             Step::Chooser => self.authorized.is_some() && self.authorizing.is_none(),
@@ -1131,6 +1246,23 @@ impl TrackerFlow {
             self.advancing = self.want_preflight();
             return false;
         }
+        if self.new_project {
+            match self.step {
+                // The chooser's Continue presses its choice's button, unless
+                // that tracker is Connected already (then on to Choose
+                // project, as below).
+                Step::Chooser if self.authorized != Some(self.choice) => {
+                    let choice = self.choice;
+                    return self.connect(choice);
+                }
+                // The rules are the last screen: the step is done.
+                Step::AgentRules => {
+                    let Some(tracker) = self.tracker else { return false };
+                    return self.finish(tracker);
+                }
+                _ => {}
+            }
+        }
         self.step = match self.step {
             Step::Chooser => {
                 self.beat = Beat::Idle;
@@ -1199,6 +1331,9 @@ impl TrackerFlow {
                 } else {
                     self.authorized = None;
                 }
+                if let Some(tracker) = self.authorized {
+                    self.choice = tracker;
+                }
                 Step::Chooser
             }
             Step::ChooseProject => {
@@ -1234,6 +1369,7 @@ impl TrackerFlow {
     /// Choose project).
     pub fn primary_label(&self) -> Option<String> {
         let label = match self.step {
+            Step::Chooser if self.new_project => CONTINUE,
             Step::Chooser if self.ready() && !self.in_beat() => CONTINUE,
             Step::Chooser => return None,
             Step::ChooseProject if self.checking() => CHECKING,
@@ -2198,5 +2334,49 @@ mod tests {
         flow.primary();
         let Some(FlowRequest::Connect(req)) = flow.due() else { panic!("the forced switch") };
         assert!(req.force);
+    }
+
+    #[test]
+    fn the_new_project_flow_adds_file_system_and_ends_at_the_rules() {
+        // Connect to an issue tracker keeps its two cards and no Continue.
+        let mut flow = TrackerFlow::new();
+        flow.load(&local());
+        assert_eq!(flow.trackers(), &TRACKERS);
+        assert_eq!(flow.primary_label(), None);
+        assert!(!flow.is_new_project());
+
+        let mut flow = TrackerFlow::for_new_project(Some("acme/app"), NEW_PROJECT_RULES);
+        assert_eq!(flow.trackers(), &NEW_PROJECT_TRACKERS);
+        assert_eq!(
+            states(&flow),
+            [(Tracker::Github, CardState::Connect), (Tracker::Linear, CardState::Connect), (Tracker::FileSystem, CardState::Use)]
+        );
+        assert_eq!((flow.choice(), flow.primary_label().as_deref()), (Tracker::Github, Some(CONTINUE)));
+        assert_eq!(flow.heading(), crate::new_project::ISSUES_TITLE);
+        assert_eq!(flow.rules(), NEW_PROJECT_RULES);
+
+        // Continue presses the choice's Connect; while it checks, nothing
+        // else can be pressed.
+        assert!(flow.advance());
+        assert_eq!(states(&flow)[0].1, CardState::Checking);
+        assert_eq!(states(&flow)[2].1, CardState::Disabled);
+        answer_reads(&mut flow);
+        beat(&mut flow);
+        assert_eq!((flow.step(), flow.repo()), (Step::ChooseProject, "acme/app"));
+        assert!(continue_(&mut flow));
+        assert_eq!(flow.step(), Step::AgentRules);
+        assert!(flow.advance());
+        assert_eq!(flow.step(), Step::AgentRules, "the rules are the last screen");
+        assert!(flow.take_complete() && !flow.take_complete());
+        assert_eq!(flow.answer(), Some(&github("acme/app")));
+        assert_eq!(flow.due(), None, "nothing to preview or connect");
+
+        // File system's Use finishes at once, over the tracker picked before.
+        while flow.back() {}
+        assert_eq!(flow.step(), Step::Chooser);
+        assert!(flow.connect(Tracker::FileSystem));
+        assert!(flow.take_complete());
+        assert_eq!((flow.answer(), flow.choice()), (Some(&local()), Tracker::FileSystem));
+        assert_eq!(flow.authorized(), Some(Tracker::Github), "GitHub stays Connected to switch back");
     }
 }

@@ -2773,12 +2773,8 @@ impl Run {
             }),
             create: Arc::new(|_, _, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
             refresh: Arc::new(|| {}),
-            preflight: Arc::new(|_| Ok(())),
-            linear: Arc::new(|_| {
-                shelbi_app::linear_setup::LinearAnswer::Teams(Err(shelbi_app::linear_setup::LinearFailure::Other(
-                    "offscreen".into(),
-                )))
-            }),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
+            linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
         };
         // Each state: its name, Continues pressed, the card chosen, whether a
         // folder is picked.
@@ -2824,6 +2820,74 @@ impl Run {
                 .unwrap();
             self.settle_sheet(window);
             self.settle_sheet(window);
+            self.write_sized(window, screen, SIZE.0 as u32);
+            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        }
+
+        // The Issues step's sub-screens (`new-project-connect-screens`):
+        // Connect to an issue tracker's screens inside the wizard. Each
+        // state: its name, the Linear answerer, the row pressed, then how
+        // many Continues (the chooser's after the Connected beat, then
+        // Choose project's), and the edit before them.
+        type Linear = fn(shelbi_app::linear_setup::LinearRequest) -> shelbi_app::linear_setup::LinearAnswer;
+        type Edit = fn(&mut shelbi_app::tracker_connect::flow::TrackerFlow);
+        use shelbi_app::add_project_wizard::Tracker;
+        use shelbi_app::linear_setup::fixture as linear_fixture;
+        use shelbi_app::tracker_connect::flow::Step as FlowStep;
+        let none: Edit = |_| {};
+        let repo: Edit = |f| f.github_mut().select_repo("acme/app");
+        let team: Edit = |f| {
+            f.linear_mut().select_team("ENG");
+            f.linear_mut().select_filter(shelbi_app::linear_setup::Filter::Project, Some("Shelbi"));
+        };
+        let subs: [(&str, Linear, Tracker, Edit, usize, FlowStep); 6] = [
+            ("add-project-issues-github-connected", linear_fixture::answer, Tracker::Github, none, 0, FlowStep::Chooser),
+            ("add-project-issues-api-key", linear_fixture::no_key, Tracker::Linear, none, 0, FlowStep::Authorize),
+            ("add-project-issues-github-choose", linear_fixture::answer, Tracker::Github, repo, 1, FlowStep::ChooseProject),
+            ("add-project-issues-linear-choose", linear_fixture::answer, Tracker::Linear, team, 1, FlowStep::ChooseProject),
+            ("add-project-issues-rules", linear_fixture::answer, Tracker::Github, repo, 2, FlowStep::AgentRules),
+            ("add-project-issues-rules-linear", linear_fixture::answer, Tracker::Linear, team, 2, FlowStep::AgentRules),
+        ];
+        for (screen, linear, tracker, edit, continues, want) in subs {
+            let mut engine = engine.clone();
+            engine.linear = Arc::new(linear);
+            let handle = self
+                .cx
+                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                    cx.new(|cx| {
+                        AddProjectView::new(Origin::Workspace, None, home.clone(), engine, Rc::new(|_, _, _| Ok(())), window, cx)
+                    })
+                })
+                .expect("open the offscreen window");
+            let view = handle.entity(&self.cx).expect("the view");
+            let window: AnyWindowHandle = handle.into();
+            self.cx
+                .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.folder_picked(Some(&folder), window, cx)))
+                .unwrap();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| {
+                    view.update(cx, |v, cx| {
+                        v.click(Focus::Primary, window, cx);
+                        v.click(Focus::Primary, window, cx);
+                        v.click(Focus::Tracker(tracker), window, cx);
+                    })
+                })
+                .unwrap();
+            self.settle_sheet(window);
+            self.cx
+                .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.edit_flow(edit, window, cx)))
+                .unwrap();
+            self.settle_sheet(window);
+            for _ in 0..continues {
+                self.cx
+                    .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.click(Focus::Primary, window, cx)))
+                    .unwrap();
+                self.settle_sheet(window);
+                self.settle_sheet(window);
+            }
+            let at = view.read_with(&self.cx, |v, _| v.wizard().flow().step());
+            self.expect(&format!("{screen}: on {want:?} (on {at:?})"), at == want);
             self.write_sized(window, screen, SIZE.0 as u32);
             let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
         }
@@ -2916,100 +2980,30 @@ impl Run {
     }
 
     /// Linear as a tracker (`linear-settings-ui`), over canned Linear answers
-    /// (`shelbi_app::linear_setup::fixture`; nothing reads Linear): the Add
-    /// Project wizard's Issues screen with Linear chosen and no key yet
-    /// (`add-project-linear-no-key`) and with a team and filters picked
-    /// (`add-project-linear`); Settings ▸ Properties' Issue tracker section on
+    /// (`shelbi_app::linear_setup::fixture`; nothing reads Linear): Settings ▸
+    /// Properties' Issue tracker section on
     /// Linear (`settings-tracker-linear`), with no key
     /// (`settings-tracker-no-key`) and a switch refused because the board has
     /// issues (`settings-tracker-refused`); and Settings ▸ Workflows over a
     /// catalog Linear manages after a Sync now (`settings-statuses-managed`).
     /// `SHELBI_VISUAL_ONLY=linear` renders just these.
     fn linear_windows(&mut self) {
-        use crate::views::add_project::{AddProjectView, Engine, SIZE};
-        use crate::views::linear_fields::Msg;
         use crate::views::settings_nav::SettingsPage;
-        use shelbi_app::add_project_wizard::{FolderCheck, Focus, Origin, Repo, Tracker};
-        use shelbi_app::linear_setup::{fixture, Filter, LinearAnswer, LinearRequest};
+        use shelbi_app::add_project_wizard::Tracker;
+        use shelbi_app::linear_setup::{fixture, LinearAnswer, LinearRequest};
         use shelbi_app::settings::tracker::TrackerService;
         use shelbi_app::tracker_connect::{ConnectError, StatusSync};
         use shelbi_core::IssueTrackerBackend;
 
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/Users/me"));
-        let folder = home.join("Projects/my-project");
+        use crate::views::linear_fields::Msg;
+        use shelbi_app::linear_setup::Filter;
+        type Answer = fn(LinearRequest) -> LinearAnswer;
         let picks = [
             Msg::Team("ENG".into()),
             Msg::Filter(Filter::Project, "Shelbi".into()),
             Msg::Filter(Filter::Label, "shelbi".into()),
             Msg::Filter(Filter::Assignee, "me".into()),
         ];
-        type Answer = fn(LinearRequest) -> LinearAnswer;
-        let wizard_states: [(&str, Answer, bool); 2] =
-            [("add-project-linear-no-key", fixture::no_key, false), ("add-project-linear", fixture::answer, true)];
-        for (screen, linear, pick) in wizard_states {
-            let engine = Engine {
-                check: Arc::new({
-                    let home = home.clone();
-                    move |_, root, _| {
-                        let path = shelbi_orchestrator::project_create::absolutize(&home, Path::new(root.trim()));
-                        FolderCheck {
-                            in_repo_dir: path.join(".shelbi"),
-                            global_dir: Some(home.join(".shelbi/projects/my-project")),
-                            path,
-                            name: Some("My project".into()),
-                            slug: Some("my-project".into()),
-                            repo: Some(Repo::Git),
-                            problem: None,
-                            facts: Default::default(),
-                        }
-                    }
-                }),
-                create: Arc::new(|_, _, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
-                refresh: Arc::new(|| {}),
-                preflight: Arc::new(|_| Ok(())),
-                linear: Arc::new(linear),
-            };
-            let handle = self
-                .cx
-                .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
-                    cx.new(|cx| {
-                        AddProjectView::new(Origin::Workspace, None, home.clone(), engine, Rc::new(|_, _, _| Ok(())), window, cx)
-                    })
-                })
-                .expect("open the offscreen window");
-            let view = handle.entity(&self.cx).expect("the view");
-            let window: AnyWindowHandle = handle.into();
-            self.cx
-                .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.folder_picked(Some(&folder), window, cx)))
-                .unwrap();
-            self.settle_sheet(window);
-            self.cx
-                .update_window(window, |_, window, cx| {
-                    view.update(cx, |v, cx| {
-                        v.click(Focus::Primary, window, cx);
-                        v.click(Focus::Primary, window, cx);
-                        v.click(Focus::Tracker(Tracker::Linear), window, cx);
-                    })
-                })
-                .unwrap();
-            self.settle_sheet(window);
-            if pick {
-                for msg in picks.clone() {
-                    self.cx
-                        .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.linear_msg(msg, window, cx)))
-                        .unwrap();
-                    self.settle_sheet(window);
-                }
-            }
-            let shown = view.read_with(&self.cx, |v, _| {
-                let linear = v.wizard().issues().linear();
-                if pick { linear.scope_line().is_some() } else { linear.needs_key() }
-            });
-            self.expect(&format!("{screen}: the Linear card's state"), shown);
-            self.write_sized(window, screen, SIZE.0 as u32);
-            let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
-        }
-
         // Settings ▸ Properties' Issue tracker section.
         let service = |linear: Answer, refuse: bool| TrackerService {
             connect: Arc::new(move |_| {

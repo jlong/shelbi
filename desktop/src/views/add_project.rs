@@ -27,6 +27,17 @@
 //!   ([`super::harness_picker`]) over the wizard's shared choice. A generic
 //!   runner is refused with the reason under them (a new project declares
 //!   none).
+//! - **Issues** (step 3, `new-project-connect-screens`) is Connect to an
+//!   Issue tracker's screens ([`super::tracker_steps`], over the wizard's
+//!   [`TrackerFlow::for_new_project`]): the chooser (GitHub Issues and
+//!   Linear with Connect, File system with Use) under the wizard's own
+//!   heading, then Add API key or Sign in to GitHub when the tracker isn't
+//!   authorized, Choose your project (its preflight on Continue) and the
+//!   agent rules, each under its own heading and still "Step 3 of 4". Back
+//!   walks those screens, and the chooser's Back returns to Agent defaults.
+//!   The rules' Continue, or File system's Use, goes on to where settings
+//!   live. The reads run off the UI thread ([`Engine::github`],
+//!   [`Engine::linear`]).
 //! - **02** picks where settings live: two cards, one selected, with the
 //!   real paths for the chosen folder.
 //! - **Create Project** runs [`Engine::create`] (the shared
@@ -73,14 +84,16 @@ use shelbi_app::add_project_wizard::{
     Tone, Tracker, Wizard, WorkflowOverview,
 };
 use shelbi_app::exec::Mutation;
-use shelbi_app::linear_setup::{Filter, LinearAnswer, LinearRequest};
+use shelbi_app::github_setup::{GithubAnswer, GithubRequest};
+use shelbi_app::linear_setup::{LinearAnswer, LinearRequest};
 use shelbi_app::new_project as np;
+use shelbi_app::tracker_connect::flow::{self as copy, FlowRequest, Step as FlowStep, TrackerFlow};
 use shelbi_core::ConfigMode;
 use shelbi_orchestrator::project_create::{self as engine, AddProjectError, ScaffoldReporter, ScaffoldStage};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
 use super::harness_picker::{self as pickers, Fields, Handlers, Host, Menu};
-use super::linear_fields::{self, LinearUi, Pick};
+use super::tracker_steps::{self as steps, key_step, FlowHost, FlowUi, CONTENT_TOP, CONTENT_W};
 use super::workflow_editor::error_line;
 use crate::app::{CloseWindow, ShelbiWindow};
 use crate::commands;
@@ -109,12 +122,12 @@ pub type CreateFn =
 /// [`Engine::refresh`]'s signature.
 pub type RefreshFn = dyn Fn() + Send + Sync;
 
-/// [`Engine::preflight`]'s signature: the GitHub repo; the fix to show on a
-/// failure.
-pub type PreflightFn = dyn Fn(&str) -> Result<(), String> + Send + Sync;
+/// [`Engine::github`]'s signature: one GitHub read for the Issues screen
+/// (the `gh` sign-in, a picker's list, the preflight), answered.
+pub type GithubFn = dyn Fn(GithubRequest) -> GithubAnswer + Send + Sync;
 
-/// [`Engine::linear`]'s signature: one Linear read for the Issues screen's
-/// Linear card, answered.
+/// [`Engine::linear`]'s signature: one Linear read for the Issues screen,
+/// answered.
 pub type LinearFn = dyn Fn(LinearRequest) -> LinearAnswer + Send + Sync;
 
 /// The blocking work the wizard runs off the UI thread. A test swaps in its
@@ -128,10 +141,11 @@ pub struct Engine {
     /// Re-read the project catalog, so the created project is in it before
     /// it opens (Okay).
     pub refresh: Arc<RefreshFn>,
-    /// The Issues screen's `gh` check of a GitHub repo.
-    pub preflight: Arc<PreflightFn>,
-    /// The Issues screen's Linear reads (teams, a team's filter lists, a
-    /// pasted key's login, the preflight).
+    /// The Issues screen's GitHub reads (the `gh` sign-in, organizations
+    /// and repositories, and the `gh` preflight of the chosen repo).
+    pub github: Arc<GithubFn>,
+    /// The Issues screen's Linear reads (teams, a team's lists, a pasted
+    /// key's login, the workspace, the preflight).
     pub linear: Arc<LinearFn>,
 }
 
@@ -154,7 +168,7 @@ impl Engine {
                 };
                 commands::run_add_project(&mutation, attempt, out)
             }),
-            preflight: Arc::new(engine::issues::preflight_github),
+            github: Arc::new(engine::github::answer),
             linear: Arc::new(|request| engine::linear::answer(None, request)),
         }
     }
@@ -278,8 +292,6 @@ pub struct AddProjectView {
     focus: FocusHandle,
     path_input: Entity<InputState>,
     name_input: Entity<InputState>,
-    /// The Issues screen's GitHub repo field.
-    repo_input: Entity<InputState>,
     /// The keyboard has moved focus: focus rings show from then on.
     keyboard: bool,
     from: Option<WindowHandle<ShelbiWindow>>,
@@ -293,8 +305,11 @@ pub struct AddProjectView {
     workflows: Vec<WorkflowOverview>,
     /// The Agent defaults picker whose menu is open.
     menu: Option<Menu>,
-    /// The Issues screen's Linear card: its key field and open picker.
-    linear: LinearUi,
+    /// The Issues screen's Add API key field and open picker.
+    flow_ui: FlowUi,
+    /// The Issues screen's step the view last showed (to focus the key
+    /// field on reaching Add API key).
+    shown: FlowStep,
     menu_anchor: style::Anchor,
     _subscriptions: Vec<Subscription>,
 }
@@ -315,8 +330,7 @@ impl AddProjectView {
         let home = std::env::var_os("HOME").map(PathBuf::from);
         let path_input = cx.new(|cx| InputState::new(window, cx).placeholder("~/Projects/my-project"));
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("Project name"));
-        let repo_input = cx.new(|cx| InputState::new(window, cx).placeholder("owner/repo"));
-        let linear = LinearUi::new(window, cx);
+        let flow_ui = FlowUi::new(window, cx);
         let this_window = window.window_handle();
         let me = cx.weak_entity();
         let subscriptions = vec![
@@ -349,33 +363,11 @@ impl AddProjectView {
                     _ => {}
                 }
             }),
-            cx.subscribe_in(&repo_input, window, |this, input, event: &InputEvent, window, cx| {
-                match event {
-                    InputEvent::Change => {
-                        let text = input.read(cx).value().to_string();
-                        this.wizard.set_repo(text);
-                        this.after_change(window, cx);
-                    }
-                    InputEvent::Focus => {
-                        this.wizard.set_focus(Focus::Repo);
-                        cx.notify();
-                    }
-                    _ => {}
-                }
-            }),
-            cx.subscribe_in(&linear.key_input, window, |this, input, event: &InputEvent, window, cx| {
-                match event {
-                    InputEvent::Change => {
-                        let text = input.read(cx).value().to_string();
-                        this.wizard.set_linear_key(text);
-                        cx.notify();
-                    }
-                    InputEvent::Focus => {
-                        this.wizard.set_focus(Focus::LinearKey);
-                        let _ = window;
-                        cx.notify();
-                    }
-                    _ => {}
+            cx.subscribe_in(&flow_ui.linear_ui.key_input, window, |this, input, event: &InputEvent, _, cx| {
+                if let InputEvent::Change = event {
+                    let text = input.read(cx).value().to_string();
+                    this.wizard.flow_mut().linear_mut().set_key_input(text);
+                    cx.notify();
                 }
             }),
             // Ahead of the text fields' own bindings (Tab indents, Return
@@ -401,7 +393,6 @@ impl AddProjectView {
             focus,
             path_input,
             name_input,
-            repo_input,
             keyboard: false,
             from,
             cwd,
@@ -411,7 +402,8 @@ impl AddProjectView {
             workflows: wiz::created_workflows(),
             menu: None,
             menu_anchor: Default::default(),
-            linear,
+            flow_ui,
+            shown: FlowStep::Chooser,
             _subscriptions: subscriptions,
         }
     }
@@ -422,10 +414,18 @@ impl AddProjectView {
         &self.wizard
     }
 
+    /// Change the Issues screen's flow as its controls would, then run what
+    /// it asks for (the visual check).
+    #[cfg(feature = "visual-check")]
+    pub fn edit_flow(&mut self, edit: impl FnOnce(&mut TrackerFlow), window: &mut Window, cx: &mut Context<Self>) {
+        edit(self.wizard.flow_mut());
+        FlowHost::flow_changed(self, window, cx);
+    }
+
     /// A key the wizard takes: Tab and ⇧Tab, Return and Esc anywhere;
     /// Space and the arrows off the text fields. `false` lets it through.
     fn key(&mut self, chord: KeyChord, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let in_text = matches!(self.wizard.focus(), Focus::Path | Focus::Name | Focus::Repo | Focus::LinearKey);
+        let in_text = matches!(self.wizard.focus(), Focus::Path | Focus::Name) || self.in_key_field(window, cx);
         let bare = chord.mods == Mods::NONE;
         let taken = match chord.code {
             Key::Tab | Key::BackTab => bare || chord.mods == Mods::SHIFT,
@@ -437,7 +437,7 @@ impl AddProjectView {
             return false;
         }
         // An open picker's menu takes Esc; any other key closes it ([`Self::act`]).
-        if chord.code == Key::Esc && (self.menu.take().is_some() || self.linear.menu.take().is_some()) {
+        if chord.code == Key::Esc && (self.menu.take().is_some() | self.flow_ui.close_menus()) {
             cx.notify();
             return true;
         }
@@ -463,12 +463,7 @@ impl AddProjectView {
         };
         // A picker's button toggles its menu; anything else closes it.
         self.menu = menu.filter(|m| self.menu != Some(*m));
-        let pick = match action {
-            Action::Menu(Focus::LinearTeam) => Some(Pick::Team),
-            Action::Menu(Focus::LinearFilter(f)) => Some(Pick::Filter(f)),
-            _ => None,
-        };
-        self.linear.menu = pick.filter(|p| self.linear.menu != Some(*p));
+        self.flow_ui.close_menus();
         match action {
             Action::Stay | Action::Menu(_) => {}
             Action::Browse => self.browse(window, cx),
@@ -476,7 +471,6 @@ impl AddProjectView {
                 window.remove_window();
                 return;
             }
-            Action::Preflight(repo) => self.preflight(repo, window, cx),
             Action::Create(request) => self.create(*request, window, cx),
             Action::Open(created) => self.open(created.slug, window, cx),
         }
@@ -487,25 +481,76 @@ impl AddProjectView {
     /// keyboard there, start a due check, repaint.
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.wizard.settle_focus();
-        self.sync_repo(window, cx);
-        let key = self.wizard.issues().linear().key_input().to_string();
-        self.linear.sync_key(&key, window, cx);
-        self.sync_focus(window, cx);
+        let key = self.wizard.flow().linear().key_input().to_string();
+        self.flow_ui.linear_ui.sync_key(&key, window, cx);
+        // Reaching Add API key puts the keyboard in its field.
+        let step = self.wizard.flow().step();
+        let reached_key = step != self.shown && self.wizard.screen() == Screen::Issues && key_step(self.wizard.flow());
+        if step != self.shown {
+            self.shown = step;
+            self.flow_ui.close_menus();
+        }
+        if reached_key {
+            let focus = self.flow_ui.linear_ui.key_input.read(cx).focus_handle(cx);
+            window.focus(&focus, cx);
+        } else {
+            self.sync_focus(window, cx);
+        }
         self.run_checks(window, cx);
-        self.run_linear(window, cx);
+        self.run_flow(window, cx);
         cx.notify();
     }
 
-    /// Run every Linear read the wizard has due off the UI thread, each
-    /// answer back to the wizard (which drops one for a pick since changed).
-    fn run_linear(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        while let Some(request) = self.wizard.linear_due() {
-            let linear = self.engine.linear.clone();
-            let task = cx.background_executor().spawn(async move { linear(request) });
+    /// The Add API key field has the keyboard.
+    fn in_key_field(&self, window: &Window, cx: &App) -> bool {
+        self.wizard.screen() == Screen::Issues
+            && key_step(self.wizard.flow())
+            && self.flow_ui.linear_ui.key_input.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    /// Run every read the Issues screen's flow has due off the UI thread,
+    /// each answer back to the wizard (which drops one for a pick since
+    /// changed), and the Connected chooser's beat.
+    fn run_flow(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        while let Some(request) = self.wizard.flow_due() {
+            match request {
+                FlowRequest::Linear(request) => {
+                    let linear = self.engine.linear.clone();
+                    let task = cx.background_executor().spawn(async move { linear(request) });
+                    cx.spawn_in(window, async move |this, cx| {
+                        let answer = task.await;
+                        this.update_in(cx, |this, window, cx| {
+                            this.wizard.linear_answer(answer);
+                            this.after_change(window, cx);
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+                FlowRequest::Github(request) => {
+                    let github = self.engine.github.clone();
+                    let task = cx.background_executor().spawn(async move { github(request) });
+                    cx.spawn_in(window, async move |this, cx| {
+                        let answer = task.await;
+                        this.update_in(cx, |this, window, cx| {
+                            this.wizard.github_answer(answer);
+                            this.after_change(window, cx);
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+                // A new project's flow ends at the agent rules: nothing to
+                // preview, count, move or connect.
+                other => tracing::warn!(?other, "the new-project flow asked for an import step"),
+            }
+        }
+        if let Some(token) = self.wizard.beat_due() {
+            let timer = cx.background_executor().timer(std::time::Duration::from_millis(copy::CONNECTED_BEAT_MS));
             cx.spawn_in(window, async move |this, cx| {
-                let answer = task.await;
+                timer.await;
                 this.update_in(cx, |this, window, cx| {
-                    this.wizard.linear_answer(answer);
+                    this.wizard.beat_done(token);
                     this.after_change(window, cx);
                 })
                 .ok();
@@ -521,8 +566,8 @@ impl AddProjectView {
         let handle = match self.wizard.focus() {
             Focus::Path => self.path_input.read(cx).focus_handle(cx),
             Focus::Name => self.name_input.read(cx).focus_handle(cx),
-            Focus::Repo => self.repo_input.read(cx).focus_handle(cx),
-            Focus::LinearKey => self.linear.key_input.read(cx).focus_handle(cx),
+            // Add API key's field keeps the keyboard until Tab moves it.
+            _ if self.in_key_field(window, cx) && !self.keyboard => return,
             _ => self.focus.clone(),
         };
         if !handle.is_focused(window) {
@@ -558,37 +603,6 @@ impl AddProjectView {
             .ok();
         })
         .detach();
-    }
-
-    /// The Issues screen's Continue on GitHub: the `gh` preflight off the UI
-    /// thread, its answer back to the wizard (which moves on when it passed).
-    fn preflight(&mut self, repo: String, window: &mut Window, cx: &mut Context<Self>) {
-        let check = self.engine.preflight.clone();
-        let task = cx.background_executor().spawn({
-            let repo = repo.clone();
-            async move { check(&repo) }
-        });
-        cx.spawn_in(window, async move |this, cx| {
-            let result = task.await;
-            this.update_in(cx, |this, window, cx| {
-                match result {
-                    Ok(()) => this.wizard.preflight_passed(&repo),
-                    Err(why) => this.wizard.preflight_failed(&repo, why),
-                }
-                this.after_change(window, cx);
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// The seeded repo field shows the wizard's repo (a new folder's GitHub
-    /// origin) when they differ.
-    fn sync_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let repo = self.wizard.issues().repo().to_string();
-        if self.repo_input.read(cx).value() != repo.as_str() {
-            self.repo_input.update(cx, |s, cx| s.set_value(repo, window, cx));
-        }
     }
 
     /// Browse: the native folder picker. A cancel keeps the folder there
@@ -776,42 +790,6 @@ impl AddProjectView {
         cx.notify();
     }
 
-    /// A click in the Linear card's fields.
-    pub(crate) fn linear_msg(&mut self, msg: linear_fields::Msg, window: &mut Window, cx: &mut Context<Self>) {
-        use linear_fields::Msg;
-        match msg {
-            Msg::Verify => {
-                self.wizard.set_focus(Focus::LinearKey);
-                self.wizard.verify_linear_key();
-            }
-            Msg::ChangeKey => {
-                self.wizard.change_linear_key();
-                self.wizard.set_focus(Focus::LinearKey);
-            }
-            Msg::CancelChangeKey => self.wizard.cancel_linear_key(),
-            Msg::Retry => self.wizard.retry_linear(),
-            Msg::Team(team) => self.wizard.select_linear_team(&team),
-            Msg::Filter(filter, value) => self.wizard.select_linear_filter(filter, Some(&value)),
-        }
-        self.after_change(window, cx);
-    }
-
-    /// A Linear picker's button (`Some`) or a press outside its menu.
-    fn linear_menu(&mut self, pick: Option<Pick>, cx: &mut Context<Self>) {
-        match pick {
-            Some(p) => {
-                self.wizard.set_focus(match p {
-                    Pick::Team => Focus::LinearTeam,
-                    Pick::Filter(f) => Focus::LinearFilter(f),
-                });
-                self.menu = None;
-                self.linear.toggle(p);
-            }
-            None => self.linear.menu = None,
-        }
-        cx.notify();
-    }
-
     /// The Agent defaults screen: Default Harness and Default model over a
     /// 620pt column, and why Continue was refused.
     fn defaults(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Div {
@@ -891,18 +869,15 @@ impl AddProjectView {
         } else {
             style::disabled_button("add-project-back", "Back", ButtonKind::Secondary, ButtonSize::Base, theme)
         };
-        let label = match screen {
-            Screen::Folder | Screen::Defaults | Screen::Issues => "Continue",
-            _ => "Create Project",
+        // The Issues screen's button is its flow's (Continue, or Checking…
+        // while the choice's preflight runs).
+        let label: SharedString = match screen {
+            Screen::Issues => self.wizard.flow().primary_label().unwrap_or_else(|| copy::CONTINUE.to_string()).into(),
+            Screen::Folder | Screen::Defaults => "Continue".into(),
+            _ => "Create Project".into(),
         };
-        let pending = self.wizard.preflighting().then(|| {
-            div()
-                .debug_selector(|| "add-project-preflight".into())
-                .flex_none()
-                .child(spinner::spinner_sized("add-project-preflight", theme.progress, 16.0))
-        });
         let primary = if self.wizard.primary_enabled() {
-            style::button("add-project-primary", label, ButtonKind::Primary, ButtonSize::Base, self.ring(Focus::Primary, window), theme)
+            style::button("add-project-primary", label.clone(), ButtonKind::Primary, ButtonSize::Base, self.ring(Focus::Primary, window), theme)
                 .on_click(cx.listener(|this, _, window, cx| this.click(Focus::Primary, window, cx)))
         } else {
             style::disabled_button("add-project-primary", label, ButtonKind::Primary, ButtonSize::Base, theme)
@@ -922,7 +897,6 @@ impl AddProjectView {
                     .child(wiz::step_label(screen)),
             )
             .child(div().flex_1())
-            .children(pending)
             .child(back)
             .child(primary)
     }
@@ -1077,115 +1051,6 @@ impl AddProjectView {
             .children(git_init_row)
     }
 
-    /// One of the Issues screen's cards.
-    fn tracker_card(&self, tracker: Tracker, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
-        let (id, title, body) = match tracker {
-            Tracker::Github => ("add-project-card-github", np::GITHUB_TITLE, np::GITHUB_BODY),
-            Tracker::Linear => ("add-project-card-linear", tracker.title(), tracker.body()),
-            Tracker::FileSystem => ("add-project-card-file-system", np::FILE_SYSTEM_TITLE, np::FILE_SYSTEM_BODY),
-        };
-        let selected = self.wizard.issues().tracker() == tracker;
-        let ring = self.ring(Focus::Tracker(tracker), window);
-        // With Linear chosen its fields need the room: the cards draw as
-        // one line each (the radio and the title).
-        let card = if self.wizard.issues().tracker() == Tracker::Linear {
-            compact_card(id, title, selected, ring, theme)
-        } else {
-            choice_card(id, title, body, None, selected, ring, theme)
-        };
-        card.on_click(cx.listener(move |this, _, window, cx| this.click(Focus::Tracker(tracker), window, cx)))
-    }
-
-    /// The Issues screen: the two cards, then (on GitHub) the repo field,
-    /// and why the last preflight failed or what a GitHub board writes.
-    fn issues(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let issues = self.wizard.issues();
-        let repo = (issues.tracker() == Tracker::Github).then(|| {
-            let focused = self.repo_input.read(cx).focus_handle(cx).is_focused(window);
-            let field = controls::textbox(
-                div().flex_1().min_w_0().child(
-                    Input::new(&self.repo_input)
-                        .appearance(false)
-                        .h_full()
-                        .px_0()
-                        .type_style(Type::Base)
-                        .text_color(theme.form_text),
-                ),
-                focused,
-                theme,
-            )
-            .debug_selector(|| "add-project-repo".into())
-            .flex_1();
-            let note = match (issues.error(), issues.verified()) {
-                (Some(why), _) => Some((why.to_string(), theme.error)),
-                (None, true) => Some((np::GITHUB_DISCLOSURE.to_string(), theme.muted)),
-                (None, false) => None,
-            };
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .w_full()
-                .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child(np::GITHUB_REPO_LABEL))
-                .child(div().flex().w_full().child(field))
-                .children(note.map(|(text, color)| {
-                    div()
-                        .debug_selector(|| "add-project-repo-note".into())
-                        .type_style(Type::Small)
-                        .text_color(color)
-                        .child(text)
-                }))
-        });
-        let linear = (issues.tracker() == Tracker::Linear).then(|| {
-            let ring = linear_fields::Ring {
-                team: self.ring(Focus::LinearTeam, window),
-                filter: Filter::ALL.into_iter().find(|f| self.ring(Focus::LinearFilter(*f), window)),
-            };
-            let choice = issues.linear();
-            let error = choice
-                .error()
-                .map(|e| error_line("add-project-linear-error".into(), e, theme));
-            let passed = choice.summary().map(|s| {
-                div()
-                    .debug_selector(|| "add-project-linear-passed".into())
-                    .type_style(Type::Small)
-                    .text_color(theme.muted)
-                    .child(format!("Verified: {s}"))
-            });
-            linear_fields::fields(
-                linear_fields::Host::AddProject,
-                choice,
-                &self.linear,
-                ring,
-                !choice.preflighting(),
-                linear_fields::Handlers {
-                    msg: |this: &mut Self, msg, window, cx| this.linear_msg(msg, window, cx),
-                    menu: |this: &mut Self, pick, cx| this.linear_menu(pick, cx),
-                },
-                theme,
-                window,
-                cx,
-            )
-            .pt(px(4.0))
-            .children(error)
-            .children(passed)
-        });
-        let cards = Tracker::ALL.map(|t| self.tracker_card(t, window, theme, cx));
-        let cards = if issues.tracker() == Tracker::Linear {
-            div().flex().flex_row().gap(px(12.0)).w_full().children(cards)
-        } else {
-            div().flex().flex_col().gap(px(16.0)).w_full().children(cards)
-        };
-        div()
-            .flex()
-            .flex_col()
-            .gap(px(16.0))
-            .w_full()
-            .child(cards)
-            .children(repo)
-            .children(linear)
-    }
-
     /// One of screen 02's cards.
     fn card(&self, mode: ConfigMode, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
         let (id, title, body) = match mode {
@@ -1199,7 +1064,7 @@ impl AddProjectView {
     }
 }
 
-/// A card to choose (screen 02's locations, the Issues screen's boards): its
+/// A card to choose (screen 02's locations): its
 /// radio, title, description and (`detail`) a muted line under them.
 fn choice_card(
     id: &'static str,
@@ -1249,35 +1114,6 @@ fn choice_card(
                         .child(path)
                 })),
         )
-}
-
-/// A board's card on one line (the Issues screen while Linear is chosen):
-/// its radio and title.
-fn compact_card(id: &'static str, title: &'static str, selected: bool, ring: bool, theme: &Theme) -> Stateful<Div> {
-    div()
-        .id(id)
-        .debug_selector(move || id.into())
-        .relative()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(12.0))
-        .flex_1()
-        .min_w_0()
-        .px(px(16.0))
-        .py(px(12.0))
-        .rounded(px(10.0))
-        .border_1()
-        .cursor_pointer()
-        .when(selected, |d| d.bg(theme.primary_fill).border_color(theme.focus_ring))
-        .when(!selected, |d| {
-            d.bg(theme.toolbar)
-                .border_color(theme.divider)
-                .hover(|s| s.bg(theme.background_hover))
-        })
-        .when(ring, |d| d.children(style::focus_bands_past(10.0, 1.0, theme)))
-        .child(radio(selected, theme))
-        .child(div().type_style(Type::BaseSemibold).text_color(theme.text_loud).truncate().child(title))
 }
 
 /// One of screen 04's cards: the workflow's name (and Default badge), what
@@ -1489,15 +1325,48 @@ pub(crate) fn radio(on: bool, theme: &Theme) -> Div {
         .child(ring)
 }
 
+impl FlowHost for AddProjectView {
+    fn flow(&self) -> &TrackerFlow {
+        self.wizard.flow()
+    }
+
+    fn flow_mut(&mut self) -> &mut TrackerFlow {
+        self.wizard.flow_mut()
+    }
+
+    fn flow_ui(&self) -> &FlowUi {
+        &self.flow_ui
+    }
+
+    fn flow_ui_mut(&mut self) -> &mut FlowUi {
+        &mut self.flow_ui
+    }
+
+    fn flow_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.wizard.flow_changed();
+        self.after_change(window, cx);
+    }
+
+    fn ring(&self, tracker: Tracker) -> bool {
+        self.keyboard && self.wizard.focus() == Focus::Tracker(tracker)
+    }
+}
+
 impl Render for AddProjectView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let screen = self.wizard.screen();
+        // The Issues screen's heading is its flow step's (the wizard's own
+        // on the chooser).
+        let title: SharedString = match screen {
+            Screen::Issues => self.wizard.flow().heading().into(),
+            _ => screen.title().into(),
+        };
         // Screen 03 has its title alone.
         let intro = match screen {
             Screen::Folder => Some(wiz::FOLDER_INTRO.to_string()),
             Screen::Defaults => Some(wiz::DEFAULTS_INTRO.to_string()),
-            Screen::Issues => Some(np::ISSUES_INTRO.to_string()),
+            Screen::Issues => Some(self.wizard.flow().subheading()),
             Screen::Settings => Some(wiz::SETTINGS_INTRO.to_string()),
             Screen::Creating => None,
             Screen::Created => Some(wiz::CREATED_INTRO.to_string()),
@@ -1513,18 +1382,30 @@ impl Render for AddProjectView {
         let details = match screen {
             Screen::Folder => details.child(self.folder_box(window, &theme, cx)),
             Screen::Defaults => details.child(self.defaults(window, &theme, cx)),
-            // Linear's fields run past the window's height: the screen
-            // scrolls, from the top.
-            Screen::Issues if self.wizard.issues().tracker() == Tracker::Linear => details.justify_start().child(
+            // Connect to an issue tracker's screens, laid out as its window
+            // lays them out (the same size as this one).
+            Screen::Issues => {
+                let centered = steps::centered(self.wizard.flow().step());
+                let error = self.wizard.flow().error().map(|e| {
+                    div()
+                        .debug_selector(|| "tracker-error".into())
+                        .type_style(Type::Small)
+                        .text_color(theme.error)
+                        .child(e)
+                });
                 div()
-                    .id("add-project-issues-scroll")
+                    .debug_selector(|| "add-project-issues".into())
+                    .flex()
+                    .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .w_full()
-                    .overflow_y_scroll()
-                    .child(self.issues(window, &theme, cx).pb(px(8.0))),
-            ),
-            Screen::Issues => details.child(self.issues(window, &theme, cx)),
+                    .when(centered, |d| d.justify_center())
+                    .when(!centered, |d| d.pt(px(CONTENT_TOP)))
+                    .gap(px(16.0))
+                    .w(px(CONTENT_W))
+                    .children(steps::content(self, &theme, window, cx))
+                    .children(error)
+            }
             Screen::Settings => details
                 .child(self.card(ConfigMode::InRepo, window, &theme, cx))
                 .child(self.card(ConfigMode::Global, window, &theme, cx))
@@ -1589,7 +1470,7 @@ impl Render for AddProjectView {
                             .debug_selector(|| "add-project-title".into())
                             .type_style(Type::Title)
                             .text_color(theme.text_loud)
-                            .child(screen.title()),
+                            .child(title),
                     )
                     .children(intro.map(|intro| {
                         div()
@@ -1706,12 +1587,14 @@ mod tests {
                     create(request, cwd, out)
                 }
             }),
-            preflight: Arc::new(|repo| if repo == "acme/ok" { Ok(()) } else { Err("gh is not signed in".into()) }),
-            linear: Arc::new(|_| {
-                shelbi_app::linear_setup::LinearAnswer::Teams(Err(shelbi_app::linear_setup::LinearFailure::Other(
-                    "offline".into(),
-                )))
+            // `gh` signed in; the preflight passes for acme/app only.
+            github: Arc::new(|req| match req {
+                GithubRequest::Preflight { repo } if repo != "acme/app" => {
+                    GithubAnswer::Preflight { repo, result: Err("gh is not signed in".into()) }
+                }
+                other => shelbi_app::github_setup::fixture::answer(other),
             }),
+            linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
         };
         let on_created: OnCreated = Rc::new({
             let (opened, open_fails) = (opened.clone(), open_fails.clone());
@@ -1786,6 +1669,16 @@ mod tests {
 
         fn drawn(&mut self, selector: &'static str) -> bool {
             self.cx.debug_bounds(selector).is_some()
+        }
+
+        fn flow<R>(&mut self, f: impl FnOnce(&TrackerFlow) -> R) -> R {
+            self.view.read_with(&self.cx, |v, _| f(v.wizard().flow()))
+        }
+
+        /// Run out the Connected chooser's beat.
+        fn beat(&mut self) {
+            self.cx.executor().advance_clock(std::time::Duration::from_millis(copy::CONNECTED_BEAT_MS + 100));
+            self.cx.run_until_parked();
         }
 
         fn window_open(&mut self) -> bool {
@@ -1865,8 +1758,8 @@ mod tests {
         );
         r.click("add-project-primary");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Issues);
-        assert!(r.drawn("add-project-card-github") && r.drawn("add-project-card-file-system"));
-        assert!(!r.drawn("add-project-repo"), "no GitHub origin: the file system, no repo field");
+        assert!(r.drawn("tracker-card-github") && r.drawn("tracker-card-local"));
+        // No GitHub origin: Continue goes on with the file system.
         r.click("add-project-primary");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
         assert!(r.drawn("add-project-recommendation"));
@@ -2229,13 +2122,12 @@ mod tests {
         assert_eq!(r.wizard(|w| w.screen()), Screen::Issues, "Return continues");
         assert_eq!(r.wizard(|w| w.focus()), Focus::Tracker(Tracker::FileSystem));
         r.keys("up");
-        assert_eq!(r.wizard(|w| w.issues().tracker()), Tracker::Linear, "an arrow moves the board");
+        assert_eq!(r.wizard(|w| w.focus()), Focus::Tracker(Tracker::Linear), "an arrow moves between the rows");
         r.keys("up");
-        assert_eq!(r.wizard(|w| w.issues().tracker()), Tracker::Github);
         assert_eq!(r.wizard(|w| w.focus()), Focus::Tracker(Tracker::Github));
         r.keys("down");
         r.keys("down");
-        assert_eq!(r.wizard(|w| w.issues().tracker()), Tracker::FileSystem);
+        assert_eq!(r.wizard(|w| w.focus()), Focus::Tracker(Tracker::FileSystem));
         r.keys("enter");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
         assert_eq!(r.wizard(|w| w.focus()), Focus::Card(ConfigMode::Global));
@@ -2271,88 +2163,134 @@ mod tests {
     }
 
     #[gpui::test]
-    fn github_issues_wait_for_the_preflight_and_show_its_fix(cx: &mut TestAppContext) {
+    fn the_issues_step_draws_the_connect_flows_chooser(cx: &mut TestAppContext) {
         let mut r = rig(cx, Origin::Workspace, Ok("repo".into()));
         r.pick(Some("/repo"));
         r.keys("enter enter");
-        r.click("add-project-card-github");
-        assert!(r.drawn("add-project-repo"), "GitHub shows its repo field");
-        let view = r.view.clone();
-        let set = |r: &mut Rig, repo: &str| {
-            let repo = repo.to_string();
-            r.cx.update(|window, cx| {
-                view.update(cx, |v, cx| {
-                    v.repo_input.update(cx, |s, cx| s.set_value(repo, window, cx));
-                    let text = v.repo_input.read(cx).value().to_string();
-                    v.wizard.set_repo(text);
-                    v.after_change(window, cx);
-                })
-            });
-            r.cx.run_until_parked();
-        };
-        set(&mut r, "acme/nope");
-        r.click("add-project-primary");
-        assert_eq!(r.wizard(|w| w.screen()), Screen::Issues, "a failed preflight stays");
-        assert!(r.drawn("add-project-repo-note"), "with its fix");
-        set(&mut r, "acme/ok");
-        r.click("add-project-primary");
-        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings, "a passed one moves on");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Issues);
+        for drawn in [
+            "tracker-card-github",
+            "tracker-connect-github",
+            "tracker-card-linear",
+            "tracker-connect-linear",
+            "tracker-card-local",
+            "tracker-connect-local",
+            "add-project-back",
+            "add-project-primary",
+            "add-project-step",
+        ] {
+            assert!(r.drawn(drawn), "{drawn}");
+        }
+        assert!(!r.drawn("add-project-card-github"), "no radio cards");
+        assert_eq!(wiz::step_label(r.wizard(|w| w.screen())), "Step 3 of 4");
+        // The chooser's Back is step 2's.
+        r.click("add-project-back");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Defaults);
+        r.keys("enter");
+        // File system's Use needs no sub-screens.
+        r.click("tracker-connect-local");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
         r.keys("enter");
         let created = r.created.lock().unwrap().clone();
-        assert_eq!(created[0].plan.issue_tracker.github.as_ref().map(|g| g.repo.as_str()), Some("acme/ok"));
+        assert_eq!(created[0].plan.issue_tracker, shelbi_core::IssueTrackerConfig::default());
     }
 
     #[gpui::test]
-    fn linear_pastes_a_key_picks_a_team_and_filters_and_creates_with_them(cx: &mut TestAppContext) {
+    fn github_connects_chooses_a_repo_runs_the_preflight_and_asks_the_rules(cx: &mut TestAppContext) {
+        let mut r = rig(cx, Origin::Workspace, Ok("repo".into()));
+        r.pick(Some("/repo"));
+        r.keys("enter enter");
+        r.click("tracker-connect-github");
+        assert!(r.drawn("tracker-card-github-connected"), "the gh sign-in passed: Connected");
+        r.beat();
+        assert_eq!(r.flow(|f| f.step()), FlowStep::ChooseProject);
+        assert!(r.drawn("tracker-github-account") && r.drawn("tracker-only-project"));
+        assert_eq!(wiz::step_label(r.wizard(|w| w.screen())), "Step 3 of 4", "still step 3");
+
+        // A repo the preflight refuses stays, with why.
+        r.click("tracker-github-owner");
+        r.click("tracker-github-owner-1");
+        r.click("tracker-github-repo");
+        r.click("tracker-github-repo-1");
+        assert_eq!(r.flow(|f| f.repo().to_string()), "acme/site");
+        r.click("add-project-primary");
+        assert_eq!(r.flow(|f| f.step()), FlowStep::ChooseProject, "a failed preflight stays");
+        assert!(r.drawn("tracker-error"));
+        r.click("tracker-github-repo");
+        r.click("tracker-github-repo-0");
+        r.click("add-project-primary");
+        assert_eq!(r.flow(|f| f.step()), FlowStep::AgentRules, "a passed one moves on");
+        assert!(r.drawn("tracker-rule-review-off") && r.drawn("tracker-rule-assigned-on"), "today's rules");
+        r.click("tracker-rule-review");
+
+        // Back walks the sub-screens, keeping the answers.
+        r.click("add-project-back");
+        assert_eq!(r.flow(|f| (f.step(), f.repo().to_string())), (FlowStep::ChooseProject, "acme/app".into()));
+        r.click("add-project-back");
+        assert_eq!(r.flow(|f| f.step()), FlowStep::Chooser);
+        assert!(r.drawn("tracker-card-github-connected"));
+        r.click("add-project-primary");
+        r.click("add-project-primary");
+        assert!(r.drawn("tracker-rule-review-on"), "the rule kept");
+        r.click("add-project-primary");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
+        r.keys("enter");
+        let created = r.created.lock().unwrap().clone();
+        let cfg = &created[0].plan.issue_tracker;
+        assert_eq!(cfg.github.as_ref().map(|g| g.repo.as_str()), Some("acme/app"));
+        assert_eq!(cfg.agent_rules, shelbi_core::AgentRules { require_review: true, assigned_only: true });
+    }
+
+    #[gpui::test]
+    fn linear_asks_for_a_key_then_its_team_and_creates_with_them(cx: &mut TestAppContext) {
         use shelbi_app::linear_setup::fixture;
         let mut r = rig(cx, Origin::Workspace, Ok("repo".into()));
         let view = r.view.clone();
         view.update(&mut r.cx, |v, _| v.engine.linear = Arc::new(fixture::no_key));
         r.pick(Some("/repo"));
         r.keys("enter enter");
-        r.click("add-project-card-linear");
-        assert_eq!(r.wizard(|w| w.issues().tracker()), Tracker::Linear);
-        // No key on this machine: the paste-and-verify field.
-        assert!(r.drawn("add-project-linear-key") && r.drawn("add-project-linear-verify"));
-        assert!(!r.drawn("add-project-linear-project"), "no filters before a team");
-        r.click("add-project-linear-verify");
-        assert_eq!(r.wizard(|w| w.issues().error().map(str::to_string)).as_deref(), Some(shelbi_app::linear_setup::KEY_EMPTY));
+        r.click("tracker-connect-linear");
+        assert_eq!(r.flow(|f| (f.step(), f.heading())), (FlowStep::Authorize, copy::API_KEY_HEADING.to_string()));
+        assert!(r.drawn("tracker-key-input") && r.drawn("tracker-key-verify") && r.drawn("tracker-key-help"));
+        assert!(r.wizard(|w| w.back_enabled()));
 
-        // A pasted key logs in; the teams load with it.
-        let input = view.read_with(&r.cx, |v, _| v.linear.key_input.clone());
+        // A pasted key verifies; then Continue.
+        let input = view.read_with(&r.cx, |v, _| v.flow_ui.linear_ui.key_input.clone());
         // A programmatic set sends no Change: hand the text over as the
         // field's subscription does.
         r.cx.update(|window, cx| {
             input.update(cx, |s, cx| s.set_value("lin_api_test".to_string(), window, cx));
             view.update(cx, |v, cx| {
-                v.wizard.set_linear_key("lin_api_test");
+                v.wizard.flow_mut().linear_mut().set_key_input("lin_api_test");
                 v.after_change(window, cx);
             })
         });
-        r.cx.run_until_parked();
-        assert_eq!(r.wizard(|w| w.issues().linear().key_input().to_string()), "lin_api_test");
-        // Once the key is stored, Linear answers with it.
         view.update(&mut r.cx, |v, _| v.engine.linear = Arc::new(fixture::answer));
-        r.click("add-project-linear-verify");
-        assert!(r.drawn("add-project-linear-account") && !r.drawn("add-project-linear-key"));
-        assert_eq!(view.read_with(&r.cx, |v, cx| v.linear.key_input.read(cx).value().to_string()), "", "the key isn't kept");
+        r.click("tracker-key-verify");
+        assert!(r.drawn("tracker-key-verified"));
+        r.keys("enter");
+        assert_eq!(r.flow(|f| f.step()), FlowStep::Chooser);
+        assert!(r.drawn("tracker-card-linear-connected"));
+        r.beat();
+        assert_eq!(r.flow(|f| f.heading()), "Choose your Linear project");
+        assert!(r.drawn("tracker-connect-linear-workspace"));
 
-        // Continue without a team says so; the team's menu, then a filter.
-        r.click("add-project-primary");
-        assert!(r.drawn("add-project-linear-error"));
-        r.click("add-project-linear-team");
-        assert!(r.drawn("add-project-linear-team-menu"));
-        r.click("add-project-linear-team-0");
-        assert_eq!(r.wizard(|w| w.issues().linear().team().to_string()), "ENG");
-        r.click("add-project-linear-label");
-        r.click("add-project-linear-label-1");
-        assert!(r.drawn("add-project-linear-scope"));
-        r.click("add-project-primary");
-        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings, "the preflight passed");
+        // The team is required.
+        r.keys("enter");
+        assert!(r.drawn("tracker-error"));
+        r.click("tracker-connect-linear-team");
+        r.click("tracker-connect-linear-team-0");
+        r.click("tracker-connect-linear-project");
+        r.click("tracker-connect-linear-project-1");
+        r.keys("enter");
+        assert_eq!(r.flow(|f| f.step()), FlowStep::AgentRules, "the preflight passed");
+        assert_eq!(r.flow(|f| f.heading()), "How should agents handle issues created in Linear?");
+        r.keys("enter");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Settings);
         r.keys("enter");
         let created = r.created.lock().unwrap().clone();
         let linear = created[0].plan.issue_tracker.linear.clone().unwrap();
-        assert_eq!((linear.team.as_str(), linear.label.as_deref()), ("ENG", Some("shelbi")));
+        assert_eq!((linear.team.as_str(), linear.project.as_deref()), ("ENG", Some("Shelbi")));
         assert!(created[0].plan.issue_tracker.github.is_none(), "one external tracker");
     }
 

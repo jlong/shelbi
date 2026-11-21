@@ -6,7 +6,9 @@
 //! Project wizard; one per project (asking again brings it to the front).
 //!
 //! [`TrackerFlow`] (shared, toolkit-free) holds the steps and decides what
-//! each button does; this view paints it, takes the keys, and runs what the
+//! each button does; this view paints it (the steps through the agent rules
+//! with [`super::tracker_steps`], which the Add Project wizard's Issues step
+//! paints too), takes the keys, and runs what the
 //! flow asks for off the UI thread through the project's
 //! [`TrackerService`]: this machine's, or the far daemon's
 //! (`far::Request::ConnectTracker` / `Linear`) for a project on another
@@ -107,29 +109,23 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, AnyWindowHandle, App, ClickEvent, ClipboardItem, Context, Div, FocusHandle,
-    Focusable, Global, Role, Stateful, Subscription, Window, WindowHandle,
+    div, prelude::*, px, AnyWindowHandle, App, ClickEvent, Context, Div, FocusHandle, Focusable, Global, Role,
+    Stateful, Subscription, Window, WindowHandle,
 };
 use gpui_kit::component::input::InputEvent;
-use shelbi_app::github_setup::{self as gh, GithubAuth};
-use shelbi_app::linear_setup::{KeyState, Loadable, LOADING, VERIFY};
-use shelbi_app::new_project::Tracker;
 use shelbi_app::settings::tracker::TrackerService;
 use shelbi_app::source::ProjectHandle;
-use shelbi_app::tracker_connect::flow::{
-    self as copy, Action, Apply, Card, CardState, FlowRequest, Move, Preview, Secondary, Step, TrackerFlow,
-};
-use shelbi_app::tracker_connect::{import_copy, rules_copy, ImportWatch, StatusSync};
+use shelbi_app::tracker_connect::flow::{self as copy, Action, Apply, FlowRequest, Move, Preview, Secondary, Step, TrackerFlow};
+use shelbi_app::tracker_connect::{import_copy, ImportWatch, StatusSync};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
-use super::harness_picker::picker_button;
-use super::linear_fields::{self, LinearUi, Pick};
-use super::workflow_editor::dropdown;
+use super::tracker_steps::{
+    self as steps, error_line, key_step, labeled, quiet, rule_card, FlowHost, FlowUi, CONTENT_TOP, CONTENT_W,
+};
 use crate::app::{CloseWindow, ShelbiWindow};
 use crate::assets::{heroicon, icons};
-use crate::elements::terminal::metrics::PRIMARY_FAMILY as MONO_FAMILY;
 use crate::elements::progress_bar::progress_bar;
-use crate::elements::{controls, spinner};
+use crate::elements::spinner;
 use crate::keys::chord_from_keystroke;
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
@@ -138,60 +134,6 @@ use crate::theme::Theme;
 pub const SIZE: (f32, f32) = (800.0, 580.0);
 /// The window's title (the menu bar's Window list).
 pub const TITLE: &str = "Connect to Issue Tracker";
-/// The cards' and the steps' width inside the 48pt inset.
-const CONTENT_W: f32 = 704.0;
-/// The room between the subheading and a step's content (the frames' 76pt,
-/// less the column's 24pt gap).
-const CONTENT_TOP: f32 = 52.0;
-/// The Choose project step's pickers' width (the frames' 624pt, centered in
-/// the 704pt column), and the Add API key step's field with its Verify.
-const FIELDS_W: f32 = 624.0;
-/// How much lower the chooser's cards sit than the later steps' content
-/// (01-select-tracker: the first card at 198pt, without the old note).
-const CHOOSER_DROP: f32 = 17.0;
-/// The Add API key step's help line's width (its frame's 420pt).
-const KEY_HELP_W: f32 = 420.0;
-
-/// A GitHub picker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GithubPick {
-    Owner,
-    Repo,
-}
-
-impl GithubPick {
-    fn id(self) -> &'static str {
-        match self {
-            GithubPick::Owner => "tracker-github-owner",
-            GithubPick::Repo => "tracker-github-repo",
-        }
-    }
-
-    fn menu_id(self) -> &'static str {
-        match self {
-            GithubPick::Owner => "tracker-github-owner-menu",
-            GithubPick::Repo => "tracker-github-repo-menu",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            GithubPick::Owner => gh::OWNER_LABEL,
-            GithubPick::Repo => gh::REPO_LABEL,
-        }
-    }
-}
-
-/// What a click in the GitHub step asks for.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum GithubMsg {
-    Owner(String),
-    Repo(String),
-    ChangeAccount,
-    CancelChangeAccount,
-    Retry,
-}
-
 /// The open flows, by project: asking again raises the open one.
 #[derive(Default)]
 struct OpenFlows(HashMap<String, AnyWindowHandle>);
@@ -230,14 +172,11 @@ pub struct TrackerConnectView {
     focus: FocusHandle,
     /// Why the project's connection couldn't be read.
     load_error: Option<String>,
-    /// The Add API key step's key field, and the Linear step's open picker.
-    linear_ui: LinearUi,
+    /// The Add API key step's key field, and the open picker.
+    ui: FlowUi,
     /// The step the view last showed (to focus the key field on reaching
     /// Add API key).
     shown: Step,
-    /// The GitHub step's open picker, and where the open one hangs.
-    github_menu: Option<GithubPick>,
-    github_anchor: style::Anchor,
     /// The import's watch, observed until the project's board has it.
     import: Option<(gpui::Entity<ImportWatch>, Subscription)>,
     _subscriptions: Vec<Subscription>,
@@ -255,8 +194,8 @@ impl TrackerConnectView {
         window.focus(&focus, cx);
         let this_window = window.window_handle();
         let me = cx.weak_entity();
-        let linear_ui = LinearUi::with_placeholder(copy::API_KEY_PLACEHOLDER, window, cx);
-        let key_input = cx.subscribe_in(&linear_ui.key_input, window, |this, input, event: &InputEvent, _, cx| {
+        let ui = FlowUi::new(window, cx);
+        let key_input = cx.subscribe_in(&ui.linear_ui.key_input, window, |this, input, event: &InputEvent, _, cx| {
             if let InputEvent::Change = event {
                 let text = input.read(cx).value().to_string();
                 this.flow.linear_mut().set_key_input(text);
@@ -281,10 +220,8 @@ impl TrackerConnectView {
             from,
             focus,
             load_error: None,
-            linear_ui,
+            ui,
             shown: Step::Chooser,
-            github_menu: None,
-            github_anchor: Default::default(),
             import: None,
             _subscriptions: subscriptions,
         };
@@ -353,20 +290,11 @@ impl TrackerConnectView {
         }
         match chord.code {
             Key::Enter => self.primary(window, cx),
-            Key::Esc if self.linear_ui.menu.is_some() || self.github_menu.is_some() => {
-                self.linear_ui.menu = None;
-                self.github_menu = None;
-                cx.notify();
-            }
+            Key::Esc if self.ui.close_menus() => cx.notify(),
             Key::Esc => self.close(window),
             _ => return false,
         }
         true
-    }
-
-    /// The Add API key step shows.
-    fn key_step(&self) -> bool {
-        self.flow.step() == Step::Authorize && self.flow.tracker() == Some(Tracker::Linear)
     }
 
     /// After the choice changed: the key field shows the choice's text (and
@@ -374,70 +302,18 @@ impl TrackerConnectView {
     /// run.
     fn after_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let key = self.flow.linear().key_input().to_string();
-        self.linear_ui.sync_key(&key, window, cx);
+        self.ui.linear_ui.sync_key(&key, window, cx);
         if self.flow.step() != self.shown {
             self.shown = self.flow.step();
-            self.linear_ui.menu = None;
-            self.github_menu = None;
-            if self.key_step() {
-                let focus = self.linear_ui.key_input.read(cx).focus_handle(cx);
+            self.ui.close_menus();
+            if key_step(&self.flow) {
+                let focus = self.ui.linear_ui.key_input.read(cx).focus_handle(cx);
                 window.focus(&focus, cx);
             } else {
                 window.focus(&self.focus, cx);
             }
         }
         self.run_due(window, cx);
-        cx.notify();
-    }
-
-    /// A click in the Linear step's fields, or the Add API key step's.
-    fn linear_msg(&mut self, msg: linear_fields::Msg, window: &mut Window, cx: &mut Context<Self>) {
-        use linear_fields::Msg;
-        match msg {
-            Msg::Verify => {
-                self.flow.verify();
-            }
-            // Change account: the Add API key step.
-            Msg::ChangeKey => self.flow.change_account(),
-            Msg::CancelChangeKey => self.flow.linear_mut().cancel_change_key(),
-            Msg::Retry => self.flow.linear_mut().retry(),
-            Msg::Team(team) => self.flow.linear_mut().select_team(&team),
-            Msg::Filter(filter, value) => self.flow.linear_mut().select_filter(filter, Some(&value)),
-        }
-        self.after_change(window, cx);
-    }
-
-    fn linear_menu(&mut self, pick: Option<Pick>, cx: &mut Context<Self>) {
-        match pick {
-            Some(p) => self.linear_ui.toggle(p),
-            None => self.linear_ui.menu = None,
-        }
-        cx.notify();
-    }
-
-    /// A click in the GitHub step.
-    fn github_msg(&mut self, msg: GithubMsg, window: &mut Window, cx: &mut Context<Self>) {
-        self.github_menu = None;
-        let github = self.flow.github_mut();
-        match msg {
-            GithubMsg::Owner(owner) => github.select_owner(&owner),
-            GithubMsg::Repo(repo) => github.select_repo(&repo),
-            GithubMsg::ChangeAccount => github.change_account(),
-            GithubMsg::CancelChangeAccount => github.cancel_change_account(),
-            GithubMsg::Retry => github.retry(),
-        }
-        self.after_change(window, cx);
-    }
-
-    /// Flip an agent rule (a click on its card).
-    fn toggle_rule(&mut self, assigned_only: bool, cx: &mut Context<Self>) {
-        let mut rules = self.flow.rules();
-        if assigned_only {
-            rules.assigned_only = !rules.assigned_only;
-        } else {
-            rules.require_review = !rules.require_review;
-        }
-        self.flow.set_rules(rules);
         cx.notify();
     }
 
@@ -452,14 +328,6 @@ impl TrackerConnectView {
     fn retry_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.flow.retry_preview();
         self.run_due(window, cx);
-        cx.notify();
-    }
-
-    /// A card's Connect.
-    fn connect(&mut self, tracker: Tracker, window: &mut Window, cx: &mut Context<Self>) {
-        if self.flow.connect(tracker) {
-            self.after_change(window, cx);
-        }
         cx.notify();
     }
 
@@ -485,8 +353,7 @@ impl TrackerConnectView {
 
     /// The footer's left button.
     fn secondary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.linear_ui.menu = None;
-        self.github_menu = None;
+        self.ui.close_menus();
         match self.flow.secondary() {
             Some(Secondary::Back) => {
                 self.flow.back();
@@ -640,75 +507,26 @@ impl Focusable for TrackerConnectView {
     }
 }
 
-/// A tracker's mark.
-fn mark(tracker: Tracker) -> crate::assets::Icon {
-    match tracker {
-        Tracker::Linear => icons::LINEAR,
-        Tracker::Github | Tracker::FileSystem => icons::GITHUB,
+impl FlowHost for TrackerConnectView {
+    fn flow(&self) -> &TrackerFlow {
+        &self.flow
     }
-}
 
-/// A card's id (`tracker-card-github`) and its button's.
-fn card_id(tracker: Tracker) -> &'static str {
-    match tracker {
-        Tracker::Github => "tracker-card-github",
-        Tracker::Linear => "tracker-card-linear",
-        Tracker::FileSystem => "tracker-card-local",
+    fn flow_mut(&mut self) -> &mut TrackerFlow {
+        &mut self.flow
     }
-}
 
-fn button_id(tracker: Tracker) -> &'static str {
-    match tracker {
-        Tracker::Github => "tracker-connect-github",
-        Tracker::Linear => "tracker-connect-linear",
-        Tracker::FileSystem => "tracker-connect-local",
+    fn flow_ui(&self) -> &FlowUi {
+        &self.ui
     }
-}
 
-/// The green "Connected" badge in a card's button slot (02a-connected).
-fn connected_badge(tracker: Tracker, theme: &Theme) -> Div {
-    div()
-        .debug_selector(move || format!("{}-connected", card_id(tracker)))
-        .flex_none()
-        .px(px(8.0))
-        .py(px(2.0))
-        .rounded(px(6.0))
-        .bg(theme.green.opacity(0.16))
-        .type_style(Type::XSmall)
-        .text_color(theme.green)
-        .child(copy::CONNECTED)
-}
+    fn flow_ui_mut(&mut self) -> &mut FlowUi {
+        &mut self.ui
+    }
 
-/// An agent rule's setting card (04-agent-rules): its title over its help,
-/// and its switch at the right.
-fn rule_card(id: &'static str, title: String, help: impl Into<gpui::SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
-    div()
-        .id(id)
-        .debug_selector(move || id.into())
-        .role(Role::Switch)
-        .aria_label(title.clone())
-        .aria_toggled(if on { gpui::Toggled::True } else { gpui::Toggled::False })
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(16.0))
-        .w_full()
-        .px(px(16.0))
-        .py(px(16.0))
-        .rounded(px(12.0))
-        .bg(theme.toolbar)
-        .cursor_pointer()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .gap(px(8.0))
-                .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child(title))
-                .child(div().debug_selector(move || format!("{id}-help")).type_style(Type::Small).text_color(theme.muted).child(help.into())),
-        )
-        .child(controls::switch(on, theme).debug_selector(move || format!("{id}-{}", if on { "on" } else { "off" })))
+    fn flow_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.after_change(window, cx);
+    }
 }
 
 /// A line of the Importing step's checklist: a check (green) or a spinner.
@@ -729,438 +547,7 @@ fn progress_line(id: &'static str, done: bool, text: String, theme: &Theme) -> D
         .child(text)
 }
 
-/// The account line (`✓ Account connected · Change account`, in the accent).
-fn account_line(id: &'static str, theme: &Theme, cx: &mut Context<TrackerConnectView>, on_change: fn(&mut TrackerConnectView, &mut Window, &mut Context<TrackerConnectView>)) -> Div {
-    div()
-        .debug_selector(move || format!("{id}-account"))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(4.0))
-        .type_style(Type::Small)
-        .text_color(theme.link)
-        .child(format!("✓ {} ·", copy::ACCOUNT_CONNECTED))
-        .child(
-            super::about::link(format!("{id}-change-account"), copy::CHANGE_ACCOUNT, theme.link, theme)
-                .role(Role::Button)
-                .aria_label(copy::CHANGE_ACCOUNT)
-                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| on_change(this, window, cx))),
-        )
-}
-
-/// A quiet line (an account being checked).
-fn quiet(selector: &'static str, text: impl Into<gpui::SharedString>, theme: &Theme) -> Div {
-    div().debug_selector(move || selector.into()).type_style(Type::Small).text_color(theme.muted).child(text.into())
-}
-
-fn error_line(selector: &'static str, text: impl Into<gpui::SharedString>, theme: &Theme) -> Div {
-    div().debug_selector(move || selector.into()).type_style(Type::Small).text_color(theme.error).child(text.into())
-}
-
-/// A field: its label over its control, 8pt apart.
-fn labeled(label: &'static str, control: impl IntoElement, theme: &Theme) -> Div {
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(8.0))
-        .w_full()
-        .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child(label))
-        .child(control)
-}
-
 impl TrackerConnectView {
-    /// The Choose your GitHub project step: the account line (or how to
-    /// sign `gh` in), then Organization and Repository.
-    fn github_step(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let choice = self.flow.github();
-        let mut col = div().flex().flex_col().gap(px(16.0)).w(px(FIELDS_W));
-        if choice.needs_auth() {
-            return col.child(self.github_auth(theme, cx));
-        }
-        col = col.child(match (choice.auth(), choice.account()) {
-            (GithubAuth::Valid, Loadable::Loaded(_)) => account_line("tracker-github", theme, cx, |this, window, cx| {
-                this.github_msg(GithubMsg::ChangeAccount, window, cx)
-            }),
-            (_, Loadable::Failed(why)) => div()
-                .flex()
-                .flex_col()
-                .gap(px(8.0))
-                .child(error_line("tracker-github-account-error", format!("Couldn't read the GitHub account: {why}"), theme))
-                .child(self.github_retry(theme, cx)),
-            _ => quiet("tracker-github-checking", "Checking the GitHub account…", theme),
-        });
-
-        let owner_label = match choice.owners() {
-            Some(_) => choice.owner().to_string(),
-            None => LOADING.to_string(),
-        };
-        let owner = self.github_picker(GithubPick::Owner, choice.owners(), choice.owner(), owner_label, theme, cx);
-        let repos = choice.repos();
-        let repo_label = match (&repos, choice.repo()) {
-            (_, repo) if !repo.is_empty() => repo.to_string(),
-            (Loadable::Loaded(rows), _) if rows.is_empty() => gh::NO_REPOS.to_string(),
-            (Loadable::Loaded(_), _) => gh::CHOOSE_REPO.to_string(),
-            (Loadable::Failed(_), _) => "Couldn't load".to_string(),
-            _ => LOADING.to_string(),
-        };
-        let repo = self.github_picker(GithubPick::Repo, repos.loaded().cloned(), choice.repo(), repo_label, theme, cx);
-        col.child(labeled(gh::OWNER_LABEL, owner, theme))
-            .child(labeled(gh::REPO_LABEL, repo, theme).children(repos.error().map(|e| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(error_line("tracker-github-repo-error", e.to_string(), theme))
-                    .child(self.github_retry(theme, cx))
-            })))
-    }
-
-    fn github_retry(&self, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
-        style::button("tracker-github-retry", copy::RETRY, ButtonKind::Secondary, ButtonSize::Small, false, theme)
-            .role(Role::Button)
-            .aria_label(copy::RETRY)
-            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.github_msg(GithubMsg::Retry, window, cx)))
-    }
-
-    /// How to sign the project's machine's `gh` in (or in to another
-    /// account): why, the command with Copy, and Retry.
-    fn github_auth(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let choice = self.flow.github();
-        let message = choice.auth_message().unwrap_or(gh::NOT_SIGNED_IN);
-        let command = div()
-            .debug_selector(|| "tracker-github-auth-command".into())
-            .flex()
-            .flex_row()
-            .items_center()
-            .h(px(36.0))
-            .gap(px(8.0))
-            .pl(px(12.0))
-            .pr(px(4.0))
-            .rounded(px(6.0))
-            .border_1()
-            .border_color(theme.divider)
-            .bg(theme.code_bg)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .font_family(MONO_FAMILY)
-                    .text_size(px(14.0))
-                    .line_height(px(18.0))
-                    .text_color(theme.code_fg)
-                    .child(gh::AUTH_COMMAND),
-            )
-            .child(
-                style::button("tracker-github-copy", "Copy", ButtonKind::Secondary, ButtonSize::Small, false, theme)
-                    .role(Role::Button)
-                    .aria_label("Copy the command")
-                    .on_click(|_: &ClickEvent, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(gh::AUTH_COMMAND.into()))),
-            );
-        let cancel = choice.changing_account().then(|| {
-            style::button("tracker-github-cancel-change", "Cancel", ButtonKind::Secondary, ButtonSize::Small, false, theme)
-                .role(Role::Button)
-                .aria_label("Cancel")
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                    this.github_msg(GithubMsg::CancelChangeAccount, window, cx)
-                }))
-        });
-        div()
-            .debug_selector(|| "tracker-github-auth".into())
-            .flex()
-            .flex_col()
-            .gap(px(12.0))
-            .w_full()
-            .child(div().type_style(Type::Base).text_color(theme.foreground).child(message))
-            .child(command)
-            .child(div().flex().flex_row().gap(px(8.0)).child(self.github_retry(theme, cx)).children(cancel))
-    }
-
-    /// A GitHub picker: its button, and `rows` in a menu under it while
-    /// open. Greyed while there are no rows to pick.
-    fn github_picker(
-        &self,
-        pick: GithubPick,
-        rows: Option<Vec<String>>,
-        selected: &str,
-        label: String,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let id = pick.id();
-        let button = picker_button(id, label, None, false, theme).aria_label(pick.label());
-        let Some(rows) = rows.filter(|r| !r.is_empty()) else {
-            return div().w_full().child(button.opacity(0.4).cursor_default()).into_any_element();
-        };
-        let selected = selected.to_string();
-        dropdown(
-            self.github_menu == Some(pick),
-            &self.github_anchor,
-            pick.menu_id(),
-            button,
-            move |cx| {
-                let theme = *cx.global::<Theme>();
-                rows.into_iter()
-                    .enumerate()
-                    .map(|(i, row)| {
-                        let on_row = row == selected;
-                        let value = row.clone();
-                        style::menu_row(format!("{id}-{i}"), on_row, &theme)
-                            .child(div().flex_1().min_w_0().truncate().child(row))
-                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
-                                cx.stop_propagation();
-                                let msg = match pick {
-                                    GithubPick::Owner => GithubMsg::Owner(value.clone()),
-                                    GithubPick::Repo => GithubMsg::Repo(value.clone()),
-                                };
-                                this.github_msg(msg, window, cx);
-                            }))
-                            .into_any_element()
-                    })
-                    .collect()
-            },
-            FIELDS_W,
-            false,
-            move |this: &mut Self, cx| {
-                this.github_menu = if this.github_menu == Some(pick) { None } else { Some(pick) };
-                cx.notify();
-            },
-            |this: &mut Self, cx| {
-                this.github_menu = None;
-                cx.notify();
-            },
-            cx,
-        )
-        .w_full()
-        .into_any_element()
-    }
-
-    /// The Choose your Linear project step: the account line, then
-    /// Workspace, Team and Project. (No key field: Change account, or a key
-    /// that stops working, opens the Add API key step.)
-    fn linear_step(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let choice = self.flow.linear();
-        let col = div().flex().flex_col().gap(px(16.0)).w(px(FIELDS_W));
-        let on = linear_fields::Handlers {
-            msg: |this: &mut Self, msg, window, cx| this.linear_msg(msg, window, cx),
-            menu: |this: &mut Self, pick, cx| this.linear_menu(pick, cx),
-        };
-        let enabled = !self.flow.checking();
-        let account = match choice.key_state() {
-            KeyState::Valid { .. } => account_line("tracker-linear", theme, cx, |this, window, cx| {
-                this.linear_msg(linear_fields::Msg::ChangeKey, window, cx)
-            }),
-            _ => quiet("tracker-linear-checking", "Checking the Linear API key…", theme),
-        };
-        col.child(account)
-            .child(linear_fields::connect_fields(choice, &self.linear_ui, enabled, on, FIELDS_W, theme, cx))
-    }
-
-    /// The Add API key step (02b-linear-api-key): the key field with Verify,
-    /// 624pt together, why a key was refused under it (or whose it is once
-    /// verified), then where keys are made, with Open Linear.
-    fn api_key_step(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Div {
-        let choice = self.flow.linear();
-        let focused = self.linear_ui.key_input.read(cx).focus_handle(cx).is_focused(window);
-        let error = self.flow.key_error();
-        let field = div().flex_1().min_w_0().child(
-            gpui_kit::component::input::Input::new(&self.linear_ui.key_input)
-                .appearance(false)
-                .h_full()
-                .px_0()
-                .type_style(Type::Base)
-                .text_color(theme.form_text),
-        );
-        let input = if error.is_some() {
-            controls::invalid_textbox(field, focused, theme)
-        } else {
-            controls::textbox(field, focused, theme)
-        }
-        .debug_selector(|| "tracker-key-input".into())
-        .flex_1()
-        .min_w_0();
-        let verify = if choice.logging_in() {
-            style::disabled_button("tracker-key-verify", "Verifying…", ButtonKind::Secondary, ButtonSize::Base, theme)
-        } else {
-            style::button("tracker-key-verify", VERIFY, ButtonKind::Secondary, ButtonSize::Base, false, theme)
-                .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.linear_msg(linear_fields::Msg::Verify, window, cx)))
-        }
-        .role(Role::Button)
-        .aria_label(VERIFY);
-        let note = match (error, self.flow.verified_line()) {
-            (Some(why), _) => Some(error_line("tracker-key-error", why, theme)),
-            (None, Some(line)) => Some(
-                div()
-                    .debug_selector(|| "tracker-key-verified".into())
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .type_style(Type::Small)
-                    .text_color(theme.green)
-                    .child(heroicon(icons::CHECK).text_color(theme.green))
-                    .child(line),
-            ),
-            (None, None) => None,
-        };
-        // The help wraps where the frame's 420pt does: the path, then the
-        // last step and Open Linear on the next line.
-        let (path, last) = copy::API_KEY_HELP.rsplit_once(" → ").unwrap_or((copy::API_KEY_HELP, ""));
-        let link = div()
-            .id("tracker-linear-keys-link")
-            .debug_selector(|| "tracker-linear-keys-link".into())
-            .role(Role::Link)
-            .aria_label(copy::LINEAR_KEYS_LINK)
-            .cursor_pointer()
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.foreground)
-            .underline()
-            .hover(|s| s.text_color(theme.text_loud))
-            .child(copy::LINEAR_KEYS_LINK)
-            .on_click(|_: &ClickEvent, _, cx| super::about::open_url(copy::LINEAR_KEYS_URL, cx));
-        let help = div()
-            .debug_selector(|| "tracker-key-help".into())
-            .flex()
-            .flex_col()
-            .w(px(KEY_HELP_W))
-            .type_style(Type::Small)
-            .text_color(theme.muted)
-            .child(format!("{path} →"))
-            .child(div().flex().flex_row().gap(px(6.0)).child(last.to_string()).child(link));
-        div()
-            .debug_selector(|| "tracker-api-key".into())
-            .flex()
-            .flex_col()
-            .gap(px(8.0))
-            .w(px(FIELDS_W))
-            .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child(copy::API_KEY_LABEL))
-            .child(div().flex().flex_row().items_center().gap(px(8.0)).w_full().child(input).child(verify))
-            .children(note)
-            .child(help)
-    }
-
-    /// The Sign in to GitHub step: how to sign the GitHub CLI in, with
-    /// Retry, and who it's signed in as once it is.
-    fn github_auth_step(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let col = div().flex().flex_col().gap(px(16.0)).w(px(FIELDS_W));
-        if let Some(line) = self.flow.verified_line() {
-            return col.child(
-                div()
-                    .debug_selector(|| "tracker-github-signed-in".into())
-                    .flex()
-                    .items_center()
-                    .gap(px(4.0))
-                    .type_style(Type::Base)
-                    .text_color(theme.green)
-                    .child(heroicon(icons::CHECK).text_color(theme.green))
-                    .child(line),
-            );
-        }
-        if self.flow.github().account().is_loading() {
-            return col.child(quiet("tracker-github-checking", "Checking the GitHub account…", theme));
-        }
-        col.child(self.github_auth(theme, cx))
-    }
-
-    fn card(&self, card: Card, theme: &Theme, cx: &mut Context<Self>) -> Stateful<Div> {
-        let tracker = card.tracker;
-        let action = match card.state {
-            CardState::Connected => connected_badge(tracker, theme).into_any_element(),
-            CardState::Checking => {
-                style::disabled_button(button_id(tracker), copy::CHECKING, ButtonKind::Primary, ButtonSize::Small, theme)
-                    .role(Role::Button)
-                    .aria_label(format!("{} {}", copy::CHECKING, card.title))
-                    .into_any_element()
-            }
-            CardState::Disabled => {
-                style::disabled_button(button_id(tracker), copy::CONNECT, ButtonKind::Primary, ButtonSize::Small, theme)
-                    .role(Role::Button)
-                    .aria_label(format!("{} {}", copy::CONNECT, card.title))
-                    .into_any_element()
-            }
-            CardState::Connect => {
-                style::button(button_id(tracker), copy::CONNECT, ButtonKind::Primary, ButtonSize::Small, false, theme)
-                    .role(Role::Button)
-                    .aria_label(format!("{} {}", copy::CONNECT, card.title))
-                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.connect(tracker, window, cx)))
-                    .into_any_element()
-            }
-        };
-        div()
-            .id(card_id(tracker))
-            .debug_selector(move || card_id(tracker).into())
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(16.0))
-            .w_full()
-            .px(px(16.0))
-            .py(px(16.0))
-            .rounded(px(12.0))
-            .bg(theme.toolbar)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(heroicon(mark(tracker)).text_color(theme.icon))
-                            .child(div().type_style(Type::BaseSemibold).text_color(theme.text_loud).child(card.title)),
-                    )
-                    .child(div().type_style(Type::Small).text_color(theme.muted).child(card.body)),
-            )
-            .child(action)
-    }
-
-    fn chooser(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let cards: Vec<_> = self.flow.cards().into_iter().map(|c| self.card(c, theme, cx)).collect();
-        div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap(px(16.0))
-            .w_full()
-            .mt(px(CHOOSER_DROP))
-            .children(cards)
-    }
-
-    /// How should agents handle issues created in <Tracker>? The two rules.
-    fn rules_step(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
-        let rules = self.flow.rules();
-        let card = |id, title, help, on, assigned_only, cx: &mut Context<Self>| {
-            rule_card(id, title, help, on, theme)
-                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.toggle_rule(assigned_only, cx)))
-        };
-        div()
-            .debug_selector(|| "tracker-rules".into())
-            .flex()
-            .flex_col()
-            .gap(px(16.0))
-            .w_full()
-            // The frame's cards sit 39pt lower than the choose step's fields.
-            .mt(px(39.0))
-            .child(card(
-                "tracker-rule-review",
-                rules_copy::REVIEW_TITLE.to_string(),
-                rules_copy::REVIEW_HELP,
-                rules.require_review,
-                false,
-                cx,
-            ))
-            .child(card(
-                "tracker-rule-assigned",
-                self.flow.assigned_title(),
-                rules_copy::ASSIGNED_HELP,
-                rules.assigned_only,
-                true,
-                cx,
-            ))
-    }
-
     /// Review your first import: what to import, the counts, the first few
     /// issues and the closed ones left out (or the read's loading or error).
     /// The move card (the agent rules' setting-card style): move the local
@@ -1337,34 +724,13 @@ impl TrackerConnectView {
     }
 
     fn content(&self, theme: &Theme, window: &Window, cx: &mut Context<Self>) -> Div {
-        let tracker = self.flow.tracker();
+        if let Some(shared) = steps::content(self, theme, window, cx) {
+            return shared;
+        }
         match self.flow.step() {
-            Step::Chooser => self.chooser(theme, cx),
-            // Centered in the room between the heading and the footer.
-            Step::Authorize => div().flex().flex_col().items_center().w_full().child(match tracker {
-                Some(Tracker::Linear) => self.api_key_step(theme, window, cx),
-                _ => self.github_auth_step(theme, cx),
-            }),
-            Step::ChooseProject => {
-                let body = match tracker {
-                    Some(Tracker::Linear) => self.linear_step(theme, cx),
-                    _ => self.github_step(theme, cx),
-                };
-                // The frames hang the account line 78pt under the subheading,
-                // 16pt above where the chooser's cards start.
-                div().flex().flex_col().items_center().w_full().mt(px(-16.0)).child(
-                    body.child(
-                        div()
-                            .debug_selector(|| "tracker-only-project".into())
-                            .type_style(Type::Small)
-                            .text_color(theme.muted)
-                            .child(copy::ONLY_PROJECT),
-                    ),
-                )
-            }
-            Step::AgentRules => self.rules_step(theme, cx),
             Step::ReviewImport => self.review_step(theme, cx),
             Step::Importing => self.importing(theme, cx),
+            Step::Chooser | Step::Authorize | Step::ChooseProject | Step::AgentRules => div(),
         }
     }
 
@@ -1415,7 +781,7 @@ impl Render for TrackerConnectView {
         // The frames hang each step's content a fixed way under the heading;
         // only Add API key's field and Importing's progress sit in the
         // middle.
-        let centered = matches!(self.flow.step(), Step::Authorize | Step::Importing);
+        let centered = steps::centered(self.flow.step());
         div()
             .id("tracker-connect")
             .debug_selector(|| "tracker-connect".into())
@@ -1483,7 +849,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use gpui::{Entity, TestAppContext, VisualTestContext};
+    use shelbi_app::new_project::Tracker;
     use shelbi_app::source::ProjectKey;
+    use shelbi_app::tracker_connect::flow::CardState;
     use shelbi_app::tracker_connect::{ConnectTracker, Connected, TrackerChoice};
     use shelbi_core::{GithubConnection, IssueTrackerBackend, IssueTrackerConfig};
 

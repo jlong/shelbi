@@ -139,6 +139,7 @@ pub mod settings_nav;
 pub mod terminal_preview;
 pub mod tool_select;
 pub mod tracker_connect;
+mod tracker_steps;
 pub mod tracker_section;
 pub mod sidebar;
 pub mod sidebar_reveal;

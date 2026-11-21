@@ -7,10 +7,11 @@
 //! the project from there); the Agent defaults screen ([`Screen::Defaults`])
 //! picks the runner and model the project's agents use by default (the
 //! shared [`HarnessPicker`], the detected install preselected); the Issues
-//! screen ([`Screen::Issues`]) picks where the board lives, a GitHub repo
-//! verified by the `gh` preflight ([`Action::Preflight`]) or a Linear team
-//! and filters ([`crate::linear_setup`], whose reads the host runs from
-//! [`Wizard::linear_due`]); and screen 02
+//! screen ([`Screen::Issues`]) picks where the board lives with the screens
+//! of Connect to an issue tracker ([`TrackerFlow::for_new_project`]: the
+//! chooser with a File system row, Add API key or Sign in to GitHub, Choose
+//! your project with its preflight, and the agent rules), whose reads the
+//! host runs from [`Wizard::flow_due`]; and screen 02
 //! picks where its settings live ([`ConfigMode`], the folder's
 //! recommendation preselected and explained). Create Project then hands the
 //! host one [`CreateRequest`] for
@@ -46,8 +47,10 @@ use shelbi_state::orchestrator_setup::RunnerSetupError;
 
 pub use crate::harness_picker::HarnessPicker;
 pub use crate::new_project::{folder_name, Facts, FolderCheck, PickUp, Problem, Repo, Tone, Tracker};
-use crate::linear_setup::{Filter, LinearAnswer, LinearRequest};
-use crate::new_project::{IssuesChoice, NewProject};
+use crate::github_setup::GithubAnswer;
+use crate::linear_setup::LinearAnswer;
+use crate::new_project::NewProject;
+use crate::tracker_connect::flow::{CardState, FlowRequest, Step as FlowStep, TrackerFlow, NEW_PROJECT_RULES};
 
 /// The footer's step count ("Step 1 of 4"): the folder, the agent defaults,
 /// the issues, the settings.
@@ -311,16 +314,8 @@ pub enum Focus {
     /// up the committed config.
     GitInit,
     PickUp,
-    /// The Issues screen's cards, and its GitHub repo field.
+    /// The Issues chooser's rows' buttons (Connect, or File system's Use).
     Tracker(Tracker),
-    Repo,
-    /// The Linear card's key field (while there's no working key), team
-    /// picker and filter pickers. A picker's [`Action::Menu`] opens its
-    /// rows ([`IssuesChoice::linear`]); the choice goes to
-    /// [`Wizard::select_linear_team`] / [`Wizard::select_linear_filter`].
-    LinearKey,
-    LinearTeam,
-    LinearFilter(Filter),
     /// Screen 02's cards.
     Card(ConfigMode),
     Back,
@@ -341,9 +336,6 @@ pub enum Action {
     Menu(Focus),
     /// Close the wizard (before Create Project, nothing was written).
     Close,
-    /// Run the `gh` preflight for this GitHub repo; its answer goes to
-    /// [`Wizard::preflight_passed`] / [`Wizard::preflight_failed`].
-    Preflight(String),
     /// Run the creation engine for this request (once per press: a running
     /// creation takes no second one).
     Create(Box<CreateRequest>),
@@ -415,9 +407,9 @@ pub struct Wizard {
     /// Screen 01's offers.
     git_init: bool,
     pick_up: bool,
-    /// The Issues screen's choice, and the repo a preflight is running for.
-    issues: IssuesChoice,
-    preflighting: Option<String>,
+    /// The Issues screen: Connect to an issue tracker's screens, for a
+    /// project that doesn't exist yet.
+    flow: TrackerFlow,
     /// The folder whose defaults the later screens were seeded with, and
     /// the screens the user changed since (a new folder leaves those alone).
     seeded: Option<PathBuf>,
@@ -449,8 +441,7 @@ impl Wizard {
             home,
             git_init: true,
             pick_up: true,
-            issues: IssuesChoice::default(),
-            preflighting: None,
+            flow: TrackerFlow::for_new_project(None, NEW_PROJECT_RULES),
             seeded: None,
             chose_runner: false,
             chose_issues: false,
@@ -674,7 +665,7 @@ impl Wizard {
             self.picker = HarnessPicker::new(facts.recommended_runner(), None);
         }
         if !self.chose_issues {
-            self.issues = facts.recommended_issues();
+            self.flow = TrackerFlow::for_new_project(facts.github_repo.as_deref(), NEW_PROJECT_RULES);
         }
         if !self.chose_mode {
             self.mode = facts.recommended_mode;
@@ -700,115 +691,85 @@ impl Wizard {
         self.offers().1 == Some(true)
     }
 
-    /// The Issues screen's choice.
-    pub fn issues(&self) -> &IssuesChoice {
-        &self.issues
+    /// The Issues screen's flow.
+    pub fn flow(&self) -> &TrackerFlow {
+        &self.flow
     }
 
-    /// A preflight is running for the GitHub repo.
-    pub fn preflighting(&self) -> bool {
-        self.preflighting.is_some()
+    /// The Issues screen's flow, to change as its controls do (a picker's
+    /// row, a key typed, Verify, Change account, a rule's switch). The host
+    /// calls [`Self::flow_changed`] after.
+    pub fn flow_mut(&mut self) -> &mut TrackerFlow {
+        self.chose_issues = true;
+        &mut self.flow
     }
 
-    /// The Issues screen's repo field changed.
-    pub fn set_repo(&mut self, text: impl Into<String>) {
-        self.issues.set_repo(text);
-    }
-
-    /// The Linear read due now (Linear is chosen on the Issues screen),
-    /// marked running: the host runs it off the UI thread and answers with
-    /// [`Self::linear_answer`]. Call until it answers `None`.
-    pub fn linear_due(&mut self) -> Option<LinearRequest> {
-        if self.screen != Screen::Issues {
-            return None;
-        }
-        self.issues.linear_due()
-    }
-
-    /// The host's answer to a [`Self::linear_due`] request. A preflight that
-    /// passed moves on to the settings, as GitHub's does.
-    pub fn linear_answer(&mut self, answer: LinearAnswer) {
-        let preflight = matches!(answer, LinearAnswer::Preflight { .. });
-        self.issues.linear_answer(answer);
-        if preflight && self.screen == Screen::Issues && self.issues.ready() {
+    /// After the flow changed: a finished choice moves on to the settings.
+    pub fn flow_changed(&mut self) {
+        if self.flow.take_complete() && self.screen == Screen::Issues {
             self.screen = Screen::Settings;
             self.focus = Focus::Card(self.mode);
         }
         self.settle_focus();
     }
 
-    /// The Linear key field's text changed.
-    pub fn set_linear_key(&mut self, text: impl Into<String>) {
-        self.issues.linear_mut().set_key_input(text);
-    }
-
-    /// Pick the Linear team (a team menu row's value).
-    pub fn select_linear_team(&mut self, team: &str) {
-        if self.screen == Screen::Issues {
-            self.chose_issues = true;
-            self.issues.linear_mut().select_team(team);
-            self.focus = Focus::LinearTeam;
+    /// The flow's next read (the tracker's authorization, Choose project's
+    /// pickers, its preflight), marked running: the host runs it off the UI
+    /// thread and answers with [`Self::linear_answer`] /
+    /// [`Self::github_answer`]. Call until it answers `None`.
+    pub fn flow_due(&mut self) -> Option<FlowRequest> {
+        if self.screen != Screen::Issues {
+            return None;
         }
+        self.flow.due()
     }
 
-    /// Pick a Linear filter (a filter menu row's value; `None` or blank is
-    /// no filter).
-    pub fn select_linear_filter(&mut self, filter: Filter, value: Option<&str>) {
-        if self.screen == Screen::Issues {
-            self.chose_issues = true;
-            self.issues.linear_mut().select_filter(filter, value);
-            self.focus = Focus::LinearFilter(filter);
+    /// The host's answer to a [`FlowRequest::Linear`].
+    pub fn linear_answer(&mut self, answer: LinearAnswer) {
+        self.flow.linear_answer(answer);
+        self.flow_changed();
+    }
+
+    /// The host's answer to a [`FlowRequest::Github`].
+    pub fn github_answer(&mut self, answer: GithubAnswer) {
+        self.flow.github_answer(answer);
+        self.flow_changed();
+    }
+
+    /// The Connected chooser's beat, once ([`TrackerFlow::beat_due`]).
+    pub fn beat_due(&mut self) -> Option<u32> {
+        if self.screen != Screen::Issues {
+            return None;
         }
+        self.flow.beat_due()
     }
 
-    /// The Linear key field's Verify: check the pasted key and store it
-    /// (the host runs the login from `linear_due`). False when nothing was
-    /// sent (an empty field says so).
-    pub fn verify_linear_key(&mut self) -> bool {
-        self.screen == Screen::Issues && self.issues.linear_mut().submit_key()
+    pub fn beat_done(&mut self, token: u32) {
+        self.flow.beat_done(token);
+        self.settle_focus();
     }
 
-    /// "Change key…" on the Linear account row, and its Cancel.
-    pub fn change_linear_key(&mut self) {
-        self.issues.linear_mut().change_key();
-    }
-
-    pub fn cancel_linear_key(&mut self) {
-        self.issues.linear_mut().cancel_change_key();
-    }
-
-    /// Ask Linear again for the lists whose read failed.
-    pub fn retry_linear(&mut self) {
-        self.issues.linear_mut().retry();
-    }
-
-    /// Choose the board (a card, or an arrow on one).
-    pub fn select_tracker(&mut self, tracker: Tracker) {
-        if self.screen == Screen::Issues {
-            self.issues.select(tracker);
+    /// A chooser row's button: Connect (its authorization, then its
+    /// screens) or File system's Use (on to the settings).
+    pub fn connect_tracker(&mut self, tracker: Tracker) {
+        if self.screen == Screen::Issues && self.flow.connect(tracker) {
             self.chose_issues = true;
             self.focus = Focus::Tracker(tracker);
+            self.flow_changed();
         }
     }
 
-    /// `repo` passed the preflight: on to the settings.
-    pub fn preflight_passed(&mut self, repo: &str) {
-        if self.preflighting.as_deref() == Some(repo) {
-            self.preflighting = None;
+    /// The chooser rows whose button can be pressed.
+    fn offered_trackers(&self) -> Vec<Tracker> {
+        if self.flow.step() != FlowStep::Chooser {
+            return Vec::new();
         }
-        self.issues.preflight_passed(repo);
-        if self.screen == Screen::Issues && self.issues.ready() {
-            self.screen = Screen::Settings;
-            self.focus = Focus::Card(self.mode);
-        }
-    }
-
-    /// `repo` failed the preflight with `message` (the fix to show).
-    pub fn preflight_failed(&mut self, repo: &str, message: impl Into<String>) {
-        if self.preflighting.as_deref() == Some(repo) {
-            self.preflighting = None;
-        }
-        self.issues.preflight_failed(repo, message);
+        self.flow
+            .cards()
+            .into_iter()
+            .filter(|c| matches!(c.state, CardState::Connect | CardState::Use))
+            .map(|c| c.tracker)
+            .collect()
     }
 
     /// Screen 02's line under the cards: the recommendation and why.
@@ -823,7 +784,11 @@ impl Wizard {
         plan.pick_up = self.picking_up();
         plan.git_init = self.offers().0 == Some(true);
         plan.defaults = self.picker.defaults();
-        plan.issue_tracker = self.issues.config();
+        // The Issues screen's last finished choice (untouched, the
+        // detected default stands, as for a pick-up).
+        if let Some(cfg) = self.flow.answer() {
+            plan.issue_tracker = cfg.clone();
+        }
         plan.mode = self.mode;
         Some(plan)
     }
@@ -834,9 +799,7 @@ impl Wizard {
             Screen::Folder | Screen::Defaults | Screen::Settings => {
                 self.check().is_some_and(FolderCheck::usable)
             }
-            Screen::Issues => {
-                self.check().is_some_and(FolderCheck::usable) && self.preflighting.is_none() && !self.issues.busy()
-            }
+            Screen::Issues => self.check().is_some_and(FolderCheck::usable) && self.flow.ready(),
             // Try Again, once a creation has failed.
             Screen::Creating => !self.progress.running && self.progress.failed.is_some(),
             Screen::Created => self.created.is_some() && !self.opening,
@@ -847,7 +810,10 @@ impl Wizard {
     pub fn back_enabled(&self) -> bool {
         match self.screen {
             Screen::Folder => self.origin == Origin::Workspace,
-            Screen::Defaults | Screen::Issues | Screen::Settings => true,
+            Screen::Defaults | Screen::Settings => true,
+            // The chooser's Back returns to the Agent defaults; a sub-screen's
+            // to the screen before it.
+            Screen::Issues => self.flow.step() == FlowStep::Chooser || self.flow.can_back(),
             Screen::Creating | Screen::Created => false,
         }
     }
@@ -901,23 +867,7 @@ impl Wizard {
                     order.push(Focus::GitInit);
                 }
             }
-            Screen::Issues => {
-                order.extend(Tracker::ALL.map(Focus::Tracker));
-                match self.issues.tracker() {
-                    Tracker::Github => order.push(Focus::Repo),
-                    Tracker::Linear => {
-                        let linear = self.issues.linear();
-                        if linear.needs_key() {
-                            order.push(Focus::LinearKey);
-                        }
-                        order.push(Focus::LinearTeam);
-                        if linear.team_option().is_some() {
-                            order.extend(Filter::ALL.map(Focus::LinearFilter));
-                        }
-                    }
-                    Tracker::FileSystem => {}
-                }
-            }
+            Screen::Issues => order.extend(self.offered_trackers().into_iter().map(Focus::Tracker)),
             Screen::Defaults => {
                 order.push(Focus::Harness);
                 if self.picker.takes_model() {
@@ -996,8 +946,14 @@ impl Wizard {
                 self.settle_focus();
                 Action::Stay
             }
-            Screen::Issues => {
+            Screen::Issues if self.flow.step() == FlowStep::Chooser => {
                 self.screen = Screen::Defaults;
+                self.focus = Focus::Primary;
+                self.settle_focus();
+                Action::Stay
+            }
+            Screen::Issues => {
+                self.flow.back();
                 self.focus = Focus::Primary;
                 self.settle_focus();
                 Action::Stay
@@ -1018,6 +974,16 @@ impl Wizard {
     /// works, so a request is never sent twice; Okay can't be pressed while
     /// the host opens the project, so it opens once.
     pub fn primary(&mut self) -> Action {
+        // The flow's Continue says why it can't go on (on Add API key, it
+        // verifies the key), so it's pressed even when not ready.
+        if self.screen == Screen::Issues {
+            if self.check().is_some_and(FolderCheck::usable) {
+                self.chose_issues = true;
+                self.flow.advance();
+                self.flow_changed();
+            }
+            return Action::Stay;
+        }
         if !self.primary_enabled() {
             return Action::Stay;
         }
@@ -1038,29 +1004,11 @@ impl Wizard {
                 }
                 self.defaults_error = None;
                 self.screen = Screen::Issues;
-                self.focus = Focus::Tracker(self.issues.tracker());
+                self.focus = Focus::Tracker(self.flow.choice());
+                self.settle_focus();
                 Action::Stay
             }
-            Screen::Issues => {
-                if self.issues.ready() {
-                    self.screen = Screen::Settings;
-                    self.focus = Focus::Card(self.mode);
-                    return Action::Stay;
-                }
-                if self.issues.tracker() == Tracker::Linear {
-                    // The host picks the login or the preflight up from
-                    // `linear_due`.
-                    self.issues.press_linear();
-                    return Action::Stay;
-                }
-                match self.issues.preflight_due() {
-                    Some(repo) => {
-                        self.preflighting = Some(repo.clone());
-                        Action::Preflight(repo)
-                    }
-                    None => Action::Stay,
-                }
-            }
+            Screen::Issues => Action::Stay,
             Screen::Settings => self.create_now(),
             Screen::Creating => self.retry(),
             Screen::Created => match &self.created {
@@ -1195,16 +1143,8 @@ impl Wizard {
                 Action::Stay
             }
             Focus::Tracker(tracker) => {
-                self.select_tracker(tracker);
+                self.connect_tracker(tracker);
                 Action::Stay
-            }
-            Focus::LinearTeam if self.screen == Screen::Issues && self.issues.linear().teams().loaded().is_some() => {
-                Action::Menu(Focus::LinearTeam)
-            }
-            Focus::LinearFilter(filter)
-                if self.screen == Screen::Issues && self.issues.linear().filter_options(filter).loaded().is_some() =>
-            {
-                Action::Menu(Focus::LinearFilter(filter))
             }
             Focus::Back => self.back(),
             Focus::Primary => self.primary(),
@@ -1249,21 +1189,15 @@ impl Wizard {
                 self.step_choice(self.focus, forward);
                 Action::Stay
             }
-            Key::Up | Key::Down | Key::Left | Key::Right
-                if bare && !in_text && matches!(self.focus, Focus::LinearTeam | Focus::LinearFilter(_)) =>
-            {
-                let forward = matches!(chord.code, Key::Down | Key::Right);
-                self.chose_issues = true;
-                match self.focus {
-                    Focus::LinearTeam => self.issues.linear_mut().step_team(forward),
-                    Focus::LinearFilter(filter) => self.issues.linear_mut().step_filter(filter, forward),
-                    _ => {}
-                }
-                Action::Stay
-            }
+            // The arrows move between the chooser's rows.
             Key::Up | Key::Down | Key::Left | Key::Right if bare && !in_text && matches!(self.focus, Focus::Tracker(_)) => {
                 let forward = matches!(chord.code, Key::Down | Key::Right);
-                self.select_tracker(self.issues.tracker().step(forward));
+                let rows = self.offered_trackers();
+                if let (Focus::Tracker(at), false) = (self.focus, rows.is_empty()) {
+                    let i = rows.iter().position(|t| *t == at).unwrap_or(0);
+                    let next = if forward { (i + 1).min(rows.len() - 1) } else { i.saturating_sub(1) };
+                    self.focus = Focus::Tracker(rows[next]);
+                }
                 Action::Stay
             }
             Key::Up | Key::Down | Key::Left | Key::Right if bare && !in_text => {
@@ -1348,6 +1282,10 @@ pub fn prose(warning: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::github_setup::{fixture as github_fixture, GithubRequest};
+    use crate::linear_setup::{fixture as linear_fixture, Filter, LinearRequest, TEAM_REQUIRED};
+    use crate::new_project::github_config;
+    use shelbi_core::{AgentRules, IssueTrackerConfig, LinearConnection};
     use crate::overlay::test_keys::{ch, key};
 
     fn home() -> PathBuf {
@@ -1911,8 +1849,32 @@ mod tests {
         assert_eq!(tilde(Path::new("/opt/x"), None), "/opt/x");
     }
 
-    #[test]
-    fn a_folders_defaults_seed_the_later_screens_and_github_waits_for_its_preflight() {
+    /// Run the wizard's due reads (and the Connected chooser's beat), GitHub's
+    /// answered by `github`, Linear's by `linear`.
+    fn run_reads(
+        w: &mut Wizard,
+        github: fn(GithubRequest) -> GithubAnswer,
+        linear: &dyn Fn(LinearRequest) -> LinearAnswer,
+    ) {
+        loop {
+            match w.flow_due() {
+                Some(FlowRequest::Github(req)) => w.github_answer(github(req)),
+                Some(FlowRequest::Linear(req)) => w.linear_answer(linear(req)),
+                Some(other) => panic!("a new project asks for no {other:?}"),
+                None => match w.beat_due() {
+                    Some(token) => w.beat_done(token),
+                    None => return,
+                },
+            }
+        }
+    }
+
+    fn signed_in(w: &mut Wizard) {
+        run_reads(w, github_fixture::answer, &linear_fixture::answer);
+    }
+
+    /// A folder with a GitHub origin on `acme/acme`, through Agent defaults.
+    fn at_issues_with_github() -> Wizard {
         let mut w = wizard(Origin::Workspace);
         w.folder_picked(Some(Path::new("/Users/me/Projects/acme")));
         let mut check = found("/Users/me/Projects/acme", "acme", Repo::Git);
@@ -1929,34 +1891,143 @@ mod tests {
         w.primary();
         assert_eq!(w.picker().runner(), RunnerKind::Codex, "the detected install");
         w.primary();
-        assert_eq!(w.issues().tracker(), Tracker::Github, "a GitHub origin");
+        assert_eq!(w.screen(), Screen::Issues);
+        w
+    }
+
+    #[test]
+    fn the_issues_step_is_the_connect_flows_chooser_with_a_file_system_row() {
+        let w = at_issues_with_github();
+        let flow = w.flow();
+        assert_eq!(flow.step(), FlowStep::Chooser);
+        assert_eq!(flow.heading(), crate::new_project::ISSUES_TITLE, "the wizard's own heading");
+        assert_eq!(flow.subheading(), crate::new_project::ISSUES_INTRO);
+        let cards: Vec<_> = flow.cards().iter().map(|c| (c.tracker, c.state)).collect();
+        assert_eq!(
+            cards,
+            [
+                (Tracker::Github, CardState::Connect),
+                (Tracker::Linear, CardState::Connect),
+                (Tracker::FileSystem, CardState::Use),
+            ]
+        );
+        assert_eq!(flow.choice(), Tracker::Github, "a GitHub origin is the chooser's Continue");
+        assert_eq!(w.focus(), Focus::Tracker(Tracker::Github));
         assert_eq!(
             w.tab_order(),
             [
                 Focus::Tracker(Tracker::Github),
                 Focus::Tracker(Tracker::Linear),
                 Focus::Tracker(Tracker::FileSystem),
-                Focus::Repo,
                 Focus::Back,
                 Focus::Primary
             ]
         );
-        assert_eq!(w.primary(), Action::Preflight("acme/acme".into()));
-        assert!(w.preflighting() && !w.primary_enabled(), "one preflight at a time");
-        w.preflight_failed("acme/acme", "gh is not signed in");
-        assert_eq!((w.screen(), w.issues().error()), (Screen::Issues, Some("gh is not signed in")));
-        assert_eq!(w.primary(), Action::Preflight("acme/acme".into()), "Continue tries again");
-        w.preflight_passed("acme/acme");
-        assert_eq!(w.screen(), Screen::Settings);
-        assert_eq!(w.mode(), ConfigMode::InRepo, "the recommendation");
+        assert_eq!(step_label(w.screen()), "Step 3 of 4");
+    }
+
+    #[test]
+    fn github_checks_the_sign_in_then_chooses_the_repo_runs_the_preflight_and_the_rules() {
+        let mut w = at_issues_with_github();
+        w.activate(Focus::Tracker(Tracker::Github));
+        assert_eq!(w.flow_due(), Some(FlowRequest::Github(GithubRequest::Account)), "the gh sign-in first");
+        w.github_answer(github_fixture::answer(GithubRequest::Account));
+        assert_eq!(w.flow().authorized(), Some(Tracker::Github), "Connected on the chooser");
+        signed_in(&mut w);
+        assert_eq!(w.flow().step(), FlowStep::ChooseProject);
+        assert_eq!(w.flow().heading(), "Choose your GitHub project");
+        assert_eq!(w.flow().repo(), "acme/acme", "the origin's repo preselected");
+
+        // Continue runs the gh preflight; a failure stays.
+        assert_eq!(w.primary(), Action::Stay);
         assert_eq!(
-            w.mode_recommendation().as_deref(),
-            Some("Recommended: In repo (origin remote + 3 committers)")
+            w.flow_due(),
+            Some(FlowRequest::Github(GithubRequest::Preflight { repo: "acme/acme".into() }))
         );
+        assert!(!w.primary_enabled(), "one preflight at a time");
+        w.github_answer(GithubAnswer::Preflight { repo: "acme/acme".into(), result: Err("gh is not signed in".into()) });
+        assert_eq!(w.flow().step(), FlowStep::ChooseProject);
+        assert_eq!(w.flow().error().as_deref(), Some("gh is not signed in"));
+        w.primary();
+        signed_in(&mut w);
+        assert_eq!(w.flow().step(), FlowStep::AgentRules);
+        assert_eq!(w.flow().heading(), "How should agents handle issues created in GitHub?");
+        assert_eq!(w.flow().rules(), NEW_PROJECT_RULES, "today's rules");
+
+        w.primary();
+        assert_eq!(w.screen(), Screen::Settings, "the rules finish the step");
+        assert_eq!(w.mode(), ConfigMode::InRepo, "the recommendation");
         let Action::Create(request) = w.primary() else { panic!("Create Project") };
         assert_eq!(request.plan.default_branch, "trunk");
         assert_eq!(request.plan.remote.as_deref(), Some("git@github.com:acme/acme.git"));
-        assert_eq!(request.plan.issue_tracker.github.unwrap().repo, "acme/acme");
+        assert_eq!(request.plan.issue_tracker, github_config("acme/acme").unwrap(), "what the wizard wrote before");
+    }
+
+    #[test]
+    fn back_walks_every_sub_screen_to_step_two_and_the_answers_survive() {
+        let mut w = at_issues_with_github();
+        w.activate(Focus::Tracker(Tracker::Github));
+        signed_in(&mut w);
+        w.flow_mut().set_repo("acme/app");
+        w.primary();
+        signed_in(&mut w);
+        let rules = AgentRules { require_review: true, assigned_only: false };
+        w.flow_mut().set_rules(rules);
+        w.primary();
+        assert_eq!(w.screen(), Screen::Settings);
+        w.select_mode(ConfigMode::Global);
+
+        assert_eq!(w.back(), Action::Stay);
+        assert_eq!((w.screen(), w.flow().step()), (Screen::Issues, FlowStep::AgentRules), "back to the rules");
+        assert_eq!(w.flow().rules(), rules);
+        w.back();
+        assert_eq!(w.flow().step(), FlowStep::ChooseProject);
+        assert_eq!(w.flow().repo(), "acme/app");
+        w.back();
+        assert_eq!(w.flow().step(), FlowStep::Chooser);
+        assert!(w.back_enabled());
+        w.back();
+        assert_eq!(w.screen(), Screen::Defaults, "the chooser's Back is step 2's");
+
+        // Forward again: every answer kept.
+        w.primary();
+        assert_eq!((w.screen(), w.flow().step()), (Screen::Issues, FlowStep::Chooser));
+        w.primary();
+        assert_eq!(w.flow().step(), FlowStep::ChooseProject, "the Connected chooser's Continue");
+        assert_eq!(w.flow().repo(), "acme/app");
+        w.primary();
+        assert_eq!(w.flow().step(), FlowStep::AgentRules, "the repo passed already");
+        w.primary();
+        assert_eq!((w.screen(), w.mode()), (Screen::Settings, ConfigMode::Global));
+        let Action::Create(request) = w.primary() else { panic!("Create Project") };
+        let mut want = github_config("acme/app").unwrap();
+        want.agent_rules = rules;
+        assert_eq!(request.plan.issue_tracker, want);
+    }
+
+    #[test]
+    fn file_system_needs_no_sub_screens_and_replaces_a_tracker_picked_before() {
+        let mut w = at_issues_with_github();
+        w.activate(Focus::Tracker(Tracker::Github));
+        signed_in(&mut w);
+        w.primary();
+        signed_in(&mut w);
+        w.primary();
+        assert_eq!(w.screen(), Screen::Settings);
+        w.back();
+        w.back();
+        w.back();
+        assert_eq!(w.flow().step(), FlowStep::Chooser);
+
+        w.activate(Focus::Tracker(Tracker::FileSystem));
+        assert_eq!(w.screen(), Screen::Settings, "Use goes straight on");
+        assert_eq!(w.plan().unwrap().issue_tracker, IssueTrackerConfig::default());
+        w.back();
+        assert_eq!((w.screen(), w.flow().step()), (Screen::Issues, FlowStep::Chooser));
+        assert_eq!(w.flow().choice(), Tracker::FileSystem, "Continue keeps the file system");
+        w.primary();
+        assert_eq!(w.screen(), Screen::Settings);
+        assert_eq!(w.plan().unwrap().issue_tracker, IssueTrackerConfig::default());
     }
 
     #[test]
@@ -1983,58 +2054,104 @@ mod tests {
     }
 
     #[test]
-    fn linear_loads_its_pickers_needs_a_team_and_moves_on_once_its_preflight_passes() {
-        use crate::linear_setup::{LinearFailure, PickOption, TEAM_REQUIRED};
+    fn linear_without_a_key_asks_for_one_then_its_team_then_the_rules() {
         let mut w = wizard(Origin::Workspace);
         w.folder_picked(Some(Path::new("/Users/me/Projects/acme")));
         answer(&mut w, found("/Users/me/Projects/acme", "acme", Repo::Git));
         w.primary();
         w.primary();
         assert_eq!(w.screen(), Screen::Issues);
-        assert_eq!(w.linear_due(), None, "the file system reads nothing");
-        w.set_focus(Focus::Tracker(Tracker::FileSystem));
-        w.handle_key(key(Key::Left), false);
-        assert_eq!(w.issues().tracker(), Tracker::Linear, "an arrow reaches Linear");
+        assert_eq!(w.flow_due(), None, "nothing to read on the chooser");
+        assert_eq!(w.focus(), Focus::Tracker(Tracker::FileSystem), "no GitHub origin: the file system");
+        w.handle_key(key(Key::Up), false);
+        assert_eq!(w.focus(), Focus::Tracker(Tracker::Linear), "an arrow moves between the rows");
 
-        // No key: the key field joins the tab order.
-        assert_eq!(w.linear_due(), Some(LinearRequest::Teams));
-        w.linear_answer(LinearAnswer::Teams(Err(LinearFailure::MissingKey("no key".into()))));
-        assert!(w.tab_order().contains(&Focus::LinearKey));
-        w.set_linear_key("lin_api_x");
-        assert_eq!(w.handle_key(key(Key::Enter), false), Action::Stay);
-        assert!(matches!(w.linear_due(), Some(LinearRequest::Login(_))));
-        assert!(!w.primary_enabled(), "Continue waits on the login");
-        w.linear_answer(LinearAnswer::Login(Ok("ada".into())));
-        assert!(!w.tab_order().contains(&Focus::LinearKey));
-        assert_eq!(w.linear_due(), Some(LinearRequest::Teams));
-        let eng = PickOption { id: "team-eng".into(), value: "ENG".into(), label: "ENG".into(), detail: None };
-        w.linear_answer(LinearAnswer::Teams(Ok(vec![eng])));
-
-        // Continue with no team says so.
+        let keyed = std::cell::Cell::new(false);
+        let linear = |req: LinearRequest| {
+            if matches!(req, LinearRequest::Login(_)) {
+                keyed.set(true);
+            }
+            if keyed.get() { linear_fixture::answer(req) } else { linear_fixture::no_key(req) }
+        };
+        w.handle_key(ch(' '), false);
+        run_reads(&mut w, github_fixture::answer, &linear);
+        assert_eq!(w.flow().step(), FlowStep::Authorize);
+        assert_eq!(w.flow().heading(), "Add API key");
+        assert!(w.back_enabled());
+        w.flow_mut().linear_mut().set_key_input("lin_api_x");
+        w.handle_key(key(Key::Enter), false);
+        run_reads(&mut w, github_fixture::answer, &linear);
+        assert_eq!(w.flow().verified_line().as_deref(), Some("Verified · Ada Lovelace <ada@example.com>"));
         w.primary();
-        assert_eq!(w.issues().error(), Some(TEAM_REQUIRED));
-        assert_eq!(w.activate(Focus::LinearTeam), Action::Menu(Focus::LinearTeam));
-        assert_eq!(w.activate(Focus::LinearFilter(Filter::Label)), Action::Stay, "no lists before a team");
-        w.select_linear_team("ENG");
-        assert!(w.tab_order().contains(&Focus::LinearFilter(Filter::Assignee)));
-        assert_eq!(w.linear_due(), Some(LinearRequest::TeamLists { team_id: "team-eng".into() }));
-        w.linear_answer(LinearAnswer::TeamLists {
-            team_id: "team-eng".into(),
-            projects: Ok(Vec::new()),
-            labels: Ok(Vec::new()),
-            users: Ok(Vec::new()),
-        });
-        assert_eq!(w.activate(Focus::LinearFilter(Filter::Assignee)), Action::Menu(Focus::LinearFilter(Filter::Assignee)));
-        w.select_linear_filter(Filter::Assignee, Some("me"));
+        run_reads(&mut w, github_fixture::answer, &linear);
+        assert_eq!(w.flow().step(), FlowStep::ChooseProject);
+        assert_eq!(w.flow().heading(), "Choose your Linear project");
 
+        // The team is required.
         w.primary();
-        let Some(LinearRequest::Preflight(conn)) = w.linear_due() else { panic!("preflight due") };
-        assert_eq!(conn.assignee.as_deref(), Some("me"));
-        w.linear_answer(LinearAnswer::Preflight { connection: conn, result: Ok("ENG".into()) });
+        assert_eq!(w.flow().error().as_deref(), Some(TEAM_REQUIRED));
+        w.flow_mut().linear_mut().select_team("ENG");
+        w.flow_changed();
+        run_reads(&mut w, github_fixture::answer, &linear);
+        w.flow_mut().linear_mut().select_filter(Filter::Project, Some("Shelbi"));
+        w.primary();
+        run_reads(&mut w, github_fixture::answer, &linear);
+        assert_eq!(w.flow().step(), FlowStep::AgentRules);
+        assert_eq!(w.flow().heading(), "How should agents handle issues created in Linear?");
+        w.primary();
         assert_eq!(w.screen(), Screen::Settings);
+
         let Action::Create(request) = w.primary() else { panic!("Create Project") };
         let cfg = request.plan.issue_tracker;
         assert_eq!(cfg.connection_blocks(), vec!["linear"]);
-        assert_eq!(cfg.linear.unwrap().team, "ENG");
+        // What the wizard wrote before for the same team and project.
+        let mut before = crate::new_project::IssuesChoice::linear_with(LinearConnection {
+            project: Some("Shelbi".into()),
+            ..LinearConnection::for_team("ENG")
+        });
+        before.linear_mut().select_team("ENG");
+        before.linear_mut().select_filter(Filter::Project, Some("Shelbi"));
+        assert_eq!(cfg, before.linear().config());
+    }
+
+    #[test]
+    fn linear_with_a_saved_key_skips_add_api_key() {
+        let mut w = wizard(Origin::Workspace);
+        w.folder_picked(Some(Path::new("/Users/me/Projects/acme")));
+        answer(&mut w, found("/Users/me/Projects/acme", "acme", Repo::Git));
+        w.primary();
+        w.primary();
+        w.activate(Focus::Tracker(Tracker::Linear));
+        signed_in(&mut w);
+        assert_eq!(w.flow().step(), FlowStep::ChooseProject);
+        assert!(w.flow().linear().workspace().loaded().is_some(), "the key's workspace shows");
+    }
+
+    #[test]
+    fn the_created_config_matches_the_old_issues_choice_for_the_same_answers() {
+        use crate::new_project::IssuesChoice;
+        use crate::tracker_connect::{ConnectTracker, TrackerChoice};
+        // File system.
+        assert_eq!(IssuesChoice::recommended(None).config(), IssueTrackerConfig::default());
+        // GitHub, and Linear with a team and filters: Connect to an issue
+        // tracker's write over a fresh project, with today's rules, is the
+        // old choice's config (the CLI's cross-front-end test compares the
+        // files written).
+        let mut gh = IssuesChoice::recommended(Some("acme/app"));
+        gh.preflight_passed("acme/app");
+        let linear = LinearConnection {
+            project: Some("Shelbi".into()),
+            label: Some("shelbi".into()),
+            assignee: Some("me".into()),
+            ..LinearConnection::for_team("ENG")
+        };
+        let old_linear = IssuesChoice::linear_with(linear.clone());
+        for (choice, old) in [
+            (TrackerChoice::Github { repo: "acme/app".into() }, gh.config()),
+            (TrackerChoice::Linear(linear), old_linear.linear().config()),
+        ] {
+            let new = ConnectTracker::new(choice, false).with_rules(NEW_PROJECT_RULES).config(&IssueTrackerConfig::default());
+            assert_eq!(new, old);
+        }
     }
 }
