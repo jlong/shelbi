@@ -670,6 +670,8 @@ fn edit_starts_a_far_editor_session_the_window_attaches_to_by_name() {
             agent_send: shelbi_orchestrator::agent_send::service(),
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
             import_preview: Arc::new(|_, choice| shelbi_app::tracker_connect::fixture::answer(choice.clone())),
+            connect: Arc::new(|_, _| Err(shelbi_app::tracker_connect::ConnectError::Failed("not in the fixture".into()))),
+            move_issues: Arc::new(|_, _| Err(shelbi_app::tracker_connect::MoveFailed::before_start("not in the fixture"))),
         };
         let reply = shelbi_orchestrator::far::answer_with(&services, &req.project, request);
         let reply = ServerMsg::Reply {

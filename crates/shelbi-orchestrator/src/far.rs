@@ -39,7 +39,21 @@ pub struct FarServices {
     /// Review your first import's read for a project here (its `gh`, or
     /// its Linear key).
     pub import_preview: Arc<ImportPreviewFn>,
+    /// Connect, switch or disconnect a project here.
+    pub connect: Arc<ConnectFn>,
+    /// Move a project's local issues into a connection before its switch.
+    pub move_issues: Arc<MoveIssuesFn>,
 }
+
+/// [`FarServices::connect`]: the project, and the request.
+pub type ConnectFn = dyn Fn(&str, &shelbi_app::tracker_connect::ConnectTracker) -> Result<shelbi_app::tracker_connect::Connected, shelbi_app::tracker_connect::ConnectError>
+    + Send
+    + Sync;
+
+/// [`FarServices::move_issues`]: the project, and the connection to move into.
+pub type MoveIssuesFn = dyn Fn(&str, &shelbi_app::tracker_connect::TrackerChoice) -> Result<shelbi_app::tracker_connect::Moved, shelbi_app::tracker_connect::MoveFailed>
+    + Send
+    + Sync;
 
 /// [`FarServices::import_preview`]: the project, and the connection to read.
 pub type ImportPreviewFn = dyn Fn(&str, &shelbi_app::tracker_connect::TrackerChoice) -> Result<shelbi_app::tracker_connect::ImportPreview, String>
@@ -57,6 +71,8 @@ impl FarServices {
             agent_send: crate::agent_send::service(),
             github: Arc::new(crate::project_create::github::answer),
             import_preview: Arc::new(crate::tracker_connect::import_preview),
+            connect: Arc::new(crate::tracker_connect::apply_tracker_connection),
+            move_issues: Arc::new(crate::tracker_connect::move_issues),
         }
     }
 }
@@ -90,14 +106,14 @@ pub fn answer_with(services: &FarServices, project: &str, request: Request) -> R
             req.target.project = project.to_string();
             Reply::Diff(shelbi_app::diff::answer(&req, services.agent_send.clone()))
         }
-        Request::ConnectTracker(req) => {
-            Reply::TrackerConnected(crate::tracker_connect::apply_tracker_connection(project, &req))
-        }
+        Request::ConnectTracker(req) => Reply::TrackerConnected((services.connect)(project, &req)),
         // The project's key: the pickers read what the connection will use.
         Request::Linear(req) => Reply::Linear(crate::project_create::linear::answer(Some(project), req)),
         Request::Github(req) => Reply::Github((services.github)(req)),
         Request::SyncStatuses => Reply::StatusesSynced(crate::tracker_connect::sync_statuses_now(project)),
         Request::ImportPreview(choice) => Reply::ImportPreview((services.import_preview)(project, &choice)),
+        Request::LocalIssues => Reply::LocalIssues(Ok(crate::tracker_connect::local_issues(project))),
+        Request::MoveIssues(choice) => Reply::MovedIssues((services.move_issues)(project, &choice)),
     }
 }
 
@@ -220,6 +236,8 @@ mod tests {
             agent_send: crate::agent_send::service(),
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
             import_preview: Arc::new(|_, choice| shelbi_app::tracker_connect::fixture::answer(choice.clone())),
+            connect: Arc::new(|_, _| Err(shelbi_app::tracker_connect::ConnectError::Failed("not in the fixture".into()))),
+            move_issues: Arc::new(|_, _| Err(shelbi_app::tracker_connect::MoveFailed::before_start("not in the fixture"))),
         };
         let reply = answer_with(
             &services,

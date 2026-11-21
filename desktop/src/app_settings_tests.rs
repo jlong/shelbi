@@ -1722,6 +1722,8 @@ fn recording_service(asked: Arc<Mutex<Vec<ConnectTracker>>>) -> TrackerService {
         github: Arc::new(shelbi_app::github_setup::fixture::answer),
         sync_statuses: Arc::new(|| StatusSync::NotNeeded),
         preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
+        local_issues: Arc::new(|| Ok(0)),
+        move_issues: Arc::new(shelbi_app::tracker_connect::fixture::moved),
     }
 }
 

@@ -256,6 +256,165 @@ impl ImportWatch {
     }
 }
 
+/// One issue a move names: its shelbi id and title.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MovedIssue {
+    pub id: String,
+    pub title: String,
+}
+
+/// The local board's issues were moved into the connection (Review your
+/// first import's move card, run on Importing before the switch): the
+/// project's own `shelbi issue-store migrate --apply`, with comments, run
+/// where the project lives.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Moved {
+    /// The issues this run created on the tracker.
+    pub moved: Vec<MovedIssue>,
+    /// Issues the tracker already held (an earlier run moved them).
+    #[serde(default)]
+    pub already: usize,
+    /// Comments copied with them.
+    #[serde(default)]
+    pub comments: usize,
+}
+
+impl Moved {
+    /// Every local issue now on the tracker: this run's and an earlier one's.
+    pub fn total(&self) -> usize {
+        self.moved.len() + self.already
+    }
+}
+
+/// A move that stopped: what made it to the tracker, what didn't, and why.
+/// Nothing was switched; moving again picks up where it stopped (the move
+/// matches issues by shelbi id).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveFailed {
+    /// The issues on the tracker now (this run's, then an earlier run's
+    /// count in `already`).
+    pub moved: Vec<MovedIssue>,
+    #[serde(default)]
+    pub already: usize,
+    /// The issues still only on the local board.
+    pub left: Vec<MovedIssue>,
+    /// Why it stopped, one sentence.
+    pub reason: String,
+}
+
+impl MoveFailed {
+    /// A failure before anything was written (the boards couldn't be read).
+    pub fn before_start(reason: impl Into<String>) -> Self {
+        MoveFailed { reason: reason.into(), ..MoveFailed::default() }
+    }
+}
+
+/// The move card's copy (06-review-import) and the Importing step's move
+/// line and failure (07-importing).
+pub mod move_copy {
+    use super::{MoveFailed, MovedIssue};
+
+    /// How many issues a failure lists by name before "and N more".
+    const NAMED: usize = 3;
+
+    fn issues(n: usize) -> String {
+        format!("{n} local issue{}", if n == 1 { "" } else { "s" })
+    }
+
+    /// "Move your 3 local issues to Linear", or "your local issues" while
+    /// the count isn't known.
+    pub fn card_title(count: Option<usize>, tracker: &str) -> String {
+        match count {
+            Some(n) => format!("Move your {} to {tracker}", issues(n)),
+            None => format!("Move your local issues to {tracker}"),
+        }
+    }
+
+    /// The card's help with the move on: `target` is where they're created
+    /// (the Linear team, the GitHub repository).
+    pub fn card_on(count: Option<usize>, target: &str) -> String {
+        let they = if count == Some(1) { "It's" } else { "They're" };
+        let its = if count == Some(1) { "its" } else { "their" };
+        format!("{they} created in {target} first, keeping {its} status, so nothing is left behind.")
+    }
+
+    /// The card's help with the move off.
+    pub fn card_off(count: Option<usize>) -> String {
+        if count == Some(1) {
+            "It stays on the local file system and won't be visible to this project.".into()
+        } else {
+            "They stay on the local file system and won't be visible to this project.".into()
+        }
+    }
+
+    /// "Moving 3 local issues…" while the move runs.
+    pub fn moving(count: Option<usize>) -> String {
+        match count {
+            Some(n) => format!("Moving {}…", issues(n)),
+            None => "Moving your local issues…".into(),
+        }
+    }
+
+    /// "Moved 3 local issues to Linear" once they're there.
+    pub fn moved(n: usize, tracker: &str) -> String {
+        match n {
+            0 => "No local issues to move".into(),
+            n => format!("Moved {} to {tracker}", issues(n)),
+        }
+    }
+
+    /// `Fix login, Add tests and 2 more`.
+    fn names(list: &[MovedIssue]) -> String {
+        let named: Vec<&str> = list
+            .iter()
+            .take(NAMED)
+            .map(|i| if i.title.trim().is_empty() { i.id.as_str() } else { i.title.as_str() })
+            .collect();
+        let rest = list.len().saturating_sub(NAMED);
+        if rest > 0 {
+            format!("{} and {rest} more", named.join(", "))
+        } else {
+            named.join(", ")
+        }
+    }
+
+    /// Why the move stopped, what made it and what didn't, and that Try
+    /// again picks up there. Nothing was switched.
+    pub fn failed(f: &MoveFailed, tracker: &str) -> String {
+        let done = f.moved.len() + f.already;
+        let total = done + f.left.len();
+        let reason = crate::view::title_case(f.reason.trim().trim_end_matches('.'));
+        let mut text = if total == 0 || done == 0 {
+            format!("Couldn't move your local issues to {tracker}. {reason}.")
+        } else {
+            format!("Moved {done} of {total} local issues to {tracker}, then it stopped. {reason}.")
+        };
+        if !f.moved.is_empty() {
+            text.push_str(&format!(" Moved: {}.", names(&f.moved)));
+        }
+        if !f.left.is_empty() && done > 0 {
+            text.push_str(&format!(" Not moved yet: {}.", names(&f.left)));
+        }
+        text.push_str(" The project wasn't switched. Try again picks up where it stopped.");
+        text
+    }
+
+    /// The Importing step's refusal when the local board still has issues
+    /// the tracker doesn't (they were added after Review): readable, with
+    /// the move offered again.
+    pub fn still_local(count: Option<usize>, tracker: &str) -> String {
+        let (n, are) = match count {
+            Some(1) => ("1 local issue".to_string(), "isn't"),
+            Some(n) => (issues(n), "aren't"),
+            None => ("Some local issues".to_string(), "may not be"),
+        };
+        format!(
+            "{n} {are} on {tracker} yet, so the project wasn't switched. Move them now, or switch \
+             anyway and leave them on the local file system, where this project won't see them."
+        )
+    }
+}
+
 /// A canned preview for tests and the offscreen renders: the frame's
 /// counts (64 open, 48 yours, 12 closed), keyed for the tracker.
 pub mod fixture {
@@ -288,6 +447,12 @@ pub mod fixture {
     /// [`preview`] as a service answers it.
     pub fn answer(choice: TrackerChoice) -> Result<ImportPreview, String> {
         Ok(preview(&choice))
+    }
+
+    /// A move that finds nothing to move (the fixtures' local board is
+    /// empty).
+    pub fn moved(_: TrackerChoice) -> Result<super::Moved, super::MoveFailed> {
+        Ok(super::Moved::default())
     }
 }
 

@@ -110,6 +110,12 @@ pub enum Request {
     /// Issue tracker's Review your first import), read where the project
     /// lives.
     ImportPreview(crate::tracker_connect::TrackerChoice),
+    /// How many issues the project's local board holds (Review your first
+    /// import's move card).
+    LocalIssues,
+    /// Move the project's local issues into this connection before it's
+    /// switched to (the move card's Import), where the project lives.
+    MoveIssues(crate::tracker_connect::TrackerChoice),
 }
 
 /// The far daemon's answer to a [`Request`].
@@ -129,6 +135,8 @@ pub enum Reply {
     Github(crate::github_setup::GithubAnswer),
     StatusesSynced(crate::tracker_connect::StatusSync),
     ImportPreview(Result<crate::tracker_connect::ImportPreview, String>),
+    LocalIssues(Result<usize, String>),
+    MovedIssues(Result<crate::tracker_connect::Moved, crate::tracker_connect::MoveFailed>),
 }
 
 /// The far paths a path Cmd+clicked in a far terminal may name: as
@@ -286,6 +294,30 @@ pub fn import_preview(
         Ok(Reply::ImportPreview(result)) => result,
         Ok(other) => Err(unexpected(&other)),
         Err(e) => Err(e),
+    }
+}
+
+/// Count `link`'s project's local issues through its daemon (blocking).
+pub fn local_issues(link: &ProjectLink) -> Result<usize, String> {
+    match link.far_request(&Request::LocalIssues) {
+        Ok(Reply::LocalIssues(result)) => result,
+        Ok(other) => Err(unexpected(&other)),
+        Err(e) => Err(e),
+    }
+}
+
+/// Move `link`'s project's local issues into `choice` through its daemon
+/// (blocking). A failure to reach the daemon answers as a move that never
+/// started.
+pub fn move_issues(
+    link: &ProjectLink,
+    choice: crate::tracker_connect::TrackerChoice,
+) -> Result<crate::tracker_connect::Moved, crate::tracker_connect::MoveFailed> {
+    use crate::tracker_connect::MoveFailed;
+    match link.far_request(&Request::MoveIssues(choice)) {
+        Ok(Reply::MovedIssues(result)) => result,
+        Ok(other) => Err(MoveFailed::before_start(unexpected(&other))),
+        Err(e) => Err(MoveFailed::before_start(format!("couldn't reach the project's machine: {e}"))),
     }
 }
 

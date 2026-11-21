@@ -25,25 +25,13 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Result};
 use clap::{Args, Subcommand, ValueEnum};
 use shelbi_core::{
-    Column, GithubConnection, Issue, IssueTrackerBackend, IssueTrackerConfig, LinearConnection,
-    StatusCategory,
+    GithubConnection, Issue, IssueTrackerBackend, IssueTrackerConfig, LinearConnection,
 };
 use shelbi_state::{
     apply_issue_migration, IssueMigrationPlan, IssueStore, MigrationControls, PartialMigration,
 };
 
 use super::require_project;
-
-/// Default spacing between successive writes on a `--to github` run. GitHub's
-/// secondary limit for content creation is 80/min and 500/hr; a write every
-/// 7.5s is ~8/min and 480/hr, safely under both, so a bulk run stays out of the
-/// limit rather than sprinting into it and recovering via backoff.
-const DEFAULT_GITHUB_PACE_SECS: f64 = 7.5;
-
-/// Default spacing between successive writes on a `--to linear` run: 3s is
-/// 1,200 writes an hour, inside Linear's hourly request budget for an API key
-/// with room left for the board's own reads.
-const DEFAULT_LINEAR_PACE_SECS: f64 = 3.0;
 
 /// How many queued cards the default plan preview lists before collapsing the
 /// rest into a count — enough to sanity-check the plan without the 588-line
@@ -157,12 +145,10 @@ fn source_backend(
 
 /// The pace for a run into `target`: `--pace-secs`, else the target's default.
 fn pace_for(target: IssueTrackerBackend, pace_secs: Option<f64>) -> Duration {
-    let default = match target {
-        IssueTrackerBackend::Github => DEFAULT_GITHUB_PACE_SECS,
-        IssueTrackerBackend::Linear => DEFAULT_LINEAR_PACE_SECS,
-        _ => 0.0,
-    };
-    Duration::from_secs_f64(pace_secs.unwrap_or(default).max(0.0))
+    match pace_secs {
+        Some(secs) => Duration::from_secs_f64(secs.max(0.0)),
+        None => shelbi_state::default_pace(target),
+    }
 }
 
 fn migrate(project: &str, args: &MigrateArgs) -> Result<()> {
@@ -186,19 +172,11 @@ fn migrate(project: &str, args: &MigrateArgs) -> Result<()> {
         Side::Linear(store) => Some(store.status_columns().map_err(|e| anyhow!(e))?),
         Side::Other(_) => None,
     };
-    let catalog = shelbi_state::load_project_statuses(project).ok();
-    let source_category = |col: &Column| -> StatusCategory {
-        catalog
-            .as_ref()
-            .and_then(|c| c.get(col.as_str()))
-            .map(|s| s.category)
-            .unwrap_or_else(|| col.category())
-    };
-    let plan = shelbi_state::plan_issue_migration_mapped(
+    let plan = shelbi_state::plan_project_migration(
+        project,
         source.store(),
         target.store(),
         targets.as_deref(),
-        &source_category,
     )
     .map_err(|e| anyhow!(e))?;
 
@@ -313,8 +291,8 @@ fn migrate(project: &str, args: &MigrateArgs) -> Result<()> {
 fn switch_hint(target: IssueTrackerBackend) -> String {
     let how = match target {
         IssueTrackerBackend::Linear => {
-            "run `shelbi tracker linear connect --team <TEAM> --force` (the old board still has \
-             its issues, so the switch needs --force)"
+            "run `shelbi tracker linear connect --team <TEAM>` (every issue is on the new board \
+             now, so the switch needs no --force)"
         }
         IssueTrackerBackend::Github => {
             "set `issue_tracker.backend: github` with its `github:` block, or connect it in Settings"
@@ -458,6 +436,7 @@ fn resolve_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shelbi_core::Column;
     use crate::commands::test_support::ENV_LOCK;
     use shelbi_state::linear_client::FakeLinear;
 
