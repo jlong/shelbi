@@ -765,9 +765,11 @@ mod tests {
     }
 
     /// The plan the desktop wizard hands over for `repo`, every screen on
-    /// its preselection, the GitHub preflight answered as passing.
+    /// its preselection (the Issues step's Continue through each of its
+    /// screens), `gh` answered as signed in and the preflight as passing.
     fn desktop_plan(repo: &Path, mode: ConfigMode) -> NewProject {
         use shelbi_app::add_project_wizard::{Action, Origin, Screen, Wizard};
+        use shelbi_app::tracker_connect::flow::FlowRequest;
         let mut w = Wizard::new(Origin::Workspace, None);
         w.folder_picked(Some(repo));
         let key = w.check_due().unwrap();
@@ -776,8 +778,20 @@ mod tests {
         w.finish_check(key, check);
         assert_eq!(w.primary(), Action::Stay);
         assert_eq!(w.primary(), Action::Stay);
-        if let Action::Preflight(gh_repo) = w.primary() {
-            w.preflight_passed(&gh_repo);
+        // The chooser, Choose your GitHub project, the agent rules.
+        for _ in 0..3 {
+            assert_eq!(w.screen(), Screen::Issues);
+            assert_eq!(w.primary(), Action::Stay);
+            loop {
+                match w.flow_due() {
+                    Some(FlowRequest::Github(req)) => w.github_answer(shelbi_app::github_setup::fixture::answer(req)),
+                    Some(other) => panic!("a GitHub origin's preselection asks for no {other:?}"),
+                    None => match w.beat_due() {
+                        Some(token) => w.beat_done(token),
+                        None => break,
+                    },
+                }
+            }
         }
         assert_eq!(w.screen(), Screen::Settings);
         w.select_mode(mode);

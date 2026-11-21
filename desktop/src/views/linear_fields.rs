@@ -3,9 +3,8 @@
 //! Change key…, or the paste-and-verify key field while there's no working
 //! key), the Team picker (required), then the optional Project, Label and
 //! Assignee pickers and the sentence saying what the picks show. One control
-//! for both places that connect Linear: the new-project wizard's Issues
-//! screen (`views/add_project.rs`) and Settings ▸ Properties' Issue tracker
-//! section (`views/tracker_section.rs`).
+//! for Settings ▸ Properties' Issue tracker section
+//! (`views/tracker_section.rs`).
 //!
 //! ```text
 //!  Linear account
@@ -27,7 +26,7 @@
 //! ```
 //!
 //! Connect to an Issue tracker's "Choose your Linear project" step
-//! (`views/tracker_connect.rs`) lays the same pickers out its own way
+//! (`views/tracker_steps.rs`, also the new-project wizard's) lays the same pickers out its own way
 //! ([`connect_fields`]): the key's Workspace (read-only), Team as
 //! `Name · KEY`, and Project from "Any project", stacked at the frame's
 //! width, with no label or assignee filter. Its key entry is its own Add API
@@ -76,7 +75,6 @@ pub enum Msg {
 /// Whose fields these are: their element ids and test selectors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Host {
-    AddProject,
     Settings,
     /// Connect to an Issue tracker's Choose your Linear project step.
     Connect,
@@ -85,7 +83,6 @@ pub enum Host {
 impl Host {
     fn prefix(self) -> &'static str {
         match self {
-            Host::AddProject => "add-project-linear",
             Host::Settings => "tracker-linear",
             Host::Connect => "tracker-connect-linear",
         }
@@ -94,10 +91,6 @@ impl Host {
     /// A picker's id (and its menu's, with `-menu`).
     pub fn pick_id(self, pick: Pick) -> &'static str {
         match (self, pick) {
-            (Host::AddProject, Pick::Team) => "add-project-linear-team",
-            (Host::AddProject, Pick::Filter(Filter::Project)) => "add-project-linear-project",
-            (Host::AddProject, Pick::Filter(Filter::Label)) => "add-project-linear-label",
-            (Host::AddProject, Pick::Filter(Filter::Assignee)) => "add-project-linear-assignee",
             (Host::Settings, Pick::Team) => "tracker-linear-team",
             (Host::Settings, Pick::Filter(Filter::Project)) => "tracker-linear-project",
             (Host::Settings, Pick::Filter(Filter::Label)) => "tracker-linear-label",
@@ -111,10 +104,6 @@ impl Host {
 
     fn menu_id(self, pick: Pick) -> &'static str {
         match (self, pick) {
-            (Host::AddProject, Pick::Team) => "add-project-linear-team-menu",
-            (Host::AddProject, Pick::Filter(Filter::Project)) => "add-project-linear-project-menu",
-            (Host::AddProject, Pick::Filter(Filter::Label)) => "add-project-linear-label-menu",
-            (Host::AddProject, Pick::Filter(Filter::Assignee)) => "add-project-linear-assignee-menu",
             (Host::Settings, Pick::Team) => "tracker-linear-team-menu",
             (Host::Settings, Pick::Filter(Filter::Project)) => "tracker-linear-project-menu",
             (Host::Settings, Pick::Filter(Filter::Label)) => "tracker-linear-label-menu",
