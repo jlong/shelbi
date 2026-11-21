@@ -7,16 +7,38 @@
 //! machine's, or the far daemon's for a project on another one).
 //!
 //! ```text
-//!  Chooser ──Connect──▶ Choose project ──▶ Agent rules ──▶ Review import ──▶ Importing
-//!  (no counter)          Step 1 of 4        Step 2 of 4     Step 3 of 4       Step 4 of 4
-//!                ◀──Back──            ◀──Back──        ◀──Back──
+//!  Chooser ──Connect──▶ (authorized?) ──yes──▶ Chooser, Connected ──beat──▶ Choose project
+//!     ▲                      │                    ▲      ▲                     │
+//!     │                      no                   │      └───────Back──────────┘
+//!     │                      ▼                    │
+//!     └───────Back────── Authorize ──Continue─────┘
+//!                     (Add API key /
+//!                      Sign in to GitHub)
+//!
+//!  Choose project ──▶ Agent rules ──▶ Review import ──▶ Importing
+//!                ◀──Back──       ◀──Back──
 //! ```
 //!
-//! - **Chooser** (01-select-tracker / 02a-connected): one card per tracker,
-//!   GitHub Issues and Linear (no Jira). A card's Connect picks its tracker
-//!   and moves on. With a tracker connected, its card shows Connected and
-//!   the others' Connect is disabled: **one external integration per
-//!   project**.
+//! No step shows a counter: every footer is Back and the primary button,
+//! right-aligned.
+//!
+//! - **Chooser** (01-select-tracker / 02a-github-connected): one card per
+//!   tracker, GitHub Issues and Linear (no Jira). A card's Connect runs its
+//!   tracker's authorization: the GitHub CLI's sign-in, or a working Linear
+//!   API key. While it runs the card says [`CHECKING`]. Once authorized the
+//!   card shows Connected and the others' Connect is disabled, and after a
+//!   short beat ([`CONNECTED_BEAT_MS`], [`TrackerFlow::beat_due`]) the flow
+//!   moves on to Choose project. Back from there returns to this Connected
+//!   chooser, whose footer's Continue moves on again; there the other
+//!   cards' Connect works again, to switch (nothing is written until
+//!   Import), and the Connected badge stays until another tracker is
+//!   authorized. A project already on a tracker shows its card Connected
+//!   and the others disabled: **one external integration per project**.
+//! - **Authorize** (02b-linear-api-key): when the tracker isn't authorized
+//!   yet. Linear's Add API key (the key field with Verify; Continue waits for
+//!   a verified key) and GitHub's sign-in help (`gh auth login`, with Retry).
+//!   Continue returns to the chooser, Connected. Choose your Linear project's
+//!   Change account opens it too, and then Back and Continue return there.
 //! - **Choose project** (03-github-choose / 03a-linear-choose): GitHub's
 //!   organization and repository through [`GithubChoice`], or Linear's
 //!   workspace (read-only), team (the only required field) and project
@@ -43,14 +65,14 @@
 use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig};
 
 use super::{import_copy, ConnectError, ConnectTracker, Connected, ImportPreview, TrackerChoice};
-use crate::github_setup::{GithubAnswer, GithubChoice, GithubRequest, REPO_REQUIRED};
-use crate::linear_setup::{LinearAnswer, LinearChoice, LinearRequest, TEAM_REQUIRED};
+use crate::github_setup::{GithubAnswer, GithubAuth, GithubChoice, GithubRequest, REPO_REQUIRED};
+use crate::linear_setup::{KeyState, LinearAnswer, LinearChoice, LinearRequest, Loadable, TEAM_REQUIRED};
 use crate::new_project::{github_config, Tracker};
 
-/// The chooser's heading, the line under it, and the note under the cards.
+/// The chooser's heading and the line under it. (No note under the cards:
+/// the Figma dropped "Only one issue tracker can be connected at a time.")
 pub const CHOOSER_HEADING: &str = "Connect to an Issue tracker";
 pub const CHOOSER_SUBHEADING: &str = "Bring external issues into Shelbi and keep work in sync.";
-pub const ONE_AT_A_TIME: &str = "Only one issue tracker can be connected at a time.";
 /// The cards' copy. (The Figma GitHub card's "a Linear team" is a slip.)
 pub const GITHUB_TITLE: &str = "GitHub Issues";
 pub const GITHUB_BODY: &str = "Sync issues from a GitHub repository.";
@@ -66,10 +88,23 @@ pub const RETRY: &str = "Retry";
 /// Linear's Workspace field, and its Project picker's first row.
 pub const WORKSPACE_LABEL: &str = "Workspace";
 pub const ANY_PROJECT: &str = "Any project";
-/// Where Linear's personal API keys are made.
+/// Where Linear's personal API keys are made, and the Add API key step's
+/// link there.
 pub const LINEAR_KEYS_URL: &str = "https://linear.app/settings/account/security";
-pub const LINEAR_KEYS_LINK: &str = "Open Linear's API key settings";
-/// The primary button while the choice's preflight runs.
+pub const LINEAR_KEYS_LINK: &str = "Open Linear";
+/// The Add API key step (02b-linear-api-key).
+pub const API_KEY_HEADING: &str = "Add API key";
+pub const API_KEY_SUBHEADING: &str = "Shelbi needs access to the Linear API. Add a personal API key below.";
+pub const API_KEY_LABEL: &str = "Linear account";
+pub const API_KEY_PLACEHOLDER: &str = "lin_api…";
+pub const API_KEY_HELP: &str = "Create one in Linear: Settings → Account → Security & access → Personal API keys.";
+/// GitHub's authorization step: the GitHub CLI's sign-in help.
+pub const GITHUB_AUTH_HEADING: &str = "Sign in to GitHub";
+pub const GITHUB_AUTH_SUBHEADING: &str = "Shelbi needs access to GitHub through the GitHub CLI (gh).";
+/// How long the chooser shows a card Connected before Choose project.
+pub const CONNECTED_BEAT_MS: u64 = 700;
+/// The primary button while the choice's preflight runs, and a card's while
+/// its authorization is checked.
 pub const CHECKING: &str = "Checking…";
 /// The buttons.
 pub const CONNECT: &str = "Connect";
@@ -92,30 +127,17 @@ pub const MENU_TITLE: &str = "Connect to issue tracker…";
 /// The trackers the chooser offers, in its order.
 pub const TRACKERS: [Tracker; 2] = [Tracker::Github, Tracker::Linear];
 
-/// The steps the counter counts (every step after the chooser).
-pub const COUNTED_STEPS: usize = 4;
-
 /// Where the flow is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     Chooser,
+    /// The picked tracker isn't authorized yet: Linear's Add API key, or how
+    /// to sign the GitHub CLI in.
+    Authorize,
     ChooseProject,
     AgentRules,
     ReviewImport,
     Importing,
-}
-
-impl Step {
-    /// The step's number in "Step N of 4"; the chooser has none.
-    pub fn number(self) -> Option<usize> {
-        match self {
-            Step::Chooser => None,
-            Step::ChooseProject => Some(1),
-            Step::AgentRules => Some(2),
-            Step::ReviewImport => Some(3),
-            Step::Importing => Some(4),
-        }
-    }
 }
 
 /// What a chooser card offers.
@@ -125,8 +147,11 @@ pub enum CardState {
     Connect,
     /// The project is connected to it: the green badge, no button.
     Connected,
-    /// Another tracker is connected: Connect, disabled.
+    /// Another tracker is connected (or being connected): Connect, disabled.
     Disabled,
+    /// Its Connect was pressed and its authorization is being checked: the
+    /// button says [`CHECKING`], disabled.
+    Checking,
 }
 
 /// One chooser card.
@@ -212,6 +237,16 @@ pub enum FlowRequest {
     Preview(TrackerChoice),
 }
 
+/// The Connected chooser's beat before it moves on to Choose project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Beat {
+    Idle,
+    /// [`TrackerFlow::beat_due`] hands it to the host next.
+    Due,
+    /// The host's timer runs; [`TrackerFlow::beat_done`] ends it.
+    Running(u32),
+}
+
 /// The footer's left button.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Secondary {
@@ -236,6 +271,19 @@ pub struct TrackerFlow {
     current: Option<IssueTrackerConfig>,
     /// The tracker a card's Connect picked.
     tracker: Option<Tracker>,
+    /// A card's Connect was pressed: its tracker's authorization is being
+    /// checked (the card says Checking…).
+    authorizing: Option<Tracker>,
+    /// The tracker whose authorization passed: the chooser shows its card
+    /// Connected.
+    authorized: Option<Tracker>,
+    /// The Connected chooser's beat before Choose project.
+    beat: Beat,
+    /// How many beats have started: a stale timer's end is dropped.
+    beats: u32,
+    /// The Authorize step was opened from Choose project (Change account):
+    /// Back and Continue return there.
+    rekey: bool,
     /// GitHub's organization and repository.
     github: GithubChoice,
     linear: LinearChoice,
@@ -259,6 +307,11 @@ impl Default for TrackerFlow {
             step: Step::Chooser,
             current: None,
             tracker: None,
+            authorizing: None,
+            authorized: None,
+            beat: Beat::Idle,
+            beats: 0,
+            rekey: false,
             github: GithubChoice::default(),
             linear: LinearChoice::default(),
             advancing: false,
@@ -331,6 +384,11 @@ impl TrackerFlow {
                 let state = match () {
                     _ if connected == Some(tracker) => CardState::Connected,
                     _ if any || !self.loaded() => CardState::Disabled,
+                    _ if self.authorizing == Some(tracker) => CardState::Checking,
+                    _ if self.authorized == Some(tracker) => CardState::Connected,
+                    // While a check or the beat runs nothing else connects;
+                    // after Back another card can (it replaces the choice).
+                    _ if self.authorizing.is_some() || self.in_beat() => CardState::Disabled,
                     _ => CardState::Connect,
                 };
                 Card { tracker, title, body, state }
@@ -338,27 +396,193 @@ impl TrackerFlow {
             .collect()
     }
 
-    /// A card's Connect: pick `tracker` and move to its Choose project step.
-    /// False when the card can't connect (another tracker is connected, the
-    /// connection isn't read yet, or the flow is past the chooser).
+    /// The tracker the chooser shows Connected for this flow (its
+    /// authorization passed), before Choose project.
+    pub fn authorized(&self) -> Option<Tracker> {
+        self.authorized
+    }
+
+    /// A card's Connect: pick `tracker` and check its authorization (the
+    /// GitHub CLI's sign-in, or a working Linear key). Authorized, the
+    /// chooser shows it Connected and the beat moves on to Choose project;
+    /// not, the Authorize step asks for it. False when the card can't
+    /// connect (another tracker is connected, the connection isn't read yet,
+    /// or the flow is past the chooser).
     pub fn connect(&mut self, tracker: Tracker) -> bool {
         let offered = self.cards().iter().any(|c| c.tracker == tracker && c.state == CardState::Connect);
         if self.step != Step::Chooser || !offered {
             return false;
         }
         self.tracker = Some(tracker);
-        self.step = Step::ChooseProject;
+        self.authorizing = Some(tracker);
         self.error = None;
-        if tracker == Tracker::Linear {
-            // The step shows the key's workspace.
-            self.linear.want_workspace();
+        match tracker {
+            Tracker::Linear => {
+                // Choose project shows the key's workspace.
+                self.linear.want_workspace();
+                // A failed teams read is asked again.
+                self.linear.retry();
+            }
+            Tracker::Github => {
+                // Signed out before: check again (it may be signed in now).
+                if self.github.needs_auth() || self.github.account().error().is_some() {
+                    self.github.retry();
+                }
+            }
+            Tracker::FileSystem => {}
         }
+        self.settle();
         true
     }
 
-    /// "Step N of 4", on every step after the chooser.
-    pub fn counter(&self) -> Option<String> {
-        self.step.number().map(|n| format!("Step {n} of {COUNTED_STEPS}"))
+    /// Whether the picked tracker is authorized: `Some(true)` yes,
+    /// `Some(false)` no (the Authorize step asks), `None` not known yet.
+    fn authorization(&self, tracker: Tracker) -> Option<bool> {
+        match tracker {
+            Tracker::Github => match self.github.auth() {
+                GithubAuth::Valid => Some(!self.github.needs_auth()),
+                GithubAuth::Missing { .. } => Some(false),
+                GithubAuth::Unknown => None,
+            },
+            Tracker::Linear => match self.linear.key_state() {
+                KeyState::Valid { .. } => Some(!self.linear.needs_key()),
+                KeyState::Missing | KeyState::Rejected(_) => Some(false),
+                KeyState::Unknown => None,
+            },
+            Tracker::FileSystem => None,
+        }
+    }
+
+    /// A card's check finished: show it Connected, or ask for the
+    /// authorization on its own step. A read that failed for another reason
+    /// (the network) shows on the chooser; Connect asks again.
+    fn settle(&mut self) {
+        let Some(tracker) = self.authorizing else { return };
+        match self.authorization(tracker) {
+            Some(true) => {
+                self.authorizing = None;
+                self.show_connected(tracker);
+            }
+            Some(false) => {
+                self.authorizing = None;
+                self.rekey = false;
+                self.step = Step::Authorize;
+            }
+            None => {
+                if let (Tracker::Linear, Loadable::Failed(why)) = (tracker, self.linear.teams()) {
+                    self.error = Some(format!("Couldn't reach Linear: {why}"));
+                    self.authorizing = None;
+                    // A tracker authorized before stays the choice.
+                    self.tracker = self.authorized.or(self.tracker);
+                }
+            }
+        }
+    }
+
+    /// The chooser with `tracker` Connected, and its beat due.
+    fn show_connected(&mut self, tracker: Tracker) {
+        self.step = Step::Chooser;
+        self.authorized = Some(tracker);
+        self.error = None;
+        self.beat = Beat::Due;
+    }
+
+    /// The Connected chooser's beat, once: the host waits
+    /// [`CONNECTED_BEAT_MS`] and hands the token back to [`Self::beat_done`].
+    pub fn beat_due(&mut self) -> Option<u32> {
+        if self.beat != Beat::Due {
+            return None;
+        }
+        self.beats += 1;
+        self.beat = Beat::Running(self.beats);
+        Some(self.beats)
+    }
+
+    /// The beat ended: on to Choose project, unless the flow moved since.
+    pub fn beat_done(&mut self, token: u32) {
+        if self.beat == Beat::Running(token) && self.step == Step::Chooser && self.authorized.is_some() {
+            self.beat = Beat::Idle;
+            self.step = Step::ChooseProject;
+        }
+    }
+
+    /// The Connected chooser is moving on by itself (no footer yet).
+    pub fn in_beat(&self) -> bool {
+        self.step == Step::Chooser && self.beat != Beat::Idle
+    }
+
+    /// Choose your Linear project's Change account: the Add API key step,
+    /// to verify another key (Back keeps the working one).
+    pub fn change_account(&mut self) {
+        if self.step != Step::ChooseProject {
+            return;
+        }
+        match self.tracker {
+            Some(Tracker::Linear) => {
+                self.linear.change_key();
+                if self.linear.changing_key() {
+                    self.advancing = false;
+                    self.error = None;
+                    self.rekey = true;
+                    self.step = Step::Authorize;
+                }
+            }
+            Some(Tracker::Github) => {
+                self.error = None;
+                self.github.change_account();
+            }
+            _ => {}
+        }
+    }
+
+    /// Verify on the Authorize step: check the pasted Linear key (and store
+    /// it), or read the GitHub CLI's account again.
+    pub fn verify(&mut self) -> bool {
+        if self.step != Step::Authorize {
+            return false;
+        }
+        match self.tracker {
+            Some(Tracker::Linear) => self.linear.submit_key(),
+            Some(Tracker::Github) => {
+                self.github.retry();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The Authorize step's tracker is authorized: Continue is offered.
+    fn verified_auth(&self) -> bool {
+        match self.tracker {
+            Some(Tracker::Linear) => self.authorization(Tracker::Linear) == Some(true) && !self.linear.logging_in(),
+            Some(Tracker::Github) => {
+                self.authorization(Tracker::Github) == Some(true) && !self.github.account().is_loading()
+            }
+            _ => false,
+        }
+    }
+
+    /// The Authorize step's line once Verify passed (`Verified · Ada
+    /// Lovelace <ada@example.com>`, `Signed in as octocat`).
+    pub fn verified_line(&self) -> Option<String> {
+        if self.step != Step::Authorize || !self.verified_auth() {
+            return None;
+        }
+        Some(match (self.tracker?, self.account()) {
+            (Tracker::Github, Some(login)) => format!("Signed in as {login}"),
+            (Tracker::Github, None) => "Signed in".to_string(),
+            (_, Some(account)) => format!("Verified · {account}"),
+            (_, None) => "Verified".to_string(),
+        })
+    }
+
+    /// Why the Authorize step's key (or the key Verify sent) was refused,
+    /// shown under the field.
+    pub fn key_error(&self) -> Option<String> {
+        if self.step != Step::Authorize || self.tracker != Some(Tracker::Linear) {
+            return None;
+        }
+        self.linear.key_error().or(self.linear.error()).map(str::to_string)
     }
 
     /// The step's heading.
@@ -366,6 +590,10 @@ impl TrackerFlow {
         let name = tracker_name(self.tracker.unwrap_or(Tracker::Github));
         match self.step {
             Step::Chooser => CHOOSER_HEADING.into(),
+            Step::Authorize => match self.tracker {
+                Some(Tracker::Linear) => API_KEY_HEADING.into(),
+                _ => GITHUB_AUTH_HEADING.into(),
+            },
             Step::ChooseProject => format!("Choose your {name} project"),
             Step::AgentRules => format!("How should agents handle issues created in {name}?"),
             Step::ReviewImport => "Review your first import".into(),
@@ -378,6 +606,10 @@ impl TrackerFlow {
         let name = tracker_name(self.tracker.unwrap_or(Tracker::Github));
         match self.step {
             Step::Chooser => CHOOSER_SUBHEADING.into(),
+            Step::Authorize => match self.tracker {
+                Some(Tracker::Linear) => API_KEY_SUBHEADING.into(),
+                _ => GITHUB_AUTH_SUBHEADING.into(),
+            },
             Step::ChooseProject => match self.tracker {
                 Some(Tracker::Linear) => "Select the team whose issues you want to work on in Shelbi.".into(),
                 _ => "Connect the project whose issues you want to work on in Shelbi.".into(),
@@ -568,7 +800,10 @@ impl TrackerFlow {
     /// Whether the step's Continue (its primary button) can be pressed.
     pub fn ready(&self) -> bool {
         match self.step {
-            Step::Chooser => false,
+            // The Connected chooser's Continue (after Back from Choose
+            // project, or Return during the beat).
+            Step::Chooser => self.authorized.is_some() && self.authorizing.is_none(),
+            Step::Authorize => self.verified_auth(),
             Step::ChooseProject => {
                 let blocked = match self.tracker {
                     Some(Tracker::Linear) => self.linear.busy(),
@@ -651,8 +886,14 @@ impl TrackerFlow {
     /// preflight: until then it starts the preflight ([`Self::checking`])
     /// and the step moves on when that passes. From Review import it starts
     /// the connection.
+    /// On the Authorize step, Continue before the key verifies (Return)
+    /// runs Verify.
     pub fn advance(&mut self) -> bool {
         if !self.ready() {
+            if self.step == Step::Authorize {
+                self.verify();
+                return false;
+            }
             if self.step == Step::ChooseProject && !self.checking() {
                 self.error = match self.tracker {
                     Some(Tracker::Github) if self.github.needs_auth() => None,
@@ -672,6 +913,20 @@ impl TrackerFlow {
             return false;
         }
         self.step = match self.step {
+            Step::Chooser => {
+                self.beat = Beat::Idle;
+                self.tracker = self.authorized;
+                Step::ChooseProject
+            }
+            Step::Authorize if self.rekey => {
+                self.rekey = false;
+                Step::ChooseProject
+            }
+            Step::Authorize => {
+                let Some(tracker) = self.tracker else { return false };
+                self.show_connected(tracker);
+                Step::Chooser
+            }
             Step::ChooseProject => Step::AgentRules,
             Step::AgentRules => {
                 self.want_preview();
@@ -682,22 +937,27 @@ impl TrackerFlow {
                 self.imported = None;
                 Step::Importing
             }
-            Step::Chooser | Step::Importing => return false,
+            Step::Importing => return false,
         };
         true
     }
 
-    /// Whether Back can be pressed: on every counted step but Importing,
-    /// which has it only after a refusal (to change the choice).
+    /// Whether Back can be pressed: on every step after the chooser but
+    /// Importing, which has it only after a refusal (to change the choice).
     pub fn can_back(&self) -> bool {
         match self.step {
             Step::Chooser => false,
+            // A key being verified finishes first (its answer decides
+            // where Change account's Back lands).
+            Step::Authorize => !self.linear.logging_in(),
             Step::ChooseProject | Step::AgentRules | Step::ReviewImport => true,
             Step::Importing => matches!(self.apply, Apply::Refused(_)),
         }
     }
 
-    /// Back: the step before, its values kept.
+    /// Back: the step before, its values kept. From Choose project that's
+    /// the chooser with the tracker Connected; from the Authorize step, the
+    /// fresh chooser (or Choose project, for Change account).
     pub fn back(&mut self) -> bool {
         if !self.can_back() {
             return false;
@@ -706,7 +966,25 @@ impl TrackerFlow {
         // A preflight still running doesn't carry the step on.
         self.advancing = false;
         self.step = match self.step {
-            Step::ChooseProject => Step::Chooser,
+            Step::Authorize if self.rekey => {
+                self.rekey = false;
+                self.linear.cancel_change_key();
+                Step::ChooseProject
+            }
+            Step::Authorize => {
+                // A tracker authorized before (Back, then another card's
+                // Connect) stays Connected and the choice.
+                if self.authorized.is_some() && self.authorized != self.tracker {
+                    self.tracker = self.authorized;
+                } else {
+                    self.authorized = None;
+                }
+                Step::Chooser
+            }
+            Step::ChooseProject => {
+                self.beat = Beat::Idle;
+                Step::Chooser
+            }
             Step::AgentRules => Step::ChooseProject,
             Step::ReviewImport => Step::AgentRules,
             Step::Importing => {
@@ -718,8 +996,8 @@ impl TrackerFlow {
         true
     }
 
-    /// The footer's left button: Back on the counted steps, Close once the
-    /// connection is under way (closing leaves it running).
+    /// The footer's left button: Back on the steps after the chooser, Close
+    /// once the connection is under way (closing leaves it running).
     pub fn secondary(&self) -> Option<Secondary> {
         match self.step {
             Step::Chooser => None,
@@ -728,12 +1006,15 @@ impl TrackerFlow {
         }
     }
 
-    /// The primary button's label; the chooser has none (its cards connect).
+    /// The primary button's label. The chooser has none (its cards connect)
+    /// but Continue once a card is Connected and its beat is over (Back from
+    /// Choose project).
     pub fn primary_label(&self) -> Option<String> {
         let label = match self.step {
+            Step::Chooser if self.ready() && !self.in_beat() => CONTINUE,
             Step::Chooser => return None,
             Step::ChooseProject if self.checking() => CHECKING,
-            Step::ChooseProject | Step::AgentRules => CONTINUE,
+            Step::Authorize | Step::ChooseProject | Step::AgentRules => CONTINUE,
             Step::ReviewImport => {
                 return Some(match self.previewed() {
                     Some(p) => import_copy::import_button(p.open),
@@ -791,7 +1072,15 @@ impl TrackerFlow {
                 None => self.preview = Preview::Idle,
             }
         }
-        if self.step == Step::ChooseProject {
+        // The picked tracker's reads: its authorization check (from the
+        // chooser, or the Authorize step), and Choose project's pickers
+        // (from the Connected chooser on, read ahead during the beat).
+        let reads = match self.step {
+            Step::Chooser => self.authorizing.is_some() || self.authorized.is_some(),
+            Step::Authorize | Step::ChooseProject => true,
+            _ => false,
+        };
+        if reads {
             match self.tracker {
                 Some(Tracker::Linear) => return self.linear.due().map(FlowRequest::Linear),
                 Some(Tracker::Github) => return self.github.due().map(FlowRequest::Github),
@@ -804,12 +1093,22 @@ impl TrackerFlow {
     /// The answer to a [`FlowRequest::Linear`].
     pub fn linear_answer(&mut self, answer: LinearAnswer) {
         self.linear.answer(answer);
+        self.settle();
+        // Choose project never shows the key field: a key that stopped
+        // working there asks for another on the Add API key step.
+        if self.step == Step::ChooseProject && self.tracker == Some(Tracker::Linear) && self.linear.needs_key() {
+            self.advancing = false;
+            self.rekey = false;
+            self.authorized = None;
+            self.step = Step::Authorize;
+        }
         self.finish_advance();
     }
 
     /// The answer to a [`FlowRequest::Github`].
     pub fn github_answer(&mut self, answer: GithubAnswer) {
         self.github.answer(answer);
+        self.settle();
         self.finish_advance();
     }
 
@@ -882,9 +1181,14 @@ mod tests {
 
     /// Run the flow's reads with the fixtures' answers.
     fn answer_reads(flow: &mut TrackerFlow) {
+        answer_with(flow, fixture::answer);
+    }
+
+    /// Run the flow's reads, Linear's answered by `linear`.
+    fn answer_with(flow: &mut TrackerFlow, linear: fn(LinearRequest) -> LinearAnswer) {
         while let Some(req) = flow.due() {
             match req {
-                FlowRequest::Linear(req) => flow.linear_answer(fixture::answer(req)),
+                FlowRequest::Linear(req) => flow.linear_answer(linear(req)),
                 FlowRequest::Github(req) => flow.github_answer(github_fixture::answer(req)),
                 FlowRequest::Preview(choice) => {
                     let answer = crate::tracker_connect::fixture::answer(choice.clone());
@@ -893,6 +1197,27 @@ mod tests {
                 FlowRequest::Connect(c) => panic!("no connection yet: {c:?}"),
             }
         }
+    }
+
+    /// Run out the Connected chooser's beat.
+    fn beat(flow: &mut TrackerFlow) {
+        let token = flow.beat_due().expect("the Connected chooser's beat");
+        assert_eq!(flow.beat_due(), None, "one beat");
+        flow.beat_done(token);
+    }
+
+    /// A card's Connect with the tracker authorized (the fixtures), through
+    /// the Connected chooser to Choose project.
+    fn connect(flow: &mut TrackerFlow, tracker: Tracker) {
+        assert!(flow.connect(tracker));
+        answer_reads(flow);
+        assert_eq!((flow.step(), flow.authorized()), (Step::Chooser, Some(tracker)));
+        beat(flow);
+        assert_eq!(flow.step(), Step::ChooseProject);
+    }
+
+    fn states(flow: &TrackerFlow) -> Vec<(Tracker, CardState)> {
+        flow.cards().iter().map(|c| (c.tracker, c.state)).collect()
     }
 
     /// Continue, with the preflight it starts answered.
@@ -908,7 +1233,7 @@ mod tests {
     fn at_review(repo: &str) -> TrackerFlow {
         let mut flow = TrackerFlow::new();
         flow.load(&local());
-        assert!(flow.connect(Tracker::Github));
+        connect(&mut flow, Tracker::Github);
         flow.set_repo(repo);
         assert!(continue_(&mut flow) && continue_(&mut flow));
         assert_eq!(flow.step(), Step::ReviewImport);
@@ -923,9 +1248,10 @@ mod tests {
         assert_eq!(flow.rules(), DEFAULT_RULES);
         assert!(flow.connect(Tracker::Github));
         assert_eq!(flow.assigned_title(), "Only work on issues assigned to me");
-        // The account comes from the GitHub picker's own account read.
+        // The account comes from the GitHub check's own account read.
         answer_reads(&mut flow);
         assert_eq!(flow.assigned_title(), "Only work on issues assigned to me (octocat)");
+        beat(&mut flow);
         // The step's toggles are what Import writes.
         flow.set_repo("acme/app");
         assert!(continue_(&mut flow));
@@ -950,35 +1276,109 @@ mod tests {
     }
 
     #[test]
-    fn the_steps_run_in_order_and_back_keeps_the_values() {
+    fn the_steps_run_in_order_with_back_and_continue_and_no_counter() {
         let mut flow = TrackerFlow::new();
         flow.load(&local());
-        assert_eq!((flow.step(), flow.counter()), (Step::Chooser, None));
+        assert_eq!(flow.step(), Step::Chooser);
         assert_eq!((flow.primary_label().as_deref(), flow.secondary()), (None, None), "the cards connect");
         assert!(!flow.advance() && !flow.back());
 
-        assert!(flow.connect(Tracker::Github));
-        assert_eq!(flow.step(), Step::ChooseProject);
+        connect(&mut flow, Tracker::Github);
         assert_eq!(flow.heading(), "Choose your GitHub project");
         flow.set_repo("acme/app");
-        let mut seen = vec![(flow.step(), flow.counter())];
+        let mut seen = vec![flow.step()];
         while flow.step() != Step::Importing {
             assert_eq!(flow.secondary(), Some(Secondary::Back));
             assert!(continue_(&mut flow), "{:?} continues", flow.step());
-            seen.push((flow.step(), flow.counter()));
+            seen.push(flow.step());
         }
-        let counter = |n: usize| Some(format!("Step {n} of 4"));
-        assert_eq!(
-            seen,
-            vec![
-                (Step::ChooseProject, counter(1)),
-                (Step::AgentRules, counter(2)),
-                (Step::ReviewImport, counter(3)),
-                (Step::Importing, counter(4)),
-            ]
-        );
+        assert_eq!(seen, vec![Step::ChooseProject, Step::AgentRules, Step::ReviewImport, Step::Importing]);
         assert_eq!(flow.secondary(), Some(Secondary::Close), "the connection runs: no Back");
         assert!(!flow.back());
+    }
+
+    #[test]
+    fn connect_shows_the_card_connected_then_moves_on_after_the_beat() {
+        let mut flow = TrackerFlow::new();
+        flow.load(&local());
+        assert!(flow.connect(Tracker::Github));
+        // The check runs: the card says so, the other can't connect.
+        assert_eq!(states(&flow), vec![(Tracker::Github, CardState::Checking), (Tracker::Linear, CardState::Disabled)]);
+        assert!(!flow.connect(Tracker::Linear));
+        assert_eq!(flow.due(), Some(FlowRequest::Github(GithubRequest::Account)));
+        flow.github_answer(github_fixture::answer(GithubRequest::Account));
+
+        // Authorized: GitHub Connected, Linear disabled (02a), no footer
+        // while the beat runs.
+        assert_eq!(flow.step(), Step::Chooser);
+        assert_eq!(states(&flow), vec![(Tracker::Github, CardState::Connected), (Tracker::Linear, CardState::Disabled)]);
+        assert!(flow.in_beat());
+        assert_eq!((flow.primary_label(), flow.secondary()), (None, None));
+        let token = flow.beat_due().expect("the beat");
+        flow.beat_done(token + 1);
+        assert_eq!(flow.step(), Step::Chooser, "another beat's end is dropped");
+        flow.beat_done(token);
+        assert_eq!(flow.step(), Step::ChooseProject);
+        assert_eq!(flow.heading(), "Choose your GitHub project");
+
+        // Back: the chooser, still Connected, with Continue to move on
+        // again, and Linear's Connect working again to switch.
+        assert!(flow.back());
+        assert_eq!(flow.step(), Step::Chooser);
+        assert_eq!(states(&flow), vec![(Tracker::Github, CardState::Connected), (Tracker::Linear, CardState::Connect)]);
+        assert!(!flow.in_beat() && flow.beat_due().is_none(), "no beat after Back");
+        assert_eq!((flow.primary_label().as_deref(), flow.secondary()), (Some(CONTINUE), None));
+        assert!(flow.ready() && flow.advance());
+        assert_eq!(flow.step(), Step::ChooseProject);
+
+        // Return during the beat moves on at once; the beat's end is then
+        // dropped.
+        let mut flow = TrackerFlow::new();
+        flow.load(&local());
+        flow.connect(Tracker::Github);
+        answer_reads(&mut flow);
+        let token = flow.beat_due().unwrap();
+        assert!(flow.advance());
+        assert_eq!(flow.step(), Step::ChooseProject);
+        flow.back();
+        flow.beat_done(token);
+        assert_eq!(flow.step(), Step::Chooser, "the old beat doesn't carry the chooser on");
+    }
+
+    #[test]
+    fn after_back_another_card_switches_and_the_badge_stays_until_it_connects() {
+        let mut flow = TrackerFlow::new();
+        flow.load(&local());
+        connect(&mut flow, Tracker::Github);
+        flow.set_repo("acme/app");
+        assert!(flow.back());
+
+        // Linear without a key: GitHub keeps its badge while Linear is
+        // checked and while its key is asked for; Back keeps GitHub the
+        // choice.
+        assert!(flow.connect(Tracker::Linear));
+        assert_eq!(states(&flow), vec![(Tracker::Github, CardState::Connected), (Tracker::Linear, CardState::Checking)]);
+        assert!(!flow.ready() && flow.primary_label().is_none(), "no Continue while Linear is checked");
+        answer_with(&mut flow, fixture::no_key);
+        assert_eq!((flow.step(), flow.heading()), (Step::Authorize, API_KEY_HEADING.to_string()));
+        assert!(flow.back());
+        assert_eq!((flow.step(), flow.tracker(), flow.authorized()), (Step::Chooser, Some(Tracker::Github), Some(Tracker::Github)));
+        assert_eq!(states(&flow), vec![(Tracker::Github, CardState::Connected), (Tracker::Linear, CardState::Connect)]);
+        assert!(flow.advance());
+        assert_eq!((flow.heading(), flow.repo()), ("Choose your GitHub project".to_string(), "acme/app"));
+
+        // A key verified this time: Linear replaces GitHub.
+        assert!(flow.back());
+        flow.connect(Tracker::Linear);
+        flow.linear_mut().set_key_input("lin_api_good");
+        flow.verify();
+        answer_reads(&mut flow);
+        assert!(flow.advance());
+        assert_eq!(states(&flow), vec![(Tracker::Github, CardState::Disabled), (Tracker::Linear, CardState::Connected)]);
+        beat(&mut flow);
+        assert_eq!((flow.step(), flow.heading()), (Step::ChooseProject, "Choose your Linear project".to_string()));
+        assert!(flow.back());
+        assert_eq!(states(&flow), vec![(Tracker::Github, CardState::Connect), (Tracker::Linear, CardState::Connected)]);
     }
 
     #[test]
@@ -990,7 +1390,8 @@ mod tests {
         assert_eq!(flow.heading(), "How should agents handle issues created in GitHub?");
         assert!(flow.back() && flow.back());
         assert_eq!(flow.step(), Step::Chooser);
-        assert!(flow.connect(Tracker::Github));
+        assert_eq!(flow.authorized(), Some(Tracker::Github));
+        assert!(flow.advance());
         assert_eq!(flow.repo(), "acme/app", "the repo is kept");
         assert!(flow.ready());
     }
@@ -999,7 +1400,7 @@ mod tests {
     fn continue_waits_until_the_project_is_chosen() {
         let mut flow = TrackerFlow::new();
         flow.load(&local());
-        flow.connect(Tracker::Github);
+        connect(&mut flow, Tracker::Github);
         assert!(!flow.ready());
         assert!(!flow.advance());
         assert_eq!(flow.step(), Step::ChooseProject);
@@ -1014,11 +1415,13 @@ mod tests {
         // Linear: a working key and a team (the only required field).
         let mut flow = TrackerFlow::new();
         flow.load(&local());
-        flow.connect(Tracker::Linear);
-        assert_eq!(flow.heading(), "Choose your Linear project");
-        assert!(matches!(flow.due(), Some(FlowRequest::Linear(LinearRequest::Teams))));
-        assert!(!flow.ready(), "the teams are loading");
+        assert!(flow.connect(Tracker::Linear));
+        assert!(matches!(flow.due(), Some(FlowRequest::Linear(LinearRequest::Teams))), "the check is the teams read");
+        assert_eq!(flow.step(), Step::Chooser, "until it answers");
         flow.linear_answer(fixture::answer(LinearRequest::Teams));
+        assert_eq!(flow.authorized(), Some(Tracker::Linear), "a working key skips Add API key");
+        beat(&mut flow);
+        assert_eq!(flow.heading(), "Choose your Linear project");
         answer_reads(&mut flow);
         assert!(!flow.advance());
         assert_eq!(flow.error().as_deref(), Some(TEAM_REQUIRED));
@@ -1041,7 +1444,7 @@ mod tests {
     fn github_continue_runs_the_preflight_and_a_failure_stays() {
         let mut flow = TrackerFlow::new();
         flow.load(&local());
-        flow.connect(Tracker::Github);
+        connect(&mut flow, Tracker::Github);
         answer_reads(&mut flow);
         assert_eq!(flow.github().owner(), github_fixture::LOGIN, "the login is the first organization");
         flow.github_mut().select_owner(github_fixture::ORG);
@@ -1063,45 +1466,135 @@ mod tests {
         flow.github_answer(GithubAnswer::Preflight { repo: "acme/app".into(), result: Ok(()) });
         assert_eq!(flow.step(), Step::Chooser);
         // ...but the pass is kept: Continue moves straight on.
-        assert!(flow.connect(Tracker::Github));
+        assert!(flow.advance());
         assert!(flow.advance());
         assert_eq!(flow.step(), Step::AgentRules);
     }
 
     #[test]
-    fn github_signed_out_shows_how_to_sign_in_and_waits() {
+    fn github_signed_out_asks_to_sign_in_then_shows_it_connected() {
         let mut flow = TrackerFlow::new();
         flow.load(&local());
         flow.connect(Tracker::Github);
         let Some(FlowRequest::Github(GithubRequest::Account)) = flow.due() else { panic!("the account first") };
         flow.github_answer(GithubAnswer::Account(Err(GithubFailure::NotSignedIn)));
+        assert_eq!(flow.step(), Step::Authorize);
+        assert_eq!((flow.heading(), flow.subheading()), (GITHUB_AUTH_HEADING.to_string(), GITHUB_AUTH_SUBHEADING.to_string()));
         assert!(flow.github().needs_auth());
-        flow.set_repo("acme/app");
-        assert!(!flow.ready() && !flow.advance());
+        assert_eq!((flow.primary_label().as_deref(), flow.secondary()), (Some(CONTINUE), Some(Secondary::Back)));
+        assert!(!flow.ready(), "Continue waits for the sign-in");
         assert_eq!(flow.error(), None, "the instructions say what's missing");
-        flow.github_mut().retry();
+        // Return (Continue before it's signed in) checks again: still out.
+        assert!(!flow.advance());
+        assert_eq!(flow.due(), Some(FlowRequest::Github(GithubRequest::Account)));
+        flow.github_answer(GithubAnswer::Account(Err(GithubFailure::NotSignedIn)));
+        assert!(!flow.ready() && flow.verified_line().is_none());
+        // Signed in now: Retry passes, and Continue shows it Connected.
+        assert!(flow.verify());
         answer_reads(&mut flow);
-        assert!(!flow.github().needs_auth());
-        assert!(continue_(&mut flow));
+        assert_eq!(flow.step(), Step::Authorize, "Continue is the user's");
+        assert_eq!(flow.verified_line().as_deref(), Some("Signed in as octocat"));
+        assert!(flow.ready() && flow.advance());
+        assert_eq!((flow.step(), flow.authorized()), (Step::Chooser, Some(Tracker::Github)));
+        beat(&mut flow);
+        assert_eq!(flow.step(), Step::ChooseProject);
+
+        // Back from the sign-in step: the fresh chooser, and Connect checks
+        // again.
+        let mut flow = TrackerFlow::new();
+        flow.load(&local());
+        flow.connect(Tracker::Github);
+        let _ = flow.due();
+        flow.github_answer(GithubAnswer::Account(Err(GithubFailure::NotSignedIn)));
+        assert!(flow.back());
+        assert_eq!(states(&flow), vec![(Tracker::Github, CardState::Connect), (Tracker::Linear, CardState::Connect)]);
+        assert!(flow.connect(Tracker::Github));
+        assert_eq!(flow.due(), Some(FlowRequest::Github(GithubRequest::Account)), "checked again");
     }
 
     #[test]
-    fn linear_without_a_key_waits_for_one() {
+    fn linear_without_a_key_asks_for_one_on_its_own_step() {
+        use crate::linear_setup::{LinearFailure, KEY_EMPTY};
         let mut flow = TrackerFlow::new();
         flow.load(&local());
         flow.connect(Tracker::Linear);
-        while let Some(FlowRequest::Linear(req)) = flow.due() {
-            flow.linear_answer(fixture::no_key(req));
-        }
-        assert!(flow.linear().needs_key());
-        assert!(!flow.ready() && !flow.advance());
-        assert_eq!(flow.error(), None, "the key field says what's missing, not Team");
+        answer_with(&mut flow, fixture::no_key);
+        assert_eq!(flow.step(), Step::Authorize);
+        assert_eq!((flow.heading(), flow.subheading()), (API_KEY_HEADING.to_string(), API_KEY_SUBHEADING.to_string()));
+        assert_eq!(flow.authorized(), None);
+        assert!(!flow.ready(), "Continue waits for a verified key");
+        assert_eq!((flow.error(), flow.key_error()), (None, None), "the field says what's missing");
+
+        // Return verifies: an empty field says so under it.
+        assert!(!flow.advance());
+        assert_eq!(flow.key_error().as_deref(), Some(KEY_EMPTY));
+        // A key Linear refuses: why, under the field.
+        flow.linear_mut().set_key_input("lin_api_bad");
+        assert!(!flow.advance());
+        let Some(FlowRequest::Linear(LinearRequest::Login(_))) = flow.due() else { panic!("the login") };
+        assert!(!flow.can_back(), "the key's check finishes first");
+        flow.linear_answer(LinearAnswer::Login(Err(LinearFailure::Rejected("Linear refused this key.".into()))));
+        assert_eq!((flow.step(), flow.key_error().as_deref()), (Step::Authorize, Some("Linear refused this key.")));
+        assert!(!flow.ready());
+        // A good one: verified, and Continue shows Linear Connected.
+        flow.linear_mut().set_key_input("lin_api_good");
+        assert!(flow.verify());
+        answer_reads(&mut flow);
+        assert_eq!((flow.key_error(), flow.verified_line()), (None, Some(format!("Verified · {}", fixture::VIEWER))));
+        assert!(flow.ready() && flow.advance());
+        assert_eq!(flow.step(), Step::Chooser);
+        assert_eq!(states(&flow), vec![(Tracker::Github, CardState::Disabled), (Tracker::Linear, CardState::Connected)]);
+        answer_reads(&mut flow);
+        beat(&mut flow);
+        assert_eq!(flow.heading(), "Choose your Linear project");
+        assert!(!flow.linear().needs_key());
+
+        // Change account opens Add API key; Back keeps the working key.
+        flow.change_account();
+        assert_eq!((flow.step(), flow.heading()), (Step::Authorize, API_KEY_HEADING.to_string()));
+        assert!(!flow.ready(), "a new key verifies first");
+        assert!(flow.back());
+        assert_eq!(flow.step(), Step::ChooseProject);
+        assert!(!flow.linear().needs_key());
+        // ...and a new key's Continue goes straight back to Choose project.
+        flow.change_account();
+        flow.linear_mut().set_key_input("lin_api_other");
+        assert!(!flow.advance(), "Return verifies first");
+        answer_reads(&mut flow);
+        assert!(flow.advance());
+        assert_eq!(flow.step(), Step::ChooseProject);
+    }
+
+    #[test]
+    fn a_key_that_stops_working_on_choose_project_asks_for_another() {
+        let mut flow = TrackerFlow::new();
+        flow.load(&local());
+        connect(&mut flow, Tracker::Linear);
+        flow.linear_answer(LinearAnswer::Viewer(Err(crate::linear_setup::LinearFailure::Rejected("revoked".into()))));
+        assert_eq!(flow.step(), Step::Authorize, "Choose project never shows the key field");
+        assert_eq!(flow.key_error().as_deref(), Some("revoked"));
+        assert!(flow.back());
+        assert_eq!((flow.step(), flow.authorized()), (Step::Chooser, None), "the fresh chooser");
+    }
+
+    #[test]
+    fn a_failed_check_shows_on_the_chooser_and_connect_asks_again() {
+        let mut flow = TrackerFlow::new();
+        flow.load(&local());
+        flow.connect(Tracker::Linear);
+        let _ = flow.due();
+        flow.linear_answer(LinearAnswer::Teams(Err(crate::linear_setup::LinearFailure::Other("offline".into()))));
+        assert_eq!(flow.step(), Step::Chooser);
+        assert_eq!(flow.error().as_deref(), Some("Couldn't reach Linear: offline"));
+        assert_eq!(states(&flow), vec![(Tracker::Github, CardState::Connect), (Tracker::Linear, CardState::Connect)]);
+        assert!(flow.connect(Tracker::Linear));
+        assert_eq!(flow.error(), None);
+        assert_eq!(flow.due(), Some(FlowRequest::Linear(LinearRequest::Teams)), "asked again");
     }
 
     #[test]
     fn a_connected_tracker_shows_connected_and_disables_the_others() {
         let mut flow = TrackerFlow::new();
-        let states = |f: &TrackerFlow| f.cards().iter().map(|c| (c.tracker, c.state)).collect::<Vec<_>>();
         assert_eq!(
             states(&flow),
             vec![(Tracker::Github, CardState::Disabled), (Tracker::Linear, CardState::Disabled)],
@@ -1119,6 +1612,7 @@ mod tests {
         assert_eq!(states(&flow), vec![(Tracker::Github, CardState::Connected), (Tracker::Linear, CardState::Disabled)]);
         assert!(!flow.connect(Tracker::Linear) && !flow.connect(Tracker::Github));
         assert_eq!(flow.step(), Step::Chooser);
+        assert_eq!(flow.primary_label(), None, "nothing to continue to");
         assert!(!flow.connect(Tracker::FileSystem), "only the two trackers are cards");
     }
 
@@ -1157,7 +1651,7 @@ mod tests {
     fn review_reads_the_preview_once_and_a_failure_retries() {
         let mut flow = TrackerFlow::new();
         flow.load(&local());
-        flow.connect(Tracker::Github);
+        connect(&mut flow, Tracker::Github);
         flow.set_repo("acme/app");
         assert!(continue_(&mut flow));
         assert_eq!(flow.step(), Step::AgentRules);
