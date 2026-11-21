@@ -20,8 +20,8 @@
 //!   neither.)
 //! * Category defaults by state type: triage / backlog -> backlog,
 //!   unstarted -> ready, started -> active (handoff when the name matches
-//!   `review`, `qa`, `verif` or `test`), completed -> done, canceled ->
-//!   archived.
+//!   `review`, `qa`, `verif` or `test`), completed -> done, canceled and
+//!   duplicate -> archived.
 //! * A category the user changed is kept across re-syncs. A status's
 //!   category counts as changed when it differs from the default for its
 //!   type and its name *as the catalog had it*; then a rename in Linear
@@ -33,9 +33,12 @@
 //!
 //! ## Triggers
 //!
-//! * [`connect`]: when a project is first pointed at Linear (the Settings
-//!   and wizard flows call it). Syncs, and returns the workflow rewrites to
-//!   offer.
+//! * [`plan_connect_to`] then [`connect`]: when a project is pointed at
+//!   Linear (the connect flows). The plan reads the team's states and maps
+//!   the project's workflows onto them without writing anything, so a status
+//!   no team status can take ([`ConnectPlan::refusal`]) refuses the
+//!   connection before it's written. [`connect`] then syncs and applies the
+//!   rewrites, so the project loads right after.
 //! * [`sync`]: `shelbi tracker linear sync`.
 //! * [`refresh_if_changed`]: the daemon's board refresh. It reads the states
 //!   (one small query, at most every [`STATES_CHECK_INTERVAL`]), compares a
@@ -94,10 +97,18 @@ pub fn default_category(kind: LinearStateType, name: &str) -> StatusCategory {
         LinearStateType::Started if is_review_name(name) => StatusCategory::Handoff,
         LinearStateType::Started => StatusCategory::Active,
         LinearStateType::Completed => StatusCategory::Done,
-        LinearStateType::Canceled => StatusCategory::Archived,
+        LinearStateType::Canceled | LinearStateType::Duplicate => StatusCategory::Archived,
         // A type a newer Linear added: park it where nothing dispatches.
         LinearStateType::Unknown => StatusCategory::Backlog,
     }
+}
+
+/// Whether `category` is what an older Shelbi gave a state of `kind` by
+/// default, so a re-sync treats it as the default rather than the user's
+/// pick. Before Shelbi knew Linear's `duplicate` type it read as unknown and
+/// landed in backlog.
+fn legacy_default(kind: LinearStateType, category: StatusCategory) -> bool {
+    kind == LinearStateType::Duplicate && category == StatusCategory::Backlog
 }
 
 /// A started state whose name reads as a review step (`/review|qa|verif|test/i`).
@@ -143,7 +154,8 @@ pub fn plan_catalog(current: &ProjectStatuses, states: &[LinearState]) -> Result
         let default = default_category(st.kind, &st.name);
         let status = match known.get(st.id.as_str()) {
             Some(prev) => {
-                let overridden = prev.category != default_category(st.kind, &prev.name);
+                let overridden = prev.category != default_category(st.kind, &prev.name)
+                    && !legacy_default(st.kind, prev.category);
                 ProjectStatus {
                     id: prev.id.clone(),
                     name: st.name.clone(),
@@ -328,22 +340,123 @@ pub fn sync_with_states(
     Ok(StatusSync { before, after, changes, written, broken })
 }
 
-/// What [`connect`] did and what it offers.
+/// What [`connect`] did.
 #[derive(Debug, Clone)]
 pub struct Connected {
     pub sync: StatusSync,
-    /// The rewrites that would map the project's workflows onto the synced
-    /// catalog. Not applied: offer them, then [`apply_workflow_rewrites`].
+    /// The rewrites that mapped the project's workflows onto the synced
+    /// catalog. Those that change something were written.
     pub rewrites: Vec<WorkflowRewrite>,
+    /// How many workflow files were written.
+    pub rewritten: usize,
+    /// Workflow statuses no team status could take: those workflows still
+    /// fail to load. Empty when [`plan_connect_to`] was asked first and
+    /// passed.
+    pub unmappable: Vec<Unmappable>,
 }
 
-/// A project was just pointed at Linear: sync its catalog and plan (without
-/// writing) the workflow rewrites onto it. Settings and the setup wizard
-/// call this after saving the connection.
+/// A project was just pointed at Linear: sync its catalog and map its
+/// workflows onto it by category (what `shelbi tracker linear sync
+/// --rewrite-workflows --yes` does), so the project loads right after. Ask
+/// [`plan_connect_to`] before writing the connection, so a status that can't
+/// be mapped refuses it instead.
 pub fn connect(project: &str) -> Result<Connected> {
-    let sync = sync(project, false)?;
-    let rewrites = plan_workflow_rewrites(project, &sync.after, &sync.before)?;
-    Ok(Connected { sync, rewrites })
+    let (team, states) = fetch_states(project)?;
+    connect_with_states(project, Some(&team), &states)
+}
+
+/// [`connect`] with the team's states already read.
+pub fn connect_with_states(project: &str, team: Option<&str>, states: &[LinearState]) -> Result<Connected> {
+    let sync = sync_with_states(project, team, states, false)?;
+    let (rewrites, unmappable) = plan_rewrites(project, &sync.after, &sync.before)?;
+    let rewritten = apply_workflow_rewrites(&rewrites)?;
+    Ok(Connected { sync, rewrites, rewritten, unmappable })
+}
+
+/// A workflow status that no status of the team has the category of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unmappable {
+    pub workflow: String,
+    pub status: String,
+    /// Its category, when Shelbi knows it (from the catalog, a status an
+    /// earlier sync retired, or Shelbi's defaults).
+    pub category: Option<StatusCategory>,
+}
+
+/// What connecting `project` to a team would write, planned before anything
+/// is: the catalog sync and the workflow rewrites onto it.
+#[derive(Debug, Clone)]
+pub struct ConnectPlan {
+    /// The team, `KEY (Name)`.
+    pub team: String,
+    /// The team's key alone (`ENG`), for messages.
+    pub team_key: String,
+    /// The sync, dry: [`StatusSync::written`] is false.
+    pub sync: StatusSync,
+    pub rewrites: Vec<WorkflowRewrite>,
+    pub unmappable: Vec<Unmappable>,
+}
+
+impl ConnectPlan {
+    /// Why the connection must not be written, if it mustn't: some workflow
+    /// names a status whose category no team status has, so the project
+    /// wouldn't load. Says what to add in Linear (or change in the workflow).
+    pub fn refusal(&self) -> Option<String> {
+        if self.unmappable.is_empty() {
+            return None;
+        }
+        let team = &self.team_key;
+        let mut msg = format!(
+            "The Linear team {team} has no status to map {} onto, so the project wouldn't load after \
+             connecting. Nothing was written.",
+            if self.unmappable.len() == 1 { "this workflow status" } else { "these workflow statuses" }
+        );
+        for u in &self.unmappable {
+            let what = match u.category {
+                Some(c) => format!("a {c} status; {team} needs {}", linear_state_for(c)),
+                None => "a status Shelbi has no category for".to_string(),
+            };
+            msg.push_str(&format!("\n  workflow `{}`: `{}` ({what})", u.workflow, u.status));
+        }
+        let ids: Vec<String> = self.sync.after.statuses.iter().map(|s| format!("`{}`", s.id)).collect();
+        msg.push_str(&format!(
+            "\nAdd that state to the team in Linear, or point the workflow at one of {team}'s \
+             statuses ({}), then connect again.",
+            ids.join(", ")
+        ));
+        Some(msg)
+    }
+}
+
+/// The kind of Linear state that syncs into `category` by default.
+fn linear_state_for(category: StatusCategory) -> &'static str {
+    match category {
+        StatusCategory::Backlog => "a Backlog or Triage state",
+        StatusCategory::Ready => "an Unstarted state (like Todo)",
+        StatusCategory::Active => "a Started state (like In Progress)",
+        StatusCategory::Handoff => {
+            "a Started state named for review, QA, verify or test (like In Review)"
+        }
+        StatusCategory::Done => "a Completed state (like Done)",
+        StatusCategory::Archived => "a Canceled state",
+    }
+}
+
+/// Plan connecting `project` to the team `filters` resolved to: read the
+/// team's states and plan the sync and the workflow rewrites onto them.
+/// Writes nothing, and works before the project is on Linear (the key is
+/// the project's or the global one).
+pub fn plan_connect_to(project: &str, filters: &linear_client::ResolvedLinearFilters) -> Result<ConnectPlan> {
+    let client = LinearClient::for_project(Some(project))?.caller(CALLER);
+    let states = client.team_states(&filters.team_id)?;
+    plan_connect(project, &team_label(filters), &filters.team_key, &states)
+}
+
+/// [`plan_connect_to`] with the team's states already read.
+pub fn plan_connect(project: &str, team: &str, team_key: &str, states: &[LinearState]) -> Result<ConnectPlan> {
+    let sync = sync_with_states(project, Some(team), states, true)?;
+    let (rewrites, unmappable) = plan_rewrites(project, &sync.after, &sync.before)?;
+    Ok(ConnectPlan { team: team.to_string(), team_key: team_key.to_string(), sync, rewrites, unmappable })
 }
 
 /// The board-refresh trigger: when `project` is on Linear, read its team's
@@ -351,8 +464,7 @@ pub fn connect(project: &str) -> Result<Connected> {
 /// changed since the last sync. `None` when the project isn't on Linear, the
 /// check was skipped, or nothing changed.
 pub fn refresh_if_changed(project: &str, min_interval: Duration) -> Result<Option<StatusSync>> {
-    let p = crate::load_project(project)?;
-    if p.issue_tracker.backend != IssueTrackerBackend::Linear {
+    if crate::load_project_tracker(project)?.backend != IssueTrackerBackend::Linear {
         return Ok(None);
     }
     let doc = read_doc(project)?;
@@ -380,9 +492,13 @@ pub fn refresh_if_changed(project: &str, min_interval: Duration) -> Result<Optio
 }
 
 /// The project's Linear team (`KEY (Name)`) and its states.
+///
+/// The connection is read without loading the project's workflows: a sync
+/// is how a workflow naming a status the team lacks gets repaired, so it
+/// can't need that workflow to load first.
 fn fetch_states(project: &str) -> Result<(String, Vec<LinearState>)> {
-    let p = crate::load_project(project)?;
-    let conn = match (p.issue_tracker.backend, p.issue_tracker.linear.as_ref()) {
+    let tracker = crate::load_project_tracker(project)?;
+    let conn = match (tracker.backend, tracker.linear.as_ref()) {
         (IssueTrackerBackend::Linear, Some(conn)) => conn.clone(),
         _ => {
             return Err(Error::InvalidIssueTracker(format!(
@@ -394,7 +510,12 @@ fn fetch_states(project: &str) -> Result<(String, Vec<LinearState>)> {
     let client = LinearClient::for_project(Some(project))?.caller(CALLER);
     let filters = linear_client::resolve_filters_cached(&client, project, &conn)?;
     let states = client.team_states(&filters.team_id)?;
-    Ok((format!("{} ({})", filters.team_key, filters.team_name), states))
+    Ok((team_label(&filters), states))
+}
+
+/// `KEY (Name)`, as a synced catalog's header names the team.
+fn team_label(filters: &linear_client::ResolvedLinearFilters) -> String {
+    format!("{} ({})", filters.team_key, filters.team_name)
 }
 
 /// The workflow files' references `catalog` lacks.
@@ -510,6 +631,16 @@ pub fn plan_workflow_rewrites(
     catalog: &ProjectStatuses,
     previous: &ProjectStatuses,
 ) -> Result<Vec<WorkflowRewrite>> {
+    Ok(plan_rewrites(project, catalog, previous)?.0)
+}
+
+/// [`plan_workflow_rewrites`], with the statuses left unmapped and their
+/// categories.
+fn plan_rewrites(
+    project: &str,
+    catalog: &ProjectStatuses,
+    previous: &ProjectStatuses,
+) -> Result<(Vec<WorkflowRewrite>, Vec<Unmappable>)> {
     let retired = retired_categories(project)?;
     let defaults = default_project_statuses();
     let category_of = |id: &str| -> Option<StatusCategory> {
@@ -520,14 +651,20 @@ pub fn plan_workflow_rewrites(
             .or_else(|| defaults.get(id).map(|s| s.category))
     };
     let mut out = Vec::new();
+    let mut unmappable = Vec::new();
     for (stem, path) in workflow_files(&crate::workflows_dir(project)?).map_err(config_err)? {
         let text = crate::read_to_string_at(&path)?;
         let rewrite = rewrite_workflow_text(&stem, path, &text, catalog, &category_of)?;
+        unmappable.extend(rewrite.unmapped.iter().map(|id| Unmappable {
+            workflow: stem.clone(),
+            status: id.clone(),
+            category: category_of(id),
+        }));
         if rewrite.changes() || !rewrite.unmapped.is_empty() {
             out.push(rewrite);
         }
     }
-    Ok(out)
+    Ok((out, unmappable))
 }
 
 /// Rewrite one workflow file's text (see [`plan_workflow_rewrites`]).

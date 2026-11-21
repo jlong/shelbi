@@ -130,7 +130,9 @@ issue_tracker:
 ```
 
 Connecting an existing project also syncs its statuses from the team right
-away. A new project syncs them on the hub daemon's first board refresh.
+away, and maps its workflows onto them (next step), so the project loads as
+soon as it's connected. A new project syncs them on the hub daemon's first
+board refresh.
 
 </Step>
 <Step title="Map your workflows onto Linear's statuses">
@@ -138,9 +140,20 @@ away. A new project syncs them on the hub daemon's first board refresh.
 Your [workflows](/docs/guides/getting-started/workflows) name statuses by id,
 and the statuses now come from Linear. Where a workflow names a status the
 team doesn't have, it has to point at one the team does. The shipped `task`
-workflow, for example, has a `review` status, and a team with the usual
-Linear states has `In Review` (`in-review`) instead. Let Shelbi do the
-mapping:
+workflow, for example, has a `review` status, and a team with an `In Review`
+state has `in-review` instead.
+
+Connecting (`shelbi tracker linear connect`, `shelbi tracker connect`, or
+the desktop's Connect to an Issue tracker) does this mapping for you: each
+missing status becomes the team's first status of the same
+[category](#statuses), and the result line lists what was renamed
+(`review -> in-review`). When a workflow names a status whose category the
+team has no status for (a team without any review state has no `handoff`
+status for `review`), connecting is refused before anything is written, and
+the message says which state to add in Linear.
+
+If you edited the config by hand, or a workflow stopped loading after a
+change in Linear, run the mapping yourself:
 
 ```bash
 shelbi tracker linear sync --rewrite-workflows
@@ -172,8 +185,8 @@ write it:
 shelbi tracker linear sync --rewrite-workflows --yes
 ```
 
-When `connect` (or Settings) finds workflows to map, its result line ends with
-this same command, so you don't have to remember it.
+The same command repairs a project whose workflow already fails to load: it
+doesn't need the project to load first.
 
 </Step>
 <Step title="Check the connection">
@@ -280,19 +293,21 @@ state gets a default category from its type:
 | Unstarted | `ready` |
 | Started | `active`, or `handoff` when the name contains "review", "QA", "verif" or "test" |
 | Completed | `done` |
-| Canceled | `archived` |
+| Canceled, Duplicate | `archived` |
 
 To change one, pick another category for the status in **Settings >
 Workflows**. A category you changed is kept across syncs, including when the
 state is renamed in Linear. A category you never changed follows the name, so
 renaming `Doing` to `In Review` in Linear moves it to `handoff`.
 
-Whatever its category, an issue in a completed or canceled Linear state is
-history, not open work: a `Shipped` or `Duplicate` state leaves the open board.
+Whatever its category, an issue in a completed, canceled or duplicate Linear
+state is history, not open work: a `Shipped` or `Duplicate` state leaves the
+open board.
 
 ### When syncs happen
 
-- **On connect.** Connecting an existing project syncs right away.
+- **On connect.** Connecting an existing project syncs right away and maps
+  its workflows onto the synced statuses.
 - **Automatically.** The hub daemon checks the team's states at most every
   five minutes, as part of its board refresh, and syncs when they changed.
 - **On demand.** `shelbi tracker linear sync` (add `--dry-run` to only see the

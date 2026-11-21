@@ -70,7 +70,8 @@ Getting started:
            assignee: me       # optional: me | email | user id
 
   5. shelbi tracker linear status           (check what the filters resolve to)
-  6. shelbi tracker linear sync --rewrite-workflows
+  6. connect syncs the team's statuses and maps the workflows onto them.
+     After a hand edit: shelbi tracker linear sync --rewrite-workflows
                                             (take the team's statuses, and see how
                                              the workflows map onto them; add --yes
                                              to write both)
@@ -902,6 +903,85 @@ project: Shelbi\n    label: bug\n    assignee: me\n";
         shelbi_state::load_workflow("lin", "task").unwrap();
         let out = run(Some("lin"), sync_cmd(false, true, true), "").unwrap();
         assert!(out.contains("Workflows already use only these statuses."), "{out}");
+    }
+
+    /// A Linear project made with `shelbi init`'s defaults: its statuses,
+    /// its workflows, and `default_workflow: task` (so it loads only while
+    /// `task`'s statuses are in the catalog).
+    fn default_project(home: &Home, name: &str, tracker: &str) {
+        register(home, name, &format!("default_workflow: task\n{tracker}"));
+        shelbi_state::scaffold_project_statuses(name).unwrap();
+        shelbi_state::scaffold_project_workflow(name).unwrap();
+        shelbi_state::load_project(name).unwrap();
+    }
+
+    #[test]
+    fn sync_rewrite_workflows_repairs_a_project_that_no_longer_loads() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        default_project(&home, "lin", "issue_tracker:\n  backend: linear\n  linear:\n    team: ENG\n");
+        let fake = FakeLinear::new();
+        let _guard = fake.install();
+        // A sync that only wrote the catalog (what connecting used to do)
+        // leaves `task` naming `review`, which the team doesn't have.
+        run(Some("lin"), sync_cmd(false, false, false), "").unwrap();
+        let err = shelbi_state::load_project("lin").unwrap_err().to_string();
+        assert!(err.contains("status `review` is not one of the Linear team's statuses"), "{err}");
+
+        // The documented repair works on it.
+        let out = run(Some("lin"), sync_cmd(false, true, false), "").unwrap();
+        assert!(out.contains("  review -> in-review"), "{out}");
+        let out = run(Some("lin"), sync_cmd(false, true, true), "").unwrap();
+        assert!(out.contains("Wrote 1 workflow file."), "{out}");
+        shelbi_state::load_project("lin").unwrap();
+        let task = shelbi_state::load_workflow("lin", "task").unwrap();
+        assert!(task.status("in-review").is_some() && task.status("review").is_none());
+        let edges: Vec<(&str, &str)> =
+            task.transitions.iter().flatten().map(|t| (t.from.as_str(), t.to.as_str())).collect();
+        assert!(edges.contains(&("in-progress", "in-review")) && edges.contains(&("in-review", "done")), "{edges:?}");
+        assert!(edges.iter().all(|(f, t)| *f != "review" && *t != "review"), "{edges:?}");
+    }
+
+    #[test]
+    fn connecting_a_default_project_maps_its_workflows_so_it_loads() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        default_project(&home, "app", "");
+        let fake = FakeLinear::new();
+        let _guard = fake.install();
+
+        let out = run(Some("app"), LinearCmd::Connect(connect_args("eng")), "").unwrap();
+        assert!(out.starts_with("Connected app to Linear ENG (Engineering)"), "{out}");
+        assert!(out.contains("mapped 1 workflow onto them (review -> in-review)"), "{out}");
+        let p = shelbi_state::load_project("app").unwrap();
+        assert_eq!(p.issue_tracker.backend, IssueTrackerBackend::Linear);
+        let task = shelbi_state::load_workflow("app", "task").unwrap();
+        assert!(task.status("in-review").is_some() && task.status("review").is_none());
+        assert!(task.transitions.iter().flatten().all(|t| t.from != "review" && t.to != "review"));
+    }
+
+    #[test]
+    fn connecting_to_a_team_the_workflows_cant_map_onto_writes_nothing() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let home = fresh_home();
+        default_project(&home, "app", "");
+        let fake = FakeLinear::new();
+        // Linear's stock team: no review state for `review` (handoff).
+        let mut states: serde_json::Value =
+            serde_json::from_str(shelbi_state::linear_client::fixture("TeamStates").unwrap()).unwrap();
+        states["data"]["team"]["states"]["nodes"].as_array_mut().unwrap().retain(|s| s["name"] != "In Review");
+        fake.on("TeamStates", states.to_string());
+        let _guard = fake.install();
+        let config = tracker_yaml(&home, "app");
+        let statuses = std::fs::read_to_string(shelbi_state::statuses_path("app").unwrap()).unwrap();
+
+        let err = run(Some("app"), LinearCmd::Connect(connect_args("eng")), "").unwrap_err().to_string();
+        assert!(err.contains("The Linear team ENG has no status"), "{err}");
+        assert!(err.contains("workflow `task`: `review` (a handoff status"), "{err}");
+        assert_eq!(tracker_yaml(&home, "app"), config, "the connection wasn't written");
+        assert_eq!(std::fs::read_to_string(shelbi_state::statuses_path("app").unwrap()).unwrap(), statuses);
+        assert!(!home.path.join("projects/app/linear.json").exists(), "no filter cache");
+        shelbi_state::load_project("app").unwrap();
     }
 
     fn connect_args(team: &str) -> ConnectArgs {

@@ -53,8 +53,9 @@ pub struct LinearTeam {
     pub name: String,
 }
 
-/// A workflow state's category. Linear's six fixed types; any type a newer
-/// Linear adds reads as [`LinearStateType::Unknown`].
+/// A workflow state's category. Linear's fixed types (`duplicate` is the
+/// type of a team's Duplicate state, a closed one like `canceled`); any type
+/// a newer Linear adds reads as [`LinearStateType::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LinearStateType {
@@ -64,6 +65,7 @@ pub enum LinearStateType {
     Started,
     Completed,
     Canceled,
+    Duplicate,
     #[serde(other)]
     Unknown,
 }
@@ -78,6 +80,7 @@ impl LinearStateType {
             LinearStateType::Started => "started",
             LinearStateType::Completed => "completed",
             LinearStateType::Canceled => "canceled",
+            LinearStateType::Duplicate => "duplicate",
             LinearStateType::Unknown => "unknown",
         }
     }

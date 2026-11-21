@@ -51,9 +51,11 @@ and troubleshooting), see [Linear](/docs/concepts/linear).
    ```
 
 5. Run `shelbi tracker linear status` to check what the filters resolve to.
-6. Run `shelbi tracker linear sync --rewrite-workflows` to take the team's
-   statuses and see how your workflows map onto them, then add `--yes` to
-   write both (see [Statuses from Linear](#statuses-from-linear)).
+6. `connect` takes the team's statuses and maps your workflows onto them, so
+   the project loads right away. If you wrote the config by hand, run
+   `shelbi tracker linear sync --rewrite-workflows` to see how your workflows
+   map onto the team's statuses, then add `--yes` to write both (see
+   [Statuses from Linear](#statuses-from-linear)).
 
 ## Where the API key lives
 
@@ -186,7 +188,7 @@ in Linear (it checks at most every five minutes).
 - **Categories stay yours.** Each state gets a default category from its type:
   triage and backlog are `backlog`, unstarted is `ready`, started is `active`
   (or `handoff` when the name mentions review, QA, verification or testing),
-  completed is `done`, canceled is `archived`. Change a category in Settings and
+  completed is `done`, canceled and duplicate are `archived`. Change a category in Settings and
   later syncs keep your choice.
 - **Ids never change.** A new state's id is its name in kebab case (`In Review`
   becomes `in-review`). When a state is renamed in Linear, only the name
@@ -195,4 +197,6 @@ in Linear (it checks at most every five minutes).
   status the team doesn't have fails to load, and the error lists the
   available ones. `sync --rewrite-workflows` maps each missing status to the
   first Linear status of the same category, keeping its owner, agent and tags,
-  and moves `initial_status` and transitions with it.
+  and moves `initial_status` and transitions with it. `connect` does the same
+  mapping when it connects, and refuses (writing nothing) when a workflow
+  names a status whose category the team has no status for.

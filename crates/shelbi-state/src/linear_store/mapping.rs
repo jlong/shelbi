@@ -58,16 +58,16 @@ pub(crate) fn column_for_state(state: &LinearState, catalog: Option<&ProjectStat
     }
     match state.kind {
         LinearStateType::Completed => Column::done(),
-        LinearStateType::Canceled => Column::canceled(),
+        LinearStateType::Canceled | LinearStateType::Duplicate => Column::canceled(),
         _ => Column::from_status_id(slug(&state.name)),
     }
 }
 
-/// Whether a state is closed in Linear (completed or canceled). The store
+/// Whether a state is closed in Linear (completed, canceled or duplicate). The store
 /// decides open vs. history by this, never by the status id, so a synced
 /// status like `shipped` or `duplicate` still leaves the open board.
 pub(crate) fn is_closed_state(state: &LinearState) -> bool {
-    matches!(state.kind, LinearStateType::Completed | LinearStateType::Canceled)
+    matches!(state.kind, LinearStateType::Completed | LinearStateType::Canceled | LinearStateType::Duplicate)
 }
 
 /// The team state a move to `col` writes: among the states that map to
@@ -259,10 +259,13 @@ pub(crate) fn with(mut base: Map<String, Value>, extra: Value) -> Value {
     Value::Object(base)
 }
 
+/// Linear's closed state types: a state of one of these leaves the open board.
+pub(crate) const CLOSED_STATE_TYPES: [&str; 3] = ["completed", "canceled", "duplicate"];
+
 /// The `state` filter for the open (non-terminal) or closed board.
 pub(crate) fn terminal_filter(closed: bool) -> Value {
     let op = if closed { "in" } else { "nin" };
-    json!({ "state": { "type": { op: ["completed", "canceled"] } } })
+    json!({ "state": { "type": { op: CLOSED_STATE_TYPES } } })
 }
 
 /// The filter matching the Shelbi attachment of `id` (by URL suffix, so a
@@ -366,10 +369,13 @@ mod tests {
             (state("d", "Triage", Triage, 0.0), "triage"),
             (state("e", "Shipped", Completed, 3.0), "done"),
             (state("f", "Duplicate", Canceled, 4.0), "canceled"),
+            // Linear gives a team's Duplicate state its own closed type.
+            (state("g", "Duplicate", Duplicate, 5.0), "canceled"),
         ];
         for (s, want) in cases {
             assert_eq!(column_for_state(&s, None).as_str(), want, "{}", s.name);
         }
+        assert!(is_closed_state(&state("g", "Duplicate", Duplicate, 5.0)));
     }
 
     #[test]

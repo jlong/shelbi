@@ -152,9 +152,9 @@ mod tests {
         let filter = &open.variables["filter"];
         assert_eq!(filter["team"]["id"]["eq"], "team-1");
         assert_eq!(filter["project"]["id"]["eq"], "proj-1");
-        assert_eq!(filter["state"]["type"]["nin"], json!(["completed", "canceled"]));
+        assert_eq!(filter["state"]["type"]["nin"], json!(["completed", "canceled", "duplicate"]));
         let closed = fake.calls_for("ImportPreviewClosed");
         assert_eq!(closed[1].variables["after"], "c1");
-        assert_eq!(closed[0].variables["filter"]["state"]["type"]["in"], json!(["completed", "canceled"]));
+        assert_eq!(closed[0].variables["filter"]["state"]["type"]["in"], json!(["completed", "canceled", "duplicate"]));
     }
 }
