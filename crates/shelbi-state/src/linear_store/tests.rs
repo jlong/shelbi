@@ -1076,7 +1076,7 @@ fn closed_page_reads_history_a_page_at_a_time() {
     assert!(second.next_cursor.is_none());
     let call = env.sim.calls("Issues").last().unwrap().clone();
     assert_eq!(call.var("orderBy"), "updatedAt");
-    assert_eq!(call.var("filter")["state"]["type"]["in"], json!(["completed", "canceled"]));
+    assert_eq!(call.var("filter")["state"]["type"]["in"], json!(["completed", "canceled", "duplicate"]));
 }
 
 #[test]

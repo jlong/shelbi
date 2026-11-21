@@ -1340,6 +1340,14 @@ pub fn load_project(project: &str) -> Result<Project> {
     Ok(p)
 }
 
+/// A project's issue-tracker connection, read without loading its
+/// workflows or running [`load_project`]'s migrations. For the tracker paths
+/// that must work while the default workflow fails to load: a status sync is
+/// how a workflow naming a status the Linear team lacks gets repaired.
+pub fn load_project_tracker(project: &str) -> Result<shelbi_core::IssueTrackerConfig> {
+    Ok(load_project_bare(project)?.issue_tracker)
+}
+
 /// Load a project's config *without* running the one-shot migrations that
 /// [`load_project`] performs. This is the loader [`config_project_dir`]
 /// uses to learn a project's [`ConfigMode`](shelbi_core::ConfigMode): the

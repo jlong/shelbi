@@ -75,6 +75,7 @@ fn state_types_default_to_categories() {
         (LinearStateType::Completed, "Done", Done),
         (LinearStateType::Canceled, "Canceled", Archived),
         (LinearStateType::Canceled, "Duplicate", Archived),
+        (LinearStateType::Duplicate, "Duplicate", Archived),
         (LinearStateType::Unknown, "Whatever", Backlog),
     ];
     for (kind, name, want) in cases {
@@ -164,6 +165,29 @@ fn resync_keeps_ids_and_category_overrides_across_rename_reorder_add_remove() {
     );
     // A second pass over the same states changes nothing.
     assert!(diff_catalogs(&next, &plan_catalog(&next, &states).unwrap()).is_empty());
+}
+
+#[test]
+fn linears_duplicate_type_reads_as_archived_and_heals_the_old_backlog_default() {
+    let dup: LinearState =
+        serde_json::from_value(json!({"id": "state-dup", "name": "Duplicate", "type": "duplicate", "position": 7.0}))
+            .unwrap();
+    assert_eq!(dup.kind, LinearStateType::Duplicate);
+    let mut states = eng_states();
+    states.push(dup);
+    let catalog = plan_catalog(&default_project_statuses(), &states).unwrap();
+    assert_eq!(catalog.get("duplicate").unwrap().category, Archived);
+
+    // A catalog an older Shelbi synced (the type read as unknown: backlog)
+    // moves to archived on the next sync, instead of keeping backlog as if
+    // the user had picked it.
+    let mut old = catalog.clone();
+    old.statuses.iter_mut().find(|s| s.id == "duplicate").unwrap().category = Backlog;
+    let resynced = plan_catalog(&old, &states).unwrap();
+    assert_eq!(resynced.get("duplicate").unwrap().category, Archived);
+    // A category the user did pick is still kept.
+    old.statuses.iter_mut().find(|s| s.id == "duplicate").unwrap().category = Done;
+    assert_eq!(plan_catalog(&old, &states).unwrap().get("duplicate").unwrap().category, Done);
 }
 
 #[test]
@@ -417,18 +441,106 @@ fn the_filter_cache_keeps_the_sync_stamp() {
     assert!(doc.contains_key("resolved"));
 }
 
+/// [`linear_project`] with `default_workflow: task`, as `shelbi init`
+/// makes it: the project fails to load while `task` names a status the
+/// catalog lacks.
+fn linear_project_with_default_workflow(home: &test_home::Home) {
+    linear_project(home);
+    let path = crate::projects_dir().unwrap().join(format!("{PROJECT}.yaml"));
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{text}default_workflow: task\n")).unwrap();
+    crate::load_project(PROJECT).unwrap();
+}
+
 #[test]
-fn connect_syncs_and_offers_the_rewrites() {
+fn connect_syncs_and_maps_the_workflows_so_the_project_loads() {
     let home = test_home::fresh();
-    linear_project(&home);
+    linear_project_with_default_workflow(&home);
     let fake = FakeLinear::new();
     let _guard = fake.install();
     let connected = connect(PROJECT).unwrap();
     assert!(connected.sync.written);
-    assert_eq!(connected.rewrites.len(), 1);
+    assert_eq!(connected.rewritten, 1);
     assert_eq!(connected.rewrites[0].workflow, "task");
-    // Offered, not applied.
-    assert!(crate::load_workflow(PROJECT, "task").is_err());
+    assert_eq!(connected.rewrites[0].remapped, vec![("review".to_string(), "in-review".to_string())]);
+    assert!(connected.unmappable.is_empty());
+    crate::load_project(PROJECT).unwrap();
+    let task = crate::load_workflow(PROJECT, "task").unwrap();
+    assert!(task.status("in-review").is_some() && task.status("review").is_none());
+    let edges: Vec<(String, String)> =
+        task.transitions.iter().flatten().map(|t| (t.from.clone(), t.to.clone())).collect();
+    assert!(edges.contains(&("in-progress".into(), "in-review".into())), "{edges:?}");
+    assert!(edges.contains(&("in-review".into(), "done".into())), "{edges:?}");
+    assert!(edges.iter().all(|(f, t)| f != "review" && t != "review"), "{edges:?}");
+}
+
+#[test]
+fn a_team_without_a_handoff_status_is_planned_as_a_refusal_and_nothing_is_written() {
+    let home = test_home::fresh();
+    linear_project_with_default_workflow(&home);
+    // Linear's stock team: no review state.
+    let states: Vec<LinearState> = eng_states().into_iter().filter(|s| s.id != "state-review").collect();
+    let statuses = crate::statuses_path(PROJECT).unwrap();
+    let task = crate::workflow_path(PROJECT, "task").unwrap();
+    let before = (std::fs::read_to_string(&statuses).unwrap(), std::fs::read_to_string(&task).unwrap());
+
+    let plan = plan_connect(PROJECT, "ENG (Engineering)", "ENG", &states).unwrap();
+    assert_eq!(
+        plan.unmappable,
+        vec![Unmappable { workflow: "task".into(), status: "review".into(), category: Some(Handoff) }]
+    );
+    let why = plan.refusal().expect("refused");
+    assert!(why.contains("The Linear team ENG has no status"), "{why}");
+    assert!(why.contains("Nothing was written."), "{why}");
+    assert!(why.contains("workflow `task`: `review` (a handoff status"), "{why}");
+    assert!(why.contains("like In Review"), "{why}");
+    assert!(why.contains("`in-progress`"), "{why}");
+    let after = (std::fs::read_to_string(&statuses).unwrap(), std::fs::read_to_string(&task).unwrap());
+    assert_eq!(after, before, "a plan writes nothing");
+    assert!(!plan.sync.written);
+
+    // A team that has one plans clean.
+    let plan = plan_connect(PROJECT, "ENG (Engineering)", "ENG", &eng_states()).unwrap();
+    assert_eq!(plan.refusal(), None);
+    assert_eq!(plan.rewrites[0].remapped, vec![("review".to_string(), "in-review".to_string())]);
+}
+
+#[test]
+fn plan_connect_to_reads_the_resolved_team() {
+    let home = test_home::fresh();
+    linear_project(&home);
+    let fake = FakeLinear::new();
+    let _guard = fake.install();
+    let client = LinearClient::for_project(Some(PROJECT)).unwrap();
+    let filters = linear_client::resolve_filters(&client, &shelbi_core::LinearConnection::for_team("ENG")).unwrap();
+    let plan = plan_connect_to(PROJECT, &filters).unwrap();
+    assert_eq!((plan.team.as_str(), plan.team_key.as_str()), ("ENG (Engineering)", "ENG"));
+    assert_eq!(fake.calls_for("TeamStates")[0].var("teamId"), "team-eng");
+    assert_eq!(plan.refusal(), None);
+}
+
+#[test]
+fn sync_repairs_a_project_whose_workflow_names_a_status_linear_lacks() {
+    let home = test_home::fresh();
+    linear_project_with_default_workflow(&home);
+    let fake = FakeLinear::new();
+    let _guard = fake.install();
+    // An older connect synced the catalog without mapping the workflows:
+    // the project no longer loads.
+    sync(PROJECT, false).unwrap();
+    let err = crate::load_project(PROJECT).unwrap_err().to_string();
+    assert!(err.contains("status `review` is not one of the Linear team's statuses"), "{err}");
+
+    // The repair still reads the connection and syncs, then maps `review`
+    // (retired by that sync, a handoff status) onto in-review.
+    let synced = sync(PROJECT, false).unwrap();
+    assert!(synced.changes.is_empty());
+    let rewrites = plan_workflow_rewrites(PROJECT, &synced.after, &synced.before).unwrap();
+    assert_eq!(rewrites[0].remapped, vec![("review".to_string(), "in-review".to_string())]);
+    apply_workflow_rewrites(&rewrites).unwrap();
+    crate::load_project(PROJECT).unwrap();
+    // The board refresh reads it without the project loading, too.
+    let _ = refresh_if_changed(PROJECT, Duration::ZERO).unwrap();
 }
 
 #[test]

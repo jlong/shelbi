@@ -12,7 +12,10 @@
 //!    count: after [`move_issues`] the switch needs no force;
 //! 2. runs the new tracker's preflight (`gh` for GitHub,
 //!    [`crate::project_create::linear::linear_preflight`] for Linear), so a
-//!    connection that can't work is never written;
+//!    connection that can't work is never written. For Linear that includes
+//!    planning the status sync onto the team ([`ConnectEnv::plan_statuses`]):
+//!    a workflow status no team status can take refuses the connection, since
+//!    the project wouldn't load after it;
 //! 3. writes the `issue_tracker:` block whole
 //!    ([`shelbi_state::tracker_config::write_issue_tracker`]), so the
 //!    project keeps exactly one external tracker block (none for the file
@@ -20,7 +23,8 @@
 //! 4. for Linear, caches the resolved filter ids
 //!    (`projects/<name>/linear.json`) and syncs the team's workflow states
 //!    into the status catalog through [`ConnectEnv::sync_statuses`]
-//!    ([`sync_linear_statuses`]).
+//!    ([`sync_linear_statuses`]), mapping the project's workflows onto the
+//!    synced statuses by category so the project loads right after.
 //!
 //! Every IO step goes through [`ConnectEnv`], so tests run the whole
 //! operation with canned answers.
@@ -49,8 +53,12 @@ pub trait ConnectEnv {
     /// The Linear preflight with `project`'s key: what `conn` resolved to,
     /// or the fix to show.
     fn linear_preflight(&mut self, project: &str, conn: &LinearConnection) -> Result<ResolvedLinearFilters, String>;
+    /// Plan syncing the Linear team's states into `project`'s catalog and
+    /// mapping its workflows onto them, writing nothing: why the connection
+    /// must be refused (a workflow status no team status can take), if so.
+    fn plan_statuses(&mut self, project: &str, filters: &ResolvedLinearFilters) -> Result<(), String>;
     /// Sync the Linear team's workflow states into `project`'s status
-    /// catalog.
+    /// catalog, and map its workflows onto them.
     fn sync_statuses(&mut self, project: &str, filters: &ResolvedLinearFilters) -> StatusSync;
 }
 
@@ -81,17 +89,33 @@ impl ConnectEnv for LiveEnv {
         linear::preflight_linear(Some(project), conn)
     }
 
+    fn plan_statuses(&mut self, project: &str, filters: &ResolvedLinearFilters) -> Result<(), String> {
+        plan_linear_statuses(project, filters)
+    }
+
     fn sync_statuses(&mut self, project: &str, filters: &ResolvedLinearFilters) -> StatusSync {
         sync_linear_statuses(project, filters)
     }
 }
 
-/// Sync a Linear team's workflow states into `project`'s status catalog
-/// (`shelbi_state::linear_statuses::connect`, run after the connection is
-/// written, so it reads the new team). The workflow rewrites it plans onto
-/// the synced catalog are offered, not applied: the line says how to
-/// apply them. A failure is reported, never fatal: the connection stands
-/// and the board refresh re-syncs when the team's states change.
+/// Whether `project`'s workflows map onto the statuses of the Linear team
+/// `filters` resolved to (`shelbi_state::linear_statuses::plan_connect_to`):
+/// the refusal to show when a workflow status has no team status of its
+/// category. Reads the team's states; writes nothing.
+pub fn plan_linear_statuses(project: &str, filters: &ResolvedLinearFilters) -> Result<(), String> {
+    let plan = shelbi_state::linear_statuses::plan_connect_to(project, filters)
+        .map_err(|e| format!("couldn't read the Linear team's statuses: {e}"))?;
+    match plan.refusal() {
+        Some(why) => Err(why),
+        None => Ok(()),
+    }
+}
+
+/// Sync a Linear team's workflow states into `project`'s status catalog and
+/// map its workflows onto them (`shelbi_state::linear_statuses::connect`,
+/// run after the connection is written, so it reads the new team). A
+/// failure is reported, never fatal: the connection stands and the board
+/// refresh re-syncs when the team's states change.
 pub fn sync_linear_statuses(project: &str, _filters: &ResolvedLinearFilters) -> StatusSync {
     match shelbi_state::linear_statuses::connect(project) {
         Ok(done) => StatusSync::Synced(status_sync_line(&done)),
@@ -138,15 +162,19 @@ const UNPACED_MOVE: usize = 10;
 /// and comments copied. Matched by shelbi id, so a re-run skips what's there
 /// and a move that stopped resumes. Nothing is switched.
 pub fn move_issues(project: &str, choice: &TrackerChoice) -> Result<Moved, MoveFailed> {
-    let current = shelbi_state::load_project(project)
-        .map_err(|e| MoveFailed::before_start(format!("project `{project}` could not be loaded: {e}")))?
-        .issue_tracker;
+    let current = shelbi_state::load_project_tracker(project)
+        .map_err(|e| MoveFailed::before_start(format!("project `{project}` could not be loaded: {e}")))?;
     let new = choice.config(&current);
     new.validate().map_err(|e| MoveFailed::before_start(e.to_string()))?;
     let unreadable = |e: shelbi_core::Error| MoveFailed::before_start(format!("couldn't read the issues to move: {e}"));
     let from = shelbi_state::raw_issue_store(project, &current).map_err(unreadable)?;
     let (to, targets): (Box<dyn shelbi_state::IssueStore>, _) = match choice {
         TrackerChoice::Linear(conn) => {
+            // The move is the first write of a connection: a team the
+            // project's workflows can't be mapped onto (the connection
+            // would be refused) is refused here, before any issue moves.
+            let filters = linear::preflight_linear(Some(project), conn).map_err(MoveFailed::before_start)?;
+            plan_linear_statuses(project, &filters).map_err(MoveFailed::before_start)?;
             // The team's own statuses: each card goes into the one of the
             // same id, else of the same category.
             let store = shelbi_state::LinearStore::new(project, conn.clone());
@@ -243,8 +271,10 @@ fn linear_import_preview(project: &str, conn: &LinearConnection) -> Result<Impor
 /// "Sync now"): the same sync a connection runs, reported the same way. A
 /// project not on Linear has nothing to sync.
 pub fn sync_statuses_now(project: &str) -> StatusSync {
-    match shelbi_state::load_project(project) {
-        Ok(p) if p.issue_tracker.backend == IssueTrackerBackend::Linear => {}
+    // Read without loading the workflows: a sync is how one naming a status
+    // the team lacks gets mapped onto the team's.
+    match shelbi_state::load_project_tracker(project) {
+        Ok(t) if t.backend == IssueTrackerBackend::Linear => {}
         Ok(_) => return StatusSync::NotNeeded,
         Err(e) => return StatusSync::Failed(e.to_string()),
     }
@@ -254,8 +284,8 @@ pub fn sync_statuses_now(project: &str) -> StatusSync {
     }
 }
 
-/// `7 statuses from the team (3 changed); 1 workflow can be mapped onto
-/// them: shelbi tracker linear sync --rewrite-workflows`.
+/// `7 statuses from the Linear team (3 changed); mapped 1 workflow onto
+/// them (review -> in-review)`.
 fn status_sync_line(done: &shelbi_state::linear_statuses::Connected) -> String {
     let sync = &done.sync;
     let n = sync.after.statuses.len();
@@ -263,17 +293,31 @@ fn status_sync_line(done: &shelbi_state::linear_statuses::Connected) -> String {
     if !sync.changes.is_empty() {
         line.push_str(&format!(" ({} changed)", sync.changes.len()));
     }
-    let rewrites = done.rewrites.iter().filter(|r| r.changes()).count();
-    if rewrites > 0 {
+    if done.rewritten > 0 {
+        let mut renames: Vec<String> = Vec::new();
+        for r in done.rewrites.iter().filter(|r| r.changes()) {
+            for (from, to) in &r.remapped {
+                let rename = format!("{from} -> {to}");
+                if !renames.contains(&rename) {
+                    renames.push(rename);
+                }
+            }
+        }
         line.push_str(&format!(
-            "; {rewrites} workflow{} can be mapped onto them: `shelbi tracker linear sync --rewrite-workflows`",
-            if rewrites == 1 { "" } else { "s" }
+            "; mapped {} workflow{} onto them",
+            done.rewritten,
+            if done.rewritten == 1 { "" } else { "s" }
         ));
-    } else if !sync.broken.is_empty() {
+        if !renames.is_empty() {
+            line.push_str(&format!(" ({})", renames.join(", ")));
+        }
+    }
+    if !done.unmappable.is_empty() {
+        let names: Vec<String> =
+            done.unmappable.iter().map(|u| format!("{}: {}", u.workflow, u.status)).collect();
         line.push_str(&format!(
-            "; {} workflow reference{} no longer match: `shelbi tracker linear sync --rewrite-workflows`",
-            sync.broken.len(),
-            if sync.broken.len() == 1 { "" } else { "s" }
+            "; no Linear status has the category of {} (give one that category, or edit the workflow)",
+            names.join(", ")
         ));
     }
     line
@@ -330,9 +374,11 @@ pub fn apply_tracker_connection_with(
     project: &str,
     req: &ConnectTracker,
 ) -> Result<Connected, ConnectError> {
-    let loaded = shelbi_state::load_project(project)
+    // The connection alone, not the workflows: connecting is also how a
+    // project whose workflow names a status the team lacks gets mapped
+    // onto the team's.
+    let current = shelbi_state::load_project_tracker(project)
         .map_err(|e| ConnectError::Failed(format!("project `{project}` could not be loaded: {e}")))?;
-    let current = loaded.issue_tracker;
     let new = req.config(&current);
     new.validate().map_err(|e| ConnectError::Preflight(e.to_string()))?;
 
@@ -390,6 +436,7 @@ pub fn apply_tracker_connection_with(
         }
         TrackerChoice::Linear(conn) => {
             let resolved = env.linear_preflight(project, conn).map_err(ConnectError::Preflight)?;
+            env.plan_statuses(project, &resolved).map_err(ConnectError::Preflight)?;
             (format!("Linear {}", linear::summary(&resolved)), Some(resolved))
         }
     };
@@ -433,7 +480,10 @@ mod tests {
         /// What `already_moved` answers; `None`: none moved.
         moved: Option<Result<usize, String>>,
         preflight: Option<String>,
+        /// What `plan_statuses` refuses with; `None`: the workflows map.
+        unmappable: Option<String>,
         counted: Vec<IssueTrackerBackend>,
+        planned: Vec<String>,
         synced: Vec<String>,
     }
 
@@ -463,6 +513,10 @@ mod tests {
                 assignee_id: None,
                 assignee_name: None,
             })
+        }
+        fn plan_statuses(&mut self, _project: &str, filters: &ResolvedLinearFilters) -> Result<(), String> {
+            self.planned.push(filters.team_id.clone());
+            self.unmappable.clone().map_or(Ok(()), Err)
         }
         fn sync_statuses(&mut self, _project: &str, filters: &ResolvedLinearFilters) -> StatusSync {
             self.synced.push(filters.team_id.clone());
@@ -502,6 +556,7 @@ machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/app\nworkspaces:
         assert_eq!(done.summary, "Linear ENG (Engineering)");
         assert_eq!(done.statuses, StatusSync::Synced("7 states".into()));
         assert_eq!(env.counted, vec![IssueTrackerBackend::Github], "the old board was checked");
+        assert_eq!(env.planned, vec!["team-eng".to_string()], "the sync was planned first");
         assert_eq!(env.synced, vec!["team-eng".to_string()]);
 
         let text = std::fs::read_to_string(&file).unwrap();
@@ -617,6 +672,50 @@ machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/app\nworkspaces:
         assert_eq!((again.moved.len(), again.already, again.total()), (0, 2, 2));
         assert_eq!(to.list().unwrap().len(), 2);
         assert_eq!(to.list_comments("fix-login").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_workflow_status_the_team_cant_take_refuses_before_anything_is_written() {
+        let _home = crate::test_lock::isolated_home();
+        let file = register(GITHUB);
+        let before = std::fs::read_to_string(&file).unwrap();
+        let mut env = FakeEnv { unmappable: Some("no handoff status in ENG".into()), ..FakeEnv::default() };
+        let err = apply_tracker_connection_with(&mut env, "app", &linear("ENG")).unwrap_err();
+        assert_eq!(err, ConnectError::Preflight("no handoff status in ENG".into()));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "nothing written");
+        assert!(!linear_client::filter_cache_path("app").unwrap().exists(), "no filter cache");
+        assert!(env.synced.is_empty(), "no sync");
+    }
+
+    #[test]
+    fn a_move_onto_a_team_the_workflows_cant_map_onto_is_refused_before_any_issue_moves() {
+        use shelbi_state::{FileSystemStore, IssueStore, NewIssue};
+        let _home = crate::test_lock::isolated_home();
+        let file = register("default_workflow: task\n");
+        std::fs::create_dir_all(file.with_extension("")).unwrap();
+        shelbi_state::scaffold_project_statuses("app").unwrap();
+        shelbi_state::scaffold_project_workflow("app").unwrap();
+        FileSystemStore::new("app")
+            .add(NewIssue::new("fix-login", "Fix login", shelbi_core::Column::todo(), ""))
+            .unwrap();
+        let fake = linear_client::FakeLinear::new();
+        // Linear's stock team: nothing for the `task` workflow's `review`.
+        let mut states: serde_json::Value =
+            serde_json::from_str(linear_client::fixture("TeamStates").unwrap()).unwrap();
+        states["data"]["team"]["states"]["nodes"].as_array_mut().unwrap().retain(|s| s["name"] != "In Review");
+        fake.on("TeamStates", states.to_string());
+        let _guard = fake.install();
+
+        let choice = TrackerChoice::Linear(LinearConnection::for_team("ENG"));
+        let err = move_issues("app", &choice).unwrap_err();
+        assert!(err.moved.is_empty() && err.left.is_empty(), "{err:?}");
+        assert!(err.reason.contains("workflow `task`: `review`"), "{}", err.reason);
+        assert!(fake.calls_for("IssueCreate").is_empty(), "no issue was created");
+        let config = std::fs::read_to_string(&file).unwrap();
+        // The connection is refused the same way, nothing written.
+        let err = apply_tracker_connection("app", &ConnectTracker::new(choice, true)).unwrap_err();
+        assert!(matches!(&err, ConnectError::Preflight(m) if m.contains("`review`")), "{err:?}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), config);
     }
 
     #[test]
