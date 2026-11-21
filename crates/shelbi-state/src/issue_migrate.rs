@@ -149,6 +149,51 @@ pub fn plan_issue_migration_mapped(
     })
 }
 
+/// Default spacing between successive writes into a GitHub target. GitHub's
+/// secondary limit for content creation is 80/min and 500/hr; a write every
+/// 7.5s is ~8/min and 480/hr, safely under both, so a bulk run stays out of
+/// the limit rather than sprinting into it and recovering via backoff.
+pub const DEFAULT_GITHUB_PACE_SECS: f64 = 7.5;
+
+/// Default spacing between successive writes into a Linear target: 3s is
+/// 1,200 writes an hour, inside Linear's hourly request budget for an API key
+/// with room left for the board's own reads.
+pub const DEFAULT_LINEAR_PACE_SECS: f64 = 3.0;
+
+/// The default pace for a bulk run into `target` (none for the on-disk board,
+/// which has no write limit).
+pub fn default_pace(target: shelbi_core::IssueTrackerBackend) -> Duration {
+    use shelbi_core::IssueTrackerBackend as B;
+    let secs = match target {
+        B::Github => DEFAULT_GITHUB_PACE_SECS,
+        B::Linear => DEFAULT_LINEAR_PACE_SECS,
+        _ => 0.0,
+    };
+    Duration::from_secs_f64(secs)
+}
+
+/// [`plan_issue_migration_mapped`] for `project`'s board: a source status's
+/// category comes from the project's status catalog (else the built-in
+/// columns'), and `targets` are a Linear target's workflow states (`None`
+/// keeps every status as is). What `shelbi issue-store migrate` and Connect to
+/// an Issue tracker's move both plan with.
+pub fn plan_project_migration(
+    project: &str,
+    from: &dyn IssueStore,
+    to: &dyn IssueStore,
+    targets: Option<&[(Column, StatusCategory)]>,
+) -> Result<IssueMigrationPlan> {
+    let catalog = crate::load_project_statuses(project).ok();
+    let source_category = |col: &Column| -> StatusCategory {
+        catalog
+            .as_ref()
+            .and_then(|c| c.get(col.as_str()))
+            .map(|s| s.category)
+            .unwrap_or_else(|| col.category())
+    };
+    plan_issue_migration_mapped(from, to, targets, &source_category)
+}
+
 /// A mid-run abort: the issues that *were* created (durable on the target)
 /// before an `add` failed, plus the error that stopped the run. Returned as the
 /// `Err` half of [`apply_issue_migration`] so the caller can report the partial

@@ -111,8 +111,9 @@ pub use github_store::{
 #[cfg(any(test, feature = "test-support"))]
 pub use github_store::{clear_test_gh_runner, set_test_gh_runner, set_test_park_side_effects};
 pub use issue_migrate::{
-    apply_issue_migration, plan_issue_migration, plan_issue_migration_mapped, IssueMigrationPlan,
-    MigrationControls, PartialMigration, StatusRemap,
+    apply_issue_migration, default_pace, plan_issue_migration, plan_issue_migration_mapped,
+    plan_project_migration, IssueMigrationPlan, MigrationControls, PartialMigration, StatusRemap,
+    DEFAULT_GITHUB_PACE_SECS, DEFAULT_LINEAR_PACE_SECS,
 };
 pub use occupancy::{project_is_working, slot_reads_working, BoardOccupancy, SlotOccupancy};
 pub use board_index::{
@@ -137,7 +138,7 @@ pub use error_log::{
 };
 pub use issue_store::{
     is_terminal_column, issue_store_for, issue_store_for_project, raw_issue_store_for,
-    resolve_issue_store, BoardRead, BoardState, ClosedPage, Cursor, FileSystemStore, IssueChange,
+    raw_issue_store, resolve_issue_store, BoardRead, BoardState, ClosedPage, Cursor, FileSystemStore, IssueChange,
     IssueComment, IssueFields, IssueStore, NewIssue, PrioMove, StatusMove,
 };
 pub use orchestrator_setup::{mark_orchestrator_onboarded, orchestrator_onboarded};

@@ -53,18 +53,28 @@
 //!   from one read of the chosen connection where the project lives
 //!   ([`FlowRequest::Preview`], answered with [`TrackerFlow::preview_answer`]):
 //!   the open count, who agents may work for under the rules, the first few
-//!   issues and the closed ones left out. A failed read offers Retry. Its
-//!   primary button (Import N issues) starts the connection.
-//! - **Importing** (07-importing): the connection runs
+//!   issues and the closed ones left out. A failed read offers Retry. When
+//!   the local board has issues ([`FlowRequest::LocalIssues`], answered with
+//!   [`TrackerFlow::local_answer`]) a card offers to move them to the
+//!   tracker first, on by default ([`TrackerFlow::move_on`]); off, the switch
+//!   leaves them on the local file system (a forced switch). Its primary
+//!   button (Import N issues) starts the move, then the connection.
+//! - **Importing** (07-importing): the move runs first when it's on
+//!   ([`FlowRequest::Move`], answered with [`TrackerFlow::moved`]: the
+//!   project's `shelbi issue-store migrate --apply`), then the connection
 //!   ([`crate::tracker_connect::ConnectTracker`], answered with
 //!   [`TrackerFlow::connected`]); then the project's board reads the new
 //!   tracker, and the step completes when its first read lands
-//!   ([`TrackerFlow::imported`]). A refusal (the local board has issues)
-//!   offers Switch anyway, as Settings does.
+//!   ([`TrackerFlow::imported`]). A move that stops says what moved and
+//!   what didn't, with Try again and Back. A refusal because the local
+//!   board still has issues (added after Review) offers the move again, or
+//!   Switch anyway.
 
 use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig};
 
-use super::{import_copy, ConnectError, ConnectTracker, Connected, ImportPreview, TrackerChoice};
+use super::{
+    import_copy, move_copy, ConnectError, ConnectTracker, Connected, ImportPreview, MoveFailed, Moved, TrackerChoice,
+};
 use crate::github_setup::{GithubAnswer, GithubAuth, GithubChoice, GithubRequest, REPO_REQUIRED};
 use crate::linear_setup::{KeyState, LinearAnswer, LinearChoice, LinearRequest, Loadable, TEAM_REQUIRED};
 use crate::new_project::{github_config, Tracker};
@@ -115,6 +125,8 @@ pub const CLOSE: &str = "Close";
 pub const IMPORT: &str = "Import issues";
 pub const VIEW_BOARD: &str = "View board";
 pub const SWITCH_ANYWAY: &str = "Switch anyway";
+/// The Importing step's primary button after a refusal with the move on.
+pub const MOVE_AND_SWITCH: &str = "Move and switch";
 pub const TRY_AGAIN: &str = "Try again";
 /// The Importing step's lines while the connection runs and once it's saved.
 pub const CONNECTING: &str = "Saving the connection…";
@@ -219,6 +231,35 @@ pub enum Preview {
     Failed(String),
 }
 
+/// The Review import step's count of the local board's issues, for its
+/// move card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalIssues {
+    /// Not asked for (any step before Review import).
+    Idle,
+    /// Asked for: [`TrackerFlow::due`] hands it to the host next.
+    Wanted,
+    /// The host is counting.
+    Loading,
+    Counted(usize),
+    /// The count failed: the card still shows ("your local issues").
+    Unknown(String),
+}
+
+/// Moving the local issues to the tracker, on Importing before the switch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Move {
+    /// Not asked for (the move is off, or there's nothing to move).
+    Idle,
+    /// Asked for: [`TrackerFlow::due`] hands it to the host next.
+    Wanted,
+    /// The host is running it.
+    Running,
+    Done(Moved),
+    /// It stopped: what moved and what didn't (Try again resumes).
+    Failed(MoveFailed),
+}
+
 /// Blocking work the host runs off the UI thread, answering with
 /// [`TrackerFlow::linear_answer`] or [`TrackerFlow::connected`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +276,12 @@ pub enum FlowRequest {
     /// Read what a first import of this connection would bring in, where the
     /// project lives (answered with [`TrackerFlow::preview_answer`]).
     Preview(TrackerChoice),
+    /// Count the project's local issues, where the project lives (answered
+    /// with [`TrackerFlow::local_answer`]).
+    LocalIssues,
+    /// Move the local issues into this connection, where the project lives
+    /// (answered with [`TrackerFlow::moved`]).
+    Move(TrackerChoice),
 }
 
 /// The Connected chooser's beat before it moves on to Choose project.
@@ -294,6 +341,13 @@ pub struct TrackerFlow {
     /// The Review import step's read, and the connection it was read for.
     preview: Preview,
     preview_for: Option<TrackerChoice>,
+    /// The local board's issues, and whether Import moves them first.
+    local: LocalIssues,
+    move_on: bool,
+    moving: Move,
+    /// The connection is a forced switch (the move was turned off): a
+    /// retry of a refusal that can't be overridden keeps it.
+    force: bool,
     apply: Apply,
     /// How many issues the board's first read of the new tracker brought in.
     imported: Option<usize>,
@@ -318,6 +372,10 @@ impl Default for TrackerFlow {
             rules: DEFAULT_RULES,
             preview: Preview::Idle,
             preview_for: None,
+            local: LocalIssues::Idle,
+            move_on: true,
+            moving: Move::Idle,
+            force: false,
             apply: Apply::Idle,
             imported: None,
             error: None,
@@ -615,6 +673,8 @@ impl TrackerFlow {
                 _ => "Connect the project whose issues you want to work on in Shelbi.".into(),
             },
             Step::AgentRules => format!("These rules apply only to new issues imported from {name}."),
+            // With local issues the move card says what becomes of them.
+            Step::ReviewImport if self.offers_move() => format!("Import from {}.", self.source_name()),
             Step::ReviewImport => {
                 format!("Import from {}. Your existing Shelbi tasks stay on this board.", self.source_name())
             }
@@ -764,6 +824,149 @@ impl TrackerFlow {
         };
     }
 
+    // ---- the move card -----------------------------------------------------
+
+    /// The local board's count.
+    pub fn local(&self) -> &LocalIssues {
+        &self.local
+    }
+
+    /// Count the local board on reaching Review import (each time: issues
+    /// may have been added since). A project not on its local board has
+    /// nothing local to move.
+    fn want_local(&mut self) {
+        let local = self.current.as_ref().is_none_or(|c| c.backend == IssueTrackerBackend::FileSystem);
+        if !local {
+            self.local = LocalIssues::Counted(0);
+        } else if self.local != LocalIssues::Loading {
+            self.local = LocalIssues::Wanted;
+        }
+    }
+
+    /// The answer to a [`FlowRequest::LocalIssues`].
+    pub fn local_answer(&mut self, result: Result<usize, String>) {
+        if self.local != LocalIssues::Loading {
+            return;
+        }
+        self.local = match result {
+            Ok(n) => LocalIssues::Counted(n),
+            Err(why) => LocalIssues::Unknown(why),
+        };
+    }
+
+    /// The step shows the move card: Review import with issues on the
+    /// local board (or a count that failed), or Importing after a refusal
+    /// because the local board still has issues.
+    pub fn offers_move(&self) -> bool {
+        match self.step {
+            Step::ReviewImport => {
+                matches!(self.local, LocalIssues::Counted(1..) | LocalIssues::Unknown(_))
+            }
+            Step::Importing => matches!(self.moving, Move::Idle | Move::Done(_)) && self.offers_force(),
+            _ => false,
+        }
+    }
+
+    /// How many local issues the card names, `None` when it can't say.
+    pub fn move_count(&self) -> Option<usize> {
+        match (&self.apply, &self.local) {
+            (Apply::Refused(ConnectError::NotEmpty { issues, .. }), _) if self.step == Step::Importing => Some(*issues),
+            (Apply::Refused(ConnectError::Unverified { .. }), _) if self.step == Step::Importing => None,
+            (_, LocalIssues::Counted(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Whether Import moves the local issues first (on by default).
+    pub fn move_on(&self) -> bool {
+        self.move_on
+    }
+
+    /// The card's switch.
+    pub fn set_move(&mut self, on: bool) {
+        if self.offers_move() {
+            self.move_on = on;
+        }
+    }
+
+    /// Where the moved issues are created: the GitHub repository, or the
+    /// Linear team.
+    pub fn move_target(&self) -> String {
+        match self.tracker {
+            Some(Tracker::Github) => self.github.repo().to_string(),
+            Some(Tracker::Linear) => {
+                let conn = self.linear.connection();
+                conn.team_ref().map(str::to_string).unwrap_or(conn.team)
+            }
+            _ => String::new(),
+        }
+    }
+
+    /// "Move your 3 local issues to Linear".
+    pub fn move_title(&self) -> String {
+        move_copy::card_title(self.move_count(), self.tracker_title())
+    }
+
+    /// The card's help: what happens to the local issues, on or off.
+    pub fn move_help(&self) -> String {
+        if self.move_on {
+            move_copy::card_on(self.move_count(), &self.move_target())
+        } else {
+            move_copy::card_off(self.move_count())
+        }
+    }
+
+    fn tracker_title(&self) -> &'static str {
+        tracker_name(self.tracker.unwrap_or(Tracker::Github))
+    }
+
+    /// The move's progress.
+    pub fn moving(&self) -> &Move {
+        &self.moving
+    }
+
+    /// The Importing step's move line: "Moving 3 local issues…" (not done)
+    /// or "Moved 3 local issues to Linear" (done). `None` without a move
+    /// (or when it stopped: that shows as the step's error).
+    pub fn move_line(&self) -> Option<(bool, String)> {
+        match &self.moving {
+            Move::Wanted | Move::Running => Some((false, move_copy::moving(self.move_count()))),
+            Move::Done(m) => Some((true, move_copy::moved(m.total(), self.tracker_title()))),
+            Move::Idle | Move::Failed(_) => None,
+        }
+    }
+
+    /// The answer to a [`FlowRequest::Move`]: moved, the switch follows
+    /// (unforced: the tracker has every local issue now).
+    pub fn moved(&mut self, result: Result<Moved, MoveFailed>) {
+        if self.moving != Move::Running {
+            return;
+        }
+        match result {
+            Ok(done) => {
+                self.moving = Move::Done(done);
+                self.force = false;
+                self.apply = Apply::Wanted { force: false };
+            }
+            Err(failed) => self.moving = Move::Failed(failed),
+        }
+    }
+
+    /// Import: the move first when the card offers it and it's on, else the
+    /// connection (forced when the card's move is off).
+    fn start_import(&mut self) {
+        self.imported = None;
+        self.apply = Apply::Idle;
+        self.moving = Move::Idle;
+        let offered = self.offers_move();
+        self.force = offered && !self.move_on;
+        if offered && self.move_on {
+            self.moving = Move::Wanted;
+        } else {
+            self.apply = Apply::Wanted { force: self.force };
+        }
+    }
+
     // ---- Importing --------------------------------------------------------
 
     /// How many open issues the import is bringing in, as the preview read
@@ -814,12 +1017,19 @@ impl TrackerFlow {
             }
             Step::AgentRules => true,
             // The count is in the button: it waits for the read (a failed
-            // read can still import, or Retry).
-            Step::ReviewImport => matches!(self.preview, Preview::Loaded(_) | Preview::Failed(_)),
-            Step::Importing => match &self.apply {
-                Apply::Running | Apply::Done(_) | Apply::Refused(_) => true,
-                Apply::Idle | Apply::Wanted { .. } => false,
-            },
+            // read can still import, or Retry), and for the local count (so
+            // the move card shows before Import can be pressed).
+            Step::ReviewImport => {
+                matches!(self.preview, Preview::Loaded(_) | Preview::Failed(_))
+                    && !matches!(self.local, LocalIssues::Wanted | LocalIssues::Loading)
+            }
+            Step::Importing => {
+                matches!(self.moving, Move::Failed(_))
+                    || match &self.apply {
+                        Apply::Running | Apply::Done(_) | Apply::Refused(_) => true,
+                        Apply::Idle | Apply::Wanted { .. } => false,
+                    }
+            }
         }
     }
 
@@ -828,8 +1038,17 @@ impl TrackerFlow {
         if let Some(e) = &self.error {
             return Some(e.clone());
         }
+        if let Move::Failed(f) = &self.moving {
+            return Some(move_copy::failed(f, self.tracker_title()));
+        }
         if let Apply::Refused(e) = &self.apply {
-            return Some(crate::view::title_case(e.message()));
+            return Some(match e {
+                // The local board still has issues: readable, not the CLI's
+                // migrate instructions (the move card offers the move).
+                ConnectError::NotEmpty { issues, .. } => move_copy::still_local(Some(*issues), self.tracker_title()),
+                ConnectError::Unverified { .. } => move_copy::still_local(None, self.tracker_title()),
+                e => crate::view::title_case(e.message()),
+            });
         }
         match (self.step, self.tracker) {
             (Step::ChooseProject, Some(Tracker::Linear)) => self.linear.error().map(str::to_string),
@@ -930,11 +1149,11 @@ impl TrackerFlow {
             Step::ChooseProject => Step::AgentRules,
             Step::AgentRules => {
                 self.want_preview();
+                self.want_local();
                 Step::ReviewImport
             }
             Step::ReviewImport => {
-                self.apply = Apply::Wanted { force: false };
-                self.imported = None;
+                self.start_import();
                 Step::Importing
             }
             Step::Importing => return false,
@@ -943,7 +1162,8 @@ impl TrackerFlow {
     }
 
     /// Whether Back can be pressed: on every step after the chooser but
-    /// Importing, which has it only after a refusal (to change the choice).
+    /// Importing, which has it only after a refusal or a move that stopped
+    /// (to change the choice).
     pub fn can_back(&self) -> bool {
         match self.step {
             Step::Chooser => false,
@@ -951,7 +1171,7 @@ impl TrackerFlow {
             // where Change account's Back lands).
             Step::Authorize => !self.linear.logging_in(),
             Step::ChooseProject | Step::AgentRules | Step::ReviewImport => true,
-            Step::Importing => matches!(self.apply, Apply::Refused(_)),
+            Step::Importing => matches!(self.apply, Apply::Refused(_)) || matches!(self.moving, Move::Failed(_)),
         }
     }
 
@@ -989,6 +1209,9 @@ impl TrackerFlow {
             Step::ReviewImport => Step::AgentRules,
             Step::Importing => {
                 self.apply = Apply::Idle;
+                self.moving = Move::Idle;
+                // Counted again: the board may have changed.
+                self.want_local();
                 Step::ReviewImport
             }
             Step::Chooser => return false,
@@ -1021,7 +1244,9 @@ impl TrackerFlow {
                     None => IMPORT.to_string(),
                 })
             }
+            Step::Importing if matches!(self.moving, Move::Failed(_)) => TRY_AGAIN,
             Step::Importing => match &self.apply {
+                Apply::Refused(_) if self.offers_force() && self.move_on => MOVE_AND_SWITCH,
                 Apply::Refused(_) if self.offers_force() => SWITCH_ANYWAY,
                 Apply::Refused(_) => TRY_AGAIN,
                 _ => VIEW_BOARD,
@@ -1031,16 +1256,33 @@ impl TrackerFlow {
     }
 
     /// The primary button: Continue on the steps before Importing; there,
-    /// View board, or after a refusal Switch anyway / Try again.
+    /// View board; after a move that stopped, Try again; after a refusal
+    /// because the local board has issues, Move and switch (the card's move
+    /// on) or Switch anyway (off); after another refusal, Try again.
     pub fn primary(&mut self) -> Action {
         if self.step != Step::Importing {
             self.advance();
             return Action::None;
         }
+        if matches!(self.moving, Move::Failed(_)) {
+            // Moving again skips what made it (matched by shelbi id).
+            self.moving = Move::Wanted;
+            return Action::None;
+        }
         match &self.apply {
             Apply::Running | Apply::Done(_) => Action::ViewBoard,
+            Apply::Refused(_) if self.offers_force() && self.move_on => {
+                self.apply = Apply::Idle;
+                self.moving = Move::Wanted;
+                Action::None
+            }
+            Apply::Refused(_) if self.offers_force() => {
+                self.force = true;
+                self.apply = Apply::Wanted { force: true };
+                Action::None
+            }
             Apply::Refused(_) => {
-                self.apply = Apply::Wanted { force: self.offers_force() };
+                self.apply = Apply::Wanted { force: self.force };
                 Action::None
             }
             Apply::Idle | Apply::Wanted { .. } => Action::None,
@@ -1052,6 +1294,15 @@ impl TrackerFlow {
     /// The next blocking request, marked running: the host runs it off the
     /// UI thread and answers. Call until `None`.
     pub fn due(&mut self) -> Option<FlowRequest> {
+        if self.moving == Move::Wanted {
+            let Some(choice) = self.wanted() else {
+                self.moving = Move::Idle;
+                self.step = Step::ChooseProject;
+                return None;
+            };
+            self.moving = Move::Running;
+            return Some(FlowRequest::Move(choice));
+        }
         if let Apply::Wanted { force } = self.apply {
             let Some(choice) = self.wanted() else {
                 // The choice can't be connected (it was changed under a
@@ -1071,6 +1322,10 @@ impl TrackerFlow {
                 }
                 None => self.preview = Preview::Idle,
             }
+        }
+        if self.local == LocalIssues::Wanted {
+            self.local = LocalIssues::Loading;
+            return Some(FlowRequest::LocalIssues);
         }
         // The picked tracker's reads: its authorization check (from the
         // chooser, or the Authorize step), and Choose project's pickers
@@ -1194,7 +1449,10 @@ mod tests {
                     let answer = crate::tracker_connect::fixture::answer(choice.clone());
                     flow.preview_answer(&choice, answer)
                 }
+                // An empty local board unless a test says otherwise.
+                FlowRequest::LocalIssues => flow.local_answer(Ok(0)),
                 FlowRequest::Connect(c) => panic!("no connection yet: {c:?}"),
+                FlowRequest::Move(c) => panic!("no move yet: {c:?}"),
             }
         }
     }
@@ -1238,6 +1496,43 @@ mod tests {
         assert!(continue_(&mut flow) && continue_(&mut flow));
         assert_eq!(flow.step(), Step::ReviewImport);
         flow
+    }
+
+    /// Review your first import with `local` answering the local board's
+    /// count (the preview read too).
+    fn at_review_with(tracker: Tracker, local: Result<usize, String>) -> TrackerFlow {
+        let mut flow = TrackerFlow::new();
+        flow.load(&self::local());
+        connect(&mut flow, tracker);
+        match tracker {
+            Tracker::Linear => {
+                flow.linear_mut().select_team("ENG");
+            }
+            _ => flow.set_repo("acme/app"),
+        }
+        assert!(continue_(&mut flow));
+        assert_eq!(flow.step(), Step::AgentRules);
+        flow.advance();
+        assert_eq!(flow.step(), Step::ReviewImport);
+        let mut local = Some(local);
+        while let Some(req) = flow.due() {
+            match req {
+                FlowRequest::Preview(choice) => {
+                    let answer = crate::tracker_connect::fixture::answer(choice.clone());
+                    flow.preview_answer(&choice, answer)
+                }
+                FlowRequest::LocalIssues => {
+                    assert!(!flow.ready(), "Import waits for the local count");
+                    flow.local_answer(local.take().expect("counted once"))
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        flow
+    }
+
+    fn issue(id: &str, title: &str) -> crate::tracker_connect::MovedIssue {
+        crate::tracker_connect::MovedIssue { id: id.into(), title: title.into() }
     }
 
     #[test]
@@ -1660,6 +1955,8 @@ mod tests {
         assert_eq!(flow.step(), Step::ReviewImport);
         let choice = TrackerChoice::Github { repo: "acme/app".into() };
         assert_eq!(flow.due(), Some(FlowRequest::Preview(choice.clone())));
+        assert_eq!(flow.due(), Some(FlowRequest::LocalIssues), "and the local board's count");
+        flow.local_answer(Ok(0));
         assert_eq!(flow.due(), None, "asked once");
         assert!(!flow.ready(), "Import waits for the count");
         assert_eq!(flow.primary_label().as_deref(), Some(IMPORT));
@@ -1677,6 +1974,8 @@ mod tests {
         // Back and on again keeps the read; another repo reads again.
         flow.back();
         flow.advance();
+        assert_eq!(flow.due(), Some(FlowRequest::LocalIssues), "only the local board is counted again");
+        flow.local_answer(Ok(0));
         assert_eq!(flow.due(), None);
         assert_eq!(flow.expected(), Some(64));
         flow.back();
@@ -1732,7 +2031,9 @@ mod tests {
             issues: 3,
             message: "project `app` has 3 issues on the local file system".into(),
         }));
-        assert!(flow.error().unwrap().starts_with("Project `app` has 3 issues"));
+        assert!(flow.error().unwrap().starts_with("3 local issues aren't on GitHub yet"));
+        assert_eq!(flow.primary_label().as_deref(), Some(MOVE_AND_SWITCH), "the move is offered again");
+        flow.set_move(false);
         assert_eq!(flow.primary_label().as_deref(), Some(SWITCH_ANYWAY));
         assert_eq!(flow.secondary(), Some(Secondary::Back));
         assert_eq!(flow.primary(), Action::None);
@@ -1743,5 +2044,159 @@ mod tests {
         assert!(flow.back());
         assert_eq!((flow.step(), flow.apply()), (Step::ReviewImport, &Apply::Idle));
         assert_eq!(flow.error(), None);
+    }
+
+    #[test]
+    fn with_local_issues_review_offers_the_move_on_by_default_and_import_moves_first() {
+        let mut flow = at_review_with(Tracker::Linear, Ok(3));
+        assert!(flow.ready());
+        assert!(flow.offers_move() && flow.move_on());
+        assert_eq!(flow.move_title(), "Move your 3 local issues to Linear");
+        assert_eq!(flow.move_help(), "They're created in ENG first, keeping their status, so nothing is left behind.");
+        assert_eq!(flow.subheading(), "Import from ENG.", "the card says what becomes of the local issues");
+
+        // Import: the move first, then the (unforced) switch.
+        flow.primary();
+        assert_eq!(flow.step(), Step::Importing);
+        let choice = flow.wanted().unwrap();
+        assert_eq!(flow.due(), Some(FlowRequest::Move(choice.clone())));
+        assert_eq!(flow.due(), None, "the switch waits for the move");
+        assert_eq!(flow.move_line(), Some((false, "Moving 3 local issues…".to_string())));
+        assert!(!flow.ready() && !flow.can_back(), "nothing to press while it moves");
+        assert_eq!(flow.secondary(), Some(Secondary::Close));
+        flow.moved(Ok(crate::tracker_connect::Moved {
+            moved: vec![issue("a", "A"), issue("b", "B"), issue("c", "C")],
+            already: 0,
+            comments: 2,
+        }));
+        assert_eq!(flow.move_line(), Some((true, "Moved 3 local issues to Linear".to_string())));
+        assert_eq!(
+            flow.due(),
+            Some(FlowRequest::Connect(ConnectTracker::new(choice, false).with_rules(DEFAULT_RULES))),
+            "no --force: nothing is left behind"
+        );
+        flow.connected(Ok(connected()));
+        assert_eq!(flow.error(), None);
+        assert_eq!(flow.primary(), Action::ViewBoard);
+    }
+
+    #[test]
+    fn with_the_move_off_the_switch_is_forced_and_nothing_moves() {
+        let mut flow = at_review_with(Tracker::Github, Ok(1));
+        assert_eq!(flow.move_title(), "Move your 1 local issue to GitHub");
+        assert_eq!(flow.move_help(), "It's created in acme/app first, keeping its status, so nothing is left behind.");
+        flow.set_move(false);
+        assert!(!flow.move_on());
+        assert_eq!(flow.move_help(), "It stays on the local file system and won't be visible to this project.");
+        flow.primary();
+        let Some(FlowRequest::Connect(req)) = flow.due() else { panic!("the connection, no move") };
+        assert!(req.force, "a forced switch, without a refusal round-trip");
+        assert_eq!(flow.move_line(), None);
+        // A refusal that can't be overridden retries as forced still.
+        flow.connected(Err(ConnectError::Preflight("gh can't see acme/app".into())));
+        assert_eq!(flow.primary_label().as_deref(), Some(TRY_AGAIN));
+        flow.primary();
+        let Some(FlowRequest::Connect(req)) = flow.due() else { panic!("the retry") };
+        assert!(req.force);
+    }
+
+    #[test]
+    fn without_local_issues_there_is_no_card_and_the_flow_is_unchanged() {
+        let mut flow = at_review_with(Tracker::Github, Ok(0));
+        assert!(!flow.offers_move());
+        assert_eq!(flow.subheading(), "Import from acme/app. Your existing Shelbi tasks stay on this board.");
+        flow.primary();
+        let Some(FlowRequest::Connect(req)) = flow.due() else { panic!("the connection") };
+        assert!(!req.force);
+        assert_eq!(flow.moving(), &Move::Idle);
+
+        // A project not on its local board isn't counted at all.
+        let mut flow = TrackerFlow::new();
+        flow.load(&github("acme/app"));
+        flow.want_local();
+        assert_eq!(flow.local(), &LocalIssues::Counted(0));
+    }
+
+    #[test]
+    fn a_count_that_fails_still_shows_the_card_with_the_move_on() {
+        let flow = at_review_with(Tracker::Linear, Err("permission denied".into()));
+        assert!(flow.offers_move() && flow.move_on());
+        assert_eq!(flow.move_title(), "Move your local issues to Linear");
+        assert_eq!(flow.move_help(), "They're created in ENG first, keeping their status, so nothing is left behind.");
+    }
+
+    #[test]
+    fn a_move_that_stops_says_what_moved_and_try_again_resumes() {
+        let mut flow = at_review_with(Tracker::Linear, Ok(3));
+        flow.primary();
+        let Some(FlowRequest::Move(choice)) = flow.due() else { panic!("the move") };
+        flow.moved(Err(crate::tracker_connect::MoveFailed {
+            moved: vec![issue("fix-login", "Fix login")],
+            already: 0,
+            left: vec![issue("add-tests", "Add tests"), issue("rename", "")],
+            reason: "Linear refused the write: rate limited".into(),
+        }));
+        let error = flow.error().unwrap();
+        assert_eq!(
+            error,
+            "Moved 1 of 3 local issues to Linear, then it stopped. Linear refused the write: rate limited. \
+             Moved: Fix login. Not moved yet: Add tests, rename. The project wasn't switched. Try again picks up \
+             where it stopped."
+        );
+        assert!(!error.contains("shelbi ") && !error.contains("--"), "no CLI text: {error}");
+        assert_eq!(flow.due(), None, "nothing is switched");
+        assert_eq!(flow.move_line(), None, "the failure is the step's error");
+        assert_eq!((flow.primary_label().as_deref(), flow.secondary()), (Some(TRY_AGAIN), Some(Secondary::Back)));
+        assert!(flow.ready());
+
+        // Try again moves again (the move skips what made it).
+        flow.primary();
+        assert_eq!(flow.due(), Some(FlowRequest::Move(choice.clone())));
+        flow.moved(Err(crate::tracker_connect::MoveFailed::before_start("couldn't reach Linear")));
+        assert_eq!(
+            flow.error().unwrap(),
+            "Couldn't move your local issues to Linear. Couldn't reach Linear. The project wasn't switched. Try \
+             again picks up where it stopped."
+        );
+        // Back: Review again, the local board counted again.
+        assert!(flow.back());
+        assert_eq!((flow.step(), flow.moving(), flow.error()), (Step::ReviewImport, &Move::Idle, None));
+        assert_eq!(flow.due(), Some(FlowRequest::LocalIssues));
+    }
+
+    #[test]
+    fn issues_added_after_review_are_refused_readably_with_the_move_offered_again() {
+        // No local issues at Review, three by the switch.
+        let mut flow = at_review_with(Tracker::Linear, Ok(0));
+        flow.primary();
+        let _ = flow.due();
+        flow.connected(Err(ConnectError::NotEmpty {
+            from: IssueTrackerBackend::FileSystem,
+            to: IssueTrackerBackend::Linear,
+            issues: 3,
+            message: "project `app` has 3 issues on the local file system; ... shelbi issue-store migrate".into(),
+        }));
+        let error = flow.error().unwrap();
+        assert!(error.starts_with("3 local issues aren't on Linear yet"), "{error}");
+        assert!(!error.contains("shelbi"), "no CLI text: {error}");
+        assert!(flow.offers_move() && flow.move_on());
+        assert_eq!(flow.move_title(), "Move your 3 local issues to Linear");
+        assert_eq!(flow.primary_label().as_deref(), Some(MOVE_AND_SWITCH));
+        flow.primary();
+        let choice = flow.wanted().unwrap();
+        assert_eq!(flow.due(), Some(FlowRequest::Move(choice.clone())));
+        flow.moved(Ok(crate::tracker_connect::Moved { moved: vec![issue("a", "A")], already: 2, comments: 0 }));
+        assert_eq!(flow.move_line(), Some((true, "Moved 3 local issues to Linear".to_string())));
+        let Some(FlowRequest::Connect(req)) = flow.due() else { panic!("the switch") };
+        assert!(!req.force);
+
+        // Off, it's Switch anyway.
+        flow.connected(Err(ConnectError::Unverified { message: "couldn't check".into() }));
+        assert!(flow.error().unwrap().starts_with("Some local issues may not be on Linear yet"));
+        flow.set_move(false);
+        assert_eq!(flow.primary_label().as_deref(), Some(SWITCH_ANYWAY));
+        flow.primary();
+        let Some(FlowRequest::Connect(req)) = flow.due() else { panic!("the forced switch") };
+        assert!(req.force);
     }
 }

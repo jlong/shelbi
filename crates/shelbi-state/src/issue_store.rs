@@ -67,6 +67,12 @@ pub fn resolve_issue_store(
     Ok(store)
 }
 
+/// The **uncached** store for `cfg` (validated first): a migration's two
+/// sides, whose "already there?" check must be a genuine read of each.
+pub fn raw_issue_store(project: &str, cfg: &IssueTrackerConfig) -> Result<Box<dyn IssueStore>> {
+    build_store(project, cfg)
+}
+
 /// Build the raw backend for `cfg`, with no caching layer.
 ///
 /// Split from [`resolve_issue_store`] so the cache's background refresh can

@@ -979,7 +979,11 @@ project: Shelbi\n    label: bug\n    assignee: me\n";
         assert!(err.contains("has 1 issue on the local file system"), "{err}");
         assert!(err.contains("shelbi issue-store migrate --to linear --linear-team ENG "), "{err}");
         assert!(err.contains("--linear-team ENG --apply"), "{err}");
-        assert!(fake.calls().is_empty(), "refused before asking Linear anything");
+        // The guard reads the team's issues (is anything moved already?) but
+        // writes nothing. `t-1` has no title, so the migration can't read it:
+        // it still counts as left behind (the guard fails closed).
+        let ops: Vec<String> = fake.calls().into_iter().map(|c| c.operation).collect();
+        assert_eq!(ops, ["Teams", "Issues"], "refused after reading Linear, nothing written");
 
         let out = run(Some("local"), LinearCmd::Connect(ConnectArgs { force: true, ..connect_args("ENG") }), "").unwrap();
         assert!(out.contains("Connected local to Linear ENG (Engineering) (was file_system)."), "{out}");

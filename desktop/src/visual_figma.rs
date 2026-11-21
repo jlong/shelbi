@@ -2573,6 +2573,8 @@ impl Run {
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| StatusSync::NotNeeded),
             preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
+            local_issues: Arc::new(|| Ok(0)),
+            move_issues: Arc::new(shelbi_app::tracker_connect::fixture::moved),
         };
         let github = IssueTrackerConfig {
             backend: IssueTrackerBackend::Github,
@@ -2672,15 +2674,29 @@ impl Run {
                 },
             })
         });
-        let later: [(&str, Tracker, Edit, usize); 5] = [
-            ("tracker-rules", Tracker::Linear, team, 1),
-            ("tracker-rules-github", Tracker::Github, repo, 1),
-            ("tracker-review", Tracker::Github, repo, 2),
-            ("tracker-review-linear", Tracker::Linear, team, 2),
-            ("tracker-importing", Tracker::Linear, team, 3),
+        // The last field: the local board's issues (the move card's).
+        let later: [(&str, Tracker, Edit, usize, usize); 8] = [
+            ("tracker-rules", Tracker::Linear, team, 1, 0),
+            ("tracker-rules-github", Tracker::Github, repo, 1, 0),
+            ("tracker-review", Tracker::Github, repo, 2, 0),
+            ("tracker-review-linear", Tracker::Linear, team, 2, 0),
+            ("tracker-importing", Tracker::Linear, team, 3, 0),
+            ("tracker-review-move", Tracker::Linear, team, 2, 3),
+            ("tracker-review-move-github", Tracker::Github, repo, 2, 3),
+            ("tracker-importing-move", Tracker::Linear, team, 3, 3),
         ];
-        for (screen, tracker, edit, steps) in later {
-            let service = writes.clone();
+        for (screen, tracker, edit, steps, local) in later {
+            let mut service = writes.clone();
+            service.local_issues = Arc::new(move || Ok(local));
+            service.move_issues = Arc::new(move |_| {
+                Ok(shelbi_app::tracker_connect::Moved {
+                    moved: (0..local)
+                        .map(|i| shelbi_app::tracker_connect::MovedIssue { id: format!("t{i}"), title: format!("Task {i}") })
+                        .collect(),
+                    already: 0,
+                    comments: 0,
+                })
+            });
             let handle = self
                 .cx
                 .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
@@ -3015,6 +3031,8 @@ impl Run {
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| StatusSync::NotNeeded),
             preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
+            local_issues: Arc::new(|| Ok(0)),
+            move_issues: Arc::new(shelbi_app::tracker_connect::fixture::moved),
         };
         let tracker_states: [(&str, Answer, bool, bool); 3] = [
             ("settings-tracker-linear", fixture::answer, true, false),

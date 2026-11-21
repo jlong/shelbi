@@ -238,6 +238,7 @@ fn far_services(asked: Arc<Mutex<FarAsked>>) -> shelbi_orchestrator::far::FarSer
         previous_name: None,
         workspaces: Vec::new(),
     };
+    let moved = Arc::new(std::sync::atomic::AtomicBool::new(false));
     shelbi_orchestrator::far::FarServices {
         pool: PoolService {
             add: Arc::new(|_, _| Err(PoolError::Unsafe("not in the fixture".into()))),
@@ -256,6 +257,38 @@ fn far_services(asked: Arc<Mutex<FarAsked>>) -> shelbi_orchestrator::far::FarSer
         agent_send: Arc::new(|target, _| Err(format!("no agent is running on `{}`", target.workspace))),
         github: Arc::new(shelbi_app::github_setup::fixture::answer),
         import_preview: Arc::new(|_, choice| shelbi_app::tracker_connect::fixture::answer(choice.clone())),
+        // The board's issues move (nothing is written), and then a switch
+        // goes through; without a move it's refused, as the real one would
+        // be with issues on the local board (before it runs `gh`).
+        move_issues: Arc::new({
+            let moved = moved.clone();
+            move |_, _| {
+                moved.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(shelbi_app::tracker_connect::Moved {
+                    moved: vec![shelbi_app::tracker_connect::MovedIssue { id: "a".into(), title: "A".into() }],
+                    already: 1,
+                    comments: 0,
+                })
+            }
+        }),
+        connect: Arc::new(move |project, req| {
+            use shelbi_app::tracker_connect::{ConnectError, Connected, StatusSync};
+            if !req.force && !moved.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(ConnectError::NotEmpty {
+                    from: shelbi_core::IssueTrackerBackend::FileSystem,
+                    to: req.choice.backend(),
+                    issues: shelbi_orchestrator::tracker_connect::local_issues(project),
+                    message: "the local board has issues".into(),
+                });
+            }
+            Ok(Connected {
+                backend: req.choice.backend(),
+                previous: shelbi_core::IssueTrackerBackend::FileSystem,
+                file: format!("{project}.yaml"),
+                summary: "the tracker".into(),
+                statuses: StatusSync::NotNeeded,
+            })
+        }),
         spawn_editor: Arc::new(move |name, cwd, argv| {
             asked
                 .lock()

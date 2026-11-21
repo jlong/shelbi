@@ -117,7 +117,7 @@ use shelbi_app::new_project::Tracker;
 use shelbi_app::settings::tracker::TrackerService;
 use shelbi_app::source::ProjectHandle;
 use shelbi_app::tracker_connect::flow::{
-    self as copy, Action, Apply, Card, CardState, FlowRequest, Preview, Secondary, Step, TrackerFlow,
+    self as copy, Action, Apply, Card, CardState, FlowRequest, Move, Preview, Secondary, Step, TrackerFlow,
 };
 use shelbi_app::tracker_connect::{import_copy, rules_copy, ImportWatch, StatusSync};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
@@ -441,6 +441,13 @@ impl TrackerConnectView {
         cx.notify();
     }
 
+    /// Flip the move card's switch.
+    fn toggle_move(&mut self, cx: &mut Context<Self>) {
+        let on = self.flow.move_on();
+        self.flow.set_move(!on);
+        cx.notify();
+    }
+
     /// The review's Retry after a failed read.
     fn retry_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.flow.retry_preview();
@@ -530,6 +537,33 @@ impl TrackerConnectView {
                         this.update_in(cx, |this, _, cx| {
                             this.flow.preview_answer(&choice, result);
                             cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+                FlowRequest::LocalIssues => {
+                    let count = self.service.local_issues.clone();
+                    let work = cx.background_executor().spawn(async move { count() });
+                    cx.spawn_in(window, async move |this, cx| {
+                        let result = work.await;
+                        this.update_in(cx, |this, _, cx| {
+                            this.flow.local_answer(result);
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                }
+                FlowRequest::Move(choice) => {
+                    let move_issues = self.service.move_issues.clone();
+                    let work = cx.background_executor().spawn(async move { move_issues(choice) });
+                    cx.spawn_in(window, async move |this, cx| {
+                        let result = work.await;
+                        this.update_in(cx, |this, window, cx| {
+                            // Moved: the switch is due next.
+                            this.flow.moved(result);
+                            this.after_change(window, cx);
                         })
                         .ok();
                     })
@@ -647,7 +681,7 @@ fn connected_badge(tracker: Tracker, theme: &Theme) -> Div {
 
 /// An agent rule's setting card (04-agent-rules): its title over its help,
 /// and its switch at the right.
-fn rule_card(id: &'static str, title: String, help: &'static str, on: bool, theme: &Theme) -> Stateful<Div> {
+fn rule_card(id: &'static str, title: String, help: impl Into<gpui::SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
     div()
         .id(id)
         .debug_selector(move || id.into())
@@ -672,7 +706,7 @@ fn rule_card(id: &'static str, title: String, help: &'static str, on: bool, them
                 .min_w_0()
                 .gap(px(8.0))
                 .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child(title))
-                .child(div().type_style(Type::Small).text_color(theme.muted).child(help)),
+                .child(div().debug_selector(move || format!("{id}-help")).type_style(Type::Small).text_color(theme.muted).child(help.into())),
         )
         .child(controls::switch(on, theme).debug_selector(move || format!("{id}-{}", if on { "on" } else { "off" })))
 }
@@ -1129,6 +1163,18 @@ impl TrackerConnectView {
 
     /// Review your first import: what to import, the counts, the first few
     /// issues and the closed ones left out (or the read's loading or error).
+    /// The move card (the agent rules' setting-card style): move the local
+    /// board's issues to the tracker first, on by default.
+    fn move_card(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
+        if !self.flow.offers_move() {
+            return None;
+        }
+        Some(
+            rule_card("tracker-move", self.flow.move_title(), self.flow.move_help(), self.flow.move_on(), theme)
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.toggle_move(cx))),
+        )
+    }
+
     fn review_step(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let field = div()
             .debug_selector(|| "tracker-import-scope".into())
@@ -1188,11 +1234,16 @@ impl TrackerConnectView {
                         .child(div().flex_none().w(px(64.0)).text_color(theme.muted).child(issue.key.clone()))
                         .child(div().flex_1().min_w_0().truncate().text_color(theme.foreground).child(issue.title.clone()))
                 });
+                // With the move card the first issues make room for it (the
+                // frame's summary sits right over the card).
+                let card = self.move_card(theme, cx);
+                let rows = card.is_none().then(|| div().flex().flex_col().gap(px(10.0)).children(rows));
                 col.child(summary)
-                    .child(div().flex().flex_col().gap(px(10.0)).children(rows))
+                    .children(card)
+                    .children(rows)
                     .child(quiet("tracker-import-closed", import_copy::closed_note(p), theme))
             }
-            Preview::Failed(why) => col.child(
+            Preview::Failed(why) => col.children(self.move_card(theme, cx)).child(
                 div()
                     .flex()
                     .flex_col()
@@ -1207,7 +1258,7 @@ impl TrackerConnectView {
                         ),
                     ),
             ),
-            Preview::Idle | Preview::Wanted | Preview::Loading => col.child(
+            Preview::Idle | Preview::Wanted | Preview::Loading => col.children(self.move_card(theme, cx)).child(
                 div()
                     .debug_selector(|| "tracker-import-loading".into())
                     .flex()
@@ -1219,9 +1270,17 @@ impl TrackerConnectView {
         }
     }
 
-    fn importing(&self, theme: &Theme) -> Div {
+    fn importing(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
         let mut lines = div().flex().flex_col().gap(px(16.0)).w_full();
+        // The move first, when it's on: "Moving 3 local issues…", then
+        // "Moved 3 local issues to Linear".
+        if let Some((done, text)) = self.flow.move_line() {
+            lines = lines.child(progress_line("tracker-progress-move", done, text, theme));
+        }
+        let moving = matches!(self.flow.moving(), Move::Wanted | Move::Running | Move::Failed(_));
         match self.flow.apply() {
+            // The connection waits for the move.
+            Apply::Idle if moving => {}
             Apply::Idle | Apply::Wanted { .. } | Apply::Running => {
                 lines = lines.child(progress_line("tracker-progress-connection", false, copy::CONNECTING.into(), theme));
             }
@@ -1266,10 +1325,12 @@ impl TrackerConnectView {
                         )),
                 );
             }
-            // The refusal shows as the step's error.
-            Apply::Refused(_) => {}
+            // The refusal shows as the step's error; the local board still
+            // has issues, the move card offers moving them again.
+            Apply::Refused(_) => lines = lines.children(self.move_card(theme, cx)),
         }
-        let running = !matches!(self.flow.apply(), Apply::Refused(_));
+        // Closing leaves the import running, but not the move.
+        let running = !matches!(self.flow.apply(), Apply::Refused(_)) && !moving;
         lines.when(running, |d| {
             d.child(div().type_style(Type::Small).text_color(theme.muted).child(copy::BACKGROUND_NOTE))
         })
@@ -1303,7 +1364,7 @@ impl TrackerConnectView {
             }
             Step::AgentRules => self.rules_step(theme, cx),
             Step::ReviewImport => self.review_step(theme, cx),
-            Step::Importing => self.importing(theme),
+            Step::Importing => self.importing(theme, cx),
         }
     }
 
@@ -1423,7 +1484,7 @@ mod tests {
 
     use gpui::{Entity, TestAppContext, VisualTestContext};
     use shelbi_app::source::ProjectKey;
-    use shelbi_app::tracker_connect::{ConnectError, ConnectTracker, Connected, TrackerChoice};
+    use shelbi_app::tracker_connect::{ConnectTracker, Connected, TrackerChoice};
     use shelbi_core::{GithubConnection, IssueTrackerBackend, IssueTrackerConfig};
 
     use super::*;
@@ -1450,6 +1511,8 @@ mod tests {
             github: Arc::new(shelbi_app::github_setup::fixture::answer),
             sync_statuses: Arc::new(|| StatusSync::NotNeeded),
             preview: Arc::new(shelbi_app::tracker_connect::fixture::answer),
+            local_issues: Arc::new(|| Ok(0)),
+            move_issues: Arc::new(shelbi_app::tracker_connect::fixture::moved),
         }
     }
 
@@ -1771,6 +1834,98 @@ mod tests {
         assert_eq!(r.flow(|f| f.primary_label()).as_deref(), Some("Import 64 issues"));
     }
 
+    /// On to Review your first import with GitHub's acme/app.
+    fn to_review(r: &mut Rig) {
+        r.connect("tracker-connect-github");
+        r.pick_repo();
+        r.keys("enter");
+        r.keys("enter");
+        assert_eq!(r.flow(|f| f.step()), Step::ReviewImport);
+    }
+
+    #[gpui::test]
+    fn local_issues_show_the_move_card_and_import_moves_them_first(cx: &mut TestAppContext) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let moves = Arc::new(Mutex::new(Vec::new()));
+        let mut service = recording(asked.clone());
+        service.local_issues = Arc::new(|| Ok(3));
+        let record = moves.clone();
+        service.move_issues = Arc::new(move |choice| {
+            record.lock().unwrap().push(choice);
+            Ok(shelbi_app::tracker_connect::Moved { moved: Vec::new(), already: 3, comments: 0 })
+        });
+        let mut r = local(cx, service, IssueTrackerConfig::default());
+        to_review(&mut r);
+        assert!(r.drawn("tracker-move-on") && r.drawn("tracker-import-summary"));
+        assert!(!r.drawn("tracker-import-issue-0"), "the card takes the first issues' room");
+        assert_eq!(r.flow(|f| f.subheading()), "Import from acme/app.");
+        r.keys("enter");
+        assert_eq!(*moves.lock().unwrap(), vec![TrackerChoice::Github { repo: "acme/app".into() }]);
+        let reqs = asked.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1);
+        assert!(!reqs[0].force, "after the move nothing is left behind");
+        assert!(r.drawn("tracker-progress-move") && r.drawn("tracker-progress-connection"));
+        assert!(!r.drawn("tracker-error"));
+    }
+
+    #[gpui::test]
+    fn the_move_off_forces_the_switch_and_no_card_without_local_issues(cx: &mut TestAppContext) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut service = recording(asked.clone());
+        service.local_issues = Arc::new(|| Ok(1));
+        service.move_issues = Arc::new(|_| panic!("the move is off"));
+        let mut r = local(cx, service, IssueTrackerConfig::default());
+        to_review(&mut r);
+        r.click("tracker-move");
+        assert!(r.drawn("tracker-move-off"));
+        assert!(!r.flow(|f| f.move_on()));
+        r.keys("enter");
+        assert!(asked.lock().unwrap()[0].force, "a forced switch, no refusal round-trip");
+        assert!(!r.drawn("tracker-progress-move") && !r.drawn("tracker-error"));
+
+        // An empty local board: no card, the flow as before.
+        let mut r = local(cx, recording(Arc::default()), IssueTrackerConfig::default());
+        to_review(&mut r);
+        assert!(!r.drawn("tracker-move"));
+        assert!(r.drawn("tracker-import-issue-0"));
+    }
+
+    #[gpui::test]
+    fn a_move_that_stops_shows_why_with_try_again_and_back(cx: &mut TestAppContext) {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let mut service = recording(asked.clone());
+        service.local_issues = Arc::new(|| Ok(2));
+        let tries = Arc::new(Mutex::new(0));
+        let counter = tries.clone();
+        service.move_issues = Arc::new(move |_| {
+            let mut n = counter.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                Err(shelbi_app::tracker_connect::MoveFailed {
+                    moved: vec![shelbi_app::tracker_connect::MovedIssue { id: "a".into(), title: "Fix login".into() }],
+                    already: 0,
+                    left: vec![shelbi_app::tracker_connect::MovedIssue { id: "b".into(), title: "Add tests".into() }],
+                    reason: "GitHub refused the write".into(),
+                })
+            } else {
+                Ok(shelbi_app::tracker_connect::Moved { moved: Vec::new(), already: 2, comments: 0 })
+            }
+        });
+        let mut r = local(cx, service, IssueTrackerConfig::default());
+        to_review(&mut r);
+        r.keys("enter");
+        assert!(r.drawn("tracker-error") && r.drawn("tracker-back"));
+        let error = r.flow(|f| f.error()).unwrap();
+        assert!(error.starts_with("Moved 1 of 2 local issues to GitHub, then it stopped."), "{error}");
+        assert!(!error.contains("shelbi issue-store"), "{error}");
+        assert_eq!(r.flow(|f| f.primary_label()).as_deref(), Some(copy::TRY_AGAIN));
+        assert!(asked.lock().unwrap().is_empty(), "nothing was switched");
+        r.keys("enter");
+        assert_eq!(*tries.lock().unwrap(), 2);
+        assert_eq!(asked.lock().unwrap().len(), 1, "moved, then switched");
+        assert!(!r.drawn("tracker-error"));
+    }
+
     #[gpui::test]
     fn esc_closes_the_window(cx: &mut TestAppContext) {
         let mut r = local(cx, recording(Arc::default()), IssueTrackerConfig::default());
@@ -1779,12 +1934,13 @@ mod tests {
         assert_eq!(r.cx.cx.update(|cx| cx.windows().len()), windows - 1);
     }
 
-    /// A project on another machine: the flow reads its connection over the
-    /// host's link, and the connection runs on the far daemon
-    /// (`far::Request::ConnectTracker`), which refuses it there because the
-    /// far board has issues (so nothing runs `gh`).
+    /// A far project (on another machine) reads its pickers, its preview
+    /// and its local board's count over the host's link, and Import moves
+    /// the local issues and connects on the far daemon
+    /// (`far::Request::MoveIssues`, then `far::Request::ConnectTracker`).
+    /// (The far fixture refuses a switch that wasn't moved first.)
     #[gpui::test]
-    fn a_far_project_reads_and_connects_through_its_daemon(cx: &mut TestAppContext) {
+    fn a_far_project_reads_moves_and_connects_through_its_daemon(cx: &mut TestAppContext) {
         let far = crate::remote_fixture::FarHost::new("tracker-flow");
         let mut remote = crate::app::RemoteWindow::new(far.session(), far.listing(), far.link.clone(), far.remote.clone());
         let handle = remote.handle_for_test(crate::remote_fixture::PROJECT);
@@ -1799,6 +1955,10 @@ mod tests {
         r.keys("enter");
         assert_eq!(r.flow(|f| f.step()), Step::AgentRules, "the far daemon's preflight passed");
         r.keys("enter");
+        assert_eq!(r.flow(|f| f.step()), Step::ReviewImport);
+        // The far board's two issues: the move card, on.
+        assert!(r.drawn("tracker-move-on"), "the move card, on by default");
+        assert_eq!(r.flow(|f| f.move_title()), "Move your 2 local issues to GitHub");
         r.keys("enter");
         let asked: Vec<_> = far.asked.lock().unwrap().requests.clone();
         use shelbi_app::github_setup::GithubRequest;
@@ -1809,21 +1969,21 @@ mod tests {
         ] {
             assert!(asked.contains(&shelbi_app::far::Request::Github(want.clone())), "{want:?} went to the far daemon: {asked:?}");
         }
-        assert!(
-            asked.contains(&shelbi_app::far::Request::ImportPreview(TrackerChoice::Github { repo: "acme/app".into() })),
-            "the review's read went to the far daemon: {asked:?}"
-        );
-        assert!(
-            asked.iter().any(|q| matches!(q, shelbi_app::far::Request::ConnectTracker(c)
-                if c.choice == TrackerChoice::Github { repo: "acme/app".into() })),
-            "{asked:?}"
-        );
-        assert!(
-            r.flow(|f| matches!(f.apply(), Apply::Refused(ConnectError::NotEmpty { issues: 2, .. }))),
-            "{:?}",
-            r.flow(|f| f.apply().clone())
-        );
-        assert_eq!(r.flow(|f| f.primary_label()).as_deref(), Some(copy::SWITCH_ANYWAY));
-        assert!(r.drawn("tracker-error"));
+        let choice = TrackerChoice::Github { repo: "acme/app".into() };
+        for want in [
+            shelbi_app::far::Request::ImportPreview(choice.clone()),
+            shelbi_app::far::Request::LocalIssues,
+            shelbi_app::far::Request::MoveIssues(choice.clone()),
+        ] {
+            assert!(asked.contains(&want), "{want:?} went to the far daemon: {asked:?}");
+        }
+        let connect = asked.iter().position(|q| matches!(q, shelbi_app::far::Request::ConnectTracker(c)
+            if c.choice == choice && !c.force));
+        let moved = asked.iter().position(|q| matches!(q, shelbi_app::far::Request::MoveIssues(_)));
+        assert!(moved < connect && connect.is_some(), "moved, then an unforced switch: {asked:?}");
+        assert!(r.flow(|f| f.finished().is_some()), "{:?}", r.flow(|f| (f.apply().clone(), f.moving().clone())));
+        assert!(r.drawn("tracker-progress-move"));
+        assert_eq!(r.flow(|f| f.move_line()), Some((true, "Moved 2 local issues to GitHub".to_string())));
+        assert!(!r.drawn("tracker-error"));
     }
 }

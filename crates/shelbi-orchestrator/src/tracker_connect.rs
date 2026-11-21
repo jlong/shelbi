@@ -5,9 +5,11 @@
 //! process; Settings sends a `ConnectTracker` app request to the project's
 //! daemon, which calls it there (`crate::far`). In order it:
 //!
-//! 1. refuses to switch boards while the current one has issues (they'd be
-//!    left behind, unseen), pointing at `shelbi issue-store migrate`, unless
-//!    [`ConnectTracker::force`];
+//! 1. refuses to switch boards while the current one has issues the new one
+//!    doesn't hold (they'd be left behind, unseen), pointing at `shelbi
+//!    issue-store migrate`, unless [`ConnectTracker::force`]. Issues already
+//!    moved there (matched by shelbi id, as the migration matches them) don't
+//!    count: after [`move_issues`] the switch needs no force;
 //! 2. runs the new tracker's preflight (`gh` for GitHub,
 //!    [`crate::project_create::linear::linear_preflight`] for Linear), so a
 //!    connection that can't work is never written;
@@ -24,7 +26,8 @@
 //! operation with canned answers.
 
 use shelbi_app::tracker_connect::{
-    ConnectError, ConnectTracker, Connected, ImportPreview, PreviewIssue, StatusSync, TrackerChoice,
+    ConnectError, ConnectTracker, Connected, ImportPreview, MoveFailed, Moved, MovedIssue, PreviewIssue, StatusSync,
+    TrackerChoice,
 };
 use shelbi_core::{IssueTrackerBackend, IssueTrackerConfig, LinearConnection};
 use shelbi_state::linear_client::{self, ResolvedLinearFilters};
@@ -36,6 +39,11 @@ pub trait ConnectEnv {
     /// How many issues `project`'s board on `tracker` holds (open ones, for
     /// a remote board).
     fn issue_count(&mut self, project: &str, tracker: &IssueTrackerConfig) -> Result<usize, String>;
+    /// How many of `current`'s issues the `new` board already holds
+    /// (matched by shelbi id), so a switch doesn't leave them behind. Asked
+    /// only when `current` has issues; the rest of [`Self::issue_count`]
+    /// counts as left behind, including any the migration can't read.
+    fn already_moved(&mut self, project: &str, current: &IssueTrackerConfig, new: &IssueTrackerConfig) -> Result<usize, String>;
     /// The `gh` preflight for `repo`: the fix to show when it fails.
     fn github_preflight(&mut self, repo: &str) -> Result<(), String>;
     /// The Linear preflight with `project`'s key: what `conn` resolved to,
@@ -56,6 +64,13 @@ impl ConnectEnv for LiveEnv {
         }
         let store = shelbi_state::issue_store::resolve_issue_store(project, tracker).map_err(|e| e.to_string())?;
         store.list().map(|l| l.len()).map_err(|e| e.to_string())
+    }
+
+    fn already_moved(&mut self, project: &str, current: &IssueTrackerConfig, new: &IssueTrackerConfig) -> Result<usize, String> {
+        let from = shelbi_state::raw_issue_store(project, current).map_err(|e| e.to_string())?;
+        let to = shelbi_state::raw_issue_store(project, new).map_err(|e| e.to_string())?;
+        let plan = shelbi_state::plan_issue_migration(from.as_ref(), to.as_ref()).map_err(|e| e.to_string())?;
+        Ok(plan.already_present.len())
     }
 
     fn github_preflight(&mut self, repo: &str) -> Result<(), String> {
@@ -96,6 +111,104 @@ pub fn local_service(project: &str) -> shelbi_app::settings::tracker::TrackerSer
         github: std::sync::Arc::new(crate::project_create::github::answer),
         sync_statuses: std::sync::Arc::new(move || sync_statuses_now(&c)),
         preview: std::sync::Arc::new(move |choice| import_preview(&d, &choice)),
+        local_issues: std::sync::Arc::new({
+            let project = project.to_string();
+            move || Ok(local_issues(&project))
+        }),
+        move_issues: std::sync::Arc::new({
+            let project = project.to_string();
+            move |choice| move_issues(&project, &choice)
+        }),
+    }
+}
+
+/// How many issues `project`'s local board holds (Connect to an Issue
+/// tracker's move card).
+pub fn local_issues(project: &str) -> usize {
+    issues::file_system_board_issue_count(project)
+}
+
+/// A move this small runs unpaced: its handful of writes is far under any
+/// tracker's limits, and the window waits on it.
+const UNPACED_MOVE: usize = 10;
+
+/// Move `project`'s current board's issues (its local board, from Connect to
+/// an Issue tracker) into `choice` before the switch: what `shelbi
+/// issue-store migrate --apply` does, statuses mapped onto a Linear team's
+/// and comments copied. Matched by shelbi id, so a re-run skips what's there
+/// and a move that stopped resumes. Nothing is switched.
+pub fn move_issues(project: &str, choice: &TrackerChoice) -> Result<Moved, MoveFailed> {
+    let current = shelbi_state::load_project(project)
+        .map_err(|e| MoveFailed::before_start(format!("project `{project}` could not be loaded: {e}")))?
+        .issue_tracker;
+    let new = choice.config(&current);
+    new.validate().map_err(|e| MoveFailed::before_start(e.to_string()))?;
+    let unreadable = |e: shelbi_core::Error| MoveFailed::before_start(format!("couldn't read the issues to move: {e}"));
+    let from = shelbi_state::raw_issue_store(project, &current).map_err(unreadable)?;
+    let (to, targets): (Box<dyn shelbi_state::IssueStore>, _) = match choice {
+        TrackerChoice::Linear(conn) => {
+            // The team's own statuses: each card goes into the one of the
+            // same id, else of the same category.
+            let store = shelbi_state::LinearStore::new(project, conn.clone());
+            let columns = store
+                .status_columns()
+                .map_err(|e| MoveFailed::before_start(format!("couldn't read the Linear team's statuses: {e}")))?;
+            (Box::new(store), Some(columns))
+        }
+        TrackerChoice::Github { .. } => (shelbi_state::raw_issue_store(project, &new).map_err(unreadable)?, None),
+        TrackerChoice::FileSystem => return Err(MoveFailed::before_start("the local board is where they are")),
+    };
+    move_between(project, from.as_ref(), to.as_ref(), targets.as_deref(), new.backend, &|d| std::thread::sleep(d))
+}
+
+/// [`move_issues`] between two stores: plan, then create each card with its
+/// comments, reporting what made it when a write fails.
+fn move_between(
+    project: &str,
+    from: &dyn shelbi_state::IssueStore,
+    to: &dyn shelbi_state::IssueStore,
+    targets: Option<&[(shelbi_core::Column, shelbi_core::StatusCategory)]>,
+    target: IssueTrackerBackend,
+    sleep: &dyn Fn(std::time::Duration),
+) -> Result<Moved, MoveFailed> {
+    let plan = shelbi_state::plan_project_migration(project, from, to, targets)
+        .map_err(|e| MoveFailed::before_start(format!("couldn't read the issues to move: {e}")))?;
+    let pace = if plan.to_migrate.len() <= UNPACED_MOVE {
+        std::time::Duration::ZERO
+    } else {
+        shelbi_state::default_pace(target)
+    };
+    let named = |id: &str, title: &str| MovedIssue { id: id.to_string(), title: title.to_string() };
+    let mut on_created = |_: usize, _: usize, _: &shelbi_core::Issue| {};
+    let mut controls = shelbi_state::MigrationControls {
+        on_created: &mut on_created,
+        pace,
+        sleep,
+        comments_from: Some(from),
+        comments_copied: 0,
+    };
+    let result = shelbi_state::apply_issue_migration(to, &plan, &mut controls);
+    let comments = controls.comments_copied;
+    match result {
+        Ok(created) => Ok(Moved {
+            moved: created.iter().map(|i| named(&i.id, &i.title)).collect(),
+            already: plan.already_present.len(),
+            comments,
+        }),
+        Err(shelbi_state::PartialMigration { created, error }) => {
+            let made: std::collections::HashSet<&str> = created.iter().map(|i| i.id.as_str()).collect();
+            Err(MoveFailed {
+                moved: created.iter().map(|i| named(&i.id, &i.title)).collect(),
+                already: plan.already_present.len(),
+                left: plan
+                    .to_migrate
+                    .iter()
+                    .filter(|tf| !made.contains(tf.task.id.as_str()))
+                    .map(|tf| named(&tf.task.id, &tf.task.title))
+                    .collect(),
+                reason: error.to_string(),
+            })
+        }
     }
 }
 
@@ -234,20 +347,28 @@ pub fn apply_tracker_connection_with(
         );
         match env.issue_count(project, &current) {
             Ok(0) => {}
-            Ok(n) => {
-                return Err(ConnectError::NotEmpty {
-                    from: current.backend,
-                    to,
-                    issues: n,
-                    message: format!(
-                        "project `{project}` has {n} issue{} on {}; switching to {} would leave {} behind. {migrate}",
-                        if n == 1 { "" } else { "s" },
-                        board_name(&current),
-                        board_name(&new),
-                        if n == 1 { "it" } else { "them" },
-                    ),
-                })
-            }
+            // Issues already moved to the new board aren't left behind. The
+            // rest are, counted from the cheap local count so a task file the
+            // migration skips (malformed) still counts, and a target that
+            // can't be read counts them all: the guard fails closed.
+            Ok(n) => match n.saturating_sub(env.already_moved(project, &current, &new).unwrap_or(0)) {
+                0 => {}
+                n => {
+                    return Err(ConnectError::NotEmpty {
+                        from: current.backend,
+                        to,
+                        issues: n,
+                        message: format!(
+                            "project `{project}` has {n} issue{} on {} that {} on {}; switching would leave {} behind. {migrate}",
+                            if n == 1 { "" } else { "s" },
+                            board_name(&current),
+                            if n == 1 { "isn't" } else { "aren't" },
+                            board_name(&new),
+                            if n == 1 { "it" } else { "them" },
+                        ),
+                    })
+                }
+            },
             Err(why) => {
                 return Err(ConnectError::Unverified {
                     message: format!(
@@ -309,6 +430,8 @@ mod tests {
     #[derive(Default)]
     struct FakeEnv {
         issues: Option<Result<usize, String>>,
+        /// What `already_moved` answers; `None`: none moved.
+        moved: Option<Result<usize, String>>,
         preflight: Option<String>,
         counted: Vec<IssueTrackerBackend>,
         synced: Vec<String>,
@@ -318,6 +441,9 @@ mod tests {
         fn issue_count(&mut self, _project: &str, tracker: &IssueTrackerConfig) -> Result<usize, String> {
             self.counted.push(tracker.backend);
             self.issues.clone().unwrap_or(Ok(0))
+        }
+        fn already_moved(&mut self, _project: &str, _current: &IssueTrackerConfig, _new: &IssueTrackerConfig) -> Result<usize, String> {
+            self.moved.clone().unwrap_or(Ok(0))
         }
         fn github_preflight(&mut self, _repo: &str) -> Result<(), String> {
             self.preflight.clone().map_or(Ok(()), Err)
@@ -426,9 +552,19 @@ machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/app\nworkspaces:
         let err = apply_tracker_connection_with(&mut env, "app", &linear("ENG")).unwrap_err();
         let ConnectError::NotEmpty { from, to, issues, message } = &err else { panic!("{err:?}") };
         assert_eq!((*from, *to, *issues), (IssueTrackerBackend::Github, IssueTrackerBackend::Linear, 3));
-        assert!(message.contains("has 3 issues on GitHub (acme/app)"), "{message}");
+        assert!(message.contains("has 3 issues on GitHub (acme/app) that aren't on Linear (ENG)"), "{message}");
         assert!(message.contains("shelbi issue-store migrate --to linear"), "{message}");
         assert!(message.contains("--force"), "{message}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "nothing written");
+
+        // Only the issues the new board doesn't hold count; a target that
+        // can't be read counts them all.
+        let mut env = FakeEnv { issues: Some(Ok(3)), moved: Some(Ok(2)), ..FakeEnv::default() };
+        let err = apply_tracker_connection_with(&mut env, "app", &linear("ENG")).unwrap_err();
+        assert!(matches!(err, ConnectError::NotEmpty { issues: 1, .. }), "{err:?}");
+        let mut env = FakeEnv { issues: Some(Ok(3)), moved: Some(Err("offline".into())), ..FakeEnv::default() };
+        let err = apply_tracker_connection_with(&mut env, "app", &linear("ENG")).unwrap_err();
+        assert!(matches!(err, ConnectError::NotEmpty { issues: 3, .. }), "{err:?}");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "nothing written");
 
         // A board that can't be counted is refused too.
@@ -437,12 +573,50 @@ machines:\n  - name: local\n    kind: local\n    work_dir: /tmp/app\nworkspaces:
         assert!(matches!(err, ConnectError::Unverified { .. }));
         assert!(err.to_string().contains("gh is not signed in"), "{err}");
 
+        // Every issue moved already: the switch needs no force.
+        let mut env = FakeEnv { issues: Some(Ok(3)), moved: Some(Ok(3)), ..FakeEnv::default() };
+        apply_tracker_connection_with(&mut env, "app", &linear("ENG")).unwrap();
+        assert_eq!(shelbi_state::load_project("app").unwrap().issue_tracker.backend, IssueTrackerBackend::Linear);
+        std::fs::write(&file, &before).unwrap();
+
         // --force switches anyway, without counting.
         let mut env = FakeEnv { issues: Some(Ok(3)), ..FakeEnv::default() };
         let req = ConnectTracker { force: true, ..linear("ENG") };
         apply_tracker_connection_with(&mut env, "app", &req).unwrap();
         assert!(env.counted.is_empty());
         assert_eq!(shelbi_state::load_project("app").unwrap().issue_tracker.backend, IssueTrackerBackend::Linear);
+    }
+
+    #[test]
+    fn a_move_copies_the_board_with_its_comments_and_a_rerun_skips_what_moved() {
+        use shelbi_state::{FileSystemStore, IssueStore, NewIssue};
+        let _home = crate::test_lock::isolated_home();
+        let home = std::path::PathBuf::from(std::env::var_os("SHELBI_HOME").unwrap());
+        for p in ["app", "dest"] {
+            std::fs::create_dir_all(home.join("projects").join(p)).unwrap();
+        }
+        let (from, to) = (FileSystemStore::new("app"), FileSystemStore::new("dest"));
+        from.add(NewIssue::new("fix-login", "Fix login", shelbi_core::Column::review(), "body")).unwrap();
+        from.add(NewIssue::new("add-tests", "Add tests", shelbi_core::Column::review(), "")).unwrap();
+        from.add_comment("fix-login", "Repro attached").unwrap();
+        assert_eq!(local_issues("app"), 2);
+
+        let slept = std::cell::Cell::new(0);
+        let sleep = |_: std::time::Duration| slept.set(slept.get() + 1);
+        let moved = move_between("app", &from, &to, None, IssueTrackerBackend::Github, &sleep).unwrap();
+        let mut ids: Vec<_> = moved.moved.iter().map(|i| i.id.as_str()).collect();
+        ids.sort();
+        assert_eq!((ids, moved.already, moved.comments), (vec!["add-tests", "fix-login"], 0, 1));
+        assert_eq!(slept.get(), 0, "a small move isn't paced");
+        let copied = to.list_comments("fix-login").unwrap();
+        assert!(copied[0].body.contains("Repro attached"), "{copied:?}");
+        assert_eq!(to.list().unwrap().len(), 2);
+
+        // Moving again is safe: what's there is skipped, nothing doubles.
+        let again = move_between("app", &from, &to, None, IssueTrackerBackend::Github, &sleep).unwrap();
+        assert_eq!((again.moved.len(), again.already, again.total()), (0, 2, 2));
+        assert_eq!(to.list().unwrap().len(), 2);
+        assert_eq!(to.list_comments("fix-login").unwrap().len(), 1);
     }
 
     #[test]
