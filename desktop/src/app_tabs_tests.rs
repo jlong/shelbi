@@ -756,3 +756,141 @@ fn the_bars_empty_space_moves_the_window_and_a_tab_never_does(cx: &mut TestAppCo
     assert_eq!(test_log::click_at(&mut h.cx, beta, 2), []);
     assert!(h.take_calls().contains(&HostCall::SwitchProject("beta".into())));
 }
+
+/// The quits a confirmed close sends, held until a test answers each one
+/// ([`answer_quit`]), by project name.
+type HeldQuits = Rc<std::cell::RefCell<HashMap<String, futures::channel::oneshot::Sender<Result<(), String>>>>>;
+
+/// Hold `h`'s quits in flight (the orchestrator's handoff and shutdown
+/// still running) in place of asking the daemon.
+fn hold_quits(h: &mut Harness) -> HeldQuits {
+    let held = HeldQuits::default();
+    let stub = held.clone();
+    h.window.update(&mut h.cx, |w, _| {
+        w.quit_stub = Some(Rc::new(move |name: &str| {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            stub.borrow_mut().insert(name.to_string(), tx);
+            Box::pin(async move { rx.await.unwrap_or_else(|_| Err("dropped".into())) })
+        }));
+    });
+    held
+}
+
+/// `name`'s quit comes back with `result`.
+fn answer_quit(h: &mut Harness, held: &HeldQuits, name: &str, result: Result<(), String>) {
+    let tx = held.borrow_mut().remove(name).unwrap_or_else(|| panic!("{name}'s quit is in flight"));
+    tx.send(result).expect("the close waits on it");
+    h.cx.run_until_parked();
+    h.draw();
+}
+
+fn in_flight(held: &HeldQuits) -> Vec<String> {
+    let mut names: Vec<String> = held.borrow().keys().cloned().collect();
+    names.sort();
+    names
+}
+
+fn closing(h: &Harness) -> Vec<String> {
+    let mut ids: Vec<String> = h.window.read_with(&h.cx, |w, _| w.closing_tabs.iter().cloned().collect());
+    ids.sort();
+    ids
+}
+
+/// Hover `tab`, click its `×` and confirm.
+fn close_tab(h: &mut Harness, tab: &'static str, close: &'static str) {
+    let at = bounds(h, tab).center();
+    h.cx.simulate_mouse_move(at, None, Modifiers::none());
+    h.click_selector(close);
+    h.cx.simulate_prompt_answer("Close Project");
+    h.cx.run_until_parked();
+    h.draw();
+}
+
+#[gpui::test]
+fn a_closing_tab_shows_a_spinner_and_closing_until_its_project_has_quit(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta"], &[]);
+    let held = hold_quits(&mut h);
+    let width = bounds(&mut h, "tab-beta").size.width;
+    assert!(!drawn(&mut h, "tab-closing-beta"), "no spinner at rest");
+
+    close_tab(&mut h, "tab-beta", "tab-close-beta");
+    assert_eq!(in_flight(&held), ["beta"], "its quit is on its way");
+    assert_eq!(closing(&h), ["beta"]);
+    // Still hovered, the spinner holds the ×'s 16pt slot, and the name
+    // reads Closing… at the width the name gave the tab.
+    assert!(drawn(&mut h, "tab-closing-beta") && !drawn(&mut h, "tab-close-beta"));
+    let spinner = bounds(&mut h, "tab-closing-beta");
+    assert_eq!(spinner.size.width, px(16.0), "in the ×'s slot");
+    assert!(drawn(&mut h, "tab-closing-label-beta"));
+    assert_eq!(bounds(&mut h, "tab-beta").size.width, width, "the tab keeps its width");
+    let tabs = h.window.read_with(&h.cx, |w, cx| w.tab_props(cx));
+    assert!(tabs.iter().any(|t| t.name == "beta" && t.closing));
+    assert!(tabs.iter().any(|t| t.name == "alpha" && !t.closing));
+
+    // The spinner isn't a button, and nothing else closes it again.
+    h.take_calls();
+    h.click_selector("tab-closing-beta");
+    assert!(!h.cx.has_pending_prompt(), "no second close");
+    assert!(h.take_calls().is_empty(), "nor does it select the tab");
+    right_click(&mut h, "tab-beta");
+    h.click_selector("tab-context-close");
+    assert!(!h.cx.has_pending_prompt(), "the menu's Close Project waits on the quit too");
+    assert_eq!(in_flight(&held), ["beta"], "one quit, not two");
+
+    // Its body still selects it.
+    h.click_selector("tab-beta");
+    assert_eq!(h.take_calls(), [HostCall::SwitchProject("beta".into())]);
+
+    answer_quit(&mut h, &held, "beta", Ok(()));
+    assert_eq!(order(&h), ["alpha"], "quit: the tab goes");
+    assert!(closing(&h).is_empty());
+    assert!(!drawn(&mut h, "tab-closing-beta"));
+}
+
+#[gpui::test]
+fn a_refused_quit_puts_the_tab_back_as_it_was_and_says_so(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta"], &[]);
+    let held = hold_quits(&mut h);
+    let width = bounds(&mut h, "tab-beta").size.width;
+    close_tab(&mut h, "tab-beta", "tab-close-beta");
+    assert!(drawn(&mut h, "tab-closing-beta"));
+
+    answer_quit(&mut h, &held, "beta", Err("the daemon said no".into()));
+    assert_eq!(order(&h), ["alpha", "beta"], "refused: the tab stays");
+    assert!(closing(&h).is_empty());
+    assert!(!drawn(&mut h, "tab-closing-beta") && !drawn(&mut h, "tab-closing-label-beta"));
+    assert!(drawn(&mut h, "tab-close-beta"), "hovered, its × is back");
+    assert_eq!(bounds(&mut h, "tab-beta").size.width, width);
+    let banner = h.window.read_with(&h.cx, |w, _| w.banner.clone().map(|b| b.to_string()));
+    assert_eq!(banner.as_deref(), Some("Couldn't close beta app: the daemon said no"));
+
+    // And it can be closed again.
+    close_tab(&mut h, "tab-beta", "tab-close-beta");
+    assert_eq!(in_flight(&held), ["beta"]);
+}
+
+#[gpui::test]
+fn close_all_other_projects_shows_each_tab_closing_until_its_own_quit_lands(cx: &mut TestAppContext) {
+    let mut h = open(cx, &["alpha", "beta", "gamma"], &[]);
+    let held = hold_quits(&mut h);
+    h.perform(vec![HostCall::CloseOtherProjects]);
+    h.cx.simulate_prompt_answer("Close Projects");
+    h.cx.run_until_parked();
+    h.draw();
+    // Both show it at once, though they quit one after the other.
+    assert_eq!(closing(&h), ["beta", "gamma"]);
+    assert!(drawn(&mut h, "tab-closing-beta") && drawn(&mut h, "tab-closing-gamma"));
+    assert!(!drawn(&mut h, "tab-closing-alpha"), "the kept tab isn't closing");
+    assert_eq!(in_flight(&held), ["beta"], "one at a time");
+
+    answer_quit(&mut h, &held, "beta", Ok(()));
+    assert_eq!(order(&h), ["alpha", "gamma"]);
+    assert_eq!(closing(&h), ["gamma"], "gamma still waits on its own quit");
+    assert!(drawn(&mut h, "tab-closing-gamma"));
+    assert_eq!(in_flight(&held), ["gamma"]);
+
+    answer_quit(&mut h, &held, "gamma", Err("busy".into()));
+    assert_eq!(order(&h), ["alpha", "gamma"], "refused: gamma stays");
+    assert!(closing(&h).is_empty());
+    assert!(!drawn(&mut h, "tab-closing-gamma"));
+}

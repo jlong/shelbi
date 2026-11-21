@@ -15,6 +15,12 @@
 //! its dot for an `×` that closes the project. While ⌘ is held each of the
 //! first nine tabs shows its ⌘N.
 //!
+//! A tab whose project is quitting (its close confirmed, the orchestrator's
+//! handoff and shutdown still in flight) shows the app's spinner in its
+//! `×`'s slot and reads "Closing…" over its name, at the width its name
+//! gives it, until its tab goes (or comes back as it was, the quit refused).
+//! The spinner isn't a button: there is no second close.
+//!
 //! The `+` slot (`new-tab-plus-morph`) is a 52pt square `+` that becomes the
 //! window's New tab (`new-tab-launch`) when clicked: the `+` turns 45°
 //! counterclockwise into an `×` while "New tab" slides out from under it to
@@ -81,6 +87,7 @@ use super::tab_tearoff;
 pub use super::tab_drag::TabReorder;
 use crate::assets::{heroicon, icons, ICON_SIZE_MENU};
 use crate::elements::placed::placed;
+use crate::elements::spinner;
 use crate::project_tabs::NEW_TAB;
 use crate::elements::window_drag;
 use crate::keys::tab_hotkey;
@@ -132,6 +139,11 @@ pub(super) const CONTEXT_GAP: f32 = 2.0;
 /// What the New tab says.
 pub const NEW_TAB_LABEL: &str = "New tab";
 
+/// What a tab whose project is quitting says in place of its name.
+pub const CLOSING_LABEL: &str = "Closing…";
+/// The closing spinner's size, centered in the `×`'s box.
+const CLOSING_SPINNER: f32 = 14.0;
+
 /// A project tab's dot: green, breathing while it works (a tab's project is
 /// always loaded). The New tab has none: its `+` slot shows its `×`.
 pub fn indicator(working: bool) -> ProjectIndicator {
@@ -154,6 +166,9 @@ pub struct Tab {
     /// One of its workspaces' agents is working: the dot breathes. A tab's
     /// project is always loaded, so it is the pulsing disc or the solid one.
     pub working: bool,
+    /// Its project is quitting: a spinner in the `×`'s slot, "Closing…"
+    /// over its name.
+    pub closing: bool,
 }
 
 /// Everything one bar frame draws.
@@ -644,6 +659,61 @@ pub fn tab_title(tab: &Tab) -> SharedString {
     }
 }
 
+/// A tab's name: a remote project's host first, quieter than its label.
+/// While the project quits, "Closing…" reads over it instead: the name stays
+/// laid out, unseen, so the tab keeps its width.
+fn tab_name(tab: &Tab, theme: &Theme) -> Div {
+    let key = &tab.name;
+    let (muted, foreground) = if tab.closing {
+        (gpui::transparent_black(), gpui::transparent_black())
+    } else {
+        (theme.muted, theme.foreground)
+    };
+    let closing = tab.closing.then(|| {
+        let selector = format!("tab-closing-label-{key}");
+        div()
+            .debug_selector(move || selector)
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .min_w_0()
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .type_style(Type::BaseMedium)
+                    .text_color(theme.muted)
+                    .child(CLOSING_LABEL),
+            )
+    });
+    div()
+        .relative()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(TAB_GAP))
+        .min_w_0()
+        .children(tab.host.clone().map(|host| {
+            let selector = format!("tab-host-{key}");
+            div()
+                .flex_none()
+                .debug_selector(move || selector)
+                .type_style(Type::BaseMedium)
+                .text_color(muted)
+                .child(format!("{host} ·"))
+        }))
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .type_style(Type::BaseMedium)
+                .text_color(foreground)
+                .child(tab.label.clone()),
+        )
+        .children(closing)
+}
+
 /// One project's tab (never the New tab: the `+` slot is that): its dot (an `×` while hovered), its host when it is
 /// on another machine, its name, and its ⌘N while ⌘ is held; dragged, it
 /// moves to another place in the bar.
@@ -669,7 +739,26 @@ fn render_tab<H: SidebarHost>(
     };
     let host = cx.entity().downgrade();
     let layout = layout.clone();
-    let lead = if hovered {
+    let lead = if tab.closing {
+        // Not a button: the quit is on its way, and a second won't be sent.
+        // A click on it is swallowed (the tab's body still selects it).
+        let selector = format!("tab-closing-{key}");
+        div()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector)
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(ICON_SIZE_MENU)
+            .child(spinner::spinner_sized(
+                SharedString::from(format!("tab-closing-spinner-{key}")),
+                theme.gray,
+                CLOSING_SPINNER,
+            ))
+            .into_any_element()
+    } else if hovered {
         let close_selector = format!("tab-close-{key}");
         let close = tab.name.clone();
         let group = SharedString::from(close_selector.clone());
@@ -720,24 +809,7 @@ fn render_tab<H: SidebarHost>(
         // Lifted: its slot draws empty (the ghost has it).
         .when(lifted, |d| d.opacity(0.0))
         .child(lead)
-        // A remote project's host first, quieter than its name.
-        .children(tab.host.clone().map(|host| {
-            let selector = format!("tab-host-{key}");
-            div()
-                .flex_none()
-                .debug_selector(move || selector)
-                .type_style(Type::BaseMedium)
-                .text_color(theme.muted)
-                .child(format!("{host} ·"))
-        }))
-        .child(
-            div()
-                .min_w_0()
-                .truncate()
-                .type_style(Type::BaseMedium)
-                .text_color(theme.foreground)
-                .child(tab.label.clone()),
-        )
+        .child(tab_name(tab, theme))
         .children(hotkey.map(|h| {
             let badge = format!("tab-hotkey-{key}");
             style::hotkey(&h, theme).px_0().debug_selector(move || badge)
