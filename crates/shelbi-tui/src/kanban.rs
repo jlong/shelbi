@@ -3321,7 +3321,8 @@ pub(crate) fn render_task_popover_into(
     let (header_lines, body_text, title) = match tf {
         Some(tf) => (
             popover_header(tf, owner, estimate, columns),
-            tf.body.clone(),
+            // The title is in the frame: a first heading repeating it is left out.
+            shelbi_app::board::body_without_title(&tf.task.title, &tf.body).to_string(),
             tf.task.title.clone(),
         ),
         None => (
@@ -4318,6 +4319,21 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         (text, row)
+    }
+
+    #[test]
+    fn the_task_sheet_leaves_out_a_heading_that_repeats_the_title() {
+        let mut tf = task_file("a", Column::todo(), 0, "2026-06-20T10:00:00Z");
+        tf.task.title = "Mac polish: 'tap' wording".into();
+        tf.body = "# Mac polish: \u{201C}tap\u{201D} wording\n\nTwo small Mac issues.\n".into();
+        let (text, _) = sheet_text(&tf);
+        assert_eq!(text.matches("tap").count(), 1, "the title shows once: {text}");
+        assert!(text.contains("Two small Mac issues."), "{text}");
+
+        // A heading that isn't the title still shows.
+        tf.body = "# Overview\n\nTwo small Mac issues.\n".into();
+        let (text, _) = sheet_text(&tf);
+        assert!(text.contains("Overview"), "{text}");
     }
 
     #[test]

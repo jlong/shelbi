@@ -47,13 +47,13 @@ use shelbi_core::StatusCategory;
 
 use super::config_surfaces::{live_entries, InventoryEntry, SurfaceFormat};
 use super::config_upgrade::{
-    append_changelog_section, append_preamble_jobs_section, apply_awareness_variant_markers, apply_handoff_path_rewrite, apply_reporting_subject_rewrite,
+    append_changelog_section, append_preamble_jobs_section, apply_awareness_variant_markers, apply_body_title_heading_rewrite, apply_handoff_path_rewrite, apply_reporting_subject_rewrite,
     apply_claim_on_start_rewrite, apply_tmux_instruction_rewrites, apply_tracker_ownership_rewrites,
     AWARENESS_VARIANTS_AUTOHEAL_CODE, CLAIM_ON_START_AUTOHEAL_CODE, TRACKER_OWNERSHIP_AUTOHEAL_CODE,
     cargo_test_without_no_fail_fast, get, insert_no_fail_fast, is_inert, legacy_status_id,
     scope_label, Classification, UpgradeFinding, UpgradeReport, CHANGELOG_TEMPLATE_MISSING,
     CHANGELOG_TEMPLATE_PRIOR_DEFAULT, PR_TEMPLATE_MISSING,
-    ORCH_CHANGELOG_RULE_MISSING, ORCH_HANDOFF_PATH_AUTOHEAL_CODE, REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_JOBS_MISSING, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
+    ORCH_BODY_TITLE_HEADING_CODE, ORCH_CHANGELOG_RULE_MISSING, ORCH_HANDOFF_PATH_AUTOHEAL_CODE, REMOVED_PROJECT_KEYS, SHARED_PREAMBLE_JOBS_MISSING, SHARED_PREAMBLE_MISSING, REPORTING_SUBJECT_AUTOHEAL_CODE, TMUX_INSTRUCTION_AUTOHEAL_CODE,
 };
 
 /// One auto-heal write-back that landed on disk this run. Returned to the
@@ -301,6 +301,12 @@ fn heal_surface(entry: &InventoryEntry, findings: &[&UpgradeFinding], applied: &
     // path swap in Markdown, handled independently like the rewrite above.
     if codes.contains(ORCH_HANDOFF_PATH_AUTOHEAL_CODE) {
         heal_orchestrator_handoff_path(entry, applied);
+    }
+
+    // Drop the title heading that opens the orchestrator's task body
+    // templates. A line removal in Markdown, handled like the rewrite above.
+    if codes.contains(ORCH_BODY_TITLE_HEADING_CODE) {
+        heal_orchestrator_body_title_heading(entry, applied);
     }
 
     // Add the tracker-ownership dispatch rule to an unedited orchestrator copy
@@ -1218,6 +1224,32 @@ fn heal_orchestrator_handoff_path(entry: &InventoryEntry, applied: &mut Vec<Appl
     );
 }
 
+/// Remove the placeholder title heading that opens each of the orchestrator's
+/// task body templates via the shared [`apply_body_title_heading_rewrite`] (the
+/// same function the sniffer keys the auto-heal on). Only those lines go, so the
+/// user's edits elsewhere survive. A no-op write is skipped.
+fn heal_orchestrator_body_title_heading(entry: &InventoryEntry, applied: &mut Vec<AppliedChange>) {
+    let path = &entry.canonical_path;
+    let Ok(text) = fs::read_to_string(path) else {
+        return;
+    };
+    let out = apply_body_title_heading_rewrite(&text);
+    if out == text {
+        return;
+    }
+    if let Err(e) = write_atomic(path, &out) {
+        eprintln!("shelbi config-upgrade: writing {} failed: {e}", path.display());
+        return;
+    }
+    record(
+        applied,
+        entry,
+        ORCH_BODY_TITLE_HEADING_CODE,
+        path,
+        "body-template-title-heading->removed".into(),
+    );
+}
+
 /// Patch the orchestrator's ready-dispatch and heartbeat missed-dispatch rules
 /// with the tracker-ownership condition via the shared
 /// [`apply_tracker_ownership_rewrites`] table (the same one the sniffer keys the
@@ -1856,6 +1888,51 @@ zen:
         );
         let applied2 = apply_auto_heal(&["demo".to_string()], &report2);
         assert!(applied2.is_empty(), "second pass wrote: {applied2:?}");
+    }
+
+    #[test]
+    fn body_template_title_heading_auto_heals_on_start_idempotently_and_discloses() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = fresh_home();
+        let guard = EnvGuard::new(&["SHELBI_HOME", "SHELBI_HUB_SOCK"]);
+        guard.set("SHELBI_HOME", &home);
+        guard.remove("SHELBI_HUB_SOCK");
+
+        std::fs::write(home.join("projects/demo.yaml"), "repo: /tmp/demo\n").unwrap();
+        let orch_dir = home.join("projects/demo/agents/orchestrator");
+        std::fs::create_dir_all(&orch_dir).unwrap();
+        let path = orch_dir.join("instructions.md");
+        let legacy = "# Orchestrator\n\nMy own rule: be brief.\n\n### Feature\n\n```\n\
+             # [Title of the issue here]\n\n[Brief description of the feature]\n```\n\n\
+             ### Bug\n\n```\n# [Title of the issue here]\n\n[Brief description of the bug]\n```\n";
+        std::fs::write(&path, legacy).unwrap();
+
+        let report = detect(&["demo".to_string()]).unwrap();
+        assert!(
+            report.findings.iter().any(|f| f.code == ORCH_BODY_TITLE_HEADING_CODE
+                && f.classification == Classification::AutoHeal),
+            "expected an {ORCH_BODY_TITLE_HEADING_CODE} auto-heal: {:?}",
+            report.findings.iter().map(|f| &f.code).collect::<Vec<_>>(),
+        );
+        let applied = apply_auto_heal(&["demo".to_string()], &report);
+        assert!(
+            applied.iter().any(|c| c.code == ORCH_BODY_TITLE_HEADING_CODE),
+            "nothing applied: {applied:?}",
+        );
+
+        let healed = std::fs::read_to_string(&path).unwrap();
+        // Other heals (the Changelog section) may append to this bare
+        // fixture; this one only drops the two placeholder lines.
+        let expected = legacy.replace("```\n# [Title of the issue here]\n\n", "```\n");
+        assert!(healed.starts_with(&expected), "{healed}");
+        assert!(!healed.contains("[Title of the issue here]"), "{healed}");
+
+        let log = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default();
+        assert!(log.contains(ORCH_BODY_TITLE_HEADING_CODE), "no disclosure line: {log}");
+
+        let report2 = detect(&["demo".to_string()]).unwrap();
+        assert!(!report2.findings.iter().any(|f| f.code == ORCH_BODY_TITLE_HEADING_CODE));
     }
 
     #[test]

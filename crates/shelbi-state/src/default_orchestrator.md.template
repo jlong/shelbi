@@ -1383,8 +1383,6 @@ Pick the matching template. Omit sections that genuinely don't apply, rather tha
 ### Feature
 
 ```
-# [Title of the issue here]
-
 [Brief description of the feature]
 
 ## Wireframes
@@ -1404,8 +1402,6 @@ Pick the matching template. Omit sections that genuinely don't apply, rather tha
 ### Bug
 
 ```
-# [Title of the issue here]
-
 [Brief description of the bug]
 
 ## Current Behavior
@@ -1426,6 +1422,7 @@ Pick the matching template. Omit sections that genuinely don't apply, rather tha
 
 - ASCII mockups go in the issue body, not as references to a plan. If a source plan has one, copy it forward.
 - Acceptance criteria are observable outcomes the workspace (and reviewer) can check off. Phrase them as "X behaves Y," not as implementation steps.
+- Don't open the body with the title as a heading. The issue's title is shown above the body, so a `# Title` line just repeats it.
 - Cross-cutting context — e.g. "this is part of the customizable-keybindings plan, see Decision §2 for rationale" — can go at the end of the body as a one-liner *for traceability*, but never as a substitute for the inline content the workspace needs.
 
 ## Handoff

@@ -308,6 +308,100 @@ pub fn card_branch(task: &Issue, workflows: &[Workflow], workflow_name: &str) ->
         })
 }
 
+/// Split an issue's body into the heading that only repeats its title and the
+/// rest, so a client that shows the title above the body can leave the copy
+/// out. The first part is the body's first block when that block is a heading
+/// (any level, `#` to `######`) whose text matches `title` ([`same_title`]),
+/// with the blank lines around it; it is empty otherwise, and the second part
+/// is then the whole body. The two parts always join back into `body`, so a
+/// client that edits the shown part can put the hidden one back before it
+/// saves. Bodies the orchestrator wrote from the pre-fix templates open with
+/// such a heading.
+pub fn split_title_heading<'a>(title: &str, body: &'a str) -> (&'a str, &'a str) {
+    let mut at = 0;
+    let mut lines = body.split_inclusive('\n');
+    let heading = loop {
+        match lines.next() {
+            Some(line) if line.trim().is_empty() => at += line.len(),
+            Some(line) => break line,
+            None => return ("", body),
+        }
+    };
+    match heading_text(heading) {
+        Some(text) if same_title(text, title) => {}
+        _ => return ("", body),
+    }
+    at += heading.len();
+    for line in lines {
+        if !line.trim().is_empty() {
+            break;
+        }
+        at += line.len();
+    }
+    body.split_at(at)
+}
+
+/// `body` without a first heading that repeats `title` ([`split_title_heading`]).
+pub fn body_without_title<'a>(title: &str, body: &'a str) -> &'a str {
+    split_title_heading(title, body).1
+}
+
+/// The text of an ATX heading line (`## Text ##`), or `None` when `line`
+/// isn't one: up to three spaces of indent, one to six `#`, then a space or
+/// the line's end. A closing run of `#` is dropped.
+fn heading_text(line: &str) -> Option<&str> {
+    let line = line.trim_end();
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let hashes = rest.len() - rest.trim_start_matches('#').len();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = &rest[hashes..];
+    if !(rest.is_empty() || rest.starts_with([' ', '\t'])) {
+        return None;
+    }
+    let rest = rest.trim();
+    let closed = rest.trim_end_matches('#');
+    Some(if closed.is_empty() || closed.ends_with([' ', '\t']) { closed.trim_end() } else { rest })
+}
+
+/// Whether a heading's text and an issue's title say the same thing: compared
+/// without case, runs of whitespace, inline markdown (`*`, `_`, backticks) or
+/// the kind of quote (straight or curly, single or double, so `'tap'` matches
+/// `"tap"`). An empty heading matches nothing.
+pub fn same_title(heading: &str, title: &str) -> bool {
+    let a = title_key(heading);
+    !a.is_empty() && a == title_key(title)
+}
+
+fn title_key(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for word in text.split_whitespace() {
+        let word: String = word
+            .chars()
+            .filter(|c| !matches!(c, '*' | '_' | '`'))
+            .map(|c| match c {
+                '"' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' | '\u{201C}' | '\u{201D}'
+                | '\u{201E}' | '\u{201F}' | '\u{2032}' | '\u{2033}' => '\'',
+                c => c,
+            })
+            .flat_map(char::to_lowercase)
+            .collect();
+        if word.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        out.push_str(&word);
+    }
+    out
+}
+
 /// The longest excerpt [`card_summary`] keeps (a card clamps it to a few
 /// lines anyway).
 const SUMMARY_MAX_CHARS: usize = 280;
@@ -1184,6 +1278,51 @@ impl BoardInput {
 mod tests {
     use super::*;
     use shelbi_core::{Column, ProjectStatus, WorkflowStatus};
+
+    const MAC_TITLE: &str = "Mac polish: app name in the menu bar, and 'tap' wording";
+
+    #[test]
+    fn a_first_heading_that_repeats_the_title_is_split_off() {
+        let body = "# Mac polish: app name in the menu bar, and \u{201C}tap\u{201D} wording\n\nTwo small Mac issues.\n";
+        assert_eq!(
+            split_title_heading(MAC_TITLE, body),
+            ("# Mac polish: app name in the menu bar, and \u{201C}tap\u{201D} wording\n\n", "Two small Mac issues.\n"),
+        );
+        // Leading blank lines go with it; the parts always join back.
+        let body = "\n\n## Mac polish: app name in the menu bar, and \"tap\" wording ##\n\n\nRest\n";
+        let (hidden, shown) = split_title_heading(MAC_TITLE, body);
+        assert_eq!(shown, "Rest\n");
+        assert_eq!(format!("{hidden}{shown}"), body);
+    }
+
+    #[test]
+    fn title_matching_ignores_case_whitespace_markdown_and_quote_kind() {
+        assert!(same_title("MAC POLISH:  app name in the menu bar, and 'tap' wording", MAC_TITLE));
+        assert!(same_title("**Mac polish**: app name in the `menu bar`, and \u{2018}tap\u{2019} wording", MAC_TITLE));
+        assert!(same_title("Fix `card_summary`", "Fix card_summary"));
+        assert!(!same_title("Mac polish", MAC_TITLE));
+        assert!(!same_title("", ""));
+        for level in 1..=6 {
+            let body = format!("{} {MAC_TITLE}\nRest\n", "#".repeat(level));
+            assert_eq!(body_without_title(MAC_TITLE, &body), "Rest\n", "level {level}");
+        }
+    }
+
+    #[test]
+    fn a_different_or_later_heading_or_a_non_heading_stays() {
+        for body in [
+            "# Overview\n\nRest\n",                       // a heading that isn't the title
+            "Intro\n\n# Mac polish: app name in the menu bar, and 'tap' wording\n", // not first
+            "####### Mac polish: app name in the menu bar, and 'tap' wording\n",     // seven #
+            "#Mac polish: app name in the menu bar, and 'tap' wording\n",            // no space
+            "    # Mac polish: app name in the menu bar, and 'tap' wording\n",       // code indent
+            "",
+        ] {
+            assert_eq!(split_title_heading(MAC_TITLE, body), ("", body), "{body:?}");
+        }
+        // The whole body was the heading: nothing is left to show.
+        assert_eq!(body_without_title(MAC_TITLE, &format!("# {MAC_TITLE}")), "");
+    }
 
     fn issue(id: &str, status: &str) -> IssueFile {
         let now = chrono::DateTime::parse_from_rfc3339("2026-10-01T10:00:00Z")

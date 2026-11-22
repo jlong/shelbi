@@ -1197,24 +1197,49 @@ impl IssuesView {
         }
         let title = self.state.draft_text(&id, Field::Title).unwrap_or(d.title);
         let body = self.state.draft_text(&id, Field::Body).unwrap_or(d.body);
+        let shown = shelbi_app::board::body_without_title(&title, &body);
         if let Some(e) = &self.pane_editors {
             e.title.update(cx, |t, cx| t.set_from_outside(&title, cx));
-            e.body.update(cx, |b, cx| b.set_from_outside(&body, cx));
+            e.body.update(cx, |b, cx| b.set_from_outside(shown, cx));
+        }
+    }
+
+    /// Task `id`'s title and body as the pane has them: the draft's while
+    /// there is one, else the read's.
+    fn title_and_body(&self, id: &str) -> (Option<String>, Option<String>) {
+        let read = self.state.input().tasks().into_iter().find(|tf| tf.task.id == id);
+        let title = self.state.draft_text(id, Field::Title).or_else(|| read.as_ref().map(|tf| tf.task.title.clone()));
+        let body = self.state.draft_text(id, Field::Body).or_else(|| read.as_ref().map(|tf| tf.body.clone()));
+        (title, body)
+    }
+
+    /// The heading the body editor leaves out of task `id`'s body, because
+    /// it only repeats the title shown above it
+    /// ([`shelbi_app::board::split_title_heading`]); empty when there's none.
+    /// An edit puts it back in front, so the saved body keeps it.
+    fn hidden_body_heading(&self, id: &str) -> String {
+        match self.title_and_body(id) {
+            (Some(title), Some(body)) => shelbi_app::board::split_title_heading(&title, &body).0.to_string(),
+            _ => String::new(),
         }
     }
 
     /// Whether an editor's text trails the draft (or the read).
     fn text_behind(&self, e: &PaneEditors, cx: &App) -> bool {
-        let read = self.state.input().tasks().into_iter().find(|tf| tf.task.id == e.id);
-        let title = self.state.draft_text(&e.id, Field::Title).or_else(|| read.as_ref().map(|tf| tf.task.title.clone()));
-        let body = self.state.draft_text(&e.id, Field::Body).or_else(|| read.as_ref().map(|tf| tf.body.clone()));
-        title.is_some_and(|t| t != e.title.read(cx).text()) || body.is_some_and(|b| b != e.body.read(cx).text())
+        let (title, body) = self.title_and_body(&e.id);
+        let shown = body.map(|b| match &title {
+            Some(t) => shelbi_app::board::body_without_title(t, &b).to_string(),
+            None => b,
+        });
+        title.is_some_and(|t| t != e.title.read(cx).text()) || shown.is_some_and(|b| b != e.body.read(cx).text())
     }
 
     /// The title and body editors for task `d`.
     fn make_editors(&mut self, d: &TaskDetailModel, window: &mut Window, cx: &mut Context<Self>) -> PaneEditors {
         let title_text = self.state.draft_text(&d.id, Field::Title).unwrap_or_else(|| d.title.clone());
         let body_text = self.state.draft_text(&d.id, Field::Body).unwrap_or_else(|| d.body.clone());
+        // A first heading that repeats the title isn't shown under it.
+        let body_text = shelbi_app::board::body_without_title(&title_text, &body_text).to_string();
         let scroll = self.detail_scroll.clone();
         let s = scroll.clone();
         let title = cx.new(|cx| DocEditor::new(&title_text, DocField::Title, "Untitled", "Task title", Some(s), window, cx));
@@ -1250,7 +1275,10 @@ impl IssuesView {
     ) {
         let saves = match ev {
             DocEvent::Changed => {
-                let text = ed.read(cx).text().to_string();
+                let mut text = ed.read(cx).text().to_string();
+                if field == Field::Body {
+                    text.insert_str(0, &self.hidden_body_heading(id));
+                }
                 self.state.edit_text(id, field, &text, Instant::now());
                 Vec::new()
             }
@@ -4219,6 +4247,43 @@ mod tests {
         assert!(view.read_with(&cx, |v, _| v.pane_editors.is_none()));
         let draft = view.read_with(&cx, |v, _| v.state.draft_text("A", Field::Body));
         assert_eq!(draft.as_deref(), Some("Body of A s a e h j k l!"));
+    }
+
+    #[gpui::test]
+    fn a_first_heading_repeating_the_title_isnt_shown_and_survives_an_edit(cx: &mut gpui::TestAppContext) {
+        use crate::views::board_state::tests::issue;
+        cx.update(|cx| cx.set_reduce_motion(true));
+        let mut a = issue("A", "todo");
+        a.task.title = "Mac polish: 'tap' wording".into();
+        a.body = "# Mac polish: \u{201C}tap\u{201D} wording\n\nTwo small issues.".into();
+        let mut b = issue("B", "todo");
+        b.body = "# Overview\n\nRest".into();
+        let (view, mut cx) = open_board_sized(cx, vec![a, b], Some(gpui::size(px(1160.0), px(1024.0))));
+        view.update(&mut cx, |v, cx| v.open_task("A", cx));
+        let (_, body) = editors(&view, &mut cx);
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), "Two small issues.");
+        assert_eq!(view.read_with(&cx, |v, _| v.state.draft_text("A", Field::Body)), None, "reading changes nothing");
+
+        // Typing keeps the heading in the body that's saved.
+        let at = body.read_with(&cx, |b, _| b.point_of("Two small issues.".len())).unwrap();
+        cx.simulate_click(at, gpui::Modifiers::none());
+        cx.simulate_input("!");
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), "Two small issues.!");
+        assert_eq!(
+            view.read_with(&cx, |v, _| v.state.draft_text("A", Field::Body)).as_deref(),
+            Some("# Mac polish: \u{201C}tap\u{201D} wording\n\nTwo small issues.!"),
+        );
+        cx.simulate_keystrokes("escape");
+        assert_eq!(
+            sent(&view, &cx),
+            vec![("A".into(), None, Some("# Mac polish: \u{201C}tap\u{201D} wording\n\nTwo small issues.!".into()))]
+        );
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), "Two small issues.!");
+
+        // A heading that isn't the title shows.
+        view.update(&mut cx, |v, cx| v.open_task("B", cx));
+        let (_, body) = editors(&view, &mut cx);
+        assert_eq!(body.read_with(&cx, |b, _| b.text().to_string()), "# Overview\n\nRest");
     }
 
     #[gpui::test]
