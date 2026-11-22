@@ -441,6 +441,7 @@ fn sniff_entry(entry: &InventoryEntry, out: &mut Vec<UpgradeFinding>) {
         sniff_orchestrator_active_dispatch(entry, &text, out);
         sniff_reporting_subject(entry, &text, out);
         sniff_orchestrator_handoff_path(entry, &text, out);
+        sniff_orchestrator_body_title_heading(entry, &text, out);
         sniff_tracker_ownership_dispatch(entry, &text, out);
         sniff_claim_on_start_dispatch(entry, &text, out);
         sniff_orchestrator_changelog(entry, &text, out);
@@ -1019,6 +1020,85 @@ fn sniff_orchestrator_handoff_path(entry: &InventoryEntry, text: &str, out: &mut
          (relative to the orchestrator's workdir, the project's state directory). Mirror the \
          shipped default template.",
         locate_line_containing(text, legacy),
+    ));
+}
+
+/// The stable code for "the orchestrator's task body templates open with a
+/// title heading". An auto-heal: the rewrite drops that one placeholder line.
+pub(crate) const ORCH_BODY_TITLE_HEADING_CODE: &str = "ORCH_BODY_TEMPLATE_TITLE_HEADING";
+
+/// The placeholder title headings the shipped Feature and Bug body templates
+/// used to open with (`issue` today, `task` before the rename). Every body the
+/// orchestrator wrote from them repeated the issue's title as its first
+/// heading, right under the title the clients already show.
+pub(crate) const ORCH_BODY_TITLE_HEADINGS: &[&str] =
+    &["# [Title of the issue here]", "# [Title of the task here]"];
+
+/// Drop each placeholder title heading that is the first line inside a fenced
+/// code block, along with the one blank line after it, so the template reads as
+/// the shipped default does now (the fence opens straight onto the
+/// description). A heading anywhere else, or a fence that opens on anything
+/// else, is left alone, as is every other line. Returns the text unchanged when
+/// there is nothing to drop. Shared by the sniffer and the healer's write-back
+/// so the two can never diverge.
+pub(crate) fn apply_body_title_heading_rewrite(text: &str) -> String {
+    let lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        out.push_str(line);
+        i += 1;
+        if !line.trim_start().starts_with("```") {
+            continue;
+        }
+        in_fence = !in_fence;
+        if !in_fence {
+            continue;
+        }
+        let is_placeholder = lines
+            .get(i)
+            .is_some_and(|next| ORCH_BODY_TITLE_HEADINGS.contains(&next.trim_end()));
+        if is_placeholder {
+            i += 1;
+            if lines.get(i).is_some_and(|next| next.trim().is_empty()) {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Sniff an orchestrator `instructions.md` whose task body templates still open
+/// with `# [Title of the issue here]`, which makes every body it writes repeat
+/// the title as a heading.
+///
+/// An auto-heal: the rewrite removes only that placeholder line (and the blank
+/// line after it) where it opens a template fence, so a user's edits anywhere
+/// else in the file survive. Idempotent: a healed copy has no such line left.
+fn sniff_orchestrator_body_title_heading(
+    entry: &InventoryEntry,
+    text: &str,
+    out: &mut Vec<UpgradeFinding>,
+) {
+    if apply_body_title_heading_rewrite(text) == text {
+        return;
+    }
+    let needle = ORCH_BODY_TITLE_HEADINGS
+        .iter()
+        .find(|h| text.contains(*h))
+        .copied()
+        .unwrap_or(ORCH_BODY_TITLE_HEADINGS[0]);
+    out.push(finding(
+        entry,
+        Classification::AutoHeal,
+        ORCH_BODY_TITLE_HEADING_CODE,
+        "orchestrator task body templates open with `# [Title of the issue here]`, so every \
+         body repeats the issue's title as its first heading",
+        "Remove the `# [Title of the issue here]` (or `# [Title of the task here]`) line that \
+         opens each body template. Mirror the shipped default template.",
+        locate_line_containing(text, needle),
     ));
 }
 
@@ -5425,6 +5505,99 @@ to your workdir). My own note: keep it short.
         sniff_orchestrator_handoff_path(&orch_entry(), shipped, &mut out);
         assert!(out.is_empty(), "{:?}", codes(&out));
         assert_eq!(apply_handoff_path_rewrite(shipped), shipped);
+    }
+
+    // ---- task body templates' title heading ----
+
+    /// A pre-fix copy: both templates open with a title heading (one on the
+    /// older `task` wording, one in a ```markdown fence), with a user's own
+    /// line and a title heading outside any fence that must both survive.
+    const PRE_FIX_BODY_TEMPLATES: &str = "\
+## Task body templates
+
+My own rule: keep bodies short.
+
+# [Title of the issue here]
+
+### Feature
+
+```
+# [Title of the issue here]
+
+[Brief description of the feature]
+
+## Acceptance Criteria
+- [ ] Criterion 1
+```
+
+### Bug
+
+```markdown
+# [Title of the task here]
+
+[Brief description of the bug]
+```
+
+### Example
+
+```
+## Not a placeholder
+# [Title of the issue here]
+```
+";
+
+    #[test]
+    fn body_template_title_heading_is_auto_healed_and_nothing_else_changes() {
+        let mut out = Vec::new();
+        sniff_orchestrator_body_title_heading(&orch_entry(), PRE_FIX_BODY_TEMPLATES, &mut out);
+        assert_eq!(codes(&out), vec![ORCH_BODY_TITLE_HEADING_CODE]);
+        assert_eq!(out[0].classification, Classification::AutoHeal);
+
+        let healed = apply_body_title_heading_rewrite(PRE_FIX_BODY_TEMPLATES);
+        let expected = PRE_FIX_BODY_TEMPLATES
+            .replacen("```\n# [Title of the issue here]\n\n", "```\n", 1)
+            .replacen("```markdown\n# [Title of the task here]\n\n", "```markdown\n", 1);
+        assert_eq!(healed, expected);
+        // Outside a fence, and not first inside one: both left alone.
+        assert!(healed.contains("short.\n\n# [Title of the issue here]\n\n### Feature"), "{healed}");
+        assert!(healed.contains("## Not a placeholder\n# [Title of the issue here]\n```"), "{healed}");
+        assert!(healed.contains("```\n[Brief description of the feature]"), "{healed}");
+        assert!(healed.contains("```markdown\n[Brief description of the bug]"), "{healed}");
+
+        let mut again = Vec::new();
+        sniff_orchestrator_body_title_heading(&orch_entry(), &healed, &mut again);
+        assert!(again.is_empty(), "{:?}", codes(&again));
+        assert_eq!(apply_body_title_heading_rewrite(&healed), healed);
+    }
+
+    #[test]
+    fn body_template_title_heading_without_a_blank_after_or_with_crlf() {
+        assert_eq!(
+            apply_body_title_heading_rewrite("```\n# [Title of the issue here]\n[Brief]\n```\n"),
+            "```\n[Brief]\n```\n",
+        );
+        assert_eq!(
+            apply_body_title_heading_rewrite("```\r\n# [Title of the issue here]\r\n\r\n[Brief]\r\n```\r\n"),
+            "```\r\n[Brief]\r\n```\r\n",
+        );
+        // A fence that ends the file right after the heading.
+        assert_eq!(apply_body_title_heading_rewrite("```\n# [Title of the issue here]"), "```\n");
+    }
+
+    /// Drift guard: the shipped templates open straight onto the description
+    /// and the Notes say not to repeat the title.
+    #[test]
+    fn shipped_default_body_templates_have_no_title_heading() {
+        let shipped = shelbi_state::DEFAULT_ORCHESTRATOR_INSTRUCTIONS;
+        for heading in ORCH_BODY_TITLE_HEADINGS {
+            assert!(!shipped.contains(heading), "the shipped template still has `{heading}`");
+        }
+        assert!(shipped.contains("```\n[Brief description of the feature]"));
+        assert!(shipped.contains("```\n[Brief description of the bug]"));
+        assert!(shipped.contains("Don't open the body with the title as a heading"));
+        let mut out = Vec::new();
+        sniff_orchestrator_body_title_heading(&orch_entry(), shipped, &mut out);
+        assert!(out.is_empty(), "{:?}", codes(&out));
     }
 
     // ---- orchestrator Reporting passage (workspace-subject -> issue) ----
