@@ -182,6 +182,10 @@ fn main() {
     if let Some(code) = shelbi_ssh::askpass::helper_requested() {
         std::process::exit(code);
     }
+    // A launcher (Walker, a `.desktop` file) may start the app with no
+    // `SHELL`: name the user's from the password database before any thread
+    // reads the environment (Linux; nothing on macOS).
+    platform::os::adopt_login_shell();
     init_logging();
     // Tools located outside the login PATH (`config.yaml` `tools:`) join the
     // PATH of the login environment the app's children run under.
@@ -265,6 +269,9 @@ fn main() {
             // resolved from `config.yaml::theme` (gpui-kit's light/dark mode
             // follows it).
             gpui_kit::init(cx);
+            // The name notifications go out under (mako's `app-name`) on
+            // Linux; the bundle's on macOS.
+            platform::os::set_identity(cx);
             theme::init(cx);
             // `desktop.app_icon` in the Dock from the start.
             app_icon::init(cx);
@@ -292,8 +299,11 @@ fn main() {
                 cx,
             );
             // A clicked notification brings up the window showing its project
-            // (else switches the frontmost one) and opens the item. (Notifications only post from the bundled app: an
-            // unbundled `cargo run` has no notification center.)
+            // (else switches the frontmost one) and opens the item. (On
+            // macOS notifications only post from the bundled app: an
+            // unbundled `cargo run` has no notification center. On Linux
+            // they go to the freedesktop notification daemon, mako on
+            // Omarchy, from any build.)
             cx.on_system_notification_response(|response, cx| {
                 app::open_notice_tag(&response.tag, cx);
             });

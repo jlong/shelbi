@@ -187,6 +187,11 @@ struct TestPlatform {
 }
 
 impl Platform for TestPlatform {
+    // The install machinery is exercised on every OS, though only macOS
+    // runs it for real.
+    fn installs_cli(&self) -> bool {
+        true
+    }
     fn login_env(&mut self) -> Env {
         let login: Env = [
             ("PATH".to_string(), self.path.clone()),

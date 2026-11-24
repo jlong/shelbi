@@ -3,6 +3,9 @@
 //! or "Automatically based on mouse or trackpad" with a trackpad), or
 //! always shown ("Always", or Automatic with a mouse plugged in). The
 //! terminals' scrollbar follows it under `desktop.terminal_scrollbar: auto`.
+//! On Linux the desktop's `overlay-scrolling` setting stands in for it
+//! ([`super::desktop_settings`]): on (the default) is overlay, off is
+//! always shown.
 
 /// Whether the system prefers overlay scroll bars: AppKit's
 /// `NSScroller.preferredScrollerStyle`, which resolves Automatic against
@@ -23,7 +26,7 @@ pub fn overlay() -> bool {
 
 #[cfg(not(target_os = "macos"))]
 pub fn overlay() -> bool {
-    true
+    super::desktop_settings::values().overlay_scrolling
 }
 
 /// Call `changed` (on the main thread) whenever the preferred style
@@ -56,4 +59,6 @@ pub fn observe(changed: futures::channel::mpsc::UnboundedSender<()>) {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn observe(_changed: futures::channel::mpsc::UnboundedSender<()>) {}
+pub fn observe(changed: futures::channel::mpsc::UnboundedSender<()>) {
+    super::desktop_settings::observe_overlay(changed);
+}

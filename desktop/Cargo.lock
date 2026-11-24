@@ -6174,6 +6174,7 @@ name = "shelbi-desktop"
 version = "0.14.0"
 dependencies = [
  "alacritty_terminal",
+ "ashpd",
  "async-channel",
  "block2 0.6.2",
  "chrono",

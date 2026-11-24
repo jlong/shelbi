@@ -690,16 +690,7 @@ fn keycap_text(chord: &KeyChord) -> String {
 
 fn open_keys_yaml() -> Result<(), String> {
     let path = shared::ensure_keys_file()?;
-    let status = std::process::Command::new("open")
-        .arg("-t")
-        .arg(&path)
-        .status()
-        .map_err(|e| format!("Couldn't open keys.yaml: {e}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err("Couldn't open keys.yaml in a text editor.".into())
-    }
+    crate::platform::os::open_text(&path).map_err(|e| format!("Couldn't open keys.yaml in a text editor: {e}"))
 }
 
 #[cfg(feature = "visual-check")]
