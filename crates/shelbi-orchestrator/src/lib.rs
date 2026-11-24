@@ -766,7 +766,7 @@ fn spawn_orchestrator_locked(
             // landed, whatever happens to the agent context.
             let enabled = awareness == shelbi_core::AwarenessMode::Awareness
                 && orchestrator_plugin_runner(runner_spec);
-            match workspace::deploy_orchestrator_awareness_plugin(host, &workdir, enabled) {
+            match stage_orchestrator_event_plugin(host, &workdir, runner_spec, enabled) {
                 Ok(staged) => awareness_plugin.set(staged),
                 Err(e) => tracing::warn!(
                     project = project_name,
@@ -774,6 +774,21 @@ fn spawn_orchestrator_locked(
                     "staging the awareness plugin failed; the orchestrator falls back to \
                      the self-driven event drain",
                 ),
+            }
+            if shelbi_agent::RunnerAdapter::for_spec(runner_spec).is_opencode() {
+                let delivery = if awareness_plugin.get() {
+                    EventDelivery::AwarenessPlugin
+                } else {
+                    EventDelivery::SelfDrain
+                };
+                let preamble = opencode_orchestrator_preamble(project_name, &workdir, delivery);
+                if let Err(e) = workspace::write_orchestrator_opencode_preamble(host, &workdir, &preamble) {
+                    tracing::warn!(
+                        project = project_name,
+                        error = %e,
+                        "writing the OpenCode orchestrator's role preamble failed",
+                    );
+                }
             }
             workspace::deploy_agent_context(
                 host,
@@ -1030,7 +1045,10 @@ pub(crate) enum EventDelivery {
     /// The heartbeat system (v1), and any launch v2 can't reach: the
     /// orchestrator watches the log and self-drains.
     SelfDrain,
-    /// Awareness (v2) for Claude: the `shelbi-awareness` plugin delivers.
+    /// Awareness (v2) through a plugin in the runner: Claude's
+    /// `shelbi-awareness` plugin, or Shelbi's OpenCode plugin playing the
+    /// orchestrator. Both run the same `shelbi orchestrator events stream`
+    /// and `shelbi orchestrator hook` commands.
     AwarenessPlugin,
     /// Awareness (v2) for Codex: the native app-server bridge delivers.
     CodexBridge,
@@ -1041,8 +1059,8 @@ pub(crate) enum EventDelivery {
 /// session: Shelbi supplies strict bounds and the repo path, while the agent
 /// reads and summarizes the evidence itself.
 ///
-/// `delivery` selects the bootstrap: the awareness (v2) one for a Claude
-/// orchestrator launched with the `shelbi-awareness` plugin or a Codex one
+/// `delivery` selects the bootstrap: the awareness (v2) one for a Claude or
+/// OpenCode orchestrator launched with its awareness plugin or a Codex one
 /// behind the bridge on v2; every other launch keeps the v1 prompt byte for
 /// byte.
 pub(crate) fn orchestrator_bootstrap_prompt(
@@ -1100,8 +1118,9 @@ pub(crate) fn orchestrator_bootstrap_prompt(
 ///
 /// Codex is routed through Shelbi's native app-server bridge. The bridge owns
 /// the exact Codex thread and attaches the visible TUI to it, so board events
-/// never need to be pasted into the pane. Claude and custom runners retain
-/// their standalone launch behavior.
+/// never need to be pasted into the pane. Claude, OpenCode and custom runners
+/// retain their standalone launch behavior; on awareness (v2) Claude and
+/// OpenCode take their events from the plugin staged for them.
 fn orchestrator_launch_command(
     shelbi_bin: &str,
     spec: &shelbi_core::AgentRunnerSpec,
@@ -1138,9 +1157,9 @@ fn orchestrator_launch_command(
 
 /// Which event system the orchestrator's instructions teach for this launch:
 /// the awareness (v2) variant only when v2 events actually reach it — a Codex
-/// orchestrator through its app-server bridge, a Claude one through the
-/// `shelbi-awareness` plugin this launch staged. A Claude launch whose plugin
-/// failed to stage, and any custom runner, run the v1 self-driven drain (their
+/// orchestrator through its app-server bridge, a Claude or OpenCode one
+/// through the plugin this launch staged. A launch whose plugin failed to
+/// stage, and any custom runner, run the v1 self-driven drain (their
 /// bootstrap prompt says so), so they read the heartbeat (v1) variant to match.
 fn instructions_awareness(
     awareness: shelbi_core::AwarenessMode,
@@ -1156,11 +1175,31 @@ fn instructions_awareness(
     }
 }
 
-/// Whether `spec` is a runner the `shelbi-awareness` plugin can deliver to
-/// (Claude: a plugin monitor plus hooks through `--plugin-dir`). Codex and
-/// custom runners keep the v1 delivery here.
+/// Whether `spec` is a runner an awareness plugin delivers events to
+/// ([`EventDelivery::AwarenessPlugin`]): Claude, through the
+/// `shelbi-awareness` plugin's monitor and hooks (`--plugin-dir`), and
+/// OpenCode, through Shelbi's plugin running the same `shelbi orchestrator
+/// events stream` and `shelbi orchestrator hook` commands. Codex has its own
+/// bridge, and custom runners keep the v1 delivery.
 fn orchestrator_plugin_runner(spec: &shelbi_core::AgentRunnerSpec) -> bool {
-    shelbi_agent::RunnerAdapter::for_spec(spec).is_claude()
+    let adapter = shelbi_agent::RunnerAdapter::for_spec(spec);
+    adapter.is_claude() || adapter.is_opencode()
+}
+
+/// Stage the plugin that delivers events to an orchestrator on `spec`'s
+/// runner, when `enabled`, and clear the other runner's: Claude's
+/// `shelbi-awareness` plugin directory, or Shelbi's OpenCode plugin. Returns
+/// whether a plugin was staged.
+fn stage_orchestrator_event_plugin(
+    host: &Host,
+    workdir: &std::path::Path,
+    spec: &shelbi_core::AgentRunnerSpec,
+    enabled: bool,
+) -> Result<bool> {
+    let opencode = shelbi_agent::RunnerAdapter::for_spec(spec).is_opencode();
+    let claude = workspace::deploy_orchestrator_awareness_plugin(host, workdir, enabled && !opencode)?;
+    let opencode = workspace::deploy_orchestrator_opencode_plugin(host, workdir, enabled && opencode)?;
+    Ok(claude || opencode)
 }
 
 fn codex_bridge_cmd(shelbi_bin: &str, project_name: &str, first_launch: bool) -> String {
@@ -1181,7 +1220,8 @@ fn codex_bridge_cmd(shelbi_bin: &str, project_name: &str, first_launch: bool) ->
 /// Claude receives the composed `agents/orchestrator/instructions.md`
 /// through `--append-system-prompt` and the bootstrap request as its
 /// first positional prompt, preserving the historical Claude startup
-/// shape. Codex (and OpenCode, through `--prompt`) has no `--append-system-prompt` equivalent in Shelbi's
+/// shape. OpenCode receives them through its config layer's `instructions`
+/// ([`opencode_orchestrator_launch`]). Codex has no `--append-system-prompt` equivalent in Shelbi's
 /// runner abstraction, but its interactive CLI accepts an initial
 /// positional prompt; for Codex we build that prompt from the project
 /// identity, worktree path, rendered instructions file, bootstrap
@@ -1216,35 +1256,130 @@ fn launch_with_bootstrap(
     } else if adapter.is_codex() {
         codex_standalone_launch(spec, project_name, workdir, bootstrap_prompt)
     } else if adapter.is_opencode() {
-        opencode_standalone_launch(spec, project_name, workdir, bootstrap_prompt, opencode_user_config)
+        opencode_orchestrator_launch(
+            spec,
+            project_name,
+            workdir,
+            bootstrap_prompt,
+            awareness_plugin,
+            opencode_user_config,
+        )
     } else {
         shelbi_agent::launch_command(spec)
     }
 }
 
-/// OpenCode has no system-prompt flag either, so its orchestrator gets the
-/// same self-contained first prompt as a standalone Codex one, through the
-/// TUI's `--prompt` (its positional argument is a directory). Its config
-/// (model, ceiling) is inline, merged over `user_config`, the user's own
-/// `OPENCODE_CONFIG_CONTENT`, so setting the variable doesn't shadow it.
-fn opencode_standalone_launch(
+/// An OpenCode orchestrator's launch. Its instructions go in at system
+/// authority through the config layer's `instructions`, the way Claude's go
+/// through `--append-system-prompt`: the role preamble
+/// ([`opencode_orchestrator_preamble`], staged at
+/// [`workspace::OPENCODE_INSTRUCTIONS_REL`]) and then the composed
+/// `agents/orchestrator/instructions.md` with any reload handoff
+/// ([`ORCH_AGENT_INSTRUCTIONS_REL`]). Shelbi's configuration skill is a real
+/// skill (`skills`), as it is for Claude. Only the bootstrap request rides
+/// the TUI's `--prompt` (its positional argument is a directory).
+///
+/// - The session is the project's own (`--session`,
+///   [`shelbi_core::opencode_orchestrator_session_id`]), so a reload, a
+///   restart or a relaunch after a crash reopens the same conversation.
+/// - With `awareness_plugin` the layer names Shelbi's plugin, which the
+///   launch tells to play the orchestrator ([`shelbi_agent::with_opencode_role`]):
+///   it runs `shelbi orchestrator events stream` and the `shelbi orchestrator
+///   hook` calls, the contract Claude's `shelbi-awareness` plugin runs.
+/// - The layer is inline, merged over `user_config`, the user's own
+///   `OPENCODE_CONFIG_CONTENT`, so setting the variable doesn't shadow it.
+fn opencode_orchestrator_launch(
     spec: &shelbi_core::AgentRunnerSpec,
     project_name: &str,
     workdir: &std::path::Path,
     bootstrap_prompt: &str,
+    awareness_plugin: bool,
     user_config: Option<&str>,
 ) -> String {
+    let abs = |rel: &str| workdir.join(rel).to_string_lossy().into_owned();
     let layer = shelbi_agent::OpenCodeLayer {
+        instructions: vec![
+            abs(workspace::OPENCODE_INSTRUCTIONS_REL),
+            abs(ORCH_AGENT_INSTRUCTIONS_REL),
+        ],
+        skills: vec![abs(workspace::ORCHESTRATOR_SYSTEM_SKILLS_REL)],
+        plugins: if awareness_plugin {
+            vec![abs(workspace::OPENCODE_PLUGIN_DIR_REL)]
+        } else {
+            Vec::new()
+        },
         user_config: user_config.map(str::to_string),
         ..Default::default()
     };
+    let spec = shelbi_agent::with_opencode_session(
+        spec,
+        &shelbi_core::opencode_orchestrator_session_id(project_name),
+        &shelbi_core::opencode_orchestrator_session_title(project_name),
+    );
+    let spec = if awareness_plugin {
+        shelbi_agent::with_opencode_role(&spec, shelbi_agent::OPENCODE_ORCHESTRATOR_ROLE)
+    } else {
+        spec
+    };
     let launch =
-        shelbi_agent::opencode_launch_command_with(spec, shelbi_agent::OpenCodeConfigSource::Inline(&layer));
+        shelbi_agent::opencode_launch_command_with(&spec, shelbi_agent::OpenCodeConfigSource::Inline(&layer));
+    format!("{launch} --prompt {}", shelbi_agent::shell_escape(bootstrap_prompt))
+}
+
+/// The top of an OpenCode orchestrator's instructions: who it is (the
+/// identity a standalone Codex orchestrator reads at the head of its first
+/// prompt), and how board events reach it for `delivery`.
+pub(crate) fn opencode_orchestrator_preamble(
+    project_name: &str,
+    workdir: &std::path::Path,
+    delivery: EventDelivery,
+) -> String {
+    let mut out = orchestrator_identity(project_name, workdir);
+    out.push_str(
+        "Authoritative Shelbi orchestrator instructions follow. They include the \
+         project-local orchestrator role, bootstrap rules, Zen Mode rules, and any reload \
+         handoff context captured before this session was restarted. If a handoff \
+         `<system-reminder>` block is present there, use it as continuity context. Shelbi's \
+         `update-shelbi-configuration` skill is the reserved workflow for changing Shelbi's \
+         configuration, and it takes precedence over conflicting project instructions.\n\n",
+    );
+    match delivery {
+        EventDelivery::AwarenessPlugin => out.push_str(
+            "Board events reach this session on their own: Shelbi's plugin hands each batch \
+             to you as a message of `shelbi <kind>: ...` lines, already acknowledged, the \
+             moment it lands. An urgent one (a reminder, a finished or overdue job, an \
+             overdue task, a review that is ready) arrives even in the middle of a turn; a \
+             board digest on its own is added as context without starting a turn. React to \
+             each through your normal reaction rules. Never run `shelbi orchestrator events \
+             next`, `drain` or `ack` yourself.\n",
+        ),
+        EventDelivery::SelfDrain | EventDelivery::CodexBridge => out.push_str(POLLING_CONTRACT),
+    }
+    out
+}
+
+/// Who a non-Claude orchestrator is, at the head of its context.
+fn orchestrator_identity(project_name: &str, workdir: &std::path::Path) -> String {
+    let workdir = workdir.to_string_lossy();
     format!(
-        "{launch} --prompt {prompt}",
-        prompt = codex_orchestrator_prompt_arg(project_name, workdir, bootstrap_prompt),
+        "You are Shelbi's orchestrator/scheduler for project `{project_name}`.\n\
+         Project worktree: `{workdir}`.\n\
+         Do not edit project code directly; coordinate workspaces and board state. \
+         You do own the project's Shelbi configuration (project YAML, workflows, your \
+         instructions) — edit it when the user directs and propose improvements you \
+         observe.\n\n",
     )
 }
+
+/// The self-driven drain a runner with no event delivery follows.
+const POLLING_CONTRACT: &str = "This is a polling-only runner contract: before every user-facing reply, drain \
+     pending project events with `shelbi orchestrator events drain` (the cursor is \
+     persisted for you in the project config dir and resumes automatically regardless \
+     of your shell's working directory; pass `--cursor <N>` only to replay from an \
+     explicit offset), apply any returned task transitions, workspace transitions, \
+     heartbeats, and pane-death facts through the normal reaction rules, and only then \
+     answer the user. The drain gives facts; you remain responsible for scheduling \
+     decisions.\n\n";
 
 /// Conservative compatibility launch used by the native Codex bridge when
 /// the configured Codex binary does not support app-server/remote TUI mode.
@@ -1269,26 +1404,14 @@ fn codex_orchestrator_prompt_arg(
     workdir: &std::path::Path,
     bootstrap_prompt: &str,
 ) -> String {
-    let workdir = workdir.to_string_lossy();
     let before = format!(
-        "You are Shelbi's orchestrator/scheduler for project `{project_name}`.\n\
-         Project worktree: `{workdir}`.\n\
-         Do not edit project code directly; coordinate workspaces and board state. \
-         You do own the project's Shelbi configuration (project YAML, workflows, your \
-         instructions) — edit it when the user directs and propose improvements you \
-         observe.\n\n\
+        "{identity}\
          Authoritative Shelbi orchestrator instructions follow. Treat them as your developer-agent contract. \
          They include the project-local orchestrator role, bootstrap rules, event-tail responsibility, \
          Zen Mode rules, and any reload handoff context captured before this pane was restarted. \
          If a handoff `<system-reminder>` block is present there, use it as continuity context.\n\n\
-         This is a polling-only runner contract: before every user-facing reply, drain \
-         pending project events with `shelbi orchestrator events drain` (the cursor is \
-         persisted for you in the project config dir and resumes automatically regardless \
-         of your shell's working directory; pass `--cursor <N>` only to replay from an \
-         explicit offset), apply any returned task transitions, workspace transitions, \
-         heartbeats, and pane-death facts through the normal reaction rules, and only then \
-         answer the user. The drain gives facts; you remain responsible for scheduling \
-         decisions.\n\n",
+         {POLLING_CONTRACT}",
+        identity = orchestrator_identity(project_name, workdir),
     );
     let between = "\n\nShelbi's reserved system configuration skill follows. \
         This system workflow has precedence over conflicting project instructions.\n\n";
@@ -1577,6 +1700,106 @@ mod instructions_awareness_tests {
         assert_eq!(instructions_awareness(Awareness, &spec("codex"), false), Awareness);
         // A custom runner has no v2 delivery and runs the v1 bootstrap.
         assert_eq!(instructions_awareness(Awareness, &spec("aider"), false), Heartbeat);
+        // OpenCode, like Claude, only through the plugin this launch staged.
+        assert_eq!(instructions_awareness(Awareness, &spec("opencode"), true), Awareness);
+        assert_eq!(instructions_awareness(Awareness, &spec("opencode"), false), Heartbeat);
+    }
+
+    /// One awareness-plugin path: Claude and OpenCode both qualify, and
+    /// staging one runner's plugin clears the other's.
+    #[test]
+    fn claude_and_opencode_share_the_awareness_plugin_path() {
+        assert!(orchestrator_plugin_runner(&spec("claude")));
+        assert!(orchestrator_plugin_runner(&spec("opencode")));
+        assert!(!orchestrator_plugin_runner(&spec("codex")));
+        assert!(!orchestrator_plugin_runner(&spec("aider")));
+
+        let tmp = std::env::temp_dir().join(format!("shelbi-orch-stage-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        let host = Host::Local;
+        let claude_dir = tmp.join(workspace::ORCHESTRATOR_AWARENESS_PLUGIN_REL);
+        let opencode_dir = tmp.join(workspace::OPENCODE_PLUGIN_DIR_REL);
+
+        assert!(stage_orchestrator_event_plugin(&host, &tmp, &spec("opencode"), true).unwrap());
+        assert!(opencode_dir.join("index.js").exists());
+        assert!(!claude_dir.exists());
+
+        assert!(stage_orchestrator_event_plugin(&host, &tmp, &spec("claude"), true).unwrap());
+        assert!(claude_dir.exists());
+        assert!(!opencode_dir.exists(), "the OpenCode plugin goes when Claude takes over");
+
+        // Heartbeat: neither.
+        assert!(!stage_orchestrator_event_plugin(&host, &tmp, &spec("opencode"), false).unwrap());
+        assert!(!claude_dir.exists() && !opencode_dir.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An OpenCode orchestrator's instructions go in at system authority:
+    /// the layer names the preamble and the composed instructions, the
+    /// configuration skill is a skill, and the prompt is only the bootstrap.
+    /// It runs on the project's own session; with the plugin staged, the
+    /// layer names it and the launch tells it to play the orchestrator.
+    #[test]
+    fn opencode_orchestrator_launches_with_instructions_and_its_plugin() {
+        let workdir = std::path::Path::new("/tmp/myapp");
+        let launch = orchestrator_launch_command(
+            "/usr/local/bin/shelbi",
+            &spec("opencode"),
+            "myapp",
+            workdir,
+            None,
+            true,
+            None,
+        );
+        let id = shelbi_core::opencode_orchestrator_session_id("myapp");
+        assert!(launch.contains(&format!("SHELBI_OPENCODE_SESSION={id} ")), "{launch}");
+        assert!(launch.contains(&format!("--session {id} ")), "{launch}");
+        assert!(launch.contains("SHELBI_OPENCODE_ROLE=orchestrator "), "{launch}");
+        assert!(launch.contains("Shelbi · myapp · orchestrator"), "{launch}");
+        assert!(
+            launch.contains(
+                r#""instructions":["/tmp/myapp/.shelbi/opencode/instructions.md","/tmp/myapp/.claude/agent-instructions.md"]"#
+            ),
+            "{launch}"
+        );
+        assert!(
+            launch.contains(r#""skills":["/tmp/myapp/.claude/shelbi-system-plugins/update-shelbi-configuration/skills"]"#),
+            "{launch}"
+        );
+        assert!(launch.contains(r#""plugins":["/tmp/myapp/.shelbi/opencode/plugins/shelbi"]"#), "{launch}");
+        let prompt = launch.split(" --prompt ").nth(1).unwrap();
+        assert_eq!(prompt, shelbi_agent::shell_escape(&orch_bootstrap_prompt_awareness()));
+        assert!(!launch.contains("$(cat"), "no instructions inlined into the prompt: {launch}");
+
+        // Heartbeat: the same instructions and session, no plugin, the v1
+        // bootstrap.
+        let v1 = orchestrator_launch_command(
+            "/usr/local/bin/shelbi",
+            &spec("opencode"),
+            "myapp",
+            workdir,
+            None,
+            false,
+            None,
+        );
+        assert!(v1.contains(&format!("--session {id} ")), "{v1}");
+        assert!(!v1.contains(r#""plugins""#), "{v1}");
+        assert!(!v1.contains("SHELBI_OPENCODE_ROLE"), "{v1}");
+        assert!(v1.contains(r#""instructions":["#), "{v1}");
+        assert!(v1.ends_with(&shelbi_agent::shell_escape(&orch_bootstrap_prompt_base("myapp"))), "{v1}");
+    }
+
+    #[test]
+    fn opencode_preamble_teaches_the_delivery_it_gets() {
+        let workdir = std::path::Path::new("/tmp/myapp");
+        let plugin = opencode_orchestrator_preamble("myapp", workdir, EventDelivery::AwarenessPlugin);
+        assert!(plugin.starts_with("You are Shelbi's orchestrator/scheduler for project `myapp`."), "{plugin}");
+        assert!(plugin.contains("Board events reach this session on their own"), "{plugin}");
+        assert!(!plugin.contains("polling-only"), "{plugin}");
+        let v1 = opencode_orchestrator_preamble("myapp", workdir, EventDelivery::SelfDrain);
+        assert!(v1.contains("polling-only runner contract"), "{v1}");
+        assert!(!v1.contains("on their own"), "{v1}");
     }
 
     #[test]

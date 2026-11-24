@@ -119,6 +119,26 @@ fn claude_awareness_orchestrator_argv_is_frozen() {
     assert_golden("claude/orchestrator-argv.txt", &v1);
 }
 
+/// The OpenCode orchestrator's launch, awareness (v2) and heartbeat (v1):
+/// instructions and skill through the config layer, the project's own
+/// session, and (v2) the plugin playing the orchestrator.
+#[test]
+fn opencode_orchestrator_argv_is_frozen() {
+    let opencode = AgentRunnerSpec { command: "opencode".into(), ..claude_runner() };
+    for (name, plugin) in [("opencode/orchestrator-awareness-argv.txt", true), ("opencode/orchestrator-argv.txt", false)] {
+        let argv = crate::orchestrator_launch_command(
+            "/usr/local/bin/shelbi",
+            &opencode,
+            "myapp",
+            Path::new("/tmp/myapp"),
+            None,
+            plugin,
+            None,
+        );
+        assert_golden(name, &argv);
+    }
+}
+
 #[test]
 fn claude_worker_argv_is_frozen() {
     let cold = crate::workspace::workspace_launch_command(&claude_runner(), Some("auto"), false);

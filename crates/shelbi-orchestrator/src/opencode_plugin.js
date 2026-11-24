@@ -38,9 +38,25 @@
 //   it admitted, and OpenCode answers a repeated prompt id with the original
 //   admission.
 //
+// - In the orchestrator's pane (SHELBI_OPENCODE_ROLE=orchestrator) the
+//   plugin is the awareness plugin instead: the same contract Claude's
+//   `shelbi-awareness` plugin runs, through the same commands. It runs
+//   `shelbi orchestrator events stream --json` for the whole session and
+//   admits each batch with `session.prompt`: queued, so an idle orchestrator
+//   starts a turn on it at once, or steered into a running turn when it's
+//   urgent. A batch that is only the board digest is added with
+//   `session.synthetic({resume: false})`, which starts no turn. When a turn
+//   starts it calls `shelbi orchestrator hook user-prompt-submit` (anything
+//   the stream hasn't delivered yet goes in as context), and when one ends
+//   `hook stop` (an urgent event still queued sends the orchestrator back to
+//   work, once). `hook session-start` runs as the plugin loads; its answer
+//   goes in with the first turn. The Shelbi CLI owns the queue, its cursor,
+//   its lock and its acks; the plugin only carries batches across.
+//
 // A pane Shelbi didn't launch (no SHELBI_PANE_TTY or SHELBI_OPENCODE_SESSION)
 // is left alone.
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -60,7 +76,7 @@ const HOOKS = ".shelbi/hooks";
 const STATE = ".shelbi/opencode";
 const LOCK = "plugin.lock";
 const BEACON = "plugin.alive";
-const PLUGIN_VERSION = 2;
+const PLUGIN_VERSION = 3;
 const HOOK_TIMEOUT_MS = 15000;
 const IDLE_DRAIN_MS = 5000;
 const INBOX = "inbox";
@@ -71,6 +87,31 @@ const INBOX_POLL_MS = 250;
 const DELIVERY_ID = /^[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 // How far up a subagent's parents the plugin looks for its own session.
 const MAX_SESSION_DEPTH = 8;
+// The orchestrator's role (SHELBI_OPENCODE_ROLE).
+const ORCHESTRATOR = "orchestrator";
+// The event stream is restarted after it exits, backing off to this.
+const STREAM_BACKOFF_MAX_MS = 60000;
+// Attempts at admitting one batch before it's given up.
+const ADMIT_ATTEMPTS = 3;
+const EVENTS_HEADER =
+  "Shelbi board events (already acknowledged; react to each through your reaction rules):";
+const DIGEST_HEADER =
+  "Shelbi board digest (already acknowledged; apply it through your digest reaction rule):";
+
+// A fresh id in the shape of OpenCode's ascending message ids (and of the
+// ids Shelbi mints for its inbox): 12 hex characters of the low 48 bits of
+// millis * 4096 + a counter, then 14 base62 characters.
+const BASE62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+let idCounter = 0;
+const newMessageId = () => {
+  const stamp =
+    (BigInt(Date.now()) * 4096n + BigInt(idCounter++ % 4096)) & 0xffffffffffffn;
+  let out = stamp.toString(16).padStart(12, "0");
+  for (const byte of randomBytes(14)) out += BASE62[byte % 62];
+  return `msg_${out}`;
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Instances in this process, by worktree: a second `setup` in the same
 // server sees the first here even before reading the lock file.
@@ -156,14 +197,269 @@ const beacon = (root) => {
   }
 };
 
+// The orchestrator's half: board events in through the awareness contract.
+// See the header.
+const orchestrate = ({ api, own, root, title, applyTitle, isTitled, release }) => {
+  const shelbi = process.env.SHELBI_BIN || "shelbi";
+  const env = process.env;
+
+  // Run `shelbi orchestrator hook <event>` with `input` as its JSON stdin and
+  // resolve with its JSON answer, or null for none. A hook never fails the
+  // turn: anything unexpected is no answer.
+  const hook = (event, input) =>
+    new Promise((resolve) => {
+      const child = execFile(
+        shelbi,
+        ["orchestrator", "hook", event],
+        { cwd: root, env, timeout: HOOK_TIMEOUT_MS, maxBuffer: 1 << 20 },
+        (_err, stdout) => {
+          const text = String(stdout ?? "").trim();
+          if (!text) return resolve(null);
+          try {
+            resolve(JSON.parse(text));
+          } catch {
+            resolve(null);
+          }
+        },
+      );
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(JSON.stringify(input ?? {}));
+    });
+  const contextOf = (answer) => {
+    const context = answer?.hookSpecificOutput?.additionalContext;
+    return typeof context === "string" && context.trim() ? context : null;
+  };
+
+  // Whether the orchestrator's own session is running a turn.
+  let busy = false;
+  // The turn running now answers our own stop-hook block, so its end mustn't
+  // block again (Claude's `stop_hook_active`).
+  let continuing = false;
+
+  // Admit a prompt, retrying with the same id: OpenCode answers a repeated
+  // id with the original admission, so a retry never admits it twice.
+  const prompt = async (text, delivery, kind) => {
+    const id = newMessageId();
+    for (let attempt = 1; ; attempt++) {
+      try {
+        await api.session.prompt({
+          sessionID: own,
+          id,
+          text,
+          delivery,
+          metadata: { source: "shelbi", kind },
+        });
+        return true;
+      } catch {
+        if (attempt >= ADMIT_ATTEMPTS) return false;
+        // A steer can lose the race with the turn ending; queue it instead.
+        delivery = "queue";
+        await sleep(250 * attempt);
+      }
+    }
+  };
+  // Add context without starting a turn. In a running turn it is taken in at
+  // the next step; otherwise with the next turn.
+  const note = async (text, description) => {
+    try {
+      await api.session.synthetic({
+        sessionID: own,
+        text,
+        description,
+        resume: false,
+        metadata: { source: "shelbi" },
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // One batch from the stream: `{lines, urgent, digest}`.
+  const admitBatch = async (batch) => {
+    const lines = Array.isArray(batch?.lines)
+      ? batch.lines.filter((line) => typeof line === "string" && line.trim())
+      : [];
+    if (!lines.length) return;
+    if (batch.digest) {
+      await note(`${DIGEST_HEADER}\n${lines.join("\n")}`, "Shelbi board digest");
+      return;
+    }
+    const delivery = batch.urgent && busy ? "steer" : "queue";
+    await prompt(`${EVENTS_HEADER}\n${lines.join("\n")}`, delivery, "events");
+  };
+
+  // Batches are admitted one at a time, in the order the stream printed them.
+  let admitting = Promise.resolve();
+  const enqueue = (line) => {
+    let batch;
+    try {
+      batch = JSON.parse(line);
+    } catch {
+      // Not a batch: a plain line (a notice) stands for itself.
+      batch = { lines: [line], urgent: false, digest: false };
+    }
+    admitting = admitting.then(() => admitBatch(batch)).catch(() => {});
+  };
+
+  let stopped = false;
+  let stream = null;
+  let streaming = false;
+  let backoff = 1000;
+  // The stream starts once the session exists (the TUI creates it on a first
+  // start): a batch admitted into a session that isn't there yet would fail,
+  // and the stream has already acked it.
+  const ensureStream = () => {
+    if (streaming) return;
+    streaming = true;
+    startStream();
+  };
+  const startStream = () => {
+    if (stopped) return;
+    const started = Date.now();
+    let child;
+    try {
+      child = spawn(shelbi, ["orchestrator", "events", "stream", "--json"], {
+        cwd: root,
+        env,
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+    } catch {
+      child = null;
+    }
+    const restart = () => {
+      if (stream === child) stream = null;
+      if (stopped) return;
+      // A stream that ran a good while was healthy: start over at the bottom.
+      if (Date.now() - started > STREAM_BACKOFF_MAX_MS) backoff = 1000;
+      const timer = setTimeout(startStream, backoff);
+      timer.unref?.();
+      backoff = Math.min(backoff * 2, STREAM_BACKOFF_MAX_MS);
+    };
+    if (!child) return restart();
+    stream = child;
+    let buffer = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      buffer += chunk;
+      let end;
+      while ((end = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, end).trim();
+        buffer = buffer.slice(end + 1);
+        if (line) enqueue(line);
+      }
+    });
+    child.on("error", () => {});
+    child.on("close", restart);
+  };
+  const stopStream = () => {
+    stopped = true;
+    try {
+      stream?.kill("SIGTERM");
+    } catch {
+      // Already gone.
+    }
+  };
+  process.once("exit", stopStream);
+
+  // The session-start answer, which goes in with the session's first turn.
+  // A session that already exists is a resume (a reload, a restart), and the
+  // hook then restates how events arrive.
+  const startup = (async () => {
+    let resumed = false;
+    try {
+      resumed = Boolean(await api.session.get({ sessionID: own }));
+    } catch {
+      // Not created yet: a first start.
+    }
+    if (resumed) ensureStream();
+    return contextOf(await hook("session-start", { source: resumed ? "resume" : "startup" }));
+  })().catch(() => null);
+  let startTaken = false;
+
+  const turnStarted = async () => {
+    busy = true;
+    const context = [];
+    if (!startTaken) {
+      startTaken = true;
+      const start = await startup;
+      if (start) context.push(start);
+    }
+    const pending = contextOf(await hook("user-prompt-submit", {}));
+    if (pending) context.push(pending);
+    if (context.length) await note(context.join("\n\n"), "Shelbi board events");
+  };
+  const turnSucceeded = async () => {
+    busy = false;
+    const answered = continuing;
+    continuing = false;
+    // Already continuing because of a stop block: never block again, so the
+    // orchestrator can't be held in a loop.
+    if (answered) return;
+    const answer = await hook("stop", { stop_hook_active: false });
+    if (answer?.decision !== "block" || typeof answer.reason !== "string") return;
+    continuing = true;
+    if (!(await prompt(answer.reason, "queue", "stop"))) continuing = false;
+  };
+
+  const handle = async (event) => {
+    const type = event?.type ?? "";
+    const data = event?.data ?? {};
+    if (type === "session.created") {
+      if (data.sessionID === own) {
+        ensureStream();
+        await applyTitle();
+      }
+      return;
+    }
+    if (type === "session.renamed") {
+      if (data.sessionID === own && title && data.title !== title) await applyTitle();
+      return;
+    }
+    // Subagents' turns are part of the orchestrator's, not turns of its own.
+    if (data.sessionID !== own) return;
+    if (type === "session.execution.started") {
+      ensureStream();
+      if (!isTitled()) await applyTitle();
+      await turnStarted();
+      return;
+    }
+    if (type === "session.execution.succeeded") {
+      await turnSucceeded();
+      return;
+    }
+    if (type === "session.execution.failed" || type === "session.execution.interrupted") {
+      busy = false;
+      continuing = false;
+    }
+  };
+
+  const controller = new AbortController();
+  (async () => {
+    for await (const event of api.event.subscribe({ signal: controller.signal })) {
+      await handle(event).catch(() => {});
+    }
+  })().catch(() => {});
+  return () => {
+    controller.abort();
+    stopStream();
+    process.removeListener("exit", stopStream);
+    release();
+  };
+};
+
 export default {
   id: "shelbi",
   setup: async (api) => {
     const tty = process.env.SHELBI_PANE_TTY;
     const own = process.env.SHELBI_OPENCODE_SESSION;
     const title = process.env.SHELBI_OPENCODE_TITLE;
+    const orchestrator = process.env.SHELBI_OPENCODE_ROLE === ORCHESTRATOR;
     const root = api.location?.directory || process.cwd();
-    if (!tty || !own || !existsSync(path.join(root, HOOKS))) return;
+    if (!tty || !own) return;
+    // A worker runs the worktree's hook scripts; without them it has nothing
+    // to do. The orchestrator's workdir has none.
+    if (!orchestrator && !existsSync(path.join(root, HOOKS))) return;
     const release = claim(root);
     if (!release) return;
     beacon(root);
@@ -238,6 +534,10 @@ export default {
         // Not created yet: `session.created` or the first turn retries.
       }
     };
+
+    if (orchestrator) {
+      return orchestrate({ api, own, root, title, applyTitle, isTitled: () => titled, release });
+    }
 
     let marker = "";
     const mark = async (state, input) => {
