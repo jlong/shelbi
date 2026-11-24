@@ -11,8 +11,6 @@
 //!   remote sessions, and hand this terminal to the host's Shelbi, reconnecting
 //!   when `ssh` drops.
 
-use std::io::IsTerminal;
-
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Subcommand;
 use shelbi_app::launch::remote::{RemoteConnector, RemoteError, RemoteSession};
@@ -107,7 +105,7 @@ fn start_accepted(host: &str) -> Result<bool> {
     if std::env::var(ASSUME_YES_ENV).as_deref() == Ok("1") {
         return Ok(true);
     }
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+    if !super::can_prompt() {
         return Ok(false);
     }
     inquire::Confirm::new(&format!("Shelbi isn't running on {host}. Start it?"))

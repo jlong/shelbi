@@ -2,7 +2,6 @@
 //! steps pre-answered by flags. Interactive at a terminal; `-y` (or no
 //! terminal) takes every detected default instead of asking.
 
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -142,7 +141,7 @@ pub struct Args {
 }
 
 pub fn run(args: Args, assume_yes: bool) -> Result<()> {
-    let interactive = !assume_yes && std::io::stdin().is_terminal();
+    let interactive = !assume_yes && super::stdin_is_interactive();
     let preset = preset(args)?;
     let outcome = if interactive {
         wizard::setup(preset, &mut Prompts)?
