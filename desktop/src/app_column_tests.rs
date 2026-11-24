@@ -1119,7 +1119,10 @@ fn the_task_pane_resizes_over_the_review_and_the_workspace_and_the_window_keeps_
 fn the_job_sheet_and_the_task_pane_share_the_windows_width(cx: &mut TestAppContext) {
     use crate::views::floating_pane::PaneHost;
     let mut c = Column::open_with(cx, |w| w.window_state.task_pane_width = 700.0);
-    let (issues, jobs) = c.update(|w, window, cx| (w.ensure_issues(window, cx), w.ensure_jobs(cx)));
+    let (issues, jobs) = c.update(|w, window, cx| {
+        let screen = w.ensure_jobs_reminders(crate::views::jobs_reminders::Segment::Jobs, window, cx);
+        (w.ensure_issues(window, cx), screen.read(cx).jobs().expect("the Jobs segment"))
+    });
     assert_eq!(jobs.read_with(&c.h.cx, |v, _| v.pane_width()), 700.0, "the sheet opens at the window's width");
 
     // A drag of the sheet's edge: the window keeps it, and the task pane

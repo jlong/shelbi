@@ -135,7 +135,33 @@ pub fn segment(
     chip_inline: bool,
     theme: &Theme,
 ) -> Stateful<Div> {
+    segment_with(id, None, label, selected, chip_inline, theme)
+}
+
+/// A [`segment`] with `icon` (16px, in the label's color) before its label,
+/// 6px apart (the Jobs and Reminders toolbar's `[Jobs | Reminders]`). The
+/// icon is `<id>-icon` to a test.
+pub fn icon_segment(
+    id: impl Into<SharedString>,
+    icon: Icon,
+    label: impl Into<SharedString>,
+    selected: bool,
+    chip_inline: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
+    segment_with(id, Some(icon), label, selected, chip_inline, theme)
+}
+
+fn segment_with(
+    id: impl Into<SharedString>,
+    icon: Option<Icon>,
+    label: impl Into<SharedString>,
+    selected: bool,
+    chip_inline: bool,
+    theme: &Theme,
+) -> Stateful<Div> {
     let id: SharedString = id.into();
+    let icon_selector = format!("{id}-icon");
     let selector = id.clone();
     let d = div()
         .id(id)
@@ -159,7 +185,16 @@ pub fn segment(
     } else {
         d.type_style(Type::Base).text_color(theme.form_text)
     };
-    d.child(label.into())
+    let color = if selected { theme.text_loud } else { theme.form_text };
+    d.when_some(icon, |d, icon| {
+        d.gap(px(6.0)).child(
+            div()
+                .debug_selector(move || icon_selector)
+                .flex_none()
+                .child(heroicon(icon).size(px(16.0)).text_color(color)),
+        )
+    })
+    .child(label.into())
 }
 
 /// The focus glow around a focused control whose corners are `radius`: a

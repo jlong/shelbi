@@ -1145,11 +1145,11 @@ impl Run {
             if let Some(v) = changelog {
                 v.update(&mut self.cx, |v, cx| v.poll(cx));
             }
-            let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap();
+            let jobs = handle.update(&mut self.cx, |w, _, cx| w.offscreen_jobs(cx)).unwrap();
             if let Some(v) = jobs {
                 v.update(&mut self.cx, |v, cx| v.poll(cx));
             }
-            let reminders = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap();
+            let reminders = handle.update(&mut self.cx, |w, _, cx| w.offscreen_reminders(cx)).unwrap();
             if let Some(v) = reminders {
                 v.update(&mut self.cx, |v, cx| v.poll(cx));
             }
@@ -1382,7 +1382,7 @@ impl Run {
         .expect("write the fixture job history");
         let handle = self.open();
         self.click(handle, View::Jobs);
-        let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap().expect("the Jobs view");
+        let jobs = handle.update(&mut self.cx, |w, _, cx| w.offscreen_jobs(cx)).unwrap().expect("the Jobs view");
         let loaded = self.wait(handle, Duration::from_secs(10), |cx| jobs.read_with(cx, |v, _| v.model().rows().len() == 8));
         self.expect("jobs: the eight fixture jobs load", loaded);
         let ids: Vec<String> = jobs.read_with(&self.cx, |v, _| v.model().rows().iter().map(|r| r.id.clone()).collect());
@@ -1393,7 +1393,7 @@ impl Run {
         // (an estimate bar a third full), its output so far, and Cancel.
         let handle = self.open();
         self.click(handle, View::Jobs);
-        let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap().expect("the Jobs view");
+        let jobs = handle.update(&mut self.cx, |w, _, cx| w.offscreen_jobs(cx)).unwrap().expect("the Jobs view");
         let loaded = self.wait(handle, Duration::from_secs(10), |cx| jobs.read_with(cx, |v, _| v.model().rows().len() == 8));
         self.expect("jobs-sheet: the jobs load", loaded);
         handle
@@ -1413,7 +1413,7 @@ impl Run {
         let _ = std::fs::remove_file(history);
         let handle = self.open();
         self.click(handle, View::Jobs);
-        let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap().expect("the Jobs view");
+        let jobs = handle.update(&mut self.cx, |w, _, cx| w.offscreen_jobs(cx)).unwrap().expect("the Jobs view");
         let empty = self.wait(handle, Duration::from_secs(10), |cx| {
             jobs.read_with(cx, |v, _| *v.model() == shelbi_app::jobs::JobsModel::Empty)
         });
@@ -1476,7 +1476,7 @@ impl Run {
         .expect("write the fixture reminder history");
         let handle = self.open();
         self.click(handle, View::Reminders);
-        let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
+        let view = handle.update(&mut self.cx, |w, _, cx| w.offscreen_reminders(cx)).unwrap().expect("the Reminders view");
         let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 9));
         self.expect("reminders: the nine fixture reminders load", loaded);
         let (next, days, fired_days) = view.read_with(&self.cx, |v, _| {
@@ -1498,7 +1498,7 @@ impl Run {
 
         let handle = self.open();
         self.click(handle, View::Reminders);
-        let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
+        let view = handle.update(&mut self.cx, |w, _, cx| w.offscreen_reminders(cx)).unwrap().expect("the Reminders view");
         let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 9));
         self.expect("reminders-sheet: the reminders load", loaded);
         view.update(&mut self.cx, |v, cx| v.open_sheet_for_check("r9", cx));
@@ -1518,7 +1518,7 @@ impl Run {
         ]);
         let handle = self.open();
         self.click(handle, View::Reminders);
-        let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
+        let view = handle.update(&mut self.cx, |w, _, cx| w.offscreen_reminders(cx)).unwrap().expect("the Reminders view");
         let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 3));
         self.expect("reminders-overdue: the reminders load", loaded);
         let overdue = view.read_with(&self.cx, |v, _| v.model().next_up().is_some_and(|r| r.overdue(now)));
@@ -1533,7 +1533,7 @@ impl Run {
         ]);
         let handle = self.open();
         self.click(handle, View::Reminders);
-        let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
+        let view = handle.update(&mut self.cx, |w, _, cx| w.offscreen_reminders(cx)).unwrap().expect("the Reminders view");
         let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 3));
         self.expect("reminders-repeating: the reminders load", loaded);
         let repeating = view.read_with(&self.cx, |v, _| v.model().next_up().is_some_and(|r| r.every.is_some()));
@@ -1543,7 +1543,7 @@ impl Run {
         set(Vec::new());
         let handle = self.open();
         self.click(handle, View::Reminders);
-        let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
+        let view = handle.update(&mut self.cx, |w, _, cx| w.offscreen_reminders(cx)).unwrap().expect("the Reminders view");
         let empty = self.wait(handle, Duration::from_secs(10), |cx| {
             view.read_with(cx, |v, _| *v.model() == shelbi_app::reminders::RemindersModel::Empty)
         });

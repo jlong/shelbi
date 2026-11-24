@@ -1,7 +1,6 @@
-//! The pieces the palette-only list screens share (Jobs, Reminders): the
-//! title row (the screen's icon and name, loud, then its count, muted, on
-//! the Machines toolbar's 37pt row), the centered, scrolling column of cards
-//! (the Changelog's column, at most [`CONTENT_MAX_W`] wide, so a wide window
+//! The pieces the palette-only list screens share (Jobs, Reminders, the two
+//! segments of one screen under its toolbar, `super::jobs_reminders`): the
+//! centered, scrolling column of cards (the Changelog's column, at most [`CONTENT_MAX_W`] wide, so a wide window
 //! doesn't stretch a row into a scan across the screen), a section's heading
 //! over its cards, the card that holds a group of compact rows, the empty
 //! state (an icon, a heading, a sentence and the command that fills the
@@ -10,7 +9,7 @@
 //! own parts in `shelbi-tui`'s `list_screen`. (The sheets themselves are the
 //! floating pane's, shared separately.)
 //!
-//! Debug selectors are named from the screen (`jobs-title`, `jobs-list`,
+//! Debug selectors are named from the screen (`jobs-list`,
 //! `reminders-empty`) and its entry (`job-row-<key>`,
 //! `reminder-sheet-cancel`), so each screen's tests find their own.
 
@@ -31,50 +30,6 @@ pub(crate) const CARD_RADIUS: f32 = 12.0;
 /// A compact row's height in a group card, and its corners.
 pub(crate) const COMPACT_ROW_H: f32 = 36.0;
 const COMPACT_ROW_RADIUS: f32 = 8.0;
-
-/// The title row: the screen's `icon`, then `title`, loud, then `summary`,
-/// muted. Selectors `<list>-title`, `<list>-title-icon` and
-/// `<list>-summary`.
-pub(crate) fn title_row(
-    list: &'static str,
-    icon: Option<Icon>,
-    title: &'static str,
-    summary: Option<String>,
-    theme: &Theme,
-) -> Div {
-    div()
-        .flex()
-        .flex_row()
-        .flex_none()
-        .items_center()
-        .gap_2()
-        .h(px(37.0))
-        .px_4()
-        .when_some(icon, |d, icon| {
-            d.child(
-                div()
-                    .debug_selector(move || format!("{list}-title-icon"))
-                    .flex_none()
-                    .child(heroicon(icon).size(px(16.0)).text_color(theme.icon)),
-            )
-        })
-        .child(
-            div()
-                .debug_selector(move || format!("{list}-title"))
-                .type_style(Type::BaseMedium)
-                .text_color(theme.text_loud)
-                .child(title),
-        )
-        .when_some(summary, |d, summary| {
-            d.child(
-                div()
-                    .debug_selector(move || format!("{list}-summary"))
-                    .type_style(Type::XSmall)
-                    .text_color(theme.muted)
-                    .child(summary),
-            )
-        })
-}
 
 /// The line in place of the list (loading, unavailable, failed), centered.
 pub(crate) fn message(selector: &'static str, text: String, theme: &Theme) -> AnyElement {

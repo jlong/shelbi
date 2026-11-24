@@ -1,14 +1,16 @@
 //! The Reminders screen (`View::Reminders`, palette-only, and left out of
 //! the palette's default list until the user types: `rem…` finds it): the
 //! project's `shelbi remind` reminders as an agenda, drawn from the shared
-//! [`shelbi_app::reminders`] model the TUI's Reminders page draws too.
+//! [`shelbi_app::reminders`] model the TUI's Reminders page draws too. It is
+//! the Reminders segment of the Jobs and Reminders screen
+//! ([`super::jobs_reminders`]), whose toolbar carries its name and counts.
 //!
 //! A reminder is a point in time coming up, so the screen reads like a day
 //! planner, in the Jobs screen's vocabulary ([`super::list_screen`]: its
-//! title row, centered column, section headings, cards and empty state):
+//! centered column, section headings, cards and empty state):
 //!
 //! ```text
-//!  ⏰ Reminders  3 pending · 5 fired
+//!  3 pending · 5 fired          [ ▤ Jobs | ◷ Reminders ]
 //!  ──────────────────────────────────────────────────────────────
 //!    Next up
 //!    ╭──────────────────────────────────────────────────────────╮
@@ -72,7 +74,7 @@ use gpui::{
 use shelbi_app::jobs::one_line;
 use shelbi_app::reminders::{
     ReminderRow, RemindersModel, RemindersRead, SheetState, CANCEL_LABEL, EMPTY_COMMAND, EMPTY_DETAIL, EMPTY_TITLE,
-    FIRED_HEADING, NEXT_UP_HEADING, REFRESH_INTERVAL, TITLE,
+    FIRED_HEADING, NEXT_UP_HEADING, REFRESH_INTERVAL,
 };
 use shelbi_app::source::{ProjectHandle, ProjectSource};
 use shelbi_app::theme::Tone;
@@ -131,6 +133,9 @@ pub struct RemindersView {
     needs_focus: bool,
     refresher: shelbi_app::Refresher<RemindersRead>,
     last_refresh: Instant,
+    /// Whether its segment of the Jobs and Reminders screen shows: hidden,
+    /// it asks for no reads (the shown segment's poll is the only one).
+    active: bool,
     scroll: ScrollHandle,
     _poll: Task<()>,
 }
@@ -177,6 +182,7 @@ impl RemindersView {
             needs_focus: true,
             refresher,
             last_refresh: Instant::now(),
+            active: true,
             scroll: ScrollHandle::new(),
             _poll: poll,
         }
@@ -190,6 +196,42 @@ impl RemindersView {
 
     pub fn request_focus(&mut self) {
         self.needs_focus = true;
+    }
+
+    /// Show or hide its segment of the Jobs and Reminders screen. Hidden, it
+    /// stops asking for reads; shown again, it reads at once.
+    pub fn set_active(&mut self, active: bool) {
+        if active && !self.active {
+            self.refresh();
+        }
+        self.active = active;
+    }
+
+    /// The counts the toolbar shows while its segment is selected.
+    pub fn summary(&self) -> Option<String> {
+        self.model.summary()
+    }
+
+    /// Drop the sheet at once, without sliding it out (a switch to the
+    /// other segment: nothing would see it go).
+    pub fn dismiss_sheet(&mut self, cx: &mut Context<Self>) {
+        self.pane_frame.cancel_resize();
+        self.closing.clear();
+        if self.sheet.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Whether a sheet is open.
+    #[cfg(test)]
+    pub fn sheet_open(&self) -> bool {
+        self.sheet.is_some()
+    }
+
+    /// Whether it asks for reads (its segment shows).
+    #[cfg(test)]
+    pub fn is_active(&self) -> bool {
+        self.active
     }
 
     /// The window's saved task pane width, which the sheet shares.
@@ -226,7 +268,7 @@ impl RemindersView {
             // Also when nothing changed: the relative times tick over.
             cx.notify();
         }
-        if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
+        if self.active && self.last_refresh.elapsed() >= REFRESH_INTERVAL {
             self.refresh();
         }
     }
@@ -727,7 +769,6 @@ impl Render for RemindersView {
             window.focus(&self.focus, cx);
         }
         let theme = *cx.global::<Theme>();
-        let summary = self.model.summary();
         let table = self.render_body(&theme, cx);
         let sheet = self.render_sheet(&theme, cx);
         div()
@@ -750,8 +791,6 @@ impl Render for RemindersView {
             .bg(theme.nested(theme.canvas))
             .type_style(Type::Base)
             .text_color(theme.foreground)
-            .child(list_screen::title_row("reminders", Some(icons::CLOCK), TITLE, summary, &theme))
-            .child(div().h(px(1.0)).flex_none().bg(theme.divider))
             .child(div().flex().flex_col().flex_1().min_h_0().min_w_0().child(table))
             .children(sheet)
     }
@@ -877,10 +916,6 @@ mod tests {
             tops.push(vcx.debug_bounds(sel(selector.clone())).unwrap_or_else(|| panic!("{selector} drawn")).top());
         }
         assert!(tops.windows(2).all(|w| w[0] < w[1]), "headings above their rows: {tops:?}");
-        // The title wears the clock, with the counts.
-        for s in ["reminders-title-icon", "reminders-title", "reminders-summary"] {
-            assert!(vcx.debug_bounds(s).is_some(), "{s} drawn");
-        }
         let model = view.read_with(&vcx, |v, _| v.model().clone());
         assert_eq!(model.summary().as_deref(), Some("2 pending · 1 fired"));
         // Next up counts down to it, with its due time and a set→due bar;

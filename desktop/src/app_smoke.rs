@@ -14,7 +14,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui::{TestAppContext, VisualTestContext, WindowAppearance};
+use gpui::{px, TestAppContext, VisualTestContext, WindowAppearance};
 use shelbi_app::command::{Command, EditItem, ProjectItem};
 use shelbi_app::theme::ThemePreference;
 use shelbi_app::view::{NavItem, ReviewRow, ReviewState, WorkspaceBadge, WorkspaceRow};
@@ -595,8 +595,41 @@ fn typing_jobs_in_the_palette_opens_the_jobs_screen(cx: &mut TestAppContext) {
     assert_eq!(calls, vec![HostCall::ShowView(View::Jobs)]);
     h.perform(calls);
     assert_eq!(h.window.read_with(&h.cx, |w, _| w.client.view().clone()), View::Jobs);
-    assert!(h.window.read_with(&h.cx, |w, _| w.jobs.is_some()), "the Jobs view is built");
-    assert!(h.cx.debug_bounds("jobs-title").is_some(), "the Jobs screen draws in the main area");
+    assert!(h.window.read_with(&h.cx, |w, cx| w.offscreen_jobs(cx).is_some()), "the Jobs view is built");
+    assert!(h.cx.debug_bounds("jobs").is_some(), "the Jobs screen draws in the main area");
+    assert!(h.cx.debug_bounds("jobs-reminders-toolbar").is_some(), "under the screen's toolbar");
+    assert!(h.window.read_with(&h.cx, |w, cx| w.offscreen_reminders(cx).is_none()), "Reminders waits to be shown");
+}
+
+#[gpui::test]
+fn the_jobs_and_reminders_control_switches_the_windows_view(cx: &mut TestAppContext) {
+    let mut h = Harness::open(cx);
+    h.perform(vec![HostCall::ShowView(View::Jobs)]);
+    h.draw();
+    let toolbar = h.cx.debug_bounds("jobs-reminders-toolbar").expect("the toolbar");
+    assert_eq!(toolbar.size.height, px(52.0), "the Issues toolbar's height");
+    let control = h.cx.debug_bounds("jobs-reminders-segments").expect("the control");
+    let center = |b: gpui::Bounds<gpui::Pixels>| f32::from(b.origin.x) + f32::from(b.size.width) / 2.0;
+    assert!((center(control) - center(toolbar)).abs() < 0.5, "the control sits on the toolbar's center line");
+
+    h.take_calls();
+    h.click_selector("reminders-segment");
+    // The click runs the palette's own command (the tap records it).
+    let calls = h.take_calls();
+    assert_eq!(calls, vec![HostCall::ShowView(View::Reminders)]);
+    h.perform(calls);
+    h.draw();
+    assert_eq!(h.window.read_with(&h.cx, |w, _| w.client.view().clone()), View::Reminders);
+    assert!(h.cx.debug_bounds("reminders").is_some() && h.cx.debug_bounds("jobs").is_none());
+    let control = h.cx.debug_bounds("jobs-reminders-segments").expect("the control");
+    assert!((center(control) - center(toolbar)).abs() < 0.5, "and stays there");
+
+    // The palette's entry for the other segment shows it on the same screen.
+    h.perform(vec![HostCall::ShowView(View::Jobs)]);
+    h.draw();
+    assert!(h.cx.debug_bounds("jobs").is_some() && h.cx.debug_bounds("reminders").is_none());
+    let screen = h.window.read_with(&h.cx, |w, _| w.offscreen_jobs_reminders()).expect("one screen");
+    assert_eq!(screen.read_with(&h.cx, |v, _| v.segment()), crate::views::jobs_reminders::Segment::Jobs);
 }
 
 #[gpui::test]
@@ -619,8 +652,9 @@ fn reminders_waits_for_a_query_in_the_palette_then_opens_its_screen(cx: &mut Tes
     assert_eq!(calls, vec![HostCall::ShowView(View::Reminders)]);
     h.perform(calls);
     assert_eq!(h.window.read_with(&h.cx, |w, _| w.client.view().clone()), View::Reminders);
-    assert!(h.window.read_with(&h.cx, |w, _| w.reminders.is_some()), "the Reminders view is built");
-    assert!(h.cx.debug_bounds("reminders-title").is_some(), "the Reminders screen draws in the main area");
+    assert!(h.window.read_with(&h.cx, |w, cx| w.offscreen_reminders(cx).is_some()), "the Reminders view is built");
+    assert!(h.cx.debug_bounds("reminders").is_some(), "the Reminders screen draws in the main area");
+    assert!(h.cx.debug_bounds("jobs-reminders-toolbar").is_some(), "under the screen's toolbar");
 }
 
 #[gpui::test]
