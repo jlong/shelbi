@@ -582,8 +582,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp_root);
     }
 
-    /// Runs the plugin under Node against a fake OpenCode `api`: the first
-    /// `setup` takes the lock and writes the beacon, a second in the same
+    /// Runs the plugin under Node against a fake OpenCode `api`: a
+    /// `setup` without Shelbi's named session stays passive, the first with
+    /// it takes the lock and writes the beacon, a second in the same
     /// process stays passive, a lock held by another live process keeps it
     /// passive, and a dead holder's lock is taken over. Skipped without
     /// `node`.
@@ -615,6 +616,11 @@ const api = () => ({
 const lock = `${wt}/.shelbi/opencode/plugin.lock`;
 const alive = `${wt}/.shelbi/opencode/plugin.alive`;
 const out = {};
+// A pane without Shelbi's named session isn't Shelbi's: no lock, no beacon.
+const session = process.env.SHELBI_OPENCODE_SESSION;
+delete process.env.SHELBI_OPENCODE_SESSION;
+out.unnamedPassive = (await plugin.setup(api())) === undefined && !existsSync(lock);
+process.env.SHELBI_OPENCODE_SESSION = session;
 const first = await plugin.setup(api());
 out.firstActive = typeof first === "function";
 out.lockPid = parseInt(readFileSync(lock, "utf8"), 10) === process.pid;
@@ -640,12 +646,15 @@ console.log(JSON.stringify(out));
             .arg(&plugin)
             .arg(&wt)
             .env("SHELBI_PANE_TTY", "/dev/null")
+            .env("SHELBI_OPENCODE_SESSION", "ses_shelbi0123456789abcdef0123")
+            .env_remove("SHELBI_OPENCODE_TITLE")
             .env_remove("TASK_ID")
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
         let result: serde_json::Value =
             serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        assert_eq!(result["unnamedPassive"], true, "{result}");
         assert_eq!(result["firstActive"], true, "{result}");
         assert_eq!(result["lockPid"], true, "{result}");
         assert_eq!(result["beacon"]["plugin"], "shelbi", "{result}");

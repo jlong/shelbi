@@ -507,6 +507,12 @@ pub struct WorkspaceStatus {
     /// When the marker was most recently observed (any state). Bumped on
     /// every successful poll regardless of transition.
     pub last_seen: DateTime<Utc>,
+    /// The OpenCode session (`opencode --session <id>`) the slot's pane runs
+    /// for `current_task`. Written by [`save_workspace_status`] from the
+    /// workspace's OpenCode ledger ([`crate::opencode_sessions`]), whatever
+    /// the caller set, so a poll that rebuilds the status keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_session: Option<String>,
 }
 
 pub fn save_workspace_status(project: &str, status: &WorkspaceStatus) -> Result<()> {
@@ -514,7 +520,15 @@ pub fn save_workspace_status(project: &str, status: &WorkspaceStatus) -> Result<
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
-    let yaml = yaml_serde::to_string(status)?;
+    let status = WorkspaceStatus {
+        opencode_session: crate::current_opencode_session(
+            project,
+            &status.workspace,
+            status.current_task.as_deref(),
+        ),
+        ..status.clone()
+    };
+    let yaml = yaml_serde::to_string(&status)?;
     atomic_write(&path, yaml.as_bytes())
 }
 
@@ -845,6 +859,7 @@ mod tests {
             state: WorkspaceState::Working,
             last_transition: now,
             last_seen: now,
+            opencode_session: None,
         };
         save_workspace_status("demo", &status).unwrap();
         let path = workspace_status_path("demo", "alpha").unwrap();
@@ -877,6 +892,7 @@ mod tests {
             state: WorkspaceState::Working,
             last_transition: now,
             last_seen: now,
+            opencode_session: None,
         })
         .unwrap();
         assert!(workspace_status_path("demo", "alpha").unwrap().exists());
@@ -932,6 +948,7 @@ mod tests {
             state,
             last_transition: Utc::now(),
             last_seen: Utc::now(),
+            opencode_session: None,
         };
         save_workspace_status("app", &status("app-task", WorkspaceState::Serving)).unwrap();
         save_workspace_status("site", &status("site-task", WorkspaceState::Blocked)).unwrap();

@@ -48,6 +48,7 @@ mod issue_cache;
 pub mod machine_state;
 pub mod migration;
 pub mod occupancy;
+pub mod opencode_sessions;
 pub mod orchestrator_setup;
 pub mod ownership;
 pub mod questions;
@@ -261,6 +262,10 @@ pub use event_log::{
     EXTERNAL_ISSUE_COMMENT_CAUSE, EXTERNAL_ISSUE_RECONCILE_CAUSE,
     GITHUB_MERGE_RECONCILE_CAUSE, ISSUE_ADOPTION_CAUSE, ORCH_EVENT_CALLBACK_SOCK_ENV,
     READY_MARKER_HANDOFF_ALIASES, READY_MARKER_HANDOFF_CAUSE,
+};
+pub use opencode_sessions::{
+    begin_opencode_session, current_opencode_session, end_opencode_session, load_opencode_sessions,
+    opencode_sessions_path, update_opencode_sessions, OpenCodeSessions, OpenCodeTaskSession,
 };
 pub use workspace_state_migration::{
     legacy_workspace_state_dirs, migrate_legacy_workspace_state_dir, LegacyStateDisposition,

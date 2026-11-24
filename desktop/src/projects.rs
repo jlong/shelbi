@@ -548,6 +548,7 @@ mod tests {
             state,
             last_transition: now,
             last_seen: now,
+            opencode_session: None,
         };
         shelbi_state::save_workspace_status("web", &status(shelbi_state::WorkspaceState::Working)).unwrap();
 

@@ -279,6 +279,11 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
     // down. Its own slow cadence keeps the filesystem scan off the 5s tick.
     let mut last_session_prune: Option<Instant> = None;
 
+    // OpenCode session archive clock: when the pass that archives a done
+    // task's OpenCode sessions next runs. `None` means due now. The pass reads
+    // only small per-workspace ledgers unless one has a session to archive.
+    let mut next_opencode_archive: Option<Instant> = None;
+
     // External-issue reconcile state. Project-wide (one tracker per project), so
     // it lives on the supervisor tick. Holds the poll watermark + last-seen
     // column per issue (ephemeral in-memory sync state — NOT a disk content
@@ -433,6 +438,13 @@ fn run_poller_loop(project_name: String, shutdown: Arc<AtomicBool>) {
                     prune_dead_session_dirs();
                     last_session_prune = Some(Instant::now() + SESSION_PRUNE_CADENCE);
                 }
+
+                // Archive (never delete) the OpenCode sessions of tasks that
+                // reached done, so Shelbi's sessions leave the user's OpenCode
+                // session lists once their work has landed. Re-derived from
+                // the ledgers and the board each pass, so every route to done
+                // (a move, an accept, a GitHub merge) is covered.
+                crate::opencode_sessions::maybe_archive_done_sessions(&project, &mut next_opencode_archive);
 
                 // Scoped CI poll: for every in-review PR, sample its checks and
                 // emit a `ci` state-change on a pass/fail transition so CI flows
@@ -4894,6 +4906,7 @@ fn decide(
             state: new_state,
             last_transition,
             last_seen: now,
+            opencode_session: None,
         },
     }
 }
@@ -9347,6 +9360,7 @@ Auto mode works better when it knows your environment. Takes about a minute.
             state,
             last_transition: Utc::now(),
             last_seen: Utc::now(),
+            opencode_session: None,
         };
         save_workspace_status(&project.name, &status(WorkspaceState::Serving, "t")).unwrap();
         assert_eq!(serving_task(&project).as_deref(), Some("t"));
@@ -9362,6 +9376,66 @@ Auto mode works better when it knows your environment. Takes about a minute.
             None => std::env::remove_var("SHELBI_HOME"),
         }
         let _ = std::fs::remove_dir_all(&gh_home);
+    }
+
+    /// Once a task is done, the poller's archive pass archives every OpenCode
+    /// session Shelbi launched for it (each generation), and only once; a task
+    /// still in progress keeps its session. A failed archive is retried, up to
+    /// a cap.
+    #[test]
+    fn a_done_tasks_opencode_sessions_are_archived_once() {
+        use crate::opencode_sessions::{archive_done_sessions, ArchiveOutcome, SessionArchiver, MAX_ARCHIVE_ATTEMPTS};
+        struct Fake {
+            calls: std::sync::Mutex<Vec<(String, String)>>,
+            fail: bool,
+        }
+        impl SessionArchiver for Fake {
+            fn archive(&self, _host: &Host, command: &str, id: &str) -> ArchiveOutcome {
+                self.calls.lock().unwrap().push((command.into(), id.into()));
+                if self.fail {
+                    ArchiveOutcome::Failed("unreachable".into())
+                } else if id.ends_with('0') {
+                    ArchiveOutcome::Missing
+                } else {
+                    ArchiveOutcome::Archived
+                }
+            }
+        }
+        let fake = |fail| Fake { calls: Default::default(), fail };
+
+        let _g = crate::test_lock::acquire();
+        let home = ReviewSlotHome::new();
+        let project = home.project();
+        save_review_task(&project, "landed", Column::done());
+        save_review_task(&project, "busy", Column::in_progress());
+        // `landed` was started fresh twice (two sessions), `busy` once.
+        shelbi_state::begin_opencode_session(&project.name, "alpha", "landed", false, "opencode").unwrap();
+        shelbi_state::begin_opencode_session(&project.name, "alpha", "landed", false, "opencode").unwrap();
+        shelbi_state::begin_opencode_session(&project.name, "alpha", "busy", false, "opencode").unwrap();
+
+        let live = fake(false);
+        archive_done_sessions(&project, &live);
+        let landed: Vec<_> = (0..2)
+            .map(|g| ("opencode".to_string(), shelbi_core::opencode_session_id(&project.name, "alpha", "landed", g)))
+            .collect();
+        assert_eq!(*live.calls.lock().unwrap(), landed, "both of the done task's sessions, none of the busy one's");
+        let ledger = shelbi_state::load_opencode_sessions(&project.name, "alpha").unwrap();
+        assert!(ledger.tasks["landed"].archived);
+        assert!(!ledger.tasks["busy"].archived);
+
+        // Already archived: the next pass leaves it alone.
+        let again = fake(false);
+        archive_done_sessions(&project, &again);
+        assert!(again.calls.lock().unwrap().is_empty());
+
+        // A failure is retried on later passes, then given up.
+        save_review_task(&project, "busy", Column::done());
+        for _ in 0..MAX_ARCHIVE_ATTEMPTS + 2 {
+            archive_done_sessions(&project, &fake(true));
+        }
+        let ledger = shelbi_state::load_opencode_sessions(&project.name, "alpha").unwrap();
+        assert!(!ledger.tasks["busy"].archived);
+        assert_eq!(ledger.tasks["busy"].archive_attempts, MAX_ARCHIVE_ATTEMPTS);
     }
 
     #[test]

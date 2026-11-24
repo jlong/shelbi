@@ -22,8 +22,14 @@
 //   version, pid). Shelbi waits for it after launch; without it the
 //   workspace reports `state_observation=degraded` and Shelbi reads
 //   OpenCode's dialogs off the screen instead.
+// - Shelbi launches the pane on a session it names (`--session`, exported as
+//   SHELBI_OPENCODE_SESSION). The plugin acts on that session and its
+//   subagents only, so another session opened in the same TUI is the user's
+//   own. It titles the session SHELBI_OPENCODE_TITLE
+//   (`Shelbi · <workspace> · <task>`) and puts the title back if it changes.
 //
-// A session Shelbi didn't launch (no SHELBI_PANE_TTY) is left alone.
+// A pane Shelbi didn't launch (no SHELBI_PANE_TTY or SHELBI_OPENCODE_SESSION)
+// is left alone.
 import { execFile } from "node:child_process";
 import {
   closeSync,
@@ -46,6 +52,8 @@ const BEACON = "plugin.alive";
 const PLUGIN_VERSION = 1;
 const HOOK_TIMEOUT_MS = 15000;
 const IDLE_DRAIN_MS = 5000;
+// How far up a subagent's parents the plugin looks for its own session.
+const MAX_SESSION_DEPTH = 8;
 
 // Instances in this process, by worktree: a second `setup` in the same
 // server sees the first here even before reading the lock file.
@@ -135,8 +143,10 @@ export default {
   id: "shelbi",
   setup: async (api) => {
     const tty = process.env.SHELBI_PANE_TTY;
+    const own = process.env.SHELBI_OPENCODE_SESSION;
+    const title = process.env.SHELBI_OPENCODE_TITLE;
     const root = api.location?.directory || process.cwd();
-    if (!tty || !existsSync(path.join(root, HOOKS))) return;
+    if (!tty || !own || !existsSync(path.join(root, HOOKS))) return;
     const release = claim(root);
     if (!release) return;
     beacon(root);
@@ -174,19 +184,43 @@ export default {
     // Sessions whose parent is another session are subagents. Their turns
     // don't end the pane's turn, but while one runs the pane is waiting on
     // background work rather than on a person.
-    const parents = new Map();
+    const parents = new Map([[own, null]]);
     const parentOf = async (sessionID) => {
       if (parents.has(sessionID)) return parents.get(sessionID);
       let parent = null;
       try {
         parent = (await api.session.get({ sessionID }))?.parentID ?? null;
       } catch {
-        // Unknown session: treat it as a main one.
+        // Unknown session: treat it as a top-level one, so not ours.
       }
       parents.set(sessionID, parent);
       return parent;
     };
+    // Whether `sessionID` is the pane's session or one of its subagents.
+    const ours = async (sessionID) => {
+      let id = sessionID;
+      for (let depth = 0; id && depth < MAX_SESSION_DEPTH; depth++) {
+        if (id === own) return true;
+        id = await parentOf(id);
+      }
+      return false;
+    };
     const runningChildren = new Set();
+
+    // Title the pane's session so the user can tell it from their own. The
+    // session may not exist yet when the plugin loads (the TUI creates it),
+    // so this is tried again when it appears, and the title is put back
+    // whenever something else renames it (OpenCode's own title agent).
+    let titled = false;
+    const applyTitle = async () => {
+      if (!title) return;
+      try {
+        await api.session.update({ sessionID: own, title });
+        titled = true;
+      } catch {
+        // Not created yet: `session.created` or the first turn retries.
+      }
+    };
 
     let marker = "";
     const mark = async (state, input) => {
@@ -248,6 +282,7 @@ export default {
     timer?.unref?.();
 
     await run("session-start.sh");
+    await applyTitle();
 
     const turnEnded = async (sessionID) => {
       if (await drain(sessionID)) return;
@@ -266,8 +301,16 @@ export default {
       const data = event?.data ?? {};
       if (type === "session.created") {
         parents.set(data.sessionID, data.parentID ?? null);
+        if (data.sessionID === own) await applyTitle();
         return;
       }
+      if (type === "session.renamed") {
+        if (data.sessionID === own && title && data.title !== title) await applyTitle();
+        return;
+      }
+      // A form's session is on the form itself.
+      const sessionID = data.sessionID ?? data.form?.sessionID;
+      if (!sessionID || !(await ours(sessionID))) return;
       if (type === "permission.asked" || type === "form.created") {
         await mark("blocked");
         return;
@@ -278,9 +321,10 @@ export default {
         if (marker === "blocked") await mark("working");
         return;
       }
-      if (!type.startsWith("session.") || !data.sessionID) return;
-      const child = (await parentOf(data.sessionID)) !== null;
+      if (!type.startsWith("session.")) return;
+      const child = sessionID !== own;
       if (type === "session.execution.started") {
+        if (!child && !titled) await applyTitle();
         if (child) {
           runningChildren.add(data.sessionID);
           return;

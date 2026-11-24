@@ -58,8 +58,9 @@ pub use model::{
     MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS, SUBTASK_WORKFLOW_NAME, TASK_WORKFLOW_NAME,
 };
 pub use opencode::{
-    efforts_for_variants, opencode_fallback_dialog_signatures, opencode_unsupported_message,
-    opencode_version_supported, parse_opencode_models, parse_opencode_version, OpenCodeModel, OPENCODE_DISCLOSURE,
+    efforts_for_variants, opencode_fallback_dialog_signatures, opencode_session_id,
+    opencode_session_title, opencode_unsupported_message, opencode_version_supported,
+    parse_opencode_models, parse_opencode_version, OpenCodeModel, OPENCODE_DISCLOSURE,
     OPENCODE_INSTALL, OPENCODE_MIN_VERSION, OPENCODE_NO_CEILING_NOTE, OPENCODE_UPGRADE,
 };
 pub use process_group::signal_process_group;

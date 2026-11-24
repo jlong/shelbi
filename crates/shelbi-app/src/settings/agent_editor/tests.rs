@@ -547,6 +547,8 @@ fn opencode_agents_disclose_what_shelbi_adds() {
     assert!(lines[0].contains("private server per pane"), "{lines:?}");
     assert!(lines.iter().any(|l| l.contains(".shelbi/opencode/")), "{lines:?}");
     assert!(lines.iter().any(|l| l.contains("OPENCODE_CONFIG_CONTENT")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("SHELBI_OPENCODE_SESSION")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("Shelbi · <workspace> · <task>")), "{lines:?}");
     assert_eq!(lines.last().map(String::as_str), Some(shelbi_core::OPENCODE_NO_CEILING_NOTE));
     // With a ceiling in effect, the allow-everything note goes.
     set_project_yaml(&home, "workspace_permissions_mode: default\n");

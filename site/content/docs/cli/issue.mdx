@@ -269,10 +269,11 @@ in-flight state:
    up, and a stale or wedged one (the duplicate-session case) is torn down
    before the fresh session comes up.
 3. For a **claude** runner the session relaunches with `--continue`, so the worker
-   reloads its prior conversation and picks up mid-thought with full context.
-   Other runners fall back to re-injecting the issue prompt. The agent continues
-   by reading its own prior work in the worktree. Either way the prompt is
-   auto-submitted.
+   reloads its prior conversation and picks up mid-thought with full context. An
+   **opencode** runner reopens the exact session Shelbi started it on
+   (`--session <id>`), never another session in the worktree. Other runners fall
+   back to re-injecting the issue prompt. The agent continues by reading its own
+   prior work in the worktree. Either way the prompt is auto-submitted.
 
 If the card has drifted out of `in_progress` (a killed worker whose issue
 someone moved back), `resume` restores it.

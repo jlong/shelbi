@@ -55,13 +55,19 @@ pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
 ///
 /// ```text
 /// env SHELBI_PANE_TTY="$(tty)" \
+///     [SHELBI_OPENCODE_SESSION=<id> SHELBI_OPENCODE_TITLE='Shelbi · <ws> · <task>'] \
 ///     [SHELBI_OPENCODE_USER_CONFIG="${SHELBI_OPENCODE_USER_CONFIG-${OPENCODE_CONFIG_CONTENT-}}" \
 ///      OPENCODE_CONFIG_CONTENT=<config>] \
 ///     OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' \
 ///     OPENCODE_DISABLE_AUTOUPDATE=1 \
-///   opencode --standalone [--auto] <flags>
+///   opencode --standalone [--auto] [--session <id>] <flags>
 /// ```
 ///
+/// - `--session <id>` (from [`with_opencode_session`]) reopens Shelbi's own
+///   session for the task, or creates it. Its id and title are exported for
+///   the plugin, which acts only on that session and its subagents and
+///   titles it. A `--continue` / `-c` beside it is dropped: it would pick the
+///   directory's newest session instead.
 /// - `--standalone` gives the pane a private server instead of OpenCode's
 ///   shared background service, so the server (and Shelbi's plugin inside it)
 ///   inherits this pane's environment (`TASK_ID`, the hub address). That
@@ -88,10 +94,16 @@ pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
 pub fn opencode_launch_command_with(spec: &AgentRunnerSpec, config: OpenCodeConfigSource<'_>) -> String {
     let mode = flag_value(&spec.flags, &[OPENCODE_PERMISSION_FLAG]);
     let bypass = mode.as_deref().is_some_and(|m| shelbi_core::permission_mode_rank(m) >= 3);
-    let mut flags: Vec<String> = strip_flag_with_value(&spec.flags, &["--model", "-m", OPENCODE_PERMISSION_FLAG])
-        .into_iter()
-        .filter(|f| f != OPENCODE_DENY_EDITS_FLAG && f != OPENCODE_STANDALONE_FLAG)
-        .collect();
+    let session = flag_value(&spec.flags, OPENCODE_SESSION_FLAGS);
+    let title = flag_value(&spec.flags, &[OPENCODE_TITLE_FLAG]);
+    let mut flags: Vec<String> =
+        strip_flag_with_value(&spec.flags, &["--model", "-m", OPENCODE_PERMISSION_FLAG, OPENCODE_TITLE_FLAG])
+            .into_iter()
+            .filter(|f| f != OPENCODE_DENY_EDITS_FLAG && f != OPENCODE_STANDALONE_FLAG)
+            .collect();
+    if session.is_some() {
+        flags.retain(|f| !OPENCODE_CONTINUE_FLAGS.contains(&f.as_str()));
+    }
     if mode.is_some() {
         flags.retain(|f| f != OPENCODE_AUTO_FLAG);
         if bypass {
@@ -111,6 +123,12 @@ pub fn opencode_launch_command_with(spec: &AgentRunnerSpec, config: OpenCodeConf
     // `exec {launch}`, and after `exec` an assignment word is taken for the
     // command name.
     let mut parts = vec!["env".to_string(), format!("{OPENCODE_PANE_TTY_ENV}=\"$(tty)\"")];
+    if let Some(session) = &session {
+        parts.push(format!("{OPENCODE_SESSION_ENV}={}", shell_escape(session)));
+        if let Some(title) = &title {
+            parts.push(format!("{OPENCODE_TITLE_ENV}={}", shell_escape(title)));
+        }
+    }
     if let Some(content) = content {
         parts.push(format!(
             "{OPENCODE_USER_CONFIG_ENV}=\"${{{OPENCODE_USER_CONFIG_ENV}-${{{OPENCODE_CONFIG_ENV}-}}}}\""
@@ -405,6 +423,49 @@ const OPENCODE_DENY_EDITS_FLAG: &str = "--shelbi-deny-edits";
 /// OpenCode's switch that approves every ask the config doesn't deny.
 const OPENCODE_AUTO_FLAG: &str = "--auto";
 
+/// OpenCode's flag naming the session to reopen, or to create when it
+/// doesn't exist.
+const OPENCODE_SESSION_FLAGS: &[&str] = &["--session", "-s"];
+
+/// OpenCode's "newest session in this directory" flags, which a named
+/// session replaces.
+const OPENCODE_CONTINUE_FLAGS: &[&str] = &["--continue", "-c"];
+
+/// The logical flag [`with_opencode_session`] carries the session title on.
+/// It becomes [`OPENCODE_TITLE_ENV`] and never reaches the OpenCode argv.
+const OPENCODE_TITLE_FLAG: &str = "--shelbi-session-title";
+
+/// Environment variable naming the OpenCode session Shelbi launched the pane
+/// on. The plugin acts only on that session and its subagents.
+pub const OPENCODE_SESSION_ENV: &str = "SHELBI_OPENCODE_SESSION";
+
+/// Environment variable carrying the title the plugin gives that session.
+pub const OPENCODE_TITLE_ENV: &str = "SHELBI_OPENCODE_TITLE";
+
+/// Return a copy of `spec` that launches OpenCode on the named session:
+/// `--session <id>` (which reopens it, or creates it on a first launch) plus
+/// the title the plugin gives it. Any session or `--continue` flag already in
+/// `spec` is replaced, since the named session is the one Shelbi tracks.
+/// Other runners get `spec` back unchanged.
+///
+/// The id comes from [`shelbi_core::opencode_session_id`]; the caller keeps
+/// the generation that picks it, so a resume passes the same id and a fresh
+/// start a new one.
+pub fn with_opencode_session(spec: &AgentRunnerSpec, id: &str, title: &str) -> AgentRunnerSpec {
+    if !RunnerAdapter::for_spec(spec).is_opencode() {
+        return spec.clone();
+    }
+    let mut names: Vec<&str> = OPENCODE_SESSION_FLAGS.to_vec();
+    names.push(OPENCODE_TITLE_FLAG);
+    let mut out = spec.clone();
+    out.flags = strip_flag_with_value(&spec.flags, &names)
+        .into_iter()
+        .filter(|f| !OPENCODE_CONTINUE_FLAGS.contains(&f.as_str()))
+        .collect();
+    out.flags.extend(["--session".into(), id.into(), OPENCODE_TITLE_FLAG.into(), title.into()]);
+    out
+}
+
 /// OpenCode's TUI config for a Shelbi pane: no terminal title (it would
 /// overwrite the `shelbi:<state>` markers) and no highlights.
 pub const OPENCODE_CLI_CONFIG_CONTENT: &str = r#"{"terminal":{"title":false},"highlights":false}"#;
@@ -454,6 +515,10 @@ pub enum ResumeStrategy {
     /// Reload the most recent transcript in the pane's cwd (`claude
     /// --continue`) — the strongest resume Shelbi can drive.
     Transcript,
+    /// Reopen the session Shelbi named at launch (`opencode --session <id>`,
+    /// see [`with_opencode_session`]): exactly that conversation, never
+    /// whichever session in the worktree is newest.
+    NamedSession,
     /// Re-open the runner's own native conversation thread (the Codex bridge's
     /// persisted owned thread).
     NativeThread,
@@ -542,7 +607,8 @@ impl RunnerAdapter {
     /// How a resumed workspace on this runner recovers its prior context.
     pub fn resume_strategy(self) -> ResumeStrategy {
         match self.kind {
-            RunnerKind::Claude | RunnerKind::OpenCode => ResumeStrategy::Transcript,
+            RunnerKind::Claude => ResumeStrategy::Transcript,
+            RunnerKind::OpenCode => ResumeStrategy::NamedSession,
             RunnerKind::Codex => ResumeStrategy::NativeThread,
             RunnerKind::Generic => ResumeStrategy::ColdBanner,
         }
@@ -735,9 +801,10 @@ impl RunnerAdapter {
     /// `claude` and `resume` is set. See the free [`with_continue`] wrapper
     /// for the full rationale.
     pub fn with_continue(self, spec: &AgentRunnerSpec, resume: bool) -> AgentRunnerSpec {
-        // Claude and OpenCode both spell it `--continue` (alias `-c`): reload
-        // the most recent session in the pane's working directory.
-        if !resume || !(self.is_claude() || self.is_opencode()) {
+        // OpenCode spells it `--continue` too, but there it means the newest
+        // session in the directory, which can be the user's own. Its resume
+        // names the session instead (`with_opencode_session`).
+        if !resume || !self.is_claude() {
             return spec.clone();
         }
         if spec
@@ -781,7 +848,8 @@ pub fn with_permission_mode(spec: &AgentRunnerSpec, mode: Option<&str>) -> Agent
 }
 
 /// Return a copy of `spec` with `--continue` appended when the runner is
-/// `claude` and `resume` is set. `claude --continue` reloads the most recent
+/// `claude` and `resume` is set (OpenCode resumes through
+/// [`with_opencode_session`] instead). `claude --continue` reloads the most recent
 /// conversation in the pane's working directory, so a resumed workspace picks
 /// up mid-thought with its full prior context — the session transcript lives
 /// under the user's `~/.claude/` and survives a killed agent session or a
@@ -1922,6 +1990,7 @@ mod tests {
     fn opencode_full_launch_line_golden() {
         let spec = with_permission_mode(&with_model(&opencode(&[]), Some("anthropic/claude-sonnet-5-5")), Some("acceptEdits"));
         let spec = with_edits_denied(&with_continue(&spec, true), true);
+        let spec = with_opencode_session(&spec, "ses_shelbi0123456789abcdef0123", "Shelbi · bravo · fix");
         let agent = concat!(
             r#"{"model":"anthropic/claude-sonnet-5-5","permissions":["#,
             r#"{"action":"edit","effect":"allow","resource":"*"},{"action":"shell","effect":"ask","resource":"*"},"#,
@@ -1930,7 +1999,7 @@ mod tests {
         assert_eq!(
             launch_command(&spec),
             format!(
-                r#"env SHELBI_PANE_TTY="$(tty)" {KEEP_USER} OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{agent},"plan":{agent}}}}}' {OC_ENV} opencode --standalone --continue"#
+                r#"env SHELBI_PANE_TTY="$(tty)" SHELBI_OPENCODE_SESSION=ses_shelbi0123456789abcdef0123 SHELBI_OPENCODE_TITLE='Shelbi · bravo · fix' {KEEP_USER} OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{agent},"plan":{agent}}}}}' {OC_ENV} opencode --standalone --session ses_shelbi0123456789abcdef0123"#
             )
         );
         let bypass = with_permission_mode(&opencode(&[]), Some("bypassPermissions"));
@@ -1948,7 +2017,7 @@ mod tests {
         assert!(adapter.is_opencode());
         assert_eq!(adapter.message_channel(), MessageChannel::Hooks);
         assert!(!adapter.polls_for_messages());
-        assert_eq!(adapter.resume_strategy(), ResumeStrategy::Transcript);
+        assert_eq!(adapter.resume_strategy(), ResumeStrategy::NamedSession);
         assert!(!adapter.needs_claude_readiness_probe());
         assert_eq!(
             adapter.orchestrator_plugin_injection(true),
@@ -1963,11 +2032,41 @@ mod tests {
 
     #[test]
     fn opencode_resume_and_effort_map_onto_its_flags() {
-        assert_eq!(with_continue(&opencode(&[]), true).flags, vec!["--continue"]);
+        // OpenCode never resumes by `--continue` (the directory's newest
+        // session, which can be the user's): it names its session.
+        assert!(with_continue(&opencode(&[]), true).flags.is_empty());
         assert!(with_continue(&opencode(&[]), false).flags.is_empty());
-        assert_eq!(with_continue(&opencode(&["-c"]), true).flags, vec!["-c"]);
         // Effort has no OpenCode switch Shelbi can drive.
         assert!(with_reasoning_effort(&opencode(&[]), Some(ReasoningEffort::High)).flags.is_empty());
+    }
+
+    /// The named session replaces any session or `--continue` a user wrote,
+    /// and only the real `--session` reaches the argv: the title rides the
+    /// environment.
+    #[test]
+    fn opencode_session_replaces_continue_and_exports_its_id() {
+        let spec = opencode(&["--continue", "-s", "ses_old", "-c", "--session=ses_older"]);
+        let named = with_opencode_session(&spec, "ses_shelbiaaaa", "Shelbi · w · t");
+        assert_eq!(
+            named.flags,
+            vec!["--session", "ses_shelbiaaaa", "--shelbi-session-title", "Shelbi · w · t"]
+        );
+        // Idempotent: naming it again leaves one session.
+        assert_eq!(with_opencode_session(&named, "ses_shelbiaaaa", "Shelbi · w · t").flags, named.flags);
+        assert_eq!(
+            launch_command(&named),
+            format!(
+                "env SHELBI_PANE_TTY=\"$(tty)\" SHELBI_OPENCODE_SESSION=ses_shelbiaaaa \
+                 SHELBI_OPENCODE_TITLE='Shelbi · w · t' {OC_ENV} opencode --standalone --session ses_shelbiaaaa"
+            )
+        );
+        // A hand-written `--continue` with no named session is the user's call.
+        assert_eq!(
+            launch_command(&opencode(&["--continue"])),
+            format!(r#"env SHELBI_PANE_TTY="$(tty)" {OC_ENV} opencode --standalone --continue"#)
+        );
+        // Other runners are untouched.
+        assert_eq!(with_opencode_session(&runner("claude"), "ses_x", "t").flags, Vec::<String>::new());
     }
 
     /// Regression: the orchestrator and worker launchers run the line as
@@ -1977,7 +2076,8 @@ mod tests {
     #[test]
     fn opencode_launch_line_survives_exec() {
         let spec = with_model(&opencode(&[]), Some("p/m"));
-        let mut spec = with_edits_denied(&with_permission_mode(&spec, Some("bypassPermissions")), true);
+        let spec = with_edits_denied(&with_permission_mode(&spec, Some("bypassPermissions")), true);
+        let mut spec = with_opencode_session(&spec, "ses_shelbi00", "Shelbi · it's · t");
         spec.command = "true".into();
         spec.integration = Some(RunnerKind::OpenCode);
         let line = format!("exec {}", launch_command(&spec));

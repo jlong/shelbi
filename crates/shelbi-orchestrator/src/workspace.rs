@@ -2911,9 +2911,11 @@ fn cancelled_launch(task_id: &str, workspace: &str) -> Error {
 /// - **Conversation resumed when the runner supports it.** For a claude runner
 ///   the pane relaunches with `--continue` (`resume: true` below → the pane
 ///   wrapper / remote launch add the flag), so the worker picks up its prior
-///   conversation with full context rather than reading its own code cold. For
-///   every other runner we fall back to re-injecting the task prompt — the
-///   agent continues by reading the work already in its worktree.
+///   conversation with full context rather than reading its own code cold. An
+///   OpenCode runner reopens the session Shelbi named at its last launch
+///   (`--session <id>`, the same generation in the workspace's OpenCode
+///   ledger). For every other runner we fall back to re-injecting the task
+///   prompt — the agent continues by reading the work already in its worktree.
 ///
 /// The pane is still recreated (that's how a killed/wedged session is
 /// reclaimed — the `duplicate session` case is handled by
@@ -3005,11 +3007,12 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
     }
     drop(git_worktree_lock);
 
-    // Prefer true conversation-resume for claude; every other runner falls back
-    // to plain prompt re-injection (the agent reads its own prior work).
+    // Prefer true conversation-resume: claude's `--continue`, OpenCode's
+    // named session. Every other runner falls back to plain prompt
+    // re-injection (the agent reads its own prior work).
     let resume = matches!(
         shelbi_agent::RunnerAdapter::for_spec(&runner).resume_strategy(),
-        shelbi_agent::ResumeStrategy::Transcript
+        shelbi_agent::ResumeStrategy::Transcript | shelbi_agent::ResumeStrategy::NamedSession
     );
     let handoff = classify_handoff(spec.project, spec.workspace, spec.task_id);
     let handoff_base = resolve_handoff_base_branch(spec.project, spec.task_id);
@@ -3083,8 +3086,9 @@ struct SpawnArgs<'a> {
     review_pgid_file: Option<&'a str>,
     /// `true` for a `shelbi task resume`: the pane is relaunched WITHOUT
     /// clearing the worktree, and a claude runner reloads its prior
-    /// conversation via `--continue`. `false` for a normal (context-clearing)
-    /// dispatch.
+    /// conversation via `--continue` (OpenCode reopens its named session).
+    /// `false` for a normal (context-clearing) dispatch, which also starts
+    /// OpenCode on a new session.
     resume: bool,
     prompt: &'a str,
 }
@@ -3261,6 +3265,7 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     let deny_edits = opencode
         && settings_deny_edits(&render_workspace_settings_preferring_agent(a.project, a.agent)?);
     let runner = shelbi_agent::with_edits_denied(a.runner, deny_edits);
+    let runner = with_named_opencode_session(&a.project.name, &a.workspace.name, a.task_id, a.resume, &runner)?;
     // OpenCode's config layer: generated from the fully resolved spec (model,
     // ceiling, edit deny) plus the staged context, and read by the launch.
     // A clean slate for the observation record: the new pane's plugin
@@ -3999,6 +4004,31 @@ fn settings_deny_edits(settings_json: &str) -> bool {
                 matches!(tool, "Edit" | "Write" | "NotebookEdit")
             })
         })
+}
+
+/// The runner `runner` launches as on `workspace` for `task_id`. OpenCode
+/// runs on a session Shelbi names (`--session <id>`), never the directory's
+/// newest one: a `resume` reopens this task's session on this slot, any other
+/// launch starts the next one (see [`shelbi_state::begin_opencode_session`]).
+/// The ledger behind it also feeds `status.yaml` and the archive pass once
+/// the task is done. Any other runner comes back unchanged, and the slot's
+/// `status.yaml` stops naming an OpenCode session.
+fn with_named_opencode_session(
+    project: &str,
+    workspace: &str,
+    task_id: &str,
+    resume: bool,
+    runner: &shelbi_core::AgentRunnerSpec,
+) -> Result<shelbi_core::AgentRunnerSpec> {
+    if !shelbi_agent::RunnerAdapter::for_spec(runner).is_opencode() {
+        if let Err(e) = shelbi_state::end_opencode_session(project, workspace) {
+            tracing::warn!(workspace, error = %e, "end_opencode_session failed");
+        }
+        return Ok(runner.clone());
+    }
+    let id = shelbi_state::begin_opencode_session(project, workspace, task_id, resume, &runner.command)?;
+    let title = shelbi_core::opencode_session_title(workspace, task_id);
+    Ok(shelbi_agent::with_opencode_session(runner, &id, &title))
 }
 
 /// Refuse to launch an OpenCode too old for Shelbi to drive (below
@@ -10625,8 +10655,8 @@ statuses:
             workspace_launch_command_with_layer(&claude, None, false, None, Some(OPENCODE_CONFIG_REL)),
             "claude"
         );
-        // A resume continues the last session and still seeds the prompt: the
-        // paste path is Claude's alone.
+        // A resume still seeds the prompt (the paste path is Claude's alone),
+        // and never adds `--continue`: the dispatch names the session.
         assert_eq!(
             workspace_launch_command_with_startup_prompt(
                 &opencode,
@@ -10637,9 +10667,71 @@ statuses:
             concat!(
                 r#"env SHELBI_PANE_TTY="$(tty)" "#,
                 r#"OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' OPENCODE_DISABLE_AUTOUPDATE=1 "#,
-                r#"opencode --standalone --continue --prompt "$(cat .shelbi/startup-prompt.md)""#,
+                r#"opencode --standalone --prompt "$(cat .shelbi/startup-prompt.md)""#,
             ),
         );
+    }
+
+    /// A dispatch launches OpenCode on `--session <deterministic id>`, never
+    /// `--continue`, and records the id in the slot's `status.yaml`. A resume
+    /// (pane killed, `issue resume`) reopens that session; a fresh start gets
+    /// a new one.
+    #[test]
+    fn opencode_dispatch_names_its_session_and_records_it() {
+        let _home = crate::test_lock::isolated_home();
+        let opencode = AgentRunnerSpec {
+            command: "opencode".into(),
+            flags: vec!["--continue".into()],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+        let launch = |resume| {
+            let runner = with_named_opencode_session("demo", "bravo", "fix-it", resume, &opencode).unwrap();
+            workspace_launch_command_with_startup_prompt(&runner, None, resume, Some(WORKTREE_STARTUP_PROMPT_REL))
+        };
+        let gen0 = shelbi_core::opencode_session_id("demo", "bravo", "fix-it", 0);
+        let gen1 = shelbi_core::opencode_session_id("demo", "bravo", "fix-it", 1);
+        let expected = |id: &str| {
+            format!(
+                "env SHELBI_PANE_TTY=\"$(tty)\" SHELBI_OPENCODE_SESSION={id} \
+                 SHELBI_OPENCODE_TITLE='Shelbi · bravo · fix-it' \
+                 OPENCODE_CLI_CONFIG_CONTENT='{{\"terminal\":{{\"title\":false}},\"highlights\":false}}' \
+                 OPENCODE_DISABLE_AUTOUPDATE=1 \
+                 opencode --standalone --session {id} --prompt \"$(cat .shelbi/startup-prompt.md)\""
+            )
+        };
+
+        let now = chrono::Utc::now();
+        shelbi_state::save_workspace_status(
+            "demo",
+            &shelbi_state::WorkspaceStatus {
+                workspace: "bravo".into(),
+                current_task: Some("fix-it".into()),
+                state: shelbi_state::WorkspaceState::Working,
+                last_transition: now,
+                last_seen: now,
+                opencode_session: None,
+            },
+        )
+        .unwrap();
+        let recorded = || {
+            shelbi_state::load_workspace_status("demo", "bravo")
+                .unwrap()
+                .unwrap()
+                .opencode_session
+        };
+
+        assert_eq!(launch(false), expected(&gen0));
+        assert_eq!(recorded().as_deref(), Some(gen0.as_str()));
+        assert_eq!(launch(true), expected(&gen0), "a resume reopens the same session");
+        assert_eq!(launch(false), expected(&gen1), "a fresh start gets a new session");
+        assert_eq!(recorded().as_deref(), Some(gen1.as_str()));
+
+        // The slot relaunched on another runner stops naming the session.
+        let claude = AgentRunnerSpec { command: "claude".into(), flags: vec![], ..opencode.clone() };
+        assert_eq!(with_named_opencode_session("demo", "bravo", "fix-it", false, &claude).unwrap().flags, Vec::<String>::new());
+        assert_eq!(recorded(), None);
     }
 
     /// The review agent's shipped settings deny the edit tools, which is what

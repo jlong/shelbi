@@ -2220,6 +2220,7 @@ mod tests {
             state,
             last_transition: chrono::Utc::now(),
             last_seen: chrono::Utc::now(),
+            opencode_session: None,
         }
     }
 

@@ -4964,6 +4964,7 @@ workspaces:
             state,
             last_transition: now,
             last_seen: now,
+            opencode_session: None,
         })
         .unwrap();
     };
