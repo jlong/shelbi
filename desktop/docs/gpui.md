@@ -138,6 +138,116 @@ goes quiet. Watch out for `font-kit` if it's ever taken.
   focused one's focus-in before the old one's focus-out when the new one was
   subscribed first.
 
+### Linux and Wayland (`dl-spike`, 2026-11-24)
+
+First step of the Omarchy port (`desktop-linux`): does the app build and run
+on Linux on the pinned channel, or do we need Zed's git gpui?
+
+**Decision: stay on `gpui-pre 0.3.9` + `gpui-kit 0.7.3` for Linux.** The
+snapshot ships Zed's Linux platform as `gpui-pre-linux` (Wayland and X11 over
+`gpui-pre-wgpu`, Vulkan through wgpu), the same code a Zed git pin at
+`93d7456` would give us. It built and ran unchanged, so there is no reason to
+switch, and the reasons above for staying (gpui-kit's widgets) still hold.
+The git channel stays the one-commit fallback.
+
+What it took:
+
+- **The Wayland backend, stated in `Cargo.toml`.** `gpui-pre-platform`
+  depends on `gpui-pre-linux` with `default-features = false`, which on its
+  own leaves only the headless platform: the app would start and never open a
+  window. `gpui-kit` turns on `gpui_platform`'s `wayland` and `x11` features
+  today, so it works without us, but a channel switch that drops gpui-kit
+  would lose it silently. A `[target.'cfg(target_os = "linux")']` entry turns
+  on `wayland` ourselves (features unify; the version pin stays in one place).
+- **gpui picks Wayland when `WAYLAND_DISPLAY` is set** (`select_backend` in
+  `gpui-pre-linux`), before X11, so under Hyprland the window is native.
+  `hyprctl clients` reports `xwayland: false` for `co.32pixels.shelbi` (the
+  `app_id` the app already sets). X11 support is still compiled in through
+  gpui-kit, so the binary links `libxcb` and `libxkbcommon-x11`.
+- **No source changes for the platform layer.** The macOS-only modules were
+  already `cfg(target_os = "macos")` with no-op Linux stubs (`platform::blur`,
+  `dock_icon`, `font_smoothing`, `metal_blend`, `motion`, `open_panel`,
+  `scrollers`, `screen`, `app_icons`, `drops::macos`/`pasteboard`, the
+  CoreText font code, `held_option_sides`), and the `objc2*` deps are
+  target-gated. The only breakage was five dead-code warnings (fatal under
+  `clippy -D warnings`): items only the macOS code reads (`SMOOTH_FONTS`,
+  `GPUI_PIPELINES`, `appkit_point`, `drops::land`, `drops::test_receiver`)
+  and `screen`'s stub `Handle = ()`, which clippy flags as a unit `clone`
+  (now a unit struct).
+
+What was checked on Arch (Omarchy, Hyprland, Intel GPU via Mesa's Vulkan
+driver):
+
+- `cargo build` and `cargo clippy --all-targets -- -D warnings` in `desktop/`
+  pass, on stable 1.100 and on the pinned 1.99.0, without changing
+  `Cargo.lock`.
+- The launch window, then a project window on a local project in a sandboxed
+  `SHELBI_ROOT`: the tab bar, the sidebar (Orchestrator, Issues, Changelog,
+  Settings, Zen mode), and the Orchestrator's terminal pane drawing a live
+  Claude Code session through the session protocol. Keys typed in the window
+  reach the session (an arrow key moved Claude Code's selection).
+- The window's transparent background works (the Hyprland wallpaper shows
+  through the glass), and text renders with the bundled faces.
+
+Not checked yet (later `desktop-linux` subtasks): mouse input, IME, the
+clipboard, file drops, notifications, menus, multiple windows and tab
+tear-off, HiDPI scaling, and `cargo test` on Linux.
+
+#### What the port still has to do
+
+Seen while running it; none of these block the build:
+
+- **Mac-specific copy and shortcuts.** "Projects on this Mac" on the launch
+  window, and `⌘` in the sidebar's shortcut hints.
+- **The traffic-light gap.** The tab bar leaves room on the left for macOS's
+  window buttons (`sidebar::traffic_light_position`); on Hyprland there are
+  none, so the gap is empty.
+- **No blur.** `platform::blur` is a no-op off macOS, so the glass is
+  see-through rather than frosted. Hyprland can blur the window with a
+  window rule; the app could also ask through the
+  `org_kde_kwin_blur`/`ext-background-effect` protocols.
+- **Fonts.** The bundled faces load through gpui (`assets::load_fonts`), but
+  the CoreText fallback registration and the installed-font list
+  (`terminal::fonts::installed`) are macOS-only, so the font picker shows only
+  the bundled faces, and glyph fallback (Nerd symbols behind a configured
+  family) is untested. gpui-kit logs that its default monospace face
+  (`DejaVu Sans Mono`) isn't installed and uses `Noto Sans Mono`; the UI font
+  resolves to Adwaita Sans.
+- **`SHELBI_ROOT` doesn't reach the app's children.** `platform::env` pins
+  `SHELBI_HOME` and the socket variables for the `shelbi` processes the app
+  starts, but not `SHELBI_ROOT`, so a child takes whatever the login shell
+  has. It's not Linux-specific; it matters for sandboxed runs, where setting
+  both is the workaround.
+- **`rust-toolchain.toml` lists only `aarch64-apple-darwin`** as an extra
+  target. Linux builds the host target anyway, so nothing breaks, but a
+  `RUSTUP_TOOLCHAIN` set in the environment (as on this machine) overrides
+  the pin: build with `RUSTUP_TOOLCHAIN=1.99.0` to match CI.
+
+#### System libraries (for the PKGBUILD)
+
+Build: `pkg-config` and the development headers of `wayland`,
+`libxkbcommon` (with `libxkbcommon-x11`), `libxcb`, `vulkan-icd-loader`,
+`fontconfig` and `freetype2` (on Arch the headers come with the runtime
+packages), plus `base-devel` for the build scripts' C compiler. Checked
+versions: wayland 1.26.0, libxkbcommon 1.13.2, vulkan-icd-loader 1.4.363,
+fontconfig 2.18.3, freetype2 2.15.0, libxcb 1.17.0.
+
+Runtime, from `ldd` and the running process's mapped libraries:
+
+| Package | Why |
+|---|---|
+| `wayland` | `libwayland-client`, the window |
+| `libxkbcommon`, `libxkbcommon-x11` | keymaps (linked) |
+| `libxcb`, `libx11`, `xcb-util-keysyms` | linked through gpui's X11 backend |
+| `vulkan-icd-loader` + a Vulkan driver (`vulkan-intel`, `vulkan-radeon` or `nvidia-utils`) | wgpu renders through Vulkan |
+| `mesa` / `libglvnd` | loaded by the Vulkan driver |
+| `zstd`, `zlib`, `expat` | loaded at runtime |
+
+`fontconfig` and `freetype2` were not loaded by the running app (gpui's Linux
+text system finds fonts itself), but they are cheap and common enough to list
+as dependencies until the fonts work is done. Plus `git` and the `shelbi` CLI
+at run time, as on macOS.
+
 ## Upgrading
 
 1. Pick the new `gpui-kit` release and read its changelog.
@@ -154,6 +264,7 @@ goes quiet. Watch out for `font-kit` if it's ever taken.
 | 2026-10-14 | | `gpui-pre 0.3.9`, `gpui-kit 0.7.3` | Initial pin. | |
 | 2026-10-14 | `gpui-pre 0.3.9` | (no upgrade) Zed git @`93d7456`, evaluated in a scratch copy | No text rendered: `gpui_macos` without `font-kit`. `gpui-kit` can't coexist with a git gpui. | `features = ["font-kit"]` on `gpui_platform`; drop `gpui-kit` (6 lines). Not switched. |
 | 2026-10-30 | | `gpui-pre 0.3.9` (no upgrade) | Fills over a translucent window read solid: `gpui_apple::metal_renderer` builds its pipelines with the destination alpha factor `One`, so alphas add (18% over 85% glass = 1.03, clamped to opaque). | `platform::metal_blend` wraps the Metal device's `newRenderPipelineStateWithDescriptor:error:` and sets `OneMinusSourceAlpha` on gpui's labeled pipelines (`quads`, `shadows`, `underlines`, `monochrome_sprites`, `polychrome_sprites`, `surfaces`, `path_sprites`); no fork, color factors untouched, opaque windows unchanged. Coupled to those labels: `--visual-check`'s blend check fails if an upgrade renames them. |
+| 2026-11-24 | | `gpui-pre 0.3.9` (no upgrade), first Linux build (Arch, Hyprland) | Nothing in gpui. Five dead-code warnings in our macOS-only code; `gpui-pre-platform` pulls `gpui-pre-linux` with no backend features. | `cfg_attr(not(macos), allow(dead_code))` on the macOS-only items; `wayland` stated on `gpui_platform` for Linux. See "Linux and Wayland". |
 
 ### Tests
 

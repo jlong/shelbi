@@ -75,6 +75,7 @@ impl NativeWindow {
 /// `primary_h` tall. No display's edge clamps it: a point above the primary
 /// display (the menu bar's row, or a display arranged above it) is simply
 /// past its top.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the macOS code only
 pub fn appkit_point(at: Point<f32>, primary_h: f64) -> (f64, f64) {
     (f64::from(at.x), primary_h - f64::from(at.y))
 }
@@ -260,7 +261,9 @@ mod imp {
 mod imp {
     use gpui::{Bounds, Point, Window};
 
-    pub type Handle = ();
+    /// No native window to hold off macOS.
+    #[derive(Clone)]
+    pub struct Handle;
 
     pub fn content_frame(_window: &Window) -> Option<Bounds<f32>> {
         None

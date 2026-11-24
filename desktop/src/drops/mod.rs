@@ -80,7 +80,7 @@ pub fn accept_in(window: &Window) {
 
 /// The receiving end of [`LANDED`], for a test that drives the AppKit hooks
 /// without the app (`install` never runs there).
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 fn test_receiver() -> async_channel::Receiver<Landed> {
     static RX: OnceLock<async_channel::Receiver<Landed>> = OnceLock::new();
     RX.get_or_init(|| {
@@ -92,6 +92,7 @@ fn test_receiver() -> async_channel::Receiver<Landed> {
 }
 
 /// Queue `paths` as a drop on `ns_window` at `position` (from any thread).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the macOS code only
 fn land(ns_window: usize, position: Point<Pixels>, paths: Vec<PathBuf>) {
     if paths.is_empty() {
         return;
@@ -112,6 +113,9 @@ fn deliver(landed: Landed, cx: &mut AsyncApp) {
         position,
         paths,
     } = landed;
+    // Only macOS drops arrive here, so only macOS matches the window.
+    #[cfg(not(target_os = "macos"))]
+    let _ = ns_window;
     for handle in cx.update(|cx| cx.windows()) {
         let delivered = handle.update(cx, |_, window, cx| {
             #[cfg(target_os = "macos")]
