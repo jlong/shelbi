@@ -1176,6 +1176,7 @@ mod tests {
                 agent: Some("developer".into()),
                 badge: WorkspaceBadge::Working,
                 pause_reason: None,
+                waiting_on: None,
             }],
             reviews: vec![ReviewRow {
                 task_id: "T-9".into(),

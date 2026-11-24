@@ -162,16 +162,7 @@ pub fn read_turn_end_wake(
     task: Option<&str>,
     now: DateTime<Utc>,
 ) -> TurnEndWake {
-    let running = || {
-        crate::awareness::read_awareness(project)
-            .map(|store| {
-                store
-                    .jobs
-                    .iter()
-                    .any(|job| starter_is(job.started_by.as_ref(), workspace, task))
-            })
-            .unwrap_or(false)
-    };
+    let running = || !waiting_jobs(project, workspace, task).is_empty();
     let grace = chrono::Duration::from_std(JOB_REPORT_GRACE).unwrap_or_default();
     let reporting = || {
         crate::awareness::read_job_history(project)
@@ -187,6 +178,23 @@ pub fn read_turn_end_wake(
     let job_pending = running() || reporting();
     let question_open = task.is_some_and(|task| task_has_open_question(project, task));
     TurnEndWake { job_pending, question_open }
+}
+
+/// The running jobs `workspace` of `project`, serving `task`, waits on: the
+/// ones it started whose result will come back to it as a prompt (the same
+/// rule as [`read_turn_end_wake`]), oldest first. What the sidebar names on a
+/// [`WorkspaceState::Waiting`] row. An unreadable store reads as none.
+pub fn waiting_jobs(project: &str, workspace: &str, task: Option<&str>) -> Vec<crate::awareness::Job> {
+    let Ok(store) = crate::awareness::read_awareness(project) else {
+        return Vec::new();
+    };
+    let mut jobs: Vec<_> = store
+        .jobs
+        .into_iter()
+        .filter(|job| starter_is(job.started_by.as_ref(), workspace, task))
+        .collect();
+    jobs.sort_by_key(|job| job.started_at);
+    jobs
 }
 
 /// Whether a job started by `starter` reports back to `workspace` serving
@@ -651,6 +659,22 @@ mod tests {
         }
     }
 
+    /// Every runner's turn-end signal folds the same way: Claude's and
+    /// Codex's `shelbi:idle` title marker and OpenCode's `idle` runner-state
+    /// report all read Waiting while the worker's own job runs, and
+    /// AwaitingInput once nothing is pending.
+    #[test]
+    fn every_runners_idle_signal_waits_on_a_job() {
+        let job = TurnEndWake { job_pending: true, question_open: false };
+        let title = parse_pane_title_marker("shelbi:idle").unwrap().workspace_state();
+        let report = crate::RunnerState::Idle.workspace_state();
+        for idle in [title, report] {
+            assert!(idle.is_turn_end());
+            assert_eq!(idle.with_turn_end_wake(job), WorkspaceState::Waiting);
+            assert_eq!(idle.with_turn_end_wake(TurnEndWake::default()), WorkspaceState::AwaitingInput);
+        }
+    }
+
     #[test]
     fn turn_end_wake_reads_the_job_and_question_stores() {
         use crate::awareness::{add_job, JobKind, JobStarter, NewJob};
@@ -680,12 +704,21 @@ mod tests {
         add_job("demo", job(Some(starter("bravo", Some("t1"))))).unwrap();
         add_job("demo", job(Some(starter("alpha", Some("t0"))))).unwrap();
         assert!(!read_turn_end_wake("demo", "alpha", Some("t1"), Utc::now()).job_pending);
+        assert!(waiting_jobs("demo", "alpha", Some("t1")).is_empty());
 
         // Alpha's own job for t1.
         let mine = add_job("demo", job(Some(starter("alpha", Some("t1"))))).unwrap();
         assert!(read_turn_end_wake("demo", "alpha", Some("t1"), Utc::now()).job_pending);
+        let ids = |ws: &str| -> Vec<String> {
+            waiting_jobs("demo", ws, Some("t1")).into_iter().map(|j| j.id).collect()
+        };
+        assert_eq!(ids("alpha"), std::slice::from_ref(&mine.id));
+        // Bravo's own job is bravo's alone.
+        assert_eq!(ids("bravo").len(), 1);
+        assert_ne!(ids("bravo"), ids("alpha"));
         let job = crate::awareness::remove_job("demo", &mine.id).unwrap().unwrap();
         assert!(!read_turn_end_wake("demo", "alpha", Some("t1"), Utc::now()).job_pending);
+        assert!(ids("alpha").is_empty());
 
         // Finished just now: its report is on its way to alpha, so alpha is
         // still waiting on it. Past the grace it no longer counts.

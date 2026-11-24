@@ -364,6 +364,18 @@ fn workspace_busy(model: &SidebarModel, name: &str) -> bool {
         .any(|w| w.name == name && w.current_task.is_some())
 }
 
+/// The workspace row's tooltip: its state as a sentence when the glyph alone
+/// doesn't say enough (what a waiting workspace waits on,
+/// [`WorkspaceRow::state_detail`](shelbi_app::view::WorkspaceRow::state_detail)).
+/// `None` for every other row, which draws no tooltip.
+pub fn workspace_tooltip(model: &SidebarModel, name: &str) -> Option<String> {
+    model
+        .workspaces
+        .iter()
+        .find(|w| w.name == name)
+        .and_then(|w| w.state_detail())
+}
+
 /// The `ordinal`-th selectable entry's selection-chip key: its selector, so
 /// the chip follows the item (not its ordinal) when rows come and go.
 pub fn selected_key(entries: &[Entry], ordinal: usize) -> Option<SharedString> {
@@ -1272,9 +1284,11 @@ fn render_row<H: SidebarHost>(
         }
         SidebarRow::Workspace { name, badge, .. } => {
             let busy = workspace_busy(props.model, name);
+            let tip = workspace_tooltip(props.model, name);
             // A machine's workspaces sit flush with its name and the section
             // title, as the component's Multiple frame draws them.
             item(base)
+                .when_some(tip, |d, tip| d.tooltip(style::tooltip(tip)))
                 .flex_row()
                 .items_center()
                 .gap_2()
@@ -1592,6 +1606,7 @@ mod tests {
             agent: task.map(|_| "developer".into()),
             badge,
             pause_reason: None,
+            waiting_on: None,
         }
     }
 
@@ -1880,6 +1895,30 @@ mod tests {
         );
     }
 
+    /// A waiting row's tooltip names the job it waits on; a row with nothing
+    /// more to say than its glyph has none.
+    #[test]
+    fn a_waiting_rows_tooltip_names_its_job() {
+        let mut waiting = ws("bravo", "hub", Some("t-1"), WorkspaceBadge::Waiting);
+        waiting.waiting_on = Some("job j372 · bravo desktop checks".into());
+        let model = SidebarModel {
+            workspaces: vec![
+                ws("alpha", "hub", Some("t-2"), WorkspaceBadge::AwaitingInput),
+                waiting,
+                ws("charlie", "hub", Some("t-3"), WorkspaceBadge::Waiting),
+            ],
+            ..SidebarModel::default()
+        };
+        assert_eq!(
+            workspace_tooltip(&model, "bravo").as_deref(),
+            Some("Waiting on job j372 · bravo desktop checks")
+        );
+        assert_eq!(workspace_tooltip(&model, "alpha"), None);
+        // Waiting on its runner's own background work: nothing to name.
+        assert_eq!(workspace_tooltip(&model, "charlie"), None);
+        assert_eq!(workspace_tooltip(&model, "nobody"), None);
+    }
+
     #[test]
     fn the_state_glyphs_are_the_components() {
         let t = theme();
@@ -1988,6 +2027,7 @@ mod render_tests {
             agent: task.map(|_| "developer".into()),
             badge,
             pause_reason: None,
+            waiting_on: None,
         }
     }
 

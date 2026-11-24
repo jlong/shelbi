@@ -1416,6 +1416,7 @@ mod tests {
             agent: agent.map(str::to_string),
             badge,
             pause_reason: None,
+            waiting_on: None,
         }
     }
 

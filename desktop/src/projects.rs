@@ -396,6 +396,7 @@ mod tests {
             agent: None,
             badge: WorkspaceBadge::Loading,
             pause_reason: None,
+            waiting_on: None,
         }];
         let catalog = Catalog::with(
             vec![ProjectEntry {

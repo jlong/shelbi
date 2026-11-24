@@ -7670,6 +7670,7 @@ mod tests {
                     agent: None,
                     badge: shelbi_app::view::WorkspaceBadge::Idle,
                     pause_reason: None,
+                    waiting_on: None,
                 }],
                 reviews: vec![],
                 config_error: None,
@@ -10640,6 +10641,7 @@ mod tests {
                 agent: None,
                 badge: shelbi_app::view::WorkspaceBadge::Loading,
                 pause_reason: None,
+                waiting_on: None,
             })
             .collect();
         m

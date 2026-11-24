@@ -46,6 +46,7 @@ pub(super) fn fixture_model() -> SidebarModel {
         agent: Some("developer".into()),
         badge: WorkspaceBadge::Working,
         pause_reason: None,
+        waiting_on: None,
     }];
     m.reviews = vec![ReviewRow {
         task_id: "T-9".into(),

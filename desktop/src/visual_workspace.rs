@@ -256,6 +256,7 @@ fn row(name: &str, machine: &str, remote: bool, task: Option<&str>, badge: Works
         agent: task.map(|_| "developer".into()),
         badge,
         pause_reason: None,
+        waiting_on: None,
     }
 }
 

@@ -124,6 +124,13 @@ pub struct WorkspaceRow {
     /// the agent. `None` when the runner gave no reason.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pause_reason: Option<String>,
+    /// What a [`WorkspaceBadge::Waiting`] workspace waits on, in words
+    /// ([`waiting_on_label`]): the Shelbi jobs it started that will wake it,
+    /// such as `job j372 · bravo desktop checks`. `None` in any other state,
+    /// or when it waits on its runner's own background work, which the hub
+    /// can't name. [`WorkspaceRow::state_detail`] reads it as a sentence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waiting_on: Option<String>,
 }
 
 /// A review-column task row.
@@ -274,6 +281,37 @@ impl WorkspaceRow {
             Some(a) => title_case(a),
             None if self.badge == WorkspaceBadge::Loading => String::new(),
             None => "idle".to_string(),
+        }
+    }
+}
+
+impl WorkspaceRow {
+    /// The row's state as a sentence when the glyph alone doesn't say enough:
+    /// what a Waiting workspace waits on (`Waiting on job j372 · bravo
+    /// desktop checks`). For a tooltip or a subtitle; `None` otherwise.
+    pub fn state_detail(&self) -> Option<String> {
+        match (&self.badge, &self.waiting_on) {
+            (WorkspaceBadge::Waiting, Some(on)) => Some(format!("Waiting on {on}")),
+            _ => None,
+        }
+    }
+}
+
+/// What a waiting workspace waits on, from the running jobs it started
+/// (`(id, label)`, oldest first): `job j372 · bravo desktop checks` for one
+/// (just `job j372` without a label), `2 jobs · j372, j375` for several.
+/// `None` with none.
+pub fn waiting_on_label<'a>(jobs: impl IntoIterator<Item = (&'a str, Option<&'a str>)>) -> Option<String> {
+    let jobs: Vec<_> = jobs.into_iter().collect();
+    match jobs.as_slice() {
+        [] => None,
+        [(id, label)] => Some(match label.map(str::trim).filter(|l| !l.is_empty()) {
+            Some(label) => format!("job {id} · {label}"),
+            None => format!("job {id}"),
+        }),
+        many => {
+            let ids: Vec<&str> = many.iter().map(|(id, _)| *id).collect();
+            Some(format!("{} jobs · {}", many.len(), ids.join(", ")))
         }
     }
 }
@@ -716,6 +754,7 @@ impl SidebarModel {
                     agent: task.and_then(|f| f.task.param_str("agent").map(str::to_string)),
                     badge,
                     pause_reason: None,
+                    waiting_on: None,
                 }
             })
             .collect();
@@ -1861,6 +1900,7 @@ mod tests {
             agent: task.map(|_| "developer".to_string()),
             badge,
             pause_reason: None,
+            waiting_on: None,
         }
     }
 
@@ -2023,6 +2063,35 @@ mod tests {
         )));
         row.badge = WorkspaceBadge::Working;
         assert_eq!(row.right_label(), "Developer");
+    }
+
+    /// A workspace waiting on its own job says which one, as a sentence;
+    /// any other state, or a wait the hub can't name, says nothing more.
+    #[test]
+    fn a_waiting_rows_detail_names_its_jobs() {
+        assert_eq!(waiting_on_label([]), None);
+        assert_eq!(
+            waiting_on_label([("j372", Some("bravo desktop checks"))]).as_deref(),
+            Some("job j372 · bravo desktop checks")
+        );
+        assert_eq!(waiting_on_label([("j372", Some("  "))]).as_deref(), Some("job j372"));
+        assert_eq!(waiting_on_label([("j372", None)]).as_deref(), Some("job j372"));
+        assert_eq!(
+            waiting_on_label([("j372", Some("a")), ("j375", None)]).as_deref(),
+            Some("2 jobs · j372, j375")
+        );
+
+        let mut row = ws_row("bravo", "hub", Some("T-1"), WorkspaceBadge::Waiting);
+        assert_eq!(row.state_detail(), None);
+        row.waiting_on = Some("job j372 · bravo desktop checks".into());
+        assert_eq!(
+            row.state_detail().as_deref(),
+            Some("Waiting on job j372 · bravo desktop checks")
+        );
+        // The agent stays the right label: the wait isn't a reason to hide it.
+        assert_eq!(row.right_label(), "Developer");
+        row.badge = WorkspaceBadge::AwaitingInput;
+        assert_eq!(row.state_detail(), None);
     }
 
     #[test]
@@ -2588,6 +2657,7 @@ mod tests {
             agent: task.map(|_| "developer".to_string()),
             badge,
             pause_reason: None,
+            waiting_on: None,
         }
     }
 

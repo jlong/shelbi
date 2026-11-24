@@ -98,6 +98,7 @@ fn sidebar_model_round_trips() {
             agent: Some("developer".into()),
             badge: WorkspaceBadge::AwaitingPermission,
             pause_reason: None,
+            waiting_on: None,
         }],
         reviews: vec![ReviewRow {
             task_id: "t-2".into(),

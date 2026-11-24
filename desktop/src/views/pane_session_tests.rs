@@ -120,6 +120,7 @@ fn ws(name: &str, task: Option<&str>) -> WorkspaceRow {
         agent: None,
         badge: if task.is_some() { WorkspaceBadge::Working } else { WorkspaceBadge::Idle },
         pause_reason: None,
+        waiting_on: None,
     }
 }
 
