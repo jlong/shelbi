@@ -114,7 +114,8 @@ pub const OPENCODE_DISCLOSURE: &[&str] = &[
      ~/.config/opencode, .opencode/, opencode.json or AGENTS.md.",
     "Environment: OPENCODE_CONFIG_CONTENT (config.json, merged over your own value, which is kept in \
      SHELBI_OPENCODE_USER_CONFIG), OPENCODE_CLI_CONFIG_CONTENT (turns off OpenCode's terminal title), \
-     OPENCODE_DISABLE_AUTOUPDATE=1, SHELBI_PANE_TTY, SHELBI_OPENCODE_SESSION and SHELBI_OPENCODE_TITLE.",
+     OPENCODE_DISABLE_AUTOUPDATE=1, SHELBI_OPENCODE_SESSION and SHELBI_OPENCODE_TITLE. Shelbi's plugin \
+     reports the pane's state to Shelbi's hub; it never writes to your terminal.",
     "Orchestrator: one session per project (--session ses_shelbiorch…, titled \"Shelbi · <project> · \
      orchestrator\"), which a reload reopens. Its instructions are named in the config layer. On the \
      awareness event system Shelbi's plugin (SHELBI_OPENCODE_ROLE=orchestrator) delivers board events into it.",

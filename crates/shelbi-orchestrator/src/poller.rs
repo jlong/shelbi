@@ -2079,16 +2079,33 @@ fn poll_one(
         }
     }
 
+    // A runner that reports its own state to the hub (`runner-state`, today
+    // OpenCode through Shelbi's plugin) is read from that report rather than
+    // the pane: it says why it's blocked or paused, which a title marker
+    // can't, and needs no screen. A report left over from another task (the
+    // slot was redispatched before the new pane reported) doesn't count.
+    let assigned_task = current_task_for(project, &workspace.name);
+    let reported = shelbi_state::read_runner_state(&project.name, &workspace.name)
+        .filter(|report| report.is_for_task(assigned_task.as_deref()));
+
     // Generic blocking-dialog advisory (trust / permission / question), deduped
     // via `last_dialog` so a still-open modal produces one event per incident.
-    // The detected kind is also folded into the persisted state below.
-    let dialog = maybe_emit_dialog_event(
-        project,
-        workspace,
-        screen.as_deref(),
-        last_dialog,
-        unknown_dialog_streak,
-    );
+    // The detected kind is also folded into the persisted state below. A
+    // reporting runner's own blocked report stands in for the screen match,
+    // so its asks reach the orchestrator as the same `dialog:<kind>` lines.
+    let dialog = match &reported {
+        Some(report) => {
+            *unknown_dialog_streak = 0;
+            record_dialog_detection(project, workspace, reported_dialog_kind(report), last_dialog)
+        }
+        None => maybe_emit_dialog_event(
+            project,
+            workspace,
+            screen.as_deref(),
+            last_dialog,
+            unknown_dialog_streak,
+        ),
+    };
 
     // Resolve this tick's workspace state. For a Claude runner the live pane
     // *content* is the primary signal, not the `shelbi:<state>` pane-title
@@ -2105,7 +2122,7 @@ fn poll_one(
     let live_state = runner_is_claude
         .then(|| screen.as_deref().and_then(live_workspace_state))
         .flatten();
-    let new_state = match live_state {
+    let new_state = match live_state.or(reported.as_ref().map(|r| r.state.workspace_state())) {
         Some(state) => state,
         // A blocking modal (trust / permission / question) parks the pane
         // awaiting a human: neither the busy footer nor the ready input box is
@@ -2134,7 +2151,6 @@ fn poll_one(
     // running (or its report is on its way), and AwaitingInput again when it
     // has an open question. Read only on turn-end ticks, so a busy pane costs
     // no store reads. See [`WorkspaceState::with_turn_end_wake`].
-    let assigned_task = current_task_for(project, &workspace.name);
     let new_state = if new_state.is_turn_end() {
         new_state.with_turn_end_wake(shelbi_state::read_turn_end_wake(
             &project.name,
@@ -2157,8 +2173,13 @@ fn poll_one(
     // to AwaitingInput for one tick and log a spurious workspace-free signal. Require the idle observation to persist for
     // `IDLE_DEBOUNCE_MIN_STREAK` polls; a real turn-end still commits one
     // interval later at most, and any other edge is unaffected.
-    let (new_state, streak) =
-        debounce_idle_edge(prior.map(|p| p.state), new_state, *idle_debounce_streak);
+    // A runner's own report is no screen sample, so it has no mid-repaint
+    // misses to debounce.
+    let (new_state, streak) = if reported.is_some() {
+        (new_state, 0)
+    } else {
+        debounce_idle_edge(prior.map(|p| p.state), new_state, *idle_debounce_streak)
+    };
     *idle_debounce_streak = streak;
 
     // Hold a confirmed-serving review slot at `Serving` when this tick's generic
@@ -2187,12 +2208,25 @@ fn poll_one(
         tracing::warn!(workspace = %workspace.name, error = %e, "save_workspace_status failed");
     }
     if outcome.transitioned {
-        if let Err(e) = append_workspace_event(
-            &project.name,
-            &workspace.name,
-            outcome.prev_state,
-            outcome.status.state,
-        ) {
+        // A runner that reported its pause says why; the line carries it.
+        let appended = match reported.as_ref() {
+            Some(report) if outcome.status.state == WorkspaceState::Paused => {
+                shelbi_state::append_runner_pause_event(
+                    &project.name,
+                    &workspace.name,
+                    outcome.prev_state,
+                    report.reason.as_deref(),
+                    report.until,
+                )
+            }
+            _ => append_workspace_event(
+                &project.name,
+                &workspace.name,
+                outcome.prev_state,
+                outcome.status.state,
+            ),
+        };
+        if let Err(e) = appended {
             tracing::warn!(workspace = %workspace.name, error = %e, "append_workspace_event failed");
         }
     }
@@ -2359,6 +2393,26 @@ fn maybe_emit_dialog_event(
         }
     };
 
+    record_dialog_detection(project, workspace, detected, last_dialog)
+}
+
+/// The dialog kind a runner's own report stands for: a `blocked` report's
+/// reason (`permission`, `question`), or `runner` when it gave none. Every
+/// other state is no dialog.
+fn reported_dialog_kind(report: &shelbi_state::RunnerStateReport) -> Option<String> {
+    (report.state == shelbi_state::RunnerState::Blocked)
+        .then(|| report.reason.clone().unwrap_or_else(|| "runner".to_string()))
+}
+
+/// Fold this tick's dialog detection into the dedupe state (`last_dialog`),
+/// appending the `dialog:<kind>` block / clear lines [`decide_dialog`] asks
+/// for. Returns the kind the pane is stuck on now, if any.
+fn record_dialog_detection(
+    project: &Project,
+    workspace: &shelbi_core::WorkspaceSpec,
+    detected: Option<String>,
+    last_dialog: &mut Option<String>,
+) -> Option<String> {
     let (events, next) = decide_dialog(last_dialog.as_deref(), detected.as_deref());
     for ev in events {
         if let Err(e) =
@@ -7810,6 +7864,125 @@ Intro prose.
         }
 
         shelbi_state::clear_observation_degraded("demo", "alpha").unwrap();
+        match prior_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A runner that reports its own state over the hub (`runner-state`) is
+    /// read from that report, not the pane: paused with its reason, blocked
+    /// as a `dialog:<reason>` the orchestrator sees, and a report for another
+    /// task ignored. No title marker exists for these panes at all.
+    #[test]
+    fn poll_one_prefers_the_runners_own_state_report() {
+        use crate::session_backend::Liveness;
+        use shelbi_state::{RunnerState, RunnerStateReport};
+
+        let _g = crate::test_lock::acquire();
+        let home = review_serving_home();
+        let prior_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.agent_runners.insert(
+            "opencode".into(),
+            AgentRunnerSpec {
+                command: "opencode".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+                integration: None,
+            },
+        );
+        project.orchestrator = OrchestratorSpec::new("opencode");
+        shelbi_state::save_task("demo", &in_progress_task("fix-login", "alpha"), "body").unwrap();
+
+        let report = |state, reason: Option<&str>, task: &str| RunnerStateReport {
+            state,
+            reason: reason.map(str::to_string),
+            until: None,
+            task: Some(task.to_string()),
+            at: Utc::now(),
+        };
+        let mut last_known = None;
+        let mut last_dialog = None;
+        let (mut dialog_streak, mut idle_streak, mut exited) = (0, 0, false);
+        let mut tick = |last_known: &mut Option<WorkspaceState>, last_dialog: &mut Option<String>| {
+            poll_one(
+                &project,
+                &project.workspaces[0],
+                last_known,
+                last_dialog,
+                &mut dialog_streak,
+                &mut idle_streak,
+                &mut exited,
+                &mut SupervisionState::default(),
+                &mut LimitResumeState::default(),
+                &mut OrphanReap::default(),
+                &mut HashMap::new(),
+            );
+        };
+        let state = || {
+            shelbi_state::load_workspace_status("demo", "alpha")
+                .unwrap()
+                .map(|s| (s.state, s.current_task))
+        };
+        let log = || std::fs::read_to_string(shelbi_state::events_log_path().unwrap()).unwrap_or_default();
+        crate::workspace::set_test_pane_liveness(Some(Liveness::Alive));
+
+        // No report and no marker: the tick records nothing.
+        tick(&mut last_known, &mut last_dialog);
+        assert_eq!(state(), None);
+
+        shelbi_state::write_runner_state("demo", "alpha", &report(RunnerState::Working, None, "fix-login")).unwrap();
+        tick(&mut last_known, &mut last_dialog);
+        assert_eq!(state(), Some((WorkspaceState::Working, Some("fix-login".into()))));
+
+        let mut paused = report(RunnerState::Paused, Some("provider.free-limit"), "fix-login");
+        paused.until = Some("2026-11-24T12:00:05Z".parse().unwrap());
+        shelbi_state::write_runner_state("demo", "alpha", &paused).unwrap();
+        tick(&mut last_known, &mut last_dialog);
+        tick(&mut last_known, &mut last_dialog);
+        assert_eq!(state().unwrap().0, WorkspaceState::Paused);
+        let lines = log();
+        assert_eq!(
+            lines
+                .matches(
+                    " project=demo workspace=alpha working -> paused reason=provider.free-limit \
+                     until=2026-11-24T12:00:05+00:00"
+                )
+                .count(),
+            1,
+            "one pause line, with the runner's reason; log:\n{lines}"
+        );
+
+        // Blocked on a permission ask: the same `dialog:permission` lines a
+        // screen-read dialog produces, and they clear when the ask is answered.
+        shelbi_state::write_runner_state("demo", "alpha", &report(RunnerState::Blocked, Some("permission"), "fix-login")).unwrap();
+        tick(&mut last_known, &mut last_dialog);
+        assert_eq!(state().unwrap().0, WorkspaceState::Blocked);
+        assert_eq!(last_dialog.as_deref(), Some("permission"));
+        assert!(log().contains("working -> blocked reason=dialog:permission"), "{}", log());
+        shelbi_state::write_runner_state("demo", "alpha", &report(RunnerState::Working, None, "fix-login")).unwrap();
+        tick(&mut last_known, &mut last_dialog);
+        assert_eq!(state().unwrap().0, WorkspaceState::Working);
+        assert_eq!(last_dialog, None);
+        assert!(log().contains("blocked -> working reason=dialog:permission:cleared"), "{}", log());
+
+        // Idle reads as awaiting input at once (no debounce on a report).
+        shelbi_state::write_runner_state("demo", "alpha", &report(RunnerState::Idle, None, "fix-login")).unwrap();
+        tick(&mut last_known, &mut last_dialog);
+        assert_eq!(state().unwrap().0, WorkspaceState::AwaitingInput);
+
+        // A report left by another task speaks for nothing: the state stands.
+        shelbi_state::write_runner_state("demo", "alpha", &report(RunnerState::Working, None, "older-task")).unwrap();
+        tick(&mut last_known, &mut last_dialog);
+        assert_eq!(state().unwrap().0, WorkspaceState::AwaitingInput);
+
+        crate::workspace::set_test_pane_liveness(None);
         match prior_home {
             Some(h) => std::env::set_var("SHELBI_HOME", h),
             None => std::env::remove_var("SHELBI_HOME"),

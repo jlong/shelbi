@@ -119,6 +119,7 @@ fn ws(name: &str, task: Option<&str>) -> WorkspaceRow {
         current_task: task.map(str::to_string),
         agent: None,
         badge: if task.is_some() { WorkspaceBadge::Working } else { WorkspaceBadge::Idle },
+        pause_reason: None,
     }
 }
 

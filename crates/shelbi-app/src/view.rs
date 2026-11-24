@@ -118,6 +118,12 @@ pub struct WorkspaceRow {
     pub agent: Option<String>,
     /// Per-workspace state glyph shown in the badge column.
     pub badge: WorkspaceBadge,
+    /// Why a [`WorkspaceBadge::Paused`] workspace is paused, in words
+    /// ([`pause_reason_label`]): its runner's own report, such as an OpenCode
+    /// pane on a provider limit. Shown as the row's right label in place of
+    /// the agent. `None` when the runner gave no reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<String>,
 }
 
 /// A review-column task row.
@@ -259,6 +265,11 @@ impl WorkspaceRow {
     /// title case, `idle` with no task, or nothing for a skeleton row whose
     /// state hasn't been read yet (its `…` badge carries that).
     pub fn right_label(&self) -> String {
+        if self.badge == WorkspaceBadge::Paused {
+            if let Some(reason) = &self.pause_reason {
+                return reason.clone();
+            }
+        }
         match &self.agent {
             Some(a) => title_case(a),
             None if self.badge == WorkspaceBadge::Loading => String::new(),
@@ -704,6 +715,7 @@ impl SidebarModel {
                     current_task,
                     agent: task.and_then(|f| f.task.param_str("agent").map(str::to_string)),
                     badge,
+                    pause_reason: None,
                 }
             })
             .collect();
@@ -1507,6 +1519,39 @@ pub fn workspace_state_badge(state: Option<WorkspaceState>) -> (&'static str, To
     }
 }
 
+/// A paused runner's reason in words, for the sidebar row: the token a
+/// runner reported (`provider.free-limit`, `provider.rate-limit`, ...) as a
+/// short phrase. `retrying` marks a pause the runner will end by itself (a
+/// scheduled retry), which reads as `Retrying` when the reason isn't a named
+/// limit. `None` when there is nothing to say.
+pub fn pause_reason_label(reason: Option<&str>, retrying: bool) -> Option<String> {
+    let token = reason.map(|r| r.strip_prefix("provider.").unwrap_or(r));
+    let named = match token {
+        Some("free-limit") => Some("Free limit"),
+        Some("go-limit") => Some("Go limit"),
+        Some("rate-limit") => Some("Rate limited"),
+        Some("quota") => Some("Quota reached"),
+        Some("budget-limit" | "model-budget-limit") => Some("Budget limit"),
+        Some("chatgpt-limit" | "chatgpt-workspace-limit") => Some("ChatGPT limit"),
+        Some("usage-limit") => Some("Usage limit"),
+        _ => None,
+    };
+    if let Some(named) = named {
+        return Some(named.to_string());
+    }
+    if retrying {
+        return Some("Retrying".to_string());
+    }
+    let words: String = token?
+        .chars()
+        .map(|c| if matches!(c, '-' | '_' | '.' | ':') { ' ' } else { c })
+        .collect();
+    let words = words.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = words.chars();
+    let first = chars.next()?;
+    Some(first.to_uppercase().chain(chars).collect())
+}
+
 /// Truncate `s` to `max` chars, marking an elision with `…`.
 pub fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -1815,6 +1860,7 @@ mod tests {
             current_task: task.map(str::to_string),
             agent: task.map(|_| "developer".to_string()),
             badge,
+            pause_reason: None,
         }
     }
 
@@ -1957,6 +2003,43 @@ mod tests {
         row.badge = WorkspaceBadge::Loading;
         assert_eq!(row.right_label(), "");
         assert_eq!(title_case(""), "");
+    }
+
+    /// A paused workspace whose runner said why shows the reason where the
+    /// agent would be; with no reason, or in any other state, the agent stays.
+    #[test]
+    fn a_paused_rows_right_label_is_its_reason() {
+        let mut row = ws_row("alpha", "hub", Some("T-1"), WorkspaceBadge::Paused);
+        assert_eq!(row.right_label(), "Developer");
+        row.pause_reason = Some("Free limit".into());
+        assert_eq!(row.right_label(), "Free limit");
+        let paused = SidebarModel {
+            workspaces: vec![row.clone()],
+            ..SidebarModel::default()
+        };
+        assert!(paused.rows().iter().any(|r| matches!(
+            r,
+            SidebarRow::Workspace { right_label, badge: WorkspaceBadge::Paused, .. } if right_label == "Free limit"
+        )));
+        row.badge = WorkspaceBadge::Working;
+        assert_eq!(row.right_label(), "Developer");
+    }
+
+    #[test]
+    fn pause_reasons_read_as_short_phrases() {
+        let label = |reason: Option<&str>, retrying| pause_reason_label(reason, retrying);
+        assert_eq!(label(Some("provider.free-limit"), false).as_deref(), Some("Free limit"));
+        assert_eq!(label(Some("provider.rate-limit"), true).as_deref(), Some("Rate limited"));
+        assert_eq!(label(Some("provider.quota"), false).as_deref(), Some("Quota reached"));
+        assert_eq!(label(Some("provider.chatgpt-workspace-limit"), false).as_deref(), Some("ChatGPT limit"));
+        assert_eq!(label(Some("usage-limit"), false).as_deref(), Some("Usage limit"));
+        // A retry after some other provider error is just a retry.
+        assert_eq!(label(Some("provider.internal"), true).as_deref(), Some("Retrying"));
+        assert_eq!(label(None, true).as_deref(), Some("Retrying"));
+        // An unknown reason still reads as words rather than a wire token.
+        assert_eq!(label(Some("provider.new-cap"), false).as_deref(), Some("New cap"));
+        assert_eq!(label(None, false), None);
+        assert_eq!(label(Some("--"), false), None);
     }
 
     #[test]
@@ -2504,6 +2587,7 @@ mod tests {
             current_task: task.map(str::to_string),
             agent: task.map(|_| "developer".to_string()),
             badge,
+            pause_reason: None,
         }
     }
 

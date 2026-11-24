@@ -550,7 +550,11 @@ pub fn load_workspace_status(project: &str, workspace: &str) -> Result<Option<Wo
 /// After clearing, `load_workspace_status` reads `None` (the "not polled" state
 /// a genuinely idle slot has) and the board-derived views render it as idle.
 /// Idempotent and best-effort: a missing file is not an error.
+///
+/// The runner's own last report ([`crate::runner_state`]) goes with it: it
+/// described the same pane.
 pub fn clear_workspace_status(project: &str, workspace: &str) -> Result<()> {
+    crate::clear_runner_state(project, workspace)?;
     let path = workspace_status_path(project, workspace)?;
     match fs::remove_file(&path) {
         Ok(()) => Ok(()),

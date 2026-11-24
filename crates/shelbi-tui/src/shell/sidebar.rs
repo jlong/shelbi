@@ -1415,6 +1415,7 @@ mod tests {
             current_task: task.map(str::to_string),
             agent: agent.map(str::to_string),
             badge,
+            pause_reason: None,
         }
     }
 

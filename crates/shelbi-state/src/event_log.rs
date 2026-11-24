@@ -1695,6 +1695,42 @@ pub fn append_workspace_pause_event(
     Ok(())
 }
 
+/// Append a runner-reported *pause* transition line to `~/.shelbi/events.log`:
+///
+/// ```text
+/// <rfc3339> project=<project> workspace=<name> <prev> -> paused reason=<reason>[ until=<rfc3339>]
+/// ```
+///
+/// The counterpart of [`append_workspace_pause_event`] for a runner that
+/// reports its own state over the hub's `runner-state` verb (OpenCode's
+/// plugin): the reason is the runner's (`provider.free-limit`,
+/// `provider.rate-limit`, ...) rather than Claude's on-screen usage limit,
+/// and `until` is a scheduled retry when the runner has one. Emitted only on
+/// the edge into Paused; the way out is an ordinary transition line.
+pub fn append_runner_pause_event(
+    project: &str,
+    workspace: &str,
+    prev: Option<WorkspaceState>,
+    reason: Option<&str>,
+    until: Option<DateTime<Utc>>,
+) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let workspace = sanitize_field(workspace);
+    let prev_str = prev.map(|s| s.as_str()).unwrap_or("working");
+    let reason = reason.map(sanitize_reason).filter(|r| !r.is_empty());
+    let mut line = format!(
+        "{ts} project={project} workspace={workspace} {prev_str} -> paused reason={}",
+        reason.as_deref().unwrap_or("runner")
+    );
+    if let Some(until) = until {
+        line.push_str(&format!(" until={}", until.to_rfc3339()));
+    }
+    append_event_line(&line)?;
+    crate::publish_change(crate::ChangeNotification::Workspace { project, workspace });
+    Ok(())
+}
+
 /// Append `<rfc3339> message=<msg_id> task=<task-id> push=ok` to
 /// `~/.shelbi/events.log`. Records a hub → workspace push on the file-based
 /// message channel (see `shelbi message`) so the channel is auditable from
@@ -6012,6 +6048,36 @@ mod tests {
     /// A subscribed client repaints off the change bus, so entering Paused has
     /// to publish like every other workspace transition or the ⏸ badge waits on
     /// some unrelated refresh.
+    #[test]
+    fn runner_pause_line_carries_the_runner_reason_and_retry_time() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+        std::fs::create_dir_all(events_log_path().unwrap().parent().unwrap()).unwrap();
+        let until: DateTime<Utc> = "2026-11-24T12:00:05Z".parse().unwrap();
+        append_runner_pause_event(
+            "demo",
+            "alpha",
+            Some(WorkspaceState::Working),
+            Some("provider.rate-limit"),
+            Some(until),
+        )
+        .unwrap();
+        append_runner_pause_event("demo", "bravo", None, None, None).unwrap();
+        let body = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert!(
+            lines[0].ends_with(
+                " project=demo workspace=alpha working -> paused reason=provider.rate-limit \
+                 until=2026-11-24T12:00:05+00:00"
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].ends_with(" project=demo workspace=bravo working -> paused reason=runner"), "{}", lines[1]);
+        std::env::remove_var("SHELBI_HOME");
+    }
+
     #[test]
     fn entering_paused_publishes_a_workspace_change() {
         let _g = TEST_LOCK.lock().unwrap();

@@ -52,6 +52,7 @@ pub mod opencode_sessions;
 pub mod orchestrator_setup;
 pub mod ownership;
 pub mod questions;
+pub mod runner_state;
 pub use migration::{
     all_workspace_migration_states, set_workspace_migration_state, workspace_migrated,
     workspace_migration_state, migration_unreachable_machines, set_migration_machine_unreachable,
@@ -245,7 +246,8 @@ pub use event_log::{
     append_send_degraded_event, append_send_event, append_settings_selfheal_event, append_supervision_event,
     append_task_edit_event, append_task_event, append_task_event_actions_skipped,
     append_workspace_dialog_event,
-    append_workspace_event, append_workspace_pane_event, append_workspace_pause_event,
+    append_runner_pause_event, append_workspace_event, append_workspace_pane_event,
+    append_workspace_pause_event,
     append_worktree_detach_event, append_worktree_detach_skipped_event, append_zen_dryrun_event,
     append_zen_mode_event, delivery_id,
     acquire_event_delivery_lock, claim_event_follower, emit_event_body, event_cursor_path,
@@ -266,6 +268,10 @@ pub use event_log::{
 pub use opencode_sessions::{
     begin_opencode_session, current_opencode_session, end_opencode_session, load_opencode_sessions,
     opencode_sessions_path, update_opencode_sessions, OpenCodeSessions, OpenCodeTaskSession,
+};
+pub use runner_state::{
+    clear_runner_state, read_runner_state, runner_state_path, sanitize_runner_reason,
+    write_runner_state, RunnerState, RunnerStateReport,
 };
 pub use workspace_state_migration::{
     legacy_workspace_state_dirs, migrate_legacy_workspace_state_dir, LegacyStateDisposition,

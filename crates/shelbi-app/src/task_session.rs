@@ -109,6 +109,7 @@ mod tests {
             current_task: task.map(str::to_string),
             agent: None,
             badge,
+            pause_reason: None,
         }
     }
 

@@ -189,6 +189,7 @@ fn sidebar_model() -> SidebarModel {
         current_task: Some("search-index".into()),
         agent: Some("developer".into()),
         badge: WorkspaceBadge::Working,
+        pause_reason: None,
     }];
     m.reviews = vec![row(ReviewState::Serving)];
     m.board_loading = false;
