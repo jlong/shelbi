@@ -111,7 +111,11 @@ pub fn command_model_from(
         .iter()
         .map(|w| WorkspaceItem {
             name: w.name.clone(),
-            subtitle: w.current_task.clone(),
+            // The task, and what a waiting workspace waits on beside it.
+            subtitle: match (w.current_task.clone(), w.state_detail()) {
+                (Some(task), Some(detail)) => Some(format!("{task} · {detail}")),
+                (task, detail) => task.or(detail),
+            },
             decoration: None,
         })
         .collect();
@@ -333,6 +337,7 @@ mod tests {
             agent: Some("developer".into()),
             badge: WorkspaceBadge::Working,
             pause_reason: None,
+            waiting_on: None,
         }];
         s.reviews = vec![ReviewRow {
             task_id: "T-9".into(),
@@ -379,6 +384,19 @@ mod tests {
         assert_eq!(m.views[0].decoration.as_ref().unwrap().glyph, "💬");
         assert_eq!(m.workspaces[0].subtitle.as_deref(), Some("T-1"));
         assert_eq!(m.reviews[0].task_id, "T-9");
+    }
+
+    /// A workspace waiting on its own job says which one after its task.
+    #[test]
+    fn a_waiting_workspaces_subtitle_names_its_job() {
+        let mut s = sidebar();
+        s.workspaces[0].badge = WorkspaceBadge::Waiting;
+        s.workspaces[0].waiting_on = Some("job j372 · desktop checks".into());
+        let m = command_model_from("alpha", &s, false, Vec::new(), Vec::new());
+        assert_eq!(
+            m.workspaces[0].subtitle.as_deref(),
+            Some("T-1 · Waiting on job j372 · desktop checks")
+        );
     }
 
     #[test]

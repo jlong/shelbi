@@ -426,6 +426,7 @@ fn the_sidebars_scroll_survives_the_review(cx: &mut TestAppContext) {
                 agent: None,
                 badge: WorkspaceBadge::Idle,
                 pause_reason: None,
+                waiting_on: None,
             })
             .collect();
     });
@@ -520,6 +521,7 @@ fn esc_on_the_workspace_panel_pushes_back_to_the_sidebar_as_it_was(cx: &mut Test
                 agent: None,
                 badge: WorkspaceBadge::Idle,
                 pause_reason: None,
+                waiting_on: None,
             })
             .collect();
         rows.insert(0, w.model.workspaces[0].clone());

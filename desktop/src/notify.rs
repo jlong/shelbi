@@ -342,6 +342,7 @@ mod tests {
             agent: None,
             badge,
             pause_reason: None,
+            waiting_on: None,
         }
     }
 

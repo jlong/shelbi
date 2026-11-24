@@ -190,6 +190,7 @@ fn sidebar_model() -> SidebarModel {
         agent: Some("developer".into()),
         badge: WorkspaceBadge::Working,
         pause_reason: None,
+        waiting_on: None,
     }];
     m.reviews = vec![row(ReviewState::Serving)];
     m.board_loading = false;

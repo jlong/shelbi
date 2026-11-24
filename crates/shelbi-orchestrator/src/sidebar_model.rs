@@ -157,6 +157,7 @@ pub fn read_config_skeleton(project: &str) -> Option<SidebarModel> {
                 agent: None,
                 badge: WorkspaceBadge::Loading,
                 pause_reason: None,
+                waiting_on: None,
             })
         })
         .collect();
@@ -233,6 +234,9 @@ fn load_workspaces(project: &str, in_progress: &[IssueFile]) -> anyhow::Result<V
         let pause_reason = (badge == WorkspaceBadge::Paused)
             .then(|| runner_pause_reason(project, &workspace.name, current_task.as_deref()))
             .flatten();
+        let waiting_on = (badge == WorkspaceBadge::Waiting)
+            .then(|| waiting_on(project, &workspace.name, current_task.as_deref()))
+            .flatten();
         out.push(WorkspaceRow {
             name: workspace.name.clone(),
             machine: workspace.machine.clone(),
@@ -241,6 +245,7 @@ fn load_workspaces(project: &str, in_progress: &[IssueFile]) -> anyhow::Result<V
             agent,
             badge,
             pause_reason,
+            waiting_on,
         });
     }
     Ok(out)
@@ -254,6 +259,16 @@ fn runner_pause_reason(project: &str, workspace: &str, task: Option<&str>) -> Op
     let report = shelbi_state::read_runner_state(project, workspace)
         .filter(|r| r.state == shelbi_state::RunnerState::Paused && r.is_for_task(task))?;
     shelbi_app::view::pause_reason_label(report.reason.as_deref(), report.until.is_some())
+}
+
+/// What a waiting workspace waits on, in words: the running Shelbi jobs it
+/// started for the task it serves ([`shelbi_state::waiting_jobs`], the same
+/// jobs that made the poller read its turn end as Waiting). `None` when it
+/// waits on its runner's own background work, or on a job that just finished
+/// and whose report is on its way.
+fn waiting_on(project: &str, workspace: &str, task: Option<&str>) -> Option<String> {
+    let jobs = shelbi_state::waiting_jobs(project, workspace, task);
+    shelbi_app::view::waiting_on_label(jobs.iter().map(|j| (j.id.as_str(), j.label.as_deref())))
 }
 
 /// Pick the badge for a workspace from the task-board signal + its on-disk
@@ -528,6 +543,50 @@ mod tests {
         assert_eq!(waiting.glyph(), "⋯");
         assert_eq!(question, WorkspaceBadge::AwaitingInput);
         assert_eq!(question.glyph(), "?");
+    }
+
+    /// A waiting row names the running jobs its worker started for its task;
+    /// the orchestrator's jobs and another workspace's never count.
+    #[test]
+    fn a_waiting_row_names_its_own_running_jobs() {
+        use shelbi_state::awareness::{add_job, remove_job, JobKind, JobStarter, NewJob};
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-sidebar-waiting-on-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join("projects/demo")).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let job = |by: Option<(&str, &str)>, label: &str| NewJob {
+            kind: JobKind::Pid,
+            target: "1".into(),
+            label: Some(label.into()),
+            estimate: None,
+            started_by: by.map(|(ws, task)| JobStarter {
+                workspace: ws.into(),
+                agent: Some("developer".into()),
+                task: Some(task.into()),
+            }),
+        };
+        let nothing = waiting_on("demo", "alpha", Some("t1"));
+        add_job("demo", job(None, "orchestrator checks")).unwrap();
+        add_job("demo", job(Some(("beta", "t1")), "beta checks")).unwrap();
+        let others_only = waiting_on("demo", "alpha", Some("t1"));
+        let mine = add_job("demo", job(Some(("alpha", "t1")), "alpha checks")).unwrap();
+        let one = waiting_on("demo", "alpha", Some("t1"));
+        remove_job("demo", &mine.id).unwrap();
+        let done = waiting_on("demo", "alpha", Some("t1"));
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(nothing, None);
+        assert_eq!(others_only, None);
+        assert_eq!(one, Some(format!("job {} · alpha checks", mine.id)));
+        assert_eq!(done, None);
     }
 
     /// A paused slot whose runner reported why (an OpenCode pane on its

@@ -621,6 +621,7 @@ impl WorkspaceView {
                 agent: None,
                 badge: WorkspaceBadge::Loading,
                 pause_reason: None,
+                waiting_on: None,
             })
         })?;
         Some(WorkspaceHeader::build(&row, self.details.as_ref()))
@@ -1868,6 +1869,7 @@ pub(crate) mod tests {
             agent: task.map(|_| "developer".to_string()),
             badge,
             pause_reason: None,
+            waiting_on: None,
         }
     }
 
