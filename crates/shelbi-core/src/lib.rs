@@ -8,6 +8,7 @@ pub mod integration;
 pub mod login_env;
 pub mod model;
 pub mod opencode;
+pub mod process_group;
 pub mod placeholders;
 pub mod pool;
 pub mod releases;
@@ -22,7 +23,7 @@ pub mod workspace_names;
 pub use agent_manifest::{
     clamp_permission_mode, is_known_permission_mode, model_suggestions, orchestrator_model,
     permission_mode_rank,
-    reasoning_efforts,
+    reasoning_efforts, takes_model,
     resolve_agent_launch, AgentManifest, AgentRequires, ReasoningEffort, ResolvedAgentLaunch,
     RunnerManifestConfig, PERMISSION_MODES,
 };
@@ -57,9 +58,11 @@ pub use model::{
     MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS, SUBTASK_WORKFLOW_NAME, TASK_WORKFLOW_NAME,
 };
 pub use opencode::{
-    opencode_fallback_dialog_signatures, opencode_unsupported_message, opencode_version_supported, parse_opencode_version,
-    OPENCODE_INSTALL, OPENCODE_MIN_VERSION, OPENCODE_UPGRADE,
+    efforts_for_variants, opencode_fallback_dialog_signatures, opencode_unsupported_message,
+    opencode_version_supported, parse_opencode_models, parse_opencode_version, OpenCodeModel, OPENCODE_DISCLOSURE,
+    OPENCODE_INSTALL, OPENCODE_MIN_VERSION, OPENCODE_NO_CEILING_NOTE, OPENCODE_UPGRADE,
 };
+pub use process_group::signal_process_group;
 pub use releases::{ReleasesConfig, TagGlob};
 pub use placeholders::{extract_placeholders, substitute_placeholders};
 pub use session_health::{

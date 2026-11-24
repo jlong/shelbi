@@ -7,6 +7,8 @@
 //! rather than as a working runner. The older npm package is still
 //! 1.x; v2 ships as `@opencode/cli`.
 
+use crate::ReasoningEffort;
+
 /// The oldest OpenCode Shelbi drives (`major`, `minor`).
 pub const OPENCODE_MIN_VERSION: (u32, u32) = (2, 3);
 
@@ -63,6 +65,61 @@ pub fn opencode_fallback_dialog_signatures() -> Vec<crate::DialogSignature> {
     vec![crate::DialogSignature::new("permission", "Permission required")]
 }
 
+/// One model `opencode models` lists: its `provider/model` id and the
+/// reasoning variants OpenCode reports for it (`low`, `high`, `max`, …;
+/// provider-specific, and often none).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeModel {
+    /// `provider/model`, as OpenCode's `model` config takes it.
+    pub id: String,
+    pub variants: Vec<String>,
+}
+
+/// The reasoning efforts a model with `variants` can take: each of Low,
+/// Medium, High and Max whose same-named variant it reports, lowest first
+/// (decision Q4, the same mapping as `shelbi_agent::opencode_effort_variant`
+/// at launch).
+/// Variants with no Shelbi effort (`minimal`, `xhigh`, `none`) aren't
+/// offered. Empty: the model takes no effort Shelbi can set.
+pub fn efforts_for_variants(variants: &[String]) -> Vec<ReasoningEffort> {
+    [ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High, ReasoningEffort::Max]
+        .into_iter()
+        .filter(|e| variants.iter().any(|v| v.trim().eq_ignore_ascii_case(e.as_str())))
+        .collect()
+}
+
+/// The ids in `opencode models` output: one `provider/model` per line.
+/// Anything else (a blank line, a log line) is skipped.
+pub fn parse_opencode_models(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.contains(char::is_whitespace) && l.contains('/'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// What Settings › Agents says an OpenCode agent runs with: how OpenCode is
+/// launched, and every file and environment variable Shelbi adds. One
+/// place, so the disclosure follows the launch (`shelbi_agent`'s
+/// `opencode_launch_command`).
+pub const OPENCODE_DISCLOSURE: &[&str] = &[
+    "OpenCode runs in a private server per pane (opencode --standalone). Shelbi adds its instructions, \
+     skills, plugin and permission rules through environment variables, and doesn't change your OpenCode config.",
+    "Files: .shelbi/opencode/ in each workspace (config.json, instructions.md, skills/, Shelbi's plugin in \
+     plugins/shelbi/, and its plugin.lock and plugin.alive), rewritten at each launch. Nothing is written to \
+     ~/.config/opencode, .opencode/, opencode.json or AGENTS.md.",
+    "Environment: OPENCODE_CONFIG_CONTENT (config.json, merged over your own value, which is kept in \
+     SHELBI_OPENCODE_USER_CONFIG), OPENCODE_CLI_CONFIG_CONTENT (turns off OpenCode's terminal title), \
+     OPENCODE_DISABLE_AUTOUPDATE=1 and SHELBI_PANE_TTY.",
+];
+
+/// The note an OpenCode agent shows when no permission ceiling applies
+/// (decision Q2): Shelbi imposes nothing, so OpenCode's own settings decide.
+pub const OPENCODE_NO_CEILING_NOTE: &str = "OpenCode's own default allows edits and shell commands. \
+     Your OpenCode config, or a permission ceiling set here or in the project, restricts them; \
+     with neither, Shelbi imposes nothing.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -101,5 +158,28 @@ mod tests {
             opencode_unsupported_message("1.19.6"),
             "OpenCode 1.19.6 isn't supported. Shelbi needs OpenCode 2.3 or later: run `opencode upgrade`."
         );
+    }
+
+    #[test]
+    fn efforts_follow_the_variants_a_model_reports() {
+        let v = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            efforts_for_variants(&v(&["low", "high", "max"])),
+            [ReasoningEffort::Low, ReasoningEffort::High, ReasoningEffort::Max]
+        );
+        assert_eq!(
+            efforts_for_variants(&v(&["minimal", "low", "medium", "high", "xhigh", "max"])),
+            [ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High, ReasoningEffort::Max]
+        );
+        assert_eq!(efforts_for_variants(&v(&["none", "minimal", "xhigh"])), []);
+        assert_eq!(efforts_for_variants(&[]), []);
+        assert_eq!(efforts_for_variants(&v(&["HIGH"])), [ReasoningEffort::High]);
+    }
+
+    #[test]
+    fn models_output_is_one_id_per_line() {
+        let out = "opencode/big-pickle\n\nanthropic/claude-sonnet-5-5\nWARN something odd\n";
+        assert_eq!(parse_opencode_models(out), ["opencode/big-pickle", "anthropic/claude-sonnet-5-5"]);
+        assert!(parse_opencode_models("").is_empty());
     }
 }

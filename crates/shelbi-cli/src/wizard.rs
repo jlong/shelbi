@@ -464,6 +464,10 @@ impl Ask for Prompts {
     }
 
     fn model(&mut self, picker: &HarnessPicker) -> Result<Option<String>> {
+        // OpenCode's models come from asking it: a prompt can wait for that.
+        if picker.runner() == shelbi_core::RunnerKind::OpenCode {
+            shelbi_app::opencode_models::wait(shelbi_app::opencode_models::DEADLINE);
+        }
         let options: Vec<Choice<Option<String>>> =
             picker.models().into_iter().map(|m| Choice(m.model, m.label)).collect();
         if options.is_empty() {

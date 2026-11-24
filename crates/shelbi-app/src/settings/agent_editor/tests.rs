@@ -472,3 +472,90 @@ fn the_orchestrator_agents_runner_moves_the_orchestrator_session() {
     save(&mut dev, vec![]);
     assert_eq!(runner(), RunnerKind::OpenCode);
 }
+
+/// OpenCode lists what `opencode models` reports, and offers only the
+/// efforts the chosen model has a same-named variant for (decision Q4).
+#[test]
+fn opencode_models_and_efforts_follow_what_opencode_reports() {
+    let _home = home("opencode-models");
+    let mut state = editor("developer");
+    assert!(state.change(Change::PreferredRunner(Some(RunnerKind::OpenCode))));
+    assert!(state.runner_takes_options(), "OpenCode takes a model");
+    // While nothing is listed: a typed model only, and no effort.
+    assert!(state.models().is_empty());
+    assert!(!state.effort_shown());
+    assert!(state.change(Change::Model(Some("anthropic/claude-sonnet-5-5".into()))), "typed in");
+    assert!(!state.effort_shown(), "an unlisted model has no variants");
+
+    crate::opencode_models::set_for_this_thread(Some(crate::opencode_models::listed(&[
+        ("opencode/beam-free", &["minimal", "low", "medium", "high", "xhigh", "max"]),
+        ("opencode/deepseek-v4.1-flash-free", &["low", "high", "max"]),
+        ("opencode/big-pickle", &[]),
+    ])));
+    assert_eq!(
+        state.models(),
+        ["opencode/beam-free", "opencode/deepseek-v4.1-flash-free", "opencode/big-pickle", "anthropic/claude-sonnet-5-5"]
+    );
+    assert!(state.change(Change::Model(Some("opencode/deepseek-v4.1-flash-free".into()))));
+    assert!(state.effort_shown());
+    let labels = |s: &AgentEditorState| s.effort_choices().into_iter().map(|c| c.label).collect::<Vec<_>>();
+    assert_eq!(labels(&state), [RUNNER_DEFAULT, "Low", "High", "Max"]);
+    assert!(state.change(Change::Effort(Some(ReasoningEffort::Max))));
+    // A model that also has `max` keeps it; one without it drops it.
+    assert!(state.change(Change::Model(Some("opencode/beam-free".into()))));
+    assert_eq!(state.effort(), Some(ReasoningEffort::Max));
+    assert_eq!(labels(&state), [RUNNER_DEFAULT, "Low", "Medium", "High", "Max"]);
+    assert!(state.change(Change::Model(Some("opencode/big-pickle".into()))));
+    assert_eq!(state.effort(), None);
+    assert!(!state.effort_shown(), "no variants: the picker is hidden");
+    save(&mut state, vec![]);
+    assert_eq!(on_disk("developer").model(RunnerKind::OpenCode), Some("opencode/big-pickle"));
+    crate::opencode_models::set_for_this_thread(None);
+}
+
+/// An effort already on disk that the model doesn't report stays a choice,
+/// so it can be cleared.
+#[test]
+fn an_opencode_effort_the_model_lacks_stays_to_clear() {
+    let _home = home("opencode-stale-effort");
+    // Saved while the model reported `high`…
+    crate::opencode_models::set_for_this_thread(Some(crate::opencode_models::listed(&[("p/plain", &["high"])])));
+    let mut state = editor("developer");
+    state.change(Change::PreferredRunner(Some(RunnerKind::OpenCode)));
+    state.change(Change::Model(Some("p/plain".into())));
+    assert!(state.change(Change::Effort(Some(ReasoningEffort::High))));
+    save(&mut state, vec![]);
+    // …and opened once it no longer does.
+    crate::opencode_models::set_for_this_thread(Some(crate::opencode_models::listed(&[("p/plain", &[])])));
+    let state = editor("developer");
+    assert!(state.effort_shown());
+    let choices = state.effort_choices();
+    assert_eq!(choices.iter().map(|c| c.label.as_str()).collect::<Vec<_>>(), [RUNNER_DEFAULT, "High"]);
+    assert!(choices[1].current);
+    crate::opencode_models::set_for_this_thread(None);
+}
+
+/// Settings › Agents discloses what Shelbi adds to an OpenCode agent, and
+/// that OpenCode's own default allows everything when no ceiling applies.
+#[test]
+fn opencode_agents_disclose_what_shelbi_adds() {
+    let home = home("opencode-disclosure");
+    let mut state = editor("developer");
+    assert!(state.runner_disclosure().is_empty(), "Claude Code has none");
+    state.change(Change::PreferredRunner(Some(RunnerKind::OpenCode)));
+    let lines = state.runner_disclosure();
+    assert!(lines[0].contains("private server per pane"), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains(".shelbi/opencode/")), "{lines:?}");
+    assert!(lines.iter().any(|l| l.contains("OPENCODE_CONFIG_CONTENT")), "{lines:?}");
+    assert_eq!(lines.last().map(String::as_str), Some(shelbi_core::OPENCODE_NO_CEILING_NOTE));
+    // With a ceiling in effect, the allow-everything note goes.
+    set_project_yaml(&home, "workspace_permissions_mode: default\n");
+    let state = {
+        let mut s = editor("developer");
+        s.change(Change::PreferredRunner(Some(RunnerKind::OpenCode)));
+        s
+    };
+    assert!(state.permissions_in_effect().is_some());
+    assert!(!state.runner_disclosure().iter().any(|l| l == shelbi_core::OPENCODE_NO_CEILING_NOTE));
+    assert_eq!(state.runner_disclosure().len(), shelbi_core::OPENCODE_DISCLOSURE.len());
+}

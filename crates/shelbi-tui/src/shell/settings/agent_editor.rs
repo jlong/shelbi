@@ -572,7 +572,10 @@ impl AgentEditorPage {
         if self.custom_model.is_some() {
             out.push(Item::Text(Text::CustomModel));
         }
-        out.extend([Item::Effort, Item::Permissions]);
+        if state.effort_shown() {
+            out.push(Item::Effort);
+        }
+        out.push(Item::Permissions);
         out.extend((0..state.assignments().len()).map(Item::Assignment));
         out.extend([Item::ManageAssignments, Item::Reset, Item::Delete]);
         out
@@ -1811,12 +1814,20 @@ impl AgentEditorPage {
         }
         help(&mut rows, &with_source(&state.model_note(), state.model_in_effect().map(|(_, s)| s)));
         errors(&mut rows, Field::Model);
-        picker(&mut rows, "Reasoning effort", &current(state.effort_choices(), "Use runner default"), Item::Effort, blocked.is_some());
-        help(&mut rows, &state.effort_note());
+        // OpenCode offers only the efforts its model reports: none, no picker.
+        if state.effort_shown() {
+            picker(&mut rows, "Reasoning effort", &current(state.effort_choices(), "Use runner default"), Item::Effort, blocked.is_some());
+            help(&mut rows, &state.effort_note());
+        }
         errors(&mut rows, Field::Effort);
         picker(&mut rows, "Permissions", &current(state.permission_choices(), "Use project settings"), Item::Permissions, false);
         help(&mut rows, &state.permissions_note());
         errors(&mut rows, Field::Permissions);
+        // What Shelbi adds to an OpenCode agent, and OpenCode's own default.
+        for line in state.runner_disclosure() {
+            rows.push(Row::blank());
+            wrapped(&mut rows, &line, width, muted);
+        }
 
         // Workflow assignments.
         rows.push(Row::blank());

@@ -75,17 +75,26 @@ paths on every `cargo test`.
 ## Platform differences (by design)
 
 - **Orchestrator onboarding** (`orch-onboarding`): the same three steps,
-  copy and saves in both clients (`shelbi_app::onboarding`). The TUI's
-  Default model ends with "Custom model…", typed in the box, as its agent
-  editor offers one; the desktop's menu lists the suggestions and any
-  model already on disk, as its agent editor does. The TUI walks the steps
+  copy and saves in both clients (`shelbi_app::onboarding`). Default model
+  ends with "Custom model…" (`shelbi_app::harness_picker::CUSTOM_MODEL`) in
+  both, as both agent editors' Model does: the TUI types the name in the
+  box, the desktop in a field under the picker (`views/harness_picker.rs`
+  `CustomModel`; Return sets it, Esc closes it). The TUI walks the steps
   by keys (Tab, arrows, Enter, Esc for Back) as well as the mouse.
 - **Agent defaults** in the new-project flow (`project-defaults-step`): the
   same step, copy, order and saves in both clients, on the onboarding's
   shared picker model (`shelbi_app::harness_picker`). As in the onboarding,
-  the TUI's Default model ends with "Custom model…" and the desktop's menu
-  lists the suggestions. The desktop wizard's three steps are screens of its
-  own window; the TUI's are pages of its Add project dialog.
+  Default model ends with "Custom model…" in both. The desktop wizard's
+  three steps are screens of its own window; the TUI's are pages of its Add
+  project dialog.
+- **OpenCode's models** (`opencode-ui-detection`): every Default model and
+  Model picker lists what the installed OpenCode reports
+  (`shelbi_app::opencode_models`: a private `opencode serve` read once per
+  process off the UI thread, 5 s deadline, `opencode models` as the
+  fallback), with "Custom model…" the only way while it can't answer. The
+  TUI redraws every frame, so its list appears when the probe answers; the
+  desktop's views wait on it off the UI thread and redraw
+  (`harness_picker::watch_opencode_models`).
 - **Diff comments, sending and revert** (`native-diff-view`): shared state and
   workers, so the same keys, status line and refusals in both. `gY` in a review
   asks each client for its own Reject prompt (`DiffOut::Reject`,
@@ -265,10 +274,19 @@ paths on every `cargo test`.
   over the agent) and open the same files in the user's editor
   (`Leave::Open`: `agent.yaml`, `instructions.md`, a skill's `SKILL.md`).
   The desktop picks an import with the macOS chooser, the TUI types its
-  path; the TUI also takes a custom model name, inspects a skill in place,
-  confirms a skill's removal and shows each runner setting's value in
-  effect under its picker (the desktop says it in the Runner preferences
-  footnote). See [`status/tui-agent-editor.md`](status/tui-agent-editor.md).
+  path; both take a custom model name (Model ▸ Custom model…). The TUI
+  also inspects a skill in place, confirms a skill's removal and shows each
+  runner setting's value in effect under its picker (the desktop says it in
+  the Runner preferences footnote). For an OpenCode agent both list
+  OpenCode's models, offer only the efforts the model in effect reports a
+  variant for and hide Reasoning effort when it reports none
+  (`AgentEditorState::effort_shown`), and draw `runner_disclosure` under
+  Runner preferences: what Shelbi adds (the `.shelbi/opencode/` layer and
+  the environment it sets) and, with no permission ceiling, that OpenCode's
+  own default allows edits and shell commands (TUI: muted lines after
+  Permissions; desktop: footnotes after the Runner preferences footnote,
+  `agent-runner-disclosure-<n>`). See
+  [`status/tui-agent-editor.md`](status/tui-agent-editor.md).
 - **Settings ▸ Orchestrator** (`awareness-setting`): both clients draw the
   page over one form (`shelbi_app::settings::orchestrator`: the Event
   delivery radio, "Simple heartbeat system (v1)" and "Awareness system
@@ -773,7 +791,7 @@ Built by `shelbi_app::harness_picker::HarnessPicker::harnesses` for the onboardi
 | `selected` | the box's choice and the row's ✓ (`picker.rs` `render_menu`; `shell/onboarding.rs` `render_harness`, `overlay/add_project.rs` `defaults_rows`) | the button's choice and the row's selected fill (`views/harness_picker.rs` `fields`) |
 
 ### `ModelOption`
-Built by `shelbi_app::harness_picker::HarnessPicker::models` for both Default model pickers.
+Built by `shelbi_app::harness_picker::HarnessPicker::models` for both Default model pickers. OpenCode's rows are the models `shelbi_app::opencode_models` lists (none until it answers); both clients add "Custom model…" after the rows.
 
 | Field | TUI | Desktop |
 |---|---|---|

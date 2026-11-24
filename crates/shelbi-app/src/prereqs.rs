@@ -235,7 +235,9 @@ impl Tool {
             (Tool::GithubCli, Platform::Linux) => {
                 "Not found on your PATH. Install it with your package manager; GitHub's guide covers each one:"
             }
-            (Tool::Agent, _) => "Shelbi runs your agents with Claude Code, Codex or OpenCode. Install any one.",
+            (Tool::Agent, _) => {
+                "Shelbi runs your agents with Claude Code, Codex or OpenCode (2.3 or later). Install any one."
+            }
         }
     }
 

@@ -19,7 +19,7 @@ use crate::textbox;
 use crate::theme::palette;
 
 /// The Default model picker's last entry: a name typed in.
-pub(crate) const CUSTOM_MODEL: &str = "Custom model…";
+pub(crate) const CUSTOM_MODEL: &str = shelbi_app::harness_picker::CUSTOM_MODEL;
 
 /// An open picker menu: which picker (the host's own tag) and its
 /// highlighted row.

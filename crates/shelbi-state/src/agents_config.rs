@@ -99,9 +99,11 @@
 //! - Reset rewrites `instructions.md` and `agent.yaml` (comments included)
 //!   to the shipped text and makes the skills exactly the shipped ones.
 //! - `model` is free text (it's passed to the runner's `--model`), so the
-//!   picker's list is [`shelbi_core::model_suggestions`]; a value not in it
-//!   stays as written. A generic runner takes no model or effort Shelbi can
-//!   drive, so setting one is refused.
+//!   picker's list is [`shelbi_core::model_suggestions`] (OpenCode's is what
+//!   `opencode models` lists); a value not in it stays as written. A generic
+//!   runner takes no model or effort Shelbi can drive, so setting one is
+//!   refused. OpenCode takes any effort here; the pickers offer only the
+//!   ones the chosen model reports a variant for.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -958,7 +960,7 @@ impl AgentsConfig {
     /// the runner's default (the key is removed).
     pub fn set_model(&self, agent: &str, runner: RunnerKind, model: Option<&str>) -> Result<Self> {
         let model = non_empty(model);
-        if model.is_some() && shelbi_core::model_suggestions(runner).is_empty() {
+        if model.is_some() && !shelbi_core::takes_model(runner) {
             return Err(AgentError::NotForRunner {
                 runner,
                 setting: "model",

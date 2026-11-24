@@ -34,7 +34,7 @@ use shelbi_app::view::{OnboardingModel, OnboardingStep};
 
 use super::agent_editor::markdown_area;
 pub use super::harness_picker::Menu;
-use super::harness_picker::{self as pickers, Fields, Handlers, Host};
+use super::harness_picker::{self as pickers, watch_opencode_models, CustomModel, Fields, Handlers, Host};
 use super::workflow_editor::error_line;
 use crate::assets::{glyph, glyphs};
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
@@ -68,6 +68,10 @@ pub struct OnboardingView {
     menu_anchor: style::Anchor,
     instructions: Entity<TextareaState>,
     focus: FocusHandle,
+    /// Default model ▸ Custom model…, while it's open.
+    custom_model: Option<CustomModel>,
+    /// Waiting for OpenCode's model list, to redraw Default model.
+    watching_models: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -96,6 +100,8 @@ impl OnboardingView {
             menu_anchor: Default::default(),
             instructions,
             focus: cx.focus_handle(),
+            custom_model: None,
+            watching_models: false,
             _subscriptions: subscriptions,
         };
         let project = project.to_string();
@@ -156,9 +162,24 @@ impl OnboardingView {
 
     pub fn select_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
         self.menu = None;
+        self.custom_model = None;
         self.state.select_model(model.as_deref());
         cx.notify();
     }
+
+    /// Default model ▸ Custom model…: type a name under the picker.
+    pub fn open_custom_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        let current = self.state.model().models.into_iter().find(|m| m.selected).and_then(|m| m.model);
+        self.custom_model = Some(CustomModel::open(
+            current.as_deref(),
+            |this: &mut Self, model, _, cx| this.select_model(model, cx),
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+
 
     pub fn continue_(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
@@ -224,10 +245,12 @@ impl Render for OnboardingView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let m = self.state.model();
+        let on_opencode = m.step == OnboardingStep::Harness && self.state.runner() == shelbi_core::RunnerKind::OpenCode;
+        watch_opencode_models(on_opencode, |this: &mut Self| &mut this.watching_models, self, cx);
         let intro = m.step == OnboardingStep::Intro;
         let step = match m.step {
             OnboardingStep::Intro => self.render_intro(&theme, cx).into_any_element(),
-            OnboardingStep::Harness => self.render_harness(&m, &theme, cx).into_any_element(),
+            OnboardingStep::Harness => self.render_harness(&m, &theme, window, cx).into_any_element(),
             OnboardingStep::Instructions => self.render_instructions(&m, &theme, window, cx).into_any_element(),
         };
         div()
@@ -245,9 +268,13 @@ impl Render for OnboardingView {
             .type_style(Type::Base)
             .text_color(theme.foreground)
             .on_key_down(cx.listener(Self::on_key))
-            // Esc, the editor's included, goes Back.
+            // Esc, the editor's included, goes Back (a Custom model being
+            // typed closes first).
             .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                if this.state.step() != OnboardingStep::Intro {
+                if this.custom_model.take().is_some() {
+                    cx.notify();
+                    cx.stop_propagation();
+                } else if this.state.step() != OnboardingStep::Intro {
                     this.back(window, cx);
                     cx.stop_propagation();
                 }
@@ -346,7 +373,7 @@ impl OnboardingView {
     }
 
     /// `01 · Orchestrator · Choose provider and model`.
-    fn render_harness(&self, m: &OnboardingModel, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    fn render_harness(&self, m: &OnboardingModel, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let fields = pickers::fields(
             Fields {
                 host: Host::Onboarding,
@@ -362,16 +389,19 @@ impl OnboardingView {
                 model_note: m.model_note.clone(),
                 width: COLUMN_W,
                 ring: (false, false),
+                custom: self.custom_model.as_ref(),
             },
             self.menu,
             &self.menu_anchor,
             Handlers {
                 select_runner: |this: &mut Self, kind, cx| this.select_runner(kind, cx),
                 select_model: |this: &mut Self, model, cx| this.select_model(model, cx),
+                custom_model: |this: &mut Self, window, cx| this.open_custom_model(window, cx),
                 toggle: |this: &mut Self, menu, cx| this.toggle_menu(menu, cx),
                 close: |this: &mut Self, _| this.menu = None,
             },
             theme,
+            window,
             cx,
         );
         let cont = if m.loading || m.busy {
