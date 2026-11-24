@@ -1,7 +1,11 @@
 # Linux packaging files
 
 What a Linux package of the desktop app installs beside the binary
-(`/usr/bin/shelbi-desktop`):
+(`/usr/bin/shelbi-desktop`). `scripts/linux-archive.sh` puts them, the
+release binary, `LICENSE` and `README.md` into
+`shelbi-desktop_Linux_x86_64.tar.gz` (built and attached to every release by
+`.github/workflows/release.yml`), and the AUR package `shelbi-desktop-bin`
+installs from that archive (`packaging/aur/` at the repo root).
 
 | File | Installs to |
 |---|---|

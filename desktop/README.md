@@ -25,7 +25,8 @@ checks); the startup requirements check (git, gh, a coding agent, brew),
 which shows only when a tool is missing;
 native
 menus and system notifications. `scripts/bundle.sh` packages it as a signed,
-notarized `Shelbi.app`, shipped as the `shelbi-desktop` Homebrew cask. Each
+notarized `Shelbi.app`, shipped as the `shelbi-desktop` Homebrew cask; on
+Linux it ships as the `shelbi-desktop-bin` AUR package. Each
 piece's story is in its status doc (`docs/README.md` lists them).
 
 The app is a client of the `shelbi` CLI. The cask depends on the formula,
@@ -344,6 +345,8 @@ desktop/
   macos/Info.plist     the unbundled binary's name (no CFBundleIdentifier: see the file)
   macos/Shelbi.app.plist  the .app bundle's Info.plist (bundle.sh fills in the version)
   scripts/bundle.sh    build, bundle, sign, notarize, staple, zip, sha256 (see Packaging)
+  scripts/linux-archive.sh  the Linux release archive the AUR package installs from (see Packaging)
+  packaging/linux/     the desktop entry and hicolor icons a Linux package installs
   scripts/app-icon.sh  compile the layered app icon and regenerate every picture cut from the icons (Xcode 26)
   assets/icon/         the app icons: Command Grille's layered source and compile, Retro's master, their renditions (see its README)
   assets/icons/        vendored Heroicons + their LICENSE
@@ -621,6 +624,27 @@ secrets into a temporary keychain, and publishes the notarized zip to the
 GitHub release and the `shelbi-desktop` cask in `jlong/homebrew-shelbi`. The
 secret names and the flow are in `docs/release.md` and
 `docs/release/homebrew-tap.md` at the repository root.
+
+### On Linux
+
+`scripts/linux-archive.sh` builds the release binary on x86_64 Linux and
+archives it with the desktop entry and the hicolor icons
+(`packaging/linux/`) as `target/dist/shelbi-desktop_Linux_x86_64.tar.gz`,
+plus a `.sha256`. It runs the binary's `--print-version` as a smoke check.
+
+```sh
+desktop/scripts/linux-archive.sh                 # cargo build --release --locked, then archive
+desktop/scripts/linux-archive.sh --binary PATH   # archive a binary you built
+```
+
+The release workflow's `desktop-linux-release` job runs it on Ubuntu 24.04
+and attaches the archive to the GitHub release. `aur-publish` then renders
+the `shelbi-bin` and `shelbi-desktop-bin` AUR packages from
+`packaging/aur/` at the repository root, builds and installs both in an Arch
+container, and pushes them to the AUR. `shelbi-desktop-bin` depends on
+`shelbi-bin` of its own version, so `yay -S shelbi-desktop-bin` installs the
+CLI too, and the app appears in Walker and the Omarchy menu.
+`packaging/aur/README.md` has the packages and how to build them by hand.
 
 ### Update notice
 
