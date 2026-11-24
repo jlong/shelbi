@@ -27,8 +27,19 @@
 //! The route and its gpui coupling are documented in `docs/gpui.md` (file
 //! drops).
 //!
+//! **Linux (Wayland).** gpui's Wayland backend takes a drop's
+//! `text/uri-list` itself and hands its `file://` entries to the same
+//! `on_drop::<ExternalPaths>` listener, so a file manager's or a screenshot
+//! tool's drag (images included) pastes its paths with nothing installed
+//! here: [`install`] and [`accept_in`] do nothing there. A drag that carries
+//! only image data or a web URL (a browser's image) is refused inside gpui
+//! before the app sees it (`docs/gpui.md`, file drops on Linux). An image on
+//! the clipboard pastes as a file ([`files`], `TerminalPane::paste_clipboard`)
+//! on both platforms.
+//!
 //! [`TerminalPane::drop_paths`]: crate::elements::terminal::TerminalPane
 
+pub mod files;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]

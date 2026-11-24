@@ -189,7 +189,7 @@ impl ActiveOverlay {
         match self {
             ActiveOverlay::Palette { palette, scroll } => {
                 // The chord that opened the palette closes it again.
-                if shelbi_app::overlay::opens_palette(keymaps, &chord) {
+                if crate::keys::opens_palette(keymaps, &chord) {
                     return OverlayEvent::Close;
                 }
                 let action = keymaps.palette.dispatch(chord);
@@ -551,9 +551,11 @@ mod tests {
             o.handle_key(chord("enter"), &keymaps()),
             OverlayEvent::RunEntry(entry("action:error-log", "Open error log"))
         );
-        for close in ["esc", "ctrl-p", "ctrl-space", "super-k"] {
+        for close in ["esc", "ctrl-p", "ctrl-space"] {
             assert_eq!(o.handle_key(chord(close), &keymaps()), OverlayEvent::Close, "{close}");
         }
+        // The platform's palette chord (⌘K, Ctrl+Shift+K on Linux).
+        assert_eq!(o.handle_key(crate::keys::palette_chord(), &keymaps()), OverlayEvent::Close);
         // While searching, Tab changes the filter.
         assert_eq!(o.handle_key(chord("tab"), &keymaps()), OverlayEvent::Stay);
         let ActiveOverlay::Palette { palette, .. } = &o else { unreachable!() };

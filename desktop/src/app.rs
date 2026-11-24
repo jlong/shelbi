@@ -5406,9 +5406,10 @@ impl ShelbiWindow {
         }
     }
 
-    /// The tab chords' badges show while ⌘ is held.
+    /// The tab chords' badges show while the app modifier is held (⌘, or
+    /// Ctrl+Shift on Linux).
     fn modifiers_changed(&mut self, modifiers: gpui::Modifiers, cx: &mut Context<Self>) {
-        let held = modifiers.platform && !modifiers.control && !modifiers.alt && !modifiers.shift;
+        let held = crate::keys::is_app(&modifiers);
         if held != self.command_held {
             self.command_held = held;
             cx.notify();
@@ -6251,7 +6252,63 @@ impl ShelbiWindow {
                 entry.shortcut = None;
             }
         }
+        // No menu bar on Linux: its client actions (Close Window, Copy, the
+        // font zoom, Documentation ...) are the palette's too, so every menu
+        // item runs from here. The registry's are listed already.
+        if !crate::keys::MAC {
+            entries.extend(self.client_palette_entries(&model));
+        }
         entries
+    }
+
+    /// The menu tree's client actions as palette entries
+    /// ([`menus::tree::client_entries`]), found as the query names them.
+    fn client_palette_entries(&self, model: &shelbi_app::command::CommandModel) -> Vec<shelbi_palette::Entry> {
+        let tree = menus::tree::build(
+            model,
+            &self.keymaps,
+            menus::tree::WindowFacts {
+                sidebar_collapsed: self.collapsed,
+            },
+        );
+        menus::tree::client_entries(&tree)
+            .into_iter()
+            .map(|e| shelbi_palette::Entry {
+                id: e.command.id().to_string(),
+                label: e.title,
+                kind: shelbi_palette::EntryKind::Action,
+                subtitle: None,
+                shortcut: e.shortcut,
+                decoration: None,
+                hidden_until_query: true,
+            })
+            .collect()
+    }
+
+    /// Run a menu client action the palette listed. The Edit actions go to
+    /// the focused element (a terminal pane takes them), as the menu's items
+    /// do; the rest run as the menu runs them.
+    fn run_client_entry(&mut self, command: menus::tree::AppCommand, window: &mut Window, cx: &mut Context<Self>) {
+        use menus::tree::{AppCommand, MenuAction};
+        let action: Option<Box<dyn gpui::Action>> = match command {
+            AppCommand::Cut => Some(Box::new(menus::Cut)),
+            AppCommand::Copy => Some(Box::new(menus::Copy)),
+            AppCommand::Paste => Some(Box::new(menus::Paste)),
+            AppCommand::SelectAll => Some(Box::new(menus::SelectAll)),
+            AppCommand::QuitClient => Some(Box::new(menus::Quit)),
+            _ => None,
+        };
+        match action {
+            Some(action) => window.dispatch_action(action, cx),
+            None => self.menu_invoke(
+                &menus::MenuInvoke {
+                    target: MenuAction::App(command),
+                    generation: 0,
+                },
+                window,
+                cx,
+            ),
+        }
     }
 
     fn open_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6351,22 +6408,31 @@ impl ShelbiWindow {
 
     /// A key while an overlay is open: it takes every key except the app's
     /// own Cmd shortcuts (close the window, quit), plus Cmd+V to paste into
-    /// its text and Cmd+C to copy the error log.
+    /// its text and Cmd+C to copy the error log. On Linux those are the
+    /// Ctrl+Shift chords, and plain Ctrl+V / Ctrl+C (a text field's) paste
+    /// and copy too.
     fn overlay_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        let cmd = keystroke.modifiers.platform && !keystroke.modifiers.control;
-        if cmd && keystroke.key == "v" {
+        let keystroke = &crate::keys::normalized(&event.keystroke);
+        let m = &keystroke.modifiers;
+        let cmd = if crate::keys::MAC {
+            m.platform && !m.control
+        } else {
+            crate::keys::is_app(m)
+        };
+        // Linux's text-field Ctrl+V / Ctrl+C.
+        let ctrl = !crate::keys::MAC && m.control && !m.shift && !m.alt && !m.platform;
+        if (cmd || ctrl) && keystroke.key == "v" {
             self.overlay_paste(window, cx);
             cx.stop_propagation();
             return;
         }
-        if cmd && keystroke.key == "c" {
+        if (cmd || ctrl) && keystroke.key == "c" {
             self.overlay_copy(cx);
             cx.stop_propagation();
             return;
         }
-        // The app's other Cmd shortcuts (⌘W, ⌘Q, ⌘,) stay live; ⌘K is the
-        // palette chord, which toggles it closed.
+        // The app's other chords (⌘W, ⌘Q, ⌘,) stay live; ⌘K is the palette
+        // chord, which toggles it closed.
         if cmd && keystroke.key != "k" {
             return;
         }
@@ -6399,6 +6465,10 @@ impl ShelbiWindow {
             OverlayEvent::RunEntry(entry) => {
                 // Close first: the command may open another overlay.
                 self.close_overlay(window, cx);
+                if let Some(command) = menus::tree::AppCommand::from_id(&entry.id) {
+                    self.run_client_entry(command, window, cx);
+                    return;
+                }
                 match CommandKind::from_id(&entry.id) {
                     Some(kind) => self.run(kind, window, cx),
                     None => self.banner = Some(format!("Unknown command: {}", entry.id).into()),
@@ -7111,7 +7181,7 @@ impl ShelbiWindow {
             cx.notify();
             return;
         }
-        if shelbi_app::overlay::opens_palette(&self.keymaps, &chord) {
+        if crate::keys::opens_palette(&self.keymaps, &chord) {
             self.open_palette(window, cx);
             cx.stop_propagation();
             return;
@@ -7122,6 +7192,12 @@ impl ShelbiWindow {
             return;
         }
         if self.chooser {
+            return;
+        }
+        // Linux's Ctrl+Shift+H, which a terminal never keeps.
+        if crate::keys::focus_sidebar_chord() == Some(chord) {
+            self.focus_sidebar(window, cx);
+            cx.stop_propagation();
             return;
         }
         match self.keymaps.global.dispatch(chord) {
@@ -7354,11 +7430,21 @@ fn row_key(target: &SidebarTarget) -> String {
 /// New Window (⌘⇧N), the terminal font zoom (⌘+ ⌘− ⌘0), and the window's
 /// chords (⌘O ⌘I ⌘L, ⌘1 to ⌘9 for the tabs, ⌃1 to ⌃9 for the sidebar's
 /// rows). Everything else is the session's.
+///
+/// On Linux a terminal keeps every plain Ctrl chord (Ctrl+H, Ctrl+L, Ctrl+P,
+/// Ctrl+Space are the program's there): `keys.yaml`'s Ctrl chords work
+/// everywhere else, and the window's Ctrl+Shift chords stand in for them
+/// over a terminal (Ctrl+Shift+H to the sidebar, Ctrl+Shift+K for the
+/// palette). The app chords are Ctrl+Shift (Ctrl+Shift+N, Ctrl+Shift+1 ...)
+/// and the rows Alt+1 to Alt+9.
 fn takes_from_terminal(keymaps: &Keymaps, chord: shelbi_state::keymap::KeyChord) -> bool {
-    matches!(
+    if !crate::keys::MAC && chord.mods == shelbi_state::keymap::Mods::CONTROL {
+        return false;
+    }
+    crate::keys::focus_sidebar_chord() == Some(chord) || matches!(
         keymaps.global.dispatch(chord),
         Some(GlobalAction::FocusSidebar | GlobalAction::FocusMain | GlobalAction::ZenToggle)
-    ) || shelbi_app::overlay::opens_palette(keymaps, &chord)
+    ) || crate::keys::opens_palette(keymaps, &chord)
         || is_new_window(&chord)
         || font_zoom(&chord).is_some()
         || window_chord(keymaps, &chord).is_some()
@@ -8480,17 +8566,25 @@ mod tests {
     fn a_focused_terminal_keeps_every_key_but_the_global_chords() {
         let keymaps = shelbi_state::keymap::validate_keymaps_yaml("", None).0;
         let chord = |spec: &str| {
-            let ks = gpui::Keystroke::parse(spec).unwrap();
+            let ks = gpui::Keystroke::parse(&crate::keys::test_keys::app_spec(spec)).unwrap();
             chord_from_keystroke(&ks).unwrap()
         };
-        // Ctrl+H back to the sidebar, Ctrl+L to the main area, the palette,
-        // the Zen toggle.
-        for spec in ["ctrl-h", "ctrl-l", "ctrl-space", "ctrl-p", "cmd-k", "alt-z"] {
+        // The palette chord (⌘K, Ctrl+Shift+K), the Zen toggle.
+        for spec in ["cmd-k", "alt-z"] {
             assert!(takes_from_terminal(&keymaps, chord(spec)), "{spec}");
+        }
+        // Ctrl+H back to the sidebar, Ctrl+L to the main area, the palette:
+        // the window's on macOS. On Linux the terminal keeps every plain
+        // Ctrl key, and Ctrl+Shift+H stands in for Ctrl+H.
+        for spec in ["ctrl-h", "ctrl-l", "ctrl-space", "ctrl-p"] {
+            assert_eq!(takes_from_terminal(&keymaps, chord(spec)), crate::keys::MAC, "{spec}");
+        }
+        if !crate::keys::MAC {
+            assert!(takes_from_terminal(&keymaps, chord("ctrl-shift-h")));
         }
         // Typing, Backspace (never mistaken for Ctrl+H), Shift+Enter, other
         // control keys reach the session.
-        for spec in ["h", "backspace", "shift-enter", "enter", "ctrl-c", "ctrl-a", "alt-b"] {
+        for spec in ["h", "backspace", "shift-enter", "enter", "ctrl-c", "ctrl-a", "alt-b", "ctrl-w", "ctrl-v"] {
             assert!(!takes_from_terminal(&keymaps, chord(spec)), "{spec}");
         }
     }

@@ -1131,7 +1131,7 @@ impl TerminalPane {
         cx.notify();
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &event.keystroke;
         let m = &ks.modifiers;
         // The find bar takes its keys first. A composition in progress owns
@@ -1143,7 +1143,10 @@ impl TerminalPane {
                 return;
             }
         }
-        let meta = m.alt && keys::option_is_meta(self.settings.option_as_meta, keys::held_option_sides());
+        // Linux has no Option layer to type through: Alt is always Meta, as in
+        // every Linux terminal.
+        let meta = m.alt
+            && (!crate::keys::MAC || keys::option_is_meta(self.settings.option_as_meta, keys::held_option_sides()));
         match keys::classify(ks, meta) {
             KeyAction::Send(key, mods) => {
                 if self.search.is_none() {
@@ -1163,7 +1166,7 @@ impl TerminalPane {
                 cx.stop_propagation();
             }
             KeyAction::Paste => {
-                self.paste_clipboard(cx);
+                self.paste_clipboard(window, cx);
                 cx.stop_propagation();
             }
             KeyAction::Find => {
@@ -1197,9 +1200,15 @@ impl TerminalPane {
     }
 
     /// Edit ▸ Paste: the clipboard's text to the find bar while it is open,
-    /// otherwise to the program.
-    fn paste_clipboard(&mut self, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+    /// otherwise to the program. A clipboard holding an image and no text (a
+    /// screenshot) pastes the image as a file, as a dropped image does: it is
+    /// written under the drops folder and its path is pasted
+    /// ([`crate::drops::files`]).
+    fn paste_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        if let Some(text) = item.text() {
             match self.search.as_mut() {
                 Some(bar) => {
                     if bar.insert(&text) {
@@ -1208,7 +1217,25 @@ impl TerminalPane {
                 }
                 None => self.paste(text, cx),
             }
+            return;
         }
+        if self.search.is_some() {
+            return;
+        }
+        let Some(image) = crate::drops::files::clipboard_image(&item) else {
+            return;
+        };
+        let written = cx
+            .background_executor()
+            .spawn(async move { crate::drops::files::write_image(&image, &crate::drops::files::drops_dir()) });
+        cx.spawn_in(window, async move |this, cx| {
+            let path = written.await;
+            let _ = this.update_in(cx, |this, window, cx| match path {
+                Ok(path) => this.drop_paths(&ExternalPaths([path].into_iter().collect()), window, cx),
+                Err(e) => cx.emit(PaneEvent::Note(format!("Couldn't paste the image: {e}"))),
+            });
+        })
+        .detach();
     }
 
     /// Edit ▸ Select All: everything retained, scrollback included (the
@@ -1377,8 +1404,9 @@ impl TerminalPane {
     }
 
     pub(crate) fn modifiers_changed(&mut self, modifiers: gpui::Modifiers, cx: &mut Context<Self>) {
-        if modifiers.platform != self.cmd_down {
-            self.cmd_down = modifiers.platform;
+        let link = crate::keys::link_mod(&modifiers);
+        if link != self.cmd_down {
+            self.cmd_down = link;
             self.update_hovered_link(cx);
         }
     }
@@ -1586,7 +1614,7 @@ impl TerminalPane {
             if self.scrollbar_press(position, cx) {
                 return;
             }
-            if modifiers.platform {
+            if crate::keys::link_mod(&modifiers) {
                 if let Some(link) = self.link_at(position) {
                     #[cfg(feature = "visual-check")]
                     if let Some(sink) = self.link_sink.as_ref() {
@@ -1659,8 +1687,9 @@ impl TerminalPane {
                 self.mouse(MouseAction::Drag, b, position, modifiers, 1, cx);
             }
             None if hovered => {
-                if self.cmd_down != modifiers.platform {
-                    self.cmd_down = modifiers.platform;
+                let link = crate::keys::link_mod(&modifiers);
+                if self.cmd_down != link {
+                    self.cmd_down = link;
                 }
                 self.update_hovered_link(cx);
                 self.mouse(MouseAction::Move, MouseButton::Left, position, modifiers, 1, cx);
@@ -1818,9 +1847,24 @@ impl TerminalPane {
             }
             MouseOutcome::Handled => cx.notify(),
             MouseOutcome::Copy(text) => {
-                // A finished selection copies, as in the TUI.
+                // A finished selection copies, as in the TUI. On Linux it is
+                // the primary selection too, for a middle click anywhere.
+                if !crate::keys::MAC {
+                    cx.write_to_primary(ClipboardItem::new_string(text.clone()));
+                }
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 cx.notify();
+            }
+            // A middle click the program doesn't take pastes the primary
+            // selection, as every Linux terminal does.
+            MouseOutcome::Ignored
+                if !crate::keys::MAC && action == MouseAction::Press && button == MouseButton::Middle =>
+            {
+                if let Some(text) = cx.read_from_primary().and_then(|item| item.text()) {
+                    if !text.is_empty() && self.search.is_none() {
+                        self.paste(text, cx);
+                    }
+                }
             }
             MouseOutcome::Ignored => {}
         }
@@ -2111,7 +2155,7 @@ impl Render for TerminalPane {
             .when(has_selection, |d| {
                 d.on_action(cx.listener(|this, _: &crate::menus::Copy, _, cx| this.copy(cx)))
             })
-            .on_action(cx.listener(|this, _: &crate::menus::Paste, _, cx| this.paste_clipboard(cx)))
+            .on_action(cx.listener(|this, _: &crate::menus::Paste, window, cx| this.paste_clipboard(window, cx)))
             .on_action(cx.listener(|this, _: &crate::menus::SelectAll, _, cx| this.select_all(cx)))
             .relative()
             .size_full()

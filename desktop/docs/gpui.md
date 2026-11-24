@@ -435,6 +435,32 @@ and find elements by `debug_selector`). Same version, so the pin is unchanged.
   returns before a modern promise is received, so it's read untyped; every
   hook runs under `catch_unwind` (a panic in an `extern "C"` hook would abort
   the app).
+- **File drops on Linux (Wayland)** (`dl-input`, gpui-pre-linux 0.3.9). The
+  Wayland client (`linux/wayland/client.rs`, `wl_data_device::Event::Enter`)
+  asks every drag offer for `text/uri-list` alone, keeps the entries that are
+  `file://` paths, and destroys the offer when none is: so a file manager's
+  or a screenshot tool's drag (image files included) reaches
+  `on_drop::<ExternalPaths>` as on the Mac, while a drag carrying only image
+  data (`image/png` ...) or a web URL (a browser's image) never reaches the
+  app. The Wayland connection and its data device are gpui's, and a second
+  connection can't see drags on gpui's surfaces, so there is no AppKit-style
+  hook to install (`drops::install` and `accept_in` do nothing on Linux).
+  Taking image data would need a patched `gpui-pre-linux` (read the offer's
+  `image/*` when the URI list is empty, write it under the drops folder, hand
+  the path on as `ExternalPaths`). The clipboard side works without one:
+  `read_from_clipboard` returns `ClipboardEntry::Image` for an `image/*`
+  selection, which the terminal pastes as a file (`drops::files`), and
+  `write_to_primary` / `read_from_primary` are the primary selection.
+- **Keys on Linux** (`dl-input`). gpui's Linux keyboard
+  (`keystroke_from_xkb`) drops Shift from a symbol key: Ctrl+Shift+1 arrives
+  as `ctrl-!`, Ctrl+Shift+, as `ctrl-<`, Ctrl+Shift+= as `ctrl-+`. A binding
+  spelled `ctrl-shift-,` never matches, so `menus::tree::keystroke` spells a
+  Linux binding the way the key arrives (`ctrl-<`), and `keys::normalized`
+  turns a key-down back into the key it was pressed on (US layout) before a
+  chord table reads it. Letters keep Shift (`ctrl-shift-n`). gpui-kit's
+  inputs bind the platform's `ctrl-` text keys (`secondary-` in Zed terms);
+  the app adds `ctrl-shift-c/v/x/a` to the `Input` context
+  (`menus::linux_text_bindings`).
 - **Measuring an element for a drag** (the Workspace view's split divider): a
   `canvas(prepaint, paint)` child with `absolute().size_full()` reports its
   bounds in prepaint; store them in the view and `cx.notify()` only when they

@@ -135,7 +135,7 @@ impl BundledSoftwareView {
         match k.key.as_str() {
             "up" if plain => self.step(-1, cx),
             "down" if plain => self.step(1, cx),
-            "f" if m.platform && !m.control && !m.alt && !m.shift => {
+            _ if crate::keys::app_key(k).as_deref() == Some("f") => {
                 let focus = self.search.read(cx).focus_handle(cx);
                 window.focus(&focus, cx);
             }

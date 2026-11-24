@@ -801,7 +801,7 @@ fn a_panel_keeps_the_sidebars_chrome_and_takes_the_numbered_chords(cx: &mut Test
     c.h.take_calls();
 
     // ⌃2 is the panel's View Diff, not the hidden sidebar's second row.
-    c.h.key("ctrl-2");
+    c.h.key(&crate::keys::test_keys::row_spec("ctrl-2"));
     let active = c.review().read_with(&c.h.cx, |r, _| r.panel().unwrap().active());
     assert_eq!(active, shelbi_app::review::ActiveView::Diff);
     assert!(c.h.take_calls().is_empty(), "no sidebar row opened");
@@ -815,7 +815,7 @@ fn a_panel_keeps_the_sidebars_chrome_and_takes_the_numbered_chords(cx: &mut Test
     // The Workspace frame (2220:18764) hides Search: the toggle alone.
     assert!(c.drawn("ws-toggle") && !c.drawn("ws-search"));
     c.h.take_calls();
-    c.h.key("ctrl-3");
+    c.h.key(&crate::keys::test_keys::row_spec("ctrl-3"));
     let active = c.workspace().read_with(&c.h.cx, |w, _| w.panel().active());
     assert_eq!(active, crate::views::workspace::ContentView::Editor);
     assert!(c.h.take_calls().is_empty(), "no sidebar row opened");
@@ -1789,7 +1789,7 @@ fn a_view_chord_and_back_keeps_the_keyboard_in_the_diff(cx: &mut TestAppContext)
     let diff = builtin_diff_up(&mut c);
 
     // To the reviewer's terminal with a chord, and back with another.
-    c.h.cx.simulate_keystrokes("ctrl-1");
+    c.h.cx.simulate_keystrokes(&crate::keys::test_keys::row_spec("ctrl-1"));
     c.advance(Duration::from_secs(1));
     c.h.cx.run_until_parked();
     c.h.draw();
@@ -1798,7 +1798,7 @@ fn a_view_chord_and_back_keeps_the_keyboard_in_the_diff(cx: &mut TestAppContext)
     assert!(on_chat);
     let in_reviewer = c.h.cx.update(|window, cx| review.read(cx).contains_focus(window, cx));
     assert!(in_reviewer, "the keyboard follows to the reviewer's pane");
-    c.h.cx.simulate_keystrokes("ctrl-2");
+    c.h.cx.simulate_keystrokes(&crate::keys::test_keys::row_spec("ctrl-2"));
     c.advance(Duration::from_secs(1));
     c.h.cx.run_until_parked();
     c.h.draw();

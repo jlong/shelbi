@@ -93,6 +93,9 @@ impl Harness {
         cx.update(|cx| {
             cx.set_global(Theme::resolve(ThemePreference::Dark, WindowAppearance::Dark));
             gpui_kit::init(cx);
+            // The app's Linux overrides of gpui-kit's bindings, as `main` binds
+            // them after it.
+            cx.bind_keys(crate::menus::linux_text_bindings());
         });
         let tap = Rc::new(RefCell::new(Vec::new()));
         let window_tap = tap.clone();
@@ -372,20 +375,20 @@ fn the_font_zoom_chords_and_menu_items_step_the_terminal_font(cx: &mut TestAppCo
     h.focus_window();
 
     // ⌘= and ⌘+ (as a US layout reports it) grow, ⌘− shrinks, ⌘0 resets.
-    h.key("cmd-=");
+    h.key(&crate::keys::test_keys::app_spec("cmd-="));
     assert_eq!(size(&mut h), (15.0, Some(15)));
-    h.key("cmd-+");
+    h.key(&crate::keys::test_keys::app_spec("cmd-+"));
     assert_eq!(size(&mut h), (16.0, Some(16)));
-    h.key("cmd--");
+    h.key(&crate::keys::test_keys::app_spec("cmd--"));
     assert_eq!(size(&mut h), (15.0, Some(15)));
-    h.key("cmd-0");
+    h.key(&crate::keys::test_keys::app_spec("cmd-0"));
     assert_eq!(size(&mut h), (14.0, None));
     assert_eq!(writes.lock().unwrap().last(), Some(&None));
 
     // An overlay doesn't take the chords.
     h.key("ctrl-space");
     assert!(h.overlay_open());
-    h.key("cmd-=");
+    h.key(&crate::keys::test_keys::app_spec("cmd-="));
     assert_eq!(size(&mut h), (15.0, Some(15)));
     assert!(h.overlay_open());
     h.key("escape");

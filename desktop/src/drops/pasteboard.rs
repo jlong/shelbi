@@ -15,7 +15,8 @@
 //! (`NSFilenamesPboardType`, a Finder drag, never gets here: gpui takes it.)
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+
+use super::files::fresh_path;
 use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
@@ -330,26 +331,6 @@ pub fn drops_dir() -> PathBuf {
             PathBuf::from(home).join("Library/Caches").join(id).join("drops")
         }
         _ => PathBuf::from(NSTemporaryDirectory().to_string()).join("shelbi-desktop/drops"),
-    }
-}
-
-/// A path in `dir` that does not exist yet: `drop-<local time>-<n>` plus
-/// `.ext` (no extension when `ext` is empty). No spaces, so it pastes
-/// without escapes.
-fn fresh_path(dir: &Path, ext: &str) -> PathBuf {
-    static SEQ: AtomicU64 = AtomicU64::new(1);
-    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-    loop {
-        let n = SEQ.fetch_add(1, Ordering::Relaxed);
-        let mut name = format!("drop-{stamp}-{n}");
-        if !ext.is_empty() {
-            name.push('.');
-            name.push_str(ext);
-        }
-        let path = dir.join(name);
-        if !path.exists() {
-            return path;
-        }
     }
 }
 

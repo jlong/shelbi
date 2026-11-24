@@ -1115,7 +1115,7 @@ pub(super) fn action_hint(view: &IssuesView, action: PaneAction) -> String {
         PaneAction::EditDescription => "e".into(),
         PaneAction::OpenInEditor => "⇧E".into(),
         PaneAction::CopyBranch => String::new(),
-        PaneAction::Delete => "⌘⌫".into(),
+        PaneAction::Delete => crate::keys::app_label("super-backspace"),
     }
 }
 

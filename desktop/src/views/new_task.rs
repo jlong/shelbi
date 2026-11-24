@@ -225,7 +225,9 @@ impl NewTaskDialog {
         let key = match chord.code {
             Code::Tab if bare => Key::Tab,
             Code::Tab | Code::BackTab if chord.mods == Mods::SHIFT || chord.code == Code::BackTab => Key::BackTab,
-            Code::Enter if chord.mods == Mods::SUPER => Key::CmdEnter,
+            // ⌘↵ (Ctrl+↵ on Linux, a text field's convention there; the
+            // app chord Ctrl+Shift+↵ too).
+            Code::Enter if crate::keys::is_submit(&chord) => Key::CmdEnter,
             // Return in the Description is its new line.
             Code::Enter if bare && in_text && focus == Field::Description => return false,
             Code::Enter if bare => Key::Enter,

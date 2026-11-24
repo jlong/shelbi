@@ -24,17 +24,18 @@ pub enum KeyAction {
     /// Typed text: let it reach the input handler (IME, dead keys), which
     /// sends the text.
     Text,
-    /// Cmd+C: copy the selection.
+    /// Cmd+C (Ctrl+Shift+C on Linux): copy the selection.
     Copy,
-    /// Cmd+V: paste the clipboard.
+    /// Cmd+V (Ctrl+Shift+V on Linux): paste the clipboard.
     Paste,
-    /// Cmd+F: open the find bar.
+    /// Cmd+F (Ctrl+Shift+F on Linux): open the find bar.
     Find,
     /// Shift+PageUp / Shift+PageDown / Shift+Home / Shift+End: Shelbi's own
     /// scrollback (the program gets the key on the alternate screen, where
     /// there is no scrollback).
     Scroll(ScrollKey),
-    /// Not the terminal's (an app shortcut such as Cmd+W): let it propagate.
+    /// Not the terminal's (an app shortcut such as Cmd+W, Ctrl+Shift+W on
+    /// Linux): let it propagate.
     Ignore,
 }
 
@@ -66,7 +67,20 @@ impl ScrollKey {
 /// Classify one key-down. `option_as_alt` makes Option a Meta key for
 /// character keys (Option+B sends `ESC b`) instead of typing the layout's
 /// Option character (`∫`); named keys (Enter, arrows, ...) always carry Alt.
+///
+/// The app chords are the app's, not the program's: every Cmd chord on
+/// macOS, and on Linux every Ctrl+Shift chord on a character key (the app
+/// modifier there, `crate::keys::app_mods`) and every Super chord (the
+/// compositor's). Of those the pane keeps copy, paste and find. Plain Ctrl
+/// keys, and Ctrl+Shift with a named key (arrows, Home, Enter ...), always
+/// reach the program.
 pub fn classify(ks: &Keystroke, option_as_alt: bool) -> KeyAction {
+    classify_in(ks, option_as_alt, crate::keys::MAC)
+}
+
+/// [`classify`] under macOS's conventions (`mac`) or Linux's.
+fn classify_in(ks: &Keystroke, option_as_alt: bool, mac: bool) -> KeyAction {
+    let ks = &crate::keys::normalized_in(ks, mac);
     let m = &ks.modifiers;
     let mods = Modifiers {
         shift: m.shift,
@@ -75,13 +89,24 @@ pub fn classify(ks: &Keystroke, option_as_alt: bool) -> KeyAction {
         sup: m.platform,
     };
 
-    // Cmd chords are the app's, except the clipboard pair and Find.
+    // Cmd chords are the app's, except the clipboard pair and Find. On
+    // Linux, Super is the compositor's: a Super chord it lets through is
+    // still nobody's here.
     if m.platform {
-        let plain = !m.control && !m.alt && !m.shift;
+        let plain = mac && !m.control && !m.alt && !m.shift;
         return match ks.key.as_str() {
             "c" if plain => KeyAction::Copy,
             "v" if plain => KeyAction::Paste,
             "f" if plain => KeyAction::Find,
+            _ => KeyAction::Ignore,
+        };
+    }
+    // Linux's app chords: Ctrl+Shift with a character key.
+    if !mac && m.control && m.shift && !m.alt && named_key(&ks.key).is_none() && ks.key != "space" {
+        return match ks.key.as_str() {
+            "c" => KeyAction::Copy,
+            "v" => KeyAction::Paste,
+            "f" => KeyAction::Find,
             _ => KeyAction::Ignore,
         };
     }
@@ -255,10 +280,11 @@ mod tests {
         assert_eq!(bytes("ctrl-d", LEGACY), b"\x04");
         assert_eq!(bytes("ctrl-space", LEGACY), b"\x00");
         assert_eq!(bytes("ctrl-[", LEGACY), b"\x1b");
-        // Ctrl+Shift chords keep both modifiers for the encoder.
+        // On macOS Ctrl+Shift chords keep both modifiers for the encoder
+        // (on Linux they are the app's).
         assert_eq!(
-            send("ctrl-shift-a"),
-            (
+            classify_in(&ks("ctrl-shift-a"), true, true),
+            KeyAction::Send(
                 Key::Char('a'),
                 Modifiers {
                     shift: true,
@@ -267,6 +293,39 @@ mod tests {
                 }
             )
         );
+    }
+
+    #[test]
+    fn on_linux_ctrl_shift_chords_are_the_apps_except_copy_paste_and_find() {
+        let linux = |spec: &str| classify_in(&ks(spec), true, false);
+        assert_eq!(linux("ctrl-shift-c"), KeyAction::Copy);
+        assert_eq!(linux("ctrl-shift-v"), KeyAction::Paste);
+        assert_eq!(linux("ctrl-shift-f"), KeyAction::Find);
+        for spec in ["ctrl-shift-w", "ctrl-shift-q", "ctrl-shift-k", "ctrl-shift-n", "ctrl-shift-o"] {
+            assert_eq!(linux(spec), KeyAction::Ignore, "{spec}");
+        }
+        // gpui reports Ctrl+Shift+1 as Ctrl+`!` and Ctrl+Shift+= as Ctrl+`+`
+        // (Shift dropped): still the app's (the tabs, the font zoom).
+        for spec in ["ctrl-!", "ctrl-+", "ctrl-_", "ctrl-)", "ctrl-<"] {
+            assert_eq!(linux(spec), KeyAction::Ignore, "{spec}");
+        }
+        // Super is the compositor's: nothing reaches the program.
+        assert_eq!(linux("cmd-c"), KeyAction::Ignore);
+        assert_eq!(linux("cmd-v"), KeyAction::Ignore);
+        // Plain Ctrl keys are the program's, Ctrl+C and Ctrl+V included.
+        assert_eq!(linux("ctrl-c"), KeyAction::Send(Key::Char('c'), Modifiers::CTRL));
+        assert_eq!(linux("ctrl-v"), KeyAction::Send(Key::Char('v'), Modifiers::CTRL));
+        assert_eq!(linux("ctrl-w"), KeyAction::Send(Key::Char('w'), Modifiers::CTRL));
+        // Ctrl+Shift with a named key is the program's too.
+        let ctrl_shift = Modifiers {
+            shift: true,
+            ctrl: true,
+            ..Modifiers::NONE
+        };
+        assert_eq!(linux("ctrl-shift-left"), KeyAction::Send(Key::Left, ctrl_shift));
+        assert_eq!(linux("ctrl-shift-enter"), KeyAction::Send(Key::Enter, ctrl_shift));
+        // Alt joined: not an app chord.
+        assert!(matches!(linux("ctrl-alt-shift-c"), KeyAction::Send(..)));
     }
 
     #[test]
@@ -318,6 +377,7 @@ mod tests {
 
     #[test]
     fn cmd_chords_are_the_apps_except_copy_paste_and_find() {
+        let classify = |ks: &Keystroke, alt: bool| classify_in(ks, alt, true);
         assert_eq!(classify(&ks("cmd-c"), true), KeyAction::Copy);
         assert_eq!(classify(&ks("cmd-v"), true), KeyAction::Paste);
         assert_eq!(classify(&ks("cmd-f"), true), KeyAction::Find);
