@@ -5,7 +5,14 @@
 //! proof. This is what a caller says about it: a visible parked message reads as
 //! a queue only when the pane was busy before and after, everything else short
 //! of a proof is a failure, and every verdict goes in `events.log`.
+//!
+//! A slot Shelbi launched OpenCode in (its OpenCode ledger names a current
+//! session) takes messages through Shelbi's plugin instead: an inbox file the
+//! plugin admits and acks ([`crate::submit::send_through_opencode_inbox`]).
+//! When that channel is down the message is pasted, and a `status=degraded`
+//! send line says so.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use shelbi_app::diff::{AgentDelivery, AgentSend, DiffTarget};
@@ -25,21 +32,54 @@ pub fn send_verified(
     runner: &AgentRunnerSpec,
     host: &Host,
     addr: &SessionTarget,
+    worktree: &Path,
     message: &str,
 ) -> Result<AgentDelivery> {
+    let transport_error = |e: Error| -> Error {
+        if let Err(log_err) = shelbi_state::append_send_event(project, id, "stuck", "transport_error") {
+            return Error::Other(format!(
+                "sending to `{id}` failed ({e}); recording the stuck delivery also failed: {log_err}"
+            ));
+        }
+        Error::Other(format!("sending to `{id}` failed: {e}"))
+    };
+    match send_route(project, id, runner) {
+        SendRoute::Pane(_) => {}
+        SendRoute::OpenCodeInbox => {
+            let sent = submit::send_through_opencode_inbox(host, addr, worktree, message).map_err(transport_error)?;
+            if let Some(reason) = sent.degraded {
+                let _ = shelbi_state::append_send_degraded_event(project, id, reason, &sent.delivery_id);
+            }
+            if sent.status == SubmitStatus::Unconfirmed {
+                // The plugin took the message and never answered. Pasting it
+                // too could deliver it twice, so it's reported instead.
+                shelbi_state::append_send_event(project, id, "stuck", "inbox_unacked")?;
+                return Err(Error::Other(format!(
+                    "OpenCode's plugin in {} took the message to `{id}` (delivery {}) but never \
+                     confirmed it; it may still arrive",
+                    addr.label(),
+                    sent.delivery_id,
+                )));
+            }
+            return record_verdict(project, id, addr, sent.status, false, false);
+        }
+        SendRoute::OpenCodePluginSilent => {
+            // The plugin never reported in after launch, so nothing reads the
+            // inbox: paste straight away rather than wait out an ack.
+            let _ = shelbi_state::append_send_degraded_event(
+                project,
+                id,
+                crate::workspace::OPENCODE_PLUGIN_SILENT_REASON,
+                "none",
+            );
+            submit::deliver_text(host, addr, message).map_err(transport_error)?;
+            let status = SubmitStatus::DeliveredUnverified { detail: "plugin_silent_paste" };
+            return record_verdict(project, id, addr, status, false, false);
+        }
+    }
     let profile = SubmitProfile::for_runner(runner);
     let baseline = PaneBaseline::capture(host, addr, profile);
-    let status = match submit::send_verified(host, addr, message, &baseline) {
-        Ok(status) => status,
-        Err(e) => {
-            shelbi_state::append_send_event(project, id, "stuck", "transport_error").map_err(|log_err| {
-                Error::Other(format!(
-                    "sending to `{id}` failed ({e}); recording the stuck delivery also failed: {log_err}"
-                ))
-            })?;
-            return Err(Error::Other(format!("sending to `{id}` failed: {e}")));
-        }
-    };
+    let status = submit::send_verified(host, addr, message, &baseline).map_err(transport_error)?;
 
     // A busy baseline alone is stale by the time the verifier has spent up
     // to two polling windows waiting. Claude may have completed that turn in
@@ -48,7 +88,20 @@ pub fn send_verified(
     // send and still has strong current-turn evidence at the final verdict.
     let finally_actively_busy =
         matches!(status, SubmitStatus::StillInBox) && PaneBaseline::capture(host, addr, profile).actively_busy;
-    let (event_status, detail, delivery) = classify_delivery(status, baseline.actively_busy, finally_actively_busy);
+    record_verdict(project, id, addr, status, baseline.actively_busy, finally_actively_busy)
+}
+
+/// Record a send's verdict on `events.log` and turn it into the delivery (or
+/// the stuck error).
+fn record_verdict(
+    project: &str,
+    id: &str,
+    addr: &SessionTarget,
+    status: SubmitStatus,
+    baseline_actively_busy: bool,
+    finally_actively_busy: bool,
+) -> Result<AgentDelivery> {
+    let (event_status, detail, delivery) = classify_delivery(status, baseline_actively_busy, finally_actively_busy);
     shelbi_state::append_send_event(project, id, event_status, detail)?;
     delivery.ok_or_else(|| {
         Error::Other(format!(
@@ -56,6 +109,40 @@ pub fn send_verified(
             addr.label()
         ))
     })
+}
+
+/// How a message reaches a workspace's agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SendRoute {
+    /// Typed into the pane and verified on its screen, per the profile.
+    Pane(SubmitProfile),
+    /// Through the OpenCode plugin's inbox.
+    OpenCodeInbox,
+    /// An OpenCode pane whose plugin never reported in: pasted.
+    OpenCodePluginSilent,
+}
+
+/// The route for a send to `workspace`. Its OpenCode ledger decides, not the
+/// project's baseline runner: a slot whose current launch is an OpenCode one
+/// has Shelbi's plugin in it whatever the baseline is, and an OpenCode
+/// baseline with no such launch has no plugin to answer.
+fn send_route(project: &str, workspace: &str, runner: &AgentRunnerSpec) -> SendRoute {
+    let opencode_launch = shelbi_state::load_opencode_sessions(project, workspace)
+        .map(|ledger| ledger.current.is_some())
+        .unwrap_or(false);
+    send_route_for(
+        opencode_launch,
+        opencode_launch && shelbi_state::observation_degraded(project, workspace),
+        SubmitProfile::for_runner(runner),
+    )
+}
+
+fn send_route_for(opencode_launch: bool, plugin_silent: bool, profile: SubmitProfile) -> SendRoute {
+    match (opencode_launch, plugin_silent) {
+        (true, false) => SendRoute::OpenCodeInbox,
+        (true, true) => SendRoute::OpenCodePluginSilent,
+        (false, _) => SendRoute::Pane(profile),
+    }
 }
 
 /// Map the transport-neutral verifier result to a delivery.
@@ -91,7 +178,15 @@ pub fn send_to_workspace(project_name: &str, workspace_name: &str, message: &str
     if !workspace::workspace_pane_alive(&target.host, &target.addr)? {
         return Err(Error::Other(format!("no agent is running on `{workspace_name}`")));
     }
-    send_verified(project_name, workspace_name, &target.runner, &target.host, &target.addr, message)
+    send_verified(
+        project_name,
+        workspace_name,
+        &target.runner,
+        &target.host,
+        &target.addr,
+        &target.worktree,
+        message,
+    )
 }
 
 /// [`send_to_workspace`] for a message meant only for the session as it is
@@ -110,7 +205,16 @@ pub fn send_to_workspace_if(
     if !still_wanted(&target.project) {
         return Ok(None);
     }
-    send_verified(project_name, workspace_name, &target.runner, &target.host, &target.addr, message).map(Some)
+    send_verified(
+        project_name,
+        workspace_name,
+        &target.runner,
+        &target.host,
+        &target.addr,
+        &target.worktree,
+        message,
+    )
+    .map(Some)
 }
 
 /// Where a workspace's agent is, and the runner profile a send verifies with.
@@ -118,6 +222,8 @@ struct WorkspaceTarget {
     project: shelbi_core::Project,
     host: Host,
     addr: SessionTarget,
+    /// The slot's worktree, where an OpenCode pane's inbox lives.
+    worktree: std::path::PathBuf,
     runner: AgentRunnerSpec,
 }
 
@@ -137,7 +243,8 @@ fn resolve_workspace(project_name: &str, workspace_name: &str) -> Result<Workspa
         .ok_or_else(|| Error::Other(format!("project `{project_name}` declares no runner")))?
         .clone();
     let host = machine.host();
-    Ok(WorkspaceTarget { project, host, addr, runner })
+    let worktree = workspace::workspace_worktree(machine, spec);
+    Ok(WorkspaceTarget { project, host, addr, worktree, runner })
 }
 
 /// How a diff view on this machine reaches a target's agent.
@@ -150,6 +257,37 @@ pub fn service() -> AgentSend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slot_launched_on_opencode_takes_sends_through_its_inbox() {
+        // The slot's ledger decides, whatever the project's baseline runner.
+        assert_eq!(send_route_for(true, false, SubmitProfile::ClaudeUi), SendRoute::OpenCodeInbox);
+        assert_eq!(send_route_for(true, false, SubmitProfile::OpenCodeInbox), SendRoute::OpenCodeInbox);
+        // A plugin that never reported in reads nothing: paste at once.
+        assert_eq!(send_route_for(true, true, SubmitProfile::OpenCodeInbox), SendRoute::OpenCodePluginSilent);
+        // No OpenCode launch on the slot: no plugin to answer.
+        assert_eq!(send_route_for(false, false, SubmitProfile::OpenCodeInbox), SendRoute::Pane(SubmitProfile::OpenCodeInbox));
+        assert_eq!(send_route_for(false, true, SubmitProfile::CodexUi), SendRoute::Pane(SubmitProfile::CodexUi));
+    }
+
+    #[test]
+    fn the_route_reads_the_slots_opencode_ledger() {
+        let _g = crate::test_lock::isolated_home();
+        let claude = AgentRunnerSpec {
+            command: "claude".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+        let _ = shelbi_state::clear_observation_degraded("inboxdemo", "alpha");
+        assert_eq!(send_route("inboxdemo", "alpha", &claude), SendRoute::Pane(SubmitProfile::ClaudeUi));
+        shelbi_state::begin_opencode_session("inboxdemo", "alpha", "t1", false, "opencode").unwrap();
+        assert_eq!(send_route("inboxdemo", "alpha", &claude), SendRoute::OpenCodeInbox);
+        shelbi_state::mark_observation_degraded("inboxdemo", "alpha", "opencode-plugin-silent").unwrap();
+        assert_eq!(send_route("inboxdemo", "alpha", &claude), SendRoute::OpenCodePluginSilent);
+        let _ = shelbi_state::clear_observation_degraded("inboxdemo", "alpha");
+    }
 
     #[test]
     fn idle_visible_input_is_stuck_but_busy_visible_input_is_queued() {

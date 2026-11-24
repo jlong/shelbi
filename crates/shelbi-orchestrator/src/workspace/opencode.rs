@@ -9,6 +9,7 @@
 //! | `skills/` | the agent's skills (not `.claude/skills/`, which OpenCode also reads) |
 //! | `plugins/shelbi/` | Shelbi's plugin (`index.js`, `package.json`) |
 //! | `plugin.lock`, `plugin.alive` | the plugin's single-instance lock and its health beacon |
+//! | `inbox/`, `ack/` | verified sends ([`crate::opencode_inbox`]): one file per message, and the plugin's answer |
 //!
 //! Everything is rewritten on each launch, and nothing goes under
 //! `.opencode/`, `opencode.json`, `AGENTS.md` or `~/.config/opencode`. The
@@ -46,6 +47,12 @@ pub const LEGACY_OPENCODE_PLUGIN_REL: &str = ".opencode/plugins/shelbi.js";
 
 /// The plugin body (see `opencode_plugin.js`).
 pub(crate) const OPENCODE_PLUGIN_JS: &str = include_str!("../opencode_plugin.js");
+
+/// [`OPENCODE_PLUGIN_JS`], for tests elsewhere in the crate.
+#[cfg(test)]
+pub(crate) fn opencode_plugin_js() -> &'static str {
+    OPENCODE_PLUGIN_JS
+}
 
 /// The plugin directory's manifest. OpenCode loads a local plugin from a
 /// directory, through its package entry point.
@@ -285,13 +292,17 @@ pub(crate) fn effort_models(host: &Host, runner: &shelbi_core::AgentRunnerSpec) 
 }
 
 /// Write the plugin directory and clear the previous launch's lock and
-/// beacon, so the beacon a launch waits for is its own plugin's.
+/// beacon, so the beacon a launch waits for is its own plugin's. The inbox
+/// and its acks are swept too: a message left over from the last pane was
+/// meant for that session, not the one this launch opens.
 pub(crate) fn deploy_opencode_plugin(host: &Host, worktree: &Path) -> Result<()> {
     let dir = worktree.join(OPENCODE_PLUGIN_DIR_REL);
     write_worktree_text(host, &dir.join("index.js"), OPENCODE_PLUGIN_JS, "opencode-plugin")?;
     write_worktree_text(host, &dir.join("package.json"), OPENCODE_PLUGIN_PACKAGE_JSON, "opencode-plugin")?;
     remove_worktree_entry(host, &worktree.join(OPENCODE_PLUGIN_ALIVE_REL))?;
     remove_worktree_entry(host, &worktree.join(OPENCODE_PLUGIN_LOCK_REL))?;
+    remove_worktree_entry(host, &worktree.join(crate::opencode_inbox::OPENCODE_INBOX_REL))?;
+    remove_worktree_entry(host, &worktree.join(crate::opencode_inbox::OPENCODE_ACK_REL))?;
     Ok(())
 }
 
@@ -491,8 +502,15 @@ mod tests {
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(wt.join(OPENCODE_PLUGIN_ALIVE_REL), "{}").unwrap();
         std::fs::write(wt.join(OPENCODE_PLUGIN_LOCK_REL), "1\n").unwrap();
+        let inbox = wt.join(crate::opencode_inbox::OPENCODE_INBOX_REL);
+        let ack = wt.join(crate::opencode_inbox::OPENCODE_ACK_REL);
+        std::fs::create_dir_all(&inbox).unwrap();
+        std::fs::create_dir_all(&ack).unwrap();
+        std::fs::write(inbox.join("old.json"), "{}").unwrap();
+        std::fs::write(ack.join("old.json"), "{}").unwrap();
 
         deploy_opencode_plugin(&Host::Local, &wt).unwrap();
+        assert!(!inbox.exists() && !ack.exists(), "the last pane's inbox is swept");
         let dir = wt.join(OPENCODE_PLUGIN_DIR_REL);
         let index = std::fs::read_to_string(dir.join("index.js")).unwrap();
         assert!(index.starts_with(OPENCODE_PLUGIN_SIGNATURE));

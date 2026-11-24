@@ -54,6 +54,12 @@ use crate::session_backend::{backend, SessionBackend, SessionTarget};
 pub enum SubmitProfile {
     ClaudeUi,
     CodexUi,
+    /// OpenCode: a message goes in through Shelbi's plugin, which admits it
+    /// into the pane's session and acks it ([`send_through_opencode_inbox`]).
+    /// The pane itself has no UI parser here, so a delivery that has no
+    /// inbox to go through (the orchestrator's pane, a launch seed) is
+    /// delivered like [`SubmitProfile::DeliveryOnly`]'s.
+    OpenCodeInbox,
     DeliveryOnly,
 }
 
@@ -62,19 +68,16 @@ impl SubmitProfile {
         match shelbi_agent::RunnerAdapter::for_spec(runner).kind() {
             shelbi_core::RunnerKind::Claude => Self::ClaudeUi,
             shelbi_core::RunnerKind::Codex => Self::CodexUi,
-            // OpenCode's title markers come from Shelbi's plugin, but its
-            // composer has no parser here yet, so a pane injection is
-            // delivered without UI verification, like a custom runner's.
-            shelbi_core::RunnerKind::OpenCode | shelbi_core::RunnerKind::Generic => {
-                Self::DeliveryOnly
-            }
+            shelbi_core::RunnerKind::OpenCode => Self::OpenCodeInbox,
+            shelbi_core::RunnerKind::Generic => Self::DeliveryOnly,
         }
     }
 
     /// Whether Shelbi knows how to locate and interpret this runner's live
     /// input UI. Callers use this to avoid Claude-only readiness probes too.
+    /// OpenCode's verification is the plugin's ack, not its screen.
     pub fn has_ui_verifier(self) -> bool {
-        self != Self::DeliveryOnly
+        matches!(self, Self::ClaudeUi | Self::CodexUi)
     }
 
     /// Whether startup readiness may use Claude's bordered-composer parser.
@@ -186,7 +189,7 @@ impl PaneBaseline {
                 codex_is_processing(screen),
                 codex_is_processing(visible_screen),
             ),
-            SubmitProfile::DeliveryOnly => (false, false),
+            SubmitProfile::OpenCodeInbox | SubmitProfile::DeliveryOnly => (false, false),
         };
         PaneBaseline {
             profile,
@@ -317,6 +320,81 @@ pub fn send_verified_guarded(
     Ok(verify_submitted_guarded(
         host, addr, text, baseline, may_submit,
     ))
+}
+
+/// What [`send_through_opencode_inbox`] did with one message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxSend {
+    /// The verdict, in the vocabulary every caller already maps:
+    /// `Submitted` on the plugin's ack (`inbox_admitted`, or
+    /// `inbox_duplicate` for an id admitted before), `DeliveredUnverified`
+    /// after a fallback paste, `Unconfirmed` when the message may or may not
+    /// have landed and so wasn't pasted as well.
+    pub status: SubmitStatus,
+    /// Why the plugin path failed and the message was pasted instead, as an
+    /// `events.log` token. `None` when the inbox carried it.
+    pub degraded: Option<&'static str>,
+    /// The message's delivery id (its inbox file name, and the session
+    /// message id `msg_<id>` OpenCode records it under).
+    pub delivery_id: String,
+}
+
+/// Send `text` to an OpenCode pane through Shelbi's plugin: an inbox file
+/// under `worktree` that the plugin admits into the pane's session and acks
+/// ([`crate::opencode_inbox`]). Nothing is typed, so a draft in the composer
+/// survives. Without an ack within [`PROMPT_SUBMIT_WAIT`], the file is taken
+/// back and the text is pasted instead ([`deliver_text`]), and `degraded`
+/// says why.
+pub fn send_through_opencode_inbox(host: &Host, addr: &SessionTarget, worktree: &std::path::Path, text: &str) -> Result<InboxSend> {
+    send_through_opencode_inbox_with(
+        host,
+        worktree,
+        text,
+        &crate::opencode_inbox::new_delivery_id(),
+        PROMPT_SUBMIT_WAIT,
+        || deliver_text(host, addr, text),
+    )
+}
+
+/// [`send_through_opencode_inbox`] with the delivery id, the ack wait and
+/// the fallback paste injected.
+pub(crate) fn send_through_opencode_inbox_with(
+    host: &Host,
+    worktree: &std::path::Path,
+    text: &str,
+    delivery_id: &str,
+    wait: std::time::Duration,
+    paste: impl FnOnce() -> Result<()>,
+) -> Result<InboxSend> {
+    use crate::opencode_inbox::{deliver, InboxOutcome, InboxTarget};
+    if text.trim().is_empty() {
+        return Err(Error::Other("verified-submit refuses an empty message".to_string()));
+    }
+    let target = InboxTarget { host: host.clone(), worktree: worktree.to_path_buf() };
+    let (status, degraded) = match deliver(&target, delivery_id, text, wait) {
+        Ok(InboxOutcome::Admitted { duplicate: false }) => {
+            (SubmitStatus::Submitted { detail: "inbox_admitted" }, None)
+        }
+        Ok(InboxOutcome::Admitted { duplicate: true }) => {
+            (SubmitStatus::Submitted { detail: "inbox_duplicate" }, None)
+        }
+        Ok(InboxOutcome::ClaimedUnacked) | Ok(InboxOutcome::Unknown { .. }) => (SubmitStatus::Unconfirmed, None),
+        Ok(InboxOutcome::Rejected { reason }) => {
+            eprintln!("shelbi: OpenCode's plugin didn't admit the message ({reason}); pasting it instead");
+            (SubmitStatus::DeliveredUnverified { detail: "inbox_fallback_paste" }, Some("opencode-inbox-rejected"))
+        }
+        Ok(InboxOutcome::Silent) => {
+            (SubmitStatus::DeliveredUnverified { detail: "inbox_fallback_paste" }, Some("opencode-inbox-silent"))
+        }
+        Err(e) => {
+            eprintln!("shelbi: couldn't write to the OpenCode pane's inbox ({e}); pasting the message instead");
+            (SubmitStatus::DeliveredUnverified { detail: "inbox_fallback_paste" }, Some("opencode-inbox-unwritable"))
+        }
+    };
+    if degraded.is_some() {
+        paste()?;
+    }
+    Ok(InboxSend { status, degraded, delivery_id: delivery_id.to_string() })
 }
 
 /// Wait for the text-submitted signal; if it doesn't arrive and the text is
@@ -495,7 +573,7 @@ fn seed_busy_signal(title: &str, screen: &str, baseline: &PaneBaseline) -> bool 
     let processing = match baseline.profile {
         SubmitProfile::ClaudeUi => claude_is_processing(screen),
         SubmitProfile::CodexUi => codex_is_processing(screen),
-        SubmitProfile::DeliveryOnly => false,
+        SubmitProfile::OpenCodeInbox | SubmitProfile::DeliveryOnly => false,
     };
     processing && !baseline.busy
 }
@@ -607,7 +685,7 @@ fn screen_shows_submitted_profile(
     let processing = match profile {
         SubmitProfile::ClaudeUi => claude_is_processing(screen),
         SubmitProfile::CodexUi => codex_is_processing(screen),
-        SubmitProfile::DeliveryOnly => false,
+        SubmitProfile::OpenCodeInbox | SubmitProfile::DeliveryOnly => false,
     };
     if !stale_busy && processing {
         return true;
@@ -768,7 +846,7 @@ fn profile_input_holds_unsubmitted(screen: &str, text: &str, profile: SubmitProf
     match profile {
         SubmitProfile::ClaudeUi => input_holds_unsubmitted_prompt(screen, text),
         SubmitProfile::CodexUi => codex_input_holds_prompt(screen, text),
-        SubmitProfile::DeliveryOnly => false,
+        SubmitProfile::OpenCodeInbox | SubmitProfile::DeliveryOnly => false,
     }
 }
 
@@ -778,7 +856,7 @@ fn profile_input_box_cleared(screen: &str, text: &str, profile: SubmitProfile) -
         SubmitProfile::CodexUi => {
             codex_input_line(screen).is_some() && !codex_input_holds_prompt(screen, text)
         }
-        SubmitProfile::DeliveryOnly => false,
+        SubmitProfile::OpenCodeInbox | SubmitProfile::DeliveryOnly => false,
     }
 }
 
@@ -981,6 +1059,28 @@ mod tests {
             SubmitProfile::for_runner(&runner("custom-agent")),
             SubmitProfile::DeliveryOnly
         );
+        // OpenCode verifies through its plugin's ack, never its screen.
+        let opencode = SubmitProfile::for_runner(&runner("/usr/local/bin/opencode"));
+        assert_eq!(opencode, SubmitProfile::OpenCodeInbox);
+        assert!(!opencode.has_ui_verifier());
+        assert!(!opencode.uses_claude_ui());
+        let baseline = PaneBaseline::from_snapshots(opencode, "✻ Working… (3s · ↑ 1.2k tokens)", "", "shelbi:working");
+        assert!(!baseline.busy && !baseline.actively_busy && !baseline.title_working);
+    }
+
+    #[test]
+    fn an_empty_message_never_reaches_an_opencode_inbox() {
+        let wt = std::env::temp_dir().join(format!("shelbi-inbox-empty-{}", std::process::id()));
+        let result = send_through_opencode_inbox_with(
+            &Host::Local,
+            &wt,
+            "  \n",
+            &crate::opencode_inbox::new_delivery_id(),
+            std::time::Duration::ZERO,
+            || panic!("nothing to paste"),
+        );
+        assert!(result.is_err());
+        assert!(!wt.exists());
     }
 
     #[test]

@@ -109,7 +109,8 @@ pub const OPENCODE_DISCLOSURE: &[&str] = &[
     "Sessions: each task runs in its own session (--session ses_shelbi…), titled \"Shelbi · <workspace> · <task>\" \
      and archived when the task is done. Your own sessions in the worktree are left alone.",
     "Files: .shelbi/opencode/ in each workspace (config.json, instructions.md, skills/, Shelbi's plugin in \
-     plugins/shelbi/, and its plugin.lock and plugin.alive), rewritten at each launch. Nothing is written to \
+     plugins/shelbi/, and its plugin.lock and plugin.alive), rewritten at each launch, plus inbox/ and ack/, \
+     where messages Shelbi sends wait for the plugin to put them into the session. Nothing is written to \
      ~/.config/opencode, .opencode/, opencode.json or AGENTS.md.",
     "Environment: OPENCODE_CONFIG_CONTENT (config.json, merged over your own value, which is kept in \
      SHELBI_OPENCODE_USER_CONFIG), OPENCODE_CLI_CONFIG_CONTENT (turns off OpenCode's terminal title), \

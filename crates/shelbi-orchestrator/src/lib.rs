@@ -39,6 +39,7 @@ pub mod machine_readiness;
 pub mod machines_model;
 pub mod migration;
 pub mod mutate;
+mod opencode_inbox;
 mod opencode_sessions;
 pub mod poller;
 pub mod pool_admin;

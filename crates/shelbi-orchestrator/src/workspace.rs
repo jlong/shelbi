@@ -26,8 +26,10 @@ mod opencode;
 pub use opencode::{
     LEGACY_OPENCODE_PLUGIN_REL, OPENCODE_CONFIG_REL, OPENCODE_DIR_REL, OPENCODE_INSTRUCTIONS_REL,
     OPENCODE_PLUGIN_ALIVE_REL, OPENCODE_PLUGIN_BEACON_WAIT, OPENCODE_PLUGIN_DIR_REL,
-    OPENCODE_PLUGIN_LOCK_REL, OPENCODE_SKILLS_REL,
+    OPENCODE_PLUGIN_LOCK_REL, OPENCODE_PLUGIN_SILENT_REASON, OPENCODE_SKILLS_REL,
 };
+#[cfg(test)]
+pub(crate) use opencode::opencode_plugin_js;
 
 
 /// Filter `git status --porcelain` output down to the lines that represent

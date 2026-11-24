@@ -45,7 +45,7 @@ pub fn run(project: Option<String>, id: String, message: String) -> Result<()> {
     let _pane_injection_lock =
         shelbi_state::lock_workspace(&project_name, &id).map_err(|e| anyhow!(e))?;
 
-    let ResolvedTarget { host, addr, runner } = target;
+    let ResolvedTarget { host, addr, worktree, runner } = target;
     // Session must be live — the workspace can be declared but idle, in which
     // case there's no runner to send to. Surface that as an actionable error.
     let alive = orch_workspace::workspace_pane_alive(&host, &addr).map_err(|e| anyhow!(e))?;
@@ -57,7 +57,8 @@ pub fn run(project: Option<String>, id: String, message: String) -> Result<()> {
             addr.label(),
         ));
     }
-    let delivery = send_verified(&project_name, &id, &runner, &host, &addr, &message).map_err(|e| anyhow!(e))?;
+    let delivery =
+        send_verified(&project_name, &id, &runner, &host, &addr, &worktree, &message).map_err(|e| anyhow!(e))?;
     let delivery = match delivery {
         AgentDelivery::Submitted => "sent",
         AgentDelivery::Queued => "queued",
@@ -73,6 +74,8 @@ pub fn run(project: Option<String>, id: String, message: String) -> Result<()> {
 struct ResolvedTarget {
     host: Host,
     addr: SessionTarget,
+    /// The workspace's worktree, where an OpenCode pane's inbox lives.
+    worktree: std::path::PathBuf,
     runner: AgentRunnerSpec,
 }
 
@@ -99,6 +102,7 @@ fn resolve_target(project: &Project, id: &str) -> Result<ResolvedTarget> {
         return Ok(ResolvedTarget {
             host: machine.host(),
             addr,
+            worktree: orch_workspace::workspace_worktree(machine, workspace),
             runner: runner.clone(),
         });
     }
