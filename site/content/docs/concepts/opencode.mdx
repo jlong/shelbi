@@ -1,0 +1,345 @@
+---
+title: OpenCode
+order: 11.5
+summary: How Shelbi runs OpenCode 2.3+ as an agent runner. The launch line, the files and environment variables it adds, how a permission ceiling becomes OpenCode rules, and what happens to the sessions it creates.
+---
+
+[OpenCode](https://opencode.ai) is one of the three coding agents Shelbi can
+run, beside Claude Code and Codex. Shelbi runs OpenCode's own terminal UI in
+the workspace's pane, so you can watch an agent work and take over at any
+time, exactly as with the other two. Everything Shelbi needs beyond the
+keyboard (the pane's state, hub messages, verified sends, board events for
+the orchestrator) goes through a small Shelbi plugin that runs inside that
+pane's private OpenCode server.
+
+Shelbi never edits your OpenCode setup. It writes nothing to
+`~/.config/opencode`, `.opencode/`, `opencode.json` or `AGENTS.md`, and it
+never touches OpenCode's shared background service. What it adds is a set of
+environment variables on the launch and a directory of files in its own
+namespace, `.shelbi/opencode/`, both listed below.
+
+To pick OpenCode for an agent, set `opencode` as its runner kind (see
+[runner kinds](/docs/configuration/agents#runner-kinds)), or choose it in
+Settings ▸ Agents, which also shows the disclosure on this page in short.
+
+## Requirements
+
+Shelbi drives **OpenCode 2.3 or later**. Install it with:
+
+```bash
+npm install -g @opencode/cli
+```
+
+The older npm package, `opencode-ai`, still installs OpenCode 1.x, which Shelbi
+doesn't support: its plugin API and events are different, and it has no
+`--standalone` mode. An OpenCode below 2.3 shows as unsupported in the
+requirements check, in new-project detection and in Settings, with the same
+sentence:
+
+```text
+OpenCode 1.19.6 isn't supported. Shelbi needs OpenCode 2.3 or later: run `opencode upgrade`.
+```
+
+A dispatch checks too. Before it launches, Shelbi runs `opencode --version` on
+the workspace's machine (over SSH for a remote one). A version below 2.3
+refuses the dispatch and records one `opencode-unsupported` line on the
+[events log](/docs/concepts/events-log), so the orchestrator sees why the task
+didn't start. When the version can't be read at all, the dispatch goes ahead.
+
+## The launch line
+
+A worker's dispatch launches OpenCode with this line (wrapped here for reading;
+it is one line in the pane):
+
+```bash
+env SHELBI_OPENCODE_SESSION=ses_shelbi215999214d9348c323d0 \
+    SHELBI_OPENCODE_TITLE='Shelbi · alpha · fix-it' \
+    SHELBI_OPENCODE_USER_CONFIG="${SHELBI_OPENCODE_USER_CONFIG-${OPENCODE_CONFIG_CONTENT-}}" \
+    OPENCODE_CONFIG_CONTENT="$(cat .shelbi/opencode/config.json)" \
+    OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' \
+    OPENCODE_DISABLE_AUTOUPDATE=1 \
+  opencode --standalone [--auto] --session ses_shelbi215999214d9348c323d0 \
+    --prompt "$(cat .shelbi/startup-prompt.md)"
+```
+
+- **`--standalone`** gives the pane a private OpenCode server instead of
+  OpenCode's shared per-user background service. The private server inherits
+  the pane's environment, so Shelbi's config layer and the hub address reach
+  the plugin, and your own background service is never reconfigured or
+  restarted.
+- **`--session <id>`** names the session Shelbi tracks for this task (see
+  [Sessions](#sessions)). A `--continue` or `-c` in the runner's `flags` is
+  dropped, because it would reopen the directory's newest session, which could
+  be one you started there.
+- **`--prompt`** submits the startup prompt, which carries only the task. The
+  agent's role instructions go in through the config layer instead (see
+  [Instructions and skills](#instructions-and-skills)).
+- **`--auto`** is passed only for a `bypassPermissions` ceiling. Under any
+  other ceiling Shelbi drops an `--auto` written into the runner's `flags`,
+  since it would approve the asks the ceiling exists to raise.
+- Shelbi uses `env …` rather than a bare `VAR=…` prefix because the pane runs
+  the line as `exec <launch>`.
+
+The pane also carries the variables every Shelbi pane gets: `TASK_ID`,
+`PROJECT`, `SHELBI_WORKSPACE`, `SHELBI_AGENT` and the hub address
+(`SHELBI_HUB_ADDR`, plus `SHELBI_HUB_SOCK` when the hub is reached over a Unix
+socket).
+
+### Environment variables
+
+| Variable | Set to | Why |
+| --- | --- | --- |
+| `OPENCODE_CONFIG_CONTENT` | the config layer, read from `.shelbi/opencode/config.json` | OpenCode's highest-ranking config document, merged over your global and project config |
+| `SHELBI_OPENCODE_USER_CONFIG` | your own `OPENCODE_CONFIG_CONTENT`, as it was before any Shelbi launch | a `shelbi` command run inside the pane reads your value from here, not Shelbi's layer |
+| `OPENCODE_CLI_CONFIG_CONTENT` | `{"terminal":{"title":false},"highlights":false}` | turns off OpenCode's terminal title, so the pane keeps the title Shelbi gives it |
+| `OPENCODE_DISABLE_AUTOUPDATE` | `1` | a worker never updates the binary under the hub mid-task |
+| `SHELBI_OPENCODE_SESSION` | the session id | the plugin acts on this session and its subagents only |
+| `SHELBI_OPENCODE_TITLE` | `Shelbi · <workspace> · <task>` | the title the plugin gives the session |
+| `SHELBI_OPENCODE_ROLE` | `orchestrator` (orchestrator only) | tells the plugin to deliver board events rather than run a worker's hooks |
+
+If you export your own `OPENCODE_CONFIG_CONTENT`, Shelbi merges it under its
+keys instead of replacing it: your keys stay, your list entries come first,
+and Shelbi's values win only where it sets one. A value that isn't a JSON
+object can't be merged; the dispatch leaves it out and records
+`opencode-user-config-ignored` on the events log. On a remote machine Shelbi
+reads your value from a login shell there.
+
+## Files Shelbi writes
+
+Everything lives under the workspace worktree's `.shelbi/`, which Shelbi
+already adds to the worktree's git exclude file, so none of it shows in
+`git status`.
+
+| Path | What | Lifetime |
+| --- | --- | --- |
+| `.shelbi/opencode/config.json` | the config layer | rewritten on every launch |
+| `.shelbi/opencode/instructions.md` | the agent's composed instructions (role, shared preamble, `instructions.md`) | rewritten on every launch |
+| `.shelbi/opencode/skills/` | the agent's skills | emptied and restaged on every launch |
+| `.shelbi/opencode/plugins/shelbi/` | Shelbi's plugin (`index.js`, `package.json`) | rewritten on every launch |
+| `.shelbi/opencode/plugin.lock` | the plugin's single-instance lock (holds its pid) | cleared on launch; released when OpenCode exits |
+| `.shelbi/opencode/plugin.alive` | the plugin's health beacon | cleared on launch; written once the plugin loads |
+| `.shelbi/opencode/inbox/`, `ack/` | [verified sends](#messages-and-verified-sends) | swept on launch; each entry removed once handled |
+| `.shelbi/startup-prompt.md` | the task prompt `--prompt` reads | rewritten on every dispatch |
+| `.shelbi/hooks/*.sh` | the runner-neutral hook scripts every runner uses | rewritten on every dispatch |
+
+Shelbi also records the session id in the workspace's `status.yaml`
+(`opencode_session`) and keeps a per-workspace ledger of the sessions it
+launched at `~/.shelbi/projects/<project>/workspaces/<ws>/opencode-sessions.yaml`.
+
+Earlier Shelbi releases put the plugin at `.opencode/plugins/shelbi.js`. A
+launch removes that file, and its git-exclude line, when it starts with
+Shelbi's signature line, plus the `.opencode/plugins/` and `.opencode/`
+directories if that leaves them empty. A file of yours at that path is never
+touched.
+
+## The config layer
+
+The generated `.shelbi/opencode/config.json` looks like this for a developer
+agent with an `auto` ceiling and a model at `high` effort (formatted here; the
+file is one line):
+
+```json
+{
+  "instructions": ["/work/myapp/.shelbi/wt/alpha/.shelbi/opencode/instructions.md"],
+  "skills": ["/work/myapp/.shelbi/wt/alpha/.shelbi/opencode/skills"],
+  "plugins": ["/work/myapp/.shelbi/wt/alpha/.shelbi/opencode/plugins/shelbi"],
+  "agents": {
+    "build": {
+      "model": "anthropic/claude-sonnet-5-5#high",
+      "permissions": [
+        { "action": "edit", "effect": "allow", "resource": "*" },
+        { "action": "shell", "effect": "ask", "resource": "*" },
+        { "action": "external_directory", "effect": "ask", "resource": "*" }
+      ]
+    },
+    "plan": { "…": "the same model and rules" }
+  }
+}
+```
+
+Every path is absolute, because OpenCode resolves a relative entry against the
+document that names it, and an environment variable has no directory. A key
+is written only when Shelbi has a value for it. With no model and no
+permission ceiling, `agents` is left out and your own OpenCode settings
+govern.
+
+### Instructions and skills
+
+An OpenCode worker gets its role instructions at system authority, through
+the layer's `instructions`, rather than at the top of its first prompt as a
+Claude worker does. The startup prompt then carries only the task. OpenCode
+re-reads instruction files when they change.
+
+Skills are staged under `.shelbi/opencode/skills/` and named in `skills`, not
+under `.claude/skills/`. OpenCode reads `.claude/skills/` as well, so a skill
+there would load twice. When a workspace that last ran Claude switches to
+OpenCode, Shelbi removes the skills it mounted in `.claude/skills/` for that
+earlier dispatch (only its own, by its manifest; yours stay). Your repo's
+`CLAUDE.md`, which OpenCode reads when there's no `AGENTS.md`, is left alone.
+
+### Model and reasoning effort
+
+OpenCode's TUI has no model flag, so the model goes in the layer, on the
+`build` and `plan` agents (OpenCode drops a `#variant` on a root-level
+model). The model is a `provider/model` id. Settings lists the ids OpenCode
+reports on the hub, from a private `opencode serve` Shelbi starts and stops
+for the purpose, with `opencode models --standalone` as a fallback; it gives
+up after 5 seconds and then takes a typed id.
+
+Reasoning effort becomes the model's variant of the same name
+(`provider/model#high`), and only when OpenCode on the hub reports that
+variant for that model. Otherwise, and always on a remote machine, the model's
+own default stands and the dispatch records `opencode-effort-unapplied` with
+the reason. A model you already wrote with a `#variant` keeps it.
+
+## Permission ceilings
+
+OpenCode has no permission-mode flag, and its default `build` agent allows
+everything. So Shelbi turns the resolved
+[permission ceiling](/docs/configuration/agents#permissions-are-a-ceiling)
+into OpenCode permission rules on the `build` and `plan` agents. Agent rules
+load after your own and the project's, and the last matching rule wins, so
+they hold the ceiling over a looser user config.
+
+| Ceiling | OpenCode rules, in order | Flag |
+| --- | --- | --- |
+| none set | none: your own OpenCode settings stand | none |
+| `plan` | deny `*`, then allow `read`, `glob`, `grep`, `webfetch`, `websearch`, `skill`, `question` | none |
+| `default` | ask before `edit`, `shell`, `webfetch`, `external_directory` | none |
+| `read-only` | the `default` rules, then deny `edit` | none |
+| `auto`, `acceptEdits` | allow `edit`; ask before `shell`, `external_directory` | none |
+| `bypassPermissions` | allow `*` | `--auto` |
+
+An unrecognized mode ranks as `default`, so a typo never loosens anything.
+An agent whose `settings.json` denies Claude's edit tools (`Edit`, `Write` or
+`NotebookEdit` in `permissions.deny`, as the shipped review agent's does) also
+gets an `edit` deny rule at the end, whatever the ceiling.
+
+<Callout type="warning" title="No ceiling means OpenCode's defaults">
+When neither the project nor the agent sets a permission mode, Shelbi adds no
+rules, and OpenCode's own default allows edits and shell commands. Set
+`workspace_permissions_mode` on the project, or restrict OpenCode in your own
+config, if you want asks.
+</Callout>
+
+In an unattended pane an `ask` shows as a blocked workspace, and the
+orchestrator handles it through its usual rules for a blocked dialog.
+
+## Sessions
+
+Each task runs on a session Shelbi names:
+
+- A worker's id is `ses_shelbi` plus 20 hex characters hashed from the
+  project, workspace, task and a generation. A resume (`shelbi issue resume`,
+  or a pane that died) reuses the generation and so reopens the same
+  conversation. Any other launch, such as a fresh start or a supervised
+  restart, bumps it and starts a new one.
+- The orchestrator's id is `ses_shelbiorch` plus a hash of the project, so a
+  reload, a restart or a relaunch after a crash reopens the same conversation.
+
+The plugin titles the session `Shelbi · <workspace> · <task>` (the
+orchestrator's is `Shelbi · <project> · orchestrator`) and puts the title back
+if OpenCode's title agent renames it, so you can tell Shelbi's sessions from
+your own in OpenCode's session list.
+
+Shelbi's sessions live in your OpenCode history, alongside your own. Once a
+task reaches a done status, Shelbi **archives** (never deletes) the sessions it
+ran for it, so they drop out of OpenCode's lists but stay restorable. The
+poller does this about once a minute by running, on the workspace's machine:
+
+```bash
+OPENCODE_DISABLE_AUTOUPDATE=1 opencode api --standalone session.update \
+  --param sessionID=<id> -d '{"archived":true}'
+```
+
+That is a private server for the one call, never your background service. A
+session OpenCode never created counts as archived, and a failure is retried
+on later passes, up to three times.
+
+## The plugin
+
+Shelbi's plugin is OpenCode's half of the hook contract Claude Code gets from
+`.claude/settings.local.json`. It acts only in a pane Shelbi launched (one with
+`SHELBI_OPENCODE_SESSION`), and only on that session and its subagents. A
+session you open yourself in the same TUI is left alone.
+
+### Pane state
+
+The plugin reports the pane's state to the hub with a `runner-state` message
+over `SHELBI_HUB_ADDR`, which works the same on a remote machine because the
+hub address is already forwarded there. The hub keeps the latest report in
+`~/.shelbi/projects/<project>/workspaces/<ws>/runner-state.json`, and the
+sidebar reads it instead of the pane title. The plugin never writes to the
+pane's terminal.
+
+| State | When |
+| --- | --- |
+| working | a turn is running (a step, a tool call, new input) |
+| idle | the turn ended and nothing is waiting |
+| background | the turn ended while a subagent it started is still running |
+| blocked | a permission ask (`permission`) or a question form (`question`) waits on a person, from the session or a subagent |
+| paused | a provider limit stopped the turn (OpenCode's free limit, a quota, a rate limit), or OpenCode scheduled a retry, with the time it runs |
+
+### Health and the fallback
+
+When the plugin loads it takes a single-instance lock (OpenCode may load a
+plugin more than once in one server, and two instances would deliver every
+message twice) and writes its beacon, `.shelbi/opencode/plugin.alive`.
+Shelbi waits up to 10 seconds after launch for the beacon. Without it, the
+workspace records `state_observation=degraded` on the events log, and the
+poller reads OpenCode's own permission dialog ("Permission required") off the
+screen instead.
+
+### Messages and verified sends
+
+At the end of each turn, and while the session sits idle (checked every 5
+seconds against the task's message log), the plugin runs `.shelbi/hooks/stop.sh`
+to drain new hub messages, and puts a non-empty batch into the session as a
+synthetic message, which starts the next turn.
+
+`shelbi send` (and the orchestrator's own nudges) reach an OpenCode pane
+without typing into it, so a draft you have in the composer stays put:
+
+1. Shelbi writes `.shelbi/opencode/inbox/<delivery-id>.json`.
+2. The plugin claims it, admits the text into the session with its own message
+   id, and answers `.shelbi/opencode/ack/<delivery-id>.json` with `admitted`,
+   `duplicate` or `failed`.
+3. Shelbi waits up to 15 seconds for the answer. With none, it takes the file
+   back and pastes the message instead, and the send line on the events log
+   says `status=degraded`. A pane whose plugin never reported in is pasted to
+   directly.
+
+A delivery id is admitted once, however often its file is dropped.
+
+### The orchestrator
+
+An OpenCode orchestrator runs in the project's config directory on its own
+session. Its config layer is inline on the launch line and names, at system
+authority, a role preamble at `.shelbi/opencode/instructions.md` and the
+composed `agents/orchestrator/instructions.md` (with any reload handoff), plus
+Shelbi's `update-shelbi-configuration` skill. Only the bootstrap request rides
+`--prompt`.
+
+When the project uses the awareness event system, the layer also names the
+plugin, with `SHELBI_OPENCODE_ROLE=orchestrator`. The plugin then plays the
+part Claude's `shelbi-awareness` plugin plays, through the same commands: it
+runs `shelbi orchestrator events stream --json` for the whole session and
+admits each batch of board events (queued while the orchestrator is idle,
+steered into a running turn when urgent, a digest added as context without
+starting a turn), and it calls `shelbi orchestrator hook` at session start,
+when a turn starts and when one ends. The Shelbi CLI owns the queue, its
+cursor and its acknowledgements; the plugin only carries batches across.
+
+## Events to look for
+
+Each of these is a `dispatch` line on the events log
+(`dispatch project=… task=… workspace=… status=<status> detail=…`), with the
+specifics in `detail`:
+
+| `status` | Means |
+| --- | --- |
+| `opencode-unsupported` | the dispatch refused an OpenCode below 2.3 |
+| `integration` (detail `state_observation=degraded reason=opencode-plugin-silent`) | the plugin never wrote its beacon; state is read off the screen |
+| `opencode-effort-unapplied` | an effort was set but no matching variant was reported; the model's default stands |
+| `opencode-user-config-ignored` | your `OPENCODE_CONFIG_CONTENT` wasn't a JSON object and was left out |
+| `opencode-legacy-plugin-removed` | the old `.opencode/plugins/shelbi.js` was cleaned up |

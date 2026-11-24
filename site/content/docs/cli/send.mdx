@@ -26,7 +26,11 @@ its own parser. A custom runner still receives the split text/Enter sequence,
 but Shelbi has no parser for its screen, so the result is `status=unverified`
 (printed as `sent (unverified)`): delivered, with no runner-specific proof.
 Which parser applies follows the project's baseline runner
-(`orchestrator.runner`).
+(`orchestrator.runner`). A workspace Shelbi launched OpenCode in takes the
+message through Shelbi's plugin instead of the keyboard, so nothing is typed
+into the pane; it falls back to a paste, recorded as `status=degraded`, when the
+plugin doesn't answer (see
+[OpenCode](/docs/concepts/opencode#messages-and-verified-sends)).
 
 On success `send` prints `✓ sent`, `✓ queued`, or `✓ sent (unverified)`, with
 the workspace and session it reached. Sends to the same workspace are

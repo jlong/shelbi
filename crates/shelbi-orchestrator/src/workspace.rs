@@ -30,7 +30,7 @@ pub use opencode::{
 };
 pub(crate) use opencode::{deploy_orchestrator_opencode_plugin, write_orchestrator_opencode_preamble};
 #[cfg(test)]
-pub(crate) use opencode::opencode_plugin_js;
+pub(crate) use opencode::{deploy_opencode_plugin, opencode_plugin_js, render_opencode_instructions};
 
 
 /// Filter `git status --porcelain` output down to the lines that represent

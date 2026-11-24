@@ -1,0 +1,1 @@
+{"agents":{"build":{"permissions":[{"action":"*","effect":"allow","resource":"*"}]},"plan":{"permissions":[{"action":"*","effect":"allow","resource":"*"}]}},"instructions":["/tmp/myapp-wt/.shelbi/opencode/instructions.md"],"plugins":["/tmp/myapp-wt/.shelbi/opencode/plugins/shelbi"],"skills":["/tmp/myapp-wt/.shelbi/opencode/skills"]}
