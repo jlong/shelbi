@@ -22,6 +22,13 @@ use shelbi_core::{
 
 use crate::session_backend::{backend, KillReason, Liveness, SessionBackend, SessionTarget};
 
+mod opencode;
+pub use opencode::{
+    LEGACY_OPENCODE_PLUGIN_REL, OPENCODE_CONFIG_REL, OPENCODE_DIR_REL, OPENCODE_INSTRUCTIONS_REL,
+    OPENCODE_PLUGIN_ALIVE_REL, OPENCODE_PLUGIN_BEACON_WAIT, OPENCODE_PLUGIN_DIR_REL,
+    OPENCODE_PLUGIN_LOCK_REL, OPENCODE_SKILLS_REL,
+};
+
 
 /// Filter `git status --porcelain` output down to the lines that represent
 /// *user-authored* changes — i.e. drop shelbi's own footprint in the worktree.
@@ -3145,24 +3152,10 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         }
     }
     deploy_runner_hooks(a.host, a.worktree)?;
-    // OpenCode reaches the same hook scripts through Shelbi's project plugin.
-    // A user-authored file at the plugin's path is never overwritten; like an
-    // unmergeable `settings.local.json`, it stops the dispatch with a message
-    // naming the file.
-    if shelbi_agent::RunnerAdapter::for_spec(a.runner).is_opencode() {
-        if let OpenCodePluginResult::UserFileInTheWay { message } =
-            deploy_opencode_plugin(a.host, a.worktree)?
-        {
-            append_dispatch_status(
-                &a.project.name,
-                a.task_id,
-                &a.workspace.name,
-                "opencode-plugin-blocked",
-                &format!("file={OPENCODE_PLUGIN_REL} reason=user-authored-file"),
-            );
-            return Err(Error::Other(message));
-        }
-    }
+    // OpenCode reaches the same hook scripts through Shelbi's plugin, which
+    // its config layer (written below, once the agent context is staged)
+    // loads from `.shelbi/opencode/plugins/shelbi/`.
+    let opencode = shelbi_agent::RunnerAdapter::for_spec(a.runner).is_opencode();
 
     // Decide + record the hub→workspace message channel for THIS launch. The
     // mode is derived from the runner's verified hook health (see
@@ -3195,7 +3188,23 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     //     task/workflow context (task #1315). Skipped when `agent` is `None`
     //     (e.g. an embed test that exercises the spawn path without resolving an
     //     agent), which preserves the historical no-agent task prompt.
+    //
+    //     OpenCode is the exception: its role instructions go in at system
+    //     authority, through the `instructions` of its config layer, and its
+    //     skills to `.shelbi/opencode/skills/` rather than `.claude/skills/`
+    //     (OpenCode reads that too, so they'd load twice). Its startup prompt
+    //     then carries only the task.
+    let mut opencode_context = None;
     let composed_instructions = match a.agent {
+        Some(agent) if opencode => {
+            opencode_context = Some(opencode::compose_and_stage_opencode_context(
+                a.host,
+                a.worktree,
+                &a.project.name,
+                agent,
+            )?);
+            None
+        }
         Some(agent) => Some(compose_and_mount_agent_context(
             a.host,
             a.worktree,
@@ -3249,15 +3258,31 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     // An agent whose settings deny Claude's edit tools (the review agent's
     // no-edit posture) gets the same deny on OpenCode, which never reads
     // those settings: its launch appends an `edit` deny rule.
-    let opencode = shelbi_agent::RunnerAdapter::for_spec(a.runner).is_opencode();
     let deny_edits = opencode
         && settings_deny_edits(&render_workspace_settings_preferring_agent(a.project, a.agent)?);
     let runner = shelbi_agent::with_edits_denied(a.runner, deny_edits);
-    let launch = workspace_launch_command_with_startup_prompt(
+    // OpenCode's config layer: generated from the fully resolved spec (model,
+    // ceiling, edit deny) plus the staged context, and read by the launch.
+    // A clean slate for the observation record: the new pane's plugin
+    // reports in (or doesn't) after the spawn below.
+    let _ = shelbi_state::clear_observation_degraded(&a.project.name, &a.workspace.name);
+    if opencode {
+        opencode::deploy_opencode_layer(opencode::OpenCodeLayerArgs {
+            host: a.host,
+            worktree: a.worktree,
+            runner: &shelbi_agent::with_permission_mode(&runner, a.permission_mode),
+            agent: a.agent.zip(opencode_context.as_ref()),
+            project: &a.project.name,
+            task_id: a.task_id,
+            workspace: &a.workspace.name,
+        })?;
+    }
+    let launch = workspace_launch_command_with_layer(
         &runner,
         a.permission_mode,
         a.resume,
         startup_prompt_rel,
+        opencode.then_some(OPENCODE_CONFIG_REL),
     );
     match a.host {
         Host::Local => {
@@ -3314,6 +3339,19 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     // worker. Best-effort: a stamp failure only forfeits that grace for this
     // slot, never the launch itself.
     let _ = stamp_launch_epoch(a.host, a.addr);
+
+    // OpenCode's plugin is its state channel: wait for its beacon, and fall
+    // back to reading the pane's dialogs (reported as degraded) without it.
+    if opencode {
+        opencode::observe_opencode_plugin(
+            a.host,
+            a.worktree,
+            &a.project.name,
+            a.task_id,
+            &a.workspace.name,
+            OPENCODE_PLUGIN_BEACON_WAIT,
+        );
+    }
 
     if launch_seed {
         // The pane was just killed + recreated (step 3), so it carries no
@@ -4976,55 +5014,6 @@ pub fn deploy_runner_hooks(host: &Host, worktree: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Worktree-relative path of Shelbi's OpenCode plugin. OpenCode loads every
-/// module in a project's `.opencode/plugins/` alongside the user's own
-/// config, so this one file wires an OpenCode workspace without touching any
-/// user-owned OpenCode settings.
-pub const OPENCODE_PLUGIN_REL: &str = ".opencode/plugins/shelbi.js";
-
-/// The plugin body (see `opencode_plugin.js`).
-const OPENCODE_PLUGIN_JS: &str = include_str!("opencode_plugin.js");
-
-/// The first line of every plugin body Shelbi writes: how a refresh tells its
-/// own file from a user's file of the same name.
-const OPENCODE_PLUGIN_SIGNATURE: &str = "// Shelbi's OpenCode plugin.";
-
-/// Outcome of [`deploy_opencode_plugin`].
-#[derive(Debug, PartialEq, Eq)]
-pub enum OpenCodePluginResult {
-    /// The plugin is written (fresh, or refreshed over Shelbi's own copy).
-    Deployed,
-    /// A file Shelbi didn't write sits at [`OPENCODE_PLUGIN_REL`]; it is left
-    /// as it was. `message` tells the orchestrator which file and why.
-    UserFileInTheWay { message: String },
-}
-
-/// Write Shelbi's OpenCode plugin to `<worktree>/.opencode/plugins/shelbi.js`
-/// and keep it out of `git status`. Refreshes Shelbi's own copy on every
-/// launch, so a workspace picks up a new plugin body on its next dispatch;
-/// never overwrites a file that doesn't carry Shelbi's signature line.
-pub fn deploy_opencode_plugin(host: &Host, worktree: &Path) -> Result<OpenCodePluginResult> {
-    let dest = worktree.join(OPENCODE_PLUGIN_REL);
-    if let Some(existing) = read_worktree_text(host, &dest)? {
-        if !existing.starts_with(OPENCODE_PLUGIN_SIGNATURE) {
-            return Ok(OpenCodePluginResult::UserFileInTheWay {
-                message: format!(
-                    "{} already holds a file Shelbi didn't write, so Shelbi can't install its \
-                     OpenCode plugin there. Rename or remove that file and dispatch again.",
-                    dest.display(),
-                ),
-            });
-        }
-        if existing == OPENCODE_PLUGIN_JS {
-            let _ = gitignore_worktree_paths(host, worktree, &[OPENCODE_PLUGIN_REL.to_string()]);
-            return Ok(OpenCodePluginResult::Deployed);
-        }
-    }
-    write_worktree_text(host, &dest, OPENCODE_PLUGIN_JS, "opencode-plugin")?;
-    let _ = gitignore_worktree_paths(host, worktree, &[OPENCODE_PLUGIN_REL.to_string()]);
-    Ok(OpenCodePluginResult::Deployed)
-}
-
 fn deploy_runner_hook_file(host: &Host, worktree: &Path, file: &RunnerHookFile) -> Result<()> {
     let dest = worktree.join(file.rel_path);
     let dest_dir = dest
@@ -5990,13 +5979,35 @@ pub fn workspace_launch_command_with_startup_prompt(
     resume: bool,
     startup_prompt_rel: Option<&str>,
 ) -> String {
+    workspace_launch_command_with_layer(runner, permissions_mode, resume, startup_prompt_rel, None)
+}
+
+/// [`workspace_launch_command_with_startup_prompt`], with an OpenCode runner
+/// reading its config layer from `opencode_config_rel` (the worktree's
+/// generated [`OPENCODE_CONFIG_REL`]) instead of inline config. Other
+/// runners ignore it.
+pub fn workspace_launch_command_with_layer(
+    runner: &shelbi_core::AgentRunnerSpec,
+    permissions_mode: Option<&str>,
+    resume: bool,
+    startup_prompt_rel: Option<&str>,
+    opencode_config_rel: Option<&str>,
+) -> String {
     // `resume` (a `shelbi task resume`) adds `--continue` for a claude runner
     // so the pane reloads its prior conversation instead of starting cold —
     // see [`shelbi_agent::with_continue`]. It's a no-op for a normal dispatch
     // and for non-claude runners.
     let runner_with_mode = shelbi_agent::with_permission_mode(runner, permissions_mode);
     let runner_resolved = shelbi_agent::with_continue(&runner_with_mode, resume);
-    let launch = shelbi_agent::launch_command(&runner_resolved);
+    let launch = match opencode_config_rel {
+        Some(rel) if shelbi_agent::RunnerAdapter::for_spec(&runner_resolved).is_opencode() => {
+            shelbi_agent::opencode_launch_command_with(
+                &runner_resolved,
+                shelbi_agent::OpenCodeConfigSource::File(rel),
+            )
+        }
+        _ => shelbi_agent::launch_command(&runner_resolved),
+    };
     with_startup_prompt(&launch, startup_prompt_rel, runner, resume)
 }
 
@@ -10584,10 +10595,35 @@ statuses:
             ),
             concat!(
                 r#"env SHELBI_PANE_TTY="$(tty)" "#,
-                r#"OPENCODE_CONFIG_CONTENT='{"agents":{"build":{"permissions":[{"action":"edit","resource":"*","effect":"allow"},{"action":"shell","resource":"*","effect":"ask"},{"action":"external_directory","resource":"*","effect":"ask"}]},"plan":{"permissions":[{"action":"edit","resource":"*","effect":"allow"},{"action":"shell","resource":"*","effect":"ask"},{"action":"external_directory","resource":"*","effect":"ask"}]}}}' "#,
+                r#"SHELBI_OPENCODE_USER_CONFIG="${SHELBI_OPENCODE_USER_CONFIG-${OPENCODE_CONFIG_CONTENT-}}" "#,
+                r#"OPENCODE_CONFIG_CONTENT='{"agents":{"build":{"permissions":[{"action":"edit","effect":"allow","resource":"*"},{"action":"shell","effect":"ask","resource":"*"},{"action":"external_directory","effect":"ask","resource":"*"}]},"plan":{"permissions":[{"action":"edit","effect":"allow","resource":"*"},{"action":"shell","effect":"ask","resource":"*"},{"action":"external_directory","effect":"ask","resource":"*"}]}}}' "#,
                 r#"OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' OPENCODE_DISABLE_AUTOUPDATE=1 "#,
                 r#"opencode --standalone --prompt "$(cat .shelbi/startup-prompt.md)""#,
             ),
+        );
+        // A worker's dispatch reads its generated layer instead: the ceiling
+        // is already in the file, so nothing of it rides the line.
+        assert_eq!(
+            workspace_launch_command_with_layer(
+                &opencode,
+                Some("auto"),
+                false,
+                Some(WORKTREE_STARTUP_PROMPT_REL),
+                Some(OPENCODE_CONFIG_REL),
+            ),
+            concat!(
+                r#"env SHELBI_PANE_TTY="$(tty)" "#,
+                r#"SHELBI_OPENCODE_USER_CONFIG="${SHELBI_OPENCODE_USER_CONFIG-${OPENCODE_CONFIG_CONTENT-}}" "#,
+                r#"OPENCODE_CONFIG_CONTENT="$(cat .shelbi/opencode/config.json)" "#,
+                r#"OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' OPENCODE_DISABLE_AUTOUPDATE=1 "#,
+                r#"opencode --standalone --prompt "$(cat .shelbi/startup-prompt.md)""#,
+            ),
+        );
+        // The layer path is OpenCode's alone.
+        let claude = AgentRunnerSpec { command: "claude".into(), ..opencode.clone() };
+        assert_eq!(
+            workspace_launch_command_with_layer(&claude, None, false, None, Some(OPENCODE_CONFIG_REL)),
+            "claude"
         );
         // A resume continues the last session and still seeds the prompt: the
         // paste path is Claude's alone.
@@ -10660,50 +10696,6 @@ statuses:
         let mut claude = fake("other", "1.0.0");
         claude.integration = Some(shelbi_core::RunnerKind::Claude);
         require_opencode_supported(&Host::Local, &claude).unwrap();
-    }
-
-    #[test]
-    fn deploy_opencode_plugin_owns_only_its_own_file() {
-        let tmp = std::env::temp_dir().join(format!(
-            "shelbi-opencode-plugin-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let worktree = tmp.join("wt");
-        std::fs::create_dir_all(&worktree).unwrap();
-        let plugin = worktree.join(OPENCODE_PLUGIN_REL);
-
-        // Fresh worktree: written.
-        assert_eq!(
-            deploy_opencode_plugin(&Host::Local, &worktree).unwrap(),
-            OpenCodePluginResult::Deployed
-        );
-        let body = std::fs::read_to_string(&plugin).unwrap();
-        assert!(body.starts_with(OPENCODE_PLUGIN_SIGNATURE));
-        assert!(body.contains(".shelbi/hooks"));
-
-        // Shelbi's own stale copy: refreshed.
-        std::fs::write(&plugin, format!("{OPENCODE_PLUGIN_SIGNATURE}\n// old\n")).unwrap();
-        assert_eq!(
-            deploy_opencode_plugin(&Host::Local, &worktree).unwrap(),
-            OpenCodePluginResult::Deployed
-        );
-        assert_eq!(std::fs::read_to_string(&plugin).unwrap(), OPENCODE_PLUGIN_JS);
-
-        // A user's file at the same path: left exactly as it was.
-        std::fs::write(&plugin, "export default {}\n").unwrap();
-        match deploy_opencode_plugin(&Host::Local, &worktree).unwrap() {
-            OpenCodePluginResult::UserFileInTheWay { message } => {
-                assert!(message.contains(".opencode/plugins/shelbi.js"), "{message}");
-            }
-            other => panic!("expected the user's file to block the deploy, got {other:?}"),
-        }
-        assert_eq!(std::fs::read_to_string(&plugin).unwrap(), "export default {}\n");
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

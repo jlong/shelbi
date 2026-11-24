@@ -426,6 +426,45 @@ pub fn clear_review_serve_pgid(project: &str, workspace: &str) -> Result<()> {
     }
 }
 
+/// `<project>/workspaces/<name>/observation-degraded`: present while the
+/// workspace's live state can only be read off its screen, because the
+/// runner's own state channel never reported in. Today that's an OpenCode
+/// pane whose Shelbi plugin wrote no `plugin.alive` beacon after launch; the
+/// poller then matches OpenCode's own dialogs on screen. The body is a short
+/// reason. A dispatch clears it before launching and sets it again only if
+/// the new pane's channel stays silent. Kept hub-side so the poller reads it
+/// with a local stat, remote workspaces included.
+pub fn observation_degraded_path(project: &str, workspace: &str) -> Result<PathBuf> {
+    crate::ensure_flat_path_component("workspace", workspace)?;
+    Ok(workspaces_dir(project)?.join(workspace).join("observation-degraded"))
+}
+
+/// Record that `workspace`'s state is read off its screen (see
+/// [`observation_degraded_path`]), with a short `reason`.
+pub fn mark_observation_degraded(project: &str, workspace: &str, reason: &str) -> Result<()> {
+    let path = observation_degraded_path(project, workspace)?;
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    atomic_write(&path, format!("{reason}\n").as_bytes())
+}
+
+/// Clear [`mark_observation_degraded`]'s record. Idempotent.
+pub fn clear_observation_degraded(project: &str, workspace: &str) -> Result<()> {
+    let path = observation_degraded_path(project, workspace)?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(shelbi_core::Error::Io(e)),
+    }
+}
+
+/// Whether `workspace`'s state is currently read off its screen. Any error
+/// reading the record reads as `false`.
+pub fn observation_degraded(project: &str, workspace: &str) -> bool {
+    observation_degraded_path(project, workspace).is_ok_and(|p| p.exists())
+}
+
 /// Local Unix-domain socket the hub daemon (`shelbi daemon`) listens on.
 /// `$SHELBI_HUB_SOCK` wins when set so tests, alternate users, or
 /// XDG_RUNTIME_DIR layouts can re-home it without touching `SHELBI_HOME`.
@@ -771,6 +810,26 @@ mod tests {
         let s = yaml_serde::to_string(&WorkspaceState::Waiting).unwrap();
         assert!(s.trim().ends_with("waiting"), "got {s:?}");
         assert_eq!(WorkspaceState::Waiting.as_str(), "waiting");
+    }
+
+    #[test]
+    fn observation_degraded_round_trips() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        assert!(!observation_degraded("demo", "alpha"));
+        mark_observation_degraded("demo", "alpha", "opencode-plugin-silent").unwrap();
+        assert!(observation_degraded("demo", "alpha"));
+        assert!(!observation_degraded("demo", "bravo"));
+        let body = std::fs::read_to_string(observation_degraded_path("demo", "alpha").unwrap()).unwrap();
+        assert_eq!(body, "opencode-plugin-silent\n");
+        clear_observation_degraded("demo", "alpha").unwrap();
+        clear_observation_degraded("demo", "alpha").unwrap();
+        assert!(!observation_degraded("demo", "alpha"));
+        assert!(observation_degraded_path("demo", "../x").is_err());
+
+        std::env::remove_var("SHELBI_HOME");
     }
 
     #[test]

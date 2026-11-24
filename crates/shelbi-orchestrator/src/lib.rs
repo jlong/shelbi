@@ -1107,6 +1107,7 @@ fn orchestrator_launch_command(
     workdir: &std::path::Path,
     first_launch_repo: Option<&std::path::Path>,
     awareness_plugin: bool,
+    opencode_user_config: Option<&str>,
 ) -> String {
     if shelbi_agent::RunnerAdapter::for_spec(spec).is_codex() {
         codex_bridge_cmd(shelbi_bin, project_name, first_launch_repo.is_some())
@@ -1122,7 +1123,14 @@ fn orchestrator_launch_command(
                 EventDelivery::SelfDrain
             },
         );
-        launch_with_bootstrap(spec, project_name, workdir, &bootstrap_prompt, awareness_plugin)
+        launch_with_bootstrap(
+            spec,
+            project_name,
+            workdir,
+            &bootstrap_prompt,
+            awareness_plugin,
+            opencode_user_config,
+        )
     }
 }
 
@@ -1183,6 +1191,7 @@ fn launch_with_bootstrap(
     workdir: &std::path::Path,
     bootstrap_prompt: &str,
     awareness_plugin: bool,
+    opencode_user_config: Option<&str>,
 ) -> String {
     let adapter = shelbi_agent::RunnerAdapter::for_spec(spec);
     if adapter.is_claude() {
@@ -1205,7 +1214,7 @@ fn launch_with_bootstrap(
     } else if adapter.is_codex() {
         codex_standalone_launch(spec, project_name, workdir, bootstrap_prompt)
     } else if adapter.is_opencode() {
-        opencode_standalone_launch(spec, project_name, workdir, bootstrap_prompt)
+        opencode_standalone_launch(spec, project_name, workdir, bootstrap_prompt, opencode_user_config)
     } else {
         shelbi_agent::launch_command(spec)
     }
@@ -1213,14 +1222,22 @@ fn launch_with_bootstrap(
 
 /// OpenCode has no system-prompt flag either, so its orchestrator gets the
 /// same self-contained first prompt as a standalone Codex one, through the
-/// TUI's `--prompt` (its positional argument is a directory).
+/// TUI's `--prompt` (its positional argument is a directory). Its config
+/// (model, ceiling) is inline, merged over `user_config`, the user's own
+/// `OPENCODE_CONFIG_CONTENT`, so setting the variable doesn't shadow it.
 fn opencode_standalone_launch(
     spec: &shelbi_core::AgentRunnerSpec,
     project_name: &str,
     workdir: &std::path::Path,
     bootstrap_prompt: &str,
+    user_config: Option<&str>,
 ) -> String {
-    let launch = shelbi_agent::launch_command(spec);
+    let layer = shelbi_agent::OpenCodeLayer {
+        user_config: user_config.map(str::to_string),
+        ..Default::default()
+    };
+    let launch =
+        shelbi_agent::opencode_launch_command_with(spec, shelbi_agent::OpenCodeConfigSource::Inline(&layer));
     format!(
         "{launch} --prompt {prompt}",
         prompt = codex_orchestrator_prompt_arg(project_name, workdir, bootstrap_prompt),
@@ -1402,6 +1419,14 @@ fn ensure_orchestrator_session(
         shelbi_state::claim_contextual_greeting(project_name)?.then_some(hub_work_dir);
 
     let shelbi_bin = current_exe_string()?;
+    // The orchestrator pane runs on the hub, in the session child environment.
+    let opencode_user_config = shelbi_agent::RunnerAdapter::for_spec(runner_spec)
+        .is_opencode()
+        .then(|| {
+            let env = shelbi_core::session_child_env();
+            shelbi_agent::opencode_user_config(|key| env.get(key).cloned())
+        })
+        .flatten();
     let launch = orchestrator_launch_command(
         &shelbi_bin,
         runner_spec,
@@ -1409,6 +1434,7 @@ fn ensure_orchestrator_session(
         workdir,
         first_launch_repo,
         awareness_plugin,
+        opencode_user_config.as_deref(),
     );
     let spec = orchestrator_session_spec(project_name, session, workdir, &launch);
 

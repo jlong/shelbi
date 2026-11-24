@@ -6120,6 +6120,7 @@ dependencies = [
 name = "shelbi-agent"
 version = "0.14.0"
 dependencies = [
+ "serde_json",
  "shelbi-core",
 ]
 

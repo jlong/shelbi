@@ -235,10 +235,16 @@ worktree's `.claude/settings.local.json` wires
 `$CLAUDE_PROJECT_DIR/.shelbi/hooks/*.sh` (`session-start`, `stop`,
 `pane-working`, `pane-idle`, `pane-blocked`) so the session pushes orchestrator
 messages to the agent as they arrive. An OpenCode worker gets the same hooks
-through a plugin Shelbi writes to the worktree's `.opencode/plugins/shelbi.js`
-(kept out of `git status`): it runs the scripts on OpenCode's session events,
-writes the `shelbi:<state>` markers to the pane title, and pushes drained
-messages into the session as they arrive, even while it sits idle. Codex has no
+through a plugin Shelbi writes to the worktree's `.shelbi/opencode/plugins/shelbi/`
+and loads through the launch's `OPENCODE_CONFIG_CONTENT`: it runs the scripts on
+OpenCode's session events, writes the `shelbi:<state>` markers to the pane
+title, and pushes drained messages into the session as they arrive, even while
+it sits idle. Shelbi writes nothing under `.opencode/`, `opencode.json` or
+`~/.config/opencode`, and on launch it removes a `.opencode/plugins/shelbi.js`
+an older Shelbi left behind (never a file of yours at that path). If the plugin
+hasn't reported in 10 seconds after launch, the dispatch logs
+`state_observation=degraded` and Shelbi reads OpenCode's "Permission required"
+dialog off the screen instead. Codex has no
 hook channel Shelbi can wire without overwriting user-owned `.codex/`
 configuration, so a Codex worker instead pulls its messages: its startup
 prompt carries a polling contract that tails `.shelbi/messages/<task-id>.log`.

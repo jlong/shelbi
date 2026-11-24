@@ -2301,7 +2301,18 @@ fn maybe_emit_dialog_event(
         *unknown_dialog_streak = 0;
         return None;
     };
-    let signatures = runner.effective_dialog_signatures();
+    let mut signatures = runner.effective_dialog_signatures();
+    // An OpenCode pane normally reports its asks through Shelbi's plugin. When
+    // the plugin never reported in after launch (the workspace's state
+    // observation is degraded), read OpenCode's own ask dialog off the screen
+    // instead. Only that named dialog: the generic unrecognized-menu shape is
+    // tuned to Claude's screens, so it stays off.
+    let screen_fallback = signatures.is_empty()
+        && shelbi_agent::RunnerAdapter::for_spec(runner).is_opencode()
+        && shelbi_state::observation_degraded(&project.name, &workspace.name);
+    if screen_fallback {
+        signatures = shelbi_core::opencode_fallback_dialog_signatures();
+    }
     if signatures.is_empty() {
         // Nothing configured for this runner (and no built-in default) —
         // clear any prior stuck-state so a config change that removes the
@@ -2326,7 +2337,7 @@ fn maybe_emit_dialog_event(
             *unknown_dialog_streak = 0;
             Some(kind)
         }
-        None if crate::ready::is_unknown_selection_dialog(screen) => {
+        None if !screen_fallback && crate::ready::is_unknown_selection_dialog(screen) => {
             *unknown_dialog_streak = unknown_dialog_streak.saturating_add(1);
             (*unknown_dialog_streak >= UNKNOWN_DIALOG_MIN_STREAK).then(|| "unknown".to_string())
         }
@@ -7736,6 +7747,56 @@ Intro prose.
         assert_eq!(no_sample, None, "no sample reports no fresh dialog");
         assert_eq!(stuck.as_deref(), Some("question"), "no sample leaves the stuck-state untouched");
 
+        match prior_home {
+            Some(h) => std::env::set_var("SHELBI_HOME", h),
+            None => std::env::remove_var("SHELBI_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// An OpenCode pane's asks normally arrive through Shelbi's plugin, so no
+    /// screen is matched. Once the dispatch found the plugin silent (the
+    /// workspace's observation is degraded), OpenCode's own "Permission
+    /// required" dialog on screen reads as a blocking permission dialog.
+    #[test]
+    fn opencode_permission_dialog_is_read_off_the_screen_only_when_degraded() {
+        let _g = crate::test_lock::acquire();
+        let home = review_serving_home();
+        let prior_home = std::env::var_os("SHELBI_HOME");
+        std::env::set_var("SHELBI_HOME", &home);
+
+        let work_dir = home.join("repo");
+        std::fs::create_dir_all(&work_dir).unwrap();
+        let mut project = local_project(&work_dir);
+        project.agent_runners.insert(
+            "opencode".into(),
+            AgentRunnerSpec {
+                command: "opencode".into(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+                integration: None,
+            },
+        );
+        project.orchestrator = OrchestratorSpec::new("opencode");
+        let ws = project.workspaces[0].clone();
+        let ask = "  △ Permission required\n  shell: rm -rf build\n  Allow once   Always allow   Reject";
+
+        let (mut last, mut streak) = (None, 0);
+        assert_eq!(maybe_emit_dialog_event(&project, &ws, Some(ask), &mut last, &mut streak), None);
+
+        shelbi_state::mark_observation_degraded("demo", "alpha", "opencode-plugin-silent").unwrap();
+        assert_eq!(
+            maybe_emit_dialog_event(&project, &ws, Some(ask), &mut last, &mut streak).as_deref(),
+            Some("permission"),
+        );
+        // A numbered menu with no named dialog isn't guessed at.
+        let menu = "Pick one\n❯ 1. Yes\n  2. No\n";
+        for _ in 0..5 {
+            assert_eq!(maybe_emit_dialog_event(&project, &ws, Some(menu), &mut last, &mut streak), None);
+        }
+
+        shelbi_state::clear_observation_degraded("demo", "alpha").unwrap();
         match prior_home {
             Some(h) => std::env::set_var("SHELBI_HOME", h),
             None => std::env::remove_var("SHELBI_HOME"),
