@@ -883,7 +883,7 @@ console.log(JSON.stringify(out));
         std::fs::write(&stream, "").unwrap();
         let hooks = root.join("hooks.log");
         let shelbi = root.join("bin/shelbi");
-        std::fs::write(
+        shelbi_state::test_support::write_executable(
             &shelbi,
             r#"#!/bin/sh
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -908,10 +908,7 @@ case "$1 $2" in
     esac ;;
 esac
 "#,
-        )
-        .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&shelbi, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let plugin = root.join("plugin.mjs");
         std::fs::write(&plugin, OPENCODE_PLUGIN_JS).unwrap();
         let calls = root.join("calls.jsonl");
@@ -1089,9 +1086,7 @@ input.on("close", () => { stop?.(); setTimeout(() => process.exit(0), 100); });
         std::fs::create_dir_all(&hooks).unwrap();
         for hook in ["session-start.sh", "stop.sh"] {
             let path = hooks.join(hook);
-            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            shelbi_state::test_support::write_executable(&path, "#!/bin/sh\nexit 0\n");
         }
         let plugin = root.join("plugin.mjs");
         std::fs::write(&plugin, OPENCODE_PLUGIN_JS).unwrap();

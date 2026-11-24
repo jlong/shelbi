@@ -331,6 +331,23 @@ mod tests {
         repo
     }
 
+    /// Install the guard for a test that then commits, which execs the hook.
+    ///
+    /// The installer writes the hook from this multi-threaded test process, so
+    /// on Linux a fork on another test thread can hand the hook's write fd to a
+    /// child that hasn't exec'd yet, and the commit's exec of the hook fails
+    /// with ETXTBSY ("Text file busy"). Git execs the hook itself, so it can't
+    /// be run through `sh` instead. Rewriting the same body through
+    /// `write_executable` gives the path a fresh inode written by a `cp` child,
+    /// which no other thread ever holds open.
+    fn install_guard_for_commit(repo: &Path, protected: &[&str]) -> HookInstall {
+        let outcome = install_hub_branch_guard(repo, protected, InstallMode::CreateIfMissing).unwrap();
+        let hook = hooks_dir(repo).unwrap().join("pre-commit");
+        let body = std::fs::read(&hook).unwrap();
+        shelbi_state::test_support::write_executable(&hook, body);
+        outcome
+    }
+
     fn stage_change(repo: &Path, name: &str) {
         std::fs::write(repo.join(name), "change\n").unwrap();
         assert_git_ok(repo, &["add", name]);
@@ -343,7 +360,7 @@ mod tests {
     #[test]
     fn hook_blocks_commit_on_protected_branch_and_allows_task_branch() {
         let repo = fixture_repo("block-main");
-        let outcome = install_hub_branch_guard(&repo, &["main"], InstallMode::CreateIfMissing).unwrap();
+        let outcome = install_guard_for_commit(&repo, &["main"]);
         assert_eq!(outcome, HookInstall::Installed);
 
         stage_change(&repo, "b.txt");
@@ -374,7 +391,7 @@ mod tests {
     #[test]
     fn hook_is_a_noop_without_managed_context_marker() {
         let repo = fixture_repo("noop-plain-shell");
-        install_hub_branch_guard(&repo, &["main"], InstallMode::CreateIfMissing).unwrap();
+        install_guard_for_commit(&repo, &["main"]);
 
         stage_change(&repo, "b.txt");
         // `run_git` scrubs the marker, simulating a plain non-Shelbi shell.
@@ -394,7 +411,7 @@ mod tests {
     #[test]
     fn bypass_env_var_allows_intentional_commit_on_protected_branch() {
         let repo = fixture_repo("bypass");
-        install_hub_branch_guard(&repo, &["main"], InstallMode::CreateIfMissing).unwrap();
+        install_guard_for_commit(&repo, &["main"]);
 
         stage_change(&repo, "b.txt");
         let out = Command::new("git")
@@ -422,7 +439,7 @@ mod tests {
     #[test]
     fn detached_squash_merge_commit_in_temp_worktree_is_allowed() {
         let repo = fixture_repo("squash-merge");
-        install_hub_branch_guard(&repo, &["main"], InstallMode::CreateIfMissing).unwrap();
+        install_guard_for_commit(&repo, &["main"]);
 
         // A task branch with a commit beyond main.
         assert_git_ok(&repo, &["checkout", "-b", "shelbi/task-x"]);
@@ -447,7 +464,7 @@ mod tests {
     #[test]
     fn hook_blocks_every_protected_branch() {
         let repo = fixture_repo("multi-branch");
-        install_hub_branch_guard(&repo, &["main", "develop"], InstallMode::CreateIfMissing).unwrap();
+        install_guard_for_commit(&repo, &["main", "develop"]);
 
         assert_git_ok(&repo, &["checkout", "-b", "develop"]);
         stage_change(&repo, "b.txt");

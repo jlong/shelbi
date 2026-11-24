@@ -10555,6 +10555,23 @@ statuses:
         require_auto_mode_supported(&Host::Local, &runner, Some("auto")).unwrap();
     }
 
+    /// A command that runs a hook script `deploy_runner_hooks` just wrote, as
+    /// `sh <script>`: the shell reads the script instead of exec'ing it.
+    ///
+    /// Exec'ing it (directly, or via `sh -c <script>`) races the parallel test
+    /// threads on Linux. Another thread that forks while the deploy's write fd
+    /// is open hands that fd to its child until the child execs, and exec(2) on
+    /// a file with a writer open fails with ETXTBSY ("Text file busy"). The
+    /// check is per inode, so nothing on the writing side short of a single-
+    /// threaded writer closes the window; reading the script has no such check.
+    /// `deploy_runner_hooks_writes_shelbi_owned_neutral_scripts_only` checks
+    /// every hook is executable, so the runner's exec path keeps its coverage.
+    fn hook_command(script: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.arg(script);
+        cmd
+    }
+
     /// Run the deployed `pane-idle.sh` (the `Stop` hook) with `payload` on
     /// stdin, the way Claude Code invokes it, and return the title it writes.
     fn run_pane_idle(payload: &str) -> String {
@@ -10569,7 +10586,7 @@ statuses:
         ));
         std::fs::create_dir_all(&tmp).unwrap();
         deploy_runner_hooks(&Host::Local, &tmp).unwrap();
-        let mut child = std::process::Command::new(tmp.join(".shelbi/hooks/pane-idle.sh"))
+        let mut child = hook_command(tmp.join(".shelbi/hooks/pane-idle.sh"))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -10769,13 +10786,11 @@ statuses:
     /// runner is never probed.
     #[test]
     fn dispatch_refuses_an_old_opencode_binary() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let fake = |name: &str, version: &str| {
             let bin = dir.path().join(name).join("opencode");
             std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-            std::fs::write(&bin, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
-            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            shelbi_state::test_support::write_executable(&bin, format!("#!/bin/sh\necho '{version}'\n"));
             AgentRunnerSpec {
                 command: bin.to_string_lossy().into_owned(),
                 flags: vec![],
@@ -10844,15 +10859,19 @@ statuses:
         assert!(stop_body.contains("message-ack"));
         assert!(stop_body.contains("$SHELBI_HUB_SOCK"));
 
+        // Every hook is executable: the runner execs it by path. The tests that
+        // run the hooks read them through `sh` instead (see `hook_command`), so
+        // this is the check that covers the exec bit.
         #[cfg(unix)]
-        {
+        for file in RUNNER_HOOK_FILES.iter().filter(|f| f.executable) {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&start)
+            let path = worktree.join(file.rel_path);
+            let mode = std::fs::metadata(&path)
                 .unwrap()
                 .permissions()
                 .mode()
                 & 0o777;
-            assert_eq!(mode, 0o755);
+            assert_eq!(mode, 0o755, "{} must be executable", path.display());
         }
 
         assert!(
@@ -10878,9 +10897,7 @@ statuses:
         deploy_runner_hooks(&Host::Local, &worktree).unwrap();
 
         let script = ".shelbi/hooks/session-start.sh";
-        let missing = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
+        let missing = hook_command(script)
             .env_remove("TASK_ID")
             .current_dir(&worktree)
             .output()
@@ -10892,9 +10909,7 @@ statuses:
         );
         assert!(worktree.join(".shelbi/messages/.no-task-id.log").is_file());
 
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(script)
+        let out = hook_command(script)
             .env("TASK_ID", "feat-x")
             .current_dir(&worktree)
             .output()
@@ -10931,9 +10946,7 @@ statuses:
         }
 
         fn hook(&self, script: &str) -> std::process::Output {
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(script)
+            let out = hook_command(script)
                 .env("TASK_ID", "feat-x")
                 .env("PROJECT", "demoproj")
                 .env_remove("SHELBI_HUB_ADDR")
@@ -11013,9 +11026,7 @@ statuses:
         let drain_acked = |msg_id: &str| {
             let listener = UnixListener::bind(&sock).unwrap();
             let acks = std::thread::spawn(move || collect_acks(listener, 1));
-            let out = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(".shelbi/hooks/stop.sh")
+            let out = hook_command(".shelbi/hooks/stop.sh")
                 .env("TASK_ID", "feat-x")
                 .env("PROJECT", "demoproj")
                 .env("SHELBI_HUB_ADDR", format!("unix:{}", sock.display()))
@@ -11162,7 +11173,7 @@ statuses:
         let wt = HookedWorktree::new("beacon-session");
         let mut session = std::process::Command::new("perl")
             .arg("-e")
-            .arg(r#"system("sh", "-c", ".shelbi/hooks/session-start.sh"); sleep 60"#)
+            .arg(r#"system("sh", ".shelbi/hooks/session-start.sh"); sleep 60"#)
             .env("TASK_ID", "feat-x")
             .current_dir(&wt.worktree)
             .stdin(std::process::Stdio::null())
@@ -11297,9 +11308,7 @@ statuses:
             received
         });
 
-        let out = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(".shelbi/hooks/stop.sh")
+        let out = hook_command(".shelbi/hooks/stop.sh")
             .env("TASK_ID", "feat-x")
             .env("PROJECT", "demoproj")
             .env("SHELBI_HUB_ADDR", format!("unix:{}", sock.display()))
