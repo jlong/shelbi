@@ -278,6 +278,9 @@ fn main() {
             theme::motion::sync_reduce_motion(cx);
             assets::load_fonts(cx);
             elements::terminal::TerminalSettings::init(cx);
+            // The active Omarchy theme and font, followed live (nothing off
+            // Omarchy).
+            theme::omarchy::follow(cx);
             // System Settings' "Show scroll bars", which the terminals'
             // scrollbar follows (read now and on every change).
             elements::terminal::scrollbar::SystemScrollbars::follow(cx);

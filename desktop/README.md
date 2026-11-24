@@ -187,6 +187,9 @@ from the Mac sits behind `src/platform/os/` (`linux.rs`):
 - The Editor and Diff tool pickers list desktop apps (VS Code, Zed, Sublime,
   the JetBrains IDEs, Meld, Sublime Merge...) by their desktop entries, with
   their icons from the icon theme.
+- On Omarchy, with `theme: auto`, the colors come from the active Omarchy
+  theme and the terminal font from Omarchy's monospace font, both followed
+  live (`src/theme/omarchy.rs`; `docs/theme.md` has the mapping).
 
 `.github/workflows/desktop-linux-ci.yml` builds, lints and tests `desktop/`
 on Linux for every pull request that touches it or the shared crates.

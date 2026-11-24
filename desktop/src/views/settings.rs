@@ -1885,7 +1885,7 @@ impl Render for SettingsView {
                         .child(motion::origin_probe(&self.theme_track))
                         .children(theme_chip.map(floating))
                         .children(THEMES.map(|t| chip(theme_label(t), t, current, cx))),
-                    Some("Shared with the TUI, which picks it up when it starts or opens Settings.".into()),
+                    Some(theme_helper(theme.follows_omarchy().then(crate::theme::omarchy::current_name).flatten()).into()),
                     &theme,
                 ))
                 .child(controls::labeled_control(
@@ -2348,6 +2348,17 @@ pub fn page_selector(page: SettingsPage) -> &'static str {
         SettingsPage::Workspaces => "settings-page-workspaces",
         SettingsPage::Orchestrator => "settings-page-orchestrator",
         SettingsPage::Properties => "settings-page-properties",
+    }
+}
+
+/// The Theme row's helper: on Omarchy, `Auto` paints from the active
+/// Omarchy theme (named when known), and says so.
+fn theme_helper(omarchy: Option<String>) -> String {
+    let shared = "Shared with the TUI, which picks it up when it starts or opens Settings.";
+    match omarchy {
+        Some(name) if !name.is_empty() => format!("Auto follows the Omarchy theme ({name}). {shared}"),
+        Some(_) => format!("Auto follows the Omarchy theme. {shared}"),
+        None => shared.to_string(),
     }
 }
 
