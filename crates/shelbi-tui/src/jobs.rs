@@ -415,7 +415,7 @@ mod tests {
     }
 
     fn running(jobs: Vec<Job>) -> JobsRead {
-        JobsRead::Jobs { running: jobs, finished: vec![] }
+        JobsRead::Jobs { running: jobs, finished: vec![], tails: Default::default() }
     }
 
     fn record(id: &str, label: &str, status: JobStatus, exit: Option<i32>, finished: DateTime<Utc>) -> JobRecord {
@@ -490,6 +490,7 @@ mod tests {
         page.apply(JobsRead::Jobs {
             running: vec![job("j5", JobKind::Pid, "1", None, at(14, 9))],
             finished: vec![record("j4", "x", JobStatus::Ok, Some(0), at(14, 9))],
+            tails: Default::default(),
         });
         assert_eq!(page.selected_row().unwrap().id, "j4");
     }
@@ -503,6 +504,7 @@ mod tests {
                 record("j7", "desktop tests", JobStatus::Failed, Some(3), at(14, 0)),
                 record("j8", "site build", JobStatus::Ok, Some(0), at(14, 5)),
             ],
+            tails: Default::default(),
         });
         let mut term = Terminal::new(TestBackend::new(120, 16)).unwrap();
         term.draw(|f| render_full(f, &mut page, f.area(), at(14, 10), true)).unwrap();
@@ -545,6 +547,7 @@ mod tests {
             // At 14:10: 5m into 10m, and 40m into 30m.
             running: vec![estimated("j3", "half way", at(14, 5), 10), estimated("j2", "running late", at(13, 30), 30)],
             finished: vec![done],
+            tails: Default::default(),
         });
         let mut term = Terminal::new(TestBackend::new(130, 16)).unwrap();
         term.draw(|f| render_full(f, &mut page, f.area(), at(14, 10), true)).unwrap();
@@ -600,6 +603,7 @@ mod tests {
         page.apply(JobsRead::Jobs {
             running: vec![],
             finished: vec![record("j4", "desktop tests", JobStatus::Ok, Some(0), at(14, 9))],
+            tails: Default::default(),
         });
         page.open_sheet(project);
         loaded(&mut page);
@@ -639,6 +643,7 @@ mod tests {
                 record("j4", "desktop tests", JobStatus::Ok, Some(0), at(14, 9)),
                 record("j3", "site build", JobStatus::Ok, Some(0), at(14, 1)),
             ],
+            tails: Default::default(),
         });
         // Closed, moving selects and opens nothing.
         page.follow_selection(project);

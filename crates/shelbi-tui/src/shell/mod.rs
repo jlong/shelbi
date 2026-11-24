@@ -8105,7 +8105,7 @@ mod tests {
             board: None,
             activity: None,
             machines: None,
-            jobs: Some(JobsRead::Jobs { running: jobs, finished: vec![] }),
+            jobs: Some(JobsRead::Jobs { running: jobs, finished: vec![], tails: Default::default() }),
             reminders: None,
         };
         let job = Job {

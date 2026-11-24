@@ -394,6 +394,9 @@ heroicons! {
     SIGNAL_SLASH = "signal-slash";
     ARROW_DOWN_CIRCLE = "arrow-down-circle";
     COMMAND_LINE = "command-line";
+    /// The Jobs screen's nav icon and palette entry (background jobs, a
+    /// queue of them), and its empty state.
+    QUEUE_LIST = "queue-list";
     /// The Reminders screen's palette entry.
     CLOCK = "clock";
     FOLDER = "folder";
