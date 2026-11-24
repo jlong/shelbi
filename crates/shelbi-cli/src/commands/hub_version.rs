@@ -21,7 +21,6 @@
 //! - No daemon listening at all is *not* a mismatch: the CLI's file
 //!   fallbacks handle that case and always have.
 
-use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -107,7 +106,7 @@ fn restart_offer_accepted(daemon: &str) -> Result<bool> {
         eprintln!("hub daemon is {daemon}, CLI is {CLI_VERSION} — restarting the daemon (--yes)");
         return Ok(true);
     }
-    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+    if !super::can_prompt() {
         return Ok(false);
     }
     inquire::Confirm::new(&format!(
@@ -121,6 +120,13 @@ fn restart_offer_accepted(daemon: &str) -> Result<bool> {
 /// Run `shelbi daemon restart` and wait for the relaunched daemon to
 /// come back speaking this CLI's version.
 fn restart_daemon_and_verify() -> Result<()> {
+    // A test must never restart a daemon: the gate's tests fake a mismatched
+    // daemon on a throwaway socket, and a restart from there (`--yes` in the
+    // environment, or a prompt answered at a developer's terminal) would run
+    // `shelbi daemon restart` for real.
+    if cfg!(test) {
+        panic!("a test reached `shelbi daemon restart` through the hub version gate");
+    }
     super::daemon::run(Some(super::daemon::DaemonCmd::Restart))
         .context("restarting the hub daemon")?;
     let deadline = Instant::now() + RESTART_VERIFY_TIMEOUT;
@@ -325,6 +331,25 @@ mod tests {
         );
         ensure_daemon_matches_for_mutation().expect("matching daemon → proceed");
         let _ = std::fs::remove_file(&sock);
+    }
+
+    /// The restart offer never prompts inside the test binary, even when
+    /// `cargo test` runs at a real terminal (a developer's shell, a Shelbi
+    /// job's PTY). It used to: the prompt waited for an answer under
+    /// `ENV_LOCK` and hung every test behind the lock.
+    #[test]
+    fn the_restart_offer_never_prompts_in_a_test_binary() {
+        let _l = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let env = EnvGuard::new(&[ASSUME_YES_ENV]);
+        env.remove(ASSUME_YES_ENV);
+        assert!(!crate::commands::can_prompt());
+        assert!(!restart_offer_accepted("0.1.0").unwrap());
+    }
+
+    #[test]
+    #[should_panic(expected = "a test reached `shelbi daemon restart`")]
+    fn a_test_can_never_restart_the_daemon() {
+        let _ = restart_daemon_and_verify();
     }
 
     #[test]

@@ -51,6 +51,33 @@ use std::path::Path;
 
 use anyhow::{anyhow, Result};
 
+/// Whether stdin is a terminal a person could answer a prompt on.
+///
+/// Never true inside this crate's test binary: `cargo test` run from a
+/// developer's terminal (or a Shelbi job, which runs in a PTY) inherits a
+/// real TTY on fd 0/2, so a prompt gated only on `is_terminal()` would sit
+/// waiting for an answer nobody gives, holding whatever lock the test took.
+/// On 2026-11-24 that wedged `cargo test -p shelbi` on the hub Mac: the hub
+/// version gate's "Restart the daemon now?" prompt hung under `ENV_LOCK`
+/// and every test behind that lock reported "running for over 60 seconds".
+/// CI has no TTY, so it never showed there.
+///
+/// Use this (or [`can_prompt`]) to decide whether to *prompt*. Code that
+/// decides whether to *read piped stdin* must keep its own `is_terminal()`
+/// check: under a test it would otherwise block reading the terminal.
+pub(crate) fn stdin_is_interactive() -> bool {
+    use std::io::IsTerminal;
+    !cfg!(test) && std::io::stdin().is_terminal()
+}
+
+/// Whether an `inquire` prompt can run: stdin is interactive (see
+/// [`stdin_is_interactive`]) and stderr, where the prompt draws, is a
+/// terminal too.
+pub(crate) fn can_prompt() -> bool {
+    use std::io::IsTerminal;
+    stdin_is_interactive() && std::io::stderr().is_terminal()
+}
+
 /// Resolve the active project name. Precedence:
 ///
 /// 1. The `--project` / `$SHELBI_PROJECT` value passed in.

@@ -184,10 +184,9 @@ pub struct TeamListArgs {
 }
 
 pub fn run(project_opt: Option<String>, cmd: TrackerCmd, assume_yes: bool) -> Result<()> {
-    use std::io::IsTerminal;
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    let interactive = !assume_yes && std::io::stdin().is_terminal();
+    let interactive = !assume_yes && super::stdin_is_interactive();
     match cmd {
         TrackerCmd::Linear { cmd } => {
             let stdin = std::io::stdin();
@@ -356,8 +355,7 @@ fn login(key_stdin: bool, input: &mut dyn BufRead, out: &mut dyn Write) -> Resul
         input.read_to_string(&mut raw).context("reading the key from stdin")?;
         raw
     } else {
-        use std::io::IsTerminal;
-        if !std::io::stdin().is_terminal() {
+        if !super::stdin_is_interactive() {
             bail!("stdin is not a terminal; pipe the key in with `shelbi tracker linear login --key-stdin`");
         }
         inquire::Password::new("Linear personal API key:")

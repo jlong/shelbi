@@ -184,7 +184,7 @@ fn maybe_offer_gitignore(plan: &MigrationPlan, dry_run: bool, yes: bool) -> Resu
     if dry_run {
         return Ok(());
     }
-    let is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+    let is_tty = super::stdin_is_interactive();
     let should_append = if yes {
         true
     } else if !is_tty {
