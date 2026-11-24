@@ -25,7 +25,11 @@
 //!   project's pin, else the preferred one, else Claude Code, as dispatch
 //!   resolves it). Use runner default is no key. A model is free text (a
 //!   custom name is passed to the runner as typed); a generic runner takes
-//!   neither.
+//!   neither. OpenCode's models are what `opencode models` lists
+//!   ([`crate::opencode_models`]), and its efforts only those the model in
+//!   effect reports a same-named variant for (decision Q4): with none, the
+//!   Reasoning effort picker is hidden ([`AgentEditorState::effort_shown`]).
+//!   Choosing a model that lacks the effort set drops the effort.
 //! - **Permissions** is `permissions_mode:`; Use project settings is no key.
 //! - **Skills** are `skills/<name>/SKILL.md` (Add skill writes one with
 //!   `name:` and `description:` frontmatter, or copies an existing skill
@@ -507,10 +511,11 @@ impl AgentEditorState {
     }
 
     /// The Model picker's choices after Use runner default: the runner's
-    /// suggestions, and the draft's own model when it isn't one of them.
+    /// suggestions (OpenCode's listed models), and the draft's own model
+    /// when it isn't one of them.
     pub fn models(&self) -> Vec<String> {
         let runner = self.runner();
-        let mut models: Vec<String> = shelbi_core::model_suggestions(runner).iter().map(|m| m.to_string()).collect();
+        let mut models = crate::harness_picker::suggested_models(runner);
         if let Some(own) = self.model() {
             if !models.iter().any(|m| m == own) {
                 models.push(own.to_string());
@@ -523,8 +528,25 @@ impl AgentEditorState {
         self.agent().model(self.runner())
     }
 
-    pub fn efforts(&self) -> &'static [ReasoningEffort] {
-        shelbi_core::reasoning_efforts(self.runner())
+    /// The efforts the agent's runner takes: Claude's and Codex's whole
+    /// scale; on OpenCode, the ones the model in effect reports a variant
+    /// for (none until the probe answers, or for no model).
+    pub fn efforts(&self) -> Vec<ReasoningEffort> {
+        let runner = self.runner();
+        if runner == RunnerKind::OpenCode {
+            let model = self.model_in_effect().map(|(m, _)| m);
+            return crate::opencode_models::catalog().efforts(model.as_deref());
+        }
+        shelbi_core::reasoning_efforts(runner).to_vec()
+    }
+
+    /// Whether the Reasoning effort picker shows. It's hidden only on a
+    /// runner that takes options but has no effort to offer: OpenCode with
+    /// no model, or one reporting no matching variant (decision Q4), unless
+    /// an effort is already set (so it can be cleared). A generic runner's
+    /// shows, dimmed, saying why ([`Self::options_blocked`]).
+    pub fn effort_shown(&self) -> bool {
+        !self.runner_takes_options() || !self.efforts().is_empty() || self.effort().is_some()
     }
 
     pub fn effort(&self) -> Option<ReasoningEffort> {
@@ -533,7 +555,7 @@ impl AgentEditorState {
 
     /// The runner takes a model and an effort Shelbi can set (not generic).
     pub fn runner_takes_options(&self) -> bool {
-        !shelbi_core::model_suggestions(self.runner()).is_empty()
+        shelbi_core::takes_model(self.runner())
     }
 
     /// Why Model and Reasoning effort can't be set: the runner takes
@@ -607,7 +629,12 @@ impl AgentEditorState {
             change: Change::Effort(None),
             current: effort.is_none(),
         }];
-        out.extend(self.efforts().iter().map(|&e| Choice {
+        let mut efforts = self.efforts();
+        // One already set that the model doesn't offer stays, to clear.
+        if let Some(own) = effort.filter(|e| !efforts.contains(e)) {
+            efforts.push(own);
+        }
+        out.extend(efforts.into_iter().map(|e| Choice {
             key: e.as_str().into(),
             label: effort_label(e).into(),
             change: Change::Effort(Some(e)),
@@ -707,6 +734,22 @@ impl AgentEditorState {
             Some((e, _)) => format!("{runner} runs at {} effort.", effort_label(e)),
             None => format!("{runner} runs at its own default effort."),
         }
+    }
+
+    /// What Shelbi adds to the agent's runner, under Runner preferences:
+    /// for OpenCode, how it's launched and every file and environment
+    /// variable Shelbi sets, then, when no permission ceiling applies, that
+    /// OpenCode's own default allows edits and shell commands (decision Q2).
+    /// Empty for every other runner.
+    pub fn runner_disclosure(&self) -> Vec<String> {
+        if self.runner() != RunnerKind::OpenCode {
+            return Vec::new();
+        }
+        let mut lines: Vec<String> = shelbi_core::OPENCODE_DISCLOSURE.iter().map(|l| l.to_string()).collect();
+        if self.permissions_in_effect().is_none() {
+            lines.push(shelbi_core::OPENCODE_NO_CEILING_NOTE.to_string());
+        }
+        lines
     }
 
     /// Permissions' line on what applies.
@@ -832,7 +875,23 @@ impl AgentEditorState {
             Change::Description(text) => c.set_description(a, Some(text)),
             Change::Instructions(text) => c.set_instructions(a, text),
             Change::PreferredRunner(r) => c.set_preferred_runner(a, *r),
-            Change::Model(m) => c.set_model(a, runner, m.as_deref()),
+            Change::Model(m) => {
+                let made = c.set_model(a, runner, m.as_deref());
+                // On OpenCode an effort is the model's variant: a model
+                // that doesn't report it drops it. The project's model, when
+                // it sets one, is the one that runs, so it decides instead.
+                match made {
+                    Ok(next) if runner == RunnerKind::OpenCode && self.draft.project_model(runner).is_none() => {
+                        let catalog = crate::opencode_models::catalog();
+                        let keeps = |e| catalog.efforts(m.as_deref()).contains(&e);
+                        match next.agent(a).and_then(|agent| agent.reasoning_effort(runner)) {
+                            Some(e) if catalog.settled() && !keeps(e) => next.set_reasoning_effort(a, runner, None),
+                            _ => Ok(next),
+                        }
+                    }
+                    other => other,
+                }
+            }
             Change::Effort(e) => c.set_reasoning_effort(a, runner, *e),
             Change::Permissions(m) => c.set_permissions_mode(a, m.as_deref()),
             Change::AddSkill { name, description, body } => c.add_skill(a, name.trim(), description, body),

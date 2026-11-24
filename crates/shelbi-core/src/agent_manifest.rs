@@ -241,18 +241,27 @@ pub const PERMISSION_MODES: &[&str] = &[
 
 /// The [`ReasoningEffort`] levels `kind` can take, lowest first. Claude and
 /// Codex take the whole scale (the adapter maps `max` to Codex's `xhigh`).
-/// OpenCode keeps its reasoning variant in its own TUI state, and a generic
-/// runner has no effort knob, so neither has one Shelbi can drive.
+/// OpenCode takes any of them as the model's same-named variant, but only
+/// where the chosen model reports that variant
+/// ([`crate::efforts_for_variants`]), so its pickers narrow this to the
+/// model's. A generic runner has no effort knob.
 pub fn reasoning_efforts(kind: RunnerKind) -> &'static [ReasoningEffort] {
     match kind {
-        RunnerKind::Claude | RunnerKind::Codex => &[
+        RunnerKind::Claude | RunnerKind::Codex | RunnerKind::OpenCode => &[
             ReasoningEffort::Low,
             ReasoningEffort::Medium,
             ReasoningEffort::High,
             ReasoningEffort::Max,
         ],
-        RunnerKind::OpenCode | RunnerKind::Generic => &[],
+        RunnerKind::Generic => &[],
     }
+}
+
+/// `kind` takes a model Shelbi can set: every runner but a generic one.
+/// OpenCode's `provider/model` ids depend on the user's providers, so it
+/// takes one with no fixed [`model_suggestions`].
+pub fn takes_model(kind: RunnerKind) -> bool {
+    !matches!(kind, RunnerKind::Generic)
 }
 
 /// Suggested `runners.<kind>.model` values for a settings picker. A model is
@@ -696,6 +705,8 @@ workspaces: []
         assert!(!model_suggestions(RunnerKind::Codex).is_empty());
         assert!(model_suggestions(RunnerKind::Generic).is_empty());
         assert_eq!(reasoning_efforts(RunnerKind::Codex).len(), 4);
+        assert_eq!(reasoning_efforts(RunnerKind::OpenCode).len(), 4);
+        assert!(takes_model(RunnerKind::OpenCode) && !takes_model(RunnerKind::Generic));
         assert!(reasoning_efforts(RunnerKind::Generic).is_empty());
     }
 

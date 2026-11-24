@@ -3558,6 +3558,54 @@ fn runner_pickers_write_their_keys_and_the_defaults_remove_them(cx: &mut TestApp
     assert!(!s.drawn("agent-model-menu"), "no model for a generic runner");
 }
 
+/// OpenCode (`opencode-ui-detection`): Model lists what OpenCode reports
+/// and ends with Custom model…, Reasoning effort offers the chosen model's
+/// variants and is gone without any, and the page discloses what Shelbi
+/// adds and OpenCode's allow-all default.
+#[gpui::test]
+fn opencode_models_efforts_and_disclosure(cx: &mut TestAppContext) {
+    let _home = crate::views::agents_state::tests::home_for("ad-opencode", "alpha");
+    shelbi_app::opencode_models::set_for_this_thread(Some(shelbi_app::opencode_models::listed(&[
+        ("opencode/deepseek-v4.1-flash-free", &["low", "high", "max"]),
+        ("opencode/big-pickle", &[]),
+    ])));
+    let mut s = Settings::open_agent(cx, "developer");
+    assert!(!s.drawn("agent-runner-disclosure"), "Claude Code has none");
+    s.click("agent-runner");
+    s.click("agent-runner-opencode");
+    assert!(!s.drawn("agent-effort"), "no model chosen: no variants, no effort");
+    for i in 0..shelbi_core::OPENCODE_DISCLOSURE.len() + 1 {
+        let selector: &'static str = Box::leak(format!("agent-runner-disclosure-{i}").into_boxed_str());
+        assert!(s.drawn(selector), "{selector}");
+    }
+
+    s.click("agent-model");
+    assert!(s.drawn("agent-model-opencode/big-pickle") && s.drawn("agent-model-custom"));
+    s.click("agent-model-opencode/deepseek-v4.1-flash-free");
+    assert!(s.drawn("agent-effort"));
+    s.click("agent-effort");
+    assert!(s.drawn("agent-effort-low") && s.drawn("agent-effort-max") && !s.drawn("agent-effort-medium"));
+    s.click("agent-effort-max");
+    s.click("agent-model");
+    s.click("agent-model-opencode/big-pickle");
+    assert!(!s.drawn("agent-effort"), "a model without variants hides it");
+
+    // Custom model…: typed under the picker, set by Return.
+    s.click("agent-model");
+    s.click("agent-model-custom");
+    let field = s.with_agent_editor(|e, _| e.custom_model_field()).expect("the field opened");
+    assert!(s.drawn("agent-custom-model"));
+    s.type_into(field, "anthropic/claude-sonnet-5-5");
+    s.key("enter");
+    assert!(!s.drawn("agent-custom-model"));
+    s.click("agent-editor-save");
+    s.saved();
+    let a = agent_on_disk("developer");
+    assert_eq!(a.model(shelbi_core::RunnerKind::OpenCode), Some("anthropic/claude-sonnet-5-5"));
+    assert_eq!(a.reasoning_effort(shelbi_core::RunnerKind::OpenCode), None, "big-pickle dropped max");
+    shelbi_app::opencode_models::set_for_this_thread(None);
+}
+
 #[gpui::test]
 fn leaving_the_agent_editor_with_edits_asks_first(cx: &mut TestAppContext) {
     let _home = crate::views::agents_state::tests::home_for("ad-leave", "alpha");

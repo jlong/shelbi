@@ -744,3 +744,87 @@ fn instructions_wrap_long_lines_and_move_by_wrapped_row() {
     assert_eq!(ed.instructions.wrapped(&wrap).1 .0, caret_row - 1);
     assert!(ed.instructions.text().ends_with(long.trim_end()), "no newline added");
 }
+
+/// OpenCode: the Model list is what OpenCode reports, Reasoning effort
+/// offers only the chosen model's variants (and is gone without any), and
+/// the page discloses what Shelbi adds and OpenCode's allow-all default.
+#[test]
+fn opencode_lists_its_models_hides_effort_without_variants_and_discloses() {
+    let _home = home("opencode");
+    shelbi_app::opencode_models::set_for_this_thread(Some(shelbi_app::opencode_models::listed(&[
+        ("opencode/deepseek-v4.1-flash-free", &["low", "high", "max"]),
+        ("opencode/big-pickle", &[]),
+    ])));
+    let mut ed = editor("developer");
+    go(&mut ed, Item::Runner);
+    press(&mut ed, key(KeyCode::Enter));
+    pick(&mut ed, "OpenCode");
+    // No model chosen: no variants, so no effort row.
+    assert!(!ed.items().contains(&Item::Effort));
+    let text = page_text(&mut ed);
+    assert!(!text.contains("Reasoning effort"), "{text}");
+    assert!(text.contains("private server per pane"), "{text}");
+    assert!(text.contains(".shelbi/opencode/"), "{text}");
+    assert!(text.contains("OpenCode's own default allows edits and shell commands."), "{text}");
+
+    go(&mut ed, Item::Model);
+    press(&mut ed, key(KeyCode::Enter));
+    let labels: Vec<String> = entries(&ed).into_iter().map(|e| e.label).collect();
+    assert_eq!(
+        labels,
+        ["Use runner default", "opencode/deepseek-v4.1-flash-free", "opencode/big-pickle", "Custom model…"]
+    );
+    pick(&mut ed, "opencode/deepseek-v4.1-flash-free");
+    assert!(ed.items().contains(&Item::Effort));
+    go(&mut ed, Item::Effort);
+    press(&mut ed, key(KeyCode::Enter));
+    let labels: Vec<String> = entries(&ed).into_iter().map(|e| e.label).collect();
+    assert_eq!(labels, ["Use runner default", "Low", "High", "Max"]);
+    pick(&mut ed, "Max");
+    save(&mut ed);
+    assert_eq!(on_disk("developer").reasoning_effort(RunnerKind::OpenCode), Some(ReasoningEffort::Max));
+    shelbi_app::opencode_models::set_for_this_thread(None);
+}
+
+/// OpenCode's Model list, its Reasoning effort list and the page with the
+/// disclosure read in light (and, with `SHELBI_THEME_DUMP=<dir>`, are
+/// written as `<dir>/opencode-*-{light,dark}.html` for the screenshots).
+#[test]
+fn opencode_pickers_and_notes_read_in_both_themes() {
+    use shelbi_app::theme::Appearance;
+    let _home = home("opencode-light");
+    shelbi_app::opencode_models::set_for_this_thread(Some(shelbi_app::opencode_models::listed(&[
+        ("anthropic/claude-sonnet-5-5", &["low", "medium", "high", "max"]),
+        ("opencode/big-pickle", &[]),
+        ("opencode/deepseek-v4.1-flash-free", &["low", "high", "max"]),
+        ("openai/gpt-5.5", &["minimal", "low", "medium", "high", "xhigh"]),
+    ])));
+    let dump = std::env::var("SHELBI_THEME_DUMP").ok().map(std::path::PathBuf::from);
+    let shoot = |ed: &mut AgentEditorPage, name: &str| {
+        let buf = crate::theme::with_appearance(Appearance::Light, || render_buf(ed, 120, 48));
+        crate::theme::assert_light_readable(&format!("{name}-light"), &buf);
+        if let Some(dir) = &dump {
+            let buf = crate::theme::with_appearance(Appearance::Dark, || render_buf(ed, 120, 48));
+            crate::theme::dump_dark_html(dir, &format!("{name}-dark"), &buf);
+        }
+    };
+    let mut ed = editor("developer");
+    go(&mut ed, Item::Runner);
+    press(&mut ed, key(KeyCode::Enter));
+    pick(&mut ed, "OpenCode");
+    go(&mut ed, Item::Model);
+    press(&mut ed, key(KeyCode::Enter));
+    shoot(&mut ed, "opencode-models");
+    pick(&mut ed, "opencode/deepseek-v4.1-flash-free");
+    go(&mut ed, Item::Effort);
+    press(&mut ed, key(KeyCode::Enter));
+    shoot(&mut ed, "opencode-effort");
+    press(&mut ed, key(KeyCode::Esc));
+    go(&mut ed, Item::Model);
+    press(&mut ed, key(KeyCode::Enter));
+    pick(&mut ed, "opencode/big-pickle");
+    // The row after Permissions, so the notes under it are in view.
+    go(&mut ed, Item::Assignment(0));
+    shoot(&mut ed, "opencode-disclosure");
+    shelbi_app::opencode_models::set_for_this_thread(None);
+}

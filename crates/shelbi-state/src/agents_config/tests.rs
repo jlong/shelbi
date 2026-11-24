@@ -821,6 +821,11 @@ fn runner_settings_are_validated() {
         "generic runners take no reasoning effort Shelbi can set"
     );
     cfg.set_model("qa", RunnerKind::Generic, None).unwrap();
+    // OpenCode takes a `provider/model` id and an effort (its variant).
+    cfg.set_model("qa", RunnerKind::OpenCode, Some("opencode/big-pickle"))
+        .unwrap()
+        .set_reasoning_effort("qa", RunnerKind::OpenCode, Some(ReasoningEffort::High))
+        .unwrap();
     assert_eq!(
         cfg.set_permissions_mode("qa", Some("yolo")).unwrap_err(),
         AgentError::UnknownPermissionMode("yolo".into())
@@ -856,9 +861,11 @@ fn picker_options_cover_every_runner() {
     );
     assert_eq!(options[0].models, &["opus", "sonnet", "haiku"]);
     assert_eq!(options[0].efforts.len(), 4);
-    // OpenCode's model ids depend on the user's providers, and its effort
-    // isn't Shelbi's to set.
-    assert!(options[2].models.is_empty() && options[2].efforts.is_empty());
+    // OpenCode's model ids depend on the user's providers (the pickers list
+    // what `opencode models` reports), and it takes the whole effort scale,
+    // narrowed in the pickers to the chosen model's variants.
+    assert!(options[2].models.is_empty());
+    assert_eq!(options[2].efforts.len(), 4);
     assert!(options[3].models.is_empty() && options[3].efforts.is_empty());
     for mode in PERMISSION_MODES {
         assert!(shelbi_core::is_known_permission_mode(mode), "{mode}");

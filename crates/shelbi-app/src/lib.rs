@@ -106,6 +106,7 @@ pub mod markdown_edit;
 pub mod nav;
 pub mod new_project;
 pub mod onboarding;
+pub mod opencode_models;
 pub mod overlay;
 pub mod prereqs;
 pub mod reachability;

@@ -8,17 +8,82 @@
 //! 2720:33054). The view that hosts them keeps which menu is open and hands
 //! in what a choice does.
 
-use gpui::{div, prelude::*, px, ClickEvent, Context, Div, SharedString, Stateful};
+use gpui::{div, prelude::*, px, AnyElement, ClickEvent, Context, Div, Entity, SharedString, Stateful, Subscription, Window};
+use gpui_kit::component::input::{InputEvent, InputState};
+use shelbi_app::harness_picker::CUSTOM_MODEL;
 use shelbi_app::onboarding::LOADING;
 use shelbi_app::view::{HarnessOption, ModelOption};
 use shelbi_core::RunnerKind;
 
-use super::workflow_editor::{dropdown, footnote, menu_item};
+use super::workflow_editor::{dropdown, footnote, menu_item, text_field};
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
 /// A picker's height (the frames' 36pt Claude Code / Opus buttons).
 pub const PICKER_H: f32 = 36.0;
+
+/// A Model picker's "Custom model…": a field under the picker, focused,
+/// holding the name being typed; Return hands it to `commit` (blank is the
+/// runner's default). Its host keeps it while it's open, drops it to close.
+pub struct CustomModel {
+    input: Entity<InputState>,
+    _sub: Subscription,
+}
+
+impl CustomModel {
+    pub fn open<V: 'static>(
+        current: Option<&str>,
+        commit: fn(&mut V, Option<String>, &mut Window, &mut Context<V>),
+        window: &mut Window,
+        cx: &mut Context<V>,
+    ) -> Self {
+        let input = cx.new(|cx| InputState::new(window, cx));
+        let current = current.unwrap_or("").to_string();
+        input.update(cx, |s, cx| {
+            s.set_value(current, window, cx);
+            s.focus(window, cx);
+        });
+        let sub = cx.subscribe_in(&input, window, move |this: &mut V, input, event: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { .. } = event {
+                let text = input.read(cx).value().trim().to_string();
+                commit(this, (!text.is_empty()).then_some(text), window, cx);
+            }
+        });
+        CustomModel { input, _sub: sub }
+    }
+
+    pub fn input(&self) -> &Entity<InputState> {
+        &self.input
+    }
+
+    /// The field, `selector` its test selector.
+    pub fn render(&self, selector: &'static str, window: &Window, cx: &gpui::App) -> Div {
+        text_field(&self.input, selector, Some("A model name; Return sets it".into()), false, window, cx)
+    }
+}
+
+/// While OpenCode's model list is still being read (`on_opencode`, and the
+/// probe hasn't answered), wait for it off the UI thread and redraw the
+/// view when it does. `watching` (the view's flag, through `flag`) keeps it
+/// to one wait.
+pub fn watch_opencode_models<V: 'static>(on_opencode: bool, flag: fn(&mut V) -> &mut bool, view: &mut V, cx: &mut Context<V>) {
+    if !on_opencode || *flag(view) || shelbi_app::opencode_models::catalog().settled() {
+        return;
+    }
+    *flag(view) = true;
+    let wait = cx
+        .background_executor()
+        .spawn(async { shelbi_app::opencode_models::wait(shelbi_app::opencode_models::DEADLINE * 2) });
+    cx.spawn(async move |this, cx| {
+        wait.await;
+        this.update(cx, |view, cx| {
+            *flag(view) = false;
+            cx.notify();
+        })
+        .ok();
+    })
+    .detach();
+}
 
 /// A picker that is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +121,13 @@ impl Host {
         }
     }
 
+    fn custom_model(self) -> &'static str {
+        match self {
+            Host::Onboarding => "onboarding-custom-model",
+            Host::AddProject => "add-project-custom-model",
+        }
+    }
+
     fn model_menu(self) -> &'static str {
         match self {
             Host::Onboarding => "onboarding-model-menu",
@@ -87,12 +159,17 @@ pub struct Fields<'a> {
     pub width: f32,
     /// The keyboard's focus ring on each button.
     pub ring: (bool, bool),
+    /// Default model ▸ Custom model…, while it's open: drawn under the
+    /// picker.
+    pub custom: Option<&'a CustomModel>,
 }
 
 /// What the host does when a picker is used.
 pub struct Handlers<V> {
     pub select_runner: fn(&mut V, RunnerKind, &mut Context<V>),
     pub select_model: fn(&mut V, Option<String>, &mut Context<V>),
+    /// Default model ▸ Custom model…: open the typed field.
+    pub custom_model: fn(&mut V, &mut Window, &mut Context<V>),
     pub toggle: fn(&mut V, Menu, &mut Context<V>),
     pub close: fn(&mut V, &mut Context<V>),
 }
@@ -143,9 +220,10 @@ pub fn fields<V: 'static>(
     anchor: &style::Anchor,
     on: Handlers<V>,
     theme: &Theme,
+    window: &Window,
     cx: &mut Context<V>,
 ) -> Div {
-    let Handlers { select_runner, select_model, toggle, close } = on;
+    let Handlers { select_runner, select_model, custom_model, toggle, close } = on;
     let harness = f.harnesses.iter().find(|h| h.selected);
     let (shown, provider) = match harness {
         Some(h) if !f.loading => (h.label.clone(), h.provider.clone()),
@@ -202,7 +280,7 @@ pub fn fields<V: 'static>(
             model_button,
             move |cx| {
                 let theme = *cx.global::<Theme>();
-                items
+                let mut rows: Vec<AnyElement> = items
                     .into_iter()
                     .enumerate()
                     .map(|(i, o)| {
@@ -214,7 +292,16 @@ pub fn fields<V: 'static>(
                             }))
                             .into_any_element()
                     })
-                    .collect()
+                    .collect();
+                rows.push(
+                    menu_item(format!("{}-custom", host.model()), CUSTOM_MODEL, false, &theme)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                            cx.stop_propagation();
+                            custom_model(this, window, cx);
+                        }))
+                        .into_any_element(),
+                );
+                rows
             },
             f.width,
             false,
@@ -225,6 +312,16 @@ pub fn fields<V: 'static>(
         .w_full()
     };
     let model_help: SharedString = f.model_note.clone().unwrap_or_else(|| f.help.to_string()).into();
+    let model_picker = match f.custom {
+        Some(custom) => div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .w_full()
+            .child(model_picker)
+            .child(custom.render(f.host.custom_model(), window, cx)),
+        None => model_picker,
+    };
 
     let field = |text: &'static str, picker: Div, help: SharedString| {
         div()

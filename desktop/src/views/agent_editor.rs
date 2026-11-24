@@ -36,13 +36,15 @@
 //! should it overwrite the hand edit).
 
 use std::sync::Arc;
+use super::harness_picker::{watch_opencode_models, CustomModel};
+use shelbi_app::harness_picker::CUSTOM_MODEL;
 use shelbi_app::source::{ProjectHandle, ProjectSource};
 use gpui::{
     div, prelude::*, px, AnyElement, App, ClickEvent, Context, Div, Entity, EventEmitter, Focusable,
     PathPromptOptions, ScrollHandle, SharedString, Stateful, Subscription, Window,
 };
 use gpui_kit::component::input::{Escape, InputEvent, InputState, Textarea, TextareaState};
-use shelbi_core::StatusCategory;
+use shelbi_core::{RunnerKind, StatusCategory};
 use shelbi_state::agents_config::{AgentsConfig, Provenance};
 
 use super::agent_editor_state::{
@@ -124,6 +126,12 @@ pub struct AgentEditor {
     /// Read the files again when the window is next active (Edit YAML sent
     /// the user to their editor).
     reload_on_return: bool,
+    /// Model ▸ Custom model…: the name being typed (Return sets it, Esc
+    /// puts the picker back), and its subscription.
+    custom_model: Option<CustomModel>,
+    /// Waiting off the UI thread for OpenCode's model list, to redraw the
+    /// pickers when it answers.
+    watching_models: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -182,6 +190,8 @@ impl AgentEditor {
             menu_anchor: Default::default(),
             scroll: ScrollHandle::new(),
             reload_on_return: false,
+            custom_model: None,
+            watching_models: false,
             _subscriptions: subscriptions,
         };
         match config {
@@ -285,6 +295,29 @@ impl AgentEditor {
     fn toggle_menu(&mut self, menu: Menu, cx: &mut Context<Self>) {
         self.menu = if self.menu == Some(menu) { None } else { Some(menu) };
         cx.notify();
+    }
+
+    /// Model ▸ Custom model…: a field under the picker, focused, holding
+    /// the model set now.
+    pub fn open_custom_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        let current = self.state.as_ref().and_then(|s| s.model()).map(str::to_string);
+        self.custom_model = Some(CustomModel::open(
+            current.as_deref(),
+            |this: &mut Self, model, window, cx| {
+                this.custom_model = None;
+                this.change(Change::Model(model), window, cx);
+            },
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+
+    /// The Custom model field, while it's open.
+    #[cfg(test)]
+    pub fn custom_model_field(&self) -> Option<Entity<InputState>> {
+        self.custom_model.as_ref().map(|c| c.input().clone())
     }
 
     // -----------------------------------------------------------------------
@@ -750,6 +783,8 @@ pub(super) fn markdown_area(
 impl Render for AgentEditor {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
+        let on_opencode = self.state.as_ref().is_some_and(|s| s.runner() == RunnerKind::OpenCode);
+        watch_opencode_models(on_opencode, |this: &mut Self| &mut this.watching_models, self, cx);
         let body = match self.state.as_ref() {
             None => div()
                 .flex()
@@ -779,7 +814,11 @@ impl Render for AgentEditor {
             .text_color(theme.foreground)
             // Esc anywhere in the editor, a field's included, goes Back.
             .capture_action(cx.listener(|this, _: &Escape, _, cx| {
-                this.back(cx);
+                if this.custom_model.take().is_some() {
+                    cx.notify();
+                } else {
+                    this.back(cx);
+                }
                 cx.stop_propagation();
             }))
             .child(self.render_titlebar(&theme, cx))
@@ -1036,7 +1075,7 @@ impl AgentEditor {
                                     .flex_none()
                                     .w(px(SIDE_W))
                                     .gap(px(GAP))
-                                    .child(self.render_runner(theme, cx))
+                                    .child(self.render_runner(theme, window, cx))
                                     .child(rule(theme))
                                     .child(self.render_assignments(theme, cx)),
                             ),
@@ -1283,7 +1322,7 @@ impl AgentEditor {
     }
 
     /// Runner preferences: the four pickers and the footnote.
-    fn render_runner(&self, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    fn render_runner(&self, theme: &Theme, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let state = self.state.as_ref().expect("loaded");
         let agent = state.agent();
         // The shared choices: (key, label, the change, selected).
@@ -1301,6 +1340,7 @@ impl AgentEditor {
             current(&runners, agent.preferred_runner().map_or("Project default", runner_label).to_string()),
             items(runners),
             None,
+            false,
             theme,
             cx,
         );
@@ -1312,6 +1352,7 @@ impl AgentEditor {
             current(&models, state.model().unwrap_or("Use runner default").to_string()),
             items(models),
             blocked.clone(),
+            true,
             theme,
             cx,
         );
@@ -1322,6 +1363,7 @@ impl AgentEditor {
             current(&efforts, "Use runner default".into()),
             items(efforts),
             blocked,
+            false,
             theme,
             cx,
         );
@@ -1332,6 +1374,7 @@ impl AgentEditor {
             current(&modes, "Use project settings".into()),
             items(modes),
             None,
+            false,
             theme,
             cx,
         );
@@ -1341,6 +1384,19 @@ impl AgentEditor {
                 .w_full()
                 .children(state.error_at(&field).map(|e| error_line(selector.into(), e, theme)))
         };
+        // Model ▸ Custom model…: the name typed under the picker.
+        let model_picker = match &self.custom_model {
+            Some(custom) => div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .w_full()
+                .child(model_picker)
+                .child(custom.render("agent-custom-model", window, cx)),
+            None => model_picker,
+        };
+        // What Shelbi adds to an OpenCode agent, and its allow-all default.
+        let disclosure = state.runner_disclosure();
         div()
             .flex()
             .flex_col()
@@ -1350,13 +1406,30 @@ impl AgentEditor {
             .child(footnote("Choose the runner and defaults recommended for this role.", theme))
             .child(field("Preferred runner", runner_picker, Field::Runner, "agent-runner-error"))
             .child(field("Model", model_picker, Field::Model, "agent-model-error"))
-            .child(field("Reasoning effort", effort_picker, Field::Effort, "agent-effort-error"))
+            // OpenCode offers only the efforts its model reports: none, no picker.
+            .when(state.effort_shown(), |d| {
+                d.child(field("Reasoning effort", effort_picker, Field::Effort, "agent-effort-error"))
+            })
             .child(field("Permissions", permissions_picker, Field::Permissions, "agent-permissions-error"))
             .child(footnote(note, theme).debug_selector(|| "agent-runner-note".into()))
+            .when(!disclosure.is_empty(), |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "agent-runner-disclosure".into())
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .w_full()
+                        .children(disclosure.into_iter().enumerate().map(|(i, line)| {
+                            footnote(line, theme).debug_selector(move || format!("agent-runner-disclosure-{i}"))
+                        })),
+                )
+            })
     }
 
     /// A Runner preferences picker: its button at the column's width and,
-    /// open, its `items` (key, label, the change, selected). `blocked`
+    /// open, its `items` (key, label, the change, selected), then "Custom
+    /// model…" when `custom` (Model's: a name typed under it). `blocked`
     /// dims it with the reason as a tooltip.
     #[allow(clippy::too_many_arguments)]
     fn picker(
@@ -1366,6 +1439,7 @@ impl AgentEditor {
         label: String,
         items: Vec<(String, String, Change, bool)>,
         blocked: Option<String>,
+        custom: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Div {
@@ -1387,7 +1461,7 @@ impl AgentEditor {
             button,
             move |cx| {
                 let theme = *cx.global::<Theme>();
-                items
+                let mut rows: Vec<AnyElement> = items
                     .into_iter()
                     .map(|(key, label, change, selected)| {
                         menu_item(format!("{id}-{key}"), label, selected, &theme)
@@ -1397,7 +1471,18 @@ impl AgentEditor {
                             }))
                             .into_any_element()
                     })
-                    .collect()
+                    .collect();
+                if custom {
+                    rows.push(
+                        menu_item(format!("{id}-custom"), CUSTOM_MODEL, false, &theme)
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                cx.stop_propagation();
+                                this.open_custom_model(window, cx);
+                            }))
+                            .into_any_element(),
+                    );
+                }
+                rows
             },
             SIDE_W,
             false,

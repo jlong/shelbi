@@ -2780,6 +2780,126 @@ impl Run {
         }
     }
 
+    /// OpenCode's pickers and Settings notes (`opencode-ui-detection`,
+    /// checked by eye), over a stand-in for what OpenCode lists: the agent
+    /// editor's Model menu, its Reasoning effort menu for a model with
+    /// variants, the page for one without (no effort; the disclosure and
+    /// the allow-all note), and the new-project Default model menu.
+    /// `SHELBI_VISUAL_ONLY=opencode` renders just these.
+    fn opencode(&mut self) {
+        use crate::views::agent_editor::Menu;
+        use crate::views::agent_editor_state::Change;
+        use crate::views::settings_nav::SettingsPage;
+        use shelbi_core::RunnerKind;
+        shelbi_app::opencode_models::set_for_this_thread(Some(shelbi_app::opencode_models::listed(&[
+            ("anthropic/claude-sonnet-5-5", &["low", "medium", "high", "max"]),
+            ("opencode/big-pickle", &[]),
+            ("opencode/deepseek-v4.1-flash-free", &["low", "high", "max"]),
+            ("openai/gpt-5.5", &["minimal", "low", "medium", "high", "xhigh"]),
+        ])));
+        let workflows = shelbi_state::workflows_dir(PROJECT).expect("the workflows directory");
+        let project_dir = workflows.parent().expect("the project directory").to_path_buf();
+        let agents = project_dir.join("agents");
+        let had_agents = agents.exists();
+        crate::views::agents_state::fixture::write(&project_dir, PROJECT);
+        // The fixture's project pins its shipped agents to Codex: a user
+        // agent of its own runs on the runner it prefers.
+        let made = shelbi_state::agents_config::AgentsConfig::load(PROJECT)
+            .and_then(|c| c.create_agent("researcher", Some("Answers questions about the codebase.")))
+            .and_then(|c| c.save());
+        self.expect("state-opencode: the agent is written", made.is_ok());
+        type Edit = dyn Fn(
+            &mut crate::views::agent_editor::AgentEditor,
+            &mut gpui::Window,
+            &mut gpui::Context<crate::views::agent_editor::AgentEditor>,
+        );
+        let shot = |run: &mut Self, screen: &str, f: &Edit| {
+            let handle = run.open();
+            handle
+                .update(&mut run.cx, |w, window, cx| w.offscreen_open_settings(SettingsPage::Agents, window, cx))
+                .unwrap();
+            run.settle(handle);
+            handle.update(&mut run.cx, |w, window, cx| w.offscreen_edit_agent("researcher", window, cx)).unwrap();
+            run.settle(handle);
+            handle
+                .update(&mut run.cx, |w, window, cx| {
+                    let editor = w.offscreen_settings().and_then(|s| s.read(cx).agent_editor()).expect("the editor shows");
+                    editor.update(cx, |e, cx| {
+                        e.make(Change::PreferredRunner(Some(RunnerKind::OpenCode)), window, cx);
+                        f(e, window, cx);
+                    });
+                })
+                .unwrap();
+            run.settle(handle);
+            run.save(handle, screen);
+        };
+        shot(self, "state-opencode-agent-models", &|e, _, cx| e.offscreen_open_menu(Menu::Model, cx));
+        shot(self, "state-opencode-agent-effort", &|e, window, cx| {
+            e.make(Change::Model(Some("opencode/deepseek-v4.1-flash-free".into())), window, cx);
+            e.offscreen_open_menu(Menu::Effort, cx);
+        });
+        shot(self, "state-opencode-agent-disclosure", &|e, window, cx| {
+            e.make(Change::Model(Some("opencode/big-pickle".into())), window, cx);
+        });
+        let _ = std::fs::remove_dir_all(&workflows);
+        if !had_agents {
+            let _ = std::fs::remove_dir_all(&agents);
+        }
+
+        // The new-project wizard's Default model menu.
+        use crate::views::add_project::{AddProjectView, Engine, SIZE};
+        use shelbi_app::add_project_wizard::{FolderCheck, Focus, Origin, Repo};
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/Users/me"));
+        let folder = home.join("Projects/my-project");
+        let engine = Engine {
+            check: Arc::new({
+                let home = home.clone();
+                move |_, root, _| {
+                    let path = shelbi_orchestrator::project_create::absolutize(&home, Path::new(root.trim()));
+                    FolderCheck {
+                        in_repo_dir: path.join(".shelbi"),
+                        global_dir: Some(home.join(".shelbi/projects/my-project")),
+                        path,
+                        name: Some("My project".into()),
+                        slug: Some("my-project".into()),
+                        repo: Some(Repo::Git),
+                        problem: None,
+                        facts: Default::default(),
+                    }
+                }
+            }),
+            create: Arc::new(|_, _, _| Err(shelbi_orchestrator::project_create::AddProjectError::Failed("offscreen".into()))),
+            refresh: Arc::new(|| {}),
+            github: Arc::new(shelbi_app::github_setup::fixture::answer),
+            linear: Arc::new(shelbi_app::linear_setup::fixture::answer),
+        };
+        let handle = self
+            .cx
+            .open_offscreen_window(size(px(SIZE.0), px(SIZE.1)), |window, cx| {
+                cx.new(|cx| AddProjectView::new(Origin::Workspace, None, home.clone(), engine, Rc::new(|_, _, _| Ok(())), window, cx))
+            })
+            .expect("open the offscreen window");
+        let view = handle.entity(&self.cx).expect("the view");
+        let window: AnyWindowHandle = handle.into();
+        self.cx
+            .update_window(window, |_, window, cx| view.update(cx, |v, cx| v.folder_picked(Some(&folder), window, cx)))
+            .unwrap();
+        self.settle_sheet(window);
+        self.cx
+            .update_window(window, |_, window, cx| {
+                view.update(cx, |v, cx| {
+                    v.click(Focus::Primary, window, cx);
+                    v.offscreen_model_menu(RunnerKind::OpenCode, cx);
+                })
+            })
+            .unwrap();
+        self.settle_sheet(window);
+        self.settle_sheet(window);
+        self.write_sized(window, "state-opencode-default-model", SIZE.0 as u32);
+        let _ = self.cx.update_window(window, |_, window, _| window.remove_window());
+        shelbi_app::opencode_models::set_for_this_thread(None);
+    }
+
     /// `SHELBI_VISUAL_ONLY=add-project` renders just these.
     fn add_project_windows(&mut self) {
         use crate::views::add_project::{AddProjectView, Engine, SIZE};
@@ -3567,6 +3687,11 @@ impl Run {
 
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "about") {
             self.about_windows();
+            return;
+        }
+
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "opencode") {
+            self.opencode();
             return;
         }
 

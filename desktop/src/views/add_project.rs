@@ -92,7 +92,7 @@ use shelbi_core::ConfigMode;
 use shelbi_orchestrator::project_create::{self as engine, AddProjectError, ScaffoldReporter, ScaffoldStage};
 use shelbi_state::keymap::{Key, KeyChord, Mods};
 
-use super::harness_picker::{self as pickers, Fields, Handlers, Host, Menu};
+use super::harness_picker::{self as pickers, watch_opencode_models, CustomModel, Fields, Handlers, Host, Menu};
 use super::tracker_steps::{self as steps, key_step, FlowHost, FlowUi, CONTENT_TOP, CONTENT_W};
 use super::workflow_editor::error_line;
 use crate::app::{CloseWindow, ShelbiWindow};
@@ -311,6 +311,10 @@ pub struct AddProjectView {
     /// field on reaching Add API key).
     shown: FlowStep,
     menu_anchor: style::Anchor,
+    /// Default model ▸ Custom model…, while it's open.
+    custom_model: Option<CustomModel>,
+    /// Waiting for OpenCode's model list, to redraw Default model.
+    watching_models: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -402,6 +406,8 @@ impl AddProjectView {
             workflows: wiz::created_workflows(),
             menu: None,
             menu_anchor: Default::default(),
+            custom_model: None,
+            watching_models: false,
             flow_ui,
             shown: FlowStep::Chooser,
             _subscriptions: subscriptions,
@@ -412,6 +418,15 @@ impl AddProjectView {
     #[cfg(any(test, feature = "visual-check"))]
     pub fn wizard(&self) -> &Wizard {
         &self.wizard
+    }
+
+    /// Agent defaults with `runner` chosen and Default model's menu open
+    /// (the visual check).
+    #[cfg(feature = "visual-check")]
+    pub fn offscreen_model_menu(&mut self, runner: shelbi_core::RunnerKind, cx: &mut Context<Self>) {
+        self.select_runner(runner, cx);
+        self.menu = Some(Menu::Model);
+        cx.notify();
     }
 
     /// Change the Issues screen's flow as its controls would, then run what
@@ -425,7 +440,21 @@ impl AddProjectView {
     /// A key the wizard takes: Tab and ⇧Tab, Return and Esc anywhere;
     /// Space and the arrows off the text fields. `false` lets it through.
     fn key(&mut self, chord: KeyChord, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let in_text = matches!(self.wizard.focus(), Focus::Path | Focus::Name) || self.in_key_field(window, cx);
+        // The Custom model field takes its own Return; Esc closes it.
+        let in_custom = self.custom_model.as_ref().is_some_and(|c| c.input().read(cx).focus_handle(cx).is_focused(window));
+        if in_custom && chord.mods == Mods::NONE {
+            match chord.code {
+                Key::Enter => return false,
+                Key::Esc => {
+                    self.custom_model = None;
+                    self.sync_focus(window, cx);
+                    cx.notify();
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        let in_text = matches!(self.wizard.focus(), Focus::Path | Focus::Name) || in_custom || self.in_key_field(window, cx);
         let bare = chord.mods == Mods::NONE;
         let taken = match chord.code {
             Key::Tab | Key::BackTab => bare || chord.mods == Mods::SHIFT,
@@ -568,6 +597,8 @@ impl AddProjectView {
             Focus::Name => self.name_input.read(cx).focus_handle(cx),
             // Add API key's field keeps the keyboard until Tab moves it.
             _ if self.in_key_field(window, cx) && !self.keyboard => return,
+            // So does Custom model's, until Return or Esc closes it.
+            _ if self.custom_model.is_some() => return,
             _ => self.focus.clone(),
         };
         if !handle.is_focused(window) {
@@ -776,8 +807,31 @@ impl AddProjectView {
     /// A Default model row.
     fn select_model(&mut self, model: Option<String>, cx: &mut Context<Self>) {
         self.menu = None;
+        self.custom_model = None;
         self.wizard.select_model(model.as_deref());
         cx.notify();
+    }
+
+    /// Default model ▸ Custom model…: type a name under the picker.
+    pub fn open_custom_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.menu = None;
+        let current = self.wizard.picker().model().map(str::to_string);
+        self.custom_model = Some(CustomModel::open(
+            current.as_deref(),
+            |this: &mut Self, model, window, cx| {
+                this.select_model(model, cx);
+                this.sync_focus(window, cx);
+            },
+            window,
+            cx,
+        ));
+        cx.notify();
+    }
+
+    /// The Custom model field, while it's open.
+    #[cfg(test)]
+    pub fn custom_model_field(&self) -> Option<Entity<InputState>> {
+        self.custom_model.as_ref().map(|c| c.input().clone())
     }
 
     /// A picker's button: its menu opens (or closes), and it takes focus.
@@ -792,7 +846,9 @@ impl AddProjectView {
 
     /// The Agent defaults screen: Default Harness and Default model over a
     /// 620pt column, and why Continue was refused.
-    fn defaults(&self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Div {
+    fn defaults(&mut self, window: &Window, theme: &Theme, cx: &mut Context<Self>) -> Div {
+        let on_opencode = self.wizard.picker().runner() == shelbi_core::RunnerKind::OpenCode;
+        watch_opencode_models(on_opencode, |this: &mut Self| &mut this.watching_models, self, cx);
         let p = self.wizard.picker();
         let harnesses = p.harnesses();
         let models = p.models();
@@ -811,16 +867,19 @@ impl AddProjectView {
                 model_note: self.wizard.model_note(),
                 width: DEFAULTS_W,
                 ring: (self.ring(Focus::Harness, window), self.ring(Focus::Model, window)),
+                custom: self.custom_model.as_ref(),
             },
             self.menu,
             &self.menu_anchor,
             Handlers {
                 select_runner: |this: &mut Self, kind, cx| this.select_runner(kind, cx),
                 select_model: |this: &mut Self, model, cx| this.select_model(model, cx),
+                custom_model: |this: &mut Self, window, cx| this.open_custom_model(window, cx),
                 toggle: |this: &mut Self, menu, cx| this.toggle_menu(menu, cx),
                 close: |this: &mut Self, _| this.menu = None,
             },
             theme,
+            window,
             cx,
         );
         div().flex().flex_row().justify_center().w_full().child(
@@ -2160,6 +2219,44 @@ mod tests {
         assert!(!r.drawn("add-project-defaults-error"));
         r.click("add-project-primary");
         assert_eq!(r.wizard(|w| w.screen()), Screen::Issues);
+    }
+
+    /// OpenCode's Default model lists what OpenCode reports, and Custom
+    /// model… takes a typed name (Return sets it, Esc closes the field).
+    #[gpui::test]
+    fn opencode_default_model_lists_its_models_and_takes_a_typed_one(cx: &mut TestAppContext) {
+        shelbi_app::opencode_models::set_for_this_thread(Some(shelbi_app::opencode_models::listed(&[
+            ("opencode/big-pickle", &[]),
+        ])));
+        let mut r = rig(cx, Origin::Workspace, Ok("repo".into()));
+        r.pick(Some("/repo"));
+        r.keys("enter");
+        r.click("add-project-harness");
+        r.click("add-project-harness-opencode");
+        r.click("add-project-model");
+        // Use runner default, then the listed model, then Custom model….
+        r.click("add-project-model-1");
+        assert_eq!(r.wizard(|w| w.picker().model().map(str::to_string)).as_deref(), Some("opencode/big-pickle"));
+
+        r.click("add-project-model");
+        r.click("add-project-model-custom");
+        assert!(r.drawn("add-project-custom-model"));
+        r.keys("escape");
+        assert!(!r.drawn("add-project-custom-model"), "Esc closes it");
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Defaults, "and stays on the screen");
+
+        r.click("add-project-model");
+        r.click("add-project-model-custom");
+        let input = r.view.read_with(&r.cx, |v, _| v.custom_model_field()).expect("open");
+        r.cx.update(|window, cx| input.update(cx, |s, cx| s.set_value("anthropic/claude-sonnet-5-5".to_string(), window, cx)));
+        r.keys("enter");
+        assert!(!r.drawn("add-project-custom-model"));
+        assert_eq!(r.wizard(|w| w.screen()), Screen::Defaults, "Return set the model, not Continue");
+        assert_eq!(
+            r.wizard(|w| w.picker().model().map(str::to_string)).as_deref(),
+            Some("anthropic/claude-sonnet-5-5")
+        );
+        shelbi_app::opencode_models::set_for_this_thread(None);
     }
 
     #[gpui::test]

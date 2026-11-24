@@ -723,8 +723,10 @@ impl RunnerAdapter {
             }
             // OpenCode's effort is a per-model variant (`provider/model#high`)
             // in the config layer, and only one OpenCode reports for that
-            // model counts (see `opencode_effort_variant`). Until Shelbi lists
-            // the models, effort is left to the user's OpenCode settings.
+            // model counts (see `opencode_effort_variant`). The pickers list
+            // the variants (`shelbi_app::opencode_models`, on the client), but
+            // no launch sets `OpenCodeLayer::variant` yet, so effort is left
+            // to the user's OpenCode settings.
             RunnerKind::OpenCode | RunnerKind::Generic => spec.clone(),
         }
     }

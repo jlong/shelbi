@@ -7,10 +7,11 @@
 //!
 //! Harness lists [`runner_options`] (Claude Code · Anthropic, Codex ·
 //! OpenAI, OpenCode, Generic). Default model offers "Use runner default" (`None`),
-//! then the runner's [`shelbi_core::model_suggestions`], then the chosen
-//! model when it's none of those (a name typed in, or one already on disk).
-//! OpenCode takes a model but has no suggestions (its `provider/model` ids
-//! depend on the user's providers); a generic runner takes none.
+//! then the runner's [`suggested_models`], then the chosen model when it's
+//! none of those (a name typed in, or one already on disk). OpenCode's are
+//! what `opencode models` lists ([`crate::opencode_models`]; its
+//! `provider/model` ids depend on the user's providers), and a typed name
+//! only while that can't answer; a generic runner takes none.
 
 use shelbi_core::RunnerKind;
 use shelbi_state::agents_config::runner_options;
@@ -18,6 +19,11 @@ use shelbi_state::agents_config::runner_options;
 use crate::settings::agent_editor::RUNNER_DEFAULT;
 use crate::settings::agents::runner_label;
 use crate::view::{HarnessOption, ModelOption};
+
+/// The last row of a Default model or Model picker: a name typed in, for a
+/// model the list doesn't have (and OpenCode's only way while its list
+/// can't be read).
+pub const CUSTOM_MODEL: &str = "Custom model…";
 
 /// The company behind a runner, shown beside its name.
 pub fn provider(kind: RunnerKind) -> Option<&'static str> {
@@ -44,9 +50,16 @@ pub fn model_label(model: &str) -> String {
 
 /// `kind` takes a model Shelbi can set.
 pub fn takes_model(kind: RunnerKind) -> bool {
+    shelbi_core::takes_model(kind)
+}
+
+/// The models a picker suggests for `kind`: Claude's and Codex's fixed
+/// aliases, OpenCode's listed models (none while the probe runs or when it
+/// can't answer: a typed name then), a generic runner's none.
+pub fn suggested_models(kind: RunnerKind) -> Vec<String> {
     match kind {
-        RunnerKind::Claude | RunnerKind::Codex | RunnerKind::OpenCode => true,
-        RunnerKind::Generic => false,
+        RunnerKind::OpenCode => crate::opencode_models::catalog().ids(),
+        _ => shelbi_core::model_suggestions(kind).iter().map(|m| m.to_string()).collect(),
     }
 }
 
@@ -140,8 +153,7 @@ impl HarnessPicker {
             label: RUNNER_DEFAULT.into(),
             selected: self.model.is_none(),
         }];
-        let mut models: Vec<String> =
-            shelbi_core::model_suggestions(self.runner).iter().map(|m| m.to_string()).collect();
+        let mut models = suggested_models(self.runner);
         if let Some(own) = &self.model {
             if !models.contains(own) {
                 models.push(own.clone());
@@ -217,5 +229,28 @@ mod tests {
         assert!(!p.takes_model());
         assert!(p.models().is_empty());
         assert_eq!(no_model_note(RunnerKind::Generic), "Generic runners take no model.");
+    }
+
+    #[test]
+    fn opencode_lists_the_models_opencode_reports() {
+        let mut p = HarnessPicker::default();
+        p.set_runner(RunnerKind::OpenCode, None);
+        // Nothing listed: only the runner's default (and a typed name).
+        assert_eq!(p.models().iter().map(|o| o.label.as_str()).collect::<Vec<_>>(), [RUNNER_DEFAULT]);
+        crate::opencode_models::set_for_this_thread(Some(crate::opencode_models::listed(&[
+            ("anthropic/claude-sonnet-5-5", &["high", "max"]),
+            ("opencode/big-pickle", &[]),
+        ])));
+        p.set_model(Some("custom/typed"));
+        assert_eq!(
+            p.models().iter().map(|o| (o.label.as_str(), o.selected)).collect::<Vec<_>>(),
+            [
+                (RUNNER_DEFAULT, false),
+                ("anthropic/claude-sonnet-5-5", false),
+                ("opencode/big-pickle", false),
+                ("custom/typed", true)
+            ]
+        );
+        crate::opencode_models::set_for_this_thread(None);
     }
 }

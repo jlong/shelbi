@@ -407,6 +407,16 @@ fn the_missing_line_says_where_to_run_the_commands() {
         Tool::Homebrew.missing_detail(Platform::Mac, false),
         "Shelbi installs the other tools with Homebrew. Install Git first, then run:"
     );
+    // The coding-agent row names the OpenCode it needs and installs v2
+    // (`@opencode/cli`; the older npm package is still 1.x).
+    for platform in [Platform::Mac, Platform::Linux] {
+        assert_eq!(
+            Tool::Agent.missing_detail(platform, false),
+            "Shelbi runs your agents with Claude Code, Codex or OpenCode (2.3 or later). Install any one."
+        );
+        let opencode = Tool::Agent.install_commands(platform).into_iter().find(|c| c.binary == Binary::OpenCode).unwrap();
+        assert_eq!((opencode.label, opencode.text.as_str()), (Some("OpenCode"), "npm install -g @opencode/cli"));
+    }
 }
 
 #[test]
