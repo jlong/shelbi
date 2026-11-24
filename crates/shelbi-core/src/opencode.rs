@@ -115,6 +115,9 @@ pub const OPENCODE_DISCLOSURE: &[&str] = &[
     "Environment: OPENCODE_CONFIG_CONTENT (config.json, merged over your own value, which is kept in \
      SHELBI_OPENCODE_USER_CONFIG), OPENCODE_CLI_CONFIG_CONTENT (turns off OpenCode's terminal title), \
      OPENCODE_DISABLE_AUTOUPDATE=1, SHELBI_PANE_TTY, SHELBI_OPENCODE_SESSION and SHELBI_OPENCODE_TITLE.",
+    "Orchestrator: one session per project (--session ses_shelbiorch…, titled \"Shelbi · <project> · \
+     orchestrator\"), which a reload reopens. Its instructions are named in the config layer. On the \
+     awareness event system Shelbi's plugin (SHELBI_OPENCODE_ROLE=orchestrator) delivers board events into it.",
 ];
 
 /// The note an OpenCode agent shows when no permission ceiling applies
@@ -135,25 +138,47 @@ pub const OPENCODE_NO_CEILING_NOTE: &str = "OpenCode's own default allows edits 
 /// on every host and across releases; the hash is FNV-1a (128-bit), spelled
 /// out here rather than borrowed from a library whose output could change.
 pub fn opencode_session_id(project: &str, workspace: &str, task: &str, generation: u32) -> String {
+    let generation = generation.to_string();
+    format!("ses_shelbi{}", session_hash(&[project, workspace, task, generation.as_str()]))
+}
+
+/// The id of a project's OpenCode orchestrator session: `ses_shelbiorch`
+/// plus 20 hex characters hashed from the project.
+///
+/// The orchestrator launches with `--session <id>`, so a reload, a restart
+/// or a relaunch after a crash reopens the same conversation (the reload
+/// handoff still rides along in its instructions), the way a Codex
+/// orchestrator resumes its persisted thread. A pure function of the
+/// project, like [`opencode_session_id`].
+pub fn opencode_orchestrator_session_id(project: &str) -> String {
+    format!("ses_shelbiorch{}", session_hash(&[project, "orchestrator"]))
+}
+
+/// The top 80 bits of the FNV-1a (128-bit) hash of `fields`, as 20 hex
+/// characters. A NUL after each field keeps (`a b`, `c`) apart from (`a`,
+/// `b c`).
+fn session_hash(fields: &[&str]) -> String {
     const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
     const PRIME: u128 = 0x0000000001000000000000000000013b;
     let mut hash = OFFSET;
-    let generation = generation.to_string();
-    // A NUL after each field keeps (`a b`, `c`) apart from (`a`, `b c`).
-    for field in [project, workspace, task, generation.as_str()] {
+    for field in fields {
         for byte in field.bytes().chain([0]) {
             hash ^= u128::from(byte);
             hash = hash.wrapping_mul(PRIME);
         }
     }
-    // The top 80 bits, as 20 hex characters.
-    format!("ses_shelbi{:020x}", hash >> 48)
+    format!("{:020x}", hash >> 48)
 }
 
 /// The title Shelbi gives its OpenCode session, so the user can tell it
 /// apart from their own in OpenCode's session list.
 pub fn opencode_session_title(workspace: &str, task: &str) -> String {
     format!("Shelbi · {workspace} · {task}")
+}
+
+/// The title of a project's OpenCode orchestrator session.
+pub fn opencode_orchestrator_session_title(project: &str) -> String {
+    format!("Shelbi · {project} · orchestrator")
 }
 
 #[cfg(test)]
@@ -215,6 +240,19 @@ mod tests {
         assert_eq!(opencode_session_id("p", "w", "t", 0), PINNED_ID);
     }
     const PINNED_ID: &str = "ses_shelbi2249bbf7ae659ba8713f";
+
+    #[test]
+    fn the_orchestrator_session_is_one_per_project() {
+        let id = opencode_orchestrator_session_id("shelbi");
+        assert_eq!(id, opencode_orchestrator_session_id("shelbi"));
+        assert_eq!(id, "ses_shelbiorche5f2550747a1e88ea95a");
+        assert_ne!(id, opencode_orchestrator_session_id("other"));
+        assert_eq!(id.len(), "ses_shelbiorch".len() + 20, "{id}");
+        assert_eq!(
+            opencode_orchestrator_session_title("shelbi"),
+            "Shelbi · shelbi · orchestrator"
+        );
+    }
 
     #[test]
     fn session_title_names_the_workspace_and_task() {

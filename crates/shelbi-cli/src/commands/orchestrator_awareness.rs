@@ -1,12 +1,18 @@
-//! Awareness (v2) delivery into a Claude orchestrator through the
-//! `shelbi-awareness` system plugin (`plugins/shelbi-awareness/`).
+//! Awareness (v2) delivery into an orchestrator through a plugin in its
+//! runner: the `shelbi-awareness` system plugin for Claude
+//! (`plugins/shelbi-awareness/`) and Shelbi's OpenCode plugin
+//! (`opencode_plugin.js` in `shelbi-orchestrator`). Both drive the same
+//! commands below; nothing here knows which runner is on the other end.
 //!
 //! Three consumers drain the project's durable delivery queue (the same
 //! `event-cursor` the v1 feed acks):
 //!
-//! * `shelbi orchestrator events stream`, the plugin's **monitor**. Claude
-//!   Code runs it for the whole session and turns each stdout line into a
-//!   notification, so the orchestrator never arms a Monitor itself.
+//! * `shelbi orchestrator events stream`, the plugin's **monitor**. The
+//!   runner runs it for the whole session. Claude Code turns each stdout line
+//!   into a notification; the OpenCode plugin reads `--json` batches and
+//!   admits each into the session (an urgent one steered into a running
+//!   turn, a digest stored without starting one). Either way the
+//!   orchestrator never arms a Monitor itself.
 //! * `shelbi orchestrator hook user-prompt-submit`: whatever the monitor
 //!   hasn't delivered yet rides along with the user's message as context, so
 //!   the orchestrator never answers from a stale board.
@@ -48,7 +54,10 @@ const MAX_CHARS: usize = 8_000;
 /// One event line is capped at this many characters.
 const MAX_LINE_CHARS: usize = 600;
 
-/// The Claude Code hook events the plugin wires to `shelbi orchestrator hook`.
+/// The hook events a plugin wires to `shelbi orchestrator hook`: Claude
+/// Code's own, and the OpenCode plugin's equivalents (a turn starting, a
+/// turn ending, the plugin loading), which it calls with the same input and
+/// reads the same JSON answer from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum HookEvent {
     /// `UserPromptSubmit`: attach undelivered events to the user's message.
@@ -78,6 +87,28 @@ enum Delivery {
     Quiet,
     /// These lines were handed over and acked.
     Delivered(Vec<String>),
+}
+
+/// One delivery's rendered lines, with what a runner needs to decide how it
+/// enters the conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Batch {
+    lines: Vec<String>,
+    /// At least one event must not wait for the next turn ([`is_urgent`]).
+    urgent: bool,
+    /// Every event is the board digest, which never needs a turn of its own.
+    digest: bool,
+}
+
+impl Batch {
+    fn notice(lines: Vec<String>) -> Batch {
+        Batch { lines, urgent: false, digest: false }
+    }
+
+    /// The `--json` form: one object per batch, on one line.
+    fn to_json_line(&self) -> String {
+        json!({ "lines": self.lines, "urgent": self.urgent, "digest": self.digest }).to_string()
+    }
 }
 
 /// The compact label an event is delivered under, or `None` for a kind the
@@ -178,7 +209,7 @@ fn cap(lines: Vec<String>) -> Vec<String> {
 
 /// Read, hand over and ack the pending batch under the delivery lock.
 ///
-/// `emit` receives the rendered lines while the lock is held; the cursor is
+/// `emit` receives the rendered batch while the lock is held; the cursor is
 /// advanced only after it returns `Ok`, so a failed hand-over (a closed pipe)
 /// leaves the batch queued.
 fn deliver(
@@ -186,7 +217,7 @@ fn deliver(
     deadline: Option<Instant>,
     cancelled: &dyn Fn() -> bool,
     policy: Policy,
-    emit: &mut dyn FnMut(&[String]) -> Result<()>,
+    emit: &mut dyn FnMut(&Batch) -> Result<()>,
 ) -> Result<Delivery> {
     let Some(_lock) = shelbi_state::acquire_event_delivery_lock(project, deadline, cancelled)
         .map_err(|e| anyhow!(e))?
@@ -215,7 +246,7 @@ fn deliver(
                  delivered; run `shelbi task list` and `shelbi workspace list` to resync",
                 earliest.saturating_sub(cursor)
             )];
-            emit(&lines)?;
+            emit(&Batch::notice(lines.clone()))?;
             write_persisted_cursor(project, earliest)?;
             return Ok(Delivery::Delivered(lines));
         }
@@ -232,9 +263,15 @@ fn deliver(
     if policy == Policy::IfUrgent && !response.events.iter().any(is_urgent) {
         return Ok(Delivery::Quiet);
     }
-    let lines = cap(response.events.iter().filter_map(render).collect());
+    let shown: Vec<&NormalizedEvent> =
+        response.events.iter().filter(|event| label(event).is_some()).collect();
+    let lines = cap(shown.iter().filter_map(|event| render(event)).collect());
     if !lines.is_empty() {
-        emit(&lines)?;
+        emit(&Batch {
+            lines: lines.clone(),
+            urgent: shown.iter().any(|event| is_urgent(event)),
+            digest: shown.iter().all(|event| event.kind == "heartbeat"),
+        })?;
     }
     write_persisted_cursor(project, through)?;
     Ok(if lines.is_empty() {
@@ -261,7 +298,11 @@ fn deliver(
 /// * A write to a closed stdout (the session is gone) ends it without acking
 ///   the batch it couldn't print.
 /// * `--max-lifetime`, when set, ends it with a line saying so.
-pub(super) fn run_stream(project: &str, max_lifetime: Option<Duration>) -> Result<()> {
+///
+/// With `json`, each batch is one JSON object on one line instead
+/// (`{"lines": [...], "urgent": bool, "digest": bool}`), for a plugin that
+/// admits a batch as a whole and needs to know whether it can wait.
+pub(super) fn run_stream(project: &str, max_lifetime: Option<Duration>, json: bool) -> Result<()> {
     ensure_registered(project)?;
     let signal = Arc::new(AtomicUsize::new(0));
     for sig in [SIGTERM, SIGHUP, SIGINT] {
@@ -269,28 +310,41 @@ pub(super) fn run_stream(project: &str, max_lifetime: Option<Duration>) -> Resul
             .map_err(|e| anyhow!("failed to install signal handler {sig}: {e}"))?;
     }
     let self_pid = shelbi_state::claim_event_follower(project).map_err(|e| anyhow!(e))?;
-    let outcome = stream_loop(project, max_lifetime, &signal, STREAM_POLL, &mut print_lines);
+    let mut print = |batch: &Batch| print_batch(batch, json);
+    let parent = std::os::unix::process::parent_id();
+    let reader_alive = || std::os::unix::process::parent_id() == parent;
+    let outcome = stream_loop(project, max_lifetime, &signal, STREAM_POLL, &reader_alive, &mut print);
     let _ = shelbi_state::release_event_follower(project, self_pid);
     match outcome {
         Ok(StreamEnd::Terminated(sig)) => {
             eprintln!("shelbi orchestrator events stream: stopped by signal {sig}");
             Ok(())
         }
+        Ok(StreamEnd::Orphaned) => {
+            eprintln!("shelbi orchestrator events stream: its parent exited; stopping");
+            Ok(())
+        }
         Ok(StreamEnd::Expired(after)) => {
-            let _ = print_lines(&[format!(
-                "shelbi: the event stream reached its --max-lifetime of {}; board events \
-                 still arrive with each user message",
-                format_duration(after)
-            )]);
+            let _ = print_batch(
+                &Batch::notice(vec![format!(
+                    "shelbi: the event stream reached its --max-lifetime of {}; board events \
+                     still arrive with each user message",
+                    format_duration(after)
+                )]),
+                json,
+            );
             Ok(())
         }
         Err(error) => {
             // Best-effort: stdout may be the very thing that failed.
-            let _ = print_lines(&[format!(
-                "shelbi: the awareness event stream stopped ({error}); board events still \
-                 arrive with each user message. Restart the session to resume live \
-                 notifications."
-            )]);
+            let _ = print_batch(
+                &Batch::notice(vec![format!(
+                    "shelbi: the awareness event stream stopped ({error}); board events still \
+                     arrive with each user message. Restart the session to resume live \
+                     notifications."
+                )]),
+                json,
+            );
             Err(error)
         }
     }
@@ -300,13 +354,23 @@ pub(super) fn run_stream(project: &str, max_lifetime: Option<Duration>) -> Resul
 enum StreamEnd {
     Terminated(usize),
     Expired(Duration),
+    /// The process that started the stream (the runner reading its output)
+    /// is gone. A runner killed outright can't stop its child, and an
+    /// orphan would otherwise sit yielded to its successor, holding nothing
+    /// but taking the slot back the moment that one exits.
+    Orphaned,
 }
 
-fn print_lines(lines: &[String]) -> Result<()> {
+fn print_batch(batch: &Batch, json: bool) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
-    for line in lines {
-        stdout.write_all(line.as_bytes())?;
+    if json {
+        stdout.write_all(batch.to_json_line().as_bytes())?;
         stdout.write_all(b"\n")?;
+    } else {
+        for line in &batch.lines {
+            stdout.write_all(line.as_bytes())?;
+            stdout.write_all(b"\n")?;
+        }
     }
     // stdout is a pipe: without the flush a line would wait for the next one.
     stdout.flush()?;
@@ -318,13 +382,17 @@ fn stream_loop(
     max_lifetime: Option<Duration>,
     signal: &AtomicUsize,
     poll: Duration,
-    emit: &mut dyn FnMut(&[String]) -> Result<()>,
+    reader_alive: &dyn Fn() -> bool,
+    emit: &mut dyn FnMut(&Batch) -> Result<()>,
 ) -> Result<StreamEnd> {
     let start = Instant::now();
     let self_pid = std::process::id();
     let cancelled = || signal.load(Ordering::Relaxed) != 0;
     let mut yielded = false;
     loop {
+        if !reader_alive() {
+            return Ok(StreamEnd::Orphaned);
+        }
         let sig = signal.load(Ordering::Relaxed);
         if sig != 0 {
             if sig == SIGTERM as usize && superseded_within(project, self_pid, SUPERSEDE_GRACE) {
@@ -383,7 +451,7 @@ fn superseded_within(project: &str, self_pid: u32, grace: Duration) -> bool {
 // ---------------------------------------------------------------------------
 // hooks
 
-/// `shelbi orchestrator hook <event>`: answer one Claude Code hook. Never
+/// `shelbi orchestrator hook <event>`: answer one hook call. Never
 /// fails the hook: any error answers with nothing (exit 0) and a note on
 /// stderr, so a Shelbi hiccup can't block the user's prompt.
 pub(super) fn run_hook(project_opt: Option<String>, event: HookEvent) -> Result<()> {
@@ -429,8 +497,8 @@ fn hook_answer(
     match event {
         HookEvent::UserPromptSubmit => {
             let mut taken = Vec::new();
-            deliver(project, deadline, &never, Policy::All, &mut |lines| {
-                taken = lines.to_vec();
+            deliver(project, deadline, &never, Policy::All, &mut |batch| {
+                taken = batch.lines.clone();
                 Ok(())
             })?;
             if taken.is_empty() {
@@ -457,8 +525,8 @@ fn hook_answer(
                 return Ok(None);
             }
             let mut taken = Vec::new();
-            deliver(project, deadline, &never, Policy::IfUrgent, &mut |lines| {
-                taken = lines.to_vec();
+            deliver(project, deadline, &never, Policy::IfUrgent, &mut |batch| {
+                taken = batch.lines.clone();
                 Ok(())
             })?;
             if taken.is_empty() {
@@ -509,8 +577,8 @@ fn hook_answer(
     }
 }
 
-const DELIVERY_REMINDER: &str = "Shelbi board events reach you automatically: the \
-    shelbi-awareness plugin's monitor delivers each one as a `shelbi <kind>: ...` notification, \
+const DELIVERY_REMINDER: &str = "Shelbi board events reach you automatically: Shelbi's \
+    awareness plugin delivers each one as a `shelbi <kind>: ...` line the moment it lands, \
     and anything not yet shown is attached to the user's next message. They are already \
     acknowledged. Don't start a Monitor on `shelbi events tail` and don't run `shelbi \
     orchestrator events next`, `drain` or `ack` yourself.";
@@ -633,7 +701,7 @@ mod tests {
         assert_eq!(hook_answer("demo", HookEvent::SessionStart, &startup, None).unwrap(), None);
         let compact = json!({"source": "compact"});
         let out = hook_answer("demo", HookEvent::SessionStart, &compact, None).unwrap().unwrap();
-        assert!(out.contains("shelbi-awareness"), "{out}");
+        assert!(out.contains("awareness plugin delivers"), "{out}");
     }
 
     #[test]
@@ -658,6 +726,45 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_says_whether_it_is_urgent_or_only_the_digest() {
+        let (_g, _home) = setup_home();
+        let take = || {
+            let mut taken = None;
+            deliver("demo", None, &|| false, Policy::All, &mut |batch| {
+                taken = Some(batch.clone());
+                Ok(())
+            })
+            .unwrap();
+            taken.expect("a batch")
+        };
+
+        let mut batches = Vec::new();
+        append_heartbeat_event("demo", 2, 1, None, None).unwrap();
+        batches.push(take());
+        append_task_event("demo", "t-1", "default", Column::todo(), Column::in_progress(), "x")
+            .unwrap();
+        append_heartbeat_event("demo", 1, 0, None, None).unwrap();
+        batches.push(take());
+        append_reminder_event("demo", "r-1", "ping").unwrap();
+        batches.push(take());
+
+        let flags: Vec<(bool, bool)> = batches.iter().map(|b| (b.urgent, b.digest)).collect();
+        assert_eq!(flags, vec![(false, true), (false, false), (true, false)], "{batches:?}");
+        // Bookkeeping that renders nothing doesn't make a digest batch look
+        // like more than a digest.
+        append_send_event("demo", "alpha", "submitted", "ok").unwrap();
+        append_heartbeat_event("demo", 0, 0, None, None).unwrap();
+        assert!(take().digest);
+
+        let json: Value = serde_json::from_str(&batches[2].to_json_line()).unwrap();
+        assert_eq!(
+            json,
+            json!({"lines": ["shelbi reminder: id=r-1 text=\"ping\""], "urgent": true, "digest": false})
+        );
+        assert!(!batches[2].to_json_line().contains('\n'), "one batch, one line");
+    }
+
+    #[test]
     fn stream_prints_then_stops_on_a_real_signal() {
         let (_g, _home) = setup_home();
         append_reminder_event("demo", "r-1", "ping").unwrap();
@@ -668,8 +775,9 @@ mod tests {
             Some(Duration::from_millis(200)),
             &signal,
             Duration::from_millis(10),
-            &mut |lines| {
-                seen.extend_from_slice(lines);
+            &|| true,
+            &mut |batch| {
+                seen.extend_from_slice(&batch.lines);
                 Ok(())
             },
         )
@@ -679,8 +787,18 @@ mod tests {
 
         // A signal while nobody else owns the slot is a real stop.
         signal.store(SIGHUP as usize, Ordering::Relaxed);
-        let end = stream_loop("demo", None, &signal, Duration::from_millis(10), &mut |_| Ok(()))
+        let end = stream_loop("demo", None, &signal, Duration::from_millis(10), &|| true, &mut |_| Ok(()))
             .unwrap();
         assert_eq!(end, StreamEnd::Terminated(SIGHUP as usize));
+
+        // Its reader gone, it stops before delivering anything more.
+        signal.store(0, Ordering::Relaxed);
+        append_reminder_event("demo", "r-2", "pong").unwrap();
+        let end = stream_loop("demo", None, &signal, Duration::from_millis(10), &|| false, &mut |_| {
+            panic!("an orphaned stream delivers nothing")
+        })
+        .unwrap();
+        assert_eq!(end, StreamEnd::Orphaned);
+        assert_eq!(lines(collect("demo", Policy::All)).len(), 1, "the batch stays queued");
     }
 }

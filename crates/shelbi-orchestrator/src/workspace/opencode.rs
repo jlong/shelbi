@@ -306,6 +306,27 @@ pub(crate) fn deploy_opencode_plugin(host: &Host, worktree: &Path) -> Result<()>
     Ok(())
 }
 
+/// Stage Shelbi's plugin for an OpenCode orchestrator in `workdir` (the
+/// project config dir) at [`OPENCODE_PLUGIN_DIR_REL`], when `enabled` (the
+/// project runs the awareness system). Otherwise the directory is removed,
+/// so a heartbeat orchestrator, or one on another runner, never has a stale
+/// copy lying around. Returns whether the plugin was staged.
+pub(crate) fn deploy_orchestrator_opencode_plugin(host: &Host, workdir: &Path, enabled: bool) -> Result<bool> {
+    if !enabled {
+        remove_worktree_entry(host, &workdir.join(OPENCODE_PLUGIN_DIR_REL))?;
+        return Ok(false);
+    }
+    deploy_opencode_plugin(host, workdir)?;
+    Ok(true)
+}
+
+/// Write an OpenCode orchestrator's role preamble
+/// ([`crate::opencode_orchestrator_preamble`]) to [`OPENCODE_INSTRUCTIONS_REL`]
+/// in `workdir`, the first of the instruction files its launch names.
+pub(crate) fn write_orchestrator_opencode_preamble(host: &Host, workdir: &Path, preamble: &str) -> Result<()> {
+    write_worktree_text(host, &workdir.join(OPENCODE_INSTRUCTIONS_REL), preamble, "opencode-instructions")
+}
+
 /// Remove the plugin an older Shelbi wrote to
 /// [`LEGACY_OPENCODE_PLUGIN_REL`], plus its git-exclude line, when the file
 /// starts with Shelbi's signature. A user's file there is never touched. The
@@ -814,6 +835,7 @@ console.log(JSON.stringify(out));
             .env("SHELBI_PANE_TTY", "/dev/null")
             .env("SHELBI_OPENCODE_SESSION", "ses_shelbi0123456789abcdef0123")
             .env_remove("SHELBI_OPENCODE_TITLE")
+            .env_remove("SHELBI_OPENCODE_ROLE")
             .env_remove("TASK_ID")
             .output()
             .unwrap();
@@ -828,6 +850,215 @@ console.log(JSON.stringify(out));
         assert_eq!(result["lockReleased"], true, "{result}");
         assert_eq!(result["heldPassive"], true, "{result}");
         assert_eq!(result["staleTaken"], true, "{result}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The orchestrator's plugin under Node, against a fake `shelbi` CLI and
+    /// a fake OpenCode `api` whose events the test feeds in: it runs `shelbi
+    /// orchestrator events stream --json` for a resumed session and admits
+    /// each batch (queued while idle, steered while a turn runs, a digest as
+    /// context that starts no turn); a turn's start brings the session-start
+    /// and prompt-submit answers in as context; a turn's end asks the stop
+    /// hook, sends a block back as a queued prompt, and never blocks the turn
+    /// that answers it. Subagent turns are ignored. Skipped without `node`.
+    #[test]
+    fn orchestrator_plugin_runs_the_awareness_contract() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+
+        if Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node not found; skipping the orchestrator plugin test");
+            return;
+        }
+        const OWN: &str = "ses_shelbiorche5f2550747a1e88ea95a";
+        let root = tmp("plugin-orch");
+        let workdir = root.join("project");
+        std::fs::create_dir_all(&workdir).unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let stream = root.join("stream.jsonl");
+        std::fs::write(&stream, "").unwrap();
+        let hooks = root.join("hooks.log");
+        let shelbi = root.join("bin/shelbi");
+        std::fs::write(
+            &shelbi,
+            r#"#!/bin/sh
+root="$(cd "$(dirname "$0")/.." && pwd)"
+case "$1 $2" in
+  "orchestrator events")
+    echo "stream $3 $4" >> "$root/hooks.log"
+    exec tail -n +1 -f "$root/stream.jsonl" ;;
+  "orchestrator hook")
+    input=$(cat)
+    echo "hook $3 $input" >> "$root/hooks.log"
+    case "$3" in
+      session-start)
+        printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Zen Mode is on."}}' ;;
+      user-prompt-submit)
+        if [ ! -e "$root/ups" ]; then : > "$root/ups"
+          printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"shelbi task: late"}}'
+        fi ;;
+      stop)
+        if [ ! -e "$root/stopped" ]; then : > "$root/stopped"
+          printf '%s\n' '{"decision":"block","reason":"handle shelbi reminder: id=r-1"}'
+        fi ;;
+    esac ;;
+esac
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&shelbi, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let plugin = root.join("plugin.mjs");
+        std::fs::write(&plugin, OPENCODE_PLUGIN_JS).unwrap();
+        let calls = root.join("calls.jsonl");
+        let script = root.join("run.mjs");
+        std::fs::write(
+            &script,
+            r#"
+import { appendFileSync } from "node:fs";
+import { createInterface } from "node:readline";
+const [pluginPath, dir, log] = process.argv.slice(2);
+const plugin = (await import(pluginPath)).default;
+const events = [];
+let wake = () => {};
+const record = (call) => async (input) => {
+  appendFileSync(log, JSON.stringify({ call, ...input }) + "\n");
+  return { id: input.id };
+};
+const api = {
+  location: { directory: dir },
+  session: {
+    get: async ({ sessionID }) => ({ id: sessionID }),
+    update: async () => {},
+    prompt: record("prompt"),
+    synthetic: record("synthetic"),
+  },
+  event: { subscribe: (opts) => ({ async *[Symbol.asyncIterator]() {
+    while (!opts.signal.aborted) {
+      if (events.length) { yield events.shift(); continue; }
+      await new Promise((r) => { wake = r; opts.signal.addEventListener("abort", r, { once: true }); });
+    }
+  } }) },
+};
+const stop = await plugin.setup(api);
+console.log(typeof stop === "function" ? "ready" : "passive");
+const input = createInterface({ input: process.stdin });
+input.on("line", (line) => { events.push(JSON.parse(line)); wake(); });
+input.on("close", () => { stop?.(); setTimeout(() => process.exit(0), 100); });
+"#,
+        )
+        .unwrap();
+        let mut node = Command::new("node")
+            .arg(&script)
+            .arg(&plugin)
+            .arg(&workdir)
+            .arg(&calls)
+            .env("SHELBI_PANE_TTY", "/dev/null")
+            .env("SHELBI_OPENCODE_SESSION", OWN)
+            .env("SHELBI_OPENCODE_ROLE", "orchestrator")
+            .env("SHELBI_BIN", &shelbi)
+            .env_remove("SHELBI_OPENCODE_TITLE")
+            .env_remove("TASK_ID")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut first = String::new();
+        BufReader::new(node.stdout.take().unwrap()).read_line(&mut first).unwrap();
+        assert_eq!(first.trim(), "ready");
+        let mut stdin = node.stdin.take().unwrap();
+        let mut send = |kind: &str, session: &str| {
+            writeln!(stdin, r#"{{"type":"{kind}","data":{{"sessionID":"{session}"}}}}"#).unwrap();
+        };
+        let emit = |batch: &str| {
+            let mut file = std::fs::OpenOptions::new().append(true).open(&stream).unwrap();
+            writeln!(file, "{batch}").unwrap();
+        };
+        let wait_for = |what: &str, done: &dyn Fn(&[serde_json::Value], &str) -> bool| {
+            let until = Instant::now() + Duration::from_secs(15);
+            loop {
+                let got: Vec<serde_json::Value> = std::fs::read_to_string(&calls)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect();
+                let hooks = std::fs::read_to_string(&hooks).unwrap_or_default();
+                if done(&got, &hooks) {
+                    return got;
+                }
+                assert!(Instant::now() < until, "timed out waiting for {what}: {got:?}\n{hooks}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+
+        // A resumed session: the stream starts at once, and session-start is
+        // asked as a resume.
+        wait_for("the stream", &|_, h| h.contains("stream --json") && h.contains(r#"hook session-start {"source":"resume"}"#));
+
+        // Idle: a batch is queued, which starts a turn.
+        emit(r#"{"lines":["shelbi task: task=t-1 todo -> ready"],"urgent":false,"digest":false}"#);
+        let got = wait_for("the queued batch", &|c, _| c.len() == 1);
+        assert_eq!(got[0]["call"], "prompt");
+        assert_eq!(got[0]["sessionID"], OWN);
+        assert_eq!(got[0]["delivery"], "queue");
+        let text = got[0]["text"].as_str().unwrap();
+        assert!(text.starts_with("Shelbi board events"), "{text}");
+        assert!(text.ends_with("\nshelbi task: task=t-1 todo -> ready"), "{text}");
+        let id = got[0]["id"].as_str().unwrap();
+        assert!(id.starts_with("msg_") && id.len() == 4 + 26, "{id}");
+        assert!(id[4..16].chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+
+        // A digest on its own starts no turn.
+        emit(r#"{"lines":["shelbi digest: zen_eligible=1 idle_workspaces=1"],"urgent":false,"digest":true}"#);
+        let got = wait_for("the digest", &|c, _| c.len() == 2);
+        assert_eq!(got[1]["call"], "synthetic");
+        assert_eq!(got[1]["resume"], false);
+        assert!(got[1]["text"].as_str().unwrap().contains("shelbi digest: zen_eligible=1"));
+
+        // A subagent's turn is not the orchestrator's.
+        send("session.execution.started", "ses_child");
+        // The orchestrator's turn starts: session-start's and prompt-submit's
+        // answers go in as context.
+        send("session.execution.started", OWN);
+        let got = wait_for("the turn's context", &|c, _| c.len() == 3);
+        assert_eq!(got[2]["call"], "synthetic");
+        assert_eq!(got[2]["resume"], false);
+        assert_eq!(got[2]["text"], "Zen Mode is on.\n\nshelbi task: late");
+
+        // Busy: an urgent batch is steered into the running turn.
+        emit(r#"{"lines":["shelbi reminder: id=r-1 text=\"ping\""],"urgent":true,"digest":false}"#);
+        let got = wait_for("the steered batch", &|c, _| c.len() == 4);
+        assert_eq!(got[3]["call"], "prompt");
+        assert_eq!(got[3]["delivery"], "steer");
+        assert_ne!(got[3]["id"], got[0]["id"]);
+
+        // The turn ends: the stop hook blocks, which goes back as a queued
+        // prompt.
+        send("session.execution.succeeded", OWN);
+        let got = wait_for("the stop block", &|c, _| c.len() == 5);
+        assert_eq!(got[4]["call"], "prompt");
+        assert_eq!(got[4]["delivery"], "queue");
+        assert_eq!(got[4]["text"], "handle shelbi reminder: id=r-1");
+        let hooks_log = std::fs::read_to_string(&hooks).unwrap();
+        assert!(hooks_log.contains(r#"hook stop {"stop_hook_active":false}"#), "{hooks_log}");
+
+        // The turn that answers the block ends without asking again.
+        send("session.execution.started", OWN);
+        send("session.execution.succeeded", OWN);
+        // The next one asks again (and the hook has nothing this time).
+        send("session.execution.started", OWN);
+        send("session.execution.succeeded", OWN);
+        wait_for("the second stop", &|_, h| h.matches("hook stop").count() == 2);
+        wait_for("the prompt-submit calls", &|_, h| h.matches("hook user-prompt-submit").count() == 3);
+        std::thread::sleep(Duration::from_millis(300));
+        let got = wait_for("nothing more", &|_, _| true);
+        assert_eq!(got.len(), 5, "{got:?}");
+        let hooks_log = std::fs::read_to_string(&hooks).unwrap();
+        assert_eq!(hooks_log.matches("hook stop").count(), 2, "{hooks_log}");
+        assert_eq!(hooks_log.matches("hook session-start").count(), 1, "{hooks_log}");
+
+        drop(stdin);
+        assert!(node.wait().unwrap().success());
         let _ = std::fs::remove_dir_all(&root);
     }
 }

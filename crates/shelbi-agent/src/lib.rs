@@ -56,6 +56,7 @@ pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
 /// ```text
 /// env SHELBI_PANE_TTY="$(tty)" \
 ///     [SHELBI_OPENCODE_SESSION=<id> SHELBI_OPENCODE_TITLE='Shelbi · <ws> · <task>'] \
+///     [SHELBI_OPENCODE_ROLE=orchestrator] \
 ///     [SHELBI_OPENCODE_USER_CONFIG="${SHELBI_OPENCODE_USER_CONFIG-${OPENCODE_CONFIG_CONTENT-}}" \
 ///      OPENCODE_CONFIG_CONTENT=<config>] \
 ///     OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' \
@@ -68,6 +69,9 @@ pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
 ///   the plugin, which acts only on that session and its subagents and
 ///   titles it. A `--continue` / `-c` beside it is dropped: it would pick the
 ///   directory's newest session instead.
+/// - `SHELBI_OPENCODE_ROLE` (from [`with_opencode_role`]) tells the plugin
+///   which part to play: `orchestrator` delivers board events to the session
+///   instead of running a worker's hook scripts.
 /// - `--standalone` gives the pane a private server instead of OpenCode's
 ///   shared background service, so the server (and Shelbi's plugin inside it)
 ///   inherits this pane's environment (`TASK_ID`, the hub address). That
@@ -96,10 +100,18 @@ pub fn opencode_launch_command_with(spec: &AgentRunnerSpec, config: OpenCodeConf
     let bypass = mode.as_deref().is_some_and(|m| shelbi_core::permission_mode_rank(m) >= 3);
     let session = flag_value(&spec.flags, OPENCODE_SESSION_FLAGS);
     let title = flag_value(&spec.flags, &[OPENCODE_TITLE_FLAG]);
+    let role = flag_value(&spec.flags, &[OPENCODE_ROLE_FLAG]);
     let mut flags: Vec<String> =
         strip_flag_with_value(
             &spec.flags,
-            &["--model", "-m", OPENCODE_PERMISSION_FLAG, OPENCODE_TITLE_FLAG, OPENCODE_EFFORT_FLAG],
+            &[
+                "--model",
+                "-m",
+                OPENCODE_PERMISSION_FLAG,
+                OPENCODE_TITLE_FLAG,
+                OPENCODE_EFFORT_FLAG,
+                OPENCODE_ROLE_FLAG,
+            ],
         )
             .into_iter()
             .filter(|f| f != OPENCODE_DENY_EDITS_FLAG && f != OPENCODE_STANDALONE_FLAG)
@@ -131,6 +143,9 @@ pub fn opencode_launch_command_with(spec: &AgentRunnerSpec, config: OpenCodeConf
         if let Some(title) = &title {
             parts.push(format!("{OPENCODE_TITLE_ENV}={}", shell_escape(title)));
         }
+    }
+    if let Some(role) = &role {
+        parts.push(format!("{OPENCODE_ROLE_ENV}={}", shell_escape(role)));
     }
     if let Some(content) = content {
         parts.push(format!(
@@ -489,6 +504,33 @@ pub const OPENCODE_SESSION_ENV: &str = "SHELBI_OPENCODE_SESSION";
 
 /// Environment variable carrying the title the plugin gives that session.
 pub const OPENCODE_TITLE_ENV: &str = "SHELBI_OPENCODE_TITLE";
+
+/// The logical flag [`with_opencode_role`] carries the plugin's role on. It
+/// becomes [`OPENCODE_ROLE_ENV`] and never reaches the OpenCode argv.
+const OPENCODE_ROLE_FLAG: &str = "--shelbi-opencode-role";
+
+/// Environment variable telling Shelbi's plugin which role the pane plays.
+/// Unset is a worker.
+pub const OPENCODE_ROLE_ENV: &str = "SHELBI_OPENCODE_ROLE";
+
+/// The [`OPENCODE_ROLE_ENV`] value of the orchestrator's pane: its plugin
+/// runs `shelbi orchestrator events stream` and the `shelbi orchestrator
+/// hook` calls, the awareness contract Claude's `shelbi-awareness` plugin
+/// runs.
+pub const OPENCODE_ORCHESTRATOR_ROLE: &str = "orchestrator";
+
+/// Return a copy of `spec` whose launch tells Shelbi's plugin to play
+/// `role` ([`OPENCODE_ROLE_ENV`]), replacing any role already set. Other
+/// runners get `spec` back unchanged.
+pub fn with_opencode_role(spec: &AgentRunnerSpec, role: &str) -> AgentRunnerSpec {
+    if !RunnerAdapter::for_spec(spec).is_opencode() {
+        return spec.clone();
+    }
+    let mut out = spec.clone();
+    out.flags = strip_flag_with_value(&spec.flags, &[OPENCODE_ROLE_FLAG]);
+    out.flags.extend([OPENCODE_ROLE_FLAG.into(), role.into()]);
+    out
+}
 
 /// Return a copy of `spec` that launches OpenCode on the named session:
 /// `--session <id>` (which reopens it, or creates it on a first launch) plus
@@ -2215,6 +2257,23 @@ mod tests {
         );
         // Other runners are untouched.
         assert_eq!(with_opencode_session(&runner("claude"), "ses_x", "t").flags, Vec::<String>::new());
+    }
+
+    /// The plugin's role rides the environment, never the argv, and naming
+    /// it again replaces it.
+    #[test]
+    fn opencode_role_is_exported_for_the_plugin() {
+        let spec = with_opencode_session(&opencode(&[]), "ses_shelbiorchaaaa", "Shelbi · p · orchestrator");
+        let spec = with_opencode_role(&with_opencode_role(&spec, "worker"), OPENCODE_ORCHESTRATOR_ROLE);
+        assert_eq!(
+            launch_command(&spec),
+            format!(
+                "env SHELBI_PANE_TTY=\"$(tty)\" SHELBI_OPENCODE_SESSION=ses_shelbiorchaaaa \
+                 SHELBI_OPENCODE_TITLE='Shelbi · p · orchestrator' SHELBI_OPENCODE_ROLE=orchestrator \
+                 {OC_ENV} opencode --standalone --session ses_shelbiorchaaaa"
+            )
+        );
+        assert_eq!(with_opencode_role(&runner("claude"), "orchestrator").flags, Vec::<String>::new());
     }
 
     /// Regression: the orchestrator and worker launchers run the line as

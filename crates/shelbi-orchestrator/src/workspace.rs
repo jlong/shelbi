@@ -28,6 +28,7 @@ pub use opencode::{
     OPENCODE_PLUGIN_ALIVE_REL, OPENCODE_PLUGIN_BEACON_WAIT, OPENCODE_PLUGIN_DIR_REL,
     OPENCODE_PLUGIN_LOCK_REL, OPENCODE_PLUGIN_SILENT_REASON, OPENCODE_SKILLS_REL,
 };
+pub(crate) use opencode::{deploy_orchestrator_opencode_plugin, write_orchestrator_opencode_preamble};
 #[cfg(test)]
 pub(crate) use opencode::opencode_plugin_js;
 

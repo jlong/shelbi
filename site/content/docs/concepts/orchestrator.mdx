@@ -144,10 +144,18 @@ put those arguments in `flags`. Shelbi does not translate Claude's
 
 Declare OpenCode the same way (`command: opencode`) and point
 `orchestrator.runner` at it. Shelbi launches it with `--standalone`, so the
-session runs its own server and inherits the pane's environment, and sends the
-rendered instructions and bootstrap request as its first prompt through
-`--prompt`. An OpenCode orchestrator keeps the heartbeat event system, so its
-event wake reports as degraded. Shelbi needs OpenCode 2.3 or later
+session runs its own server and inherits the pane's environment. The rendered
+instructions reach it at system authority through the `instructions` of the
+config layer Shelbi passes in `OPENCODE_CONFIG_CONTENT`, and only the bootstrap
+request goes in as its first prompt through `--prompt`. The orchestrator runs
+on one session per project (`--session ses_shelbiorch…`), so a reload reopens
+the same conversation. On the awareness event system
+(`orchestrator.awareness: awareness`) Shelbi's OpenCode plugin runs the same
+`shelbi orchestrator events stream` and `shelbi orchestrator hook` commands
+as Claude's awareness plugin: a task moved while the orchestrator is idle
+starts a turn at once, an urgent event (a reminder, a finished job, an overdue
+task, a review that is ready) is steered into a running turn, and a board
+digest is added as context without starting one. Shelbi needs OpenCode 2.3 or later
 (`npm install -g @opencode/cli`); it refuses to dispatch to an older one and
 says to run `opencode upgrade`. OpenCode workers map
 `workspace_permissions_mode` onto OpenCode permission rules (see

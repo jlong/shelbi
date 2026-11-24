@@ -100,8 +100,10 @@ pub enum OrchestratorEventsCmd {
     /// Deliver project events as they arrive, one compact line per event,
     /// acking each batch once printed (awareness v2).
     ///
-    /// This is the `shelbi-awareness` plugin monitor's command: Claude Code
-    /// turns each line into a notification for the orchestrator. It claims the
+    /// This is the awareness plugins' monitor command: Claude Code's
+    /// `shelbi-awareness` plugin turns each line into a notification for the
+    /// orchestrator, and Shelbi's OpenCode plugin reads `--json` batches and
+    /// admits each into the orchestrator's session. It claims the
     /// project's consuming-follower slot, prints task/workspace transitions,
     /// reminders, finished jobs, overdue tasks, pane deaths, supervision
     /// give-ups, review-ready signals, questions and the board digest, and
@@ -112,6 +114,12 @@ pub enum OrchestratorEventsCmd {
         /// Optional wall-clock lifetime, e.g. `4h`. Omit to run indefinitely.
         #[arg(long)]
         max_lifetime: Option<String>,
+        /// Print each batch as one JSON object on one line
+        /// (`{"lines": [...], "urgent": bool, "digest": bool}`) rather than
+        /// one line per event. `urgent` marks a batch that shouldn't wait
+        /// for the next turn; `digest` one that is only the board digest.
+        #[arg(long)]
+        json: bool,
     },
     /// Advance the durable cursor past an acknowledged batch delivery id.
     ///
@@ -159,12 +167,12 @@ pub fn run(project_opt: Option<String>, cmd: OrchestratorCmd) -> Result<()> {
                     print_response(&response)
                 }
             }
-            OrchestratorEventsCmd::Stream { max_lifetime } => {
+            OrchestratorEventsCmd::Stream { max_lifetime, json } => {
                 let max_lifetime = max_lifetime
                     .as_deref()
                     .map(super::events::parse_duration)
                     .transpose()?;
-                awareness::run_stream(&project, max_lifetime)
+                awareness::run_stream(&project, max_lifetime, json)
             }
             OrchestratorEventsCmd::Ack { delivery_id } => ack_delivery(&project, &delivery_id),
         },
