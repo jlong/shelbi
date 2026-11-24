@@ -1,0 +1,6 @@
+{
+  "name": "shelbi-opencode-plugin",
+  "private": true,
+  "type": "module",
+  "main": "index.js"
+}

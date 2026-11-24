@@ -197,7 +197,9 @@ tighten the project's mode, never loosen it.
 
 ### On OpenCode
 
-A worker's OpenCode wiring is a config layer Shelbi generates at
+[OpenCode](/docs/concepts/opencode) covers the whole OpenCode runner: the
+launch line, every file and environment variable Shelbi adds, sessions, and
+the plugin. In short, a worker's OpenCode wiring is a config layer Shelbi generates at
 `.shelbi/opencode/config.json` on each launch and passes as
 `OPENCODE_CONFIG_CONTENT`, the highest-ranking config you can set. It names the
 agent's instructions (`instructions`, so they reach OpenCode at system
@@ -219,6 +221,7 @@ the ceiling over a looser user config.
 | none set | none: your own OpenCode settings stand |
 | `plan` | deny everything, then allow `read`, `glob`, `grep`, `webfetch`, `websearch`, `skill` and `question` |
 | `default` | ask before `edit`, `shell`, `webfetch` and `external_directory` |
+| `read-only` | `default`'s rules, then deny `edit` |
 | `auto`, `acceptEdits` | allow `edit`, ask before `shell` and `external_directory` |
 | `bypassPermissions` | allow everything, and launch with `--auto` |
 
