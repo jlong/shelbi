@@ -58,7 +58,7 @@ use super::workflow_editor::{
 };
 use crate::assets::{icons, Icon};
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
-use crate::elements::window_drag;
+use crate::elements::{controls, window_drag};
 use crate::theme::style::{self, ButtonKind, ButtonSize, Type, Typography};
 use crate::theme::Theme;
 
@@ -656,6 +656,12 @@ impl AgentEditor {
         }
     }
 
+    /// Focus the Instructions box (as a click into it does).
+    pub fn offscreen_focus_instructions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.instructions.update(cx, |s, cx| s.focus(window, cx));
+        cx.notify();
+    }
+
     /// Ask to confirm Delete (as its menu item does).
     pub fn offscreen_ask_delete(&mut self, cx: &mut Context<Self>) {
         if let Some(state) = self.state.as_mut() {
@@ -745,39 +751,36 @@ pub(super) fn markdown_area(
 ) -> Div {
     let theme = cx.global::<Theme>();
     let focused = input.read(cx).focus_handle(cx).is_focused(window);
-    div()
-        .debug_selector(move || selector.into())
-        .flex()
-        .flex_none()
-        .w_full()
-        .h(px(height))
-        .p(px(1.0))
-        .rounded(px(6.0))
-        .bg(if focused { theme.focus_ring } else { theme.input_border })
-        .child(
-            div()
-                .flex()
-                .flex_1()
-                .min_w_0()
-                // The text area's own inset (about 9pt across, 8pt down)
-                // makes up the rest of the frame's 16pt.
-                .px(px(7.0))
-                .py(px(8.0))
-                .rounded(px(5.0))
-                .bg(theme.textbox)
-                .type_style(Type::Base)
-                .font_family(PRIMARY_FAMILY)
-                .text_color(theme.form_text)
-                // The component's own 1.25rem line would set 20pt lines.
-                .child(
-                    Textarea::new(input)
-                        .appearance(false)
-                        .h_full()
-                        .font_family(PRIMARY_FAMILY)
-                        .text_size(px(14.0))
-                        .line_height(px(18.0)),
-                ),
-        )
+    // The controls' frame, not a hand-made one: in a translucent window the
+    // `textbox` well is a tint, and an edge drawn as a fill under it shows
+    // through the whole box (the focus ring's blue, the border's gray).
+    // `edged` draws a real 1px border there instead.
+    controls::textarea_frame(
+        div()
+            .flex()
+            // The text area's own inset (about 9pt across, 8pt down)
+            // makes up the rest of the frame's 16pt.
+            .px(px(7.0))
+            .py(px(8.0))
+            .type_style(Type::Base)
+            .font_family(PRIMARY_FAMILY)
+            .text_color(theme.form_text)
+            // The component's own 1.25rem line would set 20pt lines.
+            .child(
+                Textarea::new(input)
+                    .appearance(false)
+                    .h_full()
+                    .font_family(PRIMARY_FAMILY)
+                    .text_size(px(14.0))
+                    .line_height(px(18.0)),
+            ),
+        focused,
+        theme,
+    )
+    .debug_selector(move || selector.into())
+    .flex_none()
+    .w_full()
+    .h(px(height))
 }
 
 impl Render for AgentEditor {

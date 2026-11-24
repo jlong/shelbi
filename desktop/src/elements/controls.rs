@@ -235,21 +235,27 @@ fn edged(el: Div, edge: Hsla, theme: &Theme) -> Div {
 /// appearance off): the same 1px edge, `textbox` well and focus glow, as
 /// tall as its content (the caller sets its width).
 pub fn textarea_box(content: impl IntoElement, focused: bool, theme: &Theme) -> Div {
+    textarea_frame(
+        div()
+            .px(px(8.0))
+            .py(px(6.0))
+            .type_style(Type::Base)
+            .text_color(theme.form_text)
+            .child(content),
+        focused,
+        theme,
+    )
+}
+
+/// The frame of a multi-line textbox around `well` (the caller's inset,
+/// type and content): `well` takes the `textbox` fill inside the 1px edge,
+/// which turns to the focus ring, with the glow around it, while
+/// `focused`. Focus never changes the fill. [`textarea_box`] is this with
+/// the compact inset; a tall editor sets its own inset and height.
+pub fn textarea_frame(well: Div, focused: bool, theme: &Theme) -> Div {
     let edge = if focused { theme.focus_ring } else { theme.input_border };
     edged(div().relative().flex().flex_row(), edge, theme)
-        .child(
-            div()
-                .relative()
-                .flex_1()
-                .min_w_0()
-                .px(px(8.0))
-                .py(px(6.0))
-                .rounded(px(5.0))
-                .bg(theme.textbox)
-                .type_style(Type::Base)
-                .text_color(theme.form_text)
-                .child(content),
-        )
+        .child(well.relative().flex_1().min_w_0().rounded(px(5.0)).bg(theme.textbox))
         .children(focused.then(|| glow(6.0, theme.focus_glow)))
 }
 
@@ -824,5 +830,29 @@ mod tests {
             let x = 100.0 + slider_fraction(v, &o) * 200.0;
             assert_eq!(slider_value_at(x, 100.0, 300.0, &o), v, "round trip at {v}");
         }
+    }
+
+    /// The Instructions box read as a block of focus-ring blue: a dark,
+    /// full-contrast, translucent window's canvas is the well's own black,
+    /// so the `textbox` tint over it is fully clear, and a frame that drew
+    /// its edge as a fill under the well showed that fill through it. The
+    /// frame draws a 1px border there, and focus never fills it.
+    #[test]
+    fn a_textarea_frame_draws_a_border_where_the_well_is_clear() {
+        use gpui::Styled;
+        use shelbi_app::theme::ThemePreference;
+        let dark = Theme::resolve_with(ThemePreference::Dark, 100, gpui::WindowAppearance::Dark);
+        let glass = dark.with_opacity(0.8);
+        assert_eq!(glass.textbox.a, 0.0, "the well is clear on this glass");
+        for (focused, edge) in [(false, glass.input_border), (true, glass.focus_ring)] {
+            let mut frame = textarea_frame(div(), focused, &glass);
+            let style = frame.style();
+            assert_eq!(style.background, None, "no fill behind a clear well (focused: {focused})");
+            assert_eq!(style.border_widths.left, Some(px(1.0).into()));
+            assert_eq!(style.border_color, Some(edge));
+        }
+        // Opaque, the edge is the box's fill, 1px of it around the well.
+        let mut frame = textarea_frame(div(), true, &dark);
+        assert_eq!(frame.style().background, Some(dark.focus_ring.into()));
     }
 }
