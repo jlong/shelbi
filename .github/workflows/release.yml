@@ -351,6 +351,176 @@ jobs:
         if: always() && env.KEYCHAIN != ''
         run: security delete-keychain "$KEYCHAIN" || true
 
+  desktop-linux-release:
+    name: Desktop app (Linux archive)
+    # Like desktop-release: a tag push builds after `release` has created the
+    # GitHub release and attaches the archive; a workflow_dispatch dry run
+    # builds it too and keeps it as a workflow artifact.
+    needs:
+      - validate
+      - smoke
+      - release
+    if: >-
+      always() &&
+      needs.validate.result == 'success' &&
+      needs.smoke.result == 'success' &&
+      (needs.release.result == 'success' ||
+       (needs.validate.outputs.dry_run == 'true' && needs.release.result == 'skipped'))
+    # gpui's Linux backend can't be cross-built from the macOS goreleaser job,
+    # so the archive is built natively here. Ubuntu 24.04's glibc (2.39) is
+    # older than Arch's, so the binary runs there.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      DRY_RUN: ${{ needs.validate.outputs.dry_run }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The same libraries desktop-linux-ci.yml builds against, plus
+      # desktop-file-validate for the archive's desktop entry.
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libwayland-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-xcb-dev libxcb1-dev libxcb-xkb-dev libfontconfig-dev libfreetype-dev \
+            libvulkan1 libssl-dev libzstd-dev pkg-config clang desktop-file-utils
+
+      - name: Install the pinned desktop toolchain
+        working-directory: desktop
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Cache desktop/target
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop
+          key: linux-release
+
+      - name: Build shelbi-desktop_Linux_x86_64.tar.gz
+        run: desktop/scripts/linux-archive.sh --out "$RUNNER_TEMP/desktop-linux"
+
+      - name: Keep the archive as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shelbi-desktop-${{ needs.validate.outputs.version }}-linux-x86_64
+          path: |
+            ${{ runner.temp }}/desktop-linux/shelbi-desktop_Linux_x86_64.tar.gz
+            ${{ runner.temp }}/desktop-linux/shelbi-desktop_Linux_x86_64.tar.gz.sha256
+          if-no-files-found: error
+
+      - name: Attach the archive to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          archive="$RUNNER_TEMP/desktop-linux/shelbi-desktop_Linux_x86_64.tar.gz"
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: would attach $(basename "$archive") and its .sha256 to $RELEASE_TAG"
+            exit 0
+          fi
+          gh release upload "$RELEASE_TAG" "$archive" "$archive.sha256" --clobber
+
+  aur-publish:
+    name: Publish AUR packages
+    # Both packages or neither: shelbi-desktop-bin pins shelbi-bin to its own
+    # version, so a shelbi-bin bump without the app's would stop `yay -Syu`
+    # for everyone who has the app.
+    needs:
+      - validate
+      - release
+      - desktop-linux-release
+    if: >-
+      always() &&
+      github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+      needs.release.result == 'success' &&
+      needs.desktop-linux-release.result == 'success'
+    runs-on: ubuntu-latest
+    # makepkg and pacman, to render .SRCINFO and to build and install the
+    # packages exactly as an Arch user would before they are published.
+    container: archlinux:base-devel
+    environment: release-downstream
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Install tools
+        run: pacman -Syu --noconfirm --needed git openssh desktop-file-utils
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # makepkg refuses to run as root.
+      - name: Add a build user
+        run: |
+          useradd -m builder
+          install -d -o builder "$RUNNER_TEMP/aur"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Render and build both packages from the release
+        run: |
+          for pkg in shelbi-bin shelbi-desktop-bin; do
+            runuser -u builder -- scripts/release/render-aur-package.sh \
+              --package "$pkg" --version "$VERSION" --repo "$GITHUB_REPOSITORY" \
+              --out "$RUNNER_TEMP/aur/$pkg"
+            (cd "$RUNNER_TEMP/aur/$pkg" && runuser -u builder -- makepkg -f --nodeps --noconfirm)
+          done
+
+      # pacman resolves the repo dependencies (a vulkan-driver provider
+      # included); shelbi-bin satisfies the app's pinned one.
+      - name: Install both and check them
+        run: |
+          pacman -U --noconfirm \
+            "$RUNNER_TEMP"/aur/shelbi-bin/shelbi-bin-"$VERSION"-*.pkg.tar.zst \
+            "$RUNNER_TEMP"/aur/shelbi-desktop-bin/shelbi-desktop-bin-"$VERSION"-*.pkg.tar.zst
+          shelbi --version | grep -F "$VERSION"
+          test -f /usr/share/shelbi/plugins/update-shelbi-configuration/.claude-plugin/plugin.json
+          desktop-file-validate /usr/share/applications/dev.shelbi.Desktop.desktop
+          for size in 16 24 32 48 64 128 256 512; do
+            test -f "/usr/share/icons/hicolor/${size}x${size}/apps/dev.shelbi.Desktop.png"
+          done
+          # The app's own check: its version, and the packaged CLI found and
+          # matching (exit 0). No window and no daemon.
+          shelbi-desktop --print-version | tee "$RUNNER_TEMP/print-version.txt"
+          grep -qx "Shelbi $VERSION" "$RUNNER_TEMP/print-version.txt"
+          grep -q "^shelbi CLI: /usr/bin/shelbi $VERSION (matches)$" "$RUNNER_TEMP/print-version.txt"
+
+      - name: Push to the AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "::warning title=AUR not updated::AUR_SSH_PRIVATE_KEY is not set; built and checked shelbi-bin and shelbi-desktop-bin $VERSION but pushed neither. See docs/release.md."
+            exit 0
+          fi
+          ssh_dir="$RUNNER_TEMP/aur-ssh"
+          install -d -m 700 "$ssh_dir"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$ssh_dir/key"
+          chmod 600 "$ssh_dir/key"
+          ssh-keyscan -t ed25519 aur.archlinux.org > "$ssh_dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -i $ssh_dir/key -o IdentitiesOnly=yes -o UserKnownHostsFile=$ssh_dir/known_hosts"
+          git config --global user.name "shelbi release automation"
+          git config --global user.email "release@shelbi.dev"
+          # shelbi-bin first: the app depends on it. Cloning a package that
+          # doesn't exist yet gives an empty repository; the push creates it.
+          for pkg in shelbi-bin shelbi-desktop-bin; do
+            repo="$RUNNER_TEMP/aur-git/$pkg"
+            git clone "ssh://aur@aur.archlinux.org/$pkg.git" "$repo"
+            cp "$RUNNER_TEMP/aur/$pkg/PKGBUILD" "$RUNNER_TEMP/aur/$pkg/.SRCINFO" "$repo/"
+            git -C "$repo" add PKGBUILD .SRCINFO
+            if git -C "$repo" diff --cached --quiet; then
+              echo "$pkg is already at $VERSION"
+              continue
+            fi
+            git -C "$repo" commit -m "Update to $VERSION"
+            git -C "$repo" push origin HEAD:master
+          done
+          rm -rf "$ssh_dir"
+
   homebrew-pr:
     name: Open Homebrew tap PR
     # The desktop job only adds the cask to the same PR; its failure must not
@@ -695,6 +865,7 @@ jobs:
       - homebrew-pr
       - apt-publish
       - desktop-release
+      - aur-publish
     if: always() && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment: release-downstream
@@ -707,6 +878,7 @@ jobs:
           APT_RESULT: ${{ needs.apt-publish.result }}
           DESKTOP_RESULT: ${{ needs.desktop-release.result }}
           DESKTOP_NOTARIZED: ${{ needs.desktop-release.outputs.notarized }}
+          AUR_RESULT: ${{ needs.aur-publish.result }}
         run: |
           cat <<EOF
           GitHub Release artifacts, checksums, .deb package, and attestations are published.
@@ -721,4 +893,6 @@ jobs:
             attached and added to the tap's shelbi-desktop cask only when notarized, which
             needs MACOS_CERTIFICATE_P12, MACOS_CERTIFICATE_PASSWORD, NOTARY_KEY_P8,
             NOTARY_KEY_ID, and NOTARY_ISSUER_ID.
+          - AUR shelbi-bin and shelbi-desktop-bin (result: $AUR_RESULT) are built,
+            installed and checked on Arch, then pushed when AUR_SSH_PRIVATE_KEY is set.
           EOF

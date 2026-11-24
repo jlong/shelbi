@@ -80,15 +80,34 @@ A tag push runs these jobs in `release.yml`:
    Gatekeeper accepts the app, and launches it through LaunchServices with
    `open -W ... --args --print-version`, asserting the app's version and that
    it found a matching `shelbi`.
-9. **`downstream-publication`** — always runs after the above and records the
-   downstream result in the job log.
+9. **`desktop-linux-release`**: after `release`, on `ubuntu-24.04` (gpui's
+   Linux backend can't be cross-built from the macOS goreleaser job): runs
+   `desktop/scripts/linux-archive.sh` to build
+   `shelbi-desktop_Linux_x86_64.tar.gz` (the app binary, its desktop entry and
+   hicolor icons) plus a `.sha256`, keeps both as a workflow artifact, and
+   attaches them to the GitHub release.
+10. **`aur-publish`**: after both, in an `archlinux:base-devel` container in
+    the **`release-downstream`** environment: renders the `shelbi-bin` and
+    `shelbi-desktop-bin` packages (`packaging/aur/`,
+    `scripts/release/render-aur-package.sh`) from the release's
+    `checksums.txt` and the desktop archive's `.sha256`, builds them with
+    `makepkg`, installs both with `pacman -U`, and checks the CLI, the
+    plugins, the desktop entry, the icons and `shelbi-desktop
+    --print-version` (the app finds `/usr/bin/shelbi` at its own version).
+    Then it pushes each `PKGBUILD` and `.SRCINFO` to the AUR, `shelbi-bin`
+    first, when `AUR_SSH_PRIVATE_KEY` is set (otherwise a warning). It runs
+    only when the Linux archive was built: the app pins `shelbi-bin` to its own
+    version, so publishing the CLI alone would block `yay -Syu` for app users.
+11. **`downstream-publication`** — always runs after the above and records the
+    downstream result in the job log.
 
 The `workflow_dispatch` path (a manual run with a synthetic `ref_name` such as
 `v0.9.0`) is the **dry-run path**: it runs `validate` and `smoke`, then a
 `goreleaser-dry-run` job that builds snapshot artifacts on `macos-15` without
-publishing a GitHub Release, and `desktop-release`, which bundles the app (signed
+publishing a GitHub Release, `desktop-release`, which bundles the app (signed
 and notarized when the secrets are present) and reports what it would attach
-without touching any release.
+without touching any release, and `desktop-linux-release`, which builds the Linux
+archive and keeps it as a workflow artifact. `aur-publish` runs only on a tag.
 
 ## Permissions and environments
 
@@ -126,6 +145,11 @@ Downstream publication (already provisioned) needs:
   APT hosting repository.
 - `APT_GPG_PRIVATE_KEY` — ASCII-armored private key for signing APT metadata.
 - `APT_GPG_PASSPHRASE` — passphrase for the APT private key.
+- `AUR_SSH_PRIVATE_KEY` — the private half of an SSH key registered on the AUR
+  account that maintains `shelbi-bin` and `shelbi-desktop-bin` (My Account ▸
+  SSH Public Key on aur.archlinux.org). Without it `aur-publish` still builds
+  and checks both packages but pushes neither, with a warning. The first push
+  creates each package on the AUR.
 
 The desktop app's signing and notarization (`desktop-release`) needs these five,
 on the `release` environment or the repository. The names are fixed; until all
@@ -269,6 +293,8 @@ Published GitHub Release artifacts:
 - Darwin `x86_64` archive
 - Linux `x86_64` archive
 - Debian `amd64` package
+- `shelbi-desktop_Linux_x86_64.tar.gz` and its `.sha256` (the Linux desktop
+  app; not in `checksums.txt`, which goreleaser writes before it is built)
 - `checksums.txt`
 - GitHub artifact attestation over `checksums.txt`
 
@@ -306,6 +332,14 @@ scripts/release/wait-for-apt-consistency.sh --base-url https://apt.shelbi.dev
 
 The installed version must match `VERSION`.
 
+On Arch (the `aur-publish` job checks the same packages before pushing them):
+
+```bash
+yay -S shelbi-desktop-bin            # pulls in shelbi-bin
+shelbi --version
+shelbi-desktop --print-version       # "shelbi CLI: /usr/bin/shelbi $VERSION (matches)"
+```
+
 ## Downstream publication
 
 Homebrew and APT publication run as jobs in the release workflow, each gated on a
@@ -340,6 +374,13 @@ are provisioned:
   ```
 
   See [docs/release-apt.md](release-apt.md) for the full APT runbook.
+- **AUR:** the `aur-publish` job pushes `shelbi-bin` and `shelbi-desktop-bin`
+  over SSH (`ssh://aur@aur.archlinux.org/<package>.git`) once it has built,
+  installed and checked both in an Arch container. It needs the
+  `AUR_SSH_PRIVATE_KEY` secret on `release-downstream`. A bad package is
+  rolled back by pushing a fixed `PKGBUILD` with `pkgrel` bumped (render it
+  with `scripts/release/render-aur-package.sh`, then edit `pkgrel`). See
+  [packaging/aur/README.md](../packaging/aur/README.md).
 
 ## Rollback
 
