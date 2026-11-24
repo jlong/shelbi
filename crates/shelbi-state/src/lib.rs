@@ -266,7 +266,8 @@ pub use workspace_state_migration::{
     legacy_workspace_state_dirs, migrate_legacy_workspace_state_dir, LegacyStateDisposition,
 };
 pub use workspace_status::{
-    clear_review_serve_pgid, clear_workspace_status, control_socket_path, hub_socket_path,
+    clear_observation_degraded, mark_observation_degraded, observation_degraded,
+    observation_degraded_path, clear_review_serve_pgid, clear_workspace_status, control_socket_path, hub_socket_path,
     load_workspace_status, parse_orchestrator_title_state, parse_pane_title_marker,
     parse_pane_title_state, read_review_serve_pgid, rehome_review_serve_pgid_path,
     review_serve_pgid_path, save_workspace_status, workspace_status_path, workspaces_dir,

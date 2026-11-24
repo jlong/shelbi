@@ -57,7 +57,7 @@ pub use model::{
     MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS, SUBTASK_WORKFLOW_NAME, TASK_WORKFLOW_NAME,
 };
 pub use opencode::{
-    opencode_unsupported_message, opencode_version_supported, parse_opencode_version,
+    opencode_fallback_dialog_signatures, opencode_unsupported_message, opencode_version_supported, parse_opencode_version,
     OPENCODE_INSTALL, OPENCODE_MIN_VERSION, OPENCODE_UPGRADE,
 };
 pub use releases::{ReleasesConfig, TagGlob};

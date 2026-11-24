@@ -32,10 +32,31 @@ pub fn launch_command(spec: &AgentRunnerSpec) -> String {
     parts.join(" ")
 }
 
+/// Where an OpenCode launch takes its `OPENCODE_CONFIG_CONTENT` from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenCodeConfigSource<'a> {
+    /// Built from the spec's logical flags plus this layer, and written into
+    /// the launch line. Left out when there's nothing to set.
+    Inline(&'a OpenCodeLayer),
+    /// Read at launch from this worktree-relative file, which the caller
+    /// generated with [`RunnerAdapter::opencode_config`] (a worker's
+    /// `.shelbi/opencode/config.json`). The spec's logical flags are already
+    /// in it, so the launch only strips them.
+    File(&'a str),
+}
+
+/// OpenCode's launch line with no layer beyond the spec's own flags. See
+/// [`opencode_launch_command_with`].
+pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
+    opencode_launch_command_with(spec, OpenCodeConfigSource::Inline(&OpenCodeLayer::default()))
+}
+
 /// OpenCode's launch line:
 ///
 /// ```text
-/// env SHELBI_PANE_TTY="$(tty)" [OPENCODE_CONFIG_CONTENT='{…}'] \
+/// env SHELBI_PANE_TTY="$(tty)" \
+///     [SHELBI_OPENCODE_USER_CONFIG="${SHELBI_OPENCODE_USER_CONFIG-${OPENCODE_CONFIG_CONTENT-}}" \
+///      OPENCODE_CONFIG_CONTENT=<config>] \
 ///     OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' \
 ///     OPENCODE_DISABLE_AUTOUPDATE=1 \
 ///   opencode --standalone [--auto] <flags>
@@ -46,14 +67,16 @@ pub fn launch_command(spec: &AgentRunnerSpec) -> String {
 ///   inherits this pane's environment (`TASK_ID`, the hub address). That
 ///   server has no controlling terminal, so the pane's tty path is exported
 ///   as [`OPENCODE_PANE_TTY_ENV`] for the plugin's `shelbi:<state>` markers.
-/// - `OPENCODE_CONFIG_CONTENT` is inline config OpenCode merges over the
-///   user's own. It carries what the TUI has no flag for: the model (a
-///   logical `--model <id>` in the flags, from [`RunnerAdapter::with_model`]
-///   or written by a user) and the permission ceiling (the logical
-///   `--permission-mode <mode>` [`RunnerAdapter::with_permission_mode`]
-///   adds, plus [`with_edits_denied`]'s marker), as rules on the `build` and
-///   `plan` agents (see [`opencode_permission_rules`]). It is left out when
-///   there is neither, so the user's own OpenCode settings stand.
+/// - `OPENCODE_CONFIG_CONTENT` is the config layer OpenCode merges over the
+///   user's own files (see [`RunnerAdapter::opencode_config`]): inline, or
+///   `"$(cat <file>)"` for a worker's generated layer. It is left out when
+///   the inline layer has nothing to set, so the user's settings stand.
+/// - Whenever Shelbi sets `OPENCODE_CONFIG_CONTENT` it also keeps the user's
+///   own value, as it was before any Shelbi launch, in
+///   [`OPENCODE_USER_CONFIG_ENV`]. Everything the OpenCode process starts
+///   inherits Shelbi's layer, so a `shelbi` command run from inside the pane
+///   reads the user's value back from there ([`opencode_user_config`])
+///   rather than mistaking Shelbi's layer for it.
 /// - `OPENCODE_CLI_CONFIG_CONTENT` turns off OpenCode's terminal title,
 ///   which otherwise overwrites the plugin's `shelbi:<state>` markers with
 ///   `OC | <session title>`, and its highlights.
@@ -62,10 +85,8 @@ pub fn launch_command(spec: &AgentRunnerSpec) -> String {
 /// - `--auto` (answer every remaining ask) is passed only for a
 ///   `bypassPermissions` ceiling; any other ceiling drops a hand-written one,
 ///   since it would approve the asks the ceiling exists to raise.
-pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
-    let model = flag_value(&spec.flags, &["--model", "-m"]);
+pub fn opencode_launch_command_with(spec: &AgentRunnerSpec, config: OpenCodeConfigSource<'_>) -> String {
     let mode = flag_value(&spec.flags, &[OPENCODE_PERMISSION_FLAG]);
-    let deny_edits = spec.flags.iter().any(|f| f == OPENCODE_DENY_EDITS_FLAG);
     let bypass = mode.as_deref().is_some_and(|m| shelbi_core::permission_mode_rank(m) >= 3);
     let mut flags: Vec<String> = strip_flag_with_value(&spec.flags, &["--model", "-m", OPENCODE_PERMISSION_FLAG])
         .into_iter()
@@ -78,12 +99,23 @@ pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
         }
     }
 
+    let content = match config {
+        OpenCodeConfigSource::Inline(layer) => RunnerAdapter::for_spec(spec)
+            .opencode_config(spec, layer)
+            .json
+            .map(|json| shell_escape(&json)),
+        OpenCodeConfigSource::File(rel) => Some(format!("\"$(cat {})\"", shell_escape(rel))),
+    };
+
     // `env`, not a bare `VAR=value` prefix: callers run the line as
     // `exec {launch}`, and after `exec` an assignment word is taken for the
     // command name.
     let mut parts = vec!["env".to_string(), format!("{OPENCODE_PANE_TTY_ENV}=\"$(tty)\"")];
-    if let Some(config) = opencode_config_content(model.as_deref(), mode.as_deref(), deny_edits) {
-        parts.push(format!("OPENCODE_CONFIG_CONTENT={}", shell_escape(&config)));
+    if let Some(content) = content {
+        parts.push(format!(
+            "{OPENCODE_USER_CONFIG_ENV}=\"${{{OPENCODE_USER_CONFIG_ENV}-${{{OPENCODE_CONFIG_ENV}-}}}}\""
+        ));
+        parts.push(format!("{OPENCODE_CONFIG_ENV}={content}"));
     }
     parts.push(format!("OPENCODE_CLI_CONFIG_CONTENT={}", shell_escape(OPENCODE_CLI_CONFIG_CONTENT)));
     parts.push("OPENCODE_DISABLE_AUTOUPDATE=1".into());
@@ -95,24 +127,197 @@ pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
     parts.join(" ")
 }
 
-/// The JSON for `OPENCODE_CONFIG_CONTENT`: the model at the root and the
-/// permission rules appended to the `build` and `plan` agents. Agent rules
-/// load after the user's and the project's, and the last matching rule wins,
-/// so these hold the ceiling even over a looser user config. `None` when
-/// there's nothing to set.
-fn opencode_config_content(model: Option<&str>, mode: Option<&str>, deny_edits: bool) -> Option<String> {
-    let rules = opencode_permission_rules(mode, deny_edits);
-    let mut keys = Vec::new();
-    if let Some(model) = model {
-        keys.push(format!("\"model\":{}", json_string(model)));
+/// OpenCode's inline-config variable: the highest-ranking config document a
+/// user can set, above global, project and `.opencode/` config.
+pub const OPENCODE_CONFIG_ENV: &str = "OPENCODE_CONFIG_CONTENT";
+
+/// Where an OpenCode launch keeps the user's own `OPENCODE_CONFIG_CONTENT`
+/// (empty when they had none) while Shelbi's layer takes the variable. See
+/// [`opencode_launch_command_with`].
+pub const OPENCODE_USER_CONFIG_ENV: &str = "SHELBI_OPENCODE_USER_CONFIG";
+
+/// The user's own `OPENCODE_CONFIG_CONTENT` in a launch environment, read
+/// through `get`: the value kept in [`OPENCODE_USER_CONFIG_ENV`] when an
+/// OpenCode pane Shelbi launched is an ancestor (its `OPENCODE_CONFIG_CONTENT`
+/// is Shelbi's layer), else `OPENCODE_CONFIG_CONTENT` itself. `None` for
+/// unset or blank.
+pub fn opencode_user_config(get: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let value = match get(OPENCODE_USER_CONFIG_ENV) {
+        Some(kept) => kept,
+        None => get(OPENCODE_CONFIG_ENV)?,
+    };
+    (!value.trim().is_empty()).then_some(value)
+}
+
+/// What an OpenCode config layer carries beyond the runner spec's logical
+/// flags (model, permission ceiling, edit deny). Every path is absolute:
+/// OpenCode resolves a relative entry against the document that names it,
+/// and an inline document has no directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenCodeLayer {
+    /// Instruction files, added to the system prompt (system authority, and
+    /// re-read when the file changes).
+    pub instructions: Vec<String>,
+    /// Skill directories, each holding `<name>/SKILL.md` entries.
+    pub skills: Vec<String>,
+    /// Plugin directories.
+    pub plugins: Vec<String>,
+    /// The model variant (`provider/model#variant`) for the agents' model.
+    /// Only set when OpenCode reports that variant for the model (see
+    /// [`opencode_effort_variant`]).
+    pub variant: Option<String>,
+    /// The user's own `OPENCODE_CONFIG_CONTENT` from the launch environment
+    /// ([`opencode_user_config`]), merged under Shelbi's keys.
+    pub user_config: Option<String>,
+}
+
+/// The `OPENCODE_CONFIG_CONTENT` an OpenCode launch sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenCodeConfig {
+    /// The JSON, or `None` when there's nothing to set (and the user's own
+    /// value, if any, can stand as it is).
+    pub json: Option<String>,
+    /// The user's own value wasn't a JSON object, so it was left out rather
+    /// than merged. The caller says so: the user's settings didn't apply.
+    pub user_config_unreadable: bool,
+}
+
+impl RunnerAdapter {
+    /// The config layer for an OpenCode launch, as the JSON for
+    /// `OPENCODE_CONFIG_CONTENT`. Pure: everything comes from `spec`'s
+    /// logical flags and `layer`.
+    ///
+    /// ```jsonc
+    /// {
+    ///   "instructions": ["<abs>/.shelbi/opencode/instructions.md"],
+    ///   "skills": ["<abs>/.shelbi/opencode/skills"],
+    ///   "plugins": ["<abs>/.shelbi/opencode/plugins/shelbi"],
+    ///   "agents": {
+    ///     "build": { "model": "provider/model#variant", "permissions": [ … ] },
+    ///     "plan":  { "model": "provider/model#variant", "permissions": [ … ] }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// - A key is emitted only when Shelbi has a value for it, so with no
+    ///   model and no ceiling `agents` is left out and the user's OpenCode
+    ///   settings govern.
+    /// - The model goes on the `build` and `plan` agents rather than the
+    ///   root, because OpenCode drops a root model's `#variant`.
+    /// - The permission rules ([`opencode_permission_rules`]) go on both
+    ///   agents. Agent rules load after the user's and the project's, and
+    ///   the last matching rule wins, so they hold the ceiling.
+    /// - The user's own value ([`OpenCodeLayer::user_config`]) is merged
+    ///   under Shelbi's keys, since setting the variable would otherwise
+    ///   shadow it: objects merge key by key, lists keep the user's entries
+    ///   and add Shelbi's after them (so Shelbi's permission rules still come
+    ///   last), and any other value Shelbi sets replaces the user's.
+    ///
+    /// A runner other than OpenCode gets no layer.
+    pub fn opencode_config(self, spec: &AgentRunnerSpec, layer: &OpenCodeLayer) -> OpenCodeConfig {
+        use serde_json::{Map, Value};
+
+        if !self.is_opencode() {
+            return OpenCodeConfig { json: None, user_config_unreadable: false };
+        }
+        let strings = |list: &[String]| Value::Array(list.iter().cloned().map(Value::String).collect());
+
+        let mut shelbi = Map::new();
+        if !layer.instructions.is_empty() {
+            shelbi.insert("instructions".into(), strings(&layer.instructions));
+        }
+        if !layer.skills.is_empty() {
+            shelbi.insert("skills".into(), strings(&layer.skills));
+        }
+        if !layer.plugins.is_empty() {
+            shelbi.insert("plugins".into(), strings(&layer.plugins));
+        }
+
+        let model = flag_value(&spec.flags, &["--model", "-m"]).map(|model| {
+            match layer.variant.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                Some(variant) if !model.contains('#') => format!("{model}#{variant}"),
+                _ => model,
+            }
+        });
+        let mode = flag_value(&spec.flags, &[OPENCODE_PERMISSION_FLAG]);
+        let deny_edits = spec.flags.iter().any(|f| f == OPENCODE_DENY_EDITS_FLAG);
+        let rules = opencode_permission_rules(mode.as_deref(), deny_edits);
+        let mut agent = Map::new();
+        if let Some(model) = model {
+            agent.insert("model".into(), Value::String(model));
+        }
+        if !rules.is_empty() {
+            agent.insert(
+                "permissions".into(),
+                Value::Array(rules.into_iter().map(OpenCodeRule::to_json).collect()),
+            );
+        }
+        if !agent.is_empty() {
+            let agent = Value::Object(agent);
+            let mut agents = Map::new();
+            agents.insert("build".into(), agent.clone());
+            agents.insert("plan".into(), agent);
+            shelbi.insert("agents".into(), Value::Object(agents));
+        }
+
+        let (user, user_config_unreadable) = match layer.user_config.as_deref().map(str::trim) {
+            None | Some("") => (None, false),
+            Some(text) => match serde_json::from_str::<Value>(text) {
+                Ok(Value::Object(user)) => (Some(user), false),
+                _ => (None, true),
+            },
+        };
+        if shelbi.is_empty() {
+            // Nothing of Shelbi's: the user's value (if any) stands unchanged
+            // in the environment, so there's nothing to set.
+            return OpenCodeConfig { json: None, user_config_unreadable };
+        }
+        let mut merged = Value::Object(user.unwrap_or_default());
+        merge_under(&mut merged, Value::Object(shelbi));
+        OpenCodeConfig {
+            json: Some(merged.to_string()),
+            user_config_unreadable,
+        }
     }
-    if !rules.is_empty() {
-        let list = rules.iter().copied().map(OpenCodeRule::to_json).collect::<Vec<_>>().join(",");
-        keys.push(format!(
-            "\"agents\":{{\"build\":{{\"permissions\":[{list}]}},\"plan\":{{\"permissions\":[{list}]}}}}"
-        ));
+}
+
+/// Merge `ours` over `base`: objects key by key, lists by appending the
+/// entries `base` doesn't already hold, and anything else replaced.
+fn merge_under(base: &mut serde_json::Value, ours: serde_json::Value) {
+    use serde_json::Value;
+    match (base, ours) {
+        (Value::Object(base), Value::Object(ours)) => {
+            for (key, value) in ours {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_under(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (Value::Array(base), Value::Array(ours)) => {
+            for value in ours {
+                if !base.contains(&value) {
+                    base.push(value);
+                }
+            }
+        }
+        (base, ours) => *base = ours,
     }
-    (!keys.is_empty()).then(|| format!("{{{}}}", keys.join(",")))
+}
+
+/// The OpenCode model variant for a Shelbi effort level: the same-named
+/// variant (`low`, `medium`, `high`, `max`), only when OpenCode reports it
+/// for the chosen model (`available`, from `opencode models`). Variants are
+/// provider-specific, so anything else gets no variant and the model's own
+/// default stands.
+pub fn opencode_effort_variant(effort: ReasoningEffort, available: &[String]) -> Option<String> {
+    let name = effort.as_str();
+    available
+        .iter()
+        .find(|v| v.trim().eq_ignore_ascii_case(name))
+        .map(|_| name.to_string())
 }
 
 /// One OpenCode permission rule: `effect` for `action` on `resource`.
@@ -128,13 +333,8 @@ impl OpenCodeRule {
         OpenCodeRule { action, resource: "*", effect }
     }
 
-    fn to_json(self) -> String {
-        format!(
-            "{{\"action\":{},\"resource\":{},\"effect\":{}}}",
-            json_string(self.action),
-            json_string(self.resource),
-            json_string(self.effect)
-        )
+    fn to_json(self) -> serde_json::Value {
+        serde_json::json!({ "action": self.action, "resource": self.resource, "effect": self.effect })
     }
 }
 
@@ -238,22 +438,6 @@ fn flag_value(flags: &[String], names: &[&str]) -> Option<String> {
         }
     }
     found
-}
-
-/// `s` as a JSON string literal.
-fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Environment variable carrying the pane's tty path into an OpenCode
@@ -537,9 +721,10 @@ impl RunnerAdapter {
                 out.flags.push(override_arg);
                 out
             }
-            // OpenCode keeps a per-model variant the TUI selects itself; the
-            // project config's `#variant` suffix doesn't reach it, so Shelbi
-            // leaves effort to the user's OpenCode settings.
+            // OpenCode's effort is a per-model variant (`provider/model#high`)
+            // in the config layer, and only one OpenCode reports for that
+            // model counts (see `opencode_effort_variant`). Until Shelbi lists
+            // the models, effort is left to the user's OpenCode settings.
             RunnerKind::OpenCode | RunnerKind::Generic => spec.clone(),
         }
     }
@@ -694,7 +879,8 @@ impl MessageChannel {
 ///   path is the proven, shipped default, so claude resolves to
 ///   [`MessageChannel::Hooks`].
 /// - **OpenCode** loads Shelbi's plugin from the worktree's
-///   `.opencode/plugins/`, which runs the same hook scripts on OpenCode's
+///   `.shelbi/opencode/plugins/shelbi/` (named in the launch's config layer,
+///   see [`RunnerAdapter::opencode_config`]), which runs the same hook scripts on OpenCode's
 ///   session events and pushes the drained batch back in as a synthetic
 ///   message, so it resolves to [`MessageChannel::Hooks`] too.
 /// - **Codex and every other runner** resolve to [`MessageChannel::Polling`].
@@ -1386,21 +1572,222 @@ mod tests {
         );
     }
 
+    /// The `OPENCODE_CONFIG_CONTENT` value a launch line sets inline, parsed.
+    fn inline_config(line: &str) -> Option<serde_json::Value> {
+        let rest = line.split("OPENCODE_CONFIG_CONTENT='").nth(1)?;
+        let json = &rest[..rest.find("' ")?];
+        Some(serde_json::from_str(json).unwrap())
+    }
+
+    /// What every Shelbi-set `OPENCODE_CONFIG_CONTENT` is preceded by.
+    const KEEP_USER: &str =
+        r#"SHELBI_OPENCODE_USER_CONFIG="${SHELBI_OPENCODE_USER_CONFIG-${OPENCODE_CONFIG_CONTENT-}}""#;
+
     #[test]
-    fn opencode_model_leaves_the_argv_for_inline_config() {
+    fn opencode_model_leaves_the_argv_for_the_agents_in_inline_config() {
         let spec = with_model(&opencode(&[]), Some("anthropic/claude-sonnet-4-5"));
         assert_eq!(
             launch_command(&spec),
             format!(
-                r#"env SHELBI_PANE_TTY="$(tty)" OPENCODE_CONFIG_CONTENT='{{"model":"anthropic/claude-sonnet-4-5"}}' {OC_ENV} opencode --standalone"#
+                r#"env SHELBI_PANE_TTY="$(tty)" {KEEP_USER} OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{{"model":"anthropic/claude-sonnet-4-5"}},"plan":{{"model":"anthropic/claude-sonnet-4-5"}}}}}}' {OC_ENV} opencode --standalone"#
             )
         );
         // A hand-written `--model=` form is honored the same way, and a quote
         // in the id stays valid JSON.
         let spec = opencode(&["--model=we\"ird"]);
+        let config = inline_config(&launch_command(&spec)).unwrap();
+        assert_eq!(config["agents"]["build"]["model"], "we\"ird");
+    }
+
+    /// The pane-less layer pieces the worker launch fills in.
+    fn worker_layer() -> OpenCodeLayer {
+        OpenCodeLayer {
+            instructions: vec!["/wt/.shelbi/opencode/instructions.md".into()],
+            skills: vec!["/wt/.shelbi/opencode/skills".into()],
+            plugins: vec!["/wt/.shelbi/opencode/plugins/shelbi".into()],
+            ..OpenCodeLayer::default()
+        }
+    }
+
+    fn config_json(spec: &AgentRunnerSpec, layer: &OpenCodeLayer) -> Option<serde_json::Value> {
+        RunnerAdapter::for_spec(spec)
+            .opencode_config(spec, layer)
+            .json
+            .map(|json| serde_json::from_str(&json).unwrap())
+    }
+
+    #[test]
+    fn opencode_config_layer_emits_only_the_keys_shelbi_has() {
+        // Nothing at all: no layer, so the user's settings stand.
+        assert_eq!(config_json(&opencode(&[]), &OpenCodeLayer::default()), None);
+
+        // A worker's files with no model and no ceiling: no `agents`.
         assert_eq!(
-            launch_command(&spec),
-            format!(r#"env SHELBI_PANE_TTY="$(tty)" OPENCODE_CONFIG_CONTENT='{{"model":"we\"ird"}}' {OC_ENV} opencode --standalone"#)
+            config_json(&opencode(&[]), &worker_layer()),
+            Some(serde_json::json!({
+                "instructions": ["/wt/.shelbi/opencode/instructions.md"],
+                "skills": ["/wt/.shelbi/opencode/skills"],
+                "plugins": ["/wt/.shelbi/opencode/plugins/shelbi"],
+            }))
+        );
+
+        // An agent without skills leaves `skills` out.
+        let no_skills = OpenCodeLayer { skills: vec![], ..worker_layer() };
+        let config = config_json(&opencode(&[]), &no_skills).unwrap();
+        assert!(config.get("skills").is_none(), "{config}");
+
+        // Model, variant and ceiling land on both agents.
+        let spec = with_permission_mode(
+            &with_model(&opencode(&[]), Some("anthropic/claude-sonnet-5-5")),
+            Some("acceptEdits"),
+        );
+        let layer = OpenCodeLayer { variant: Some("high".into()), ..worker_layer() };
+        let config = config_json(&spec, &layer).unwrap();
+        let agent = serde_json::json!({
+            "model": "anthropic/claude-sonnet-5-5#high",
+            "permissions": [
+                {"action": "edit", "resource": "*", "effect": "allow"},
+                {"action": "shell", "resource": "*", "effect": "ask"},
+                {"action": "external_directory", "resource": "*", "effect": "ask"},
+            ],
+        });
+        assert_eq!(config["agents"], serde_json::json!({ "build": agent, "plan": agent }));
+
+        // A model the user already pinned a variant on keeps it.
+        let spec = with_model(&opencode(&[]), Some("p/m#max"));
+        let config = config_json(&spec, &layer).unwrap();
+        assert_eq!(config["agents"]["build"]["model"], "p/m#max");
+
+        // Only a ceiling: permissions without a model.
+        let spec = with_permission_mode(&opencode(&[]), Some("plan"));
+        let config = config_json(&spec, &OpenCodeLayer::default()).unwrap();
+        assert!(config["agents"]["build"].get("model").is_none(), "{config}");
+        assert_eq!(config.as_object().unwrap().len(), 1, "{config}");
+
+        // Another runner gets no layer.
+        let claude = AgentRunnerSpec { command: "claude".into(), ..opencode(&[]) };
+        assert_eq!(config_json(&claude, &worker_layer()), None);
+    }
+
+    #[test]
+    fn opencode_config_layer_merges_the_users_own_content_under_shelbis() {
+        let spec = with_permission_mode(&with_model(&opencode(&[]), Some("p/shelbi")), Some("default"));
+        let user = serde_json::json!({
+            "model": "p/root",
+            "theme": "dark",
+            "instructions": ["/home/me/rules.md"],
+            "plugins": ["/home/me/plugin"],
+            "agents": {
+                "build": {
+                    "model": "p/user",
+                    "steps": 40,
+                    "permissions": [{"action": "shell", "resource": "rm *", "effect": "deny"}],
+                },
+                "review": {"model": "p/review"},
+            },
+            "mcp": {"servers": {"docs": {"url": "https://example.test"}}},
+        });
+        let layer = OpenCodeLayer { user_config: Some(user.to_string()), ..worker_layer() };
+        let config = config_json(&spec, &layer).unwrap();
+
+        // Keys Shelbi doesn't set survive untouched.
+        assert_eq!(config["model"], "p/root");
+        assert_eq!(config["theme"], "dark");
+        assert_eq!(config["mcp"], user["mcp"]);
+        assert_eq!(config["agents"]["review"], user["agents"]["review"]);
+        assert_eq!(config["agents"]["build"]["steps"], 40);
+        // Lists keep the user's entries, Shelbi's after them.
+        assert_eq!(
+            config["instructions"],
+            serde_json::json!(["/home/me/rules.md", "/wt/.shelbi/opencode/instructions.md"])
+        );
+        assert_eq!(
+            config["plugins"],
+            serde_json::json!(["/home/me/plugin", "/wt/.shelbi/opencode/plugins/shelbi"])
+        );
+        // Shelbi wins on the values it sets, and its permission rules come
+        // last, so the ceiling still holds over the user's rules.
+        assert_eq!(config["agents"]["build"]["model"], "p/shelbi");
+        let rules = config["agents"]["build"]["permissions"].as_array().unwrap();
+        assert_eq!(rules[0], user["agents"]["build"]["permissions"][0]);
+        assert_eq!(rules.len(), 1 + rules_for(Some("default")).len());
+        assert_eq!(config["agents"]["plan"]["model"], "p/shelbi");
+
+        let result = RunnerAdapter::for_spec(&spec).opencode_config(&spec, &layer);
+        assert!(!result.user_config_unreadable);
+
+        // With nothing of Shelbi's to add, the user's value is left alone.
+        let bare = OpenCodeLayer { user_config: Some(user.to_string()), ..OpenCodeLayer::default() };
+        assert_eq!(config_json(&opencode(&[]), &bare), None);
+
+        // A value that isn't a JSON object can't be merged: Shelbi's layer
+        // goes in alone and the caller is told.
+        for bad in ["{not json", "[1,2]", "\"text\""] {
+            let layer = OpenCodeLayer { user_config: Some(bad.into()), ..worker_layer() };
+            let result = RunnerAdapter::for_spec(&spec).opencode_config(&spec, &layer);
+            assert!(result.user_config_unreadable, "{bad}");
+            let config: serde_json::Value = serde_json::from_str(&result.json.unwrap()).unwrap();
+            assert_eq!(config["instructions"], serde_json::json!(["/wt/.shelbi/opencode/instructions.md"]));
+        }
+        // Blank is no value at all.
+        let layer = OpenCodeLayer { user_config: Some("  ".into()), ..worker_layer() };
+        assert!(!RunnerAdapter::for_spec(&spec).opencode_config(&spec, &layer).user_config_unreadable);
+    }
+
+    fn rules_for(mode: Option<&str>) -> Vec<OpenCodeRule> {
+        opencode_permission_rules(mode, false)
+    }
+
+    #[test]
+    fn opencode_user_config_prefers_the_value_a_shelbi_launch_kept() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| pairs.iter().find(|(k, _)| *k == key).map(|(_, v)| v.to_string())
+        };
+        assert_eq!(opencode_user_config(env(&[])), None);
+        assert_eq!(
+            opencode_user_config(env(&[("OPENCODE_CONFIG_CONTENT", "{\"a\":1}")])),
+            Some("{\"a\":1}".into())
+        );
+        // Inside a Shelbi OpenCode pane the variable holds Shelbi's layer; the
+        // user's own value is the one the launch kept, even an empty one.
+        assert_eq!(
+            opencode_user_config(env(&[
+                ("OPENCODE_CONFIG_CONTENT", "{\"shelbi\":1}"),
+                ("SHELBI_OPENCODE_USER_CONFIG", "{\"a\":1}"),
+            ])),
+            Some("{\"a\":1}".into())
+        );
+        assert_eq!(
+            opencode_user_config(env(&[
+                ("OPENCODE_CONFIG_CONTENT", "{\"shelbi\":1}"),
+                ("SHELBI_OPENCODE_USER_CONFIG", ""),
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_effort_maps_only_onto_a_variant_the_model_reports() {
+        let variants: Vec<String> = vec!["minimal".into(), "high".into(), "Max".into()];
+        assert_eq!(opencode_effort_variant(ReasoningEffort::High, &variants), Some("high".into()));
+        assert_eq!(opencode_effort_variant(ReasoningEffort::Max, &variants), Some("max".into()));
+        assert_eq!(opencode_effort_variant(ReasoningEffort::Low, &variants), None);
+        assert_eq!(opencode_effort_variant(ReasoningEffort::Medium, &[]), None);
+    }
+
+    /// A worker's launch reads its generated layer from the file, keeps the
+    /// user's own value, and strips the logical flags.
+    #[test]
+    fn opencode_worker_launch_reads_the_layer_file() {
+        let spec = with_edits_denied(
+            &with_permission_mode(&with_model(&opencode(&[]), Some("p/m")), Some("bypassPermissions")),
+            true,
+        );
+        assert_eq!(
+            opencode_launch_command_with(&spec, OpenCodeConfigSource::File(".shelbi/opencode/config.json")),
+            format!(
+                r#"env SHELBI_PANE_TTY="$(tty)" {KEEP_USER} OPENCODE_CONFIG_CONTENT="$(cat .shelbi/opencode/config.json)" {OC_ENV} opencode --standalone --auto"#
+            )
         );
     }
 
@@ -1500,15 +1887,16 @@ mod tests {
                     assert!(!line.contains("OPENCODE_CONFIG_CONTENT"), "{line}");
                     continue;
                 }
-                let list = expected
+                let list: Vec<serde_json::Value> = expected
                     .iter()
-                    .map(|(a, e)| format!(r#"{{"action":"{a}","resource":"*","effect":"{e}"}}"#))
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let config = format!(
-                    r#"OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{{"permissions":[{list}]}},"plan":{{"permissions":[{list}]}}}}}}'"#
+                    .map(|(a, e)| serde_json::json!({"action": a, "resource": "*", "effect": e}))
+                    .collect();
+                let agent = serde_json::json!({ "permissions": list });
+                assert_eq!(
+                    inline_config(&line),
+                    Some(serde_json::json!({ "agents": { "build": agent, "plan": agent } })),
+                    "{mode:?}/{deny_edits}: {line}"
                 );
-                assert!(line.contains(&config), "{mode:?}/{deny_edits}: {line}\nwanted {config}");
             }
         }
         // A ceiling below bypass drops a hand-written `--auto`: it would
@@ -1532,23 +1920,22 @@ mod tests {
     fn opencode_full_launch_line_golden() {
         let spec = with_permission_mode(&with_model(&opencode(&[]), Some("anthropic/claude-sonnet-5-5")), Some("acceptEdits"));
         let spec = with_edits_denied(&with_continue(&spec, true), true);
+        let agent = concat!(
+            r#"{"model":"anthropic/claude-sonnet-5-5","permissions":["#,
+            r#"{"action":"edit","effect":"allow","resource":"*"},{"action":"shell","effect":"ask","resource":"*"},"#,
+            r#"{"action":"external_directory","effect":"ask","resource":"*"},{"action":"edit","effect":"deny","resource":"*"}]}"#,
+        );
         assert_eq!(
             launch_command(&spec),
-            concat!(
-                r#"env SHELBI_PANE_TTY="$(tty)" "#,
-                r#"OPENCODE_CONFIG_CONTENT='{"model":"anthropic/claude-sonnet-5-5","agents":{"#,
-                r#""build":{"permissions":[{"action":"edit","resource":"*","effect":"allow"},{"action":"shell","resource":"*","effect":"ask"},{"action":"external_directory","resource":"*","effect":"ask"},{"action":"edit","resource":"*","effect":"deny"}]},"#,
-                r#""plan":{"permissions":[{"action":"edit","resource":"*","effect":"allow"},{"action":"shell","resource":"*","effect":"ask"},{"action":"external_directory","resource":"*","effect":"ask"},{"action":"edit","resource":"*","effect":"deny"}]}}}' "#,
-                r#"OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' "#,
-                r#"OPENCODE_DISABLE_AUTOUPDATE=1 "#,
-                r#"opencode --standalone --continue"#,
+            format!(
+                r#"env SHELBI_PANE_TTY="$(tty)" {KEEP_USER} OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{agent},"plan":{agent}}}}}' {OC_ENV} opencode --standalone --continue"#
             )
         );
         let bypass = with_permission_mode(&opencode(&[]), Some("bypassPermissions"));
         assert_eq!(
             launch_command(&bypass),
             format!(
-                r#"env SHELBI_PANE_TTY="$(tty)" OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{{"permissions":[{{"action":"*","resource":"*","effect":"allow"}}]}},"plan":{{"permissions":[{{"action":"*","resource":"*","effect":"allow"}}]}}}}}}' {OC_ENV} opencode --standalone --auto"#
+                r#"env SHELBI_PANE_TTY="$(tty)" {KEEP_USER} OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{{"permissions":[{{"action":"*","effect":"allow","resource":"*"}}]}},"plan":{{"permissions":[{{"action":"*","effect":"allow","resource":"*"}}]}}}}}}' {OC_ENV} opencode --standalone --auto"#
             )
         );
     }
@@ -1599,5 +1986,36 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "{line}");
+
+        // The file form, with `env` standing in for OpenCode so the line
+        // prints what the OpenCode process would see: Shelbi's layer in the
+        // variable, the user's own value kept beside it.
+        let dir = std::env::temp_dir().join(format!("shelbi-oc-exec-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("layer.json"), r#"{"plugins":["/p"]}"#).unwrap();
+        let mut spec = opencode(&[]);
+        spec.command = "env".into();
+        spec.integration = Some(RunnerKind::OpenCode);
+        let line = opencode_launch_command_with(&spec, OpenCodeConfigSource::File("layer.json"))
+            .replace(" --standalone", "");
+        let run = |env: &[(&str, &str)]| {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", &format!("exec {line}")]).current_dir(&dir);
+            cmd.env_remove("OPENCODE_CONFIG_CONTENT").env_remove("SHELBI_OPENCODE_USER_CONFIG");
+            cmd.envs(env.iter().copied());
+            let out = cmd.stdin(std::process::Stdio::null()).output().unwrap();
+            assert!(out.status.success(), "{line}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let out = run(&[("OPENCODE_CONFIG_CONTENT", r#"{"theme":"x y"}"#)]);
+        assert!(out.lines().any(|l| l == r#"OPENCODE_CONFIG_CONTENT={"plugins":["/p"]}"#), "{out}");
+        assert!(out.lines().any(|l| l == r#"SHELBI_OPENCODE_USER_CONFIG={"theme":"x y"}"#), "{out}");
+        // A nested launch keeps the original user value, not the outer layer.
+        let out = run(&[
+            ("OPENCODE_CONFIG_CONTENT", r#"{"outer":1}"#),
+            ("SHELBI_OPENCODE_USER_CONFIG", r#"{"theme":"x"}"#),
+        ]);
+        assert!(out.lines().any(|l| l == r#"SHELBI_OPENCODE_USER_CONFIG={"theme":"x"}"#), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

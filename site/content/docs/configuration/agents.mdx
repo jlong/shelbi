@@ -86,7 +86,7 @@ projects that configure their fleets differently.
 | --- | --- |
 | `claude` | Claude Code. `--model` and `--effort` flags; `--append-system-prompt` wiring. |
 | `codex` | Codex. `--model` and `-c model_reasoning_effort="…"`; the `max` level maps to Codex `xhigh`. |
-| `opencode` | OpenCode 2.3 or later. The model is a `provider/model` id, passed as inline config (`OPENCODE_CONFIG_CONTENT`) because the TUI has no model flag, along with the permission rules (see [On OpenCode](#on-opencode)). The launch also turns off OpenCode's terminal title, which would overwrite Shelbi's state markers, and its autoupdate. Reasoning effort stays with OpenCode's own variant setting. |
+| `opencode` | OpenCode 2.3 or later. The model is a `provider/model` id, set on the `build` and `plan` agents in the config layer Shelbi passes as `OPENCODE_CONFIG_CONTENT` (see [On OpenCode](#on-opencode)), because the TUI has no model flag. The launch also turns off OpenCode's terminal title, which would overwrite Shelbi's state markers, and its autoupdate. Reasoning effort stays with OpenCode's own variant setting. |
 | `generic` | Any other runner. No model/effort contract Shelbi drives. |
 
 A `model` like `claude-opus-4-8` is a *logical* value; turning it into a launch
@@ -197,11 +197,22 @@ tighten the project's mode, never loosen it.
 
 ### On OpenCode
 
+A worker's OpenCode wiring is a config layer Shelbi generates at
+`.shelbi/opencode/config.json` on each launch and passes as
+`OPENCODE_CONFIG_CONTENT`, the highest-ranking config you can set. It names the
+agent's instructions (`instructions`, so they reach OpenCode at system
+authority and the first prompt carries only the task), its skills (`skills`,
+staged under `.shelbi/opencode/skills/` rather than `.claude/skills/`, which
+OpenCode also reads), Shelbi's plugin (`plugins`), and the model and permission
+rules on the `build` and `plan` agents. Each key is left out when Shelbi has
+nothing for it. If you export your own `OPENCODE_CONFIG_CONTENT`, Shelbi merges
+it under its keys instead of replacing it: your keys stay, your list entries
+come first, and Shelbi's values win only where it sets one.
+
 OpenCode has no permission-mode flag, and its default agent allows everything,
-so Shelbi turns the resolved mode into OpenCode permission rules. It adds them
-to the `build` and `plan` agents in the inline config it already passes
-(`OPENCODE_CONFIG_CONTENT`). Agent rules load after your own and the last match
-wins, so they hold the ceiling over a looser user config.
+so Shelbi turns the resolved mode into OpenCode permission rules on those two
+agents. Agent rules load after your own and the last match wins, so they hold
+the ceiling over a looser user config.
 
 | Mode | OpenCode rules |
 | --- | --- |

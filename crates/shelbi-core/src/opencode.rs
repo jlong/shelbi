@@ -54,9 +54,26 @@ pub fn opencode_unsupported_message(version: &str) -> String {
     )
 }
 
+/// The screen signatures a pane falls back to when Shelbi's OpenCode plugin
+/// never reported in (no `plugin.alive` beacon after launch). Normally the
+/// plugin marks a permission ask as `shelbi:blocked`; without it, the poller
+/// reads the pane for OpenCode's own ask dialog ("△ Permission required").
+/// The question form's wording isn't pinned yet, so it has no signature.
+pub fn opencode_fallback_dialog_signatures() -> Vec<crate::DialogSignature> {
+    vec![crate::DialogSignature::new("permission", "Permission required")]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_signatures_match_the_permission_dialog() {
+        let sigs = opencode_fallback_dialog_signatures();
+        assert_eq!(sigs.len(), 1);
+        assert_eq!(sigs[0].kind, "permission");
+        assert!("  △ Permission required\n  Allow once".contains(&sigs[0].pattern));
+    }
 
     #[test]
     fn versions_parse_from_both_major_lines() {

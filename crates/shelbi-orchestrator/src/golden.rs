@@ -86,6 +86,7 @@ fn claude_orchestrator_argv_is_frozen() {
         Path::new("/tmp/myapp"),
         &crate::orch_bootstrap_prompt_base("myapp"),
         false,
+        None,
     );
     assert_golden("claude/orchestrator-argv.txt", &argv);
 }
@@ -101,6 +102,7 @@ fn claude_awareness_orchestrator_argv_is_frozen() {
         Path::new("/tmp/myapp"),
         None,
         true,
+        None,
     );
     assert_golden("claude/orchestrator-awareness-argv.txt", &argv);
 
@@ -112,6 +114,7 @@ fn claude_awareness_orchestrator_argv_is_frozen() {
         Path::new("/tmp/myapp"),
         None,
         false,
+        None,
     );
     assert_golden("claude/orchestrator-argv.txt", &v1);
 }
