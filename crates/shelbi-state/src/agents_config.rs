@@ -303,7 +303,7 @@ pub struct RunnerOptions {
 
 /// Every runner kind Shelbi supports, in picker order.
 pub fn runner_options() -> Vec<RunnerOptions> {
-    [RunnerKind::Claude, RunnerKind::Codex, RunnerKind::Generic]
+    [RunnerKind::Claude, RunnerKind::Codex, RunnerKind::OpenCode, RunnerKind::Generic]
         .into_iter()
         .map(|kind| RunnerOptions {
             kind,

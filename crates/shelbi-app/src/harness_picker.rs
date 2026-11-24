@@ -6,10 +6,11 @@
 //! [`crate::overlay::add_project`] in the TUI).
 //!
 //! Harness lists [`runner_options`] (Claude Code · Anthropic, Codex ·
-//! OpenAI, Generic). Default model offers "Use runner default" (`None`),
+//! OpenAI, OpenCode, Generic). Default model offers "Use runner default" (`None`),
 //! then the runner's [`shelbi_core::model_suggestions`], then the chosen
 //! model when it's none of those (a name typed in, or one already on disk).
-//! A runner with no suggestions takes no model.
+//! OpenCode takes a model but has no suggestions (its `provider/model` ids
+//! depend on the user's providers); a generic runner takes none.
 
 use shelbi_core::RunnerKind;
 use shelbi_state::agents_config::runner_options;
@@ -23,7 +24,8 @@ pub fn provider(kind: RunnerKind) -> Option<&'static str> {
     match kind {
         RunnerKind::Claude => Some("Anthropic"),
         RunnerKind::Codex => Some("OpenAI"),
-        RunnerKind::Generic => None,
+        // OpenCode runs models from any provider the user configured.
+        RunnerKind::OpenCode | RunnerKind::Generic => None,
     }
 }
 
@@ -42,7 +44,10 @@ pub fn model_label(model: &str) -> String {
 
 /// `kind` takes a model Shelbi can set.
 pub fn takes_model(kind: RunnerKind) -> bool {
-    !shelbi_core::model_suggestions(kind).is_empty()
+    match kind {
+        RunnerKind::Claude | RunnerKind::Codex | RunnerKind::OpenCode => true,
+        RunnerKind::Generic => false,
+    }
 }
 
 /// The note under Default model for a runner that takes none.
@@ -174,7 +179,7 @@ mod tests {
         let h = p.harnesses();
         assert_eq!(
             h.iter().map(|h| (h.label.as_str(), h.provider.as_deref())).collect::<Vec<_>>(),
-            [("Claude Code", Some("Anthropic")), ("Codex", Some("OpenAI")), ("Generic", None)]
+            [("Claude Code", Some("Anthropic")), ("Codex", Some("OpenAI")), ("OpenCode", None), ("Generic", None)]
         );
         assert!(h[0].selected && !h[1].selected);
         let m = p.models();

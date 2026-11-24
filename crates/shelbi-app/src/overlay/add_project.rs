@@ -1072,6 +1072,9 @@ mod tests {
         assert_eq!(f.handle_key(ch(' ')), Step::Menu(Field::Model));
         f.handle_key(key(Key::BackTab));
         f.handle_key(key(Key::Right));
+        assert_eq!(f.picker().runner(), RunnerKind::OpenCode);
+        assert_eq!(f.fields(), [Field::Harness, Field::Model, Field::Back, Field::Primary], "OpenCode takes a model");
+        f.handle_key(key(Key::Right));
         assert_eq!(f.picker().runner(), RunnerKind::Generic);
         assert_eq!(f.fields(), [Field::Harness, Field::Back, Field::Primary], "no model to pick");
         assert_eq!(f.model_note().as_deref(), Some("Generic runners take no model."));

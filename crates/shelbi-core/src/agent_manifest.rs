@@ -231,8 +231,9 @@ pub const PERMISSION_MODES: &[&str] = &[
 ];
 
 /// The [`ReasoningEffort`] levels `kind` can take, lowest first. Claude and
-/// Codex take the whole scale (the adapter maps `max` to Codex's `xhigh`); a
-/// generic runner has no effort knob Shelbi can drive.
+/// Codex take the whole scale (the adapter maps `max` to Codex's `xhigh`).
+/// OpenCode keeps its reasoning variant in its own TUI state, and a generic
+/// runner has no effort knob, so neither has one Shelbi can drive.
 pub fn reasoning_efforts(kind: RunnerKind) -> &'static [ReasoningEffort] {
     match kind {
         RunnerKind::Claude | RunnerKind::Codex => &[
@@ -241,18 +242,20 @@ pub fn reasoning_efforts(kind: RunnerKind) -> &'static [ReasoningEffort] {
             ReasoningEffort::High,
             ReasoningEffort::Max,
         ],
-        RunnerKind::Generic => &[],
+        RunnerKind::OpenCode | RunnerKind::Generic => &[],
     }
 }
 
 /// Suggested `runners.<kind>.model` values for a settings picker. A model is
 /// free text passed to the runner's `--model`, so these are suggestions, not
-/// a whitelist; a generic runner takes no model Shelbi can drive.
+/// a whitelist. OpenCode takes a `provider/model` id that depends on the
+/// providers the user configured, so it has no fixed suggestions; a generic
+/// runner takes no model Shelbi can drive.
 pub fn model_suggestions(kind: RunnerKind) -> &'static [&'static str] {
     match kind {
         RunnerKind::Claude => &["opus", "sonnet", "haiku"],
         RunnerKind::Codex => &["gpt-5", "gpt-5-codex"],
-        RunnerKind::Generic => &[],
+        RunnerKind::OpenCode | RunnerKind::Generic => &[],
     }
 }
 

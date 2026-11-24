@@ -199,6 +199,8 @@ fn a_generic_harness_disables_default_model() {
     press(&mut page, KeyCode::Enter);
     press(&mut page, KeyCode::Right);
     press(&mut page, KeyCode::Right);
+    assert_eq!(page.state().runner(), RunnerKind::OpenCode);
+    press(&mut page, KeyCode::Right);
     assert_eq!(page.state().runner(), RunnerKind::Generic);
     // Model leaves the Tab order.
     press(&mut page, KeyCode::Tab);

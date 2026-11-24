@@ -467,7 +467,7 @@ fn probe_nearest_writable_directory(path: &Path) -> Result<()> {
 
 /// Whether a new project can be created with `defaults`: a generic runner
 /// has no command Shelbi could scaffold, so a new project (which declares
-/// only Claude Code and Codex) can't default to one. The same refusal the
+/// only Claude Code, Codex and OpenCode) can't default to one. The same refusal the
 /// orchestrator onboarding gives an undeclared generic runner.
 pub fn check_agent_defaults(
     defaults: &AgentDefaults,
@@ -476,7 +476,7 @@ pub fn check_agent_defaults(
         RunnerKind::Generic => {
             Err(shelbi_state::orchestrator_setup::RunnerSetupError::NotDeclared(RunnerKind::Generic))
         }
-        RunnerKind::Claude | RunnerKind::Codex => Ok(()),
+        RunnerKind::Claude | RunnerKind::Codex | RunnerKind::OpenCode => Ok(()),
     }
 }
 

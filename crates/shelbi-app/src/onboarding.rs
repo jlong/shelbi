@@ -98,7 +98,7 @@ pub fn load(project: &str) -> Result<Setup, String> {
         return Err(format!("This project has no {AGENT} agent."));
     }
     let loaded = shelbi_state::load_project(project).map_err(|e| sentence(&e.to_string()))?;
-    let declared = [RunnerKind::Claude, RunnerKind::Codex, RunnerKind::Generic]
+    let declared = [RunnerKind::Claude, RunnerKind::Codex, RunnerKind::OpenCode, RunnerKind::Generic]
         .into_iter()
         .filter(|k| orchestrator_setup::runner_declared(&loaded, *k))
         .collect();

@@ -151,12 +151,14 @@ pub fn read_machines_input(project_name: &str) -> anyhow::Result<MachinesInput> 
     })
 }
 
-/// A runner's name as the Machines view shows it: `Claude`, `Codex`, or a
+/// A runner's name as the Machines view shows it: `Claude`, `Codex`,
+/// `OpenCode`, or a
 /// generic runner's command name (`aider`).
 fn runner_label(spec: &shelbi_core::AgentRunnerSpec) -> String {
     match shelbi_core::RunnerKind::detect(spec) {
         shelbi_core::RunnerKind::Claude => "Claude".to_string(),
         shelbi_core::RunnerKind::Codex => "Codex".to_string(),
+        shelbi_core::RunnerKind::OpenCode => "OpenCode".to_string(),
         shelbi_core::RunnerKind::Generic => std::path::Path::new(&spec.command)
             .file_name()
             .and_then(|s| s.to_str())

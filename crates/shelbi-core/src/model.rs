@@ -366,13 +366,18 @@ pub fn default_dialog_signatures(command: &str) -> Vec<DialogSignature> {
             DialogSignature::new("question", "Enter to select"),
             DialogSignature::new("question", "to add notes"),
         ],
-        RunnerKind::Codex | RunnerKind::Generic => Vec::new(),
+        // OpenCode reports its own permission prompts and questions through
+        // the Shelbi plugin (`shelbi:blocked`), so no screen scrape is needed.
+        RunnerKind::Codex | RunnerKind::OpenCode | RunnerKind::Generic => Vec::new(),
     }
 }
 
 pub fn default_prompt_injection(command: &str) -> PromptInjectionSpec {
     match RunnerKind::from_command(command) {
         RunnerKind::Claude | RunnerKind::Codex => PromptInjectionSpec::positional_arg(),
+        // OpenCode's positional argument is the project directory; its TUI
+        // takes the first prompt as `--prompt <text>` and submits it itself.
+        RunnerKind::OpenCode => PromptInjectionSpec::flag_value("--prompt"),
         // Among unrecognized runners, `aider` reads its prompt from a file;
         // every other runner gets the stdin default.
         RunnerKind::Generic => {
@@ -1955,6 +1960,7 @@ pub struct AgentRunnerSpec {
 pub enum RunnerKind {
     Claude,
     Codex,
+    OpenCode,
     Generic,
 }
 
@@ -1970,6 +1976,7 @@ impl RunnerKind {
         match Path::new(command).file_name().and_then(|s| s.to_str()) {
             Some("claude") => RunnerKind::Claude,
             Some("codex") => RunnerKind::Codex,
+            Some("opencode") => RunnerKind::OpenCode,
             _ => RunnerKind::Generic,
         }
     }
@@ -1989,6 +1996,7 @@ impl RunnerKind {
         match self {
             RunnerKind::Claude => "claude",
             RunnerKind::Codex => "codex",
+            RunnerKind::OpenCode => "opencode",
             RunnerKind::Generic => "generic",
         }
     }
@@ -2014,6 +2022,16 @@ impl RunnerKind {
                 event_wake: Conventional,
                 state_observation: Conventional,
                 message_delivery: Degraded,
+                resume: Conventional,
+            },
+            // OpenCode runs the same contract as Claude through Shelbi's
+            // project plugin: the plugin writes the `shelbi:<state>` title
+            // markers and pushes drained messages into the session.
+            RunnerKind::OpenCode => crate::CapabilityLadder {
+                context_delivery: Conventional,
+                event_wake: Conventional,
+                state_observation: Conventional,
+                message_delivery: Conventional,
                 resume: Conventional,
             },
             RunnerKind::Generic => crate::CapabilityLadder {
@@ -2114,6 +2132,13 @@ impl PromptInjectionSpec {
         }
     }
 
+    pub fn flag_value(flag: impl Into<String>) -> Self {
+        Self {
+            kind: PromptInjectionKind::FlagValue,
+            flag: Some(flag.into()),
+        }
+    }
+
     pub fn stdin() -> Self {
         Self {
             kind: PromptInjectionKind::Stdin,
@@ -2134,6 +2159,8 @@ impl PromptInjectionSpec {
 pub enum PromptInjectionKind {
     PositionalArg,
     FlagFile,
+    /// The prompt text itself as the value of a flag (`--prompt <text>`).
+    FlagValue,
     Stdin,
     Paste,
 }
@@ -5738,6 +5765,14 @@ updated_at: 2026-06-19T00:00:00Z
         let back: AgentRunnerSpec = yaml_serde::from_str(&y).unwrap();
         assert_eq!(back.integration, Some(RunnerKind::Claude));
 
+        // `opencode` is detected by basename (any path) and pinnable by name.
+        let oc: AgentRunnerSpec = yaml_serde::from_str("command: /opt/homebrew/bin/opencode\n").unwrap();
+        assert_eq!(RunnerKind::detect(&oc), RunnerKind::OpenCode);
+        let pinned: AgentRunnerSpec =
+            yaml_serde::from_str("command: oc-wrapper\nintegration: opencode\n").unwrap();
+        assert_eq!(RunnerKind::detect(&pinned), RunnerKind::OpenCode);
+        assert_eq!(RunnerKind::OpenCode.as_str(), "opencode");
+
         // The field can also force the generic contract onto a recognized
         // basename.
         let generic: AgentRunnerSpec =
@@ -5754,6 +5789,8 @@ updated_at: 2026-06-19T00:00:00Z
         // which falls to degraded polling (no verified hook push).
         assert_eq!(RunnerKind::Codex.capabilities().context_delivery, Conventional);
         assert_eq!(RunnerKind::Codex.capabilities().message_delivery, Degraded);
+        // OpenCode's plugin gives it Claude's contract, message push included.
+        assert_eq!(RunnerKind::OpenCode.capabilities(), RunnerKind::Claude.capabilities());
         // Generic runners are degraded on every axis.
         let g = RunnerKind::Generic.capabilities();
         assert_eq!(g.context_delivery, Degraded);
@@ -5776,6 +5813,21 @@ updated_at: 2026-06-19T00:00:00Z
         assert_eq!(
             unknown.effective_prompt_injection(),
             PromptInjectionSpec::stdin()
+        );
+        // OpenCode's positional argument is a directory, so its prompt rides
+        // `--prompt <text>`; the kind round-trips as `flag-value`.
+        let opencode: AgentRunnerSpec = yaml_serde::from_str("command: opencode\n").unwrap();
+        assert_eq!(
+            opencode.effective_prompt_injection(),
+            PromptInjectionSpec::flag_value("--prompt")
+        );
+        let custom: AgentRunnerSpec = yaml_serde::from_str(
+            "command: my-agent\nprompt_injection: { kind: flag-value, flag: --task }\n",
+        )
+        .unwrap();
+        assert_eq!(
+            custom.effective_prompt_injection(),
+            PromptInjectionSpec::flag_value("--task")
         );
 
         let spec: AgentRunnerSpec =

@@ -63,6 +63,7 @@ fn kind_name(kind: RunnerKind) -> &'static str {
     match kind {
         RunnerKind::Claude => "Claude Code",
         RunnerKind::Codex => "Codex",
+        RunnerKind::OpenCode => "OpenCode",
         RunnerKind::Generic => "generic",
     }
 }

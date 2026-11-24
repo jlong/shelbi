@@ -15,7 +15,7 @@ brew install jlong/shelbi/shelbi && shelbi
 ```
 
 Every time it starts, `shelbi` first checks the tools it depends on: `git`,
-`gh`, a coding agent (`claude` or `codex`) and, on macOS, `brew`. When they are
+`gh`, a coding agent (`claude`, `codex` or `opencode`) and, on macOS, `brew`. When they are
 all installed you never see the check. When one is missing, a screen lists it
 with the command to install it (`c` copies it; run it in another terminal),
 lets you point Shelbi at a copy installed outside your `PATH` (`b`, **Browse…**),
@@ -44,7 +44,7 @@ inside the repository. See
 [Set up your first project](/docs/guides/getting-started/first-project).
 
 Each time it starts, the app also checks the command-line tools Shelbi depends
-on: `git`, `gh`, a coding agent (Claude Code or Codex) and `brew`. When one is
+on: `git`, `gh`, a coding agent (Claude Code, Codex or OpenCode) and `brew`. When one is
 missing, a window lists it with the command to install it and a **Copy**
 button. Open the Terminal app (in Applications ▸ Utilities), paste the command
 and press Return. **Browse…** points Shelbi at a copy installed outside your
@@ -115,8 +115,9 @@ If you're hacking on Shelbi or testing unreleased changes, use the
 You need two things before you start:
 
 - **An agent CLI.** At least one of `claude`
-  ([Claude Code](https://docs.claude.com/en/docs/claude-code)) or `codex`,
-  installed and authenticated. If you install both, each agent
+  ([Claude Code](https://docs.claude.com/en/docs/claude-code)), `codex` or
+  `opencode` ([OpenCode](https://opencode.ai)), installed and authenticated.
+  If you install more than one, each agent
   (orchestrator, developer, review, and so on) recommends a runner and the
   project config can override it; workspaces don't pick one.
 - **Git and SSH.** Shelbi creates git worktrees and can run workspaces on
