@@ -1132,6 +1132,35 @@ pub fn tinted_icon_button(
     )
 }
 
+/// A screen's toolbar band's height (the Figma Issues Header).
+pub const TOOLBAR_H: f32 = 52.0;
+/// The toolbar band's room at its leading edge.
+pub const TOOLBAR_PAD_L: f32 = 12.0;
+/// The toolbar band's room at its trailing edge.
+pub const TOOLBAR_PAD_R: f32 = 16.0;
+/// The toolbar band's canvas edge on its left.
+pub const TOOLBAR_EDGE: f32 = 1.0;
+
+/// A screen's toolbar band (the Figma Issues Header, which the Jobs and
+/// Reminders screen shares): a [`TOOLBAR_H`] row on the `toolbar` fill,
+/// 12px in at the left and 16px at the right, its items centered and 8px
+/// apart, with a 1px canvas edge on its left. The caller adds the items.
+pub fn toolbar_band(theme: &Theme) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .pl(px(TOOLBAR_PAD_L))
+        .pr(px(TOOLBAR_PAD_R))
+        .h(px(TOOLBAR_H))
+        .flex_none()
+        .bg(theme.toolbar)
+        // Figma's Header: a 1px canvas edge on its left.
+        .border_l(px(TOOLBAR_EDGE))
+        .border_color(theme.canvas)
+}
+
 /// A toolbar action (the board's New issue): the Button at Small, Default
 /// style, with a left icon.
 pub fn toolbar_button(

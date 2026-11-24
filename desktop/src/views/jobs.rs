@@ -1,6 +1,8 @@
 //! The Jobs screen (`View::Jobs`, palette-only): the project's awareness
 //! jobs (what `shelbi job run` and `shelbi job watch` create), drawn from the
-//! shared [`shelbi_app::jobs`] model the TUI's Jobs page draws too.
+//! shared [`shelbi_app::jobs`] model the TUI's Jobs page draws too. It is the
+//! Jobs segment of the Jobs and Reminders screen
+//! ([`super::jobs_reminders`]), whose toolbar carries its name and counts.
 //!
 //! There's no Figma frame for it, so it borrows the app's vocabulary: the
 //! board's cards, the issue pane's chips and the Changelog's centered
@@ -8,7 +10,7 @@
 //! a row into a scan across the screen).
 //!
 //! ```text
-//! Jobs  2 running · 3 finished
+//! 2 running · 3 finished        [ ▤ Jobs | ◷ Reminders ]
 //! ─────────────────────────────────────────────────────────────
 //!   Running 2
 //!   ╭─────────────────────────────────────────────────────────╮
@@ -90,7 +92,7 @@ use gpui::{
 };
 use shelbi_app::jobs::{
     clock_label, one_line, JobRow, JobsModel, JobsRead, SheetLoad, CANCEL_LABEL, EMPTY_COMMAND, EMPTY_DETAIL,
-    EMPTY_TITLE, REFRESH_INTERVAL, RUNNING_HEADING, TITLE,
+    EMPTY_TITLE, REFRESH_INTERVAL, RUNNING_HEADING,
 };
 use shelbi_app::source::{ProjectHandle, ProjectSource};
 use shelbi_app::theme::Tone;
@@ -149,6 +151,9 @@ pub struct JobsView {
     needs_focus: bool,
     refresher: shelbi_app::Refresher<JobsRead>,
     last_refresh: Instant,
+    /// Whether its segment of the Jobs and Reminders screen shows: hidden,
+    /// it asks for no reads (the shown segment's poll is the only one).
+    active: bool,
     scroll: ScrollHandle,
     _poll: Task<()>,
 }
@@ -238,6 +243,7 @@ impl JobsView {
             needs_focus: true,
             refresher,
             last_refresh: Instant::now(),
+            active: true,
             scroll: ScrollHandle::new(),
             _poll: poll,
         }
@@ -251,6 +257,36 @@ impl JobsView {
 
     pub fn request_focus(&mut self) {
         self.needs_focus = true;
+    }
+
+    /// Show or hide its segment of the Jobs and Reminders screen. Hidden, it
+    /// stops asking for reads; shown again, it reads at once.
+    pub fn set_active(&mut self, active: bool) {
+        if active && !self.active {
+            self.refresh();
+        }
+        self.active = active;
+    }
+
+    /// The counts the toolbar shows while its segment is selected.
+    pub fn summary(&self) -> Option<String> {
+        self.model.summary()
+    }
+
+    /// Drop the sheet at once, without sliding it out (a switch to the
+    /// other segment: nothing would see it go).
+    pub fn dismiss_sheet(&mut self, cx: &mut Context<Self>) {
+        self.pane_frame.cancel_resize();
+        self.closing.clear();
+        if self.sheet.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Whether it asks for reads (its segment shows).
+    #[cfg(test)]
+    pub fn is_active(&self) -> bool {
+        self.active
     }
 
     /// The window's saved task pane width, which the sheet shares.
@@ -290,7 +326,7 @@ impl JobsView {
             // Also when nothing changed: the ages tick over.
             cx.notify();
         }
-        if self.last_refresh.elapsed() >= REFRESH_INTERVAL {
+        if self.active && self.last_refresh.elapsed() >= REFRESH_INTERVAL {
             self.refresher.request();
             self.last_refresh = Instant::now();
         }
@@ -329,7 +365,6 @@ impl JobsView {
     }
 
     /// Ask for a read now.
-    #[cfg(test)]
     pub fn refresh(&mut self) {
         self.refresher.request();
         self.last_refresh = Instant::now();
@@ -901,7 +936,6 @@ impl Render for JobsView {
             window.focus(&self.focus, cx);
         }
         let theme = *cx.global::<Theme>();
-        let summary = self.model.summary();
         let table = self.render_body(&theme, cx);
         let sheet = self.render_sheet(&theme, cx);
         div()
@@ -926,9 +960,6 @@ impl Render for JobsView {
             .bg(theme.nested(theme.canvas))
             .type_style(Type::Base)
             .text_color(theme.foreground)
-            // The title row: the view's name, loud, then the count, muted.
-            .child(list_screen::title_row("jobs", Some(icons::QUEUE_LIST), TITLE, summary, &theme))
-            .child(div().h(px(1.0)).flex_none().bg(theme.divider))
             // The table at its full width, whether or not the sheet is open:
             // the sheet floats over it.
             .child(div().flex().flex_col().flex_1().min_h_0().min_w_0().child(table))
@@ -1108,7 +1139,6 @@ mod tests {
         let ids: Vec<String> = view.read_with(&vcx, |v, _| v.model().rows().iter().map(|r| r.id.clone()).collect());
         assert_eq!(ids, ["j2", "j1"], "newest first");
         assert!(vcx.debug_bounds("jobs-list").is_some());
-        assert!(vcx.debug_bounds("jobs-title").is_some());
         assert!(vcx.debug_bounds("jobs-running-heading").is_some());
         assert!(vcx.debug_bounds("job-row-j2").is_some() && vcx.debug_bounds("job-row-j1").is_some());
 
@@ -1184,9 +1214,9 @@ mod tests {
         // The failure reads inline, in red; a success shows its command.
         assert!(vcx.debug_bounds("job-failure-j7").is_some());
         assert!(vcx.debug_bounds("job-failure-j8").is_none() && vcx.debug_bounds("job-command-j8").is_some());
-        assert!(vcx.debug_bounds("jobs-summary").is_some());
+        // The counts the toolbar shows.
+        assert_eq!(view.read_with(&vcx, |v, _| v.summary()).as_deref(), Some("1 running · 2 finished"));
         let model = view.read_with(&vcx, |v, _| v.model().clone());
-        assert_eq!(model.summary().as_deref(), Some("1 running · 2 finished"));
         let failed = &model.rows()[2];
         assert_eq!(failed.status_label(), "Failed · exit 3");
         assert_eq!(failed.failure_detail().as_deref(), Some("exit 3"));

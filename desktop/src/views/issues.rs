@@ -102,9 +102,6 @@ const SUMMARY_WIDTH: f32 = 244.0;
 const CARD_RADIUS: f32 = 12.0;
 /// A collapsed column's width (Figma's turned column heading: 24pt).
 const COLLAPSED_WIDTH: f32 = 24.0;
-/// The toolbar's height (Figma: the 52px Header, no rule under it; its band
-/// sets it off from the board).
-const TOOLBAR_H: f32 = 52.0;
 /// The toolbar's search field's width (Figma's Searchbox in the Header).
 const SEARCH_W: f32 = 180.0;
 /// The key-hint footer's height, its rule included (Figma: a 1px divider
@@ -1571,19 +1568,7 @@ impl IssuesView {
         // board shows local results because GitHub's search is unavailable.
         let search_note = model.search.as_ref().and_then(|s| s.label());
         let search = self.render_search(theme, window, cx);
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_2()
-            .pl_3()
-            .pr_4()
-            .h(px(TOOLBAR_H))
-            .flex_none()
-            .bg(theme.toolbar)
-            // Figma's Header: a 1px canvas edge on its left.
-            .border_l_1()
-            .border_color(theme.canvas)
+        style::toolbar_band(theme)
             .child(
                 div()
                     .flex_none()
