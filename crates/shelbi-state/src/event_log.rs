@@ -3112,6 +3112,26 @@ pub fn append_send_event(project: &str, workspace: &str, status: &str, detail: &
     ))
 }
 
+/// Append `<rfc3339> send project=<project> workspace=<name> status=degraded
+/// detail=<reason> integration=degraded fallback=paste delivery=<id>` to
+/// `~/.shelbi/events.log`. Recorded when a send to an OpenCode pane couldn't
+/// go through Shelbi's plugin (no ack, a rejected admission, an unwritable
+/// inbox, or a plugin known to be silent) and was pasted into the pane
+/// instead. The delivery's own verdict follows as a separate `send` line;
+/// this one says the structured channel is down, so the fallback isn't
+/// silent.
+pub fn append_send_degraded_event(project: &str, workspace: &str, reason: &str, delivery: &str) -> Result<()> {
+    let ts = Utc::now().to_rfc3339();
+    let project = sanitize_field(project);
+    let workspace = sanitize_field(workspace);
+    let reason = sanitize_reason(reason);
+    let delivery = sanitize_field(delivery);
+    append_event_line(&format!(
+        "{ts} send project={project} workspace={workspace} status=degraded detail={reason} \
+         integration=degraded fallback=paste delivery={delivery}"
+    ))
+}
+
 /// Append `<rfc3339> settings-selfheal workspace=<name> path=<path> detail=<detail>`
 /// to `~/.shelbi/events.log`. Emitted when the launch/add path self-heals a
 /// parseable but hook-less `settings.local.json` by additively merging Shelbi's
@@ -6640,6 +6660,28 @@ mod tests {
             "{}",
             lines[1]
         );
+
+        std::env::remove_var("SHELBI_HOME");
+    }
+
+    #[test]
+    fn append_send_degraded_event_names_the_fallback() {
+        let _g = TEST_LOCK.lock().unwrap();
+        let home = fresh_home();
+        std::env::set_var("SHELBI_HOME", &home);
+
+        append_send_degraded_event("demo", "alpha", "opencode-inbox-silent", "0123456789abXYZ").unwrap();
+        let log = std::fs::read_to_string(events_log_path().unwrap()).unwrap();
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(
+            log.contains(
+                " send project=demo workspace=alpha status=degraded detail=opencode-inbox-silent \
+                 integration=degraded fallback=paste delivery=0123456789abXYZ"
+            ),
+            "{log}"
+        );
+        let envelope = EventEnvelope::from_log_line(log.lines().next().unwrap());
+        assert_eq!(envelope.project.as_deref(), Some("demo"));
 
         std::env::remove_var("SHELBI_HOME");
     }

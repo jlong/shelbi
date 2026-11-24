@@ -27,6 +27,16 @@
 //   subagents only, so another session opened in the same TUI is the user's
 //   own. It titles the session SHELBI_OPENCODE_TITLE
 //   (`Shelbi · <workspace> · <task>`) and puts the title back if it changes.
+// - `shelbi send` reaches the session through `.shelbi/opencode/inbox/`: one
+//   `<delivery-id>.json` per message. The plugin claims each by renaming it
+//   to `<delivery-id>.taken` (Shelbi takes back an unclaimed file when no
+//   answer comes, so only one side ever has it), admits the text with
+//   `session.prompt({id: "msg_<delivery-id>"})`, and answers in
+//   `.shelbi/opencode/ack/<delivery-id>.json` with `admitted`, `duplicate`
+//   or `failed`. Nothing is typed into the TUI, so the user's draft in the
+//   composer stays put. An id is admitted once: the plugin remembers the ids
+//   it admitted, and OpenCode answers a repeated prompt id with the original
+//   admission.
 //
 // A pane Shelbi didn't launch (no SHELBI_PANE_TTY or SHELBI_OPENCODE_SESSION)
 // is left alone.
@@ -36,6 +46,7 @@ import {
   existsSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   renameSync,
   statSync,
@@ -49,9 +60,15 @@ const HOOKS = ".shelbi/hooks";
 const STATE = ".shelbi/opencode";
 const LOCK = "plugin.lock";
 const BEACON = "plugin.alive";
-const PLUGIN_VERSION = 1;
+const PLUGIN_VERSION = 2;
 const HOOK_TIMEOUT_MS = 15000;
 const IDLE_DRAIN_MS = 5000;
+const INBOX = "inbox";
+const ACK = "ack";
+const INBOX_POLL_MS = 250;
+// Shelbi's delivery ids have the shape of OpenCode's own message ids, so a
+// sent message sorts by its send time among the session's messages.
+const DELIVERY_ID = /^[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 // How far up a subagent's parents the plugin looks for its own session.
 const MAX_SESSION_DEPTH = 8;
 
@@ -281,6 +298,96 @@ export default {
       : null;
     timer?.unref?.();
 
+    // Verified sends: admit each inbox entry into the pane's session and
+    // answer it. Entries are taken in id (send) order, one at a time.
+    const inboxDir = path.join(root, STATE, INBOX);
+    const ackDir = path.join(root, STATE, ACK);
+    const admitted = new Set();
+    const answer = (id, status, error) => {
+      try {
+        mkdirSync(ackDir, { recursive: true });
+        const file = path.join(ackDir, `${id}.json`);
+        const tmp = path.join(ackDir, `.${id}.${process.pid}.tmp`);
+        writeFileSync(tmp, `${JSON.stringify(error ? { id, status, error } : { id, status })}\n`);
+        renameSync(tmp, file);
+      } catch {
+        // Shelbi then takes the message for lost and says so.
+      }
+    };
+    const admit = async (id) => {
+      const entry = path.join(inboxDir, `${id}.json`);
+      const taken = path.join(inboxDir, `${id}.taken`);
+      try {
+        renameSync(entry, taken);
+      } catch {
+        // Shelbi took it back first.
+        return;
+      }
+      try {
+        if (admitted.has(id)) {
+          answer(id, "duplicate");
+          return;
+        }
+        let text;
+        try {
+          const body = JSON.parse(readFileSync(taken, "utf8"));
+          if (body?.id !== id) throw new Error("its id doesn't match its name");
+          text = typeof body.text === "string" ? body.text : "";
+        } catch (err) {
+          answer(id, "failed", `unreadable entry: ${err?.message ?? err}`);
+          return;
+        }
+        if (!text.trim()) {
+          answer(id, "failed", "empty message");
+          return;
+        }
+        try {
+          await api.session.prompt({
+            sessionID: own,
+            id: `msg_${id}`,
+            text,
+            metadata: { source: "shelbi", delivery: id },
+          });
+        } catch (err) {
+          answer(id, "failed", String(err?.message ?? err));
+          return;
+        }
+        admitted.add(id);
+        answer(id, "admitted");
+      } finally {
+        try {
+          unlinkSync(taken);
+        } catch {
+          // Already gone.
+        }
+      }
+    };
+    let reading = false;
+    const readInbox = async () => {
+      if (reading) return;
+      reading = true;
+      try {
+        let names;
+        try {
+          names = readdirSync(inboxDir);
+        } catch {
+          return;
+        }
+        const ids = names
+          .filter((name) => name.endsWith(".json"))
+          .map((name) => name.slice(0, -".json".length))
+          .filter((id) => DELIVERY_ID.test(id))
+          .sort();
+        for (const id of ids) await admit(id);
+      } finally {
+        reading = false;
+      }
+    };
+    const inboxTimer = setInterval(() => {
+      readInbox().catch(() => {});
+    }, INBOX_POLL_MS);
+    inboxTimer.unref?.();
+
     await run("session-start.sh");
     await applyTitle();
 
@@ -356,6 +463,7 @@ export default {
     return () => {
       controller.abort();
       if (timer) clearInterval(timer);
+      clearInterval(inboxTimer);
       release();
     };
   },
