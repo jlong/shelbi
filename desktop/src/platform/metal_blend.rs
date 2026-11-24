@@ -28,6 +28,7 @@
 /// gpui's pipelines whose alpha factor is `One` (`metal_renderer.rs`'s
 /// `build_pipeline_state` and `build_path_sprite_pipeline_state` callers).
 /// `paths_rasterization` already blends alpha with `OneMinusSourceAlpha`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the macOS code only
 pub const GPUI_PIPELINES: &[&str] = &[
     "path_sprites",
     "shadows",

@@ -17,6 +17,7 @@
 //! to `true`: [`apply`] then removes the app's override.
 
 /// Whether the app draws text with macOS font smoothing (stem thickening).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // used by the macOS code only
 pub const SMOOTH_FONTS: bool = false;
 
 /// Write (or clear) the app's `AppleFontSmoothing` override per
