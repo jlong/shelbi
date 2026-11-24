@@ -99,7 +99,7 @@ CI and PR watches ask GitHub once a minute, and only while the machine is online
 ## Estimates
 
 `--estimate` on `job run` or `job watch` takes a duration (`45m`, `2h`,
-`1h30m`, as `shelbi issue start --estimate` does): how long the job should
+`1h30m`, `1d`, as `shelbi issue start --estimate` does): how long the job should
 take. Once it has run that long, the hub writes the job's `overdue` line, and
 repeats it every half the estimate (at least every 10 minutes) until the job
 finishes. A job that hangs is reported, instead of looking the same as a slow

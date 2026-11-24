@@ -116,7 +116,7 @@ impl EstimateProgress {
     pub fn status_text(&self) -> String {
         let minute = |d: Duration| {
             let secs = d.as_secs();
-            shelbi_core::format_duration(Duration::from_secs(if secs >= 60 { secs / 60 * 60 } else { secs }))
+            shelbi_core::display_duration(Duration::from_secs(if secs >= 60 { secs / 60 * 60 } else { secs }))
         };
         if self.overdue() {
             format!(
@@ -144,13 +144,13 @@ fn whole_minutes(d: Duration) -> Duration {
     Duration::from_secs(d.as_secs() / 60 * 60)
 }
 
-/// [`shelbi_core::format_duration`] with a space between its units
+/// [`shelbi_core::display_duration`] with a space between its units
 /// (`1h 12m`), and `0m` for nothing.
 fn spaced(d: Duration) -> String {
     if d.as_secs() == 0 {
         return "0m".to_string();
     }
-    let compact = shelbi_core::format_duration(d);
+    let compact = shelbi_core::display_duration(d);
     let mut out = String::with_capacity(compact.len() + 2);
     for ch in compact.chars() {
         if ch.is_ascii_digit() && out.ends_with(|c: char| c.is_ascii_alphabetic()) {

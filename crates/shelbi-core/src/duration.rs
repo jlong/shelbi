@@ -1,23 +1,35 @@
 //! Human durations for the awareness CLI and workflow config: `30s`, `5m`,
-//! `1h`, and compounds like `1h30m` or `2h5m10s`.
+//! `1h`, `1d`, and compounds like `1h30m`, `2d12h` or `2h5m10s`.
 //!
-//! The same unit letters the `heartbeat` config accepts (`s`, `m`, `h`, any
-//! case), in descending order, each at most once. A bare number is rejected:
-//! guessing a unit is exactly the foot-gun the heartbeat parser avoids, and the
-//! two must read alike. [`format_duration`] prints the compact form back
-//! (`4200s` → `1h10m`), so a parsed value round-trips.
+//! The units are `d` (24 hours), `h`, `m` and `s`, any case, in descending
+//! order, each at most once. A bare number is rejected: guessing a unit is
+//! exactly the foot-gun the `heartbeat` parser avoids, and the two must read
+//! alike.
+//!
+//! Two printers:
+//!
+//! - [`format_duration`] is the on-disk form ([`serde_compact`], used by the
+//!   reminder and job stores) and never writes `d`: `86400s` → `24h`. An older
+//!   binary, whose parser knows only `h`, `m` and `s`, has to keep reading a
+//!   store a newer one wrote. Don't teach it days.
+//! - [`display_duration`] is for people: whole days come out as `Nd`
+//!   (`86400s` → `1d`, `2d19h`). Never persist its output.
+//!
+//! Both round-trip through [`parse_duration`].
 
 use std::time::Duration;
 
-/// Parse a duration like `45s`, `10m`, `2h` or `1h30m`. Zero is rejected.
+/// Parse a duration like `45s`, `10m`, `2h`, `1h30m`, `1d` or `2d12h`. Zero
+/// is rejected.
 pub fn parse_duration(s: &str) -> Result<Duration, String> {
     let trimmed = s.trim();
     if trimmed.is_empty() {
-        return Err("empty duration: use a form like `30s`, `5m`, `1h` or `1h30m`".into());
+        return Err("empty duration: use a form like `30s`, `5m`, `1h`, `1h30m` or `1d`".into());
     }
     let mut total: u64 = 0;
     let mut digits = String::new();
-    // Rank of the last unit seen (h=3, m=2, s=1); units must strictly descend.
+    // Rank of the last unit seen (d=4, h=3, m=2, s=1); units must strictly
+    // descend.
     let mut last_rank = u8::MAX;
     for c in trimmed.chars() {
         if c.is_ascii_digit() {
@@ -25,12 +37,13 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
             continue;
         }
         let (mult, rank) = match c.to_ascii_lowercase() {
-            'h' => (3_600u64, 3u8),
+            'd' => (86_400u64, 4u8),
+            'h' => (3_600, 3),
             'm' => (60, 2),
             's' => (1, 1),
             _ => {
                 return Err(format!(
-                    "duration `{s}`: unexpected `{c}`; use `s`, `m` or `h` (e.g. `45m`, `1h30m`)"
+                    "duration `{s}`: unexpected `{c}`; use `d`, `h`, `m` or `s` (e.g. `45m`, `1h30m`, `1d`)"
                 ))
             }
         };
@@ -54,7 +67,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
     }
     if !digits.is_empty() {
         return Err(format!(
-            "duration `{s}`: missing unit; add `s`, `m` or `h` (e.g. `{digits}m`)"
+            "duration `{s}`: missing unit; add `d`, `h`, `m` or `s` (e.g. `{digits}m`)"
         ));
     }
     if total == 0 {
@@ -65,13 +78,31 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
 
 /// Compact form of `d`, whole seconds: `45s`, `10m`, `1h`, `1h10m`, `2h0m5s`
 /// is printed `2h5s`. Zero prints `0s`.
+///
+/// This is the serialization form ([`serde_compact`]), so it stays in `h`,
+/// `m` and `s` however long `d` is (`1d` prints `24h`): older parsers don't
+/// know `d`. For text a person reads, use [`display_duration`].
 pub fn format_duration(d: Duration) -> String {
-    let secs = d.as_secs();
+    compact(d.as_secs(), false)
+}
+
+/// [`format_duration`] for display: whole days lead as `Nd` (`1d`, `2d19h`,
+/// `1d30m`), the rest as `format_duration` prints it. Display only; persist
+/// [`format_duration`].
+pub fn display_duration(d: Duration) -> String {
+    compact(d.as_secs(), true)
+}
+
+fn compact(secs: u64, days: bool) -> String {
     if secs == 0 {
         return "0s".into();
     }
-    let (h, m, s) = (secs / 3_600, (secs % 3_600) / 60, secs % 60);
+    let (dd, rest) = if days { (secs / 86_400, secs % 86_400) } else { (0, secs) };
+    let (h, m, s) = (rest / 3_600, (rest % 3_600) / 60, rest % 60);
     let mut out = String::new();
+    if dd > 0 {
+        out.push_str(&format!("{dd}d"));
+    }
     if h > 0 {
         out.push_str(&format!("{h}h"));
     }
@@ -140,8 +171,79 @@ mod tests {
 
     #[test]
     fn rejects_ambiguous_or_empty_input() {
-        for bad in ["", "45", "0m", "1x", "m", "30m1h", "1h1h", "1.5h", "-5m", "1h 30m"] {
+        for bad in ["", "45", "0m", "1x", "m", "30m1h", "1h1h", "1.5h", "-5m", "1h 30m", "0d", "d"] {
             assert!(parse_duration(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn parses_days_alone_and_leading_compounds() {
+        assert_eq!(secs("1d"), 86_400);
+        assert_eq!(secs("3d"), 3 * 86_400);
+        assert_eq!(secs("2d12h"), 2 * 86_400 + 12 * 3_600);
+        assert_eq!(secs("1d30m"), 86_400 + 1_800);
+        assert_eq!(secs("1d1h1m1s"), 86_400 + 3_661);
+        assert_eq!(secs("1D"), 86_400);
+    }
+
+    #[test]
+    fn days_follow_the_ordering_and_repeat_rules() {
+        for bad in ["1h1d", "30m1d", "1d1d", "1d2d"] {
+            let err = parse_duration(bad).unwrap_err();
+            assert!(err.contains("largest to smallest"), "{bad:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn errors_list_the_day_unit() {
+        let err = parse_duration("1w").unwrap_err();
+        assert!(err.contains("use `d`, `h`, `m` or `s` (e.g. `45m`, `1h30m`, `1d`)"), "{err}");
+        let err = parse_duration("45").unwrap_err();
+        assert!(err.contains("add `d`, `h`, `m` or `s`"), "{err}");
+    }
+
+    #[test]
+    fn serialization_never_writes_days() {
+        // What an older binary's parser accepts: `h`, `m`, `s` only.
+        fn old_parser_reads(text: &str) -> bool {
+            !text.is_empty() && text.chars().all(|c| c.is_ascii_digit() || "hms".contains(c))
+        }
+        for (text, stored) in [("1d", "24h"), ("3d", "72h"), ("2d12h", "60h"), ("1d30m", "24h30m")] {
+            let d = parse_duration(text).unwrap();
+            assert_eq!(format_duration(d), stored);
+            assert!(old_parser_reads(&format_duration(d)));
+            assert_eq!(parse_duration(&format_duration(d)).unwrap(), d);
+        }
+
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Stored {
+            #[serde(with = "serde_compact")]
+            every: Duration,
+            #[serde(with = "serde_compact::option")]
+            estimate: Option<Duration>,
+        }
+        let v = Stored { every: parse_duration("1d").unwrap(), estimate: Some(parse_duration("2d12h").unwrap()) };
+        let text = yaml_serde::to_string(&v).unwrap();
+        assert_eq!(text, "every: 24h\nestimate: 60h\n");
+        assert_eq!(yaml_serde::from_str::<Stored>(&text).unwrap(), v);
+    }
+
+    #[test]
+    fn display_shows_whole_days() {
+        for (secs, text) in [
+            (0, "0s"),
+            (45, "45s"),
+            (3_600, "1h"),
+            (23 * 3_600, "23h"),
+            (86_400, "1d"),
+            (2 * 86_400 + 19 * 3_600, "2d19h"),
+            (86_400 + 1_800, "1d30m"),
+            (86_400 + 5, "1d5s"),
+        ] {
+            assert_eq!(display_duration(Duration::from_secs(secs)), text);
+            if secs > 0 {
+                assert_eq!(parse_duration(text).unwrap().as_secs(), secs);
+            }
         }
     }
 

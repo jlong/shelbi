@@ -412,15 +412,7 @@ impl ReminderRow {
             }
             return format!("due {}", age_label(self.due_at, now));
         }
-        let secs = (self.due_at - now).num_seconds().unsigned_abs();
-        if secs < 86_400 {
-            return relative_label(self.due_at, now);
-        }
-        let hours = secs / 3600;
-        match (hours / 24, hours % 24) {
-            (d, 0) => format!("in {d}d"),
-            (d, h) => format!("in {d}d {h}h"),
-        }
+        relative_label(self.due_at, now)
     }
 
     /// The agenda's time gutter in `tz`: when a pending reminder is due, or
@@ -636,6 +628,14 @@ fn relative_label(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
         return age_label(t, now);
     }
     let secs = (t - now).num_seconds().unsigned_abs();
+    if secs >= 86_400 {
+        // A day out or more: days and whole hours (`in 2d 19h`, `in 3d`).
+        let hours = secs / 3600;
+        return match (hours / 24, hours % 24) {
+            (d, 0) => format!("in {d}d"),
+            (d, h) => format!("in {d}d {h}h"),
+        };
+    }
     let rounded = if secs >= 60 { secs / 60 * 60 } else { secs };
     format!("in {}", duration_label(Duration::from_secs(rounded)))
 }
@@ -907,6 +907,16 @@ mod tests {
         // Due when set: full.
         let instant = ReminderRow::from_pending(&reminder("r2", at(9, 0), None));
         assert_eq!(instant.progress(at(8, 0)), 1.0);
+    }
+
+    #[test]
+    fn the_sheet_reads_a_day_out_or_more_in_days() {
+        let now = at(9, 0);
+        let after = |secs: i64| now + chrono::Duration::seconds(secs);
+        assert_eq!(relative_label(after(23 * 3600 + 59 * 60), now), "in 23h 59m");
+        assert_eq!(relative_label(after(86_400), now), "in 1d");
+        assert_eq!(relative_label(after(2 * 86_400 + 19 * 3600 + 120), now), "in 2d 19h");
+        assert_eq!(relative_label(after(3 * 86_400), now), "in 3d");
     }
 
     #[test]

@@ -27,7 +27,7 @@ pub use agent_manifest::{
     resolve_agent_launch, AgentManifest, AgentRequires, ReasoningEffort, ResolvedAgentLaunch,
     RunnerManifestConfig, PERMISSION_MODES,
 };
-pub use duration::{format_duration, parse_duration};
+pub use duration::{display_duration, format_duration, parse_duration};
 pub use error::{Error, GhTokenProbeFailure, Result};
 pub use file_limit::raise_file_limit;
 pub use home::{account_home_dir, home_dir};
