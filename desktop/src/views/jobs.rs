@@ -100,7 +100,7 @@ use super::estimate_bar;
 use super::floating_pane::{
     self, header_button, property_row, value_text, PaneFrame, PaneHost, PaneIds, PaneMotion, SlideOut, INSET,
 };
-use super::list_screen;
+use super::list_screen::{self, section_heading, tint, CARD_RADIUS};
 use crate::assets::{glyph, glyphs, heroicon, icons};
 use crate::elements::spinner::spinner_sized;
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
@@ -111,12 +111,6 @@ use crate::theme::Theme;
 /// How often the view drains its refresher.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The content column's widest; a wider window centers it.
-const CONTENT_MAX_W: f32 = 960.0;
-/// The column's room from the view's edges.
-const CONTENT_PAD_X: f32 = 24.0;
-/// A card's corners: the board cards'.
-const CARD_RADIUS: f32 = 12.0;
 /// A running card's padding.
 const CARD_PAD: f32 = 14.0;
 /// A running card's estimate bar: thick enough to read at a glance.
@@ -125,8 +119,7 @@ const CARD_BAR_H: f32 = 6.0;
 const CARD_BAR_LABEL_W: f32 = 64.0;
 /// The running card's live spinner.
 const LIVE_GLYPH: f32 = 14.0;
-/// A history row's height, and its status mark's.
-const HISTORY_ROW_H: f32 = 36.0;
+/// A history row's status mark.
 const MARK: f32 = 18.0;
 /// The history's trailing columns, right-aligned so they line up across
 /// rows and days.
@@ -517,7 +510,7 @@ impl JobsView {
 
     fn render_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         if self.model == JobsModel::Empty {
-            return empty_state(theme);
+            return list_screen::empty_state("jobs-empty", icons::QUEUE_LIST, EMPTY_TITLE, EMPTY_DETAIL, EMPTY_COMMAND, theme);
         }
         if let Some(message) = self.model.message() {
             return list_screen::message("jobs-empty", message, theme);
@@ -525,7 +518,7 @@ impl JobsView {
         let now = super::activity::now();
         let open = |row: &JobRow| self.sheet.as_ref().is_some_and(|s| s.id == row.id);
         let (running, finished) = (self.model.running(), self.model.finished());
-        let mut column = div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W)).gap(px(8.0));
+        let mut column = list_screen::content();
         if !running.is_empty() {
             column = column.child(section_heading("jobs-running-heading", RUNNING_HEADING.to_string(), Some(running.len()), false, theme));
             for row in running {
@@ -538,34 +531,9 @@ impl JobsView {
             let spaced = n > 0 || !running.is_empty();
             column = column.child(section_heading(format!("jobs-day-{n}-heading"), label.clone(), None, spaced, theme));
             let rows = finished[*start..end].iter().map(|row| history_row(row, now, open(row), theme, cx));
-            column = column.child(
-                div()
-                    .debug_selector(move || format!("jobs-day-{n}"))
-                    .flex()
-                    .flex_col()
-                    .p(px(4.0))
-                    .rounded(px(CARD_RADIUS))
-                    .bg(theme.card)
-                    .shadow(style::card_shadow(theme))
-                    .children(rows),
-            );
+            column = column.child(list_screen::group_card(format!("jobs-day-{n}"), rows, theme));
         }
-        div()
-            .id("jobs-list")
-            .debug_selector(|| "jobs-list".into())
-            .track_scroll(&self.scroll)
-            .flex()
-            .flex_col()
-            .items_center()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .overflow_y_scroll()
-            .px(px(CONTENT_PAD_X))
-            .pt(px(12.0))
-            .pb(px(24.0))
-            .child(column)
-            .into_any_element()
+        list_screen::scrolling("jobs", &self.scroll, column)
     }
 }
 
@@ -573,49 +541,6 @@ impl JobsView {
 fn selector(part: &'static str, id: &str) -> impl FnOnce() -> String {
     let s = format!("job-{part}-{id}");
     move || s
-}
-
-/// A section's heading over its cards (`Running 2`, `Today`), in the
-/// sidebar sections' type; `spaced` sets it off from the section above.
-fn section_heading(selector: impl Into<String>, text: String, count: Option<usize>, spaced: bool, theme: &Theme) -> AnyElement {
-    let selector = selector.into();
-    div()
-        .debug_selector(move || selector)
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(6.0))
-        .px(px(4.0))
-        .when(spaced, |d| d.pt(px(12.0)))
-        .type_style(Type::SmallMedium)
-        .text_color(theme.muted)
-        .child(text)
-        .when_some(count, |d, n| {
-            d.child(
-                div()
-                    .px(px(5.0))
-                    .rounded(px(4.0))
-                    .bg(theme.background)
-                    .type_style(Type::XSmallMedium)
-                    .text_color(theme.foreground)
-                    .child(n.to_string()),
-            )
-        })
-        .into_any_element()
-}
-
-/// The tint behind a chip in `tone`, laid on a card.
-fn tint(tone: Tone, theme: &Theme) -> Hsla {
-    let fill = match tone {
-        Tone::Green => theme.green_tint,
-        Tone::Yellow => theme.yellow_tint,
-        Tone::Red | Tone::LightRed => theme.red_tint,
-        Tone::Blue => theme.blue_tint,
-        Tone::Cyan => theme.cyan_tint,
-        Tone::Magenta => theme.magenta_tint,
-        _ => theme.background,
-    };
-    theme.fill_on(fill, theme.card)
 }
 
 /// A small chip on a card: X-Small Medium on a tint, 4pt corners.
@@ -890,7 +815,6 @@ fn history_row(
     let label = one_line(&row.description);
     let long_label = label.chars().count() > TIP_CHARS;
     let click_id = row.id.clone();
-    let highlight = theme.fill_on(theme.background_hover, theme.card);
     let duration_color = row.duration_tone(now).map_or(theme.muted, |t| theme.tone(t));
     let detail = match row.failure_detail() {
         Some(why) => div()
@@ -914,20 +838,7 @@ fn history_row(
             .child(one_line(&row.command)),
         None => div().id(SharedString::from(format!("job-detail-{}", row.id))).flex_1(),
     };
-    div()
-        .id(SharedString::from(format!("job-row-{}", row.id)))
-        .debug_selector(selector("row", &row.id))
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(px(12.0))
-        .h(px(HISTORY_ROW_H))
-        .min_w_0()
-        .px(px(10.0))
-        .rounded(px(8.0))
-        .cursor_pointer()
-        .when(open, |d| d.bg(highlight))
-        .hover(move |d| d.bg(highlight))
+    list_screen::compact_row(format!("job-row-{}", row.id), open, theme)
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.open_sheet(&click_id, window, cx)))
         .child(status_mark(row, theme))
         .child(
@@ -983,48 +894,6 @@ fn history_row(
         .into_any_element()
 }
 
-/// No jobs at all: what jobs are, and the command that starts one, ready to
-/// copy (the bootstrap screen's command box).
-fn empty_state(theme: &Theme) -> AnyElement {
-    div()
-        .debug_selector(|| "jobs-empty".into())
-        .flex()
-        .flex_col()
-        .flex_1()
-        .min_w_0()
-        .items_center()
-        .justify_center()
-        .gap(px(12.0))
-        .p_6()
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .justify_center()
-                .size(px(44.0))
-                .rounded_full()
-                .bg(theme.background)
-                .child(heroicon(icons::QUEUE_LIST).text_color(theme.icon)),
-        )
-        .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child(EMPTY_TITLE))
-        .child(
-            div()
-                .max_w(px(400.0))
-                .text_center()
-                .type_style(Type::Small)
-                .text_color(theme.muted)
-                .child(EMPTY_DETAIL),
-        )
-        .child(
-            div()
-                .debug_selector(|| "jobs-empty-command".into())
-                .mt(px(4.0))
-                .max_w_full()
-                .child(super::bootstrap::command_box(0, EMPTY_COMMAND, theme)),
-        )
-        .into_any_element()
-}
-
 impl Render for JobsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.needs_focus {
@@ -1058,7 +927,7 @@ impl Render for JobsView {
             .type_style(Type::Base)
             .text_color(theme.foreground)
             // The title row: the view's name, loud, then the count, muted.
-            .child(list_screen::title_row("jobs", TITLE, summary, &theme))
+            .child(list_screen::title_row("jobs", Some(icons::QUEUE_LIST), TITLE, summary, &theme))
             .child(div().h(px(1.0)).flex_none().bg(theme.divider))
             // The table at its full width, whether or not the sheet is open:
             // the sheet floats over it.
@@ -1304,7 +1173,7 @@ mod tests {
         assert!(tops.windows(2).all(|w| w[0] < w[1]), "running, the day's heading, then finished: {tops:?}");
         // The history is compact: one short line a job, every one alike.
         let (j8, j7) = (vcx.debug_bounds("job-row-j8").unwrap(), vcx.debug_bounds("job-row-j7").unwrap());
-        assert_eq!((j8.size.height, j7.size.height), (px(HISTORY_ROW_H), px(HISTORY_ROW_H)));
+        assert_eq!((j8.size.height, j7.size.height), (px(list_screen::COMPACT_ROW_H), px(list_screen::COMPACT_ROW_H)));
         assert!(j8.size.height < vcx.debug_bounds("job-row-j9").unwrap().size.height / 2.0, "the running card is the hero");
         // Its columns line up across rows.
         for part in ["status", "duration", "ago"] {

@@ -22,6 +22,13 @@
 //!  r8   fired 20m ago   check deploy
 //! ```
 //!
+//! The desktop draws the same rows as an agenda ([`RemindersModel::next_up`],
+//! [`RemindersModel::agenda_days`], [`RemindersModel::fired_days`]): the
+//! soonest pending reminder as a [`NEXT_UP_HEADING`] card counting down to
+//! it, the rest under their local day (`Today`, `Tomorrow`, `Thursday`,
+//! `Mon, Dec 7`), a pending one past its time under [`OVERDUE_HEADING`], and
+//! the fired ones as history under the day they fired.
+//!
 //! A row opens a side sheet with the whole text, the due time (absolute and
 //! relative), the repeat, when it was created and, for a pending reminder,
 //! [`CANCEL_LABEL`], which does what `shelbi remind cancel <id>` does
@@ -29,10 +36,11 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Local, TimeZone, Utc};
+use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
 use shelbi_state::awareness::{job_id_number, FiredReminder, Reminder};
 
-use crate::jobs::{age_label, clock_label, duration_label};
+use crate::estimate::OVERDUE_TONE;
+use crate::jobs::{age_label, clock_label, day_label, duration_label};
 use crate::theme::Tone;
 
 /// The screen's title.
@@ -49,6 +57,25 @@ pub const FIRED_HEADING: &str = "Fired";
 
 /// What the screen says with no reminders, pending or fired.
 pub const EMPTY_TEXT: &str = "No reminders. Set one with `shelbi remind in 30m <text>`.";
+
+/// The desktop empty state's heading, over [`EMPTY_DETAIL`] and
+/// [`EMPTY_COMMAND`].
+pub const EMPTY_TITLE: &str = "No reminders";
+
+/// The desktop empty state's sentence.
+pub const EMPTY_DETAIL: &str =
+    "A reminder is a note for later. When its time comes the hub hands it to the orchestrator, once or on a repeat.";
+
+/// The command the desktop empty state offers to copy.
+pub const EMPTY_COMMAND: &str = "shelbi remind in 30m \"check the deploy\"";
+
+/// The desktop agenda's heading over the soonest pending reminder's card.
+pub const NEXT_UP_HEADING: &str = "Next up";
+
+/// The desktop agenda's heading over pending reminders past their time that
+/// haven't fired yet (the hub fires one on its next tick, so these are
+/// rare: a hub that was down).
+pub const OVERDUE_HEADING: &str = "Overdue";
 
 /// What the screen says in a remote project's window: like the jobs, its
 /// store is on the far machine and nothing reads it over the link yet.
@@ -153,6 +180,44 @@ impl RemindersModel {
     /// How many rows are pending reminders (they come first).
     pub fn pending_count(&self) -> usize {
         self.rows().iter().filter(|r| r.is_pending()).count()
+    }
+
+    /// The pending reminders' rows, soonest due first.
+    pub fn pending(&self) -> &[ReminderRow] {
+        &self.rows()[..self.pending_count()]
+    }
+
+    /// The fired reminders' rows, newest fired first.
+    pub fn fired(&self) -> &[ReminderRow] {
+        &self.rows()[self.pending_count()..]
+    }
+
+    /// The soonest pending reminder: the agenda's [`NEXT_UP_HEADING`] card.
+    pub fn next_up(&self) -> Option<&ReminderRow> {
+        self.pending().first()
+    }
+
+    /// The agenda under the Next up card: the other pending reminders by
+    /// their local day in `tz`, as of `now`. For each day, the index into
+    /// [`pending`](Self::pending) of its first row (never 0: that one is
+    /// Next up) and its heading ([`agenda_label`]). Empty with at most one
+    /// pending reminder.
+    pub fn agenda_days<Tz: TimeZone>(&self, now: DateTime<Utc>, tz: &Tz) -> Vec<(usize, String)>
+    where
+        Tz::Offset: std::fmt::Display,
+    {
+        group_runs(self.pending().iter().enumerate().skip(1).map(|(i, r)| (i, agenda_label(r.due_at, now, tz))))
+    }
+
+    /// The fired reminders by the local day in `tz` they fired, as of
+    /// `now`: for each day, the index into [`fired`](Self::fired) of its
+    /// first row and its heading ([`day_label`]: `Today`, `Yesterday`, `Mon,
+    /// Nov 16`). Empty with nothing fired.
+    pub fn fired_days<Tz: TimeZone>(&self, now: DateTime<Utc>, tz: &Tz) -> Vec<(usize, String)>
+    where
+        Tz::Offset: std::fmt::Display,
+    {
+        group_runs(self.fired().iter().enumerate().filter_map(|(i, r)| Some((i, day_label(r.fired_at()?, now, tz)))))
     }
 
     /// The index of the first fired row, where the [`FIRED_HEADING`] row
@@ -328,6 +393,90 @@ impl ReminderRow {
         out
     }
 
+    /// Whether it is pending at or past its time: the hub hasn't fired it
+    /// yet. It wears [`OVERDUE_TONE`], like a job past its estimate.
+    pub fn overdue(&self, now: DateTime<Utc>) -> bool {
+        self.is_pending() && self.due_at <= now
+    }
+
+    /// The agenda's countdown at `now`: `in 45s`, `in 12m`, `in 3h 27m`,
+    /// `in 2d 4h` ahead; `due now` in its first minute past, then `due 20m
+    /// ago`. Empty for a fired row.
+    pub fn countdown(&self, now: DateTime<Utc>) -> String {
+        if !self.is_pending() {
+            return String::new();
+        }
+        if self.due_at <= now {
+            if (now - self.due_at).num_seconds() < 60 {
+                return "due now".to_string();
+            }
+            return format!("due {}", age_label(self.due_at, now));
+        }
+        let secs = (self.due_at - now).num_seconds().unsigned_abs();
+        if secs < 86_400 {
+            return relative_label(self.due_at, now);
+        }
+        let hours = secs / 3600;
+        match (hours / 24, hours % 24) {
+            (d, 0) => format!("in {d}d"),
+            (d, h) => format!("in {d}d {h}h"),
+        }
+    }
+
+    /// The agenda's time gutter in `tz`: when a pending reminder is due, or
+    /// when a fired one fired, as a time of day (`10:45 AM`); the day is its
+    /// group's heading.
+    pub fn gutter_time<Tz: TimeZone>(&self, tz: &Tz) -> String
+    where
+        Tz::Offset: std::fmt::Display,
+    {
+        let t = self.fired_at().unwrap_or(self.due_at);
+        t.with_timezone(tz).format("%-I:%M %p").to_string()
+    }
+
+    /// The Next up card's due time in `tz`: the time alone today (`10:45
+    /// AM`), the date too on another day ([`clock_label`]).
+    pub fn due_clock<Tz: TimeZone>(&self, now: DateTime<Utc>, tz: &Tz) -> String
+    where
+        Tz::Offset: std::fmt::Display,
+    {
+        clock_label(self.due_at, now, tz)
+    }
+
+    /// How far along the wait from when it was set to when it is due, at
+    /// `now`, from 0 to 1 (full once due, and for a fired row).
+    pub fn progress(&self, now: DateTime<Utc>) -> f32 {
+        let span = (self.due_at - self.created_at).num_milliseconds();
+        if !self.is_pending() || span <= 0 || now >= self.due_at {
+            return 1.0;
+        }
+        let gone = (now - self.created_at).num_milliseconds().max(0);
+        (gone as f64 / span as f64).clamp(0.0, 1.0) as f32
+    }
+
+    /// The Next up bar's label: `set 48m ago`.
+    pub fn set_label(&self, now: DateTime<Utc>) -> String {
+        format!("set {}", age_label(self.created_at, now))
+    }
+
+    /// The color of its countdown and glyph at `now`: [`OVERDUE_TONE`] past
+    /// its time, blue while pending, `None` (muted) once fired.
+    pub fn tone_at(&self, now: DateTime<Utc>) -> Option<Tone> {
+        if self.overdue(now) {
+            return Some(OVERDUE_TONE);
+        }
+        self.when_tone()
+    }
+
+    /// The sheet's status color at `now`: [`OVERDUE_TONE`] past its time,
+    /// else [`status_tone`](Self::status_tone).
+    pub fn status_tone_at(&self, now: DateTime<Utc>) -> Tone {
+        if self.overdue(now) {
+            return OVERDUE_TONE;
+        }
+        self.status_tone()
+    }
+
     /// Whether the sheet offers [`CANCEL_LABEL`]: the reminder is pending.
     pub fn can_cancel(&self) -> bool {
         self.is_pending()
@@ -416,6 +565,40 @@ pub fn reminder_rows(pending: &[Reminder], fired: &[FiredReminder]) -> Vec<Remin
     });
     rows.extend(done);
     rows
+}
+
+/// The heading over the pending reminders due on `due`'s day in `tz`, as of
+/// `now`: [`OVERDUE_HEADING`] once its time has passed, `Today`, `Tomorrow`,
+/// the weekday within the week (`Thursday`), then the date (`Mon, Dec 7`),
+/// with the year in another year (`Mon, Jan 4, 2027`).
+pub fn agenda_label<Tz: TimeZone>(due: DateTime<Utc>, now: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    if due <= now {
+        return OVERDUE_HEADING.to_string();
+    }
+    let day = due.with_timezone(tz).date_naive();
+    let today = now.with_timezone(tz).date_naive();
+    match (day - today).num_days() {
+        i64::MIN..=0 => "Today".to_string(),
+        1 => "Tomorrow".to_string(),
+        2..=6 => day.format("%A").to_string(),
+        _ if day.year() == today.year() => day.format("%a, %b %-d").to_string(),
+        _ => day.format("%a, %b %-d, %Y").to_string(),
+    }
+}
+
+/// `(index, heading)` pairs, in order, cut to where each run of one heading
+/// starts.
+fn group_runs(items: impl Iterator<Item = (usize, String)>) -> Vec<(usize, String)> {
+    let mut out: Vec<(usize, String)> = Vec::new();
+    for (i, label) in items {
+        if out.last().is_none_or(|(_, last)| *last != label) {
+            out.push((i, label));
+        }
+    }
+    out
 }
 
 /// A pending reminder's When, in `tz`: `due now` once its time has come
@@ -621,6 +804,109 @@ mod tests {
         // Just past local midnight, a couple of hours out: still hours.
         let late = Utc.with_ymd_and_hms(2026, 11, 15, 4, 0, 0).unwrap(); // 11 PM local
         assert_eq!(due_label(late + chrono::Duration::hours(2), late, &tz), "in 2h");
+    }
+
+    #[test]
+    fn the_agenda_puts_the_soonest_up_next_and_groups_the_rest_by_day() {
+        // UTC-5: 19:10 UTC on Sat the 14th is 2:10 PM there.
+        let tz = FixedOffset::west_opt(5 * 3600).unwrap();
+        let now = at(19, 10);
+        let local = |d: u32, h: u32, m: u32| tz.with_ymd_and_hms(2026, 11, d, h, m, 0).unwrap().with_timezone(&Utc);
+        let pending = vec![
+            reminder("r1", now - chrono::Duration::minutes(20), None),
+            reminder("r2", now + chrono::Duration::minutes(12), None),
+            reminder("r3", local(14, 17, 30), Some(86_400)),
+            reminder("r4", local(15, 9, 0), None),
+            reminder("r5", local(15, 11, 0), None),
+            reminder("r6", local(19, 9, 0), None),
+            reminder("r7", local(30, 9, 0), None),
+        ];
+        let fired = vec![
+            FiredReminder::fired(&reminder("r0", local(14, 10, 2), None), local(14, 10, 2)),
+            FiredReminder::fired(&reminder("r9", local(13, 23, 40), None), local(13, 23, 40)),
+            FiredReminder::fired(&reminder("r8", local(14, 8, 15), None), local(14, 8, 15)),
+        ];
+        let model = RemindersModel::from_read(RemindersRead::Reminders { pending, fired });
+        assert_eq!(model.next_up().map(|r| r.id.as_str()), Some("r1"), "soonest, overdue or not");
+        assert_eq!(model.pending().len(), 7);
+        assert_eq!(model.fired().len(), 3);
+        let days = model.agenda_days(now, &tz);
+        assert_eq!(
+            days,
+            [
+                (1, "Today".to_string()),
+                (3, "Tomorrow".to_string()),
+                (5, "Thursday".to_string()),
+                (6, "Mon, Nov 30".to_string()),
+            ],
+            "Next up is left out; r2 is still ahead today"
+        );
+        // Past due, the next one leads an Overdue group.
+        let later = RemindersModel::from_read(RemindersRead::Reminders {
+            pending: vec![
+                reminder("r1", now - chrono::Duration::minutes(30), None),
+                reminder("r2", now - chrono::Duration::minutes(20), None),
+                reminder("r3", now + chrono::Duration::minutes(20), None),
+            ],
+            fired: vec![],
+        });
+        assert_eq!(later.agenda_days(now, &tz), [(1, OVERDUE_HEADING.to_string()), (2, "Today".to_string())]);
+        // Fired: newest first, by the day each fired.
+        let ids: Vec<&str> = model.fired().iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["r0", "r8", "r9"]);
+        assert_eq!(model.fired_days(now, &tz), [(0, "Today".to_string()), (2, "Yesterday".to_string())]);
+        assert_eq!(model.fired()[0].gutter_time(&tz), "10:02 AM");
+        assert_eq!(model.pending()[3].gutter_time(&tz), "9:00 AM");
+        assert_eq!(model.pending()[4].due_clock(now, &tz), "Nov 15, 11:00 AM");
+        assert_eq!(model.pending()[1].due_clock(now, &tz), "2:22 PM");
+        assert_eq!(agenda_label(local(14, 0, 0) + chrono::Duration::days(400), now, &tz), "Sun, Dec 19, 2027");
+    }
+
+    #[test]
+    fn countdowns_tick_down_then_say_due() {
+        let now = at(14, 10);
+        let row = |due: DateTime<Utc>| ReminderRow::from_pending(&reminder("r1", due, None));
+        let s = |secs: i64| row(now + chrono::Duration::seconds(secs)).countdown(now);
+        assert_eq!(s(45), "in 45s");
+        assert_eq!(s(12 * 60 + 20), "in 12m");
+        assert_eq!(s(3 * 3600 + 27 * 60 + 5), "in 3h 27m");
+        assert_eq!(s(22 * 3600), "in 22h");
+        assert_eq!(s(2 * 86_400 + 4 * 3600 + 60), "in 2d 4h");
+        assert_eq!(s(3 * 86_400), "in 3d");
+        assert_eq!(s(0), "due now");
+        assert_eq!(s(-30), "due now");
+        assert_eq!(s(-20 * 60), "due 20m ago");
+        let fired = ReminderRow::from_fired(&FiredReminder::fired(&reminder("r1", now, None), now));
+        assert_eq!(fired.countdown(now), "");
+    }
+
+    #[test]
+    fn a_reminder_past_its_time_is_overdue_until_it_fires() {
+        let now = at(14, 10);
+        let ahead = ReminderRow::from_pending(&reminder("r1", at(14, 30), None));
+        let past = ReminderRow::from_pending(&reminder("r2", at(14, 10), None));
+        let fired = ReminderRow::from_fired(&FiredReminder::fired(&reminder("r3", at(14, 0), None), at(14, 0)));
+        assert!(!ahead.overdue(now) && past.overdue(now) && !fired.overdue(now));
+        assert_eq!(ahead.tone_at(now), Some(Tone::Blue));
+        assert_eq!(past.tone_at(now), Some(OVERDUE_TONE));
+        assert_eq!(fired.tone_at(now), None);
+        assert_eq!(past.status_tone_at(now), OVERDUE_TONE);
+        assert_eq!(ahead.status_tone_at(now), Tone::Blue);
+    }
+
+    #[test]
+    fn progress_runs_from_set_to_due() {
+        // Set at 9:00, due at 14:00.
+        let row = ReminderRow::from_pending(&reminder("r1", at(14, 0), None));
+        assert_eq!(row.progress(at(9, 0)), 0.0);
+        assert_eq!(row.progress(at(8, 0)), 0.0, "a skewed clock");
+        assert!((row.progress(at(11, 30)) - 0.5).abs() < 1e-6);
+        assert_eq!(row.progress(at(14, 0)), 1.0);
+        assert_eq!(row.progress(at(15, 0)), 1.0);
+        assert_eq!(row.set_label(at(9, 48)), "set 48m ago");
+        // Due when set: full.
+        let instant = ReminderRow::from_pending(&reminder("r2", at(9, 0), None));
+        assert_eq!(instant.progress(at(8, 0)), 1.0);
     }
 
     #[test]

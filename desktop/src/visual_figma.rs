@@ -98,10 +98,11 @@
 //! and with none, and `jobs-sheet` the running bundle job's sheet floating
 //! over the cards (no frame; checked by eye against the task pane);
 //! `=jobs` renders just those.
-//! `reminders`, `reminders-sheet` and `reminders-empty` are the Reminders
-//! screen with three pending and two fired reminders, with a pending one's
-//! sheet open, and with none (checked by eye); `=reminders` renders just
-//! those.
+//! `reminders`, `reminders-sheet`, `reminders-overdue`,
+//! `reminders-repeating` and `reminders-empty` are the Reminders agenda with
+//! five pending and four fired reminders, with a pending one's sheet open,
+//! with two past their time, with a repeating one up next, and with none
+//! (checked by eye); `=reminders` renders just those.
 //! With `SHELBI_VISUAL_THEME` unset
 //! it runs once per theme. Frames are saved at 1x (the references' scale),
 //! downsampled from the window's backing scale; `--2x` opens each window on
@@ -1419,21 +1420,26 @@ impl Run {
         self.save(handle, "jobs-empty");
     }
 
-    /// The Reminders screen (no Figma frame; checked by eye): `reminders`
-    /// with three pending reminders (one recurring), soonest first, then two
-    /// fired ones under `Fired`; `reminders-sheet` with the recurring one's
-    /// sheet open; `reminders-empty` once there are none. The store and the
-    /// history are written straight into the fixture project, as `shelbi
-    /// remind` and the hub would. `SHELBI_VISUAL_ONLY=reminders` renders
-    /// just these.
+    /// The Reminders screen (no Figma frame; checked by eye), pinned at 3 PM:
+    /// `reminders` with five pending reminders (Next up in 12m, two more
+    /// today, one of them repeating, one tomorrow, one later in the week)
+    /// and four fired ones (two today, two yesterday); `reminders-sheet`
+    /// with the devbox one's sheet open; `reminders-overdue` with two past
+    /// their time that the hub hasn't fired (Next up and the Overdue group);
+    /// `reminders-repeating` with a repeating reminder up next;
+    /// `reminders-empty` once there are none. The store and the history are
+    /// written straight into the fixture project, as `shelbi remind` and the
+    /// hub would. `SHELBI_VISUAL_ONLY=reminders` renders just these.
     fn reminders(&mut self) {
         use shelbi_state::awareness::{record_fired_reminders, update_awareness, FiredReminder, Reminder};
         let now = pinned_now();
-        let reminder = |id: &str, text: &str, due_mins: i64, every_mins: Option<u64>| Reminder {
+        let mins = chrono::Duration::minutes;
+        // Due `due` minutes from now, set `set` minutes ago.
+        let reminder = |id: &str, text: &str, due: i64, set: i64, every_mins: Option<u64>| Reminder {
             id: id.into(),
-            due_at: now + chrono::Duration::minutes(due_mins),
+            due_at: now + mins(due),
             text: text.into(),
-            created_at: now - chrono::Duration::minutes(90),
+            created_at: now - mins(set),
             every: every_mins.map(|m| std::time::Duration::from_secs(m * 60)),
         };
         let set = |reminders: Vec<Reminder>| {
@@ -1443,20 +1449,26 @@ impl Run {
             })
             .expect("write the fixture awareness store")
         };
-        set(vec![
-            reminder("r12", "check PR #2311 CI", 14, None),
-            reminder("r9", "ask about the devbox relay before the release goes out to the tap", 120, Some(24 * 60)),
-            reminder("r14", "release tap", 20 * 60, None),
-        ]);
+        let history = shelbi_state::awareness::reminder_history_path(PROJECT).expect("the history path");
         let fired = |r: Reminder| {
             let at = r.due_at;
             FiredReminder::fired(&r, at)
         };
+        let day = 24 * 60;
+        set(vec![
+            reminder("r7", "Check PR #2424 CI and merge if green", 12, 48, None),
+            reminder("r9", "Look at the devbox relay before the release goes out to the Homebrew tap", 207, 120, None),
+            reminder("r10", "Nightly: check stale branches", 150, 6 * 60, Some(day as u64)),
+            reminder("r11", "Ping the Homebrew tap PR", 18 * 60, 30, None),
+            reminder("r14", "Draft the v0.15 release notes", 3 * day - 5 * 60, 60, None),
+        ]);
         record_fired_reminders(
             PROJECT,
             vec![
-                fired(reminder("r8", "check deploy", -20, None)),
-                fired(reminder("r5", "nudge alpha", -180, Some(60))),
+                fired(reminder("r6", "Re-check alpha's build job", -298, 400, None)),
+                fired(reminder("r5", "Look at release v0.14 CI", -405, 500, None)),
+                fired(reminder("r3", "Morning summary for the user", -920, 1000, None)),
+                fired(reminder("r10", "Nightly: check stale branches", -(day - 150), 2 * day, Some(day as u64))),
             ],
             now,
         )
@@ -1464,16 +1476,29 @@ impl Run {
         let handle = self.open();
         self.click(handle, View::Reminders);
         let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
-        let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 5));
-        self.expect("reminders: the five fixture reminders load", loaded);
-        let ids: Vec<String> = view.read_with(&self.cx, |v, _| v.model().rows().iter().map(|r| r.id.clone()).collect());
-        self.expect("reminders: pending soonest first, then fired", ids == ["r12", "r9", "r14", "r8", "r5"]);
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 9));
+        self.expect("reminders: the nine fixture reminders load", loaded);
+        let (next, days, fired_days) = view.read_with(&self.cx, |v, _| {
+            let m = v.model();
+            let labels = |d: Vec<(usize, String)>| d.into_iter().map(|(_, l)| l).collect::<Vec<_>>();
+            (
+                m.next_up().map(|r| r.id.clone()),
+                labels(m.agenda_days(now, &Local)),
+                labels(m.fired_days(now, &Local)),
+            )
+        });
+        self.expect("reminders: the soonest is up next", next.as_deref() == Some("r7"));
+        self.expect(
+            "reminders: the rest by day",
+            days.len() == 3 && days[0] == "Today" && days[1] == "Tomorrow",
+        );
+        self.expect("reminders: fired by day", fired_days == ["Today", "Yesterday"]);
         self.save(handle, "reminders");
 
         let handle = self.open();
         self.click(handle, View::Reminders);
         let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
-        let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 5));
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 9));
         self.expect("reminders-sheet: the reminders load", loaded);
         view.update(&mut self.cx, |v, cx| v.open_sheet_for_check("r9", cx));
         self.settle(handle);
@@ -1483,9 +1508,38 @@ impl Run {
         self.settle(handle);
         self.save(handle, "reminders-sheet");
 
+        // Two past their time, not yet fired (a hub that was down).
+        let _ = std::fs::remove_file(&history);
+        set(vec![
+            reminder("r21", "Re-run the flaky desktop tests on alpha", -18, 60, None),
+            reminder("r22", "Ask the user about the devbox disk", -6, 90, None),
+            reminder("r23", "Check the Linear import finished", 40, 20, None),
+        ]);
+        let handle = self.open();
+        self.click(handle, View::Reminders);
+        let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 3));
+        self.expect("reminders-overdue: the reminders load", loaded);
+        let overdue = view.read_with(&self.cx, |v, _| v.model().next_up().is_some_and(|r| r.overdue(now)));
+        self.expect("reminders-overdue: the one up next is overdue", overdue);
+        self.save(handle, "reminders-overdue");
+
+        // A repeating reminder up next.
+        set(vec![
+            reminder("r30", "Hourly: post a digest of the workers' progress for the user", 25, 35, Some(60)),
+            reminder("r31", "Nightly: check stale branches", 150, 6 * 60, Some(day as u64)),
+            reminder("r32", "Look at the devbox relay", 207, 120, None),
+        ]);
+        let handle = self.open();
+        self.click(handle, View::Reminders);
+        let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| view.read_with(cx, |v, _| v.model().rows().len() == 3));
+        self.expect("reminders-repeating: the reminders load", loaded);
+        let repeating = view.read_with(&self.cx, |v, _| v.model().next_up().is_some_and(|r| r.every.is_some()));
+        self.expect("reminders-repeating: the one up next repeats", repeating);
+        self.save(handle, "reminders-repeating");
+
         set(Vec::new());
-        let history = shelbi_state::awareness::reminder_history_path(PROJECT).expect("the history path");
-        let _ = std::fs::remove_file(history);
         let handle = self.open();
         self.click(handle, View::Reminders);
         let view = handle.update(&mut self.cx, |w, _, _| w.offscreen_reminders()).unwrap().expect("the Reminders view");

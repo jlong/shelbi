@@ -135,6 +135,7 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (Icon, Hsla) {
         "view:activity" => icons::BOLT,
         "view:machines" => icons::SERVER_STACK,
         "view:jobs" => icons::QUEUE_LIST,
+        "view:reminders" => icons::CLOCK,
         "action:detach" => icons::BOLT_SLASH,
         "action:toggle-zen" if entry.label.ends_with(" off") => icons::TOGGLE_ON,
         "action:toggle-zen" => icons::TOGGLE_OFF,
@@ -678,6 +679,11 @@ mod tests {
         let jobs = crate::views::sidebar::nav_icon(&shelbi_app::nav::View::Jobs);
         assert_eq!(icon_for(&entry("view:jobs", None), &theme).0, jobs);
         assert_eq!(jobs, icons::QUEUE_LIST);
+        // Reminders is the clock everywhere: its nav drawing, the palette,
+        // the screen's title and its empty state.
+        let reminders = crate::views::sidebar::nav_icon(&shelbi_app::nav::View::Reminders);
+        assert_eq!(icon_for(&entry("view:reminders", None), &theme).0, reminders);
+        assert_eq!(reminders, icons::CLOCK);
         let mut zen = entry("action:toggle-zen", None);
         zen.label = "Turn Zen Mode on".into();
         assert_eq!(icon_for(&zen, &theme).0, icons::TOGGLE_OFF);
