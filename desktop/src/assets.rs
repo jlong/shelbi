@@ -397,7 +397,9 @@ heroicons! {
     /// The Jobs screen's nav icon and palette entry (background jobs, a
     /// queue of them), and its empty state.
     QUEUE_LIST = "queue-list";
-    /// The Reminders screen's palette entry.
+    /// The Reminders screen's icon everywhere: its nav drawing, palette
+    /// entry, title and empty state (and a one-shot reminder's glyph; a
+    /// watch job's activity line too).
     CLOCK = "clock";
     FOLDER = "folder";
     GLOBE_ALT = "globe-alt";

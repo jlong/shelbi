@@ -1,55 +1,111 @@
 //! The Reminders screen (`View::Reminders`, palette-only, and left out of
 //! the palette's default list until the user types: `rem…` finds it): the
-//! project's `shelbi remind` reminders in a four-column table (Id, When,
-//! Reminder, Repeats), the pending ones soonest first under `Pending`, then
-//! the recently fired ones newest first under `Fired`, drawn from the shared
+//! project's `shelbi remind` reminders as an agenda, drawn from the shared
 //! [`shelbi_app::reminders`] model the TUI's Reminders page draws too.
 //!
-//! It is the Jobs screen's layout, built from the same pieces
-//! ([`super::list_screen`]): the title row with its count, the bordered
-//! table with section headings, and the clickable rows. A row opens its
-//! sheet the way a job's opens: the shared floating pane
+//! A reminder is a point in time coming up, so the screen reads like a day
+//! planner, in the Jobs screen's vocabulary ([`super::list_screen`]: its
+//! title row, centered column, section headings, cards and empty state):
+//!
+//! ```text
+//!  ⏰ Reminders  3 pending · 5 fired
+//!  ──────────────────────────────────────────────────────────────
+//!    Next up
+//!    ╭──────────────────────────────────────────────────────────╮
+//!    │ (◷) in 12m                              10:45 AM  [r7]   │
+//!    │     Check PR #2424 CI and merge if green                 │
+//!    │     ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░░░░░░           set 48m ago │
+//!    ╰──────────────────────────────────────────────────────────╯
+//!    Today
+//!    ╭──────────────────────────────────────────────────────────╮
+//!    │  2:00 PM  ◷ Look at the devbox relay           in 3h 27m │
+//!    │  5:30 PM  ↻ Nightly: check stale…  every 1d    in 6h 57m │
+//!    ╰──────────────────────────────────────────────────────────╯
+//!    Tomorrow
+//!    ╭──────────────────────────────────────────────────────────╮
+//!    │  9:00 AM  ◷ Ping the Homebrew tap PR             in 22h  │
+//!    ╰──────────────────────────────────────────────────────────╯
+//!    Fired 3
+//!    ╭──────────────────────────────────────────────────────────╮
+//!    │ Today      10:02 AM  ✓ Re-check alpha's build job        │
+//!    │             8:15 AM  ✓ Look at release v0.14 CI          │
+//!    │ Yesterday  11:40 PM  ✓ Morning summary for the user      │
+//!    ╰──────────────────────────────────────────────────────────╯
+//! ```
+//!
+//! The soonest pending reminder is the hero: a card with its glyph (a clock,
+//! or the repeat arrows for one that repeats) in a tinted disc, a live
+//! countdown (`in 12m`, ticking over with each read), its due time, its
+//! repeat and its id, its whole text (up to two lines), and a bar from when
+//! it was set to when it is due. The rest are grouped by their local day
+//! (`Today`, `Tomorrow`, `Thursday`, `Mon, Dec 7`), one compact row each: the
+//! time of day in a gutter, the glyph, the text, the repeat and how long
+//! until it is due, right-aligned. A reminder past its time that the hub
+//! hasn't fired yet (a hub that was down) wears the warning color, like a
+//! job past its estimate, and the ones after Next up gather under `Overdue`.
+//! Fired reminders are a dimmed history, newest first, the day in the
+//! gutter of each day's first row. With none at all, the empty state shows
+//! the clock and the command that sets one, ready to copy.
+//!
+//! Clicking any reminder opens its sheet: the shared floating pane
 //! ([`super::floating_pane`], the issue pane's chrome) over the full-width
-//! table, at the window's task pane width (a drag of its left edge sets it
+//! agenda, at the window's task pane width (a drag of its left edge sets it
 //! for every pane), sliding in and back out. Its Header is `id · text` with
 //! Close; it shows the reminder's status, when it is due (absolute and
 //! relative), its repeat, when it was created, its whole text and, for a
 //! pending one, a Cancel reminder button (`shelbi remind cancel`). Another
-//! row's click shows that reminder; Escape or Close closes it.
+//! reminder's click shows that one; Escape or Close closes it.
 //!
 //! Like the Jobs screen, it re-reads the store and the reminder history
 //! every [`REFRESH_INTERVAL`] while it is open, off the UI thread through
 //! the window's [`ProjectSource`] (a remote window's source says the far
 //! store isn't readable yet), so a reminder appears, fires, or goes on its
-//! own; each read also repaints, which ticks the relative times over.
+//! own; each read also repaints, which ticks the countdowns over.
 
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Local, Utc};
 use gpui::{
-    div, prelude::*, px, AnyElement, ClickEvent, Context, EventEmitter, FocusHandle, KeyDownEvent, ScrollHandle,
-    SharedString, Task, Window,
+    div, prelude::*, px, relative, AnyElement, ClickEvent, Context, EventEmitter, FocusHandle, Hsla, KeyDownEvent,
+    ScrollHandle, SharedString, Task, Window,
 };
 use shelbi_app::jobs::one_line;
 use shelbi_app::reminders::{
-    ReminderRow, RemindersModel, RemindersRead, SheetState, CANCEL_LABEL, COLUMNS, REFRESH_INTERVAL, TITLE,
+    ReminderRow, RemindersModel, RemindersRead, SheetState, CANCEL_LABEL, EMPTY_COMMAND, EMPTY_DETAIL, EMPTY_TITLE,
+    FIRED_HEADING, NEXT_UP_HEADING, REFRESH_INTERVAL, TITLE,
 };
 use shelbi_app::source::{ProjectHandle, ProjectSource};
+use shelbi_app::theme::Tone;
 
 use super::floating_pane::{
     self, header_button, property_row, value_text, PaneFrame, PaneHost, PaneIds, PaneMotion, SlideOut, INSET,
 };
-use super::list_screen;
-use crate::assets::icons;
+use super::list_screen::{self, section_heading, tint, CARD_RADIUS};
+use crate::assets::{glyph, glyphs, heroicon, icons, Icon};
 use crate::theme::style::{self, Type, Typography};
 use crate::theme::Theme;
 
 /// How often the view drains its refresher.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The fixed columns' widths; Reminder takes the rest.
-const ID_W: f32 = 44.0;
-const WHEN_W: f32 = 132.0;
-const REPEATS_W: f32 = 110.0;
+/// The Next up card's padding, its glyph's disc, and its bar.
+const CARD_PAD: f32 = 14.0;
+const DISC: f32 = 32.0;
+const CARD_BAR_H: f32 = 6.0;
+/// The bar's words (`set 48m ago`).
+const CARD_BAR_LABEL_W: f32 = 96.0;
+/// A row's glyph.
+const GLYPH: f32 = 14.0;
+/// The agenda's time gutter (`11:40 PM`), and the fired history's day
+/// gutter before it (`Yesterday`, `Mon, Nov 16`).
+const TIME_W: f32 = 64.0;
+const DAY_W: f32 = 84.0;
+/// The countdown column, right-aligned so it lines up across rows and days
+/// (`in 23h 59m`, `due 20m ago`).
+const COUNTDOWN_W: f32 = 88.0;
+/// A text longer than this many characters may be cut: it gets a tooltip
+/// with the whole text.
+const TIP_CHARS: usize = 40;
 
 /// The sheet's ids: tests and the visual check find it by them.
 const IDS: PaneIds = PaneIds {
@@ -269,7 +325,7 @@ impl RemindersView {
             "Status",
             value_text(theme)
                 .debug_selector(|| "reminder-sheet-status".into())
-                .text_color(theme.tone(row.status_tone()))
+                .text_color(theme.tone(row.status_tone_at(now)))
                 .child(sheet.status(now)),
         );
         let facts = row.details(now).into_iter().map(|(label, value)| {
@@ -331,76 +387,336 @@ impl RemindersView {
     }
 
     fn render_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if self.model == RemindersModel::Empty {
+            return list_screen::empty_state("reminders-empty", icons::CLOCK, EMPTY_TITLE, EMPTY_DETAIL, EMPTY_COMMAND, theme);
+        }
         if let Some(message) = self.model.message() {
-            // The empty line's two sentences on lines of their own: wrapped
-            // as one, the command's closing "`." breaks onto a line alone.
-            let message = match self.model {
-                RemindersModel::Empty => message.replacen(". ", ".\n", 1),
-                _ => message,
-            };
             return list_screen::message("reminders-empty", message, theme);
         }
         let now = super::activity::now();
-        let headings = list_screen::headings_row()
-            .child(div().w(px(ID_W)).flex_none().child(COLUMNS[0]))
-            .child(div().w(px(WHEN_W)).flex_none().child(COLUMNS[1]))
-            .child(div().flex_1().min_w_0().child(COLUMNS[2]))
-            .child(div().w(px(REPEATS_W)).flex_none().child(COLUMNS[3]));
-        let rows = self
-            .model
-            .rows()
-            .iter()
-            .map(|row| {
-                let open = self.sheet.as_ref().is_some_and(|s| s.row.key == row.key);
-                reminder_row(row, now, open, theme, cx)
-            })
-            .collect();
-        let rows = list_screen::sectioned("reminders", rows, &self.model.headings(), theme);
-        list_screen::list("reminders", &self.scroll, headings, rows, theme)
+        let open = |row: &ReminderRow| self.sheet.as_ref().is_some_and(|s| s.row.key == row.key);
+        let (pending, fired) = (self.model.pending(), self.model.fired());
+        let mut column = list_screen::content();
+        let mut spaced = false;
+        if let Some(next) = self.model.next_up() {
+            column = column.child(section_heading("reminders-next-heading", NEXT_UP_HEADING.to_string(), None, false, theme));
+            column = column.child(next_up_card(next, now, open(next), theme, cx));
+            spaced = true;
+        }
+        let days = self.model.agenda_days(now, &Local);
+        for (n, (start, label)) in days.iter().enumerate() {
+            let end = days.get(n + 1).map_or(pending.len(), |(next, _)| *next);
+            column = column.child(section_heading(format!("reminders-day-{n}-heading"), label.clone(), None, spaced, theme));
+            let rows = pending[*start..end].iter().map(|row| agenda_row(row, now, open(row), theme, cx));
+            column = column.child(list_screen::group_card(format!("reminders-day-{n}"), rows, theme));
+            spaced = true;
+        }
+        if !fired.is_empty() {
+            column = column.child(section_heading(
+                "reminders-fired-heading",
+                FIRED_HEADING.to_string(),
+                Some(fired.len()),
+                spaced,
+                theme,
+            ));
+            let days = self.model.fired_days(now, &Local);
+            let rows = fired.iter().enumerate().map(|(i, row)| {
+                let day = days.iter().find(|(at, _)| *at == i).map(|(_, label)| label.clone());
+                fired_row(row, day, open(row), theme, cx)
+            });
+            column = column.child(list_screen::group_card("reminders-fired".to_string(), rows, theme));
+        }
+        list_screen::scrolling("reminders", &self.scroll, column)
     }
 }
 
-/// One reminder's row: its id, when it is due (blue) or when it fired
-/// (muted), its text cut to the column (whole in a tooltip), its repeat.
-fn reminder_row(
+/// A debug selector `reminder-<part>-<key>`.
+fn selector(part: &'static str, key: &str) -> impl FnOnce() -> String {
+    let s = format!("reminder-{part}-{key}");
+    move || s
+}
+
+/// A reminder's glyph: the repeat arrows for one that repeats, else the
+/// clock.
+fn glyph_icon(row: &ReminderRow) -> Icon {
+    if row.every.is_some() {
+        icons::ARROW_PATH
+    } else {
+        icons::CLOCK
+    }
+}
+
+/// A pending reminder's accent at `now`: blue, the warning color once past
+/// its time.
+fn accent(row: &ReminderRow, now: DateTime<Utc>, theme: &Theme) -> (Tone, Hsla) {
+    let tone = row.tone_at(now).unwrap_or(Tone::Blue);
+    let color = if row.overdue(now) { theme.warning } else { theme.tone(tone) };
+    (tone, color)
+}
+
+/// The soonest pending reminder's card: its glyph in a tinted disc, the
+/// countdown, the due time, repeat and id; its whole text (two lines at
+/// most); the bar from when it was set to when it is due.
+fn next_up_card(
     row: &ReminderRow,
-    now: chrono::DateTime<chrono::Utc>,
+    now: DateTime<Utc>,
+    open: bool,
+    theme: &Theme,
+    cx: &mut Context<RemindersView>,
+) -> AnyElement {
+    let (tone, color) = accent(row, now, theme);
+    let key = row.key.clone();
+    let disc = div()
+        .debug_selector(selector("glyph", &row.key))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(DISC))
+        .rounded_full()
+        .bg(tint(tone, theme))
+        .child(heroicon(glyph_icon(row)).size(px(16.0)).text_color(color));
+    let top = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .min_w_0()
+        .child(
+            div()
+                .debug_selector(selector("countdown", &row.key))
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .type_style(Type::LargeSemibold)
+                .text_color(color)
+                .child(row.countdown(now)),
+        )
+        .when(row.every.is_some(), |d| {
+            d.child(
+                div()
+                    .debug_selector(selector("repeats", &row.key))
+                    .flex_none()
+                    .type_style(Type::Small)
+                    .text_color(theme.muted)
+                    .child(row.repeats()),
+            )
+        })
+        .child(
+            div()
+                .debug_selector(selector("due", &row.key))
+                .flex_none()
+                .type_style(Type::Small)
+                .text_color(theme.foreground)
+                .child(row.due_clock(now, &Local)),
+        )
+        .child(
+            div()
+                .debug_selector(selector("id", &row.key))
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(px(20.0))
+                .px(px(6.0))
+                .rounded(px(4.0))
+                .bg(theme.fill_on(theme.background, theme.card))
+                .type_style(Type::XSmallMedium)
+                .text_color(theme.muted)
+                .child(row.id.clone()),
+        );
+    let text = div()
+        .id(SharedString::from(format!("reminder-text-{}", row.key)))
+        .debug_selector(selector("text", &row.key))
+        .min_w_0()
+        .line_clamp(2)
+        .type_style(Type::BaseMedium)
+        .text_color(theme.text_loud)
+        .tooltip(style::tooltip(row.text.clone()))
+        .child(row.text.clone());
+    let bar = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .child(
+            div()
+                .debug_selector(selector("bar", &row.key))
+                .flex_1()
+                .h(px(CARD_BAR_H))
+                .rounded_full()
+                .bg(theme.search)
+                .child(div().h_full().w(relative(row.progress(now))).rounded_full().bg(color)),
+        )
+        .child(
+            div()
+                .debug_selector(selector("bar-label", &row.key))
+                .flex_none()
+                .w(px(CARD_BAR_LABEL_W))
+                .text_right()
+                .whitespace_nowrap()
+                .type_style(Type::XSmall)
+                .text_color(theme.muted)
+                .child(row.set_label(now)),
+        );
+    div()
+        .id(SharedString::from(format!("reminder-row-{}", row.key)))
+        .debug_selector(selector("row", &row.key))
+        .flex()
+        .flex_row()
+        .items_start()
+        .gap(px(12.0))
+        .min_w_0()
+        .p(px(CARD_PAD))
+        .rounded(px(CARD_RADIUS))
+        .bg(theme.card)
+        // The open reminder's card wears the focus ring, as the board's
+        // selected card does.
+        .shadow(if open && theme.translucent() {
+            style::focus_shadow_inset(theme)
+        } else if open {
+            style::focus_shadow(theme)
+        } else {
+            style::card_shadow(theme)
+        })
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_sheet(&key, cx)))
+        .child(disc)
+        .child(div().flex().flex_col().flex_1().min_w_0().gap(px(8.0)).child(top).child(text).child(bar))
+        .into_any_element()
+}
+
+/// A pending reminder's agenda row: the time of day, its glyph, its text
+/// (whole in a tooltip when cut), its repeat, and how long until it is due.
+fn agenda_row(
+    row: &ReminderRow,
+    now: DateTime<Utc>,
+    open: bool,
+    theme: &Theme,
+    cx: &mut Context<RemindersView>,
+) -> AnyElement {
+    let (_, color) = accent(row, now, theme);
+    let overdue = row.overdue(now);
+    let key = row.key.clone();
+    let text = one_line(&row.text);
+    let long = text.chars().count() > TIP_CHARS;
+    list_screen::compact_row(format!("reminder-row-{}", row.key), open, theme)
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_sheet(&key, cx)))
+        .type_style(Type::Small)
+        .child(
+            div()
+                .debug_selector(selector("time", &row.key))
+                .flex_none()
+                .w(px(TIME_W))
+                .text_right()
+                .whitespace_nowrap()
+                .text_color(if overdue { theme.warning } else { theme.muted })
+                .child(row.gutter_time(&Local)),
+        )
+        .child(
+            div()
+                .debug_selector(selector("glyph", &row.key))
+                .flex_none()
+                .child(heroicon(glyph_icon(row)).size(px(GLYPH)).text_color(if overdue { theme.warning } else { theme.icon })),
+        )
+        .child(
+            div()
+                .id(SharedString::from(format!("reminder-text-{}", row.key)))
+                .debug_selector(selector("text", &row.key))
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .type_style(Type::Base)
+                .text_color(theme.text_loud)
+                .when(long, |d| d.tooltip(style::tooltip(row.text.clone())))
+                .child(text),
+        )
+        .when(row.every.is_some(), |d| {
+            d.child(
+                div()
+                    .debug_selector(selector("repeats", &row.key))
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .text_color(theme.muted)
+                    .child(row.repeats()),
+            )
+        })
+        .child(
+            div()
+                .debug_selector(selector("countdown", &row.key))
+                .flex_none()
+                .w(px(COUNTDOWN_W))
+                .text_right()
+                .whitespace_nowrap()
+                .text_color(color)
+                .child(row.countdown(now)),
+        )
+        .into_any_element()
+}
+
+/// A fired reminder's history row, dimmed: the day (on each day's first
+/// row), the time it fired, a check, its text and its repeat.
+fn fired_row(
+    row: &ReminderRow,
+    day: Option<String>,
     open: bool,
     theme: &Theme,
     cx: &mut Context<RemindersView>,
 ) -> AnyElement {
     let key = row.key.clone();
-    let when_color = row.when_tone().map_or(theme.muted, |t| theme.tone(t));
-    list_screen::row("reminder", &row.key, open, theme)
+    let text = one_line(&row.text);
+    let long = text.chars().count() > TIP_CHARS;
+    list_screen::compact_row(format!("reminder-row-{}", row.key), open, theme)
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| this.open_sheet(&key, cx)))
-        .child(div().w(px(ID_W)).flex_none().truncate().text_color(theme.muted).child(row.id.clone()))
+        .type_style(Type::Small)
+        .text_color(theme.muted)
         .child(
             div()
-                .debug_selector({
-                    let key = row.key.clone();
-                    move || format!("reminder-when-{key}")
-                })
-                .w(px(WHEN_W))
+                .debug_selector(selector("day", &row.key))
                 .flex_none()
+                .w(px(DAY_W))
                 .truncate()
-                .text_color(when_color)
-                .child(row.when(now)),
+                .when_some(day, |d, day| d.child(day)),
+        )
+        .child(
+            div()
+                .debug_selector(selector("time", &row.key))
+                .flex_none()
+                .w(px(TIME_W))
+                .text_right()
+                .whitespace_nowrap()
+                .child(row.gutter_time(&Local)),
+        )
+        .child(
+            div()
+                .debug_selector(selector("glyph", &row.key))
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(px(GLYPH))
+                .child(glyph(glyphs::CHECK).text_color(theme.muted)),
         )
         .child(
             div()
                 .id(SharedString::from(format!("reminder-text-{}", row.key)))
-                .debug_selector({
-                    let key = row.key.clone();
-                    move || format!("reminder-text-{key}")
-                })
+                .debug_selector(selector("text", &row.key))
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_color(theme.text_loud)
-                .tooltip(style::tooltip(row.text.clone()))
-                .child(one_line(&row.text)),
+                .type_style(Type::Base)
+                .text_color(theme.muted)
+                .when(long, |d| d.tooltip(style::tooltip(row.text.clone())))
+                .child(text),
         )
-        .child(div().w(px(REPEATS_W)).flex_none().truncate().text_color(theme.muted).child(row.repeats()))
+        .when(row.every.is_some(), |d| {
+            d.child(
+                div()
+                    .debug_selector(selector("repeats", &row.key))
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .child(row.repeats()),
+            )
+        })
         .into_any_element()
 }
 
@@ -434,7 +750,7 @@ impl Render for RemindersView {
             .bg(theme.nested(theme.canvas))
             .type_style(Type::Base)
             .text_color(theme.foreground)
-            .child(list_screen::title_row("reminders", TITLE, summary, &theme))
+            .child(list_screen::title_row("reminders", Some(icons::CLOCK), TITLE, summary, &theme))
             .child(div().h(px(1.0)).flex_none().bg(theme.divider))
             .child(div().flex().flex_col().flex_1().min_h_0().min_w_0().child(table))
             .children(sheet)
@@ -449,7 +765,7 @@ mod tests {
     use crate::views::pane_width::DEFAULT_W;
     use chrono::Utc;
     use gpui::{Entity, TestAppContext, VisualTestContext};
-    use shelbi_app::reminders::{EMPTY_TEXT, REMOTE_TEXT};
+    use shelbi_app::reminders::REMOTE_TEXT;
     use shelbi_app::source::ProjectKey;
     use shelbi_state::awareness::{record_fired_reminders, update_awareness, FiredReminder, Reminder};
 
@@ -536,7 +852,7 @@ mod tests {
     }
 
     #[gpui::test]
-    fn pending_then_fired_under_their_headings_and_following_the_store(cx: &mut TestAppContext) {
+    fn next_up_then_the_agenda_then_fired_and_following_the_store(cx: &mut TestAppContext) {
         let _home = shelbi_app::settings::agents::fixture::Home::new("dt-reminders", PROJECT, crate::test_env::lock());
         let fired_one = reminder("r8", "check deploy", -20, None);
         set_reminders(vec![
@@ -551,8 +867,9 @@ mod tests {
         let fired_key = view.read_with(&vcx, |v, _| v.model().rows()[2].key.clone());
         let mut tops = Vec::new();
         for selector in [
-            "reminders-pending-heading".to_string(),
+            "reminders-next-heading".to_string(),
             "reminder-row-r12".to_string(),
+            "reminders-day-0-heading".to_string(),
             "reminder-row-r9".to_string(),
             "reminders-fired-heading".to_string(),
             format!("reminder-row-{fired_key}"),
@@ -560,9 +877,33 @@ mod tests {
             tops.push(vcx.debug_bounds(sel(selector.clone())).unwrap_or_else(|| panic!("{selector} drawn")).top());
         }
         assert!(tops.windows(2).all(|w| w[0] < w[1]), "headings above their rows: {tops:?}");
-        assert!(vcx.debug_bounds("reminders-title").is_some() && vcx.debug_bounds("reminders-summary").is_some());
+        // The title wears the clock, with the counts.
+        for s in ["reminders-title-icon", "reminders-title", "reminders-summary"] {
+            assert!(vcx.debug_bounds(s).is_some(), "{s} drawn");
+        }
         let model = view.read_with(&vcx, |v, _| v.model().clone());
         assert_eq!(model.summary().as_deref(), Some("2 pending · 1 fired"));
+        // Next up counts down to it, with its due time and a set→due bar;
+        // the agenda row has its time, its repeat and its countdown.
+        for s in [
+            "reminder-countdown-r12",
+            "reminder-due-r12",
+            "reminder-id-r12",
+            "reminder-bar-r12",
+            "reminder-bar-label-r12",
+            "reminder-time-r9",
+            "reminder-glyph-r9",
+            "reminder-repeats-r9",
+            "reminder-countdown-r9",
+        ] {
+            assert!(vcx.debug_bounds(s).is_some(), "{s} drawn");
+        }
+        assert!(vcx.debug_bounds("reminder-repeats-r12").is_none(), "a one-shot reminder has no repeat");
+        let next = model.next_up().unwrap();
+        assert!(next.countdown(Utc::now()).starts_with("in 1"), "{}", next.countdown(Utc::now()));
+        // The fired row is history: its day, its time, no countdown.
+        assert!(vcx.debug_bounds(sel(format!("reminder-day-{fired_key}"))).is_some());
+        assert!(vcx.debug_bounds(sel(format!("reminder-countdown-{fired_key}"))).is_none());
         let row = vcx.debug_bounds("reminder-row-r12").unwrap();
         assert!(row.right() <= px(1000.0), "no sideways scroll");
 
@@ -573,11 +914,38 @@ mod tests {
             "the new reminder appears, the canceled one goes"
         );
         assert!(vcx.debug_bounds("reminder-row-r12").is_none());
+        assert!(vcx.debug_bounds("reminder-countdown-r15").is_some(), "the new one is up next");
         set_reminders(vec![]);
         std::fs::remove_file(shelbi_state::awareness::reminder_history_path(PROJECT).unwrap()).unwrap();
         assert!(read_until(&view, &mut vcx, |m| *m == RemindersModel::Empty), "nothing left");
-        assert!(vcx.debug_bounds("reminders-empty").is_some());
-        assert_eq!(view.read_with(&vcx, |v, _| v.model().message()).as_deref(), Some(EMPTY_TEXT));
+        // The empty state: the clock, and the command that sets one.
+        for s in ["reminders-empty", "reminders-empty-icon", "reminders-empty-command"] {
+            assert!(vcx.debug_bounds(s).is_some(), "{s} drawn");
+        }
+        view.update(&mut vcx, |v, _| v.stop_workers());
+    }
+
+    #[gpui::test]
+    fn a_reminder_past_its_time_shows_overdue(cx: &mut TestAppContext) {
+        let _home =
+            shelbi_app::settings::agents::fixture::Home::new("dt-reminders-overdue", PROJECT, crate::test_env::lock());
+        set_reminders(vec![
+            reminder("r3", "missed while the hub was down", -30, None),
+            reminder("r4", "also missed", -10, None),
+            reminder("r5", "still ahead", 30, None),
+        ]);
+        let (view, mut vcx) = open(cx, shelbi_orchestrator::source::local_handle(PROJECT));
+        assert!(read_until(&view, &mut vcx, |m| m.rows().len() == 3));
+        let model = view.read_with(&vcx, |v, _| v.model().clone());
+        let now = Utc::now();
+        assert_eq!(model.next_up().map(|r| r.id.as_str()), Some("r3"));
+        assert!(model.next_up().unwrap().overdue(now));
+        assert_eq!(model.next_up().unwrap().countdown(now), "due 30m ago");
+        let days = model.agenda_days(now, &Local);
+        assert_eq!(days[0], (1, shelbi_app::reminders::OVERDUE_HEADING.to_string()));
+        for s in ["reminder-countdown-r3", "reminder-row-r4", "reminders-day-0-heading", "reminder-row-r5"] {
+            assert!(vcx.debug_bounds(s).is_some(), "{s} drawn");
+        }
         view.update(&mut vcx, |v, _| v.stop_workers());
     }
 
