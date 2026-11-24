@@ -762,7 +762,6 @@ mod tests {
             .unwrap_or_else(|| "<none>".into())
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn cmd_shift_n_is_new_window() {
         let chord = |spec: &str| chord_from_keystroke(&test_keys::app_keystroke(spec)).unwrap();
