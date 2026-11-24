@@ -161,6 +161,11 @@ objc2-app-kit = { version = "0.3", features = [
 # XWayland. Features unify with the dependency above: the pin stays there.
 [target.'cfg(target_os = "linux")'.dependencies]
 gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["wayland"] }
+# The XDG Desktop Portal (`platform::open_panel`'s file chooser, which can
+# start in a folder where gpui's can't; `platform::desktop_settings`' Reduce
+# Motion and overlay scroll bars): the version and runtime gpui's Linux
+# backend already uses, so the lockfile only records the edge.
+ashpd = { version = "0.13", default-features = false, features = ["async-io", "file_chooser", "settings"] }
 
 [features]
 # `cargo run --features visual-check -- --visual-check <dir>`: render the

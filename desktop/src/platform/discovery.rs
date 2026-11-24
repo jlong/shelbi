@@ -2,10 +2,12 @@
 //!
 //! Order: the `desktop.cli_path` setting in `~/.shelbi/config.yaml`, then the
 //! login shell's `PATH`, then the places Shelbi gets installed when that
-//! `PATH` doesn't say (`/opt/homebrew/bin`, `/usr/local/bin`,
-//! `~/.cargo/bin`, and `~/bin`, where the app's own install and
-//! `scripts/install.sh` put it). A set override is the only candidate: a typo in it is
-//! reported, never papered over by a different `shelbi` found elsewhere.
+//! `PATH` doesn't say, per OS ([`super::os::known_cli_dirs`]: on macOS
+//! `/opt/homebrew/bin`, `/usr/local/bin`, `~/.cargo/bin` and `~/bin`, where
+//! the app's own install and `scripts/install.sh` put it; on Linux
+//! `~/.local/bin` and the package's `/usr/bin` first). A set override is the
+//! only candidate: a typo in it is reported, never papered over by a
+//! different `shelbi` found elsewhere.
 //!
 //! The order and the search are pure ([`candidates`], [`discover`]) so they
 //! are tested without a filesystem.
@@ -68,21 +70,13 @@ pub struct CliNotFound {
     pub config_error: Option<String>,
 }
 
-/// The well-known install directories, in search order.
+/// The well-known install directories, in search order (this OS's).
 pub fn known_locations(home: Option<&Path>) -> Vec<PathBuf> {
-    let mut dirs = vec![
-        PathBuf::from("/opt/homebrew/bin"),
-        PathBuf::from("/usr/local/bin"),
-    ];
-    if let Some(home) = home {
-        dirs.push(home.join(".cargo/bin"));
-        dirs.push(home.join("bin"));
-    }
-    dirs
+    super::os::known_cli_dirs(home)
 }
 
 /// Every candidate, in search order, without duplicates (a `PATH` that already
-/// lists `/opt/homebrew/bin` doesn't search it twice).
+/// lists `/usr/local/bin` doesn't search it twice).
 pub fn candidates(
     setting: Option<&Path>,
     path_dirs: &[PathBuf],
@@ -223,51 +217,58 @@ mod tests {
         cands.iter().map(|c| c.path.display().to_string()).collect()
     }
 
+    /// `known_locations(home)` as candidate paths.
+    fn known(home: Option<&Path>) -> Vec<String> {
+        known_locations(home)
+            .iter()
+            .map(|d| d.join(CLI_NAME).display().to_string())
+            .collect()
+    }
+
     #[test]
-    fn order_is_login_path_then_homebrew_then_usr_local_then_cargo_then_home_bin() {
+    fn order_is_login_path_then_the_known_locations() {
         let home = Path::new("/Users/me");
-        let cands = candidates(None, &[PathBuf::from("/Users/me/.local/bin")], Some(home));
-        assert_eq!(
-            paths(&cands),
-            [
-                "/Users/me/.local/bin/shelbi",
-                "/opt/homebrew/bin/shelbi",
-                "/usr/local/bin/shelbi",
-                "/Users/me/.cargo/bin/shelbi",
-                "/Users/me/bin/shelbi",
-            ]
-        );
+        let cands = candidates(None, &[PathBuf::from("/opt/tools/bin")], Some(home));
+        let mut want = vec!["/opt/tools/bin/shelbi".to_string()];
+        want.extend(known(Some(home)));
+        assert_eq!(paths(&cands), want);
         assert_eq!(cands[0].source, CliSource::LoginPath);
         assert!(cands[1..]
             .iter()
             .all(|c| c.source == CliSource::KnownLocation));
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn on_macos_the_known_order_is_homebrew_then_usr_local_then_cargo_then_home_bin() {
+        assert_eq!(
+            known(Some(Path::new("/Users/me"))),
+            [
+                "/opt/homebrew/bin/shelbi",
+                "/usr/local/bin/shelbi",
+                "/Users/me/.cargo/bin/shelbi",
+                "/Users/me/bin/shelbi",
+            ]
+        );
+    }
+
     #[test]
     fn a_known_location_already_on_path_keeps_its_path_position() {
         let cands = candidates(
             None,
-            &[PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")],
+            &[PathBuf::from("/usr/local/bin"), PathBuf::from("/opt/x")],
             None,
         );
-        assert_eq!(
-            paths(&cands),
-            [
-                "/usr/local/bin/shelbi",
-                "/usr/bin/shelbi",
-                "/opt/homebrew/bin/shelbi"
-            ]
-        );
+        let mut want = vec!["/usr/local/bin/shelbi".to_string(), "/opt/x/shelbi".to_string()];
+        want.extend(known(None).into_iter().filter(|p| p != "/usr/local/bin/shelbi"));
+        assert_eq!(paths(&cands), want);
         assert_eq!(cands[0].source, CliSource::LoginPath);
     }
 
     #[test]
     fn relative_path_entries_are_skipped() {
         let cands = candidates(None, &[PathBuf::from("bin"), PathBuf::from(".")], None);
-        assert_eq!(
-            paths(&cands),
-            ["/opt/homebrew/bin/shelbi", "/usr/local/bin/shelbi"]
-        );
+        assert_eq!(paths(&cands), known(None));
     }
 
     #[test]
@@ -308,7 +309,7 @@ mod tests {
         assert_eq!(found.path, PathBuf::from("/usr/local/bin/shelbi"));
 
         let none = discover(None, &[PathBuf::from("/x")], Some(home), |_| false).unwrap_err();
-        assert_eq!(none.searched.len(), 5);
+        assert_eq!(none.searched.len(), 1 + known_locations(Some(home)).len());
         assert_eq!(none.setting, None);
     }
 

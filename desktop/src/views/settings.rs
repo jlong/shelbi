@@ -40,7 +40,8 @@
 //!   View Diff open, each picked from a Select ([`ToolSelect`]) over the
 //!   shared model ([`GeneralForm`]): the default, the installed CLI tools and
 //!   apps (detected off the UI thread), the current setting, Browse… (a
-//!   native open panel in `/Applications`) and Other command… (a typed
+//!   native open panel in `/Applications`, the portal's file chooser in
+//!   `/usr/bin` on Linux) and Other command… (a typed
 //!   command line, saved on Return). A pick saves only its key at once,
 //!   shown pending until the write lands; a failed write puts the picker
 //!   back and says why. The window then refreshes what the Workspace and
@@ -1490,13 +1491,14 @@ impl SettingsView {
     }
 
     /// Choose an app or a program for `setting` in a native open panel
-    /// starting in `/Applications` ([`Self::browse_picked`]).
+    /// starting in `/Applications` (`/usr/bin` on Linux, in the portal's
+    /// file chooser) ([`Self::browse_picked`]).
     fn browse_tool(&mut self, setting: ToolSetting, window: &mut Window, cx: &mut Context<Self>) {
         let message = match setting {
             ToolSetting::Editor => "Choose an editor: an app, or a program to run in a pane.",
             ToolSetting::DiffTool => "Choose a diff tool: an app, or a program to run in a pane.",
         };
-        let picked = crate::platform::open_panel::choose_file(Path::new("/Applications"), message);
+        let picked = crate::platform::open_panel::choose_file(Path::new(crate::platform::os::BROWSE_START), message);
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Some(path)) = picked.await else {
                 return;
@@ -2294,9 +2296,10 @@ impl SettingsView {
 /// `~/bin` on a shell whose `PATH` lacks it) gets the line that fixes that.
 /// The app never edits shell startup files itself.
 pub fn cli_help(running: Option<(PathBuf, bool)>, home: Option<PathBuf>) -> String {
-    let mut help = String::from(
-        "The `shelbi` binary the app runs, found on your login PATH, in Homebrew, \
-         ~/.cargo/bin, or ~/bin unless you pick one. Takes effect on the next launch.",
+    let mut help = format!(
+        "The `shelbi` binary the app runs, found on your login PATH, {} unless you pick one. \
+         Takes effect on the next launch.",
+        crate::platform::os::KNOWN_CLI_PLACES,
     );
     if let Some((cli, false)) = running {
         let dir = cli.parent().map(|d| d.to_path_buf()).unwrap_or_default();

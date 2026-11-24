@@ -21,12 +21,10 @@ use crate::theme::Theme;
 use crate::theme::style::{Type, Typography};
 use shelbi_app::launch::remote::REOPEN_LABEL;
 
-/// The CLI's install command.
-pub const INSTALL_COMMAND: &str = "brew install jlong/shelbi/shelbi";
-/// The CLI's upgrade command.
-pub const UPGRADE_COMMAND: &str = "brew upgrade shelbi";
-/// The app's own upgrade command (its cask).
-pub const APP_UPGRADE_COMMAND: &str = "brew upgrade --cask shelbi-desktop";
+/// The CLI's install and upgrade commands and the app's own upgrade
+/// command: this OS's package manager's (Homebrew on macOS, yay on Linux).
+pub use crate::platform::os::{APP_UPGRADE_COMMAND, INSTALL_COMMAND, UPGRADE_COMMAND};
+use crate::platform::os::{INSTALL_LABEL, OR_INSTALL_LABEL};
 /// Restarting the daemon onto the installed binary.
 pub const DAEMON_RESTART_COMMAND: &str = "shelbi daemon restart";
 
@@ -173,7 +171,7 @@ fn cli_not_found(nf: &CliNotFound) -> Screen {
             config_path_label()
         )));
     } else {
-        fix.push(FixStep::run("Install it with Homebrew:", INSTALL_COMMAND));
+        fix.push(FixStep::run(INSTALL_LABEL, INSTALL_COMMAND));
     }
     fix.push(FixStep::run(
         format!(
@@ -223,7 +221,7 @@ fn install_failed(e: &InstallError) -> Screen {
             "Try again. Anything already installed was left as it was."
         }
     })];
-    fix.push(FixStep::run("Or install it with Homebrew:", INSTALL_COMMAND));
+    fix.push(FixStep::run(OR_INSTALL_LABEL, INSTALL_COMMAND));
     fix.push(FixStep::run(
         format!("Or tell the app where shelbi is, in {}:", config_path_label()),
         "desktop:\n  cli_path: /path/to/shelbi",

@@ -138,7 +138,7 @@ you gave in `~/.shelbi/feedback.json`, and
 
 ## Build and run
 
-macOS on Apple silicon, macOS 15 or later.
+macOS on Apple silicon (macOS 15 or later), or Linux under Wayland.
 
 ```sh
 cd desktop
@@ -148,6 +148,35 @@ cargo run -- <project> # or a named one ($SHELBI_PROJECT works too)
 
 `rust-toolchain.toml` pins the toolchain, so rustup installs it on first use.
 Set `RUST_LOG` (default `warn`) to see more of the log on stderr.
+
+### On Linux
+
+The same commands build and run it on Linux under Wayland (the
+`desktop-linux` port; `docs/gpui.md` has the backend notes). What differs
+from the Mac sits behind `src/platform/os/` (`linux.rs`):
+
+- The `shelbi` CLI comes from the `shelbi-bin` package, which
+  `shelbi-desktop-bin` depends on: the app never downloads one. Discovery
+  searches the login shell's `PATH`, then `~/.local/bin`, `/usr/bin`,
+  `/usr/local/bin`, `~/.cargo/bin` and `~/bin`. A launcher (Walker) that
+  starts the app without `SHELL` gets the user's shell from `/etc/passwd`,
+  so the login-shell capture still runs. A missing CLI names `yay -S
+  shelbi-bin`; the update notice names `yay -Syu shelbi-desktop-bin
+  shelbi-bin`.
+- Links, files and folders open with `xdg-open`; a terminal editor runs in
+  the default terminal through `xdg-terminal-exec` (else `$TERMINAL -e`).
+- Settings' Browse… is the XDG Desktop Portal's file chooser, starting in
+  `/usr/bin`; Download Image… starts in the XDG download folder.
+- Notifications go to the freedesktop notification daemon (mako on
+  Omarchy) under the app name Shelbi; the clipboard is Wayland's.
+- Reduce Motion and the terminals' overlay scroll bars follow the desktop's
+  `enable-animations` and `overlay-scrolling` (the settings portal, else
+  GTK's `settings.ini`).
+- Relaunch re-runs the executable `/proc/self/exe` names, so an upgraded
+  package's new binary starts.
+
+`.github/workflows/desktop-linux-ci.yml` builds, lints and tests `desktop/`
+on Linux for every pull request that touches it or the shared crates.
 
 ## Its own workspace
 
@@ -261,7 +290,8 @@ desktop/
   src/theme.rs         shelbi_app::theme tokens as gpui colors; theme: setting, live system appearance
   src/assets.rs        the asset source (Heroicons, then gpui-kit's assets)
   src/platform/        bootstrap: login env, CLI discovery, the CLI install (install.rs), daemon start,
-                       version check, relaunch; --print-version (print_version.rs), the daily release check (update.rs)
+                       version check, relaunch; --print-version (print_version.rs), the daily release check (update.rs);
+                       os/ is the per-OS interface (macos.rs, linux.rs): install dirs, package commands, openers
   src/views/           bootstrap screens, sidebar, chat, issues, activity, machines, workspace, review, palette
   src/elements/        custom elements, chiefly the terminal (elements/terminal/)
   src/drops/           image and file-promise drops onto a terminal (AppKit hooks on gpui's window)

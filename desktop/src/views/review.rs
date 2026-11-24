@@ -223,18 +223,10 @@ impl ReviewOps for LiveOps {
     }
 }
 
+/// Open a URL or reveal a folder with the system's handler (`open` on
+/// macOS, `xdg-open` on Linux).
 pub(crate) fn run_open(target: &str) -> Result<(), String> {
-    std::process::Command::new("open")
-        .arg(target)
-        .status()
-        .map_err(|e| format!("couldn't run `open`: {e}"))
-        .and_then(|s| {
-            if s.success() {
-                Ok(())
-            } else {
-                Err(format!("`open {target}` exited {s}"))
-            }
-        })
+    crate::platform::os::open(target)
 }
 
 /// What the view needs from the outside world.

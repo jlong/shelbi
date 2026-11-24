@@ -1,23 +1,19 @@
 //! Relaunching the app after the CLI was upgraded under it.
 //!
-//! From the `.app` bundle, `open -n` starts a fresh instance of the bundle on
+//! The command is the OS's ([`super::os::relaunch_command`]). On macOS, from
+//! the `.app` bundle, `open -n` starts a fresh instance of the bundle on
 //! disk (which `brew upgrade` has replaced); an unbundled `cargo run` binary
-//! re-runs itself. The caller quits the old process right after.
+//! re-runs itself. On Linux the app re-runs the executable `/proc/self/exe`
+//! names, the path the package manager just replaced. The caller quits the
+//! old process right after.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 /// Start a new instance of the app.
 pub fn relaunch() -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
-    let mut cmd = match bundle_of(&exe) {
-        Some(app) => {
-            let mut open = Command::new("/usr/bin/open");
-            open.arg("-n").arg(app);
-            open
-        }
-        None => Command::new(&exe),
-    };
+    let mut cmd = super::os::relaunch_command(&exe);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -26,6 +22,7 @@ pub fn relaunch() -> std::io::Result<()> {
 }
 
 /// The `.app` bundle holding `exe` (`X.app/Contents/MacOS/<exe>`), if any.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn bundle_of(exe: &Path) -> Option<PathBuf> {
     let macos = exe.parent()?;
     let contents = macos.parent()?;
