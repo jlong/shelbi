@@ -187,9 +187,11 @@ pub(crate) fn deploy_opencode_layer(a: OpenCodeLayerArgs<'_>) -> Result<()> {
     deploy_opencode_plugin(a.host, a.worktree)?;
 
     let abs = |rel: &str| a.worktree.join(rel).to_string_lossy().into_owned();
+    let models = effort_models(a.host, a.runner);
     let mut layer = shelbi_agent::OpenCodeLayer {
         plugins: vec![abs(OPENCODE_PLUGIN_DIR_REL)],
         user_config: launch_env_opencode_user_config(a.host),
+        models: models.listed().to_vec(),
         ..Default::default()
     };
     match a.agent {
@@ -214,11 +216,72 @@ pub(crate) fn deploy_opencode_layer(a: OpenCodeLayerArgs<'_>) -> Result<()> {
             "reason=not-a-json-object var=OPENCODE_CONFIG_CONTENT",
         );
     }
+    if let Some(effort) = config.effort_unapplied {
+        // The launch goes ahead on the model's own default effort.
+        append_dispatch_status(
+            a.project,
+            a.task_id,
+            a.workspace,
+            "opencode-effort-unapplied",
+            &format!("effort={} reason={}", effort.as_str(), models.unapplied_reason(a.runner)),
+        );
+    }
     // The layer always names the plugin, so there's always a document.
     let json = config.json.unwrap_or_else(|| "{}".to_string());
     write_worktree_text(a.host, &a.worktree.join(OPENCODE_CONFIG_REL), &json, "opencode-config")?;
     let _ = gitignore_worktree_paths(a.host, a.worktree, &[".shelbi/".to_string()]);
     Ok(())
+}
+
+/// The model list an OpenCode launch maps its effort against: the hub's
+/// `opencode models` probe, the same catalog the effort picker reads.
+#[derive(Debug)]
+pub(crate) enum EffortModels {
+    /// No effort was resolved, so nothing was asked.
+    NotNeeded,
+    /// The launch runs on another machine, whose OpenCode the hub's list
+    /// doesn't describe: no variant rather than a guessed one.
+    Remote,
+    /// The probe couldn't answer (OpenCode missing, too old, or slow).
+    Unavailable,
+    Listed(Vec<shelbi_core::OpenCodeModel>),
+}
+
+impl EffortModels {
+    pub(crate) fn listed(&self) -> &[shelbi_core::OpenCodeModel] {
+        match self {
+            EffortModels::Listed(models) => models,
+            _ => &[],
+        }
+    }
+
+    /// Why an effort set no variant, for the dispatch status line.
+    pub(crate) fn unapplied_reason(&self, runner: &shelbi_core::AgentRunnerSpec) -> &'static str {
+        match self {
+            EffortModels::Remote => "remote-host",
+            EffortModels::Unavailable => "models-unavailable",
+            _ if shelbi_agent::opencode_model(runner).is_none() => "no-model",
+            _ => "variant-not-reported",
+        }
+    }
+}
+
+/// The models to map `runner`'s effort against. Asked only when an effort
+/// was resolved and the launch is on this machine; waits for the probe (it
+/// runs once per process, within [`shelbi_app::opencode_models::DEADLINE`])
+/// and never fails the dispatch.
+pub(crate) fn effort_models(host: &Host, runner: &shelbi_core::AgentRunnerSpec) -> EffortModels {
+    use shelbi_app::opencode_models::{wait, Catalog, DEADLINE};
+    if shelbi_agent::opencode_effort(runner).is_none() {
+        return EffortModels::NotNeeded;
+    }
+    if !host.is_local() {
+        return EffortModels::Remote;
+    }
+    match wait(DEADLINE) {
+        Catalog::Listed(models) => EffortModels::Listed(models.to_vec()),
+        Catalog::Probing | Catalog::Unavailable => EffortModels::Unavailable,
+    }
 }
 
 /// Write the plugin directory and clear the previous launch's lock and
@@ -527,6 +590,91 @@ mod tests {
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         assert_eq!(parse_remote_env_probe(&text), Some(r#"{"theme":"a b"}"#.into()), "{text:?}");
+    }
+
+    /// Deploy a worker layer for `runner` and read back the model both
+    /// agents get, plus the events the dispatch disclosed.
+    fn deployed_model(runner: &shelbi_core::AgentRunnerSpec, tag: &str) -> (serde_json::Value, String) {
+        let wt = tmp(tag);
+        deploy_opencode_layer(OpenCodeLayerArgs {
+            host: &Host::Local,
+            worktree: &wt,
+            runner,
+            agent: None,
+            project: "demo",
+            task_id: tag,
+            workspace: "alpha",
+        })
+        .expect("the dispatch never fails over effort");
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(wt.join(OPENCODE_CONFIG_REL)).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&wt);
+        assert_eq!(config["agents"]["build"]["model"], config["agents"]["plan"]["model"], "{config}");
+        let events = std::fs::read_to_string(shelbi_state::events_log_path().unwrap())
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(&format!("task={tag} ")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (config["agents"]["build"]["model"].clone(), events)
+    }
+
+    fn opencode_runner(model: Option<&str>, effort: Option<shelbi_core::ReasoningEffort>) -> shelbi_core::AgentRunnerSpec {
+        let base = shelbi_core::AgentRunnerSpec {
+            command: "opencode".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+        shelbi_agent::with_reasoning_effort(&shelbi_agent::with_model(&base, model), effort)
+    }
+
+    /// Decision Q4 at dispatch: the effort becomes the variant only when the
+    /// hub's model list reports it; otherwise the launch goes ahead with no
+    /// variant and says why.
+    #[test]
+    fn dispatch_maps_effort_onto_a_reported_variant_only() {
+        use shelbi_app::opencode_models::{listed, set_for_this_thread, Catalog};
+        use shelbi_core::ReasoningEffort::{High, Max};
+        let _g = crate::test_lock::isolated_home();
+
+        set_for_this_thread(Some(listed(&[("anthropic/sonnet", &["low", "high"])])));
+        let (model, events) = deployed_model(&opencode_runner(Some("anthropic/sonnet"), Some(High)), "eff-high");
+        assert_eq!(model, "anthropic/sonnet#high");
+        assert!(!events.contains("opencode-effort-unapplied"), "{events}");
+
+        // A variant the model doesn't report.
+        let (model, events) = deployed_model(&opencode_runner(Some("anthropic/sonnet"), Some(Max)), "eff-max");
+        assert_eq!(model, "anthropic/sonnet");
+        assert!(events.contains("status=opencode-effort-unapplied"), "{events}");
+        assert!(events.contains("effort=max") && events.contains("reason=variant-not-reported"), "{events}");
+
+        // No effort: no variant, nothing to say.
+        let (model, events) = deployed_model(&opencode_runner(Some("anthropic/sonnet"), None), "eff-none");
+        assert_eq!(model, "anthropic/sonnet");
+        assert!(!events.contains("opencode-effort-unapplied"), "{events}");
+
+        // The probe failed: no variant, and the dispatch still succeeds.
+        set_for_this_thread(Some(Catalog::Unavailable));
+        let (model, events) = deployed_model(&opencode_runner(Some("anthropic/sonnet"), Some(High)), "eff-noprobe");
+        assert_eq!(model, "anthropic/sonnet");
+        assert!(events.contains("effort=high") && events.contains("reason=models-unavailable"), "{events}");
+        set_for_this_thread(None);
+    }
+
+    /// A remote launch never borrows the hub's list, and nothing is asked
+    /// when there's no effort.
+    #[test]
+    fn effort_models_asks_only_for_a_local_launch_with_an_effort() {
+        let remote = Host::Ssh { host: "box".into() };
+        let high = opencode_runner(Some("p/m"), Some(shelbi_core::ReasoningEffort::High));
+        let none = opencode_runner(Some("p/m"), None);
+        assert!(matches!(effort_models(&remote, &high), EffortModels::Remote));
+        assert_eq!(effort_models(&remote, &high).unapplied_reason(&high), "remote-host");
+        assert!(matches!(effort_models(&Host::Local, &none), EffortModels::NotNeeded));
+        let no_model = opencode_runner(None, Some(shelbi_core::ReasoningEffort::High));
+        assert_eq!(EffortModels::Listed(vec![]).unapplied_reason(&no_model), "no-model");
     }
 
     #[test]
