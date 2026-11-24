@@ -227,9 +227,9 @@ impl DocEditor {
         if self.model.is_composing() {
             return;
         }
-        let k = &ev.keystroke;
+        let k = &crate::keys::normalized(&ev.keystroke);
         let m = &k.modifiers;
-        let (cmd, alt, ctrl, shift) = (m.platform, m.alt, m.control, m.shift);
+        let (cmd, alt, ctrl, shift) = editing_mods(&k.key, m);
         let body = self.field == Field::Body;
         let handled = match k.key.as_str() {
             "escape" if !cmd && !alt && !ctrl => {
@@ -330,6 +330,13 @@ impl DocEditor {
                 self.vertical(15, shift, cx);
                 true
             }
+            // Ctrl+Home / Ctrl+End: the document's ends (Linux's keys for
+            // macOS's ⌘↑ / ⌘↓).
+            "home" | "end" if cmd => {
+                let end = k.key == "end";
+                self.moved(cx, |e| e.move_to_edge(end, shift));
+                true
+            }
             "home" => {
                 let to = self.line_edge(false);
                 self.moved(cx, |e| e.move_to(to, shift));
@@ -359,6 +366,13 @@ impl DocEditor {
             "z" if cmd => {
                 self.edit(cx, |e| {
                     e.undo();
+                });
+                true
+            }
+            // Linux's other Redo.
+            "y" if cmd && !crate::keys::MAC => {
+                self.edit(cx, |e| {
+                    e.redo();
                 });
                 true
             }
@@ -479,7 +493,7 @@ impl DocEditor {
             }
         }
         let src = p.layout.hit(self.model.doc(), rel);
-        if e.modifiers.platform {
+        if crate::keys::link_mod(&e.modifiers) {
             if let Some(url) = self.model.link_at(src) {
                 cx.open_url(&url);
                 return;
@@ -656,7 +670,7 @@ impl DocEditor {
             .and_then(|r| r.task())
             .is_some();
         let button =
-            |id: &'static str, label: &'static str, tip: &'static str, on: bool, ty: Type, f: fn(&mut Editor)| {
+            |id: &'static str, label: &'static str, tip: String, on: bool, ty: Type, f: fn(&mut Editor)| {
                 div()
                     .id(id)
                     .debug_selector(move || id.into())
@@ -673,7 +687,7 @@ impl DocEditor {
                     .when(on, |d| d.bg(theme.background_active))
                     .hover(|d| d.bg(theme.background_hover))
                     .role(Role::Button)
-                    .aria_label(tip)
+                    .aria_label(tip.clone())
                     .tooltip(style::tooltip(tip))
                     .child(label)
                     .on_mouse_down(MouseButton::Left, |_, window, cx| {
@@ -697,23 +711,23 @@ impl DocEditor {
             .child(button(
                 "fmt-bold",
                 "B",
-                "Bold (⌘B)",
+                format!("Bold ({})", crate::keys::text_label("super-b")),
                 s.bold,
                 Type::BaseSemibold,
                 |e| e.toggle_mark(MarkKind::Bold),
             ))
-            .child(button("fmt-italic", "I", "Italic (⌘I)", s.italic, Type::Base, |e| {
+            .child(button("fmt-italic", "I", format!("Italic ({})", crate::keys::text_label("super-i")), s.italic, Type::Base, |e| {
                 e.toggle_mark(MarkKind::Italic)
             }))
             .child(button(
                 "fmt-strike",
                 "S",
-                "Strikethrough (⇧⌘X)",
+                format!("Strikethrough ({})", crate::keys::text_label("shift-super-x")),
                 s.strike,
                 Type::Base,
                 |e| e.toggle_mark(MarkKind::Strike),
             ))
-            .child(button("fmt-code", "</>", "Code (⌘E)", s.code, Type::XSmall, |e| {
+            .child(button("fmt-code", "</>", format!("Code ({})", crate::keys::text_label("super-e")), s.code, Type::XSmall, |e| {
                 e.toggle_mark(MarkKind::Code)
             }))
             .child(
@@ -730,8 +744,8 @@ impl DocEditor {
                     .text_color(if s.link { theme.text_loud } else { theme.foreground })
                     .hover(|d| d.bg(theme.background_hover))
                     .role(Role::Button)
-                    .aria_label("Link (⌘K)")
-                    .tooltip(style::tooltip("Link (⌘K)"))
+                    .aria_label(format!("Link ({})", crate::keys::text_label("super-k")))
+                    .tooltip(style::tooltip(format!("Link ({})", crate::keys::text_label("super-k"))))
                     .child("Link")
                     .on_mouse_down(MouseButton::Left, |_, window, cx| {
                         window.prevent_default();
@@ -743,7 +757,7 @@ impl DocEditor {
             .child(button(
                 "fmt-heading",
                 "H",
-                "Heading (⌥⌘2)",
+                format!("Heading ({})", crate::keys::text_label("alt-super-2")),
                 heading,
                 Type::BaseSemibold,
                 |e| e.set_block(BlockKind::Heading(2)),
@@ -751,7 +765,7 @@ impl DocEditor {
             .child(button(
                 "fmt-list",
                 "•",
-                "Bulleted list (⇧⌘8)",
+                format!("Bulleted list ({})", crate::keys::text_label("shift-super-8")),
                 false,
                 Type::Base,
                 |e| e.set_block(BlockKind::Bullet),
@@ -759,7 +773,7 @@ impl DocEditor {
             .child(button(
                 "fmt-task",
                 "☐",
-                "Checklist (⇧⌘9)",
+                format!("Checklist ({})", crate::keys::text_label("shift-super-9")),
                 task,
                 Type::Base,
                 |e| e.set_block(BlockKind::Task),
@@ -813,6 +827,23 @@ impl DocEditor {
             .into_any_element(),
         )
     }
+}
+
+/// The editing modifiers a key carries, as the macOS keys read them:
+/// `(cmd, alt, ctrl, shift)`. On macOS the modifiers themselves. On Linux
+/// (GTK's text keys) Ctrl is the command modifier (Ctrl+B, Ctrl+Z, Ctrl+A),
+/// except on the word keys, where Ctrl moves and deletes by word as macOS's
+/// Option does (Ctrl+←, Ctrl+Backspace); there is no Emacs Ctrl layer.
+fn editing_mods(key: &str, m: &gpui::Modifiers) -> (bool, bool, bool, bool) {
+    editing_mods_in(key, m, crate::keys::MAC)
+}
+
+fn editing_mods_in(key: &str, m: &gpui::Modifiers, mac: bool) -> (bool, bool, bool, bool) {
+    if mac {
+        return (m.platform, m.alt, m.control, m.shift);
+    }
+    let word = matches!(key, "left" | "right" | "backspace" | "delete");
+    (m.control && !word, m.alt || (m.control && word), false, m.shift)
 }
 
 #[cfg(test)]

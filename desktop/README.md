@@ -191,6 +191,73 @@ from the Mac sits behind `src/platform/os/` (`linux.rs`):
   theme and the terminal font from Omarchy's monospace font, both followed
   live (`src/theme/omarchy.rs`; `docs/theme.md` has the mapping).
 
+#### Keys, clipboard and drops on Linux
+
+Every app chord is **Ctrl+Shift+key** in every view, as in Alacritty,
+Ghostty and Kitty: where the Mac has ⌘, Linux has Ctrl+Shift
+(`crate::keys::platform_chord`). A terminal pane keeps every plain Ctrl key
+(Ctrl+C, Ctrl+L, Ctrl+W, Ctrl+P, Ctrl+Space reach the program), and Super
+stays with Hyprland: no app chord holds Super. The table is fixed in code
+(`src/keys.rs`, `src/menus/tree.rs`, `src/elements/terminal/keys.rs`);
+Settings ▸ Keybindings lists it read-only under App, and the `keys.yaml`
+stub the app writes lists it as comments. Making it rebindable in
+`keys.yaml` is a follow-up.
+
+| | macOS | Linux |
+|---|---|---|
+| Command palette | ⌘K | Ctrl+Shift+K |
+| Settings | ⌘, | Ctrl+Shift+, |
+| New window | ⇧⌘N | Ctrl+Shift+N |
+| Close window | ⌘W | Ctrl+Shift+W |
+| Quit (agents keep running) | ⌘Q | Ctrl+Shift+Q |
+| Sidebar | ⌃⌘S | Ctrl+Shift+S |
+| Focus the sidebar from a terminal | `keys.yaml`'s ⌃H | Ctrl+Shift+H |
+| Orchestrator, Issues, Changelog | ⌘O ⌘I ⌘L | Ctrl+Shift+O, I, L |
+| Project tabs | ⌘1 to ⌘9 | Ctrl+Shift+1 to 9 |
+| Sidebar rows | ⌃1 to ⌃9 | Alt+1 to Alt+9 |
+| Copy, paste, cut, select all | ⌘C ⌘V ⌘X ⌘A | Ctrl+Shift+C, V, X, A |
+| Find in a terminal | ⌘F | Ctrl+Shift+F |
+| Terminal font bigger, smaller, actual size | ⌘+ ⌘- ⌘0 | Ctrl+Shift+= - 0 |
+| Delete the open issue | ⌘⌫ | Ctrl+Shift+Backspace |
+| Submit a dialog | ⌘↵ | Ctrl+↵ (or Ctrl+Shift+↵) |
+
+- **Text fields** follow GTK's keys as well: plain Ctrl+C, V, X, A, Z (and
+  Ctrl+Shift+Z or Ctrl+Y to redo), Ctrl+B / I / E / K for formatting in the
+  issue editor, Ctrl+←/→ and Ctrl+Backspace by word, Ctrl+Home/End to the
+  ends. Ctrl+Shift+C, V, X, A work in them too, so the chord is the same as
+  in a terminal.
+- `keys.yaml`'s plain Ctrl chords (Ctrl+H and Ctrl+L focus, Ctrl+P and
+  Ctrl+Space for the palette) work everywhere but a focused terminal, which
+  keeps them; the Ctrl+Shift chords above stand in for them there.
+- Alt is always Meta in a terminal (`option_as_meta` is macOS's).
+  Ctrl+click opens a link (⌘-click on the Mac).
+- Linux has no global menu bar. Every client action from the Mac's menus
+  (Close Window, Copy, Bigger, Toggle Sidebar, Documentation ...) is in the
+  command palette, beside the registry's commands, which it lists already.
+  Hide, Hide Others, Show All, Minimize and Services are left out: those are
+  Hyprland's.
+- **Clipboard.** Ctrl+Shift+C / V copy and paste the Wayland clipboard. A
+  finished selection is the primary selection too, and a middle click in a
+  terminal pastes it. A clipboard holding an image and no text (a
+  screenshot) pastes into a terminal as a file: the image is written under
+  `$XDG_CACHE_HOME/shelbi-desktop/drops` and its path is pasted, as a
+  dropped file's is (the Mac does the same, under its Caches folder).
+- **Drops.** A file or image dragged from a file manager or a screenshot
+  tool (a `text/uri-list` of `file://` URIs) pastes its paths into the
+  terminal under the pointer. A drag that carries only image data or a web
+  URL (an image out of a browser) is refused inside gpui's Wayland backend
+  before the app sees it (`docs/gpui.md`); save it first, or copy it and
+  paste.
+- **Omarchy's Super+C / Super+V** send plain Ctrl+C / Ctrl+V to a window
+  that isn't tagged a terminal, and Ctrl+C in a terminal pane interrupts
+  its agent. Tag Shelbi a terminal so they send Ctrl+Shift+C / V instead,
+  in `~/.config/hypr/bindings.lua` (or any file Hyprland loads; the
+  window's class is `dev.shelbi.Desktop`):
+
+  ```lua
+  o.window("dev\\.shelbi\\.Desktop", { tag = "+terminal" })
+  ```
+
 `.github/workflows/desktop-linux-ci.yml` builds, lints and tests `desktop/`
 on Linux for every pull request that touches it or the shared crates.
 

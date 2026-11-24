@@ -575,8 +575,9 @@ fn the_window_keeps_what_the_diff_has_no_use_for(cx: &mut TestAppContext) {
     assert!(wants(&h, "j"));
     assert!(wants(&h, "g"), "starts a two-key binding");
     assert!(!wants(&h, "ctrl-space"), "the window's palette");
-    assert!(!wants(&h, "super-k"), "the window's palette");
-    assert!(!wants(&h, "super-1"), "a tab's chord");
+    let platform = |spec: &str| crate::keys::app_chord(spec).canonical();
+    assert!(!wants(&h, &platform("super-k")), "the window's palette");
+    assert!(!wants(&h, &platform("super-1")), "a tab's chord");
     assert!(!wants(&h, "ctrl-1"), "the sidebar's row chord");
     assert!(!wants(&h, "ctrl-h"), "the focus move");
     assert!(!wants(&h, "esc"), "nothing held to let go of");

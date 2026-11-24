@@ -309,7 +309,7 @@ fn cmd_return_sends_from_the_message(cx: &mut TestAppContext) {
     let mut f = Feedback::open(cx, "cmd-return");
     f.open_dialog();
     f.fill("", "ada@example.com", "Quick one");
-    f.h.key("cmd-enter");
+    f.h.key(&crate::keys::test_keys::app_spec("cmd-enter"));
     assert_eq!(f.endpoint.bodies(), [expected(None, "bug", "Quick one", true)]);
 }
 

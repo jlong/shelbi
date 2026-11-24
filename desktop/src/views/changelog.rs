@@ -141,7 +141,8 @@ pub fn nav_for(ks: &Keystroke) -> Option<Nav> {
     let bare = !m.control && !m.alt && !m.platform && !m.function;
     let plain = bare && !m.shift;
     let only_alt = m.alt && !m.control && !m.platform && !m.shift;
-    let only_cmd = m.platform && !m.control && !m.alt && !m.shift;
+    // The app modifier: ⌘, Ctrl+Shift on Linux.
+    let only_cmd = crate::keys::is_app(m);
     Some(match ks.key.as_str() {
         "down" if only_alt => Nav::NextEntry,
         "up" if only_alt => Nav::PreviousEntry,
@@ -1201,7 +1202,7 @@ mod tests {
     }
 
     fn nav(spec: &str) -> Option<Nav> {
-        nav_for(&Keystroke::parse(spec).unwrap())
+        nav_for(&Keystroke::parse(&crate::keys::test_keys::app_spec(spec)).unwrap())
     }
 
     #[test]
@@ -1584,7 +1585,7 @@ mod tests {
         assert_eq!(model(&view, &vcx, |m| m.total()), 3, "the new entry appears live");
 
         // ⌘F, then a query: the entries narrow, the subtitle counts them.
-        vcx.simulate_keystrokes("cmd-f");
+        vcx.simulate_keystrokes(&crate::keys::test_keys::app_spec("cmd-f"));
         view.update_in(&mut vcx, |v, window, cx| {
             assert!(v.search_focused(window, cx), "⌘F puts the keyboard in the search");
             v.search_for("board", window, cx);

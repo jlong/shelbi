@@ -1458,6 +1458,18 @@ const MODIFIERS: [char; 5] = ['⌘', '⌃', '⌥', '⇧', '⇪'];
 pub fn split_chord(chord: &str) -> Vec<String> {
     let mut keys = Vec::new();
     let mut rest = chord;
+    // Linux spells its modifiers as words (`Ctrl+Shift+O`): each is a key
+    // of its own, as a glyph is.
+    'words: loop {
+        for word in ["Ctrl+", "Alt+", "Shift+", "Super+"] {
+            if let Some(after) = rest.strip_prefix(word).filter(|after| !after.is_empty()) {
+                keys.push(word.trim_end_matches('+').to_string());
+                rest = after;
+                continue 'words;
+            }
+        }
+        break;
+    }
     while let Some(c) = rest.chars().next() {
         if MODIFIERS.contains(&c) {
             keys.push(c.to_string());
@@ -1874,5 +1886,10 @@ mod tests {
         assert_eq!(split_chord("⌃P"), ["⌃", "P"]);
         assert_eq!(split_chord("⌘⇧k"), ["⌘", "⇧", "K"]);
         assert_eq!(split_chord("Esc"), ["ESC"]);
+        // Linux's words.
+        assert_eq!(split_chord("Ctrl+Shift+O"), ["Ctrl", "Shift", "O"]);
+        assert_eq!(split_chord("Alt+3"), ["Alt", "3"]);
+        assert_eq!(split_chord("Ctrl+Shift+="), ["Ctrl", "Shift", "="]);
+        assert_eq!(split_chord("Ctrl++"), ["Ctrl", "+"]);
     }
 }

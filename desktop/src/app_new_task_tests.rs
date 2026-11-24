@@ -180,7 +180,7 @@ fn create_task_makes_one_create_and_the_window_flashes_it(cx: &mut TestAppContex
 
     t.type_title("  Write docs ");
     t.type_description("Line one\n\nLine two");
-    t.h.key("cmd-enter");
+    t.h.key(&crate::keys::test_keys::app_spec("cmd-enter"));
     t.h.cx.run_until_parked();
     let seen = t.seen();
     assert_eq!(seen.len(), 1, "one create");
@@ -221,7 +221,7 @@ fn a_task_is_created_in_the_project_on_screen_after_a_switch(cx: &mut TestAppCon
 
     t.open_dialog();
     t.type_title("For beta");
-    t.h.key("cmd-enter");
+    t.h.key(&crate::keys::test_keys::app_spec("cmd-enter"));
     t.h.cx.run_until_parked();
     assert_eq!(*t.projects.lock().unwrap(), [ProjectKey::local("beta")]);
     assert_eq!(t.seen().len(), 1);

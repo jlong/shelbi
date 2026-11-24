@@ -17,15 +17,24 @@
 //! typing) and macOS doesn't already own it ([`reserved_by`]); those that
 //! macOS owns are reported in the settings view ([`reserved_conflicts`]).
 //!
+//! On Linux the same tree is built with the platform's chords
+//! ([`crate::keys::platform_chord`]: Ctrl+Shift where macOS has ⌘), without
+//! the macOS-only window-manager items (Services, Hide, Hide Others, Show
+//! All, Minimize: Hyprland owns those), and the reserved chords are the
+//! app's own and the compositor's. There is no global menu bar there, so the
+//! window lists the tree's client actions in the command palette
+//! ([`client_entries`]) beside the registry's commands, which it lists
+//! already: every menu item runs from the palette.
+//!
 //! gpui never appears here; `super::install` converts the tree.
 
 use std::collections::HashSet;
 
 use shelbi_app::command::{Command, CommandModel};
 use shelbi_app::{CommandKind, CommandRegistry};
-use shelbi_state::keymap::{
-    format_chord, Action, DisplayStyle, GlobalAction, Key, KeyChord, Keymaps, Mods,
-};
+use shelbi_state::keymap::{format_chord, Action, GlobalAction, Key, KeyChord, Keymaps, Mods};
+
+use crate::keys::{app_chord, display_style, MAC};
 
 /// The menu bar: top-level menus, left to right.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,9 +118,80 @@ pub struct Shortcut {
     pub display: String,
 }
 
+impl AppCommand {
+    /// Every client action, in menu order.
+    pub const ALL: [AppCommand; 21] = [
+        AppCommand::Settings,
+        AppCommand::Hide,
+        AppCommand::HideOthers,
+        AppCommand::ShowAll,
+        AppCommand::QuitClient,
+        AppCommand::CloseWindow,
+        AppCommand::Minimize,
+        AppCommand::Zoom,
+        AppCommand::ToggleSidebar,
+        AppCommand::CommandPalette,
+        AppCommand::FocusSidebar,
+        AppCommand::FocusMain,
+        AppCommand::Cut,
+        AppCommand::Copy,
+        AppCommand::Paste,
+        AppCommand::SelectAll,
+        AppCommand::FontBigger,
+        AppCommand::FontSmaller,
+        AppCommand::FontActualSize,
+        AppCommand::Documentation,
+        AppCommand::ReportIssue,
+    ];
+
+    /// The action's id as a palette entry (`menu:close-window`), for the
+    /// Linux palette's client entries ([`client_entries`]).
+    pub fn id(self) -> &'static str {
+        match self {
+            AppCommand::Settings => "menu:settings",
+            AppCommand::Hide => "menu:hide",
+            AppCommand::HideOthers => "menu:hide-others",
+            AppCommand::ShowAll => "menu:show-all",
+            AppCommand::QuitClient => "menu:quit-client",
+            AppCommand::CloseWindow => "menu:close-window",
+            AppCommand::Minimize => "menu:minimize",
+            AppCommand::Zoom => "menu:zoom",
+            AppCommand::ToggleSidebar => "menu:toggle-sidebar",
+            AppCommand::CommandPalette => "menu:command-palette",
+            AppCommand::FocusSidebar => "menu:focus-sidebar",
+            AppCommand::FocusMain => "menu:focus-main",
+            AppCommand::Cut => "menu:cut",
+            AppCommand::Copy => "menu:copy",
+            AppCommand::Paste => "menu:paste",
+            AppCommand::SelectAll => "menu:select-all",
+            AppCommand::FontBigger => "menu:font-bigger",
+            AppCommand::FontSmaller => "menu:font-smaller",
+            AppCommand::FontActualSize => "menu:font-actual-size",
+            AppCommand::Documentation => "menu:documentation",
+            AppCommand::ReportIssue => "menu:report-issue",
+        }
+    }
+
+    /// The action an [`id`](Self::id) names.
+    pub fn from_id(id: &str) -> Option<AppCommand> {
+        AppCommand::ALL.into_iter().find(|c| c.id() == id)
+    }
+
+    /// Whether this platform offers the action. Hide, Hide Others, Show All
+    /// and Minimize are macOS's window manager's: on Linux Hyprland owns them
+    /// (its Super binds), so they have no item, chord or palette entry there.
+    pub fn offered(self) -> bool {
+        MAC || !matches!(
+            self,
+            AppCommand::Hide | AppCommand::HideOthers | AppCommand::ShowAll | AppCommand::Minimize
+        )
+    }
+}
+
 /// The macOS-standard shortcuts, as `keys.yaml` chord strings. These are the
 /// app's own bindings (`super::bind_fixed_keys` binds the same table), never
-/// read from `keys.yaml`.
+/// read from `keys.yaml`. Written in their macOS form: [`fixed_chord`] spells
+/// each for the platform (Ctrl+Shift on Linux).
 pub const FIXED_SHORTCUTS: &[(AppCommand, &str)] = &[
     (AppCommand::Settings, "super-,"),
     (AppCommand::Hide, "super-h"),
@@ -124,6 +204,49 @@ pub const FIXED_SHORTCUTS: &[(AppCommand, &str)] = &[
     (AppCommand::Copy, "super-c"),
     (AppCommand::Paste, "super-v"),
     (AppCommand::SelectAll, "super-a"),
+];
+
+/// A [`FIXED_SHORTCUTS`] entry's chord on this platform, `None` for one the
+/// platform doesn't offer ([`AppCommand::offered`]).
+pub fn fixed_chord(command: AppCommand) -> Option<KeyChord> {
+    if !command.offered() {
+        return None;
+    }
+    let (_, spec) = FIXED_SHORTCUTS.iter().find(|(c, _)| *c == command)?;
+    Some(app_chord(spec))
+}
+
+/// What a fixed shortcut does, for the reserved-chord report on Linux.
+fn fixed_name(command: AppCommand) -> &'static str {
+    match command {
+        AppCommand::Settings => "Settings",
+        AppCommand::Hide => "Hide Shelbi",
+        AppCommand::HideOthers => "Hide Others",
+        AppCommand::QuitClient => "Quit",
+        AppCommand::CloseWindow => "Close Window",
+        AppCommand::Minimize => "Minimize",
+        AppCommand::ToggleSidebar => "Show Sidebar",
+        AppCommand::Cut => "Cut",
+        AppCommand::Copy => "Copy",
+        AppCommand::Paste => "Paste",
+        AppCommand::SelectAll => "Select All",
+        _ => "Shelbi",
+    }
+}
+
+/// Who owns the reserved chords, as the conflict report names it.
+const RESERVED_OWNER: &str = if MAC { "macOS" } else { "the desktop" };
+
+/// Chords the Linux desktop (Hyprland and Omarchy's defaults) takes before
+/// any app sees them, with what they do. Every Super chord is the
+/// compositor's too ([`reserved_by`]).
+const LINUX_RESERVED: &[(&str, &str)] = &[
+    ("alt-tab", "switching windows"),
+    ("alt-shift-tab", "switching windows"),
+    ("ctrl-alt-tab", "switching monitors"),
+    ("ctrl-alt-shift-tab", "switching monitors"),
+    ("ctrl-alt-delete", "the system menu"),
+    ("alt-space", "dictation"),
 ];
 
 /// Chords macOS (or the standard app menus) already own, with what they do.
@@ -159,13 +282,31 @@ const RESERVED: &[(&str, &str)] = &[
     ("ctrl-right", "switching Spaces"),
 ];
 
-/// What macOS uses `chord` for, when it is reserved.
+/// What the platform uses `chord` for, when it is reserved: macOS's
+/// standard chords there; on Linux the app's own fixed chords (Ctrl+Shift+Q,
+/// Ctrl+Shift+C ...), every Super chord (Hyprland's) and the desktop's few
+/// others ([`LINUX_RESERVED`]).
 pub fn reserved_by(chord: &KeyChord) -> Option<&'static str> {
     let canonical = chord.canonical();
-    RESERVED.iter().find_map(|(spec, what)| {
-        let reserved = KeyChord::parse(spec).ok()?;
-        (reserved.canonical() == canonical).then_some(*what)
-    })
+    let table = |table: &'static [(&'static str, &'static str)]| {
+        table.iter().find_map(|(spec, what)| {
+            let reserved = KeyChord::parse(spec).ok()?;
+            (reserved.canonical() == canonical).then_some(*what)
+        })
+    };
+    if MAC {
+        return table(RESERVED);
+    }
+    if chord.mods.contains(Mods::SUPER) {
+        return Some("Hyprland's Super shortcuts");
+    }
+    FIXED_SHORTCUTS
+        .iter()
+        .find_map(|(command, _)| {
+            let fixed = fixed_chord(*command)?;
+            (fixed.canonical() == canonical).then(|| fixed_name(*command))
+        })
+        .or_else(|| table(LINUX_RESERVED))
 }
 
 /// A `keys.yaml` binding macOS already owns.
@@ -185,8 +326,8 @@ impl ShortcutConflict {
     /// One line for the settings view.
     pub fn message(&self) -> String {
         format!(
-            "{}.{} is bound to {}, which macOS uses for {}: it won't reach Shelbi.",
-            self.mode, self.action, self.chord, self.reserved_by
+            "{}.{} is bound to {}, which {} uses for {}: it won't reach Shelbi.",
+            self.mode, self.action, self.chord, RESERVED_OWNER, self.reserved_by
         )
     }
 }
@@ -201,7 +342,7 @@ pub fn reserved_conflicts(keymaps: &Keymaps) -> Vec<ShortcutConflict> {
                 out.push(ShortcutConflict {
                     mode: action.mode(),
                     action: action.key_name(),
-                    chord: format_chord(&chord, DisplayStyle::Mac),
+                    chord: format_chord(&chord, display_style()),
                     reserved_by: what,
                 });
             }
@@ -235,41 +376,59 @@ fn global_shortcut(keymaps: &Keymaps, action: GlobalAction) -> Option<Shortcut> 
         .find_map(menu_shortcut)
 }
 
-/// The terminal font zoom items' shortcuts (⌘+ ⌘− ⌘0). The window takes
-/// the chords itself (`crate::keys::font_zoom`); here they label the items.
+/// The terminal font zoom items' shortcuts (⌘+ ⌘− ⌘0, Ctrl+Shift+=
+/// Ctrl+Shift+- Ctrl+Shift+0 on Linux). The window takes the chords itself
+/// (`crate::keys::font_zoom`); here they label the items.
 pub fn font_zoom_shortcut(command: AppCommand) -> Option<Shortcut> {
-    let spec = match command {
-        AppCommand::FontBigger => crate::keys::FONT_BIGGER,
-        AppCommand::FontSmaller => crate::keys::FONT_SMALLER,
-        AppCommand::FontActualSize => crate::keys::FONT_ACTUAL_SIZE,
+    use crate::elements::terminal::FontZoom;
+    let step = match command {
+        AppCommand::FontBigger => FontZoom::Bigger,
+        AppCommand::FontSmaller => FontZoom::Smaller,
+        AppCommand::FontActualSize => FontZoom::ActualSize,
         _ => return None,
     };
-    shortcut(&KeyChord::parse(spec).ok()?)
+    shortcut(&crate::keys::font_zoom_chord(step))
 }
 
-/// A [`FIXED_SHORTCUTS`] entry's shortcut.
+/// A [`FIXED_SHORTCUTS`] entry's shortcut on this platform.
 pub fn fixed_shortcut(command: AppCommand) -> Option<Shortcut> {
-    let (_, spec) = FIXED_SHORTCUTS.iter().find(|(c, _)| *c == command)?;
-    shortcut(&KeyChord::parse(spec).ok()?)
+    shortcut(&fixed_chord(command)?)
 }
 
 /// Render `chord` both ways, or `None` for a key with no gpui name.
 fn shortcut(chord: &KeyChord) -> Option<Shortcut> {
     Some(Shortcut {
         keystroke: keystroke(chord)?,
-        display: format_chord(chord, DisplayStyle::Mac),
+        display: format_chord(chord, display_style()),
     })
 }
 
 /// `chord` in gpui's keystroke syntax: `ctrl-alt-shift-cmd-<key>`, with
-/// gpui's key names (`space`, `escape`, `pageup`, `f5`).
+/// gpui's key names (`space`, `escape`, `pageup`, `f5`). On Linux a symbol
+/// held with Shift and Ctrl or Alt is spelled as gpui's Linux keyboard
+/// reports it, the shifted symbol without Shift (`ctrl-<` for
+/// Ctrl+Shift+,), so a binding matches the key.
 pub fn keystroke(chord: &KeyChord) -> Option<String> {
+    keystroke_in(chord, MAC)
+}
+
+/// [`keystroke`] under macOS's conventions (`mac`) or Linux's.
+pub(crate) fn keystroke_in(chord: &KeyChord, mac: bool) -> Option<String> {
     let mut mods = chord.mods;
     let key = match chord.code {
         Key::Char(' ') => "space".to_string(),
         Key::Char(c) if c.is_ascii_uppercase() => {
             mods |= Mods::SHIFT;
             c.to_ascii_lowercase().to_string()
+        }
+        Key::Char(c)
+            if !mac
+                && mods.contains(Mods::SHIFT)
+                && mods.intersects(Mods::CONTROL | Mods::ALT)
+                && crate::keys::shifted(c).is_some() =>
+        {
+            mods = mods.without(Mods::SHIFT);
+            crate::keys::shifted(c).unwrap_or(c).to_string()
         }
         Key::Char(c) => c.to_string(),
         Key::Up => "up".into(),
@@ -432,7 +591,7 @@ pub fn build(model: &CommandModel, keymaps: &Keymaps, facts: WindowFacts) -> Men
 fn app_menu(slot: &impl Fn(&str, &str, Option<Shortcut>) -> MenuEntry) -> MenuSpec {
     MenuSpec {
         title: "Shelbi".into(),
-        items: vec![
+        items: [
             // The registry's About, as the palette runs it.
             slot("action:about", "About Shelbi", None),
             MenuEntry::Separator,
@@ -442,8 +601,10 @@ fn app_menu(slot: &impl Fn(&str, &str, Option<Shortcut>) -> MenuEntry) -> MenuSp
             // Under Settings… (Figma's application menu, 2544:10362).
             slot("action:connect-remote", "Connect to Remote Session…", None),
             MenuEntry::Separator,
-            MenuEntry::Services,
-            MenuEntry::Separator,
+        ]
+        .into_iter()
+        .chain(MAC.then_some([MenuEntry::Services, MenuEntry::Separator]).into_iter().flatten())
+        .chain([
             // Detach closes this client like ⌘Q (agents keep running); the
             // registry offers it, so it is here too.
             slot("action:detach", "Detach", None),
@@ -453,12 +614,21 @@ fn app_menu(slot: &impl Fn(&str, &str, Option<Shortcut>) -> MenuEntry) -> MenuSp
             slot("action:quit-project", "Quit Project…", None),
             slot("action:quit-shelbi", "Quit Shelbi and Stop All Agents…", None),
             MenuEntry::Separator,
-            app("Hide Shelbi", AppCommand::Hide),
-            app("Hide Others", AppCommand::HideOthers),
-            app("Show All", AppCommand::ShowAll),
-            MenuEntry::Separator,
-            app("Quit Shelbi", AppCommand::QuitClient),
-        ],
+        ])
+        .chain(
+            MAC.then(|| {
+                [
+                    app("Hide Shelbi", AppCommand::Hide),
+                    app("Hide Others", AppCommand::HideOthers),
+                    app("Show All", AppCommand::ShowAll),
+                    MenuEntry::Separator,
+                ]
+            })
+            .into_iter()
+            .flatten(),
+        )
+        .chain([app("Quit Shelbi", AppCommand::QuitClient)])
+        .collect(),
     }
 }
 
@@ -484,11 +654,9 @@ fn file_menu<'a, I: Iterator<Item = &'a Command>>(
             _ => {}
         }
     }
-    // ⌘⇧N: the window takes the chord itself (`crate::keys::NEW_WINDOW`);
-    // here it labels the item.
-    let new_window = KeyChord::parse(crate::keys::NEW_WINDOW)
-        .ok()
-        .and_then(|c| shortcut(&c));
+    // ⌘⇧N (Ctrl+Shift+N on Linux): the window takes the chord itself
+    // (`crate::keys::new_window_chord`); here it labels the item.
+    let new_window = shortcut(&crate::keys::new_window_chord());
     MenuSpec {
         title: "File".into(),
         items: vec![
@@ -558,7 +726,15 @@ fn view_menu(
                 AppCommand::ToggleSidebar,
             ),
             MenuEntry::Separator,
-            keyed("Focus Sidebar", AppCommand::FocusSidebar, GlobalAction::FocusSidebar),
+            // On Linux the window's own Ctrl+Shift+H, which a terminal never
+            // keeps (`keys.yaml`'s Ctrl+H is the terminal's there).
+            match crate::keys::focus_sidebar_chord() {
+                Some(chord) => MenuEntry::Item(MenuItemSpec {
+                    shortcut: shortcut(&chord),
+                    ..app_item("Focus Sidebar", AppCommand::FocusSidebar)
+                }),
+                None => keyed("Focus Sidebar", AppCommand::FocusSidebar, GlobalAction::FocusSidebar),
+            },
             keyed("Focus Main Area", AppCommand::FocusMain, GlobalAction::FocusMain),
             MenuEntry::Separator,
             // The terminal font, in every terminal pane (the window zoom is
@@ -652,11 +828,14 @@ fn window_menu() -> MenuSpec {
     // switch), the key one checked.
     MenuSpec {
         title: "Window".into(),
-        items: vec![
-            app("Minimize", AppCommand::Minimize),
-            app("Zoom", AppCommand::Zoom),
-            MenuEntry::Separator,
-        ],
+        items: [
+            AppCommand::Minimize.offered().then(|| app("Minimize", AppCommand::Minimize)),
+            Some(app("Zoom", AppCommand::Zoom)),
+            Some(MenuEntry::Separator),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
     }
 }
 
@@ -732,6 +911,36 @@ pub fn items(entries: &[MenuEntry]) -> Vec<&MenuItemSpec> {
         }
     }
     out
+}
+
+/// A client action as the Linux palette lists it: its id
+/// ([`AppCommand::id`]), its menu's title, and its shortcut as this platform
+/// writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientEntry {
+    pub command: AppCommand,
+    pub title: String,
+    pub shortcut: Option<String>,
+}
+
+/// The tree's client actions (the items that aren't registry commands,
+/// which the palette lists already), in menu order, for the palette on a
+/// platform without a menu bar. Command Palette is left out: the palette is
+/// open.
+pub fn client_entries(tree: &MenuTree) -> Vec<ClientEntry> {
+    let mut seen = HashSet::new();
+    tree.items()
+        .into_iter()
+        .filter_map(|item| match item.action {
+            MenuAction::App(command) if command != AppCommand::CommandPalette && item.enabled => Some(ClientEntry {
+                command,
+                title: item.title.clone(),
+                shortcut: item.shortcut.as_ref().map(|s| s.display.clone()),
+            }),
+            _ => None,
+        })
+        .filter(|e| seen.insert(e.command))
+        .collect()
 }
 
 impl MenuTree {
@@ -880,6 +1089,8 @@ mod tests {
         assert!(find(&tree, "Detach").enabled);
     }
 
+    // The macOS spellings; Linux's are `linux_*` below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn the_app_menu_keeps_agents_safe_from_a_stray_chord() {
         let tree = build(&fixture(), &defaults(), WindowFacts::default());
@@ -975,6 +1186,8 @@ mod tests {
         }
     }
 
+    // The macOS spellings; Linux's are `linux_*` below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn file_opens_a_new_window_on_cmd_shift_n() {
         let tree = build(&fixture(), &defaults(), WindowFacts::default());
@@ -1002,6 +1215,8 @@ mod tests {
         assert!(find(&tree, "Edit Project Settings").enabled);
     }
 
+    // The macOS spellings; Linux's are `linux_*` below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn keys_yaml_chords_become_key_equivalents() {
         let tree = build(&fixture(), &defaults(), WindowFacts::default());
@@ -1022,6 +1237,8 @@ mod tests {
         assert_eq!((palette.keystroke.as_str(), palette.display.as_str()), ("shift-cmd-p", "⇧⌘P"));
     }
 
+    // The macOS spellings; Linux's are `linux_*` below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn view_has_the_terminal_font_zoom_beside_the_window_zoom() {
         let tree = build(&fixture(), &defaults(), WindowFacts::default());
@@ -1075,6 +1292,8 @@ mod tests {
         assert!(find(&tree, "Show Sidebar").enabled);
     }
 
+    // The macOS spellings; Linux's are `linux_*` below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn menu_shortcuts_need_a_modifier_and_a_free_chord() {
         let chord = |s: &str| KeyChord::parse(s).unwrap();
@@ -1101,6 +1320,8 @@ mod tests {
         assert_eq!(rendered("ctrl-esc"), ("ctrl-escape".into(), "⌃Esc".into()));
     }
 
+    // The macOS spellings; Linux's are `linux_*` below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn fixed_shortcuts_render_as_the_mac_standards() {
         let display = |c| fixed_shortcut(c).map(|s| s.display);
@@ -1117,6 +1338,8 @@ mod tests {
         assert_eq!(reserved_conflicts(&defaults()), []);
     }
 
+    // The macOS spellings; Linux's are `linux_*` below.
+    #[cfg(target_os = "macos")]
     #[test]
     fn a_reserved_rebinding_is_reported_and_kept_off_the_menu() {
         let km = keymaps("defaults:\n  global:\n    open_palette: super-w\n  kanban:\n    refresh: [r, super-space]\n");
@@ -1150,5 +1373,120 @@ mod tests {
         assert_eq!(place(&CommandKind::ApproveReview { id: s() }), Placement::GoReview);
         assert_eq!(place(&CommandKind::StartIssue { id: s() }), Placement::Board);
         assert_eq!(place(&CommandKind::OpenIssue { id: s() }), Placement::Search);
+    }
+
+    #[test]
+    fn the_palette_lists_every_client_action_the_platform_offers() {
+        let tree = build(&fixture(), &defaults(), WindowFacts::default());
+        let entries = client_entries(&tree);
+        let commands: Vec<AppCommand> = entries.iter().map(|e| e.command).collect();
+        for want in [
+            AppCommand::QuitClient,
+            AppCommand::CloseWindow,
+            AppCommand::Zoom,
+            AppCommand::ToggleSidebar,
+            AppCommand::FocusSidebar,
+            AppCommand::FocusMain,
+            AppCommand::Cut,
+            AppCommand::Copy,
+            AppCommand::Paste,
+            AppCommand::SelectAll,
+            AppCommand::FontBigger,
+            AppCommand::FontSmaller,
+            AppCommand::FontActualSize,
+            AppCommand::Documentation,
+            AppCommand::ReportIssue,
+        ] {
+            assert!(commands.contains(&want), "{want:?}");
+        }
+        // The palette is open already; Settings is the registry's.
+        assert!(!commands.contains(&AppCommand::CommandPalette));
+        assert!(!commands.contains(&AppCommand::Settings));
+        // Every client item in the tree is listed, once, and runs by its id.
+        for item in tree.items() {
+            if let MenuAction::App(command) = item.action {
+                if command != AppCommand::CommandPalette {
+                    assert!(commands.contains(&command), "{command:?}");
+                }
+            }
+        }
+        for e in &entries {
+            assert_eq!(AppCommand::from_id(e.command.id()), Some(e.command));
+            assert!(e.command.offered());
+        }
+        assert_eq!(commands.len(), entries.iter().map(|e| e.command).collect::<HashSet<_>>().len());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_menus_leave_the_window_manager_to_hyprland() {
+        let tree = build(&fixture(), &defaults(), WindowFacts::default());
+        let all: Vec<String> = tree.menus.iter().flat_map(|m| titles(&m.items)).collect();
+        for gone in ["Services ▸", "Hide Shelbi", "Hide Others", "Show All", "Minimize"] {
+            assert!(!all.iter().any(|t| t == gone), "{gone}");
+        }
+        assert_eq!(find(&tree, "Quit Shelbi").shortcut.as_ref().unwrap().display, "Ctrl+Shift+Q");
+        let settings = find(&tree, "Settings…").shortcut.clone().unwrap();
+        // Ctrl+Shift+, as gpui's Linux keyboard reports it.
+        assert_eq!((settings.keystroke.as_str(), settings.display.as_str()), ("ctrl-<", "Ctrl+Shift+,"));
+        let new_window = find(&tree, "New Window").shortcut.clone().unwrap();
+        assert_eq!((new_window.keystroke.as_str(), new_window.display.as_str()), ("ctrl-shift-n", "Ctrl+Shift+N"));
+        let focus = find(&tree, "Focus Sidebar").shortcut.clone().unwrap();
+        assert_eq!(focus.display, "Ctrl+Shift+H");
+        for (title, keystroke, display) in [
+            ("Bigger", "ctrl-+", "Ctrl+Shift+="),
+            ("Smaller", "ctrl-_", "Ctrl+Shift+-"),
+            ("Actual Size", "ctrl-)", "Ctrl+Shift+0"),
+        ] {
+            let s = find(&tree, title).shortcut.clone().unwrap();
+            assert_eq!((s.keystroke.as_str(), s.display.as_str()), (keystroke, display), "{title}");
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_fixed_shortcuts_are_ctrl_shift() {
+        let display = |c| fixed_shortcut(c).map(|s| (s.keystroke, s.display));
+        let pair = |k: &str, d: &str| Some((k.to_string(), d.to_string()));
+        assert_eq!(display(AppCommand::CloseWindow), pair("ctrl-shift-w", "Ctrl+Shift+W"));
+        assert_eq!(display(AppCommand::QuitClient), pair("ctrl-shift-q", "Ctrl+Shift+Q"));
+        assert_eq!(display(AppCommand::ToggleSidebar), pair("ctrl-shift-s", "Ctrl+Shift+S"));
+        assert_eq!(display(AppCommand::Copy), pair("ctrl-shift-c", "Ctrl+Shift+C"));
+        assert_eq!(display(AppCommand::Paste), pair("ctrl-shift-v", "Ctrl+Shift+V"));
+        assert_eq!(display(AppCommand::Hide), None);
+        assert_eq!(display(AppCommand::HideOthers), None);
+        assert_eq!(display(AppCommand::Minimize), None);
+        // None holds Super or is a plain Ctrl chord.
+        for (command, _) in FIXED_SHORTCUTS {
+            if let Some(chord) = fixed_chord(*command) {
+                assert!(!chord.mods.contains(Mods::SUPER), "{command:?}");
+                assert_ne!(chord.mods, Mods::CONTROL, "{command:?}");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn linux_reserves_the_apps_chords_and_the_compositors() {
+        let chord = |s: &str| KeyChord::parse(s).unwrap();
+        assert_eq!(reserved_by(&chord("ctrl-shift-w")), Some("Close Window"));
+        assert_eq!(reserved_by(&chord("ctrl-shift-c")), Some("Copy"));
+        assert_eq!(reserved_by(&chord("super-w")), Some("Hyprland's Super shortcuts"));
+        assert_eq!(reserved_by(&chord("super-shift-p")), Some("Hyprland's Super shortcuts"));
+        assert_eq!(reserved_by(&chord("alt-tab")), Some("switching windows"));
+        // A terminal's keys and keys.yaml's defaults are free.
+        assert_eq!(reserved_by(&chord("ctrl-w")), None);
+        assert_eq!(reserved_by(&chord("ctrl-p")), None);
+        assert_eq!(reserved_conflicts(&defaults()), []);
+        let km = keymaps("defaults:\n  global:\n    open_palette: ctrl-shift-w\n");
+        let conflicts = reserved_conflicts(&km);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].message(),
+            "global.open_palette is bound to Ctrl+Shift+W, which the desktop uses for Close Window: it won't reach Shelbi."
+        );
+        // And a reserved chord never labels a menu item.
+        assert_eq!(menu_shortcut(&chord("ctrl-shift-w")), None);
+        assert_eq!(menu_shortcut(&chord("super-k")), None);
     }
 }

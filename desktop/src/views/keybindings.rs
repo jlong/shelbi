@@ -436,6 +436,70 @@ impl KeybindingsPage {
             )
     }
 
+    /// The app's fixed shortcuts, read-only: built in, not in `keys.yaml`
+    /// (its stub lists them). Shown under every context and while the
+    /// search matches one; their keycaps take no click.
+    fn render_app_shortcuts(&self, shortcuts: &[crate::keys::AppShortcut], theme: &Theme) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .w(px(controls::LABELED_MAX_W))
+            .debug_selector(|| "keybindings-group-app".into())
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .type_style(Type::BaseMedium)
+                            .text_color(theme.text_loud)
+                            .child("App"),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .type_style(Type::XSmall)
+                            .text_color(theme.form_hint)
+                            .child("Built in, everywhere in the window; not set in keys.yaml"),
+                    ),
+            )
+            .child(div().flex().flex_col().children(shortcuts.iter().enumerate().map(|(ix, s)| {
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .h(px(ROW_H))
+                    .border_b_1()
+                    .border_color(theme.divider)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .type_style(Type::Base)
+                            .text_color(theme.foreground)
+                            .child(s.label),
+                    )
+                    .child(
+                        style::button_base(
+                            format!("keybinding-app-{ix}"),
+                            ButtonKind::Secondary,
+                            ButtonSize::Small,
+                            false,
+                            theme,
+                        )
+                        .min_w(px(KEYCAP_MIN_W))
+                        .child(style::keycap_label(keycap_keys(&s.chord), theme)),
+                    )
+            })))
+    }
+
     fn render_row(&self, row: &Row, theme: &Theme, cx: &mut Context<Self>) -> impl IntoElement {
         let action = row.action;
         let id = format!("keybinding-{}-{}", action.mode(), action.key_name());
@@ -597,6 +661,12 @@ impl Render for KeybindingsPage {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.global::<Theme>();
         let groups = self.state.groups();
+        // The app's fixed chords, under "All contexts" only.
+        let app = if self.state.context.is_none() {
+            matching_app_shortcuts(&self.state.query)
+        } else {
+            Vec::new()
+        };
         let list = div()
             .id("keybindings-list")
             .debug_selector(|| "keybindings-list".into())
@@ -610,7 +680,8 @@ impl Render for KeybindingsPage {
                     .flex_col()
                     .gap(px(24.0))
                     .children(groups.iter().map(|g| self.render_group(g, &theme, cx)))
-                    .when(groups.is_empty(), |d| {
+                    .when(!app.is_empty(), |d| d.child(self.render_app_shortcuts(&app, &theme)))
+                    .when(groups.is_empty() && app.is_empty(), |d| {
                         d.child(
                             div()
                                 .type_style(Type::Base)
@@ -688,9 +759,33 @@ fn keycap_text(chord: &KeyChord) -> String {
     keycap_keys(chord).concat()
 }
 
+/// Open `keys.yaml` in a text editor. A missing file is created first as the
+/// shared stub plus this platform's list of the app's fixed shortcuts
+/// ([`crate::keys::keys_stub_shortcuts`]): comments only, binding nothing.
 fn open_keys_yaml() -> Result<(), String> {
-    let path = shared::ensure_keys_file()?;
+    let path = shared::keys_yaml_path().ok_or("No Shelbi home directory.")?;
+    if !path.exists() {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        let stub = format!("{}{}", shared::KEYS_STUB, crate::keys::keys_stub_shortcuts());
+        std::fs::write(&path, stub).map_err(|e| format!("Couldn't create keys.yaml: {e}"))?;
+    }
     crate::platform::os::open_text(&path).map_err(|e| format!("Couldn't open keys.yaml in a text editor: {e}"))
+}
+
+/// The app's fixed shortcuts ([`crate::keys::app_shortcuts`]) the search
+/// `query` matches (by label or keycap), all of them for an empty one.
+fn matching_app_shortcuts(query: &str) -> Vec<crate::keys::AppShortcut> {
+    let query = query.trim().to_lowercase();
+    crate::keys::app_shortcuts()
+        .into_iter()
+        .filter(|s| {
+            query.is_empty()
+                || s.label.to_lowercase().contains(&query)
+                || keycap_text(&s.chord).to_lowercase().contains(&query)
+        })
+        .collect()
 }
 
 #[cfg(feature = "visual-check")]

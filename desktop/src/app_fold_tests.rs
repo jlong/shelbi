@@ -216,12 +216,12 @@ fn the_keys_skip_a_closing_sections_rows(cx: &mut TestAppContext) {
     assert!(f.h.take_calls().is_empty(), "a closing row isn't clickable");
 
     // The chords keep their rows mid-fold.
-    f.h.key("ctrl-1");
+    f.h.key(&crate::keys::test_keys::row_spec("ctrl-1"));
     assert!(
         f.h.take_calls().contains(&HostCall::ShowView(View::Session("alpha-1".into()))),
         "⌃1 is still alpha-1"
     );
-    f.h.key("ctrl-2");
+    f.h.key(&crate::keys::test_keys::row_spec("ctrl-2"));
     assert!(
         f.h.take_calls().contains(&HostCall::LoadReview("T-9".into())),
         "⌃2 is still the review"
@@ -231,7 +231,7 @@ fn the_keys_skip_a_closing_sections_rows(cx: &mut TestAppContext) {
 #[gpui::test]
 fn the_selection_rides_with_its_row_through_a_fold(cx: &mut TestAppContext) {
     let mut f = Fold::open(cx);
-    f.h.key("ctrl-2");
+    f.h.key(&crate::keys::test_keys::row_spec("ctrl-2"));
     f.h.take_calls();
     f.advance(Duration::from_secs(1));
     let before = f.top("sidebar-selection");
@@ -313,9 +313,9 @@ fn a_machine_group_folds_too(cx: &mut TestAppContext) {
     assert!(mid > 0.0 && mid < full, "part-way: {mid} of {full}");
     // A collapsed group's rows take no chord (they aren't in the shared
     // rows), from the fold's first frame: box-1's ⌃2 passes to the review.
-    f.h.key("ctrl-2");
+    f.h.key(&crate::keys::test_keys::row_spec("ctrl-2"));
     assert!(f.h.take_calls().contains(&HostCall::LoadReview("T-9".into())));
-    f.h.key("ctrl-3");
+    f.h.key(&crate::keys::test_keys::row_spec("ctrl-3"));
     assert!(f.h.take_calls().is_empty());
     f.advance(FOLD);
     assert!(!f.animating());
