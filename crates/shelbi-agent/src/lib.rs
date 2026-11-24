@@ -20,42 +20,210 @@ pub use shelbi_core::shell_escape;
 /// Construct the shell command to launch the agent CLI. Returns a single
 /// string suitable for a session process's child command.
 ///
-/// OpenCode gets three additions. `--standalone` gives the pane a private
-/// server instead of OpenCode's shared background service, so the server (and
-/// Shelbi's plugin inside it) inherits this pane's environment (`TASK_ID`,
-/// the hub address). Because that server runs without a controlling
-/// terminal, the pane's tty path is exported as [`OPENCODE_PANE_TTY_ENV`] for
-/// the plugin to write its `shelbi:<state>` title markers to. And since the
-/// TUI has no model flag, a `--model <id>` pair in the flags (the adapter's
-/// [`RunnerAdapter::with_model`], or one a user wrote) leaves the argv and
-/// becomes inline config in `OPENCODE_CONFIG_CONTENT`, which OpenCode merges
-/// over the user's own config.
+/// OpenCode's line is assembled by [`opencode_launch_command`].
 pub fn launch_command(spec: &AgentRunnerSpec) -> String {
-    if !RunnerAdapter::for_spec(spec).is_opencode() {
-        let mut parts = vec![shell_escape(&spec.command)];
-        for f in &spec.flags {
-            parts.push(shell_escape(f));
-        }
-        return parts.join(" ");
+    if RunnerAdapter::for_spec(spec).is_opencode() {
+        return opencode_launch_command(spec);
     }
+    let mut parts = vec![shell_escape(&spec.command)];
+    for f in &spec.flags {
+        parts.push(shell_escape(f));
+    }
+    parts.join(" ")
+}
+
+/// OpenCode's launch line:
+///
+/// ```text
+/// env SHELBI_PANE_TTY="$(tty)" [OPENCODE_CONFIG_CONTENT='{…}'] \
+///     OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' \
+///     OPENCODE_DISABLE_AUTOUPDATE=1 \
+///   opencode --standalone [--auto] <flags>
+/// ```
+///
+/// - `--standalone` gives the pane a private server instead of OpenCode's
+///   shared background service, so the server (and Shelbi's plugin inside it)
+///   inherits this pane's environment (`TASK_ID`, the hub address). That
+///   server has no controlling terminal, so the pane's tty path is exported
+///   as [`OPENCODE_PANE_TTY_ENV`] for the plugin's `shelbi:<state>` markers.
+/// - `OPENCODE_CONFIG_CONTENT` is inline config OpenCode merges over the
+///   user's own. It carries what the TUI has no flag for: the model (a
+///   logical `--model <id>` in the flags, from [`RunnerAdapter::with_model`]
+///   or written by a user) and the permission ceiling (the logical
+///   `--permission-mode <mode>` [`RunnerAdapter::with_permission_mode`]
+///   adds, plus [`with_edits_denied`]'s marker), as rules on the `build` and
+///   `plan` agents (see [`opencode_permission_rules`]). It is left out when
+///   there is neither, so the user's own OpenCode settings stand.
+/// - `OPENCODE_CLI_CONFIG_CONTENT` turns off OpenCode's terminal title,
+///   which otherwise overwrites the plugin's `shelbi:<state>` markers with
+///   `OC | <session title>`, and its highlights.
+/// - `OPENCODE_DISABLE_AUTOUPDATE` keeps a worker pane from updating the
+///   binary under the hub mid-task.
+/// - `--auto` (answer every remaining ask) is passed only for a
+///   `bypassPermissions` ceiling; any other ceiling drops a hand-written one,
+///   since it would approve the asks the ceiling exists to raise.
+pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
     let model = flag_value(&spec.flags, &["--model", "-m"]);
-    let flags = strip_flag_with_value(&spec.flags, &["--model", "-m"]);
+    let mode = flag_value(&spec.flags, &[OPENCODE_PERMISSION_FLAG]);
+    let deny_edits = spec.flags.iter().any(|f| f == OPENCODE_DENY_EDITS_FLAG);
+    let bypass = mode.as_deref().is_some_and(|m| shelbi_core::permission_mode_rank(m) >= 3);
+    let mut flags: Vec<String> = strip_flag_with_value(&spec.flags, &["--model", "-m", OPENCODE_PERMISSION_FLAG])
+        .into_iter()
+        .filter(|f| f != OPENCODE_DENY_EDITS_FLAG && f != OPENCODE_STANDALONE_FLAG)
+        .collect();
+    if mode.is_some() {
+        flags.retain(|f| f != OPENCODE_AUTO_FLAG);
+        if bypass {
+            flags.insert(0, OPENCODE_AUTO_FLAG.into());
+        }
+    }
+
     // `env`, not a bare `VAR=value` prefix: callers run the line as
     // `exec {launch}`, and after `exec` an assignment word is taken for the
     // command name.
     let mut parts = vec!["env".to_string(), format!("{OPENCODE_PANE_TTY_ENV}=\"$(tty)\"")];
-    if let Some(model) = model {
-        let config = format!("{{\"model\":{}}}", json_string(&model));
+    if let Some(config) = opencode_config_content(model.as_deref(), mode.as_deref(), deny_edits) {
         parts.push(format!("OPENCODE_CONFIG_CONTENT={}", shell_escape(&config)));
     }
+    parts.push(format!("OPENCODE_CLI_CONFIG_CONTENT={}", shell_escape(OPENCODE_CLI_CONFIG_CONTENT)));
+    parts.push("OPENCODE_DISABLE_AUTOUPDATE=1".into());
     parts.push(shell_escape(&spec.command));
+    parts.push(OPENCODE_STANDALONE_FLAG.into());
     for f in &flags {
         parts.push(shell_escape(f));
     }
-    if !flags.iter().any(|f| f == OPENCODE_STANDALONE_FLAG) {
-        parts.push(OPENCODE_STANDALONE_FLAG.into());
-    }
     parts.join(" ")
+}
+
+/// The JSON for `OPENCODE_CONFIG_CONTENT`: the model at the root and the
+/// permission rules appended to the `build` and `plan` agents. Agent rules
+/// load after the user's and the project's, and the last matching rule wins,
+/// so these hold the ceiling even over a looser user config. `None` when
+/// there's nothing to set.
+fn opencode_config_content(model: Option<&str>, mode: Option<&str>, deny_edits: bool) -> Option<String> {
+    let rules = opencode_permission_rules(mode, deny_edits);
+    let mut keys = Vec::new();
+    if let Some(model) = model {
+        keys.push(format!("\"model\":{}", json_string(model)));
+    }
+    if !rules.is_empty() {
+        let list = rules.iter().copied().map(OpenCodeRule::to_json).collect::<Vec<_>>().join(",");
+        keys.push(format!(
+            "\"agents\":{{\"build\":{{\"permissions\":[{list}]}},\"plan\":{{\"permissions\":[{list}]}}}}"
+        ));
+    }
+    (!keys.is_empty()).then(|| format!("{{{}}}", keys.join(",")))
+}
+
+/// One OpenCode permission rule: `effect` for `action` on `resource`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenCodeRule {
+    pub action: &'static str,
+    pub resource: &'static str,
+    pub effect: &'static str,
+}
+
+impl OpenCodeRule {
+    const fn new(action: &'static str, effect: &'static str) -> Self {
+        OpenCodeRule { action, resource: "*", effect }
+    }
+
+    fn to_json(self) -> String {
+        format!(
+            "{{\"action\":{},\"resource\":{},\"effect\":{}}}",
+            json_string(self.action),
+            json_string(self.resource),
+            json_string(self.effect)
+        )
+    }
+}
+
+/// The OpenCode permission rules for a Shelbi permission ceiling, in order
+/// (the last match wins). OpenCode's own default `build` agent allows
+/// everything, so every ceiling has to be spelled out:
+///
+/// | ceiling | rules |
+/// | --- | --- |
+/// | none | none: the user's OpenCode settings stand |
+/// | `plan` | deny everything, then allow `read`, `glob`, `grep`, `webfetch`, `websearch`, `skill`, `question` |
+/// | `default` | ask for `edit`, `shell`, `webfetch`, `external_directory` |
+/// | `read-only` | `default`'s, then deny `edit` |
+/// | `auto` / `acceptEdits` | allow `edit`, ask for `shell` and `external_directory` |
+/// | `bypassPermissions` | allow everything (and the launch adds `--auto`) |
+///
+/// `deny_edits` (an agent whose settings deny Claude's edit tools, such as
+/// the review agent) appends an `edit` deny at any ceiling, and with none.
+/// An unrecognized mode ranks as `default`, so a typo never loosens.
+pub fn opencode_permission_rules(mode: Option<&str>, deny_edits: bool) -> Vec<OpenCodeRule> {
+    const ASK_DEFAULT: [OpenCodeRule; 4] = [
+        OpenCodeRule::new("edit", "ask"),
+        OpenCodeRule::new("shell", "ask"),
+        OpenCodeRule::new("webfetch", "ask"),
+        OpenCodeRule::new("external_directory", "ask"),
+    ];
+    let mut rules = match mode.map(str::trim) {
+        None => Vec::new(),
+        Some("read-only" | "readonly") => {
+            let mut r = ASK_DEFAULT.to_vec();
+            r.push(OpenCodeRule::new("edit", "deny"));
+            r
+        }
+        Some(m) => match shelbi_core::permission_mode_rank(m) {
+            0 => {
+                let mut r = vec![OpenCodeRule::new("*", "deny")];
+                r.extend(
+                    ["read", "glob", "grep", "webfetch", "websearch", "skill", "question"]
+                        .into_iter()
+                        .map(|a| OpenCodeRule::new(a, "allow")),
+                );
+                r
+            }
+            1 => ASK_DEFAULT.to_vec(),
+            2 => vec![
+                OpenCodeRule::new("edit", "allow"),
+                OpenCodeRule::new("shell", "ask"),
+                OpenCodeRule::new("external_directory", "ask"),
+            ],
+            _ => vec![OpenCodeRule::new("*", "allow")],
+        },
+    };
+    if deny_edits {
+        rules.push(OpenCodeRule::new("edit", "deny"));
+    }
+    rules
+}
+
+/// The logical flag carrying the permission ceiling to
+/// [`opencode_launch_command`], which turns it into permission rules. Spelled
+/// like Claude's real flag; it never reaches the OpenCode argv.
+const OPENCODE_PERMISSION_FLAG: &str = "--permission-mode";
+
+/// The logical flag [`with_edits_denied`] adds for [`opencode_launch_command`]
+/// to append an `edit` deny. It never reaches the OpenCode argv.
+const OPENCODE_DENY_EDITS_FLAG: &str = "--shelbi-deny-edits";
+
+/// OpenCode's switch that approves every ask the config doesn't deny.
+const OPENCODE_AUTO_FLAG: &str = "--auto";
+
+/// OpenCode's TUI config for a Shelbi pane: no terminal title (it would
+/// overwrite the `shelbi:<state>` markers) and no highlights.
+pub const OPENCODE_CLI_CONFIG_CONTENT: &str = r#"{"terminal":{"title":false},"highlights":false}"#;
+
+/// Return a copy of `spec` that denies file edits, for an agent whose
+/// settings deny Claude's edit tools (the review agent's no-edit posture).
+/// Claude enforces that deny from the agent's `settings.json` itself, so this
+/// only changes an OpenCode runner, whose launch then appends an `edit` deny
+/// rule (see [`opencode_permission_rules`]). Idempotent.
+pub fn with_edits_denied(spec: &AgentRunnerSpec, deny: bool) -> AgentRunnerSpec {
+    if !deny
+        || !RunnerAdapter::for_spec(spec).is_opencode()
+        || spec.flags.iter().any(|f| f == OPENCODE_DENY_EDITS_FLAG)
+    {
+        return spec.clone();
+    }
+    let mut out = spec.clone();
+    out.flags.push(OPENCODE_DENY_EDITS_FLAG.into());
+    out
 }
 
 /// The value of the last `--flag value` / `--flag=value` among `names`.
@@ -255,10 +423,27 @@ impl RunnerAdapter {
     }
 
     /// Return a copy of `spec` with `--permission-mode <mode>` appended when
-    /// this runner is `claude` and the mode is non-default. See the free
+    /// this runner is `claude` and the mode is non-default, or carrying the
+    /// mode to OpenCode's permission rules. See the free
     /// [`with_permission_mode`] wrapper for the full rationale; this is the
     /// adapter-scoped form that skips re-detecting the runner kind.
     pub fn with_permission_mode(self, spec: &AgentRunnerSpec, mode: Option<&str>) -> AgentRunnerSpec {
+        // OpenCode's own default allows everything, so every configured mode,
+        // `default` included, becomes permission rules; only `None` (nothing
+        // configured) leaves the user's OpenCode settings in charge. The mode
+        // rides a logical `--permission-mode` that `opencode_launch_command`
+        // turns into rules, replacing one a user wrote: the resolved ceiling
+        // is the authority.
+        if self.is_opencode() {
+            let Some(mode) = mode else {
+                return spec.clone();
+            };
+            let mut out = spec.clone();
+            out.flags = strip_flag_with_value(&spec.flags, &[OPENCODE_PERMISSION_FLAG]);
+            out.flags.push(OPENCODE_PERMISSION_FLAG.into());
+            out.flags.push(mode.into());
+            return out;
+        }
         // `None` (nothing configured) and `Some("default")` (claude's own
         // baseline) both mean "pass no flag" — the agent runs under the user's
         // `permissions.defaultMode`. A flag is appended only for claude and only
@@ -267,9 +452,6 @@ impl RunnerAdapter {
             Some(m) if m != "default" => m,
             _ => return spec.clone(),
         };
-        if self.is_opencode() {
-            return with_opencode_auto(spec, mode);
-        }
         if !self.is_claude() {
             return spec.clone();
         }
@@ -393,7 +575,13 @@ impl RunnerAdapter {
 /// `mode` is `Option`: **`None` means nothing was configured**, so shelbi
 /// passes no flag and the agent runs under the user's own
 /// `permissions.defaultMode`. `Some("default")` (claude's baseline) is treated
-/// the same way. For non-claude runners the spec is always returned unchanged.
+/// the same way.
+///
+/// OpenCode is the exception on both counts: its default agent allows
+/// everything, so any configured mode (`default` included) is carried, as a
+/// logical flag, into permission rules in its launch config (see
+/// [`opencode_permission_rules`]). Every other runner gets the spec back
+/// unchanged.
 ///
 /// Idempotent: if the user-authored YAML already includes `--permission-mode`
 /// in `flags` (common for projects that adopted the flag before this helper
@@ -435,20 +623,6 @@ pub fn with_reasoning_effort(
     effort: Option<ReasoningEffort>,
 ) -> AgentRunnerSpec {
     RunnerAdapter::for_spec(spec).with_reasoning_effort(spec, effort)
-}
-
-/// Map a Shelbi permission mode onto OpenCode's one switch: `--auto`
-/// auto-approves every permission the user's config doesn't explicitly deny.
-/// Claude's `auto` and `bypassPermissions` both mean "don't stop to ask", so
-/// they turn it on; `acceptEdits` and `plan` have no OpenCode equivalent and
-/// leave the user's own permission config in charge. Idempotent.
-fn with_opencode_auto(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSpec {
-    if !matches!(mode, "auto" | "bypassPermissions") || spec.flags.iter().any(|f| f == "--auto") {
-        return spec.clone();
-    }
-    let mut out = spec.clone();
-    out.flags.push("--auto".into());
-    out
 }
 
 /// Codex's `model_reasoning_effort` accepts `minimal|low|medium|high|xhigh`;
@@ -1194,16 +1368,21 @@ mod tests {
         }
     }
 
+    /// The env every OpenCode launch carries ahead of the binary, after the
+    /// optional `OPENCODE_CONFIG_CONTENT`.
+    const OC_ENV: &str = r#"OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' OPENCODE_DISABLE_AUTOUPDATE=1"#;
+
     #[test]
     fn opencode_launch_exports_the_pane_tty_and_runs_standalone() {
         assert_eq!(
             launch_command(&opencode(&[])),
-            r#"env SHELBI_PANE_TTY="$(tty)" opencode --standalone"#
+            format!(r#"env SHELBI_PANE_TTY="$(tty)" {OC_ENV} opencode --standalone"#)
         );
-        // A flag the user already wrote isn't doubled.
+        // A flag the user already wrote isn't doubled, and with no ceiling a
+        // hand-written `--auto` is the user's own choice.
         assert_eq!(
             launch_command(&opencode(&["--standalone", "--auto"])),
-            r#"env SHELBI_PANE_TTY="$(tty)" opencode --standalone --auto"#
+            format!(r#"env SHELBI_PANE_TTY="$(tty)" {OC_ENV} opencode --standalone --auto"#)
         );
     }
 
@@ -1212,14 +1391,165 @@ mod tests {
         let spec = with_model(&opencode(&[]), Some("anthropic/claude-sonnet-4-5"));
         assert_eq!(
             launch_command(&spec),
-            r#"env SHELBI_PANE_TTY="$(tty)" OPENCODE_CONFIG_CONTENT='{"model":"anthropic/claude-sonnet-4-5"}' opencode --standalone"#
+            format!(
+                r#"env SHELBI_PANE_TTY="$(tty)" OPENCODE_CONFIG_CONTENT='{{"model":"anthropic/claude-sonnet-4-5"}}' {OC_ENV} opencode --standalone"#
+            )
         );
         // A hand-written `--model=` form is honored the same way, and a quote
         // in the id stays valid JSON.
         let spec = opencode(&["--model=we\"ird"]);
         assert_eq!(
             launch_command(&spec),
-            r#"env SHELBI_PANE_TTY="$(tty)" OPENCODE_CONFIG_CONTENT='{"model":"we\"ird"}' opencode --standalone"#
+            format!(r#"env SHELBI_PANE_TTY="$(tty)" OPENCODE_CONFIG_CONTENT='{{"model":"we\"ird"}}' {OC_ENV} opencode --standalone"#)
+        );
+    }
+
+    /// `(action, effect)` pairs of the rules a ceiling produces, every rule
+    /// on resource `*`.
+    fn rules(mode: Option<&str>, deny_edits: bool) -> Vec<(&'static str, &'static str)> {
+        opencode_permission_rules(mode, deny_edits)
+            .into_iter()
+            .map(|r| {
+                assert_eq!(r.resource, "*", "{r:?}");
+                (r.action, r.effect)
+            })
+            .collect()
+    }
+
+    /// Every row of the ceiling mapping (Plans/opencode-integration.md,
+    /// "Permission ceiling mapping").
+    #[test]
+    fn opencode_ceilings_map_onto_permission_rules() {
+        let ask_default = vec![
+            ("edit", "ask"),
+            ("shell", "ask"),
+            ("webfetch", "ask"),
+            ("external_directory", "ask"),
+        ];
+        // None configured: nothing imposed, the user's settings stand.
+        assert_eq!(rules(None, false), vec![]);
+        // plan: deny everything, then allow the read-only tools.
+        assert_eq!(
+            rules(Some("plan"), false),
+            vec![
+                ("*", "deny"),
+                ("read", "allow"),
+                ("glob", "allow"),
+                ("grep", "allow"),
+                ("webfetch", "allow"),
+                ("websearch", "allow"),
+                ("skill", "allow"),
+                ("question", "allow"),
+            ]
+        );
+        // default: ask before edits, shell, fetches and leaving the tree.
+        assert_eq!(rules(Some("default"), false), ask_default);
+        // read-only: default's asks, then no edits at all.
+        let mut read_only = ask_default.clone();
+        read_only.push(("edit", "deny"));
+        assert_eq!(rules(Some("read-only"), false), read_only);
+        // auto and acceptEdits: edits allowed, shell still asks.
+        for mode in ["auto", "acceptEdits"] {
+            assert_eq!(
+                rules(Some(mode), false),
+                vec![("edit", "allow"), ("shell", "ask"), ("external_directory", "ask")],
+                "{mode}"
+            );
+        }
+        // bypassPermissions: everything allowed.
+        assert_eq!(rules(Some("bypassPermissions"), false), vec![("*", "allow")]);
+        // A typo ranks as default: never looser.
+        assert_eq!(rules(Some("bogus"), false), ask_default);
+        // The review agent's no-edit posture appends an edit deny at any
+        // ceiling, and with none.
+        for mode in [None, Some("plan"), Some("default"), Some("auto"), Some("bypassPermissions")] {
+            let r = rules(mode, true);
+            assert_eq!(r.last(), Some(&("edit", "deny")), "{mode:?}");
+            assert_eq!(&r[..r.len() - 1], &rules(mode, false)[..], "{mode:?}");
+        }
+    }
+
+    /// The ceiling reaches the launch as config on both agents, and only
+    /// `bypassPermissions` passes `--auto`.
+    #[test]
+    fn opencode_ceilings_reach_the_launch_and_only_bypass_passes_auto() {
+        let modes = [
+            None,
+            Some("plan"),
+            Some("default"),
+            Some("read-only"),
+            Some("auto"),
+            Some("acceptEdits"),
+            Some("bypassPermissions"),
+        ];
+        for mode in modes {
+            for deny_edits in [false, true] {
+                let spec = with_edits_denied(&with_permission_mode(&opencode(&[]), mode), deny_edits);
+                let line = launch_command(&spec);
+                let argv = line.split(" opencode ").nth(1).unwrap();
+                assert_eq!(
+                    argv.split(' ').any(|t| t == "--auto"),
+                    mode == Some("bypassPermissions"),
+                    "{mode:?}: {line}"
+                );
+                // The logical flags never reach OpenCode.
+                assert!(!line.contains("--permission-mode"), "{line}");
+                assert!(!line.contains("--shelbi-deny-edits"), "{line}");
+                let expected = rules(mode, deny_edits);
+                if expected.is_empty() {
+                    assert!(!line.contains("OPENCODE_CONFIG_CONTENT"), "{line}");
+                    continue;
+                }
+                let list = expected
+                    .iter()
+                    .map(|(a, e)| format!(r#"{{"action":"{a}","resource":"*","effect":"{e}"}}"#))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let config = format!(
+                    r#"OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{{"permissions":[{list}]}},"plan":{{"permissions":[{list}]}}}}}}'"#
+                );
+                assert!(line.contains(&config), "{mode:?}/{deny_edits}: {line}\nwanted {config}");
+            }
+        }
+        // A ceiling below bypass drops a hand-written `--auto`: it would
+        // approve the asks the ceiling raises.
+        let spec = with_permission_mode(&opencode(&["--auto"]), Some("auto"));
+        assert!(!launch_command(&spec).contains("--auto"));
+        // The resolved ceiling replaces a hand-written logical one.
+        let spec = with_permission_mode(&opencode(&["--permission-mode", "bypassPermissions"]), Some("plan"));
+        assert_eq!(spec.flags, vec!["--permission-mode", "plan"]);
+        // Edits are denied once, and only on OpenCode (Claude reads its
+        // settings.json deny itself).
+        let twice = with_edits_denied(&with_edits_denied(&opencode(&[]), true), true);
+        assert_eq!(twice.flags, vec!["--shelbi-deny-edits"]);
+        let claude = AgentRunnerSpec { command: "claude".into(), ..opencode(&[]) };
+        assert!(with_edits_denied(&claude, true).flags.is_empty());
+    }
+
+    /// The whole line a resumed review worker (edits denied) on an
+    /// `acceptEdits` ceiling with a model launches with, and a bypass one.
+    #[test]
+    fn opencode_full_launch_line_golden() {
+        let spec = with_permission_mode(&with_model(&opencode(&[]), Some("anthropic/claude-sonnet-5-5")), Some("acceptEdits"));
+        let spec = with_edits_denied(&with_continue(&spec, true), true);
+        assert_eq!(
+            launch_command(&spec),
+            concat!(
+                r#"env SHELBI_PANE_TTY="$(tty)" "#,
+                r#"OPENCODE_CONFIG_CONTENT='{"model":"anthropic/claude-sonnet-5-5","agents":{"#,
+                r#""build":{"permissions":[{"action":"edit","resource":"*","effect":"allow"},{"action":"shell","resource":"*","effect":"ask"},{"action":"external_directory","resource":"*","effect":"ask"},{"action":"edit","resource":"*","effect":"deny"}]},"#,
+                r#""plan":{"permissions":[{"action":"edit","resource":"*","effect":"allow"},{"action":"shell","resource":"*","effect":"ask"},{"action":"external_directory","resource":"*","effect":"ask"},{"action":"edit","resource":"*","effect":"deny"}]}}}' "#,
+                r#"OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' "#,
+                r#"OPENCODE_DISABLE_AUTOUPDATE=1 "#,
+                r#"opencode --standalone --continue"#,
+            )
+        );
+        let bypass = with_permission_mode(&opencode(&[]), Some("bypassPermissions"));
+        assert_eq!(
+            launch_command(&bypass),
+            format!(
+                r#"env SHELBI_PANE_TTY="$(tty)" OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{{"permissions":[{{"action":"*","resource":"*","effect":"allow"}}]}},"plan":{{"permissions":[{{"action":"*","resource":"*","effect":"allow"}}]}}}}}}' {OC_ENV} opencode --standalone --auto"#
+            )
         );
     }
 
@@ -1243,21 +1573,10 @@ mod tests {
     }
 
     #[test]
-    fn opencode_resume_and_permissions_map_onto_its_flags() {
+    fn opencode_resume_and_effort_map_onto_its_flags() {
         assert_eq!(with_continue(&opencode(&[]), true).flags, vec!["--continue"]);
         assert!(with_continue(&opencode(&[]), false).flags.is_empty());
         assert_eq!(with_continue(&opencode(&["-c"]), true).flags, vec!["-c"]);
-
-        for mode in ["auto", "bypassPermissions"] {
-            assert_eq!(with_permission_mode(&opencode(&[]), Some(mode)).flags, vec!["--auto"], "{mode}");
-        }
-        for mode in [None, Some("default"), Some("acceptEdits"), Some("plan")] {
-            assert!(with_permission_mode(&opencode(&[]), mode).flags.is_empty(), "{mode:?}");
-        }
-        assert_eq!(
-            with_permission_mode(&opencode(&["--auto"]), Some("auto")).flags,
-            vec!["--auto"]
-        );
         // Effort has no OpenCode switch Shelbi can drive.
         assert!(with_reasoning_effort(&opencode(&[]), Some(ReasoningEffort::High)).flags.is_empty());
     }
@@ -1268,7 +1587,8 @@ mod tests {
     /// over the exact line, with `true` standing in for the OpenCode binary.
     #[test]
     fn opencode_launch_line_survives_exec() {
-        let mut spec = with_model(&opencode(&[]), Some("p/m"));
+        let spec = with_model(&opencode(&[]), Some("p/m"));
+        let mut spec = with_edits_denied(&with_permission_mode(&spec, Some("bypassPermissions")), true);
         spec.command = "true".into();
         spec.integration = Some(RunnerKind::OpenCode);
         let line = format!("exec {}", launch_command(&spec));

@@ -198,6 +198,15 @@ fn permission_rank(mode: &str) -> u8 {
     known_permission_rank(mode).unwrap_or(1)
 }
 
+/// A permission mode's rank on the tightest→loosest axis: 0 `plan`,
+/// 1 `default` (and `read-only`), 2 `auto`/`acceptEdits`, 3
+/// `bypassPermissions`, with their aliases. An unrecognized mode ranks as
+/// `default`, so a typo never widens anything. A runner adapter that maps
+/// the ceiling onto its own rules (OpenCode) reads it from here.
+pub fn permission_mode_rank(mode: &str) -> u8 {
+    permission_rank(mode)
+}
+
 /// [`permission_rank`] for a mode Shelbi recognizes, `None` otherwise.
 fn known_permission_rank(mode: &str) -> Option<u8> {
     Some(match mode.trim() {

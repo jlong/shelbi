@@ -146,9 +146,12 @@ Declare OpenCode the same way (`command: opencode`) and point
 `orchestrator.runner` at it. Shelbi launches it with `--standalone`, so the
 session runs its own server and inherits the pane's environment, and sends the
 rendered instructions and bootstrap request as its first prompt through
-`--prompt`. An OpenCode orchestrator keeps the heartbeat event system.
-`workspace_permissions_mode: auto` or `bypassPermissions` adds `--auto`; the
-other modes leave OpenCode's own permission settings in charge.
+`--prompt`. An OpenCode orchestrator keeps the heartbeat event system, so its
+event wake reports as degraded. Shelbi needs OpenCode 2.3 or later
+(`npm install -g @opencode/cli`); it refuses to dispatch to an older one and
+says to run `opencode upgrade`. OpenCode workers map
+`workspace_permissions_mode` onto OpenCode permission rules (see
+[Permissions are a ceiling](/docs/configuration/agents#on-opencode)).
 
 ### Switching an existing project
 

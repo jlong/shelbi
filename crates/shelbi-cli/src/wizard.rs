@@ -222,15 +222,28 @@ pub(crate) fn answer_steps(
     let installed = installed_runners();
     let runner = match preset.runner {
         Some(runner) => {
-            if !ask.interactive() && !installed.iter().any(|r| r.kind == runner.kind()) {
-                bail!(
-                    "requested runner {runner} was not found on PATH; installed supported runners: {}",
-                    installed.iter().map(|r| r.kind.as_str()).collect::<Vec<_>>().join(", ")
-                );
+            let found = installed.iter().find(|r| r.kind == runner.kind());
+            if !ask.interactive() {
+                if let Some(reason) = found.and_then(|r| r.unsupported_reason()) {
+                    bail!("{reason}");
+                }
+                if found.is_none() {
+                    bail!(
+                        "requested runner {runner} was not found on PATH; installed supported runners: {}",
+                        installed
+                            .iter()
+                            .filter(|r| r.supported())
+                            .map(|r| r.kind.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                }
             }
             runner.kind()
         }
-        None if installed.is_empty() && !ask.interactive() => bail!("{}", missing_runner_guidance()),
+        None if !installed.iter().any(|r| r.supported()) && !ask.interactive() => {
+            bail!("{}", missing_runner_guidance())
+        }
         None => ask.runner(check.facts.recommended_runner())?,
     };
     let mut picker = HarnessPicker::new(runner, None);
@@ -373,7 +386,8 @@ fn missing_runner_guidance() -> String {
     concat!(
         "No supported agent runner was found on PATH. Install and authenticate Claude Code ",
         "(https://docs.claude.com/en/docs/claude-code), Codex ",
-        "(npm install -g @openai/codex) or OpenCode (npm install -g opencode-ai), ",
+        "(npm install -g @openai/codex) or OpenCode 2.3 or later (npm install -g @opencode/cli; ",
+        "upgrade an older one with `opencode upgrade`), ",
         "then start Shelbi again."
     )
     .to_string()
@@ -433,7 +447,11 @@ impl Ask for Prompts {
             .map(|kind| {
                 let found = installed.iter().find(|r| r.kind == kind);
                 let label = shelbi_app::settings::agents::runner_label(kind);
-                let detail = found.map_or_else(|| "not detected on PATH".to_string(), |r| r.version.clone());
+                let detail = match found {
+                    None => "not detected on PATH".to_string(),
+                    Some(r) if !r.supported() => format!("{}, unsupported: run `opencode upgrade`", r.version),
+                    Some(r) => r.version.clone(),
+                };
                 Choice(kind, format!("{label} ({detail})"))
             })
             .collect();

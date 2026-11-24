@@ -7,6 +7,7 @@ pub mod home;
 pub mod integration;
 pub mod login_env;
 pub mod model;
+pub mod opencode;
 pub mod placeholders;
 pub mod pool;
 pub mod releases;
@@ -20,6 +21,7 @@ pub mod workspace_names;
 
 pub use agent_manifest::{
     clamp_permission_mode, is_known_permission_mode, model_suggestions, orchestrator_model,
+    permission_mode_rank,
     reasoning_efforts,
     resolve_agent_launch, AgentManifest, AgentRequires, ReasoningEffort, ResolvedAgentLaunch,
     RunnerManifestConfig, PERMISSION_MODES,
@@ -53,6 +55,10 @@ pub use model::{
     DEFAULT_ISSUE_REFRESH_SECS, DEFAULT_LINEAR_REFRESH_SECS, DEFAULT_WORKFLOW_NAME, GIB, HEARTBEAT_DEFAULT, KNOWN_OPTIONAL_TASK_FIELDS,
     LOCAL_PROJECT_FIELDS,
     MAX_TASK_ID_LEN, SHARED_PROJECT_FIELDS, SUBTASK_WORKFLOW_NAME, TASK_WORKFLOW_NAME,
+};
+pub use opencode::{
+    opencode_unsupported_message, opencode_version_supported, parse_opencode_version,
+    OPENCODE_INSTALL, OPENCODE_MIN_VERSION, OPENCODE_UPGRADE,
 };
 pub use releases::{ReleasesConfig, TagGlob};
 pub use placeholders::{extract_placeholders, substitute_placeholders};

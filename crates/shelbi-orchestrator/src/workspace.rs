@@ -2677,6 +2677,9 @@ pub fn start_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
     //     Surface it up front so the failure mode is "shelbi rejected this
     //     machine" instead of "my workspace keeps pausing for no reason."
     require_auto_mode_supported(&host, &runner, permission_mode.as_deref())?;
+    // 0a'. An OpenCode below 2.3 can't run Shelbi's plugin: refuse it here,
+    //      naming the upgrade, rather than start a pane that never reports.
+    refuse_unsupported_opencode(&host, &runner, &spec.project.name, spec.task_id, &spec.workspace.name)?;
 
     // 0b. Clear any stale review marker left in the worktree from a previous
     //     task before we reuse the worktree — otherwise the poller could read
@@ -2944,6 +2947,7 @@ pub fn resume_workspace_on_task(spec: StartSpec<'_>) -> Result<SessionTarget> {
     }
 
     require_auto_mode_supported(&host, &runner, permission_mode.as_deref())?;
+    refuse_unsupported_opencode(&host, &runner, &spec.project.name, spec.task_id, &spec.workspace.name)?;
 
     // Clear any stale review marker before we relaunch so the poller can't read
     // an old task id and misfire. A task being resumed is in `in_progress`, so
@@ -3242,8 +3246,15 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     //   it outlives the connection. Resolve + gate the remote binary first (a
     //   missing/incompatible one fails the dispatch naming `shelbi machine
     //   setup`), then launch the session running the `cd_launch` line.
+    // An agent whose settings deny Claude's edit tools (the review agent's
+    // no-edit posture) gets the same deny on OpenCode, which never reads
+    // those settings: its launch appends an `edit` deny rule.
+    let opencode = shelbi_agent::RunnerAdapter::for_spec(a.runner).is_opencode();
+    let deny_edits = opencode
+        && settings_deny_edits(&render_workspace_settings_preferring_agent(a.project, a.agent)?);
+    let runner = shelbi_agent::with_edits_denied(a.runner, deny_edits);
     let launch = workspace_launch_command_with_startup_prompt(
-        a.runner,
+        &runner,
         a.permission_mode,
         a.resume,
         startup_prompt_rel,
@@ -3932,6 +3943,86 @@ fn require_runner_available(host: &Host, runner: &shelbi_core::AgentRunnerSpec) 
         )));
     }
     Ok(())
+}
+
+/// Whether a Claude `settings.json` body denies the edit tools: `Edit`,
+/// `Write` or `NotebookEdit` in `permissions.deny`, bare or with a pattern
+/// (`Edit(src/**)`). That is how an agent declares a no-edit posture (the
+/// review agent's `settings.json`). An unparseable body denies nothing.
+fn settings_deny_edits(settings_json: &str) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(settings_json) else {
+        return false;
+    };
+    v.pointer("/permissions/deny")
+        .and_then(|d| d.as_array())
+        .is_some_and(|deny| {
+            deny.iter().filter_map(|e| e.as_str()).any(|entry| {
+                let tool = entry.split('(').next().unwrap_or(entry).trim();
+                matches!(tool, "Edit" | "Write" | "NotebookEdit")
+            })
+        })
+}
+
+/// Refuse to launch an OpenCode too old for Shelbi to drive (below
+/// [`shelbi_core::OPENCODE_MIN_VERSION`]). On 1.x Shelbi's plugin silently
+/// does nothing and `--standalone` doesn't exist, so the pane would start but
+/// never report state or take messages. Probes the runner's own command on
+/// the workspace host; when its version can't be read, the dispatch goes
+/// ahead (a probe failure isn't evidence of an old install).
+pub(crate) fn require_opencode_supported(host: &Host, runner: &shelbi_core::AgentRunnerSpec) -> Result<()> {
+    if !shelbi_agent::RunnerAdapter::for_spec(runner).is_opencode() {
+        return Ok(());
+    }
+    let command = runner.command.trim();
+    let out = match host {
+        Host::Local => shelbi_ssh::run(host, [command, "--version"]),
+        Host::Ssh { .. } => crate::git::run_login_shell_script(
+            host,
+            &format!("{} --version", shelbi_agent::shell_escape(command)),
+        ),
+    };
+    let Ok(out) = out else {
+        eprintln!("shelbi: couldn't run `{command} --version` on {host:?}; skipping the OpenCode version check");
+        return Ok(());
+    };
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    opencode_version_gate(&text)
+}
+
+/// [`require_opencode_supported`] for a dispatch: a refusal also records one
+/// `opencode-unsupported` dispatch event, so the orchestrator sees why the
+/// task didn't start.
+fn refuse_unsupported_opencode(
+    host: &Host,
+    runner: &shelbi_core::AgentRunnerSpec,
+    project: &str,
+    task_id: &str,
+    workspace: &str,
+) -> Result<()> {
+    require_opencode_supported(host, runner).inspect_err(|e| {
+        let (major, minor) = shelbi_core::OPENCODE_MIN_VERSION;
+        append_dispatch_status(
+            project,
+            task_id,
+            workspace,
+            "opencode-unsupported",
+            &format!("min_version={major}.{minor} fix=\"opencode upgrade\" error=\"{e}\""),
+        );
+    })
+}
+
+/// [`require_opencode_supported`]'s verdict on `opencode --version` output.
+fn opencode_version_gate(version_output: &str) -> Result<()> {
+    match shelbi_core::parse_opencode_version(version_output) {
+        Some((major, minor, patch)) if (major, minor) < shelbi_core::OPENCODE_MIN_VERSION => Err(Error::Other(
+            shelbi_core::opencode_unsupported_message(&format!("{major}.{minor}.{patch}")),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn runner_label(command: &str) -> &'static str {
@@ -10491,7 +10582,12 @@ statuses:
                 false,
                 Some(WORKTREE_STARTUP_PROMPT_REL),
             ),
-            r#"env SHELBI_PANE_TTY="$(tty)" opencode --auto --standalone --prompt "$(cat .shelbi/startup-prompt.md)""#,
+            concat!(
+                r#"env SHELBI_PANE_TTY="$(tty)" "#,
+                r#"OPENCODE_CONFIG_CONTENT='{"agents":{"build":{"permissions":[{"action":"edit","resource":"*","effect":"allow"},{"action":"shell","resource":"*","effect":"ask"},{"action":"external_directory","resource":"*","effect":"ask"}]},"plan":{"permissions":[{"action":"edit","resource":"*","effect":"allow"},{"action":"shell","resource":"*","effect":"ask"},{"action":"external_directory","resource":"*","effect":"ask"}]}}}' "#,
+                r#"OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' OPENCODE_DISABLE_AUTOUPDATE=1 "#,
+                r#"opencode --standalone --prompt "$(cat .shelbi/startup-prompt.md)""#,
+            ),
         );
         // A resume continues the last session and still seeds the prompt: the
         // paste path is Claude's alone.
@@ -10502,8 +10598,68 @@ statuses:
                 true,
                 Some(WORKTREE_STARTUP_PROMPT_REL),
             ),
-            r#"env SHELBI_PANE_TTY="$(tty)" opencode --continue --standalone --prompt "$(cat .shelbi/startup-prompt.md)""#,
+            concat!(
+                r#"env SHELBI_PANE_TTY="$(tty)" "#,
+                r#"OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' OPENCODE_DISABLE_AUTOUPDATE=1 "#,
+                r#"opencode --standalone --continue --prompt "$(cat .shelbi/startup-prompt.md)""#,
+            ),
         );
+    }
+
+    /// The review agent's shipped settings deny the edit tools, which is what
+    /// gives an OpenCode review worker its `edit` deny rule; the developer's
+    /// don't.
+    #[test]
+    fn settings_deny_edits_reads_the_review_agents_posture() {
+        assert!(settings_deny_edits(shelbi_state::DEFAULT_REVIEW_WORKSPACE_SETTINGS_TEMPLATE));
+        assert!(!settings_deny_edits(shelbi_state::DEFAULT_WORKSPACE_SETTINGS_TEMPLATE));
+        assert!(settings_deny_edits(r#"{"permissions":{"deny":["Bash(rm:*)","Write(src/**)"]}}"#));
+        assert!(!settings_deny_edits(r#"{"permissions":{"deny":["Bash(rm:*)"],"allow":["Edit"]}}"#));
+        assert!(!settings_deny_edits("not json"));
+    }
+
+    #[test]
+    fn opencode_below_two_point_three_is_refused_with_the_upgrade() {
+        for old in ["1.19.6", "opencode v2.2.0"] {
+            let err = opencode_version_gate(old).unwrap_err().to_string();
+            assert!(err.contains("isn't supported"), "{err}");
+            assert!(err.contains("opencode upgrade"), "{err}");
+        }
+        assert!(opencode_version_gate("opencode v2.3.2").is_ok());
+        assert!(opencode_version_gate("opencode v2.4.1\n").is_ok());
+        // An unreadable version isn't evidence of an old install.
+        assert!(opencode_version_gate("").is_ok());
+    }
+
+    /// The dispatch gate probes the runner's own command: a fake `opencode`
+    /// printing a 1.x version is refused, a 2.4 one passes, and a non-OpenCode
+    /// runner is never probed.
+    #[test]
+    fn dispatch_refuses_an_old_opencode_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fake = |name: &str, version: &str| {
+            let bin = dir.path().join(name).join("opencode");
+            std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+            std::fs::write(&bin, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+            AgentRunnerSpec {
+                command: bin.to_string_lossy().into_owned(),
+                flags: vec![],
+                prompt_injection: None,
+                dialog_signatures: vec![],
+                integration: None,
+            }
+        };
+        let err = require_opencode_supported(&Host::Local, &fake("v1", "1.19.6")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "OpenCode 1.19.6 isn't supported. Shelbi needs OpenCode 2.3 or later: run `opencode upgrade`."
+        );
+        require_opencode_supported(&Host::Local, &fake("v2", "opencode v2.4.1")).unwrap();
+        let mut claude = fake("other", "1.0.0");
+        claude.integration = Some(shelbi_core::RunnerKind::Claude);
+        require_opencode_supported(&Host::Local, &claude).unwrap();
     }
 
     #[test]

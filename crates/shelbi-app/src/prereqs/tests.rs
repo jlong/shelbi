@@ -216,7 +216,7 @@ fn linux_has_no_homebrew_row_and_its_own_hints() {
         [
             (Some("Claude Code"), "npm install -g @anthropic-ai/claude-code".to_string()),
             (Some("Codex"), "npm install -g @openai/codex".to_string()),
-            (Some("OpenCode"), "npm install -g opencode-ai".to_string()),
+            (Some("OpenCode"), "npm install -g @opencode/cli".to_string()),
         ]
     );
     let ready = checked(
@@ -232,6 +232,8 @@ fn mac_agent_commands_offer_both() {
     let cmds = Tool::Agent.install_commands(Platform::Mac);
     assert_eq!(cmds[0].text, "brew install --cask claude-code");
     assert_eq!(cmds[1].text, "brew install --cask codex");
+    // OpenCode 2.x ships on npm as `@opencode/cli` (no verified formula).
+    assert_eq!(cmds[2].text, "npm install -g @opencode/cli");
     assert_eq!(Tool::GithubCli.install_commands(Platform::Mac)[0].text, "brew install gh");
 }
 
@@ -447,4 +449,60 @@ fn the_bounded_runner_reads_output_and_failures() {
     let mut slow = Command::new("/bin/sh");
     slow.args(["-c", "sleep 5"]);
     assert!(run_bounded_for_test(slow, Duration::from_millis(100)).unwrap_err().starts_with("no answer"));
+}
+
+/// OpenCode 1.x (or 2.0 to 2.2) as the only coding agent: found, but
+/// unsupported, so the row counts as missing and offers the upgrade first.
+#[test]
+fn an_old_opencode_alone_is_unsupported_with_the_upgrade() {
+    let probe = Fake::new(&["/usr/bin", "/opt/homebrew/bin", "/b"])
+        .exe("/usr/bin/git", "git version 2.39.5 (Apple Git-154)")
+        .exe("/opt/homebrew/bin/gh", "gh version 2.62.0")
+        .exe("/opt/homebrew/bin/brew", "Homebrew 4.4.6")
+        .exe("/b/opencode", "1.19.6");
+    let p = checked(Platform::Mac, &probe, &ToolPaths::default());
+    let RowState::Unsupported(f) = p.state(Tool::Agent) else {
+        panic!("expected unsupported, got {:?}", p.state(Tool::Agent));
+    };
+    assert_eq!((f.binary, f.version.as_deref()), (Binary::OpenCode, Some("1.19.6")));
+    assert_eq!(p.phase(), Phase::Missing);
+    assert_eq!(p.missing(), [Tool::Agent]);
+    assert_eq!(
+        p.missing_detail(Tool::Agent),
+        "OpenCode 1.19.6 isn't supported. Shelbi needs OpenCode 2.3 or later. Upgrade it, or install Claude Code or Codex."
+    );
+    let commands: Vec<_> = p.install_commands(Tool::Agent).into_iter().map(|c| (c.label, c.text)).collect();
+    assert_eq!(
+        commands,
+        [
+            (Some("OpenCode"), "opencode upgrade".to_string()),
+            (Some("Claude Code"), "brew install --cask claude-code".to_string()),
+            (Some("Codex"), "brew install --cask codex".to_string()),
+        ]
+    );
+    // The launch's quiet look asks OpenCode its version too, so it shows the
+    // screen rather than counting the old install as ready.
+    assert!(!quick_check(&ToolPaths::default(), Platform::Mac, &probe));
+
+    // 2.3 and later are a working agent.
+    let current = Fake::new(&["/b"]).exe("/b/opencode", "opencode v2.4.1");
+    assert!(matches!(
+        check_tool(Tool::Agent, &ToolPaths::default(), Platform::Mac, &current, false),
+        RowState::Found(Found { binary: Binary::OpenCode, .. })
+    ));
+    // An old OpenCode beside Claude Code doesn't matter: Claude satisfies it.
+    let both = Fake::new(&["/b"]).exe("/b/claude", "2.1.4 (Claude Code)").exe("/b/opencode", "1.19.6");
+    assert!(matches!(
+        check_tool(Tool::Agent, &ToolPaths::default(), Platform::Mac, &both, true),
+        RowState::Found(Found { binary: Binary::Claude, .. })
+    ));
+}
+
+#[test]
+fn locating_an_old_opencode_is_refused_with_the_upgrade() {
+    let probe = Fake::new(&[]).exe("/x/opencode", "1.19.6");
+    let err = validate_located(Tool::Agent, "/x/opencode", None, Platform::Mac, &probe).unwrap_err();
+    assert_eq!(err, "OpenCode 1.19.6 isn't supported. Shelbi needs OpenCode 2.3 or later: run `opencode upgrade`.");
+    let ok = Fake::new(&[]).exe("/x/opencode", "opencode v2.3.2");
+    assert!(validate_located(Tool::Agent, "/x/opencode", None, Platform::Mac, &ok).is_ok());
 }
