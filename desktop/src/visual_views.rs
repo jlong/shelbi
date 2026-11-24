@@ -824,6 +824,7 @@ workspaces:
         state: shelbi_state::WorkspaceState::AwaitingInput,
         last_transition: now,
         last_seen: now,
+        opencode_session: None,
     })
     .unwrap();
     let at = |mins: i64| (now - chrono::Duration::minutes(mins)).to_rfc3339();

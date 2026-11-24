@@ -106,12 +106,14 @@ pub fn parse_opencode_models(output: &str) -> Vec<String> {
 pub const OPENCODE_DISCLOSURE: &[&str] = &[
     "OpenCode runs in a private server per pane (opencode --standalone). Shelbi adds its instructions, \
      skills, plugin and permission rules through environment variables, and doesn't change your OpenCode config.",
+    "Sessions: each task runs in its own session (--session ses_shelbi…), titled \"Shelbi · <workspace> · <task>\" \
+     and archived when the task is done. Your own sessions in the worktree are left alone.",
     "Files: .shelbi/opencode/ in each workspace (config.json, instructions.md, skills/, Shelbi's plugin in \
      plugins/shelbi/, and its plugin.lock and plugin.alive), rewritten at each launch. Nothing is written to \
      ~/.config/opencode, .opencode/, opencode.json or AGENTS.md.",
     "Environment: OPENCODE_CONFIG_CONTENT (config.json, merged over your own value, which is kept in \
      SHELBI_OPENCODE_USER_CONFIG), OPENCODE_CLI_CONFIG_CONTENT (turns off OpenCode's terminal title), \
-     OPENCODE_DISABLE_AUTOUPDATE=1 and SHELBI_PANE_TTY.",
+     OPENCODE_DISABLE_AUTOUPDATE=1, SHELBI_PANE_TTY, SHELBI_OPENCODE_SESSION and SHELBI_OPENCODE_TITLE.",
 ];
 
 /// The note an OpenCode agent shows when no permission ceiling applies
@@ -119,6 +121,39 @@ pub const OPENCODE_DISCLOSURE: &[&str] = &[
 pub const OPENCODE_NO_CEILING_NOTE: &str = "OpenCode's own default allows edits and shell commands. \
      Your OpenCode config, or a permission ceiling set here or in the project, restricts them; \
      with neither, Shelbi imposes nothing.";
+
+/// The id of the OpenCode session Shelbi launches for one task on one
+/// workspace: `ses_shelbi` plus 20 hex characters hashed from the project,
+/// workspace, task and generation.
+///
+/// The launch passes it as `--session <id>`, which reopens that session or
+/// creates it, so a resume lands on exactly this conversation rather than on
+/// whatever session in the worktree is newest (`--continue`), which could be
+/// one the user started there. A fresh start bumps `generation` and so gets a
+/// new session. The id is a pure function of its inputs, so it reads the same
+/// on every host and across releases; the hash is FNV-1a (128-bit), spelled
+/// out here rather than borrowed from a library whose output could change.
+pub fn opencode_session_id(project: &str, workspace: &str, task: &str, generation: u32) -> String {
+    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013b;
+    let mut hash = OFFSET;
+    let generation = generation.to_string();
+    // A NUL after each field keeps (`a b`, `c`) apart from (`a`, `b c`).
+    for field in [project, workspace, task, generation.as_str()] {
+        for byte in field.bytes().chain([0]) {
+            hash ^= u128::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    }
+    // The top 80 bits, as 20 hex characters.
+    format!("ses_shelbi{:020x}", hash >> 48)
+}
+
+/// The title Shelbi gives its OpenCode session, so the user can tell it
+/// apart from their own in OpenCode's session list.
+pub fn opencode_session_title(workspace: &str, task: &str) -> String {
+    format!("Shelbi · {workspace} · {task}")
+}
 
 #[cfg(test)]
 mod tests {
@@ -150,6 +185,39 @@ mod tests {
         assert_eq!(opencode_version_supported("opencode v2.4.1"), Some(true));
         assert_eq!(opencode_version_supported("opencode v3.0.0"), Some(true));
         assert_eq!(opencode_version_supported("garbled"), None);
+    }
+
+    #[test]
+    fn session_ids_are_deterministic_and_distinct() {
+        let id = opencode_session_id("shelbi", "bravo", "opencode-sessions", 0);
+        assert_eq!(id, opencode_session_id("shelbi", "bravo", "opencode-sessions", 0));
+        assert!(id.starts_with("ses_shelbi"), "{id}");
+        assert_eq!(id.len(), "ses_shelbi".len() + 20, "{id}");
+        assert!(id["ses_shelbi".len()..].chars().all(|c| c.is_ascii_hexdigit()), "{id}");
+        // Every input moves the id, and fields can't bleed into each other.
+        let others = [
+            opencode_session_id("shelbi", "bravo", "opencode-sessions", 1),
+            opencode_session_id("shelbi", "alpha", "opencode-sessions", 0),
+            opencode_session_id("other", "bravo", "opencode-sessions", 0),
+            opencode_session_id("shelbi", "bravo", "other-task", 0),
+            opencode_session_id("shelbib", "ravo", "opencode-sessions", 0),
+        ];
+        for other in &others {
+            assert_ne!(&id, other);
+        }
+    }
+
+    /// The hash is spelled out in this crate, so an id never changes under a
+    /// session that is still on disk. This pins it.
+    #[test]
+    fn session_ids_are_stable_across_releases() {
+        assert_eq!(opencode_session_id("p", "w", "t", 0), PINNED_ID);
+    }
+    const PINNED_ID: &str = "ses_shelbi2249bbf7ae659ba8713f";
+
+    #[test]
+    fn session_title_names_the_workspace_and_task() {
+        assert_eq!(opencode_session_title("bravo", "fix-it"), "Shelbi · bravo · fix-it");
     }
 
     #[test]

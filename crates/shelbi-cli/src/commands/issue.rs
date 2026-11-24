@@ -136,8 +136,9 @@ pub enum IssueCmd {
     },
     /// Relaunch the assigned workspace on the issue it is ALREADY working,
     /// WITHOUT discarding progress. For a stalled or killed worker: recreates
-    /// or reclaims the tmux pane and (for a claude runner) resumes the prior
-    /// conversation via `--continue`, while preserving the worktree as-is —
+    /// or reclaims the tmux pane and resumes the prior conversation (claude's
+    /// `--continue`; OpenCode reopens the session Shelbi named for it), while
+    /// preserving the worktree as-is —
     /// its branch, commits, and uncommitted changes stay put. Contrast with
     /// `start`, which wipes context and re-checks-out a clean branch. Restores
     /// the issue to `in_progress` if it drifted. Pass `--workspace` to target a

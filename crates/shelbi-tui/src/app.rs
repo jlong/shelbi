@@ -3670,6 +3670,7 @@ mod tests {
                 state,
                 last_transition: now,
                 last_seen: now,
+                opencode_session: None,
             })
             .unwrap();
         }
@@ -3734,6 +3735,7 @@ mod tests {
             state: WorkspaceState::AwaitingInput,
             last_transition: now,
             last_seen: now,
+            opencode_session: None,
         })
         .unwrap();
 
@@ -3786,6 +3788,7 @@ mod tests {
             state: WorkspaceState::Blocked,
             last_transition: now,
             last_seen: now,
+            opencode_session: None,
         })
         .unwrap();
 
@@ -3807,6 +3810,7 @@ mod tests {
             state: WorkspaceState::Blocked,
             last_transition: now,
             last_seen: now,
+            opencode_session: None,
         })
         .unwrap();
         app.refresh().unwrap();
@@ -3860,6 +3864,7 @@ mod tests {
             state: WorkspaceState::Paused,
             last_transition: now,
             last_seen: now,
+            opencode_session: None,
         })
         .unwrap();
 
@@ -3918,6 +3923,7 @@ mod tests {
             state: WorkspaceState::Working,
             last_transition: now,
             last_seen: now,
+            opencode_session: None,
         })
         .unwrap();
 
@@ -3951,6 +3957,7 @@ mod tests {
             state: WorkspaceState::Working,
             last_transition: now,
             last_seen: now,
+            opencode_session: None,
         })
         .unwrap();
 
