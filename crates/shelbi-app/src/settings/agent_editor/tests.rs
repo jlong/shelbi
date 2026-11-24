@@ -445,3 +445,30 @@ fn an_import_path_expands_home_and_relative_paths() {
     assert_eq!(import_path("skills/lint", Some(home), cwd), PathBuf::from("/work/skills/lint"));
     assert_eq!(import_path("/abs/lint.md", None, cwd), PathBuf::from("/abs/lint.md"));
 }
+
+#[test]
+fn the_orchestrator_agents_runner_moves_the_orchestrator_session() {
+    let _home = home("orch-runner");
+    let runner = || shelbi_state::orchestrator_setup::orchestrator_runner_kind(&shelbi_state::load_project(PROJECT).unwrap());
+    assert_eq!(runner(), RunnerKind::Claude);
+
+    // Choosing OpenCode for the orchestrator agent points `orchestrator.runner`
+    // at it, declaring the runner when the project had none.
+    let mut state = editor(shelbi_state::ORCHESTRATOR_AGENT);
+    assert!(state.change(Change::PreferredRunner(Some(RunnerKind::OpenCode))));
+    save(&mut state, vec![]);
+    assert_eq!(runner(), RunnerKind::OpenCode);
+    let project = shelbi_state::load_project(PROJECT).unwrap();
+    assert_eq!(project.agent_runners.get("opencode").map(|r| r.command.as_str()), Some("opencode"));
+
+    // Project default leaves the session where it is.
+    assert!(state.change(Change::PreferredRunner(None)));
+    save(&mut state, vec![]);
+    assert_eq!(runner(), RunnerKind::OpenCode);
+
+    // Another agent's runner never touches it.
+    let mut dev = editor("developer");
+    assert!(dev.change(Change::PreferredRunner(Some(RunnerKind::Codex))));
+    save(&mut dev, vec![]);
+    assert_eq!(runner(), RunnerKind::OpenCode);
+}

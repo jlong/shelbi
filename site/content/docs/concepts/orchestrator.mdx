@@ -150,6 +150,15 @@ rendered instructions and bootstrap request as its first prompt through
 `workspace_permissions_mode: auto` or `bypassPermissions` adds `--auto`; the
 other modes leave OpenCode's own permission settings in charge.
 
+### Switching an existing project
+
+Settings ▸ Agents ▸ orchestrator ▸ Preferred runner switches the orchestrator
+of a project that already exists. Saving it points `orchestrator.runner` at
+that kind and declares an `agent_runners` entry for it when the project has
+none. The new runner takes over the next time the orchestrator starts (quit
+and reopen the project, or `shelbi reload chat`). Project default leaves
+`orchestrator.runner` as it is.
+
 ## Bootstrap flow on session start
 
 The prompt instructs the orchestrator to do these things on the first
