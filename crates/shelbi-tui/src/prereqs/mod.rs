@@ -271,7 +271,7 @@ impl PrereqApp {
         let mut out = Vec::new();
         for tool in self.model.tools() {
             let commands = self.model.install_commands(tool);
-            let missing = matches!(self.model.state(tool), RowState::Missing);
+            let missing = self.model.state(tool).is_missing();
             if missing && self.model.locating() != Some(tool) && !commands.is_empty() {
                 out.extend(commands.into_iter().map(|c| Stop { tool, command: Some(c) }));
             } else {
@@ -368,7 +368,7 @@ impl PrereqApp {
             KeyCode::Char('c') => self.copy(),
             KeyCode::Char('b') => {
                 if let Some(stop) = self.focused() {
-                    if matches!(self.model.state(stop.tool), RowState::Missing) {
+                    if self.model.state(stop.tool).is_missing() {
                         self.model.start_locate(stop.tool);
                         self.path.clear();
                         self.save_error = None;
@@ -429,7 +429,7 @@ impl PrereqApp {
             let locating = self.model.locating() == Some(tool);
             let (icon, icon_style) = match state {
                 RowState::Found(_) => ('✓', Style::default().fg(p.green)),
-                RowState::Missing => ('✕', Style::default().fg(p.red)),
+                RowState::Missing | RowState::Unsupported(_) => ('✕', Style::default().fg(p.red)),
                 RowState::Checking => (self.spinner(), Style::default().fg(p.cyan)),
                 RowState::Pending => ('○', Style::default().fg(p.muted)),
             };
@@ -438,7 +438,7 @@ impl PrereqApp {
                 _ => Style::default().fg(p.white).add_modifier(Modifier::BOLD),
             };
             let detail = match state {
-                RowState::Found(f) if !locating => f.detail(home),
+                RowState::Found(f) | RowState::Unsupported(f) if !locating => f.detail(home),
                 RowState::Checking => model::CHECKING_ROW.to_string(),
                 RowState::Pending => model::WAITING_ROW.to_string(),
                 _ => String::new(),
@@ -488,10 +488,10 @@ impl PrereqApp {
                 }
                 continue;
             }
-            if !matches!(state, RowState::Missing) {
+            if !state.is_missing() {
                 continue;
             }
-            for l in wrap(self.model.missing_detail(tool), inner.max(1)) {
+            for l in wrap(&self.model.missing_detail(tool), inner.max(1)) {
                 lines.push(Line::from(vec![indent(), Span::styled(l, Style::default().fg(p.muted))]));
             }
             for command in self.model.install_commands(tool) {

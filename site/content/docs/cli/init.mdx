@@ -116,7 +116,7 @@ Running `init -y` again in a directory that already belongs to a project prints
 | `--root <ROOT>` | Folder | the current Git checkout's top | Repository Shelbi will manage. Put it after `init`: `shelbi --root PATH init` sets the Shelbi state directory instead. A relative path is resolved against the current directory and must exist. |
 | `--project <PROJECT>` | Folder | the folder's name | The project's name. Shelbi lowercases it and replaces characters a project id can't hold with `-` for the id, keeping what you typed as the display name. With a pick-up, the local alias. |
 | `--pick-up` | Folder | offered when found | Take the committed `<repo>/.shelbi/project.yaml` (searching parent folders when `--root` isn't given). A committed name that's taken locally gets a suffixed alias (`-2`, `-3`, and so on). |
-| `--runner <RUNNER>` | Agents | the installed runner, Claude Code first | `claude`, `codex` or `opencode`. With `-y` it must be installed on `PATH`. |
+| `--runner <RUNNER>` | Agents | the installed runner, Claude Code first | `claude`, `codex` or `opencode`. With `-y` it must be installed on `PATH`, and OpenCode must be 2.3 or later (`opencode upgrade` moves an older one). |
 | `--model <MODEL>` | Agents | the runner's default | The agents' default model. |
 | `--issue-tracker <BACKEND>` | Issues | GitHub for a GitHub origin that passes the preflight, else `file_system` | `github`, `linear` or `file_system`. `github` and `linear` are preflighted before anything is written; a failure is a hard error naming the fix. |
 | `--github-repo <OWNER/REPO>` | Issues | detected origin repo | The repo for `--issue-tracker github`. Required when the origin remote is not a GitHub repo. |

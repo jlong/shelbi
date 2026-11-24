@@ -99,7 +99,8 @@ pub fn detect_facts(path: &Path, repo: Repo) -> Facts {
         recommended_mode,
         mode_reason,
         pick_up: detect_pick_up(path),
-        runners: installed_runners().iter().map(|r| r.kind).collect(),
+        // An OpenCode too old to drive isn't a runner a project can default to.
+        runners: installed_runners().iter().filter(|r| r.supported()).map(|r| r.kind).collect(),
         default_branch,
         remote,
     }
@@ -230,6 +231,20 @@ pub struct InstalledRunner {
     pub version: String,
 }
 
+impl InstalledRunner {
+    /// Whether Shelbi can drive this install: every version except an
+    /// OpenCode below [`shelbi_core::OPENCODE_MIN_VERSION`] (an unreadable
+    /// version gets the benefit of the doubt).
+    pub fn supported(&self) -> bool {
+        self.kind != RunnerKind::OpenCode || shelbi_core::opencode_version_supported(&self.version) != Some(false)
+    }
+
+    /// Why Shelbi can't drive it, naming the upgrade; `None` when it can.
+    pub fn unsupported_reason(&self) -> Option<String> {
+        (!self.supported()).then(|| shelbi_core::opencode_unsupported_message(&self.version))
+    }
+}
+
 /// The runners a new project can default to, in preference order.
 pub const SUPPORTED_RUNNERS: [RunnerKind; 3] =
     [RunnerKind::Claude, RunnerKind::Codex, RunnerKind::OpenCode];
@@ -319,6 +334,25 @@ mod tests {
         assert_eq!(normalize_version("claude", "Claude Code 2.1.0"), "2.1.0");
         assert_eq!(normalize_version("codex", "codex-cli 0.9"), "0.9");
         assert_eq!(normalize_version("codex", "\u{1b}weird"), "weird");
+        assert_eq!(normalize_version("opencode", "opencode v2.4.1"), "2.4.1");
+        assert_eq!(normalize_version("opencode", "1.19.6"), "1.19.6");
+    }
+
+    #[test]
+    fn an_old_opencode_is_installed_but_unsupported() {
+        let runner = |kind, version: &str| InstalledRunner { kind, version: version.into() };
+        let old = runner(RunnerKind::OpenCode, "1.19.6");
+        assert!(!old.supported());
+        assert_eq!(
+            old.unsupported_reason().as_deref(),
+            Some("OpenCode 1.19.6 isn't supported. Shelbi needs OpenCode 2.3 or later: run `opencode upgrade`.")
+        );
+        assert!(!runner(RunnerKind::OpenCode, "2.2.0").supported());
+        assert!(runner(RunnerKind::OpenCode, "2.3.2").supported());
+        assert!(runner(RunnerKind::OpenCode, "version unknown").supported());
+        // The gate is OpenCode's alone.
+        assert!(runner(RunnerKind::Claude, "1.0.0").supported());
+        assert_eq!(runner(RunnerKind::OpenCode, "2.4.1").unsupported_reason(), None);
     }
 
     #[test]

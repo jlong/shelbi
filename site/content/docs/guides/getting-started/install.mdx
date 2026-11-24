@@ -116,7 +116,9 @@ You need two things before you start:
 
 - **An agent CLI.** At least one of `claude`
   ([Claude Code](https://docs.claude.com/en/docs/claude-code)), `codex` or
-  `opencode` ([OpenCode](https://opencode.ai)), installed and authenticated.
+  `opencode` ([OpenCode](https://opencode.ai) 2.3 or later:
+  `npm install -g @opencode/cli`, or `opencode upgrade` for an older install),
+  installed and authenticated.
   If you install more than one, each agent
   (orchestrator, developer, review, and so on) recommends a runner and the
   project config can override it; workspaces don't pick one.

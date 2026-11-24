@@ -1390,6 +1390,9 @@ fn ensure_orchestrator_session(
     hub_work_dir: &std::path::Path,
     awareness_plugin: bool,
 ) -> Result<()> {
+    // An OpenCode too old to drive is refused before anything starts, with the
+    // same upgrade sentence a worker dispatch gives.
+    workspace::require_opencode_supported(&shelbi_core::Host::Local, runner_spec)?;
     let b = backend();
 
     // Claim the one-shot first-project greeting exactly as the tmux path does, so

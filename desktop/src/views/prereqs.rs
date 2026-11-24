@@ -435,7 +435,9 @@ impl PrereqsView {
         }
         match self.model.state(tool) {
             RowState::Found(_) => slot().child(heroicon(icons::CHECK).text_color(theme.icon_green)).into_any_element(),
-            RowState::Missing => slot().child(heroicon(icons::X_MARK).text_color(theme.error)).into_any_element(),
+            RowState::Missing | RowState::Unsupported(_) => {
+                slot().child(heroicon(icons::X_MARK).text_color(theme.error)).into_any_element()
+            }
             RowState::Checking => slot()
                 .child(spinner_sized(SharedString::from(format!("prereq-spin-{tool:?}")), theme.progress, 20.0))
                 .into_any_element(),
@@ -478,7 +480,7 @@ impl PrereqsView {
         }
         let home = self.deps.home.as_deref();
         let detail = match self.model.state(tool) {
-            RowState::Missing => return self.missing_row(tool, theme, cx),
+            RowState::Missing | RowState::Unsupported(_) => return self.missing_row(tool, theme, cx),
             RowState::Found(found) => found.detail(home),
             RowState::Checking => model::CHECKING_ROW.to_string(),
             RowState::Pending => model::WAITING_ROW.to_string(),

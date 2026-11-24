@@ -257,12 +257,12 @@ impl Tool {
             (Tool::Agent, Platform::Mac) => vec![
                 agent(Binary::Claude, "brew install --cask claude-code"),
                 agent(Binary::Codex, "brew install --cask codex"),
-                agent(Binary::OpenCode, "brew install opencode"),
+                agent(Binary::OpenCode, shelbi_core::OPENCODE_INSTALL),
             ],
             (Tool::Agent, Platform::Linux) => vec![
                 agent(Binary::Claude, "npm install -g @anthropic-ai/claude-code"),
                 agent(Binary::Codex, "npm install -g @openai/codex"),
-                agent(Binary::OpenCode, "npm install -g opencode-ai"),
+                agent(Binary::OpenCode, shelbi_core::OPENCODE_INSTALL),
             ],
         }
     }
@@ -365,6 +365,17 @@ pub enum RowState {
     Checking,
     Found(Found),
     Missing,
+    /// Found, but too old for Shelbi to drive: an OpenCode below
+    /// [`shelbi_core::OPENCODE_MIN_VERSION`] when no other coding agent is
+    /// installed. It counts as missing; the row offers the upgrade.
+    Unsupported(Found),
+}
+
+impl RowState {
+    /// Whether the row needs the user: missing, or found but unsupported.
+    pub fn is_missing(&self) -> bool {
+        matches!(self, RowState::Missing | RowState::Unsupported(_))
+    }
 }
 
 /// One row's news from a check run.
@@ -459,7 +470,7 @@ impl Prereqs {
     }
 
     fn is_missing(&self, tool: Tool) -> bool {
-        matches!(self.state(tool), RowState::Missing) && tool.applies(self.platform)
+        self.state(tool).is_missing() && tool.applies(self.platform)
     }
 
     /// The rows in the order they show: with Git or Homebrew missing,
@@ -516,14 +527,30 @@ impl Prereqs {
     }
 
     /// A missing row's detail (GitHub CLI's says it needs Homebrew when
-    /// that's missing too).
-    pub fn missing_detail(&self, tool: Tool) -> &'static str {
-        tool.missing_detail(self.platform, self.is_missing(Tool::Homebrew))
+    /// that's missing too; an unsupported OpenCode's names its version).
+    pub fn missing_detail(&self, tool: Tool) -> String {
+        match self.state(tool) {
+            RowState::Unsupported(found) => unsupported_detail(found),
+            _ => tool.missing_detail(self.platform, self.is_missing(Tool::Homebrew)).to_string(),
+        }
     }
 
-    /// A missing row's commands.
+    /// A missing row's commands. An unsupported OpenCode's row offers its
+    /// upgrade first, then the other agents' installs.
     pub fn install_commands(&self, tool: Tool) -> Vec<InstallCommand> {
-        tool.install_commands(self.platform)
+        let commands = tool.install_commands(self.platform);
+        match self.state(tool) {
+            RowState::Unsupported(found) => {
+                let mut out = vec![InstallCommand {
+                    binary: found.binary,
+                    label: Some(found.binary.label()),
+                    text: shelbi_core::OPENCODE_UPGRADE.to_string(),
+                }];
+                out.extend(commands.into_iter().filter(|c| c.binary != found.binary));
+                out
+            }
+            _ => commands,
+        }
     }
 
     /// The skip confirmation's list: each missing tool and what breaks
@@ -625,24 +652,45 @@ pub fn resolve(binary: Binary, located: &ToolPaths, platform: Platform, probe: &
 }
 
 /// Check one tool: Found with the first binary that's there (its version
-/// when `versions`), else Missing.
+/// when `versions`), else Missing. An OpenCode is always asked its version,
+/// since one below [`shelbi_core::OPENCODE_MIN_VERSION`] is Unsupported:
+/// Shelbi's plugin does nothing on it.
 pub fn check_tool(tool: Tool, located: &ToolPaths, platform: Platform, probe: &dyn Probe, versions: bool) -> RowState {
     for &binary in tool.binaries() {
         if let Some((path, was_located)) = resolve(binary, located, platform, probe) {
-            let version = if versions {
-                probe.version(&path).ok().and_then(|out| parse_version(&out))
+            let output = if versions || binary == Binary::OpenCode {
+                probe.version(&path).ok()
             } else {
                 None
             };
-            return RowState::Found(Found {
+            let found = Found {
                 binary,
                 path,
-                version,
+                version: output.as_deref().and_then(parse_version),
                 located: was_located,
-            });
+            };
+            if binary == Binary::OpenCode
+                && output.as_deref().and_then(shelbi_core::opencode_version_supported) == Some(false)
+            {
+                return RowState::Unsupported(found);
+            }
+            return RowState::Found(found);
         }
     }
     RowState::Missing
+}
+
+/// An unsupported OpenCode row's detail, over its upgrade command.
+fn unsupported_detail(found: &Found) -> String {
+    let (major, minor) = shelbi_core::OPENCODE_MIN_VERSION;
+    let name = match &found.version {
+        Some(version) => format!("OpenCode {version}"),
+        None => "This OpenCode".to_string(),
+    };
+    format!(
+        "{name} isn't supported. Shelbi needs OpenCode {major}.{minor} or later. \
+         Upgrade it, or install Claude Code or Codex."
+    )
 }
 
 /// Check every tool in [`Tool::CHECK_ORDER`], reporting each as it starts
@@ -716,6 +764,11 @@ pub fn validate_located(
     let out = probe
         .version(&path)
         .map_err(|e| format!("`{} --version` failed: {e}", display_path(&path, home)))?;
+    // An OpenCode too old to drive is refused here too, naming the upgrade.
+    if binary == Binary::OpenCode && shelbi_core::opencode_version_supported(&out) == Some(false) {
+        let version = parse_version(&out).unwrap_or_else(|| out.trim().to_string());
+        return Err(shelbi_core::opencode_unsupported_message(&version));
+    }
     Ok(Found {
         binary,
         path,

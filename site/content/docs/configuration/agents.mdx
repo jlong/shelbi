@@ -86,7 +86,7 @@ projects that configure their fleets differently.
 | --- | --- |
 | `claude` | Claude Code. `--model` and `--effort` flags; `--append-system-prompt` wiring. |
 | `codex` | Codex. `--model` and `-c model_reasoning_effort="…"`; the `max` level maps to Codex `xhigh`. |
-| `opencode` | OpenCode. The model is a `provider/model` id, passed as inline config (`OPENCODE_CONFIG_CONTENT`) because the TUI has no model flag. Reasoning effort stays with OpenCode's own variant setting. |
+| `opencode` | OpenCode 2.3 or later. The model is a `provider/model` id, passed as inline config (`OPENCODE_CONFIG_CONTENT`) because the TUI has no model flag, along with the permission rules (see [On OpenCode](#on-opencode)). The launch also turns off OpenCode's terminal title, which would overwrite Shelbi's state markers, and its autoupdate. Reasoning effort stays with OpenCode's own variant setting. |
 | `generic` | Any other runner. No model/effort contract Shelbi drives. |
 
 A `model` like `claude-opus-4-8` is a *logical* value; turning it into a launch
@@ -194,6 +194,29 @@ An unrecognized mode ranks as `default`, so a typo can never widen the ceiling.
 A task's `launch.permission_mode` is a request too: it wins over the manifest's
 `permissions_mode`, and both are clamped by the same ceiling, so a task can only
 tighten the project's mode, never loosen it.
+
+### On OpenCode
+
+OpenCode has no permission-mode flag, and its default agent allows everything,
+so Shelbi turns the resolved mode into OpenCode permission rules. It adds them
+to the `build` and `plan` agents in the inline config it already passes
+(`OPENCODE_CONFIG_CONTENT`). Agent rules load after your own and the last match
+wins, so they hold the ceiling over a looser user config.
+
+| Mode | OpenCode rules |
+| --- | --- |
+| none set | none: your own OpenCode settings stand |
+| `plan` | deny everything, then allow `read`, `glob`, `grep`, `webfetch`, `websearch`, `skill` and `question` |
+| `default` | ask before `edit`, `shell`, `webfetch` and `external_directory` |
+| `auto`, `acceptEdits` | allow `edit`, ask before `shell` and `external_directory` |
+| `bypassPermissions` | allow everything, and launch with `--auto` |
+
+Only `bypassPermissions` passes `--auto`; under any other mode Shelbi drops an
+`--auto` written into the runner's `flags`, since it would approve the asks the
+mode exists to raise. An agent whose `settings.json` denies Claude's edit tools
+(`Edit`, `Write` or `NotebookEdit` in `permissions.deny`, as the review agent's
+does) also gets an `edit` deny rule, whatever the mode. In an unattended pane an
+`ask` shows as a blocked dialog.
 
 ## Editing from Settings
 

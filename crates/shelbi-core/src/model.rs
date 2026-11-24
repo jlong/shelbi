@@ -2006,7 +2006,8 @@ impl RunnerKind {
     /// scheduler): Claude runs the verified tmux-submission + OSC-hook
     /// `conventional` contract on every axis; Codex matches it except that it
     /// has no verified hook push, so its message delivery falls to `degraded`
-    /// polling; an unrecognized runner is `degraded` throughout.
+    /// polling; OpenCode's event wake and state reads are `degraded` (see its
+    /// arm); an unrecognized runner is `degraded` throughout.
     pub fn capabilities(self) -> crate::CapabilityLadder {
         use crate::IntegrationMode::{Conventional, Degraded};
         match self {
@@ -2024,13 +2025,18 @@ impl RunnerKind {
                 message_delivery: Degraded,
                 resume: Conventional,
             },
-            // OpenCode runs the same contract as Claude through Shelbi's
-            // project plugin: the plugin writes the `shelbi:<state>` title
-            // markers and pushes drained messages into the session.
+            // OpenCode's worker plugin writes the `shelbi:<state>` title
+            // markers and pushes drained messages into the session, so
+            // context, messages and resume match Claude. Two axes don't:
+            // - event wake: an OpenCode orchestrator only drains events on
+            //   its heartbeat (no awareness plugin delivers them yet).
+            // - state: Claude's usage-limit detection doesn't read an
+            //   OpenCode pane, so a limit-stalled pane reads as idle rather
+            //   than paused, and the orchestrator pane has no markers.
             RunnerKind::OpenCode => crate::CapabilityLadder {
                 context_delivery: Conventional,
-                event_wake: Conventional,
-                state_observation: Conventional,
+                event_wake: Degraded,
+                state_observation: Degraded,
                 message_delivery: Conventional,
                 resume: Conventional,
             },
@@ -5789,8 +5795,14 @@ updated_at: 2026-06-19T00:00:00Z
         // which falls to degraded polling (no verified hook push).
         assert_eq!(RunnerKind::Codex.capabilities().context_delivery, Conventional);
         assert_eq!(RunnerKind::Codex.capabilities().message_delivery, Degraded);
-        // OpenCode's plugin gives it Claude's contract, message push included.
-        assert_eq!(RunnerKind::OpenCode.capabilities(), RunnerKind::Claude.capabilities());
+        // OpenCode's plugin gives it Claude's message push, but its event
+        // wake is the heartbeat and its state reads miss usage limits.
+        let oc = RunnerKind::OpenCode.capabilities();
+        assert_eq!(oc.context_delivery, Conventional);
+        assert_eq!(oc.message_delivery, Conventional);
+        assert_eq!(oc.resume, Conventional);
+        assert_eq!(oc.event_wake, Degraded);
+        assert_eq!(oc.state_observation, Degraded);
         // Generic runners are degraded on every axis.
         let g = RunnerKind::Generic.capabilities();
         assert_eq!(g.context_delivery, Degraded);
