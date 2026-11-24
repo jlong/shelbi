@@ -255,6 +255,7 @@ fn row(name: &str, machine: &str, remote: bool, task: Option<&str>, badge: Works
         current_task: task.map(str::to_string),
         agent: task.map(|_| "developer".into()),
         badge,
+        pause_reason: None,
     }
 }
 

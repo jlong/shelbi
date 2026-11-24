@@ -1159,6 +1159,18 @@ struct Message {
     /// A `diff-comment` reply's text. Newlines are escaped by the JSON.
     #[serde(default)]
     body: Option<String>,
+    /// `runner-state`'s state: `working`, `idle`, `background`, `blocked`
+    /// or `paused`.
+    #[serde(default)]
+    state: Option<String>,
+    /// `runner-state`'s short reason token (`permission`,
+    /// `provider.free-limit`, ...).
+    #[serde(default)]
+    reason: Option<String>,
+    /// `runner-state`'s RFC 3339 time a `paused` runner expects to carry on
+    /// by itself (a scheduled retry).
+    #[serde(default)]
+    until: Option<String>,
 }
 
 /// Dispatch one client frame. `Ok(None)` means "reply with the standard
@@ -1173,6 +1185,7 @@ fn dispatch(raw: &str, daemon: &Daemon) -> Result<Option<String>> {
         "message-pushed" => handle_message_pushed(&msg, daemon).map(|()| None),
         "message-ack" => handle_message_ack(&msg, daemon).map(|()| None),
         "refresh-board" => handle_refresh_board(&msg, daemon).map(Some),
+        "runner-state" => handle_runner_state(&msg).map(|()| None),
         "diff-comment" => Ok(Some(super::super::diff_comment::answer_hub(
             msg.project.as_deref(),
             msg.task_id.as_deref(),
@@ -1196,6 +1209,50 @@ fn dispatch(raw: &str, daemon: &Daemon) -> Result<Option<String>> {
 fn handle_refresh_board(msg: &Message, daemon: &Daemon) -> Result<String> {
     let project = required(msg.project.as_deref(), "refresh-board", "project")?;
     daemon.board.refresh_now(project)
+}
+
+/// A runner's own report of its pane's state (`runner-state`): `project`,
+/// `workspace` and `state` are required; `reason`, `until` and `task_id` are
+/// optional. The latest report is written to
+/// `workspaces/<ws>/runner-state.json`, which the poller prefers over the
+/// pane's title marker (see [`shelbi_state::runner_state`]). Runner-neutral:
+/// OpenCode's Shelbi plugin sends it today, from the hub or over a forwarded
+/// address on an SSH host alike.
+///
+/// The project must be a registered one (a report under a mistyped name
+/// would land where no poller reads it), the workspace a plain name, and the
+/// state one of the five. An unparseable `until` is dropped rather than
+/// failing the report: the state is what matters.
+fn handle_runner_state(msg: &Message) -> Result<()> {
+    let project = required(msg.project.as_deref(), "runner-state", "project")?;
+    let workspace = required(msg.workspace.as_deref(), "runner-state", "workspace")?;
+    let raw_state = required(msg.state.as_deref(), "runner-state", "state")?;
+    let state = shelbi_state::RunnerState::parse(raw_state)
+        .ok_or_else(|| anyhow!("runner-state: unknown state {raw_state:?}"))?;
+    if !shelbi_state::has_project_registration(project).unwrap_or(false) {
+        return Err(anyhow!("runner-state: unknown project {project:?}"));
+    }
+    let until = msg
+        .until
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&chrono::Utc));
+    let report = shelbi_state::RunnerStateReport {
+        state,
+        reason: msg.reason.as_deref().and_then(shelbi_state::sanitize_runner_reason),
+        until,
+        task: msg.task_id.clone().filter(|t| !t.is_empty()),
+        at: chrono::Utc::now(),
+    };
+    shelbi_state::write_runner_state(project, workspace, &report).map_err(|e| anyhow!(e))?;
+    tracing::debug!(
+        project,
+        workspace,
+        state = state.as_str(),
+        reason = report.reason.as_deref().unwrap_or(""),
+        "shelbi daemon: recorded runner state"
+    );
+    Ok(())
 }
 
 fn handle_event(msg: &Message) -> Result<()> {
@@ -1733,6 +1790,71 @@ mod tests {
             line.contains("dropdown") || line.contains("ARIA"),
             "line dropped the question text: {line}"
         );
+    }
+
+    /// `runner-state` writes the workspace's latest report, which the poller
+    /// prefers over the pane title; each report replaces the one before.
+    #[test]
+    fn runner_state_dispatch_records_the_latest_report() {
+        let iso = IsolatedShelbiHome::new("runner-state");
+        std::fs::create_dir_all(iso.home.join("projects")).unwrap();
+        std::fs::write(iso.home.join("projects/demo.yaml"), "name: demo\n").unwrap();
+        let d = test_daemon();
+
+        let reply = dispatch(
+            r#"{"verb":"runner-state","project":"demo","workspace":"alpha","task_id":"t-1","state":"working"}"#,
+            &d,
+        )
+        .expect("runner-state dispatch");
+        assert_eq!(reply, None, "acked with the standard ok");
+        let report = shelbi_state::read_runner_state("demo", "alpha").expect("recorded");
+        assert_eq!(report.state, shelbi_state::RunnerState::Working);
+        assert_eq!(report.task.as_deref(), Some("t-1"));
+        assert_eq!(report.reason, None);
+
+        dispatch(
+            r#"{"verb":"runner-state","project":"demo","workspace":"alpha","task_id":"t-1","state":"paused","reason":"provider.rate-limit","until":"2026-11-24T12:00:05.000Z"}"#,
+            &d,
+        )
+        .expect("paused report");
+        let report = shelbi_state::read_runner_state("demo", "alpha").expect("recorded");
+        assert_eq!(report.state, shelbi_state::RunnerState::Paused);
+        assert_eq!(report.reason.as_deref(), Some("provider.rate-limit"));
+        assert_eq!(
+            report.until.map(|t| t.to_rfc3339()),
+            Some("2026-11-24T12:00:05+00:00".to_string())
+        );
+
+        // A reason is folded to a token, and a bad `until` is dropped, not fatal.
+        dispatch(
+            r#"{"verb":"runner-state","project":"demo","workspace":"alpha","state":"blocked","reason":"perm ission","until":"soon"}"#,
+            &d,
+        )
+        .expect("blocked report");
+        let report = shelbi_state::read_runner_state("demo", "alpha").expect("recorded");
+        assert_eq!(report.state, shelbi_state::RunnerState::Blocked);
+        assert_eq!(report.reason.as_deref(), Some("perm-ission"));
+        assert_eq!(report.until, None);
+        assert_eq!(report.task, None);
+    }
+
+    #[test]
+    fn runner_state_dispatch_rejects_bad_reports() {
+        let iso = IsolatedShelbiHome::new("runner-state-bad");
+        std::fs::create_dir_all(iso.home.join("projects")).unwrap();
+        std::fs::write(iso.home.join("projects/demo.yaml"), "name: demo\n").unwrap();
+        let d = test_daemon();
+        for payload in [
+            r#"{"verb":"runner-state","workspace":"alpha","state":"idle"}"#,
+            r#"{"verb":"runner-state","project":"demo","state":"idle"}"#,
+            r#"{"verb":"runner-state","project":"demo","workspace":"alpha"}"#,
+            r#"{"verb":"runner-state","project":"demo","workspace":"alpha","state":"review"}"#,
+            r#"{"verb":"runner-state","project":"typo","workspace":"alpha","state":"idle"}"#,
+            r#"{"verb":"runner-state","project":"demo","workspace":"../alpha","state":"idle"}"#,
+        ] {
+            assert!(dispatch(payload, &d).is_err(), "accepted {payload}");
+        }
+        assert_eq!(shelbi_state::read_runner_state("demo", "alpha"), None);
     }
 
     /// A long question is stored in full on the hub before its events line

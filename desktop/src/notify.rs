@@ -341,6 +341,7 @@ mod tests {
             current_task: Some("T-9".into()),
             agent: None,
             badge,
+            pause_reason: None,
         }
     }
 

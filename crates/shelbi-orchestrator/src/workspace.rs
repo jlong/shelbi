@@ -3271,9 +3271,11 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
     let runner = with_named_opencode_session(&a.project.name, &a.workspace.name, a.task_id, a.resume, &runner)?;
     // OpenCode's config layer: generated from the fully resolved spec (model,
     // ceiling, edit deny) plus the staged context, and read by the launch.
-    // A clean slate for the observation record: the new pane's plugin
-    // reports in (or doesn't) after the spawn below.
+    // A clean slate for the observation record and the runner's own state
+    // report: the new pane's plugin reports in (or doesn't) after the spawn
+    // below, and a report from the pane this one replaces mustn't speak for it.
     let _ = shelbi_state::clear_observation_degraded(&a.project.name, &a.workspace.name);
+    let _ = shelbi_state::clear_runner_state(&a.project.name, &a.workspace.name);
     if opencode {
         opencode::deploy_opencode_layer(opencode::OpenCodeLayerArgs {
             host: a.host,
@@ -10627,7 +10629,7 @@ statuses:
                 Some(WORKTREE_STARTUP_PROMPT_REL),
             ),
             concat!(
-                r#"env SHELBI_PANE_TTY="$(tty)" "#,
+                "env ",
                 r#"SHELBI_OPENCODE_USER_CONFIG="${SHELBI_OPENCODE_USER_CONFIG-${OPENCODE_CONFIG_CONTENT-}}" "#,
                 r#"OPENCODE_CONFIG_CONTENT='{"agents":{"build":{"permissions":[{"action":"edit","effect":"allow","resource":"*"},{"action":"shell","effect":"ask","resource":"*"},{"action":"external_directory","effect":"ask","resource":"*"}]},"plan":{"permissions":[{"action":"edit","effect":"allow","resource":"*"},{"action":"shell","effect":"ask","resource":"*"},{"action":"external_directory","effect":"ask","resource":"*"}]}}}' "#,
                 r#"OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' OPENCODE_DISABLE_AUTOUPDATE=1 "#,
@@ -10645,7 +10647,7 @@ statuses:
                 Some(OPENCODE_CONFIG_REL),
             ),
             concat!(
-                r#"env SHELBI_PANE_TTY="$(tty)" "#,
+                "env ",
                 r#"SHELBI_OPENCODE_USER_CONFIG="${SHELBI_OPENCODE_USER_CONFIG-${OPENCODE_CONFIG_CONTENT-}}" "#,
                 r#"OPENCODE_CONFIG_CONTENT="$(cat .shelbi/opencode/config.json)" "#,
                 r#"OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' OPENCODE_DISABLE_AUTOUPDATE=1 "#,
@@ -10668,7 +10670,7 @@ statuses:
                 Some(WORKTREE_STARTUP_PROMPT_REL),
             ),
             concat!(
-                r#"env SHELBI_PANE_TTY="$(tty)" "#,
+                "env ",
                 r#"OPENCODE_CLI_CONFIG_CONTENT='{"terminal":{"title":false},"highlights":false}' OPENCODE_DISABLE_AUTOUPDATE=1 "#,
                 r#"opencode --standalone --prompt "$(cat .shelbi/startup-prompt.md)""#,
             ),
@@ -10697,7 +10699,7 @@ statuses:
         let gen1 = shelbi_core::opencode_session_id("demo", "bravo", "fix-it", 1);
         let expected = |id: &str| {
             format!(
-                "env SHELBI_PANE_TTY=\"$(tty)\" SHELBI_OPENCODE_SESSION={id} \
+                "env SHELBI_OPENCODE_SESSION={id} \
                  SHELBI_OPENCODE_TITLE='Shelbi · bravo · fix-it' \
                  OPENCODE_CLI_CONFIG_CONTENT='{{\"terminal\":{{\"title\":false}},\"highlights\":false}}' \
                  OPENCODE_DISABLE_AUTOUPDATE=1 \

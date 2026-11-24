@@ -483,7 +483,11 @@ process.stdin.on("end", () => { stop?.(); process.exit(0); });
             .arg(&plugin)
             .arg(&wt)
             .arg(&prompts)
-            .env("SHELBI_PANE_TTY", "/dev/null")
+            // Never report to the live hub this test may run under.
+            .env_remove("SHELBI_HUB_ADDR")
+            .env_remove("SHELBI_HUB_SOCK")
+            .env_remove("PROJECT")
+            .env_remove("SHELBI_WORKSPACE")
             .env("SHELBI_OPENCODE_SESSION", "ses_shelbi0123456789abcdef0123")
             .env_remove("SHELBI_OPENCODE_TITLE")
             .env_remove("TASK_ID")

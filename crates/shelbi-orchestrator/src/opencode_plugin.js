@@ -6,10 +6,15 @@
 // Code gets from `.claude/settings.local.json`: it runs the same
 // runner-neutral scripts under `.shelbi/hooks/` on OpenCode's session events.
 //
-// - The pane title carries Shelbi's `shelbi:<state>` markers. OpenCode runs
-//   this plugin in a server process with no controlling terminal, so the
-//   launch exports the pane's tty as SHELBI_PANE_TTY and the marker scripts'
-//   output is written there.
+// - The pane's state (working, idle, background, blocked, paused) goes to the
+//   hub as a `runner-state` report over $SHELBI_HUB_ADDR, the address every
+//   Shelbi pane carries (forwarded on an SSH host too). The hub records the
+//   latest report and the poller reads it instead of the pane title, so the
+//   plugin never writes to the pane's terminal. A report says why: `blocked`
+//   names the ask (`permission`, `question`), `paused` the provider's error
+//   (`provider.free-limit`, `provider.rate-limit`, ...) and, for a scheduled
+//   retry, when it runs (`until`). Which event means which state is the
+//   worker's `handlers` table below.
 // - At the end of each turn, and while the session sits idle, `stop.sh`
 //   drains new hub messages; a non-empty batch goes back into the session as
 //   a synthetic message, which starts the next turn.
@@ -53,10 +58,10 @@
 //   goes in with the first turn. The Shelbi CLI owns the queue, its cursor,
 //   its lock and its acks; the plugin only carries batches across.
 //
-// A pane Shelbi didn't launch (no SHELBI_PANE_TTY or SHELBI_OPENCODE_SESSION)
-// is left alone.
+// A pane Shelbi didn't launch (no SHELBI_OPENCODE_SESSION) is left alone.
 import { execFile, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import net from "node:net";
 import {
   closeSync,
   existsSync,
@@ -76,7 +81,7 @@ const HOOKS = ".shelbi/hooks";
 const STATE = ".shelbi/opencode";
 const LOCK = "plugin.lock";
 const BEACON = "plugin.alive";
-const PLUGIN_VERSION = 3;
+const PLUGIN_VERSION = 4;
 const HOOK_TIMEOUT_MS = 15000;
 const IDLE_DRAIN_MS = 5000;
 const INBOX = "inbox";
@@ -87,6 +92,66 @@ const INBOX_POLL_MS = 250;
 const DELIVERY_ID = /^[0-9a-f]{12}[0-9A-Za-z]{14}$/;
 // How far up a subagent's parents the plugin looks for its own session.
 const MAX_SESSION_DEPTH = 8;
+// How long one hub report may take, and the pause before its one retry.
+const HUB_TIMEOUT_MS = 3000;
+const HUB_RETRY_MS = 500;
+
+// OpenCode's error types (`session.execution.failed`, `session.retry.scheduled`)
+// that mean a provider stopped the session on a limit rather than broke. Any
+// other `provider.*` type naming a limit or quota counts too, so a renamed or
+// new limit still reads as paused.
+const LIMIT_ERRORS = new Set([
+  "provider.free-limit",
+  "provider.go-limit",
+  "provider.rate-limit",
+  "provider.quota",
+  "provider.budget-limit",
+  "provider.model-budget-limit",
+  "provider.chatgpt-limit",
+  "provider.chatgpt-workspace-limit",
+]);
+const isLimitError = (type) =>
+  typeof type === "string" &&
+  (LIMIT_ERRORS.has(type) || (type.startsWith("provider.") && /limit|quota/.test(type)));
+
+// Where the hub listens: `unix:<path>` or `tcp:<host>:<port>` in
+// SHELBI_HUB_ADDR, else the legacy SHELBI_HUB_SOCK path. Null when neither is
+// set (a pane Shelbi didn't wire to a hub).
+const hubTarget = (env) => {
+  const addr = env.SHELBI_HUB_ADDR || (env.SHELBI_HUB_SOCK ? `unix:${env.SHELBI_HUB_SOCK}` : "");
+  if (addr.startsWith("unix:")) return { path: addr.slice(5) };
+  if (addr.startsWith("tcp:")) {
+    const hostPort = addr.slice(4);
+    const at = hostPort.lastIndexOf(":");
+    const port = Number(hostPort.slice(at + 1));
+    if (at > 0 && Number.isInteger(port)) return { host: hostPort.slice(0, at), port };
+  }
+  return null;
+};
+
+// Send one JSON line to the hub and resolve whether it answered `ok`. The
+// write side is closed after the line, so a report the hub rejects (it sends
+// no `ok`) ends with the connection instead of waiting out the timeout.
+const sendHub = (target, body) =>
+  new Promise((resolve) => {
+    let reply = "";
+    let settled = false;
+    const done = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    const socket = net.createConnection(target, () => socket.end(`${JSON.stringify(body)}\n`));
+    socket.setTimeout(HUB_TIMEOUT_MS, () => done(false));
+    socket.on("data", (chunk) => {
+      reply += chunk;
+      if (reply.includes("\n")) done(reply.trim() === "ok");
+    });
+    socket.on("end", () => done(reply.trim() === "ok"));
+    socket.on("error", () => done(false));
+  });
+
 // The orchestrator's role (SHELBI_OPENCODE_ROLE).
 const ORCHESTRATOR = "orchestrator";
 // The event stream is restarted after it exits, backing off to this.
@@ -451,12 +516,11 @@ const orchestrate = ({ api, own, root, title, applyTitle, isTitled, release }) =
 export default {
   id: "shelbi",
   setup: async (api) => {
-    const tty = process.env.SHELBI_PANE_TTY;
     const own = process.env.SHELBI_OPENCODE_SESSION;
     const title = process.env.SHELBI_OPENCODE_TITLE;
     const orchestrator = process.env.SHELBI_OPENCODE_ROLE === ORCHESTRATOR;
     const root = api.location?.directory || process.cwd();
-    if (!tty || !own) return;
+    if (!own) return;
     // A worker runs the worktree's hook scripts; without them it has nothing
     // to do. The orchestrator's workdir has none.
     if (!orchestrator && !existsSync(path.join(root, HOOKS))) return;
@@ -479,20 +543,6 @@ export default {
         child.stdin?.on("error", () => {});
         child.stdin?.end(input);
       });
-
-    const writeTitle = (sequence) => {
-      if (!sequence) return;
-      try {
-        const fd = openSync(tty, "w");
-        try {
-          writeSync(fd, sequence);
-        } finally {
-          closeSync(fd);
-        }
-      } catch {
-        // A pane that closed mid-write has nobody left to read the title.
-      }
-    };
 
     // Sessions whose parent is another session are subagents. Their turns
     // don't end the pane's turn, but while one runs the pane is waiting on
@@ -539,12 +589,35 @@ export default {
       return orchestrate({ api, own, root, title, applyTitle, isTitled: () => titled, release });
     }
 
-    let marker = "";
-    const mark = async (state, input) => {
-      if (state === marker) return;
-      marker = state;
-      const script = state === "idle" ? "pane-idle.sh" : `pane-${state}.sh`;
-      writeTitle(await run(script, input));
+    // Report the pane's state to the hub. Reports go out one at a time, in
+    // order, and only when something changed. A send that gets no `ok` is
+    // retried once; past that the hub reconciles from what it sees.
+    const hub = hubTarget(process.env);
+    const project = process.env.PROJECT;
+    const workspace = process.env.SHELBI_WORKSPACE;
+    const task = process.env.TASK_ID;
+    let reported = "";
+    let outbox = Promise.resolve();
+    const report = (state, reason, until) => {
+      const key = `${state}|${reason ?? ""}|${until ?? ""}`;
+      if (key === reported) return outbox;
+      reported = key;
+      if (!hub || !project || !workspace) return outbox;
+      const body = { verb: "runner-state", project, workspace, state };
+      if (task) body.task_id = task;
+      if (reason) body.reason = reason;
+      if (until) body.until = until;
+      outbox = outbox.then(async () => {
+        if (await sendHub(hub, body)) return;
+        await sleep(HUB_RETRY_MS);
+        await sendHub(hub, body);
+      });
+      return outbox;
+    };
+    let current = "";
+    const mark = (state, reason, until) => {
+      current = state;
+      return report(state, reason, until);
     };
 
     // Deliver whatever `stop.sh` drains. Returns whether a batch went in.
@@ -691,16 +764,72 @@ export default {
     await run("session-start.sh");
     await applyTitle();
 
-    const turnEnded = async (sessionID) => {
+    // The pane's turn ended. New messages start the next one; otherwise the
+    // pane is paused on a provider limit, waiting on a subagent it started,
+    // or idle at its prompt.
+    const turnEnded = async (sessionID, paused) => {
       if (await drain(sessionID)) return;
       drainedSize = messageLog ? logSize() : 0;
       idleSession = sessionID;
-      const background = runningChildren.size > 0;
-      // `pane-idle.sh` reads Claude's Stop payload; a non-empty
-      // `background_tasks` list makes it write `shelbi:background`.
-      const payload = background ? '{"background_tasks":[{"type":"subagent"}]}' : "{}";
-      marker = "";
-      await mark("idle", payload);
+      if (paused) return mark("paused", paused);
+      return mark(runningChildren.size > 0 ? "background" : "idle");
+    };
+    const busy = () => {
+      idleSession = null;
+      return mark("working");
+    };
+    const ended = (child, sessionID, paused) => {
+      if (child) {
+        runningChildren.delete(sessionID);
+        return;
+      }
+      return turnEnded(sessionID, paused);
+    };
+
+    // What each OpenCode event means for the pane, keyed by event type. Each
+    // handler gets the event's data, whether it came from a subagent, and
+    // its session id. Only the pane's session and its subagents reach here.
+    // Event names and shapes are OpenCode 2.4's (recorded in
+    // `tests/fixtures/opencode/events-2.4.1.sse`, which a contract test
+    // replays through this table).
+    const handlers = {
+      // An ask, from the session or a subagent, waits on a person.
+      "permission.asked": () => mark("blocked", "permission"),
+      "form.created": () => mark("blocked", "question"),
+      // Answered either way, the turn carries on. (A rejected ask is a
+      // `permission.replied` with `reply: "reject"`.)
+      "permission.replied": () => current === "blocked" && mark("working"),
+      "form.replied": () => current === "blocked" && mark("working"),
+      "form.cancelled": () => current === "blocked" && mark("working"),
+      "session.execution.started": (_data, child, sessionID) => {
+        if (child) {
+          runningChildren.add(sessionID);
+          return;
+        }
+        if (!titled) applyTitle();
+        return busy();
+      },
+      "session.execution.succeeded": (_data, child, sessionID) => ended(child, sessionID),
+      "session.execution.interrupted": (_data, child, sessionID) => ended(child, sessionID),
+      // A failed turn on a provider limit is paused, not idle: nobody needs
+      // to answer anything, the limit has to lift.
+      "session.execution.failed": (data, child, sessionID) => {
+        const type = data.error?.type;
+        return ended(child, sessionID, isLimitError(type) ? type : null);
+      },
+      // OpenCode waits out a retryable provider error by itself (a rate
+      // limit, an overloaded provider) and says until when.
+      "session.retry.scheduled": (data, child) => {
+        if (child) return;
+        idleSession = null;
+        const at = Number(data.at);
+        const until = Number.isFinite(at) && at > 0 ? new Date(at).toISOString() : undefined;
+        return mark("paused", data.error?.type || "retry", until);
+      },
+      // Work moving again: a retried step, new input, a tool call.
+      "session.step.started": (_data, child) => !child && busy(),
+      "session.inbox.enqueued": (_data, child) => !child && busy(),
+      "session.tool.called": (_data, child) => !child && busy(),
     };
 
     const handle = async (event) => {
@@ -715,43 +844,12 @@ export default {
         if (data.sessionID === own && title && data.title !== title) await applyTitle();
         return;
       }
+      const handler = handlers[type];
+      if (!handler) return;
       // A form's session is on the form itself.
       const sessionID = data.sessionID ?? data.form?.sessionID;
       if (!sessionID || !(await ours(sessionID))) return;
-      if (type === "permission.asked" || type === "form.created") {
-        await mark("blocked");
-        return;
-      }
-      // Answered either way, the turn carries on. (A rejected ask is a
-      // `permission.replied` with `reply: "reject"`.)
-      if (type === "permission.replied" || type === "form.replied" || type === "form.cancelled") {
-        if (marker === "blocked") await mark("working");
-        return;
-      }
-      if (!type.startsWith("session.")) return;
-      const child = sessionID !== own;
-      if (type === "session.execution.started") {
-        if (!child && !titled) await applyTitle();
-        if (child) {
-          runningChildren.add(data.sessionID);
-          return;
-        }
-        idleSession = null;
-        await mark("working");
-        return;
-      }
-      if (type.startsWith("session.execution.")) {
-        if (child) {
-          runningChildren.delete(data.sessionID);
-          return;
-        }
-        await turnEnded(data.sessionID);
-        return;
-      }
-      if (!child && (type === "session.inbox.enqueued" || type === "session.tool.called")) {
-        idleSession = null;
-        await mark("working");
-      }
+      await handler(data, sessionID !== own, sessionID);
     };
 
     const controller = new AbortController();
@@ -760,11 +858,12 @@ export default {
         await handle(event).catch(() => {});
       }
     })().catch(() => {});
-    return () => {
+    return async () => {
       controller.abort();
       if (timer) clearInterval(timer);
       clearInterval(inboxTimer);
       release();
+      await outbox.catch(() => {});
     };
   },
 };

@@ -86,7 +86,7 @@ projects that configure their fleets differently.
 | --- | --- |
 | `claude` | Claude Code. `--model` and `--effort` flags; `--append-system-prompt` wiring. |
 | `codex` | Codex. `--model` and `-c model_reasoning_effort="…"`; the `max` level maps to Codex `xhigh`. |
-| `opencode` | OpenCode 2.3 or later. The model is a `provider/model` id, set on the `build` and `plan` agents in the config layer Shelbi passes as `OPENCODE_CONFIG_CONTENT` (see [On OpenCode](#on-opencode)), because the TUI has no model flag. The launch also turns off OpenCode's terminal title, which would overwrite Shelbi's state markers, and its autoupdate. Each task runs on a session Shelbi names (`--session ses_shelbi…`, shown in the workspace's `status.yaml`): a resume reopens it and a fresh start begins a new one. Shelbi titles it `Shelbi · <workspace> · <task>` and archives it (it isn't deleted) once the task is done. Reasoning effort becomes the model's same-named variant (`provider/model#high`) when OpenCode on the hub reports that variant for the model; otherwise, and on a remote machine, the model's own default stands and the dispatch logs `opencode-effort-unapplied`. |
+| `opencode` | OpenCode 2.3 or later. The model is a `provider/model` id, set on the `build` and `plan` agents in the config layer Shelbi passes as `OPENCODE_CONFIG_CONTENT` (see [On OpenCode](#on-opencode)), because the TUI has no model flag. The launch also turns off OpenCode's terminal title and its autoupdate. Each task runs on a session Shelbi names (`--session ses_shelbi…`, shown in the workspace's `status.yaml`): a resume reopens it and a fresh start begins a new one. Shelbi titles it `Shelbi · <workspace> · <task>` and archives it (it isn't deleted) once the task is done. Reasoning effort becomes the model's same-named variant (`provider/model#high`) when OpenCode on the hub reports that variant for the model; otherwise, and on a remote machine, the model's own default stands and the dispatch logs `opencode-effort-unapplied`. |
 | `generic` | Any other runner. No model/effort contract Shelbi drives. |
 
 A `model` like `claude-opus-4-8` is a *logical* value; turning it into a launch
@@ -228,6 +228,13 @@ mode exists to raise. An agent whose `settings.json` denies Claude's edit tools
 (`Edit`, `Write` or `NotebookEdit` in `permissions.deny`, as the review agent's
 does) also gets an `edit` deny rule, whatever the mode. In an unattended pane an
 `ask` shows as a blocked dialog.
+
+Shelbi's plugin reports the pane's state to the hub rather than through the pane
+title: working, idle, waiting on a subagent, blocked on a permission ask or a
+question, or paused. A turn that stops on a provider limit (OpenCode's free
+limit, a quota, a rate limit) shows as Paused with the limit beside the
+workspace in the sidebar, and so does a retry OpenCode has scheduled, until it
+runs. The plugin never writes to the pane's terminal.
 
 ## Editing from Settings
 

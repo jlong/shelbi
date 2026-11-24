@@ -1591,6 +1591,7 @@ mod tests {
             current_task: task.map(str::to_string),
             agent: task.map(|_| "developer".into()),
             badge,
+            pause_reason: None,
         }
     }
 
@@ -1986,6 +1987,7 @@ mod render_tests {
             current_task: task.map(str::to_string),
             agent: task.map(|_| "developer".into()),
             badge,
+            pause_reason: None,
         }
     }
 

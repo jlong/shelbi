@@ -54,8 +54,7 @@ pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
 /// OpenCode's launch line:
 ///
 /// ```text
-/// env SHELBI_PANE_TTY="$(tty)" \
-///     [SHELBI_OPENCODE_SESSION=<id> SHELBI_OPENCODE_TITLE='Shelbi · <ws> · <task>'] \
+/// env [SHELBI_OPENCODE_SESSION=<id> SHELBI_OPENCODE_TITLE='Shelbi · <ws> · <task>'] \
 ///     [SHELBI_OPENCODE_ROLE=orchestrator] \
 ///     [SHELBI_OPENCODE_USER_CONFIG="${SHELBI_OPENCODE_USER_CONFIG-${OPENCODE_CONFIG_CONTENT-}}" \
 ///      OPENCODE_CONFIG_CONTENT=<config>] \
@@ -74,9 +73,9 @@ pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
 ///   instead of running a worker's hook scripts.
 /// - `--standalone` gives the pane a private server instead of OpenCode's
 ///   shared background service, so the server (and Shelbi's plugin inside it)
-///   inherits this pane's environment (`TASK_ID`, the hub address). That
-///   server has no controlling terminal, so the pane's tty path is exported
-///   as [`OPENCODE_PANE_TTY_ENV`] for the plugin's `shelbi:<state>` markers.
+///   inherits this pane's environment (`TASK_ID`, the hub address). The
+///   plugin reports the pane's state to the hub (`runner-state`) over that
+///   address; it never writes to the pane's terminal.
 /// - `OPENCODE_CONFIG_CONTENT` is the config layer OpenCode merges over the
 ///   user's own files (see [`RunnerAdapter::opencode_config`]): inline, or
 ///   `"$(cat <file>)"` for a worker's generated layer. It is left out when
@@ -87,9 +86,9 @@ pub fn opencode_launch_command(spec: &AgentRunnerSpec) -> String {
 ///   inherits Shelbi's layer, so a `shelbi` command run from inside the pane
 ///   reads the user's value back from there ([`opencode_user_config`])
 ///   rather than mistaking Shelbi's layer for it.
-/// - `OPENCODE_CLI_CONFIG_CONTENT` turns off OpenCode's terminal title,
-///   which otherwise overwrites the plugin's `shelbi:<state>` markers with
-///   `OC | <session title>`, and its highlights.
+/// - `OPENCODE_CLI_CONFIG_CONTENT` turns off OpenCode's terminal title
+///   (`OC | <session title>`), so the pane keeps the title its session
+///   gives it, and its highlights.
 /// - `OPENCODE_DISABLE_AUTOUPDATE` keeps a worker pane from updating the
 ///   binary under the hub mid-task.
 /// - `--auto` (answer every remaining ask) is passed only for a
@@ -137,7 +136,7 @@ pub fn opencode_launch_command_with(spec: &AgentRunnerSpec, config: OpenCodeConf
     // `env`, not a bare `VAR=value` prefix: callers run the line as
     // `exec {launch}`, and after `exec` an assignment word is taken for the
     // command name.
-    let mut parts = vec!["env".to_string(), format!("{OPENCODE_PANE_TTY_ENV}=\"$(tty)\"")];
+    let mut parts = vec!["env".to_string()];
     if let Some(session) = &session {
         parts.push(format!("{OPENCODE_SESSION_ENV}={}", shell_escape(session)));
         if let Some(title) = &title {
@@ -556,8 +555,9 @@ pub fn with_opencode_session(spec: &AgentRunnerSpec, id: &str, title: &str) -> A
     out
 }
 
-/// OpenCode's TUI config for a Shelbi pane: no terminal title (it would
-/// overwrite the `shelbi:<state>` markers) and no highlights.
+/// OpenCode's TUI config for a Shelbi pane: no terminal title (the pane keeps
+/// the one its session gives it; Shelbi reads OpenCode's state from the
+/// plugin's hub reports, not the title) and no highlights.
 pub const OPENCODE_CLI_CONFIG_CONTENT: &str = r#"{"terminal":{"title":false},"highlights":false}"#;
 
 /// Return a copy of `spec` that denies file edits, for an agent whose
@@ -590,10 +590,6 @@ fn flag_value(flags: &[String], names: &[&str]) -> Option<String> {
     }
     found
 }
-
-/// Environment variable carrying the pane's tty path into an OpenCode
-/// session, where Shelbi's plugin writes its title markers.
-pub const OPENCODE_PANE_TTY_ENV: &str = "SHELBI_PANE_TTY";
 
 /// OpenCode flag that runs a private server for this TUI rather than
 /// attaching to the shared background service.
@@ -1727,13 +1723,13 @@ mod tests {
     fn opencode_launch_exports_the_pane_tty_and_runs_standalone() {
         assert_eq!(
             launch_command(&opencode(&[])),
-            format!(r#"env SHELBI_PANE_TTY="$(tty)" {OC_ENV} opencode --standalone"#)
+            format!(r#"env {OC_ENV} opencode --standalone"#)
         );
         // A flag the user already wrote isn't doubled, and with no ceiling a
         // hand-written `--auto` is the user's own choice.
         assert_eq!(
             launch_command(&opencode(&["--standalone", "--auto"])),
-            format!(r#"env SHELBI_PANE_TTY="$(tty)" {OC_ENV} opencode --standalone --auto"#)
+            format!(r#"env {OC_ENV} opencode --standalone --auto"#)
         );
     }
 
@@ -1754,7 +1750,7 @@ mod tests {
         assert_eq!(
             launch_command(&spec),
             format!(
-                r#"env SHELBI_PANE_TTY="$(tty)" {KEEP_USER} OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{{"model":"anthropic/claude-sonnet-4-5"}},"plan":{{"model":"anthropic/claude-sonnet-4-5"}}}}}}' {OC_ENV} opencode --standalone"#
+                r#"env {KEEP_USER} OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{{"model":"anthropic/claude-sonnet-4-5"}},"plan":{{"model":"anthropic/claude-sonnet-4-5"}}}}}}' {OC_ENV} opencode --standalone"#
             )
         );
         // A hand-written `--model=` form is honored the same way, and a quote
@@ -2039,7 +2035,7 @@ mod tests {
         assert_eq!(
             opencode_launch_command_with(&spec, OpenCodeConfigSource::File(".shelbi/opencode/config.json")),
             format!(
-                r#"env SHELBI_PANE_TTY="$(tty)" {KEEP_USER} OPENCODE_CONFIG_CONTENT="$(cat .shelbi/opencode/config.json)" {OC_ENV} opencode --standalone --auto"#
+                r#"env {KEEP_USER} OPENCODE_CONFIG_CONTENT="$(cat .shelbi/opencode/config.json)" {OC_ENV} opencode --standalone --auto"#
             )
         );
     }
@@ -2182,14 +2178,14 @@ mod tests {
         assert_eq!(
             launch_command(&spec),
             format!(
-                r#"env SHELBI_PANE_TTY="$(tty)" SHELBI_OPENCODE_SESSION=ses_shelbi0123456789abcdef0123 SHELBI_OPENCODE_TITLE='Shelbi · bravo · fix' {KEEP_USER} OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{agent},"plan":{agent}}}}}' {OC_ENV} opencode --standalone --session ses_shelbi0123456789abcdef0123"#
+                r#"env SHELBI_OPENCODE_SESSION=ses_shelbi0123456789abcdef0123 SHELBI_OPENCODE_TITLE='Shelbi · bravo · fix' {KEEP_USER} OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{agent},"plan":{agent}}}}}' {OC_ENV} opencode --standalone --session ses_shelbi0123456789abcdef0123"#
             )
         );
         let bypass = with_permission_mode(&opencode(&[]), Some("bypassPermissions"));
         assert_eq!(
             launch_command(&bypass),
             format!(
-                r#"env SHELBI_PANE_TTY="$(tty)" {KEEP_USER} OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{{"permissions":[{{"action":"*","effect":"allow","resource":"*"}}]}},"plan":{{"permissions":[{{"action":"*","effect":"allow","resource":"*"}}]}}}}}}' {OC_ENV} opencode --standalone --auto"#
+                r#"env {KEEP_USER} OPENCODE_CONFIG_CONTENT='{{"agents":{{"build":{{"permissions":[{{"action":"*","effect":"allow","resource":"*"}}]}},"plan":{{"permissions":[{{"action":"*","effect":"allow","resource":"*"}}]}}}}}}' {OC_ENV} opencode --standalone --auto"#
             )
         );
     }
@@ -2246,14 +2242,14 @@ mod tests {
         assert_eq!(
             launch_command(&named),
             format!(
-                "env SHELBI_PANE_TTY=\"$(tty)\" SHELBI_OPENCODE_SESSION=ses_shelbiaaaa \
+                "env SHELBI_OPENCODE_SESSION=ses_shelbiaaaa \
                  SHELBI_OPENCODE_TITLE='Shelbi · w · t' {OC_ENV} opencode --standalone --session ses_shelbiaaaa"
             )
         );
         // A hand-written `--continue` with no named session is the user's call.
         assert_eq!(
             launch_command(&opencode(&["--continue"])),
-            format!(r#"env SHELBI_PANE_TTY="$(tty)" {OC_ENV} opencode --standalone --continue"#)
+            format!(r#"env {OC_ENV} opencode --standalone --continue"#)
         );
         // Other runners are untouched.
         assert_eq!(with_opencode_session(&runner("claude"), "ses_x", "t").flags, Vec::<String>::new());
@@ -2268,7 +2264,7 @@ mod tests {
         assert_eq!(
             launch_command(&spec),
             format!(
-                "env SHELBI_PANE_TTY=\"$(tty)\" SHELBI_OPENCODE_SESSION=ses_shelbiorchaaaa \
+                "env SHELBI_OPENCODE_SESSION=ses_shelbiorchaaaa \
                  SHELBI_OPENCODE_TITLE='Shelbi · p · orchestrator' SHELBI_OPENCODE_ROLE=orchestrator \
                  {OC_ENV} opencode --standalone --session ses_shelbiorchaaaa"
             )
@@ -2278,7 +2274,7 @@ mod tests {
 
     /// Regression: the orchestrator and worker launchers run the line as
     /// `exec {launch}`, where a bare `VAR=value` prefix becomes the command
-    /// name ("no such file or directory: SHELBI_PANE_TTY=…"). Run a real shell
+    /// name ("no such file or directory: OPENCODE_CLI_CONFIG_CONTENT=…"). Run a real shell
     /// over the exact line, with `true` standing in for the OpenCode binary.
     #[test]
     fn opencode_launch_line_survives_exec() {

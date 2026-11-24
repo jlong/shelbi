@@ -676,6 +676,7 @@ fn workspace_row(name: &str, task: Option<&str>, badge: WorkspaceBadge) -> Works
         current_task: task.map(str::to_string),
         agent: task.map(|_| "developer".into()),
         badge,
+        pause_reason: None,
     }
 }
 

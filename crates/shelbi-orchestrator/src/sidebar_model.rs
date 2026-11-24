@@ -156,6 +156,7 @@ pub fn read_config_skeleton(project: &str) -> Option<SidebarModel> {
                 current_task: None,
                 agent: None,
                 badge: WorkspaceBadge::Loading,
+                pause_reason: None,
             })
         })
         .collect();
@@ -229,6 +230,9 @@ fn load_workspaces(project: &str, in_progress: &[IssueFile]) -> anyhow::Result<V
                 .unwrap_or_else(|| DEFAULT_TASK_AGENT.to_string())
         });
         let badge = derive_workspace_badge(project, &workspace.name, current_task.as_deref());
+        let pause_reason = (badge == WorkspaceBadge::Paused)
+            .then(|| runner_pause_reason(project, &workspace.name, current_task.as_deref()))
+            .flatten();
         out.push(WorkspaceRow {
             name: workspace.name.clone(),
             machine: workspace.machine.clone(),
@@ -236,9 +240,20 @@ fn load_workspaces(project: &str, in_progress: &[IssueFile]) -> anyhow::Result<V
             current_task,
             agent,
             badge,
+            pause_reason,
         });
     }
     Ok(out)
+}
+
+/// Why a paused workspace's runner says it is paused, in words: its own
+/// `runner-state` report ([`shelbi_state::runner_state`]), when that report is
+/// a pause for the task the slot serves. A pause the runner didn't report
+/// (Claude's on-screen usage limit) has no reason here.
+fn runner_pause_reason(project: &str, workspace: &str, task: Option<&str>) -> Option<String> {
+    let report = shelbi_state::read_runner_state(project, workspace)
+        .filter(|r| r.state == shelbi_state::RunnerState::Paused && r.is_for_task(task))?;
+    shelbi_app::view::pause_reason_label(report.reason.as_deref(), report.until.is_some())
 }
 
 /// Pick the badge for a workspace from the task-board signal + its on-disk
@@ -513,6 +528,51 @@ mod tests {
         assert_eq!(waiting.glyph(), "⋯");
         assert_eq!(question, WorkspaceBadge::AwaitingInput);
         assert_eq!(question.glyph(), "?");
+    }
+
+    /// A paused slot whose runner reported why (an OpenCode pane on its
+    /// provider's free limit) carries the reason in words; a report for
+    /// another task, or one that isn't a pause, carries none.
+    #[test]
+    fn a_runner_reported_pause_names_its_reason() {
+        use shelbi_state::{RunnerState, RunnerStateReport};
+        let _g = crate::test_lock::acquire();
+        let home = std::env::temp_dir().join(format!(
+            "shelbi-sidebar-pause-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(home.join("projects/demo")).unwrap();
+        std::env::set_var("SHELBI_HOME", &home);
+        let reason_for = |state, reason: &str, task: &str, until: bool| {
+            shelbi_state::write_runner_state(
+                "demo",
+                "alpha",
+                &RunnerStateReport {
+                    state,
+                    reason: Some(reason.into()),
+                    until: until.then(chrono::Utc::now),
+                    task: Some(task.into()),
+                    at: chrono::Utc::now(),
+                },
+            )
+            .unwrap();
+            runner_pause_reason("demo", "alpha", Some("t1"))
+        };
+        let free = reason_for(RunnerState::Paused, "provider.free-limit", "t1", false);
+        let retry = reason_for(RunnerState::Paused, "provider.internal", "t1", true);
+        let other_task = reason_for(RunnerState::Paused, "provider.free-limit", "t0", false);
+        let blocked = reason_for(RunnerState::Blocked, "permission", "t1", false);
+        std::env::remove_var("SHELBI_HOME");
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert_eq!(free.as_deref(), Some("Free limit"));
+        assert_eq!(retry.as_deref(), Some("Retrying"));
+        assert_eq!(other_task, None);
+        assert_eq!(blocked, None);
     }
 
     #[test]

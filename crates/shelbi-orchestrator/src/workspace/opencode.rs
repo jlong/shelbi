@@ -832,11 +832,15 @@ console.log(JSON.stringify(out));
             .arg(&script)
             .arg(&plugin)
             .arg(&wt)
-            .env("SHELBI_PANE_TTY", "/dev/null")
             .env("SHELBI_OPENCODE_SESSION", "ses_shelbi0123456789abcdef0123")
             .env_remove("SHELBI_OPENCODE_TITLE")
             .env_remove("SHELBI_OPENCODE_ROLE")
             .env_remove("TASK_ID")
+            // Never report to the live hub this test may run under.
+            .env_remove("SHELBI_HUB_ADDR")
+            .env_remove("SHELBI_HUB_SOCK")
+            .env_remove("PROJECT")
+            .env_remove("SHELBI_WORKSPACE")
             .output()
             .unwrap();
         assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
@@ -953,7 +957,11 @@ input.on("close", () => { stop?.(); setTimeout(() => process.exit(0), 100); });
             .arg(&plugin)
             .arg(&workdir)
             .arg(&calls)
-            .env("SHELBI_PANE_TTY", "/dev/null")
+            // Never report to the live hub this test may run under.
+            .env_remove("SHELBI_HUB_ADDR")
+            .env_remove("SHELBI_HUB_SOCK")
+            .env_remove("PROJECT")
+            .env_remove("SHELBI_WORKSPACE")
             .env("SHELBI_OPENCODE_SESSION", OWN)
             .env("SHELBI_OPENCODE_ROLE", "orchestrator")
             .env("SHELBI_BIN", &shelbi)
@@ -1059,6 +1067,153 @@ input.on("close", () => { stop?.(); setTimeout(() => process.exit(0), 100); });
 
         drop(stdin);
         assert!(node.wait().unwrap().success());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The contract test for OpenCode's event names. Replays a real
+    /// OpenCode 2.4.1 event stream (`tests/fixtures/opencode/events-2.4.1.sse`:
+    /// a rate-limit retry, a permission ask, a question form, a free-usage
+    /// limit, an interrupt and a subagent) through the plugin under Node, with
+    /// a fake hub socket, and checks the `runner-state` reports it sends. An
+    /// OpenCode release that renames an event the plugin relies on breaks
+    /// this sequence once the fixture is re-recorded. Skipped without `node`.
+    #[test]
+    fn opencode_plugin_replays_recorded_events() {
+        if std::process::Command::new("node").arg("--version").output().is_err() {
+            eprintln!("node not found; skipping the plugin contract test");
+            return;
+        }
+        let root = tmp("plugin-contract");
+        let wt = root.join("wt");
+        let hooks = wt.join(".shelbi/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        for hook in ["session-start.sh", "stop.sh"] {
+            let path = hooks.join(hook);
+            std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plugin = root.join("plugin.mjs");
+        std::fs::write(&plugin, OPENCODE_PLUGIN_JS).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opencode/events-2.4.1.sse");
+        // Short: a Unix socket path has a ~100 byte limit on macOS.
+        let sock = std::env::temp_dir().join(format!("shb-occ-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let script = root.join("replay.mjs");
+        std::fs::write(
+            &script,
+            r#"
+import net from "node:net";
+import { readFileSync } from "node:fs";
+const [pluginPath, wt, fixture, sock] = process.argv.slice(2);
+const events = readFileSync(fixture, "utf8")
+  .split("\n")
+  .filter((l) => l.startsWith("data: "))
+  .map((l) => JSON.parse(l.slice(6)));
+const reports = [];
+const hub = net.createServer((c) => {
+  let buf = "";
+  c.on("data", (d) => {
+    buf += d;
+    if (buf.includes("\n")) {
+      reports.push(JSON.parse(buf.trim()));
+      c.end("ok\n");
+    }
+  });
+});
+await new Promise((r) => hub.listen(sock, r));
+let replayed;
+const done = new Promise((r) => (replayed = r));
+const plugin = (await import(pluginPath)).default;
+const api = {
+  location: { directory: wt },
+  session: {
+    get: async () => ({}),
+    update: async () => {},
+    synthetic: async () => {},
+  },
+  event: {
+    subscribe: (opts) => ({
+      async *[Symbol.asyncIterator]() {
+        for (const event of events) yield event;
+        // Reached once the plugin handled the last event.
+        replayed();
+        await new Promise((r) => opts.signal.addEventListener("abort", r));
+      },
+    }),
+  },
+};
+const cleanup = await plugin.setup(api);
+await done;
+await cleanup();
+hub.close();
+console.log(JSON.stringify(reports));
+"#,
+        )
+        .unwrap();
+        let out = std::process::Command::new("node")
+            .arg(&script)
+            .arg(&plugin)
+            .arg(&wt)
+            .arg(&fixture)
+            .arg(&sock)
+            .env("SHELBI_HUB_ADDR", format!("unix:{}", sock.display()))
+            .env_remove("SHELBI_HUB_SOCK")
+            .env("PROJECT", "demo")
+            .env("SHELBI_WORKSPACE", "alpha")
+            .env("TASK_ID", "t-1")
+            .env("SHELBI_OPENCODE_SESSION", "ses_shelbirec00000000000001")
+            .env_remove("SHELBI_OPENCODE_TITLE")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_file(&sock);
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let reports: Vec<serde_json::Value> =
+            serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+        for r in &reports {
+            assert_eq!(r["verb"], "runner-state", "{r}");
+            assert_eq!(r["project"], "demo", "{r}");
+            assert_eq!(r["workspace"], "alpha", "{r}");
+            assert_eq!(r["task_id"], "t-1", "{r}");
+        }
+        let seen: Vec<String> = reports
+            .iter()
+            .map(|r| match r["reason"].as_str() {
+                Some(reason) => format!("{}:{reason}", r["state"].as_str().unwrap()),
+                None => r["state"].as_str().unwrap().to_string(),
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                // Rate limited, OpenCode retries by itself, then asks to run a shell.
+                "working",
+                "paused:provider.rate-limit",
+                "working",
+                "blocked:permission",
+                "working",
+                "idle",
+                // A question form.
+                "working",
+                "blocked:question",
+                "working",
+                "idle",
+                // The free usage limit ends the turn paused, not idle.
+                "working",
+                "paused:provider.free-limit",
+                // Interrupted by the user.
+                "working",
+                "idle",
+                // A subagent runs inside the turn; only the pane's own turn ends it.
+                "working",
+                "idle",
+            ],
+            "{reports:?}"
+        );
+        // The retry says when it runs; the free limit has no such time.
+        let until = reports[1]["until"].as_str().expect("retry time");
+        assert!(chrono::DateTime::parse_from_rfc3339(until).is_ok(), "{until}");
+        assert!(reports[11].get("until").is_none(), "{}", reports[11]);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
