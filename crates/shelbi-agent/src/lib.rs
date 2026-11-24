@@ -97,7 +97,10 @@ pub fn opencode_launch_command_with(spec: &AgentRunnerSpec, config: OpenCodeConf
     let session = flag_value(&spec.flags, OPENCODE_SESSION_FLAGS);
     let title = flag_value(&spec.flags, &[OPENCODE_TITLE_FLAG]);
     let mut flags: Vec<String> =
-        strip_flag_with_value(&spec.flags, &["--model", "-m", OPENCODE_PERMISSION_FLAG, OPENCODE_TITLE_FLAG])
+        strip_flag_with_value(
+            &spec.flags,
+            &["--model", "-m", OPENCODE_PERMISSION_FLAG, OPENCODE_TITLE_FLAG, OPENCODE_EFFORT_FLAG],
+        )
             .into_iter()
             .filter(|f| f != OPENCODE_DENY_EDITS_FLAG && f != OPENCODE_STANDALONE_FLAG)
             .collect();
@@ -180,10 +183,13 @@ pub struct OpenCodeLayer {
     pub skills: Vec<String>,
     /// Plugin directories.
     pub plugins: Vec<String>,
-    /// The model variant (`provider/model#variant`) for the agents' model.
-    /// Only set when OpenCode reports that variant for the model (see
-    /// [`opencode_effort_variant`]).
-    pub variant: Option<String>,
+    /// The models OpenCode lists, each with the variants it reports (the
+    /// hub's `opencode models` probe, the one the effort picker reads).
+    /// Empty when the probe couldn't answer. A resolved effort becomes the
+    /// model's `#variant` only when the spec's model is listed here with a
+    /// same-named variant ([`opencode_effort_variant`]); otherwise no variant
+    /// is set, never a guessed one.
+    pub models: Vec<shelbi_core::OpenCodeModel>,
     /// The user's own `OPENCODE_CONFIG_CONTENT` from the launch environment
     /// ([`opencode_user_config`]), merged under Shelbi's keys.
     pub user_config: Option<String>,
@@ -198,6 +204,11 @@ pub struct OpenCodeConfig {
     /// The user's own value wasn't a JSON object, so it was left out rather
     /// than merged. The caller says so: the user's settings didn't apply.
     pub user_config_unreadable: bool,
+    /// An effort was resolved for the launch but set no variant: there's no
+    /// model, the model isn't listed ([`OpenCodeLayer::models`] is empty when
+    /// the probe failed), or it reports no variant of that name. The model's
+    /// own default stands; the caller says so.
+    pub effort_unapplied: Option<ReasoningEffort>,
 }
 
 impl RunnerAdapter {
@@ -222,6 +233,11 @@ impl RunnerAdapter {
     ///   settings govern.
     /// - The model goes on the `build` and `plan` agents rather than the
     ///   root, because OpenCode drops a root model's `#variant`.
+    /// - A resolved effort ([`opencode_effort`]) becomes that `#variant` only
+    ///   when [`OpenCodeLayer::models`] lists the model with a same-named
+    ///   variant. Otherwise the bare model is written and the effort is
+    ///   reported back in [`OpenCodeConfig::effort_unapplied`]. A model that
+    ///   already names a variant keeps it.
     /// - The permission rules ([`opencode_permission_rules`]) go on both
     ///   agents. Agent rules load after the user's and the project's, and
     ///   the last matching rule wins, so they hold the ceiling.
@@ -236,7 +252,7 @@ impl RunnerAdapter {
         use serde_json::{Map, Value};
 
         if !self.is_opencode() {
-            return OpenCodeConfig { json: None, user_config_unreadable: false };
+            return OpenCodeConfig { json: None, user_config_unreadable: false, effort_unapplied: None };
         }
         let strings = |list: &[String]| Value::Array(list.iter().cloned().map(Value::String).collect());
 
@@ -251,11 +267,22 @@ impl RunnerAdapter {
             shelbi.insert("plugins".into(), strings(&layer.plugins));
         }
 
-        let model = flag_value(&spec.flags, &["--model", "-m"]).map(|model| {
-            match layer.variant.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
-                Some(variant) if !model.contains('#') => format!("{model}#{variant}"),
-                _ => model,
-            }
+        let model = opencode_model(spec);
+        let effort = opencode_effort(spec);
+        // A model the user already pinned a variant on keeps it.
+        let variant = match (&model, effort) {
+            (Some(model), Some(effort)) if !model.contains('#') => layer
+                .models
+                .iter()
+                .find(|m| m.id == *model)
+                .and_then(|m| opencode_effort_variant(effort, &m.variants)),
+            _ => None,
+        };
+        let pinned = model.as_deref().is_some_and(|m| m.contains('#'));
+        let effort_unapplied = effort.filter(|_| variant.is_none() && !pinned);
+        let model = model.map(|model| match &variant {
+            Some(variant) => format!("{model}#{variant}"),
+            None => model,
         });
         let mode = flag_value(&spec.flags, &[OPENCODE_PERMISSION_FLAG]);
         let deny_edits = spec.flags.iter().any(|f| f == OPENCODE_DENY_EDITS_FLAG);
@@ -288,13 +315,14 @@ impl RunnerAdapter {
         if shelbi.is_empty() {
             // Nothing of Shelbi's: the user's value (if any) stands unchanged
             // in the environment, so there's nothing to set.
-            return OpenCodeConfig { json: None, user_config_unreadable };
+            return OpenCodeConfig { json: None, user_config_unreadable, effort_unapplied };
         }
         let mut merged = Value::Object(user.unwrap_or_default());
         merge_under(&mut merged, Value::Object(shelbi));
         OpenCodeConfig {
             json: Some(merged.to_string()),
             user_config_unreadable,
+            effort_unapplied,
         }
     }
 }
@@ -336,6 +364,21 @@ pub fn opencode_effort_variant(effort: ReasoningEffort, available: &[String]) ->
         .iter()
         .find(|v| v.trim().eq_ignore_ascii_case(name))
         .map(|_| name.to_string())
+}
+
+/// The model an OpenCode launch's config layer sets (its logical `--model`),
+/// if any.
+pub fn opencode_model(spec: &AgentRunnerSpec) -> Option<String> {
+    flag_value(&spec.flags, &["--model", "-m"])
+}
+
+/// The effort [`RunnerAdapter::with_reasoning_effort`] resolved for an
+/// OpenCode launch (its logical `--shelbi-effort` flag), if any.
+pub fn opencode_effort(spec: &AgentRunnerSpec) -> Option<ReasoningEffort> {
+    let value = flag_value(&spec.flags, &[OPENCODE_EFFORT_FLAG])?;
+    [ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High, ReasoningEffort::Max]
+        .into_iter()
+        .find(|e| value.trim().eq_ignore_ascii_case(e.as_str()))
 }
 
 /// One OpenCode permission rule: `effect` for `action` on `resource`.
@@ -419,6 +462,11 @@ const OPENCODE_PERMISSION_FLAG: &str = "--permission-mode";
 /// The logical flag [`with_edits_denied`] adds for [`opencode_launch_command`]
 /// to append an `edit` deny. It never reaches the OpenCode argv.
 const OPENCODE_DENY_EDITS_FLAG: &str = "--shelbi-deny-edits";
+
+/// The logical flag [`RunnerAdapter::with_reasoning_effort`] carries an
+/// OpenCode launch's effort on, for [`RunnerAdapter::opencode_config`] to
+/// turn into the model's `#variant`. It never reaches the OpenCode argv.
+const OPENCODE_EFFORT_FLAG: &str = "--shelbi-effort";
 
 /// OpenCode's switch that approves every ask the config doesn't deny.
 const OPENCODE_AUTO_FLAG: &str = "--auto";
@@ -789,11 +837,16 @@ impl RunnerAdapter {
             }
             // OpenCode's effort is a per-model variant (`provider/model#high`)
             // in the config layer, and only one OpenCode reports for that
-            // model counts (see `opencode_effort_variant`). The pickers list
-            // the variants (`shelbi_app::opencode_models`, on the client), but
-            // no launch sets `OpenCodeLayer::variant` yet, so effort is left
-            // to the user's OpenCode settings.
-            RunnerKind::OpenCode | RunnerKind::Generic => spec.clone(),
+            // model counts (see `opencode_effort_variant`). The effort rides
+            // a logical flag until `opencode_config` has the model list.
+            RunnerKind::OpenCode => {
+                let mut out = spec.clone();
+                out.flags = strip_flag_with_value(&spec.flags, &[OPENCODE_EFFORT_FLAG]);
+                out.flags.push(OPENCODE_EFFORT_FLAG.into());
+                out.flags.push(effort.as_str().into());
+                out
+            }
+            RunnerKind::Generic => spec.clone(),
         }
     }
 
@@ -1708,10 +1761,13 @@ mod tests {
 
         // Model, variant and ceiling land on both agents.
         let spec = with_permission_mode(
-            &with_model(&opencode(&[]), Some("anthropic/claude-sonnet-5-5")),
+            &with_reasoning_effort(
+                &with_model(&opencode(&[]), Some("anthropic/claude-sonnet-5-5")),
+                Some(ReasoningEffort::High),
+            ),
             Some("acceptEdits"),
         );
-        let layer = OpenCodeLayer { variant: Some("high".into()), ..worker_layer() };
+        let layer = OpenCodeLayer { models: models(&[("anthropic/claude-sonnet-5-5", &["high"])]), ..worker_layer() };
         let config = config_json(&spec, &layer).unwrap();
         let agent = serde_json::json!({
             "model": "anthropic/claude-sonnet-5-5#high",
@@ -1724,8 +1780,11 @@ mod tests {
         assert_eq!(config["agents"], serde_json::json!({ "build": agent, "plan": agent }));
 
         // A model the user already pinned a variant on keeps it.
-        let spec = with_model(&opencode(&[]), Some("p/m#max"));
-        let config = config_json(&spec, &layer).unwrap();
+        let spec = with_reasoning_effort(&with_model(&opencode(&[]), Some("p/m#max")), Some(ReasoningEffort::High));
+        let layer = OpenCodeLayer { models: models(&[("p/m", &["high", "max"])]), ..worker_layer() };
+        let config = RunnerAdapter::for_spec(&spec).opencode_config(&spec, &layer);
+        assert_eq!(config.effort_unapplied, None);
+        let config: serde_json::Value = serde_json::from_str(&config.json.unwrap()).unwrap();
         assert_eq!(config["agents"]["build"]["model"], "p/m#max");
 
         // Only a ceiling: permissions without a model.
@@ -1836,6 +1895,85 @@ mod tests {
         );
     }
 
+    fn models(list: &[(&str, &[&str])]) -> Vec<shelbi_core::OpenCodeModel> {
+        list.iter()
+            .map(|(id, variants)| shelbi_core::OpenCodeModel {
+                id: id.to_string(),
+                variants: variants.iter().map(|v| v.to_string()).collect(),
+            })
+            .collect()
+    }
+
+    /// The model each agent gets for `spec` over a layer listing `listed`,
+    /// and the effort the generator reports it couldn't apply.
+    fn agent_models(spec: &AgentRunnerSpec, listed: &[(&str, &[&str])]) -> (serde_json::Value, Option<ReasoningEffort>) {
+        let layer = OpenCodeLayer { models: models(listed), ..worker_layer() };
+        let config = RunnerAdapter::for_spec(spec).opencode_config(spec, &layer);
+        let json: serde_json::Value = serde_json::from_str(&config.json.unwrap()).unwrap();
+        assert!(json.get("model").is_none(), "the root never carries the model: {json}");
+        let agents = json.get("agents").cloned().unwrap_or_default();
+        assert_eq!(agents.get("build"), agents.get("plan"), "{json}");
+        (agents.get("build").and_then(|a| a.get("model")).cloned().unwrap_or_default(), config.effort_unapplied)
+    }
+
+    /// Decision Q4: an effort becomes the same-named variant on both agents'
+    /// model, only when OpenCode reports that variant for the model.
+    #[test]
+    fn opencode_effort_sets_the_variant_the_model_reports() {
+        let listed: &[(&str, &[&str])] = &[
+            ("anthropic/claude-sonnet-5-5", &["low", "medium", "high", "max"]),
+            ("openai/gpt-6", &["minimal", "high"]),
+            ("local/plain", &[]),
+        ];
+        let spec = |model: &str, effort| with_reasoning_effort(&with_model(&opencode(&[]), Some(model)), effort);
+
+        // Each level lands on its same-named variant.
+        for (effort, variant) in [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+            (ReasoningEffort::Max, "max"),
+        ] {
+            assert_eq!(
+                agent_models(&spec("anthropic/claude-sonnet-5-5", Some(effort)), listed),
+                (serde_json::json!(format!("anthropic/claude-sonnet-5-5#{variant}")), None),
+            );
+        }
+        assert_eq!(
+            agent_models(&spec("openai/gpt-6", Some(ReasoningEffort::High)), listed),
+            (serde_json::json!("openai/gpt-6#high"), None),
+        );
+
+        // A variant the model doesn't report: the bare model, never a guess.
+        assert_eq!(
+            agent_models(&spec("openai/gpt-6", Some(ReasoningEffort::Max)), listed),
+            (serde_json::json!("openai/gpt-6"), Some(ReasoningEffort::Max)),
+        );
+        assert_eq!(
+            agent_models(&spec("local/plain", Some(ReasoningEffort::Low)), listed),
+            (serde_json::json!("local/plain"), Some(ReasoningEffort::Low)),
+        );
+        // A model the list doesn't have.
+        assert_eq!(
+            agent_models(&spec("other/model", Some(ReasoningEffort::High)), listed),
+            (serde_json::json!("other/model"), Some(ReasoningEffort::High)),
+        );
+        // The probe failed: no list, no variant.
+        assert_eq!(
+            agent_models(&spec("anthropic/claude-sonnet-5-5", Some(ReasoningEffort::High)), &[]),
+            (serde_json::json!("anthropic/claude-sonnet-5-5"), Some(ReasoningEffort::High)),
+        );
+        // An effort with no model has nothing to put a variant on.
+        let no_model = with_reasoning_effort(&opencode(&[]), Some(ReasoningEffort::High));
+        assert_eq!(agent_models(&no_model, listed), (serde_json::Value::Null, Some(ReasoningEffort::High)));
+
+        // No effort: no variant, and nothing to report.
+        assert_eq!(
+            agent_models(&spec("anthropic/claude-sonnet-5-5", None), listed),
+            (serde_json::json!("anthropic/claude-sonnet-5-5"), None),
+        );
+    }
+
     #[test]
     fn opencode_effort_maps_only_onto_a_variant_the_model_reports() {
         let variants: Vec<String> = vec!["minimal".into(), "high".into(), "Max".into()];
@@ -1850,7 +1988,10 @@ mod tests {
     #[test]
     fn opencode_worker_launch_reads_the_layer_file() {
         let spec = with_edits_denied(
-            &with_permission_mode(&with_model(&opencode(&[]), Some("p/m")), Some("bypassPermissions")),
+            &with_permission_mode(
+                &with_reasoning_effort(&with_model(&opencode(&[]), Some("p/m")), Some(ReasoningEffort::High)),
+                Some("bypassPermissions"),
+            ),
             true,
         );
         assert_eq!(
@@ -2036,8 +2177,15 @@ mod tests {
         // session, which can be the user's): it names its session.
         assert!(with_continue(&opencode(&[]), true).flags.is_empty());
         assert!(with_continue(&opencode(&[]), false).flags.is_empty());
-        // Effort has no OpenCode switch Shelbi can drive.
-        assert!(with_reasoning_effort(&opencode(&[]), Some(ReasoningEffort::High)).flags.is_empty());
+        // Effort rides a logical flag (the config layer turns it into the
+        // model's variant), and a newer effort replaces an older one.
+        let high = with_reasoning_effort(&opencode(&[]), Some(ReasoningEffort::High));
+        assert_eq!(opencode_effort(&high), Some(ReasoningEffort::High));
+        let low = with_reasoning_effort(&high, Some(ReasoningEffort::Low));
+        assert_eq!(low.flags, vec!["--shelbi-effort".to_string(), "low".to_string()]);
+        assert_eq!(opencode_effort(&low), Some(ReasoningEffort::Low));
+        assert_eq!(with_reasoning_effort(&high, None), high);
+        assert_eq!(opencode_effort(&opencode(&[])), None);
     }
 
     /// The named session replaces any session or `--continue` a user wrote,
