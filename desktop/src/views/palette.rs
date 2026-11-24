@@ -134,6 +134,7 @@ pub fn icon_for(entry: &Entry, theme: &Theme) -> (Icon, Hsla) {
         "view:changelog" => icons::ROCKET_LAUNCH,
         "view:activity" => icons::BOLT,
         "view:machines" => icons::SERVER_STACK,
+        "view:jobs" => icons::QUEUE_LIST,
         "action:detach" => icons::BOLT_SLASH,
         "action:toggle-zen" if entry.label.ends_with(" off") => icons::TOGGLE_ON,
         "action:toggle-zen" => icons::TOGGLE_OFF,
@@ -673,6 +674,10 @@ mod tests {
             icon_for(&entry("view:activity", None), &theme).0,
             crate::views::sidebar::nav_icon(&shelbi_app::nav::View::Activity)
         );
+        // Jobs keeps its nav drawing too, one no other view uses.
+        let jobs = crate::views::sidebar::nav_icon(&shelbi_app::nav::View::Jobs);
+        assert_eq!(icon_for(&entry("view:jobs", None), &theme).0, jobs);
+        assert_eq!(jobs, icons::QUEUE_LIST);
         let mut zen = entry("action:toggle-zen", None);
         zen.label = "Turn Zen Mode on".into();
         assert_eq!(icon_for(&zen, &theme).0, icons::TOGGLE_OFF);

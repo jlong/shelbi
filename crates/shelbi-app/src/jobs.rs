@@ -22,11 +22,20 @@
 //! ([`JobRow::bar`], [`crate::estimate`]) and reads `Overdue` once the
 //! estimate is used up, and a finished one keeps its actual duration against
 //! the estimate as text.
+//!
+//! The desktop screen draws richer rows from the same model: a running job's
+//! last output line ([`JobRow::activity_line`], read off the job's
+//! `output.log` by [`read_local`]), its kind ([`JobRow::kind_label`]) and who
+//! started it ([`JobRow::started_by_label`]); a finished job's failure inline
+//! ([`JobRow::failure_detail`]) and how long ago it finished
+//! ([`JobRow::finished_ago`]), the history grouped by day
+//! ([`JobsModel::finished_days`]).
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
-use shelbi_state::awareness::{job_id_number, short_sha, Job, JobKind, JobRecord, JobStatus};
+use shelbi_state::awareness::{job_id_number, short_sha, Job, JobKind, JobRecord, JobStarter, JobStatus};
 
 use crate::estimate::{EstimateProgress, OVERDUE_TONE};
 use crate::theme::Tone;
@@ -43,6 +52,30 @@ pub const FINISHED_HEADING: &str = "Finished";
 /// What the screen says with no jobs, running or finished.
 pub const EMPTY_TEXT: &str = "No jobs yet. `shelbi job run` and `shelbi job watch` add them here.";
 
+/// The desktop empty state's heading, over [`EMPTY_DETAIL`] and
+/// [`EMPTY_COMMAND`].
+pub const EMPTY_TITLE: &str = "No jobs yet";
+
+/// The desktop empty state's sentence.
+pub const EMPTY_DETAIL: &str =
+    "Builds, test runs and PR watches started with shelbi job show up here while they run, then stay as history.";
+
+/// The command the empty state offers to copy.
+pub const EMPTY_COMMAND: &str = "shelbi job run --label \"<label>\" -- <command>";
+
+/// The section over the running jobs (the desktop screen's).
+pub const RUNNING_HEADING: &str = "Running";
+
+/// What a running command job shows before it has printed anything.
+pub const NO_OUTPUT_YET: &str = "No output yet";
+
+/// How much of a running job's `output.log` [`last_output_line`] reads back
+/// from its end to find the last line.
+const TAIL_READ: u64 = 8 * 1024;
+
+/// The longest last line a row keeps (a client cuts it to its width).
+const TAIL_MAX_CHARS: usize = 400;
+
 /// What the screen says in a remote project's window: its store is on the
 /// far machine and nothing reads it over the link yet.
 pub const REMOTE_TEXT: &str = "Jobs aren't available for remote projects yet.";
@@ -54,8 +87,10 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_secs(3);
 /// One read of a project's jobs ([`crate::source::ProjectSource::jobs`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobsRead {
-    /// The running jobs (store order) and the finished ones (the history).
-    Jobs { running: Vec<Job>, finished: Vec<JobRecord> },
+    /// The running jobs (store order) and the finished ones (the history),
+    /// with each running command's last output line by job id (`tails`: a
+    /// job missing from it has printed nothing yet).
+    Jobs { running: Vec<Job>, finished: Vec<JobRecord>, tails: BTreeMap<String, String> },
     /// The source can't read the store (a remote project's window).
     Unavailable,
     /// The store couldn't be read or parsed.
@@ -68,10 +103,84 @@ pub fn read_local(project: &str) -> JobsRead {
         Ok(store) => store.jobs,
         Err(e) => return JobsRead::Failed(e.to_string()),
     };
+    let tails = running
+        .iter()
+        .filter(|j| j.kind == JobKind::Command)
+        .filter_map(|j| {
+            let path = shelbi_state::awareness::job_output_path(project, &j.id).ok()?;
+            Some((j.id.clone(), last_output_line(&path)?))
+        })
+        .collect();
     match shelbi_state::awareness::read_job_history(project) {
-        Ok(finished) => JobsRead::Jobs { running, finished },
+        Ok(finished) => JobsRead::Jobs { running, finished, tails },
         Err(e) => JobsRead::Failed(e.to_string()),
     }
+}
+
+/// The last line of the log at `path` that has something on it, as a row
+/// shows it: escape sequences dropped, a line a carriage return redrew (a
+/// progress bar) as its last drawing, trimmed and cut to a few hundred
+/// characters. `None` when the log is missing or blank. Reads only the
+/// log's last few KiB.
+pub fn last_output_line(path: &std::path::Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(TAIL_READ);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8_lossy(&bytes);
+    // A read that starts mid-file starts mid-line: skip that partial line,
+    // unless it is the only one.
+    let lines: Vec<&str> = text.split('\n').collect();
+    let skip = usize::from(start > 0 && lines.len() > 1);
+    lines[skip..].iter().rev().find_map(|line| {
+        let drawn = line.rsplit('\r').map(strip_escapes).find(|seg| !seg.trim().is_empty())?;
+        Some(truncate(drawn.trim(), TAIL_MAX_CHARS))
+    })
+}
+
+/// `text` without its terminal escape sequences (CSI `ESC [ … final`, OSC
+/// `ESC ] … BEL` or `ESC \\`, and two-byte escapes) or other control
+/// characters; a tab is a space.
+pub fn strip_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    // Parameters and intermediates, then one final byte.
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // A character set designation: one more byte.
+                Some('(' | ')' | '*' | '+') => {
+                    chars.next();
+                }
+                _ => {}
+            },
+            '\t' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// What the screen shows.
@@ -95,10 +204,10 @@ impl JobsModel {
     /// The model for one read.
     pub fn from_read(read: JobsRead) -> Self {
         match read {
-            JobsRead::Jobs { running, finished } if running.is_empty() && finished.is_empty() => {
+            JobsRead::Jobs { running, finished, .. } if running.is_empty() && finished.is_empty() => {
                 JobsModel::Empty
             }
-            JobsRead::Jobs { running, finished } => JobsModel::Rows(job_rows(&running, &finished)),
+            JobsRead::Jobs { running, finished, tails } => JobsModel::Rows(job_rows(&running, &finished, &tails)),
             JobsRead::Unavailable => JobsModel::Unavailable,
             JobsRead::Failed(e) => JobsModel::Failed(e),
         }
@@ -115,6 +224,36 @@ impl JobsModel {
     /// How many rows are running jobs (they come first).
     pub fn running_count(&self) -> usize {
         self.rows().iter().filter(|r| r.is_running()).count()
+    }
+
+    /// The running jobs' rows, newest first.
+    pub fn running(&self) -> &[JobRow] {
+        &self.rows()[..self.running_count()]
+    }
+
+    /// The finished jobs' rows, newest finished first.
+    pub fn finished(&self) -> &[JobRow] {
+        &self.rows()[self.running_count()..]
+    }
+
+    /// The finished jobs by the day they finished in `tz`, as of `now`: for
+    /// each day, the index into [`finished`](Self::finished) of its first
+    /// row and its heading ([`day_label`]: `Today`, `Yesterday`, `Mon, Nov
+    /// 16`, ...). Empty with no finished jobs.
+    pub fn finished_days<Tz: TimeZone>(&self, now: DateTime<Utc>, tz: &Tz) -> Vec<(usize, String)>
+    where
+        Tz::Offset: std::fmt::Display,
+    {
+        let mut days: Vec<(usize, String)> = Vec::new();
+        let mut last = None;
+        for (i, row) in self.finished().iter().enumerate() {
+            let day = row.end(now).with_timezone(tz).date_naive();
+            if last != Some(day) {
+                last = Some(day);
+                days.push((i, day_label(row.end(now), now, tz)));
+            }
+        }
+        days
     }
 
     /// The index of the first finished row, where the [`FINISHED_HEADING`]
@@ -177,8 +316,17 @@ pub struct JobRow {
     pub state: JobState,
     /// What it is: only a command job has a terminal and output.
     pub kind: JobKind,
+    /// What it runs or watches: the command line, pid, commit sha or PR.
+    pub target: String,
     /// How long it was expected to take (`--estimate`), if it had a say.
     pub estimate: Option<Duration>,
+    /// The worker that started it; `None` is the orchestrator (or a shell
+    /// outside any workspace).
+    pub started_by: Option<JobStarter>,
+    /// A running command's last output line ([`last_output_line`]), or a
+    /// finished job's `detail` (its last line, why it never started, a
+    /// watch's failing check).
+    pub last_line: Option<String>,
 }
 
 impl JobRow {
@@ -191,7 +339,10 @@ impl JobRow {
             started_at: job.started_at,
             state: JobState::Running,
             kind: job.kind,
+            target: job.target.clone(),
             estimate: job.estimate,
+            started_by: job.started_by.clone(),
+            last_line: None,
         }
     }
 
@@ -208,7 +359,10 @@ impl JobRow {
                 finished_at: record.finished_at,
             },
             kind: record.kind,
+            target: record.target.clone(),
             estimate: record.estimate,
+            started_by: record.started_by.clone(),
+            last_line: record.detail.as_deref().map(one_line).filter(|d| !d.trim().is_empty()),
         }
     }
 
@@ -253,6 +407,92 @@ impl JobRow {
                 JobStatus::Canceled => Tone::Yellow,
                 JobStatus::Exited | JobStatus::Closed => Tone::Gray,
             },
+        }
+    }
+
+    /// What kind of job it is, with what it watches: `Command`, `PR #2265`,
+    /// `CI d482e3f` (a short sha), `PID 4242`.
+    pub fn kind_label(&self) -> String {
+        match self.kind {
+            JobKind::Command => "Command".to_string(),
+            JobKind::Pr => format!("PR #{}", self.target.trim_start_matches('#')),
+            JobKind::Ci => format!("CI {}", sha7(&self.target)),
+            JobKind::Pid => format!("PID {}", self.target),
+        }
+    }
+
+    /// Who started it: `alpha`, the worker's workspace, or `orchestrator`.
+    pub fn started_by_label(&self) -> String {
+        match &self.started_by {
+            Some(s) => s.workspace.clone(),
+            None => "orchestrator".to_string(),
+        }
+    }
+
+    /// What a running job is doing, in a line: a command's last output line
+    /// ([`NO_OUTPUT_YET`] before it prints any), or what a watch waits for.
+    pub fn activity_line(&self) -> String {
+        match self.kind {
+            JobKind::Command => self.last_line.clone().unwrap_or_else(|| NO_OUTPUT_YET.to_string()),
+            JobKind::Pr => format!("Waiting for PR #{} to merge or close", self.target.trim_start_matches('#')),
+            JobKind::Ci => format!("Waiting for CI on {}", sha7(&self.target)),
+            JobKind::Pid => format!("Waiting for process {} to exit", self.target),
+        }
+    }
+
+    /// Whether [`activity_line`](Self::activity_line) is program output
+    /// (drawn in monospace) rather than Shelbi's own words.
+    pub fn activity_is_output(&self) -> bool {
+        self.kind == JobKind::Command && self.last_line.is_some()
+    }
+
+    /// Why a failed job failed, for its history row: its exit code and its
+    /// last line (`exit 101 · test result: FAILED`), either alone. `None`
+    /// unless it failed.
+    pub fn failure_detail(&self) -> Option<String> {
+        let JobState::Finished { status: JobStatus::Failed, exit_code, .. } = self.state else {
+            return None;
+        };
+        let exit = exit_code.filter(|c| *c != 0).map(|c| format!("exit {c}"));
+        match (exit, self.last_line.as_deref()) {
+            (Some(e), Some(l)) => Some(format!("{e} · {l}")),
+            (Some(e), None) => Some(e),
+            (None, Some(l)) => Some(l.to_string()),
+            (None, None) => Some("Failed".to_string()),
+        }
+    }
+
+    /// How long ago it finished (`12m ago`); empty while it runs.
+    pub fn finished_ago(&self, now: DateTime<Utc>) -> String {
+        match self.state {
+            JobState::Running => String::new(),
+            JobState::Finished { finished_at, .. } => age_label(finished_at, now),
+        }
+    }
+
+    /// The estimate's share used, as a whole percent (`35%`), capped at
+    /// 100; `None` without a bar.
+    pub fn percent(&self, now: DateTime<Utc>) -> Option<u32> {
+        self.bar(now).map(|p| (p.fraction() * 100.0).round() as u32)
+    }
+
+    /// The words beside a running job's bar: the share used (`35%`), or by
+    /// how much it is past its estimate (`9m over`). `None` without a bar.
+    pub fn bar_label(&self, now: DateTime<Utc>) -> Option<String> {
+        let bar = self.bar(now)?;
+        if bar.overdue() {
+            let over = bar.elapsed.saturating_sub(bar.estimate);
+            return Some(format!("{} over", duration_label(over)));
+        }
+        self.percent(now).map(|p| format!("{p}%"))
+    }
+
+    /// Who started it, in full: `alpha (developer, task-7)`, or
+    /// `orchestrator`.
+    pub fn started_by_detail(&self) -> String {
+        match &self.started_by {
+            Some(s) => s.describe(),
+            None => "orchestrator".to_string(),
         }
     }
 
@@ -538,8 +778,11 @@ fn command_text_for(kind: JobKind, target: &str) -> String {
 /// Every job's row: the running ones newest started first, then the
 /// finished ones newest finished first. Jobs in the same second keep the
 /// newer id first (ids count up).
-pub fn job_rows(running: &[Job], finished: &[JobRecord]) -> Vec<JobRow> {
-    let mut active: Vec<JobRow> = running.iter().map(JobRow::from_job).collect();
+pub fn job_rows(running: &[Job], finished: &[JobRecord], tails: &BTreeMap<String, String>) -> Vec<JobRow> {
+    let mut active: Vec<JobRow> = running
+        .iter()
+        .map(|j| JobRow { last_line: tails.get(&j.id).cloned(), ..JobRow::from_job(j) })
+        .collect();
     active.sort_by(|a, b| {
         b.started_at
             .cmp(&a.started_at)
@@ -584,6 +827,31 @@ where
         local.format("%b %-d, %-I:%M %p").to_string()
     } else {
         local.format("%b %-d %Y, %-I:%M %p").to_string()
+    }
+}
+
+/// A commit's short form, as git abbreviates it: its first 7 characters.
+fn sha7(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
+}
+
+/// The heading over the jobs that finished on `t`'s day in `tz`, as of
+/// `now`: `Today`, `Yesterday`, then the weekday and date within the week
+/// (`Mon, Nov 16`), the date within the year (`Nov 12`), and the year too
+/// before that (`Dec 30, 2025`).
+pub fn day_label<Tz: TimeZone>(t: DateTime<Utc>, now: DateTime<Utc>, tz: &Tz) -> String
+where
+    Tz::Offset: std::fmt::Display,
+{
+    let day = t.with_timezone(tz).date_naive();
+    let today = now.with_timezone(tz).date_naive();
+    let back = (today - day).num_days();
+    match back {
+        i64::MIN..=0 => "Today".to_string(),
+        1 => "Yesterday".to_string(),
+        2..=6 => day.format("%a, %b %-d").to_string(),
+        _ if day.year() == today.year() => day.format("%b %-d").to_string(),
+        _ => day.format("%b %-d, %Y").to_string(),
     }
 }
 
@@ -644,6 +912,10 @@ mod tests {
         }
     }
 
+    fn read(running: Vec<Job>, finished: Vec<JobRecord>) -> JobsRead {
+        JobsRead::Jobs { running, finished, tails: BTreeMap::new() }
+    }
+
     fn at(h: u32, m: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 11, 14, h, m, 0).unwrap()
     }
@@ -691,7 +963,7 @@ mod tests {
             // Same second as j2: the newer id first.
             job("j10", JobKind::Command, "c", None, at(14, 6)),
         ];
-        let ids: Vec<String> = job_rows(&jobs, &[]).into_iter().map(|r| r.id).collect();
+        let ids: Vec<String> = job_rows(&jobs, &[], &BTreeMap::new()).into_iter().map(|r| r.id).collect();
         assert_eq!(ids, ["j10", "j2", "j3", "j1"]);
     }
 
@@ -711,23 +983,17 @@ mod tests {
             record("j2", JobStatus::Failed, Some(3), at(8, 0), at(12, 0)),
             record("j3", JobStatus::Canceled, None, at(10, 0), at(10, 5)),
         ];
-        let model = JobsModel::from_read(JobsRead::Jobs { running, finished });
+        let model = JobsModel::from_read(read(running, finished));
         let ids: Vec<&str> = model.rows().iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["j9", "j8", "j2", "j3", "j1"]);
         assert_eq!(model.running_count(), 2);
         assert_eq!(model.finished_start(), Some(2));
         assert_eq!(model.summary().as_deref(), Some("2 running · 3 finished"));
 
-        let only_done = JobsModel::from_read(JobsRead::Jobs {
-            running: vec![],
-            finished: vec![record("j1", JobStatus::Ok, Some(0), at(9, 0), at(9, 30))],
-        });
+        let only_done = JobsModel::from_read(read(vec![], vec![record("j1", JobStatus::Ok, Some(0), at(9, 0), at(9, 30))]));
         assert_eq!(only_done.finished_start(), Some(0));
         assert_eq!(only_done.summary().as_deref(), Some("1 finished"));
-        let only_running = JobsModel::from_read(JobsRead::Jobs {
-            running: vec![job("j1", JobKind::Pid, "1", None, at(9, 0))],
-            finished: vec![],
-        });
+        let only_running = JobsModel::from_read(read(vec![job("j1", JobKind::Pid, "1", None, at(9, 0))], vec![]));
         assert_eq!((only_running.finished_start(), only_running.summary().as_deref()), (None, Some("1 running")));
     }
 
@@ -766,14 +1032,11 @@ mod tests {
 
     #[test]
     fn the_model_names_each_state() {
-        let none = JobsRead::Jobs { running: vec![], finished: vec![] };
+        let none = read(vec![], vec![]);
         assert_eq!(JobsModel::from_read(none), JobsModel::Empty);
         assert_eq!(JobsModel::Empty.message().as_deref(), Some(EMPTY_TEXT));
         assert_eq!(JobsModel::from_read(JobsRead::Unavailable).message().as_deref(), Some(REMOTE_TEXT));
-        let rows = JobsModel::from_read(JobsRead::Jobs {
-            running: vec![job("j1", JobKind::Pid, "1", None, at(1, 0))],
-            finished: vec![],
-        });
+        let rows = JobsModel::from_read(read(vec![job("j1", JobKind::Pid, "1", None, at(1, 0))], vec![]));
         assert_eq!(rows.rows().len(), 1);
         assert_eq!(rows.message(), None);
         assert!(JobsModel::from_read(JobsRead::Failed("bad json".into()))
@@ -877,6 +1140,142 @@ mod tests {
         assert_eq!(row.duration_tone(now), Some(OVERDUE_TONE), "it ran over");
         r.finished_at = at(14, 8);
         assert_eq!(JobRow::from_record(&r).duration_tone(now), None);
+    }
+
+    #[test]
+    fn a_row_names_its_kind_and_who_started_it() {
+        let sha = "d482e3fe5a1b2c3d4e5f60718293a4b5c6d7e8f9";
+        let kinds = [
+            (JobKind::Command, "cargo test", "Command"),
+            (JobKind::Pr, "2265", "PR #2265"),
+            (JobKind::Pr, "#2265", "PR #2265"),
+            (JobKind::Ci, sha, "CI d482e3f"),
+            (JobKind::Ci, "abc", "CI abc"),
+            (JobKind::Pid, "4242", "PID 4242"),
+        ];
+        for (kind, target, want) in kinds {
+            assert_eq!(JobRow::from_job(&job("j1", kind, target, None, at(14, 0))).kind_label(), want);
+        }
+        let mut j = job("j1", JobKind::Command, "make", None, at(14, 0));
+        assert_eq!(JobRow::from_job(&j).started_by_label(), "orchestrator");
+        j.started_by = Some(JobStarter { workspace: "alpha".into(), agent: Some("developer".into()), task: None });
+        assert_eq!(JobRow::from_job(&j).started_by_label(), "alpha");
+        assert_eq!(JobRow::from_job(&j).started_by_detail(), "alpha (developer)");
+        let r = JobRecord::finished(&j, JobStatus::Ok, at(14, 2));
+        assert_eq!(JobRow::from_record(&r).started_by_label(), "alpha", "the history keeps it");
+    }
+
+    #[test]
+    fn a_running_job_says_what_it_is_doing() {
+        let cmd = job("j1", JobKind::Command, "make", None, at(14, 0));
+        let mut tails = BTreeMap::new();
+        let rows = job_rows(std::slice::from_ref(&cmd), &[], &tails);
+        assert_eq!((rows[0].activity_line().as_str(), rows[0].activity_is_output()), (NO_OUTPUT_YET, false));
+        tails.insert("j1".to_string(), "Compiling shelbi v0.42.0".to_string());
+        let rows = job_rows(&[cmd], &[], &tails);
+        assert_eq!((rows[0].activity_line().as_str(), rows[0].activity_is_output()), ("Compiling shelbi v0.42.0", true));
+        let pr = JobRow::from_job(&job("j2", JobKind::Pr, "2265", None, at(14, 0)));
+        assert_eq!((pr.activity_line().as_str(), pr.activity_is_output()), ("Waiting for PR #2265 to merge or close", false));
+        let ci = JobRow::from_job(&job("j3", JobKind::Ci, "d482e3fe5a1b2c3d4e5f", None, at(14, 0)));
+        assert_eq!(ci.activity_line(), "Waiting for CI on d482e3f");
+        let pid = JobRow::from_job(&job("j4", JobKind::Pid, "4242", None, at(14, 0)));
+        assert_eq!(pid.activity_line(), "Waiting for process 4242 to exit");
+    }
+
+    #[test]
+    fn a_failed_job_says_why_inline() {
+        let mut r = record("j1", JobStatus::Failed, Some(101), at(14, 0), at(14, 7));
+        r.detail = Some("test result: FAILED. 3 passed; 1 failed".into());
+        let row = JobRow::from_record(&r);
+        assert_eq!(row.failure_detail().as_deref(), Some("exit 101 · test result: FAILED. 3 passed; 1 failed"));
+        assert_eq!(row.finished_ago(at(14, 19)), "12m ago");
+        r.detail = None;
+        assert_eq!(JobRow::from_record(&r).failure_detail().as_deref(), Some("exit 101"));
+        r.exit_code = None;
+        r.detail = Some("the job runner exited without recording a result".into());
+        assert_eq!(
+            JobRow::from_record(&r).failure_detail().as_deref(),
+            Some("the job runner exited without recording a result")
+        );
+        r.detail = Some("  ".into());
+        assert_eq!(JobRow::from_record(&r).failure_detail().as_deref(), Some("Failed"));
+        let ok = JobRow::from_record(&record("j2", JobStatus::Ok, Some(0), at(14, 0), at(14, 1)));
+        assert_eq!((ok.failure_detail(), ok.finished_ago(at(14, 1))), (None, "just now".to_string()));
+        let running = JobRow::from_job(&job("j3", JobKind::Command, "x", None, at(14, 0)));
+        assert_eq!((running.failure_detail(), running.finished_ago(at(15, 0))), (None, String::new()));
+    }
+
+    #[test]
+    fn the_percent_used_tracks_the_bar() {
+        let mut j = job("j1", JobKind::Command, "cargo test", None, at(14, 0));
+        j.set_estimate(Duration::from_secs(1200));
+        let row = JobRow::from_job(&j);
+        assert_eq!(row.percent(at(14, 7)), Some(35));
+        assert_eq!(row.percent(at(15, 0)), Some(100), "capped once overdue");
+        assert_eq!(row.bar_label(at(14, 7)).as_deref(), Some("35%"));
+        assert_eq!(row.bar_label(at(14, 29)).as_deref(), Some("9m over"));
+        let plain = JobRow::from_job(&job("j2", JobKind::Command, "x", None, at(14, 0)));
+        assert_eq!((plain.percent(at(14, 7)), plain.bar_label(at(14, 7))), (None, None));
+    }
+
+    #[test]
+    fn the_history_groups_by_the_day_each_job_finished() {
+        // UTC-5: the 14th 19:10 UTC is 2:10 PM there.
+        let tz = FixedOffset::west_opt(5 * 3600).unwrap();
+        let now = at(19, 10);
+        let day = |d: u32, h: u32| Utc.with_ymd_and_hms(2026, 11, d, h, 0, 0).unwrap();
+        let finished = vec![
+            record("j1", JobStatus::Ok, Some(0), day(14, 17), day(14, 18)),
+            record("j2", JobStatus::Ok, Some(0), day(14, 14), day(14, 15)),
+            // 03:00 UTC on the 14th is the 13th in UTC-5: yesterday.
+            record("j3", JobStatus::Failed, Some(1), day(14, 2), day(14, 3)),
+            record("j4", JobStatus::Ok, Some(0), day(11, 12), day(11, 13)),
+            record("j5", JobStatus::Ok, Some(0), day(2, 12), day(2, 13)),
+        ];
+        let model = JobsModel::from_read(read(vec![job("j9", JobKind::Pid, "1", None, at(19, 0))], finished));
+        assert_eq!(model.running().len(), 1);
+        assert_eq!(model.finished().len(), 5);
+        assert_eq!(
+            model.finished_days(now, &tz),
+            [
+                (0, "Today".to_string()),
+                (2, "Yesterday".to_string()),
+                (3, "Wed, Nov 11".to_string()),
+                (4, "Nov 2".to_string()),
+            ]
+        );
+        let last_year = Utc.with_ymd_and_hms(2025, 12, 30, 19, 0, 0).unwrap();
+        assert_eq!(day_label(last_year, now, &tz), "Dec 30, 2025");
+        assert_eq!(day_label(now + chrono::Duration::hours(1), now, &tz), "Today", "a skewed clock");
+        assert!(JobsModel::Empty.finished_days(now, &tz).is_empty());
+    }
+
+    #[test]
+    fn the_last_output_line_is_the_last_one_drawn() {
+        let path = std::env::temp_dir().join(format!("shelbi-jobs-tail-{}.log", std::process::id()));
+        let tail = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            last_output_line(&path)
+        };
+        assert_eq!(tail("one\ntwo\n").as_deref(), Some("two"));
+        assert_eq!(tail("one\ntwo\n\n   \n").as_deref(), Some("two"), "blank lines skipped");
+        assert_eq!(tail("").as_deref(), None);
+        assert_eq!(tail("\n\n").as_deref(), None);
+        // A progress bar redrawn with carriage returns: its last drawing.
+        assert_eq!(tail("Downloading  10%\rDownloading  55%\r").as_deref(), Some("Downloading  55%"));
+        // Colors and other escapes go.
+        assert_eq!(
+            tail("\u{1b}[1m\u{1b}[32m   Compiling\u{1b}[0m shelbi\tv0.42\u{1b}]0;title\u{7}\n").as_deref(),
+            Some("Compiling shelbi v0.42")
+        );
+        // A long log reads only its end, skipping the cut line.
+        let big = "x".repeat(TAIL_READ as usize * 2) + "\nlast line\n";
+        assert_eq!(tail(&big).as_deref(), Some("last line"));
+        let one_huge = "y".repeat(TAIL_READ as usize * 2);
+        assert_eq!(tail(&one_huge).map(|l| l.chars().count()), Some(TAIL_MAX_CHARS), "cut to the cap");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(last_output_line(&path), None, "a missing log");
+        assert_eq!(strip_escapes("a\u{1b}[38;5;196mb\u{1b}(Bc\u{7}"), "abc");
     }
 
     #[test]

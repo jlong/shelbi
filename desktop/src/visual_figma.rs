@@ -93,9 +93,10 @@
 //! screens and those states; `=settings` just Settings, its state and the
 //! components; `=issues` just the board, its states and the task pane;
 //! `=sidebar` just the sidebar's and the tab bar's states. `jobs` and
-//! `jobs-empty` are the Jobs screen with four running and two finished jobs,
+//! `jobs-empty` are the Jobs screen with four running and four finished jobs
+//! (two today, two the day before),
 //! and with none, and `jobs-sheet` the running bundle job's sheet floating
-//! over the table (no frame; checked by eye against the task pane);
+//! over the cards (no frame; checked by eye against the task pane);
 //! `=jobs` renders just those.
 //! `reminders`, `reminders-sheet` and `reminders-empty` are the Reminders
 //! screen with three pending and two fired reminders, with a pending one's
@@ -1275,7 +1276,9 @@ impl Run {
     /// written straight into the fixture project, as `shelbi job` would.
     /// `SHELBI_VISUAL_ONLY=jobs` renders just these.
     fn jobs(&mut self) {
-        use shelbi_state::awareness::{record_finished_jobs, update_awareness, Job, JobKind, JobRecord, JobStatus};
+        use shelbi_state::awareness::{
+            record_finished_jobs, update_awareness, Job, JobKind, JobRecord, JobStarter, JobStatus,
+        };
         let now = pinned_now();
         let job = |id: &str, kind, target: &str, label: Option<&str>, mins: i64| Job {
             id: id.into(),
@@ -1307,10 +1310,31 @@ impl Run {
             job("j4", JobKind::Pr, "2265", None, 62),
         ];
         // Estimates: the bundle a third of the way in, the checks past theirs
-        // (an overdue bar), the rest with none.
+        // (an overdue bar), the rest with none. The bundle and the checks
+        // were started by workers, the watches by the orchestrator.
         let mut jobs = jobs;
         jobs[0].set_estimate(std::time::Duration::from_secs(12 * 60));
         jobs[1].set_estimate(std::time::Duration::from_secs(30 * 60));
+        let by = |ws: &str, task: &str| {
+            Some(JobStarter { workspace: ws.into(), agent: Some("developer".into()), task: Some(task.into()) })
+        };
+        jobs[0].started_by = by("alpha", "desktop-bundle");
+        jobs[1].started_by = by("charlie", "project-tabs");
+        // What the two commands printed last (the watches print nothing).
+        for (id, text) in [
+            (
+                "j7",
+                "=== bundle desktop app\r\n   Compiling shelbi-desktop v0.42.0\r\n    Finished `release` profile [optimized] target(s) in 3m 41s\r\n    Bundling Shelbi.app\r\n",
+            ),
+            (
+                "j6",
+                "running 214 tests\ntest views::jobs::tests::the_sheet_slides_in_and_back_out ... ok\ntest views::tab_drag::tests::a_tab_dragged_past_the_last_drops_at_the_end has been running for over 60 seconds\n",
+            ),
+        ] {
+            let log = shelbi_state::awareness::job_output_path(PROJECT, id).expect("the output path");
+            std::fs::create_dir_all(log.parent().expect("the job dir")).expect("make the job dir");
+            std::fs::write(&log, text).expect("write the fixture job output");
+        }
         let set = |jobs: Vec<Job>| {
             update_awareness(PROJECT, |store| {
                 store.jobs = jobs;
@@ -1319,19 +1343,36 @@ impl Run {
             .expect("write the fixture awareness store")
         };
         set(jobs);
-        let record = |id: &str, label: &str, target: &str, status, exit, ran: i64, mins: i64| JobRecord {
+        let record = |id: &str, kind, label: Option<&str>, target: &str, status, exit, ran: i64, mins: i64| JobRecord {
             exit_code: exit,
             ..JobRecord::finished(
-                &job(id, JobKind::Command, target, Some(label), mins + ran),
+                &job(id, kind, target, label, mins + ran),
                 status,
                 now - chrono::Duration::minutes(mins),
             )
         };
+        let mut failed = record(
+            "j3",
+            JobKind::Command,
+            Some("desktop tests"),
+            "cargo test --workspace",
+            JobStatus::Failed,
+            Some(101),
+            7,
+            80,
+        );
+        failed.detail = Some("test result: FAILED. 812 passed; 1 failed; 0 ignored; finished in 41.07s".into());
+        failed.started_by = by("bravo", "tab-drag");
+        // A day back (the pinned clock is mid-afternoon, so a day earlier is
+        // yesterday in any zone): a merged PR watch and a canceled build.
+        let day = 24 * 60;
         record_finished_jobs(
             PROJECT,
             vec![
-                record("j3", "desktop tests", "cargo test --workspace", JobStatus::Failed, Some(101), 7, 80),
-                record("j2", "site build", "npm run build", JobStatus::Ok, Some(0), 2, 95),
+                record("j0", JobKind::Command, Some("release build"), "./scripts/release/build.sh", JobStatus::Canceled, None, 3, day + 40),
+                record("j1", JobKind::Pr, None, "2251", JobStatus::Merged, None, 48, day + 20),
+                failed,
+                record("j2", JobKind::Command, Some("site build"), "npm run build", JobStatus::Ok, Some(0), 2, 95),
             ],
             now,
         )
@@ -1339,25 +1380,18 @@ impl Run {
         let handle = self.open();
         self.click(handle, View::Jobs);
         let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap().expect("the Jobs view");
-        let loaded = self.wait(handle, Duration::from_secs(10), |cx| jobs.read_with(cx, |v, _| v.model().rows().len() == 6));
-        self.expect("jobs: the six fixture jobs load", loaded);
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| jobs.read_with(cx, |v, _| v.model().rows().len() == 8));
+        self.expect("jobs: the eight fixture jobs load", loaded);
         let ids: Vec<String> = jobs.read_with(&self.cx, |v, _| v.model().rows().iter().map(|r| r.id.clone()).collect());
-        self.expect("jobs: running newest first, then finished", ids == ["j7", "j6", "j5", "j4", "j3", "j2"]);
+        self.expect("jobs: running newest first, then finished", ids == ["j7", "j6", "j5", "j4", "j3", "j2", "j1", "j0"]);
         self.save(handle, "jobs");
 
-        // The bundle job's sheet, floating over the table: its properties
+        // The bundle job's sheet, floating over the cards: its properties
         // (an estimate bar a third full), its output so far, and Cancel.
-        let log = shelbi_state::awareness::job_output_path(PROJECT, "j7").expect("the output path");
-        std::fs::create_dir_all(log.parent().expect("the job dir")).expect("make the job dir");
-        std::fs::write(
-            &log,
-            "=== bundle desktop app\r\n   Compiling shelbi-desktop v0.42.0\r\n    Finished `release` profile [optimized] target(s) in 3m 41s\r\n    Bundling Shelbi.app\r\n",
-        )
-        .expect("write the fixture job output");
         let handle = self.open();
         self.click(handle, View::Jobs);
         let jobs = handle.update(&mut self.cx, |w, _, _| w.offscreen_jobs()).unwrap().expect("the Jobs view");
-        let loaded = self.wait(handle, Duration::from_secs(10), |cx| jobs.read_with(cx, |v, _| v.model().rows().len() == 6));
+        let loaded = self.wait(handle, Duration::from_secs(10), |cx| jobs.read_with(cx, |v, _| v.model().rows().len() == 8));
         self.expect("jobs-sheet: the jobs load", loaded);
         handle
             .update(&mut self.cx, |_, window, cx| jobs.update(cx, |v, cx| v.open_job("j7", window, cx)))

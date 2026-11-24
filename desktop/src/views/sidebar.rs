@@ -645,7 +645,9 @@ pub fn nav_icon(view: &View) -> Icon {
         // frame draws, beside the Changelog's rocket there.
         View::Activity => icons::BOLT,
         View::Machines => icons::SERVER_STACK,
-        View::Jobs => icons::COMMAND_LINE,
+        // A queue of work running in the background (Activity has the
+        // bolt, Reminders the clock, the shells the command line).
+        View::Jobs => icons::QUEUE_LIST,
         View::Reminders => icons::CLOCK,
     }
 }
@@ -1917,8 +1919,11 @@ mod tests {
         assert_eq!(nav_icon(&View::Issues), icons::RECTANGLE_STACK);
         assert_eq!(nav_icon(&View::Changelog), icons::ROCKET_LAUNCH);
         assert_eq!(nav_icon(&View::Activity), icons::BOLT);
-        assert_eq!(nav_icon(&View::Jobs), icons::COMMAND_LINE);
+        assert_eq!(nav_icon(&View::Jobs), icons::QUEUE_LIST);
         assert_eq!(nav_icon(&View::Reminders), icons::CLOCK);
+        // Jobs' drawing is its own: no other view shares it.
+        let others = [View::Session("orch".into()), View::Issues, View::Changelog, View::Activity, View::Machines, View::Reminders];
+        assert!(others.iter().all(|v| nav_icon(v) != nav_icon(&View::Jobs)));
     }
 }
 

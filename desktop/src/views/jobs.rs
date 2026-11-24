@@ -1,23 +1,48 @@
 //! The Jobs screen (`View::Jobs`, palette-only): the project's awareness
-//! jobs (what `shelbi job run` and `shelbi job watch` create) in a
-//! five-column table, the running ones first, then the finished ones from
-//! the job history under a `Finished` row, drawn from the shared
-//! [`shelbi_app::jobs`] model the TUI's Jobs page draws too. A failed job's
-//! Status is red.
+//! jobs (what `shelbi job run` and `shelbi job watch` create), drawn from the
+//! shared [`shelbi_app::jobs`] model the TUI's Jobs page draws too.
 //!
-//! There's no Figma frame for it, so it borrows the app's: the Machines
-//! view's toolbar (the view's name, loud, on a 37pt row over a divider) and
-//! the Settings tables' look (muted SmallMedium headings over the strong
-//! rule, Base cells, a divider between rows). The Command cell is cut with
-//! an ellipsis so the table never scrolls sideways; hovering it shows the
-//! whole command (a long Description likewise).
+//! There's no Figma frame for it, so it borrows the app's vocabulary: the
+//! board's cards, the issue pane's chips and the Changelog's centered
+//! column (at most [`CONTENT_MAX_W`] wide, so a wide window doesn't stretch
+//! a row into a scan across the screen).
 //!
-//! A running job started with `--estimate` draws a thin progress bar along
-//! the bottom of its row (elapsed against the estimate, the shared
-//! [`shelbi_app::estimate`] fraction the TUI's block bar draws too), full and
-//! in the overdue tone once the estimate is used up, when its Status reads
-//! `Overdue`. Its Duration reads `4m 12s / 10m`; a finished job keeps its
-//! actual duration against the estimate as that text, with no bar.
+//! ```text
+//! Jobs  2 running · 3 finished
+//! ─────────────────────────────────────────────────────────────
+//!   Running 2
+//!   ╭─────────────────────────────────────────────────────────╮
+//!   │ ◠ bundle desktop app                           4m / 12m │
+//!   │ ████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░    35% │
+//!   │ [Command] [👤 alpha] zsh -c ./bundle.sh …      2:06 PM │
+//!   │ › Bundling Shelbi.app                                   │
+//!   ╰─────────────────────────────────────────────────────────╯
+//!   Today
+//!   ╭─────────────────────────────────────────────────────────╮
+//!   │ ✓ site build    npm run build                  2m 12m ago│
+//!   │ ✕ desktop tests exit 101 · FAILED…             7m  1h ago│
+//!   ╰─────────────────────────────────────────────────────────╯
+//! ```
+//!
+//! Running jobs are the hero: one card each (the board card's surface,
+//! corners and shadow), with a live spinner (the progress color, the warning
+//! color once overdue), the label, an `Overdue` chip once it is past its
+//! estimate, and the elapsed time against the estimate; under it a rounded estimate bar with the share used
+//! (or how far over); a meta line with the job's kind, who started it, its
+//! command and when it started; and a well with what it is doing: a
+//! command's last output line in monospace, or what a watch waits for.
+//!
+//! Finished jobs are compact history, newest first, grouped by the day they
+//! finished (`Today`, `Yesterday`, `Mon, Nov 16`), each day on one card: a
+//! status mark (a green check, a red ✕, a yellow stop for a cancel, a
+//! neutral mark for a watch that ended), the label, the command (a failed
+//! job's exit code and last line instead, in red), a watch's kind, how long it
+//! ran and how long ago it finished. Labels, commands and output lines cut
+//! with an ellipsis so the screen never scrolls sideways; hovering one shows
+//! it whole.
+//!
+//! With no jobs at all the screen says what jobs are and offers the
+//! command that starts one, in the bootstrap screen's copyable command box.
 //!
 //! Clicking a row opens the job's sheet, drawn exactly like the issue pane
 //! (the shared [`super::floating_pane`]): floating over the table's right,
@@ -43,8 +68,9 @@
 //! ```
 //!
 //! The Header reads `id · label`, then ✕. Under it, the job's Status (its
-//! glyph and tone) and Duration (with the estimate bar while it runs against
-//! one) and its Command as property rows, then a running command's live
+//! glyph and tone), Duration (with the estimate bar while it runs against
+//! one), when it started and who started it, and its Command as property
+//! rows, then a running command's live
 //! terminal (watched, never typed into) or a finished one's saved output in
 //! a framed well, and Cancel while it runs. Escape or ✕ closes it. The loads
 //! are [`shelbi_app::jobs::open_sheet`]'s, the TUI's too.
@@ -59,21 +85,24 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    div, prelude::*, px, relative, AnyElement, ClickEvent, Context, Entity, EventEmitter, FocusHandle, KeyDownEvent,
-    ScrollHandle, SharedString, Task, Window,
+    div, prelude::*, px, relative, AnyElement, ClickEvent, Context, Div, Entity, EventEmitter, FocusHandle, Hsla,
+    KeyDownEvent, ScrollHandle, SharedString, Task, Window,
 };
 use shelbi_app::jobs::{
-    one_line, JobRow, JobsModel, JobsRead, SheetLoad, CANCEL_LABEL, COLUMNS, FINISHED_HEADING, REFRESH_INTERVAL,
-    TITLE,
+    clock_label, one_line, JobRow, JobsModel, JobsRead, SheetLoad, CANCEL_LABEL, EMPTY_COMMAND, EMPTY_DETAIL,
+    EMPTY_TITLE, REFRESH_INTERVAL, RUNNING_HEADING, TITLE,
 };
 use shelbi_app::source::{ProjectHandle, ProjectSource};
+use shelbi_app::theme::Tone;
+use shelbi_state::awareness::{JobKind, JobStatus};
 
 use super::estimate_bar;
 use super::floating_pane::{
     self, header_button, property_row, value_text, PaneFrame, PaneHost, PaneIds, PaneMotion, SlideOut, INSET,
 };
-use super::list_screen::{self, ROW_RADIUS};
-use crate::assets::icons;
+use super::list_screen;
+use crate::assets::{glyph, glyphs, heroicon, icons};
+use crate::elements::spinner::spinner_sized;
 use crate::elements::terminal::metrics::PRIMARY_FAMILY;
 use crate::elements::terminal::{session as term_session, TerminalPane};
 use crate::theme::style::{self, Type, Typography};
@@ -82,17 +111,35 @@ use crate::theme::Theme;
 /// How often the view drains its refresher.
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
-/// The fixed columns' widths; Command takes the rest.
-const DESCRIPTION_W: f32 = 200.0;
-const STATUS_W: f32 = 120.0;
-/// Wide enough for elapsed against an estimate (`1h 4m / 1h 30m`).
-const DURATION_W: f32 = 116.0;
-
-const FINISHED_W: f32 = 160.0;
-
-/// A Description longer than this many characters may not fit its column:
-/// it gets a tooltip with the whole text.
-const DESCRIPTION_TIP_CHARS: usize = 24;
+/// The content column's widest; a wider window centers it.
+const CONTENT_MAX_W: f32 = 960.0;
+/// The column's room from the view's edges.
+const CONTENT_PAD_X: f32 = 24.0;
+/// A card's corners: the board cards'.
+const CARD_RADIUS: f32 = 12.0;
+/// A running card's padding.
+const CARD_PAD: f32 = 14.0;
+/// A running card's estimate bar: thick enough to read at a glance.
+const CARD_BAR_H: f32 = 6.0;
+/// The bar's words (`35%`, `12m over`).
+const CARD_BAR_LABEL_W: f32 = 64.0;
+/// The running card's live spinner.
+const LIVE_GLYPH: f32 = 14.0;
+/// A history row's height, and its status mark's.
+const HISTORY_ROW_H: f32 = 36.0;
+const MARK: f32 = 18.0;
+/// The history's trailing columns, right-aligned so they line up across
+/// rows and days.
+const KIND_W: f32 = 96.0;
+/// Wide enough for a duration against an estimate (`1h 4m / 1h 30m`).
+const HISTORY_DURATION_W: f32 = 108.0;
+const AGO_W: f32 = 64.0;
+/// A command's and an output line's monospace size.
+const MONO_SIZE: f32 = 12.0;
+const MONO_LINE: f32 = 18.0;
+/// A label or line longer than this many characters may be cut: it gets a
+/// tooltip with the whole text.
+const TIP_CHARS: usize = 40;
 
 pub struct JobsView {
     project: String,
@@ -469,125 +516,512 @@ impl JobsView {
     }
 
     fn render_body(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        if self.model == JobsModel::Empty {
+            return empty_state(theme);
+        }
         if let Some(message) = self.model.message() {
             return list_screen::message("jobs-empty", message, theme);
         }
         let now = super::activity::now();
-        let headings = list_screen::headings_row()
-            .child(div().w(px(DESCRIPTION_W)).flex_none().child(COLUMNS[0]))
-            .child(div().flex_1().min_w_0().child(COLUMNS[1]))
-            .child(div().w(px(STATUS_W)).flex_none().child(COLUMNS[2]))
-            .child(div().w(px(DURATION_W)).flex_none().child(COLUMNS[3]))
-            .child(div().w(px(FINISHED_W)).flex_none().child(COLUMNS[4]));
-        let rows = self
-            .model
-            .rows()
-            .iter()
-            .map(|row| {
-                let open = self.sheet.as_ref().is_some_and(|s| s.id == row.id);
-                job_row(row, now, open, theme, cx)
-            })
-            .collect();
-        let finished: Vec<(usize, &'static str)> =
-            self.model.finished_start().map(|at| (at, FINISHED_HEADING)).into_iter().collect();
-        let rows = list_screen::sectioned("jobs", rows, &finished, theme);
-        list_screen::list("jobs", &self.scroll, headings, rows, theme)
+        let open = |row: &JobRow| self.sheet.as_ref().is_some_and(|s| s.id == row.id);
+        let (running, finished) = (self.model.running(), self.model.finished());
+        let mut column = div().flex().flex_col().w_full().max_w(px(CONTENT_MAX_W)).gap(px(8.0));
+        if !running.is_empty() {
+            column = column.child(section_heading("jobs-running-heading", RUNNING_HEADING.to_string(), Some(running.len()), false, theme));
+            for row in running {
+                column = column.child(running_card(row, now, open(row), theme, cx));
+            }
+        }
+        let days = self.model.finished_days(now, &chrono::Local);
+        for (n, (start, label)) in days.iter().enumerate() {
+            let end = days.get(n + 1).map_or(finished.len(), |(next, _)| *next);
+            let spaced = n > 0 || !running.is_empty();
+            column = column.child(section_heading(format!("jobs-day-{n}-heading"), label.clone(), None, spaced, theme));
+            let rows = finished[*start..end].iter().map(|row| history_row(row, now, open(row), theme, cx));
+            column = column.child(
+                div()
+                    .debug_selector(move || format!("jobs-day-{n}"))
+                    .flex()
+                    .flex_col()
+                    .p(px(4.0))
+                    .rounded(px(CARD_RADIUS))
+                    .bg(theme.card)
+                    .shadow(style::card_shadow(theme))
+                    .children(rows),
+            );
+        }
+        div()
+            .id("jobs-list")
+            .debug_selector(|| "jobs-list".into())
+            .track_scroll(&self.scroll)
+            .flex()
+            .flex_col()
+            .items_center()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_y_scroll()
+            .px(px(CONTENT_PAD_X))
+            .pt(px(12.0))
+            .pb(px(24.0))
+            .child(column)
+            .into_any_element()
     }
 }
 
-/// One job's row: its description, its command cut to the column (whole in
-/// a tooltip), its status (red when it failed), how long it ran (against its
-/// estimate when it has one), and when it finished. A running job with an
-/// estimate has a bar along the bottom ([`row_estimate_bar`]).
-fn job_row(
+/// A debug selector `job-<part>-<id>`.
+fn selector(part: &'static str, id: &str) -> impl FnOnce() -> String {
+    let s = format!("job-{part}-{id}");
+    move || s
+}
+
+/// A section's heading over its cards (`Running 2`, `Today`), in the
+/// sidebar sections' type; `spaced` sets it off from the section above.
+fn section_heading(selector: impl Into<String>, text: String, count: Option<usize>, spaced: bool, theme: &Theme) -> AnyElement {
+    let selector = selector.into();
+    div()
+        .debug_selector(move || selector)
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(4.0))
+        .when(spaced, |d| d.pt(px(12.0)))
+        .type_style(Type::SmallMedium)
+        .text_color(theme.muted)
+        .child(text)
+        .when_some(count, |d, n| {
+            d.child(
+                div()
+                    .px(px(5.0))
+                    .rounded(px(4.0))
+                    .bg(theme.background)
+                    .type_style(Type::XSmallMedium)
+                    .text_color(theme.foreground)
+                    .child(n.to_string()),
+            )
+        })
+        .into_any_element()
+}
+
+/// The tint behind a chip in `tone`, laid on a card.
+fn tint(tone: Tone, theme: &Theme) -> Hsla {
+    let fill = match tone {
+        Tone::Green => theme.green_tint,
+        Tone::Yellow => theme.yellow_tint,
+        Tone::Red | Tone::LightRed => theme.red_tint,
+        Tone::Blue => theme.blue_tint,
+        Tone::Cyan => theme.cyan_tint,
+        Tone::Magenta => theme.magenta_tint,
+        _ => theme.background,
+    };
+    theme.fill_on(fill, theme.card)
+}
+
+/// A small chip on a card: X-Small Medium on a tint, 4pt corners.
+fn chip(text: String, fill: Hsla, color: Hsla) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(4.0))
+        .h(px(20.0))
+        .px(px(6.0))
+        .rounded(px(4.0))
+        .bg(fill)
+        .type_style(Type::XSmallMedium)
+        .text_color(color)
+        .whitespace_nowrap()
+        .child(text)
+}
+
+/// The kind chip (`Command`, `PR #2265`, `CI d482e3f`, `PID 4242`).
+fn kind_chip(row: &JobRow, theme: &Theme) -> Div {
+    chip(row.kind_label(), theme.fill_on(theme.background, theme.card), theme.foreground)
+        .debug_selector(selector("kind", &row.id))
+}
+
+/// Who started it: a person for a worker's workspace, the robot for the
+/// orchestrator, its full name (agent, task) on hover.
+fn started_by_chip(row: &JobRow, theme: &Theme) -> impl IntoElement {
+    let icon = if row.started_by.is_some() {
+        heroicon(icons::USER_SMALL)
+    } else {
+        heroicon(icons::ROBOT).size(px(14.0))
+    };
+    div()
+        .id(SharedString::from(format!("job-by-{}", row.id)))
+        .debug_selector(selector("by", &row.id))
+        .flex()
+        .flex_row()
+        .flex_none()
+        .items_center()
+        .gap(px(4.0))
+        .text_color(theme.muted)
+        .child(icon.text_color(theme.icon))
+        .child(row.started_by_label())
+        .tooltip(style::tooltip(format!("Started by {}", row.started_by_detail())))
+}
+
+/// Monospace text at the cards' code size.
+fn mono(d: Div) -> Div {
+    d.font_family(PRIMARY_FAMILY).text_size(px(MONO_SIZE)).line_height(px(MONO_LINE))
+}
+
+/// A running job's card: the live spinner, the label, the status chip and
+/// elapsed against the estimate; the estimate bar; the kind, who started
+/// it, the command and when; and what it is doing now.
+fn running_card(
     row: &JobRow,
     now: chrono::DateTime<chrono::Utc>,
     open: bool,
     theme: &Theme,
     cx: &mut Context<JobsView>,
 ) -> AnyElement {
-    let description = one_line(&row.description);
-    let long_description = description.chars().count() > DESCRIPTION_TIP_CHARS;
-    let click_id = row.id.clone();
     let overdue = row.overdue(now);
-    let duration_color = row.duration_tone(now).map_or(theme.muted, |t| theme.tone(t));
-    list_screen::row("job", &row.id, open, theme)
-        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.open_sheet(&click_id, window, cx)))
+    let accent = if overdue { theme.warning } else { theme.progress };
+    let label = one_line(&row.description);
+    let long_label = label.chars().count() > TIP_CHARS;
+    let status_tone = row.status_tone_at(now);
+    let duration_color = row.duration_tone(now).map_or(theme.foreground, |t| theme.tone(t));
+    let click_id = row.id.clone();
+
+    let title = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(10.0))
+        .min_w_0()
+        .child(
+            div()
+                .debug_selector(selector("live", &row.id))
+                .flex_none()
+                .child(spinner_sized(SharedString::from(format!("job-live-{}", row.id)), accent, LIVE_GLYPH)),
+        )
         .child(
             div()
                 .id(SharedString::from(format!("job-description-{}", row.id)))
-                .w(px(DESCRIPTION_W))
-                .flex_none()
-                .min_w_0()
-                .truncate()
-                .text_color(theme.text_loud)
-                .when(long_description, |d| d.tooltip(style::tooltip(row.description.clone())))
-                .child(description),
-        )
-        .child(
-            div()
-                .id(SharedString::from(format!("job-command-{}", row.id)))
-                .debug_selector({
-                    let id = row.id.clone();
-                    move || format!("job-command-{id}")
-                })
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .text_color(theme.foreground)
-                .tooltip(style::tooltip(row.command.clone()))
-                .child(one_line(&row.command)),
+                .type_style(Type::BaseMedium)
+                .text_color(theme.text_loud)
+                .when(long_label, |d| d.tooltip(style::tooltip(row.description.clone())))
+                .child(label),
+        )
+        // The spinner says it is running; only an overdue job gets a word.
+        .when(overdue, |d| {
+            d.child(
+                chip(row.status_label_at(now), tint(status_tone, theme), theme.tone(status_tone))
+                    .debug_selector(selector("status", &row.id)),
+            )
+        })
+        .child(
+            div()
+                .debug_selector(selector("duration", &row.id))
+                .flex_none()
+                .type_style(Type::Small)
+                .text_color(duration_color)
+                .child(row.duration(now)),
+        );
+
+    let bar = row.bar(now).map(|bar| {
+        let fill = estimate_bar::fill_color(&bar, theme);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .debug_selector(selector("bar", &row.id))
+                    .flex_1()
+                    .h(px(CARD_BAR_H))
+                    .rounded_full()
+                    .bg(theme.search)
+                    .child(div().h_full().w(relative(bar.fraction())).rounded_full().bg(fill)),
+            )
+            .child(
+                div()
+                    .debug_selector(selector("bar-label", &row.id))
+                    .flex_none()
+                    .w(px(CARD_BAR_LABEL_W))
+                    .text_right()
+                    .type_style(Type::XSmall)
+                    .text_color(if overdue { theme.warning } else { theme.muted })
+                    .child(row.bar_label(now).unwrap_or_default()),
+            )
+    });
+
+    let command = (row.kind == JobKind::Command).then(|| {
+        mono(div())
+            .id(SharedString::from(format!("job-command-{}", row.id)))
+            .debug_selector(selector("command", &row.id))
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_color(theme.muted)
+            .tooltip(style::tooltip(row.command.clone()))
+            .child(one_line(&row.command))
+    });
+    let meta = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .min_w_0()
+        .type_style(Type::XSmall)
+        .text_color(theme.muted)
+        .child(kind_chip(row, theme))
+        .child(started_by_chip(row, theme))
+        .map(|d| match command {
+            Some(c) => d.child(c),
+            None => d.child(div().flex_1()),
+        })
+        .child(
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .child(format!("started {}", clock_label(row.started_at, now, &chrono::Local))),
+        );
+
+    let activity = row.activity_line();
+    let is_output = row.activity_is_output();
+    let long_activity = activity.chars().count() > TIP_CHARS * 2;
+    let well = div()
+        .id(SharedString::from(format!("job-activity-{}", row.id)))
+        .debug_selector(selector("activity", &row.id))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(8.0))
+        .min_w_0()
+        .h(px(30.0))
+        .px(px(10.0))
+        .rounded(px(6.0))
+        .bg(theme.fill_on(theme.background, theme.card))
+        .when(long_activity, |d| d.tooltip(style::tooltip(activity.clone())))
+        .child(if is_output {
+            mono(div()).flex_none().text_color(theme.icon).child("\u{203A}")
+        } else {
+            div().flex_none().child(heroicon(icons::CLOCK).size(px(14.0)).text_color(theme.icon))
+        })
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .map(|d| if is_output { mono(d) } else { d.type_style(Type::XSmall) })
+                .text_color(if is_output { theme.foreground } else { theme.muted })
+                .child(activity),
+        );
+
+    div()
+        .id(SharedString::from(format!("job-row-{}", row.id)))
+        .debug_selector(selector("row", &row.id))
+        .relative()
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .min_w_0()
+        .p(px(CARD_PAD))
+        .rounded(px(CARD_RADIUS))
+        .bg(theme.card)
+        // The open job's card wears the focus ring, as the board's selected
+        // card does.
+        .shadow(if open && theme.translucent() {
+            style::focus_shadow_inset(theme)
+        } else if open {
+            style::focus_shadow(theme)
+        } else {
+            style::card_shadow(theme)
+        })
+        .cursor_pointer()
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.open_sheet(&click_id, window, cx)))
+        .child(title)
+        .children(bar)
+        .child(meta)
+        .child(well)
+        .into_any_element()
+}
+
+/// A finished job's status mark: a tinted disc with a glyph. A success is
+/// a green check, a failure a red ✕, a cancel a yellow stop; a watch that
+/// ended without a verdict (exited, merged, closed) is neutral.
+fn status_mark(row: &JobRow, theme: &Theme) -> AnyElement {
+    let status = match row.state {
+        shelbi_app::jobs::JobState::Finished { status, .. } => status,
+        shelbi_app::jobs::JobState::Running => JobStatus::Exited,
+    };
+    let small = |icon| heroicon(icon).size(px(12.0));
+    let (fill, mark): (Hsla, AnyElement) = match status {
+        JobStatus::Ok => (tint(Tone::Green, theme), glyph(glyphs::CHECK).text_color(theme.green).into_any_element()),
+        JobStatus::Failed => (tint(Tone::Red, theme), small(icons::X_MARK_MENU).text_color(theme.red).into_any_element()),
+        JobStatus::Canceled => (tint(Tone::Yellow, theme), small(icons::MINUS).text_color(theme.yellow).into_any_element()),
+        JobStatus::Merged => (tint(Tone::Gray, theme), small(icons::PULL_REQUEST).text_color(theme.foreground).into_any_element()),
+        JobStatus::Closed => (tint(Tone::Gray, theme), small(icons::X_MARK_MENU).text_color(theme.muted).into_any_element()),
+        JobStatus::Exited => (tint(Tone::Gray, theme), glyph(glyphs::DOT).text_color(theme.muted).into_any_element()),
+    };
+    div()
+        .id(SharedString::from(format!("job-status-{}", row.id)))
+        .debug_selector(selector("status", &row.id))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .size(px(MARK))
+        .rounded_full()
+        .bg(fill)
+        .child(mark)
+        .tooltip(style::tooltip(row.status_label()))
+        .into_any_element()
+}
+
+/// One finished job's row: its mark, label, command (or, failed, why in
+/// red), kind, how long it ran and how long ago it finished.
+fn history_row(
+    row: &JobRow,
+    now: chrono::DateTime<chrono::Utc>,
+    open: bool,
+    theme: &Theme,
+    cx: &mut Context<JobsView>,
+) -> AnyElement {
+    let label = one_line(&row.description);
+    let long_label = label.chars().count() > TIP_CHARS;
+    let click_id = row.id.clone();
+    let highlight = theme.fill_on(theme.background_hover, theme.card);
+    let duration_color = row.duration_tone(now).map_or(theme.muted, |t| theme.tone(t));
+    let detail = match row.failure_detail() {
+        Some(why) => div()
+            .id(SharedString::from(format!("job-failure-{}", row.id)))
+            .debug_selector(selector("failure", &row.id))
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .type_style(Type::Small)
+            .text_color(theme.red)
+            .when(why.chars().count() > TIP_CHARS, |d| d.tooltip(style::tooltip(why.clone())))
+            .child(why),
+        None if row.kind == JobKind::Command => mono(div())
+            .id(SharedString::from(format!("job-command-{}", row.id)))
+            .debug_selector(selector("command", &row.id))
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_color(theme.muted)
+            .tooltip(style::tooltip(row.command.clone()))
+            .child(one_line(&row.command)),
+        None => div().id(SharedString::from(format!("job-detail-{}", row.id))).flex_1(),
+    };
+    div()
+        .id(SharedString::from(format!("job-row-{}", row.id)))
+        .debug_selector(selector("row", &row.id))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .h(px(HISTORY_ROW_H))
+        .min_w_0()
+        .px(px(10.0))
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .when(open, |d| d.bg(highlight))
+        .hover(move |d| d.bg(highlight))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| this.open_sheet(&click_id, window, cx)))
+        .child(status_mark(row, theme))
+        .child(
+            div()
+                .id(SharedString::from(format!("job-description-{}", row.id)))
+                // Up to 40% of the row, and shrinking before the trailing
+                // columns do in a narrow window.
+                .flex_initial()
+                .min_w_0()
+                .max_w(relative(0.4))
+                .truncate()
+                .type_style(Type::Base)
+                .text_color(theme.text_loud)
+                .when(long_label, |d| d.tooltip(style::tooltip(row.description.clone())))
+                .child(label),
+        )
+        .child(detail)
+        // A watch's kind (`PR #2251`); a command's monospace line already
+        // says what it is.
+        .child(
+            div()
+                .flex_none()
+                .w(px(KIND_W))
+                .flex()
+                .flex_row()
+                .justify_end()
+                .when(row.kind != JobKind::Command, |d| d.child(kind_chip(row, theme))),
         )
         .child(
             div()
-                .debug_selector({
-                    let id = row.id.clone();
-                    move || format!("job-status-{id}")
-                })
-                .w(px(STATUS_W))
+                .debug_selector(selector("duration", &row.id))
                 .flex_none()
+                .w(px(HISTORY_DURATION_W))
+                .text_right()
                 .truncate()
-                .when(row.failed() || overdue, |d| d.type_style(Type::BaseMedium))
-                .text_color(theme.tone(row.status_tone_at(now)))
-                .child(row.status_label_at(now)),
-        )
-        .child(
-            div()
-                .debug_selector({
-                    let id = row.id.clone();
-                    move || format!("job-duration-{id}")
-                })
-                .w(px(DURATION_W))
-                .flex_none()
-                .truncate()
+                .type_style(Type::Small)
                 .text_color(duration_color)
                 .child(row.duration(now)),
         )
         .child(
             div()
-                .w(px(FINISHED_W))
+                .id(SharedString::from(format!("job-ago-{}", row.id)))
+                .debug_selector(selector("ago", &row.id))
                 .flex_none()
-                .truncate()
+                .w(px(AGO_W))
+                .text_right()
+                .whitespace_nowrap()
+                .type_style(Type::Small)
                 .text_color(theme.muted)
-                .child(row.finished(now)),
+                .tooltip(style::tooltip(format!("Finished {}", row.finished(now))))
+                .child(row.finished_ago(now)),
         )
-        .when_some(row.bar(now), |d, bar| d.child(row_estimate_bar(&row.id, bar, theme)))
         .into_any_element()
 }
 
-/// The bar along the bottom of a running job's row: the issue cards' bar
-/// ([`estimate_bar`]), flush with the row's bottom edge and clipped to its
-/// corners, full and in the warning color once the estimate is used up.
-fn row_estimate_bar(id: &str, bar: shelbi_app::estimate::EstimateProgress, theme: &Theme) -> AnyElement {
-    let selector = format!("job-bar-{id}");
+/// No jobs at all: what jobs are, and the command that starts one, ready to
+/// copy (the bootstrap screen's command box).
+fn empty_state(theme: &Theme) -> AnyElement {
     div()
-        .debug_selector(move || selector.clone())
-        .absolute()
-        .left_0()
-        .right_0()
-        .bottom_0()
-        .h(px(ROW_RADIUS))
-        .child(estimate_bar::estimate_bar(bar, ROW_RADIUS, theme))
+        .debug_selector(|| "jobs-empty".into())
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_w_0()
+        .items_center()
+        .justify_center()
+        .gap(px(12.0))
+        .p_6()
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(44.0))
+                .rounded_full()
+                .bg(theme.background)
+                .child(heroicon(icons::QUEUE_LIST).text_color(theme.icon)),
+        )
+        .child(div().type_style(Type::BaseMedium).text_color(theme.text_loud).child(EMPTY_TITLE))
+        .child(
+            div()
+                .max_w(px(400.0))
+                .text_center()
+                .type_style(Type::Small)
+                .text_color(theme.muted)
+                .child(EMPTY_DETAIL),
+        )
+        .child(
+            div()
+                .debug_selector(|| "jobs-empty-command".into())
+                .mt(px(4.0))
+                .max_w_full()
+                .child(super::bootstrap::command_box(0, EMPTY_COMMAND, theme)),
+        )
         .into_any_element()
 }
 
@@ -689,6 +1123,16 @@ fn sheet_properties(row: &JobRow, canceling: bool, now: chrono::DateTime<chrono:
                         .child(row.duration(now)),
                 )
                 .children(bar),
+        ))
+        .child(property_row(
+            theme,
+            "Started",
+            value_text(theme).debug_selector(|| "job-sheet-started".into()).child(row.started(now)),
+        ))
+        .child(property_row(
+            theme,
+            "Started by",
+            value_text(theme).debug_selector(|| "job-sheet-started-by".into()).child(row.started_by_detail()),
         ))
         .child(property_row(
             theme,
@@ -794,23 +1238,25 @@ mod tests {
         assert!(read_until(&view, &mut vcx, |m| m.rows().len() == 2), "the first read lands");
         let ids: Vec<String> = view.read_with(&vcx, |v, _| v.model().rows().iter().map(|r| r.id.clone()).collect());
         assert_eq!(ids, ["j2", "j1"], "newest first");
-        assert!(vcx.debug_bounds("jobs-table").is_some());
+        assert!(vcx.debug_bounds("jobs-list").is_some());
         assert!(vcx.debug_bounds("jobs-title").is_some());
+        assert!(vcx.debug_bounds("jobs-running-heading").is_some());
         assert!(vcx.debug_bounds("job-row-j2").is_some() && vcx.debug_bounds("job-row-j1").is_some());
 
-        // The long command is cut to its cell: the row never outgrows the
+        // The long command is cut to its cell: the card never outgrows the
         // window, and hovering the cell shows the whole command.
         let row = vcx.debug_bounds("job-row-j2").unwrap();
         let cell = vcx.debug_bounds("job-command-j2").unwrap();
         assert!(cell.right() <= row.right(), "the command cell stays in its row");
         assert!(row.right() <= px(1000.0), "no sideways scroll");
         assert_eq!(row.size.height, vcx.debug_bounds("job-row-j1").unwrap().size.height, "one line, cut");
+        assert!(vcx.debug_bounds("job-bar-j2").is_none(), "no estimate, no bar");
         assert!(vcx.debug_bounds("tooltip").is_none());
         vcx.simulate_mouse_move(cell.center(), None, gpui::Modifiers::none());
         vcx.executor().advance_clock(Duration::from_millis(600));
         vcx.run_until_parked();
         let tip = vcx.debug_bounds("tooltip").expect("hovering the command shows its tooltip");
-        assert!(tip.size.height > row.size.height / 2.0, "{tip:?}");
+        assert!(tip.size.height > cell.size.height, "the whole command, wrapped: {tip:?}");
 
         // A job started outside the screen appears; one that finishes goes.
         set_jobs(vec![
@@ -825,13 +1271,14 @@ mod tests {
         set_jobs(vec![]);
         assert!(read_until(&view, &mut vcx, |m| *m == JobsModel::Empty), "every job finished");
         assert!(vcx.debug_bounds("jobs-empty").is_some());
-        assert!(vcx.debug_bounds("jobs-table").is_none());
+        assert!(vcx.debug_bounds("jobs-list").is_none());
+        assert!(vcx.debug_bounds("jobs-empty-command").is_some(), "the empty state offers the command");
         assert_eq!(view.read_with(&vcx, |v, _| v.model().message()).as_deref(), Some(EMPTY_TEXT));
         view.update(&mut vcx, |v, _| v.stop_workers());
     }
 
     #[gpui::test]
-    fn finished_jobs_sit_under_a_heading_after_the_running_ones(cx: &mut TestAppContext) {
+    fn finished_jobs_sit_under_a_day_heading_after_the_running_ones(cx: &mut TestAppContext) {
         let _home = shelbi_app::settings::agents::fixture::Home::new("dt-jobs-history", PROJECT, crate::test_env::lock());
         let now = Utc::now();
         let ago = |m: i64| now - chrono::Duration::minutes(m);
@@ -851,15 +1298,30 @@ mod tests {
         let ids: Vec<String> = view.read_with(&vcx, |v, _| v.model().rows().iter().map(|r| r.id.clone()).collect());
         assert_eq!(ids, ["j9", "j8", "j7"], "running, then newest finished first");
         let mut tops = Vec::new();
-        for sel in ["job-row-j9", "jobs-finished-heading", "job-row-j8", "job-row-j7"] {
+        for sel in ["jobs-running-heading", "job-row-j9", "jobs-day-0-heading", "job-row-j8", "job-row-j7"] {
             tops.push(vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} drawn")).top());
         }
-        assert!(tops.windows(2).all(|w| w[0] < w[1]), "running, the heading, then finished: {tops:?}");
+        assert!(tops.windows(2).all(|w| w[0] < w[1]), "running, the day's heading, then finished: {tops:?}");
+        // The history is compact: one short line a job, every one alike.
+        let (j8, j7) = (vcx.debug_bounds("job-row-j8").unwrap(), vcx.debug_bounds("job-row-j7").unwrap());
+        assert_eq!((j8.size.height, j7.size.height), (px(HISTORY_ROW_H), px(HISTORY_ROW_H)));
+        assert!(j8.size.height < vcx.debug_bounds("job-row-j9").unwrap().size.height / 2.0, "the running card is the hero");
+        // Its columns line up across rows.
+        for part in ["status", "duration", "ago"] {
+            let mut at = |id: &str| vcx.debug_bounds(Box::leak(format!("job-{part}-{id}").into_boxed_str())).unwrap();
+            let (a, b) = (at("j8"), at("j7"));
+            assert_eq!(a.right(), b.right(), "{part} lines up");
+        }
+        // The failure reads inline, in red; a success shows its command.
+        assert!(vcx.debug_bounds("job-failure-j7").is_some());
+        assert!(vcx.debug_bounds("job-failure-j8").is_none() && vcx.debug_bounds("job-command-j8").is_some());
         assert!(vcx.debug_bounds("jobs-summary").is_some());
         let model = view.read_with(&vcx, |v, _| v.model().clone());
         assert_eq!(model.summary().as_deref(), Some("1 running · 2 finished"));
         let failed = &model.rows()[2];
         assert_eq!(failed.status_label(), "Failed · exit 3");
+        assert_eq!(failed.failure_detail().as_deref(), Some("exit 3"));
+        assert_eq!(failed.finished_ago(Utc::now()), "30m ago");
         let theme = vcx.update(|_, cx| *cx.global::<Theme>());
         assert_eq!(theme.tone(failed.status_tone()), theme.red, "a failure reads red");
         assert!(vcx.debug_bounds("job-status-j7").is_some());
@@ -888,9 +1350,13 @@ mod tests {
 
         let row = vcx.debug_bounds("job-row-j1").unwrap();
         let bar = vcx.debug_bounds("job-bar-j1").expect("an estimated running job draws a bar");
-        // Flush along the row's bottom edge, its full width, like a card's.
-        assert_eq!((bar.bottom(), bar.left(), bar.size.width), (row.bottom(), row.left(), row.size.width), "{bar:?} in {row:?}");
-        assert!(bar.top() > row.center().y, "along the row's bottom: {bar:?} in {row:?}");
+        // A thick rounded bar inside the card, under its title.
+        assert_eq!(bar.size.height, px(CARD_BAR_H), "{bar:?}");
+        assert!(bar.left() > row.left() && bar.right() < row.right(), "inside the card: {bar:?} in {row:?}");
+        let title = vcx.debug_bounds("job-duration-j1").unwrap();
+        assert!(bar.top() > title.bottom(), "under the title: {bar:?}");
+        assert!(bar.size.width > row.size.width / 2.0, "most of the card's width: {bar:?}");
+        assert!(vcx.debug_bounds("job-bar-label-j1").is_some());
         let model = view.read_with(&vcx, |v, _| v.model().clone());
         let quarter = model.rows().iter().find(|r| r.id == "j1").unwrap().bar(Utc::now()).unwrap();
         assert!((quarter.fraction() - 0.25).abs() < 0.02, "a quarter full: {}", quarter.fraction());
@@ -902,6 +1368,9 @@ mod tests {
         assert_eq!(late.status_label_at(Utc::now()), "Overdue");
         let over = late.bar(Utc::now()).unwrap();
         assert!(over.overdue() && over.fraction() == 1.0);
+        assert_eq!(late.bar_label(Utc::now()).as_deref(), Some("15m over"));
+        assert!(vcx.debug_bounds("job-status-j2").is_some(), "the Overdue chip");
+        assert!(vcx.debug_bounds("job-status-j1").is_none(), "on time: the spinner says it all");
         assert!(late.duration(Utc::now()).ends_with("/ 30m"));
 
         // No estimate, or finished: no bar; the finished one keeps its text.
@@ -912,6 +1381,70 @@ mod tests {
         assert!(vcx.debug_bounds("job-duration-j0").is_some());
         let row = vcx.debug_bounds("job-row-j2").unwrap();
         assert!(row.right() <= px(1000.0), "no sideways scroll");
+        view.update(&mut vcx, |v, _| v.stop_workers());
+    }
+
+    #[gpui::test]
+    fn a_running_card_shows_its_last_output_line_kind_and_starter(cx: &mut TestAppContext) {
+        let _home = shelbi_app::settings::agents::fixture::Home::new("dt-jobs-card", PROJECT, crate::test_env::lock());
+        let now = Utc::now();
+        let mut built = job("j1", JobKind::Command, "cargo build", Some("bundle"), now - chrono::Duration::minutes(2));
+        built.started_by = Some(shelbi_state::awareness::JobStarter {
+            workspace: "alpha".into(),
+            agent: Some("developer".into()),
+            task: None,
+        });
+        set_jobs(vec![built, job("j2", JobKind::Pr, "2265", None, now - chrono::Duration::minutes(5))]);
+        write_log("j1", "\u{1b}[32m   Compiling\u{1b}[0m shelbi v0.42.0\nBundling Shelbi.app\n");
+        let (view, mut vcx) = open(cx, shelbi_orchestrator::source::local_handle(PROJECT));
+        assert!(
+            read_until(&view, &mut vcx, |m| m.rows().iter().any(|r| r.last_line.is_some())),
+            "the first read lands, with the job's output"
+        );
+        let model = view.read_with(&vcx, |v, _| v.model().clone());
+        // The command started 2m ago, the watch 5m ago: newest first.
+        let (cmd, pr) = (&model.rows()[0], &model.rows()[1]);
+        assert_eq!((cmd.id.as_str(), pr.id.as_str()), ("j1", "j2"));
+        assert_eq!((cmd.activity_line().as_str(), cmd.activity_is_output()), ("Bundling Shelbi.app", true));
+        assert_eq!((cmd.kind_label().as_str(), cmd.started_by_label().as_str()), ("Command", "alpha"));
+        assert_eq!(pr.activity_line(), "Waiting for PR #2265 to merge or close");
+        assert_eq!((pr.kind_label().as_str(), pr.started_by_label().as_str()), ("PR #2265", "orchestrator"));
+        for part in ["live", "duration", "kind", "by", "activity"] {
+            for id in ["j1", "j2"] {
+                let sel: &'static str = Box::leak(format!("job-{part}-{id}").into_boxed_str());
+                let b = vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} drawn"));
+                let card = vcx.debug_bounds(Box::leak(format!("job-row-{id}").into_boxed_str())).unwrap();
+                assert!(b.left() >= card.left() && b.right() <= card.right(), "{sel} inside its card");
+            }
+        }
+        // A watch has no command line to show; the command job does.
+        assert!(vcx.debug_bounds("job-command-j1").is_some() && vcx.debug_bounds("job-command-j2").is_none());
+        view.update(&mut vcx, |v, _| v.stop_workers());
+    }
+
+    #[gpui::test]
+    fn a_narrow_window_cuts_every_long_line_and_never_scrolls_sideways(cx: &mut TestAppContext) {
+        let _home = shelbi_app::settings::agents::fixture::Home::new("dt-jobs-narrow", PROJECT, crate::test_env::lock());
+        let now = Utc::now();
+        let label = "a very long label that names everything this job does and then some more words";
+        set_jobs(vec![job("j1", JobKind::Command, LONG, Some(label), now - chrono::Duration::minutes(2))]);
+        write_log("j1", &format!("{}\n", "x".repeat(300)));
+        let mut failed = JobRecord::finished(
+            &job("j0", JobKind::Command, LONG, Some(label), now - chrono::Duration::minutes(9)),
+            JobStatus::Failed,
+            now - chrono::Duration::minutes(8),
+        );
+        failed.exit_code = Some(1);
+        failed.detail = Some("e".repeat(300));
+        record_finished_jobs(PROJECT, vec![failed], now).unwrap();
+        let (view, mut vcx) = open(cx, shelbi_orchestrator::source::local_handle(PROJECT));
+        vcx.simulate_resize(gpui::size(px(520.0), px(600.0)));
+        assert!(read_until(&view, &mut vcx, |m| m.rows().len() == 2 && m.rows()[0].last_line.is_some()));
+        let root = vcx.debug_bounds("jobs").unwrap();
+        for sel in ["job-row-j1", "job-activity-j1", "job-command-j1", "job-row-j0", "job-failure-j0", "job-ago-j0"] {
+            let b = vcx.debug_bounds(sel).unwrap_or_else(|| panic!("{sel} drawn"));
+            assert!(b.right() <= root.right(), "{sel} stays in the window: {b:?} in {root:?}");
+        }
         view.update(&mut vcx, |v, _| v.stop_workers());
     }
 
