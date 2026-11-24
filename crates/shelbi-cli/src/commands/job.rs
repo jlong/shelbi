@@ -45,7 +45,7 @@ pub enum JobCmd {
         /// A short name for the event line and `job list`.
         #[arg(long)]
         label: Option<String>,
-        /// How long it should take (`45m`, `2h`, `1h30m`). If it is still
+        /// How long it should take (`45m`, `2h`, `1h30m`, `1d`). If it is still
         /// running after that, a job `overdue` line goes to the events log,
         /// then again every half the estimate (at least 10m) until it exits.
         #[arg(long, value_name = "DURATION")]
@@ -68,7 +68,7 @@ pub enum JobCmd {
         /// A short name for the event line and `job list`.
         #[arg(long)]
         label: Option<String>,
-        /// How long it should take (`45m`, `2h`, `1h30m`); see `job run
+        /// How long it should take (`45m`, `2h`, `1h30m`, `1d`); see `job run
         /// --estimate`.
         #[arg(long, value_name = "DURATION")]
         estimate: Option<String>,
@@ -78,7 +78,7 @@ pub enum JobCmd {
     /// alerts on the next tick.
     Estimate {
         id: String,
-        /// `45m`, `2h`, `1h30m`.
+        /// `45m`, `2h`, `1h30m`, `1d`.
         duration: String,
     },
     /// List the jobs still being watched. `--all` adds the finished ones
@@ -163,7 +163,7 @@ pub fn run(project_opt: Option<String>, cmd: JobCmd) -> Result<()> {
             println!(
                 "✓ {verb} estimate for job {}: {} ({})",
                 job.id,
-                shelbi_core::format_duration(d),
+                shelbi_core::display_duration(d),
                 progress_of(&job, Utc::now()).map(|p| p.status_text()).unwrap_or_default()
             );
             Ok(())
@@ -196,7 +196,7 @@ pub fn run(project_opt: Option<String>, cmd: JobCmd) -> Result<()> {
     }
 }
 
-/// `--estimate`'s value, parsed: `45m`, `2h`, `1h30m`.
+/// `--estimate`'s value, parsed: `45m`, `2h`, `1h30m`, `1d`.
 fn parse_estimate(value: Option<&str>) -> Result<Option<Duration>> {
     value
         .map(|v| shelbi_core::parse_duration(v).map_err(|e| anyhow!("--estimate: {e}")))
@@ -206,7 +206,7 @@ fn parse_estimate(value: Option<&str>) -> Result<Option<Duration>> {
 /// The `  estimate: 30m` line after a job starts with one.
 fn print_estimate(job: &Job) {
     if let Some(d) = job.estimate {
-        println!("  estimate: {}", shelbi_core::format_duration(d));
+        println!("  estimate: {}", shelbi_core::display_duration(d));
     }
 }
 
@@ -230,7 +230,7 @@ fn record_progress(record: &JobRecord) -> Option<EstimateProgress> {
 
 /// `12m/30m`: elapsed (or how long it ran) against the estimate, compact.
 fn against(progress: &EstimateProgress) -> String {
-    format!("{}/{}", duration_text(progress.elapsed), shelbi_core::format_duration(progress.estimate))
+    format!("{}/{}", duration_text(progress.elapsed), shelbi_core::display_duration(progress.estimate))
 }
 
 /// `shelbi __job-exec <id> -- <cmd...>`. Only `job run` starts it, after
@@ -295,7 +295,7 @@ fn list_json(jobs: &[Job], history: &[JobRecord]) -> Result<serde_json::Value> {
 
 /// A duration as the listings show it, whole seconds (`2m13s`).
 fn duration_text(d: Duration) -> String {
-    shelbi_core::format_duration(Duration::from_secs(d.as_secs()))
+    shelbi_core::display_duration(Duration::from_secs(d.as_secs()))
 }
 
 /// `job list --all`: running jobs, then finished ones, newest first.
@@ -507,13 +507,13 @@ fn log_header(found: &Found, now: DateTime<Utc>) -> Option<String> {
 
 /// `30m estimate, elapsed 12m, 18m left` / `..., overdue by 15m`.
 fn estimate_text(p: &EstimateProgress) -> String {
-    format!("{} estimate, {}", shelbi_core::format_duration(p.estimate), p.status_text())
+    format!("{} estimate, {}", shelbi_core::display_duration(p.estimate), p.status_text())
 }
 
 /// How a finished job went against its estimate: `ran 12m of a 30m
 /// estimate` / `ran 45m, 15m over its 30m estimate`.
 fn ran_text(p: &EstimateProgress) -> String {
-    let estimate = shelbi_core::format_duration(p.estimate);
+    let estimate = shelbi_core::display_duration(p.estimate);
     if p.elapsed > p.estimate {
         format!(
             "ran {}, {} over its {estimate} estimate",

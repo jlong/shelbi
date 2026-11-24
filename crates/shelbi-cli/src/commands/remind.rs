@@ -18,12 +18,12 @@ use super::require_registered_project;
 pub enum RemindCmd {
     /// Remind me after a duration: `shelbi remind in 1h "check the tap PR"`.
     In {
-        /// How long from now: `30s`, `10m`, `1h`, `1h30m`.
+        /// How long from now: `30s`, `10m`, `1h`, `1h30m`, `3d`.
         duration: String,
         /// What to be reminded of (the words are joined, so quoting is optional).
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
-        /// Repeat every DURATION after the first (at least 10m).
+        /// Repeat every DURATION after the first (at least 10m; `1d` for daily).
         #[arg(long, value_name = "DURATION")]
         every: Option<String>,
     },
@@ -33,7 +33,7 @@ pub enum RemindCmd {
         time: String,
         #[arg(required = true, num_args = 1..)]
         text: Vec<String>,
-        /// Repeat every DURATION after the first (at least 10m).
+        /// Repeat every DURATION after the first (at least 10m; `1d` for daily).
         #[arg(long, value_name = "DURATION")]
         every: Option<String>,
     },
@@ -102,7 +102,7 @@ fn add(project: &str, due: DateTime<Utc>, text: &[String], every: Option<&str>) 
     let r = awareness::add_reminder(project, due, &text.join(" "), every).map_err(|e| anyhow!(e))?;
     let repeat = r
         .every
-        .map(|e| format!(", then every {}", shelbi_core::format_duration(e)))
+        .map(|e| format!(", then every {}", shelbi_core::display_duration(e)))
         .unwrap_or_default();
     println!(
         "✓ reminder {} due {} ({}{repeat})",
@@ -163,11 +163,11 @@ pub(crate) fn relative(t: DateTime<Utc>, now: DateTime<Utc>) -> String {
         0 => "now".into(),
         s if s > 0 => format!(
             "in {}",
-            shelbi_core::format_duration(std::time::Duration::from_secs(round(s as u64)))
+            shelbi_core::display_duration(std::time::Duration::from_secs(round(s as u64)))
         ),
         s => format!(
             "{} ago",
-            shelbi_core::format_duration(std::time::Duration::from_secs(round(s.unsigned_abs())))
+            shelbi_core::display_duration(std::time::Duration::from_secs(round(s.unsigned_abs())))
         ),
     }
 }
@@ -196,7 +196,7 @@ fn render_all(reminders: &[Reminder], fired: &[FiredReminder], now: DateTime<Utc
         return "no reminders\n".into();
     }
     let every = |e: Option<std::time::Duration>| {
-        e.map(|e| format!("  (every {})", shelbi_core::format_duration(e))).unwrap_or_default()
+        e.map(|e| format!("  (every {})", shelbi_core::display_duration(e))).unwrap_or_default()
     };
     let mut out = String::new();
     for r in reminders {
@@ -232,7 +232,7 @@ fn render_list(reminders: &[Reminder], now: DateTime<Utc>) -> String {
     for r in reminders {
         let every = r
             .every
-            .map(|e| format!("  (every {})", shelbi_core::format_duration(e)))
+            .map(|e| format!("  (every {})", shelbi_core::display_duration(e)))
             .unwrap_or_default();
         out.push_str(&format!(
             "{:<5} {}  {:<10} {}{every}\n",
@@ -298,7 +298,10 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2, "{text}");
         assert!(lines[0].starts_with("r9    pending") && lines[0].contains("in 14m"), "{text}");
-        assert!(lines[0].ends_with("check PR CI  (every 24h)"), "{text}");
+        // Displayed in days; `--json` and the store keep the `h` form.
+        assert!(lines[0].ends_with("check PR CI  (every 1d)"), "{text}");
+        let json = list_json(std::slice::from_ref(&pending), &[]).unwrap();
+        assert_eq!(json[0]["every"], "24h");
         assert!(lines[1].starts_with("r8    fired") && lines[1].contains("20m ago"), "{text}");
         assert!(lines[1].ends_with("check deploy"), "{text}");
         assert_eq!(render_all(&[], &[], now), "no reminders\n");

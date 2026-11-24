@@ -118,7 +118,7 @@ pub enum IssueCmd {
         /// over from someone else). The orchestrator never passes this itself.
         #[arg(long)]
         take: bool,
-        /// How long the issue should stay active (`45m`, `2h`, `1h30m`). If it
+        /// How long the issue should stay active (`45m`, `2h`, `1h30m`, `1d`). If it
         /// is still active after that, an `overdue` line goes to the events
         /// log, then again every half the estimate (at least 10m) until it
         /// leaves the active category. Without it, the issue's workflow
@@ -131,7 +131,7 @@ pub enum IssueCmd {
     /// started; a revision that is already exceeded alerts on the next tick.
     Estimate {
         id: String,
-        /// `45m`, `2h`, `1h30m`.
+        /// `45m`, `2h`, `1h30m`, `1d`.
         duration: String,
     },
     /// Relaunch the assigned workspace on the issue it is ALREADY working,
@@ -474,7 +474,7 @@ fn record_start_estimate(project: &str, id: &str, explicit: Option<std::time::Du
         Ok(estimate)
     })();
     match result {
-        Ok(Some(d)) => println!("  estimate: {}", shelbi_core::format_duration(d)),
+        Ok(Some(d)) => println!("  estimate: {}", shelbi_core::display_duration(d)),
         Ok(None) => {}
         Err(e) => eprintln!("warning: issue started, but its estimate was not recorded: {e}"),
     }
@@ -504,7 +504,7 @@ fn set_estimate(project: &str, id: &str, duration: &str) -> Result<()> {
     let verb = if existing.is_some() { "revised" } else { "set" };
     println!(
         "✓ {verb} estimate for {id}: {} ({})",
-        shelbi_core::format_duration(est.estimate),
+        shelbi_core::display_duration(est.estimate),
         estimate_status(&est, chrono::Utc::now())
     );
     Ok(())
@@ -840,7 +840,7 @@ fn show(project: &str, id: &str) -> Result<()> {
         }
         println!(
             "→ estimate: {} ({})",
-            shelbi_core::format_duration(est.estimate),
+            shelbi_core::display_duration(est.estimate),
             estimate_status(&est, chrono::Utc::now())
         );
     }

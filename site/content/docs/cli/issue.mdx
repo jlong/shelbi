@@ -218,7 +218,7 @@ the orchestrator runs when an issue hits `todo`.
 | `--reason <REASON>` | string | `user:cli:start` | Reason tag recorded in `~/.shelbi/events.log` when the column transitions to `in_progress`. |
 | `--force` | flag | off | Launch on a `review`-tagged workspace anyway (refused by default). Recorded in `~/.shelbi/events.log`. |
 | `--take` | flag | off | On a remote issue tracker (e.g. GitHub), assign the issue to you on the tracker before starting. Needed for an unassigned issue or one you're taking over; Shelbi only starts issues assigned to you there. The orchestrator never passes it. |
-| `--estimate <DURATION>` | duration | workflow `default_estimate` | How long the issue should stay active (`45m`, `2h`, `1h30m`). See [estimate](#estimate). |
+| `--estimate <DURATION>` | duration | workflow `default_estimate` | How long the issue should stay active (`45m`, `2h`, `1h30m`, `1d`). See [estimate](#estimate). |
 
 ## estimate
 
