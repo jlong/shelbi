@@ -2048,6 +2048,10 @@ impl Run {
         self.save(handle, "settings-agent-details");
 
         let handle = open(self, "developer");
+        edit(self, handle, &|e, window, cx| e.offscreen_focus_instructions(window, cx));
+        self.save(handle, "state-agent-details-focused");
+
+        let handle = open(self, "developer");
         edit(self, handle, &|e, window, cx| {
             e.make(Change::Permissions(Some("acceptEdits".into())), window, cx);
             e.offscreen_open_menu(Menu::More, cx);
@@ -3676,6 +3680,11 @@ impl Run {
             return;
         }
 
+        if std::env::var(ONLY_VAR).is_ok_and(|v| v == "agents") {
+            self.settings_agents();
+            return;
+        }
+
         if std::env::var(ONLY_VAR).is_ok_and(|v| v == "workspaces") {
             self.settings_workspaces();
             return;
@@ -5011,13 +5020,17 @@ workspaces:
     // Settings: the frame's Shelbi CLI path, as an override (the window has
     // no discovery to show, so it draws with Reset). Its font and size predate the
     // Source Code Pro default, so those keep theirs.
-    // The run's contrast is the saved one too, so Settings shows it (and
-    // reading the file doesn't put the theme back to 0).
-    let contrast = crate::visual_check::theme().contrast();
+    // The run's contrast and opacity are the saved ones too, so Settings
+    // shows them (and reading the file doesn't put the theme back to 0
+    // contrast, opaque).
+    let theme = crate::visual_check::theme();
+    let contrast = theme.contrast();
     let contrast = if contrast == 0 { String::new() } else { format!("  contrast: {contrast}\n") };
+    let opacity = (theme.opacity() * 100.0).round() as u8;
+    let opacity = if opacity >= 100 { String::new() } else { format!("  window_opacity: {opacity}\n") };
     std::fs::write(
         home.join("config.yaml"),
-        format!("desktop:\n  cli_path: /opt/homebrew/bin/shelbi\n{contrast}"),
+        format!("desktop:\n  cli_path: /opt/homebrew/bin/shelbi\n{contrast}{opacity}"),
     )
     .unwrap();
 }
