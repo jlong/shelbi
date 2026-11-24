@@ -12,7 +12,9 @@
 //!   switches to it ([`move_tab`]);
 //! - torn off: a new window opens holding just that tab, its tab under the
 //!   pointer ([`tear_off`]), unless it was the window's only tab, when the
-//!   window itself moves there.
+//!   window itself moves there. Without global positions (Wayland) the new
+//!   window opens where the compositor puts it, and only the tab menu's
+//!   "Move to window" moves a tab into another window ([`move_tab_to`]).
 //!
 //! The project travels as a switch does: the giving window remembers where
 //! it was left, the taking window adopts that and attaches the same daemon
@@ -84,6 +86,7 @@ impl ShelbiWindow {
         state.reduce_motion = (self.reduce_motion)();
         // Any tab can leave: a remote one takes its host along.
         state.tearable = true;
+        state.can_float = screen::global_positions();
         let frame = screen::content_frame(window);
         let at = window.mouse_position();
         state.pointer = frame.origin + point(at.x.as_f32(), at.y.as_f32());
@@ -100,6 +103,11 @@ impl ShelbiWindow {
             .borrow()
             .bar
             .map(|bar| BarSpot { window: me, frame, bar: on_screen(bar, &frame) });
+        // No shared screen space (Wayland): the other windows' bars can't be
+        // placed against the pointer, so only this one's counts.
+        if !screen::global_positions() {
+            return own.into_iter().collect();
+        }
         let mut bars = Vec::new();
         let mut own_listed = false;
         for handle in windows_front_to_back(cx) {
@@ -222,7 +230,7 @@ impl ShelbiWindow {
                 let tear = TearOff {
                     project: state.project.clone(),
                     from: me,
-                    at: state.pointer,
+                    at: Some(state.pointer),
                     grab: state.grab,
                     first_x: state.first_x,
                 };
@@ -360,8 +368,9 @@ fn move_tab(landing: Landing, from: WindowId, to: WindowId, cx: &mut App) {
 struct TearOff {
     project: String,
     from: WindowId,
-    /// The drop, in screen space.
-    at: Point<f32>,
+    /// The drop, in screen space (`None`: no drop, Move to Window ▸ New
+    /// Window; the window opens where a new one would).
+    at: Option<Point<f32>>,
     /// Where in the tab the pointer held it.
     grab: Point<f32>,
     /// Where the source window's first tab starts (the new window's only
@@ -392,18 +401,30 @@ fn tear_off(t: TearOff, cx: &mut App) {
     }) else {
         return;
     };
-    let origin = t.at - point(t.first_x + t.grab.x, t.grab.y);
-    // Display-relative, on the display the tab was dropped on (screen space
-    // is the source's display-relative space when the platform can't say).
-    let (origin, display) = match screen::display_at(t.at, cx) {
-        Some((id, top_left)) => {
-            let display = cx.displays().into_iter().find(|d| d.id() == id).map(|d| display_ref(&*d));
-            (origin - top_left, display)
+    // Where there is no screen space to place it in (Wayland), the
+    // compositor places it (Hyprland tiles it).
+    let at = t.at.filter(|_| screen::global_positions());
+    let bounds = match at {
+        Some(at) => {
+            let origin = at - point(t.first_x + t.grab.x, t.grab.y);
+            // Display-relative, on the display the tab was dropped on (screen
+            // space is the source's display-relative space when the platform
+            // can't say).
+            let (origin, display) = match screen::display_at(at, cx) {
+                Some((id, top_left)) => {
+                    let display = cx.displays().into_iter().find(|d| d.id() == id).map(|d| display_ref(&*d));
+                    (origin - top_left, display)
+                }
+                None => (origin, source_display),
+            };
+            state.display = display;
+            Some(Bounds::new(point(px(origin.x), px(origin.y)), size))
         }
-        None => (origin, source_display),
+        None => {
+            state.display = source_display;
+            None
+        }
     };
-    state.display = display;
-    let bounds = Bounds::new(point(px(origin.x), px(origin.y)), size);
     let taken: Vec<usize> = cx
         .try_global::<Shell>()
         .map(|s| s.windows.iter().map(|w| w.slot).collect())
@@ -412,7 +433,7 @@ fn tear_off(t: TearOff, cx: &mut App) {
     // A remote tab opens over its host, as the source had it open (or, not
     // yet open there, opening in the new window's tab).
     let key = tab_key(&t.project);
-    let Some(handle) = open_window_on(&key, host, slot, state, Some(bounds), cx) else {
+    let Some(handle) = open_window_on(&key, host, slot, state, bounds, cx) else {
         return;
     };
     let _ = handle.update(cx, |w, window, cx| {
@@ -422,6 +443,54 @@ fn tear_off(t: TearOff, cx: &mut App) {
         window.activate_window();
     });
     let _ = source.update(cx, |w, window, cx| w.give_up_tab(&t.project, window, cx));
+}
+
+/// The tab menu's Move to Window: move `project`'s tab from window `from`
+/// to window `to`, as its last tab (`None`: into a new window of its own).
+/// Where the project was left, and a remote tab's open host, travel with it,
+/// as they do when the tab is dragged there.
+pub(super) fn move_tab_to(project: String, from: WindowId, to: Option<WindowId>, cx: &mut App) {
+    let Some(to) = to else {
+        tear_off(
+            TearOff {
+                project,
+                from,
+                at: None,
+                grab: Point::default(),
+                first_x: 0.0,
+            },
+            cx,
+        );
+        return;
+    };
+    let (Some(source), Some(target)) = (find_window(from, cx), find_window(to, cx)) else {
+        return;
+    };
+    let host = source
+        .update(cx, |w, _, cx| {
+            if w.shows(&project) {
+                w.remember_view_state(cx);
+            }
+            w.host_of_tab(&project)
+        })
+        .ok()
+        .flatten();
+    if target
+        .update(cx, |w, window, cx| {
+            if let Some(host) = host {
+                w.adopt_host(host, cx);
+            }
+            if w.tabs.insert(&project) {
+                w.tabs_changed(cx);
+            }
+            window.activate_window();
+            w.switch_to(&project, window, cx);
+            cx.notify();
+        })
+        .is_ok()
+    {
+        let _ = source.update(cx, |w, window, cx| w.give_up_tab(&project, window, cx));
+    }
 }
 
 /// The `+` slot's width in `reorder`'s bar as it last painted (wider while

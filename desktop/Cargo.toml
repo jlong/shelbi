@@ -166,6 +166,9 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = 
 # Motion and overlay scroll bars): the version and runtime gpui's Linux
 # backend already uses, so the lockfile only records the edge.
 ashpd = { version = "0.13", default-features = false, features = ["async-io", "file_chooser", "settings"] }
+# The chosen app icon, scaled to the hicolor theme's sizes
+# (`platform::dock_icon`). Already in the tree (`--visual-check`'s).
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [features]
 # `cargo run --features visual-check -- --visual-check <dir>`: render the

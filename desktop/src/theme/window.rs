@@ -13,9 +13,11 @@
 //! and the blur is the window server's own background blur at the chosen
 //! radius ([`crate::platform::blur`]).
 //!
-//! Reduce Transparency (System Settings ▸ Accessibility ▸ Display) makes
+//! Reduce Transparency (System Settings ▸ Accessibility ▸ Display; on Linux
+//! the desktop's high contrast, or a session that can't composite) makes
 //! every window opaque whatever the setting says; [`sync_reduce_transparency`]
-//! reads it when a window activates, as Reduce Motion is.
+//! reads it when a window activates, as Reduce Motion is. On Linux the
+//! compositor blurs, at its own radius ([`crate::platform::blur`]).
 
 use std::ops::RangeInclusive;
 

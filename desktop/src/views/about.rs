@@ -66,7 +66,7 @@ pub fn options(title: &str, size: (f32, f32), resizable: bool, cx: &App) -> Wind
         is_resizable: resizable,
         is_minimizable: resizable,
         window_min_size: resizable.then(|| gpui::size(px(super::bundled_software::MIN_SIZE.0), px(super::bundled_software::MIN_SIZE.1))),
-        app_id: Some("co.32pixels.shelbi".into()),
+        app_id: Some(crate::platform::os::APP_ID.into()),
         ..Default::default()
     }
 }

@@ -86,7 +86,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use gpui::{
-    div, point, prelude::*, px, App, Context, Div, Entity, EventEmitter, Focusable, Image, ImageFormat,
+    div, point, prelude::*, px, App, Context, Div, Entity, EventEmitter, Focusable, Image,
     PathPromptOptions, ScrollHandle, SharedString, Subscription, Window,
 };
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, MoveDown, MoveUp};
@@ -1457,8 +1457,8 @@ impl SettingsView {
             paths
                 .into_iter()
                 .filter_map(|p| {
-                    let png = crate::platform::app_icons::png(&p, tool_select::APP_ICON_PX)?;
-                    Some((p, Arc::new(Image::from_bytes(ImageFormat::Png, png))))
+                    let (format, bytes) = crate::platform::app_icons::image(&p, tool_select::APP_ICON_PX)?;
+                    Some((p, Arc::new(Image::from_bytes(format, bytes))))
                 })
                 .collect::<Vec<_>>()
         });
@@ -2105,6 +2105,14 @@ impl SettingsView {
     fn render_translucency(&self, theme: &Theme, cx: &App) -> impl IntoElement {
         let reduced = WindowLook::current(cx).reduce_transparency;
         let help = |text: &'static str| (!reduced).then(|| SharedString::from(text));
+        let adjustable = crate::platform::blur::radius_adjustable();
+        let opacity_help = if adjustable {
+            "How much of the desktop shows through the window. 100% is opaque."
+        } else {
+            // The compositor blurs it (Hyprland's `decoration:blur`).
+            "How much of the desktop shows through the window. 100% is opaque. \
+             Your compositor blurs what shows through."
+        };
         div()
             .flex()
             .flex_col()
@@ -2112,25 +2120,23 @@ impl SettingsView {
             .child(controls::labeled_control(
                 "Window transparency",
                 self.opacity_slider.clone(),
-                help("How much of the desktop shows through the window. 100% is opaque."),
+                help(opacity_help),
                 theme,
             ))
-            .child(controls::labeled_control(
-                "Background blur",
-                self.blur_slider.clone(),
-                help("Blurs what shows through. 0 is a clear see-through."),
-                theme,
-            ))
+            .when(adjustable, |d| {
+                d.child(controls::labeled_control(
+                    "Background blur",
+                    self.blur_slider.clone(),
+                    help("Blurs what shows through. 0 is a clear see-through."),
+                    theme,
+                ))
+            })
             .when(reduced, |d| {
                 d.child(
                     div()
                         .debug_selector(|| "settings-reduce-transparency".into())
                         .mt(px(-18.0))
-                        .child(controls::helper(
-                            "Reduce Transparency is on (System Settings ▸ Accessibility ▸ Display), \
-                             so windows are opaque.",
-                            theme,
-                        )),
+                        .child(controls::helper(crate::platform::blur::opaque_note(), theme)),
                 )
             })
     }

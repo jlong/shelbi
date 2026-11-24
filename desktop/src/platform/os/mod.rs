@@ -32,9 +32,11 @@ mod imp;
 
 pub use imp::*;
 
-/// The app's reverse-DNS id: the Linux app id (and `.desktop` file name).
-/// The macOS bundle names itself in `Info.plist`.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+/// The app's reverse-DNS id: every window's Wayland app id (X11 `WM_CLASS`),
+/// which Hyprland's window rules match and which names the `.desktop` file
+/// (`packaging/linux/dev.shelbi.Desktop.desktop`) and the hicolor icons the
+/// compositor and the bar show for it. gpui ignores it on macOS, whose
+/// bundle names itself in `Info.plist`.
 pub const APP_ID: &str = "dev.shelbi.Desktop";
 
 /// The app's display name, as notifications carry it on Linux.

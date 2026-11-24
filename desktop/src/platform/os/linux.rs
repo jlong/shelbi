@@ -100,9 +100,16 @@ pub fn open_text(path: &Path) -> Result<(), String> {
     open(&path.to_string_lossy())
 }
 
-/// Open `file` in `app`: an executable is run with the file; anything else
-/// (an `.app` from a Mac's `config.yaml`) has no meaning here.
+/// Open `file` in `app`: a desktop entry (what the tool pickers list here)
+/// runs its `Exec` line on the file, an executable is run with the file;
+/// anything else (an `.app` from a Mac's `config.yaml`) has no meaning here.
 pub fn open_with_app(app: &Path, file: &Path) -> Result<(), String> {
+    if app.extension().is_some_and(|e| e == "desktop") {
+        let argv = shelbi_state::tools::desktop_exec_argv(app, &[file.to_string_lossy().into_owned()])?;
+        let mut cmd = Command::new(&argv[0]);
+        cmd.args(&argv[1..]);
+        return spawn_detached(cmd);
+    }
     if !crate::platform::discovery::is_executable_file(app) {
         return Err(format!(
             "{} isn't a program this computer can run: choose an editor command in Settings",

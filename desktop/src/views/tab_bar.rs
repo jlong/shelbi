@@ -40,8 +40,14 @@
 //! Right-clicking a project's tab (never the `+` slot) opens its context menu at
 //! the pointer ([`TabMenu`]): "Close Project", closing that tab's project as
 //! its `×` does, and "Close All Other Projects", closing every other tab's
-//! after one confirmation (dimmed while it's the only tab). It closes on a
-//! press outside it or Esc.
+//! after one confirmation (dimmed while it's the only tab), then, past a
+//! rule, "Move to Window", whose submenu lists the other Shelbi windows (by
+//! title) and New Window: picking one moves the tab there as a drag between
+//! windows would, which is the only way to on Wayland, where a drag can't
+//! find another window ([`tab_tearoff`]). It is dimmed with nowhere to go
+//! (no other window, and the tab is the window's only one). Hovering the row,
+//! clicking it, or → on it opens the submenu; ← or Esc closes it. The menu
+//! closes on a press outside it or Esc.
 //!
 //! Dragging a tab moves it ([`TabReorder`], [`super::tab_drag`]): a
 //! tab-shaped ghost ([`TabGhost`]) follows the pointer, the dragged tab's
@@ -133,6 +139,12 @@ const PLUS_LABEL_W_GUESS: f32 = 52.0;
 
 /// A tab's context menu's width.
 const MENU_W: f32 = 240.0;
+/// Its Move to Window submenu's width.
+const SUBMENU_W: f32 = 200.0;
+/// How far down the menu the Move to Window row starts: the menu's 4pt
+/// padding, the two Close rows, and the rule ([`project_menu::divider`]'s
+/// 8 + 1 + 8). The submenu's first row lines up with it.
+const MOVE_ROW_Y: f32 = 4.0 + 2.0 * project_menu::ROW_H + 17.0;
 /// A tab's context menu's gap under the pointer.
 pub(super) const CONTEXT_GAP: f32 = 2.0;
 
@@ -266,12 +278,36 @@ struct TabLook {
     lifted: bool,
 }
 
+/// Where Move to Window can take a tab: another window, or a new one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoveTarget {
+    /// The window (`None`: a new one).
+    pub window: Option<gpui::WindowId>,
+    /// What the row says: the window's title, or "New Window".
+    pub label: SharedString,
+}
+
+impl MoveTarget {
+    /// The submenu's last row.
+    pub fn new_window() -> MoveTarget {
+        MoveTarget {
+            window: None,
+            label: "New Window".into(),
+        }
+    }
+}
+
 /// A tab's context menu, as one frame draws it.
 pub struct TabMenuProps<'a> {
     /// The project whose tab was right-clicked.
     pub project: &'a str,
     /// Another tab is open: "Close All Other Projects" can run.
     pub can_close_others: bool,
+    /// Where Move to Window can take the tab (none: the row is dimmed).
+    pub targets: &'a [MoveTarget],
+    /// The Move to Window submenu shows, and its keyboard row.
+    pub submenu: bool,
+    pub sub_highlight: Option<usize>,
     /// The keyboard's row ([`TabMenuRow`]), if the keys have moved onto one.
     pub highlight: Option<TabMenuRow>,
     /// How shown the menu is: 0 (hidden) to 1, eased.
@@ -285,15 +321,18 @@ pub struct TabMenuProps<'a> {
 pub enum TabMenuRow {
     CloseProject,
     CloseOthers,
+    /// Opens the Move to Window submenu.
+    MoveToWindow,
 }
 
 impl TabMenuRow {
-    pub const ALL: [TabMenuRow; 2] = [TabMenuRow::CloseProject, TabMenuRow::CloseOthers];
+    pub const ALL: [TabMenuRow; 3] = [TabMenuRow::CloseProject, TabMenuRow::CloseOthers, TabMenuRow::MoveToWindow];
 
     pub fn label(self) -> &'static str {
         match self {
             TabMenuRow::CloseProject => "Close Project",
             TabMenuRow::CloseOthers => "Close All Other Projects",
+            TabMenuRow::MoveToWindow => "Move to Window",
         }
     }
 
@@ -301,6 +340,7 @@ impl TabMenuRow {
         match self {
             TabMenuRow::CloseProject => "tab-context-close",
             TabMenuRow::CloseOthers => "tab-context-close-others",
+            TabMenuRow::MoveToWindow => "tab-context-move",
         }
     }
 }
@@ -314,6 +354,9 @@ pub struct TabMenu {
     open: bool,
     changed: Option<Instant>,
     highlight: Option<TabMenuRow>,
+    /// The Move to Window submenu shows, and its keyboard row.
+    submenu: bool,
+    sub_highlight: Option<usize>,
     /// The pointer where the tab was right-clicked (the menu's anchor).
     pub anchor: Anchor,
 }
@@ -340,6 +383,7 @@ impl TabMenu {
         self.project = Some(project.to_string());
         self.open = true;
         self.highlight = None;
+        self.close_submenu();
     }
 
     pub fn close(&mut self, now: Instant) {
@@ -347,6 +391,45 @@ impl TabMenu {
             self.open = false;
             self.changed = Some(now);
         }
+        self.close_submenu();
+    }
+
+    pub fn submenu_open(&self) -> bool {
+        self.submenu
+    }
+
+    pub fn sub_highlight(&self) -> Option<usize> {
+        self.sub_highlight
+    }
+
+    /// Show the Move to Window submenu (its row lit), its keyboard row on
+    /// `first` (the keys open it on its first row, the pointer on none).
+    pub fn open_submenu(&mut self, first: Option<usize>) {
+        self.highlight = Some(TabMenuRow::MoveToWindow);
+        if !self.submenu {
+            self.sub_highlight = first;
+        }
+        self.submenu = true;
+    }
+
+    pub fn close_submenu(&mut self) {
+        self.submenu = false;
+        self.sub_highlight = None;
+    }
+
+    /// Move the submenu's keyboard row by `delta` over its `len` rows,
+    /// wrapping.
+    pub fn step_submenu(&mut self, delta: isize, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let n = len as isize;
+        let at = match self.sub_highlight {
+            Some(ix) => (ix as isize + delta).rem_euclid(n),
+            None if delta < 0 => n - 1,
+            None => 0,
+        };
+        self.sub_highlight = Some(at as usize);
     }
 
     /// Move the keyboard's row by `delta` over the rows `enabled` allows,
@@ -859,15 +942,20 @@ fn render_tab_menu_layer<H: SidebarHost>(
     theme: &Theme,
     cx: &mut Context<H>,
 ) -> impl IntoElement {
+    // The submenu sits beside the menu inside one placed box, so a press on
+    // it is a press on the menu (not outside it, which would dismiss both).
+    let submenu = (menu.submenu && !menu.targets.is_empty()).then(|| render_move_submenu(menu, theme, cx));
     let body = div()
         .relative()
         .top(px((1.0 - menu.phase) * motion::SLIDE_PX))
         .opacity(menu.phase)
         .flex()
-        .flex_col()
+        .flex_row()
+        .items_start()
+        .gap_1()
         .min_h_0()
-        .w(px(MENU_W))
-        .child(render_tab_menu(menu, theme, cx));
+        .child(div().flex().flex_col().w(px(MENU_W)).child(render_tab_menu(menu, theme, cx)))
+        .children(submenu);
     let placed = placed(anchor, body).gap(CONTEXT_GAP);
     let placed = if menu.open {
         placed.on_dismiss(cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -880,29 +968,97 @@ fn render_tab_menu_layer<H: SidebarHost>(
 }
 
 /// The context menu's rows: Close Project, then Close All Other Projects
-/// (dimmed while there is no other tab), on the menus' raised fill.
+/// (dimmed while there is no other tab), a rule, and Move to Window (dimmed
+/// with nowhere to go), on the menus' raised fill.
 fn render_tab_menu<H: SidebarHost>(menu: &TabMenuProps<'_>, theme: &Theme, cx: &mut Context<H>) -> impl IntoElement {
-    let rows = TabMenuRow::ALL.into_iter().map(|row| {
+    let rows = TabMenuRow::ALL.into_iter().flat_map(|row| {
         let id = SharedString::from(row.selector());
-        if row == TabMenuRow::CloseOthers && !menu.can_close_others {
-            return project_menu::disabled_text_row(id.clone(), id, row.label(), theme).into_any_element();
-        }
-        let project = menu.project.to_string();
-        project_menu::text_row(id.clone(), id, row.label(), menu.highlight == Some(row), theme)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                let event = match row {
-                    TabMenuRow::CloseProject => SidebarEvent::CloseTab(project.clone()),
-                    TabMenuRow::CloseOthers => SidebarEvent::CloseOtherTabs(project.clone()),
-                };
-                this.sidebar_event(event, window, cx)
-            }))
-            .into_any_element()
+        let rule = (row == TabMenuRow::MoveToWindow).then(|| project_menu::divider(theme).into_any_element());
+        let disabled = match row {
+            TabMenuRow::CloseProject => false,
+            TabMenuRow::CloseOthers => !menu.can_close_others,
+            TabMenuRow::MoveToWindow => menu.targets.is_empty(),
+        };
+        let element = if disabled {
+            project_menu::disabled_text_row(id.clone(), id, row.label(), theme).into_any_element()
+        } else if row == TabMenuRow::MoveToWindow {
+            let lit = menu.highlight == Some(row) || menu.submenu;
+            let row = project_menu::text_row(id.clone(), id, row.label(), lit, theme)
+                .child(heroicon(icons::CHEVRON_RIGHT_MENU).flex_none().text_color(theme.gray))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.sidebar_event(SidebarEvent::OpenTabSubmenu, window, cx)
+                }));
+            on_row_hover("tab-context-move-hover", SidebarEvent::OpenTabSubmenu, row, cx).into_any_element()
+        } else {
+            let project = menu.project.to_string();
+            let hover_id = SharedString::from(format!("{}-hover", row.selector()));
+            let row = project_menu::text_row(id.clone(), id, row.label(), menu.highlight == Some(row), theme)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let event = match row {
+                        TabMenuRow::CloseOthers => SidebarEvent::CloseOtherTabs(project.clone()),
+                        _ => SidebarEvent::CloseTab(project.clone()),
+                    };
+                    this.sidebar_event(event, window, cx)
+                }));
+            on_row_hover(hover_id, SidebarEvent::CloseTabSubmenu, row, cx).into_any_element()
+        };
+        rule.into_iter().chain(std::iter::once(element))
     });
     div()
         .id("tab-context-menu")
         .debug_selector(|| "tab-context-menu".into())
         .flex()
         .flex_col()
+        .px_1()
+        .py_1()
+        .rounded(px(NAV_RADIUS))
+        .bg(theme.raised.blend(theme.search))
+        .text_color(theme.foreground)
+        .occlude()
+        .children(rows)
+}
+
+/// `row` in a wrapper that sends `event` when the pointer enters it (the
+/// row's own hover drives its fill fade, and an element has one).
+fn on_row_hover<H: SidebarHost>(
+    id: impl Into<SharedString>,
+    event: SidebarEvent,
+    row: impl IntoElement,
+    cx: &mut Context<H>,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    div()
+        .id(id)
+        .flex()
+        .flex_col()
+        .on_hover(cx.listener(move |this, hovered: &bool, window, cx| {
+            if *hovered {
+                this.sidebar_event(event.clone(), window, cx)
+            }
+        }))
+        .child(row)
+}
+
+/// The Move to Window submenu, beside the menu at its row: a row per other
+/// window (its title), then New Window.
+fn render_move_submenu<H: SidebarHost>(menu: &TabMenuProps<'_>, theme: &Theme, cx: &mut Context<H>) -> impl IntoElement {
+    let rows = menu.targets.iter().enumerate().map(|(ix, target)| {
+        let id = SharedString::from(format!("tab-move-{ix}"));
+        let project = menu.project.to_string();
+        let to = target.window;
+        project_menu::text_row(id.clone(), id, target.label.clone(), menu.sub_highlight == Some(ix), theme).on_click(
+            cx.listener(move |this, _, window, cx| {
+                this.sidebar_event(SidebarEvent::MoveTab(project.clone(), to), window, cx)
+            }),
+        )
+    });
+    div()
+        .id("tab-move-menu")
+        .debug_selector(|| "tab-move-menu".into())
+        .mt(px(MOVE_ROW_Y - 4.0))
+        .flex()
+        .flex_col()
+        .w(px(SUBMENU_W))
         .px_1()
         .py_1()
         .rounded(px(NAV_RADIUS))
@@ -1092,11 +1248,22 @@ mod tests {
         m.step(1, |_| true);
         assert_eq!(m.highlight(), Some(TabMenuRow::CloseOthers));
         m.step(1, |_| true);
+        assert_eq!(m.highlight(), Some(TabMenuRow::MoveToWindow));
+        m.step(1, |_| true);
         assert_eq!(m.highlight(), Some(TabMenuRow::CloseProject), "wraps");
-        // The only tab: Close All Other Projects is skipped.
-        let only = |r: TabMenuRow| r != TabMenuRow::CloseOthers;
+        // The only tab, in the only window: Close All Other Projects and
+        // Move to Window are skipped.
+        let only = |r: TabMenuRow| r == TabMenuRow::CloseProject;
         m.step(1, only);
         assert_eq!(m.highlight(), Some(TabMenuRow::CloseProject));
+        // The submenu opens on its first row and steps, wrapping.
+        m.open_submenu(Some(0));
+        assert_eq!((m.highlight(), m.submenu_open()), (Some(TabMenuRow::MoveToWindow), true));
+        m.step_submenu(1, 2);
+        m.step_submenu(1, 2);
+        assert_eq!(m.sub_highlight(), Some(0), "wraps");
+        m.close_submenu();
+        assert_eq!((m.submenu_open(), m.sub_highlight()), (false, None));
         m.close(now);
         assert!(!m.is_open());
         assert_eq!(m.project(), Some("alpha"), "kept while it fades");

@@ -8,8 +8,13 @@
 //! setting is either form ([`ToolChoice`]): a plain string is a command line,
 //! as `editor:` has always been, and `{ app: <path to .app> }` is an app.
 //!
+//! On Linux an app is a desktop entry (a `.desktop` file in an XDG
+//! `applications` folder, `{ app: /usr/share/applications/code.desktop }`),
+//! opened by its `Exec` line ([`desktop_exec_argv`]).
+//!
 //! Nothing here spawns a process. Detection reads directories (the login
-//! `PATH`, `/Applications`, `~/Applications`) and is cached
+//! `PATH`, `/Applications`, `~/Applications`, or on Linux the XDG
+//! applications folders) and is cached
 //! ([`detected_tools`]); the launch side resolves a choice to an
 //! [`EditorLaunch`] or a [`DiffLaunch`], which `shelbi_orchestrator::tools`
 //! turns into the pane command or the app launch.
@@ -255,7 +260,7 @@ pub struct AppDiff {
     pub style: DiffStyle,
 }
 
-/// A macOS app Shelbi knows.
+/// An app Shelbi knows, on macOS and on Linux.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KnownApp {
     pub name: &'static str,
@@ -263,35 +268,48 @@ pub struct KnownApp {
     /// Where it installs, relative to an applications folder
     /// (`/Applications`, `~/Applications`): every bundle name it ships as.
     pub bundles: &'static [&'static str],
+    /// Its Linux desktop entries' file names, in an XDG `applications`
+    /// folder: every name a package, Flatpak or JetBrains Toolbox installs
+    /// it as.
+    pub desktop_ids: &'static [&'static str],
     /// How it diffs, for a diff tool.
     pub diff: Option<AppDiff>,
 }
 
-const fn editor_app(name: &'static str, bundle_id: &'static str, bundles: &'static [&'static str]) -> KnownApp {
-    KnownApp { name, bundle_id, bundles, diff: None }
+const fn editor_app(
+    name: &'static str,
+    bundle_id: &'static str,
+    bundles: &'static [&'static str],
+    desktop_ids: &'static [&'static str],
+) -> KnownApp {
+    KnownApp { name, bundle_id, bundles, desktop_ids, diff: None }
 }
+
+/// VS Code's desktop entries: Microsoft's package, the AUR's, Flathub's,
+/// and Code - OSS.
+const VSCODE_DESKTOP: &[&str] = &["code.desktop", "visual-studio-code.desktop", "com.visualstudio.code.desktop", "code-oss.desktop"];
 
 /// The editor apps Shelbi lists when installed, in the order shown. (Users
 /// pick any other app with Browse.)
 pub const EDITOR_APPS: &[KnownApp] = &[
-    editor_app("Visual Studio Code", "com.microsoft.VSCode", &["Visual Studio Code.app"]),
-    editor_app("Zed", "dev.zed.Zed", &["Zed.app"]),
-    editor_app("Sublime Text", "com.sublimetext.4", &["Sublime Text.app"]),
-    editor_app("BBEdit", "com.barebones.bbedit", &["BBEdit.app"]),
-    editor_app("Nova", "com.panic.Nova", &["Nova.app"]),
-    editor_app("TextMate", "com.macromates.TextMate", &["TextMate.app"]),
-    editor_app("Xcode", "com.apple.dt.Xcode", &["Xcode.app"]),
-    editor_app("MacVim", "org.vim.MacVim", &["MacVim.app"]),
-    editor_app("Emacs", "org.gnu.Emacs", &["Emacs.app"]),
-    editor_app("CotEditor", "com.coteditor.CotEditor", &["CotEditor.app"]),
-    editor_app("IntelliJ IDEA", "com.jetbrains.intellij", &["IntelliJ IDEA.app", "IntelliJ IDEA CE.app", "IntelliJ IDEA Ultimate.app"]),
-    editor_app("WebStorm", "com.jetbrains.WebStorm", &["WebStorm.app"]),
-    editor_app("RustRover", "com.jetbrains.rustrover", &["RustRover.app"]),
-    editor_app("GoLand", "com.jetbrains.goland", &["GoLand.app"]),
-    editor_app("PyCharm", "com.jetbrains.pycharm", &["PyCharm.app", "PyCharm CE.app", "PyCharm Professional Edition.app"]),
-    editor_app("CLion", "com.jetbrains.CLion", &["CLion.app"]),
-    editor_app("PhpStorm", "com.jetbrains.PhpStorm", &["PhpStorm.app"]),
-    editor_app("RubyMine", "com.jetbrains.rubymine", &["RubyMine.app"]),
+    editor_app("Visual Studio Code", "com.microsoft.VSCode", &["Visual Studio Code.app"], VSCODE_DESKTOP),
+    editor_app("Zed", "dev.zed.Zed", &["Zed.app"], &["dev.zed.Zed.desktop", "zed.desktop"]),
+    editor_app("Sublime Text", "com.sublimetext.4", &["Sublime Text.app"], &["sublime_text.desktop", "com.sublimetext.three.desktop"]),
+    editor_app("BBEdit", "com.barebones.bbedit", &["BBEdit.app"], &[]),
+    editor_app("Nova", "com.panic.Nova", &["Nova.app"], &[]),
+    editor_app("TextMate", "com.macromates.TextMate", &["TextMate.app"], &[]),
+    editor_app("Xcode", "com.apple.dt.Xcode", &["Xcode.app"], &[]),
+    editor_app("MacVim", "org.vim.MacVim", &["MacVim.app"], &[]),
+    editor_app("Emacs", "org.gnu.Emacs", &["Emacs.app"], &["emacs.desktop"]),
+    editor_app("CotEditor", "com.coteditor.CotEditor", &["CotEditor.app"], &[]),
+    editor_app("IntelliJ IDEA", "com.jetbrains.intellij", &["IntelliJ IDEA.app", "IntelliJ IDEA CE.app", "IntelliJ IDEA Ultimate.app"], &["jetbrains-idea.desktop", "jetbrains-idea-ce.desktop"]),
+    editor_app("WebStorm", "com.jetbrains.WebStorm", &["WebStorm.app"], &["jetbrains-webstorm.desktop"]),
+    editor_app("RustRover", "com.jetbrains.rustrover", &["RustRover.app"], &["jetbrains-rustrover.desktop"]),
+    editor_app("GoLand", "com.jetbrains.goland", &["GoLand.app"], &["jetbrains-goland.desktop"]),
+    editor_app("PyCharm", "com.jetbrains.pycharm", &["PyCharm.app", "PyCharm CE.app", "PyCharm Professional Edition.app"], &["jetbrains-pycharm.desktop", "jetbrains-pycharm-ce.desktop"]),
+    editor_app("CLion", "com.jetbrains.CLion", &["CLion.app"], &["jetbrains-clion.desktop"]),
+    editor_app("PhpStorm", "com.jetbrains.PhpStorm", &["PhpStorm.app"], &["jetbrains-phpstorm.desktop"]),
+    editor_app("RubyMine", "com.jetbrains.rubymine", &["RubyMine.app"], &["jetbrains-rubymine.desktop"]),
 ];
 
 /// The diff apps Shelbi lists when installed, in the order shown.
@@ -300,6 +318,7 @@ pub const DIFF_APPS: &[KnownApp] = &[
         name: "FileMerge",
         bundle_id: "com.apple.FileMerge",
         bundles: &["Xcode.app/Contents/Applications/FileMerge.app"],
+        desktop_ids: &[],
         // `| cat` holds opendiff until FileMerge closes the comparison (git's
         // own opendiff driver does the same).
         diff: Some(AppDiff { program: "opendiff", in_bundle: &[], cmd: "{helper} \"$LOCAL\" \"$REMOTE\" | cat", style: DiffStyle::Dirs }),
@@ -308,6 +327,7 @@ pub const DIFF_APPS: &[KnownApp] = &[
         name: "Kaleidoscope",
         bundle_id: "app.kaleidoscope.v4",
         bundles: &["Kaleidoscope.app"],
+        desktop_ids: &[],
         diff: Some(AppDiff {
             program: "ksdiff",
             in_bundle: &["Contents/MacOS/ksdiff", "Contents/Resources/bin/ksdiff"],
@@ -319,12 +339,14 @@ pub const DIFF_APPS: &[KnownApp] = &[
         name: "Beyond Compare",
         bundle_id: "com.ScooterSoftware.BeyondCompare",
         bundles: &["Beyond Compare.app"],
+        desktop_ids: &["bcompare.desktop"],
         diff: Some(AppDiff { program: "bcomp", in_bundle: &["Contents/MacOS/bcomp"], cmd: "{helper} \"$LOCAL\" \"$REMOTE\"", style: DiffStyle::Dirs }),
     },
     KnownApp {
         name: "Visual Studio Code",
         bundle_id: "com.microsoft.VSCode",
         bundles: &["Visual Studio Code.app"],
+        desktop_ids: VSCODE_DESKTOP,
         diff: Some(AppDiff {
             program: "code",
             in_bundle: &["Contents/Resources/app/bin/code"],
@@ -336,12 +358,14 @@ pub const DIFF_APPS: &[KnownApp] = &[
         name: "Sublime Merge",
         bundle_id: "com.sublimemerge",
         bundles: &["Sublime Merge.app"],
+        desktop_ids: &["sublime_merge.desktop"],
         diff: Some(AppDiff { program: "smerge", in_bundle: &["Contents/SharedSupport/bin/smerge"], cmd: "", style: DiffStyle::Worktree }),
     },
     KnownApp {
         name: "P4Merge",
         bundle_id: "com.perforce.p4merge",
         bundles: &["p4merge.app", "P4Merge.app"],
+        desktop_ids: &[],
         diff: Some(AppDiff {
             program: "launchp4merge",
             in_bundle: &["Contents/Resources/launchp4merge"],
@@ -353,6 +377,7 @@ pub const DIFF_APPS: &[KnownApp] = &[
         name: "Araxis Merge",
         bundle_id: "com.araxis.merge",
         bundles: &["Araxis Merge.app"],
+        desktop_ids: &[],
         diff: Some(AppDiff {
             program: "compare",
             in_bundle: &["Contents/Utilities/compare"],
@@ -364,12 +389,21 @@ pub const DIFF_APPS: &[KnownApp] = &[
         name: "DeltaWalker",
         bundle_id: "com.deltopia.DeltaWalker",
         bundles: &["DeltaWalker.app"],
+        desktop_ids: &[],
         diff: Some(AppDiff {
             program: "DeltaWalker",
             in_bundle: &["Contents/MacOS/DeltaWalker"],
             cmd: "{helper} \"$LOCAL\" \"$REMOTE\"",
             style: DiffStyle::Files,
         }),
+    },
+    KnownApp {
+        name: "Meld",
+        bundle_id: "org.gnome.Meld",
+        bundles: &["Meld.app"],
+        desktop_ids: &["org.gnome.Meld.desktop", "meld.desktop"],
+        // `meld` stays in the foreground until its window closes.
+        diff: Some(AppDiff { program: "meld", in_bundle: &["Contents/MacOS/Meld"], cmd: "{helper} \"$LOCAL\" \"$REMOTE\"", style: DiffStyle::Dirs }),
     },
 ];
 
@@ -396,6 +430,8 @@ const PROGRAM_NAMES: &[(&str, &str)] = &[
     ("ksdiff", "Kaleidoscope"),
     ("bcomp", "Beyond Compare"),
     ("smerge", "Sublime Merge"),
+    ("meld", "Meld"),
+    ("zeditor", "Zed"),
 ];
 
 /// The basename of a command line's program (`/usr/bin/hx -v` → `hx`).
@@ -427,17 +463,26 @@ pub fn command_display_name(command: &str) -> String {
 }
 
 /// The catalog app installed as `app` (matched on the bundle's trailing
-/// path, so `FileMerge.app` inside any Xcode matches), from `table`.
+/// path, so `FileMerge.app` inside any Xcode matches, or on a desktop
+/// entry's file name), from `table`.
 pub fn known_app<'a>(table: &'a [KnownApp], app: &Path) -> Option<&'a KnownApp> {
-    table.iter().find(|k| k.bundles.iter().any(|b| app.ends_with(b)))
+    let file = app.file_name().and_then(|f| f.to_str());
+    table
+        .iter()
+        .find(|k| k.bundles.iter().any(|b| app.ends_with(b)) || file.is_some_and(|f| k.desktop_ids.contains(&f)))
 }
 
-/// An app's display name: the catalog's name for a known bundle, else the
-/// bundle's file name without `.app` (`/Applications/Foo Bar.app` →
-/// `Foo Bar`).
+/// An app's display name: the catalog's name for a known bundle, else a
+/// desktop entry's `Name`, else the bundle's file name without `.app`
+/// (`/Applications/Foo Bar.app` → `Foo Bar`).
 pub fn app_display_name(app: &Path) -> String {
     if let Some(k) = known_app(EDITOR_APPS, app).or_else(|| known_app(DIFF_APPS, app)) {
         return k.name.to_string();
+    }
+    if is_desktop_file_name(app) {
+        if let Some(name) = std::fs::read_to_string(app).ok().and_then(|text| desktop_entry_value(&text, "Name")) {
+            return name;
+        }
     }
     app.file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -522,12 +567,153 @@ pub fn is_app_bundle(path: &Path) -> bool {
         && path.join("Contents").join("Info.plist").is_file()
 }
 
-/// The first of `app`'s bundles installed in `app_dirs`.
+/// A path named `*.desktop`.
+fn is_desktop_file_name(path: &Path) -> bool {
+    path.extension().is_some_and(|e| e.eq_ignore_ascii_case("desktop"))
+}
+
+/// A desktop entry an app launcher would list: a `.desktop` file whose
+/// `[Desktop Entry]` is an `Application` with an `Exec`, not `Hidden`.
+pub fn is_desktop_entry(path: &Path) -> bool {
+    if !is_desktop_file_name(path) {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    desktop_entry_value(&text, "Type").as_deref() == Some("Application")
+        && desktop_entry_value(&text, "Exec").is_some()
+        && desktop_entry_value(&text, "Hidden").as_deref() != Some("true")
+}
+
+/// `key`'s value in a desktop entry's `[Desktop Entry]` group (the
+/// unlocalized one: `Name`, not `Name[de]`).
+pub fn desktop_entry_value(text: &str, key: &str) -> Option<String> {
+    let mut in_entry = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_entry = line == "[Desktop Entry]";
+            continue;
+        }
+        if !in_entry || line.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        if k.trim() == key {
+            let v = v.trim();
+            return (!v.is_empty()).then(|| v.to_string());
+        }
+    }
+    None
+}
+
+/// The command line a desktop entry's `Exec` runs on `files` (the Desktop
+/// Entry spec's quoting and field codes): `%f`/`%u` take the first file,
+/// `%F`/`%U` all of them, `%c` the entry's name, `%k` its path, `%i` its
+/// icon (`--icon <icon>`), `%%` a `%`; the deprecated codes go. An `Exec`
+/// with no file code gets the files appended. `Err` when there is no
+/// `Exec` to run.
+pub fn desktop_exec_argv(desktop: &Path, files: &[String]) -> Result<Vec<String>, String> {
+    let shown = desktop.display();
+    let text = std::fs::read_to_string(desktop).map_err(|e| format!("couldn't read {shown}: {e}"))?;
+    let exec = desktop_entry_value(&text, "Exec").ok_or_else(|| format!("{shown} has no Exec line to run"))?;
+    let name = desktop_entry_value(&text, "Name").unwrap_or_default();
+    let icon = desktop_entry_value(&text, "Icon");
+    let mut argv = Vec::new();
+    let mut took_files = false;
+    for word in exec_words(&exec) {
+        match word.as_str() {
+            "%f" | "%u" => {
+                argv.extend(files.first().cloned());
+                took_files = true;
+            }
+            "%F" | "%U" => {
+                argv.extend(files.iter().cloned());
+                took_files = true;
+            }
+            "%i" => {
+                if let Some(icon) = &icon {
+                    argv.extend(["--icon".to_string(), icon.clone()]);
+                }
+            }
+            _ => {
+                let mut out = String::new();
+                let mut chars = word.chars();
+                while let Some(c) = chars.next() {
+                    if c != '%' {
+                        out.push(c);
+                        continue;
+                    }
+                    match chars.next() {
+                        Some('%') => out.push('%'),
+                        Some('c') => out.push_str(&name),
+                        Some('k') => out.push_str(&desktop.to_string_lossy()),
+                        // %d %D %n %N %v %m, and a code mid-word: dropped.
+                        _ => {}
+                    }
+                }
+                if !out.is_empty() {
+                    argv.push(out);
+                }
+            }
+        }
+    }
+    if argv.is_empty() {
+        return Err(format!("{shown}'s Exec line is empty"));
+    }
+    if !took_files {
+        argv.extend(files.iter().cloned());
+    }
+    Ok(argv)
+}
+
+/// An `Exec` value split into words: double quotes group, and inside them
+/// a backslash escapes `"`, `` ` ``, `$` and `\`.
+fn exec_words(exec: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    let mut chars = exec.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            '\\' if quoted => {
+                if let Some(next) = chars.next() {
+                    word.push(next);
+                }
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started || !word.is_empty() {
+                    words.push(std::mem::take(&mut word));
+                }
+                started = false;
+            }
+            c => word.push(c),
+        }
+    }
+    if started || !word.is_empty() {
+        words.push(word);
+    }
+    words
+}
+
+/// The first of `app`'s bundles (or, on Linux, desktop entries) installed
+/// in `app_dirs`.
 fn installed_bundle(app: &KnownApp, app_dirs: &[PathBuf]) -> Option<PathBuf> {
-    app_dirs
-        .iter()
-        .flat_map(|dir| app.bundles.iter().map(move |b| dir.join(b)))
-        .find(|p| is_app_bundle(p))
+    app_dirs.iter().find_map(|dir| {
+        app.bundles
+            .iter()
+            .map(|b| dir.join(b))
+            .find(|p| is_app_bundle(p))
+            .or_else(|| app.desktop_ids.iter().map(|d| dir.join(d)).find(|p| is_desktop_entry(p)))
+    })
 }
 
 /// Which catalog tools are installed: CLIs on `path_dirs`, apps in
@@ -568,12 +754,44 @@ pub fn login_path_dirs() -> Vec<PathBuf> {
 }
 
 /// The folders apps are found in: `/Applications` and `~/Applications`.
+#[cfg(target_os = "macos")]
 pub fn app_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![PathBuf::from("/Applications")];
     if let Some(home) = shelbi_core::home_dir() {
         dirs.push(home.join("Applications"));
     }
     dirs
+}
+
+/// The folders desktop entries are found in, the user's first: the
+/// `applications` folder of `$XDG_DATA_HOME` (`~/.local/share`), of each of
+/// `$XDG_DATA_DIRS` (`/usr/local/share:/usr/share`), and of Flatpak's
+/// exports.
+#[cfg(not(target_os = "macos"))]
+pub fn app_dirs() -> Vec<PathBuf> {
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    xdg_app_dirs(shelbi_core::home_dir().as_deref(), var("XDG_DATA_HOME"), var("XDG_DATA_DIRS"))
+}
+
+/// [`app_dirs`] for a home and the two XDG variables.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
+fn xdg_app_dirs(home: Option<&Path>, data_home: Option<String>, data_dirs: Option<String>) -> Vec<PathBuf> {
+    let mut data: Vec<PathBuf> = Vec::new();
+    match data_home {
+        Some(d) => data.push(PathBuf::from(d)),
+        None => data.extend(home.map(|h| h.join(".local/share"))),
+    }
+    data.extend(home.map(|h| h.join(".local/share/flatpak/exports/share")));
+    let dirs = data_dirs.unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    data.extend(dirs.split(':').filter(|d| !d.is_empty()).map(PathBuf::from));
+    data.push(PathBuf::from("/var/lib/flatpak/exports/share"));
+    let mut out: Vec<PathBuf> = Vec::new();
+    for dir in data.into_iter().map(|d| d.join("applications")) {
+        if !out.contains(&dir) {
+            out.push(dir);
+        }
+    }
+    out
 }
 
 /// The difftool the user's global git config names: `diff.guitool`, else
@@ -625,6 +843,13 @@ pub fn choice_from_path(path: &Path) -> Result<ToolChoice, String> {
     let shown = path.display();
     if !path.exists() {
         return Err(format!("{shown} doesn't exist"));
+    }
+    if is_desktop_file_name(path) {
+        return if is_desktop_entry(path) {
+            Ok(ToolChoice::app(path))
+        } else {
+            Err(format!("{shown} isn't an application's desktop entry (no Type=Application with an Exec)"))
+        };
     }
     if path.extension().is_some_and(|e| e.eq_ignore_ascii_case("app")) {
         return if is_app_bundle(path) {
@@ -734,6 +959,14 @@ pub fn diff_launch(choice: Option<&ToolChoice>, path_dirs: &[PathBuf]) -> Result
         }
         ToolChoice::App { app } => {
             let Some(known) = known_app(DIFF_APPS, &app) else {
+                if is_desktop_file_name(&app) {
+                    // A desktop entry's Exec opens a window and returns: git
+                    // would delete the sides from under it.
+                    return Err(format!(
+                        "Shelbi doesn't know how {} compares two folders; pick a diff command instead",
+                        app_display_name(&app)
+                    ));
+                }
                 return Ok(DiffLaunch::Difftool {
                     cmd: format!(
                         "open -W -a {} \"$LOCAL\" \"$REMOTE\"",
@@ -916,6 +1149,92 @@ mod tests {
         assert_eq!(pycharm.choice, ToolChoice::app(home_apps.join("PyCharm CE.app")));
         assert_eq!(pycharm.app_path.as_deref(), Some(home_apps.join("PyCharm CE.app").as_path()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn desktop_entry(path: &Path, body: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, format!("[Desktop Entry]\nType=Application\n{body}")).unwrap();
+    }
+
+    #[test]
+    fn linux_apps_are_desktop_entries_in_the_xdg_folders() {
+        let root = scratch("desktop-entries");
+        let user = root.join("home/.local/share/applications");
+        let system = root.join("usr/share/applications");
+        desktop_entry(&system.join("code.desktop"), "Name=Visual Studio Code\nExec=/usr/bin/code %F\nIcon=vscode\n");
+        desktop_entry(&user.join("dev.zed.Zed.desktop"), "Name=Zed\nExec=zeditor %U\nIcon=zed\n");
+        desktop_entry(&system.join("org.gnome.Meld.desktop"), "Name=Meld\nExec=meld %F\n");
+        // Hidden, or no Exec: not an app a launcher lists.
+        desktop_entry(&system.join("sublime_text.desktop"), "Name=Sublime Text\nExec=subl\nHidden=true\n");
+        desktop_entry(&system.join("emacs.desktop"), "Name=Emacs\n");
+
+        let found = detect_in(&[], &[user.clone(), system.clone()]);
+        let names = |opts: &[ToolOption]| opts.iter().map(|o| o.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&found.editors), ["Visual Studio Code", "Zed"]);
+        assert_eq!(names(&found.diff_tools), ["Visual Studio Code", "Meld"]);
+        let zed = &found.editors[1];
+        assert_eq!(zed.app_path.as_deref(), Some(user.join("dev.zed.Zed.desktop").as_path()));
+        assert_eq!(ToolChoice::app(system.join("org.gnome.Meld.desktop")).display_name(), "Meld");
+
+        // Browse takes a desktop entry as an app, named by its Name.
+        let other = root.join("other.desktop");
+        desktop_entry(&other, "Name=Kate\nExec=kate -b %U\n");
+        assert_eq!(choice_from_path(&other), Ok(ToolChoice::app(&other)));
+        assert_eq!(ToolChoice::app(&other).display_name(), "Kate");
+        std::fs::write(root.join("broken.desktop"), "[Desktop Entry]\nName=x\n").unwrap();
+        assert!(choice_from_path(&root.join("broken.desktop")).is_err());
+
+        // A known diff app runs its helper; an unknown one is refused.
+        let meld = diff_launch(Some(&ToolChoice::app(system.join("org.gnome.Meld.desktop"))), &[]);
+        assert!(meld.is_err(), "meld isn't on the (empty) PATH: {meld:?}");
+        let bin = root.join("bin");
+        executable(&bin.join("meld"));
+        assert_eq!(
+            diff_launch(Some(&ToolChoice::app(system.join("org.gnome.Meld.desktop"))), &[bin]),
+            Ok(DiffLaunch::Difftool { cmd: "meld \"$LOCAL\" \"$REMOTE\"".into(), dir_diff: true })
+        );
+        assert!(diff_launch(Some(&ToolChoice::app(&other)), &[]).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_desktop_entry_runs_its_exec_line_on_the_files() {
+        let root = scratch("desktop-exec");
+        let entry = root.join("code.desktop");
+        desktop_entry(&entry, "Name=Code\nExec=/usr/bin/code --new-window %F\nIcon=vscode\n");
+        let files = vec!["/w/a".to_string(), "/w/b".to_string()];
+        assert_eq!(desktop_exec_argv(&entry, &files).unwrap(), ["/usr/bin/code", "--new-window", "/w/a", "/w/b"]);
+        desktop_entry(&entry, "Name=Zed\nExec=zeditor %u\n");
+        assert_eq!(desktop_exec_argv(&entry, &files).unwrap(), ["zeditor", "/w/a"]);
+        // No file code: the files go last. Quotes group, deprecated codes go.
+        desktop_entry(&entry, "Name=Ed\nExec=\"/opt/My Ed/ed\" --title=%c %i %d 100%%\nIcon=ed\n");
+        assert_eq!(
+            desktop_exec_argv(&entry, &files[..1]).unwrap(),
+            ["/opt/My Ed/ed", "--title=Ed", "--icon", "ed", "100%", "/w/a"]
+        );
+        // Only the [Desktop Entry] group counts.
+        std::fs::write(&entry, "[Desktop Action new]\nExec=x\n").unwrap();
+        assert!(desktop_exec_argv(&entry, &files).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn xdg_app_dirs_put_the_users_first() {
+        let home = Path::new("/home/me");
+        let dirs: Vec<String> = xdg_app_dirs(Some(home), None, None).iter().map(|d| d.display().to_string()).collect();
+        assert_eq!(
+            dirs,
+            [
+                "/home/me/.local/share/applications",
+                "/home/me/.local/share/flatpak/exports/share/applications",
+                "/usr/local/share/applications",
+                "/usr/share/applications",
+                "/var/lib/flatpak/exports/share/applications",
+            ]
+        );
+        let dirs = xdg_app_dirs(Some(home), Some("/d".into()), Some("/a:/usr/share".into()));
+        assert_eq!(dirs[0], PathBuf::from("/d/applications"));
+        assert_eq!(dirs[2], PathBuf::from("/a/applications"));
     }
 
     #[test]

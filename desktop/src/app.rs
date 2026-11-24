@@ -725,7 +725,7 @@ fn open_window_as(
             // (`elements::window_drag`), so AppKit doesn't take a press on a
             // tab as a window drag before the tab's own drag starts.
             app_owns_titlebar_drag: true,
-            app_id: Some("co.32pixels.shelbi".into()),
+            app_id: Some(crate::platform::os::APP_ID.into()),
             ..Default::default()
         },
         move |window, cx| {
@@ -5448,26 +5448,80 @@ impl ShelbiWindow {
     /// keyboard row over the rows it can run, Enter runs it, Esc closes.
     /// `false` for any other key.
     fn tab_menu_key(&mut self, code: Key, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        use tab_bar::TabMenuRow;
         let others = self.tabs.projects().len() > 1;
-        let enabled = |row: tab_bar::TabMenuRow| others || row != tab_bar::TabMenuRow::CloseOthers;
+        let targets = self.move_targets(window, cx);
+        let movable = !targets.is_empty();
+        let enabled = |row: TabMenuRow| match row {
+            TabMenuRow::CloseProject => true,
+            TabMenuRow::CloseOthers => others,
+            TabMenuRow::MoveToWindow => movable,
+        };
+        if self.tab_menu.submenu_open() {
+            match code {
+                Key::Up | Key::BackTab => self.tab_menu.step_submenu(-1, targets.len()),
+                Key::Down | Key::Tab => self.tab_menu.step_submenu(1, targets.len()),
+                Key::Left | Key::Esc => self.tab_menu.close_submenu(),
+                Key::Enter => {
+                    let project = self.tab_menu.project().map(str::to_string);
+                    let target = self.tab_menu.sub_highlight().and_then(|ix| targets.get(ix));
+                    if let (Some(project), Some(target)) = (project, target) {
+                        self.sidebar_event(SidebarEvent::MoveTab(project, target.window), window, cx);
+                    }
+                }
+                _ => return false,
+            }
+            return true;
+        }
         match code {
             Key::Up | Key::BackTab => self.tab_menu.step(-1, enabled),
             Key::Down | Key::Tab => self.tab_menu.step(1, enabled),
             Key::Esc => self.tab_menu.close((self.clock)()),
+            Key::Right if self.tab_menu.highlight() == Some(TabMenuRow::MoveToWindow) && movable => {
+                self.tab_menu.open_submenu(Some(0))
+            }
             Key::Enter => {
                 let (Some(project), Some(row)) = (self.tab_menu.project().map(str::to_string), self.tab_menu.highlight())
                 else {
                     return true;
                 };
                 let event = match row {
-                    tab_bar::TabMenuRow::CloseProject => SidebarEvent::CloseTab(project),
-                    tab_bar::TabMenuRow::CloseOthers => SidebarEvent::CloseOtherTabs(project),
+                    TabMenuRow::CloseProject => SidebarEvent::CloseTab(project),
+                    TabMenuRow::CloseOthers => SidebarEvent::CloseOtherTabs(project),
+                    TabMenuRow::MoveToWindow => {
+                        if movable {
+                            self.tab_menu.open_submenu(Some(0));
+                        }
+                        return true;
+                    }
                 };
                 self.sidebar_event(event, window, cx);
             }
             _ => return false,
         }
         true
+    }
+
+    /// Where the tab menu's Move to Window can take its tab: every other
+    /// Shelbi window (by its title), then a new window while the tab isn't
+    /// this window's only one.
+    fn move_targets(&self, window: &Window, cx: &App) -> Vec<tab_bar::MoveTarget> {
+        let me = window.window_handle().window_id();
+        let mut targets: Vec<tab_bar::MoveTarget> = shelbi_windows(cx)
+            .into_iter()
+            .filter(|h| h.window_id() != me)
+            .filter_map(|h| {
+                let label = h.read(cx).ok()?.window_title();
+                Some(tab_bar::MoveTarget {
+                    window: Some(h.window_id()),
+                    label: label.into(),
+                })
+            })
+            .collect();
+        if self.tabs.projects().len() > 1 {
+            targets.push(tab_bar::MoveTarget::new_window());
+        }
+        targets
     }
 
     /// A key on the chooser: ↑↓ (and Tab) move its row, Enter opens it (the
@@ -7390,6 +7444,17 @@ impl SidebarHost for ShelbiWindow {
                 self.focus_handle.focus(window, cx);
             }
             SidebarEvent::CloseTabMenu => self.tab_menu.close((self.clock)()),
+            SidebarEvent::OpenTabSubmenu => {
+                if self.tab_menu.is_open() && !self.move_targets(window, cx).is_empty() {
+                    self.tab_menu.open_submenu(None);
+                }
+            }
+            SidebarEvent::CloseTabSubmenu => self.tab_menu.close_submenu(),
+            SidebarEvent::MoveTab(project, to) => {
+                self.tab_menu.close((self.clock)());
+                let me = window.window_handle().window_id();
+                cx.defer(move |cx| tab_tearoff_host::move_tab_to(project, me, to, cx));
+            }
             SidebarEvent::CloseOtherTabs(project) => {
                 self.tab_menu.close((self.clock)());
                 if self.tabs.projects().len() > 1 {
@@ -7735,6 +7800,11 @@ impl ShelbiWindow {
         // Where the bar is, for a tab dragged from another window: its paint
         // says, and a frame without it says none.
         self.tab_reorder.layout.borrow_mut().bar = None;
+        let move_targets = if self.tab_menu.project().is_some() && tab_menu_phase.is_some() {
+            self.move_targets(window, cx)
+        } else {
+            Vec::new()
+        };
         let tab_bar = (!editing_workflow && (!self.chooser || self.new_tab.is_some() || self.pending.is_some())).then(|| {
             let tabs = self.tab_props(cx);
             tab_bar::render(
@@ -7748,6 +7818,9 @@ impl ShelbiWindow {
                         tab_bar::TabMenuProps {
                             project,
                             can_close_others: self.tabs.projects().len() > 1,
+                            targets: &move_targets,
+                            submenu: self.tab_menu.submenu_open(),
+                            sub_highlight: self.tab_menu.sub_highlight(),
                             highlight: self.tab_menu.highlight(),
                             phase,
                             open: self.tab_menu.is_open(),
