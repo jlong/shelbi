@@ -174,6 +174,19 @@ from the Mac sits behind `src/platform/os/` (`linux.rs`):
   GTK's `settings.ini`).
 - Relaunch re-runs the executable `/proc/self/exe` names, so an upgraded
   package's new binary starts.
+- Windows report the Wayland app id `dev.shelbi.Desktop`, for Hyprland's
+  window rules, the desktop entry and the hicolor icons
+  (`packaging/linux/`). A translucent window is blurred by Hyprland's own
+  `decoration:blur` (so Settings has no blur slider), and is opaque when the
+  desktop asks for high contrast or the session isn't Wayland. The app icon
+  picked in Settings goes into `~/.local/share/icons/hicolor`.
+- File ▸ New Window is Ctrl+Shift+N. Dragging a tab off its bar opens it in
+  a new window, which Hyprland tiles; a tab moves into another window with
+  its tab menu's Move to Window (Wayland gives a drag no way to find another
+  window).
+- The Editor and Diff tool pickers list desktop apps (VS Code, Zed, Sublime,
+  the JetBrains IDEs, Meld, Sublime Merge...) by their desktop entries, with
+  their icons from the icon theme.
 
 `.github/workflows/desktop-linux-ci.yml` builds, lints and tests `desktop/`
 on Linux for every pull request that touches it or the shared crates.

@@ -1249,3 +1249,98 @@ fn a_bar_left_hosting_by_a_missed_move_closes_its_gap_on_its_next_frame(cx: &mut
     assert!(!gap_open(cx, b));
     release_at(cx, a, point(px(450.0), px(600.0)));
 }
+
+/// Right-click `selector` in `handle`: a tab's context menu opens.
+fn right_click_in(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, selector: &'static str) {
+    let at = bounds_in(cx, handle, selector).unwrap_or_else(|| panic!("{selector} is drawn")).center();
+    let mut v = vcx(cx, handle);
+    v.simulate_mouse_down(at, MouseButton::Right, Modifiers::none());
+    v.simulate_mouse_up(at, MouseButton::Right, Modifiers::none());
+    cx.run_until_parked();
+    draw(cx, handle);
+}
+
+fn click_in(cx: &mut TestAppContext, handle: WindowHandle<ShelbiWindow>, selector: &'static str) {
+    let at = bounds_in(cx, handle, selector).unwrap_or_else(|| panic!("{selector} is drawn")).center();
+    vcx(cx, handle).simulate_click(at, Modifiers::none());
+    cx.run_until_parked();
+    draw(cx, handle);
+}
+
+/// Wayland: no window knows where it or any other is. A tab dragged over
+/// where another window's bar would be is just away from its own bar, so it
+/// tears off; the card is drawn in its own window (no floating ghost, which
+/// couldn't be placed), and the new window opens where the compositor puts
+/// it.
+#[gpui::test]
+fn without_global_positions_a_drag_keeps_to_its_own_window(cx: &mut TestAppContext) {
+    crate::platform::screen::test_global_positions(false);
+    let f = tearoff_fixture(cx, &["alpha", "beta", "gamma"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(0.0, 0.0), &["alpha", "beta"]);
+    let b = open_at(cx, &f, "gamma", 1, frame(1000.0, 0.0), &["gamma"]);
+    let gamma = bounds_in(cx, b, "tab-gamma").unwrap();
+    press_and_start(cx, a, "tab-beta");
+    // Where gamma's bar is in a shared screen space, and far from a's own.
+    let to = point(px(1300.0) + gamma.left(), gamma.center().y);
+    move_to(cx, a, to);
+    assert_eq!(over(cx), Some(None), "torn off: the other bar isn't found");
+    assert!(!read(cx, b, |w, _| w.tab_reorder.hosting()), "b opens no gap");
+    assert!(floats(cx).is_empty(), "no floating ghost");
+    assert!(bounds_in(cx, a, "tab-drag-card").is_some(), "a draws the card itself");
+    release_at(cx, a, to);
+    assert_eq!(windows(cx).len(), 3, "a new window");
+    assert_eq!(tabs_of(cx, a), ["alpha"]);
+    assert_eq!(tabs_of(cx, b), ["gamma"], "the other window is untouched");
+    let c = cx.update(|cx| cx.global::<Shell>().windows[2].handle);
+    assert_eq!(tabs_of(cx, c), ["beta"]);
+    crate::platform::screen::test_global_positions(true);
+}
+
+/// The tab menu's Move to Window lists the other windows and New Window,
+/// and moves the tab as a drag between windows would: by the pointer or the
+/// keys.
+#[gpui::test]
+fn move_to_window_moves_a_tab_into_another_window_or_a_new_one(cx: &mut TestAppContext) {
+    let f = tearoff_fixture(cx, &["alpha", "beta", "gamma", "delta"]);
+    let a = open_at(cx, &f, "alpha", 0, frame(0.0, 0.0), &["alpha", "beta", "delta"]);
+    let b = open_at(cx, &f, "gamma", 1, frame(1000.0, 0.0), &["gamma"]);
+
+    // Hovering the row opens the submenu: gamma's window, then New Window.
+    right_click_in(cx, a, "tab-beta");
+    assert!(bounds_in(cx, a, "tab-move-menu").is_none(), "closed until asked");
+    click_in(cx, a, "tab-context-move");
+    let row = bounds_in(cx, a, "tab-context-move").unwrap();
+    let sub = bounds_in(cx, a, "tab-move-menu").expect("the submenu");
+    assert!(sub.left() > row.right(), "beside the menu");
+    assert_eq!(bounds_in(cx, a, "tab-move-0").unwrap().top(), row.top(), "its first row level with Move to Window");
+    assert!(bounds_in(cx, a, "tab-move-1").is_some(), "New Window");
+    assert!(bounds_in(cx, a, "tab-move-2").is_none());
+    click_in(cx, a, "tab-move-0");
+    assert_eq!(tabs_of(cx, b), ["gamma", "beta"], "last in the other window");
+    assert_eq!(shown(cx, b), "beta", "which switches to it");
+    assert_eq!(tabs_of(cx, a), ["alpha", "delta"]);
+    assert!(bounds_in(cx, a, "tab-context-menu").is_none(), "the menu closed");
+
+    // New Window, by the keys: ↑ lands on Move to Window (the last row), →
+    // opens the submenu on its first row, ↓ steps to New Window.
+    right_click_in(cx, a, "tab-delta");
+    let mut v = vcx(cx, a);
+    v.simulate_keystrokes("up right down enter");
+    cx.run_until_parked();
+    assert_eq!(windows(cx).len(), 3, "a new window");
+    let c = cx.update(|cx| cx.global::<Shell>().windows[2].handle);
+    assert_eq!(tabs_of(cx, c), ["delta"]);
+    assert_eq!(tabs_of(cx, a), ["alpha"]);
+
+    // A window's only tab: no New Window, but the other windows still.
+    right_click_in(cx, a, "tab-alpha");
+    click_in(cx, a, "tab-context-move");
+    assert!(bounds_in(cx, a, "tab-move-1").is_some(), "the two other windows");
+    assert!(bounds_in(cx, a, "tab-move-2").is_none(), "and no New Window");
+    // The click empties (and closes) the window it lands in: no redraw.
+    let at = bounds_in(cx, a, "tab-move-1").unwrap().center();
+    vcx(cx, a).simulate_click(at, Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(windows(cx).len(), 2, "the emptied window closed");
+    assert_eq!(tabs_of(cx, c), ["delta", "alpha"]);
+}

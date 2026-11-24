@@ -18,7 +18,12 @@ use crate::elements::terminal::FontZoom;
 /// File ▸ New Window, the macOS standard (⌘⇧N), as a `keys.yaml` chord. The
 /// window takes it before a focused terminal can (`crate::app`), and the
 /// menu shows it on the item.
+#[cfg(target_os = "macos")]
 pub const NEW_WINDOW: &str = "shift-super-n";
+/// File ▸ New Window on Linux: Ctrl+Shift+N, as terminals and browsers
+/// there have it (Super is the compositor's: Hyprland binds Super+Shift+N).
+#[cfg(not(target_os = "macos"))]
+pub const NEW_WINDOW: &str = "ctrl-shift-n";
 
 /// Whether `chord` is [`NEW_WINDOW`].
 pub fn is_new_window(chord: &KeyChord) -> bool {
@@ -333,12 +338,22 @@ mod tests {
             .unwrap_or_else(|| "<none>".into())
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn cmd_shift_n_is_new_window() {
         let chord = |spec| chord_from_keystroke(&ks(spec, Some("n"))).unwrap();
         assert!(is_new_window(&chord("cmd-shift-n")));
         assert!(!is_new_window(&chord("cmd-n")));
         assert!(!is_new_window(&chord("ctrl-shift-n")));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn ctrl_shift_n_is_new_window_on_linux() {
+        let chord = |spec| chord_from_keystroke(&ks(spec, Some("n"))).unwrap();
+        assert!(is_new_window(&chord("ctrl-shift-n")));
+        assert!(!is_new_window(&chord("ctrl-n")), "the terminal's");
+        assert!(!is_new_window(&chord("cmd-shift-n")), "Hyprland's");
     }
 
     #[test]

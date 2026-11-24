@@ -397,6 +397,14 @@ pub enum SidebarEvent {
     OpenTabMenu(String),
     /// Close the tab's context menu (a press outside it).
     CloseTabMenu,
+    /// Show the tab menu's Move to Window submenu (its row hovered or
+    /// clicked).
+    OpenTabSubmenu,
+    /// Hide it (another row hovered).
+    CloseTabSubmenu,
+    /// Move to Window: move a project's tab into another window (`None`: a
+    /// new one).
+    MoveTab(String, Option<gpui::WindowId>),
     /// A tab's context menu's Close All Other Projects: close every other
     /// tab's project, keeping this one.
     CloseOtherTabs(String),

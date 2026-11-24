@@ -987,7 +987,11 @@ mod tests {
         assert!(item.enabled);
         assert_eq!(item.action, MenuAction::Command("action:new-window".into()));
         let shortcut = item.shortcut.as_ref().unwrap();
-        assert_eq!((shortcut.keystroke.as_str(), shortcut.display.as_str()), ("shift-cmd-n", "⇧⌘N"));
+        if cfg!(target_os = "macos") {
+            assert_eq!((shortcut.keystroke.as_str(), shortcut.display.as_str()), ("shift-cmd-n", "⇧⌘N"));
+        } else {
+            assert_eq!(KeyChord::parse(&shortcut.keystroke).map(|c| c.canonical()), KeyChord::parse("ctrl-shift-n").map(|c| c.canonical()));
+        }
     }
 
     #[test]

@@ -9,6 +9,11 @@
 //! - `overlay-scrolling` (on is "Show scroll bars: When scrolling",
 //!   [`super::scrollers`]).
 //!
+//! And one from the freedesktop appearance namespace: `contrast` 1 (the
+//! desktop asks for high contrast; GNOME's `high-contrast` accessibility
+//! key says the same), which the app takes as Reduce Transparency
+//! ([`super::blur`]): every window opaque.
+//!
 //! The first read starts one thread that asks the portal and then listens
 //! for its changes. Until it answers (or when there is no portal) the values
 //! come from GTK's own `settings.ini` (`gtk-enable-animations`,
@@ -23,12 +28,21 @@ use futures::channel::mpsc::UnboundedSender;
 const NAMESPACE: &str = "org.gnome.desktop.interface";
 const ANIMATIONS: &str = "enable-animations";
 const OVERLAY: &str = "overlay-scrolling";
+/// The freedesktop appearance namespace and its contrast key (a `u32`: 0 no
+/// preference, 1 high contrast).
+const APPEARANCE: &str = "org.freedesktop.appearance";
+const CONTRAST: &str = "contrast";
+/// GNOME's accessibility namespace and its high-contrast switch.
+const A11Y: &str = "org.gnome.desktop.a11y.interface";
+const HIGH_CONTRAST: &str = "high-contrast";
 
 /// The values the app follows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Values {
     pub animations: bool,
     pub overlay_scrolling: bool,
+    /// The desktop asks for high contrast.
+    pub high_contrast: bool,
 }
 
 impl Default for Values {
@@ -36,6 +50,7 @@ impl Default for Values {
         Values {
             animations: true,
             overlay_scrolling: true,
+            high_contrast: false,
         }
     }
 }
@@ -92,6 +107,7 @@ fn apply(key: &str, value: bool) {
     };
     match key {
         ANIMATIONS => state.values.animations = value,
+        CONTRAST | HIGH_CONTRAST => state.values.high_contrast = value,
         OVERLAY if state.values.overlay_scrolling != value => {
             state.values.overlay_scrolling = value;
             state.overlay_watchers.retain(|w| w.unbounded_send(()).is_ok());
@@ -115,15 +131,24 @@ async fn watch_portal() {
             Err(e) => tracing::debug!(key, %e, "the settings portal has no value"),
         }
     }
+    if let Ok(contrast) = settings.read::<u32>(APPEARANCE, CONTRAST).await {
+        apply(CONTRAST, contrast == 1);
+    }
+    if let Ok(true) = settings.read::<bool>(A11Y, HIGH_CONTRAST).await {
+        apply(HIGH_CONTRAST, true);
+    }
     let Ok(mut changes) = settings.receive_setting_changed().await else {
         return;
     };
     while let Some(setting) = changes.next().await {
-        if setting.namespace() != NAMESPACE {
-            continue;
-        }
-        if let Some(value) = as_bool(setting.value()) {
-            apply(setting.key(), value);
+        let key = setting.key();
+        let value = match (setting.namespace(), key) {
+            (NAMESPACE, _) | (A11Y, HIGH_CONTRAST) => as_bool(setting.value()),
+            (APPEARANCE, CONTRAST) => as_u32(setting.value()).map(|c| c == 1),
+            _ => None,
+        };
+        if let Some(value) = value {
+            apply(key, value);
         }
     }
 }
@@ -133,6 +158,15 @@ fn as_bool(value: &ashpd::zvariant::Value<'_>) -> Option<bool> {
     match value {
         ashpd::zvariant::Value::Bool(b) => Some(*b),
         ashpd::zvariant::Value::Value(inner) => as_bool(inner),
+        _ => None,
+    }
+}
+
+/// A `u32`, unwrapping the variant a portal may box it in.
+fn as_u32(value: &ashpd::zvariant::Value<'_>) -> Option<u32> {
+    match value {
+        ashpd::zvariant::Value::U32(n) => Some(*n),
+        ashpd::zvariant::Value::Value(inner) => as_u32(inner),
         _ => None,
     }
 }
@@ -188,7 +222,8 @@ mod tests {
             parse_gtk_ini(text, Values::default()),
             Values {
                 animations: false,
-                overlay_scrolling: false
+                overlay_scrolling: false,
+                high_contrast: false,
             }
         );
         assert_eq!(parse_gtk_ini("[Settings]\n", Values::default()), Values::default());

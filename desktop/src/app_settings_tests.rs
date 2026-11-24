@@ -1287,6 +1287,22 @@ fn reduce_transparency_makes_the_window_opaque_and_disables_the_sliders(cx: &mut
     assert!(!s.read(|_, cx| opacity.read(cx).is_disabled()));
 }
 
+/// On Linux the compositor blurs (Hyprland's `decoration:blur`), at a radius
+/// the app can't set: Settings shows the transparency slider and no blur one.
+#[gpui::test]
+fn a_compositor_blur_leaves_only_the_transparency_slider(cx: &mut TestAppContext) {
+    crate::platform::blur::test_radius_adjustable(false);
+    let mut s = Settings::open(cx);
+    s.open_settings();
+    let mut cfg = shelbi_state::UserConfig::default();
+    cfg.desktop.window_opacity = Some(80);
+    general_page(&mut s, cfg);
+    assert!(s.drawn("settings-window-opacity"));
+    assert!(!s.drawn("settings-window-blur"), "the compositor's radius, not ours");
+    assert_eq!(theme_opacity(&mut s), 0.8, "the window is still translucent");
+    crate::platform::blur::test_radius_adjustable(true);
+}
+
 // ---- Settings ▸ Workflows (`dt-wf-settings-index`) -------------------------
 
 use crate::views::workflows::WorkflowsPage;

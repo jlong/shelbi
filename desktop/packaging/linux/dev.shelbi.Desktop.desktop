@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Shelbi
+GenericName=Agent Orchestrator
+Comment=Talk to one orchestrator agent that runs coding agents in parallel
+Exec=shelbi-desktop
+Icon=dev.shelbi.Desktop
+Terminal=false
+Categories=Development;
+Keywords=agent;orchestrator;claude;codex;
+StartupWMClass=dev.shelbi.Desktop
+StartupNotify=true

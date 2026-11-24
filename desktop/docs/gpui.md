@@ -202,10 +202,7 @@ Seen while running it; none of these block the build:
 - **The traffic-light gap.** The tab bar leaves room on the left for macOS's
   window buttons (`sidebar::traffic_light_position`); on Hyprland there are
   none, so the gap is empty.
-- **No blur.** `platform::blur` is a no-op off macOS, so the glass is
-  see-through rather than frosted. Hyprland can blur the window with a
-  window rule; the app could also ask through the
-  `org_kde_kwin_blur`/`ext-background-effect` protocols.
+- ~~**No blur.**~~ Done in `dl-windowing` (below): Hyprland blurs.
 - **Fonts.** The bundled faces load through gpui (`assets::load_fonts`), but
   the CoreText fallback registration and the installed-font list
   (`terminal::fonts::installed`) are macOS-only, so the font picker shows only
@@ -222,6 +219,56 @@ Seen while running it; none of these block the build:
   target. Linux builds the host target anyway, so nothing breaks, but a
   `RUSTUP_TOOLCHAIN` set in the environment (as on this machine) overrides
   the pin: build with `RUSTUP_TOOLCHAIN=1.99.0` to match CI.
+
+#### Windows under Hyprland (`dl-windowing`, 2026-11-24)
+
+- **Translucency is right as drawn.** `gpui-pre-wgpu` asks the surface for
+  `CompositeAlphaMode::PreMultiplied` (Mesa and NVIDIA both offer it on
+  Wayland) and blends every pipeline with `PREMULTIPLIED_ALPHA_BLENDING`,
+  premultiplied "over" on alpha too. So the Metal bug `platform::metal_blend`
+  works around (alphas adding up to opaque) doesn't exist here: a fill over
+  the glass tints it. Should a surface offer no premultiplied mode, gpui falls
+  back to `Inherit`, then whatever is first.
+- **Hyprland blurs; the app can't set the radius.** Hyprland blurs whatever
+  shows through a translucent window (`decoration:blur`, on by default; a
+  `windowrule = noblur, class:^(dev\.shelbi\.Desktop)$` turns it off). gpui's
+  `WindowBackgroundAppearance::Blurred` asks through `org_kde_kwin_blur`,
+  which Hyprland doesn't implement, and no protocol carries a radius. So on
+  Linux `platform::blur` sets nothing, and Settings shows only the
+  transparency slider (`blur::radius_adjustable`).
+- **Opaque when it can't be translucent.** Reduce Transparency on Linux is
+  the desktop asking for high contrast (the settings portal's
+  `org.freedesktop.appearance` `contrast` = 1, or GNOME's `high-contrast`),
+  or a session that isn't Wayland (X11 promises no compositor). Settings
+  names which (`blur::opaque_note`).
+- **App id `dev.shelbi.Desktop`** on every window (`platform::os::APP_ID`;
+  it was `co.32pixels.shelbi`). The package installs the matching desktop
+  entry and hicolor icons (`packaging/linux/`). An icon picked in Settings
+  goes into `~/.local/share/icons/hicolor` at every size, which the icon
+  theme looks up first (`platform::dock_icon`).
+- **No global positions.** Wayland tells a window neither where it is nor
+  where another is (gpui reports every window's origin as 0,0) and won't
+  place one. So a tab drag keeps to its own window
+  (`platform::screen::global_positions`): no other window's bar takes the
+  tab, no floating ghost opens (the card is drawn in the source window), and
+  a tab dropped away from its bar opens in a new window the compositor
+  places (Hyprland tiles it). The compositor's implicit grab keeps sending
+  the source window the press's moves past its edges, so tearing off itself
+  works. The tab menu's **Move to Window** (other windows by title, then New
+  Window) moves a tab into another window, on both OSes.
+- **File ▸ New Window is Ctrl+Shift+N** (`keys::NEW_WINDOW`): Hyprland
+  binds Super+Shift+N.
+- **Tool pickers.** On Linux an editor or diff app is a desktop entry
+  (`shelbi_state::tools`: each `KnownApp`'s `desktop_ids`, found in the XDG
+  `applications` folders, opened by its `Exec` line), and its picker icon is
+  its `Icon` from the icon theme (`platform::icon_theme`: the GTK icon theme,
+  what it inherits, then hicolor; SVG first).
+- **Font smoothing** is a macOS setting only (`platform::font_smoothing`).
+  gpui's Linux text (swash, grayscale antialiasing, no stem darkening) draws
+  close to macOS with smoothing off, which the app already uses, so the
+  frames' weights hold without a Linux counterpart. Light-on-dark text reads
+  a touch lighter than on a Retina Mac at 1x scale, as any grayscale-AA
+  renderer does.
 
 #### System libraries (for the PKGBUILD)
 
