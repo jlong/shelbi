@@ -216,6 +216,7 @@ fn linux_has_no_homebrew_row_and_its_own_hints() {
         [
             (Some("Claude Code"), "npm install -g @anthropic-ai/claude-code".to_string()),
             (Some("Codex"), "npm install -g @openai/codex".to_string()),
+            (Some("OpenCode"), "npm install -g opencode-ai".to_string()),
         ]
     );
     let ready = checked(

@@ -58,6 +58,8 @@ pub fn text(label: &str, default: &str) -> Result<String> {
 pub(crate) enum Runner {
     Claude,
     Codex,
+    #[value(name = "opencode")]
+    OpenCode,
 }
 
 impl Runner {
@@ -65,6 +67,7 @@ impl Runner {
         match self {
             Self::Claude => RunnerKind::Claude,
             Self::Codex => RunnerKind::Codex,
+            Self::OpenCode => RunnerKind::OpenCode,
         }
     }
 }
@@ -369,8 +372,9 @@ fn heading(step: Step, ask: &dyn Ask) {
 fn missing_runner_guidance() -> String {
     concat!(
         "No supported agent runner was found on PATH. Install and authenticate Claude Code ",
-        "(https://docs.claude.com/en/docs/claude-code) or Codex ",
-        "(npm install -g @openai/codex), then start Shelbi again."
+        "(https://docs.claude.com/en/docs/claude-code), Codex ",
+        "(npm install -g @openai/codex) or OpenCode (npm install -g opencode-ai), ",
+        "then start Shelbi again."
     )
     .to_string()
 }

@@ -290,7 +290,33 @@ pub fn run_save(job: SaveJob, store: &dyn ConfigStore) -> SaveOutcome {
         name = new;
     }
     let saved = save_agents(store, &config).map_err(|e| (Field::Save, message(&e)))?;
+    follow_orchestrator_runner(&saved.config, &name)?;
     Ok((saved, name))
+}
+
+/// The orchestrator session launches on `orchestrator.runner` in the
+/// project YAML, not on the orchestrator agent's `preferred_runner`, so
+/// choosing a runner for that agent also points `orchestrator.runner` at it
+/// (adding the `agent_runners` entry when the project has none), the same
+/// write the orchestrator onboarding makes. It applies the next time the
+/// orchestrator starts. Project default leaves the YAML alone, and so does
+/// a generic runner the project doesn't declare (the launch would refuse
+/// it anyway).
+fn follow_orchestrator_runner(config: &AgentsConfig, name: &str) -> Result<(), (Field, String)> {
+    if name != shelbi_state::ORCHESTRATOR_AGENT {
+        return Ok(());
+    }
+    let Some(kind) = config.agent(name).and_then(|a| a.preferred_runner()) else {
+        return Ok(());
+    };
+    match shelbi_state::orchestrator_setup::set_orchestrator_runner(config.project(), kind) {
+        Ok(_) => Ok(()),
+        Err(shelbi_state::orchestrator_setup::RunnerSetupError::NotDeclared(_)) => Ok(()),
+        Err(e) => Err((
+            Field::Save,
+            format!("Saved, but the orchestrator still runs on its old runner: {e}"),
+        )),
+    }
 }
 
 /// Copy agent `name` (as saved) as `copy` and save it through `store`, off

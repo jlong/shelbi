@@ -852,11 +852,14 @@ fn picker_options_cover_every_runner() {
     let options = runner_options();
     assert_eq!(
         options.iter().map(|o| o.kind).collect::<Vec<_>>(),
-        vec![RunnerKind::Claude, RunnerKind::Codex, RunnerKind::Generic]
+        vec![RunnerKind::Claude, RunnerKind::Codex, RunnerKind::OpenCode, RunnerKind::Generic]
     );
     assert_eq!(options[0].models, &["opus", "sonnet", "haiku"]);
     assert_eq!(options[0].efforts.len(), 4);
+    // OpenCode's model ids depend on the user's providers, and its effort
+    // isn't Shelbi's to set.
     assert!(options[2].models.is_empty() && options[2].efforts.is_empty());
+    assert!(options[3].models.is_empty() && options[3].efforts.is_empty());
     for mode in PERMISSION_MODES {
         assert!(shelbi_core::is_known_permission_mode(mode), "{mode}");
     }

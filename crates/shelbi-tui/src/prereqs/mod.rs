@@ -14,7 +14,7 @@
 //!     Already installed somewhere else?  b Browse…
 //!                                                                  ┃
 //!   ✕ Coding agent                                                 │
-//!     Shelbi runs your agents with Claude Code or Codex. …         │
+//!     Shelbi runs your agents with Claude Code, Codex or OpenCode. …
 //!
 //!                                   ▄▄▄▄▄▄▄▄▄▄▄▄▄▄ ▄▄▄▄▄▄▄▄▄▄▄▄▄
 //!                                     Skip for now   Check again
@@ -23,7 +23,7 @@
 //! ```
 //!
 //! The keyboard moves between the rows (and, in a missing coding-agent row,
-//! between its Claude Code and Codex commands); the list scrolls to keep the
+//! between its Claude Code, Codex and OpenCode commands); the list scrolls to keep the
 //! selection in view, with a scrollbar when it doesn't fit. `c` copies the
 //! selected command (OSC 52, and `pbcopy` on macOS, as the shell copies) and
 //! the line reads "Copied" for two seconds. `b` (the row's Browse…) opens its

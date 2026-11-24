@@ -300,13 +300,13 @@ fn workspace_integration_modes(
 
 /// Classify a workspace runner command into its integration tier. A runner
 /// Shelbi knows how to wake with verified submission and read OSC pane-title
-/// markers from (Claude Code, Codex) is `conventional`; an unrecognized runner
+/// markers from (Claude Code, Codex, OpenCode) is `conventional`; an unrecognized runner
 /// is `degraded` (polling contract only).
 fn workspace_integration_mode(runner_command: &str) -> IntegrationMode {
     match shelbi_agent::RunnerAdapter::for_command(runner_command).kind() {
-        shelbi_core::RunnerKind::Claude | shelbi_core::RunnerKind::Codex => {
-            IntegrationMode::Conventional
-        }
+        shelbi_core::RunnerKind::Claude
+        | shelbi_core::RunnerKind::Codex
+        | shelbi_core::RunnerKind::OpenCode => IntegrationMode::Conventional,
         shelbi_core::RunnerKind::Generic => IntegrationMode::Degraded,
     }
 }

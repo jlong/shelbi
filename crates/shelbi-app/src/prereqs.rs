@@ -144,7 +144,7 @@ pub enum Tool {
     Git,
     Homebrew,
     GithubCli,
-    /// Claude Code or Codex: either one satisfies it.
+    /// Claude Code, Codex or OpenCode: any one satisfies it.
     Agent,
 }
 
@@ -169,7 +169,7 @@ impl Tool {
             Tool::Git => &[Binary::Git],
             Tool::Homebrew => &[Binary::Brew],
             Tool::GithubCli => &[Binary::Gh],
-            Tool::Agent => &[Binary::Claude, Binary::Codex],
+            Tool::Agent => &[Binary::Claude, Binary::Codex, Binary::OpenCode],
         }
     }
 
@@ -197,7 +197,9 @@ impl Tool {
     /// What the Locate panel asks for.
     pub fn locate_body(self) -> String {
         match self {
-            Tool::Agent => "Choose the claude or codex executable. Shelbi remembers this location.".to_string(),
+            Tool::Agent => {
+                "Choose the claude, codex or opencode executable. Shelbi remembers this location.".to_string()
+            }
             tool => format!(
                 "Choose the {} executable. Shelbi remembers this location.",
                 tool.binaries()[0].command()
@@ -233,7 +235,7 @@ impl Tool {
             (Tool::GithubCli, Platform::Linux) => {
                 "Not found on your PATH. Install it with your package manager; GitHub's guide covers each one:"
             }
-            (Tool::Agent, _) => "Shelbi runs your agents with Claude Code or Codex. Install either one.",
+            (Tool::Agent, _) => "Shelbi runs your agents with Claude Code, Codex or OpenCode. Install any one.",
         }
     }
 
@@ -255,10 +257,12 @@ impl Tool {
             (Tool::Agent, Platform::Mac) => vec![
                 agent(Binary::Claude, "brew install --cask claude-code"),
                 agent(Binary::Codex, "brew install --cask codex"),
+                agent(Binary::OpenCode, "brew install opencode"),
             ],
             (Tool::Agent, Platform::Linux) => vec![
                 agent(Binary::Claude, "npm install -g @anthropic-ai/claude-code"),
                 agent(Binary::Codex, "npm install -g @openai/codex"),
+                agent(Binary::OpenCode, "npm install -g opencode-ai"),
             ],
         }
     }
@@ -276,6 +280,7 @@ pub enum Binary {
     Gh,
     Claude,
     Codex,
+    OpenCode,
 }
 
 impl Binary {
@@ -287,6 +292,7 @@ impl Binary {
             Binary::Gh => "gh",
             Binary::Claude => "claude",
             Binary::Codex => "codex",
+            Binary::OpenCode => "opencode",
         }
     }
 
@@ -298,6 +304,7 @@ impl Binary {
             Binary::Gh => "GitHub CLI",
             Binary::Claude => "Claude Code",
             Binary::Codex => "Codex",
+            Binary::OpenCode => "OpenCode",
         }
     }
 }
@@ -308,7 +315,7 @@ pub struct InstallCommand {
     /// The binary it installs.
     pub binary: Binary,
     /// Its label beside the command (the coding-agent row's "Claude Code",
-    /// "Codex"); `None` for a row's only command.
+    /// "Codex", "OpenCode"); `None` for a row's only command.
     pub label: Option<&'static str>,
     /// Exactly what Copy puts on the clipboard.
     pub text: String,
@@ -669,7 +676,8 @@ pub fn quick_check(located: &ToolPaths, platform: Platform, probe: &dyn Probe) -
 
 /// Validate a path the user located for `tool`: it must be an executable
 /// file whose `--version` succeeds. For the coding agent, a file named like
-/// `codex` is Codex, anything else Claude Code. Blocking.
+/// `opencode` is OpenCode, one named like `codex` is Codex, anything else
+/// Claude Code. Blocking.
 pub fn validate_located(
     tool: Tool,
     input: &str,
@@ -689,7 +697,9 @@ pub fn validate_located(
     let binary = match tool {
         Tool::Agent => {
             let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-            if name.contains("codex") {
+            if name.contains("opencode") {
+                Binary::OpenCode
+            } else if name.contains("codex") {
                 Binary::Codex
             } else {
                 Binary::Claude

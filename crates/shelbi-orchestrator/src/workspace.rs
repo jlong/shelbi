@@ -3141,6 +3141,24 @@ fn deploy_and_spawn(a: SpawnArgs<'_>) -> Result<()> {
         }
     }
     deploy_runner_hooks(a.host, a.worktree)?;
+    // OpenCode reaches the same hook scripts through Shelbi's project plugin.
+    // A user-authored file at the plugin's path is never overwritten; like an
+    // unmergeable `settings.local.json`, it stops the dispatch with a message
+    // naming the file.
+    if shelbi_agent::RunnerAdapter::for_spec(a.runner).is_opencode() {
+        if let OpenCodePluginResult::UserFileInTheWay { message } =
+            deploy_opencode_plugin(a.host, a.worktree)?
+        {
+            append_dispatch_status(
+                &a.project.name,
+                a.task_id,
+                &a.workspace.name,
+                "opencode-plugin-blocked",
+                &format!("file={OPENCODE_PLUGIN_REL} reason=user-authored-file"),
+            );
+            return Err(Error::Other(message));
+        }
+    }
 
     // Decide + record the hub→workspace message channel for THIS launch. The
     // mode is derived from the runner's verified hook health (see
@@ -3920,6 +3938,7 @@ fn runner_label(command: &str) -> &'static str {
     match shelbi_agent::RunnerAdapter::for_command(command).kind() {
         shelbi_core::RunnerKind::Claude => "Claude",
         shelbi_core::RunnerKind::Codex => "Codex",
+        shelbi_core::RunnerKind::OpenCode => "OpenCode",
         shelbi_core::RunnerKind::Generic => "agent runner",
     }
 }
@@ -4864,6 +4883,55 @@ pub fn deploy_runner_hooks(host: &Host, worktree: &Path) -> Result<()> {
         deploy_runner_hook_file(host, worktree, file)?;
     }
     Ok(())
+}
+
+/// Worktree-relative path of Shelbi's OpenCode plugin. OpenCode loads every
+/// module in a project's `.opencode/plugins/` alongside the user's own
+/// config, so this one file wires an OpenCode workspace without touching any
+/// user-owned OpenCode settings.
+pub const OPENCODE_PLUGIN_REL: &str = ".opencode/plugins/shelbi.js";
+
+/// The plugin body (see `opencode_plugin.js`).
+const OPENCODE_PLUGIN_JS: &str = include_str!("opencode_plugin.js");
+
+/// The first line of every plugin body Shelbi writes: how a refresh tells its
+/// own file from a user's file of the same name.
+const OPENCODE_PLUGIN_SIGNATURE: &str = "// Shelbi's OpenCode plugin.";
+
+/// Outcome of [`deploy_opencode_plugin`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpenCodePluginResult {
+    /// The plugin is written (fresh, or refreshed over Shelbi's own copy).
+    Deployed,
+    /// A file Shelbi didn't write sits at [`OPENCODE_PLUGIN_REL`]; it is left
+    /// as it was. `message` tells the orchestrator which file and why.
+    UserFileInTheWay { message: String },
+}
+
+/// Write Shelbi's OpenCode plugin to `<worktree>/.opencode/plugins/shelbi.js`
+/// and keep it out of `git status`. Refreshes Shelbi's own copy on every
+/// launch, so a workspace picks up a new plugin body on its next dispatch;
+/// never overwrites a file that doesn't carry Shelbi's signature line.
+pub fn deploy_opencode_plugin(host: &Host, worktree: &Path) -> Result<OpenCodePluginResult> {
+    let dest = worktree.join(OPENCODE_PLUGIN_REL);
+    if let Some(existing) = read_worktree_text(host, &dest)? {
+        if !existing.starts_with(OPENCODE_PLUGIN_SIGNATURE) {
+            return Ok(OpenCodePluginResult::UserFileInTheWay {
+                message: format!(
+                    "{} already holds a file Shelbi didn't write, so Shelbi can't install its \
+                     OpenCode plugin there. Rename or remove that file and dispatch again.",
+                    dest.display(),
+                ),
+            });
+        }
+        if existing == OPENCODE_PLUGIN_JS {
+            let _ = gitignore_worktree_paths(host, worktree, &[OPENCODE_PLUGIN_REL.to_string()]);
+            return Ok(OpenCodePluginResult::Deployed);
+        }
+    }
+    write_worktree_text(host, &dest, OPENCODE_PLUGIN_JS, "opencode-plugin")?;
+    let _ = gitignore_worktree_paths(host, worktree, &[OPENCODE_PLUGIN_REL.to_string()]);
+    Ok(OpenCodePluginResult::Deployed)
 }
 
 fn deploy_runner_hook_file(host: &Host, worktree: &Path, file: &RunnerHookFile) -> Result<()> {
@@ -5870,6 +5938,15 @@ fn with_startup_prompt(
             let flag = spec.flag.as_deref().unwrap_or("--message-file");
             format!(
                 "{launch} {flag} {rel}",
+                flag = shelbi_agent::shell_escape(flag),
+                rel = shelbi_agent::shell_escape(rel),
+            )
+        }
+        PromptInjectionKind::FlagValue => {
+            let spec = effective_prompt_injection_for_spawn(runner, resume);
+            let flag = spec.flag.as_deref().unwrap_or("--prompt");
+            format!(
+                "{launch} {flag} \"$(cat {rel})\"",
                 flag = shelbi_agent::shell_escape(flag),
                 rel = shelbi_agent::shell_escape(rel),
             )
@@ -10396,6 +10473,81 @@ statuses:
         // An older Claude Code with no `background_tasks`, or no payload at all.
         assert_eq!(run_pane_idle(r#"{"hook_event_name":"Stop"}"#), "\x1b]2;shelbi:idle\x07");
         assert_eq!(run_pane_idle(""), "\x1b]2;shelbi:idle\x07");
+    }
+
+    #[test]
+    fn opencode_launch_seeds_the_prompt_through_its_prompt_flag() {
+        let opencode = AgentRunnerSpec {
+            command: "opencode".into(),
+            flags: vec![],
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        };
+        assert_eq!(
+            workspace_launch_command_with_startup_prompt(
+                &opencode,
+                Some("auto"),
+                false,
+                Some(WORKTREE_STARTUP_PROMPT_REL),
+            ),
+            r#"env SHELBI_PANE_TTY="$(tty)" opencode --auto --standalone --prompt "$(cat .shelbi/startup-prompt.md)""#,
+        );
+        // A resume continues the last session and still seeds the prompt: the
+        // paste path is Claude's alone.
+        assert_eq!(
+            workspace_launch_command_with_startup_prompt(
+                &opencode,
+                None,
+                true,
+                Some(WORKTREE_STARTUP_PROMPT_REL),
+            ),
+            r#"env SHELBI_PANE_TTY="$(tty)" opencode --continue --standalone --prompt "$(cat .shelbi/startup-prompt.md)""#,
+        );
+    }
+
+    #[test]
+    fn deploy_opencode_plugin_owns_only_its_own_file() {
+        let tmp = std::env::temp_dir().join(format!(
+            "shelbi-opencode-plugin-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let worktree = tmp.join("wt");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let plugin = worktree.join(OPENCODE_PLUGIN_REL);
+
+        // Fresh worktree: written.
+        assert_eq!(
+            deploy_opencode_plugin(&Host::Local, &worktree).unwrap(),
+            OpenCodePluginResult::Deployed
+        );
+        let body = std::fs::read_to_string(&plugin).unwrap();
+        assert!(body.starts_with(OPENCODE_PLUGIN_SIGNATURE));
+        assert!(body.contains(".shelbi/hooks"));
+
+        // Shelbi's own stale copy: refreshed.
+        std::fs::write(&plugin, format!("{OPENCODE_PLUGIN_SIGNATURE}\n// old\n")).unwrap();
+        assert_eq!(
+            deploy_opencode_plugin(&Host::Local, &worktree).unwrap(),
+            OpenCodePluginResult::Deployed
+        );
+        assert_eq!(std::fs::read_to_string(&plugin).unwrap(), OPENCODE_PLUGIN_JS);
+
+        // A user's file at the same path: left exactly as it was.
+        std::fs::write(&plugin, "export default {}\n").unwrap();
+        match deploy_opencode_plugin(&Host::Local, &worktree).unwrap() {
+            OpenCodePluginResult::UserFileInTheWay { message } => {
+                assert!(message.contains(".opencode/plugins/shelbi.js"), "{message}");
+            }
+            other => panic!("expected the user's file to block the deploy, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&plugin).unwrap(), "export default {}\n");
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

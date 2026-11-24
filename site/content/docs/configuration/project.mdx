@@ -201,7 +201,8 @@ Shelbi validates that `orchestrator.runner` names an entry in
 (`--append-system-prompt` and the first-message bootstrap prompt). Codex
 is launched as the configured `command` plus `flags`, then receives an
 initial startup prompt containing the rendered orchestrator instructions
-and bootstrap request. Other runners launch exactly as configured. Put any
+and bootstrap request. OpenCode gets the same startup prompt through its
+`--prompt` flag. Other runners launch exactly as configured. Put any
 required Codex mode flags in `agent_runners.codex.flags`.
 
 ### Event systems
@@ -225,7 +226,7 @@ The orchestrator's instructions teach whichever system is set. The passages
 that differ sit in marked blocks, and each launch keeps only the blocks for the
 current setting (see
 [customizing the prompt](/docs/concepts/orchestrator#customizing-the-prompt-per-project)).
-A runner other than Claude or Codex has no v2 delivery path, so on `awareness`
+A runner other than Claude or Codex (OpenCode included) has no v2 delivery path, so on `awareness`
 it keeps the heartbeat instructions and bootstrap while the periodic heartbeat
 stays off. Leave such projects on `heartbeat`.
 
@@ -233,7 +234,11 @@ Worker hooks are deployed into each worktree under `.shelbi/hooks/`, and the
 worktree's `.claude/settings.local.json` wires
 `$CLAUDE_PROJECT_DIR/.shelbi/hooks/*.sh` (`session-start`, `stop`,
 `pane-working`, `pane-idle`, `pane-blocked`) so the session pushes orchestrator
-messages to the agent as they arrive. Codex has no
+messages to the agent as they arrive. An OpenCode worker gets the same hooks
+through a plugin Shelbi writes to the worktree's `.opencode/plugins/shelbi.js`
+(kept out of `git status`): it runs the scripts on OpenCode's session events,
+writes the `shelbi:<state>` markers to the pane title, and pushes drained
+messages into the session as they arrive, even while it sits idle. Codex has no
 hook channel Shelbi can wire without overwriting user-owned `.codex/`
 configuration, so a Codex worker instead pulls its messages: its startup
 prompt carries a polling contract that tails `.shelbi/messages/<task-id>.log`.
@@ -260,8 +265,8 @@ from this map when no top-level [`runners`](#runners) fleet is declared).
 | `command` | string | yes | — | Executable to invoke (e.g. `claude`, `codex`). |
 | `flags` | list of string | no | `[]` | Extra flags appended to every invocation. |
 | `dialog_signatures` | list of object | no | built-in per-runner set | Blocking-dialog text signatures the poller uses to detect a session frozen on a dialog. When empty, defaults keyed on `command` apply. |
-| `prompt_injection` | `{ kind, flag? }` | no | by executable basename | How Shelbi delivers the per-task initial prompt. `kind` is `positional-arg`, `flag-file` (with `flag`, e.g. `--message-file`), `stdin`, or `paste` (for REPL-only harnesses). When omitted, `claude` and `codex` get a positional prompt, `aider` gets `--message-file <prompt-file>`, and anything else reads the prompt on stdin. |
-| `integration` | `claude` \| `codex` \| `generic` | no | detected from `command` | Pins the runner adapter, overriding the basename detection, so a wrapper executable Shelbi wouldn't recognize can still get the Claude or Codex contract. |
+| `prompt_injection` | `{ kind, flag? }` | no | by executable basename | How Shelbi delivers the per-task initial prompt. `kind` is `positional-arg`, `flag-file` (with `flag`, e.g. `--message-file`), `flag-value` (the prompt text as the flag's value, e.g. `--prompt`), `stdin`, or `paste` (for REPL-only harnesses). When omitted, `claude` and `codex` get a positional prompt, `opencode` gets `--prompt <text>`, `aider` gets `--message-file <prompt-file>`, and anything else reads the prompt on stdin. |
+| `integration` | `claude` \| `codex` \| `opencode` \| `generic` | no | detected from `command` | Pins the runner adapter, overriding the basename detection, so a wrapper executable Shelbi wouldn't recognize can still get the Claude, Codex or OpenCode contract. |
 
 ```yaml
 agent_runners:

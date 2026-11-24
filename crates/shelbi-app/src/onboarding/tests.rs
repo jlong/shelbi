@@ -91,7 +91,12 @@ fn step_two_starts_on_what_the_orchestrator_runs() {
         .collect();
     assert_eq!(
         harnesses,
-        [("Claude Code", Some("Anthropic"), true), ("Codex", Some("OpenAI"), false), ("Generic", None, false)]
+        [
+            ("Claude Code", Some("Anthropic"), true),
+            ("Codex", Some("OpenAI"), false),
+            ("OpenCode", None, false),
+            ("Generic", None, false)
+        ]
     );
     assert_eq!(model.model_label, RUNNER_DEFAULT);
     let labels: Vec<&str> = model.models.iter().map(|m| m.label.as_str()).collect();

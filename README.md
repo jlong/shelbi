@@ -15,7 +15,7 @@
 ## What is Shelbi
 
 You talk to one agent, the orchestrator. It writes your work up as tasks,
-dispatches them to worker agents (Claude Code, Codex, aider, anything with a
+dispatches them to worker agents (Claude Code, Codex, OpenCode, aider, anything with a
 CLI) running in parallel across your machines, locally or over SSH, and brings
 finished work back for you to review. Each workspace is a persistent Shelbi
 session with its own git worktree; Shelbi switches that worktree to each task's

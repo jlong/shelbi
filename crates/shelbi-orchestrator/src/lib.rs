@@ -1171,7 +1171,7 @@ fn codex_bridge_cmd(shelbi_bin: &str, project_name: &str, first_launch: bool) ->
 /// Claude receives the composed `agents/orchestrator/instructions.md`
 /// through `--append-system-prompt` and the bootstrap request as its
 /// first positional prompt, preserving the historical Claude startup
-/// shape. Codex has no `--append-system-prompt` equivalent in Shelbi's
+/// shape. Codex (and OpenCode, through `--prompt`) has no `--append-system-prompt` equivalent in Shelbi's
 /// runner abstraction, but its interactive CLI accepts an initial
 /// positional prompt; for Codex we build that prompt from the project
 /// identity, worktree path, rendered instructions file, bootstrap
@@ -1204,9 +1204,27 @@ fn launch_with_bootstrap(
         )
     } else if adapter.is_codex() {
         codex_standalone_launch(spec, project_name, workdir, bootstrap_prompt)
+    } else if adapter.is_opencode() {
+        opencode_standalone_launch(spec, project_name, workdir, bootstrap_prompt)
     } else {
         shelbi_agent::launch_command(spec)
     }
+}
+
+/// OpenCode has no system-prompt flag either, so its orchestrator gets the
+/// same self-contained first prompt as a standalone Codex one, through the
+/// TUI's `--prompt` (its positional argument is a directory).
+fn opencode_standalone_launch(
+    spec: &shelbi_core::AgentRunnerSpec,
+    project_name: &str,
+    workdir: &std::path::Path,
+    bootstrap_prompt: &str,
+) -> String {
+    let launch = shelbi_agent::launch_command(spec);
+    format!(
+        "{launch} --prompt {prompt}",
+        prompt = codex_orchestrator_prompt_arg(project_name, workdir, bootstrap_prompt),
+    )
 }
 
 /// Conservative compatibility launch used by the native Codex bridge when

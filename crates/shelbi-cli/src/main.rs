@@ -272,8 +272,8 @@ enum Cmd {
     },
     /// Initialize a Shelbi project. `shelbi init -y` detects the repository,
     /// runner, and workspace plan, then scaffolds it without prompts.
-    /// If both Claude and Codex are installed, add `--runner claude` or
-    /// `--runner codex`.
+    /// If more than one of Claude, Codex and OpenCode is installed, add
+    /// `--runner claude`, `--runner codex` or `--runner opencode`.
     ///
     /// Without `-y`, Shelbi preserves the legacy config-location flow and
     /// offers a choice of *global* mode (config lives at

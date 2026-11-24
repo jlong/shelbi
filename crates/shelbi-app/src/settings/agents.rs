@@ -52,6 +52,7 @@ pub fn runner_label(runner: RunnerKind) -> &'static str {
     match runner {
         RunnerKind::Claude => "Claude Code",
         RunnerKind::Codex => "Codex",
+        RunnerKind::OpenCode => "OpenCode",
         RunnerKind::Generic => "Generic",
     }
 }

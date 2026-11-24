@@ -19,13 +19,82 @@ pub use shelbi_core::shell_escape;
 
 /// Construct the shell command to launch the agent CLI. Returns a single
 /// string suitable for a session process's child command.
+///
+/// OpenCode gets three additions. `--standalone` gives the pane a private
+/// server instead of OpenCode's shared background service, so the server (and
+/// Shelbi's plugin inside it) inherits this pane's environment (`TASK_ID`,
+/// the hub address). Because that server runs without a controlling
+/// terminal, the pane's tty path is exported as [`OPENCODE_PANE_TTY_ENV`] for
+/// the plugin to write its `shelbi:<state>` title markers to. And since the
+/// TUI has no model flag, a `--model <id>` pair in the flags (the adapter's
+/// [`RunnerAdapter::with_model`], or one a user wrote) leaves the argv and
+/// becomes inline config in `OPENCODE_CONFIG_CONTENT`, which OpenCode merges
+/// over the user's own config.
 pub fn launch_command(spec: &AgentRunnerSpec) -> String {
-    let mut parts = vec![shell_escape(&spec.command)];
-    for f in &spec.flags {
+    if !RunnerAdapter::for_spec(spec).is_opencode() {
+        let mut parts = vec![shell_escape(&spec.command)];
+        for f in &spec.flags {
+            parts.push(shell_escape(f));
+        }
+        return parts.join(" ");
+    }
+    let model = flag_value(&spec.flags, &["--model", "-m"]);
+    let flags = strip_flag_with_value(&spec.flags, &["--model", "-m"]);
+    // `env`, not a bare `VAR=value` prefix: callers run the line as
+    // `exec {launch}`, and after `exec` an assignment word is taken for the
+    // command name.
+    let mut parts = vec!["env".to_string(), format!("{OPENCODE_PANE_TTY_ENV}=\"$(tty)\"")];
+    if let Some(model) = model {
+        let config = format!("{{\"model\":{}}}", json_string(&model));
+        parts.push(format!("OPENCODE_CONFIG_CONTENT={}", shell_escape(&config)));
+    }
+    parts.push(shell_escape(&spec.command));
+    for f in &flags {
         parts.push(shell_escape(f));
+    }
+    if !flags.iter().any(|f| f == OPENCODE_STANDALONE_FLAG) {
+        parts.push(OPENCODE_STANDALONE_FLAG.into());
     }
     parts.join(" ")
 }
+
+/// The value of the last `--flag value` / `--flag=value` among `names`.
+fn flag_value(flags: &[String], names: &[&str]) -> Option<String> {
+    let mut found = None;
+    let mut iter = flags.iter();
+    while let Some(f) = iter.next() {
+        if names.iter().any(|n| f == n) {
+            found = iter.next().cloned();
+        } else if let Some(v) = names.iter().find_map(|n| f.strip_prefix(&format!("{n}="))) {
+            found = Some(v.to_string());
+        }
+    }
+    found
+}
+
+/// `s` as a JSON string literal.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Environment variable carrying the pane's tty path into an OpenCode
+/// session, where Shelbi's plugin writes its title markers.
+pub const OPENCODE_PANE_TTY_ENV: &str = "SHELBI_PANE_TTY";
+
+/// OpenCode flag that runs a private server for this TUI rather than
+/// attaching to the shared background service.
+const OPENCODE_STANDALONE_FLAG: &str = "--standalone";
 
 /// How Shelbi restores a runner's prior context when a workspace is resumed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,6 +177,11 @@ impl RunnerAdapter {
         self.kind == RunnerKind::Codex
     }
 
+    /// Whether this runner is OpenCode.
+    pub fn is_opencode(self) -> bool {
+        self.kind == RunnerKind::OpenCode
+    }
+
     /// The per-contract transport tiers Shelbi has with this runner.
     pub fn capabilities(self) -> CapabilityLadder {
         self.kind.capabilities()
@@ -116,7 +190,7 @@ impl RunnerAdapter {
     /// How a resumed workspace on this runner recovers its prior context.
     pub fn resume_strategy(self) -> ResumeStrategy {
         match self.kind {
-            RunnerKind::Claude => ResumeStrategy::Transcript,
+            RunnerKind::Claude | RunnerKind::OpenCode => ResumeStrategy::Transcript,
             RunnerKind::Codex => ResumeStrategy::NativeThread,
             RunnerKind::Generic => ResumeStrategy::ColdBanner,
         }
@@ -125,10 +199,9 @@ impl RunnerAdapter {
     /// Which delivery channel this runner uses for hub→workspace messages.
     /// See [`message_channel`] for the health basis behind each runner's mode.
     pub fn message_channel(self) -> MessageChannel {
-        if self.is_claude() {
-            MessageChannel::Hooks
-        } else {
-            MessageChannel::Polling
+        match self.kind {
+            RunnerKind::Claude | RunnerKind::OpenCode => MessageChannel::Hooks,
+            RunnerKind::Codex | RunnerKind::Generic => MessageChannel::Polling,
         }
     }
 
@@ -158,7 +231,7 @@ impl RunnerAdapter {
                 OrchestratorPluginInjection::CodexNativeSkillRoot
             }
             RunnerKind::Codex => OrchestratorPluginInjection::CodexDeveloperInstructions,
-            RunnerKind::Generic => OrchestratorPluginInjection::None,
+            RunnerKind::OpenCode | RunnerKind::Generic => OrchestratorPluginInjection::None,
         }
     }
 
@@ -194,6 +267,9 @@ impl RunnerAdapter {
             Some(m) if m != "default" => m,
             _ => return spec.clone(),
         };
+        if self.is_opencode() {
+            return with_opencode_auto(spec, mode);
+        }
         if !self.is_claude() {
             return spec.clone();
         }
@@ -225,7 +301,9 @@ impl RunnerAdapter {
         };
         let flag = match self.kind {
             // Claude and Codex both select the model with `--model <id>`.
-            RunnerKind::Claude | RunnerKind::Codex => "--model",
+            // OpenCode's TUI has no model flag, so its `--model` is logical:
+            // [`launch_command`] moves it into `OPENCODE_CONFIG_CONTENT`.
+            RunnerKind::Claude | RunnerKind::Codex | RunnerKind::OpenCode => "--model",
             // A generic runner has no model contract Shelbi knows how to drive.
             RunnerKind::Generic => return spec.clone(),
         };
@@ -277,7 +355,10 @@ impl RunnerAdapter {
                 out.flags.push(override_arg);
                 out
             }
-            RunnerKind::Generic => spec.clone(),
+            // OpenCode keeps a per-model variant the TUI selects itself; the
+            // project config's `#variant` suffix doesn't reach it, so Shelbi
+            // leaves effort to the user's OpenCode settings.
+            RunnerKind::OpenCode | RunnerKind::Generic => spec.clone(),
         }
     }
 
@@ -285,7 +366,9 @@ impl RunnerAdapter {
     /// `claude` and `resume` is set. See the free [`with_continue`] wrapper
     /// for the full rationale.
     pub fn with_continue(self, spec: &AgentRunnerSpec, resume: bool) -> AgentRunnerSpec {
-        if !resume || !self.is_claude() {
+        // Claude and OpenCode both spell it `--continue` (alias `-c`): reload
+        // the most recent session in the pane's working directory.
+        if !resume || !(self.is_claude() || self.is_opencode()) {
             return spec.clone();
         }
         if spec
@@ -352,6 +435,20 @@ pub fn with_reasoning_effort(
     effort: Option<ReasoningEffort>,
 ) -> AgentRunnerSpec {
     RunnerAdapter::for_spec(spec).with_reasoning_effort(spec, effort)
+}
+
+/// Map a Shelbi permission mode onto OpenCode's one switch: `--auto`
+/// auto-approves every permission the user's config doesn't explicitly deny.
+/// Claude's `auto` and `bypassPermissions` both mean "don't stop to ask", so
+/// they turn it on; `acceptEdits` and `plan` have no OpenCode equivalent and
+/// leave the user's own permission config in charge. Idempotent.
+fn with_opencode_auto(spec: &AgentRunnerSpec, mode: &str) -> AgentRunnerSpec {
+    if !matches!(mode, "auto" | "bypassPermissions") || spec.flags.iter().any(|f| f == "--auto") {
+        return spec.clone();
+    }
+    let mut out = spec.clone();
+    out.flags.push("--auto".into());
+    out
 }
 
 /// Codex's `model_reasoning_effort` accepts `minimal|low|medium|high|xhigh`;
@@ -422,6 +519,10 @@ impl MessageChannel {
 ///   `.claude/settings.json` — a Shelbi-owned config layer — and that push
 ///   path is the proven, shipped default, so claude resolves to
 ///   [`MessageChannel::Hooks`].
+/// - **OpenCode** loads Shelbi's plugin from the worktree's
+///   `.opencode/plugins/`, which runs the same hook scripts on OpenCode's
+///   session events and pushes the drained batch back in as a synthetic
+///   message, so it resolves to [`MessageChannel::Hooks`] too.
 /// - **Codex and every other runner** resolve to [`MessageChannel::Polling`].
 ///   The installed Codex CLI rejects the `-c core.hooksPath=<path>` override
 ///   Shelbi previously passed (`unknown configuration field 'core'` under
@@ -1081,5 +1182,102 @@ mod tests {
             out.flags,
             vec!["--model", "claude-opus-4-8", "--effort", "high"]
         );
+    }
+
+    fn opencode(flags: &[&str]) -> AgentRunnerSpec {
+        AgentRunnerSpec {
+            command: "opencode".into(),
+            flags: flags.iter().map(|f| f.to_string()).collect(),
+            prompt_injection: None,
+            dialog_signatures: vec![],
+            integration: None,
+        }
+    }
+
+    #[test]
+    fn opencode_launch_exports_the_pane_tty_and_runs_standalone() {
+        assert_eq!(
+            launch_command(&opencode(&[])),
+            r#"env SHELBI_PANE_TTY="$(tty)" opencode --standalone"#
+        );
+        // A flag the user already wrote isn't doubled.
+        assert_eq!(
+            launch_command(&opencode(&["--standalone", "--auto"])),
+            r#"env SHELBI_PANE_TTY="$(tty)" opencode --standalone --auto"#
+        );
+    }
+
+    #[test]
+    fn opencode_model_leaves_the_argv_for_inline_config() {
+        let spec = with_model(&opencode(&[]), Some("anthropic/claude-sonnet-4-5"));
+        assert_eq!(
+            launch_command(&spec),
+            r#"env SHELBI_PANE_TTY="$(tty)" OPENCODE_CONFIG_CONTENT='{"model":"anthropic/claude-sonnet-4-5"}' opencode --standalone"#
+        );
+        // A hand-written `--model=` form is honored the same way, and a quote
+        // in the id stays valid JSON.
+        let spec = opencode(&["--model=we\"ird"]);
+        assert_eq!(
+            launch_command(&spec),
+            r#"env SHELBI_PANE_TTY="$(tty)" OPENCODE_CONFIG_CONTENT='{"model":"we\"ird"}' opencode --standalone"#
+        );
+    }
+
+    #[test]
+    fn opencode_adapter_runs_the_hook_contract() {
+        let adapter = RunnerAdapter::for_spec(&opencode(&[]));
+        assert!(adapter.is_opencode());
+        assert_eq!(adapter.message_channel(), MessageChannel::Hooks);
+        assert!(!adapter.polls_for_messages());
+        assert_eq!(adapter.resume_strategy(), ResumeStrategy::Transcript);
+        assert!(!adapter.needs_claude_readiness_probe());
+        assert_eq!(
+            adapter.orchestrator_plugin_injection(true),
+            OrchestratorPluginInjection::None
+        );
+        // An explicit `integration:` pins a wrapper binary to the adapter.
+        let mut wrapped = opencode(&[]);
+        wrapped.command = "my-oc-wrapper".into();
+        wrapped.integration = Some(RunnerKind::OpenCode);
+        assert!(RunnerAdapter::for_spec(&wrapped).is_opencode());
+    }
+
+    #[test]
+    fn opencode_resume_and_permissions_map_onto_its_flags() {
+        assert_eq!(with_continue(&opencode(&[]), true).flags, vec!["--continue"]);
+        assert!(with_continue(&opencode(&[]), false).flags.is_empty());
+        assert_eq!(with_continue(&opencode(&["-c"]), true).flags, vec!["-c"]);
+
+        for mode in ["auto", "bypassPermissions"] {
+            assert_eq!(with_permission_mode(&opencode(&[]), Some(mode)).flags, vec!["--auto"], "{mode}");
+        }
+        for mode in [None, Some("default"), Some("acceptEdits"), Some("plan")] {
+            assert!(with_permission_mode(&opencode(&[]), mode).flags.is_empty(), "{mode:?}");
+        }
+        assert_eq!(
+            with_permission_mode(&opencode(&["--auto"]), Some("auto")).flags,
+            vec!["--auto"]
+        );
+        // Effort has no OpenCode switch Shelbi can drive.
+        assert!(with_reasoning_effort(&opencode(&[]), Some(ReasoningEffort::High)).flags.is_empty());
+    }
+
+    /// Regression: the orchestrator and worker launchers run the line as
+    /// `exec {launch}`, where a bare `VAR=value` prefix becomes the command
+    /// name ("no such file or directory: SHELBI_PANE_TTY=…"). Run a real shell
+    /// over the exact line, with `true` standing in for the OpenCode binary.
+    #[test]
+    fn opencode_launch_line_survives_exec() {
+        let mut spec = with_model(&opencode(&[]), Some("p/m"));
+        spec.command = "true".into();
+        spec.integration = Some(RunnerKind::OpenCode);
+        let line = format!("exec {}", launch_command(&spec));
+        let status = std::process::Command::new("sh")
+            .args(["-c", &line])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success(), "{line}");
     }
 }

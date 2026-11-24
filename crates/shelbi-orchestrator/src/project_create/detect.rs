@@ -231,7 +231,8 @@ pub struct InstalledRunner {
 }
 
 /// The runners a new project can default to, in preference order.
-pub const SUPPORTED_RUNNERS: [RunnerKind; 2] = [RunnerKind::Claude, RunnerKind::Codex];
+pub const SUPPORTED_RUNNERS: [RunnerKind; 3] =
+    [RunnerKind::Claude, RunnerKind::Codex, RunnerKind::OpenCode];
 
 /// The supported runners installed on this machine (Claude Code first),
 /// probed once per process: each probe runs the runner's `--version` with a
@@ -280,6 +281,7 @@ pub fn normalize_version(command: &str, line: &str) -> String {
     let prefixes: &[&str] = match command {
         "claude" => &["claude code ", "claude "],
         "codex" => &["codex-cli ", "codex "],
+        "opencode" => &["opencode v", "opencode "],
         _ => &[],
     };
     let lower = trimmed.to_ascii_lowercase();

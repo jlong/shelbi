@@ -62,7 +62,12 @@ impl SubmitProfile {
         match shelbi_agent::RunnerAdapter::for_spec(runner).kind() {
             shelbi_core::RunnerKind::Claude => Self::ClaudeUi,
             shelbi_core::RunnerKind::Codex => Self::CodexUi,
-            shelbi_core::RunnerKind::Generic => Self::DeliveryOnly,
+            // OpenCode's title markers come from Shelbi's plugin, but its
+            // composer has no parser here yet, so a pane injection is
+            // delivered without UI verification, like a custom runner's.
+            shelbi_core::RunnerKind::OpenCode | shelbi_core::RunnerKind::Generic => {
+                Self::DeliveryOnly
+            }
         }
     }
 
