@@ -119,3 +119,18 @@ jobs:
 
       - name: Smoke the TUI inside GNU Screen
         run: SHELBI_BIN="$PWD/target/debug/shelbi" scripts/ci/tui-smoke.sh screen
+
+  # Shelbi's OpenCode plugin (`crates/shelbi-orchestrator/src/opencode_plugin.js`)
+  # is JavaScript that runs inside OpenCode's server, so the Rust suites don't
+  # cover it. Node's own test runner does, against a fake plugin context and a
+  # fake hub. It takes the test file, not its directory (Node 24 rejects a
+  # directory argument).
+  opencode-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test the OpenCode plugin
+        run: node --test --test-timeout=60000 crates/shelbi-orchestrator/tests/opencode-plugin/plugin.test.mjs
