@@ -1,7 +1,7 @@
 // Unit tests for Shelbi's OpenCode plugin (`src/opencode_plugin.js`), run
 // with Node's own test runner against a fake OpenCode plugin context:
 //
-//   node --test crates/shelbi-orchestrator/tests/opencode-plugin/
+//   node --test crates/shelbi-orchestrator/tests/opencode-plugin/plugin.test.mjs
 //
 // The fake `ctx` has the parts of OpenCode 2.x's plugin API the plugin uses
 // (`location.directory`, `session.get/update/synthetic/prompt` and
