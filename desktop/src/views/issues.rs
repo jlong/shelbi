@@ -3034,7 +3034,7 @@ mod tests {
 
         click(&mut cx, "board-more");
         click(&mut cx, "board-menu-settings");
-        assert_eq!(settings.borrow().as_slice(), [shelbi_app::settings::SettingsPage::Properties]);
+        assert_eq!(settings.borrow().as_slice(), [shelbi_app::settings::SettingsPage::Issues]);
 
         // A connected board's menu has only Settings.
         view.update(&mut cx, |v, cx| {

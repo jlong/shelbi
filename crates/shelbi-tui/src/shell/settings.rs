@@ -48,6 +48,10 @@
 //!   workflow, and the poll intervals), over the shared
 //!   `shelbi_app::settings::properties` form. A field saves when Enter
 //!   commits it; the Default workflow picker saves as it changes.
+//! - Issues (`settings-issues-page`, [`issues`]): where the project's issues
+//!   live (the local board, GitHub or Linear), that connection's fields and
+//!   agent rules, over the shared `shelbi_app::settings::tracker` form.
+//!   Nothing is written until Connect.
 //! - Orchestrator (`awareness-setting`): how events reach the project's
 //!   orchestrator (the heartbeat or the awareness system), a radio saved to
 //!   the project YAML as it is picked, and Restart orchestrator, over the
@@ -111,6 +115,7 @@ use crate::theme::palette;
 
 mod agent_editor;
 mod agents;
+pub(crate) mod issues;
 mod machine_form;
 pub(crate) mod properties;
 mod tool_picker;
@@ -122,6 +127,7 @@ pub(crate) use agent_editor::{run_work as run_agent_work, AgentDone, AgentWork};
 use agent_editor::{AgentEditorPage, Back as AgentBack, EditorAction as AgentAction, Landed as AgentLanded};
 pub(crate) use agents::CommitJob;
 use agents::{AgentsHit, AgentsPage, Outcome};
+use issues::IssuesPage;
 use properties::PropertiesPage;
 use tool_picker::ToolLayer;
 pub(crate) use workflow_editor::{run_work, EditorDone, EditorWork};
@@ -161,7 +167,8 @@ pub(crate) const OFFERED: PageSet = PageSet::NONE
     .with(SettingsPage::Workflows)
     .with(SettingsPage::Agents)
     .with(SettingsPage::Orchestrator)
-    .with(SettingsPage::Properties);
+    .with(SettingsPage::Properties)
+    .with(SettingsPage::Issues);
 
 /// A page's background read the shell starts ([`SettingsShell::begin_page_load`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +189,9 @@ pub(crate) enum Load {
     /// The Properties page: this project's workflow config (it carries the
     /// project YAML).
     Properties(Ticket, String),
+    /// The Issues page: this project's workflow config (it carries the
+    /// `issue_tracker:` block).
+    Issues(Ticket, String),
 }
 
 /// Where keyboard focus sits inside Settings.
@@ -240,8 +250,8 @@ pub(crate) enum SettingsAction {
     /// The Workflows page queued a save: start it off the UI thread
     /// ([`SettingsShell::begin_commit`]).
     Commit,
-    /// The Properties page's Issue tracker section has work (a Linear read,
-    /// a connection) to run off the UI thread
+    /// The Issues page has work (a Linear read, a connection) to run off
+    /// the UI thread
     /// ([`SettingsShell::take_tracker_work`]).
     TrackerWork,
     /// Workflows' Sync now: sync `project`'s status catalog from its
@@ -310,17 +320,16 @@ impl PartialEq for PropertiesSave {
 
 impl Eq for PropertiesSave {}
 
-/// The Properties page's save to start, as an action.
-/// What a Properties key or click asks for: its save, else the Issue
-/// tracker section's work.
-fn properties_action(page: &properties::PropertiesPage, save: Option<(Ticket, String, WorkflowConfig)>) -> SettingsAction {
-    match save {
-        Some(save) => save_properties(Some(save)),
-        None if page.tracker_work_due() => SettingsAction::TrackerWork,
-        None => SettingsAction::Stay,
+/// What an Issues key or click asks for: the page's work, if it has some.
+fn issues_action(page: &IssuesPage) -> SettingsAction {
+    if page.work_due() {
+        SettingsAction::TrackerWork
+    } else {
+        SettingsAction::Stay
     }
 }
 
+/// The Properties page's save to start, as an action.
 fn save_properties(save: Option<(Ticket, String, WorkflowConfig)>) -> SettingsAction {
     match save {
         Some((ticket, project, config)) => SettingsAction::SaveProperties(Box::new(PropertiesSave { ticket, project, config })),
@@ -435,6 +444,7 @@ fn page_glyph(page: SettingsPage) -> &'static str {
         SettingsPage::Agents => "🤖",
         SettingsPage::Orchestrator => "📡",
         SettingsPage::Properties => "📋",
+        SettingsPage::Issues => "🎫",
     }
 }
 
@@ -492,6 +502,8 @@ pub(crate) struct SettingsShell {
     properties: PropertiesPage,
     /// The leave prompt's Save is the Properties page's typed field.
     prompt_properties: bool,
+    /// The Issues page, loaded per project.
+    issues: IssuesPage,
     /// The page's text start column at the last draw (editor clicks).
     page_x: u16,
     /// The workflow editor, while it shows (over both columns).
@@ -553,6 +565,7 @@ impl Default for SettingsShell {
             orch_restart: Job::default(),
             properties: PropertiesPage::default(),
             prompt_properties: false,
+            issues: IssuesPage::default(),
             page_x: 0,
             editor: None,
             agent_editor: None,
@@ -642,6 +655,11 @@ impl SettingsShell {
     }
 
     #[cfg(test)]
+    pub(crate) fn issues(&self) -> &IssuesPage {
+        &self.issues
+    }
+
+    #[cfg(test)]
     pub(crate) fn retired(&self) -> usize {
         self.retired.len()
     }
@@ -673,8 +691,8 @@ impl SettingsShell {
     }
 
     /// Settings opened: on the last page, the selection on its row, the keys
-    /// on the sidebar. Opened for one `page` (Connect to Issue Tracker's
-    /// Properties), the keys go to that page instead.
+    /// on the sidebar. Opened for one `page` (Connect to an Issue tracker's
+    /// Issues), the keys go to that page instead.
     pub(crate) fn open(&mut self, page: Option<SettingsPage>) {
         self.nav.open(page);
         self.stop = Stop::Page(self.nav.page());
@@ -1079,6 +1097,7 @@ impl SettingsShell {
         }
         self.form.cancel_edit();
         self.properties.cancel_typing();
+        self.issues.cancel_typing();
         self.agents.close_editor();
         if let Some(editor) = self.editor.as_mut() {
             editor.discard_for_settings();
@@ -1140,6 +1159,9 @@ impl SettingsShell {
         }
         if self.nav.page() == SettingsPage::Properties {
             return self.region == Region::Page && self.properties.paste(text);
+        }
+        if self.nav.page() == SettingsPage::Issues {
+            return self.region == Region::Page && self.issues.paste(text);
         }
         if self.tools.paste(text) {
             return true;
@@ -1224,6 +1246,7 @@ impl SettingsShell {
         self.orch_save.reset();
         self.orch_restart.reset();
         self.properties.project_changed();
+        self.issues.project_changed();
         self.save.reset();
         self.action = 0;
         self.scroll = 0;
@@ -1251,7 +1274,8 @@ impl SettingsShell {
             | SettingsPage::Workflows
             | SettingsPage::Agents
             | SettingsPage::Orchestrator
-            | SettingsPage::Properties => None,
+            | SettingsPage::Properties
+            | SettingsPage::Issues => None,
         }
     }
 
@@ -1298,6 +1322,12 @@ impl SettingsShell {
                 let ticket = self.properties.begin_load(project)?;
                 Some(Load::Properties(ticket, project?.to_string()))
             }
+            // Read on every visit, to show a connection made elsewhere (the
+            // CLI, the desktop app).
+            SettingsPage::Issues => {
+                let ticket = self.issues.begin_load(project)?;
+                Some(Load::Issues(ticket, project?.to_string()))
+            }
             SettingsPage::Terminal => None,
         }
     }
@@ -1306,24 +1336,32 @@ impl SettingsShell {
     pub(crate) fn properties_loaded(&mut self, ticket: &Ticket, read: Result<WorkflowConfig, String>) -> SettingsAction {
         if !self.properties.loaded(ticket, read) {
             self.dropped += 1;
+        }
+        SettingsAction::Stay
+    }
+
+    /// The Issues page's read landed: its Linear and GitHub reads start.
+    pub(crate) fn issues_loaded(&mut self, ticket: &Ticket, read: Result<WorkflowConfig, String>) -> SettingsAction {
+        if !self.issues.loaded(ticket, read) {
+            self.dropped += 1;
             return SettingsAction::Stay;
         }
-        properties_action(&self.properties, None)
+        issues_action(&self.issues)
     }
 
-    /// The Issue tracker section's work to run now, for its project.
-    pub(crate) fn take_tracker_work(&mut self) -> Option<(String, Vec<properties::TrackerWork>)> {
-        self.properties.take_tracker_work()
+    /// The Issues page's work to run now, for its project.
+    pub(crate) fn take_tracker_work(&mut self) -> Option<(String, Vec<issues::TrackerWork>)> {
+        self.issues.take_tracker_work()
     }
 
-    /// A piece of the section's work landed for `project`. A connection
+    /// A piece of the Issues page's work landed for `project`. A connection
     /// written reads the page again; more Linear reads go on.
-    pub(crate) fn tracker_done(&mut self, project: &str, done: properties::TrackerDone) -> (SettingsAction, bool) {
-        let wrote = self.properties.tracker_done(project, done);
-        if wrote && self.nav.page() == SettingsPage::Properties {
+    pub(crate) fn tracker_done(&mut self, project: &str, done: issues::TrackerDone) -> (SettingsAction, bool) {
+        let wrote = self.issues.tracker_done(project, done);
+        if wrote && self.nav.page() == SettingsPage::Issues {
             return (SettingsAction::Reload, true);
         }
-        (properties_action(&self.properties, None), wrote)
+        (issues_action(&self.issues), wrote)
     }
 
     /// Workflows' Sync now landed for `project`: the page reads its files
@@ -1659,7 +1697,8 @@ impl SettingsShell {
             | SettingsPage::Workspaces
             | SettingsPage::Workflows
             | SettingsPage::Agents
-            | SettingsPage::Properties => Vec::new(),
+            | SettingsPage::Properties
+            | SettingsPage::Issues => Vec::new(),
         }
     }
 
@@ -1870,9 +1909,16 @@ impl SettingsShell {
             // saves it; digits and Tab type).
             let nav = Nav { up: false, down: false, activate: false };
             return match self.properties.key(k, nav) {
-                Some(save) => properties_action(&self.properties, save),
+                Some(save) => save_properties(save),
                 None => SettingsAction::Stay,
             };
+        }
+        if self.region == Region::Page && self.nav.page() == SettingsPage::Issues && self.issues.typing() {
+            // The field being typed holds every key (Esc puts it back, Enter
+            // takes it; digits and Tab type).
+            let nav = Nav { up: false, down: false, activate: false };
+            self.issues.key(k, nav);
+            return issues_action(&self.issues);
         }
         let chord = crate::keymap::chord_from_event(k);
         let sidebar = chord.and_then(|c| keymaps.sidebar.dispatch(c));
@@ -1920,8 +1966,22 @@ impl SettingsShell {
             }
             Region::Page if on_workflows => self.workflows.handle_key(k, nav),
             Region::Page if self.nav.page() == SettingsPage::Keybindings => self.keys_key(k, keymaps),
+            Region::Page if self.nav.page() == SettingsPage::Issues => {
+                if self.issues.key(k, nav) {
+                    return issues_action(&self.issues);
+                }
+                match k.code {
+                    KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(8),
+                    KeyCode::PageDown => self.scroll = self.scroll.saturating_add(8),
+                    KeyCode::Home => self.scroll = 0,
+                    KeyCode::End => self.scroll = u16::MAX,
+                    KeyCode::Char('r') if k.modifiers.is_empty() => return SettingsAction::Reload,
+                    _ => {}
+                }
+                SettingsAction::Stay
+            }
             Region::Page if self.nav.page() == SettingsPage::Properties => match self.properties.key(k, nav) {
-                Some(save) => properties_action(&self.properties, save),
+                Some(save) => save_properties(save),
                 None => {
                     match k.code {
                         KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(8),
@@ -2198,8 +2258,19 @@ impl SettingsShell {
                             }
                             return save_properties(self.properties.commit_typing());
                         }
-                        let save = self.properties.activate(i);
-                        properties_action(&self.properties, save)
+                        save_properties(self.properties.activate(i))
+                    }
+                    Some(Hit::Action(i)) if self.nav.page() == SettingsPage::Issues => {
+                        if self.issues.typing() {
+                            // A click in the field being typed leaves it
+                            // typing; one elsewhere takes what's typed first.
+                            if i == self.issues.cursor() {
+                                return SettingsAction::Stay;
+                            }
+                            self.issues.commit_typing();
+                        }
+                        self.issues.activate(i);
+                        issues_action(&self.issues)
                     }
                     Some(Hit::Action(i)) => self.run_action(i),
                     Some(Hit::Agents(h)) => {
@@ -2467,6 +2538,7 @@ impl SettingsShell {
             SettingsPage::Workflows => self.workflows.cursor(),
             SettingsPage::Workspaces => self.workspaces.cursor(),
             SettingsPage::Properties => self.properties.cursor(),
+            SettingsPage::Issues => self.issues.cursor(),
             _ => self.action,
         };
         // Keep the focused rows in view: the last marked, then the first (an
@@ -2561,6 +2633,7 @@ impl SettingsShell {
             }
             SettingsPage::Workflows => self.workflows.rows(width, self.region == Region::Page, self.has_project),
             SettingsPage::Properties => self.properties.rows(width, self.region == Region::Page, self.has_project),
+            SettingsPage::Issues => self.issues.rows(width, self.region == Region::Page, self.has_project),
             SettingsPage::Agents => {
                 let focused = self.region == Region::Page;
                 self.agents.rows(width, height, focused)
@@ -3870,8 +3943,9 @@ mod tests {
                 Stop::Page(SettingsPage::Properties),
                 Stop::Page(SettingsPage::Orchestrator),
                 Stop::Page(SettingsPage::Agents),
-                Stop::Page(SettingsPage::Workspaces),
-                Stop::Page(SettingsPage::Workflows)
+                Stop::Page(SettingsPage::Issues),
+                Stop::Page(SettingsPage::Workflows),
+                Stop::Page(SettingsPage::Workspaces)
             ]
         );
         assert_eq!(s.page(), SettingsPage::General);
@@ -3892,14 +3966,16 @@ mod tests {
             SettingsPage::Properties,
             SettingsPage::Orchestrator,
             SettingsPage::Agents,
-            SettingsPage::Workspaces,
+            SettingsPage::Issues,
             SettingsPage::Workflows,
+            SettingsPage::Workspaces,
         ] {
             s.handle_key(key(KeyCode::Down), &km);
             assert_eq!(s.stop, Stop::Page(page));
         }
         s.handle_key(key(KeyCode::Down), &km);
-        assert_eq!(s.stop, Stop::Page(SettingsPage::Workflows), "stops at the bottom");
+        assert_eq!(s.stop, Stop::Page(SettingsPage::Workspaces), "stops at the bottom");
+        s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);
         s.handle_key(key(KeyCode::Char('k')), &km);

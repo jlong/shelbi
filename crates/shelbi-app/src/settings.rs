@@ -32,6 +32,8 @@
 //! - [`properties`]: the Properties page's form over the project YAML's own
 //!   settings (its label, repository, default branch and workflow, editor,
 //!   and the poll intervals), with its validation and save.
+//! - [`tracker`]: the Issues page's form (where the project's issues live,
+//!   its connection's fields and agent rules, and Connect).
 //! - [`orchestrator`]: the Orchestrator page's event delivery radio
 //!   (`orchestrator.awareness:`) and its Restart orchestrator.
 //! - [`workspaces`] and [`workspace_form`]: the Workspaces page (the pool,
@@ -89,6 +91,9 @@ pub enum SettingsPage {
     Workflows,
     /// The project's agents and their shared instructions.
     Agents,
+    /// Where the project's issues live: its issue tracker (the local board,
+    /// GitHub or Linear), that connection's fields and its agent rules.
+    Issues,
 }
 
 /// Whose settings a page edits.
@@ -111,13 +116,14 @@ impl SettingsPage {
             SettingsPage::Agents => "Agents",
             SettingsPage::Orchestrator => "Orchestrator",
             SettingsPage::Properties => "Properties",
+            SettingsPage::Issues => "Issues",
         }
     }
 
     /// Its number while Settings is open: ⌃N in the desktop app (⌘N are
     /// the project tabs), the digit key in the TUI. Counted in the order the
     /// sidebar lists every page, as the Figma frame (2252:27532) numbers
-    /// them: General 1 through Workflows 8. Both clients offer every page,
+    /// them: General 1 through Workspaces 9. Both clients offer every page,
     /// so the count is the same whichever client draws it.
     pub fn shortcut(self) -> u8 {
         let at = pages().position(|p| p == self).expect("every page is in a section");
@@ -139,7 +145,8 @@ impl SettingsPage {
             | SettingsPage::Workspaces
             | SettingsPage::Workflows
             | SettingsPage::Agents
-            | SettingsPage::Orchestrator => Scope::Project,
+            | SettingsPage::Orchestrator
+            | SettingsPage::Issues => Scope::Project,
         }
     }
 
@@ -154,6 +161,7 @@ impl SettingsPage {
             SettingsPage::Agents => 1 << 5,
             SettingsPage::Orchestrator => 1 << 6,
             SettingsPage::Properties => 1 << 7,
+            SettingsPage::Issues => 1 << 8,
         }
     }
 }
@@ -191,8 +199,9 @@ pub const SECTIONS: &[Section] = &[
             SettingsPage::Properties,
             SettingsPage::Orchestrator,
             SettingsPage::Agents,
-            SettingsPage::Workspaces,
+            SettingsPage::Issues,
             SettingsPage::Workflows,
+            SettingsPage::Workspaces,
         ],
     },
 ];
@@ -216,7 +225,8 @@ impl PageSet {
             | SettingsPage::Workflows.bit()
             | SettingsPage::Agents.bit()
             | SettingsPage::Orchestrator.bit()
-            | SettingsPage::Properties.bit(),
+            | SettingsPage::Properties.bit()
+            | SettingsPage::Issues.bit(),
     );
 
     /// No page.
@@ -573,8 +583,8 @@ mod tests {
     #[test]
     fn the_pages_are_numbered_in_order() {
         let all: Vec<_> = pages().collect();
-        // The Figma frame's order (2252:27532): Properties leads the project
-        // section, then Orchestrator, Agents, Workspaces, Workflows.
+        // Properties leads the project section, then Orchestrator, Agents,
+        // Issues, Workflows, Workspaces.
         assert_eq!(
             all,
             [
@@ -584,28 +594,31 @@ mod tests {
                 SettingsPage::Properties,
                 SettingsPage::Orchestrator,
                 SettingsPage::Agents,
-                SettingsPage::Workspaces,
+                SettingsPage::Issues,
                 SettingsPage::Workflows,
+                SettingsPage::Workspaces,
             ]
         );
-        // Numbered ⌃1 to ⌃8 in that order, as the frame's badges.
-        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8]);
+        // Numbered ⌃1 to ⌃9 in that order.
+        assert_eq!(all.iter().map(|p| p.shortcut()).collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6, 7, 8, 9]);
         assert_eq!(SettingsPage::for_shortcut(4), Some(SettingsPage::Properties));
         assert_eq!(SettingsPage::for_shortcut(5), Some(SettingsPage::Orchestrator));
         assert_eq!(SettingsPage::for_shortcut(6), Some(SettingsPage::Agents));
-        assert_eq!(SettingsPage::for_shortcut(7), Some(SettingsPage::Workspaces));
+        assert_eq!(SettingsPage::for_shortcut(7), Some(SettingsPage::Issues));
         assert_eq!(SettingsPage::for_shortcut(8), Some(SettingsPage::Workflows));
-        assert_eq!(SettingsPage::for_shortcut(9), None);
+        assert_eq!(SettingsPage::for_shortcut(9), Some(SettingsPage::Workspaces));
+        assert_eq!(SettingsPage::for_shortcut(10), None);
         assert_eq!(SettingsPage::for_shortcut(0), None);
         assert_eq!(
             SECTIONS.iter().map(|s| (s.header, s.pages.len())).collect::<Vec<_>>(),
-            [(Header::Title("Global"), 3), (Header::Project, 5)]
+            [(Header::Title("Global"), 3), (Header::Project, 6)]
         );
         assert_eq!(SettingsPage::Terminal.scope(), Scope::Global);
         assert_eq!(SettingsPage::Properties.scope(), Scope::Project);
         assert_eq!(SettingsPage::Workspaces.scope(), Scope::Project);
         assert_eq!(SettingsPage::Workflows.scope(), Scope::Project);
         assert_eq!(SettingsPage::Orchestrator.scope(), Scope::Project);
+        assert_eq!(SettingsPage::Issues.scope(), Scope::Project);
         for (i, a) in all.iter().enumerate() {
             for b in &all[i + 1..] {
                 assert_ne!(a.shortcut(), b.shortcut(), "{a:?} and {b:?} share a number");
@@ -625,7 +638,7 @@ mod tests {
         assert_eq!(tui.pages().collect::<Vec<_>>(), [SettingsPage::General]);
         assert_eq!(tui.for_shortcut(1), Some(SettingsPage::General));
         assert_eq!(tui.for_shortcut(6), None, "Agents isn't offered");
-        assert_eq!(PageSet::ALL.pages().count(), 8);
+        assert_eq!(PageSet::ALL.pages().count(), 9);
         assert_eq!(PageSet::NONE.first(), None);
         // Reversed input still walks in sidebar order.
         let set = PageSet::of(&[SettingsPage::Agents, SettingsPage::General]);
@@ -664,19 +677,19 @@ mod tests {
         assert_eq!((nav.page(), nav.selected()), (SettingsPage::General, SettingsPage::General));
         nav.step(false);
         assert_eq!(nav.selected(), SettingsPage::General, "stops at the top");
-        for _ in 0..8 {
+        for _ in 0..9 {
             nav.step(true);
         }
         assert_eq!(
             nav.selected(),
-            SettingsPage::Workflows,
+            SettingsPage::Workspaces,
             "crosses into the project section and stops at the bottom"
         );
         assert_eq!(nav.page(), SettingsPage::General, "moving doesn't open");
         assert!(nav.activate());
         assert_eq!(
             (nav.page(), nav.selected()),
-            (SettingsPage::Workflows, SettingsPage::Workflows)
+            (SettingsPage::Workspaces, SettingsPage::Workspaces)
         );
         assert!(!nav.activate(), "already shown");
         // Properties leads the project section: one up from Orchestrator,

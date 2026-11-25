@@ -1619,8 +1619,8 @@ impl Run {
 
     /// Settings ▸ Properties (`settings-properties-page`): the settings
     /// sidebar as the Navigation component's State=Settings draws it
-    /// (2252:27532: Properties first under the project, Agents' robot, ⌃1 to
-    /// ⌃8), over the page (no frame of its own: the General page's
+    /// (Properties first under the project, Agents' robot, ⌃1 to ⌃9), over
+    /// the page (no frame of its own: the General page's
     /// controls), then the page with Advanced open.
     fn settings_properties(&mut self) {
         use crate::views::settings_nav::SettingsPage;
@@ -3195,7 +3195,7 @@ impl Run {
 
     /// Linear as a tracker (`linear-settings-ui`), over canned Linear answers
     /// (`shelbi_app::linear_setup::fixture`; nothing reads Linear): Settings ▸
-    /// Properties' Issue tracker section on
+    /// Issues on
     /// Linear (`settings-tracker-linear`), with no key
     /// (`settings-tracker-no-key`) and a switch refused because the board has
     /// issues (`settings-tracker-refused`); and Settings ▸ Workflows over a
@@ -3218,7 +3218,7 @@ impl Run {
             Msg::Filter(Filter::Label, "shelbi".into()),
             Msg::Filter(Filter::Assignee, "me".into()),
         ];
-        // Settings ▸ Properties' Issue tracker section.
+        // Settings ▸ Issues' tracker section.
         let service = |linear: Answer, refuse: bool| TrackerService {
             connect: Arc::new(move |_| {
                 if refuse {
@@ -3250,11 +3250,11 @@ impl Run {
         for (screen, linear, pick, refuse) in tracker_states {
             let handle = self.open();
             handle
-                .update(&mut self.cx, |w, window, cx| w.offscreen_open_settings(SettingsPage::Properties, window, cx))
+                .update(&mut self.cx, |w, window, cx| w.offscreen_open_settings(SettingsPage::Issues, window, cx))
                 .unwrap();
             self.settle(handle);
             let page = handle
-                .update(&mut self.cx, |w, _, cx| w.offscreen_settings().map(|v| v.read(cx).properties()))
+                .update(&mut self.cx, |w, _, cx| w.offscreen_settings().map(|v| v.read(cx).issues()))
                 .unwrap()
                 .expect("Settings is open");
             let section = page.read_with(&self.cx, |p, _| p.tracker());

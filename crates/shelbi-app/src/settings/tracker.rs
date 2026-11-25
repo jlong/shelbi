@@ -1,6 +1,6 @@
-//! Settings ▸ Properties' Issue tracker section (`linear-settings-ui`),
+//! Settings ▸ Issues (`linear-settings-ui`, `settings-issues-page`),
 //! toolkit-free: where the project's issues live, and switching or editing
-//! that connection. The desktop app's and the TUI's Properties pages draw
+//! that connection. The desktop app's and the TUI's Issues pages draw
 //! [`TrackerForm`].
 //!
 //! ```text
@@ -19,7 +19,7 @@
 //!
 //! The choice is the new-project flow's ([`IssuesChoice`], with Linear's
 //! key, team and filter pickers in [`crate::linear_setup::LinearChoice`]),
-//! seeded with the project's connection. Unlike the other Properties fields
+//! seeded with the project's connection. Unlike the other Settings fields
 //! nothing saves until Connect (or Save, for the same board's new filters):
 //! a connection is one operation
 //! (`shelbi_orchestrator::tracker_connect::apply_tracker_connection`), run

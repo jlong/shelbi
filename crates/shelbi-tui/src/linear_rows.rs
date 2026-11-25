@@ -3,8 +3,8 @@
 //! masked key field to paste one into), the Team picker (required), then the
 //! optional Project, Label and Assignee pickers and the sentence saying what
 //! the picks show. Shared by the new-project dialog's Issues page
-//! (`overlay/add_project.rs`) and Settings ▸ Properties' Issue tracker
-//! section (`shell/settings/properties.rs`), after the desktop's
+//! (`overlay/add_project.rs`) and Settings ▸ Issues
+//! (`shell/settings/issues.rs`), after the desktop's
 //! `views/linear_fields.rs`.
 //!
 //! ```text

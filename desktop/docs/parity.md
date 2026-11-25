@@ -300,8 +300,8 @@ paths on every `cargo test`.
   a radio row and draws the note beside the button; the desktop clicks.
 - **Settings ▸ Properties** (`settings-properties-page`): both clients draw
   the page over one form (`shelbi_app::settings::properties`: Name,
-  Repository, Default branch, Default workflow, the read-only Issue
-  tracker summary, and Advanced's two intervals, with each field's help,
+  Repository, Default branch, Default workflow, and Advanced's two
+  intervals, with each field's help,
   placeholder and error). A field saves when it's committed and a picker
   when it changes, through the project's `WorkflowConfig` (the hash-checked
   project-YAML write, checked as `shelbi config lint` would). Neither shows
@@ -310,6 +310,16 @@ paths on every `cargo test`.
   focus leaving a field; the TUI types a field after Enter (Esc puts it
   back) and steps the Default workflow with ←/→. Leaving the TUI page mid-typing asks to save or discard, as
   General's command field does.
+- **Settings ▸ Issues** (`settings-issues-page`): both clients draw the
+  page over one form (`shelbi_app::settings::tracker::TrackerForm`): the
+  three boards (Local board, GitHub Issues, Linear), the GitHub repo or the
+  Linear key, team and filters, the agent rules for an external tracker,
+  and Cancel / Connect (Switch anyway after a refusal). It sits between
+  Agents and Workflows, so the project pages number Properties ⌃4 through
+  Workspaces ⌃9. Nothing is written until Connect; the page reads the
+  project again on every visit and after a connection lands. The board's
+  ⋮ ▸ Settings opens it in the desktop app; the TUI opens it for Connect to
+  an Issue tracker (the desktop runs its guided flow instead).
 - **Settings ▸ Workspaces** (`tui-settings-workspaces`): both clients show
   the same rows (`shelbi_app::settings::workspaces`: each workspace's name,
   derived worktree, machine and Local or SSH, own and inherited tags, and

@@ -194,20 +194,21 @@ fn the_numbered_chords_switch_pages_inside_settings_only(cx: &mut TestAppContext
     );
     s.key("ctrl-2");
     assert_eq!(s.page(), Some(SettingsPage::Keybindings));
-    // ⌃4 to ⌃8 are the project's pages in the frame's order.
+    // ⌃4 to ⌃9 are the project's pages in sidebar order.
     for (key, page) in [
         ("ctrl-4", SettingsPage::Properties),
         ("ctrl-5", SettingsPage::Orchestrator),
         ("ctrl-6", SettingsPage::Agents),
-        ("ctrl-7", SettingsPage::Workspaces),
+        ("ctrl-7", SettingsPage::Issues),
         ("ctrl-8", SettingsPage::Workflows),
+        ("ctrl-9", SettingsPage::Workspaces),
     ] {
         s.key(key);
         assert_eq!(s.page(), Some(page), "{key}");
     }
     s.key("ctrl-2");
-    s.key("ctrl-9");
-    assert_eq!(s.page(), Some(SettingsPage::Keybindings), "no page is ⌃9");
+    s.key("ctrl-0");
+    assert_eq!(s.page(), Some(SettingsPage::Keybindings), "no page is ⌃0");
     assert!(s.h.take_calls().is_empty(), "no sidebar row opened");
 
     // ⌘N stays the tabs': it opens no page.
@@ -258,8 +259,9 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
     for page in [
         SettingsPage::Orchestrator,
         SettingsPage::Agents,
-        SettingsPage::Workspaces,
+        SettingsPage::Issues,
         SettingsPage::Workflows,
+        SettingsPage::Workspaces,
     ] {
         s.key("down");
         assert_eq!(s.selected_row(), Some(page));
@@ -267,12 +269,12 @@ fn up_down_and_enter_walk_the_settings_rows(cx: &mut TestAppContext) {
     s.key("down");
     assert_eq!(
         s.selected_row(),
-        Some(SettingsPage::Workflows),
+        Some(SettingsPage::Workspaces),
         "it stops at the last row"
     );
     s.key("enter");
-    assert_eq!(s.page(), Some(SettingsPage::Workflows));
-    for _ in 0..5 {
+    assert_eq!(s.page(), Some(SettingsPage::Workspaces));
+    for _ in 0..6 {
         s.key("up");
     }
     s.key("enter");
@@ -1641,21 +1643,20 @@ fn the_properties_page_saves_the_project_yaml_and_refuses_bad_values(cx: &mut Te
         "properties-default-branch",
         "properties-default-workflow-button",
         "properties-advanced",
-        "tracker-section",
     ] {
         assert!(s.drawn(selector), "{selector}");
     }
+    assert!(!s.drawn("tracker-section"), "the issue tracker has its own page");
     assert!(!s.drawn("properties-poll-interval"), "Advanced starts closed");
     assert!(!s.drawn("properties-editor-row") && !s.drawn("properties-editor-button"), "no Editor field");
     // Top to bottom: Name, Repository, Default branch, Default workflow,
-    // Advanced, then the Issue tracker section.
+    // Advanced.
     let order = [
         "properties-name",
         "properties-repository",
         "properties-default-branch",
         "properties-default-workflow-button",
         "properties-advanced",
-        "tracker-section",
     ];
     for pair in order.windows(2) {
         assert!(s.above(pair[0], pair[1]), "{} above {}", pair[0], pair[1]);
@@ -1690,9 +1691,30 @@ fn the_properties_page_saves_the_project_yaml_and_refuses_bad_values(cx: &mut Te
     let _ = text_selector(Text::Label);
 }
 
-// ---- Settings ▸ Properties ▸ Issue tracker (`linear-settings-ui`) -----------
+// ---- Settings ▸ Issues (`linear-settings-ui`, `settings-issues-page`) -------
 
+use crate::views::issues_settings::IssuesSettingsPage;
 use shelbi_app::settings::tracker::TrackerService;
+
+impl Settings {
+    /// Settings on Issues (⌃7), its page loaded from `home`'s files.
+    fn open_issues(cx: &mut TestAppContext) -> Settings {
+        let mut s = Settings::open(cx);
+        s.open_settings();
+        s.key("ctrl-7");
+        let page = s.issues();
+        s.update(|_, window, cx| page.update(cx, |p, cx| p.load(window, cx)));
+        s.saved();
+        s
+    }
+
+    fn issues(&self) -> Entity<IssuesSettingsPage> {
+        self.read(|w, cx| match &w.route {
+            Route::Settings(view) => view.read(cx).issues(),
+            _ => panic!("Settings is open"),
+        })
+    }
+}
 use shelbi_app::tracker_connect::{ConnectError, ConnectTracker, Connected, StatusSync, TrackerChoice};
 
 /// A tracker service over canned Linear answers that records each
@@ -1728,10 +1750,15 @@ fn recording_service(asked: Arc<Mutex<Vec<ConnectTracker>>>) -> TrackerService {
 }
 
 #[gpui::test]
-fn the_issue_tracker_section_connects_linear_and_can_force_a_refused_switch(cx: &mut TestAppContext) {
-    let _home = Home::with_project("props-tracker", "alpha");
-    let mut s = Settings::open_properties(cx);
-    let page = s.properties();
+fn the_issues_page_connects_linear_and_can_force_a_refused_switch(cx: &mut TestAppContext) {
+    let _home = Home::with_project("issues-tracker", "alpha");
+    let mut s = Settings::open_issues(cx);
+    assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Issues), Some(SettingsPage::Issues)));
+    for selector in ["settings-nav-issues", "settings-page-issues", "settings-issues", "issues-settings-subtitle", "tracker-section"] {
+        assert!(s.drawn(selector), "{selector}");
+    }
+    assert!(s.above("issues-settings-subtitle", "tracker-choice-local"), "the page's help leads");
+    let page = s.issues();
     let section = s.read(|_, cx| page.read(cx).tracker());
     let asked = Arc::new(Mutex::new(Vec::new()));
     s.update(|_, _, cx| section.update(cx, |t, _| t.set_service(recording_service(asked.clone()))));
@@ -3812,11 +3839,11 @@ use shelbi_app::settings::workspaces::fixtures::{write_pool, POOL};
 use shelbi_app::settings::workspaces::{probe_key, Intent, Load};
 
 impl Settings {
-    /// Settings on Workspaces (⌃7), its page loaded from the test's home.
+    /// Settings on Workspaces (⌃9), its page loaded from the test's home.
     fn open_workspaces(cx: &mut TestAppContext) -> Settings {
         let mut s = Settings::open(cx);
         s.open_settings();
-        s.key("ctrl-7");
+        s.key("ctrl-9");
         s.load_workspaces();
         s
     }
@@ -3872,14 +3899,15 @@ workspaces:
 ";
 
 #[gpui::test]
-fn workspaces_sits_before_workflows_on_its_own_chord(cx: &mut TestAppContext) {
+fn workspaces_sits_last_after_workflows_on_its_own_chord(cx: &mut TestAppContext) {
     let mut s = Settings::open(cx);
     s.open_settings();
     let label = s.bounds("settings-project-label").unwrap();
-    let workspaces = s.bounds("settings-nav-workspaces").unwrap();
+    let issues = s.bounds("settings-nav-issues").unwrap();
     let workflows = s.bounds("settings-nav-workflows").unwrap();
-    assert!(label.bottom() < workspaces.top() && workspaces.bottom() < workflows.top());
-    s.key("ctrl-7");
+    let workspaces = s.bounds("settings-nav-workspaces").unwrap();
+    assert!(label.bottom() < issues.top() && issues.bottom() < workflows.top() && workflows.bottom() < workspaces.top());
+    s.key("ctrl-9");
     assert_eq!((s.page(), s.selected_row()), (Some(SettingsPage::Workspaces), Some(SettingsPage::Workspaces)));
     assert!(s.drawn("settings-page-workspaces") && s.drawn("workspaces-heading"));
     s.key("ctrl-3");
@@ -3898,7 +3926,7 @@ fn the_workspaces_page_lists_the_pool_then_its_machines(cx: &mut TestAppContext)
     write_pool("alpha", POOL);
     let mut s = Settings::open(cx);
     s.open_settings();
-    s.key("ctrl-7");
+    s.key("ctrl-9");
     assert!(s.drawn("workspaces-loading"), "loading until the read lands");
     s.load_workspaces();
     assert!(!s.drawn("workspaces-loading"));

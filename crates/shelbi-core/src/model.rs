@@ -1020,7 +1020,7 @@ pub struct IssueTrackerConfig {
 
 /// The `issue_tracker.agent_rules` block: how agents handle the issues on a
 /// remote tracker (the connection flow's "How should agents handle issues
-/// created in <Tracker>?" step, and Settings ▸ Properties ▸ Issue tracker).
+/// created in <Tracker>?" step, and Settings ▸ Issues).
 ///
 /// ```yaml
 /// issue_tracker:

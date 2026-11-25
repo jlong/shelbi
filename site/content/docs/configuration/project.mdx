@@ -135,8 +135,8 @@ workspaces:
 | `session` | `{ raw_output_log }` | no | off | `raw_output_log: true` keeps a full raw output log of every session at `~/.shelbi/sessions/<id>/raw.log`. Opt-in, for debugging: the log is mostly repaint noise for full-screen agents and captures anything pasted into a session. |
 
 Settings ▸ Properties edits `name`, `github_url`, `default_branch`,
-`default_workflow` and the two intervals in the desktop app and the TUI. Its
-Issue tracker section connects, switches or disconnects the `issue_tracker`
+`default_workflow` and the two intervals in the desktop app and the TUI.
+Settings ▸ Issues connects, switches or disconnects the `issue_tracker`
 backend and edits the Linear filters, saving only when you press Connect or
 Save (see [`shelbi tracker`](/docs/cli/tracker#from-settings-or-a-new-project)). It checks each value first and
 refuses a file the loader wouldn't take, writes only the keys that changed,
@@ -638,8 +638,8 @@ hub daemon refreshes it against the key's rate limits.
 
 ### issue_tracker agent rules
 
-How agents handle the issues on a remote tracker. Settings ▸ Properties ▸ Issue
-tracker shows both as checkboxes, and connecting a tracker from the Issues
+How agents handle the issues on a remote tracker. Settings ▸ Issues
+shows both as checkboxes, and connecting a tracker from the Issues
 board's ⋮ menu asks for them. An absent block is the behavior Shelbi had before
 the rules existed. The local board (`file_system`) ignores both.
 

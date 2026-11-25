@@ -112,7 +112,7 @@ pub enum HeaderItem {
     /// "Connect to issue tracker…": offered while the project is on the
     /// local board (a connected one shows only Settings, 2753:12123).
     ConnectTracker,
-    /// Settings, on the Properties page (where the Issue tracker section is).
+    /// Settings, on the Issues page (where the tracker settings are).
     Settings,
 }
 
@@ -881,7 +881,7 @@ impl BoardState {
         match self.header_items().get(ix) {
             Some(HeaderItem::ConnectTracker) => vec![Intent::Command(CommandKind::ConnectTracker)],
             Some(HeaderItem::Settings) => {
-                vec![Intent::OpenSettings(shelbi_app::settings::SettingsPage::Properties)]
+                vec![Intent::OpenSettings(shelbi_app::settings::SettingsPage::Issues)]
             }
             None => Vec::new(),
         }
@@ -3794,8 +3794,8 @@ pub(crate) mod tests {
         assert_eq!(b.mode, Mode::HeaderMenu { cursor: Some(1) });
         assert_eq!(
             press(&mut b, "enter"),
-            vec![Intent::OpenSettings(shelbi_app::settings::SettingsPage::Properties)],
-            "Settings opens on Properties, where the Issue tracker section is"
+            vec![Intent::OpenSettings(shelbi_app::settings::SettingsPage::Issues)],
+            "Settings opens on Issues, the tracker's page"
         );
         assert_eq!(b.mode, Mode::Board);
         b.toggle_header_menu();
@@ -3813,7 +3813,7 @@ pub(crate) mod tests {
         press(&mut b, "down");
         assert_eq!(
             press(&mut b, "enter"),
-            vec![Intent::OpenSettings(shelbi_app::settings::SettingsPage::Properties)]
+            vec![Intent::OpenSettings(shelbi_app::settings::SettingsPage::Issues)]
         );
     }
 
